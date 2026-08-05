@@ -1688,6 +1688,12 @@ version = "0.1.0"
 [[package]]
 name = "oc-llm"
 version = "0.1.0"
+dependencies = [
+ "futures",
+ "oc-error",
+ "serde_json",
+ "thiserror 2.0.19",
+]
 
 [[package]]
 name = "oc-lsp"
