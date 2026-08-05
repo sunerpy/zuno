@@ -9,7 +9,30 @@ repository.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+# ---------------------------------------------------------------------------
+# `oc-llm` MUST NOT depend on any `oc-provider-*` crate.
+#
+# That edge is the one this crate exists to keep absent. `oc-llm` is the spine
+# every provider family implements against; if the spine also *named* the
+# families, editing one wire protocol would recompile the spine and, through it,
+# `oc-engine`, `oc-server`, `oc-tui` and the CLI. The registry in `registry.rs`
+# is how a provider reaches the spine instead: the composition root in `oc-cli`
+# owns both edges, so a provider edit rebuilds one leaf.
+#
+# `tests/registry_dependency_direction.rs` asserts the absence over the whole
+# first-party transitive closure, so a later todo cannot re-add the edge — not
+# even indirectly through a third crate.
+#
+# The technique, and the note explaining why an unused reverse edge is worth
+# deleting rather than tolerating, is taken from
+# `.omo/refs/jcode/crates/jcode-app-core/Cargo.toml:64-67`.
+# ---------------------------------------------------------------------------
 [dependencies]
+oc-error = { workspace = true }
+
+futures = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
 
 [lints]
 workspace = true
