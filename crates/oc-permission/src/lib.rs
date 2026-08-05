@@ -7,6 +7,7 @@
 mod engine;
 mod rule;
 mod types;
+pub mod visibility;
 mod wildcard;
 
 pub use crate::engine::PermissionEngine;
