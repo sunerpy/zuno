@@ -15,7 +15,9 @@ futures = { workspace = true }
 oc-db = { workspace = true }
 oc-error = { workspace = true }
 oc-llm = { workspace = true }
+oc-permission = { workspace = true }
 oc-tool = { workspace = true }
+jsonschema = { version = "=0.37.1", default-features = false }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
