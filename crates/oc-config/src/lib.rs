@@ -2,10 +2,15 @@
 
 pub mod discovery;
 pub mod legacy;
+pub mod instructions;
 pub mod schema;
 pub mod variable;
 
 pub use crate::discovery::DEFAULT_SCHEMA;
 pub use crate::legacy::{DeprecatedForm, Deprecation};
+pub use crate::instructions::{
+    InstructionOptions, InstructionPath, InstructionText, InstructionWarning, Instructions,
+    LoadedInstructions, Origin, UpwardClaims, WarningKind,
+};
 pub use crate::schema::{Config, KNOWN_TOP_LEVEL_KEYS};
 pub use crate::variable::{Missing, Source, Substitution};
