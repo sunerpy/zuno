@@ -5,3 +5,4 @@ pub mod command;
 pub mod formatter;
 pub mod lsp_config;
 pub mod reference;
+pub mod skill;
