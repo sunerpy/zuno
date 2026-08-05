@@ -3,6 +3,6 @@
 pub mod dispatch;
 pub mod interrupt;
 pub mod r#loop;
-pub mod stream;
 pub mod retry;
 pub mod status;
+pub mod stream;
