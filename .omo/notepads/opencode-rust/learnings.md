@@ -378,3 +378,2252 @@ project's sessions.
 - **`url` costs ~15 transitive crates** (`idna`, five `icu_*`, `zerovec`, …). It is
   already a workspace dependency, and hand-rolling WHATWG parsing to save the
   build time would be the wrong trade for a value that keys the project id.
+
+## Task 5 — oc-observability (tracing subscriber, stdout-safe routing)
+
+### The two oracle env vars: exact names, exact accepted values
+
+Both live in one place, `packages/core/src/observability/logging.ts`. Read them there,
+not from memory — two of the three details below are counter-intuitive.
+
+`OPENCODE_LOG_LEVEL` (logging.ts:56-65)
+- Uppercased, then looked up in a **four**-key map: `DEBUG INFO WARN ERROR`.
+- So `debug`, `Debug`, `DEBUG` all work.
+- **Anything else silently becomes `INFO`.** Not an error, not a warning.
+- **`TRACE` is NOT accepted.** It maps to `INFO` like any other unknown value. The
+  CLI's `--log-level` offers the identical four choices (`index.ts:58-62`), so
+  accepting a fifth value in Rust would be a silent behaviour divergence. `TRACE` is
+  reachable only through a programmatic directive string.
+
+`OPENCODE_PRINT_LOGS` (logging.ts:67-69)
+- Compared with `=== "1"`. **Not** through the `truthy()` helper at
+  `flag.ts:3-6` that most other `OPENCODE_*` booleans use.
+- So `OPENCODE_PRINT_LOGS=true` does **not** enable printing. Verified against the
+  real binary for `1 true TRUE yes 0 ""` — only `"1"` turns the sink on.
+- Printing is **additive**: `[fileLogger(), stderrLogger]`. It never replaces the
+  file sink, and the sink it adds is `process.stderr`. Never stdout.
+
+The CLI writes the flags into `process.env` before anything reads them
+(`index.ts:66-69`), which is how `--print-logs` / `--log-level` win over the
+environment. In Rust the same precedence is expressed as data — `LogConfig::level:
+Option<LogLevel>` — with no global mutation.
+
+### The log path
+
+`packages/core/src/global.ts:11,23`: `log = path.join(xdgData, "opencode", "log")`,
+i.e. `$XDG_DATA_HOME/opencode/log`. `oc-paths` owns this; do not re-derive it.
+`oc_paths::log()` did not exist at Task 5's base commit, so `LogConfig::dir` is a
+parameter (see issues.md).
+
+### WorkerGuard lifetime — the trap every caller must know
+
+`tracing_appender::non_blocking()` returns `(NonBlocking, WorkerGuard)`. The guard's
+`Drop` shuts down and flushes the background writer thread, so **dropping the guard
+stops all file logging**, silently and with no error.
+
+`oc_observability::init()` returns a `LogHandle` that owns it. That makes the handle's
+lifetime the process's logging lifetime:
+
+```rust
+let _logging = oc_observability::init(config)?;   // right: lives to end of main
+let _         = oc_observability::init(config)?;  // WRONG: dropped immediately, no logs
+```
+
+`LogHandle` is `#[must_use]` with a message naming this, and `into_guard()` exists for
+a caller that wants to park the guard elsewhere. Letting the handle fall out of scope
+at the end of `main` is also what flushes the last records.
+
+### tracing-subscriber facts worth not rediscovering
+
+- **`fmt::layer()` writes to STDOUT by default.** Every layer must set `with_writer`
+  explicitly. This is the single most likely way to reintroduce a stdout leak, and it
+  looks like a formatting choice rather than a protocol bug.
+- `FmtSpan` is **not `Copy`**. Building two layers with the same span-event config
+  needs `.clone()`.
+- `EnvFilter::builder().with_default_directive(level.into()).parse_lossy("")` gives a
+  level-only filter; `.parse(directives)` returns a typed
+  `tracing_subscriber::filter::ParseError` for a bad directive string.
+- `Option<L>` implements `Layer<S>`, so an optional sink is just
+  `.with(print_logs.then(|| ...))` — no boxing, no `Vec<Box<dyn Layer>>`.
+- The default `fmt` format renders the whole enclosing span stack inline on every
+  record: `turn{session="…" turn=0 agent="build"}:tool_call{tool="bash" call_id="…"}:`.
+  That is the concrete payoff over a hand-rolled logger: an event emitted deep inside
+  a tool arrives already attributed to its session and turn with nobody threading an
+  id through the call graph.
+- `Span::record` on a field that was **never declared** is a silent no-op. Late-bound
+  fields (a model chosen after config resolution, an HTTP status) must be declared as
+  `tracing::field::Empty` in the `info_span!` invocation or they vanish.
+- Field rendering differs by sigil: `%value` (Display) renders unquoted
+  (`tool=bash`), a `&'static str` renders Debug-quoted (`phase="pending"`). A test
+  asserting on file content has to match the right one.
+
+### Proving a stdout guarantee needs a child process
+
+A property about a process's fd 1 cannot be asserted from inside `cargo test`:
+`libtest` writes its own progress lines to the same stdout, so the captured bytes mix
+protocol frames with harness chatter and the assertion has to allow-list the chatter —
+which is the loophole a real leak walks through. `dup2` would work but needs `unsafe`,
+which this workspace forbids. The answer is a small `src/bin/` fixture
+(`oc-log-probe`) reachable from an integration test via `env!("CARGO_BIN_EXE_<name>")`.
+
+### A textual source guard has a substring hazard
+
+`no_stdout_in_library.rs` bans `print!` — and `print!` is a substring of `eprintln!`,
+the *legitimate* stderr diagnostic. The first version of the guard therefore forbade
+the very thing it wanted people to use instead. Fix: match banned tokens only at an
+identifier boundary (the preceding char must not be alphanumeric or `_`). A guard that
+false-positives on the correct alternative is a guard someone deletes.
+
+## Task 6 — oc-testkit (differential harness, cassette replay, capturing mock provider)
+
+### THE CASSETTE FORMAT (read this before touching any provider work — todos 29/30/87/94/95/96)
+
+Root: `<oracle-tree>/packages/llm/test/fixtures/recordings/<route>/<name>.json`
+Written by `@opencode-ai/http-recorder` v1.18.13. Measured across all 40 files / 52
+interactions at commit `aefaf140c1`. Rust structs live in `oc_testkit::cassette`.
+
+```json
+{ "version": 1,
+  "metadata": { "name": "anthropic-messages/streams-text",
+                "recordedAt": "2026-04-28T21:18:45.535Z",
+                "tags": ["prefix:anthropic-messages","provider:anthropic"] },
+  "interactions": [
+    { "transport": "http",
+      "request":  { "method":"POST","url":"https://api.anthropic.com/v1/messages",
+                    "headers":{"anthropic-version":"2023-06-01","content-type":"application/json"},
+                    "body":"{\"model\":\"...\",\"stream\":true}" },
+      "response": { "status":200,
+                    "headers":{"content-type":"text/event-stream; charset=utf-8"},
+                    "body":"event: message_start\ndata: {...}\n\n...",
+                    "bodyEncoding":"base64" } } ] }
+```
+
+Non-obvious facts, each verified against the real files:
+
+- **`version` is always 1.** Top-level keys are exactly `{version, metadata, interactions}`.
+- **`metadata` is optional and has two shapes.** 31 files: `{name, recordedAt, tags}`.
+  9 files also carry `{provider, route, transport, model}`. Deserialize as an open map,
+  not a fixed struct.
+- **Interactions are tagged by `transport`: `"http"` | `"websocket"`.** All 52 recorded
+  ones are http. The websocket arm is real in the schema (`packages/llm/test/recorded-websocket.ts`
+  uses it) but nothing is committed under it.
+- **Bodies are strings, never nested JSON.** A request body is a JSON *string* containing JSON.
+- **A streaming response is ONE buffered string. There is no chunk array and no timing.**
+  `text/event-stream` matches the recorder's text content-type test, so the whole stream is
+  drained into `body`. Event boundaries survive. Network chunk boundaries, inter-chunk delays
+  and backpressure are gone and are NOT recoverable from the file. A todo that needs to assert
+  on streaming *timing* must record that separately.
+- **`bodyEncoding` is present only for non-text bodies, and only as `"base64"`.** Exactly 4
+  occurrences, all `bedrock-converse`, content-type `application/vnd.amazon.eventstream`
+  (AWS eventstream binary framing: 4-byte big-endian total length prelude). The schema also
+  accepts `"text"` but the recorder never writes it — treat the field's absence as text.
+- **Headers are a tiny allow-list, applied before writing.** Responses retain ONLY
+  `content-type`. Requests retain `content-type`, `accept`, `openai-beta`, plus
+  `anthropic-version` where the anthropic recordings allow it explicitly. `authorization`,
+  `x-api-key`, `x-goog-api-key`, `cookie`, `x-amz-security-token` are DROPPED. A cassette can
+  therefore never be used to assert on credential headers — assert those against `MockProvider`,
+  which captures every header.
+- **Every recorded request is `POST`.** Statuses: 51x 200, 1x 400 (an intentional sad path in
+  `anthropic-messages/rejects-malformed-assistant-tool-order-without-patch`).
+- **8 cassettes hold 2 interactions** (tool loops, cache second-call, reasoning continuation);
+  the other 32 hold 1.
+- **11 real endpoints are covered**: openai `/v1/responses` (10), anthropic `/v1/messages` (9),
+  openrouter (8), gemini `streamGenerateContent?alt=sse` (5), openai `/v1/chat/completions` (5),
+  bedrock `converse-stream` (4), groq (4), cloudflare AI gateway (2), cloudflare workers-ai (2),
+  togetherai (2), deepseek (1). Cloudflare URLs contain literal `{account}`/`{gateway}`
+  placeholders — the recorder redacted them, so a matcher must not expect real ids there.
+
+**Matching (`packages/http-recorder/src/matching.ts`, ported in `cassette::canonical_snapshot`):**
+- **No hashing anywhere.** The key is a canonical JSON string of `{method, url, headers, body}`.
+- Object keys sorted recursively; **array order preserved**; a non-JSON body compared exactly.
+- **Replay is a strict cursor, not a search.** Request *n* may only be served by interaction *n*.
+  A mismatch does not advance the cursor. Finishing with interactions unconsumed is an error
+  (`CassetteUnused`), as is running past the end (`CassetteExhausted`). This is what makes an
+  extra/missing/reordered provider call a test failure rather than an invisible difference.
+- Names may contain `/`, resolve to `<root>/<name>.json`, and must reject empty/absolute/`..`.
+
+**Record vs replay mode**, if a new recording is ever needed: `auto` = CI set and not
+`"false"`/`"0"` → replay; else cassette exists → replay; else record. Several consumer tests use
+their own `RECORD=true` to force an explicit record layer — `RECORD` is *not* read by the
+recorder. The recorder refuses to write a file if it still detects a secret in it.
+
+### THE ORACLE INVOCATIONS THAT WORK
+
+Installed release binary (the default; ~0.46 s per run):
+```
+$ opencode --version                     # -> 1.18.12
+  which opencode -> /config/.local/share/mise/shims/opencode
+  real binary    -> /config/.local/share/mise/installs/opencode/1.18.12/opencode
+```
+
+From the pinned source tree (~1.1 s per run):
+```
+$ bun run --conditions=browser /config/workspace/ProdDir/AI/opencode/packages/opencode/src/index.ts --version
+  -> local
+```
+`--conditions=browser` is required (it is what `packages/opencode/package.json`'s `dev` script
+uses). Any cwd works — bun resolves `node_modules` from the entry file, not the cwd — so the
+harness runs it in the scripted temp project directory like the binary.
+
+**A from-source run reports `local`, not `1.18.13`.** `packages/core/src/installation/version.ts`
+reads a global `OPENCODE_VERSION` that only the bundler injects
+(`packages/opencode/script/build.ts:194`) and falls back to the literal `"local"`. Setting
+`OPENCODE_VERSION` in the environment does NOT help; it is a compile-time `define`. So the
+from-source flavour cannot self-report a version, which is why it is not the default.
+
+### ENVIRONMENT CONTRACT FOR SCRIPTING EITHER SIDE
+
+`packages/core/src/global.ts:10-30` resolves paths from `xdg-basedir` at *module load*, so
+`XDG_*` must be set before the process starts (there is no runtime re-read). `OPENCODE_TEST_HOME`
+overrides `paths.home` and is the only one read lazily. `packages/core/src/global.ts:37-45`
+eagerly `mkdir -p`s data/config/state/tmp/log/bin/repos on every start, so a scripted run always
+materializes seven directories — do not treat their existence as a signal.
+
+`ScriptedEnv` clears the environment entirely and passes through only `PATH`. It always sets
+`OPENCODE_DISABLE_AUTOUPDATE=1` and `OPENCODE_DISABLE_MODELS_FETCH=1`, which is how "the harness
+never makes a live call" is enforced for the *oracle's own* network use.
+
+`packages/opencode/src/config/paths.ts` — the `.opencode` chain walks up from cwd and **stops at
+the worktree root**, then always appends `$HOME/.opencode`, then `$OPENCODE_CONFIG_DIR`.
+`ConfigFixture::mark_worktree_root()` writes the empty `.git` dir that stops the walk, so a
+fixture chooses whether an ancestor layer is visible.
+
+### ID SHAPE (needed by any normalizer or journal comparison)
+
+`packages/schema/src/identifier.ts`: an id is `<prefix>_` + 12 lowercase hex (48 bits of
+`timestamp*0x1000 + counter`, bitwise-inverted for descending ids) + 14 base62 characters from
+`crypto.getRandomValues`. Total 26 characters after the underscore. Prefixes
+(`packages/core/src/id/id.ts`): `job evt ses msg per que prt pty tool wrk`.
+
+## Task 7 — the complete config key inventory (oracle: `packages/core/src/v1/config/config.ts:32-190`)
+
+Read this before touching todos 8-12. Every type below was read out of the oracle,
+not remembered. `Opt` = the key is optional (all of them are). "PositiveInt" is
+`>= 1` and maps to `NonZeroU32`; "NonNegativeInt" is `>= 0` and maps to `u32`;
+`Schema.Finite` maps to `f64`.
+
+### 33 top-level keys as implemented in `crates/oc-config/src/schema.rs`
+
+| key | oracle type | Rust type |
+| --- | --- | --- |
+| `$schema` | String | `Option<String>` (serde rename) |
+| `shell` | String | `Option<String>` |
+| `logLevel` | Literals DEBUG/INFO/WARN/ERROR | `Option<LogLevel>` (UPPERCASE) |
+| `server` | ServerConfig | `{port: NonZeroU32, hostname, mdns: bool, mdnsDomain, cors: Vec<String>}` |
+| `command` | Record<String, CommandInfo> | `OrderedMap<CommandConfig>`; `template` is **required**, then description/agent/model/variant/subtask |
+| `skills` | {paths, urls} | `SkillsConfig{paths: Vec<String>, urls: Vec<String>}` |
+| `references` | Record<String, Entry> | `OrderedMap<ReferenceEntry>` — **three-way union** |
+| `reference` | same as `references`, @deprecated | kept (see decisions.md) |
+| `watcher` | {ignore: String[]} | `WatcherConfig` |
+| `snapshot` | Boolean (default true) | `Option<bool>` |
+| `plugin` | Array<String \| [String, Record<String,Unknown>]> | `Vec<PluginSpec>` |
+| `share` | Literals manual/auto/disabled | `ShareMode` |
+| `autoupdate` | Boolean \| Literal "notify" | `Autoupdate` union |
+| `disabled_providers` | String[] | `Vec<String>` |
+| `enabled_providers` | String[] | `Vec<String>` |
+| `model` | String (`provider/model`) | `Option<String>` |
+| `small_model` | String | `Option<String>` |
+| `default_agent` | String | `Option<String>` |
+| `subagent_depth` | NonNegativeInt (default 1) | `Option<u32>` |
+| `username` | String | `Option<String>` |
+| `agent` | StructWithRest(plan/build/general/explore/title/summary/compaction, [Record<String, AgentInfo>]) | `OrderedMap<AgentConfig>` — the named keys carry **no** extra type, so a plain map is faithful |
+| `provider` | Record<String, ProviderConfig> | `OrderedMap<ProviderConfig>` |
+| `mcp` | Record<String, (Local\|Remote) \| {enabled: Boolean}> | `OrderedMap<McpServerConfig>` — **three** arms, not two |
+| `formatter` | Boolean \| Record<String, Entry> | `FormatterConfig` union |
+| `lsp` | Boolean \| Record<String, Entry> + a schema-level check | `LspConfig` union |
+| `instructions` | String[] | `Vec<String>` (todo 8: concat-dedup, not last-wins) |
+| `permission` | Action \| StructWithRest(15 keys, [Record<String, Rule>]) | `PermissionConfig` union |
+| `tools` | Record<String, Boolean> | `OrderedMap<bool>` |
+| `attachment` | {image: {auto_resize, max_width, max_height, max_base64_bytes}} | all four PositiveInt except the bool |
+| `enterprise` | {url} | `EnterpriseConfig` |
+| `tool_output` | {max_lines, max_bytes} PositiveInt | defaults 2000 / 51200 |
+| `compaction` | {auto, prune, tail_turns, preserve_recent_tokens, reserved} | auto default true, prune default false, tail_turns default 2, three NonNegativeInt |
+| `experimental` | {disable_paste_summary, batch_tool, openTelemetry, primary_tools, continue_loop_on_deny, mcp_timeout, policies} | `mcp_timeout` PositiveInt; `policies: Vec<PolicyStatement>` |
+
+### Deliberately absent (todo 10's rejection list)
+`mode` (deprecated alias of `agent`), `layout` (`auto`|`stretch`, "always uses
+stretch"), `autoshare`, and agent-level `tools` / `maxSteps`. All five DO exist in
+the oracle; they are omitted here so the rejection pass has something to catch.
+
+### Nested vocabularies worth not re-deriving
+
+* **Reference entry** (`config/reference.ts:5-21`): `String` | `{repository, branch?,
+  description?, hidden?}` | `{path, description?, hidden?}`. `repository` and `path`
+  are the disjoint discriminators.
+* **Agent** (`config/agent.ts:12-41`): model, variant, temperature, top_p, prompt,
+  **tools (dep)**, disable, description, mode(subagent|primary|all), hidden,
+  options, color, steps(PositiveInt), **maxSteps (dep)**, permission — plus a rest
+  record. `color` is `/^#[0-9a-fA-F]{6}$/` **or** one of
+  primary/secondary/accent/success/warning/error/info.
+* **Agent KNOWN_KEYS** (`:43-60`) has **16** entries and includes `name`, which is
+  *not* a schema field. Consequence: `name` must NOT be swept into `options`.
+* **Permission** (`config/permission.ts:18-34`): read, edit, glob, grep, list, bash,
+  task, external_directory, lsp, skill take `Action | Record<String, Action>`;
+  todowrite, question, webfetch, websearch, doom_loop take a **bare Action only**.
+  A bare string at the top of `permission` decodes to `{"*": action}` (`:40-41`).
+* **Provider** (`config/provider.ts:82-126`): api, name, env[], id, npm, whitelist[],
+  blacklist[], options(StructWithRest), models. Options names apiKey, baseURL,
+  enterpriseUrl, setCacheKey, timeout(PositiveInt|false), headerTimeout(same),
+  chunkTimeout(PositiveInt) and passes everything else through.
+* **Model** (`:13-80`): id, name, family, release_date, attachment, reasoning,
+  temperature, tool_call, interleaved(bool|String|{field}), cost{input!, output!,
+  cache_read?, cache_write?, context_over_200k{...}}, limit{context!, input?,
+  output!}, modalities{input[],output[]} over text/audio/image/video/pdf,
+  experimental, status(alpha|beta|deprecated|active), provider{npm,api}, options,
+  headers, variants(Record<String, StructWithRest({disabled?})>).
+* **MCP** (`config/mcp.ts:6-62`): local{type,command!,cwd,environment,enabled,timeout},
+  remote{type,url!,enabled,headers,oauth(OAuth|false),timeout},
+  oauth{clientId,clientSecret,scope,callbackPort(1..=65535),redirectUri}.
+* **LSP** (`config/lsp.ts:5-78`): entry is `{disabled: true}` | `{command!, extensions?,
+  disabled?, env?, initialization?}`, and the union carries a schema-level check —
+  a server id outside the **39** builtin ids must declare `extensions`. That id list
+  is copied verbatim into `schema::lsp::BUILTIN_SERVER_IDS`.
+* **Policy** (`packages/core/src/policy.ts:11-15` + `config/experimental.ts:9-14`):
+  `{action, effect, resource}`, all **required**; `effect` is allow|deny and `action`
+  is the single literal `"provider.use"` (from `Catalog.PolicyActions`).
+
+### Effect Schema constructs that do not map cleanly onto serde
+
+1. **`StructWithRest(A, [Record(String, X)])`** = named fields plus a typed
+   catch-all. serde's `#[serde(flatten)] map` is the equivalent, but it cannot
+   coexist with `deny_unknown_fields` on the same struct — which is fine, because
+   the oracle never denies where it writes a rest.
+2. **Unknown-key policy is per level, not global.** Top level: **hard error** —
+   `packages/opencode/src/config/parse.ts:40-53` runs its own `topLevelExtraKeys`
+   scan and throws `unrecognized_keys` *before* decoding. Nested: **silently
+   dropped**, because Effect's default `onExcessProperty` is `"ignore"`. Anything
+   stricter than that at a nested level would reject configs the real binary accepts.
+3. **`Schema.decodeTo(..., transform)`** (agent `normalize`, permission
+   `normalizeInput`) means decoding is not a pure projection — it rewrites the
+   value. The agent sweep is reproduced; the permission `"*"` expansion is offered
+   as a method instead, so the parsed value still records which form was written.
+4. **`Schema.Literal(false)`** needs a dedicated type; `bool` would accept `true`.
+   `schema::ordered::False` covers the two places it appears.
+5. **`Schema.Finite`** is a JS number, with no int/float distinction. `f64` is the
+   consequence, and re-serializing `272000` yields `272000.0`.
+6. **`PositiveInt` / `Int.isBetween(1, 65535)`** map exactly onto `NonZeroU32` /
+   `NonZeroU16` — no hand-written validator needed, and the error message is decent.
+7. **`propertyOrder: "original"`** (`config/parse.ts:55`) has no serde equivalent
+   and no `serde_json`/`indexmap` equivalent in this workspace. See issues.md — this
+   is the single most dangerous finding for todos 8 and 17.
+
+### `packages/web/src/content/docs/config.mdx` has 36 titled JSON blocks, not 33
+Three are titled `tui.json` and are the **TUI's own** config file — `theme`,
+`keybinds`, `attention`, `diff_style`, `mouse`, `scroll_acceleration`,
+`scroll_speed` are NOT `opencode.json` keys. Do not add them to `Config`.
+## Task 8
+- Verified ascending precedence from the 1.18.13 oracle: global config.json -> opencode.json -> opencode.jsonc (config.ts:246-260); OPENCODE_CONFIG (401-404); ancestor project opencode.json(c), outermost first and nearest last (406-410 plus paths.ts:10-21); config directories in Global.Path.config -> project .opencode nearest-first -> project ancestors -> HOME/.opencode -> OPENCODE_CONFIG_DIR order, with opencode.json before opencode.jsonc in each eligible directory (config.ts:416-465 plus paths.ts:23-40); OPENCODE_CONFIG_CONTENT (468-475); system managed opencode.json then opencode.jsonc (516-522); macOS managed preferences last and therefore overriding all config sources (524-534); OPENCODE_PERMISSION after all sources (545-551).
+- Post-processing verified from config.ts:553-584: tools produce permission defaults before explicit permission wins; username gets a fallback; disable-autocompact and disable-prune flags patch compaction.
+- instructions is the sole array exception: mergeConfigConcatArrays at config.ts:45-49 computes Array.from(new Set([...target.instructions, ...source.instructions])). Earlier/lower-precedence entries stay first, source entries append, and the first occurrence wins de-duplication. Every other array follows mergeDeep replacement semantics.
+- File-backed layers without $schema receive https://opencode.ai/config.json, matching config.ts:231-235; inline and managed-preference virtual sources do not trigger file mutation.
+
+
+## Task 9 — `{env:VAR}` / `{file:path}` substitution (`oc-config::variable`)
+
+Oracle: `packages/opencode/src/config/variable.ts:33-90`. Every rule below was
+established by **executing** the TypeScript module under bun 1.3.14, not by
+reading it. Probe transcripts: `.omo/evidence/task-9-opencode-rust.txt`.
+
+### The comment-skip rule, exactly (Todo 8 and Todo 12 must agree with this)
+
+Applies to `{file:...}` **only**. For a token at byte offset `i` in the
+already-env-expanded text: `line_start` = index of the last `\n` before `i`, plus
+one, else 0. Skip iff `js_trim_start(text[line_start..i])` starts with `//`. A
+skipped token is emitted verbatim and **its file is never read**, so a missing
+file inside a comment cannot fail the load.
+
+| text | skipped? |
+| --- | --- |
+| `  // {file:x}` | yes |
+| `/// {file:x}` | yes |
+| `\u{feff}// {file:x}` | yes — `trimStart` eats a BOM |
+| `\u{a0}// {file:x}` | yes |
+| CRLF comment line | yes |
+| `// {file:a} and {file:b}` | yes, **both** |
+| `{"a":1} // {file:x}` | **no** — a trailing comment is not a comment line |
+| `{"a":"// {file:x}"}` | **no** — `//` inside a JSON string value |
+| `/* {file:x} */` | **no** — block comments are not recognized at all |
+| `{\r  // {file:x}\r}` | **no** — `lastIndexOf("\n")` ignores a lone CR |
+| ` / {file:x}` | **no** — one slash is not a comment |
+
+### `{env:...}` IS substituted inside comment lines
+
+The env pass is one unconditional `String.replace` over the whole text with no
+comment check whatsoever; only the file pass has one. Measured: `//  {env:FOO}`,
+`{"a":1} // {env:FOO}` and `/* {env:FOO} */` all expand. The clearest case is
+`// {env:OC_X}{file:./rel.md}` → `// E{file:./rel.md}` — env expanded, file
+skipped, on the same line.
+
+**Consequence for Todo 8/12:** do not implement "skip tokens in comments" as one
+rule. It is `{file:}`-only. Anything that strips JSONC comments *before*
+substitution would also change behaviour, because the oracle strips comments
+*after* (`config.ts:220-227`: substitute → `ConfigParse.jsonc` → schema).
+
+### Escape rule
+
+`content = js_trim(lossy_utf8(bytes))`, emitted as `JSON.stringify(content)[1..-1]`
+— the **body** of a JSON string with no surrounding quotes, dropped between quotes
+that are already in the document. Escapes: `\"` `\\` `\b`(08) `\t`(09) `\n`(0A)
+`\f`(0C) `\r`(0D), and any other `c < 0x20` as `\u00xx` **lowercase** hex.
+Not escaped: `/`, U+007F (DEL), U+0085, all non-ASCII. Identical to
+`serde_json::to_string(s)[1..len-1]`, and a proptest in `variable.rs` proves the
+equality for arbitrary strings — reuse that trick rather than re-deriving the table.
+
+### Trim set is `String.prototype.trim`, **not** `char::is_whitespace`
+
+`09 0B 0C 20 A0 FEFF 1680 2000-200A 202F 205F 3000 0A 0D 2028 2029`. Two deltas
+against Rust, both observable in real files:
+
+* **U+FEFF** — JS trims it, Unicode `White_Space` does not. A prompt file saved
+  with a BOM loses it, and `\u{feff}// {file:x}` **is** a comment line.
+* **U+0085** (NEL) — Unicode `White_Space` does, JS does not, so it survives at
+  the edges where `str::trim` would have eaten it.
+
+Anywhere else in this port that mirrors a JS `.trim()` / `.trimStart()` has the
+same hazard. `is_js_whitespace` in `oc-config::variable` is the reference set.
+
+### Path resolution — three shapes, and the oracle is deliberately inconsistent
+
+* `~/rest` → `path.join(os.homedir(), rest)`, which **normalizes**.
+  `{file:~/../x}` with home `/config` reports `/x`.
+* absolute → used **verbatim, unnormalized**. `{file:/a/../b}` reports `/a/../b`
+  and the *kernel* resolves the `..`, so it is symlink-aware — unlike a textual
+  `path.resolve`. Normalizing it here would change both the reported path and,
+  under symlinks, which file is read.
+* anything else → `path.resolve(dirname(configFile), spec)`, which normalizes.
+  The base is the **config file's directory**, never `process.cwd()`.
+
+A bare `~` is not special: `{file:~}` resolves to `<configdir>/~`.
+`os.homedir()` is the real home — `OPENCODE_TEST_HOME` does **not** reach
+`variable.ts`, so `oc_paths::home()` (which honours it) is the wrong function here.
+With no usable `HOME`, `path.join("", "x") == "x"`, so a `~/` reference silently
+degrades to config-relative rather than failing.
+
+### Token grammar is two regexes and nothing more
+
+`/\{env:([^}]+)\}/g` and `/\{file:[^}]+\}/g`.
+
+* `{env:}` / `{file:}` are **not** tokens (`[^}]+` needs a character) — left literal.
+* Unterminated `{env:FOO` / `{file:x` — left literal.
+* A token may span a line break, a quote, anything but `}`. `{"a":"{env:FOO"}`
+  matches `{env:FOO"}` with the variable name `FOO"` and yields `{"a":"`.
+* `{env:{env:A}}` resolves the variable literally named `{env:A`, then a stray `}`.
+* Missing env var → **empty string** (`|| ""`), never an error, never the token.
+* The env pass runs first over the whole text, so an env value can supply a whole
+  `{file:}` token or part of a file path. A file **body** is not rescanned.
+* Read failures: ENOENT → `bad file reference: "<token>" <resolved> does not exist`;
+  any other failure (e.g. a directory) → `bad file reference: "<token>"` with no
+  suffix. `missing: "empty"` swallows **every** read failure, not just absence.
+
+## Orchestrator — plan corrected by Todo 9's investigation (comment-skip asymmetry)
+
+The plan's Todo 9 said "tokens appearing inside comment lines are not
+substituted". That is true for only one of the two token forms. Verified in
+`packages/opencode/src/config/variable.ts`:
+
+- `:36-38` — `{env:VAR}` is a single blanket `text.replace(/\{env:([^}]+)\}/g, ...)`
+  with **no line inspection at all**. Env tokens inside `//` comments ARE
+  substituted. Missing variable → `|| ""`, i.e. empty string, not an error.
+- `:47-61` — `{file:path}` iterates matches and, for each, checks
+  `text.slice(lineStart, index).trimStart().startsWith("//")`; if so the token is
+  emitted verbatim and skipped. Only file tokens honour comments.
+- `:87` — file content is `JSON.stringify(content).slice(1, -1)`: escaped but with
+  the surrounding quotes stripped, so it drops into an existing JSON string.
+- Order matters: the env pass runs to completion first, so a file path can be
+  built from an env variable (`{file:{env:HOME}/x.md}` works).
+
+Todo 9's implementation encodes the asymmetry with a test per side
+(`env_tokens_in_a_comment_line_are_substituted_too`,
+`file_tokens_on_a_comment_line_are_left_untouched`). The plan text has been
+corrected to match the oracle. Todo 8's JSONC parsing and Todo 12's differential
+must not "fix" this asymmetry — it is the compatible behaviour.
+
+## Orchestrator — plan corrected by Todo 9's investigation (comment-skip asymmetry)
+
+The plan's Todo 9 said "tokens appearing inside comment lines are not
+substituted". True for only ONE of the two forms. Verified in
+`packages/opencode/src/config/variable.ts`:
+
+- `:36-38` — `{env:VAR}` is a single blanket `text.replace(/\{env:([^}]+)\}/g, ...)`
+  with **no line inspection**. Env tokens inside `//` comments ARE substituted.
+  Missing variable → `|| ""`, i.e. empty string, never an error.
+- `:47-61` — `{file:path}` iterates matches and per match checks
+  `text.slice(lineStart, index).trimStart().startsWith("//")`; if so the token is
+  emitted verbatim. Only file tokens honour comments.
+- `:87` — content is `JSON.stringify(content).slice(1, -1)`: escaped, quotes
+  stripped, so it drops into an existing JSON string.
+- Order matters: the env pass completes first, so a file path can be built from an
+  env variable.
+
+Todo 9 encoded the asymmetry with a test per side
+(`env_tokens_in_a_comment_line_are_substituted_too`,
+`file_tokens_on_a_comment_line_are_left_untouched`). The plan text is corrected.
+**Todo 12's differential must not "fix" this asymmetry — it is the compatible
+behaviour.**
+
+## Task 11
+
+Oracle read in full: `packages/opencode/src/session/instruction.ts` (237 lines), the walk/glob primitives at `packages/core/src/fs-util.ts:147-198`, and the upstream behavioural spec `packages/opencode/test/session/instruction.test.ts` (264 lines). Every rule below is quoted from those, not from the task summary — and two of them contradict the summary.
+
+### The filename cascade: "first class" means first class over the WHOLE ancestor range, not per level
+
+`instruction.ts:123-133`:
+
+```
+for (const file of instructionFiles) {
+  const matches = yield* fs.findUp(file, ctx.directory, ctx.worktree)
+  if (matches.length > 0) { matches.forEach((i) => paths.add(path.resolve(i))); break }
+}
+```
+
+`findUp` (`fs-util.ts:154-166`) is **not** a first-hit search: it walks `start` upward, pushes `join(current, target)` for *every* level where it exists, and checks `stop === current` **after** searching, so `stop` (the worktree) is inclusive. It returns all matches.
+
+Exact rule, verbatim: *for each filename class in order (`AGENTS.md`, then `CLAUDE.md` when Claude compatibility is on, then upstream's `CONTEXT.md`), scan the entire ancestor range `directory ..= worktree`; the first class with at least one hit anywhere in that range wins; all of its hits at every level are loaded; no later class is looked for at all.*
+
+Two consequences the "per level" reading gets backwards:
+1. An `AGENTS.md` at a **deep** level suppresses a `CLAUDE.md` at a **shallower** level. The decision is never per level.
+2. Within the winning class, ancestor levels **do** stack — `a/b/AGENTS.md` and `a/AGENTS.md` are both loaded, deepest first. **The task prompt's "do not stack every ancestor level" is wrong as written.** Upstream's own comment ("so we don't stack AGENTS.md/CLAUDE.md from every ancestor", `:122`) is about not stacking different *filename classes*; `matches.forEach(...)` at `:129` provably stacks levels of the winning class.
+
+`Instruction.find` (`:171-177`) is the *other* shape and the only per-level one: one directory, first class present wins, returns a single path. That is what the upward append uses.
+
+### Global is ALSO first-wins — at most ONE global file is ever loaded
+
+`instruction.ts:115-120` loops `globalFiles = [$CONFIG/AGENTS.md, $HOME/.claude/CLAUDE.md]` (`:60-63`) and `break`s on the first that exists. **The task prompt's "Global: `$CONFIG/AGENTS.md`, then optional `~/.claude/CLAUDE.md`" reads as if both load; they do not.** If `$CONFIG/AGENTS.md` exists, `~/.claude/CLAUDE.md` is never stat'd. Confirmed by the upstream test at `instruction.test.ts:213-230`, which gets exactly 2 blocks (one global + one project) with `rules[0]` global and `rules[1]` project — global first in output order.
+
+`disableClaudeCodePrompt` removes `CLAUDE.md` from **both** lists (`:62` and `:66`), verified by `instruction.test.ts:232-248`.
+
+### Upward append: ordering and the four dedup rules
+
+`instruction.ts:179-221`. Root is `InstanceState.directory` (not worktree). `current = dirname(target)`, loop bound `while (current.startsWith(root) && current !== root)` — so **the root directory itself is excluded**; that is not a gap, because root's own instruction file is already in `systemPaths` and would be filtered anyway.
+
+Ordering: entries are `push`ed (`:214`), so parent instructions are appended **at the end**, deepest ancestor first, shallowest last.
+
+Four things make an entry "the same" and skip it — `:196` and `:206`: (1) `found === target`, the file being read; (2) `sys.has(found)`, already in `systemPaths`; (3) `already.has(found)`, an earlier `read` tool call reported it in `state.metadata.loaded` (`extract`, `:17-32`); (4) the per-`messageID` claim set already holds it. Rule (4) is what makes a parent `AGENTS.md` attach **once**, not once per level and not once per read. `Instruction.clear` (`:105-108`) drops the claim set. All four verified by `instruction.test.ts:115-207`.
+
+Note this is a *different* dedup key from Todo 8's merged-array dedup: Todo 8 dedups `instructions[]` by **raw string** before resolution (`discovery_instructions_keep_earlier_entries_first_and_deduplicate`); the loader dedups by **resolved absolute path** afterwards, in one insertion-ordered set shared by global + project + glob results (`instruction.ts:113`, a JS `Set`).
+
+### Concurrency and timeout, with oracle lines
+
+`instruction.ts:162` local reads `{ concurrency: 8 }`; `:163` remote fetches `{ concurrency: 4 }`; `:97` `Effect.timeout(5000)` per fetch. Failure handling: `:92` read errors catch to `""`, `:98` fetch errors/timeouts catch to `null`, `:100` null body becomes `""`, and `:166-167` drop empty strings from the output. So a failed or empty instruction is silently absent and **never** aborts the load.
+
+One upstream weakness worth knowing: the 5s bound covers only `http.execute` (headers). The body read at `:101` is unbounded, so a server that answers headers and then stalls the body hangs upstream forever. "Abandoned at 5s" is only true if the whole operation is bounded.
+
+### instructions[] resolution, three shapes
+
+`instruction.ts:135-150`. URLs (`http://`/`https://`, case-sensitive prefix match, `:137`/`:158-160`) are skipped in the path pass and fetched separately. `~/` is rewritten as `join(global.home, raw.slice(2))` (`:138`). Then:
+- **absolute** entry → `glob(basename(instruction), { cwd: dirname(instruction), absolute: true, include: "file" })` (`:141-145`) — note it globs only the **basename**, and passes **no `dot` option**, so dotfiles are excluded;
+- **relative** entry → `globUp(instruction, ctx.directory, ctx.worktree)` (`:83`), which globs at every ancestor level with `dot: true` (`fs-util.ts:188`) and inclusive `stop`;
+- with `OPENCODE_DISABLE_PROJECT_CONFIG`, the relative branch instead globs `globUp(instruction, global.config, global.config)` (`:87`) and the whole project cascade is skipped (`:123`).
+
+Output block format, exact: `Instructions from: {source}\n{content}` (`:166-167`, and `:214` for the append). Output order: global, then project cascade deepest-first, then `instructions[]` glob matches in config order, then remote URLs in config order.
+
+## Task 10 — the ten deprecated config forms, verified in the oracle
+
+Every form below was confirmed by reading the oracle tree at
+`/config/workspace/ProdDir/AI/opencode`. None of the plan's ten turned out to be
+mis-classified; all ten are genuinely deprecated upstream.
+
+| # | Form | Oracle proof | Already covered? |
+|---|---|---|---|
+| 1 | `mode.<name>` | `packages/core/src/v1/config/config.ts:95` — ``@deprecated Use `agent` field instead.``; normalized at `packages/opencode/src/config/config.ts:536-543` (spreads each entry into `agent` and forces `mode:"primary"`) | **Todo 7 rejected it** as `unrecognized key` (not a `Config` field + `deny_unknown_fields`); Task 10 supplies the actionable message |
+| 2 | a `{mode,modes}/` agent directory | `packages/opencode/src/config/agent.ts:32-58` — `loadMode` globs `{mode,modes}/*.md` and forces `mode:"primary"`; the modern loader at `:11-30` globs `{agent,agents}/**/*.md` | **new in Task 10** |
+| 3 | agent `tools: {..}` | `packages/core/src/v1/config/agent.ts:68-77` — folds each entry into `permission`, with `write`/`edit`/`patch` **all collapsing to `permission.edit`** | **new in Task 10.** Todo 7 only kept it out of the provider-options sweep (`SWEEP_EXEMPT_KEYS`); nothing rejected it |
+| 4 | agent `maxSteps` | `packages/core/src/v1/config/agent.ts:79` — `const steps = agent.steps ?? agent.maxSteps` | **new in Task 10** (same as above: exempted from the sweep, never rejected) |
+| 5 | `layout` | `packages/core/src/v1/config/config.ts:127` — `@deprecated Always uses stretch layout.` | **Todo 7 rejected it**; Task 10 supplies the message |
+| 6 | `autoshare` | `packages/core/src/v1/config/config.ts:61-63` — ``@deprecated Use 'share' field instead.``; applied at `packages/opencode/src/config/config.ts:578-580` (`autoshare === true` → `share: "auto"`) | **Todo 7 rejected it**; Task 10 supplies the message |
+| 7 | `CONTEXT.md` | `packages/opencode/src/session/instruction.ts:68` — the oracle's own trailing comment is literally `// deprecated` | **new in Task 10** |
+| 8 | a global TOML `config` file | `packages/opencode/src/config/config.ts:262-275` — `existsSync(path.join(Global.Path.config, "config"))`, imported `with { type: "toml" }`, then **written to `config.json` and `unlink`ed** | **new in Task 10** |
+| 9 | `reference` (singular) | `packages/core/src/v1/config/config.ts:48-50` — ``@deprecated Use 'references' field instead.`` | **new in Task 10.** Todo 7 deliberately *accepted* it (it is in `KNOWN_TOP_LEVEL_KEYS` with a doc comment saying it is "not on the legacy-rejection list"). The plan does list it, so Task 10 rejects it in the legacy pass while the schema keeps parsing it — see decisions.md |
+| 10 | auth-prompt `condition` | `packages/plugin/src/index.ts:102-103` (text prompt) and `:115-116` (select prompt) — ``/** @deprecated Use `when` instead */`` on both shapes | **new in Task 10** |
+
+Score: **3 of 10 already rejected** by Todo 7 (`mode`, `layout`, `autoshare` — all
+three as top-level unknown keys, message `unrecognized key`), **7 newly detected**
+here.
+
+Two further oracle facts worth keeping:
+
+* Top-level `tools` is **not** deprecated (`core/v1/config/config.ts:129`, folded
+  into `permission` at `opencode/config/config.ts:565-576`). Only the **agent-level**
+  `tools` is. Rejecting the top-level one would be a false positive.
+* `mode` inside an *agent* definition (`agent.build.mode = "primary"`) is the
+  modern, correct key (`core/v1/config/agent.ts:26`). Only the **top-level** `mode`
+  map is deprecated. The two are one character apart in a config file and easy to
+  conflate.
+
+## Task 11 — instruction discovery and the `instructions[]` loader
+
+### The filename cascade: "first class wins" means the first *filename*, not the first *file*
+
+The plan's prose ("stop at the first filename class found — do not stack every
+ancestor level") reads as if only one file is ever loaded. **The oracle does not
+do that**, and the difference is observable on any monorepo.
+`packages/opencode/src/session/instruction.ts:122-131`:
+
+```ts
+// The first project-level match wins so we don't stack AGENTS.md/CLAUDE.md from every ancestor.
+if (!Flag.OPENCODE_DISABLE_PROJECT_CONFIG) {
+  for (const file of instructionFiles) {
+    const matches = yield* fs.findUp(file, ctx.directory, ctx.worktree)   // :124
+    if (matches.length > 0) {
+      matches.forEach((item) => paths.add(path.resolve(item)))            // :128
+      break                                                              // :129
+    }
+  }
+}
+```
+
+`findUp` (`packages/core/src/fs-util.ts:154-166`) returns **every** ancestor level
+that holds `target`, nearest first. So the `break` only stops the loop from
+trying the *next filename*; all levels of the winning filename are added. The
+oracle's own comment is about not mixing `AGENTS.md` with `CLAUDE.md`, not about
+collapsing the levels. Concretely, with `directory=repo/sub`, `worktree=repo`:
+
+| tree | loaded |
+| --- | --- |
+| `repo/AGENTS.md` + `repo/sub/AGENTS.md` | **both** |
+| `repo/AGENTS.md` + `repo/sub/CLAUDE.md` | only `repo/AGENTS.md` (a nearer `CLAUDE.md` loses to a further `AGENTS.md`) |
+| `repo/CLAUDE.md` + `repo/sub/CLAUDE.md` | **both** |
+| `repo/AGENTS.md` + `repo/CLAUDE.md` (same dir) | only `AGENTS.md` |
+
+Reproduces the Todo 9 lesson: the plan prose was imprecise, the oracle decided it.
+Tests `the_first_filename_class_wins_and_claims_every_level` and
+`a_nearer_claude_md_does_not_beat_a_further_agents_md` pin all four rows.
+
+**The global probe is a different rule.** `instruction.ts:115-120` loops over
+`globalFiles` and `break`s on the first that *exists*, so **at most one** global
+file is ever loaded — `$CONFIG/AGENTS.md`, else `~/.claude/CLAUDE.md`, never both.
+Two "first wins" rules, opposite shapes; do not merge them.
+
+### The flag that disables Claude compatibility
+
+`flags.disableClaudeCodePrompt` (`instruction.ts:62` and `:66`), defined in
+`packages/opencode/src/effect/runtime-flags.ts:23-26` as the OR of two variables:
+
+- `OPENCODE_DISABLE_CLAUDE_CODE` (broad — also gates `disableClaudeCodeSkills`)
+- `OPENCODE_DISABLE_CLAUDE_CODE_PROMPT` (targeted)
+
+Either one drops `~/.claude/CLAUDE.md` from the global candidates **and**
+`CLAUDE.md` from the project cascade. Both are exported as public constants.
+
+### How the upward append de-duplicates
+
+`Instruction.resolve` (`instruction.ts:179-220`) is a *separate* mechanism from
+the cascade, triggered when a file is read mid-session. It walks up from
+`dirname(target)` and calls `find(dir)` — the first cascade filename **in that
+one directory**, no walk — then applies **four** independent skips (`:186-206`):
+
+1. `found === target` — never attach the file being read;
+2. `sys.has(found)` — the system set already paid for it;
+3. `already.has(found)` — a completed `read` tool call this session already
+   loaded it (`extract()` at `:17-31` mines `part.state.metadata.loaded`,
+   skipping compacted parts);
+4. `set.has(found)` where `set = claims.get(messageID)` — this assistant message
+   already attached it.
+
+Guard 4 is the per-message ledger (`state.claims`, `:74`, cleared by
+`Instruction.clear`, `:105-108`). Reading `pkg/src/main.rs` then `pkg/src/lib.rs`
+in one message attaches `pkg/AGENTS.md` **once** — that is what makes it exactly
+once rather than once per file read. This port hands the ledger to the caller as
+`UpwardClaims` so the property is assertable instead of hidden in service state.
+
+The loop bound is `current.startsWith(root) && current !== root` (`:187`) where
+`root = resolve(InstanceState.directory)` — the **directory**, not the worktree,
+and a **string prefix**, not an ancestry test. `/repo` therefore treats
+`/repo-vendor` as inside it. Reproduced deliberately; a "fix" here would be a
+differential divergence.
+
+### Bun glob semantics that `globset` does not give you for free
+
+- `*` must not cross `/` → `GlobBuilder::literal_separator(true)`. The default
+  lets `*.md` match `docs/nested/x.md`.
+- `globUp` runs the pattern once **per ancestor directory up to `/`**
+  (`fs-util.ts:184-199`). A recursive scan for a literal `AGENTS.md` would walk
+  every sibling of every ancestor — near `/` that is the whole disk. A literal
+  pattern must short-circuit to an existence check.
+- `globUp` passes `dot: true`, but the absolute-entry branch (`instruction.ts:141-146`)
+  does not, so a dotfile-hiding rule is needed for the latter only.
+
+## Task 10 — the ten deprecated forms, each verified against the oracle
+
+Every form below was re-verified in `/config/workspace/ProdDir/AI/opencode` rather
+than taken from the plan. Two of the plan's claims were wrong; both are flagged.
+
+| # | Deprecated form | Modern replacement | Oracle proof | Detectable from config text? | Test |
+|---|---|---|---|---|---|
+| 1 | top-level `mode.<name>` | `agent.<name>` with `mode: "primary"` | schema `core/src/v1/config/config.ts:90-92` (`@deprecated Use \`agent\` field instead.`); normalization `opencode/src/config/config.ts:536-543` | yes | `mode_block_names_the_agent_replacement` |
+| 2 | a `{mode,modes}/` agent directory | `agent/` (or `agents/`) | `opencode/src/config/agent.ts:37` globs `{mode,modes}/*.md`; the modern loader at `:13` globs `{agent,agents}/**/*.md` | **no — filesystem fact** | `mode_directory_names_the_agent_directory`, `the_plural_modes_directory_is_rejected_too` |
+| 3 | agent `tools: {..}` | `permission` | schema `core/src/v1/config/agent.ts:21-23`; conversion `:68-77` | yes | `agent_tools_names_permission` |
+| 4 | agent `maxSteps` | `steps` | schema `core/src/v1/config/agent.ts:37`; fallback `:79` (`agent.steps ?? agent.maxSteps`) | yes | `agent_max_steps_names_steps` |
+| 5 | top-level `layout` | removed, no replacement | `core/src/v1/config/config.ts:127` — `@deprecated Always uses stretch layout.` | yes | `layout_is_reported_as_removed` |
+| 6 | top-level `autoshare` | `share` (`true` → `"auto"`) | schema `core/src/v1/config/config.ts:61-63`; runtime `opencode/src/config/config.ts:575-577`; migration `core/src/v1/config/migrate.ts:42` | yes | `autoshare_names_share` |
+| 7 | a discovered `CONTEXT.md` | `AGENTS.md` | `opencode/src/session/instruction.ts:64-68`, with the oracle's own `// deprecated`; first-class-wins at `:124-132` | **no — filesystem fact** | `context_file_names_agents_md` |
+| 8 | a global TOML `config` file | `config.json` | `opencode/src/config/config.ts:262-275` | **no — filesystem fact** | `toml_config_names_config_json` |
+| 9 | top-level `reference` | `references` | schema `core/src/v1/config/config.ts:47-49`; fallback `core/src/v1/config/migrate.ts:65` (`info.references ?? info.reference`) | yes | `reference_names_references` |
+| 10 | auth-prompt `condition` | `when`, a `{ key, op, value }` rule | type `plugin/src/index.ts:102-104`, repeated at `:115-117`, `:131-133`, `:145-147`; evaluated `opencode/src/cli/cmd/providers.ts:68-77` | **no — runtime JS closure** | `auth_prompt_condition_names_when` |
+
+### Corrections to the plan's description of these forms
+
+- **Form 8 is not `config.toml`.** `config.ts:262` joins the global config dir with
+  the bare literal `"config"` — no extension — and parses it with a dynamic
+  `import(..., { with: { type: "toml" } })`. A detector that looked for
+  `config.toml` would find nothing. `LEGACY_TOML_CONFIG_FILE = "config"`.
+- **Form 10 is not a value a config file can hold.** `condition` is typed
+  `(inputs: Record<string, string>) => boolean` — a closure — while its replacement
+  `when` is a static `Rule` object. A closure has no JSON encoding, so scanning
+  config text for `condition` proves nothing about whether a plugin uses it. It is
+  also *not* a config key at all: it is a field of
+  `AuthHook.methods[].prompts[]`, read only during `auth login`.
+- **Form 2's globs differ in depth, not just in name.** The legacy glob
+  `{mode,modes}/*.md` is flat; the modern `{agent,agents}/**/*.md` recurses. So an
+  `.md` nested two levels under `mode/` was never loaded by the oracle either, and
+  rejecting it would be a false positive. `inspect_directory` therefore reports only
+  `*.md` directly inside `mode/` or `modes/`.
+- **Form 1 merges, it does not overwrite.** `mergeDeep(result.agent ?? {}, {[name]: {...mode, mode: "primary"}})`
+  spreads the legacy entry *into* `agent`, and the spread order means a `mode`
+  field inside the legacy block is overwritten by `"primary"`. Because the whole
+  entry is spread verbatim, a `mode.build.maxSteps` is **two** deprecated inputs;
+  `inspect_config` scans `mode.*` for agent-level forms as well as `agent.*`, so the
+  author is not sent round the loop twice.
+- **Form 3's collapse is lossy and worth saying in the message.** `write`, `edit`,
+  and `patch` all map onto the single `permission.edit` key
+  (`core/src/v1/config/agent.ts:71-74`), so `tools: {write: false, patch: true}`
+  cannot be expressed as two rules. `true` → `"allow"`, `false` → `"deny"`.
+- **Forms 4, 5, 6, 9 are not normalized in `config.ts:545-584`.** That block only
+  handles `OPENCODE_PERMISSION`, top-level `tools`, `username`, `autoshare`, and the
+  compaction flags. `maxSteps` is resolved in the agent decoder, and `reference` in
+  the v1 migration. Citing `:545-584` for all of them would have been wrong.
+
+## Wave 15 research — hermes-agent memory architecture (source of the added scope)
+
+Source: `NousResearch/hermes-agent` @ `a6e1e270b1103cc026275419a21ba9b5f581f96b`, cloned to
+`.omo/refs/hermes-agent/`. Candidate identification was real work: `NousResearch/Hermes`
+is **404**; the agent lives at `NousResearch/hermes-agent` ("The agent that grows with
+you", 225k stars, active 2026-08-05). `letta-ai/letta` (MemGPT) exists and has
+core/recall/archival tiers, but hermes deliberately does NOT copy that split — and its
+divergence is the interesting part.
+
+**Storage — two unrelated things, not one system.**
+- Curated memory = two Markdown files, `$HERMES_HOME/memories/{MEMORY.md,USER.md}`
+  (`tools/memory_tool.py:53`), entries split by `"\n§\n"` (`:67`), capped in
+  **characters** (2200 + 1375, `:165`) because "char counts are model-independent"
+  (`:22`). Config records the equivalence: ~800 + ~500 tokens
+  (`cli-config.yaml.example:691-693`). **Total resident budget ≈ 1300 tokens.** That cap
+  IS the design; an uncapped store becomes a log the model ignores.
+- Session archive = SQLite schema v25 (`hermes_state_common.py:155`) with
+  `messages.active` / `.compacted` flags — compacted messages are **marked, never
+  deleted** (`:185`), so the archive stays complete. Retrieval is **FTS5
+  external-content** (`:403`) plus a **trigram** table for CJK (`:467`) built excluding
+  `role='tool'`, because the trigram index costs ~2.6x the text it covers while tool rows
+  are ~90% of bytes and near-pure noise (`:456-466`).
+
+**No vector store in the official path.** Even the bundled `plugins/memory/holographic`
+is SQLite+FTS5 with `auto_extract: false` by default. LanceDB / mem0 / supermemory are
+external plugins, and `MemoryManager` allows only **one** at a time to avoid tool-schema
+bloat (`agent/memory_provider.py:6-9`).
+
+**Write path — three independent mechanisms.**
+1. Explicit `memory` tool (`tools/memory_tool.py:1152`). Three properties worth copying
+   verbatim: only `add`/`replace`/`remove`; `replace`/`remove` locate by **short unique
+   substring**, not ID (no ID bookkeeping for the model); **batch is atomic and the cap is
+   checked only on the FINAL result**, which is the only way "it's full" has a solution —
+   one call can delete stale entries and add a new one. Its SKIP list explicitly excludes
+   task progress / completed-work logs / TODO state, pointing at session_search instead:
+   the guardrail that stops memory degenerating into a log.
+2. Every-N-turns nudge, default 10 (`agent/turn_context.py:584`).
+3. **Background review fork** — the actual innovation
+   (`agent/background_review.py:1-17`): "Main conversation and prompt cache are never
+   touched." Spawned only after the response is delivered
+   (`agent/turn_finalizer.py:714-724`, guarded on `final_response and not interrupted`,
+   wrapped in `except Exception: pass`), with a **tool whitelist** of memory/skill only and
+   a runtime deny message (`:893-909`), and `compression_enabled = False` (`:881`).
+
+**Read path — the frozen snapshot is the key mechanism.** Both files are injected into the
+system prompt **as a snapshot taken at session start**; mid-session writes hit disk
+immediately but do NOT change the prompt (`tools/memory_tool.py:12-16`, `:682`). This
+single choice buys three things: prefix cache survives the session, the prompt is
+byte-stable, and **memory can never be summarized away because it was never in the message
+stream**. The compaction path re-verifies that the *currently rendered* blocks appear
+verbatim in the cached prompt and that no stale header remains
+(`agent/conversation_compression.py:211`) — comparing rendered-vs-cached, not
+snapshot-vs-snapshot, because the latter locks stale memory for a whole session in any
+fresh-agent path. Injected block carries a live usage header:
+`MEMORY (your personal notes) [63% — 1,390/2,200 chars]` (`:731`).
+
+**Consolidation, and the anti-thrash details.** No auto-eviction: a full store refuses the
+add and shows current entries. A **3-failures-per-turn circuit breaker** returns a terminal
+error telling the model to stop and continue its reply, because "a failed memory side
+effect must never block the turn's reply" (`:161-201`). Success responses deliberately do
+NOT echo all entries — doing so was observed causing 5 redundant repeat batches
+(`:717-723`). Writes are injection-scanned with a strict ruleset (`:86`) since memory
+enters the system prompt and persists; external drift is detected and refused with a
+`.bak.<ts>` (`:807`).
+
+**"Continuous learning" is real, but it lives in the SKILLS layer, not the memory layer.**
+Memory is fact storage; the writable skill library is where a turn gets distilled into a
+reusable rule (`agent/background_review.py:346-352`: memory says "who the user is and what
+state operations are in", skills say "how to do this class of task"). The load-bearing
+safety valve is the **do-not-learn list** (`:274-300`): never record
+environment-dependent failures, never record negative claims about tools ("X is broken"
+hardens into a refusal the agent cites at itself for months after the fix), never record
+transient errors that self-resolved, never record one-off narratives, and **never write up
+an unresolved failure as a working procedure** — that hands a future session an untested
+sequence of failures as validated guidance.
+
+**Comparison — omo notepads.** `dist/index.js:114960` defines exactly four files
+(learnings/decisions/issues/problems) scaffolded with `flag: "wx"` (never overwrite,
+`:114991`), read by the orchestrator via glob+Read and injected as "Inherited Wisdom",
+writes forced append-only by a hook. **Plan-scoped working memory, not cross-session
+learning** — no retrieval, no consolidation, no reflection. But its four-way semantic split
+and its append-only hard rule are worth keeping; that split is exactly what a coding agent
+needs to survive across turns.
+
+**Comparison — upstream opencode: NO PERSISTENT MEMORY, definitively.**
+`find packages -iname '*memor*'` → only `app/src/context/tab-memory.ts` (UI tab state). No
+memory tool in the registry. Instruction loading is read-only
+(`session/instruction.ts:60-68`); skill discovery's only write is a `.opencode-version`
+cache marker. `grep -rn "reflect|learning|distill"` → two noise hits. Compaction produces a
+fixed five-section summary into the **message stream**, never to disk
+(`core/src/session/compaction.ts:15`), so the next session knows nothing of the last one.
+**Consequence for this project: Wave 15 has no upstream contract to match, so it is a
+declared divergence rather than a compatibility risk — and it must be gateable.**
+
+**Judgment adopted into the plan.** Load-bearing: character cap the model can see; frozen
+snapshot; post-response review fork with a write-only whitelist; the do-not-learn list.
+Explicitly out of scope as decoration for this project: vector store (retrieval targets
+here are identifiers/paths/error codes/commit hashes, where lexical beats semantic, and an
+embedding dependency would break the self-contained-binary requirement), MemGPT's paging
+archival API, the pluggable provider abstraction, and the 7-day curator daemon.
+
+## Task 12
+
+- `--pure` is parsed by the top-level CLI at `packages/opencode/src/index.ts:62-71`, which writes `OPENCODE_PURE=1`; `packages/opencode/src/cli/cmd/debug/index.ts:65-67` reports `external plugins disabled (--pure)`, and `packages/opencode/src/plugin/tui/runtime.ts:1088-1106` turns only the external plugin origin list into `[]` while retaining internal plugins. Oracle config diffs prove that neither `--pure` nor `OPENCODE_PURE=true` suppresses any config layer.
+- Config-related truth parsing is not uniform at the process boundary. `OPENCODE_DISABLE_PROJECT_CONFIG=TRUE` follows `Flag.truthy` and is accepted case-insensitively, while the real 1.18.12 command rejects `OPENCODE_PURE=TRUE` and `TrUe` through its Effect boolean schema before the command runs. Lowercase `true` and `1` are accepted.
+- Both the installed oracle (`1.18.12`) and the source oracle (`1.18.13`, commit `aefaf140c1`, self-reporting `local`) exhibit the same `OPENCODE_PERMISSION` new-key ordering: remeda emits new keys in reverse source order.
+## Task 16
+
+- Oracle wildcard semantics (`packages/core/src/util/wildcard.ts:3-13`): normalize every `\\` to `/`; escape regex metacharacters as literals; translate `*` to any number of UTF-16 code units and `?` to exactly one UTF-16 code unit; anchor the whole match; enable dot-all; treat a trailing `" *"` as an optional space plus arguments so `git *` matches both `git` and `git push`; matching is case-insensitive only on Windows.
+- Permission keys use the same wildcard matcher as value patterns (`packages/opencode/src/permission/index.ts:28-37`). The explicit config key set is `read, edit, glob, grep, list, bash, task, external_directory, todowrite, question, webfetch, websearch, lsp, doom_loop, skill`; `StructWithRest` means arbitrary custom keys remain valid.
+- `reject` resolves the selected pending first, then rejects every remaining pending with the same `sessionID`, regardless of permission or pattern. Optional correction feedback applies only to the selected request; sibling rejections have no feedback (`index.ts:121-139`).
+- `always` first resolves the selected pending, appends an `allow` runtime rule for each selected `always` pattern using the selected permission, then clears only same-session pendings whose every pattern evaluates to `allow` against the runtime-approved rules alone. Other sessions, different permissions, and partially covered pattern lists remain pending (`index.ts:142-166`).
+- Todo 12 key-order allow-list reasoning does not hold generally. Outer config keys can overlap because permission keys themselves are wildcard patterns (for example `bash` and `*`), so reversing newly-added `OPENCODE_PERMISSION` keys can change the winning rule.
+
+## Task 18 — references / formatter / lsp union arms
+
+- `references` (`packages/core/src/config/reference.ts:18`) is `Record(String, Union([String, Git, Local]))` — 3 arms: bare string; `Git {repository, branch?, description?, hidden?}` (`:5-10`); `Local {path, description?, hidden?}` (`:12-16`). The bare-string arm carries no `description`/`hidden`, so the shorthand is unclassifiable at config level — kept verbatim for the loader.
+- `formatter` (`packages/core/src/v1/config/formatter.ts:12`) is `Union([Boolean, Record(String, Entry)])` — 2 arms; `Entry` (`:5-10`) has all four fields optional, so `{"gofmt":{}}` is valid.
+- `lsp` (`packages/core/src/v1/config/lsp.ts:76`) is `Union([Boolean, Record(String, Entry)])` — 2 outer arms; `Entry` (`:7-18`) is itself `Union([{disabled: Literal(true)}, {command, extensions?, disabled?, env?, initialization?}])` — 2 inner arms. **7 arms total** as the plan says (3 + 2 + 2), plus the inner union which the plan counted inside the lsp 2. I tested 3 + 2 + 2 outer/inner explicitly = 10 round-trip tests.
+- Surprising: **absent means disabled** for both `formatter` and `lsp`. The runtime gates on truthiness — `if (!cfg.formatter)` (`packages/opencode/src/format/index.ts:120`) and `if (!cfg.lsp)` (`packages/opencode/src/lsp/lsp.ts:151`) — and no default is merged in; opencode's own tests set `{lsp: true}` / `{formatter: true}` explicitly.
+- Surprising: `ruff` and `uv` are one backend, so disabling **either** disables **both** (`format/index.ts:138-143`), and a `ruff` override is dropped when `uv` is disabled.
+- Surprising: the runtime removes a server on *truthy* `disabled`, and an object arm **enables the built-ins first** and only then applies overrides (`lsp.ts:155-181`) — so an unmentioned built-in is enabled, not disabled.
+- The 38 built-in LSP server ids (`lsp.ts:22-61`) include the space-bearing id `"php intelephense"`.
+- Plan claim checked and **partly wrong**: the prompt says "todo 10 rejects the singular `reference`". The *oracle schema* accepts it (`packages/core/src/v1/config/config.ts:48-50`, `@deprecated`) and todo 7 keeps the field so a layer still parses; todo 10's legacy pass is what rejects it (`oc-config/src/legacy.rs:302-307`). Both are true at different layers. My resolution layer reads only `references`.
+
+## Task 13 — agent loading from config and markdown
+
+### The name-derivation rule, verified against the real binary (not inferred)
+
+An agent's name is its path **relative to the config directory**, minus the
+`agent/` or `agents/` prefix and minus the extension. Oracle:
+`packages/opencode/src/config/agent.ts:22` calling
+`configEntryNameFromPath` at `packages/opencode/src/config/entry-name.ts:14-18`.
+
+Verified empirically with `opencode agent list` on opencode 1.18.12, sealed temp
+HOME/XDG:
+
+| file | agent name |
+|---|---|
+| `$XDG_CONFIG_HOME/opencode/agent/review/security.md` | `review/security` (**not** `security`) |
+| `<project>/.opencode/agent/deep/nested/thing.md` | `deep/nested/thing` (**not** `thing`) |
+| `$XDG_CONFIG_HOME/opencode/agent/flat.md` | `flat` |
+
+Three details that only the oracle source states, all reproduced:
+
+* The prefix match is **anchored** to the relative path. `entry-name.ts:11-12`
+  carries an upstream comment: matching the prefix anywhere in an *absolute* path
+  mis-keyed agents whose home/parent directories happened to contain a segment
+  called `agent` (upstream issue #25713). A path with no matching prefix falls
+  back to `path.basename`.
+* `agent/` is tried **before** `agents/`, so `agents/agent/x.md` is `agent/x`,
+  not `x`.
+* Only the final extension is stripped, and a leading dot is not an extension:
+  `agent/a.tar.md` -> `a.tar`, `agent/.hidden` -> `.hidden`.
+
+**A frontmatter `name:` key overrides the derived name entirely.** The oracle
+spreads `md.data` *over* the derived name (`config/agent.ts:24-28`) and then keys
+the result map on the result (`:29`). Verified: `agent/original.md` carrying
+`name: renamed-by-frontmatter` listed as `renamed-by-frontmatter`, and `original`
+did not appear at all.
+
+### The seven built-ins, with the oracle line for each
+
+`packages/opencode/src/agent/agent.ts`:
+
+| agent | oracle lines | mode | hidden | prompt | note |
+|---|---|---|---|---|---|
+| `build` | `:142-156` | primary | no | none | description only |
+| `plan` | `:157-181` | primary | no | none | description only |
+| `general` | `:182-195` | subagent | no | none | description only |
+| `explore` | `:196-217` | subagent | no | `prompt/explore.txt` | |
+| `compaction` | `:218-232` | primary | **yes** | `prompt/compaction.txt` | no description |
+| `title` | `:233-248` | primary | **yes** | `prompt/title.txt` | `temperature: 0.5` |
+| `summary` | `:249-263` | primary | **yes** | `prompt/summary.txt` | no description |
+
+`build`, `plan`, and `general` genuinely have **no prompt** — that is part of
+their definition, not an omission. Only `title` sets a temperature. The four
+prompt files were copied byte-for-byte (`md5sum`-verified at import) rather than
+retyped; a test pins their exact byte lengths (823 / 871 / 648 / 2120) and anchor
+phrases, because a truncated built-in prompt changes agent behaviour silently.
+
+### Override precedence, confirmed
+
+* A user definition **overrides** a built-in field-by-field with `??` semantics
+  (`agent.ts:280-293`): an override that sets only `model` keeps the built-in's
+  prompt, temperature and hidden flag. Verified Rust-side and against the binary
+  (`plan` given `mode: all` printed as `plan (all)`).
+* **An overridden built-in stays native.** `agent list` sorts natives first
+  (`cli/cmd/agent.ts:241-246`); an overridden `plan` still printed inside the
+  native block, before the user's own agents. So "native" is a property of the
+  name, not of whether config touched it.
+* `disable: true` deletes the agent, built-in or not (`agent.ts:268-271`).
+* A name with no built-in becomes a new agent with `mode: "all"`
+  (`agent.ts:274-279`). Verified: a markdown agent whose frontmatter omits `mode`
+  printed as `(all)`.
+
+### Layer order for `agent`, both boundaries verified against the binary
+
+```
+global config < OPENCODE_CONFIG < project files < per-dir .opencode
+  < MARKDOWN agents < OPENCODE_CONFIG_CONTENT < managed preferences
+```
+
+The markdown layer sits in the **middle**, not last (`config/config.ts:460` vs
+`:467-475`). Both boundaries were probed, because getting either wrong is silent:
+
+* `opencode.json` defining `agent.collide.mode = primary` **plus**
+  `agent/collide.md` with `mode: subagent` -> the binary printed
+  `collide (subagent)`. **Markdown beats a config file.**
+* `agent/contentwin.md` with `mode: subagent` **plus**
+  `OPENCODE_CONFIG_CONTENT={"agent":{"contentwin":{"mode":"all"}}}` -> the binary
+  printed `contentwin (all)`. **The env layer beats markdown.**
+
+### `opencode agent list --format json` does not exist
+
+The plan's acceptance criterion names this flag. `cli/cmd/agent.ts:235-257`
+declares no options at all, and running it exits 1 with a yargs usage error and
+zero bytes on stdout. The real output is, per agent, a `name (mode)` header line
+followed by the resolved permission ruleset as indented JSON whose closing `]`
+sits at column 0.
+
+### `#` after whitespace is a comment even inside a plain frontmatter scalar
+
+`color: #ff5733` unquoted made the binary report
+`Expected string | "primary" | ... | undefined, got null color` — the value was
+consumed as a comment and the key resolved to null. So a hex colour **must** be
+quoted, and `description: fixes issue #25713` really does lose the `#25713`.
+I initially assumed the opposite and wrote a test asserting it; the probe
+overturned that.
+
+## Task 17 — tool visibility (oc-permission/src/visibility.rs)
+
+**The hiding predicate, verbatim from the oracle** (`packages/opencode/src/permission/index.ts:204-219`,
+`disabled`): for each tool, map its name onto a permission key, then
+`ruleset.findLast(rule => Wildcard.match(permission, rule.permission))` — the search matches the
+**permission key only, ignoring the pattern** — and the tool is hidden iff that last rule has
+`pattern === "*" && action === "deny"`.
+
+Two consequences that are easy to get wrong:
+- It is a *conservative sufficient* condition, not "no input can be allowed". `[{bash,"*",deny},
+  {bash,"rm *",deny}]` denies every input, yet the last permission-matching rule has pattern
+  `"rm *"`, so the oracle keeps `bash` **visible**. Ported as-is; drop-in parity beats being clever.
+- A later *narrower* rule un-hides. `{"bash": {"*":"deny","echo *":"allow"}}` → last matching rule is
+  `echo *`/allow → `bash` stays visible, and `rm -rf /` is still denied at call time.
+  Oracle test parity: `test/permission/next.test.ts:452-556`.
+
+**The complete alias table** (both groups confirmed in the oracle, not guessed):
+- `edit`, `write`, `apply_patch` → key **`edit`**  (`permission/index.ts:205`)
+- `list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource` → key **`read`**
+  (`permission/index.ts:206`; the same three names are declared as `MCP_RESOURCE_TOOLS` in
+  `session/tools.ts:28-32`)
+- every other tool is governed by its own name.
+
+**Agent/session merge precedence — the prompt had this backwards.** `merge(...rulesets) =>
+rulesets.flat()` and both call sites are `Permission.merge(agent.permission, session.permission ?? [])`
+(`session/tools.ts:87`, `tool/registry.ts:280`). Agent rules are appended **first**, session rules
+**last**, so under `findLast` **session rules win**. Agent permission is the *base* layer, not the
+override layer. A session `{"edit":"allow"}` re-enables all three edit aliases for a plan agent; an
+agent `{"edit":"deny"}` with an empty session ruleset keeps them hidden.
+
+**Permission keys are wildcard patterns too**, so the key-level match must go through the same
+`wildcard_match`: `{"*":"deny"}` hides every tool, and outer key order decides
+(`{"*":"deny","bash":"allow"}` → only bash survives; `{"bash":"allow","*":"deny"}` → nothing survives).
+This is the Todo 16 finding applied to visibility.
+
+**In v1.18.13 the oracle's only production caller of `visibleTools` is `registry.describeCodeMode`
+(`tool/registry.ts:281`)**, over MCP tools; `registry.tools()` itself does *not* yet filter builtins by
+permission. So Todos 38/44 own the decision of where to apply this filter — the utility is oracle-exact,
+its wiring is not yet dictated by the oracle.
+
+## Task 104 — raw `OPENCODE_PERMISSION` key order
+
+The inherited claim that remeda `mergeDeep` reverses newly added object keys was
+false. Raw probes against installed `1.18.12` and source `1.18.13 @ aefaf140c1`,
+plus inspection of remeda `2.26.0`, all showed the same recursive rule: existing
+keys retain their positions, overwritten values change in place, and source-only
+keys append in source order.
+
+The apparent reversal came from the Rust differential harness itself. Parsing
+oracle output into `serde_json::Value` sorted object keys before comparison, so
+the harness was not observing raw oracle bytes. A flattened typed deserializer
+can remove the oracle-only top-level `mode` field while preserving the insertion
+order of the remaining config, including nested permission objects.
+
+## Task 14 — skill discovery: the six roots, both render forms, the remote index
+
+### The six roots, in the oracle's order, one citation each
+
+`discoverSkills` (`packages/opencode/src/skill/index.ts:173-233`). Every row below was
+confirmed by building a fixture for it and diffing `opencode debug skill`, not by reading
+alone.
+
+| # | root | pattern | `dot` | oracle |
+|---|------|---------|-------|--------|
+| 1 | `$HOME/.claude` | `skills/**/SKILL.md` | true | `:21`, `:187`, `:191-193` |
+| 2 | `$HOME/.agents` | `skills/**/SKILL.md` | true | `:22`, `:188`, `:191-193` |
+| 3 | every `.claude`/`.agents` from `directory` up to `worktree` | `skills/**/SKILL.md` | true | `:196-202` |
+| 4 | every config directory | `{skill,skills}/**/SKILL.md` | false | `:24`, `:205-208` |
+| 5 | each `skills.paths[]` entry | `**/SKILL.md` | false | `:25`, `:210-220` |
+| 6 | each cache dir a `skills.urls[]` index produced | `**/SKILL.md` | false | `:222-227` |
+
+Shared scan options: `absolute: true, include: "file", symlink: true` (`:148-156`), so `**`
+descends into symlinked directories and the **symlink** path is what `location` reports.
+`**` matches zero segments, so `~/.agents/skills/SKILL.md` is a match. The built-in
+`customize-opencode` is registered *before* root 1 (`:276-283`) with `location` the literal
+string `<built-in>`.
+
+Four rules that are not visible in the table:
+
+- **The Claude switch also silences the project walk.** `externalDirs` is built once
+  (`:186-188`) and reused for the `$HOME` probe *and* the ancestor walk, so
+  `OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1` removes `proj/.claude/skills` too. Measured.
+- **`OPENCODE_DISABLE_PROJECT_CONFIG` does not reach root 3.** It gates
+  `ConfigPaths.directories` (root 4), not `fsys.up`. Measured: a project `.agents` skill
+  survives the flag.
+- **`skills.paths[]` relative entries resolve against the CWD, not the worktree** —
+  `path.join(directory, expanded)` at `:213`. Measured inside a git repo with the process in
+  `proj/sub/deeper`: `relskills` under the CWD was found, `relskills` under the repo root was
+  not. **The plan's "relative to workspace" is wrong.**
+- **The path set is keyed by the walked string, not a canonical path.** `state.matches` is a
+  `Set<string>` (`:168`) and nothing canonicalizes. So a
+  `~/.claude/skills/x -> ~/.agents/skills/x` symlink yields **two** matches with one `name`,
+  which lands in duplicate-**name** handling, not path de-duplication. 27 of this machine's
+  136 skills are exactly that alias.
+
+### Both render forms, exact bytes
+
+`Skill.fmt` (`:321-346`). Only caller of the verbose form is `session/system.ts:108`, on
+every request. Neither form is reachable from any CLI command, so there is nothing to diff —
+they are protected by `insta` snapshots plus per-rule assertions.
+
+List form (`join("\n")`, **no** trailing newline):
+
+```
+## Available Skills
+- **<name>**: <description>
+```
+
+Verbose form (`join("\n")`, **no** trailing newline; two-space and four-space indents):
+
+```
+<available_skills>
+  <skill>
+    <name><name></name>
+    <description><description></description>
+    <location><escapeHtml(location)></location>
+  </skill>
+</available_skills>
+```
+
+Empty case, both forms: `No skills are currently available.`
+
+Three details that are easy to lose: a skill with **no** `description` is filtered out
+(`:322`) *before* the emptiness check (`:323`), so an all-description-less set renders as the
+empty sentinel while still being in `all()`; `escapeHtml` is applied to `location` **only**,
+never to `name` or `description`; and the sort is `a.name.localeCompare(b.name)`, not a byte
+sort.
+
+### `localeCompare`, measured rather than approximated
+
+Probed `String.prototype.localeCompare` under the oracle's Node. Primary weight order for
+printable ASCII is
+
+```
+ _-,;:!?.'"()[]{}@*/\&#%`^+<=>|~$0123456789 <letters, case-insensitive>
+```
+
+and **case is tertiary**: `"Zebra".localeCompare("zzz") < 0`, so a table that simply places
+`Z` after `z` gets it backwards. Two levels reproduce every measured case: primary key with
+letters folded to lowercase, then a case tiebreak (lowercase first). Cases pinned in tests:
+`aB<Ab`, `ab<aB`, `a-b>a_b`, `ab-c<abc`, `zz>z-z`, `a1<aA`, `a<a-`, `Zebra<zzz`.
+Non-ASCII sorts after the table by code point — a recorded divergence from ICU, and no skill
+name on this machine contains anything outside `[a-z0-9_-]`.
+
+### Remote index protocol (`skill/discovery.ts`)
+
+Verified end to end by pointing the real binary at `python3 -m http.server`.
+
+```
+GET <url>/index.json                                   :50-51 (trailing slash added, so
+                                                        https://h/sub -> https://h/sub/index.json)
+{"skills":[{"name","files":[...],"version"?}]}          :13-21
+entry without "SKILL.md" in files -> warn, drop, never fetched   :67-73
+cache root  $XDG_CACHE_HOME/opencode/skills/<name>/     :35, :79
+files resolve against <url>/<name>/                     :90
+no version, or .opencode-version already matches ->
+  download in place; an existing file is skipped        :38, :87-92
+version changed -> stage in <root>.tmp-<uuid>, require a
+  SKILL.md, stamp .opencode-version, rename with
+  <root>.old-<uuid> as rollback, always clean staging   :93-125
+root returned only if <root>/SKILL.md exists            :126
+concurrency 4 skills / 8 files                          :10-11
+```
+
+Live check: an index of `remoteok`(SKILL.md+helper.md), `remotebad`(README.md only) and
+`remoteextra`(version `v1`) produced exactly `remoteok` and `remoteextra` from
+`~/.cache/opencode/skills`, with `.opencode-version` written only for `remoteextra`, and
+`remotebad` never requested.
+
+### `opencode debug skill` truncates its own stdout through a pipe
+
+```
+$ for i in 1 2 3; do opencode debug skill | wc -c; done      -> 40960 40960 57344
+$ for i in 1 2 3; do opencode debug skill > f; wc -c < f; done -> 2807771 x3
+```
+
+`debug/skill.ts` ends with a bare `process.stdout.write(...)` and the process exits without
+draining the pipe. **`oc_testkit::Oracle::run` captures through a pipe and therefore cannot
+be used for any oracle command with large output.** Both halves of the skill differential
+redirect stdout to a file. Anyone writing a differential against a verbose `debug`
+subcommand needs the same workaround, or `Oracle::run` needs a file-capture mode.
+
+### The oracle's duplicate-name winner is racy
+
+`loadSkills` uses `Effect.forEach(..., { concurrency: "unbounded" })` (`:240-243`) and each
+load starts with an async read, so the *order the writes land* is I/O timing. Fixture with
+`dupe` under `~/.claude`, `~/.agents` and a config directory: three consecutive runs picked
+`.agents`, `config`, `config`. Three runs over the real tree: **name set identical every
+time, location set different every time.** The name set is the contract.
+
+### Frontmatter: `gray-matter` + js-yaml 4, and only two keys
+
+`isSkillFrontmatter` (`:53-59`) reads `name` and `description` and nothing else — confirmed,
+not assumed: a file carrying `license`, `allowed-tools` and `version` alongside them loaded
+with those ignored. Delimiter and scalar behaviour, all measured:
+
+| fixture | oracle |
+|---|---|
+| `----\nname: x\n----` | not a delimiter; no frontmatter; skill dropped |
+| `---\n# comment only\n---` | empty data; skill dropped |
+| no closing `---` | frontmatter parses, `content` is **empty** |
+| `---\r\n…\r\n---\r\nBody\r\n` | `content` is `Body\r\n` |
+| `---yaml` / `---json` | parsed by that engine |
+| `name:` or `description:` (null) | present-but-not-a-string; skill dropped |
+| `name: yes` | the **string** `"yes"`; skill loaded |
+| `name: true` / `name: 123` | not a string; skill dropped |
+| `description: Use when: X` | loads, via the `sanitize` block-scalar retry |
+| `description: >` folded | folds to `line one line two\npara two\n` |
+
+`name: yes` staying a string is why YAML 1.2 core matters: `serde_yaml` (libyaml, YAML 1.1)
+would make it a boolean and silently drop such a skill. `yaml_rust2` resolves like js-yaml 4.
+
+## Task 15 — command resolution precedence and argument expansion
+
+### The precedence chain, with the oracle line for each level
+
+Four sources write into ONE `Record<string, Info>`. A later level overwrites an
+earlier one, except the last, which does not.
+
+| # | level | oracle line | overwrite? |
+|---|---|---|---|
+| 1 | built-in `init`, `review` | `command/index.ts:70-88` | seeds the map |
+| 2 | `cfg.command` entries (incl. markdown commands) | `:90-103` | unconditional |
+| 3 | MCP prompts | `:105-132` | unconditional |
+| 4 | skills | `:134-152` | **only if the name is free** |
+
+The whole "skills never override" rule is ONE line — `command/index.ts:135`:
+`if (commands[item.name]) continue`. A losing skill is dropped entirely; it does
+not appear twice and its description does not leak.
+
+Verified twice: read from the oracle AND observed on the real binary via
+`GET /command` on a fixture that collides all four levels (transcript in
+`.omo/evidence/task-15-opencode-rust.txt` §1). Config beat the built-in `review`;
+an MCP prompt beat `command["srv:hello"]`; skills named `collide` and
+`srv:noargs` vanished from the listing.
+
+**Overwriting keeps the ORIGINAL listing position.** A config `review` stays in
+slot 1 where the built-in put it, because assigning to an existing JavaScript
+object property does not move the key. `OrderedMap::insert` already reproduces
+this, so nothing extra was needed — but a `HashMap` + sort would have got it
+wrong.
+
+### MCP prompts are keyed `client:prompt`, sanitized
+
+`mcp/catalog.ts:100-105` keys prompt records `sanitize(client) + ":" +
+sanitize(name)`, where `sanitize` (`:113`) maps every character outside
+`[A-Za-z0-9_-]` to `_`. So prompt `hello` on server `srv` is the command
+`srv:hello`. Level 3 IS an unconditional overwrite, but it can only collide with
+a config command whose key is literally that colon-qualified spelling — worth
+knowing before someone "fixes" a collision that cannot happen.
+
+`command/index.ts:117-118`: the server is asked for its prompt with every
+declared argument bound to the LITERAL string `"$1"`, `"$2"`, … so the returned
+text still carries those placeholders and ordinary expansion fills them
+afterwards. Hints come from the argument COUNT (`:130`), never from the text.
+
+### Argument expansion — every rule, all observed
+
+Oracle `session/prompt.ts:1372-1395`; regexes `:1594-1596`; hints
+`command/index.ts:36-43`. Pinned by a 59-case differential against a verbatim
+JavaScript transcription (`tests/fixtures/command_expansion_oracle.cjs`).
+
+- **The highest placeholder is greedy.** `A=[$1] B=[$2]` with four arguments
+  gives `A=[one] B=[two three four]`. Greediness follows the NUMBER, not the
+  position in the text: `B=[$2] A=[$1]` still makes `$2` greedy. This is the
+  single most surprising rule and the plan does not mention it.
+- **A positional past the end is EMPTY**, never an error: `$3` with two
+  arguments → `C=[]`. (The plan's failure scenario, confirmed.)
+- **`$ARGUMENTS` with no input is empty**, and the final `.trim()` then removes
+  the gap: `"Input: $ARGUMENTS"` + `""` → `"Input:"`.
+- **`$0` is a JavaScript artefact.** `args[-1]` is `undefined`, so `$0` renders
+  the literal text `undefined` — UNLESS `$0` is itself the highest placeholder,
+  when `slice(-1)` makes it the LAST argument. `$00` behaves the same; `$01` is
+  just position 1.
+- **A bare `$` before a digit IS a placeholder.** `COST IS $5.00` becomes
+  `COST IS .00`. `$x` and a trailing `$` are literal. `hints` reports `['$5']`.
+- **`$10` is the TENTH argument**, not `$1` then `0`; `\d+` is greedy.
+- **`\d` is ASCII-only**: `$٣` (U+0663) is not a placeholder.
+- **Absurd numbers are fine**: `$999`, `$99999999999999999999` → empty.
+- **Append fallback**: a template mentioning NO placeholder at all gets the raw
+  input appended after `\n\n`, provided the input is not blank.
+- **`$ARGUMENTS` is the RAW input; `$N` are tokenized.** `"quoted arg"  spaced`
+  → `$1` = `quoted arg spaced` (greedy, unquoted) but `$ARGUMENTS` keeps the
+  quotes and the double space.
+
+### The `$`-pattern trap inside `$ARGUMENTS` (found by running, not reading)
+
+`:1391` is `withArgs.replaceAll("$ARGUMENTS", input.arguments)` — a STRING
+replacement, so ECMA-262 `GetSubstitution` runs over the USER'S OWN ARGUMENTS:
+
+| user types | lands as |
+|---|---|
+| `$$` | `$` |
+| `$&` | the literal text `$ARGUMENTS` |
+| `` $` `` | everything in the template before the placeholder |
+| `$'` | everything after it |
+| `$1`, `$<name>` | left alone (no capture groups) |
+
+Positional substitution at `:1383` uses a FUNCTION replacer and does none of
+this — `$$` and `$&` stay literal there. So the two substitution steps have
+DIFFERENT escaping rules, and a naive `str::replace` for `$ARGUMENTS` diverges
+the moment a user pastes a shell `$$` or a ref containing `$&`.
+
+### Tokenizer (`argsRegex` + `quoteTrimRegex`)
+
+`/(?:\[Image\s+\d+\]|"[^"]*"|'[^']*'|[^\s"']+)/gi` then `/^["']|["']$/g`:
+
+- `[Image 3]` is ONE token, case-insensitively (`[image 12]` too).
+- A quoted run is one token and loses its quotes, so `""` yields an EMPTY token.
+- An UNPAIRED quote matches no alternative and is skipped whole: `" second`
+  yields just `["second"]`, not `['"', 'second']`.
+- `don't` splits into `don`, `t` — the apostrophe opens a group that never
+  closes.
+- Whitespace runs collapse; the quote-trim is anchored so a lone `"` cannot
+  underflow.
+
+### Hints are sorted LEXICOGRAPHICALLY
+
+`command/index.ts:40` dedupes through a `Set` (insertion-ordered) then calls
+`.sort()` — a string sort. So `$2 and $10` yields `['$10','$2']`, observed on the
+real binary. The raw spelling survives (`$01` stays `$01`). `$ARGUMENTS` is
+appended AFTER the sort, never inside it. A skill's hints are hardcoded empty
+(`:150`) even when its body contains `$1` — but expansion still runs over that
+body.
+
+### Built-in shapes, observed
+
+- `init`: description `guided AGENTS.md setup`, no `subtask`, `${path}`
+  interpolated ONCE (`String.replace` with a string pattern), template 3500
+  chars for a 15-char worktree (file is 3492).
+- `review`: description `review changes [commit|branch|pr], defaults to
+  uncommitted`, **`subtask: true`**, 4704 chars, and it contains NO `${path}` so
+  its substitution is a no-op.
+- A config entry replacing a built-in replaces it WHOLESALE — the config `review`
+  loses `subtask: true` unless it declares it.
+- `variant` exists on the config entry (`config/command.ts:10`) but
+  `command/index.ts:91-102` never copies it into `Info`, so the resolved command
+  has no variant field. Adding one would invent a field `/command` does not
+  return.
+
+## Task 24 — `oc-auth`: the two credential files
+
+### `auth.json` — three shapes, exact field names (oracle: `packages/opencode/src/auth/index.ts`)
+
+Provider-keyed JSON object, values discriminated by `type` (`:35`).
+
+| `type` | oracle | fields (exact on-disk spelling) |
+| --- | --- | --- |
+| `oauth` | `:14-21` | `refresh` str, `access` str, `expires` **NonNegativeInt** ms, `accountId?` str, `enterpriseUrl?` str |
+| `api` | `:23-27` | `key` str, `metadata?` `Record<string,string>` |
+| `wellknown` | `:29-33` | `key` str, `token` str |
+
+`expires` is `NonNegativeInt` (`:18`, importing from `@opencode-ai/core/schema`), so a
+negative value fails to decode and the whole entry is dropped — confirmed by seeding
+`expires: -5` and watching `auth list` not show it. `OAUTH_DUMMY_KEY =
+"opencode-oauth-dummy-key"` at `:8` is the placeholder an OAuth provider stores where
+an API key would go; re-exported as `oc_auth::OAUTH_DUMMY_KEY`.
+
+Confirmed against the live `$XDG_DATA_HOME/opencode/auth.json` on this machine (read
+structurally, values never printed): 10 `api` entries and 2 `oauth`, one of which
+carries `accountId`. Both optional-field shapes occur in the wild.
+
+### What `OPENCODE_AUTH_CONTENT` actually overrides (`:58-66`)
+
+It replaces **the whole result of `all()`**, and `all()` is the only reader — so `get`
+is overridden too. The file is not consulted at all when the variable parses.
+
+Three consequences, each **observed against the 1.18.12 binary**, not inferred:
+
+1. A malformed value falls through to the file. `:62` is a bare `catch {}`. Verified:
+   `OPENCODE_AUTH_CONTENT='{not json'` listed the file's credentials.
+2. Writes still go to the **file**, never to the variable. `set`/`remove` (`:73-89`)
+   both start from `all()`, so a mutation under an active override writes
+   *override ∪ mutation* to disk and **destroys whatever the file held**. Verified: a
+   file holding `filealpha`+`filebeta`, plus an override naming `envgamma`+`filebeta`,
+   plus `auth logout filebeta`, left exactly `{"envgamma":…}` — `filealpha` gone.
+   `oc-auth` reproduces this deliberately; diverging would mean the two binaries
+   disagree about the user's credentials.
+3. It is not a schema bypass: an override entry of an unknown shape is dropped exactly
+   as a file entry would be.
+
+### `mcp-auth.json` — the MCP OAuth shape (oracle: `packages/opencode/src/mcp/auth.ts`)
+
+Server-name-keyed object of `Entry` (`:25-31`), **every field optional** because the
+flow fills them in over several steps. All camelCase on disk.
+
+| field | oracle | contents |
+| --- | --- | --- |
+| `tokens` | `:9-14`, `:26` | `accessToken` str, `refreshToken?` str, `expiresAt?` num, `scope?` str |
+| `clientInfo` | `:17-22`, `:27` | `clientId` str, `clientSecret?` str, `clientIdIssuedAt?` num, `clientSecretExpiresAt?` num |
+| `codeVerifier` | `:28` | the PKCE verifier, live only between redirect and callback |
+| `oauthState` | `:29` | the CSRF `state`, checked on callback |
+| `serverUrl` | `:30` | which URL these credentials were issued for |
+
+`Tokens.expiresAt` / `ClientInfo.clientIdIssuedAt` are plain `Schema.Number`, **not**
+`NonNegativeInt` — unlike `auth.json`'s `expires`. Modelled as `i64`.
+
+`getForUrl` (`:89-95`) returns `undefined` when the entry records **no** `serverUrl` at
+all, not just when it differs. An entry with no recorded URL is never assumed to match.
+
+`clearField` (`:122-130`) returns `undefined` for an absent server, and `mutate`'s
+`if (!next) return` (`:79`) means **no write happens** — so clearing a field on an
+unknown server leaves the file untouched (does not even create it).
+
+### The write path (`fs-util.ts:110-113`, called with `0o600` at `auth/index.ts:79` and `mcp/auth.ts:80`)
+
+```ts
+const content = JSON.stringify(data, null, 2)
+yield* fs.writeFileString(path, content)
+if (mode) yield* fs.chmod(path, mode)      // <-- AFTER the write
+```
+
+- Encoding is `JSON.stringify(data, null, 2)`: two-space indent, **no trailing
+  newline**. Byte-verified with `xxd` against a file 1.18.12 wrote — ends `}\n}` with
+  no final `0a`. `serde_json::to_vec_pretty` matches exactly.
+- The chmod is a *follow-up*, so the file exists at the umask (typically `0644`) with
+  the tokens already in it for a moment. `oc-auth` passes the mode to `open(2)` via
+  `OpenOptionsExt::mode` instead, then also `set_permissions` because `mode()` only
+  applies on creation and an existing permissive file must still be repaired.
+- A write **does** repair a permissive file: observed `0644` → `0600` after
+  `auth logout`.
+
+### Decoding is per-entry and lossy in the oracle
+
+`Record.filterMap` (`:66`) silently drops any value that fails to decode, and the next
+write persists their absence. Observed: 5 seeded entries (1 good, 1 no `type`, 1
+`type:"banana"`, 1 negative `expires`, 1 with an extra unknown field) → `auth list`
+showed 2, and one `auth logout` left those 2 on disk with the extra field stripped. An
+unknown extra field is therefore tolerated on read and dropped on write.
+
+## Task 19 — opening `opencode.db`: what the four pragmas actually report
+
+`database.ts:27-32` issues **five** pragmas plus a checkpoint, not four. In order:
+`journal_mode = WAL`, `synchronous = NORMAL`, `busy_timeout = 5000`,
+`cache_size = -64000`, `foreign_keys = ON`, then `wal_checkpoint(PASSIVE)`. The plan's
+acceptance criterion names four; `cache_size` is the fifth and is applied and verified
+too. `PRAGMA_SEQUENCE` in `crates/oc-db/src/open.rs` is asserted line-for-line against
+that list.
+
+### Read-back values, measured on a fresh file database
+
+| pragma | set as | reads back as | type |
+| --- | --- | --- | --- |
+| `journal_mode` | `WAL` | `wal` | text, lowercase |
+| `synchronous` | `NORMAL` | `1` | integer |
+| `busy_timeout` | `5000` | `5000` | integer, ms |
+| `cache_size` | `-64000` | `-64000` | integer, negative = KiB not pages |
+| `foreign_keys` | `ON` | `1` | integer |
+
+`journal_mode` is the only one recorded in the database file; the rest are
+per-connection. A reopen with no pragmas reports `wal` but `synchronous = 2` and
+`cache_size = -2000`. That asymmetry is why `Pool` owns connection creation and has no
+constructor taking a caller's `Connection`.
+
+### `:memory:` reports `memory`, not `wal`
+
+SQLite refuses WAL for an in-memory database and does **not** error — it keeps `memory`
+journalling and returns that. A verifier asserting `wal` unconditionally asserts
+something SQLite never promised, so `verify_pragmas` expects `memory` for
+`DbLocation::Memory`. `foreign_keys` and `busy_timeout` still apply normally there.
+
+### Two of the four pragmas are already correct by accident on this driver
+
+- `libsqlite3-sys` 0.38.1 `build.rs:126` compiles the amalgamation with
+  `-DSQLITE_DEFAULT_FOREIGN_KEYS=1`. Stock SQLite defaults it **off** — measured 0 on the
+  system CLI 3.53.4.
+- `rusqlite` 0.40.1 `src/inner_connection.rs:118` calls `sqlite3_busy_timeout(db, 5000)`
+  on every connection, which is exactly the oracle's value.
+
+So `foreign_keys` and `busy_timeout` read back correct **even if the code never issues
+them**, and a pragma-readback test alone cannot prove the implementation works. Both
+defaults are pinned by
+`tests/open.rs::the_stack_below_this_crate_already_defaults_two_pragmas_to_the_oracle_values`
+so a driver bump that flips either fails loudly rather than silently disabling cascades.
+Enforcement is proven behaviourally instead: a dangling-FK insert is rejected with
+`SqliteFailure(ConstraintViolation, extended_code 787)` / "FOREIGN KEY constraint
+failed", and a `foreign_keys = OFF` control shows the identical insert accepted.
+
+### What WAL puts on disk, and when it disappears
+
+While a connection is open: `opencode.db`, `opencode.db-wal`, `opencode.db-shm` (8 KiB /
+16 KiB / 32 KiB in the QA run). **A clean shutdown checkpoints and deletes both
+sidecars** — after the last connection closed, only `opencode.db` remained. So for
+**todo 82 (prune)** and **todo 84 (vacuum)**: the sidecars must be handled when present
+(moving or deleting the main file alone loses committed transactions) but their absence
+is not evidence of a missing WAL. `oc_db::sidecar_files(path)` returns the pair;
+`Pool::sidecar_files()` returns them for a file pool and empty for memory.
+
+WAL is recorded in the file header at bytes 18-19 (both `2`), which is why an external
+SQLite 3.53.4 — a different build from the bundled 3.53.2 — opens the file, reports
+`journal_mode = wal` and reads back both committed rows.
+
+### Pinned versions
+
+`rusqlite 0.40.1` → `libsqlite3-sys 0.38.1` → **SQLite 3.53.2**
+(`sqlite_source_id() = 2026-06-03 19:12:13 d6e03d8c777cfa2d35e3b60d8ec3e0187f3e9f99d8e2ee9cac695fd6fcdf1a24`).
+Compiled in and relevant later: `ENABLE_FTS5` (todos 101-102), `THREADSAFE=1`,
+`ENABLE_JSON1`, `ENABLE_RTREE`, `ENABLE_STAT4`.
+
+### `IMMEDIATE`, not `DEFERRED`, is what makes `busy_timeout` work
+
+A `DEFERRED` transaction takes a read lock and asks to upgrade on its first write; if
+another writer committed in between, SQLite fails with `SQLITE_BUSY_SNAPSHOT`, which the
+busy handler is explicitly **not** allowed to retry because the snapshot is already
+stale. `Pool::transaction` therefore uses `TransactionBehavior::Immediate`, taking the
+write lock up front so a second writer waits out the timeout instead of failing.
+Measured: writer B contended for 335ms against a writer holding the lock 300ms, and both
+committed — inside the 5000ms budget.
+
+## Task 23 — oc-snapshot: per-project git object store
+
+**The store path, observed not inferred.** Ran the real binary (`opencode` 1.18.12 at
+`/config/.local/share/mise/installs/opencode/1.18.12/opencode`; the `mise` shim is broken, call the
+install path directly) as `debug snapshot track` in a fixture worktree under a temp `XDG_DATA_HOME`.
+It created exactly:
+
+```
+$XDG_DATA_HOME/opencode/snapshot/<projectID>/<sha1(worktree absolute path STRING)>
+```
+
+- component 1 = `projectID` from `oc_paths::project::resolve_project` (remote hash → cached
+  `.git/opencode` marker → root commit → `global`). The fixture had no remote, so it was the root
+  commit, and the binary also *wrote* that id into `<git-common-dir>/opencode`.
+- component 2 = `sha1` hex of the worktree path **string**. Not normalized, not canonicalized, no
+  trailing-slash handling. `Hash.fast` (`packages/core/src/util/hash.ts`) is plain SHA-1 despite the
+  name; oracle site is `packages/opencode/src/snapshot/index.ts:71`.
+- `oc-paths` (todo 4) already implements the whole thing as `Layout::snapshot_store()` /
+  `Layout::worktree_hash()` / `snapshot_root()`. **Consume it; do not re-derive the hash.**
+
+**Git commands and env the oracle uses.** `git init` is the only invocation driven by environment
+(`GIT_DIR` + `GIT_WORK_TREE`, cwd = worktree); *everything else* passes `--git-dir <store>
+--work-tree <worktree>` as flags, preceded by `-c` overrides. Three flag sets exist and are not
+interchangeable: `core` = `core.longpaths`+`core.symlinks`; `cfg` = `core.autocrlf=false` + core;
+`quote` = cfg + `core.quotepath=false`. Path-listing and diffing use `quote`; staging uses `cfg`;
+`read-tree`/`checkout-index` use `core`; `write-tree` and `gc` use no `-c` at all. Init writes eight
+`config` keys in a fixed order, the last four (`feature.manyFiles`, `index.version=4`,
+`index.threads`, `core.untrackedCache`) purely to bound the first `add` on a huge checkout.
+
+**`seed()` is why a store is cheap.** On first init the oracle writes the source repo's objects dir
+into `<store>/objects/info/alternates` and copies the source `index` file in. Consequence worth
+remembering: a snapshot tree whose content the user already committed is resolved **through the
+alternate** and no object is written into the store at all. A test that wants a store-local object to
+exist must snapshot *uncommitted* content.
+
+**File lists never travel as argv.** `git add`/`rm --cached` receive
+`--pathspec-from-file=- --pathspec-file-nul` and the names arrive on stdin as NUL-separated
+`:(top,literal)<path>` pathspecs. That is simultaneously the injection defence and the reason a file
+named `*` or `:(exclude)x` is handled as itself. `check-ignore` gets a protective `./` prefix for
+names starting with `:` and echoes it back, so it must be stripped again.
+
+**GC parameters.** `prune = "7.days"` (`index.ts:23`), `limit = 2 MiB` for untracked files
+(`:24`), `cleanup()` = `git gc --prune=7.days` guarded on `exists(gitdir)` and `enabled()`
+(`:300-316`), cadence = one minute delay then `Schedule.spaced(1 hour)` forked for the store's
+lifetime (`:761-766`). Measured facts about real `git` 2.43 that source-reading does not give you:
+`gc` **repacks** loose objects, unreachable ones into a cruft pack with `.mtimes`, so a loose file
+disappearing proves nothing — only `cat-file -e` distinguishes reclaimed from repacked. Objects
+inside the 7-day window survive; older unreachable ones are dropped. The **latest** snapshot tree
+stays reachable through the index's cache-tree and therefore survives forever; a **superseded** tree
+older than seven days is reclaimed.
+## Task 20
+
+- Verified `schema.gen.ts` creates **19 application tables** in its one `up(tx)`: `workspace`, `data_migration`, `account_state`, `account`, `control_account`, `credential`, `event_sequence`, `event`, `permission`, `project_directory`, `project`, `message`, `part`, `session_context_epoch`, `session_input`, `session_message`, `session`, `todo`, `session_share`. `migration` is created afterward, so a fresh current DB has 20 tables. A migrated legacy DB may additionally retain `__drizzle_migrations`.
+- The six cloud-side tables are `workspace`, `account_state`, `account`, `control_account`, `credential`, and `permission`; all are created because the generated `up` and migration journal cover them. `data_migration` is the seventh non-session/project table and is migration infrastructure rather than cloud-side state.
+- Exact explicit indexes: `event_aggregate_seq_idx`, `event_aggregate_type_seq_idx`, `permission_project_action_resource_idx`, `message_session_time_created_id_idx`, `part_message_id_id_idx`, `part_session_idx`, `session_input_session_pending_delivery_seq_idx`, `session_input_session_admitted_seq_idx`, `session_input_session_promoted_seq_idx`, `session_message_session_seq_idx`, `session_message_session_type_seq_idx`, `session_message_session_time_created_id_idx`, `session_message_time_created_idx`, `session_project_idx`, `session_workspace_idx`, `session_parent_idx`, `todo_session_idx`.
+- Exact real-user journal ids in observed `rowid` order: `20260127222353_familiar_lady_ursula`, `20260211171708_add_project_commands`, `20260213144116_wakeful_the_professor`, `20260225215848_workspace`, `20260227213759_add_session_workspace_id`, `20260303231226_add_workspace_fields`, `20260228203230_blue_harpoon`, `20260309230000_move_org_to_state`, `20260312043431_session_message_cursor`, `20260323234822_events`, `20260410174513_workspace-name`, `20260413175956_chief_energizer`, `20260423070820_add_icon_url_override`, `20260428004200_add_session_path`, `20260427172553_slow_nightmare`, `20260501142318_next_venus`, `20260504145000_add_sync_owner`, `20260507164347_add_workspace_time`, `20260511000411_data_migration_state`, `20260510033149_session_usage`, `20260511173437_session-metadata`, `20260601010001_normalize_storage_paths`, `20260601202201_amazing_prowler`, `20260602002951_lowly_union_jack`, `20260602182828_add_project_directories`, `20260603001617_session_message_projection_indexes`, `20260603040000_session_message_projection_order`, `20260603141458_session_input_inbox`, `20260603160727_jittery_ezekiel_stane`, `20260604172448_event_sourced_session_input`, `20260605003541_add_session_context_snapshot`, `20260605042240_add_context_epoch_agent`, `20260611035744_credential`, `20260611192811_lush_chimera`, `20260612174303_project_dir_strategy`, `20260622142730_simplify_session_context_epoch`, `20260622170816_reset_v2_session_state`, `20260622202450_simplify_session_input`.
+- The journal contains 38 ids. Exact first id: `20260127222353_familiar_lady_ursula`; exact last id: `20260622202450_simplify_session_input`.
+- The real user's historical `rowid` order differs from current generated order for three pairs; completion is set-based in upstream `applyOnly`, so current generated order is correct for fresh seeding while existing journals must not be reordered.
+
+
+## Task 93
+
+### The TypeScript binary's memory, measured for the first time
+
+Binary: `/config/.local/share/mise/installs/opencode/1.18.12/opencode`, version
+**1.18.12** (the released binary, not the from-source flavour — running the TS
+entry point under Bun would measure a different process tree than users run).
+
+Machine: `ip-192-168-157-161`, kernel `6.17.0-1019-aws`, Intel Xeon 6975P-C,
+32 logical CPUs, 64,767,892 KiB RAM (61.8 GiB). Sampling is total-process-tree
+RSS: root plus every transitive child via `/proc/<pid>/task/*/children`, every
+2 seconds.
+
+**W-real — the number the whole project exists for.** Hydrating the user's
+largest real session (`ses_2bcaee257ffeFZNJrmtpi3ZglR`, 931 messages, 3,620
+parts, 100.2 MB of `part.data`) and running one turn:
+
+| | KiB | MB |
+| --- | --- | --- |
+| min | 2,939,880 | 2,870 |
+| **median** | **3,026,992** | **2,956** |
+| max | 3,465,388 | 3,384 |
+
+max/min = **1.1788x**. That is ~2.96 GB of resident memory for a single turn on
+one session, and the tree was still growing 55s after the keystroke because every
+provider request re-serialises the whole session. First hard number behind the
+"the TypeScript binary exhausts memory" premise. G2 gives Rust a ceiling of
+**1,478.0 MB**.
+
+**W-idle — cold start plus one cassette-backed tool turn, 148s trace:**
+
+| | KiB | MB |
+| --- | --- | --- |
+| min | 878,432 | 857 |
+| **median** | **954,240** | **931.9** |
+| max | 1,001,568 | 978 |
+
+max/min = **1.1402x**. G1 gives Rust a ceiling of **465.9 MB**. So the released
+TypeScript binary needs ~932 MB to start up and answer one trivial prompt.
+
+### Revision 1 hid 203 MB of W-idle's peak
+
+Revision 1 discarded the first 90 seconds of *every* workload as warm-up. W-idle's
+trace is 148s / 75 samples, so that dropped 45 samples — 60% of them and the whole
+cold start. Recomputed over the whole trace from the artifact's own retained
+samples: median **954,240 KiB (931.9 MB)** vs the **746,408 KiB (728.9 MB)**
+revision 1 published. Delta **207,832 KiB = 203.0 MB**.
+
+W-real is untouched by the correction: its turn is only typed once hydration
+settles at the 90s mark, so its peak lands after the old discard window either
+way. Both rules give 3,026,992 KiB. Verified per-run, all five reps identical
+under both rules.
+
+### Run-to-run variance is wider than 10% on this machine
+
+Neither workload would have passed a "two independent passes agree within 10%"
+criterion: 1.14x and 1.18x. Useful to know before Wave 14 — a Rust/TS comparison
+this close to the 0.50 gate boundary would be noise-dominated, but at 466 MB vs
+932 MB and 1,478 MB vs 2,956 MB the margin is far outside the spread.
+
+### W-idle's peak is genuinely cold-start-dominated
+
+Per-rep, whole-trace peak vs post-90s peak: 878,432/746,408; 1,001,568/768,324;
+954,240/767,080; 888,280/740,752; 990,168/695,156. Every rep peaks in its first
+90 seconds and then *falls* by 130-300 MB. So the startup transient is not merely
+included in the peak — it **is** the peak, and the RSS afterwards is 20-30% lower.
+## Task 93
+
+**Measured TypeScript baseline (revision 2), `benchmarks/ts-baseline.json`.** Machine: `ip-192-168-157-161`, kernel `6.17.0-1019-aws`, Intel(R) Xeon(R) 6975P-C, 32 logical CPUs, 64,767,892 KiB RAM (61.8 GiB). Binary measured: `/config/.local/share/mise/installs/opencode/1.18.12/opencode`, self-reports **1.18.12**. The pinned oracle source tree is **1.18.13** — the released binary installed on the machine is what users run, so that is what the artifact attributes. 1,500 raw samples retained; every published peak re-derives from them.
+
+- **W-idle** median per-run peak **954,240 KiB = 931.9 MiB**; five peaks 878,432 / 888,280 / 954,240 / 990,168 / 1,001,568 KiB; spread max/min **1.140**; 75 samples per run over a 148 s trace.
+- **W-real** median per-run peak **3,026,992 KiB = 2,956.0 MiB** on session `ses_2bcaee257ffeFZNJrmtpi3ZglR` (931 messages, 3,620 parts, 105,118,812 bytes of `part.data`); five peaks 2,939,880 / 3,016,072 / 3,026,992 / 3,063,628 / 3,465,388 KiB; spread **1.179**; 225 samples per run over a 448 s trace.
+- **W-soak** `null`. See `decisions.md` and `issues.md`.
+- Thresholds Wave 14 inherits by substitution: **G1 ≤ 465.9 MiB**, **G2 ≤ 1,478.0 MiB**. G3/G4 are absolute predicates and need no TS median, but **G3 has no TS evidence at all**.
+
+**How a trivial turn runs with no live provider.** `MockProvider` (axum, loopback) replays the oracle's own recorded cassettes from `<tree>/packages/llm/test/fixtures/recordings/`; `ScriptedEnv` hands the child a cleared environment with `OPENCODE_CONFIG_CONTENT` pointing `baseURL` at that loopback port, plus `OPENCODE_DISABLE_AUTOUPDATE=1` and `OPENCODE_DISABLE_MODELS_FETCH=1`. No network is reachable and `oc-testkit` has no HTTP *client* in its dependency graph. Two further conditions are load-bearing and were each found by observing a failure, not by reading source:
+1. **`permission: {"*": "allow"}`** in the generated config, or the custom tool blocks on an interactive approval that an unattended TUI never answers.
+2. **Fake completed local npm state** — an empty `node_modules/` directory plus a `package-lock.json` declaring `@opencode-ai/plugin` — in *both* `<project>/.opencode/` and `<XDG_CONFIG_HOME>/opencode/`. Without it the binary tries to reify plugin dependencies over the network and the turn never starts.
+
+**Every run needs exactly one tool-free text request before the tool loop, but it is not the same request on both paths.** A **new** session's prelude generates the session title. A **restored** session's prelude is a **compaction summary**, because W-real deliberately selects the largest session and it overflows the model's context window. Serving that prelude from the tool-loop cassette makes the TUI print `Tool call not allowed while generating summary: get_weather` and the turn never completes — visible only in the PTY transcript, since the provider still counted requests. Serving `openai-chat/streams-text` first, unconditionally, then the tool loop, produced 3 requests (1,629,657 → 1,767,929 → 1,768,561 bytes, `tools=0` then `tools=11`) and a completed turn.
+
+**`--prompt` is discarded when `--session` restores a session**; the saved draft input wins, so the turn must be typed into the PTY. Measured on the 105 MB session: RSS sat flat at ~680 MB for 126 s with zero provider requests until a `\r` was written; then 13 s from keystroke to the first request, and the tree was still climbing at 1.1 GB 55 s later, because each request re-serialises the whole session.
+
+**`--agent build` is not the fix for that**, and neither is `--mini`. A run with `--agent build` still hit the compaction prelude at 43.5 s. The auto-approval path needs the full TUI (`--auto` without `--mini`).
+
+**Zombies and kernel threads publish a `/proc/<pid>/status` with no `VmRSS` line.** A 150 s × 5-run sampling loop hits this: run 1 of a full pass died with `invalid process-tree data for pid 1951313 at /proc/1951313/status: VmRSS field is absent`. Such a process holds no resident memory, so it must contribute nothing rather than abort a measurement already underway — but a `VmRSS` line that is *present and unparsable* must still fail, since that would be a format the code misreads.
+
+**`mise` shims are not the binary.** `which opencode` resolves to `/config/.local/share/mise/shims/opencode`, a symlink to `/config/.local/bin/mise`. It works interactively but the absolute installs path is what belongs in a baseline: a launcher inside the measured process tree is a launcher inside the measured RSS.
+
+**Do not point the harness at the live `opencode.db`.** It is **54 GB** with an 815 MB WAL. A `sqlite3 .backup` of it ran **4 h 7 min**, had written a 19 GB partial copy, and was still going when I killed it — it had taken `/config` from 674 GB to 693 GB used. `opencode.db.bak.20260408` (2.6 GB, 2,345 sessions, 92,378 messages, 329,432 parts) backs up in ~50 s and is what every measured run used, via `OPENCODE_DB`.
+## Task 27
+
+- The genuine corpus contains 47 SSE responses across 36 cassettes. It has 446 LF blank-line separators. The only CRLF blank-line separators are one each in `gemini/gemini-2-5-flash-image`, `gemini/streams-text`, and `gemini/streams-tool-call` (3 total).
+- Incremental UTF-8 rule: emit only the valid prefix; when `Utf8Error::error_len()` is `None`, buffer the incomplete trailing bytes and prepend them to the next network chunk. Emit U+FFFD only for a genuinely invalid sequence or an unfinished code point at end-of-stream.
+- The recordings preserve SSE frame boundaries but not original network chunk boundaries or timing, so the every-byte split sweep is required independently of cassette replay.
+
+
+## Task 25
+
+**The bundled-factory count is 24, not 23.** The plan (`.omo/plans/opencode-rust.md:364-370`) and the task brief both say "23 bundled SDK factories". `BUNDLED_PROVIDERS` in `packages/opencode/src/provider/provider.ts` opens at line 107 and closes at line 134, and holds **24** keys. `awk 'NR>=107 && NR<=136' … | grep -c '^[[:space:]]*"'` → `24`. The cited line range in the plan is correct; only the count is one low. Three independent ways of counting, none of which yields 23:
+
+- **24 registry keys**, in source order: `@ai-sdk/amazon-bedrock`, `@ai-sdk/amazon-bedrock/mantle`, `@ai-sdk/anthropic`, `@ai-sdk/azure`, `@ai-sdk/google`, `@ai-sdk/google-vertex`, `@ai-sdk/google-vertex/anthropic`, `@ai-sdk/openai`, `@ai-sdk/openai-compatible`, `@openrouter/ai-sdk-provider`, `@ai-sdk/xai`, `@ai-sdk/mistral`, `@ai-sdk/groq`, `@ai-sdk/deepinfra`, `@ai-sdk/cerebras`, `@ai-sdk/cohere`, `@ai-sdk/gateway`, `@ai-sdk/togetherai`, `@ai-sdk/perplexity`, `@ai-sdk/vercel`, `@ai-sdk/alibaba`, `gitlab-ai-provider`, `@ai-sdk/github-copilot`, `venice-ai-sdk-provider`.
+- **24 distinct SDK factory functions.** Every key resolves to its own `create*` export. `@ai-sdk/openai-compatible → createOpenAICompatible` and `@ai-sdk/github-copilot → createOpenaiCompatible` (from `@opencode-ai/core/github-copilot/copilot-provider`) differ in both module and capitalisation — two functions, not one.
+- **22 distinct npm packages.** `@ai-sdk/amazon-bedrock` contributes two keys (base and `/mantle`) and `@ai-sdk/google-vertex` two (base and `/anthropic`), via subpath exports rather than separate packages.
+
+Nothing in todo 25 depends on the number — the registry is keyed by string — but **todo 26 (catalog) and todos 29/30/94/95/96 do**, and a hard-coded 23 would silently drop one.
+
+**Separately, `custom()` at `provider.ts:168` returns 22 loaders**, which is a different set from `BUNDLED_PROVIDERS` and keyed by *provider id* (`opencode`, `openai`, `meta`, `xai`, `github-copilot`, `azure`, `azure-cognitive-services`, `amazon-bedrock`, `llmgateway`, `openrouter`, `nvidia`, `vercel`, `google-vertex`, `google-vertex-anthropic`, `sap-ai-core`, `zenmux`, `gitlab`, `cloudflare-workers-ai`, `cloudflare-ai-gateway`, `cerebras`, `kilo`, `snowflake-cortex`) rather than by npm name. A provider id and an npm package name are **not** interchangeable keys; todo 26 needs both maps.
+
+**Three of those loaders route to a different SDK surface per call, and that is what forces `Spec` to carry per-provider parameters:**
+
+- `selectAzureLanguageModel` (`provider.ts:154-160`) walks `chat` → `responses` → `messages` → `languageModel`, gated on a `useChat` flag. Its endpoint is assembled from a `resourceName` resolved from provider options, then env, then stored auth. Needs base URL + API version + a construction-time surface.
+- `selectBedrockMantleLanguageModel` (`:162-166`) sends model ids `openai.gpt-oss-safeguard-20b` and `-120b` to `chat()` and everything else to `responses()`, falling back to `languageModel()`. Routing is **per model**, not per provider, and sits on top of a region for the signer.
+- `github-copilot`'s `getModel` (`:225-239`) prefers `model.api.endpoint` when the catalog declares one, else matches `/^gpt-(\d+)/` and picks `responses()` when `N >= 5` and the id is not `gpt-5-mini`, else `chat()`. Also **per model**.
+
+So the surface choice lives in two places, not one: `Spec.surface` for a choice fixed at construction (Azure), `CompletionRequest.surface` for a choice made per model (Mantle, Copilot). A registry keyed only by provider name cannot express any of the three.
+
+## Task 22 - message/part payload parity (crates/oc-db/src/message.rs)
+
+### The `Part` union has TWELVE variants, not the nine the plan lists
+`packages/schema/src/v1/session.ts:357-370` is the authority. Todo 22's list omits
+`snapshot`, `agent` and `retry`. They are live: the real 1.18.12 binary's
+`opencode export` decoded and re-emitted all three from rows this crate wrote.
+Todos 34 (stream projection), 76 (TUI rendering) and 101 (FTS) must handle twelve.
+
+### Discriminator and payload shape, per variant
+`type` is the discriminator on every part. `req`/`opt` per Schema.optional.
+
+| tag | required | optional |
+|---|---|---|
+| `text` (:102) | `text` | `synthetic`, `ignored`, `time{start,end?}`, `metadata` |
+| `subtask` (:204) | `prompt`, `description`, `agent` | `model{providerID,modelID}`, `command` |
+| `reasoning` (:118) | `text`, `time{start,end?}` | `metadata` |
+| `file` (:171) | `mime`, `url` | `filename`, `source` (union on `type`: `file`/`symbol`/`resource`) |
+| `tool` (:315) | `callID`, `tool`, `state` | `metadata` |
+| `step-start` (:233) | *(none)* | `snapshot` |
+| `step-finish` (:240) | `reason`, `cost`, `tokens{input,output,reasoning,cache{read,write},total?}` | `snapshot` |
+| `snapshot` (:87) | `snapshot` | - |
+| `patch` (:94) | `hash`, `files[]` | - |
+| `agent` (:181) | `name` | `source{value,start,end}` |
+| `retry` (:220) | `attempt`, `error`(APIError), `time{created}` | - |
+| `compaction` (:195) | `auto` | `overflow`, `tail_start_id` |
+
+`tool.state` is a **nested** union discriminated on `status` (:304-312):
+`pending{input,raw}` / `running{input,time{start},title?,metadata?}` /
+`completed{input,output,title,metadata,time{start,end,compacted?},attachments?}` /
+`error{input,error,time{start,end},metadata?}`. `attachments` is `FilePart[]` -
+i.e. **parts nested inside a part's payload**, each carrying its own
+id/sessionID/messageID (those are NOT stripped when nested; only the top-level
+row's are).
+
+`message.data` keeps `role`, the `Info` discriminator (:490).
+`user` (:332) requires `role`, `time{created}`, `agent`, `model{providerID,modelID,variant?}`.
+`assistant` (:453) requires `role`, `time{created,completed?}`, `parentID`,
+`modelID`, `providerID`, `mode`, `agent`, `path{cwd,root}`, `cost`, `tokens{...}`.
+
+### The strip contract, both directions
+`sql.ts:19-20` states it as a subtraction:
+`V1MessageData = Omit<Info,"id"|"sessionID">`,
+`V1PartData = Omit<Part,"id"|"sessionID"|"messageID">`.
+Write side is `projector.ts:78-88`; read side is `message-v2.ts:80-93`, which puts
+them back **from the columns**. Confirmed empirically: `opencode export` on a
+Rust-written session printed `id`/`sessionID` inside `info`, sourced from the
+columns, and no real `part.data` in a 1M-row production table contains any of the
+three keys.
+
+### Variants actually present in the user's real database
+51 GiB `opencode.db`, 233 500 messages, **1 035 733 parts**, counted read-only:
+`tool` 317980, `step-start` 218899, `step-finish` 217066, `reasoning` 129099,
+`text` 108713, `patch` 42683, `compaction` 1255, `file` **37**, `subtask` **1**.
+`snapshot`/`agent`/`retry` = 0 in this install.
+The long tail matters: a fixture-only suite would plausibly get `file` and
+`subtask` wrong and nothing would notice.
+
+### Real rows carry fields the schema does not declare
+A production `file` part has `synthetic`, which is **not** in `FilePart` at
+`:171` (it is in `TextPart`). A strict typed decoder would have dropped it and
+broken the round trip for every attachment a user has. This is why the blob is
+carried as `serde_json::Map` and only the discriminator is typed - parity beats
+type safety on a column whose writer is another program.
+
+`step-start` blobs in production are literally `{"type":"step-start"}` - a
+one-key object with no payload at all.
+
+### `opencode export <sessionID>` is the sharpest available parity oracle
+It decodes both `data` blobs through the TypeScript schema before printing, so a
+wrong field name or an unknown tag fails there rather than silently rendering
+wrong. Works headless with `--pure` and an isolated `HOME`/`XDG_*`, exits 0, and
+prints the `{info, parts}` hydration shape. Costs under a second. Any future task
+touching either blob should use it. `opencode db --pure --format json <sql>` (the
+harness Todo 20 built) is the weaker cousin - it proves the file opens, not that
+the payload decodes.
+
+### rusqlite 0.40.1 statement tracing
+No `set_authorizer` in this version. `Connection::trace_v2(TraceEventCodes::
+SQLITE_TRACE_STMT, Some(f))` works and needs only `&self`; disable with
+`TraceEventCodes::empty()` (there is no `SQLITE_TRACE_NONE` constant). The
+callback is a bare `fn` pointer - it cannot capture - so a tally must live in a
+`static AtomicUsize`. Requires the `trace` feature, added additively on the
+crate's own `rusqlite` line without touching the root manifest.
+
+## Task 21 — session CRUD, the three list scopes, the subtree delete
+
+### `remove()`'s exact order of operations
+
+`packages/opencode/src/session/session.ts:608-629`, with the two steps it defers
+to elsewhere:
+
+1. `:609` — `get(sessionID)`; a missing session fails before anything is deleted.
+2. `:613-618` — `cancelBackgroundJobs(background, sessionID)`, guarded by a
+   `hasInstance` check so a broken session can still be cleaned up without
+   instance state. The filter is at `:940-955`: a running job whose `id`,
+   `metadata.sessionId` **or** `metadata.parentSessionId` is this session.
+3. `:619-622` — `const kids = yield* children(sessionID)`, then `remove(child.id)`
+   for each. **The whole subtree delete is application code.** Children are fully
+   removed before the parent.
+4. `:624` — publish `SessionV1.Event.Deleted`, whose projector is the *only* real
+   row delete: `projector.ts:259-261`,
+   `db.delete(SessionTable).where(eq(SessionTable.id, event.data.sessionID))`.
+5. `:625` — `events.remove(sessionID)` → `core/src/event.ts:513-523`:
+   `DELETE FROM event_sequence WHERE aggregate_id = ?` **then**
+   `DELETE FROM event WHERE aggregate_id = ?`, both inside one `db.transaction`.
+   Order matters only cosmetically here (`event.aggregate_id` cascades from
+   `event_sequence`), but both statements are explicit upstream.
+6. `:626-628` — the whole body is inside a `try`, and a failure is *logged, not
+   propagated*. Rust's `remove` returns the error instead; swallowing it would
+   report a delete that did not happen.
+
+`parent_id` has **no foreign key and no cascade** — the only FK on `session` is
+`project_id → project(id) ON DELETE CASCADE` (`schema.rs:153-184`). So step 3 is
+not an optimisation, it is the only thing that removes descendants.
+
+Two tables need explicit sweeps beyond the declared cascades:
+
+- **`part`** — `part.session_id` is `part_session_idx`, an index, never a
+  constraint; the only FK on `part` is `message_id → message(id)`. A part whose
+  message belongs to a *surviving* session is invisible to the cascade and
+  outlives its own session with a dangling `session_id`. Reproduced in the
+  fixture as `prt_orphan` and swept with `DELETE FROM part WHERE session_id = ?`.
+- **`event` / `event_sequence`** — keyed by `aggregate_id`, a plain text column
+  with no schema-visible relationship to `session.id`.
+
+`parent_id` having no FK also means nothing prevents an `a → b → a` cycle, so the
+subtree walk is iterative with a visited set rather than recursive. A cycle
+terminates instead of overflowing the stack; there is a test for it.
+
+### The three scopes' SQL predicates
+
+The scopes are mutually exclusive because upstream's schema says so:
+`ListInput = Schema.Union([ListDirectoryInput, ListProjectInput, ListAllInput])`
+(`core/src/session.ts:56-76`). Modelled as an enum, not three `Option` fields.
+
+| scope | predicate | oracle |
+| --- | --- | --- |
+| directory | `directory = ?` (exact, never a prefix) | `core/src/session.ts:274`, `session.ts:559` |
+| project | `project_id = ?` | `core/src/session.ts:276` |
+| project + subpath | `path = ? OR substr(path,1,length(?)+1) = ? \|\| '/'` | see below |
+| global | none | `core/src/session.ts:294` (`undefined` where clause) |
+
+Narrowing filters, all scope-independent: `workspace_id = ?` (`:275`),
+`parent_id IS NULL` for roots (`session.ts:560`), `title LIKE '%?%'`
+(`session.ts:563`), `<sort> >= ?` for `start` (`:561`), `<sort> < ?` for the
+keyset `cursor` (`:562`), `time_archived IS NULL` (`:564`).
+
+Ordering: `time_updated DESC, id DESC` (`session.ts:574`). The `id` tie-break is
+load-bearing, not decorative — `time_updated` is a millisecond clock reading, so
+two sessions in the same millisecond would otherwise come back in an arbitrary
+order, and a keyset cursor over an unstable order skips or repeats rows. The
+opt-in `created` sort swaps in `time_created`, which is what the v2 list uses
+(`core/src/session.ts:272`).
+
+Two upstream inconsistencies worth knowing, both surfaced rather than papered
+over:
+- `listGlobal` defaults `limit` to 100 (`:575`) and `listByProject` to 100
+  (`:997`), while the v2 `list` applies none (`core/src/session.ts:299`). The
+  Rust `ListQuery::limit` is `Option`, unset by default, with the constant
+  exported as `UPSTREAM_LIST_LIMIT` so the request layer applies it where
+  upstream does. A store that silently truncated at 100 is indistinguishable from
+  a store that only had 100 rows.
+- `listGlobal` hides archived sessions unless asked; `listByProject` has no
+  archived handling and returns them. Rust makes it an explicit
+  `ArchivedFilter`, defaulting to hiding nothing.
+
+### What `subpath` should filter on
+
+`session.path`, which is the **worktree-relative** directory, written once at
+creation by `sessionPath` (`session.ts:171-173`):
+`path.relative(path.resolve(worktree), cwd).replaceAll("\\", "/")`. Called at
+both create sites, `:683` and `:699`.
+
+Consequences that matter:
+- **A session at the worktree root stores `""`, not `NULL`.** `path.relative` of
+  a directory against itself is the empty string and `toRow` stores it verbatim.
+  Upstream then treats that empty string as *absent* in two places —
+  `info.ts:42` (`row.path ? make(row.path) : undefined`) and `listByProject`'s
+  `if (input.path)` guard (`:969`) — which is why writing `NULL` instead would
+  land in a different branch of the oracle's
+  `OR (path IS NULL AND directory = ?)` arm (`:980-984`).
+- The comparison is **lexical**, never filesystem-resolved. `path.relative` does
+  not touch the disk, does not resolve symlinks, and does not require either path
+  to exist. `std::fs::canonicalize` does all three and would diverge on any
+  worktree reached through a symlink (macOS `/tmp → /private/tmp`, a symlinked
+  home). `src/session/path.rs` reimplements Node's `normalizeString` textually.
+- Prefix semantics come from the legacy filter (`session.ts:969-984`): the
+  subpath itself **plus everything beneath it**, i.e. `path = ?` OR
+  `path LIKE ? || '/%'`. The trailing `/` is what stops `pkg` from matching
+  `pkgx`.
+
+### `create`'s field set
+
+`session.ts:513-533`: `id` (`SessionID.descending()`), `slug` (`Slug.create()`),
+`version` (`InstallationVersion`), `projectID` from `ctx.project.id`, `directory`,
+`path`, `workspaceID`, `parentID`, `title` defaulting to
+`(parentID ? "Child session - " : "New session - ") + new Date().toISOString()`
+(`:48-49`, `:523`), `agent`, `model`, `metadata`, `permission`, `cost: 0`,
+`tokens: EmptyTokens`, `time.created == time.updated == Date.now()`.
+
+The projector inserts with `onConflictDoNothing` and treats a conflict as
+`SessionAlreadyProjected` (`projector.ts:215-224`), which the create path
+resolves in favour of the row already on disk — "Concurrent creation lost the
+projection race. The existing Session identity wins." (`core/src/session.ts:249-259`).
+Rust returns a `Creation::{Inserted, AlreadyExists}` enum so a caller can tell a
+fresh session from one it lost a race for; returning a bare row would hide it.
+
+`id` and `slug` are **not** generated in this module. Upstream generates them
+outside the store too, and both are identifier concerns with their own byte
+format (`packages/schema/src/identifier.ts`: 26 chars, 6 hex bytes of
+`~(timestamp * 0x1000 + counter)` then 20 base-62 random) — a later id todo owns
+that, not the storage layer.
+
+### `touch`
+
+`session.ts:751-753` — `patch(sessionID, { time: { updated: Date.now() } })`,
+nothing else. Because it goes through `patch`, which reads the session first, a
+missing session is an error rather than a silent no-op; Rust reports
+`DbError::NotFound` and asserts it.
+
+## Task 31
+- Per-provider effort fields from the TypeScript oracle: OpenAI/Azure/Mantle and compatible providers use `reasoningEffort` (`transform.ts:935-974,1750-1769`); Anthropic uses `thinking.budgetTokens` or adaptive `thinking` plus top-level `effort` (`:976-1022,1779-1800,1807-1809`); Bedrock uses `reasoningConfig` (`:1024-1069,1813-1814`); Google/Vertex uses `thinkingConfig` (`:703-718,1071-1075,1810-1812`); OpenRouter uses `reasoning.effort` (`:745-750,801-808`).
+- The default reasoning path also matters to provider adapters: `transform.ts:1273-1297` installs medium effort plus reasoning summary/encrypted reasoning where supported, and `:1352-1410` gates and namespaces those options.
+- Exact prompt split: the reference puts base prompt, self-dev guidance, AGENTS instructions, prompt overlays, preferred-tool guidance, and the available-skill catalog in the static prefix (`jcode-base/src/prompt.rs:478-530`). Memory and active skill begin the dynamic side at `:533-547`; per-turn reminders and effort directives append to that dynamic side (`jcode-app-core/src/agent/prompting.rs:70-124`). This implementation freezes only caller-supplied project/session-stable text in `PromptCache::new`; all memory and turn context must enter through `DynamicContext`, which creates the final user message.
+- The integrated three-turn test proved identical static bytes while dynamic clock/memory changed, append-only history grew, and late MCP caused one tool-list rebuild only.
+
+## Task 28
+
+### Full stream event vocabulary (24 variants)
+`TextDelta`, `ToolUseStart`, `ToolInputDelta`, `ToolUseEnd`, `ToolUseSignature`, `ToolResult`, `GeneratedImage`, `ReasoningStart`, `ReasoningDelta`, `ReasoningSignatureDelta`, `ProviderReasoningItem`, `ReasoningEnd`, `ReasoningDone`, `MessageEnd`, `RetryRollback { attempt, max }`, `TokenUsage`, `ConnectionType`, `ConnectionPhase`, `StatusDetail`, `Error { message, retry_after }`, `SessionId`, `Compaction`, `UpstreamProvider`, `NativeToolCall`.
+
+### Five reasoning representations and why they cannot be collapsed
+1. `ContentBlock::Reasoning` is unsigned/plain reasoning. It remains in the transcript but generic replay excludes it because providers such as Anthropic reject thinking without the matching signature.
+2. `ContentBlock::ReasoningTrace` is history/debug-only. It remains available for recall but is never replayed, preventing permanent token cost with no model benefit.
+3. `ContentBlock::SignedThinking { thinking, signature }` preserves the provider signature beside the text, making later replay valid.
+4. `ContentBlock::ProviderEncryptedReasoning { id, summary, encrypted_content, status }` preserves a provider-native replay item, notably OpenAI Responses reasoning state when `store=false`.
+5. `ThoughtSignature` is a separate newtype stored per `ToolUse`, not a reasoning-block signature. Gemini 3 requires it on the matching future `functionCall`; dropping or misattaching it breaks multi-turn tool use.
+
+### Verified Part count and projection reachability
+`packages/schema/src/v1/session.ts:357-370` declares exactly 12 variants, in order: `text`, `subtask`, `reasoning`, `file`, `tool`, `step-start`, `step-finish`, `snapshot`, `patch`, `agent`, `retry`, `compaction`. This confirms Todo 22's correction. Provider events directly carry text, reasoning, tool, file/image, step completion/usage, retry, and compaction data. Step start, snapshot, patch, agent, and subtask are generated from engine/session context at the corresponding event boundary; they are not payloads a provider sends, so the 24-variant provider vocabulary is complete without inventing provider events for engine-owned data.
+
+`StreamEvent::Error.retry_after` uses `Option<std::time::Duration>`, matching `oc_error::ProviderError::RateLimited` rather than losing precision in an integer-seconds field.
+
+## Task 38 — `oc-tool`: the tool trait, schemars schemas, central augmentation
+
+**Todos 39-44, 47, 65, 70, 99-100 implement against this.** Read this section before
+writing a tool; you should not need to write a JSON schema or a `ToolContext`.
+
+### The trait you implement: `TypedTool`
+
+```rust
+#[async_trait]
+pub trait TypedTool: Send + Sync + 'static {
+    type Params: JsonSchema + DeserializeOwned + Send;
+    fn id(&self) -> &str;
+    fn description(&self) -> &str;
+    async fn run(&self, params: Self::Params, ctx: ToolContext) -> Result<ToolOutput, ToolError>;
+}
+```
+
+Declare a params struct with `#[derive(Deserialize, JsonSchema)]`, doc-comment each
+field (schemars turns them into the `description` the model reads), use `Option<T>`
+for optional fields (that is where `required` comes from). **Write no JSON.** Then
+`oc_tool::erase(MyTool)` gives you `Arc<dyn Tool>` for the registry.
+
+`#[serde(deny_unknown_fields)]` is safe: the injected properties are stripped from the
+arguments before your params struct sees them, and schemars emits
+`additionalProperties: false` which the injected properties satisfy because they are in
+`properties`.
+
+### The object-safe trait the registry stores: `Tool`
+
+```rust
+#[async_trait]
+pub trait Tool: Send + Sync {
+    fn id(&self) -> &str;
+    fn description(&self) -> &str;
+    fn raw_parameters_schema(&self) -> Value;      // un-augmented, named for it
+    async fn execute(&self, args: Value, ctx: ToolContext) -> Result<ToolOutput, ToolError>;
+    fn definition(&self) -> ToolDefinition { /* THE augmentation point */ }
+}
+```
+
+Implement `Tool` **directly only for MCP proxies** (todo 47), where no Rust type
+describes the parameters. `ToolDefinition { id, description, parameters }`.
+
+### The augmentation: injected keys and their cost
+
+Injected by `Tool::definition` into every object schema, derived or proxied:
+
+| key | type | in `required`? | description |
+|---|---|---|---|
+| `intent` | `string` | **yes** | `Required short label shown in the UI: why this call is being made.` |
+| `accept_large_output` | `boolean` | no | `Re-run accepting the stated token cost of a withheld result.` |
+
+**Cost: 237 bytes of compact JSON per tool per request** (measured: 373 → 610 on a
+three-field params struct; `tests/schema_augmentation.rs` pins the ceiling at 260).
+With ~19 tools exposed that is ~4.5 KB on every request for the life of a session, so
+if you add a third cross-cutting property, justify it against that number. Descriptions
+are deliberately terse; the long explanation belongs in the refusal message, which is
+only rendered when relevant.
+
+Read the keys back with `guard::intent(&args) -> Option<&str>` and
+`guard::accepts_large_output(&args) -> bool`. Never re-type the literals — use
+`schema::INTENT_KEY` / `schema::ACCEPT_LARGE_OUTPUT_KEY`.
+
+Three deliberate schemars settings, each paid per request: **draft-07** (what
+tool-calling APIs consume; the 2020-12 default uses `$defs`/`$dynamicRef` providers do
+not implement), **`inline_subschemas = true`** (a `$ref` hop providers handle
+inconsistently), and **`$schema` + `title` stripped** (46 bytes no provider reads, plus
+the Rust type name, which says nothing the tool's id does not).
+
+### `ToolContext` fields
+
+```rust
+pub struct ToolContext {
+    pub session_id: String,
+    pub message_id: String,
+    pub call_id: String,
+    pub agent: String,
+    pub depth: u32,                            // 0 at turn level; for_subcall increments
+    pub permission: Arc<dyn PermissionAsker>,
+    pub interrupt: Arc<dyn InterruptHandle>,
+}
+```
+
+Methods: `new(...)`, `for_subcall(call_id)`, `is_interrupted() -> bool` (sync, no
+runtime needed), `ask(tool, PermissionAsk) -> Result<(), ToolError>`, `tool_call() ->
+oc_permission::ToolCall`. `Clone` is cheap and shares the two collaborators.
+
+Test helpers exported: `AllowAll`, `DenyAll`, `NeverInterrupted`.
+
+`PermissionAsk { permission, patterns, metadata, always }` — the oracle's
+`Omit<Request, "id"|"sessionID"|"tool">`. `PermissionAsk::new(permission, pattern)` for
+the common case; `into_request(id, session_id, tool)` completes it. Map your tool id to
+its permission key with `oc_permission::visibility::permission_key` — do **not** pass
+the raw tool id (`edit`/`write`/`apply_patch` share one key).
+
+### `ToolOutput`
+
+```rust
+pub struct ToolOutput {
+    pub title: String,
+    pub output: String,
+    pub metadata: serde_json::Map<String, Value>,
+    pub attachments: Vec<Attachment>,
+}
+```
+
+`ToolOutput::text(title, output)`, `.with_metadata(k, v)`, `.with_attachment(a)`.
+`Attachment { mime, filename, url, source }` serializes to the oracle's `FilePart`
+minus the three ids: `{"type":"file","mime":…,"filename":…,"url":…}`. `source` is a
+`Value` on purpose — it is the `FileSource | SymbolSource` union the message-part layer
+owns, and re-declaring it here would be a second copy.
+
+### Size detection (NOT policy)
+
+`OutputLimits::from_config(Option<&ToolOutputConfig>)` → defaults 2000 lines /
+51200 bytes, **each field defaulted independently** (the oracle applies `??` at read
+time, so a config setting only `max_lines` keeps the default `max_bytes`).
+
+`measure(text, limits) -> SizeMeasurement { lines, bytes, limits, verdict }`;
+`verdict: SizeVerdict::{WithinLimits, Oversized(LimitExceeded::{Lines,Bytes,Both})}`.
+Lines = `'\n'` count + 1 (so `""` is 1 line), bytes = UTF-8 bytes. Limits are
+**inclusive** — exactly at the limit fits, matching the oracle's `<=`.
+
+`ToolOutputStore::{in_layout, new, persist, read, entries}` writes the full text with
+`create_new` (the oracle's `flag: "wx"`). `ToolOutput::record_output_path(&path)`
+appends to the `outputPaths` metadata key; `output_paths()` reads it back.
+
+**This crate does not truncate and does not decide what the model sees on overflow.**
+That is todo 72's alone.
+
+## Task 26
+
+### The three catalog env vars, exactly
+
+| var | parsing | effect |
+|---|---|---|
+| `OPENCODE_MODELS_URL` | JavaScript `||` — **`""` means unset** (`models-dev.ts:160`) | changes the source **and** the cache filename |
+| `OPENCODE_MODELS_PATH` | raw value (`flag.ts:46`) | read this file **instead of the cache**; never written to |
+| `OPENCODE_DISABLE_MODELS_FETCH` | `Flag.truthy` (`flag.ts:3-6`) — only `"1"` and case-insensitive `"true"` | no fetch, ever, including the 60-minute startup refresh |
+
+`=0`, `=no`, `=yes`, `=2` all leave fetching **enabled**. `oc-paths::Env` already has
+both parsers (`truthy_value` and `flag`); do not re-parse strings.
+
+### Cache path rules
+- default source → `<cache>/opencode/models.json`
+- any other source → `<cache>/opencode/models-<sha1(source)>.json`, SHA-1 over the
+  URL's raw UTF-8 bytes, lowercase hex (`models-dev.ts:161-164`), so a mirror cannot
+  poison the default cache.
+- `oc_paths::Layout::models_cache()` / `models_cache_for_source()` already implement
+  this. `XDG_CACHE_HOME` is the only override; `OPENCODE_CONFIG_DIR` does **not**
+  affect the cache.
+- TTL is 5 minutes (`:165`); write is temp-file-then-rename with pid+millis in the
+  temp name (`:202-215`).
+- A corrupt **cache** is deleted and treated as a miss; a corrupt/absent **explicit
+  path** is an error and is never deleted (`:184-196`). The asymmetry is deliberate:
+  a cache is ours, a path is the user's instruction.
+
+### Availability precedence, verified in isolation against 1.18.12
+Three independent sources, applied in this order, **last sufficient one wins**:
+1. env var — first *declared* var (catalog order) with a non-empty value (`provider.ts:1527`)
+2. stored auth — **only `type: "api"`** (`:1540`)
+3. config — the mere existence of a `provider.<id>` block (`:1588-1595`)
+
+Each verified alone with a pinned catalog and isolated HOME: env var alone → provider
+appears; `auth.json {"type":"api"}` alone → appears; `{"provider":{"groq":{}}}` alone,
+no credential at all → appears. **`auth.json {"type":"oauth"}` alone → NOTHING.**
+OAuth providers reach availability through their own `custom()` loader, which knows
+how to refresh; the generic path must not guess. Todos 29/30/94/95/96 own that.
+
+### `opencode models` sorts with ICU collation, not byte order
+`models.ts:38`/`:56-62` use `localeCompare`. It disagrees with `str::cmp` on real
+catalog data (`"glm-5-turbo" < "glm-5.1"` under ICU, the reverse byte-wise). Every id
+in the whole 180-provider catalog is ASCII over 68 characters; over that alphabet
+`localeCompare` = primary level (punctuation `_ - : . @ / ~`, then digits, then
+case-folded letters, prefix-first) + tertiary case level (lowercase first). Verified
+over **all 4,753,986 pairs** of the 3,084 distinct ids: zero disagreements. Ported in
+`catalog/collate.rs`. Provider ids additionally float every `opencode*` id to the front.
+
+### With fetching disabled and no cache, the released binary is NOT empty
+`models-dev.ts` has three fallbacks, not one: cache (`:218`), then a **catalog
+snapshot compiled into the binary** (`OPENCODE_MODELS_DEV`, `:198-200`, read `:220-221`),
+then `{}` (`:222`). Rung 2 is live — `OPENCODE_DISABLE_MODELS_FETCH=1` with an empty
+cache still listed 7 `opencode/*` models and exited 0, writing no cache. So `return {}`
+is essentially unreachable in a release build. Any todo that quotes "returns an empty
+catalog" as the oracle's behaviour is quoting rung 3.
+
+### A model with no catalog entry, on `@ai-sdk/openai-compatible`, whose wire id
+contains `deepseek`, defaults to `interleaved: {field: "reasoning_content"}`
+(`provider.ts:1485-1487`), gated on there being no existing entry. Real quirk, ported.
+
+### `tool_call` defaults to **`true`**
+Alone among the capability booleans (`provider.ts:1464`; every other one defaults
+`false`). A `false` default makes every config-declared model refuse to call tools.
+
+### Declaring `modalities` turns the undeclared ones OFF
+`:1466-1481` reads each flag independently, so `{"modalities":{"input":["image"]}}`
+turns image on **and text off**. Only an entirely absent `modalities` block inherits.
+
+## Task 96
+- Gemini request lowering is native: `systemInstruction.parts` holds system text; non-system messages become ordered `contents[]` entries with `role: user|model`; each block becomes a Gemini `parts[]` member (`text`, `inlineData`, `functionCall`, or `functionResponse`). No OpenAI-shaped serializer is used.
+- Verified canonical `thinkingConfig` mapping through `oc_llm::effort`: `off -> {includeThoughts:false,thinkingBudget:0}`; `low -> {includeThoughts:true,thinkingLevel:"low"}`; `medium -> {...,"medium"}`; `high|xhigh|max -> {...,"high"}`. Declared token-budget capability still selects `thinkingBudget`, including catalog maximum clamping.
+- `thoughtSignature` is a sibling of `functionCall` in one Gemini part. The stream decoder emits `ToolUseSignature(ThoughtSignature)` immediately after that tool input; the next-turn request places the unchanged value back on the matching assistant `functionCall` part.
+- Verified endpoint rules: Vertex Gemini uses `aiplatform.googleapis.com` for `global` and `<region>-aiplatform.googleapis.com` otherwise. Vertex-Anthropic uses `aiplatform.{us|eu}.rep.googleapis.com` for continental `us`/`eu`, `aiplatform.googleapis.com` for `global`, and `<region>-aiplatform.googleapis.com` for ordinary regions. Paths end in `:streamGenerateContent?alt=sse` for Gemini and `:streamRawPredict` for Anthropic.
+
+## Task 29 — Anthropic provider
+
+- Anthropic signed thinking is a three-stage wire protocol: `content_block_start`
+  identifies a `thinking` block, `thinking_delta` appends visible reasoning, and
+  `signature_delta` appends the opaque signature. The provider emits canonical
+  `ReasoningStart`, `ReasoningDelta`, `ReasoningSignatureDelta`, and
+  `ReasoningEnd` events; `StreamAccumulator` then keeps reasoning and signature
+  together for `RequestContentBlock::SignedThinking` replay.
+- Tool JSON arrives as one or more `input_json_delta.partial_json` fragments. The
+  provider brackets each call with `ToolUseStart`/`ToolUseEnd` and forwards every
+  fragment as `ToolInputDelta`; it does not parse incomplete JSON or execute tools
+  during streaming.
+- Anthropic usage is split across `message_start.message.usage` and
+  `message_delta.usage`. Input, cache-read, and cache-creation tokens come from the
+  first event; final output tokens come from the latter. The decoder retains all
+  four counters in one canonical `TokenUsage` event.
+- API-key and OAuth modes use different wire headers. API keys use `x-api-key`;
+  OAuth credentials use `Authorization: Bearer ...` plus Anthropic's OAuth beta
+  header. Both modes resolve credentials through `oc-auth`; cassette recordings
+  intentionally cannot prove auth headers because the recorder redacts secrets.
+- Cache control belongs on stable prompt content only. The serializer marks the
+  final static system block with `cache_control: {type:"ephemeral"}` and does not
+  mark dynamic message content. The real cache cassette confirms cache-creation
+  tokens on the first request and cache-read tokens on the second.
+- A successful response may report a model different from the requested model.
+  The stream surfaces this once as `StreamEvent::StatusDetail` rather than silently
+  accepting the substitution or treating it as a transport failure.
+
+## Task 95
+- AWS EventStream has 16 bytes of fixed framing overhead: the 8-byte big-endian
+  length prelude, 4-byte prelude CRC, and 4-byte message CRC. Absolute stream
+  offsets must be retained before draining the incremental buffer so corrupt-frame
+  diagnostics remain useful under arbitrary transport chunking.
+- Bedrock's outer `chunk` payload contains base64-encoded provider-native JSON, so
+  decoding requires two independent incremental UTF-8/JSON buffers: one for the
+  EventStream payload and one for the decoded inner bytes.
+- The published AWS S3 SigV4 vector is suitable for a Bedrock signer because the
+  signing algorithm is service-independent. The byte-exact expected signature is
+  `f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41`.
+- A full split sweep over the recorded 1,077-byte stream proved framing output is
+  invariant at every byte boundary; corrupting the final CRC produced a typed
+  error at absolute byte offset 149 rather than a panic.
+
+## Task 94 — the OpenAI-compatible profile: verified oracle rules and claimed ids
+
+### The Azure rule is NOT a model-id rule — the plan's wording is wrong
+
+`packages/opencode/src/provider/provider.ts:154-160`:
+
+```ts
+function selectAzureLanguageModel(sdk: any, modelID: string, useChat: boolean) {
+  if (useChat && sdk.chat) return sdk.chat(modelID)
+  if (sdk.responses)       return sdk.responses(modelID)
+  if (sdk.messages)        return sdk.messages(modelID)
+  if (sdk.chat)            return sdk.chat(modelID)
+  return sdk.languageModel(modelID)
+}
+```
+
+Called from `:265` (`azure`) and `:285` (`azure-cognitive-services`), both as
+`selectAzureLanguageModel(sdk, modelID, Boolean(options?.["useCompletionUrls"]))`.
+
+**`modelID` is accepted and never read.** Azure's selection is a surface-
+availability walk gated by one provider option. Todo 94's acceptance criterion
+asks for "Azure's model selection … per model id"; implementing that literally
+would invent behaviour the oracle does not have, and a test could then "confirm"
+a per-model Azure behaviour that does not exist. `surface.rs::azure_surface`
+therefore takes **no** `model_id` parameter, and
+`azure_picks_the_same_endpoint_for_every_model_id` asserts the absence of the
+dependency over 6 model ids. Only Copilot is genuinely per-model.
+
+Two Azure ids share the selector; they differ only in how the base URL is
+assembled (`:240-278` builds from a resource name; `:279-292` builds
+`https://<name>.cognitiveservices.azure.com/openai[/v1]`). That is spec data, so
+one `SurfaceRule::Azure` row serves both.
+
+### The Copilot rule, verified — `provider.ts:225-239`
+
+```ts
+if (sdk.responses === undefined && sdk.chat === undefined) return sdk.languageModel(modelID)
+if (model && "endpoint" in model.api) {
+  if (model.api.endpoint === "responses" && sdk.responses) return sdk.responses(modelID)
+  if (model.api.endpoint === "chat"      && sdk.chat)      return sdk.chat(modelID)
+}
+const match = /^gpt-(\d+)/.exec(modelID)
+if (match && Number(match[1]) >= 5 && !modelID.startsWith("gpt-5-mini")) return sdk.responses(modelID)
+return sdk.chat(modelID)
+```
+
+Three tiers: declared endpoint, then a `gpt-N` **version comparison** with one
+explicit exclusion, then chat. The version comparison is why this does not
+reintroduce the model-id literals that `oc-llm`'s
+`policy_sources_contain_no_model_id_literals` forbids — the only literal is
+`gpt-5-mini`, the oracle's own exclusion, which a version comparison cannot
+express. `gpt-41` routes to `/responses` because the regex captures all digits.
+`gpt-oss-20b` routes to `/chat/completions` because no digit follows `gpt-`.
+
+One divergence, documented at `copilot_surface`: after the declared-endpoint
+block the oracle calls `sdk.responses(...)` / `sdk.chat(...)` with no presence
+check, so a chat-only SDK plus `gpt-5` throws a `TypeError`. This port falls back
+to the available surface. No configuration the first guard admits can observe a
+different *successful* answer; only the crash is removed.
+
+### The 21 provider ids this profile claims
+
+`alibaba, azure, azure-cognitive-services, cerebras, cloudflare-ai-gateway,
+cloudflare-workers-ai, cohere, deepinfra, deepseek, github-copilot, gitlab, groq,
+meta, mistral, openai-compatible, openrouter, perplexity, togetherai, venice,
+vercel, xai` — plus any id whose config declares
+`provider.<id>.options.npm = "@ai-sdk/openai-compatible"`, which is the same
+opt-in the oracle reads (`provider.ts:108`, consumed at `:1198` and `:1485`).
+Silence is never consent: an unlisted, undeclared id is refused.
+
+Three of the claimed ids do not take the SDK default surface, per the oracle's own
+custom loaders: `xai` → `responses` (`:212-217`), `meta` → `responses`
+(`:218-223`), and OpenRouter/Vercel are pinned to `chat` because they are routers.
+`openrouter` and `vercel` additionally carry `routes_upstreams: true` — both put
+the resolved upstream in a top-level `provider` field on each chunk.
+
+### Six ids refused, with destinations
+
+`amazon-bedrock` → `oc-provider-bedrock` (95); `anthropic` →
+`oc-provider-anthropic` (29); `google`, `google-vertex`,
+`google-vertex-anthropic` → `oc-provider-google` (96); `openai` →
+`oc-provider-openai` (30). The refusal names the crate **and** why the wire
+differs, because "unsupported" alone sends the reader nowhere.
+
+### Cassettes replayed — 6 distinct vendors this profile claims
+
+| vendor | host | cassette |
+|---|---|---|
+| DeepSeek | `api.deepseek.com` | `openai-compatible-chat/deepseek-streams-text` |
+| Groq | `api.groq.com` | `openai-compatible-chat/groq-streams-tool-call` |
+| OpenRouter | `openrouter.ai` | `openai-compatible-chat/openrouter-streams-text` |
+| TogetherAI | `api.together.xyz` | `openai-compatible-chat/togetherai-streams-tool-call` |
+| Cloudflare Workers AI | `api.cloudflare.com` | `cloudflare-workers-ai/…gpt-oss-20b-tools-tool-call` |
+| Cloudflare AI Gateway | `gateway.ai.cloudflare.com` | `cloudflare-ai-gateway/…gpt-oss-20b-tools-tool-call` |
+
+The corpus holds **seven** OpenAI-compatible endpoints across 11 route
+directories / 40 files. The seventh is `api.openai.com` itself, whose provider id
+this profile **refuses**, so it is replayed only under a user-declared compatible
+id as canonical-shape evidence and is not counted toward the four.
+
+### What the corpus taught that no specification says
+
+- **`reasoning_content` exists only in the two Cloudflare cassettes.** Fourteen
+  `delta.reasoning_content` fragments each, and **the first is the empty string** —
+  so a reasoning block must open on the field's *presence*, not on non-empty
+  content. Nothing in the corpus emits `delta.reasoning`, `delta.thinking` or
+  `reasoning_details`; the profile reads `reasoning` too because gateways do send
+  it, but that is not corpus-verified.
+- **OpenRouter opens with an SSE comment frame**, `: OPENROUTER PROCESSING`. It
+  must not become an event. `oc_llm::sse::parse_frame` already drops `:`-prefixed
+  lines, which is why consuming that parser rather than writing one mattered here.
+- **Groq sends a tool call whole** — name and complete arguments in one fragment —
+  while **TogetherAI splits it**, sending `id`+`name` with empty arguments, then a
+  second fragment with arguments only, no `id`, no `name`. Both must produce one
+  bracketed call. Tool-call identity across chunks is `index`, not `id`.
+- **Duplicate terminal chunks are normal.** OpenRouter, TogetherAI and both
+  Cloudflare endpoints each send `finish_reason` on two chunks. Exactly one
+  `MessageEnd` may be emitted. Groq repeats its `usage` on a final
+  `choices: []` chunk — that second `TokenUsage` is kept, because suppressing it
+  would hide a real duplicate from whoever reconciles accounting.
+- **`tool_calls: null` and `usage: null` both occur.** `#[serde(default)]` covers
+  an absent key, not a present null, so a `Vec` field needs an explicit
+  null-tolerant deserializer.
+- **Vendors carry fields no schema mentions**: `obfuscation`,
+  `system_fingerprint`, `service_tier`, `x_groq`, `token_ids`, `stop_reason`,
+  `native_finish_reason`, `seed`, and a top-level `text`/`role` on TogetherAI's
+  `choices[]`. A `deny_unknown_fields` reader would turn every vendor release into
+  an outage.

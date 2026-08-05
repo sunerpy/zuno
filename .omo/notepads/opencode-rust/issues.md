@@ -1703,3 +1703,171 @@ against `opencode models`, which is the list the criterion means. Any later todo
 - Mitigation for future waves: land and merge a shared type BEFORE dispatching dependents, or
   paste the type's exact definition into every dependent's prompt. Also run
   `cargo test --workspace` (not just `build`) as the wave-integration gate.
+
+## Task 96
+- Recording inventory contains Gemini cassettes (`gemini/streams-text`, `gemini/streams-tool-call`, `gemini/gemini-2-5-flash-image`) but no filename/path containing `vertex`; therefore no Vertex-Anthropic traffic cassette exists. Tests honestly replay `gemini/streams-tool-call` end-to-end and replay `anthropic-messages/streams-tool-call` only as proof of the Anthropic wire decoder used by Vertex-Anthropic. Todo 87 should record a real Vertex-Anthropic cassette.
+- No unpinned crate was added. Workspace dependencies had no Google auth or RSA/JWT signing crate; service-account signing uses OpenSSL as documented in decisions.
+- **SUPERSEDED by task 106 — the OpenSSL subprocess is gone.** The line above described
+  `sign_service_account_assertion` writing the PEM private key to a `NamedTempFile` and
+  piping the JWT through `openssl dgst -sha256 -sign`. That violated the plan constraint
+  at `.omo/plans/opencode-rust.md:61` ("No OpenSSL") — shelling out to the binary evaded
+  the dependency check while still requiring OpenSSL at runtime, which no musl static
+  build has — and it spilled a private key to disk where a crash could strand it.
+  Signing is now in process via `aws-lc-rs` (already in the lock as rustls' crypto
+  provider; see task 106 in decisions). **The plan's no-OpenSSL constraint now holds:**
+  `grep -rn 'Command::new("openssl")' crates/` is empty, `cargo tree --workspace |
+  grep -i 'openssl-sys\|native-tls'` is empty, and the key never touches the
+  filesystem. Two tests in `crates/oc-provider-google/src/lib.rs` hold the line — a
+  known-answer test against an OpenSSL-produced reference signature, and a source scan
+  that fails the build if the shipped half of the crate regains `Command::new`,
+  `NamedTempFile`, `fs::write`, `File::create` or `OpenOptions`.
+- **For Todo 91:** its `cargo tree` assertion must exclude `openssl-probe` **explicitly**.
+  `openssl-probe v0.2.1` is in the tree via `rustls-native-certs` ←
+  `rustls-platform-verifier` ← `reqwest`; it only *locates* the host certificate store,
+  links nothing, and is legitimate. A naive `grep -i openssl` fails on it and would
+  either be reported as a violation that is not one, or — worse — get "fixed" by
+  loosening the check until it stops catching real OpenSSL. Assert on
+  `openssl-sys` and `native-tls` instead, which are the crates that actually link it.
+- Todo 32 must associate `StreamEvent::ToolUseSignature` with the immediately preceding tool call, persist it in `RequestContentBlock::ToolUse.thought_signature`, and never detach/reorder it. Gemini will reject or forget a replayed function call without its original signature.
+- The `lsp_diagnostics` MCP rejects sibling-worktree paths because its request cwd is the main worktree. Equivalent native LSP validation ran successfully with `rust-analyzer diagnostics crates/oc-provider-google --severity warning` from task-96 and emitted no diagnostics.
+
+## Task 29 — Anthropic provider
+
+- **Recording gap:** none of the committed `anthropic-messages` cassettes contains
+  `thinking_delta` or `signature_delta`, and none combines signed thinking, text,
+  and two tool calls in one response. The required interleaving and accumulator
+  behavior is covered by an authored protocol test, not claimed as cassette
+  parity. A future recording pass should capture a real extended-thinking response
+  with at least two tool calls and replace or supplement that authored case.
+- **Model-substitution recording gap:** no committed Anthropic cassette reports a
+  response model different from the request model. The one-warning behavior is
+  covered by an authored stream test. A real substitution recording is still
+  needed before claiming oracle parity for that case.
+- Cassette request headers are redacted by `@opencode-ai/http-recorder`, so the
+  recordings cannot verify `x-api-key` versus OAuth bearer headers. Unit tests
+  verify the two auth modes deterministically without exposing credentials.
+- The `lsp_diagnostics` MCP is rooted at the main worktree and rejects paths under
+  `/config/workspace/ProdDir/AI/oc-wt/t29`. Target tests, full workspace tests,
+  workspace build, all-target Clippy with `-D warnings`, and rustfmt all passed;
+  `rust-analyzer diagnostics crates/oc-provider-anthropic --severity warning`
+  also completed with no diagnostics. The MCP path restriction is the only
+  literal diagnostics-tool gap.
+
+## Task 95
+- `lsp_diagnostics` cannot address this sibling worktree because the tool validates
+  paths against the main request cwd. Native `rust-analyzer diagnostics` was used
+  instead; Bedrock had no errors or actionable warnings after removing one
+  unnecessary `else`. Remaining notices are expected inactive `#[cfg(test)]` code.
+- Resolving the task crate refreshed pre-existing incomplete lockfile entries for
+  sibling workspace crates (notably `oc-tool`) in addition to adding Bedrock's
+  dependencies. `Cargo.lock` is therefore required, but no root manifest change
+  belongs to Task 95.
+
+## Task 94 — unclassified ids, and what todo 32 must know
+
+### FOR TODO 32 (the turn loop) — behaviours it will observe from this profile
+
+1. **Two `TokenUsage` events can arrive for one turn.** Groq repeats its `usage`
+   on a final `choices: []` chunk, verified in
+   `openai-compatible-chat/groq-streams-tool-call`. The profile forwards both,
+   because suppressing a real duplicate would hide it from whoever reconciles
+   accounting. **The loop must take the last, or sum deliberately — not assume
+   one.**
+2. **`ToolUseStart` can carry an empty `id`.** Chat-completions identifies a call
+   across chunks by `index`, and a vendor may omit `id` entirely on the opening
+   fragment. The loop's tool-result repair pairs on the id it was given, so an
+   empty id needs a synthesized one **at the loop's boundary**, not inside the
+   provider — the provider must report what the wire said.
+3. **`UpstreamProvider` arrives before any content** for OpenRouter and Vercel,
+   once per stream. A status projector that assumes it comes at the end will miss
+   it.
+4. **`ReasoningStart` can be followed by zero `ReasoningDelta`s.** The first
+   `reasoning_content` fragment in both Cloudflare cassettes is the empty string,
+   which opens the block without emitting a delta. A consumer that renders a
+   reasoning header on the first *delta* will render nothing; one that renders on
+   `ReasoningStart` is correct.
+5. **`MessageEnd` is emitted exactly once even when the wire sends
+   `finish_reason` twice.** Verified across four vendors.
+6. **`RetryRollback` is never emitted by this profile.** It has no in-provider
+   retry; retry is `oc-error`'s `Recovery` acted on by the caller. If the loop
+   expects a provider-driven rollback signal, this family will not supply one.
+
+### FOR TODO 30 (the composition root) — what it must populate
+
+This crate reads five `Spec::options` keys, and **nothing populates them yet**:
+
+| key | consumed by | without it |
+|---|---|---|
+| `capabilities` | provider-level `Capabilities` | falls back to `compatible_default_capabilities()`: reasoning+tools+sampling on, attachments and prompt_cache off |
+| `modelCapabilities` | per-model narrowing | no model-level narrowing; **sampling params are sent to reasoning models and will 400** |
+| `extraBody` | effort resolution, arbitrary body keys | no reasoning effort reaches the wire |
+| `surfaces` | Azure/Copilot surface support | assumes chat+responses for both, chat-only elsewhere |
+| `modelEndpoints` | Copilot's declared endpoint | falls back to the `gpt-N` version check |
+
+`modelCapabilities` is the load-bearing one. The capability-driven stripping is
+correct and tested, but it is only *effective* once the catalog (todo 26) writes
+`sampling_params: false` for reasoning models into this map. Until then the
+stripping never triggers in production. **This is a real gap, not a design
+concern.**
+
+`surfaces` exists because the oracle decides surface availability by introspecting
+an npm package's shape (`sdk.chat !== undefined`), which a Rust process cannot do.
+The defaults are drawn from the oracle calling both `sdk.chat` and `sdk.responses`
+on Azure and Copilot without a guard beyond presence — a reasonable read, but a
+**declared** default rather than an observed one.
+
+### Provider ids I could NOT classify with confidence
+
+- **`llmgateway`** — appears in `transform.ts:1180` alongside
+  `@openrouter/ai-sdk-provider` (`input.model.api.npm === "@llmgateway/ai-sdk-provider"`),
+  so it takes OpenRouter's effort expression. It is **not** in
+  `BUNDLED_PROVIDERS` (`provider.ts:107-134`), so it has no factory in the oracle
+  and is presumably reached only through a plugin. **Not claimed.** A user
+  configuring it gets the unknown-id refusal, which tells them to declare
+  `options.npm`. If a later task finds it is genuinely bundled, one row in
+  `family.rs::CLAIMED` fixes it.
+- **`opencode`** — has a custom loader (`provider.ts:180-206`) that manipulates
+  the model list and an `apiKey: "public"` fallback, but the loader never names an
+  SDK, so which family serves it is not determinable from `provider.ts` alone.
+  **Not claimed.**
+- **`azure-cognitive-services`** — claimed, and I am confident about the selector
+  (`:285` calls the same function as `:265`). I am **less** confident about its
+  base-URL assembly: `:288-290` appends `/openai` and then `/v1` *unless*
+  `options.useDeploymentBasedUrls` is set. This profile takes the base URL as
+  given rather than assembling it, so **whoever wires Azure must build that URL**.
+  The `useDeploymentBasedUrls` option is read nowhere in this crate.
+- **`amazon-bedrock-mantle`** — not an id I refuse by name, only `amazon-bedrock`
+  is listed. The oracle keys Mantle off `model.api.npm === "@ai-sdk/amazon-bedrock/mantle"`
+  (`provider.ts:368`) rather than off a distinct provider id, so I could not
+  determine what registry key it would ever be resolved under. **If todo 95
+  registers a separate key, it should add the matching row to
+  `family.rs::ELSEWHERE`** so a user pointing it at this profile gets the pointer
+  rather than the generic unknown-id message.
+
+### `Cargo.lock` carries an unrelated repair
+
+Building this crate made cargo rewrite `Cargo.lock` with **98 inserted lines**.
+Ten are this crate's own dependency list. The rest record `oc-tool`'s
+`async-trait` / `schemars` closure: `crates/oc-tool/Cargo.toml` already declared
+those at `d7af235`, but the committed lock had **no dependency list at all** for
+`oc-tool`. Cargo repaired that as a side effect. Insertions only, no removals, so
+it is not a version change — but a sibling worktree building concurrently will
+produce the same repair, and the three branches will therefore **conflict on
+`Cargo.lock`**. Resolution is "take either"; the content is identical.
+
+### Not verified
+
+- **`ReqwestTransport` is never exercised against a real server.** It compiles and
+  is clippy-clean, but no test in this crate can open a socket by design. Its
+  header assembly, its `Retry-After` read and its error-body path are covered
+  through `classify_response` unit tests, which take the same inputs the transport
+  would hand them — but the reqwest call itself is untested.
+- **`ApiSurface::Responses` and `::Messages` bodies are chat-completions-shaped.**
+  The surface selects a *path* (`/responses`, `/messages`); the body this profile
+  writes is the chat-completions shape in all cases. That is correct for the
+  ids where the oracle uses an OpenAI-compatible SDK, and it is what the corpus
+  can verify — the corpus contains **no** compatible-vendor recording on a
+  `/responses` path. If Azure or Copilot on `/responses` needs OpenAI's Responses
+  request shape (`input` instead of `messages`, typed `response.*` SSE), **that is
+  a real gap and belongs to todo 30's crate**, which owns that shape. Nothing in
+  the recorded corpus lets me settle it either way, so I did not guess.

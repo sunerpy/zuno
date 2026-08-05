@@ -2276,3 +2276,225 @@ is `origin`. Cosmetic, but it is why the variants read the way they do.
   concatenates. Imported `crate::event::RequestContentBlock` in the test module only
   (`registry::provider` does not re-export it).
 - The five assertions still compare real message prose; nothing was weakened or ignored.
+
+## Task 96
+- Kept three explicit provider types/construction paths: `GoogleGenerativeAi` (API key + Gemini API), `VertexGemini` (GCP bearer auth + Gemini shape), and `VertexAnthropic` (GCP bearer auth + Anthropic shape). Shared code is limited to Gemini body/stream translation and transport helpers; Vertex-Anthropic does not pass through Gemini or OpenAI lowering.
+- GCP auth implements ADC order (`GOOGLE_APPLICATION_CREDENTIALS`, gcloud well-known file, metadata server), both standard ADC JSON forms (`authorized_user`, `service_account`), token caching/refresh, and explicit bearer tokens for deterministic tests. No JWT/RSA crate is pinned in workspace dependencies, and root `Cargo.toml` is out of scope, so service-account RS256 uses the installed OpenSSL CLI with a protected `NamedTempFile`; reqwest handles token exchange.
+- HTTP failures are classified from status plus exact structured error-code fields. Rendered provider messages are never inspected for retryability.
+
+## Task 29 — Anthropic provider
+
+- `AnthropicProvider` owns transport and authentication; request lowering,
+  stream decoding, and error classification are separate modules. This keeps the
+  `Provider` implementation small while making each protocol boundary directly
+  testable.
+- The provider uses `oc_llm::sse::SseParser` exclusively. It does not keep a local
+  line parser or perform lossy UTF-8 conversion, so partial multibyte code points,
+  CRLF frames, and trailing frames inherit the shared parser's tested behavior.
+- Error recovery is decided from HTTP status and structured Anthropic error
+  fields. Provider-rendered message text is retained only as payload for display;
+  it never selects `RateLimited`, `Transient`, `Auth`, `Refused`, or `Fatal`.
+  Numeric `retry-after` is preserved as `Duration`.
+- Signed thinking is replayed only through the canonical
+  `RequestContentBlock::SignedThinking { thinking, signature }` form. Plain
+  reasoning remains excluded by Todo 28's outbound type, preventing Anthropic
+  from receiving unsigned thinking.
+- Cache breakpoints are deterministic: only the last non-empty static system
+  block receives ephemeral cache control. Per-turn messages remain unmarked, so
+  a changing clock, memory item, or tool result cannot poison the stable prefix.
+- Real recordings are strict request-and-event golden tests through
+  `CassettePlayer`, including both interactions of the tool loop and cache cases.
+  Auth headers, interleaved signed thinking, two simultaneous tool calls, and
+  model substitution use authored unit tests because no committed recording
+  contains those wire cases; they are not represented as recorded evidence.
+
+## Task 95
+- Implemented SigV4 locally using the already-pinned `sha2` crate rather than
+  introducing an AWS SDK/signing dependency or editing the root manifest. HMAC is
+  built from SHA-256 with fixed block handling and is locked by RFC 4231 plus the
+  published AWS known-answer vector.
+- Credential resolution follows explicit -> environment -> profile -> SSO cache
+  -> container -> IMDS. Explicit credentials lead because they are deliberate
+  provider configuration; metadata endpoints are last and use bounded requests.
+- `BedrockOperation` keeps ConverseStream and InvokeModelWithResponseStream as
+  explicit wire paths. Mantle changes only the shared `ApiSurface`: exactly the
+  two `openai.gpt-oss-safeguard-{20b,120b}` model ids select Chat; all others
+  select Responses, matching the TypeScript oracle.
+- Error recovery is classified from HTTP status and structured AWS error-code
+  fields, never from rendered provider text. EventStream exceptions use the same
+  typed taxonomy, and secrets are redacted from credential `Debug` output.
+
+## Task 94 — how the quirk table is organized, and why stripping keys off capabilities
+
+### One concrete type, fifteen-plus identities; classification is a closed table
+
+`CompatibleProvider` serves every claimed provider id. The differences are data —
+base URL, surface rule, capability set, headers — so there is no per-vendor struct
+and no per-vendor branch in the request path. `Spec::provider` tells the instance
+which identity it took on, which is why `Provider::id()` returns rather than being
+stamped by the registry.
+
+`family.rs::CLAIMED` is a **closed** table, not a fallthrough. Both reference
+implementations treat OpenAI-compatible as the default for an unrecognized id,
+which converts a misconfiguration into a deserialization error naming JSON. Here
+an unclaimed id is refused at construction and the message names the destination
+crate. The escape hatch for a user's own endpoint is explicit
+(`options.npm = "@ai-sdk/openai-compatible"`), mirroring the oracle's own
+catalog-declaration mechanism.
+
+The refusal is `Declined::Failed(ProviderError::fatal(UnsupportedProvider))`, not
+`Declined::Unavailable`. `Unavailable`'s three reasons are fixed strings that
+cannot name a crate, and naming it is the whole point. It stays terminal:
+`Fatal → Recovery::Fail`, so nothing retries a misrouted provider. This keeps
+`oc-llm`'s two diagnostics distinct — a refused id is *not* "not registered"
+(a wiring bug) and *not* "unavailable" (a login or a config edit); it is the wrong
+family, which is a third thing, and `RegistryError::Construction` is where it
+belongs.
+
+### The quirk table: three places, each named, none scattered
+
+- `family.rs` — id → `{surface rule, routes_upstreams}`. One row per id.
+- `surface.rs` — the two rule *functions*, Azure and Copilot, in one file with
+  their oracle citations. `request.rs` receives a resolved `ApiSurface` and never
+  learns which provider produced it.
+- `quirks.rs::MODEL_PROTOCOL_RULES` — the profile's **only** model-id table,
+  currently one row (`deepseek-v4`). Adding a row here is the review boundary.
+
+`tests/discipline.rs::model_id_literals_appear_only_in_the_two_named_rule_tables`
+enforces that `gpt-5-mini` and `deepseek-v4` appear only in `surface.rs` and
+`quirks.rs`. This is the local form of `oc-llm`'s
+`policy_sources_contain_no_model_id_literals`: this crate genuinely *has* two
+model-id rules, so the discipline is that they are confined, not that they are
+absent.
+
+### Sampling-param stripping keys off `Capabilities::sampling_params`
+
+The reference maintained `is_reasoning_model()` as a growing prefix list
+(`openai_compat.rs:1191-1204`) — `o1`, `o3`, `o4`, `qwq`, `contains("thinking")` —
+and every new reasoning model was an edit there. `Capabilities::sampling_params`
+already exists for this, and the catalog supplies it per model, so `Quirks`
+consults the capability and this crate never learns a reasoning model's name.
+
+`Capabilities` is a *provider*-level answer on the trait, but `sampling_params` is
+genuinely per model: one deployment serves both a reasoning model that 400s on
+`temperature` and a chat model that wants it. `MODEL_CAPABILITIES_OPTION` narrows
+the provider default for one model id, and `capabilities_for(model)` is the
+lookup. `Provider::capabilities()` keeps returning the provider-level set, so the
+trait is unchanged.
+
+The same mechanism gates tools and attachments. An image bound for a text-only
+model is **dropped**, not sent — that is what `Capabilities::attachments` is for,
+and dropping is a decision while a 400 is an accident.
+
+### `reasoning_content`: read always, echo conditionally
+
+Reading is unconditional and free — a vendor that never sends the field costs
+nothing, and two of seven corpus vendors do send it. Echoing is gated on
+`Quirks::reasoning_protocol`, because for every other model it is pure token cost
+on every later turn and a vendor that never sent it may reject it.
+
+Three-level precedence, so a user is never stuck: an explicit
+`options.reasoningContent` boolean (including `false`, which switches the protocol
+*off* for a model the table matches), then `options.reasoningContentModels` as an
+extension list, then the built-in table. A vendor changing behaviour mid-release
+is a config edit, not a release.
+
+Model ids are canonicalized before matching (lowercase, routing prefix stripped),
+so `deepseek/deepseek-v4-pro` from a router and `deepseek-v4-pro` from the vendor
+hit the same rule.
+
+### `thinking` is written after `extra_body`
+
+`RequestBody::build` applies `extra_body`, then writes
+`thinking: {"type":"enabled"}` when the protocol is on. A caller with a stale
+`thinking` option cannot disable a required opt-in
+(`openai_compat.rs:1226-1227`). With the protocol off, the caller's value stands.
+`PROTECTED_KEYS` additionally prevents `extra_body` from replacing `model`,
+`messages`, `stream`, `tools`, `tool_choice` or either max-tokens spelling — the
+fields derived from the request itself, where an override would make the wire and
+the transcript disagree silently.
+
+`extra_body` is also the seam for `oc-llm`'s effort resolution:
+`EffortResolution::apply_to` writes into a `Map`, and that map is
+`Spec.options.extraBody`. Effort policy therefore stays in one place for all five
+families instead of being re-expressed per provider.
+
+### A `Transport` trait rather than `#[cfg(test)]`
+
+`Provider::stream` reaches bytes only through `Transport`. Tests construct the
+provider with a cassette-backed transport, so "no live call in a test" holds
+structurally: there is no test-only branch inside the request path to erode. It
+also keeps `reqwest` out of the translation logic, which is the part with
+behaviour worth testing.
+
+The cassette transport re-slices each recorded body into 7-byte pieces (and one
+test into 1-byte pieces). The recorder buffered whole streams, so the original
+network boundaries are gone; re-slicing restores the property that matters — a
+frame separator and a multi-byte code point landing across two chunks. This does
+not re-test `oc-llm`'s parser (already proven by a 4220-offset sweep); it asserts
+this profile *inherits* the property rather than bypassing it.
+
+### Errors: status first, structured body only to disambiguate
+
+`ProviderError::from_status` is the floor. The body refines it only where a status
+genuinely cannot distinguish two recovery classes: `400` +
+`code: "context_length_exceeded"` → `Compact`, and `code`/`type: "content_filter"`
+→ `Refused`. Both are structured-field reads. `WireError::message` is attached as
+a source for the human and never examined — the rule `oc-error` exists to make
+unnecessary.
+
+Two wire details worth keeping: several gateways report an upstream `429` as a
+`200` carrying `{"error":{"code":429}}`, so `WireError::status()` parses a numeric
+or numeric-string `code`; and `Retry-After` is honoured only in delta-seconds
+form, because a mis-parsed HTTP-date would produce a worse backoff than deferring
+to `oc-error`'s own policy.
+
+## Task 106
+
+Service-account RS256 now signs **in process** via `aws-lc-rs 1.17.3`
+(`signature::RsaKeyPair::from_pkcs8` / `from_der` + `RSA_PKCS1_SHA256`), replacing
+the `openssl dgst -sha256 -sign` subprocess that task 96 documented above.
+
+Why aws-lc-rs and not the `rsa` crate: aws-lc-rs was **already in `Cargo.lock`** as
+rustls' crypto provider (reqwest's `rustls` feature selects it), so promoting it to a
+first-party pin adds no crate, no new C build, and no second crypto implementation to
+audit. Pinned with `default-features = false, features = ["aws-lc-sys", "alloc"]`,
+which drops `ring-io`/`ring-sig-verify` — their only effect here would be to add a
+second `untrusted` major version for a *ring*-compat shim this code never calls.
+`Cargo.lock` therefore gains **zero** packages: its whole diff is
+`+aws-lc-rs` / `-tempfile` under `oc-provider-google`. `ring` was rejected for the
+opposite reason: it is present only transitively and is stricter about acceptable RSA
+keys than GCP is about the ones it mints. The `rsa` crate was not needed and would
+have been a third RSA implementation in one binary.
+
+PEM handling is local: `pem_der` slices between the armor lines, strips ASCII
+whitespace, and base64-decodes with the `STANDARD` engine. Both PKCS#8
+(`-----BEGIN PRIVATE KEY-----`, what GCP service-account JSON actually ships) and
+PKCS#1 (`-----BEGIN RSA PRIVATE KEY-----`, what an older or re-exporting tool emits)
+are accepted; `Ok(None)` means "armor absent" so the caller can try the other
+encoding, and only a present-but-corrupt body is an error.
+
+Known-answer test provenance — `KNOWN_ANSWER_SIGNATURE_BASE64` in
+`crates/oc-provider-google/src/lib.rs` was produced once, outside this codebase, by:
+
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out key.pem
+    openssl rsa -in key.pem -traditional -out key_pkcs1.pem   # same key, PKCS#1 armor
+    printf '%s' '<KNOWN_ANSWER_MESSAGE>' > msg.txt
+    openssl dgst -sha256 -sign key.pem -out sig.bin msg.txt
+    base64 -w0 sig.bin
+
+with OpenSSL 3.0.13 (30 Jan 2024). Both the key and the signature are committed
+verbatim. RSASSA-PKCS1-v1_5 is deterministic — no salt, no nonce — so the expected
+bytes are a property of the algorithm, not of the tool that produced them, and any
+conforming signer must reproduce all 256 of them. That makes the test a real oracle
+against an implementation sharing no code with the one under test: a regression in
+the digest, the PKCS#1 padding or the DER parse fails locally instead of surfacing
+in production as a token Google refuses without explanation. The key is a throwaway
+that guards nothing.
+
+Error taxonomy: the `OpenSsl*` variants are gone. `ServiceAccountSigningError` now
+carries `PrivateKeyNotPem`, `PrivateKeyBase64(base64::DecodeError)`,
+`PrivateKeyRejected(aws_lc_rs::error::KeyRejected)` and
+`Sign(aws_lc_rs::error::Unspecified)` — every variant typed, none carrying a
+free-form `String`, and none able to render key material (a test asserts the
+rejected input does not appear in either `Display` or `Debug`).
