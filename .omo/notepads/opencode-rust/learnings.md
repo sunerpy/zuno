@@ -196,3 +196,185 @@ made correct, but would require a separate proof across two atomic locations and
 would buy nothing on this low-frequency control path. `SeqCst` preserves one
 global order that sync readers, async waiters, and OS-thread race tests can all
 reason about directly.
+
+## Task 4 — XDG layout and project resolution (`oc-paths`)
+
+### The resolved path table, measured on this machine
+
+Produced by `opencode debug paths` from the real 1.18.12 binary and reproduced
+byte-for-byte by `Layout::debug_paths_dump()`. `HOME=/config`, no `XDG_*` set:
+
+| getter | value | oracle |
+| --- | --- | --- |
+| `home()` | `/config` | `OPENCODE_TEST_HOME ?? os.homedir()` |
+| `data()` | `/config/.local/share/opencode` | `global.ts:11` |
+| `bin()` | `/config/.cache/opencode/bin` | `global.ts:22` |
+| `log()` | `/config/.local/share/opencode/log` | `global.ts:23` |
+| `repos()` | `/config/.local/share/opencode/repos` | `global.ts:24` |
+| `cache()` | `/config/.cache/opencode` | `global.ts:12` |
+| `config()` | `/config/.config/opencode` | `global.ts:13` |
+| `state()` | `/config/.local/state/opencode` | `global.ts:14` |
+| `temp()` | `/tmp/opencode` | `global.ts:15` |
+
+Not printed by `debug paths`, so unit-tested against source instead:
+
+| getter | value |
+| --- | --- |
+| `snapshot_root()` | `<data>/snapshot` |
+| `snapshot_store(id, wt)` | `<data>/snapshot/<id>/<sha1(wt)>` |
+| `tool_output()` | `<data>/tool-output` |
+| `auth_file()` | `<data>/auth.json` |
+| `mcp_auth_file()` | `<data>/mcp-auth.json` |
+| `models_cache()` | `<cache>/models.json`, or `<cache>/models-<sha1(source)>.json` |
+| `db_path()` | `<data>/opencode.db` on `latest`/`beta`/`prod`, else `<data>/opencode-<channel>.db` |
+
+### The snapshot hash is SHA-1, over the raw worktree string
+
+`Hash.fast` = `createHash("sha1").update(input).digest("hex")`
+(`packages/core/src/util/hash.ts:4-6`). Input is `ctx.worktree` verbatim — **not**
+canonicalized, **not** trailing-slash-normalized. `/repo` hashes to
+`83630750896a66f949c084b8d0e97c1f692b3608` and `/repo/` to
+`9feece9c0dfe9efe2cb209e4c589790fd731e71a`, so the two spellings get two stores.
+Todo 23 must hash exactly what it was handed. The same SHA-1 keys
+`models-<hash>.json` (`models-dev.ts:163`) and the remote-derived project id,
+`Hash.fast("git-remote:" + normalized)` (`project.ts:78`).
+
+`sha2` is pinned in the workspace but SHA-2 is the wrong family; no SHA-1 crate is
+pinned, so `sha1.rs` implements FIPS 180-4 in ~60 lines. Every test vector is
+coreutils `sha1sum` output, never this implementation read back to itself.
+
+### Six things in `global.ts` and its neighbours that surprised me
+
+1. **`path.join` normalizes and `PathBuf::join` does not**, and it shows up in the
+   layout. Measured `data` rows: `XDG_DATA_HOME=/tmp/x//data` →
+   `/tmp/x/data/opencode`; `=/tmp/x/../y` → `/tmp/y/opencode`; `=x/y/..` →
+   `x/opencode`; `=a/../../b` → `../b/opencode`. A `PathBuf`-based join produces a
+   different string for four of those. Hence `node_path.rs`, a line-for-line port
+   of `path.posix` — used for every join in the crate.
+2. **A relative `XDG_DATA_HOME` is honoured verbatim.** `XDG_DATA_HOME=relx` makes
+   the oracle report `data relx/opencode`. This is the reason the `dirs` crate is
+   **not** used: `dirs` discards a relative XDG value and substitutes the
+   home-relative default, which would silently relocate the whole data directory.
+   `dirs` stays pinned in the workspace but `oc-paths` does not depend on it.
+3. **`||` vs `??` is observable, and the two are one line apart.**
+   `xdg-basedir@5.1.0` uses `env.XDG_DATA_HOME || join(home, ".local", "share")`,
+   so `XDG_DATA_HOME=` (empty) **falls back** — confirmed, still reports
+   `/config/.local/share/opencode`. `Global.Path.home` uses
+   `process.env.OPENCODE_TEST_HOME ?? os.homedir()`, so `OPENCODE_TEST_HOME=`
+   (empty) is **used as-is** — confirmed, prints an empty `home`. `Env::truthy_value`
+   and `Env::value` model the two and are deliberately not interchangeable.
+4. **`os.tmpdir()` strips one trailing slash only when the result stays non-empty.**
+   `TMPDIR=/probe/` → `/probe/opencode`, but `TMPDIR=/` → `/opencode` (the
+   `length > 1` guard). The ladder is `TMPDIR || TMP || TEMP || "/tmp"`, all three
+   verified.
+5. **`OPENCODE_CONFIG_DIR` does *not* move `Global.Path.config`.** `debug paths`
+   still prints the XDG directory; the override only appears in
+   `Global.make()`'s `config` field (`global.ts:64`) and as the *last* entry of the
+   config-directory chain. Two separate accessors, `config()` and
+   `effective_config()`. Todo 8 needs the distinction.
+6. **`OPENCODE_DISABLE_CHANNEL_DB` is case-sensitive while every other flag is
+   not.** `Flag.truthy` lower-cases (`flag.ts:4-6`), but `database.ts:50-52`
+   compares the raw string against `"1"`/`"true"`. So `TRUE` enables
+   `OPENCODE_DISABLE_PROJECT_CONFIG` but **not** `OPENCODE_DISABLE_CHANNEL_DB`.
+   Modelled as `Env::flag` and `Env::exact_flag`.
+
+### `OPENCODE_DB`, all three forms, verified against the binary
+
+`database.ts:43-55`. Order matters: the override is checked before any channel
+rule, so `OPENCODE_DB=:memory:` beats `OPENCODE_DISABLE_CHANNEL_DB=1`.
+
+- `:memory:` → passed through as a sentinel. Modelled as `DbLocation::Memory`,
+  not a `PathBuf`, so a consumer cannot `create_dir_all` its parent.
+- absolute → used verbatim.
+- **relative → joined onto `data()`, not the cwd.** Observed, not read: with
+  `XDG_DATA_HOME=<tmp>/xdg` and `OPENCODE_DB=relprobe.db`, run from an empty
+  directory, the real binary created `<tmp>/xdg/opencode/relprobe.db` (plus
+  `-shm`/`-wal`) and left the working directory empty.
+
+Channel suffix: `latest`/`beta`/`prod` → `opencode.db`; anything else →
+`opencode-<channel>.db` with `[^a-zA-Z0-9._-]` → `-`. A build with no
+`OPENCODE_CHANNEL` reports `local`, hence `opencode-local.db` — see issues.md.
+
+### `FSUtil.up` is the primitive under every discovery step
+
+`fs-util.ts:168-182`. Three behaviours consumers depend on:
+
+- **`stop` is checked *after* the directory is searched**, so it is inclusive: a
+  walk bounded by the worktree still reads the worktree's own `.opencode`.
+- **`stop` is string equality, not ancestry.** A `stop` off the chain never
+  matches and the walk runs to the filesystem root.
+- **Targets are probed in the order given, per directory.** For
+  `[".jsonc", ".json"]` a directory holding both yields `.jsonc` first, which is
+  precisely why `ConfigPaths.files`' closing `toReversed()` ends up putting
+  `.json` before `.jsonc` within one directory.
+
+`fs.exists` is true for a file *or* a directory, so a *file* named `.opencode` is
+collected by the config chain.
+
+### The config chain order, for todo 8
+
+`directories()` = global config, then project `.opencode` nearest-first (unless
+`OPENCODE_DISABLE_PROJECT_CONFIG`), then `$HOME/.opencode`, then
+`OPENCODE_CONFIG_DIR`; deduplicated first-occurrence-wins. The `$HOME` probe uses
+`start === stop === home`, so it is a single-directory check, never a walk.
+`files()` is the reverse — outermost first. `fileInDirectory()` returns
+`[name.json, name.jsonc]`, the opposite order from the `files()` probe; both are
+upstream's and neither is a typo.
+
+### Project identity, for todos 20/23
+
+`Project.resolve` (`project.ts:110-122`): `git.repo.discover` finds the nearest
+`.git`, then `rev-parse --show-toplevel` / `--git-dir` / `--git-common-dir`.
+Outside a repository, `directory` becomes `path.parse(input).root` (`/`) and the
+id is `global` — so every non-repository directory on a machine shares one project
+id. Inside, the id is `remote ?? cached ?? rootCommit ?? global`, where `cached`
+reads `<commonDirectory>/opencode`.
+
+**`--git-dir` and `--git-common-dir` differ in a linked worktree** and the
+distinction is load-bearing: the snapshot store keys on the *worktree*, the id
+marker lives in the *common* directory. Verified with a real `git worktree add` in
+a temp repo — `git_directory` came back as `<repo>/.git/worktrees/linked` while
+`common_directory` stayed `<repo>/.git`.
+
+Remote normalization (`project.ts:81-103`) was pinned by **executing the oracle's
+own `url`/`parts` helpers under `bun`** over 19 inputs rather than reading them.
+Two results are counter-intuitive and I had one of them wrong before running it:
+
+- `github.com:owner/repo` → **undefined**. WHATWG accepts `github.com` as a URL
+  scheme (letters and `.` are legal), so `new URL` succeeds with an opaque path,
+  the SCP fallback is never reached, and `hostname` comes out empty. Rust's
+  `url::Url::parse` behaves identically, so the port matches for free.
+- `http://[::1]/a/b.git` → `[::1]/a/b`, brackets kept. `url::Url::host_str()`
+  agrees with JS `hostname` here.
+
+`git@github.com:owner/repo.git` and `https://github.com/owner/repo.git` both
+normalize to `github.com/owner/repo`, so changing transport does not fork a
+project's sessions.
+
+### Cheap facts
+
+- **The 1.18.12 binary is a valid oracle for the 1.18.13 source.**
+  `git diff --stat 7fe993879f..aefaf140c1` over the thirteen layout-relevant files
+  (`global.ts`, `database.ts`, `config/paths.ts`, `tool-output-store.ts`,
+  `models-dev.ts`, `auth/index.ts`, `mcp/auth.ts`, `snapshot/index.ts`,
+  `util/hash.ts`, `debug/index.ts`, `project.ts`, `git.ts`, `fs-util.ts`) is
+  **empty** across 18 commits. Check this before blaming version skew for a
+  future differential failure.
+- **The `opencode` on `PATH` is a mise shim that re-execs `mise`.** It aborts
+  under `env -i` and, worse, rewrites the environment — useless for a differential
+  test. Use the real binary at
+  `~/.local/share/mise/installs/opencode/latest/opencode`.
+- **`cargo` is also a mise shim.** `cargo run` under `env -i` with a redirected
+  `XDG_CONFIG_HOME` fails with `Config files in ~/.config/mise/config.toml are not
+  trusted`. Build first, then invoke `target/debug/examples/<name>` directly. This
+  cost one evidence regeneration.
+- **`std::env::home_dir()` is un-deprecated and correct again** as of recent Rust;
+  it returns `/config` here and matches Node's `os.homedir()` on Unix (`HOME`,
+  then `getpwuid`).
+- **`std::env::set_var` is `unsafe` in edition 2024**, and this workspace forbids
+  `unsafe_code`, so **no test in this workspace can mutate the process
+  environment**. Every env-dependent type needs an injectable environment from the
+  start; retrofitting one later means rewriting its whole test suite.
+- **`url` costs ~15 transitive crates** (`idna`, five `icu_*`, `zerovec`, …). It is
+  already a workspace dependency, and hand-rolling WHATWG parsing to save the
+  build time would be the wrong trade for a value that keys the project id.

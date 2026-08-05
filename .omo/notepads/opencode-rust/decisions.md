@@ -184,3 +184,158 @@ did not name, decided here, and now binding on ~95 downstream todos.
 - **No bare public `reset()` is exposed.** A caller must capture `epoch()` and
   use `reset_if_epoch()`, preventing later waves from accidentally reintroducing
   the unconditional clear that erased repeated cancellation requests.
+
+## Task 4 — choices the plan left open
+
+### The one divergence from the oracle: no eager `mkdir` (required record)
+
+`packages/core/src/global.ts:35-43` creates **seven** directories at module
+import — `data`, `config`, `state`, `tmp`, `log`, `bin`, `repos` — before any
+command has decided it needs them. This crate creates none of them in a getter.
+Creation lives in exactly one place, `Layout::ensure()`, which a caller invokes
+explicitly.
+
+**Why.** A path query is a question, not an action. Three concrete costs of the
+oracle's shape:
+
+1. It makes the getters untestable in isolation. A test that merely *asks* where
+   the data directory is would litter the filesystem, so every path test would
+   need a temp `HOME` and cleanup — for a pure string computation.
+2. It makes failure arrive at the wrong time and in the wrong place. Measured:
+   `TMPDIR=/ opencode debug paths` prints **no paths at all** and exits 1 with
+   `EACCES: permission denied, mkdir '/opencode'`. A command whose entire job is
+   to print nine strings cannot complete because an unrelated import decided to
+   create a directory. The pure version cannot fail that way.
+3. It couples every consumer to a side effect it did not ask for. `oc-cli`
+   printing a path, `oc-tui` rendering one, and a test asserting one all
+   currently pay for a `mkdir` in the TypeScript design.
+
+**Why this has to be written down.** A differential test cannot see it. Both
+binaries report identical *paths*; the difference is *when directories appear*.
+So there is no automated guard, and the record is the guard: whoever wires
+startup must call `oc_paths::ensure()` once, or the directories will not exist.
+`ensure()` is idempotent, so calling it at every startup is correct.
+
+**Scope.** `ensure()` creates exactly the oracle's seven, in the oracle's order,
+and nothing else. `cache()` is deliberately absent (it exists only as `bin()`'s
+parent); so are `snapshot/`, `tool-output/` and the database file — their owning
+todos create them on demand, as upstream does. Adding `cache()` explicitly would
+be inventing behaviour.
+
+### Environment as a value, not a global read
+
+`Layout::resolve(&Env)` takes an environment snapshot instead of reading
+`std::env` internally. Forced by the workspace: `std::env::set_var` is `unsafe`
+in edition 2024 and `unsafe_code = "forbid"` is live, so **no test here can
+mutate the process environment**. Threading `Env` is the only way to test XDG
+resolution at all — and it pays off twice, because the differential test can hand
+*the same* `BTreeMap` to a child process and to `Layout::resolve_with` and
+compare, which is what makes the comparison prove anything.
+
+`Env` is a `BTreeMap`, not a `HashMap`, so building a child environment from it is
+deterministic and a failing comparison is reproducible.
+
+`resolve_with(&env, home_fallback)` exists alongside `resolve(&env)` so a test can
+be *fully* pure: `resolve` still consults `std::env::home_dir()` when `HOME` is
+absent, which is right for production and wrong for a hermetic test.
+
+### `node_path`: a hand-written port of `path.posix`, not `PathBuf`
+
+Every join in this crate goes through `node_path`, because Node's `path.join`
+normalizes and Rust's does not, and the difference changes the resolved directory
+for four of the nine `XDG_DATA_HOME` spellings actually measured against the
+binary. A `PathBuf`-based layout would read a different data directory than the
+TypeScript binary for any of them.
+
+Scope is POSIX only. `path.win32` is a genuinely different algorithm (drive
+letters, UNC roots, `\`), and guessing at it would be worse than the recorded gap
+in issues.md. `FSUtil.windowsPath` is ported as a named identity function rather
+than inlined away, so the Windows branch has an obvious home later.
+
+### SHA-1 implemented in-crate rather than adding a dependency
+
+The workspace pins `sha2`; SHA-1 is a different family and no SHA-1 crate is
+pinned. Adding one means editing the root `Cargo.toml` while sibling agents hold
+it. SHA-1 is a fixed, fully specified 60-line algorithm, so implementing it is
+cheaper and lower-risk than a concurrent manifest edit. Test vectors are FIPS
+180-4's plus coreutils `sha1sum` output at five block boundaries — never this
+implementation read back to itself.
+
+Documented in the module: SHA-1 is used **only** to reproduce directory names, is
+never a security boundary, and nothing here endorses it as one. A later todo that
+wants a vetted implementation can swap the two functions out; the call sites go
+through `sha1::hex` only.
+
+### `dirs` is pinned in the workspace but deliberately unused here
+
+`dirs` normalizes a relative XDG value away and substitutes the home-relative
+default. The oracle does not: `XDG_DATA_HOME=relx` really does put the data
+directory at `relx/opencode`. Using `dirs` would silently relocate a user's data
+directory whenever a relative XDG value is set. `xdg_base()` is eleven lines and
+matches `xdg-basedir@5.1.0` exactly.
+
+### `DbLocation` is an enum, not a `PathBuf`
+
+`OPENCODE_DB=:memory:` is a SQLite sentinel, not a filename. A `PathBuf` cannot
+say that, and the string form invites exactly the wrong move —
+`create_dir_all(path.parent())` on a path called `:memory:`. `DbLocation::Memory`
+makes the case unmissable in a `match`, and `as_oracle_string()` still yields the
+literal string a driver wants. Consistent with task 2's rule that the type
+carries the decision rather than the caller re-deriving it from text.
+
+### `db_path()` reads the channel from `option_env!("OPENCODE_CHANNEL")`
+
+The oracle's channel is a bundler-injected define. The closest Rust analogue is a
+build-time environment variable, so a release build sets `OPENCODE_CHANNEL=latest`
+and lands on the same `opencode.db` the TypeScript release binary uses.
+`db_path_for_channel(channel)` is public so a test and todo 19 can pin a channel
+explicitly rather than depending on how the test binary was built. The
+consequence for a plain `cargo build` is recorded in issues.md.
+
+### `PathsError` is local to this crate
+
+`oc-error` is committed and owned by task 2, and issues.md is where a request for
+a new variant belongs — so a filesystem failure here is a local
+`thiserror` enum with one variant, `CreateDirectory { path, source }`. It follows
+task 2's rules: a single specific variant, no `Other(String)`, the path carried as
+data so the caller can report *which* directory failed rather than parsing a
+message. If a later todo wants this in the aggregate, it is a one-line `#[from]`.
+
+`ensure()` stops at the first failure rather than continuing. A half-created
+layout is not a state any consumer should have to reason about.
+
+### The differential test asserts its own sensitivity
+
+`the_comparison_detects_a_single_character_divergence` perturbs each of the nine
+lines in turn and requires the comparison to notice. Without it,
+`assert_eq!(oracle, subject)` could be comparing two copies of the same
+computation and would pass forever. Same reasoning as task 2's floor assertions in
+the no-anyhow guard: a test that can pass vacuously is worse than no test.
+
+The skip path (no `opencode` binary) **prints** its reason instead of failing
+silently, and `oracle_binary_is_locatable` reports the resolved binary and its
+version, so a machine that has quietly lost the oracle is visible in the log
+rather than looking green.
+
+Nothing is normalized. The plan forbids passing a differential test by smoothing
+a real difference away, so the comparison is on raw bytes and the version-skew
+question was settled by `git diff` over the thirteen layout files instead — the
+diff between the v1.18.12 and v1.18.13 release commits is empty, so a mismatch
+would be this crate's bug.
+
+### `examples/dump_paths.rs` exists so the comparison is reproducible from a shell
+
+One `print!` of `debug_paths_dump()`. It makes
+`diff <(opencode debug paths) <(dump_paths)` a real command a human can run, which
+is how the QA transcripts in the evidence file are produced, and it is the exact
+shape todo 6's `Subject` harness needs.
+
+### Module split, and a flat public API
+
+Nine modules — `node_path`, `sha1`, `env`, `layout`, `files`, `walk`, `project`,
+`config_chain`, `ensure` — because eight downstream todos will each touch one of
+them and a single `lib.rs` would be a merge magnet. Same reasoning as task 2's
+nine error modules. The modules are `pub` (unlike task 2's) because their
+documentation *is* the oracle mapping and should be reachable from rustdoc, but the
+names consumers need are also re-exported flat from the crate root, and the free
+functions (`oc_paths::data()`, …) are the intended production API.
