@@ -9,7 +9,36 @@ repository.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+# ---------------------------------------------------------------------------
+# THE LOAD-BEARING ABSENCE: there is no HTTP *client* here.
+#
+# `reqwest` is deliberately not a dependency, and must never become one. The
+# invariant "the harness never makes a live provider call" is then not a matter
+# of discipline that a later wave can erode — the capability does not exist in
+# this crate's dependency graph. `axum` is a server; it cannot originate a
+# request. `tests/no_http_client.rs` fails if `reqwest` (or any other client)
+# appears here.
+#
+# A consumer that needs to *drive* `MockProvider` brings its own client and
+# points it at `MockProvider::base_url()`, which is always loopback.
+# ---------------------------------------------------------------------------
 [dependencies]
+axum = { workspace = true }
+base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+which = { workspace = true }
+
+[dev-dependencies]
+# The self-tests speak raw HTTP/1.1 over a `tokio::net::TcpStream` on purpose.
+# Using the production client to test the mock would repeat the exact mistake
+# this crate exists to prevent: a fixture that agrees with the implementation
+# because both share one assumption. See the crate docs.
+toml = { workspace = true }
+walkdir = { workspace = true }
 
 [lints]
 workspace = true
