@@ -10,6 +10,12 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+oc-error = { workspace = true }
+oc-paths = { workspace = true }
+rusqlite = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
