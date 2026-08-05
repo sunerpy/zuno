@@ -12,6 +12,7 @@ publish.workspace = true
 [dependencies]
 async-trait = { workspace = true }
 futures = { workspace = true }
+oc-config = { workspace = true }
 oc-db = { workspace = true }
 oc-error = { workspace = true }
 oc-llm = { workspace = true }
@@ -24,6 +25,7 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 oc-paths = { workspace = true }
+proptest = { workspace = true }
 
 [lints]
 workspace = true
