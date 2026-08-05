@@ -1,0 +1,807 @@
+//! Tests for the config schema.
+//!
+//! Named `schema::tests::*` so `cargo test -p oc-config schema` selects them.
+
+use super::*;
+use crate::schema::agent::{AgentColor, AgentConfig, AgentMode, SWEEP_EXEMPT_KEYS, ThemeColor};
+use crate::schema::formatter::FormatterConfig;
+use crate::schema::lsp::{BUILTIN_SERVER_IDS, LspConfig};
+use crate::schema::mcp::{McpOauth, McpServerConfig};
+use crate::schema::ordered::False;
+use crate::schema::permission::{PermissionAction, PermissionConfig, PermissionRule};
+use crate::schema::plugin::PluginSpec;
+use crate::schema::provider::Timeout;
+use crate::schema::reference::ReferenceEntry;
+use oc_error::ConfigError;
+use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
+
+const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+
+fn fixture(name: &str) -> String {
+    let path = PathBuf::from(FIXTURES).join(name);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+fn parse(text: &str) -> Result<Config, ConfigError> {
+    Config::from_json_str(Path::new("opencode.json"), text)
+}
+
+fn parse_value(value: Value) -> Result<Config, ConfigError> {
+    Config::from_json_value(Path::new("opencode.json"), value)
+}
+
+/// The rendered key path of the single issue in an `Invalid` error.
+fn issue_path(error: &ConfigError) -> String {
+    let ConfigError::Invalid { issues, .. } = error else {
+        panic!("expected Invalid, got {error:?}");
+    };
+    assert_eq!(issues.len(), 1, "expected one issue, got {issues:?}");
+    issues[0].key_path.join(".")
+}
+
+fn issue_detail(error: &ConfigError) -> String {
+    let ConfigError::Invalid { issues, .. } = error else {
+        panic!("expected Invalid, got {error:?}");
+    };
+    issues[0].detail.clone()
+}
+
+/// JSON with every number reduced to its `f64` value.
+///
+/// JSON has one number type; `serde_json` keeps the integer/float distinction of
+/// the text it read, so `272000` and `272000.0` are unequal `Value`s despite being
+/// the same JSON number. Comparing after this pass compares the documents, not
+/// their spelling.
+fn canonical(value: &Value) -> Value {
+    match value {
+        Value::Number(number) => number
+            .as_f64()
+            .and_then(serde_json::Number::from_f64)
+            .map_or_else(|| value.clone(), Value::Number),
+        Value::Array(items) => Value::Array(items.iter().map(canonical).collect()),
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(k, v)| (k.clone(), canonical(v)))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+/// Every key of `expected` appears in `actual` with an equal value, recursively.
+fn assert_contains(actual: &Value, expected: &Value, path: &str) {
+    match (actual, expected) {
+        (Value::Object(actual), Value::Object(expected)) => {
+            for (key, want) in expected {
+                let got = actual
+                    .get(key)
+                    .unwrap_or_else(|| panic!("{path}.{key} was dropped"));
+                assert_contains(got, want, &format!("{path}.{key}"));
+            }
+        }
+        (Value::Array(actual), Value::Array(expected)) => {
+            assert_eq!(actual.len(), expected.len(), "{path} changed length");
+            for (index, want) in expected.iter().enumerate() {
+                assert_contains(&actual[index], want, &format!("{path}.{index}"));
+            }
+        }
+        _ => assert_eq!(
+            canonical(actual),
+            canonical(expected),
+            "{path} changed value"
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Acceptance: every top-level key round-trips with no field loss.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_all_keys_fixture_uses_every_top_level_key() {
+    let text = fixture("all-keys.json");
+    let value: Value = serde_json::from_str(&text).expect("fixture is valid JSON");
+    let present: Vec<&str> = value
+        .as_object()
+        .expect("fixture is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let mut missing: Vec<&str> = KNOWN_TOP_LEVEL_KEYS
+        .iter()
+        .copied()
+        .filter(|key| !present.contains(key))
+        .collect();
+    missing.sort_unstable();
+    assert!(
+        missing.is_empty(),
+        "fixture does not exercise these keys: {missing:?}"
+    );
+    assert_eq!(present.len(), KNOWN_TOP_LEVEL_KEYS.len());
+    assert!(
+        KNOWN_TOP_LEVEL_KEYS.len() >= 30,
+        "the plan promises 30+ keys"
+    );
+}
+
+#[test]
+fn every_top_level_key_round_trips_without_field_loss() {
+    let text = fixture("all-keys.json");
+    let before: Value = serde_json::from_str(&text).expect("fixture is valid JSON");
+    let config = parse(&text).expect("fixture deserializes");
+    let after = serde_json::to_value(&config).expect("config serializes");
+    assert_eq!(
+        canonical(&after),
+        canonical(&before),
+        "round trip changed the document"
+    );
+}
+
+#[test]
+fn round_trip_is_stable_on_a_second_pass() {
+    let text = fixture("all-keys.json");
+    let once = parse(&text).expect("fixture deserializes");
+    let json = serde_json::to_string(&once).expect("serializes");
+    let twice = parse(&json).expect("re-parses");
+    assert_eq!(once, twice);
+}
+
+// ---------------------------------------------------------------------------
+// Acceptance: the agent unknown-key sweep.
+// ---------------------------------------------------------------------------
+
+fn agent(value: Value) -> AgentConfig {
+    serde_json::from_value(value).expect("agent deserializes")
+}
+
+#[test]
+fn an_unknown_agent_key_lands_in_options() {
+    let agent = agent(json!({ "reasoningEffort": "high" }));
+    let options = agent.options.as_ref().expect("options materialized");
+    assert_eq!(options["reasoningEffort"], json!("high"));
+    // The key is also kept verbatim, so the legacy-rejection pass can still see it.
+    assert_eq!(agent.extra["reasoningEffort"], json!("high"));
+}
+
+#[test]
+fn a_nested_unknown_agent_key_lands_in_options_intact() {
+    let thinking = json!({ "type": "enabled", "budgetTokens": 32000 });
+    let agent = agent(json!({
+        "model": "anthropic/claude-sonnet-4-5",
+        "reasoningEffort": "high",
+        "thinking": thinking,
+    }));
+    let options = agent.options.as_ref().expect("options materialized");
+    assert_eq!(options["reasoningEffort"], json!("high"));
+    assert_eq!(options["thinking"], thinking);
+    assert_eq!(options["thinking"]["budgetTokens"], json!(32000));
+    assert_eq!(agent.model.as_deref(), Some("anthropic/claude-sonnet-4-5"));
+}
+
+#[test]
+fn the_sweep_merges_into_declared_options_without_dropping_them() {
+    let agent = agent(json!({
+        "options": { "reasoningEffort": "low", "declared": true },
+        "reasoningEffort": "high",
+    }));
+    let options = agent.options.as_ref().expect("options present");
+    assert_eq!(options["declared"], json!(true));
+    // A top-level key wins over the same key inside `options`, matching
+    // `config/agent.ts:63-66`, which spreads `agent.options` first and then
+    // overwrites from the unknown keys.
+    assert_eq!(options["reasoningEffort"], json!("high"));
+}
+
+#[test]
+fn an_agent_without_unknown_keys_keeps_options_absent() {
+    let agent = agent(json!({ "model": "anthropic/claude-sonnet-4-5" }));
+    assert!(agent.options.is_none());
+    assert!(agent.extra.is_empty());
+}
+
+#[test]
+fn an_explicit_empty_options_object_survives() {
+    let agent = agent(json!({ "options": {} }));
+    assert_eq!(agent.options, Some(JsonMap::new()));
+}
+
+#[test]
+fn sweep_exempt_keys_never_become_provider_options() {
+    let agent = agent(json!({
+        "name": "build",
+        "tools": { "write": false },
+        "maxSteps": 40,
+        "reasoningEffort": "high",
+    }));
+    let options = agent.options.as_ref().expect("options materialized");
+    for exempt in SWEEP_EXEMPT_KEYS {
+        assert!(
+            !options.contains_key(*exempt),
+            "{exempt} must not be swept into options"
+        );
+        assert!(
+            agent.extra.contains_key(*exempt),
+            "{exempt} must still be visible for legacy rejection"
+        );
+    }
+    assert_eq!(options["reasoningEffort"], json!("high"));
+}
+
+#[test]
+fn an_agent_with_swept_keys_loses_nothing_on_round_trip() {
+    let before = json!({
+        "agent": {
+            "build": {
+                "model": "anthropic/claude-sonnet-4-5",
+                "reasoningEffort": "high",
+                "thinking": { "type": "enabled", "budgetTokens": 32000 }
+            }
+        }
+    });
+    let config = parse_value(before.clone()).expect("deserializes");
+    let after = serde_json::to_value(&config).expect("serializes");
+    assert_contains(&after, &before, "$");
+    let build = &after["agent"]["build"];
+    assert_eq!(build["options"]["reasoningEffort"], json!("high"));
+    assert_eq!(build["options"]["thinking"]["budgetTokens"], json!(32000));
+}
+
+#[test]
+fn agent_named_fields_are_not_swept() {
+    let agent = agent(json!({
+        "model": "m", "variant": "v", "temperature": 0.5, "top_p": 0.9,
+        "prompt": "p", "disable": false, "description": "d", "mode": "subagent",
+        "hidden": true, "color": "primary", "steps": 10,
+        "permission": "allow",
+    }));
+    assert!(agent.options.is_none(), "no named key may reach options");
+    assert!(agent.extra.is_empty());
+    assert_eq!(agent.mode, Some(AgentMode::Subagent));
+    assert_eq!(agent.color, Some(AgentColor::Theme(ThemeColor::Primary)));
+    assert_eq!(agent.steps.map(|s| s.get()), Some(10));
+}
+
+#[test]
+fn agent_colour_takes_hex_and_theme_names_only() {
+    assert_eq!(
+        agent(json!({ "color": "#Ff5733" })).color,
+        Some(AgentColor::Hex("#Ff5733".to_owned()))
+    );
+    assert_eq!(
+        agent(json!({ "color": "error" })).color,
+        Some(AgentColor::Theme(ThemeColor::Error))
+    );
+    for bad in ["banana", "#fff", "#12345g", "ff5733"] {
+        let error = parse_value(json!({ "agent": { "a": { "color": bad } } }))
+            .expect_err("invalid colour must be rejected");
+        assert_eq!(issue_path(&error), "agent.a.color", "for {bad}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Acceptance: deprecated keys are absent, so the rejection pass can act.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn deprecated_top_level_keys_are_not_accepted() {
+    for key in ["mode", "layout", "autoshare"] {
+        let error = parse_value(json!({ key: json!({}) })).expect_err("must be rejected");
+        assert_eq!(issue_path(&error), key);
+        assert_eq!(issue_detail(&error), "unrecognized key");
+    }
+}
+
+#[test]
+fn every_unrecognized_top_level_key_gets_its_own_issue() {
+    let error = parse_value(json!({ "theme": "system", "keybinds": {}, "model": "a/b" }))
+        .expect_err("must be rejected");
+    let ConfigError::Invalid { issues, .. } = &error else {
+        panic!("expected Invalid, got {error:?}");
+    };
+    let mut paths: Vec<String> = issues.iter().map(|i| i.key_path.join(".")).collect();
+    paths.sort();
+    assert_eq!(paths, vec!["keybinds".to_owned(), "theme".to_owned()]);
+}
+
+#[test]
+fn deprecated_agent_keys_stay_visible_but_unnamed() {
+    let config = parse_value(json!({
+        "agent": { "build": { "tools": { "write": false }, "maxSteps": 40 } }
+    }))
+    .expect("the oracle's rest record accepts them");
+    let build = config
+        .agent
+        .as_ref()
+        .and_then(|agents| agents.get("build"))
+        .expect("agent present");
+    assert!(build.extra.contains_key("tools"));
+    assert!(build.extra.contains_key("maxSteps"));
+    assert!(build.options.is_none(), "neither may reach options");
+}
+
+// ---------------------------------------------------------------------------
+// Acceptance: the unions.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn references_is_a_three_way_union() {
+    let config = parse(&fixture("all-keys.json")).expect("fixture deserializes");
+    let references = config.references.as_ref().expect("references present");
+    assert!(matches!(
+        references.get("shorthand"),
+        Some(ReferenceEntry::Shorthand(_))
+    ));
+    let Some(ReferenceEntry::Git(git)) = references.get("gitform") else {
+        panic!(
+            "gitform is not the git arm: {:?}",
+            references.get("gitform")
+        );
+    };
+    assert_eq!(git.branch.as_deref(), Some("dev"));
+    let Some(ReferenceEntry::Local(local)) = references.get("localform") else {
+        panic!("localform is not the local arm");
+    };
+    assert_eq!(local.path, "../sibling-repo");
+    assert_eq!(local.hidden, Some(true));
+}
+
+#[test]
+fn plugin_entries_are_a_string_or_a_string_and_options() {
+    let config = parse_value(json!({
+        "plugin": ["bare@1.0.0", ["with-options", { "level": "verbose" }]]
+    }))
+    .expect("deserializes");
+    let plugins = config.plugin.as_ref().expect("plugin present");
+    assert!(matches!(plugins[0], PluginSpec::Name(_)));
+    assert_eq!(plugins[0].name(), "bare@1.0.0");
+    assert!(plugins[0].options().is_none());
+    assert!(matches!(plugins[1], PluginSpec::WithOptions(..)));
+    assert_eq!(
+        plugins[1].options().expect("options")["level"],
+        json!("verbose")
+    );
+}
+
+#[test]
+fn formatter_is_a_bool_or_a_map() {
+    for flag in [true, false] {
+        let config = parse_value(json!({ "formatter": flag })).expect("deserializes");
+        assert_eq!(config.formatter, Some(FormatterConfig::Enabled(flag)));
+    }
+    let config = parse_value(json!({
+        "formatter": { "prettier": { "command": ["prettier", "--write", "$FILE"] } }
+    }))
+    .expect("deserializes");
+    let Some(FormatterConfig::Formatters(formatters)) = &config.formatter else {
+        panic!("expected the map arm");
+    };
+    assert_eq!(
+        formatters.get("prettier").expect("prettier").command,
+        Some(vec![
+            "prettier".to_owned(),
+            "--write".to_owned(),
+            "$FILE".to_owned()
+        ])
+    );
+}
+
+#[test]
+fn lsp_is_a_bool_or_a_map() {
+    for flag in [true, false] {
+        let config = parse_value(json!({ "lsp": flag })).expect("deserializes");
+        assert_eq!(config.lsp, Some(LspConfig::Enabled(flag)));
+    }
+    let config = parse_value(json!({ "lsp": { "typescript": { "disabled": true } } }))
+        .expect("deserializes");
+    let Some(LspConfig::Servers(servers)) = &config.lsp else {
+        panic!("expected the map arm");
+    };
+    assert!(servers.get("typescript").expect("typescript").is_disabled());
+}
+
+#[test]
+fn a_custom_lsp_server_must_declare_extensions() {
+    assert!(!BUILTIN_SERVER_IDS.contains(&"my-lsp"));
+    let error = parse_value(json!({ "lsp": { "my-lsp": { "command": ["my-lsp"] } } }))
+        .expect_err("must be rejected");
+    assert_eq!(issue_path(&error), "lsp.my-lsp");
+    assert!(
+        issue_detail(&error).contains("extensions"),
+        "message must name the missing key: {}",
+        issue_detail(&error)
+    );
+    parse_value(json!({ "lsp": { "gopls": { "command": ["gopls"] } } }))
+        .expect("a built-in server infers its extensions");
+    parse_value(json!({ "lsp": { "my-lsp": { "disabled": true } } }))
+        .expect("a disabled custom server needs nothing");
+}
+
+#[test]
+fn an_lsp_server_needs_a_command_unless_disabled() {
+    let error = parse_value(json!({ "lsp": { "gopls": { "disabled": false } } }))
+        .expect_err("must be rejected");
+    assert!(
+        issue_detail(&error).contains("command"),
+        "message must name the missing key: {}",
+        issue_detail(&error)
+    );
+}
+
+#[test]
+fn mcp_entries_cover_local_remote_and_the_enabled_only_toggle() {
+    let config = parse(&fixture("all-keys.json")).expect("fixture deserializes");
+    let servers = config.mcp.as_ref().expect("mcp present");
+    let Some(McpServerConfig::Local(local)) = servers.get("local-one") else {
+        panic!("local-one is not the local arm");
+    };
+    assert_eq!(local.command, vec!["uvx".to_owned(), "mcpdoc".to_owned()]);
+    let Some(McpServerConfig::Remote(remote)) = servers.get("remote-one") else {
+        panic!("remote-one is not the remote arm");
+    };
+    assert!(matches!(remote.oauth, Some(McpOauth::Config(_))));
+    let Some(McpServerConfig::Remote(no_oauth)) = servers.get("remote-no-oauth") else {
+        panic!("remote-no-oauth is not the remote arm");
+    };
+    assert_eq!(no_oauth.oauth, Some(McpOauth::Disabled(False)));
+    let Some(McpServerConfig::Toggle(toggle)) = servers.get("inherited-off") else {
+        panic!("inherited-off is not the toggle arm");
+    };
+    assert!(!toggle.enabled);
+}
+
+#[test]
+fn a_broken_mcp_entry_reports_the_arm_its_type_names() {
+    let error =
+        parse_value(json!({ "mcp": { "x": { "type": "remote" } } })).expect_err("url is required");
+    assert_eq!(issue_path(&error), "mcp.x");
+    assert!(
+        issue_detail(&error).contains("url"),
+        "message must name the missing key: {}",
+        issue_detail(&error)
+    );
+}
+
+#[test]
+fn autoupdate_is_a_bool_or_notify() {
+    assert_eq!(
+        parse_value(json!({ "autoupdate": true }))
+            .expect("bool")
+            .autoupdate,
+        Some(Autoupdate::Enabled(true))
+    );
+    assert_eq!(
+        parse_value(json!({ "autoupdate": "notify" }))
+            .expect("notify")
+            .autoupdate,
+        Some(Autoupdate::Mode(AutoupdateMode::Notify))
+    );
+    let error = parse_value(json!({ "autoupdate": "later" })).expect_err("must be rejected");
+    assert_eq!(issue_path(&error), "autoupdate");
+}
+
+#[test]
+fn a_provider_timeout_is_millis_or_the_literal_false() {
+    let config = parse_value(json!({
+        "provider": { "p": { "options": { "timeout": 1000, "headerTimeout": false } } }
+    }))
+    .expect("deserializes");
+    let options = config
+        .provider
+        .as_ref()
+        .and_then(|p| p.get("p"))
+        .and_then(|p| p.options.as_ref())
+        .expect("options present");
+    assert_eq!(
+        options.timeout,
+        Some(Timeout::Millis(1000.try_into().unwrap()))
+    );
+    assert_eq!(options.header_timeout, Some(Timeout::Disabled(False)));
+    let error = parse_value(json!({ "provider": { "p": { "options": { "timeout": true } } } }))
+        .expect_err("true is not a timeout");
+    assert_eq!(issue_path(&error), "provider.p.options.timeout");
+}
+
+#[test]
+fn unknown_provider_options_are_kept_for_the_sdk() {
+    let config = parse_value(json!({
+        "provider": { "p": { "options": { "apiKey": "k", "customKnob": { "deep": 1 } } } }
+    }))
+    .expect("deserializes");
+    let options = config
+        .provider
+        .as_ref()
+        .and_then(|p| p.get("p"))
+        .and_then(|p| p.options.as_ref())
+        .expect("options present");
+    assert_eq!(options.api_key.as_deref(), Some("k"));
+    assert_eq!(options.extra["customKnob"], json!({ "deep": 1 }));
+}
+
+// ---------------------------------------------------------------------------
+// Acceptance: permission order and shape.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn permission_keeps_the_authors_key_order() {
+    // `config/permission.ts:14-16`: precedence depends on this order.
+    let config = parse(
+        r#"{"permission": {"zebra": "deny", "bash": "ask", "alpha": "allow", "read": "allow"}}"#,
+    )
+    .expect("deserializes");
+    let Some(PermissionConfig::Object(object)) = &config.permission else {
+        panic!("expected the object arm");
+    };
+    let keys: Vec<&str> = object.iter().map(|(key, _)| key).collect();
+    assert_eq!(keys, vec!["zebra", "bash", "alpha", "read"]);
+}
+
+#[test]
+fn parsing_through_a_json_value_forfeits_key_order() {
+    // Pinned, not aspirational: `serde_json::Map` is a `BTreeMap` here, so a
+    // document that has been through `Value` is already sorted and no downstream
+    // type can recover the author's order. Anything that needs permission
+    // precedence must parse from the text.
+    let text = r#"{"permission": {"zebra": "deny", "alpha": "allow"}}"#;
+    let value: Value = serde_json::from_str(text).expect("valid JSON");
+    let from_value = parse_value(value).expect("deserializes");
+    let Some(PermissionConfig::Object(object)) = &from_value.permission else {
+        panic!("expected the object arm");
+    };
+    assert_eq!(
+        object.iter().map(|(k, _)| k).collect::<Vec<_>>(),
+        vec!["alpha", "zebra"]
+    );
+
+    let from_text = parse(text).expect("deserializes");
+    let Some(PermissionConfig::Object(object)) = &from_text.permission else {
+        panic!("expected the object arm");
+    };
+    assert_eq!(
+        object.iter().map(|(k, _)| k).collect::<Vec<_>>(),
+        vec!["zebra", "alpha"]
+    );
+}
+
+#[test]
+fn a_bare_permission_action_normalizes_to_a_star_rule() {
+    let config = parse_value(json!({ "permission": "deny" })).expect("deserializes");
+    let permission = config.permission.as_ref().expect("permission present");
+    assert_eq!(
+        permission,
+        &PermissionConfig::Action(PermissionAction::Deny),
+        "the parsed value keeps the form the author wrote"
+    );
+    let normalized = permission.normalized();
+    assert_eq!(
+        normalized.get("*"),
+        Some(&PermissionRule::Action(PermissionAction::Deny))
+    );
+}
+
+#[test]
+fn action_only_permissions_reject_per_pattern_rules() {
+    let error = parse_value(json!({ "permission": { "webfetch": { "*": "allow" } } }))
+        .expect_err("webfetch takes a bare action");
+    assert_eq!(issue_path(&error), "permission.webfetch");
+    assert!(issue_detail(&error).contains("webfetch"));
+    parse_value(json!({ "permission": { "bash": { "git push": "ask" } } }))
+        .expect("bash does take per-pattern rules");
+}
+
+#[test]
+fn an_unknown_permission_key_is_kept() {
+    let config =
+        parse_value(json!({ "permission": { "todoread": "allow" } })).expect("deserializes");
+    let Some(PermissionConfig::Object(object)) = &config.permission else {
+        panic!("expected the object arm");
+    };
+    assert_eq!(
+        object.get("todoread"),
+        Some(&PermissionRule::Action(PermissionAction::Allow))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Acceptance: bounded integers.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn positive_int_fields_reject_zero_and_negatives() {
+    for bad in [json!(0), json!(-1)] {
+        let error =
+            parse_value(json!({ "server": { "port": bad } })).expect_err("PositiveInt excludes it");
+        assert_eq!(issue_path(&error), "server.port");
+    }
+    // NonNegativeInt does allow zero.
+    assert_eq!(
+        parse_value(json!({ "subagent_depth": 0 }))
+            .expect("zero depth is legal")
+            .subagent_depth,
+        Some(0)
+    );
+    let error = parse_value(json!({ "subagent_depth": -1 })).expect_err("negative is not");
+    assert_eq!(issue_path(&error), "subagent_depth");
+}
+
+#[test]
+fn an_mcp_callback_port_stays_inside_the_port_range() {
+    parse_value(json!({
+        "mcp": { "x": { "type": "remote", "url": "u", "oauth": { "callbackPort": 65535 } } }
+    }))
+    .expect("65535 is a port");
+    let error = parse_value(json!({
+        "mcp": { "x": { "type": "remote", "url": "u", "oauth": { "callbackPort": 65536 } } }
+    }))
+    .expect_err("65536 is not");
+    assert_eq!(issue_path(&error), "mcp.x.oauth.callbackPort");
+}
+
+// ---------------------------------------------------------------------------
+// Acceptance: unknown-key policy per level.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn nested_unknown_keys_are_ignored_like_the_oracle() {
+    // Effect Schema's default `onExcessProperty` is "ignore", so this is accepted
+    // and the stray key is dropped rather than rejected.
+    let config = parse_value(json!({ "server": { "port": 1234, "prot": 4321 } }))
+        .expect("a nested typo is not fatal");
+    assert_eq!(
+        config.server.as_ref().and_then(|s| s.port).map(|p| p.get()),
+        Some(1234)
+    );
+    let after = serde_json::to_value(&config).expect("serializes");
+    assert_eq!(after["server"].as_object().expect("object").len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// QA: the failure scenario, and the depth of the recovered key path.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_bad_server_port_names_the_key_path_instead_of_panicking() {
+    let error = parse(r#"{"server": {"port": "not-a-number"}}"#)
+        .expect_err("a string is not a port number");
+    assert_eq!(issue_path(&error), "server.port");
+    assert!(
+        issue_detail(&error).contains("invalid type: string"),
+        "detail carries the validator's own words: {}",
+        issue_detail(&error)
+    );
+    let ConfigError::Invalid { path, .. } = &error else {
+        panic!("expected Invalid");
+    };
+    assert_eq!(path, Path::new("opencode.json"));
+    assert_eq!(
+        error.to_string(),
+        "config file opencode.json failed validation (1 issue(s))"
+    );
+}
+
+#[test]
+fn the_key_path_reaches_through_maps_and_arrays() {
+    let error = parse_value(json!({
+        "provider": {
+            "anthropic": { "models": { "m": { "limit": { "context": "big", "output": 64000 } } } }
+        }
+    }))
+    .expect_err("a string is not a limit");
+    assert_eq!(
+        issue_path(&error),
+        "provider.anthropic.models.m.limit.context"
+    );
+
+    let error = parse_value(json!({ "plugin": ["ok", 7] })).expect_err("7 is not a plugin");
+    assert_eq!(issue_path(&error), "plugin.1");
+
+    let error = parse_value(json!({
+        "experimental": { "policies": [{ "action": "provider.use", "effect": "maybe", "resource": "*" }] }
+    }))
+    .expect_err("maybe is not an effect");
+    // The probe stops at the enclosing object: `effect` is required, and no probe
+    // value satisfies a closed set of string variants, so its removal or
+    // substitution cannot be shown to fix the document. The detail carries the rest.
+    assert_eq!(issue_path(&error), "experimental.policies.0");
+    assert!(
+        issue_detail(&error).contains("unknown variant `maybe`"),
+        "detail must still identify the offending value: {}",
+        issue_detail(&error)
+    );
+}
+
+#[test]
+fn malformed_json_is_reported_as_json_not_validation() {
+    let error = parse("{\n  \"model\": ,\n}").expect_err("not valid JSON");
+    let ConfigError::Json { source, .. } = &error else {
+        panic!("expected Json, got {error:?}");
+    };
+    assert_eq!(source.line(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// QA: the real corpora.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_documented_examples_all_deserialize() {
+    let dir = PathBuf::from(FIXTURES).join("docs");
+    let mut names: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .expect("docs fixtures exist")
+        .map(|entry| entry.expect("readable entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    names.sort();
+    assert_eq!(
+        names.len(),
+        33,
+        "every opencode.json block from config.mdx must be present"
+    );
+    for path in &names {
+        let text = std::fs::read_to_string(path).expect("readable");
+        let before: Value = serde_json::from_str(&text).expect("valid JSON");
+        let config = Config::from_json_str(path, &text)
+            .unwrap_or_else(|e| panic!("{} failed: {e:?}", path.display()));
+        let after = serde_json::to_value(&config).expect("serializes");
+        assert_contains(&after, &before, path.to_str().expect("utf-8 path"));
+    }
+}
+
+#[test]
+fn the_real_user_config_deserializes() {
+    let text = fixture("user-config.json");
+    let before: Value = serde_json::from_str(&text).expect("valid JSON");
+    let config = parse(&text).expect("the user's own config must load");
+    let after = serde_json::to_value(&config).expect("serializes");
+    assert_contains(&after, &before, "user-config.json");
+    assert!(config.mcp.as_ref().expect("mcp present").len() >= 8);
+    assert!(config.plugin.as_ref().expect("plugin present").len() == 3);
+    // `permission.todoread` is not one of the oracle's named keys and must survive.
+    let Some(PermissionConfig::Object(permission)) = &config.permission else {
+        panic!("expected the object arm");
+    };
+    assert!(permission.get("todoread").is_some());
+}
+
+// ---------------------------------------------------------------------------
+// The order-preserving map itself.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_ordered_map_preserves_order_and_resolves_duplicates_last_wins() {
+    let map: ordered::OrderedMap<u8> =
+        serde_json::from_str(r#"{"b": 1, "a": 2, "b": 3}"#).expect("deserializes");
+    assert_eq!(map.keys().collect::<Vec<_>>(), vec!["b", "a"]);
+    assert_eq!(map.get("b"), Some(&3));
+    assert_eq!(map.len(), 2);
+    assert!(!map.is_empty());
+    assert_eq!(
+        serde_json::to_string(&map).expect("serializes"),
+        r#"{"b":3,"a":2}"#
+    );
+}
+
+#[test]
+fn the_false_literal_rejects_true() {
+    assert_eq!(
+        serde_json::from_value::<False>(json!(false)).expect("false is the literal"),
+        False
+    );
+    assert!(serde_json::from_value::<False>(json!(true)).is_err());
+    assert_eq!(
+        serde_json::to_value(False).expect("serializes"),
+        json!(false)
+    );
+}
+
+#[test]
+fn an_empty_config_round_trips_to_an_empty_object() {
+    let config = parse("{}").expect("an empty config is valid");
+    assert_eq!(config, Config::default());
+    assert_eq!(
+        serde_json::to_value(&config).expect("serializes"),
+        json!({}),
+        "absent keys must not become nulls"
+    );
+}

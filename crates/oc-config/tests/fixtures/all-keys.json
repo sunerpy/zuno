@@ -1,0 +1,252 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "shell": "/bin/zsh",
+  "logLevel": "DEBUG",
+  "server": {
+    "port": 4096,
+    "hostname": "127.0.0.1",
+    "mdns": true,
+    "mdnsDomain": "opencode.local",
+    "cors": ["https://example.com"]
+  },
+  "command": {
+    "review": {
+      "template": "Review $ARGUMENTS",
+      "description": "Review a diff",
+      "agent": "plan",
+      "model": "anthropic/claude-sonnet-4-5",
+      "variant": "thinking",
+      "subtask": true
+    }
+  },
+  "skills": {
+    "paths": ["./skills", "~/.config/opencode/skill"],
+    "urls": ["https://example.com/.well-known/skills/"]
+  },
+  "references": {
+    "shorthand": "github.com/sst/opencode",
+    "gitform": {
+      "repository": "https://github.com/sst/opencode.git",
+      "branch": "dev",
+      "description": "upstream",
+      "hidden": false
+    },
+    "localform": {
+      "path": "../sibling-repo",
+      "description": "the sibling",
+      "hidden": true
+    }
+  },
+  "reference": {
+    "legacy": "github.com/sst/opencode"
+  },
+  "watcher": {
+    "ignore": ["node_modules/**", "target/**"]
+  },
+  "snapshot": false,
+  "plugin": [
+    "opencode-antigravity-auth@1.6.0",
+    ["@sunerpy/oh-my-openagent", { "level": "verbose", "retries": 3 }]
+  ],
+  "share": "manual",
+  "autoupdate": "notify",
+  "disabled_providers": ["openai"],
+  "enabled_providers": ["anthropic", "google"],
+  "model": "anthropic/claude-sonnet-4-5",
+  "small_model": "anthropic/claude-haiku-4-5",
+  "default_agent": "build",
+  "subagent_depth": 0,
+  "username": "ada",
+  "agent": {
+    "build": {
+      "model": "anthropic/claude-sonnet-4-5",
+      "variant": "thinking",
+      "temperature": 0.2,
+      "top_p": 0.9,
+      "prompt": "{file:./prompts/build.md}",
+      "disable": false,
+      "description": "Write code",
+      "mode": "primary",
+      "hidden": false,
+      "options": { "reasoningEffort": "medium" },
+      "color": "#ff5733",
+      "steps": 120,
+      "permission": {
+        "edit": "allow",
+        "bash": { "git push": "ask", "*": "allow" }
+      }
+    },
+    "explore": {
+      "description": "Read-only survey",
+      "mode": "subagent",
+      "color": "accent",
+      "permission": "deny"
+    }
+  },
+  "provider": {
+    "anthropic": {
+      "api": "https://api.anthropic.com",
+      "name": "Anthropic",
+      "env": ["ANTHROPIC_API_KEY"],
+      "id": "anthropic",
+      "npm": "@ai-sdk/anthropic",
+      "whitelist": ["claude-sonnet-4-5"],
+      "blacklist": ["claude-2"],
+      "options": {
+        "apiKey": "{env:ANTHROPIC_API_KEY}",
+        "baseURL": "https://api.anthropic.com/v1",
+        "enterpriseUrl": "https://github.example.com",
+        "setCacheKey": true,
+        "timeout": 120000,
+        "headerTimeout": false,
+        "chunkTimeout": 30000,
+        "customSdkKnob": { "nested": true }
+      },
+      "models": {
+        "claude-sonnet-4-5": {
+          "id": "claude-sonnet-4-5",
+          "name": "Claude Sonnet 4.5",
+          "family": "claude",
+          "release_date": "2025-09-29",
+          "attachment": true,
+          "reasoning": true,
+          "temperature": true,
+          "tool_call": true,
+          "interleaved": { "field": "reasoning_content" },
+          "cost": {
+            "input": 3.0,
+            "output": 15.0,
+            "cache_read": 0.3,
+            "cache_write": 3.75,
+            "context_over_200k": {
+              "input": 6.0,
+              "output": 22.5,
+              "cache_read": 0.6,
+              "cache_write": 7.5
+            }
+          },
+          "limit": { "context": 1000000.0, "input": 900000.0, "output": 64000.0 },
+          "modalities": {
+            "input": ["text", "image", "pdf"],
+            "output": ["text"]
+          },
+          "experimental": false,
+          "status": "active",
+          "provider": { "npm": "@ai-sdk/anthropic", "api": "https://api.anthropic.com" },
+          "options": { "thinking": { "type": "enabled", "budgetTokens": 32000 } },
+          "headers": { "anthropic-beta": "context-1m-2025-08-07" },
+          "variants": {
+            "thinking": {
+              "disabled": false,
+              "options": { "reasoningEffort": "high" }
+            }
+          }
+        }
+      }
+    }
+  },
+  "mcp": {
+    "local-one": {
+      "type": "local",
+      "command": ["uvx", "mcpdoc"],
+      "cwd": "./tools",
+      "environment": { "HTTP_PROXY": "http://127.0.0.1:1080" },
+      "enabled": true,
+      "timeout": 5000
+    },
+    "remote-one": {
+      "type": "remote",
+      "url": "https://knowledge-mcp.global.api.aws",
+      "enabled": true,
+      "headers": { "X-Api-Key": "{env:MCP_KEY}" },
+      "oauth": {
+        "clientId": "abc",
+        "clientSecret": "shh",
+        "scope": "mcp:read",
+        "callbackPort": 19876,
+        "redirectUri": "http://127.0.0.1:19876/mcp/oauth/callback"
+      },
+      "timeout": 10000
+    },
+    "remote-no-oauth": {
+      "type": "remote",
+      "url": "https://example.com/mcp",
+      "oauth": false
+    },
+    "inherited-off": { "enabled": false }
+  },
+  "formatter": {
+    "prettier": {
+      "disabled": false,
+      "command": ["prettier", "--write", "$FILE"],
+      "environment": { "NODE_OPTIONS": "--max-old-space-size=4096" },
+      "extensions": [".ts", ".tsx"]
+    }
+  },
+  "lsp": {
+    "rust": {
+      "command": ["rust-analyzer"],
+      "extensions": [".rs"],
+      "disabled": false,
+      "env": { "RA_LOG": "info" },
+      "initialization": { "cargo": { "allFeatures": true } }
+    },
+    "typescript": { "disabled": true },
+    "my-custom-server": {
+      "command": ["my-lsp", "--stdio"],
+      "extensions": [".mylang"]
+    }
+  },
+  "instructions": ["CONTRIBUTING.md", "docs/**/*.md"],
+  "permission": {
+    "read": "allow",
+    "edit": { "src/**": "allow", "*": "ask" },
+    "glob": "allow",
+    "grep": "allow",
+    "list": "allow",
+    "bash": { "git status": "allow", "*": "ask" },
+    "task": "allow",
+    "external_directory": "ask",
+    "todowrite": "allow",
+    "question": "ask",
+    "webfetch": "ask",
+    "websearch": "ask",
+    "lsp": "allow",
+    "doom_loop": "deny",
+    "skill": "allow",
+    "todoread": "allow"
+  },
+  "tools": {
+    "bash": true,
+    "webfetch": false
+  },
+  "attachment": {
+    "image": {
+      "auto_resize": true,
+      "max_width": 2000,
+      "max_height": 2000,
+      "max_base64_bytes": 5242880
+    }
+  },
+  "enterprise": { "url": "https://opencode.example.com" },
+  "tool_output": { "max_lines": 2000, "max_bytes": 51200 },
+  "compaction": {
+    "auto": true,
+    "prune": false,
+    "tail_turns": 2,
+    "preserve_recent_tokens": 20000,
+    "reserved": 8000
+  },
+  "experimental": {
+    "disable_paste_summary": true,
+    "batch_tool": true,
+    "openTelemetry": false,
+    "primary_tools": ["task"],
+    "continue_loop_on_deny": true,
+    "mcp_timeout": 15000,
+    "policies": [
+      { "action": "provider.use", "effect": "deny", "resource": "openai/*" },
+      { "action": "provider.use", "effect": "allow", "resource": "anthropic/*" }
+    ]
+  }
+}

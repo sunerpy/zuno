@@ -1114,6 +1114,11 @@ version = "0.1.0"
 [[package]]
 name = "oc-config"
 version = "0.1.0"
+dependencies = [
+ "oc-error",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "oc-db"
