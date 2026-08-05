@@ -12,7 +12,12 @@ publish.workspace = true
 [dependencies]
 oc-error = { workspace = true }
 oc-paths = { workspace = true }
-rusqlite = { workspace = true }
+# `trace` is carried for one reason: the hydration test proves its statement
+# count with SQLite's own `SQLITE_TRACE_STMT` hook, not only with the counter
+# this crate keeps. A self-reported number is not evidence of an absent N+1.
+rusqlite = { workspace = true, features = ["trace"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
