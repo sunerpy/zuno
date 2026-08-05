@@ -1875,6 +1875,20 @@ dependencies = [
 [[package]]
 name = "oc-provider-google"
 version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "futures",
+ "oc-error",
+ "oc-llm",
+ "oc-testkit",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "url",
+]
 
 [[package]]
 name = "oc-provider-openai"
