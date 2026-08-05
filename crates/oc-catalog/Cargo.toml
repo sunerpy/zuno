@@ -13,6 +13,14 @@ publish.workspace = true
 oc-config = { workspace = true }
 oc-error = { workspace = true }
 serde_json = { workspace = true }
+oc-paths = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+oc-testkit = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
