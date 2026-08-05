@@ -2,8 +2,8 @@
 
 use std::path::Path;
 
-use crate::{Oracle, ScriptedEnv};
 use crate::error::{Result, TestkitError};
+use crate::{Oracle, ScriptedEnv};
 
 use super::baseline::{BaselineReport, MachineFacts};
 
@@ -65,7 +65,11 @@ pub(crate) fn write_memory_driver_tool(env: &ScriptedEnv, soak: bool) -> Result<
 fn write_offline_dependency_state(directory: &Path) -> Result<()> {
     let node_modules = directory.join("node_modules");
     std::fs::create_dir_all(&node_modules).map_err(|source| {
-        TestkitError::io("create baseline node_modules sentinel", &node_modules, source)
+        TestkitError::io(
+            "create baseline node_modules sentinel",
+            &node_modules,
+            source,
+        )
     })?;
     let lockfile = directory.join("package-lock.json");
     let body = serde_json::json!({

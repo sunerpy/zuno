@@ -11,8 +11,8 @@ mod workload;
 mod workload_tests;
 
 pub use baseline::{
-    BaselineReport, MachineFacts, RssSample, RunMeasurement, WorkloadMeasurement, WorkloadName,
-    load_committed_baseline,
+    BaselineReport, MachineFacts, PeakSpread, RssSample, RunMeasurement, WorkloadMeasurement,
+    WorkloadName, load_committed_baseline,
 };
 pub use methodology::{FrozenThresholds, PERF_METHODOLOGY_REVISION};
 pub use runner::{

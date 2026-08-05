@@ -5,13 +5,18 @@ use crate::error::{Result, TestkitError};
 use super::baseline::{BaselineReport, WorkloadName};
 
 /// Sampling-methodology revision assigned to the committed formula digest.
-pub const PERF_METHODOLOGY_REVISION: u32 = 1;
+pub const PERF_METHODOLOGY_REVISION: u32 = 2;
 #[cfg(test)]
 const FORMULA_START: &str = "<!-- PERF_FORMULAS_START -->";
 #[cfg(test)]
 const FORMULA_END: &str = "<!-- PERF_FORMULAS_END -->";
 #[cfg(test)]
 const REVISION_1_HASH: &str = "db49ffeb3a19a265a948e5545afe14e245f8ac7c8201ae1b1e1748e87f6922ad";
+/// Same digest as revision 1: revision 2 scoped the warm-up discard to `W-soak`
+/// and left the formula section byte-identical. Registered per revision rather
+/// than aliased, so this stays a digest revision 2 must match on its own.
+#[cfg(test)]
+const REVISION_2_HASH: &str = "db49ffeb3a19a265a948e5545afe14e245f8ac7c8201ae1b1e1748e87f6922ad";
 
 /// Numeric right-hand sides of the four frozen gate predicates.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -115,6 +120,7 @@ fn methodology_hash(bytes: &[u8]) -> String {
 const fn expected_methodology_hash(revision: u32) -> &'static str {
     match revision {
         1 => REVISION_1_HASH,
+        2 => REVISION_2_HASH,
         _ => "UNREGISTERED_METHODOLOGY_REVISION",
     }
 }

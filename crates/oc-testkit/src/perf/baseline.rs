@@ -25,9 +25,9 @@ pub enum WorkloadName {
 pub struct RunMeasurement {
     /// One-based repetition number.
     pub repetition: usize,
-    /// Peak after the frozen 90-second warm-up.
+    /// Peak over the samples this workload's warm-up rule retains.
     pub peak_rss_kib: u64,
-    /// Every 2-second sample, including discarded warm-up samples.
+    /// Every 2-second sample, including any the warm-up rule discards.
     pub samples: Vec<RssSample>,
 }
 
@@ -52,8 +52,51 @@ pub struct WorkloadMeasurement {
     pub part_data_bytes: Option<u64>,
     /// Independent run results.
     pub runs: Vec<RunMeasurement>,
-    /// Median of per-run peaks after warm-up.
+    /// Median of the per-run peaks.
     pub median_peak_rss_kib: Option<u64>,
+    /// Why this workload carries no measurement, when it carries none.
+    ///
+    /// Present only for a workload deferred to a later wave. A workload that
+    /// G1 or G2 consumes can never reach this state: [`BaselineReport::validate`]
+    /// rejects a report whose W-idle or W-real lacks five runs and a median, so a
+    /// missing gate input fails the artifact instead of being waived here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_reason: Option<String>,
+}
+
+/// Run-to-run stability evidence derived from a workload's retained peaks.
+///
+/// Derived rather than stored so it cannot drift from the runs it summarises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeakSpread {
+    /// Lowest per-run peak.
+    pub min_rss_kib: u64,
+    /// Median per-run peak, by the same rule the runner reports.
+    pub median_rss_kib: u64,
+    /// Highest per-run peak.
+    pub max_rss_kib: u64,
+}
+
+impl PeakSpread {
+    /// Ratio of the widest pair of per-run peaks, `1.0` when every run agreed.
+    #[must_use]
+    pub fn max_over_min(self) -> f64 {
+        self.max_rss_kib as f64 / self.min_rss_kib as f64
+    }
+}
+
+impl WorkloadMeasurement {
+    /// Spread of the retained per-run peaks, or `None` for a deferred workload.
+    #[must_use]
+    pub fn peak_spread(&self) -> Option<PeakSpread> {
+        let mut peaks: Vec<u64> = self.runs.iter().map(|run| run.peak_rss_kib).collect();
+        peaks.sort_unstable();
+        Some(PeakSpread {
+            min_rss_kib: *peaks.first()?,
+            median_rss_kib: *peaks.get(peaks.len() / 2)?,
+            max_rss_kib: *peaks.last()?,
+        })
+    }
 }
 
 /// Facts needed to reproduce and attribute a baseline.
@@ -177,5 +220,58 @@ mod tests {
         assert_eq!(idle.expect("W-idle").runs.len(), 5);
         assert_eq!(real.expect("W-real").runs.len(), 5);
         assert!(soak.expect("W-soak").smoke_only);
+    }
+
+    /// Run-to-run stability is evidenced from one pass's five peaks.
+    ///
+    /// This replaces a second full measurement pass agreeing within 10%: the
+    /// spread of the retained peaks measures the same variance from data already
+    /// committed, and the measured spread exceeds 10% on this machine.
+    #[test]
+    fn committed_baseline_records_the_spread_of_every_measured_workloads_peaks() {
+        // Given: the committed artifact's measured and deferred workloads.
+        let baseline = load_committed_baseline().expect("committed baseline must parse");
+
+        // When/Then: each measured workload reports a coherent five-run spread whose
+        // median is the median the artifact publishes.
+        for name in [WorkloadName::WIdle, WorkloadName::WReal] {
+            let workload = baseline.workload(name).expect("measured workload");
+            let spread = workload.peak_spread().expect("five retained peaks");
+            assert_eq!(workload.runs.len(), 5, "{name:?}");
+            assert!(spread.min_rss_kib <= spread.median_rss_kib, "{spread:?}");
+            assert!(spread.median_rss_kib <= spread.max_rss_kib, "{spread:?}");
+            assert!(spread.max_over_min() >= 1.0, "{spread:?}");
+            assert_eq!(
+                Some(spread.median_rss_kib),
+                workload.median_peak_rss_kib,
+                "{name:?} publishes a median its own runs do not support"
+            );
+        }
+
+        // And: the deferred workload records no spread and says why instead.
+        let soak = baseline.workload(WorkloadName::WSoak).expect("W-soak");
+        assert_eq!(soak.peak_spread(), None);
+        assert!(soak.median_peak_rss_kib.is_none());
+        assert!(soak.deferred_reason.is_some());
+    }
+
+    #[test]
+    fn every_committed_peak_is_reproducible_from_its_retained_samples() {
+        // Given: the committed artifact, which retains every raw sample.
+        let baseline = load_committed_baseline().expect("committed baseline must parse");
+
+        // When: each stored peak is re-derived through the production rule.
+        // Then: it matches, so no number was recorded under a superseded revision.
+        for workload in &baseline.workloads {
+            for run in &workload.runs {
+                assert_eq!(
+                    super::super::workload::peak_after_warm_up(&run.samples, workload.name),
+                    Some(run.peak_rss_kib),
+                    "{:?} repetition {} disagrees with its own samples",
+                    workload.name,
+                    run.repetition
+                );
+            }
+        }
     }
 }

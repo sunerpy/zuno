@@ -26,11 +26,11 @@ pub(crate) fn sample(root: u32, started: Instant) -> Result<RssSample> {
     let mut included = Vec::with_capacity(pids.len());
     for pid in pids {
         match linux_rss_kib(pid) {
-            Ok(rss) => {
+            Ok(Some(rss)) => {
                 total_rss_kib = total_rss_kib.saturating_add(rss);
                 included.push(pid);
             }
-            Err(TestkitError::ProcessVanished { .. }) => {}
+            Ok(None) | Err(TestkitError::ProcessVanished { .. }) => {}
             Err(error) => return Err(error),
         }
     }
@@ -127,7 +127,7 @@ fn linux_children(pid: u32) -> Result<Vec<u32>> {
     Ok(children.into_iter().collect())
 }
 
-fn linux_rss_kib(pid: u32) -> Result<u64> {
+fn linux_rss_kib(pid: u32) -> Result<Option<u64>> {
     let path = PathBuf::from(format!("/proc/{pid}/status"));
     let text = std::fs::read_to_string(&path).map_err(|source| {
         if source.kind() == ErrorKind::NotFound {
@@ -143,15 +143,17 @@ fn linux_rss_kib(pid: u32) -> Result<u64> {
     parse_status_rss(pid, &path, &text)
 }
 
-fn parse_status_rss(pid: u32, path: &Path, text: &str) -> Result<u64> {
-    let line = text
-        .lines()
-        .find(|line| line.starts_with("VmRSS:"))
-        .ok_or_else(|| TestkitError::ProcessTreeFormat {
-            pid,
-            path: path.to_path_buf(),
-            detail: "VmRSS field is absent".to_owned(),
-        })?;
+/// `None` for a process that has no address space to attribute.
+///
+/// A zombie's status file survives its `mm`, and a kernel thread never has one,
+/// so both publish a status file with no `VmRSS` line. Neither holds resident
+/// memory, and a run must not fail because a child was reaped between the
+/// process-tree walk and this read. A `VmRSS` line that is present but
+/// unparsable is still an error: that would be a format this code misreads.
+fn parse_status_rss(pid: u32, path: &Path, text: &str) -> Result<Option<u64>> {
+    let Some(line) = text.lines().find(|line| line.starts_with("VmRSS:")) else {
+        return Ok(None);
+    };
     let value = line
         .split_whitespace()
         .nth(1)
@@ -162,6 +164,7 @@ fn parse_status_rss(pid: u32, path: &Path, text: &str) -> Result<u64> {
         })?;
     value
         .parse::<u64>()
+        .map(Some)
         .map_err(|source| TestkitError::ProcessTreeParse {
             pid,
             path: path.to_path_buf(),
@@ -204,6 +207,20 @@ mod tests {
         let rss = parse_status_rss(7, Path::new("/proc/7/status"), status).expect("valid status");
 
         // Then: the numeric KiB value is retained without unit conversion.
-        assert_eq!(rss, 12_345);
+        assert_eq!(rss, Some(12_345));
+    }
+
+    #[test]
+    fn a_reaped_child_contributes_no_resident_memory_instead_of_failing_the_run() {
+        // Given: the status file a zombie publishes after its address space is
+        // gone, which a long sampling run will encounter.
+        let zombie = "Name:\tbun\nState:\tZ (zombie)\nThreads:\t1\n";
+
+        // When: its resident memory is read.
+        let rss = parse_status_rss(9, Path::new("/proc/9/status"), zombie)
+            .expect("a zombie must not fail the run");
+
+        // Then: it is skipped rather than aborting a measurement already underway.
+        assert_eq!(rss, None);
     }
 }

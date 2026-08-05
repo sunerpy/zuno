@@ -1,11 +1,17 @@
 //! Read-only isolation and largest-session selection for W-real.
 
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tempfile::TempDir;
 
 use crate::error::{Result, TestkitError};
+
+/// `rw-------`: one run's private, writable copy of the snapshot.
+const OWNER_READ_WRITE: u32 = 0o600;
+/// `r--r--r--`: the shared snapshot no run may write back to.
+const READ_ONLY: u32 = 0o444;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RealSession {
@@ -63,11 +69,7 @@ impl RealDatabaseSnapshot {
         std::fs::copy(&self.path, target).map_err(|source| {
             TestkitError::io("clone W-real snapshot for one run", target, source)
         })?;
-        let mut permissions = std::fs::metadata(target)
-            .map_err(|source| TestkitError::io("read W-real clone permissions", target, source))?
-            .permissions();
-        permissions.set_readonly(false);
-        std::fs::set_permissions(target, permissions)
+        std::fs::set_permissions(target, std::fs::Permissions::from_mode(OWNER_READ_WRITE))
             .map_err(|source| TestkitError::io("make W-real run clone writable", target, source))?;
         Ok(target.to_path_buf())
     }
@@ -114,15 +116,9 @@ fn make_sqlite_family_read_only(path: &Path) -> Result<()> {
         if !candidate.exists() {
             continue;
         }
-        let mut permissions = std::fs::metadata(&candidate)
-            .map_err(|source| {
-                TestkitError::io("read W-real snapshot permissions", &candidate, source)
-            })?
-            .permissions();
-        permissions.set_readonly(true);
-        std::fs::set_permissions(&candidate, permissions).map_err(|source| {
-            TestkitError::io("make W-real snapshot read-only", candidate, source)
-        })?;
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(READ_ONLY)).map_err(
+            |source| TestkitError::io("make W-real snapshot read-only", candidate, source),
+        )?;
     }
     Ok(())
 }
@@ -236,7 +232,10 @@ mod tests {
 
         // Then: the standalone snapshot contains the committed WAL row.
         let result = Command::new(sqlite)
-            .args([target.to_string_lossy().as_ref(), "SELECT COUNT(*) FROM probe;"])
+            .args([
+                target.to_string_lossy().as_ref(),
+                "SELECT COUNT(*) FROM probe;",
+            ])
             .output()
             .expect("query snapshot");
         assert!(result.status.success(), "{:?}", result.stderr);
