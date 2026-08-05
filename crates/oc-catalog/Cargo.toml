@@ -12,7 +12,6 @@ publish.workspace = true
 [dependencies]
 oc-config = { workspace = true }
 oc-error = { workspace = true }
-serde_json = { workspace = true }
 oc-paths = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
