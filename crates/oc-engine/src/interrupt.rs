@@ -39,7 +39,7 @@ pub struct EngineInterrupts {
 }
 
 /// A reset-safe interruption signal readable by sync code and awaitable by async code.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct InterruptSignal {
     flag: Arc<AtomicBool>,
     epoch: Arc<AtomicU64>,
@@ -121,6 +121,17 @@ impl InterruptSignal {
 impl Default for InterruptSignal {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl oc_tool::InterruptHandle for InterruptSignal {
+    fn is_set(&self) -> bool {
+        InterruptSignal::is_set(self)
+    }
+
+    async fn notified(&self) {
+        InterruptSignal::notified(self).await;
     }
 }
 

@@ -1732,6 +1732,15 @@ dependencies = [
 name = "oc-engine"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "futures",
+ "oc-db",
+ "oc-error",
+ "oc-llm",
+ "oc-paths",
+ "oc-tool",
+ "serde_json",
+ "thiserror 2.0.19",
  "tokio",
 ]
 
