@@ -128,6 +128,18 @@ notify = "8.2.0"
 walkdir = "2.5.0"
 which = "8.0.5"
 
+# -- storage ----------------------------------------------------------------
+# `bundled` compiles the SQLite C amalgamation, which is the point: the session
+# store must be byte-compatible with an `opencode.db` the TypeScript binary also
+# opens, so the SQLite version has to be pinned by us rather than by whatever the
+# host happens to ship. A *system* `libsqlite3` would trade this build-time C
+# dependency for a runtime version-skew hazard against a file another binary
+# writes, which is strictly worse. `cc` is therefore an accepted build
+# requirement; see `.omo/notepads/opencode-rust/issues.md` ("RESOLVED"), and
+# todo 91 crosses to musl/aarch64 with `cargo-zigbuild` rather than a per-target
+# C cross-toolchain.
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+
 # -- primitives -------------------------------------------------------------
 base64 = "0.23.1"
 sha2 = "0.11.0"

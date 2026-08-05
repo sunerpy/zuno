@@ -1,0 +1,1029 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "compaction": {
+    "auto": true,
+    "prune": true
+  },
+  "mcp": {
+    "adk-docs-mcp": {
+      "command": [
+        "uvx",
+        "--from",
+        "mcpdoc==0.0.10",
+        "--with",
+        "mcp[cli]==1.29.0",
+        "mcpdoc",
+        "--urls",
+        "AgentDevelopmentKit:https://adk.dev/llms.txt",
+        "--transport",
+        "stdio"
+      ],
+      "enabled": true,
+      "environment": {
+        "HTTPS_PROXY": "http://127.0.0.1:1080",
+        "HTTP_PROXY": "http://127.0.0.1:1080",
+        "http_proxy": "http://127.0.0.1:1080",
+        "https_proxy": "http://127.0.0.1:1080",
+        "no_proxy": "onethinker.top,test-ai-api.nwcdcloud.cn,192.168.143.247,amazonaws.com.cn,localhost,127.0.0.1,18.179.104.237"
+      },
+      "type": "local"
+    },
+    "openai-developer-docs": {
+      "enabled": true,
+      "type": "remote",
+      "url": "https://developers.openai.com/mcp"
+    },
+    "aws-knowledge-mcp-server": {
+      "enabled": true,
+      "type": "remote",
+      "url": "https://knowledge-mcp.global.api.aws"
+    },
+    "chrome-devtools": {
+      "command": [
+        "npx",
+        "-y",
+        "chrome-devtools-mcp@latest",
+        "--browser-url=http://127.0.0.1:22306"
+      ],
+      "type": "local"
+    },
+    "codegraph-mcp-server": {
+      "command": [
+        "codegraph",
+        "serve",
+        "--mcp"
+      ],
+      "enabled": true,
+      "type": "local"
+    },
+    "canvas-authoring": {
+      "command": [
+        "dnx",
+        "Microsoft.PowerApps.CanvasAuthoring.McpServer",
+        "--yes",
+        "--prerelease",
+        "--source",
+        "https://api.nuget.org/v3/index.json"
+      ],
+      "enabled": true,
+      "type": "local"
+    },
+    "microsoft-learn": {
+      "enabled": true,
+      "type": "remote",
+      "url": "https://learn.microsoft.com/api/mcp"
+    },
+    "quick-ticket": {
+      "enabled": true,
+      "headers": {
+        "X-Authenticated-User-Email": "shaonanzhang@nwcdcloud.cn"
+      },
+      "type": "remote",
+      "url": "http://localhost:18080/quick-ticket/mcp"
+    }
+  },
+  "permission": {
+    "lsp": "allow",
+    "todoread": "allow",
+    "todowrite": "allow"
+  },
+  "plugin": [
+    "opencode-antigravity-auth@1.6.0",
+    "@sunerpy/opencode-kiro-auth@0.18.0",
+    "@sunerpy/oh-my-openagent@4.21.0"
+  ],
+  "provider": {
+    "awsopenai": {
+      "models": {
+        "openai.gpt-5.4": {
+          "limit": {
+            "context": 272000,
+            "output": 65536
+          },
+          "name": "AWS OpenAI GPT-5.4",
+          "options": {
+            "reasoningEffort": "medium",
+            "textVerbosity": "low"
+          },
+          "variants": {
+            "high": {
+              "reasoningEffort": "high"
+            },
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "xhigh": {
+              "reasoningEffort": "xhigh"
+            }
+          }
+        },
+        "openai.gpt-5.5": {
+          "limit": {
+            "context": 272000,
+            "output": 65536
+          },
+          "name": "AWS OpenAI GPT-5.5",
+          "options": {
+            "reasoningEffort": "medium",
+            "textVerbosity": "low"
+          }
+        }
+      },
+      "name": "aws openai",
+      "npm": "@ai-sdk/openai",
+      "options": {
+        "baseURL": "https://bedrock-mantle.us-east-2.api.aws/openai/v1",
+        "chunkTimeout": 3000000,
+        "headerTimeout": false,
+        "timeout": 3000000
+      }
+    },
+    "google": {
+      "models": {
+        "antigravity-claude-opus-4-5-thinking": {
+          "limit": {
+            "context": 200000,
+            "output": 64000
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "pdf"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "name": "Claude Opus 4.5 Thinking (Antigravity)",
+          "variants": {
+            "low": {
+              "thinkingConfig": {
+                "thinkingBudget": 8192
+              }
+            },
+            "max": {
+              "thinkingConfig": {
+                "thinkingBudget": 32768
+              }
+            }
+          }
+        },
+        "antigravity-claude-opus-4-6-thinking": {
+          "limit": {
+            "context": 200000,
+            "output": 64000
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "pdf"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "name": "Claude Opus 4.6 Thinking (Antigravity)",
+          "variants": {
+            "low": {
+              "thinkingConfig": {
+                "thinkingBudget": 8192
+              }
+            },
+            "max": {
+              "thinkingConfig": {
+                "thinkingBudget": 32768
+              }
+            }
+          }
+        },
+        "antigravity-claude-sonnet-4-5": {
+          "limit": {
+            "context": 200000,
+            "output": 64000
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "pdf"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "name": "Claude Sonnet 4.5 (Antigravity)"
+        },
+        "antigravity-claude-sonnet-4-5-thinking": {
+          "limit": {
+            "context": 200000,
+            "output": 64000
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "pdf"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "name": "Claude Sonnet 4.5 Thinking (Antigravity)",
+          "variants": {
+            "low": {
+              "thinkingConfig": {
+                "thinkingBudget": 8192
+              }
+            },
+            "max": {
+              "thinkingConfig": {
+                "thinkingBudget": 32768
+              }
+            }
+          }
+        },
+        "antigravity-gemini-3-flash": {
+          "limit": {
+            "context": 1048576,
+            "output": 65536
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "pdf"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "name": "Gemini 3 Flash (Antigravity)",
+          "variants": {
+            "high": {
+              "thinkingLevel": "high"
+            },
+            "low": {
+              "thinkingLevel": "low"
+            },
+            "medium": {
+              "thinkingLevel": "medium"
+            },
+            "minimal": {
+              "thinkingLevel": "minimal"
+            }
+          }
+        },
+        "antigravity-gemini-3-pro": {
+          "limit": {
+            "context": 1048576,
+            "output": 65535
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "pdf"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "name": "Gemini 3 Pro (Antigravity)",
+          "variants": {
+            "high": {
+              "thinkingLevel": "high"
+            },
+            "low": {
+              "thinkingLevel": "low"
+            }
+          }
+        },
+        "antigravity-gemini-3.1-pro": {
+          "limit": {
+            "context": 1048576,
+            "output": 65535
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "pdf"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "name": "Gemini 3.1 Pro (Antigravity)",
+          "variants": {
+            "high": {
+              "thinkingLevel": "high"
+            },
+            "low": {
+              "thinkingLevel": "low"
+            }
+          }
+        },
+        "gemini-2.5-flash": {
+          "limit": {
+            "context": 1048576,
+            "output": 65536
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "pdf"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "name": "Gemini 2.5 Flash (Gemini CLI)"
+        },
+        "gemini-2.5-pro": {
+          "limit": {
+            "context": 1048576,
+            "output": 65536
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "pdf"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "name": "Gemini 2.5 Pro (Gemini CLI)"
+        },
+        "gemini-3-flash-preview": {
+          "limit": {
+            "context": 1048576,
+            "output": 65536
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "pdf"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "name": "Gemini 3 Flash Preview (Gemini CLI)"
+        },
+        "gemini-3-pro-preview": {
+          "limit": {
+            "context": 1048576,
+            "output": 65535
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "pdf"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "name": "Gemini 3 Pro Preview (Gemini CLI)"
+        },
+        "gemini-3.1-pro-preview": {
+          "limit": {
+            "context": 1048576,
+            "output": 65535
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "pdf"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "name": "Gemini 3.1 Pro Preview (Gemini CLI)"
+        }
+      },
+      "name": "Google"
+    },
+    "amazon-bedrock": {
+      "options": {
+        "region": "us-east-2",
+        "profile": "us",
+        "endpoint": "https://bedrock-mantle.us-east-1.api.aws/openai/v1"
+      }
+    },
+    "myopenai": {
+      "models": {
+        "gpt-5.4": {
+          "limit": {
+            "context": 272000,
+            "output": 65536
+          },
+          "name": "AWS-Bedrock GPT-5.4",
+          "options": {
+            "reasoningEffort": "medium",
+            "textVerbosity": "low"
+          },
+          "variants": {
+            "high": {
+              "reasoningEffort": "high"
+            },
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "xhigh": {
+              "reasoningEffort": "xhigh"
+            }
+          }
+        },
+        "gpt-5.5": {
+          "limit": {
+            "context": 272000,
+            "output": 65536
+          },
+          "name": "AWS Bedrock GPT-5.5",
+          "options": {
+            "reasoningEffort": "medium",
+            "textVerbosity": "low"
+          },
+          "variants": {
+            "high": {
+              "reasoningEffort": "high"
+            },
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "xhigh": {
+              "reasoningEffort": "xhigh"
+            }
+          }
+        },
+        "gpt-5.6-sol": {
+          "limit": {
+            "context": 272000,
+            "output": 65536
+          },
+          "name": "AWS Bedrock GPT-5.6 Sol",
+          "options": {
+            "reasoningEffort": "medium",
+            "textVerbosity": "low"
+          },
+          "variants": {
+            "high": {
+              "reasoningEffort": "high"
+            },
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "max": {
+              "reasoningEffort": "max"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "xhigh": {
+              "reasoningEffort": "xhigh"
+            }
+          }
+        },
+        "gpt-5.6-terra": {
+          "limit": {
+            "context": 272000,
+            "output": 65536
+          },
+          "name": "AWS Bedrock GPT-5.6 Terra",
+          "options": {
+            "reasoningEffort": "medium",
+            "textVerbosity": "low"
+          },
+          "variants": {
+            "high": {
+              "reasoningEffort": "high"
+            },
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "max": {
+              "reasoningEffort": "max"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "xhigh": {
+              "reasoningEffort": "xhigh"
+            }
+          }
+        },
+        "gpt-5.6-luna": {
+          "limit": {
+            "context": 272000,
+            "output": 65536
+          },
+          "name": "AWS Bedrock GPT-5.6 Luna",
+          "options": {
+            "reasoningEffort": "medium",
+            "textVerbosity": "low"
+          },
+          "variants": {
+            "high": {
+              "reasoningEffort": "high"
+            },
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "max": {
+              "reasoningEffort": "max"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "xhigh": {
+              "reasoningEffort": "xhigh"
+            }
+          }
+        },
+        "global.anthropic.claude-fable-5": {
+          "limit": {
+            "context": 1024000,
+            "output": 65536
+          },
+          "name": "Claude Fable 5",
+          "variants": {
+            "high": {
+              "reasoningEffort": "high"
+            },
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "max": {
+              "reasoningEffort": "max"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "xhigh": {
+              "reasoningEffort": "xhigh"
+            }
+          }
+        },
+        "us.anthropic.claude-fable-5": {
+          "limit": {
+            "context": 1024000,
+            "output": 65536
+          },
+          "name": "Claude Fable 5 US",
+          "options": {
+            "reasoningEffort": "medium",
+            "reasoningSummary": "auto"
+          },
+          "variants": {
+            "high": {
+              "reasoningEffort": "high"
+            },
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "max": {
+              "reasoningEffort": "max"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "xhigh": {
+              "reasoningEffort": "xhigh"
+            }
+          }
+        },
+        "global.anthropic.claude-haiku-4-5-20251001-v1:0": {
+          "limit": {
+            "context": 200000,
+            "output": 64000
+          },
+          "name": "Claude 4.5 Haiku"
+        },
+        "us.anthropic.claude-haiku-4-5-20251001-v1:0": {
+          "limit": {
+            "context": 200000,
+            "output": 64000
+          },
+          "name": "Claude 4.5 Haiku US"
+        },
+        "global.anthropic.claude-opus-4-6-v1": {
+          "limit": {
+            "context": 1024000,
+            "output": 65536
+          },
+          "name": "Claude 4.6 Opus",
+          "variants": {
+            "high": {
+              "reasoningEffort": "high"
+            },
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "max": {
+              "reasoningEffort": "max"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "xhigh": {
+              "reasoningEffort": "xhigh"
+            }
+          }
+        },
+        "us.anthropic.claude-opus-4-6-v1": {
+          "limit": {
+            "context": 1024000,
+            "output": 65536
+          },
+          "name": "Claude 4.6 Opus US",
+          "variants": {
+            "high": {
+              "reasoningEffort": "high"
+            },
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "max": {
+              "reasoningEffort": "max"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "xhigh": {
+              "reasoningEffort": "xhigh"
+            }
+          }
+        },
+        "global.anthropic.claude-opus-4-7": {
+          "limit": {
+            "context": 1024000,
+            "output": 65536
+          },
+          "name": "Claude 4.7 Opus",
+          "variants": {
+            "high": {
+              "reasoningEffort": "high"
+            },
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "max": {
+              "reasoningEffort": "max"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "xhigh": {
+              "reasoningEffort": "xhigh"
+            }
+          }
+        },
+        "us.anthropic.claude-opus-4-7": {
+          "limit": {
+            "context": 1024000,
+            "output": 65536
+          },
+          "name": "Claude 4.7 Opus US",
+          "variants": {
+            "high": {
+              "reasoningEffort": "high"
+            },
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "max": {
+              "reasoningEffort": "max"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "xhigh": {
+              "reasoningEffort": "xhigh"
+            }
+          }
+        },
+        "global.anthropic.claude-opus-4-8": {
+          "limit": {
+            "context": 1024000,
+            "output": 65536
+          },
+          "name": "Claude 4.8 Opus",
+          "variants": {
+            "high": {
+              "reasoningEffort": "high"
+            },
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "max": {
+              "reasoningEffort": "max"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "xhigh": {
+              "reasoningEffort": "xhigh"
+            }
+          }
+        },
+        "us.anthropic.claude-opus-4-8": {
+          "limit": {
+            "context": 1024000,
+            "output": 65536
+          },
+          "name": "Claude 4.8 Opus US",
+          "variants": {
+            "high": {
+              "reasoningEffort": "high"
+            },
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "max": {
+              "reasoningEffort": "max"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "xhigh": {
+              "reasoningEffort": "xhigh"
+            }
+          }
+        },
+        "global.anthropic.claude-opus-5": {
+          "limit": {
+            "context": 1024000,
+            "output": 65536
+          },
+          "name": "Claude 5 Opus",
+          "options": {
+            "reasoningEffort": "max",
+            "reasoningSummary": "auto"
+          },
+          "variants": {
+            "high": {
+              "reasoningEffort": "high"
+            },
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "max": {
+              "reasoningEffort": "max"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "xhigh": {
+              "reasoningEffort": "xhigh"
+            }
+          }
+        },
+        "us.anthropic.claude-opus-5": {
+          "limit": {
+            "context": 1024000,
+            "output": 65536
+          },
+          "name": "Claude 5 Opus US",
+          "options": {
+            "reasoningEffort": "max",
+            "reasoningSummary": "auto"
+          },
+          "variants": {
+            "high": {
+              "reasoningEffort": "high"
+            },
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "max": {
+              "reasoningEffort": "max"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "xhigh": {
+              "reasoningEffort": "xhigh"
+            }
+          }
+        },
+        "global.anthropic.claude-sonnet-4-5-20250929-v1:0": {
+          "limit": {
+            "context": 200000,
+            "output": 65536
+          },
+          "name": "Claude 4.5 Sonnet"
+        },
+        "us.anthropic.claude-sonnet-4-5-20250929-v1:0": {
+          "limit": {
+            "context": 200000,
+            "output": 65536
+          },
+          "name": "Claude 4.5 Sonnet US"
+        },
+        "global.anthropic.claude-sonnet-4-6": {
+          "limit": {
+            "context": 1000000,
+            "output": 65536
+          },
+          "name": "Claude 4.6 Sonnet",
+          "variants": {
+            "high": {
+              "reasoningEffort": "high"
+            },
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "max": {
+              "reasoningEffort": "max"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "xhigh": {
+              "reasoningEffort": "xhigh"
+            }
+          }
+        },
+        "us.anthropic.claude-sonnet-4-6": {
+          "limit": {
+            "context": 1000000,
+            "output": 65536
+          },
+          "name": "Claude 4.6 Sonnet US",
+          "variants": {
+            "high": {
+              "reasoningEffort": "high"
+            },
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "max": {
+              "reasoningEffort": "max"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "xhigh": {
+              "reasoningEffort": "xhigh"
+            }
+          }
+        },
+        "global.anthropic.claude-sonnet-5": {
+          "limit": {
+            "context": 1000000,
+            "output": 65536
+          },
+          "name": "Claude Sonnet 5",
+          "variants": {
+            "high": {
+              "reasoningEffort": "high"
+            },
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "max": {
+              "reasoningEffort": "max"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "xhigh": {
+              "reasoningEffort": "xhigh"
+            }
+          }
+        },
+        "us.anthropic.claude-sonnet-5": {
+          "limit": {
+            "context": 1000000,
+            "output": 65536
+          },
+          "name": "Claude Sonnet 5 US",
+          "variants": {
+            "high": {
+              "reasoningEffort": "high"
+            },
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "max": {
+              "reasoningEffort": "max"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "xhigh": {
+              "reasoningEffort": "xhigh"
+            }
+          }
+        },
+        "qwen.qwen3-coder-480b-a35b-v1:0": {
+          "limit": {
+            "context": 102236,
+            "output": 65536
+          },
+          "name": "My Qwen3 coder 480b"
+        },
+        "zai.glm-5": {
+          "limit": {
+            "context": 1024000,
+            "output": 65536
+          },
+          "name": "ZAI GLM-5"
+        }
+      },
+      "name": "my openai",
+      "npm": "@ai-sdk/openai",
+      "options": {
+        "baseURL": "https://openai-us.onethinker.top/api/v1",
+        "chunkTimeout": 3000000,
+        "headerTimeout": false,
+        "timeout": 3000000
+      }
+    },
+    "nwcdai": {
+      "models": {
+        "gemini-3.1-flash-lite-preview": {
+          "limit": {
+            "context": 1048576,
+            "output": 65536
+          },
+          "name": "Gemini-3-flash"
+        },
+        "gemini-3.1-pro-preview": {
+          "limit": {
+            "context": 1048576,
+            "output": 65536
+          },
+          "name": "Gemini-3-pro"
+        }
+      },
+      "name": "nwcdai",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://192.168.143.247/v1"
+      }
+    },
+    "openai": {
+      "models": {
+        "gpt-5.1-codex-max": {
+          "limit": {
+            "context": 272000,
+            "output": 128000
+          }
+        },
+        "gpt-5.1-codex-mini": {
+          "limit": {
+            "context": 272000,
+            "output": 128000
+          }
+        },
+        "gpt-5.2": {
+          "limit": {
+            "context": 272000,
+            "output": 128000
+          }
+        },
+        "gpt-5.2-codex": {
+          "limit": {
+            "context": 272000,
+            "output": 128000
+          }
+        },
+        "gpt-5.4": {
+          "limit": {
+            "context": 1050000,
+            "output": 128000
+          }
+        },
+        "gpt-5.4-codex": {
+          "limit": {
+            "context": 1050000,
+            "output": 128000
+          }
+        }
+      }
+    },
+    "zhipuai": {
+      "api": "https://open.bigmodel.cn/api/coding/paas/v4"
+    }
+  }
+}
