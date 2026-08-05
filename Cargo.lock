@@ -2139,6 +2139,21 @@ dependencies = [
 [[package]]
 name = "oc-tools"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "oc-error",
+ "oc-permission",
+ "oc-tool",
+ "reqwest",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "time",
+ "tokio",
+ "url",
+ "wiremock",
+]
 
 [[package]]
 name = "oc-tui"
