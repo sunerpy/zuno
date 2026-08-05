@@ -73,3 +73,92 @@ Non-obvious settings, each of which cost a build cycle to find:
 6. Debug profile uses `debug = "line-tables-only"`: panics and backtraces keep
    file and line, but links far faster than full debuginfo. jcode goes further
    with `debug = 0`, which loses that.
+
+## Task 2 — typed error taxonomy (`oc-error`)
+
+### The final variant list
+
+Nine public types. `Recovery` is the answer every error owes its caller;
+`Recoverable` is the trait that produces it; the rest are the taxonomy proper.
+
+| type | variants |
+| --- | --- |
+| `Recovery` | `Retry { after: Option<Duration> }`, `Compact`, `Reauthenticate`, `Fail` |
+| `ProviderError` | `ContextLimit { limit_tokens, used_tokens }`, `RateLimited { retry_after }`, `Transient { status, source }`, `Auth { provider, source }`, `Refused { provider, provider_text }`, `Fatal { status, source }` |
+| `ToolError` | `Denied { tool }`, `InvalidArgs { tool, source }`, `Timeout { tool, elapsed }`, `NotFound { tool }`, `Failed { tool, source }` |
+| `ConfigError` | `Io { path, source }`, `Json { path, source }`, `Invalid { path, issues }`, `Frontmatter { path, source }`, `DirectoryTypo { path, dir, suggestion }`, `RemoteAuth { url, remote }` |
+| `DbError` | `Open { path, source }`, `Migration { version, source }`, `Query { source }`, `Busy { retry_after }`, `NotFound { table, id }`, `Decode { table, source }` |
+| `PluginError` | `Load { plugin, source }`, `Hook { plugin, hook, source }`, `Timeout { plugin, hook, elapsed }`, `IncompatibleApi { plugin, required, provided }` |
+| `McpError` | `Connect { server, source }`, `Handshake { server, source }`, `Protocol { server, source }`, `Timeout { server, elapsed }`, `ToolCall { server, tool, source }` |
+| `LspError` | `NotInstalled { server, command }`, `Spawn { server, command, source }`, `Initialize { server, source }`, `Protocol { server, source }`, `Timeout { server, elapsed }`, `Exited { server, code }` |
+| `Error` | one `#[from]` newtype per domain above, all `#[error(transparent)]` |
+
+Also public: `ConfigIssue { key_path: Vec<String>, detail: String }` and
+`BoxSource = Box<dyn Error + Send + Sync + 'static>`.
+
+**The retryable set, for the record.** `ProviderError::{RateLimited, Transient}`,
+`ToolError::Timeout`, `DbError::Busy`, `PluginError::Timeout`,
+`McpError::{Connect, Timeout}`, `LspError::{Timeout, Exited}`. Nothing in
+`ConfigError` retries. **`ProviderError::ContextLimit` is deliberately NOT
+retryable** — it maps to `Recovery::Compact`. Conflating "recoverable" with
+"retryable" is what makes a retry loop burn its whole attempt budget re-sending a
+request that overflows the same window every time.
+
+**Only two variants carry a delay from the wire:**
+`ProviderError::RateLimited.retry_after` and `DbError::Busy.retry_after`. Every
+other retryable variant yields `Recovery::Retry { after: None }`, meaning "the
+peer named no delay, apply your own backoff".
+
+### What `thiserror` 2.0.19 actually does
+
+Verified by compiling a throwaway probe enum in `oc-error` before writing the
+real taxonomy, then deleting it. All five behaviours confirmed by a passing test,
+not assumed:
+
+1. **`#[source] source: Option<BoxSource>` works.** The derive special-cases an
+   `Option` source: `None` yields `Error::source() == None`, `Some(e)` yields that
+   `e`. This is what allows one variant to serve both "we have a cause" and "the
+   provider only gave us a status code" without splitting into two variants.
+2. **A field named `source` is picked up implicitly**, `#[source]` attribute or
+   not. Every one is annotated here anyway — the intent should not depend on a
+   naming convention a future rename could silently break.
+3. **`{field:?}` works in `#[error("…")]`**, so `Option<u64>` and
+   `Option<Duration>` render without a helper. `Duration` has no `Display`, only
+   `Debug`, so `{after:?}` is the only way to show it — it prints as `30s`, not
+   `Duration { secs: 30 }`.
+4. **`#[error(transparent)]` + `#[from]` on a newtype variant** forwards both
+   `Display` and `source()` to the inner error. The aggregate `Error` is therefore
+   free: `Error::from(ToolError::Failed{…}).to_string()` equals the inner text,
+   and the full cause chain survives one more hop.
+5. **A shorthand `#[error("… ({} issue(s))", issues.len())]` is accepted** —
+   trailing format arguments may be arbitrary expressions over the variant's
+   fields, which avoids a hand-written `impl Display`.
+
+Two things that differ from 1.x-era examples: `Option` source support is not
+something to reach for a `#[source]`-less workaround for, and there is no need
+for `#[backtrace]` unless nightly backtraces are wanted (not used here).
+
+### Measured sizes
+
+`size_of::<Error>() == 80`, `ProviderError` 48, `ConfigError` 72, `Recovery` 16.
+Clippy's `result_large_err` threshold is 128 bytes, so nothing needs boxing yet.
+A test asserts the 128-byte budget so the crate that blows past it fails in
+`oc-error` rather than as a warning in whatever unrelated crate happens to return
+the fat `Result`. Watch `ConfigError` — it is the widest at 72 bytes because
+`Invalid` holds a `PathBuf` plus a `Vec`.
+
+### Cheap facts worth not rediscovering
+
+- **Integration tests in `tests/` see both `[dependencies]` and
+  `[dev-dependencies]`.** `tests/taxonomy.rs` uses `serde_json` (a normal
+  dependency) and `tests/no_anyhow_in_libraries.rs` uses `walkdir` (dev-only);
+  neither needed anything declared twice.
+- **`cargo fmt` was NOT clean on hand-written code.** Task 1 left every crate
+  rustfmt-clean (spot-checked `oc-config`, `oc-types`, `oc-cli`, `oc-tui`,
+  `oc-db`), so `cargo fmt -p oc-error` was run to match. Run it per-crate, never
+  `--all`, while sibling agents hold files open.
+- **`size_of` needs no import in edition 2024** — it is in the prelude, so
+  `std::mem::size_of` is redundant and clippy would flag the import.
+- **`std::io::Error::other(msg)`** is the short constructor for a test cause;
+  `Error::new(ErrorKind::Other, msg)` is the older spelling and clippy prefers
+  the former.
