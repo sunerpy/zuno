@@ -61,3 +61,18 @@ impl FileTools {
 pub fn uses_apply_patch(model_id: &str) -> bool {
     model_id.contains("gpt-") && !model_id.contains("oss") && !model_id.contains("gpt-4")
 }
+//!
+//! # Search
+//!
+//! [`glob`] matches paths and [`grep`] searches contents, both over
+//! [`oc_search`]'s embedded engine. Nothing here downloads a ripgrep binary, which
+//! the oracle does on first search; a system `rg` is reachable only through
+//! [`oc_search::Backend::from_env`] and is never selected implicitly.
+
+pub mod glob;
+pub mod grep;
+pub mod search_common;
+
+pub use crate::glob::{GlobParams, GlobTool};
+pub use crate::grep::{GrepParams, GrepTool};
+pub use crate::search_common::{RESULT_LIMIT, SearchScope, SearchTooling};
