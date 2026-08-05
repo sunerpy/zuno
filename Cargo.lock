@@ -1797,6 +1797,18 @@ version = "0.1.0"
 [[package]]
 name = "oc-provider-compatible"
 version = "0.1.0"
+dependencies = [
+ "futures",
+ "oc-error",
+ "oc-llm",
+ "oc-testkit",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "toml",
+]
 
 [[package]]
 name = "oc-provider-google"
