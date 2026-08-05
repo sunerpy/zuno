@@ -1,0 +1,439 @@
+//! Where the catalog comes from: the three environment variables, the cache file,
+//! and the fetch — in that order of authority.
+//!
+//! Ported from `packages/core/src/models-dev.ts:160-231`. The resolution ladder is
+//! the part worth stating precisely, because each rung answers a different
+//! question and they are routinely conflated:
+//!
+//! | variable | question it answers | effect |
+//! |---|---|---|
+//! | `OPENCODE_MODELS_URL` | *where* would a fetch go | changes the source **and** the cache filename |
+//! | `OPENCODE_MODELS_PATH` | read this file **instead** | bypasses the cache path entirely; never written to |
+//! | `OPENCODE_DISABLE_MODELS_FETCH` | may we go to the network | no fetch, ever — including at startup |
+//!
+//! Three details that a reimplementation gets wrong by default:
+//!
+//! 1. **The cache filename depends on the source.** `models.json` for the default
+//!    source, `models-<sha1(source)>.json` for anything else
+//!    (`models-dev.ts:161-164`), so pointing at a mirror cannot poison the
+//!    default cache. `oc-paths` already implements this; this module does not
+//!    re-derive it.
+//! 2. **`OPENCODE_MODELS_URL` is read with JavaScript `||` semantics**, so
+//!    `OPENCODE_MODELS_URL=""` means *unset*, not "empty source"
+//!    (`models-dev.ts:160`). `OPENCODE_DISABLE_MODELS_FETCH` goes through
+//!    `Flag.truthy` instead, where only `"1"` and a case-insensitive `"true"`
+//!    count (`flag.ts:3-6`) — so `OPENCODE_DISABLE_MODELS_FETCH=0`, `=no` and
+//!    `=yes` all leave fetching **enabled**. Both are `oc-paths::Env` methods
+//!    already; this module uses them rather than parsing strings again.
+//! 3. **An unreadable cache file is deleted; an unreadable explicit path is not**
+//!    (`models-dev.ts:184-196`). A corrupt cache is this program's own mess to
+//!    clean up. An explicit path is the user's instruction, and quietly falling
+//!    back from it would hide a typo.
+//!
+//! # The divergence, stated precisely
+//!
+//! With fetching disabled and no cache, the oracle has **three** fallbacks, not
+//! one, and only the third is the empty catalog people quote:
+//!
+//! 1. the cache file (`models-dev.ts:218`),
+//! 2. a **catalog snapshot compiled into the binary** — the `OPENCODE_MODELS_DEV`
+//!    global at `models-dev.ts:198-200`, read at `:220-221`,
+//! 3. `{}` (`:222`), reached only when there is no snapshot either.
+//!
+//! Rung 2 is live in the installed release. Verified: `OPENCODE_DISABLE_MODELS_FETCH=1`
+//! with an empty `XDG_CACHE_HOME` and an isolated `HOME` still listed seven
+//! `opencode/*` models and exited 0, and wrote no cache file. So the released
+//! binary essentially never reaches the empty catalog.
+//!
+//! This crate has no compiled-in snapshot, so its rung 2 does not exist, and
+//! silently landing on rung 3 would be the worst of the three outcomes: an empty
+//! catalog is indistinguishable from "you have no providers configured", and the
+//! user meets it as a mysteriously empty model picker rather than as the one
+//! sentence naming the flag they set. Hence [`CatalogError::FetchDisabled`].
+//!
+//! A caller that *wants* rung 3 can match [`CatalogError::is_policy`] and
+//! substitute an empty document; nothing here decides that for it. A future todo
+//! that bakes in a snapshot should insert it between [`CatalogSource::load_from_disk`]
+//! and this error, which is rung 2 in the same position the oracle has it.
+
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
+use oc_paths::Layout;
+use oc_paths::env::Env;
+
+use crate::catalog::error::CatalogError;
+use crate::catalog::models_dev::CatalogDocument;
+
+/// `OPENCODE_MODELS_PATH` — read this catalog file instead of the cache.
+pub const OPENCODE_MODELS_PATH: &str = "OPENCODE_MODELS_PATH";
+/// `OPENCODE_DISABLE_MODELS_FETCH` — never go to the network for the catalog.
+pub const OPENCODE_DISABLE_MODELS_FETCH: &str = "OPENCODE_DISABLE_MODELS_FETCH";
+
+/// How long a cache file counts as fresh — `models-dev.ts:165`.
+pub const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// The catalog request path appended to the source — `models-dev.ts:176`.
+const API_PATH: &str = "/api.json";
+
+/// The fetch timeout — `models-dev.ts:180`.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Attempts after the first — `models-dev.ts:152-156` (`times: 2`).
+const FETCH_RETRIES: u32 = 2;
+
+/// Base backoff between attempts — `models-dev.ts:155` (`exponential(200)`).
+const FETCH_BACKOFF: Duration = Duration::from_millis(200);
+
+/// Everything the three variables and the layout decide, resolved once.
+///
+/// Built by [`CatalogSource::resolve`] from an explicit [`Env`] rather than from
+/// `std::env`, so a test states the environment it means instead of mutating the
+/// process and racing every other test in the binary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogSource {
+    source: String,
+    cache: PathBuf,
+    explicit_path: Option<PathBuf>,
+    fetch_disabled: bool,
+}
+
+impl CatalogSource {
+    /// Resolve the source, the cache path and the fetch policy from one `Env`.
+    #[must_use]
+    pub fn resolve(env: &Env, layout: &Layout) -> Self {
+        Self {
+            // `models_source()` is `OPENCODE_MODELS_URL` with `||` semantics and
+            // the models.dev default; the cache filename hangs off it.
+            source: layout.models_source().to_owned(),
+            cache: layout.models_cache(),
+            explicit_path: env.truthy_value(OPENCODE_MODELS_PATH).map(PathBuf::from),
+            fetch_disabled: env.flag(OPENCODE_DISABLE_MODELS_FETCH),
+        }
+    }
+
+    /// The base URL a fetch would target.
+    #[must_use]
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// The cache file for this source.
+    #[must_use]
+    pub fn cache(&self) -> &Path {
+        &self.cache
+    }
+
+    /// The file `OPENCODE_MODELS_PATH` named, if it named one.
+    #[must_use]
+    pub fn explicit_path(&self) -> Option<&Path> {
+        self.explicit_path.as_deref()
+    }
+
+    /// True when policy forbids the network.
+    #[must_use]
+    pub const fn fetch_disabled(&self) -> bool {
+        self.fetch_disabled
+    }
+
+    /// The URL a fetch would request.
+    #[must_use]
+    pub fn api_url(&self) -> String {
+        format!("{}{API_PATH}", self.source.trim_end_matches('/'))
+    }
+
+    /// The file this source reads from: the explicit path, else the cache.
+    #[must_use]
+    pub fn read_path(&self) -> &Path {
+        self.explicit_path.as_deref().unwrap_or(&self.cache)
+    }
+
+    /// True when the cache exists and is younger than [`CACHE_TTL`].
+    ///
+    /// `models-dev.ts:168-173`: a missing file is stale, and an unreadable mtime
+    /// is treated as the epoch, which is also stale.
+    #[must_use]
+    pub fn cache_is_fresh(&self) -> bool {
+        let Ok(metadata) = std::fs::metadata(&self.cache) else {
+            return false;
+        };
+        let Ok(modified) = metadata.modified() else {
+            return false;
+        };
+        SystemTime::now()
+            .duration_since(modified)
+            .is_ok_and(|age| age < CACHE_TTL)
+    }
+
+    /// Read the catalog from disk, without touching the network.
+    ///
+    /// `Ok(None)` means "nothing usable on disk" and is not an error — it is the
+    /// signal to fetch. Distinguishing the two is the whole point:
+    ///
+    /// - explicit path missing or unreadable → [`CatalogError::ExplicitPathUnreadable`],
+    ///   because the user named it;
+    /// - cache missing → `Ok(None)`;
+    /// - cache present but unparseable → the file is **removed** and `Ok(None)`,
+    ///   matching `models-dev.ts:184-196`; a corrupt cache this program wrote is
+    ///   this program's to discard;
+    /// - explicit path present but unparseable → [`CatalogError::Malformed`],
+    ///   never removed.
+    pub fn load_from_disk(&self) -> Result<Option<CatalogDocument>, CatalogError> {
+        if let Some(path) = self.explicit_path.as_deref() {
+            let bytes =
+                std::fs::read(path).map_err(|source| CatalogError::ExplicitPathUnreadable {
+                    path: path.to_owned(),
+                    source,
+                })?;
+            let document =
+                serde_json::from_slice(&bytes).map_err(|source| CatalogError::Malformed {
+                    path: path.to_owned(),
+                    source,
+                })?;
+            return Ok(Some(document));
+        }
+
+        let Ok(bytes) = std::fs::read(&self.cache) else {
+            return Ok(None);
+        };
+        match serde_json::from_slice(&bytes) {
+            Ok(document) => Ok(Some(document)),
+            Err(_) => {
+                // Best-effort: a cache we cannot delete is still a cache we will
+                // not use, and failing here would turn a recoverable state into
+                // a hard error.
+                let _ = std::fs::remove_file(&self.cache);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Load the catalog: disk first, then the network if policy allows.
+    ///
+    /// The fetch is only reached when disk yielded nothing. When it is also
+    /// forbidden, this returns [`CatalogError::FetchDisabled`] naming the source,
+    /// the cache path and the variable — rather than hanging on a request policy
+    /// forbids, or returning an empty catalog the caller cannot tell apart from
+    /// "no providers configured".
+    pub async fn load(&self) -> Result<CatalogDocument, CatalogError> {
+        if let Some(document) = self.load_from_disk()? {
+            return Ok(document);
+        }
+        if self.fetch_disabled {
+            return Err(CatalogError::FetchDisabled {
+                origin: self.source.clone(),
+                cache: self.cache.clone(),
+            });
+        }
+        let text = self.fetch().await?;
+        let document = serde_json::from_str(&text).map_err(|source| CatalogError::Malformed {
+            path: self.cache.clone(),
+            source,
+        })?;
+        // A cache write failure is reported, not swallowed: the next run would
+        // silently re-fetch and the user would never learn why.
+        self.write_cache(&text)?;
+        Ok(document)
+    }
+
+    /// Refresh the cache from the network.
+    ///
+    /// `force` skips the [`CACHE_TTL`] check, which is what `models --refresh`
+    /// does (`models.ts:28-31`, `models-dev.ts:237-244`). Returns `Ok(false)`
+    /// when the cache was already fresh and nothing was fetched.
+    ///
+    /// Returns [`CatalogError::FetchDisabled`] rather than silently doing nothing
+    /// when policy forbids the network: a user who typed `--refresh` asked a
+    /// direct question and deserves a direct answer.
+    pub async fn refresh(&self, force: bool) -> Result<bool, CatalogError> {
+        if self.fetch_disabled {
+            return Err(CatalogError::FetchDisabled {
+                origin: self.source.clone(),
+                cache: self.cache.clone(),
+            });
+        }
+        if !force && self.cache_is_fresh() {
+            return Ok(false);
+        }
+        let text = self.fetch().await?;
+        self.write_cache(&text)?;
+        Ok(true)
+    }
+
+    /// `GET {source}/api.json`, with the oracle's timeout and retry budget.
+    async fn fetch(&self) -> Result<String, CatalogError> {
+        let url = self.api_url();
+        let client = reqwest::Client::builder()
+            .timeout(FETCH_TIMEOUT)
+            .build()
+            .map_err(|error| CatalogError::Fetch {
+                origin: self.source.clone(),
+                cause: Box::new(error),
+            })?;
+
+        let mut attempt = 0;
+        loop {
+            let outcome = client
+                .get(&url)
+                .header(reqwest::header::USER_AGENT, user_agent())
+                .send()
+                .await
+                .and_then(reqwest::Response::error_for_status);
+            match outcome {
+                Ok(response) => match response.text().await {
+                    Ok(text) => return Ok(text),
+                    Err(error) if attempt < FETCH_RETRIES => {
+                        backoff(attempt).await;
+                        attempt += 1;
+                        let _ = error;
+                    }
+                    Err(error) => {
+                        return Err(CatalogError::Fetch {
+                            origin: self.source.clone(),
+                            cause: Box::new(error),
+                        });
+                    }
+                },
+                Err(error) if attempt < FETCH_RETRIES => {
+                    backoff(attempt).await;
+                    attempt += 1;
+                    let _ = error;
+                }
+                Err(error) => {
+                    return Err(CatalogError::Fetch {
+                        origin: self.source.clone(),
+                        cause: Box::new(error),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Write the cache atomically: temp file, then rename.
+    ///
+    /// `models-dev.ts:202-215` names the temp file after the pid and the clock
+    /// so two concurrent CLIs cannot collide, and renames because a reader must
+    /// never observe a half-written catalog. Both are reproduced here.
+    fn write_cache(&self, text: &str) -> Result<(), CatalogError> {
+        let parent = self.cache.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent).map_err(|source| CatalogError::CacheWrite {
+            path: self.cache.clone(),
+            source,
+        })?;
+        let stamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis());
+        let temp = self
+            .cache
+            .with_extension(format!("json.{}.{stamp}.tmp", std::process::id()));
+        let write = std::fs::write(&temp, text).and_then(|()| std::fs::rename(&temp, &self.cache));
+        if let Err(source) = write {
+            let _ = std::fs::remove_file(&temp);
+            return Err(CatalogError::CacheWrite {
+                path: self.cache.clone(),
+                source,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Exponential backoff between fetch attempts.
+async fn backoff(attempt: u32) {
+    tokio::time::sleep(FETCH_BACKOFF * 2_u32.pow(attempt)).await;
+}
+
+/// The `User-Agent` the oracle sends — `models-dev.ts:23`.
+fn user_agent() -> String {
+    format!(
+        "opencode/{}/{}/cli",
+        oc_paths::installation_channel(),
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oc_paths::env::{HOME, OPENCODE_MODELS_URL, XDG_CACHE_HOME};
+
+    fn source_for(pairs: &[(&str, &str)]) -> CatalogSource {
+        let env = Env::from_pairs(pairs.iter().copied());
+        let layout = Layout::resolve_with(&env, None);
+        CatalogSource::resolve(&env, &layout)
+    }
+
+    #[test]
+    fn the_default_source_caches_at_models_json() {
+        let source = source_for(&[(HOME, "/h"), (XDG_CACHE_HOME, "/c")]);
+        assert_eq!(source.source(), "https://models.opencode.ai");
+        assert_eq!(source.cache(), Path::new("/c/opencode/models.json"));
+        assert_eq!(source.api_url(), "https://models.opencode.ai/api.json");
+    }
+
+    #[test]
+    fn a_custom_source_gets_its_own_cache_file() {
+        let source = source_for(&[
+            (HOME, "/h"),
+            (XDG_CACHE_HOME, "/c"),
+            (OPENCODE_MODELS_URL, "https://mirror.example.com"),
+        ]);
+        assert_eq!(source.source(), "https://mirror.example.com");
+        // sha1("https://mirror.example.com"); the suffix keeps a mirror from
+        // poisoning the default cache.
+        let file = source.cache().file_name().expect("a file name");
+        let file = file.to_string_lossy();
+        assert!(
+            file.starts_with("models-") && file.ends_with(".json") && file.len() == 7 + 40 + 5,
+            "expected models-<40 hex>.json, got {file}"
+        );
+        assert_ne!(source.cache(), Path::new("/c/opencode/models.json"));
+        assert_eq!(source.api_url(), "https://mirror.example.com/api.json");
+    }
+
+    #[test]
+    fn an_empty_models_url_means_unset() {
+        // JavaScript `||`: `models-dev.ts:160` treats "" as absent.
+        let source = source_for(&[
+            (HOME, "/h"),
+            (XDG_CACHE_HOME, "/c"),
+            (OPENCODE_MODELS_URL, ""),
+        ]);
+        assert_eq!(source.source(), "https://models.opencode.ai");
+        assert_eq!(source.cache(), Path::new("/c/opencode/models.json"));
+    }
+
+    #[test]
+    fn only_one_and_true_disable_the_fetch() {
+        // `Flag.truthy` — flag.ts:3-6. Everything else leaves fetching on, so
+        // `=0` and `=no` must not silently disable the network.
+        for value in ["1", "true", "TRUE", "True"] {
+            let source = source_for(&[(HOME, "/h"), (OPENCODE_DISABLE_MODELS_FETCH, value)]);
+            assert!(source.fetch_disabled(), "{value} should disable the fetch");
+        }
+        for value in ["0", "false", "no", "yes", "", "2"] {
+            let source = source_for(&[(HOME, "/h"), (OPENCODE_DISABLE_MODELS_FETCH, value)]);
+            assert!(
+                !source.fetch_disabled(),
+                "{value} must not disable the fetch"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_path_replaces_the_cache_as_the_read_target() {
+        let source = source_for(&[
+            (HOME, "/h"),
+            (XDG_CACHE_HOME, "/c"),
+            (OPENCODE_MODELS_PATH, "/pinned/fixture.json"),
+        ]);
+        assert_eq!(
+            source.explicit_path(),
+            Some(Path::new("/pinned/fixture.json"))
+        );
+        assert_eq!(source.read_path(), Path::new("/pinned/fixture.json"));
+        // The cache path is still computed: refresh() writes there even when a
+        // read comes from the explicit path.
+        assert_eq!(source.cache(), Path::new("/c/opencode/models.json"));
+    }
+}
