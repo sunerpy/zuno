@@ -162,3 +162,37 @@ the fat `Result`. Watch `ConfigError` — it is the widest at 72 bytes because
 - **`std::io::Error::other(msg)`** is the short constructor for a test cause;
   `Error::new(ErrorKind::Other, msg)` is the older spelling and clippy prefers
   the former.
+
+## Task 3
+
+### `Notify` semantics this primitive depends on
+
+- Tokio 1.53.1's `Notified` snapshots the `notify_waiters()` generation when the
+  future is **created**, so a future created before `notify_waiters()` resolves
+  even if it was not polled or explicitly enabled first. The contract test
+  `interrupt_notify_waiters_tracks_creation_and_stores_no_permit` locks this
+  exact behavior and also proves that a future created after `notify_waiters()`
+  does not resolve: `notify_waiters()` stores no permit for future waiters.
+- `InterruptSignal::notified()` still pins the future and calls `enable()` before
+  re-reading the atomic flag. That makes registration explicit and keeps the
+  cancellation protocol correct if a future Tokio version stops giving
+  creation-time registration. The flag handles fires that happened before the
+  waiter existed; the enabled waiter handles fires between registration and the
+  flag re-check.
+- Because creation-time registration is real in the pinned Tokio, deleting only
+  `enable()` does not make the requested hammer time out. The exact removal was
+  run and recorded honestly in Task 3 evidence; it stayed green but introduced
+  an `unused_mut` warning, which the zero-warning gate turns into the recorded
+  deliberate failure.
+
+### Atomic ordering
+
+`flag` and `epoch` use `Ordering::SeqCst` for every load, store, and increment.
+The reset protocol observes two atomics as one ordered state machine: `fire()`
+increments the epoch before publishing the flag; `reset_if_epoch()` checks the
+epoch, clears the flag, then checks the epoch again and restores the flag plus a
+broadcast if a newer fire raced. A weaker mixed Acquire/Release scheme could be
+made correct, but would require a separate proof across two atomic locations and
+would buy nothing on this low-frequency control path. `SeqCst` preserves one
+global order that sync readers, async waiters, and OS-thread race tests can all
+reason about directly.

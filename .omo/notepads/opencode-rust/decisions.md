@@ -161,3 +161,26 @@ did not name, decided here, and now binding on ~95 downstream todos.
   builds. A later todo that wants this in CI should lift the guard test itself
   (which *is* committed, at `crates/oc-error/tests/no_anyhow_in_libraries.rs`),
   not this script.
+
+## Task 3
+
+- **The three roles live together in `oc_engine::interrupt::EngineInterrupts`.**
+  `graceful_shutdown` and `background_tool` are distinct `InterruptSignal`
+  instances rather than aliases of one shared signal, so later turn-loop and
+  tool-detachment code cannot consume each other's state. `soft_interrupts` is
+  the third role and is an `Arc<std::sync::Mutex<Vec<_>>>`, deliberately not a
+  Tokio mutex, so parser loops, signal handlers, and other synchronous callers
+  can enqueue without a runtime.
+- **`SoftInterruptMessage` follows the jcode transport shape:** `content`,
+  `images: Vec<(String, String)>`, `urgent`, and a typed `source` enum with
+  `User`, `System`, and `BackgroundTask`. Keeping content and images now avoids
+  forcing later turn-loop work to replace the queue payload when it starts
+  injecting messages; `urgent` and `source` remain typed policy data rather than
+  conventions encoded in content text.
+- **Both 2,000-iteration hammers are normal tests, not `#[ignore]`d.** Together
+  with the 50 ms Notify contract timeout they complete in about 0.10 seconds per
+  full interrupt run on this machine, so ignoring them would save negligible CI
+  time while removing the regression gate from ordinary `cargo test`.
+- **No bare public `reset()` is exposed.** A caller must capture `epoch()` and
+  use `reset_if_epoch()`, preventing later waves from accidentally reintroducing
+  the unconditional clear that erased repeated cancellation requests.
