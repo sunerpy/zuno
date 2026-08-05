@@ -1491,6 +1491,16 @@ version = "0.1.0"
 [[package]]
 name = "oc-catalog"
 version = "0.1.0"
+dependencies = [
+ "oc-config",
+ "oc-error",
+ "oc-paths",
+ "oc-testkit",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
 
 [[package]]
 name = "oc-cli"
