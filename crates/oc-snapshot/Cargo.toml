@@ -10,6 +10,18 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+oc-paths = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+# `test-util` powers the paused-clock assertion on the hourly gc cadence. Resolver
+# 3 keeps a dev-only feature out of normal builds.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
