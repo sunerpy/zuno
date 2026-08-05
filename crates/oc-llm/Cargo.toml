@@ -33,6 +33,12 @@ oc-error = { workspace = true }
 futures = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+oc-testkit = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

@@ -1662,8 +1662,6 @@ dependencies = [
  "oc-error",
  "oc-paths",
  "rusqlite",
- "serde",
- "serde_json",
  "tempfile",
 ]
 
@@ -1691,10 +1689,11 @@ version = "0.1.0"
 name = "oc-llm"
 version = "0.1.0"
 dependencies = [
- "futures",
  "oc-error",
+ "oc-testkit",
+ "serde",
  "serde_json",
- "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]
