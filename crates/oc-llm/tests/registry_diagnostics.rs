@@ -13,6 +13,7 @@
 //! tells a user who has simply not logged in that the program is miswired.
 
 use oc_error::{ProviderError, Recoverable, Recovery};
+use oc_llm::event::RequestContentBlock;
 use oc_llm::registry::{
     ApiSurface, Capabilities, CompletionRequest, CredentialPresence, Declined, FinishReason,
     Message, Provider, ProviderRegistry, ProviderStream, RegistryError, Role, Spec, StreamEvent,
@@ -64,9 +65,21 @@ impl Provider for Echo {
         let mut events: Vec<Result<StreamEvent, ProviderError>> = request
             .messages
             .iter()
-            .map(|message| Ok(StreamEvent::TextDelta(message.text.clone())))
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                RequestContentBlock::Text { text } => {
+                    Some(Ok(StreamEvent::TextDelta(text.clone())))
+                }
+                RequestContentBlock::SignedThinking { .. }
+                | RequestContentBlock::ProviderEncryptedReasoning { .. }
+                | RequestContentBlock::ToolUse { .. }
+                | RequestContentBlock::ToolResult { .. }
+                | RequestContentBlock::Image { .. } => None,
+            })
             .collect();
-        events.push(Ok(StreamEvent::Finish(FinishReason::Stop)));
+        events.push(Ok(StreamEvent::MessageEnd {
+            stop_reason: Some(FinishReason::Stop),
+        }));
         Box::pin(futures::stream::iter(events))
     }
 }
@@ -134,7 +147,9 @@ fn registry_resolved_provider_streams_through_the_traits_one_io_method() {
         vec![
             StreamEvent::TextDelta("be brief".to_owned()),
             StreamEvent::TextDelta("hello".to_owned()),
-            StreamEvent::Finish(FinishReason::Stop),
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::Stop),
+            },
         ]
     );
 }
