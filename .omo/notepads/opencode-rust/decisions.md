@@ -339,3 +339,1940 @@ nine error modules. The modules are `pub` (unlike task 2's) because their
 documentation *is* the oracle mapping and should be reachable from rustdoc, but the
 names consumers need are also re-exported flat from the crate root, and the free
 functions (`oc_paths::data()`, …) are the intended production API.
+
+## Task 5 — choices the plan left open
+
+### `init()` returns a `LogHandle`, not a bare `WorkerGuard`
+
+The plan said the guard must be returned to the caller. It is, wrapped:
+
+```rust
+pub fn init(config: LogConfig) -> Result<LogHandle, LogInitError>
+```
+
+`LogHandle` owns the `WorkerGuard` and adds `installed()`, `level()`,
+`print_logs()`, `dir()`, `dropped_lines()`, plus `into_guard()` for a caller that
+wants the raw guard.
+
+**Why not the bare guard.** Three of those answers are things a caller genuinely
+needs and cannot otherwise get:
+- `installed()` distinguishes "this call installed the subscriber" from "one was
+  already there". A bare `WorkerGuard` looks identical in both cases, and in the
+  second it holds nothing, so dropping it is a no-op — which a caller reasoning
+  about flush-on-exit has to know.
+- `dropped_lines()` surfaces the cost of the lossy writer (below). Without it the
+  loss is an unexplained gap in a file someone is debugging from.
+- `level()` / `print_logs()` let a caller report the resolved configuration
+  without re-deriving the flag-over-environment precedence and getting it subtly
+  different.
+
+`#[must_use = "dropping the LogHandle stops all file logging; …"]` puts the
+lifetime trap in the compiler's mouth rather than only in a doc comment.
+
+### Idempotence: a second `init()` succeeds and installs nothing
+
+Not an error, not a panic, and no `AlreadyInitialized` error variant.
+
+**Why `Ok` rather than `Err`.** Both the CLI and the test suite call `init`. If the
+second call returned `Err`, every caller would have to decide whether that
+particular error is benign — and the only correct answer is always "yes, carry
+on", which is a decision better made once, here. `handle.installed() == false`
+carries the information for the rare caller that cares.
+
+Guarded by a `static INSTALLED: OnceLock<()>`, whose `set` is atomic, so of two
+racing callers exactly one proceeds and the loser tears its appender down rather
+than registering a second subscriber. Both fallible steps (filter, appender) run
+**before** the claim, so a failure leaves the process untouched and a later `init`
+can still succeed. `tracing_subscriber`'s `try_init` (not `init`) is used, so a
+subscriber installed by something outside this crate is a reason to step aside,
+not to abort.
+
+`OnceLock` here is **not** an implicit initializer: nothing reads or writes it at
+load time, and a unit test asserts `!is_initialized()` before any `init` runs.
+
+### File naming: `opencode.<YYYY-MM-DD>.log`, daily, keep 14
+
+The oracle appends forever to a single `opencode.log`
+(`logging.ts:49-52`). An agent that logs every tool call and every provider
+request cannot share that policy — the file grows without bound.
+
+Chosen: prefix `opencode` and suffix `log` (so the name is recognizably the
+oracle's), `Rotation::DAILY`, `max_log_files(14)`. `Rotation::Never` is available
+and reproduces the oracle's exact single `opencode.log`, which is what the tests
+use so that assertions do not depend on today's date.
+
+14 days is a judgement call: long enough to investigate a bug reported "last
+week", short enough that a chatty agent does not fill a disk.
+
+### The non-blocking writer is lossy, and that is deliberate
+
+`NonBlockingBuilder::lossy(true)` with `buffered_lines_limit(8_192)`.
+
+The alternative is backpressure, which would let a slow disk stall the async
+runtime in the middle of a turn. Losing a log line is strictly better than
+stalling a user's request. `LogHandle::dropped_lines()` makes the cost visible so
+the trade is observable rather than silent.
+
+8_192 rather than `tracing-appender`'s 128_000 default: a backlog that large means
+the disk is far behind, and at that point the useful record is the drop count, not
+another minute of stale history held in memory by a process already under
+pressure. Enforced at compile time via `const _: () = assert!(…)`, not by a test.
+
+### Span field names (the contract every later wave codes against)
+
+Three spans, names and fields pinned by `pub const` and asserted by tests so a
+rename is a visible breaking change rather than a silent filter that stops
+matching:
+
+| span | fields |
+| --- | --- |
+| `turn` | `session`, `turn`, `agent`, + late-bound `provider`, `model` |
+| `tool_call` | `tool`, `call_id` |
+| `provider_request` | `provider`, `model`, `attempt` (1-based), `stream`, + late-bound `status`, `request_id` |
+
+Late-bound fields are declared `tracing::field::Empty` and filled by
+`record_turn_model` / `record_provider_response`. They have to be declared:
+`Span::record` on an undeclared field is a silent no-op.
+
+`attempt` is 1-based so a retry reads `attempt=2` and is distinguishable from a
+first try without diffing timestamps.
+
+### `TOOL_LIFECYCLE` has five phases, not four
+
+`pending → running → completed | error`, plus **`abandoned`**, emitted at warn
+level from `ToolLifecycle::drop` when neither terminal phase was reached.
+
+A tool call that stops being tracked without an outcome — a `?` on a path nobody
+considered, a cancelled task — otherwise just stops appearing in the log. An
+absence is the hardest thing to notice, so it is turned into a record.
+
+A failure records `error_kind` (a stable discriminant from an exhaustive match on
+`ToolError`), `retryable` and `model_correctable` as **fields**. A consumer
+deciding whether a failure was the model's fault reads `model_correctable=true`;
+it never matches on rendered text, which is the defect `oc-error` exists to
+prevent. The match is exhaustive, so a new `ToolError` variant fails to compile
+here rather than falling into a wildcard.
+
+### `LogInitError` is local to this crate, not a new `oc-error` variant
+
+Logging setup has no recovery: it happens once, before anything is running that
+could retry. Folding it into `ConfigError::Io` was considered and rejected — that
+variant renders `"config file {path} could not be read"`, which is factually wrong
+for a log directory, and `oc-error`'s own contract is that a config error names the
+config file at fault.
+
+It implements `oc_error::Recoverable` so a caller can ask the same question it
+asks of every other workspace error; the answer is always `Recovery::Fail`.
+
+### `TRACE` is not in `LogLevel`
+
+`LogLevel` is a closed four-variant enum matching the oracle's map exactly. Adding
+`Trace` would make `OPENCODE_LOG_LEVEL=TRACE` behave differently in the two
+implementations. `TRACE` is reachable only via `LogConfig::with_directives("trace")`
+— programmatic, so it cannot diverge from a user's environment. No env var feeds
+`directives`, because the oracle has no equivalent and inventing one would be a
+divergence a differential test could not see.
+
+### A `src/bin/` fixture is part of the deliverable
+
+`src/bin/oc-log-probe.rs` is a real process that frames newline-delimited JSON on
+stdout, initializes logging, and emits at every level. It exists because the
+guarantee is about a process's fd 1, and the two alternatives both fail:
+re-executing the test binary mixes `libtest`'s own stdout chatter into the capture
+(forcing an allow-list, which is the loophole a real leak walks through), and
+`dup2` needs `unsafe`, which the workspace forbids.
+
+It is the **only** file allowed to touch stdout, and
+`tests/no_stdout_in_library.rs` names it as the single exemption plus asserts the
+exemption still matches a real file — so deleting or renaming the probe fails
+loudly instead of silently disabling the guard.
+
+## Task 6 — oc-testkit
+
+### D6.1 The default oracle is the INSTALLED BINARY (1.18.12), not the pinned source tree
+
+Both flavours are implemented and both are tested. `Oracle::discover()` prefers the installed
+release; `Oracle::from_source(tree)` runs the pinned tree with bun.
+
+Why the binary is the default:
+1. It is the artifact users actually run, so a difference against it is a difference users see.
+2. It **self-reports a real version** (`1.18.12`). A from-source run reports `local`, because the
+   version is a build-time `define` — so a report built on it could not name what it compared
+   against.
+3. It is ~2.4x faster per invocation (0.46 s vs 1.1 s measured). Ninety later tasks each run it.
+
+**The cost is a version gap, and it is surfaced rather than absorbed.** The installed release is
+1.18.12; the pinned tree is 1.18.13 at `aefaf140c1`. Therefore:
+- `Oracle::version_gap()` returns `VersionGap { reported, pinned }` with
+  `is_aligned()` / `is_unversioned()` / `describe()`. On this machine `describe()` prints:
+  *"oracle reports 1.18.12 but the pinned source is 1.18.13; a differential failure here may be a
+  version gap rather than a compatibility defect"*.
+- **Every** `Provenance::label()` carries the flavour, the reported version, the pinned version
+  and the pinned commit, and `diff_runs()` puts that label in the report header. A differential
+  failure can never be silently attributed to a compatibility defect when it was a patch bump.
+- Whoever hits a suspicious failure re-runs it against `Oracle::from_source()` to tell the two
+  apart. `the_from_source_oracle_runs_the_pinned_tree_and_reports_local` proves both flavours
+  work from one machine.
+
+Overrides: `OC_TESTKIT_ORACLE` (exact binary), `OC_TESTKIT_ORACLE_SOURCE` (tree),
+`OC_TESTKIT_ORACLE_FLAVOUR` (`binary` | `source`; anything else is a typed error, never a silent
+fallback).
+
+### D6.2 The exact normalization rule list, and why each is safe
+
+Five default rules, pinned by `normalize::tests::default_rule_names_are_pinned` so adding,
+removing or renaming one breaks a test and must be justified. Each rule is a hand-written scanner
+that must match a fully specified shape **at an exact offset** — there is no pattern language here
+to loosen by one character. Each has a `why()` string and its own test asserting what it matches
+*and* what it must not.
+
+| rule | masks | why it cannot hide a semantic difference |
+|---|---|---|
+| `iso8601-timestamp` → `<TIMESTAMP>` | full date-time: `YYYY-MM-DD` + `T`/`t`/space + `hh:mm:ss` + optional fraction + optional zone | Requires the **time** component. A bare date (`2026-04-28`) is left alone, so a differing release date, or a date in a non-timestamp field, still diverges. `1.18.13` cannot match. |
+| `opencode-id` → `<ID>` | one of the 10 known prefixes, `_`, exactly 12 lowercase hex, exactly 14 base62, bounded on both sides | Grounded in `packages/schema/src/identifier.ts`: 48 mint-time bits + 14 random base62 chars, so it cannot agree across runs. Too narrow for any word, model name, path or hash to satisfy. `xses_…` and `nope_…` are rejected by the boundary check. |
+| `uuid` → `<UUID>` | canonical hyphenated 8-4-4-4-12 hex only | Randomly generated per run. An **unhyphenated** hex blob is deliberately NOT matched, because content hashes look like that and a differing hash is a real difference (a sha256 survives, asserted). |
+| `loopback-port` → `<PORT>` | the digit run (1–5 digits) after `127.0.0.1:` / `localhost:` / `[::1]:` / `::1:` | The kernel picks ephemeral ports. **Only the digits are replaced; the host and colon stay in the diff**, so a differing host still diverges. `api.anthropic.com:443` and `"port": 4096` are untouched. `0.0.0.0` is excluded: it is a different address, not loopback. |
+| `labelled-pid` → `<PID>` | the digit run after `"pid":`, `"pid": `, `pid=`, `pid: `, value ≥ 2 | The kernel picks pids. **Only the digits are replaced; the label stays.** `"pid":0`, `"pid":1` and `"pid":null` still diverge, because those would indicate a subject that failed to record one. `parentpid=` does not fire. |
+
+**Volatile paths are literals, never patterns.** There is no `/tmp/.*` rule. A run masks the exact
+strings it created via `ScriptedEnv::normalizer()` → `Normalizer::mask_literal(name, literal,
+placeholder)`, longest literal first. `a_literal_mask_does_not_become_a_pattern` proves a
+neighbouring temp path (`/tmp/oc-testkit-somewhere-else`) is still compared.
+
+**Deliberately NOT normalized** (each of these has caught a real defect somewhere, and any of them
+can be masked explicitly by a caller that can justify it):
+line endings; whitespace and indentation; durations and elapsed times; numbers in general.
+
+**`Normalizer::none()` is the right default for most comparisons** — a path dump, a JSON schema, a
+tool list should agree byte for byte. Reach for `Normalizer::default()` only when a genuinely
+volatile span is present. `DiffReport::render()` prints which rules fired and how many spans each
+masked **even when the diff passes**, so masking is visible rather than implied.
+
+Anti-widening proof: `diff::tests::a_real_value_difference_survives_normalization` and
+`a_volatile_looking_value_outside_a_masked_position_still_diverges`
+(`{"port":4096}` vs `{"port":4097}` with differing timestamps → reported;
+`iso8601-timestamp` fired twice, `loopback-port` did not fire).
+
+### D6.3 "The harness never makes a live provider call" is enforced structurally
+
+`oc-testkit` declares **no HTTP client** — not `reqwest`, not `hyper`, nothing. Rust only permits
+importing direct dependencies, so no code in this crate *can* originate a request; `axum` is a
+server and cannot. `tests/no_http_client.rs` fails if one is added, and also fails if a
+non-loopback URL appears in executable (non-doc, non-test) source. A consumer that needs to drive
+`MockProvider` brings its own client and points it at `MockProvider::base_url()`, always loopback.
+`ScriptedEnv` additionally sets `OPENCODE_DISABLE_AUTOUPDATE=1` and
+`OPENCODE_DISABLE_MODELS_FETCH=1` for the oracle's own network use.
+
+Consequence for the self-tests: they speak **hand-written HTTP/1.1 over a raw `tokio::net::TcpStream`**.
+Proving a mock correct with the same client that will later be under test is precisely the
+`Content-Length`-framing failure this crate exists to prevent — two components agreeing because
+they share one assumption.
+
+### D6.4 Response provenance is data: `Recorded` vs `Authored`
+
+`ResponseOrigin::Recorded { cassette, interaction }` vs `ResponseOrigin::Authored { reason }`,
+carried on every `MockResponse` and echoed back on every `CapturedRequest.served_origin`.
+`MockProvider::authored_scenarios()` lists the authored ones with their reasons. Authoring is
+sometimes necessary (an error path no real provider produces on demand) but proves nothing about a
+wire format, and a harness that cannot tell them apart cannot warn anybody. **A todo validating a
+provider protocol should assert `authored_scenarios()` is empty for the scenarios it relies on.**
+
+### D6.5 `oc-testkit` uses no `anyhow`, despite being exempt from the workspace guard
+
+19 typed `TestkitError` variants, no catch-all. A harness whose failures are opaque strings reports
+"something went wrong" at exactly the moment a ninety-task verification chain needs to know *what*.
+Every variant carries the paths, names and counts a caller needs — `BinaryNotFound` names the
+expected path, everything else searched, and a remedy; `CassetteMismatch` carries both canonical
+forms.
+
+### D6.6 `requested_flavour` is a pure public function because env vars are untestable here
+
+Rust 2024 makes `std::env::set_var` `unsafe` and this workspace sets `unsafe_code = "forbid"`, so
+**no test in this workspace can mutate the process environment.** Any env-driven branch must
+therefore be split into a pure function over `Option<&str>` to be testable. `oracle::requested_flavour`
+is the pattern to copy; later todos with env-var-driven behaviour (config layers, flags) should do
+the same rather than leaving the branch unverified.
+
+## Task 7 — how each union was modelled, and where the escape hatches are
+
+### Unknown keys: deny at the top, ignore in the middle, capture where the oracle does
+Top-level unknown keys are **rejected**, one `ConfigIssue` per key with
+`key_path = [key]`. That is the oracle's behaviour, not a choice:
+`packages/opencode/src/config/parse.ts:40-53` scans for extra top-level keys and
+throws `unrecognized_keys` before decoding. `Config` also carries
+`#[serde(deny_unknown_fields)]` so direct `serde` use is strict too, and todo 10
+gets a structured key list to turn into an actionable deprecation message.
+
+Nested unknown keys are **ignored** (dropped), matching Effect's default
+`onExcessProperty: "ignore"`. This was the deliberate opposite of "be strict
+everywhere": being stricter than the oracle at a nested level would reject configs
+the real binary accepts, which is a drop-in-replacement failure. A test pins it
+(`nested_unknown_keys_are_ignored_like_the_oracle`).
+
+`#[serde(flatten)]` is used in exactly the four places the oracle writes
+`StructWithRest`: `AgentConfig::extra`, `ProviderOptions::extra`,
+`ModelVariant::extra`, and (via a custom visitor) the permission object.
+
+### The agent sweep: `options` gains the key, `extra` keeps it
+`AgentConfig` deserializes through a wire struct and then runs the oracle's
+`normalize` (`config/agent.ts:62-81`): every flattened key is copied into `options`.
+Two refinements:
+
+* the key is *also* kept verbatim in `extra`, so the value is lossless and todo 10
+  can still see a deprecated key that a sweep would otherwise have buried;
+* `SWEEP_EXEMPT_KEYS = ["name", "tools", "maxSteps"]` are **not** swept. All three
+  are in the oracle's `KNOWN_KEYS`, so the oracle never sweeps them either. Since
+  this schema deliberately does not *name* `tools`/`maxSteps`, they would otherwise
+  fall through into provider options — a deprecated key silently becoming an API
+  argument, which is worse than either accepting or rejecting it.
+
+`options` is `Option<JsonMap>`, not `JsonMap`: an author who writes `"options": {}`
+gets an empty map back, and an author who writes neither gets `None`, so the round
+trip does not invent a key.
+
+### The unions
+* **`references` / `reference`** — untagged 3-arm enum. Arms are disjoint by required
+  field (`repository` vs `path`), and the string arm can only match a string, so arm
+  order is not load-bearing.
+* **`plugin`** — untagged `Name(String) | WithOptions(String, JsonMap)`; the tuple
+  variant serializes back to a 2-element array.
+* **`formatter`** — untagged `bool | OrderedMap<FormatterEntry>`.
+* **`lsp`** — hand-written visitor (`visit_bool` / `visit_map`) instead of untagged,
+  because untagged swallows the inner error and the LSP rules produce two messages
+  worth keeping ("needs a command unless disabled", "custom server must declare
+  extensions"). The oracle's 39-id builtin list is copied verbatim and its
+  `requiresExtensionsForCustomServers` check (`config/lsp.ts:63-78`) is enforced here,
+  because in the oracle it is part of the schema, not of the runtime.
+* **`LspEntry`** is one struct with `command: Option<...>` plus a `try_from`
+  requirement ("command unless disabled"), rather than the oracle's
+  `{disabled: true} | {command, ...}` union. Same accept/reject set, but lossless: the
+  union's first arm would silently drop a `command` written next to `disabled: true`.
+* **`mcp`** — custom `Deserialize` that buffers to `Value` and tries local → remote →
+  toggle in the oracle's union order (first success wins, so `{type:"local",
+  enabled:false}` with no command still lands on the toggle arm exactly as the oracle
+  does), then, if all three fail, re-runs the arm the author's own `type` names so the
+  error says "missing field `url`" instead of "no variant matched".
+* **`permission`** — visitor over `visit_str` / `visit_map`. The bare-action form is
+  **not** eagerly rewritten to `{"*": action}`; `PermissionConfig::normalized()`
+  offers that instead. Keeping both forms means the parsed value still records what
+  the author wrote, which a merge pass and a round trip both need.
+* **`timeout` / `headerTimeout` / `oauth`** — untagged with a dedicated `False` type,
+  because `Schema.Literal(false)` must reject `true`.
+* **`autoupdate`** — untagged `bool | AutoupdateMode::Notify`.
+* **`interleaved`** — untagged `bool | String | {field}`; the oracle's three literals
+  are inside a `Union([Literals, String])`, so any string is legal.
+
+### `OrderedMap` instead of `BTreeMap`
+`config/permission.ts:14-16` states outright that permission precedence depends on
+the author's key order, and `config/parse.ts:55` passes `propertyOrder: "original"`
+to get it. `BTreeMap` sorts; `serde_json::Map` also sorts here (no `preserve_order`
+feature); `indexmap` is not pinned and the root manifest is off-limits. So
+`schema::ordered::OrderedMap<V>` is a `Vec<(String, V)>` with hand-written serde
+impls, used for every `Record<String, X>`. Duplicate keys resolve last-wins in place.
+
+**Consequence, and the reason `from_json_str` exists:** parsing must run against the
+**text**. A document that has been through `serde_json::Value` is already sorted, and
+no downstream type can recover the order. `Config::from_json_value` is kept for
+convenience with that caveat documented, and a test
+(`parsing_through_a_json_value_forfeits_key_order`) pins both behaviours so nobody
+"simplifies" `from_json_str` into a `from_json_value` wrapper. **Todo 8's merge must
+not route layers through `Value`.**
+
+### `Schema.Finite` -> `f64`, and the round-trip comparison
+`f64` is the type the consumers want (cost arithmetic, limits). The cost is that an
+integral value re-serializes as `272000.0`. JSON has one number type, so this is a
+spelling change, not a value change; the round-trip test therefore compares after
+canonicalizing every number through `as_f64()`. Recorded in issues.md for todo 12.
+
+### `reference` (singular) is kept as a field
+It is `@deprecated` in the oracle (`config/config.ts:46-48`) but it is **not** on
+todo 10's rejection list (`mode`, `layout`, `autoshare`, agent `tools`, agent
+`maxSteps`) and it is not in todo 7's key list either. Dropping it would make a
+config the real binary accepts fail as an unrecognized key and lose the user's data,
+so fidelity wins. Flagged in issues.md so todo 12's differential watches it.
+
+### Key paths in errors without `serde_path_to_error`
+The root manifest is off-limits, so `schema::parse::locate_failure` recovers the path
+from what is pinned: on failure it removes one candidate child at a time from a copy
+of the document and re-runs the deserializer; the child whose removal makes the
+document valid is the culprit, and recursion gives the full path. Required fields
+cannot be removed without breaking the document a second way, so they are instead
+overwritten with each of `PROBE_VALUES` (`0`, `""`, `false`, `{}`, `[]`). A false
+positive is impossible because the whole document has to pass. Runs only on the
+failure path. Known blind spot recorded in issues.md.
+
+### For todo 12 / `ConfigFixture`
+`Config` is `PartialEq` and `Serialize`, so a differential can compare parsed values
+directly or compare `serde_json::to_value` output. Two normalizations are required
+before comparing against `opencode debug config`: canonicalize numbers (`272000` vs
+`272000.0`) and expect `agent.*.options` to have absorbed swept keys (the oracle does
+the same, so this is agreement, not drift).
+
+## Orchestrator — per-task verification uses the /dual-review convergence gate
+
+Applied from Todo 7 onward, after the user asked for convergent review to avoid
+repeated rejection cycles. My verification of a subagent's work admits a defect
+as blocking only when it passes all three clauses:
+
+1. **Specific and falsifiable** — I can name the file/line and state concretely
+   what breaks. "Could be more robust" is not admissible.
+2. **In scope** — it contradicts something the todo already states. A capability
+   the todo never claimed is scope creep, not a defect.
+3. **Not a preference** — "I would have structured it differently" is never a
+   blocker.
+
+Anything failing a clause is recorded as a follow-up and does not block the
+merge. Disputes default to pass. Verification is still adversarial — I re-run the
+subagent's central claim myself rather than trusting the report — but the *bar*
+is "would this actually fail in use", not "is this how I would have written it".
+
+First application, Todo 7: my grep flagged `mode`/`tools`/`maxSteps` appearing in
+`schema/agent.rs`, which looked like the schema accepting deprecated forms that
+Todo 10 must reject. Investigation showed the opposite:
+- `AgentConfig.mode` is a **legitimate** agent field in the oracle
+  (`packages/core/src/v1/config/agent.ts:26`, `subagent|primary|all`). The
+  deprecated thing is the **top-level** `mode.<name>` block, and
+  `deprecated_top_level_keys_are_not_accepted` proves that is rejected.
+- `tools`/`maxSteps` appear only in `SWEEP_EXEMPT_KEYS`, which stops them
+  becoming provider options — a deprecated key silently turning into an API
+  argument would be worse than either accepting or rejecting it.
+Verdict: sound, no rejection. Under the old habit this would have cost a rework
+round on a false positive.
+## Task 8
+- macOS precedence is tested on Linux through DiscoveryOptions::with_managed_preferences, which injects the decoded plist document at the same final merge point used by native discovery. The test puts conflicting scalar and instructions values in every earlier layer and proves the injected macOS value wins while instructions still append/de-duplicate. Native macOS discovery mirrors managed.ts:43-65 and remains cfg-gated.
+- JSONC uses an internal byte-stable lexical pass because the workspace pins no JSONC parser and root Cargo.toml cannot be edited in this task. Comments become spaces while newlines are retained, and only syntactically trailing commas become spaces; serde_json then supplies line/column. json_error_byte_offset maps that position to the original bytes.
+- The differential uses Normalizer::none: no volatile value is masked. Before byte comparison, both outputs pass through the typed Config serializer. The sole explicit allow-list is an empty deprecated mode object emitted by the oracle bootstrap; a non-empty mode fails the test instead of being hidden. This is required because Todo 7 intentionally rejects deprecated mode.
+- Variable substitution belongs immediately before strip_jsonc in parse_layer. Todo 9 can call its variable pass there, before schema validation and merge; Task 8 does not interpret {env:VAR} or {file:path}.
+
+
+## Task 9 — `oc-config::variable`
+
+### The API Todo 8 should wire into
+
+```rust
+Substitution::for_file(&Path)            // relative {file:} resolve against its dirname
+Substitution::for_virtual(label, dir)    // remote body: label goes in errors, dir is the base
+    .with_env(&oc_paths::env::Env)       // the oracle's input.env, consulted first
+    .with_process_env(&Env)              // stands in for process.env AND os.homedir()
+    .on_missing(Missing::Empty)           // default is Missing::Error
+    .apply(&str) -> Result<String, ConfigError>
+```
+
+`apply` takes and returns **text**: call it on the raw file contents, then strip
+JSONC comments, then `Config::from_json_str`. That is the oracle's order
+(`config.ts:220-227`) and it is load-bearing — see `learnings.md`.
+
+Builder rather than an input struct, because four of the five knobs are defaulted
+at almost every call site and a struct literal would need `..Default::default()`
+plus a lifetime. Everything is `const fn` and `Copy`, so a configured
+`Substitution` can be built once per layer and reused across texts.
+
+### Injected env: `oc_paths::env::Env`, not a new map type
+
+`Env` already models the two JavaScript lookup rules this needs (`value` = `??`,
+`truthy_value` = `||`) and Todo 8 will be holding one anyway. Defining a second
+map type would have forced a conversion at every call site and re-litigated the
+empty-string semantics. `Env::empty().with(k, v)` makes test setup a one-liner.
+
+### `process.env` and `os.homedir()` are one injectable knob, not two
+
+The oracle reads both from the real environment, so modelling them as one
+`with_process_env(&Env)` (with `HOME` inside it) is faithful *and* removes the
+need for a separate `with_home`. Unset, it snapshots the real environment once in
+a `OnceLock`; the snapshot cannot go stale because mutating the environment is
+`unsafe` and this workspace forbids `unsafe`. This is the same argument
+`oc_paths::global()` makes.
+
+Deliberately **not** `oc_paths::home()`: that is `Global.Path.home`, which
+`OPENCODE_TEST_HOME` overrides, and `variable.ts` calls `os.homedir()` directly
+and never sees that override.
+
+### Ambiguities the oracle left, and how each was resolved
+
+* **Where does a bad file reference live in `ConfigError`?** The oracle throws
+  `InvalidError` with `message` set and `issues` unset — the fault is the file's,
+  not a key's. `oc-error` has no message-only shape, so it is one `ConfigIssue`
+  with an **empty `key_path`**, which is how "nowhere in particular" is spelled in
+  the Todo 2 taxonomy. Rejected `ConfigError::Io`: it would lose the token text,
+  and the oracle deliberately reports the token so the user can find it.
+* **Virtual sources have a label, not a path.** `ConfigError::Invalid.path` is a
+  `PathBuf`; the label (`https://example.test/config.json`) goes in it via
+  `PathBuf::from`. Mild abuse, but the oracle uses one string field for both and
+  splitting them here would fork the error type for no caller's benefit.
+* **Invalid UTF-8.** `readFile(p, "utf-8")` is lossy, so `String::from_utf8_lossy`
+  — not an error. Verified byte-for-byte: `[41 ff fe 42]` → `A\u{fffd}\u{fffd}B`.
+* **No usable `HOME`.** Node falls through to the password database; nothing pinned
+  here can. Yields `""`, which makes `path.join("", "x") == "x"`, so a `~/`
+  reference degrades to config-relative — the same thing Node does when
+  `os.homedir()` returns empty. Documented and tested rather than papered over
+  with `dirs::home_dir()`, which would have diverged from `HOME`.
+* **Regex semantics without a regex crate.** `regex` is not pinned and the root
+  `Cargo.toml` is off limits, so both patterns are hand-scanned. On a failed match
+  the scanner resumes just past the literal prefix rather than one character on;
+  that is equivalent here because no shorter overlapping prefix of `{env:` or
+  `{file:` exists, and the overlap cases (`{env:}{env:A}`, `{env:{env:A}`) are
+  tested against measured oracle output.
+* **Absolute paths are not normalized.** Tempting to canonicalize; it would change
+  the reported path and, under symlinks, which file is read. Left verbatim.
+
+### Test placement
+
+Unit tests inline in `src/variable.rs` (so they are named `variable::tests::*`)
+and integration tests named `variable_*` in `tests/variable_substitution.rs`, so
+that the plan's `cargo test -p oc-config variable` name filter selects both.
+
+## Task 11
+
+**Task NOT completed. Stopped deliberately on a concurrent-writer collision — see `issues.md` (task 11). Nothing committed; `task-11` is still at `b317132`.** The decisions below are recorded so whichever implementation is adopted does not have to re-derive them.
+
+- **The `CONTEXT.md` seam for Todo 10.** The cascade must not accept `CONTEXT.md` (upstream `instruction.ts:67`), but a repository carrying one silently loses its instructions under this port, so detection has to live somewhere. Three-part seam, chosen because Todo 10 needs both the name and the two *shapes* the cascade uses: (1) `pub const DEPRECATED_CONTEXT_FILE: &str = "CONTEXT.md"` so no caller spells it; (2) `Loader::deprecated_instruction_files()` — every `CONTEXT.md` in the same inclusive `directory ..= worktree` range the cascade scanned, deepest first, i.e. exactly what upstream would have accepted; (3) `deprecated_instruction_file_in(dir)` — the single-directory check mirroring `find`, which is the upward append's blind spot. Detection only; acceptance stays rejected.
+- **How the concurrency cap is tested, not trusted.** The cap is `futures::StreamExt::buffered(limit)` — order-preserving, and it constructs futures lazily so nothing runs before admission. Observed with a `Gauge { inflight, peak }` of atomics: each future increments on **first poll** (inside the async block body, not at construction, or the count would read 64), sleeps 25ms so admitted futures genuinely overlap, then decrements. 64 items at limit 8 must observe peak **exactly** 8 — `assert_eq!`, not `<=`, so a regression to unbounded *or* to serial both fail. Same for 4. Plus `bounded_map_treats_zero_as_one` and an order-preservation assert inside the helper.
+- **Remote failures warn, they are not silent, and they are never errors.** Upstream is silent (`:98` catches to `null`). Diverging deliberately: a `tracing::warn!` carrying the URL and reason, **and** a returned `Vec<InstructionWarning>` so the caller can surface it. An instruction that silently fails to load changes model behaviour with no observable cause, which is the worst failure mode this module has. The load itself always succeeds — the entry is simply absent from `blocks`.
+- **The 5s bound covers the body read, not just the headers.** Upstream times out only `http.execute` (`:96-99`) and reads the body unbounded (`:101`), so a server that answers headers and stalls the body hangs it forever. Bounding the whole operation with `tokio::time::timeout` is the only way "abandoned at 5s" is actually true. Deliberate improvement over the oracle.
+- **Upstream's `withTransientReadRetry` (`:59`) is not ported.** A retry inside a 5s wall-clock bound cannot help, and it makes the bound harder to reason about.
+- **Ancestry is component-wise, not string-prefix.** Upstream's `current.startsWith(root)` (`:194`) is a string compare, so a sibling directory `/rootfoo` passes for root `/root`. Using `Path::starts_with` instead. Only reachable when the file being read is outside the root, so no observable parity cost.
+- **Glob results are sorted; upstream does not sort.** Bun's `Glob.scan` yields directory order, which is not reproducible across machines. A system prompt whose instruction order changes between runs is not debuggable. Ordering *between* sources still follows the oracle exactly.
+- **Glob walks are bounded by the pattern's literal prefix.** Descend from `cwd/<leading literal components>`, and cap `walkdir` depth at the remaining component count unless a component contains `**`. A pattern with no metacharacters at all is a direct `is_file` check, no walk. Without this, one relative entry costs a full-repository walk *per ancestor level*.
+- **No ambient state: `Claims` is caller-owned.** Upstream keeps `Map<MessageID, Set<string>>` inside the service (`:74`). One `Claims` per assistant message, owned by the session layer, keeps `oc-config` free of instance state while preserving the only semantics that matter (attach-once-per-message). `Claims::clear` maps to `Instruction.clear`.
+- **`Locations` takes all four anchors explicitly** (`global_config`, `home`, `directory`, `worktree`) and never consults the process working directory, so discovery is testable on `tempfile` trees without mutating process env.
+
+## Task 10 — error shape and filesystem detection
+
+**Reused `ConfigError::Invalid`, did not add a `Deprecated` variant.** The plan's
+prose named `ConfigError::Deprecated { found, replacement, location }`, but the task
+constraints forbid touching any crate other than `oc-config`, so adding a variant to
+`oc-error` was not available — and it turned out not to be needed. `Invalid { path,
+issues: Vec<ConfigIssue> }` already carries exactly the three things a deprecation
+report needs: `path` = the file, `ConfigIssue::key_path` = the structured JSON pointer
+(`["agent","build","maxSteps"]`), `ConfigIssue::detail` = the payload. `Invalid` also
+reports *many* problems at once, which matters here: a config with four deprecated
+keys should produce four repair instructions, not four consecutive runs.
+
+The typed classification lives in `oc-config` instead: `legacy::DeprecatedForm` (a
+closed ten-variant enum, not `#[non_exhaustive]`, matching Todo 2's convention) and
+`legacy::Deprecation { form, path, pointer, found, replacement }`. `Deprecation::issue()`
+lowers it into a `ConfigIssue`. No `String`-carrying catch-all was introduced.
+
+**Every message is self-contained.** `Deprecation::message()` renders
+`deprecated {kind} \`{found}\` at {path}; {replacement}` — e.g.
+
+```
+deprecated key `agent.build.maxSteps` at /repo/opencode.json; use `steps`
+deprecated agent definition `mode/build.md` at /repo/.opencode/mode/build.md; move it to `agent/build.md`
+```
+
+The path is repeated inside the issue detail even though `Invalid` already has a
+`path`, because for a *directory* scan `Invalid.path` is the scanned root and the
+offending file is a child of it. An issue that did not name its own path would lose
+that.
+
+**Ordering contract, not a code change to Todo 7's files.** `schema/parse.rs` already
+rejects `mode`/`layout`/`autoshare` as `unrecognized key`. Rather than edit that file
+(not owned by this task), `legacy::check_config` is written to run **before**
+`Config::from_json_str`, and a test
+(`legacy::tests::the_legacy_pass_is_what_makes_the_schemas_rejection_actionable`)
+pins the contract: it asserts the schema's message is the bare `unrecognized key` and
+the legacy pass's message names `agent.build`. Whoever wires the two together must
+call the legacy pass first.
+
+**`reference` is rejected by the legacy pass while the schema keeps parsing it.** Todo 7
+put `reference` in `KNOWN_TOP_LEVEL_KEYS` on the grounds that dropping it would lose a
+real user's data. That is still true, and it is left as-is — parse succeeds, the legacy
+pass errors. This is deliberate layering: the schema's job is to *understand* the
+document, the legacy pass's job is to *refuse* it. Nothing needed to change in the
+schema.
+
+**Filesystem forms are detected by scanning a directory, never by reaching into
+another task's module.**
+
+* `inspect_directory(dir)` — the project- or global-level forms. For `{mode,modes}/`
+  it reports one `Deprecation` per `*.md` **directly inside** the directory, which is
+  exactly the oracle's `{mode,modes}/*.md` glob. An *empty* `mode/` directory is
+  **not** reported: the oracle loads nothing from it, so there is no behavioural
+  difference, and a false positive here blocks a config load. It also reports
+  `CONTEXT.md` when present.
+* `inspect_global_directory(dir)` — the above plus the extensionless TOML `config`
+  file, which `config/config.ts:262` looks for under the global config dir **only**.
+  A test pins that a project directory containing a `config` file is not flagged.
+* `CONTEXT.md` coordination with Todo 11: this task only *detects the file's presence*
+  in a scanned directory. It does not touch `instructions.rs` and does not need
+  Todo 11's cascade — Todo 11 excludes `CONTEXT.md` from the cascade, this task
+  explains why it is excluded.
+
+**`condition` is matched structurally, not by name alone.** An auth prompt is a plugin
+API descriptor, so `inspect_auth` walks the descriptor's JSON form and flags
+`condition` **only on an element of a `prompts` array**. A test pins that a bare
+`{"rules":[{"condition":"always"}]}` is not flagged — `condition` is a perfectly
+ordinary word and flagging it everywhere would be noise.
+
+**A `mode.<name>` entry is scanned for agent-level forms too.** `mode.build.maxSteps`
+produces two findings (`mode.build` and `mode.build.maxSteps`), because the oracle
+spreads a `mode` entry into `agent` verbatim, so both are genuinely deprecated. Report
+both and the author fixes it once; report only the outer one and they come back.
+
+**Nothing is written.** The oracle's TOML path migrates and `unlink`s. This pass has a
+test (`the_toml_config_file_is_never_rewritten_or_removed`) asserting the file is
+byte-identical afterwards and that no `config.json` appeared.
+
+**Test placement is dictated by the acceptance command.** `cargo test -p oc-config legacy`
+filters on test *name*, not on target. Unit tests therefore live in
+`src/legacy/tests.rs` so their paths are `legacy::tests::*`, and the two integration
+QA tests in `tests/legacy.rs` are named with a `legacy_` prefix. Tests placed in
+`tests/legacy.rs` with unprefixed names would silently not run under that command.
+
+## Task 11 — instruction discovery and the `instructions[]` loader
+
+### `CONTEXT.md` excluded from the cascade (deliberate divergence)
+
+The oracle's `instructionFiles` is `["AGENTS.md", "CLAUDE.md", "CONTEXT.md"]`
+(`packages/opencode/src/session/instruction.ts:64-68`), with `CONTEXT.md` marked
+`// deprecated` at `:67`. This port's `INSTRUCTION_FILENAMES` is `AGENTS.md` →
+`CLAUDE.md` only, matching the user's "reject deprecated forms" directive and
+todo 10, which rejects `CONTEXT.md` explicitly.
+
+Observable consequence, recorded so todo 12's differential harness can allow-list
+it: a repo whose **only** instruction file is `CONTEXT.md` loads zero project
+instructions here and one under the TypeScript binary. A repo that also has
+`AGENTS.md` or `CLAUDE.md` behaves identically, because `CONTEXT.md` is last in
+the oracle's cascade and the earlier name always claims the chain first. So the
+divergence is reachable only from a fully deprecated tree. Pinned by
+`context_md_is_never_loaded`.
+
+### Concurrency modelled as `futures::StreamExt::buffered`, bounds as public constants
+
+`Effect.forEach(..., { concurrency: 8 })` / `{ concurrency: 4 }`
+(`instruction.ts:157-158`) map to `futures::stream::iter(..).buffered(N)`, which
+preserves **output order** while bounding in-flight work — order matters because
+the rendered instruction blocks must line up with `Array.from(paths)`.
+`LOCAL_CONCURRENCY = 8`, `REMOTE_CONCURRENCY = 4` and `REMOTE_TIMEOUT = 5s` are
+`pub const` rather than literals so a caller and a test can name them.
+
+Remote concurrency is **observed**, not just asserted: `remote_fetches_run_exactly_four_at_a_time`
+registers 8 wiremock endpoints delayed 30s, spawns the load, samples
+`received_requests()` at 1.5s and asserts the server has received exactly 4.
+Local concurrency is *not* directly observable — filesystem reads finish faster
+than any sampling window, and the only ways to block one (FIFOs, FUSE) are
+platform-specific and flaky. It is therefore asserted structurally: the constant
+is checked, the single `.buffered(LOCAL_CONCURRENCY)` call site is the only read
+path, and `a_file_count_above_the_concurrency_bound_loads_completely_and_in_order`
+proves 25 files (> 3× the bound) all arrive in order. Stated as unverified in the
+task report rather than claimed as proven.
+
+### The 5s remote budget needs two timeouts, and one error classification
+
+`Effect.timeout(5000)` (`instruction.ts:97`) wraps only the response; the body
+read at `:100-101` is unbounded. This port bounds the **whole** fetch — headers
+and body — with `tokio::time::timeout(REMOTE_TIMEOUT, ..)` *and* sets the same
+budget on the `reqwest::Client`, so a server that answers `200` then stalls
+mid-body cannot hang a turn.
+
+Consequence found empirically: with both budgets equal, `reqwest`'s own timeout
+usually trips first and surfaces as a *transport* error, so a hanging server was
+initially reported as `RemoteTransport("error sending request…")`. `fetch_one`
+now routes `reqwest::Error::is_timeout()` to `WarningKind::RemoteTimeout`
+(`transport_or_timeout`). Without that, a hang and a DNS failure are
+indistinguishable in the logs. The wiremock test asserts the *kind*, not just
+that the load finished.
+
+### Failures are non-fatal warnings, not `ConfigError`
+
+The oracle swallows every instruction failure into `""`
+(`instruction.ts:91-92, 98-99`), which makes a typo in `instructions[]` silently
+invisible. `Instructions::load` is therefore **infallible** — it returns
+`LoadedInstructions { entries, warnings }` — because one unreachable URL in a
+config file must not make the agent unusable, and there is no failure mode left
+that deserves to abort a config load. Warnings are additionally emitted through
+`tracing::warn!`, so a caller that ignores `warnings()` can still explain a
+missing instruction. Nothing in this module needs `ConfigError`, and no
+dynamically typed error is introduced.
+
+### De-duplication keyed on canonical identity, reported as the textual path
+
+Node's `path.resolve` is textual and symlink-blind, so string de-duplication
+alone charges twice for a symlink and its target — and an instruction file is
+re-sent on **every turn**, so a duplicate is a permanent cost. The `seen` key is
+`fs::canonicalize(resolved)` with the resolved path as fallback; the path
+*reported* stays the textually resolved one so output still matches the oracle
+where the canonical path differs (`/var` vs `/private/var`).
+
+### `InstructionOptions` takes `Env` + `Layout`, not bare paths
+
+Mirrors `discovery.rs` (todo 8) rather than inventing a second convention: the
+`OPENCODE_*` flags are read through `Env::flag`, and `$CONFIG`/`$HOME` come from
+`Layout`, so todo 12's differential harness can hand the same immutable `Env` to
+both this loader and the TypeScript oracle without `std::env::set_var` (forbidden
+here — `unsafe_code = "forbid"`). The merged `instructions` list is an **input**;
+todo 8 owns the cross-layer concat/de-dup and this module never re-implements it.
+
+## Task 10 — where each seam lives, and why
+
+**`ConfigError` gained no variant.** `oc-error` is another crate and its enums are
+not `#[non_exhaustive]`, so adding `Deprecated { found, replacement, location }`
+would force every existing `match` on `ConfigError` to change. The information the
+plan asked that variant to carry is carried instead by a `Deprecation` struct in
+`oc-config::legacy`, which renders itself into the existing
+`ConfigError::Invalid { path, issues }` — one `ConfigIssue` per finding, `key_path`
+holding the structured JSON pointer and `detail` holding the full repair
+instruction. Nothing is lost: `Deprecation` exposes `form()`, `path()`,
+`pointer()`, `found()`, and `replacement()` as separate accessors, so a caller that
+wants the fields does not parse the message. See `issues.md` for the tradeoff.
+
+**Every issue names its own file.** `ConfigError::Invalid` has one `path`, but a
+directory scan finds problems in several files (`mode/build.md`, `CONTEXT.md`,
+`config`). So `path` is the *scanned root* and each issue's `detail` repeats its own
+absolute file. Without that, a finding under a scanned directory could not be traced
+to the `.md` carrying it.
+
+**`CONTEXT.md` detection lives at the instruction-file cascade, not in this crate's
+traversal.** `legacy::inspect_instruction_file(path) -> Option<Deprecation>` and
+`legacy::is_legacy_instruction_file(path) -> bool` take one already-resolved
+candidate path. Todo 11 owns the `AGENTS.md` → `CLAUDE.md` → `CONTEXT.md` walk up to
+the worktree root; re-implementing that walk here would have been a second chance to
+disagree with the first about which file wins. `inspect_instruction_file` returns
+`None` both for a non-`CONTEXT.md` name and for a `CONTEXT.md` that does not exist,
+so the loader can hand it every candidate unconditionally.
+`legacy::inspect_directory` also calls it for the single-directory case, which is how
+the per-form test reaches it without an instruction loader.
+
+**The auth-prompt `condition` predicate takes field *names*, not a JSON value.**
+`legacy::auth_prompt_uses_condition(keys: impl IntoIterator<Item = impl AsRef<str>>)`
+and `legacy::auth_prompt_deprecation(source, pointer, keys)` are the primary
+detectors, because upstream's `condition` is a JS closure and can never appear in
+JSON. `legacy::inspect_auth(path, &Value)` is kept as a convenience for a plugin
+bridge that reflects an `AuthHook` into JSON with function fields reduced to
+markers, and its doc comment says to prefer the predicate. The call site is not in
+this crate: `condition` is read only while an auth method's prompts are presented
+(`opencode/src/cli/cmd/providers.ts:68-77`), so the wiring lands in the plugin wave,
+Todos 57-62. The test for this form exercises the predicate directly rather than
+faking a config-level fixture.
+
+**`SWEEP_EXEMPT_KEYS` was left exactly as Todo 7 wrote it.** `tools` and `maxSteps`
+stay out of `options` and stay visible in `AgentConfig::extra`; `legacy` reads
+`extra` to reject them. Sweeping a deprecated key into provider options would turn
+it into an API argument, which is worse than either accepting or rejecting it.
+
+**Detection never writes.** The oracle's TOML migration rewrites `config.json` and
+`unlink`s the old file (`config.ts:270-272`). `the_toml_config_file_is_never_rewritten_or_removed`
+asserts the file is byte-identical after rejection and that no `config.json` appeared.
+
+**An empty `mode/` directory is not a finding.** The oracle's flat
+`{mode,modes}/*.md` glob would load nothing from it, so rejecting it changes no
+behaviour and would be a false positive on a load-blocking check.
+
+## Task 12
+
+- The acceptance matrix has 14 named trees: `global-only`, `project-only`, `global-and-project`, `dot-opencode-chain`, `env-config-file-before-project`, `env-config-content-after-project`, `home-and-env-config-dir`, `permission-env-object`, `project-disabled-uppercase-true`, `pure-env-keeps-config-layers`, `pure-cli-flag-keeps-config-layers`, `jsonc-comments-and-trailing-commas`, `deep-ancestor-walk-with-env-file`, and `all-config-env-layers`. A coverage assertion pins every required source and both pure entry paths.
+- Todo 8 already proves ten-layer discovery broadly. This matrix retains the minimum overlapping baseline needed to diagnose precedence, then extends it with isolated `OPENCODE_PERMISSION`, environment and CLI pure paths, a six-level ancestor walk, all config env vars in one collision tree, explicit coverage accounting, failure aggregation, and a pinned-source 1.18.13 run.
+- All 14 acceptance-tree comparisons use `Normalizer::none()` and are byte-exact after the existing typed canonicalization removes only the oracle empty deprecated `mode` field. Every final matrix diff is empty.
+- Intentional divergence allow-list: `permission-env-object-key-order` — remeda reverses newly inserted `OPENCODE_PERMISSION` keys while Rust preserves JSON insertion order; the names are distinct and have no precedence interaction. It is isolated from the happy matrix in its own test, requires a non-empty one-line reason, and asserts the exact three-line ordering diff so the entry becomes stale if either side changes.
+- Oracle coverage uses the installed `/config/.local/share/mise/installs/opencode/1.18.12/opencode` and separately the pinned source tree `/config/workspace/ProdDir/AI/opencode` at version 1.18.13, commit `aefaf140c1`.
+## Task 16
+
+- Public rule API: `rules_from_config(&PermissionConfig) -> Vec<Rule>` preserves outer and nested source order; `evaluate(permission, pattern, rules) -> PermissionAction` is pure, last-match-wins, and defaults to `Ask`.
+- Stateful API for Todos 17/32/33: `PermissionEngine` owns insertion-ordered `pending: Vec<PermissionRequest>` plus ordered runtime `approved: Vec<Rule>`. `authorize(request, ruleset)` returns `Authorization::Allowed` or `Authorization::Pending`, and returns `ToolError::Denied` before inserting state on any deny.
+- `reply(PermissionReply) -> Option<ReplyOutcome>` models transitions as returned data. `None` means the request ID was not pending. `ReplyOutcome.resolved` tells the turn/event layer every request removed and its effective reply; `installed_rules` tells it what an always reply remembered. `pending()` and `approved_rules()` expose read-only slices for server/tool wiring.
+- `PermissionRequest` mirrors the oracle request data (`id`, `sessionID`, permission, patterns, metadata, always, optional tool coordinates) and is serde-compatible for future API/event layers. Tool aliasing and visibility remain outside this crate for Todo 17.
+
+## Task 18 — resolution layer only; no duplicate types
+
+- **All three schema types already existed** from todo 7 and were consumed, not re-declared: `oc_config::schema::reference::{ReferenceEntry, GitReference, LocalReference}`, `oc_config::schema::formatter::{FormatterConfig, FormatterEntry}`, `oc_config::schema::lsp::{LspConfig, LspEntry, BUILTIN_SERVER_IDS}`. Todo 18 is therefore purely the resolved-view layer plus round-trip coverage per arm.
+- Todo 7 had already collapsed the inner lsp union into one `LspEntry` with a `try_from` guard ("command required unless disabled"), which accepts/rejects the same documents while preserving every key the author wrote. Kept as-is.
+- **Resolved-view API for todo 48 (LSP) and todo 79 (formatter)**:
+  - `oc_catalog::lsp_config::ResolvedLsp::resolve(Option<&LspConfig>)` → `is_enabled()`, `is_server_enabled(id)`, `command_for(id) -> Option<&[String]>`, `extensions_for(id) -> Option<&[String]>` (`None` = keep built-in's), `initialization_for(id) -> Option<&JsonMap>`, `servers()`, `disabled()`, `get(id)`, `for_extension(ext)`. `ResolvedServer::is_builtin()` for the 38-id registry.
+  - `oc_catalog::formatter::ResolvedFormatters::resolve(Option<&FormatterConfig>)` → `is_enabled()`, `is_formatter_enabled(name)` (already accounts for the ruff/uv link), `command_for(name)`, `overrides()`, `disabled()`, `get(name)`, `for_extension(ext)` (matches the leading-dot form the runtime uses).
+  - `oc_catalog::reference::ResolvedReferences::resolve(Option<&OrderedMap<ReferenceEntry>>)` → `iter()`, `visible()` (drops `hidden`), `get(name)`; `ReferenceTarget::{Shorthand, Git, Local}`.
+- The ruff/uv linked disable lives in the **resolution** layer, not in todo 79's execution, because it decides *which formatters are enabled* — the question the resolved view exists to answer.
+- `oc_catalog::reference::parse` / `parse_json` deserialize the map entry-by-entry so a non-matching arm reports `ConfigError::Invalid` with `key_path == ["references", <name>]`. Serde's untagged error alone never names the key, and every bad entry is reported, not just the first.
+- Declaration order is preserved everywhere via `OrderedMap`, since permission precedence already depends on it.
+
+## Task 17 — tool visibility
+
+- **Reused Todo 16's `wildcard_match` for the key match; did NOT reuse `evaluate`.** `evaluate` cannot
+  express the hiding predicate: it matches permission *and* pattern, so
+  `evaluate("bash","*",[{bash,"*",deny},{bash,"echo *",allow}])` returns `Deny` and would hide a tool
+  the oracle keeps visible. `is_tool_hidden` therefore does the oracle's permission-only `findLast`
+  over the same shared matcher — one matching primitive, no duplicated pattern logic.
+- **A proptest ties the two paths together**: whenever `is_tool_hidden` is true, `evaluate` must return
+  `Deny` for arbitrary input. That is the invariant that would break if the predicate ever drifted.
+- **API for Todos 38/44** (`oc_permission::visibility`):
+  - `is_tool_visible(tool, &[Rule]) -> bool` / `is_tool_hidden(...)` — the primitive.
+  - `visible_tools(tools: IntoIterator<T>, &[Rule], id: Fn(&T)->&str) -> Vec<T>` — order-preserving
+    filter over any tool-def collection; the oracle's `visibleTools` for a Rust registry.
+  - `retain_visible_tools(&mut Vec<T>, &[Rule], id)` — in-place variant for a built registry list.
+  - `disabled_tools(names, &[Rule]) -> BTreeSet<String>` — the oracle's `disabled`; `BTreeSet` (not
+    `HashSet`) so the reported set is deterministic in tests and logs.
+  - `merge_agent_session(agent, session)` / `merge_rulesets(&[&[Rule]])` — the flatten, with the
+    precedence documented at the call site.
+  - `EDIT_TOOLS` / `READ_TOOLS` / `permission_key(tool)` — the alias table, exported so the registry
+    and any future tool never re-hardcodes it.
+- **`lib.rs` edit is exactly one line: `pub mod visibility;`.** The crate's other modules are private
+  with flat `pub use` re-exports, but the mandate was a single-line touch of Todo 16's file, so the
+  module is public instead of adding a second re-export line. Consumers call
+  `oc_permission::visibility::…`. Flattening it later is a one-line follow-up if the crate owner prefers.
+- **Did not fix the `wildcard_match` input-`*` defect** found by the proptest (see issues.md). It lives
+  in Todo 16's file, is guarded by its 17 tests, and is an evaluation bug, not a visibility bug.
+
+## Task 13 — agent loading from config and markdown
+
+### Frontmatter parser: hand-written, because no YAML crate is pinned
+
+`[workspace.dependencies]` in the root `Cargo.toml` has **no YAML parser**. The
+only `yaml` string in it is `insta`'s `yaml` snapshot feature, which is a
+dev-only serializer, not a parser. This task may add a dependency to
+`crates/oc-catalog/Cargo.toml` only if it is already in
+`[workspace.dependencies]`, and may not edit the root manifest — so a YAML crate
+was not available.
+
+Decision: implement the YAML subset in
+`crates/oc-catalog/src/agent/frontmatter.rs` (~600 lines with tests), and choose
+the subset **by probing the real binary** rather than by reading the YAML spec.
+Every construct the module accepts is one opencode 1.18.12 was observed to accept
+in an `agent/*.md` file: plain / single-quoted / double-quoted scalars, nested
+block maps, flow maps and sequences, block scalars (`|`, `|-`, `>`, `>-`),
+comments, blank lines, an unquoted colon in a value, and no frontmatter at all.
+Anything outside the subset — anchors, aliases, tags, merge keys, multi-document
+streams, explicit complex keys, block-scalar indentation indicators — is a parse
+**error** rather than a silent misread, because a frontmatter key that quietly
+becomes the wrong value reaches the provider as a wrong model or permission.
+
+Two oracle behaviours in `packages/core/src/config/markdown.ts` were reproduced
+deliberately:
+
+* `parse` retries the whole document through `sanitize` (`:5-10`) when the first
+  attempt fails. `sanitize` (`:22-35`) rewrites any top-level `key: value` whose
+  value contains a further colon into a `key: |-` block scalar. Real agent files
+  written by other coding agents depend on this. Ported line-for-line, including
+  its regex `^([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*(.*)$` and its capture boundary: the
+  oracle's group excludes the newline before the closing `---`, so the
+  replacement must too or the head gets welded to the delimiter.
+* Because of that retry, a **malformed flow map is not a parse error**. Verified:
+  `permission: { edit: deny` (unclosed) is sanitized into the string
+  `"{ edit: deny"`, and the binary then fails at the *schema* layer with
+  `Expected PermissionActionConfig, got "{ edit: deny" permission`. This crate
+  produces the identical string and rejects it at the same layer.
+
+Error line numbers are **1-based within the whole file**, not within the
+frontmatter head, so a message names the line the author actually wrote.
+
+### Consumed oc-config's sweep rather than re-implementing it
+
+`oc_config::schema::agent::AgentConfig`'s hand-written `Deserialize` already
+performs the oracle's unknown-key sweep into `options`
+(`packages/core/src/v1/config/agent.ts:62-81`), and already honours
+`SWEEP_EXEMPT_KEYS = ["name", "tools", "maxSteps"]` so a deprecated key cannot
+become a provider option. This task therefore:
+
+* builds a `serde_json::Value` from the frontmatter, installs the trimmed body as
+  `prompt`, and hands it to `serde_json::from_value::<AgentConfig>` — the sweep
+  happens inside that call and is not duplicated anywhere in `oc-catalog`;
+* reads the renaming `name` key back out of `AgentConfig::extra` (where the
+  exemption leaves it) rather than adding a `name` field;
+* reuses `oc_config::legacy::check_agent_frontmatter` (todo 10) for the
+  `tools` / `maxSteps` rejection, calling it on every markdown definition instead
+  of restating the deprecation list.
+
+`oc_paths::Layout::config_directories` supplies the config-dir chain; the merge
+uses `oc_config::discovery::discover_with` for everything below the markdown
+layer. No path logic and no merge logic is re-derived.
+
+### Deep merge operates on JSON, not on `AgentConfig`
+
+`merge_agent_maps` converts each side to `serde_json::Value`, runs a port of
+remeda's `mergeDeep`, and re-deserializes. That is what the oracle's `mergeDeep`
+does (`config/config.ts:460`), and it is the only way a nested `options` map or
+`permission` object merges key-by-key instead of being replaced wholesale. A
+field-by-field Rust merge would have silently replaced `options`.
+
+### Permissions carried as data, not resolved
+
+`Agent` carries the `permission` key verbatim and `builtin::Builtin::
+permission_overlay()` returns each built-in's `Permission.fromConfig` literal as
+declarative data. Resolution into a ruleset belongs to todos 16-17: it needs the
+runtime default set, `Truncate.GLOB`, the global tmp and plans directories, the
+discovered skill and reference directories, and a worktree-relative rewrite.
+`permission_overlay_is_partial()` returns `true` for `plan` and `explore`, whose
+overlays contain those runtime-path-dependent entries, so a later caller cannot
+mistake the overlay for the finished ruleset.
+
+### The differential compares headers, and says why
+
+Since `agent list --format json` does not exist, the differential compares the
+`name (mode)` header of every agent in oracle order, and **not** the permission
+ruleset that follows each one — that ruleset is todos 16-17's output, so
+comparing it would either fail for reasons outside this task or force a
+normalizer wide enough to hide a real difference. The header set is not a weak
+assertion: it carries which agents exist, what each is called (the whole
+path-derived name rule), whether an override created or modified an agent, the
+`mode: "all"` default, and the native-first sort order. Normalizer is
+`Normalizer::none()` — byte-exact, nothing masked. Intentional-divergence list is
+**empty**.
+
+A test `the_oracle_has_no_format_json_flag` asserts the flag is still rejected,
+so if a future opencode adds it the suite fails and the differential gets
+upgraded rather than the correction being forgotten.
+
+### `localeCompare` approximated as lowercase-then-raw
+
+`agent list` sorts with `a.name.localeCompare(b.name)`. Agent names come from
+file paths and config keys, so they are ASCII-dominated; the one behaviour worth
+reproducing is that `localeCompare` puts `a` before `B` where a byte comparison
+would not. `locale_compare` therefore keys on the lowercased name and breaks ties
+on the raw name. A full ICU collation would need a dependency that is not pinned.
+
+## Task 104 — remove the permission-order allow-list
+
+`permission-env-object` is no longer an intentional divergence. The allow-list
+is empty, and the matrix now compares raw observable key order byte-for-byte.
+No production merge change was made: `oc-config` discovery already matched both
+raw oracles. The fix belongs in `tests/differential.rs`, where
+`OracleDebugConfig` strips only the top-level oracle `mode` field without routing
+the rest of the document through `serde_json::Value`.
+
+The regression test uses overlapping permission keys and covers one new key,
+four new keys, overwrite-plus-append, and nested objects. This makes ordering a
+security-relevant observable under `findLast`, rather than accepting distinct
+keys whose precedence interaction would be hidden.
+
+## Task 14 — skill discovery
+
+### The two de-duplication dimensions are separate types of thing
+
+They are handled in different places on purpose, because conflating them changes which
+`location` the user sees:
+
+- **By path** — `SkillSources::absorb` keys on `node_path::normalize(path)`, mirroring the
+  oracle's `Set<string>` (`skill/index.ts:168`). Deliberately **not** `canonicalize`: the
+  oracle does not, and canonicalizing would silently merge a `~/.claude → ~/.agents` symlink
+  alias into one match, changing which file wins the name.
+- **By name** — `Skills::insert` replaces the entry **in place** and warns once
+  (`:125-139`). In place matters: the oracle's state is a JS object, so re-assigning an
+  existing key keeps its original position, and `Skill.all()` returns `Object.values`, which
+  makes that position observable in `debug skill`.
+
+Note this differs from `oc-config::instructions`, which dedups by *canonicalized* identity.
+Both are right for their own oracle; the divergence is in the oracle, not in this port.
+
+### The duplicate winner is made deterministic, on purpose
+
+The oracle's winner is decided by I/O timing (three runs, three different winners — see
+learnings). This port loads in root order and lets the later root win. That reproduces the
+oracle's real-tree outcome for every alias on this machine (`.agents` beats `.claude`, a
+config directory beats both) and is reproducible run to run. A prompt that changes between
+runs is worse than one that differs from a coin flip, so determinism wins. Recorded rather
+than hidden: the differential compares the name **set** for the real tree and the **whole
+document** for the sandboxed trees, which have no duplicates.
+
+### `yaml-rust2` added to `oc-catalog/Cargo.toml`, not to the root pins
+
+The root manifest ships no YAML parser and this task may not edit it. `yaml-rust2 = "0.11.0"`
+is therefore a crate-local version literal with a comment saying so and asking for promotion
+the next time the root manifest is touched. The choice over `serde_yaml` is behavioural, not
+stylistic: `serde_yaml` is libyaml/YAML 1.1, where `name: yes` is a boolean and the skill
+would be silently dropped; `yaml-rust2` is YAML 1.2 core, matching js-yaml 4 under
+`gray-matter`, where it stays the string `"yes"`. Confirmed against the oracle.
+
+### Frontmatter is not deserialized into a struct
+
+`Field` is a three-state enum — `Absent` / `Text` / `NotAString` — because the oracle's guard
+distinguishes all three (`typeof data.name === "string"`, and `description === undefined ||
+typeof description === "string"`). A `#[derive(Deserialize)]` struct with
+`Option<String>` would fold `NotAString` into `Absent` and load skills the oracle drops. The
+same reason keeps every other key ignored rather than rejected: `deny_unknown_fields` would
+turn a skill carrying `license:` into an error, which the oracle does not.
+
+### Rejection is a narrow private enum, not the public warning enum
+
+`Rejection` has exactly the three ways one `SKILL.md` can fail. Both mappings out of it — to
+`SkillWarningKind` for `load`, to `ConfigError` for `parse_file` — are exhaustive with no
+catch-all arm, so adding a rejection reason is a compile error rather than a silent fall
+through to a generic message. This is the `oc-error` "no `Other(String)`" rule applied one
+level down.
+
+### `load` never fails; `parse_file` does
+
+`load` returns `Skills` with a `warnings()` list and no `Result`, because the oracle logs and
+continues past every failure and one broken skill must not cost the user the other 135.
+`parse_file` is the typed-error entry point for a caller that wants to *report* a bad file
+(`ConfigError::Invalid` with `key_path: ["name"]`, or `ConfigError::Frontmatter`). Warnings
+are both `tracing::warn!`ed and returned, following `oc-config::instructions`.
+
+### The remote root is hardened past the oracle in one place
+
+`index.json` is remote input and the oracle joins each `files` entry onto the cache root with
+no traversal check, so `"files": ["../../../.bashrc"]` would write outside the cache. This
+port drops any entry file that escapes its skill root, with a warning, and drops the entry
+entirely if that removes its `SKILL.md`. It only refuses what the oracle should not have
+accepted; a well-formed index is byte-identical. Recorded as an intentional divergence in
+code and tested.
+
+### The Claude-compatibility flags
+
+Roots 1 and 3 drop `.claude` when **either** `OPENCODE_DISABLE_CLAUDE_CODE` or
+`OPENCODE_DISABLE_CLAUDE_CODE_SKILLS` is set (`effect/runtime-flags.ts:28-29`), and
+`OPENCODE_DISABLE_EXTERNAL_SKILLS` (`:22`) removes roots 1-3 outright. Read from an injected
+`Env` snapshot, never from the process, so tests need no `unsafe` env mutation. All three are
+differential cases.
+
+### The real-tree differential compares against `--pure`, and says why in an assertion
+
+The plain run reports one extra skill from `$XDG_CACHE_HOME/opencode/skills` because the
+installed `@sunerpy/oh-my-openagent` plugin contributes `skills.*` config; `--pure` drops
+external plugins and the run matches this port exactly (135 = 135). Rather than leave `--pure`
+as an unexplained convenience, the test *also* runs the plain command and asserts every extra
+name is cache-located — so the leftover gap is *checked* to be the unimplemented plugin layer
+(todo 26+) rather than merely claimed to be.
+
+### Bounds: 8 local reads, 4 remote skills, 8 remote files, 5s per request
+
+Local read concurrency is 8 (the oracle is unbounded; a bound is what makes the load
+reproducible, and 8 matches `oc-config::instructions`). Remote bounds are the oracle's own
+(`discovery.ts:10-11`). The 5s per-request timeout is stated rather than inherited from an
+HTTP layer, and is *observed* by tests, not assumed: a hanging TCP server proves the timeout
+fires, and a counting server proves file downloads really run concurrently and never exceed 8.
+
+## Task 15 — command resolution
+
+### The skill-source shape I own, and what todo 14 must satisfy
+
+Todo 14 (`src/skill.rs`) was being written concurrently, so `command.rs` depends
+on nothing from it. I defined the minimal shape command resolution needs, owned
+by `command.rs`:
+
+```rust
+pub struct SkillCommand {
+    pub name: String,
+    pub description: Option<String>,
+    pub content: String,          // the body, verbatim
+    pub location: SkillLocation,
+}
+pub enum SkillLocation { Builtin, File(PathBuf) }   // File holds the SKILL.md path
+```
+
+**What todo 14 must supply** — a mapping from its own record onto this, i.e. it
+needs to expose, per skill: `name`, `description`, the verbatim body, and whether
+the skill is the `<built-in>` sentinel or a path. That is exactly the field set
+`skill/index.ts` already carries, so no negotiation should be needed; the only
+thing to get right is that `location` for a file-backed skill is the SKILL.md
+path itself, not its directory — `command/index.ts:136` takes `path.dirname` of
+it, and `SkillCommand::base_dir` reproduces that with `Path::parent`.
+
+A plain struct rather than a trait: a trait would buy nothing (there is one
+implementor) and would force `dyn` or a generic parameter through `Sources`,
+`Registry::build`, and every test. Todo 14 can add a `From<Skill> for
+SkillCommand` in its own module without touching mine.
+
+**Footer**: a file-backed skill's command template is the body, a blank line, the
+base directory, and the relative-path note (`command/index.ts:141-149`); a
+`<built-in>` skill gets its body unchanged. Verified against the real binary,
+including the three consecutive newlines that arise when the body has its own
+trailing newline.
+
+### Modeling MCP prompts pending todos 45-47
+
+The MCP client does not exist yet, so level 3's input is also a shape I own:
+
+```rust
+pub struct McpPrompt { client, prompt, description, arguments: Vec<String> }
+```
+
+`arguments` is a flat `Vec<String>` of declared argument NAMES in order —
+everything `command/index.ts:117,130` actually reads. The oracle treats an absent
+list and an empty list identically, so both are the empty vec and there is no
+`Option<Vec<_>>` to get wrong.
+
+**Resolution is two-phase, because the oracle's is.** `Registry::resolve` returns
+`Resolution::PendingMcp` for an MCP command rather than pretending to have the
+text: `command/index.ts:110-129` builds a lazy promise, and
+`session/prompt.ts:1374` awaits it. The caller finishes with
+`PendingMcp::complete(&[Option<String>])`, one entry per returned message —
+`Some(text)` for a text block, `None` for anything else, matching
+`:121-126` where a non-text block becomes `""` but is still joined by `"\n"`.
+Todo 47 supplies that slice and needs no other seam.
+
+`Template::Mcp` carries the `(argument name, "$N")` pairs already computed, so
+todo 47 sends them verbatim as `prompts/get` arguments and does not re-derive the
+mapping.
+
+### Zero new dependencies — deliberate, to avoid a union-merge break
+
+`crates/oc-catalog/Cargo.toml` is UNCHANGED. Todos 13, 14, and 15 all landed in
+this crate concurrently and the orchestrator union-merges its manifest; two
+agents inserting an identical `serde = { workspace = true }` line into
+`[dependencies]` would produce a DUPLICATE KEY and fail the build. So:
+
+- `CommandError` implements `Display` + `std::error::Error` by hand instead of
+  deriving `thiserror`. It has exactly one variant (`NotFound`), so this is ~14
+  lines.
+- No `serde` derives on `Info`. The `/command` HTTP response belongs to the
+  server crate, which can shape its own DTO; deriving here would have added a dep
+  for a caller that does not exist yet.
+- The integration test parses its fixtures as `serde_json::Value` — `serde_json`
+  is already a dependency and test targets see `[dependencies]`.
+
+`oc-error` was NOT extended with a command variant, because that would mean
+editing another crate, which this task forbids.
+
+### `Sources` is a struct, not four method calls
+
+`Registry::build` takes one `Sources<'_>` with all four levels rather than
+exposing `add_config`, `add_mcp`, `add_skills`. The ORDER is the entire feature —
+a per-level API would let a caller apply skills before config and silently invert
+the precedence. There is no way to build a registry with the levels out of order.
+
+### Expansion lives in resolution, not dispatch
+
+`Registry::resolve(name, arguments)` returns a `Resolved` whose `prompt` is
+already final, matching `session/prompt.ts:1362-1395` — the oracle resolves,
+awaits the template, expands, and only then builds a message. Nothing downstream
+re-expands. The `` !`cmd` `` shell substitution (`:1397-1408`) is deliberately
+NOT here: it spawns processes, runs strictly after everything in this module, and
+belongs to whichever todo owns shell execution.
+
+### The differential is a golden file plus a re-derivation
+
+`tests/fixtures/command_expansion_oracle.cjs` is a verbatim transcription of the
+oracle's expansion body and its three regexes. It generates
+`command_expansion_expected.json` from `command_expansion_cases.json` (59 cases).
+The Rust test diffs against the golden ALWAYS, and additionally re-runs the
+JavaScript when node is present, failing if the golden has drifted. That keeps
+the suite green on a machine without node while making it impossible for the
+golden to rot into the self-consistent fiction `oc-testkit`'s docs warn about.
+
+`oc-testkit`'s `Oracle` was not used: it drives the installed BINARY, and there
+is no CLI or HTTP surface in this project yet to point it at (todos 55-56, 71).
+The binary was still used for observation, by hand, through `opencode serve` +
+`GET /command` — recorded in the evidence file.
+
+## Task 24 — `oc-auth`
+
+### Redaction: a `Secret` newtype, not a discipline
+
+`oc_auth::Secret(String)` wraps every refresh token, access token, API key, client
+secret, PKCE verifier and OAuth state. Both `Debug` and `Display` render the constant
+`oc_auth::REDACTED` = `"<redacted>"`; `serde` is `#[serde(transparent)]`, so the on-disk
+bytes are identical to the `String` it replaces.
+
+Both traits are overridden, not just `Debug`, because the two real leak paths are both
+automatic and one of them is `Display`:
+
+- `#[derive(Debug)]` on an enclosing struct plus any `{:?}` — a `tracing` field, a
+  `dbg!`, an `assert_eq!` failure, a panic payload, an `unwrap()` on a `Result` whose
+  error contains it.
+- `{}` in a format string, when the author reached for `Display` because the field
+  happened to be a bare `String`.
+
+`Secret::expose()` is the only way out, deliberately awkward and greppable. It is not
+encryption and does not zero on drop — the plaintext is in the heap exactly as it is in
+the file. The threat answered is accidental disclosure through this crate's own output.
+`PartialEq` is byte-comparing, therefore not constant-time; nothing here compares a
+stored credential against attacker-supplied input.
+
+`Secret::hint()` gives `sk-…4f2a` for a human telling two credentials apart. Opt-in,
+never used by `Debug`/`Display`, char-boundary safe, and it refuses to reveal anything
+from a value under 12 characters where prefix+suffix would be most of the secret.
+
+Two fields are deliberately **not** secrets: `Credential::Api::metadata` **keys** (the
+values are wrapped; the keys are what makes a log line useful) and
+`ClientInfo::client_id` (an OAuth client ID is public by design and travels in query
+strings — hiding it costs legibility and protects nothing). `metadata` *values* are
+wrapped because a provider is free to put a token in there.
+
+### A too-permissive file WARNS; it does not refuse
+
+The plan text for todo 24 says "**refuse** to read a file that is group/world-readable
+with a warning". That is wrong for parity and the prompt's own restatement ("a
+too-permissive file is a warning, not a hard failure — confirm that against the oracle")
+is right. Confirmed both ways:
+
+- There is no permission check anywhere in `auth/index.ts` or `mcp/auth.ts`.
+- Observed on 1.18.12: `auth.json` at `0644`, `opencode auth list` printed all
+  credentials and left the mode at `0644`.
+
+Refusing would be a parity break in the worst direction: a user whose file came back
+from a backup at `0644` would be locked out of every model they have configured, by the
+crate whose job is to let them in. So `store::read_json` reads it, returns a
+`PermissionWarning { path, mode }` alongside the value, and emits a `tracing::warn!`
+naming the path and both the found and wanted modes. A **write** then repairs the mode
+to `0600`, which is what the oracle does.
+
+The finding is returned as data, not only logged, so a caller that *wants* to refuse can
+— and so a test can assert it fired.
+
+`PermissionWarning` has a hand-written `Debug` that renders `mode` in octal: a derived
+one prints `0o644` as `420`, the one number an operator reading a dump cannot act on.
+
+### Mode is set at `open(2)`, not after the write
+
+`OpenOptions::mode(0o600)` on Unix, so the file is `0600` from the instant it exists,
+followed by `set_permissions` to repair a pre-existing permissive file (`mode()` applies
+only on creation). This closes the window the oracle leaves at `fs-util.ts:110-113`,
+where the file is created at the umask and chmodded afterwards — and where `chmod` does
+not revoke a descriptor another process already opened. No `unsafe` is involved;
+`std::os::unix::fs::{OpenOptionsExt, PermissionsExt}` are safe.
+
+### Windows: nothing is set, and that is a gap todo 91 must know about
+
+`CREDENTIAL_FILE_MODE` and every permission assertion are `#[cfg(unix)]`. On Windows
+there are no Unix mode bits: `File::set_permissions` can only toggle the read-only
+attribute, which is not an access control. Real protection would need an explicit DACL
+via `SetNamedSecurityInfo`/`windows-acl`, which is out of scope here and would pull in a
+Windows-only dependency. **So on Windows both credential files inherit the parent
+directory's ACL and this crate adds no restriction.** `permission_warning` returns `None`
+there, so no false warning is emitted either. Flagged for todo 91's cross-platform
+packaging in `issues.md`.
+
+### Divergence: malformed JSON is an error, not silently an empty store
+
+The oracle pipes every read failure into `orElseSucceed(() => ({}))`
+(`auth/index.ts:65`) and `Effect.catch(() => ({}))` (`mcp/auth.ts:68`). A truncated
+`auth.json` therefore reads as empty, and the next `set` writes that emptiness back —
+destroying every credential in the file. `oc-auth` returns `AuthError::Malformed { path,
+source }` instead, so a caller can decline to write. A **missing** file still reads as
+empty (that is the normal first-run path), and so does an empty one (what a crash
+between create and write leaves behind).
+
+Relatedly, entries that individually fail to decode are dropped as the oracle drops
+them, **and** listed in `Credentials::skipped` / `McpCredentials::skipped` — because a
+subsequent write silently destroys exactly those entries, and the caller deserves the
+chance to see it coming.
+
+### `AuthError` lives in `oc-auth`, not `oc-error`
+
+`oc-error` has no auth-storage domain and adding one means editing a crate this task
+does not own. The five variants (`Read`, `Malformed`, `Write`, `Serialize`,
+`Permissions`) follow that crate's doctrine verbatim: no catch-all, no `String` message
+field, not `#[non_exhaustive]`, every variant carries its `PathBuf` plus the concrete
+`io::Error`/`serde_json::Error` in `#[source]` position so `ErrorKind` and JSON
+line/column survive. It implements `oc_error::Recoverable`; every variant is
+`Recovery::Fail` — notably **not** `Reauthenticate`, which is the answer when a provider
+rejects a credential, whereas these are failures to reach the store at all and a fresh
+login would write to the same unwritable path.
+
+### `Tokens` and `ClientInfo` are deliberately not `Default`
+
+`accessToken` and `clientId` are the one required field of each. A `Default` impl would
+let a caller construct a token pair with an empty access token, which is not a thing
+that can exist. `Entry` *is* `Default` (all its fields are optional) because
+`updateField` needs to create a blank entry for an unseen server.
+
+### `Env` is passed in, never read from the process
+
+`AuthStore::with_env(path, &Env)` takes `oc_paths::Env` by reference rather than reading
+`std::env` itself, so the `OPENCODE_AUTH_CONTENT` tests do not race each other —
+mutating process env from parallel tests is unsound in practice. `AuthStore::resolve`
+and `McpAuthStore::resolve` take the `oc_paths::Layout` for the same reason.
+
+## Task 19 — `oc-db`: driver pin, pool, and the `transaction()` shape
+
+### What was added to the root `Cargo.toml` — **todo 20 read this**
+
+One dependency, twelve lines, all additions, nothing removed or reordered
+(`git diff --stat Cargo.toml` → `1 file changed, 12 insertions(+)`). In a new
+`# -- storage --` section between `# -- filesystem, search, watching --` and
+`# -- primitives --`:
+
+```toml
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+```
+
+Todo 20 should therefore write `rusqlite = { workspace = true }` in
+`crates/oc-db/Cargo.toml` — it is **already there**, so no manifest change is needed for
+schema work. Resolved: `libsqlite3-sys 0.38.1`, bundled **SQLite 3.53.2**.
+`ENABLE_FTS5` is compiled in.
+
+The `sha2` pin an earlier agent deleted was **not** touched. Nothing tripped over it.
+
+`crates/oc-db/Cargo.toml` now declares `oc-error`, `oc-paths`, `rusqlite` and a
+dev-dependency on `tempfile`, all `{ workspace = true }`.
+
+### `Pool` owns connection creation; there is no `Pool::from_connection`
+
+Four of the five pragmas are per-connection state, and one of them is `foreign_keys`. A
+pool that accepted a caller's `Connection` could hand out one that declines to enforce
+every `ON DELETE CASCADE` in todo 20's schema, with no error anywhere. So the only ways
+in are `Pool::open_default()`, `Pool::open(&DbLocation)` and
+`Pool::open_with_max_idle(&DbLocation, usize)`, each of which routes through
+`open::open_target` → `apply_pragmas` → `verify_pragmas`. **Do not add a constructor that
+takes a connection.**
+
+### The pool is a `Mutex<Vec<Connection>>`, not `r2d2`/`deadpool`
+
+`Connection` is `Send` but not `Sync`, so a connection must be checked out exclusively.
+Checkout pops an idle connection or opens a fresh one; `PooledConnection` returns it on
+`Drop`, discarding it if `max_idle` (default 4) is already met. No extra dependency, no
+async runtime coupling — the store is synchronous and SQLite serializes writers itself.
+Adding a pool crate later is a local change; it is not needed to hit the acceptance bar.
+
+### `:memory:` becomes a *named shared-cache* database inside the pool
+
+Plain `:memory:` gives every connection its own private database, so a pool of them would
+silently hand out unrelated databases and a two-connection test would pass for the wrong
+reason. `Pool` therefore opens `file:oc-db-<pid>-<n>?mode=memory&cache=shared` for
+`DbLocation::Memory`, and permanently retains one **anchor** connection that is never
+handed out, because a shared in-memory database is destroyed when its last connection
+closes. `Pool::target()` exposes the URI, `Pool::holds_memory_anchor()` reports the
+anchor. `oc_paths::db_path()` still returns plain `DbLocation::Memory`; the URI is an
+implementation detail of pooling and does not change what the oracle would compute.
+
+Two pools over `DbLocation::Memory` are independent (distinct names), which is the
+per-process transience `OPENCODE_DB=:memory:` promises.
+
+### `transaction()` API shape — todos 21-24 build on this
+
+```rust
+pool.transaction(|tx: &rusqlite::Transaction| -> Result<T, DbError> { ... })  // IMMEDIATE
+pool.transaction_with_behavior(behavior, |tx| ...)
+conn.transaction(|tx| ...)   // on a PooledConnection already checked out
+```
+
+`Ok` commits, `Err` drops the transaction unfinished and rolls back (proved by a test
+asserting zero rows persist). The closure takes `&Transaction` so `execute`, `prepare` and
+`execute_batch` are all reachable, and returns `Result<T, DbError>` so a caller maps
+`rusqlite::Error` once via `oc_db::open::map_error`.
+
+Default behaviour is `IMMEDIATE` deliberately — see `learnings.md`: `DEFERRED` yields
+`SQLITE_BUSY_SNAPSHOT` on a write-write race, which the busy handler may not retry, so
+`busy_timeout` would not help. `transaction_with_behavior` exists for a genuine
+read-only or exclusive case.
+
+### Error mapping: `Busy` is the only retryable classification
+
+`open::map_error` returns `DbError::Busy { retry_after: None }` for `SQLITE_BUSY` /
+`SQLITE_LOCKED` and `DbError::Query { source }` for everything else, keeping the original
+`rusqlite::Error` as the cause. `retry_after` is `None` because SQLite reports no
+suggested delay. Predicates `open::is_busy` and `open::is_constraint_violation` are public
+so a caller can branch without matching on message text. Nothing uses `anyhow`; the guard
+test passes.
+
+### `open_at` creates the parent directory — a deliberate superset of the oracle
+
+`oc-paths` keeps every path getter pure and the oracle relies on `global.ts` having
+already `mkdir`ed `data()`. `open::ensure_parent` does it at open time instead, which also
+covers an `OPENCODE_DB` pointing at a nested directory that the oracle would fail to open.
+Tested by `opencode_db_absolute_is_used_verbatim` with a two-level path.
+
+### Path rules are consumed, never re-derived
+
+`oc-db` calls `oc_paths::db_path()` and matches on `DbLocation`. It contains no reference
+to `OPENCODE_DB`, no `is_absolute` check and no channel logic. Tests exercise all three
+forms by building a `Layout` from an explicit `Env` (`Layout::resolve_with`), never by
+mutating process env — `set_var` is `unsafe` and this workspace forbids it.
+
+## Task 23 — oc-snapshot
+
+**Shell out to `git`, do not use a Git library.** The snapshot store is not a normal repository:
+it is driven with three distinct `-c` override sets, a private index seeded by *copying another
+repository's index file*, `--pathspec-from-file=- --pathspec-file-nul` staging, `write-tree` against
+that private index, and `checkout-index -a -f` to restore. The Rust and TypeScript binaries must read
+each other's stores, so reproducing the oracle's invocations exactly outranks elegance — and no
+pinned Rust Git library exposes the index-file-copy trick or cruft-pack `gc` anyway. `oc-paths`
+already set the shell-out precedent for Git discovery. Injection safety comes from
+`std::process::Command::args(&[OsString])` → `execvp` argv (never a shell string) plus keeping file
+names off argv entirely; proven against a worktree path containing a space, a single quote, a double
+quote, `$(touch pwned)` and `; rm -rf .`, and against a file named ``a file's; rm -rf $HOME `id`.txt``.
+
+**`std::process::Command`, not `tokio::process`.** Every existing library crate that spawns a process
+uses the blocking API. The one place that must not block a runtime worker — the hourly gc loop — wraps
+the call in `tokio::task::spawn_blocking`. `tokio` is a normal dependency; `features = ["test-util"]`
+is a **dev**-dependency addition only (resolver 3 keeps it out of normal builds) so the cadence can be
+asserted on a paused clock instead of waiting an hour.
+
+**Crate-local `SnapshotError`, not a new `oc-error` variant.** `oc-error` deliberately has no
+process/exec or `Io` variant, and its aggregate `Error` is not `#[non_exhaustive]`, so adding a
+variant breaks every exhaustive `match` in the workspace. `oc-paths` set the precedent by owning
+`PathsError`. Variants: `Spawn`, `Git { args, code, stderr }`, `Encoding`, `Store { operation, path }`,
+`Scan`. If a later todo wants snapshot failures inside `oc_error::Error`, add one
+`Error::Snapshot(#[from] SnapshotError)` arm — the type is ready for it.
+
+**Reference-count query API — todo 83 consumes this.**
+
+```rust
+pub struct StoreKey        { pub project_id: String, pub worktree_hash: String }
+pub struct SessionRef      { pub session_id: String, pub project_id: String, pub worktree: PathBuf }
+pub struct StoreReferences { pub key: StoreKey, pub path: PathBuf, pub on_disk: bool,
+                             pub sessions: BTreeSet<String> }
+
+pub fn discover_stores(root: &Path) -> Result<Vec<StoreKey>>;
+pub fn reference_counts<I: IntoIterator<Item = SessionRef>>(root, sessions) -> Result<Vec<StoreReferences>>;
+pub fn unreferenced_stores<I: IntoIterator<Item = SessionRef>>(root, sessions) -> Result<Vec<StoreReferences>>;
+pub fn is_worktree_hash(name: &str) -> bool;
+```
+
+Shape rationale: the caller owns the session list (it comes from the DB, which this crate must not
+depend on) and owns every deletion. `reference_counts` returns *all* stores including zero-reference
+ones so a GC can report and dry-run; `on_disk` distinguishes "referenced but never tracked" from
+"exists". Sorted by key for stable output. `is_worktree_hash` is strict (40 lowercase hex) so a stray
+directory is never reported as a deletion candidate.
+
+**Restore restores content only.** `read-tree` + `checkout-index -a -f`, matching upstream: a file
+created after the snapshot is left in place. Deleting those is `revert`'s job (todo 74), which is why
+`patch()` returns the changed-file list.
+## Task 20
+
+- Fresh schema creation and journal insertion occur in one `IMMEDIATE` transaction. All 38 ids from current `migration.gen.ts` receive one captured Unix-millisecond `time_completed`, matching upstream's one schema-creation transaction while avoiding partially current databases.
+- Existing databases with a `session` table are accepted only when their `migration` journal contains every current id. Rust does not speculatively mark an older schema current; a missing id returns `DbError::Migration` instead of making TypeScript skip required SQL.
+- All 19 tables from generated `schema.up(tx)` are emitted verbatim, including the six cloud-side tables, because omitted tables would contradict a fully seeded journal and later TypeScript migrations can alter them.
+- Schema differential normalization removes backtick/double-quote identifier quoting, collapses insignificant SQL whitespace, trims a terminal semicolon, and lowercases SQL keywords/identifiers. These rules are safe here because all generated identifiers are lowercase, SQLite identifiers and keywords are case-insensitive, and literals/defaults remain structurally checked via `pragma_table_info`. Table names, column order/name/type/null/default/PK position, index name/DDL, and FK source/target/update/delete/match actions are still compared exactly.
+- The differential uses a fresh database created by the real binary rather than the 51 GiB user database, because the legacy database deliberately retains `__drizzle_migrations` and therefore is not the output of current `schema.up`.
+
+
+## Task 93
+
+### Methodology revision 2: the warm-up discard is now W-soak only
+
+**Decision.** `PERF_METHODOLOGY_REVISION` 1 -> 2. The 90-second warm-up discard
+applies to `W-soak` alone. `W-idle` and `W-real` take their peak over the whole
+trace.
+
+**Why revision 1 was wrong, not merely different.** For a bounded cold-start
+workload the peak *is* the startup-plus-turn spike, so discarding the startup
+discards the measurement. W-idle's trace is 148s; a 90s discard cut 45 of its 75
+samples and under-reported its median peak as 728.9 MB against the 931.9 MB its
+own retained samples hold — 203 MB hidden. Every rep peaks inside the discarded
+window and then falls 130-300 MB, so this was not an edge case.
+
+**Why now is the only legitimate moment.** No Rust binary has been measured yet,
+so the change cannot have been fitted to a comparison result. This is exactly the
+case the `PERF_METHODOLOGY_REVISION` mechanism exists to permit: an honest
+pre-comparison correction, recorded with its evidence.
+
+**The four G1-G4 formulas were not touched.** The frozen section is byte-identical
+across revisions 1 and 2, hashing to the same
+`db49ffeb3a19a265a948e5545afe14e245f8ac7c8201ae1b1e1748e87f6922ad`. Registered as
+a separate `REVISION_2_HASH` constant rather than aliased to `REVISION_1_HASH`, so
+revision 2 has a digest it must match on its own and editing a formula still
+breaks the lock. Proved by mutating G1's coefficient 0.50 -> 0.75 (guard FAILED
+with digest `aa519eca...`) and reverting (guard ok). Transcript in the evidence file.
+
+**Enforced in one place.** `runner::warm_up_discard(WorkloadName) -> Duration` is
+the single source of the rule; `workload::peak_after_warm_up` is the only consumer,
+and the artifact test re-derives every committed peak through that same function.
+A stored peak therefore cannot drift from the rule that produced it.
+
+### QA substitution: within-run spread replaces a second full baseline pass
+
+**This is a deliberate change to the verification method, not a skipped check.**
+
+The original happy-path scenario was "two independent baseline runs agree within
+10%". Dropped. It costs a second ~50-minute measurement pass for information the
+committed artifact already contains, and the measured within-pass spread of the
+five per-run peaks — 1.1402x for W-idle, 1.1788x for W-real — is *wider* than the
+10% the criterion would have demanded. Running the second pass would have produced
+either a false failure or a passing number obtained by luck.
+
+**Replaced with:** `WorkloadMeasurement::peak_spread()` deriving min / median /
+max / max-over-min from the retained runs, plus
+`committed_baseline_records_the_spread_of_every_measured_workloads_peaks`
+asserting that every measured workload records a coherent five-run spread whose
+median is the median the artifact publishes, and that the deferred workload
+records no spread and a reason instead. Spread is derived, never stored, so it
+cannot drift from the runs it summarises. Recorded in `docs/perf-methodology.md`
+so the substitution is visible to a reader who never sees this notepad.
+
+### Measured versus deferred
+
+- **W-idle** — measured. 5 runs, median 954,240 KiB. Feeds G1.
+- **W-real** — measured. 5 runs, median 3,026,992 KiB. Feeds G2.
+- **W-soak** — deferred, honestly labelled: `smoke_only: true`, `runs: []`,
+  `median_peak_rss_kib: null`, and a `deferred_reason` naming the exact failure.
+  Left as-is. A 20-turn smoke cannot satisfy G3 even when it succeeds, so losing
+  it costs no gate evidence, and `soak_outcome` already distinguishes this from a
+  failed *full* soak, which is propagated because it is the G3 input itself.
+  Fabricating a number here would have been the only real defect available.
+
+### Artifact recomputed, never re-measured
+
+Every number came from the retained raw samples already on disk. The
+revision 1 -> 2 diff is exactly 7 lines: `methodology_revision`, W-idle's five
+per-run peaks, W-idle's median. W-real and W-soak byte-identical apart from the
+shared revision field. The redundant second measurement pass (`run-b`) was killed
+before this task began and was not restarted.
+## Task 93
+
+**Measured vs `null`, and why.**
+
+| Workload | State | Why |
+|---|---|---|
+| W-idle | **measured**, 5 runs, median 954,240 KiB | G1's only input. Cold start + one cassette-backed tool turn + settle, 2 s sampling, 148 s trace. |
+| W-real | **measured**, 5 runs, median 3,026,992 KiB | G2's only input. Largest session by `SUM(LENGTH(part.data))`, restored, rendered, one turn. |
+| W-soak | **`null` + reason** | Not a G1/G2 input. The plan already states a 20-turn run is smoke-only and **cannot satisfy G3**, so the permitted smoke has no gate value even when it succeeds. Chasing it would not have produced G3 evidence. Deferred to Todos 88-90. |
+
+The recorded reason is explicit rather than a bare error: *"not measured: the 20-turn W-soak smoke is not a G3 input and was not pursued; the full W-soak of 500 turns over 2 hours remains owed by the G3 gate. Smoke attempt reported: …only 0 of 20 cassette-backed turns completed; captured 2 provider request(s)"*. A later reader must not be able to mistake it for a measurement that came out small.
+
+**A failed W-soak *smoke* is deferred; a failed *full* soak propagates.** `soak_outcome` splits on `smoke_only`. Losing the smoke costs no gate evidence and must not discard the ten G1/G2 runs already measured; losing the full soak loses G3's input itself, so it fails the report. `BaselineReport::validate` still rejects any artifact whose W-idle or W-real lacks five runs and a median, so a *gate* input can never reach the deferred state — the artifact fails instead.
+
+**`PERF_METHODOLOGY_REVISION` bumped 1 → 2. The four formulas were not touched.** Revision 1 discarded the first 90 s of *every* workload as warm-up, which is wrong by construction for a bounded cold-start workload: W-idle's whole trace is 148 s, so the rule threw away 45 of 75 samples — 61% of the trace, including the entire cold start it exists to measure. Recomputed from the retained raw samples, W-idle's median peak is **954,240 KiB (931.9 MiB)** over the whole trace against **746,408 KiB (728.9 MiB)** under the discard: the rule hid ~203 MiB of real peak. W-real is unaffected — its turn is typed only after the 90 s hydration gate, so its peak lands after the former window either way, and both rules give 3,026,992 KiB. Revision 2 therefore scopes the discard to W-soak alone, where startup is genuinely noise against hours of steady state. The formula section is **byte-identical** across both revisions (`sha256 = db49ffeb…6922ad`), and revision 2 re-registers that digest rather than aliasing revision 1's, so it must match on its own. The correction landed **before any Rust binary was measured**, which is the case a revision bump exists to record — it cannot have been fitted to a comparison result.
+
+**The 90 s mark keeps a second, non-aggregation role.** A restored session's first turn is not typed until 90 s have elapsed, so W-real's keystrokes reach a TUI that has finished replaying its parts rather than one still hydrating. That is a run-shaping gate, not a sample filter, and the two uses are now named separately (`hydration_is_settled` vs `warm_up_discard`).
+
+**W-real's sampling window is 450 s, not 150 s.** `90 s` hydration gate + `300 s` turn allowance + `60 s` settle. The turn cannot start before the gate, so a 150 s window ended before the turn's peak existed. 300 s is sized from measurement: 13 s keystroke-to-first-request and still climbing 55 s later on this session.
+
+**The cassette prelude is unconditional.** Both a new and a restored session issue exactly one tool-free text request first, so `openai-chat/streams-text` is always served before the tool loop and `completed_tool_turns` always deducts exactly one prelude request. Making it conditional on the session kind was the wrong model — see `learnings.md`; the two preludes differ in *purpose* (title vs compaction summary), not in count.
+
+**The released binary is measured, never the from-source oracle.** `released_oracle()` honours `OC_TESTKIT_ORACLE` — the not-found error's own remedy instructs the operator to set it, and a `PATH` hit can be a launcher shim — but deliberately ignores the from-source flavour. Running the TypeScript entry point under Bun would measure a different process tree than the release users run, so a baseline taken that way would not describe the software the gates are about.
+
+**Run-to-run stability is evidenced from one pass's five peaks, not from a second pass.** Two second-pass attempts were started; neither finished (one hit the pre-fix W-real failure, one was destroyed when `/tmp` was swept mid-run and took the harness binary with it). Neither contributed a number. The within-pass spread of the five retained peaks measures the same quantity from data the artifact already holds, and the measured spread — **1.140x** for W-idle, **1.179x** for W-real — is *wider* than a two-pass 10% agreement criterion would have tolerated. Reporting the measured spread states that variance honestly; asserting a 10% tolerance this machine does not meet would not. `PeakSpread` is derived from the runs rather than stored, so it cannot drift from them, and `every_committed_peak_is_reproducible_from_its_retained_samples` re-derives each published peak through the production rule.
+
+**File permissions use explicit Unix modes.** `Permissions::set_readonly(false)` is a clippy warning and, on Unix, ambiguous about which of user/group/other it grants. The snapshot is `0o444` and each run's private clone is `0o600`.
+## Task 27
+
+- Todos 29/30/94/96 must feed raw response bytes through `oc_llm::sse::SseParser::push`, call `finish` at EOF, and deserialize each `SseEvent` through `SseEvent::deserialize(provider, model)`. Provider crates must not decode UTF-8 or split SSE frames themselves.
+- All text/event-stream providers share this parser. `SseParser` recognizes both LF and CRLF blank-line frame delimiters, joins repeated `data:` fields with newline, ignores comments and unrelated fields, and emits a trailing unterminated frame from `finish`.
+- Stream idle timeout defaults to 300 seconds. Provider config is passed to `StreamIdleTimeout::from_config`; the positive integer environment override is `OPENCODE_STREAM_IDLE_TIMEOUT_SECS`. Providers wrap each `stream.next()` future with `StreamIdleTimeout::wait`.
+- A timeout is `ProviderError::Transient`; malformed streamed JSON is `ProviderError::Fatal`. Both preserve actionable provider/model source context without adding a catch-all error variant.
+
+
+## Task 25
+
+**The `Provider` trait is three methods.** The reference implementation's is ~30 and the plan names that an anti-pattern; the cost is not aesthetic, it is that every method is a question all five families must answer including the ones for which it is meaningless, and each is a place a caller can start behaving per-provider.
+
+```rust
+pub trait Provider: std::fmt::Debug + Send + Sync + 'static {
+    fn id(&self) -> &str;
+    fn capabilities(&self) -> Capabilities;
+    fn stream(&self, request: CompletionRequest) -> ProviderStream<'_>;
+}
+```
+
+`Debug` is a **supertrait, not a method**, so it costs the trait no width; it is required because a `Result` carrying a provider must be printable when it turns out to be the wrong branch (`unwrap_err` needs `T: Debug`), and because a startup audit listing what got wired beats one that counts it. Implementations must not render a credential.
+
+`stream` returns `Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send + '_>>` rather than an `async fn`, so the trait stays object-safe without `async_trait`, and a request-shaping failure surfaces as the stream's first item instead of a second error channel.
+
+`Capabilities` is one plain struct — `reasoning`, `tool_calls`, `prompt_cache`, `attachments`, `sampling_params` — rather than five predicate methods: a caller needing two answers should not pay two virtual calls, and a new capability must not widen the trait. Each field is there because a *named* downstream todo branches on it (28 reasoning, 29/31 prompt cache, 30 sampling-param stripping, 32 attachments).
+
+**Deliberately excluded from the trait, with the owner of each:** model listing / metadata / cost / token limits → `catalog.rs` (26); authentication and credential refresh → `oc-auth` (24); retry, backoff and compaction decisions → `oc-error`'s `Recovery` (2); prompt caching and reasoning-effort resolution → `effort.rs` + `cache.rs` (31); SSE framing and incremental UTF-8 decoding → `sse.rs` (27); the full stream-event vocabulary including `RetryRollback` → `event.rs` + `stream.rs` (28).
+
+**`Spec` is a struct of optional parameters, not an enum of provider identities.** The reference uses an enum, one variant per identity (`OpenRouterRuntimeSpec::{Default, OpenRouterApiKey, CompatibleProfile, NamedProfile}`), which works when the variants are known and few. Here five families are still unwritten, and an enum would force each of them to add a variant to a shared type **in `oc-llm`** — reintroducing in the type system exactly the coupling this registry deletes from the dependency graph. Shape:
+
+```rust
+pub struct Spec {
+    pub provider: String,                              // the key being instantiated
+    pub surface: ApiSurface,                           // Default | Chat | Responses | Messages
+    pub base_url: Option<String>,                      // Azure endpoint, Vertex REP domain, profile URL
+    pub api_version: Option<String>,                   // Azure api-version
+    pub region: Option<String>,                        // Bedrock signing, Vertex routing
+    pub project: Option<String>,                       // Vertex publisher path
+    pub headers: BTreeMap<String, String>,             // anthropic-beta, Copilot editor headers
+    pub options: BTreeMap<String, serde_json::Value>,  // the user's provider.*.options bag
+}
+```
+
+`BTreeMap` not `HashMap` so a spec renders and compares deterministically — todo 31's byte-stable-prefix test will depend on that. `options` is `serde_json::Value` on purpose: it mirrors the oracle's own `Record<string, any>` config surface, so a provider-specific option a user sets does not require a field here first. It is a *config* bag, never an error channel; nothing makes a recovery decision from it.
+
+**Three error variants, not two, and never one.** `RegistryError::NotRegistered` (a wiring bug — nothing a user can configure fixes it), `Unavailable { reason: Unavailable }` (a user-facing state — login or config edit), `Construction { source: ProviderError }` (the provider ran and broke). The reference collapses the first two into a bare `Option::None` and logs the same "composition root must call `register_external_provider()`" warning for both (`external.rs:219-245`), so a user with no GitHub token is told the *program* is miswired. `Unavailable` is itself an enum — `MissingCredential | UnsupportedPlatform | IncompleteConfiguration` — because only the first warrants pushing the user through a login flow and only it is worth re-checking after one.
+
+**A fallible factory must name a reason for declining.** `FactoryOutcome = Result<Arc<dyn Provider>, Declined>`, and there is deliberately no `Ok(None)`: an unexplained decline is precisely what leaves a caller unable to tell a user what to do. `Declined::{Unavailable(Unavailable), Failed(ProviderError)}` with `From` impls for both, so `?` works in a factory body.
+
+**`ProviderRegistry` is an owned value, not a global.** The reference uses a process-wide `OnceLock<RwLock<HashMap<..>>>` and documents that re-registering a key replaces the previous factory "useful for tests" (`external.rs:184-195`) — an admission that a global registry and a parallel test suite fight each other. This workspace's tests run in parallel, so the composition root builds a value and passes it down. That also makes "wired in exactly one place" true *by construction* rather than by convention: there is no ambient state to reach for.
+
+**The composition-root signature todos 29, 30, 94, 95, 96 must satisfy:**
+
+```rust
+pub type Factory        = Arc<dyn Fn(Spec) -> FactoryOutcome + Send + Sync>;
+pub type FactoryOutcome = Result<Arc<dyn Provider>, Declined>;
+pub type Composition    = fn() -> ProviderRegistry;
+
+// infallible — the provider always constructs
+registry.register("anthropic", |spec| Arc::new(Anthropic::new(spec)));
+
+// fallible — construction may decline, and must say why
+registry.register_fallible("github-copilot", |spec| {
+    let token = load_token().ok_or(Unavailable::MissingCredential)?;
+    Ok(Arc::new(Copilot::new(spec, token)?))
+});
+```
+
+Each provider todo adds **one** call inside `oc-cli`'s single `Composition` function and changes nothing else in the workspace.
+
+**Credential presence arrives through a one-method trait, not a dependency on `oc-auth`.** `CredentialPresence::has_credential(&self, provider: &str) -> bool` is all the "credentialed but unwired" diagnostic needs, and taking `oc-auth` as a dependency to get it would put credential storage, refresh and file-permission concerns in the spine. Same inversion as the factories, applied to the one dependency the diagnostic would otherwise force in. `ProviderRegistry::unwired(&dyn CredentialPresence, &[&str])` returns one `NotRegistered` per credentialed-but-unregistered candidate; the candidate list comes from the catalog (26), because the registry has no opinion about which providers exist in the world, only which it can build.
+
+**The absent `oc-llm → oc-provider-*` edge is asserted mechanically, over the transitive closure.** `cargo tree -p oc-llm | grep oc-provider-` is the stated criterion, but `crates/oc-llm/tests/registry_dependency_direction.rs` is the durable form: it parses every member manifest, walks the first-party closure breadth-first (so an edge added through an intermediate crate is caught too), scans `dependencies`, `dev-dependencies` **and** `build-dependencies` (a dev edge costs the same rebuild on every CI run), and carries two vacuity guards — it fails unless it finds ≥33 members, all five `oc-provider-*` crates, and `oc-llm → oc-error`, so a scan that walked the wrong directory cannot pass by finding nothing.
+
+## Task 22 - message/part persistence
+
+### The blob is `serde_json::Map`, not a typed struct per variant
+Only the discriminator (`type` / `role`) is typed; the payload rides as an
+untyped object. Reason: the writer on the other side of this file is another
+program that ships independently. A production `file` part carries `synthetic`,
+which `FilePart` does not declare - a typed decoder would have dropped it and
+silently broken every attachment. Byte parity is the requirement; a typed model
+would trade it for a type-safety guarantee this module cannot honour anyway.
+Consequence for callers: reach for `PartKind` to dispatch, then index `data`.
+
+`preserve_order` is **off** in this workspace, so `Map` is a `BTreeMap` and
+`to_string` emits one canonical key order. That is what makes "byte-identical
+JSON" a meaningful assertion rather than an accident of insertion order - both
+sides of every comparison are independently re-serialised.
+
+### Hydration: two statements, chunked at 900 ids
+`messages_for_session` (1 statement, `ORDER BY time_created, id` to ride
+`message_session_time_created_id_idx`) then `parts_by_message` (1 statement per
+900 ids, `WHERE message_id IN (...) ORDER BY message_id, id`), grouped into a
+`HashMap` and zipped. Shape taken from `message-v2.ts:98-123`.
+**Measured: 500 messages x 3 parts = 2 statements.** 900 is well under SQLite's
+32766 variable ceiling; it bounds statement text and the bind array, it is not
+working around a limit.
+An empty message set issues **no** part lookup at all (1 statement total) -
+guarded, because `IN ()` is a syntax error.
+
+### The query count is proved two independent ways
+Every statement in the module is prepared through one private
+`MessageStore::prepare`, the only place a `Cell<u32>` counter moves - so a
+statement cannot be issued without being counted. That alone is self-reported, so
+the 500-message test **also** installs SQLite's own `SQLITE_TRACE_STMT` hook and
+asserts both numbers are 2. If a statement ever escaped the wrapper the two would
+disagree and the test would fail. Cost: the `trace` feature on oc-db's own
+`rusqlite` line (documented in the manifest as existing for exactly this).
+`reset_query_count()` is called immediately before the measured call so setup
+writes are excluded - the first draft omitted this and the real-data test caught
+it at 29 instead of 2.
+
+### An unknown variant is `DbError::Decode`, and the row is left alone
+`PartKind` / `MessageRole` have no catch-all arm and `from_tag` returns `Option`;
+the decode path converts `None` into `DbError::Decode { table: "part", .. }` whose
+source names both the rejected tag and the twelve expected ones. Rationale: a
+dropped part renders as a tool call with no result or a step with no finish, with
+nothing in the logs. `Decode` is already classified non-retryable by oc-error, so
+a retry loop will not spin on it. Following Todo 2's discipline, a thirteenth
+upstream variant breaks compilation at every match rather than being absorbed.
+The failing row is **not** deleted or skipped - asserted.
+
+### A stripped key found inside `data` on read is also `Decode`
+Nothing in SQLite rejects a blob that duplicates `id`/`sessionID`/`messageID`, and
+a schema test cannot see it, so it is checked on the read path
+(`reject_stored_keys`). Without this the duplicate becomes a second source of
+truth that can disagree with the indexed column.
+
+### `time_created` comes from the payload, `time_updated` from the clock
+`projector.ts:264` reads `info.time.created`; `MessageRecord::from_json` does the
+same and falls back to `0` rather than to a clock read, keeping the value a pure
+function of the input. A part's `time_created` is **not** in its payload
+(`projector.ts:321` uses the event's own timestamp) so it is a parameter.
+`put_*_at(record, now)` takes the write stamp explicitly and `put_*` supplies the
+clock, so every test is deterministic without a clock abstraction.
+
+### QA went for the strong direction
+`opencode export` exists in 1.18.12, so the differential is Rust-writes ->
+TypeScript-reads (all twelve variants, exit 0, 12/12 surfaced) rather than the
+prompt's permitted fallback. The reverse direction is covered too, against nine
+genuine production rows behind `OC_T22_REAL_ROWS`. The fixture is deliberately
+**not committed** - it is the user's conversation content; the extraction query is
+in the evidence file so anyone can regenerate it.
+
+### The 51 GiB database was opened read-only, not copied
+The prompt suggested copying it. It is 51 GiB with an 815 MiB `-wal`; a copy would
+have burned the task budget and the disk. `file:...?mode=ro` is strictly safer
+than a copy anyway - no write handle is ever created and the `-wal` is untouched.
+
+## Task 21 — session store
+
+### `subpath` is implemented — intentional divergence, for Todo 86's allow-list
+
+**DIVERGENCE CANDIDATE #1 — `subpath` is applied instead of ignored.**
+
+Upstream declares `subpath` on the project arm of the list union
+(`packages/core/src/session.ts:64-68`), re-declares it in the HTTP query schema
+(`packages/protocol/src/groups/session.ts:44` and `:102`), carries it through the
+generated client (`packages/client/src/generated/client.ts:298`) and the SDK
+(`packages/sdk/js/src/v2/gen/sdk.gen.ts:5440-5456`) — and then **never reads it**
+in the handler (`core/src/session.ts:268-303` builds its conditions from
+`directory`, `workspaceID`, `project`, `search` and `anchor`, and nothing else).
+The intent is even written down as a comment at `core/src/session.ts:50`:
+`// - by subpath`. The v1 code had it: `listByProject`'s path filter at
+`session.ts:969-984`.
+
+So a caller asking for one directory's sessions today silently receives the whole
+project's. This project applies the filter, taking its prefix semantics from that
+v1 filter: `path = ?` OR everything beneath `?/`.
+
+Two sub-decisions inside it:
+
+1. **`substr(path, 1, length(?) + 1) = ? || '/'` rather than `path LIKE ? || '/%'`.**
+   `LIKE` reads `_` and `%` as wildcards, so upstream's v1 filter matches a
+   session under `axb/` when asked for `a_b` — it interpolates the path straight
+   into the pattern. There is no index on `session.path` either way, so the exact
+   form costs nothing. Pinned by
+   `a_subpath_containing_a_like_wildcard_is_not_treated_as_a_pattern`.
+   **This is a second, smaller divergence** and should go on the allow-list with
+   the first: given `subpath` was dead code upstream, there is no observable
+   behaviour to break, and matching a directory literally is the only reading of
+   "sessions under this subpath" that is not a bug.
+2. **An empty subpath filters nothing**, matching upstream's own `if (input.path)`
+   guard (`session.ts:969`). A session at the worktree root stores `""`, so an
+   empty subpath would otherwise mean "only the root", which is not what an
+   absent filter means.
+
+`ListQuery::with_subpath` on a non-project scope is dropped rather than
+reinterpreted, and `ListQuery::subpath_applies()` reports whether a subpath will
+actually narrow anything — so a caller can never silently pass a subpath that is
+ignored, which is the exact failure this divergence fixes.
+
+### The API shape Todos 71-76 will consume
+
+Two layers, both in `oc_db::session`:
+
+- **Free functions taking `&Transaction`** — `create`, `get`, `find`, `touch`,
+  `touch_at`, `list`, `list_global`, `children`, `subtree`, `remove`. These
+  compose inside a caller's own transaction, which is what the turn loop (Todo 32)
+  needs when a session write has to land atomically with message writes.
+- **`Store<'pool>`**, a `Copy` facade over `&Pool` with the same method names.
+  Reads take a pooled connection; writes go through `Pool::transaction`
+  (`IMMEDIATE`), so a subtree delete is one atomic unit under contention. This is
+  the layer the request handlers should use.
+
+Request-shaped types:
+
+- `SessionCreate` — required fields via `SessionCreate::new(id, slug, project_id,
+  worktree, directory, title, version)`, then `.with_parent()`, `.with_workspace()`,
+  `.at(millis)`. `worktree` is an input, not a stored column: it exists only to
+  derive `path`. `SessionCreate::default_title_prefix(parent_id)` returns
+  upstream's prefix; the timestamp half is the caller's to format, because it is
+  the only part needing a calendar.
+- `ListQuery { scope, workspace_id, search, roots, start, cursor, archived, sort,
+  direction, limit }` with `ListQuery::{global, directory, project}` constructors
+  and `.with_subpath()`, `.created_order()`, `.with_limit()`, `.active_only()`.
+  Every field defaults to not narrowing.
+- `ListScope::{Directory{directory}, Project{project_id, subpath}, Global}` — an
+  enum, because the upstream schema is a union and a struct of three `Option`s
+  would let a caller ask for two scopes at once.
+- `Creation::{Inserted, AlreadyExists}` — see learnings; `.session()`,
+  `.into_session()`, `.was_inserted()`.
+- `Session` with grouped `tokens: Tokens` and `summary: Option<Summary>`, matching
+  the shape `fromRow` emits. `Session::subpath()` applies upstream's
+  empty-string-is-absent rule; `Session::path` is the raw column.
+- `GlobalSession { session, project: Option<ProjectSummary> }` for `list_global`.
+  Two statements, not a join (`session.ts:578-595`), so a session whose project
+  row is gone still comes back with `project: None` — upstream's `?? null` at
+  `:595`.
+
+### JSON columns are carried as `Option<String>`, unparsed
+
+`model`, `metadata`, `revert`, `permission` and `summary_diffs` are stored and
+returned verbatim. Nothing in this module needs to look inside them, and
+re-encoding is exactly how a byte-compatible payload stops being byte-compatible
+— key order, number formatting and absent-vs-null all shift. Todo 22 makes the
+same call for `message.data` / `part.data`. A later todo that needs typed access
+should parse at its own boundary, not here.
+
+### `remove` returns the removed ids rather than cancelling background jobs
+
+`session.ts:618` cancels the subtree's running jobs before deleting. The job
+registry is not in this crate and `oc-db` must not grow a dependency on it, so
+`remove` returns `Vec<String>` (deepest first, root last) and the caller that
+owns the registry does step 2. Todos 80-85 need that list anyway.
+
+### `session.path` gets its own module, not `std::fs::canonicalize`
+
+`src/session/path.rs` reimplements Node's `path.resolve` + `path.relative`
+lexically. `canonicalize` resolves symlinks and requires existence; a worktree
+reached through a symlink would then produce a `path` the oracle never wrote, and
+the subpath filter matches on that column. 13 unit tests, including
+`/abc` vs `/abcd` → `../abcd` (a shared prefix that is not a shared segment).
+
+## Task 31
+- Prefix protection is both type-level and tracker-level. `PromptCache<T>` owns a private immutable `StaticSystemPrompt`; `prepare_turn` has no static-prompt parameter. Volatile input has the separate `DynamicContext` type and can only become a trailing `Role::User` message. `CacheTracker::record` remains defense in depth and rejects byte changes, history shrinkage, and in-place prefix edits while retaining the last valid baseline.
+- Model-declared variants are exact JSON option objects keyed by canonical effort and always win before generic provider-family mapping. Adaptive/budget differences are catalog capabilities, never model-name checks.
+- Todo 47 MCP merge API: call `LockedTools::tools_for_request(&available_tools, McpToolStatus::Pending)` while discovery is incomplete, then call it with `McpToolStatus::Ready` when discovery settles. The first changed ready snapshot consumes the single rebuild; later tool changes remain hidden until explicit `LockedTools::reset()`.
+- A late-MCP rebuild resets the message tracker baseline because that request is already the one intentional provider-cache miss; the immutable static prefix still remains byte-identical.
+
+## Task 28
+
+### Replay exclusion is type-level
+Stored transcripts use `ContentBlock`; provider-bound messages use `RequestContentBlock`. The outbound enum deliberately has no `Reasoning` or `ReasoningTrace` variant. `TranscriptMessage::to_request` filters both while preserving `SignedThinking`, `ProviderEncryptedReasoning`, and tool-call `ThoughtSignature`. This is stronger than relying on every provider serializer to remember a boolean or repeat a filter.
+
+### Turn-loop accumulator API
+Consumers call `StreamAccumulator::apply(&StreamEvent)`. It accumulates visible text, raw tool-input JSON, reasoning text, reasoning signatures, and a per-tool thought signature. It deliberately does not parse partial JSON or execute tools. `RetryRollback` calls `clear_attempt()`, which clears text, tool calls, reasoning, and reasoning signature together. Read-only access is through `text()`, `tool_calls()`, `reasoning()`, `reasoning_signature()`, and `is_empty()`.
+
+### Compatibility with Todo 25's registry contract
+`registry::ProviderStream` now yields the canonical `event::StreamEvent`; the temporary four-variant enum was removed. `CompletionRequest.messages` now holds `event::Message`, whose content is already the safe `RequestContentBlock` type. Registry re-exports preserve the existing import surface for downstream provider crates.
+
+## Task 38 — `oc-tool` trait, schema pipeline, context
+
+### Object safety: `#[async_trait]` boxing, and a named adapter rather than a blanket impl
+
+`Tool` uses `#[async_trait]`, so `execute` returns a boxed future and `Arc<dyn Tool>`
+works. The alternative — a hand-rolled `fn execute(&self, …) -> Pin<Box<dyn Future + '_>>`
+— is the same allocation with worse ergonomics for 19 implementors.
+
+The bridge from `TypedTool` to `Tool` is a **named wrapper `Typed<T>`** plus
+`erase(tool) -> Arc<dyn Tool>`, *not* `impl<T: TypedTool> Tool for T`. A blanket impl
+would conflict with any direct `impl Tool`, because the compiler cannot prove an MCP
+proxy is not also a `TypedTool`. Todo 47 needs `impl Tool` directly (a remote server's
+schema is not describable by a Rust type), so the blanket impl would have closed the
+door this crate must leave open. Cost: implementors write `erase(MyTool)` once.
+
+### `raw_parameters_schema` is named for being un-augmented
+
+`Tool` exposes the derived schema and the augmented one separately, and the augmented
+one is only reachable through `definition()`. Naming the raw accessor `parameters_schema`
+(as jcode does) invites a caller to send it to a provider and silently skip the
+cross-cutting properties. `ToolDefinition` has no public constructor path that bypasses
+`definition()`, so augmentation is not something a caller can forget.
+
+### Two artifacts collapsed into one, and the settings that cost tokens
+
+The schema is `schemars`-derived from `TypedTool::Params`, the same type serde
+deserializes. Three departures from schemars' defaults, each a per-request cost:
+draft-07 (providers do not implement 2020-12's `$defs`/`$dynamicRef`), subschemas
+inlined (a `$ref` hop providers handle inconsistently), `$schema` and `title` stripped
+(46 dead bytes and the Rust type name).
+
+A params type whose derived schema is not object-shaped is **normalized to an empty
+object schema**. `#[derive(JsonSchema)]` on a unit struct yields `{"type":"null"}`, but a
+no-argument call arrives as `{}`, and a non-object schema would silently lose the
+injected `intent`. jcode's `ensure_intent_in_schema` returns non-object schemas
+untouched and has no derivation step, so it never hits this.
+
+### The guard-key test is behavioural, not `assert_eq!` on two constants
+
+Comparing two constants passes trivially if both are renamed and only one side's
+*reader* is updated. `tests/guard_key.rs` instead diffs an augmented schema against its
+input to **discover** the injected property names, then proves each one is observed **by
+calling the guards**, and that exactly one key feeds each guard. A rename on either side
+alone fails it. The wire spellings are pinned separately, because a coordinated rename
+is still a wire change.
+
+`INJECTED_KEYS` exists so `strip_cross_cutting` cannot fall behind the injector, and a
+test asserts the declared list equals what augmentation actually injects.
+
+### `for_subcall` shares everything except the call id, and adds a depth
+
+Session, message, agent, permission asker and interrupt are all inherited by `Arc` clone
+(proved with `Arc::ptr_eq`): a sub-call runs under the same rules and the same abort, so
+a denied edit stays denied and one interrupt stops the whole tree. **Anything a composing
+tool could vary here would be a way to launder a sub-call past a gate the parent could
+not pass**, which is why nothing is parameterized.
+
+`depth` is added over jcode's version. Todo 70's `execute` re-enters the registry, so a
+tool that composes itself recurses without a bound. Choosing the limit is the composer's
+call; *recording* the depth belongs here, because this is the only place a child context
+is created.
+
+### The interrupt is a trait, because the concrete signal is downstream
+
+`InterruptSignal` lives in `oc-engine`, and `oc-engine → oc-tool` is required by todo 33.
+So `oc-tool` declares `InterruptHandle { fn is_set(&self) -> bool; async fn notified(&self) }`
+with method names and signatures **identical** to `InterruptSignal`'s, leaving `oc-engine`
+a one-line forwarding impl with nowhere to introduce a discrepancy (spelled out in
+`context.rs`'s module docs). `is_set` stays synchronous, preserving todo 3's property that
+blocking tool code can poll cancellation with no Tokio runtime. `NeverInterrupted::notified`
+never completes, which is the honest reading of "never interrupted".
+
+### Size detection API, and the policy that is explicitly not here
+
+`measure(text, limits) -> SizeMeasurement { lines, bytes, limits, verdict }`. Two
+deliberate shapes:
+
+- `SizeVerdict` is an enum, not a `bool`, and `LimitExceeded` distinguishes
+  `Lines`/`Bytes`/`Both`. A caller reporting *why* output was withheld has to name the
+  threshold, and re-deriving that from the numbers at the reporting site is how the
+  reported reason drifts from the decided one.
+- `SizeMeasurement` carries the `limits` it applied. Otherwise the number in a message
+  and the number in the decision are two reads of configuration that can disagree.
+
+**The refuse-vs-truncate policy is todo 72's alone.** This crate detects the size and
+persists the full text; nothing here truncates, and no test here asserts what a caller
+receives on overflow. `tests/oversized_output.rs` says so in its module docs. The one
+test that touches the untruncated text asserts only that *this crate's own operations*
+(`measure`, `persist`) do not rewrite it — a statement about these functions, not about
+what todo 72 hands back.
+
+### Storage divergence: the session id goes in the filename
+
+Deliberate, documented divergence from the oracle. See `issues.md` for the upstream
+defect that forces it. The `tool_` prefix is preserved so files written by this binary
+stay prunable by the TypeScript binary sharing the directory, and the unique component is
+a UUIDv7 so the ascending-by-creation ordering of `Identifier.ascending()` survives.
+Session components are sanitized to `[A-Za-z0-9_-]`; a test proves `../../etc/ses_x`
+cannot move the file out of the store.
+
+### `record_output_path` uses `outputPaths` (plural), matching the v2 wire
+
+The oracle has two shapes: v1 `Tool.wrap` writes `metadata.outputPath` (singular) plus
+`metadata.truncated`; v2 `ToolOutputStore.bound` returns `outputPaths` (array), which is
+what `message-updater.ts:313` persists. The array is used here — one result can spill more
+than once. **`metadata.truncated` is deliberately not written**: setting it would presume
+the policy this todo does not own.
+
+## Task 26
+
+### The pinned fixture: a real 7-provider subset, compiled in
+`crates/oc-llm/tests/fixtures/models-dev-pinned.json` (sha256 `a11b7af8395945c2…`) is a
+**verbatim subset** of a real `https://models.opencode.ai/api.json` response — captured
+once from `/config/.cache/opencode/models.json`, never re-fetched. Both sides of the
+differential read it: the oracle through `OPENCODE_MODELS_PATH`, this crate through
+`include_str!` (compiled in, so a test cannot silently read a stale file).
+
+Seven providers, each earning its place by covering a shape the resolver must handle:
+`deepseek` (provider-level api+npm, cache_read cost), `mistral` (a `deprecated` model),
+`groq` (a `beta` model and a `/`-bearing model id), `inceptron` (an `alpha` model),
+`anyapi` (`experimental.modes`), `impossibl` (`cost.tiers` + `context_over_200k`),
+`zhipuai` (`interleaved:{field}` + `reasoning_options`).
+
+**The selection criterion that makes the differential meaningful**: none of the seven has
+a `custom()` loader in `provider.ts:168-963`, so availability is decided purely by the
+three generic sources this crate implements. A difference in the model list is therefore
+a difference in *this* logic, not in a provider-specific autoload rule owned by another
+todo. A test asserts the fixture still covers all seven shapes, so trimming it later
+fails loudly instead of quietly weakening the differential.
+
+### Why `opencode models`, not `--format json`
+`--format json` does not exist on 1.18.12 (`models --help` lists only `--verbose` and
+`--refresh`; the flag prints help and lists nothing). `--verbose` was rejected as the
+target because its JSON key order differs between catalog-derived and config-derived
+models — the oracle builds them by different code paths — so a diff would fail on key
+order and say nothing about which models resolved. The plain `provider/model` line list
+is the actual contract, so `Catalog::model_lines()` reproduces it and the comparison
+runs under `Normalizer::none()`: a model list has no timestamps, ids, ports or pids, so
+masking anything would mask a real difference.
+
+### Availability maps onto todo 25's diagnostics, and only onto one of them
+`Availability::unavailable_reason()` returns `registry::Unavailable`, **never**
+`RegistryError::NotRegistered`:
+- nothing fired → `Unavailable::MissingCredential` ("log in")
+- a credential exists but is a shape the generic path cannot use (oauth / wellknown) →
+  `Unavailable::IncompleteConfiguration` ("this needs its provider's own flow")
+
+Whether a provider is *wired into this build* is a fact about `oc-cli`'s composition
+root and is unknowable from a catalog, a config file and `auth.json`. Keeping the two
+apart is precisely what stops a user with no API key from being told the program is
+miswired — the bug todo 25 called out in the reference implementation.
+
+### Fail loudly rather than return an empty catalog
+With fetching disabled and no cache this returns `CatalogError::FetchDisabled` naming
+the flag, the source, the cache path and the alternative, where the oracle would fall
+through to its compiled-in snapshot. This crate has no snapshot; silently returning `{}`
+would be indistinguishable from "you have no providers configured" and the user would
+meet it as an empty model picker. A caller wanting the oracle's silence matches
+`is_policy()`. A future snapshot-baking todo inserts rung 2 between `load_from_disk()`
+and the error, the same position the oracle has it.
+
+### Loading is async, resolving is not
+`CatalogSource::load()` is the only thing that can touch the network; `Catalog::resolve()`
+is synchronous and pure. That split is what lets every merge and availability test run
+with zero I/O, and makes "do not fetch at startup when the flag is set" a property of one
+small function rather than of the whole pipeline.
+
+### `ResolveInput` is a builder, not positional arguments
+The three availability sources are independent, and a positional API invites a caller to
+pass two of three and not notice. Each has a `with_` method so a test states exactly one.
+
+### Variants are merged here, derived in todo 31
+`ProviderTransform.variants` is reasoning-effort logic and belongs to `effort.rs`
+(todo 31, concurrent). This crate merges config-declared variants and drops
+`disabled: true` ones; `MergeOutcome::variant_derivation_pending` names the providers
+where a derived set would have applied, so todo 31 has a seam rather than a rewrite.
+
+### Field named `origin`, not `source`, in `CatalogError`
+`thiserror` reserves a field called `source` for the error cause, so the models.dev URL
+is `origin`. Cosmetic, but it is why the variants read the way they do.
+
+## Task 105
+- Chose option 2 (test-local helper) over adding an accessor to `Message`. Reason: the fix needed
+  zero changes outside `crates/oc-llm/src/cache.rs`, and `event.rs` is owned by Todo 28 — an
+  additive method there would still be a cross-owner edit for no extra benefit in this test.
+- Helper added in `cache.rs` `#[cfg(test)]` module:
+  `fn text_of(message: &Message) -> String` — filters `RequestContentBlock::Text { text }` and
+  concatenates. Imported `crate::event::RequestContentBlock` in the test module only
+  (`registry::provider` does not re-export it).
+- The five assertions still compare real message prose; nothing was weakened or ignored.

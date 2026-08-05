@@ -444,9 +444,21 @@ impl<T: Clone + PartialEq> PromptCache<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::RequestContentBlock;
 
     fn message(role: Role, text: &str) -> Message {
         Message::new(role, text)
+    }
+
+    fn text_of(message: &Message) -> String {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                RequestContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -516,11 +528,12 @@ mod tests {
                 .iter()
                 .all(|message| message.role == Role::User)
         );
-        assert_ne!(dynamic_messages[0].text, dynamic_messages[1].text);
-        assert_ne!(dynamic_messages[1].text, dynamic_messages[2].text);
-        assert!(dynamic_messages[0].text.contains("memory generation one"));
-        assert!(dynamic_messages[1].text.contains("memory generation two"));
-        assert!(dynamic_messages[2].text.contains("memory generation three"));
+        let dynamic_texts = dynamic_messages.map(text_of);
+        assert_ne!(dynamic_texts[0], dynamic_texts[1]);
+        assert_ne!(dynamic_texts[1], dynamic_texts[2]);
+        assert!(dynamic_texts[0].contains("memory generation one"));
+        assert!(dynamic_texts[1].contains("memory generation two"));
+        assert!(dynamic_texts[2].contains("memory generation three"));
         assert!(!turn_one.system_static().contains("clock="));
         assert!(!turn_one.system_static().contains("memory generation"));
 
