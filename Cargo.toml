@@ -141,6 +141,21 @@ which = "8.0.5"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 
 # -- primitives -------------------------------------------------------------
+# Already in the tree: reqwest's `rustls` feature selects aws-lc-rs as rustls'
+# crypto provider (see the HTTP client note above), so pinning it here adds no
+# crate and no new C build — it only makes RSA-PKCS1-SHA256 reachable, which is
+# what lets GCP service-account JWTs be signed in process instead of by piping a
+# temp-file private key through the `openssl` binary. Keep this version in
+# lockstep with rustls' choice, or the build forks two copies of aws-lc-sys.
+#
+# `default-features = false` drops `ring-io` and `ring-sig-verify`, whose only
+# effect here would be to add a second `untrusted` major version to the lock for
+# a *ring*-compatibility shim this crate never calls. `Cargo.lock` therefore
+# gains no package at all from this dependency.
+aws-lc-rs = { version = "1.17.3", default-features = false, features = [
+  "aws-lc-sys",
+  "alloc",
+] }
 base64 = "0.23.1"
 sha2 = "0.11.0"
 time = { version = "0.3.55", features = [

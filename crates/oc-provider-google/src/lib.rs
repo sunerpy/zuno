@@ -8,12 +8,11 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use aws_lc_rs::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
 use base64::Engine as _;
 use futures::{StreamExt as _, TryStreamExt as _};
 use oc_error::ProviderError;
@@ -28,7 +27,6 @@ use oc_llm::sse::{SseEvent, SseParser};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use url::Url;
 
@@ -1732,6 +1730,13 @@ fn sign_service_account_assertion(
         .duration_since(UNIX_EPOCH)
         .map_err(ServiceAccountSigningError::Clock)?
         .as_secs();
+    sign_service_account_assertion_at(credentials, now)
+}
+
+fn sign_service_account_assertion_at(
+    credentials: &ServiceAccountCredentials,
+    now: u64,
+) -> Result<SignedAssertion, ServiceAccountSigningError> {
     let header = json!({
         "alg": "RS256",
         "typ": "JWT",
@@ -1748,61 +1753,95 @@ fn sign_service_account_assertion(
     let claims = serde_json::to_vec(&claims).map_err(ServiceAccountSigningError::Json)?;
     let encoder = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let signing_input = format!("{}.{}", encoder.encode(header), encoder.encode(claims));
-
-    let mut key_file = NamedTempFile::new().map_err(ServiceAccountSigningError::TempKey)?;
-    key_file
-        .write_all(credentials.private_key.as_bytes())
-        .map_err(ServiceAccountSigningError::TempKey)?;
-    key_file
-        .flush()
-        .map_err(ServiceAccountSigningError::TempKey)?;
-
-    let mut child = Command::new("openssl")
-        .args(["dgst", "-sha256", "-sign"])
-        .arg(key_file.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(ServiceAccountSigningError::OpenSslStart)?;
-    child
-        .stdin
-        .take()
-        .ok_or(ServiceAccountSigningError::OpenSslStdin)?
-        .write_all(signing_input.as_bytes())
-        .map_err(ServiceAccountSigningError::OpenSslWrite)?;
-    let output = child
-        .wait_with_output()
-        .map_err(ServiceAccountSigningError::OpenSslWait)?;
-    if !output.status.success() {
-        return Err(ServiceAccountSigningError::OpenSslStatus {
-            status: output.status.code(),
-        });
-    }
+    let signature = sign_rs256(&credentials.private_key, signing_input.as_bytes())?;
     Ok(SignedAssertion {
-        value: format!("{signing_input}.{}", encoder.encode(output.stdout)),
+        value: format!("{signing_input}.{}", encoder.encode(signature)),
         token_uri: credentials.token_uri.clone(),
     })
 }
 
+/// RS256 — RSASSA-PKCS1-v1_5 over SHA-256 — computed entirely in this process.
+///
+/// The private key travels PEM text → DER → `RsaKeyPair` in memory and is handed
+/// straight to aws-lc-rs. It is never written to a file and never handed to a child
+/// process, so a crash cannot strand key material on disk and a host without an
+/// `openssl` binary — every musl target among them — still signs.
+fn sign_rs256(
+    private_key_pem: &str,
+    message: &[u8],
+) -> Result<Vec<u8>, ServiceAccountSigningError> {
+    let key = parse_rsa_private_key(private_key_pem)?;
+    let mut signature = vec![0_u8; key.public_modulus_len()];
+    key.sign(
+        &RSA_PKCS1_SHA256,
+        &aws_lc_rs::rand::SystemRandom::new(),
+        message,
+        &mut signature,
+    )
+    .map_err(ServiceAccountSigningError::Sign)?;
+    Ok(signature)
+}
+
+/// PKCS#8 is what a GCP service-account JSON carries; PKCS#1 is accepted because a
+/// key minted by an older tool, or re-exported by one, still arrives that way and the
+/// only difference is which DER parser reads it.
+fn parse_rsa_private_key(pem: &str) -> Result<RsaKeyPair, ServiceAccountSigningError> {
+    const PKCS8: (&str, &str) = ("-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----");
+    const PKCS1: (&str, &str) = (
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "-----END RSA PRIVATE KEY-----",
+    );
+
+    if let Some(der) = pem_der(pem, PKCS8)? {
+        RsaKeyPair::from_pkcs8(&der)
+    } else if let Some(der) = pem_der(pem, PKCS1)? {
+        RsaKeyPair::from_der(&der)
+    } else {
+        return Err(ServiceAccountSigningError::PrivateKeyNotPem);
+    }
+    .map_err(ServiceAccountSigningError::PrivateKeyRejected)
+}
+
+/// `Ok(None)` means "this armor is absent", which is a different outcome from a
+/// present-but-corrupt body and lets the caller try the other encoding.
+fn pem_der(
+    pem: &str,
+    (begin, end): (&str, &str),
+) -> Result<Option<Vec<u8>>, ServiceAccountSigningError> {
+    let Some(after_begin) = pem.find(begin).map(|at| at + begin.len()) else {
+        return Ok(None);
+    };
+    let body = &pem[after_begin..];
+    let Some(before_end) = body.find(end) else {
+        return Ok(None);
+    };
+    let base64_body: String = body[..before_end]
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(base64_body)
+        .map(Some)
+        .map_err(ServiceAccountSigningError::PrivateKeyBase64)
+}
+
+/// No variant carries key material, and none carries a free-form `String`: every
+/// failure here is one of a closed set, and a caller logging the chain must not be
+/// able to log the key.
 #[derive(Debug, thiserror::Error)]
 enum ServiceAccountSigningError {
     #[error("system clock is before the Unix epoch")]
     Clock(#[source] std::time::SystemTimeError),
     #[error("failed to encode service-account JWT")]
     Json(#[source] serde_json::Error),
-    #[error("failed to create a protected temporary key file for service-account signing")]
-    TempKey(#[source] std::io::Error),
-    #[error("failed to start the pinned workspace's OpenSSL signing fallback")]
-    OpenSslStart(#[source] std::io::Error),
-    #[error("OpenSSL signing process exposed no stdin")]
-    OpenSslStdin,
-    #[error("failed to send JWT bytes to OpenSSL")]
-    OpenSslWrite(#[source] std::io::Error),
-    #[error("failed to wait for OpenSSL signing")]
-    OpenSslWait(#[source] std::io::Error),
-    #[error("OpenSSL rejected the service-account private key (status={status:?})")]
-    OpenSslStatus { status: Option<i32> },
+    #[error("service-account private_key is not a PEM-armored RSA private key")]
+    PrivateKeyNotPem,
+    #[error("service-account private_key PEM body is not valid base64")]
+    PrivateKeyBase64(#[source] base64::DecodeError),
+    #[error("service-account private_key is not a usable RSA private key")]
+    PrivateKeyRejected(#[source] aws_lc_rs::error::KeyRejected),
+    #[error("RSA-PKCS1-SHA256 signing of the service-account JWT failed")]
+    Sign(#[source] aws_lc_rs::error::Unspecified),
     #[error("service-account signing worker failed")]
     Join(#[source] tokio::task::JoinError),
 }
@@ -2033,5 +2072,356 @@ const fn block_kind(block: &RequestContentBlock) -> &'static str {
         RequestContentBlock::ToolUse { .. } => "tool-use",
         RequestContentBlock::ToolResult { .. } => "tool-result",
         RequestContentBlock::Image { .. } => "image",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A throwaway 2048-bit RSA key, generated once for this test and committed. It
+    /// protects nothing: the assertions it signs are never sent to Google.
+    const TEST_PKCS8_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+         MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC/Z94dayqx5JBb\n\
+         h2gYJ5LvnbLHWBACFrDInFMLZ9T72SDv7zkbFCoIaec6yn3uBFMA4dsVjlmQOADk\n\
+         Nj4JN8enwOdxuUmrUtdBDY5iNpZ9RNoSuGXCseItiKeom2vgOZke89pwX6QS+Alb\n\
+         3CTRf+vuhxPgq2lm/jgE0Oe3nhi9gTxI/EsGIgVBX6rE7/V0D1oQmbgpwOKPx50R\n\
+         Mjwfa1uMUIP8/k57tu+9yQnG3usGDt6dingZvp76a4UBwypS/ukeVJnj+WZALnbU\n\
+         ABBxgahKNJbHU2lYPFHnspLnDIw2yIDFM3LPEQb0HhmYGbNl3BfL6HNHLJBa9aAi\n\
+         +5sNewMpAgMBAAECggEABSPk8yVNoDljJxIb2Yo2h/jUNEZJJ8U0Oi74i/Xd4mWS\n\
+         XN8vyWphNpihfRKzDxFOqVdnaszH2vemDnrmb5jv47FqhcNUFyXCYhzbFgghQnv2\n\
+         30nUccYVLOPenMiPvRXO5uXll975qQjAN5dR5c5pp545Cm+QBRQOrRJvJp84St6B\n\
+         slkTMIHMC7e+V2RS/XLWCaGvIEl9DVt3k71iFM22feFeO9QG/RcXLf0WhArgh26t\n\
+         oIn7s02UbglD7cdd93SrNuA7XgJOXaqOXvrT4hRF3ixpKbvsMm8/g5uebOzIUeal\n\
+         4jUWj1AsV8czvYQTzHUljivUNlkPIx8csbl00nXDgQKBgQDv9t/9Wew82KWoTRSn\n\
+         XBxugisHAy2HI800KizfKxmxQT6nqQbI6v94EzH4PvTEx0aAq5ughVdlKOwDV3NG\n\
+         yxlPIA8MnrMjGZRS3ENzbJZd45Xf27rWKwvQoXwGSJqalx40bJZIoYBbvT18X7Ge\n\
+         99xLaDiY546XykPdXAGDmOw/owKBgQDMMkoLHYVpWjY4HwhXJRCq6BKnjgzDJz+C\n\
+         nids7V38Y4bKHhxZL0AnzODi0i9NeRRuWY2kxkDdXXg9Jld9TVTsGIi3atloZCQG\n\
+         p0WBirbvSAizswBwgaJCBcHj0APMlC3SCjfRGfezXeznAb3/aAskV9llsXfvz8kP\n\
+         dKCz+f/uwwKBgQCVW0ypLUobySC6s1dSn8NWiRBs6e5xebgkasfJE9OG/zwXMN53\n\
+         OcVOoGvuvois3fek6KsR60ytOx5DKjAm9QzIsgSL709CXo5yUIRvGDwzLg8/6UzO\n\
+         NrbA4XIHmzMXW03ChX+4r0TsVMorWoh8kHt+N91aVm3rTkqVQcnzdcA+DwKBgGOl\n\
+         zvhpqadl/LuaeUl9rwqYQjI+YgACcT3ezEKd+5WlRCvyUcc8BcTmeIB4LdlS0yOe\n\
+         1D6q+RCOApVk1qExUdX9iwpnPD1zURlmG8dB2FAhCQ4Ytogw2uv5P0tbQd9eGJY9\n\
+         okuKrpR7q5Z4BS5UqctMi6zS1ELVVbsTITFzOPBdAoGBAKBy7BbmMOqGfPpDDzmu\n\
+         HxdSaLdyjykYVT5Xshpcihv5cAV8p+x1BpHZvmRcn3EA2Z0EFL8aJm5vuNKLnd/H\n\
+         mNsbEgXy1RjfCNrz2DAEyycfuEzHn9vE2tN6nDAO4FLlX/sPfobSqifScg9Q3U+u\n\
+         3AdfAVm537FuaitHjB/ho5UO\n\
+         -----END PRIVATE KEY-----\n";
+
+    /// The same key re-armored as PKCS#1 by `openssl rsa -traditional`, so the two DER
+    /// parsers can be proved to agree on one key rather than on two look-alikes.
+    const TEST_PKCS1_PEM: &str = "-----BEGIN RSA PRIVATE KEY-----\n\
+         MIIEpAIBAAKCAQEAv2feHWsqseSQW4doGCeS752yx1gQAhawyJxTC2fU+9kg7+85\n\
+         GxQqCGnnOsp97gRTAOHbFY5ZkDgA5DY+CTfHp8DncblJq1LXQQ2OYjaWfUTaErhl\n\
+         wrHiLYinqJtr4DmZHvPacF+kEvgJW9wk0X/r7ocT4KtpZv44BNDnt54YvYE8SPxL\n\
+         BiIFQV+qxO/1dA9aEJm4KcDij8edETI8H2tbjFCD/P5Oe7bvvckJxt7rBg7enYp4\n\
+         Gb6e+muFAcMqUv7pHlSZ4/lmQC521AAQcYGoSjSWx1NpWDxR57KS5wyMNsiAxTNy\n\
+         zxEG9B4ZmBmzZdwXy+hzRyyQWvWgIvubDXsDKQIDAQABAoIBAAUj5PMlTaA5YycS\n\
+         G9mKNof41DRGSSfFNDou+Iv13eJlklzfL8lqYTaYoX0Ssw8RTqlXZ2rMx9r3pg56\n\
+         5m+Y7+OxaoXDVBclwmIc2xYIIUJ79t9J1HHGFSzj3pzIj70Vzubl5Zfe+akIwDeX\n\
+         UeXOaaeeOQpvkAUUDq0SbyafOEregbJZEzCBzAu3vldkUv1y1gmhryBJfQ1bd5O9\n\
+         YhTNtn3hXjvUBv0XFy39FoQK4IduraCJ+7NNlG4JQ+3HXfd0qzbgO14CTl2qjl76\n\
+         0+IURd4saSm77DJvP4ObnmzsyFHmpeI1Fo9QLFfHM72EE8x1JY4r1DZZDyMfHLG5\n\
+         dNJ1w4ECgYEA7/bf/VnsPNilqE0Up1wcboIrBwMthyPNNCos3ysZsUE+p6kGyOr/\n\
+         eBMx+D70xMdGgKuboIVXZSjsA1dzRssZTyAPDJ6zIxmUUtxDc2yWXeOV39u61isL\n\
+         0KF8BkiampceNGyWSKGAW709fF+xnvfcS2g4mOeOl8pD3VwBg5jsP6MCgYEAzDJK\n\
+         Cx2FaVo2OB8IVyUQqugSp44Mwyc/gp4nbO1d/GOGyh4cWS9AJ8zg4tIvTXkUblmN\n\
+         pMZA3V14PSZXfU1U7BiIt2rZaGQkBqdFgYq270gIs7MAcIGiQgXB49ADzJQt0go3\n\
+         0Rn3s13s5wG9/2gLJFfZZbF378/JD3Sgs/n/7sMCgYEAlVtMqS1KG8kgurNXUp/D\n\
+         VokQbOnucXm4JGrHyRPThv88FzDedznFTqBr7r6IrN33pOirEetMrTseQyowJvUM\n\
+         yLIEi+9PQl6OclCEbxg8My4PP+lMzja2wOFyB5szF1tNwoV/uK9E7FTKK1qIfJB7\n\
+         fjfdWlZt605KlUHJ83XAPg8CgYBjpc74aamnZfy7mnlJfa8KmEIyPmIAAnE93sxC\n\
+         nfuVpUQr8lHHPAXE5niAeC3ZUtMjntQ+qvkQjgKVZNahMVHV/YsKZzw9c1EZZhvH\n\
+         QdhQIQkOGLaIMNrr+T9LW0HfXhiWPaJLiq6Ue6uWeAUuVKnLTIus0tRC1VW7EyEx\n\
+         czjwXQKBgQCgcuwW5jDqhnz6Qw85rh8XUmi3co8pGFU+V7IaXIob+XAFfKfsdQaR\n\
+         2b5kXJ9xANmdBBS/GiZub7jSi53fx5jbGxIF8tUY3wja89gwBMsnH7hMx5/bxNrT\n\
+         epwwDuBS5V/7D36G0qon0nIPUN1PrtwHXwFZud+xbmorR4wf4aOVDg==\n\
+         -----END RSA PRIVATE KEY-----\n";
+
+    /// The exact bytes a real JWT signing input has: the URL-safe unpadded base64 of a
+    /// header and a claim set, joined by a dot.
+    const KNOWN_ANSWER_MESSAGE: &str = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5LWlkIn0.\
+         eyJpc3MiOiJrbm93bi1hbnN3ZXJAdGVzdC5pYW0uZ3NlcnZpY2VhY2NvdW50LmNvbSJ9";
+
+    /// Produced once by `openssl dgst -sha256 -sign key.pem` (OpenSSL 3.0.13) over
+    /// [`KNOWN_ANSWER_MESSAGE`] with [`TEST_PKCS8_PEM`] — an implementation sharing no
+    /// code with the one under test. RSASSA-PKCS1-v1_5 is deterministic, so every
+    /// conforming signer reproduces these exact bytes; a regression in the digest, the
+    /// PKCS#1 padding, or the DER parse fails here instead of surfacing later as a
+    /// token Google refuses without saying why.
+    const KNOWN_ANSWER_SIGNATURE_BASE64: &str = "PrmUy1ghJQIgihroPdxNy2GkSFctkbrm0MvfNhHVG6e9QhcG+JfCeEL+qeuquj38L5fea2a0S9tI\
+         eV8+QG8cA4NQ/syFiPAQklvfcGTQd6sW4PFTT4pyGzJvgy/4Ltwx0bkEkbiqe2heALQcsESxmhMV\
+         mvOrGSKdMu/sKNszP2BTZsPaMcglm9XqnrbCW2K7PkA8pyH3NMFIw1uFHCSzkOdWE1P6EFtMRuKT\
+         b7CzXDZjT3GKMHgpcSPK9k1lQkgJNDilYib2R3vr+jnwDpF52yqdhOSd3lM1ALOOAaDHdNRpEIf8\
+         NSp+5cyd6rcoQJUwQJoUpeG/M+R0zxkFFd8iww==";
+
+    /// A slice of the key's own base64 body, long enough that nothing else on the
+    /// machine contains it. It is what the disk scan looks for.
+    const KEY_MATERIAL_MARKER: &str =
+        "h2gYJ5LvnbLHWBACFrDInFMLZ9T72SDv7zkbFCoIaec6yn3uBFMA4dsVjlmQOADk";
+
+    /// Everything in this library that could put bytes on disk or hand them to another
+    /// program. Reading the ADC credentials file is legitimate and stays permitted;
+    /// writing anything, or spawning anything, is not — that is precisely the shape the
+    /// OpenSSL subprocess had.
+    const FILESYSTEM_AND_SUBPROCESS_TOKENS: &[&str] = &[
+        "Command::new",
+        "std::process",
+        "NamedTempFile",
+        "tempfile::",
+        "fs::write",
+        "File::create",
+        "OpenOptions",
+    ];
+
+    fn test_credentials(private_key: &str) -> ServiceAccountCredentials {
+        ServiceAccountCredentials {
+            private_key_id: Some("test-key-id".to_owned()),
+            private_key: private_key.to_owned(),
+            client_email: "known-answer@test.iam.gserviceaccount.com".to_owned(),
+            token_uri: "https://oauth2.googleapis.com/token".to_owned(),
+        }
+    }
+
+    /// The half of this file that ships. The test module below quotes the banned tokens
+    /// in order to name them, so scanning the whole file would accuse the guard itself.
+    fn library_source() -> &'static str {
+        const MARKER: &str = "\n#[cfg(test)]\nmod tests {";
+        let source = include_str!("lib.rs");
+        let at = source
+            .find(MARKER)
+            .expect("the test module marker must exist, or the scan covers nothing");
+        &source[..at]
+    }
+
+    /// Drops trailing line comments so that prose *about* the ban does not read as a
+    /// violation of it.
+    fn strip_line_comment(line: &str) -> &str {
+        match line.find("//") {
+            Some(at) if !line[..at].contains('"') => &line[..at],
+            _ => line,
+        }
+    }
+
+    /// Top-level entries only, and only small ones: a `NamedTempFile` lands exactly
+    /// there, so this covers the regression without walking the whole filesystem.
+    fn temp_dir_files_leaking_key_material() -> Vec<PathBuf> {
+        let mut leaks = Vec::new();
+        let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+            return leaks;
+        };
+        for entry in entries.flatten() {
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if !metadata.is_file() || metadata.len() > 64 * 1024 {
+                continue;
+            }
+            if let Ok(contents) = fs::read_to_string(entry.path())
+                && contents.contains(KEY_MATERIAL_MARKER)
+            {
+                leaks.push(entry.path());
+            }
+        }
+        leaks
+    }
+
+    #[test]
+    fn rs256_signing_reproduces_the_openssl_known_answer() {
+        let signature = sign_rs256(TEST_PKCS8_PEM, KNOWN_ANSWER_MESSAGE.as_bytes())
+            .expect("the committed PKCS#8 test key must sign");
+
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD.encode(&signature),
+            KNOWN_ANSWER_SIGNATURE_BASE64,
+            "in-process RS256 diverged from the OpenSSL-produced reference signature"
+        );
+        assert_eq!(
+            signature.len(),
+            256,
+            "a 2048-bit modulus must yield a 256-byte signature"
+        );
+    }
+
+    #[test]
+    fn pkcs8_and_pkcs1_armor_of_one_key_sign_identically() {
+        let from_pkcs8 = sign_rs256(TEST_PKCS8_PEM, KNOWN_ANSWER_MESSAGE.as_bytes())
+            .expect("PKCS#8 armor must parse");
+        let from_pkcs1 = sign_rs256(TEST_PKCS1_PEM, KNOWN_ANSWER_MESSAGE.as_bytes())
+            .expect("PKCS#1 armor must parse");
+
+        assert_eq!(
+            from_pkcs8, from_pkcs1,
+            "both armors carry the same key, so both must produce the same signature"
+        );
+    }
+
+    #[test]
+    fn signing_leaves_no_key_material_anywhere_in_the_temp_directory() {
+        assert!(
+            temp_dir_files_leaking_key_material().is_empty(),
+            "the temp directory already held this key before signing; the test cannot \
+             attribute a leak"
+        );
+
+        let assertion = sign_service_account_assertion_at(&test_credentials(TEST_PKCS8_PEM), 1_000)
+            .expect("signing must succeed");
+        assert!(!assertion.value.is_empty());
+
+        let leaks = temp_dir_files_leaking_key_material();
+        assert!(
+            leaks.is_empty(),
+            "signing wrote the private key to disk: {leaks:?}"
+        );
+    }
+
+    #[test]
+    fn the_signing_path_cannot_reach_the_filesystem_or_a_subprocess() {
+        let source = library_source();
+        let mut violations = Vec::new();
+
+        for (index, raw_line) in source.lines().enumerate() {
+            let code = strip_line_comment(raw_line);
+            for token in FILESYSTEM_AND_SUBPROCESS_TOKENS {
+                if code.contains(token) {
+                    violations.push(format!(
+                        "  line {}: {:?} in {}",
+                        index + 1,
+                        token,
+                        code.trim()
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "the shipped half of oc-provider-google can write to disk or spawn a process, \
+             which is how the service-account private key used to leak:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    /// A scanner that cannot fail is not a guard.
+    #[test]
+    fn the_source_scanner_detects_the_violation_it_replaced() {
+        for case in [
+            "let mut child = Command::new(signing_binary).args([\"dgst\"]).spawn()?;",
+            "let key_file = NamedTempFile::new()?;",
+            "use tempfile::NamedTempFile;",
+            "fs::write(path, credentials.private_key.as_bytes())?;",
+            "let file = File::create(path)?;",
+            "use std::process::Stdio;",
+        ] {
+            let code = strip_line_comment(case);
+            assert!(
+                FILESYSTEM_AND_SUBPROCESS_TOKENS
+                    .iter()
+                    .any(|token| code.contains(token)),
+                "the scanner missed a violation in {case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_source_scanner_permits_reading_the_credentials_file() {
+        for case in [
+            "fs::read_to_string(path).map_err(|source| GoogleProviderError::CredentialFileIo {",
+            "// the OpenSSL subprocess this replaced used Command::new and NamedTempFile",
+        ] {
+            let code = strip_line_comment(case);
+            assert!(
+                !FILESYSTEM_AND_SUBPROCESS_TOKENS
+                    .iter()
+                    .any(|token| code.contains(token)),
+                "the scanner falsely accused {case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_assertion_is_a_three_part_jwt_carrying_the_declared_claims() {
+        let assertion = sign_service_account_assertion_at(&test_credentials(TEST_PKCS8_PEM), 1_700)
+            .expect("signing must succeed");
+
+        let segments: Vec<&str> = assertion.value.split('.').collect();
+        assert_eq!(segments.len(), 3, "a JWS compact serialization has 3 parts");
+
+        let decoder = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let header: Value = serde_json::from_slice(
+            &decoder
+                .decode(segments[0])
+                .expect("the header segment must be URL-safe base64"),
+        )
+        .expect("the header must be JSON");
+        let claims: Value = serde_json::from_slice(
+            &decoder
+                .decode(segments[1])
+                .expect("the claims segment must be URL-safe base64"),
+        )
+        .expect("the claims must be JSON");
+
+        assert_eq!(header["alg"], "RS256");
+        assert_eq!(header["typ"], "JWT");
+        assert_eq!(header["kid"], "test-key-id");
+        assert_eq!(claims["iss"], "known-answer@test.iam.gserviceaccount.com");
+        assert_eq!(claims["scope"], CLOUD_PLATFORM_SCOPE);
+        assert_eq!(claims["aud"], "https://oauth2.googleapis.com/token");
+        assert_eq!(claims["iat"], 1_700);
+        assert_eq!(claims["exp"], 1_700 + 3_600);
+        assert_eq!(assertion.token_uri, "https://oauth2.googleapis.com/token");
+
+        let signature = decoder
+            .decode(segments[2])
+            .expect("the signature segment must be URL-safe base64");
+        assert_eq!(
+            signature,
+            sign_rs256(TEST_PKCS8_PEM, segments[0..2].join(".").as_bytes())
+                .expect("re-signing the same input must succeed"),
+            "the third segment must be RS256 over the first two"
+        );
+    }
+
+    #[test]
+    fn a_non_pem_private_key_is_rejected_without_echoing_the_input() {
+        let secret = "not-a-pem-but-still-secret";
+        let error = sign_rs256(secret, b"payload").expect_err("a non-PEM key must be rejected");
+
+        assert!(matches!(
+            error,
+            ServiceAccountSigningError::PrivateKeyNotPem
+        ));
+        let rendered = format!("{error} / {error:?}");
+        assert!(
+            !rendered.contains(secret),
+            "the error rendered the key material it rejected: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_pem_body_is_reported_as_base64_rather_than_as_a_missing_key() {
+        let pem = "-----BEGIN PRIVATE KEY-----\n!!!not base64!!!\n-----END PRIVATE KEY-----\n";
+        let error = sign_rs256(pem, b"payload").expect_err("a corrupt body must be rejected");
+
+        assert!(matches!(
+            error,
+            ServiceAccountSigningError::PrivateKeyBase64(_)
+        ));
+    }
+
+    #[test]
+    fn a_well_formed_pem_that_is_not_an_rsa_key_is_rejected_by_the_parser() {
+        let pem = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+            base64::engine::general_purpose::STANDARD.encode(b"valid base64, invalid DER")
+        );
+        let error = sign_rs256(&pem, b"payload").expect_err("a non-key must be rejected");
+
+        assert!(matches!(
+            error,
+            ServiceAccountSigningError::PrivateKeyRejected(_)
+        ));
     }
 }
