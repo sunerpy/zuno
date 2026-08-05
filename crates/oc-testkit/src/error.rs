@@ -221,6 +221,111 @@ pub enum TestkitError {
         /// Its captured stderr.
         stderr: String,
     },
+
+    /// The committed performance baseline is not valid JSON of the expected schema.
+    #[error("TypeScript baseline {path} is invalid: {source}")]
+    BaselineDecode {
+        /// Artifact that could not be decoded.
+        path: PathBuf,
+        /// JSON syntax or shape failure.
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// A decoded baseline violates a frozen measurement invariant.
+    #[error("TypeScript baseline invariant failed: {detail}")]
+    BaselineInvariant {
+        /// Exact missing or contradictory fact.
+        detail: String,
+    },
+
+    /// The methodology document lost its hash-delimited formula section.
+    #[error("docs/perf-methodology.md must contain one PERF_FORMULAS_START/END section")]
+    MethodologyFormulaSection,
+
+    /// Linux process-tree metadata could not be read.
+    #[error("could not read process-tree data for pid {pid} at {path}: {source}")]
+    ProcessTreeRead {
+        /// Process being enumerated.
+        pid: u32,
+        /// Procfs file or directory.
+        path: PathBuf,
+        /// Kernel filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Linux procfs exposed a malformed PID or RSS number.
+    #[error("invalid process-tree number {value:?} for pid {pid} at {path}: {source}")]
+    ProcessTreeParse {
+        /// Process being enumerated.
+        pid: u32,
+        /// Procfs file containing the value.
+        path: PathBuf,
+        /// Text that was not numeric.
+        value: String,
+        /// Integer parse failure.
+        #[source]
+        source: std::num::ParseIntError,
+    },
+
+    /// Linux procfs omitted a field required for RSS measurement.
+    #[error("invalid process-tree data for pid {pid} at {path}: {detail}")]
+    ProcessTreeFormat {
+        /// Process being measured.
+        pid: u32,
+        /// Procfs file with the missing field.
+        path: PathBuf,
+        /// Specific format defect.
+        detail: String,
+    },
+
+    /// A process disappeared during an otherwise valid process-tree walk.
+    #[error("pid {pid} exited while its RSS was sampled")]
+    ProcessVanished {
+        /// PID that exited.
+        pid: u32,
+    },
+
+    /// The user's real database cannot be copied for W-real.
+    #[error("W-real database is unavailable at {path}: {detail}")]
+    RealDatabaseUnavailable {
+        /// Path resolved by `oc-paths` using the installed release channel.
+        path: PathBuf,
+        /// Actionable reason the baseline cannot proceed.
+        detail: String,
+    },
+
+    /// A required local helper command is unavailable.
+    #[error("required command {command:?} was not found; {remedy}")]
+    HelperCommandNotFound {
+        /// Executable expected on PATH.
+        command: &'static str,
+        /// Concrete installation or build action.
+        remedy: &'static str,
+    },
+
+    /// A local helper command failed while preparing or running a workload.
+    #[error("{program} {} failed with exit {status:?}: {stderr}", args.join(" "))]
+    HelperCommandFailed {
+        /// Program that ran.
+        program: PathBuf,
+        /// Complete argument vector.
+        args: Vec<String>,
+        /// Exit code, or `None` for signal termination.
+        status: Option<i32>,
+        /// Captured diagnostic output.
+        stderr: String,
+    },
+
+    /// A long-running oracle workload failed to start or make expected progress.
+    #[error("TypeScript {workload} workload failed: {detail}")]
+    BaselineRunFailed {
+        /// Stable workload label.
+        workload: &'static str,
+        /// Missing process, provider request, or other exact failure.
+        detail: String,
+    },
 }
 
 /// The harness result type.

@@ -83,6 +83,7 @@ pub mod error;
 pub mod mock_provider;
 pub mod normalize;
 pub mod oracle;
+pub mod perf;
 pub mod run;
 pub mod subject;
 
