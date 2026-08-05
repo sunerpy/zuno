@@ -36,6 +36,7 @@
 //!   `cache.rs` (todo 31), applied to the request before it reaches a provider.
 //! - **SSE framing.** One parser in `sse.rs` (todo 27) serves every family.
 
+pub use crate::event::{FinishReason, Message, Role, StreamEvent};
 use crate::registry::spec::ApiSurface;
 use oc_error::ProviderError;
 use std::pin::Pin;
@@ -133,16 +134,11 @@ impl Capabilities {
 ///
 /// # Scope
 ///
-/// This is deliberately the *narrow* shape: a model id, the surface to invoke it
-/// on, and the turn's text. The full message model — content parts, tool results,
-/// attachments — belongs to the session layer, and the full stream event
-/// vocabulary belongs to `event.rs` and `stream.rs` (todo 28), which also adds
-/// `RetryRollback` and the five-way reasoning model.
-///
-/// They are not redefined here, and this type is not a placeholder for them: it
-/// is what `Provider::stream` needs to have a real signature today, and todo 28
-/// widens it additively. A registry whose only trait method took no arguments and
-/// returned nothing would compile and prove nothing.
+/// This is deliberately the provider-safe shape: a model id, the SDK surface to
+/// invoke, and outbound messages whose block type cannot represent history-only
+/// or unsigned reasoning. Transcript storage remains in `event.rs`; conversion at
+/// that boundary preserves signed and encrypted reasoning while filtering blocks
+/// that must not be replayed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletionRequest {
     /// The model to invoke, named as the provider's own catalog names it.
@@ -177,63 +173,6 @@ impl CompletionRequest {
         self.surface = surface;
         self
     }
-}
-
-/// One message in a request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Message {
-    pub role: Role,
-    pub text: String,
-}
-
-impl Message {
-    /// A message from `role` carrying `text`.
-    #[must_use]
-    pub fn new(role: Role, text: impl Into<String>) -> Self {
-        Self {
-            role,
-            text: text.into(),
-        }
-    }
-}
-
-/// Who produced a message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    System,
-    User,
-    Assistant,
-}
-
-/// One event from a provider's stream.
-///
-/// The intersection of what every bundled SDK family emits, and no more. Todo 28
-/// owns the full vocabulary; this exists so a provider's stream item is a typed
-/// value rather than an untyped blob, and so a fake provider in a test can
-/// actually stream something.
-#[derive(Debug, Clone, PartialEq)]
-pub enum StreamEvent {
-    /// A fragment of the answer.
-    TextDelta(String),
-    /// A fragment of the model's reasoning.
-    ReasoningDelta(String),
-    /// Token accounting, reported once the provider knows it.
-    Usage { input: u64, output: u64 },
-    /// The turn ended.
-    Finish(FinishReason),
-}
-
-/// Why a turn ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FinishReason {
-    /// The model finished its answer.
-    Stop,
-    /// The model hit its output limit mid-answer.
-    Length,
-    /// The model wants tools run before continuing.
-    ToolCalls,
-    /// The model declined to answer.
-    Refusal,
 }
 
 /// Whether a credential exists for a provider key.
