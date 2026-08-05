@@ -1524,7 +1524,12 @@ version = "0.1.0"
 dependencies = [
  "oc-config",
  "oc-error",
+ "oc-paths",
+ "oc-testkit",
+ "serde",
  "serde_json",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
