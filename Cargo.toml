@@ -1,0 +1,207 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+repository = "https://github.com/sunerpy/opencode-rust"
+authors = ["sunerpy <nkuzhangshn@gmail.com>"]
+publish = false
+
+# The central safety guarantee of this workspace. Every crate opts in via
+# `[lints] workspace = true`; a crate that omits that key silently loses the
+# guarantee, so the omission is treated as a review defect.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+
+# ---------------------------------------------------------------------------
+# Shared dependencies.
+#
+# Every third-party version lives here exactly once. Member crates reference
+# them as `dep = { workspace = true }` and NEVER restate a version; a crate that
+# needs extra cargo features adds them additively alongside the inheritance,
+# e.g. `tokio = { workspace = true, features = ["test-util"] }`.
+#
+# This is deliberately the opposite of the reference implementation in
+# `.omo/refs/claw-code/rust/Cargo.toml`, which hoists only `serde_json` and then
+# re-declares `reqwest` and `tokio` five to six times across its crates with
+# divergent feature sets.
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+
+# -- first-party crates (path-only; the workspace is not published) ----------
+oc-acp = { path = "crates/oc-acp" }
+oc-agent = { path = "crates/oc-agent" }
+oc-auth = { path = "crates/oc-auth" }
+oc-catalog = { path = "crates/oc-catalog" }
+oc-cli = { path = "crates/oc-cli" }
+oc-config = { path = "crates/oc-config" }
+oc-db = { path = "crates/oc-db" }
+oc-engine = { path = "crates/oc-engine" }
+oc-error = { path = "crates/oc-error" }
+oc-goal = { path = "crates/oc-goal" }
+oc-llm = { path = "crates/oc-llm" }
+oc-lsp = { path = "crates/oc-lsp" }
+oc-mcp = { path = "crates/oc-mcp" }
+oc-observability = { path = "crates/oc-observability" }
+oc-paths = { path = "crates/oc-paths" }
+oc-permission = { path = "crates/oc-permission" }
+oc-plugin = { path = "crates/oc-plugin" }
+oc-plugin-sdk = { path = "crates/oc-plugin-sdk" }
+oc-provider-anthropic = { path = "crates/oc-provider-anthropic" }
+oc-provider-bedrock = { path = "crates/oc-provider-bedrock" }
+oc-provider-compatible = { path = "crates/oc-provider-compatible" }
+oc-provider-google = { path = "crates/oc-provider-google" }
+oc-provider-openai = { path = "crates/oc-provider-openai" }
+oc-pty = { path = "crates/oc-pty" }
+oc-search = { path = "crates/oc-search" }
+oc-server = { path = "crates/oc-server" }
+oc-snapshot = { path = "crates/oc-snapshot" }
+oc-testkit = { path = "crates/oc-testkit" }
+oc-tool = { path = "crates/oc-tool" }
+oc-tools = { path = "crates/oc-tools" }
+oc-tui = { path = "crates/oc-tui" }
+oc-types = { path = "crates/oc-types" }
+oc-watch = { path = "crates/oc-watch" }
+
+# -- async runtime ----------------------------------------------------------
+async-trait = "0.1.91"
+futures = "0.3.33"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-util = { version = "0.7.19", features = ["io", "codec"] }
+
+# -- HTTP client ------------------------------------------------------------
+# `default-features = false` is mandatory: reqwest's default TLS is native-tls,
+# which links OpenSSL. TLS therefore comes from rustls only.
+#
+# NOTE for todo 91: reqwest 0.13 renamed the 0.12-era `rustls-tls` feature to
+# `rustls`, and that feature selects the `aws-lc-rs` crypto provider, which
+# builds C. See `.omo/notepads/opencode-rust/issues.md` (task 1) — the
+# "no C toolchain in a default build" constraint is not satisfiable by any
+# production-grade Rust TLS stack and is todo 91's call, not a silent default.
+reqwest = { version = "0.13.4", default-features = false, features = [
+  "json",
+  "stream",
+  "rustls",
+  "charset",
+  "http2",
+] }
+url = "2.5.8"
+
+# -- serialization ----------------------------------------------------------
+schemars = "1.2.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+toml = "1.1.4"
+
+# -- errors and diagnostics -------------------------------------------------
+thiserror = "2.0.19"
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+
+# -- CLI --------------------------------------------------------------------
+clap = { version = "4.6.5", features = ["derive", "env"] }
+
+# -- HTTP server ------------------------------------------------------------
+axum = "0.8.9"
+tower = { version = "0.5.3", features = ["util", "timeout"] }
+tower-http = { version = "0.7.0", features = ["fs", "trace", "cors"] }
+
+# -- terminal UI ------------------------------------------------------------
+crossterm = "0.29.0"
+ratatui = { version = "0.30.2", features = ["serde"] }
+
+# -- filesystem, search, watching -------------------------------------------
+dirs = "6.0.0"
+globset = "0.4.20"
+grep-regex = "0.1.14"
+grep-searcher = "0.1.17"
+ignore = "0.4.33"
+notify = "8.2.0"
+walkdir = "2.5.0"
+which = "8.0.5"
+
+# -- primitives -------------------------------------------------------------
+base64 = "0.23.1"
+sha2 = "0.11.0"
+time = { version = "0.3.55", features = [
+  "formatting",
+  "parsing",
+  "macros",
+  "local-offset",
+] }
+uuid = { version = "1.24.0", features = ["v4", "v7", "serde"] }
+
+# -- test-only --------------------------------------------------------------
+insta = { version = "1.48.0", features = ["json", "yaml", "redactions"] }
+proptest = "1.11.0"
+tempfile = "3.27.0"
+wiremock = "0.6.5"
+
+# ---------------------------------------------------------------------------
+# Profiles.
+#
+# `line-tables-only` keeps file/line in panics and backtraces — which is what a
+# long-running agent actually needs from a debug build — while linking far
+# faster than full debuginfo.
+# ---------------------------------------------------------------------------
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+
+# Keep the terminal render stack optimized even in dev and test builds.
+#
+# Every TUI frame walks ratatui buffers cell-by-cell and re-measures visible
+# text with unicode-width / unicode-segmentation / unicode-truncate. At
+# opt-level = 0 those inner loops dominate the frame budget and read as
+# input-line lag while a response streams. These are stable third-party crates
+# that almost never recompile, so pinning them costs one compile and removes the
+# lag. Technique taken from `.omo/refs/jcode/Cargo.toml:340-404`.
+[profile.dev.package.ratatui]
+opt-level = 3
+[profile.test.package.ratatui]
+opt-level = 3
+
+[profile.dev.package.ratatui-core]
+opt-level = 3
+[profile.test.package.ratatui-core]
+opt-level = 3
+
+[profile.dev.package.ratatui-widgets]
+opt-level = 3
+[profile.test.package.ratatui-widgets]
+opt-level = 3
+
+[profile.dev.package.ratatui-crossterm]
+opt-level = 3
+[profile.test.package.ratatui-crossterm]
+opt-level = 3
+
+[profile.dev.package.crossterm]
+opt-level = 3
+[profile.test.package.crossterm]
+opt-level = 3
+
+[profile.dev.package.unicode-width]
+opt-level = 3
+[profile.test.package.unicode-width]
+opt-level = 3
+
+[profile.dev.package.unicode-segmentation]
+opt-level = 3
+[profile.test.package.unicode-segmentation]
+opt-level = 3
+
+[profile.dev.package.unicode-truncate]
+opt-level = 3
+[profile.test.package.unicode-truncate]
+opt-level = 3

@@ -1,0 +1,15 @@
+[package]
+name = "oc-snapshot"
+description = "Workspace snapshots and diffs used for revert and for tool-edit provenance."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

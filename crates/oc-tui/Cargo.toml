@@ -1,0 +1,21 @@
+[package]
+name = "oc-tui"
+description = "Terminal user interface: views, keybindings, themes, and the render loop."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# The render stack is declared here, not deferred to the TUI todo, because the
+# root manifest's dev/test `opt-level = 3` pins are matched against the resolved
+# dependency graph: a pin for a package nothing depends on is a cargo warning,
+# and this workspace treats warnings as failures.
+[dependencies]
+crossterm = { workspace = true }
+ratatui = { workspace = true }
+
+[lints]
+workspace = true

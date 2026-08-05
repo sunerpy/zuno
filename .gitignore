@@ -1,0 +1,15 @@
+/target
+
+# Reference clones of the projects this port draws on (~570 MB). Task 1 copies
+# them here from /tmp so the References lines in .omo/plans stop dangling; they
+# are other people's repositories and must never enter this history.
+.omo/refs/
+
+# Per-task verification transcripts: local proof, not shared source.
+.omo/evidence/
+
+.omo/run-continuation/
+.omo/delegated-runtime/
+
+*.pdb
+.DS_Store

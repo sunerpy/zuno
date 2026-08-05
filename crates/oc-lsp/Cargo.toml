@@ -1,0 +1,15 @@
+[package]
+name = "oc-lsp"
+description = "Language server client pool used for diagnostics and symbol lookup."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

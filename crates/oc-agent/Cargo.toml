@@ -1,0 +1,15 @@
+[package]
+name = "oc-agent"
+description = "Agent definitions, presets, and the sub-agent task boundary."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "oc-provider-openai"
+description = "OpenAI Chat Completions and Responses wire protocols."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

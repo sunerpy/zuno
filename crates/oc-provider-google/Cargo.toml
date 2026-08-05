@@ -1,0 +1,15 @@
+[package]
+name = "oc-provider-google"
+description = "Google Gemini and Vertex AI, including the Vertex-hosted Anthropic publisher."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "oc-cli"
+description = "Command-line entry point and subcommand dispatch."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "opencode-rust"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

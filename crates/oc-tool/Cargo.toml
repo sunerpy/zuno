@@ -1,0 +1,15 @@
+[package]
+name = "oc-tool"
+description = "The tool trait, argument schemas, and the result shape every tool returns."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

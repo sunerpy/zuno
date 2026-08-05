@@ -1,0 +1,15 @@
+[package]
+name = "oc-engine"
+description = "The turn engine: the agent loop, tool dispatch, compaction, retry, and cancellation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
