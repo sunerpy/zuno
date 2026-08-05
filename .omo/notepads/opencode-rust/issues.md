@@ -1871,3 +1871,43 @@ produce the same repair, and the three branches will therefore **conflict on
   request shape (`input` instead of `messages`, typed `response.*` SSE), **that is
   a real gap and belongs to todo 30's crate**, which owns that shape. Nothing in
   the recorded corpus lets me settle it either way, so I did not guess.
+
+## Task 32
+
+- `lsp_diagnostics` could not inspect the mandated `/config/workspace/ProdDir/AI/oc-wt/t32` worktree because the tool enforces the request CWD `/config/workspace/ProdDir/AI/opencode-rust`; both absolute and `../oc-wt/t32` paths were rejected before a language server ran. Compiler diagnostics, `cargo build --workspace`, and `cargo clippy --workspace --all-targets -- -D warnings` were clean. This is the sole unverified tool-specific check.
+- Todo 33 receives malformed tool JSON as `ToolCall { input: Value::String(raw), input_error: Some(...) }`; it must synthesize a model-correctable tool result rather than aborting the loop.
+- Todo 34 currently has one terminal checkpoint write per text/reasoning/tool part. Add delta batching inside the checkpoint/projector seam, not by introducing a streaming-specific loop.
+- Todo 35 must insert compaction at the hydrated-history boundary and recreate/reset the local `PromptCache`; it must preserve tool pairs during boundary selection.
+- Todo 36 must own provider retry budgets. Task 32 forwards raw `RetryRollback` and clears the current accumulator, but performs no retry policy.
+- Todo 37 must enforce one loop per session outside `run_turn`, register the live `InterruptSignal`, and inject soft interrupts only at this loop's safe points.
+- Interfaces in Todos 51-56 and 63-70 must call `event_channel()` and consume `TurnEvent`. They must not invoke providers, dispatch tools, checkpoint messages, or render from inside `oc-engine`.
+- Oracle clarification implemented: `prompt.ts:1103-1129` continues after a provider reports `stop` when tool calls are present. Exit is driven by absence of accumulated calls, not solely by `FinishReason::Stop`.
+
+## Task 37
+- Interface wave must retain `SessionRunGuard` for the exact lifetime of `run_turn` and pass `guard.interrupt_signal()` into `TurnContext`; bypassing `begin_turn` bypasses both the single-loop invariant and registry-routed abort.
+- `loop.rs` is frozen for Task 37 and currently has no soft-interrupt safe-point hook. The registry exposes `take_soft_interrupts_at_safe_point()` and tests its FIFO/urgent policy, but the owner that integrates this seam with the transcript/tool loop must call it at safe points. Actual message persistence inside `run_turn` cannot be added from `status.rs` because `TurnContext` internals and transcript helpers are private; no forbidden spine edit was made.
+- The built-in `lsp_diagnostics` tool rejects git-worktree paths outside the request root. Equivalent `rust-analyzer diagnostics . --severity warning` was run in `/config/workspace/ProdDir/AI/oc-wt/t37` and completed cleanly.
+## Task 36
+- Todo 35 compaction must treat `ProviderError::ContextLimit` as `Recovery::Compact`, not as an unchanged-request retry. After each completed compaction it should call `record_context_limit_retry()` before re-entering the provider request, and call `reset_context_limit_retries()` after a successful provider request.
+- `src/loop.rs` was intentionally not modified. Its current private `TurnEventSender::send` and existing `TurnError` shape mean integration should pass an async emit closure into `retry_provider`; the integrating task must map `RetryError`/`ProviderRetryError` into its typed turn error without string classification.
+- The OpenCode oracle retries retryable API errors without a finite maximum. This conflicts with Todo 36s explicit no-indefinite-retry requirement; the retry module therefore requires a finite policy instead of copying the unbounded schedule.
+- The scoped `lsp_diagnostics` tool rejected sibling-worktree paths as outside its request cwd. `rust-analyzer diagnostics .` was run directly in t36 instead; it reported no diagnostics for the three changed files. Workspace-wide inactive-code weak warnings are pre-existing cfg diagnostics.
+
+
+## Task 34
+
+- Oracle `processor.ts:294-305,499-509` calls `updatePartDelta` for every reasoning/text delta. That conflicts with Todo 34's explicit memory/SQLite performance contract. Rust intentionally preserves incremental visible state while batching SQLite upserts at 4096 dirty bytes; measured 5,000 deltas -> 2 writes.
+- `subtask`, standalone `snapshot`, and `agent` are valid persisted Part variants but have no producing `StreamEvent`. `subtask` belongs to delegation/user input, `agent` to mention/input parsing, and the oracle embeds snapshots in `step-start`/`step-finish` rather than emitting standalone `snapshot`. Todos 35/76/101 must keep these shapes in exhaustive matches even though this projector does not synthesize them.
+- Todo 35 should consume `ProjectionOutcome::needs_compaction` and the `ProjectionEffects` overflow result; Task 34 records the check but deliberately does not implement compaction.
+- Todo 76 should render live text/reasoning from provider events and treat DB updates as batched checkpoints, not assume one database notification per token. Synthetic incomplete-tool errors have `state.status=error`, `state.metadata.synthetic=true`, and retain `state.raw`.
+- Todo 101 FTS must index the final `text`/`reasoning` value from the upserted part and tolerate repeated updates to one part id; it must not expect append-only per-token rows.
+- The current `loop.rs` still owns terminal-only checkpointing and cannot be edited under Todo 34's contract. Integrating `StreamProjector` into the turn spine requires the loop owner to replace that checkpoint path rather than run both projectors, or duplicate terminal parts will result.
+- The provided `lsp_diagnostics` MCP rejected the task worktree as outside its fixed request cwd. Equivalent `rust-analyzer diagnostics .` completed; no diagnostics referenced `oc-engine/src/stream.rs`, `oc-engine/tests/stream.rs`, or `oc-engine/src/lib.rs`. It reported only pre-existing inactive-code weak warnings in other crates.
+
+## Task 33
+
+- Todos 39-43 must continue to call `ToolContext::ask` immediately before observable work with their precise semantic resource. The dispatcher provides a conservative first gate, but Todo 39 still owns workspace-relative/external-directory escalation and Todo 40 still owns tree-sitter extraction of every compound shell resource; matching only the dispatcher's raw `command` is insufficient for those acceptance suites.
+- Todo 44 should construct `ToolRegistryDispatcher` with the final ordered tool vector, merged agent+session rules (session last), runtime approval implementation, engine `background_tool` signal, and MCP discovery status. Do not pre-filter the executable vector; `available_tools()` handles unconditional permission hiding while dispatch verifies the locked per-turn snapshot.
+- Todo 70's explicit batch tool should re-enter dispatch through `ToolContext::for_subcall`; ordinary loop dispatch remains sequential. Parallelism belongs only inside that explicit batch tool, and each subcall must pass the same resolver/schema/permission choke point.
+- A detached task keeps running, but this seam has no background-task registry or later result channel. Any later task-status/result feature must own that handle/result lifecycle instead of changing `loop.rs` or making ordinary calls parallel.
+- `lsp_diagnostics` could not inspect this worktree because the MCP tool is rooted at `/config/workspace/ProdDir/AI/opencode-rust` and rejected `/config/workspace/ProdDir/AI/oc-wt/t33/...` as outside request cwd. This is a harness limitation, not a source diagnostic; `cargo clippy --workspace --all-targets -- -D warnings`, workspace build, and workspace tests all passed.

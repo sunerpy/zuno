@@ -2498,3 +2498,50 @@ carries `PrivateKeyNotPem`, `PrivateKeyBase64(base64::DecodeError)`,
 `Sign(aws_lc_rs::error::Unspecified)` — every variant typed, none carrying a
 free-form `String`, and none able to render key material (a test asserts the
 rejected input does not appear in either `Display` or `Debug`).
+
+## Task 32
+
+### Bounded event transport
+
+`TURN_EVENT_CHANNEL_CAPACITY` is 64. Overflow policy is lossless backpressure: `TurnEventSender::send` awaits capacity. Events are never dropped, coalesced, or buffered without a bound; if the consumer closes, the loop returns typed `TurnError::EventConsumerClosed`.
+
+### Public spine for Todos 33-37 and interfaces
+
+`run_turn(request: RunTurnRequest, context: TurnContext<'_>, events: TurnEventSender) -> Result<TurnOutcome, TurnError>` is the sole turn state machine. `TurnContext` receives SQLite, provider registry, `AgentModelResolver`, `ToolDispatcher`, and `InterruptSignal` by reference. Interfaces construct the bounded channel and consume `TurnEvent`; they do not receive a headless/rendering alternate path.
+
+Todo 33 replaces the `ToolDispatcher` implementation. Todo 34 evolves terminal checkpoint helpers into batched live projection while preserving the surrounding loop. Todo 35 adds compaction decisions at the history boundary and resets/recreates prompt-cache state. Todo 36 handles typed provider errors and `RetryRollback` at the stream boundary. Todo 37 wraps `run_turn` with the one-live-session registry and routes abort/soft interrupt state into the existing signal and safe points.
+
+### Locked tool list
+
+The loop owns one `PromptCache<ToolDefinition>` for the full turn. Each step asks `ToolDispatcher::available_tools`, then `prepare_turn` freezes the first list and permits exactly one changed snapshot when MCP status moves from `Pending` to `Ready`. The frozen definitions are emitted as `ToolSnapshotLocked` and carried into each `DispatchRequest` as `Arc<[ToolDefinition]>`, so dispatch executes against exactly what the model saw.
+
+### Persisted IDs
+
+The caller supplies a database-unique `turn_id`; assistant and part IDs are deterministic functions of `(turn_id, step, call_index)`. That makes the three-run event transcript byte-identical without introducing random IDs into acceptance tests.
+
+## Task 37
+- Chose rejection for a second concurrent prompt: `begin_turn` returns typed `SessionBusy`. Rejection is explicit and cannot silently discard the distinct work supplied by the second caller; the test proves exactly one `Running` and one `Busy` result under a simultaneous race.
+- Soft-interrupt payload reuses `interrupt::SoftInterruptMessage { content, images, urgent, source }` and `SoftInterruptSource::{User,System,BackgroundTask}`. The per-live-turn FIFO is drained only through `take_soft_interrupts_at_safe_point`; any urgent message returns `SkipRemainingTools`, while neither path fires abort.
+- Interface API for Todos 51-56: share one `SessionRunRegistry`; use `status(session_id)` and sorted `active_sessions()` for reporting, `control(session_id).abort()` for stale-safe cancellation, `control(session_id).queue_soft_interrupt(...)` for injection, and retain `begin_turn(session_id)`'s guard for the full `run_turn` lifetime.
+## Task 36
+- Loop-facing API: `retry_provider(policy, operation, emit)` performs real Tokio sleeps; `retry_provider_with_sleep` injects the sleeper for deterministic tests. The operation receives the 1-based attempt number and the emit closure preserves bounded-channel backpressure.
+- `ProviderRetryPolicy` requires a caller-supplied `NonZeroU32` total-attempt limit, making an unbounded provider retry unrepresentable through this API.
+- Retry without provider guidance uses OpenCode oracle backoff: 2 seconds times 2^(failed_attempt-1), capped at 30 seconds. A carried `retry_after` is used unchanged.
+- `StreamEvent::RetryRollback { attempt: next_attempt, max }` is emitted after a retryable failure but before the sleep and before the replayed provider operation. If rollback emission fails, replay is aborted.
+- Provider retries replay the unchanged request. Context-limit recovery and continuation prompts change the request and therefore use the separate per-turn `RecoveryBudgets` counters.
+- Oracle discrepancy: OpenCode `SessionRetry.policy` has no finite attempt ceiling, while this task explicitly forbids indefinite retries. The implementation keeps the oracle delay behavior but enforces a finite caller-supplied policy. Jcode also returned partial/silent completion when incomplete or empty continuation budgets ended; this implementation follows the task contract and returns a typed exhaustion error.
+
+
+## Task 34
+
+- **Batch window:** use a deterministic 4096 dirty-byte size window shared by text and reasoning, plus terminal flushes. A size window is testable without sleeps or scheduler sensitivity and caps 5,000 one-byte deltas at two delta upserts rather than 5,000 transactions.
+- **Tool input parsing:** retain `ToolInputDelta` fragments as raw text and parse exactly once at `ToolUseEnd` (or `MessageEnd` when the provider omits the explicit end). First try strict JSON-object parsing, then a quote-aware trailing-comma repair; non-object or still-invalid input becomes a synthetic error tool part. `finish_incomplete` never treats partial JSON as complete and records an error without panicking.
+- **Rollback cleanliness:** every attempt-scoped persisted part id is tracked. `RetryRollback` deletes those rows before clearing text, reasoning, active/completed tools, usage and dirty-byte state; the retry marker itself remains for observability.
+- **Step finish effects:** projector start captures the pre-step snapshot through `ProjectionEffects`. `MessageEnd` captures the completed snapshot, writes `step-finish`, updates assistant finish/cost/tokens, asks `ProjectionEffects::patch(pre_step_snapshot)` for a patch part, then triggers summary and overflow hooks. This keeps `stream.rs` independent of Todo 35's compaction implementation and avoids modifying the forbidden `loop.rs` spine.
+
+## Task 33
+
+- **Suggestion ranking/cutoff:** ported `.omo/refs/jcode/crates/jcode-app-core/src/tool/mod.rs:404-439,1196-1219`. Compare lowercase names; exact equality scores 0, prefix in either direction scores 1, substring in either direction scores 2, otherwise Levenshtein distance is accepted only when `distance <= max(longer_len / 3, 2)` and scores `3 + distance`. Sort by `(score, tool_name)`, return at most 3. Every miss also includes the complete alphabetically sorted available list. `ToolSerch` produces `Unknown tool: ToolSerch. Did you mean: tool_search? Available tools: bash, tool_search.`
+- **Background grace:** 750 ms, matching `.omo/refs/jcode/crates/jcode-app-core/src/agent/turn_streaming_mpsc.rs:1366-1412`. Dispatch uses a biased select: normal completion wins, then a background signal gets 750 ms for graceful completion before the join handle is detached, while the turn receives a synthesized successful background status; a turn interrupt aborts the task and returns an error result.
+- **Dispatcher wiring:** `ToolRegistryDispatcher::new(tools, merged_rules, approval, background_tool, mcp_status)` receives registry assembly rather than owning it. `available_tools()` applies `oc-permission` visibility and emits definitions. `dispatch()` is the only name-resolution/miss choke point, validates against the augmented definition schema, applies the argument-derived permission ask, constructs `ToolContext`, spawns execution, and converts every tool/join/input/name failure into `ToolDispatchResult`. `loop.rs` remains the owner of sequential iteration and running/completed/error events and was not modified.
+- **Permission resolution:** an unconditional rule allow proceeds; deny synthesizes a denied tool result; ask blocks on the supplied `PermissionAsker` before execution. The per-dispatch context asker re-evaluates later, more precise asks from built-ins and remembers approved `(permission, pattern)` pairs for that call only, preventing a parent grant from laundering unrelated subcalls.

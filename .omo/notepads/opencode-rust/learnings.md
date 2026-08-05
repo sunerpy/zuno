@@ -2627,3 +2627,105 @@ id as canonical-shape evidence and is not counted toward the four.
   `native_finish_reason`, `seed`, and a top-level `text`/`role` on TogetherAI's
   `choices[]`. A `deny_unknown_fields` reader would turn every vendor release into
   an outage.
+
+## Task 32
+
+### Single-loop phase order
+
+- Oracle `prompt.ts:1055-1058`: load the session, clean revert state, persist the user message, then touch the session. `run_turn` receives an already-persisted user message, verifies the session, and touches it before emitting `TurnStarted`.
+- Oracle `prompt.ts:1088-1097`: enter the one loop, mark work active, hydrate/filter history, and find the latest user/assistant/task state. The Rust loop hydrates once per provider step and derives agent/model from the latest stored user message.
+- Oracle `prompt.ts:1100-1129`: a nominal `stop` does not exit while a non-orphaned tool call exists. The Rust loop likewise dispatches and re-enters whenever the completed stream accumulated a tool call, independent of the provider stop reason.
+- Oracle `prompt.ts:1141,1170-1201`: resolve model and agent, then persist the assistant shell before streaming. The Rust order is `AgentResolved` -> `ModelResolved` -> `AssistantMessageCreated`.
+- Oracle `prompt.ts:1226-1241`: resolve tools before request processing. The Rust loop calls `AvailableTools`, passes the definitions through `PromptCache<ToolDefinition>`, freezes the resulting snapshot, and emits `ToolSnapshotLocked`.
+- Oracle `prompt.ts:1255-1286`: convert stored messages, assemble system state, then process the provider stream. The Rust conversion emits provider-safe `RequestContentBlock` values and puts volatile context only at the trailing-message cache boundary.
+- Oracle `prompt.ts:1288-1335`: checkpoint/finalize and either stop or continue. Rust checkpoints the assistant, dispatches tool calls sequentially through one seam, persists each result, emits `StepCompleted`, and re-enters the same loop.
+- Oracle `prompt.ts:1343-1347`: the run-state layer guarantees one live loop per session. Todo 37 must wrap this exact `run_turn`; it must not add a second state machine.
+
+### Event vocabulary
+
+`TurnStarted`, `HistoryRepaired`, `AgentResolved`, `ModelResolved`, `AssistantMessageCreated`, `ToolSnapshotLocked`, `ProviderRequestStarted`, raw provider `Provider { event }`, `AssistantCheckpointed`, `ToolDispatchStarted`, `ToolDispatchCompleted`, `ToolResultAppended`, `StepCompleted`, `TurnCompleted`, and `TurnInterrupted`.
+
+### Tool-result repair
+
+Before every provider request, every stored `tool` part whose state is not terminal (`completed` or `error`) is rewritten to `error` with `[Tool execution was interrupted]` and `metadata.interrupted=true`. Conversion then always places a matching `ToolResult { is_error: true }` after the `ToolUse`; the fake-provider test proves the provider receives the repaired pair and the database contains the repair.
+
+### Duplicate-loop cost observed in jcode
+
+`turn_loops.rs` is 1,193 lines and `turn_streaming_mpsc.rs` is 1,720 lines: 2,913 lines of parallel state machine. The former has the cancel-at-loop-head guard at lines 35-41; the latter has the stream-wait cancel arm at lines 367-391. Keeping two copies made their mid-stream cancel behavior diverge. Task 32 keeps both checks in one function.
+
+## Task 37
+- Oracle single-loop rule: `packages/opencode/src/session/prompt.ts:1343-1347` delegates every prompt loop to `state.ensureRunning(sessionID, ...)`; `run-state.ts:57-68,88-94` keeps one runner per session and reuses it. Rust reproduces the safety boundary with one exclusive `SessionRunGuard`; a second `begin_turn` is rejected.
+- Stale-control lookup semantics: `SessionControl` stores only `session_id` plus the shared registry. `abort()` resolves the current `ActiveSession` at call time and fires that live signal, never a signal captured when the handle was created.
+- Busy state is in-process only. Oracle `packages/opencode/src/session/status.ts:26-48` stores non-idle entries in an instance-local `Map` and deletes them on idle; Rust likewise stores active entries only in `SessionRunRegistry`, with no SQLite persistence.
+- Turn cleanup captures the interrupt epoch and calls `reset_if_epoch(epoch)` after unregistering. This preserves a newer concurrent fire instead of clearing it.
+## Task 36
+- Budgets: `MAX_CONTEXT_LIMIT_RETRIES = 5` bounds repeated compaction when a still-oversized conversation cannot be made to fit; attempts 1..=5 are accepted and attempt 6 returns `RetryError::BudgetExhausted`.
+- Budgets: `MAX_INCOMPLETE_CONTINUATION_ATTEMPTS = 3` prevents repeated length/incomplete stops from continuing forever; attempts 1..=3 are accepted and attempt 4 returns the typed exhaustion error.
+- Budgets: `MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS = 5` prevents an empty response after tools from silently ending a run or looping forever; this is the turn-43 failure that ended a 20-hour run half-done. Attempts 1..=5 are accepted and the sixth observation fails with an error naming `empty-post-tool-continuation attempts`.
+- `ProviderError::retry_after()` wins exactly when present. Without it, retry delay follows the OpenCode oracle: 2s exponential backoff (2s, 4s, 8s, 16s) capped at 30s.
+- `ProviderError::ContextLimit`, `Auth`, `Refused`, and `Fatal` are never replayed as provider retries; decisions use the enum and `is_retryable()`, never rendered text.
+
+
+## Task 34
+
+### Complete StreamEvent -> Part mapping
+
+| Persisted `Part` variant | Producing stream events / lifecycle | Projection behavior |
+|---|---|---|
+| `text` | `TextDelta`; terminal `MessageEnd` or `finish_incomplete` | Accumulates incrementally in memory; upserts at the 4096-byte batch window and once at terminal completion. |
+| `subtask` | None | A delegation/user-input concern, not a provider-stream event; this projector cannot produce it. |
+| `reasoning` | `ReasoningStart`, `ReasoningDelta`, `ReasoningSignatureDelta`, `ReasoningEnd`, `ReasoningDone`; `ProviderReasoningItem` | Incremental reasoning is batched like text; signature/duration are terminal metadata. Provider-native encrypted items become separate reasoning parts carrying provider metadata. |
+| `file` | `GeneratedImage` | Persists the generated image path/mime and provider metadata as a file part. |
+| `tool` | `ToolUseStart` + `ToolInputDelta` + `ToolUseEnd`; `ToolUseSignature`; `ToolResult`; `NativeToolCall`; truncated-stream `finish_incomplete` | Raw input fragments accumulate without parsing. The complete input is parsed once at end; provider results complete/error the same part; truncated/invalid input becomes a synthetic error part. |
+| `step-start` | Projector `start` lifecycle, before the first stream event | Persists the optional pre-step snapshot. |
+| `step-finish` | `MessageEnd` | Persists finish reason, optional completed snapshot, tokens, cache tokens and cost; also updates assistant message accounting. |
+| `snapshot` | None | The oracle embeds snapshot hashes in `step-start`/`step-finish`; no provider stream event produces the standalone legacy/schema variant. |
+| `patch` | `MessageEnd` terminal effects | Diffs the pre-step snapshot and persists hash/files when the patch is non-empty. |
+| `agent` | None | Agent mentions are parsed from user input/configuration, not provider-stream output; this projector cannot produce them. |
+| `retry` | `RetryRollback { attempt, max }` | Deletes all flushed parts from the abandoned attempt, clears accumulators, then persists a retry marker. |
+| `compaction` | `Compaction { trigger, pre_tokens, openai_encrypted_content }` | Persists an auto compaction boundary with overflow and provider metadata. |
+
+Non-part status events are intentionally observed without persistence here: `ConnectionType`, `ConnectionPhase`, `StatusDetail`, `Error`, `SessionId`, and `UpstreamProvider`; Todo 37 owns status projection. `TokenUsage` accumulates accounting consumed by `MessageEnd` rather than creating its own part.
+
+### Measured batching
+
+The `stream_five_thousand_text_deltas_are_batched_below_the_documented_write_bound` test fed 5,000 one-byte `TextDelta` events. Measured `delta_writes=2`; asserted bound `<= 2` (one 4096-byte size-window upsert plus one terminal upsert). The resulting DB state contained one text part with exactly 5,000 bytes.
+
+## Task 33
+
+### Alias resolver (single choke point)
+
+Source shape: `.omo/refs/jcode/crates/jcode-tool-types/src/lib.rs:74-141`; canonical lookup and miss recovery are both in `crates/oc-engine/src/dispatch.rs::ToolRegistryDispatcher::dispatch`. A leading `functions.` namespace is stripped before the table is applied; any other namespace is preserved.
+
+Complete implemented aliases (jcode names are adapted to this plan's opencode wire IDs):
+
+- `communicate` -> `task`
+- `task_runner`, `subagent` -> `task`
+- `launch` -> `open`
+- `shell`, `shell_exec` -> `bash`
+- `read_file`, `file_read` -> `read`
+- `write_file`, `file_write` -> `write`
+- `edit_file`, `file_edit` -> `edit`
+- `file_grep` -> `grep`
+- `skill_manage` -> `skill`
+- `discover_tools` -> `integration_tools`
+- `todoread`, `todo_read`, `todo_write`, `todos`, `todo` -> `todowrite`
+- PascalCase: `Bash` -> `bash`, `Read` -> `read`, `Write` -> `write`, `Edit` -> `edit`, `Grep` -> `grep`, `Agent`/`Task` -> `task`, `Skill` -> `skill`, `WebFetch` -> `webfetch`, `WebSearch` -> `websearch`, `TodoWrite` -> `todowrite`, `ApplyPatch` -> `apply_patch`, `Question` -> `question`, `PlanExit` -> `plan_exit`, `Lsp` -> `lsp`, `Execute` -> `execute`, `ScheduleWakeup` -> `schedule`.
+
+Examples pinned by tests: `Bash` -> `bash`, `functions.bash` -> `bash`, `functions.shell_exec` -> `bash`; `mcp.functions.bash` remains unchanged.
+
+### Permission-pattern derivation
+
+The permission key is always obtained from `oc_permission::visibility::permission_key`, so `edit`/`write`/`apply_patch` share `edit`, and `list_mcp_resources`/`list_mcp_resource_templates`/`read_mcp_resource` share `read`; the dispatcher does not duplicate that alias table. Patterns are derived from arguments as follows:
+
+- `bash`: `command` (Todo 40 must issue subsequent precise asks for each tree-sitter-extracted compound-command resource).
+- `read`, `write`, `edit`: non-empty values from `filePath`, `file_path`, `path`.
+- `apply_patch`: every path following `*** Add File:`, `*** Update File:`, `*** Delete File:`, or `*** Move to:` in `patchText`/`patch_text`/`patch`.
+- `glob`, `grep`: non-empty `pattern`, then `query`.
+- `webfetch`: `url`; `websearch`: `query`.
+- `task`: `subagent_type` or `subagentType`; `skill`: `name`.
+- `read_mcp_resource`: `uri`, `resource_name`, `server`; MCP list tools: `server`.
+- `todowrite`, `question`, `invalid`, `plan_exit`, `lsp`, `execute`: `*`.
+- Other/plugin tools: first all non-empty known resource keys (`path`, `filePath`, `file_path`, `url`, `uri`, `query`, `pattern`, `command`, `name`); if none exist, stable key-sorted canonical JSON with `intent` and `accept_large_output` removed; an otherwise empty object becomes `*`.
+
+Duplicate patterns are removed without changing first-seen order. The original arguments are also placed in permission metadata. `jsonschema = 0.37.1` is exact-pinned and used before permission or execution, so malformed/schema-invalid calls become model-visible error results without running the tool.
