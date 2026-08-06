@@ -3240,3 +3240,163 @@ distinct forgeries.
 - `Pool::transaction` is typed on `DbError`, so a closure that also produces a
   domain error has to collapse it. Doing that in one named helper
   (`into_db_error`) beats sprinkling `map_err` at every call site.
+
+## [2026-08-06] Task 98: character-capped resident memory (`oc-memory`)
+
+Porting `.omo/refs/hermes-agent/tools/memory_tool.py` + `tools/threat_patterns.py`.
+Five things in that reference are load-bearing and non-obvious; four of them are
+traps that fail *silently*.
+
+### 1. The threat-pattern scope taxonomy — and why memory gets the broadest set
+
+`threat_patterns.py:14-24` tags every pattern with a scope, and the scopes NEST:
+
+| scope | count | applied to | implies |
+|---|---|---|---|
+| `all` | 11 | everywhere | `context`, `strict` |
+| `context` | 17 | context files + memory + tool results | `strict` |
+| `strict` | 8 | memory writes + skill installs only | — |
+
+So `scan_for_threats(content, scope="strict")` runs **36** patterns, not 8
+(`:182-201`). Memory writes use `strict` (`memory_tool.py:86-89`) for a reason
+worth carrying: memory enters the system prompt as a *frozen snapshot*, so a
+poisoned entry persists for a whole session and across sessions until removed.
+Aggressive checks are acceptable precisely because the content is user-curated
+and a false positive can be resolved by rewriting the entry. Tool results — web
+pages, GitHub issues, MCP responses — get the *narrower* set, because the user
+did not author them and cannot edit them, so blocking there breaks the session.
+
+Anchoring rule (`:26-32`): patterns anchor on **C2-specific vocabulary or
+unambiguous attack behaviour, never on bossy English**. `you must` alone appears
+all over legitimate `AGENTS.md`, so the pattern is `you\s+must\s+...(register|
+connect|report|beacon)`. The reference removed `praxis` from its C2-framework
+brand list because it is a common word (`:109-114`) — one false positive there
+blocks an entire legitimate file.
+
+### 2. TRAP — the invisible-codepoint check must run BEFORE normalisation
+
+`threat_patterns.py:231-234` spells it out: NFKC normalisation **strips some of
+the 17 invisible codepoints**, so a scanner that normalises first and then looks
+for them reports clean on exactly the input the check exists for. Raw text first,
+fold second. There is no test that catches getting this backwards unless you
+write one specifically (`invisible_codepoint_survives_folding`).
+
+### 3. TRAP — the multi-word filler is bounded on purpose
+
+`_FILLER = r"(?:\w+\s+){0,8}"` (`:55-59`), and the comment records that the
+earlier `(?:\w+\s+)*` "is ambiguous and can backtrack heavily on adversarial
+near-misses". In Python that is a real DoS in a path that runs on every write.
+Rust's `regex` cannot backtrack at all, so the bound stops being what saves you —
+but keep it anyway, because it is also the pattern's *meaning*: "these tokens,
+near each other", not "anywhere in the entry".
+
+### 4. TRAP (Rust-specific) — `RegexSet` over these 36 patterns exceeds the size limit
+
+Eleven of the reference's patterns use bounded repetition (`[^\n]{0,2048}`,
+`[^>]{0,512}`). Rust's `regex` **materialises** a bounded repetition rather than
+counting it, so the *union* blows the default 10 MB program budget:
+
+```
+CompiledTooBig(10485760)
+```
+
+Individually every pattern is small. Fix: compile a `Vec<Regex>` instead of one
+`RegexSet`. That is also better — first-match can short-circuit, and declaration
+order is preserved by construction, which makes a finding reproducible from the
+input alone (the reference intersects Python `set`s at `:234-237`, so *its*
+reported codepoint is unspecified when an entry contains several).
+
+Corollary for the no-`expect`-in-libraries rule: `OnceLock::get_or_init` cannot
+return `Result`, so a fallible regex build has nowhere to put the error. Adding a
+`Threat::ScannerUnavailable(id)` variant makes the scanner **fail closed** —
+content that could not be screened is refused — with no `expect` and no `Result`
+in the hot API. A `#[cfg(test)]` assertion proves the variant is unreachable.
+
+### 5. Drift detection uses TWO structural signals, neither of them mtime
+
+`memory_tool.py:807-856`. Both are *content* signals:
+
+1. **Round-trip mismatch** — parse-then-serialize does not reproduce the file
+   bytes, so rewriting from parsed entries would lose data.
+2. **Entry-size overflow** — a single parsed entry exceeds the *whole store's*
+   cap. Impossible for a tool-written entry, since the cap is checked against the
+   entire store; it means an external writer appended free-form text into what the
+   parser now reads as one entry.
+
+Neither catches a hand edit that KEEPS the §-delimited shape — that needs a
+stamp. See issues.md for why all three now run.
+
+Related, and the same class of bug: `_read_raw_checked` (`:750-770`) distinguishes
+*unreadable* from *empty*, and treats invalid UTF-8 as unreadable. A
+read-modify-write caller that took a failed read for an empty store would rewrite
+the file down to whatever the current batch adds and **wipe every prior entry**.
+`Ok(None)` = absent = clean empty store; existing-but-undecodable = abort.
+
+Also: `_write_file` uses atomic rename, which is *why* no file locking is needed —
+a reader always sees one complete version of the file.
+
+### 6. The anti-thrash rule: success returns usage, failure returns entries
+
+The single most valuable comment in the reference, `memory_tool.py:711-723`:
+
+> We do NOT echo the full entries list here — dumping it invites the model to
+> "find more to fix" and re-issue the same operations (observed thrash: the
+> correct batch on call 1, then 5 redundant repeats). Entries are only shown on
+> the error/over-budget paths, where the model genuinely needs them to decide what
+> to consolidate.
+
+So the rule runs both directions: **success is terminal and minimal** (`success`,
+`done`, `scope`, `usage`, `entry_count`, plus "do not repeat it"), **failure is
+actionable and carries the entries**. Adding the entry list to the success path
+looks like helpfulness and costs five redundant tool calls per write. Encode both
+halves and doc-comment the reason, or a future maintainer will "helpfully" undo
+it. Todo 100's acceptance depends on the failure half; nothing but the comment
+protects the success half.
+
+### 7. Why chars and not tokens, from the reference's own config
+
+`cli-config.yaml.example:691-693`:
+
+```yaml
+# Character limits (~2.75 chars per token, model-independent)
+memory_char_limit: 2200   # ~800 tokens
+user_char_limit: 1375     # ~500 tokens
+```
+
+The token figure is a **comment, not a computation**. A token cap needs a
+tokenizer (dependency), a model id (config), and moves under content already on
+disk when either changes — a store that fit yesterday overflows today with no
+write in between.
+
+Unit choice inside "characters": `chars().count()`, not `len()`. Under a byte cap
+the same instruction in Chinese costs 3× what it costs in English while occupying
+a third of the attention budget it was paying for. `char_count("先读代码再改")`
+is 6; its `len()` is 18.
+
+## Task 102 — FTS5 archival search and `session_search`
+
+- FTS installation is deliberately opt-in through `oc_db::fts::ensure(&mut
+  Connection)`. Keeping the FTS views, virtual tables, and triggers out of
+  `migration::apply` / `schema::up` preserves byte-level parity with databases
+  created by the real OpenCode binary while allowing callers that want archival
+  search to enable it idempotently.
+- Both FTS tables are external-content indexes keyed by `message.rowid`. The
+  source views aggregate final `text`, `reasoning`, `subtask`, and tool-part
+  content for the main index; the trigram source excludes tool parts to avoid
+  paying the roughly 2.6x CJK index cost for machine-heavy output. CJK-script
+  detection selects trigram search; ordinary text uses the `unicode61` index.
+- Sync requires triggers on both `message` and `part`. Part insert/update/delete,
+  moving a part to another message, and message cascade deletion all update the
+  external-content indexes. Compaction does not delete source rows, so archived
+  pre-compaction text remains searchable.
+- `session_search` infers exactly three SQL-only modes: `query` means discovery;
+  `session_id + around_message_id` means anchored scroll; no mode fields means
+  recent-session browse. Invalid combinations are `ToolError::InvalidArgs` and
+  remain model-correctable. Discovery returns a snippet, a +/-5-message window,
+  three-message bookends, and before/after counts.
+- Child/noisy sessions are down-ranked rather than filtered. The regression test
+  proves a root-session hit outranks a child hit while the child remains in the
+  result set, preventing repetitive session classes from monopolizing recall.
+- External-content rowids are not durable across `VACUUM`; callers that compact
+  the database must run `oc_db::fts::rebuild` afterwards so both FTS tables are
+  repopulated from their source views.

@@ -2354,3 +2354,88 @@ Also confirmed the todo-72 boundary is respected: `params.timeout` is carried in
 it — only `hard_ceiling` and the interrupt kill. No test asserts a foreground
 timeout kills anything, so todo 72 can implement promote-to-background without
 contradicting a green suite.
+
+## [2026-08-06] Task 98: the plan's drift signal is weaker than the reference's, so all three now run
+
+**Plan wording** (todo 98): "Detect external drift (mtime+len changed under us)
+and refuse the write".
+
+**Reference** (`memory_tool.py:807-856`) does NOT use mtime or length. It uses two
+*structural* signals: a parse/serialize round-trip mismatch, and any single parsed
+entry exceeding the whole store's cap.
+
+Neither side subsumes the other, and each misses a real writer:
+
+| writer | stamp (mtime+len) | round-trip | entry-overflow |
+|---|---|---|---|
+| hand edit that keeps the §-delimited shape | **caught** | missed | missed |
+| shell append of free-form text | caught | often missed | **caught** |
+| writer that produced odd delimiters | maybe | **caught** | missed |
+| sister process writing a well-formed store | **caught** | missed | missed |
+
+The middle two rows are the reference's cases; the outer two are the plan's. A
+same-size edit inside one filesystem timestamp tick also slips past length alone,
+which is why the stamp is the pair and not either half.
+
+**Resolution: implemented all three** (`error::DriftReason::{Stamp, RoundTrip,
+EntryOverflow}`), structural signals first because a file that cannot survive a
+rewrite is unsafe to rewrite whether or not it changed since load — and naming
+*that* is more useful to whoever has to fix it. One `.bak.<ts>` per detection
+either way. Not a plan defect so much as a plan that specified the signal it could
+see from outside; the reference had two more from inside.
+
+### Divergence, deliberate: drift REFUSES where the reference RELOADS
+
+The reference's `add` path skips the drift guard entirely (`memory_tool.py:414-420`)
+on the argument that "appending never clobbers", and its other paths reload a
+sister session's writes before mutating. This port refuses on any scope for any
+operation, because the rendered block is frozen into a system prompt (todo 99):
+silently adopting a change would make the returned `Usage` describe content the
+caller never saw and cannot reconcile. Recovery is an explicit
+`MemoryStore::reload()`, which is a decision rather than a default. Tested by
+`a_reload_clears_the_drift_and_the_retry_lands`.
+
+### Divergence, forced: no NFKC
+
+The reference normalises to NFKC before matching (`threat_patterns.py:239-245`)
+and is candid that NFKC does not stop cross-script confusables (Cyrillic `а`
+U+0430) — that needs a TR#39 database. Full NFKC in Rust means
+`unicode-normalization` plus its tables: new packages in `Cargo.lock` for a crate
+whose whole point is being dependency-light. `threat::fold` instead implements the
+transformation the reference's own comment names as the purpose (`ｃａｔ` → `cat`,
+`Ａ` → `A`) as an arithmetic range map over U+FF01..=U+FF5E plus the compatibility
+spaces U+3000 / U+00A0. Documented attack covered, documented gap unchanged; what
+is lost is the NFKC long tail (ligatures, circled digits, CJK compatibility
+ideographs), none of which appears in a pattern token.
+
+### Roster: the two floor assertions naming 33 were deliberately NOT bumped
+
+`oc-llm/tests/registry_dependency_direction.rs:32` (`MINIMUM_MEMBERS = 33`) and
+`oc-error/tests/no_anyhow_in_libraries.rs:29-30` (`MINIMUM_CRATES`,
+`MINIMUM_SOURCE_FILES` = 33) both document themselves as **floors, not exact
+counts**, existing to make a mis-pointed directory walk fail loudly instead of
+passing vacuously. 34 >= 33, so both still pass, and both crates are outside todo
+98's edit scope (five sibling agents were live). Tightening them to 34 is
+correct-but-optional and belongs to whoever next touches those crates.
+
+`crates/oc-config/src/schema/tests.rs:738` also asserts `33` — that is the count
+of `docs/` JSON fixtures, unrelated to the crate roster. Correctly left alone.
+
+`scripts/gen-crates.sh` WAS updated (header + roster line). Verified safe: the
+generator skips any crate whose `Cargo.toml` already exists, so re-running it
+after this commit prints `skip oc-memory (already exists)` and reports
+`generated 34 crate skeletons` without clobbering real work. Confirmed by running
+it and checking `git status` was unchanged.
+
+## Task 102
+
+- The `lsp_diagnostics` MCP rejects files under the sibling worktree
+  `/config/workspace/ProdDir/AI/oc-wt/t102` because its request cwd is the main
+  worktree. Equivalent native validation ran as
+  `rust-analyzer diagnostics . --severity warning` from `t102` and completed
+  without surfaced diagnostics. Build, tests, Clippy, rustfmt, and locked offline
+  metadata validation all passed.
+- FTS external-content rows use SQLite `message.rowid`, not the stable message
+  text id. A `VACUUM` may renumber rowids; this is documented and the explicit
+  recovery is `oc_db::fts::rebuild`. Running `VACUUM` without rebuilding can leave
+  stale FTS document ids even though ordinary message reads remain correct.

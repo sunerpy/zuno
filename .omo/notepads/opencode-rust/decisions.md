@@ -3066,3 +3066,158 @@ belong in `DbError` — and four sibling crates depend on `oc-error` being stabl
 this wave. `GoalError` wraps `DbError` with `#[error(transparent)] #[from]` and
 adds the domain failures. `GoalError::is_model_refusal()` tells the goal tool
 (todo 68) whether to hand the text to the model or treat it as internal.
+
+## [2026-08-06] Task 98: `oc-memory` — unit, scopes, patterns, drift, header
+
+### Counting unit: `chars().count()` — Unicode scalar values
+
+Matches what the reference's `len(str)` counts in Python 3, so the 2200 figure
+means the same thing on both sides. Bytes were the alternative and are wrong: the
+cap exists to bound how much *instruction* rides in the system prompt, and under a
+byte cap the same rule written in Chinese costs 3× what it costs in English while
+occupying a third of the attention budget it paid for. `char_count("先读代码再改")`
+= 6, `len()` = 18. One function, `scope::char_count`, so no call site can disagree
+with another about what "2200 chars" means. UTF-16 units were never a candidate —
+they would encode a JS engine's internals into a file format.
+
+Not tokens, ever. See learnings.md §7.
+
+### Two scopes, diverging from the reference's split
+
+| Scope | Path (via `oc-paths`) | Cap |
+|---|---|---|
+| `Scope::Global` | `$CONFIG/memory/MEMORY.md` | **2200** |
+| `Scope::Project` | `<worktree>/.opencode/RULES.md` | **3000** |
+
+The reference splits by *who the note is about* (agent notes vs user profile) —
+right for a personal assistant whose whole context is one user. A coding agent's
+context is one user across many repositories, so the real axes are **habits that
+travel** and **rules that do not**. One store means every repo pays prompt budget
+for every other repo's rules; per-repo habits means relearning them in each new
+checkout.
+
+2200 carried unchanged from `memory_char_limit`: same quantity, notes that load in
+*every* session including repos the note has nothing to do with. 3000 for project
+rules rather than the reference's 1375, because a build command, a test gate, a
+lint policy and a directory convention are each one sentence, and they only ever
+load inside the one repository that pays for them.
+
+Both paths come from `oc_paths::config()` / `PROJECT_CONFIG_DIRECTORY`, never a
+local `XDG_*` read — so an `OPENCODE_CONFIG_DIR` override is honoured for free and
+the store lands beside the TypeScript binary's config. (The reference makes the
+same point from the other direction at `memory_tool.py:50-56`: a *function* not an
+import-time constant, so a profile switch is respected.)
+
+### Threat patterns: all 36 of the `strict` set, three retargeted
+
+Carried the full broadest ruleset (`all` 11 + `context` 17 + `strict` 8), in the
+reference's declaration order, with the reference's verbatim pattern ids so a
+finding traces back to its line. Three retargeted from hermes paths to this
+agent's — same attack class, different filename:
+
+| reference id | here | why |
+|---|---|---|
+| `hermes_env` (`~/.hermes/.env`) | `agent_credential_store` (`auth.json` / `mcp-auth.json`) | this agent's secret store |
+| `hermes_config_mod` (`.hermes/config.yaml`) | `opencode_config_mod` (`opencode.json(c)`, `.opencode/`) | this agent's self-modification target |
+| `env_var_unset_agent` | `OPENCODE` added to the runtime list | same sub-session-bypass behaviour |
+
+Bounded `{0,8}` filler kept (15 occurrences); no unbounded repetition anywhere.
+Invisible-codepoint check runs on RAW text before folding. Compiled as a
+`Vec<Regex>` not a `RegexSet` — see learnings.md §4 for the `CompiledTooBig` reason
+and the `Threat::ScannerUnavailable` fail-closed design that keeps `expect` out of
+the library.
+
+### Drift: three signals, refuse + `.bak.<ts>`, atomic rename
+
+`Stamp` (mtime **and** length, as the plan asked) + `RoundTrip` + `EntryOverflow`
+(both from the reference). Structural signals evaluated first. Rationale and the
+per-writer coverage table are in issues.md.
+
+Two ordering details that are the actual safety:
+- The stamp is read **before** the content. If a writer lands between the two
+  reads, the stamp is then *older* than the content, so the next `apply_batch`
+  sees a differing fresh stamp and refuses. Reading content first gives the
+  opposite, unsafe skew: stale content under a current-looking stamp.
+- Writes are temp-file-then-rename in the destination's own directory. Atomic, so
+  a reader sees one complete version and **no lock is needed** — the reference's
+  reasoning at `memory_tool.py:762-764`.
+
+`.bak.<ts>` uses second resolution like the reference. Two drifts inside one second
+write the same path, which is harmless *because* drift refuses the write: the file
+has not changed between detections, so the second snapshot is the first again.
+
+### `apply_batch` semantics
+
+Cap validated **once, against the final candidate**. Applying operations to a
+clone and measuring only the result is what lets a store sitting on exactly
+2200/2200 accept `[remove, remove, add]` in one call. A per-operation check rejects
+that batch on the add even though the removals ahead of it freed the room —
+`the_add_in_that_batch_would_not_fit_on_its_own` pins that the test is not vacuous.
+
+All-or-nothing: nothing is written unless every operation validates, including the
+final cap check. Locators are short unique substrings, never ids — an id would have
+to survive in the prompt, stay stable across a rewrite, and be re-read correctly,
+three ways to address the wrong note. Ambiguity (≥2 *distinct* matches) is refused
+rather than resolved by position; identical duplicates are not ambiguous. A
+duplicate `add` is idempotent, not a failure — "make sure this is recorded" has
+succeeded when it already is. **No auto-eviction**: a full store fails and the
+error carries the entries.
+
+### The rendered header, verbatim
+
+```
+══════════════════════════════════════════════
+MEMORY (agent notes) [63% — 1,390/2,200 chars]
+══════════════════════════════════════════════
+<entries joined by "\n§\n">
+```
+
+46 `═` above and below (`memory_tool.py:746`), em dash, thousands separators,
+integer-truncated percent clamped to 100. `MEMORY (project rules)` for the other
+scope. Thousands grouping is hand-rolled — `{:,}` has no Rust equivalent and a
+formatting crate for one comma is not a trade worth making.
+
+**An empty store renders `""`.** Not cosmetic: a `0% — 0/2,200 chars` header spends
+prompt space announcing it has nothing to say, and leaves a block for todo 99's
+consistency check to find after the last entry is removed.
+
+### API shaped for todos 99-101, not for this crate
+
+- `apply_batch(&[Operation]) -> Result<Usage>`; `Usage: Display` gives todo 100 the
+  `current/limit` string with no second read.
+- `MemoryError::current_entries()` and `is_consolidation_failure()` are accessors,
+  not just `Display`, so todo 100 can serialize the entries its own way and count
+  the right failures for its circuit breaker.
+- `Scope::label()` is public and stable so todo 99's consistency check can spot a
+  leftover header (the reference exports the same constants at
+  `memory_tool.py:59-65` for exactly that).
+- `Operation::parse(index, action, content, old_text)` so todo 100's
+  model-supplied-JSON path produces the *same* wording for a missing field that
+  `apply_batch` does, instead of deriving its own.
+- `render_block()` is a pure function of the entries, which is what lets todo 99
+  freeze it.
+
+### Verification note
+
+`lsp_diagnostics` could not be used: the LSP tool refuses paths outside the
+request cwd (`/config/workspace/ProdDir/AI/opencode-rust`) and this work is in the
+`oc-wt/t98` worktree. `cargo clippy --workspace --all-targets --offline` at 0
+warnings plus a clean `cargo build --workspace --offline` is the stronger gate and
+was used instead.
+
+## Task 102
+
+- FTS objects are an explicit extension, not a schema migration. This keeps the
+  19-table OpenCode schema oracle unchanged and makes the storage cost opt-in;
+  `ensure` is idempotent and `rebuild` is the maintenance seam.
+- The main `unicode61` index includes tool content for complete lexical recall.
+  The trigram index excludes tool parts, implementing the plan's cost boundary
+  without pretending tool output does not exist. Query script detection, rather
+  than a caller-selected mode, chooses the appropriate index.
+- `SessionSearchTool` owns only a database path and executes SQLite queries. Its
+  public schema has no provider, model, embedding, or external-service parameter,
+  making the zero-LLM property structural rather than a test-only convention.
+- Discovery ranks sessions after grouping message hits and applies a child-session
+  penalty. It never removes the penalized class. Scroll is intentionally separate
+  from FTS and bookends: an exact `(session_id, around_message_id)` anchor returns
+  local context even if the anchor contains no searchable text.
