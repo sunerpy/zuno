@@ -13,9 +13,18 @@ publish.workspace = true
 oc-paths = { workspace = true }
 regex = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
+futures = { workspace = true }
+oc-config = { workspace = true }
+oc-db = { workspace = true }
+oc-engine = { workspace = true }
+oc-error = { workspace = true }
+oc-llm = { workspace = true }
+sha2 = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true }
 
 [lints]
 workspace = true
