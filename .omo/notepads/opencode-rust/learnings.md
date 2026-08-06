@@ -3589,3 +3589,172 @@ limit` asserted after **every** one of the 12,800 pushes, plus the identity
 `assert!(total_written >= 100 MiB)` is the analogue of todo 2's file-count floor.
 Without it, a `yes | head` that silently produced nothing would pass every ceiling
 assertion vacuously. Same for the shell list: `assert!(!shells.is_empty())`.
+
+
+## [2026-08-06] Task 45: MCP stdio is NDJSON, and real-server proof matters
+
+A real `codegraph 0.42.9 serve --mcp` exchange is one UTF-8 JSON value per line. It accepted protocol `2024-11-05`, returned four tools, and a `codegraph_search` call for `task45-no-symbol` completed with `isError: false` and `No results found`. There are no LSP `Content-Length` headers. The live test initializes an isolated project and prints the literal initialize/list/call responses under `--nocapture`; if the binary is unavailable it emits an explicit skip rather than silently replacing the server with a fixture.
+
+The reader must classify every parsed line before touching a waiter. Responses are routed by numeric id through `HashMap<u64, oneshot::Sender<_>>`; notifications are broadcast independently, and an unknown response id is logged and ignored. Tests prove that an interleaved notification and an unknown id cannot consume or desynchronize the real response. A multi-kilobyte UTF-8 result also proves framing is newline-based, not fixed-buffer based.
+
+`notifications/tools/list_changed` triggers a fresh paginated `tools/list` and broadcasts the resulting cache snapshot. Child stderr is drained independently; close/drop kill and reap the child so neither a full stderr pipe nor a zombie can stall the transport.
+
+Validation: package tests 9/9; live codegraph handshake/list/call 1/1; three rounds of six concurrent `cargo test -p oc-mcp stdio --offline` runs 18/18; workspace build, workspace all-target clippy, fmt, and rust-analyzer diagnostics all clean.
+
+## [2026-08-06] Task 71: destructive shell commands need a pre-spawn three-verdict gate
+
+- `shell::analyze_command` is the right assessment boundary: its tree-sitter walk exposes every command in compound statements, subshells, and command substitutions without executing any of them. The risk pass consumes those resources and recursively parses static `eval`, `sh -c`/`bash -lc`, `su -c`, and `find -exec` payloads.
+- The parser intentionally omits some shell expansions from `CommandResource.tokens`; `$HOME` was the concrete case. Protected symbolic targets therefore need a narrow source-level recovery in addition to token analysis. Static shell quoting and backslash concatenation also need normalization: `r'm'`, `r\m`, and `/e''tc` are the same shell words as `rm` and `/etc`.
+- The three outcomes have distinct recovery semantics: safe commands run; bounded or runtime-computed destructive commands reflect and require a substantive `justification`; filesystem root, home, credential stores, system paths, and device nodes are denied permanently. A justification never changes a catastrophic verdict.
+- The gate runs after lexical cwd resolution but before permission prompts, environment hooks, process spawn, explicit background adoption, or foreground timeout promotion. Timeout promotion only adopts an already-started task, so this one pre-spawn insertion covers all shell execution paths.
+- The adversarial matrix now covers compound/subshell commands, shell/eval/su wrappers, `sudo`/`env`/`timeout`/`chroot`, `xargs`, `find -delete`/`-exec`, escaped and concatenated shell words, static brace expansion, globs, dynamic command names and targets, upward traversal, redirects, root/home/credentials/device nodes, and explicit background dispatch.
+
+## [2026-08-06] Task 51: secure HTTP core and bounded event fan-out
+
+- Axum layers apply only to routes already present, and the last layer is outermost. `ServerBuilder` therefore merges every feature router before adding directory selection and adds Basic auth last, so future routes cannot accidentally bypass authentication.
+- Authentication matches the oracle's exact environment semantics: an absent or empty `OPENCODE_SERVER_PASSWORD` disables auth, while `OPENCODE_SERVER_USERNAME` defaults to `opencode` only when absent. `AuthConfig` redacts its password in `Debug`.
+- SDK directory routing is query `directory` first, then `x-opencode-directory`, then the startup directory. Query parsing removes the form-encoding layer before one component decode, which is why `%252Fworkspace` in the query and `%2Fworkspace` in the header both resolve to `/workspace`.
+- Each event subscriber owns a fixed `VecDeque` (default 64). Overflow drops newest events and increments one saturating scalar; after retained events drain, `Delivery::Lagged { dropped }` makes loss observable without allocating per dropped event. Three rounds of six concurrent pressure-test processes passed 18/18.
+- `EventSubscription::recv` creates its `Notify` waiter before checking queue state. This ordering closes the empty-check/await lost-wakeup window while retaining a synchronous bounded publish path.
+
+## [2026-08-06] Task 69: markdown goal projection — breaking the write-then-watch loop
+
+### The self-render loop is the bug this shape ships with, and a stamp is the wrong fix
+
+This module writes `.opencode/goal/<sessionID>.md` **and** consumes watch events
+for it. Its own atomic rename fires a `Change`, so without suppression the first
+render re-ingests forever.
+
+`GoalProjection` retains the **exact bytes** of its last render plus the `Goal`
+they were rendered from, and an ingest that finds the file byte-identical returns
+`Ingest::OwnRender` without touching SQL and without rewriting the file. Three
+things fall out of choosing bytes over `oc-memory`'s mtime+len stamp:
+
+1. **No same-size-within-one-timestamp-tick false negative.** `oc-memory` needs a
+   stamp because it compares against a version it no longer holds; a projection has
+   just *produced* the bytes it is about to compare, so equality is free and exact.
+2. **A save that changed nothing correctly reads as "no edit"** — the user opened
+   the file, saved without typing, and nothing happens. A stamp would see a new
+   mtime and treat it as an edit, then report zero rejections and rewrite the file,
+   which is a visible no-op churn on every editor autosave.
+3. **It is not one-shot.** An ignore-next-event token would be consumed by the
+   first of `oc-watch`'s coalesced events and then let the next one through.
+   Tested: `a_render_does_not_trigger_a_re_ingest` ingests six times.
+
+The subtler half: the **rejection baseline must be the last render, not current
+SQL**. SQL moves on between the render and the user's save — `record_usage`
+changes `tokens_used`, `tokens_remaining` *and* `updated_at_ms` in one statement —
+so diffing the document against live SQL reports three edits the user never made.
+`an_untouched_field_is_not_reported_when_sql_moved_on_since_the_render` is the
+regression test; it fails loudly against the naive version.
+
+### Atomic-rename details that actually mattered
+
+- `with_file_name(format!("{name}.tmp.{nanos}"))`, **not** `with_extension`.
+  `oc-memory` uses `with_extension`, which replaces the existing extension:
+  `ses_1.md` becomes `ses_1.tmp.<nanos>`. Harmless there; here a session id
+  containing a dot would make the temp name collide with a *different* session's
+  document. `with_file_name` appends instead, so the temp path is always distinct
+  from every target.
+- Nanos in the name, so two concurrent renders of the same document cannot land on
+  one temp file and interleave.
+- The rename's error arm removes the temp file, so a failure does not leave litter
+  next to a document a human is going to open.
+- Neither this nor `oc-memory` calls `sync_all`. For a *projection* that is right:
+  the file is derived, a render lost to a power cut is regenerated from SQL on the
+  next material change, and fsyncing on every token-count update buys nothing SQL
+  does not already guarantee.
+
+### Measured: the mutation proof for atomicity is not close
+
+Replacing temp+rename with a direct `fs::write` made
+`the_render_is_atomic_under_a_concurrent_reader` fail with **292,699 of 293,732
+reads observing a partial document**, all of them `0 bytes` — the truncate window.
+Two lessons: a reader that only checked "non-empty" would have caught this one but
+not a torn tail, and 1,000 renders against a spinning reader produces ~294k reads,
+so the test's `>= 50` floor is three orders of magnitude of headroom rather than a
+tight bound.
+
+### `document_path` validated the derived filename, which is exactly backwards
+
+First draft checked `Path::new(&format!("{id}.md")).file_name() == Some(&file)`.
+Appending `.md` turns `..` into `...md`, which is a perfectly legal single
+component — so the check **accepted the one input that most needed refusing** and
+resolved `..` to `/repo/.opencode/goal/...md`. Caught by the hostile-id test on the
+first run. Validate the *input*, never the string you built from it.
+
+## [2026-08-06] Task 100: the `memory` tool — retargeted description, and which `ToolContext` field is a turn
+
+### `ToolContext` has no turn identifier; `session_id` is the only usable key
+
+The reference's circuit breaker is "per turn". `ToolContext`
+(`crates/oc-tool/src/context.rs:169-190`) carries `session_id`, `message_id`,
+`call_id` and `depth`. None of them is a turn, and two of the three are traps:
+
+| field | keying on it | why |
+|---|---|---|
+| `call_id` | never fires | unique per call, so the counter resets every attempt |
+| `message_id` | **never fires, but tests green** | `oc-engine` mints a new assistant message **per step** (`loop.rs:620-624`); a retry costs a step, so the id differs every attempt — yet a test that reuses one id passes |
+| `session_id` | fires correctly | stable across every step of a turn |
+
+`message_id` is the dangerous one: it looks like "the model's current message"
+and it *is* — for one step. The breaker test therefore passes `msg_1..msg_4`
+deliberately, so keying on `message_id` fails it.
+
+The reference never states its key because it does not have to: the counter lives
+on a `MemoryStore` that is "one instance per AIAgent" (`memory_tool.py:148-149`)
+and per-turn-ness comes entirely from an *external* `reset_consolidation_failures()`
+at the turn boundary (`:176-178`). Ported as
+`MemoryTool::reset_for_turn(session_id)`. **It has no caller yet** — wiring the
+engine is outside this todo's crate boundary. Until then the streak still resets on
+the reference's other reset: a **successful write clears it** (`:704-706`), because
+the cap counts a stuck loop, not a lifetime tally. Failure direction of the gap is
+safe: it can trip one turn early, never late.
+
+### The retargeted description (1969 chars, full text in the evidence file)
+
+Structure carried from `memory_tool.py:1152` unchanged: HOW / WHEN / IF FULL /
+TARGETS / SKIP. Two sections diverge, both because this project is a coding agent:
+
+- **TARGETS** — the reference splits by *who the note is about* (`memory` = agent
+  notes, `user` = user profile). Todo 98 split by *where the note applies*
+  (`global` = habits that travel, `project` = one repo's rules). Naming the
+  reference's targets would have advertised a store that does not exist. The clause
+  now also states the *cost* of choosing wrong in both directions ("a repo rule
+  filed globally is paid for in every unrelated session; a travelling habit filed
+  per-project is relearned in every checkout"), because the model has no other way
+  to learn that the two stores have different blast radii.
+- **SKIP** — keeps "task progress, completed-work logs, temporary TODO state" and
+  points them at **both** owners this project has: the goal tools
+  (`get_goal`/`update_goal`, todo 68) and `session_search` (todo 102). The
+  reference names only `session_search` because it has no goal tool.
+
+`target` is the one required field. Everything else is optional, so the model can
+send either shape — see issues.md for why `schemars` forced that.
+
+### Every `///` on a params type is billed on every request, all session
+
+`schemars` copies rustdoc verbatim into the wire schema. A rationale paragraph on
+`MemoryParams` therefore rides alongside the description in **every** request for
+the whole session, and it is written for a maintainer who will never read it there.
+Two consequences now enforced by a test
+(`no_maintainer_rationale_rides_in_the_wire_schema`):
+
+1. Maintainer reasoning goes in `//!` module docs, which do not ship. Where a
+   `#[derive(JsonSchema)]` type needs a note, use a plain `//` comment *above* the
+   doc line — invisible to `schemars`, visible in the source.
+2. Intra-doc links (`` [`Scope`] ``) render **literally** in the schema. A params
+   type's docs must be plain prose.
+
+This applies to every tool in `oc-tools`, not just this one.
+
+### A tool result that carries an error is not a `ToolError`
+
+`dispatch.rs:496-515` maps `Ok(Err(ToolError))` to `ToolDispatchResult::error`,
+which sets `is_error: true` and **replaces the tool's body with a rendered error
+string**. The turn survives either way (`loop.rs:751-790` persists and continues),
+so "don't fail the turn" is not the reason to avoid `Err` — losing the payload is.
+A memory refusal has to carry `usage`, `current/limit` and often the entry list;
+returning `Err` would throw all of that away. So every store refusal, including the
+breaker's terminal one, is `Ok(ToolOutput)` with `success: false`. The only `Err` is
+an unusable call *shape*, where there is genuinely nothing to report about memory.

@@ -3442,3 +3442,224 @@ reading when the clock has not advanced (`AtomicU64::fetch_update`), so two ids
 minted in the same millisecond still sort by creation. That is what `ascending()`
 promises and what lets `list()` reproduce the oracle's `Map` insertion order by
 sorting on the id instead of depending on a `HashMap`'s iteration order.
+
+
+## [2026-08-06] Task 45: MCP stdio transport decisions
+
+- Framing is strict NDJSON: serialize exactly one JSON-RPC object plus `\n`, and parse stdout line by line. `Content-Length` is deliberately unsupported because it is the known non-functional claw-code implementation and not the MCP stdio wire format used by the real server.
+- Concurrent requests allocate monotonically increasing `u64` ids and register `oneshot` senders in a shared map before writing. Only a response carrying that exact id removes its waiter; notifications and unknown ids never do.
+- Initialization uses protocol `2024-11-05`, sends `notifications/initialized`, then obtains the complete tool catalog through cursor pagination. A tools-changed notification refreshes the cache before publishing `ToolsChanged`.
+- The default request timeout is 30 seconds, matching the executable TypeScript oracle rather than its conflicting 5-second schema prose. Configured timeout values are milliseconds and override the default.
+- Child environment order is inherited process environment, then `BUN_BE_BUN=1` only for an `opencode` command, then configured `environment` overrides. Relative `cwd` is resolved lexically against the workspace.
+- Tool ids port the JavaScript UTF-16 sanitizer exactly, including one underscore per non-ASCII UTF-16 code unit, so astral characters become two underscores.
+- Explicit `close` is the normal lifecycle; drop is the safety net. Both ensure the child is killed/reaped and pending requests are failed instead of leaked.
+
+## [2026-08-06] Task 71: deterministic run / reflect / deny policy
+
+- Assessment is a pure synchronous function over command text, `ShellSyntax`, cwd, and a HOME snapshot. It makes no LLM call, filesystem query, environment mutation, or process invocation. This makes one verdict reproducible and safe to run before every dispatch.
+- `Reflect` is represented as `ToolError::InvalidArgs`, because adding a substantive `justification` is a model-correctable resubmission. `Deny` is `ToolError::Failed` with `PermissionDenied` as its source, because identical arguments plus prose must never unlock a catastrophic target.
+- `justification` belongs to `ShellParams`, not a global cross-cutting schema field. It is meaningful only to this gate and adding it to every tool would charge schema tokens on every request for a shell-only recovery path.
+- Protected paths are conservative and explicit: filesystem root; critical system roots and recursive stores; the current user's home; credential stores; selected home configuration/data roots; and `/dev`. `/dev/null`, `/dev/stdout`, `/dev/stderr`, and `/dev/fd/*` are allowed only as redirect sinks, not as destructive-command targets.
+- Every verdict is emitted through `tracing` under target `oc_tools::risk`; nothing writes to stdout. The log happens before shell dispatch observes the outcome, so allowed, reflected, and denied attempts are all auditable.
+
+## [2026-08-06] Task 51: HTTP-core security and overflow policy
+
+- The default listener is `127.0.0.1:0`. Before binding, the configured hostname is resolved once; without a non-empty password, every returned address must be loopback. The selected validated `SocketAddr` is bound directly, avoiding a validate-then-re-resolve DNS race. Resolution failure is an error, never permission to assume locality.
+- Non-loopback binding is a hard startup error only when auth is disabled. The diagnostic names both `--hostname` and `OPENCODE_SERVER_PASSWORD`, making the remedy actionable without printing credentials.
+- Fan-out uses drop-newest per subscriber rather than blocking the engine or evicting retained events. A scalar pending-drop count is delivered after the retained backlog, including when publishing has already stopped. This preserves event order, gives each connection a hard memory ceiling, and isolates one stalled client from every other subscriber.
+- `ServerServices` is the extension seam for later route groups: it owns the one-live-turn registry and `EventFanout<TurnEvent>`. `ServerBuilder::with_routes` is intentionally the only route-extension point before mandatory middleware is finalized.
+- A small `oc-server serve --hostname/--port` binary provides Task 51's executable QA surface. Todos 55-56 remain responsible for integrating the same server builder into the final `opencode-rust` CLI command tree.
+
+## [2026-08-06] Task 69: the goal document's format, its conflict rule, and self-render suppression
+
+### The document format
+
+`.opencode/goal/<sessionID>.md`, or `$XDG_DATA_HOME/opencode/goal/<sessionID>.md`
+when the project is not a repository — the same two-way choice the oracle makes for
+plans (`packages/opencode/src/session/session.ts:331-335`). `document_path`
+validates the **session id** as a single normal path component and refuses
+`../../etc/passwd`, `a/b`, `..`, `.`, `""` and `/absolute`.
+
+Five sections, in this order: `## Objective`, `## State`, `## Budget`,
+`## Checklist`, `## Rejected edits`. Above them an HTML comment stating the
+conflict rule, so a user who opens the file learns it without reading source.
+
+The objective is delimited by `<!-- goal:objective:begin -->` /
+`<!-- goal:objective:end -->` rather than a fenced code block or a heading. HTML
+comments because (a) they render as nothing in every Markdown viewer, so the
+document stays readable, (b) they are unambiguous machine markers, and (c) an
+objective that itself contains a fence or a `##` heading cannot break the parse.
+The region is taken from the **first** opening marker to the **last** closing one,
+so an objective containing the closing marker still round trips — tested.
+
+Everything else is `- \`key\`: value` lines and `- [x] \`key\`: prose` checkboxes.
+`Field` (9 variants) and `Check` (3) are exported with `ALL` arrays, so
+`every_projected_field_and_checkbox_is_guarded` walks the whole matrix rather than
+the fields whoever wrote the test remembered, with a floor assertion so a shrunken
+`ALL` cannot make it pass vacuously.
+
+`parse` returns `None` unless the objective region **and every** field and checkbox
+key is present. That strictness is what makes it usable as the assertion in the
+atomicity test: holding a `Document` proves the reader did not see a partial file.
+
+### The conflict rule
+
+| field | authority |
+|---|---|
+| objective text | **the document** — adopted on the next turn |
+| `status` | **SQL** |
+| `token_budget`, `tokens_used`, `tokens_remaining`, `time_used_seconds` | **SQL** |
+| `session_id`, `goal_id`, `created_at_ms`, `updated_at_ms` | **SQL** |
+| the checklist | **SQL** — a projection, never an input |
+
+Adoption goes through `GoalStore::update_objective`, deliberately **not** around
+it, so todo 67's 4,000-character cap and spill apply to a hand edit exactly as to a
+tool call: a 6,000-character hand-edited objective spills to
+`<spill_dir>/<uuid>/goal-objective.md` and the document then shows the pointer
+sentence, not the raw text. Tested end to end including that the re-render round
+trips as `OwnRender`.
+
+"Adopted on the next turn" means SQL, not a cache in the projection layer: todo
+68's `GoalContinuation::injection` reads `GoalStore::goal`, so writing SQL *is* the
+adoption. `an_edited_objective_is_adopted_and_the_next_turns_injection_carries_it`
+asserts against `injection()` rather than against the store, so the two halves
+cannot drift apart.
+
+An objective edited to whitespace is refused (`GoalError::EmptyObjective`) and
+reported like any other rejection — the one case where the document-authoritative
+field still loses, because an empty objective is a north star pointing nowhere.
+
+### The rejection message, verbatim
+
+```
+- `status` was edited to `complete`, but the status is the system's to set, not the document's; the goal database still says `active`.
+```
+
+Four things, because a user needs all four: what they edited, what they set it to,
+who owns it, and what the value really is. Grouped nouns — "the counters", "the
+timestamps" — because `tokens_remaining is the system's to set` invites the user to
+try `tokens_used` instead.
+
+Singular/plural is carried by `Refusal::SystemOwned { noun, plural }` and built
+only through `Field::owner()`, after the first draft shipped "the counters **is**
+the system's to set". A grammar bug in a tested artifact; the constructor makes it
+unrepresentable.
+
+An unparsable document is preserved at `<name>.bak.<unix-seconds>` (matching
+`oc-memory`'s `.bak.<ts>`) and rebuilt from SQL, with the document naming the
+backup. Second resolution is safe for the same reason it is there: two salvages in
+one second preserve the same bytes.
+
+### Self-render suppression: retained bytes, not a stamp or a token
+
+`GoalProjection` holds the exact bytes of its last render plus the `Goal` behind
+them. Byte-identical file ⇒ `Ingest::OwnRender`, no SQL write, no rewrite. Chosen
+over `oc-memory`'s mtime+len stamp (exact here, since we just produced the bytes)
+and over an ignore-next-event token (coalescing makes one token cover N events).
+Rejections diff against **the last render**, not live SQL, so a turn finishing
+between render and save does not report edits the user never made. Full reasoning
+in learnings.md.
+
+### Where the gitignore recommendation lives
+
+`projection::GITIGNORE_SNIPPET`, a `pub const` carrying `.opencode/goal/` on a line
+of its own plus comment lines explaining itself. No recommended-snippet file exists
+in this repo or the oracle to append to — see issues.md — and inventing one would
+claim a file another todo may own.
+
+### `GoalError::Document { operation, path, source }`
+
+Separate from `GoalError::Spill`: a spill failure means an objective could not be
+*stored*, so the write must fail; a projection failure means the human-readable
+copy is stale while SQL is still correct. `is_model_refusal()` is `false` — a
+filesystem failure is not something the model can rephrase its way out of.
+
+## [2026-08-06] Task 100: `memory` tool response shapes, breaker keying, and the Ok-carrying-error rule
+
+### Three response shapes, and what each deliberately withholds
+
+| shape | `done` | `current_entries` | why |
+|---|---|---|---|
+| success | `true` | **absent** | terminal and minimal. `memory_tool.py:711-723` measured echoing them: the correct batch on call 1, then 5 redundant repeats |
+| refusal | `false` | **present** | consolidating is a judgement about which of two overlapping notes to keep; the model cannot make it blind |
+| breaker terminal | `true` | **absent** | handing the entries over here would argue for exactly the retry this response forbids |
+
+All three carry `scope`, `usage`, `current`, `limit`, `entry_count` — the plan's
+"report current/limit in every response". `usage` is `Usage: Display` from todo 98,
+so the string in a response is the same string in the prompt header and no second
+formatter can disagree. On a refusal the figures are the store's size **before** the
+batch, because nothing was written; they are omitted only when the store could not
+be opened at all, where there is no trustworthy count.
+
+Both halves of the asymmetry are asserted
+(`success_withholds_the_entries_and_failure_hands_them_over`,
+`a_terminal_refusal_still_reports_the_budget_but_not_the_entries`) and mutation-proven.
+Nothing but a test protects the success half; the reference protected it with a comment
+and someone will still "helpfully" add the list back.
+
+### The breaker keys on `session_id`, resets on success, and has an explicit turn hook
+
+`ConsolidationBreaker` is a `Mutex<HashMap<session_id, usize>>`. Keying rationale is
+in learnings.md — the short version is that `call_id` and `message_id` both reset on
+every attempt, and `message_id` does so while still passing a naive test.
+
+Three resets, in the reference's order of reliability:
+1. **A successful write clears the streak** (`memory_tool.py:704-706`). The cap counts
+   a *stuck loop*, not a lifetime tally.
+2. **`reset_for_turn(session_id)`**, the port of `reset_consolidation_failures()`
+   (`:176-178`). No caller yet — the engine wiring is outside this todo's crate
+   boundary. Gap documented on the method and in the evidence file; it fails safe
+   (trips a turn early, never late).
+3. A new session is a new key.
+
+Only sessions with a *pending* streak occupy an entry and both resets evict, so the
+map is bounded by sessions currently mid-consolidation, not by sessions ever seen.
+
+**Only consolidation failures count.** `MemoryError::is_consolidation_failure()`
+(todo 98) gates it: `NoMatch`, `Ambiguous`, `CapExceeded` are worth another attempt;
+a blocked injection pattern, a drifted file or an unreadable store will not resolve by
+merging entries, so they must not spend the budget that protects the reply. An
+unusable call shape does not spend it either. Three tests pin those.
+
+A poisoned `Mutex` recovers via `into_inner()` rather than propagating. The count is
+advisory; panicking out of a memory side effect would take the turn's reply with it,
+which is the exact failure this whole module exists to prevent.
+
+### A breaker trip stays a successful tool result
+
+Every store refusal — including the terminal one — is `Ok(ToolOutput)` with
+`success: false` in the body. The reason is not "an `Err` would fail the turn" (it
+would not; `dispatch.rs:496-515` converts it to an error *result* and `loop.rs`
+continues). The reason is that `ToolDispatchResult::error` **replaces the tool's body
+with a rendered error string**, discarding the usage figures and the entry list the
+model needs. The single `Err` path is `ToolError::InvalidArgs` for an unusable call
+shape, where there is nothing to report about memory and the model must correct the
+call — and it is model-correctable, so it comes back as a tool result anyway.
+
+### Store opened per call, not held
+
+`MemoryTool` holds only `ScopePaths` and the breaker; `MemoryStore::open` runs on
+every call. Todo 98 refuses a write whose file moved underneath it, and that drift
+check is only as good as the freshness of the handle it compares against — a
+long-lived store would compare against a stamp from session start and refuse every
+write after any external edit. Todo 99's frozen-snapshot contract is unaffected:
+`SessionMemory` freezes the *rendered blocks*, so a mid-session write lands on disk
+without moving the prompt, which is what the happy-path QA test asserts end to end.
+
+### `ScopePaths` is the test seam, and it is not new machinery
+
+`Scope::Global` resolves through `oc_paths::config()`, a process-wide cached layout —
+so a test using `Scope::path()` would write the developer's real `MEMORY.md`.
+`ScopePaths::at(global, project)` wraps todo 98's existing
+`MemoryStore::open(scope, path)` escape hatch rather than adding a second override
+mechanism. `ScopePaths::discover(worktree)` is the production constructor. Every test
+in both targets uses `at` with a `TempDir`.
+
+### `MemoryTarget` / `MemoryAction` mirror `oc-memory` rather than deriving on it
+
+`Scope` and `Operation` live in `oc-memory`, which does not depend on `schemars` and
+must not (it is a storage crate; a schema derive there would put a serialization
+concern in the file format's owner). So the wire enums are local, the conversions are
+total `match`es, and `wire_names_cover_every_scope` asserts `Scope::ALL.len() == 2` —
+a third scope in `oc-memory` fails that test instead of silently becoming unreachable
+from the tool.

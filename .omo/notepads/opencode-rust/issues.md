@@ -2868,3 +2868,153 @@ means "already out of the registry", exactly when suppression is correct.
 `GET /pty/:ptyID` paired with `GET /pty/:ptyID/connect` inherits this guarantee. The
 route layer must not reintroduce a gap between reading status and subscribing —
 `tests/exit_events.rs` guards the library, not the HTTP surface.
+
+
+## [2026-08-06] Task 45 oracle disagreement: MCP default timeout
+
+The executable TypeScript path uses `timeout ?? 30_000` in `packages/opencode/src/mcp/index.ts` (runtime construction/request path), while the config schema prose in `packages/core/src/v1/config/mcp.ts` says the default is 5 seconds. The Rust transport follows observable runtime behavior and defaults to 30 seconds; an explicit per-server timeout still wins. This is recorded rather than silently treating the prose as authoritative. A later schema/documentation parity task should reconcile the upstream disagreement.
+
+## [2026-08-06] Task 71: static destructive-command assessment is not confinement
+
+- This gate is deliberately **not a sandbox**. A permitted shell command retains the user's full filesystem, network, credentials, process, and device access. The crate and tool descriptions say this explicitly; a future confinement layer must be a separate named design rather than an inference from this tripwire.
+- Static recognition cannot prove arbitrary program semantics. Examples outside its guarantee include `python -c 'os.remove(...)'`, custom binaries/functions/aliases that delete data, encoded or downloaded scripts, symlink/TOCTOU changes after lexical assessment, and destructive behavior hidden behind an otherwise benign executable. Recognized runtime-computed command names/targets reflect, but the gate cannot classify every general-purpose interpreter or application as destructive without making ordinary shell use unusable.
+- Path normalization is lexical and performs no filesystem probes, glob expansion, canonicalization, or symlink following. That preserves the “assessment executes nothing and has no side effects” contract, but it also means symlink destinations are outside the permanent-path proof.
+- The `lsp_diagnostics` MCP is rooted at the main worktree and rejects files in `/config/workspace/ProdDir/AI/oc-wt/t71` before starting a language server. Task 71 therefore uses `rust-analyzer diagnostics` from the mandated worktree for the equivalent changed-source diagnostic check; the MCP path restriction remains a tooling limitation.
+
+## [2026-08-06] Task 51: remaining integration notes
+
+- The `lsp_diagnostics` MCP is rooted at the main worktree and rejected `/config/workspace/ProdDir/AI/oc-wt/t51` as outside its request cwd. The same rust-analyzer engine was run directly from the task worktree with `rust-analyzer diagnostics . --severity warning`; it completed with no diagnostics for `oc-server`. Workspace build and all-target clippy with `-D warnings` also passed.
+- Basic auth does not provide transport encryption. A password permits a non-loopback bind as required by the plan, but a production deployment must terminate TLS in front of this HTTP listener or keep it on a trusted private transport; otherwise Basic credentials are visible on the wire. TLS ownership is outside Task 51.
+- Task 51 supplies bounded fan-out and the engine forwarding seam, not the SSE endpoint or durable replay. Todo 53 must translate `Delivery::Lagged` into its explicit stream diagnostic and add cursor-based replay without replacing the per-connection queue ceiling.
+
+## [2026-08-06] Task 69: `oc-watch` cannot ignore an event you are about to cause, and its default does not watch the project
+
+Two gaps, both found by trying to satisfy the plan's "watch the file" literally.
+Neither is an `oc-watch` defect; both change where the seam belongs.
+
+### 1. There is no suppression API, so self-render must be solved consumer-side
+
+`oc-watch`'s only filtering is **static and configuration-time**: `extra_ignore`,
+`whitelist`, `gitignore(true)`, the built-in `IGNORED_FOLDERS`/`IGNORED_FILE_GLOBS`,
+and `Filter::is_ignored`. `Filter::invalidate()` clears the gitignore matcher cache
+and is not event suppression. There is no per-event token, no "ignore the next
+change to this path", no generation counter.
+
+For a module that both writes and watches one file that is a real gap — but adding
+one would be wrong. A suppress token races: `oc-watch` coalesces, so one token can
+be consumed by the first of N merged events and let the rest through. Byte
+comparison against the last render has no such window. **Recorded as a resolved
+design question, not a request to change `oc-watch`.**
+
+### 2. `Decision::VcsOnly` is the default, so a watcher built here would be inert
+
+Without `OPENCODE_EXPERIMENTAL_FILEWATCHER` the flag resolution yields
+`Decision::VcsOnly` — the VCS directory only, project directory not watched
+(recorded under todo 50's "`OPENCODE_EXPERIMENTAL_FILEWATCHER` is NOT a master
+switch"). A `Watcher` constructed inside `oc-goal` would therefore be **silently
+inert in the default configuration**, and forcing the flag on from here would
+override a user's explicit choice.
+
+So `oc-goal` builds no watcher. `GoalProjection::ingest_event` takes `oc-watch`'s
+own `FileEvent`, and whoever already runs a `Watcher` routes matching events in.
+One watcher in the workspace, in the crate that owns watching.
+`GoalProjection::matches` and `ingest` are the whole surface a caller needs; the
+tests drive `ingest_event` with hand-built `FileEvent`s, which is deterministic and
+needs no inotify.
+
+### The plan's "add the directory to the recommended gitignore snippet" — no such snippet exists
+
+Searched the workspace: every `.gitignore` hit is either gitignore **parsing**
+(`oc-watch/src/ignore.rs`, `oc-search`, `oc-snapshot/src/store.rs`) or the
+repository's own `.gitignore`. The oracle has none either — its only
+`.gitignore`-writing code is `config.ts:295-312`, which seeds the *config*
+directory's internal ignore file and does not mention `.opencode/plans`.
+
+So there was nothing to append to. Following the prompt's instruction, the
+recommendation lives as `projection::GITIGNORE_SNIPPET` (a `pub const` with its own
+explanatory comment lines) plus a module-docs section saying why it is a constant.
+Whoever adds user documentation or an `init` command should emit the constant
+rather than retyping the path. **Deliberately did not create a snippet file another
+todo may own.**
+
+### Divergence from the plan: `## Rejected edits` is always present, even when empty
+
+The plan says a rejected edit must be visible in the document. Rendering the
+section **only** when non-empty would make its absence ambiguous — a user cannot
+tell "nothing was rejected" from "this build does not report rejections". The
+section always renders, with `_Nothing has been rejected._` when there is nothing
+to say. Costs four lines; makes the guarantee legible.
+
+## [2026-08-06] Task 100: schemars cannot express the dual shape, and a mutation that a test rescaled instead of catching
+
+### `schemars` could NOT express the `operations` XOR bare-fields either/or
+
+The plan requires one tool taking an `operations` array **plus** bare
+`action`/`content`/`old_text` for a lone change, with the schema derived
+(Todo 38 forbids hand-writing it). That is a JSON Schema `oneOf` over sibling
+fields of one struct, and `schemars` 1.2.2 derives no such thing — the derive
+maps a struct to one object schema, and the `oneOf` it *does* emit is for Rust
+enums, which would force the model to send a tagged wrapper the reference does
+not have.
+
+Options considered:
+1. `#[serde(untagged)]` enum of two variants. Produces the `oneOf`, but serde's
+   untagged deserializer reports "data did not match any variant" for **every**
+   malformed call, discarding which field was missing — and that message is the
+   model's only correction signal.
+2. Hand-write the `oneOf`. Forbidden, and it would reintroduce exactly the
+   two-artifacts drift `oc-tool` exists to prevent.
+3. The plan's stated fallback: all-optional fields plus run-time validation.
+
+Took (3). `MemoryParams::operations()` resolves the shape and returns
+`ToolError::InvalidArgs` whose **cause** is `oc-memory`'s own
+`MemoryError::MalformedOperation`, so a missing `content` is worded identically
+whether the tool or `apply_batch` caught it (todo 98 exposed `Operation::parse`
+for precisely this). Four shape errors are covered: neither shape, empty array,
+both shapes, and a per-action missing field.
+
+The reference lands in the same place from the same constraint — its schema
+requires only `target` (`memory_tool.py:1216`) and validates the rest in the
+handler. Documented on the module rather than left to be rediscovered.
+
+`target` is kept **required** even though it could default. Choosing the wrong
+store is the one silently expensive mistake here, and a default hides it.
+
+### A mutation the test rescaled instead of catching — the first (b) attempt PASSED
+
+Mutation (b) is "raise the breaker threshold from 3 to 99, the 4th-attempt test
+must fail". It did **not** fail. The test read
+
+```rust
+for attempt in 1..=MAX_CONSOLIDATION_FAILURES_PER_TURN { ... }
+assert_eq!(fourth["error"], json!(breaker_error(MAX_CONSOLIDATION_FAILURES_PER_TURN + 1)));
+```
+
+so both the loop bound and the expected streak length were derived from the very
+constant under mutation. Raising it moved the goalposts with it and the test
+passed at 99 — a test that cannot fail.
+
+Fixed two ways: the loop and the assertion now use the **literals** `3` and `4`,
+and a separate `the_per_turn_budget_is_the_references_three` pins the constant to
+`memory_tool.py:163`. Both fail under the mutation. The literals carry a comment
+saying why, because every Rust reviewer's instinct is to "clean them up" back into
+the named constant and silently delete the guarantee.
+
+**General rule for this project**: a test asserting a threshold's *behaviour* must
+not read the threshold from the code. Assert the literal, and pin the constant
+separately. Any `for _ in 0..SOME_CONST` in an assertion about `SOME_CONST` is the
+same bug — this file's remaining breaker tests use the constant deliberately and
+only for *setup* (walk the budget down), never as the thing asserted.
+
+### Not disagreements, but plan details worth recording
+
+- The QA failure scenario ("a malformed `old_text` matching two entries is refused
+  with a message naming both") needed **no new code**. `oc-memory`'s
+  `MemoryError::Ambiguous` (`error.rs:110-125`) already names every distinct match
+  with a numbered preview. Surfaced rather than re-worded; a second phrasing would
+  be a second thing to keep in sync. Asserted at both layers.
+- `cargo test -p oc-tools memory` reports **20 passed** in the lib and
+  `0 passed; 5 filtered out` for `tests/memory.rs`, because the filter matches test
+  *names* and the integration tests are named for their behaviour. Reported rather
+  than fixed by stuffing "memory" into five test names to make a filter look better.
+  `--test memory` runs all five, green.
