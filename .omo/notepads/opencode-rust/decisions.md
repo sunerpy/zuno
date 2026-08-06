@@ -3712,3 +3712,139 @@ from the tool.
   `Allow` in this destructive-command gate. Read/exfiltration policy belongs to
   permission policy or confinement; allowing it here is a named boundary, not an
   accidental omission.
+
+## [2026-08-06] Task 46: remote MCP transport and OAuth decisions
+
+- One `protocol.rs` owns response validation, id waiter routing, notification classification, and pending-failure fan-out for stdio and remote transports. Transport modules own framing only: NDJSON, HTTP JSON/SSE, or legacy SSE events.
+- Remote negotiation is Streamable HTTP then legacy SSE. Any non-authentication connection error permits fallback; 401/403 never does. `oauth: false` converts the challenge into `OAuthDisabled`, while absent OAuth config enables automatic discovery.
+- `AuthorizationRequest` is the explicit pause point. Its `Debug` redacts the whole authorization URL because the query contains CSRF state. `finish(code, returned_state)` validates state, exchanges the code with the persisted PKCE verifier, clears transient state only after success, stores tokens, and reconnects.
+- Configured `redirectUri` overrides `callbackPort`; otherwise the callback is `http://127.0.0.1:19876/mcp/oauth/callback`. Configured client id/secret overrides stored DCR information. Dynamic clients are reused only for the exact server URL and only while their secret is unexpired.
+- Refresh occurs before the MCP handshake when stored expiry is within 30 seconds. If the token endpoint omits a replacement refresh token, the existing one is retained.
+- Static remote headers are applied to protocol requests; OAuth credentials are never included in error text or derived `Debug`. Access, refresh, client secret, verifier, and state remain `Secret` at persistence boundaries.
+
+## [2026-08-06] Task 53 — SSE service boundaries
+
+- `EventService` owns persistence and per-session bounded broadcast senders;
+  `events_router` owns HTTP parsing and SSE framing. The split lets non-HTTP
+  producers publish typed events without depending on Axum response types.
+- The service keeps strong sender references so a session stream survives periods
+  with no subscribers. Subscriber capacity is fixed at service construction and a
+  lagged receiver gets one `server.stream.lagged` diagnostic without an SSE id,
+  then disconnects so reconnect cannot replay the diagnostic as domain history.
+- Heartbeats are SSE comments rather than named events, so they keep proxies and
+  clients alive without advancing a durable cursor.
+- Store initialization is lazy and pool-local. This is idempotent for file-backed
+  databases and required for `:memory:` pools, where an independently migrated
+  connection would initialize the wrong database.
+
+## [2026-08-06] Task 63: lean built-in agent roster
+
+**The six-agent mapping from slim's nine.** Slim
+(`.omo/refs/omo-slim/src/config/constants.ts:7-20`) ships `orchestrator` + `explorer,
+librarian, oracle, designer, fixer, observer, council, councillor`:
+
+| slim | here | why |
+| --- | --- | --- |
+| `orchestrator` | `orchestrator` | kept as-is: primary, write-capable, the only `MayDelegate` |
+| `explorer` | `explorer` | kept: internal recon, read-only |
+| `librarian` | `librarian` | kept: the **only** lane with `webfetch`/`websearch` |
+| `oracle` + `observer`(advisory half) | `advisor` | one lane. "Should we do X" and "tell me why this patch is wrong" are the same act — read the code and argue with it — and two names for it made the caller choose between them instead of using either |
+| `fixer` | `worker` | kept, **minus the amnesia** (below) |
+| `observer`(multimodal half) | `looker` | kept, **un-gated** (below) |
+| `designer` | — | dropped. Its whole justification is UI/UX taste (slim spends 0.7 temperature there and nowhere else); this is a terminal agent harness with no UI surface, and a dropped agent is cheaper than one nobody routes to |
+| `council` + `councillor` | — | dropped. Slim prices multi-model consensus at "3x slower … 3x or more cost" in its own prompt (`src/agents/orchestrator.ts:95`). Two agents and a fan-out protocol to obtain disagreement is replaced by one required envelope section — see the temperature note |
+| — | (omo's `prometheus`/`metis`/`momus`, Team Mode) | never adopted. A test (`the_dropped_agents_stay_dropped`) asserts all eleven forbidden names resolve to `None`, so a later todo cannot reintroduce one by accident |
+
+**The amnesiac-worker defect, and how `worker` avoids it.** Slim's `fixer` prompt
+(`src/agents/fixer.ts:15-17`) reads: *"NO external research (no context7, gh_grep) / NO
+spawning subagents … / No multi-step research/planning; minimal execution sequence ok"*.
+Two very different bounds are bundled there. `NO spawning subagents` is the one that
+matters — it is what keeps a delegated lane from becoming a fan-out tree that the depth
+limit alone has to contain. `NO external research` / `no multi-step planning` bound nothing
+dangerous; they just guarantee that any *explore → decide → implement → verify* task
+bounces back through the orchestrator between every phase, so the orchestrator's context
+window absorbs the discovery, the decision, and the verification of work it delegated
+precisely to avoid absorbing. This is deviation (1) recorded in
+`.omo/drafts/opencode-rust.md`. Here the two bounds are separate roster columns —
+`Delegation::NoChildren` and `Research::Allowed` — and `worker` takes one of each. It gets
+`read/glob/grep/lsp/edit/bash/webfetch/websearch/todowrite/skill/execute` and is denied
+`task`; a test asserts each of those individually
+(`the_worker_writes_researches_and_iterates_but_spawns_nothing`).
+
+**`looker` is capability-gated, not opt-in** (deviation (2) in the draft; slim disables its
+multimodal agent by default at `constants.ts:91`). An opt-in context-hygiene feature is one
+nobody opts into, and the cost of the agent merely existing is a paragraph of prompt. So
+`Gate::VisionModel` asks the catalog a question — is any resolved model's `input.image`
+true — and the roster is a *function* of that answer: `roster(vision_available)`. No config
+key participates. Signal is `ModelCapabilities.input.image`, **not** `attachment`; see
+learnings for why that distinction is load-bearing.
+
+**Which agent got the higher temperature: `advisor`, at 0.4.** Everything else sits at 0.1,
+except `looker` at 0.2. The reasoning is the `council` cut. Cutting it removed the only
+place in slim's roster where two *independent* readings of a problem were produced on
+purpose, and the advisor inherits that job through a **required `<alternatives>` section
+demanding at least two options with their costs**. At temperature 0.1 a model collapses
+onto the single most probable reading and writes two alternatives that are one alternative
+in different words — exactly the failure council existed to prevent. 0.4 buys enough
+divergence to surface a genuinely second option and stays well short of the 0.7 slim spends
+on prose taste, where review output starts asserting facts about code it did not read.
+`looker`'s 0.2 is a smaller claim: at 0.1 image descriptions collapse into clipped
+templated phrases and lose the detail the caller delegated for. Tests pin both — one
+asserting `advisor` is the *only* lean agent above 0.2, and a range assertion
+(`0.0..=1.0` for all, `0.1..=0.5` for the non-internals) so a typo like `10.0` cannot pass.
+
+**Are the internals exempt from the table requirements? Partially, and the exemption is
+encoded in the table rather than in the test.** Two of the four columns cannot be
+meaningfully filled for an engine-invoked agent: a *delegation* boundary for something no
+caller can delegate to, and an *output envelope* for output the engine consumes raw (a
+title string, a compacted transcript). So the field types carry the exemption as data:
+`Boundary::NotDelegable { reason }` and `OutputContract::EnginePrompt { prompt }`. The
+table test then closes it from three sides: `NotDelegable`/`EnginePrompt` are accepted only
+when `role == Role::Internal`, only when the name appears in `INTERNAL_NAMES` (a list fixed
+by upstream's hidden natives, not by this roster), and the `reason`/`prompt` must itself be
+substantial (≥40 chars / >200 bytes). The other two columns are **not** exempt: every
+internal declares a temperature and a deny-by-default set like everyone else. Net effect —
+a seventh *subagent* cannot borrow the exemption, and adding one with an empty boundary
+fails `every_agent_states_every_column` (demonstrated for real; output in
+`.omo/evidence/task-63-opencode-rust.txt` §8).
+
+**`plan` is not reproduced in `oc-agent`'s roster.** It is the fourth upstream native this
+roster does not carry, and unlike `build`/`general`/`explore` it is not *replaced* by
+anything: `orchestrator` is write-capable, so it cannot be plan mode. The argument for
+leaving it out is that `plan` is a visible primary *mode* whose entire content is a
+permission overlay over a primary agent, and `oc_catalog::agent::builtin::plan` already
+carries exactly that (including the overlay, marked partial pending runtime paths).
+Duplicating it here would put two roster entries under one name. The cost is stated and
+tested rather than hidden: every entry in `oc-agent`'s roster denies `plan_exit`, and
+`plan_mode_is_not_reproduced_and_no_agent_can_leave_it` asserts both that `get("plan")` is
+`None` here and that the catalog still has it — so whichever later todo makes this roster
+the sole source of agents fails that test and has to add plan mode deliberately.
+
+## [2026-08-06] Task 70 — execute scheduling and registry re-entry
+
+- `execute` re-enters `ToolRegistry::execute` through a weak registry handle instead
+  of calling tools directly. This preserves aliases, permission checks, context, and
+  future registry policy in one seam without creating a strong-reference cycle.
+- The hard limit applies after `$each` expansion, because expanded calls are the
+  actual resource cost. A request that expands beyond 10 is rejected before dispatch.
+- Failed siblings remain result records rather than cancelling the batch; dependency
+  failures affect only calls whose bindings cannot be resolved.
+
+**Deny-by-default is stronger here than slim's.** Beyond porting the `'*': deny` +
+explicit-denies + explicit-allows redundancy from `permissions.ts:13-30`, every agent must
+give **every** governed tool an explicit verdict: `denied ∪ allowed == GOVERNED_TOOL_IDS`,
+asserted per agent. Adding a tool id to the governed list therefore forces all nine agents
+to state a position on it, instead of the new tool quietly landing in whichever bucket the
+catch-all happens to put it in.
+
+**API shape for todos 64-69.** `builtin::roster(vision_available) -> Vec<Agent>` is the
+entry point; `lean()` / `internals()` / `delegable()` / `get(name, vision)` narrow it.
+Todo 64 (`model_policy.rs`): `Agent` deliberately has **no model or variant field** — there
+is nothing to default to unset because the concept is absent from the roster, and
+`no_agent_names_a_model` scans every rendered string (description, boundary, envelope,
+`agent list` line) for model-shaped tokens, so 64's own grep-test has a working scanner to
+reuse. Todo 65 (`task.rs`): `delegable()` is the valid `subagent_type` set and already
+excludes the orchestrator and the internals; `Delegation::MayDelegate` identifies the
+coordinator to reject as a target. Todo 66 (`continuation.rs`): `Role`/`AgentMode`/`hidden`
+are what a job board renders, and `Agent::summary_line()` / `render_list()` are the
+`agent list` rendering the CLI todo can call without re-deciding the wording.

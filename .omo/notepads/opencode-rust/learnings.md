@@ -3776,3 +3776,102 @@ an unusable call *shape*, where there is genuinely nothing to report about memor
 - The task prose says 39 built-ins, but the pinned `server.ts` exports 38 `Info`
   values and `BUILTIN_SERVER_IDS` also contains 38. The registry test compares the
   entire ordered id vector to the schema constant, avoiding a stale magic count.
+
+## [2026-08-06] Task 46: remote MCP needs both HTTP response shapes and a real fallback proof
+
+- Streamable HTTP does not imply one response content type. The live AWS endpoint returned ordinary JSON and negotiated protocol `2025-03-26`; the live Microsoft endpoint returned SSE and negotiated `2024-11-05`. The same POST path must therefore dispatch by `Content-Type` and route either shape through the same JSON-RPC waiter map.
+- Transport order is observable behavior: POST Streamable HTTP first, then GET legacy SSE only after a non-auth failure. A 401/403 stops fallback and starts OAuth, because trying the second transport would duplicate discovery and can overwrite pending authorization state.
+- Legacy SSE cannot POST until its `endpoint` event arrives. The source reader starts only after the request waiter is registered, which prevents an immediately buffered `message` event from racing ahead of its id.
+- OAuth is a state machine, not a bearer-header toggle: protected-resource discovery selects the authorization server; metadata supplies authorize/token/register endpoints; DCR supplies a client when config does not; PKCE verifier and CSRF state persist before returning the browser URL; code or refresh exchange writes tokens through `McpAuthStore` at `0600`.
+- The configured live file is JSONC and currently contains fields the Task 46 schema does not accept globally. The live test strips JSONC and decodes only the two `mcp` entries it owns, so unrelated future config fields cannot turn a reachable transport proof into a schema-validation skip.
+
+## [2026-08-06] Task 53 — durable SSE replay and live fan-out
+
+- A reconnect-safe stream must subscribe before taking its replay snapshot. The
+  snapshot's sequence boundary then suppresses live events at or below that
+  boundary, closing both the replay/live gap and duplicate window.
+- SSE cursors are session-bound (`<session>:<sequence>`). Parsing with the final
+  colon keeps the session portion opaque, and rejecting a cursor from another
+  session prevents cross-session replay.
+- Reusing `event`/`event_sequence` needs a separate aggregate namespace:
+  `sse:<session>`. Using the bare session id would couple SSE cursor allocation to
+  unrelated domain events already persisted for that session.
+- SQLite `:memory:` is connection-local. Migrating a standalone connection and
+  then opening a pool creates two different databases; migration must run through
+  the exact pool used by the service. A failing-first test and live curl both
+  caught this despite the workspace build being green.
+
+## [2026-08-06] Task 63: lean built-in agent roster
+
+**opencode's real native set is seven, not three, and only three of them are internals.**
+`packages/opencode/src/agent/agent.ts:140-265` declares `build, plan, general, explore,
+compaction, title, summary` — already ported as data in `oc_catalog::agent::builtin`
+(todo 13/18). Sorting them by *who invokes them*:
+
+| native | invoked by | what is lost if absent | lean roster |
+| --- | --- | --- | --- |
+| `build` | the user | the primary write-capable turn | replaced by `orchestrator` |
+| `plan` | the user (a mode) | a primary agent that cannot edit; the only home for `plan_exit` | **left to the catalog's natives** (see decisions) |
+| `general` | a `task` call | a bounded executor | replaced by `worker` |
+| `explore` | a `task` call | fast repo recon | replaced by `explorer` |
+| `compaction` | the engine, on overflow | auto-compaction — nothing else provides it | **carried** |
+| `title` | the engine, after turn 1 | readable session lists | **carried** (temp 0.5 is upstream's, `agent.ts:239`) |
+| `summary` | the engine, on resume | session summaries | **carried** |
+
+The three carried ones share a signature that identifies an internal mechanically:
+`hidden: true` + a prompt + `{"*": "deny"}`. `oc-agent` carries them **by reference** —
+`internal()` calls `oc_catalog::agent::builtin::get(name)` and reuses `native.prompt`,
+`native.mode`, `native.hidden`, `native.temperature` — so the upstream prompt text
+(`prompt/*.txt`, md5-verified at import by todo 13) still lives in exactly one crate.
+A test asserts the reused prompt is the catalog's pointer, not a copy.
+
+**Capability type used for vision detection: `oc_llm::catalog::resolved::ModelCapabilities`,
+field `input.image`** (a `ModalityFlags` bool, populated from models.dev's
+`modalities.input` at `oc-llm/src/catalog/merge.rs:194`). Do **not** use the sibling
+`attachment` flag: the pinned fixture
+(`oc-llm/tests/fixtures/models-dev-pinned.json:145,160`) contains models with
+`attachment: true` whose only input modality is `text`, so `attachment` over-reports and
+would put `looker` in the roster for a model that errors on an image. There is a test
+pinning that distinction (`attachment_support_alone_does_not_make_a_model_vision_capable`).
+Note `ModalityFlags::default()` is text-on/everything-else-off, and
+`merge.rs:972-989` shows a config declaring `["image"]` turns **text off** — the flags are
+independent, not additive.
+
+**`oc_permission::visibility::permission_key` collapses aliases before any lookup**, so a
+permission set is not a tool list. `edit`/`write`/`apply_patch` all key to `edit`, and
+`is_tool_hidden("write", rules)` looks for rules whose `permission` wildcard-matches
+`"edit"` — a rule literally keyed `"write"` never matches anything. Also: `evaluate` and
+`is_tool_hidden` both take the **last** matching rule, so a deny-by-default set must emit
+`{"*","*",Deny}` first and its allows last. Emitting them the other way round yields a set
+that reads as an allow-list and behaves as deny-all; there is a test asserting allow
+positions are all greater than the wildcard's index.
+
+## [2026-08-06] Task 57 — plugin contract and ordered hook bus
+
+- Count only property signatures directly inside `interface Hooks`: there are 21.
+  Regex-counting every `?:` also counts nested optional fields and callback parameters,
+  which produced the stale 24. `HookName::ALL` is now an executable ordered oracle.
+- `tool`, `auth`, and `provider` are resources, not `(input, output)` callbacks. The bus
+  gathers them through dedicated trait methods while still exposing them as typed
+  `HookInvocation` variants, so one exhaustive table covers the full interface without
+  pretending resource maps are functions.
+- Auth prompt validators, deprecated conditions, loaders, authorizers, and OAuth
+  callbacks are live function handles. They are represented by `Arc<dyn ...>` callback
+  traits rather than serialized data, preserving the resident-runtime requirement of
+  Task 60.
+- Mutation order is observable behavior. `HookBus` stores plugins exactly in supplied
+  configuration order and awaits each callback before invoking the next; the test uses
+  add-then-multiply on one temperature so concurrent or reversed dispatch cannot pass.
+- Relative plugin specs must be resolved before config layers lose provenance. Auto
+  discovery scans `plugin/` then `plugins/`, sorts entries within each directory, includes
+  dotfiles and symlinks, and preserves the supplied config-directory order.
+
+## [2026-08-06] Task 70 — execute composition
+
+- Binding must consume structured metadata, not scrape rendered tool text. Adding
+  unique `grep.metadata.files` made `$each` fan-out stable and machine-readable.
+- Deterministic output and concurrent execution are compatible: submit ready calls
+  concurrently, retain their declaration indices, then sort completed records only
+  at the rendering boundary.
+- Recursion protection belongs after alias normalization. Guarding only the literal
+  `execute` spelling leaves aliases as a trivial bypass.

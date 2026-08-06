@@ -3119,3 +3119,101 @@ test fail at the warning-kind assertion, then restored.
    `cargo test --workspace`. A flake there randomly blocks merges and trains the next
    reader to re-run until green, which is exactly how a real regression gets waved
    through.
+
+## [2026-08-06] Task 46 oracle disagreement: MCP token expiry units
+
+`oc-auth::Tokens::expires_at` currently documents milliseconds and its Task 24 fixture uses millisecond-sized values. The executable OAuth provider in `packages/opencode/src/mcp/oauth-provider.ts:96-120`, however, computes and consumes the field in Unix seconds: `Date.now() / 1000 + expires_in`, then subtracts `Date.now() / 1000` when rebuilding `expires_in`.
+
+Task 46 follows the executable OAuth path and stores Unix seconds, which is required for refresh to occur at the correct time. A later credential-schema cleanup should correct the `oc-auth` docs and old fixture values; changing that crate was outside Task 46's `oc-mcp` scope.
+
+## [2026-08-06] Task 53 verification limitation
+
+The `lsp_diagnostics` MCP is rooted at the main request cwd and rejects the linked
+worktree path `/config/workspace/ProdDir/AI/oc-wt/t53`. No source diagnostic was
+silently skipped: `cargo test -p oc-server`, Clippy with `-D warnings`, and
+`cargo build --workspace` all passed after the final change. This is the same
+tool-root limitation previously observed by Tasks 12, 27, 28, and 31.
+
+## [2026-08-06] Task 63: lean built-in agent roster
+
+**1. Four of slim's permission ids do not exist in this project, and one of upstream's
+does not either.** `.omo/refs/omo-slim/src/agents/permissions.ts:13-30` names
+`ast_grep_replace`, `ast_grep_search`, `codesearch`, and `list`; none are in
+`oc-tools/src/registry.rs:52-68`. Dropped. Separately, **upstream itself ships two dead
+permission keys in this port**: `oc_catalog::agent::builtin`'s `explore` overlay allows
+`list` and its `build` overlay allows `plan_enter` (faithful ports of `agent.ts:203` and
+`:147`), but neither `list` nor `plan_enter` is a registered tool here — `BUILTIN_ORDER`
+has 17 slots and includes neither. Harmless (an allow for a nonexistent tool is a no-op),
+but a later todo reconciling agent permissions against the registry should expect them.
+
+**2. `write` and `apply_patch` cannot be denied by name.** Slim's deliberate redundancy —
+`'*': deny` plus explicit `edit`/`write`/`apply_patch` denies — is only expressible for
+`edit` here, because `permission_key` collapses the three before matching. `oc-agent`'s
+`GOVERNED_TOOL_IDS` therefore omits `write`, `apply_patch`, and `invalid`, and a test
+asserts every id a permission set names satisfies `permission_key(id) == id`, so a future
+edit that adds `"write": deny` fails rather than shipping dead config.
+
+**3. `GOVERNED_TOOL_IDS` duplicates the registry's wire ids, on purpose.** Todo 65 puts
+the `task` tool in `oc-tools`, so the edge is `oc-tools -> oc-agent`; importing
+`oc_tools::registry::BUILTIN_ORDER` here (even as a dev-dependency for the "do these ids
+exist" check) would make the pair mutually dependent. **The cross-crate assertion that
+`GOVERNED_TOOL_IDS ⊆ BUILTIN_ORDER.map(wire_id)` is unwritten and belongs in `oc-tools`
+(todo 65), where both crates are already visible.** Until then a registry rename is caught
+by nothing.
+
+**4. A `'*': deny` base hides MCP and plugin tools, including from the primary agent.**
+The plan requires a deny-by-default set for *every* agent, but MCP tools arrive with
+server-derived ids (`oc-mcp/src/stdio.rs:984` builds `{server}_{tool}`) that no static
+allow-list can name, so under `is_tool_hidden` they would be invisible to the orchestrator
+— i.e. configuring an MCP server would have no effect on the primary agent. Resolved
+without weakening the default: `ExtensionTools::{Inherit,Excluded}` is a required roster
+column, the orchestrator is the only `Inherit`, and
+`Agent::rules_with_extension_tools(ids)` appends an explicit allow per assembled id. **The
+wiring is not done** — nothing calls it yet, because no crate depends on `oc-agent`. Todo
+65 or the registry-assembly path must call it, or the primary agent ships blind to MCP.
+
+**5. Plan disagreement (minor, resolved by reading the source as instructed).** Todo 63
+names the required internals as "`compaction`, `title`, `summary`" and that is right, but
+upstream has *seven* natives; `plan` is a fourth that this roster does not reproduce. See
+decisions.md — the consequence is that `plan_exit` is denied by every entry in `oc-agent`'s
+roster and plan mode continues to come from `oc_catalog::agent::builtin`. A test
+(`plan_mode_is_not_reproduced_and_no_agent_can_leave_it`) pins both halves so a later todo
+that promotes `oc-agent` to the sole source of agents trips over it instead of silently
+losing plan mode.
+
+**6. The plan requires a declared temperature for every agent; upstream declares one for
+only one internal.** `compaction` and `summary` have no upstream temperature (provider
+default). Satisfying the criterion means choosing values upstream did not: both take 0.1.
+Deliberate, argued in decisions.md, and a behaviour difference from upstream for two
+engine-internal calls.
+
+## [2026-08-06] Task 57 — plugin integration gaps left for composition
+
+1. **The authoritative `Hooks` interface has 21 top-level members, not 20 or 24.**
+   `packages/plugin/src/index.ts:222-335` declares exactly the 21 names now pinned by
+   `HookName::ALL`. The earlier 24 count included optional nested payload/callback fields;
+   the plan's acceptance count of 20 omitted one real top-level member. The interface,
+   not either stale count, is the compatibility contract.
+2. **`chat.params` currently has no outbound owner below `oc-plugin`.**
+   `oc_llm::registry::CompletionRequest` carries only `model_id`, `surface`, and
+   `messages`, so Task 57 defines `ChatParamsOutput` in `oc-plugin` but cannot prove the
+   final provider request observes temperature/top-p/top-k/options without changing an
+   out-of-scope crate. The later composition task must either extend the provider request
+   contract or map this output into each provider request builder before invocation.
+3. **Merged `oc_config::Config` does not retain declaring-file provenance.** Relative
+   plugin specs therefore cannot be resolved correctly from a merged config alone.
+   `discover_plugins` intentionally requires `ConfigLayer { source, scope, config }`;
+   the config-loading composition must preserve these layers until plugin discovery has
+   resolved each local spec.
+4. **The shared event type creates a dependency-direction constraint.** Reusing
+   `oc_engine::loop::TurnEvent` as required makes `oc-plugin -> oc-engine`. The engine
+   cannot later depend directly on `oc-plugin` without a cycle; a composition crate must
+   own the bus, or the shared event vocabulary must move to a lower crate before direct
+   engine integration.
+
+## [2026-08-06] Task 70 — diagnostics tooling limitation
+
+- The `lsp_diagnostics` MCP is rooted at the main worktree and rejects the sibling
+  `t70` path with `LSP file path must be inside request cwd`. Direct
+  `rust-analyzer diagnostics crates/oc-tools` completed instead; changed files had
+  no errors, with only the existing inactive-test WeakWarning in `grep.rs`.
