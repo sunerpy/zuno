@@ -395,3 +395,23 @@ about merge conflicts; this is worse, it is two writers on one checkout.
 If it happens again and both are live: the first writer's uncommitted work is the one
 at risk. Check `git status` in the worktree, and if two sets of files are appearing,
 stop both and re-dispatch one.
+
+## MY ERROR (2026-08-06): todo 60 dispatched twice into one worktree
+
+I launched todo 60 twice — `bg_43686d92` (category `deep`, session
+`ses_0277498f3ffeKAs7CvFukXrMrR`) and then `bg_db66d6b0` (category `ultrabrain`,
+session `ses_027742e4effeO4MAl2Z7UQ6gfM`) — both pointed at
+`/config/workspace/ProdDir/AI/oc-wt/t60`. Cancelling the first returned
+"Task not found", so it had already ended or was never registered.
+
+**Two agents in one worktree is a corruption hazard**: they write the same files
+with no coordination, and the loser's edits silently vanish or interleave. At the
+moment I noticed, `t60` was still clean, so nothing was lost.
+
+**Rule**: one worktree, one agent, always. Before `task()`, confirm the worktree
+has no live agent. A dispatch is not idempotent — re-reading a prompt does not
+mean re-sending it.
+
+**Watch for**: duplicated modules, two competing API shapes for the same thing, or
+a commit whose diff contains both. If `t60` shows any of that, reset it and resume
+exactly one session.
