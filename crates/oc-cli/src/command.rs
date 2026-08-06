@@ -79,7 +79,7 @@ pub struct Cli {
     pub version: bool,
 
     /// Include the real Rust build identity with the compatibility version.
-    #[arg(long, global = true, requires = "version", action = ArgAction::SetTrue)]
+    #[arg(long, global = true, hide = true, requires = "version", action = ArgAction::SetTrue)]
     pub long: bool,
 
     /// Print logs to stderr in addition to the rolling log file.
@@ -160,31 +160,332 @@ pub struct RejectedArgs {
     pub args: Vec<OsString>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum RunFormat {
+    #[default]
+    Default,
+    Json,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct RunArgs {
+    #[arg(value_name = "message")]
+    pub message: Vec<String>,
+    #[arg(long)]
+    pub command: Option<String>,
+    #[arg(short = 'c', long)]
+    pub r#continue: bool,
+    #[arg(short = 's', long)]
+    pub session: Option<String>,
+    #[arg(long)]
+    pub fork: bool,
+    #[arg(long)]
+    pub share: bool,
+    #[arg(short = 'm', long)]
+    pub model: Option<String>,
+    #[arg(long)]
+    pub agent: Option<String>,
+    #[arg(long, value_enum, default_value_t)]
+    pub format: RunFormat,
+    #[arg(short = 'f', long)]
+    pub file: Vec<String>,
+    #[arg(long)]
+    pub title: Option<String>,
+    #[arg(long)]
+    pub attach: Option<String>,
+    #[arg(short = 'p', long)]
+    pub password: Option<String>,
+    #[arg(short = 'u', long)]
+    pub username: Option<String>,
+    #[arg(long)]
+    pub dir: Option<String>,
+    #[arg(long)]
+    pub port: Option<u16>,
+    #[arg(long)]
+    pub variant: Option<String>,
+    #[arg(long)]
+    pub thinking: bool,
+    #[arg(short = 'i', long, default_value_t = false)]
+    pub interactive: bool,
+    #[arg(long, default_value_t = false)]
+    pub auto: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ServeArgs {
+    #[arg(long, default_value_t = 0)]
+    pub port: u16,
+    #[arg(long, default_value = "127.0.0.1")]
+    pub hostname: String,
+    #[arg(long, default_value_t = false)]
+    pub mdns: bool,
+    #[arg(long, default_value = "opencode.local")]
+    pub mdns_domain: String,
+    #[arg(long)]
+    pub cors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+#[command(subcommand_required = true)]
+pub struct SessionArgs {
+    #[command(subcommand)]
+    pub command: Option<SessionCommand>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum SessionCommand {
+    List(SessionListArgs),
+    Delete { session_id: String },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum SessionFormat {
+    #[default]
+    Table,
+    Json,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct SessionListArgs {
+    #[arg(short = 'n', long)]
+    pub max_count: Option<u32>,
+    #[arg(long, value_enum, default_value_t)]
+    pub format: SessionFormat,
+}
+
+#[derive(Debug, Clone, Args)]
+#[command(subcommand_required = true)]
+pub struct AgentArgs {
+    #[command(subcommand)]
+    pub command: Option<AgentCommand>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum AgentCommand {
+    Create(AgentCreateArgs),
+    List,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AgentMode {
+    All,
+    Primary,
+    Subagent,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct AgentCreateArgs {
+    #[arg(long)]
+    pub path: Option<String>,
+    #[arg(long)]
+    pub description: Option<String>,
+    #[arg(long, value_enum)]
+    pub mode: Option<AgentMode>,
+    #[arg(long, visible_alias = "tools")]
+    pub permissions: Option<String>,
+    #[arg(short = 'm', long)]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ModelsArgs {
+    pub provider: Option<String>,
+    #[arg(long)]
+    pub verbose: bool,
+    #[arg(long)]
+    pub refresh: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+#[command(subcommand_required = true)]
+pub struct ProvidersArgs {
+    #[command(subcommand)]
+    pub command: Option<ProvidersCommand>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum ProvidersCommand {
+    #[command(alias = "ls")]
+    List,
+    Login {
+        url: Option<String>,
+        #[arg(short = 'p', long)]
+        provider: Option<String>,
+        #[arg(short = 'm', long)]
+        method: Option<String>,
+    },
+    Logout {
+        provider: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Args)]
+#[command(subcommand_required = true)]
+pub struct McpArgs {
+    #[command(subcommand)]
+    pub command: Option<McpCommand>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum McpCommand {
+    Add(McpAddArgs),
+    #[command(alias = "ls")]
+    List,
+    Auth(McpAuthArgs),
+    Logout {
+        name: Option<String>,
+    },
+    Debug {
+        name: String,
+    },
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct McpAddArgs {
+    pub name: Option<String>,
+    #[arg(long)]
+    pub url: Option<String>,
+    #[arg(long)]
+    pub env: Vec<String>,
+    #[arg(long)]
+    pub header: Vec<String>,
+    #[arg(last = true)]
+    pub server_command: Vec<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct McpAuthArgs {
+    pub name: Option<String>,
+    #[command(subcommand)]
+    pub command: Option<McpAuthCommand>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum McpAuthCommand {
+    #[command(alias = "ls")]
+    List,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum DbFormat {
+    Json,
+    #[default]
+    Tsv,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DbArgs {
+    pub query: Option<String>,
+    #[arg(long, value_enum, default_value_t)]
+    pub format: DbFormat,
+}
+
+#[derive(Debug, Clone, Args)]
+#[command(subcommand_required = true)]
+pub struct DebugArgs {
+    #[command(subcommand)]
+    pub command: Option<DebugCommand>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum DebugCommand {
+    Paths,
+    Config,
+    Agent(DebugAgentArgs),
+    Skill,
+    Rg(DebugRgArgs),
+    Lsp(DebugLspArgs),
+    Snapshot(DebugSnapshotArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DebugAgentArgs {
+    pub name: String,
+    #[arg(long)]
+    pub tool: Option<String>,
+    #[arg(long)]
+    pub params: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+#[command(subcommand_required = true)]
+pub struct DebugRgArgs {
+    #[command(subcommand)]
+    pub command: Option<DebugRgCommand>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum DebugRgCommand {
+    Files {
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long)]
+        glob: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    Search {
+        pattern: String,
+        #[arg(long)]
+        glob: Vec<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+}
+
+#[derive(Debug, Clone, Args)]
+#[command(subcommand_required = true)]
+pub struct DebugLspArgs {
+    #[command(subcommand)]
+    pub command: Option<DebugLspCommand>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum DebugLspCommand {
+    Diagnostics { file: String },
+    Symbols { query: String },
+    DocumentSymbols { uri: String },
+}
+
+#[derive(Debug, Clone, Args)]
+#[command(subcommand_required = true)]
+pub struct DebugSnapshotArgs {
+    #[command(subcommand)]
+    pub command: Option<DebugSnapshotCommand>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum DebugSnapshotCommand {
+    Track,
+    Patch { hash: String },
+    Diff { hash: String },
+}
+
 /// Every command intentionally registered by this skeleton.
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
     /// Run OpenCode with a message.
-    Run(PendingArgs),
+    Run(RunArgs),
     /// Start the headless server.
     ///
     /// Its owner wraps [`oc_server::ServerBuilder`] through a dependency added by
     /// todo 56; it must not spawn `oc-server` or duplicate listener behavior.
-    Serve(PendingArgs),
+    Serve(ServeArgs),
     /// Manage sessions.
-    Session(PendingArgs),
+    Session(SessionArgs),
     /// Manage agents.
-    Agent(PendingArgs),
+    Agent(AgentArgs),
     /// List available models.
-    Models(PendingArgs),
+    Models(ModelsArgs),
     /// Manage providers and credentials.
     #[command(alias = "auth")]
-    Providers(PendingArgs),
+    Providers(ProvidersArgs),
     /// Manage Model Context Protocol servers.
-    Mcp(PendingArgs),
+    Mcp(McpArgs),
     /// Database tools.
-    Db(PendingArgs),
+    Db(DbArgs),
     /// Diagnostics and introspection.
-    Debug(PendingArgs),
+    Debug(DebugArgs),
     /// Generate shell completion output.
     Completion(PendingArgs),
     /// Export session data.
@@ -213,18 +514,27 @@ pub enum Command {
 impl Command {
     fn action(self, environment: StartupEnvironment) -> Action {
         match self {
-            Self::Run(args) => dispatch(ImplementedCommand::Run, args, environment),
-            Self::Serve(args) => dispatch(ImplementedCommand::Serve, args, environment),
-            Self::Session(args) => dispatch(ImplementedCommand::Session, args, environment),
-            Self::Agent(args) => dispatch(ImplementedCommand::Agent, args, environment),
-            Self::Models(args) => dispatch(ImplementedCommand::Models, args, environment),
-            Self::Providers(args) => dispatch(ImplementedCommand::Providers, args, environment),
-            Self::Mcp(args) => dispatch(ImplementedCommand::Mcp, args, environment),
-            Self::Db(args) => dispatch(ImplementedCommand::Db, args, environment),
-            Self::Debug(args) => dispatch(ImplementedCommand::Debug, args, environment),
-            Self::Completion(args) => dispatch(ImplementedCommand::Completion, args, environment),
-            Self::Export(args) => dispatch(ImplementedCommand::Export, args, environment),
-            Self::Import(args) => dispatch(ImplementedCommand::Import, args, environment),
+            Self::Run(args) => dispatch(DispatchArguments::Run(args), environment),
+            Self::Serve(args) => dispatch(DispatchArguments::Serve(args), environment),
+            Self::Session(args) => dispatch(DispatchArguments::Session(args), environment),
+            Self::Agent(args) => dispatch(DispatchArguments::Agent(args), environment),
+            Self::Models(args) => dispatch(DispatchArguments::Models(args), environment),
+            Self::Providers(args) => dispatch(DispatchArguments::Providers(args), environment),
+            Self::Mcp(args) => dispatch(DispatchArguments::Mcp(args), environment),
+            Self::Db(args) => dispatch(DispatchArguments::Db(args), environment),
+            Self::Debug(args) => dispatch(DispatchArguments::Debug(args), environment),
+            Self::Completion(args) => dispatch(
+                DispatchArguments::Pending(ImplementedCommand::Completion, args.args),
+                environment,
+            ),
+            Self::Export(args) => dispatch(
+                DispatchArguments::Pending(ImplementedCommand::Export, args.args),
+                environment,
+            ),
+            Self::Import(args) => dispatch(
+                DispatchArguments::Pending(ImplementedCommand::Import, args.args),
+                environment,
+            ),
             Self::Console(_) => reject("console", environment),
             Self::Web(_) => reject("web", environment),
             Self::Stats(_) => reject("stats", environment),
@@ -237,16 +547,12 @@ impl Command {
     }
 }
 
-fn dispatch(
-    command: ImplementedCommand,
-    args: PendingArgs,
-    environment: StartupEnvironment,
-) -> Action {
-    Action::Dispatch(DispatchRequest {
-        command,
-        args: args.args,
+fn dispatch(args: DispatchArguments, environment: StartupEnvironment) -> Action {
+    Action::Dispatch(Box::new(DispatchRequest {
+        command: args.command(),
+        args,
         environment,
-    })
+    }))
 }
 
 fn reject(command: &'static str, environment: StartupEnvironment) -> Action {
@@ -310,13 +616,44 @@ impl ImplementedCommand {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum DispatchArguments {
+    Run(RunArgs),
+    Serve(ServeArgs),
+    Session(SessionArgs),
+    Agent(AgentArgs),
+    Models(ModelsArgs),
+    Providers(ProvidersArgs),
+    Mcp(McpArgs),
+    Db(DbArgs),
+    Debug(DebugArgs),
+    Pending(ImplementedCommand, Vec<OsString>),
+}
+
+impl DispatchArguments {
+    #[must_use]
+    pub const fn command(&self) -> ImplementedCommand {
+        match self {
+            Self::Run(_) => ImplementedCommand::Run,
+            Self::Serve(_) => ImplementedCommand::Serve,
+            Self::Session(_) => ImplementedCommand::Session,
+            Self::Agent(_) => ImplementedCommand::Agent,
+            Self::Models(_) => ImplementedCommand::Models,
+            Self::Providers(_) => ImplementedCommand::Providers,
+            Self::Mcp(_) => ImplementedCommand::Mcp,
+            Self::Db(_) => ImplementedCommand::Db,
+            Self::Debug(_) => ImplementedCommand::Debug,
+            Self::Pending(command, _) => *command,
+        }
+    }
+}
+
 /// Stable boundary between CLI policy and command behavior.
 #[derive(Debug, Clone)]
 pub struct DispatchRequest {
     /// Command implementation to invoke.
     pub command: ImplementedCommand,
-    /// Remaining arguments, to be replaced by typed command arguments in todo 56.
-    pub args: Vec<OsString>,
+    pub args: DispatchArguments,
     /// Resolved startup environment and all known flags.
     pub environment: StartupEnvironment,
 }
@@ -327,7 +664,7 @@ pub enum Action {
     /// Print the requested version identity.
     Version { long: bool },
     /// Hand a registered command to its implementation.
-    Dispatch(DispatchRequest),
+    Dispatch(Box<DispatchRequest>),
     /// Fail with the deliberate scope or migration decision.
     Rejected {
         command: &'static str,
@@ -343,14 +680,40 @@ pub trait CommandDispatcher {
 }
 
 /// A registered command reached a handler that has not landed yet.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("`{command}` is registered, but its handler is pending {owner}")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchError {
     /// Canonical CLI spelling.
     pub command: &'static str,
     /// Todo that owns the implementation.
     pub owner: &'static str,
+    pub detail: Option<String>,
 }
+
+impl DispatchError {
+    #[must_use]
+    pub fn command(command: ImplementedCommand, detail: impl Into<String>) -> Self {
+        Self {
+            command: command.as_str(),
+            owner: "todo 56",
+            detail: Some(detail.into()),
+        }
+    }
+}
+
+impl std::fmt::Display for DispatchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.detail {
+            Some(detail) => formatter.write_str(detail),
+            None => write!(
+                formatter,
+                "`{}` is registered, but its handler is pending {}",
+                self.command, self.owner
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DispatchError {}
 
 /// Honest default while todo 56 has not supplied the command handlers.
 #[derive(Debug, Default)]
@@ -361,6 +724,7 @@ impl CommandDispatcher for PendingCommandDispatcher {
         Err(DispatchError {
             command: request.command.as_str(),
             owner: "todo 56",
+            detail: None,
         })
     }
 }
@@ -371,24 +735,26 @@ mod tests {
 
     #[test]
     fn all_registered_headless_commands_reach_the_dispatch_seam() {
-        for name in [
-            "run",
-            "serve",
-            "session",
-            "agent",
-            "models",
-            "providers",
-            "auth",
-            "mcp",
-            "db",
-            "debug",
-            "completion",
-            "export",
-            "import",
+        for args in [
+            &["run"][..],
+            &["serve"],
+            &["session", "list"],
+            &["agent", "list"],
+            &["models"],
+            &["providers", "list"],
+            &["auth", "list"],
+            &["mcp", "list"],
+            &["db"],
+            &["debug", "paths"],
+            &["completion"],
+            &["export"],
+            &["import"],
         ] {
-            let cli = Cli::try_parse_from(["opencode-rust", name]).expect("registered command");
+            let cli =
+                Cli::try_parse_from(std::iter::once("opencode-rust").chain(args.iter().copied()))
+                    .expect("registered command");
             let action = cli.action(&Env::empty());
-            assert!(matches!(action, Action::Dispatch(_)), "{name}");
+            assert!(matches!(action, Action::Dispatch(_)), "{}", args[0]);
         }
     }
 

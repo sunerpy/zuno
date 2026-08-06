@@ -15,10 +15,40 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true }
+oc-agent = { workspace = true }
+oc-auth = { workspace = true }
+oc-catalog = { workspace = true }
+oc-config = { workspace = true }
+oc-db = { workspace = true }
+oc-engine = { workspace = true }
+oc-llm = { workspace = true }
+oc-lsp = { workspace = true }
+oc-mcp = { workspace = true }
 oc-observability = { workspace = true }
 oc-paths = { workspace = true }
+oc-permission = { workspace = true }
+oc-provider-anthropic = { workspace = true }
+oc-provider-bedrock = { workspace = true }
+oc-provider-compatible = { workspace = true }
+oc-provider-google = { workspace = true }
+oc-provider-openai = { workspace = true }
+oc-search = { workspace = true }
+oc-server = { workspace = true }
+oc-snapshot = { workspace = true }
+oc-tool = { workspace = true }
 oc-tools = { workspace = true }
+reqwest = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
