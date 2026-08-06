@@ -4306,3 +4306,25 @@ non-empty with a `file:line` shape. The capture document, the diagnostics payloa
 and the 501 bodies all read the same table, so a route's justification cannot drift
 away from the route. That is the acceptance criterion "every implemented route maps
 to >=1 recorded callsite" made executable instead of reviewable.
+
+## Task 101: background reflection fork
+
+**`ReflectionFork` owns scheduling; `ReflectionRunner` owns review execution.** The
+fork checks delivery and trigger policy synchronously, then launches a detached
+Tokio task. Runner errors and panics are contained and logged because reflection is
+advisory and must never alter foreground turn delivery.
+
+**The default periodic cadence is ten delivered turns; zero disables it.** A
+same-command fail-then-succeed recovery is an independent trigger, so the two
+conditions are ORed. Trigger state records the last scheduled delivered-turn count
+to avoid duplicate periodic reviews.
+
+**The tool whitelist is enforced by exact runtime dispatch.** Only `memory` can be
+called, with the stable rejection text required by acceptance. The public boundary
+uses `oc-tool` directly rather than importing `oc-tools`, which keeps `oc-agent`
+independent of concrete tool implementations.
+
+**Policy input is an owned transcript snapshot.** The detached review cannot read
+or compact the live parent conversation. `CompactionMode` deliberately has only
+`Disabled`, making the no-compaction rule representable in the type surface rather
+than relying on convention.
