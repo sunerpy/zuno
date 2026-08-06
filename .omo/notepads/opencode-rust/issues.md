@@ -2564,3 +2564,235 @@ thing tying them together; a future reader should not assume `PRUNE` is live.
 2. **Any new `oc-snapshot` test that edits a tracked file must change its length**,
    or it inherits this exact flake. The other tests in the file happen to be safe
    (`"hello\nworld\n"` is 12 bytes), which is why only this one flaked.
+
+## [2026-08-06] Task 44: oracle and plan disagreements
+
+- The plan names `opencode debug agent <name> --tool` as the list command. Binary `--help` proves `--tool` is `Tool id to execute`; the working list command is `debug agent <name> --pure`.
+- The debug command does not remove fully denied tools from its JSON map; it emits them as `false` (`bash: false` in the blanket-deny case). The runtime registry still must hide them before provider exposure, per todo 17 and `permission/index.ts:204-219`. The differential therefore compares the keys whose debug value is `true` and separately asserts the expected `false` entry.
+- `FileTools::exposed_for_model` is not divergent: its predicate is exactly `model_id.contains("gpt-") && !model_id.contains("oss") && !model_id.contains("gpt-4")`, matching `registry.ts:292-295`.
+- The real binary has no `execute` entry in these cases because todo 70/code mode has no usable MCP catalog in the isolated oracle environment. Task 44 tests both independent gates with a stub but does not implement execute.
+
+## Task 99 — remaining integration boundaries
+
+- `lsp_diagnostics` is rooted at the main worktree and rejects files under
+  `oc-wt/t99`, the same tool limitation recorded by Tasks 12 and 98. The identical
+  rust-analyzer engine was run directly as `rust-analyzer diagnostics .`; it
+  completed without errors in changed files. Cargo build, tests, clippy and fmt are
+  the authoritative compile/lint gates.
+- `CacheConsistency` deliberately classifies reuse but does not edit a cached
+  prompt in place. The caller must rebuild the whole static prefix on `Stale` or
+  `Unknown`. A generalized stale-block scrubber is deferred: substring surgery on
+  an instruction-bearing system prompt is a separate security-sensitive feature,
+  not part of frozen snapshot injection.
+- The external-context sanitizer is intentionally narrow: it removes forged
+  `memory-context` fences and forged system-note payloads before applying the one
+  trusted wrapper. It is not a general HTML/XML or prompt-injection scrubber; the
+  resident store's write-time threat scanner remains the first-party defence.
+
+## Task 72 — tooling limitations
+
+- `lsp_diagnostics` is rooted at the main worktree and rejects files under
+  `oc-wt/t72`. Direct `rust-analyzer diagnostics crates/oc-tools` in the linked
+  worktree was clean; build, targeted tests, clippy, fmt, and diff checks also passed.
+- CodeGraph could not inspect this worktree because it has no local index. Context7
+  documentation lookup was also unavailable because the monthly quota was exceeded.
+  Neither limitation blocked implementation or local verification.
+
+## [2026-08-06] Task 68 — remaining integration boundary
+
+- `GoalContinuation` provides the guards and state transitions, but the later
+  engine/CLI integration task must supply truthful values for active-turn, plan-mode,
+  and queued-user-input state. Bypassing any one input invalidates the four-guard
+  self-continuation contract even though this crate's unit tests remain green.
+- The concurrent-start guard is intentionally process-local. Two independent
+  OpenCode processes addressing the same session can both pass it. If multi-process
+  continuation becomes supported, the start claim needs a transactional lease in
+  `goal_1.db`; this task does not claim that guarantee.
+- The `lsp_diagnostics` MCP rejected the sibling `t68` worktree because it is rooted
+  at the main request cwd. Diagnostics were completed through a temporary linked
+  validation worktree containing the identical changed Rust files; all ten reported
+  zero diagnostics. Cargo check, tests, Clippy, and rustfmt also passed.
+
+## [2026-08-06] Task 49: oracle corrections, and one real divergence in todo 40's Windows shell list
+
+### Corrections to the task brief (the oracle wins)
+
+- `EXITED_LIMIT` is at `packages/core/src/pty.ts:**17**`, not `:18`. Line 18 is
+  `const pty = lazy(() => import("#pty"))`. Value 25 confirmed.
+- The brief described `shell.ts:111` as "a POSIX fallback list". It is the fallback
+  **only when `/etc/shells` is missing or empty**; the primary source is
+  `/etc/shells` (`shell.ts:109`), which the brief did not mention. On this host
+  that is the difference between 3 shells and 11.
+- `Pty.Info` carries **no** `rows`, `cols`, `env`, or timestamps
+  (`packages/schema/src/pty.ts:20-29`). Size exists only in `UpdateInput.size`.
+  Anything in wave 9 assuming `Info` reports a size will be wrong.
+- The WebSocket has **no resize control message**. Every client frame is terminal
+  input; resize goes through HTTP `PUT /pty/:ptyID`. Todos 64-70 should not invent
+  a control channel.
+
+### `oc-tools`'s Windows shell candidates diverge from the oracle — NOT fixed here
+
+`crates/oc-tools/src/shell.rs:903-908` (todo 40):
+
+```rust
+#[cfg(windows)]
+let candidates = ["pwsh.exe", "powershell.exe", "bash.exe", "cmd.exe"];
+```
+
+The oracle (`packages/core/src/shell.ts:98-106`) is
+`pwsh -> powershell -> gitbash() -> COMSPEC -> cmd.exe`. Two behaviours are lost:
+
+1. **Git Bash is not resolved the oracle's way.** `gitbash()` (`shell.ts:123-130`)
+   locates `<git>/../../bin/bash.exe` and honours the `OPENCODE_GIT_BASH_PATH`
+   override. `bash.exe` on `PATH` is a *different* thing on Windows — commonly the
+   WSL shim, which is not a Git Bash and does not accept the same paths.
+2. **`COMSPEC` is ignored**, so a user with a non-default command processor gets
+   `cmd.exe` regardless.
+
+`oc-pty` implements the oracle's order. **I did not edit `oc-tools`** (four
+siblings live). Someone owning `oc-tools` should either adopt the oracle's order or
+depend on `oc_pty::shells`. Linux and macOS agree between the two crates today, so
+this is Windows-only and not currently observable in CI.
+
+### `preferred` vs `acceptable` is a real distinction, not redundancy
+
+Worth recording because collapsing them looks like a simplification and is a bug.
+The oracle has two selectors:
+
+- `Shell.preferred` (`shell.ts:205`) — **no** deny list. Used by the PTY
+  (`pty.ts:174`), so a fish user's terminal is fish.
+- `Shell.acceptable` (`shell.ts:214`) — deny list applied. Used by non-interactive
+  execution, which injects POSIX script that fish and nushell cannot parse.
+
+Todo 40's single `discover_shell` implements `acceptable` (it filters `SHELL`
+through its `acceptable()` helper), which is correct for the bash tool. `oc-pty`
+exports both. A future refactor that merges them would either break fish users'
+terminals or feed POSIX script to a shell that rejects it.
+
+### Upstream weaknesses this port deliberately does not reproduce
+
+1. **`BUFFER_LIMIT` is enforced by re-slicing the whole buffer per chunk.**
+   `session.buffer = session.buffer.slice(excess)` (`pty.ts:220`) allocates and
+   copies the retained 2 MiB on *every* chunk once the cap is reached. At an 8 KiB
+   read that is roughly 250 GiB of memcpy per gigabyte of output. A fixed-capacity
+   ring makes each write two `copy_from_slice` calls.
+2. **The buffer is a JavaScript string measured in UTF-16 code units.** `slice()`
+   can split a surrogate pair, so a replay can begin with a lone surrogate. This
+   port keeps bytes and realigns the head to a UTF-8 boundary.
+3. **Per-subscriber `pending: string[]` is unbounded** (`pty.ts:26`, filled at
+   `:207` while `active === false`). A client that completes the WebSocket upgrade
+   and never calls `activate()` accumulates the session's entire output a second
+   time, outside `BUFFER_LIMIT`. This port has no staging array at all — the replay
+   snapshot and the subscription are taken under one lock — and its per-attachment
+   queue is bounded with an explicit `Lagged` signal.
+4. **Write, resize and kill failures are swallowed** by bare `try {} catch {}`
+   (`pty.ts:126`, `:194`, `:200`). A user whose keystrokes are going nowhere cannot
+   learn that. This port returns `PtyError::Write` / `PtyError::Resize`.
+5. **Orphaned tickets outlive their session.** `ticket.ts` expires by TTL only, so a
+   ticket minted for a since-removed PTY stays redeemable for up to 60 s. This port
+   revokes a session's tickets when the session is removed.
+
+### `cargo metadata --locked --offline` gap for target-specific dependencies
+
+See learnings.md for the reproduction. The check every dependency-adding task
+should run is there too. This is a genuine CI-breaking class that `cargo build`
+cannot detect, and this task is the second occurrence in the project.
+
+## [2026-08-06] Task 49 BUG FOUND IN REVIEW: `Ended` could overtake the reader, truncating a session's tail
+
+A real product bug in the first `oc-pty` commit, found by verification and fixed
+before merge. Worth recording in full because the *shape* of it — two threads, one
+stop signal, no ordering — recurs, and because of how nearly it shipped.
+
+### The bug
+
+`spawn_reader` and `spawn_waiter` were two independent OS threads with **no
+synchronization between them**:
+
+- the reader loops `read` → `ingest` → `try_send(PtyOutput::Chunk(..))`;
+- the waiter blocks on `child.wait()`, then `mark_exited` → `try_send(PtyOutput::Ended { .. })`.
+
+A child's death and its output having been read are **different events**.
+`child.wait()` returns as soon as the process dies, while the bytes it wrote
+microseconds earlier are still in the kernel's pty buffer waiting to be read. So the
+waiter could publish `Ended` first.
+
+`Ended` is the stop signal — every consumer stops there, including wave 9's
+`GET /pty/:ptyID/connect`. So **every short-lived command could silently lose its
+last output**: a user runs `ls` in a terminal and intermittently sees nothing. The
+data was in the scrollback the whole time, which is what makes it insidious — every
+"is it bounded / is it retained" assertion passed.
+
+### The fix: a drain latch the waiter awaits, bounded
+
+`DrainGate { drained: Mutex<bool>, signal: Condvar }` on `SessionShared`. The reader
+calls `mark_drained()` **after its loop**, so the latch means "every chunk is already
+queued", not "no more will be read". The waiter does:
+
+```rust
+let exit_code = child.wait().ok().map(|s| s.exit_code());   // reap FIRST
+if !shared.drain.wait_for_drain(DRAIN_GRACE) { tracing::debug!(...); }
+if shared.mark_exited(exit_code) { on_exit(&owned, exit_code); }
+```
+
+Four properties that are each load-bearing, in the order they were needed:
+
+1. **`child.wait()` stays ahead of the drain wait**, so a slow drain can never delay
+   the reap. `dropping_the_service_terminates_and_reaps_every_child` covers it.
+2. **The wait is bounded** (`DRAIN_GRACE = 500ms`). The pty can outlive the child
+   whenever a grandchild inherited it, and an unbounded wait would defer the exit,
+   the retention eviction, and every subscriber's `Ended` for the grandchild's whole
+   lifetime.
+3. **A separate mutex from `SessionState`.** The waiter blocks on the gate; blocking
+   on the state mutex would stall `ingest` — the very thing it is waiting for. No
+   path takes both, so there is no order to invert.
+4. **The latch is released if the reader thread fails to spawn**, or every exit on
+   that session would pay the full grace waiting for output that cannot come.
+
+`mark_exited`'s single-delivery guard is untouched; the wait sits in front of it.
+
+### THE PART TO REMEMBER: a serial run hid it completely, and so did the obvious test
+
+`cargo test -p oc-pty` passed **every** time serially. It failed **3 of 18** runs
+under six-way concurrency. The race is decided by scheduler latency and nothing else:
+data-becoming-available wakes the reader *before* the child's death wakes the waiter,
+so with a free core the reader always wins. It only loses when it has to queue for
+CPU.
+
+That has a sharp consequence for the regression test. The natural test — one session
+writes, exits, assert the subscriber saw it all — **passed 5/5 against the reverted
+fix**. It cannot fail. The test has to generate the contention itself: 64 concurrent
+sessions (128 threads), each gated and released together. Measured against the
+reverted fix, **13% of individual sessions lose output**, so at least one shortfall
+per 64-session batch is a near-certainty. Mutation proof: 5/5 FAILED with the fix
+reverted (4-8 short subscribers each), 5/5 ok restored, then 18/18 clean.
+
+Two rules out of this:
+
+1. **For a concurrency bug, the regression test must reproduce the *condition*, not
+   just the scenario.** If the bug needs load, the test must create load. A test that
+   cannot fail is not a test, and "I wrote a test for it" is not evidence — reverting
+   the fix is.
+2. **`for i in 1..6; cargo test & wait` is not paranoia, it is the only run that
+   found this.** Every task touching threads should do the 6x check, and should not
+   treat a serial pass as evidence of anything.
+
+### Measured: on Linux the pty hangs up when its session leader exits
+
+Probed while testing the bound, because it changes what `DRAIN_GRACE` is *for*.
+Once the pty's session leader (the spawned child) exits, the kernel hangs the
+terminal up and the master read ends in **~5 ms regardless of what descendants do
+with the slave fd**. Verified with `sleep &`, `nohup`, `setsid`, `trap "" HUP` and
+`setsid` + `trap` variants: all ended in ~5 ms, and output written by the survivor a
+second later was **never retained** in any variant.
+
+So `DRAIN_GRACE` is a genuine bound rather than a routinely exercised path, and its
+timeout branch is **not reachable from an integration test on Linux**. It is tested
+where it is deterministic — four `DrainGate` unit tests. Two of them use a
+ten-minute grace so that returning `true` can only mean the latch/notify was
+observed, because timing out would hang the test rather than fail it: a timing
+assertion replaced by a structural one.
+
+Consequence for wave 9 and anyone else: **a background process started from a
+terminal loses its output at the moment the terminal's shell exits**, on Linux, and
+that is the kernel's behaviour, not something this crate can fix.

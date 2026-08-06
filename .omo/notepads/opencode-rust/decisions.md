@@ -3221,3 +3221,224 @@ was used instead.
   penalty. It never removes the penalized class. Scroll is intentionally separate
   from FTS and bookends: an exact `(session_id, around_message_id)` anchor returns
   local context even if the anchor contains no searchable text.
+
+## [2026-08-06] Task 44: registry seams and filter order
+
+`ToolRegistryBuilder` owns an ordered `BuiltinSlot -> Arc<dyn Tool>` map plus the shared `FileTools`. Built-ins are emitted through the fixed upstream slot sequence; requiring `FileTools` lets per-model resolution call `FileTools::exposed_for_model` rather than duplicate the GPT substring rule.
+
+Custom loading is a `CustomToolLoader` with separate `config_directory_tools(&[PathBuf])` and `plugin_tools()` methods because upstream appends those sources in that order. `McpToolLoader::tools()` is a second seam appended afterward. Both default to no-op implementations until waves 9 and 8 land. Config directories come directly from `oc_paths::config_directories(directory, worktree)`. `config_tool_id(path, export)` is the pure load-bearing naming function: default export -> basename, named export -> `{basename}_{export}`.
+
+Resolution order is fixed: process-wide exposure flags while assembling built-ins; append config tools, plugin tools, then MCP tools; per-turn websearch and `FileTools` model filtering; the independent execute-description gate; finally `oc_permission::visibility::retain_visible_tools`. Permission hiding is last so it also covers every extension source and alias mapping.
+
+## Task 99 — snapshot and cache-consistency choices
+
+- `SessionMemory` owns both stores and freezes each rendered block at construction.
+  `store_mut` remains available so a memory-tool write lands immediately, while
+  `inject_into` can only read the frozen strings. A new `SessionMemory` is the sole
+  operation that makes new disk state visible to a prompt.
+- Scope order in the static prompt is global then project, with exactly two newlines
+  between non-empty components. Empty blocks add no bytes. This keeps prompt bytes
+  deterministic and preserves Task 98's `render_block` format as the single source
+  of header and usage formatting.
+- `cache_consistency` first opens every enabled current scope, then classifies. This
+  makes an unreadable enabled scope return `Unknown` even if another scope already
+  appears stale; proven unreadability is the stronger conservative signal. Disabled
+  scopes are not read, but their stable header must be absent from the cache.
+- A non-empty current rendered block must occur verbatim in the cached prompt. An
+  empty current block is checked through `Scope::label`, because there is no block
+  string to compare. This is the same independent header handle the reference
+  exports for compaction consistency.
+- The external fence is a separate function rather than part of `inject_into`.
+  Global and project stores are first-party, threat-scanned resident memory and must
+  not be relabelled as external user input; external recall is sanitized and fenced
+  with the required authoritative-memory note.
+
+## Task 72 — policy and background-task boundaries
+
+- `OutputPolicy` owns both persistence and refusal so callers cannot accidentally
+  reject an oversized value before preserving it. Refusal reports bytes, lines,
+  estimated tokens, retrieval path, and the exact `accept_large_output` escape hatch.
+- The token count is deliberately an estimate using four UTF-8 bytes per token. It
+  is documented rather than presented as tokenizer-accurate context accounting.
+- `BackgroundManager` is an adoption seam. Explicit background execution and
+  foreground timeout promotion both hand the same running future to it, producing
+  queryable task state and output/status files under `.opencode/background`.
+- Caller-selected foreground timeout values are normalized to at most 600 seconds;
+  the existing 30-minute hard ceiling is retained instead of being conflated with
+  the foreground-attention cap.
+- The promotion response warns that the command is still running and should not be
+  rerun unless a duplicate process is intentional.
+
+## [2026-08-06] Task 68 — hidden goal context and continuation policy
+
+- Goal context is a synthetic pseudo-user transcript entry regenerated from
+  `GoalStore`, never a persisted message. This makes SQL the single durable source
+  and prevents compaction from deleting the control objective.
+- Auxiliary continuation state lives beside the goal in `goal_1.db`, in separate
+  `goal_continuation_deferral` and `goal_failure_streak` tables. The existing `goal`
+  table is unchanged, preserving Task 67's schema contract while keeping restart
+  behavior durable.
+- Self-continuation is conjunctive: process-local start ownership, no active engine
+  turn, no plan mode, no queued user input, no consumed one-shot deferral, and an
+  active goal are all required. A missing guard returns a typed non-start outcome;
+  it never "best-effort" starts.
+- The model may request only `blocked` or `complete`, reusing Task 67's
+  `ModelStatus` boundary. `blocked` adds a persistent audit threshold of three
+  matching failure signals; terminal infrastructure errors are the exception and
+  block immediately because no model turn remains in which to report them.
+- The start mutex is deliberately process-local. A database lease was rejected for
+  this scope because no caller currently promises cross-process continuation; the
+  limitation is explicit rather than implied away.
+
+## [2026-08-06] Task 49: oc-pty ring design, exit-order eviction, thread shape, and the ticket model
+
+### The scrollback is a fixed-capacity ring, UTF-8-realigned at the head
+
+```rust
+pub const BUFFER_LIMIT: usize = 1024 * 1024 * 2;   // packages/core/src/pty.ts:14
+const MAX_CONTINUATION_BYTES: usize = 3;
+const INITIAL_PHYSICAL: usize = 8 * 1024;
+```
+
+**Bytes, not characters.** The oracle counts UTF-16 code units of a JavaScript
+string; this counts bytes, which is the quantity that actually bounds memory. They
+agree exactly for ASCII; for CJK this retains fewer characters and the same number
+of bytes, which is the correct reading of a *memory* cap.
+
+**A ring, not periodic re-slicing.** `buffer = buffer.slice(excess)` (`pty.ts:220`)
+copies the retained 2 MiB per chunk once full. The ring makes the bound structural
+rather than periodic: the allocation never exceeds the limit and a write is two
+`copy_from_slice` calls no matter how much has been discarded.
+
+**Grows geometrically from 8 KiB.** Eagerly reserving 2 MiB would mean 50 MiB held
+for 25 retained-exited sessions nobody is reading. `reserved_bytes()` is exposed
+separately from `retained_len()` precisely so a memory assertion reads the
+high-water mark rather than the current fill.
+
+**UTF-8: realign the HEAD, bounded at 3 bytes.** Discarding an arbitrary byte count
+splits code points, and `replay` is decoded as text; the user works in Chinese, so
+mojibake at the top of every replay is the *common* case, not an edge case. After
+any discard the head advances past continuation bytes (`0b10xxxxxx`), at most 3
+because a UTF-8 sequence is at most 4 bytes.
+
+**The 3-byte bound is load-bearing, not defensive.** A PTY also carries binary
+output, where a "continuation byte" is just a byte; an unbounded scan would empty
+the buffer looking for a lead byte that never comes. `realignment_is_bounded_on_
+binary_output` drives 32 bytes of `0x80` into an 8-byte buffer and requires exactly
+5 retained.
+
+**Not `oc_llm::Utf8StreamDecoder`** (`crates/oc-llm/src/sse.rs:24-91`). That holds
+an incomplete *trailing* sequence pending the next chunk, which is right for a
+stream decoding to `String` in order. A ring stays bytes (a terminal replay is
+bytes — escape sequences, cursor moves, partial writes) and truncates at the
+*head*. Mirror-image problem, so the approach is shared (`error_len() == None`
+means "incomplete, not invalid") but the code is not.
+
+### Eviction is exit-ordered, and the test asserts identity rather than count
+
+`ExitRetention` is a `VecDeque<PtyId>` appended on exit and popped from the front,
+mirroring `exitOrder.push(id)` (`pty.ts:228`) with `exitOrder[0]` evicted
+(`:234-238`). The oracle uses `indexOf` + `splice` rather than `shift`, so an
+explicitly removed exited session frees its slot; `forget()` does the same.
+
+**Why identity, not count.** A creation-ordered implementation retains exactly 25
+and retains the *wrong* 25, so a count assertion passes on a broken port. The test
+makes exit order the exact reverse of creation order and asserts the retained queue
+with `assert_eq!` against the exact 25-element exit-order slice. Measured:
+
+```
+EXIT ORDER by creation index: [29, 28, ... 1, 0]
+EVICTED creation indices:     [25, 26, 27, 28, 29]   <- the five EARLIEST exits
+oldest-5-by-CREATION still retained: [true, true, true, true, true]
+```
+Creation-ordered eviction would have produced `{0,1,2,3,4}`. Disjoint sets.
+
+**`record_exit` returns the evictions instead of performing them.** That keeps the
+type free of any knowledge of processes or locks, so the ordering is testable
+without spawning anything (6 unit tests, microseconds). It also makes the
+self-eviction hazard representable-and-excluded: a non-zero limit guarantees a slot
+for the just-exited id, which matters because eviction runs on that session's own
+waiter thread — evicting itself would mean tearing down the thread doing the
+tearing down. `with_limit(0)` is therefore raised to 1.
+
+**A duplicate `record_exit` is a no-op.** The oracle guards with a status check
+before the push (`pty.ts:224`); this repeats the guarantee at the queue, so a
+double notification cannot silently shorten the retained history.
+
+### Two OS threads per session, and dropped output rather than a longer queue
+
+`portable_pty`'s reader is a blocking `std::io::Read` and its child wait is a
+blocking `wait()`; neither has an async form. So each session owns a reader thread
+and a waiter thread, and every publish is `try_send`. Nothing in the crate needs a
+Tokio runtime to exist — same conclusion todo 50 reached for `oc-watch`, and it is
+what lets every method be a plain `fn` and every test a plain `#[test]`.
+
+The waiter thread is not merely bookkeeping: **`wait()` is the reap.** It is the
+only call that collects the zombie, so the thread existing is the containment.
+
+**Degradation for a slow subscriber: drop and report.** Per-attachment queue is 256
+slots x 8 KiB = 2 MiB, deliberately equal to the scrollback bound — a subscriber
+cannot cost more than the history it could re-read anyway. On overflow, chunks are
+discarded and counted, and `PtyOutput::Lagged { dropped, cursor }` is sent **ahead
+of** the next chunk so a client learns of the hole before rendering a discontinuity.
+
+Dropping is safe *here* and not in a filesystem watcher because **the scrollback is
+the durable copy**: `retained_output()` serves the missed window. That is the
+property to preserve if this is ever changed. Growing the channel instead would
+move the unbounded buffer one layer down, which is this crate's whole failure mode.
+
+**No `activate()` two-phase attach.** The oracle stages output in an unbounded
+per-subscriber `pending` array between `attach` and `activate` (`pty.ts:26`,
+`:252-261`). Here the replay snapshot and the subscription are taken **under one
+lock** — the reader thread needs the same lock to append — so no chunk can land
+between them and there is nothing to stage. Deleting the staging array deletes the
+unbounded buffer with it.
+
+**Poisoned mutexes are recovered** (`PoisonError::into_inner`), as in `oc-watch`:
+the guarded region is a byte ring and a map of senders, both structurally valid,
+and the alternative is one panic permanently stopping every client of that session.
+
+**`shutdown` signals and returns; it does not reap.** The session's own waiter
+thread observes the death. Holding the registry lock across a session teardown
+would let one session's reader block every other session's lookups, so `take()`
+removes under the lock and tears down after releasing it.
+
+### `PtyServiceConfig` instead of `&mut self` builder setters
+
+The setters were first written as `self`-by-value with `Arc::get_mut`, which is
+sound only while the service is unshared and silently no-ops otherwise — a footgun
+with no compile-time signal. A plain config struct consumed by
+`PtyService::with_config` makes construction-time-only structural.
+
+### Errors: the oracle's two, plus the four it swallows
+
+`NotFound` and `Exited` are `pty.ts:74-80`. `Open`, `Spawn`, `Write`, `Resize` are
+additions — the oracle wraps those calls in bare `try {} catch {}`, so a user whose
+keystrokes go nowhere cannot learn that. A write or resize *after* a clean exit is
+still a no-op rather than an error, matching the `status === "running"` guards
+(`:194`, `:200`): a client reporting its window size should not need to know
+whether the shell is still alive.
+
+### connect-token IS modelled, and revoked with its session
+
+`TicketStore`: `uuid::Uuid::new_v4()`, 60 s TTL, capacity 10,000 — all three the
+oracle's (`core/src/pty/ticket.ts:9-10`, `:41`). Single-use, and scoped to
+`{pty_id, directory, workspace_id}` so a ticket for one project's PTY cannot be
+replayed against another that reuses the identifier.
+
+It lives in the library, not the route, because the store is the only stateful half
+and the oracle has **two** upgrade surfaces that must not each keep their own.
+
+**One addition: `revoke_session`.** The oracle expires by TTL only, so a ticket
+minted for a since-removed PTY stays redeemable for up to 60 s against whatever
+later session might reuse the id. Since a WebSocket URL ends up in history, proxy
+logs and referrers, narrowing that window to zero is worth one `retain` call.
+
+### `PtyId::mint` is monotonic within the process
+
+`pty_` + 12 lowercase hex of the mint-time millisecond + 14 base62, per
+`packages/schema/src/identifier.ts`. The millisecond is bumped past the previous
+reading when the clock has not advanced (`AtomicU64::fetch_update`), so two ids
+minted in the same millisecond still sort by creation. That is what `ascending()`
+promises and what lets `list()` reproduce the oracle's `Map` insertion order by
+sorting on the id instead of depending on a `HashMap`'s iteration order.

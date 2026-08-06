@@ -3400,3 +3400,192 @@ is 6; its `len()` is 18.
 - External-content rowids are not durable across `VACUUM`; callers that compact
   the database must run `oc_db::fts::rebuild` afterwards so both FTS tables are
   repopulated from their source views.
+
+## [2026-08-06] Task 44: full conditional registry measurements
+
+The working oracle invocation is `env -i ... /config/.local/share/mise/installs/opencode/1.18.12/opencode debug agent <agent> --pure`; `--tool` executes one tool and does not print a list. Read the JSON `tools` object and select entries whose value is `true` to obtain the provider-visible set.
+
+Measured visible sets:
+
+- `openai/gpt-5.2`, build: `invalid question bash read glob grep task webfetch todowrite skill apply_patch`.
+- `anthropic/claude-sonnet-4-5`, build, narrow `bash/git push*` deny: `invalid question bash read glob grep edit write task webfetch todowrite skill`.
+- `openai/gpt-4.1`, build, blanket bash deny: `invalid question read glob grep edit write task webfetch todowrite skill`; debug JSON retains `bash: false`.
+- `openai/gpt-oss-120b`, build, Exa and LSP enabled: `invalid question bash read glob grep edit write task webfetch todowrite websearch skill lsp`.
+- `opencode/gpt-5.2`, plan, plan mode enabled: `invalid question bash read glob grep task webfetch todowrite websearch skill apply_patch plan_exit`.
+
+The full literal transcripts are in `.omo/evidence/task-44-opencode-rust.txt`. `FileTools::exposed_for_model` matched `registry.ts:292-295` exactly, including both `gpt-4` and `oss` carve-outs.
+
+## Task 99 — frozen resident-memory snapshots
+
+- A session needs two deliberately separate memory views: mutable `MemoryStore`
+  handles for immediate durable writes, and immutable rendered strings captured by
+  `SessionMemory::open`. Re-rendering the live handles in `inject_into` would make
+  a mid-session write change the static provider-cache prefix; storing the rendered
+  strings separately makes that failure structurally unavailable.
+- Cache freshness is a comparison between the cached prompt and independently
+  re-opened, currently rendered stores. Comparing two values captured by the same
+  session only proves that the stale snapshot agrees with itself. Current empty or
+  disabled scopes still need a negative check for their stable `Scope::label`, or
+  a removed block remains latched forever.
+- Freshness needs three states. `Fresh` proves both enabled current blocks match;
+  `Stale` proves readable current memory differs; `Unknown` means a current scope
+  could not be read and therefore forces the conservative rebuild path. Treating
+  unreadable as empty would both hide data loss and incorrectly classify a cached
+  header as ordinary staleness.
+- `oc-engine` compaction already preserves the initial system prefix outside the
+  summarizer input. Two real `run_compaction` passes prove both frozen scope blocks
+  survive byte-for-byte while neither `MEMORY (` block reaches either summarizer
+  request. No compaction-specific memory reinjection is needed.
+- First-party global/project blocks are injected directly. Only externally recalled
+  memory is wrapped in `<memory-context>` after case-insensitive removal of forged
+  fences and forged `[System note: ...]` payloads. The trusted note is then added
+  exactly once by the wrapper.
+
+## Task 72 — output refusal and cancel-safe timeout promotion
+
+- Large output must be persisted before policy evaluation returns a refusal. This
+  guarantees that refusing prompt-expensive content never destroys the only full
+  copy and gives the caller a stable retrieval path.
+- Cross-cutting raw arguments must be inspected before `strip_cross_cutting`.
+  `ShellTool` therefore implements `Tool` directly while keeping its typed inherent
+  `run`; otherwise `accept_large_output` disappears before output policy can see it.
+- `tokio::time::timeout` must borrow `&mut JoinHandle<T>` for promotion. Consuming
+  or dropping the handle on timeout would cancel ownership of the only reachable
+  completion path; borrowing allows the background manager to adopt the same live
+  process without restarting it.
+- Foreground timeout and process lifetime are different policies. The 120-second
+  default and 600-second cap bound interactive attention, while cancellation and
+  the pre-existing 30-minute hard ceiling remain the only termination boundaries.
+
+## [2026-08-06] Task 68 — goal tools, hidden injection, guarded continuation
+
+- A goal that must survive compaction cannot be injected by first writing it into
+  conversation history. `GoalContinuation::inject_hidden_context` reads the active
+  goal from SQL for every request and appends a synthetic pseudo-user entry only to
+  the request transcript. Compaction can remove every prior message and the next
+  request still reconstructs the same rubric.
+- Synthetic XML-like context must escape model-authored objective text. Escaping
+  `&`, `<`, `>`, quotes, and apostrophes before interpolation prevents an objective
+  from closing the trusted goal element and forging adjacent instructions.
+- A one-turn deferral is state, not an in-memory boolean. Persisting and atomically
+  consuming it in `goal_1.db` makes the "defer exactly once" contract survive a
+  restart and prevents a repeated read from deferring forever.
+- "Blocked" needs evidence that survives the turn that produced it. A persisted
+  `(failure_key, count)` streak lets the update tool require three matching signals;
+  a changed signal restarts the streak rather than aggregating unrelated failures.
+- The safest terminal-error behavior is to block immediately. Provider or
+  compaction terminal failures occur outside the model's opportunity to call
+  `update_goal`; leaving the goal active would let the continuation scheduler
+  repeatedly submit the same doomed turn.
+
+## [2026-08-06] Task 49: portable-pty gotchas, PTY test determinism, and the measured 100 MB number
+
+### `drop(pair.slave)` before reading the master, or the reader thread never ends
+
+The single highest-value line in `session.rs`. While the slave fd is open the
+kernel keeps the pty writable, so `read()` on the master **never returns 0** even
+after the child is dead and reaped. Without the drop, every session leaks one
+thread blocked forever in `read`, and the leak is invisible: status flips to
+`exited` correctly (a different thread observes that), output stops arriving, and
+nothing looks wrong until you count threads.
+
+```rust
+let child = pair.slave.spawn_command(builder)?;
+drop(pair.slave);          // <- not optional
+let reader = pair.master.try_clone_reader()?;
+```
+
+### On Linux a closed pty reports EIO, not EOF
+
+The reader loop must treat *any* error other than `Interrupted` as end-of-output:
+
+```rust
+Ok(0) => break,
+Err(e) if e.kind() == ErrorKind::Interrupted => {}
+Err(_) => break,           // EIO on a closed pty is normal, not a fault
+```
+Logging that error would produce one spurious warning per session exit.
+
+### `child.wait()` IS the reap, and it is the only reap
+
+`portable_pty` has no reaper. The blocking `wait()` on the session's waiter thread
+is what collects the zombie, so **the thread existing is the containment**. Drop
+the waiter and an externally killed child stays in the process table forever.
+
+The test that proves it is `/proc/<pid>` disappearing — a zombie **keeps** its
+`/proc` entry, so "killed but unreaped" and "reaped" are distinguishable. Checking
+`kill -0` cannot tell them apart; both succeed on a zombie.
+
+### `ExitStatus::exit_code()` is `u32` and a signalled child still has one
+
+`portable_pty::ExitStatus` maps a signal to `code = status.code().unwrap_or(1)`
+plus `signal: Some(name)` (`lib.rs:208-236`). So `kill -KILL` yields
+`exit_code() == 1`, not `None` and not 137. Anything asserting `exit_code.is_some()`
+holds for signalled children too, which is what the external-kill QA relies on.
+
+### `cargo metadata --locked --offline` fails on a Windows-only transitive dep
+
+Exactly the hazard WORKTREE.md item 4 warns about, hit for real. `portable-pty`
+pulls `shared_library` **only on Windows**. `cargo build` on Linux never fetches
+it, so it lands in `Cargo.lock` but not in the registry cache, and `cargo metadata`
+— which resolves *all* targets — refuses:
+
+```
+error: failed to download `shared_library v0.1.9`
+Caused by: attempting to make an HTTP request, but --offline was specified
+```
+
+One `cargo fetch` fixes it permanently. **Rule for any task adding a dependency
+with `[target."cfg(windows)".dependencies]`: run `cargo fetch` (online) once, then
+verify `cargo metadata --locked --offline`.** A plain build will never surface it.
+Checking is two lines:
+
+```sh
+git diff Cargo.lock | grep '^+name = ' | tr -d '"' | sed 's/^+name = //' \
+  | while read p; do ls ~/.cargo/registry/cache/*/"$p"-*.crate >/dev/null 2>&1 || echo "MISSING: $p"; done
+```
+
+### Making PTY tests deterministic: sequence the exits, never time them
+
+Todo 50's four rules carry over unchanged. One addition specific to processes:
+
+**Gate each child on `read` from its own pty and release it with a `write`.** That
+turns "these 30 sessions exit in this exact order" into a structural fact. The
+alternatives both fail: `exit N` children race the create loop (observed —
+`assert_eq!(list().len(), 30)` failed with **26**, because the retention cap began
+evicting before all 30 existed), and gate *files* need 30 shells spinning on
+`sleep`, which is slower and host-speed dependent.
+
+**A cap test cannot wait for every session's `exited` status.** Once more than the
+cap has exited, the earliest exits are already gone, so `wait_for_exit` times out
+with `Err(NotFound)` — observed, 20 s wasted. The correct wait is
+"exited **or** evicted", justified because eviction is only ever triggered from
+`record_exit`, so evicted implies exited. This is the second-order race a naive
+port would paper over with a sleep.
+
+Result: 6/6 green under six-way concurrent `cargo test -p oc-pty`, whole suite
+~2.6 s, and the slow test's spread across the six runs is 1.27-1.45 s.
+
+### The measured 100 MB number
+
+End to end through a real pty (`yes | head -c 104857600`), read by the session's
+own reader thread:
+
+```
+total_written=107691589  retained=2097152  reserved=2097152
+discarded=105594437      limit=2097152     process RSS delta 4724 KiB
+```
+
+`retained` and `reserved` are **exactly** 2 MiB — the ceiling, hit precisely.
+Driving the ring directly, RSS delta is 2312 KiB for the same 100 MiB.
+
+RSS is corroboration, not proof: it is page-granular and includes transient read
+buffers the allocator has not returned. What proves it is `reserved_bytes() <=
+limit` asserted after **every** one of the 12,800 pushes, plus the identity
+`discarded == total_written - retained`, which fails if a byte goes unaccounted.
+
+### A floor assertion belongs on the producer too
+
+`assert!(total_written >= 100 MiB)` is the analogue of todo 2's file-count floor.
+Without it, a `yes | head` that silently produced nothing would pass every ceiling
+assertion vacuously. Same for the shell list: `assert!(!shells.is_empty())`.
