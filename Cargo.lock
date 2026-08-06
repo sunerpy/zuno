@@ -2232,6 +2232,7 @@ dependencies = [
  "oc-llm",
  "oc-paths",
  "oc-tool",
+ "oc-watch",
  "rusqlite",
  "schemars",
  "serde",
