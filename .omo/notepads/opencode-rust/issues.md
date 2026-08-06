@@ -3032,3 +3032,18 @@ only for *setup* (walk the budget down), never as the thing asserted.
 - The `lsp_diagnostics` integration is fixed to the parent session cwd and rejects
   sibling worktree files. Validation used `rust-analyzer diagnostics . --severity
   error` in the task worktree; it completed without error diagnostics.
+
+## [2026-08-06] Task 71 review correction: first pass overclaimed coverage
+
+The first Task 71 adversarial pass and evidence said brace expansion and compound
+statements were covered. That claim was false for four legal empty-alternative
+forms (`/{,}`, `/{a,}`, `{/,}`, `/{.,}`) and seven location-changing compounds
+(`cd`/`pushd` followed by a relative destructive target). Each reached `Allow`
+after a substantive justification. The tests had sampled ordinary brace lists and
+compound syntax but had not asserted these shapes; the review inferred a category
+from examples instead of proving its boundary.
+
+Future reviews must distrust category-level “covered” claims unless the assertion
+names the relevant shape. Task 71 now keeps table-driven regressions for the exact
+reported commands and mutation-proves both fixes. Unknown static semantics are
+listed as limitations instead of being absorbed into a broad coverage statement.

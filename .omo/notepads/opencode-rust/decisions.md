@@ -3683,3 +3683,32 @@ from the tool.
 - The model surface is one `TypedTool` named `lsp`, matching upstream. Schemars and
   serde derive from the same params type; the tool preserves one-based model input
   and converts to zero-based LSP positions at the boundary.
+
+## [2026-08-06] Task 71 adversarial correction: real bypasses and boundaries
+
+- **FIXED — empty brace alternatives:** `rm -rf /{,}`, `rm -rf /{a,}`,
+  `rm -rf {/,}`, and `rm -rf /{.,}` reached `Allow` after a substantive
+  justification because an empty alternative aborted expansion and the raw token
+  was assessed as a literal. Empty alternatives now expand to the empty string, so
+  all four expose their protected target and permanently `Deny`.
+- **FIXED — ordered cwd changes:** `cd / && rm -rf .`, `cd / && rm -rf *`,
+  `cd ~ && rm -rf .`, `cd / ; rm -rf .`, `pushd / && rm -rf .`,
+  `cd /etc && rm -rf .`, and `cd / && rm -rf ./` reached `Allow` after a
+  substantive justification because every relative target used the session cwd.
+  The assessor now consumes `CommandResource::changes_directory` in lexical order,
+  simulates Bash and PowerShell location stacks, and resolves each later target
+  against the simulated cwd. All seven now permanently `Deny`.
+- **DOCUMENTED — unknown braces and locations fail closed:** unsupported or
+  malformed brace syntax is an unknown target rather than a literal path and
+  produces `Reflect`. A dynamic/unknown directory change makes subsequent relative
+  destructive targets unknowable even after a justification, so those permanently
+  `Deny`. The gate does not claim to know either concrete runtime destination.
+- **DOCUMENTED — conservative control flow:** `&&`, `;`, and `||` conditions are
+  not used to waive a constituent. If the destructive command can run, it is
+  assessed. Nested-shell scope, arbitrary application/interpreter semantics,
+  aliases/functions, encoded/downloaded scripts, symlinks, and TOCTOU still require
+  confinement and remain outside the static proof.
+- **DOCUMENTED — reads are not destruction:** `cat ~/.ssh/id_rsa` is intentionally
+  `Allow` in this destructive-command gate. Read/exfiltration policy belongs to
+  permission policy or confinement; allowing it here is a named boundary, not an
+  accidental omission.
