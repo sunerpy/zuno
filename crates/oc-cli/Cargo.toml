@@ -14,6 +14,11 @@ name = "opencode-rust"
 path = "src/main.rs"
 
 [dependencies]
+clap = { workspace = true }
+oc-observability = { workspace = true }
+oc-paths = { workspace = true }
+oc-tools = { workspace = true }
+thiserror = { workspace = true }
 
 [lints]
 workspace = true
