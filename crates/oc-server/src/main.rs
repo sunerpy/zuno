@@ -4,8 +4,8 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use oc_server::api::{self, ApiState};
 use oc_server::{
-    AuthConfig, DEFAULT_EVENT_SUBSCRIBER_CAPACITY, EventService, ServerBuilder, ServerConfig,
-    events_router,
+    AuthConfig, CompatV1State, DEFAULT_EVENT_SUBSCRIBER_CAPACITY, EventService, ServerBuilder,
+    ServerConfig, compat_v1_router, events_router,
 };
 
 #[derive(Debug, Parser)]
@@ -50,7 +50,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .with_default_directory(&directory);
             let state = ApiState::open_default(directory)?;
             let server = ServerBuilder::new(config)
-                .with_routes(api::router(state).merge(events_router(events)))
+                .with_routes(
+                    api::router(state)
+                        .merge(events_router(events))
+                        .merge(compat_v1_router(CompatV1State::new())),
+                )
                 .bind()
                 .await?;
             let mut stdout = io::stdout().lock();
