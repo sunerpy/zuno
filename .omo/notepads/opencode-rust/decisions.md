@@ -3869,3 +3869,101 @@ are what a job board renders, and `Agent::summary_line()` / `render_list()` are 
 - Backends that do not exist locally are represented by registered, structured
   `501 not_implemented` seams. Returning empty or invented success data is not an
   acceptable compatibility strategy.
+
+
+## [2026-08-06] Task 55: command dispositions and dual version identities
+
+| upstream symbol | CLI spelling | disposition | reason / replacement |
+|---|---|---|---|
+| `AcpCommand` | `acp` | not registered | todo 78 owns the real ACP adapter |
+| `AgentCommand` | `agent` | implemented seam | todo 56 |
+| `AttachCommand` | `attach` | not registered | requires the TUI/terminal lifecycle wave |
+| `ConsoleCommand` | `console` | rejected | hosted Console is excluded; use `providers`/`auth` for local credentials |
+| `DbCommand` | `db` | implemented seam | todo 56, extended by todo 84 |
+| `DebugCommand` | `debug` | implemented seam | todo 56 |
+| `ExportCommand` | `export` | implemented seam | todo 56 |
+| `GenerateCommand` | `generate` | rejected | source-tree Prettier generator is excluded; consume `/openapi.json` |
+| `GithubCommand` | `github` | rejected | hosted GitHub agent is excluded; use `run` in CI |
+| `ImportCommand` | `import` | implemented seam | todo 56 |
+| `McpCommand` | `mcp` | implemented seam | todo 56 |
+| `ModelsCommand` | `models` | implemented seam | todo 56 |
+| `PluginCommand` | `plugin` | not registered | todo 60 must land the resident JS host before installs can be accepted |
+| `PrCommand` | `pr` | rejected | use `gh pr checkout`, then `opencode-rust run` |
+| `ProvidersCommand` | `providers` (`auth` alias) | implemented seam | todo 56 |
+| `RunCommand` | `run` | implemented seam | todo 56 |
+| `ServeCommand` | `serve` | implemented seam | todo 56 wraps `oc_server::ServerBuilder`; it does not spawn `oc-server` or duplicate server logic |
+| `SessionCommand` | `session` | implemented seam | todo 56, extended by todos 80-85 |
+| `StatsCommand` | `stats` | rejected | stats package/direct SQL path is excluded; use todo 84's `db stats` |
+| `TuiThreadCommand` | `$0` | not registered | ratatui and terminal lease belong to the TUI wave |
+| `UninstallCommand` | `uninstall` | rejected | use the package manager/installer that placed the binary |
+| `UpgradeCommand` | `upgrade` | rejected | use the Rust release installer; do not let TS self-update replace this artifact |
+| `WebCommand` | `web` | rejected | bundled hosted web app is excluded; use `serve` plus a supported client |
+
+`completion` is an upstream yargs-generated command rather than a `*Command` symbol; it is separately
+registered through the same implemented seam.
+
+The identities stay separate by API and text: `compatibility_version()` and short `--version` are
+exactly `1.18.13`, the value todo 60 must pass to npm `engines.opencode`; `BUILD_ID`,
+`--version --long`, and a user agent beginning `opencode-rust/` expose the real Rust package/build.
+The long form includes both values so neither audience can mistake one for the other.
+
+Startup resolves flags as immutable data, then on Unix safely `exec`s itself with `AGENT=1`,
+`OPENCODE=1`, `OPENCODE_PID=<same exec-preserved pid>`, and CLI overrides. This avoids forbidden
+Rust-2024 process-global mutation while ensuring downstream libraries that read the real environment
+observe upstream middleware semantics. The typed `CommandDispatcher`/`DispatchRequest` seam is the
+only route from registered skeleton commands to todos 56 and 80-85.
+
+## [2026-08-06] Task 97: terminal-lease protocol
+
+**The concurrent-acquire policy is refusal.** The plan said "a policy" without saying
+which. A second `acquire` against a live lease returns `TerminalLeaseError::Busy`
+naming the holder. Queueing was rejected twice over: a queued device-code prompt
+arrives with no context on a terminal the user has moved on from and is
+indistinguishable from the first, and a host that never releases would make every
+later acquirer block — turning the symptom back into a hang one level further out,
+with the force-reclaim freeing only the head of the queue. Preemption was rejected
+because revoking a lease mid-prompt yanks the terminal out from under half-typed
+input. So the only involuntary transition is the deadline, and it is loud.
+
+**Release is `Drop`, therefore `reclaim_terminal` is synchronous.** A guard whose
+release had to await would either block a runtime thread or spawn a detached task
+whose completion nobody could observe, and a release that may not have happened yet
+is exactly the deadlock the lease removes. Same reasoning as
+`oc_tool::InterruptHandle::is_set` (todo 3): the caller has no runtime to lend it.
+`yield_terminal` stays async, because acquisition is in async host code and a real
+owner must let its render loop reach a safe point first.
+
+**Force-reclaim has two paths and one settle-once flag.** A per-grant watchdog task
+cancelled by the guard's `oneshot::Sender` being dropped — which covers a panic unwind,
+where a notification-based scheme would miss — plus a sweep at the top of `acquire`
+and a public `reclaim_if_expired()`. Two paths because the watchdog needs a live Tokio
+runtime: `acquire` uses `Handle::try_current` and degrades to sweep-only rather than
+panicking inside the terminal protocol. Both paths `swap` the same `AtomicBool`, so
+`reclaim_terminal` runs exactly once per grant however they race, and a wedged guard
+dropped after its lease was taken cannot restore a terminal someone else has redrawn.
+
+**The diagnostic is a struct, not a string, and it names the plugin.** `LeaseReason`
+carries the plugin separately from the purpose specifically so `ForcedReclaim` can
+say `plugin `kiro` held the terminal for `device-code prompt` past its N ms deadline
+and did not release it`. "A lease expired" is not actionable. It is handed to the
+owner rather than logged here, because `oc-engine` has no logging facade and inventing
+one would put a presentation decision in the wrong layer.
+
+**The no-`oc-tui`-dependency check is mechanical, and reads manifests rather than
+running cargo.** `terminal_lease_keeps_the_plugin_crate_away_from_the_tui_and_ratatui`
+BFS-closes the first-party graph (runtime + dev + build) from `oc-plugin` and fails on
+`oc-tui`, `ratatui` or `crossterm`. `crossterm` is in the list because a host that can
+reach it can seize the terminal directly, which is what the protocol exists to route
+through a lease. Three floor assertions stop a vacuous pass: >=33 crates scanned, both
+`oc-plugin` and `oc-tui` present, and `ratatui`+`crossterm` reachable *from* `oc-tui`
+(so a rename of the render stack fails loudly instead of making the exclusion trivial).
+Manifests over `cargo tree` because spawning cargo inside a cargo test run can block
+on the shared build-directory lock.
+
+**Every timeout is injected; no test waits a production interval and none sleeps as
+synchronisation.** `DEFAULT_LEASE_TIMEOUT` is 300 s — sized for a human reading a
+device code off a browser and typing it back. Tests use `TerminalBroker::with_timeout`:
+`Duration::ZERO` for the deterministic reclaim assertions (already expired on return,
+so no timer is involved at all), 5 ms plus a 10 s bounded-poll budget for the watchdog,
+and 3600 s wherever the assertion is that a reclaim did *not* happen. Every direction
+is one-sided, because load can only make a timer late.

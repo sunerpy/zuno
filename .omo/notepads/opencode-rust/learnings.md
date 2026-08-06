@@ -3891,3 +3891,31 @@ positions are all greater than the wildcard's index.
 - Production startup opens and migrates the shared database, seeds the global
   project idempotently, and merges the API router before server middleware. Tests
   use an isolated shared-memory pool through the same initializer.
+
+
+## [2026-08-06] Task 55: exhaustive CLI surface and version gate
+
+The mechanically extracted `packages/opencode/src/index.ts:45-103` registration set has **23** symbols:
+`AcpCommand`, `AgentCommand`, `AttachCommand`, `ConsoleCommand`, `DbCommand`, `DebugCommand`,
+`ExportCommand`, `GenerateCommand`, `GithubCommand`, `ImportCommand`, `McpCommand`, `ModelsCommand`,
+`PluginCommand`, `PrCommand`, `ProvidersCommand`, `RunCommand`, `ServeCommand`, `SessionCommand`,
+`StatsCommand`, `TuiThreadCommand`, `UninstallCommand`, `UpgradeCommand`, `WebCommand`.
+
+The committed fixture is regenerated mechanically with:
+
+```sh
+sed -n '45,103p' packages/opencode/src/index.ts | grep -oE "[A-Z][A-Za-z]*Command" | sort -u
+```
+
+`checkPluginCompatibility` is a semver-**range** check, not exact equality
+(`packages/opencode/src/plugin/shared.ts:194-204`): invalid versions and major-zero versions bypass the
+check; otherwise `package.json`'s string `engines.opencode` is tested with
+`semver.satisfies(opencodeVersion, range)` and mismatch throws. `loader.ts:123-130` applies this only
+to npm plugins, catches the throw as stage `compatibility`, and therefore skips loading that candidate;
+file plugins bypass it. The compatibility identity must consequently be valid stable semver `1.18.13`.
+
+`flag.ts:3-78` contains 33 unique `OPENCODE_*` names. The startup snapshot deliberately contains 37:
+those 33 plus the CLI/runtime values `OPENCODE`, `OPENCODE_PID`, `OPENCODE_PRINT_LOGS`, and
+`OPENCODE_LOG_LEVEL`. It reuses `oc_paths::Env` for `Flag.truthy` inputs and
+`oc_tools::exposure::ExposureFlags` for the measured experimental fallback, so
+`OPENCODE_EXPERIMENTAL=true OPENCODE_EXPERIMENTAL_PLAN_MODE=false` still leaves plan mode off.

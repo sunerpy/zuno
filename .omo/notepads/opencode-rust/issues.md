@@ -3284,3 +3284,41 @@ Splitting a crate between concurrent agents worked — no merge damage, no scope
 overlap — but neither agent owned the *join*. When work is split this way, one side
 must own an assembled-app test asserting the union of the routes, or the gap stays
 invisible until someone drives the real binary.
+
+
+## [2026-08-06] Task 55: five registrations omitted by the plan's disposition lists
+
+The plan's implement/reject lists do not assign a disposition to five symbols that are registered by
+`packages/opencode/src/index.ts:45-103`: `AcpCommand`, `AttachCommand`, `PluginCommand`,
+`TuiThreadCommand`, and `GenerateCommand` (the prose only says to “decide explicitly”). The committed
+23-entry fixture and bidirectional one-to-one test close this gap. The first four remain deliberately
+unregistered with named owners; `generate` is registered only to reject with the `/openapi.json`
+replacement. A future upstream symbol added to the fixture fails as `has no disposition` rather than
+vanishing.
+
+## [2026-08-06] Task 97: the todo's own title contradicts its body
+
+1. **The plan's todo 97 title names the wrong crate.** It says
+   `crates/oc-tui/src/terminal_lease.rs`, while its body says "Must NOT put the trait
+   in `oc-tui`", its parenthetical says "interface defined in `oc-engine`", and its
+   acceptance criterion requires `cargo tree -p oc-plugin` to show no `oc-tui` and no
+   `ratatui`. Three of the four statements agree with each other and the title does
+   not, so the title lost. The trait is in **`crates/oc-engine/src/terminal_lease.rs`**;
+   nothing was created under `crates/oc-tui/`. Todo 73 implements `TerminalOwner` in
+   `oc-tui`, which depends on `oc-engine`, so the edge points the right way for both
+   sides without either naming the other.
+2. **`oc-testkit` now has an `oc-engine` edge, which creates dev-dependency cycles.**
+   `FakeTerminalOwner` implements `oc_engine::terminal_lease::TerminalOwner`, so
+   `oc-testkit -> oc-engine`. Nine crates dev-depend on `oc-testkit`, and three of them
+   (`oc-config`, `oc-llm`, plus `oc-permission`/`oc-tool` transitively) are *below*
+   `oc-engine`, so the graph now contains e.g.
+   `oc-config (dev) -> oc-testkit -> oc-engine -> oc-config`. Cargo permits cycles
+   through dev-dependencies and `cargo metadata --locked` accepts it, but it means a
+   future task that needs `oc-testkit` in a **runtime** dependency of anything at or
+   below `oc-engine` will hit a hard cycle. All nine were re-tested green.
+3. **The acceptance criterion's `cargo tree` check cannot fail on its own.** A
+   criterion nobody re-runs expires, so it is now
+   `terminal_lease_keeps_the_plugin_crate_away_from_the_tui_and_ratatui`, which walks
+   the manifests rather than shelling out to cargo — spawning cargo inside a cargo test
+   run can block on the shared build-directory lock, which in this workspace is a real
+   load-dependent hazard.
