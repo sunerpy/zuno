@@ -11,6 +11,7 @@
 //! queue; a stalled connection loses new events and receives an explicit
 //! [`Delivery::Lagged`] count instead of making the process grow without bound.
 
+pub mod api;
 mod auth;
 mod directory;
 mod event;

@@ -3712,3 +3712,25 @@ from the tool.
   `Allow` in this destructive-command gate. Read/exfiltration policy belongs to
   permission policy or confinement; allowing it here is a named boundary, not an
   accidental omission.
+
+## [2026-08-06] Task 52 — generated API contract and deliberate divergences
+
+- OpenAPI is generated from one deterministic operation registry plus
+  `schemars`-derived DTO schemas. This reuses the workspace's pinned schema stack
+  and avoids adding `utoipa`; the same registry is compared against the pinned
+  oracle document as a method/path subset of all 56 task-owned operations.
+- The count boundary is explicit: 61 protocol operations overall, 58 `/api`
+  operations, and 56 owned here after excluding task 53's two event streams. The
+  three experimental project-copy operations and the fixture-only generate-name
+  operation are not mounted by this router.
+- Normalization for any future live differential is restricted to generated
+  session/PTY ids and slugs, timestamps, PTY pid/exit timing, temporary absolute
+  directory/worktree values, and cursor tokens. HTTP status, error code, shape,
+  field presence, ordering, and stable values remain comparison-bearing.
+- Two divergences from the oracle are intentional and tested. Project `subpath`
+  is applied as a literal tree prefix instead of being ignored or interpreted as
+  a SQL wildcard. Session listing defaults to `time_updated DESC, id DESC` for a
+  total stable order; `?sort=created` explicitly selects creation-time ordering.
+- Backends that do not exist locally are represented by registered, structured
+  `501 not_implemented` seams. Returning empty or invented success data is not an
+  acceptable compatibility strategy.

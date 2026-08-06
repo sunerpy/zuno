@@ -2485,11 +2485,22 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "clap",
+ "oc-catalog",
+ "oc-db",
  "oc-engine",
+ "oc-error",
+ "oc-paths",
+ "oc-pty",
+ "reqwest",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.19",
  "tokio",
  "tower",
  "url",
+ "uuid",
 ]
 
 [[package]]

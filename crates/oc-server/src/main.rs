@@ -1,6 +1,7 @@
 use std::io::{self, Write as _};
 
 use clap::{Parser, Subcommand};
+use oc_server::api::{self, ApiState};
 use oc_server::{AuthConfig, ServerBuilder, ServerConfig};
 
 #[derive(Debug, Parser)]
@@ -32,11 +33,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let Cli { command } = Cli::parse();
     match command {
         Command::Serve { hostname, port } => {
+            let directory = std::env::current_dir()?.to_string_lossy().into_owned();
             let config = ServerConfig::default()
                 .with_hostname(hostname)
                 .with_port(port)
-                .with_auth(AuthConfig::from_env());
-            let server = ServerBuilder::new(config).bind().await?;
+                .with_auth(AuthConfig::from_env())
+                .with_default_directory(&directory);
+            let state = ApiState::open_default(directory)?;
+            let server = ServerBuilder::new(config)
+                .with_routes(api::router(state))
+                .bind()
+                .await?;
             let mut stdout = io::stdout().lock();
             writeln!(stdout, "http://{}", server.local_addr())?;
             stdout.flush()?;
