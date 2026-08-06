@@ -1,6 +1,11 @@
+use crate::output_policy::OutputPolicy;
+use crate::timeout::{
+    BackgroundAdoption, BackgroundManager, ForegroundTask, LocalBackgroundManager,
+    background_started_output, normalize_foreground_timeout, wait_or_promote,
+};
 use async_trait::async_trait;
 use oc_error::ToolError;
-use oc_tool::{OutputLimits, PermissionAsk, ToolContext, ToolOutput, ToolOutputStore, TypedTool};
+use oc_tool::{OutputLimits, PermissionAsk, Tool, ToolContext, ToolOutput, ToolOutputStore};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -15,7 +20,6 @@ use tokio::process::{Child, Command};
 use tree_sitter::{Node, Parser};
 
 const TOOL_ID: &str = "bash";
-const DEFAULT_HARD_CEILING: Duration = Duration::from_secs(30 * 60);
 const TERMINATE_GRACE: Duration = Duration::from_millis(200);
 const DESCRIPTION: &str = "Executes a command with the configured shell. Commands are parsed with tree-sitter before execution so each constituent command is permission-checked independently. Use workdir instead of changing directories inside the command.";
 
@@ -129,6 +133,7 @@ pub struct ShellTool {
     output_store: ToolOutputStore,
     output_limits: OutputLimits,
     hard_ceiling: Duration,
+    background_manager: Arc<dyn BackgroundManager>,
 }
 
 impl ShellTool {
@@ -140,13 +145,17 @@ impl ShellTool {
         let workspace = workspace.canonicalize()?;
         let shell = discover_shell(configured)?;
         let output_store = ToolOutputStore::new(workspace.join(".opencode").join("tool-output"));
+        let background_manager = Arc::new(LocalBackgroundManager::new(
+            workspace.join(".opencode").join("background"),
+        ));
         Ok(Self {
             workspace,
             shell,
             env_hook: Arc::new(NoopShellEnv),
             output_store,
             output_limits: OutputLimits::default(),
-            hard_ceiling: DEFAULT_HARD_CEILING,
+            hard_ceiling: crate::timeout::DEFAULT_HARD_CEILING,
+            background_manager,
         })
     }
 
@@ -172,6 +181,84 @@ impl ShellTool {
     pub fn with_hard_ceiling(mut self, ceiling: Duration) -> Self {
         self.hard_ceiling = ceiling;
         self
+    }
+
+    #[must_use]
+    pub fn with_background_manager(mut self, manager: Arc<dyn BackgroundManager>) -> Self {
+        self.background_manager = manager;
+        self
+    }
+
+    pub async fn run(
+        &self,
+        params: ShellParams,
+        ctx: ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
+        self.run_with_output_acceptance(params, ctx, false).await
+    }
+
+    async fn run_with_output_acceptance(
+        &self,
+        params: ShellParams,
+        ctx: ToolContext,
+        accept_large_output: bool,
+    ) -> Result<ToolOutput, ToolError> {
+        if params.command.trim().is_empty() {
+            return Err(invalid("command must not be empty"));
+        }
+        if params.timeout == Some(0) {
+            return Err(invalid("timeout must be a positive number"));
+        }
+        if ctx.is_interrupted() {
+            return Err(interrupted());
+        }
+
+        let cwd = self.resolve_workdir(params.workdir.as_deref())?;
+        let analysis = analyze_command(&params.command, self.syntax())?;
+        self.authorize(&params.command, &cwd, &analysis, &ctx)
+            .await?;
+        if ctx.is_interrupted() {
+            return Err(interrupted());
+        }
+        let env = self.environment(&cwd, &ctx).await?;
+        let child = self.spawn(&params.command, &cwd, &env)?;
+        let pid = child.id();
+        let command = params.command.clone();
+        let session_id = ctx.session_id.clone();
+        let foreground_timeout_ms = normalize_foreground_timeout(params.timeout);
+        let execution = ChildExecution {
+            command: command.clone(),
+            session_id: session_id.clone(),
+            ctx,
+            output_policy: OutputPolicy::new(self.output_store.clone(), self.output_limits),
+            hard_ceiling: self.hard_ceiling,
+            foreground_timeout_ms,
+            accept_large_output,
+        };
+        let work = tokio::spawn(async move { complete_child(child, execution).await });
+
+        if params.background {
+            let handle = self.background_manager.adopt(BackgroundAdoption {
+                tool_name: TOOL_ID.to_owned(),
+                display_name: command.clone(),
+                session_id,
+                work,
+            })?;
+            return Ok(background_started_output(command, pid, handle));
+        }
+
+        wait_or_promote(
+            self.background_manager.as_ref(),
+            ForegroundTask {
+                tool_name: TOOL_ID.to_owned(),
+                display_name: command,
+                session_id,
+                foreground_timeout_ms,
+                hard_ceiling: self.hard_ceiling,
+                work,
+            },
+        )
+        .await
     }
 
     fn syntax(&self) -> ShellSyntax {
@@ -319,9 +406,7 @@ impl ShellTool {
 }
 
 #[async_trait]
-impl TypedTool for ShellTool {
-    type Params = ShellParams;
-
+impl Tool for ShellTool {
     fn id(&self) -> &str {
         TOOL_ID
     }
@@ -330,61 +415,19 @@ impl TypedTool for ShellTool {
         DESCRIPTION
     }
 
-    async fn run(&self, params: ShellParams, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
-        if params.command.trim().is_empty() {
-            return Err(invalid("command must not be empty"));
-        }
-        if params.timeout == Some(0) {
-            return Err(invalid("timeout must be a positive number"));
-        }
-        if ctx.is_interrupted() {
-            return Err(interrupted());
-        }
+    fn raw_parameters_schema(&self) -> Value {
+        oc_tool::schema::derive_params_schema::<ShellParams>()
+    }
 
-        let cwd = self.resolve_workdir(params.workdir.as_deref())?;
-        let analysis = analyze_command(&params.command, self.syntax())?;
-        self.authorize(&params.command, &cwd, &analysis, &ctx)
-            .await?;
-        if ctx.is_interrupted() {
-            return Err(interrupted());
-        }
-        let env = self.environment(&cwd, &ctx).await?;
-        let mut child = self.spawn(&params.command, &cwd, &env)?;
-        let pid = child.id();
-        let command = params.command.clone();
-        let session_id = ctx.session_id.clone();
-        let output_store = self.output_store.clone();
-        let output_limits = self.output_limits;
-        let hard_ceiling = self.hard_ceiling;
-        let foreground_timeout = params.timeout;
-
-        let execution = ChildExecution {
-            command,
-            session_id,
-            ctx,
-            output_store,
-            output_limits,
-            hard_ceiling,
-            foreground_timeout,
-        };
-
-        if params.background {
-            let _job = tokio::spawn(async move {
-                let _result = complete_child(&mut child, &execution).await;
-            });
-            return Ok(ToolOutput::text(
-                format!("{} running in background", params.command),
-                format!(
-                    "Command is running in the background{}.",
-                    pid.map_or_else(String::new, |pid| format!(" with process id {pid}"))
-                ),
-            )
-            .with_metadata("background", true)
-            .with_metadata("pid", json!(pid))
-            .with_metadata("timeout", json!(params.timeout)));
-        }
-
-        complete_child(&mut child, &execution).await
+    async fn execute(&self, mut args: Value, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        let accept_large_output = oc_tool::guard::accepts_large_output(&args);
+        oc_tool::guard::strip_cross_cutting(&mut args);
+        let params = serde_json::from_value(args).map_err(|error| ToolError::InvalidArgs {
+            tool: TOOL_ID.to_owned(),
+            source: Box::new(error),
+        })?;
+        self.run_with_output_acceptance(params, ctx, accept_large_output)
+            .await
     }
 }
 
@@ -714,15 +757,15 @@ struct ChildExecution {
     command: String,
     session_id: String,
     ctx: ToolContext,
-    output_store: ToolOutputStore,
-    output_limits: OutputLimits,
+    output_policy: OutputPolicy,
     hard_ceiling: Duration,
-    foreground_timeout: Option<u64>,
+    foreground_timeout_ms: u64,
+    accept_large_output: bool,
 }
 
 async fn complete_child(
-    child: &mut Child,
-    execution: &ChildExecution,
+    mut child: Child,
+    execution: ChildExecution,
 ) -> Result<ToolOutput, ToolError> {
     let mut process_tree = ProcessTreeGuard::new(child.id());
     let stdout = child.stdout.take();
@@ -734,12 +777,12 @@ async fn complete_child(
     let status = tokio::select! {
         result = child.wait() => Some(result.map_err(failed)?),
         () = execution.ctx.interrupt.notified() => {
-            terminate_process_tree(child).await;
+            terminate_process_tree(&mut child).await;
             let _status = child.wait().await;
             None
         }
         () = tokio::time::sleep(execution.hard_ceiling) => {
-            terminate_process_tree(child).await;
+            terminate_process_tree(&mut child).await;
             let _status = child.wait().await;
             process_tree.disarm();
             let _stdout = join_pipe(stdout_task).await;
@@ -764,22 +807,23 @@ async fn complete_child(
     if full.is_empty() {
         full = "(no output)".to_owned();
     }
-    let mut output = ToolOutput::text(&execution.command, full)
+    let output = ToolOutput::text(&execution.command, full)
         .with_metadata("exit", json!(status.code()))
         .with_metadata("truncated", false)
         .with_metadata("background", false)
-        .with_metadata("timeout", json!(execution.foreground_timeout));
-    if output.measure(execution.output_limits).is_oversized() {
-        let stored =
-            execution
-                .output_store
-                .persist(TOOL_ID, &execution.session_id, &output.output)?;
-        output.record_output_path(&stored.path);
-        output
-            .metadata
-            .insert("oversized".to_owned(), Value::Bool(true));
-    }
-    Ok(output)
+        .with_metadata("timeout", json!(execution.foreground_timeout_ms));
+    execution
+        .output_policy
+        .apply(
+            TOOL_ID,
+            &execution.session_id,
+            output,
+            execution.accept_large_output,
+        )
+        .map_err(|error| ToolError::Failed {
+            tool: TOOL_ID.to_owned(),
+            source: Box::new(error),
+        })
 }
 
 struct ProcessTreeGuard {
