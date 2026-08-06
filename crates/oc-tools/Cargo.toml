@@ -22,7 +22,11 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-bash = { workspace = true }
+tree-sitter-powershell = { workspace = true }
 url = { workspace = true }
+which = { workspace = true }
 
 [dev-dependencies]
 oc-permission = { workspace = true }
