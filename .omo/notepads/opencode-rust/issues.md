@@ -2868,3 +2868,18 @@ means "already out of the registry", exactly when suppression is correct.
 `GET /pty/:ptyID` paired with `GET /pty/:ptyID/connect` inherits this guarantee. The
 route layer must not reintroduce a gap between reading status and subscribing —
 `tests/exit_events.rs` guards the library, not the HTTP surface.
+
+## [2026-08-06] Task 48 — acceptance-count and Rust-oracle discrepancies
+
+- The acceptance text calls for a 39-server registry, but current upstream
+  `packages/opencode/src/lsp/server.ts` and the existing Rust config schema both
+  enumerate 38. Adding a fabricated 39th server would diverge from both sources;
+  coverage is pinned to exact ordered equality with `BUILTIN_SERVER_IDS` instead.
+- OpenCode 1.18.12 returns an empty diagnostic array for a deliberate Rust E0425,
+  even though `rust-analyzer diagnostics` and the new stdio client both report the
+  error. Exact Rust differential equality is therefore impossible without
+  weakening correct behavior. TypeScript remains exact-differential; Rust is a
+  real-server assertion with the discrepancy recorded in evidence.
+- The `lsp_diagnostics` integration is fixed to the parent session cwd and rejects
+  sibling worktree files. Validation used `rust-analyzer diagnostics . --severity
+  error` in the task worktree; it completed without error diagnostics.

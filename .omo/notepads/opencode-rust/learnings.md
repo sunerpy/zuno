@@ -3589,3 +3589,22 @@ limit` asserted after **every** one of the 12,800 pushes, plus the identity
 `assert!(total_written >= 100 MiB)` is the analogue of todo 2's file-count floor.
 Without it, a `yes | head` that silently produced nothing would pass every ceiling
 assertion vacuously. Same for the shell list: `assert!(!shells.is_empty())`.
+
+## [2026-08-06] Task 48 — LSP framing, live diagnostics, and oracle isolation
+
+- LSP stdout must have exactly one reader. A request/write/read sequence cannot work:
+  servers publish diagnostics and issue reverse requests while responses are in
+  flight. One incremental `Content-Length` framer plus an id-keyed oneshot map
+  handles split headers, coalesced frames, notifications, and out-of-order replies.
+- A diagnostics test must isolate the selected server. An object-valued `lsp`
+  config enables every built-in before overrides; overriding only TypeScript also
+  starts ESLint/Biome candidates. The fixture disables every other built-in and then
+  supplies one explicit command.
+- The installed OpenCode 1.18.12 returns the expected TS2322 only with an explicit
+  TypeScript command override, and returns `[]` for a Rust E0425 that the same host's
+  rust-analyzer reports. Differential assertions therefore compare TypeScript
+  exactly and separately require a real rust-analyzer diagnostic rather than
+  encoding the oracle's empty Rust result.
+- The task prose says 39 built-ins, but the pinned `server.ts` exports 38 `Info`
+  values and `BUILTIN_SERVER_IDS` also contains 38. The registry test compares the
+  entire ordered id vector to the schema constant, avoiding a stale magic count.
