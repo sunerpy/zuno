@@ -332,3 +332,49 @@ files early rather than read for an hour.
 CodeGraph MCP has been uninitialized in every worktree for **three waves**; `context7` is
 quota-exhausted. Both are stated up front with "fall back immediately" so agents stop
 burning turns on them.
+
+## Wave 12 dispatch record (2026-08-06)
+
+Seven agents live. `main` = 2202 tests, 68/103 todos done.
+
+| todo | crate(s) | blocks |
+|---|---|---|
+| 47 | `oc-mcp/catalog.rs` (sole) | 64 |
+| 54 | `oc-server/compat_v1.rs` (sole) | 57-62 |
+| 55 | `oc-cli` (sole, fresh) | 56, 80-85 |
+| 58 | `oc-plugin/jsonrpc.rs` + new `oc-plugin-sdk` | 59-62 |
+| 78 | `oc-acp` (sole, fresh) | 86 |
+| 79 | `oc-tools/format.rs` + `oc-agent/plan_file.rs` | 86 |
+| 97 | trait in `oc-engine`, fake in `oc-testkit`, test in `oc-plugin` | 60, 73 |
+
+58 and 97 share `oc-plugin` — at the two-editor cap. 97 was told to add only a test
+file and to stay out of `src/{jsonrpc,hooks,manifest,discovery,payload,auth,provider}.rs`.
+
+Held back: **64** and **101** (both `oc-agent`, taken by 79), **73** (`oc-tui`, wants
+97's lease interface first).
+
+### Probes done up front
+
+- **`@agentclientprotocol/sdk` v0.21.0 is on disk** at
+  `opencode/node_modules/@agentclientprotocol/sdk`, so todo 78's live-SDK criterion is
+  satisfiable with no network fetch.
+- **Extracted the real CLI command list**: `index.ts:45-103` registers **23** commands.
+  The plan's implement list (12) + reject list (7) = 19, so **`AcpCommand`,
+  `AttachCommand`, `PluginCommand`, `TuiThreadCommand`** appear in the real
+  registration and in neither plan list, plus `GenerateCommand` which the plan defers.
+  That is precisely the "command vanishes without an entry" failure todo 55 exists to
+  prevent, so it was given the real list.
+
+### A plan self-contradiction found and resolved
+
+Todo 97's **title** says `crates/oc-tui/src/terminal_lease.rs` while its **body** says
+"Must NOT put the trait in `oc-tui`" and its acceptance requires
+`cargo tree -p oc-plugin` to show no `oc-tui`/`ratatui`. The title is wrong; the trait
+goes in `oc-engine`. Told the agent so and asked it to record the contradiction.
+
+### Running count of plan-vs-source discrepancies
+
+Four now, all found by measuring rather than trusting prose: 61→58 `/api` operations,
+20→21 plugin hooks, 19→23 CLI commands, and 97's title-vs-body. Plus two evidence-path
+typos (todo 57 → `task-51`, todo 58 → `task-52`). **The source has been right every
+time.** Prompts now say so explicitly and tell agents to count for themselves.
