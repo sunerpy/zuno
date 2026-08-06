@@ -33,6 +33,11 @@
 //! [`exposure`] answers only the first of two gates. The permission ruleset withholds
 //! `plan_exit` again from every agent but `plan`; that layer is [`oc_permission`]'s and
 //! a caller that stops at [`exposure`] will over-offer the tool.
+//!
+//! # Session recall
+//!
+//! [`session_search`] provides FTS5 discovery, anchored scrolling, and recent
+//! session browsing directly over SQLite, with no provider or LLM dependency.
 
 pub mod apply_patch;
 pub mod edit;
@@ -100,10 +105,12 @@ pub fn uses_apply_patch(model_id: &str) -> bool {
 pub mod glob;
 pub mod grep;
 pub mod search_common;
+pub mod session_search;
 
 pub use crate::glob::{GlobParams, GlobTool};
 pub use crate::grep::{GrepParams, GrepTool};
 pub use crate::search_common::{RESULT_LIMIT, SearchScope, SearchTooling};
+pub use crate::session_search::{SessionSearchParams, SessionSearchTool};
 
 pub mod webfetch;
 pub mod websearch;

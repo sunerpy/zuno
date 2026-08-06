@@ -43,6 +43,7 @@
 //! # Ok::<(), oc_error::DbError>(())
 //! ```
 
+pub mod fts;
 pub mod message;
 pub mod migration;
 pub mod open;
