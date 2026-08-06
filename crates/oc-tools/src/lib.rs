@@ -13,6 +13,11 @@
 //! bounded in time, response size and redirect hops, poll the turn's interrupt while
 //! a body streams, and treat everything they retrieve as data rather than
 //! instruction. See [`webfetch::bounds`] for the values and where each came from.
+//!
+//! # Session recall
+//!
+//! [`session_search`] provides FTS5 discovery, anchored scrolling, and recent
+//! session browsing directly over SQLite, with no provider or LLM dependency.
 
 pub mod apply_patch;
 pub mod edit;
@@ -79,10 +84,12 @@ pub fn uses_apply_patch(model_id: &str) -> bool {
 pub mod glob;
 pub mod grep;
 pub mod search_common;
+pub mod session_search;
 
 pub use crate::glob::{GlobParams, GlobTool};
 pub use crate::grep::{GrepParams, GrepTool};
 pub use crate::search_common::{RESULT_LIMIT, SearchScope, SearchTooling};
+pub use crate::session_search::{SessionSearchParams, SessionSearchTool};
 
 pub mod webfetch;
 pub mod websearch;
