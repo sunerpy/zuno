@@ -11,6 +11,7 @@
 
 pub mod builtin;
 pub mod plan_file;
+pub mod reflection;
 
 pub use plan_file::{
     PLANS_DIRECTORY, PROJECT_DIRECTORY, PlanKey, PlanLocation, plan_path, read_plan, write_plan,

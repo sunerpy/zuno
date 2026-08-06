@@ -20,6 +20,7 @@ publish.workspace = true
 # locally instead; see its doc comment for where the cross-crate check belongs.
 # ---------------------------------------------------------------------------
 [dependencies]
+async-trait = { workspace = true }
 oc-catalog = { workspace = true }
 oc-config = { workspace = true }
 oc-llm = { workspace = true }
@@ -28,8 +29,13 @@ oc-llm = { workspace = true }
 # one place that resolves it.
 oc-paths = { workspace = true }
 oc-permission = { workspace = true }
+oc-tool = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
+oc-error = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]
