@@ -3593,3 +3593,21 @@ Task 54's tests assert against the **assembled** app — `api::router` +
 `events_router` + `compat_v1_router` merged exactly as `main.rs` does — not just
 its own router. Two tests build that merged app on purpose. The seam question
 ("does my catch-all shadow theirs?") therefore has a test rather than an opinion.
+
+## Task 101: background reflection fork
+
+### Workspace-scoped LSP tool could not address the sibling worktree
+
+The native `lsp_diagnostics` request rejected
+`/config/workspace/ProdDir/AI/oc-wt/t101` because the tool session is rooted at the
+main checkout. The fallback `rust-analyzer -q diagnostics crates/oc-agent
+--severity warning` ran inside the Task 101 worktree and completed without reported
+diagnostics. Formatting, all 14 package tests, strict clippy, `cargo check`, and
+locked offline metadata also passed.
+
+### Reflection failures intentionally have no foreground retry path
+
+The fork catches both runner errors and task panics, logs them, and terminates the
+background attempt. Retrying from the foreground path would couple advisory memory
+maintenance to user-visible turn latency and could duplicate memory writes. A
+future retry policy, if needed, belongs inside the isolated runner.
