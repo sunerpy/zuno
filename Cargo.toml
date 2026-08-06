@@ -119,6 +119,25 @@ tower-http = { version = "0.7.0", features = ["fs", "trace", "cors"] }
 crossterm = "0.29.0"
 ratatui = { version = "0.30.2", features = ["serde"] }
 
+# -- pseudo-terminals -------------------------------------------------------
+# One crate covering unix `openpty` and Windows ConPTY, compiled into the binary.
+# The oracle instead loads a per-platform native addon at runtime — `bun-pty`
+# (`core/src/pty/pty.bun.ts`) or `@lydell/node-pty` (`pty.node.ts`) — so there is
+# no `.node` file to ship here and no `hasNativeBinding()` case to degrade into.
+#
+# It is the *only* dependency that lets `oc-pty` honour this workspace's
+# `unsafe_code = "forbid"`: creating a pty is `posix_openpt`/`grantpt` on unix and
+# `CreatePseudoConsole` on Windows, both of which are `unsafe` FFI. Verified by
+# building a probe crate that itself set `unsafe_code = "forbid"` against
+# portable-pty 0.9.0 — it compiled, spawned `sh`, read its output, observed exit
+# code 7, and resized, with no `unsafe` in the probe. A hand-rolled `forkpty` or a
+# raw `libc`/`nix` fd dance cannot satisfy that lint at all.
+#
+# Pinned exactly: the pty is the one subsystem where a patch-level behaviour
+# change (EOF timing, signal-to-exit-code mapping) would silently alter what a
+# session reports, and those are precisely the properties `oc-pty`'s tests assert.
+portable-pty = "=0.9.0"
+
 # -- filesystem, search, watching -------------------------------------------
 dirs = "6.0.0"
 globset = "0.4.20"
