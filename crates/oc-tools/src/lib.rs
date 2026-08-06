@@ -67,6 +67,19 @@
 //! [`risk`], because a formatter command is operator-authored and spawned as argv
 //! with no shell, so there is no model-composed string for that gate to judge.
 //!
+//! # Delegation
+//!
+//! [`task`] hands a bounded unit of work to a child session. Its five refusals —
+//! no target, two targets, a coordinator as target, the depth bound, and a
+//! permission denial — each carry a message that names the fix, because a
+//! delegation refusal is read by a model and `oh-my-opencode-slim` pays for the
+//! absence of that property with a nine-pattern recovery hook. There is
+//! deliberately **no** `load_skills` argument: skills are permission-gated per
+//! agent, so nothing about them is a property of the call. Targets come from
+//! [`oc_agent::builtin::delegable`] and the child's model from
+//! [`oc_agent::model_policy`], with this call's own `model`/`effort` as a fourth,
+//! highest rung on that ladder.
+//!
 //! # Resident memory
 //!
 //! [`memory`] is the one tool that writes [`oc_memory`]'s capped stores. It takes a
@@ -192,6 +205,16 @@ pub use crate::todo::{
 };
 
 pub mod memory;
+pub mod task;
+
+pub use crate::task::{
+    BACKGROUND_ID_PREFIX, ChildTurn, ChildTurnError, ChildTurnHost, ChildTurnRequest,
+    DEFAULT_SUBAGENT_DEPTH, DESCRIPTION as TASK_DESCRIPTION, DelegationLimits, DelegationPlan,
+    FixedFacts, GENERIC_EXECUTOR, GUIDANCE_KEY, ModelFacts, NoProviders,
+    PERMISSION_KEY as TASK_PERMISSION_KEY, ProviderFacts, RecordingHost as RecordingChildTurnHost,
+    TaskParams, TaskRejection, TaskTool, WIRE_ID as TASK_WIRE_ID, background_id, denial_guidance,
+    valid_targets,
+};
 
 pub use crate::memory::{
     DESCRIPTION as MEMORY_DESCRIPTION, MAX_CONSOLIDATION_FAILURES_PER_TURN, MEMORY_TOOL_ID,
