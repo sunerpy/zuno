@@ -12,6 +12,12 @@ publish.workspace = true
 [dependencies]
 async-trait = { workspace = true }
 base64 = { workspace = true }
+# `task` resolves its delegation target and its model through `oc-agent` rather than
+# re-listing either. The edge runs this way deliberately: `oc-agent/src/builtin.rs:78`
+# states its `GOVERNED_TOOL_IDS` inline "because the dependency edge runs the other
+# way … the cross-crate assertion belongs in `oc-tools`, where todo 65's `task` tool
+# already sees both crates". `tests/task.rs` is that assertion.
+oc-agent = { workspace = true }
 # For `formatter::ResolvedFormatters` only: todo 18 parsed the `formatter` config
 # and `oc-catalog` resolved its two-arm union, so `format` consumes that answer
 # rather than re-reading the config shape. The edge is one-way; `oc-catalog` does
@@ -19,6 +25,10 @@ base64 = { workspace = true }
 oc-catalog = { workspace = true }
 oc-db = { workspace = true }
 oc-error = { workspace = true }
+# `task` names todo 31's canonical effort levels and todo 25's provider capability
+# facts so it can refuse an effort the resolved provider cannot honour, instead of
+# inventing a second effort vocabulary here.
+oc-llm = { workspace = true }
 oc-memory = { workspace = true }
 oc-paths = { workspace = true }
 oc-permission = { workspace = true }
