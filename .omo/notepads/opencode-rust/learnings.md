@@ -3875,3 +3875,19 @@ positions are all greater than the wildcard's index.
   at the rendering boundary.
 - Recursion protection belongs after alias normalization. Guarding only the literal
   `execute` spelling leaves aliases as a trivial bypass.
+## [2026-08-06] Task 52 — owned HTTP API surface
+
+- The oracle exposes 58 `/api` operations. Excluding the two event streams owned by
+  task 53 leaves exactly 56 operations; the generated OpenAPI registry is tested as
+  a method/path set against the pinned 1.18.12 fixture.
+- Session listing belongs on `oc_db::session::ListQuery`: the HTTP layer only parses
+  the mutually exclusive directory/project scopes, applies the API default limit
+  of 50, and selects updated or created ordering. Literal subtree matching remains
+  in the store, where `%` and `_` cannot become wildcard bugs.
+- `oc-pty::PtyService` already provides the complete synchronous lifecycle needed
+  by list/create/get/update/delete handlers. Operations with no local backend are
+  registered explicitly and return structured `501 not_implemented` responses;
+  they never fabricate successful payloads.
+- Production startup opens and migrates the shared database, seeds the global
+  project idempotently, and merges the API router before server middleware. Tests
+  use an isolated shared-memory pool through the same initializer.

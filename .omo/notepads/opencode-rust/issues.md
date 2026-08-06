@@ -3217,3 +3217,23 @@ engine-internal calls.
   `t70` path with `LSP file path must be inside request cwd`. Direct
   `rust-analyzer diagnostics crates/oc-tools` completed instead; changed files had
   no errors, with only the existing inactive-test WeakWarning in `grep.rs`.
+## Task 52 — API count boundary and remaining differential gap
+
+- The protocol defines **61 operations total**, but only **58** are under `/api`.
+  Task 52 owns **56** because `GET /api/event` and
+  `GET /api/session/{sessionID}/event` belong to task 53. Treating any of these
+  three numbers as interchangeable either steals task 53's routes or drops the
+  non-API project-copy surface.
+- The three protocol operations outside `/api` currently have no owner in this
+  task: `POST /experimental/project/{projectID}/copy`,
+  `DELETE /experimental/project/{projectID}/copy`, and
+  `POST /experimental/project/{projectID}/copy/refresh`. The live exercise fixture
+  additionally contains the protocol-absent
+  `POST /experimental/project/{projectID}/copy/generate-name`; it is unowned too.
+- No live differential was run against the installed 1.18.12 binary for task 52.
+  The generated method/path subset and local HTTP behavior are verified, but wire
+  parity remains unverified. A future differential must normalize only volatile
+  values: session/PTY identifiers and slugs, timestamps, PTY pid/exit timing, the
+  temporary absolute directory/worktree, and generated cursor tokens. Status,
+  error code, field presence, array order, and nonvolatile values must not be
+  normalized.
