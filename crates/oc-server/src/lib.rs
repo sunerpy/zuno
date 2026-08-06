@@ -14,9 +14,13 @@
 mod auth;
 mod directory;
 mod event;
+mod events;
 mod server;
 
 pub use auth::AuthConfig;
 pub use directory::RequestDirectory;
 pub use event::{DEFAULT_EVENT_SUBSCRIBER_CAPACITY, Delivery, EventFanout, EventSubscription};
+pub use events::{
+    EventCursor, EventService, EventStreamError, NewEvent, StreamEvent, events_router,
+};
 pub use server::{BoundServer, ServerBuilder, ServerConfig, ServerError, ServerServices};
