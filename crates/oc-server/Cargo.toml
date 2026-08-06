@@ -10,6 +10,16 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+axum = { workspace = true }
+base64 = { workspace = true }
+clap = { workspace = true }
+oc-engine = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true }
 
 [lints]
 workspace = true
