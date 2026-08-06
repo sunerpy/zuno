@@ -4306,3 +4306,100 @@ non-empty with a `file:line` shape. The capture document, the diagnostics payloa
 and the 501 bodies all read the same table, so a route's justification cannot drift
 away from the route. That is the acceptance criterion "every implemented route maps
 to >=1 recorded callsite" made executable instead of reviewable.
+
+## [2026-08-06] Task 73: TUI foundation contracts
+
+**Components are `Component { render, handle_event }` trait objects composed by
+layout containers.** `render` receives only a ratatui frame/area; `handle_event`
+receives the TUI's `AppEvent`. Engine execution is not callable from rendering:
+`TurnEvent` is an input value, preserving the `oc-tui -> oc-engine` dependency.
+
+**Terminal input uses a lossless bounded channel of 64; engine events retain
+`TURN_EVENT_CHANNEL_CAPACITY` (64).** Both producers await capacity. The loop does
+not use `try_recv` or silently discard input. While a lease owns stdin, both receive
+branches are disabled, applying bounded backpressure; a race already selected at the
+suspension edge is retained and dispatched after reclaim.
+
+**Yield and reclaim are synchronous at the physical boundary.** Yield marks the TUI
+suspended, waits for the shared render lock, leaves the alternate screen, disables
+configured mouse capture, and restores cooked mode. The existing `TerminalBroker`
+then grants or refuses exactly as todo 97 decided. Guard drop/forced timeout re-enable
+raw mode, enter the alternate screen, restore mouse capture, clear stale cells, and
+complete a repaint before returning; forced reclaim also emits the broker diagnostic
+to stderr. No second exclusion or timeout policy exists in `oc-tui`.
+
+## [2026-08-06] Task 64: where preset data lives, and the three-rung ladder
+
+### Preset shape is code; preset data is configuration. `oc-agent` ships zero model ids.
+
+The acceptance test walks every `*.rs` under `crates/oc-agent/src` and fails on a
+model-id-shaped token, so a shipped preset could not have named one anyway — but the
+reason is not the test. A preset compiled into the binary **is**
+`CATEGORY_MODEL_REQUIREMENTS` with better manners: it encodes today's model market and
+rots on the next release. Slim looks like a counter-example and is not — its five
+`MODEL_MAPPINGS` presets are consumed only by the *installer*, which writes them into
+the user's config file, and the runtime reads `config.presets` and never the constant
+(see learnings). So the contract here is a shape (`PresetDocument`) and the data is a
+file: whatever an installer writes, a user hand-edits, or a future `Config` field
+carries. No preset asset ships either — an embedded TOML/JSON would put the ids back
+in the crate's build output and just move them past the source scan.
+
+### Resolution precedence: per-agent override > active preset > session model
+
+Three rungs, one test each, and the ladder is *skip-on-unavailable* rather than
+fail-on-unavailable:
+
+1. `agent.<name>.model` from the user's own config — the highest rung because it is the
+   most specific thing the user said.
+2. the active preset's entry for that agent.
+3. the session/global model — the default for **every** agent, which is todo 64's whole
+   point (slim's all-`undefined` table).
+
+A rung whose model is unavailable, or is not in `provider/model` form, is skipped with
+a `Diagnostic` and the next rung is tried. **The session model is never checked for
+availability**: there is nothing below it, and rejecting it would replace a working
+session with `None`.
+
+### Resolution has no error path. At all.
+
+The module has exactly one error type, `PresetError::Parse`, and it can only come from
+reading preset *bytes*. `ModelPolicy::resolve` / `resolve_category` / `resolve_roster`
+return a `Resolution`, never a `Result` — so "a missing preset entry must not
+hard-fail" is a **type-level** guarantee rather than a convention a later edit can
+forget. Everything that would have been an error is a `Diagnostic` carried alongside a
+usable answer: `UnknownPreset`, `UnknownCategory`, `ModelUnavailable`,
+`ModelNotQualified`, `UnknownVariant`. Mutation-tested: turning the unavailable branch
+into a `panic!` fails three independent tests.
+
+### Categories are a preset key and nothing else
+
+omo's eight categories are a good idea buried in a hardcoded table. Kept as a
+*shorthand*: `ModelPreset::with_category` puts a `{model, variant}` under a name, and
+`resolve_category` answers from the **active preset only**. There is no built-in
+category list — two presets may declare different categories or none, and a test
+asserts all eight of omo's names resolve to the session model against an empty preset.
+An unknown category is a diagnostic, not an error.
+
+### `ModelAvailability` is a trait, not a `&Catalog` parameter
+
+Resolution runs on paths where no catalog exists (`agent list` with no credentials),
+and a test proving the fallthrough should not have to build a models.dev document.
+`AnyModel` (not checking) and `NoModel` cover the ends; `impl ModelAvailability for
+oc_llm::catalog::Catalog` is the real answer and treats a **bare** model id as
+unavailable — choosing a provider for an unqualified id is exactly the entitlement
+guessing `CATEGORY_MODEL_REQUIREMENTS` hardcodes as ten provider ids per rung.
+
+### The model-id predicate moved into `model_policy`, and `builtin/tests.rs` imports it
+
+Todo 63 defined `looks_like_model_id` privately in `builtin/tests.rs`. Todo 64 needed
+it crate-wide *and* had to fix it (source citations `path/file:line` read as
+`provider/model`), but `builtin.rs` was owned by a sibling task. Resolution: the
+predicate lives in `model_policy` as `#[cfg(test)] pub(crate)` — test-only because
+preset data is exactly where model ids belong, so no shipping code has a use for it —
+and `builtin/tests.rs` imports it. One definition, so the two scans cannot drift.
+
+### No fourth rung for `small_model`
+
+The engine already routes its internal agents (`oc-engine/src/compaction.rs:404`).
+Adding a `small_model` rung here would give two places to disagree about which model
+titles a session. Internals resolve like any other agent and a test asserts it.

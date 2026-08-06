@@ -3593,3 +3593,58 @@ Task 54's tests assert against the **assembled** app — `api::router` +
 `events_router` + `compat_v1_router` merged exactly as `main.rs` does — not just
 its own router. Two tests build that merged app on purpose. The seam question
 ("does my catch-all shadow theirs?") therefore has a test rather than an opinion.
+
+## [2026-08-06] Task 73: TTY verification boundary
+
+The test environment has no controlling TTY. Tests therefore prove observable
+transition ordering, panic-before-report restoration, lease exclusion/timeout policy,
+and off-screen repaint, but cannot prove the kernel termios state changed, a real
+`bun`/`node` readline child receives cooked stdin, or crossterm escape sequences are
+interpreted by a terminal emulator. That live pty integration remains the explicitly
+deferred todo 76/compat-suite boundary from todo 97. No missing `oc-engine` seam was
+found; `TerminalOwner` and `TerminalBroker` were sufficient without modifying a
+sibling crate.
+
+The integrated `lsp_diagnostics` tool is rooted at the main checkout and rejects
+files in sibling worktrees. `rust-analyzer diagnostics .` was run from `oc-wt/t73`
+instead; it completed the workspace scan without an error in the changed `oc-tui`
+files. Cargo build, test, and clippy provide the remaining compiler diagnostics.
+
+## [2026-08-06] Task 64: no config key for preset selection (per-agent overrides need none)
+
+**Per-agent overrides need NO new key.** `agent.<name>.model` and
+`agent.<name>.variant` already exist (`oc-config/src/schema/agent.rs:129-135`) and are
+already merged onto built-ins by `oc_catalog::agent::apply` (`agent.rs:566-572`).
+`ModelPolicy::with_agent_overrides(&OrderedMap<AgentConfig>)` reads exactly those two,
+so a user who has configured a model for one agent does not learn a second mechanism.
+A `variant`-only entry is deliberately **not** an override — there is no model to
+attach it to.
+
+**Preset selection has no home in `oc-config`.** `Config` (`schema.rs:111-219`) has
+`model`, `small_model`, `default_agent`, `agent`, `provider` … and **no `preset` /
+`presets` field**. Slim's equivalents are top-level config keys (`config.preset`,
+`config.presets` — `src/index.ts:209-215`), plus an env override
+`OH_MY_OPENCODE_SLIM_PRESET` (`src/config/codemap.md:40`).
+
+`oc-config` was **not** modified — four sibling tasks were live and the plan scopes
+todo 64 to `oc-agent`. The seam left instead:
+
+* `model_policy::PresetDocument::parse_json(&str) -> Result<_, PresetError>` +
+  `PresetDocument::library() -> PresetLibrary`, so wiring is a two-field addition to
+  `Config` (`preset: Option<String>`, `presets: Option<OrderedMap<PresetBody>>`) and a
+  call, with no change to this module.
+* `PresetLibrary::select` accepts a name that does not exist on purpose — a stale
+  `preset` key must not stop the program from starting. Slim hit this and chose the
+  same way: "Missing preset → warning, continue with empty preset"
+  (`src/config/codemap.md:201`); `src/index.ts:216-218` clears the stale name.
+  `Diagnostic::UnknownPreset` carries the available names so the message can say the
+  way out.
+
+Whoever owns the `Config` schema next should add those two fields. Until then presets
+are reachable only by a caller that reads the JSON itself.
+
+**Reserved words.** A preset body cannot configure an agent literally named `agents` or
+`categories` (`model_policy::AGENTS_KEY` / `CATEGORIES_KEY`). That is the price of
+accepting the flat shape a neighbouring tool already writes; a body that declares one
+section may declare *only* sections, so a typo becomes a parse error rather than an
+agent named `agent`.

@@ -4176,3 +4176,100 @@ Three consequences worth knowing before reaching for this:
 - `method_not_allowed_fallback` must be applied **after** the routes it covers;
   axum retrofits it onto already-registered `MethodRouter`s only
   (`path_router.rs:116-126`).
+
+## [2026-08-06] Task 73: TUI lifecycle and TTY ownership
+
+Terminal restoration is testable without a controlling TTY by separating the
+idempotent `TerminalLifecycle` transition from crossterm. `FakeLifecycle` records
+active state and enter/restore ordering while ratatui's `TestBackend` proves the
+component tree and reclaim repaint. The headline panic test panics from
+`Component::handle_event`, observes that the panic hook made the lifecycle inactive
+*before* the reporter ran, and then proves the guard's later drop is idempotent.
+
+Panic hooks are process-global, so replacing/restoring one in every test is itself a
+race. Task 73 installs one permanent dispatcher with `OnceLock`, delegates to the
+pre-existing hook outside an active session, and serializes active session contexts
+with a process-global mutex guard held for the session lifetime. Eighteen concurrent
+test processes across three rounds all returned zero failures.
+
+## [2026-08-06] Task 64: preset-based model policy, and slim's installer sleight-of-hand
+
+**Slim's `DEFAULT_MODELS` is nine `undefined` entries, and the comment above it is the
+whole design argument** (`.omo/refs/omo-slim/src/config/constants.ts:26-41`), verbatim:
+
+> Default models for each agent.
+> All set to undefined so agents follow the global/session model.
+> Users can override per-agent via oh-my-opencode-slim.json agents.\<name\>.model.
+
+**Slim's five presets are NOT shipped policy — they are installer scaffolding.**
+This is the fact that decides where preset data may live. `MODEL_MAPPINGS`
+(`src/cli/providers.ts:11-56`) has five agent-keyed maps — `openai`, `kimi`,
+`copilot`, `zai-plan`, `opencode-go` — each `{agent → {model, variant}}` over six
+agents (`opencode-go` adds a seventh). But its ONLY consumer is `generateLiteConfig`
+(`:79-137`), which **writes them into the user's config file at install time**
+(`config.presets[presetName] = buildPreset(presetName)`). The runtime then reads
+`config.presets` (`src/index.ts:209-215`) and never touches the constant. Two of the
+five are even gated behind `GENERATED_PRESETS = ['openai', 'opencode-go']` (`:8`) —
+the other three are unreachable from the installer at all.
+
+So "provide named presets" and "no model id literal in the crate" are not in tension:
+preset **shape** is code, preset **data** is configuration. A preset compiled into the
+binary is `CATEGORY_MODEL_REQUIREMENTS` with better manners and rots identically.
+
+**Two preset body shapes have to be accepted, and an untagged enum silently eats one.**
+Flat (`{agent: {model, variant}}`, what slim's installer emits) is a *superset* of the
+structured field set (`{"agents": {...}, "categories": {...}}`), so
+`#[serde(untagged)]` reads `{"worker": …}` as a structured body with two defaulted
+empty maps and **drops every entry without a word**. `PresetBody`'s `Deserialize` is
+hand-written and branches on the presence of a reserved section key instead.
+
+**The shape of omo's Claude thinking-budget conditional, ported without its model list.**
+`oh-my-openagent/dist/index.js:28822-28829`:
+
+```js
+var CLAUDE_THINKING_BUDGET_TOKENS = 32000;
+function buildClaudeThinkingConfig(model) {
+  if (isClaudeOpus47OrLaterModel(model) || isClaudeFableOrMythosModel(model)) {
+    return {};                     // newer models: let native variants take over
+  }
+  return { thinking: { type: "enabled", budgetTokens: CLAUDE_THINKING_BUDGET_TOKENS } };
+}
+```
+
+The valuable half is the *empty return* — "the model knows better than my table, get
+out of the way". The rotten half is `isClaudeOpus47OrLaterModel`: a hand-written
+name-matching predicate (there are also `isGptNativeSisyphusModel`, `isGpt5_5Model`,
+`isGpt5_6Model` right below it at `:28832-28843`, each a regex or substring over the
+model name), so every model release needs a new one. Ported version: the branch is
+taken on a **catalog fact**. `model_policy::declared_variants` lifts
+`ResolvedModel::variants` — keyed by **name** — into todo 31's `DeclaredVariants` —
+keyed by canonical **effort** — so a model that declares `"max"` wins over the generic
+provider-family mapping inside `resolve_effort`, and a model that declares nothing
+gets the budget shape. A variant name that is *not* a canonical level but *is*
+declared (slim ships one: `variant: 'thinking'`, `providers.ts:48`) comes back
+verbatim as `EffortOutcome::ModelVariant` with the catalog's own option object.
+Nothing is synthesised, and no predicate needs updating when a model ships.
+
+**A crate-wide model-id source scan finds a false positive the prose scan never could.**
+Todo 63's `looks_like_model_id` only ever saw *rendered strings*. Pointed at source it
+failed instantly on `builtin.rs:49`'s citation `` `dist/index.js:24475` `` — a
+two-segment path with digits on the right is indistinguishable from `provider/model`.
+Fix: exclude tokens containing `:` from the `provider/model` branch only (no provider
+spells a model with a colon; the family branch runs first so real ids stay caught).
+The predicate therefore had to **move** into `model_policy` and be shared rather than
+duplicated — `builtin.rs` was owned by another task and could not be edited.
+
+**Every guard test that walks a directory needs BOTH floors.** `>= 6 files found` and
+`>= 3 files scanned`, because the exclusion list (`tests.rs`) could otherwise grow
+until the scan covers nothing. The exclusion itself is *verified*: for each excluded
+file the test reads the parent module and asserts it contains
+`"#[cfg(test)]\nmod tests;"`, so "a test module cannot reach the binary" is checked
+rather than assumed.
+
+**omo's category count is eight, and the plan's line numbers are one-off-inside-the-object.**
+`CATEGORY_MODEL_REQUIREMENTS` (`dist/index.js:24652`, plan said 24660) declares
+`visual-engineering, ultrabrain, deep, artistry, quick, unspecified-low,
+unspecified-high, writing` — 8, as the plan says — with 1-5 rungs each, every rung a
+model id plus up to ten provider ids. `AGENT_MODEL_REQUIREMENTS` is at `:24467` (plan
+said 24475). Both plan numbers point inside the object rather than at `var`, so they
+find it; nothing else in the plan's description of either table was wrong.
