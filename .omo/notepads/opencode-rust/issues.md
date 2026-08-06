@@ -3237,3 +3237,50 @@ engine-internal calls.
   temporary absolute directory/worktree, and generated cursor tokens. Status,
   error code, field presence, array order, and nonvolatile values must not be
   normalized.
+
+## [2026-08-06] GAP: the event stream serves `/event` but not `/api/event`
+
+Found in hands-on QA of the merged wave-11 tree, not by any test.
+
+Todo 53 mounts its stream at **`/event`** (`crates/oc-server/src/events/route.rs:20`).
+The real binary serves **four** event paths — measured from
+`.omo/fixtures/oracle-openapi-1.18.12.json`:
+
+```
+GET /event
+GET /api/event
+GET /api/session/{sessionID}/event
+GET /global/event
+```
+
+Live check against our merged binary:
+
+| path | ours |
+|---|---|
+| `/event?sessionID=ses_x` | **200** |
+| `/api/event?sessionID=ses_x` | **404** |
+| `/api/session/ses_x/event` | **404** |
+
+One of four is served. This slipped through because the two surfaces were split
+across concurrent tasks and each one's tests only covered its own half: todo 52 was
+explicitly told to leave the two `/api` event operations to todo 53, and todo 53's
+tests mount `events_router` directly rather than through the assembled app, so
+neither suite ever asked for `/api/event`.
+
+**`/global/event` is a fourth path no todo owns at all** — outside the `/api/*` scope
+todo 52 was given, like the other non-`/api` operations in todo 52's notes.
+
+### What has to happen
+
+A follow-up must mount the stream at all four paths (or whichever set upstream treats
+as aliases — `/event` and `/api/event` are plausibly one handler, and
+`/api/session/{sessionID}/event` is the per-session scope todo 53 already implements
+behind a `sessionID` **query** parameter rather than a path segment).
+
+### The generalisable lesson
+
+**Coordinating two tasks by omission leaves the seam untested by construction.**
+Splitting a crate between concurrent agents worked — no merge damage, no scope
+overlap — but neither agent owned the *join*. When work is split this way, one side
+must own an assembled-app test asserting the union of the routes, or the gap stays
+invisible until someone drives the real binary.
