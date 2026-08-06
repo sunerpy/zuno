@@ -10,12 +10,18 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 base64 = { workspace = true }
 futures = { workspace = true }
 oc-auth = { workspace = true }
+oc-catalog = { workspace = true }
 oc-config = { workspace = true }
 oc-error = { workspace = true }
+oc-llm = { workspace = true }
 oc-paths = { workspace = true }
+oc-permission = { workspace = true }
+oc-tool = { workspace = true }
+oc-tools = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

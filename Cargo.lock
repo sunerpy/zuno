@@ -2311,12 +2311,18 @@ dependencies = [
 name = "oc-mcp"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64 0.23.1",
  "futures",
  "oc-auth",
+ "oc-catalog",
  "oc-config",
  "oc-error",
+ "oc-llm",
  "oc-paths",
+ "oc-permission",
+ "oc-tool",
+ "oc-tools",
  "reqwest",
  "serde",
  "serde_json",
