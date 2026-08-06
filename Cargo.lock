@@ -2361,6 +2361,24 @@ dependencies = [
 [[package]]
 name = "oc-plugin"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "oc-auth",
+ "oc-config",
+ "oc-db",
+ "oc-engine",
+ "oc-error",
+ "oc-llm",
+ "oc-paths",
+ "oc-permission",
+ "oc-tool",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "url",
+]
 
 [[package]]
 name = "oc-plugin-sdk"
