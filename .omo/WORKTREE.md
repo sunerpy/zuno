@@ -220,3 +220,26 @@ merged mutation-tested code and the most expensive thing to reconcile.
   why the FTS layer had to stay out of `migration::apply` — it would have broken
   todo 20's `user_tables().len() == 20` assertion and its byte-compat snapshot
   against the real binary.
+
+### Wave 9 in-flight snapshot (for recovery after a context reset)
+
+All five agents are mid-implementation with **0 commits** on their branches; progress
+is visible only as untracked files in each worktree. If this session is interrupted,
+recover by reading each worktree's `git status` rather than assuming nothing happened:
+
+- `t44` — `registry.rs` + `tests/registry.rs` written, manifest and `lib.rs` edited
+- `t49` — `oc-pty` sources appearing
+- `t72` — `output_policy.rs` + `timeout.rs` written
+- `t68`, `t99` — reading phase, nothing on disk yet
+
+Continuation ids are in the dispatch table above. Use `task(task_id="ses_...")` to
+resume a specific agent rather than starting fresh; a fresh session re-reads every
+file and costs ~3-4× the tokens.
+
+**Merge order is not negotiable**: 49, 68, 99 (sole-owner crates, no `lib.rs`
+contention) → 44 → 72 last. 72 edits `shell.rs`, which is merged, mutation-tested
+code; reconciling it against 44's `lib.rs` edits is the most expensive conflict on
+the board, so it goes last when everything else is already proven.
+
+Gate every merge with `.omo/premerge.sh <n>`; it stops on the three hazard classes
+rather than silently unioning them.
