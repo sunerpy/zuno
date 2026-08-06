@@ -2377,12 +2377,14 @@ dependencies = [
  "oc-llm",
  "oc-paths",
  "oc-permission",
+ "oc-testkit",
  "oc-tool",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "toml",
  "url",
 ]
 
@@ -2518,13 +2520,16 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "clap",
+ "futures",
  "oc-catalog",
  "oc-db",
  "oc-engine",
  "oc-error",
+ "oc-llm",
  "oc-paths",
  "oc-pty",
  "reqwest",
+ "rusqlite",
  "schemars",
  "serde",
  "serde_json",
@@ -2553,8 +2558,10 @@ dependencies = [
 name = "oc-testkit"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "base64 0.23.1",
+ "oc-engine",
  "oc-paths",
  "serde",
  "serde_json",

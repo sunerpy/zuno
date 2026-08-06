@@ -7,3 +7,4 @@ pub mod r#loop;
 pub mod retry;
 pub mod status;
 pub mod stream;
+pub mod terminal_lease;
