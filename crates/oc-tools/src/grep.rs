@@ -147,6 +147,15 @@ impl TypedTool for GrepTool {
 
         let truncated = rows.len() == RESULT_LIMIT;
         let total = rows.len();
+        let files: Vec<String> = rows
+            .iter()
+            .map(|row| row.path.to_string_lossy().into_owned())
+            .fold(Vec::new(), |mut files, path| {
+                if files.last() != Some(&path) {
+                    files.push(path);
+                }
+                files
+            });
 
         let mut lines = vec![format!(
             "Found {total} matches{}",
@@ -178,7 +187,8 @@ impl TypedTool for GrepTool {
 
         Ok(ToolOutput::text(&params.pattern, lines.join("\n"))
             .with_metadata("matches", total)
-            .with_metadata("truncated", truncated))
+            .with_metadata("truncated", truncated)
+            .with_metadata("files", json!(files)))
     }
 }
 
@@ -205,6 +215,7 @@ fn empty(pattern: &str) -> ToolOutput {
     ToolOutput::text(pattern, EMPTY_OUTPUT)
         .with_metadata("matches", 0)
         .with_metadata("truncated", false)
+        .with_metadata("files", json!([]))
 }
 
 /// The failure for an empty `pattern`.
@@ -287,6 +298,7 @@ mod tests {
         assert_eq!(output.title, "zzzznomatchzzzz");
         assert_eq!(output.metadata["matches"], 0);
         assert_eq!(output.metadata["truncated"], false);
+        assert_eq!(output.metadata["files"], json!([]));
     }
 
     #[tokio::test]
@@ -308,6 +320,10 @@ mod tests {
             "the terminator inside each match text is the oracle's, and produces the blank lines"
         );
         assert_eq!(output.metadata["matches"], 2);
+        assert_eq!(
+            output.metadata["files"],
+            json!([dir.path().join("src/a.ts"), dir.path().join("src/b.ts")])
+        );
     }
 
     #[tokio::test]

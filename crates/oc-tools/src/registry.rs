@@ -7,14 +7,15 @@
 //! must also hide tools that arrived from an extension host.
 
 use crate::FileTools;
+use crate::batch::ExecuteTool;
 use crate::exposure::{ExposureFlags, exposure_predicate};
 use crate::websearch::gating::{SearchConfig, web_search_enabled};
 use oc_permission::Rule;
-use oc_permission::visibility::retain_visible_tools;
-use oc_tool::Tool;
+use oc_permission::visibility::{permission_key, retain_visible_tools};
+use oc_tool::{PermissionAsk, Tool, ToolContext, ToolOutput, ToolOutputStore, erase};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 /// The wire-level tool object stored by extension seams.
 pub type CustomTool = Arc<dyn Tool>;
@@ -261,25 +262,33 @@ impl ToolRegistryBuilder {
     pub fn build(self) -> ToolRegistry {
         let config_directories =
             oc_paths::config_directories(&self.directory, self.worktree.as_deref());
-        let mut tools = Vec::new();
-
-        for slot in BUILTIN_ORDER {
-            if slot.exposed_by_flags(&self.flags)
-                && let Some(tool) = self.builtins.get(&slot)
-            {
-                tools.push(Arc::clone(tool));
+        let output_store = ToolOutputStore::new(self.directory.join(".opencode/tool-output"));
+        let core = Arc::new_cyclic(|weak| {
+            let mut tools = Vec::new();
+            for slot in BUILTIN_ORDER {
+                if !slot.exposed_by_flags(&self.flags) {
+                    continue;
+                }
+                if let Some(tool) = self.builtins.get(&slot) {
+                    tools.push(Arc::clone(tool));
+                } else if slot == BuiltinSlot::Execute {
+                    tools.push(erase(ExecuteTool::new(
+                        RegistryHandle::new(weak.clone()),
+                        output_store.clone(),
+                    )));
+                }
             }
-        }
-
-        tools.extend(
-            self.custom_loader
-                .config_directory_tools(&config_directories),
-        );
-        tools.extend(self.custom_loader.plugin_tools());
-        tools.extend(self.mcp_loader.tools());
+            tools.extend(
+                self.custom_loader
+                    .config_directory_tools(&config_directories),
+            );
+            tools.extend(self.custom_loader.plugin_tools());
+            tools.extend(self.mcp_loader.tools());
+            RegistryCore { tools }
+        });
 
         ToolRegistry {
-            tools,
+            core,
             file_tools: self.file_tools,
             flags: self.flags,
             config_directories,
@@ -322,7 +331,7 @@ impl<'a> ResolveInput<'a> {
 
 /// The assembled registry, before and after per-turn filtering.
 pub struct ToolRegistry {
-    tools: Vec<Arc<dyn Tool>>,
+    core: Arc<RegistryCore>,
     file_tools: FileTools,
     flags: RegistryFlags,
     config_directories: Vec<PathBuf>,
@@ -332,7 +341,7 @@ impl ToolRegistry {
     /// Every loaded tool after process-wide exposure flags, before turn filters.
     #[must_use]
     pub fn all(&self) -> &[Arc<dyn Tool>] {
-        &self.tools
+        &self.core.tools
     }
 
     /// The config directory chain handed to the custom-tool loader.
@@ -362,6 +371,7 @@ impl ToolRegistry {
         ];
 
         let mut visible: Vec<Arc<dyn Tool>> = self
+            .core
             .tools
             .iter()
             .filter(|tool| {
@@ -392,6 +402,100 @@ impl ToolRegistry {
             .into_iter()
             .map(|tool| tool.id().to_owned())
             .collect()
+    }
+
+    /// Execute a tool through the registry's shared lookup and permission boundary.
+    pub async fn execute(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        ctx: ToolContext,
+    ) -> Result<ToolOutput, oc_error::ToolError> {
+        self.core.execute(name, arguments, ctx).await
+    }
+}
+
+struct RegistryCore {
+    tools: Vec<Arc<dyn Tool>>,
+}
+
+impl RegistryCore {
+    async fn execute(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        ctx: ToolContext,
+    ) -> Result<ToolOutput, oc_error::ToolError> {
+        let resolved = canonical_tool_name(name);
+        let tool = self
+            .tools
+            .iter()
+            .find(|tool| tool.id() == resolved)
+            .cloned()
+            .ok_or_else(|| oc_error::ToolError::NotFound {
+                tool: resolved.to_owned(),
+            })?;
+        ctx.ask(resolved, PermissionAsk::new(permission_key(resolved), "*"))
+            .await?;
+        tool.execute(arguments, ctx).await
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct RegistryHandle {
+    core: Weak<RegistryCore>,
+}
+
+impl RegistryHandle {
+    fn new(core: Weak<RegistryCore>) -> Self {
+        Self { core }
+    }
+
+    pub(crate) async fn execute(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        ctx: ToolContext,
+    ) -> Result<ToolOutput, oc_error::ToolError> {
+        let core = self
+            .core
+            .upgrade()
+            .ok_or_else(|| oc_error::ToolError::Failed {
+                tool: name.to_owned(),
+                source: Box::new(RegistryUnavailable),
+            })?;
+        core.execute(name, arguments, ctx).await
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("tool registry is no longer available")]
+struct RegistryUnavailable;
+
+/// Normalize names before registry lookup, including provider namespacing.
+#[must_use]
+pub(crate) fn canonical_tool_name(name: &str) -> &str {
+    let name = name.strip_prefix("functions.").unwrap_or(name);
+    match name {
+        "communicate" | "task_runner" | "subagent" | "Agent" | "Task" => "task",
+        "launch" => "open",
+        "shell" | "shell_exec" | "Bash" => "bash",
+        "read_file" | "file_read" | "Read" => "read",
+        "write_file" | "file_write" | "Write" => "write",
+        "edit_file" | "file_edit" | "Edit" => "edit",
+        "file_grep" | "Grep" => "grep",
+        "skill_manage" | "Skill" => "skill",
+        "discover_tools" => "integration_tools",
+        "todoread" | "todo_read" | "todo_write" | "todos" | "todo" | "TodoWrite" => "todowrite",
+        "WebFetch" => "webfetch",
+        "WebSearch" => "websearch",
+        "ApplyPatch" => "apply_patch",
+        "Question" => "question",
+        "PlanExit" => "plan_exit",
+        "Lsp" => "lsp",
+        "Execute" => "execute",
+        "ScheduleWakeup" => "schedule",
+        other => other,
     }
 }
 
