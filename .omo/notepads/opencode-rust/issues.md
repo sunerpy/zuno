@@ -3882,3 +3882,39 @@ attribute pass, not a semantic argument about whose type was correct. Note the r
 cost even so — a serde *contract* (`Serialize` + minimal output) owned by the narrow
 todo still forced a change across all nine of the wide todo's fields. Cross-cutting
 derives and serialization policy belong to the schema owner, not to the field adder.
+
+## [2026-08-06] Todo 101's five negative-list tests overlap; the gate is real but the tests are not independent
+
+Verified by mutation. Disabling the **whole** `is_negative_learning` gate
+(`crates/oc-agent/src/reflection/policy.rs:108`) fails **all five** safety tests, so
+the negative list is a real Rust gate, not prose:
+
+```
+safety::environment_dependent_failure_produces_no_memory_write ... FAILED
+safety::negative_tool_claim_produces_no_memory_write ... FAILED
+safety::transient_error_that_self_resolved_produces_no_memory_write ... FAILED
+safety::one_off_task_narrative_produces_no_memory_write ... FAILED
+safety::unresolved_failure_produces_no_memory_write ... FAILED
+```
+
+**But disabling any single predicate fails nothing.** I removed
+`has_environment_failure()` from the disjunction and all 14 tests still passed. The
+reason is that each fixture trips more than one predicate: the environment fixture is
+a single failed `jq --version` with no later success, so `has_unresolved_failure()`
+catches it too. Removing one item from the `NEGATIVE_LEARNING_LIST` string array also
+fails nothing, because that array is the **prompt text**, not the gate.
+
+So the current tests prove "the gate suppresses these five transcripts", which is the
+property that matters for safety, but they do **not** pin each predicate
+independently. A future refactor could delete `has_environment_failure` and stay green.
+
+**Fix when someone next touches this file**: give each safety test a fixture that
+trips *only* its own predicate, and add a per-predicate unit test. The environment case
+needs a failed command that is *not* also an unresolved failure — e.g. a
+`command not found` failure followed by a successful *different* command, so the
+session did end with a working method.
+
+**The generalisable rule**: a disjunction of N safety predicates needs N fixtures that
+each isolate one term. Otherwise the suite proves the disjunction, not the terms, and
+the weakest term can rot silently. Same class as "a test that cannot fail is not a
+test", one level up.
