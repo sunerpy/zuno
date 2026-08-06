@@ -2136,7 +2136,10 @@ dependencies = [
  "oc-llm",
  "oc-paths",
  "oc-permission",
+ "serde",
+ "serde_json",
  "tempfile",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
