@@ -21,6 +21,10 @@ oc-error = { workspace = true }
 oc-llm = { workspace = true }
 oc-paths = { workspace = true }
 oc-tool = { workspace = true }
+# The Markdown projection is watched, not watching: it consumes `oc-watch`'s own
+# `FileEvent` so there is exactly one file watcher in the workspace, in the crate
+# that owns watching. See `projection.rs` for why no `Watcher` is built here.
+oc-watch = { workspace = true }
 rusqlite = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }

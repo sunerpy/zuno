@@ -101,6 +101,25 @@ pub enum GoalError {
         max: usize,
     },
 
+    /// The Markdown projection could not be read or written.
+    ///
+    /// Separate from [`GoalError::Spill`] because the two files answer different
+    /// questions: a spill failure means an objective could not be *stored*, so
+    /// the write must fail, while a projection failure means the human-readable
+    /// copy is stale. SQL is still authoritative either way, which is why this
+    /// variant exists to be reported rather than to be recovered from.
+    #[error("goal document {operation} failed for {path}")]
+    Document {
+        /// What was being attempted: `read`, `write`, `rename`, `create directory`
+        /// or `back up`.
+        operation: &'static str,
+        /// The file or directory involved.
+        path: PathBuf,
+        /// The I/O failure.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// The system clock is before the Unix epoch, so no timestamp can be taken.
     #[error("the system clock is before the Unix epoch")]
     Clock(#[from] std::time::SystemTimeError),
@@ -118,9 +137,11 @@ impl GoalError {
             | Self::UnknownStatus { .. }
             | Self::GoalNotReplaceable { .. }
             | Self::EmptyObjective => true,
-            Self::Db(_) | Self::Spill { .. } | Self::PointerTooLong { .. } | Self::Clock(_) => {
-                false
-            }
+            Self::Db(_)
+            | Self::Spill { .. }
+            | Self::PointerTooLong { .. }
+            | Self::Document { .. }
+            | Self::Clock(_) => false,
         }
     }
 }

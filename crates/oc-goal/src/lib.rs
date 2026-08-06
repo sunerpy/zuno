@@ -12,7 +12,7 @@
 //! Ported from codex's `/goal` mechanism, `codex-rs/state/src/runtime/goals.rs`
 //! and `codex-rs/state/src/model/thread_goal.rs`.
 //!
-//! # The three decisions this crate makes
+//! # The four decisions this crate makes
 //!
 //! **Statuses are split by who may write them.** The model may report `blocked`
 //! or `complete` — facts about its own work. It may not write `paused`,
@@ -32,6 +32,14 @@
 //! goal that cascaded away with unrelated session state would defeat the whole
 //! point. See [`store`] for the full argument.
 //!
+//! **The Markdown document is a projection, and the conflict rule is fixed.** The
+//! goal is also rendered to `.opencode/goal/<sessionID>.md` for a human to read
+//! and edit. SQL stays authoritative for the status, the budget and the counters;
+//! the document is authoritative for the objective text, and nothing else. An
+//! edit outside that one region is refused *and reported inside the document*,
+//! because a file that could set the status would let an editor left open on a
+//! stale copy resurrect a completed goal by saving. See [`projection`].
+//!
 //! ```
 //! use oc_goal::{GoalStore, ModelStatus};
 //!
@@ -50,6 +58,7 @@
 
 pub mod continuation;
 pub mod error;
+pub mod projection;
 pub mod spill;
 pub mod status;
 pub mod store;
@@ -61,6 +70,11 @@ pub use crate::continuation::{
     render_goal_context,
 };
 pub use crate::error::GoalError;
+pub use crate::projection::{
+    Check, Document, Edited, Field, GITIGNORE_SNIPPET, GOAL_DIRECTORY, GoalProjection, Ingest,
+    Notes, OBJECTIVE_BEGIN, OBJECTIVE_END, PROJECT_DIRECTORY, Refusal, RejectedEdit, document_path,
+    parse, render,
+};
 pub use crate::spill::{
     MAX_OBJECTIVE_CHARS, OBJECTIVE_FILE_NAME, OBJECTIVE_POINTER_PREFIX, OBJECTIVE_POINTER_SUFFIX,
 };
