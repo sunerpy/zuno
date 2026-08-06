@@ -10,6 +10,19 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
+oc-engine = { workspace = true }
+oc-error = { workspace = true }
+oc-llm = { workspace = true }
+oc-tool = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
