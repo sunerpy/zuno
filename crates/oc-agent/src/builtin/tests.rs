@@ -8,6 +8,7 @@
 //! claim them — so the exemption cannot be borrowed by a newly added subagent.
 
 use super::*;
+use crate::model_policy::looks_like_model_id;
 use oc_llm::catalog::resolved::ModalityFlags;
 use oc_permission::visibility::{is_tool_hidden, permission_key};
 use std::collections::BTreeSet;
@@ -242,51 +243,9 @@ fn attachment_support_alone_does_not_make_a_model_vision_capable() {
     assert!(is_vision_capable(&image_input));
 }
 
-/// Families and shapes a model id is spelled with.
-fn looks_like_model_id(raw: &str) -> bool {
-    let token = raw.trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != '-');
-    let lower = token.to_ascii_lowercase();
-
-    const FAMILIES: [&str; 15] = [
-        "claude",
-        "gpt-",
-        "gpt4",
-        "gemini",
-        "sonnet",
-        "opus",
-        "haiku",
-        "kimi",
-        "glm-",
-        "grok",
-        "llama",
-        "mistral",
-        "qwen",
-        "deepseek",
-        "codestral",
-    ];
-    if FAMILIES.iter().any(|family| lower.contains(family)) {
-        return true;
-    }
-    for reasoning in ["o1", "o3", "o4"] {
-        if lower.starts_with(reasoning) && lower.len() > reasoning.len() {
-            return true;
-        }
-    }
-
-    // A `provider/model` pair. A digit on the right-hand side is what separates it
-    // from an ordinary source path: `src/auth.ts` and `utils/parser.ts` appear in the
-    // upstream prompts this roster carries, and neither is a model id.
-    let mut halves = lower.split('/');
-    let (Some(left), Some(right), None) = (halves.next(), halves.next(), halves.next()) else {
-        return false;
-    };
-    !left.is_empty()
-        && !right.is_empty()
-        && !lower.starts_with('/')
-        && !lower.starts_with('.')
-        && right.contains(|c: char| c.is_ascii_digit())
-}
-
+/// The scanner now lives in [`crate::model_policy`], which is the module whose whole
+/// contract is that no model id exists in this crate; both it and this roster's prose
+/// scan call the same definition rather than keeping two that drift.
 #[test]
 fn the_model_id_scanner_catches_model_ids_and_nothing_else() {
     for positive in [

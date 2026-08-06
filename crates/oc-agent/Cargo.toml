@@ -28,6 +28,11 @@ oc-llm = { workspace = true }
 # one place that resolves it.
 oc-paths = { workspace = true }
 oc-permission = { workspace = true }
+# `model_policy` reads preset data — the only place a model id may exist — as
+# configuration rather than shipping it as Rust source, so it needs a deserializer.
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
