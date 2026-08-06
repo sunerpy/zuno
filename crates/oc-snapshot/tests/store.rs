@@ -349,7 +349,18 @@ fn gc_reclaims_a_snapshot_superseded_more_than_the_prune_window_ago() {
     // Both trees must be content the source repository has never committed,
     // otherwise `write-tree` resolves them through `objects/info/alternates` and
     // no object is written into the store to reclaim.
-    fixture.write("a.txt", "first\n");
+    //
+    // Each revision must also differ in *length* from the one before it, not only
+    // in bytes. `Store::seed` copies the source repository's index, whose cached
+    // mtime has one-second granularity (git is built without `USE_NSEC`), so an
+    // edit made in the same second as the commit is indistinguishable by stat
+    // alone. `git add -A` then trusts the stale entry, `write-tree` hands back the
+    // *source's* tree, and the assertions below fail because that tree lives in
+    // the alternate rather than in the store. Differing sizes make `ce_match_stat`
+    // notice unconditionally, which is what makes this test deterministic under
+    // load — the second-boundary crossing that defeats git's racily-clean
+    // fallback is otherwise pure timing.
+    fixture.write("a.txt", "first revision\n");
     let old = store.track().expect("track").expect("enabled");
     fixture.write("a.txt", "second\n");
     let latest = store.track().expect("track").expect("enabled");

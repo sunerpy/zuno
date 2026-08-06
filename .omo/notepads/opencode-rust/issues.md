@@ -2480,3 +2480,87 @@ What remains, and what a fix task should test:
 as its merge gate. A load-correlated flake there will randomly block future merges
 and, worse, train the next reader to re-run until green — which is how a real
 regression gets waved through. Fix it before it does that.
+
+### RESOLVED — root cause was NEITHER hypothesis: `Store::seed`'s copied index has a second-granularity stat cache
+
+Both recorded hypotheses were refuted by runtime evidence; the real mechanism is a
+**stale stat cache in the index `seed()` copies from the source repository**, and it
+is a genuine production correctness hazard, not a test artifact.
+
+**Evidence.** Diagnostics printed at the failing assertion (8 concurrent runs of the
+target, ~50% failure rate) reported, every time:
+
+```
+DIAG old=2e81171448eb9f2ee3821e3d447aa6b2fe3ddba1 latest=24c34f943da5d883b979e2013cfc2408aeb7fbf3
+DIAG resolves(old)=true          <- the object IS reachable
+DIAG count-objects=count: 2      <- H1 refuted: nothing was packed
+DIAG packs=[]
+DIAG source has old? true        <- it lives in the SOURCE repo, not the store
+DIAG alternates=Ok(".../wt/.git/objects\n")
+```
+
+`2e81171448eb9f2ee3821e3d447aa6b2fe3ddba1` is **the fixture's own initial commit
+tree** — the tree of `{a.txt: "hello\n"}`, verified by building the fixture by hand.
+So `old` was not the tree of `"first\n"` at all: `git add -A` never noticed the edit,
+and `write-tree` handed back the tree the source repository had already committed.
+That tree resolves through `objects/info/alternates`, so no object was written into
+the store and `loose.is_file()` was correctly false.
+
+- **H1 (loose vs packed) is FALSE.** `count: 2`, `objects/pack/` empty. Nothing gc'd
+  or packed the object, so `gc.auto` is irrelevant and `INIT_CONFIG` was left alone.
+- **H2 (alternates) is the SYMPTOM, not the cause.** The comment's premise ("both
+  trees must be content the source repository has never committed") was sound; what
+  broke was that the *first* tree silently became content the source repo *had*
+  committed.
+
+**The mechanism.** `Store::seed` (`store.rs:495-499`) copies the source repository's
+`index` into the store. Git 2.43.0 here is built **without `USE_NSEC`**, so index
+entries cache `mtime` at one-second granularity. `"hello\n"` and `"first\n"` are both
+6 bytes, so when the edit lands in the same second as the fixture's commit,
+`ce_match_stat` sees identical mtime-seconds *and* identical size and calls the file
+clean. Git's racily-clean fallback (entry mtime >= index-file mtime ⇒ compare
+contents) normally saves this, but it stops applying once the index file is written
+in a *later* second than the cached mtime — and `init()` spawns `git init` plus eight
+`git config` processes between the edit and the index copy, so under load that
+second boundary is routinely crossed. Hence load-correlated, ~50%, always the same
+oid.
+
+Reduced to a deterministic shell repro (one worktree, seed order preserved):
+
+```
+same-size  (a.txt 6 bytes,  sleep 1.2 before seed) -> write-tree = 2e8117...  # the source's tree, WRONG
+diff-size  (a.txt 15 bytes, sleep 1.2 before seed) -> write-tree = 5d6739...  # correct, 2/2
+```
+
+**Fix applied (test-only).** `tests/store.rs` now writes `"first revision\n"`
+(15 bytes) instead of `"first\n"`, with a comment recording why the *length* must
+differ. Size is part of `ce_match_stat`, so the edit is detected unconditionally and
+the flake is removed at its source rather than papered over. Production `store.rs`
+was not touched: the oracle copies the index the same way
+(`packages/opencode/src/snapshot/index.ts`), so changing `seed()` would be a
+deliberate divergence needing its own decision. Verified 24/24 green across three
+rounds of 8 concurrent target runs; full workspace 1941 passed / 0 failed; clippy 0
+warnings; fmt clean.
+
+**Mutation proof the test still guards the behaviour.** Setting
+`GC_ARGS = ["gc", "--prune=never"]` makes it fail at `tests/store.rs:378`
+("a superseded snapshot past the prune window is reclaimed"); restored and green.
+Note that mutating `PRUNE` alone does **nothing** — `PRUNE` (`store.rs:46`) and
+`GC_ARGS` (`store.rs:53`) each hold the literal `7.days` independently, and only
+`GC_ARGS` reaches `gc()`. `oracle_gc_parameters_are_carried_verbatim` is the only
+thing tying them together; a future reader should not assume `PRUNE` is live.
+
+**Two hazards this leaves for later waves:**
+
+1. **`track()` can record a snapshot that does not reflect the worktree.** Any file
+   edited within the same second as the last commit *and* unchanged in size is
+   invisible to the first `track()` after `seed()` copies the index. Real users hit
+   this whenever an agent rewrites a file to the same length immediately after a
+   commit — a snapshot taken then silently restores the wrong content. Faithful to
+   the oracle, so it is a parity-preserving bug, not a regression; fixing it means
+   diverging (e.g. `git update-index --refresh` is no help — it is stat-based too;
+   the honest fix is not copying stat data, at the cost of the rehash `seed()` exists
+   to avoid).
+2. **Any new `oc-snapshot` test that edits a tracked file must change its length**,
+   or it inherits this exact flake. The other tests in the file happen to be safe
+   (`"hello\nworld\n"` is 12 bytes), which is why only this one flaked.
