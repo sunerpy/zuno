@@ -67,6 +67,7 @@
 //! reply.
 
 pub mod apply_patch;
+pub mod batch;
 pub mod edit;
 pub mod output_policy;
 pub mod read;
@@ -75,6 +76,7 @@ pub mod shell;
 pub mod timeout;
 pub mod write;
 
+pub use batch::{ExecuteParams, ExecuteTool, MAX_SUBCALLS, TOTAL_OUTPUT_BYTES};
 pub use read::{FileFormatter, NoopFormatter};
 
 use apply_patch::ApplyPatchTool;
