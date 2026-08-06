@@ -6,6 +6,14 @@
 //! only routes that already exist. This keeps later route additions from
 //! accidentally escaping the password gate.
 //!
+//! Two surfaces are served side by side. [`api`] owns the prefixed `/api/*`
+//! operations; [`compat_v1`] owns the unprefixed paths the published SDK — and so
+//! every resident plugin — actually requests. The v1 surface is deliberately a
+//! measured minimum rather than a full port, and it accounts for its own gaps: an
+//! unmeasured v1 path answers 404 with instructions instead of leaving a plugin to
+//! hang. See that module's docs for why the accounting is scoped to a prefix set
+//! rather than installed as a router fallback.
+//!
 //! Engine transitions enter [`EventFanout`] through
 //! [`EventFanout::forward_engine_events`]. Every connection receives its own fixed
 //! queue; a stalled connection loses new events and receives an explicit
@@ -13,12 +21,17 @@
 
 pub mod api;
 mod auth;
+pub mod compat_v1;
 mod directory;
 mod event;
 mod events;
 mod server;
 
 pub use auth::AuthConfig;
+pub use compat_v1::{
+    CompatV1State, Toast, ToastForwarder, UnknownRoutes, V1_PREFIXES, V1_SURFACE, V1Route,
+    compat_v1_router,
+};
 pub use directory::RequestDirectory;
 pub use event::{DEFAULT_EVENT_SUBSCRIBER_CAPACITY, Delivery, EventFanout, EventSubscription};
 pub use events::{
