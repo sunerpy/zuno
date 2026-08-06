@@ -877,6 +877,7 @@ fn theme_config_key_accepts_the_system_value() {
 fn theme_config_round_trips_through_serde() {
     let config = TuiConfig {
         theme: Some(String::from("nord")),
+        ..Default::default()
     };
     let json = serde_json::to_string(&config).expect("serializable");
     assert_eq!(json, "{\"theme\":\"nord\"}");

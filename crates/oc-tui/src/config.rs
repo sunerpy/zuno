@@ -30,7 +30,8 @@
 //! layer that walks directories and merges files is a separate concern.
 
 use serde::de::{self, MapAccess, Visitor};
-use serde::{Deserialize, Deserializer};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::num::{NonZeroU16, NonZeroU64};
@@ -70,7 +71,7 @@ pub enum TuiConfigError {
 }
 
 /// How a diff is laid out (`index.tsx:30-32`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiffStyle {
     /// Adapt the column count to the terminal width.
@@ -80,7 +81,7 @@ pub enum DiffStyle {
 }
 
 /// Scroll acceleration settings (`index.tsx:27-29`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ScrollAcceleration {
     /// Whether velocity accumulates across consecutive scroll events.
     pub enabled: bool,
@@ -128,14 +129,25 @@ impl<'de> Deserialize<'de> for MaxWidth {
     }
 }
 
+impl Serialize for MaxWidth {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // The two shapes have to stay asymmetric, because the deserializer above
+        // distinguishes them by JSON type, not by a tag.
+        match self {
+            Self::Auto => serializer.serialize_str("auto"),
+            Self::Columns(columns) => serializer.serialize_u16(columns.get()),
+        }
+    }
+}
+
 /// Prompt size settings (`index.tsx:45-51`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 pub struct PromptConfig {
     /// Maximum textarea height in rows.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_height: Option<NonZeroU16>,
     /// Maximum home prompt width.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_width: Option<MaxWidth>,
 }
 
@@ -204,6 +216,25 @@ impl<'de> Deserialize<'de> for BindingItem {
         }
 
         deserializer.deserialize_any(ItemVisitor)
+    }
+}
+
+impl Serialize for BindingItem {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.prevent_default {
+            // The string form is what a user writes and what the default table
+            // holds, so emitting the object form unconditionally would rewrite
+            // every plain spelling into noise on the way back out.
+            None => serializer.serialize_str(&self.key),
+            Some(prevent_default) => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("key", &self.key)?;
+                // Upstream spells this key in camelCase (`keybind.ts:8-27`); the
+                // deserializer above reads that spelling and nothing else.
+                map.serialize_entry("preventDefault", &prevent_default)?;
+                map.end()
+            }
+        }
     }
 }
 
@@ -291,37 +322,58 @@ impl<'de> Deserialize<'de> for BindingValue {
     }
 }
 
+impl Serialize for BindingValue {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            // `false` rather than the `"none"` sentinel: both deserialize back to
+            // `Disabled`, and `false` cannot be misread as a key named "none".
+            Self::Disabled => serializer.serialize_bool(false),
+            // A lone item is emitted bare, matching how the single-spelling form is
+            // written; wrapping it in an array would round-trip but churn the file.
+            Self::Keys(items) => match items.as_slice() {
+                [item] => item.serialize(serializer),
+                items => items.serialize(serializer),
+            },
+        }
+    }
+}
+
 /// The TUI configuration exactly as written, before defaults are applied.
 ///
-/// Field set from `packages/tui/src/config/index.tsx:53-66`. The keys this todo
-/// does not own (`theme`, `attention`, `plugin`, `plugin_enabled`) are absent and
-/// tolerated by the ignore-unknown policy documented on this module, so the todos
-/// that own them add one field each without touching anything here.
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+/// Field set from `packages/tui/src/config/index.tsx:53-66`, plus `theme`, which
+/// the theme layer added here rather than redefining the type. The keys still
+/// unowned (`attention`, `plugin`, `plugin_enabled`) are absent and tolerated by
+/// the ignore-unknown policy documented on this module, so the todos that own them
+/// add one field each without touching anything here.
+///
+/// Every field skips serializing when unset, so writing a parsed configuration
+/// back out yields only the keys the user actually spoke about instead of a wall
+/// of nulls and empty objects.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
 pub struct TuiConfig {
     /// JSON Schema reference, accepted and unused.
-    #[serde(default, rename = "$schema")]
+    #[serde(default, rename = "$schema", skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
     /// Per-action keybind overrides, keyed by action name.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub keybinds: BTreeMap<String, BindingValue>,
     /// Leader-key timeout in milliseconds.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub leader_timeout: Option<NonZeroU64>,
     /// Prompt size settings.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<PromptConfig>,
     /// Lines scrolled per wheel notch.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scroll_speed: Option<f64>,
     /// Scroll acceleration settings.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scroll_acceleration: Option<ScrollAcceleration>,
     /// Diff rendering style.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_style: Option<DiffStyle>,
     /// Whether mouse capture is enabled.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mouse: Option<bool>,
     /// The theme to render with.
     ///
@@ -330,7 +382,7 @@ pub struct TuiConfig {
     /// built-in default ([`crate::theme::DEFAULT_THEME`]). A name no layer provides
     /// is not an error: [`crate::theme::ThemeRegistry::resolve`] falls back and
     /// reports a diagnostic naming it.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
 }
 

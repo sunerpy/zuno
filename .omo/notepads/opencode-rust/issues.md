@@ -3830,3 +3830,55 @@ The fork catches both runner errors and task panics, logs them, and terminates t
 background attempt. Retrying from the foreground path would couple advisory memory
 maintenance to user-visible turn latency and could duplicate memory writes. A
 future retry policy, if needed, belongs inside the isolated runner.
+
+## Tasks 74 + 75: two concurrent todos both defined `TuiConfig`
+
+### What collided
+
+`crates/oc-tui/src/config.rs` is the TUI-only config surface, deliberately kept out of
+`oc-config` because upstream loads these keys from separate `tui.json`/`tui.jsonc` files.
+Both todos needed it, so both wrote it. Todo 74 wrote the full nine-key schema
+(`$schema`, `keybinds`, `leader_timeout`, `prompt`, `scroll_speed`,
+`scroll_acceleration`, `diff_style`, `mouse`) deriving `Debug, Clone, PartialEq,
+Default, Deserialize`. Todo 75 wrote a one-field `TuiConfig` holding only `theme`,
+deriving additionally `Eq` and `Serialize` with
+`#[serde(default, skip_serializing_if = "Option::is_none")]`.
+
+### How it was reconciled
+
+Todo 74's file won as the base; todo 75 contributed its `theme` field and `theme()`
+accessor. That built, but `cargo test -p oc-tui` did not: todo 75's
+`theme_config_round_trips_through_serde` was written against a one-field struct and
+asserted both `{"theme":"nord"}` and that `TuiConfig::default()` serializes to `{}`.
+Both assertions were kept, and the schema was made to satisfy them:
+
+- `Serialize` added to `TuiConfig` — purely additive, and todo 75's contract needs it.
+- `skip_serializing_if` on **every** field, not just `theme`. The `{}` assertion is a
+  property of the whole struct, so one unguarded field breaks it. `Option::is_none` for
+  the eight options, `BTreeMap::is_empty` for `keybinds`. `$schema` keeps its
+  `rename`; `rename` and `skip_serializing_if` compose without interference.
+- `Serialize` propagated to the nested types the fields reach (`DiffStyle`,
+  `ScrollAcceleration`, `PromptConfig` derived; `MaxWidth`, `BindingItem`,
+  `BindingValue` hand-written, because their deserializers distinguish shapes by JSON
+  type rather than by a tag and the encodings had to be chosen, not derived).
+- The test's struct literal gained `..Default::default()`, preserving its intent that
+  only `theme` is set.
+- **`Eq` was deliberately not added.** `scroll_speed: Option<f64>` makes it impossible.
+  No todo-75 test needed it, so nothing had to be adapted; had one needed it, the test
+  would have been adapted rather than the schema contorted.
+
+Mutation-proved: dropping the `keybinds` guard makes the `{}` assertion fail with
+`{"keybinds":{},"theme":"nord"}`.
+
+### The rule this implies
+
+**When two tasks must share one struct, the task that owns the wider schema should land
+first, and the later one adds a field rather than redefining the type.** Todo 74 wrote
+exactly that expectation into its doc comment — naming `theme`, `attention`, `plugin`
+and `plugin_enabled` as keys it did not own, and setting an ignore-unknown policy so a
+partially landed schema parses instead of erroring. That prediction is the whole reason
+the merge was cheap: the reconciliation was one field, one derive, and a uniform
+attribute pass, not a semantic argument about whose type was correct. Note the residual
+cost even so — a serde *contract* (`Serialize` + minimal output) owned by the narrow
+todo still forced a change across all nine of the wide todo's fields. Cross-cutting
+derives and serialization policy belong to the schema owner, not to the field adder.
