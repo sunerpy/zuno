@@ -960,8 +960,8 @@ fn the_table_declares_the_check_constraint_and_deliberately_no_foreign_key() {
         )
         .expect("count the tables");
     assert_eq!(
-        tables, 1,
-        "the goal database holds one table and shares nothing with opencode.db"
+        tables, 3,
+        "the goal database holds its goal and runtime tables"
     );
 }
 

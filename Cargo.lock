@@ -2099,14 +2099,20 @@ dependencies = [
 name = "oc-goal"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "oc-db",
+ "oc-engine",
  "oc-error",
+ "oc-llm",
  "oc-paths",
+ "oc-tool",
  "rusqlite",
+ "schemars",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",
+ "tokio",
  "uuid",
 ]
 

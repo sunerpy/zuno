@@ -10,23 +10,29 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 # `oc-db` supplies the connection, the pragmas and the `IMMEDIATE` transaction
 # helper. It is a dependency and *not* a host: the goal lives in its own database
 # file so that adding it cannot perturb `oc-db`'s byte-compatible 19-table
 # `opencode.db` schema. See `store.rs`.
 oc-db = { workspace = true }
+oc-engine = { workspace = true }
 oc-error = { workspace = true }
+oc-llm = { workspace = true }
 oc-paths = { workspace = true }
+oc-tool = { workspace = true }
 rusqlite = { workspace = true }
+schemars = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 # A spilled objective is addressed by a v4 UUID directory, which is also what
 # makes the pointer sentence unforgeable: a path whose parent is not a UUID is
 # rejected rather than read. Ports `codex-rs/tui/src/goal_files.rs:171`.
 uuid = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]
