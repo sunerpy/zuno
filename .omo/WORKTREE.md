@@ -158,3 +158,30 @@ Then it gates, in this order (order matters):
 
 Both static checks were self-tested against known-good `main` and report clean,
 so a hit is a real regression, not a false positive.
+
+## Disk budget, measured 2026-08-06
+
+`/config` sits at 95% (40G free) with six live worktrees. Per-worktree cost is
+**~2.4-3.4G of `target/`** (each worktree gets its own; `CARGO_TARGET_DIR` is NOT
+exported, so there is no cross-worktree sharing and no cross-worktree cache reuse).
+`opencode-rust/target` is another 5.9G.
+
+Budget rule: **~3G per concurrent worktree, plus ~1.5G growth as it adds deps.**
+Six concurrent tasks is roughly the ceiling at current free space. Prefer merging
+and removing a worktree before adding a seventh.
+
+The large `/tmp` consumers are NOT this project's and must not be reclaimed here:
+`gs-pg-atlas2` (28G, live postgres socket), `atlas-t` (15G, another project's cargo
+target), `r12-b4-momus.*` (2.6G, `godot-mcp-*` crates), `oc15`, `tv-cache`.
+Inside `/tmp/opencode` (the pre-approved scratch) `godot-mcp-f3-dry-run-*` (11G) and
+`t14-target` (3.2G) belong to unrelated finished tasks — not ours to delete.
+
+Note: `fuser -m <dir>` answers "who has this *mount* open" and on `/tmp` returns
+hundreds of PIDs. It is useless for deciding whether a directory is in use.
+
+## Merge-conflict blast radius: cap concurrent editors per crate
+
+Three of the wave-7 breakages came from four tasks landing in `oc-tools` at once.
+Rule now: **at most two in-flight tasks per crate**, and when a choice exists,
+dispatch the todo whose crate has no other editor. Todos in a fresh crate
+(`oc-pty`, `oc-watch`, `oc-goal`, `oc-memory`) are free of this cost entirely.
