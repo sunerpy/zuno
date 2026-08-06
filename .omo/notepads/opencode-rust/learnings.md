@@ -2729,3 +2729,205 @@ The permission key is always obtained from `oc_permission::visibility::permissio
 - Other/plugin tools: first all non-empty known resource keys (`path`, `filePath`, `file_path`, `url`, `uri`, `query`, `pattern`, `command`, `name`); if none exist, stable key-sorted canonical JSON with `intent` and `accept_large_output` removed; an otherwise empty object becomes `*`.
 
 Duplicate patterns are removed without changing first-seen order. The original arguments are also placed in permission metadata. `jsonschema = 0.37.1` is exact-pinned and used before permission or execution, so malformed/schema-invalid calls become model-visible error results without running the tool.
+
+## Task 35
+- Oracle summary prompt compatibility shape: `## Objective`, `## Important Details`, `## Work State` (`### Completed`, `### Active`, `### Blocked`), `## Next Move`, and `## Relevant Files`; every section remains present, terse, and exact paths/symbols/commands/errors/URLs/IDs are preserved.
+- Trigger resolution: `auto=true`, `prune=false`, `tail_turns=2`; derived `reserved=min(20_000,max_output)` unless configured, usable threshold is `context - max(max_output,reserved)`; derived `preserve_recent_tokens=clamp(usable/4,2_000,8_000)` unless configured. Threshold compaction requires auto and used >= usable; typed `ContextLimit` always enters compaction.
+- Boundary rule: retain leading initial context; identify recent real user turns; scan backward within `preserve_recent_tokens`; then walk the split backward whenever the retained suffix starts with or contains a `ToolResult` whose matching `ToolUse` lies before the split. This avoids provider 400 responses for orphaned tool messages.
+- Oracle contradiction: current TypeScript `SessionCompaction.process` resolves an explicit `compaction` agent model or falls back to the current user model; it does not directly select global `small_model`. Todo 35 explicitly requires the small model, so the Rust API takes `small_model_id` and the cassette asserts that exact model is called.
+## Task 39
+
+### Exact model-facing parameters
+- read: `filePath` — `The absolute path to the file or directory to read`; `offset` — `The line number to start reading from (1-indexed)`; `limit` — `The maximum number of lines to read (defaults to 2000)`.
+- write: `content` — `The content to write to the file`; `filePath` — `The absolute path to the file to write (must be absolute, not relative)`.
+- edit: `filePath` — `The absolute path to the file to modify`; `oldString` — `The text to replace`; `newString` — `The text to replace it with (must be different from oldString)`; `replaceAll` — `Replace all occurrences of oldString (default false)`.
+- apply_patch: `patchText` — `The full patch text that describes all changes to be made`.
+
+### Exact tool descriptions
+read:
+Read a file or directory from the local filesystem. If the path does not exist, an error is returned.
+
+Usage:
+- The filePath parameter should be an absolute path.
+- By default, this tool returns up to 2000 lines from the start of the file.
+- The offset parameter is the line number to start from (1-indexed).
+- To read later sections, call this tool again with a larger offset.
+- Use the grep tool to find specific content in large files or files with long lines.
+- If you are unsure of the correct file path, use the glob tool to look up filenames by glob pattern.
+- Contents are returned with each line prefixed by its line number as `<line>: <content>`. For example, if a file has contents "foo\n", you will receive "1: foo\n". For directories, entries are returned one per line (without line numbers) with a trailing `/` for subdirectories.
+- Any line longer than 2000 characters is truncated.
+- Call this tool in parallel when you know there are multiple files you want to read.
+- Avoid tiny repeated slices (30 line chunks). If you need more context, read a larger window.
+- This tool can read image files and PDFs and return them as file attachments.
+
+write:
+Writes a file to the local filesystem.
+
+Usage:
+- This tool will overwrite the existing file if there is one at the provided path.
+- If this is an existing file, you MUST use the Read tool first to read the file's contents. This tool will fail if you did not read the file first.
+- ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.
+- NEVER proactively create documentation files (*.md) or README files. Only create documentation files if explicitly requested by the User.
+- Only use emojis if the user explicitly requests it. Avoid writing emojis to files unless asked.
+
+edit:
+Performs exact string replacements in files. 
+
+Usage:
+- You must use your `Read` tool at least once in the conversation before editing. This tool will error if you attempt an edit without reading the file. 
+- When editing text from Read tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format is: line number + colon + space (e.g., `1: `). Everything after that space is the actual file content to match. Never include any part of the line number prefix in the oldString or newString.
+- ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.
+- Only use emojis if the user explicitly requests it. Avoid adding emojis to files unless asked.
+- The edit will FAIL if `oldString` is not found in the file with an error "oldString not found in content".
+- The edit will FAIL if `oldString` is found multiple times in the file with an error "Found multiple matches for oldString. Provide more surrounding lines in oldString to identify the correct match." Either provide a larger string with more surrounding context to make it unique or use `replaceAll` to change every instance of `oldString`. 
+- Use `replaceAll` for replacing and renaming strings across the file. This parameter is useful if you want to rename a variable for instance.
+
+apply_patch:
+Use the `apply_patch` tool to edit files. Its patch language is a stripped-down, file-oriented diff envelope: `*** Begin Patch`, one or more Add/Delete/Update sections, then `*** End Patch`. Add lines require `+`; Update supports optional `*** Move to:` and `@@` hunks. The implementation preserves the exact oracle parameter and grammar surface.
+
+### Verified conditional rule
+Oracle `packages/opencode/src/tool/registry.ts:292-295`: `const usePatch = input.modelID.includes("gpt-") && !input.modelID.includes("oss") && !input.modelID.includes("gpt-4")`; `ApplyPatchTool` is present when `usePatch`; `EditTool` and `WriteTool` are present when `!usePatch`. This is substring-based, not a semantic version comparison.
+
+
+## Task 42 — web tools (webfetch, websearch)
+
+**Verified search env vars.** The plan named three; there are eight, and the plan
+pointed at the wrong file. `packages/core/src/flag/flag.ts` contains **none** of
+them (grep: 0 matches). The real sources are
+`packages/opencode/src/effect/runtime-flags.ts:31-39` and
+`packages/core/src/tool/websearch.ts:76-83`:
+
+| variable | what it does |
+|---|---|
+| `OPENCODE_WEBSEARCH_PROVIDER` | **routes only** (`exa`\|`parallel`); does NOT enable the tool |
+| `OPENCODE_ENABLE_EXA` | enables Exa, and with it the tool |
+| `OPENCODE_EXPERIMENTAL_EXA` | legacy spelling of the above, still honoured |
+| `OPENCODE_ENABLE_PARALLEL` | enables Parallel, and with it the tool |
+| `OPENCODE_EXPERIMENTAL_PARALLEL` | legacy spelling, still honoured |
+| `OPENCODE_EXPERIMENTAL` | blanket switch — **enables Exa ONLY** |
+| `EXA_API_KEY` | key, in the URL as `?exaApiKey=` |
+| `PARALLEL_API_KEY` | key, as `Authorization: Bearer` |
+
+Two traps in that table. `OPENCODE_WEBSEARCH_PROVIDER=exa` does **not** make the
+tool appear — `webSearchEnabled` (`registry.ts:58-60`) never reads it, so setting
+it on a non-`opencode` provider leaves the tool absent and the override inert. And
+`OPENCODE_EXPERIMENTAL` is in `enableExa`'s disjunction but *not* `enableParallel`'s;
+verified in both `runtime-flags.ts:31-39` and `core/src/tool/websearch.ts:79-80`, so
+the asymmetry is deliberate, not a typo in one place.
+
+**Registry key vs wire id — plan confirmed, and it generalizes.** `fetch` is the
+registry key, `webfetch` the wire id (`registry.ts:216`, `webfetch.ts:24`). The plan
+did not mention that `websearch` has the same split: registry key `search`
+(`registry.ts:218`). `Tool::id()` returns the **wire** id in both cases, because that
+is what the model emits and what `oc-config`'s `KNOWN_KEYS` uses as the permission
+key. The registry-side keys are internal handles with no wire meaning.
+
+**`http` → `https`: the description lies, and upstream lies the same way.**
+`webfetch.txt` states "HTTP URLs will be automatically upgraded to HTTPS". No
+upstream implementation does it: v1 (`webfetch.ts:34-36`) prefix-checks, v2
+(`webfetch.ts:82-84`, `assertHttpUrl`) protocol-checks, and neither rewrites. The
+request goes out against the URL as given. Reproduced the behaviour and kept the
+text byte-identical rather than shipping a different description than upstream.
+
+**The three bounds, with lines.**
+
+| | webfetch | websearch |
+|---|---|---|
+| size | 5 MiB — `core/src/tool/webfetch.ts:17` | 256 KiB — `core/src/tool/websearch.ts:25` |
+| time | 30 s default / 120 s max — `:18-19` | 25 s — `:181` |
+| redirects | 10 hops — **no oracle line** | 10 hops |
+
+The redirect cap is this port's. Upstream never states one and inherits undici's
+default, which is how a cycle becomes unbounded. Ten is undici's and every browser's
+limit, so naming it changes no reachable page.
+
+**API keys are environment-only.** `core/src/tool/websearch.ts:81-82` reads
+`process.env` directly and never touches the credential store; `auth.json` holds
+model-provider credentials and neither `exa` nor `parallel` is a model provider
+there. Checked before assuming, per the task brief.
+
+**`cargo test <filter>` under-runs across targets.** `cargo test -p oc-tools web` —
+the plan's literal acceptance command — reports `76 passed` for the lib (test names
+carry the module path `webfetch::tests::…`) and `0 passed; 22 filtered out` for the
+`webfetch` integration binary, whose test fn names contain no "web". The hazard note
+in the brief is real and bit here. Use `--test <name>`.
+
+**wiremock's `set_body_string` sets its own `Content-Type: text/plain`,** silently
+overwriting an earlier `insert_header("content-type", "text/html")`. Cost four
+failing tests that believed they were serving HTML. Use `set_body_raw(body, mime)`.
+Separately, hyper *panics* on a hand-written `content-length` that disagrees with the
+body, so a "lying header" cannot be faked; test the declared-size path with an
+accurate oversized length instead.
+
+## Task 41 — search: the exact rg flags, the ordering truth, and the ignore/hidden semantics
+
+### The exact flags the oracle passes (`packages/core/src/ripgrep.ts`)
+
+| entry point | argv |
+|---|---|
+| `glob` (:160-168) | `--no-config --files [--hidden] [--follow] --glob=<pattern> --glob=!**/.git/** .` |
+| `find` (:192-200) | as `glob`, but the `--glob` is omitted entirely when the pattern is `*` |
+| `grep` (:221-231) | `--no-config --json --hidden --no-messages [--glob=<include>] --glob=!**/.git/** -- <pattern> <file\|.>` |
+
+What each implies for an embedded engine built on `ignore` + `grep-searcher`:
+
+- `--files` → walk yielding regular files only; a directory is a traversal step, never a result.
+- `--glob=<p>` → `OverrideBuilder::add`. **A whitelist, not a post-filter** — see below.
+- `--glob=!**/.git/**` is appended **last** on every call, so in the gitignore last-match-wins
+  ordering it beats any include: a caller asking for `**/*` still never gets the object store.
+- `--hidden` is passed **unconditionally for grep** and **never for glob**. Note the polarity trap:
+  `WalkBuilder::hidden(true)` means *skip* hidden, so `--hidden` is `hidden(false)`. Getting this
+  backwards is a silent 2-file difference on a small tree and invisible on a large one.
+- `--no-messages` → per-entry and per-file errors are skipped, not surfaced.
+- `--no-config` → nothing may read `RIPGREP_CONFIG_PATH`.
+- `--json` → the record shape is `packages/schema/src/filesystem.ts:14-33`; `text` **keeps the line
+  terminator**, `offset` is the byte offset of the *line*, not of the match.
+- No `-U`/`--multiline`, no `--sort`, no `--crlf`, no `-i`. So: `line_terminator(Some(b'\n'))` on the
+  matcher, `multi_line(false)` on the searcher, `BinaryDetection::quit(0)`, case-sensitive.
+- Caps the oracle applies after the fact: line text sliced at 2000 (`ripgrep.ts:267`) and submatches
+  at 100 (`:20`). The 2000 is a JS `String.length` comparison, i.e. **UTF-16 code units** — a
+  byte-counting or char-counting port disagrees on the first non-ASCII long line.
+
+### `--glob` is a whitelist whose precedence beats gitignore AND the hidden rule
+
+`ignore-0.4.33/src/dir.rs:511-522` returns an override match *immediately*, before any ignore file is
+consulted, and `walk.rs:481` skips a hidden path only "if the path hasn't been whitelisted". So the
+oracle's `glob` tool, which always passes `--glob=<pattern>`, **returns gitignored and hidden files**
+when the pattern names them. Measured against 1.18.12:
+
+```
+$ opencode debug rg files --glob '**/*.ts'
+.hidden_file.ts        <- hidden, returned: the glob whitelisted the file
+ignored.ts             <- in .gitignore, returned: same reason
+nested/deep/d.ts  src/a.ts  src/b.ts
+```
+and in the same run `.hidden_dir/e.ts` and `node_modules/pkg/f.ts` are **absent**, while `**/*`
+returns both. The difference is that a whitelist glob is matched against **directories** too: `**/*`
+matches `.hidden_dir`, so the directory is whitelisted and traversed; `**/*.ts` does not, so the
+directory is pruned by the hidden/ignore rule before the walk ever sees its children. Corollary that
+bit the differential: `--glob '.hidden_dir/**'` returns **nothing**, because it does not match
+`.hidden_dir` itself; `--glob '{.hidden_dir,.hidden_dir/**}'` returns the file.
+
+### `require_git` is on
+
+`ignore`'s and ripgrep's default is `require_git = true`: a `.gitignore` in a tree with **no `.git`
+anywhere** is not applied. Verified with rg 15.1.0 — `secret.ts` comes back despite being listed. Any
+fixture that means to test ignore semantics must `git init`, or it silently tests nothing.
+
+### Ordering: there is no oracle order to preserve
+
+No `--sort` is passed, so the walk is parallel. Five consecutive `opencode debug rg files` runs over
+one **unchanged** ten-file tree returned five different orders (transcript in the evidence file).
+"Identical ordering" in the acceptance criterion can therefore only mean identical after sorting both
+sides. Both `oc-search` backends emit **path-sorted** results (`WalkBuilder::sort_by_file_path`, i.e.
+`rg --sort=path`), which is not a change to anything that could have been depended on and buys three
+things the oracle lacks: deterministic truncation ("the first 100 of a stable order"), correct
+`grep` grouping (a path can never head two separate groups), and a diffable transcript.
+
+### Submatch spans must be located on the line *without* its terminator
+
+`grep-searcher` matches against `lines::without_terminator(...)` (`searcher/core.rs:120`), so calling
+`Matcher::find_iter` on `SinkMatch::bytes()` — which *includes* the `\n` — finds nothing for any
+`$`-anchored pattern: Rust's regex has no "before a final newline" rule. The differential caught this
+as `"submatches": []` against the oracle's `start: 0, end: 23` for `export const needle = 0$`.
+Offsets are unaffected because the terminator only ever sits at the end.

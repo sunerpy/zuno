@@ -105,3 +105,27 @@ Rules going forward:
    prompts. Wave 5 dispatched all four together and paid one fix task for it.
 3. After merging a batch, run `cargo clean -p` for every crate in the batch
    before trusting the suite (see the stale-`CARGO_MANIFEST_DIR` hazard above).
+
+## HAZARD: mechanical union-merge is unsafe for TOML and for file-head docs
+
+Wave 7 cost three fix commits, all from the same root cause: my union-merge script
+de-duplicates **by line**, which is correct only for homogeneous single-line lists.
+
+Two shapes where it breaks:
+
+1. **TOML section semantics.** Three branches each added `[dev-dependencies]`
+   entries; line-union produced **three `[dev-dependencies]` tables** and
+   `cargo metadata` failed with "Cannot declare ('dev-dependencies',) twice".
+   It also mis-filed seven runtime deps into the dev section.
+2. **Rust inner doc comments.** Three branches each wrote a `//!` module header;
+   line-union appended the 2nd and 3rd **after** the first section's items, giving
+   `error[E0753]: expected outer doc comment`. `cargo build` caught it but only
+   after the manifest was already fixed.
+
+**Rule**: when a merge conflicts in a `Cargo.toml` or in the first ~20 lines of a
+`lib.rs`, do NOT trust the script. Run `git show <branch>:<path>` for **every**
+branch involved, then rewrite the file from those facts. The script is fine for
+`pub mod` lines and nothing else.
+
+**Also**: `cargo metadata` can report a stale exit code right after a manifest
+write. Re-run it before concluding the manifest is still broken.

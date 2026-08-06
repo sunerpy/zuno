@@ -2545,3 +2545,155 @@ The caller supplies a database-unique `turn_id`; assistant and part IDs are dete
 - **Background grace:** 750 ms, matching `.omo/refs/jcode/crates/jcode-app-core/src/agent/turn_streaming_mpsc.rs:1366-1412`. Dispatch uses a biased select: normal completion wins, then a background signal gets 750 ms for graceful completion before the join handle is detached, while the turn receives a synthesized successful background status; a turn interrupt aborts the task and returns an error result.
 - **Dispatcher wiring:** `ToolRegistryDispatcher::new(tools, merged_rules, approval, background_tool, mcp_status)` receives registry assembly rather than owning it. `available_tools()` applies `oc-permission` visibility and emits definitions. `dispatch()` is the only name-resolution/miss choke point, validates against the augmented definition schema, applies the argument-derived permission ask, constructs `ToolContext`, spawns execution, and converts every tool/join/input/name failure into `ToolDispatchResult`. `loop.rs` remains the owner of sequential iteration and running/completed/error events and was not modified.
 - **Permission resolution:** an unconditional rule allow proceeds; deny synthesizes a denied tool result; ask blocks on the supplied `PermissionAsker` before execution. The per-dispatch context asker re-evaluates later, more precise asks from built-ins and remembers approved `(permission, pattern)` pairs for that call only, preventing a parent grant from laundering unrelated subcalls.
+
+## Task 35
+- Context-limit attempts are recorded only through Todo 36 `RecoveryBudgets::record_context_limit_retry`; `CompactionState` adds only a terminal failure latch, not a parallel attempt counter. A failure persists `CompactionError`, latches the state, and a second call returns `AlreadyFailed` without a provider request.
+- Plugin-host seam: `CompactionHooks::compacting` mirrors `experimental.session.compacting` with mutable context/prompt output; `CompactionHooks::auto_continue` mirrors `experimental.compaction.autocontinue`. `NoopCompactionHooks` supplies current defaults until Todos 57-62 wire the real host.
+- Cache sequencing: persist the completed summary and compaction marker first, then call both Todo 31 mechanisms (`CacheTracker::reset`, `LockedTools::reset`), then ask the auto-continue hook. A hook failure after summary persistence remains terminal, but the cache still correctly reflects the changed prefix.
+- The new public API doc comments are intentional: this crate documents public interfaces consistently, while the boundary comment carries the required provider-400 rationale and the module comment records the failure-latch/cache ordering invariant.
+## Task 39
+
+### external_directory escalation shape
+Resolve the argument path against the canonical workspace and canonicalize the longest existing ancestor so symlink escapes cannot be disguised as workspace-local paths. Internal resources are slash-normalized workspace-relative paths and ask only the native permission (`read` or aliased `edit`). External resources first ask `permission = external_directory` with `patterns = [<canonical parent>/*]`, `always = [<canonical parent>/*]`, and metadata `{ filepath: <canonical target>, parentDir: <canonical parent> }`; after approval, ask the native permission against the canonical absolute target. Directory reads use the directory itself as the external boundary; file operations use the parent. Todos 40-44 should reuse this two-stage shape.
+
+### Formatter seam
+`FileFormatter::format(&Path) -> io::Result<bool>` is injected into `FileTools::with_formatter`. write, edit, and every non-delete apply_patch operation call it after bytes are written and then re-read final bytes into session state. `NoopFormatter` is the current default because formatter execution belongs to Todo 79; Todo 79 can implement the trait without changing file-tool semantics.
+
+### Read-before-edit state
+One `FileAccessState` is shared by all four tools. It keys reads by `(session_id, canonical_path)` and stores a length plus in-memory content hash. edit and overwrite-by-write require a matching current revision; missing state returns `File must be read before editing...`, and stale bytes return `File changed after it was read...`. Successful writes update the stored revision; delete and move forget the source path. The shared FileTools lifetime is therefore the session-state boundary, while session IDs prevent cross-session laundering.
+
+### Mutation consistency
+All write/edit/apply_patch mutations share one async mutex. Permission is obtained before the mutex; file revision checks and writes happen under it. apply_patch verifies every operation before the first mutation and refuses duplicate operation paths.
+
+
+## Task 42 — web tools (webfetch, websearch)
+
+**HTML→markdown/text is hand-rolled, in `webfetch/html.rs`.** The workspace pins no
+HTML parser and this task may not add one, so upstream's `htmlparser2` +
+`turndown` pair is replaced by one tolerant tokenizer with two renderers.
+
+Text extraction is byte-identical to upstream and asserted as such against a fixture
+captured by *running* upstream's `extractTextFromHTML`. Markdown is deliberately not
+byte-identical: turndown emits whitespace artifacts (a leading space and two trailing
+spaces on the `<title>` run, `-   ` three-space bullets) that would require
+reimplementing its whitespace collapser rather than its markdown. Instead the port
+matches turndown's *configuration* — atx headings, `---`, `-` bullets, fenced code,
+`*` emphasis, `script`/`style`/`meta`/`link` removed — and a test normalizes both
+documents and asserts they agree line for line, so the snapshot is pinned to the
+oracle rather than to itself. Both fixtures are in the repo, and a second assertion
+fails if they ever become byte-equal, which would mean the documented delta is stale.
+
+The tokenizer treats **unknown elements as block containers**, with a closed inline
+set. Inverting that default collapses `html`/`body` and every custom element onto one
+line — which it did, once, before the inline set existed.
+
+**Gating maps onto two independent mechanisms, not one.** `web_search_enabled`
+(mirroring `registry.ts:58-60`) answers "is a provider configured"; it is a free
+function so the registry and the tool cannot hold divergent copies, and a test asserts
+`WebSearchTool::enabled_for` delegates to it for five configurations.
+`oc_permission::visibility::is_tool_hidden` answers "is it denied outright". Either
+removes the tool from the list. `WebError::NoSearchProvider` exists only so that a
+registry bug which exposes an unconfigured tool fails by name instead of as a
+confusing transport error — it is not the intended path.
+
+**Keys are read through `SearchConfig::from_lookup`,** with `from_env` as the thin
+default. Tests state a configuration without mutating process globals (which would
+race across the shared test binary), and todo 44 can source a key from somewhere else
+without editing the tool.
+
+**`WebError` is a local `thiserror` enum in `#[source]` position.** `ToolError` has no
+`Other(String)`, so a web failure has to be classified before it can be reported;
+every variant of `WebError` names a specific bound or transport condition, and callers
+downcast to assert on them.
+
+**Body reads stream through `read_bounded`, never `response.bytes()`.** `bytes()`
+buffers the whole body before any cap can be consulted, so a 100 MB response would be
+100 MB resident and uncancellable. The reader refuses *before* retaining an oversized
+chunk (peak stays at the cap plus one chunk) and polls `InterruptHandle::is_set()`
+before every chunk.
+
+**`with_endpoint` and `with_timeout` on `WebSearchTool`.** No test may reach a real
+backend, and no test should wait out a real 25 s budget. The default budget is pinned
+by a separate constant assertion plus a test that observes 25 s in the typed failure,
+so shortening it in one test cannot hide a wrong default.
+
+**`reqwest::redirect::Policy::limited(10)` on the client rather than manual hop
+counting.** `reqwest` surfaces an exhausted policy as `Error::is_redirect()`, which
+`classify_send_error` maps to `WebError::TooManyRedirects`; without that mapping the
+hop cap would be indistinguishable from a refused connection.
+
+## Task 41 — search: backend selection, the shape of `oc-search`, and the params structs
+
+### Embedded by default; a system `rg` only when asked by name
+
+`Backend::from_env` reads `OPENCODE_SEARCH_BACKEND` (values `ripgrep` or `rg`, anything else or
+absent → embedded). Rationale: the embedded engine is *why* the runtime download in
+`ripgrep/binary.ts:88-121` is gone, so a machine that happens to have an old `rg` on `PATH` must not
+be able to silently change what search returns. The oracle's own order is the opposite — it prefers a
+system binary and downloads one if absent — and reproducing that preference would reintroduce the
+version-skew it causes.
+
+The `rg` backend is kept for one purpose: when a divergence is suspected, the same `GlobRequest` /
+`GrepRequest` can be answered by the very binary the oracle would have used, which turns "our walker
+disagrees" into a mechanical question. `crates/oc-search/tests/engine_semantics.rs` has a
+cross-backend equality test that runs whenever an `rg` is present and skips (loudly) otherwise.
+
+Asking for `ripgrep` with no `rg` on `PATH` **degrades to embedded with a `tracing::warn!`** rather
+than failing every search; the alternative is worse and the two produce the same answers.
+`Backend::select(Option<&str>)` is the pure form, because Rust 2024 makes `env::set_var` `unsafe` and
+the workspace forbids `unsafe_code`, so a test cannot exercise `from_env` directly.
+
+### How `oc-search` is laid out
+
+- `types` — `Entry`/`Submatch`/`Match` field-for-field from `packages/schema/src/filesystem.ts`,
+  because `debug rg search` serialises exactly those and the differential compares that JSON.
+  Also `normalize_relative` (the `./`-stripping from `ripgrep.ts:171-175`) and `truncate_utf16`.
+- `embedded` — one `ignore::Walk`, `grep-searcher` per file. The module doc carries the flag-by-flag
+  table from `rg` so the mapping is checkable without re-reading the TypeScript.
+- `ripgrep` — the opt-in backend. Spawns **once per request** over the whole directory; never per
+  file. Sorts before truncating so both backends have one contract.
+- `backend` — the enum and the selection.
+- `cancel` — `Cancellation`, a **local** one-method trait, not a dependency on `oc-tool`'s
+  `InterruptHandle`. `oc-search` must be usable without the tool layer linked in (todo 48's LSP walk
+  wants the same engine), and `oc-tools::search_common::InterruptCancellation` is the forwarding
+  adapter. Synchronous, like `is_set`, so blocking walk code needs no runtime.
+- `error` — `SearchError` with `is_model_correctable()`. No `Other(String)`.
+
+`SearchResults::truncated` reports what the engine actually saw (a result existed past the limit).
+The **tools** deliberately re-derive the oracle's weaker `len() == limit` test for the output the
+model reads, since that claim is part of the rendered text; the honest field stays for other callers.
+
+Interrupt polling is every 256 entries (`CANCEL_POLL_INTERVAL`), plus once per matched line in the
+grep sink. Bounds interrupt latency to a few hundred `stat`s without an atomic load per entry.
+
+### The params structs
+
+Derived, never hand-written (`oc-tool::TypedTool`), and the doc comment on each field **is** the
+description the model reads, so it is copied verbatim from the oracle:
+
+- `GlobParams  { pattern: String, path: Option<String> }`                       — `glob.ts:10-15`
+- `GrepParams  { pattern: String, path: Option<String>, include: Option<String> }` — `grep.ts:10-18`
+
+Both are `#[serde(deny_unknown_fields)]`; `oc-tool`'s adapter strips the injected `intent` /
+`accept_large_output` before decoding, so that is safe.
+
+### Oracle behaviours reproduced that look like defects and are not ours to fix
+
+1. `grep` with a `path` naming a **file** searches that file's whole **directory** — `grep.ts:62`
+   takes `dirname` and hands it to `rg` as the cwd. So `grep pattern path=src/a.ts` also returns
+   matches from `src/b.ts`. Asserted by a test that says so.
+2. Each rendered `grep` match keeps the line's terminator, so the output has a blank line after every
+   match (`Found 2 matches\n<a>:\n  Line 1: alpha needle here\n\n\n<b>:\n...`).
+3. `grep`'s empty output says `"No files found"` even though the search was over contents.
+4. `truncated` is `len() == 100`, so a tree with exactly 100 results claims more are available.
+
+### `external_directory`, pending Todo 39
+
+Todo 39 had not landed a shared escalation when this was written, so
+`oc-tools::search_common::assert_external_directory` is a local port of
+`tool/external-directory.ts:15-44`: permission key `external_directory`, pattern
+`<directory>/*`, `always` the same pattern, metadata `{filepath, parentDir}`; the target directory is
+the path itself when it is a directory and its parent otherwise. Containment is checked against
+**both** the session directory and the worktree, matching `containsPath(full, ins)`. If Todo 39 lands
+a shared helper with this shape, `search_common` should delegate to it and delete its copy — the
+shapes were chosen to make that a deletion rather than a reconciliation.

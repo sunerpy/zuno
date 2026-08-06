@@ -1911,3 +1911,159 @@ produce the same repair, and the three branches will therefore **conflict on
 - Todo 70's explicit batch tool should re-enter dispatch through `ToolContext::for_subcall`; ordinary loop dispatch remains sequential. Parallelism belongs only inside that explicit batch tool, and each subcall must pass the same resolver/schema/permission choke point.
 - A detached task keeps running, but this seam has no background-task registry or later result channel. Any later task-status/result feature must own that handle/result lifecycle instead of changing `loop.rs` or making ordinary calls parallel.
 - `lsp_diagnostics` could not inspect this worktree because the MCP tool is rooted at `/config/workspace/ProdDir/AI/opencode-rust` and rejected `/config/workspace/ProdDir/AI/oc-wt/t33/...` as outside request cwd. This is a harness limitation, not a source diagnostic; `cargo clippy --workspace --all-targets -- -D warnings`, workspace build, and workspace tests all passed.
+
+## Task 35
+- Todos 57-62: adapt the plugin host to `CompactionHooks`; preserve hook ordering (prompt hook before provider request, auto-continue hook only after a durable non-empty summary), and pass the original model/provider context if the host contract expands beyond the current IDs.
+- Todo 68: after compaction the locked tool list is deliberately empty and will relock from the next available tool registry. Ensure the goal tool is registered before that next request, and inject/preserve active goal state through the compaction prompt or initial context so summarization cannot discard it.
+- `lsp_diagnostics` is installed but the session MCP is rooted at the main worktree and rejects task-worktree paths as outside request cwd. Targeted `cargo clippy -p oc-engine --all-targets -- -D warnings` is clean; final evidence records this tooling limitation unless the coordinator runs LSP from `oc-wt/t35`.
+## Task 39
+
+- Todo 79: formatter configuration resolution exists in oc-catalog, but formatter process execution does not. Wire an executor by implementing `oc_tools::FileFormatter`; preserve the post-format re-read contract and BOM behavior.
+- Todo 44: use `FileTools::exposed_for_model` or the exported `uses_apply_patch` predicate. Do not reinterpret "newer GPT": the oracle rule is exact substring matching (`gpt-`, excluding `oss` and `gpt-4`).
+- Todos 40-44: external path escalation shape is recorded in decisions.md. Keep external_directory as a separate first ask and retain the native permission as the second ask.
+- Todo 70: composed calls must reuse the parent session ID so read-before-edit state remains valid; `for_subcall` already does this.
+- Dispatch currently performs a generic argument-derived native permission ask before tool execution. File tools then ask through the same RulePermissionAsker, whose approved-once cache suppresses duplicate native approval, and add the workspace-aware external_directory ask. Do not remove the tool-side external ask until dispatch has workspace-aware canonical path resolution.
+- `lsp_diagnostics` could not inspect this sibling worktree because the MCP tool enforces the main worktree as request cwd and rejected `/config/workspace/ProdDir/AI/oc-wt/t39`. rustc build, clippy with `-D warnings`, and all workspace tests are clean; this is the only unverified acceptance item.
+- Oracle contrast: current upstream edit includes fuzzy replacement fallbacks, while Todo 39 explicitly requires exact-match replacement; this implementation follows the approved Todo 39 contract and rejects non-unique exact matches with `provide more context or use replaceAll`.
+
+
+## Task 42 — web tools (webfetch, websearch)
+
+**For todo 44 (registry assembly) — conditional exposure of `websearch`.**
+
+1. Filter on `oc_tools::web_search_enabled(provider_id, &config)` or
+   `WebSearchTool::enabled_for(provider_id)`. `provider_id` is the **model** provider
+   serving the turn (`opencode`, `openai`, …), *not* the search backend. Confusing the
+   two makes the tool appear for everyone or no one.
+2. **`OPENCODE_WEBSEARCH_PROVIDER` must not be treated as an enable flag.** It routes
+   only. Upstream's `webSearchEnabled` never reads it; a registry that did would
+   expose the tool on providers upstream does not.
+3. Registry key ≠ wire id for both web tools: keys `fetch` and `search`, ids
+   `webfetch` and `websearch`. `Tool::id()` already returns the wire id, so keying the
+   registry map on `id()` produces `webfetch`/`websearch`, not upstream's internal
+   handles. If the differential test compares against upstream's *keys*, it will
+   mismatch — upstream's wire-visible tool list uses the ids.
+4. Filter order matters and is upstream's: model-conditional predicate first
+   (`registry.ts:288-290`), permission hiding second
+   (`permission/index.ts:204-219`). `tests/websearch.rs::resolve_tool_ids` is a working
+   two-filter model of this; reuse the shape.
+5. `WebSearchTool` owns a `reqwest::Client` and is intentionally not `Clone`. Build one
+   per registry instance from a `SearchConfig`; `config()` exposes it for a rebuild.
+
+**`cargo test -p oc-tools web` silently under-runs** — see learnings. Any future
+acceptance criterion phrased as a bare filter across a crate with integration tests
+has this problem; prefer `--test <name>`.
+
+**A 25 s test remains in `tests/websearch.rs`**
+(`the_default_budget_is_wired_and_not_merely_declared`). It is the price of proving the
+default budget reaches the timeout call rather than being a constant nobody reads. If
+suite wall-time becomes a problem, that is the one to reconsider — but deleting it
+would leave the default unverified.
+
+## Task 41 — search: things Todo 44 (registry) and Todo 48 (LSP walk) must know
+
+### 1. The oracle silently truncates its own stdout at 64 KiB — affects EVERY differential
+
+Measured reproducibly on this machine. Fixture: 5,007 files, 85,108 bytes of output.
+
+| how the oracle was run | bytes captured |
+|---|---|
+| `oc-testkit` `ScriptedEnv` (cleared env, temp `HOME`), stdout = **pipe** | **65,536** — deterministic, 3+ runs |
+| same scripted env, stdout redirected to a **file** | 85,108 (complete) |
+| host environment intact, stdout = pipe | 85,108 (complete) |
+
+The lost region cuts **mid-directory** (whole `pkg00NN` directories plus a partial one), so it is a
+flush race in the oracle's exit path, not a search difference. It is triggered by the temp `HOME` /
+cleared environment, not by output size alone — a fresh `HOME` with the host env intact produced a
+*1-byte* result on one run.
+
+**Consequence for anyone writing a differential**: `oc_testkit::run::run_process` captures through
+`Command::output()`, i.e. a pipe. Any comparison whose oracle stdout exceeds 64 KiB is comparing
+**truncated data** and can pass while being wrong — including a comparison of two truncated sides.
+Todo 44 compares tool-id sets (small, safe), but anything that captures a session transcript, a large
+`debug` dump, or a file listing is exposed.
+
+Mitigation used here, reusable: keep each invocation's stdout well under the limit and **assert it**.
+`crates/oc-tools/tests/search_differential.rs` has `STDOUT_BUDGET = 40_000` and fails with an
+explanatory message naming this defect if an invocation ever approaches it. Where one bounded call
+cannot cover the subject, cover it with a **partition** of disjoint bounded calls and compare their
+union against a single unbounded call on the Rust side (`the_union_of_the_partition_is_the_whole_tree`
+does exactly that for 5,007 files).
+
+A better fix belongs in `oc-testkit`, not here: teach `run_process` an opt-in "capture stdout to a
+temporary file rather than a pipe" mode. That would make large differentials sound by construction.
+Not done in this task — `oc-testkit` is another task's crate.
+
+### 2. `grep-matcher` is declared with a literal version in `crates/oc-search/Cargo.toml`
+
+`grep-matcher = "0.1.9"`, not `{ workspace = true }`, because it is **absent** from
+`[workspace.dependencies]` and this task was not permitted to edit the root manifest. It is required,
+not optional: submatch parity needs `Matcher::find_iter`, that method is on `grep_matcher::Matcher`,
+and neither `grep-regex` nor `grep-searcher` re-exports the trait. **Please hoist it into
+`[workspace.dependencies]` next to `globset` / `grep-regex` / `grep-searcher` / `ignore`** and switch
+the crate to inheritance; it is the only literal version in either crate I own.
+
+### 3. Todo 48's LSP walk should use `oc-search`, not a second walker
+
+`oc-search` deliberately does **not** depend on `oc-tool`: its `Cancellation` trait is local and
+one-method, so the engine is usable from the LSP layer with no tool machinery. Reuse
+`EmbeddedEngine::glob` there rather than adding a `walkdir` loop — a second walker is a second set of
+gitignore/hidden semantics to get wrong, and the hidden-directory pruning rule (learnings, task 41)
+is subtle enough that it will be got wrong.
+
+### 4. `oc-tools/src/lib.rs` currently declares only the search modules
+
+`mod glob; mod grep; mod search_common;`. Todos 39, 40, 42, 43 each add their own `mod` lines; Todo 44
+should expect the file to be the union of four tasks' edits and not assume the list it last saw.
+
+### 5. The `glob` and `grep` permission keys are their own, and are asked *before* resolution
+
+`PermissionAsk { permission: "glob"|"grep", patterns: [<the pattern>], always: ["*"] }`, raised
+before the path argument is resolved or stat'd — the oracle's order (`glob.ts:28-36`,
+`grep.ts:39-48`), so the gate sees the call as the model wrote it. Neither maps onto `read`.
+`oc_permission::visibility::permission_key` already leaves them alone; confirm it stays that way when
+Todo 44 wires permission-based hiding.
+
+### 6. `cargo test -p oc-tools search` reports `filtered out` counts
+
+It passes (10 + 1) but it is a name filter, not a whole-suite run: 14 and 4 tests are filtered out.
+The full runs are `--lib` (24) and `--test search_differential` (5). Recorded because the plan's
+acceptance criterion is written in the filter form and a future reader will otherwise wonder whether
+the filtered-out tests were skipped for a reason.
+
+### 7. ADDENDUM (post-merge): three-way union merges break `oc-tools` in three files at once
+
+Discovered after task-41 was merged, by rebuilding on **main** rather than in the worktree. Wave 7
+puts todos 39, 41, 42, 43 in one crate, and the merge driver unioned each task's additions instead of
+reconciling them. Three distinct breakages, all of which a worktree-only verification misses:
+
+1. **`crates/oc-tools/src/lib.rs` — `error[E0753]`, 14 errors, the crate did not compile.** Each task
+   wrote its own `//!` header block. Unioned, blocks two and three land *after* `pub mod` items, and
+   an inner doc comment may only precede items. Fixed at `3efe436` by merging all three prose blocks
+   into the single leading header. **Todo 43 and 44: add your prose to the existing header block, do
+   not open a new `//!` run below the items.**
+
+2. **`crates/oc-tools/Cargo.toml` — three separate `[dev-dependencies]` tables**, with `reqwest`,
+   `time` and `url` stranded under one of them despite being runtime dependencies. `cargo metadata`
+   *accepted* this (later tables merge rather than error), so it was silent; it becomes a real failure
+   the moment a runtime dependency lands in a `[dev-dependencies]` block. Collapsed to one
+   `[dependencies]` + one `[dev-dependencies]` at `f5c47c5`.
+
+3. **`Cargo.lock` — the task-42 merge took its own side wholesale and dropped 8 packages** that
+   task-41 had added: `ignore`, `grep-searcher`, `grep-regex`, `grep-matcher`, `memmap2`,
+   `encoding_rs_io`, `crossbeam-deque`, `crossbeam-epoch`. `oc-search`'s entry was left with **no
+   dependency list at all**. An ordinary `cargo build` silently re-resolved and repaired it, which is
+   why nothing looked wrong; a `--locked` build — i.e. CI — fails outright:
+
+   ```
+   error: cannot update the lock file ... because --locked was passed to prevent this
+   ```
+   Restored (additions only, 0 real removals) at `00d37c9`.
+
+   **Anyone merging a wave-7 branch: the lock is not unionable.** Verify with
+   `cargo metadata --locked --offline` after every merge, not `cargo build`, which hides it.
+
+State after the repair, measured on main at `00d37c9`: `cargo build --workspace --offline` clean,
+`cargo clippy --workspace --all-targets --offline` **0 warnings**, `cargo fmt --all --check` clean,
+`cargo test --workspace --offline` **1637 passing, 0 failing targets**; `oc-tools --lib` is 100 tests
+(three tasks' worth) and the task-41 differential against the real 1.18.12 binary is 5/5.
