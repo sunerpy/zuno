@@ -1,10 +1,10 @@
 //! Resident memory: what the agent carries from one session into the next.
 //!
 //! A coding agent that has to be told the same thing every session is not learning
-//! anything. This crate is the durable half of the fix — a small, curated, capped
-//! store of notes that gets injected into the system prompt. Todos 99 to 101 build
-//! the rest: freezing the block into the prompt so it survives compaction, the tool
-//! the model calls, and the nudge that makes it call it.
+//! anything. This crate stores a small, curated, capped set of notes and freezes
+//! their rendered blocks into each session's system prompt. Writes persist during
+//! the session but only appear in the next session's frozen snapshot. Todos 100 and
+//! 101 add the tool the model calls and the nudge that makes it call it.
 //!
 //! # Shape
 //!
@@ -72,6 +72,7 @@
 pub mod error;
 pub mod render;
 pub mod scope;
+pub mod snapshot;
 pub mod store;
 pub mod threat;
 
@@ -79,6 +80,9 @@ pub use crate::error::{DriftReason, MemoryError};
 pub use crate::render::{Usage, parse, render_block, serialize, usage_of};
 pub use crate::scope::{
     ENTRY_DELIMITER, GLOBAL_FILE, MEMORY_DIRECTORY, PROJECT_FILE, Scope, char_count,
+};
+pub use crate::snapshot::{
+    CacheConsistency, EXTERNAL_MEMORY_NOTE, ScopeEnablement, SessionMemory, fence_external_context,
 };
 pub use crate::store::{MemoryStore, Operation};
 pub use crate::threat::{Threat, first_threat, scan_for_threats};

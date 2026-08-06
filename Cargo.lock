@@ -2170,10 +2170,19 @@ version = "0.1.0"
 name = "oc-memory"
 version = "0.1.0"
 dependencies = [
+ "futures",
+ "oc-config",
+ "oc-db",
+ "oc-engine",
+ "oc-error",
+ "oc-llm",
  "oc-paths",
  "regex",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.19",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
