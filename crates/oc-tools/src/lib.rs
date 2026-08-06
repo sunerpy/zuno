@@ -34,6 +34,13 @@
 //! `plan_exit` again from every agent but `plan`; that layer is [`oc_permission`]'s and
 //! a caller that stops at [`exposure`] will over-offer the tool.
 //!
+//! # Registry
+//!
+//! [`registry`] preserves upstream's built-in order while making the final set a
+//! projection of the model, provider, runtime flags, extension sources, and merged
+//! permission rules. Plugin and MCP hosts enter through no-op-by-default seams so
+//! their later implementations cannot bypass the same visibility pass.
+//!
 //! # Session recall
 //!
 //! [`session_search`] provides FTS5 discovery, anchored scrolling, and recent
@@ -124,6 +131,7 @@ pub mod exposure;
 pub mod invalid;
 pub mod plan_exit;
 pub mod question;
+pub mod registry;
 pub mod todo;
 
 pub use crate::exposure::{
