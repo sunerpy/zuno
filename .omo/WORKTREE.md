@@ -129,3 +129,32 @@ branch involved, then rewrite the file from those facts. The script is fine for
 
 **Also**: `cargo metadata` can report a stale exit code right after a manifest
 write. Re-run it before concluding the manifest is still broken.
+
+## Merging: use `.omo/premerge.sh <n> [<n>...]`
+
+Encodes the three wave-7 breakage classes as hard stops rather than silent damage:
+
+- **`Cargo.toml` conflict** → refuses to proceed. Section semantics; a line-union
+  produced three `[dev-dependencies]` tables and mis-filed 7 runtime deps.
+  Resolve by `git show <branch>:<path>` for every side, then rewrite by fact.
+- **`Cargo.lock` conflict** → refuses. Not unionable. Take one side, re-resolve,
+  then confirm nothing was dropped.
+- **`lib.rs` / `mod.rs` conflict** → warns that the leading `//!` block must be
+  merged as *prose into the single existing header*; a `//!` run below any item
+  is `error[E0753]`.
+
+Then it gates, in this order (order matters):
+
+1. `cargo metadata --locked --offline` (with one retry for the stale-exit-code
+   quirk) — **first**, because a broken lock makes every later failure look like
+   a code problem, and `cargo build` silently repairs it.
+2. Manifest table uniqueness — catches the duplicate-table bug `cargo metadata`
+   *accepts*.
+3. Stranded `//!` scan — reports `file:line` before the compiler does.
+4. `cargo build --workspace`.
+5. `cargo test --workspace` — **the real integration gate**; build can be green
+   while tests fail to compile.
+6. `cargo clippy --workspace --all-targets` = 0, `cargo fmt --all --check`.
+
+Both static checks were self-tested against known-good `main` and report clean,
+so a hit is a real regression, not a false positive.
