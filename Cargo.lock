@@ -2389,6 +2389,7 @@ name = "oc-plugin"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures",
  "oc-auth",
  "oc-config",
  "oc-db",
@@ -2397,6 +2398,7 @@ dependencies = [
  "oc-llm",
  "oc-paths",
  "oc-permission",
+ "oc-plugin-sdk",
  "oc-testkit",
  "oc-tool",
  "serde",
@@ -2405,12 +2407,20 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "toml",
+ "tracing",
  "url",
 ]
 
 [[package]]
 name = "oc-plugin-sdk"
 version = "0.1.0"
+dependencies = [
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+]
 
 [[package]]
 name = "oc-provider-anthropic"
