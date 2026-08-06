@@ -2681,6 +2681,8 @@ dependencies = [
  "crossterm 0.29.0",
  "oc-engine",
  "ratatui",
+ "serde",
+ "serde_json",
  "thiserror 2.0.19",
  "tokio",
 ]
