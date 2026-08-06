@@ -18,8 +18,9 @@
 //!
 //! [`shell`] parses Bash and PowerShell syntax before execution so compound commands
 //! are authorized as their individual command resources. Cancellation and the hard
-//! ceiling terminate the entire spawned process group, while oversized output is
-//! preserved through [`oc_tool::ToolOutputStore`].
+//! ceiling terminate the entire spawned process group. A foreground timeout instead
+//! hands the live command to [`timeout::BackgroundManager`], and [`output_policy`]
+//! persists oversized output before requiring explicit context-cost acceptance.
 //!
 //! # The conditional tools
 //!
@@ -48,8 +49,10 @@
 
 pub mod apply_patch;
 pub mod edit;
+pub mod output_policy;
 pub mod read;
 pub mod shell;
+pub mod timeout;
 pub mod write;
 
 pub use read::{FileFormatter, NoopFormatter};

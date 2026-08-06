@@ -1,11 +1,12 @@
 use async_trait::async_trait;
 use oc_error::ToolError;
 use oc_permission::{PermissionAction, Rule, evaluate};
-use oc_tool::{AllowAll, InterruptHandle, ToolContext, TypedTool};
+use oc_tool::{ACCEPT_LARGE_OUTPUT_KEY, AllowAll, InterruptHandle, Tool, ToolContext};
 use oc_tool::{OutputLimits, ToolOutputStore};
 use oc_tools::shell::{
     ShellEnvHook, ShellEnvInput, ShellParams, ShellSyntax, ShellTool, analyze_command,
 };
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -243,12 +244,15 @@ async fn shell_oversized_output_is_detected_and_persisted_in_the_shared_store() 
         });
 
     let output = tool
-        .run(
-            params("printf 'one\\ntwo\\n'"),
+        .execute(
+            json!({
+                "command": "printf 'one\\ntwo\\n'",
+                ACCEPT_LARGE_OUTPUT_KEY: true,
+            }),
             context(Arc::new(oc_tool::NeverInterrupted)),
         )
         .await
-        .expect("command succeeds");
+        .expect("explicitly accepted command output succeeds");
 
     assert_eq!(output.output, "one\ntwo\n");
     assert_eq!(output.metadata["oversized"], true);
