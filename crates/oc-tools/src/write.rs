@@ -1,6 +1,6 @@
 use crate::read::{
     FileToolRuntime, PathKind, check_interrupt, decode_text, encode_text, failed, invalid,
-    write_with_dirs,
+    report_formatting, write_with_dirs,
 };
 use async_trait::async_trait;
 use oc_error::ToolError;
@@ -95,10 +95,12 @@ impl TypedTool for WriteTool {
         let bytes = encode_text(content, old_bom || new_bom);
         write_with_dirs(&target.canonical, &bytes).map_err(|error| failed("write", error))?;
         check_interrupt("write", &ctx)?;
-        let formatted = self
+        // Past this point the write has landed, so nothing a formatter does may
+        // turn into an `Err` from this tool.
+        let outcome = self
             .runtime
             .formatter
-            .format(&target.canonical)
+            .format_reporting(&target.canonical)
             .await
             .map_err(|error| failed("write", error))?;
         let final_bytes =
@@ -107,12 +109,13 @@ impl TypedTool for WriteTool {
             .state
             .record_write(&ctx.session_id, &target.canonical, &final_bytes);
 
-        Ok(
+        Ok(report_formatting(
             ToolOutput::text(self.runtime.title(&target), "Wrote file successfully.")
                 .with_metadata("filepath", json!(target.canonical))
                 .with_metadata("exists", json!(existing.is_some()))
-                .with_metadata("formatted", formatted),
-        )
+                .with_metadata("formatted", outcome.changed),
+            &outcome.failures,
+        ))
     }
 }
 

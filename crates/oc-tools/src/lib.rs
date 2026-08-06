@@ -55,6 +55,18 @@
 //! [`session_search`] provides FTS5 discovery, anchored scrolling, and recent
 //! session browsing directly over SQLite, with no provider or LLM dependency.
 //!
+//! # Post-edit formatting
+//!
+//! [`format`] is the execution half of the `formatter` config, which [`oc_catalog`]
+//! resolves and this crate runs. Its central promise is that **a formatter failure
+//! cannot cost an edit**: the write lands first, a formatter is offered the file
+//! second, and a formatter that fails has its damage undone and its stderr reported
+//! rather than raising an error for a write that succeeded. It formats in place
+//! because every command in the built-in table does, it only runs a formatter that
+//! claims the file's extension, and — unlike [`shell`] — it does not consult
+//! [`risk`], because a formatter command is operator-authored and spawned as argv
+//! with no shell, so there is no model-composed string for that gate to judge.
+//!
 //! # Resident memory
 //!
 //! [`memory`] is the one tool that writes [`oc_memory`]'s capped stores. It takes a
@@ -69,6 +81,7 @@
 pub mod apply_patch;
 pub mod batch;
 pub mod edit;
+pub mod format;
 pub mod output_policy;
 pub mod read;
 pub mod risk;
@@ -77,6 +90,10 @@ pub mod timeout;
 pub mod write;
 
 pub use batch::{ExecuteParams, ExecuteTool, MAX_SUBCALLS, TOTAL_OUTPUT_BYTES};
+pub use format::{
+    Availability, DEFINITIONS as FORMATTER_DEFINITIONS, Definition as FormatterDefinition,
+    FailureKind, FormatFailure, FormatOutcome, Formatters, ProgramLocator, SystemPrograms,
+};
 pub use read::{FileFormatter, NoopFormatter};
 
 use apply_patch::ApplyPatchTool;

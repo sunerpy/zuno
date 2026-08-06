@@ -23,7 +23,14 @@ publish.workspace = true
 oc-catalog = { workspace = true }
 oc-config = { workspace = true }
 oc-llm = { workspace = true }
+# For the plan document's data-directory fallback: `session.ts:333` reaches for
+# `Global.Path.data` when the project is not a repository, and `oc-paths` is the
+# one place that resolves it.
+oc-paths = { workspace = true }
 oc-permission = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
