@@ -4273,3 +4273,187 @@ unspecified-high, writing` — 8, as the plan says — with 1-5 rungs each, ever
 model id plus up to ten provider ids. `AGENT_MODEL_REQUIREMENTS` is at `:24467` (plan
 said 24475). Both plan numbers point inside the object rather than at `var`, so they
 find it; nothing else in the plan's description of either table was wrong.
+
+## [2026-08-06] Task 74: the 184-entry keybind table, and what the "odd" call sites are
+
+The prompt's "~20 `keybind(` calls in another position" are not nested or differently
+shaped calls. `grep -c 'keybind('` = 184 and `grep -o | wc -l` = 184, so every call is on
+its own line inside `Definitions`. The 164/20 split is purely syntactic: 20 entries have a
+**dot in the name** and therefore must be written as a quoted object key
+(`keybind.ts:202-221` — `dialog.select.*` ×7, `dialog.prompt.submit`, `dialog.mcp.toggle`,
+`dialog.move_session.*` ×3, `prompt.autocomplete.*` ×5, `permission.prompt.fullscreen`,
+`plugins.toggle`, `dialog.plugins.install`). They are ordinary rows. So the table is 184
+entries = 183 actions + the `leader` row (`:46`), which configures the leader chord.
+
+`CommandMap` (`:256-420`) has **163** entries = 164 unquoted names minus `leader`. The 20
+dotted names are deliberately absent and reach their command id through
+`CommandMap[name] ?? name` (`:423`) — for them the name *is* the command.
+
+Extraction command (self-checking; exits non-zero on an unparsed row or a count != 184),
+following todo 55's precedent of a committed mechanically regenerable fixture:
+
+```sh
+python3 extract.py packages/tui/src/config/keybind.ts \
+  > crates/oc-tui/tests/fixtures/upstream-keybinds-1.18.13.tsv
+```
+
+`extract.py` slices the `Definitions` and `CommandMap` blocks by their literal opening and
+`satisfies` closing lines, matches `^\s*("?)(name)\1:\s*keybind\((val),\s*"(desc)"\)`,
+resolves `LeaderDefault` and the one object-shaped default, and emits
+`name\tkeys\tcommand\tprevent_default\tdescription`. Full body in
+`.omo/evidence/task-74-opencode-rust.txt`. Verified byte-identical on regeneration.
+
+**The multi-key / leader-mixing rule.** `app_exit: "ctrl+c,ctrl+d,<leader>q"` (`:48`) proves
+two things at once: one action carries **several** comma-separated spellings, and a single
+spelling list **mixes** plain chords with leader sequences. 28 of 184 defaults contain
+`<leader>` and 28 carry more than one spelling. The table is therefore
+action → [sequence…], and resolution is sequence → action with pending state — never
+action → key.
+
+**Scope derivation, measured rather than guessed.** Upstream attaches bindings to
+renderables, so a flat global map would report dozens of "conflicts" in the shipped
+defaults. Two candidate rules, measured over the real table:
+
+| rule | scopes | conflicting (scope, sequence) pairs |
+|---|---|---|
+| first `_` segment | 33 | 1 — `dialog.select.submit` vs `dialog.prompt.submit`, both `return` |
+| namespace before last `.`, else first `_` segment | **39** | **0** |
+
+The second rule is implemented. Because the defaults are conflict-free under it, any
+conflict a build reports provably comes from user config — which is what makes the report
+signal instead of noise. 39 namespaces = 38 action scopes + `leader`. 43 of 184 are `none`.
+
+**Three normalizations a terminal forces.** `enter` and `return` both appear in the table
+and are one key. `E` (`:64`, bare uppercase) and `shift+i` (`:221`) are the same shape
+spelled two ways. `?` (`:75`) is a shifted glyph a terminal may report with or without the
+SHIFT flag. `Chord::new` folds uppercase ASCII into lowercase+shift and strips SHIFT from
+non-alphabetic characters, so both spellings and both event shapes resolve.
+
+## [2026-08-06] Task 75: four-layer theme resolution with 33 built-in themes
+
+**The oracle's four-layer order is not the order the plan states, and the oracle
+states its own order in a comment.** `packages/tui/src/theme/index.ts:171-183`:
+
+```ts
+function listThemes() {
+  // Priority: defaults < plugin installs < custom files < generated system.
+  const themes = { ...DEFAULT_THEMES, ...pluginThemes, ...customThemes }
+  if (!systemTheme) return themes
+  return { ...themes, system: systemTheme }
+}
+```
+
+So it is **built-in < plugin-provided < user custom < system**. The plan's prose puts
+user custom *before* plugin-provided. Sixth plan-vs-source discrepancy on the board;
+the source was right again.
+
+**The fourth rung of the ladder can only be tested on the name `system`.** The system
+layer is not merged key-by-key — `:179-182` publishes it as a single entry named
+`system`. It therefore shadows that one name and nothing else, which is a property
+worth its own test: getting it wrong would make *every* theme silently become the
+terminal-derived one. `theme_layers_override_the_layer_below_them` walks
+builtin→plugin→custom on `dracula` and then custom→system on `system`.
+
+**Terminal capability was probed without a TTY by taking the answer as an input, not
+by faking the terminal.** The escape-sequence round trip that really answers "what is
+your palette" needs the stdin/stdout pair todo 73's `TerminalSession` owns, so
+`theme.rs` declares `trait TerminalPalette { fn query(&self) -> Option<TerminalColors> }`
+and ports only the *derivation* (`index.ts:360-469`). Tests pass a `FakePalette`
+holding an `Option`, so "no terminal" is `FakePalette(None)` — one line, no TTY, no
+process state. The real impl reads `COLORFGBG` and returns `None` when it is unset,
+which is every non-interactive run.
+
+**`COLORFGBG` had to be parsed by a pure function to keep the suite concurrency-safe.**
+Setting an env var to test the probe would race every other test in the process — the
+same class of hazard todo 73 hit with the process-global panic hook. `parse_colorfgbg`
+is public and tested directly; `EnvironmentPalette::query` is a two-line read over it.
+Result: nothing in `theme_tests.rs` touches global state, so the 38 theme tests run
+concurrently with the 10 `app_tests.rs` tests that do own the hook. 18 concurrent test
+processes across 3 rounds, zero failures.
+
+**`cargo test -p oc-tui theme` only matches test *names*, not target names.** An
+integration test in `tests/theme.rs` whose functions are called `resolves_everything`
+reports `0 passed; N filtered out` for that filter — a silent skip. Putting the tests
+in `src/theme_tests.rs` included as `mod tests` from `theme.rs` makes every path
+`theme::tests::…`, so the module path itself satisfies the filter. Measured: 38 passed,
+10 filtered out.
+
+**A raw string cannot hold a hex colour if it is opened with a single `#`.** `r#"…"#`
+around JSON containing `"#101010"` terminates at the `"#` of the literal. `r##"…"##`.
+Two of these; both were parse errors, not silent bugs, but they cost a build cycle.
+
+**One macro-declared field table is what makes 52 palette colours maintainable.**
+`declare_palette!` takes `field => "jsonKey"` pairs once and generates the struct, the
+`REQUIRED_KEYS`/`OPTIONAL_KEYS` slices, `entries()` (used by the snapshot view), and
+the resolution loop. A field the resolver never fills, or a JSON key no field consumes,
+is not expressible. Side effect worth knowing: issues come out in *declaration* order
+(the oracle's `Theme` member order, `index.ts:36-92`), not the sorted order the backing
+`BTreeMap` would suggest — I wrote a test asserting `issues[0].key == "accent"` and it
+is `"primary"`.
+
+## [2026-08-06] Task 65: the delegation tool's override precedence, stacked on todo 64's
+
+**The ladder is four rungs now, and rung 1 is a tool argument.** Todo 64 built three
+(`per-agent config override > active preset > session model`). `task` adds one above
+all of them:
+
+| rung | who says it | where |
+| --- | --- | --- |
+| 1 | **this `task` call's `model` / `effort` arguments** | `task::TaskTool::plan` |
+| 2 | `agent.<name>.model` from the user's config | `ModelPolicy::with_agent_override` |
+| 3 | the active preset's entry for the agent, or for the `category` shorthand | `ModelPolicy::resolve` / `resolve_category` |
+| 4 | the parent session's model | `ModelPolicy::with_session_model` |
+
+The stacking is *additive, not a reimplementation*: `plan()` calls
+`resolve`/`resolve_category` for rungs 2-4, keeps the returned `Resolution`'s
+diagnostics, and only then lets an explicit `model` argument displace
+`Resolution::model`. Nothing about rungs 2-4 is restated in `oc-tools`. Verified by
+two tests: one where the call argument beats a config override *and* a preset entry,
+and one where removing the argument lets the preset rung answer again.
+
+**Rung 1 inherits todo 64's skip-on-unavailable rule, and it matters more here.** An
+unreachable or unqualified `model` argument does not fail the delegation — it becomes
+a note and the ladder continues. Refusing outright would throw away a task the caller
+has already framed over a model name it guessed. What is forbidden is *silence*: every
+skip lands in `DelegationPlan::notes` and is rendered inside the result envelope as
+`<note>…</note>`, so a caller reading only the body still learns its `effort` was
+dropped. That is the concrete reading of "must not accept a model or effort the
+resolved provider cannot honor **without saying so**".
+
+**Effort honouring needs three separate refusals, and only one of them is todo 64's.**
+`resolve_variant` already answers "is this name canonical, model-declared, or
+neither". Two more questions have to be asked *before* it, and they are the ones a
+tool can answer and a config-time resolver cannot:
+
+1. no model resolved at all → nothing can be asked about reasoning support;
+2. the model resolved but `reasoning == false` → a canonical level cannot be honoured,
+   and sending reasoning options to a non-reasoning model is a provider error, so the
+   options are dropped **and** noted.
+
+`ReasoningEffort::Off` is exempt from (2): asking a non-reasoning model not to reason
+is trivially honoured.
+
+**`ToolContext::depth` alone cannot bound delegation recursion.** It counts *tool
+composition* (`for_subcall` increments it), so it is `0` for every turn-level call —
+including a `task` call made inside a child session, which is precisely the hop the
+bound exists to stop. Upstream's measure (walking `parentID`,
+`packages/opencode/src/tool/task.ts:106-117`) is the mirror image: it sees delegation
+hops and is blind to a `task` nested inside `execute`. Each is blind to the other's
+recursion, so the guard is `max(session_ancestry, ctx.depth) >= subagent_depth`, with
+a test for each half. The session half needs a host method (`delegation_depth`)
+because only the session store knows the parent chain.
+
+**`ToolError::Denied` has no `#[source]`**, so no fix-naming prose can ride on a
+permission refusal. Every other rejection can chain a typed error and be asserted
+through `error.source().to_string()`; a denial cannot. The guidance therefore travels
+on the outbound `PermissionAsk` metadata (`task::GUIDANCE_KEY`) — which is arguably
+the better place anyway, since that is what the human approving actually reads — and a
+recording asker makes it assertable. Worth knowing before writing another gated tool
+whose acceptance criterion mentions a denial message.
+
+**`#[schemars(skip)]` + a declared serde field is how you refuse an argument by name.**
+`deny_unknown_fields` alone gives serde's generic "unknown field" error, which names
+no fix. Declaring `load_skills` on the params struct but hiding it from the derived
+schema means: no caller learns the name from this tool, a caller that sends it anyway
+is refused with a message pointing at per-agent permissions, and every *other* unknown
+field still gets `deny_unknown_fields`. Confirmed working on schemars 1.2.2.

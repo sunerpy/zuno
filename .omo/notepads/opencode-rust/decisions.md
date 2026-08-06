@@ -4403,3 +4403,245 @@ and `builtin/tests.rs` imports it. One definition, so the two scans cannot drift
 The engine already routes its internal agents (`oc-engine/src/compaction.rs:404`).
 Adding a `small_model` rung here would give two places to disagree about which model
 titles a session. Internals resolve like any other agent and a test asserts it.
+
+## [2026-08-06] Task 74: where the TUI schema lives, the conflict report, and the leader machine
+
+**The TUI-only config schema lives in `crates/oc-tui/src/config.rs`, not `oc-config`.** None
+of `theme`, `keybinds`, `leader_timeout`, `prompt`, `scroll_speed`, `scroll_acceleration`,
+`diff_style`, `mouse` appears in `packages/core/src/v1/config/config.ts`; upstream declares
+them in `packages/tui/src/config/index.tsx` and loads them from separate `tui.json` files.
+Modelling them in `oc-config` would advertise keys the real binary rejects there. It is one
+struct of independent fields with unknown keys ignored, so concurrent todos add one field
+each. `oc-config` was **not** modified.
+
+**Conflict detection is scope-local, and precedence across scopes is explicit ordering.**
+Each action carries a `scope` derived from its name (namespace before the last `.`, else the
+segment before the first `_`). Two bindings claiming one sequence *within* a scope have no
+ordering to break the tie and are reported. Across scopes, `Keymap::resolve` takes an
+**ordered active scope chain** — the focus chain in data form — and the first scope with a
+match answers. That is declared precedence, not a silent duplicate, and it is what lets
+`diff_expand` (`right`) and `session_child_cycle` (`right`) coexist as upstream intends.
+
+**Report format.** Every collision is collected before returning, so one bad config yields
+one report rather than a fix-and-rerun loop:
+
+```
+1 keybind conflict:
+  `ctrl+x l` is bound to both `session_list` and `session_new` in scope `session`
+```
+
+Three or more: ``is bound to all of `a`, `b`, and `c` ``. Actions are sorted so the message
+is stable. A second kind is reported for a short binding that makes a longer sequence
+unreachable — ``…which shadows the longer sequence `ctrl+x x` `` — because a dead binding is
+the same failure as a duplicate wearing a different hat.
+
+**Three further loud refusals rather than silent drops**: an unrecognized keybind *name*
+(upstream throws too, `keybind.ts:450-451`); an unparseable spelling, naming the action and
+the spelling; and unbinding `leader` while 28 defaults are written `<leader>…`, which would
+silently delete 28 bindings.
+
+**The leader state machine is a general prefix matcher with an injected clock.**
+`<leader>q` is not special: a spelling is a whitespace-separated chord list in which
+`<leader>` expands to the configured chord, so multi-chord sequences the upstream table
+happens not to use work for free. `resolve(scopes, chord, now)` takes `now` as a parameter —
+the timeout test asserts behaviour at `start + timeout - 1ms` and at `start + timeout` with
+**no sleep and no polling**. Order inside `resolve`: expire a stale pending sequence, then
+exact match in scope order, then extendable-prefix in scope order (sets pending), otherwise
+clear pending and report unmatched. A separate `expire(now)` exists so a timer tick can
+close a which-key panel on time, but correctness never depends on a tick arriving.
+
+**The anti-hardcoding seam is `KeyDispatcher` + `ActionComponent`.** The dispatcher wraps a
+component, resolves `TerminalEvent::Input` from todo 73's existing loop, and passes down a
+`&'static Definition` — never a key. A view therefore cannot branch on a keystroke, and
+rebinding changes nothing below that point. `prevent_default` rides on the resolution rather
+than being consulted by the view.
+
+**The fixture is the oracle; the Rust table is the implementation.** Both are generated from
+the same extraction, and a test diffs them row for row *including table order*, so an
+upstream bump regenerates the TSV and the diff names exactly what moved instead of a
+hand-maintained list quietly rotting.
+
+## [2026-08-06] Task 75: four-layer theme resolution with 33 built-in themes
+
+**Fallback source for a missing key: the built-in `opencode` theme, same mode — not the
+layer below.** Two candidates were real. "The layer below" is intuitive but wrong for
+two reasons: a user theme is usually a *whole* theme rather than an override of a
+built-in of the same name, so there is normally no layer below to fall back to; and it
+makes the resolved palette depend on registration order, which turns a diagnostic into
+a heisenbug. `opencode` is also what the oracle itself falls back to on every failure
+path (`src/context/theme.tsx:143`, `:162`, `:177`). So every failure — missing key,
+dangling reference, reference cycle, malformed hex — substitutes that key's `opencode`
+value and records a `ThemeIssue`.
+
+Resolution is therefore total and cannot recurse: `baseline(mode)` is a `OnceLock`
+holding `opencode` resolved against a `last_resort()` palette (ANSI white on a
+transparent background), and that palette needs no fallback of its own. A corrupt
+`opencode.json` degrades to legible monochrome instead of panicking, and
+`ThemeRegistry::load_issues()` says so.
+
+**A missing *theme name* is the same class of failure as a missing key.** `resolve()`
+never returns `Option`. An unknown name yields `ThemeIssue::UnknownTheme` plus the
+default theme's palette, written without recursion so a broken default cannot loop. This
+is what makes `theme: "system"` safe when no terminal answered: the system layer is
+simply absent, the name resolves to nothing, and the diagnostic is
+`theme "opencode": no theme named "system" in any layer; falling back to the built-in
+"opencode" theme`.
+
+**Palette shape: a flat struct of 52 `Rgba` fields plus `thinking_opacity` and
+`has_selected_list_item_text`, generated from one macro table.** Rejected a
+`HashMap<String, Rgba>` — a view would then need to handle a missing key at every paint
+site, which is exactly the panic the task forbids, and typos would be runtime failures.
+The flat struct makes `palette.text` infallible and misspellings compile errors. `Rgba`
+keeps its alpha (rather than flattening to ratatui's `Color`) because two behaviours
+read it: `From<Rgba> for Color` maps `a == 0` to `Color::Reset`, which is how a cell
+says "keep the emulator's own background", and `selected_foreground` branches on
+`background.a == 0` to pick contrast (`index.ts:100-107`).
+
+**The snapshot subject: one row per palette field, rendered through todo 73's
+`render_offscreen`, serialized as style runs.** `PaletteSampleView` emits the field's
+own JSON key as text, styled `fg = that field's colour` on `bg = palette.background`,
+plus a `thinkingOpacity` row and a derived `selectedForeground` row — 55 rows in a
+26-column buffer. Three properties this buys:
+
+- every field reaches a cell, so a snapshot of a blank buffer cannot pass;
+- the snapshot is taken from the rendered `Buffer`, not from the `Palette`, so it proves
+  the colours survived the render path;
+- one colour change diffs one line. Measured: mutating `nord`'s `nord8` def changed
+  exactly 1 of 33 `.snap` files (12 lines inside it, since 12 keys reference that def).
+
+Chose dark mode only for the snapshots, giving exactly the 33 the plan asks for; light
+mode is covered by `theme_resolves_in_both_modes_without_issues` and by the
+variant-resolution tests, which is cheaper than 33 more `.snap` files.
+
+**`add_plugin_theme` and `upsert_theme` are both ported, because they differ.** The
+oracle's `addTheme` (`index.ts:220-227`) refuses to shadow an existing name; only
+`upsertTheme` (`:229-240`) replaces, and it writes to whichever of the custom/plugin
+layers already holds the name. Keeping both is what makes the layer *order* observable
+at all — with only `addTheme`, a plugin could never shadow a built-in and rung 2 of the
+ladder would be untestable.
+
+**A guard test enforces "no view hardcodes a colour" rather than a convention.**
+`theme_no_view_hardcodes_a_color` scans `crates/oc-tui/src/*.rs`, excludes `theme.rs`
+and its tests, and fails on `Color::Rgb`, `Color::Indexed`, or `Rgba::opaque`. It carries
+the mandatory floor assertion (`scanned >= 3`) so the stale-`CARGO_MANIFEST_DIR` hazard
+in `.omo/WORKTREE.md` cannot make it pass vacuously. The asset-count test does the same
+with `== 33` against the on-disk directory *and* an exact set comparison against the
+embedded table, so an added file, a deleted file, or a rename all fail.
+
+## [2026-08-06] Task 65: the five refusals, and why a job id is not a session id
+
+### The five rejection messages, verbatim
+
+Each is a `TaskRejection` variant's `Display`, chained as the `#[source]` of a
+`ToolError`, so `error.source().to_string()` is the tested artifact. All five name the
+fix; `"invalid arguments"` would have failed the acceptance criterion.
+
+1. **neither target** — `Must provide either `category` or `subagent_type`. Add
+   `subagent_type="worker"` naming one of the valid targets (explorer, librarian,
+   advisor, worker), or `category="<preset shorthand>"` to run the `worker` agent at
+   that preset's model.`
+2. **both targets** — `` `category` and `subagent_type` are mutually exclusive; you sent
+   `category="cheap"` and `subagent_type="explorer"`. Provide only one: keep
+   `subagent_type="explorer"` to choose the agent, or keep `category="cheap"` to run the
+   `worker` agent at that preset's model.``
+3. **a coordinator as target** — `` `orchestrator` coordinates delegations and cannot be
+   a delegation target — targeting it would reopen the unbounded recursion the roster
+   closes. Set `subagent_type` to one of the valid targets: explorer, librarian, advisor,
+   worker.``
+4. **depth exceeded** — `Subagent depth limit reached: this session is already 1
+   delegation hop(s) deep and `subagent_depth` is 1. Do this work in the current session,
+   or raise `subagent_depth` in config to allow nested subagents.`
+5. **permission denied** — `` `task` is not permitted for `worker`. Grant `task` for
+   pattern `worker`, or set `subagent_type` to a target the current rules allow
+   (explorer, librarian, advisor, worker).`` — carried on the `PermissionAsk` metadata
+   under `task::GUIDANCE_KEY`, because `ToolError::Denied` has no `#[source]` to hang it
+   on. The error itself stays `Denied`, so `is_model_correctable()` is `false` and the
+   model does not retry a refusal that needs a grant.
+
+Two more in the same shape: a passed `load_skills`, and an unknown agent (which also
+suggests `category=` in case the caller meant a preset shorthand — the exact confusion
+omo's `'Unknown category'`/`'Unknown agent'` hook pair exists to unpick).
+
+### The target list is never written down here
+
+`valid_targets(vision_available)` is `oc_agent::builtin::delegable(..)` mapped to names,
+and a test asserts the two are equal rather than merely overlapping. So the coordinator
+is excluded *by the roster*, not by this tool — todo 63 already encoded that as data
+(`Role::Orchestrator` is the one non-`Subagent` role). The `COORDINATOR` constant exists
+only to render the refusal. Consequence worth noting: the vision-gated target is
+unreachable until the catalog offers a vision model, and there is a test that drives the
+same target name through both polarities of `with_vision_available`.
+
+### `category` forces the generic executor, and gates on *it*
+
+A category names a `{model, variant}` and says nothing about conduct, so it cannot pick
+a specialist — omo's rule, and the same conclusion here. The agent is
+`GENERIC_EXECUTOR = "worker"` (todo 63's replacement for upstream's `general`), and the
+model resolves through `ModelPolicy::resolve_category`, i.e. the active preset's category
+map and nothing else. No built-in category table, so an unknown category is a note plus
+the session model, never an error.
+
+The load-bearing detail: **the permission pattern for a `category` call is `worker`, not
+the category name.** A rule can only match a pattern some agent is named by; keying the
+ask on `"cheap"` would make every category delegation unmatched by any real rule and
+therefore governed by whatever the wildcard says. Tested.
+
+### Variant selection: three refusals, three variants of `ToolError`
+
+- the three *argument* rejections (1, 2, 3 above, plus unknown-agent and `load_skills`)
+  are `InvalidArgs` — genuinely correctable by a different call;
+- **depth is `Failed`, deliberately not `InvalidArgs`.** `InvalidArgs` advertises
+  `is_model_correctable`, and a model that believes a depth limit is an argument problem
+  reissues the identical call and is refused again. `Failed` is the only remaining
+  variant that both carries a message and reports `Recovery::Fail`. The first draft used
+  `InvalidArgs` and a test caught it, which is why the choice is documented at the
+  `unrecoverable()` constructor;
+- permission stays `Denied`, unchanged, for the same reason.
+
+### Argument validity is checked before the human is asked
+
+Upstream asks permission first and validates the agent afterwards
+(`task.ts:118-183`), so a user can be prompted to approve delegation to an agent that
+cannot exist. Order reversed here: target validity, then depth, then the gate. A
+permission prompt is the scarcest thing this tool spends, and spending it on a call that
+is going to fail anyway is worse than a slightly different order from the oracle.
+
+### A background dispatch's id differs from the child session id — on purpose
+
+Upstream sets `jobId: nextSession.id` (`task.ts:279`). One string then answers two
+different questions — "cancel this job" and "resume this session" — and a client holding
+it cannot tell which it has. Here:
+
+- **foreground** returns the child session id only. `background_id` is `None` and the
+  envelope carries no `background=` attribute.
+- **background** returns both. The job id is `task::background_id(session)` =
+  `"bg_" + session_id`, and both appear on the wire:
+  `<task id="ses_child_of_ses_root" background="bg_ses_child_of_ses_root" state="running">`.
+- The tool **refuses a host that hands back the session id as the job id**
+  (`ToolError::Failed`, "must be distinguishable"). `RecordingHost::conflating_ids()`
+  reproduces the upstream shape so that refusal is a tested property, not a claim.
+
+The prefix rather than a fresh random id is deliberate: it keeps the job id derivable
+from the session id (so a client can find one from the other) while keeping them
+distinguishable by inspection, which a random id would not.
+
+### `load_skills` is dropped, and passing it is an error rather than ignored
+
+Skills are permission-gated per agent, so nothing about them is a property of the call.
+The evidence for dropping it is that slim needs a hook family to recover from its
+omission — `.omo/refs/omo-slim/src/hooks/delegate-task-retry/patterns.ts:14-18` maps the
+substring `'load_skills'` to the fix hint "Add `load_skills=[]` (empty array when no
+skill is needed)". An argument whose most common correct value is the empty one that
+means nothing, and whose omission needs a recovery hook, should not exist. `background`
+survives the same test only because its default genuinely carries information.
+
+Chosen over silently ignoring it: a caller that believes it loaded a skill and did not
+will blame the child for ignoring the skill, and that misattribution costs more than one
+refused call. The argument is hidden from the derived schema
+(`#[schemars(skip)]`) so no caller learns the name here.
+
+### Resolution notes are rendered inside the result envelope
+
+`<note>…</note>` lines sit inside `<task>`, before `<task_result>`. Appending them after
+the envelope would let a caller that parses only the result body miss the fact that its
+`effort` was dropped — which is exactly the silent downgrade the plan forbids.

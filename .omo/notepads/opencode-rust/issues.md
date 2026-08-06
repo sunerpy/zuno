@@ -3648,3 +3648,168 @@ are reachable only by a caller that reads the JSON itself.
 accepting the flat shape a neighbouring tool already writes; a body that declares one
 section may declare *only* sections, so a typo becomes a parse error rather than an
 agent named `agent`.
+
+## [2026-08-06] Task 74: a QA-scenario copy-paste slip, and the TUI config keys defined
+
+**Plan slip.** Todo 74's QA "happy" scenario reads "a resize event re-lays out without
+artifacts". That is todo 73's event loop, not the keybind engine — a copy-paste from 73,
+whose `app_event_loop_consumes_both_bounded_channels_and_resize_relays_out` already covers
+it. Substituted the scenario that actually exercises this todo: a leader sequence resolving
+end to end (`a_leader_sequence_resolves_end_to_end`). The failure scenario was correct and
+is implemented verbatim.
+
+**A criterion that is not literally satisfiable, and how it was honoured.** "all 184
+bindings resolve to their documented action" cannot hold as written: 43 defaults are `none`
+(no key to press) and `leader` is not an action. All 184 fixture rows *are* asserted —
+140 by replaying every spelling to its action, 43 by asserting they are unbound, 1 by
+asserting it configures the leader chord — with floor assertions (184 rows, exactly 43
+unbound, ≥170 sequences replayed) so the test cannot pass vacuously. The count 184 itself
+is correct; no discrepancy this time, and the draft's B14 note matches the source.
+
+**TUI config keys defined, for merge reconciliation with t75 (`theme.rs`).**
+`crates/oc-tui/src/config.rs`, struct `TuiConfig` (oracle
+`packages/tui/src/config/index.tsx:53-66`):
+
+  `$schema`, `keybinds`, `leader_timeout`, `prompt{max_height,max_width}`,
+  `scroll_speed`, `scroll_acceleration{enabled}`, `diff_style`, `mouse`
+
+Plus `ResolvedTuiConfig`, `ResolveOptions{terminal_suspend}`, `PromptConfig`, `MaxWidth`,
+`DiffStyle`, `ScrollAcceleration`, `BindingValue`, `BindingItem`, `TuiConfigError`.
+
+**Deliberately absent — one additive field each for their owner**: `theme` (todo 75),
+`attention` (todo 77), `plugin`/`plugin_enabled` (plugin wave). Unknown keys are **ignored,
+not rejected** (Effect Schema's default `onExcessProperty` is `"ignore"`, unlike
+`oc-config`'s top-level `deny_unknown_fields`), so a config already carrying `theme` parses
+today and t75's merge is a one-line field addition to an independent-field struct. Merging
+should be mechanical; if `t75` created its own `config.rs`, keep this one and move its
+`theme` field in.
+
+**`app.rs` and `app_tests.rs` are byte-identical to `main`** — `git diff --stat` on both is
+empty. No wiring edit was needed: `KeyDispatcher` implements todo 73's `Component`, so the
+engine consumes the existing bounded event loop's `TerminalEvent::Input` without a second
+input path.
+
+**Not implemented, and named rather than skipped**: TUI config *discovery* — the walk over
+`tui.json`/`tui.jsonc` and the multi-file merge order in
+`packages/opencode/src/config/tui.ts:150-206`. This todo owns the vocabulary and its
+defaults; the loader is a separate concern with no todo yet, and it is what a real TUI
+launch will need.
+
+## [2026-08-06] Task 75: four-layer theme resolution with 33 built-in themes
+
+**TUI config keys I defined — for merge reconciliation with t74.** New file
+`crates/oc-tui/src/config.rs`, one struct, one field:
+
+```rust
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuiConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
+}
+```
+
+Plus `impl TuiConfig { pub fn theme(&self) -> Option<&str> }`. Nothing else. If t74
+also created `config.rs` with a `TuiConfig`, the union is `theme` plus whatever t74
+declared; no field of mine can collide with a keybind/leader/mouse/prompt field.
+`crates/oc-tui/src/lib.rs` gained two `pub mod` lines (`config`, `theme`) — the
+ordinary unionable `pub mod` conflict `.omo/premerge.sh` handles.
+
+**Every one of the 33 theme assets is well formed; no missing or unexpected keys.**
+Measured before writing any Rust, over `packages/tui/src/theme/assets/*.json`:
+
+- all 33 set all **50** required colour keys;
+- `selectedListItemText` is set by **2** of 33, `backgroundMenu` by **1** — both are
+  documented-optional with an in-theme fallback (`index.ts:274-289`), so their absence
+  is deliberately *not* a diagnostic;
+- `thinkingOpacity` is set by **0** of 33, so every built-in gets the 0.6 default
+  (`index.ts:292`). The key is still supported and still validated as a number;
+- all 33 carry a `defs` block. Value shapes across the set: 1549 `{dark,light}`
+  variants, 95 bare references, 9 bare hex literals, 16 `transparent`/`none` inside
+  variants, 863 hex + 2365 reference entries in `defs`. **Zero** numeric ANSI values
+  anywhere — the numeric branch (`index.ts:260-261`) is dead for built-ins, so it is
+  covered by a hand-written test rather than by any asset.
+
+Consequence: `theme_resolves_in_both_modes_without_issues` asserts **zero** diagnostics
+for all 33 in both modes. A future asset with a typo will fail that test, not degrade
+quietly.
+
+**`thinkingOpacity` shares the `theme` object with the colours but is a scalar.** In TS
+that is free; in Rust a `BTreeMap<String, ColorValue>` would have read `0.6` as an ANSI
+index and produced black. Fixed by giving the scalar enum a single `Number(f64)` variant
+that both interpretations read — ANSI index in a colour position, opacity in that one
+key — which is exactly what the oracle's `ColorValue = … | number` union does.
+
+**A `#`-prefixed value that is not valid hex needed its own state.** Treating a failed
+hex parse as "then it must be a reference" would turn `"#nothex"` into a
+*reference-not-found* diagnostic naming `"#nothex"` as a def, which sends the reader
+looking in the wrong block. `ScalarColor::Malformed` keeps the literal so the diagnostic
+says "is not a valid hex color".
+
+**No blocker for `oc-config`.** The `theme` key stayed out of the main schema, matching
+the oracle (`packages/core/src/v1/config/config.ts` has no `theme`;
+`packages/tui/src/config/index.tsx:55` does). No crate other than `oc-tui` was touched.
+
+## [2026-08-06] Task 65: oc-engine has no child-session seam, and omo's dist is not on disk
+
+**`oc-engine` exposes nothing a tool can hold to spawn a child session.** This is the
+missing seam the brief asked me to stop and report rather than work around.
+`oc_engine::run_turn` takes a `TurnContext` built from `&mut Connection`, a
+`&ProviderRegistry`, an `&dyn AgentModelResolver`, an `&dyn ToolDispatcher` and an
+`&InterruptSignal` (`crates/oc-engine/src/loop.rs:327-360`). A tool cannot hold any of
+them, and the dispatcher in that list is the very thing calling the tool — so the edge
+`oc-tools → oc-engine` would be a call back into the layer above through a borrow it
+cannot obtain. `oc-engine` was NOT modified.
+
+The contract is declared in `oc-tools` instead, as `task::ChildTurnHost`, following the
+precedent `plan_exit::PlanExitHost` set for session-message writes ("a trait rather than
+a dependency on that layer, because `oc-tools` sits below it"). Two methods:
+
+```rust
+async fn delegation_depth(&self, session_id: &str) -> Result<u32, ChildTurnError>;
+async fn dispatch(&self, request: ChildTurnRequest) -> Result<ChildTurn, ChildTurnError>;
+```
+
+**What the implementor still owes (todo 66 / the wiring todo):**
+- `delegation_depth` must walk oc-db's parent/child session chain (todo 21's recursive
+  query). Returning a constant `0` silently disables half the recursion bound — the
+  `ctx.depth` half still fires, but a child session's turn-level `task` call would be
+  allowed through. There is a test for the ancestry half using a host that reports 1.
+- `dispatch` must create the child with `parent_id = request.parent_session_id`,
+  honour `resume_session_id` (from `task_id`) instead of creating one, and drive the
+  turn with `request.model` / `request.provider_options` **as given** — the ladder has
+  already run, so a host that re-resolves the model will disagree with the parent.
+- For a background dispatch it must return `background_id: Some(id)` with
+  `id != session_id`. `task::background_id(session_id)` is the canonical derivation.
+  The tool refuses a host that returns the session id as the job id — upstream does
+  exactly that (`task.ts:279`, `jobId: nextSession.id`) and there is a test
+  (`a_host_that_reuses_the_session_id_as_its_job_id_is_refused`) plus a
+  `RecordingHost::conflating_ids()` double that reproduces the upstream shape.
+- The tool is NOT registered into the registry here. `BuiltinSlot::Task` already exists
+  and `tests/task.rs::the_task_tool_registers_in_its_upstream_slot_and_resolves` proves
+  a `TaskTool` accepts that slot, but nothing constructs one in
+  `ToolRegistryBuilder::build` — deliberately, because the host does not exist yet and
+  a `TaskTool` with no host cannot be built.
+
+**What a passed `load_skills` does: `ToolError::InvalidArgs`, not silently ignored.**
+The argument is declared on `TaskParams` but `#[schemars(skip)]`-ed out of the
+advertised schema, so no caller learns the name from this tool. A caller that sends it
+anyway (having learned it from another harness) is refused with a message naming the
+fix. Silently ignoring it was the alternative and was rejected: a caller that believes
+it loaded a skill and did not will blame the child for ignoring it, and that
+misattribution is more expensive than one refused call. Tested both ways — the refusal
+message, and that no child session is dispatched.
+
+**omo's `dist/index.js` is not in this repo.** `.omo/refs/` contains claw-code, codex,
+hermes-agent, jcode, omo-slim and nothing else, so the plan's three omo citations
+(`:136191-136258` category/coordinator dispatch rules, `:136040-136072` override
+precedence, `:136363-136372` the schema) could not be measured. Every rule they
+describe is corroborated by the one omo artefact that IS on disk —
+`.omo/refs/omo-slim/src/hooks/delegate-task-retry/patterns.ts:7-51`, whose nine
+error-substring/fixHint pairs include 'category OR subagent_type', 'Must provide either
+category or subagent_type', 'Unknown category', 'Unknown agent', 'load_skills',
+'run_in_background' and 'is not allowed. Allowed agents:'. Any later todo needing the
+omo bundle should expect to not find it.
+
+**The prompt's per-target baseline was off by one target.** It listed `registry` at 10;
+measured on unmodified `main`, `tests/registry.rs` has 8 tests and `tests/batch.rs` has
+10. It also omitted `websearch` (21). No regression — those files are untouched.
