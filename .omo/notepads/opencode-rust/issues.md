@@ -2067,3 +2067,290 @@ State after the repair, measured on main at `00d37c9`: `cargo build --workspace 
 `cargo clippy --workspace --all-targets --offline` **0 warnings**, `cargo fmt --all --check` clean,
 `cargo test --workspace --offline` **1637 passing, 0 failing targets**; `oc-tools --lib` is 100 tests
 (three tasks' worth) and the task-41 differential against the real 1.18.12 binary is 5/5.
+
+## Task 40 — Tooling constraints
+- CodeGraph was unavailable because the task worktree had no `.codegraph` index; source inspection used the authorized Read/Grep fallback.
+- Context7 quota was exhausted, so current tree-sitter and Tokio API details were checked from docs.rs search results instead.
+- `lsp_diagnostics` only accepts paths under the request cwd; diagnostics were run against a temporary local copy of the task worktree, then that copy was removed.
+
+## Task 30 — verification constraints
+- CodeGraph was unavailable because sibling worktree `oc-wt/t30` has no `.codegraph` index; the task used direct source and real-cassette inspection instead.
+- `lsp_diagnostics` rejects sibling-worktree paths. Diagnostics were run against a temporary copy under the main request cwd; all six changed Rust files were clean and the copy was removed.
+- The committed OpenAI recordings do not expose secret headers and retain no original network timing. Authentication is therefore covered structurally through `oc-auth`, while cassette replay proves request bodies, endpoints, SSE framing, and canonical event output without making a live request.
+
+## [2026-08-06] Task 50: oracle ambiguities and deliberate divergences in oc-watch
+
+### The two filewatcher flags do NOT use `Flag.truthy` — and the difference is observable
+
+`flag/flag.ts:37-42` declares both with Effect's `Config.boolean`, not with
+`Flag.truthy` (`flag.ts:3-6`, which accepts only lower-cased `"true"` or `"1"`):
+
+```ts
+OPENCODE_EXPERIMENTAL_FILEWATCHER: Config.boolean("OPENCODE_EXPERIMENTAL_FILEWATCHER")
+  .pipe(Config.withDefault(false)),
+```
+
+Two consequences a port that reuses `Env::flag` would get wrong:
+
+1. `Config.boolean` accepts a **wider** value set — `true/1/yes/on` and
+   `false/0/no/off` — where `truthy` accepts only `true`/`1`.
+2. It **fails** on an unparseable value instead of reading it as `false`.
+   `Config.withDefault(false)` supplies `false` only when the variable is
+   *absent*. A present-but-unparseable value yields an Effect `InvalidData`
+   failure, which propagates out of the `Layer.effect` body into the
+   `Effect.catchCause` at `watcher.ts:130-136`; that handler logs and returns an
+   empty service. So a typo in either variable takes down the **whole layer,
+   including the otherwise-ungated `.git` subscription** — it does not fall back
+   to "enable off".
+
+**NOT CONFIRMED against the 1.18.12 binary.** Five values (`yes`, `on`, `bogus`,
+`2`, `TRUE`) produced byte-identical `opencode debug paths` output, because the
+watcher layer is not constructed on that code path and its failure is logged
+rather than surfaced. There is no `debug` subcommand that reports watcher state.
+Both the value set and the unparseable-value behaviour are therefore read off
+`Config.boolean`'s contract and the oracle source, not measured. If a later task
+finds a code path that surfaces it, re-check `flags.rs`.
+
+### `OPENCODE_EXPERIMENTAL_FILEWATCHER` is NOT a master switch — precedence, resolved
+
+Both flags set to true → **watcher OFF**. `DISABLE` is read first, at
+`watcher.ts:59`, before the backend check and before the binding load, and returns
+`Service.of({})` immediately.
+
+The part that is easy to get wrong: the **enable** flag gates only the
+project-directory subscription (`watcher.ts:107`). The `.git` subscription at
+`watcher.ts:112` is gated on nothing but the repository being git. **With no flags
+set at all, the oracle still watches `.git`.** Modelled as `Decision::VcsOnly`; a
+port that treats the enable flag as a master switch silently stops noticing branch
+switches in the default configuration. The task prompt's framing ("the two
+experimental flags", implying a boolean gate) points the wrong way here.
+
+### DIVERGENCE: folder pruning is per-component, not top-level-only
+
+`Ignore.PATTERNS` (`ignore.ts:48`) is `[...FILES, ...FOLDERS]` — 11 globs
+concatenated with 28 bare directory **basenames** — handed to `@parcel/watcher`'s
+`ignore` option (`watcher.ts:107-109`). In parcel a bare name is a path relative to
+the watched directory, so **the oracle prunes only a TOP-LEVEL `node_modules`**.
+
+The same module's own matcher, `Ignore.match` (`ignore.ts:55-58`), instead tests
+the basename set against **every component**:
+
+```ts
+const parts = filepath.split(/[/\\]/)
+for (const part of parts) if (FOLDERS.has(part)) return true
+```
+
+`oc-watch` implements `Ignore.match`'s rule, not parcel's. The set contains
+`node_modules`, `target`, `dist`, `build`, `bin`, `obj` — a monorepo has several of
+those inside every package, and reporting them defeats the watcher's purpose. This
+is a deliberate divergence and a strict narrowing of what is reported.
+
+### DIVERGENCE: `.gitignore` support is an addition, not a port
+
+`@parcel/watcher` has no gitignore support; **nothing in the oracle consults
+`.gitignore`**, and `Ignore.PATTERNS` is a hard-coded stand-in for it. The plan's
+"plus gitignore semantics" is therefore new behaviour, not parity. It is opt-in via
+`WatchOptions::gitignore(true)` and **off by default** so the default configuration
+stays oracle-equivalent.
+
+### DIVERGENCE: the `.git` filter states its intent instead of snapshotting
+
+`watcher.ts:117-120` reads `.git`'s directory entries **at subscribe time** and
+ignores all of them except `HEAD`:
+
+```ts
+const ignore = (yield* fs.readDirectoryEntries(vcs)...).flatMap(
+  (entry) => (entry.name === "HEAD" ? [] : [entry.name]),
+)
+```
+
+Because that list is a snapshot, an entry created in `.git` *after* subscribing is
+not in it and **slips through the oracle's filter**. `is_vcs_reportable` states
+"only `HEAD`" directly, which is a strict narrowing and what the code clearly
+intends.
+
+### `FOLDERS` has 28 entries, not 29
+
+Counted from `ignore.ts:3-32`. A `[&str; 29]` was the first thing the compiler
+rejected. The count is now pinned by `the_pattern_counts_match_the_oracle` so a
+future edit that drops an entry fails loudly instead of quietly pruning less.
+
+### `oc_config::WatcherConfig` is NOT re-exported from the crate root
+
+`crates/oc-config/src/lib.rs:15` re-exports only `Config` and
+`KNOWN_TOP_LEVEL_KEYS`. `WatcherConfig` (and every other nested config type) must
+be referenced as `oc_config::schema::WatcherConfig`. Cost one compile error here;
+worth a root re-export if another crate hits it.
+
+### `oc_testkit::perf`'s memory helper is unusable from outside the crate
+
+The task prompt suggested reusing it. `perf::process_tree::sample` is
+**`pub(crate)`** and measures a *child process tree*, not the caller's own RSS.
+Reading `/proc/self/status` `VmRSS` directly is four lines and adds no dependency.
+
+## [2026-08-06] Task 43: contradictions between the plan, the oracle, and the binary
+
+### 1. BLOCKING FOR TODO 44 — `plan_exit` has a SECOND gate the plan does not mention
+
+The plan says `plan_exit` is "exposed only under the experimental plan mode with a CLI
+client". That is the **registry** condition (`registry.ts:243`) and it is **not
+sufficient**. Measured on 1.18.12, same environment both times:
+
+```
+OPENCODE_EXPERIMENTAL_PLAN_MODE=true  debug agent build --pure  -> plan_exit ABSENT
+OPENCODE_EXPERIMENTAL_PLAN_MODE=true  debug agent plan  --pure  -> plan_exit PRESENT
+```
+
+Cause: `packages/opencode/src/agent/agent.ts:128,164` — `plan_exit: "deny"` in the
+agent permission defaults, `plan_exit: "allow"` only for the `plan` agent. The registry
+offers it in both cases; the permission ruleset takes it back for `build`.
+
+**The binary wins over the plan, per the brief.** `oc-tools::exposure` implements the
+registry gate only, because the permission gate is `oc-permission`'s and this task may
+not touch that crate. Documented on `exposure`'s and `plan_exit`'s module docs and in
+the evidence file. **Todo 44 must apply both, registry predicate first then
+`oc_permission` visibility, or it will over-offer `plan_exit` on every non-plan agent
+and its differential against `debug agent build` will fail.**
+
+Note the same layering already exists for `question`: `question: "deny"` in the
+defaults with `"allow"` for both `build` and `plan` (`agent.ts:126,150,161`), so the
+`question` gate happens to agree with the registry for those two agents and would
+diverge for a custom agent that does not re-allow it.
+
+### 2. The brief's `--tool` flag does not do what it says
+
+`opencode debug agent <name> --tool` does **not** print the resolved tool list; `--tool`
+is "Tool id to execute" (from `--help`). The list is the `tools` object of the plain
+`debug agent <name>` call. Todo 44's differential must use the plain call **and vary
+the agent**, not just the environment.
+
+### 3. Two of the plan's "determine from the oracle" questions, answered
+
+- `invalid` **is** model-visible — present in all 18 measured configurations, with the
+  description "Do not use". Its "exposure condition" is therefore "always", and the
+  predicate says so across a 28-configuration matrix rather than being left implicit.
+- `todowrite` **is** unconditional (`registry.ts:237`, present in all 18 cases).
+
+### 4. Deliberate divergence: this port REFUSES `priority: 0`, upstream accepts it
+
+Upstream declares `status` and `priority` as bare `Schema.String` with the allowed
+values only in the *description* (`packages/schema/src/session-todo.ts:6-16`), so
+`priority: 0` and `status: "banana"` are accepted and written to the `text` column
+verbatim. This port models them as Rust enums, so both are refused as
+`ToolError::InvalidArgs` and the schema advertises the permitted values to the model.
+
+The plan asked for this ("a todo item with priority `0` is rejected with a message
+naming the allowed string values"), so it is intended — but it **is** a behaviour
+difference, and it has one real consequence: a `.db` the TypeScript binary has written
+to can contain values this port refuses to read. That case surfaces as
+`TodoStoreError::UnknownValue { field, value, position }` rather than a silent coercion,
+because guessing which enum an unknown string meant would corrupt the user's list.
+Anyone porting a todo *reader* elsewhere needs the same decision.
+
+### 5. `oc-tools` now has 5 modules from 5 tasks, and the count keeps rising
+
+`lib.rs` after this task: `apply_patch, edit, read, write` (39/42), `glob, grep,
+search_common` (41), `webfetch, websearch` (42), `exposure, invalid, plan_exit,
+question, todo` (43). Todo 40 (`shell`) is landing concurrently and todo 44
+(`registry`) is next. My additions are confined to (a) prose inside the **existing**
+leading `//!` block and (b) `pub mod`/`pub use` lines appended at the very end, so a
+union merge of the tail is safe; the header block is the only place that needs manual
+reconciliation.
+
+`Cargo.toml` gained `oc-db` + `rusqlite` (runtime) and `oc-paths` (dev). Verified
+exactly one `[dependencies]` and one `[dev-dependencies]` table remain, per the wave-7
+hazard. `Cargo.lock` gained 3 lines, all additions, and
+`cargo metadata --locked --offline` succeeds.
+
+### 6. `cargo test -p oc-tools conditional` under-runs, as expected
+
+The plan's literal acceptance command passes (28 lib + 8 integration = 36) but filters
+out 153 lib and 12 integration tests, and matches zero in four other integration
+binaries. Unfiltered counts reported alongside it: `--lib` 181, `--test
+conditional_tools` 20. Third occurrence of this in this crate; the pattern is now
+reliable enough that any bare-filter acceptance criterion should be read as "also run
+the unfiltered targets".
+
+## [2026-08-06] Task 67: the plan's replace guard is codex's, in a function the prompt did not name
+
+The task prompt says codex's `replace_thread_goal` "has no status guard" while
+the plan requires the replace to succeed only over a `complete` goal, and framed
+that as a deliberate divergence. Half right, and the other half matters.
+
+codex has **two** replacement functions:
+
+- `codex-rs/state/src/runtime/goals.rs:156-211` `replace_thread_goal` —
+  unguarded upsert. This is what the `/goal` slash command calls.
+- `codex-rs/state/src/runtime/goals.rs:213-269` `insert_thread_goal` — the same
+  upsert **plus `WHERE thread_goals.status = 'complete'`** at `:245`.
+
+So the guard the plan asks for is codex's own SQL, verbatim. What codex leaves to
+convention is *which* of the two the model can reach. `oc-goal` moves that from
+convention into the API's names: `create_goal` (guarded, model-facing) and
+`replace_goal_as_system` (unguarded, the user's escape hatch).
+
+**The unguarded path is load-bearing and must not be dropped.** Without it a
+`blocked` goal is permanent: no `SystemStatus` variant is `complete`, so nothing
+can move a blocked goal into the state `create_goal` accepts. A design that only
+ships the guarded replace deadlocks the moment the model reports `blocked`.
+
+The genuinely-absent-from-codex half of the plan is the two-scope ownership
+split. codex lets any caller name any status and repairs the outcome in SQL. The
+plan wins there.
+
+### codex needs four accounting modes for something that should be one rule
+
+`GoalAccountingMode` (`goals.rs:32-38`) has `ActiveStatusOnly`, `ActiveOnly`,
+`ActiveOrComplete`, `ActiveOrStopped`, threaded through a `QueryBuilder` that
+splices a different status filter per mode. It exists to answer "may a non-active
+goal accrue usage?" — and the four answers are all yes-with-caveats, because a
+turn that finished or was interrupted still cost tokens.
+
+`oc-goal` collapses it: counters **always** accrue, and only the budget *flip* is
+restricted to `active` (which is codex's `budget_limit_status_filter` for three
+of its four modes anyway, `goals.rs:526-531`). One statement, no builder, and the
+behaviour codex's `ActiveOrComplete` mode exists to enable is simply the default.
+If todo 68/69 needs "do not record usage for a paused goal", that is a caller-side
+decision and should stay there — a store whose counters silently stop counting is
+a store whose numbers nobody can trust.
+
+## [2026-08-06] Task 40 verification: one coverage gap I found and did NOT block on
+
+The implementation is correct and matches the oracle; the gap is a missing *test*
+for behavior that IS implemented.
+
+`analyze_command("cd /tmp && git push origin main")` returns **both** resources —
+which is what the plan's acceptance criterion demands — and `authorize()` then
+**filters out** the `changes_directory` ones before asking permission
+(`shell.rs:241`). That filter is exact oracle parity: `shell.ts:28` defines
+`CWD = {cd, chdir, popd, pushd, push-location, set-location}` and `shell.ts:407`
+guards `if (tokens.length && (!cmd || !CWD.has(cmd)))` before
+`scan.patterns.add(...)`. So `cd` is a *resource* but never an *ask*.
+
+**No test asserts the second half.** Nothing would catch a refactor that starts
+asking permission for `cd`. Not a security hole — external directories are asked
+separately under the `external_directory` permission (`shell.rs:226-235`) — but a
+UX regression that would pass CI.
+
+**Todo 44 should assert it** when it wires permission-based hiding: a recording
+asker over `cd /tmp && git push origin main` must receive exactly one pattern,
+`git push origin main`.
+
+### Mutation testing performed on task 40 (all three mutations correctly failed)
+
+Verification was not "tests are green". I mutated the implementation three times
+and confirmed each mutation breaks the specific test that claims to cover it:
+
+| mutation | expected failure | observed |
+|---|---|---|
+| delete `process.process_group(0)` (`shell.rs:316`) | group kill | `shell_cancellation_kills_the_shell_and_its_whole_process_group` FAILED at `tests/shell.rs:144` |
+| `analyze_command` returns one opaque compound resource | resource extraction | 2 FAILED, `left: ["cd /tmp && git push origin main"]` vs `right: ["cd /tmp", "git push origin main"]` |
+| `hard_ceiling * 10_000` | hard ceiling | `shell_injected_hard_ceiling_really_terminates_the_process_under_two_seconds` FAILED |
+
+Restored after each; 7/7 green again. **The tests test what they claim.**
+
+Also confirmed the todo-72 boundary is respected: `params.timeout` is carried into
+`ChildExecution.foreground_timeout` and surfaced as metadata, but nothing kills on
+it — only `hard_ceiling` and the interrupt kill. No test asserts a foreground
+timeout kills anything, so todo 72 can implement promote-to-background without
+contradicting a green suite.

@@ -2697,3 +2697,372 @@ the path itself when it is a directory and its parent otherwise. Containment is 
 **both** the session directory and the worktree, matching `containsPath(full, ins)`. If Todo 39 lands
 a shared helper with this shape, `search_common` should delegate to it and delete its copy — the
 shapes were chosen to make that a deletion rather than a reconciliation.
+
+## Task 40 — Shell execution boundaries
+- The public wire id is `bash`; Bash and PowerShell are parsed before permission asks, and every non-directory-changing constituent is submitted as its own resource pattern.
+- User foreground `timeout` is carried in metadata but does not kill the child here; only cancellation and the injectable hard ceiling terminate it, preserving todo 72 ownership of foreground timeout promotion.
+- `shell.env` is represented by the injectable `ShellEnvHook` with a no-op default, following the existing formatter seam rather than depending on the plugin crate directly.
+
+## Task 30 — OpenAI protocol boundaries
+- One provider owns both genuine OpenAI wire shapes. Surface selection is explicit, with `Default -> Responses`; the compatible-provider family remains separate and unchanged.
+- Responses reasoning is persisted as `ProviderReasoningItem` / `ProviderEncryptedReasoning`, never flattened into generic text or signed-thinking forms. The private ciphertext is opaque data and is not decoded, normalized, or regenerated.
+- Request and stream conversion are separate state machines around the shared canonical `CompletionRequest`, `RequestContentBlock`, and `StreamEvent` types. No OpenAI-specific event enum crosses the crate boundary.
+- Error recovery is classified from HTTP status and structured `error.type` / `error.code`. Human-readable `message` is retained only as an error source or refusal detail and never controls retry policy.
+
+## [2026-08-06] Task 50: oc-watch channel capacity, coalescing rules, and drop visibility
+
+### Bounded channel: 1024 events, buffer 4096 paths
+
+```rust
+pub const DEFAULT_CAPACITY: usize    = 1_024;  // tokio::sync::mpsc, bounded
+pub const DEFAULT_MAX_PENDING: usize = 4_096;  // distinct paths coalesced
+```
+
+**1024** is sized to absorb one full flush of the largest realistic single event:
+a `git checkout` that touches ~1,000 distinct files. Measured — the 1,000-file
+burst test delivers 1,000 events with **0 drops**. 1024 is the next power of two
+above the measured requirement. Cost is bounded and small (~40 KiB of slots plus
+the paths actually queued). Raising it buys no correctness: past this size a
+consumer that cannot keep up wants an overflow signal and a rescan, not a longer
+queue, so a bigger number only trades staleness for memory.
+
+**4096 = 4 x capacity.** Four flush-windows of coalescing for a fully stalled
+consumer before anything is discarded. Beyond that the honest answer is
+`Overflow`: a buffer large enough to hold every path in a monorepo is an unbounded
+queue with extra steps.
+
+Both are `#[must_use]` builder overrides, which is what makes the pressure path
+testable — `capacity(16)` + `max_pending(64)` reaches the give-up path with 4,000
+files in under a second instead of needing production-scale load.
+
+Also `DEFAULT_DEBOUNCE = 100ms` (long enough that a multi-write save lands in one
+window, short enough to feel immediate) and `DEFAULT_MAX_WAIT = 1s` (a build
+touches something every few ms, so the trailing debounce alone would never elapse
+and the consumer would starve for the build's duration).
+
+### Two kinds of drop, surfaced differently — this is the load-bearing decision
+
+The plan says "coalesce-and-drop, never grow" as if it were one outcome. It is
+two, with different consumer consequences, and conflating them hides a real bug
+class:
+
+| | information | how it is surfaced |
+|---|---|---|
+| superseded (coalesced) | preserved — merged into a newer event | **silent**, this is the normal case |
+| given up (buffer full) | **lost** | `WatchEvent::Overflow { dropped }` |
+
+Degradation order: **coalesce → hold → drop.**
+
+- *Hold*: channel full → the batch is requeued into the coalescing buffer and
+  retried one quiet period later. `Debouncer::requeue` sets `last_activity` as
+  well as `window_opened`, which is what makes the retry a **backoff** instead of
+  a hot loop — without it the flush thread spins against a full channel. Requeued
+  events are treated as **older** than anything that arrived meanwhile, so a
+  newer kind wins.
+- *Drop*: buffer full → further **new** paths are discarded and counted. Paths
+  already held keep merging, because merging costs no memory and losing them
+  would report stale kinds.
+
+`Overflow` is sent **ahead of** the batch it precedes, so a consumer learns its
+view has a hole *before* it acts on a partial one. `dropped` counts since the
+previous `Overflow`, not since the start, so a consumer can act on the number
+without keeping a running total.
+
+### Coalescing rule: newer kind wins, EXCEPT `Add` survives a following `Change`
+
+```
+Add     + Change  -> Add       <- the only asymmetric case
+Add     + Unlink  -> Unlink
+Change  + Add     -> Add       <- atomic-rename save
+Change  + Unlink  -> Unlink
+Unlink  + Add     -> Add       <- same, seen in the other order
+Unlink  + Change  -> Change
+```
+
+The asymmetry is necessary: a consumer has never heard of a newly created path, so
+the first thing it must hear is "this is new", and `Create + Modify` is what
+inotify emits for **every** file write. Collapsing that to `Change` would tell a
+consumer to update a record it does not have.
+
+`Add + Unlink -> Unlink` rather than "emit nothing": a consumer that observed the
+file mid-window (via its own scan) would otherwise be left stale forever. An
+`Unlink` for a path a consumer never had is a harmless no-op; the reverse is not.
+
+This is safe **only because every consumer action is idempotent under the rule** —
+`Add` and `Change` both mean "read this path", `Unlink` means "forget it". That is
+the property that makes the oracle's 3 events and this 1 event leave a consumer in
+the same state, and it is the invariant to preserve if the rule is ever extended.
+
+### Ambiguous notify kinds read as `Change`, never as `Unlink`
+
+`Modify(Name(Any))`, `Modify(Name(Other))`, `EventKind::Any`, `EventKind::Other`
+carry no direction. All four map to `Change`: it tells the consumer to re-read,
+which is correct whether the path was written or moved into place, and a re-read of
+a vanished path fails harmlessly. Guessing `Unlink` would **evict live files** from
+a consumer's index. `Access(_)` maps to nothing at all — the oracle publishes only
+create/update/delete (`watcher.ts:85-89`), so mapping `IN_CLOSE_WRITE` would invent
+events. `Modify(Name(Both))` is the one notification that is genuinely two changes
+(two paths, `(from, to)` order) and is split into `Unlink` + `Add`.
+
+### The notify callback thread is never blocked, and the lock is never held over a send
+
+`notify` runs its callback on a thread it owns, and the kernel's inotify queue is
+bounded (16384 on this host) — overrun it and the kernel sets `IN_Q_OVERFLOW` and
+**silently discards** events. So the callback only classifies, filters, takes the
+buffer mutex, merges, and wakes. Every publish is `Sender::try_send` from a
+separate flush thread, **with the mutex not held**. No path in the crate calls a
+blocking or awaiting send.
+
+The flush loop is a plain `std::thread` + `Condvar`, not a Tokio task: `try_send`
+needs no reactor, so the crate constructs and publishes outside a runtime, and the
+loop's timing does not depend on runtime scheduling. That is also what lets the
+tests be plain `#[test]` with `try_recv` polling — no `#[tokio::test]` anywhere.
+
+A poisoned mutex is recovered (`PoisonError::into_inner`) rather than propagated:
+the guarded region is a map and three counters, and the alternative to recovering
+is that one panic permanently stops the consumer hearing about anything.
+
+### The gitignore chain is lazy and per-directory, with an explicit staleness escape
+
+One `Gitignore` matcher **per directory that owns a `.gitignore`**, consulted
+deepest-first, built on first use and cached. Per-directory is forced by
+correctness (`GitignoreBuilder` anchors to the builder root — see issues.md);
+lazy is forced by the watcher's purpose (an eager map means walking the whole repo
+at startup).
+
+The consequence is stated in the docs rather than papered over: a `.gitignore`
+created in a directory not yet seen **is** picked up; one in an already-cached
+directory is not, and an **edited** one is not re-read. `Filter::is_gitignore(path)`
+plus `Filter::invalidate()` let a consumer handle it — the edit is itself an event
+it receives. `Watcher::filter()` returns the `Arc` so this needs no restart.
+
+### `Decision` is data, and a disabled watcher is the same type
+
+Three variants — `Disabled(reason)` / `VcsOnly` / `Full` — because the oracle
+watches two different things under two different conditions and a caller must be
+able to tell them apart (see issues.md on the enable flag not being a master
+switch). `DisabledReason` distinguishes `ExplicitlyDisabled` (deliberate opt-out,
+log nothing) from `UnparseableFlag { key, value }` (misconfiguration worth telling
+the user about).
+
+A disabled watcher is **not** a separate type and **not** an error: `Watcher::start`
+returns an `EventStream` that never yields, exactly as the oracle returns an empty
+service (`watcher.ts:59`, `watcher.ts:130-136`). Callers therefore have no branch
+to write; they consult `decision()` only if the reason is worth logging.
+
+`Env` is threaded in rather than read from `std::env`, because this workspace
+forbids `unsafe` and `std::env::set_var` is `unsafe` in edition 2024 — the same
+constraint that shaped `oc-paths`. It is the only way a test can vary the flags.
+
+## [2026-08-06] Task 43: the exposure-predicate API, the todo replace strategy, and four seams
+
+### The exposure API todo 44 consumes
+
+`crates/oc-tools/src/exposure.rs`. One data struct, four predicates, one lookup:
+
+```rust
+pub struct Client(String);                 // newtype, NOT an enum — see below
+pub struct ExposureFlags {
+    pub client: Client,
+    pub enable_question_tool: bool,
+    pub experimental_plan_mode: bool,
+}
+impl ExposureFlags {
+    pub fn from_env() -> Self;
+    pub fn from_lookup(impl Fn(&str) -> Option<String>) -> Self;
+    // builders for tests: with_client, with_plan_mode, with_question_tool
+}
+
+pub type ExposurePredicate = fn(&ExposureFlags) -> bool;
+pub fn exposes_invalid(&ExposureFlags) -> bool;      // always true
+pub fn exposes_todowrite(&ExposureFlags) -> bool;    // always true
+pub fn exposes_question(&ExposureFlags) -> bool;
+pub fn exposes_plan_exit(&ExposureFlags) -> bool;
+
+pub const CONDITIONAL_TOOLS: [(&str, ExposurePredicate); 4];
+pub fn exposure_predicate(wire_id: &str) -> Option<ExposurePredicate>;
+pub fn exposed_conditional_tools(&ExposureFlags) -> Vec<&'static str>;
+```
+
+Design choices and why:
+
+- **`exposure_predicate(wire_id) -> Option<_>` is the intended registry entry point.**
+  The filter is `predicate(&flags)` where it returns `Some`, unconditional otherwise —
+  one lookup, no `match` in the registry to keep in step with this module. `None` for a
+  non-conditional tool is a deliberate signal, tested against `read`/`write`/`glob`/
+  `grep` **and** against `todo`/`plan` (the registry *keys*, which must not resolve).
+- **`fn` pointers, not boxed closures**, so `CONDITIONAL_TOOLS` is a `const` and two
+  predicates can be compared for identity.
+- **Keyed on WIRE ids.** `Tool::id()` returns the wire id, so the registry map is keyed
+  `invalid`/`question`/`todowrite`/`plan_exit`. Upstream's registry keys `todo` and
+  `plan` have no wire meaning and are deliberately not reproduced anywhere. A test
+  asserts neither appears in `CONDITIONAL_TOOLS`.
+- **`exposed_conditional_tools` exists for the differential**, which compares a list per
+  flag configuration. `tests/conditional_tools.rs` has a 15-row table of measured binary
+  invocations driving it, with a floor assertion (`>= 15`) so a table that silently
+  shrank fails loudly.
+- **`ExposureFlags::default()` is hand-written, not derived**, because the client's
+  default is `"cli"` and an empty client matches no gate — a derived `Default` would be
+  wrong in a way nothing would notice.
+- **Flags as data, read through a lookup closure**, exactly as `websearch::gating`
+  already does: Rust 2024 makes `env::set_var` `unsafe`, the workspace forbids
+  `unsafe_code`, so an env-mutating test cannot be written at all, let alone run
+  concurrently in a shared binary.
+- **`Client` is a newtype over `String`, not a closed enum.** Upstream's flag is a bare
+  `Config.string` with no validation, so an unrecognised client is a normal state that
+  matches no gate rather than an error, and keeping the raw value lets a caller log
+  what it was actually given. `can_render_questions()` and `is_plan_exit_client()` are
+  the two questions anyone asks of it.
+
+### The `(session_id, position)` primary-key strategy: delete-then-insert, one transaction
+
+Forced by the DDL and matching upstream (`session/todo.ts:29-51`). Inside a single
+`Pool::transaction` (IMMEDIATE, so the busy timeout applies): `DELETE FROM todo WHERE
+session_id = ?`, then one prepared `INSERT` per item with `position` = the item's index
+in the model's array and one shared `now_millis()` for the whole batch.
+
+Rejected alternatives:
+- **`INSERT OR REPLACE`** — leaves stale rows behind whenever the new list is shorter,
+  which is the common case as a session's todos get completed and pruned.
+- **Diffing the existing list** — needs a stable item identity the schema does not have
+  (there is no id column), so any diff would be content-based and would renumber
+  positions on a reordering anyway.
+- **One timestamp per row** — a list written together would appear to have been written
+  over several milliseconds, which is a lie a transcript can show.
+
+`SqliteTodoStore::list` reads with an explicit `ORDER BY position ASC`. Without it the
+correct order is a coincidence of the index, not a guarantee.
+
+### `TodoStatus` / `TodoPriority`: hand-written `Deserialize` over one shared visitor
+
+The derived decoder cannot name the allowed values in its error, which is the whole
+point (see learnings). One `EnumVisitor<T>` holds `allowed: &'static [&'static str]`
+plus a `fn(&str) -> Option<T>` parser, and both enums delegate to it — so the two error
+messages cannot drift, and adding a third string enum here is three lines.
+`ALLOWED` is `pub` so a test and a caller assert against the same list.
+
+### Four seams, because this crate sits below the layers that own the effects
+
+| tool | seam | why |
+|---|---|---|
+| `todowrite` | `TodoStore` (+ `SqliteTodoStore`, `MemoryTodoStore`) | synchronous, because the only real impl is a local SQLite write; `spawn_blocking` at the call site rather than an async trait to suit one implementation |
+| `question` | `QuestionAsker` (+ `ScriptedAnswers`) | the round trip to a human needs an event bus and an HTTP API, neither of which is in this crate |
+| `plan_exit` | `QuestionAsker` **and** `PlanExitHost` (+ `RecordingHost`) | reuses the *same* asker upstream does — one transport, not two — plus a host for the session-message write |
+| `invalid` | none | it formats a diagnosis someone else made; infallible in both implementations |
+
+`ScriptedAnswers` and `RecordingHost` are `pub` in the library, not `#[cfg(test)]`
+helpers, so `plan_exit`'s tests and the integration test share one double and one
+contract with `question`'s.
+
+`plan_exit`'s params are `struct PlanExitParams {}` — an empty **struct**, not a unit
+type — so `schemars` derives `{"type":"object"}` and `oc-tool`'s central augmentation
+has an object to inject `intent`/`accept_large_output` into. A unit type derives `null`
+and the augmentation would have nothing to attach to.
+
+### Upstream oddities reproduced rather than corrected, each with a test that says so
+
+- `question`'s title pluralises on `> 1`, so zero questions reads "Asked 0 question"
+  (singular). `question.ts:35`.
+- `todowrite`'s title counts items whose status is not `completed`, so `cancelled`
+  counts as open and a one-item list reads "1 todos". `todo.ts:37`.
+- `question`'s answer rendering joins multiple selected labels with `", "` — the same
+  separator that joins the question/answer pairs, so the two are indistinguishable by
+  separator alone. `question.ts:30-32`.
+- `plan_exit` tests `answers[0]?.[0] === "No"`, so an **empty** answer is not a refusal
+  and falls through to the switch. Inventing a refusal there would strand the session
+  in plan mode. `plan.ts:46`.
+
+## [2026-08-06] Task 67: sqlite goal store with split status ownership and budgets
+
+### The goal table lives in its own database file, `goal_1.db`
+
+`$XDG_DATA_HOME/opencode/goal_1.db`, beside `opencode.db` and not inside it.
+Spill files at `$XDG_DATA_HOME/opencode/goal-objective/<uuid-v4>/goal-objective.md`.
+
+Two independent reasons:
+
+1. **`opencode.db` is not ours to extend.** `oc-db` reproduces the TypeScript
+   schema byte-for-byte — `TABLE_COUNT = 19` plus the `migration` journal — and
+   proves it with a differential test against a real database plus the 38-entry
+   journal contract. A 20th table breaks that test and the promise it guards.
+   A goal is a feature the TypeScript binary does not have, so it has no place
+   in a file that binary also writes.
+2. **A goal must outlive session churn.** Its purpose is to survive the
+   compaction that discards the conversation which set it, so it must not share
+   a file with state that gets pruned, vacuumed and cascaded.
+
+Therefore **no** `FOREIGN KEY (session_id) REFERENCES session(id) ON DELETE
+CASCADE`. A goal is keyed *by* a session id. Asserted:
+`pragma_foreign_key_list('goal')` returns zero rows, the DDL contains no
+"FOREIGN KEY", and the database holds exactly one table.
+
+Schema is one `CREATE TABLE IF NOT EXISTS`, no migration chain — reopening must
+be a no-op, and that is what makes a goal survive a restart. An incompatible
+change revs the filename (`goal_2.db`), codex's convention
+(`codex-rs/state/src/sqlite.rs:30`).
+
+### Ownership is enforced by two types, not by a runtime check
+
+```
+ModelStatus  = { blocked, complete }
+SystemStatus = { active, paused, usage_limited, budget_limited }
+GoalStatus   = the union; nothing accepts a bare GoalStatus as a write
+```
+
+`update_status_as_model(&self, session_id, ModelStatus)` — there is no `paused`
+variant to pass, so a future caller cannot smuggle one through. The alternative
+shape (one method taking an `Actor` parameter) was rejected: it makes the
+illegal state representable and then rejects it at runtime, which is exactly the
+check a refactor forgets.
+
+**`active` is system-owned.** The non-obvious one. The model already obtains
+`active` by creating a goal, so making it model-writable buys nothing — and it
+opens a hole: a model on a `budget_limited` goal could set `active` and keep
+spending. The plan's "must not let the model clear a budget limit" decides it.
+
+### Two invariants live in SQL because in Rust they would be races
+
+- **The guarded replace** is one upsert whose `DO UPDATE` carries
+  `WHERE goal.status = 'complete'` (ports `goals.rs:245`). A read-then-write
+  would let two concurrent `create_goal` calls both observe `complete` and both
+  replace. The refusal *is* the statement returning no row; the follow-up read
+  that names the blocking status runs in the same transaction and only labels.
+- **The budget flip** is a `CASE` in every statement that can move `tokens_used`
+  or `token_budget`. `tokens_used + ?1 >= token_budget` reads the pre-update
+  value, so the flip decides on the post-increment total inside the statement
+  performing the increment. Also in `set_token_budget` (lowering below the spend
+  stops the goal at once) and in `set_status_as_system` (an `active` request on
+  an over-budget goal resolves to `budget_limited`, so even the system cannot
+  clear a limit without raising the budget first). And the upsert's `0 >= ?4`
+  means a budget of `Some(0)` is never observable as an `active` goal.
+
+Both are proven by tests that run the statement text **directly** against a
+connection, because a test that only calls the store cannot distinguish a SQL
+`WHERE` from a Rust `if` around an unguarded statement.
+
+### The objective cap and the pointer sentence
+
+`MAX_OBJECTIVE_CHARS = 4_000`, counted with `chars().count()`. Above it the
+objective spills and the column holds, verbatim:
+
+```
+Read the full goal objective at <spill_dir>/<uuid-v4>/goal-objective.md before continuing.
+```
+
+Both the cap and the spill sit **below** the store's API — codex splits them
+across protocol and TUI (`protocol.rs:4082`, `goal_files.rs:121`), which means
+every caller must remember to spill. Folding them in makes "the column is never
+longer than 4,000 chars" unbreakable from outside.
+
+Reading it back validates rather than parses: inside the spill dir, named
+`goal-objective.md`, parent directory a v4 UUID (`goal_files.rs:164-171`). The
+objective is model-writable, so a pointer that resolved to any path would be an
+arbitrary-file-read primitive.
+
+### Error taxonomy: `GoalError`, and `oc-error` untouched
+
+A refused status is a policy decision, not a broken statement, so it does not
+belong in `DbError` — and four sibling crates depend on `oc-error` being stable
+this wave. `GoalError` wraps `DbError` with `#[error(transparent)] #[from]` and
+adds the domain failures. `GoalError::is_model_refusal()` tells the goal tool
+(todo 68) whether to hand the text to the model or treat it as internal.

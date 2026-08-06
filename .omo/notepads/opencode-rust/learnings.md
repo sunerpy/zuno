@@ -2931,3 +2931,312 @@ things the oracle lacks: deterministic truncation ("the first 100 of a stable or
 `$`-anchored pattern: Rust's regex has no "before a final newline" rule. The differential caught this
 as `"submatches": []` against the oracle's `start: 0, end: 23` for `export const needle = 0$`.
 Offsets are unaffected because the terminator only ever sits at the end.
+
+## Task 40 — ShellTool resource extraction and lifecycle
+- tree-sitter 0.26 uses grammar `LANGUAGE.into()` plus `Parser::set_language`; recursive `Node::children` traversal extracts nested command substitutions without evaluating them.
+- Tokio `Command::process_group(0)` gives each Unix shell a dedicated process group, so cancellation and the hard ceiling can terminate the shell and descendants together.
+- `ToolOutputStore` remains the sole overflow persistence path; ShellTool records `outputPaths` while leaving todo 72 to decide model-visible refusal/promotion policy.
+
+## Task 30 — genuine OpenAI family
+- `ApiSurface::Default` means Responses for the genuine OpenAI provider because the oracle constructs `sdk.responses(modelID)`; Chat is selected explicitly and targets `/v1/chat/completions`.
+- Stateless Responses reasoning requires `store: false` plus `include: ["reasoning.encrypted_content"]`. Continuation replays `encrypted_content` byte-for-byte but deliberately omits the prior response item `id`.
+- Sampling controls are unsafe for the o-series, non-chat GPT-5, Codex, and computer-use families. All of `temperature`, `top_p`, `frequency_penalty`, and `presence_penalty` are omitted together; `gpt-5-chat-*` remains a normal chat model.
+- Real recordings buffer complete SSE bodies, so the provider tests deliberately split each body into 17-byte chunks before feeding the shared `oc_llm::sse::SseParser`; this proves arbitrary transport chunking without claiming the cassette retained original network boundaries.
+
+## [2026-08-06] Task 50: debounced file watching over notify, bounded channel
+
+### inotify does not report one notification per logical change — it reports 2-3
+
+Measured on this host (Linux, `notify` 8.2.0 → `INotifyWatcher`). Creating and
+writing one small file yields, in order:
+
+```
+Create(File)                    IN_CREATE
+Modify(Data(Any))               IN_MODIFY
+Access(Close(Write))            IN_CLOSE_WRITE
+```
+
+A 1,000-file burst therefore produces ~3,000 kernel notifications, of which
+**2,003 survive classification** (`Access` is discarded, matching the oracle,
+which publishes only create/update/delete — `watcher.ts:85-89`). Coalescing folds
+those 2,003 into exactly **1,000** delivered events. The 2.0x ratio is the whole
+justification for a debouncer: the oracle publishes one event per notification, so
+a consumer that re-reads a file on every event re-reads it 2-3 times per save.
+
+Corollary for anyone writing an assertion: **`accepted == published` is the bug
+signal, not the healthy state.** Both the single-edit and the burst test assert
+`accepted > published` for exactly this reason.
+
+### The inotify race that WILL make your test flake: files in a just-created subdir
+
+`built_in_ignored_folders_are_never_reported` failed on the first run with:
+
+```
+the source file was not reported: {"/tmp/.tmp2zhbVr/src"}
+```
+
+`src` was reported; `src/main.rs`, written immediately after `create_dir_all`, was
+**never reported at all**. This is not a bug in the port. inotify watches one
+directory at a time, so a recursive watcher has to add a watch for `src` when it
+*processes* `src`'s creation event — and anything written between the `mkdir` and
+that watch landing is invisible to the kernel. `notify` cannot fix this and
+neither can we; `@parcel/watcher` has the same hole.
+
+Two consequences:
+
+1. **Any test that writes into a directory it just created must retry the write
+   until the path shows up**, with a deadline. A single write plus a sleep is a
+   coin flip. The retry loop is also what a real consumer needs, so it is not
+   test-only scaffolding.
+2. A consumer that must not miss files in new directories needs a rescan on
+   directory-creation events. Todo 64 will care.
+
+### Making filesystem tests deterministic — the four rules that got 3/3 identical runs
+
+Three consecutive full runs: `13 passed` in **3.02s each**, wall clock 3.32s.
+Identical to 10 ms. That did not happen by accident:
+
+1. **`notify::Watcher::watch()` returns before the kernel is delivering.** Every
+   fixture writes a probe file in a retry loop and blocks until it is observed,
+   then drains the probe's own events. Skip this and the first assertion in every
+   test races the watch registration. This is the single highest-value line in the
+   test file.
+2. **No fixed `sleep` as a synchronisation primitive.** Two helpers only:
+   `poll_until(budget, cond)` (5 ms steps, hard deadline) and
+   `drain_until_quiet(stream, quiet, budget)` which returns `(events, went_quiet)`
+   so a timeout is distinguishable from a genuine quiescence and fails with the
+   observed state.
+3. **Inject the debounce.** Tests use 250 ms with `max_wait` at 30 s, which makes
+   "the burst produces exactly one flush" structurally true rather than
+   disk-speed-dependent — the write phase is far shorter than 250 ms of quiet.
+4. **Assert bounds and per-path counts, never raw totals.** `dropped` came out
+   5648 / 6764 / 7718 across runs (it depends on how many flush cycles the loop
+   completes). Asserting `dropped > 0` plus `held <= capacity + max_pending` is
+   stable; asserting `dropped == 7718` would have flaked immediately.
+
+Plus: **keep the clock out of the state machine.** `debounce.rs` never calls
+`Instant::now()` — every entry point takes an `Instant`. All 22 of its unit tests
+are pure functions of an explicit timeline and cannot flake, so the coalescing
+*rules* are tested there and the filesystem tests only confirm the wiring. That
+split is why the fast tests are the thorough ones.
+
+### The structural bound is the proof; RSS is only corroboration
+
+The acceptance criterion asked for a memory-delta ceiling. Measured, from
+`/proc/self/status` VmRSS: **248 KiB** delta for the 1,000-file burst and **0 KiB**
+for a fully stalled consumer taking 4,000 files, both against an 8 MiB ceiling.
+
+Those numbers are real but they are not what proves boundedness — RSS is
+page-granular and these buffers are tens of KiB. What proves it:
+
+- `watcher.pending() <= max_pending` and `stream.queued() <= capacity` asserted
+  **after every single write**, 1,000 and 4,000 times respectively, so a transient
+  excursion fails the test even if RSS never notices.
+- The stalled consumer held **exactly 80 = capacity(16) + max_pending(64)**. Not
+  "about 80" — the configured ceiling, hit precisely, with nothing being read.
+
+If you need a memory assertion in this workspace: `oc_testkit::perf::process_tree`
+is **`pub(crate)`** and measures a *child* process tree, so it cannot be reused for
+the test's own RSS. Reading `/proc/self/status` is four lines and adds no
+dependency.
+
+### Deliberately tiny capacities are how you test a pressure path
+
+`capacity(16)` + `max_pending(64)` reaches the give-up path with 4,000 files in
+under a second. Trying to hit the production 1024/4096 ceilings with real load
+would need a burst large enough to be slow *and* would make the outcome depend on
+host speed. Two `#[must_use]` builder knobs turned "asserted in a doc comment"
+into "asserted in a test".
+
+### `GitignoreBuilder` anchors to the builder root and ignores the `from` path
+
+Extending todo 41's notes with the matcher-side finding. `GitignoreBuilder::add_line`
+(`ignore-0.4.33/src/gitignore.rs:460-540`) anchors every pattern to the
+**builder's** root; the `from: Option<PathBuf>` argument is kept only for error
+reporting. So feeding a nested `sub/.gitignore` into one root-anchored builder
+**mis-anchors its `/`-prefixed patterns**: `/foo` in `sub/.gitignore` must mean
+`sub/foo`, and one builder reads it as `foo`.
+
+Correctness needs **one matcher per directory that owns a `.gitignore`**,
+consulted deepest-first — which is what `WalkBuilder` does internally with a type
+it does not export. A watcher cannot use `WalkBuilder` at all (it is handed a path
+and must answer, not enumerate), so `oc-watch` builds that map itself, lazily and
+cached: building it eagerly would mean walking the whole repo at startup, the one
+cost a watcher exists to avoid.
+
+Also confirmed: `matched_path_or_any_parents` **panics** if the path is not under
+the matcher root (`gitignore.rs:243`), so strip and bounds-check before calling it.
+
+### `require_git` bites the matcher side too
+
+Todo 41 recorded this for the walker. It applies verbatim here: a `.gitignore` in a
+tree with no `.git` is not applied, so a watcher fixture that forgets it tests
+nothing and passes. An **empty `.git` directory is enough** — the check is for
+presence, so `fs::create_dir(root.join(".git"))` avoids shelling out to `git init`
+in a test. (`.git` is itself in `IGNORED_FOLDERS`, so nothing inside it is reported
+anyway.)
+
+## [2026-08-06] Task 43: the conditional tools — measured exposure, the client enum, and todo replace semantics
+
+### `opencode debug agent <name> --tool` does NOT print a tool list
+
+The brief (and, I suspect, todo 44's) assumption. `--help` says `--tool` is
+"Tool id to execute". The resolved list is the **`tools` object of the plain
+`debug agent <name>` call**, a `{ id: bool }` map. Todo 44's differential must read
+that, and it must vary the **agent** as well as the environment — see the plan_exit
+finding below.
+
+Reproducible invocation (clean env, temp `HOME`, `--pure`, scratch git repo):
+
+```
+env -i HOME=$TMP PATH=/usr/bin:/bin TERM=dumb OPENCODE_CLIENT=... \
+  /config/.local/share/mise/installs/opencode/1.18.12/opencode debug agent build --pure
+```
+
+### The measured exposure conditions (18 invocations, full transcript in the evidence file)
+
+| wire id | condition | oracle |
+|---|---|---|
+| `invalid` | always, and it **is** model-visible | `registry.ts:227` |
+| `todowrite` | always | `registry.ts:237` |
+| `question` | client ∈ {`app`,`cli`,`desktop`} **or** `OPENCODE_ENABLE_QUESTION_TOOL` | `registry.ts:202,228` |
+| `plan_exit` | plan mode **and** client == `"cli"`, **then** an agent-keyed permission gate | `registry.ts:243` + `agent/agent.ts:128,164` |
+
+`invalid` is present in all 18 configurations with the description "Do not use". That
+reads contradictory and is not: the name has to be in the model's vocabulary for a
+correction message to arrive attributed to a tool call, while the description
+discourages deliberate use.
+
+### The client is a bare string, and both edge cases bite
+
+`OPENCODE_CLIENT` is `Config.string(...).withDefault("cli")`
+(`runtime-flags.ts:57`) — no validation, so an unrecognised client is a normal state
+that matches no gate. Two measured surprises:
+
+- **Case-sensitive.** `OPENCODE_CLIENT=CLI` offers neither `question` nor `plan_exit`.
+  An `eq_ignore_ascii_case` would silently change behaviour.
+- **Set-but-empty is not defaulted.** `OPENCODE_CLIENT=` offers neither either; the
+  `"cli"` default applies only when the variable is *absent*. A
+  `.filter(|v| !v.is_empty())` would silently change behaviour.
+
+Modelled as `exposure::Client(String)` — a newtype, not a closed enum — for exactly
+that reason.
+
+### `OPENCODE_EXPERIMENTAL` is a FALLBACK, not an override
+
+`enabledByExperimental` (`runtime-flags.ts:11-15`) reads the specific flag as an
+`Option` and substitutes the blanket switch only when it is **absent**. Measured:
+
+- `OPENCODE_EXPERIMENTAL=true OPENCODE_EXPERIMENTAL_PLAN_MODE=false` → plan mode **off**
+- `OPENCODE_EXPERIMENTAL=false OPENCODE_EXPERIMENTAL_PLAN_MODE=true` → plan mode **on**
+
+A disjunction reading — which is the obvious one, and which the sibling `websearch`
+gating in this crate legitimately uses for `enable_exa` — gets the first case wrong.
+The two flags genuinely differ: `enableExa` puts `experimental` in a disjunction
+(`runtime-flags.ts:31-39`), `experimentalPlanMode` uses the option fallback. Do not
+generalise one to the other. Hence `exposure::parse_bool` returns
+`Option<bool>` so "unset" and "explicitly false" stay distinguishable.
+
+`0`/`false`/`no`/`off` and `1`/`true`/`yes`/`on` are honoured; anything else counts as
+absent and falls through to the blanket switch.
+
+### `todo` replace semantics: the primary key forces the strategy
+
+`(session_id, position)` is the primary key, so upstream's `Todo.update`
+(`session/todo.ts:29-51`) does the only thing that works: **one transaction**,
+`DELETE WHERE session_id = ?`, then insert with `position` = the item's index in the
+model's array. Three consequences, each now asserted rather than assumed:
+
+- `position` **is** the ordering; nothing else in the row records it, so a read needs
+  an explicit `ORDER BY position`.
+- `todos: []` is a **clear**, not a no-op — upstream returns early *after* the delete.
+- A shorter second list only works because of the delete; without it you get
+  `UNIQUE constraint failed: todo.session_id, todo.position`.
+
+`time_created`/`time_updated` are also NOT NULL with **no SQL default** — drizzle's
+`Timestamps` supplies both from `Date.now()` at insert time
+(`core/src/database/schema.sql.ts:3-10`, where `$onUpdate` fires on insert too). An
+insert naming only the five columns the plan quotes fails.
+
+The FK is live: `oc-db` issues `PRAGMA foreign_keys = ON` on every connection, verified
+by reading the pragma back off a pooled connection (1), so a write for an unknown
+session **fails** and deleting a session cascades its todos away. Both tested.
+
+### `serde`'s derived enum decoder cannot name the allowed values
+
+`#[derive(Deserialize)]` on a string enum reports a numeric input as
+`invalid type: integer 0, expected variant identifier` — the permitted values do not
+appear anywhere, so a model cannot correct the call. Hand-writing `Deserialize` over
+one visitor whose `expecting` enumerates them yields
+`invalid type: integer 0, expected one of "high", "medium", "low"`.
+
+`visit_u64` **and** `visit_i64` both need explicit arms: `serde_json` routes `0`
+through `visit_u64` and `-1` through `visit_i64`, and `Visitor`'s default arms produce
+a message against a borrowed expectation that reads worse.
+
+## [2026-08-06] Task 67: sqlite goal store with split status ownership and budgets
+
+### codex keeps goals in a SEPARATE database file, deliberately
+
+`codex-rs/state/src/sqlite.rs:29-33` lists five runtime databases by filename:
+`logs_2.sqlite`, `goals_1.sqlite`, `memories_1.sqlite`, `state_5.sqlite`,
+`thread_history_1.sqlite`. Goals are not in `state_5.sqlite`, and the main
+migration set contains `0034_drop_thread_goals.sql` — the table used to live in
+the shared state DB and was moved out. Two consequences worth reusing:
+
+1. **The `_N` suffix is the migration strategy.** An incompatible schema change
+   revs the filename rather than migrating in place. For state that is cheap to
+   lose and expensive to corrupt, that is the right trade — and it means the
+   schema can be a single `CREATE TABLE IF NOT EXISTS` with no journal at all.
+2. **A goal has no FK to the thread.** `thread_goals.thread_id` is a plain
+   `TEXT PRIMARY KEY` (`goals_migrations/0001_thread_goals.sql:2`). Keyed *by* a
+   thread, not owned by a thread row. That is what lets it survive compaction.
+
+`oc-goal` ports this as `goal_1.db` under `oc_paths::data()`, one table, no FK.
+Adding it to `oc-db`'s `opencode.db` was never an option: `TABLE_COUNT = 19`
+plus the schema-differential test against a real DB would have failed, and the
+byte-compatibility promise is worth more than the convenience of one file.
+
+### codex's objective cap is split across two layers; folding it into the store is better
+
+- `codex-rs/protocol/src/protocol.rs:4076` `MAX_THREAD_GOAL_OBJECTIVE_CHARS = 4_000`,
+  and `:4082` **rejects** anything longer, counting with `chars().count()`.
+- `codex-rs/tui/src/goal_files.rs:121-136` — the *caller* spills to
+  `attachments/<uuid-v4>/goal-objective.md` first and substitutes a sentence.
+
+So every future caller of codex's store has to remember to spill. Putting both
+below the store's API instead makes "the column is never longer than 4,000
+chars" a property callers cannot break. Cost: the store owns a filesystem
+dependency it would otherwise not have.
+
+**`chars().count()`, not `len()`.** A byte cap cuts a CJK objective to a third of
+an ASCII one. `oc-goal` has a test that a 4,000-character CJK objective (12,000
+bytes) does *not* spill, which is the only way to catch a byte/char slip.
+
+### reading a model-authored path back is a security boundary, not a parse
+
+`goal_files.rs:157-172` does not just strip the prefix/suffix — it checks the
+path is inside `$CODEX_HOME/attachments`, is named `goal-objective.md`, and that
+its parent directory name parses as a UUID. All three matter: the objective is
+model-writable, so a pointer that resolved to any path would be an
+arbitrary-file-read primitive handed to the model. Ported verbatim in
+`oc-goal/src/spill.rs::objective_pointer_path`, with a test covering four
+distinct forgeries.
+
+### `rusqlite` 0.40.1 and CHECK-constraint violations
+
+- A `CHECK` violation arrives as `Error::SqliteFailure(inner, _)` with
+  `inner.code == ErrorCode::ConstraintViolation` — the same code as an FK or
+  UNIQUE violation. `oc_db::is_constraint_violation` already covers it; there is
+  no separate `ErrorCode` for CHECK, so distinguishing a CHECK from a UNIQUE
+  needs the extended code or the message string. `oc-goal` never needs to: the
+  `CHECK` exists so an unknown status is *unstorable*, and a violation is a bug
+  in this crate, not input.
+- `oc_db::map_error` maps it to `DbError::Query`, correctly non-retryable.
+- **`RETURNING` needs `query`, not `execute`.** `Connection::execute` with a
+  `RETURNING` clause returns a row count and discards the row.
+  `statement.query(params)?.next()?` is the shape that gives you
+  `Option<&Row>` — and `None` is how a guarded upsert reports its refusal.
+- `Pool::transaction` is typed on `DbError`, so a closure that also produces a
+  domain error has to collapse it. Doing that in one named helper
+  (`into_db_error`) beats sprinkling `map_err` at every call site.
