@@ -28,6 +28,7 @@ oc-plugin-sdk = { workspace = true }
 oc-tool = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -35,7 +36,6 @@ url = { workspace = true }
 
 [dev-dependencies]
 oc-testkit = { workspace = true }
-tempfile = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 

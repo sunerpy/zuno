@@ -916,7 +916,7 @@ impl RemoteTool {
 #[error("remote plugin tool failed: {0}")]
 struct RemoteToolFailure(String);
 
-fn encode_hook(hook: &HookInvocation<'_>) -> Result<HookCall, HookCodecError> {
+pub(crate) fn encode_hook(hook: &HookInvocation<'_>) -> Result<HookCall, HookCodecError> {
     let (input, output) = match hook {
         HookInvocation::Dispose => (Value::Null, Value::Null),
         HookInvocation::Event { event } => (json!({ "event": event_value(event)? }), Value::Null),
@@ -1048,7 +1048,10 @@ fn encode_hook(hook: &HookInvocation<'_>) -> Result<HookCall, HookCodecError> {
     })
 }
 
-fn apply_hook_output(hook: &mut HookInvocation<'_>, value: Value) -> Result<(), HookCodecError> {
+pub(crate) fn apply_hook_output(
+    hook: &mut HookInvocation<'_>,
+    value: Value,
+) -> Result<(), HookCodecError> {
     match hook {
         HookInvocation::Dispose | HookInvocation::Event { .. } => Ok(()),
         HookInvocation::Config { config } => {
@@ -1536,7 +1539,7 @@ struct WireTextOutput {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum HookCodecError {
+pub(crate) enum HookCodecError {
     #[error("plugin hook JSON failed: {0}")]
     Json(#[from] serde_json::Error),
     #[error("plugin hook output is invalid: {0}")]
