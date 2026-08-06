@@ -6,14 +6,15 @@
 //! environment markers, or make another upstream command disappear. The frozen
 //! `index.ts` fixture and [`validate_upstream_surface`] guard that boundary.
 
+mod cmd;
 mod command;
 mod disposition;
 mod environment;
 mod version;
 
 pub use command::{
-    Action, Cli, CliLogLevel, Command, CommandDispatcher, DispatchError, DispatchRequest,
-    GlobalOptions, ImplementedCommand, PendingCommandDispatcher,
+    Action, Cli, CliLogLevel, Command, CommandDispatcher, DispatchArguments, DispatchError,
+    DispatchRequest, GlobalOptions, ImplementedCommand, PendingCommandDispatcher,
 };
 pub use disposition::{
     CommandDisposition, Disposition, SurfaceError, disposition_for, dispositions,
@@ -83,7 +84,7 @@ pub fn run_process() -> ExitCode {
         }
     };
 
-    execute_action(action, &mut PendingCommandDispatcher)
+    execute_action(action, &mut cmd::HeadlessCommandDispatcher)
 }
 
 fn restart_with_environment(args: &[OsString], environment: &StartupEnvironment) -> ExitCode {
@@ -157,7 +158,7 @@ pub fn execute_action(action: Action, dispatcher: &mut dyn CommandDispatcher) ->
             println!("{output}");
             ExitCode::SUCCESS
         }
-        Action::Dispatch(request) => match dispatcher.dispatch(request) {
+        Action::Dispatch(request) => match dispatcher.dispatch(*request) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("{error}");
