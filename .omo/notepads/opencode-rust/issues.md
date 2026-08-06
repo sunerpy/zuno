@@ -2439,3 +2439,44 @@ it and checking `git status` was unchanged.
   text id. A `VACUUM` may renumber rowids; this is documented and the explicit
   recovery is `oc_db::fts::rebuild`. Running `VACUUM` without rebuilding can leave
   stale FTS document ids even though ordinary message reads remain correct.
+
+## [2026-08-06] KNOWN FLAKE: `oc-snapshot` gc prune-window test
+
+`crates/oc-snapshot/tests/store.rs:359` —
+`gc_reclaims_a_snapshot_superseded_more_than_the_prune_window_ago` failed **once**
+during the task-98 merge gate, then passed 3/3 alone, 3/3 for its whole target, and
+4/4 for the full workspace. It is intermittent, load-correlated, and **not** caused
+by task 98 (which does not touch `oc-snapshot`).
+
+Symptom, verbatim:
+```
+panicked at crates/oc-snapshot/tests/store.rs:359:5:
+the superseded tree is local to the store:
+/tmp/.tmpNzhg2b/data/snapshot/proj/a54d.../objects/2e/81171448eb9f2ee3821e3d447aa6b2fe3ddba1
+```
+So the assertion that the superseded tree was written as a **loose object** failed —
+`objects/2e/8117…` was absent at that moment.
+
+What I ruled out by reading the fixture (`tests/store.rs:22-41`): it is fully
+isolated — its own `tempfile::tempdir()`, its own `git init`, its own commit. No
+shared source repo, no shared index, no `git config --global` writes. So this is
+not cross-test interference between the target's parallel threads.
+
+What remains, and what a fix task should test:
+1. **`objects/info/alternates` resolution.** The test's own comment says both trees
+   must be content the source repo never committed, "otherwise `write-tree` resolves
+   them through `objects/info/alternates` and no object is written into the store".
+   The fixture commits `a.txt` = `"hello\n"`, and the test writes `"first\n"` then
+   `"second\n"` — distinct, so this *should* hold. Worth re-deriving under load.
+2. **Loose-vs-packed.** `INIT_CONFIG` (`store.rs:448-457`) sets 8 keys and **does not
+   set `gc.auto=0`**. If anything in the path runs an automatic gc, the object is
+   packed rather than loose and `loose.is_file()` is false while the object still
+   *resolves*. The assertion tests the storage form, not the property the test cares
+   about. **The likely correct fix: assert the object resolves (`resolves(...)`),
+   not that a loose file exists** — and set `gc.auto=0` in `INIT_CONFIG` so the
+   store's packing behaviour is deterministic regardless.
+
+**Why this matters beyond one test**: `.omo/premerge.sh` runs `cargo test --workspace`
+as its merge gate. A load-correlated flake there will randomly block future merges
+and, worse, train the next reader to re-run until green — which is how a real
+regression gets waved through. Fix it before it does that.
