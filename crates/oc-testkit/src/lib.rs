@@ -46,6 +46,7 @@
 //! | [`diff_normalized`] | the verdict, with provenance and masking in the report |
 //! | [`CassettePlayer`] | cursor replay of the oracle's recorded provider traffic |
 //! | [`MockProvider`] | a loopback provider stand-in that captures every request |
+//! | [`FakeTerminalOwner`] | a terminal-lease owner that records transitions and owns no TTY |
 //!
 //! # A differential in full
 //!
@@ -86,6 +87,7 @@ pub mod oracle;
 pub mod perf;
 pub mod run;
 pub mod subject;
+pub mod terminal_owner;
 
 pub use crate::cassette::{
     BodyEncoding, Cassette, CassettePlayer, HttpInteraction, Interaction, RequestSnapshot,
@@ -102,6 +104,7 @@ pub use crate::normalize::{NormalizationRule, Normalizer};
 pub use crate::oracle::{Oracle, OracleFlavour, requested_flavour};
 pub use crate::run::{Provenance, RunOutcome, VersionGap};
 pub use crate::subject::{SUBJECT_BIN, SUBJECT_PACKAGE, Subject};
+pub use crate::terminal_owner::{FakeTerminalOwner, TerminalTranscript, TerminalTransition};
 
 /// Compare two [`RunOutcome`]s, labelling each side with its own provenance.
 ///
