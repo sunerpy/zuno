@@ -13,10 +13,18 @@
 //! bounded in time, response size and redirect hops, poll the turn's interrupt while
 //! a body streams, and treat everything they retrieve as data rather than
 //! instruction. See [`webfetch::bounds`] for the values and where each came from.
+//!
+//! # Shell
+//!
+//! [`shell`] parses Bash and PowerShell syntax before execution so compound commands
+//! are authorized as their individual command resources. Cancellation and the hard
+//! ceiling terminate the entire spawned process group, while oversized output is
+//! preserved through [`oc_tool::ToolOutputStore`].
 
 pub mod apply_patch;
 pub mod edit;
 pub mod read;
+pub mod shell;
 pub mod write;
 
 pub use read::{FileFormatter, NoopFormatter};
