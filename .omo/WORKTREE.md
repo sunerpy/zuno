@@ -185,3 +185,38 @@ Three of the wave-7 breakages came from four tasks landing in `oc-tools` at once
 Rule now: **at most two in-flight tasks per crate**, and when a choice exists,
 dispatch the todo whose crate has no other editor. Todos in a fresh crate
 (`oc-pty`, `oc-watch`, `oc-goal`, `oc-memory`) are free of this cost entirely.
+
+## Wave 9 dispatch record (2026-08-06)
+
+Five agents live, chosen to respect the per-crate concurrency cap:
+
+| todo | crate(s) | session |
+|---|---|---|
+| 44 | `oc-tools/registry.rs` | `ses_02ae5455affeThfGDZoq6x7RMA` |
+| 72 | `oc-tools/{output_policy,timeout}.rs` + surgical `shell.rs` | `ses_02ae24ba5ffeM8Qfpiis23Wph7` |
+| 49 | `oc-pty` (sole owner) | `ses_02adc3a78ffe4eFZqnnLrZyRzv` |
+| 68 | `oc-goal` (sole owner) | `ses_02ad60be4ffeEHk3HsIYosMhXQ` |
+| 99 | `oc-memory` (sole owner) | `ses_02ac70caaffeBXKAcwkFdeKeaC` |
+
+Held back deliberately: **71** (`risk.rs`) and **79** (`format.rs`) — both land in
+`oc-tools`, which already has two editors. Dispatch them once 44 and 72 merge.
+
+Merge order when they return: the three sole-owner crates first (49, 68, 99 — no
+`lib.rs` contention), then 44, then 72 last because it edits `shell.rs`, which is
+merged mutation-tested code and the most expensive thing to reconcile.
+
+### Probes done up front so subagents did not have to
+
+- `portable-pty = "0.9.0"` compiles and runs here, **and builds under
+  `unsafe_code = "forbid"`** — so todo 49's "no first-party unsafe" is satisfiable.
+  Gotcha handed to the agent: `drop(pair.slave)` before reading or the reader never
+  sees EOF.
+- `rusqlite 0.40.1` bundled ships SQLite **3.53.2** with FTS5 **and**
+  `tokenize='trigram'`; external-content FTS5 over a **VIEW** works. Measured the
+  CJK failure mode: `unicode61` returns **0** for `MATCH '"连接失败"'`, trigram
+  returns **1**. That is why todo 102's trigram table is mandatory, not a nicety.
+- One FTS5 virtual table adds **5** rows to `sqlite_master`'s table inventory
+  (`x`, `x_config`, `x_data`, `x_docsize`, `x_idx`); two add 10 plus a view. That is
+  why the FTS layer had to stay out of `migration::apply` — it would have broken
+  todo 20's `user_tables().len() == 20` assertion and its byte-compat snapshot
+  against the real binary.
