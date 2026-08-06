@@ -26,6 +26,27 @@ use tokio::net::TcpListener;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// An address whose TCP connect is guaranteed to fail *fast*, with
+/// `ECONNREFUSED`, so the load reports `IndexUnreachable`.
+///
+/// Port 1 is privileged: the test process does not run as root, so nothing in
+/// this workspace — or anywhere else on the machine without root — can bind it
+/// and answer. Nothing is listening, so the connect is refused immediately.
+///
+/// Do NOT go back to the bind-then-drop trick (bind `127.0.0.1:0`, learn the
+/// ephemeral port, drop the listener). Once the listener is dropped the port
+/// returns to the ephemeral pool, and `cargo test` runs targets concurrently:
+/// a sibling test — including a `wiremock` server — can bind that exact port
+/// before the request goes out. The "unreachable" URL then reaches a live
+/// server and loads *its* index, so this test intermittently saw a foreign
+/// skill in the result and the merge gate flaked.
+///
+/// A reserved unroutable address (e.g. `192.0.2.1`, RFC 5737) is also wrong
+/// here: it *times out* instead of refusing, producing `IndexTimeout` and
+/// making the test slow — that case is already covered separately by
+/// `a_hanging_index_is_abandoned_at_the_timeout_without_failing_the_load`.
+const REFUSED_ADDRESS: &str = "127.0.0.1:1";
+
 struct Tree {
     dir: TempDir,
 }
@@ -280,11 +301,7 @@ async fn a_malformed_index_is_warned_about_and_the_load_continues() {
 
 #[tokio::test]
 async fn an_unreachable_host_is_warned_about_and_the_load_continues() {
-    // Bind, learn the port, drop the listener: nothing is listening there now.
-    let dead = {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        listener.local_addr().expect("addr")
-    };
+    let dead = REFUSED_ADDRESS;
 
     let tree = Tree::new();
     tree.local_skill("survivor");
@@ -532,10 +549,7 @@ async fn one_dead_url_does_not_stop_the_next_one() {
         .mount(&good)
         .await;
 
-    let dead = {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        listener.local_addr().expect("addr")
-    };
+    let dead = REFUSED_ADDRESS;
 
     let tree = Tree::new();
     let skills = load(&tree.options(vec![format!("http://{dead}"), good.uri()])).await;

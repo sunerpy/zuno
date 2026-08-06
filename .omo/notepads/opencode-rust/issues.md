@@ -3047,3 +3047,75 @@ Future reviews must distrust category-level “covered” claims unless the asse
 names the relevant shape. Task 71 now keeps table-driven regressions for the exact
 reported commands and mutation-proves both fixes. Unknown static semantics are
 listed as limitations instead of being absorbed into a broad coverage statement.
+
+## [2026-08-06] RULE: a test may not assume exclusive use of a shared namespace
+
+Fourth load-correlated flake this session, and the **third distinct root cause** in one
+family: *the test assumed something about shared machine state*. Sibling entries:
+
+1. `oc-snapshot` — a same-size edit within one second of a commit was invisible to
+   git's stat cache (shared namespace: **clock granularity**).
+2. `oc-pty` ×2 — a state change became observable before the event reporting it (see
+   "an event must be in the channel before the state it reports is observable").
+3. this one — an ephemeral **port** assumed to stay free.
+
+### Occurrence — `skill_remote.rs` raced for an ephemeral port
+
+`an_unreachable_host_is_warned_about_and_the_load_continues` manufactured a "dead"
+address with bind-then-drop:
+
+```rust
+// Bind, learn the port, drop the listener: nothing is listening there now.
+let dead = {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    listener.local_addr().expect("addr")
+};
+```
+
+The comment's premise is false. On drop the port returns to the ephemeral pool, and
+`cargo test` runs targets concurrently — so between the drop and the HTTP request
+another test can bind that exact port. The failure value named the thief:
+
+```
+left:  ["customize-opencode", "survivor", "second"]
+right: ["customize-opencode", "survivor"]
+```
+
+`"second"` is served by the sibling test `one_dead_url_does_not_stop_the_next_one`,
+whose `wiremock` server registers `/second/SKILL.md`. The "unreachable" URL had
+reached a *live* server and loaded its index. Production code was never wrong.
+
+Fix: a single documented `REFUSED_ADDRESS = "127.0.0.1:1"`. Port 1 is privileged, so a
+non-root test process cannot bind it — the refusal is **unstealable**, and
+`ECONNREFUSED` arrives in microseconds. Rejected alternatives, recorded so they are not
+retried: a reserved unroutable address (`192.0.2.1`, RFC 5737) *times out* rather than
+refuses, so it yields `IndexTimeout` and collides with the existing
+`a_hanging_index_is_abandoned_at_the_timeout_without_failing_the_load`; holding a
+listener bound and never accepting *is* the hanging case, not the unreachable one.
+Both racy sites in the file were fixed (the two bind-then-drop sites); the two that keep
+the listener alive are a different, sound pattern and were left alone.
+
+Verified: 3 rounds × 6 concurrent runs of the target, 0 failures; `cargo test
+--workspace` twice, 2141 passed / 0 failed both times; clippy 0 warnings; fmt clean.
+Mutation proof: flipping `transport_or_timeout` to return `IndexMalformed` makes the
+test fail at the warning-kind assertion, then restored.
+
+### The rules
+
+1. **A test may not assume exclusive use of a shared namespace** — TCP/UDP ports, pids,
+   fixed temp paths, hostnames, env vars, or clock granularity. `cargo test` runs
+   targets concurrently and each target runs its own tests concurrently, so any
+   resource you released is a resource a sibling may now hold.
+2. **Learning an identifier does not reserve it.** `bind(:0)` then drop tells you a port
+   *was* free. To rely on a port being unusable, pick one nothing can bind (a privileged
+   port as a non-root process); to rely on it being yours, **keep the listener alive**.
+3. **Prefer a statically hostile resource over a dynamically discovered one.** A
+   constant that cannot be acquired by anyone beats a value that merely happened to be
+   free a microsecond ago.
+4. **Fix the pattern, not the occurrence.** After any such flake, grep the whole file
+   for the premise (here `bind("127.0.0.1:0")`) and fix every instance — a second copy
+   is a second future flake.
+5. **Never wave one of these through.** `.omo/premerge.sh` gates every merge on
+   `cargo test --workspace`. A flake there randomly blocks merges and trains the next
+   reader to re-run until green, which is exactly how a real regression gets waved
+   through.
