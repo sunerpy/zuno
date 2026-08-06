@@ -2121,7 +2121,9 @@ dependencies = [
  "oc-catalog",
  "oc-config",
  "oc-llm",
+ "oc-paths",
  "oc-permission",
+ "tempfile",
 ]
 
 [[package]]
@@ -2518,13 +2520,16 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "clap",
+ "futures",
  "oc-catalog",
  "oc-db",
  "oc-engine",
  "oc-error",
+ "oc-llm",
  "oc-paths",
  "oc-pty",
  "reqwest",
+ "rusqlite",
  "schemars",
  "serde",
  "serde_json",
@@ -2590,6 +2595,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
+ "oc-catalog",
+ "oc-config",
  "oc-db",
  "oc-error",
  "oc-memory",

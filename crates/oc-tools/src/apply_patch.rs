@@ -1,8 +1,9 @@
 mod parser;
 
+use crate::format::FormatFailure;
 use crate::read::{
     FileToolRuntime, PathKind, ResolvedPath, check_interrupt, decode_text, encode_text, failed,
-    interrupted, invalid, slash, write_with_dirs,
+    interrupted, invalid, report_formatting, slash, write_with_dirs,
 };
 use async_trait::async_trait;
 use oc_error::ToolError;
@@ -119,20 +120,20 @@ impl TypedTool for ApplyPatchTool {
         let mut summaries = Vec::new();
         let mut files = Vec::<Value>::new();
         let mut formatted_files = Vec::<Value>::new();
+        let mut failures = Vec::<FormatFailure>::new();
         for change in changes {
             check_interrupt("apply_patch", &ctx)?;
             let source_path = change.source.canonical.clone();
             let target = change.destination.as_ref().unwrap_or(&change.source);
             let target_path = target.canonical.clone();
+            // Every branch that writes has already written by the time it formats,
+            // so a formatter's failure is collected rather than propagated: one
+            // uncooperative formatter must not abandon a patch mid-way.
             let formatted = match change.kind {
                 ChangeKind::Add | ChangeKind::Update => {
                     write_with_dirs(&target_path, &change.new_bytes)
                         .map_err(|error| failed("apply_patch", error))?;
-                    self.runtime
-                        .formatter
-                        .format(&target_path)
-                        .await
-                        .map_err(|error| failed("apply_patch", error))?
+                    self.format(&target_path, &mut failures).await?
                 }
                 ChangeKind::Move => {
                     write_with_dirs(&target_path, &change.new_bytes)
@@ -140,11 +141,7 @@ impl TypedTool for ApplyPatchTool {
                     std::fs::remove_file(&source_path)
                         .map_err(|error| failed("apply_patch", error))?;
                     self.runtime.state.forget(&source_path);
-                    self.runtime
-                        .formatter
-                        .format(&target_path)
-                        .await
-                        .map_err(|error| failed("apply_patch", error))?
+                    self.format(&target_path, &mut failures).await?
                 }
                 ChangeKind::Delete => {
                     std::fs::remove_file(&source_path)
@@ -181,13 +178,36 @@ impl TypedTool for ApplyPatchTool {
             "Success. Updated the following files:\n{}",
             summaries.join("\n")
         );
-        Ok(ToolOutput::text(output.clone(), output)
-            .with_metadata("files", Value::Array(files))
-            .with_metadata("formattedFiles", Value::Array(formatted_files)))
+        Ok(report_formatting(
+            ToolOutput::text(output.clone(), output)
+                .with_metadata("files", Value::Array(files))
+                .with_metadata("formattedFiles", Value::Array(formatted_files)),
+            &failures,
+        ))
     }
 }
 
 impl ApplyPatchTool {
+    /// Format one written file, accumulating any failure instead of raising it.
+    ///
+    /// The `Err` arm is reachable only when the formatter implementation itself is
+    /// broken — a conforming one reports formatter failures in the outcome — so it
+    /// stays a real error rather than being folded into the report.
+    async fn format(
+        &self,
+        path: &Path,
+        failures: &mut Vec<FormatFailure>,
+    ) -> Result<bool, ToolError> {
+        let outcome = self
+            .runtime
+            .formatter
+            .format_reporting(path)
+            .await
+            .map_err(|error| failed("apply_patch", error))?;
+        failures.extend(outcome.failures);
+        Ok(outcome.changed)
+    }
+
     fn prepare_changes(
         &self,
         operations: &[PatchOperation],

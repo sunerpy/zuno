@@ -1,6 +1,7 @@
+use crate::format::{FormatFailure, FormatOutcome, METADATA_FAILURES_KEY};
 use async_trait::async_trait;
 use oc_error::ToolError;
-use oc_tool::{PermissionAsk, ToolContext};
+use oc_tool::{PermissionAsk, ToolContext, ToolOutput};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -98,14 +99,37 @@ impl FileAccessState {
     }
 }
 
-/// Named seam consumed by Todo 79's formatter runtime.
+/// The seam Todo 39 left for the formatter runtime, now filled by
+/// [`crate::format::Formatters`].
 #[async_trait]
 pub trait FileFormatter: Send + Sync {
     /// Format `path` after a successful write. Returns whether bytes changed.
     async fn format(&self, path: &Path) -> io::Result<bool>;
+
+    /// Format `path`, reporting which formatters failed rather than only whether
+    /// the bytes changed.
+    ///
+    /// This exists as a second method with a default body rather than as a wider
+    /// return type on [`FileFormatter::format`] so that every implementation
+    /// written against the original seam keeps compiling and keeps working. The
+    /// default says the honest thing about such an implementation: it changed the
+    /// bytes or it did not, and it has no failures to report because it has no way
+    /// to express one.
+    ///
+    /// An implementation must not report a formatter's failure as `Err`. The write
+    /// has already landed by the time this is called, so an `Err` here would make
+    /// the tool tell the model its edit failed when the edit is on disk — which is
+    /// exactly the confusion [`crate::format::FormatOutcome::failures`] exists to
+    /// prevent.
+    async fn format_reporting(&self, path: &Path) -> io::Result<FormatOutcome> {
+        Ok(FormatOutcome {
+            changed: self.format(path).await?,
+            failures: Vec::new(),
+        })
+    }
 }
 
-/// Formatter used until the formatter execution runtime is connected.
+/// Formatter for a host that has no formatter configuration at all.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoopFormatter;
 
@@ -248,6 +272,31 @@ pub(crate) fn encode_text(text: &str, bom: bool) -> Vec<u8> {
     }
     bytes.extend_from_slice(text.as_bytes());
     bytes
+}
+
+/// Attach formatter failures to a *successful* tool result.
+///
+/// Both the text and the metadata carry them. The text is there because that is
+/// what the model reads, and a formatter that is misconfigured stays misconfigured
+/// until somebody is told; the metadata is there because a UI needs the fields
+/// rather than a sentence. Nothing is attached when there is nothing to say, so an
+/// ordinary edit's output is byte-identical to what it was before formatters ran.
+pub(crate) fn report_formatting(mut output: ToolOutput, failures: &[FormatFailure]) -> ToolOutput {
+    if failures.is_empty() {
+        return output;
+    }
+    output.output.push_str("\n\n");
+    output.output.push_str(
+        &failures
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    output.with_metadata(
+        METADATA_FAILURES_KEY,
+        Value::Array(failures.iter().map(FormatFailure::to_metadata).collect()),
+    )
 }
 
 pub(crate) fn write_with_dirs(path: &Path, bytes: &[u8]) -> io::Result<()> {

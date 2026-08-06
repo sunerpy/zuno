@@ -1,6 +1,6 @@
 use crate::read::{
     FileToolRuntime, PathKind, check_interrupt, decode_text, encode_text, failed, invalid,
-    write_with_dirs,
+    report_formatting, write_with_dirs,
 };
 use async_trait::async_trait;
 use oc_error::ToolError;
@@ -104,10 +104,12 @@ impl TypedTool for EditTool {
         let bytes = encode_text(&next, decoded.bom);
         write_with_dirs(&target.canonical, &bytes).map_err(|error| failed("edit", error))?;
         check_interrupt("edit", &ctx)?;
-        let formatted = self
+        // Past this point the edit has landed, so nothing a formatter does may
+        // turn into an `Err` from this tool.
+        let outcome = self
             .runtime
             .formatter
-            .format(&target.canonical)
+            .format_reporting(&target.canonical)
             .await
             .map_err(|error| failed("edit", error))?;
         let final_bytes =
@@ -116,12 +118,13 @@ impl TypedTool for EditTool {
             .state
             .record_write(&ctx.session_id, &target.canonical, &final_bytes);
 
-        Ok(
+        Ok(report_formatting(
             ToolOutput::text(self.runtime.title(&target), "Edit applied successfully.")
                 .with_metadata("filepath", target.canonical.to_string_lossy().into_owned())
                 .with_metadata("replacements", replacements)
-                .with_metadata("formatted", formatted),
-        )
+                .with_metadata("formatted", outcome.changed),
+            &outcome.failures,
+        ))
     }
 }
 

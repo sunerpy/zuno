@@ -3,7 +3,7 @@ mod support;
 pub use support::{FileFormatter, NoopFormatter};
 pub(crate) use support::{
     FileToolRuntime, PathKind, ResolvedPath, check_interrupt, decode_text, encode_text, failed,
-    interrupted, invalid, slash, write_with_dirs,
+    interrupted, invalid, report_formatting, slash, write_with_dirs,
 };
 
 use async_trait::async_trait;

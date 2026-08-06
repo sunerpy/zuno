@@ -12,6 +12,11 @@ publish.workspace = true
 [dependencies]
 async-trait = { workspace = true }
 base64 = { workspace = true }
+# For `formatter::ResolvedFormatters` only: todo 18 parsed the `formatter` config
+# and `oc-catalog` resolved its two-arm union, so `format` consumes that answer
+# rather than re-reading the config shape. The edge is one-way; `oc-catalog` does
+# not depend on this crate.
+oc-catalog = { workspace = true }
 oc-db = { workspace = true }
 oc-error = { workspace = true }
 oc-memory = { workspace = true }
@@ -37,6 +42,10 @@ url = { workspace = true }
 which = { workspace = true }
 
 [dev-dependencies]
+# `tests/format.rs` parses the real `formatter` union from JSON rather than
+# hand-building the resolved enum, so a typo in the config shape fails the test
+# instead of being papered over.
+oc-config = { workspace = true }
 oc-testkit = { workspace = true }
 tempfile = { workspace = true }
 wiremock = { workspace = true }
