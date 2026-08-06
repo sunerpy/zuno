@@ -4009,3 +4009,170 @@ so. Retaining state you could have dropped is sometimes what makes a rule testab
 `{cursor}` → `{<key>: [...], nextCursor}`, so one generic `fetch_list(method, key)`
 covers them. `tools/list` deliberately keeps its own loop: it also swaps the cached
 tool snapshot, and folding it in would couple that cache to every pure read.
+
+## [2026-08-06] Task 79: the built-in formatter table, and how to stub a formatter
+
+### The table is 26 entries, and two are keyed under a name that is not their export
+
+`grep -c '^export const' packages/opencode/src/format/formatter.ts` = **26**. Two
+of those exports carry a `name` field that differs from the identifier, and the
+config keys on the **`name`**, not the export:
+
+- `export const clang` -> `name: "clang-format"` (`formatter.ts:166-167`)
+- `export const rlang`  -> `name: "air"`          (`formatter.ts:218-219`)
+
+So `{"formatter": {"clang": {...}}}` silently declares a *new* formatter with no
+extensions rather than overriding clang-format. Asserted both ways:
+`definition("clang-format").is_some()` and `definition("clang").is_none()`.
+
+### The table is language -> command PLUS a per-formatter availability CLOSURE
+
+The plan describes it as "a table of language -> command". It is not: each `Info`
+carries `enabled(context): Promise<string[] | false>`, and there are **eight
+distinct closure shapes** across the 26. Ported as an `Availability` enum so the
+table can be walked by a test — a table of closures cannot be:
+
+| variant | who uses it | oracle |
+|---|---|---|
+| `Program` | most of the table | `which(x)` |
+| `ProgramWithMarker` | clang-format, ocamlformat | `which` + `findUp(marker)` |
+| `ProgramWithHelpFirstLine` | air | `--help` line 1 has "R language" AND "formatter" (`:218-234`) |
+| `ProgramWithHelpExitZero` | uv | `uv format --help` exits 0 (`:236-247`) |
+| `NodeMarker` | biome | `biome.json`/`biome.jsonc` + `Npm.which` |
+| `NodePackage` | prettier, oxfmt | `package.json` declares it + `Npm.which` |
+| `VendoredPackage` | pint | `composer.json` declares `laravel/pint`; command is `./vendor/bin/pint`, **never** a PATH lookup (`:360-374`) |
+| `RuffConfig` | ruff | three layers (`:189-216`) |
+
+Plus two orthogonal flags: `oxfmt` is behind `experimentalOxfmt` (`:96`), and
+`uv` is `shadowed_by: ruff` (`:238` — `if (await ruff.enabled(context)) return false`).
+The shadow check must live **outside** the availability probe or the two recurse:
+asking "is ruff available" must not ask "does anything shadow ruff".
+
+### `path.extname()` means one of the oracle's own entries can never match
+
+`htmlbeautifier` claims `".html.erb"` (`formatter.ts:271`). `path.extname()`
+returns only the final segment, so `index.html.erb` is `".erb"` — that entry is
+dead upstream too. Carried verbatim; silently correcting the oracle's table would
+be a divergence hiding inside a port. `the_extension_is_the_final_segment_with_a_leading_dot`
+pins the semantics.
+
+### Ruff's fallback is a substring match, and that is upstream's rule
+
+`formatter.ts:205-215`: after the config files, ruff is enabled if
+`requirements.txt`/`pyproject.toml`/`Pipfile` *contains the string* `"ruff"`. A
+comment naming ruff counts. Loose, but tightening it here would silently stop
+formatting projects the oracle formats.
+
+### How to stub a formatter deterministically, without downloading one
+
+Nothing is installed (todo 41's ripgrep line held). Each test writes its own
+`/bin/sh` script into a per-test `tempfile::tempdir()`, behind one `script()`
+helper so no site can skip the pre-flight:
+
+- `rewriting_stub` — rewrites the file to a byte-exact known value, exit 0. Makes
+  "did it format" an equality check rather than a guess about a real formatter's
+  style.
+- `failing_stub` — leaves the file alone, literal stderr, `exit 3`. Makes the
+  stderr assertion exact; a real formatter's message varies by version.
+- `destructive_stub` — **truncates the file and then fails**. This is the case
+  that decides whether an edit can be lost, and no real formatter reproduces it
+  on demand.
+- `recording_stub` — appends every path it was handed to a log, then rewrites.
+  Turns "was this formatter even offered the file" into a line count.
+- `hanging_stub` — `sleep 600`, for the ceiling.
+
+Three details that are not obvious:
+
+1. **Target the LAST positional argument**, not `$1`. A built-in command is
+   `clang-format -i $FILE`, so `$1` is the flag. `for target in "$@"; do :; done`
+   resolves the last one in POSIX sh.
+2. **Every stub changes the file's LENGTH as well as its content**, so "the bytes
+   changed" cannot be true by coincidence. Habit borrowed from the `oc-snapshot`
+   stat-cache flake, even though nothing here consults git.
+3. **Inject the program locator; never touch `PATH`.** Mutating the environment
+   is `unsafe` and forbidden in this workspace. A stub `ProgramLocator` also lets
+   a test drive a *built-in* definition on a machine that does not have that
+   formatter installed. Note a **configured** command is taken verbatim
+   (`format/index.ts:154` replaces the probe with `async () => info.command ?? false`),
+   so those fixtures pass an absolute path; the locator governs the built-ins.
+
+### The oracle's positive-only cache means not caching is unobservable
+
+`format/index.ts:42-48` caches `enabled()`'s answer per formatter, but
+`cmd === false || cmd === undefined` re-probes — so a negative is never cached.
+Skipping the cache entirely therefore changes nothing observable, and it means an
+operator installing a formatter mid-session is picked up.
+
+### `findUp`'s stop bound includes the stop directory itself
+
+`util/filesystem.ts:192-200` pushes `start`, then loops `if (stop === current) break`
+**before** pushing the parent — so `stop` is in the list and its parent is not.
+A port that stops one directory early misses a marker at the worktree root, which
+is exactly where `biome.json` and `.clang-format` usually live.
+
+## [2026-08-06] Task 54: the re-measured plugin call set is 20 methods, not six
+
+**The plan's "six SDK methods" undercounted by 3.3x, for two independent reasons.**
+Both are re-run hazards, not plan sloppiness, and both will recur.
+
+1. **The plugin list had three entries, not two.** `/config/.config/opencode/opencode.json:87-92`
+   enables `opencode-antigravity-auth@1.6.0`, `@sunerpy/opencode-kiro-auth@0.20.1`
+   **and** `@sunerpy/oh-my-openagent@4.21.0` (line 89 is a commented-out `file://`
+   spec). The plan's prose said "the two auth plugins"; the third is a
+   session-orchestration plugin and is responsible for **13 of the 14 additions**.
+   The config lines the plan cited already contained it.
+2. **One callsite aliases the SDK namespace.** `client.app.log` is written
+   `const app = _client?.app;` then `app.log({...})`
+   (AG `dist/src/plugin/logger.js:45-50`). A grep for `client.` cannot see it.
+   **Any future capture must search method-path fragments — `auth.set`,
+   `showToast`, `app.log` — independently of the receiver name.**
+
+**`client.provider.oauth` is not a method.** It is a namespace object
+(`Provider.oauth = new Oauth(...)`, `packages/sdk/js/src/gen/sdk.gen.ts:715-750,753-774`)
+whose two children are what plugins call: `.authorize` and `.callback`, both from
+KIRO `dist/core/request/request-handler.js:783-790` with body `{method: 0}`.
+Implementing the plan's spelling literally would have served
+`/provider/{id}/oauth` — a path the oracle does not have — and left both real
+calls unrouted. **A namespace in a call chain reads exactly like a method; check
+the SDK for `new` before mapping one to a route.**
+
+Confirmed verbatim from the plan's six: `auth.set`, `session.abort`,
+`session.messages`, `session.prompt`, `tui.showToast`. Net: 6 -> 20 routes, all 20
+present in `.omo/fixtures/oracle-openapi-1.18.12.json`.
+
+**The SDK does not prefix its requests.** `InstanceHttpApi` composes its groups
+with no `.prefix("/api")` (`.../httpapi/api.ts:61-76`) and the generated client
+asks for bare `/session/{id}/abort`, `/tui/show-toast`
+(`packages/sdk/js/src/gen/sdk.gen.ts:437,1120`). Serving only `/api/*` leaves
+*every* plugin call unrouted — that is why a pre-`/api` surface exists at all,
+and why the toast path is `/tui/show-toast` (server `groups/tui.ts:45,140-149`,
+SDK `sdk.gen.ts:1115-1126`), not `/tui/showToast`.
+
+### axum: a scoped catch-all is `nest` + inner fallback, never a `{*rest}` sibling
+
+Measured the hard way — 12 of 16 tests failed on the first attempt:
+
+```
+Invalid route "/auth/{*rest}": Insertion failed due to conflict with
+previously registered route: /auth/{providerID}
+```
+
+`matchit` treats a wildcard and a named parameter **at the same depth** as
+*conflicting*, not as one outranking the other. So "register the specific route,
+then a `{*rest}` above it" **panics at assembly** on the first prefix that has a
+parameterised route. A global `Router::fallback` is the other dead end: it also
+answers for unmatched `/api/*`, and merging two routers that both have a fallback
+panics.
+
+What works: **one `Router::nest` per prefix, each inner router carrying its own
+fallback.** axum grafts an inner fallback into the outer router *at the nest
+prefix* (`axum-0.8.9/src/routing/mod.rs:227-229`) — exactly the scoping needed.
+Three consequences worth knowing before reaching for this:
+
+- The nest **strips its prefix** before the fallback runs, so the handler must
+  read `OriginalUri` or it reports a path the caller never sent.
+- A nest at `/foo` matches bare `/foo`, but the grafted fallback sits one segment
+  deeper — prefixes with no measured root route need an explicit bare route.
+- `method_not_allowed_fallback` must be applied **after** the routes it covers;
+  axum retrofits it onto already-registered `MethodRouter`s only
+  (`path_router.rs:116-126`).

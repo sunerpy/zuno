@@ -4069,3 +4069,240 @@ so a model sending an empty string gets the all-servers listing rather than a re
 (`:173-175`) even though the registry currently gates these tools under the coarser
 `read` / `*` pair — it is strictly narrower than what the coarse gate already allows,
 and porting it now means whoever wires a per-server gate has it ready and tested.
+
+## [2026-08-06] Task 79: in-place formatting, the risk-gate boundary, and plan-file precedence
+
+### A failed format restores the pre-format bytes — a deliberate divergence
+
+`format/index.ts:96-113` logs the failure and keeps whatever the formatter left on
+disk. `Formatters::format_all` instead retains the post-write bytes and **restores
+them whenever the formatter did not succeed** (non-zero exit, spawn failure, or
+timeout). The contract a caller can rely on is exact: *after a failed format the
+file holds precisely the bytes the edit wrote.*
+
+The mutation proof is not close. Reverting to upstream's behaviour makes
+`a_formatter_that_truncates_the_file_before_failing_has_its_damage_undone` fail
+with `left: ""` — the edit entirely gone. A formatter killed at a ceiling, or one
+that truncates before failing to parse, leaves a file that is neither the edit nor
+a formatted version of it.
+
+**Price paid, stated plainly**: a formatter that exits non-zero *after* doing
+useful work has its partial work discarded. `rubocop --autocorrect` returns 1
+while any offence remains uncorrected, so a rubocop run that fixed nine of ten
+offences is rolled back to the unformatted edit. That leaves the file exactly as
+it would be if rubocop were not installed — losing an optional partial reformat,
+against keeping a mangled file. Taken.
+
+### In place, not through a temporary file
+
+Every command in the built-in table mutates the file it is handed: `-w`, `-i`,
+`--write`, `--fix`. Handing them a temp copy breaks two classes of formatter:
+those that resolve configuration by walking up from the *file's own* directory
+(`.clang-format`, `.ocamlformat`, `rustfmt.toml`, `biome.json`) and those that key
+behaviour on the filename.
+
+A temp file would buy atomicity against a concurrent reader. Restoring the
+pre-format bytes buys the property that actually matters — the **edit** survives —
+and buys it without lying to the formatter about where the file lives. Note this
+is the opposite call from `oc-goal`'s projection (todo 69), which *does* use
+temp+rename: there the writer owns the file and a reader may open it at any
+moment; here a third-party process must see the real path.
+
+### A formatter does NOT go through the risk gate
+
+`crates/oc-tools/src/risk.rs` (todo 71) exists because `bash` executes a string
+the **model** composed. A formatter command comes from either the compile-time
+table or the operator's config, so there is no model-authored text anywhere in it
+and the gate has no audience. It is also spawned as argv with **no shell**, so
+there is no command string to parse — `rm -rf` cannot appear as a side effect of
+word splitting when there is no word splitting.
+
+What *is* borrowed from `shell.rs` is the hygiene rather than the policy: `stdin`
+closed, both output streams captured, `kill_on_drop(true)`, `process_group(0)` on
+Unix so a formatter that spawns helpers is torn down with them, and a hard
+ceiling. Direct `tokio::process::Command`, not the shell machinery: routing
+through `ShellTool` would mean permission asks, tree-sitter parsing, and output
+policy for a command the operator already authorised by writing it into config.
+
+### A 30s ceiling where the oracle has none
+
+The oracle can hang an edit forever on a wedged formatter. Thirty seconds is far
+more than any formatter in the table needs for one file and far less than a user
+waits before assuming the tool is broken. Reported as `TimedOut`, edit intact.
+`kill_on_drop` does the killing when the timeout future drops the child, so no
+separate kill path is needed.
+
+### The seam widened by ADDING a method, not by changing one
+
+Todo 39 left `FileFormatter::format(&Path) -> io::Result<bool>`. Failures need
+more than a bool, but changing that signature would break every existing
+implementation. So `format_reporting(&Path) -> io::Result<FormatOutcome>` was
+added **with a default body** that delegates to `format`. Every implementation
+written against the original seam keeps compiling and keeps working, and the
+default says the honest thing about such an implementation: bytes changed or not,
+no failures to report because it has no way to express one. `NoopFormatter` and
+the existing `RecordingFormatter` in `tests/file_tools.rs` are untouched.
+
+### A formatter failure is NOT an `Err` from the tool
+
+`FormatOutcome { changed, failures }`, and `failures` being non-empty is a
+successful call. The write already landed by the time a formatter runs, so an
+`Err` would make the tool tell the model its edit failed when the edit is on disk
+— which is precisely the confusion that makes a model redo a write it already
+made. Failures are attached to the *successful* result, in both the text (what the
+model reads) and metadata under `formatterFailures` (what a UI reads). Nothing is
+attached when there is nothing to say, so an ordinary edit's output is
+byte-identical to what it was before formatters existed.
+
+The report says "The edit was written and is intact" explicitly. That sentence is
+load-bearing prose, not decoration.
+
+`apply_patch` accumulates failures across operations rather than propagating the
+first: one uncooperative formatter must not abandon a patch half-applied.
+
+### Node-hosted formatters resolve from the project, not by installing
+
+`Npm.which` (`core/src/npm.ts:192-241`) reads a *global* per-package install
+directory and **installs the package if it is missing**. Installing something to
+satisfy a format is out of scope, so `NodePackage`/`NodeMarker` look for
+`node_modules/.bin/<bin>` walking up from the edited file. A project that has the
+formatter installed still formats; one that does not is skipped rather than
+triggering a download. The declared-dependency check itself is ported exactly.
+
+### A configured `command` replaces the availability probe outright
+
+`format/index.ts:154`: `enabled` becomes `async () => info.command ?? false`
+whenever an override supplies a command. An operator naming a command *is* the
+assertion that it exists, so no `which` and no marker check — and no shadowing
+either, since `shadowed_by` is a fact about the built-in, not about a command the
+operator chose. Everything the override omits keeps the built-in's value
+(`mergeDeep`), which is why each field is applied conditionally.
+
+### An empty extension short-circuits before matching
+
+`format_all` returns early when `path.extension()` is `None`. Without that, a
+config entry with `extensions: [""]` would claim every extensionless file —
+`Makefile`, `.gitignore`, `LICENSE`. Tested with exactly that config.
+
+### Plan-file location precedence: `project.vcs`, not "is there a worktree"
+
+`session.ts:331-335` branches on `instance.project.vcs`. The enum is therefore
+named after the *condition* — `PlanLocation::{Worktree(&Path), Global}` — rather
+than after the directories, because a parameter shaped like
+`worktree: Option<&Path>` invites the wrong call: a caller that *has* a worktree
+but whose project is not a repository must still choose `Global`. Naming the
+branch after the fact makes that impossible to get wrong by accident.
+
+Precedence, in order:
+1. `project.vcs` set -> `<worktree>/.opencode/plans/<created>-<slug>.md`
+2. otherwise -> `<oc_paths::data()>/plans/<created>-<slug>.md`
+
+Why the fallback exists at all: `.opencode/plans/` is the location a human
+actually finds, and in a repository it is a path they can gitignore or commit as
+they choose. Outside a repository there is no such place — writing `.opencode/`
+into whatever directory the user started in litters unrelated trees with files
+nothing will clean up, and there is no `.gitignore` to keep them out of someone
+else's commit. `oc-goal`'s `document_path` (todo 69) makes the same two-way choice
+for the same reason and says so; this is the convention it copied.
+
+### The slug is validated, never the filename built from it
+
+`PlanKey::file_name` validates the **slug**, because appending `.md` turns `..`
+into the perfectly legal single component `...md` — so validating the derived name
+accepts exactly the input that most needs refusing. `oc-goal` shipped that bug in
+its first draft and its notepad entry says so; the lesson is reused rather than
+relearned. Leading/trailing whitespace is refused too, since a filename with a
+trailing space is a support ticket rather than an error.
+
+### The plan file is written atomically, and does not `fsync`
+
+Temp file in the destination's own directory, then rename. Same filesystem, so the
+rename is atomic and a reader — the model next turn, or a human with the file open
+— always sees one complete document. The three temp-name details learned in todo
+69 are carried rather than rediscovered: `with_file_name` not `with_extension` (a
+slug containing a dot would otherwise collide with a *different* plan), nanos in
+the name so concurrent writes cannot interleave, and the rename's error arm
+removes the temp file so a failure leaves no litter beside a document a human is
+about to open. `a_rewrite_is_atomic_under_a_concurrent_reader` spins a reader
+against 200 rewrites and asserts 0 partial reads with a `>= 50` observation floor.
+
+No `sync_all`. A plan is a document the user iterates on with the ordinary editing
+tools, not a ledger; a rename that reaches the directory entry is what the next
+reader needs.
+
+### `read_plan` returns `Ok(None)` for a missing plan
+
+"No plan yet" is the ordinary state of a new session, not an error.
+`reminders.ts:55,73` branches on exactly this and tells the model to *create* the
+plan rather than failing, so the Rust shape has to make that branch cheap.
+
+## [2026-08-06] Task 54: where the counter lives, how the catch-all is scoped, what a toast does with no TUI
+
+**The counter is surfaced twice, and both halves are load-bearing.**
+`GET /compat/v1/diagnostics` returns the implemented surface (each route with its
+SDK method, callers and callsites), the exact unknown total, a bounded per-path
+breakdown, the overflow figure, and the toast sink's state. **And** the *first*
+sighting of each distinct unknown path writes one line to stderr. A diagnostics
+endpoint alone requires an operator who already suspects a problem — which is the
+state the mechanism exists to prevent; a log line alone cannot be asserted on
+cheaply or read as a running total. Repeat sightings are counted but not re-logged,
+so a path scanner is fully counted while the log stays bounded.
+`/compat/v1/diagnostics` deliberately sits **outside** `V1_PREFIXES` so it cannot
+be shadowed by, or shadow, anything it reports on.
+
+**The breakdown is capped at 64 distinct paths (256 bytes each, truncated at a
+char boundary); the total is never capped.** The key is caller-controlled, so an
+uncapped map is an unbounded allocation driven by whoever can reach the port.
+Losing the exact total would defeat the mechanism, so overflow past the cap is
+reported as its own `overflowedSightings` figure. Test: 200 distinct paths ->
+total 200, breakdown 64, overflowed 136.
+
+**Catch-all scope: the oracle's 25 pre-`/api` top-level segments minus `event` = 24.**
+Not a global `Router::fallback` (it would claim unmatched `/api/*` as v1 gaps, and
+merging two fallback-bearing routers panics) and not `/{prefix}/{*rest}` (matchit
+rejects it as *conflicting* with `/auth/{providerID}` — it panics at assembly, see
+learnings). It is one `nest` per prefix with a fallback on each inner router.
+`event` is excluded because the SSE stream owns `/event` exactly. **A test derives
+the prefix set from the committed OpenAPI fixture and asserts equality**, plus
+asserts it never contains `api`, so the scope cannot silently drift from the
+document it claims to mirror.
+
+**An unmeasured VERB on a measured path is accounted too, at 405 rather than 404.**
+The plan only specifies unimplemented *paths*, but a mis-measured *operation* is
+the same failure and would otherwise escape as axum's bodiless default 405 — no
+body, no counter, no way to find it. Downgrading it to 404 would misreport a path
+that exists, so it keeps 405, carries the same actionable body, and is keyed
+`"VERB path"` in the breakdown. `DELETE /auth/{providerID}` is the live case: the
+oracle serves it, no installed plugin calls it.
+
+**A toast with no TUI attached returns `200 true` and is recorded, not dropped and
+not failed.** Upstream answers a bare `true`; a 500 would break a plugin over a
+display that does not exist yet (todo 73), and silently discarding would leave
+nothing to diagnose. So the route is a **recording seam**: a bounded 64-entry ring
+plus an accepted counter, both reported by diagnostics. When a TUI arrives it
+registers through `CompatV1State::with_toast_forwarder` and the *same route*
+forwards **as well as** records — recording does not stop, or diagnostics go blind
+the moment a TUI connects. Keeping the HTTP surface independent of the TUI's
+existence is the point of the seam.
+
+**Two deliberate leniencies vs the oracle on that route**: a missing `variant`
+defaults to `info`, and unknown fields are ignored. Three of three installed
+plugins call `/tui/show-toast`, so a 400 over a cosmetic schema mismatch breaks
+precisely what the plan warns about. Still strict on `message`: absent or
+non-string is 400, because there is then nothing to show.
+
+**The other 19 routes are registered, structured `501 not_implemented` seams**, each
+naming its SDK method and its calling plugins so the operator learns *which plugin
+needs which backend*. This follows todo 52's precedent for `/api`: an operation with
+no local backend answers definitively rather than fabricating success. Backends land
+in todos 57-62. Stated plainly for whoever picks those up: against this surface the
+installed auth plugins complete their **call lifecycle** — every request reaches a
+registered route, nothing hangs — but they cannot **authenticate**, because
+`auth.set` and the OAuth pair have no credential backend here.
+
+**`V1_SURFACE` carries its evidence as data, not as a comment.** Each entry has
+`sdk_method`, `plugins` and `callsites`, and the tests assert `callsites` is
+non-empty with a `file:line` shape. The capture document, the diagnostics payload
+and the 501 bodies all read the same table, so a route's justification cannot drift
+away from the route. That is the acceptance criterion "every implemented route maps
+to >=1 recorded callsite" made executable instead of reviewable.

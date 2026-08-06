@@ -3419,3 +3419,177 @@ are name-ordered while each server's own tools keep the order it advertised
 (`docs_search, docs_lookup`, not sorted). This is required, not cosmetic: todo 31's
 `LockedTools` compares whole snapshots with `PartialEq`, so a non-deterministic order
 would look like a changed tool list and burn the one late-MCP rebuild at random.
+
+## [2026-08-06] Task 79: todo 18's parsed config was complete, and a REAL ETXTBSY flake
+
+### Nothing was missing from todo 18's parsed formatter config
+
+The task brief asked me to report any field `format.rs` needed that todo 18 had
+not parsed. **There are none.** `oc_config::schema::formatter::FormatterEntry`
+carries all four oracle fields (`disabled`, `command`, `environment`,
+`extensions` — `config/formatter.ts:5-10`), and
+`oc_catalog::formatter::ResolvedFormatters` already answers "may I format, and
+how", including the linked ruff/uv pair. `oc-tools` consumes `ResolvedFormatters`
+and never re-reads the union. No change to `oc-config` or `oc-catalog` was needed
+or made.
+
+One thing worth naming for a future reader rather than as a gap: the config has
+**three** off-switches, not one, and a test that only covers `disabled: true`
+under-tests it.
+
+1. `"formatter": false` — the `Enabled(false)` arm.
+2. The key **absent**. `format/index.ts:120` is `if (!cfg.formatter)`, so an
+   omitted key disables every formatter, same as `false`.
+   `ResolvedFormatters::resolve(None)` already models this.
+3. Per-formatter `"disabled": true`.
+
+Plus the linkage: disabling **either** of `ruff`/`uv` disables **both**
+(`format/index.ts:138-143`), because they are one backend.
+
+### FOURTH-FAMILY FLAKE, fifth occurrence: ETXTBSY on a test-written executable
+
+`tests/format.rs` failed intermittently under `cargo test -p oc-tools` while
+passing 100% when its target was run alone — the exact signature of this
+project's load-correlated flake family. Sibling entries: `oc-snapshot`'s
+same-size-edit stat cache (clock granularity), `oc-pty` x2 (event ordering),
+`skill_remote.rs` (an ephemeral port). Shared namespace this time: **the
+process-wide file-descriptor table**.
+
+Symptom:
+
+```
+---- a_node_hosted_formatter_needs_both_the_declaration_and_the_binary ----
+assertion failed: runtime.format_all(&script).await.changed
+```
+
+i.e. the stub the test had just written was reported `NotSpawned` rather than
+running.
+
+**Mechanism.** `cargo test` runs a target's tests as **threads in one process**.
+`execve` fails with `ETXTBSY` while *any* process holds the target file
+write-open. A sibling test's `fork` — and every test in this file spawns
+processes — snapshots the fd table while this thread's write fd to the freshly
+written stub is still open, so the forked child holds a **copy** of that fd until
+it reaches its own `execve`. During that window the stub is unexecutable. Nothing
+in production code was wrong.
+
+**Measured**, standalone harness, this machine:
+
+```
+6 writer+exec threads x 2000 stubs, alongside 6 concurrent /bin/sh forkers
+    -> attempts=12000  ETXTBSY=1342  (11%)   other_spawn_errors=0
+1 writer, NO concurrent forkers
+    -> attempts=2000   ETXTBSY=0
+same load, with the bounded retry in place
+    -> attempts=12000  transient_ETXTBSY_retried=1063  UNRECOVERED=0
+```
+
+The middle line is the important one: **serially it is 0/2000**, which is why
+this class of bug is invisible until the suite is loaded.
+
+**Fix.** `wait_until_executable()` in `tests/format.rs`: every stub is probed
+with a `--probe-executable` argument until `execve` succeeds, bounded at 8 x 5ms.
+All stubs go through one `script()` helper so no site can skip it.
+
+**Why a retry is a fix here and not a mask.** The condition is *self-limiting*:
+nothing ever write-opens the inode again after the probe returns, so once the
+borrowed fd is gone it cannot come back. Contrast the ephemeral-port flake, where
+a retry would have been a mask because the racing sibling could re-steal the port
+at any time — there the fix had to be a resource nobody can acquire. The bound is
+three orders of magnitude past a fork-to-execve window (microseconds), and the
+harness recovered 1063/1063 with 0 unrecovered.
+
+**Rule for future tests: any test that writes a file and then executes it must
+wait for it to become executable.** `chmod +x` returning success does not mean
+`execve` will succeed. `std::io::ErrorKind` has no `ETXTBSY` variant on stable;
+match `error.raw_os_error() == Some(26)`.
+
+Production is deliberately untouched: opencode does not write the formatter it
+then executes, so it cannot lend out an fd to one. A formatter installed by a
+package manager mid-session could in principle hit this, and it is already
+reported cleanly as `NotSpawned` carrying the OS message.
+
+### The oracle's `htmlbeautifier` has a dead extension entry
+
+`formatter.ts:271` claims `".html.erb"`, which `path.extname()` never produces
+(it returns `".erb"`). The entry is unreachable upstream too. Carried verbatim
+rather than corrected — silently fixing the oracle's table would be an
+undocumented divergence.
+
+### Not checkable as written: the plan's "the result compiles" QA line
+
+Todo 79's happy-path QA scenario says "editing a Rust file runs the configured
+formatter and the result compiles". Compilation cannot be asserted without
+shipping a real `rustfmt` and a real `rustc` invocation, which this task is
+forbidden from downloading. The equivalent and strictly stronger assertion is
+that the file's bytes are byte-exactly the formatter's output; that is what the
+test does.
+
+## [2026-08-06] Task 54: v1 capture gaps and what could not be re-confirmed
+
+**G1 — `client.session.children` has no line-numbered callsite in the plugin
+entry bundle.** The call exists in the same package's CLI bundle
+(`@sunerpy/oh-my-openagent@4.21.0` `dist/cli/index.js:106371,106539`) and the
+plugin bundle reuses that implementation, but the plugin-entry line numbers were
+not captured. `GET /session/{sessionID}/children` is therefore the **one** route
+in `V1_SURFACE` whose justification rests on a CLI-bundle citation. It is labelled
+inline in the table (`plugin-entry line UNVERIFIED, gap G1`) rather than presented
+as equal evidence. A stricter reading would drop it; a re-run should pin the
+plugin-entry line or remove the route.
+
+**Callsite with no route: none.** All 20 measured SDK methods map to a verb+path
+present in `.omo/fixtures/oracle-openapi-1.18.12.json`.
+
+**Route with no callsite: none.** Asserted executably, not by review:
+`compat_v1_every_route_has_a_recorded_callsite` also rejects an empty plugin list
+and any callsite string without a `:`.
+
+**Plugin source unavailable: none.** All three installed plugins were located
+under `/config/.cache/opencode/packages/` and read, so no part of the plan's six
+is unconfirmed for that reason.
+
+**No wire differential was run** against the installed 1.18.12 binary. Routing,
+status, bodies and the accounting are verified locally and by curl against our own
+binary; byte-parity for these 20 routes is unverified — and largely not yet
+meaningful, since 19 of 20 are 501 seams with no backend to compare.
+
+### Deliberate leniency on `POST /tui/show-toast`, and its cost
+
+The oracle marks `variant` **required** and sets `additionalProperties: false`.
+This seam defaults a missing `variant` to `"info"` and ignores unknown fields,
+because all three installed plugins call this route and a 400 over a cosmetic
+mismatch breaks exactly the toasts the endpoint exists to preserve. **Cost: a
+plugin sending a malformed toast gets a success instead of a diagnostic.** A
+missing/non-string `message` is still 400 — there is nothing to display. If a
+later todo wants oracle-strict validation it must decide that tradeoff knowingly;
+there is a test pinning the current behaviour in both directions.
+
+### Accounting edge not covered: trailing slash
+
+A v1 path with a trailing slash (`/session/`) matches neither the nest nor the
+bare route and falls through to `ServerBuilder`'s plain 404 — no body, no counter
+bump. No SDK method generates a trailing slash, so nothing in the capture reaches
+it, but it is a real hole in the "every unimplemented v1 path is accounted" claim.
+
+### Bearing on the `/api/event` gap recorded earlier
+
+The v1 accounting **neither fixes nor worsens** it. `/api/event` and
+`/api/session/{sessionID}/event` sit under `/api`, which `V1_PREFIXES` excludes by
+construction; driving the merged binary confirms those 404s are the core
+fallback's (`content-length: 0`) and that the v1 counter does not move. Whoever
+fixes the gap adds routes to the `/api` surface or to `events_router`; nothing here
+obstructs it.
+
+It **does** improve the fourth event path. `/global/event` — the one the earlier
+note said "no todo owns at all" — is under the `global` v1 prefix, so it now
+returns an actionable 404 naming the path, logs one operator line, and appears in
+the diagnostics breakdown. Still unimplemented, no longer *silent*. That
+invisibility is what let the original gap survive, so removing it from one of the
+four paths is worth recording even though the route itself is unbuilt.
+
+### The `/api/event`-class lesson, applied
+
+Task 54's tests assert against the **assembled** app — `api::router` +
+`events_router` + `compat_v1_router` merged exactly as `main.rs` does — not just
+its own router. Two tests build that merged app on purpose. The seam question
+("does my catch-all shadow theirs?") therefore has a test rather than an opinion.
