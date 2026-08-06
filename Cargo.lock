@@ -2137,6 +2137,16 @@ name = "oc-mcp"
 version = "0.1.0"
 
 [[package]]
+name = "oc-memory"
+version = "0.1.0"
+dependencies = [
+ "oc-paths",
+ "regex",
+ "tempfile",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "oc-observability"
 version = "0.1.0"
 dependencies = [

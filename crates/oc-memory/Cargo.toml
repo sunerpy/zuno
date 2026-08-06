@@ -1,0 +1,21 @@
+[package]
+name = "oc-memory"
+description = "Character-capped resident memory: §-delimited entries, batch-atomic apply, injection scanning."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+oc-paths = { workspace = true }
+regex = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
