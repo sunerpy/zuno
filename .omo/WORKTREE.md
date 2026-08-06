@@ -378,3 +378,20 @@ Four now, all found by measuring rather than trusting prose: 61→58 `/api` oper
 20→21 plugin hooks, 19→23 CLI commands, and 97's title-vs-body. Plus two evidence-path
 typos (todo 57 → `task-51`, todo 58 → `task-52`). **The source has been right every
 time.** Prompts now say so explicitly and tell agents to count for themselves.
+
+## MY OWN ERROR (2026-08-06): dispatched todo 60 twice into one worktree
+
+I fired `task()` for todo 60 twice in the same wave — `bg_43686d92` (category `deep`)
+and `bg_db66d6b0` (category `ultrabrain`) — both pointed at `oc-wt/t60`. Two agents
+writing the same worktree corrupts both.
+
+`background_cancel(bg_43686d92)` returned "Task not found", so I could not cancel it
+that way. The worktree was still clean at the time I noticed, so nothing was lost.
+
+**Rule**: before dispatching, list the todo numbers already sent **this wave** and
+check the new one against that list. One worktree, one agent — the per-crate cap is
+about merge conflicts; this is worse, it is two writers on one checkout.
+
+If it happens again and both are live: the first writer's uncommitted work is the one
+at risk. Check `git status` in the worktree, and if two sets of files are appearing,
+stop both and re-dispatch one.
