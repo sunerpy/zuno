@@ -459,3 +459,38 @@ to look for.
 
 59 shares `oc-plugin` with 60, and 101 shares `oc-agent` with 64 — both at the
 two-editor cap, so both wait for their partner to merge.
+
+## Wave 14 dispatch ledger (2026-08-06) — written AT dispatch, per the new rule
+
+`main` = 2387 tests, 78/103 done.
+
+| todo | crate | session | dispatched |
+|---|---|---|---|
+| 101 | `oc-agent/reflection.rs` (sole) | `ses_0271b46f0ffearjGUHm2UVKZtd` | yes |
+| 74 | `oc-tui/keybind.rs` + TUI config | `ses_0271a5d12ffeb64b164UINjdLV` | yes |
+| 75 | `oc-tui/theme.rs` + 33 assets | `ses_027198f21ffeerJyilIlAFpvWe` | yes |
+| 65 | `oc-tools/task.rs` (sole) | `ses_0271870bcffeq5YnuArg6hjPfx` | yes |
+| 56 | `oc-cli/cmd/*` | `ses_027735b19ffewx40JYj9p3KRiH` | carried over from wave 13, still working |
+| 59 | `oc-plugin/wasm.rs` | — | **held**: needs `wasmtime`, absent from the offline registry cache |
+| 61 | `oc-plugin/config_tools.rs` | — | **held**: `oc-plugin` at the 2-editor cap once 59 goes |
+| 77 | `oc-tui/attention.rs` | — | **held**: would be the 3rd editor in `oc-tui` |
+
+74 and 75 both need the **TUI-only config surface** (`keybinds`, `leader_timeout`,
+`theme`, `prompt`, `scroll_*`, `diff_style`, `mouse`, `max_*`), which upstream keeps in
+`packages/tui/src/config/index.tsx` and which is **absent from the main config schema**
+— so `oc-config` does not model it. Both were told to put it in its own module with
+independent fields and to report which keys they defined, so the merge is a union
+rather than a rewrite.
+
+### Probes done up front
+
+- `packages/tui/src/config/keybind.ts` is 471 lines with **184** `keybind(` calls —
+  the plan's number is right. But only **164** are `^\s+<name>: keybind(...)`, so ~20
+  are in another position; todo 74 was told to find out what they are rather than
+  assume 184 named actions. Also `app_exit: keybind("ctrl+c,ctrl+d,<leader>q")` proves
+  one action can carry **multiple** key strings and **mix** a chord with a leader
+  sequence — so the table is action→[key…], not action→key.
+- `packages/tui/src/theme/assets/` has exactly **33** JSON files. `insta` is already in
+  the workspace table and the registry cache, so 33 snapshots are offline-buildable.
+- **`wasmtime` is not in the offline registry cache** (0 hits). Todo 59 needs it and the
+  workspace builds `--offline`; that has to be resolved before dispatching it.
