@@ -46,6 +46,17 @@
 //!
 //! [`session_search`] provides FTS5 discovery, anchored scrolling, and recent
 //! session browsing directly over SQLite, with no provider or LLM dependency.
+//!
+//! # Resident memory
+//!
+//! [`memory`] is the one tool that writes [`oc_memory`]'s capped stores. It takes a
+//! whole batch so consolidating and adding can happen in one atomic call, reports
+//! `current/limit` on every response, and withholds the entry list on success —
+//! echoing it invites the model to keep "fixing" a store that is already correct. A
+//! refused write is returned as a successful call carrying `success: false`, and
+//! after three consolidation failures in one turn the next attempt is told to stop
+//! and answer the user: a failed memory side effect must never cost the turn's
+//! reply.
 
 pub mod apply_patch;
 pub mod edit;
@@ -150,4 +161,11 @@ pub use crate::question::{
 pub use crate::todo::{
     MemoryTodoStore, SqliteTodoStore, TodoItem, TodoPriority, TodoStatus, TodoStore,
     TodoStoreError, TodoWriteParams, TodoWriteTool,
+};
+
+pub mod memory;
+
+pub use crate::memory::{
+    DESCRIPTION as MEMORY_DESCRIPTION, MAX_CONSOLIDATION_FAILURES_PER_TURN, MEMORY_TOOL_ID,
+    MemoryAction, MemoryOperation, MemoryParams, MemoryTarget, MemoryTool, ScopePaths,
 };
