@@ -3663,3 +3663,23 @@ concern in the file format's owner). So the wire enums are local, the conversion
 total `match`es, and `wire_names_cover_every_scope` asserts `Scope::ALL.len() == 2` —
 a third scope in `oc-memory` fails that test instead of silently becoming unreachable
 from the tool.
+## [2026-08-06] Task 48 — oc-lsp boundaries and supervision
+
+- `Client` owns protocol only: framed stdio, request demultiplexing, reverse
+  requests, document versions, and diagnostics caches. `Manager` owns processes,
+  roots, fan-out, status, restart policy, and reaping. `ServerRegistry` owns static
+  definitions plus resolved config. This keeps process failure from corrupting the
+  protocol state machine.
+- Downloads are represented by `ServerInstaller`; the default is a no-op and this
+  crate performs no network operation. Built-ins retain install provenance so a
+  future host can opt in without embedding HTTP/package-manager behavior in
+  detection or tests.
+- Restart delays are bounded exponential backoff with a finite consecutive-failure
+  cap. Every child uses piped stdio and `kill_on_drop`; explicit termination and
+  shutdown both call kill then wait, making reaping a lifecycle invariant.
+- Lifecycle event publication occurs under the same state mutex status readers
+  acquire. `Connected`, `Restarted`, `Degraded`, and `Stopped` enter the bounded
+  broadcast channel before their corresponding state becomes observable.
+- The model surface is one `TypedTool` named `lsp`, matching upstream. Schemars and
+  serde derive from the same params type; the tool preserves one-based model input
+  and converts to zero-based LSP positions at the boundary.

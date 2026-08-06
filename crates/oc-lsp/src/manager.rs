@@ -1,0 +1,956 @@
+//! Language-server process pool, lifecycle supervision, and request fan-out.
+
+use crate::client::{Client, ClientError, Diagnostic, Position};
+use crate::registry::{RegistryError, ServerRegistry, ServerSpec};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
+use tokio::process::{Child, Command};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
+use tokio::time::Instant;
+use url::Url;
+
+const CLIENT_READY_TIMEOUT: Duration = Duration::from_secs(50);
+
+/// Bounded restart behavior for a crashed language server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestartPolicy {
+    /// Delay before the first restart.
+    pub initial_delay: Duration,
+    /// Maximum delay between attempts.
+    pub maximum_delay: Duration,
+    /// Number of consecutive failures before supervision stops.
+    pub maximum_restarts: u32,
+    /// Runtime after which an earlier failure streak is forgotten.
+    pub stable_after: Duration,
+}
+
+impl Default for RestartPolicy {
+    fn default() -> Self {
+        Self {
+            initial_delay: Duration::from_millis(100),
+            maximum_delay: Duration::from_secs(2),
+            maximum_restarts: 5,
+            stable_after: Duration::from_secs(30),
+        }
+    }
+}
+
+impl RestartPolicy {
+    fn delay(self, failure: u32) -> Duration {
+        let exponent = failure.saturating_sub(1).min(31);
+        self.initial_delay
+            .saturating_mul(1_u32 << exponent)
+            .min(self.maximum_delay)
+    }
+}
+
+/// Observable state of one server/root pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerState {
+    Starting,
+    Connected,
+    Degraded,
+    Stopped,
+}
+
+/// Snapshot returned by [`Manager::status`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerStatus {
+    pub id: String,
+    pub root: PathBuf,
+    pub state: ServerState,
+    pub process_id: Option<u32>,
+    pub consecutive_failures: u32,
+}
+
+/// Lifecycle event emitted on the manager's bounded broadcast channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagerEvent {
+    Connected {
+        id: String,
+        root: PathBuf,
+        process_id: u32,
+    },
+    Degraded {
+        id: String,
+        root: PathBuf,
+        process_id: Option<u32>,
+        attempt: u32,
+    },
+    Restarted {
+        id: String,
+        root: PathBuf,
+        process_id: u32,
+        attempt: u32,
+    },
+    Stopped {
+        id: String,
+        root: PathBuf,
+    },
+}
+
+/// Process-pool failures surfaced to callers without terminating the agent.
+#[derive(Debug, thiserror::Error)]
+pub enum ManagerError {
+    #[error(transparent)]
+    Registry(#[from] RegistryError),
+    #[error("language server {server_id} could not be spawned with {command}")]
+    Spawn {
+        server_id: String,
+        command: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("language server {server_id} did not provide piped {stream}")]
+    MissingPipe {
+        server_id: String,
+        stream: &'static str,
+    },
+    #[error("language server {server_id} failed during initialization")]
+    Initialize {
+        server_id: String,
+        #[source]
+        source: ClientError,
+    },
+    #[error("language server {server_id} is unavailable")]
+    Unavailable { server_id: String },
+    #[error("no language server is available for {path}")]
+    NoServer { path: PathBuf },
+    #[error("LSP request through {server_id} failed")]
+    Request {
+        server_id: String,
+        #[source]
+        source: ClientError,
+    },
+    #[error("path cannot be represented as a file URI: {path}")]
+    InvalidFileUri { path: PathBuf },
+}
+
+#[derive(Debug)]
+enum SupervisorCommand {
+    Terminate,
+    Shutdown,
+}
+
+#[derive(Debug)]
+struct RuntimeState {
+    status: ServerStatus,
+    client: Option<Client>,
+}
+
+struct ManagedServer {
+    spec: ServerSpec,
+    root: PathBuf,
+    state: Mutex<RuntimeState>,
+    changed: watch::Sender<u64>,
+    command: mpsc::Sender<SupervisorCommand>,
+}
+
+impl std::fmt::Debug for ManagedServer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedServer")
+            .field("spec", &self.spec)
+            .field("root", &self.root)
+            .finish_non_exhaustive()
+    }
+}
+
+struct ManagerInner {
+    workspace: PathBuf,
+    registry: Arc<ServerRegistry>,
+    policy: RestartPolicy,
+    servers: RwLock<BTreeMap<String, Arc<ManagedServer>>>,
+    events: broadcast::Sender<ManagerEvent>,
+}
+
+/// Lazily started language-server pool for one workspace.
+#[derive(Clone)]
+pub struct Manager {
+    inner: Arc<ManagerInner>,
+}
+
+impl std::fmt::Debug for Manager {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Manager")
+            .field("workspace", &self.inner.workspace)
+            .field("policy", &self.inner.policy)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Manager {
+    /// Create a lazy pool. No process starts until a file is touched.
+    #[must_use]
+    pub fn new(
+        workspace: impl Into<PathBuf>,
+        registry: Arc<ServerRegistry>,
+        policy: RestartPolicy,
+    ) -> Self {
+        let (events, _) = broadcast::channel(64);
+        Self {
+            inner: Arc::new(ManagerInner {
+                workspace: workspace.into(),
+                registry,
+                policy,
+                servers: RwLock::new(BTreeMap::new()),
+                events,
+            }),
+        }
+    }
+
+    /// Receive subsequent lifecycle events.
+    #[must_use]
+    pub fn subscribe(&self) -> broadcast::Receiver<ManagerEvent> {
+        self.inner.events.subscribe()
+    }
+
+    /// Return status in stable server-id/root order.
+    pub async fn status(&self) -> Vec<ServerStatus> {
+        let servers: Vec<_> = self.inner.servers.read().await.values().cloned().collect();
+        let mut statuses = Vec::with_capacity(servers.len());
+        for server in servers {
+            statuses.push(server.state.lock().await.status.clone());
+        }
+        statuses
+    }
+
+    /// Whether at least one configured definition can handle `file`.
+    #[must_use]
+    pub fn has_server(&self, file: &Path) -> bool {
+        self.inner
+            .registry
+            .matching(file, &self.inner.workspace)
+            .next()
+            .is_some()
+    }
+
+    /// Open or refresh `file` on every matching server.
+    pub async fn touch_file(&self, file: &Path) -> Result<(), ManagerError> {
+        let clients = self.clients_for(file).await?;
+        for client in clients {
+            client
+                .open_or_change(file)
+                .await
+                .map_err(|source| ManagerError::Request {
+                    server_id: client.server_id().to_owned(),
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Open a file and wait for fresh diagnostics from every matching server.
+    pub async fn diagnostics(&self, file: &Path) -> Result<Vec<Diagnostic>, ManagerError> {
+        let clients = self.clients_for(file).await?;
+        let mut diagnostics = Vec::new();
+        for client in clients {
+            let (_version, epoch) =
+                client
+                    .open_or_change(file)
+                    .await
+                    .map_err(|source| ManagerError::Request {
+                        server_id: client.server_id().to_owned(),
+                        source,
+                    })?;
+            match client.wait_for_diagnostics(file, epoch).await {
+                Ok(items) => diagnostics.extend(items),
+                Err(ClientError::Timeout { .. }) => {
+                    diagnostics.extend(client.diagnostics_for(file).await);
+                }
+                Err(source) => {
+                    return Err(ManagerError::Request {
+                        server_id: client.server_id().to_owned(),
+                        source,
+                    });
+                }
+            }
+        }
+        deduplicate_diagnostics(&mut diagnostics);
+        Ok(diagnostics)
+    }
+
+    /// Close `file` on all live matching clients.
+    pub async fn close_file(&self, file: &Path) -> Result<(), ManagerError> {
+        let clients = self.connected_clients_for(file).await;
+        for client in clients {
+            client
+                .close_document(file)
+                .await
+                .map_err(|source| ManagerError::Request {
+                    server_id: client.server_id().to_owned(),
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Send a position-based request to every matching client and flatten results.
+    pub async fn position_request(
+        &self,
+        file: &Path,
+        position: Position,
+        method: &str,
+        extra: Value,
+    ) -> Result<Vec<Value>, ManagerError> {
+        let clients = self.clients_for(file).await?;
+        let uri = file_uri(file)?;
+        let mut output = Vec::new();
+        for client in clients {
+            let mut params = json!({
+                "textDocument": { "uri": uri },
+                "position": position
+            });
+            if let (Some(target), Some(source)) = (params.as_object_mut(), extra.as_object()) {
+                target.extend(source.clone());
+            }
+            let result =
+                client
+                    .request(method, params)
+                    .await
+                    .map_err(|source| ManagerError::Request {
+                        server_id: client.server_id().to_owned(),
+                        source,
+                    })?;
+            flatten_result(result, &mut output);
+        }
+        Ok(output)
+    }
+
+    /// Request symbols from every matching document client.
+    pub async fn document_symbols(&self, file: &Path) -> Result<Vec<Value>, ManagerError> {
+        self.document_request(file, "textDocument/documentSymbol")
+            .await
+    }
+
+    /// Request workspace symbols from every already-started client.
+    pub async fn workspace_symbols(&self, query: &str) -> Result<Vec<Value>, ManagerError> {
+        let clients = self.connected_clients().await;
+        let mut output = Vec::new();
+        for client in clients {
+            let result = client
+                .request("workspace/symbol", json!({ "query": query }))
+                .await
+                .map_err(|source| ManagerError::Request {
+                    server_id: client.server_id().to_owned(),
+                    source,
+                })?;
+            flatten_result(result, &mut output);
+        }
+        output.retain(|symbol| {
+            symbol
+                .get("kind")
+                .and_then(Value::as_u64)
+                .is_some_and(|kind| matches!(kind, 5 | 6 | 10 | 11 | 12 | 13 | 14 | 23))
+        });
+        output.truncate(10);
+        Ok(output)
+    }
+
+    /// Prepare a call-hierarchy item and query one direction on each client.
+    pub async fn call_hierarchy(
+        &self,
+        file: &Path,
+        position: Position,
+        direction: &str,
+    ) -> Result<Vec<Value>, ManagerError> {
+        let clients = self.clients_for(file).await?;
+        let uri = file_uri(file)?;
+        let mut output = Vec::new();
+        for client in clients {
+            let prepared = client
+                .request(
+                    "textDocument/prepareCallHierarchy",
+                    json!({ "textDocument": { "uri": uri }, "position": position }),
+                )
+                .await
+                .map_err(|source| ManagerError::Request {
+                    server_id: client.server_id().to_owned(),
+                    source,
+                })?;
+            let Some(item) = prepared.as_array().and_then(|items| items.first()).cloned() else {
+                continue;
+            };
+            let result = client
+                .request(direction, json!({ "item": item }))
+                .await
+                .map_err(|source| ManagerError::Request {
+                    server_id: client.server_id().to_owned(),
+                    source,
+                })?;
+            flatten_result(result, &mut output);
+        }
+        Ok(output)
+    }
+
+    /// Kill a live child to exercise or trigger normal restart supervision.
+    pub async fn terminate(&self, server_id: &str, root: &Path) -> bool {
+        let key = server_key(server_id, root);
+        let server = self.inner.servers.read().await.get(&key).cloned();
+        match server {
+            Some(server) => server
+                .command
+                .send(SupervisorCommand::Terminate)
+                .await
+                .is_ok(),
+            None => false,
+        }
+    }
+
+    /// Stop every supervisor, kill and reap every child, and leave no live client.
+    pub async fn shutdown(&self) {
+        let servers: Vec<_> = self.inner.servers.read().await.values().cloned().collect();
+        for server in &servers {
+            let _result = server.command.send(SupervisorCommand::Shutdown).await;
+        }
+        for server in servers {
+            let mut changed = server.changed.subscribe();
+            let wait = async {
+                loop {
+                    if server.state.lock().await.status.state == ServerState::Stopped {
+                        break;
+                    }
+                    if changed.changed().await.is_err() {
+                        break;
+                    }
+                }
+            };
+            let _result = tokio::time::timeout(Duration::from_secs(5), wait).await;
+        }
+    }
+
+    async fn document_request(
+        &self,
+        file: &Path,
+        method: &str,
+    ) -> Result<Vec<Value>, ManagerError> {
+        let clients = self.clients_for(file).await?;
+        let uri = file_uri(file)?;
+        let mut output = Vec::new();
+        for client in clients {
+            let result = client
+                .request(method, json!({ "textDocument": { "uri": uri } }))
+                .await
+                .map_err(|source| ManagerError::Request {
+                    server_id: client.server_id().to_owned(),
+                    source,
+                })?;
+            flatten_result(result, &mut output);
+        }
+        Ok(output)
+    }
+
+    async fn clients_for(&self, file: &Path) -> Result<Vec<Client>, ManagerError> {
+        let matches: Vec<_> = self
+            .inner
+            .registry
+            .matching(file, &self.inner.workspace)
+            .map(|(spec, root)| (spec.clone(), root))
+            .collect();
+        if matches.is_empty() {
+            return Err(ManagerError::NoServer {
+                path: file.to_path_buf(),
+            });
+        }
+        let mut clients = Vec::new();
+        for (spec, root) in matches {
+            let server = self.ensure_supervisor(spec, root).await;
+            clients.push(wait_for_client(&server).await?);
+        }
+        Ok(clients)
+    }
+
+    async fn connected_clients_for(&self, file: &Path) -> Vec<Client> {
+        let keys: Vec<_> = self
+            .inner
+            .registry
+            .matching(file, &self.inner.workspace)
+            .map(|(spec, root)| server_key(&spec.id, &root))
+            .collect();
+        let map = self.inner.servers.read().await;
+        let servers: Vec<_> = keys
+            .iter()
+            .filter_map(|key| map.get(key).cloned())
+            .collect();
+        drop(map);
+        let mut clients = Vec::new();
+        for server in servers {
+            if let Some(client) = server.state.lock().await.client.clone() {
+                clients.push(client);
+            }
+        }
+        clients
+    }
+
+    async fn connected_clients(&self) -> Vec<Client> {
+        let servers: Vec<_> = self.inner.servers.read().await.values().cloned().collect();
+        let mut clients = Vec::new();
+        for server in servers {
+            if let Some(client) = server.state.lock().await.client.clone() {
+                clients.push(client);
+            }
+        }
+        clients
+    }
+
+    async fn ensure_supervisor(&self, spec: ServerSpec, root: PathBuf) -> Arc<ManagedServer> {
+        let key = server_key(&spec.id, &root);
+        if let Some(server) = self.inner.servers.read().await.get(&key).cloned() {
+            return server;
+        }
+        let mut servers = self.inner.servers.write().await;
+        if let Some(server) = servers.get(&key).cloned() {
+            return server;
+        }
+        let (changed, _) = watch::channel(0_u64);
+        let (command, receiver) = mpsc::channel(4);
+        let server = Arc::new(ManagedServer {
+            spec,
+            root,
+            state: Mutex::new(RuntimeState {
+                status: ServerStatus {
+                    id: key_id(&key),
+                    root: key_root(&key),
+                    state: ServerState::Starting,
+                    process_id: None,
+                    consecutive_failures: 0,
+                },
+                client: None,
+            }),
+            changed,
+            command,
+        });
+        servers.insert(key, Arc::clone(&server));
+        drop(servers);
+        tokio::spawn(supervise(
+            Arc::clone(&self.inner),
+            Arc::clone(&server),
+            receiver,
+        ));
+        server
+    }
+}
+
+async fn supervise(
+    manager: Arc<ManagerInner>,
+    server: Arc<ManagedServer>,
+    mut commands: mpsc::Receiver<SupervisorCommand>,
+) {
+    let mut failures = 0_u32;
+    let mut started_once = false;
+    loop {
+        let launched = launch(&manager, &server).await;
+        let (mut child, client, process_id) = match launched {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(server = %server.spec.id, %error, "language server launch failed");
+                failures = failures.saturating_add(1);
+                publish_degraded(&manager, &server, None, failures).await;
+                if failures > manager.policy.maximum_restarts {
+                    publish_stopped(&manager, &server).await;
+                    return;
+                }
+                if wait_backoff_or_shutdown(&manager, &server, &mut commands, failures).await {
+                    return;
+                }
+                continue;
+            }
+        };
+
+        let started_at = Instant::now();
+        publish_connected(
+            &manager,
+            &server,
+            client.clone(),
+            process_id,
+            failures,
+            started_once,
+        )
+        .await;
+        started_once = true;
+
+        let should_restart = tokio::select! {
+            status = child.wait() => {
+                if let Err(error) = status {
+                    tracing::warn!(server = %server.spec.id, %error, "language server wait failed");
+                }
+                true
+            }
+            command = commands.recv() => {
+                match command {
+                    Some(SupervisorCommand::Terminate) => {
+                        kill_and_reap(&mut child).await;
+                        true
+                    }
+                    Some(SupervisorCommand::Shutdown) | None => {
+                        client.shutdown().await;
+                        kill_and_reap(&mut child).await;
+                        publish_stopped(&manager, &server).await;
+                        return;
+                    }
+                }
+            }
+        };
+        if !should_restart {
+            publish_stopped(&manager, &server).await;
+            return;
+        }
+
+        if started_at.elapsed() >= manager.policy.stable_after {
+            failures = 0;
+        }
+        failures = failures.saturating_add(1);
+        publish_degraded(&manager, &server, Some(process_id), failures).await;
+        if failures > manager.policy.maximum_restarts {
+            publish_stopped(&manager, &server).await;
+            return;
+        }
+        if wait_backoff_or_shutdown(&manager, &server, &mut commands, failures).await {
+            return;
+        }
+    }
+}
+
+async fn launch(
+    manager: &ManagerInner,
+    server: &ManagedServer,
+) -> Result<(Child, Client, u32), ManagerError> {
+    let argv = manager.registry.launch_command(&server.spec).await?;
+    let executable = argv.first().ok_or_else(|| RegistryError::EmptyCommand {
+        server_id: server.spec.id.clone(),
+    })?;
+    let mut command = Command::new(executable);
+    command
+        .args(&argv[1..])
+        .current_dir(&server.root)
+        .envs(&server.spec.env)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(|source| ManagerError::Spawn {
+        server_id: server.spec.id.clone(),
+        command: argv.join(" "),
+        source,
+    })?;
+    let process_id = child.id().unwrap_or(0);
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ManagerError::MissingPipe {
+            server_id: server.spec.id.clone(),
+            stream: "stdout",
+        })?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| ManagerError::MissingPipe {
+            server_id: server.spec.id.clone(),
+            stream: "stdin",
+        })?;
+    if let Some(stderr) = child.stderr.take() {
+        let server_id = server.spec.id.clone();
+        tokio::spawn(async move {
+            let mut buffer = Vec::new();
+            if stderr
+                .take(64 * 1024)
+                .read_to_end(&mut buffer)
+                .await
+                .is_ok()
+                && !buffer.is_empty()
+            {
+                tracing::debug!(server = %server_id, bytes = buffer.len(), "language server stderr");
+            }
+        });
+    }
+    match Client::connect(
+        server.spec.id.clone(),
+        server.root.clone(),
+        Some(std::process::id()),
+        stdout,
+        stdin,
+        server.spec.initialization.clone(),
+    )
+    .await
+    {
+        Ok(client) => Ok((child, client, process_id)),
+        Err(source) => {
+            kill_and_reap(&mut child).await;
+            Err(ManagerError::Initialize {
+                server_id: server.spec.id.clone(),
+                source,
+            })
+        }
+    }
+}
+
+async fn wait_for_client(server: &ManagedServer) -> Result<Client, ManagerError> {
+    let mut changed = server.changed.subscribe();
+    let server_id = server.spec.id.clone();
+    let wait = async {
+        loop {
+            let state = server.state.lock().await;
+            if let Some(client) = state.client.clone() {
+                return Ok(client);
+            }
+            if state.status.state == ServerState::Stopped {
+                return Err(ManagerError::Unavailable {
+                    server_id: server_id.clone(),
+                });
+            }
+            drop(state);
+            if changed.changed().await.is_err() {
+                return Err(ManagerError::Unavailable {
+                    server_id: server_id.clone(),
+                });
+            }
+        }
+    };
+    tokio::time::timeout(CLIENT_READY_TIMEOUT, wait)
+        .await
+        .map_err(|_| ManagerError::Unavailable { server_id })?
+}
+
+async fn publish_connected(
+    manager: &ManagerInner,
+    server: &ManagedServer,
+    client: Client,
+    process_id: u32,
+    failures: u32,
+    restarted: bool,
+) {
+    let mut state = server.state.lock().await;
+    let event = if restarted {
+        ManagerEvent::Restarted {
+            id: server.spec.id.clone(),
+            root: server.root.clone(),
+            process_id,
+            attempt: failures,
+        }
+    } else {
+        ManagerEvent::Connected {
+            id: server.spec.id.clone(),
+            root: server.root.clone(),
+            process_id,
+        }
+    };
+    let _result = manager.events.send(event);
+    state.status.state = ServerState::Connected;
+    state.status.process_id = Some(process_id);
+    state.status.consecutive_failures = failures;
+    state.client = Some(client);
+    signal_change(server);
+}
+
+async fn publish_degraded(
+    manager: &ManagerInner,
+    server: &ManagedServer,
+    process_id: Option<u32>,
+    attempt: u32,
+) {
+    let mut state = server.state.lock().await;
+    let _result = manager.events.send(ManagerEvent::Degraded {
+        id: server.spec.id.clone(),
+        root: server.root.clone(),
+        process_id,
+        attempt,
+    });
+    state.status.state = ServerState::Degraded;
+    state.status.process_id = None;
+    state.status.consecutive_failures = attempt;
+    state.client = None;
+    signal_change(server);
+}
+
+async fn publish_stopped(manager: &ManagerInner, server: &ManagedServer) {
+    let mut state = server.state.lock().await;
+    let _result = manager.events.send(ManagerEvent::Stopped {
+        id: server.spec.id.clone(),
+        root: server.root.clone(),
+    });
+    state.status.state = ServerState::Stopped;
+    state.status.process_id = None;
+    state.client = None;
+    signal_change(server);
+}
+
+fn signal_change(server: &ManagedServer) {
+    let next = server.changed.borrow().saturating_add(1);
+    let _result = server.changed.send(next);
+}
+
+async fn wait_backoff_or_shutdown(
+    manager: &ManagerInner,
+    server: &ManagedServer,
+    commands: &mut mpsc::Receiver<SupervisorCommand>,
+    failure: u32,
+) -> bool {
+    tokio::select! {
+        () = tokio::time::sleep(manager.policy.delay(failure)) => false,
+        command = commands.recv() => {
+            match command {
+                Some(SupervisorCommand::Shutdown) | None => {
+                    publish_stopped(manager, server).await;
+                    true
+                }
+                Some(SupervisorCommand::Terminate) => false,
+            }
+        }
+    }
+}
+
+async fn kill_and_reap(child: &mut Child) {
+    let _result = child.kill().await;
+    let _result = child.wait().await;
+}
+
+fn server_key(id: &str, root: &Path) -> String {
+    format!("{id}\0{}", root.to_string_lossy())
+}
+
+fn key_id(key: &str) -> String {
+    key.split_once('\0')
+        .map_or_else(|| key.to_owned(), |(id, _)| id.to_owned())
+}
+
+fn key_root(key: &str) -> PathBuf {
+    key.split_once('\0')
+        .map_or_else(PathBuf::new, |(_, root)| PathBuf::from(root))
+}
+
+fn file_uri(path: &Path) -> Result<String, ManagerError> {
+    Url::from_file_path(path)
+        .map(String::from)
+        .map_err(|()| ManagerError::InvalidFileUri {
+            path: path.to_path_buf(),
+        })
+}
+
+fn flatten_result(result: Value, output: &mut Vec<Value>) {
+    match result {
+        Value::Array(items) => output.extend(items),
+        Value::Null => {}
+        item => output.push(item),
+    }
+}
+
+fn deduplicate_diagnostics(diagnostics: &mut Vec<Diagnostic>) {
+    let mut seen = std::collections::BTreeSet::new();
+    diagnostics.retain(|diagnostic| {
+        serde_json::to_string(&(
+            diagnostic.code.as_ref(),
+            diagnostic.severity,
+            &diagnostic.message,
+            diagnostic.source.as_deref(),
+            diagnostic.range,
+        ))
+        .map_or(true, |key| seen.insert(key))
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oc_catalog::lsp_config::ResolvedLsp;
+    use oc_config::schema::lsp::LspConfig;
+    use std::fs;
+
+    fn write_server(path: &Path) {
+        fs::write(
+            path,
+            r#"import json, sys
+def read():
+    size = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b'\r\n', b'\n'):
+            break
+        if line.lower().startswith(b'content-length:'):
+            size = int(line.split(b':', 1)[1].strip())
+    return json.loads(sys.stdin.buffer.read(size))
+def send(value):
+    body = json.dumps(value, separators=(',', ':')).encode()
+    sys.stdout.buffer.write(('Content-Length: %d\r\n\r\n' % len(body)).encode() + body)
+    sys.stdout.buffer.flush()
+while True:
+    message = read()
+    if message is None:
+        break
+    if message.get('method') == 'initialize':
+        send({'jsonrpc':'2.0','id':message['id'],'result':{'capabilities':{}}})
+    elif 'id' in message:
+        send({'jsonrpc':'2.0','id':message['id'],'result':None})
+"#,
+        )
+        .expect("write test language server");
+    }
+
+    #[tokio::test]
+    async fn a_killed_server_publishes_degraded_before_restarting() {
+        if which::which("python3").is_err() {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let script = temp.path().join("server.py");
+        let source = temp.path().join("file.mine");
+        write_server(&script);
+        fs::write(&source, "content\n").expect("write source file");
+        let config: LspConfig = serde_json::from_value(json!({
+            "test": {
+                "command": ["python3", script.to_string_lossy(), "--stdio"],
+                "extensions": [".mine"]
+            }
+        }))
+        .expect("custom LSP config");
+        let registry = Arc::new(ServerRegistry::offline(&ResolvedLsp::resolve(Some(
+            &config,
+        ))));
+        let manager = Manager::new(
+            temp.path(),
+            registry,
+            RestartPolicy {
+                initial_delay: Duration::from_millis(10),
+                maximum_delay: Duration::from_millis(20),
+                maximum_restarts: 2,
+                stable_after: Duration::from_secs(10),
+            },
+        );
+        let mut events = manager.subscribe();
+        manager
+            .touch_file(&source)
+            .await
+            .expect("start test server");
+        let first_pid = match events.recv().await.expect("connected event") {
+            ManagerEvent::Connected { process_id, .. } => process_id,
+            other => panic!("expected connected event, got {other:?}"),
+        };
+        assert!(manager.terminate("test", temp.path()).await);
+        match events.recv().await.expect("degraded event") {
+            ManagerEvent::Degraded {
+                process_id: Some(process_id),
+                attempt: 1,
+                ..
+            } => assert_eq!(process_id, first_pid),
+            other => panic!("expected degraded event, got {other:?}"),
+        }
+        assert_eq!(manager.status().await[0].state, ServerState::Degraded);
+        let second_pid = match events.recv().await.expect("restart event") {
+            ManagerEvent::Restarted { process_id, .. } => process_id,
+            other => panic!("expected restart event, got {other:?}"),
+        };
+        assert_ne!(first_pid, second_pid);
+        assert_eq!(manager.status().await[0].state, ServerState::Connected);
+        manager.shutdown().await;
+        assert_eq!(manager.status().await[0].state, ServerState::Stopped);
+    }
+}

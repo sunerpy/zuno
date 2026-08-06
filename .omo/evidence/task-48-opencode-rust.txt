@@ -1,0 +1,54 @@
+Task 48 — oc-lsp client, registry, supervision, and composite tool
+Date: 2026-08-06
+
+Implementation scope
+- Incremental Content-Length JSON-RPC framing with concurrent request-id demultiplexing.
+- Initialize/initialized handshake, reverse requests, didOpen/didChange/didClose, and diagnostics notifications.
+- Table-driven coverage of every built-in in the current oracle/server schema (38 definitions; the task text says 39, but both current server.ts and BUILTIN_SERVER_IDS contain 38).
+- Resolved LSP config support: disable-all, per-server disable, command/extensions/env/initialization overrides, and custom servers.
+- Injectable ServerInstaller seam; tests and runtime perform no network download.
+- Bounded restart supervision, degraded event-before-state ordering, child kill/reap, and clean shutdown.
+- Single TypedTool named lsp with the nine upstream operations.
+
+Validation
+1. cargo fmt --all -- --check
+   PASS
+2. cargo test -p oc-lsp
+   PASS: 8 unit tests, 2 live integration tests, 0 failures.
+3. Live TypeScript differential
+   PASS: typescript-language-server 5.3.0 reported TS2322 and the normalized diagnostic exactly matched opencode 1.18.12 with an explicit command override.
+4. Live rust-analyzer
+   PASS: rust-analyzer 1.96.0 reported the deliberate E0425/does_not_exist error in an isolated temporary Cargo project.
+   Oracle note: opencode 1.18.12 returned an empty diagnostics array for the same Rust fixture, so exact differential equality would assert the oracle defect; the live-server assertion proves the Rust client behavior instead.
+5. cargo clippy -p oc-lsp --all-targets -- -D warnings
+   PASS
+6. cargo build -p oc-lsp
+   PASS
+7. rust-analyzer diagnostics . --severity error
+   PASS: diagnostic scan complete with no error diagnostics.
+   The lsp_diagnostics tool rejected the sibling worktree path as outside its fixed request cwd; rust-analyzer's workspace diagnostic command was used as the equivalent changed-file diagnostic check.
+8. git diff --check
+   PASS
+9. Explicit missing-prerequisite skip proof
+   PASS: temporarily changed the TypeScript server lookup to a guaranteed-missing command and ran the targeted live test with --nocapture.
+   Observed: "skipping live TypeScript LSP differential: typescript-language-server not found"; the test passed, and the temporary lookup change was restored.
+10. cargo test -p oc-lsp --offline
+    PASS: 8 unit tests, 2 live integration tests, and doc tests; 0 failures.
+11. cargo clippy --workspace --all-targets --offline -- -D warnings
+    PASS
+12. cargo fmt --all --check
+    PASS
+13. cargo metadata --locked --offline --format-version 1
+    PASS
+14. Three rounds of six concurrent offline library-test processes
+    Command: for round in 1 2 3; do seq 1 6 | xargs -P6 -I{} cargo test -p oc-lsp --offline --lib --quiet; done
+    PASS: all 18 processes passed all 8 library tests; 0 failures.
+    Scope note: this concurrency check intentionally used --lib, as permitted, to avoid multiplying the 13-second external live-server tests.
+
+Constraints checked
+- No language server binary was downloaded.
+- rust-analyzer was pointed only at a temporary isolated fixture for the live test, never this repository.
+- No cargo test --workspace was run.
+- No unsafe code.
+- unwrap()/expect() occur only in tests.
+- Every optional live-test prerequisite now prints the missing dependency and states that the test is being skipped before returning successfully.

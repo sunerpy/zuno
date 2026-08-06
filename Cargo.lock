@@ -2161,6 +2161,22 @@ dependencies = [
 [[package]]
 name = "oc-lsp"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "oc-catalog",
+ "oc-config",
+ "oc-error",
+ "oc-tool",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "url",
+ "which",
+]
 
 [[package]]
 name = "oc-mcp"
