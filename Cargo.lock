@@ -2164,6 +2164,13 @@ dependencies = [
 [[package]]
 name = "oc-cli"
 version = "0.1.0"
+dependencies = [
+ "clap",
+ "oc-observability",
+ "oc-paths",
+ "oc-tools",
+ "thiserror 2.0.19",
+]
 
 [[package]]
 name = "oc-config"
@@ -2518,13 +2525,16 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "clap",
+ "futures",
  "oc-catalog",
  "oc-db",
  "oc-engine",
  "oc-error",
+ "oc-llm",
  "oc-paths",
  "oc-pty",
  "reqwest",
+ "rusqlite",
  "schemars",
  "serde",
  "serde_json",

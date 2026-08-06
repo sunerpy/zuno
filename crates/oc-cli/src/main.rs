@@ -1,3 +1,5 @@
 //! Command-line entry point and subcommand dispatch.
 
-fn main() {}
+fn main() -> std::process::ExitCode {
+    oc_cli::run_process()
+}
