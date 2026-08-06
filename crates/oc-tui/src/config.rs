@@ -323,6 +323,23 @@ pub struct TuiConfig {
     /// Whether mouse capture is enabled.
     #[serde(default)]
     pub mouse: Option<bool>,
+    /// The theme to render with.
+    ///
+    /// Any name any theme layer provides, including the special value `system`,
+    /// which derives a palette from the terminal's own colours. Absent means the
+    /// built-in default ([`crate::theme::DEFAULT_THEME`]). A name no layer provides
+    /// is not an error: [`crate::theme::ThemeRegistry::resolve`] falls back and
+    /// reports a diagnostic naming it.
+    #[serde(default)]
+    pub theme: Option<String>,
+}
+
+impl TuiConfig {
+    /// The configured theme name, or `None` when the key was omitted.
+    #[must_use]
+    pub fn theme(&self) -> Option<&str> {
+        self.theme.as_deref()
+    }
 }
 
 /// Host facts that change how the configuration resolves.
