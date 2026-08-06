@@ -659,7 +659,7 @@ Dependency direction is strictly downward from `oc-cli`; `oc-engine` never depen
   QA scenarios: happy - a plugin mutating `chat.params.temperature` is observed in the outbound request; failure - a plugin returning an unknown hook name is rejected with a message listing valid hooks. Evidence `.omo/evidence/task-51-opencode-rust.txt`
   Commit: Y | `feat(plugin): manifest, hook bus, and full hook payload contract`
 
-- [ ] 58. `crates/oc-plugin/src/jsonrpc.rs` + `crates/oc-plugin-sdk/`: implement the out-of-process JSON-RPC plugin host as the primary Rust-authorable path - expect a Rust example plugin passing the conformance suite
+- [x] 58. `crates/oc-plugin/src/jsonrpc.rs` + `crates/oc-plugin-sdk/`: implement the out-of-process JSON-RPC plugin host as the primary Rust-authorable path - expect a Rust example plugin passing the conformance suite
   What to do / Must NOT do: implement a stdio JSON-RPC host that spawns a plugin process, negotiates a versioned protocol, dispatches hooks as requests with typed params, applies returned output mutations, and enforces a per-hook timeout; isolate crashes (a dead plugin degrades to disabled with a diagnostic, never takes down the agent); expose a small `oc-plugin-sdk` crate so a plugin is a few lines of Rust; ship a conformance test suite a plugin can run against itself. Must NOT use `unsafe`. Must NOT let a hung plugin hang a turn.
   Parallelization: Wave 10 | Blocked by: 57 | Blocks: 59-62
   References: `packages/plugin/src/index.ts:222-335` (the hooks to expose over the wire); `packages/opencode/src/plugin/loader.ts:203-235` (parallel resolve, ordered registration — the concurrency contract to preserve); the crash-isolation and manifest-conflict patterns in `/tmp/ulw-refs/claw-code/rust/crates/plugins/src/lib.rs:307-332` (subprocess plugin tools fed JSON on stdin with prefixed env vars) and `/tmp/ulw-refs/claw-code/rust/crates/tools/src/lib.rs:127-171` (registry conflict detection against builtins).
@@ -836,7 +836,7 @@ Dependency direction is strictly downward from `oc-cli`; `oc-engine` never depen
   QA scenarios: happy - a permission prompt raises a notification and its cue; failure - an environment with no audio device logs once and continues rather than failing the TUI. Evidence `.omo/evidence/task-77-opencode-rust.txt`
   Commit: Y | `feat(tui): attention notifications and sound system`
 
-- [ ] 78. `crates/oc-acp/`: implement the Agent Client Protocol so editor clients can attach - expect a live handshake against the real ACP client SDK
+- [x] 78. `crates/oc-acp/`: implement the Agent Client Protocol so editor clients can attach - expect a live handshake against the real ACP client SDK
   What to do / Must NOT do: implement all the protocol methods upstream implements, framing JSON on **stdout** with nothing else written there (logs go to stderr or file per todo 5); map ACP concepts onto the engine's session, permission, and event surfaces; support cancellation and streaming updates. Must NOT validate against self-authored fixtures only — drive the real client SDK. Must NOT emit a single stray byte on stdout.
   Parallelization: Wave 12 | Blocked by: 32,37,53 | Blocks: 86
   References: `packages/opencode/src/acp/agent.ts:32` (the implemented Agent interface and its 13 methods) and the surrounding module; `@agentclientprotocol/sdk` as the real counterpart to test against; the stdout-purity requirement from todo 5.
