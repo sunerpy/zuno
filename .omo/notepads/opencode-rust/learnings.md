@@ -4457,3 +4457,26 @@ no fix. Declaring `load_skills` on the params struct but hiding it from the deri
 schema means: no caller learns the name from this tool, a caller that sends it anyway
 is refused with a message pointing at per-agent permissions, and every *other* unknown
 field still gets `deny_unknown_fields`. Confirmed working on schemars 1.2.2.
+## Task 101: background reflection fork
+
+### Delivery, not invocation, is the scheduling boundary
+
+Reflection bookkeeping must advance only after a turn produced a final response
+and was not interrupted. Counting tool-loop attempts or interrupted turns makes
+the periodic trigger nondeterministic from the user's perspective. The fork now
+accepts both facts explicitly and rejects the turn before evaluating triggers.
+
+### A narrow injected tool boundary is stronger than prompt-only prohibition
+
+The background runner receives an injected `Arc<dyn oc_tool::Tool>` but dispatches
+only the exact id `memory`. A second structural guard fixes compaction to
+`CompactionMode::Disabled`. This keeps the fork isolated from shell tools and from
+the parent transcript even if a runner attempts unsupported behavior.
+
+### Recovery evidence needs adjacency and a completed outcome
+
+The useful fail-then-succeed signal is an adjacent repetition of the same command,
+not merely two matching commands anywhere in the transcript. Requiring a later
+successful outcome prevents unresolved failures and one-off incidents from being
+promoted into durable memory. The five Hermes exclusions are therefore executable
+filters rather than prompt prose.

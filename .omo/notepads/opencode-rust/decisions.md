@@ -4645,3 +4645,24 @@ refused call. The argument is hidden from the derived schema
 `<note>…</note>` lines sit inside `<task>`, before `<task_result>`. Appending them after
 the envelope would let a caller that parses only the result body miss the fact that its
 `effort` was dropped — which is exactly the silent downgrade the plan forbids.
+## Task 101: background reflection fork
+
+**`ReflectionFork` owns scheduling; `ReflectionRunner` owns review execution.** The
+fork checks delivery and trigger policy synchronously, then launches a detached
+Tokio task. Runner errors and panics are contained and logged because reflection is
+advisory and must never alter foreground turn delivery.
+
+**The default periodic cadence is ten delivered turns; zero disables it.** A
+same-command fail-then-succeed recovery is an independent trigger, so the two
+conditions are ORed. Trigger state records the last scheduled delivered-turn count
+to avoid duplicate periodic reviews.
+
+**The tool whitelist is enforced by exact runtime dispatch.** Only `memory` can be
+called, with the stable rejection text required by acceptance. The public boundary
+uses `oc-tool` directly rather than importing `oc-tools`, which keeps `oc-agent`
+independent of concrete tool implementations.
+
+**Policy input is an owned transcript snapshot.** The detached review cannot read
+or compact the live parent conversation. `CompactionMode` deliberately has only
+`Disabled`, making the no-compaction rule representable in the type surface rather
+than relying on convention.

@@ -2131,15 +2131,20 @@ dependencies = [
 name = "oc-agent"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "oc-catalog",
  "oc-config",
+ "oc-error",
  "oc-llm",
  "oc-paths",
  "oc-permission",
+ "oc-tool",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

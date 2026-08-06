@@ -3813,3 +3813,20 @@ omo bundle should expect to not find it.
 **The prompt's per-target baseline was off by one target.** It listed `registry` at 10;
 measured on unmodified `main`, `tests/registry.rs` has 8 tests and `tests/batch.rs` has
 10. It also omitted `websearch` (21). No regression — those files are untouched.
+## Task 101: background reflection fork
+
+### Workspace-scoped LSP tool could not address the sibling worktree
+
+The native `lsp_diagnostics` request rejected
+`/config/workspace/ProdDir/AI/oc-wt/t101` because the tool session is rooted at the
+main checkout. The fallback `rust-analyzer -q diagnostics crates/oc-agent
+--severity warning` ran inside the Task 101 worktree and completed without reported
+diagnostics. Formatting, all 14 package tests, strict clippy, `cargo check`, and
+locked offline metadata also passed.
+
+### Reflection failures intentionally have no foreground retry path
+
+The fork catches both runner errors and task panics, logs them, and terminates the
+background attempt. Retrying from the foreground path would couple advisory memory
+maintenance to user-visible turn latency and could duplicate memory writes. A
+future retry policy, if needed, belongs inside the isolated runner.
