@@ -2117,6 +2117,12 @@ version = "0.1.0"
 [[package]]
 name = "oc-agent"
 version = "0.1.0"
+dependencies = [
+ "oc-catalog",
+ "oc-config",
+ "oc-llm",
+ "oc-permission",
+]
 
 [[package]]
 name = "oc-auth"
