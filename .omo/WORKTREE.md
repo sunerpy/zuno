@@ -415,3 +415,47 @@ mean re-sending it.
 **Watch for**: duplicated modules, two competing API shapes for the same thing, or
 a commit whose diff contains both. If `t60` shows any of that, reset it and resume
 exactly one session.
+
+### It happened twice. The mechanism, and the fix.
+
+Todo 60 and then todo 73 were each dispatched **twice into the same worktree** in one
+wave. Both times the worktree was still clean when I noticed, so nothing was lost, but
+that was luck, not process.
+
+**Why it happened**: I wrote a long prompt, the turn ended, and on the next turn I did
+not have a reliable list of what had already gone out — so I re-derived the dispatch
+plan from the plan file, which of course still showed the todo as pending. The plan
+file is not a dispatch ledger.
+
+**The fix, now mandatory**: before every `task()`, run
+
+```
+git worktree list        # which worktrees exist
+```
+
+and check the target against the **dispatch table in this file** for the current wave.
+A worktree that exists but has no table row is either finished or double-dispatched —
+resolve that before sending anything.
+
+Second, **append the row to the table at dispatch time, not at the end of the wave.**
+The table is the ledger; if it is written after the fact it cannot prevent this.
+
+Cancelling works if the task is still registered (`background_cancel` succeeded for
+todo 73's duplicate, and returned "Task not found" for todo 60's, which had already
+ended). Either way, check the worktree's `git status` afterwards: two writers produce
+duplicated modules or two competing shapes for the same API, and that is the signature
+to look for.
+
+### Wave 13 dispatch ledger
+
+| todo | crate | session | dispatched |
+|---|---|---|---|
+| 56 | `oc-cli/cmd/*` | `ses_027735b19ffewx40JYj9p3KRiH` | yes |
+| 60 | `oc-plugin/js` | `ses_027742e4effeO4MAl2Z7UQ6gfM` | yes (a first, unregistered attempt ended on its own) |
+| 73 | `oc-tui` | `ses_027702a2effev2qAFABiAy9C9l` | yes (duplicate `bg_bbef31e3` cancelled) |
+| 64 | `oc-agent/model_policy` | `ses_0276e452cffejbP0zrOsMqDH3x` | yes |
+| 59 | `oc-plugin/wasm` | — | **not yet** |
+| 101 | `oc-agent/reflection` | — | **not yet** |
+
+59 shares `oc-plugin` with 60, and 101 shares `oc-agent` with 64 — both at the
+two-editor cap, so both wait for their partner to merge.
