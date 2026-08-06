@@ -3919,3 +3919,28 @@ those 33 plus the CLI/runtime values `OPENCODE`, `OPENCODE_PID`, `OPENCODE_PRINT
 `OPENCODE_LOG_LEVEL`. It reuses `oc_paths::Env` for `Flag.truthy` inputs and
 `oc_tools::exposure::ExposureFlags` for the measured experimental fallback, so
 `OPENCODE_EXPERIMENTAL=true OPENCODE_EXPERIMENTAL_PLAN_MODE=false` still leaves plan mode off.
+
+## [2026-08-06] Task 58: out-of-process JSON-RPC plugins
+
+- The stdio protocol is strict NDJSON JSON-RPC 2.0. One reader classifies every
+  frame before consulting the id-indexed waiter map, so notifications, server
+  requests, and unknown response ids cannot consume another request's response.
+- Startup concurrency and dispatch ordering are separate properties:
+  `join_all` starts every plugin initialization concurrently and preserves the
+  input vector's order; the existing sequential `HookBus` remains the sole
+  authority for applying mutations. A two-process startup gate proves startup is
+  actually concurrent, and non-commutative text mutations prove dispatch order.
+- Every initialization, hook, and tool request uses the process spec's deadline.
+  A timeout disables the plugin, records one typed diagnostic, fails pending
+  requests, signals process shutdown, and lets the bus complete the turn.
+- Explicit shutdown closes stdin, signals and reaps the child, and joins the
+  reader/supervisor tasks with bounded grace periods. `Drop` remains a safety net
+  that aborts the reader and transfers the child task to Tokio rather than
+  blocking synchronously.
+- `oc-plugin-sdk` reserves stdout for protocol frames and exposes a reusable
+  conformance suite. The 158-line Rust example registers one tool and three hooks
+  and passes that suite without host-private types.
+- Mutation proof caught both load-bearing properties: replacing the injected
+  60 ms request deadline with 2 s failed the hung-hook test, and reversing the
+  resolved plugin vector failed the configuration-order test. Restoring the
+  implementation returned all five JSON-RPC integration tests to green.

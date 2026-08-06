@@ -3967,3 +3967,24 @@ device code off a browser and typing it back. Tests use `TerminalBroker::with_ti
 so no timer is involved at all), 5 ms plus a 10 s bounded-poll budget for the watchdog,
 and 3600 s wherever the assertion is that a reclaim did *not* happen. Every direction
 is one-sided, because load can only make a timer late.
+
+## [2026-08-06] Task 58: JSON-RPC host boundaries
+
+- Protocol version `1.0` is negotiated by `plugin.initialize`; the host offers a
+  version list and rejects a plugin selecting anything else. Hook names remain
+  the exact Task 57 strings, and resource hooks (`tool`, `auth`, `provider`) are
+  never misrepresented as serializable callback calls.
+- The default request deadline is five seconds and lives on
+  `PluginProcessSpec`; tests inject shorter values. One policy covers initialize,
+  hook, and tool exchanges so no request class can become an unbounded exception.
+- Process failure is containment, not bus failure. A timeout, malformed frame,
+  closed stdout, failed read, or unexpected exit permanently disables that
+  plugin and records a `PluginDiagnostic`; `Plugin::call` still returns success so
+  sibling plugins and the turn continue.
+- Remote tool names are checked as a complete set before entering the shared
+  registry. A collision with a built-in or another plugin is an explicit error;
+  registry insertion order never decides which implementation wins.
+- `oc-plugin-sdk` owns wire types, the plugin builder, stdio server, and reusable
+  self-conformance runner. `oc-plugin` owns spawning, deadlines, lifecycle,
+  diagnostics, typed Task 57 hook codecs, and adaptation to the existing bus.
+  This keeps third-party plugin code independent of host internals.

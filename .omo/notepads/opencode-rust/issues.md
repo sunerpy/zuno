@@ -3321,4 +3321,19 @@ vanishing.
    `terminal_lease_keeps_the_plugin_crate_away_from_the_tui_and_ratatui`, which walks
    the manifests rather than shelling out to cargo — spawning cargo inside a cargo test
    run can block on the shared build-directory lock, which in this workspace is a real
-   load-dependent hazard.
+    load-dependent hazard.
+
+## [2026-08-06] Task 58: verification and roster notes
+
+- `lsp_diagnostics` is rooted at the main worktree and rejects every `oc-wt/t58`
+  path with `LSP file path must be inside request cwd`. Direct rust-analyzer
+  diagnostics were used during implementation; the final zero-warning Clippy
+  pass and full workspace build are the executable gates for the committed tree.
+- The plan-era expectation of 35 workspace packages is stale. `oc-plugin-sdk`
+  was already an empty workspace member before Task 58, so implementing it adds
+  no member. Authoritative `cargo metadata --locked --offline` and
+  `crates.expected` both contain the same 34 sorted package names.
+- Regenerating the lockfile initially surfaced unrelated `oc-server` dependency
+  normalization (`futures`, `oc-llm`, `rusqlite`). Those three lines were removed;
+  the final lock diff contains only the Task 58 dependencies of `oc-plugin` and
+  `oc-plugin-sdk`.
