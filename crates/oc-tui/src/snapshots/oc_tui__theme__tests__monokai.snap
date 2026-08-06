@@ -1,0 +1,59 @@
+---
+source: crates/oc-tui/src/theme_tests.rs
+expression: "theme_sample(&registry, name, Mode::Dark)"
+---
+"monokai                   " fg=#f8f8f2 bg=#272822 mod=BOLD
+"primary                   " fg=#66d9ef bg=#272822 mod=NONE
+"secondary                 " fg=#ae81ff bg=#272822 mod=NONE
+"accent                    " fg=#a6e22e bg=#272822 mod=NONE
+"error                     " fg=#f92672 bg=#272822 mod=NONE
+"warning                   " fg=#e6db74 bg=#272822 mod=NONE
+"success                   " fg=#a6e22e bg=#272822 mod=NONE
+"info                      " fg=#fd971f bg=#272822 mod=NONE
+"text                      " fg=#f8f8f2 bg=#272822 mod=NONE
+"textMuted                 " fg=#75715e bg=#272822 mod=NONE
+"background                " fg=#272822 bg=#272822 mod=NONE
+"backgroundPanel           " fg=#1e1f1c bg=#272822 mod=NONE
+"backgroundElement         " fg=#3e3d32 bg=#272822 mod=NONE
+"border                    " fg=#3e3d32 bg=#272822 mod=NONE
+"borderActive              " fg=#66d9ef bg=#272822 mod=NONE
+"borderSubtle              " fg=#1e1f1c bg=#272822 mod=NONE
+"diffAdded                 " fg=#a6e22e bg=#272822 mod=NONE
+"diffRemoved               " fg=#f92672 bg=#272822 mod=NONE
+"diffContext               " fg=#75715e bg=#272822 mod=NONE
+"diffHunkHeader            " fg=#75715e bg=#272822 mod=NONE
+"diffHighlightAdded        " fg=#a6e22e bg=#272822 mod=NONE
+"diffHighlightRemoved      " fg=#f92672 bg=#272822 mod=NONE
+"diffAddedBg               " fg=#1a3a1a bg=#272822 mod=NONE
+"diffRemovedBg             " fg=#3a1a1a bg=#272822 mod=NONE
+"diffContextBg             " fg=#1e1f1c bg=#272822 mod=NONE
+"diffLineNumber            " fg=#9b9b95 bg=#272822 mod=NONE
+"diffAddedLineNumberBg     " fg=#1a3a1a bg=#272822 mod=NONE
+"diffRemovedLineNumberBg   " fg=#3a1a1a bg=#272822 mod=NONE
+"markdownText              " fg=#f8f8f2 bg=#272822 mod=NONE
+"markdownHeading           " fg=#f92672 bg=#272822 mod=NONE
+"markdownLink              " fg=#66d9ef bg=#272822 mod=NONE
+"markdownLinkText          " fg=#ae81ff bg=#272822 mod=NONE
+"markdownCode              " fg=#a6e22e bg=#272822 mod=NONE
+"markdownBlockQuote        " fg=#75715e bg=#272822 mod=NONE
+"markdownEmph              " fg=#e6db74 bg=#272822 mod=NONE
+"markdownStrong            " fg=#fd971f bg=#272822 mod=NONE
+"markdownHorizontalRule    " fg=#75715e bg=#272822 mod=NONE
+"markdownListItem          " fg=#66d9ef bg=#272822 mod=NONE
+"markdownListEnumeration   " fg=#ae81ff bg=#272822 mod=NONE
+"markdownImage             " fg=#66d9ef bg=#272822 mod=NONE
+"markdownImageText         " fg=#ae81ff bg=#272822 mod=NONE
+"markdownCodeBlock         " fg=#f8f8f2 bg=#272822 mod=NONE
+"syntaxComment             " fg=#75715e bg=#272822 mod=NONE
+"syntaxKeyword             " fg=#f92672 bg=#272822 mod=NONE
+"syntaxFunction            " fg=#a6e22e bg=#272822 mod=NONE
+"syntaxVariable            " fg=#f8f8f2 bg=#272822 mod=NONE
+"syntaxString              " fg=#e6db74 bg=#272822 mod=NONE
+"syntaxNumber              " fg=#ae81ff bg=#272822 mod=NONE
+"syntaxType                " fg=#66d9ef bg=#272822 mod=NONE
+"syntaxOperator            " fg=#f92672 bg=#272822 mod=NONE
+"syntaxPunctuation         " fg=#f8f8f2 bg=#272822 mod=NONE
+"selectedListItemText      " fg=#272822 bg=#272822 mod=NONE
+"backgroundMenu            " fg=#3e3d32 bg=#272822 mod=NONE
+"thinkingOpacity 0.60      " fg=#75715e bg=#272822 mod=NONE
+"selectedForeground        " fg=#272822 bg=#66d9ef mod=NONE
