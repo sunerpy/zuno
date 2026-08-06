@@ -49,6 +49,7 @@ oc-goal = { path = "crates/oc-goal" }
 oc-llm = { path = "crates/oc-llm" }
 oc-lsp = { path = "crates/oc-lsp" }
 oc-mcp = { path = "crates/oc-mcp" }
+oc-memory = { path = "crates/oc-memory" }
 oc-observability = { path = "crates/oc-observability" }
 oc-paths = { path = "crates/oc-paths" }
 oc-permission = { path = "crates/oc-permission" }
@@ -157,6 +158,15 @@ aws-lc-rs = { version = "1.17.3", default-features = false, features = [
   "alloc",
 ] }
 base64 = "0.23.1"
+# Already in the lock as a transitive dependency of `grep-regex` at this exact
+# version, so naming it here adds a manifest line and **zero** packages. It is a
+# direct dependency because `oc-memory`'s prompt-injection scanner runs on every
+# memory write and needs a matcher with a *guaranteed* linear-time bound: this
+# crate compiles to a finite automaton and cannot backtrack, so an adversarial
+# near-miss entry cannot turn the scan into a DoS. A hand-rolled matcher would
+# trade that proof for our own, and the reference's 36 patterns would stop being
+# checkable line-by-line against it.
+regex = "1.13.1"
 sha2 = "0.11.0"
 time = { version = "0.3.55", features = [
   "formatting",

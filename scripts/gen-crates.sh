@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-shot generator for the 33 crate skeletons. Kept in the tree as the record
+# One-shot generator for the 34 crate skeletons. Kept in the tree as the record
 # of how the roster was materialised; it is idempotent and safe to re-run.
 set -euo pipefail
 
@@ -34,6 +34,7 @@ oc-watch	Filesystem watcher publishing coalesced, bounded change events.
 oc-engine	The turn engine: the agent loop, tool dispatch, compaction, retry, and cancellation.
 oc-agent	Agent definitions, presets, and the sub-agent task boundary.
 oc-goal	Goal store and continuation board that survive across sessions.
+oc-memory	Character-capped resident memory: §-delimited entries, batch-atomic apply, injection scanning.
 oc-plugin	Plugin host: the hook bus and the plugin lifecycle.
 oc-plugin-sdk	The surface a plugin is written against, shared by hosts and plugin authors.
 oc-server	HTTP server exposing the `/api` surface and the server-sent event stream.

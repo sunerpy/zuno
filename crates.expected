@@ -11,6 +11,7 @@ oc-goal
 oc-llm
 oc-lsp
 oc-mcp
+oc-memory
 oc-observability
 oc-paths
 oc-permission
