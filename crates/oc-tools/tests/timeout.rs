@@ -25,6 +25,7 @@ fn params(command: impl Into<String>, timeout: Option<u64>) -> ShellParams {
         timeout,
         workdir: None,
         background: false,
+        justification: None,
     }
 }
 

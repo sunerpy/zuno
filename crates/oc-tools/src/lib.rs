@@ -21,6 +21,14 @@
 //! ceiling terminate the entire spawned process group. A foreground timeout instead
 //! hands the live command to [`timeout::BackgroundManager`], and [`output_policy`]
 //! persists oversized output before requiring explicit context-cost acceptance.
+//! [`risk`] adds a deterministic destructive-command tripwire before any foreground
+//! or background spawn. This is **not a sandbox**: shell commands retain the user's
+//! full filesystem, network, and credentials. A confinement layer is a named future
+//! decision, not a guarantee implied by this tool. The gate fails closed to
+//! reflection when a brace expansion cannot be resolved statically, and permanently
+//! denies a relative destructive target after an unknown directory change. It
+//! intentionally does not classify credential reads such as
+//! `cat ~/.ssh/id_rsa` as destruction; see [`risk`]'s documented boundary.
 //!
 //! # The conditional tools
 //!
@@ -51,6 +59,7 @@ pub mod apply_patch;
 pub mod edit;
 pub mod output_policy;
 pub mod read;
+pub mod risk;
 pub mod shell;
 pub mod timeout;
 pub mod write;

@@ -2562,6 +2562,7 @@ dependencies = [
  "thiserror 2.0.19",
  "time",
  "tokio",
+ "tracing",
  "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-powershell",
