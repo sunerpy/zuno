@@ -14,8 +14,12 @@ publish.workspace = true
 # dependency graph: a pin for a package nothing depends on is a cargo warning,
 # and this workspace treats warnings as failures.
 [dependencies]
+async-trait = { workspace = true }
 crossterm = { workspace = true }
+oc-engine = { workspace = true }
 ratatui = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
 
 [lints]
 workspace = true

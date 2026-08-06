@@ -2667,8 +2667,12 @@ dependencies = [
 name = "oc-tui"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "crossterm 0.29.0",
+ "oc-engine",
  "ratatui",
+ "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]
