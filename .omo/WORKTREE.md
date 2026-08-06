@@ -283,3 +283,52 @@ CodeGraph MCP has been uninitialized in **every** worktree for two waves running
 Prompts now say so up front and tell the agent to fall back to Read/Grep/Glob
 immediately instead of burning turns on it. Same for `context7`, which has been
 quota-exhausted for several siblings.
+
+## Wave 11 dispatch record (2026-08-06)
+
+Six agents live. `main` = 2141 tests at dispatch, 62/103 todos done.
+
+| todo | crate(s) | session |
+|---|---|---|
+| 46 | `oc-mcp/remote.rs` (sole) | `ses_0290a7709ffeqWpqPJx8wzoCg2` |
+| 52 | `oc-server/api/**` | `ses_028fb8174ffem4wEM7JpXQXNFI` |
+| 53 | `oc-server/events.rs` | `ses_029090234ffeLC0beC5vQW86QW` |
+| 57 | `oc-plugin` (sole, fresh) | (see task list) |
+| 63 | `oc-agent` (sole, fresh) | `ses_028f7c574ffefvcs7y3mVE3htZ` |
+| 70 | `oc-tools/batch.rs` (sole) | (see task list) |
+
+52 and 53 share `oc-server` — coordinated by **omission**: 53 owns `GET /api/event` and
+`GET /api/session/{sessionID}/event`; 52 was told not to implement those two and not to
+touch `auth.rs`/`directory.rs`/`event.rs`/`server.rs`/`main.rs`.
+
+Todo 63 is a **retry**: its first attempt was cancelled by a stale-activity timeout at
+90 minutes having produced only a `Cargo.toml` edit. The retry prompt tells it to write
+files early rather than read for an hour.
+
+### Probes done up front
+
+- **Remote MCP live targets exist and need no auth.** POSTed a real `initialize` to
+  three of the user's four configured remote servers. All 200. `learn.microsoft.com`
+  and `developers.openai.com` answer with **SSE** framing; `knowledge-mcp.global.api.aws`
+  answers with **plain JSON** and negotiates **`2025-03-26`**, not `2024-11-05`. So a
+  Streamable-HTTP POST can be answered either way on the *same* transport — that is not
+  the same thing as falling back to the SSE transport, and conflating them is the
+  obvious way to get this wrong.
+- **Captured the real binary's OpenAPI document** to `.omo/fixtures/oracle-openapi-1.18.12.json`
+  (479 KB, committed — note `.omo/refs/` is gitignored, `.omo/fixtures/` is not). Measured:
+  **162 paths / 188 operations, 58 under `/api/`**. The protocol groups declare 56
+  `HttpApiEndpoint` calls. **The plan says 61.** Three numbers, none matching; todo 52 was
+  given the fixture and told to report the real count. `/doc`, `/openapi.json` and
+  `/api/doc` all return 200.
+- **Counted the plugin hook set**: the `Hooks` interface has **24** optional keys; the
+  plan's prose lists 21 and its acceptance criterion says 20. Told todo 57 the interface
+  is the contract and to reconcile all three. Also flagged that `tool` is a **map**, not
+  a callback, and that `auth`/`provider` are their own interfaces.
+- The plan's todo 57 line points its evidence at `task-51-opencode-rust.txt` — a typo;
+  told it to write `task-57`.
+
+### Standing instructions now in every prompt
+
+CodeGraph MCP has been uninitialized in every worktree for **three waves**; `context7` is
+quota-exhausted. Both are stated up front with "fall back immediately" so agents stop
+burning turns on them.
