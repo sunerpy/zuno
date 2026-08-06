@@ -3988,3 +3988,84 @@ is one-sided, because load can only make a timer late.
   self-conformance runner. `oc-plugin` owns spawning, deadlines, lifecycle,
   diagnostics, typed Task 57 hook codecs, and adaptation to the existing bus.
   This keeps third-party plugin code independent of host internals.
+
+## [2026-08-06] Task 47: how a failed connection is surfaced, and where tools-changed is published
+
+### A failed connection is surfaced as retained data, not as a deletion
+
+The oracle deletes a dead server's cached definitions in `onclose`
+(`mcp/index.ts:442-455`). I deliberately do NOT. `Catalog::unavailable` flips only
+`ServerStatus` and leaves both the tool snapshot and the `ConnectedServer` handle in
+place, so `ServerStatus::is_connected()` in `Catalog::tools()` is the **single** thing
+standing between a dead server and the merged list.
+
+Why: if `unavailable` also cleared the tools, a missing gate would be hidden behind a
+second accidental one — the tools would vanish for the wrong reason and no test could
+tell the difference. That is not hypothetical; my first implementation cleared the
+handle and the connected-only mutation passed vacuously. Retaining state I could have
+dropped is what makes the rule falsifiable.
+
+Surfacing shape:
+
+- `ServerStatus` mirrors the oracle's `Status` union (`mcp/index.ts:83-107`):
+  `Connected | Disabled | Failed{error} | NeedsAuth | NeedsClientRegistration{error}`.
+- `Diagnostic { server, status }` is **data**, with `message()` rendering one line.
+  The oracle splits this across a `logWarning` (`:383-386`) and, for the two OAuth
+  cases, a toast (`:297-321`). Both spellings agree on the only thing a user staring
+  at a missing tool needs — the server's *name* — so I carry it structurally and let
+  the caller choose log, toast, or TUI panel. Verbatim example:
+  `MCP server broken is unavailable and contributes no tools: Connection closed`
+- `needs_auth` keeps the remedy in the message (`run `opencode mcp auth <name>``),
+  because that is the one status a user can fix without reading docs.
+
+### Tools-changed is published from three places, all inside `Catalog`
+
+`CatalogEvent::ToolsChanged { server }` — payload is the server name only, matching
+`mcp/index.ts:461-471`, so a subscriber re-reads the catalog rather than trusting a
+diff it was handed. It is published by:
+
+1. `connected` / `connected_with_prompts` — a late connection is a change.
+2. `unavailable` — a withdrawal is a change.
+3. `refresh(server)` — the `notifications/tools/list_changed` path.
+
+Todo 45's `refresh` mpsc channel and `subscribe_tools_changed()` stay where they are:
+they are *per-client*, and `Catalog::refresh` is what turns a per-client notification
+into a catalog-level event. A failed re-list leaves the previous snapshot untouched
+(`mcp/index.ts:465-466`) — a transient list failure must not empty a working server.
+
+### `ConnectedServer` is a trait, not an enum over the two transports
+
+Both `StdioClient` and `RemoteClient` implement it. An enum would force every call
+site to re-decide which transport it holds; the trait means `McpToolProxy` relays a
+call without knowing. Remote failures are re-wrapped as `McpError::Connect` so the
+catalog holds one error type — `RemoteError`'s `Display` already names the server and
+the transport, so nothing is lost as a boxed source.
+
+`supports_resources` / `supports_prompts` read the `initialize` capabilities and treat
+**any present non-null value** as support, matching `getServerCapabilities()?.resources`
+(`session/tools.ts:155-157`) where an empty object still counts.
+
+### The proxy holds two names on purpose
+
+`McpToolProxy { id, tool }`: `id` is the namespaced id the model calls, `tool` is the
+server-local name sent on the wire. Never derived from each other — the sanitizer is
+not injective. A tool-level `is_error` becomes `ToolError::Failed` naming the
+*namespaced* id with the server's own text as the source, so the message a user sees
+still says which server refused.
+
+### Permission filtering happens in two places, and that is not redundant
+
+`Catalog::visible_tools(rules)` filters, and `oc-tools`' registry filters again after
+appending (`registry.rs:387-395`). The registry route is the normal one; the code-mode
+path describes `mcp.tools()` **without** going through the registry
+(`tool/registry.ts:275-284`), so the deny has to hold on both routes. `CatalogLoader`
+therefore hands the registry the list *unfiltered* — the registry owns that pass.
+
+### Resource-tool argument parsing follows the oracle's hand-written parser
+
+Not serde-derived: `optional_server` treats `""` as absent (`session/tools.ts:512-518`),
+so a model sending an empty string gets the all-servers listing rather than a refusal.
+`resource_permission_patterns(server, servers)` ports the finer `mcp:<server>:*` ask
+(`:173-175`) even though the registry currently gates these tools under the coarser
+`read` / `*` pair — it is strictly narrower than what the coarse gate already allows,
+and porting it now means whoever wires a per-server gate has it ready and tested.

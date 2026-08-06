@@ -3944,3 +3944,68 @@ those 33 plus the CLI/runtime values `OPENCODE`, `OPENCODE_PID`, `OPENCODE_PRINT
   60 ms request deadline with 2 s failed the hung-hook test, and reversing the
   resolved plugin vector failed the configuration-order test. Restoring the
   implementation returned all five JSON-RPC integration tests to green.
+
+## [2026-08-06] Task 47: the namespacing rule as it behaves, and the one-shot rebuild
+
+### `tool_name` is `sanitize(server) + "_" + sanitize(tool)` and nothing else
+
+Todo 45 ported it; I reused it rather than writing a second rule. Measured behaviour,
+not paraphrased:
+
+- Allowed set is `[a-zA-Z0-9_-]`. Every other UTF-16 code unit becomes one `_`.
+- Separator is a plain `_`. **There is no length truncation** — the oracle
+  (`mcp/catalog.ts:117-119`) has none, so a 300-character server name produces a
+  300-character prefix.
+- `search` on `docs` → `docs_search`. `search/all` on `my docs` → `my_docs_search_all`.
+
+The consequence that matters for design: **the rule is not injective.** `a.b` and
+`a/b` both sanitize to `a_b`, and an underscore inside a server name makes the
+server/tool boundary ambiguous. So a namespaced id can never be split back into
+`(server, tool)` to route a call. The oracle avoids this by capturing the original
+`ToolDefinition` and the client in the closure (`mcp/catalog.ts:42-67`); my
+`McpToolProxy` stores `id` (namespaced, for the model) and `tool` (server-local, for
+the wire) as two separate fields. Only code-mode splits, and only for display
+(`tool/code-mode.ts:39-55`).
+
+The plan's reference to `session/tools.ts:388-492` says the namespaced id is "split
+back into server+tool at call time". It is not. Do not implement it that way.
+
+### The locked-list rebuild fires exactly once, and the mechanism is not mine
+
+Todo 31's `LockedTools::tools_for_request(available, status)` owns the once-only
+property. Reading its body is the only way to feed it correctly:
+
+- First call always freezes `available`, and records `late_mcp_resolved = (status == Ready)`.
+- If the first call was `Pending`, the *first* subsequent `Ready` compares the whole
+  list; if it differs, the snapshot is replaced, `rebuild_count = 1`, and
+  `rebuilt_for_late_mcp` is true for that one request.
+- **`late_mcp_resolved` is set to true on that first `Ready` whether or not the list
+  changed.** So a second late connection can never rebuild.
+- Only `reset()` re-arms it.
+
+Therefore the integration rule is: feed the **complete** id list (order and content
+both participate in `PartialEq`) plus a discovery status, and **never call `reset()`**.
+`Catalog::tools_for_request` is three lines for exactly that reason.
+
+The status signal needed inventing. `Catalog::new(expected_server_names)` records what
+configuration asked for, and each `connected`/`unavailable` removes one name;
+`discovery_status()` is `Ready` only when the expected set is empty. Consequences:
+a server that never reports keeps discovery `Pending` forever, which is the safe
+answer (the allowance is held in reserve rather than spent on a partial view), and
+zero configured servers is `Ready` immediately rather than never.
+
+### A mutation test found a vacuous pass in my own test
+
+My first `unavailable()` cleared both the status **and** `entry.handle`. The
+connected-only test still passed with the gate deleted, because the tools disappeared
+for a second, accidental reason. I changed the code so `unavailable` keeps the tools
+*and* the handle, making `ServerStatus::is_connected()` the single decision point —
+then deleting the gate leaks `broken_dangerous` into the merged list and the test says
+so. Retaining state you could have dropped is sometimes what makes a rule testable.
+
+### Every MCP list method pages the same way
+
+`resources/list`, `resources/templates/list`, and `prompts/list` all use
+`{cursor}` → `{<key>: [...], nextCursor}`, so one generic `fetch_list(method, key)`
+covers them. `tools/list` deliberately keeps its own loop: it also swaps the cached
+tool snapshot, and folding it in would couple that cache to every pure read.

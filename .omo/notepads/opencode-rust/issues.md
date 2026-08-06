@@ -3337,3 +3337,85 @@ vanishing.
   normalization (`futures`, `oc-llm`, `rusqlite`). Those three lines were removed;
   the final lock diff contains only the Task 58 dependencies of `oc-plugin` and
   `oc-plugin-sdk`.
+
+## [2026-08-06] Task 47: what already existed, and the four seams that did not
+
+### `permission_key` ALREADY collapses the three resource tools — no change needed
+
+`oc-permission/src/visibility.rs:30-34` declares:
+
+```rust
+pub const READ_TOOLS: [&str; 3] = [
+    "list_mcp_resources",
+    "list_mcp_resource_templates",
+    "read_mcp_resource",
+];
+```
+
+and `permission_key` (`:40-48`) returns `"read"` for all three. This is a faithful
+port of `permission/index.ts:204-219`. Todo 47 needed **zero** edits to
+`oc-permission`, and the acceptance test exercises the real function rather than a
+local copy:
+
+```rust
+assert_eq!(RESOURCE_TOOLS, oc_permission::visibility::READ_TOOLS);
+```
+
+That assertion is the guard rail. Rename a resource tool and it fails immediately
+rather than silently detaching the tool from the `read` key. Mutation 3 proves it.
+
+Boundary worth knowing: the collapse only *hides* a tool when the last matching rule
+has `pattern == "*"` and `action == Deny`. `{"read": {"mcp:docs:*": "deny"}}` leaves
+all three visible; that is upstream behaviour, not a bug, and there is a test pinning it.
+
+### The command-resolver seam existed, and is richer than the plan implies
+
+`oc-catalog::command::Sources::with_mcp_prompts(&[McpPrompt])` is level 3 of a
+four-level precedence (`command.rs:381-408`): built-ins → config (overrides) → MCP
+prompts (overrides) → skills (fill free names only). Beyond that, `resolve()` returns
+`Resolution::PendingMcp` carrying an `McpTemplate { client, prompt, arguments }`, so
+the resolver already models the deferred `prompts/get` round trip and `complete(&messages)`
+finishes it. Todo 47 owes that seam only a `Vec<McpPrompt>`, which `Catalog::prompts()`
+now supplies from connected servers only.
+
+### FOUR MCP methods did not exist and had to be added inside oc-mcp
+
+The crate's `lib.rs` header has claimed "tools, resources, prompts" since todo 45,
+but only tools were implemented. Neither `StdioClient` nor `RemoteClient` had:
+
+- `resources/list`
+- `resources/templates/list`
+- `resources/read`
+- `prompts/list`
+
+Without them the three resource tools have no transport and `Catalog::prompts()` has
+no source. I added all four to both transports (in `oc-mcp`, so no sibling crate was
+touched). **This is worth flagging to whoever audits todo 45/46 coverage**: their
+acceptance criteria were about tools, and the resource/prompt half of the MCP surface
+was silently absent until now.
+
+### `RemoteClient` had no way to report its configured server name
+
+`RemoteError` has no `server()` accessor and `RemoteClient` exposed no name at all;
+the only name reachable was `initialization().server_info.name`, which is the server's
+*self-reported* identity and can collide between two configured entries. I added
+`RemoteClient::server_name()` returning the configured `inner.server`. Namespacing and
+diagnostics must key on the configured name — two entries pointing at the same vendor
+service would otherwise merge into one namespace.
+
+### A gate the plan does not mention: the `resources` capability
+
+`session/tools.ts:155-157` registers the three resource tools only when some connected
+client declares a `resources` capability. Without that gate, a configuration whose
+servers serve no resources still advertises three tools that can only fail. My
+`Catalog::tools()` appends them only when `resource_servers()` is non-empty, and
+withdraws them when the last resource-capable server fails. Two tests cover it.
+
+### Order divergence from the oracle, deliberate
+
+The oracle iterates a JavaScript object's insertion order, which is not reproducible
+across configuration reads. I key entries by server name in a `BTreeMap`, so servers
+are name-ordered while each server's own tools keep the order it advertised
+(`docs_search, docs_lookup`, not sorted). This is required, not cosmetic: todo 31's
+`LockedTools` compares whole snapshots with `PartialEq`, so a non-deterministic order
+would look like a changed tool list and burn the one late-MCP rebuild at random.
