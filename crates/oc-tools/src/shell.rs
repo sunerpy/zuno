@@ -1,4 +1,5 @@
 use crate::output_policy::OutputPolicy;
+use crate::risk::{GateOutcome, Justification, RiskContext, assess_and_gate};
 use crate::timeout::{
     BackgroundAdoption, BackgroundManager, ForegroundTask, LocalBackgroundManager,
     background_started_output, normalize_foreground_timeout, wait_or_promote,
@@ -21,12 +22,13 @@ use tree_sitter::{Node, Parser};
 
 const TOOL_ID: &str = "bash";
 const TERMINATE_GRACE: Duration = Duration::from_millis(200);
-const DESCRIPTION: &str = "Executes a command with the configured shell. Commands are parsed with tree-sitter before execution so each constituent command is permission-checked independently. Use workdir instead of changing directories inside the command.";
+const DESCRIPTION: &str = "Executes a command with the configured shell. Commands are parsed with tree-sitter before execution so each constituent command is permission-checked independently. A deterministic destructive-command gate runs before every foreground or background spawn. This is not a sandbox: commands retain the user's full filesystem, network, and credentials; confinement is a future decision, not an implied guarantee. Use workdir instead of changing directories inside the command.";
 
 const CWD_COMMANDS: &[&str] = &[
     "cd",
     "chdir",
     "popd",
+    "pop-location",
     "pushd",
     "push-location",
     "set-location",
@@ -70,6 +72,9 @@ pub struct ShellParams {
     /// Start the command and return immediately while its lifecycle continues asynchronously.
     #[serde(default)]
     pub background: bool,
+    /// Only for resubmitting a reflected command; identify the actual user request it serves.
+    #[serde(default)]
+    pub justification: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,6 +220,30 @@ impl ShellTool {
 
         let cwd = self.resolve_workdir(params.workdir.as_deref())?;
         let analysis = analyze_command(&params.command, self.syntax())?;
+        let risk_context = RiskContext::from_env(Some(cwd.clone()));
+        let justification = Justification {
+            text: params.justification.clone(),
+        };
+        match assess_and_gate(
+            &params.command,
+            self.syntax(),
+            &risk_context,
+            &justification,
+        )? {
+            GateOutcome::Allow => {}
+            GateOutcome::Reflect { prompt } => {
+                return Err(ToolError::InvalidArgs {
+                    tool: TOOL_ID.to_owned(),
+                    source: Box::new(io::Error::new(io::ErrorKind::InvalidInput, prompt)),
+                });
+            }
+            GateOutcome::Deny { reason } => {
+                return Err(ToolError::Failed {
+                    tool: TOOL_ID.to_owned(),
+                    source: Box::new(io::Error::new(io::ErrorKind::PermissionDenied, reason)),
+                });
+            }
+        }
         self.authorize(&params.command, &cwd, &analysis, &ctx)
             .await?;
         if ctx.is_interrupted() {
