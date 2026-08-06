@@ -1,8 +1,12 @@
 use std::io::{self, Write as _};
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use oc_server::api::{self, ApiState};
-use oc_server::{AuthConfig, ServerBuilder, ServerConfig};
+use oc_server::{
+    AuthConfig, DEFAULT_EVENT_SUBSCRIBER_CAPACITY, EventService, ServerBuilder, ServerConfig,
+    events_router,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "oc-server")]
@@ -34,6 +38,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Command::Serve { hostname, port } => {
             let directory = std::env::current_dir()?.to_string_lossy().into_owned();
+            // One pool backs both surfaces: the `/api` handlers and the event
+            // stream's durable sequence must see the same database, or a cursor
+            // would resume against rows the API never wrote.
+            let pool = Arc::new(oc_db::Pool::open_default()?);
+            let events = EventService::new(Arc::clone(&pool), DEFAULT_EVENT_SUBSCRIBER_CAPACITY);
             let config = ServerConfig::default()
                 .with_hostname(hostname)
                 .with_port(port)
@@ -41,7 +50,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .with_default_directory(&directory);
             let state = ApiState::open_default(directory)?;
             let server = ServerBuilder::new(config)
-                .with_routes(api::router(state))
+                .with_routes(api::router(state).merge(events_router(events)))
                 .bind()
                 .await?;
             let mut stdout = io::stdout().lock();
