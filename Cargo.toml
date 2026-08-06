@@ -87,6 +87,7 @@ tokio-util = { version = "0.7.19", features = ["io", "codec"] }
 # "no C toolchain in a default build" constraint is not satisfiable by any
 # production-grade Rust TLS stack and is todo 91's call, not a silent default.
 reqwest = { version = "0.13.4", default-features = false, features = [
+  "form",
   "json",
   "stream",
   "rustls",

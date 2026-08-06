@@ -28,6 +28,11 @@ use tokio::process::{Child, Command};
 use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::protocol::{
+    ExchangeError, Pending, ReaderFailure, decode_error, decode_response, fail_pending, lock,
+    route_message,
+};
+
 /// Protocol version proven against the real server used by the live test.
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
 
@@ -44,8 +49,6 @@ const TOOLS_CHANGED_CAPACITY: usize = 16;
 const TASK_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 const PROCESS_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
-type PendingResult = Result<Value, ReaderFailure>;
-type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<PendingResult>>>>;
 type DynReader = Pin<Box<dyn AsyncRead + Send>>;
 type DynWriter = Pin<Box<dyn AsyncWrite + Send>>;
 
@@ -503,21 +506,7 @@ impl StdioClient {
         let exchange = async {
             self.write_value(&request).await?;
             let message = receiver.await.map_err(|_| ExchangeError::Closed)??;
-            if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-                return Err(ExchangeError::Invalid(format!(
-                    "MCP response for {method} did not use jsonrpc 2.0"
-                )));
-            }
-            if let Some(error) = message.get("error") {
-                let error =
-                    serde_json::from_value(error.clone()).map_err(ExchangeError::DecodeResult)?;
-                return Err(ExchangeError::Rpc(error));
-            }
-            message.get("result").cloned().ok_or_else(|| {
-                ExchangeError::Invalid(format!(
-                    "MCP response for {method} contained neither result nor error"
-                ))
-            })
+            decode_response(method, message)
         };
 
         let result = match tokio::time::timeout(self.inner.timeout, exchange).await {
@@ -603,72 +592,6 @@ struct ListToolsResult {
     tools: Vec<ToolDefinition>,
     #[serde(default)]
     next_cursor: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct RpcResponseError {
-    code: i64,
-    message: String,
-    #[serde(default)]
-    data: Option<Value>,
-}
-
-impl std::fmt::Display for RpcResponseError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "JSON-RPC error {}: {}", self.code, self.message)?;
-        if let Some(data) = &self.data {
-            write!(formatter, " ({data})")?;
-        }
-        Ok(())
-    }
-}
-
-impl std::error::Error for RpcResponseError {}
-
-#[derive(Debug, thiserror::Error)]
-enum ExchangeError {
-    #[error("MCP connection closed")]
-    Closed,
-    #[error("MCP request timed out")]
-    Timeout,
-    #[error("MCP request could not be encoded")]
-    Encode(#[source] serde_json::Error),
-    #[error("MCP response result could not be decoded")]
-    DecodeResult(#[source] serde_json::Error),
-    #[error("MCP stdout line was not JSON")]
-    FrameDecode { line: Arc<str> },
-    #[error("MCP stdin write failed")]
-    Write(#[source] io::Error),
-    #[error("MCP stdout read failed")]
-    Read(#[source] io::Error),
-    #[error(transparent)]
-    Rpc(#[from] RpcResponseError),
-    #[error("{0}")]
-    Invalid(String),
-}
-
-#[derive(Debug, Clone)]
-enum ReaderFailure {
-    Closed,
-    Io {
-        kind: io::ErrorKind,
-        message: Arc<str>,
-    },
-    Decode {
-        line: Arc<str>,
-    },
-}
-
-impl From<ReaderFailure> for ExchangeError {
-    fn from(failure: ReaderFailure) -> Self {
-        match failure {
-            ReaderFailure::Closed => Self::Closed,
-            ReaderFailure::Io { kind, message } => {
-                Self::Read(io::Error::new(kind, message.to_string()))
-            }
-            ReaderFailure::Decode { line } => Self::FrameDecode { line },
-        }
-    }
 }
 
 struct ProcessControl {
@@ -780,56 +703,6 @@ async fn read_loop(
     }
 }
 
-fn route_message(
-    server: &str,
-    pending: &Pending,
-    notifications: &broadcast::Sender<Notification>,
-    refresh: &mpsc::Sender<()>,
-    message: Value,
-) {
-    let Some(object) = message.as_object() else {
-        tracing::warn!(%server, "MCP server emitted a non-object JSON-RPC message");
-        return;
-    };
-
-    if let Some(method) = object.get("method").and_then(Value::as_str) {
-        if let Some(id) = object.get("id") {
-            // Client capabilities intentionally advertise no server-callable
-            // methods. Crucially, a same-numbered server request must not consume
-            // the client's response waiter: the two id namespaces are independent.
-            tracing::warn!(%server, id = %id, %method, "unsupported MCP server request");
-            return;
-        }
-        let notification = Notification {
-            method: method.to_owned(),
-            params: object.get("params").cloned().unwrap_or(Value::Null),
-        };
-        if method == "notifications/tools/list_changed" {
-            let _result = refresh.try_send(());
-        }
-        let _receivers = notifications.send(notification);
-        return;
-    }
-
-    let Some(id_value) = object.get("id") else {
-        tracing::warn!(%server, "MCP server emitted a message with neither method nor id");
-        return;
-    };
-    let Some(id) = id_value.as_u64() else {
-        tracing::warn!(%server, id = %id_value, "MCP response id was not an unsigned integer");
-        return;
-    };
-    let sender = lock(pending).remove(&id);
-    match sender {
-        Some(sender) => {
-            let _receiver = sender.send(Ok(message));
-        }
-        None => {
-            tracing::warn!(%server, id, "MCP response id has no pending request");
-        }
-    }
-}
-
 async fn refresh_loop(inner: Weak<Inner>, mut refresh: mpsc::Receiver<()>) {
     while refresh.recv().await.is_some() {
         let Some(inner) = inner.upgrade() else {
@@ -851,13 +724,6 @@ async fn refresh_loop(inner: Weak<Inner>, mut refresh: mpsc::Receiver<()>) {
                 );
             }
         }
-    }
-}
-
-fn fail_pending(pending: &Pending, failure: ReaderFailure) {
-    let waiters: Vec<_> = lock(pending).drain().map(|(_, waiter)| waiter).collect();
-    for waiter in waiters {
-        let _receiver = waiter.send(Err(failure.clone()));
     }
 }
 
@@ -954,24 +820,8 @@ async fn finish_task(mut task: JoinHandle<()>, grace: Duration) {
     }
 }
 
-fn decode_error(line: &str) -> serde_json::Error {
-    match serde_json::from_str::<Value>(line) {
-        Err(error) => error,
-        Ok(_) => serde_json::Error::io(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "reader reported a JSON decode failure for a valid value",
-        )),
-    }
-}
-
 fn empty_object() -> Value {
     Value::Object(Map::new())
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Namespaces one MCP tool exactly as the TypeScript registry does
