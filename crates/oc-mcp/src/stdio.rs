@@ -28,6 +28,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::catalog::{PromptDefinition, ResourceContents, ResourceDefinition, ResourceTemplate};
 use crate::protocol::{
     ExchangeError, Pending, ReaderFailure, decode_error, decode_response, fail_pending, lock,
     route_message,
@@ -343,6 +344,49 @@ impl StdioClient {
         })
     }
 
+    /// Lists every resource, following `nextCursor` pages.
+    ///
+    /// # Errors
+    ///
+    /// A transport, protocol, JSON-RPC, pagination, or timeout failure.
+    pub async fn list_resources(&self) -> Result<Vec<ResourceDefinition>, McpError> {
+        self.fetch_list("resources/list", "resources").await
+    }
+
+    /// Lists every resource template, following `nextCursor` pages.
+    ///
+    /// # Errors
+    ///
+    /// A transport, protocol, JSON-RPC, pagination, or timeout failure.
+    pub async fn list_resource_templates(&self) -> Result<Vec<ResourceTemplate>, McpError> {
+        self.fetch_list("resources/templates/list", "resourceTemplates")
+            .await
+    }
+
+    /// Lists every prompt, following `nextCursor` pages.
+    ///
+    /// # Errors
+    ///
+    /// A transport, protocol, JSON-RPC, pagination, or timeout failure.
+    pub async fn list_prompts(&self) -> Result<Vec<PromptDefinition>, McpError> {
+        self.fetch_list("prompts/list", "prompts").await
+    }
+
+    /// Reads one resource by its MCP URI.
+    ///
+    /// # Errors
+    ///
+    /// A transport, protocol, JSON-RPC, result-decode, or timeout failure.
+    pub async fn read_resource(&self, uri: &str) -> Result<ResourceContents, McpError> {
+        let value = self
+            .request("resources/read", json!({ "uri": uri }))
+            .await
+            .map_err(|error| self.map_list_error(error))?;
+        serde_json::from_value(value)
+            .map_err(ExchangeError::DecodeResult)
+            .map_err(|error| self.map_list_error(error))
+    }
+
     /// Closes stdin, kills and reaps the child, and stops background tasks.
     /// Calling it more than once is harmless.
     pub async fn close(&self) {
@@ -485,6 +529,52 @@ impl StdioClient {
 
         Err(self.map_list_error(ExchangeError::Invalid(format!(
             "MCP tools/list exceeded {MAX_LIST_PAGES} pages"
+        ))))
+    }
+
+    /// `tools/list` deliberately keeps its own loop: it also swaps the tool cache,
+    /// and folding it in here would couple that cache to every pure read.
+    async fn fetch_list<T>(&self, method: &str, key: &str) -> Result<Vec<T>, McpError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let mut items = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = HashSet::new();
+
+        for _ in 0..MAX_LIST_PAGES {
+            let params = cursor
+                .as_ref()
+                .map_or_else(|| json!({}), |cursor| json!({ "cursor": cursor }));
+            let value = self
+                .request(method, params)
+                .await
+                .map_err(|error| self.map_list_error(error))?;
+            let page = value
+                .get(key)
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new()));
+            let page: Vec<T> = serde_json::from_value(page)
+                .map_err(ExchangeError::DecodeResult)
+                .map_err(|error| self.map_list_error(error))?;
+            items.extend(page);
+            let Some(next) = value
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+            else {
+                return Ok(items);
+            };
+            if !seen.insert(next.clone()) {
+                return Err(self.map_list_error(ExchangeError::Invalid(format!(
+                    "MCP {method} returned duplicate cursor {next:?}"
+                ))));
+            }
+            cursor = Some(next);
+        }
+
+        Err(self.map_list_error(ExchangeError::Invalid(format!(
+            "MCP {method} exceeded {MAX_LIST_PAGES} pages"
         ))))
     }
 

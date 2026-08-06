@@ -6,6 +6,7 @@ use oc_config::schema::mcp::{McpOauth, McpRemote};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
+use crate::catalog::{PromptDefinition, ResourceContents, ResourceDefinition, ResourceTemplate};
 use crate::protocol::{ReaderFailure, fail_pending, lock};
 use crate::stdio::{InitializeResult, ToolCallResult, ToolDefinition};
 
@@ -64,6 +65,14 @@ impl RemoteClient {
         self.inner.transport
     }
 
+    /// The **configured** server name, which is what namespacing and diagnostics
+    /// use. Deliberately not `initialization().server_info.name`: that is the
+    /// server's self-reported identity and two configured entries can share it.
+    #[must_use]
+    pub fn server_name(&self) -> &str {
+        &self.inner.server
+    }
+
     /// Successful initialize payload.
     #[must_use]
     pub fn initialization(&self) -> &InitializeResult {
@@ -98,6 +107,68 @@ impl RemoteClient {
             cursor = Some(next);
         }
         Err(self.protocol_error(format!("tools/list exceeded {MAX_LIST_PAGES} pages")))
+    }
+
+    /// Lists every resource page.
+    pub async fn list_resources(&self) -> Result<Vec<ResourceDefinition>, RemoteError> {
+        self.fetch_list("resources/list", "resources").await
+    }
+
+    /// Lists every resource-template page.
+    pub async fn list_resource_templates(&self) -> Result<Vec<ResourceTemplate>, RemoteError> {
+        self.fetch_list("resources/templates/list", "resourceTemplates")
+            .await
+    }
+
+    /// Lists every prompt page.
+    pub async fn list_prompts(&self) -> Result<Vec<PromptDefinition>, RemoteError> {
+        self.fetch_list("prompts/list", "prompts").await
+    }
+
+    /// Reads one resource by its MCP URI.
+    pub async fn read_resource(&self, uri: &str) -> Result<ResourceContents, RemoteError> {
+        let value = self
+            .request("resources/read", json!({ "uri": uri }))
+            .await?;
+        serde_json::from_value(value)
+            .map_err(|error| self.protocol_error(format!("invalid resources/read result: {error}")))
+    }
+
+    async fn fetch_list<T>(&self, method: &str, key: &str) -> Result<Vec<T>, RemoteError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let mut items = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = HashSet::new();
+        for _ in 0..MAX_LIST_PAGES {
+            let params = cursor
+                .as_ref()
+                .map_or_else(|| json!({}), |cursor| json!({ "cursor": cursor }));
+            let value = self.request(method, params).await?;
+            let page = value
+                .get(key)
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new()));
+            let page: Vec<T> = serde_json::from_value(page).map_err(|error| {
+                self.protocol_error(format!("invalid {method} result: {error}"))
+            })?;
+            items.extend(page);
+            let Some(next) = value
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+            else {
+                return Ok(items);
+            };
+            if !seen.insert(next.clone()) {
+                return Err(
+                    self.protocol_error(format!("{method} returned duplicate cursor {next:?}"))
+                );
+            }
+            cursor = Some(next);
+        }
+        Err(self.protocol_error(format!("{method} exceeded {MAX_LIST_PAGES} pages")))
     }
 
     /// Calls one remote MCP tool.
