@@ -48,17 +48,29 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+pub mod continuation;
 pub mod error;
 pub mod spill;
 pub mod status;
 pub mod store;
+pub mod tools;
 
+pub use crate::continuation::{
+    BLOCKED_TURN_THRESHOLD, BlockedAudit, ContinuationAttempt, ContinuationSuppression,
+    GoalContinuation, GoalTurnMode, GoalTurnOutcome, PreparedContinuation, QueuedUserInput,
+    render_goal_context,
+};
 pub use crate::error::GoalError;
 pub use crate::spill::{
     MAX_OBJECTIVE_CHARS, OBJECTIVE_FILE_NAME, OBJECTIVE_POINTER_PREFIX, OBJECTIVE_POINTER_SUFFIX,
 };
 pub use crate::status::{GoalStatus, ModelStatus, StatusOwner, SystemStatus};
 pub use crate::store::{
-    GOAL_DB_FILE, Goal, GoalStore, OBJECTIVE_SPILL_DIRECTORY, SCHEMA, TABLE, default_db_path,
-    default_spill_dir,
+    AUXILIARY_SCHEMA, FailureStreak, GOAL_DB_FILE, Goal, GoalStore, OBJECTIVE_SPILL_DIRECTORY,
+    SCHEMA, TABLE, default_db_path, default_spill_dir,
+};
+pub use crate::tools::{
+    CREATE_GOAL_TOOL_ID, CreateGoalParams, CreateGoalTool, GET_GOAL_TOOL_ID, GetGoalParams,
+    GetGoalTool, UPDATE_GOAL_TOOL_ID, UpdateGoalParams, UpdateGoalStatus, UpdateGoalTool,
+    goal_from_metadata, goal_tools,
 };

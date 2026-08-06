@@ -63,7 +63,7 @@ use crate::status::{GoalStatus, ModelStatus, SystemStatus};
 use oc_db::Pool;
 use oc_error::DbError;
 use oc_paths::DbLocation;
-use rusqlite::{Row, Transaction, params};
+use rusqlite::{OptionalExtension, Row, Transaction, params};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -111,6 +111,22 @@ CREATE TABLE IF NOT EXISTS goal (
     updated_at_ms INTEGER NOT NULL
 )";
 
+/// Runtime-only state kept beside, but not inside, the stable [`TABLE`] schema.
+///
+/// These tables may evolve without changing the `goal` table contract or the
+/// `goal_1.db` filename. Neither has a foreign key: the goal table deliberately
+/// survives unrelated session deletion, and its auxiliary state follows the same
+/// ownership rule. Goal replacement clears both rows explicitly.
+pub const AUXILIARY_SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS goal_continuation_deferral (
+    session_id TEXT PRIMARY KEY NOT NULL
+);
+CREATE TABLE IF NOT EXISTS goal_failure_streak (
+    session_id TEXT PRIMARY KEY NOT NULL,
+    signal TEXT NOT NULL,
+    consecutive_turns INTEGER NOT NULL CHECK(consecutive_turns BETWEEN 1 AND 3)
+)";
+
 const COLUMNS: &str = "session_id, goal_id, objective, status, token_budget, tokens_used, \
      time_used_seconds, created_at_ms, updated_at_ms";
 
@@ -145,6 +161,15 @@ pub struct Goal {
     pub created_at_ms: i64,
     /// When it last changed, in Unix milliseconds.
     pub updated_at_ms: i64,
+}
+
+/// The blocking condition observed at the end of consecutive goal turns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailureStreak {
+    /// Stable, caller-supplied description used to recognize the same blocker.
+    pub signal: String,
+    /// Number of consecutive turns, saturated at the three-turn threshold.
+    pub consecutive_turns: u32,
 }
 
 impl Goal {
@@ -213,7 +238,10 @@ impl GoalStore {
 
     fn open(location: &DbLocation, spill_dir: PathBuf) -> Result<Self, GoalError> {
         let pool = Pool::open(location)?;
-        pool.transaction(|tx| tx.execute_batch(SCHEMA).map_err(oc_db::map_error))?;
+        pool.transaction(|tx| {
+            tx.execute_batch(SCHEMA).map_err(oc_db::map_error)?;
+            tx.execute_batch(AUXILIARY_SCHEMA).map_err(oc_db::map_error)
+        })?;
         Ok(Self { pool, spill_dir })
     }
 
@@ -294,6 +322,9 @@ impl GoalStore {
                 token_budget,
                 now_ms,
             )?;
+            if inserted.is_some() {
+                clear_auxiliary_state(tx, session_id)?;
+            }
             match inserted {
                 Some(goal) => Ok(Ok(goal)),
                 // Read only to *name* the blocker. The refusal itself already
@@ -335,7 +366,7 @@ impl GoalStore {
         let goal_id = new_goal_id();
         let now_ms = now_ms()?;
         let replaced = self.pool.transaction(|tx| {
-            upsert(
+            let goal = upsert(
                 tx,
                 UPSERT_UNCONDITIONAL,
                 session_id,
@@ -343,7 +374,11 @@ impl GoalStore {
                 &objective,
                 token_budget,
                 now_ms,
-            )
+            )?;
+            if goal.is_some() {
+                clear_auxiliary_state(tx, session_id)?;
+            }
+            Ok(goal)
         })?;
         replaced.ok_or_else(|| {
             DbError::NotFound {
@@ -376,7 +411,7 @@ impl GoalStore {
         session_id: &str,
         status: ModelStatus,
     ) -> Result<Option<Goal>, GoalError> {
-        self.write_status(SET_STATUS_AS_MODEL, session_id, status.as_str())
+        self.write_status(SET_STATUS_AS_MODEL, session_id, status.as_str(), false)
     }
 
     /// Set a status only the runtime or the user may choose.
@@ -400,7 +435,105 @@ impl GoalStore {
         session_id: &str,
         status: SystemStatus,
     ) -> Result<Option<Goal>, GoalError> {
-        self.write_status(SET_STATUS_AS_SYSTEM, session_id, status.as_str())
+        self.write_status(
+            SET_STATUS_AS_SYSTEM,
+            session_id,
+            status.as_str(),
+            matches!(status, SystemStatus::Active),
+        )
+    }
+
+    /// Suppress exactly the next idle continuation for an active goal.
+    ///
+    /// Returns `false` when the session has no active goal, so stale resume or
+    /// fork notifications cannot leave a deferral that affects a later goal.
+    pub fn defer_continuation_once(&self, session_id: &str) -> Result<bool, GoalError> {
+        let changed = self.pool.transaction(|tx| {
+            tx.execute(
+                "INSERT INTO goal_continuation_deferral (session_id) \
+                 SELECT session_id FROM goal WHERE session_id = ?1 AND status = 'active' \
+                 ON CONFLICT(session_id) DO NOTHING",
+                params![session_id],
+            )
+            .map_err(oc_db::map_error)
+        })?;
+        Ok(changed > 0)
+    }
+
+    /// Consume a pending one-shot continuation deferral atomically.
+    ///
+    /// Competing idle callbacks cannot both observe the row: only the callback
+    /// whose `DELETE ... RETURNING` removes it receives `true`.
+    pub fn consume_continuation_deferral(&self, session_id: &str) -> Result<bool, GoalError> {
+        let consumed = self.pool.transaction(|tx| {
+            tx.query_row(
+                "DELETE FROM goal_continuation_deferral WHERE session_id = ?1 \
+                 RETURNING session_id",
+                params![session_id],
+                |_row| Ok(()),
+            )
+            .optional()
+            .map(|row| row.is_some())
+            .map_err(oc_db::map_error)
+        })?;
+        Ok(consumed)
+    }
+
+    /// Record one turn's blocking signal, or clear the streak after progress.
+    ///
+    /// Repeating the same non-empty signal increments the count; a different
+    /// signal starts again at one. The count saturates at three because that is
+    /// the only threshold the continuation policy consumes. A missing or blank
+    /// signal means the turn made progress and deletes the persisted streak.
+    pub fn record_failure_signal(
+        &self,
+        session_id: &str,
+        signal: Option<&str>,
+    ) -> Result<Option<FailureStreak>, GoalError> {
+        let signal = signal.map(str::trim).filter(|signal| !signal.is_empty());
+        let streak = self.pool.transaction(|tx| {
+            let Some(signal) = signal else {
+                tx.execute(
+                    "DELETE FROM goal_failure_streak WHERE session_id = ?1",
+                    params![session_id],
+                )
+                .map_err(oc_db::map_error)?;
+                return Ok(None);
+            };
+
+            tx.query_row(
+                "INSERT INTO goal_failure_streak (session_id, signal, consecutive_turns) \
+                 SELECT session_id, ?2, 1 FROM goal \
+                 WHERE session_id = ?1 AND status = 'active' \
+                 ON CONFLICT(session_id) DO UPDATE SET \
+                     signal = excluded.signal, \
+                     consecutive_turns = CASE \
+                         WHEN goal_failure_streak.signal = excluded.signal \
+                             THEN min(goal_failure_streak.consecutive_turns + 1, 3) \
+                         ELSE 1 \
+                     END \
+                 RETURNING signal, consecutive_turns",
+                params![session_id, signal],
+                failure_streak_from_row,
+            )
+            .optional()
+            .map_err(oc_db::map_error)
+        })?;
+        Ok(streak)
+    }
+
+    /// Read the current consecutive blocking signal for a session.
+    pub fn failure_streak(&self, session_id: &str) -> Result<Option<FailureStreak>, GoalError> {
+        let connection = self.pool.get()?;
+        connection
+            .query_row(
+                "SELECT signal, consecutive_turns FROM goal_failure_streak WHERE session_id = ?1",
+                params![session_id],
+                failure_streak_from_row,
+            )
+            .optional()
+            .map_err(oc_db::map_error)
+            .map_err(GoalError::from)
     }
 
     /// Change the token budget, flipping the status if the new one is already
@@ -503,12 +636,23 @@ impl GoalStore {
         sql: &str,
         session_id: &str,
         status: &str,
+        clear_failure_streak: bool,
     ) -> Result<Option<Goal>, GoalError> {
         let now_ms = now_ms()?;
         let goal = self.pool.transaction(|tx| {
-            let mut statement = tx.prepare(sql).map_err(oc_db::map_error)?;
-            read_optional(&mut statement, params![status, now_ms, session_id])
-                .map_err(into_db_error)
+            let goal = {
+                let mut statement = tx.prepare(sql).map_err(oc_db::map_error)?;
+                read_optional(&mut statement, params![status, now_ms, session_id])
+                    .map_err(into_db_error)?
+            };
+            if clear_failure_streak && goal.is_some() {
+                tx.execute(
+                    "DELETE FROM goal_failure_streak WHERE session_id = ?1",
+                    params![session_id],
+                )
+                .map_err(oc_db::map_error)?;
+            }
+            Ok(goal)
         })?;
         Ok(goal)
     }
@@ -656,6 +800,28 @@ fn blocking_status(tx: &Transaction<'_>, session_id: &str) -> Result<GoalStatus,
         )
         .map_err(oc_db::map_error)?;
     GoalStatus::parse(&stored).map_err(into_db_error)
+}
+
+fn clear_auxiliary_state(tx: &Transaction<'_>, session_id: &str) -> Result<(), DbError> {
+    tx.execute(
+        "DELETE FROM goal_continuation_deferral WHERE session_id = ?1",
+        params![session_id],
+    )
+    .map_err(oc_db::map_error)?;
+    tx.execute(
+        "DELETE FROM goal_failure_streak WHERE session_id = ?1",
+        params![session_id],
+    )
+    .map_err(oc_db::map_error)?;
+    Ok(())
+}
+
+fn failure_streak_from_row(row: &Row<'_>) -> rusqlite::Result<FailureStreak> {
+    let count: i64 = row.get("consecutive_turns")?;
+    Ok(FailureStreak {
+        signal: row.get("signal")?,
+        consecutive_turns: u32::try_from(count).unwrap_or(3),
+    })
 }
 
 fn read_optional(
