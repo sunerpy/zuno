@@ -165,6 +165,32 @@ struct Registry {
     retention: ExitRetention,
 }
 
+/// Connects a session's exit to the service that owns it.
+///
+/// Weak, so a session outliving its service cannot keep the service alive; a dropped
+/// service has already killed and cleared everything, so an exit arriving afterwards
+/// has nothing left to report.
+struct RegistryExitObserver {
+    inner: Weak<ServiceInner>,
+}
+
+impl ExitObserver for RegistryExitObserver {
+    fn announce(&self, id: &PtyId, exit_code: Option<u32>) {
+        if let Some(inner) = self.inner.upgrade() {
+            PtyService { inner }.publish(PtyEvent::Exited {
+                id: id.clone(),
+                exit_code,
+            });
+        }
+    }
+
+    fn record(&self, id: &PtyId) {
+        if let Some(inner) = self.inner.upgrade() {
+            PtyService { inner }.retain_exit(id);
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ServiceInner {
     registry: Mutex<Registry>,
@@ -286,6 +312,20 @@ impl PtyService {
     }
 
     /// Lifecycle events from now on. Late subscribers do not see past events.
+    ///
+    /// Every event is published before the state change it reports becomes readable
+    /// through this service, so a consumer never has to poll for one it has already
+    /// seen the effect of:
+    ///
+    /// | event | in the channel by the time… |
+    /// |---|---|
+    /// | `Created` | [`Self::create`] returns |
+    /// | `Updated` | [`Self::update`] returns |
+    /// | `Exited` | [`Self::get`] can report [`PtyStatus::Exited`] |
+    /// | `Deleted` | [`Self::remove`] returns |
+    ///
+    /// The `Exited` row is the one that needed enforcing rather than falling out of
+    /// the code — see [`crate::session`]'s `mark_exited`.
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<PtyEvent> {
         self.inner.events.subscribe()
@@ -482,12 +522,18 @@ impl PtyService {
         Some(session)
     }
 
-    /// Records an exit, then evicts whatever the retention cap displaced.
+    /// Retains an exited session, then evicts whatever the cap displaced.
     ///
-    /// Runs on the exiting session's waiter thread. A session already removed by
-    /// [`Self::remove`] records nothing: its identifier is gone, so retaining it
-    /// would resurrect an entry no lookup could reach.
-    fn handle_exit(&self, id: &PtyId, exit_code: Option<u32>) {
+    /// Runs on the exiting session's waiter thread, after its state lock is released
+    /// — it takes the registry lock, and [`Self::list`] already holds
+    /// registry-then-session, so acquiring it under a session lock would invert the
+    /// order. That is why the exit's *announcement* is a separate phase.
+    ///
+    /// A session removed between the announcement and this call retains nothing: its
+    /// identifier is already gone, so a retention entry would name a session no
+    /// lookup could reach. The event went out either way, which is the difference
+    /// from the bug this shape replaced.
+    fn retain_exit(&self, id: &PtyId) {
         let evicted = {
             let mut registry = self.lock();
             if !registry.sessions.contains_key(id) {
@@ -495,24 +541,15 @@ impl PtyService {
             }
             registry.retention.record_exit(id.clone())
         };
-        self.publish(PtyEvent::Exited {
-            id: id.clone(),
-            exit_code,
-        });
         for stale in evicted {
             tracing::debug!(%stale, "evicting an exited pty session at the retention cap");
             self.take(&stale);
         }
     }
 
-    fn exit_observer(&self) -> ExitObserver {
-        let weak: Weak<ServiceInner> = Arc::downgrade(&self.inner);
-        Arc::new(move |id: &PtyId, exit_code: Option<u32>| {
-            // A dropped service has already killed and cleared everything, so an
-            // exit arriving after it went away has nothing left to record.
-            if let Some(inner) = weak.upgrade() {
-                PtyService { inner }.handle_exit(id, exit_code);
-            }
+    fn exit_observer(&self) -> Arc<dyn ExitObserver> {
+        Arc::new(RegistryExitObserver {
+            inner: Arc::downgrade(&self.inner),
         })
     }
 

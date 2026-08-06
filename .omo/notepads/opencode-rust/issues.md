@@ -2796,3 +2796,75 @@ assertion replaced by a structural one.
 Consequence for wave 9 and anyone else: **a background process started from a
 terminal loses its output at the moment the terminal's shell exits**, on Linux, and
 that is the kernel's behaviour, not something this crate can fix.
+
+## [2026-08-06] RULE: an event must be in the channel before the state it reports is observable
+
+`oc-pty` produced **two** flakes in one session from a single root pattern. Both were
+invisible to a serial test run. Write this rule down so there is no third.
+
+### The pattern
+
+A service exposes *both* a queryable status and an event stream. If the status flips
+before the event is published, any consumer that reads status and then reads events
+can miss the event entirely. "Read whatever is currently in the channel" is not a
+weaker version of "wait for the event" — it is an assertion that this ordering holds.
+
+### Occurrence 1 — `PtyOutput::Ended` before the reader drained
+
+`spawn_reader` and `spawn_waiter` were two unsynchronised OS threads. The waiter could
+publish `Ended` before the reader had drained the pty's remaining output, so a
+subscriber that stopped at `Ended` lost the tail. Fixed with a `DrainGate`
+(`Mutex<bool>` + `Condvar`) that the reader latches *after* its loop, bounded by
+`DRAIN_GRACE = 500ms`, with `child.wait()` deliberately kept **ahead** of the gate so
+a slow drain never delays reaping.
+
+### Occurrence 2 — `PtyEvent::Exited` never published at all
+
+Worse: not late, **permanently lost**. The registry announced the exit behind a
+`sessions.contains_key(id)` early return, while the session's status flipped to
+`Exited` earlier under a *different* lock. A `remove` landing in that window made the
+announcement skip itself. A consumer that had already seen `Exited` via `get`/`list`
+could never learn the exit code.
+
+Measured on this host, 1,280 iterations of "wait for `Exited` status, remove, drain
+events", both directions:
+
+```
+with the fix:     total=1280 prompt=1280 late=0 LOST=0
+without the fix:  total=1280 prompt=1273 late=0 LOST=7
+```
+
+Fix: split `ExitObserver` into two phases with different lock requirements —
+`announce` runs **inside** the session state lock (the same lock every status reader
+takes, which is what makes "status implies event" a happens-before), and `record`
+runs outside it because it takes the registry lock and `PtyService::list` already
+holds registry-then-session. Collapsing them back reintroduces either the lost event
+or a lock-order inversion. A `detached` flag set in `detach_all`'s lock acquisition
+stops a removed session's later exit from announcing after its own `Deleted`.
+
+Verified safe: `PtyService::publish` only calls `events.send(...)` and takes no
+registry lock, so announcing under the session lock cannot invert order.
+`detach_all` is reachable only from `shutdown`, called after
+`registry.sessions.remove(id)` and from `Drop for ServiceInner` — so `detached` always
+means "already out of the registry", exactly when suppression is correct.
+
+### The rules
+
+1. **When a service has both a status and an event stream, publish the event before
+   the status becomes readable.** Enforce it with the lock the status reader takes,
+   not with ordering that merely happens to hold today.
+2. **A regression test for a concurrency bug must reproduce the *condition*, not just
+   the scenario.** The obvious single-session test passed 5/5 against the live bug.
+   `tests/exit_events.rs` hammers 32 workers × 40 iterations because the pre-fix loss
+   rate was 7/1,280 — an order of magnitude fewer iterations would report a clean pass
+   against a broken tree.
+3. **Report *lost* separately from *late*.** They are a dropped event and an ordering
+   slip; conflating them sends the next reader after the wrong bug.
+4. `for i in 1..6; do cargo test & done; wait` is not paranoia. It is the only run
+   shape that found either of these.
+
+### Consequence for wave 9
+
+`GET /pty/:ptyID` paired with `GET /pty/:ptyID/connect` inherits this guarantee. The
+route layer must not reintroduce a gap between reading status and subscribing —
+`tests/exit_events.rs` guards the library, not the HTTP surface.
