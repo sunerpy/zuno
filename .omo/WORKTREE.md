@@ -243,3 +243,43 @@ the board, so it goes last when everything else is already proven.
 
 Gate every merge with `.omo/premerge.sh <n>`; it stops on the three hazard classes
 rather than silently unioning them.
+
+## Wave 10 dispatch record (2026-08-06)
+
+Seven agents live. `main` = 2046 tests at dispatch.
+
+| todo | crate(s) | session |
+|---|---|---|
+| 45 | `oc-mcp` (sole) | `ses_029f65abeffez1G4gpAFDjt3Wm` |
+| 48 | `oc-lsp` (sole) | `ses_029f520bdffeQ6ZaDcCyKnfcFi` |
+| 51 | `oc-server` (sole) | `ses_029f3d33affe3LrNk9oLFL50ey` |
+| 63 | `oc-agent` (sole) | `ses_029f13b25ffeH7P1ZVnBbCrwjV` |
+| 69 | `oc-goal` (sole) | `ses_029ef71a4ffeMcWvqq6AcpXjcD` |
+| 71 | `oc-tools/risk.rs` | `ses_029e991b8ffexjUj6duUpHB6XG` |
+| 100 | `oc-tools/memory.rs` | `ses_029e1e1c2ffefd9B0N0V0qSwag` |
+
+Held back: **70** (`oc-tools/batch.rs`) and **79** (`oc-tools/format.rs` + `oc-agent/plan_file.rs`)
+— `oc-tools` is already at its two-editor cap and `oc-agent` is taken by 63.
+
+Merge order: the five sole-owner crates first (any order, no contention), then 71
+and 100 last since both touch `oc-tools/src/lib.rs`.
+
+### Probes done up front so subagents did not have to
+
+- **`codegraph serve --mcp` speaks real NDJSON.** Drove it by hand with three lines
+  on stdin; got `protocolVersion 2024-11-05`, `serverInfo codegraph 0.42.9`, and a
+  non-empty `tools/list`. Todo 45's live-server acceptance criterion is satisfiable
+  as written, and the handshake bytes are in its prompt.
+- **`rust-analyzer` and `typescript-language-server` are both on PATH** via mise
+  shims, so todo 48's two-live-server criterion is satisfiable. Warned it not to
+  point rust-analyzer at this repo.
+- Extracted the hermes memory description verbatim for todo 100 and jcode's
+  `GateOutcome`/`Justification`/reflect-prompt shape for todo 71, so neither had to
+  paraphrase from memory — the plan explicitly forbids paraphrasing the former.
+
+### Standing instruction added to every prompt this wave
+
+CodeGraph MCP has been uninitialized in **every** worktree for two waves running.
+Prompts now say so up front and tell the agent to fall back to Read/Grep/Glob
+immediately instead of burning turns on it. Same for `context7`, which has been
+quota-exhausted for several siblings.
