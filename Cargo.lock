@@ -2022,6 +2022,17 @@ dependencies = [
 [[package]]
 name = "oc-goal"
 version = "0.1.0"
+dependencies = [
+ "oc-db",
+ "oc-error",
+ "oc-paths",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "uuid",
+]
 
 [[package]]
 name = "oc-llm"
