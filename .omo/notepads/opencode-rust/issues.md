@@ -4262,3 +4262,10 @@ those bodies. Any future scan over "strings in match arms" will hit the same thi
 `app.rs`, `keybind.rs`, `theme.rs` and `attention.rs` have **zero** diff lines. The
 33 theme snapshots were not regenerated. `oc-tui` gained `oc-llm` and `oc-permission`
 as workspace dependencies and **no new third-party crate**.
+
+## [2026-08-07] Task 82: prune boundary and verification caveats
+
+- The plan and later milestone text say twelve related tables, but the locked schema exposes ten. The test pins the actual names and order rather than inventing two tables or adding a migration.
+- Remote unshare cannot be atomic with the SQLite transaction. The safe asymmetry is remote-first: a later local rollback may leave local history after the remote copy is gone, but local history is never silently deleted while a known remote copy survives. `--force` crosses only an unshare failure and emits a pinned warning.
+- Upstream single-session removal cancels background jobs in the service layer. `oc-db` does not depend on todo 66’s job board, so task 82 leaves that coordination to the later service/CLI boundary instead of crossing crate ownership.
+- Integrated `lsp_diagnostics` rejects sibling worktree paths. Diagnostics were run against a temporary byte-for-byte copy inside the main request cwd and were clean for all three changed files; the copy was deleted immediately.

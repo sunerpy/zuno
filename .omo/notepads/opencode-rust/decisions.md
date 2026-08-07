@@ -5208,3 +5208,10 @@ what a test can assert.
 occupy — which the scroll offset and the scrollbar both need. So `wrap()` produces the
 lines already broken, on word boundaries, splitting a run longer than the row (paths
 and URLs are common here and neither breaks on spaces).
+
+## [2026-08-07] Task 82: destructive prune safety boundary
+
+- `PruneRequest::default()` is preview-only. Archive changes only `session.time_archived` and has an explicit inverse; delete requires a separate confirmation bit both at the public entry point and at the caller-owned transaction seam.
+- Every mutation uses `TransactionBehavior::Immediate`. Delete captures its preview in that transaction, performs remote-unshare checks before local statements, deletes the ten related tables in the pinned order, and then performs the global `part` orphan sweep before commit.
+- `RemoteUnshare` is injected. Tests use an in-memory fake and never make a network call; failures refuse local deletion unless force was explicitly supplied.
+- No table, index, or migration was added. The API reports exact per-table rows, logical bytes, aggregate cost, and all five token counters so later CLI/HTTP surfaces can share one loss report.

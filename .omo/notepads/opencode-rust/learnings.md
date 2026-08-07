@@ -4870,3 +4870,11 @@ that family are worth knowing about for the same reason.
 adding a second `space` row would be a conflict `Keymap::from_config` rejects at
 construction. The question prompt matches that action *and* accepts the raw `' '` as
 a fallback for a user who rebound it.
+
+## [2026-08-07] Task 82: preview-first pruning and exact loss accounting
+
+- The live schema has ten session-attributable prune tables, not the plan’s stale count of twelve: `session_context_epoch`, `session_input`, `session_message`, `todo`, `part`, `message`, `session_share`, `session`, `event_sequence`, and `event`.
+- Pruning consumes todo 81’s descendant-closed `RetentionReport.selected` ids directly. Sorting and deduplicating those ids is safe; walking `parent_id` again would create a second, divergent selector.
+- Preview bytes are logical payload bytes (the sum of non-null column lengths), not SQLite page reclamation. This makes preview deterministic and attributable to the selected rows; page-level bytes cannot be assigned reliably inside shared B-trees.
+- `part.session_id` and durable event aggregate ids are not protected by session foreign keys. Exact deletion therefore needs both a final global `part` orphan sweep and explicit cleanup of raw plus `sse:<session_id>` event aggregates.
+- Four mutation proofs were non-vacuous: changing the default to delete, bypassing confirmation, bypassing remote-unshare refusal, and omitting the orphan sweep each failed its dedicated test.
