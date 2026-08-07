@@ -245,12 +245,55 @@ pub enum SessionFormat {
     Json,
 }
 
+/// Which timestamp `session list` orders on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum SessionSortKey {
+    /// `time_updated` — last activity. Upstream's `listGlobal` order.
+    #[default]
+    Updated,
+    /// `time_created`.
+    Created,
+}
+
 #[derive(Debug, Clone, Args)]
 pub struct SessionListArgs {
-    #[arg(short = 'n', long)]
-    pub max_count: Option<u32>,
+    /// List sessions from every project, not just this checkout.
+    #[arg(long, conflicts_with = "project")]
+    pub all_projects: bool,
+    /// List one project, named by its id or its worktree path.
+    #[arg(long, value_name = "PATH|ID")]
+    pub project: Option<String>,
+    /// Include archived sessions alongside the live ones.
+    #[arg(long)]
+    pub archived: bool,
+    /// Only root sessions. This is the default; pass `--no-roots` for children.
+    #[arg(long, overrides_with = "no_roots")]
+    pub roots: bool,
+    /// Include child sessions, which are hidden by default.
+    #[arg(long = "no-roots", overrides_with = "roots")]
+    pub no_roots: bool,
+    /// Order by last activity or by creation time.
+    #[arg(long, value_enum, default_value_t)]
+    pub sort: SessionSortKey,
+    /// Limit to N sessions, most recent first. Defaults to 100.
+    #[arg(short = 'n', long, visible_alias = "max-count")]
+    pub limit: Option<u32>,
+    /// Output format.
     #[arg(long, value_enum, default_value_t)]
     pub format: SessionFormat,
+}
+
+impl SessionListArgs {
+    /// Whether the listing shows root sessions only.
+    ///
+    /// Roots-only is the default because that is what upstream's `session list`
+    /// does — `svc.list({ roots: true, … })` with no way to turn it off
+    /// (`cli/cmd/session.ts:87`). `--roots` therefore names the default rather
+    /// than changing it, and `--no-roots` is the escape hatch upstream lacks.
+    #[must_use]
+    pub fn roots_only(&self) -> bool {
+        self.roots || !self.no_roots
+    }
 }
 
 #[derive(Debug, Clone, Args)]
