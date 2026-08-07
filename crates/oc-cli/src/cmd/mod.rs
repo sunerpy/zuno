@@ -1,5 +1,6 @@
 mod agent;
 mod db;
+mod db_maint;
 mod debug;
 mod mcp;
 mod models;
