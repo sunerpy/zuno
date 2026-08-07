@@ -1089,3 +1089,55 @@ for `w-real`) and its last attempt died 636s in. Instructed to report partial fi
 rather than nothing if it cannot finish.
 
 Session `ses_0223c678bffeW2JyrhgxVE1xzD`.
+
+## Wave 26 (2026-08-07): the sixth seam — a config-only provider cannot start the binary
+
+`main` = 3088 tests, **102/108 done**. Todo 88 has refused **five** times; all five correct,
+and each produced a real feature (104, 105, 106, 107, now 108).
+
+### Round 5's finding, reproduced by me with both binaries
+
+Identical clean environment (`env -i`, empty `XDG_CACHE_HOME`,
+`OPENCODE_DISABLE_MODELS_FETCH=1`), and a config that **fully** specifies
+`provider.test.models.test-model` — cost, limit, `tool_call`, `options.baseURL`:
+
+- **Ours**: dies before any turn with `the model catalog is unavailable: …`
+- **Released 1.18.12**: `opencode models` exits **0**, lists dozens of models, and
+  `grep -c "^test/test-model"` returns **1**
+
+The mechanism is `packages/core/src/models-dev.ts:196-223` — three fallbacks before the
+flag matters: on-disk cache, a **compile-time bundled snapshot** (`OPENCODE_MODELS_DEV`),
+then `return {}` — *an empty catalog, never an error* — with config providers merged over
+the result.
+
+Ours has neither the snapshot nor the empty fallback. `CatalogError::FetchDisabled` fails
+fast, and its own module docs argue for it: *"returning an empty catalog and letting the
+user discover it as 'no models found' three screens later"* is the failure it was written
+to avoid.
+
+**That argument is right for the case it describes and wrong for this one.** Fail-fast is
+correct when the user names a model nobody defined; it is wrong when the config already
+defines the model completely, because there is nothing to look up. Todo 108 splits the two.
+
+### Why five waves of tests never caught it
+
+`crates/oc-cli/tests/tui_turn.rs:120-139` and `tests/tool_turn.rs:133-141` **both inject
+`OPENCODE_MODELS_PATH`**. So every end-to-end seam test handed the product the very thing
+the product should not have needed.
+
+**A fixture that injects the variable the product should not need is a fixture that hides
+the defect.** Removing both injections is part of todo 108's acceptance criteria — the
+tests must prove the product, not the workaround.
+
+Note `oc-testkit/src/env.rs:218` sets the flag deliberately to enforce the
+no-live-provider invariant. That invariant is correct and stays; the product must work
+under it.
+
+### Six seams, one family
+
+`/api/event` 404 · prune's unattributable 4.19 GB · tool execution · the internal agents ·
+legacy migration · config-only providers. Every one a transition nobody owned, every one
+invisible to a green suite. **Two of the last three were first-launch failures for a real
+user**, found only because a perf gate refused to fake a number.
+
+Session `ses_02210d5a7ffeim5kVovHbnxsqE`.
