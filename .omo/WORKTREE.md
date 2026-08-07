@@ -506,7 +506,7 @@ rather than a rewrite.
 | 66 | `oc-agent/continuation.rs` | (below) | yes |
 | 77 | `oc-tui/attention.rs` | (below) | yes |
 | 80 | `oc-db/session_list.rs` + `oc-cli` | (below) | yes |
-| 87 | `oc-testkit/cassettes.rs` | (below) | yes |
+| 87 | `oc-testkit/cassettes.rs` | — | **withdrawn**: `Blocked by: 29,30,31,86` — 86 needs all of 1-85, so 87 is a wave-14 task, not now. Worktree removed. |
 
 59 and 61 share `oc-plugin` (cap 2). 80 touches `oc-db` **and** `oc-cli`; nothing else
 is in either this wave.
