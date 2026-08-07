@@ -867,3 +867,51 @@ Also note what the check bought: without todo 31's four cache-stability mechanis
 refactor would have silently cost a prompt-cache hit on every turn of every session, and
 nothing would have failed. The assertion that fired is the reason the regression is
 visible at all.
+
+## Wave 22 (2026-08-07): the seam is closed, 88 dispatched for the third time
+
+`main` = 3057 tests, **100/105 done**. Todo 105 merged.
+
+### The full arc of one integration gap
+
+Todo 88 refused to run **twice**, and both refusals were correct. It took two new todos
+to make the founding claim measurable at all:
+
+| round | what was missing | closed by |
+|---|---|---|
+| 1 | no `tui` command; `run --auto` refused; `run` dispatched `Vec::new(), Vec::new(), AllowAll`; prompt route `unsupported`; `App::run()` never called; **and `CompletionRequest` had no `tools` field at all** | todo 104 (`e61e01c`) |
+| 2 | the TUI rendered but its prompt submission never started a turn — *"the engine channel exists but nothing sends on it"* | todo 105 (`d0d4c27`) |
+
+Todo 105's result, verified by me: `cmd/turn.rs` is the shared composition root and both
+`run.rs` and `tui.rs` call it; `tests/tui_turn.rs` drives the **real binary** under a real
+PTY and **accepts the frozen `oracle_command` shape**
+(`<program> --pure --prompt <text> --model <id> --auto`), which is precisely what
+`perf/workload.rs:272` issues. So TUI-vs-TUI is now an honest comparison. Disabling
+`host.drive(...)` fails both PTY tests.
+
+### A regression my review caught before it merged
+
+Todo 105's first attempt was interrupted uncommitted, and reviewing the tree I found it
+broke todo 104's tool-turn tests:
+
+```
+append-only cache violation on turn 2: stable history message 1 changed
+```
+
+`oc-llm/src/cache.rs:153` — todo 31's prompt-cache stability check, firing because a
+persisted message mutated in place between turns. The same tests passed on `main`
+(`ok. 3 passed`), so it was the refactor. Localised to turn 2 (the post-tool-result
+continuation) and handed over with the diagnosis; fixed before merge.
+
+**Two things worth keeping from that**: without todo 31's four cache-stability mechanisms
+this refactor would have silently cost a prompt-cache hit on every turn of every session
+and *nothing would have failed* — the assertion that fired is the only reason it was
+visible. And reviewing an uncommitted tree produced the localisation for free, which is
+the same lesson as *a green subagent report is not evidence; the diff and the failing
+output are.*
+
+### The tail is strictly linear from here
+
+`88 → 89 → 90 → 92 → 103 → F1-F4`. I created worktrees for 89/90/92/103, confirmed each
+is blocked by its predecessor, and removed them again — only **88** is dispatchable.
+Session `ses_022ef1a30fferqml6j8kd22kWO`.
