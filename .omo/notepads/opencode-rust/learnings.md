@@ -5297,3 +5297,21 @@ a change in **timing** with no logic difference. What found it was instrumenting
 **Rule**: before asserting a failure is deterministic, run it at least 8 times.
 Before proposing a most-likely cause in a prompt, say how confident it is — a
 subagent that trusts a wrong localisation spends its budget in the wrong file.
+
+## [2026-08-07] Task 88: accepting the command shape is not accepting the frozen workload
+
+Todo 105 proved the real Rust TUI accepts `<program> --pure --prompt … --model …
+--auto` and completes one tool turn with exactly **2 provider requests**. Todo 93's
+runner recognizes a turn only after **3**: one TypeScript-only title/compaction prelude
+plus the two tool-loop requests. Its formula is `(captured - 1) / 2`, so the successful
+Rust turn is deterministically counted as zero.
+
+The same mismatch is sharper for W-real. The frozen driver assumes a restored TS TUI
+discards `--prompt` and therefore types the first turn after 90 seconds. The Rust TUI
+submits `--prompt` for an existing session immediately, so the driver submits a second
+prompt at 90 seconds. A PTY and a working turn seam are necessary but not sufficient;
+the provider response plan and completion predicate are part of an executable workload.
+
+General rule: an end-to-end compatibility test must cover the harness's full protocol,
+not only its argv. “The binary accepts the same invocation” says nothing about whether
+the harness will feed it the same logical operation or recognize completion.

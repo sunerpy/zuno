@@ -4767,9 +4767,98 @@ The inherited tree added `StatusView::{IDLE, WORKING, is_running, mark_running}`
 and the `reset(false)` on turn end, all of it an explicit acceptance criterion, and
 `rg` found no test touching any of it — the only `is_running` assertions in the
 crate are on the unrelated `Transcript::is_running`. Added
+
+## [2026-08-07] Task 88: OPEN — Todo 93 exposes no valid Rust-side G1/G2 runner
+
+Task 105 closed the product seam, but the frozen performance API remains explicitly
+TypeScript-only. `measure_typescript_baseline` is the only public runner; the single-run
+driver, process sampler, database snapshot and timing windows are private. More
+importantly, that private driver hard-codes one TypeScript title/compaction prelude and
+requires 3 captured requests per completed tool turn. The real Rust PTY test proves its
+turn uses exactly 2, which the frozen predicate classifies as zero.
+
+W-real also assumes restored `--prompt` is discarded. Rust submits it immediately and
+the frozen driver types again after 90 seconds. Therefore source-including private
+modules from `memory.rs`, copying process-tree code, or branching the cassette sequence
+there would create a new methodology outside the frozen API. Task 88 correctly fails
+closed with no number.
+
+Required owner: a prerequisite task must either (a) add and freeze a public paired
+runner with explicit logical-turn plans for TS and Rust, or (b) make Rust reproduce the
+TS title/compaction and restored-prompt semantics. It necessarily edits frozen
+`perf/**` or `oc-cli`, which Task 88 is forbidden to touch.
 `views_status_strip_never_reads_idle_while_a_turn_is_under_way`.
 
 **Pattern to watch**: when a task's acceptance criterion names a behaviour and the
 implementing agent adds a *public accessor* for it, check that the accessor is
 actually asserted somewhere. An accessor with no caller is a criterion that was
 made observable and then not observed.
+
+## [2026-08-07] BLOCKER #3 on todo 88, verified: the three internal agents are never invoked
+
+Todo 88 refused for the **third** time. Verified again, and this time the finding is
+larger than the gate: **the frozen harness is right and our port is missing a feature.**
+
+### The mechanism
+
+`crates/oc-testkit/src/perf/workload.rs:18-19`:
+```rust
+const RESPONSES_PER_TURN: usize = 2;
+const PRELUDE_REQUESTS: usize = 1;
+```
+so `completed_tool_turns(captured) = (captured - 1) / 2`. Arithmetic:
+`(2-1)/2 = 0`, `(3-1)/2 = 1`.
+
+Our Rust TUI sends **exactly 2** requests for one tool turn — todo 105's PTY test
+asserts it (`tui_turn.rs:343`, *"the turn did not send a second request, so the tool
+result never went back"*), and the agent reproduced it live:
+`HAPPY_QA submission=Flag pty_requests=2`. So the frozen runner scores our turn as
+**0 completed** and times out.
+
+The obvious reading is that the harness is TS-specific. It is not. Its own doc comment
+(`workload.rs:21-35`) explains what the prelude *is*, measured from real 1.18.12 traffic:
+
+> *"A **new** session's prelude generates the session title, and `--prompt` is submitted
+> for it automatically. A **restored** session's prelude is a compaction summary,
+> because W-real selects the largest session and it overflows the model's context
+> window."*
+
+### The actual gap
+
+Neither of those exists in our port. Measured:
+
+- **No session title is ever generated.** `grep` for a title-generating model request
+  across `oc-engine` and `oc-cli` returns nothing. Every `title` hit is either a *tool
+  output* title (`loop.rs:789`, `:1281`) or a session-title *option* passed in
+  (`turn.rs:97`).
+- **Auto-compaction never fires.** `grep -rn "compaction::|select_boundary|should_compact"
+  crates/oc-engine/src/loop.rs` returns **nothing**. `oc-engine::compaction` is
+  referenced only by `oc-agent`'s roster/policy metadata and its own module — never by
+  the turn loop.
+- **`INTERNAL_NAMES = ["compaction", "title", "summary"]`** (`builtin.rs:478`) is
+  referenced only by its own tests.
+
+And todo 63 predicted this in its own doc comment (`builtin.rs:858-860`): the three
+internals are *"`hidden: true`, take a … and dropping any of them silently removes
+auto-compaction, session titles, …"*. They were declared, tested as data, and never
+invoked.
+
+### So this is the fourth instance of one structural failure
+
+1. Wave 11 — `/event` served, `/api/event` 404, because two tasks each tested their own half.
+2. Wave 17 — `session prune` proposed deleting 4.19 GB because a reference count could not see the sessions.
+3. Wave 20/21 — the agent could not use a tool: registry and runner built separately, and `CompletionRequest` had no `tools` field at all.
+4. **Now** — the three internal agents exist as roster data with 21 passing tests and are never called, so titles, auto-compaction and summaries are silently absent.
+
+Every one is a **seam**, and every one was invisible to a green suite. Todo 62 remains
+the only seam in this plan that had a dedicated owner, and the only one right first time.
+
+### What must NOT happen
+
+Do **not** "fix" this by editing `PRELUDE_REQUESTS`, by making the harness
+subject-aware, or by bumping the methodology hash. The constant is not wrong. Changing
+it would make G1/G2 measure a Rust binary doing strictly less work than the TS binary it
+is compared against — a massaged pass, and the exact thing three agents refused to
+produce.
+
+The fix is **todo 106**: wire the internal agents. It is owed on parity grounds alone.

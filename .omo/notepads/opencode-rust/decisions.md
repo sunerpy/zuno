@@ -5700,3 +5700,17 @@ Deliberately NOT done: reproducing the harness's 0x0 pty. Our test sets
 `stty rows 40 cols 120` so the reply-on-screen assertion is meaningful; the harness
 keeps 0x0 because the oracle baseline was measured through 0x0 and the comparison
 must stay apples-to-apples. `perf/**` and `docs/perf-methodology.md` untouched.
+
+## [2026-08-07] Task 88: do not source-include or copy the private TS workload into the gate
+
+The topology decision remains release TUI-vs-TUI. The new blocker is not a reason to
+fall back to headless `run` or debug Rust. It is also not permission to compile
+`perf/workload.rs` a second time through `#[path]` from `memory.rs`, copy its private
+process sampler, or silently omit its prelude: each would produce an unreviewed runner
+outside the public frozen API while claiming to execute the frozen one.
+
+Decision: report G1/G2 as fail-closed and unmeasurable, preserve the committed TS
+medians and W-real provenance, and create no code or commit. Resume only after the
+runner has one public paired entry point whose per-subject request plan still means one
+logical cassette-backed tool turn, with the existing five-run AB/BA schedule and
+process-tree/timing rules frozen around it.
