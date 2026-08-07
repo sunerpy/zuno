@@ -783,3 +783,57 @@ got a dedicated todo, and it is the only one that was right first time.
 | 91 | `.github/` + `Makefile` + packaging | (dispatching) |
 
 Remaining after: **89, 90, 92, 103** = 4, then F1-F4.
+
+## Wave 21 (2026-08-07): the seam, second half
+
+`main` = 3045 tests, 99/103 done (104 and 105 added mid-flight; the plan is now 105 items).
+
+### Todo 88 was blocked twice, and refused twice. Both refusals were correct.
+
+Round one found five gaps; todo 104 closed them and also found a sixth nobody had
+spotted (`CompletionRequest` had no `tools` field at all). Round two found the
+**remaining half**, and I verified it in the code:
+
+`crates/oc-cli/src/cmd/tui.rs:19-25` says so itself —
+> *"Submitting a prompt does not start a turn. The turn driver needs a session, a
+> provider registry and a database resolved on the TUI's own thread … the engine
+> channel exists but nothing sends on it. `run` is the surface that executes a turn
+> today."*
+
+Why that blocks the founding claim: the frozen harness measures the **TUI**.
+`perf/workload.rs:114-123` launches the subject under `script -qefc` in a real PTY, and
+`oracle_command` at `:272` builds `<program> --pure --prompt '…' --model test/test-model
+--auto`. So our `tui` renders but cannot execute; our `run` executes but is headless.
+**Measuring `run` against a TUI baseline would be a massaged pass** — which is exactly
+why two agents declined, and they were right both times.
+
+Todo 105 dispatched to close it: extract `run`'s composition root, drive it from the
+TUI's prompt submission, wire the real permission prompt instead of `HeadlessApproval`,
+stop the status strip lying, and prove it with a PTY test issuing the frozen
+`oracle_command` shape against our own binary.
+
+**Session**: `ses_02366f3b7ffexced6AiZghCo5w`.
+
+### Todo 91 merged, and its OpenSSL assertion is honestly designed
+
+Six-target matrix (`x86_64`/`aarch64` musl via `cargo zigbuild`; four native
+macOS/Windows legs), `Makefile` with `ci: metadata fmt-check lint test deny`,
+`deny.toml`, and **21 tests** in `crates/oc-cli/tests/release_surface.rs`.
+
+`make ci` passes locally: *"advisories ok, bans ok, licenses ok, sources ok"* then
+*"OK metadata + fmt + clippy + tests + cargo-deny"*.
+
+Worth recording: I tried to mutation-test the no-OpenSSL assertion by adding a real
+`openssl` dependency, and **it cannot build in this environment at all** —
+`openssl-sys` fails with *"Could not find directory of OpenSSL installation"*. The
+agent had anticipated exactly this and self-tests the matcher against **synthetic
+graph lines** (`the_package_matcher_catches_a_real_openssl_entry` feeds
+`openssl v0.10.68`, `openssl-sys`, `native-tls`, `openssl-src` and asserts one hit
+each, plus a prefix-confusion negative). That is the right design: the assertion
+mechanism is proven without needing a dependency the host cannot compile.
+
+### Running tally of plan counts contradicted by the source: six
+
+61→58 `/api` ops · 20→21 plugin hooks · 19→23 CLI commands · 184 keybind calls vs 164
+named · 12→10 prune tables · "seven divergences" is seven declared but at least
+thirteen real. Every prompt now tells the agent to verify inherited numbers.
