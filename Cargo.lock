@@ -2444,6 +2444,7 @@ dependencies = [
  "oc-plugin-sdk",
  "oc-testkit",
  "oc-tool",
+ "oc-tools",
  "serde",
  "serde_json",
  "tempfile",

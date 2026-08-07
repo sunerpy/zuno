@@ -440,6 +440,154 @@ function legacyPlugins(mod) {
 }
 
 // ---------------------------------------------------------------------------
+// Config-directory tools
+// ---------------------------------------------------------------------------
+
+function isZodType(value) {
+  return isRecord(value) && "_zod" in value;
+}
+
+function isPluginTool(value) {
+  return (
+    isRecord(value) &&
+    "args" in value &&
+    "description" in value &&
+    "execute" in value
+  );
+}
+
+function isJsonSchemaDefinition(value) {
+  return (
+    typeof value === "boolean" ||
+    (isRecord(value) && !Array.isArray(value))
+  );
+}
+
+function legacyJsonSchema(entries) {
+  const properties = Object.fromEntries(
+    entries.filter((entry) => isJsonSchemaDefinition(entry[1])),
+  );
+  return {
+    type: "object",
+    properties,
+    required: Object.keys(properties),
+  };
+}
+
+async function loadZod(entry) {
+  const require = createRequire(pathToFileURL(entry));
+  let target;
+  try {
+    target = require.resolve("zod");
+  } catch (error) {
+    throw new Error(
+      `config tool ${entry} uses Zod arguments, but its install tree has no resolvable zod package: ${error?.message ?? String(error)}`,
+    );
+  }
+  const mod = await import(pathToFileURL(target).href);
+  const z = mod.z ?? mod.default ?? mod;
+  if (typeof z.object !== "function" || typeof z.toJSONSchema !== "function") {
+    throw new Error(`config tool ${entry} resolved an incompatible zod package at ${target}`);
+  }
+  return z;
+}
+
+function zodMetadataRegistry(z, schema) {
+  const registry = z.registry();
+  const seen = new WeakSet();
+  const collect = (value) => {
+    if (!isRecord(value) || seen.has(value)) return;
+    seen.add(value);
+    if (isZodType(value)) {
+      const metadata = typeof value.meta === "function" ? value.meta() : undefined;
+      const description =
+        typeof value.description === "string" ? value.description : undefined;
+      const merged = {
+        ...(isRecord(metadata) ? metadata : {}),
+        ...(description ? { description } : {}),
+      };
+      if (Object.keys(merged).length) registry.add(value, merged);
+      collect(value._zod.def);
+      return;
+    }
+    for (const item of Object.values(value)) collect(item);
+  };
+  collect(schema);
+  return registry;
+}
+
+function normalizeZodJsonSchema(value) {
+  if (Array.isArray(value)) return value.map(normalizeZodJsonSchema);
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key, item]) =>
+        (key === "exclusiveMaximum" || key === "exclusiveMinimum") &&
+        typeof item === "boolean"
+          ? false
+          : true,
+      )
+      .map(([key, item]) => [key, normalizeZodJsonSchema(item)]),
+  );
+}
+
+function zodJsonSchema(z, schema) {
+  const result = normalizeZodJsonSchema(
+    z.toJSONSchema(schema, {
+      io: "input",
+      metadata: zodMetadataRegistry(z, schema),
+    }),
+  );
+  if (!isRecord(result)) {
+    throw new Error("plugin tool Zod schema produced a non-object JSON Schema");
+  }
+  const { $defs, ...rest } = result;
+  return isRecord($defs) ? { ...rest, definitions: $defs } : rest;
+}
+
+async function describeConfigTools(mod, entry) {
+  const tools = [];
+  for (const [exportID, definition] of Object.entries(mod)) {
+    if (!isPluginTool(definition)) continue;
+    const args = definition.args ?? {};
+    const entries = Object.entries(args);
+    const allZod = entries.every((entry) => isZodType(entry[1]));
+    let parameters;
+    let validate = (value) => value;
+    if (allZod) {
+      const z = await loadZod(entry);
+      const schema = z.object(args);
+      parameters = zodJsonSchema(z, schema);
+      validate = (value) => {
+        const parsed = schema.safeParse(value);
+        if (parsed.success) return parsed.data;
+        const error = new Error(parsed.error.message);
+        error.ocToolErrorKind = "invalid_args";
+        throw error;
+      };
+    } else {
+      parameters = legacyJsonSchema(entries);
+    }
+    const execute = async (value, context) => {
+      if (typeof definition.execute !== "function") {
+        throw new TypeError(`config tool export ${exportID} has a non-function execute member`);
+      }
+      return definition.execute(validate(value), context);
+    };
+    tools.push({
+      export: exportID,
+      description:
+        typeof definition.description === "string"
+          ? definition.description
+          : String(definition.description ?? ""),
+      parameters,
+      execute: encode(execute),
+    });
+  }
+  return tools;
+}
+
+// ---------------------------------------------------------------------------
 // Hook table
 // ---------------------------------------------------------------------------
 
@@ -551,6 +699,24 @@ async function handleRequest(frame) {
       if (initialized) throw new Error("init was already performed");
       initialized = true;
       await patchReadline();
+      if (params.kind === "config-tool") {
+        const href = pathToFileURL(params.entry).href;
+        const mod = await import(href);
+        if (!mod) throw new Error(`Config tool ${params.entry} module is empty`);
+        respond(id, {
+          id: null,
+          exports: Object.keys(mod),
+          sdk: null,
+          runtime: typeof Bun === "undefined" ? "node" : "bun",
+          workspace: [],
+          hooks: [],
+          auth: [],
+          provider: [],
+          callbacks: {},
+          tools: await describeConfigTools(mod, params.entry),
+        });
+        return;
+      }
       const { input, sdkFrom } = await buildInput(params);
       const href = pathToFileURL(params.entry).href;
       const mod = await import(href);
@@ -587,6 +753,71 @@ async function handleRequest(frame) {
       const args = (params.args ?? []).map(decodeArgument);
       const value = await fn(...args);
       respond(id, { value: encode(value), args: encode(args) });
+      return;
+    }
+    case "tool.call": {
+      const fn = handles.get(params.handle);
+      if (!fn) throw new Error(`handle ${params.handle} is no longer retained`);
+      const reported = { title: "", metadata: {} };
+      const controller = new AbortController();
+      if (params.context?.aborted) controller.abort();
+      const context = {
+        sessionID: String(params.context?.sessionID ?? ""),
+        messageID: String(params.context?.messageID ?? ""),
+        agent: String(params.context?.agent ?? ""),
+        directory: String(params.context?.directory ?? ""),
+        worktree: String(params.context?.worktree ?? ""),
+        abort: controller.signal,
+        metadata(input) {
+          if (!isRecord(input)) return;
+          if (typeof input.title === "string") reported.title = input.title;
+          if (isRecord(input.metadata)) Object.assign(reported.metadata, input.metadata);
+        },
+        ask(input) {
+          return request("tool.ask", {
+            context: params.contextID,
+            input: isRecord(input) ? input : {},
+          });
+        },
+      };
+      try {
+        const value = await fn(params.args ?? {}, context);
+        if (typeof value === "string") {
+          respond(id, {
+            result: {
+              title: reported.title,
+              output: value,
+              metadata: reported.metadata,
+              attachments: [],
+            },
+          });
+          return;
+        }
+        if (!isRecord(value)) {
+          throw new TypeError("config tool returned neither a string nor a result object");
+        }
+        respond(id, {
+          result: {
+            title: typeof value.title === "string" ? value.title : reported.title,
+            output: typeof value.output === "string" ? value.output : String(value.output ?? ""),
+            metadata: {
+              ...reported.metadata,
+              ...(isRecord(value.metadata) ? value.metadata : {}),
+            },
+            attachments: Array.isArray(value.attachments) ? value.attachments : [],
+          },
+        });
+      } catch (error) {
+        respond(id, {
+          error: {
+            kind:
+              error?.ocToolErrorKind === "invalid_args"
+                ? "invalid_args"
+                : "failed",
+            message: error?.message ?? String(error),
+          },
+        });
+      }
       return;
     }
     case "release": {
