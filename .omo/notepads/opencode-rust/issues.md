@@ -4176,3 +4176,89 @@ both package test matrices also passed.
 - `/api/session/active` is process-local evidence. An empty response from a reachable server means no IDs reported active by that process; it must not trigger the recency fallback. No reachable server is the distinct state that activates the fallback.
 - Filtering protected rows after subtree expansion is unsafe: it strands a selected parent. The selector instead rejects an age-eligible root when any descendant is protected and records `ProtectedDescendant` evidence for preview.
 - Proptest writes `tests/retention.proptest-regressions` on an intentional mutation failure; remove that generated mutation artifact after restoring the implementation.
+
+## [2026-08-07] Task 76: one partial capability, three seams left open, and five plan-vs-source facts
+
+### The one capability that did NOT fully land: a real `$EDITOR` / clipboard implementation
+
+Item 10 of the plan's ten is **PARTIAL**. What ships:
+
+- `ExternalEditor` and `Clipboard` traits, with `ScriptedEditor` and
+  `MemoryClipboard` as working implementations (not `#[cfg(test)]` — the CLI's
+  no-editor mode and the ACP host both need an editor that answers without a
+  terminal);
+- every pure part, fully tested: `editor_spec()` (VISUAL before EDITOR, blank treated
+  as absent), `invocation()` (splits `EDITOR="code --wait"`), `copy_command()` (all
+  five oracle arms + the not-installed fallthrough), `image_read_command()` (the two
+  arms expressible as a command), `osc52()` with tmux wrapping, `is_multiplexed()`,
+  `base64()` against RFC 4648's vectors, `EditorRequest::lease_reason()`.
+
+What does **not** ship: any implementation of either trait that spawns a process.
+
+Reason, stated rather than hidden: the prompt forbids a subprocess or a clipboard
+access in any test, so a real implementation would ship **untested** — and the two
+paths it would exercise (a child that owns stdin, and a program that may not exist)
+are exactly the ones that fail in the field. The pure logic is where the bugs are and
+it is covered. A follow-up landing `CrosstermEditor`/`SystemClipboard` needs an
+integration test gated on an env var, or a fake `PATH` with shell stubs.
+
+### Seams a later todo has to connect
+
+1. **Nothing constructs the session screen.** `views_tests.rs` has a `SessionRoot`
+   that wires `TranscriptView` + `InputEditor` + `DialogHost` + `KeyDispatcher`
+   together and asserts they compose, but it is a test fixture. The real screen —
+   which decides layout, focus, scope chains, and which `DialogOutcome` goes where —
+   belongs to whoever owns the TUI entry point (todo 86).
+
+2. **`DialogOutcome` is drained, never routed.** `DialogHost::drain_outcomes()`
+   returns `(dialog_id, outcome)` pairs and nothing consumes them. A
+   `PermissionDecision` has `into_reply()` for `oc_permission::PermissionReply`, but
+   the wiring to `PermissionEngine::reply` is the server/engine layer's, not a view's.
+
+3. **Autocomplete's file and agent sources are `StaticSource` only.**
+   `CompletionSource` is the seam; a real file walk (respecting ignore rules, which
+   `oc-search` already knows how to do) and a real agent list from `oc-agent` are a
+   later edge. `StaticSource` is a full implementation for slash commands, which are
+   a fixed list.
+
+4. **The transcript has no persistence.** It folds live `TurnEvent`s. Rehydrating a
+   session from `oc-db`'s `MessageWithParts` is a separate mapping, and the fold's
+   `Message`/`MessagePart` shape was designed to be the target of it.
+
+### Five plan-vs-source facts worth recording
+
+a) **`help_show` ships UNBOUND** — `keybind.rs:1024-1030`, `keys: "none"`. Reachable
+   only through the command palette. A test asserting resolved keys against it failed
+   and had to be retargeted to `session_interrupt`. Anyone writing a "the default
+   binding for X" test should check `keys` first.
+
+b) **The default scroll speed is 3, not 1** (`util/scroll.ts:26`). A one-line-per-notch
+   TUI feels broken and nothing in the config schema hints at the real default.
+
+c) **The split-diff threshold is exclusive**: `width > 120`, so exactly 120 columns is
+   unified. Tested at both 120 and 121.
+
+d) **`space` has exactly one row in the 184-entry table** (`dialog.mcp.toggle`). A
+   multi-select dialog must claim that row; adding a second `space` row is a conflict
+   `Keymap::from_config` rejects at construction. Anyone adding a dialog with a toggle
+   needs to know this before designing its keys.
+
+e) **`Dialog::desired_height` needed a second parameter.** With only `available`, every
+   dialog rendered full-height and hid the transcript it was asking about. It now takes
+   `(content_rows, available)`; the host passes the count from its own `lines()` call
+   because `lines()` takes `&mut self` and a size query must not mutate.
+
+### A guard-scan trap for the next person who writes one
+
+The "every action name a view matches on exists in the table" scan initially reported
+ten false positives — `"bash" =>`, `"glob" =>`, `"read" =>` from `message.rs`'s
+tool-icon table and `"edit" =>` from `permission.rs`'s describe(). A tool name and an
+action name are both snake_case strings in a match arm and are not distinguishable by
+shape. Fix: track brace depth from `fn handle_action` and only inspect arms inside
+those bodies. Any future scan over "strings in match arms" will hit the same thing.
+
+### Not a defect, but worth knowing
+
+`app.rs`, `keybind.rs`, `theme.rs` and `attention.rs` have **zero** diff lines. The
+33 theme snapshots were not regenerated. `oc-tui` gained `oc-llm` and `oc-permission`
+as workspace dependencies and **no new third-party crate**.

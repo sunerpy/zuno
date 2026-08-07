@@ -5086,3 +5086,125 @@ feature and Unix PID controls. The real tests run only with both capabilities.
 - `oc-db::retention::select` is read-only and returns a preview-oriented report: selected rows with inclusion reasons plus age-eligible exclusions with direct or descendant protection reasons. It emits no `DELETE`; mutation remains a later service concern.
 - Scope is explicit (`CurrentProject`, named `Project`, or `AllProjects`), `time_updated` is the default age key, `time_created` is opt-in, and age uses a strict `< cutoff` boundary. `time_archived` is intentionally absent from protection.
 - Public `LivenessProbe` makes server discovery fakeable without coupling `oc-db` to HTTP. The process edge may aggregate reachable local servers into `Liveness::Reachable`; `Liveness::Unreachable` preserves the honest uncertainty boundary.
+
+## [2026-08-07] Task 76: the dialog's non-blocking shape, the external seams, and the view module layout
+
+### A dialog is state in the component tree. It cannot await, by construction.
+
+`Dialog` is deliberately **not** a `Component`. It has `handle_action(action, event)
+-> DialogStep`, where `DialogStep` is `Ignored | Redraw | Resolved(DialogOutcome)`,
+and `DialogHost` owns a stack of them. Making a dialog a `Component` would let it be
+mounted directly into the tree, where nothing would enforce the contract; making the
+answer a return value rather than a callback means there is no place a reply *could*
+be awaited from. Outcomes accumulate in a queue that a consumer drains — a callback
+would run inside `handle_event`, which is precisely the frame that must not block.
+
+Why this is architecture and not style: `App::run` is the single consumer of terminal
+input, engine events, **and** the terminal-lease wake notification. A dialog that
+awaited inside `handle_event` stops all three, and the lease the plugin host takes for
+an OAuth prompt (todos 60/97) can then neither be granted nor reclaimed, because
+reclaim needs the render lock that frame is holding. That is a deadlock, not a stall.
+
+`DialogHost::handle_event` forwards **every non-key event to the base
+unconditionally**. One line, and it is the whole property the acceptance test asserts.
+Mutating it to `_ if self.is_open() => EventResult::REDRAW` — i.e. making the host
+modal — fails three tests, one of them by tokio timeout.
+
+**An action a dialog does not understand is NOT forwarded to the base.** A modal owns
+the keyboard; forwarding would let `session_new` fire while a permission prompt is up.
+So `DialogStep::Ignored` returns `handled: true, redraw: false`.
+
+### Escape resolves a permission prompt to `reject`, never to the highlighted option
+
+The highlighted option is `Allow once`. A prompt dismissed by a mis-keyed escape must
+not have granted anything, so `app_exit` maps to `Reject` unconditionally. Cancelling
+the *escalation* (the "always allow" confirmation) is different: it returns to the
+choice rather than resolving, because the user has not decided yet.
+
+### `$EDITOR` and the clipboard are traits, and the editor path takes todo 97's lease
+
+`ExternalEditor` and `Clipboard` are traits with `ScriptedEditor` / `MemoryClipboard`
+doubles — the same shape todo 73 used for `TerminalLifecycle`, for the same reason: a
+real `$EDITOR` blocks on a human and a real clipboard read depends on which of
+`wl-paste`/`xclip`/`pbpaste` happens to exist on the CI machine.
+
+Upstream wraps the child in `renderer.suspend()`/`resume()` (`editor.ts:32-53`). This
+crate already has the right mechanism — todo 97's `TerminalBroker` driven by todo 73's
+`TerminalLeaseOwner` — so `EditorRequest::lease_reason()` returns
+`LeaseReason::new("tui", "external editor")` and the **caller acquires a lease**. Two
+suspend mechanisms in one process is how you get a deadlock against a plugin prompt;
+`LeaseReason::plugin` names the culprit in a forced-reclaim diagnostic, and for this
+path the culprit is the TUI, so it says so instead of borrowing a plugin's name.
+
+**No process-spawning implementation ships.** The prompt forbids a subprocess or a
+clipboard access in any test, so a real implementation would ship untested. What does
+ship is every *pure* part — `invocation()`, `editor_spec()`, `copy_command()`,
+`image_read_command()`, `osc52()`, `base64()` — which is where the bugs live. Recorded
+in issues.md as the one partial item.
+
+### `base64` is hand-rolled rather than a new dependency
+
+Twenty lines, tested against RFC 4648 §10's seven vectors. Adding an encoder crate to
+the render stack for one OSC 52 sequence is a poor trade, and the root manifest pins
+dev/test `opt-level` per package — a new package means a new pin to justify.
+
+### OSC 52 is written even when a native tool exists
+
+`clipboard.ts:120-124` does both. Over SSH the native tool copies into the *remote*
+machine's clipboard, which is not where the user is looking. The tmux/screen wrapper
+is part of it, because those multiplexers swallow an unwrapped sequence.
+
+### `ViewContext` carries the palette AND the config, as one value
+
+Not a palette argument threaded through every `render`. The two travel together: a
+view that paints also needs the user's diff/scroll/size preferences, and both are
+immutable for the life of a frame. It also gives the palette-discipline scan a single
+thing to look for — "does this module mention `ViewContext`" is the complement of "does
+it name a colour", and a view that paints nothing fails the first check.
+
+`diff_columns(width)` lives on the context rather than in `diff.rs` so the permission
+prompt and a standalone diff viewer cannot disagree about the `diff_style` fork.
+
+### Twelve modules, one concern each, `#[path]` test files beside them
+
+`views.rs` + `views/{message,dialog,permission,question,editor,diff,autocomplete,
+picker,help,scroll,external}.rs`, each with a sibling `*_tests.rs` via
+`#[cfg(test)] #[path = "…"] mod tests;` — the layout `app.rs`/`keybind.rs`/`theme.rs`
+already use. Plus `views/views_tests.rs` for the cross-module guards and the
+composition tests, which is where an assertion that spans two views belongs.
+
+**One `SelectDialog` with four constructors, not four picker components.** Upstream
+ships `dialog-session-list.tsx`, `dialog-model.tsx`, `dialog-agent.tsx` and
+`dialog-theme-list.tsx` over one shared `ui/dialog-select.tsx`. The shared part *is*
+the behaviour; four copies of the paging arithmetic is four places for it to be wrong.
+The theme picker's preview is a closure, which is also how it reuses todo 75's
+resolved palettes — resolved once at construction, because resolution walks colour
+references and a picker redraws on every keystroke.
+
+**The model picker's value is `provider/model`, never a bare model id.** A bare id is
+exactly the unqualified form `oc-agent/src/model_policy.rs` treats as unavailable.
+
+### Help is generated from the live `Keymap`, and lists unbound actions
+
+A hand-written help text is wrong the moment a user rebinds anything, and wrong
+*silently*. Grouping is by the table's `scope` column, because scope is not a category
+label — it is the condition under which the key resolves at all, so it answers the
+question a user actually has ("what can I press *here*"). An unbound action still gets
+a row reading `(unbound)`: a user who unbound something needs to see it exists, or
+they conclude the feature is gone.
+
+### Autocomplete ranking is a documented rule, not a Fuse.js reimplementation
+
+Upstream uses Fuse with `threshold: 0.5` for `@` and `0` for `/`. Fuse's score is not
+derivable from its configuration, so `score()` is prefix (1000) > word-boundary (500)
+> substring (250) > scattered subsequence (10), ties broken by the source's own order
+via a stable sort. The `/` exactness is preserved as "must score ≥ 500", so a
+half-typed slash command cannot match by scattered letters. Deterministic, which is
+what a test can assert.
+
+### The transcript wraps text itself instead of letting ratatui do it
+
+`Paragraph::wrap` would work, but then the transcript cannot *count* the rows it will
+occupy — which the scroll offset and the scrollbar both need. So `wrap()` produces the
+lines already broken, on word boundaries, splitting a run longer than the row (paths
+and URLs are common here and neither breaks on spaces).

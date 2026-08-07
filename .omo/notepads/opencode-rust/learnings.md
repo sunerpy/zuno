@@ -4802,3 +4802,71 @@ hidden predicate in the store.
 - Protection is evaluated over the entire candidate subtree. A shared, compacting, active, or no-server-recent descendant vetoes its ancestor candidate; otherwise retaining that descendant while selecting the ancestor would violate closure.
 - Liveness is an injected probe result, not a database inference. Reachable `/api/session/active` responses protect reported IDs; only `Unreachable` activates the default one-hour `time_updated` fallback.
 - Mutation proof was non-vacuous: replacing descendant traversal with the root alone shrank to a two-node tree (`[(0,false),(0,false)]`) and selected 1 of 2 rows.
+
+## [2026-08-07] Task 76: the view layer's capability inventory, and how incremental streaming is asserted off-screen
+
+**The 204-file reference is a capability inventory, and treating it as one made the
+todo finishable.** All ten plan items landed except a process-spawning
+`$EDITOR`/clipboard implementation, in 10,633 lines across 12 modules — against
+31,729 upstream lines. What was ported *exactly* is the short list of things that are
+contracts rather than chrome, each cited in its module header:
+
+- the three permission replies (`oc_permission::ReplyKind`, not invented here);
+- the `diff_style` fork, `permission.tsx:38-42` — `stacked` always wins, `auto`
+  splits only at `width > 120` (**exclusive**; 120 columns is unified);
+- the scroll precedence, `util/scroll.ts:18-27` — acceleration beats `scroll_speed`,
+  and the default is a **constant 3** lines per notch, not 1;
+- `MacOSScrollAccel`'s curve `1 + 0.8·(e^(v/3) − 1)` capped at 6, with its two
+  guards: a >150 ms gap resets the streak, and a <6 ms gap returns 1 *without
+  recording* (some terminals emit several events per physical notch, and recording
+  them accelerates one notch straight to the cap);
+- the nine per-tool icons and their "Writing command…"-style placeholders;
+- `normalizePromptContent` (`editor.ts:12-24`) — a **single**-line paste loses its
+  trailing newline, a multi-line paste keeps it;
+- the clipboard ladder `copy_command` (`clipboard.ts:75-91`), Wayland before X11,
+  `xclip` before `xsel`.
+
+**Incremental streaming is asserted as prefix growth between frames, not as a final
+state.** Draw, feed one `TextDelta`, draw again — then assert (a) each delta returned
+`redraw: true`, (b) frame N contains its own delta and *not* the next one, and (c)
+every frame's whitespace-stripped text is a **prefix** of the following frame's. (c)
+is the part that distinguishes "rendered incrementally" from "re-rendered from
+scratch each time and happens to end up right". It only works because the transcript
+is a *fold* over `TurnEvent` with rendering as a pure function of the fold — an
+implementation that rendered from a provider stream directly could not be stepped.
+
+**`StreamEvent::RetryRollback` is a rendering correctness requirement, not an
+optimisation.** Its doc comment says consumers must discard the interrupted attempt.
+A transcript that appends instead shows the model's answer twice. One test.
+
+**A dialog that renders full-height hides the thing it is asking about.**
+`Dialog::desired_height` first took only `available`, so every dialog covered the
+transcript and the "renders over a live base" test failed. It now takes
+`(content_rows, available)` — the host passes the row count the dialog's own
+`lines()` call produced, because `lines()` takes `&mut self` and a size query must
+not be able to mutate. The permission prompt then caps itself at 15
+(`permission.tsx:626`), which is what keeps the prompt *decidable*: the user can see
+the command scrolling past behind it.
+
+**Four directory-scanning guards, each with a floor, and three of them mutation-proven.**
+`views_tests.rs` scans the 12 view sources for: a literal colour (20 spellings incl.
+`Rgba::opaque`), a raw key (15 `KeyCode`/`KeyModifiers` spellings), and an action name
+absent from the shipped table. Floors: ≥12 files, ≥40 action names checked. The
+action-name scan had to be restricted to match arms **inside `fn handle_action`
+bodies** (brace-depth tracked) because a tool name and an action name are both
+snake_case strings in a match arm — a whole-file scan reported `"bash" =>` from the
+tool-icon table as an unknown action. A fifth test is the complement of the colour
+scan: every painting module must actually *read* `ViewContext`, because a view that
+paints nothing also has no literals.
+
+**`help_show` ships unbound.** `keybind.ts` gives it `keys: "none"`, so it is
+reachable only through the command palette. A help test asserting "the keys the
+keymap resolved" against it failed; it had to be retargeted to `session_interrupt`,
+and the unbound-by-default fact is now pinned by its own test. Two other actions in
+that family are worth knowing about for the same reason.
+
+**`space` is a scarce key inside a dialog.** The binding table has exactly one
+`space` row — `dialog.mcp.toggle` — so a multi-select question has to claim it;
+adding a second `space` row would be a conflict `Keymap::from_config` rejects at
+construction. The question prompt matches that action *and* accepts the raw `' '` as
+a fallback for a user who rebound it.
