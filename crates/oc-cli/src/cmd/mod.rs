@@ -7,6 +7,7 @@ mod providers;
 mod run;
 mod serve;
 mod session;
+mod session_list;
 
 use crate::{
     CommandDispatcher, DispatchArguments, DispatchError, DispatchRequest, PendingCommandDispatcher,

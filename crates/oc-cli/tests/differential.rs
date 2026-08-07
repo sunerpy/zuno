@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
+use std::io::{BufRead as _, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 const ORACLE: &str = "/config/.local/share/mise/installs/opencode/1.18.12/opencode";
 
@@ -58,6 +60,31 @@ fn long_flags(output: &[u8]) -> BTreeSet<String> {
         .collect()
 }
 
+/// Long options this port adds beyond the oracle's, per command.
+///
+/// The surface check below is an **equality**, so an addition has to be declared
+/// here or the test fails. That is the point: equality catches a dropped upstream
+/// flag *and* a flag that appeared without anyone deciding to add it, which a
+/// one-directional superset check would wave through.
+///
+/// `session list` is the one entry. Upstream's listing cannot leave the current
+/// project (`session/session.ts:548-555` injects the id unconditionally), so
+/// every flag that makes a cross-project listing expressible is necessarily
+/// absent from its help. `--limit` carries upstream's `--max-count` as a visible
+/// alias, so both names appear and the upstream spelling still works.
+const ADDED_LONG_FLAGS: &[(&[&str], &[&str])] = &[(
+    &["session", "list"],
+    &[
+        "all-projects",
+        "project",
+        "archived",
+        "roots",
+        "no-roots",
+        "sort",
+        "limit",
+    ],
+)];
+
 fn assert_help_flags(args: &[&str]) {
     let root = tempfile::tempdir().expect("tempdir");
     let mut oracle_args = args.to_vec();
@@ -76,14 +103,54 @@ fn assert_help_flags(args: &[&str]) {
         "Rust help failed: {}",
         String::from_utf8_lossy(&actual.stderr)
     );
+
+    let mut expected = long_flags(&oracle_help);
+    let added: BTreeSet<String> = ADDED_LONG_FLAGS
+        .iter()
+        .find(|(command, _)| *command == args)
+        .map(|(_, flags)| flags.iter().map(|flag| (*flag).to_owned()).collect())
+        .unwrap_or_default();
+    expected.extend(added.iter().cloned());
+
     assert_eq!(
         long_flags(&actual_help),
-        long_flags(&oracle_help),
-        "long-option mismatch for {}\nRust:\n{}\nOracle:\n{}",
+        expected,
+        "long-option mismatch for {}\ndeclared additions: {added:?}\nRust:\n{}\nOracle:\n{}",
         args.join(" "),
         String::from_utf8_lossy(&actual_help),
         String::from_utf8_lossy(&oracle_help),
     );
+}
+
+#[test]
+fn every_declared_flag_addition_is_actually_present_and_upstream_keeps_its_own() {
+    let root = tempfile::tempdir().expect("tempdir");
+    for (args, added) in ADDED_LONG_FLAGS {
+        let mut with_help = args.to_vec();
+        with_help.push("--help");
+        let actual = run(&rust_path(), &with_help, root.path());
+        let flags = long_flags(&[actual.stdout.as_slice(), actual.stderr.as_slice()].concat());
+        for flag in *added {
+            assert!(
+                flags.contains(*flag),
+                "{} declares --{flag} as an addition but does not offer it",
+                args.join(" ")
+            );
+        }
+        let oracle = run(Path::new(ORACLE), &with_help, root.path());
+        let upstream = long_flags(&[oracle.stdout.as_slice(), oracle.stderr.as_slice()].concat());
+        for flag in &upstream {
+            assert!(
+                flags.contains(flag),
+                "{} dropped upstream's --{flag}",
+                args.join(" ")
+            );
+        }
+        assert!(
+            upstream.contains("max-count"),
+            "the fixture assumption changed: upstream's session list no longer offers --max-count"
+        );
+    }
 }
 
 #[test]
@@ -451,4 +518,392 @@ fn debug_config_emits_only_resolved_json() {
         serde_json::from_slice(&output.stdout).expect("stdout contains only JSON");
     assert_eq!(config["username"], "debug-user");
     assert_eq!(config["share"], "disabled");
+}
+
+// ---------------------------------------------------------------------------
+// `session list --all-projects` against the documented endpoint
+//
+// `/experimental/session` (`groups/experimental.ts:224-233`) is the only place
+// upstream publishes a cross-project listing, and it returns exactly the shape
+// the CLI now emits. Both sides are pointed at one database file through
+// `OPENCODE_DB` — the real binary resolves it in `core/src/database/database.ts:44-47`
+// and `oc_paths::db_path` honours the same variable — so the comparison is a set
+// equality on the same rows rather than two independently seeded stores.
+//
+// The two `roots` pairings are compared separately because the defaults differ
+// and neither is wrong: the CLI defaults to roots-only, which is what upstream's
+// own `session list` hard-codes (`cli/cmd/session.ts:87`), while the endpoint's
+// `roots` query parameter is unset by default.
+// ---------------------------------------------------------------------------
+
+struct FixtureSession {
+    id: &'static str,
+    project: &'static str,
+    parent: Option<&'static str>,
+    created: i64,
+    updated: i64,
+    archived: Option<i64>,
+}
+
+/// Every session the fixture seeds: three projects, two parent/child pairs, and
+/// one archived root so `--archived` has something to widen the result with.
+const FIXTURE_SESSIONS: &[FixtureSession] = &[
+    FixtureSession {
+        id: "ses_dx_one_root",
+        project: "prj_dx_one",
+        parent: None,
+        created: 1_000,
+        updated: 5_000,
+        archived: None,
+    },
+    FixtureSession {
+        id: "ses_dx_one_kid",
+        project: "prj_dx_one",
+        parent: Some("ses_dx_one_root"),
+        created: 1_100,
+        updated: 4_500,
+        archived: None,
+    },
+    FixtureSession {
+        id: "ses_dx_one_arch",
+        project: "prj_dx_one",
+        parent: None,
+        created: 1_200,
+        updated: 4_800,
+        archived: Some(4_900),
+    },
+    FixtureSession {
+        id: "ses_dx_two_root",
+        project: "prj_dx_two",
+        parent: None,
+        created: 3_000,
+        updated: 4_000,
+        archived: None,
+    },
+    FixtureSession {
+        id: "ses_dx_two_kid",
+        project: "prj_dx_two",
+        parent: Some("ses_dx_two_root"),
+        created: 3_100,
+        updated: 3_500,
+        archived: None,
+    },
+    FixtureSession {
+        id: "ses_dx_three_root",
+        project: "prj_dx_three",
+        parent: None,
+        created: 4_000,
+        updated: 3_000,
+        archived: None,
+    },
+];
+
+/// Seed a database the oracle and the Rust CLI will both open.
+///
+/// Written with `rusqlite`, which `oc-cli` already depends on, so the fixture
+/// does not depend on either binary being able to write it.
+fn seed_shared_database(path: &Path) {
+    let mut connection = rusqlite::Connection::open(path).expect("create the shared database");
+    oc_db::migration::apply(&mut connection).expect("apply the schema");
+    for (id, worktree, name) in [
+        ("prj_dx_one", "/srv/dx-one", Some("DX One")),
+        ("prj_dx_two", "/srv/dx-two", None),
+        ("prj_dx_three", "/srv/dx-three", Some("DX Three")),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO project (id, worktree, name, time_created, time_updated, sandboxes) \
+                 VALUES (?1, ?2, ?3, 1, 1, '[]')",
+                rusqlite::params![id, worktree, name],
+            )
+            .expect("insert project");
+    }
+    for seed in FIXTURE_SESSIONS {
+        connection
+            .execute(
+                "INSERT INTO session (id, project_id, parent_id, slug, directory, path, title, \
+                 version, cost, tokens_input, tokens_output, tokens_reasoning, \
+                 tokens_cache_read, tokens_cache_write, agent, time_created, time_updated, \
+                 time_archived) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, '1.18.13', 2.0, 10, 20, 0, 0, 0, 'build', \
+                 ?7, ?8, ?9)",
+                rusqlite::params![
+                    seed.id,
+                    seed.project,
+                    seed.parent,
+                    seed.id.trim_start_matches("ses_"),
+                    format!("/srv/{}", seed.project),
+                    format!("Title for {}", seed.id),
+                    seed.created,
+                    seed.updated,
+                    seed.archived,
+                ],
+            )
+            .expect("insert session");
+    }
+}
+
+/// Start the oracle's HTTP server on `port`, waiting for it to say so.
+fn spawn_oracle_server(root: &Path, database: &Path, port: u16) -> Option<Child> {
+    let mut command = Command::new(ORACLE);
+    command
+        .args([
+            "serve",
+            "--hostname",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    isolated(&mut command, root);
+    command.env("OPENCODE_DB", database);
+    let mut child = command.spawn().expect("spawn the oracle server");
+
+    let stdout = child.stdout.take().expect("oracle stdout");
+    let mut reader = BufReader::new(stdout);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut line = String::new();
+    while Instant::now() < deadline {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) if line.contains("listening on") => return Some(child),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
+
+/// `GET` one path off the oracle server and parse it as JSON.
+///
+/// Written on a raw socket rather than through `reqwest::blocking`, which is not
+/// in this workspace's feature set — and enabling it would edit a manifest five
+/// other crates share. A loopback HTTP/1.1 request with `Connection: close` is
+/// small enough to be obvious, and it also sidesteps the ambient `http_proxy`
+/// this machine exports, which silently swallows loopback requests.
+fn oracle_json(port: u16, query: &str) -> serde_json::Value {
+    let target = format!("/experimental/session{query}");
+    let request = format!(
+        "GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: application/json\r\n\
+         Connection: close\r\n\r\n"
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match std::net::TcpStream::connect(("127.0.0.1", port)) {
+            Ok(mut stream) => {
+                use std::io::Write as _;
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(20)))
+                    .expect("set a read timeout");
+                stream
+                    .write_all(request.as_bytes())
+                    .expect("send the request");
+                return read_http_json(&mut stream, &target);
+            }
+            Err(error) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "{target}: could not connect: {error}"
+                );
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+}
+
+/// Read one HTTP/1.1 response off `stream` and parse its body as JSON.
+///
+/// The framing is read rather than assumed: the oracle's server does not close
+/// the socket on `Connection: close`, so reading to EOF blocks until the read
+/// timeout expires. `Content-Length` bounds the body, and the chunked branch is
+/// there because the same server answers some routes with SSE-style framing.
+fn read_http_json(stream: &mut std::net::TcpStream, target: &str) -> serde_json::Value {
+    let mut reader = BufReader::new(stream);
+    let mut head = String::new();
+    loop {
+        let mut line = String::new();
+        let read = reader.read_line(&mut line).expect("read a header line");
+        assert!(read > 0, "{target}: the connection closed mid-header");
+        if line == "\r\n" || line == "\n" {
+            break;
+        }
+        head.push_str(&line);
+    }
+
+    let status = head.lines().next().unwrap_or_default();
+    assert!(status.contains(" 200 "), "{target} -> {status} ({head})");
+
+    let header = |name: &str| {
+        head.lines()
+            .find(|line| {
+                line.to_ascii_lowercase()
+                    .starts_with(&format!("{}:", name.to_ascii_lowercase()))
+            })
+            .and_then(|line| line.split_once(':'))
+            .map(|(_, value)| value.trim().to_owned())
+    };
+
+    let payload = if header("transfer-encoding").is_some_and(|value| value.contains("chunked")) {
+        dechunk(&mut reader, target)
+    } else {
+        let length: usize = header("content-length")
+            .unwrap_or_else(|| panic!("{target}: neither Content-Length nor chunked ({head})"))
+            .parse()
+            .expect("a numeric Content-Length");
+        let mut body = vec![0_u8; length];
+        std::io::Read::read_exact(&mut reader, &mut body).expect("read the body");
+        String::from_utf8(body).expect("a UTF-8 body")
+    };
+
+    serde_json::from_str(&payload)
+        .unwrap_or_else(|error| panic!("{target}: {error} in body {payload}"))
+}
+
+/// Reassemble an HTTP/1.1 chunked body.
+fn dechunk(reader: &mut BufReader<&mut std::net::TcpStream>, target: &str) -> String {
+    let mut out = String::new();
+    loop {
+        let mut size_line = String::new();
+        let read = reader.read_line(&mut size_line).expect("read a chunk size");
+        assert!(read > 0, "{target}: the connection closed mid-chunk");
+        let size =
+            usize::from_str_radix(size_line.trim().split(';').next().unwrap_or("0").trim(), 16)
+                .unwrap_or(0);
+        if size == 0 {
+            return out;
+        }
+        let mut chunk = vec![0_u8; size + 2];
+        std::io::Read::read_exact(reader, &mut chunk).expect("read a chunk");
+        chunk.truncate(size);
+        out.push_str(&String::from_utf8(chunk).expect("a UTF-8 chunk"));
+    }
+}
+
+/// Run the Rust CLI's JSON listing against the shared database.
+fn rust_listing(root: &Path, database: &Path, args: &[&str]) -> serde_json::Value {
+    let mut command = rust_binary();
+    command.args(args);
+    isolated(&mut command, root);
+    command.env("OPENCODE_DB", database);
+    let output = command.output().expect("run the Rust session listing");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("stdout contains only JSON")
+}
+
+#[test]
+fn session_list_all_projects_matches_the_experimental_endpoint_on_one_database() {
+    if !Path::new(ORACLE).is_file() {
+        eprintln!(
+            "SKIPPED session_list_all_projects_matches_the_experimental_endpoint_on_one_database: \
+             the real opencode binary is absent at {ORACLE}; the cross-project listing was NOT \
+             compared against /experimental/session"
+        );
+        return;
+    }
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let database = root.path().join("shared.db");
+    seed_shared_database(&database);
+
+    // A port the OS hands out, released before the oracle claims it. A fixed
+    // port would collide with a sibling test run; binding to 0 and letting the
+    // oracle inherit the socket is not something its CLI supports.
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a port");
+        listener
+            .local_addr()
+            .expect("read the reserved port")
+            .port()
+    };
+
+    let Some(mut server) = spawn_oracle_server(root.path(), &database, port) else {
+        eprintln!(
+            "SKIPPED session_list_all_projects_matches_the_experimental_endpoint_on_one_database: \
+             the real opencode binary never reported `listening on`; the cross-project listing was \
+             NOT compared against /experimental/session"
+        );
+        return;
+    };
+
+    let comparisons = [
+        (
+            "roots-only",
+            vec!["session", "list", "--all-projects", "--format", "json"],
+            "?roots=true",
+            3,
+        ),
+        (
+            "including children",
+            vec![
+                "session",
+                "list",
+                "--all-projects",
+                "--no-roots",
+                "--format",
+                "json",
+            ],
+            "",
+            5,
+        ),
+        (
+            "including archived",
+            vec![
+                "session",
+                "list",
+                "--all-projects",
+                "--no-roots",
+                "--archived",
+                "--format",
+                "json",
+            ],
+            "?archived=true",
+            6,
+        ),
+    ];
+
+    let mut failures: Vec<String> = Vec::new();
+    for (label, args, query, expected) in comparisons {
+        let oracle = oracle_json(port, query);
+        let actual = rust_listing(root.path(), &database, &args);
+
+        let oracle_rows = oracle.as_array().expect("the endpoint returns an array");
+        let actual_rows = actual.as_array().expect("the CLI returns an array");
+        if oracle_rows.len() != expected || actual_rows.len() != expected {
+            failures.push(format!(
+                "{label}: expected {expected} rows, oracle gave {}, Rust gave {}",
+                oracle_rows.len(),
+                actual_rows.len()
+            ));
+        }
+        if actual != oracle {
+            failures.push(format!(
+                "{label}: sets differ\nRust:\n{}\nOracle:\n{}",
+                serde_json::to_string_pretty(&actual).expect("render"),
+                serde_json::to_string_pretty(&oracle).expect("render"),
+            ));
+        }
+        // Byte parity too, not only semantic equality: `serde_json` renders an
+        // integral f64 as `2.0` where `JSON.stringify` writes `2`, and that was
+        // the one textual difference this comparison found. Dropping the check
+        // would let it come back invisibly.
+        let actual_text = serde_json::to_string(&actual).expect("render");
+        let oracle_text = serde_json::to_string(&oracle).expect("render");
+        if actual_text != oracle_text {
+            failures.push(format!(
+                "{label}: JSON text differs\nRust:  {actual_text}\nOracle:{oracle_text}"
+            ));
+        }
+    }
+
+    let _ = server.kill();
+    let _ = server.wait();
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }

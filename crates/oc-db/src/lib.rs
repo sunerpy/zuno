@@ -50,6 +50,7 @@ pub mod open;
 pub mod pool;
 pub mod schema;
 pub mod session;
+pub mod session_list;
 
 pub use crate::open::{
     BUSY_TIMEOUT_MS, CACHE_SIZE_KIB, FOREIGN_KEYS_ON, JOURNAL_MODE_MEMORY, JOURNAL_MODE_WAL,

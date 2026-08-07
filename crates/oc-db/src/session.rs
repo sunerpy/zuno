@@ -390,7 +390,7 @@ pub enum SessionSort {
 }
 
 impl SessionSort {
-    fn column(self) -> &'static str {
+    pub(crate) fn column(self) -> &'static str {
         match self {
             Self::Updated => "time_updated",
             Self::Created => "time_created",
@@ -715,22 +715,7 @@ pub fn touch_at(transaction: &Transaction<'_>, id: &str, millis: i64) -> Result<
 ///
 /// [`DbError::Query`] if the read fails.
 pub fn list(connection: &Connection, query: &ListQuery) -> Result<Vec<Session>, DbError> {
-    let (predicates, bindings) = filters(query);
-    let sort = query.sort.column();
-    let direction = query.direction.keyword();
-
-    let mut sql = format!("SELECT {COLUMNS} FROM session");
-    if !predicates.is_empty() {
-        sql.push_str(" WHERE ");
-        sql.push_str(&predicates.join(" AND "));
-    }
-    sql.push_str(&format!(" ORDER BY {sort} {direction}, id {direction}"));
-    let mut values = bindings;
-    if let Some(limit) = query.limit {
-        sql.push_str(&format!(" LIMIT ?{}", values.len() + 1));
-        values.push(Value::Integer(i64::from(limit)));
-    }
-
+    let (sql, values) = list_sql(query);
     let mut statement = connection.prepare(&sql).map_err(open::map_error)?;
     let rows = statement
         .query_map(params_from_iter(values), from_row)
@@ -1017,6 +1002,33 @@ impl<'pool> Store<'pool> {
     }
 }
 
+/// The `SELECT` a listing runs, and the bindings it expects, in order.
+///
+/// Split out of [`list`] so a caller that needs to wrap the same rows in
+/// something else — [`crate::session_list`] joins them against `project` and
+/// counts their messages — inherits this query's predicates, limit **and**
+/// ordering instead of restating them. A second hand-written copy of the
+/// `time_updated DESC, id DESC` tie-break is the kind of divergence that only
+/// shows up as a paginated client seeing a row twice.
+pub(crate) fn list_sql(query: &ListQuery) -> (String, Vec<Value>) {
+    let (predicates, bindings) = filters(query);
+    let sort = query.sort.column();
+    let direction = query.direction.keyword();
+
+    let mut sql = format!("SELECT {COLUMNS} FROM session");
+    if !predicates.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&predicates.join(" AND "));
+    }
+    sql.push_str(&format!(" ORDER BY {sort} {direction}, id {direction}"));
+    let mut values = bindings;
+    if let Some(limit) = query.limit {
+        sql.push_str(&format!(" LIMIT ?{}", values.len() + 1));
+        values.push(Value::Integer(i64::from(limit)));
+    }
+    (sql, values)
+}
+
 /// Build the `WHERE` predicates and their bindings for a listing.
 ///
 /// Returns positional SQL fragments already numbered against the bindings that
@@ -1145,7 +1157,7 @@ fn child_ids(connection: &Connection, parent_id: &str) -> Result<Vec<String>, Db
 }
 
 /// Decode one row selected with [`COLUMNS`], in that column order.
-fn from_row(row: &Row<'_>) -> rusqlite::Result<Session> {
+pub(crate) fn from_row(row: &Row<'_>) -> rusqlite::Result<Session> {
     let summary_additions: Option<i64> = row.get(10)?;
     let summary_deletions: Option<i64> = row.get(11)?;
     let summary_files: Option<i64> = row.get(12)?;
