@@ -3918,3 +3918,117 @@ session did end with a working method.
 each isolate one term. Otherwise the suite proves the disjunction, not the terms, and
 the weakest term can rot silently. Same class as "a test that cannot fail is not a
 test", one level up.
+
+## [2026-08-07] Task 77: four things the plan got wrong, and three seams left open
+
+**(a) "four mp3 files" is five.** Stated twice, including in the MUST-NOT ("Must NOT
+pull the excluded UI package into the build for four assets"). `attention.ts:17-22` has
+six imports over five distinct files — `bip-bop-01.mp3` fills both `default` and `done`
+(`:47`, `:55`). The constraint is honoured either way; the count is wrong. Fifth
+plan-vs-source discrepancy on the board, and the source was right again.
+
+**(b) The title and the body contradict each other.** Title: "implement notifications
+and the sound system **with bundled audio assets**". Body: offers ship-silence-by-default
+as a sanctioned option, and its own third acceptance criterion is "a missing sound pack
+degrades to notification-only with a diagnostic". Those cannot both hold — with assets
+bundled, the third criterion is untestable without deleting them first. Read the body.
+Same shape as todo 97's title-vs-body contradiction already recorded in `.omo/WORKTREE.md`.
+
+**(c) It is not five notification mappings — one class is audio-only, structurally.**
+The plan says "map event classes … to desktop notifications and audio cues".
+`notifications.ts:15` passes `notification: isSubagent ? false : { when: "blurred" }`,
+so `SubagentDone` has **no** notification channel and it is not a config knob that could
+be turned back on. `EventClass::SubagentDone.cue().notification_when` is `None` and a
+test asserts it for all five classes.
+
+**(d) There are SIX sound slots, not five.** `default` exists alongside the five event
+classes (`config/index.tsx:8-15`, `packages/plugin/src/tui.ts:235`). No event class
+resolves to it — it is the slot a caller reaches when it names none (`attention.ts:200`)
+— but a user's `attention.sounds` table can set it, so it had to be modelled.
+
+### Seams deliberately left open
+
+**No real audio playback.** `SilentPlayer` ships. A decoding backend would pull a
+device-level dependency and its system libraries into a crate that ships nothing to
+decode. `trait SoundPlayer` is the seam; whoever adds one changes no caller. Note this
+is *not* a gap the tests paper over — `attention_a_pack_that_cannot_be_played_is_reported_with_its_candidates`
+uses the shipping `SilentPlayer` and asserts the resulting diagnostic.
+
+**No persistence of the active sound pack.** Upstream stores the soundboard selection
+in its KV store (`attention.ts:171-177`, key `attention_sound_pack`); that store is not
+in `oc-tui` and no sibling crate exposes one. `Attention::activate_pack` lives for the
+process; the configured `sound_pack` is the durable answer. A crate owning a KV surface
+can layer persistence on top without touching this module. **No `oc-engine` seam was
+missing** — the module needed nothing from another crate, and no `Cargo.toml` changed.
+
+**No renderer focus wiring.** `Attention::set_focus(FocusState)` is the seam. The
+focus/blur subscription upstream makes (`attention.ts:126-131`) needs a renderer event
+stream that todo 73's loop does not surface yet. `FocusState::Unknown` is the default
+and **declines** focus-conditional channels rather than guessing, which is what upstream
+does too (`attention.ts:109`) — so the un-wired state is safe rather than noisy: today
+notifications stay silent and sounds (`when: "always"`) still fire.
+
+**`renderer_destroyed` omitted from `SkipReason`.** It is a fact about the renderer's
+lifetime, not about attention policy; the equivalent here is not calling `notify()`.
+The other five upstream reasons are all present.
+
+**Verification boundary.** The OSC 777 bytes are asserted exactly; whether a given
+emulator raises a tray notification for them cannot be observed in this environment —
+the same boundary todo 73 recorded for kernel termios state. No test opens an audio
+device, needs a display server, spawns a process, or touches the filesystem outside
+`CARGO_MANIFEST_DIR`.
+
+**The integrated `lsp_diagnostics` tool is rooted at the main checkout and rejects
+files in sibling worktrees** (same as todo 73 found). Compiler diagnostics came from
+`cargo build`/`test`/`clippy --all-targets`, all clean.
+
+## [2026-08-07] Task 66: reference-path and citation errors in the plan, and one missing wire
+
+### `/tmp/ulw-refs/` does not exist; `.omo/refs/` is main-worktree-only
+
+The plan cites slim as `/tmp/ulw-refs/omo-slim/...`. The real path is
+`.omo/refs/omo-slim/` — and it exists **only in the main worktree**, because `.omo/refs/`
+is gitignored and therefore absent from every linked worktree. A worktree agent must read
+from the absolute path `/config/workspace/ProdDir/AI/opencode-rust/.omo/refs/`. Worth
+putting in future prompts: "`.omo/refs/` is not in your worktree" is a stronger statement
+than "adjust the path".
+
+### Three citations off by a file or by ten lines
+
+- **Board field list**: plan says `src/hooks/task-session-manager/board-injection.ts`.
+  That file only *places* board text (cache-safe anchoring, replay, tail stripping). The
+  `alias / session / agent / state` rendering is in `src/utils/background-job-board.ts`
+  — `formatForPromptWithMetadata` (:657-690), `formatJob` (:838-861),
+  `formatReusableJob` (:755-769).
+- **Active rule**: plan says `src/agents/orchestrator.ts:216-231`. The "Active Task
+  Amendments" block that carries the un-addressable rule is `:226-231`; `:216-224` is
+  "Background Task Discipline".
+- **"Prose is not enough"**: plan says `:245-247`. It is at `:245` exactly, one line.
+
+Consistent with the wave's running tally: the source has been right every time.
+
+### The board is NOT wired to `oc-tools`' `task` tool
+
+Deliberate — `oc-tools` was out of scope this wave and no sibling was in it. The seam is
+correct and needs no change: `ChildTurnHost::dispatch` already takes `resume_session_id`
+and returns `background_id`. But until a host calls `JobBoard::dispatch`, todo 65's
+`task_id` parameter resolves nothing and `RecordingHost` is the only implementation.
+Section 11 of `.omo/evidence/task-66-opencode-rust.txt` lists exactly what the host owes,
+including which `ContinuationError` variants map to `ToolError::Failed` (not fixable by
+reissuing the same arguments) versus `InvalidArgs` (a different `task_id` fixes them).
+
+### The Active guarantee is in-process only, and cannot be made stronger here
+
+`RunState` defers to `SessionRunRegistry::status`, which is explicitly not persisted
+(`crates/oc-engine/src/status.rs:1-6`). The board therefore refuses a re-dispatch that
+would collide **inside this process** and can say nothing about another one. This is
+recorded as a limit rather than a defect: the alternative would be a second, persisted
+notion of "running" that could disagree with the engine's — which is the failure the
+"do not invent a second notion" constraint exists to prevent. No cross-process claim is
+made anywhere in the module docs or the errors.
+
+### Todos 67-69 were already merged, so nothing was unblocked
+
+The plan lists 66 as blocking 67-69, but all three landed earlier. Checked for
+regression rather than assuming: `oc-goal` untouched, `cargo build --workspace` and
+`cargo clippy --workspace --all-targets` both clean.

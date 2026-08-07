@@ -4666,3 +4666,273 @@ independent of concrete tool implementations.
 or compact the live parent conversation. `CompactionMode` deliberately has only
 `Disabled`, making the no-compaction rule representable in the type surface rather
 than relying on convention.
+
+## [2026-08-07] Task 77: silence by default, because the licence cannot be stated
+
+### The asset decision, and it is a licensing decision rather than a technical one
+
+Upstream's built-in pack is six `.mp3` imports from `@opencode-ai/ui`
+(`attention.ts:17-22`) — the only runtime reference from the ported tree into an
+excluded package, and assets rather than code. The plan sanctioned two options: vendor
+equivalents with a clear licence note, or ship silence by default with a documented path
+to supply a pack. **Chose silence**, and the reason is that option 1 is not actually
+available here:
+
+* `packages/ui/package.json` declares `"license": "MIT"` and `packages/ui/LICENSE` is
+  the MIT text, "Copyright (c) 2025 opencode". That licenses **the package**.
+* It does not establish redistributable rights in the 90 audio files under
+  `packages/ui/src/assets/audio/` (45 `.mp3` + 45 `.aac`). Measured: that tree contains
+  no LICENSE, no NOTICE, no README, no attribution file of any kind.
+* The names — `alert-01..10`, `bip-bop-01..10`, `nope-01..12`, `staplebops-01..07`,
+  `yup-01..06`, each in two encodings — are the numbered-variation naming of a purchased
+  UI-sound library. Those are routinely licensed to the buyer for use *in a product*
+  while forbidding redistribution of the assets standalone or inside another pack.
+
+So the provenance is unknown and the licence is unstatable. **Shipping bytes whose
+licence cannot be stated is worse than shipping silence** — a downstream consumer
+inherits a liability they cannot audit, in exchange for a courtesy sound. This is the
+same refusal todo 41 made about a ripgrep binary and todo 48 about a language server,
+one category over: not "do not download at build time" but "do not redistribute what
+you cannot license".
+
+Note also that silence-by-default is not a *degraded* outcome here — upstream ships
+`attention.enabled: false` (`config/index.tsx:103`), so the out-of-box behaviour of the
+real binary is already silence. What this decision changes is what happens after a user
+turns attention on: they get notifications immediately and audio once they supply files.
+
+### What ships instead: the right id, no bytes, and a diagnostic that says so
+
+`builtin_pack()` registers under upstream's own `opencode.default` and is **empty**. The
+id matters: `sound_pack` defaults to it, so a pack has to answer to that name or every
+diagnostic would be an `UnknownSoundPack` about the *default*, which reads like a bug in
+the port. With the id registered and the slots empty, the honest finding surfaces
+instead:
+
+```
+sound pack "opencode.default" has no done sound and none is configured under `attention.sounds.done`; notifying without audio
+```
+
+Candidate order is upstream's (`attention.ts:146-150`): per-slot `attention.sounds`
+override, then the active pack, then the built-in — deduplicated. So the two documented
+paths to supply audio compose rather than competing, and a user can fill one slot without
+adopting a pack.
+
+**"No audio ships" is a guard test, not a convention.**
+`attention_no_audio_asset_is_compiled_into_this_crate` walks the crate and fails on any
+file with an audio extension or any `include_bytes!` in a source, with the mandatory
+floors (`>= 40` files, `>= 6` sources; measured 79 and 10). A future contributor who
+vendors a pack "just to make the sound work" fails a test that explains why.
+
+### A cue is a pair, so the outcome is a pair — never one boolean
+
+`AttentionOutcome { notification, sound, skipped, diagnostics }` with `ok() = notification || sound`.
+Two consequences that a single boolean would have destroyed:
+
+1. **Notification-only is a delivered cue, not a skip.** The missing-pack path returns
+   `notification: true, sound: false, skipped: None` plus a diagnostic. Reporting a skip
+   reason next to a delivered notification would be a lie, so `skipped` is populated
+   **only when nothing was delivered** (mirrors `attention.ts:202-205`).
+2. **A diagnostic is not an error.** `notify` returns no `Result` at all. Attention is
+   the least important subsystem in the process and must never be the reason a turn
+   fails, so every failure mode — unknown pack, missing slot, unplayable file,
+   out-of-range volume — is an `AttentionDiagnostic` carried alongside a usable outcome.
+   Same type-level guarantee todo 64 chose for model resolution.
+
+### The master switch is checked before either channel is *constructed as a decision*
+
+`enabled: false` returns `SkipReason::AttentionDisabled` before the message is
+normalized and before a notifier or player is consulted, so the "must not play a sound
+when `enabled` is false" constraint is positional rather than a conjunction someone could
+later reorder. The test asserts `(notifier.count(), player.count()) == (0, 0)` across all
+five classes with everything else saying yes — so only the master switch can account for
+the silence. Mutation-tested: `if !self.config.enabled` -> `if false` fails two tests.
+
+### Two seams, following todo 73's precedent rather than inventing a third pattern
+
+`trait Notifier` and `trait SoundPlayer`, both with inert defaults, exactly as
+`TerminalLifecycle` is a trait so its tests can run without a TTY.
+
+* `OscNotifier<W: Write>` is the **real** notification path, generic over the sink. This
+  is not a testability concession — a TUI owning the alternate screen must choose its own
+  stream — and it makes the assertion the exact bytes rather than "a mock was called".
+  OSC 777 is the chosen sequence because `renderer.triggerNotification`'s synchronous
+  `boolean` return (`attention.ts:30`) cannot be awaiting a native async API; see
+  learnings.
+* `SilentPlayer` is the real player **and** the default. Deferring a decoding backend is
+  the honest ordering when the crate ships nothing to decode; `trait SoundPlayer` means
+  adding one later changes no caller. The "no hardware in tests" property and the "no
+  unlicensable assets" decision are therefore the same fact.
+
+### The config field: exactly one, following todo 75's `theme` precedent
+
+```rust
+/// Notification and sound-cue settings.
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub attention: Option<crate::attention::AttentionSettings>,
+```
+
+Third task to add a field to `TuiConfig`; the pattern was established, so nothing else in
+`config.rs` moved. `skip_serializing_if` is mandatory — every sibling field carries it so
+`TuiConfig::default()` serializes to `{}`, and `theme_config_round_trips_through_serde`
+asserts exactly that. `AttentionSettings` repeats the pattern on all six of its own keys,
+so `{"attention":{"enabled":true}}` round-trips to those bytes and nothing else.
+
+The vocabulary itself lives in `attention.rs` rather than `config.rs`, for the reason
+todo 74 gave for keeping the whole TUI schema out of `oc-config`: it belongs next to the
+only code that reads it. `oc-config` was not touched and needs no change — `attention` is
+a `tui.json` key, absent from `packages/core/src/v1/config/config.ts`.
+
+Two docstring corrections came with it: the module header and the `TuiConfig` docstring
+both listed `theme`/`attention` as not-yet-owned, and `config_tests.rs` used `attention`
+as its example of a *tolerated unknown key*. That test now uses `plugin`/`plugin_enabled`
+(genuinely unowned) and asserts theme and attention parse — otherwise it would have kept
+passing while proving nothing.
+
+### Volume is clamped with a diagnostic, not rejected
+
+Upstream's schema rejects a volume outside `0..1`, but its runtime **also** clamps
+(`clampVolume`, `attention.ts:77-80`) — so the value is already treated as untrusted, and
+refusing to start a TUI over a loudness setting trades a working session for a pedantic
+one. A non-finite volume is silence, matching `!Number.isFinite(volume) -> 0`. The clamp
+finding is produced once at load and reported with the **first** cue rather than on every
+one, so a misconfiguration is said once instead of per notification.
+
+## [2026-08-07] Task 66: where aliases live, how Active is derived, and the board's shape
+
+### Aliases persist in the board's own in-process map, and nowhere else
+
+Minted once per lane at dispatch (`Lanes::next_alias`, a per-`(parent, prefix)` counter)
+and never recomputed. Three options were live:
+
+1. **`oc-db`** — rejected. Its 19-table schema is byte-compat-guarded by a diff test
+   against the real binary, and todo 68 already established that a new table goes in its
+   own database rather than there.
+2. **A separate database, as `oc-goal` did** — rejected, but for a reason worth stating:
+   the board's `Active` state derives from `SessionRunRegistry`, which is process-local by
+   construction (`oc-engine/src/status.rs:1-6`). Persisting the alias half while the
+   authority for the state half cannot be persisted buys a handle that survives a restart
+   and resolves to a state the board can no longer compute. Half-durable is worse than
+   in-process.
+3. **In-process, alongside the run state it derives from** — chosen. Both halves have the
+   same lifetime, so the board is coherent at every moment it exists.
+
+The property the tests actually pin is *stability across turns*, not durability across
+restarts: an alias must not change while the model may still be holding it. Six tests
+cover it, and mutation 2 (regenerating aliases at render time) fails twelve.
+
+One consequence, made explicit: a **vanished** lane's alias is never returned to the
+counter. `JobBoard::forget` drops the lane and leaves the counter alone, so a handle the
+model may still hold can never come to mean a different lane. Tested
+(`a_vanished_lanes_alias_is_never_reissued_to_a_later_lane`).
+
+### `Active` is derived, and the run registry wins
+
+```rust
+fn derive(lane: &Lane, runs: &dyn RunState) -> JobState {
+    if runs.is_running(&lane.session_id) { return JobState::Active; }
+    match lane.recorded { Running => Active, Completed if reconciled => Reconciled, ... }
+}
+```
+
+`RunState` is consulted **first** and overrides the stored record. A lane the board
+believes finished but whose session still holds a live turn is `Active`, because
+`SessionRunRegistry::begin_turn` would reject the resumed turn with `SessionBusy` — so
+agreeing with the engine here converts a confusing downstream failure into a refusal that
+names the lane. That ordering is the concrete meaning of "do not invent a second notion of
+running", and it has its own fixture
+(`a_lane_whose_session_holds_a_live_turn_is_active_even_though_its_record_settled`).
+
+`RunState` is a trait rather than a `SessionRunRegistry` because `oc-agent` must not
+depend on `oc-engine` (`oc-tools -> oc-agent` already exists; the reverse closes a cycle
+through the delegation tool). The sole intended implementation is
+`|id| registry.status(id) == SessionStatus::Busy`.
+
+### Five states, three sections, and why the section carries the meaning
+
+States: `Active`, `Unreconciled`, `Reconciled`, `Failed`, `Cancelled`. Sections:
+`Active` (not addressable), `Reusable` (addressable), `Closed` (terminal). slim has two
+sections and folds unread failures into Active (`background-job-board.ts:662-664`), which
+renders an already-failed lane as "still working". Split, because the question a section
+answers is "may I send to this", and a failed lane is un-sendable for a different reason
+than a busy one — the refusals differ (`ActiveLane` vs `NotReusable`) and so should the
+heading.
+
+`Unreconciled` applies to a **completed** lane only. The reason a completed-but-unread
+lane is un-addressable is that a re-dispatch would overwrite an answer already waiting;
+a failed lane has no answer to lose. So `settle` and `reconcile` are separate operations
+and only the second makes a lane addressable — a running lane cannot be reconciled at all
+(`a_running_job_cannot_be_reconciled_before_it_settles`).
+
+Section presence is unconditional: an empty section renders `- none` rather than
+disappearing, because an absent heading reads as an unanswered question.
+
+### The board's rendered format
+
+```
+### Background Job Board
+<PROSE_IS_NOT_ENOUGH>
+<ACTIVE_IS_NOT_ADDRESSABLE>
+<REUSABLE_RULE>
+
+#### Active
+- exp-1 / ses_child_0001 / explorer / active
+  Job: bg_000001
+  Objective: explorer: map the loader
+...
+#### Reusable
+#### Closed
+```
+
+slim's four fields plus the **job id**, which slim cannot show because it does not have
+one. Nothing time-dependent renders — slim excludes wall-clock ages for the cache reason
+(`:839-841`) and the same applies here: the board is re-injected every turn, so a byte
+that changes when nothing happened both busts the provider's prompt-cache prefix and makes
+an unchanged lane look like it moved. Pinned byte-for-byte by
+`the_board_renders_in_one_pinned_shape`, so a row moving between sections or a state word
+changing spelling is a deliberate edit.
+
+The three rules are rendered **as data**, in the board, next to the aliases they refer to.
+slim keeps them in the orchestrator's system prompt, a different file from the board that
+supplies the handles; a rename in one silently invalidates the other. Here
+`PROSE_IS_NOT_ENOUGH` is a `pub const` that a test asserts appears in every render.
+
+### Job ids come from the board's own sequence, not from the session id
+
+`bg_000001`, `bg_000002`, … A lane takes several dispatches over its life, so deriving
+the job id from the session id would give them all the same handle — precisely the
+ambiguity upstream creates (`task.ts:262` reports a session id as `jobId`, `:294` reports
+a service handle, same field). `no_job_id_is_ever_a_session_id` asserts the two spaces
+stay disjoint, and `a_stale_completion_cannot_settle_the_dispatch_that_replaced_it`
+asserts a superseded job id no longer names a lane — which is the concrete value of having
+a per-dispatch handle at all.
+
+### `ChildSessions` has no way to rebuild a session
+
+Three methods: `open`, `append_turn`, `message_count`. No `replace_history`, no
+`copy_messages`, no `replay`. "Must not copy or replay a child's history" is therefore
+inexpressible through the seam rather than merely forbidden by prose, and the operation
+log the recording double keeps makes it checkable: a continuation is exactly
+`[Count, Append]` against an existing session, pinned by
+`a_continuation_appends_to_the_session_and_never_reopens_or_replays_it`.
+
+`message_count` returns `Option<usize>` — `None` means the session is gone, which is not
+the same as zero. The store outlives the process the board lives in, so a lane can name a
+session that no longer exists; appending to it would create a one-message conversation and
+report it as a continuation.
+
+### `task_id: Some("")` is the same as `None`
+
+Both start a fresh lane. A model that emits an empty string is not asking for a
+continuation, and making the same intent succeed or fail on whitespace would produce a
+refusal whose fix is invisible. slim reaches the same conclusion in prose
+(`orchestrator.ts:247`: "omitted or empty `task_id` creates a new specialist session").
+
+### Refusal variants map to two `ToolError` kinds, and the split is by fixability
+
+Recorded here for the host that wires this to `oc-tools`, following todo 65's precedent
+that a model must not retry a refusal it cannot fix:
+
+- `ActiveLane`, `NotReusable`, `VanishedSession` -> `ToolError::Failed`. None is fixable
+  by reissuing the same arguments; the caller must wait, or start fresh.
+- `UnknownTaskId`, `ForeignParent`, `AgentMismatch` -> `ToolError::InvalidArgs`. A
+  different `task_id` (or none) fixes each.

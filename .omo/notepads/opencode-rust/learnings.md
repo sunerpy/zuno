@@ -4480,3 +4480,152 @@ not merely two matching commands anywhere in the transcript. Requiring a later
 successful outcome prevents unresolved failures and one-off incidents from being
 promoted into durable memory. The five Hermes exclusions are therefore executable
 filters rather than prompt prose.
+
+## [2026-08-07] Task 77: the six audio assets, and how a display server and an audio device were faked
+
+**The six imports, and there are only FIVE distinct files.** `attention.ts:17-22`
+imports six paths from the excluded `@opencode-ai/ui`; `attention.ts:47-56` maps them
+to slots:
+
+| slot | file |
+|---|---|
+| `default` | `@opencode-ai/ui/audio/bip-bop-01.mp3` |
+| `question` | `@opencode-ai/ui/audio/bip-bop-03.mp3` |
+| `permission` | `@opencode-ai/ui/audio/staplebops-06.mp3` |
+| `error` | `@opencode-ai/ui/audio/nope-03.mp3` |
+| `done` | `@opencode-ai/ui/audio/bip-bop-01.mp3` — **the same file as `default`** |
+| `subagent_done` | `@opencode-ai/ui/audio/yup-01.mp3` |
+
+Six imports, five files. The plan says "four mp3 files" twice, including in its
+MUST-NOT. The slot *names* are the compatibility surface even when the bytes are not,
+so `SoundName` keeps all six spellings verbatim and `attention.sounds.<slot>` lets a
+user fill them one at a time.
+
+**The upstream asset directory is 90 files and carries no attribution.**
+`packages/ui/src/assets/audio/` holds 45 `.mp3` + 45 `.aac` — `alert-01..10`,
+`bip-bop-01..10`, `nope-01..12`, `staplebops-01..07`, `yup-01..06`. Measured: no
+LICENSE, NOTICE, README, or `.txt`/`.md` of any kind under `packages/ui/src/assets`.
+`packages/ui/package.json` says `"license": "MIT"` and `packages/ui/LICENSE` is the
+MIT text — that covers *the package*, not the redistribution rights in a numbered
+sound library someone bought. Hence the decision in `decisions.md`.
+
+**`renderer.triggerNotification` returns a synchronous `boolean`, and that is the tell.**
+`attention.ts:30` types it `triggerNotification(message, title?): boolean` and
+`:185` calls it. OpenTUI's implementation is not vendored anywhere in the checkout
+(`grep -rn triggerNotification` finds only those two lines). Every platform's native
+notification API is asynchronous, so a synchronous boolean cannot be waiting on one —
+what it can be doing is writing an escape sequence and letting the emulator raise the
+notification. That is why the Rust port's real notifier writes **OSC 777**
+(`ESC ] 777 ; notify ; <title> ; <body> ST`), understood by kitty, WezTerm, foot, and
+urxvt and ignored by everything else. Ignoring is the right failure for a courtesy
+channel, and it means the notification path needs no platform dependency at all.
+
+**Faking a display server: make the sink a type parameter, not a mock.**
+`OscNotifier<W: Write>` is the *real* implementation and a test constructs it over a
+`Vec<u8>`, so the assertion is on the exact bytes rather than on "a mock was called".
+That is stronger than a mock and it is also the correct design: a TUI that owns the
+alternate screen must decide for itself which stream a sequence goes to.
+
+**Faking an audio device: the trait's default implementation plays nothing, and that
+is also what ships.** `SilentPlayer` is not a test double — it is the only real
+`SoundPlayer` today, because the crate ships nothing to decode. So the "no hardware in
+tests" property and the "no unlicensable assets" decision are the *same* fact, not two
+constraints that had to be reconciled. `RecordingPlayer` records `(path, volume)` per
+call and answers a configured bool, which is what makes *"the channel was never
+reached"* distinguishable from *"the channel said no"* — a distinction the
+enabled-matrix test depends on, since it asserts call counts and not just outcomes.
+
+**A `Vec<Diagnostic>` compared with `assert_eq!` breaks on NaN.** The volume-clamp
+table had a `(f64::NAN, 0.0)` row; `VolumeClamped { configured: NaN }` is never equal
+to itself, so the failure printed two identical-looking sides. Pulled that row out and
+asserted it structurally with `matches!(.. if configured.is_nan())`. Any diagnostic
+enum carrying an `f64` has this landmine.
+
+**A guard test that forbids a macro must exclude the file that names it.**
+`attention_no_audio_asset_is_compiled_into_this_crate` greps every `.rs` under the
+crate for `include_bytes!` — and found its own two occurrences. Excluding
+`attention_tests.rs` is safe (it is `#[cfg(test)]`, so it cannot reach a binary) but
+the exclusion has to be *justified inline*, per todo 64's rule, or the guard quietly
+becomes a guard over nine files instead of ten. Floors: `>= 40` files walked,
+`>= 6` sources read; measured 79 and 10.
+
+## [2026-08-07] Task 66: session continuation and the background job board
+
+### omo/opencode's continuation semantics, as they actually are in the source
+
+`packages/opencode/src/tool/task.ts` resolves `task_id` in exactly one expression:
+
+```ts
+const session = params.task_id ? yield* sessions.get(SessionID.make(params.task_id)) : undefined
+const nextSession = session ?? (yield* sessions.create({ parentID: ctx.sessionID, ... }))
+```
+
+(`:136-137` and `:167-172`). That is the whole of it — **reuse in place, no history
+rebuild**, and the `?? create` shape is why "no `task_id`" silently means "fresh
+session" rather than an error. There is nothing to port beyond the shape; the work is
+the *state* that makes the handle resolvable, which upstream keeps in a background-job
+service and slim keeps in a plugin-side board.
+
+### The two id spaces are genuinely independent, and upstream proves it by accident
+
+Upstream reports `jobId` on two adjacent code paths with two different meanings:
+
+- `background.extend(...)` (an amendment to a running lane) reports
+  `jobId: nextSession.id` — a **session** id (`task.ts:256-263`);
+- `background.start(...)` (a new lane) reports `jobId: info.id` — the background
+  **service's** handle (`task.ts:288-295`).
+
+Same field, same tool, same turn, two id spaces, and the caller cannot tell which it
+got. So "one continuation may keep the session id while getting a fresh background id"
+is not a design nicety — it is the only way to describe what upstream already does, and
+naming the two spaces separately is the fix. Here: the session id is the conversation,
+the job id is one dispatch into it, and a lane accumulates job ids over its life while
+keeping one session id and one alias.
+
+### slim's Active rule is prose, and prose is the wrong layer for it
+
+`.omo/refs/omo-slim/src/agents/orchestrator.ts:226-231` ("Active Task Amendments")
+tells the model that a running lane "cannot receive another `task` call, even with its
+`task_id`". But slim's board still *lists* the lane, and slim's tool still *accepts*
+the call — the only thing stopping it is the model reading and obeying a paragraph.
+`:231` even admits the failure mode: "A `running [resumed]` board label reflects
+lifecycle bookkeeping, not confirmation that a new instruction reached the specialist."
+That sentence is an apology for a missing refusal. Made it a refusal.
+
+### Where slim's board actually renders (the plan cites the wrong file)
+
+`board-injection.ts` is 1216 lines of **placement** — cache-safe anchoring, byte-
+identical replay of frozen boards, tail-zone stripping. The four rendered fields live
+in `src/utils/background-job-board.ts`: `formatForPromptWithMetadata` (:657-690) builds
+the two sections, `formatJob` (:838-861) and `formatReusableJob` (:755-769) render
+`alias / taskID / agent / state`. Worth knowing which file to open.
+
+### slim's alias prefix table encodes nothing the agent name does not
+
+`AGENT_PREFIX` (`background-job-board.ts:119-127`) maps seven agents to three-letter
+prefixes, and **every entry is that agent's own first three characters** —
+`council: 'cou'`, `explorer: 'exp'`, `fixer: 'fix'`. The fallback right below it is
+`agent.slice(0, 3)`. The table is therefore a hand-maintained restatement of the
+fallback, and a roster change needs an edit for no gain. Taking the prefix from the
+name and asserting the roster's prefixes stay pairwise distinct gets the same property
+with nothing to maintain — and the assertion fires the moment two agents would collide,
+which is the only time an explicit table would have been needed.
+
+### Two events, not one: finishing and being read
+
+A lane that has completed but whose answer the parent has not read yet must NOT be
+addressable — a re-dispatch would overwrite an answer already waiting. So `settle` and
+`reconcile` are separate operations and only the second makes a lane reusable. slim has
+this too (`terminalUnreconciled`), but folds unread **failures** into the same Active
+section (`:662-664`), which renders a lane that already failed as "still working". The
+distinction that actually matters is whether a re-dispatch destroys an answer, and only
+a completed-but-unread lane has one to destroy.
+
+### `Option<usize>` beats `usize` for a message count across a process boundary
+
+The board is in-process; the message store is not. A lane can outlive the session it
+names (compaction, delete, a store restored from a copy), and appending to a session
+that no longer exists creates a one-message conversation and calls it a continuation.
+`message_count -> Option<usize>` makes "absent" distinguishable from "empty", so that
+case becomes a refusal that also drops the stale lane from the board. A `usize` return
+would have reported `0` and the append would have silently succeeded.
