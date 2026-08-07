@@ -567,3 +567,39 @@ Two things worth carrying forward:
   `opencode/packages/opencode/node_modules/zod`, with an `OPENCODE_ZOD_FIXTURE`
   override and a printed skip when absent. That is the pattern for "test against the
   real dependency without vendoring it", now used by todos 45, 46, 60, 61 and 78.
+
+## Wave 17 dispatch ledger (2026-08-07)
+
+`main` = 2935 tests, 92/103 done. Two agents; the chain permits no more.
+
+| todo | crate | session | dispatched |
+|---|---|---|---|
+| 83 | `oc-db/artifact_gc.rs` | `ses_02531d123ffe8Q645RCqiDEXSf` | yes |
+| 84 | `oc-db/vacuum.rs` + `oc-cli/cmd/db_maint.rs` | `ses_025305e64ffefIJtATEFCKtPMS` | yes |
+
+Both in `oc-db` — at the two-editor cap, coordinated by file ownership.
+
+Remaining after this wave: **85, 86, 87, 88, 89, 90, 91, 92, 103** = 9, and the chain
+is nearly linear from here: `{83,84} → 85 → 86 → {87,88,91} → {89,92} → 90 → 103`.
+**86** is the choke point — the full differential compat suite, blocked on 62, 76 and
+all of 81-85.
+
+### Wave 16 result
+
+**62** (three-tier plugin integration), **76** (TUI views — 253 new tests), **81**
+(retention selector), **82** (transactional prune). 2673 → 2935.
+
+Two verification notes worth carrying:
+
+- **Todo 82 found the plan's table count wrong** and pinned the truth in a test whose
+  message reads *"the plan's 12-table count is stale"* — the real related-table count
+  is **10**. That is the fifth plan count I have seen contradicted by the source
+  (61→58 `/api` ops, 20→21 hooks, 19→23 CLI commands, 184 keybind calls vs 164 named,
+  12→10 tables). Prompts now tell agents to verify every inherited number.
+- **Todo 62's integration suite is `#[cfg(all(feature = "wasm", unix))]`** with a
+  `wasm_integration_skip!` macro that emits a printed skip for each of the six tests
+  when the feature is off. I confirmed the skip message is actually printed (6
+  occurrences under `--nocapture`) — so the "no silent skip" rule is honoured, and the
+  6/6 pass I saw without the feature was the skip stubs, not the real tests. With
+  `--features wasm` the real six run and pass, and reversing the hook bus fails four
+  of them.
