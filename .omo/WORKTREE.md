@@ -977,3 +977,58 @@ subject-agnostic despite the name — and, if a seam really is missing from a cr
 not edit, to report it precisely rather than work around it.
 
 Session `ses_022a074fcffeO59D11sF1wVbUt`.
+
+## Wave 24 (2026-08-07): the fifth seam — the binary cannot open an existing database
+
+`main` = 3077 tests, **101/107 done**. Todo 88 has now refused **four** times; all four
+refusals correct, and each produced a real missing feature (104, 105, 106, now 107).
+
+### What round 4 found, verified by me
+
+The frozen `W-real` source is the user's real 2.6 GB backup
+`/config/.local/share/opencode/opencode.db.bak.20260408`. Measured:
+
+```
+SELECT count(*) FROM migration            -> no such table: migration
+SELECT count(*) FROM __drizzle_migrations -> 10
+14 tables, including session
+```
+The **live** DB has all 38 rows in `migration`. So the backup is a genuine legacy install.
+
+Our `apply()` (`crates/oc-db/src/migration/mod.rs:71-78`) has exactly two paths: empty →
+`create_current`, has `session` → `verify_journal`. And `verify_journal` runs
+`SELECT id FROM migration` on a table that is not there, returning
+`DbError::Migration { version: 38 }`. **We implement greenfield creation and journal
+verification, and no migration path at all.**
+
+Upstream's `applyOnly` (`migration.ts:43-79`) does three things we do not: creates the
+journal `IF NOT EXISTS`; seeds it from `__drizzle_migrations` when empty — with the comment
+*"Existing installs used Drizzle's migration journal. Seed the new journal once so
+TypeScript migrations don't replay old SQL"*; then runs only the unrecorded migrations.
+That is exactly this disk, and why the released TS binary opened the backup while our
+release TUI exited before sampling.
+
+**This is a first-launch defect, not a perf-gate detail**: any user whose install predates
+the `migration` table cannot run this binary at all.
+
+### Why todo 20's twenty tests could not catch it
+
+Todo 20 diffs our schema byte-for-byte against a database **the real binary created**, and
+round-trips a Rust-created DB back through the real binary. Both are *greenfield*. Neither
+ever opens a database the real binary had **already been using**.
+
+**A test that only exercises the greenfield path says nothing about the upgrade path.**
+That is the new rule, and it generalises the four earlier seams: each was a transition
+nobody owned — between two routers, between a selector and its data, between a registry
+and a runner, between declared agents and the loop.
+
+### One question closed
+
+Round 3 had worried that only `measure_typescript_baseline` is public while the
+single-workload runner and samplers are `pub(crate)`. Round 4 settled it: that function
+**is** subject-agnostic at the process boundary — it resolves `OC_TESTKIT_ORACLE` and
+publishes raw `RunMeasurement`s — and a public-API-only composition for five interleaved
+AB/BA pairs was proved with 7 passing tests, copying no internals. **No seam is missing
+from the frozen crate.** The gate is implementable the moment the database opens.
+
+Todo 107 dispatched: `ses_02267b79affeolOovqZCdf60eJ`.
