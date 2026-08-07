@@ -603,3 +603,75 @@ Two verification notes worth carrying:
   6/6 pass I saw without the feature was the skip stubs, not the real tests. With
   `--features wasm` the real six run and pass, and reversing the hook bus fails four
   of them.
+
+## Wave 18: the choke point (2026-08-07)
+
+`main` = 2987 tests, 95/103 done. **One agent** — todo 86 gates everything left.
+
+| todo | crate | session |
+|---|---|---|
+| 86 | `oc-testkit/tests/compat_suite.rs` + `docs/divergences.toml` | `ses_02453e2d1ffe1ZQY034DBSZaV6` |
+
+After 86: `{87, 88, 91} → {89, 92} → 90 → 103`, then F1-F4.
+
+### Wave 17 result: 83, 84, 85 merged. 2943 → 2987.
+
+### A data-destroying defect I found by running the binary, not by reading tests
+
+Todo 85's tests were all green and its implementation of the specified behaviour was
+correct. I ran the command against the real environment anyway:
+
+```
+$ opencode-rust session prune --older-than 90 --all-projects --format json
+selected sessions : 0
+db rows to delete : 0
+artifact items    : 106
+artifact bytes    : 4.19 GB      <- including one 2.9 GB snapshot store
+```
+
+**Zero sessions selected, zero rows, and 4.19 GB of the user's snapshot history
+proposed for deletion.** With `--delete --yes` it would be gone.
+
+Mechanism, traced: upstream's DB path is **channel-dependent**
+(`packages/core/src/database/database.ts:45-55`). The user's release install writes
+`opencode.db` (**5,656 sessions**); our from-source build resolves channel `local` and
+opens `opencode-local.db` (**0 sessions**). But snapshot stores live in
+`data/snapshot/`, **shared across every channel** — 85 of them on disk. Todo 83's
+reference count asks "which sessions in the *currently open* DB reference this store",
+and with the wrong-channel DB the answer is "none", so every store looked
+unreferenced. The preview looked entirely legitimate.
+
+Two rounds of fixes, both verified by me:
+1. `ensure_visible_session_owners` refuses artifact GC when the open DB has **zero
+   total** sessions (not zero *selected*), naming the path and the count. Re-run:
+   **4.19 GB → 0**.
+2. The refusal was then **silent** — the table read `Artifact bytes 0` and
+   `warnings: []`, i.e. "nothing to prune" rendered identically to "I cannot see your
+   data". Now it emits a warning naming the database, on both surfaces, for preview and
+   delete alike. Mutation-verified: suppressing the push fails
+   `session_prune_empty_database_warns_for_preview_and_delete`.
+
+**Three rules earned here:**
+- *A reference count over a data set you might not be able to see must fail closed.*
+- *"No results" and "cannot see the data" must never render identically.*
+- **Tests cannot find this class of bug.** It needed running the real binary against
+  the real environment. Todo 83's own module docs already stated the right principle —
+  retain when ambiguous — and the code resolved it the unsafe way anyway. Hands-on QA
+  is not a formality.
+
+Whether the channel-DB path is itself an eighth declared divergence is now todo 86's
+call; it was told to report the contradiction rather than quietly make the count eight.
+
+### A gate bug in my own tooling, fixed
+
+`.omo/premerge.sh` decided pass/fail solely from `^test result: FAILED`. Merging
+task-84 it printed `ok  2936 tests pass, 0 failing targets` while the same output
+carried `error[E0463]` and `error: doctest failed` — **a test target that fails to
+compile emits no `test result:` line at all.** It was transient (three clean re-runs
+after), but the gate was blind by construction. It now also fails on
+`^error: doctest failed`, `^error: could not compile`, `^error: test failed`, and
+`^error\[E[0-9]+\]`, self-tested against the known-good tree for false positives.
+
+Same shape as two findings already in `issues.md` — a test that can only fail one way,
+and five overlapping safety fixtures proving a disjunction rather than its terms.
+**A check that can only detect one shape of failure is not a check.**
