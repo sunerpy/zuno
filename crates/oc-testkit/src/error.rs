@@ -318,6 +318,38 @@ pub enum TestkitError {
         stderr: String,
     },
 
+    /// `docs/divergences.toml` is not valid TOML of the expected shape.
+    #[error("divergence allow-list {path} could not be decoded: {detail}")]
+    DivergenceDecode {
+        /// The file that failed to decode.
+        path: PathBuf,
+        /// The `toml` parser's complaint, retained so line and column survive.
+        detail: String,
+    },
+
+    /// A decoded allow-list entry would weaken the guarantee the file exists for.
+    ///
+    /// Separate from [`Self::DivergenceDecode`] because a file that parses but
+    /// carries an entry with an empty `reason` is the failure this whole mechanism
+    /// is aimed at: the allow-list turning into a place to hide differences.
+    #[error("divergence allow-list {path} is not usable: {detail}")]
+    DivergenceShape {
+        /// The offending file.
+        path: PathBuf,
+        /// Which rule was broken, naming the entry.
+        detail: String,
+    },
+
+    /// The compatibility report could not be written.
+    #[error("could not write the compatibility report to {path}: {source}")]
+    ReportWrite {
+        /// Intended artifact path.
+        path: PathBuf,
+        /// The underlying OS failure.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// A long-running oracle workload failed to start or make expected progress.
     #[error("TypeScript {workload} workload failed: {detail}")]
     BaselineRunFailed {
