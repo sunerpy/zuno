@@ -4896,3 +4896,110 @@ The fix is **todo 106**: wire the internal agents. It is owed on parity grounds 
    `run_compaction` left `cargo build --workspace` green while four test targets
    failed to compile. Second occurrence of this hazard. `cargo test --workspace` is
    the integration gate; a green build across a signature change proves nothing.
+
+## [2026-08-07] Task 88: BLOCKED — Rust cannot open the frozen W-real legacy database
+
+Task 106 made the Rust TUI's logical turn shape compatible with the frozen workload,
+and a temporary `memory.rs` proved the public API can reconstruct five chronological
+AB/BA pairs without copying private perf internals. The live gate then reached the real
+database and exposed a product blocker instead of a harness blocker.
+
+The released TypeScript TUI completed the first W-idle and W-real launches. The
+release-profile Rust TUI exited before its first W-real sample with
+`migration to schema version 38 failed`. The frozen April database contains the target
+session but no `migration` table. `oc_db::migration::apply` treats any database with a
+`session` table as current and calls `verify_journal`; its first query against the
+missing journal fails. Rust therefore supports empty→current and current→verified, but
+not legacy TypeScript→current.
+
+No Rust median or ratio exists. G1 remains unmeasurable at the committed TS median of
+954,240 KiB (477,120 KiB ceiling); G2 remains unmeasurable at 3,026,992 KiB
+(1,513,496 KiB ceiling). Pre-migrating the frozen input would conceal the compatibility
+failure and change the workload. Required owner: add a tested, fail-closed legacy
+`opencode.db` migration path in `oc-db`, then rerun Task 88 unchanged.
+
+## [2026-08-07] BLOCKER #4 on todo 88, verified: the Rust binary cannot open a legacy database
+
+Todo 88 refused for the **fourth** time. Verified again, and this is the most
+user-visible gap found so far: **our binary dies on a real, pre-existing opencode
+database.** Not the perf gate's problem — a parity defect that todo 20's
+byte-compatibility test could never catch, because that test only ever creates a *fresh*
+database.
+
+### Measured, by me
+
+The frozen `W-real` source is `/config/.local/share/opencode/opencode.db.bak.20260408`
+(2.6 GB, the user's real backup). What it contains:
+
+```
+$ sqlite3 -readonly …bak.20260408 "SELECT count(*) FROM migration"
+Parse error: no such table: migration          <- no journal at all
+$ sqlite3 -readonly …bak.20260408 "SELECT count(*) FROM __drizzle_migrations"
+10                                              <- a LEGACY Drizzle journal
+tables: __drizzle_migrations account account_state control_account event
+        event_sequence message part permission project session session_share todo workspace
+```
+and for contrast the live DB has all 38 rows in `migration`.
+
+So this is a genuine legacy install: 14 tables, a `session` table, **no `migration`
+table**, and a Drizzle journal with 10 entries.
+
+### What each implementation does with it
+
+**Ours** (`crates/oc-db/src/migration/mod.rs:71-78`): empty → `create_current`; has
+`session` → `verify_journal`; else die. And `verify_journal` (`:110`) immediately calls
+`journal_ids`, which runs `SELECT id FROM migration` — the table does not exist, so it
+returns `DbError::Migration { version: 38 }`. **We implement fresh-schema creation and
+journal verification, and no migration path at all.**
+
+**The oracle** (`packages/core/src/database/migration.ts:43-79`, `applyOnly`) does three
+things we do not:
+1. `CREATE TABLE IF NOT EXISTS migration (…)` — never assumes the journal exists;
+2. if the journal is empty **and** `__drizzle_migrations` exists, seeds it from that
+   table, with the comment *"Existing installs used Drizzle's migration journal. Seed the
+   new journal once so TypeScript migrations don't replay old SQL"*;
+3. runs each migration whose id is not already recorded.
+
+That is exactly the case on this disk, and it is why the released TS binary opened the
+backup and completed its `W-real` launch while our release TUI exited before sampling.
+
+### The failure the agent saw, and a mislabelled error
+
+```
+TypeScript W-real workload failed: oracle TUI exited early with exit status: 1
+… direct diagnostic against a private copy: migration to schema version 38 failed
+```
+Note the harness's error variant says "TypeScript" even when `OC_TESTKIT_ORACLE` names
+the Rust subject. Minor, but it cost diagnosis time and is worth fixing.
+
+### Why none of the workarounds is acceptable
+
+- **Pre-migrating the source with the TS binary** changes the frozen workload input and
+  hides the product's inability to open the user's database.
+- **Pointing at the 61.9 GB live DB** changes the selected session and its provenance,
+  and repeats a known four-hour snapshot failure.
+- **Editing `PRELUDE_REQUESTS`** or the methodology is the same massaged-pass temptation
+  refused three times already.
+
+### One good thing the agent established
+
+`measure_typescript_baseline` **is** subject-agnostic at the process boundary despite its
+name — it resolves `OC_TESTKIT_ORACLE` and publishes raw `RunMeasurement`s. It proved a
+public-API-only composition for five interleaved AB/BA pairs (two sequential calls, one
+side per pass, positions split by `interleaved_pair_order(5)`) with 7 passing tests, and
+copied no private internals. **So there is no missing seam in the frozen crate** — that
+question from round 3 is now answered, and the composition is reusable once the DB opens.
+
+### The fix: todo 107
+
+Port `applyOnly`'s three behaviours. It is owed on parity grounds regardless of the perf
+gate: **any user with an install older than the `migration` table cannot run this binary
+at all**, and todo 92's compatibility docs would otherwise be wrong.
+
+### The fifth seam, same shape as the other four
+
+`/api/event` · prune's 4.19 GB · tool execution · the internal agents · now legacy
+migration. Every one invisible to a green suite. Todo 20 has 20 tests including a
+byte-for-byte schema diff against a database the real binary created — and it never
+opened a database the real binary had *already been using*. **A test that only exercises
+the greenfield path says nothing about the upgrade path.**

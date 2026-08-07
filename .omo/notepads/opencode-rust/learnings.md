@@ -5411,3 +5411,24 @@ compaction" to `CompactionPolicy`. Known gap: I did **not** use `limit.input`,
 because `TokenWindow` has no field for it and adding one changes todo 35's tested
 type — a model declaring a smaller input ceiling compacts slightly later than
 upstream would.
+
+## [2026-08-07] Task 88: a fresh-schema differential does not prove an old database can be opened
+
+The schema suite proves two current databases have identical objects and that a
+Rust-created 38-entry journal round-trips through TS. W-real supplied the missing
+direction: an April user database with a `session` table and **no `migration` table**.
+TS 1.18.12 migrated its writable clone and ran; Rust failed before raw mode with
+`migration to schema version 38 failed`.
+
+`migration::apply` has only two success shapes: empty DB → create current schema, or
+existing `session` DB → verify all current journal ids. A real legacy database is
+neither. Compatibility must test old→current as well as current↔current; otherwise the
+first production action on a user's actual history can fail while every schema diff is
+green.
+
+The public perf API was more composable than its name suggested. Two sequential
+`measure_typescript_baseline` calls can route their ten G1/G2 launches through an
+immediate subject dispatcher: assign each call five positions of
+`interleaved_pair_order(5)`, duplicate each position for W-idle/W-real, then split the
+public reports. This yields five chronological AB/BA pairs without touching private
+samplers or overlapping process trees. The product, not the API, is now the blocker.

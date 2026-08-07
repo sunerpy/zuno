@@ -5789,3 +5789,18 @@ crate-private, and that is the point: importing them would let a future edit to
 earlier agents declined to produce. If the two copies ever disagree, the port has
 changed its request shape and the perf gate is no longer measuring what it measured
 from real 1.18.12 traffic — and a duplicated constant is what makes that visible.
+
+## [2026-08-07] Task 88: preserve the frozen W-real input; fail closed on legacy migration
+
+The gate must not pre-migrate the April W-real database with TypeScript. Doing so would
+change the frozen subject input and turn a production compatibility failure into an
+apparently favourable memory number. It must also not seed the 38 migration journal ids
+without applying the real historical transformations: that would certify an unknown
+schema as current and weaken `migration::apply`'s fail-closed contract.
+
+Decision: retain the existing release TUI-vs-TUI topology and frozen database, publish
+no Rust median or ratio, and leave the temporary gate uncommitted. Resume only after
+`oc-db` can migrate an existing TypeScript session database that has no migration
+journal, with a faithful fixture or a private copy of W-real proving the path. Task 88
+then reruns with the same five repetitions, AB/BA ordering, PTY, sampler, windows,
+baseline, and 0.50x thresholds.
