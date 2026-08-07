@@ -94,6 +94,10 @@ pub struct Cli {
     #[arg(long, global = true, action = ArgAction::SetTrue)]
     pub pure: bool,
 
+    /// The default command's own options, accepted without naming it.
+    #[command(flatten)]
+    pub tui: TuiArgs,
+
     /// The selected command. Absent means the interactive TUI, as upstream's `$0`.
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -118,11 +122,13 @@ impl Cli {
         }
 
         let environment = StartupEnvironment::resolve(base, &self.globals());
+        let root_tui = self.tui;
         match self.command {
             Some(command) => command.action(environment),
             // Upstream's default command is the TUI, so a bare invocation dispatches
-            // exactly what `tui` does rather than explaining an absence.
-            None => dispatch(DispatchArguments::Tui(TuiArgs::default()), environment),
+            // exactly what `tui` does rather than explaining an absence — including
+            // the options it was given without the subcommand's name.
+            None => dispatch(DispatchArguments::Tui(root_tui), environment),
         }
     }
 }
@@ -210,8 +216,36 @@ pub struct RunArgs {
 ///
 /// A struct rather than a unit variant so the dispatch seam keeps one shape for
 /// every command, and so a later flag does not change the variant's arity.
+///
+/// These are upstream's `tui` options (`cli/cmd/tui.ts:81-113`), and they are the
+/// invocation an unattended caller uses: `--prompt` submits a turn without a
+/// keystroke. They are flattened onto the root command as well, because upstream's
+/// default command *is* the TUI and a bare `opencode --prompt …` has to reach it.
 #[derive(Debug, Clone, Default, Args)]
-pub struct TuiArgs {}
+pub struct TuiArgs {
+    /// Submit this prompt on start, as though it had been typed and sent.
+    #[arg(long)]
+    pub prompt: Option<String>,
+    /// The model to use, as `provider/model`.
+    #[arg(short = 'm', long)]
+    pub model: Option<String>,
+    /// The agent to use.
+    #[arg(long)]
+    pub agent: Option<String>,
+    /// Continue the most recent session in this directory.
+    #[arg(short = 'c', long)]
+    pub r#continue: bool,
+    /// Talk in this exact session.
+    #[arg(short = 's', long)]
+    pub session: Option<String>,
+    /// Approve every permission that is not explicitly denied, without asking.
+    ///
+    /// Upstream's own description ends in "(dangerous!)" and it means it: this
+    /// replaces the human at the permission prompt, so a tool call the default
+    /// ruleset would have stopped to ask about proceeds unattended.
+    #[arg(long)]
+    pub auto: bool,
+}
 
 #[derive(Debug, Clone, Args)]
 pub struct ServeArgs {

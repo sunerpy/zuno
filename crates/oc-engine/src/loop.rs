@@ -17,7 +17,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::StreamExt;
 use oc_db::message::{
-    MessageRecord, MessageRole, MessageStore, MessageWithParts, PartKind, PartRecord, now_millis,
+    MessageRecord, MessageRole, MessageStore, MessageWithParts, PartKind, PartRecord,
+    created_after, now_millis,
 };
 use oc_db::{Connection, open, session};
 use oc_error::{DbError, ProviderError};
@@ -48,6 +49,17 @@ pub struct TurnEventSender {
 }
 
 impl TurnEventSender {
+    /// Publish one event from a producer outside [`run_turn`].
+    ///
+    /// A host that drives turns has to be able to report a failure that happened
+    /// before the loop could emit anything — resolving a session, persisting the
+    /// prompt — and for an interface whose only window is the terminal this channel
+    /// is the only place such a report can go. Fallible for the same reason the
+    /// loop's own sends are: a consumer that has gone is not the producer's to fix.
+    pub async fn publish(&self, event: TurnEvent) -> Result<(), TurnError> {
+        self.send(event).await
+    }
+
     async fn send(&self, event: TurnEvent) -> Result<(), TurnError> {
         self.sender
             .send(event)
@@ -617,8 +629,9 @@ pub async fn run_turn(
             .map_err(ProviderError::from)?;
         let capabilities = provider.capabilities();
         let stable_history = provider_messages(&agent.system_prompt, &history);
-        let mut assistant =
-            assistant_message(&request, &session, &requested, &agent, &model, step)?;
+        let mut assistant = assistant_message(
+            &request, &session, &requested, &agent, &model, step, &history,
+        )?;
         let assistant_id = assistant.id.clone();
         MessageStore::new(context.connection).put_message(&assistant)?;
         last_assistant_id = Some(assistant_id.clone());
@@ -1056,6 +1069,15 @@ fn append_tool_pair(
     }
 }
 
+/// The assistant record for one step, stamped so it sorts after `history`.
+///
+/// Deriving the stamp from the history rather than from the clock alone is what
+/// makes the reply's position in the request a fact. `history` was just hydrated in
+/// `(time_created, id)` order and the record built here is about to join it; when
+/// the clock has not ticked since the prompt was persisted, an unclamped stamp ties
+/// it, and the tie is broken by whichever random id sorts first. Losing that flip
+/// puts the reply ahead of the prompt, changes the stable prefix between one step
+/// and the next, and the append-only tracker rightly refuses the request.
 fn assistant_message(
     request: &RunTurnRequest,
     session: &session::Session,
@@ -1063,8 +1085,12 @@ fn assistant_message(
     agent: &ResolvedAgent,
     model: &ResolvedModel,
     step: u32,
+    history: &[MessageWithParts],
 ) -> Result<MessageRecord, TurnError> {
-    let created = now_millis();
+    let created = created_after(
+        now_millis(),
+        history.iter().map(|entry| entry.info.time_created).max(),
+    );
     MessageRecord::from_json(json!({
         "id": assistant_message_id(&request.turn_id, step),
         "sessionID": request.session_id,

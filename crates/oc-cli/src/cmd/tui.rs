@@ -1,12 +1,11 @@
-//! Booting the terminal application.
+//! Booting the terminal application, and driving a turn from it.
 //!
 //! `oc-tui` has had a working event loop and a full view layer since todos 73 and
 //! 76, and nothing called [`oc_tui::app::App::run`]. This module is that call. It
-//! owns only wiring: the terminal session, the two bounded channels, the input
-//! producer, and the component tree's root. Every rendering decision stays in
-//! `oc-tui`, and no engine call is reachable from here — the TUI consumes
-//! [`oc_engine::r#loop::TurnEvent`] as data, which is what keeps rendering above
-//! the turn loop.
+//! owns only wiring: the terminal session, the channels, the input producer, the
+//! component tree's root, and the task that turns a submitted prompt into a turn.
+//! Every rendering decision stays in `oc-tui`, and the turn's composition stays in
+//! [`super::turn`] — this module resolves neither.
 //!
 //! # Why a non-terminal invocation is refused rather than degraded
 //!
@@ -15,35 +14,49 @@
 //! refusal names `run` because that is the surface a non-interactive caller wants,
 //! and it is the same reason `run` refuses `--interactive`.
 //!
-//! # What this does not do yet
+//! # The turn runs beside the loop, never inside it
 //!
-//! Submitting a prompt does not start a turn. The turn driver needs a session, a
-//! provider registry and a database resolved on the TUI's own thread, and giving
-//! the screen a partial version of that would be worse than a screen that says so:
-//! the prompt lands in the transcript, the status strip stays `idle`, and the
-//! engine channel exists but nothing sends on it. `run` is the surface that
-//! executes a turn today.
+//! A prompt leaves the screen as a `String` on a bounded channel; a task with the
+//! only [`super::turn::TurnHost`] picks it up and drives the turn, publishing
+//! [`oc_engine::r#loop::TurnEvent`]s on the channel the application already
+//! consumes. Nothing about that is an optimisation: the loop is the only consumer of
+//! terminal input, engine events **and** the terminal-lease wake, so a turn awaited
+//! inside a component handler would stop all three and deadlock against a plugin's
+//! terminal lease.
+//!
+//! The prompt channel holds exactly one message, which is what makes a second
+//! submission while a turn is running a visible refusal in the transcript rather
+//! than a silently queued turn.
+//!
+//! # Everything that can fail is resolved before raw mode
+//!
+//! [`super::turn::TurnPlan::resolve`] and [`super::turn::TurnHost::open`] both run
+//! before [`oc_tui::app::TerminalSession::start`]. An error printed into a raw-mode
+//! alternate screen that is about to be torn down is an error nobody reads.
 
 use std::io::IsTerminal as _;
 use std::sync::Arc;
 
-use oc_engine::r#loop::event_channel;
+use oc_engine::r#loop::{TurnEvent, TurnEventSender, event_channel};
+use oc_llm::event::StreamEvent;
+use oc_tool::PermissionAsker;
 use oc_tui::app::{App, CrosstermDrawTarget, CrosstermLifecycle, TerminalSession};
 use oc_tui::config::ResolvedTuiConfig;
 use oc_tui::keybind::{KeyDispatcher, Keymap};
 use oc_tui::views::ViewContext;
 use oc_tui::views::dialog::DialogHost;
-use oc_tui::views::message::Message;
 use oc_tui::views::session::{SessionScreen, scopes};
+use tokio::sync::mpsc;
 
+use super::tui_permission::{AutoApproval, PermissionBridge, PermissionBroker};
+use super::turn::{SessionChoice, TurnHost, TurnOptions, TurnPlan};
 use crate::command::TuiArgs;
 use crate::environment::StartupEnvironment;
 
-/// The greeting the transcript opens with, which states the surface's one limit.
-const OPENING_NOTE: &str =
-    "Interactive turns are not wired yet: use `opencode-rust run <message>` to execute one.";
+/// How many prompts may be in flight. One, so a second is refused and not queued.
+const PROMPT_CHANNEL_CAPACITY: usize = 1;
 
-pub(super) fn execute(_args: &TuiArgs, _environment: &StartupEnvironment) -> Result<(), String> {
+pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Result<(), String> {
     if !std::io::stdout().is_terminal() {
         return Err(
             "the interactive TUI requires a terminal; use `run <message>` for a \
@@ -56,17 +69,44 @@ pub(super) fn execute(_args: &TuiArgs, _environment: &StartupEnvironment) -> Res
     let keymap = Keymap::defaults().map_err(to_string)?;
     let context = ViewContext::defaults();
     let (terminal_sender, terminal_receiver) = oc_tui::app::terminal_event_channel();
-    // Held for the application's lifetime: `App::run` treats a closed engine channel
-    // as a producer that disappeared mid-run, which is a failure rather than an exit.
     let (engine_sender, engine_receiver) = event_channel();
+    let (prompt_sender, prompt_receiver) = mpsc::channel(PROMPT_CHANNEL_CAPACITY);
 
-    let mut screen = SessionScreen::new(context.clone(), terminal_sender.clone());
-    screen
-        .transcript_mut()
-        .transcript_mut()
-        .push(Message::user(OPENING_NOTE));
-    let host = DialogHost::new(context, Box::new(screen));
-    let root = KeyDispatcher::new(keymap, scopes(), Box::new(host));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(to_string)?;
+    let options = TurnOptions {
+        directory: None,
+        model: args.model.clone(),
+        agent: args.agent.clone(),
+        session: SessionChoice::resolve(args.session.as_deref(), args.r#continue),
+        title: None,
+    };
+    let plan = runtime.block_on(TurnPlan::resolve(&options, environment))?;
+    let broker = Arc::new(PermissionBroker::new(terminal_sender.clone()));
+    let approval: Arc<dyn PermissionAsker> = if args.auto {
+        Arc::new(AutoApproval)
+    } else {
+        Arc::clone(&broker) as Arc<dyn PermissionAsker>
+    };
+    let host = TurnHost::open(plan, environment, approval)?;
+    broker.bind_session(host.session_id());
+
+    let mut screen = SessionScreen::new(context.clone(), terminal_sender.clone())
+        .with_prompt_sink(prompt_sender);
+    if let Some(prompt) = args
+        .prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+    {
+        screen.submit_prompt(prompt);
+    }
+    let dialogs = DialogHost::new(context.clone(), Box::new(screen));
+    let bridge = PermissionBridge::new(context, broker, dialogs);
+    let root = KeyDispatcher::new(keymap, scopes(), Box::new(bridge));
 
     let lifecycle = Arc::new(CrosstermLifecycle::new(config.mouse));
     let target = CrosstermDrawTarget::new().map_err(to_string)?;
@@ -78,21 +118,55 @@ pub(super) fn execute(_args: &TuiArgs, _environment: &StartupEnvironment) -> Res
         engine_receiver,
     );
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .map_err(to_string)?;
     let session = TerminalSession::start(lifecycle).map_err(to_string)?;
     let outcome = runtime.block_on(async move {
         let input = tokio::spawn(oc_tui::app::forward_terminal_input(terminal_sender));
+        let turns = tokio::spawn(drive_turns(host, prompt_receiver, engine_sender));
         let outcome = app.run().await;
         input.abort();
+        turns.abort();
         outcome
     });
     drop(session);
-    drop(engine_sender);
     outcome.map_err(to_string)
+}
+
+/// Drive one turn per submitted prompt until the screen stops sending.
+///
+/// Failures are reported through the same channel the turn's own events travel on,
+/// because the alternate screen is the only surface the user is looking at: an error
+/// on stderr under raw mode is either invisible or corrupts the frame. The interrupt
+/// event goes first so the status strip stops claiming a running turn, and the error
+/// second so the strip's detail is what remains on screen.
+async fn drive_turns(
+    mut host: TurnHost,
+    mut prompts: mpsc::Receiver<String>,
+    events: TurnEventSender,
+) {
+    while let Some(prompt) = prompts.recv().await {
+        if let Err(message) = host.drive(&prompt, events.clone()).await {
+            let reported = events
+                .publish(TurnEvent::TurnInterrupted {
+                    assistant_message_id: None,
+                    steps: 0,
+                })
+                .await
+                .and(
+                    events
+                        .publish(TurnEvent::Provider {
+                            step: 0,
+                            event: StreamEvent::Error {
+                                message,
+                                retry_after: None,
+                            },
+                        })
+                        .await,
+                );
+            if reported.is_err() {
+                return;
+            }
+        }
+    }
 }
 
 fn to_string(error: impl std::fmt::Display) -> String {

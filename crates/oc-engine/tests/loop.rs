@@ -744,6 +744,82 @@ async fn loop_head_interrupt_starts_no_provider_request() {
     assert!(provider.requests().is_empty());
 }
 
+/// The reply must sort after the prompt no matter what the clock says.
+///
+/// Todo 105 regressed exactly this. Moving the prompt's write to immediately before
+/// the loop left it in the same millisecond as the first assistant record, ties are
+/// broken by the random uuid in the id, and the losing half of those flips filed the
+/// reply ahead of the prompt. Step 2 then hydrated a different message at index 1
+/// than step 1 had sent and the append-only tracker refused the request.
+///
+/// A same-millisecond tie only reproduces that a fraction of the time, so this pins
+/// the general invariant instead: a prompt stamped ahead of the current clock. An
+/// unclamped reply carries `now_millis()`, sorts before that prompt every single
+/// time, and this test fails deterministically. Clock skew and an imported session
+/// reach the same state in production.
+#[tokio::test]
+async fn loop_reply_sorts_after_a_prompt_stamped_ahead_of_the_clock() {
+    let ahead = oc_db::message::now_millis() + 60_000;
+    let mut connection = seeded();
+    put_user(&connection, "msg_user", ahead, "echo hello");
+    let provider = Arc::new(FakeProvider::new(full_turn_responses()));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        request("turn-skew"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, _events) = tokio::join!(turn, collect_events(receiver));
+    assert_eq!(
+        outcome.expect("a prompt ahead of the clock must not break the request prefix"),
+        TurnOutcome::Completed {
+            assistant_message_id: "msg_turn-skew_0002".to_owned(),
+            steps: 2,
+        }
+    );
+
+    let hydrated = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .expect("hydrate the completed turn");
+    let order: Vec<&str> = hydrated
+        .iter()
+        .map(|message| message.info.role.as_str())
+        .collect();
+    assert_eq!(
+        order,
+        vec!["user", "assistant", "assistant"],
+        "the persisted order put a reply ahead of the prompt it answers"
+    );
+    assert!(
+        hydrated
+            .windows(2)
+            .all(|pair| pair[0].info.time_created < pair[1].info.time_created),
+        "each record must carry a strictly later stamp than the one before it, so the \
+         order does not depend on which random id sorts first"
+    );
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert_eq!(
+            request.messages[1].role,
+            Role::User,
+            "the prompt must stay at index 1 of every request in the turn"
+        );
+    }
+}
+
 #[test]
 fn loop_test_fixture_uses_no_live_network_provider() {
     let provider = FakeProvider::new(Vec::new());

@@ -6,6 +6,16 @@
 //! lives here rather than in the CLI so that rendering stays inside this crate and
 //! the host only wires channels.
 //!
+//! # A submitted prompt leaves through a channel, and the turn comes back as events
+//!
+//! [`SessionScreen::with_prompt_sink`] is the only outward edge this screen has
+//! besides shutdown, and it is deliberately as thin as one: a `String` out, and
+//! [`oc_engine::r#loop::TurnEvent`]s back in through
+//! [`crate::app::AppEvent::Engine`]. The screen therefore knows nothing about
+//! sessions, providers, databases or tools — a turn driver is not a collaborator it
+//! holds, it is a reader on the far side of a bounded channel. That is what keeps
+//! this crate above the turn loop even though a keystroke here now starts one.
+//!
 //! # Shutdown travels back through the terminal channel
 //!
 //! [`crate::app::App`] ends its loop on [`crate::app::TerminalEvent::Shutdown`] and
@@ -38,6 +48,7 @@ pub struct SessionScreen {
     status: StatusView,
     editor: InputEditor,
     shutdown: mpsc::Sender<TerminalEvent>,
+    prompts: Option<mpsc::Sender<String>>,
     submissions: Vec<String>,
 }
 
@@ -50,8 +61,24 @@ impl SessionScreen {
             status: StatusView::new(context.clone()),
             editor: InputEditor::new(context),
             shutdown,
+            prompts: None,
             submissions: Vec::new(),
         }
+    }
+
+    /// Forward every submitted prompt to a turn driver.
+    ///
+    /// A channel and not a callback for the reason the dialog set has one: a
+    /// callback would run inside `handle_action`, which is the one frame a turn must
+    /// not be started from — the loop that has to draw the turn's events is the
+    /// caller. `try_send` for the same reason the shutdown sender uses it.
+    ///
+    /// Optional because a screen with no driver is still a legitimate screen — every
+    /// view test builds one — and a `Sender` it could not answer would be worse.
+    #[must_use]
+    pub fn with_prompt_sink(mut self, prompts: mpsc::Sender<String>) -> Self {
+        self.prompts = Some(prompts);
+        self
     }
 
     /// The transcript, for a host that appends locally composed messages.
@@ -61,12 +88,48 @@ impl SessionScreen {
 
     /// Every text the user has submitted, oldest first.
     ///
-    /// Retained rather than handed to a callback because a turn driver does not
-    /// exist yet: a host that gains one reads them from here, and a host that has
-    /// none can still show that the submission was received.
+    /// Retained as well as forwarded: a screen with no driver attached still has to
+    /// show that the submission was received, and a test asserting what the user
+    /// sent should not have to own the other end of a channel to read it.
     #[must_use]
     pub fn submissions(&self) -> &[String] {
         &self.submissions
+    }
+
+    /// Submit `text` as though the user had typed and sent it.
+    ///
+    /// The one path a host needs for a prompt supplied on the command line. It goes
+    /// through the same code an interactive submission does so that an unattended
+    /// invocation and a typed one cannot diverge — which is exactly the divergence a
+    /// host that pushed to the transcript itself would introduce.
+    pub fn submit_prompt(&mut self, text: impl Into<String>) {
+        self.submit(text.into());
+    }
+
+    /// Hand `text` to the driver, or say in the transcript that nobody took it.
+    ///
+    /// Reporting the refusal is the point. A prompt that vanished because the driver
+    /// had gone away, rendered identically to one accepted, is the defect where "no
+    /// results" and "cannot see the data" look the same.
+    fn submit(&mut self, text: String) {
+        self.transcript
+            .transcript_mut()
+            .push(Message::user(text.clone()));
+        if let Some(prompts) = self.prompts.as_ref() {
+            match prompts.try_send(text.clone()) {
+                Ok(()) => self.status.mark_running(),
+                Err(error) => {
+                    let reason = match error {
+                        mpsc::error::TrySendError::Full(_) => "a turn is already running",
+                        mpsc::error::TrySendError::Closed(_) => "the turn driver has stopped",
+                    };
+                    self.transcript
+                        .transcript_mut()
+                        .push(Message::user(format!("not sent: {reason}")));
+                }
+            }
+        }
+        self.submissions.push(text);
     }
 }
 
@@ -118,10 +181,7 @@ impl ActionComponent for SessionScreen {
         match self.editor.handle_action(action) {
             EditorSignal::None => EventResult::IGNORED,
             EditorSignal::Submit(text) => {
-                self.transcript
-                    .transcript_mut()
-                    .push(Message::user(text.clone()));
-                self.submissions.push(text);
+                self.submit(text);
                 EventResult::REDRAW
             }
             EditorSignal::Changed

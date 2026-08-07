@@ -46,6 +46,14 @@ pub enum TerminalEvent {
     Input(CrosstermEvent),
     /// The terminal's drawable area changed.
     Resize { width: u16, height: u16 },
+    /// State a component shares with an out-of-loop producer changed.
+    ///
+    /// A turn driver running off the loop has news that is neither a key nor a
+    /// [`TurnEvent`]: it needs a human to answer a permission ask. It parks the
+    /// request in state the component tree already shares with it and sends this to
+    /// say "look again". Carrying no payload is deliberate — a wake that described
+    /// the change would be a second, racing copy of the state it announces.
+    Wake,
     /// Stop the render loop after components observe the shutdown.
     Shutdown,
 }
