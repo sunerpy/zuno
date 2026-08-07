@@ -30,31 +30,53 @@
 //!    clean up. An explicit path is the user's instruction, and quietly falling
 //!    back from it would hide a typo.
 //!
-//! # The divergence, stated precisely
+//! # Fetching disabled with nothing on disk is not a failure
 //!
 //! With fetching disabled and no cache, the oracle has **three** fallbacks, not
-//! one, and only the third is the empty catalog people quote:
+//! one, and none of them is an error:
 //!
 //! 1. the cache file (`models-dev.ts:218`),
 //! 2. a **catalog snapshot compiled into the binary** — the `OPENCODE_MODELS_DEV`
 //!    global at `models-dev.ts:198-200`, read at `:220-221`,
-//! 3. `{}` (`:222`), reached only when there is no snapshot either.
+//! 3. `{}` (`:222`) — an *empty catalog*, returned as a success.
 //!
-//! Rung 2 is live in the installed release. Verified: `OPENCODE_DISABLE_MODELS_FETCH=1`
-//! with an empty `XDG_CACHE_HOME` and an isolated `HOME` still listed seven
-//! `opencode/*` models and exited 0, and wrote no cache file. So the released
-//! binary essentially never reaches the empty catalog.
+//! Rung 3 is what makes upstream work for an air-gapped user with a
+//! self-contained `provider.*` block: `provider.ts:1425-1520` merges config
+//! providers *over* whatever the load returned, so an empty document plus a config
+//! that names its own provider, model, cost and limits still resolves that model.
+//! Measured on 1.18.12 under `env -i`, an empty `XDG_CACHE_HOME`,
+//! `OPENCODE_DISABLE_MODELS_FETCH=1` and no `OPENCODE_MODELS_PATH`: `opencode
+//! models` exits 0 and prints `test/test-model` from config alone.
 //!
-//! This crate has no compiled-in snapshot, so its rung 2 does not exist, and
-//! silently landing on rung 3 would be the worst of the three outcomes: an empty
-//! catalog is indistinguishable from "you have no providers configured", and the
-//! user meets it as a mysteriously empty model picker rather than as the one
-//! sentence naming the flag they set. Hence [`CatalogError::FetchDisabled`].
+//! So [`CatalogSource::load`] returns `Ok` with an empty [`CatalogDocument`] here,
+//! tagged [`CatalogProvenance::FetchForbidden`]. Returning an error instead is the
+//! defect todo 108 fixed: the binary refused to start for a user whose config had
+//! nothing left to look up.
 //!
-//! A caller that *wants* rung 3 can match [`CatalogError::is_policy`] and
-//! substitute an empty document; nothing here decides that for it. A future todo
-//! that bakes in a snapshot should insert it between [`CatalogSource::load_from_disk`]
-//! and this error, which is rung 2 in the same position the oracle has it.
+//! What that tag buys is the other half. An empty catalog *is* indistinguishable
+//! from "you have no providers configured" — so the provenance travels with the
+//! document, and the moment a caller asks for a model the resolved catalog does not
+//! contain, [`LoadedCatalog::unresolved_model`] turns it back into
+//! [`CatalogError::FetchDisabled`], naming the model, the flag, the source and the
+//! cache path. Fail-fast is kept for the case it was written for — a model nobody
+//! defined — and dropped for the case where there was nothing to look up.
+//!
+//! # Rung 2 is deliberately absent
+//!
+//! This crate ships no compiled-in snapshot, and that is a decision rather than an
+//! omission. The oracle's snapshot is not a copy of models.dev: measured, it holds
+//! exactly the seven `opencode/*` models of that release's hosted gateway, all
+//! `-free` preview names that rotate between releases. Baking a frozen copy in
+//! would make this binary advertise models on someone else's gateway from a list it
+//! can never refresh — precisely the air-gapped user who would be worst served by a
+//! stale one. It would also need either a network fetch at build time, which this
+//! workspace forbids, or a committed blob to keep current forever.
+//!
+//! The cost is a listing difference, not a functional one: under
+//! `OPENCODE_DISABLE_MODELS_FETCH` with no cache, upstream lists its seven gateway
+//! models and this crate lists none. Anything the user's own config declares
+//! resolves identically on both sides, which is what
+//! `tests/catalog_differential.rs` asserts byte for byte.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -210,19 +232,30 @@ impl CatalogSource {
 
     /// Load the catalog: disk first, then the network if policy allows.
     ///
-    /// The fetch is only reached when disk yielded nothing. When it is also
-    /// forbidden, this returns [`CatalogError::FetchDisabled`] naming the source,
-    /// the cache path and the variable — rather than hanging on a request policy
-    /// forbids, or returning an empty catalog the caller cannot tell apart from
-    /// "no providers configured".
-    pub async fn load(&self) -> Result<CatalogDocument, CatalogError> {
+    /// The fetch is only reached when disk yielded nothing. When it is *also*
+    /// forbidden this still succeeds, with an empty document tagged
+    /// [`CatalogProvenance::FetchForbidden`] — `models-dev.ts:222`. A config that
+    /// fully specifies its own provider and model has nothing left to look up, and
+    /// refusing to start it was the whole of todo 108's defect. The tag is what
+    /// keeps the other half honest: see [`LoadedCatalog::unresolved_model`].
+    pub async fn load(&self) -> Result<LoadedCatalog, CatalogError> {
         if let Some(document) = self.load_from_disk()? {
-            return Ok(document);
+            let provenance = match self.explicit_path.as_deref() {
+                Some(path) => CatalogProvenance::ExplicitPath(path.to_owned()),
+                None => CatalogProvenance::Cache(self.cache.clone()),
+            };
+            return Ok(LoadedCatalog {
+                document,
+                provenance,
+            });
         }
         if self.fetch_disabled {
-            return Err(CatalogError::FetchDisabled {
-                origin: self.source.clone(),
-                cache: self.cache.clone(),
+            return Ok(LoadedCatalog {
+                document: CatalogDocument::new(),
+                provenance: CatalogProvenance::FetchForbidden {
+                    origin: self.source.clone(),
+                    cache: self.cache.clone(),
+                },
             });
         }
         let text = self.fetch().await?;
@@ -233,7 +266,10 @@ impl CatalogSource {
         // A cache write failure is reported, not swallowed: the next run would
         // silently re-fetch and the user would never learn why.
         self.write_cache(&text)?;
-        Ok(document)
+        Ok(LoadedCatalog {
+            document,
+            provenance: CatalogProvenance::Fetched,
+        })
     }
 
     /// Refresh the cache from the network.
@@ -242,14 +278,15 @@ impl CatalogSource {
     /// does (`models.ts:28-31`, `models-dev.ts:237-244`). Returns `Ok(false)`
     /// when the cache was already fresh and nothing was fetched.
     ///
-    /// Returns [`CatalogError::FetchDisabled`] rather than silently doing nothing
+    /// Returns [`CatalogError::RefreshDisabled`] rather than silently doing nothing
     /// when policy forbids the network: a user who typed `--refresh` asked a
-    /// direct question and deserves a direct answer.
+    /// direct question and deserves a direct answer. That is the one place a
+    /// disabled fetch is still an error on its own, because refreshing *is* the
+    /// request — unlike [`Self::load`], which has a config to fall back on.
     pub async fn refresh(&self, force: bool) -> Result<bool, CatalogError> {
         if self.fetch_disabled {
-            return Err(CatalogError::FetchDisabled {
+            return Err(CatalogError::RefreshDisabled {
                 origin: self.source.clone(),
-                cache: self.cache.clone(),
             });
         }
         if !force && self.cache_is_fresh() {
@@ -335,6 +372,96 @@ impl CatalogSource {
             });
         }
         Ok(())
+    }
+}
+
+/// Where a loaded catalog document came from.
+///
+/// Travels with the document because the *same* empty document means two opposite
+/// things. Loaded from a cache that genuinely lists nothing, an absent model is a
+/// wrong id. Left empty because `OPENCODE_DISABLE_MODELS_FETCH` forbade the only
+/// remaining way to fill it, an absent model is a policy problem with a named fix —
+/// and a caller with no way to tell those apart must either fail on both, which
+/// breaks the air-gapped user todo 108 exists for, or fail on neither, which is how
+/// an unknown model degrades into a mysteriously empty model picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogProvenance {
+    /// Read from the file `OPENCODE_MODELS_PATH` named.
+    ExplicitPath(PathBuf),
+    /// Read from this source's cache file.
+    Cache(PathBuf),
+    /// Fetched from the source and written to the cache.
+    Fetched,
+    /// Empty because policy forbade the fetch and nothing was on disk.
+    FetchForbidden {
+        /// The source a fetch would have gone to.
+        origin: String,
+        /// The cache file that was looked for and not found.
+        cache: PathBuf,
+    },
+}
+
+impl CatalogProvenance {
+    /// True when the document is empty because policy forbade filling it.
+    #[must_use]
+    pub const fn is_fetch_forbidden(&self) -> bool {
+        matches!(self, Self::FetchForbidden { .. })
+    }
+
+    /// The failure to report when the resolved catalog has no `requested` model.
+    ///
+    /// `Some` only when the document was empty because policy forbade filling it:
+    /// the user named a model, nothing in their config defines it, and nothing was
+    /// allowed to be looked up — so the answer names the model *and* all three ways
+    /// out. `None` when a catalog was actually loaded, leaving the caller its own
+    /// "no such model" wording, which is the truthful answer in that case.
+    ///
+    /// Calling this *before* checking the resolved catalog would resurrect the defect
+    /// it exists to avoid: a config that fully specifies the requested model has
+    /// nothing to look up and must not see an error at all.
+    #[must_use]
+    pub fn unresolved_model(&self, requested: &str) -> Option<CatalogError> {
+        match self {
+            Self::FetchForbidden { origin, cache } => Some(CatalogError::FetchDisabled {
+                requested: requested.to_owned(),
+                origin: origin.clone(),
+                cache: cache.clone(),
+            }),
+            Self::ExplicitPath(_) | Self::Cache(_) | Self::Fetched => None,
+        }
+    }
+}
+
+/// A catalog document together with how it was obtained.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoadedCatalog {
+    document: CatalogDocument,
+    provenance: CatalogProvenance,
+}
+
+impl LoadedCatalog {
+    /// The document, ready for [`crate::catalog::Catalog::resolve`].
+    #[must_use]
+    pub const fn document(&self) -> &CatalogDocument {
+        &self.document
+    }
+
+    /// How this document was obtained.
+    #[must_use]
+    pub const fn provenance(&self) -> &CatalogProvenance {
+        &self.provenance
+    }
+
+    /// Take the document, discarding the provenance.
+    #[must_use]
+    pub fn into_document(self) -> CatalogDocument {
+        self.document
+    }
+
+    /// [`CatalogProvenance::unresolved_model`], for a caller holding the load.
+    #[must_use]
+    pub fn unresolved_model(&self, requested: &str) -> Option<CatalogError> {
+        self.provenance.unresolved_model(requested)
     }
 }
 

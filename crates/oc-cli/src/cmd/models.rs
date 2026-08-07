@@ -41,7 +41,11 @@ pub(super) fn execute(args: &ModelsArgs, environment: &StartupEnvironment) -> Re
                 .map_err(|error| error.to_string())?;
             println!("Models cache refreshed");
         }
-        source.load().await.map_err(|error| error.to_string())
+        source
+            .load()
+            .await
+            .map(oc_llm::catalog::LoadedCatalog::into_document)
+            .map_err(|error| error.to_string())
     })?;
     let input = ResolveInput::new()
         .with_config(&config)

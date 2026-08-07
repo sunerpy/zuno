@@ -8,8 +8,9 @@
 
 use std::path::Path;
 
-use oc_llm::catalog::CatalogError;
+use oc_config::schema::Config;
 use oc_llm::catalog::source::{CatalogSource, OPENCODE_DISABLE_MODELS_FETCH, OPENCODE_MODELS_PATH};
+use oc_llm::catalog::{Catalog, CatalogError, CatalogProvenance, ResolveInput};
 use oc_paths::Layout;
 use oc_paths::env::{Env, HOME, OPENCODE_MODELS_URL, XDG_CACHE_HOME};
 
@@ -31,11 +32,12 @@ fn source_in(root: &Path, extra: &[(&str, &str)]) -> CatalogSource {
 }
 
 // ---------------------------------------------------------------------------
-// The QA failure scenario: fetch disabled, no cache.
+// Fetch disabled, no cache: an empty catalog, and fail-fast only for a model
+// nothing defines.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn fetch_disabled_with_no_cache_fails_immediately_and_actionably() {
+async fn fetch_disabled_with_no_cache_yields_an_empty_catalog_rather_than_an_error() {
     let temp = tempfile::tempdir().expect("temp dir");
     let source = source_in(temp.path(), &[(OPENCODE_DISABLE_MODELS_FETCH, "1")]);
     assert!(source.fetch_disabled());
@@ -46,14 +48,89 @@ async fn fetch_disabled_with_no_cache_fails_immediately_and_actionably() {
 
     // The load must return, not hang: a five-second budget is ~500x what a
     // filesystem miss needs and 0x what a forbidden network call would take.
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), source.load())
+    let loaded = tokio::time::timeout(std::time::Duration::from_secs(5), source.load())
         .await
-        .expect("load must return promptly rather than attempting a forbidden fetch");
-    let error = outcome.expect_err("no catalog is available");
+        .expect("load must return promptly rather than attempting a forbidden fetch")
+        .expect("`models-dev.ts:222` returns `{}`, not an error");
+
+    assert!(
+        loaded.document().is_empty(),
+        "nothing was readable, so the document must be empty rather than invented"
+    );
+    assert_eq!(
+        loaded.provenance(),
+        &CatalogProvenance::FetchForbidden {
+            origin: "https://models.opencode.ai".to_owned(),
+            cache: source.cache().to_owned(),
+        },
+        "the reason must travel with the document or an unknown model cannot be \
+         told apart from an unconfigured one"
+    );
+    assert!(loaded.provenance().is_fetch_forbidden());
+}
+
+/// The air-gapped user's whole scenario, from the source to a selectable model.
+///
+/// No cache, no network, no `OPENCODE_MODELS_PATH` — only a config that names its
+/// own provider, model, limits and base URL. Upstream runs this
+/// (`provider.ts:1425-1520` merges config over the loaded document); measured on
+/// 1.18.12, `opencode models` prints `test/test-model` and exits 0.
+#[tokio::test]
+async fn a_config_only_provider_resolves_with_no_cache_and_no_network() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let source = source_in(temp.path(), &[(OPENCODE_DISABLE_MODELS_FETCH, "1")]);
+    let config: Config = serde_json::from_str(
+        r#"{"provider":{"test":{"name":"Test","id":"test","env":[],
+             "npm":"@ai-sdk/openai-compatible","api":"https://gateway.internal/v1",
+             "models":{"test-model":{"id":"test-model","name":"Test Model",
+               "tool_call":true,"limit":{"context":100000,"output":10000},
+               "cost":{"input":0,"output":0}}},
+             "options":{"apiKey":"k","baseURL":"https://gateway.internal/v1"}}}}"#,
+    )
+    .expect("config parses");
+
+    let loaded = source
+        .load()
+        .await
+        .expect("a forbidden fetch is not an error");
+    let catalog = Catalog::resolve(loaded.document(), &ResolveInput::new().with_config(&config));
+
+    assert_eq!(catalog.model_lines(), vec!["test/test-model"]);
+    let model = catalog
+        .model("test", "test-model")
+        .expect("the config's own model resolves without a catalog");
+    assert_eq!(model.api.url, "https://gateway.internal/v1");
+    assert!(
+        loaded.unresolved_model("test/test-model").is_some(),
+        "the policy error is still constructible; what matters is that the caller \
+         never reaches for it, because the lookup above already succeeded"
+    );
+}
+
+#[tokio::test]
+async fn a_model_nothing_defines_still_fails_immediately_and_actionably() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let source = source_in(temp.path(), &[(OPENCODE_DISABLE_MODELS_FETCH, "1")]);
+    let loaded = source
+        .load()
+        .await
+        .expect("an empty catalog is not an error");
+
+    let error = loaded
+        .unresolved_model("nobody/defines-this")
+        .expect("a forbidden fetch is exactly when this must be reported");
 
     assert!(error.is_policy(), "classified as a policy failure");
     let rendered = error.to_string();
     // Each assertion is one thing the user needs in order to fix this.
+    assert!(
+        rendered.contains("nobody/defines-this"),
+        "must name the model that was asked for: {rendered}"
+    );
+    assert!(
+        rendered.contains("provider"),
+        "must name the config block that would define it: {rendered}"
+    );
     assert!(
         rendered.contains("OPENCODE_DISABLE_MODELS_FETCH"),
         "must name the flag that caused it: {rendered}"
@@ -76,6 +153,21 @@ async fn fetch_disabled_with_no_cache_fails_immediately_and_actionably() {
     );
 }
 
+/// A catalog that *was* loaded and simply lacks the model is not a policy failure.
+///
+/// Blaming the flag there would send the user to unset a variable that had nothing
+/// to do with it, and would hide a plain typo in a model id.
+#[tokio::test]
+async fn a_loaded_catalog_does_not_blame_the_flag_for_an_absent_model() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let source = source_in(temp.path(), &[(OPENCODE_DISABLE_MODELS_FETCH, "1")]);
+    std::fs::create_dir_all(source.cache().parent().expect("a parent")).expect("mkdir");
+    std::fs::write(source.cache(), PINNED).expect("seed the cache");
+
+    let loaded = source.load().await.expect("the cache satisfies the load");
+    assert!(loaded.unresolved_model("groq/no-such-model").is_none());
+}
+
 #[tokio::test]
 async fn fetch_disabled_with_a_cache_present_loads_from_it() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -83,8 +175,12 @@ async fn fetch_disabled_with_a_cache_present_loads_from_it() {
     std::fs::create_dir_all(source.cache().parent().expect("a parent")).expect("mkdir");
     std::fs::write(source.cache(), PINNED).expect("seed the cache");
 
-    let document = source.load().await.expect("the cache satisfies the load");
-    assert_eq!(document.len(), 7);
+    let loaded = source.load().await.expect("the cache satisfies the load");
+    assert_eq!(loaded.document().len(), 7);
+    assert_eq!(
+        loaded.provenance(),
+        &CatalogProvenance::Cache(source.cache().to_owned())
+    );
 }
 
 #[tokio::test]
@@ -119,8 +215,12 @@ async fn an_explicit_path_is_read_instead_of_the_cache() {
     );
     // The cache does not exist; the explicit path still satisfies the load.
     assert!(!source.cache().exists());
-    let document = source.load().await.expect("the explicit path is honoured");
-    assert_eq!(document.len(), 7);
+    let loaded = source.load().await.expect("the explicit path is honoured");
+    assert_eq!(loaded.document().len(), 7);
+    assert_eq!(
+        loaded.provenance(),
+        &CatalogProvenance::ExplicitPath(pinned.clone())
+    );
 }
 
 #[tokio::test]

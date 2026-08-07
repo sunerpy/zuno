@@ -97,10 +97,118 @@ fn model_selection_splits_only_the_provider_prefix() {
     .expect("catalog document");
     let config = serde_json::from_str(r#"{"provider":{"anyapi":{}}}"#).expect("config");
     let catalog = Catalog::resolve(&document, &ResolveInput::new().with_config(&config));
-    let (provider, model, _) =
-        select_model(&catalog, Some("anyapi/openai/gpt")).expect("nested model id");
+    let (provider, model, _) = select_model(
+        &catalog,
+        Some("anyapi/openai/gpt"),
+        &CatalogProvenance::Fetched,
+    )
+    .expect("nested model id");
     assert_eq!(provider, "anyapi");
     assert_eq!(model, "openai/gpt");
+}
+
+/// The catalog a forbidden fetch leaves behind, as [`CatalogSource::load`] builds it.
+fn forbidden_fetch() -> CatalogProvenance {
+    CatalogProvenance::FetchForbidden {
+        origin: "https://models.opencode.ai".to_owned(),
+        cache: PathBuf::from("/nowhere/cache/opencode/models.json"),
+    }
+}
+
+/// A config that specifies a provider and a model end to end, as an air-gapped user
+/// pointing at a private gateway writes it.
+fn self_specified_config() -> oc_config::schema::Config {
+    serde_json::from_str(
+        r#"{"provider":{"private":{"name":"Private","id":"private","env":[],
+             "npm":"@ai-sdk/openai-compatible","api":"https://gateway.internal/v1",
+             "models":{"house-model":{"id":"house-model","name":"House Model",
+               "tool_call":true,"limit":{"context":100000,"output":10000},
+               "cost":{"input":0,"output":0}}},
+             "options":{"apiKey":"k","baseURL":"https://gateway.internal/v1"}}}}"#,
+    )
+    .expect("config")
+}
+
+/// Todo 108's happy path, at the seam that refused it: an empty catalog plus a config
+/// that leaves nothing to look up must still select the model.
+#[test]
+fn a_config_specified_model_selects_with_no_catalog_at_all() {
+    let config = self_specified_config();
+    let catalog = Catalog::resolve(
+        &oc_llm::catalog::models_dev::CatalogDocument::new(),
+        &ResolveInput::new().with_config(&config),
+    );
+
+    let (provider, model, resolved) =
+        select_model(&catalog, Some("private/house-model"), &forbidden_fetch())
+            .expect("a config that fully specifies the model needs no catalog");
+
+    assert_eq!(provider, "private");
+    assert_eq!(model, "house-model");
+    assert_eq!(resolved.api.url, "https://gateway.internal/v1");
+    assert!(
+        supports_compatible_transport(&resolved.api.npm),
+        "the config's transport must survive resolution or the turn is refused later"
+    );
+}
+
+/// The other half: a model nobody defines still fails immediately, and names the fix.
+#[test]
+fn a_model_no_config_defines_fails_immediately_and_names_the_fix() {
+    let config = self_specified_config();
+    let catalog = Catalog::resolve(
+        &oc_llm::catalog::models_dev::CatalogDocument::new(),
+        &ResolveInput::new().with_config(&config),
+    );
+
+    let message = select_model(&catalog, Some("private/absent-model"), &forbidden_fetch())
+        .expect_err("nothing defines this model");
+
+    for needle in [
+        "private/absent-model",
+        "provider",
+        "OPENCODE_DISABLE_MODELS_FETCH",
+        "https://models.opencode.ai",
+        "/nowhere/cache/opencode/models.json",
+        "OPENCODE_MODELS_PATH",
+    ] {
+        assert!(
+            message.contains(needle),
+            "the refusal must name `{needle}`, so it is actionable rather than \
+             surfacing later as an empty model list: {message}"
+        );
+    }
+}
+
+/// With nothing requested and nothing selectable, the policy must still be named.
+///
+/// "No available model" alone reads as "you configured nothing", which is the
+/// mis-diagnosis this whole todo was about.
+#[test]
+fn an_empty_catalog_with_no_request_still_explains_the_policy() {
+    let catalog = Catalog::resolve(
+        &oc_llm::catalog::models_dev::CatalogDocument::new(),
+        &ResolveInput::new(),
+    );
+    let message = select_model(&catalog, None, &forbidden_fetch())
+        .expect_err("an empty catalog offers no default");
+    assert!(
+        message.contains("OPENCODE_DISABLE_MODELS_FETCH"),
+        "{message}"
+    );
+    assert!(
+        message.contains("/nowhere/cache/opencode/models.json"),
+        "{message}"
+    );
+
+    // And a catalog that was genuinely loaded must NOT blame the flag.
+    let loaded = select_model(&catalog, None, &CatalogProvenance::Fetched)
+        .expect_err("an empty catalog offers no default");
+    assert!(
+        !loaded.contains("OPENCODE_DISABLE_MODELS_FETCH"),
+        "a loaded catalog that lists nothing is a configuration problem, not a \
+         policy one: {loaded}"
+    );
 }
 
 #[test]
