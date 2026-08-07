@@ -914,7 +914,7 @@ Dependency direction is strictly downward from `oc-cli`; `oc-engine` never depen
   QA scenarios: happy - the suite is green and the report lists every compared surface; failure - deliberately renaming one DB index makes the suite fail, naming the index, then revert. Evidence `.omo/evidence/task-86-opencode-rust.txt`
   Commit: Y | `test(compat): full differential compatibility suite with journal round-trip`
 
-- [ ] 87. `crates/oc-testkit/src/cassettes.rs`: build the recorded-provider suite covering every provider and reasoning shape - expect replay parity across all providers
+- [x] 87. `crates/oc-testkit/src/cassettes.rs`: build the recorded-provider suite covering every provider and reasoning shape - expect replay parity across all providers
   What to do / Must NOT do: import the upstream recordings and record additional cassettes where coverage is missing, ensuring each provider family is exercised for: plain text, interleaved reasoning, signed thinking, encrypted reasoning items, parallel tool calls, a mid-stream error with retry, a context-limit error, and a rate-limit with `retry-after`; assert the emitted event sequence per cassette. Must NOT make a live provider call in CI. Must NOT skip a provider because it is inconvenient — an unexercised provider is an unverified one.
   Parallelization: Wave 14 | Blocked by: 29,30,31,86 | Blocks: F1-F4
   References: `packages/llm/test/fixtures/recordings/` (the existing corpus); `packages/http-recorder/` (the record/replay design); todo 28's event vocabulary.
