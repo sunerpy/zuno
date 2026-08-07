@@ -5804,3 +5804,56 @@ no Rust median or ratio, and leave the temporary gate uncommitted. Resume only a
 journal, with a faithful fixture or a private copy of W-real proving the path. Task 88
 then reruns with the same five repetitions, AB/BA ordering, PTY, sampler, windows,
 baseline, and 0.50x thresholds.
+
+## [2026-08-07] Task 107: `create_current` is made unreachable, not merely unreached
+
+The QA failure scenario named the catastrophic outcome exactly: reverting the
+seeding step must fail the legacy test *rather than silently recreating a schema
+over live data*. Two structural changes ensure that.
+
+1. **`apply` now tests in upstream's order** (`migration.ts:18-26`): `session`
+   first, then non-empty, then empty. Previously emptiness was tested first, which
+   is harmless but makes the reader do the reasoning. Now the `session` case
+   returns before creation is even a candidate.
+2. **`create_current` re-checks emptiness inside its own `IMMEDIATE`
+   transaction**, and names the tables it found when it refuses. This is not
+   belt-and-braces: `apply`'s check runs before any write lock exists, so another
+   process can create the schema in the gap, and `create_current` is reachable from
+   anywhere in the module. Three unit tests pin it —
+   `create_current_refuses_a_database_that_already_holds_a_session_table`,
+   `create_current_refuses_any_non_empty_database_even_without_a_session_table`,
+   and `apply_tests_for_a_session_table_before_it_tests_for_emptiness`, the last of
+   which asserts the *absence* of the creation-refusal message, i.e. that routing
+   happened rather than being caught by the guard.
+
+**`apply_only` returns `Applied { seeded, executed }` rather than `()`.** "Nothing
+was replayed" is only checkable if seeding and execution are reported separately.
+Inferring it from a successful return would be inferring it from the fact that
+replayed DDL *happens* to error — a coincidence, not a guarantee. With the split, the
+test asserts `executed == MIGRATION_IDS[10..]` and that no seeded id appears in
+`executed`. `apply` discards the report, so no caller had to change.
+
+**Drizzle's journal is deliberately left in place.** The user's installed
+`opencode.db`, migrated by the TypeScript binary, still has `__drizzle_migrations`
+with its 10 rows. Dropping it would be a change upstream does not make, so the
+schema-equivalence test filters that one table out and asserts its retention
+explicitly, with the measurement recorded in a comment so nobody "fixes" it later.
+
+**Migrations commit one transaction each**, as upstream does, rather than one
+transaction for the chain. A chain that fails halfway leaves the completed prefix
+recorded and the next launch resumes. Wrapping all 38 in one transaction would be
+tidier and would mean a single failure discards up to 28 migrations' worth of work
+over a 2.6 GB database.
+
+**One migration is not data.** `20260511173437_session-metadata` is conditional
+upstream — the column briefly shipped again under a withdrawn migration — so it is
+the single `Step::AddSessionMetadataIfAbsent` variant beside `Step::Sql`. Adding it
+unconditionally would fail with "duplicate column name" on exactly the installs that
+took that release.
+
+**Deviation, stated rather than hidden**: the real-backup test is gated on
+`OPENCODE_LEGACY_DB` being set, not merely on the file existing. It copies 2.6 GB and
+takes 35 s, which every future `cargo test --workspace` would pay. The skip prints
+the env var name, the measured path, whether that path is present, and why it is
+opt-in — loud, not silent. I ran it with the variable set; the transcript is in the
+evidence file.

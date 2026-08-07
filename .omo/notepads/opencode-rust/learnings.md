@@ -5432,3 +5432,53 @@ immediate subject dispatcher: assign each call five positions of
 `interleaved_pair_order(5)`, duplicate each position for W-idle/W-real, then split the
 public reports. This yields five chronological AB/BA pairs without touching private
 samplers or overlapping process trees. The product, not the API, is now the blocker.
+
+## [2026-08-07] Task 107: a legacy database is a third state, not a variant of two
+
+**The defect, in one line.** `migration::apply` had two paths — empty →
+`create_current`, has `session` → `verify_journal` — and `verify_journal`'s first
+statement was `SELECT id FROM migration`. A real install predating that table takes
+the second path and has nothing to read, so the binary died on the user's own
+history. Measured: `~/.local/share/opencode/opencode.db.bak.20260408`, 2.6 GB,
+14 tables, `session` with **2,345 sessions** and 92,378 messages, **no `migration`
+table**, `__drizzle_migrations` with 10 rows. The released TypeScript binary opens
+it; ours printed `migration to schema version 38 failed`. Confirmed by reverting
+`migration/` with `git stash` and running the CLI against a copy.
+
+**How I built the fixture, and why not by trimming.** Copying 2.6 GB per test is
+not viable, and trimming a real database risks importing whatever incidental state
+it happens to hold. Instead the fixture is *reconstructed*: `sqlite3 -readonly
+… .schema` output from the real backup, committed verbatim as
+`crates/oc-db/tests/fixtures/legacy_pre_migration.sql`, plus synthetic rows and the
+real backup's ten `__drizzle_migrations` names in the order that table holds them.
+It is embedded with `include_str!` rather than read at run time, specifically to
+dodge this file's stale-`CARGO_MANIFEST_DIR` hazard — a baked-in `oc-wt/tNN` path
+breaks once the worktree is removed, and embedded bytes have no such failure mode.
+The real backup is still exercised once, opt-in via `OPENCODE_LEGACY_DB`, and that
+run is the decisive artifact: **sessions 2345 → 2345, messages 92378 → 92378,
+journal 0 → 38 ids, 10 seeded, 28 executed, 34.9 s.**
+
+**The 10 Drizzle names are NOT `MIGRATION_IDS[..10]`.** Rows 6 and 7 hold
+`20260303231226_add_workspace_fields` *before* `20260228203230_blue_harpoon` — the
+reverse of the generated order. So seeding must copy what the old journal says, and
+a test asserting `seeded == MIGRATION_IDS[..10]` would be asserting something false
+about the user's real data. The test asserts against the recorded names instead, and
+separately that they equal what the fixture's `__drizzle_migrations` contains.
+
+**Validating a ported migration chain without trusting inspection.** Before writing
+any Rust I transcribed all 38 upstream migrations into two `.sql` files and diffed
+the result against the user's **installed** `opencode.db`, which the TypeScript
+binary migrated itself. Both directions came out identical — objects and full column
+metadata (type, nullability, default, pk position) — for `legacy .schema + 11..38`
+and for `1..38 from empty`. That is a stronger check than reading the TypeScript,
+and it caught the two places where a *migrated* database legitimately differs from a
+*freshly created* one: `account_state.id` is `NOT NULL` in the chain and not in
+`schema.gen.ts`, and `workspace.time_used` carries `DEFAULT 0` in the chain because
+SQLite refuses to add a `NOT NULL` column without one. Both differences are present
+in the real migrated database, so reproducing them is fidelity, not drift.
+
+**Deriving the id list from the SQL that runs.** `MIGRATION_IDS` is now a `const`
+computed in a `while` loop over `steps::MIGRATIONS`, not a second hand-written copy.
+A journal naming a migration nobody executed is worse than no journal, and two lists
+maintained by hand will diverge. The old hand-written array and the derived one agree
+on all 38, which is how I know the port is complete.

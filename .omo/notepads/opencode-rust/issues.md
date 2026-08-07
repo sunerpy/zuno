@@ -5003,3 +5003,43 @@ migration. Every one invisible to a green suite. Todo 20 has 20 tests including 
 byte-for-byte schema diff against a database the real binary created — and it never
 opened a database the real binary had *already been using*. **A test that only exercises
 the greenfield path says nothing about the upgrade path.**
+
+## [2026-08-07] Task 107: the fifth seam, and it is the first-launch one
+
+Four seams have now been found by running the binary rather than by reading tests:
+wave 11's `/api/event` 404, wave 17's 4.19 GB prune, wave 20's tool execution,
+wave 23's uninvoked internal agents. This is the fifth, and it is the earliest one a
+user meets: **the binary died on a pre-existing opencode database**, before any
+feature could be reached.
+
+It was invisible to 3,077 passing tests for a specific and repeatable reason. Every
+`oc-db` test built its database by calling `migration::apply` on an *empty* file —
+`grep` finds 40-odd such call sites across the workspace and every one of them takes
+the `create_current` path. Todo 20's differential test compares our fresh database
+against a database the real binary *also created fresh*. So the entire suite
+exercised one of the three states `apply` has to handle, and the two-path
+implementation was consistent with all of it.
+
+**The rule this adds**: a function that branches on the state of pre-existing user
+data needs a test per branch, and the branches must be enumerated from the oracle,
+not from the states the test helpers happen to produce. Here the oracle
+(`migration.ts:18-26`) has exactly three and we had implemented two — the missing one
+being the only branch that touches data the user already had.
+
+Related, and worth its own line: **`verify_journal` could only report one shape of
+failure**, "the journal is missing ids", and it reported the *absence of the journal
+table* as that same failure. `DbError::Migration { version: 38 }` with a cause of
+`no such table: migration` reads as "your database is behind" when the truth was
+"this code cannot read a database of your vintage at all". Same shape as the
+`premerge.sh` gate that could only detect one failure mode, and as the prune command
+rendering "no results" identically to "cannot see your data". *A check that
+collapses two different situations into one message is not a check.* The
+neither-journal test now asserts specifically that the cause is **not**
+`no such table: migration`, so a regression to journal-first reading fails loudly.
+
+**The plan got nothing wrong on this one.** Its measured numbers — 14 tables, no
+`migration` table, 10 Drizzle rows, `applyOnly` at `migration.ts:43-79`, the three
+missing behaviours — all held up. The running tally of plan counts contradicted by
+the source therefore stays at six. One thing the plan did not know: the 10 Drizzle
+names are not the generated order's first ten (rows 6 and 7 are swapped), which is
+why "seed from the table" and "seed `MIGRATION_IDS[..10]`" are not interchangeable.
