@@ -1222,3 +1222,40 @@ Todo 88 stays open, now `Blocked by: 86,93,109`. Its resumable harness survives 
 context fingerprint, so the ~50 minutes of completed passes are not thrown away.
 
 worktree: oc-wt/t109 | branch task-109
+
+## Wave 29 (2026-08-07): 88 (7th) + 110 dispatched IN PARALLEL — disjoint files
+
+Todo 109 merged and verified (**3113 tests**). I mutation-tested it four ways myself:
+restoring the defect, swapping the precedence, leaking the endpoint keys into the SDK
+option bag, and dropping the emptiness test — all four caught, at both the unit and the
+integration layer. Hands-on with the real binary: `only options.baseURL` flipped from
+`unrecoverable provider failure` to `transient` (it now dials); a live server received
+requests when `endpoint` beat a dead `baseURL`; the no-endpoint case exits **1** naming
+`provider.test.options.baseURL`; `models` still exits 0 for an endpoint-less provider, so
+todo 108 did not regress.
+
+### SEAM #7, measured while auditing 109's two "adjacent gaps"
+
+`provider.options` is read at exactly one place — the endpoint keys — so every other
+provider-level option is dropped, **including `apiKey`**. A real listener logged
+`AUTH=None` for a config that puts `baseURL` and `apiKey` together the way the docs show.
+Upstream seeds the whole SDK bag from the provider (`:1676`) and makes `options.apiKey`
+primary over the stored credential (`:1719`); ours has that inverted. Also confirmed:
+`${VAR}` in base URLs is never expanded despite `resolved.rs:85` promising it.
+→ todos **110** and **111**.
+
+### Why this does NOT block todo 88 (checked before dispatching)
+
+The frozen workload puts `apiKey` in provider options (`fixtures.rs:48`), which looked like
+a seventh blocker. It is not: `MockProvider` never inspects `Authorization` — there is no
+auth enforcement anywhere in `oc-testkit` — and cassettes drop auth headers before matching
+(`cassette.rs:57`). Proven by an exit-0 turn against a live server that saw `AUTH=None`.
+
+### Parallel, not sequential
+
+88 lives in `crates/oc-testkit/tests/memory.rs`; 110 lives in `crates/oc-cli/src/cmd/turn.rs`.
+No shared file, no input dependency — so they fan out together. 111 is genuinely sequential
+after 110 (same file region). Separate worktrees mean 88 measures its own build, and its
+context fingerprint invalidates a stale pass if the binary moves under it.
+
+worktrees: oc-wt/t88 (task-88), oc-wt/t110 (task-110)
