@@ -1,0 +1,418 @@
+# Release: build, smoke-test, and publish the cross-platform artifacts.
+#
+# ---------------------------------------------------------------------------
+# THE RULE THIS FILE EXISTS TO ENFORCE
+#
+#   Must not ship an artifact that was never executed.
+#
+# So the topology is build -> smoke -> publish, and `publish` lists BOTH earlier
+# jobs in `needs`. GitHub's default `needs` semantics require every listed job to
+# have succeeded, so a single failed or skipped smoke leg blocks publication of
+# all six archives. There is no path from a compiled binary to a release asset
+# that does not pass through a process that ran it.
+#
+# `crates/oc-cli/tests/release_surface.rs` asserts from outside this file that the
+# two matrices name the same six targets, because a target added to `build` and
+# forgotten in `smoke` would otherwise ship unexecuted and CI would stay green.
+# ---------------------------------------------------------------------------
+#
+# ---------------------------------------------------------------------------
+# WHY ZIG, AND WHAT IT REPLACES
+#
+# This workspace compiles C in every build: `rusqlite`'s `bundled` feature builds
+# the SQLite amalgamation (required for byte-level `opencode.db` parity), and
+# `reqwest`'s `rustls` feature selects `aws-lc-rs`, whose `aws-lc-sys` compiles C
+# through cc/cmake. That is measured, not assumed — see
+# `.omo/notepads/opencode-rust/issues.md` under "RESOLVED".
+#
+# A C dependency is cheap for a NATIVE build and expensive for a cross build: it
+# normally means assembling a per-target C cross-toolchain, or `cross`'s docker
+# images, or per-target apt packages. Zig ships a complete hermetic C
+# cross-compiler as ONE download, and `cargo-zigbuild` points rustc's linker at
+# it. So the two Linux/musl legs need no system cross-gcc, no docker, and no
+# apt-get. The other four legs build natively on runners of their own
+# architecture, where no cross-compilation happens at all.
+#
+# `release_surface.rs` also asserts this file installs no cross-gcc, invokes no
+# docker, and runs no `cross` — an assertion, because a future "fix" for a
+# link error is exactly where a per-target toolchain would sneak back in.
+# ---------------------------------------------------------------------------
+#
+# ---------------------------------------------------------------------------
+# WHAT SHIPS
+#
+# `opencode-rust` (from `oc-cli`) only. The workspace also builds `oc-server`,
+# but `opencode-rust serve` wraps `oc_server::ServerBuilder` as a library rather
+# than spawning that binary (see `oc-cli/src/command.rs`), so `oc-server` is a
+# development and QA surface, not a user entry point. Shipping both would invite
+# users to run the wrong one. `oc-example-plugin`, `oc-acp-conformance`,
+# `oc-log-probe` and `ts-baseline` are likewise test harnesses.
+# ---------------------------------------------------------------------------
+#
+# ---------------------------------------------------------------------------
+# WHEN THIS RUNS
+#
+# On a `v*` tag, and on manual dispatch. NOT on every push: a six-target matrix
+# with a full smoke leg each is far too slow for a per-commit gate, and CI already
+# exercises the same packaging and smoke path on the host leg for every push and
+# pull request (see ci.yml's `artifact` job). The manual `workflow_dispatch` path
+# runs the complete matrix WITHOUT creating a release, so the pipeline is
+# exercisable end to end before any tag exists — a release pipeline whose first
+# ever run is the real release is not a pipeline anybody has tested.
+# ---------------------------------------------------------------------------
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Create a GitHub Release from the built artifacts (leave off for a dry run)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  BINARY_NAME: opencode-rust
+  CLI_CRATE: oc-cli
+
+jobs:
+  # -------------------------------------------------------------------------
+  # version: resolve one version string every later job uses, and refuse a tag
+  # that disagrees with the manifest. An artifact named 0.2.0 built from a tree
+  # whose `Cargo.toml` says 0.1.0 is a lie that survives forever in a filename.
+  # -------------------------------------------------------------------------
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      publish: ${{ steps.resolve.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve and cross-check the version
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest=$(
+            cargo metadata --locked --no-deps --format-version 1 \
+              | jq -r --arg name "$CLI_CRATE" '.packages[] | select(.name == $name) | .version'
+          )
+          if [ -z "$manifest" ]; then
+            echo "::error title=Version::could not read $CLI_CRATE's version from cargo metadata"
+            exit 1
+          fi
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME#v}"
+            if [ "$tag" != "$manifest" ]; then
+              echo "::error title=Version::tag v${tag} disagrees with ${CLI_CRATE}'s manifest version ${manifest}"
+              exit 1
+            fi
+            echo "version=${manifest}" >> "$GITHUB_OUTPUT"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            # Dry run: a version that can never be mistaken for a release.
+            echo "version=${manifest}-dev.${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            echo "publish=${{ inputs.publish }}" >> "$GITHUB_OUTPUT"
+          fi
+
+  # -------------------------------------------------------------------------
+  # build: one archive per target. Adapted from the proven six-target matrix at
+  # codegraph-rust's .github/workflows/release-please.yml.
+  # -------------------------------------------------------------------------
+  build:
+    name: Build ${{ matrix.target }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            use_zigbuild: true
+            archive: tar.gz
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            use_zigbuild: true
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            use_zigbuild: false
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            use_zigbuild: false
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            use_zigbuild: false
+            archive: zip
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+            use_zigbuild: false
+            archive: zip
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      # Zig is the whole reason the two musl legs need no per-target C
+      # toolchain: it is a hermetic C cross-compiler in one download, and
+      # cargo-zigbuild wires it in as rustc's linker. 0.13.0 is pinned because
+      # cargo-zigbuild tracks Zig's CLI, which is not yet stable.
+      - name: Install Zig
+        if: matrix.use_zigbuild
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        if: matrix.use_zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build (zigbuild)
+        if: matrix.use_zigbuild
+        run: cargo zigbuild --locked --release -p ${{ env.CLI_CRATE }} --bin ${{ env.BINARY_NAME }} --target ${{ matrix.target }}
+
+      - name: Build (native)
+        if: ${{ !matrix.use_zigbuild }}
+        run: cargo build --locked --release -p ${{ env.CLI_CRATE }} --bin ${{ env.BINARY_NAME }} --target ${{ matrix.target }}
+
+      # Recorded per leg so the evidence for "no cross toolchain" is in the log
+      # rather than only in a comment. `file` reports the ELF machine and whether
+      # the binary is static, which is what the musl legs claim.
+      - name: Describe the artifact
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/${BINARY_NAME}"
+          ls -l "$binary"
+          file "$binary" || true
+
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          tar -czf "dist/${BINARY_NAME}-${{ needs.version.outputs.version }}-${{ matrix.target }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" "${BINARY_NAME}"
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive `
+            -Path "target/${{ matrix.target }}/release/${env:BINARY_NAME}.exe" `
+            -DestinationPath "dist/${env:BINARY_NAME}-${{ needs.version.outputs.version }}-${{ matrix.target }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # -------------------------------------------------------------------------
+  # smoke: run every archive's binary on a runner of its own architecture.
+  #
+  # `runner` is chosen per target so the artifact is EXECUTED rather than merely
+  # inspected. The two cases worth knowing:
+  #
+  #   * x86_64-unknown-linux-musl smokes on ubuntu-latest even though it was
+  #     cross-linked there: a static musl binary runs on any Linux of the same
+  #     architecture, glibc host included.
+  #   * aarch64-unknown-linux-musl is BUILT on x86_64 (zigbuild) and cannot run
+  #     there, so it is handed to ubuntu-24.04-arm. That runner-crossing handoff
+  #     is the reason smoke is a separate job from build.
+  #
+  # `oc-smoke` is compiled from this checkout on the smoke runner, then pointed at
+  # the unpacked artifact. It runs `--version`, `--help`, and a headless `run`
+  # against a committed cassette, asserting the tool registry reached the wire and
+  # that the turn continued after the tool result. See
+  # `crates/oc-testkit/src/bin/oc-smoke.rs`.
+  # -------------------------------------------------------------------------
+  smoke:
+    name: Smoke ${{ matrix.target }}
+    needs: [version, build]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            archive: zip
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: smoke-${{ matrix.runner }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist
+
+      - name: Unpack (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p unpacked
+          tar -xzf "dist/${BINARY_NAME}-${{ needs.version.outputs.version }}-${{ matrix.target }}.tar.gz" -C unpacked
+          chmod +x "unpacked/${BINARY_NAME}"
+
+      - name: Unpack (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path unpacked | Out-Null
+          Expand-Archive `
+            -Path "dist/${env:BINARY_NAME}-${{ needs.version.outputs.version }}-${{ matrix.target }}.zip" `
+            -DestinationPath unpacked -Force
+
+      - name: Build the smoke driver
+        run: cargo build --locked --release -p oc-testkit --bin oc-smoke
+
+      - name: Smoke the unpacked artifact (unix)
+        if: matrix.archive == 'tar.gz'
+        run: ./target/release/oc-smoke --binary "unpacked/${BINARY_NAME}"
+
+      - name: Smoke the unpacked artifact (windows)
+        if: matrix.archive == 'zip'
+        run: ./target/release/oc-smoke.exe --binary "unpacked/${env:BINARY_NAME}.exe"
+
+  # -------------------------------------------------------------------------
+  # checksums: computed from the same merged `dist/` the release attaches, so the
+  # sums provably describe the uploaded bytes. `LC_ALL=C sort` on basenames gives
+  # a locale-independent, byte-ordered listing, and `sha256sum` runs with
+  # cwd=dist so each line carries the bare asset name.
+  # -------------------------------------------------------------------------
+  checksums:
+    name: Checksums
+    needs: [version, build, smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(*.tar.gz *.zip)
+          if [ "${#archives[@]}" -ne 6 ]; then
+            echo "::error title=Checksums::expected 6 archives, found ${#archives[@]}: ${archives[*]-none}"
+            exit 1
+          fi
+          mapfile -t sorted < <(printf '%s\n' "${archives[@]}" | LC_ALL=C sort)
+          : > SHA256SUMS
+          for archive in "${sorted[@]}"; do
+            sha256sum "$archive" >> SHA256SUMS
+          done
+          cat SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 1
+
+  # -------------------------------------------------------------------------
+  # publish: the only job that writes anything public, and the only one with
+  # `contents: write`. It lists build, smoke and checksums in `needs`, so it
+  # cannot run unless all six artifacts were built AND all six were executed.
+  #
+  # Skipped on a dry run: `version.outputs.publish` is false unless a `v*` tag was
+  # pushed or the dispatcher explicitly asked for it.
+  # -------------------------------------------------------------------------
+  publish:
+    name: Publish release
+    needs: [version, build, smoke, checksums]
+    if: needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: checksums
+          path: dist
+
+      - name: Attach assets to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
