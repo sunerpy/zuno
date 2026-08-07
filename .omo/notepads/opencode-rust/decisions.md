@@ -5650,3 +5650,53 @@ crate inherits the lint". Both are now tests, with floors (>= 300 source files,
 the key would accept unsafe code silently and no amount of scanning the other 33
 would see it. Measured today: 34/34 inherit, 0 keyword-position uses (22 textual
 mentions, all in doc comments).
+
+## [2026-08-07] Task 105: clamp the timestamp; do not touch the cache check
+
+Three options for the append-only cache violation:
+
+1. **Relax the tracker** — rejected. Todo 31 implements four mechanisms precisely to
+   protect the prompt-cache prefix; suppressing the assertion costs a cache hit on
+   every turn of every session and hides the real defect. The check was right: the
+   prefix genuinely changed.
+2. **Time-ordered ids** — the correct fix, deferred. It is a data-format change
+   touching the DB, the differential tests and every id parser. Recorded in
+   `issues.md` as an open todo.
+3. **Clamp `time_created` so a write cannot tie or precede what it follows** —
+   chosen. Two small additions to `oc-db`, which already owns the ordering contract,
+   applied at the two write sites. Small, local, and it also fixes a backwards
+   clock, which (2) would not.
+
+Placement decision: `created_after` and `latest_time_created` live in
+`oc-db::message` and not in the engine, because the hazard IS the `ORDER BY` in
+that module. Putting the escape hatch next to the rule it escapes is what gives a
+future reader both halves at once; in the engine it would read as an arbitrary
+`+1`.
+
+## [2026-08-07] Task 105: the regression test uses clock skew, not a same-millisecond tie
+
+A test that reproduces the actual tie would fail 15-25% of the time — a flaky test
+guarding against a flaky bug, which nobody can act on. `loop_reply_sorts_after_a_
+prompt_stamped_ahead_of_the_clock` instead persists the prompt 60 s ahead of the
+clock: an unclamped reply then sorts before it **every** time. Same invariant, 100%
+signal. Mutation-proved: removing only the clamp yields
+`Cache(HistoryPrefixChanged { turn: 2, index: 1 })`, the exact variant and indices
+of the original failure.
+
+**Generalisable**: when a bug's natural repro is a race, find the deterministic
+member of the same equivalence class rather than testing the race. Clock skew and an
+imported session reach the same state in production, so this is not a weaker test.
+
+## [2026-08-07] Task 105: the PTY test covers both submission shapes todo 88 issues
+
+`--prompt` (W-idle, W-real) and typing into the pty (W-soak, `perf/workload.rs:200-214`)
+are different code paths with nothing in common past the editor: the typed one goes
+through the terminal reader, the key dispatcher and the editor's `input_submit`
+binding. A green `--prompt` test says nothing about whether W-soak can be measured
+at all. Both now run the same shared assertion body, so they cannot drift into
+testing two different things while both passing.
+
+Deliberately NOT done: reproducing the harness's 0x0 pty. Our test sets
+`stty rows 40 cols 120` so the reply-on-screen assertion is meaningful; the harness
+keeps 0x0 because the oracle baseline was measured through 0x0 and the comparison
+must stay apples-to-apples. `perf/**` and `docs/perf-methodology.md` untouched.

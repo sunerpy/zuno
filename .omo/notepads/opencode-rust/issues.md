@@ -4730,3 +4730,46 @@ mise nor the shim.
 `warning: please specify --format-version flag explicitly to avoid compatibility
 problems` on every `make ci`. Harmless, but a warning nobody acts on trains people
 to ignore the gate's output.
+
+## [2026-08-07] Task 105: OPEN — random message ids make same-millisecond ordering a coin flip
+
+**Fixed by clamping, not by removing the hazard.** `oc_db::message::created_after`
+now guarantees a strictly increasing `time_created` at the two sites that write
+messages during a turn (`oc-engine/src/loop.rs::assistant_message`,
+`oc-cli/src/cmd/turn.rs::TurnHost::drive`). Any **third** write site that persists
+into a live session and forgets the clamp reintroduces the append-only cache
+violation, and it will do so only 15-25% of the time.
+
+The root hazard remains: `prefixed_id` is `Uuid::new_v4()` while
+`messages_for_session` ties on `id ASC`. Upstream's ids are time-ordered so the
+tie-break is meaningful there and meaningless here.
+
+**Proper fix, not done**: give messages and parts time-ordered ids (ULID-style, or
+`{millis:013}_{random}`) so the id tie-break carries the same information as the
+timestamp. That is a data-format change touching the DB, the differential tests and
+anything that parses an id, so it wants its own todo.
+
+**Until then**: every new message write into an existing session must go through
+`created_after(now_millis(), store.latest_time_created(session)?)`. A reviewer
+seeing a bare `now_millis()` in a message write should treat it as a defect.
+
+## [2026-08-07] Task 105: cargo-deny reports 10 pre-existing duplicate-version warnings
+
+`make ci` prints `warning[duplicate]` for base64, bitflags, getrandom, hashbrown,
+hashlink, r-efi, syn, thiserror, thiserror-impl, windows-sys, then `bans ok`. These
+are on `main`, not introduced by any task. Worth knowing so `grep -cE '^warning'`
+on `make ci` output is not mistaken for a clippy regression — **clippy itself is 0**;
+count clippy separately.
+
+## [2026-08-07] Task 105: `StatusView`'s new state landed untested
+
+The inherited tree added `StatusView::{IDLE, WORKING, is_running, mark_running}`
+and the `reset(false)` on turn end, all of it an explicit acceptance criterion, and
+`rg` found no test touching any of it — the only `is_running` assertions in the
+crate are on the unrelated `Transcript::is_running`. Added
+`views_status_strip_never_reads_idle_while_a_turn_is_under_way`.
+
+**Pattern to watch**: when a task's acceptance criterion names a behaviour and the
+implementing agent adds a *public accessor* for it, check that the accessor is
+actually asserted somewhere. An accessor with no caller is a criterion that was
+made observable and then not observed.

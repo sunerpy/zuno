@@ -5236,3 +5236,64 @@ the query broke — wrong `-p`, changed `cargo tree` output shape, a matcher tha
 matches nothing. Same shape as the lesson already in issues.md: *a check that can
 only detect one shape of failure is not a check.* Every "X is absent" assertion in
 this file carries a paired "the thing that would contain X is present".
+
+## [2026-08-07] Task 105: this port's random ids cannot express "later", and one refactor exposed it
+
+**The bug, in one line**: `MessageStore::messages_for_session` breaks a
+`time_created` tie with `ORDER BY … id ASC` — faithful to upstream, whose ids are
+*time-ordered identifiers* — but this port's ids are `Uuid::new_v4()`. Two messages
+written in the same millisecond therefore order by **coin flip**.
+
+Todo 105 moved the prompt's write to immediately before `run_turn`. `main` had
+~40 ms of `tool_runtime::assemble` between the prompt write and the first
+`assistant_message()`, which reliably crossed a millisecond boundary; `TurnHost`
+correctly moved that work into `open()`, the gap closed, and the flip started.
+Half the time the reply sorted **ahead of the prompt it answers**, the request
+prefix changed between step 1 and step 2, and todo 31's tracker refused it:
+
+```
+append-only cache violation on turn 2: stable history message 1 changed
+```
+
+**`main` was not correct — it was lucky, and the luck was load-bearing.** Any
+future change that removes work from between two writes in one session can bring
+this back. The fix is `oc_db::message::created_after(now, latest)` +
+`MessageStore::latest_time_created`, applied at both write sites
+(`loop.rs::assistant_message`, `turn.rs::TurnHost::drive`). The real fix would be
+time-ordered ids; the clamp is the cheap half and it is now pinned by
+`loop_reply_sorts_after_a_prompt_stamped_ahead_of_the_clock`.
+
+**Generalisable**: whenever this port keeps an upstream ordering rule whose
+tie-break depends on a property upstream's ids have and ours do not, the rule is
+correct and the *data* is wrong. Grep for other `ORDER BY … id` on tables we write
+with `prefixed_id`.
+
+## [2026-08-07] Task 105: `script -qefc` gives a real PTY with a 0x0 window size
+
+Measured: `script -qefc "sh -c 'stty size'" /dev/null < /dev/null` prints `0 0`.
+`script` copies the winsize from **its own stdin**, and under a test harness or
+`Stdio::piped()` that is a pipe with no size. The pty is real, `is_terminal()` is
+true, and the TUI paints 28 empty frames. It looks exactly like a render bug.
+
+Fix from inside the launched command, the only place that owns that terminal:
+
+```
+script -qefc "stty rows 40 cols 120; <program> …" /dev/null
+```
+
+`perf/workload.rs` has the same 0x0 pty and **must keep it**: the TS oracle
+baseline was measured through it, so it is apples-to-apples. It only means neither
+side pays for rendering.
+
+## [2026-08-07] Task 105: a nondeterministic failure reported as deterministic costs the diagnosis
+
+`.omo/WORKTREE.md` recorded this regression as "the refactor, not a flake". It was
+the refactor **and** a flake — 2 failures in 8 runs, ~15-25%. Its stated most-likely
+cause (`resolve_session`'s `&RunArgs` → `&TurnPlan`) was wrong, and a line-by-line
+diff of that function could never have found the real cause, because the cause was
+a change in **timing** with no logic difference. What found it was instrumenting
+`hydrate_session` and re-running until it failed.
+
+**Rule**: before asserting a failure is deterministic, run it at least 8 times.
+Before proposing a most-likely cause in a prompt, say how confident it is — a
+subagent that trusts a wrong localisation spends its budget in the wrong file.
