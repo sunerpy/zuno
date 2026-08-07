@@ -501,11 +501,11 @@ rather than a rewrite.
 
 | todo | crate | session | dispatched |
 |---|---|---|---|
-| 59 | `oc-plugin/wasm.rs` (feature-gated) | (below) | yes |
-| 61 | `oc-plugin/config_tools.rs` | (below) | yes |
-| 66 | `oc-agent/continuation.rs` | (below) | yes |
-| 77 | `oc-tui/attention.rs` | (below) | yes |
-| 80 | `oc-db/session_list.rs` + `oc-cli` | (below) | yes |
+| 59 | `oc-plugin/wasm.rs` (feature-gated) | `ses_026374ef2ffeVKvgfrfRZYyPia` | yes |
+| 61 | `oc-plugin/config_tools.rs` | `ses_026361cccffeNQv77T18EHJl3h` | yes |
+| 66 | `oc-agent/continuation.rs` | `ses_026341b32ffeK1NxLxxn9X2Cp6` | yes |
+| 77 | `oc-tui/attention.rs` | `ses_02630f437ffe1coQOH2A6rMTfS` | yes |
+| 80 | `oc-db/session_list.rs` + `oc-cli` | `ses_026327538ffe45xzIgZRzO17v4` | yes |
 | 87 | `oc-testkit/cassettes.rs` | — | **withdrawn**: `Blocked by: 29,30,31,86` — 86 needs all of 1-85, so 87 is a wave-14 task, not now. Worktree removed. |
 
 59 and 61 share `oc-plugin` (cap 2). 80 touches `oc-db` **and** `oc-cli`; nothing else
