@@ -494,8 +494,14 @@ pub enum CompactionError {
 }
 
 /// Run one bounded, LLM-backed compaction attempt.
+///
+/// `connection` is `&mut` although nothing here needs a transaction: an attempt
+/// interleaves database writes with a provider stream, so a shared `&Connection` held
+/// across those awaits would make the whole future non-`Send` and unspawnable — and
+/// the interactive surface drives its turns from a spawned task. Exclusive is also the
+/// honest signature for something that writes.
 pub async fn run_compaction<T, H>(
-    connection: &Connection,
+    connection: &mut Connection,
     provider: &dyn Provider,
     hooks: &H,
     state: &mut CompactionState,

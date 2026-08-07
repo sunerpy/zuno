@@ -36,6 +36,30 @@ use oc_testkit::{CassettePlayer, MockProvider, Scenario, ScriptedEnv};
 /// The recorded conversation both tests build on.
 const CASSETTE: &str = "openai-chat/drives-a-tool-loop-end-to-end";
 
+/// The recorded tool-free text completion that answers the prelude's title request.
+///
+/// The same recording todo 88's frozen harness uses for the same purpose
+/// (`crates/oc-testkit/src/perf/workload.rs:93`), for the same reason: every run now
+/// opens with exactly one tool-free request, because a new session generates its title
+/// before its first real turn. That is what makes the harness's
+/// `completed_tool_turns(captured) = (captured - PRELUDE_REQUESTS) / RESPONSES_PER_TURN`
+/// come out at 1 for one tool turn instead of 0.
+const TITLE_CASSETTE: &str = "openai-chat/streams-text";
+
+/// `PRELUDE_REQUESTS` and `RESPONSES_PER_TURN` from the frozen harness, in that order.
+///
+/// Duplicated here rather than imported because `oc-testkit`'s copies are
+/// crate-private and deliberately frozen — importing them would let a future edit to
+/// one silently retune this assertion, which is the massaged pass three earlier agents
+/// declined to produce. If these ever disagree with `perf/workload.rs:18-19`, the port
+/// has changed its request shape and the perf gate is no longer measuring what it
+/// measured from real 1.18.12 traffic.
+const FROZEN_PRELUDE_REQUESTS: usize = 1;
+const FROZEN_RESPONSES_PER_TURN: usize = 2;
+
+/// Total provider requests one tool turn must produce for the frozen gate to score it.
+const REQUESTS_FOR_ONE_TOOL_TURN: usize = FROZEN_PRELUDE_REQUESTS + FROZEN_RESPONSES_PER_TURN;
+
 /// The tool the recording calls, which this runtime deliberately does not have.
 const RECORDED_TOOL: &str = "get_weather";
 
@@ -160,6 +184,11 @@ fn advertised_tools(body: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The frozen harness's own arithmetic, reproduced so a failure names the number.
+const fn completed_tool_turns(captured_requests: usize) -> usize {
+    captured_requests.saturating_sub(FROZEN_PRELUDE_REQUESTS) / FROZEN_RESPONSES_PER_TURN
+}
+
 fn has_tool_result(body: &serde_json::Value) -> bool {
     body.get("messages")
         .and_then(serde_json::Value::as_array)
@@ -174,6 +203,8 @@ fn has_tool_result(body: &serde_json::Value) -> bool {
 async fn tool_turn_offers_the_assembled_registry_and_continues_after_a_tool_result() {
     let env = ScriptedEnv::new().expect("isolated environment");
     let scenario = Scenario::new("recorded-tool-loop")
+        .from_oracle_cassette(TITLE_CASSETTE)
+        .expect("the recorded text completion loads")
         .from_oracle_cassette(CASSETTE)
         .expect("the recorded tool loop loads");
     let provider = MockProvider::start(vec![scenario])
@@ -196,11 +227,31 @@ async fn tool_turn_offers_the_assembled_registry_and_continues_after_a_tool_resu
     );
     assert_eq!(
         captured.len(),
-        2,
-        "the turn did not send a second request, so the tool result never went back"
+        REQUESTS_FOR_ONE_TOOL_TURN,
+        "one tool turn must be one tool-free prelude request plus two turn requests; \
+         the frozen gate scores {} completed turn(s) from {} captured",
+        completed_tool_turns(captured.len()),
+        captured.len()
+    );
+    assert_eq!(
+        completed_tool_turns(captured.len()),
+        1,
+        "the frozen perf harness would still score this turn as incomplete"
     );
 
-    let first = captured[0].json().expect("the first request is JSON");
+    let prelude = captured[0].json().expect("the prelude request is JSON");
+    assert!(
+        advertised_tools(&prelude).is_empty(),
+        "the prelude request offered tools, but the title agent denies every one of \
+         them:\nbody:\n{prelude:#}"
+    );
+    assert!(
+        !has_tool_result(&prelude),
+        "the prelude request is the first thing on the wire and cannot carry a tool \
+         result:\n{prelude:#}"
+    );
+
+    let first = captured[1].json().expect("the first turn request is JSON");
     let offered = advertised_tools(&first);
     for required in REQUIRED_TOOLS {
         assert!(
@@ -210,7 +261,7 @@ async fn tool_turn_offers_the_assembled_registry_and_continues_after_a_tool_resu
         );
     }
 
-    let second = captured[1].json().expect("the second request is JSON");
+    let second = captured[2].json().expect("the second turn request is JSON");
     assert!(
         has_tool_result(&second),
         "the second request carries no tool result:\n{second:#}"
@@ -298,6 +349,8 @@ async fn tool_turn_executes_a_real_tool_and_the_side_effect_lands_on_disk() {
 
     let scenario = Scenario::new("write-tool-loop")
         .on_path("/v1/chat/completions")
+        .from_oracle_cassette(TITLE_CASSETTE)
+        .expect("the recorded text completion loads")
         .respond(write_tool_call_response(&recorded_first, &target))
         .respond(
             MockResponse::from_recorded(CASSETTE, 2, second).expect("the continuation decodes"),
@@ -318,7 +371,7 @@ async fn tool_turn_executes_a_real_tool_and_the_side_effect_lands_on_disk() {
     );
     assert_eq!(
         captured.len(),
-        2,
+        REQUESTS_FOR_ONE_TOOL_TURN,
         "the turn did not continue after the tool result"
     );
     assert_eq!(
@@ -328,14 +381,14 @@ async fn tool_turn_executes_a_real_tool_and_the_side_effect_lands_on_disk() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        captured[1]
+        captured[2]
             .json()
             .is_some_and(|body| has_tool_result(&body)),
         "the executed tool's result was not sent back to the model"
     );
     assert!(
         matches!(
-            captured[0].served_origin.as_ref(),
+            captured[1].served_origin.as_ref(),
             Some(ResponseOrigin::Authored { .. })
         ),
         "the rewritten first response must be reported as authored"

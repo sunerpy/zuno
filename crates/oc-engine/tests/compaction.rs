@@ -300,7 +300,7 @@ fn compaction_policy_honors_all_five_configuration_fields() {
 
 #[tokio::test]
 async fn compaction_summarizes_two_hundred_messages_with_the_small_model_and_resets_cache() {
-    let connection = seeded();
+    let mut connection = seeded();
     let mut entries = vec![entry("system", Role::System, "Initial project context", 20)];
     for turn in 0..100 {
         entries.push(entry(
@@ -368,7 +368,7 @@ async fn compaction_summarizes_two_hundred_messages_with_the_small_model_and_res
     let outcome = {
         let mut cache = CompactionCache::new(&mut tracker, &mut locked_tools);
         run_compaction(
-            &connection,
+            &mut connection,
             provider.as_ref(),
             &hooks,
             &mut state,
@@ -474,7 +474,7 @@ async fn compaction_summarizes_two_hundred_messages_with_the_small_model_and_res
 
 #[tokio::test]
 async fn compaction_failure_marks_the_summary_message_and_never_reenters() {
-    let connection = seeded();
+    let mut connection = seeded();
     let entries = valid_transcript(&[false, true, false, true]);
     let provider = CassetteProvider::new(vec![vec![Err(ProviderError::Fatal {
         status: Some(400),
@@ -511,7 +511,7 @@ async fn compaction_failure_marks_the_summary_message_and_never_reenters() {
     let mut cache = CompactionCache::new(&mut tracker, &mut locked_tools);
 
     let first = run_compaction(
-        &connection,
+        &mut connection,
         &provider,
         &hooks,
         &mut state,
@@ -531,7 +531,7 @@ async fn compaction_failure_marks_the_summary_message_and_never_reenters() {
     assert_eq!(state.context_limit_attempts(), 1);
 
     let second = run_compaction(
-        &connection,
+        &mut connection,
         &provider,
         &hooks,
         &mut state,

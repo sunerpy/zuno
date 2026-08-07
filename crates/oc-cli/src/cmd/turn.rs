@@ -30,16 +30,22 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use oc_agent::model_policy::{AnyModel, ModelChoice, ModelPolicy};
 use oc_auth::Credential;
+use oc_engine::compaction::{CompactionState, TokenWindow};
 use oc_engine::dispatch::ToolRegistryDispatcher;
 use oc_engine::interrupt::InterruptSignal;
 use oc_engine::r#loop::{
     AgentModelResolver, ResolvedAgent, ResolvedModel as EngineModel, RunTurnRequest, TurnContext,
-    TurnEventSender, run_turn,
+    TurnEvent, TurnEventSender, run_turn,
+};
+use oc_engine::prelude::{
+    InternalAgent, InternalProviders, Internals, PreludeContext, PreludeOutcome, run_prelude,
 };
 use oc_llm::cache::{DynamicContext, McpToolStatus};
 use oc_llm::catalog::{Catalog, CatalogSource, ResolveInput};
-use oc_llm::registry::{ApiSurface, ProviderRegistry, Spec};
+use oc_llm::event::StreamEvent;
+use oc_llm::registry::{ApiSurface, Provider, ProviderRegistry, Spec};
 use oc_provider_compatible::{ReqwestTransport, Transport, factory};
 use oc_tool::PermissionAsker;
 use serde_json::json;
@@ -109,6 +115,9 @@ pub(crate) struct TurnPlan {
     resolver: Resolver,
     session: SessionChoice,
     title: Option<String>,
+    internals: Internals,
+    window: TokenWindow,
+    notes: Vec<String>,
 }
 
 impl TurnPlan {
@@ -183,6 +192,19 @@ impl TurnPlan {
             wire_model: catalog_model.api.id.clone(),
             spec: model_spec(catalog_model),
         };
+        let window = TokenWindow {
+            context: token_count(catalog_model.limit.context),
+            max_output: token_count(catalog_model.limit.output),
+        };
+        let mut notes = Vec::new();
+        let internals = resolve_internals(
+            &config,
+            &catalog,
+            &provider_id,
+            &model_id,
+            catalog_model,
+            &mut notes,
+        )?;
         Ok(Self {
             directory,
             project,
@@ -194,8 +216,142 @@ impl TurnPlan {
             resolver,
             session: options.session.clone(),
             title: options.title.clone(),
+            internals,
+            window,
+            notes,
         })
     }
+}
+
+/// A catalog token ceiling, which is JSON and therefore a float, as a token count.
+///
+/// The catalog stores `limit.context` and `limit.output` as `f64` because
+/// `models.dev` publishes them as JSON numbers. A negative or non-finite value is
+/// zero rather than a wrapped integer, and zero is already meaningful:
+/// [`oc_engine::compaction::CompactionPolicy`] treats a zero window as
+/// "compaction cannot be triggered by a threshold", which is the correct reading of a
+/// model that declares no window.
+fn token_count(limit: f64) -> u64 {
+    if limit.is_finite() && limit > 0.0 {
+        limit as u64
+    } else {
+        0
+    }
+}
+
+/// Resolve `compaction`, `title` and `summary` through todo 64's model policy.
+///
+/// Iterates [`oc_agent::builtin::INTERNAL_NAMES`] rather than three literals, so an
+/// internal added there is resolved here with no edit — which is the whole reason
+/// that constant exists. Each name's prompt comes from
+/// [`oc_catalog::agent::builtin`], which is where the upstream native's text lives;
+/// nothing is written twice.
+///
+/// # Why an internal cannot leave the session's provider
+///
+/// [`ModelPolicy`] may legitimately answer with a model under a different provider,
+/// and this function then declines it and records why. [`TurnHost::open`] wires
+/// exactly one credential — the session provider's — so honouring a cross-provider
+/// answer would mean presenting that credential to a different vendor's endpoint.
+/// Falling back to the session's own model costs a larger model for a small job;
+/// the alternative costs the user's API key. The note is emitted on the turn's event
+/// channel so the downgrade is visible rather than silent.
+///
+/// The preset rung of the precedence chain is reachable but unfed: nothing in this
+/// workspace discovers a [`oc_agent::model_policy::PresetLibrary`] yet, so only the
+/// per-agent override and the session model can answer today.
+fn resolve_internals(
+    config: &oc_config::schema::Config,
+    catalog: &Catalog,
+    provider_id: &str,
+    model_id: &str,
+    session_model: &oc_llm::catalog::ResolvedModel,
+    notes: &mut Vec<String>,
+) -> Result<Internals, String> {
+    let session_choice = ModelChoice::new(format!("{provider_id}/{model_id}"));
+    let mut policy = ModelPolicy::new().with_session_model(session_choice);
+    if let Some(agents) = &config.agent {
+        policy = policy.with_agent_overrides(agents);
+    }
+
+    let mut resolved = std::collections::BTreeMap::new();
+    for name in oc_agent::builtin::INTERNAL_NAMES {
+        let prompt = internal_prompt(name)?;
+        let resolution = policy.resolve(name, &AnyModel);
+        notes.extend(resolution.render_diagnostics());
+        let chosen = resolution
+            .model
+            .as_ref()
+            .and_then(|choice| {
+                let (chosen_provider, chosen_model) = (choice.provider()?, choice.model_id()?);
+                if chosen_provider != provider_id {
+                    notes.push(format!(
+                        "{name}: `{}` is served by `{chosen_provider}`, and only \
+                         `{provider_id}`'s credential is wired for this turn; using \
+                         `{provider_id}/{model_id}` instead",
+                        choice.model
+                    ));
+                    return None;
+                }
+                let model = catalog.model(chosen_provider, chosen_model)?;
+                if !supports_compatible_transport(&model.api.npm) {
+                    notes.push(format!(
+                        "{name}: `{}` uses transport {}, which this runtime has no \
+                         provider for; using `{provider_id}/{model_id}` instead",
+                        choice.model, model.api.npm
+                    ));
+                    return None;
+                }
+                Some((chosen_model.to_owned(), model))
+            })
+            .unwrap_or_else(|| (model_id.to_owned(), session_model));
+        let (chosen_model_id, catalog_model) = chosen;
+        resolved.insert(
+            name,
+            InternalAgent {
+                name: name.to_owned(),
+                prompt,
+                model: EngineModel::new(
+                    model_spec(catalog_model),
+                    catalog_model.api.id.clone(),
+                    ApiSurface::Chat,
+                ),
+            },
+        );
+        debug_assert!(
+            catalog.model(provider_id, &chosen_model_id).is_some(),
+            "an internal resolved to a model the catalog does not carry"
+        );
+    }
+
+    let take = |name: &str| -> Result<InternalAgent, String> {
+        resolved
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("internal agent `{name}` did not resolve"))
+    };
+    Ok(Internals {
+        title: take("title")?,
+        compaction: take("compaction")?,
+        summary: take("summary")?,
+    })
+}
+
+/// The upstream native's prompt for one internal agent.
+///
+/// Read through [`oc_agent::builtin::internals`] rather than
+/// [`oc_catalog::agent::builtin`] directly, because the roster is what decides which
+/// internals this build has — reading past it would let the two disagree about the
+/// set while both looked correct.
+fn internal_prompt(name: &str) -> Result<String, String> {
+    oc_agent::builtin::internals()
+        .into_iter()
+        .find(|agent| agent.name == name)
+        .and_then(|agent| match agent.output {
+            oc_agent::builtin::OutputContract::EnginePrompt { prompt } => Some(prompt.to_owned()),
+            _ => None,
+        })
+        .ok_or_else(|| format!("internal agent `{name}` declares no prompt"))
 }
 
 /// An open database, an assembled tool set, and the session a turn runs in.
@@ -209,6 +365,26 @@ pub(crate) struct TurnHost {
     agent: String,
     provider_id: String,
     model_id: String,
+    internals: Internals,
+    compaction_config: oc_config::schema::CompactionConfig,
+    compaction_state: CompactionState,
+    window: TokenWindow,
+    notes: Vec<String>,
+}
+
+/// The registry answering for whichever spec an internal agent resolved to.
+///
+/// A newtype rather than an `impl` on [`ProviderRegistry`] because the trait belongs
+/// to `oc-engine` and the registry to `oc-llm`: neither crate may name the other's
+/// concern, and this composition root is the one place that may name both.
+struct RegistryProviders<'a>(&'a ProviderRegistry);
+
+impl InternalProviders for RegistryProviders<'_> {
+    fn provider_for(&self, agent: &InternalAgent) -> Result<Arc<dyn Provider>, String> {
+        self.0
+            .resolve(agent.model.provider.clone())
+            .map_err(to_string)
+    }
 }
 
 impl TurnHost {
@@ -275,6 +451,11 @@ impl TurnHost {
             agent: plan.agent.name,
             provider_id: plan.provider_id,
             model_id: plan.model_id,
+            internals: plan.internals,
+            compaction_config: plan.config.compaction.clone().unwrap_or_default(),
+            compaction_state: CompactionState::default(),
+            window: plan.window,
+            notes: plan.notes,
         })
     }
 
@@ -292,9 +473,26 @@ impl TurnHost {
     /// would sometimes file a new prompt ahead of the answer it follows and send the
     /// provider a conversation that never happened.
     ///
+    /// # The prelude runs between the prompt and the turn, in that order
+    ///
+    /// The `title` internal names a session from its opening exchange, so it needs the
+    /// prompt already stored; the turn needs whatever the `compaction` internal
+    /// decided, so it has to run after both. Sequencing rather than forking — upstream
+    /// forks the title (`session/prompt.ts:1133-1138`) — makes the number of provider
+    /// requests per turn a fact instead of a race, which is what lets the perf
+    /// harness's `completed_tool_turns` arithmetic mean anything.
+    ///
+    /// This is also why the prelude cannot disturb todo 31's append-only cache
+    /// tracker: [`run_turn`] builds a fresh [`oc_llm::cache::PromptCache`] per call
+    /// and every prelude write lands before the first `prepare_turn`, so the tracker
+    /// only ever sees one prefix. A prelude folded into the loop's continuation would
+    /// change the prefix between step 1 and step 2, which is exactly the violation
+    /// `oc-llm` refuses.
+    ///
     /// # Errors
     ///
-    /// Returns a message when the prompt cannot be persisted or the turn fails.
+    /// Returns a message when the prompt cannot be persisted, the prelude cannot read
+    /// the session, or the turn fails.
     pub(crate) async fn drive(
         &mut self,
         prompt: &str,
@@ -312,6 +510,8 @@ impl TurnHost {
             prompt,
             oc_db::message::created_after(oc_db::message::now_millis(), latest),
         )?;
+        let outcome = self.run_prelude().await?;
+        report_prelude(&events, &self.notes, &outcome).await?;
         run_turn(
             RunTurnRequest::new(
                 self.session_id.clone(),
@@ -331,6 +531,64 @@ impl TurnHost {
         .map_err(to_string)?;
         Ok(())
     }
+
+    /// Run every internal that applies before this turn.
+    ///
+    /// The `summary` internal is resolved by the same [`resolve_internals`] pass and
+    /// reached through the same [`PreludeContext`] as the other two, but nothing here
+    /// requests one: no surface in this workspace displays a session summary yet, and
+    /// inventing a command to prove the wiring would ship a subcommand upstream does
+    /// not have. What matters is that when a surface does want one it calls
+    /// [`oc_engine::prelude::summarize`] with this context rather than resolving a
+    /// second model of its own — resolving separately is exactly how all three
+    /// internals came to be declared and never invoked.
+    async fn run_prelude(&mut self) -> Result<PreludeOutcome, String> {
+        let providers = RegistryProviders(&self.providers);
+        let mut context = PreludeContext {
+            connection: &mut self.connection,
+            providers: &providers,
+            internals: &self.internals,
+            compaction: &self.compaction_config,
+            window: self.window,
+            state: &mut self.compaction_state,
+        };
+        run_prelude(&self.session_id, &mut context)
+            .await
+            .map_err(to_string)
+    }
+}
+
+/// Put every prelude decision on the turn's own event channel.
+///
+/// The channel and not stderr, because the interactive surface owns the terminal and a
+/// line written past it either vanishes or corrupts the frame — the same argument
+/// `tui.rs` makes for reporting turn failures this way. Reporting at all is the point:
+/// a session that could not be named and a history that could not be compacted are
+/// both losses the user is entitled to see, and "no output" is how the three internals
+/// stayed missing through 3,057 passing tests.
+async fn report_prelude(
+    events: &TurnEventSender,
+    notes: &[String],
+    outcome: &PreludeOutcome,
+) -> Result<(), String> {
+    let mut details: Vec<String> = notes.to_vec();
+    if let Some(title) = &outcome.title {
+        details.push(format!("session titled: {title}"));
+    }
+    if outcome.compacted {
+        details.push("history compacted before this turn".to_owned());
+    }
+    details.extend(outcome.skipped.iter().cloned());
+    for detail in details {
+        events
+            .publish(TurnEvent::Provider {
+                step: 0,
+                event: StreamEvent::StatusDetail { detail },
+            })
+            .await
+            .map_err(to_string)?;
+    }
+    Ok(())
 }
 
 fn select_model<'a>(
