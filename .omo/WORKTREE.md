@@ -1141,3 +1141,63 @@ invisible to a green suite. **Two of the last three were first-launch failures f
 user**, found only because a perf gate refused to fake a number.
 
 Session `ses_02210d5a7ffeim5kVovHbnxsqE`.
+
+## Wave 27 (2026-08-07): the sixth seam closed, 88 dispatched for the sixth time
+
+`main` = 3095 tests, **103/108 done**. Todo 108 merged.
+
+### Todo 108's fix, verified by me against both binaries
+
+Under `env -i`, empty cache, `OPENCODE_DISABLE_MODELS_FETCH=1`, a config-only provider, and
+**no `OPENCODE_MODELS_PATH`**:
+
+```
+$ opencode-rust models
+test/test-model            exit=0
+```
+and the released 1.18.12 binary agrees — `grep -c "^test/test-model"` returns 1 for the
+same config.
+
+The unknown-model path is preserved and improved. It now names the model *and* all three
+ways out:
+
+> `model 'nope/nothing' is not available: no 'provider' block in your configuration
+> defines it, OPENCODE_DISABLE_MODELS_FETCH is set so no fetch … was attempted, and no
+> cached catalog exists at … Define the provider and model under 'provider' in your config,
+> or unset OPENCODE_DISABLE_MODELS_FETCH …, or set OPENCODE_MODELS_PATH …`
+
+That is strictly better than what it replaced: the old message could not name the model
+because it fired before the lookup.
+
+**The design is the interesting part.** `CatalogProvenance::unresolved_model` returns an
+error *only* for `FetchForbidden`, and `select_model` calls it **inside** the
+`ok_or_else` — after the catalog lookup has already failed. Its doc comment states the
+invariant: *"Calling this before checking the resolved catalog would resurrect the defect
+it exists to avoid: a config that fully specifies the requested model has nothing to look
+up and must not see an error at all."*
+
+I mutated exactly that — hoisting the provenance check above the lookup — and
+`a_config_specified_model_selects_with_no_catalog_at_all` failed. The ordering is
+load-bearing and pinned.
+
+Both `OPENCODE_MODELS_PATH` injections are gone from the seam tests, replaced by a comment
+recording why: *"Injecting a fixture here is what hid todo 108 — the binary could not start
+without one — through five waves."*
+
+### Six seams, six identical failures, three of them first-launch
+
+`/api/event` 404 · prune's unattributable 4.19 GB · tool execution · the internal agents ·
+legacy databases · config-only providers.
+
+**Three of the last four would have stopped a real user on first launch**, and all three
+were found only because a perf gate refused to fake a number. The plan's own verification
+strategy did not catch them; an agent declining to measure a broken subject did.
+
+### 88's sixth attempt
+
+All five blockers closed, and both of its earlier structural findings confirmed usable.
+The remaining risk is purely the wall clock: ~100 minutes of measurement, and its last two
+runs died at 636s and 652s on product bugs now fixed. It was told to preserve per-launch
+figures and report partial verdicts rather than losing everything again.
+
+Session `ses_021e9d6eaffemW7aUekVWRwEUG`.
