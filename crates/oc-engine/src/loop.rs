@@ -1095,6 +1095,15 @@ fn completion_request(
         model_id: model.model_id.clone(),
         surface: model.surface,
         messages: prepared.messages().to_vec(),
+        tools: prepared
+            .tools()
+            .iter()
+            .map(|tool| oc_llm::registry::ToolSchema {
+                name: tool.id.clone(),
+                description: tool.description.clone(),
+                parameters: tool.parameters.clone(),
+            })
+            .collect(),
     }
 }
 

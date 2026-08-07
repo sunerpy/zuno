@@ -22,7 +22,11 @@ pub enum Disposition {
 pub struct CommandDisposition {
     /// Symbol extracted from `packages/opencode/src/index.ts`.
     pub upstream_symbol: &'static str,
-    /// User-facing command spelling, or `$0` for the default TUI command.
+    /// User-facing command spelling.
+    ///
+    /// `TuiThreadCommand` is upstream's default command with no name of its own;
+    /// this port gives it the explicit spelling `tui` and *also* accepts the bare
+    /// invocation, so the row names `tui` and the registration check can find it.
     pub command: &'static str,
     /// Whether and how this crate registers it.
     pub disposition: Disposition,
@@ -147,9 +151,9 @@ const COMMAND_DISPOSITIONS: [CommandDisposition; 23] = [
     },
     CommandDisposition {
         upstream_symbol: "TuiThreadCommand",
-        command: "$0",
-        disposition: Disposition::NotRegistered,
-        reason: "the default interactive command needs the ratatui application and terminal lease owned by the TUI wave; use a registered headless command until then",
+        command: "tui",
+        disposition: Disposition::Implemented,
+        reason: "registered as `tui` and as the bare invocation upstream spells `$0`; it boots oc-tui's application over the terminal lease from todo 73 and the views from todo 76",
     },
     CommandDisposition {
         upstream_symbol: "UninstallCommand",

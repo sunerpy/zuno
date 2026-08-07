@@ -94,7 +94,7 @@ pub struct Cli {
     #[arg(long, global = true, action = ArgAction::SetTrue)]
     pub pure: bool,
 
-    /// The selected command. No command is explicit while the TUI owner is pending.
+    /// The selected command. Absent means the interactive TUI, as upstream's `$0`.
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -120,14 +120,9 @@ impl Cli {
         let environment = StartupEnvironment::resolve(base, &self.globals());
         match self.command {
             Some(command) => command.action(environment),
-            None => Action::Rejected {
-                command: "$0",
-                message: disposition_for("$0").map_or(
-                    "the default TUI command is not registered yet; use a headless command",
-                    |entry| entry.reason,
-                ),
-                environment,
-            },
+            // Upstream's default command is the TUI, so a bare invocation dispatches
+            // exactly what `tui` does rather than explaining an absence.
+            None => dispatch(DispatchArguments::Tui(TuiArgs::default()), environment),
         }
     }
 }
@@ -210,6 +205,13 @@ pub struct RunArgs {
     #[arg(long, default_value_t = false)]
     pub auto: bool,
 }
+
+/// The interactive terminal application, which takes no arguments of its own.
+///
+/// A struct rather than a unit variant so the dispatch seam keeps one shape for
+/// every command, and so a later flag does not change the variant's arity.
+#[derive(Debug, Clone, Default, Args)]
+pub struct TuiArgs {}
 
 #[derive(Debug, Clone, Args)]
 pub struct ServeArgs {
@@ -543,6 +545,8 @@ pub enum DebugSnapshotCommand {
 pub enum Command {
     /// Run OpenCode with a message.
     Run(RunArgs),
+    /// Start the interactive terminal application. Also the default with no command.
+    Tui(TuiArgs),
     /// Start the headless server.
     ///
     /// Its owner wraps [`oc_server::ServerBuilder`] through a dependency added by
@@ -592,6 +596,7 @@ impl Command {
     fn action(self, environment: StartupEnvironment) -> Action {
         match self {
             Self::Run(args) => dispatch(DispatchArguments::Run(args), environment),
+            Self::Tui(args) => dispatch(DispatchArguments::Tui(args), environment),
             Self::Serve(args) => dispatch(DispatchArguments::Serve(args), environment),
             Self::Session(args) => dispatch(DispatchArguments::Session(args), environment),
             Self::Agent(args) => dispatch(DispatchArguments::Agent(args), environment),
@@ -648,6 +653,8 @@ fn reject(command: &'static str, environment: StartupEnvironment) -> Action {
 pub enum ImplementedCommand {
     /// `run`.
     Run,
+    /// `tui`, and the bare invocation upstream registers as `$0`.
+    Tui,
     /// `serve`; wraps the `oc-server` library rather than its standalone binary.
     Serve,
     /// `session`.
@@ -678,6 +685,7 @@ impl ImplementedCommand {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Run => "run",
+            Self::Tui => "tui",
             Self::Serve => "serve",
             Self::Session => "session",
             Self::Agent => "agent",
@@ -696,6 +704,7 @@ impl ImplementedCommand {
 #[derive(Debug, Clone)]
 pub enum DispatchArguments {
     Run(RunArgs),
+    Tui(TuiArgs),
     Serve(ServeArgs),
     Session(SessionArgs),
     Agent(AgentArgs),
@@ -712,6 +721,7 @@ impl DispatchArguments {
     pub const fn command(&self) -> ImplementedCommand {
         match self {
             Self::Run(_) => ImplementedCommand::Run,
+            Self::Tui(_) => ImplementedCommand::Tui,
             Self::Serve(_) => ImplementedCommand::Serve,
             Self::Session(_) => ImplementedCommand::Session,
             Self::Agent(_) => ImplementedCommand::Agent,
@@ -823,6 +833,7 @@ mod tests {
             &["mcp", "list"],
             &["db"],
             &["debug", "paths"],
+            &["tui"],
             &["completion"],
             &["export"],
             &["import"],
@@ -833,6 +844,18 @@ mod tests {
             let action = cli.action(&Env::empty());
             assert!(matches!(action, Action::Dispatch(_)), "{}", args[0]);
         }
+    }
+
+    #[test]
+    fn a_bare_invocation_dispatches_the_tui_like_upstreams_default_command() {
+        // Upstream registers the TUI as `$0`, so a bare invocation must reach the
+        // same handler as `tui` rather than explain that no command was given.
+        let cli = Cli::try_parse_from(["opencode-rust"]).expect("a bare invocation parses");
+        let Action::Dispatch(request) = cli.action(&Env::empty()) else {
+            panic!("a bare invocation must dispatch");
+        };
+        assert_eq!(request.command, ImplementedCommand::Tui);
+        assert!(matches!(request.args, DispatchArguments::Tui(_)));
     }
 
     #[test]

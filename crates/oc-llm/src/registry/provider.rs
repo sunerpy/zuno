@@ -39,6 +39,7 @@
 pub use crate::event::{FinishReason, Message, Role, StreamEvent};
 use crate::registry::spec::ApiSurface;
 use oc_error::ProviderError;
+use serde_json::Value;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -153,18 +154,49 @@ pub struct CompletionRequest {
     pub surface: ApiSurface,
     /// The turn, in order.
     pub messages: Vec<Message>,
+    /// The tools this request offers the model, already frozen for the turn.
+    ///
+    /// Carried here rather than on the provider because the set is a property of
+    /// the *request*: it is the snapshot the turn loop locked, and dispatch is
+    /// checked against exactly what the model was shown. A provider that held its
+    /// own tool list could answer with a call the loop would then refuse.
+    pub tools: Vec<ToolSchema>,
+}
+
+/// One tool as the model is told about it, before any provider's wire shape.
+///
+/// Provider-neutral on purpose: `oc-llm` does not depend on `oc-tool`, and each
+/// family nests these three fields differently — OpenAI under
+/// `function`, Anthropic and Gemini at the top level. Translating in the provider
+/// keeps this spine free of any one vendor's envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolSchema {
+    /// The name the model calls.
+    pub name: String,
+    /// The description the model reads.
+    pub description: String,
+    /// The JSON Schema for the arguments.
+    pub parameters: Value,
 }
 
 impl CompletionRequest {
     /// A request for `model_id` carrying `messages` on the provider's default
-    /// surface.
+    /// surface, offering no tools.
     #[must_use]
     pub fn new(model_id: impl Into<String>, messages: Vec<Message>) -> Self {
         Self {
             model_id: model_id.into(),
             surface: ApiSurface::Default,
             messages,
+            tools: Vec::new(),
         }
+    }
+
+    /// Offer `tools` to the model on this request.
+    #[must_use]
+    pub fn with_tools(mut self, tools: Vec<ToolSchema>) -> Self {
+        self.tools = tools;
+        self
     }
 
     /// Pin this request to a specific SDK surface.

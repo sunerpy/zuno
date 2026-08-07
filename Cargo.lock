@@ -2446,6 +2446,7 @@ dependencies = [
 name = "oc-cli"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "clap",
  "oc-agent",
@@ -2454,6 +2455,7 @@ dependencies = [
  "oc-config",
  "oc-db",
  "oc-engine",
+ "oc-error",
  "oc-llm",
  "oc-lsp",
  "oc-mcp",
@@ -2468,8 +2470,10 @@ dependencies = [
  "oc-search",
  "oc-server",
  "oc-snapshot",
+ "oc-testkit",
  "oc-tool",
  "oc-tools",
+ "oc-tui",
  "reqwest",
  "rusqlite",
  "serde",

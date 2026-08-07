@@ -53,6 +53,7 @@ pub mod permission;
 pub mod picker;
 pub mod question;
 pub mod scroll;
+pub mod session;
 
 #[cfg(test)]
 #[path = "views/views_tests.rs"]

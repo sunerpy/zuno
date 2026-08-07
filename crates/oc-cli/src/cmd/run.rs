@@ -14,7 +14,6 @@ use oc_llm::catalog::{Catalog, CatalogSource, ResolveInput};
 use oc_llm::event::{ConnectionPhase, StreamEvent};
 use oc_llm::registry::{ApiSurface, ProviderRegistry, Spec};
 use oc_provider_compatible::{ReqwestTransport, Transport, factory};
-use oc_tool::AllowAll;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -123,10 +122,19 @@ pub(super) fn execute(args: &RunArgs, environment: &StartupEnvironment) -> Resul
     )?;
 
     let interrupt = InterruptSignal::new();
+    let runtime_tools = crate::cmd::tool_runtime::assemble(
+        &directory,
+        worktree,
+        env,
+        &config,
+        selected_agent,
+        &provider_id,
+        &model_id,
+    )?;
     let dispatcher = ToolRegistryDispatcher::new(
-        Vec::new(),
-        Vec::new(),
-        Arc::new(AllowAll),
+        runtime_tools.tools,
+        runtime_tools.rules,
+        Arc::new(crate::cmd::tool_runtime::HeadlessApproval),
         InterruptSignal::new(),
         McpToolStatus::Ready,
     );

@@ -49,7 +49,15 @@ fn list(environment: &StartupEnvironment) -> Result<(), String> {
     Ok(())
 }
 
-struct DynamicRules {
+/// The rule patterns that cannot be written down ahead of time.
+///
+/// They name resolved paths — the tool-output directory, the temp directory, the
+/// discovered skill and reference directories, the plan directory — so they are
+/// computed once per invocation and then handed to [`resolved_rules`]. This is
+/// `pub(crate)` because `run` needs the same ruleset the listing prints: a
+/// permission set that a user can read with `agent list` but that the turn loop
+/// does not actually enforce would be worse than having no listing at all.
+pub(crate) struct DynamicRules {
     readonly_external: Vec<Rule>,
     truncate_glob: String,
     plan_directory_glob: String,
@@ -57,7 +65,7 @@ struct DynamicRules {
 }
 
 impl DynamicRules {
-    fn resolve(
+    pub(crate) fn resolve(
         directory: &Path,
         worktree: Option<&Path>,
         env: &oc_paths::Env,
@@ -99,7 +107,11 @@ impl DynamicRules {
     }
 }
 
-fn resolved_rules(entry: &agent::Agent, config: &Config, dynamic: &DynamicRules) -> Vec<Rule> {
+pub(crate) fn resolved_rules(
+    entry: &agent::Agent,
+    config: &Config,
+    dynamic: &DynamicRules,
+) -> Vec<Rule> {
     let mut rules = default_rules(dynamic);
 
     if entry.source.is_native()

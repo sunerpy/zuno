@@ -514,6 +514,40 @@ pub fn terminal_event_channel() -> (mpsc::Sender<TerminalEvent>, mpsc::Receiver<
     mpsc::channel(TERMINAL_EVENT_CHANNEL_CAPACITY)
 }
 
+/// How long the input producer waits for a key before re-checking for shutdown.
+///
+/// Short enough that leaving the TUI does not visibly stall on the last poll, long
+/// enough that an idle terminal is not a busy loop.
+pub const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Read the physical terminal and forward every event until the consumer is gone.
+///
+/// This is the producer half of [`App`]'s terminal channel, and it lives here
+/// rather than in a host because it is the only code that has to know crossterm's
+/// reader is synchronous: the poll and the read run on blocking threads, while the
+/// send is **awaited**, so a burst of input applies backpressure instead of being
+/// dropped. Returning on a closed channel is what lets the task end promptly once
+/// the application has exited.
+pub async fn forward_terminal_input(sender: mpsc::Sender<TerminalEvent>) {
+    while !sender.is_closed() {
+        match tokio::task::spawn_blocking(|| crossterm::event::poll(INPUT_POLL_INTERVAL)).await {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => continue,
+            Ok(Err(_)) | Err(_) => return,
+        }
+        let Ok(Ok(event)) = tokio::task::spawn_blocking(crossterm::event::read).await else {
+            return;
+        };
+        let event = match event {
+            CrosstermEvent::Resize(width, height) => TerminalEvent::Resize { width, height },
+            other => TerminalEvent::Input(other),
+        };
+        if sender.send(event).await.is_err() {
+            return;
+        }
+    }
+}
+
 /// A TUI event-loop failure.
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {

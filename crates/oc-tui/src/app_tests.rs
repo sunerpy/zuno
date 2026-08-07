@@ -578,3 +578,18 @@ fn app_declares_bounded_lossless_channel_capacities() {
         "the TUI consumes the engine's declared lossless bounded channel"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn app_the_input_producer_returns_once_its_consumer_is_gone() {
+    // The boot path aborts this task, but a producer that could only end by being
+    // aborted would keep a blocking thread alive across a clean exit. One poll
+    // interval is the whole budget.
+    let (sender, receiver) = terminal_event_channel();
+    let producer = tokio::spawn(forward_terminal_input(sender));
+    drop(receiver);
+
+    tokio::time::timeout(INPUT_POLL_INTERVAL * 4, producer)
+        .await
+        .expect("the producer must notice a closed channel within a few polls")
+        .expect("the producer must not panic");
+}
