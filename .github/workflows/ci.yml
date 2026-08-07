@@ -1,0 +1,207 @@
+# CI: every gate `make ci` runs locally, plus the ones that need a clean machine.
+#
+# The contract with the Makefile is deliberate: `fmt-check`, `lint`, `test`,
+# `deny` and `artifact` below invoke the SAME make targets a developer runs, so
+# "green locally" and "green in CI" cannot drift into meaning different things.
+#
+# Two jobs exist here that `make ci` cannot fully cover on a developer machine:
+#
+#   * `artifact` proves the packaging and smoke path works on every push, not only
+#     when someone cuts a tag. The release workflow's six-target matrix is far too
+#     slow for a per-commit gate, but its host leg is not — and a release pipeline
+#     whose smoke step is first exercised during the real release is untested.
+#   * `windows` catches the platform-specific failures a Linux developer cannot
+#     see: path separators, and the two Windows targets the release ships.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  BINARY_NAME: opencode-rust
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      # No `toolchain:` input: rust-toolchain.toml pins 1.96.0 and the components,
+      # and naming a channel here would silently override it.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: rustfmt,clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `--locked` first and on its own: a lock file that cannot be reproduced
+      # makes every later failure look like a code problem, and a plain
+      # `cargo build` silently repairs it. Learned the hard way merging wave 7.
+      - name: Verify the lock file is reproducible
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+      - name: Format check
+        run: make fmt-check
+
+      - name: Clippy
+        run: make lint
+
+      - name: Test suite
+        run: make test
+
+  # The supply-chain gate is its own job so a licence or advisory failure is
+  # legible at a glance instead of buried in a 3000-test log.
+  supply-chain:
+    name: Supply chain
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      # Online here on purpose: cargo-deny fetches the RUSTSEC advisory database,
+      # and the whole point of the advisories check is to be current. `make deny`
+      # is the offline-capable local equivalent.
+      - name: cargo deny
+        run: cargo deny --all-features check
+
+  # -------------------------------------------------------------------------
+  # artifact: the release pipeline's packaging + smoke path, on the host leg.
+  #
+  # Same three checks the release workflow runs against all six archives —
+  # `--version`, `--help`, and a headless `run` against a committed cassette —
+  # against a real release build that was packaged and unpacked first. Cheap
+  # enough for every push, and it means a break in the smoke driver or the
+  # cassette surfaces on the pull request that caused it.
+  # -------------------------------------------------------------------------
+  artifact:
+    name: Artifact smoke (host)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: artifact
+
+      - name: Package and smoke
+        run: make smoke-artifact
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test suite
+        run: cargo test --workspace
+
+  # -------------------------------------------------------------------------
+  # ci-success: the single status check to require in branch protection.
+  #
+  # It must be a STRICT gate. `needs.<job>.result` can be success, failure,
+  # cancelled or skipped; a check that rejects only `failure` passes a run that
+  # was cancelled by a newer push or skipped entirely. Combined with
+  # `cancel-in-progress: true` above, that would let a green tick sit on a run
+  # whose tests never finished. Anything other than `success` fails here,
+  # including any result value GitHub adds in future.
+  #
+  # The results are read from `toJSON(needs)` rather than named one by one, so
+  # adding a job to `needs:` below makes it required with no change to the script.
+  # GitHub cannot close the remaining gap — the `needs` context contains only the
+  # jobs listed in `needs:`, so a job never added there is invisible to this gate
+  # however the expression is written. `crates/oc-cli/tests/release_surface.rs`
+  # closes it from outside by asserting `ci-success.needs` lists every job in this
+  # file.
+  # -------------------------------------------------------------------------
+  ci-success:
+    name: CI Success
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [test, supply-chain, artifact, windows]
+    steps:
+      - name: Check every required job succeeded
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NEEDS_JSON:-}" ]; then
+            echo "::error title=CI gate::the needs context was empty; failing closed."
+            exit 1
+          fi
+          if ! printf '%s' "$NEEDS_JSON" | jq -e 'type == "object" and length > 0' > /dev/null 2>&1; then
+            echo "::error title=CI gate::the needs context did not parse as a non-empty object; failing closed."
+            printf 'needs context was: %s\n' "$NEEDS_JSON"
+            exit 1
+          fi
+          # A job whose `result` key is absent renders as <missing> and fails.
+          mapfile -t rows < <(
+            printf '%s' "$NEEDS_JSON" \
+              | jq -r 'to_entries | sort_by(.key)[] | "\(.key)\t\(.value.result // "<missing>")"'
+          )
+          if [ "${#rows[@]}" -eq 0 ]; then
+            echo "::error title=CI gate::no required jobs in the needs context; failing closed."
+            exit 1
+          fi
+          offenders=0
+          for row in "${rows[@]}"; do
+            job="${row%%$'\t'*}"
+            result="${row#*$'\t'}"
+            if [ "$result" = "success" ]; then
+              printf '  ok   %-14s %s\n' "$job" "$result"
+            else
+              printf '  FAIL %-14s %s\n' "$job" "$result"
+              echo "::error title=CI gate::required job '${job}' concluded '${result}', not 'success'."
+              offenders=$((offenders + 1))
+            fi
+          done
+          if [ "$offenders" -ne 0 ]; then
+            echo "CI failed: ${offenders} of ${#rows[@]} required job(s) did not conclude 'success'."
+            exit 1
+          fi
+          echo "CI passed: all ${#rows[@]} required job(s) concluded 'success'."

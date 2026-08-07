@@ -1,5 +1,9 @@
 /target
 
+# Release archives and the unpacked artifact `make smoke-artifact` exercises.
+# Build outputs, never source.
+/dist
+
 # Reference clones of the projects this port draws on (~570 MB). Task 1 copies
 # them here from /tmp so the References lines in .omo/plans stop dangling; they
 # are other people's repositories and must never enter this history.

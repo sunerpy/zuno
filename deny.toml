@@ -1,0 +1,133 @@
+# cargo-deny: the supply-chain gate for the release pipeline.
+#
+# Run by `make deny`, by the CI `supply-chain` job, and therefore before any
+# artifact is published. Every list below is deliberately an ALLOW list: a new
+# transitive dependency carrying an unreviewed licence or coming from an unknown
+# registry turns the build red rather than shipping quietly.
+#
+# WHY the allow list looks long: it was not guessed. It is the exact set of
+# licence expressions present in this workspace's resolved graph, enumerated
+# from `cargo metadata --locked --offline` and then narrowed until cargo-deny
+# reported no unmatched entry. With cargo-deny's stock configuration this
+# workspace produces 392 `error[rejected]: failed to satisfy license
+# requirements`, because the stock configuration allows nothing.
+
+[graph]
+# No `targets` restriction on purpose. Narrowing the graph to the six shipped
+# triples would make the audit weaker in a way that is invisible from its output:
+# a crate that only links on a platform outside the list stops being judged at
+# all. Auditing every target is the stronger gate and, measured here, costs
+# nothing — the full graph passes.
+#
+# `wasm` stays off (plan todo 59 made it a cargo feature and
+# `crates/oc-plugin/tests/wasmtime_feature_gate.rs` holds it off by default).
+# Enabling all features would pull `wasmtime` into the audited graph and make
+# this file assert something about a dependency no default artifact contains.
+all-features = false
+# Dev-dependencies are IN scope. A compromised test-only crate still runs on
+# developer machines and on CI runners that hold a checkout and a token, which is
+# a real blast radius even though it never reaches a published artifact.
+exclude-dev = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+# No `ignore` entries today. When one becomes necessary it must carry the RUSTSEC
+# id and a sentence saying why the vulnerable path is unreachable here; an
+# unexplained ignore is indistinguishable from an unnoticed vulnerability.
+ignore = []
+# Scoped to direct workspace dependencies: an unmaintained crate we chose is a
+# decision to revisit, whereas one buried five levels down is not actionable and
+# would only train people to ignore this gate.
+unmaintained = "workspace"
+yanked = "deny"
+
+[licenses]
+# Permissive only. Every entry is present in the resolved graph today.
+allow = [
+  "MIT",
+  "MIT-0",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "BSL-1.0",
+  "Unlicense",
+  # The `icu_*` family and `unicode-ident` ship their data tables under this.
+  "Unicode-3.0",
+]
+confidence-threshold = 0.9
+
+# A dual-licensed crate is judged on its best option, so `MIT OR MPL-2.0`
+# (termina) and `CC0-1.0 OR MIT-0 OR Apache-2.0` (dunce) resolve against the
+# list above and need no help. The three exceptions below are crates that offer
+# a single non-standard licence and nothing else. Each is named individually so
+# that adding a fourth is a visible decision rather than an inherited one.
+
+# Public-domain dedication. Permissive in substance but not OSI-approved, so it
+# is granted per-crate instead of workspace-wide.
+[[licenses.exceptions]]
+name = "notify"
+allow = ["CC0-1.0"]
+
+# The Mozilla CA bundle, published under a *data* licence with no code-licence
+# alternative. Reached through rustls-platform-verifier <- reqwest.
+[[licenses.exceptions]]
+name = "webpki-root-certs"
+allow = ["CDLA-Permissive-2.0"]
+
+# Weak, file-scoped copyleft. `option-ext` is a two-function helper reached
+# through dirs <- dirs-sys; MPL-2.0's reciprocity applies per-file to files this
+# workspace does not modify, so linking it does not affect our own licensing.
+# Deliberately NOT a workspace-wide allow: the next MPL-2.0 crate should have to
+# be looked at rather than inherit this reasoning.
+[[licenses.exceptions]]
+name = "option-ext"
+allow = ["MPL-2.0"]
+
+[licenses.private]
+# The 34 first-party crates are all `publish = false` with `license = "MIT"`.
+# Ignoring them keeps this gate about third-party code.
+ignore = true
+
+[bans]
+# Duplicate major versions are a size and audit-surface cost, not a correctness
+# problem, and a workspace this size cannot dedupe them unilaterally. Reported,
+# not fatal — 12 pairs today.
+multiple-versions = "warn"
+# A `*` version requirement on a registry crate is not a reproducible release
+# input. The first-party crates are exempt because a workspace path dependency
+# legitimately carries no version requirement
+# (`oc-cli = { path = "crates/oc-cli" }`), and all 34 are `publish = false`.
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+
+# The no-OpenSSL constraint (plan todo 1), stated declaratively as well as in
+# `crates/oc-cli/tests/release_surface.rs`. Two mechanisms because they fail
+# differently: the test names the offending dependency path and runs offline
+# inside `make ci`; this list also covers target/feature combinations the test's
+# `cargo tree` invocation does not resolve.
+#
+# `openssl-probe` is deliberately ABSENT. It only locates the host certificate
+# store, links nothing, and is legitimately present via rustls-native-certs <-
+# rustls-platform-verifier <- reqwest. Banning it — or matching the substring
+# "openssl" — produces a false positive that someone would then "fix" by
+# loosening the check until it stopped catching the real thing.
+deny = [
+  { name = "openssl", reason = "TLS is rustls-only; OpenSSL must not enter the graph" },
+  { name = "openssl-sys", reason = "the crate that actually links libssl/libcrypto" },
+  { name = "openssl-src", reason = "vendors and builds the OpenSSL C sources" },
+  { name = "native-tls", reason = "selects the platform TLS stack, which is OpenSSL on Linux" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# No git dependencies. A git source pins a commit that can be force-pushed away,
+# which is not a reproducible release input.
+allow-git = []
