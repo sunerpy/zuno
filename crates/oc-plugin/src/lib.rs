@@ -17,3 +17,8 @@ pub use crate::jsonrpc::*;
 pub use crate::manifest::*;
 pub use crate::payload::*;
 pub use crate::provider::*;
+
+#[cfg(feature = "wasm")]
+pub mod wasm;
+#[cfg(feature = "wasm")]
+pub use crate::wasm::*;

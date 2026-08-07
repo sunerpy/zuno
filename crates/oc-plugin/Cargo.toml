@@ -9,6 +9,10 @@ repository.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+wasm = ["dep:wasmtime"]
+
 [[bin]]
 name = "oc-example-plugin"
 path = "../../examples/rust_plugin.rs"
@@ -33,6 +37,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
+wasmtime = { workspace = true, optional = true }
 
 [dev-dependencies]
 oc-testkit = { workspace = true }
