@@ -4161,3 +4161,18 @@ clarifications rather than errors:
   (`cli/cmd/session.ts:87`) with no way off, so `--roots` names the existing
   default and `--no-roots` is the new escape hatch. Making `--roots` opt-in would
   have changed the no-flag behaviour, which the plan does not ask for.
+
+## [2026-08-07] Task 62: sibling-worktree LSP boundary
+
+The integrated `lsp_diagnostics` tool is rooted at the main checkout and rejects
+`/config/workspace/ProdDir/AI/oc-wt/t62/...` as outside its request cwd. This is the
+same tool boundary previously observed by Tasks 73 and 77, not a source diagnostic.
+`rust-analyzer diagnostics crates/oc-plugin/tests/integration.rs` completed cleanly
+from the task worktree; feature-on/off `cargo check`, clippy with `-D warnings`, and
+both package test matrices also passed.
+
+## [2026-08-07] Task 81: liveness and descendant-protection pitfalls
+
+- `/api/session/active` is process-local evidence. An empty response from a reachable server means no IDs reported active by that process; it must not trigger the recency fallback. No reachable server is the distinct state that activates the fallback.
+- Filtering protected rows after subtree expansion is unsafe: it strands a selected parent. The selector instead rejects an age-eligible root when any descendant is protected and records `ProtectedDescendant` evidence for preview.
+- Proptest writes `tests/retention.proptest-regressions` on an intentional mutation failure; remove that generated mutation artifact after restoring the implementation.

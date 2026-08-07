@@ -4775,3 +4775,30 @@ the CLI could never list across projects while `/experimental/session` always
 could. `ProjectScope` is a two-arm enum with **no `Default`**, so the ambient
 project is now a *resolved default in the CLI layer* that a flag overrides, not a
 hidden predicate in the store.
+
+## [2026-08-07] Task 62: three-tier integration without private process handles
+
+- A single heterogeneous `HookBus` is the only useful ordering oracle. The test
+  uses noncommutative mutations (`[x]`, then `!`, then duplication) so tier
+  grouping, sorting, or reversed iteration cannot accidentally pass.
+- Public loaders do not expose child handles or PIDs. Exact lifecycle testing can
+  still stay outside implementation code: a `/bin/sh` `exec` wrapper records the
+  JSON-RPC PID without introducing an intermediate process, while the JS fixture
+  records `process.pid` during initialization. Shutdown then polls only those
+  recorded PIDs with a deadline.
+- Failure isolation must positively observe the surviving tiers, not merely assert
+  one diagnostic. Killing JSON-RPC yields `[x|x]`; fuel-halting WASM yields `[x!]`;
+  removing JS yields `x!|x!`.
+- Feature-off coverage remains visible by retaining the six named test targets and
+  printing an explicit skip reason. Runtime absence in the dedicated JS degradation
+  case is an assertion path, not a suite skip.
+- Mutation proofs confirmed both load-bearing assertions: reversed bus iteration
+  changed `[x]!|[x]!` to `[x|x!]`, and suppressing WASM dispose failed with
+  `dispose did not reach surviving wasm tier`.
+
+## [2026-08-07] Task 81: retention selection must close whole subtrees
+
+- Age eligibility applies to candidate roots, then selection expands through every transitive `parent_id` descendant; an old child never pulls in its newer parent. A visited set is mandatory because `parent_id` has no FK and cycles are schema-valid.
+- Protection is evaluated over the entire candidate subtree. A shared, compacting, active, or no-server-recent descendant vetoes its ancestor candidate; otherwise retaining that descendant while selecting the ancestor would violate closure.
+- Liveness is an injected probe result, not a database inference. Reachable `/api/session/active` responses protect reported IDs; only `Unreachable` activates the default one-hour `time_updated` fallback.
+- Mutation proof was non-vacuous: replacing descendant traversal with the root alone shrank to a two-node tree (`[(0,false),(0,false)]`) and selected 1 of 2 rows.

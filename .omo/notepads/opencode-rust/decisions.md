@@ -5062,3 +5062,27 @@ listing everything.
 paginated client seeing a row twice. `SessionSort::column` and
 `session::from_row` became `pub(crate)` for the same reason: one decoder, one
 column list, one order.
+
+## [2026-08-07] Task 62: integration-test lifecycle boundaries
+
+**No production PID accessor was added.** Child identity is a test concern here:
+the JSON-RPC fixture is launched through a shell that writes `$$` and immediately
+`exec`s the real plugin, and the JS fixture writes `process.pid`. This records the
+actual owned children while preserving the production API and permits exact-PID
+orphan checks instead of process-table pattern matching.
+
+**Dispose is dispatched before transport shutdown.** After intentionally killing
+the JSON-RPC sibling, the shared bus receives `HookInvocation::Dispose`; only then
+do the surviving process loaders shut down and reap. A tracking adapter observes
+that every still-enabled tier was traversed, while the JS fixture independently
+persists a marker from its real dispose callback.
+
+**WASM-off is explicit, not silent.** The integration target keeps the same six
+test names under the inverse cfg and emits a reason naming the required `wasm`
+feature and Unix PID controls. The real tests run only with both capabilities.
+
+## [2026-08-07] Task 81: retention selector boundary
+
+- `oc-db::retention::select` is read-only and returns a preview-oriented report: selected rows with inclusion reasons plus age-eligible exclusions with direct or descendant protection reasons. It emits no `DELETE`; mutation remains a later service concern.
+- Scope is explicit (`CurrentProject`, named `Project`, or `AllProjects`), `time_updated` is the default age key, `time_created` is opt-in, and age uses a strict `< cutoff` boundary. `time_archived` is intentionally absent from protection.
+- Public `LivenessProbe` makes server discovery fakeable without coupling `oc-db` to HTTP. The process edge may aggregate reachable local servers into `Liveness::Reachable`; `Liveness::Unreachable` preserves the honest uncertainty boundary.
