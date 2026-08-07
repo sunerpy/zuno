@@ -820,7 +820,7 @@ Dependency direction is strictly downward from `oc-cli`; `oc-engine` never depen
   QA scenarios: happy - switching themes at runtime re-renders with the new palette; failure - a custom theme missing a key inherits it from the built-in base and logs which key was defaulted. Evidence `.omo/evidence/task-75-opencode-rust.txt`
   Commit: Y | `feat(tui): four-layer theme resolution with 33 built-in themes`
 
-- [ ] 76. `crates/oc-tui/src/views/`: implement the chat view, dialogs, autocomplete, and editor/clipboard integration - expect off-screen assertions for each view
+- [x] 76. `crates/oc-tui/src/views/`: implement the chat view, dialogs, autocomplete, and editor/clipboard integration - expect off-screen assertions for each view
   What to do / Must NOT do: implement the message/part rendering (text, reasoning with its own affordance, tool calls with status, diffs honoring `diff_style`, attachments), the input editor with history and multi-line handling, autocomplete for commands/files/agents, the dialog set (session picker, model picker, agent picker, permission prompt, question prompt, theme picker, help), scrolling honoring `scroll_speed`/`scroll_acceleration`, and external `$EDITOR` and clipboard integration; every view must render into an off-screen buffer for tests. Must NOT reproduce upstream pixel-for-pixel (out of scope) — reproduce **capability**. Must NOT block the event loop on a dialog.
   Parallelization: Wave 12 | Blocked by: 73,74,75 | Blocks: 86
   References: `packages/tui/src/**` (204 files / 31,729 LOC — the capability inventory, not a porting target); the permission and question prompt contracts from todos 16 and 43; `packages/tui/src/config/index.tsx` (`prompt`, `diff_style`, scroll keys).
