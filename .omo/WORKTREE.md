@@ -1201,3 +1201,24 @@ runs died at 636s and 652s on product bugs now fixed. It was told to preserve pe
 figures and report partial verdicts rather than losing everything again.
 
 Session `ses_021e9d6eaffemW7aUekVWRwEUG`.
+
+## Wave 28 (2026-08-07): todo 109 dispatched — the seventh seam
+
+Todo 88's harness merged (**3104 tests**), verdict still UNMEASURABLE. Blocker #6 is a real
+product defect: `options.baseURL` is ignored, so a provider configured the standard upstream
+way has no endpoint. Verified by me against our binary under one clean env —
+`unrecoverable provider failure` with only `options.baseURL`, `transient provider failure`
+once a top-level `api` is added, proving the second dials and the first never does.
+
+Oracle spec: `provider.ts:355-358`, `options.endpoint ?? options.baseURL`. Upstream's
+`model.api` is an **SDK-shape hint** (`:230-232` picks `sdk.responses` vs `sdk.chat`;
+`:368` reads `api.npm`), not a URL. We conflated them.
+
+**Second instance of one anti-pattern in two waves**: #5 was an injected env var
+(`OPENCODE_MODELS_PATH`), #6 an injected config key (`"api"`). Generalised rule now in the
+notepad: *a fixture that supplies something the real input shape does not have hides a defect.*
+
+Todo 88 stays open, now `Blocked by: 86,93,109`. Its resumable harness survives the fix via a
+context fingerprint, so the ~50 minutes of completed passes are not thrown away.
+
+worktree: oc-wt/t109 | branch task-109
