@@ -43,7 +43,7 @@ use oc_engine::prelude::{
     InternalAgent, InternalProviders, Internals, PreludeContext, PreludeOutcome, run_prelude,
 };
 use oc_llm::cache::{DynamicContext, McpToolStatus};
-use oc_llm::catalog::{Catalog, CatalogSource, ResolveInput};
+use oc_llm::catalog::{Catalog, CatalogProvenance, CatalogSource, ResolveInput};
 use oc_llm::event::StreamEvent;
 use oc_llm::registry::{ApiSurface, Provider, ProviderRegistry, Spec};
 use oc_provider_compatible::{ReqwestTransport, Transport, factory};
@@ -151,7 +151,7 @@ impl TurnPlan {
             .all()
             .map_err(to_string)?
             .entries;
-        let document = CatalogSource::resolve(env, &layout)
+        let loaded = CatalogSource::resolve(env, &layout)
             .load()
             .await
             .map_err(to_string)?;
@@ -164,7 +164,7 @@ impl TurnPlan {
                     .collect(),
             )
             .with_experimental_models(env.flag(OPENCODE_ENABLE_EXPERIMENTAL_MODELS));
-        let catalog = Catalog::resolve(&document, &input);
+        let catalog = Catalog::resolve(loaded.document(), &input);
 
         let agents =
             oc_catalog::agent::load(&directory, worktree.as_deref(), env).map_err(to_string)?;
@@ -174,7 +174,8 @@ impl TurnPlan {
             .find(|entry| entry.name == agent_name)
             .ok_or_else(|| format!("Agent not found: {agent_name}"))?;
         let requested_model = options.model.as_deref().or(agent.model.as_deref());
-        let (provider_id, model_id, catalog_model) = select_model(&catalog, requested_model)?;
+        let (provider_id, model_id, catalog_model) =
+            select_model(&catalog, requested_model, loaded.provenance())?;
         if !supports_compatible_transport(&catalog_model.api.npm) {
             return Err(format!(
                 "model {provider_id}/{model_id} uses transport {}, but this runtime currently supports OpenAI-compatible transports",
@@ -591,17 +592,27 @@ async fn report_prelude(
     Ok(())
 }
 
+/// Pick the model this turn runs on.
+///
+/// Takes the [`CatalogProvenance`] rather than just the catalog because an absent
+/// model means two different things. The lookup happens against the **resolved**
+/// catalog, config already merged in, so a config that fully specifies its provider
+/// and model succeeds here with no catalog at all — that is todo 108's fix, and it is
+/// why the provenance is consulted only after the lookup has already failed.
 fn select_model<'a>(
     catalog: &'a Catalog,
     requested: Option<&str>,
+    provenance: &CatalogProvenance,
 ) -> Result<(String, String, &'a oc_llm::catalog::ResolvedModel), String> {
     if let Some(requested) = requested {
         let (provider_id, model_id) = requested
             .split_once('/')
             .ok_or_else(|| format!("model must be provider/model, got {requested:?}"))?;
-        let model = catalog
-            .model(provider_id, model_id)
-            .ok_or_else(|| format!("Model not found: {requested}"))?;
+        let model = catalog.model(provider_id, model_id).ok_or_else(|| {
+            provenance
+                .unresolved_model(requested)
+                .map_or_else(|| format!("Model not found: {requested}"), to_string)
+        })?;
         return Ok((provider_id.to_owned(), model_id.to_owned(), model));
     }
 
@@ -619,7 +630,18 @@ fn select_model<'a>(
             return Ok((provider_id.to_owned(), model_id.to_owned(), model));
         }
     }
-    Err("no available model; configure a provider credential or provider block".to_owned())
+    let mut message =
+        "no available model; configure a provider credential or provider block".to_owned();
+    if let CatalogProvenance::FetchForbidden { origin, cache } = provenance {
+        // Nothing was requested, so there is no model to name — but "no available
+        // model" alone would let a forbidden fetch read as "you configured nothing".
+        message.push_str(&format!(
+            ", or allow the catalog to load: OPENCODE_DISABLE_MODELS_FETCH is set, so \
+             `{origin}` was not contacted and no cached catalog exists at `{}`",
+            cache.display()
+        ));
+    }
+    Err(message)
 }
 
 fn supports_compatible_transport(npm: &str) -> bool {

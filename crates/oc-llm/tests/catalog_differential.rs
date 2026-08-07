@@ -71,6 +71,45 @@ fn document() -> CatalogDocument {
     serde_json::from_str(PINNED).expect("the pinned fixture parses")
 }
 
+/// Run `opencode models` with **no** catalog available at all and return its stdout.
+///
+/// The scenario todo 108 exists for: `OPENCODE_DISABLE_MODELS_FETCH=1`, an empty
+/// cache directory, and deliberately **no** `OPENCODE_MODELS_PATH`. Injecting a
+/// fixture is what hid the defect, so this one must not.
+///
+/// `enabled_providers` narrows the comparison to the config's own provider on
+/// purpose. Upstream falls back to a snapshot compiled into its bundle
+/// (`models-dev.ts:198-200`) which holds that release's seven `opencode/*` gateway
+/// models; this crate deliberately ships none (see `catalog/source.rs`). Without the
+/// allow-list the diff would report that known, declared listing difference instead of
+/// the property under test, which is whether a self-specified provider resolves
+/// identically on both sides.
+fn oracle_models_without_a_catalog(oracle: Oracle, config_json: &str) -> Option<(String, String)> {
+    let env = ScriptedEnv::new().expect("scripted env");
+    std::fs::write(env.project().join("opencode.json"), config_json).expect("write config");
+    let env = env.set("OPENCODE_DISABLE_MODELS_FETCH", "1");
+    assert!(
+        !env.env_vars().contains_key("OPENCODE_MODELS_PATH"),
+        "this scenario is void if a catalog fixture is injected"
+    );
+
+    let version = oracle.reported_version().to_owned();
+    match oracle.with_env(env).run(["models"]) {
+        Ok(outcome) if outcome.is_success() => Some((outcome.stdout, version)),
+        Ok(outcome) => {
+            println!(
+                "SKIP: the oracle exited {:?}\nstdout:\n{}\nstderr:\n{}",
+                outcome.exit_code, outcome.stdout, outcome.stderr
+            );
+            None
+        }
+        Err(error) => {
+            println!("SKIP: the oracle could not be run: {error}");
+            None
+        }
+    }
+}
+
 /// Run `opencode models` against the pinned fixture and return its stdout plus
 /// the version that produced it.
 ///
@@ -287,6 +326,53 @@ fn parity_across_every_provider_in_the_fixture_at_once() {
         ),
         &[],
     );
+}
+
+/// Todo 108's differential: a config-only provider, with no catalog on either side.
+///
+/// The measurement this test automates: before the fix our binary exited 1 with
+/// "the model catalog is unavailable" while 1.18.12 exited 0 and printed
+/// `test/test-model`.
+#[test]
+fn parity_for_a_config_only_provider_with_no_catalog_available() {
+    const CONFIG: &str = r#"{"enabled_providers":["test"],
+        "provider":{"test":{"name":"Test","id":"test","env":[],
+          "npm":"@ai-sdk/openai-compatible","api":"https://gateway.internal/v1",
+          "models":{"test-model":{"id":"test-model","name":"Test Model",
+            "tool_call":true,"limit":{"context":100000,"output":10000},
+            "cost":{"input":0,"output":0}}},
+          "options":{"apiKey":"k","baseURL":"https://gateway.internal/v1"}}}}"#;
+
+    let Some(oracle) = oracle() else {
+        return;
+    };
+    let Some((oracle_stdout, version)) = oracle_models_without_a_catalog(oracle, CONFIG) else {
+        return;
+    };
+    println!("differential `config-only, no catalog` ran against oracle version {version}");
+
+    let config: Config = serde_json::from_str(CONFIG).expect("config parses");
+    // The empty document is what `CatalogSource::load` now returns under this policy.
+    let lines = Catalog::resolve(
+        &CatalogDocument::new(),
+        &ResolveInput::new().with_config(&config),
+    )
+    .model_lines();
+    assert_eq!(
+        lines,
+        vec!["test/test-model"],
+        "the config-only model must resolve with no catalog at all"
+    );
+    let ours = format!("{}\n", lines.join("\n"));
+
+    let report = diff_normalized(
+        "oc-llm::catalog",
+        &ours,
+        format!("opencode {version} models"),
+        &oracle_stdout,
+        &Normalizer::none(),
+    );
+    report.assert_identical();
 }
 
 #[test]

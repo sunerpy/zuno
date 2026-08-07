@@ -16,7 +16,10 @@
 //! out of order changes the answer:
 //!
 //! 1. **Load** the models.dev document — [`source::CatalogSource`]. Three env vars
-//!    decide where from, and whether the network may be touched at all.
+//!    decide where from, and whether the network may be touched at all. The
+//!    document may legitimately be **empty**: with fetching disabled and no cache,
+//!    the oracle returns `{}` rather than failing (`models-dev.ts:222`), and stage 3
+//!    is what makes a self-contained `provider.*` block work anyway.
 //! 2. **Lift** every catalog provider into resolved shape, expanding
 //!    `experimental.modes` into their own model ids — [`merge::from_catalog`].
 //! 3. **Extend** from `provider.*` config, which may add models, add whole
@@ -75,7 +78,7 @@ pub use crate::catalog::error::CatalogError;
 pub use crate::catalog::merge::MergeOutcome;
 pub use crate::catalog::models_dev::{CatalogDocument, CatalogProvider, CatalogStatus};
 pub use crate::catalog::resolved::{ResolvedModel, ResolvedProvider};
-pub use crate::catalog::source::CatalogSource;
+pub use crate::catalog::source::{CatalogProvenance, CatalogSource, LoadedCatalog};
 
 /// Everything resolution needs that is not the catalog document itself.
 ///

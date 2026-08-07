@@ -129,13 +129,12 @@ fn variables(env: &ScriptedEnv, base_url: &str) -> BTreeMap<String, String> {
         ("TERM".to_owned(), "dumb".to_owned()),
         ("OPENCODE_PURE".to_owned(), "1".to_owned()),
         ("OPENCODE_AUTH_CONTENT".to_owned(), "{}".to_owned()),
+        // No `OPENCODE_MODELS_PATH`: the config below fully specifies `test/test-model`,
+        // so a catalog is not needed to resolve it. Injecting a fixture here is what hid
+        // todo 108 — the binary could not start without one — through five waves.
         (
             "OPENCODE_DISABLE_MODELS_FETCH".to_owned(),
             "true".to_owned(),
-        ),
-        (
-            "OPENCODE_MODELS_PATH".to_owned(),
-            models_fixture().to_string_lossy().into_owned(),
         ),
         (
             "OPENCODE_CONFIG_CONTENT".to_owned(),
@@ -143,10 +142,6 @@ fn variables(env: &ScriptedEnv, base_url: &str) -> BTreeMap<String, String> {
         ),
     ]);
     variables
-}
-
-fn models_fixture() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../oc-llm/tests/fixtures/models-dev-pinned.json")
 }
 
 /// Launch the real binary and wait for it, bounded.
