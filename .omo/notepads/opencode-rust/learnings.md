@@ -4629,3 +4629,149 @@ that no longer exists creates a one-message conversation and calls it a continua
 `message_count -> Option<usize>` makes "absent" distinguishable from "empty", so that
 case becomes a refusal that also drops the stale lane from the board. A `usize` return
 would have reported `0` and the append would have silently succeeded.
+
+## [2026-08-07] Task 59: an optional WebAssembly component hook tier
+
+**The empty component linker is the capability boundary.** The host inspects component
+imports before instantiation and rejects every import, including WASI filesystem and
+socket interfaces. That is stronger and easier to audit than constructing a broad WASI
+context and trying to subtract authority later. A future grant must become an explicit
+field on `WasmPluginSpec` and one deliberately linked interface.
+
+**Fuel, epoch interruption, and store limits cover different failure classes.** Fuel
+halts instruction-heavy loops deterministically; an epoch deadline bounds wall-clock
+execution; `StoreLimits` caps linear-memory growth and object counts. All three budgets
+are reset per invocation. A failure disables only that resident component, records a
+typed `PluginDiagnostic`, and returns success to the shared sequential `HookBus`, so a
+bad guest cannot abort sibling hooks or the turn.
+
+**JSON strings make the component ABI stable while Rust hook payloads evolve.** The WIT
+world exports one function for every `HookName::ALL` entry. Inputs and replacement
+outputs cross as JSON strings; the currently observable mutation codec is
+`experimental-chat-system-transform`. The one-to-one export table and a test over
+`HookName::ALL` make a newly added authoritative hook fail until the WIT is updated.
+
+**Optional means absent from the normal dependency graph, not merely unused in code.**
+`wasmtime = 47.0.3` is exact-pinned, has default features disabled, and is reachable only
+through `oc-plugin/wasm`. An offline `cargo tree --no-default-features` integration test
+mechanically proves that the default `oc-plugin` graph contains no `wasmtime` package.
+Mutation-removing `optional = true` made that test fail with the complete leaked graph.
+
+## [2026-08-07] Task 61: Zod schemas stay with the resident JavaScript host
+
+The real fixture uses Zod v4 from
+`/config/workspace/ProdDir/AI/opencode/packages/opencode/node_modules/zod`. The test
+symlinks that package into an isolated fixture's `node_modules`, so the TypeScript
+module imports exactly `zod` as a user tool does. Absence of Bun/Node, Zod, or Unix
+symlink support produces an explicit `SKIP` line instead of a vacuous green test.
+
+The two conversion paths differ materially. When every `args` member is a Zod type,
+the shim builds `z.object(args)`, calls Zod's own `toJSONSchema`, and retains that same
+object for `safeParse` before every execution. Optionality and enum semantics therefore
+come from Zod itself. A non-Zod shape instead filters JSON-Schema-like object/boolean
+members into `properties` and marks the retained keys required; no Zod semantics are
+invented in Rust. Rust receives only the finished JSON Schema and a stable tool index.
+
+Config modules are imported concurrently but their collected results retain config
+directory, `tool` before `tools`, sorted filename, and export order. A failed import is
+one diagnostic attached to its source path and does not hide healthy sibling modules.
+Execution uses the existing resident-host timeout, memory ceiling, restart policy, and
+terminal/permission bridge. After a restart, the callable handle is re-resolved from
+the stable tool index rather than reusing a stale JavaScript handle id.
+
+## [2026-08-07] Task 80: cross-project session listing, and how to point the real binary at a fixture DB
+
+### The real binary opens whatever `OPENCODE_DB` names — measured, not assumed
+
+`packages/core/src/database/database.ts:44-47`:
+
+```ts
+if (Flag.OPENCODE_DB) {
+  if (Flag.OPENCODE_DB === ":memory:" || isAbsolute(Flag.OPENCODE_DB)) return Flag.OPENCODE_DB
+  return join(Global.Path.data, Flag.OPENCODE_DB)
+}
+```
+
+So an **absolute** path is used verbatim. Verified end to end: seeded three
+projects and five sessions into a file with `sqlite3`, started
+`opencode serve --port <n> --hostname 127.0.0.1` with `OPENCODE_DB=<that file>`,
+and `GET /experimental/session` returned exactly those rows with their project
+summaries. `oc_paths::db_path` honours the same variable, so **both binaries can
+be pointed at one file** and the differential is a real set equality rather than
+two independently seeded stores. This is the missing piece task 52's notepad
+recorded as "no live differential was run".
+
+Three operational gotchas, each of which cost a cycle:
+
+1. **`--port 0` does not give you an ephemeral port.** The oracle prints
+   `opencode server listening on http://127.0.0.1:4096` — it silently falls back
+   to its default. Reserve a port with `TcpListener::bind("127.0.0.1:0")`, read
+   `local_addr().port()`, drop the listener, and pass that number.
+2. **This machine exports `http_proxy=http://127.0.0.1:1080`**, and a loopback
+   request through it returns `HTTP 000`. `curl --noproxy '*'` works; from Rust,
+   a raw `TcpStream` sidesteps it entirely.
+3. **The oracle's server ignores `Connection: close`.** `read_to_end` blocks
+   until the read timeout (`WouldBlock` after 20s). Read the headers, take
+   `Content-Length`, then `read_exact` that many bytes.
+
+`reqwest::blocking` is **not** available in this workspace — the workspace table
+enables `form`/`json`/`stream`/`rustls`/`charset`/`http2` and no `blocking`.
+Adding it would edit a manifest five sibling crates share, so the differential
+speaks HTTP/1.1 on a raw socket (~70 lines including a chunked branch).
+
+### The one byte-level divergence in the whole payload: `2.0` vs `2`
+
+With the shapes otherwise identical, `serde_json::to_string` and
+`JSON.stringify` disagreed on exactly one thing: an integral `f64`. JavaScript
+has one numeric type, so `cost: 2` (SQLite `real`) serialises as `2`; Rust emits
+`2.0`. Both parse to the same number, and `serde_json::Value` equality says
+they are equal — so a *semantic* comparison passes while the bytes differ. Any
+client that hashes, caches or diffs the document sees two different documents.
+
+Fixed with a `serialize_with` that emits an integer when `fract() == 0.0` and the
+value fits `i64`. `1e300` is integral but does not fit, and falls through to the
+float path, which renders `1e+300` — which is also what `JSON.stringify` writes.
+NaN and infinity have a NaN `fract()` so they never reach the cast.
+
+**The differential asserts both** `Value` equality and `to_string` equality. The
+byte check is the one that found this.
+
+### The composed listing query, and its cost
+
+One statement: the row filter as a subquery (so `LIMIT` applies to *sessions*,
+before any join), then `LEFT JOIN project`, then a correlated
+`(SELECT COUNT(*) FROM message WHERE message.session_id = listed.id)`.
+
+- **`LEFT`, not inner.** A session whose `project` row is gone must still list
+  with `project: null` — upstream preserves it too, via `?? null`
+  (`session.ts:595`), because its version is two statements and a map lookup.
+- **Correlated, not `GROUP BY`.** A joined grouped aggregate scans and groups the
+  whole `message` table — the largest table in the database — even to list ten
+  sessions. The correlated form runs one index probe per **returned row** against
+  the existing `message_session_time_created_id_idx` (`schema.rs:208`), so cost is
+  bounded by the page size, not by the message count. No new index was needed and
+  none was added; the schema is locked by todo 20's byte-compat snapshot.
+- **Cost needs no aggregate at all** — `session.cost` is maintained on the row.
+
+Upstream's `listGlobal` is instead two statements plus an `IN (…)` lookup
+(`session.ts:578-595`). One statement is fewer round trips and identical output;
+the differential proves the output is identical.
+
+### `--archived` widens. It is not a filter.
+
+`session.ts:564` is `if (!input?.archived) conditions.push(isNull(time_archived))`.
+The flag *removes* a predicate. `oc-db`'s `ArchivedFilter` is three-way
+(`Any`/`Active`/`Archived`) because todo 21 needed the exclusive form elsewhere,
+so `GlobalListRequest::archived` is deliberately a **`bool`** that maps only to
+`Any`/`Active` — exposing the three-way enum at the CLI boundary is an invitation
+to wire `--archived` to `Archived` and silently redefine it.
+
+### Where the `session list` scope actually came from
+
+`Session.list` reads `InstanceState.context` and pushes `projectID: ctx.project.id`
+into every query (`session.ts:548-555`); `listByProject` then makes it the first,
+unconditional predicate (`:964`). No input turns it off. That is the whole reason
+the CLI could never list across projects while `/experimental/session` always
+could. `ProjectScope` is a two-arm enum with **no `Default`**, so the ambient
+project is now a *resolved default in the CLI layer* that a flag overrides, not a
+hidden predicate in the store.

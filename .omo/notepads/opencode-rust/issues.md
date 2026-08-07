@@ -4032,3 +4032,132 @@ made anywhere in the module docs or the errors.
 The plan lists 66 as blocking 67-69, but all three landed earlier. Checked for
 regression rather than assuming: `oc-goal` untouched, `cargo build --workspace` and
 `cargo clippy --workspace --all-targets` both clean.
+
+## [2026-08-07] Task 59: verification boundaries and integration seam
+
+**The integrated `lsp_diagnostics` tool cannot address the sibling worktree.** It is
+rooted at `/config/workspace/ProdDir/AI/opencode-rust` and rejected changed files under
+`/config/workspace/ProdDir/AI/oc-wt/t59` as outside the request cwd. Compiler diagnostics
+were instead covered by successful feature-off/on builds and strict all-target Clippy
+runs with `-D warnings`; formatting and targeted tests are also clean.
+
+**Only `ChatSystemTransform` has a concrete replacement-output codec in this task.** The
+WIT and export discovery cover all 21 authoritative hooks, but hooks without mutable
+output currently receive `null` and ignore the returned JSON. This is intentional scope,
+not a claim that every future mutable payload is already adapted. Todo 62 can register
+the tier through `WasmPluginLoad::hook_bus()` without special dispatch, while later hook
+payload owners add codecs to `encode_hook`/`apply_hook_output`.
+
+**The epoch timer uses one short-lived host thread per bounded operation.** It gives a
+hard wall-clock interrupt without adding an ambient async runtime requirement, but it is
+not a throughput optimization. If the WASM tier later becomes high-volume, replace it
+with a shared epoch ticker while preserving per-store deadlines and the same tests.
+
+## [2026-08-07] Task 61: two small plan/seam corrections
+
+The plan guessed `/config/workspace/ProdDir/AI/opencode/node_modules/zod`; that path
+does not contain the package. The real package used by the oracle is under
+`packages/opencode/node_modules/zod` (and another copy exists under
+`packages/plugin/node_modules/zod`). The fixture points at the former and documents
+the `OPENCODE_ZOD_FIXTURE` override.
+
+`oc-tools` already exposed both required seams: `config_tool_id` and
+`CustomToolLoader`. No change outside `oc-plugin` was needed. The collision algorithm,
+however, existed only inside `PluginLoad::validate_tool_names`; Task 61 needed the same
+check with source paths. It was factored into a crate-private helper in `jsonrpc.rs`,
+preserving the old messages while adding `DuplicateSources { first, second }`.
+
+The integrated `lsp_diagnostics` tool remains rooted at the main checkout and rejects
+linked-worktree paths. `rust-analyzer diagnostics .` was run from the Task 61 worktree;
+the changed files had no errors or warnings, only expected workspace-wide
+`inactive-code` weak diagnostics for disabled `#[cfg]` branches.
+
+## [2026-08-07] Task 80: a behavioural tie test cannot detect a missing `id` tie-break
+
+**This is the finding of the task, and it invalidates the obvious test.**
+
+The plan asked for a mutation proof: "drop the `id DESC` tiebreak → a test must
+catch the nondeterminism (write one that does)". I wrote the natural one — eight
+sessions sharing one `time_updated`, inserted in **ascending** id order, asserting
+the listing comes back descending. Then I dropped the tie-break from
+`session::list_sql`.
+
+**The test passed.** SQLite returned the rows descending anyway.
+
+The mechanism, measured with a probe test that printed both orders:
+
+```
+PROBE composed order: ["ses_tie_08", … "ses_tie_01"]   <- session_list::list
+PROBE plain order:    ["ses_tie_01", … "ses_tie_08"]   <- session::list
+```
+
+Two separate reasons the assertion was blind:
+
+1. **The composed query has its own outer `ORDER BY`.** `session_list::list`
+   wraps the row query as a subquery and re-sorts, so its outer
+   `ORDER BY listed.time_updated DESC, listed.id DESC` masked the inner mutation
+   completely. Dropping the tie-break from the *outer* clause instead still left
+   the test passing, because sorting an already-sorted 8-row set preserves it.
+2. **Even standalone, the order is not guaranteed to flip.** SQLite is *free* to
+   return tied rows in any order; on a bare table it returned ascending (caught),
+   inside the 29-column real query it returned descending (not caught). Neither is
+   a bug in SQLite — that is what "unspecified" means. `PRAGMA
+   reverse_unordered_selects=ON` did **not** change either result, so it is not a
+   usable lever here: the plan uses a TEMP B-TREE sort, and that pragma only
+   reverses unordered *scans*.
+
+**A behavioural fixture cannot prove this guarantee.** The detector that works is
+reading the generated SQL. `composed_sql` was extracted from `list` for exactly
+that purpose, and `every_order_by_carries_the_descending_id_tie_break` asserts
+both clauses across four request shapes.
+
+Mutation results, all recorded:
+
+| mutation | SQL detector | integration tie test | todo 21's `session` suite |
+|---|---|---|---|
+| outer `id DESC` dropped | **FAILS** (correct) | passes (blind) | passes |
+| both clauses dropped | **FAILS** (correct) | **FAILS** | **3 FAIL** |
+
+So the guarantee is covered — but by an assertion on the query text, not on
+observed order. Any future task that needs to prove an ordering guarantee should
+assert the SQL, and should not trust a fixture that happens to come back sorted.
+
+## [2026-08-07] Task 80: `clippy::unused_format_specs` caught a real column-alignment bug
+
+`{:>COST_WIDTH$}` applied to a `format_args!("${:.2}", …)` argument does
+**nothing** — the width applies to the argument, and a lazily formatted one has no
+width to apply it to. The Cost column was silently unpadded; it only looked
+aligned because every fixture value was five characters. Hands-on QA did not catch
+it (the table looked fine); clippy did. Fixed with a `String`-returning helper.
+
+Worth knowing generally: **any `format_args!` inside a padded slot is unpadded.**
+
+## [2026-08-07] Task 80: the differential surface check needed a declared-additions table
+
+`every_headless_command_keeps_the_oracle_long_option_surface` (todo 56) asserts
+the Rust long-option set **equals** the oracle's per command. Todo 80 adds seven
+flags to `session list`, so it failed — correctly.
+
+Resolved by adding `ADDED_LONG_FLAGS`, a per-command allow-list, and keeping the
+assertion an equality against `oracle ∪ declared`. A one-directional superset
+check would have been the easy fix and would have stopped catching a flag that
+appeared without anyone deciding to add it. A second test
+(`every_declared_flag_addition_is_actually_present_and_upstream_keeps_its_own`)
+asserts every declared addition really exists, that no upstream flag was dropped,
+and that upstream still offers `--max-count` — so the table cannot rot into a
+list of flags that no longer exist.
+
+## [2026-08-07] Task 80: nothing in the plan was wrong
+
+Unusually for this project — every reference resolved, every line number was
+accurate, and both "Must NOT"s described real upstream behaviour. Two small
+clarifications rather than errors:
+
+- The plan says the table shows "project, title, agent, last-activity, message
+  count, and cost" — six columns. The rendered table has **seven**: those six plus
+  the session id, which is the value a caller copies into `session delete`. A
+  listing without it is not actionable.
+- The plan asks for `--roots`. Upstream's `session list` hard-codes `roots: true`
+  (`cli/cmd/session.ts:87`) with no way off, so `--roots` names the existing
+  default and `--no-roots` is the new escape hatch. Making `--roots` opt-in would
+  have changed the no-flag behaviour, which the plan does not ask for.

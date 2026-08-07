@@ -4936,3 +4936,129 @@ that a model must not retry a refusal it cannot fix:
   by reissuing the same arguments; the caller must wait, or start fresh.
 - `UnknownTaskId`, `ForeignParent`, `AgentMismatch` -> `ToolError::InvalidArgs`. A
   different `task_id` (or none) fixes each.
+
+## [2026-08-07] Task 59: WASM component host policy
+
+- **Component model, not core-module ad hoc ABI.** Guests export named WIT functions
+  matching the authoritative hook names and exchange JSON strings. This keeps plugin
+  binaries language-neutral and avoids exposing Rust layouts across the boundary.
+- **No WASI and no ambient capabilities.** The linker starts empty and any import is a
+  startup diagnostic. Capability growth must be named, opt-in, and linked interface by
+  interface; filesystem, network, environment, clocks, and inherited stdio are not
+  silently available.
+- **Resident instance, serialized calls.** Each component owns one `Store` and `Instance`
+  behind a mutex and adapts to the existing sequential `HookBus`. Calls are never
+  parallelized; configuration order remains mutation order.
+- **Failure containment over host failure.** Compile/instantiate errors exclude only the
+  bad component. Runtime traps, malformed output, resource exhaustion, and interrupts
+  disable only that component and become diagnostics; hook dispatch itself remains
+  successful so healthy siblings continue.
+- **The heavyweight runtime is opt-in.** `oc-plugin` keeps `default = []`; only feature
+  `wasm` activates exact `wasmtime = 47.0.3`. The default workspace build therefore does
+  not compile or carry Wasmtime.
+
+## [2026-08-07] Task 61: conversion ownership and collision evidence
+
+Zod conversion and validation live entirely in `shim.mjs`. The resident host imports
+the tool's own Zod package, converts the schema there, retains the execute closure, and
+runs `safeParse` immediately before invoking it. Rust does not inspect Zod internals:
+schemars remains the single source of truth for first-party Rust tools, while
+JavaScript-provided tools carry their own finished schema across the bridge. Both enter
+the downstream registry as `Tool` values.
+
+Collision validation happens before registry assembly. Reserved-name errors retain the
+existing stable text (`plugin tool \`bash\` conflicts with a reserved tool name`). A
+duplicate config tool reports one error containing the generated name and both source
+paths: `duplicate plugin tool name \`duplicate\` from \`<first>/tool/duplicate.js\`
+and \`<second>/tools/duplicate.js\``. This is preferred to first-wins/last-wins because
+lookup order must never silently decide which user code executes.
+
+## [2026-08-07] Task 80: cross-project session listing
+
+### The 100-cap is a **default**, not a ceiling
+
+`listGlobal` reads `input?.limit ?? 100` (`session.ts:575`), so a caller asking
+for 500 gets 500 upstream. `GlobalListRequest::effective_limit()` does the same:
+`self.limit.unwrap_or(UPSTREAM_LIST_LIMIT)`. Clamping to 100 would make
+`--limit 500` return a truncated page indistinguishable from a database holding
+100 sessions — the same failure todo 21 avoided by leaving `ListQuery::limit` an
+unset `Option` in the store. The cap lives at the request boundary, where
+upstream puts it, and `session_list_limit_above_the_upstream_default_is_honoured`
+pins it.
+
+The endpoint's `limit + 1` / `x-next-cursor` probe
+(`handlers/experimental.ts:139-156`) is **not** reproduced: the CLI prints a page,
+it does not paginate, and inventing a cursor header on stdout would be noise.
+
+### Table column widths — fixed, not fitted
+
+| column | width | why |
+|---|---|---|
+| Session ID | natural, floor 20 | the value copied into `session delete`; a truncated id is useless |
+| Project | 18 | fits `opencode-rust`-length names and a `prj_…` id |
+| Title | 32 | the longest cell that still leaves the numeric columns on one 120-col line |
+| Agent | 9 | `general` (7) is the longest built-in; 9 leaves room |
+| Last activity | 32 | `11:38 PM · 12/31/2026` (21) **plus** ` (archived)` (11) |
+| Msgs | 4 right | four digits is 9999 messages |
+| Cost | 8 right | `$99999.99` |
+
+**Fixed, not fitted to the data.** Upstream fits to the longest title
+(`cli/cmd/session.ts:121-122`), which makes every run a different shape — two
+listings cannot be diffed, and a terminal that fit yesterday wraps today. Only
+the id column follows its data, and only upward.
+
+`ACTIVITY_WIDTH` was 20 at first and truncated the archive marker to a bare `…`,
+which told the reader a cell had been cut but not that the session was archived —
+the one thing `--archived` exists to show. Found by eye in hands-on QA, then
+pinned by `an_archived_row_keeps_its_marker_at_the_widest_timestamp`, which uses
+the widest timestamp the formatter can emit.
+
+### `--format json` emits `GlobalInfo`, not upstream's flat six fields
+
+Upstream's `formatSessionJSON` (`cli/cmd/session.ts:137-147`) emits
+`{id, title, updated, created, projectId, directory}` — which spells the project
+id **`projectId`**, a spelling neither the endpoint (`projectID`) nor the database
+(`project_id`) uses, and which has no project summary at all. A cross-project
+listing whose JSON cannot name the projects is not usable.
+
+So there is one JSON shape and it is the documented endpoint's. The differential
+asserts set **and** byte equality against `/experimental/session` on a shared
+database, which is only meaningful because the shapes are the same.
+
+Consequence, deliberate: the **message count stays out of `GlobalInfo`**. Folding
+it in would make the CLI's JSON a superset of the endpoint's and turn the
+differential from an equality into a subset check, losing the ability to notice a
+*missing* field. It lives on `ListedSession` alongside `info`, and only the table
+reads it.
+
+### No pager
+
+Upstream spawns `less` when stdout is a TTY (`cli/cmd/session.ts:93-111`, plus a
+20-line Windows `less.exe` hunt). A listing command that pipes itself into a pager
+cannot be composed, and `| less` is one keystroke. Dropped, with the 20 lines of
+platform probing it required.
+
+### `ProjectScope` has no `Default`
+
+Two arms, `AllProjects` and `Project(String)`, and no `Default` impl — a caller
+cannot forget to choose. The ambient project is resolved in the **CLI** layer
+(`cmd/session_list.rs::scope`) as the no-flag default, so it is a default a flag
+overrides rather than a predicate the store injects. That is the whole difference
+from `Session.list` (`session.ts:548-555`).
+
+`--project` accepts a **path or an id** because neither is derivable from the
+other — the id is a hash of the Git remote — and a user standing in a checkout
+knows the path while a user reading a listing knows the id. The path is tried both
+raw and canonicalised, so `.`, `..` and a symlinked checkout all resolve, while a
+worktree that has since been deleted (uncanonicalisable) is still listable. An
+unresolvable value is an **error naming the value**, not a silent fall-through to
+listing everything.
+
+### `session::list_sql` extracted rather than the query restated
+
+`session_list` wraps `session::list_sql` as a subquery instead of building its own
+`WHERE`. A second hand-written copy of the predicates and the
+`time_updated DESC, id DESC` ordering is the divergence that shows up as a
+paginated client seeing a row twice. `SessionSort::column` and
+`session::from_row` became `pub(crate)` for the same reason: one decoder, one
+column list, one order.
