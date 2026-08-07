@@ -4554,3 +4554,60 @@ Wiring, then 88 resumes. It is small and mechanical: pass todo 44's assembled re
 into `run`'s dispatcher, register a `tui` command that calls `App::run()`, and implement
 the prompt route over the same `run_turn`. None of it is new design — every part exists
 and is tested.
+
+## [2026-08-07] Task 104: the prompt route is still unwired, and why
+
+### `POST /api/session/{sessionID}/prompt` remains `unsupported`
+
+Deliberate, under the task's own rule that a duplicated turn driver is worse than
+an unsupported route. It is **not** a thin adapter over what `run` now produces.
+
+`oc-server`'s dependency list is `axum, base64, clap, futures, oc-catalog, oc-db,
+oc-engine, oc-error, oc-paths, oc-pty, rusqlite, schemars, serde, serde_json,
+thiserror, tokio, url, uuid`. Driving a turn needs, additionally:
+
+- `oc-llm` — the provider registry, the catalog, `Spec`, `DynamicContext`
+- `oc-auth` — credentials for the resolved provider
+- `oc-config` — discovery, and the permission rules the ruleset is built from
+- `oc-tools` — the registry assembly
+- `oc-provider-compatible` (and the other four families, for parity with `run`)
+
+That is five to nine new crate edges and a full composition root inside
+`oc-server`: model selection, credential resolution, agent loading, catalog
+loading, registry assembly, and a per-request database connection. `run`'s
+`execute` is 120 lines of exactly that work.
+
+**The honest next step** is to extract that composition root — model + provider +
+agent + registry + rules → `TurnContext` — into a crate both surfaces depend on
+(`oc-runtime`, or `oc-engine` if the dependency direction allows), and then have
+both `run` and the route call it. Todo 85's rule ("both surfaces call the same
+service function so behavior cannot diverge") is the right rule; satisfying it
+means the extraction, not a second driver in `oc-server`.
+
+Today's shared point is `crates/oc-cli/src/cmd/tool_runtime.rs::assemble`, which
+both `run` and any future CLI-side turn caller use. It is deliberately in `oc-cli`
+because `oc-cli` is the only crate that currently sees every input.
+
+### `--interactive` / `--auto` are still refused, and that is still correct
+
+`run.rs`'s rejection is unchanged. `tui` boots the application, renders, accepts
+input and exits cleanly, but **submitting a prompt does not start a turn**: the
+engine channel exists and nothing sends on it. Making `--interactive` meaningful
+requires the same extraction as the prompt route — the turn driver has to be
+callable from the TUI's thread with the TUI's channel as the event sink.
+
+Repurposing the flags before that would be the worst outcome: `run --interactive`
+would open a screen that looks like it can converse and cannot.
+
+### Two smaller things found and left
+
+1. **A killed TUI does not restore the terminal.** `TerminalSession`'s `Drop`
+   restores on a normal exit and the panic hook restores on a panic, but
+   `SIGTERM`/`SIGKILL` leaves the pane in the alternate screen with raw mode on.
+   Observed in tmux (`alternate_on=1` after `pkill`). A signal handler is a
+   separate decision; `Drop` and the panic hook cover the paths that matter for a
+   normal session.
+2. **The prompt gutter is not composed.** `views::editor::PromptGutter` exists and
+   `SessionScreen` renders only `InputEditor`, so the `▏` marker draws after the
+   text rather than before it. Cosmetic, and fixing it means deciding the prompt's
+   two-column layout, which is view design rather than wiring.

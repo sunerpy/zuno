@@ -5054,3 +5054,85 @@ The registry mutation proof is the important anti-vacuity test: adding a synthet
 `new-provider` registration makes matrix validation fail with
 `registered provider `new-provider` has no cassette family`. Counting a hard-coded
 family enum would not catch that change.
+
+## [2026-08-07] Task 104: what the end-to-end tool turn actually required
+
+The blocker's own list was accurate but **incomplete**. Passing todo 44's
+assembled registry into `run`'s dispatcher is necessary and not sufficient: with
+the registry wired, `tool_snapshot_locked` reported nine tools and the captured
+provider request still carried **no `tools` key at all**. There was a second,
+unlisted gap.
+
+`oc_llm::registry::CompletionRequest` had exactly three fields — `model_id`,
+`surface`, `messages`. `oc-provider-compatible`'s `RequestBody` had a `tools`
+field, `build()` gated it on `Quirks::accepts_tools()`, and `body_for()` never
+assigned it. Two layers each looked complete in isolation:
+
+- `oc-engine/src/loop.rs:632-651` asks `available_tools()`, freezes the snapshot,
+  emits `ToolSnapshotLocked` with the ids — and then builds a `CompletionRequest`
+  that has nowhere to put them.
+- `request.rs:119-123` correctly omits `tools` when the field is `None`, and its
+  own test `tools_are_omitted_for_a_model_that_cannot_use_them` sets the field by
+  hand, so it proved the gate and never the plumbing.
+
+**The generalisable shape: a struct field that no production code path assigns is
+invisible to every test that sets it directly.** `oc-provider-compatible` has 30+
+request tests and all of them construct `RequestBody` themselves.
+
+The fix adds a provider-neutral `ToolSchema { name, description, parameters }` to
+`CompletionRequest` and translates it per family in the provider — OpenAI nests
+under `function`, Anthropic and Gemini do not — so `oc-llm` still does not depend
+on `oc-tool`.
+
+### The cassette that proved it
+
+`openai-chat/drives-a-tool-loop-end-to-end` (two interactions, real 1.18.x
+recording). Its recorded call is `get_weather({"city":"Paris"})`, a tool this
+runtime does not have, which turns out to be **more** useful than a matching one:
+it proves the request carries the registry and that an unknown call still
+produces a tool result the loop sends back, with zero authored bytes.
+
+Executing a *real* tool needs the model to name one this runtime has, and no
+recording of that can exist yet. The second test rewrites the recorded stream —
+parsing each SSE frame, replacing the tool name and collapsing the five argument
+fragments into one, re-serialising — and declares the result
+`MockResponse::authored`, so `authored_scenarios()` reports it. Frame sequence,
+finish reason and usage frame stay recorded. **A textual splice does not work**:
+the arguments arrive as `{\"`, `city`, `\":\"`, `Paris`, `\"}` across five frames
+and any string patch leaves malformed JSON that the provider rejects before the
+loop is reached.
+
+Two mechanical facts a first attempt gets wrong:
+
+1. **`intent` is a required property on every tool call.** `oc-tool`'s schema
+   augmentation injects it, so a hand-written argument object without it fails
+   validation with `"intent" is a required property` — before the tool runs.
+2. **The test must drive the binary with `tokio::process`, not
+   `std::process`.** The mock provider's axum server runs on the test's runtime;
+   a synchronous `output()` stops driving it, the response never gets written,
+   and the run hangs instead of failing. That cost three debugging rounds.
+
+### The TUI's exit key is shadowed by the editor
+
+`ctrl+c` appears twice in the shipped 184-binding table: `input_clear` in scope
+`input` (`keybind.rs:1800`) and `app_exit` in scope `app` (`keybind.rs:944`).
+`ctrl+d` likewise collides with `input_delete` (`keybind.rs:2024`). The scope
+chain resolves `input` first, so a screen that watched only for `app_exit` boots
+a TUI **nobody can leave** — verified live in tmux before the fix: the alternate
+screen stayed up through both keys.
+
+The faithful behaviour is the reference TUI's: the first press clears a typed
+prompt, and a press with nothing to clear exits. So the screen treats
+`input_clear`/`input_delete` as exit when the buffer is empty.
+
+The near-miss worth recording: my first scope test asserted
+`matches!(resolve(...), Resolution::Action { .. })` and **passed** while
+resolving the wrong action. Asserting that *something* resolved says nothing.
+The test now asserts the action name and records the shadowing as the reason the
+compensation exists.
+
+Also: a printable key resolves to no action, so the dispatcher forwards it to the
+component tree and **the host is what routes it into the editor**
+(`InputEditor::insert_char`'s doc says so). Without that the prompt renders and
+cannot be typed into — invisible to every view test, because each drives the
+editor through `handle_action` directly.

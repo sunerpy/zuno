@@ -5422,3 +5422,86 @@ needed because multiple provider ids share one wire family, but the registry is 
 authority over which ids must map. Consequently a newly registered id fails the suite
 until its family is chosen, while a new scenario fails until every family receives a
 cell.
+
+## [2026-08-07] Task 104: where the tool runtime lives, and what governs it
+
+### The shared assembly point is `oc-cli`'s `cmd::tool_runtime`
+
+`assemble(directory, worktree, env, config, agent, provider_id, model_id)`
+returns the resolved tool vector and the merged ruleset. Every surface that
+drives a turn calls it; there is deliberately no second place that builds a
+registry.
+
+It is in `oc-cli` and not in a new crate because `oc-cli` is currently the only
+crate that sees all seven inputs. Moving it becomes necessary — and is the named
+next step — when `oc-server` needs it. See `issues.md` for that extraction.
+
+The registry is built through todo 44's `ToolRegistryBuilder` and projected with
+`ToolRegistry::resolve`, so the model-conditional and permission-hiding passes run
+in the documented order rather than being restated.
+
+### `run`'s permission rules are the ones `agent list` prints
+
+`cmd::agent::resolved_rules` and `DynamicRules::resolve` became `pub(crate)` and
+are now called by `tool_runtime::assemble`. This is the load-bearing choice: a
+ruleset a user can inspect with `agent list` but that the turn loop does not
+enforce is worse than having no listing. For the `build` agent that resolves to
+15 rules, ending in the four `read` rules that make `*.env` an ask.
+
+**`AllowAll` is gone from the production dispatch path.** `HeadlessApproval`
+replaces it: `oc-permission` resolves `allow` and `deny` itself and only calls the
+approval collaborator for `ask`, and a headless run has nobody to ask — stdin is
+the prompt or a pipe and stdout is the model's answer. Blocking would hang a
+non-interactive invocation forever; prompting would corrupt the output. So it
+refuses, and names the rule that would authorize the call. `external_directory`,
+`doom_loop` and reading a `.env` file all resolve to `ask` by default, and each is
+a decision a person should make.
+
+Todo 71's destructive-command gate is unaffected: it lives inside the shell tool,
+before any spawn, and still applies to every `bash` call.
+
+### The tool snapshot travels on `CompletionRequest`, not on the provider
+
+`CompletionRequest` gained `tools: Vec<ToolSchema>` where `ToolSchema` is
+`{ name, description, parameters }` — provider-neutral, because each family nests
+the same three fields differently and `oc-llm` must not depend on `oc-tool`. The
+turn loop fills it from the snapshot it already locked, so **dispatch is checked
+against exactly what the model was shown**; a provider holding its own tool list
+could answer with a call the loop would then refuse.
+
+`oc-provider-compatible::function_envelopes` does the OpenAI translation and
+returns `None` for an empty snapshot rather than `[]`, because several compatible
+vendors reject `tools: []` outright.
+
+### Which built-ins `run` registers, and why the list is short
+
+Registered: `invalid`, `bash`, `read`, `glob`, `grep`, `edit`, `write`,
+`apply_patch`, `webfetch`, `todowrite`, `websearch`. Resolved for a non-GPT model
+that is nine (`websearch` needs a configured backend, `apply_patch` is GPT-only).
+
+Not registered, each for a stated reason: `question` and `plan_exit` need a live
+user to answer; `task` needs a child-session host; `skill` and `lsp` have no
+`oc-tools` implementation; `execute` is the builder's own, behind
+`experimental_code_mode`. An unregistered slot is simply absent from the assembled
+vector, so the model is never told about a tool that cannot run.
+
+### `TuiThreadCommand`'s disposition changed from `NotRegistered` to `Implemented`
+
+Its row now names `tui` rather than `$0`, and the bare invocation dispatches the
+same handler — upstream's default command is the TUI, so a bare `opencode-rust`
+should not explain an absence. `crates/oc-cli/tests/surface.rs`'s 23-command
+fixture is unchanged and still one-to-one; the registration check now finds `tui`
+under its explicit spelling.
+
+`cmd::tui::execute` owns only wiring: the terminal session, the two bounded
+channels, the input producer, the root component. Every rendering decision stayed
+in `oc-tui`, and no engine call is reachable from it — todo 73's rule holds.
+
+`forward_terminal_input` went into `oc-tui::app` rather than the CLI: it is the
+only code that has to know crossterm's reader is synchronous, and its contract
+(poll and read on blocking threads, **await** the send so a burst backpressures
+instead of dropping) belongs with the channel it feeds.
+
+A non-terminal `tui` invocation is refused, not degraded. Entering raw mode and
+the alternate screen on a pipe writes escape sequences into whatever is reading it
+and leaves no way to type the exit key.
