@@ -5482,3 +5482,17 @@ computed in a `while` loop over `steps::MIGRATIONS`, not a second hand-written c
 A journal naming a migration nobody executed is worse than no journal, and two lists
 maintained by hand will diverge. The old hand-written array and the derived one agree
 on all 38, which is how I know the port is complete.
+
+## [2026-08-07] Task 88: a configured model and a catalog-backed model are different startup paths
+
+After todo 107, the real legacy database migrated and the TUI remained alive through
+the 90-second hydration boundary. The next frozen run exposed an earlier W-idle seam:
+`ScriptedEnv` disables models.dev fetches and provides a complete provider/model in
+`OPENCODE_CONFIG_CONTENT`, which TypeScript accepts, but Rust still requires either a
+cached global catalog or `OPENCODE_MODELS_PATH` and exits before the turn.
+
+The existing TUI and headless turn tests both add `OPENCODE_MODELS_PATH`, so they prove
+the seam only in a richer environment than the performance harness uses. A feature's
+end-to-end test must include the poorest supported closed-world environment, especially
+when the test claims to mirror another harness. Otherwise an extra fixture can conceal
+a mandatory startup dependency that the real entry point does not have.

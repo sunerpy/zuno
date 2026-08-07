@@ -5857,3 +5857,16 @@ takes 35 s, which every future `cargo test --workspace` would pay. The skip prin
 the env var name, the measured path, whether that path is present, and why it is
 opt-in — loud, not silent. I ran it with the variable set; the transcript is in the
 evidence file.
+
+## [2026-08-07] Task 88: do not inject a model catalog into the frozen subject dispatcher
+
+Decision: fail closed when Rust cannot start from the exact closed-world environment
+that produced the TS baseline. Adding `OPENCODE_MODELS_PATH` in `memory.rs` would make
+Rust run, but it would also silently modify an already-frozen workload and compare it
+with a committed TS baseline measured without that variable. Supplying the variable to
+both paired subjects still would not repair the committed-baseline mismatch.
+
+Resume only after the product accepts an explicitly configured provider/model while
+fetches are disabled and no global catalog exists. Pin that with a real TUI/tool turn
+test that omits `OPENCODE_MODELS_PATH`; then rerun the unchanged release TUI-vs-TUI
+gate, five AB/BA repetitions, whole-tree sampler and 0.50x formulas.

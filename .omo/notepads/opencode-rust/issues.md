@@ -5043,3 +5043,89 @@ missing behaviours — all held up. The running tally of plan counts contradicte
 the source therefore stays at six. One thing the plan did not know: the 10 Drizzle
 names are not the generated order's first ten (rows 6 and 7 are swapped), which is
 why "seed from the table" and "seed `MIGRATION_IDS[..10]`" are not interchangeable.
+
+## [2026-08-07] Task 88: BLOCKED — explicit provider model still requires models.dev catalog
+
+The post-107 literal gate reached the schedule's third launch after TS completed one
+W-idle and one W-real window, then Rust exited before producing a trace. A diagnostic
+worker preserved stderr and reproduced the failure on W-idle in 12 seconds:
+`OPENCODE_DISABLE_MODELS_FETCH` is set, no cached catalog exists, and
+`OPENCODE_MODELS_PATH` is absent.
+
+This is a product parity defect, not a convenient baseline problem. The frozen config
+fully declares `test/test-model`; TypeScript runs it without models.dev, while Rust
+loads the unrelated global catalog first. `tui_turn.rs` and `tool_turn.rs` miss the
+defect because both inject `OPENCODE_MODELS_PATH`. Task 88 cannot fix `oc-llm`/`oc-cli`
+or inject an extra variable through its dispatcher without changing the frozen
+workload. No valid Rust median or ratio exists.
+
+## [2026-08-07] BLOCKER #5 on todo 88, verified: no bundled catalog snapshot, so a config-only provider cannot run
+
+Todo 88 refused a **fifth** time. Verified again, and this is another real parity defect,
+not a harness problem.
+
+### Measured, by me, with both binaries under an identical clean environment
+
+A config that *fully* specifies a provider and model (`provider.test.models.test-model`
+with cost, limit, `tool_call`), `OPENCODE_DISABLE_MODELS_FETCH=1`, and an empty
+`XDG_CACHE_HOME`:
+
+**Ours** — dies before any turn:
+```
+the model catalog is unavailable: OPENCODE_DISABLE_MODELS_FETCH is set, so no fetch
+from `https://models.opencode.ai` was attempted, and no cached catalog exists at
+`…/cache/opencode/models.json`. …
+```
+
+**The released 1.18.12 binary** — `opencode models` exits 0, lists dozens of models, and
+**includes our config-only `test/test-model`** (grep count 1).
+
+### The mechanism, from the oracle
+
+`packages/core/src/models-dev.ts:196-223`:
+```ts
+const loadSnapshot = Effect.sync(() =>
+  typeof OPENCODE_MODELS_DEV === "undefined" ? undefined : OPENCODE_MODELS_DEV)
+…
+const fromDisk = yield* loadFromDisk;   if (fromDisk) return fromDisk
+const snapshot = yield* loadSnapshot;   if (snapshot) return snapshot
+if (Flag.OPENCODE_DISABLE_MODELS_FETCH) return {}
+```
+Three fallbacks before the flag matters: an on-disk cache, a **compile-time bundled
+snapshot** (`OPENCODE_MODELS_DEV`, injected by the bundler), and only then `{}` — *an
+empty catalog, never an error*. Config providers are merged over whatever that returns, so
+a self-contained config always works.
+
+Ours has neither the snapshot nor the empty-catalog fallback. `CatalogError::FetchDisabled`
+(`crates/oc-llm/src/catalog/error.rs:28`) fails fast, and its own doc comment argues the
+case: *"returning an empty catalog and letting the user discover it as 'no models found'
+three screens later"* is the failure it was written to avoid.
+
+**That reasoning is good and the resulting behaviour is still wrong.** The fail-fast is
+right when the user names a model nobody defined. It is wrong when the config already
+defines the model completely — there is nothing to look up, and upstream proves it.
+
+### Real user impact, independent of the perf gate
+
+Anyone running fully self-specified providers — air-gapped, a private gateway, a corporate
+proxy, or simply offline — cannot start this binary. That is a first-launch failure for a
+supported upstream workflow, and it is the second one this project has found in two waves
+(todo 107 was the other).
+
+### Why todo 88 was right to refuse again
+
+Injecting `OPENCODE_MODELS_PATH` into the subject dispatcher would silently change the
+frozen workload and make the paired run use a different environment from the committed TS
+baseline. Note our own seam tests already do inject it — `tui_turn.rs:120-139` and
+`tool_turn.rs:133-141` — which is exactly why they never caught this.
+
+**A fixture that injects the variable the product should not need is a fixture that hides
+the defect.** Sixth seam, same family as the other five.
+
+### Owed: todo 108
+
+Add the catalog fallback chain upstream has. Options, in the order the oracle tries them:
+a bundled snapshot compiled in, then the empty catalog rather than an error, with
+`FetchDisabled` retained **only** for the case where the requested model is genuinely
+unknown. Then remove the `OPENCODE_MODELS_PATH` injection from the two seam tests so they
+prove the product rather than the workaround.
