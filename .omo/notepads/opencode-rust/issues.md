@@ -4269,3 +4269,11 @@ as workspace dependencies and **no new third-party crate**.
 - Remote unshare cannot be atomic with the SQLite transaction. The safe asymmetry is remote-first: a later local rollback may leave local history after the remote copy is gone, but local history is never silently deleted while a known remote copy survives. `--force` crosses only an unshare failure and emits a pinned warning.
 - Upstream single-session removal cancels background jobs in the service layer. `oc-db` does not depend on todo 66’s job board, so task 82 leaves that coordination to the later service/CLI boundary instead of crossing crate ownership.
 - Integrated `lsp_diagnostics` rejects sibling worktree paths. Diagnostics were run against a temporary byte-for-byte copy inside the main request cwd and were clean for all three changed files; the copy was deleted immediately.
+
+## [2026-08-07] Task 83: plan corrections and retained boundaries
+
+- The draft adopted-defaults row still says tool-output GC must not attempt per-session attribution. Task 38 deliberately changed the Rust filename to carry the sanitized session id, and task 83 correctly consumes that newer contract while keeping age-only cleanup for upstream names.
+- `session.directory` is not the snapshot-store worktree key for sessions opened below the repository root. GC joins `project.worktree`; if that row/value is unavailable it retains the project’s stores instead of hashing an ambiguous directory.
+- The deleted-session id list is caller evidence, not authority: a requested id that still exists in `session` is filtered out before any attributed artifact deletion.
+- Legacy `part/<message>/` is not session-keyed. It is swept only when the corresponding message id was first observed in `message/<deleted-session>/`; arbitrary part directories are never guessed from names.
+- Integrated `lsp_diagnostics` rejects sibling-worktree paths. As in task 82, diagnostics use a temporary byte-for-byte copy inside the main request cwd; it is deleted after the check.

@@ -5215,3 +5215,11 @@ and URLs are common here and neither breaks on spaces).
 - Every mutation uses `TransactionBehavior::Immediate`. Delete captures its preview in that transaction, performs remote-unshare checks before local statements, deletes the ten related tables in the pinned order, and then performs the global `part` orphan sweep before commit.
 - `RemoteUnshare` is injected. Tests use an in-memory fake and never make a network call; failures refuse local deletion unless force was explicitly supplied.
 - No table, index, or migration was added. The API reports exact per-table rows, logical bytes, aggregate cost, and all five token counters so later CLI/HTTP surfaces can share one loss report.
+
+## [2026-08-07] Task 83: off-database artifact GC safety boundary
+
+- GC re-reads surviving `session` rows under an `IMMEDIATE` transaction and holds that writer lock through filesystem decisions. Filesystem deletion cannot roll back with SQLite, so it remains a separate, preview-default pass after prune rather than part of task 82’s transaction.
+- Snapshot stores are keyed by `(project_id, sha1(project.worktree))`, reference-counted with `oc_snapshot::reference_counts`, and removed only at count zero. A missing/empty joined project worktree is ambiguous and retains every store for that project.
+- Rust-authored `tool_<sanitized-session>_<uuidv7>` files use `oc_tool::store::session_of`; attributed files are reclaimed only for requested ids no longer present in the database. `None` is never guessed and uses only the configurable mtime backstop, defaulting to upstream’s seven days.
+- Legacy `storage/{session,message,part,session_diff}` cleanup is disabled by default and requires an explicit request opt-in. Session/message/diff paths are directly attributable; part directories are reached only through message ids enumerated under a deleted session.
+- Preview and delete share one candidate-discovery path and report stable path-ordered logical content bytes. Scans and recursive byte accounting use `symlink_metadata`; managed roots and legacy category roots that are symlinks are retained without traversal.

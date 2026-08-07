@@ -4878,3 +4878,11 @@ a fallback for a user who rebound it.
 - Preview bytes are logical payload bytes (the sum of non-null column lengths), not SQLite page reclamation. This makes preview deterministic and attributable to the selected rows; page-level bytes cannot be assigned reliably inside shared B-trees.
 - `part.session_id` and durable event aggregate ids are not protected by session foreign keys. Exact deletion therefore needs both a final global `part` orphan sweep and explicit cleanup of raw plus `sse:<session_id>` event aggregates.
 - Four mutation proofs were non-vacuous: changing the default to delete, bypassing confirmation, bypassing remote-unshare refusal, and omitting the orphan sweep each failed its dedicated test.
+
+## [2026-08-07] Task 83: conservative filesystem reclamation
+
+- Snapshot attribution must use `project.worktree`, not `session.directory`: the latter can be a subdirectory and hashes to a different store. A LEFT JOIN makes missing project metadata visible so ambiguity can retain rather than delete.
+- `oc_tool::store::session_of` intentionally splits from the right. A Rust UUIDv7 name is attributable even when a session id contains underscores; an upstream `tool_<ascending-id>` has no separator pair and returns `None`.
+- Holding SQLite’s `IMMEDIATE` transaction prevents a concurrent database writer from creating a new survivor after the reference set is read. It cannot prevent unrelated filesystem writers, so every removal rechecks the candidate’s file/directory type and refuses a changed shape.
+- Safe byte reporting recursively uses `symlink_metadata` and counts only regular-file lengths. Snapshot Git alternates and any other symlink are never followed, so reported reclaimed bytes remain store-local.
+- Three mutation proofs were non-vacuous: removing `store.is_referenced()` deleted the live snapshot store; attributing every `None` tool name deleted a fresh upstream file; enabling legacy cleanup by default deleted its fixture before opt-in.
