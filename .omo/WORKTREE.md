@@ -494,3 +494,37 @@ rather than a rewrite.
   the workspace table and the registry cache, so 33 snapshots are offline-buildable.
 - **`wasmtime` is not in the offline registry cache** (0 hits). Todo 59 needs it and the
   workspace builds `--offline`; that has to be resolved before dispatching it.
+
+## Wave 15 dispatch ledger (2026-08-06)
+
+`main` = 2541 tests, 83/103 done. Six agents, one per worktree.
+
+| todo | crate | session | dispatched |
+|---|---|---|---|
+| 59 | `oc-plugin/wasm.rs` (feature-gated) | (below) | yes |
+| 61 | `oc-plugin/config_tools.rs` | (below) | yes |
+| 66 | `oc-agent/continuation.rs` | (below) | yes |
+| 77 | `oc-tui/attention.rs` | (below) | yes |
+| 80 | `oc-db/session_list.rs` + `oc-cli` | (below) | yes |
+| 87 | `oc-testkit/cassettes.rs` | (below) | yes |
+
+59 and 61 share `oc-plugin` (cap 2). 80 touches `oc-db` **and** `oc-cli`; nothing else
+is in either this wave.
+
+### `wasmtime` unblocked — measured
+
+Todo 59 was held last wave because `wasmtime` was absent from the offline registry
+cache and the workspace builds `--offline`. Resolved by fetching it once:
+
+- `cargo add wasmtime` → **47.0.3**. The first `cargo build` timed out on a slow
+  mirror; a second attempt completed in **44s** and populated the cache, after which
+  `cargo build --offline` succeeds. So the fetch is a one-time cost, already paid.
+- Verified the API todo 59 needs, in a throwaway crate: `Config::consume_fuel(true)`,
+  `Config::epoch_interruption(true)`, `Store::set_fuel`, `Store::set_epoch_deadline`
+  all present and working.
+- **Verified it builds under `[lints.rust] unsafe_code = "forbid"`**, which is the
+  workspace policy and todo 59's explicit "Must NOT use `unsafe`" requirement.
+
+Note `cargo search` is unusable here — the registry is replaced by the `aliyun` mirror
+and it errors with "crates-io is replaced with non-remote-registry source". Use
+`cargo add --dry-run` to check availability instead.
