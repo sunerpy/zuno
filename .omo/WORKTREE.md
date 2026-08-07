@@ -915,3 +915,65 @@ output are.*
 `88 → 89 → 90 → 92 → 103 → F1-F4`. I created worktrees for 89/90/92/103, confirmed each
 is blocked by its predecessor, and removed them again — only **88** is dispatchable.
 Session `ses_022ef1a30fferqml6j8kd22kWO`.
+
+## Wave 23 (2026-08-07): the fourth seam, and 88 dispatched for the fourth time
+
+`main` = 3077 tests, **101/106 done**. Todo 106 merged.
+
+### Todo 88 has now been blocked three times, and every refusal built a real feature
+
+| round | what was actually missing | closed by |
+|---|---|---|
+| 1 | tool execution end to end — no `tui` command, `run` dispatching `AllowAll` with two empty vectors, `unsupported` prompt route, and **`CompletionRequest` with no `tools` field at all** | 104 |
+| 2 | the TUI's prompt submission never started a turn | 105 |
+| 3 | **the three internal agents were never invoked** | 106 |
+
+Round 3 is worth stating precisely, because the easy fix was the wrong one. The frozen
+harness counts `completed_tool_turns(captured) = (captured - 1) / 2`, so a 2-request turn
+scores **0**. Our port sent 2. The tempting move is to call the harness TS-specific and
+edit `PRELUDE_REQUESTS`. But the harness's own doc comment records what it measured from
+live 1.18.12 traffic: *"A new session's prelude generates the session title … A restored
+session's prelude is a compaction summary."*
+
+I checked, and the harness was right:
+
+- no title-generating model request existed anywhere in `oc-engine` or `oc-cli` — every
+  `title` hit was a *tool output* title or a passed-in *option*
+- `grep -rn "compaction::|select_boundary|should_compact" crates/oc-engine/src/loop.rs`
+  returned **nothing**; `oc-engine::compaction` was referenced only by `oc-agent`'s roster
+  metadata and its own module
+- `INTERNAL_NAMES` was referenced only by its own tests
+
+And todo 63 had predicted the consequence in a doc comment at `builtin.rs:858-860`:
+dropping any of the three *"silently removes auto-compaction, session titles"*. They were
+declared, tested as data, and never called.
+
+Todo 106 fixed it **in the product**: `oc-engine/src/prelude.rs::generate_title`, wired on
+`TurnHost` so `run` and `tui` both get it. `tool_turn.rs` now asserts
+`captured.len() == FROZEN_PRELUDE_REQUESTS + FROZEN_RESPONSES_PER_TURN` **and**
+`completed_tool_turns(captured.len()) == 1`, plus that the prelude advertises no tools.
+My mutation — `generate_title` returning `Ok(None)` — drops the capture to 1 and fails with
+*"the frozen gate scores 0 completed turn(s)"*.
+
+### Four seams, four identical failures
+
+1. Wave 11 — `/event` served, `/api/event` 404.
+2. Wave 17 — prune proposed deleting 4.19 GB it could not attribute.
+3. Wave 20/21 — the agent could not use a tool.
+4. Wave 23 — titles, auto-compaction and summaries silently absent.
+
+Every one invisible to a green suite, because **per-file todos produce per-file
+correctness and say nothing about the seams**. Todo 62 is still the only seam in this plan
+that had a dedicated owner, and still the only one right first time. If this plan were
+rewritten, the lesson is one line: *give every seam a todo.*
+
+### One open question handed to 88
+
+Round 3 also reported that only `measure_typescript_baseline` is public while the
+single-workload runner and samplers are `pub(crate)`, and rejected `#[path]` importing as
+manufacturing an unfrozen methodology. That was the right instinct. 88 was told to read
+that function's signature first — if it takes a program path it may already be
+subject-agnostic despite the name — and, if a seam really is missing from a crate it may
+not edit, to report it precisely rather than work around it.
+
+Session `ses_022a074fcffeO59D11sF1wVbUt`.
