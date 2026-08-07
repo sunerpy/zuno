@@ -888,7 +888,7 @@ Dependency direction is strictly downward from `oc-cli`; `oc-engine` never depen
   QA scenarios: happy - pruning every session of one project removes that project's snapshot store and reclaims measurable bytes; failure - pruning one of two sessions sharing a worktree leaves the store intact. Evidence `.omo/evidence/task-83-opencode-rust.txt`
   Commit: Y | `feat(session): reference-counted gc of snapshots and tool output`
 
-- [ ] 84. `crates/oc-db/src/vacuum.rs` + `crates/oc-cli/src/cmd/db_maint.rs`: implement explicit VACUUM with byte reporting and integrity checks - expect a test asserting vacuum is never implicit
+- [x] 84. `crates/oc-db/src/vacuum.rs` + `crates/oc-cli/src/cmd/db_maint.rs`: implement explicit VACUUM with byte reporting and integrity checks - expect a test asserting vacuum is never implicit
   What to do / Must NOT do: implement `db vacuum` reporting file size before and after and the bytes reclaimed, plus `db integrity-check` and a `db stats` summarizing rows per table, DB size, WAL size, and the largest sessions by part bytes; refuse to vacuum when free disk is under the DB size (VACUUM rewrites the whole file) with an actionable message; never run VACUUM as a side effect of a prune. Must NOT vacuum implicitly. Must NOT run it inside the prune transaction.
   Parallelization: Wave 13 | Blocked by: 82,19 | Blocks: 85
   References: `packages/opencode/src/cli/cmd/db.ts:8-62` (the existing `db` surface these extend); `packages/core/src/database/database.ts:22-33` (WAL mode, which makes WAL size worth reporting); the finding that **no `VACUUM` call exists anywhere upstream**, recorded in `.omo/drafts/opencode-rust.md`.
