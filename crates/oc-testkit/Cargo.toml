@@ -53,3 +53,24 @@ walkdir = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies.oc-error]
+workspace = true
+
+[dev-dependencies.oc-llm]
+workspace = true
+
+[dev-dependencies.oc-provider-anthropic]
+workspace = true
+
+[dev-dependencies.oc-provider-bedrock]
+workspace = true
+
+[dev-dependencies.oc-provider-compatible]
+workspace = true
+
+[dev-dependencies.oc-provider-google]
+workspace = true
+
+[dev-dependencies.oc-provider-openai]
+workspace = true

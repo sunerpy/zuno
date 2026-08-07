@@ -176,3 +176,6 @@ mod tests {
         assert!(rendered.contains("opencode-rust"), "{rendered}");
     }
 }
+
+#[cfg(test)]
+mod cassettes;
