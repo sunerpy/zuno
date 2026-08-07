@@ -496,14 +496,16 @@ fn an_empty_endpoint_option_falls_through_to_the_next_rung() {
     assert_eq!(spec.base_url.as_deref(), Some("https://from-api/v1"));
 }
 
-/// An endpoint key is never forwarded as an SDK option.
+/// Neither an endpoint key nor `apiKey` is ever forwarded as an SDK option.
 ///
-/// `model.options` is the bag [`model_spec`] forwards, so that is where the keys are
-/// planted here. `Spec::options` is read by allow-listed key today — `capabilities`,
-/// `extraBody`, `useCompletionUrls` — so a stray `baseURL` there is inert, and
-/// inert-today is exactly how it would go unnoticed until someone widened that read and
-/// a request body grew a field named after a URL. Every other model option must still
-/// come through, or this becomes a filter that eats configuration.
+/// [`model_spec`] now forwards **both** bags — the provider's, seeded first, and the
+/// model's overlaid on top — so the exclusion has to hold on both, and the keys are
+/// planted in both here. `Spec::options` is read by allow-listed key today —
+/// `capabilities`, `extraBody`, `useCompletionUrls` — so a stray `baseURL` or `apiKey`
+/// there is inert, and inert-today is exactly how it would go unnoticed until someone
+/// widened that read and a request body grew a field named after a URL, or one carrying
+/// key material. Every other option must still come through, or this becomes a filter
+/// that eats configuration.
 #[test]
 fn the_endpoint_keys_do_not_also_travel_in_the_option_bag() {
     let document = serde_json::from_str(
@@ -513,19 +515,30 @@ fn the_endpoint_keys_do_not_also_travel_in_the_option_bag() {
     )
     .expect("catalog document");
     let config: oc_config::schema::Config = serde_json::from_str(
-        r#"{"provider":{"probe":{"options":{"baseURL":"https://from-base-url/v1"},
+        r#"{"provider":{"probe":{"options":{
+               "baseURL":"https://from-base-url/v1",
+               "endpoint":"https://from-base-url/v1",
+               "apiKey":"sk-provider-level",
+               "providerKept":true},
              "models":{"probe-model":{"options":{
                "baseURL":"https://model-level/v1",
                "endpoint":"https://model-level-endpoint/v1",
+               "apiKey":"sk-model-level",
                "extraBody":{"kept":true}}}}}}}"#,
     )
     .expect("config");
     let catalog = Catalog::resolve(&document, &ResolveInput::new().with_config(&config));
+    let provider = catalog.provider("probe").expect("the provider");
     let model = catalog.model("probe", "probe-model").expect("the model");
-    assert!(
-        model.options.contains_key("baseURL"),
-        "the fixture must actually carry the key through the merge or it proves nothing"
-    );
+    for (label, options) in [("provider", &provider.options), ("model", &model.options)] {
+        for key in ["baseURL", "endpoint", "apiKey"] {
+            assert!(
+                options.contains_key(key),
+                "the fixture lost `{key}` from the {label}'s options in the merge, so \
+                 the exclusion it is meant to prove is untested"
+            );
+        }
+    }
 
     let spec = model_spec(&catalog, model).expect("the provider option supplies the endpoint");
 
@@ -535,7 +548,7 @@ fn the_endpoint_keys_do_not_also_travel_in_the_option_bag() {
         "a model-level endpoint key is not an endpoint source; only the provider's is \
          (`provider.ts:1698-1700` reads `provider.options`)"
     );
-    for key in ["endpoint", "baseURL"] {
+    for key in ["endpoint", "baseURL", "apiKey"] {
         assert!(
             !spec.options.contains_key(key),
             "`{key}` reached the SDK option bag: {:?}",
@@ -545,7 +558,17 @@ fn the_endpoint_keys_do_not_also_travel_in_the_option_bag() {
     assert_eq!(
         spec.options.get("extraBody"),
         Some(&serde_json::json!({"kept": true})),
-        "every option that is not an endpoint must still reach the SDK"
+        "every model option that is not resolved elsewhere must still reach the SDK"
+    );
+    assert_eq!(
+        spec.options.get("providerKept"),
+        Some(&serde_json::json!(true)),
+        "every provider option that is not resolved elsewhere must still reach the SDK"
+    );
+    assert!(
+        !format!("{:?}", spec.options).contains("sk-"),
+        "key material reached the option bag: {:?}",
+        spec.options
     );
 }
 
@@ -562,6 +585,194 @@ fn a_provider_with_no_endpoint_anywhere_names_the_key_to_set() {
             "the refusal must name `{needle}`: {message}"
         );
     }
+}
+
+/// The endpoint injected into every fixture built by [`options_spec`].
+const PROBE_ENDPOINT: &str = "https://gateway.probe/v1";
+
+/// The spec one provider/model option pair produces, endpoint supplied for free.
+///
+/// `baseURL` is injected into the provider's options rather than left to the caller so
+/// no test here can accidentally assert on a `Spec` that [`model_spec`] refused to
+/// build — and so the endpoint-exclusion test operates on a `baseURL` that is genuinely
+/// load-bearing rather than a decorative one.
+fn options_spec(provider_options: &serde_json::Value, model_options: &serde_json::Value) -> Spec {
+    let document = serde_json::from_str(
+        r#"{"probe":{"id":"probe","name":"Probe","env":[],"npm":"@ai-sdk/openai-compatible",
+             "models":{"probe-model":{"id":"probe-model","name":"Probe Model",
+               "limit":{"context":1,"output":1}}}}}"#,
+    )
+    .expect("catalog document");
+    let mut provider = provider_options
+        .as_object()
+        .cloned()
+        .expect("the provider options are an object");
+    provider.insert("baseURL".to_owned(), serde_json::json!(PROBE_ENDPOINT));
+    let config: oc_config::schema::Config = serde_json::from_value(serde_json::json!({
+        "provider": {"probe": {
+            "options": serde_json::Value::Object(provider),
+            "models": {"probe-model": {"options": model_options}}
+        }}
+    }))
+    .expect("config");
+    let catalog = Catalog::resolve(&document, &ResolveInput::new().with_config(&config));
+    let model = catalog.model("probe", "probe-model").expect("the model");
+    model_spec(&catalog, model).expect("the injected endpoint resolves")
+}
+
+/// A resolved provider carrying exactly `options`, for the credential precedence table.
+fn probe_provider(options: serde_json::Value) -> Catalog {
+    let document = serde_json::from_str(
+        r#"{"probe":{"id":"probe","name":"Probe","env":[],"npm":"@ai-sdk/openai-compatible",
+             "models":{"probe-model":{"id":"probe-model","name":"Probe Model",
+               "limit":{"context":1,"output":1}}}}}"#,
+    )
+    .expect("catalog document");
+    let config: oc_config::schema::Config = serde_json::from_value(serde_json::json!({
+        "provider": {"probe": {"options": options}}
+    }))
+    .expect("config");
+    Catalog::resolve(&document, &ResolveInput::new().with_config(&config))
+}
+
+/// `options.apiKey` is primary; the stored credential is the fallback — `:1719`.
+///
+/// The whole table in one test, because the defect was a *precedence* and a precedence
+/// is only wrong relative to its alternatives: reading only the option breaks
+/// `opencode auth login`, and reading only the credential is the bug this todo fixes.
+/// Every expectation names a distinct string, so no row can pass by coincidence.
+#[test]
+fn an_options_api_key_is_primary_and_the_stored_credential_is_the_fallback() {
+    let stored = oc_auth::Credential::Api {
+        key: oc_auth::Secret::new("sk-from-the-store"),
+        metadata: None,
+    };
+    let cases = [
+        (
+            serde_json::json!({"apiKey": "sk-from-options"}),
+            true,
+            Some("sk-from-options"),
+            "`options.apiKey` must win when both are present",
+        ),
+        (
+            serde_json::json!({"apiKey": "sk-from-options"}),
+            false,
+            Some("sk-from-options"),
+            "`options.apiKey` alone must be the credential",
+        ),
+        (
+            serde_json::json!({}),
+            true,
+            Some("sk-from-the-store"),
+            "the stored credential must still authenticate when no option names a key",
+        ),
+        (
+            serde_json::json!({}),
+            false,
+            None,
+            "neither source means no credential, which a local endpoint is entitled to",
+        ),
+        (
+            serde_json::json!({"apiKey": ""}),
+            true,
+            Some(""),
+            "an explicitly empty `apiKey` is a key, not a fall-through: `:1719` tests \
+             for `=== undefined`, and falling back here would present a real vendor \
+             key to an endpoint the user never named",
+        ),
+    ];
+
+    for (options, present, expected, why) in cases {
+        let catalog = probe_provider(options.clone());
+        let provider = catalog.provider("probe").expect("the provider resolves");
+        assert_eq!(
+            provider.options.get("apiKey"),
+            options.get("apiKey"),
+            "the fixture lost `apiKey` in the merge, so this row proves nothing"
+        );
+
+        let resolved = resolved_credential(Some(provider), present.then_some(&stored));
+
+        assert_eq!(resolved.as_deref(), expected, "{why} (options={options})");
+    }
+}
+
+/// Why [`provider_api_key`]'s string test can never be reached from a config file.
+///
+/// `ProviderOptions::api_key` is typed `Option<String>`
+/// (`oc-config/src/schema/provider.rs:54`), so a non-string `apiKey` is refused before
+/// any provider is resolved and the `as_str` guard is belt over braces — kept because
+/// `ResolvedProvider::options` is a free-form JSON map that a future non-config source
+/// could populate, and a number silently becoming `Bearer 7` is not an acceptable
+/// outcome. Asserted rather than assumed, so a schema change that loosened the field
+/// would show up here instead of at a gateway.
+#[test]
+fn a_non_string_api_key_never_reaches_the_resolved_provider() {
+    let refused = serde_json::from_value::<oc_config::schema::Config>(serde_json::json!({
+        "provider": {"probe": {"options": {"apiKey": 7}}}
+    }));
+
+    assert!(
+        refused.is_err(),
+        "the config schema accepted a non-string `apiKey`, so `provider_api_key`'s \
+         fall-through is now reachable and needs a case of its own"
+    );
+}
+
+/// A provider-level option reaches the surface that reads it — `:1676`.
+///
+/// `useCompletionUrls` is the case worth pinning: it is a *provider* option in the
+/// oracle (`provider.ts:265` passes `options?.["useCompletionUrls"]`), it has a reader
+/// here, and before this fix setting it where the docs say to set it did nothing at all.
+/// The assertion goes through that reader rather than stopping at
+/// `spec.options.contains_key`, because "the bag holds the key" and "the code that
+/// consults the bag sees it" are different claims and only the second one matters.
+#[test]
+fn a_provider_level_option_reaches_the_surface_that_reads_it() {
+    let spec = options_spec(
+        &serde_json::json!({"useCompletionUrls": true}),
+        &serde_json::json!({}),
+    );
+
+    assert!(
+        oc_provider_compatible::surface::use_completion_urls(&spec),
+        "a provider-level `useCompletionUrls` is still inert; options: {:?}",
+        spec.options
+    );
+}
+
+/// The model wins on collision, and the provider's other leaves survive — `:1497`.
+///
+/// Three claims in one fixture, each with its own witness: `shared` proves the direction,
+/// `providerOnly` proves the merge is deep rather than a replace, and `modelOnly` proves
+/// the model's own keys are not lost to the seed.
+#[test]
+fn a_model_option_wins_over_a_provider_option_of_the_same_name() {
+    let spec = options_spec(
+        &serde_json::json!({
+            "extraBody": {"shared": "from-the-provider", "providerOnly": "kept"},
+            "providerScalar": "kept"
+        }),
+        &serde_json::json!({
+            "extraBody": {"shared": "from-the-model", "modelOnly": "kept"},
+            "providerScalar": "replaced"
+        }),
+    );
+
+    assert_eq!(
+        spec.options.get("extraBody"),
+        Some(&serde_json::json!({
+            "shared": "from-the-model",
+            "providerOnly": "kept",
+            "modelOnly": "kept"
+        })),
+        "the provider/model overlay is not a deep merge with the model winning"
+    );
+    assert_eq!(
+        spec.options.get("providerScalar"),
+        Some(&serde_json::json!("replaced")),
+        "a provider-level scalar overrode the model's, so the direction is inverted"
+    );
 }
 
 /// An internal whose own model has no endpoint is declined, not fatal.

@@ -5986,3 +5986,74 @@ unreachable is the worse failure.
 camouflage; each file now documents why it must not come back. No workload or perf
 fixture was taught to emit `api` — todo 88 refused that crutch and this change makes
 it unnecessary rather than tolerable.
+
+## [2026-08-07] Task 110: options.apiKey is the credential's primary source, and the option bag is seeded from the provider
+
+**Decision.** `crates/oc-cli/src/cmd/turn.rs` gains two resolvers, both read at spec /
+plan construction and nowhere else:
+
+- `resolved_credential` = `provider.<id>.options.apiKey` **then** the stored credential.
+  Ported from `provider.ts:1719`. The precedence is documented on `provider_api_key`
+  naming the tests that guard it, and mutation M2 (inverting it) fails both
+  `turn_tests::an_options_api_key_is_primary_and_the_stored_credential_is_the_fallback`
+  and `provider_options::an_options_api_key_wins_over_the_stored_credential`.
+- `forwarded_options` = the provider's options, with the model's overlaid **deep**, the
+  model winning at each colliding leaf. Ported from `:1676` + `:1497`.
+
+**Why the direction is provider-then-model and not the reverse.** The later write wins,
+so the model must be second. Swapping them (M3) is caught at both layers. Documented on
+`forwarded_options` under a "Direction is load-bearing" heading, the same shape todo 109
+used for the endpoint ladder — because that is the mutation a future editor is most
+likely to introduce while "simplifying" the iterator chain.
+
+**Why the overlay is a deep merge and not an insert.** Every interesting value in the
+bag is an object (`extraBody`, `capabilities`, `modelCapabilities`), so a shallow
+overlay makes a model that narrows one `extraBody` key silently discard every other key
+the provider set. Upstream's `mergeDeep` does not. M4 pins it.
+
+**`apiKey` joins the endpoint keys in the exclusion list, and the list is renamed.**
+`ENDPOINT_OPTIONS` stays as the endpoint *ladder* (order matters there);
+`RESOLVED_ELSEWHERE = ["endpoint", "baseURL", "apiKey"]` is the separate question of
+which keys must not *also* travel in the SDK bag, because each already has exactly one
+answerer — `Spec::base_url` or the credential. Two lists rather than one because they
+answer different questions and only one of them is ordered. Todo 109's test was widened
+to plant all three keys in **both** the provider's and the model's options (the fix made
+both bags reachable), to assert the fixture carried each key through the merge before
+asserting the exclusion, and to assert no `sk-` substring reaches `Spec::options` at
+all — so key material cannot arrive by the option-bag route even if someone widens the
+allow-listed read.
+
+**A keyless provider is still not refused at plan time.** `CompatibleProvider::new`
+documents that a local endpoint legitimately has no credential, so the first moment a
+missing key is *known* to be a problem is the gateway's 401. What changed is what the
+user reads: `describe_turn_failure` maps `ProviderError::Auth` to a message naming both
+legitimate places to put a key — `provider.<id>.options.apiKey` and `opencode auth
+login <id>` — built from the provider id alone, so it can never echo key material.
+Refusing earlier was considered and rejected: it would break every local endpoint that
+takes no key, which is precisely the case an empty `apiKey` exists to express.
+
+**A non-string `apiKey` is unreachable from config, and that is asserted rather than
+assumed.** See the learnings entry; `oc-config/src/schema/provider.rs:54` types the
+field, so the `as_str` guard is belt over braces and
+`turn_tests::a_non_string_api_key_never_reaches_the_resolved_provider` fails if a schema
+change makes the branch live.
+
+**Wire proof comes from `extraBody`, not `useCompletionUrls`.** The todo's acceptance
+criteria assumed a provider-level `useCompletionUrls` would be observable on a request.
+It is not for `openai-compatible` — it gates `SurfaceRule::Azure` only and this profile
+is `Fixed(Chat)`, so `resolve_surface` returns before reading it. The criterion is met
+by calling the actual reader (`oc_provider_compatible::surface::use_completion_urls`)
+directly, and the seed's wire-observable proof is a provider-level `extraBody` key
+appearing in the body a real loopback server parsed.
+
+**`${VAR}` expansion is deliberately absent.** Todo 111 owns it; nothing here touches
+`Spec::base_url` beyond what todo 109 established.
+
+**Post-review correction to the above (same task).** The exclusion list was first
+written as `const RESOLVED_ELSEWHERE: [&str; 3] = ["endpoint", "baseURL", API_KEY_OPTION]`
+— which restates `ENDPOINT_OPTIONS`' entries as literals and would silently stop
+excluding a third endpoint spelling added there. Replaced with a `resolved_elsewhere()`
+predicate that derives from `ENDPOINT_OPTIONS`, and each half of the predicate was then
+mutated separately (M5a: drop the `apiKey` clause; M5b: drop the `ENDPOINT_OPTIONS`
+clause). Both fail `the_endpoint_keys_do_not_also_travel_in_the_option_bag`, so neither
+half masks the other. Nine mutations tried in total, nine caught.
