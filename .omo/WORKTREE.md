@@ -837,3 +837,33 @@ mechanism is proven without needing a dependency the host cannot compile.
 61→58 `/api` ops · 20→21 plugin hooks · 19→23 CLI commands · 184 keybind calls vs 164
 named · 12→10 prune tables · "seven divergences" is seven declared but at least
 thirteen real. Every prompt now tells the agent to verify inherited numbers.
+
+## A regression my own verification caught (2026-08-07)
+
+Todo 105's first attempt was interrupted with the work uncommitted. Reviewing it I found
+it **regressed todo 104's tool-turn tests**:
+
+```
+append-only cache violation on turn 2: stable history message 1 changed
+```
+
+from `crates/oc-llm/src/cache.rs:153` — todo 31's prompt-cache stability check, firing
+because a persisted message mutated in place between turn 1 and turn 2 of the tool loop.
+
+**The same two tests pass on `main`** (`test result: ok. 3 passed`), so it was the
+refactor, not a flake. Localised before delegating the fix: the failure is on **turn 2**
+(the continuation after the tool result), `TurnHost::drive` persists-then-runs in the
+same order as `main`, and the most likely culprit is `resolve_session`'s changed
+signature (`&RunArgs` → `&TurnPlan`).
+
+**Why this is worth recording**: had the interruption not happened, the agent might have
+committed and the merge gate *would* have caught it — but only as a red workspace run
+with no diagnosis. Reviewing the uncommitted tree first produced the localisation for
+free. The lesson is the one already in `issues.md` in another form: *a green subagent
+report is not evidence; the diff and the failing output are.* Here there was no report at
+all and the diff still gave up the answer.
+
+Also note what the check bought: without todo 31's four cache-stability mechanisms this
+refactor would have silently cost a prompt-cache hit on every turn of every session, and
+nothing would have failed. The assertion that fired is the reason the regression is
+visible at all.
