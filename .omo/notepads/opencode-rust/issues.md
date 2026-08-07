@@ -4862,3 +4862,37 @@ is compared against — a massaged pass, and the exact thing three agents refuse
 produce.
 
 The fix is **todo 106**: wire the internal agents. It is owed on parity grounds alone.
+
+## [2026-08-07] Task 106: open items left behind
+
+1. **Mid-turn overflow is not compacted until the next turn.** The prelude runs
+   before `run_turn`, so a step whose own measured usage crosses the window
+   completes and the compaction happens on the following turn. Upstream re-checks
+   after every step (`session/prompt.ts:1161-1167`). Closing it means giving
+   `run_turn` a small-model provider, the compaction hooks and a `CompactionState`;
+   the insertion point is the `if !accumulator.calls.is_empty()` continuation.
+   Documented in `crates/oc-engine/src/prelude.rs`'s module header.
+
+2. **`limit.input` is ignored.** Upstream's `usable()` prefers
+   `model.limit.input - reserved` when the model declares an input ceiling smaller
+   than its context window (`session/overflow.ts:16-19`). `TokenWindow` has only
+   `context` and `max_output`, and adding a third field changes todo 35's tested
+   type. Consequence: a model with `limit.input < limit.context` compacts slightly
+   later than upstream would. Not a divergence candidate — it is a gap.
+
+3. **The model-policy `preset` rung is reachable but unfed.** Nothing in this
+   workspace discovers a `PresetLibrary`, so `resolve_internals` can only be
+   answered by a per-agent override or the session model. `ModelPolicy` is wired to
+   accept one the moment a config source produces it.
+
+4. **`&Connection` across an await makes a future unspawnable.** `rusqlite::
+   Connection` is `Send` but not `Sync`, so any async fn in this workspace that
+   interleaves DB writes with provider streaming must take `&mut Connection` or it
+   can never be `tokio::spawn`ed. `run_compaction` took `&Connection` and had to be
+   widened. Worth grepping for the same shape before the next surface spawns a
+   driver.
+
+5. **The signature change was invisible to `cargo build`.** Widening
+   `run_compaction` left `cargo build --workspace` green while four test targets
+   failed to compile. Second occurrence of this hazard. `cargo test --workspace` is
+   the integration gate; a green build across a signature change proves nothing.

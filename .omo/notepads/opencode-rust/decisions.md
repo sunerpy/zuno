@@ -5714,3 +5714,78 @@ medians and W-real provenance, and create no code or commit. Resume only after t
 runner has one public paired entry point whose per-subject request plan still means one
 logical cassette-backed tool turn, with the existing five-run AB/BA schedule and
 process-tree/timing rules frozen around it.
+
+## [2026-08-07] Task 106: a prelude before the loop, not a step inside it
+
+Upstream runs both internals from inside its turn loop — `title` forked at step 1
+(`session/prompt.ts:1132-1138`) and the overflow check on the previous assistant's
+measured usage each iteration (`:1161-1167`). Three options considered:
+
+1. **Copy upstream: fold both into `run_turn`'s loop.** Rejected. `run_turn` would
+   need a provider for the small model, the compaction hooks and a
+   `CompactionState` threaded through `TurnContext`, changing a signature every
+   existing caller and 3,057 green tests depend on. It also puts a prefix change in
+   the middle of a turn, which is precisely the `append-only cache violation` shape.
+2. **Prelude before `run_turn`, sequenced.** Chosen. `run_turn`'s signature is
+   untouched, the prompt cache only ever sees the post-compaction prefix, and the
+   request count per turn becomes a *fact* rather than a race — which is the whole
+   point, since the frozen perf gate counts requests.
+3. **Prelude before `run_turn`, forked like upstream.** Rejected: whether the title
+   request or the turn's first request reaches the provider first would be a race,
+   and `captured[0]` could then be either. A test asserting the count would be flaky
+   and the perf gate's arithmetic would mean nothing.
+
+**Cost of (2), recorded rather than hidden**: an overflow discovered *mid-turn* — a
+step whose own usage crosses the window — is not compacted until the next turn.
+The place it would go is `run_turn`'s `if !accumulator.calls.is_empty()`
+continuation, and it needs option (1)'s plumbing.
+
+## [2026-08-07] Task 106: an internal may not leave the session's provider
+
+`ModelPolicy::resolve` can legitimately answer with a model under a different
+provider. `TurnHost::open` wires exactly **one** credential — the session
+provider's — so honouring that answer would present the user's API key to a
+different vendor's endpoint. `resolve_internals` therefore declines a
+cross-provider answer, falls back to the session's own model, and pushes a note.
+
+Falling back costs a large model for a small job. Honouring it costs the key. Not
+close. Pinned by `an_internal_pointed_at_another_provider_falls_back_and_says_why`.
+
+The downgrade goes on the **turn's event channel**, not stderr — same argument
+`tui.rs` makes for turn failures: a line written past a raw-mode terminal either
+vanishes or corrupts the frame.
+
+## [2026-08-07] Task 106: `summary` is resolved but not requested, and that is stated not narrowed
+
+The todo says "`summary` is available on the same path". It is: resolved by the same
+`resolve_internals` pass, reachable through the same `PreludeContext` via
+`oc_engine::prelude::summarize`, and tested
+(`summarize_issues_one_tool_free_request_carrying_the_summary_agents_prompt`).
+
+But **no surface requests one**, because no surface displays a session summary. The
+options were:
+
+1. Add `session summary <id>` to the CLI — rejected: upstream has no such command,
+   so it would need a `docs/divergences.toml` entry and a `DECLARED_COUNT` bump for
+   a feature nobody asked for.
+2. Keep a `TurnHost::summarize` nobody calls — rejected: it is dead code, and
+   `#[allow(dead_code)]` to hide it would be the same "declared and never invoked"
+   defect this todo exists to remove, one layer down.
+3. Resolve it on the shared path, document why it is not invoked, and prove the
+   resolution — chosen.
+
+What actually matters is that a future surface calls `prelude::summarize` with the
+host's context instead of resolving a second model of its own, since resolving
+separately is how all three internals came to be orphaned. Recorded in
+`TurnHost::run_prelude`'s doc comment so the next reader sees a decision, not an
+oversight.
+
+## [2026-08-07] Task 106: the frozen constants are duplicated in the test on purpose
+
+`tool_turn.rs` declares its own `FROZEN_PRELUDE_REQUESTS = 1` and
+`FROZEN_RESPONSES_PER_TURN = 2` rather than importing `oc-testkit`'s. They are
+crate-private, and that is the point: importing them would let a future edit to
+`perf/workload.rs` silently retune this assertion, which is the massaged pass three
+earlier agents declined to produce. If the two copies ever disagree, the port has
+changed its request shape and the perf gate is no longer measuring what it measured
+from real 1.18.12 traffic — and a duplicated constant is what makes that visible.

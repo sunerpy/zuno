@@ -5315,3 +5315,99 @@ the provider response plan and completion predicate are part of an executable wo
 General rule: an end-to-end compatibility test must cover the harness's full protocol,
 not only its argv. “The binary accepts the same invocation” says nothing about whether
 the harness will feed it the same logical operation or recognize completion.
+
+## [2026-08-07] Task 106: the fourth declared-and-never-invoked seam, and why `cargo build` could not see the regression it caused
+
+`oc_agent::builtin::INTERNAL_NAMES = ["compaction", "title", "summary"]` had 21
+passing tests and no caller. Todo 63's own doc comment predicted the cost —
+*"dropping any of them silently removes auto-compaction, session titles, or
+session summaries"* — and declaring them did not supply them either. The measured
+consequence was the perf gate: our binary sent **2** provider requests for one
+tool turn where upstream sends **3**, so the frozen
+`completed_tool_turns(captured) = (captured - 1) / 2` scored our turn as **0** and
+timed out. The harness was right; we were missing the feature.
+
+**Now 3, on both surfaces**: `pty_requests=3` for the `--prompt` flag path and for
+keystrokes typed into the pty, and 3 captured in the headless `run` test.
+`completed_tool_turns(3) = 1`.
+
+### The regression `cargo build --workspace` reported as green
+
+Widening `compaction::run_compaction` from `&Connection` to `&mut Connection` —
+necessary because a shared `&Connection` held across the provider stream makes the
+whole future non-`Send`, and the TUI spawns its turn driver — left the build clean
+while **four test targets failed to compile** (`oc-memory/src/snapshot.rs:587`,
+`oc-engine/tests/compaction.rs:371,514,534`). This is the wave-5 hazard again, and
+it is now the second time it has cost a fix pass: **`cargo test --workspace` is the
+integration gate; a green `cargo build` across a signature change proves nothing.**
+
+### `&Connection` across an await is the thing that makes a future unspawnable
+
+Worth generalising, because it will recur. `rusqlite::Connection` is `Send` but not
+`Sync`, so `&Connection: Send` is false and `&mut Connection: Send` is true. Any
+async function in this workspace that interleaves DB writes with provider streaming
+must take `&mut Connection` or it can never be `tokio::spawn`ed. `run_turn` already
+did, by luck rather than intent; `run_compaction` did not, and had never been
+called from a spawned task because it had never been called at all.
+
+### The append-only cache violation did not fire, and not by luck
+
+This task adds a request to the **front** of every turn, which is exactly the shape
+that produced `append-only cache violation on turn 2: stable history message 1
+changed` (`oc-llm/src/cache.rs:153`) in todo 105's first attempt. It is structurally
+safe here:
+
+- `run_turn` creates its `PromptCache` **inside** the call (`loop.rs:561`), so the
+  tracker's first observation is already the post-prelude, post-compaction prefix.
+  There is no earlier prefix to differ from and nothing to reset.
+- The prelude's own requests never reach that tracker: `collect_text` builds bare
+  `CompletionRequest`s with `tools: []`, and compaction owns a `CacheTracker` and
+  `LockedTools` created and dropped inside `compact_if_overflowing`.
+- Compaction **appends** (marker, summary message, summary text) and honouring it is
+  dropping a *prefix* of stored history. Nothing is mutated in place, so what the
+  tracker sees stays append-only within the turn.
+
+The general rule: **the safe place to change a request prefix is before the cache
+tracker for that request exists.** Anything that changes it between step *n* and
+step *n+1* is the violation, whatever wrote it.
+
+### Compaction is honoured by reading, not by rewriting
+
+`loop::retained_history` was the design decision that made this small. A compaction
+attempt persists a marker naming `tail_start_id`, and all three of its writes sort
+*after* the tail because they are stamped when the attempt runs. So honouring a
+compaction is `&history[tail_index..]` — the marker projects to nothing (`compaction`
+is not a request-bearing `PartKind`), the summary projects to the assistant text
+message, and the request that comes out is byte-identical to what
+`run_compaction` returned in its `messages` field, without either being
+reconstructed. No second projection to drift.
+
+**A failed attempt is deliberately ignored.** It persists the marker *and* an errored
+summary carrying no text; honouring that marker would drop the history and substitute
+nothing — a conversation starting mid-thought, indistinguishable from a working
+compaction from outside. So a marker takes effect only once its paired summary has
+text and no error, and a dangling `tail_start_id` leaves history intact. Same family
+as wave-17's 4.19 GB prune: **when a reduction's replacement might be missing, retain.**
+
+### "Not needed" and "could not" must not share a variant
+
+The first version reported `CompactionOutcome::NotNeeded` as a skip, and the PTY
+transcript then read *"compaction: the session has no finished assistant message, so
+nothing has been measured"* on the very first turn of every session. That is the
+wave-18 lesson in a new place: a line on every ordinary turn is a line the user
+learns to ignore, and then a real loss goes unread. `compact_if_overflowing` now
+returns `Ok(false)` for a history that fits and `Err(Reason)` only when the history
+overflowed and the attempt could not be made. Pinned by
+`an_ordinary_turn_reports_nothing_at_all`.
+
+### The context window was already in the catalog
+
+`oc_llm::catalog::resolved::ModelLimit { context, input, output }` — models.dev's
+`limit.*`, carried through `merge.rs:486-490` so a config override wins. Upstream
+reads the same two fields for the same decision (`session/overflow.ts:10-19`), so no
+constant was invented. They are `f64` because models.dev publishes JSON numbers;
+`token_count` maps non-finite/negative/zero to 0, and 0 already means "no threshold
+compaction" to `CompactionPolicy`. Known gap: I did **not** use `limit.input`,
+because `TokenWindow` has no field for it and adding one changes todo 35's tested
+type — a model declaring a smaller input ceiling compacts slightly later than
+upstream would.
