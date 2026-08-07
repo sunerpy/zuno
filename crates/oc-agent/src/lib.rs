@@ -20,8 +20,22 @@
 //! `oh-my-openagent/dist/index.js:24467` and `:24652`, whose per-agent and
 //! per-category fallback chains name concrete models and the providers entitled to
 //! serve them, and therefore go stale on every model release.
+//!
+//! # Continuing a child session
+//!
+//! [`continuation`] owns the state that makes `task_id` mean something. Two ids, not
+//! one: a session id names a conversation and a job id names one dispatch into it, so a
+//! lane can be continued repeatedly without its handles colliding — upstream reuses the
+//! session id as the job id and the ambiguity is visible on a single code path
+//! (`packages/opencode/src/tool/task.ts:262` against `:294`). The board it renders is
+//! injected into the coordinator's context each turn, and its load-bearing rule is that
+//! an `Active` lane is **not addressable**: a re-dispatch into a running lane is
+//! refused, naming the lane, rather than silently amending work already in flight.
+//! "Active" is derived from the engine's run registry rather than stored a second time,
+//! which is why the answer is process-local and the module says so.
 
 pub mod builtin;
+pub mod continuation;
 pub mod model_policy;
 pub mod plan_file;
 pub mod reflection;
