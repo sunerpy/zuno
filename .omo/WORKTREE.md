@@ -528,3 +528,42 @@ cache and the workspace builds `--offline`. Resolved by fetching it once:
 Note `cargo search` is unusable here — the registry is replaced by the `aliyun` mirror
 and it errors with "crates-io is replaced with non-remote-registry source". Use
 `cargo add --dry-run` to check availability instead.
+
+## Wave 16 dispatch ledger (2026-08-07)
+
+`main` = 2655 tests, 88/103 done. Three agents; only three todos are unblocked.
+
+| todo | crate | session | dispatched |
+|---|---|---|---|
+| 62 | `oc-plugin/tests/integration.rs` (sole) | `ses_025aad319ffee2q49dpz0bne4E` | yes |
+| 76 | `oc-tui/views/` (sole) | `ses_025a9a8c2ffeKfRl3Pm4j7qY87` | yes |
+| 81 | `oc-db/retention.rs` (sole) | `ses_025a89acaffeTNxfTGYvPTsnS8` | yes |
+
+Everything else is a **strict chain**: `81 → 82 → {83,84} → 85 → 86 → {87,88,91} → {89,92} → 90 → 103`.
+So parallelism collapses from here: after this wave it is mostly one or two at a time,
+and **86** (the full differential compat suite) is the choke point — it needs 62, 76,
+and the entire 81-85 chain.
+
+Remaining after this wave: 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 103 = 12.
+
+### Wave 15 result
+
+All five merged: **59** (wasm tier, feature-gated), **61** (config-dir Zod tools),
+**66** (continuation + job board), **77** (attention), **80** (global session listing).
+2541 → 2655 tests.
+
+Mutation-verified this wave, ten in total, every one caught by exactly the right test:
+`enabled:false` still emitting a cue; no-degrade-to-notification-only; every lane
+addressable (5 tests); dropping the `id DESC` tiebreak; `--archived` made exclusive;
+`wasm = []` with an unconditional wasmtime dep (the feature-gate graph test);
+`enabled` master switch ignored.
+
+Two things worth carrying forward:
+
+- **`wasmtime` is now in the offline cache.** A cold fetch failed once on a slow mirror
+  and succeeded on retry in 44s. `cargo search` is unusable here (aliyun mirror
+  replacement); use `cargo add --dry-run`.
+- **Todo 61's Zod fixture symlinks the oracle tree's real `zod`** at
+  `opencode/packages/opencode/node_modules/zod`, with an `OPENCODE_ZOD_FIXTURE`
+  override and a printed skip when absent. That is the pattern for "test against the
+  real dependency without vendoring it", now used by todos 45, 46, 60, 61 and 78.
