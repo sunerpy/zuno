@@ -581,19 +581,16 @@ impl PluginLoad {
         &self,
         reserved: impl IntoIterator<Item = &'a str>,
     ) -> Result<(), PluginToolConflict> {
-        let reserved = reserved.into_iter().collect::<BTreeSet<_>>();
-        let mut plugin_names = BTreeSet::new();
-        for plugin in &self.plugins {
-            for (name, _) in &plugin.inner.tools {
-                if reserved.contains(name.as_str()) {
-                    return Err(PluginToolConflict::Reserved { name: name.clone() });
-                }
-                if !plugin_names.insert(name.clone()) {
-                    return Err(PluginToolConflict::Duplicate { name: name.clone() });
-                }
-            }
-        }
-        Ok(())
+        validate_tool_names(
+            self.plugins.iter().flat_map(|plugin| {
+                plugin
+                    .inner
+                    .tools
+                    .iter()
+                    .map(|(name, _)| (name.as_str(), None))
+            }),
+            reserved,
+        )
     }
 
     pub async fn shutdown(&self) {
@@ -608,6 +605,44 @@ pub enum PluginToolConflict {
     Reserved { name: String },
     #[error("duplicate plugin tool name `{name}`")]
     Duplicate { name: String },
+    #[error(
+        "duplicate plugin tool name `{name}` from `{first}` and `{second}`",
+        first = first.display(),
+        second = second.display()
+    )]
+    DuplicateSources {
+        name: String,
+        first: PathBuf,
+        second: PathBuf,
+    },
+}
+
+pub(crate) fn validate_tool_names<'a, 'b, 'c>(
+    tools: impl IntoIterator<Item = (&'a str, Option<&'b std::path::Path>)>,
+    reserved: impl IntoIterator<Item = &'c str>,
+) -> Result<(), PluginToolConflict> {
+    let reserved = reserved.into_iter().collect::<BTreeSet<_>>();
+    let mut extension_names = BTreeMap::new();
+    for (name, origin) in tools {
+        if reserved.contains(name) {
+            return Err(PluginToolConflict::Reserved {
+                name: name.to_owned(),
+            });
+        }
+        if let Some(first) = extension_names.insert(name, origin) {
+            return match (first, origin) {
+                (Some(first), Some(second)) => Err(PluginToolConflict::DuplicateSources {
+                    name: name.to_owned(),
+                    first: first.to_path_buf(),
+                    second: second.to_path_buf(),
+                }),
+                _ => Err(PluginToolConflict::Duplicate {
+                    name: name.to_owned(),
+                }),
+            };
+        }
+    }
+    Ok(())
 }
 
 /// Spawn all configured processes concurrently and register successes in input order.

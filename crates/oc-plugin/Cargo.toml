@@ -30,6 +30,7 @@ oc-paths = { workspace = true }
 oc-permission = { workspace = true }
 oc-plugin-sdk = { workspace = true }
 oc-tool = { workspace = true }
+oc-tools = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

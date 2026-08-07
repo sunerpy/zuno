@@ -1,6 +1,7 @@
 //! Plugin host: the hook bus and the plugin lifecycle.
 
 mod auth;
+mod config_tools;
 mod discovery;
 mod hooks;
 mod js;
@@ -10,6 +11,7 @@ mod payload;
 mod provider;
 
 pub use crate::auth::*;
+pub use crate::config_tools::*;
 pub use crate::discovery::*;
 pub use crate::hooks::*;
 pub use crate::js::*;

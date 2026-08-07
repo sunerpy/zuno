@@ -60,6 +60,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use oc_engine::terminal_lease::{LeaseReason, TerminalLease, TerminalLeaseGuard};
+use oc_tool::{PermissionAsk, ToolContext};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -388,6 +389,8 @@ struct HostInner {
     terminal: Option<Arc<dyn TerminalLease>>,
     lease: Mutex<Option<TerminalLeaseGuard>>,
     handle_peak: AtomicU64,
+    tool_contexts: Mutex<HashMap<u64, (String, ToolContext)>>,
+    next_tool_context: AtomicU64,
     _temp: Option<Arc<tempfile::TempDir>>,
 }
 
@@ -443,6 +446,28 @@ impl JsHostBuilder {
             entry: entry.into(),
             spec: spec.spec().to_owned(),
             kind: spec.kind().as_str(),
+            input,
+            limits: JsHostLimits::default(),
+            terminal: None,
+            shim: None,
+        }
+    }
+
+    /// A resident host for one config-directory tool module.
+    #[must_use]
+    pub fn config_tool(
+        runtime: JsRuntime,
+        entry: impl Into<PathBuf>,
+        input: JsPluginInput,
+    ) -> Self {
+        let entry = entry.into();
+        let label = entry.display().to_string();
+        Self {
+            plugin: label.clone(),
+            runtime,
+            entry,
+            spec: format!("file:{label}"),
+            kind: "config-tool",
             input,
             limits: JsHostLimits::default(),
             terminal: None,
@@ -540,6 +565,8 @@ impl JsHostBuilder {
             terminal: self.terminal,
             lease: Mutex::new(None),
             handle_peak: AtomicU64::new(0),
+            tool_contexts: Mutex::new(HashMap::new()),
+            next_tool_context: AtomicU64::new(1),
             _temp: temp,
         });
 
@@ -659,6 +686,75 @@ impl JsHost {
             .map_err(|error| JsHostError::Disabled {
                 plugin: self.inner.plugin.clone(),
                 detail: format!("the host executor stopped during a callback: {error}"),
+            })?
+    }
+
+    /// Invoke a config-directory tool retained by this host.
+    ///
+    /// The execution context stays resident in Rust. JavaScript receives the public
+    /// coordinates and a context id; `context.ask(...)` round-trips through that id
+    /// so permission decisions are never reimplemented in the compat process.
+    pub async fn call_tool(
+        &self,
+        tool: &str,
+        index: usize,
+        arguments: Value,
+        context: ToolContext,
+        directory: &std::path::Path,
+        worktree: &std::path::Path,
+    ) -> Result<Value, JsHostError> {
+        let inner = Arc::clone(&self.inner);
+        let executor = inner.executor.clone();
+        let tool = tool.to_owned();
+        let directory = directory.to_path_buf();
+        let worktree = worktree.to_path_buf();
+        executor
+            .spawn(async move {
+                if !inner.enabled.load(Ordering::SeqCst) {
+                    inner.restart().await?;
+                }
+                let handle_id = lock(&inner.report)
+                    .as_ref()
+                    .and_then(|report| report.tools.get(index))
+                    .and_then(|descriptor| descriptor.get("execute"))
+                    .and_then(|execute| {
+                        JsHandle::from_value(execute, inner.generation.load(Ordering::SeqCst))
+                    })
+                    .map(|handle| handle.id)
+                    .ok_or_else(|| JsHostError::Protocol {
+                        plugin: inner.plugin.clone(),
+                        detail: format!("config tool `{tool}` has no executable handle"),
+                    })?;
+                let context_id = inner.next_tool_context.fetch_add(1, Ordering::SeqCst);
+                let context_value = json!({
+                    "sessionID": context.session_id,
+                    "messageID": context.message_id,
+                    "callID": context.call_id,
+                    "agent": context.agent,
+                    "depth": context.depth,
+                    "directory": directory,
+                    "worktree": worktree,
+                    "aborted": context.is_interrupted(),
+                });
+                lock(&inner.tool_contexts).insert(context_id, (tool, context));
+                let result = inner
+                    .request(
+                        "tool.call",
+                        json!({
+                            "handle": handle_id,
+                            "args": arguments,
+                            "contextID": context_id,
+                            "context": context_value,
+                        }),
+                    )
+                    .await;
+                lock(&inner.tool_contexts).remove(&context_id);
+                result
+            })
+            .await
+            .map_err(|error| JsHostError::Disabled {
+                plugin: self.inner.plugin.clone(),
+                detail: format!("the host executor stopped during a tool call: {error}"),
             })?
     }
 
@@ -1401,6 +1497,44 @@ fn route(host: &Arc<HostInner>, frame: Value, hello: &mut Option<oneshot::Sender
                 });
             }
         }
+        "tool.ask" => {
+            let context_id = frame
+                .get("params")
+                .and_then(|params| params.get("context"))
+                .and_then(Value::as_u64);
+            let input = frame
+                .get("params")
+                .and_then(|params| params.get("input"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let context = context_id
+                .and_then(|context_id| lock(&host.tool_contexts).get(&context_id).cloned());
+            let host = Arc::clone(host);
+            host.executor.clone().spawn(async move {
+                let result = match context {
+                    Some((tool, context)) => {
+                        let ask = permission_ask(&input);
+                        context
+                            .ask(&tool, ask)
+                            .await
+                            .map(|()| Value::Null)
+                            .map_err(|error| error.to_string())
+                    }
+                    None => Err("tool execution context is no longer available".to_owned()),
+                };
+                if let Some(id) = id {
+                    let frame = match result {
+                        Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                        Err(message) => json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": { "code": -32000, "message": message },
+                        }),
+                    };
+                    let _written = host.write(&frame).await;
+                }
+            });
+        }
         other => {
             tracing::debug!(plugin = %host.plugin, method = other, "ignored plugin-initiated frame");
             if let Some(id) = id {
@@ -1417,6 +1551,36 @@ fn route(host: &Arc<HostInner>, frame: Value, hello: &mut Option<oneshot::Sender
                 });
             }
         }
+    }
+}
+
+fn permission_ask(input: &Value) -> PermissionAsk {
+    let strings = |key: &str| {
+        input
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    PermissionAsk {
+        permission: input
+            .get("permission")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        patterns: strings("patterns"),
+        metadata: input
+            .get("metadata")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default(),
+        always: strings("always"),
     }
 }
 
