@@ -119,7 +119,24 @@ echo "$out" | grep -E "^(error|warning: unused)" | head -20
 pass=$(echo "$out" | grep -oE '^test result: ok\. [0-9]+' | grep -oE '[0-9]+' | paste -sd+ | bc 2>/dev/null || echo 0)
 fail=$(echo "$out" | grep -cE '^test result: FAILED')
 [ "$fail" -eq 0 ] || { echo "$out" | grep -B5 "^failures:" | head -40; die "$fail failing test target(s)"; }
-ok "$pass tests pass, 0 failing targets"
+
+# A test target that fails to COMPILE never emits a `test result:` line, so the
+# count above cannot see it. Merging task-84 printed "0 failing targets" while the
+# same output carried `error[E0463]` and `error: doctest failed`. A gate that
+# recognises one spelling of failure is not a gate.
+for spelling in \
+  '^error: doctest failed' \
+  '^error: could not compile' \
+  '^error: test failed' \
+  '^error\[E[0-9]+\]'
+do
+  hits=$(echo "$out" | grep -cE "$spelling")
+  [ "$hits" -eq 0 ] || {
+    echo "$out" | grep -E "$spelling" -A6 | head -30
+    die "$hits occurrence(s) of /$spelling/ — a test target failed to build"
+  }
+done
+ok "$pass tests pass, 0 failing targets, no compile-time test failures"
 
 note "cargo clippy --workspace --all-targets --offline"
 cl=$(cargo clippy --workspace --all-targets --offline 2>&1 | grep -cE '^(warning|error)')
