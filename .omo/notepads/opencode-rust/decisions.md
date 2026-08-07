@@ -5870,3 +5870,54 @@ Resume only after the product accepts an explicitly configured provider/model wh
 fetches are disabled and no global catalog exists. Pin that with a real TUI/tool turn
 test that omits `OPENCODE_MODELS_PATH`; then rerun the unchanged release TUI-vs-TUI
 gate, five AB/BA repetitions, whole-tree sampler and 0.50x formulas.
+
+## [2026-08-07] Task 108: no bundled catalog snapshot — deliberate, with the measurement
+
+Upstream's rung 2 (`models-dev.ts:198-200`, read at `:220-221`) is a catalog snapshot
+its bundler injects as the `OPENCODE_MODELS_DEV` global. Todo 108 allowed either
+embedding one or skipping it. **Skipped**, and the reasoning is measured rather than
+convenient:
+
+- **What is actually in it.** Under `env -i`, an empty `XDG_CACHE_HOME` and
+  `OPENCODE_DISABLE_MODELS_FETCH=1`, 1.18.12 lists exactly seven models:
+  `opencode/big-pickle`, `deepseek-v4-flash-free`, `laguna-s-2.1-free`,
+  `ling-3.0-flash-free`, `mimo-v2.5-free`, `nemotron-3-ultra-free`,
+  `north-mini-code-free`. Six carry `-free`. That is **not** a copy of models.dev —
+  it is a manifest of that release's own hosted gateway, made of preview names that
+  rotate between releases.
+- **So a frozen copy is a parity hazard, not parity.** It would make this binary
+  advertise models on someone else's gateway from a list it can never refresh, worst
+  for exactly the air-gapped user the todo serves.
+- **It buys nothing for the case at hand.** The config-only model resolves through the
+  merge (`provider.ts:1425-1520`), not through the snapshot. Verified: with
+  `enabled_providers:["test"]` scoping out the gateway models, ours and 1.18.12 both
+  print `test/test-model` and exit 0 — byte-identical.
+- **And the build constraint is real.** This workspace builds `--offline` throughout
+  (`.omo/premerge.sh`, `make ci`); `cargo search` does not work here at all. Embedding
+  would mean a committed blob someone must keep current forever.
+
+**Declared cost**: under the disabled flag with no cache, upstream lists its seven
+gateway models and we list none. That is a listing difference only; anything the user's
+own config declares resolves identically. Recorded in the `catalog/source.rs` module
+docs under "Rung 2 is deliberately absent" so the next reader does not re-litigate it,
+and asserted by the scoped differential rather than left as prose.
+
+**DIVERGENCE CANDIDATE for the allow-list** (`docs/divergences.toml`, whoever revises
+`oc_testkit::divergence::DECLARED_COUNT` next — todo 103 already has to move that
+number): *no compile-time catalog snapshot*. It is the same class as the six already
+nominated in wave 18 — a deliberate, reasoned, documented difference, not a bug. If it
+is added, the count bump must land in the same commit or the compat suite refuses.
+
+### Two API decisions inside the fix
+
+- **`CatalogProvenance` is a four-variant enum, not a bool.** `is_fetch_forbidden()`
+  alone would have worked for today's single caller, but the discriminator's whole
+  purpose is that "empty" is ambiguous; a bool re-creates the ambiguity one level up.
+  The variants carry the `origin`/`cache` needed to build the error, so the message
+  cannot drift from the reason.
+- **`unresolved_model` lives on `CatalogProvenance`, with a delegating method on
+  `LoadedCatalog`.** It depends on nothing else, and both call sites (`oc-cli`'s
+  `select_model`, which holds only the provenance, and the integration tests, which
+  hold the load) get the same answer from one implementation. Its doc comment states
+  the ordering constraint explicitly — *consult it only after the resolved-catalog
+  lookup fails* — because calling it first restores the defect and compiles cleanly.

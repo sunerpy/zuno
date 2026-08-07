@@ -5496,3 +5496,46 @@ the seam only in a richer environment than the performance harness uses. A featu
 end-to-end test must include the poorest supported closed-world environment, especially
 when the test claims to mirror another harness. Otherwise an extra fixture can conceal
 a mandatory startup dependency that the real entry point does not have.
+
+## [2026-08-07] Task 108: an error is not a fallback, and a fixture that supplies
+## what the product should not need hides the gap forever
+
+**The defect.** `OPENCODE_DISABLE_MODELS_FETCH=1` with an empty cache returned
+`CatalogError::FetchDisabled` **even when the config fully specified the provider
+and the model**. An air-gapped user with a private gateway could not start the
+binary. Measured against both binaries under one `env -i` environment, empty
+`XDG_CACHE_HOME`, no `OPENCODE_MODELS_PATH`: ours exit 1, no output; released
+1.18.12 exit 0, eight models, including the config-only `test/test-model`.
+
+**Upstream's chain is three fallbacks and the last one is a success, not an
+error** — `models-dev.ts:196-223`: on-disk cache, then a compile-time bundled
+snapshot, then `return {}`. Config providers are merged *over* that result
+(`provider.ts:1425-1520`), which is why a self-contained config always works
+there. Our port had rung 1 and turned rung 3 into an error.
+
+**The reasoning that was right and misapplied.** `catalog/error.rs` argued
+fail-fast because the alternatives — hanging on a forbidden fetch, or an empty
+catalog the user meets as "no models found" three screens later — are both worse.
+That is correct **for a model nobody defines** and wrong when the config already
+defines it, because then there is nothing to look up. The fix split the two cases
+rather than deleting the error: `load()` succeeds with an empty document carrying
+a `CatalogProvenance`, and `FetchDisabled` is raised only after the **resolved**
+catalog (config merged in) fails to contain a *requested* model. It still names
+the model, the flag, the source, the cache path and the `provider` block.
+
+**The generalisable shape**: the same empty value meant two opposite things, and
+the caller could not tell them apart. Failing on both breaks the legitimate case;
+failing on neither hides the illegitimate one. The answer is to carry the *reason*
+alongside the value — here a four-variant `CatalogProvenance` — so each case gets
+its own answer. Same family as wave 17's *"no results" and "cannot see the data"
+must never render identically*, one level earlier: **do not let a caller choose
+between two wrong answers when the producer already knew which was right.**
+
+**And the fixture lesson, which is the sharper one.** `oc-cli/tests/tui_turn.rs`
+and `tool_turn.rs` both injected `OPENCODE_MODELS_PATH`. That is why five waves of
+seam tests never caught this: they handed the binary the very catalog the product
+should not have needed. Removing both injections is part of the product fix, not
+housekeeping — and the proof is that **mutation 1 (restoring the fail-fast) now
+fails both seam tests**, which it could not have done before. A fixture that
+supplies a dependency the product is supposed to do without does not test the
+product; it tests the fixture.

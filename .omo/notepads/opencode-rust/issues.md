@@ -5129,3 +5129,38 @@ a bundled snapshot compiled in, then the empty catalog rather than an error, wit
 `FetchDisabled` retained **only** for the case where the requested model is genuinely
 unknown. Then remove the `OPENCODE_MODELS_PATH` injection from the two seam tests so they
 prove the product rather than the workaround.
+
+## [2026-08-07] Task 108: the sixth seam, and the first one a *fixture* created
+
+Five previous seams (wave 11 `/api/event`, wave 17's 4.19 GB prune, todos 104/105/106,
+todo 107's legacy DB) all came from per-file todos producing per-file correctness with
+nobody owning the join. **Todo 108 is different in kind**: the seam had tests pointed
+straight at it, and they passed because the fixture injected the thing the product
+could not supply.
+
+`crates/oc-cli/tests/{tui_turn,tool_turn}.rs` both set `OPENCODE_MODELS_PATH` to
+`oc-llm/tests/fixtures/models-dev-pinned.json`. Those two tests drive the **real
+binary** end to end, under a real PTY, with `OPENCODE_DISABLE_MODELS_FETCH=1` — the
+exact scenario. They could not fail, because the one variable that mattered was
+pre-supplied.
+
+**Rule, added to the ones already here**: a test fixture that sets an environment
+variable, writes a file, or injects a path the *product* is supposed to work without
+is not a fixture — it is a silent `#[ignore]` on the property that variable stands in
+for. When adding one, state in a comment which product behaviour it is standing in
+for, and whether the product must also work without it. If it must, there needs to be
+a second test that does without.
+
+Corollary for review: **grep a new test's env block for anything the product resolves
+on its own.** `OPENCODE_MODELS_PATH`, `OPENCODE_CONFIG_CONTENT`, `OPENCODE_DB` are all
+overrides of a resolution path; each one narrows what the test can observe. Deliberate
+overrides are fine (`OPENCODE_DISABLE_MODELS_FETCH=1` in `oc-testkit/src/env.rs:218`
+enforces the no-live-provider invariant and is correct). The test is that the product
+works *under* the invariant, not that the fixture routes around it.
+
+Also worth noting the running tally is unchanged at six plan counts contradicted by
+the source — todo 108's plan text was accurate on every measurable claim. Its one
+imprecision is a mechanism attribution, not a count: it credits the bundled snapshot
+with making the config-only case work upstream, when measurement shows the snapshot
+only supplies the seven `opencode/*` gateway models and the config-only model comes
+from the merge. That is why skipping the snapshot costs nothing here.
