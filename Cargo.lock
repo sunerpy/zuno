@@ -2968,6 +2968,8 @@ dependencies = [
  "crossterm 0.29.0",
  "insta",
  "oc-engine",
+ "oc-llm",
+ "oc-permission",
  "ratatui",
  "serde",
  "serde_json",
