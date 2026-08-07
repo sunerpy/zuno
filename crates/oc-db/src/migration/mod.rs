@@ -1,4 +1,25 @@
-//! Atomic current-schema creation and TypeScript migration-journal parity.
+//! Atomic current-schema creation, legacy migration, and TypeScript
+//! migration-journal parity.
+//!
+//! # Three databases, three paths
+//!
+//! [`apply`] is a port of `packages/core/src/database/migration.ts:18-79`, and the
+//! shape of that function is the whole design. A database arrives in exactly one
+//! of three states and each needs different handling:
+//!
+//! * **has `session`** — someone's real history. Never recreate it; run only the
+//!   migrations its journal does not already record ([`apply_only`]).
+//! * **empty** — a fresh install. Create the current schema in one statement batch
+//!   and pre-seed all 38 journal ids, so no migration ever replays.
+//! * **non-empty without `session`** — unrecognised. Fail; touching it would be
+//!   guesswork over someone's data.
+//!
+//! The order those are tested in is load-bearing, so it matches upstream's:
+//! `session` first, then non-empty, then empty. `create_current` cannot be reached
+//! by any database that has tables, and it re-checks that *inside* its own write
+//! transaction rather than trusting the caller — see there for why.
+
+mod steps;
 
 use crate::{open, schema};
 use oc_error::DbError;
@@ -6,83 +27,177 @@ use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use steps::MIGRATIONS;
+
 /// The migration ids loaded by `migration.gen.ts`, in its generated order.
-pub const MIGRATION_IDS: [&str; 38] = [
-    "20260127222353_familiar_lady_ursula",
-    "20260211171708_add_project_commands",
-    "20260213144116_wakeful_the_professor",
-    "20260225215848_workspace",
-    "20260227213759_add_session_workspace_id",
-    "20260228203230_blue_harpoon",
-    "20260303231226_add_workspace_fields",
-    "20260309230000_move_org_to_state",
-    "20260312043431_session_message_cursor",
-    "20260323234822_events",
-    "20260410174513_workspace-name",
-    "20260413175956_chief_energizer",
-    "20260423070820_add_icon_url_override",
-    "20260427172553_slow_nightmare",
-    "20260428004200_add_session_path",
-    "20260501142318_next_venus",
-    "20260504145000_add_sync_owner",
-    "20260507164347_add_workspace_time",
-    "20260510033149_session_usage",
-    "20260511000411_data_migration_state",
-    "20260511173437_session-metadata",
-    "20260601010001_normalize_storage_paths",
-    "20260601202201_amazing_prowler",
-    "20260602002951_lowly_union_jack",
-    "20260602182828_add_project_directories",
-    "20260603001617_session_message_projection_indexes",
-    "20260603040000_session_message_projection_order",
-    "20260603141458_session_input_inbox",
-    "20260603160727_jittery_ezekiel_stane",
-    "20260604172448_event_sourced_session_input",
-    "20260605003541_add_session_context_snapshot",
-    "20260605042240_add_context_epoch_agent",
-    "20260611035744_credential",
-    "20260611192811_lush_chimera",
-    "20260612174303_project_dir_strategy",
-    "20260622142730_simplify_session_context_epoch",
-    "20260622170816_reset_v2_session_state",
-    "20260622202450_simplify_session_input",
-];
+///
+/// Derived from [`steps::MIGRATIONS`] at compile time rather than written out
+/// twice: a hand-maintained copy could disagree with the SQL that actually runs,
+/// and a journal that names a migration nobody executed is worse than no journal.
+pub const MIGRATION_IDS: [&str; MIGRATIONS.len()] = {
+    let mut ids = [""; MIGRATIONS.len()];
+    let mut index = 0;
+    while index < MIGRATIONS.len() {
+        ids[index] = MIGRATIONS[index].id;
+        index += 1;
+    }
+    ids
+};
 
 /// Numeric version attached to failures from this generated migration set.
 pub const CURRENT_VERSION: u32 = MIGRATION_IDS.len() as u32;
 
+/// The journal Drizzle wrote before upstream replaced it with `migration`.
+///
+/// Only its `name` column is read, and only once — see [`seed_from_drizzle`].
+pub const DRIZZLE_JOURNAL_TABLE: &str = "__drizzle_migrations";
+
+/// What [`apply_only`] did, so a caller can tell seeding from execution.
+///
+/// The distinction is the whole safety property of a legacy migration: an id that
+/// was *seeded* is a claim the old journal made about SQL that already ran, and an
+/// id that was *executed* is SQL this call ran itself. "Nothing was replayed" is
+/// only checkable if the two are reported separately — inferring it from a
+/// successful return would be inferring it from the fact that replayed DDL happens
+/// to error, which is a coincidence, not a guarantee.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Applied {
+    /// Ids copied out of Drizzle's journal, in the order that journal held them.
+    pub seeded: Vec<String>,
+    /// Ids whose SQL this call ran, in [`MIGRATION_IDS`] order.
+    pub executed: Vec<String>,
+}
+
 const JOURNAL_SQL: &str =
     "CREATE TABLE \"migration\" (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)";
 
-/// Create a current database atomically, or verify that an existing session
-/// database already records every migration this binary knows.
-///
-/// Existing databases are never marked current speculatively. If one lacks a
-/// known id, this function fails rather than hiding an older schema behind a
-/// newly seeded journal.
+const JOURNAL_IF_ABSENT_SQL: &str = "CREATE TABLE IF NOT EXISTS \"migration\" (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)";
+
+/// Bring a database to the current schema, whatever state it arrives in.
 ///
 /// # Errors
 ///
-/// [`DbError::Migration`] for an unknown non-empty database, missing journal
-/// entries, time conversion failures, or SQLite DDL/DML failures.
-/// [`DbError::Busy`] if another writer holds the database lock.
+/// [`DbError::Migration`] for a non-empty database with no `session` table, for a
+/// migration SQLite rejects, for time conversion failures, or for SQLite DDL/DML
+/// failures. [`DbError::Busy`] if another writer holds the database lock.
 pub fn apply(connection: &mut Connection) -> Result<(), DbError> {
     let tables = table_names(connection)?;
-    if tables.is_empty() {
-        return create_current(connection);
-    }
     if tables.iter().any(|table| table == "session") {
-        return verify_journal(connection);
+        return apply_only(connection).map(|_| ());
     }
-    Err(failure(std::io::Error::other(
-        "database is not empty and has no session table",
-    )))
+    if !tables.is_empty() {
+        return Err(failure(std::io::Error::other(
+            "database is not empty and has no session table",
+        )));
+    }
+    create_current(connection)
 }
 
+/// Run every migration an existing database has not recorded.
+///
+/// A port of `migration.ts:43-79`. Three things it does that a journal check
+/// alone does not:
+///
+/// 1. **Creates the journal if it is absent.** A real install predating the
+///    `migration` table has a `session` table and no journal at all, so reading
+///    the journal first is how this function used to fail on the very databases it
+///    exists to serve.
+/// 2. **Seeds the journal from Drizzle's, once.** See [`seed_from_drizzle`].
+/// 3. **Skips anything already recorded**, so old SQL never replays over data.
+///
+/// Each migration commits in its own transaction, as upstream does: a chain that
+/// fails halfway leaves the completed prefix recorded, and the next launch resumes
+/// rather than starting over.
+///
+/// # Errors
+///
+/// [`DbError::Migration`] if the journal cannot be created or read, or if a
+/// migration's SQL fails. [`DbError::Busy`] if another writer holds the lock.
+pub fn apply_only(connection: &mut Connection) -> Result<Applied, DbError> {
+    connection
+        .execute_batch(JOURNAL_IF_ABSENT_SQL)
+        .map_err(map_error)?;
+
+    let mut applied = Applied::default();
+    let mut completed = journal_ids(connection)?;
+    if completed.is_empty() && has_table(connection, DRIZZLE_JOURNAL_TABLE)? {
+        seed_from_drizzle(connection)?;
+        applied.seeded = drizzle_names(connection)?;
+        completed = journal_ids(connection)?;
+    }
+
+    for migration in &MIGRATIONS {
+        if completed.contains(migration.id) {
+            continue;
+        }
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_error)?;
+        migration.run(&transaction)?;
+        record(&transaction, migration.id)?;
+        transaction.commit().map_err(map_error)?;
+        applied.executed.push(migration.id.to_owned());
+    }
+    Ok(applied)
+}
+
+/// Copy Drizzle's completed migration names into the `migration` journal.
+///
+/// Upstream's reason, verbatim from `migration.ts:52-54`: *"Existing installs used
+/// Drizzle's migration journal. Seed the new journal once so TypeScript migrations
+/// don't replay old SQL."*
+///
+/// Without this step every migration looks outstanding on a legacy install, and
+/// migration 1 would try to `CREATE TABLE session` over 2,345 live sessions. The
+/// `INSERT OR IGNORE` and the empty-journal precondition together make it a
+/// once-only operation, and the names are taken as-is: this function's job is to
+/// record what the old journal claims, not to audit it against
+/// [`MIGRATION_IDS`].
+fn seed_from_drizzle(connection: &Connection) -> Result<(), DbError> {
+    let time_completed = unix_milliseconds()?;
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO migration (id, time_completed) \
+             SELECT name, ?1 FROM __drizzle_migrations WHERE name IS NOT NULL",
+            params![time_completed],
+        )
+        .map_err(map_error)?;
+    Ok(())
+}
+
+fn drizzle_names(connection: &Connection) -> Result<Vec<String>, DbError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT name FROM __drizzle_migrations \
+             WHERE name IS NOT NULL ORDER BY rowid",
+        )
+        .map_err(map_error)?;
+    statement
+        .query_map([], |row| row.get(0))
+        .map_err(map_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_error)
+}
+
+/// Create the current schema and pre-seed the journal, atomically.
+///
+/// The emptiness check is repeated here, inside the `IMMEDIATE` transaction, and
+/// that is not belt-and-braces. [`apply`]'s check runs before any write lock
+/// exists, so another process can create the schema in the gap; and this function
+/// is reachable from anywhere in the module. `schema::up` over a live `session`
+/// table would recreate tables on top of someone's history. Refusing here makes
+/// that unreachable no matter how the function is called or who else is writing.
 fn create_current(connection: &mut Connection) -> Result<(), DbError> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(map_error)?;
+    let tables = transaction_table_names(&transaction)?;
+    if !tables.is_empty() {
+        return Err(failure(std::io::Error::other(format!(
+            "refusing to create the current schema over an existing database: {}",
+            tables.join(", ")
+        ))));
+    }
     schema::up(&transaction)?;
     create_journal(&transaction)?;
     seed_journal(&transaction)?;
@@ -107,23 +222,26 @@ fn seed_journal(transaction: &Transaction<'_>) -> Result<(), DbError> {
     Ok(())
 }
 
-fn verify_journal(connection: &Connection) -> Result<(), DbError> {
-    let completed = journal_ids(connection)?;
-    let missing: Vec<_> = MIGRATION_IDS
-        .iter()
-        .copied()
-        .filter(|id| !completed.contains(*id))
-        .collect();
-    if missing.is_empty() {
-        return Ok(());
-    }
-    Err(failure(std::io::Error::other(format!(
-        "migration journal is missing: {}",
-        missing.join(", ")
-    ))))
+fn record(transaction: &Transaction<'_>, id: &str) -> Result<(), DbError> {
+    let time_completed = unix_milliseconds()?;
+    transaction
+        .execute(
+            "INSERT INTO migration (id, time_completed) VALUES (?1, ?2)",
+            params![id, time_completed],
+        )
+        .map_err(map_error)?;
+    Ok(())
 }
 
 fn table_names(connection: &Connection) -> Result<Vec<String>, DbError> {
+    query_table_names(connection)
+}
+
+fn transaction_table_names(transaction: &Transaction<'_>) -> Result<Vec<String>, DbError> {
+    query_table_names(transaction)
+}
+
+fn query_table_names(connection: &Connection) -> Result<Vec<String>, DbError> {
     let mut statement = connection
         .prepare(
             "SELECT name FROM sqlite_master \
@@ -134,6 +252,17 @@ fn table_names(connection: &Connection) -> Result<Vec<String>, DbError> {
         .query_map([], |row| row.get(0))
         .map_err(map_error)?
         .collect::<Result<Vec<_>, _>>()
+        .map_err(map_error)
+}
+
+fn has_table(connection: &Connection, name: &str) -> Result<bool, DbError> {
+    connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![name],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count > 0)
         .map_err(map_error)
 }
 
@@ -166,5 +295,94 @@ fn failure(source: impl std::error::Error + Send + Sync + 'static) -> DbError {
     DbError::Migration {
         version: CURRENT_VERSION,
         source: Box::new(source),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migration_ids_are_derived_from_the_statements_that_actually_run() {
+        assert_eq!(MIGRATION_IDS.len(), 38);
+        assert_eq!(CURRENT_VERSION, 38);
+        for (index, migration) in MIGRATIONS.iter().enumerate() {
+            assert_eq!(MIGRATION_IDS[index], migration.id);
+        }
+        assert_eq!(MIGRATION_IDS[0], "20260127222353_familiar_lady_ursula");
+        assert_eq!(MIGRATION_IDS[37], "20260622202450_simplify_session_input");
+    }
+
+    #[test]
+    fn migration_ids_are_unique() {
+        let unique: HashSet<&str> = MIGRATION_IDS.iter().copied().collect();
+        assert_eq!(unique.len(), MIGRATION_IDS.len());
+    }
+
+    fn memory() -> Connection {
+        open::open(&oc_paths::DbLocation::Memory).expect("open memory database")
+    }
+
+    #[test]
+    fn create_current_refuses_a_database_that_already_holds_a_session_table() {
+        let mut connection = memory();
+        connection
+            .execute_batch(
+                "CREATE TABLE session (id text PRIMARY KEY, title text NOT NULL);
+                 INSERT INTO session VALUES ('session-1', 'someone real history');",
+            )
+            .expect("stand in for a live database");
+
+        let error = create_current(&mut connection).expect_err("must refuse");
+        let cause = format!("{:?}", std::error::Error::source(&error));
+        assert!(
+            cause.contains("refusing to create the current schema"),
+            "{cause}"
+        );
+
+        let title: String = connection
+            .query_row("SELECT title FROM session", [], |row| row.get(0))
+            .expect("the session survived");
+        assert_eq!(title, "someone real history");
+        let tables = query_table_names(&connection).expect("inventory");
+        assert_eq!(tables, ["session"], "no schema was created over the data");
+    }
+
+    #[test]
+    fn create_current_refuses_any_non_empty_database_even_without_a_session_table() {
+        let mut connection = memory();
+        connection
+            .execute_batch("CREATE TABLE something_else (id text PRIMARY KEY)")
+            .expect("create an unrelated table");
+
+        let error = create_current(&mut connection).expect_err("must refuse");
+        let cause = format!("{:?}", std::error::Error::source(&error));
+        assert!(cause.contains("something_else"), "{cause}");
+        assert_eq!(
+            query_table_names(&connection).expect("inventory"),
+            ["something_else"]
+        );
+    }
+
+    #[test]
+    fn apply_tests_for_a_session_table_before_it_tests_for_emptiness() {
+        let mut connection = memory();
+        connection
+            .execute_batch(
+                "CREATE TABLE session (id text PRIMARY KEY, title text NOT NULL);
+                 INSERT INTO session VALUES ('session-1', 'kept');",
+            )
+            .expect("stand in for a live database");
+
+        let error = apply(&mut connection).expect_err("the chain cannot migrate this shape");
+        let cause = format!("{:?}", std::error::Error::source(&error));
+        assert!(
+            !cause.contains("refusing to create the current schema"),
+            "apply must route a session database to the migration path, not to creation: {cause}"
+        );
+        let title: String = connection
+            .query_row("SELECT title FROM session", [], |row| row.get(0))
+            .expect("the session survived");
+        assert_eq!(title, "kept");
     }
 }
