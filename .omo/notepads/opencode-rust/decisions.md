@@ -5400,3 +5400,25 @@ Cost paid for this: `oc-testkit` gains `oc-db`, `oc-server`, `oc-tool` and `oc-t
 and `tests/no_http_client.rs` still passes — the load-bearing absence of an HTTP *client*
 in `[dependencies]` is untouched. `toml` moved into `[dependencies]` because todo 92's
 docs test will read the same allow-list through the same loader.
+
+## Task 87 — provenance-first cassette coverage
+
+The suite reuses `oc_testkit::cassette::{CassettePlayer, Cassette, HttpInteraction,
+RequestSnapshot}` rather than introducing a provider-specific replay engine. Each cell
+uses the production decoder (`AnthropicDecoder`, `OpenAiDecoder`, `ChunkTranslator`,
+`BedrockEventDecoder`, or `GeminiStreamDecoder`) and asserts the complete ordered event
+vector. This keeps request matching, cursor semantics, and unused-interaction checks in
+the one cassette implementation Task 6 already established.
+
+`Evidence::{Recorded, Authored, Gap}` is closed data on the matrix cell. `Authored`
+requires a reason and may exercise decoder behavior, but never upgrades itself into wire
+compatibility evidence. `Gap` is an executable omission: it names the missing protocol
+artifact and is excluded only from replay, not from matrix completeness. This is chosen
+over manufacturing all 40 cells as recordings because false provenance is worse than an
+explicitly incomplete compatibility claim.
+
+Registry coverage is derived from `ProviderRegistry::registered()`. A family map is still
+needed because multiple provider ids share one wire family, but the registry is the
+authority over which ids must map. Consequently a newly registered id fails the suite
+until its family is chosen, while a new scenario fails until every family receives a
+cell.

@@ -5028,3 +5028,29 @@ by accident. The two absences are `GET /api/event` and
 upstream paths are not. Recorded as a gap, not a divergence: an omission is not a
 decision, and laundering it into `docs/divergences.toml` is precisely what the plan's
 "must NOT normalize away a real difference" forbids.
+
+## Task 87 — provider-family cassette matrix
+
+The compatibility surface is a Cartesian product, not a handful of representative
+fixtures: five registered provider families × eight scenarios = **40 cells**. The
+test derives the required families from `ProviderRegistry::registered()` and checks
+that every `(family, scenario)` pair occurs exactly once, so registering a new provider
+without assigning it to a cassette family fails instead of silently shrinking coverage.
+
+Evidence provenance is part of every cell. The final matrix contains **5 Recorded**
+plain-text cells, **30 Authored** cells for protocol shapes absent from the committed
+recordings, and **5 explicit Gap** cells. A green authored fixture proves the Rust
+decoder handles that shape; it does not claim a provider emitted those bytes. Every
+non-gap cell is replayed through the existing `CassettePlayer` and the production family
+decoder, then compared against an exact ordered `Vec<StreamEvent>`.
+
+The five named gaps are all opaque-reasoning artifacts that the committed corpus does
+not contain: OpenAI and OpenAI-compatible signed thinking, plus OpenAI-compatible,
+Bedrock, and Gemini encrypted reasoning items. Gemini's recorded opaque tool signature
+is preserved and asserted separately; it must not be generalized into evidence for an
+encrypted reasoning item.
+
+The registry mutation proof is the important anti-vacuity test: adding a synthetic
+`new-provider` registration makes matrix validation fail with
+`registered provider `new-provider` has no cassette family`. Counting a hard-coded
+family enum would not catch that change.

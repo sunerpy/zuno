@@ -4481,3 +4481,18 @@ edit alone, which is the whole mechanism.
 - **38 migrations** — confirmed twice, before and after the real binary opened a
   Rust-created database.
 - **20 tables** (19 + `migration`) — confirmed against a database the real binary created.
+
+## Task 87 — remaining provider-cassette gaps and verification hazard
+
+Five of the 40 matrix cells are deliberately `Gap`, not authored approximations:
+OpenAI/compatible signed thinking and compatible/Bedrock/Gemini encrypted reasoning
+items. The committed oracle recordings contain no real wire evidence for those shapes.
+Closing a gap requires adding a real sanitized recording with provenance; copying a
+neighbouring provider's payload or inventing bytes would only relabel an authored test.
+
+The first validation attempt exposed the known shared-target/worktree hazard in a new
+form. Temporarily relocating the Task 87 worktree left a previously compiled test binary's
+`CARGO_MANIFEST_DIR` pointing at the old path, so a path-sensitive guard failed although
+the source was correct. Restoring the worktree to
+`/config/workspace/ProdDir/AI/oc-wt/t87` and rerunning the same gates passed. This was an
+artifact-location failure, not a product or provider-decoder defect.
