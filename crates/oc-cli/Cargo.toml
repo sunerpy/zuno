@@ -14,6 +14,7 @@ name = "opencode-rust"
 path = "src/main.rs"
 
 [dependencies]
+async-trait = { workspace = true }
 clap = { workspace = true }
 oc-agent = { workspace = true }
 oc-auth = { workspace = true }
@@ -21,6 +22,7 @@ oc-catalog = { workspace = true }
 oc-config = { workspace = true }
 oc-db = { workspace = true }
 oc-engine = { workspace = true }
+oc-error = { workspace = true }
 oc-llm = { workspace = true }
 oc-lsp = { workspace = true }
 oc-mcp = { workspace = true }
@@ -37,6 +39,7 @@ oc-server = { workspace = true }
 oc-snapshot = { workspace = true }
 oc-tool = { workspace = true }
 oc-tools = { workspace = true }
+oc-tui = { workspace = true }
 reqwest = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
@@ -48,6 +51,7 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+oc-testkit = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 tower = { workspace = true }

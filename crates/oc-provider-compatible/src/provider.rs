@@ -21,7 +21,7 @@ use futures::StreamExt;
 use oc_error::ProviderError;
 use oc_llm::registry::{
     ApiSurface, Capabilities, CompletionRequest, Declined, FactoryOutcome, Provider,
-    ProviderStream, Spec, StreamEvent, Unavailable,
+    ProviderStream, Spec, StreamEvent, ToolSchema, Unavailable,
 };
 use oc_llm::sse::{SseParser, StreamIdleTimeout};
 use serde_json::{Map, Value};
@@ -180,6 +180,7 @@ impl CompatibleProvider {
     pub fn body_for(&self, request: &CompletionRequest) -> Value {
         let quirks = self.quirks_for(&request.model_id, request.surface);
         let mut body = RequestBody::new(request.model_id.clone(), request.messages.clone());
+        body.tools = function_envelopes(&request.tools);
         body.sampling = self.sampling;
         body.extra_body = self.extra_body.clone();
         body.build(&quirks)
@@ -354,6 +355,32 @@ pub const fn compatible_default_capabilities() -> Capabilities {
         attachments: false,
         sampling_params: true,
     }
+}
+
+/// Wrap each tool in OpenAI's `function` envelope, or `None` when there are none.
+///
+/// `None` rather than an empty array: several compatible vendors reject
+/// `tools: []` outright instead of reading it as "no tools", so an empty snapshot
+/// has to leave the key off entirely.
+fn function_envelopes(tools: &[ToolSchema]) -> Option<Value> {
+    if tools.is_empty() {
+        return None;
+    }
+    Some(Value::Array(
+        tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    }
+                })
+            })
+            .collect(),
+    ))
 }
 
 /// Read a capability object, keeping the default for any absent field.

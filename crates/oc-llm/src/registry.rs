@@ -100,7 +100,7 @@ mod spec;
 pub use crate::registry::error::{Declined, FactoryOutcome, RegistryError, Unavailable};
 pub use crate::registry::provider::{
     Capabilities, CompletionRequest, CredentialPresence, FinishReason, Message, Provider,
-    ProviderStream, Role, StreamEvent,
+    ProviderStream, Role, StreamEvent, ToolSchema,
 };
 pub use crate::registry::spec::{ApiSurface, Spec};
 

@@ -10,6 +10,8 @@ mod serve;
 mod session;
 mod session_list;
 mod session_prune;
+mod tool_runtime;
+mod tui;
 
 use crate::{
     CommandDispatcher, DispatchArguments, DispatchError, DispatchRequest, PendingCommandDispatcher,
@@ -54,6 +56,10 @@ impl CommandDispatcher for HeadlessCommandDispatcher {
         }
         if let DispatchArguments::Run(args) = &request.args {
             return run::execute(args, &request.environment)
+                .map_err(|error| DispatchError::command(request.command, error));
+        }
+        if let DispatchArguments::Tui(args) = &request.args {
+            return tui::execute(args, &request.environment)
                 .map_err(|error| DispatchError::command(request.command, error));
         }
 
