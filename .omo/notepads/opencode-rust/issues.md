@@ -5164,3 +5164,90 @@ imprecision is a mechanism attribution, not a count: it credits the bundled snap
 with making the config-only case work upstream, when measurement shows the snapshot
 only supplies the seven `opencode/*` gateway models and the config-only model comes
 from the merge. That is why skipping the snapshot costs nothing here.
+
+## [2026-08-07] Task 88: BLOCKED — the frozen provider endpoint never reaches the Rust turn
+
+The post-Task-108 release measurement now gets past legacy migration and config-only
+model resolution, but Rust W-real still captures **zero provider requests** during its
+450-second window. The next join is in endpoint composition: the frozen standard config
+sets `provider.options.baseURL`, while `oc-cli/src/cmd/turn.rs::model_spec` reads
+`model.api.url`. Existing turn seams additionally inject a top-level `provider.api`, so
+they do not exercise the frozen configuration shape.
+
+This is not a memory-gate failure and must not be converted into one. The runner did not
+produce a Rust W-real sample, did not finish a five-run pass, and therefore produced no
+valid Rust median. G1/G2 remain **fail-closed and numerically unavailable**, rather than
+PASS/FAIL based on partial TypeScript observations or a zero-RSS placeholder.
+
+The defect is outside Task 88's `oc-testkit`-only ownership. Fix the production endpoint
+resolution and pin it with a real turn test that supplies only
+`provider.options.baseURL`; then rerun the unchanged `cargo test --test memory --
+--nocapture` gate. Evidence and dispatcher state are preserved under
+`.omo/evidence/task-88-opencode-rust.txt` and `target/perf/task-88-work/`.
+
+## [2026-08-07] BLOCKER #6 on todo 88, verified: `options.baseURL` is ignored, so the standard provider shape has no endpoint
+
+Todo 88 refused a **sixth** time. Same family as #5, and the same tell: **the seam tests
+supply a crutch the real config shape does not have.**
+
+### Measured, by me
+
+Our binary, a config using the standard upstream shape — endpoint in
+`provider.test.options.baseURL`, nothing else:
+```
+unrecoverable provider failure (status=None)
+```
+Add a top-level `provider.test.api` pointing at the same dead loopback port and it changes to:
+```
+transient provider failure (status=None)
+```
+i.e. with `api` it actually dials the address; with only `options.baseURL` it has no
+endpoint at all.
+
+### The mechanism, both sides
+
+**Ours** — `crates/oc-cli/src/cmd/turn.rs:654` `model_spec`:
+```rust
+if !model.api.url.is_empty() { spec = spec.with_base_url(&model.api.url); }
+```
+The only source of a base URL is `model.api.url`. The config merge keeps
+`options.baseURL` but never promotes it, so `options` reaches the provider as opaque
+options and the transport has nothing to dial.
+
+**The oracle** — `packages/opencode/src/provider/provider.ts:355-358`:
+```ts
+// Add custom endpoint if specified (endpoint takes precedence over baseURL)
+const endpoint = providerConfig?.options?.endpoint ?? providerConfig?.options?.baseURL
+if (endpoint) { providerOptions.baseURL = endpoint }
+```
+So upstream's endpoint precedence is **`options.endpoint` → `options.baseURL`**, and
+`:251` treats a missing `options.baseURL` as a reason to require a resource. Meanwhile
+`model.api` upstream is an **SDK-shape hint**, not a URL — `:230-232` reads
+`model.api.endpoint` to choose `sdk.responses` vs `sdk.chat`, and `:368` reads
+`model.api.npm`. **We conflated a shape hint with the endpoint.**
+
+### Why six waves of tests missed it
+
+`crates/oc-cli/tests/tui_turn.rs:91` and `tests/tool_turn.rs:100` both send
+`"api": format!("{base_url}/v1")` **in addition to** `options.baseURL`. The frozen perf
+workload (`perf/fixtures.rs:39`) sends only `baseURL`, which is why it is the thing that
+found this.
+
+That is the second instance of one anti-pattern in two waves. #5 was an injected env var;
+this is an injected config key. **Generalised: a fixture that supplies something the real
+input shape does not have is a fixture that hides a defect.** Both seam tests need the
+extra `api` key removed once this is fixed, exactly as todo 108 removed
+`OPENCODE_MODELS_PATH`.
+
+### What todo 88 did right
+
+It reached the root cause with a direct release-binary experiment rather than guessing, and
+**declined to add the `api` crutch to the frozen workload** — which would have made the gate
+green while leaving the product unable to talk to a standard config. It also committed a
+resumable harness (see its decisions entry) so the next run does not throw away 50 minutes
+of completed passes.
+
+### Owed: todo 109
+
+Honour `options.endpoint ?? options.baseURL` as the endpoint, keep `api` as the SDK-shape
+hint upstream treats it as, and strip the `api` crutch from both seam tests.

@@ -5921,3 +5921,22 @@ is added, the count bump must land in the same commit or the compat suite refuse
   hold the load) get the same answer from one implementation. Its doc comment states
   the ordering constraint explicitly — *consult it only after the resolved-catalog
   lookup fails* — because calling it first restores the defect and compiles cleanly.
+
+## [2026-08-07] Task 88: commit the gate harness, but do not invent a verdict around a product defect
+
+Decision: keep Task 88 within its frozen `oc-testkit` ownership and commit the reusable
+G1/G2 harness even though the first real measurement cannot complete. The harness is
+independently verified: it reconstructs five public AB/BA pairs, rejects a missing
+baseline, rejects deliberately inflated Rust values, persists completed passes, and
+invalidates them when any measured binary or database changes.
+
+Do not modify `oc-cli` endpoint composition from this task, inject a top-level
+`provider.api`, or reinterpret zero captured requests as zero memory. Each would make
+the gate green by changing either the product or the frozen workload without the
+required ownership and evidence. Preserve the failed real run as a fail-closed result:
+G1/G2 have no numerical verdict until Rust completes all five W-idle and W-real samples.
+
+Resume criterion: a separately owned fix must make the exact frozen
+`provider.options.baseURL` configuration produce a captured provider request. After
+that, rerun the unchanged release-vs-release harness; only the resulting complete
+reports may produce and publish G1/G2 medians and ratios.

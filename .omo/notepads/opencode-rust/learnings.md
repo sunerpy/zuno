@@ -5539,3 +5539,25 @@ housekeeping — and the proof is that **mutation 1 (restoring the fail-fast) no
 fails both seam tests**, which it could not have done before. A fixture that
 supplies a dependency the product is supposed to do without does not test the
 product; it tests the fixture.
+
+## [2026-08-07] Task 88: a public runner can compare two subjects without copying its frozen workload
+
+The frozen runner already exposes everything the gate needs except a two-subject
+entry point: `OC_TESTKIT_ORACLE` selects the launched binary, each public report
+contains five runs per workload, and `interleaved_pair_order(5)` defines the AB/BA
+order. Two sequential runner passes plus an immediate dispatcher therefore recover
+five TypeScript and five Rust runs while leaving the private workload, PTY windows,
+process-tree sampler and aggregation rule single-sourced in `oc_testkit::perf`.
+
+Long measurements need identity-aware resume, not merely an output-file check. The
+Task 88 work directory fingerprints the harness executable, both subject binaries
+and the immutable W-real database. A completed pass survives interruption only when
+all four identities still match; changing any measured bytes invalidates it. This
+keeps a two-hour gate recoverable without allowing stale measurements to pass.
+
+The real attempt also reinforced that a performance gate must fail closed before
+publishing partial numbers. TypeScript completed W-idle and W-real repetitions, but
+the Rust W-real launch emitted zero provider requests. Because the frozen runner
+writes a report only after all five repetitions, there is no valid Rust median and
+therefore no numerical G1/G2 verdict to report. The useful result is the blocked
+boundary and its durable evidence, not a ratio reconstructed from incomplete logs.
