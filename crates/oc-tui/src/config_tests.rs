@@ -76,13 +76,22 @@ fn an_empty_document_resolves_to_the_upstream_defaults() {
 
 #[test]
 fn keys_owned_by_sibling_todos_are_tolerated_rather_than_rejected() {
-    // `theme` and `attention` belong to other todos in the same TUI surface. A
-    // partially landed schema must not turn a valid config into a parse error.
+    // `plugin` and `plugin_enabled` belong to other todos in the same TUI surface.
+    // A partially landed schema must not turn a valid config into a parse error.
+    // `theme` and `attention` have since landed, so they are asserted rather than
+    // merely tolerated.
     let config = TuiConfig::from_json_str(
-        r#"{ "theme": "opencode", "attention": { "enabled": true }, "mouse": true }"#,
+        r#"{ "theme": "opencode", "attention": { "enabled": true },
+             "plugin": ["acme/tui"], "plugin_enabled": { "acme/tui": true },
+             "mouse": true }"#,
     )
     .expect("unknown keys are ignored, as Effect Schema does");
     assert_eq!(config.mouse, Some(true));
+    assert_eq!(config.theme(), Some("opencode"));
+    assert_eq!(
+        config.attention.and_then(|attention| attention.enabled),
+        Some(true)
+    );
 }
 
 #[test]

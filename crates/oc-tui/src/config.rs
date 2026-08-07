@@ -15,9 +15,9 @@
 //! `onExcessProperty` is `"ignore"`. This module matches that rather than
 //! `oc-config`'s top-level `deny_unknown_fields`, which is reserved for the main
 //! config's explicit `unrecognized_keys` pass. The practical consequence is that
-//! the surfaces this todo does not own — `theme`, `attention`, `plugin`,
-//! `plugin_enabled` — are silently tolerated until the todos that own them add
-//! their fields, instead of turning a partially landed schema into a parse error.
+//! the surfaces this todo does not own — `plugin`, `plugin_enabled` — are silently
+//! tolerated until the todos that own them add their fields, instead of turning a
+//! partially landed schema into a parse error.
 //!
 //! Keybind names are the one exception: an unrecognized *keybind* is reported,
 //! because upstream reports it too (`packages/tui/src/config/keybind.ts:450-451`).
@@ -340,11 +340,11 @@ impl Serialize for BindingValue {
 
 /// The TUI configuration exactly as written, before defaults are applied.
 ///
-/// Field set from `packages/tui/src/config/index.tsx:53-66`, plus `theme`, which
-/// the theme layer added here rather than redefining the type. The keys still
-/// unowned (`attention`, `plugin`, `plugin_enabled`) are absent and tolerated by
-/// the ignore-unknown policy documented on this module, so the todos that own them
-/// add one field each without touching anything here.
+/// Field set from `packages/tui/src/config/index.tsx:53-66`, plus `theme` and
+/// `attention`, which those layers added here rather than redefining the type. The
+/// keys still unowned (`plugin`, `plugin_enabled`) are absent and tolerated by the
+/// ignore-unknown policy documented on this module, so the todos that own them add
+/// one field each without touching anything here.
 ///
 /// Every field skips serializing when unset, so writing a parsed configuration
 /// back out yields only the keys the user actually spoke about instead of a wall
@@ -384,6 +384,14 @@ pub struct TuiConfig {
     /// reports a diagnostic naming it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
+    /// Notification and sound-cue settings.
+    ///
+    /// The vocabulary lives with the only code that reads it
+    /// ([`crate::attention::AttentionSettings`]), so this stays a single field the
+    /// way `theme` does. Absent means every default, and the master default is
+    /// **off** — nothing here makes noise until a user asks for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<crate::attention::AttentionSettings>,
 }
 
 impl TuiConfig {
