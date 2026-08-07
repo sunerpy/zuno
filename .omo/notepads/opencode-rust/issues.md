@@ -4611,3 +4611,122 @@ would open a screen that looks like it can converse and cannot.
    `SessionScreen` renders only `InputEditor`, so the `▏` marker draws after the
    text rather than before it. Cosmetic, and fixing it means deciding the prompt's
    two-column layout, which is view design rather than wiring.
+
+## [2026-08-07] Task 88 recheck after Task 104: narrower blocker remains
+
+The older Task 88 blocker above is partly obsolete after Task 104: `tui` is now
+registered and boots, and headless `run` now assembles and executes real tools. The
+remaining blocker is narrower but still prevents the frozen measurement:
+
+- `crates/oc-cli/src/cmd/tui.rs:18-25` explicitly states that submitting a prompt
+  does not start a turn and that only `run` executes one.
+- `crates/oc-cli/src/cmd/tui.rs:58-95` creates the engine channel, passes only its
+  receiver to `App`, retains the sender for lifetime, and never starts `run_turn` or
+  any producer that sends `TurnEvent`s.
+- `crates/oc-testkit/src/perf/workload.rs:168-189` accepts a workload only after the
+  loopback provider captured enough requests for a complete tool turn. A Rust TUI run
+  therefore times out with zero completed turns rather than yielding a measurement.
+- `crates/oc-cli/src/cmd/run.rs:124-159` proves the headless path can execute the
+  turn, but it is not the TUI process topology represented by
+  `benchmarks/ts-baseline.json` and cannot truthfully consume that baseline.
+
+Consequently G1/G2 are still **unmeasurable**, not failed. No `memory.rs` gate, absent-
+baseline guard, inflated-measurement mutation, or commit was produced: those would
+claim an executable comparison that does not exist. Owed prerequisite: expose one
+shared turn composition root to TUI and `run`, start it on prompt submission, and send
+its events through the existing engine channel; then rerun Task 88 with release builds.
+
+## [2026-08-07] Task 91: what the release pipeline cannot prove here, and one real gap it exposed
+
+### UNVERIFIABLE IN THIS ENVIRONMENT — stated so nobody mistakes it for verified
+
+Neither workflow has ever run. I cannot run GitHub Actions here. Both are
+`actionlint`-clean (v1.7.12, exit 0, no output) and their structure is asserted by
+six tests, and a real `yaml.safe_load` parse agrees with the textual parser those
+tests use — but:
+
+- **No macOS, Windows, or arm64 leg has ever executed.** Four of the six targets
+  were never even built here; no such host exists.
+- **`aarch64-unknown-linux-musl` was built and inspected, not executed.**
+  `./opencode-rust --version` → `exec format error`. In CI it goes to
+  `ubuntu-24.04-arm` and is executed there; locally it cannot be.
+- **`checksums` and `publish` never ran.** No release has ever been cut, no asset
+  has ever been uploaded, and `softprops/action-gh-release@v2` is unexercised.
+- The `smoke` job's `windows-11-arm` and `macos-15-intel` runner labels are taken
+  from current GitHub documentation, not from an observed run.
+
+What WAS executed here: both musl builds (~64s each, offline, zig only), the
+x86_64-musl artifact's full three-check smoke, `make smoke-artifact` end to end
+(release build → tar.gz → untar → smoke), `make ci`, and six mutations. Evidence
+in `.omo/evidence/task-91-opencode-rust.txt`, which labels every claim as executed
+or unexecuted.
+
+### GAP FOUND: `oc-plugin` is not in `oc-cli`'s dependency graph at all
+
+Measured: `cargo tree -p oc-cli -e normal` has **394** unique packages and
+`oc-plugin` is not among them. The 431-package workspace graph has it. So the
+plugin subsystem — three tiers of it, todos 57-62 — **is not reachable from the
+shipped binary**. There is no plugin host wired into the CLI.
+
+This is not something todo 91 should fix, but it changes what a "no wasmtime in the
+artifact" test can honestly claim: the `-p oc-cli` assertion has no meaningful
+positive half, because the crate that *would* carry the runtime is absent for an
+unrelated reason. So there are two tests — one on `oc-cli` (the artifact) and one on
+`--workspace` (the plan's literal claim, with `oc-plugin` asserted present) — and
+the source comment says why rather than papering over it.
+
+**For whoever wires the plugin host in:** the `-p oc-cli` no-wasmtime test will
+start carrying real weight at that moment, and its positive half should be added
+then.
+
+### The plan's proven-pipeline reference was proven for a weaker property
+
+`codegraph-rust/.github/workflows/release-please.yml` builds **both** darwin
+targets on `macos-latest`. `macos-latest` is Apple Silicon now, so its
+`x86_64-apple-darwin` artifact is cross-compiled and **cannot be executed on the
+runner that built it**. Fine for codegraph, whose job ends at "produce a binary";
+wrong for todo 91, whose acceptance criterion is "each passes its smoke test".
+
+Copied verbatim, that one line would have shipped an unexecutable artifact — the
+precise thing this todo forbids. Fixed by `macos-15-intel` for the x86_64 leg.
+
+**Generalisable:** when a plan says "copy the proven pipeline", check what the
+reference was proving. A pipeline proven for a weaker property is a starting point,
+not an answer.
+
+### `cargo deny check advisories --offline` needs one online `cargo fetch` first
+
+It failed with `failed to download mach2 v0.6.0 … --offline was specified`.
+cargo-deny resolves **all** targets, and `mach2` is macOS-only, so a Linux build
+never fetched it. One `cargo fetch --locked --target x86_64-apple-darwin` fixed it
+permanently. Same hazard learnings.md already records for `shared_library` under
+`portable-pty`; it applies to cargo-deny too, not just `cargo metadata`.
+
+### `cargo deny` false-alarm shapes worth knowing before you tune deny.toml
+
+1. `wildcards = "deny"` fires on **all 34 first-party crates** — a workspace path
+   dependency legitimately carries no version requirement. Needs
+   `allow-wildcard-paths = true`, not a weakened rule.
+2. A `[graph] targets = [...]` restriction makes the audit **weaker in a way its
+   output never shows**: a crate that only links on an excluded platform stops
+   being judged at all. Tempting because it looks like "audit what we ship". Left
+   unrestricted; the full graph passes.
+3. `warning[license-not-encountered]` / `warning[license-exception-not-encountered]`
+   are how you tell a real allow list from a hopeful one. Mine started with a
+   `Unicode-DFS-2016` allowance and two exceptions that matched nothing — all
+   copied from a licence census taken with a target restriction in place. Removed.
+
+### `zig` behind a mise shim breaks cargo-zigbuild
+
+`Error: Failed to find zig / Caused by: empty string, expected a semver version`.
+cargo-zigbuild probes `zig version`; the mise shim errors when no version is
+selected for the directory, and cargo-zigbuild reads the empty output as a version.
+Symlink the real binary onto PATH. Worth knowing because the message names neither
+mise nor the shim.
+
+### `make metadata` needs `--format-version 1`
+
+`cargo metadata --locked --offline` without it prints
+`warning: please specify --format-version flag explicitly to avoid compatibility
+problems` on every `make ci`. Harmless, but a warning nobody acts on trains people
+to ignore the gate's output.

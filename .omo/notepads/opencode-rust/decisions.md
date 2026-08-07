@@ -5505,3 +5505,148 @@ instead of dropping) belongs with the channel it feeds.
 A non-terminal `tui` invocation is refused, not degraded. Entering raw mode and
 the alternate screen on a pipe writes escape sequences into whatever is reading it
 and leaves no way to type the exit key.
+
+## [2026-08-07] Task 88 recheck after Task 104: topology and build decision
+
+The committed TypeScript G1/G2 artifact measures the released **TUI** under a real
+PTY. Therefore the only admissible Rust comparison is the released Rust **TUI**
+executing the same cassette-backed turn, with the same W-idle/W-real database shape,
+sampling window, process-tree accounting, and five-run AB/BA schedule. Comparing
+`opencode-rust run` against that artifact is rejected: it omits the terminal renderer,
+input task, and TUI channels, so a lower number would mix an implementation saving
+with a topology change.
+
+When the TUI turn path exists, both sides must be release artifacts. A debug Rust
+binary includes different optimization, allocator, and debug-assertion behaviour and
+cannot support a production memory claim against the installed TypeScript release.
+This decision is recorded now, but no Rust measurement was taken.
+
+Task 104 closed two earlier gaps: `run` now assembles real tools, and `tui` is a
+registered command that boots `App::run`. It deliberately did not connect the TUI to
+the turn composition root. `cmd/tui.rs` creates and retains an engine sender but never
+sends through it; its module contract explicitly says prompt submission only updates
+the transcript and that `run` is the sole turn-executing surface. The frozen perf
+driver decides completion from captured provider requests, so the Rust TUI can never
+satisfy even one turn today.
+
+Decision: Task 88 remains blocked rather than adding a gate that compares unlike
+surfaces or a guard that can only fail forever. Resume after the turn composition root
+is callable from the TUI thread and emits into the TUI's existing engine channel.
+
+## [2026-08-07] Task 91: what ships, when it runs, and how "executed" is enforced
+
+### `opencode-rust` ships. `oc-server` does NOT.
+
+The workspace produces **six** cargo binary targets, not two: `opencode-rust`
+(oc-cli), `oc-server`, `oc-example-plugin` (oc-plugin), `oc-acp-conformance`
+(oc-acp), `oc-log-probe` (oc-observability), `ts-baseline` (oc-testkit). Only the
+first is a release artifact.
+
+`oc-server` is excluded on purpose. `oc-cli/src/command.rs:552-554` documents that
+`opencode-rust serve` "wraps the `oc-server` library rather than its standalone
+binary", and `decisions.md` (task 45) records the `oc-server` binary as "Task 51's
+executable QA surface". Two binaries where one is a QA harness invites users to run
+the wrong one. If `oc-server` ever becomes a deployable, that is a deliberate
+decision with its own smoke leg, not a side effect of `--bins`.
+
+Every build step names `--bin opencode-rust` explicitly rather than relying on
+package defaults, so adding a `src/bin/*.rs` to `oc-cli` cannot silently change
+what gets packaged.
+
+### Release runs on a `v*` tag or on manual dispatch — never on every push
+
+Six builds plus six smoke legs is far too slow for a per-commit gate. But a
+pipeline whose first ever run is the real release is untested, so the gap is closed
+twice:
+
+- `workflow_dispatch` runs the **complete six-target matrix with `publish`
+  skipped** (`version.outputs.publish` is false unless a tag was pushed or the
+  dispatcher ticked the box). The pipeline is exercisable end to end before any tag
+  exists.
+- `ci.yml`'s `artifact` job runs the same **package → unpack → smoke** path on the
+  host leg for every push and pull request, via `make smoke-artifact`. A break in
+  the smoke driver or the cassette surfaces on the PR that caused it.
+
+**No release-please.** This project has no release process and inventing one is
+todo 92's territory. Instead a `version` job resolves one version string from
+`cargo metadata` and **fails if a `v*` tag disagrees with oc-cli's manifest
+version** — an artifact filename that lies outlives the mistake.
+
+### "Must not ship an artifact that was never executed" is enforced structurally
+
+`build` (6) → `smoke` (6, each on a runner matching the artifact's architecture) →
+`checksums` → `publish`, and `publish` lists `[version, build, smoke, checksums]`
+in `needs`. GitHub's default `needs` semantics require every listed job to have
+succeeded, so one failed or skipped smoke leg blocks publication of **all six**.
+There is no path from a compiled binary to a release asset that skips a process
+that ran it.
+
+Two tests hold the shape from outside the workflow, because the failure is
+otherwise invisible: `every_built_target_is_also_smoke_tested` (a target in `build`
+and missing from `smoke` would ship unexecuted with CI green) and
+`publication_depends_on_the_smoke_job`.
+
+### Why `build` and `smoke` are separate jobs
+
+Only because of one leg. `aarch64-unknown-linux-musl` is cross-linked on x86_64 and
+**cannot execute there**; it has to be handed to `ubuntu-24.04-arm`. That
+runner-crossing handoff is the entire reason for the split. The other five legs
+could have smoked in place, and keeping them in the same shape costs one artifact
+download and buys a uniform, assertable topology.
+
+Runner choice per leg, and why `macos-15-intel` rather than codegraph's
+`macos-latest`: `macos-latest` is Apple Silicon now, so an `x86_64-apple-darwin`
+build there is cross-compiled and unexecutable — the exact failure this todo
+forbids. codegraph's matrix was proven for "produce a binary", not for "run it".
+
+### The smoke cassette is committed, not read from the oracle tree
+
+`packaging/smoke/cassettes/openai-chat/drives-a-tool-loop-end-to-end.json`, sha256
+`fab3c2b9991544004e02a101c4bbe5843f887d2084d96353a684fba4f0e5acd4`, byte-identical
+to upstream's recording. `oc_testkit::cassette::recordings_root()` finds cassettes
+by walking up for a sibling `opencode` checkout — correct on a developer machine,
+impossible on a CI runner that has this repository and nothing else.
+
+The copy cannot rot silently:
+`committed_smoke_cassette_matches_the_oracle_recording` compares the two byte for
+byte whenever an oracle tree is reachable and prints a **named skip** otherwise.
+`PROVENANCE.md` records the source path, the recording date, and the hash.
+
+Chosen deliberately because its recorded call names `get_weather`, a tool this
+runtime does not have — so the smoke proves the assembled registry reached the wire
+and that an unknown call still produces a tool result the loop sends back, with
+`authored_scenarios()` empty. Zero authored bytes, asserted.
+
+### `oc-smoke` is a binary, not a `#[test]`
+
+`crates/oc-testkit/src/bin/oc-smoke.rs`. It takes `--binary <path>`, because the
+subject of a release gate is the binary **inside the archive**, after packaging and
+transport, on the platform it targets. `tool_turn.rs` resolves
+`env!("CARGO_BIN_EXE_opencode-rust")` at compile time, which is precisely the wrong
+subject. Same three checks, same loopback `MockProvider`, same env recipe, same
+`tokio::process` requirement (a synchronous wait stops driving the mock's server
+and the run hangs instead of failing — todo 104's three-round debugging lesson).
+
+It canonicalises `--binary` before use: every subprocess runs with `current_dir`
+set to a scratch project, so a relative path resolves against that scratch
+directory and reports a bare "No such file or directory".
+
+### `cargo-deny`: offline locally, online in CI
+
+`make deny` passes `--offline` so `make ci` needs no network, and prints a **named
+skip** when cargo-deny is absent (it is a supply-chain gate, not a build
+requirement). The CI `supply-chain` job runs it **online and unskippable**, because
+the whole value of the advisories check is being current. `ignore = []` — nothing
+acknowledged, nothing suppressed, and a future entry must carry its RUSTSEC id and
+a reachability argument.
+
+### The unsafe gate needed the half nobody had written
+
+`[workspace.lints.rust] unsafe_code = "forbid"` existed from todo 1. It applies
+**only to crates that write `[lints] workspace = true`**, so the enforceable
+property is not "no unsafe in the source" but "no unsafe in the source AND every
+crate inherits the lint". Both are now tests, with floors (>= 300 source files,
+>= 34 manifests). The inheritance test is the load-bearing one: a crate omitting
+the key would accept unsafe code silently and no amount of scanning the other 33
+would see it. Measured today: 34/34 inherit, 0 keyword-position uses (22 textual
+mentions, all in doc comments).

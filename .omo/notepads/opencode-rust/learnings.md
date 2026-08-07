@@ -5136,3 +5136,103 @@ component tree and **the host is what routes it into the editor**
 (`InputEditor::insert_char`'s doc says so). Without that the prompt renders and
 cannot be typed into — invisible to every view test, because each drives the
 editor through `handle_action` directly.
+
+## [2026-08-07] Task 91: the cross-platform release pipeline, and what running it taught me
+
+### The two musl legs are not a claim — I built them, offline, with zig only
+
+Both `cargo zigbuild --release --target {x86_64,aarch64}-unknown-linux-musl
+--offline` completed **in ~64s each** on this host and produced statically linked,
+stripped ELF binaries (26.7 MB x86_64, 23.7 MB aarch64). `ldd` on the x86_64 one:
+`not a dynamic executable`.
+
+The decisive part is the aarch64 leg. This host has **no aarch64 C compiler of any
+kind** — no `aarch64-linux-gnu-gcc`, no `aarch64-linux-musl-gcc`, no qemu — yet a
+static aarch64 binary linked, including the bundled SQLite C amalgamation and
+`aws-lc-sys`'s C. Only Zig can have done that. Docker was present and running and
+was never invoked. So the corrected constraint ("no *per-target* C
+cross-toolchain") is not merely satisfiable, it is **measured**.
+
+Gotcha for anyone reproducing it: `zig` behind a mise shim fails with
+`Error: Failed to find zig / empty string, expected a semver version`, because
+cargo-zigbuild probes `zig version` and the shim errors when no version is
+selected. Symlink the real binary onto PATH:
+`ln -s ~/.local/share/mise/installs/zig/0.13.0/zig /tmp/bin/zig`.
+
+### The x86_64 musl artifact was fully smoke-tested here; the aarch64 one cannot be
+
+`./target/release/oc-smoke --binary target/x86_64-unknown-linux-musl/release/opencode-rust`
+→ PASS on all three checks. A static musl binary runs on a glibc host of the same
+architecture, which is why the release workflow smokes that leg in place.
+
+`./target/aarch64-unknown-linux-musl/release/opencode-rust --version`
+→ `exec format error`. That is the honest limit, and the answer is **an arm64
+runner, not an emulator**: the workflow hands that one archive to
+`ubuntu-24.04-arm`. Exactly one of the six artifacts is cross-compiled at all.
+
+### `macos-latest` is Apple Silicon now — copying codegraph's matrix verbatim
+### would have shipped an unexecutable artifact
+
+codegraph-rust's proven matrix puts **both** darwin targets on `macos-latest`.
+That was fine when its goal was "produce a binary"; it is wrong when the goal is
+"execute the binary you produced", because an `x86_64-apple-darwin` build on an
+arm64 runner is cross-compiled and cannot run there. This pipeline uses
+`macos-15-intel` for the x86_64 leg. **The proven pipeline was proven for a
+weaker property than the one this todo demands.**
+
+### `openssl-probe` is the trap, and the plan's issues.md warning was right
+
+`cargo tree -p oc-cli` has 394 unique lines. `grep -i openssl` returns exactly
+one: `openssl-probe v0.2.1`, which locates the host certificate store, links
+nothing, and arrives via `rustls-native-certs <- rustls-platform-verifier <-
+reqwest`. Match `"<name> "` with the trailing space, on the four crates that
+actually link it (`openssl`, `openssl-sys`, `openssl-src`, `native-tls`). Count
+with the correct matcher: **0**.
+
+Corollary that took a moment to get right: **family-prefix matching is correct for
+wasmtime and wrong for OpenSSL.** Wasmtime resolves to 32 packages
+(`wasmtime-internal-*`, `cranelift-*`, `wasmparser`, `wasm-encoder`) so naming
+each would go stale; OpenSSL has a legitimate sibling one character away. Two
+matchers, and a self-test for each asymmetry, or someone will "unify" them.
+
+### Flipping reqwest to native-tls cannot even compile here — which IS the argument
+
+The mutation added `openssl v0.10.81` + `openssl-sys v0.9.117` to the lock and
+then failed to build: *"The system library `openssl` required by crate
+`openssl-sys` was not found … PKG_CONFIG_PATH is not set."* A static musl release
+artifact can never have that system library. So "rustls only" is not a taste
+preference, it is what makes a single-file static binary possible.
+
+Because the assertion shells out to `cargo tree` rather than building, the
+**pre-mutation test binary** reads the mutated manifest and reports correctly.
+That is a genuinely useful property: `target/debug/deps/<test>-<hash>` can be run
+directly against a mutated tree that no longer compiles.
+
+### `cargo-deny` with no config rejects everything — 392 errors
+
+Stock cargo-deny allows no licence at all: `cargo deny check licenses` on this
+workspace produced **392** `error[rejected]`. The allow list in `deny.toml` was
+built from a `cargo metadata` licence census (37 distinct expressions across 372
+packages) and then **narrowed until cargo-deny reported no unmatched allowance or
+exception** — `warning[license-not-encountered]` and
+`warning[license-exception-not-encountered]` are how you tell a real allow list
+from a hopeful one. Dual-licensed crates resolve on their best option, so
+`MIT OR MPL-2.0` (termina) and `CC0-1.0 OR MIT-0 OR Apache-2.0` (dunce) need no
+exception; only three crates do, each with a single non-standard licence:
+`notify` (CC0-1.0), `webpki-root-certs` (CDLA-Permissive-2.0 — the Mozilla CA
+bundle, a *data* licence), `option-ext` (MPL-2.0).
+
+Two other findings: `wildcards = "deny"` fires on all 34 first-party path
+dependencies until you add `allow-wildcard-paths = true`; and a `[graph] targets`
+restriction makes the audit **weaker** in a way its output never shows — a crate
+that only links outside the list stops being judged. Left unrestricted; it passes.
+
+### A positive control is what makes a "no X" assertion mean anything
+
+`the_graph_query_does_detect_the_runtime_when_the_feature_is_on` runs
+`cargo tree -p oc-plugin --features wasm` and requires **>= 10** wasm-family
+packages (32 today). Without it, both no-wasmtime tests could be green because
+the query broke — wrong `-p`, changed `cargo tree` output shape, a matcher that
+matches nothing. Same shape as the lesson already in issues.md: *a check that can
+only detect one shape of failure is not a check.* Every "X is absent" assertion in
+this file carries a paired "the thing that would contain X is present".
