@@ -4948,3 +4948,83 @@ options as before.
 - Ephemeral loopback ports require explicit process discovery. A lifetime-scoped URL record is only a candidate: the CLI must connect, validate `/api/session/active`, and aggregate every successful response before it can claim `Liveness::Reachable`.
 - Stale discovery files are safe when connection success is the evidence boundary. A reachable response with an empty map means “this process reports no active sessions”; zero successful responses means `Unreachable` and activates the one-hour recency guard.
 - Previewing artifact reclamation requires evaluating survivors as if selected sessions were gone. Filtering only after actual deletion makes a dry run under-report reclaimable snapshot/tool-output artifacts.
+
+## [2026-08-07] Task 86: what the compatibility suite genuinely compares, and what it does not
+
+`cargo test --test compat_suite` is now the single gate. 8 tests, all green with the
+real 1.18.12 binary present, and it writes `target/compat/compat-report.json`
+(`OC_COMPAT_REPORT` overrides). The report is the deliverable: a green suite answers
+"did anything I checked disagree", not "what did you check".
+
+### The suite AGGREGATES; it does not re-run
+
+It does not spawn nested `cargo test`. Doubling workspace runtime to re-derive results
+the caller already has would also make its failure mode "some other target failed",
+which is the diagnostic that made assembling this necessary. Instead:
+
+- It **re-asserts the two load-bearing DB contracts itself**, because the plan's QA
+  scenario requires renaming an index to fail *this* command. Re-expressed with
+  name-keyed `BTreeMap`s rather than `oc-db`'s flat-vector `assert_eq!`, so the failure
+  reads `index session_project_idx exists in the database the real binary created but
+  NOT in the Rust database` instead of dumping two whole schemas.
+- Everything else is a **surface registry row** naming `crates/…/tests/x.rs::test_name`.
+  `every_registered_evidence_test_still_exists` reads each file and greps for
+  `fn <name>(`, with a floor of 15 resolved so it cannot pass vacuously. A renamed or
+  deleted differential fails here rather than silently shrinking the claim. This caught
+  five of my own guessed names on the first run (agents, skills, models, paths,
+  compat_v1) — the registry earned its keep before it was even committed.
+
+### 19 surfaces compared, 3 deliberately not
+
+Compared (`compared`, 15): db-schema, db-migration-journal, config-merge,
+config-permission, agents, skills, commands, tool-registry, cli-commands,
+cli-disposition, paths, search, session-rows, message-export, models-catalog.
+
+Compared with a stated exception (`partially_compared`, 4):
+- **api-operations** — 56 of 58 upstream operations served; 2 absent (below); 2 added.
+- **lsp-diagnostics** — TypeScript only. Task 48's evidence records the oracle returning
+  an **empty** diagnostics array for a Rust fixture, so asserting exact equality there
+  would assert an oracle defect. Not claimed.
+- **v1-compat-surface** — the measured plugin callsites, not the full 67-route v1 surface.
+- **execute-parameter-contract** — a divergence, and the only one *verified*: the live
+  schemars schema is compared against what the TOML declares.
+
+NOT compared, each saying so in the report in words a skimmer cannot miss:
+- **provider-wire-protocol** — `oc-testkit` has no HTTP client *by construction*
+  (`Cargo.toml`'s load-bearing absence), and todo 87 owns cassette-replayed parity.
+  Provider coverage is a *declared divergence*, not a measured equality. This is the
+  single largest thing the suite does not prove.
+- **tui-rendering** — never will be; Q1 chose an equivalent ratatui interface.
+- **acp-transport** — todo 78 validates against the real SDK on disk, which is a
+  live-counterpart check, not an oracle differential.
+
+### The full normalization list — three entries, and why three is the right number
+
+Every mask is a licence to differ and enough of them make any two programs agree, so
+the list is short on purpose and each entry carries its reason in the artifact:
+
+1. **db-schema**: SQL whitespace runs, backtick/double-quote identifier quoting, trailing
+   semicolons, identifier and type letter case. SQLite re-emits the `CREATE` it was
+   given; quoting and spacing are not part of the schema's meaning. Structure — object
+   names, column order, notnull, defaults, foreign-key actions — is compared exactly.
+2. **db-schema + db-migration-journal**: the temporary directory each side's database
+   lives under. The harness chose both; a path it invented cannot be a compatibility
+   fact, and nothing inside the database records it.
+3. **api-operations**: OpenAPI schema bodies, descriptions and component ordering. The
+   comparison is over the path+method SET. Response shapes are compared per group by
+   `oc-server/tests/api.rs`; claiming a document-level byte match here would overstate it.
+
+Everything else in the suite is byte-exact or set-exact. `oc-config`'s 14-tree
+differential runs `Normalizer::none()`; `oc-cli`'s long-option check is exact equality
+against `oracle ∪ ADDED_LONG_FLAGS`, not a superset.
+
+### The API gap is exact, not tolerant
+
+`missing == API_KNOWN_GAPS` and `extra == {the two C8 prune operations}` are both
+*equalities*. A third absence, or a third addition, fails — the exemption cannot widen
+by accident. The two absences are `GET /api/event` and
+`GET /api/session/{sessionID}/event`; an equivalent stream exists at the compat path
+`/event` (`oc-server/src/events/route.rs:20`), so the capability is present and only the
+upstream paths are not. Recorded as a gap, not a divergence: an omission is not a
+decision, and laundering it into `docs/divergences.toml` is precisely what the plan's
+"must NOT normalize away a real difference" forbids.

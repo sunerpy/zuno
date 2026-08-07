@@ -4412,3 +4412,72 @@ merge gate blind to compile-time test failures. Same bug, three altitudes.
   released installation can see an empty session list because the builds select
   different channel databases. Document the channel choice, the disable/override
   escape hatches, and the warning before presenting session-list parity as broken.
+
+## [2026-08-07] Task 86: the channel-DB question, and the plan's "seven" is incomplete
+
+### The channel-DB path is NOT an eighth divergence — it is faithful behaviour
+
+Task 85 handed this to me and WORKTREE.md:662 made it my call. Verdict: **not a
+divergence**.
+
+`oc_paths::db_path()` reproduces `packages/core/src/database/database.ts:45-55` rule for
+rule: `opencode.db` on `latest`/`beta`/`prod` or when `OPENCODE_DISABLE_CHANNEL_DB` is
+set, otherwise `opencode-<channel>.db`, with `OPENCODE_DB` overriding everything and an
+absolute value used verbatim. A source build of *either* implementation resolves
+`opencode-local.db`; the TypeScript source tree does the same thing. The only Rust-side
+choice is the *mechanism* — `option_env!("OPENCODE_CHANNEL")` standing in for a bundler
+define — which is a faithful analogue, not a behaviour change.
+
+So it does not belong in `docs/divergences.toml`. Putting it there would assert a
+decision where there is only a build-configuration hazard, and would inflate the count
+the plan asserts for no gain.
+
+It IS recorded, as a **known gap** in the compat report
+(`id: channel-dependent-database-filename`), because it presents as a parity bug: a
+`cargo build` sees 0 sessions where the installed release sees 5,656, and the first
+person to try side-by-side operation will call that a compatibility failure. Todo 92
+owns documenting the channel choice, the escape hatches, and the warning.
+
+### The plan's "seven" is a correct count of the seven it enumerates — and NOT the
+### complete set of deliberate differences this port has taken
+
+This is the finding that matters. `docs/divergences.toml` has exactly the seven the plan
+names, and the suite asserts 7. But at least **six more** deliberate differences are
+already declared in code, and two of them were explicitly nominated for *this* allow-list
+by the task that made them:
+
+| proposed id | declared at |
+|---|---|
+| `subpath-is-implemented` | decisions.md:1969-2008 — verbatim "DIVERGENCE CANDIDATE #1 … for Todo 86's allow-list" |
+| `subpath-matches-literally` | decisions.md:1990-1999 — "a second, smaller divergence … should go on the allow-list with the first" |
+| `context-md-excluded` | decisions.md:925-939 |
+| `malformed-auth-json-is-an-error` | decisions.md:1524-1537 |
+| `failed-format-restores-pre-format-bytes` | decisions.md:4075-4090 |
+| `memory-subsystem` | plan:1017-1020, learnings.md:1188 |
+
+I did **not** add them. Adding any one breaks the count assertion, and that assertion
+exists precisely to force this conversation rather than let the file drift. They are
+reported instead, in the artifact's `nominated_divergences` array, each citing where it
+is already declared, and a test asserts none of their ids collides with a declared one
+and each carries a source. So the omission is *data the gate emits*, not something a
+reader has to notice.
+
+**What needs deciding (not by me):** whether the plan's count becomes 13 (seven plus
+these six), or whether the seven are meant to be "the divergences that cross a
+compatibility surface a user can observe" with the rest staying as in-code records. Note
+todo 103 already requires an eighth entry (memory) and an updated count, so the number
+is scheduled to move regardless. Whoever revises it must bump
+`oc_testkit::divergence::DECLARED_COUNT` in the same commit — the suite refuses either
+edit alone, which is the whole mechanism.
+
+### Plan counts checked this task
+
+- **"seven" divergences** — correct as a count of the plan's enumeration; incomplete as a
+  census (above). Not a wrong number so much as an under-specified one.
+- **58 `/api` operations** in the committed oracle capture — confirmed by re-measuring
+  `.omo/fixtures/oracle-openapi-1.18.12.json`. The plan's prose still says 61 in places;
+  the fixture says 58, and 56 of those are served. Sixth confirmation that the source
+  wins.
+- **38 migrations** — confirmed twice, before and after the real binary opened a
+  Rust-created database.
+- **20 tables** (19 + `migration`) — confirmed against a database the real binary created.

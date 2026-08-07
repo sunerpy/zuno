@@ -5325,3 +5325,78 @@ SQL fall through to the query runner.
 - `/api/session/active` exposes only `ServerServices::runs`, preserving its process-local meaning. It returns the oracle-compatible `{data:{sessionID:{type:"running"}}}` shape with deterministic key order.
 - Each bound loopback server owns a unique URL record under `$XDG_STATE_HOME/opencode/servers` and removes it on drop. Discovery accepts only credential-free `http` URLs with literal loopback IPs and explicit ports; CLI probes concurrently with proxy bypass and optional server Basic auth, then unions IDs from every valid responder.
 - Failure to publish a loopback discovery record fails server binding rather than silently weakening pruning safety. Non-loopback authenticated listeners are not published because a standalone local-maintenance probe must never discover or contact a network endpoint implicitly.
+
+## [2026-08-07] Task 86: the report's shape, and how the suite reaches other crates' work
+
+### `docs/divergences.toml` is loaded through `oc-testkit`, not parsed in the test
+
+`oc_testkit::divergence::DivergenceList::load()` finds the workspace root, reads
+`docs/divergences.toml`, and rejects three shapes before any caller sees it: an empty
+`id`/`surface`/`reason`, a duplicate id, and an unknown key (`deny_unknown_fields`, so a
+typo'd field is an error rather than silently dropped data). `DECLARED_COUNT = 7` lives
+beside the loader rather than only inside the test, because two consumers need it: this
+suite, and todo 92's documentation test. A single `const` both read is the smallest thing
+that cannot drift.
+
+The count assertion is in the *test*, not the loader, so the message that names the
+mismatch sits next to the number it is asserting. `load()` deliberately does not check
+the count — a loader that refuses to parse a file with eight entries could not be used to
+*report* that there are eight.
+
+The `execute` entry carries a `[divergence.contract]` sub-table of sorted property-name
+lists. That is what makes it verified rather than declared: the suite derives the live
+schema through `oc_tool::schema::params_schema::<oc_tools::ExecuteParams>()` and compares
+property and required sets, plus a subset check on `Subcall`'s control properties (a
+subset, because tool-specific arguments are `#[serde(flatten)]`ed in beside them). It also
+asserts `code` is *absent* — if `execute` ever grew a `code` parameter the divergence
+would no longer exist and the entry must go.
+
+### The report is JSON at `target/compat/compat-report.json`
+
+Chosen over TOML or Markdown: the consumers are F1-F4 and a human asking "what was
+proven", and JSON is the only one of the three that a script and a reader both handle
+without a parser choice. Pretty-printed and newline-terminated so two runs diff cleanly.
+`OC_COMPAT_REPORT` overrides the path; the default is under `target/` so it is not
+committed — the artifact is evidence of a run, not source, and a committed copy would
+immediately be stale.
+
+Four verdicts, because three distinctions matter and "pass/fail" collapses all of them:
+`compared`, `partially_compared` (compared, with a named exception),
+`not_compared` (with a mandatory `NOT COMPARED` in the detail text), and `skipped` (the
+comparison exists but the environment lacked the oracle). A surface marked
+`not_compared` must name `OracleKind::None` and must not claim an evidence test —
+asserted, so the two cannot disagree.
+
+Three separate lists sit beside the surfaces, and keeping them separate is the point:
+- `normalizations` — each mask with the reason it hides nothing real.
+- `known_gaps` — this port is behind upstream, with no decision behind it.
+- `nominated_divergences` — a real decision that the plan's asserted count excludes.
+
+An unimplemented surface in the divergence file would convert an omission into a design
+choice by fiat. That is the laundering the plan's "must NOT normalize away a real
+difference" forbids, so gaps get their own list and read as what they are.
+
+### How the suite reaches ninety-five tasks' work without re-running or duplicating it
+
+Two mechanisms, and no third:
+
+1. **Re-assertion, for exactly two contracts.** The DB schema and the journal round-trip
+   are re-expressed in this target because the plan's QA scenario requires
+   `cargo test --test compat_suite` itself to fail when an index is renamed. Delegating
+   would have made the gate report "oc-db failed". The re-expression is not a copy: it
+   compares name-keyed maps so the failure names the object, where `oc-db`'s version
+   compares flat vectors and dumps both schemas.
+2. **A registry of `path::test_name` claims, verified to resolve.** Every other surface is
+   a row naming the test that does the work.
+   `every_registered_evidence_test_still_exists` opens each file and requires
+   `fn <name>(` to be present, with a floor of 15 so a wrong root cannot pass vacuously.
+   This is deliberately a *weaker* check than running the test — it proves the claim
+   points at something real, not that it currently passes, which is
+   `cargo test --workspace`'s job. Stating that limit is better than implying a strength
+   the mechanism does not have.
+
+Cost paid for this: `oc-testkit` gains `oc-db`, `oc-server`, `oc-tool` and `oc-tools` as
+**dev**-dependencies. They are dev-only so nothing in the harness's runtime graph changes,
+and `tests/no_http_client.rs` still passes — the load-bearing absence of an HTTP *client*
+in `[dependencies]` is untouched. `toml` moved into `[dependencies]` because todo 92's
+docs test will read the same allow-list through the same loader.
