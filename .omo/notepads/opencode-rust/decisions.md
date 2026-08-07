@@ -5223,3 +5223,97 @@ and URLs are common here and neither breaks on spaces).
 - Rust-authored `tool_<sanitized-session>_<uuidv7>` files use `oc_tool::store::session_of`; attributed files are reclaimed only for requested ids no longer present in the database. `None` is never guessed and uses only the configurable mtime backstop, defaulting to upstream’s seven days.
 - Legacy `storage/{session,message,part,session_diff}` cleanup is disabled by default and requires an explicit request opt-in. Session/message/diff paths are directly attributable; part directories are reached only through message ids enumerated under a deleted session.
 - Preview and delete share one candidate-discovery path and report stable path-ordered logical content bytes. Scans and recursive byte accounting use `symlink_metadata`; managed roots and legacy category roots that are symlinks are retained without traversal.
+
+## [2026-08-07] Task 84: vacuum is a command, not a flag, and the borrow checker enforces it
+
+### `vacuum` takes `&mut Connection` so it cannot be folded into a prune
+
+`VACUUM` rewrites the whole file, cannot run inside a transaction, and needs free space
+of roughly the database's own size. Todo 82's delete is one
+`TransactionBehavior::Immediate` transaction by design. A live `rusqlite::Transaction`
+holds the connection's mutable borrow for its lifetime, so `vacuum(&mut connection, …)`
+**does not compile** while that transaction is open. The prohibition is a type error
+rather than a comment. `tests/vacuum.rs` also proves the underlying constraint is real
+in the linked SQLite (`execute_batch("VACUUM")` inside a transaction errors, and the
+message names the transaction), so the signature is guarding a genuine failure rather
+than a remembered one.
+
+A second, independent guard: `vacuum_is_never_reachable_as_a_side_effect_of_another_module`
+walks all 13 `oc-db` source files, skips `//` lines (three doc comments in `fts.rs` and
+`open.rs` legitimately discuss `VACUUM`), and fails on any executable line outside
+`vacuum.rs` that contains `VACUUM` or `vacuum::vacuum`, or any line anywhere that
+mentions `auto_vacuum`/`incremental_vacuum` — because those would make reclamation
+implicit at the SQLite level, defeating the whole design. Both guards have floor
+assertions (≥12 files, ≥2000 executable lines) so the scan cannot pass vacuously the way
+todo 2's did under a stale `CARGO_MANIFEST_DIR`.
+
+### The refusal threshold is `available < main_bytes`, and Unknown proceeds
+
+`VACUUM` materializes a second copy of the file before replacing the original, so the
+main file's current size is the requirement. Refuse iff strictly less is available;
+**equality passes**, with its own test, because an off-by-one there refuses every vacuum
+on a disk that is exactly large enough.
+
+It is a necessary, not sufficient, condition — SQLite may place its intermediate copy
+under `SQLITE_TMPDIR` on another filesystem, which this check cannot see. And when free
+space cannot be established at all (`Availability::Unknown`, i.e. every non-unix host),
+the rewrite **proceeds** and the report records why the guard was not evaluated.
+Refusing instead would make the command unusable on those platforms to prevent a failure
+SQLite already handles safely: an out-of-space `VACUUM` aborts and rolls back with the
+original database intact. Refusing is for the case where we *know*, and the value of
+knowing is the actionable message.
+
+The message names, exactly once each: the path, the required bytes (human + exact), the
+available bytes (human + exact), the shortfall (human + exact), and `OPENCODE_DB` as the
+lever a user can actually pull. Byte formatting is integer arithmetic throughout — a
+formatter that goes through `f64` starts disagreeing with the exact count printed beside
+it.
+
+### `DiskSpace` is injected, following the two seams already in this crate
+
+Same shape as todo 81's `LivenessProbe` and todo 82's `RemoteUnshare`: the database
+cannot answer a question about the host, and a test must not have to fill a disk. The
+fake counts its own calls, so a test can assert the guard was *consulted* rather than
+merely that it did not fire.
+
+### `integrity-check` runs `foreign_key_check` too, and that is the load-bearing half
+
+`PRAGMA integrity_check` answers `ok` for a structurally perfect file whose references do
+not resolve — which is precisely the damage a connection that inherited
+`foreign_keys = OFF` leaves behind, the hazard this crate's module docs are built around.
+So `foreign_key_check` runs alongside it, and `IntegrityReport::is_ok()` requires both.
+That makes this the check that actually proves todo 82's explicit ten-table delete order
+and its global `part` orphan sweep worked. One test constructs the readable-but-orphaned
+case and asserts `integrity == ["ok"]` while `is_ok() == false`.
+
+At the CLI, damage is an `Err` and therefore a non-zero exit, not a report printed with
+status 0 — a script's exit status has to mean what it looks like it means.
+
+### `vacuum` reports the FTS rebuild obligation instead of discharging it
+
+`fts.rs:240-244` says a rewrite may renumber the implicit `message.rowid` values the
+external-content indexes use as document ids. `VacuumReport::fts_rebuild_required` is
+therefore a detected fact, not an action: rebuilding inside `vacuum` would be exactly the
+hidden side effect this module exists to refuse, and the indexes are opt-in and absent
+from `migration::apply`, so an unconditional rebuild would fail on the ordinary database.
+The **CLI** discharges it, because that is a caller. One test proves the obligation is
+dischargeable: rebuild after the rewrite and the surviving messages are findable again.
+
+### `db stats` shares one definition of "bytes" with the prune preview
+
+`part` bytes are the sum of non-null column lengths, spelled the same way
+`prune::preview` spells them, and a test asserts the two agree on a real database for the
+heaviest session. Two definitions would make the number `db stats` shows disagree with
+the number a prune previews for the same rows, and the operator would reasonably read
+that as a bug in one of them.
+
+### Positional keywords, not clap subcommands
+
+`db path` was already dispatched on the positional's value. A clap subcommand alongside a
+positional needs `args_conflicts_with_subcommands` and turns one unambiguous string match
+into parser configuration nobody can read — and adding any flag would break
+`differential.rs`'s exact long-option comparison against the real binary. Keywords add no
+flag. `Maintenance::parse` matches exactly: `Stats`, `IntegrityCheck` (both
+`integrity-check` and `integrity_check`, since the pragma has the underscore spelling),
+`Vacuum`, and a test pins that `path`, `VACUUM`, `Stats`, `" stats"`, `"stats;"` and any
+SQL fall through to the query runner.

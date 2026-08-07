@@ -4277,3 +4277,59 @@ as workspace dependencies and **no new third-party crate**.
 - The deleted-session id list is caller evidence, not authority: a requested id that still exists in `session` is filtered out before any attributed artifact deletion.
 - Legacy `part/<message>/` is not session-keyed. It is swept only when the corresponding message id was first observed in `message/<deleted-session>/`; arbitrary part directories are never guessed from names.
 - Integrated `lsp_diagnostics` rejects sibling-worktree paths. As in task 82, diagnostics use a temporary byte-for-byte copy inside the main request cwd; it is deleted after the check.
+
+## [2026-08-07] Task 84: two counts to keep straight, and one CLI branch not reachable end-to-end
+
+### The table count, for the third time
+
+The plan says 12 related tables; todo 82 corrected that to 10 and pinned it. Neither is
+the number of tables in the database, which is **20**: `schema::TABLE_COUNT = 19` from
+`schema::up`, plus `migration` from `migration::apply`. All three numbers are correct for
+different questions and none substitutes for another. `db stats` reads its inventory from
+`sqlite_master` at runtime for exactly this reason — a hard-coded list silently stops
+counting whatever a later migration adds, and the count is what an operator uses to decide
+whether a prune is worth running.
+
+### `db integrity-check`'s damage-reporting branch is covered by a unit test, not by QA
+
+I could not reach it from the command line, and the reason is structural rather than an
+oversight:
+
+* A **readable but FK-inconsistent** database cannot be produced through the CLI at all,
+  because every `db` connection opens with `foreign_keys = ON` (that is the whole point of
+  `open::apply_pragmas` reading the pragma back). With enforcement on, the offending
+  insert is rejected; `part.session_id` has no declared FK, so it is not a route either.
+* A **genuinely corrupt** file (31 pages overwritten with `0xAA`) does make the CLI exit 1
+  with `database statement failed` on stderr rather than print a false `ok` — but SQLite
+  rejects it inside `migration::apply`, *before* `integrity_check` runs. So the observed
+  failure is the right outcome via the wrong code path.
+
+What is verified: the happy path end-to-end in both formats and both before and after a
+rewrite, the non-zero exit on a damaged file, and — in `oc-db` — the orphaned-reference
+case asserting `integrity == ["ok"]` with `is_ok() == false`. A follow-up wanting true
+end-to-end coverage needs a fixture database written by something other than this CLI.
+
+### `lsp_diagnostics` still rejects sibling worktree paths
+
+Same as todo 82: "LSP file path must be inside request cwd". Todo 82's workaround was a
+byte-for-byte copy inside the main worktree, but a new module copied to a path with no
+`pub mod` line for it is not compiled, so the result would be **vacuously** clean. I used
+`cargo clippy --workspace --all-targets --offline` as the diagnostic gate instead (0
+warnings, and clippy runs the full rustc analysis), plus targeted
+`clippy -p oc-db -p oc-cli --all-targets` at 0. Stated rather than papered over.
+
+### One clippy lint worth knowing about in a `cfg`-dependent test
+
+`assert!(!cfg!(unix), "…")` trips `clippy::assertions_on_constants` — the condition is a
+compile-time constant, so clippy asks for a `const` block, which is not what a per-platform
+assertion wants. Fix: `#[cfg(unix)] match … { Unknown { reason } => panic!("…{reason}") }`
+with a `#[cfg(not(unix))]` arm beside it. Any future test that branches on the host will
+hit the same lint.
+
+### `cargo add fs4 --dry-run --offline` fails here
+
+"the crate `fs4` could not be found in registry index" — it is not in the offline cache.
+`fs2` and `sysinfo` *are* cached but both are heavier than needed. `rustix` was already in
+the lock at the exact version and feature `tempfile` needs, so it cost zero packages.
+Confirming the worktree note: `cargo search` is unusable (aliyun mirror replacement);
+`cargo add --dry-run` is the availability check, and it answers honestly for a miss.

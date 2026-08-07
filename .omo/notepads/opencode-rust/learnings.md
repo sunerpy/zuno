@@ -4886,3 +4886,58 @@ a fallback for a user who rebound it.
 - Holding SQLite’s `IMMEDIATE` transaction prevents a concurrent database writer from creating a new survivor after the reference set is read. It cannot prevent unrelated filesystem writers, so every removal rechecks the candidate’s file/directory type and refuses a changed shape.
 - Safe byte reporting recursively uses `symlink_metadata` and counts only regular-file lengths. Snapshot Git alternates and any other symlink are never followed, so reported reclaimed bytes remain store-local.
 - Three mutation proofs were non-vacuous: removing `store.is_referenced()` deleted the live snapshot store; attributing every `None` tool name deleted a fresh upstream file; enabling legacy cleanup by default deleted its fixture before opt-in.
+
+## [2026-08-07] Task 84: explicit VACUUM, and why a size measurement in WAL mode lies
+
+**The live database has 20 tables, not 19 and not 12.** `schema::TABLE_COUNT` is 19 —
+the tables `schema::up` creates — and `migration::apply` adds a 20th, `migration`, for
+its own bookkeeping. `db stats` reads the inventory from `sqlite_master` at runtime
+rather than from any constant, and `tests/vacuum.rs` pins all 20 names in sort order.
+Todo 82's `PRUNE_TABLES = 10` is a different and also correct number: the
+session-attributable subset. Three numbers, all right, none interchangeable — anyone
+writing a "how many tables" assertion has to say *which* count they mean.
+
+**Measuring a database's size in WAL mode requires a truncating checkpoint on both
+sides, or the number is wrong in both directions.** Every connection is opened in WAL
+mode (`open.rs`'s `PRAGMA_SEQUENCE`, a port of `database.ts:22-33`), so a delete's
+pages land in `opencode.db-wal` and the main file does not change at all. Measure
+naively and a prune looks like it reclaimed nothing *for the wrong reason*, while the
+footprint including the sidecar has **grown**. `vacuum()` therefore issues
+`PRAGMA wal_checkpoint(TRUNCATE)` before it measures and again after the rewrite.
+`TRUNCATE`, not the `PASSIVE` form the open sequence uses: passive leaves `-wal` at its
+high-water mark, so bytes that hold nothing get counted. Two tests pin this — one
+asserts `main_bytes == page_size * page_count` right after a truncating checkpoint, the
+other asserts an uncheckpointed prune shows up as `wal_bytes > 0` with `main_bytes`
+unchanged.
+
+Sizes are re-`stat`ed from the filesystem on every call and never cached; the whole
+point of the before/after pair is that they were observed at two different times.
+`DatabaseSize` counts `-wal` and `-shm` alongside the main file because they are part of
+the database, not a cache.
+
+**The measured effect, on a 2.0 MiB fixture with half its sessions pruned:**
+main file 2,125,824 → 2,125,824 bytes (prune reclaimed **0**, with 228 pages now on the
+freelist *inside* the file) → 1,179,648 bytes after `VACUUM` (reclaimed **946,176**).
+The same sequence through the real CLI: 1,531,904 bytes unchanged by the delete with
+158 freelist pages, then 651,264 bytes reclaimed. `PRAGMA auto_vacuum` is asserted to
+be 0 (NONE) first, because with it on SQLite would return pages on commit and the whole
+distinction would evaporate.
+
+**Free space costs zero new packages.** `rustix` 1.1.4 with feature `fs` was already in
+`Cargo.lock` — `tempfile` pulls exactly that — so `[target.'cfg(unix)'.dependencies]
+rustix` added one manifest edge and **no package**. `f_bavail * (f_frsize or f_bsize)`,
+with `f_bsize` as the documented fallback for filesystems that report `f_frsize` as 0.
+The syscall's `unsafe` stays inside the dependency, so `oc-db` keeps
+`unsafe_code = "forbid"`; a hand-rolled `libc::statvfs` could not. And it needs no
+subprocess, which matters concretely: `df -Pk` parsing would fail under the stripped
+`PATH` that `oc-cli`'s differential suite runs `db` against. `statvfs` needs a path that
+exists, so a database that has not been created yet is answered from its parent
+directory.
+
+**A CLI subcommand can be added without touching a frozen `--help` surface** by
+dispatching on the value of the existing positional, which is how `db path` already
+worked. `differential.rs` compares `db --help`'s long options against the real binary
+exactly unless an addition is declared in `ADDED_LONG_FLAGS`; `db stats`,
+`db integrity-check` and `db vacuum` add **zero** flags, so nothing had to be declared
+and the comparison stayed green. Verified by hand: `db --help` prints the same six long
+options as before.
