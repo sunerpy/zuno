@@ -675,3 +675,64 @@ after), but the gate was blind by construction. It now also fails on
 Same shape as two findings already in `issues.md` — a test that can only fail one way,
 and five overlapping safety fixtures proving a disjunction rather than its terms.
 **A check that can only detect one shape of failure is not a check.**
+
+## Wave 19 dispatch ledger (2026-08-07)
+
+`main` = 3003 tests, 96/103 done. **86 is merged — the choke point is cleared.**
+
+| todo | crate | session |
+|---|---|---|
+| 87 | `oc-testkit/src/cassettes.rs` | `ses_02424fa4affeR3PmOdz5MKvRG3` |
+| 88 | `oc-testkit/tests/memory.rs` (G1/G2) | `ses_02425ed86ffeIuf2WRyJLNcXZ5` |
+
+**91 withdrawn from this wave** — `Blocked by: 86,87`, and 87 is still in flight. Its
+worktree was removed. The proven pipeline it must copy is confirmed present at
+`/config/workspace/ProdDir/AI/codegraph-rust/.github/workflows/release-please.yml:178+`
+(six-target matrix, `use_zigbuild: true` on both musl legs). This repo has no
+`.github/` yet.
+
+Remaining: **87, 88, 89, 90, 91, 92, 103** = 7, then F1-F4.
+
+### Todo 86's verdict, which is the important artifact of wave 18
+
+The suite is 8 tests and emits `target/compat/compat-report.json`. I read the report
+rather than the summary. **22 surfaces: 15 compared, 4 partially, 3 not compared** —
+and every non-`compared` verdict carries a reason, which is exactly what was asked for:
+
+- `provider-wire-protocol` **not compared** — no HTTP client in the harness by
+  construction; explicitly deferred to todo 87.
+- `tui-rendering` **not compared and never will be** — Q1's answer was an equivalent
+  ratatui interface, not a pixel reproduction.
+- `acp-transport` **not compared against the real binary** — todo 78 validates against
+  the real `@agentclientprotocol/sdk`, which is a live-counterpart check instead.
+- `api-operations` **partial**: 56 of 58 upstream operations served. The two missing are
+  `GET /api/event` and `GET /api/session/{sessionID}/event` — the gap I found by driving
+  the merged binary in wave 11. It is now recorded as a **known gap, not a divergence**,
+  with the correct reasoning: success criterion 4 requires upstream's operation set to be
+  a subset of ours, and today it is not.
+
+**Both mutations I ran bit correctly.** Renaming `todo_session_idx` failed
+`db_schema_matches_a_database_the_real_binary_created` naming the index in both
+directions. Adding an eighth divergence entry failed the count assertion with a message
+demanding a `DECLARED_COUNT` bump in the same commit.
+
+### The finding worth escalating: "seven" was never the complete set
+
+`docs/divergences.toml` has exactly the seven the plan enumerates, and the suite asserts
+7. But todo 86 found **at least six more deliberate differences already declared in
+code**, two of which were explicitly nominated for this allow-list by the task that
+created them (`subpath-is-implemented` and `subpath-matches-literally`, both marked
+"DIVERGENCE CANDIDATE … for Todo 86's allow-list" in `decisions.md`). Plus
+`context-md-excluded`, `malformed-auth-json-is-an-error`,
+`failed-format-restores-pre-format-bytes`, and `memory-subsystem`.
+
+It correctly did **not** add them — that would have broken the count assertion, which
+exists to force this conversation. They are emitted in the report's
+`nominated_divergences` array with citations. **Todo 103 already requires an eighth entry
+(memory) and a count bump**, so the number moves regardless; whoever revises it must bump
+`oc_testkit::divergence::DECLARED_COUNT` in the same commit or the suite refuses.
+
+It also ruled the channel-DB filename **faithful behaviour, not a divergence** — our
+`opencode-local.db` versus an installed release's `opencode.db` mirrors
+`database.ts:45-55` exactly. Recorded as a known gap because it presents as a parity bug
+the first time anyone tries it; todo 92 owns documenting it.
