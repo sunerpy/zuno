@@ -1,6 +1,8 @@
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use oc_db::prune::PruneError;
+use oc_db::session_prune::SessionPruneError;
 use oc_error::DbError;
 use oc_pty::PtyError;
 use serde::Serialize;
@@ -15,6 +17,8 @@ pub enum ApiError {
     Database(#[from] DbError),
     #[error(transparent)]
     Pty(#[from] PtyError),
+    #[error(transparent)]
+    Maintenance(#[from] SessionPruneError),
 }
 
 #[derive(Serialize)]
@@ -60,6 +64,26 @@ impl IntoResponse for ApiError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "pty_error",
                 "internal pseudo-terminal error".to_owned(),
+            ),
+            Self::Maintenance(SessionPruneError::Prune(PruneError::ConfirmationRequired)) => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "session delete requires explicit confirmation".to_owned(),
+            ),
+            Self::Maintenance(SessionPruneError::Prune(PruneError::RemoteUnshareFailed {
+                session_id,
+                detail,
+            })) => (
+                StatusCode::CONFLICT,
+                "maintenance_refused",
+                format!(
+                    "remote unshare failed for shared session {session_id}: {detail}; local rows were not deleted"
+                ),
+            ),
+            Self::Maintenance(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "maintenance_failed",
+                "session maintenance failed".to_owned(),
             ),
         };
         (

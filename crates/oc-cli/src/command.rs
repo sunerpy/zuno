@@ -235,6 +235,7 @@ pub struct SessionArgs {
 #[derive(Debug, Clone, Subcommand)]
 pub enum SessionCommand {
     List(SessionListArgs),
+    Prune(SessionPruneArgs),
     Delete { session_id: String },
 }
 
@@ -253,6 +254,39 @@ pub enum SessionSortKey {
     Updated,
     /// `time_created`.
     Created,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum SessionPruneKey {
+    #[default]
+    Updated,
+    Created,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct SessionPruneArgs {
+    #[arg(long, value_name = "DAYS")]
+    pub older_than: u64,
+    #[arg(long, conflicts_with = "project")]
+    pub all_projects: bool,
+    #[arg(long, value_name = "PATH|ID")]
+    pub project: Option<String>,
+    #[arg(long, value_enum, default_value_t)]
+    pub by: SessionPruneKey,
+    #[arg(long, conflicts_with = "delete")]
+    pub archive: bool,
+    #[arg(long, conflicts_with = "archive")]
+    pub delete: bool,
+    #[arg(long)]
+    pub include_shared: bool,
+    #[arg(long)]
+    pub include_recent: bool,
+    #[arg(long)]
+    pub force: bool,
+    #[arg(long, requires = "delete")]
+    pub yes: bool,
+    #[arg(long, value_enum, default_value_t)]
+    pub format: SessionFormat,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -842,5 +876,101 @@ mod tests {
             assert!(cli.log_level.is_some());
         }
         assert!(Cli::try_parse_from(["opencode-rust", "--log-level", "TRACE", "run"]).is_err());
+    }
+
+    #[test]
+    fn session_prune_defaults_to_preview_for_the_current_project() {
+        let cli = Cli::try_parse_from(["opencode-rust", "session", "prune", "--older-than", "90"])
+            .expect("session prune parses");
+        let Some(Command::Session(SessionArgs {
+            command: Some(SessionCommand::Prune(args)),
+        })) = cli.command
+        else {
+            panic!("expected session prune");
+        };
+        assert_eq!(args.older_than, 90);
+        assert!(!args.all_projects);
+        assert!(args.project.is_none());
+        assert_eq!(args.by, SessionPruneKey::Updated);
+        assert!(!args.archive);
+        assert!(!args.delete);
+        assert!(!args.yes);
+        assert_eq!(args.format, SessionFormat::Table);
+    }
+
+    #[test]
+    fn session_prune_accepts_the_complete_destructive_shape() {
+        let cli = Cli::try_parse_from([
+            "opencode-rust",
+            "session",
+            "prune",
+            "--older-than",
+            "30",
+            "--all-projects",
+            "--by",
+            "created",
+            "--delete",
+            "--yes",
+            "--include-shared",
+            "--include-recent",
+            "--force",
+            "--format",
+            "json",
+        ])
+        .expect("destructive session prune parses");
+        let Some(Command::Session(SessionArgs {
+            command: Some(SessionCommand::Prune(args)),
+        })) = cli.command
+        else {
+            panic!("expected session prune");
+        };
+        assert!(args.all_projects);
+        assert_eq!(args.by, SessionPruneKey::Created);
+        assert!(args.delete);
+        assert!(args.yes);
+        assert!(args.include_shared);
+        assert!(args.include_recent);
+        assert!(args.force);
+        assert_eq!(args.format, SessionFormat::Json);
+    }
+
+    #[test]
+    fn session_prune_rejects_conflicting_scopes_and_actions() {
+        assert!(
+            Cli::try_parse_from([
+                "opencode-rust",
+                "session",
+                "prune",
+                "--older-than",
+                "90",
+                "--all-projects",
+                "--project",
+                "prj_a",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "opencode-rust",
+                "session",
+                "prune",
+                "--older-than",
+                "90",
+                "--archive",
+                "--delete",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "opencode-rust",
+                "session",
+                "prune",
+                "--older-than",
+                "90",
+                "--yes",
+            ])
+            .is_err()
+        );
     }
 }

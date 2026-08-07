@@ -10,6 +10,7 @@ pub(super) fn execute(args: &SessionArgs) -> Result<(), String> {
         .ok_or("session subcommand is required")?
     {
         SessionCommand::List(args) => super::session_list::run(&pool, args),
+        SessionCommand::Prune(args) => super::session_prune::run(&pool, args),
         SessionCommand::Delete { session_id } => {
             let store = Store::new(&pool);
             if store

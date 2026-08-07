@@ -23,6 +23,7 @@ pub mod api;
 mod auth;
 pub mod compat_v1;
 mod directory;
+mod discovery;
 mod event;
 mod events;
 mod server;
@@ -33,6 +34,7 @@ pub use compat_v1::{
     compat_v1_router,
 };
 pub use directory::RequestDirectory;
+pub use discovery::local_server_urls;
 pub use event::{DEFAULT_EVENT_SUBSCRIBER_CAPACITY, Delivery, EventFanout, EventSubscription};
 pub use events::{
     EventCursor, EventService, EventStreamError, NewEvent, StreamEvent, events_router,

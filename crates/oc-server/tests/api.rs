@@ -5,7 +5,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use oc_db::session::SessionCreate;
 use oc_server::api::{self, ApiState};
-use oc_server::{ServerBuilder, ServerConfig};
+use oc_server::{Delivery, ServerBuilder, ServerConfig, ServerServices};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -13,6 +13,15 @@ fn api_app(state: ApiState) -> Router {
     ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
         .with_routes(api::router(state))
         .router()
+}
+
+fn api_app_with_services(state: ApiState) -> (Router, ServerServices) {
+    let services = ServerServices::new(64);
+    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
+        .with_services(services.clone())
+        .with_routes(api::router(state))
+        .router();
+    (app, services)
 }
 
 fn request(method: Method, uri: &str, body: Option<Value>) -> Request<Body> {
@@ -199,6 +208,29 @@ async fn api_session_list_defaults_to_updated_then_id_desc_and_created_opts_out(
 }
 
 #[tokio::test]
+async fn api_session_active_reports_only_process_local_running_sessions_in_stable_order() {
+    let state = ApiState::memory("/repo").expect("in-memory API state initializes");
+    let (app, services) = api_app_with_services(state);
+    let _z_guard = services.runs.begin_turn("ses_z").expect("start z turn");
+    let _a_guard = services.runs.begin_turn("ses_a").expect("start a turn");
+
+    let response = app
+        .oneshot(request(Method::GET, "/api/session/active", None))
+        .await
+        .expect("active-session route responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await,
+        json!({
+            "data": {
+                "ses_a": {"type": "running"},
+                "ses_z": {"type": "running"}
+            }
+        })
+    );
+}
+
+#[tokio::test]
 async fn api_unbacked_endpoint_is_explicit_instead_of_fabricating_data() {
     let state = ApiState::memory("/repo").expect("in-memory API state initializes");
     let response = api_app(state)
@@ -233,4 +265,158 @@ async fn api_pty_list_and_create_use_the_real_pty_service() {
     assert_eq!(created.status(), StatusCode::OK);
     let body = response_json(created).await;
     assert_eq!(body["data"]["command"], "sh");
+}
+
+#[tokio::test]
+async fn api_maintenance_preview_is_inert_and_emits_ordered_progress() {
+    let state = ApiState::memory("/repo").expect("in-memory API state initializes");
+    state
+        .sessions()
+        .create(
+            &SessionCreate::new(
+                "ses_old", "ses_old", "global", "/repo", "/repo", "old", "test",
+            )
+            .at(1),
+        )
+        .expect("old fixture session inserts");
+    let (app, services) = api_app_with_services(state.clone());
+    let mut progress = services.maintenance_events.subscribe();
+
+    let response = app
+        .oneshot(request(
+            Method::GET,
+            "/api/session/prune?olderThan=90&project=global",
+            None,
+        ))
+        .await
+        .expect("maintenance preview responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .expect("preview body is readable");
+    let body: Value = serde_json::from_slice(&bytes).expect("preview is JSON");
+    assert_eq!(body["action"], "preview");
+    assert_eq!(body["selected_session_ids"], json!(["ses_old"]));
+    assert_eq!(body["changed_sessions"], 0);
+    assert!(
+        state
+            .sessions()
+            .find("ses_old")
+            .expect("read session")
+            .is_some()
+    );
+
+    let mut phases = Vec::new();
+    for _ in 0..5 {
+        let delivery = progress.recv().await.expect("progress stream remains open");
+        let Delivery::Event(event) = delivery else {
+            panic!("progress must not lag");
+        };
+        phases.push(event.phase);
+    }
+    assert_eq!(
+        phases,
+        [
+            oc_db::session_prune::ProgressPhase::Selecting,
+            oc_db::session_prune::ProgressPhase::Selected,
+            oc_db::session_prune::ProgressPhase::Database,
+            oc_db::session_prune::ProgressPhase::Artifacts,
+            oc_db::session_prune::ProgressPhase::Completed,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn api_maintenance_mutation_requires_apply_true() {
+    let state = ApiState::memory("/repo").expect("in-memory API state initializes");
+    state
+        .sessions()
+        .create(
+            &SessionCreate::new(
+                "ses_old", "ses_old", "global", "/repo", "/repo", "old", "test",
+            )
+            .at(1),
+        )
+        .expect("old fixture session inserts");
+
+    for body in [
+        json!({
+            "olderThan": 90,
+            "project": "global",
+            "action": "delete"
+        }),
+        json!({
+            "olderThan": 90,
+            "project": "global",
+            "action": "delete",
+            "apply": false
+        }),
+    ] {
+        let response = api_app(state.clone())
+            .oneshot(request(Method::POST, "/api/session/prune", Some(body)))
+            .await
+            .expect("maintenance mutation responds");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "invalid_request"
+        );
+        assert!(
+            state
+                .sessions()
+                .find("ses_old")
+                .expect("read session")
+                .is_some()
+        );
+    }
+}
+
+#[tokio::test]
+async fn api_maintenance_archive_mutates_only_with_explicit_apply() {
+    let state = ApiState::memory("/repo").expect("in-memory API state initializes");
+    state
+        .sessions()
+        .create(
+            &SessionCreate::new(
+                "ses_old", "ses_old", "global", "/repo", "/repo", "old", "test",
+            )
+            .at(1),
+        )
+        .expect("old fixture session inserts");
+
+    let response = api_app(state.clone())
+        .oneshot(request(
+            Method::POST,
+            "/api/session/prune",
+            Some(json!({
+                "olderThan": 90,
+                "project": "global",
+                "action": "archive",
+                "apply": true
+            })),
+        ))
+        .await
+        .expect("maintenance archive responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert!(body["action"]["archive"]["at_ms"].is_number());
+    assert_eq!(body["changed_sessions"], 1);
+    assert!(
+        state
+            .sessions()
+            .find("ses_old")
+            .expect("read session")
+            .expect("session remains after archive")
+            .time_archived
+            .is_some()
+    );
+}
+
+#[test]
+fn api_maintenance_openapi_registers_preview_and_mutation() {
+    let document = api::openapi();
+    assert!(document["paths"]["/api/session/prune"]["get"].is_object());
+    assert!(document["paths"]["/api/session/prune"]["post"].is_object());
+    assert!(document["components"]["schemas"]["SessionPruneMutation"].is_object());
+    assert!(document["components"]["schemas"]["SessionActiveResponse"].is_object());
 }

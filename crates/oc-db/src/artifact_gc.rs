@@ -183,6 +183,13 @@ pub struct ArtifactGcReport {
 /// A classified database, snapshot scan, or filesystem failure.
 #[derive(Debug)]
 pub enum ArtifactGcError {
+    /// The open database cannot prove ownership of channel-shared artifacts.
+    NoVisibleSessions {
+        /// SQLite's path for the main database, or `:memory:`.
+        database: String,
+        /// Total rows observed in `session`.
+        session_count: u64,
+    },
     /// Reading the survivor set or acquiring its lock failed.
     Database(DbError),
     /// Snapshot store discovery failed.
@@ -201,6 +208,13 @@ pub enum ArtifactGcError {
 impl fmt::Display for ArtifactGcError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NoVisibleSessions {
+                database,
+                session_count,
+            } => write!(
+                formatter,
+                "refusing artifact gc for database {database}: total session count is {session_count}; shared artifacts may belong to sessions in another channel database"
+            ),
             Self::Database(error) => error.fmt(formatter),
             Self::Snapshot(error) => error.fmt(formatter),
             Self::Filesystem {
@@ -217,6 +231,7 @@ impl fmt::Display for ArtifactGcError {
 impl std::error::Error for ArtifactGcError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::NoVisibleSessions { .. } => None,
             Self::Database(error) => Some(error),
             Self::Snapshot(error) => Some(error),
             Self::Filesystem { source, .. } => Some(source),
@@ -250,17 +265,27 @@ pub fn execute(
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(open::map_error)?;
-    let survivors = read_survivors(&transaction)?;
+    ensure_visible_session_owners(&transaction)?;
+    let mut survivors = read_survivors(&transaction)?;
+    let requested_session_ids = request
+        .deleted_session_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let survivor_ids = survivors
         .iter()
         .map(|survivor| survivor.session_id.clone())
         .collect::<BTreeSet<_>>();
-    let deleted_session_ids = request
-        .deleted_session_ids
-        .iter()
-        .filter(|session_id| !survivor_ids.contains(session_id.as_str()))
-        .cloned()
-        .collect::<BTreeSet<_>>();
+    let deleted_session_ids = match request.mode {
+        ArtifactGcMode::Preview => {
+            survivors.retain(|survivor| !requested_session_ids.contains(&survivor.session_id));
+            requested_session_ids
+        }
+        ArtifactGcMode::Delete => requested_session_ids
+            .difference(&survivor_ids)
+            .cloned()
+            .collect(),
+    };
 
     let mut candidates = Vec::new();
     discover_snapshot_candidates(paths, &survivors, &mut candidates)?;
@@ -292,6 +317,27 @@ pub fn execute(
     }
     transaction.commit().map_err(open::map_error)?;
     Ok(report)
+}
+
+pub(crate) fn ensure_visible_session_owners(
+    connection: &Connection,
+) -> Result<(), ArtifactGcError> {
+    let session_count = connection
+        .query_row("SELECT count(*) FROM session", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(open::map_error)?
+        .unsigned_abs();
+    if session_count > 0 {
+        return Ok(());
+    }
+    Err(ArtifactGcError::NoVisibleSessions {
+        database: connection
+            .path()
+            .unwrap_or(oc_paths::MEMORY_SENTINEL)
+            .to_owned(),
+        session_count,
+    })
 }
 
 #[derive(Debug)]
@@ -689,6 +735,11 @@ mod tests {
             .expect("insert session");
     }
 
+    fn insert_visibility_sentinel(connection: &Connection, worktree: &Path) {
+        insert_project(connection, "guard-project", worktree);
+        insert_session(connection, "ses_guard", "guard-project", worktree);
+    }
+
     fn write(path: &Path, content: &[u8]) {
         fs::create_dir_all(path.parent().expect("fixture path has parent"))
             .expect("create fixture parent");
@@ -705,6 +756,40 @@ mod tests {
             .expect("open fixture")
             .set_modified(when)
             .expect("set fixture mtime");
+    }
+
+    #[test]
+    fn zero_total_sessions_refuses_gc_and_names_the_database() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let database_path = temp.path().join("wrong-channel.db");
+        let mut connection = Connection::open(&database_path).expect("open file database");
+        connection
+            .execute_batch(
+                "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL);\
+                 CREATE TABLE session (\
+                   id TEXT PRIMARY KEY,\
+                   project_id TEXT NOT NULL,\
+                   directory TEXT NOT NULL\
+                 );",
+            )
+            .expect("create schema");
+        let paths = ArtifactGcPaths::from_data_root(temp.path());
+        let unowned = StoreKey::new("project", &temp.path().join("worktree"));
+        write(
+            &unowned.path_in(&paths.snapshots).join("objects/history"),
+            b"must survive",
+        );
+
+        let error = execute(
+            &mut connection,
+            &paths,
+            &ArtifactGcRequest::new(["ses_selected"], SystemTime::now()),
+        )
+        .expect_err("an empty database cannot prove shared artifacts are unreferenced");
+        let message = error.to_string();
+        assert!(message.contains(&database_path.to_string_lossy().into_owned()));
+        assert!(message.contains("0"), "{message}");
+        assert!(unowned.path_in(&paths.snapshots).is_dir());
     }
 
     #[test]
@@ -851,6 +936,7 @@ mod tests {
             write(path, b"{}");
         }
         let mut connection = database();
+        insert_visibility_sentinel(&connection, temp.path());
 
         execute(
             &mut connection,
@@ -884,6 +970,7 @@ mod tests {
             .join("tool_ses_deleted_00000000000000000000000000000001");
         write(&output, b"12345");
         let mut connection = database();
+        insert_visibility_sentinel(&connection, temp.path());
 
         let report = execute(
             &mut connection,
@@ -918,6 +1005,7 @@ mod tests {
 
         let paths = ArtifactGcPaths::from_data_root(&data);
         let mut connection = database();
+        insert_visibility_sentinel(&connection, temp.path());
         let report = execute(
             &mut connection,
             &paths,
@@ -949,6 +1037,7 @@ mod tests {
         symlink(&outside, paths.legacy_storage.join("part")).expect("link part root");
 
         let mut connection = database();
+        insert_visibility_sentinel(&connection, temp.path());
         let report = execute(
             &mut connection,
             &paths,
