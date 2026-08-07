@@ -651,6 +651,27 @@ impl<'conn> MessageStore<'conn> {
         }
     }
 
+    /// The newest `time_created` in a session, or `None` when it has no messages.
+    ///
+    /// A writer that must sort after everything already stored cannot get that from
+    /// the clock alone. [`Self::messages_for_session`] breaks a `time_created` tie
+    /// with `id`, faithfully to upstream — but upstream's ids are time-ordered
+    /// identifiers and this port's are random UUIDs, so two messages written inside
+    /// one millisecond order by coin flip. Pair this with [`created_after`] to make
+    /// the new row's position a fact rather than a race.
+    ///
+    /// Costs one statement, answered from `message_session_time_created_id_idx`
+    /// (`schema.rs:208`) without reading a `data` blob.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError::Query`] or [`DbError::Busy`] from SQLite.
+    pub fn latest_time_created(&self, session_id: &str) -> Result<Option<i64>, DbError> {
+        self.prepare("SELECT MAX(time_created) FROM message WHERE session_id = ?1")?
+            .query_row([session_id], |row| row.get::<_, Option<i64>>(0))
+            .map_err(map_error)
+    }
+
     /// Every message of a session, oldest first.
     ///
     /// Ordered `(time_created, id)` to ride `message_session_time_created_id_idx`
@@ -763,6 +784,23 @@ impl fmt::Debug for MessageStore<'_> {
             .debug_struct("MessageStore")
             .field("statements", &self.statements.get())
             .finish_non_exhaustive()
+    }
+}
+
+/// A `time_created` at or after `now` that sorts strictly after `latest`.
+///
+/// The clock is not enough on its own: a caller can persist two messages inside one
+/// millisecond, and [`MessageStore::messages_for_session`] then breaks the tie with
+/// the random UUID in the id rather than with the order they were written. Half of
+/// those coin flips put a reply ahead of what it replies to, which reorders the
+/// request prefix and costs the prompt-cache hit `oc_llm`'s append-only tracker
+/// exists to protect. Clamping is the cheap half of the fix; the expensive half
+/// would be replacing random ids with time-ordered ones.
+#[must_use]
+pub fn created_after(now: i64, latest: Option<i64>) -> i64 {
+    match latest {
+        Some(latest) => now.max(latest.saturating_add(1)),
+        None => now,
     }
 }
 

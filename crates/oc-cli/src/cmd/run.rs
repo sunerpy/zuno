@@ -1,162 +1,50 @@
+//! The headless turn surface: one prompt in, the turn's events printed.
+//!
+//! Everything about *composing* a turn moved to [`super::turn`] when the TUI gained
+//! the ability to drive one, so what is left here is this surface's own two jobs —
+//! deciding which invocations it can honour, and rendering
+//! [`oc_engine::r#loop::TurnEvent`]s as text. The composition is shared precisely so
+//! that a tool, a permission rule, or a session-resolution fix cannot land on one
+//! surface and miss the other.
+
 use std::io::{IsTerminal as _, Read as _, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use oc_auth::Credential;
-use oc_engine::dispatch::ToolRegistryDispatcher;
-use oc_engine::interrupt::InterruptSignal;
-use oc_engine::r#loop::{
-    AgentModelResolver, ResolvedAgent, ResolvedModel as EngineModel, RunTurnRequest, TurnContext,
-    TurnEvent, event_channel, run_turn,
-};
-use oc_llm::cache::{DynamicContext, McpToolStatus};
-use oc_llm::catalog::{Catalog, CatalogSource, ResolveInput};
+use oc_engine::r#loop::{TurnEvent, event_channel};
 use oc_llm::event::{ConnectionPhase, StreamEvent};
-use oc_llm::registry::{ApiSurface, ProviderRegistry, Spec};
-use oc_provider_compatible::{ReqwestTransport, Transport, factory};
 use serde_json::{Value, json};
-use uuid::Uuid;
 
+use crate::cmd::turn::{SessionChoice, TurnHost, TurnOptions, TurnPlan};
 use crate::command::{RunArgs, RunFormat};
 use crate::environment::StartupEnvironment;
-
-const COMPATIBLE_PROVIDER: &str = "openai-compatible";
-const DEFAULT_AGENT: &str = "build";
-const DEFAULT_MAX_STEPS: u32 = 100;
-const OPENCODE_ENABLE_EXPERIMENTAL_MODELS: &str = "OPENCODE_ENABLE_EXPERIMENTAL_MODELS";
 
 pub(super) fn execute(args: &RunArgs, environment: &StartupEnvironment) -> Result<(), String> {
     validate_flags(args)?;
     let message = prompt(args)?;
-    let directory = args
-        .dir
-        .as_deref()
-        .map(PathBuf::from)
-        .map_or_else(std::env::current_dir, Ok)
-        .map_err(to_string)?;
-    let env = environment.resolved();
-    let project = oc_paths::project::resolve_project(&directory);
-    let worktree = project.vcs.as_ref().map(|_| project.directory.as_path());
-    let layout = oc_paths::Layout::resolve(env);
-    let config = oc_config::discovery::discover_with(&oc_config::discovery::DiscoveryOptions::new(
-        &directory,
-        worktree,
-        env.clone(),
-    ))
-    .map_err(to_string)?;
-    let credentials = oc_auth::AuthStore::resolve(&layout, env)
-        .all()
-        .map_err(to_string)?
-        .entries;
-    let catalog_source = CatalogSource::resolve(env, &layout);
-    let runtime = runtime()?;
-    let document = runtime.block_on(catalog_source.load()).map_err(to_string)?;
-    let input = ResolveInput::new()
-        .with_config(&config)
-        .with_credentials(credentials.clone())
-        .with_env(
-            env.iter()
-                .map(|(key, value)| (key.to_owned(), value.to_owned()))
-                .collect(),
-        )
-        .with_experimental_models(env.flag(OPENCODE_ENABLE_EXPERIMENTAL_MODELS));
-    let catalog = Catalog::resolve(&document, &input);
-
-    let agents = oc_catalog::agent::load(&directory, worktree, env).map_err(to_string)?;
-    let agent_name = args.agent.as_deref().unwrap_or(DEFAULT_AGENT);
-    let selected_agent = agents
-        .iter()
-        .find(|entry| entry.name == agent_name)
-        .ok_or_else(|| format!("Agent not found: {agent_name}"))?;
-    let requested_model = args.model.as_deref().or(selected_agent.model.as_deref());
-    let (provider_id, model_id, catalog_model) = select_model(&catalog, requested_model)?;
-    if !supports_compatible_transport(&catalog_model.api.npm) {
-        return Err(format!(
-            "model {provider_id}/{model_id} uses transport {}, but this headless run path currently supports OpenAI-compatible transports",
-            catalog_model.api.npm
-        ));
-    }
-    let credential = credentials.get(&provider_id).map(credential_value);
-    let spec = model_spec(catalog_model);
-    let resolver = Resolver {
-        requested_agent: selected_agent.name.clone(),
-        system_prompt: selected_agent.prompt.clone().unwrap_or_default(),
-        max_steps: selected_agent
-            .steps
-            .map_or(DEFAULT_MAX_STEPS, std::num::NonZeroU32::get),
-        requested_provider: provider_id.clone(),
-        requested_model: model_id.clone(),
-        wire_model: catalog_model.api.id.clone(),
-        spec,
+    let options = TurnOptions {
+        directory: args.dir.as_deref().map(PathBuf::from),
+        model: args.model.clone(),
+        agent: args.agent.clone(),
+        session: SessionChoice::resolve(args.session.as_deref(), args.r#continue),
+        title: args.title.clone(),
     };
-
-    let mut providers = ProviderRegistry::new();
-    let transport: Arc<dyn Transport> = Arc::new(ReqwestTransport::new(&provider_id));
-    providers.register_fallible(
-        COMPATIBLE_PROVIDER,
-        factory(transport, move |_| credential.clone()),
-    );
-
-    let mut connection = oc_db::open_default().map_err(to_string)?;
-    oc_db::migration::apply(&mut connection).map_err(to_string)?;
-    let now = oc_db::message::now_millis();
-    ensure_project(&connection, &project, now)?;
-    let session = resolve_session(
-        &mut connection,
-        args,
-        &project,
-        &directory,
-        &provider_id,
-        &model_id,
-        agent_name,
-        now,
-    )?;
-    persist_user_message(
-        &connection,
-        &session.id,
-        agent_name,
-        &provider_id,
-        &model_id,
-        &message,
-        now,
-    )?;
-
-    let interrupt = InterruptSignal::new();
-    let runtime_tools = crate::cmd::tool_runtime::assemble(
-        &directory,
-        worktree,
-        env,
-        &config,
-        selected_agent,
-        &provider_id,
-        &model_id,
-    )?;
-    let dispatcher = ToolRegistryDispatcher::new(
-        runtime_tools.tools,
-        runtime_tools.rules,
+    let runtime = runtime()?;
+    let plan = runtime.block_on(TurnPlan::resolve(&options, environment))?;
+    let mut host = TurnHost::open(
+        plan,
+        environment,
         Arc::new(crate::cmd::tool_runtime::HeadlessApproval),
-        InterruptSignal::new(),
-        McpToolStatus::Ready,
-    );
+    )?;
+
     let (sender, receiver) = event_channel();
-    let turn = run_turn(
-        RunTurnRequest::new(
-            session.id,
-            Uuid::new_v4().simple().to_string(),
-            DynamicContext::default(),
-        ),
-        TurnContext::new(
-            &mut connection,
-            &providers,
-            &resolver,
-            &dispatcher,
-            &interrupt,
-        ),
-        sender,
-    );
-    let (outcome, rendered) =
-        runtime.block_on(async { tokio::join!(turn, render_events(receiver, args.format)) });
-    outcome.map_err(to_string)?;
+    let (outcome, rendered) = runtime.block_on(async {
+        tokio::join!(
+            host.drive(&message, sender),
+            render_events(receiver, args.format)
+        )
+    });
+    outcome?;
     rendered?;
     Ok(())
 }
@@ -191,9 +79,12 @@ fn validate_flags(args: &RunArgs) -> Result<(), String> {
                 .to_owned(),
         );
     }
+    // Both are interactive-surface flags, and the interactive surface now honours
+    // them: `--auto` is `tui --auto`. Refusing here rather than quietly ignoring them
+    // keeps a scripted caller from believing a headless run auto-approved anything.
     if args.interactive || args.auto {
         return Err(
-            "--interactive and --auto require the TUI loop and are not available in headless run"
+            "--interactive and --auto belong to the interactive surface; run `tui --auto --prompt <message>` instead"
                 .to_owned(),
         );
     }
@@ -219,204 +110,6 @@ fn prompt(args: &RunArgs) -> Result<String, String> {
         return Err("a message is required".to_owned());
     }
     Ok(message)
-}
-
-fn select_model<'a>(
-    catalog: &'a Catalog,
-    requested: Option<&str>,
-) -> Result<(String, String, &'a oc_llm::catalog::ResolvedModel), String> {
-    if let Some(requested) = requested {
-        let (provider_id, model_id) = requested
-            .split_once('/')
-            .ok_or_else(|| format!("model must be provider/model, got {requested:?}"))?;
-        let model = catalog
-            .model(provider_id, model_id)
-            .ok_or_else(|| format!("Model not found: {requested}"))?;
-        return Ok((provider_id.to_owned(), model_id.to_owned(), model));
-    }
-
-    for provider_id in catalog.provider_ids() {
-        let provider = catalog
-            .provider(provider_id)
-            .expect("provider_ids only returns catalog providers");
-        let mut model_ids: Vec<&str> = provider.models.keys().map(String::as_str).collect();
-        model_ids.sort_by(|left, right| oc_llm::catalog::collate::compare(left, right));
-        if let Some(model_id) = model_ids.into_iter().next() {
-            let model = provider
-                .models
-                .get(model_id)
-                .expect("model id came from provider models");
-            return Ok((provider_id.to_owned(), model_id.to_owned(), model));
-        }
-    }
-    Err("no available model; configure a provider credential or provider block".to_owned())
-}
-
-fn supports_compatible_transport(npm: &str) -> bool {
-    matches!(
-        npm,
-        "@ai-sdk/openai-compatible" | "@ai-sdk/openai" | "@openrouter/ai-sdk-provider"
-    )
-}
-
-fn model_spec(model: &oc_llm::catalog::ResolvedModel) -> Spec {
-    let mut spec = Spec::new(COMPATIBLE_PROVIDER).with_surface(ApiSurface::Chat);
-    if !model.api.url.is_empty() {
-        spec = spec.with_base_url(&model.api.url);
-    }
-    for (name, value) in &model.headers {
-        spec = spec.with_header(name, value);
-    }
-    for (name, value) in &model.options {
-        spec = spec.with_option(name, value.clone());
-    }
-    spec
-}
-
-fn credential_value(credential: &Credential) -> String {
-    match credential {
-        Credential::Api { key, .. } => key.expose().to_owned(),
-        Credential::Oauth { access, .. } => access.expose().to_owned(),
-        Credential::WellKnown { token, .. } => token.expose().to_owned(),
-    }
-}
-
-struct Resolver {
-    requested_agent: String,
-    system_prompt: String,
-    max_steps: u32,
-    requested_provider: String,
-    requested_model: String,
-    wire_model: String,
-    spec: Spec,
-}
-
-impl AgentModelResolver for Resolver {
-    fn resolve_agent(&self, requested: &str) -> Option<ResolvedAgent> {
-        (requested == self.requested_agent).then(|| {
-            ResolvedAgent::new(
-                self.requested_agent.clone(),
-                self.system_prompt.clone(),
-                self.max_steps,
-            )
-        })
-    }
-
-    fn resolve_model(&self, provider_id: &str, model_id: &str) -> Option<EngineModel> {
-        (provider_id == self.requested_provider && model_id == self.requested_model)
-            .then(|| EngineModel::new(self.spec.clone(), self.wire_model.clone(), ApiSurface::Chat))
-    }
-}
-
-fn ensure_project(
-    connection: &rusqlite::Connection,
-    project: &oc_paths::project::ResolvedProject,
-    now: i64,
-) -> Result<(), String> {
-    connection
-        .execute(
-            "INSERT INTO project \
-             (id, worktree, vcs, time_created, time_updated, sandboxes) \
-             VALUES (?1, ?2, ?3, ?4, ?4, '[]') \
-             ON CONFLICT (id) DO UPDATE SET \
-               worktree = excluded.worktree, \
-               vcs = excluded.vcs, \
-               time_updated = excluded.time_updated",
-            (
-                project.id.as_str(),
-                project.directory.to_string_lossy().as_ref(),
-                project.vcs.as_ref().map(|_| "git"),
-                now,
-            ),
-        )
-        .map_err(to_string)?;
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn resolve_session(
-    connection: &mut rusqlite::Connection,
-    args: &RunArgs,
-    project: &oc_paths::project::ResolvedProject,
-    directory: &Path,
-    provider_id: &str,
-    model_id: &str,
-    agent: &str,
-    now: i64,
-) -> Result<oc_db::session::Session, String> {
-    if let Some(session_id) = &args.session {
-        return oc_db::session::get(connection, session_id).map_err(to_string);
-    }
-    if args.r#continue {
-        return oc_db::session::list(
-            connection,
-            &oc_db::session::ListQuery::directory(directory.to_string_lossy())
-                .active_only()
-                .with_limit(1),
-        )
-        .map_err(to_string)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| "no session found to continue in the current directory".to_owned());
-    }
-
-    let session_id = prefixed_id("ses");
-    let title = args
-        .title
-        .clone()
-        .unwrap_or_else(|| "New session".to_owned());
-    let mut input = oc_db::session::SessionCreate::new(
-        &session_id,
-        Uuid::new_v4().simple().to_string(),
-        &project.id,
-        project.directory.to_string_lossy().into_owned(),
-        directory.to_string_lossy().into_owned(),
-        title,
-        crate::COMPATIBILITY_VERSION,
-    )
-    .at(now);
-    input.agent = Some(agent.to_owned());
-    input.model = Some(json!({"providerID": provider_id, "modelID": model_id}).to_string());
-    let transaction = connection.transaction().map_err(to_string)?;
-    let creation = oc_db::session::create(&transaction, &input).map_err(to_string)?;
-    transaction.commit().map_err(to_string)?;
-    Ok(creation.into_session())
-}
-
-fn persist_user_message(
-    connection: &rusqlite::Connection,
-    session_id: &str,
-    agent: &str,
-    provider_id: &str,
-    model_id: &str,
-    text: &str,
-    now: i64,
-) -> Result<(), String> {
-    let message_id = prefixed_id("msg");
-    let message = oc_db::message::MessageRecord::from_json(json!({
-        "id": message_id,
-        "sessionID": session_id,
-        "role": "user",
-        "time": {"created": now},
-        "agent": agent,
-        "model": {"providerID": provider_id, "modelID": model_id}
-    }))
-    .map_err(to_string)?;
-    let part = oc_db::message::PartRecord::from_json(
-        json!({
-            "id": prefixed_id("prt"),
-            "sessionID": session_id,
-            "messageID": message.id,
-            "type": "text",
-            "text": text
-        }),
-        now,
-    )
-    .map_err(to_string)?;
-    let store = oc_db::message::MessageStore::new(connection);
-    store.put_message_at(&message, now).map_err(to_string)?;
-    store.put_part_at(&part, now).map_err(to_string)?;
-    Ok(())
 }
 
 async fn render_events(
@@ -648,10 +341,6 @@ fn connection_phase(phase: ConnectionPhase) -> Value {
     }
 }
 
-fn prefixed_id(prefix: &str) -> String {
-    format!("{prefix}_{}", Uuid::new_v4().simple())
-}
-
 fn runtime() -> Result<tokio::runtime::Runtime, String> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -693,75 +382,11 @@ mod tests {
     }
 
     #[test]
-    fn model_selection_splits_only_the_provider_prefix() {
-        let document = serde_json::from_str(
-            r#"{"anyapi":{"id":"anyapi","name":"AnyAPI","env":[],"models":{"openai/gpt":{"id":"openai/gpt","name":"GPT","limit":{"context":1,"output":1}}}}}"#,
-        )
-        .expect("catalog document");
-        let config = serde_json::from_str(r#"{"provider":{"anyapi":{}}}"#).expect("config");
-        let catalog = Catalog::resolve(&document, &ResolveInput::new().with_config(&config));
-        let (provider, model, _) =
-            select_model(&catalog, Some("anyapi/openai/gpt")).expect("nested model id");
-        assert_eq!(provider, "anyapi");
-        assert_eq!(model, "openai/gpt");
-    }
-
-    #[test]
     fn unsupported_remote_and_session_flags_are_rejected_before_side_effects() {
         let mut args = run_args();
         args.r#continue = true;
         args.session = Some("ses_x".to_owned());
         assert!(validate_flags(&args).is_err());
-    }
-
-    #[test]
-    fn new_session_and_user_message_are_persisted_together() {
-        let mut connection =
-            oc_db::open::open(&oc_paths::DbLocation::Memory).expect("open memory database");
-        oc_db::migration::apply(&mut connection).expect("apply schema");
-        let project = oc_paths::project::ResolvedProject {
-            previous: None,
-            id: "project-run-test".to_owned(),
-            directory: PathBuf::from("/workspace"),
-            vcs: None,
-        };
-        let now = 1_780_000_000_000;
-        ensure_project(&connection, &project, now).expect("persist project");
-        let session = resolve_session(
-            &mut connection,
-            &run_args(),
-            &project,
-            Path::new("/workspace"),
-            "provider",
-            "model",
-            "build",
-            now,
-        )
-        .expect("create session");
-        persist_user_message(
-            &connection,
-            &session.id,
-            "build",
-            "provider",
-            "model",
-            "hello",
-            now,
-        )
-        .expect("persist prompt");
-
-        let store = oc_db::message::MessageStore::new(&connection);
-        let messages = store
-            .messages_for_session(&session.id)
-            .expect("load messages");
-        assert_eq!(messages.len(), 1);
-        let grouped = store
-            .parts_by_message(&[messages[0].id.clone()])
-            .expect("load message parts");
-        let parts = grouped
-            .get(&messages[0].id)
-            .expect("parts grouped under the message");
-        assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0].data["text"], "hello");
     }
 
     #[tokio::test]

@@ -18,3 +18,12 @@ pub mod config;
 pub mod keybind;
 pub mod theme;
 pub mod views;
+
+/// The terminal backend, re-exported.
+///
+/// [`app::Component`] has `ratatui` and `crossterm` types in its signature, so a
+/// host that composes one has to name them. Re-exporting is what keeps that host from
+/// declaring its own dependency on either and drifting to a different version of the
+/// very types it passes across this boundary.
+pub use crossterm;
+pub use ratatui;

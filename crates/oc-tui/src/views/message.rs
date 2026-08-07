@@ -700,6 +700,7 @@ impl Component for TranscriptView {
 /// (`routes/session/footer.tsx`).
 pub struct StatusView {
     context: ViewContext,
+    running: bool,
     agent: Option<String>,
     model: Option<String>,
     step: u32,
@@ -707,16 +708,55 @@ pub struct StatusView {
 }
 
 impl StatusView {
+    /// The word the strip shows when nothing is running.
+    pub const IDLE: &'static str = "idle";
+
+    /// The word the strip shows the instant a turn starts, before anything resolves.
+    pub const WORKING: &'static str = "working";
+
     /// A status strip over `context`.
     #[must_use]
     pub fn new(context: ViewContext) -> Self {
         Self {
             context,
+            running: false,
             agent: None,
             model: None,
             step: 0,
             detail: None,
         }
+    }
+
+    /// Whether a turn is in flight, as the strip is reporting it.
+    #[must_use]
+    pub const fn is_running(&self) -> bool {
+        self.running
+    }
+
+    /// Report a turn as running before the engine's first event arrives.
+    ///
+    /// A prompt has to be persisted before [`TurnEvent::TurnStarted`] can be sent, so
+    /// there is a window in which work has started and no event has. Closing it here
+    /// is not cosmetic: for that window the strip would otherwise read
+    /// [`Self::IDLE`], which is the one thing it must never say while a turn is
+    /// under way.
+    pub fn mark_running(&mut self) {
+        self.reset(true);
+    }
+
+    /// Discard everything a turn resolved and record whether one is now running.
+    ///
+    /// The strip reports what is happening, not what last happened. Carrying the
+    /// previous turn's agent, model and step past its end would leave the one row a
+    /// user glances at claiming a state the process is not in — the same defect as a
+    /// strip that stayed [`Self::IDLE`] through a running turn, in the other
+    /// direction.
+    fn reset(&mut self, running: bool) {
+        self.running = running;
+        self.agent = None;
+        self.model = None;
+        self.step = 0;
+        self.detail = None;
     }
 
     /// The rendered row.
@@ -745,7 +785,11 @@ impl StatusView {
             text.push_str(detail);
         }
         if text.is_empty() {
-            text.push_str("idle");
+            text.push_str(if self.running {
+                Self::WORKING
+            } else {
+                Self::IDLE
+            });
         }
         padded(&format!(" {text}"), width, self.context.element())
     }
@@ -764,6 +808,10 @@ impl Component for StatusView {
             return EventResult::IGNORED;
         };
         match turn {
+            TurnEvent::TurnStarted { .. } => {
+                self.reset(true);
+                EventResult::REDRAW
+            }
             TurnEvent::AgentResolved { agent, .. } => {
                 self.agent = Some(agent.clone());
                 EventResult::REDRAW
@@ -795,7 +843,7 @@ impl Component for StatusView {
                 EventResult::REDRAW
             }
             TurnEvent::TurnCompleted { .. } | TurnEvent::TurnInterrupted { .. } => {
-                self.detail = None;
+                self.reset(false);
                 EventResult::REDRAW
             }
             _ => EventResult::IGNORED,

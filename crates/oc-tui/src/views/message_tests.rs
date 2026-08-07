@@ -464,6 +464,58 @@ fn views_status_strip_is_idle_before_anything_resolves() {
     assert_eq!(rows(&buffer).remove(0), " idle");
 }
 
+/// The strip must never read `idle` while a turn is under way.
+///
+/// Three moments, because the strip can lie at any of them and only the middle one
+/// is obvious: before the engine's first event (the prompt is being persisted), while
+/// the turn resolves, and after it ends — where carrying the last turn's agent and
+/// model forward would leave the row describing a turn that is over.
+#[test]
+fn views_status_strip_never_reads_idle_while_a_turn_is_under_way() {
+    let mut status = StatusView::new(ViewContext::defaults());
+    let rendered = |status: &mut StatusView| {
+        rows(&render_offscreen(status, 48, 1).expect("infallible")).remove(0)
+    };
+
+    status.mark_running();
+    assert!(status.is_running());
+    assert_eq!(
+        rendered(&mut status).trim(),
+        StatusView::WORKING,
+        "the window between a submitted prompt and the engine's first event read idle"
+    );
+
+    for event in [
+        TurnEvent::TurnStarted {
+            session_id: String::from("ses_status"),
+        },
+        TurnEvent::AgentResolved {
+            step: 1,
+            agent: String::from("build"),
+        },
+    ] {
+        assert!(status.handle_event(&AppEvent::Engine(event)).redraw);
+    }
+    assert!(status.is_running());
+    assert_eq!(rendered(&mut status), " build");
+
+    assert!(
+        status
+            .handle_event(&AppEvent::Engine(TurnEvent::TurnCompleted {
+                assistant_message_id: String::from("msg_status"),
+                steps: 1,
+            }))
+            .redraw
+    );
+    assert!(!status.is_running());
+    assert_eq!(
+        rendered(&mut status).trim(),
+        StatusView::IDLE,
+        "the finished turn's agent stayed on the strip, so it still describes a turn \
+         that is over"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Wrapping
 // ---------------------------------------------------------------------------

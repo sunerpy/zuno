@@ -55,6 +55,7 @@ oc-testkit = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 tower = { workspace = true }
+which = { workspace = true }
 
 [lints]
 workspace = true

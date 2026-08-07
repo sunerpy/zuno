@@ -9,7 +9,7 @@
 
 use oc_db::message::{
     HYDRATION_CHUNK, MessageRecord, MessageRole, MessageStore, MessageWithParts, PART_KIND_COUNT,
-    PartKind, PartRecord,
+    PartKind, PartRecord, created_after,
 };
 use oc_db::{Connection, migration, open};
 use oc_error::DbError;
@@ -670,6 +670,65 @@ fn hydrating_500_messages_costs_two_statements_not_501() {
             );
         }
     }
+}
+
+/// A writer that must sort last cannot get there from the clock alone.
+///
+/// `hydration_orders_messages_by_time_then_id_and_parts_by_id` below pins the tie
+/// rule: equal `time_created` orders by id. That is faithful to upstream, whose ids
+/// are time-ordered — but this port's ids are random uuids, so a caller writing two
+/// messages inside one millisecond gets a coin flip instead of the order it wrote
+/// them in. [`created_after`] is how a caller declines the flip, and pairing it with
+/// [`MessageStore::latest_time_created`] is the whole mechanism.
+#[test]
+fn a_stamp_clamped_past_the_latest_message_cannot_tie_it() {
+    let connection = seeded();
+    let store = MessageStore::new(&connection);
+    assert_eq!(
+        store
+            .latest_time_created(SESSION_ID)
+            .expect("empty session"),
+        None,
+        "a session with no messages has no latest stamp to sort after"
+    );
+    assert_eq!(
+        created_after(500, None),
+        500,
+        "with nothing to sort after, the clock stands"
+    );
+
+    for (id, created) in [
+        ("msg_e00000000000000000000000000000", 100),
+        ("msg_f00000000000000000000000000000", 400),
+    ] {
+        let record = MessageRecord::from_json(user_message(id, created)).expect("split");
+        store.put_message_at(&record, created).expect("write");
+    }
+    let latest = store
+        .latest_time_created(SESSION_ID)
+        .expect("read the latest stamp");
+    assert_eq!(latest, Some(400), "the newest stamp, not the last written");
+
+    assert_eq!(
+        created_after(400, latest),
+        401,
+        "a clock that has not moved past the latest message must still sort after it"
+    );
+    assert_eq!(
+        created_after(399, latest),
+        401,
+        "a clock that went backwards must not file a new message before an old one"
+    );
+    assert_eq!(
+        created_after(900, latest),
+        900,
+        "a clock already past the latest message is left alone"
+    );
+    assert_eq!(
+        created_after(0, Some(i64::MAX)),
+        i64::MAX,
+        "saturating rather than wrapping, because a wrapped stamp sorts first"
+    );
 }
 
 #[test]
