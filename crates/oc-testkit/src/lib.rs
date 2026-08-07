@@ -77,8 +77,10 @@
 //! ```
 
 pub mod cassette;
+pub mod compat_report;
 pub mod config_fixture;
 pub mod diff;
+pub mod divergence;
 pub mod env;
 pub mod error;
 pub mod mock_provider;
@@ -93,8 +95,15 @@ pub use crate::cassette::{
     BodyEncoding, Cassette, CassettePlayer, HttpInteraction, Interaction, RequestSnapshot,
     ResponseSnapshot, SseFrame, canonical_snapshot, list_cassettes, recordings_root,
 };
+pub use crate::compat_report::{
+    ComparedSurface, CompatReport, DivergenceSummary, KnownGap, NominatedDivergence, Normalization,
+    OracleAvailability, OracleKind, Verdict,
+};
 pub use crate::config_fixture::{ConfigFixture, ConfigLayer, PlacedLayer};
 pub use crate::diff::{DiffReport, Divergence, diff_normalized};
+pub use crate::divergence::{
+    DECLARED_COUNT, DeclaredDivergence, DivergenceList, EXECUTE_CONTRACT_ID, ExecuteContract,
+};
 pub use crate::env::{DbChoice, ScriptedEnv};
 pub use crate::error::{Result, TestkitError};
 pub use crate::mock_provider::{

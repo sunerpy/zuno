@@ -1,0 +1,64 @@
+# Intentional divergences from upstream `opencode` 1.18.13.
+#
+# This file is DATA THE COMPATIBILITY GATE CONSULTS, not prose a human remembers.
+# `crates/oc-testkit/tests/compat_suite.rs` loads it, asserts the entry count
+# against `oc_testkit::divergence::DECLARED_COUNT`, asserts every entry carries a
+# non-empty `id`, `surface` and `reason`, and — for `execute-parameter-contract` —
+# asserts the *live* parameter schema matches what the entry declares. Adding a
+# divergence without an entry, or an entry without bumping the count, fails the
+# gate.
+#
+# An entry belongs here only when the difference is a DECISION. A surface that is
+# merely unimplemented is a gap, not a divergence: it is reported by the suite's
+# `not_compared` / `known_gaps` sections and must never be laundered into an
+# entry here. See `.omo/notepads/opencode-rust/decisions.md`.
+#
+# Count discipline: this file has SEVEN entries, which is the count plan todo 86
+# asserts. Plan todo 103 (the cross-session memory subsystem — upstream has no
+# memory at all) is required by the plan to add an eighth entry and bump
+# `DECLARED_COUNT` with it. Until that todo lands, seven is the honest number.
+
+[[divergence]]
+id = "session-list-default-sort"
+surface = "CLI `session list`; HTTP `GET /api/session`; `oc-db` session listing"
+reason = "Upstream is self-inconsistent — `/api/session` sorts `time_created` while the legacy and experimental global listings sort `time_updated` — so one default was chosen: `time_updated DESC, id DESC`, with `--sort created` / `?sort=created` to opt out."
+
+[[divergence]]
+id = "tool-output-filename-carries-session"
+surface = "on-disk `$XDG_DATA_HOME/opencode/tool-output/tool_<session>_<uuidv7>`"
+reason = "Upstream's `bound()` takes a `sessionID` that `write()` never uses, so a filename cannot be attributed to a session; the prune in plan todo 83 needs that attribution, so the session id is encoded in the name and the mtime sweep is kept as the backstop for foreign files."
+
+[[divergence]]
+id = "no-eager-directory-creation"
+surface = "process startup; `oc-paths` layout getters"
+reason = "Upstream's `global.ts:35-43` creates seven directories at module import, before any command has decided it needs them — observable as `TMPDIR=/ opencode debug paths` exiting 1 with `EACCES … mkdir '/opencode'`; here every getter is a pure computation and creation happens only in `Layout::ensure`."
+
+[[divergence]]
+id = "split-version-identity"
+surface = "CLI `--version` and `--version --long`; the npm plugin compatibility gate"
+reason = "Two peers need different answers: `plugin/loader.ts:123-130` skips an npm plugin whose declared range excludes the running version, so the short version reports the pinned `1.18.13`, while the real build identity is exposed separately by `--version --long` rather than being hidden."
+
+[[divergence]]
+id = "execute-parameter-contract"
+surface = "tool `execute` — the model-facing parameter schema"
+reason = "Upstream takes `{ code: string }` and runs a confined `acorn`+`typescript` interpreter (`packages/opencode/src/tool/code-mode.ts:12-20`); a binary that forbids `unsafe` and bundles no JavaScript runtime instead takes jcode-shaped structured sub-calls, which changes what the model sees and so is declared rather than implied."
+
+# Consumed by the compat suite's live-schema assertion. These are the property
+# names the model actually sees, so a silent rename of `tool_calls` — or of the
+# cross-cutting keys the central augmentation injects — fails the gate.
+[divergence.contract]
+upstream_properties = ["code"]
+upstream_required = ["code"]
+properties = ["accept_large_output", "intent", "tool_calls"]
+required = ["intent", "tool_calls"]
+subcall_properties = ["bind", "intent", "tool"]
+
+[[divergence]]
+id = "c8-maintenance-endpoints"
+surface = "HTTP `GET /api/session/prune`, `POST /api/session/prune`"
+reason = "Session retention is added scope that upstream lacks entirely, so the `/api` relation to upstream is a required subset and never an equality claim; these two operations are the whole extension and the suite asserts that set exactly."
+
+[[divergence]]
+id = "provider-coverage-by-wire-family"
+surface = "provider selection; `oc-provider-compatible` family routing and its diagnostics"
+reason = "Upstream bundles 23 SDK factories behind one config surface; SigV4+EventStream, Gemini's wire format and Vertex auth cannot share an OpenAI-compatible request builder, so coverage is stated per wire-protocol family and an id no family claims is named in an error instead of being silently routed through the compatible profile."
