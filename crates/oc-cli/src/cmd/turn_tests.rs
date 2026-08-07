@@ -51,7 +51,42 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         credential: None,
         session,
         title: None,
+        internals: stub_internals(),
+        window: TokenWindow {
+            context: 0,
+            max_output: 0,
+        },
+        notes: Vec::new(),
     }
+}
+
+fn stub_internals() -> Internals {
+    let agent = |name: &str| InternalAgent {
+        name: name.to_owned(),
+        prompt: String::new(),
+        model: EngineModel::new(Spec::new(COMPATIBLE_PROVIDER), "model", ApiSurface::Chat),
+    };
+    Internals {
+        title: agent("title"),
+        compaction: agent("compaction"),
+        summary: agent("summary"),
+    }
+}
+
+fn catalog_with_two_models_and_a_title_override() -> (Catalog, oc_config::schema::Config) {
+    let document = serde_json::from_str(
+        r#"{"test":{"id":"test","name":"Test","env":[],"npm":"@ai-sdk/openai-compatible",
+             "models":{
+               "big":{"id":"big","name":"Big","limit":{"context":200000,"output":8192}},
+               "small":{"id":"small","name":"Small","limit":{"context":100000,"output":4096}}}}}"#,
+    )
+    .expect("catalog document");
+    let config = serde_json::from_str(
+        r#"{"provider":{"test":{}},"agent":{"title":{"model":"test/small"}}}"#,
+    )
+    .expect("config");
+    let catalog = Catalog::resolve(&document, &ResolveInput::new().with_config(&config));
+    (catalog, config)
 }
 
 #[test]
@@ -140,6 +175,95 @@ fn session_choice_resolves_the_two_flags_into_one_answer() {
         SessionChoice::resolve(Some("ses_1"), true),
         SessionChoice::Existing("ses_1".to_owned())
     );
+}
+
+#[test]
+fn all_three_internals_resolve_with_the_roster_prompt_and_a_reachable_model() {
+    // Given: a catalog with two models and a per-agent override for `title` only.
+    let (catalog, config) = catalog_with_two_models_and_a_title_override();
+    let session_model = catalog.model("test", "big").expect("the session model");
+    let mut notes = Vec::new();
+
+    // When: the internals are resolved.
+    let internals = resolve_internals(&config, &catalog, "test", "big", session_model, &mut notes)
+        .expect("every internal resolves");
+
+    // Then: the overridden one took its override, the other two inherited the
+    // session's model, and all three carry the roster's prompt.
+    assert_eq!(internals.title.model.model_id, "small");
+    assert_eq!(internals.compaction.model.model_id, "big");
+    assert_eq!(internals.summary.model.model_id, "big");
+    for internal in [&internals.title, &internals.compaction, &internals.summary] {
+        assert!(
+            !internal.prompt.trim().is_empty(),
+            "`{}` resolved with no prompt, so its request would carry no instructions",
+            internal.name
+        );
+    }
+    assert_eq!(
+        internals.title.prompt,
+        oc_catalog::agent::builtin::PROMPT_TITLE,
+        "the title prompt was rewritten instead of read from the catalog"
+    );
+}
+
+/// Every name the roster declares internal must resolve here.
+///
+/// The assertion is over [`oc_agent::builtin::INTERNAL_NAMES`] and not over three
+/// literals, so a fourth internal added to the roster fails this test rather than
+/// silently becoming another declared-and-never-invoked entry — which is the exact
+/// defect this wiring exists to remove.
+#[test]
+fn the_resolved_set_is_exactly_what_the_roster_calls_internal() {
+    let (catalog, config) = catalog_with_two_models_and_a_title_override();
+    let session_model = catalog.model("test", "big").expect("the session model");
+    let mut notes = Vec::new();
+    let internals = resolve_internals(&config, &catalog, "test", "big", session_model, &mut notes)
+        .expect("every internal resolves");
+
+    let resolved: std::collections::BTreeSet<&str> = [
+        internals.title.name.as_str(),
+        internals.compaction.name.as_str(),
+        internals.summary.name.as_str(),
+    ]
+    .into_iter()
+    .collect();
+    let declared: std::collections::BTreeSet<&str> =
+        oc_agent::builtin::INTERNAL_NAMES.into_iter().collect();
+    assert_eq!(
+        resolved, declared,
+        "the roster declares internals this composition root does not resolve"
+    );
+}
+
+#[test]
+fn an_internal_pointed_at_another_provider_falls_back_and_says_why() {
+    // Given: an override naming a model under a provider whose credential this turn
+    // does not wire.
+    let (catalog, _) = catalog_with_two_models_and_a_title_override();
+    let config: oc_config::schema::Config =
+        serde_json::from_str(r#"{"agent":{"summary":{"model":"elsewhere/some-model"}}}"#)
+            .expect("config");
+    let session_model = catalog.model("test", "big").expect("the session model");
+    let mut notes = Vec::new();
+
+    let internals = resolve_internals(&config, &catalog, "test", "big", session_model, &mut notes)
+        .expect("a declined override is not a failure");
+
+    assert_eq!(internals.summary.model.model_id, "big");
+    assert!(
+        notes.iter().any(|note| note.contains("summary")),
+        "the downgrade was silent; notes: {notes:?}"
+    );
+}
+
+#[test]
+fn a_catalog_limit_that_is_absent_or_negative_reads_as_no_window() {
+    assert_eq!(token_count(200_000.0), 200_000);
+    assert_eq!(token_count(0.0), 0);
+    assert_eq!(token_count(-1.0), 0);
+    assert_eq!(token_count(f64::NAN), 0);
+    assert_eq!(token_count(f64::INFINITY), 0);
 }
 
 /// Neither surface may compose a turn of its own.

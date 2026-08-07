@@ -551,7 +551,7 @@ mod tests {
     }
 
     async fn force_compaction(
-        connection: &Connection,
+        connection: &mut Connection,
         provider: &SummaryProvider,
         state: &mut CompactionState,
         tracker: &mut CacheTracker,
@@ -613,14 +613,14 @@ mod tests {
             transcript_entry("recent-user", Role::User, "recent request", 5),
             transcript_entry("recent-assistant", Role::Assistant, "recent answer", 5),
         ];
-        let connection = seeded_connection();
+        let mut connection = seeded_connection();
         let provider = SummaryProvider::new(&["first anchored summary", "second anchored summary"]);
         let mut state = CompactionState::default();
         let mut tracker = CacheTracker::new();
         let mut tools = LockedTools::new();
 
         let first = force_compaction(
-            &connection,
+            &mut connection,
             &provider,
             &mut state,
             &mut tracker,
@@ -633,7 +633,7 @@ mod tests {
 
         let second_entries = entries_from_messages(&first);
         let second = force_compaction(
-            &connection,
+            &mut connection,
             &provider,
             &mut state,
             &mut tracker,

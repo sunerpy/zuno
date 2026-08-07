@@ -35,6 +35,18 @@ use oc_testkit::{MockProvider, Scenario, ScriptedEnv};
 /// The recorded conversation, chosen because todo 88's harness replays the same one.
 const CASSETTE: &str = "openai-chat/drives-a-tool-loop-end-to-end";
 
+/// The tool-free text completion that answers the prelude's title request.
+///
+/// The harness's own prelude recording (`crates/oc-testkit/src/perf/workload.rs:93`).
+/// Since todo 106 a new session generates its title before its first real turn, so the
+/// interactive surface opens with the same single tool-free request the harness counts
+/// as `PRELUDE_REQUESTS`.
+const TITLE_CASSETTE: &str = "openai-chat/streams-text";
+
+/// One prelude request plus the two a tool turn takes, which is what the frozen
+/// `completed_tool_turns(captured) = (captured - 1) / 2` scores as exactly one turn.
+const REQUESTS_FOR_ONE_TOOL_TURN: usize = 3;
+
 /// The prompt the frozen harness submits, verbatim.
 const PROMPT: &str = "Use get_weather for Paris.";
 
@@ -302,6 +314,8 @@ fn run_under_pty(
 async fn one_turn_through(submission: Submission) {
     let env = ScriptedEnv::new().expect("isolated environment");
     let scenario = Scenario::new("recorded-tool-loop")
+        .from_oracle_cassette(TITLE_CASSETTE)
+        .expect("the recorded text completion loads")
         .from_oracle_cassette(CASSETTE)
         .expect("the recorded tool loop loads");
     let provider = MockProvider::start(vec![scenario])
@@ -331,7 +345,16 @@ async fn one_turn_through(submission: Submission) {
          captured; the prompt never reached a turn\ntranscript:\n{}",
         transcript.text
     );
-    let first = captured[0].json().expect("the first request is JSON");
+    let prelude = captured[0].json().expect("the prelude request is JSON");
+    assert!(
+        prelude
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|tools| tools.is_empty()),
+        "the interactive surface's prelude offered tools, but the title agent denies \
+         every one of them:\n{prelude:#}"
+    );
+    let first = captured[1].json().expect("the first turn request is JSON");
     assert!(
         first
             .get("tools")
@@ -342,8 +365,9 @@ async fn one_turn_through(submission: Submission) {
     );
     assert_eq!(
         captured.len(),
-        2,
-        "the turn did not send a second request, so the tool result never went back"
+        REQUESTS_FOR_ONE_TOOL_TURN,
+        "the interactive surface must produce the same one-prelude-plus-two shape the \
+         headless one does, so the frozen perf gate scores its turn as completed"
     );
     assert!(
         transcript.saw_wanted,

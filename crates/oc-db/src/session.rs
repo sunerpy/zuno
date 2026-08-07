@@ -702,6 +702,63 @@ pub fn touch_at(transaction: &Transaction<'_>, id: &str, millis: i64) -> Result<
     Ok(millis)
 }
 
+/// Replace a session's title, returning the millisecond it was updated at.
+///
+/// Separate from [`touch_at`] rather than folded into a general `patch` because
+/// the title is the only session column a *model* writes: the engine's `title`
+/// internal generates one from the first exchange, and upstream's own writer is
+/// likewise a one-column update (`session.ts:755-757`). Keeping it one column wide
+/// means a title write can never clobber a field the turn is concurrently changing.
+///
+/// # Errors
+///
+/// [`DbError::NotFound`] when no row has that id. [`DbError::Query`] if the clock
+/// or the update fails.
+pub fn set_title(transaction: &Transaction<'_>, id: &str, title: &str) -> Result<i64, DbError> {
+    let now = unix_milliseconds()?;
+    let updated = transaction
+        .execute(
+            "UPDATE session SET title = ?2, time_updated = ?3 WHERE id = ?1",
+            params![id, title, now],
+        )
+        .map_err(open::map_error)?;
+    if updated == 0 {
+        return Err(DbError::NotFound {
+            table: TABLE.to_owned(),
+            id: id.to_owned(),
+        });
+    }
+    Ok(now)
+}
+
+/// Whether `title` is still the one [`create`] invented, and so may be replaced.
+///
+/// Lives next to [`SessionCreate::default_title_prefix`] for the same reason
+/// [`crate::message::created_after`] lives next to the `ORDER BY` it escapes: the
+/// predicate is only correct for exactly the strings that function produces, and a
+/// reader who changes one has to see the other.
+///
+/// Upstream tests the two prefixes followed by an ISO-8601 instant
+/// (`session.ts:51-55`). This accepts the prefix with *any* suffix, and also the
+/// bare prefix with its trailing separator trimmed, because this port's own
+/// [`create`] callers have written `"New session"` with no timestamp. Being laxer
+/// only ever means a generated title replaces a placeholder; being stricter would
+/// mean a session the user never named stays unnamed forever, which is the failure
+/// the `title` internal exists to prevent.
+#[must_use]
+pub fn is_default_title(title: &str) -> bool {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    [PARENT_TITLE_PREFIX, CHILD_TITLE_PREFIX]
+        .iter()
+        .any(|prefix| {
+            trimmed.starts_with(prefix)
+                || trimmed == prefix.trim_end().trim_end_matches('-').trim_end()
+        })
+}
+
 /// List sessions in one of the three scopes.
 ///
 /// Ordering is `<sort column> DESC, id DESC` by default — `listGlobal`'s

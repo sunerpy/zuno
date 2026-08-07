@@ -4,6 +4,7 @@ pub mod compaction;
 pub mod dispatch;
 pub mod interrupt;
 pub mod r#loop;
+pub mod prelude;
 pub mod retry;
 pub mod status;
 pub mod stream;

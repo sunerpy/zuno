@@ -586,6 +586,7 @@ pub async fn run_turn(
                 .await?;
         }
 
+        let retained = retained_history(&history);
         let requested = requested_turn(&request.session_id, &history)?;
         let agent = context
             .resolver
@@ -628,7 +629,7 @@ pub async fn run_turn(
             .resolve(model.provider.clone())
             .map_err(ProviderError::from)?;
         let capabilities = provider.capabilities();
-        let stable_history = provider_messages(&agent.system_prompt, &history);
+        let stable_history = provider_messages(&agent.system_prompt, retained);
         let mut assistant = assistant_message(
             &request, &session, &requested, &agent, &model, step, &history,
         )?;
@@ -838,7 +839,7 @@ fn requested_turn(
     let user = history
         .iter()
         .rev()
-        .find(|message| message.info.role == MessageRole::User)
+        .find(|message| message.info.role == MessageRole::User && !is_compaction_marker(message))
         .ok_or_else(|| TurnError::NoUserMessage {
             session_id: session_id.to_owned(),
         })?;
@@ -919,15 +920,140 @@ fn repair_missing_tool_outputs(
     Ok(repaired)
 }
 
-fn provider_messages(system_prompt: &str, history: &[MessageWithParts]) -> Vec<Message> {
-    let mut messages = vec![Message::new(Role::System, system_prompt)];
+/// One provider-bound message, and the stored message it was projected from.
+///
+/// The provenance is here because compaction needs it: its boundary is expressed as
+/// a *stored* message id (`tail_start_id`), while its token budget is measured over
+/// *projected* messages, and one stored assistant message projects to two — the
+/// assistant turn and the `tool` turn carrying its results. Carrying the id through
+/// is what lets [`retained_history`] and
+/// [`crate::prelude::transcript`] agree about where the tail starts; deriving it
+/// twice is how they would come to disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectedMessage {
+    /// The stored message this was projected from, absent for the system prompt.
+    pub message_id: Option<String>,
+    /// The message as the provider will receive it.
+    pub message: Message,
+}
+
+/// Project stored history into the exact message list a request carries.
+///
+/// The single projection. A caller that wants only the messages uses
+/// [`provider_messages`]; a caller that has to reason about *which* stored message
+/// produced one uses this. Two projections would be free to drift, and the one that
+/// drifted would be the one compaction measured.
+#[must_use]
+pub fn project_history(system_prompt: &str, history: &[MessageWithParts]) -> Vec<ProjectedMessage> {
+    let mut projected = vec![ProjectedMessage {
+        message_id: None,
+        message: Message::new(Role::System, system_prompt),
+    }];
     for message in history {
+        let mut messages = Vec::new();
         match message.info.role {
             MessageRole::User => append_user_message(&mut messages, message),
             MessageRole::Assistant => append_assistant_message(&mut messages, message),
         }
+        projected.extend(messages.into_iter().map(|projection| ProjectedMessage {
+            message_id: Some(message.info.id.clone()),
+            message: projection,
+        }));
     }
-    messages
+    projected
+}
+
+fn provider_messages(system_prompt: &str, history: &[MessageWithParts]) -> Vec<Message> {
+    project_history(system_prompt, history)
+        .into_iter()
+        .map(|projected| projected.message)
+        .collect()
+}
+
+/// The suffix of `history` a request may carry, honouring the newest compaction.
+///
+/// A compaction attempt writes three things: a marker user message naming the stored
+/// id its verbatim tail starts at, an assistant summary message, and — on success —
+/// the summary text. All three sort *after* the tail, because they are stamped when
+/// the attempt runs. So honouring a compaction is not a rewrite: it is dropping
+/// every stored message before the tail. The marker itself projects to nothing
+/// (`compaction` is not a request-bearing part kind) and the summary projects to the
+/// assistant text message [`crate::compaction::run_compaction`] returns, so the
+/// resulting request is exactly that function's `messages` without either being
+/// reconstructed here.
+///
+/// # Why a failed attempt is ignored rather than honoured
+///
+/// A failed attempt persists the marker *and* an errored summary carrying no text.
+/// Honouring that marker would drop the history and substitute nothing, silently
+/// sending the model a conversation that starts mid-thought — the worst available
+/// outcome, and indistinguishable from a working compaction from the outside. So a
+/// marker only takes effect once its paired summary carries text and no error, and
+/// an unrecognised or dangling `tail_start_id` leaves the full history in place.
+/// Retaining too much costs tokens; retaining too little loses the conversation.
+#[must_use]
+pub fn retained_history(history: &[MessageWithParts]) -> &[MessageWithParts] {
+    let Some((marker_index, tail_start_id)) = history
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, message)| compaction_tail_start(message).map(|tail| (index, tail)))
+    else {
+        return history;
+    };
+    if !compaction_summary_succeeded(history, &history[marker_index].info.id) {
+        return history;
+    }
+    history
+        .iter()
+        .position(|message| message.info.id == tail_start_id)
+        .map_or(history, |tail_index| &history[tail_index..])
+}
+
+fn compaction_tail_start(message: &MessageWithParts) -> Option<String> {
+    message
+        .parts
+        .iter()
+        .filter(|part| part.kind == PartKind::Compaction)
+        .find_map(|part| {
+            part.data
+                .get("tail_start_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+}
+
+fn compaction_summary_succeeded(history: &[MessageWithParts], marker_id: &str) -> bool {
+    history
+        .iter()
+        .filter(|message| {
+            message.info.data.get("parentID").and_then(Value::as_str) == Some(marker_id)
+        })
+        .any(|summary| {
+            !summary.info.data.contains_key("error")
+                && summary.parts.iter().any(|part| {
+                    part.kind == PartKind::Text
+                        && part
+                            .data
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| !text.trim().is_empty())
+                })
+        })
+}
+
+/// Whether a stored user message records a compaction rather than a user's turn.
+///
+/// [`crate::compaction::run_compaction`] files its marker under the `user` role so
+/// the transcript reads in order, but it is a machine's bookkeeping: its model is the
+/// small summarising model, and answering it would run the turn on that model instead
+/// of the one the user chose.
+fn is_compaction_marker(message: &MessageWithParts) -> bool {
+    !message.parts.is_empty()
+        && message
+            .parts
+            .iter()
+            .all(|part| part.kind == PartKind::Compaction)
 }
 
 fn append_user_message(messages: &mut Vec<Message>, message: &MessageWithParts) {
