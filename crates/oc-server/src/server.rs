@@ -15,11 +15,13 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
+use oc_db::session_prune::SessionPruneProgress;
 use oc_engine::r#loop::TurnEvent;
 use oc_engine::status::SessionRunRegistry;
 use tokio::net::{TcpListener, lookup_host};
 
 use crate::auth::WWW_AUTHENTICATE_VALUE;
+use crate::discovery::{self, LocalServerRegistration};
 use crate::{AuthConfig, EventFanout};
 
 /// Bind, middleware, and fan-out settings.
@@ -104,6 +106,8 @@ pub struct ServerServices {
     pub runs: SessionRunRegistry,
     /// Bounded per-connection destination for engine transitions.
     pub events: EventFanout<TurnEvent>,
+    /// Bounded destination for session-maintenance progress.
+    pub maintenance_events: EventFanout<SessionPruneProgress>,
 }
 
 impl ServerServices {
@@ -113,6 +117,7 @@ impl ServerServices {
         Self {
             runs: SessionRunRegistry::new(),
             events: EventFanout::with_capacity(event_capacity),
+            maintenance_events: EventFanout::with_capacity(event_capacity),
         }
     }
 }
@@ -185,11 +190,14 @@ impl ServerBuilder {
         let local_addr = listener
             .local_addr()
             .map_err(|source| ServerError::LocalAddress { source })?;
+        let registration =
+            discovery::register(local_addr).map_err(|source| ServerError::Discovery { source })?;
         let router = self.router();
         Ok(BoundServer {
             listener,
             router,
             local_addr,
+            _registration: registration,
         })
     }
 }
@@ -209,6 +217,7 @@ pub struct BoundServer {
     listener: TcpListener,
     router: Router,
     local_addr: SocketAddr,
+    _registration: Option<LocalServerRegistration>,
 }
 
 impl BoundServer {
@@ -264,6 +273,12 @@ pub enum ServerError {
     /// The socket bound but its actual ephemeral address could not be read.
     #[error("could not read the bound HTTP listener address: {source}")]
     LocalAddress {
+        #[source]
+        source: std::io::Error,
+    },
+    /// The listener bound but could not publish its loopback discovery record.
+    #[error("could not register the local HTTP server for maintenance discovery: {source}")]
+    Discovery {
         #[source]
         source: std::io::Error,
     },

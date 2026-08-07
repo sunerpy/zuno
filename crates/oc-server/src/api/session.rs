@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
+
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use oc_db::session::{ListQuery, Session, SessionCreate, SortDirection};
 use oc_paths::GLOBAL_PROJECT_ID;
 use schemars::JsonSchema;
@@ -9,6 +11,7 @@ use uuid::Uuid;
 use super::Data;
 use super::error::ApiError;
 use super::state::ApiState;
+use crate::ServerServices;
 
 #[derive(Debug, Deserialize)]
 pub struct SessionListQuery {
@@ -84,6 +87,20 @@ pub struct SessionListResponse {
     pub data: Vec<SessionInfo>,
     pub cursor: SessionCursor,
 }
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SessionActive {
+    #[serde(rename = "type")]
+    pub kind: SessionActiveKind,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionActiveKind {
+    Running,
+}
+
+pub type SessionActiveResponse = Data<BTreeMap<String, SessionActive>>;
 
 impl From<Session> for SessionInfo {
     fn from(session: Session) -> Self {
@@ -183,6 +200,23 @@ pub async fn create(
     create.agent = input.agent;
     let session = state.sessions().create(&create)?.into_session();
     Ok(Json(Data::new(SessionInfo::from(session))))
+}
+
+pub async fn active(Extension(services): Extension<ServerServices>) -> Json<SessionActiveResponse> {
+    let data = services
+        .runs
+        .active_sessions()
+        .into_iter()
+        .map(|session_id| {
+            (
+                session_id,
+                SessionActive {
+                    kind: SessionActiveKind::Running,
+                },
+            )
+        })
+        .collect();
+    Json(Data::new(data))
 }
 
 pub async fn get(

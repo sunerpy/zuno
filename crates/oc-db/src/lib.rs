@@ -54,6 +54,7 @@ pub mod retention;
 pub mod schema;
 pub mod session;
 pub mod session_list;
+pub mod session_prune;
 pub mod vacuum;
 
 pub use crate::open::{

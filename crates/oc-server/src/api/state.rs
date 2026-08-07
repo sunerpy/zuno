@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use oc_db::Pool;
+use oc_db::artifact_gc::ArtifactGcPaths;
 use oc_db::session::Store;
 use oc_error::DbError;
 use oc_paths::{DbLocation, GLOBAL_PROJECT_ID};
@@ -11,6 +12,7 @@ pub struct ApiState {
     pool: Arc<Pool>,
     pty: PtyService,
     directory: Arc<str>,
+    artifact_paths: ArtifactGcPaths,
 }
 
 impl ApiState {
@@ -19,7 +21,16 @@ impl ApiState {
     /// # Errors
     /// Returns the classified database failure when opening or seeding fails.
     pub fn memory(directory: impl Into<String>) -> Result<Self, DbError> {
-        Self::initialize(Pool::open(&DbLocation::Memory)?, directory.into())
+        let directory = directory.into();
+        let artifact_root = std::env::temp_dir().join(format!(
+            "opencode-rust-api-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        Self::initialize(
+            Pool::open(&DbLocation::Memory)?,
+            directory,
+            ArtifactGcPaths::from_data_root(&artifact_root),
+        )
     }
 
     /// Opens the process database and installs the current API services.
@@ -27,10 +38,30 @@ impl ApiState {
     /// # Errors
     /// Returns the classified database failure when opening or migrating fails.
     pub fn open_default(directory: impl Into<String>) -> Result<Self, DbError> {
-        Self::initialize(Pool::open_default()?, directory.into())
+        Self::initialize(
+            Pool::open_default()?,
+            directory.into(),
+            ArtifactGcPaths::in_layout(oc_paths::global()),
+        )
     }
 
-    fn initialize(pool: Pool, directory: String) -> Result<Self, DbError> {
+    /// Creates API state from caller-owned database and artifact storage.
+    ///
+    /// # Errors
+    /// Returns the classified database failure when migration or project seeding fails.
+    pub fn from_pool(
+        pool: Pool,
+        directory: impl Into<String>,
+        artifact_paths: ArtifactGcPaths,
+    ) -> Result<Self, DbError> {
+        Self::initialize(pool, directory.into(), artifact_paths)
+    }
+
+    fn initialize(
+        pool: Pool,
+        directory: String,
+        artifact_paths: ArtifactGcPaths,
+    ) -> Result<Self, DbError> {
         {
             let mut connection = pool.get()?;
             oc_db::migration::apply(&mut connection)?;
@@ -46,6 +77,7 @@ impl ApiState {
             pty: PtyService::new(&directory),
             directory: Arc::from(directory),
             pool: Arc::new(pool),
+            artifact_paths,
         })
     }
 
@@ -62,5 +94,13 @@ impl ApiState {
     #[must_use]
     pub fn directory(&self) -> &str {
         &self.directory
+    }
+
+    pub(super) fn pool(&self) -> &Pool {
+        &self.pool
+    }
+
+    pub(super) fn artifact_paths(&self) -> &ArtifactGcPaths {
+        &self.artifact_paths
     }
 }

@@ -51,6 +51,8 @@ pub const OPERATIONS: &[(&str, &str)] = &[
     ),
     ("/api/session", "get"),
     ("/api/session", "post"),
+    ("/api/session/prune", "get"),
+    ("/api/session/prune", "post"),
     ("/api/session/active", "get"),
     ("/api/session/{sessionID}", "get"),
     ("/api/session/{sessionID}/agent", "post"),
@@ -96,7 +98,10 @@ pub fn document() -> Value {
             "schemas": {
                 "Session": schemars::schema_for!(super::session::SessionInfo),
                 "SessionCreate": schemars::schema_for!(super::session::CreateSessionBody),
-                "SessionListResponse": schemars::schema_for!(super::session::SessionListResponse)
+                "SessionListResponse": schemars::schema_for!(super::session::SessionListResponse),
+                "SessionActive": schemars::schema_for!(super::session::SessionActive),
+                "SessionActiveResponse": schemars::schema_for!(super::session::SessionActiveResponse),
+                "SessionPruneMutation": schemars::schema_for!(super::maintenance::MutationBody)
             }
         }
     })

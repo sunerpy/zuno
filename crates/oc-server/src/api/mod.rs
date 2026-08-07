@@ -1,4 +1,5 @@
 mod error;
+mod maintenance;
 mod openapi;
 mod pty;
 mod session;
@@ -39,6 +40,11 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/health", get(health))
         .route("/api/location", get(location))
         .route("/api/session", get(session::list).post(session::create))
+        .route("/api/session/active", get(session::active))
+        .route(
+            "/api/session/prune",
+            get(maintenance::preview).post(maintenance::mutate),
+        )
         .route("/api/session/{sessionID}", get(session::get))
         .route("/api/pty", get(pty::list).post(pty::create))
         .route(
@@ -136,7 +142,6 @@ fn unsupported_routes() -> Router<ApiState> {
             "/api/session/{sessionID}/question/{requestID}/reject",
             post(unsupported),
         )
-        .route("/api/session/active", get(unsupported))
         .route("/api/session/{sessionID}/agent", post(unsupported))
         .route("/api/session/{sessionID}/model", post(unsupported))
         .route("/api/session/{sessionID}/prompt", post(unsupported))
