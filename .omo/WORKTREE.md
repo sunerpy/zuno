@@ -736,3 +736,50 @@ It also ruled the channel-DB filename **faithful behaviour, not a divergence** �
 `opencode-local.db` versus an installed release's `opencode.db` mirrors
 `database.ts:45-55` exactly. Recorded as a known gap because it presents as a parity bug
 the first time anyone tries it; todo 92 owns documenting it.
+
+## Wave 20 (2026-08-07): the integration gap, and todo 104
+
+`main` = 3024 tests, 98/103 done (104 added mid-flight).
+
+### Todo 88 refused to run, and it was right
+
+The memory-gate task investigated, found it could not measure anything honestly, and
+**stopped without producing a number**. I verified all five claims:
+
+| claim | verified at |
+|---|---|
+| no `tui` command registered | `oc-cli/src/command.rs` — grep returns nothing |
+| `run --auto` refused | `oc-cli/src/cmd/run.rs:186` |
+| headless `run` had **no tools** | `oc-cli/src/cmd/run.rs:126` — `ToolRegistryDispatcher::new(Vec::new(), Vec::new(), AllowAll, …)` |
+| server could not prompt | `oc-server/src/api/mod.rs:147` — `post(unsupported)` |
+| `App::run()` never called | `oc-tui/src/app.rs:574` |
+
+**The binary could not execute a turn in which a model calls a tool** — invisible to
+3,009 passing tests, because every todo tested its own piece and none owned the seam.
+
+Todo 104 was created and closed it. It also found a **sixth** gap nobody had spotted:
+`CompletionRequest` had **no `tools` field at all**, so no provider could have been
+offered a tool regardless of the dispatcher. Its doc comment for the new field is the
+right reasoning: *"a provider that held its own tool list could answer with a call the
+loop would then refuse."*
+
+Both of my mutations bit: reverting the dispatcher to `Vec::new()` failed 2 of 3
+tool-turn tests; blanking `tools:` in `completion_request` failed the offer test
+specifically. And `crates/oc-cli/tests/tool_turn.rs` now drives the **real binary**
+against a loopback `MockProvider`, asserting the written file's contents, that the
+provider was called twice, and that the tool result went back in the second request.
+
+**This is the third instance of one structural failure** — wave 11's `/api/event` gap,
+wave 17's 4.19 GB prune, and now tool execution. Rule, recorded in `issues.md`:
+*a plan decomposed into per-file todos produces per-file correctness and says nothing
+about the seams. Every seam needs an owner.* Todo 62 is the only seam in this plan that
+got a dedicated todo, and it is the only one that was right first time.
+
+### In flight
+
+| todo | crate | session |
+|---|---|---|
+| 88 | `oc-testkit/tests/memory.rs` (G1/G2), resumed post-104 | `ses_023acd04cffeoOaA4rLTutn9hG` |
+| 91 | `.github/` + `Makefile` + packaging | (dispatching) |
+
+Remaining after: **89, 90, 92, 103** = 4, then F1-F4.
