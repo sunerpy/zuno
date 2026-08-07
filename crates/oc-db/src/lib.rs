@@ -48,6 +48,7 @@ pub mod message;
 pub mod migration;
 pub mod open;
 pub mod pool;
+pub mod retention;
 pub mod schema;
 pub mod session;
 pub mod session_list;
