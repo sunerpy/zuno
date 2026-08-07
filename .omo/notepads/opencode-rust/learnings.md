@@ -5561,3 +5561,58 @@ the Rust W-real launch emitted zero provider requests. Because the frozen runner
 writes a report only after all five repetitions, there is no valid Rust median and
 therefore no numerical G1/G2 verdict to report. The useful result is the blocked
 boundary and its durable evidence, not a ratio reconstructed from incomplete logs.
+
+## [2026-08-07] Task 109: `api` is a shape hint, `options` is where the endpoint lives
+
+Upstream keeps two different questions in two different places, and conflating them
+is what made a documented provider config undialable. `model.api` is an **SDK-shape
+hint** — `provider.ts:230-232` reads `api.endpoint` to pick `sdk.responses` vs
+`sdk.chat`, `:368` reads `api.npm` to pick a factory — and its `url` field is only
+the catalog merge's own rung (`:1455`). The URL the SDK is actually constructed with
+is chosen later, in `resolveSDK` (`:1698-1700`), where the **provider's** option bag
+wins: `options.baseURL`, when a non-empty string, beats `model.api.url`. The bedrock
+loader (`:355-358`) adds the second spelling: `options.endpoint ?? options.baseURL`.
+
+Our `model_spec` read `model.api.url` and nothing else, so a provider carrying its
+endpoint in `provider.<id>.options.baseURL` — the shape every upstream doc page
+shows, and the shape todo 88's frozen workload emits — reached the transport with no
+endpoint at all and was declined before a socket was opened. Full ladder now:
+`options.endpoint` → `options.baseURL` → `model.api.url`, each rung tested non-empty.
+
+**Where a precedence lives matters as much as what it is.** Resolving this during the
+catalog merge (writing the option into `ResolvedModel.api.url`) was the tempting fix
+and it is wrong twice: `api.url` is a *printed* field (`models.rs:151`, `opencode
+models --verbose`), so rewriting it makes our catalog output diverge from the
+oracle's for the same input; and it leaves `model_spec` still reading `api.url`, i.e.
+two readers of "where do I dial?" that can disagree. Resolved at spec construction
+instead, so `Spec::base_url` is the single answer.
+
+**An endpoint is a URL, not an SDK parameter.** `model_spec` forwards every
+`model.options` entry via `with_option`; `endpoint`/`baseURL` are now skipped there.
+They would have been *inert* today, because `Spec::options` is read by allow-listed
+key only — and inert-today is exactly how a body field named after a URL survives
+until someone widens that read.
+
+**Fixtures fail in both directions.** Blocker #6 was a fixture supplying something
+real input lacks (a top-level `api`). Fixing it exposed the mirror image three tests
+down: `catalog_with_two_models_and_a_title_override()` **omitted** something real
+input must have — any endpoint at all — so it described a provider no turn could run
+against, and building a `base_url: None` spec from it passed unnoticed for waves.
+Ask both questions of a fixture: what does it add that reality does not, and what
+does it leave out that reality always has?
+
+**Mutation-test the test, not just the fix.** Four mutations were tried; three were
+caught immediately. The fourth — deleting the option-bag exclusion — was **not**,
+because the test planted `baseURL` in the *provider's* options while the code
+iterates the *model's*. It passed vacuously and would have shipped. A test that
+never fails when its target is broken is worse than no test, because it is counted.
+
+**Two adjacent gaps found, deliberately left (each needs its own todo).**
+(1) `${VAR}` placeholders in a base URL are never expanded, though
+`catalog/resolved.rs:85` documents them and upstream expands them at `:1701-1716`; an
+azure-shaped catalog URL reaches the transport with a literal `${...}` in it.
+(2) **Provider**-level options are never forwarded to the transport at all — only
+model-level ones are — although upstream hands `{ ...provider.options }` to the SDK
+(`:1673`). So provider-level `useCompletionUrls`, `timeout`, `headerTimeout`,
+`chunkTimeout`, `setCacheKey` are silently inert here even where `Spec::options`
+readers for them exist (`oc-provider-compatible/src/surface.rs:306`, `quirks.rs:148`).

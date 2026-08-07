@@ -5940,3 +5940,49 @@ Resume criterion: a separately owned fix must make the exact frozen
 `provider.options.baseURL` configuration produce a captured provider request. After
 that, rerun the unchanged release-vs-release harness; only the resulting complete
 reports may produce and publish G1/G2 medians and ratios.
+
+## [2026-08-07] Task 109: the provider endpoint precedence resolves at spec construction, not in the catalog merge
+
+**Decision.** `options.endpoint` → `options.baseURL` → `model.api.url` is resolved in
+`crates/oc-cli/src/cmd/turn.rs::provider_endpoint`, read by `model_spec`, at the
+moment a `Spec` is built. It is **not** resolved in
+`crates/oc-llm/src/catalog/merge.rs`, and `ResolvedModel.api.url` keeps exactly the
+value upstream's `:1455` ladder gives it.
+
+**Why not the merge.** Two reasons, and either alone is sufficient.
+`ResolvedModel.api.url` is a *printed* field — `cmd/models.rs:151` renders it for
+`opencode models --verbose`, whose output is a port of upstream's — so writing a
+provider option into it would make our catalog disagree with the oracle's for
+identical input: a visible divergence introduced to fix an invisible one. And it
+would not remove the second reader: `model_spec` would still consult `api.url`, so
+"where do I dial?" would have two answerers that can drift. Resolving at construction
+leaves `Spec::base_url` as the only answer, computed in one function.
+
+**Why the catalog rung is kept last, not dropped.** This is added precedence. A
+genuine models.dev catalog supplies `api` per provider, and a config's top-level
+`api`/`provider.api` still feeds it. Dropping it would break every provider that has
+no `options` block at all.
+
+**Endpoint keys are excluded from `Spec::options`.** `model_spec` forwards
+`model.options` to the SDK bag; `endpoint` and `baseURL` are skipped, because they
+are a URL and they already travel as `Spec::base_url`. Pinned by a test that also
+asserts non-endpoint options still come through, so the exclusion cannot silently
+become a filter that eats configuration.
+
+**A missing endpoint is fatal at plan time, not at request time.** `model_spec`
+returns `Err` naming `provider.<id>.options.baseURL`. Previously the transport
+answered `IncompleteConfiguration` and the user saw `unrecoverable provider failure
+(status=None)` after a whole turn had been composed — a message naming nothing.
+
+**Exception: an internal agent's own unreachable model is declined, not fatal.** A
+per-model `provider.api` can leave one model in a provider without an endpoint while
+the session's model has one. `resolve_internals` pushes a note and falls back to the
+session model, matching the idiom it already uses for cross-provider and
+unsupported-transport overrides. Losing a whole turn because a title agent is
+unreachable is the worse failure.
+
+**Both seam tests now carry the endpoint only in `options.baseURL`.** The top-level
+`api` key they used to send was the same URL by another name and was the defect's
+camouflage; each file now documents why it must not come back. No workload or perf
+fixture was taught to emit `api` — todo 88 refused that crutch and this change makes
+it unnecessary rather than tolerable.
