@@ -4496,3 +4496,61 @@ form. Temporarily relocating the Task 87 worktree left a previously compiled tes
 the source was correct. Restoring the worktree to
 `/config/workspace/ProdDir/AI/oc-wt/t87` and rerunning the same gates passed. This was an
 artifact-location failure, not a product or provider-decoder defect.
+
+## [2026-08-07] BLOCKER, verified: the binary cannot execute a turn with tools
+
+Todo 88 (G1/G2 memory gates) reported itself blocked rather than fabricating a
+measurement. **I verified all five of its claims myself and every one is accurate.**
+This is the most important finding in the project so far, and it is invisible to the
+3,009 passing tests.
+
+| claim | verified at | fact |
+|---|---|---|
+| no TUI command registered | `oc-cli/src/command.rs` | `grep -nE "Tui\|tui"` returns **nothing** |
+| `run --auto`/`--interactive` refused | `oc-cli/src/cmd/run.rs:186` | `"--interactive and --auto require the TUI loop and are not available in headless run"` |
+| headless `run` has **no tools** | `oc-cli/src/cmd/run.rs:126` | `ToolRegistryDispatcher::new(Vec::new(), Vec::new(), ...)` |
+| server cannot prompt | `oc-server/src/api/mod.rs:147` | `.route("/api/session/{sessionID}/prompt", post(unsupported))` |
+| `oc-tui` never booted | `oc-tui/src/app.rs:574` | `App::run()` exists; **nothing calls it** |
+
+So there is no executable path — CLI or HTTP — that runs a turn in which a model calls
+a tool. The frozen `W-idle`/`W-real` workloads cannot be run against the Rust binary,
+which is why G1/G2 are unmeasurable rather than failing.
+
+### Why 97 completed todos did not catch this
+
+Every todo built its piece and tested that piece. **Nobody owned the wiring.** Todo 44
+assembled the registry with conditional exposure and 10 tests; todo 56 built `run` and
+passes it *two empty vectors*. Both are green. Todo 73 built the terminal lifecycle and
+event loop with 114 tests; todo 76 added 253 more for the views; no todo registers a
+`tui` command. Todo 52 declared the prompt route and left it `unsupported` as a seam;
+no todo closed it.
+
+This is the **third** instance of the same structural failure in this project, and by
+far the most consequential:
+
+1. Wave 11 — the event stream served `/event` but not `/api/event`, because todo 52 was
+   told to leave it to todo 53 and todo 53 tested its router in isolation.
+2. Wave 17 — `session prune` proposed deleting 4.19 GB because todo 83's reference count
+   could not see the sessions in another channel's database.
+3. Now — the agent cannot use a tool, because the registry and the runner were built by
+   different tasks and never joined.
+
+**The rule, stated as generally as it deserves: a plan decomposed into per-file todos
+produces per-file correctness and says nothing about the seams. Every seam needs an
+owner, and "integration" is not a phase you can leave to the end — todo 62 proved the
+three plugin tiers coexist precisely because someone was told to, and that is the only
+seam in this project that got a dedicated todo.**
+
+### What it does not mean
+
+The crates are not wasted. `run_turn` is real and mutation-tested (wave 6: changing one
+emitted field breaks the event-sequence test; 5000 deltas still produce 2 DB writes).
+The registry resolves tool sets that match the real binary for five model/flag
+combinations. The pieces work; the assembly is missing.
+
+### Owed work
+
+Wiring, then 88 resumes. It is small and mechanical: pass todo 44's assembled registry
+into `run`'s dispatcher, register a `tui` command that calls `App::run()`, and implement
+the prompt route over the same `run_turn`. None of it is new design — every part exists
+and is tested.
