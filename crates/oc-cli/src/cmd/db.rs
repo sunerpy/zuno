@@ -3,12 +3,16 @@ use std::io::{BufRead as _, IsTerminal as _, Write as _};
 use rusqlite::types::ValueRef;
 use serde_json::{Map, Number, Value};
 
+use super::db_maint;
 use crate::command::{DbArgs, DbFormat};
 
 pub(super) fn execute(args: &DbArgs) -> Result<(), String> {
     if args.query.as_deref() == Some("path") {
         println!("{}", oc_paths::db_path().as_oracle_string());
         return Ok(());
+    }
+    if let Some(command) = args.query.as_deref().and_then(db_maint::Maintenance::parse) {
+        return db_maint::execute(command, args.format);
     }
 
     let pool = oc_db::Pool::open_default().map_err(|error| error.to_string())?;

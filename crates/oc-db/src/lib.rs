@@ -53,6 +53,7 @@ pub mod retention;
 pub mod schema;
 pub mod session;
 pub mod session_list;
+pub mod vacuum;
 
 pub use crate::open::{
     BUSY_TIMEOUT_MS, CACHE_SIZE_KIB, FOREIGN_KEYS_ON, JOURNAL_MODE_MEMORY, JOURNAL_MODE_WAL,
@@ -61,4 +62,9 @@ pub use crate::open::{
     verify_pragmas,
 };
 pub use crate::pool::{DEFAULT_MAX_IDLE, Pool, PooledConnection};
+pub use crate::vacuum::{
+    Availability, DEFAULT_LARGEST_SESSIONS, DatabaseSize, DatabaseStats, DiskSpace, INTEGRITY_OK,
+    IntegrityReport, SystemDiskSpace, VacuumError, VacuumReport, database_size, integrity_check,
+    stats, vacuum,
+};
 pub use rusqlite::{Connection, Transaction, TransactionBehavior};
