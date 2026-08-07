@@ -4333,3 +4333,42 @@ hit the same lint.
 the lock at the exact version and feature `tempfile` needs, so it cost zero packages.
 Confirming the worktree note: `cargo search` is unusable (aliyun mirror replacement);
 `cargo add --dry-run` is the availability check, and it answers honestly for a miss.
+
+## [2026-08-07] `.omo/premerge.sh` under-counted: a doctest failure did not fail the gate
+
+Merging task-84 the gate printed `ok  2936 tests pass, 0 failing targets` while the
+same output also contained:
+
+```
+error[E0463]: can't find crate for `oc_engine`
+error: doctest failed, to rerun pass `-p oc-acp --doc`
+```
+
+**Root cause in my own tooling.** `premerge.sh` decides pass/fail from
+`grep -cE '^test result: FAILED'`. A doctest that fails to *compile* never emits a
+`test result:` line at all — it emits `error: doctest failed`. So the gate counted zero
+failing targets and merged.
+
+It was transient: three clean re-runs of `cargo test --workspace --offline` afterwards
+show **0 failing targets, 0 doctest errors, 0 E0463, 2965 passing**, and
+`cargo test -p oc-acp --doc` passes on its own. The likely cause is a stale
+`oc-engine` rlib mid-rebuild while another `cargo` held the lock — the same
+shared-target-directory family as the stale-artifact hazard already documented here.
+
+**The tooling bug is real regardless of this instance.** `premerge.sh` must also fail
+on:
+
+- `^error: doctest failed`
+- `^error\[E[0-9]+\]` outside a mutation run
+- `^error: could not compile`
+- `^error: test failed`
+
+A gate that only recognises one failure spelling will wave through every other
+spelling. Fix before the next merge; until then, read the gate's raw output rather
+than trusting its verdict.
+
+**The wider lesson**, and it is the same one this project keeps re-learning at a
+different level each time: *a check that can only detect one shape of failure is not a
+check.* Todo 101's five safety fixtures proved a disjunction rather than its terms;
+`cargo test <filter>` printing `0 passed; N filtered out` looks like a pass; and now a
+merge gate blind to compile-time test failures. Same bug, three altitudes.
