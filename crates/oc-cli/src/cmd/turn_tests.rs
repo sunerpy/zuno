@@ -73,6 +73,14 @@ fn stub_internals() -> Internals {
     }
 }
 
+/// Two models under one provider, with `title` overridden to the smaller one.
+///
+/// The provider carries an endpoint in `options.baseURL`. It has to: a provider with no
+/// endpoint in either place is one no turn could ever run against, and building specs
+/// from it was how a spec with no base URL used to pass unnoticed. This is the same
+/// lesson as the top-level `api` key the seam tests no longer send — a fixture must not
+/// be servable in ways the real input shape is not, and must not be unservable in ways
+/// it would not be either.
 fn catalog_with_two_models_and_a_title_override() -> (Catalog, oc_config::schema::Config) {
     let document = serde_json::from_str(
         r#"{"test":{"id":"test","name":"Test","env":[],"npm":"@ai-sdk/openai-compatible",
@@ -82,7 +90,8 @@ fn catalog_with_two_models_and_a_title_override() -> (Catalog, oc_config::schema
     )
     .expect("catalog document");
     let config = serde_json::from_str(
-        r#"{"provider":{"test":{}},"agent":{"title":{"model":"test/small"}}}"#,
+        r#"{"provider":{"test":{"options":{"baseURL":"https://gateway.test/v1"}}},
+             "agent":{"title":{"model":"test/small"}}}"#,
     )
     .expect("config");
     let catalog = Catalog::resolve(&document, &ResolveInput::new().with_config(&config));
@@ -362,6 +371,247 @@ fn an_internal_pointed_at_another_provider_falls_back_and_says_why() {
     assert!(
         notes.iter().any(|note| note.contains("summary")),
         "the downgrade was silent; notes: {notes:?}"
+    );
+}
+
+/// A catalog holding one provider whose endpoint is placed wherever the caller says.
+///
+/// `api` is the top-level provider key that feeds `model.api.url`; `endpoint` and
+/// `base_url` go into `provider.probe.options`.
+fn endpoint_catalog(api: Option<&str>, endpoint: Option<&str>, base_url: Option<&str>) -> Catalog {
+    let mut options = serde_json::Map::new();
+    if let Some(endpoint) = endpoint {
+        options.insert("endpoint".to_owned(), serde_json::json!(endpoint));
+    }
+    if let Some(base_url) = base_url {
+        options.insert("baseURL".to_owned(), serde_json::json!(base_url));
+    }
+    let mut provider = serde_json::Map::new();
+    provider.insert(
+        "npm".to_owned(),
+        serde_json::json!("@ai-sdk/openai-compatible"),
+    );
+    if let Some(api) = api {
+        provider.insert("api".to_owned(), serde_json::json!(api));
+    }
+    provider.insert("options".to_owned(), serde_json::Value::Object(options));
+    provider.insert(
+        "models".to_owned(),
+        serde_json::json!({"probe-model": {"id": "probe-model"}}),
+    );
+    let config: oc_config::schema::Config = serde_json::from_value(serde_json::json!({
+        "provider": {"probe": serde_json::Value::Object(provider)}
+    }))
+    .expect("config");
+    Catalog::resolve(
+        &oc_llm::catalog::models_dev::CatalogDocument::new(),
+        &ResolveInput::new().with_config(&config),
+    )
+}
+
+fn probe_spec(
+    api: Option<&str>,
+    endpoint: Option<&str>,
+    base_url: Option<&str>,
+) -> Result<Spec, String> {
+    let catalog = endpoint_catalog(api, endpoint, base_url);
+    let model = catalog
+        .model("probe", "probe-model")
+        .expect("the config declares the model");
+    model_spec(&catalog, model)
+}
+
+/// The whole ladder, rung by rung — `provider.ts:1698-1700` plus `:355-358`.
+///
+/// Each case gives the winning rung a distinct URL, so a reordering changes the
+/// asserted value rather than merely changing which of two identical URLs was used.
+/// The first case is the defect: `options.baseURL` alone, the shape the upstream docs
+/// show, which reached the transport with no endpoint at all.
+#[test]
+fn the_endpoint_comes_from_options_before_the_catalog() {
+    let cases = [
+        (
+            (None, None, Some("https://from-base-url/v1")),
+            "https://from-base-url/v1",
+            "`options.baseURL` alone must be the endpoint",
+        ),
+        (
+            (None, Some("https://from-endpoint/v1"), None),
+            "https://from-endpoint/v1",
+            "`options.endpoint` alone must be the endpoint",
+        ),
+        (
+            (
+                None,
+                Some("https://from-endpoint/v1"),
+                Some("https://from-base-url/v1"),
+            ),
+            "https://from-endpoint/v1",
+            "`options.endpoint` must beat `options.baseURL`",
+        ),
+        (
+            (Some("https://from-api/v1"), None, None),
+            "https://from-api/v1",
+            "a catalog-supplied `api.url` must still work when no option names one",
+        ),
+        (
+            (
+                Some("https://from-api/v1"),
+                None,
+                Some("https://from-base-url/v1"),
+            ),
+            "https://from-base-url/v1",
+            "`options.baseURL` must beat the catalog's `api.url`",
+        ),
+        (
+            (
+                Some("https://from-api/v1"),
+                Some("https://from-endpoint/v1"),
+                Some("https://from-base-url/v1"),
+            ),
+            "https://from-endpoint/v1",
+            "`options.endpoint` must beat everything",
+        ),
+    ];
+
+    for ((api, endpoint, base_url), expected, why) in cases {
+        let spec = probe_spec(api, endpoint, base_url).expect("an endpoint resolves");
+        assert_eq!(
+            spec.base_url.as_deref(),
+            Some(expected),
+            "{why} (api={api:?}, endpoint={endpoint:?}, baseURL={base_url:?})"
+        );
+    }
+}
+
+/// An empty option is not an endpoint — `provider.ts:1699` tests the string for `!== ""`.
+///
+/// Without the emptiness test, `"baseURL": ""` would win the ladder and produce a spec
+/// whose base URL is the empty string, which the transport would happily prepend
+/// nothing to and dial a relative path.
+#[test]
+fn an_empty_endpoint_option_falls_through_to_the_next_rung() {
+    let spec = probe_spec(Some("https://from-api/v1"), Some(""), Some(""))
+        .expect("the catalog rung still answers");
+    assert_eq!(spec.base_url.as_deref(), Some("https://from-api/v1"));
+}
+
+/// An endpoint key is never forwarded as an SDK option.
+///
+/// `model.options` is the bag [`model_spec`] forwards, so that is where the keys are
+/// planted here. `Spec::options` is read by allow-listed key today — `capabilities`,
+/// `extraBody`, `useCompletionUrls` — so a stray `baseURL` there is inert, and
+/// inert-today is exactly how it would go unnoticed until someone widened that read and
+/// a request body grew a field named after a URL. Every other model option must still
+/// come through, or this becomes a filter that eats configuration.
+#[test]
+fn the_endpoint_keys_do_not_also_travel_in_the_option_bag() {
+    let document = serde_json::from_str(
+        r#"{"probe":{"id":"probe","name":"Probe","env":[],"npm":"@ai-sdk/openai-compatible",
+             "models":{"probe-model":{"id":"probe-model","name":"Probe Model",
+               "limit":{"context":1,"output":1}}}}}"#,
+    )
+    .expect("catalog document");
+    let config: oc_config::schema::Config = serde_json::from_str(
+        r#"{"provider":{"probe":{"options":{"baseURL":"https://from-base-url/v1"},
+             "models":{"probe-model":{"options":{
+               "baseURL":"https://model-level/v1",
+               "endpoint":"https://model-level-endpoint/v1",
+               "extraBody":{"kept":true}}}}}}}"#,
+    )
+    .expect("config");
+    let catalog = Catalog::resolve(&document, &ResolveInput::new().with_config(&config));
+    let model = catalog.model("probe", "probe-model").expect("the model");
+    assert!(
+        model.options.contains_key("baseURL"),
+        "the fixture must actually carry the key through the merge or it proves nothing"
+    );
+
+    let spec = model_spec(&catalog, model).expect("the provider option supplies the endpoint");
+
+    assert_eq!(
+        spec.base_url.as_deref(),
+        Some("https://from-base-url/v1"),
+        "a model-level endpoint key is not an endpoint source; only the provider's is \
+         (`provider.ts:1698-1700` reads `provider.options`)"
+    );
+    for key in ["endpoint", "baseURL"] {
+        assert!(
+            !spec.options.contains_key(key),
+            "`{key}` reached the SDK option bag: {:?}",
+            spec.options
+        );
+    }
+    assert_eq!(
+        spec.options.get("extraBody"),
+        Some(&serde_json::json!({"kept": true})),
+        "every option that is not an endpoint must still reach the SDK"
+    );
+}
+
+/// No endpoint anywhere fails immediately and names the key that supplies one.
+///
+/// The pre-fix path composed the whole turn and then said `unrecoverable provider
+/// failure (status=None)` from the transport, which names nothing actionable.
+#[test]
+fn a_provider_with_no_endpoint_anywhere_names_the_key_to_set() {
+    let message = probe_spec(None, None, None).expect_err("nothing supplies an endpoint");
+    for needle in ["provider.probe.options", "baseURL", "endpoint"] {
+        assert!(
+            message.contains(needle),
+            "the refusal must name `{needle}`: {message}"
+        );
+    }
+}
+
+/// An internal whose own model has no endpoint is declined, not fatal.
+///
+/// A per-model `provider.api` can give one model in a provider an endpoint and leave
+/// another without one. Propagating that with `?` would lose the whole turn because a
+/// title agent could not be reached, so it takes the same downgrade-and-say-why path as
+/// a cross-provider or unsupported-transport override.
+#[test]
+fn an_internal_whose_model_has_no_endpoint_falls_back_and_says_why() {
+    // Given: `big` carries its own endpoint, `small` carries none, and `title` is
+    // pointed at `small`.
+    let document = serde_json::from_str(
+        r#"{"test":{"id":"test","name":"Test","env":[],"npm":"@ai-sdk/openai-compatible",
+             "models":{
+               "big":{"id":"big","name":"Big","limit":{"context":200000,"output":8192}},
+               "small":{"id":"small","name":"Small","limit":{"context":100000,"output":4096}}}}}"#,
+    )
+    .expect("catalog document");
+    let config: oc_config::schema::Config = serde_json::from_str(
+        r#"{"provider":{"test":{"models":{
+             "big":{"provider":{"api":"https://gateway.test/v1"}},
+             "small":{}}}},
+             "agent":{"title":{"model":"test/small"}}}"#,
+    )
+    .expect("config");
+    let catalog = Catalog::resolve(&document, &ResolveInput::new().with_config(&config));
+    assert!(
+        catalog
+            .model("test", "small")
+            .expect("small resolves")
+            .api
+            .url
+            .is_empty(),
+        "the fixture must leave `small` without an endpoint or it proves nothing"
+    );
+    let session_model = catalog.model("test", "big").expect("the session model");
+    let mut notes = Vec::new();
+
+    // When: the internals resolve.
+    let internals = resolve_internals(&config, &catalog, "test", "big", session_model, &mut notes)
+        .expect("an unreachable override is a downgrade, not a failure");
+
+    // Then: title fell back to the session model and said so.
+    assert_eq!(internals.title.model.model_id, "big");
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("title") && note.contains("baseURL")),
+        "the downgrade was silent or did not name the missing key; notes: {notes:?}"
     );
 }
 

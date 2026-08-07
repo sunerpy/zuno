@@ -191,7 +191,7 @@ impl TurnPlan {
             requested_provider: provider_id.clone(),
             requested_model: model_id.clone(),
             wire_model: catalog_model.api.id.clone(),
-            spec: model_spec(catalog_model),
+            spec: model_spec(&catalog, catalog_model)?,
         };
         let window = TokenWindow {
             context: token_count(catalog_model.limit.context),
@@ -303,6 +303,18 @@ fn resolve_internals(
                     ));
                     return None;
                 }
+                // Declined rather than fatal, for the same reason as the two above: a
+                // per-model `provider.api` can leave one model in a provider without an
+                // endpoint while the session's has one, and losing the whole turn over a
+                // title agent is worse than downgrading it audibly.
+                if let Err(why) = model_spec(catalog, model) {
+                    notes.push(format!(
+                        "{name}: `{}` cannot be reached ({why}); using \
+                         `{provider_id}/{model_id}` instead",
+                        choice.model
+                    ));
+                    return None;
+                }
                 Some((chosen_model.to_owned(), model))
             })
             .unwrap_or_else(|| (model_id.to_owned(), session_model));
@@ -313,7 +325,7 @@ fn resolve_internals(
                 name: name.to_owned(),
                 prompt,
                 model: EngineModel::new(
-                    model_spec(catalog_model),
+                    model_spec(catalog, catalog_model)?,
                     catalog_model.api.id.clone(),
                     ApiSurface::Chat,
                 ),
@@ -651,18 +663,102 @@ fn supports_compatible_transport(npm: &str) -> bool {
     )
 }
 
-fn model_spec(model: &oc_llm::catalog::ResolvedModel) -> Spec {
-    let mut spec = Spec::new(COMPATIBLE_PROVIDER).with_surface(ApiSurface::Chat);
-    if !model.api.url.is_empty() {
-        spec = spec.with_base_url(&model.api.url);
-    }
+/// The provider-option keys that name an endpoint, in precedence order.
+///
+/// `endpoint` first — `provider.ts:355-358` spells the fallback
+/// `options?.endpoint ?? options?.baseURL`, so a provider carrying both is dialled at
+/// `endpoint`. Both are also excluded from the SDK option bag by [`model_spec`]: they
+/// are a URL, not a parameter, and they travel as [`Spec::base_url`].
+const ENDPOINT_OPTIONS: [&str; 2] = ["endpoint", "baseURL"];
+
+/// Where a provider's transport endpoint comes from, in the oracle's order.
+///
+/// The precedence is `resolveSDK`'s
+/// (`packages/opencode/src/provider/provider.ts:1698-1700`), with the bedrock loader's
+/// `endpoint ?? baseURL` normalisation folded in (`:355-358`):
+///
+/// 1. `provider.<id>.options.endpoint`
+/// 2. `provider.<id>.options.baseURL`
+/// 3. the catalog's `model.api.url`
+///
+/// # Why this is not resolved during the catalog merge
+///
+/// `model.api.url` is the merge's own ladder — `config.provider.api` → `provider.api`
+/// → the catalog's entry (`:1455`) — and it is what `opencode models --verbose`
+/// prints. Upstream leaves that field alone and chooses the transport URL here, at
+/// SDK construction, because `options` belongs to the *provider* and `api` belongs to
+/// the *model*. Promoting an option into `api.url` during the merge would make the
+/// printed catalog disagree with the oracle's and would leave two readers of the same
+/// question. After this function, [`Spec::base_url`] is the only answer to it.
+///
+/// # Why `api` is not a URL first
+///
+/// Upstream treats `model.api` as an SDK-shape hint: `:230-232` reads
+/// `model.api.endpoint` to choose `sdk.responses` over `sdk.chat`, and `:368` reads
+/// `model.api.npm` to pick a factory. Its `url` is the catalog's rung, which is why it
+/// is last here rather than first. A provider configured the documented way — endpoint
+/// in `options.baseURL`, nothing top-level — carries no `api.url` at all.
+///
+/// # Ordering is load-bearing
+///
+/// `endpoint` must be consulted before `baseURL`, and both before `api.url`. Any
+/// reordering is caught by
+/// `provider_endpoint::endpoint_wins_over_base_url_when_both_are_set` and by
+/// [`crate::cmd::turn_tests`]'s ladder test, which point the losing rungs at a dead
+/// port precisely so a swap fails instead of passing more slowly.
+fn provider_endpoint(
+    provider: Option<&oc_llm::catalog::ResolvedProvider>,
+    model: &oc_llm::catalog::ResolvedModel,
+) -> Option<String> {
+    provider
+        .into_iter()
+        .flat_map(|provider| {
+            ENDPOINT_OPTIONS
+                .into_iter()
+                .filter_map(|key| provider.options.get(key))
+        })
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .chain(std::iter::once(model.api.url.clone()))
+        .find(|url| !url.is_empty())
+}
+
+/// The transport spec for one model, endpoint included.
+///
+/// # Errors
+///
+/// Returns a message naming the key to set when neither the provider's options nor the
+/// catalog supply an endpoint. Refusing here rather than at the transport is the whole
+/// point: [`oc_provider_compatible::CompatibleProvider::new`] answers a missing base
+/// URL with `IncompleteConfiguration`, which surfaces as `unrecoverable provider
+/// failure (status=None)` after a turn has already been composed and names nothing a
+/// user can act on.
+fn model_spec(catalog: &Catalog, model: &oc_llm::catalog::ResolvedModel) -> Result<Spec, String> {
+    let provider = catalog.provider(&model.provider_id);
+    let endpoint = provider_endpoint(provider, model).ok_or_else(|| {
+        format!(
+            "provider `{}` has no endpoint: set \
+             `provider.{}.options.baseURL` (or `options.endpoint`) to the API base URL",
+            model.provider_id, model.provider_id
+        )
+    })?;
+    let mut spec = Spec::new(COMPATIBLE_PROVIDER)
+        .with_surface(ApiSurface::Chat)
+        .with_base_url(endpoint);
     for (name, value) in &model.headers {
         spec = spec.with_header(name, value);
     }
     for (name, value) in &model.options {
+        // An endpoint is a URL, not an SDK parameter. `Spec::options` is read by
+        // allow-listed key — `capabilities`, `extraBody`, `useCompletionUrls` — so
+        // forwarding these would be inert today, and inert-today is how a body field
+        // named `baseURL` appears the moment someone widens that read.
+        if ENDPOINT_OPTIONS.contains(&name.as_str()) {
+            continue;
+        }
         spec = spec.with_option(name, value.clone());
     }
-    spec
+    Ok(spec)
 }
 
 fn credential_value(credential: &Credential) -> String {

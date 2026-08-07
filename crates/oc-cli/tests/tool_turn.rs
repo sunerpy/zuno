@@ -87,6 +87,12 @@ fn binary() -> PathBuf {
 /// It deliberately does **not** set `permission`. The turn must be governed by the
 /// ruleset `agent list` prints, so an `"*": "allow"` override here would hide a
 /// regression in which the real rules never reach the dispatcher.
+///
+/// It also deliberately does **not** set a top-level `api`. The endpoint lives only in
+/// `options.baseURL`, which is the shape the upstream docs show and the shape todo 88's
+/// frozen workload emits. The top-level key that used to be here was the same URL by
+/// another name, and it is what hid todo 109 — the binary could not dial a provider
+/// configured the documented way — through every wave that ran this test green.
 fn provider_config(base_url: &str) -> String {
     serde_json::json!({
         "formatter": false,
@@ -97,7 +103,6 @@ fn provider_config(base_url: &str) -> String {
                 "id": "test",
                 "env": [],
                 "npm": "@ai-sdk/openai-compatible",
-                "api": format!("{base_url}/v1"),
                 "models": {
                     "test-model": {
                         "id": "test-model",

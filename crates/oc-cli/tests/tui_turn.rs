@@ -78,6 +78,11 @@ fn binary() -> PathBuf {
 /// `permission` is unset on purpose, exactly as in `tool_turn.rs`: the turn must be
 /// governed by the real ruleset, so an `"*": "allow"` override here would hide a
 /// regression in which the rules never reach the dispatcher.
+///
+/// A top-level `api` is unset for the same reason, also exactly as in `tool_turn.rs`:
+/// the endpoint lives only in `options.baseURL`, the shape the upstream docs show. The
+/// key that used to be here was the same URL by another name, and it is what hid todo
+/// 109 — the binary could not dial a provider configured the documented way.
 fn provider_config(base_url: &str) -> String {
     serde_json::json!({
         "formatter": false,
@@ -88,7 +93,6 @@ fn provider_config(base_url: &str) -> String {
                 "id": "test",
                 "env": [],
                 "npm": "@ai-sdk/openai-compatible",
-                "api": format!("{base_url}/v1"),
                 "models": {
                     "test-model": {
                         "id": "test-model",
