@@ -5317,3 +5317,11 @@ flag. `Maintenance::parse` matches exactly: `Stats`, `IntegrityCheck` (both
 `integrity-check` and `integrity_check`, since the pragma has the underscore spelling),
 `Vacuum`, and a test pins that `path`, `VACUUM`, `Stats`, `" stats"`, `"stats;"` and any
 SQL fall through to the query runner.
+
+## [2026-08-07] Task 85: session-prune adapters and local-server discovery
+
+- `oc-db::session_prune::execute` is the sole orchestration boundary. CLI and HTTP resolve transport-specific input and confirmation, then pass one `SessionPruneRequest`; neither owns selection, mutation, accounting, or artifact logic.
+- GET `/api/session/prune` is structurally preview-only. POST requires both an archive/delete action and literal `apply: true`; delete also reaches the service-level confirmation guard, so an adapter omission cannot silently become destructive.
+- `/api/session/active` exposes only `ServerServices::runs`, preserving its process-local meaning. It returns the oracle-compatible `{data:{sessionID:{type:"running"}}}` shape with deterministic key order.
+- Each bound loopback server owns a unique URL record under `$XDG_STATE_HOME/opencode/servers` and removes it on drop. Discovery accepts only credential-free `http` URLs with literal loopback IPs and explicit ports; CLI probes concurrently with proxy bypass and optional server Basic auth, then unions IDs from every valid responder.
+- Failure to publish a loopback discovery record fails server binding rather than silently weakening pruning safety. Non-loopback authenticated listeners are not published because a standalone local-maintenance probe must never discover or contact a network endpoint implicitly.

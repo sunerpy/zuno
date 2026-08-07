@@ -4372,3 +4372,43 @@ different level each time: *a check that can only detect one shape of failure is
 check.* Todo 101's five safety fixtures proved a disjunction rather than its terms;
 `cargo test <filter>` printing `0 passed; N filtered out` looks like a pass; and now a
 merge gate blind to compile-time test failures. Same bug, three altitudes.
+
+## [2026-08-07] Task 85: sibling-worktree LSP boundary and stale discovery
+
+- `lsp_diagnostics` again rejected `/config/workspace/ProdDir/AI/oc-wt/t85` because its request cwd is the main checkout. Diagnostics were obtained from an exact staged mirror in the main checkout, then the mirror was removed; cargo tests, clippy, and build ran in the real Task 85 worktree.
+- A server killed without dropping `BoundServer` can leave a discovery URL file. This is intentionally non-authoritative: the CLI treats it as unreachable unless `/api/session/active` completes successfully within the bounded probe timeout. No stale-file cleanup is required for safety, only hygiene.
+
+## [2026-08-07] Task 85: cross-channel artifact GC must fail closed
+
+- A real preview opened `/config/.local/share/opencode/opencode-local.db`, which had
+  zero sessions, while the channel-shared `snapshot/` and `tool-output/` roots
+  contained artifacts associated with `/config/.local/share/opencode/opencode.db`
+  (5,656 sessions). Before the guard, a preview with zero selected sessions and zero
+  visible database rows proposed deleting 106 artifacts totaling 4.19 GB, including
+  snapshot stores of about 2.9 GB and 167 MB.
+- The mechanism is intentional channel-dependent database naming: a source build
+  defaults to `opencode-local.db`, while a released build uses `opencode.db`.
+  Artifact roots are not channel-dependent. Therefore a reference count from one
+  channel database is not authoritative over the shared artifact roots.
+- Safety rule: **a reference count over a data set you might not be able to see must
+  fail closed**. Direct artifact GC now refuses any database with total session
+  count zero and reports both the SQLite path and count. `session prune` separately
+  treats an empty selection as zero artifact impact and does not invoke a global
+  sweep. Independent fixtures prove each guard, and a selected-session fixture
+  proves ordinary reclamation still works.
+- The operator-facing discrepancy is measured, not hypothetical:
+  `/config/.local/share/opencode/opencode.db` contains 5,656 sessions while
+  `/config/.local/share/opencode/opencode-local.db` contains 0. Oracle source
+  `packages/core/src/database/database.ts:45-55` selects `opencode.db` for
+  `latest`/`beta`/`prod` (or when channel DBs are disabled), but otherwise suffixes
+  the installation channel into `opencode-${channel}.db`; a plain source build is
+  therefore isolated from the released install's rows while still sharing artifact
+  roots.
+- Operator rule: **"no results" and "cannot see the data" must never render
+  identically.** The empty-database prune report now warns in both table and JSON
+  output, names the open database path and zero session count, and explains why
+  shared artifact reclamation was skipped.
+- **Todo 92 compatibility docs:** anyone running this binary alongside an existing
+  released installation can see an empty session list because the builds select
+  different channel databases. Document the channel choice, the disable/override
+  escape hatches, and the warning before presenting session-list parity as broken.

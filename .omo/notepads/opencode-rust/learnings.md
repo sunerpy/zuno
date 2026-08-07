@@ -4941,3 +4941,10 @@ exactly unless an addition is declared in `ADDED_LONG_FLAGS`; `db stats`,
 `db integrity-check` and `db vacuum` add **zero** flags, so nothing had to be declared
 and the comparison stayed green. Verified by hand: `db --help` prints the same six long
 options as before.
+
+## [2026-08-07] Task 85: one prune service, two adapters, and real liveness
+
+- CLI and HTTP parity is strongest when both serialize the exact same report with the same function; a byte-equality test catches adapter-specific defaults and response reshaping that semantic assertions miss.
+- Ephemeral loopback ports require explicit process discovery. A lifetime-scoped URL record is only a candidate: the CLI must connect, validate `/api/session/active`, and aggregate every successful response before it can claim `Liveness::Reachable`.
+- Stale discovery files are safe when connection success is the evidence boundary. A reachable response with an empty map means “this process reports no active sessions”; zero successful responses means `Unreachable` and activates the one-hour recency guard.
+- Previewing artifact reclamation requires evaluating survivors as if selected sessions were gone. Filtering only after actual deletion makes a dry run under-report reclaimable snapshot/tool-output artifacts.
