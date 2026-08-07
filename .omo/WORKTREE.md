@@ -1032,3 +1032,60 @@ AB/BA pairs was proved with 7 passing tests, copying no internals. **No seam is 
 from the frozen crate.** The gate is implementable the moment the database opens.
 
 Todo 107 dispatched: `ses_02267b79affeolOovqZCdf60eJ`.
+
+## Wave 25 (2026-08-07): the fifth seam closed, 88 dispatched for the fifth time
+
+`main` = 3088 tests, **102/107 done**. Todo 107 merged.
+
+### Todo 107's fix, verified by me against the real 2.6 GB database
+
+The agent's real-backup test is **opt-in** (gated on `OPENCODE_LEGACY_DB`) with a printed
+skip naming the file, because copying 2.6 GB per test run is not viable. That is the right
+call — but it means the decisive claim was unverified, so I ran it myself:
+
+```
+copied /config/.local/share/opencode/opencode.db.bak.20260408 (2630582272 bytes)
+real backup: sessions 2345 -> 2345, messages 92378 -> 92378, journal 0 -> 38,
+             seeded [10 drizzle ids], executed 28
+```
+
+**2,345 sessions and 92,378 messages preserved exactly.** Journal seeded from
+`__drizzle_migrations` with the 10 recorded ids, then only the remaining **28** executed —
+no replay. Five tests cover it, including one asserting the seeded names match Drizzle's
+exactly and one asserting the migrated schema equals what the current creator produces.
+
+And it fails **safely**. Removing the seeding step (my mutation) fails 4 of 6 tests with:
+
+```
+Migration { version: 38, source: … msg: "table `project` already exists" … }
+```
+
+An error on a pre-existing table, **not** a schema recreation over live data — which is
+precisely what the QA scenario demanded.
+
+### Five seams, five identical failures
+
+`/api/event` 404 · prune's unattributable 4.19 GB · tool execution · the internal agents ·
+legacy migration. Every one invisible to a green suite.
+
+The new rule, from this one: **a test that only exercises the greenfield path says nothing
+about the upgrade path.** Todo 20 has 20 tests including a byte-for-byte schema diff
+against a database the real binary created, and a round-trip back through it — all
+greenfield. None ever opened a database the real binary had *already been using*.
+
+Generalising all five: each was a **transition nobody owned** — between two routers,
+between a selector and its data, between a registry and a runner, between declared agents
+and the loop, between an old install and a new binary. Todo 62 remains the only seam with
+a dedicated todo and the only one right first time.
+
+### Todo 88's fifth attempt
+
+All four blockers closed. Its own earlier finding is confirmed usable:
+`measure_typescript_baseline` is subject-agnostic at the process boundary, and the
+public-API-only composition for five interleaved AB/BA pairs was already proved with 7
+tests. It was told to rebuild that composition, and warned about the wall clock — the
+schedule is ~100 minutes of pure measurement (150s × 5 × 2 sides for `w-idle`, 450s × 5 × 2
+for `w-real`) and its last attempt died 636s in. Instructed to report partial figures
+rather than nothing if it cannot finish.
+
+Session `ses_0223c678bffeW2JyrhgxVE1xzD`.
