@@ -5251,3 +5251,64 @@ of completed passes.
 
 Honour `options.endpoint ?? options.baseURL` as the endpoint, keep `api` as the SDK-shape
 hint upstream treats it as, and strip the `api` crutch from both seam tests.
+
+## [2026-08-07] SEAM #7, measured: provider-level options never reach the transport — including `apiKey`
+
+Found while auditing the two "adjacent gaps" todo 109 reported. It reported them as
+inert-looking config plumbing; one of them is an **authentication failure**.
+
+### Measured, by me, against a real listener
+
+Config with the endpoint AND the key both in `provider.test.options` — the shape the
+upstream docs show:
+```json
+"options": { "baseURL": "http://127.0.0.1:8793/v1", "apiKey": "sk-from-options" }
+```
+The local server logged what it actually received:
+```
+AUTH=None
+AUTH=None
+```
+The turn still exits 0 **only because the mock does not check auth**. Against any real
+gateway this is a 401 for a correctly-configured user.
+
+### The mechanism, both sides
+
+**The oracle**, `provider.ts:1676` — the SDK option bag is seeded from the *provider's*
+options:
+```ts
+const options = { ...provider.options }
+```
+and `:1719` makes `options.apiKey` **primary**, with the stored credential as fallback:
+```ts
+if (options["apiKey"] === undefined && provider.key) options["apiKey"] = provider.key
+```
+
+**Ours**: `model_spec` forwards only `model.options` (`turn.rs:751`), and `provider.options`
+is read at exactly one place — `provider_endpoint`, for the two endpoint keys
+(`turn.rs:718`). Every other provider-level option is dropped on the floor. The credential
+is the *only* auth source (`turn.rs:214`, `credential_value`), so our precedence is
+inverted as well as incomplete.
+
+Confirmed dropped even though readers exist for them: `useCompletionUrls`
+(`oc-provider-compatible/src/surface.rs:23`), `capabilities` and `extraBody`
+(`provider.rs:37,53`). A provider-level `useCompletionUrls` is silently inert today.
+
+### Why this does NOT block todo 88
+
+The frozen workload puts `apiKey` in provider options (`perf/fixtures.rs:48`), so this
+looked like a sixth blocker. It is not: `MockProvider` never checks `Authorization`
+(no auth enforcement anywhere in `oc-testkit`), and cassettes drop auth headers before
+matching (`cassette.rs:57`). Verified by the exit-0 run above. **88 is unblocked.**
+
+### GAP B, also confirmed: `${VAR}` in base URLs is never expanded
+
+`catalog/resolved.rs:85` documents the field as *"possibly containing `${VAR}`
+placeholders"* and nothing anywhere expands them. Upstream expands twice at
+`:1698-1716` — first via `varsLoaders[providerID]`, then from the environment. A URL like
+`https://${REGION}.api.example.com/v1` is dialled literally today.
+
+### Owed: todos 110 and 111
+
+Both land in the same region of `turn.rs`, so they are sequential with respect to each
+other — a real file conflict, not a guess.
