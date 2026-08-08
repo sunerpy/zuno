@@ -46,6 +46,7 @@ oc-config = { workspace = true }
 oc-db = { workspace = true }
 oc-lsp = { workspace = true }
 oc-pty = { workspace = true }
+rustix = { workspace = true }
 oc-server = { workspace = true }
 oc-tool = { workspace = true }
 oc-tools = { workspace = true }

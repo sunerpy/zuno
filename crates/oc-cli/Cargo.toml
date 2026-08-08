@@ -29,6 +29,7 @@ oc-mcp = { workspace = true }
 oc-observability = { workspace = true }
 oc-paths = { workspace = true }
 oc-permission = { workspace = true }
+oc-process = { workspace = true }
 oc-provider-anthropic = { workspace = true }
 oc-provider-bedrock = { workspace = true }
 oc-provider-compatible = { workspace = true }

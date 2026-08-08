@@ -706,8 +706,9 @@ impl SessionHandle {
                 source: BoxSource::from(source),
             })?;
 
-        let mut builder = CommandBuilder::new(&command);
-        builder.args(&args);
+        let (guarded_program, guarded_arguments) = oc_process::guarded_argv(&command, &args);
+        let mut builder = CommandBuilder::new(guarded_program);
+        builder.args(guarded_arguments);
         builder.cwd(&cwd);
         for (key, value) in input.env.unwrap_or_default() {
             builder.env(key, value);

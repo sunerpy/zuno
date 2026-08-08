@@ -6239,3 +6239,49 @@ recorded `database_sha256` for resumability; this promotes that precedent into t
 to *look*, but identity is what makes a located file acceptable. A byte-identical copy at any
 path is accepted; a mutated database at the pinned path is rejected. The ambient environment is
 how the current value was originally obtained, never what makes it correct.
+
+## [2026-08-08] Todo 90: one shared guard owns every persistent child-host launch
+
+**Decision.** LSP, MCP stdio, PTY, JSON-RPC plugins and JavaScript plugins all wrap their argv
+through `oc_process::guarded_argv`; `oc-cli` activates its own executable and dispatches the
+hidden guard protocol before ordinary argument parsing.
+
+**Why.** Cleanup attached separately to five `Child` handles cannot cover parent `SIGKILL`, and
+five platform-specific implementations would drift. One process boundary gives Linux one
+process-group/PDEATHSIG policy and Windows one Job Object policy while leaving host protocols and
+public APIs unchanged.
+
+**Linux invariant.** The monitor kills the complete host process group when either its caller
+dies or the direct host exits, then reaps what it owns. Waiting only for the direct host is not
+enough because descendants can outlive it.
+
+**Scope.** The locally proven G6 contract is Linux: two sessions for each of four host kinds,
+clean exit and parent `SIGKILL`, at least 33 transitive PIDs, zero survivors. The Windows Job
+Object implementation is retained behind target cfg and pinned to `process-wrap = 9.1.0`, but no
+Windows runtime was available for this task.
+
+## [2026-08-08] Todo 90: ACP outbound frames use bounded lossless blocking
+
+**Decision.** Replace the ACP outbound unbounded queue with Tokio mpsc capacity 64 and await every
+producer send.
+
+**Why.** Frames are protocol output and cannot be coalesced or dropped without changing ACP
+semantics. A fixed queue bounds memory, and awaited send transfers pressure to the producing task;
+the G5 probe separately proves another task still progresses while that consumer is stalled.
+
+## [2026-08-08] Todo 90 review correction: containment is fail-closed only after activation
+
+**Before activation.** `guarded_argv` returns the original program and arguments. Library-only
+consumers and test binaries that never install a guard continue to launch directly; absence of a
+global guard is not itself a launch error.
+
+**Production activation.** `opencode-rust` dispatches a hidden guard request first. For an ordinary
+invocation it then resolves `current_exe` and activates it before entering `run_process`. Failure to
+locate the executable or a conflicting activation terminates startup with an error. Once activated,
+a guard-stage failure is also terminal; the code never retries the host outside containment.
+
+**Per-crate necessity.** `oc-lsp`, `oc-mcp`, `oc-pty`, and the JSON-RPC half of `oc-plugin` are the
+four real host kinds exercised by G6. `oc-cli` is the production integration root rather than a
+fixture dependency. The JavaScript half of `oc-plugin` was changed for uniform containment of its
+second persistent host path, not because this fixture exercised it. No pre-guard orphan count was
+measured, so this is a contract-enforcement decision rather than a measured old-defect fix.

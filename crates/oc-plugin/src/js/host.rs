@@ -973,17 +973,16 @@ impl HostInner {
                 detail: format!("the protocol listener has no address: {error}"),
             })?;
 
-        let mut command = Command::new(self.boot.runtime.program());
-        for flag in self
+        let mut arguments = self
             .boot
             .runtime
             .kind()
-            .memory_flags(self.limits.memory_ceiling)
-        {
-            command.arg(flag);
-        }
+            .memory_flags(self.limits.memory_ceiling);
+        arguments.push(self.boot.shim.as_os_str().to_os_string());
+        let (program, arguments) = oc_process::guarded_argv(self.boot.runtime.program(), arguments);
+        let mut command = Command::new(program);
         command
-            .arg(&self.boot.shim)
+            .args(arguments)
             // fd 0 and 1 stay inherited so a `readline` prompt reaches the user;
             // the shim rebinds `console` to stderr so protocol-adjacent chatter
             // cannot land on a terminal the TUI is about to redraw.

@@ -89,11 +89,18 @@ struct Outbound {
     sent: oneshot::Sender<Result<(), String>>,
 }
 
+/// Maximum number of encoded ACP frames waiting for the stdout writer.
+///
+/// The queue is lossless: once full, request tasks wait while the reader keeps
+/// accepting client responses and the writer keeps draining frames. This bounds
+/// memory without allowing a slow editor to make the adapter allocate forever.
+pub const OUTBOUND_FRAME_CHANNEL_CAPACITY: usize = 64;
+
 type Pending = HashMap<String, oneshot::Sender<Result<Value, RpcError>>>;
 
 #[derive(Clone)]
 pub struct ClientConnection {
-    output: mpsc::UnboundedSender<Outbound>,
+    output: mpsc::Sender<Outbound>,
     pending: Arc<Mutex<Pending>>,
     next_id: Arc<AtomicU64>,
 }
@@ -159,6 +166,7 @@ impl ClientConnection {
                 value,
                 sent: sent_tx,
             })
+            .await
             .map_err(|_| RpcError::internal("ACP writer is closed"))?;
         sent_rx
             .await
@@ -214,7 +222,7 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (output_tx, output_rx) = mpsc::unbounded_channel();
+    let (output_tx, output_rx) = mpsc::channel(OUTBOUND_FRAME_CHANNEL_CAPACITY);
     let writer = tokio::spawn(write_frames(output, output_rx));
     let client = ClientConnection {
         output: output_tx,
@@ -308,7 +316,7 @@ where
 
 async fn write_frames<W>(
     mut output: W,
-    mut frames: mpsc::UnboundedReceiver<Outbound>,
+    mut frames: mpsc::Receiver<Outbound>,
 ) -> Result<(), std::io::Error>
 where
     W: AsyncWrite + Unpin,

@@ -627,9 +627,10 @@ async fn launch(
     let executable = argv.first().ok_or_else(|| RegistryError::EmptyCommand {
         server_id: server.spec.id.clone(),
     })?;
-    let mut command = Command::new(executable);
+    let (program, arguments) = oc_process::guarded_argv(executable, &argv[1..]);
+    let mut command = Command::new(program);
     command
-        .args(&argv[1..])
+        .args(arguments)
         .current_dir(&server.root)
         .envs(&server.spec.env)
         .stdin(Stdio::piped())

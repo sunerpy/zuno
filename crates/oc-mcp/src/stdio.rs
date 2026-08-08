@@ -825,9 +825,10 @@ fn build_command(workspace: &Path, config: &McpLocal) -> io::Result<Command> {
         )
     })?;
     let cwd = resolve_cwd(workspace, config.cwd.as_deref())?;
-    let mut command = Command::new(program);
+    let (guarded_program, guarded_arguments) = oc_process::guarded_argv(program, arguments);
+    let mut command = Command::new(guarded_program);
     command
-        .args(arguments)
+        .args(guarded_arguments)
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
