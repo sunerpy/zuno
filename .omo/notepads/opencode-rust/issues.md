@@ -5456,3 +5456,82 @@ kill it. Anyone verifying should use `OC_MEMORY_GATE_MODE=skip` unless they inte
 Windowing/streaming so a turn does not hold the whole session decoded three times over.
 This is the one remaining piece of the project's headline claim, and it is a real
 engineering task, not a test fix.
+
+## [2026-08-08] Todo 113, wave 1: my G2 root cause was WRONG in its mechanism, and W-real turns out to be non-reproducible
+
+Two findings. The first corrects me; the second is worse than either of us thought.
+
+### 1. The agent's correction to my diagnosis is right — verified
+
+I wrote that the 3.2 GB peak was *"three simultaneous fully-decoded representations of
+105 MB"*. The agent said no: W-real's session already contains a **compaction** marker, so
+`retained_history` trims to the compaction tail and the two projections
+(`project_history`, `provider_messages`) operate on a **small** slice — the real provider
+request is on the order of 1.7 MB. The peak is almost entirely `hydrate_session` decoding
+the whole session *before* the trim happens.
+
+Verified against the live database. Compaction parts exist in exactly the sessions this
+workload selects:
+
+| session | messages | parts | part bytes | `compaction` parts |
+|---|---|---|---|---|
+| `ses_024892384ffe…` | 73 | 395 | 299,771,941 | **1** |
+| `ses_038c0be3dffe…` | 948 | 7,184 | 134,658,937 | **82** |
+
+And the byte weight is overwhelmingly `tool` output: **299,725,496 of 299,771,941 bytes**
+(99.98%) in the first, 133 MB of 134 MB in the second. So the amplification is a large pile
+of JSON tool blobs being decoded into Rust structures that are far larger than their wire
+form, and then thrown away by the trim.
+
+**That makes the fix cleaner than my framing implied**: find the compaction boundary from
+lightweight metadata first, then decode only the parts after it. `retained_history`'s
+semantics do not change; the decode simply stops doing work whose result is discarded.
+
+*My error, recorded plainly*: I inferred the mechanism from reading the call chain and did
+not check whether the fixture actually carries a compaction marker. The call chain was
+right; the conclusion about which step dominates was not.
+
+### 2. THE BIGGER PROBLEM: W-real selects a moving target, so G2 is not reproducible
+
+`RealDatabaseSnapshot::capture` (`perf/database.rs`) resolves the **user's live database**
+via `Layout::from_process_env()` and then `select_largest_session` picks whichever session
+has the most `part.data` bytes *at measurement time*.
+
+That database is mutable and I am writing to it continuously by doing this work. Measured
+consequences, today:
+
+- Todo 88's measured subject, `ses_2bcaee257ffeFZNJrmtpi3ZglR` (931 msgs / 3,620 parts /
+  105,118,812 bytes), **no longer exists** — `SELECT … WHERE session_id=…` returns 0 parts.
+- Today's largest session is **299,771,941 bytes — 2.85× larger** than the one measured.
+
+So a re-measurement now runs a materially different workload against the **same fixed
+ceiling** (`0.50 × committed_TS = 1,513,496 KiB`, from frozen `methodology.rs:54-55` and
+frozen `benchmarks/ts-baseline.json`). The Rust peak and the paired TS peak both scale with
+the session; the ceiling does not. **The gate gets arbitrarily harder or easier over time
+through no change in the code.**
+
+Why 88's own result is still sound: it ran Rust and TS in one interleaved schedule against
+one snapshot, and its paired TS reproduced the committed baseline within 2.5% — so at that
+moment the subject matched the baseline's subject closely. It is *cross-run* comparison
+that is invalid, which is precisely what todo 113 needs.
+
+Note the harness already protects itself: the resumable pass fingerprint covers the W-real
+database, so 88's cached passes are correctly invalidated by this change. The harness is
+honest; the workload definition is the problem.
+
+### Consequences for todo 113
+
+- It must **not** compare an "after" number against 88's 3,249,508 KiB. Different subject.
+- Before/after must come from the **same snapshot**, or be expressed against the **paired**
+  TS median from the same run (`rust_to_paired_typescript_ratio`, which the artifact already
+  records) rather than the committed baseline.
+- A PASS against the committed ceiling may be unreachable today purely because the largest
+  session tripled. That is not the code's fault and must not be papered over.
+
+### Owed: todo 114
+
+Pin W-real's subject so the gate is reproducible — a committed fixture session, or a
+recorded id with a documented recapture procedure — and state how the committed baseline
+relates to it. This is a **methodology** change touching frozen files, so it needs its own
+todo, an explicit unfreeze decision, and a methodology-revision bump. It is not a licence
+for 113 to edit the frozen crate.
