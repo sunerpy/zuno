@@ -5677,3 +5677,37 @@ The pin lives in its own module and is re-exported from `perf`. Adding gates tou
 `methodology.rs` thresholds and `baseline.rs` workloads, neither of which the pin constrains.
 G3/G4 do not use a real database (`uses_real_database` is W-real only), so no new pinning is
 owed. Adding them requires undoing none of this.
+
+## [2026-08-08] NINTH seam, found while scoping todo 90: an unbounded channel survives in `oc-acp`
+
+The plan lists *"no unbounded channels"* among its **Must NOT have** items (line 66), calling it
+*"a named defect observed in a reference implementation."* Requirement 16 restates it: *"Bounded
+channels on every producer/consumer boundary, each with a declared overflow policy."*
+
+Measured by me across the whole workspace, excluding tests:
+- **23** bounded channel sites (`mpsc::channel`, `broadcast::channel`, `watch::channel`).
+- **1** unbounded site: `crates/oc-acp/src/transport.rs:217`
+  ```rust
+  let (output_tx, output_rx) = mpsc::unbounded_channel();
+  let writer = tokio::spawn(write_frames(output, output_rx));
+  ```
+
+It is the ACP transport's outbound frame queue: every `ClientConnection` write goes here and a
+spawned writer drains it to stdout. If the client stops reading stdout, this grows without limit
+— exactly the OOM shape the requirement exists to forbid. There is **no comment justifying it**
+and no declared overflow policy, so it is not a documented exception either.
+
+**Why no test caught it**: todo 90 (G5, per-channel backpressure) is the todo that would have,
+and it has not run yet. The ACP work merged earlier with its own passing tests, none of which
+stall a consumer. Ninth instance of the same lesson: *per-file todos give per-file correctness
+and say nothing about the cross-cutting requirement.*
+
+This is genuinely in todo 90's scope — its acceptance criteria demand *"a registry test asserting
+the enumerated set matches the channels actually constructed, so a new channel without a test
+fails the suite."* A registry that enumerates 23 bounded channels while ignoring the 1 unbounded
+one would be a vacuous registry. Todo 90 must either bound it with a declared policy, or record
+it as a deliberate, documented exception with a reason — and the registry must be able to *see*
+it either way.
+
+Ground truth for todo 90's registry test, so it cannot be written to match itself:
+**23 bounded sites across 14 files, 1 unbounded site in `oc-acp/src/transport.rs`.**
