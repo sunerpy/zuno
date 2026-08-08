@@ -82,7 +82,8 @@ fn write_offline_dependency_state(directory: &Path) -> Result<()> {
         .map_err(|source| TestkitError::io("write baseline dependency lockfile", lockfile, source))
 }
 
-pub(crate) fn create_watcher_tree(project: &Path) -> Result<()> {
+/// Create the frozen W-soak tree of 50,000 files under `project`.
+pub fn create_watcher_tree(project: &Path) -> Result<()> {
     let root = project.join("watch-tree");
     for index in 0..SOAK_FILE_COUNT {
         let directory = root.join(format!("d{:03}", index / 500));

@@ -40,10 +40,16 @@ toml = { workspace = true }
 which = { workspace = true }
 
 [dev-dependencies]
+futures = { workspace = true }
+oc-catalog = { workspace = true }
+oc-config = { workspace = true }
 oc-db = { workspace = true }
+oc-lsp = { workspace = true }
+oc-pty = { workspace = true }
 oc-server = { workspace = true }
 oc-tool = { workspace = true }
 oc-tools = { workspace = true }
+oc-watch = { workspace = true }
 # The self-tests speak raw HTTP/1.1 over a `tokio::net::TcpStream` on purpose.
 # Using the production client to test the mock would repeat the exact mistake
 # this crate exists to prevent: a fixture that agrees with the implementation

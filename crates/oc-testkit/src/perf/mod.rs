@@ -16,7 +16,9 @@ pub use baseline::{
     WorkloadName, load_committed_baseline,
 };
 pub use database::verify_pinned_database;
+pub use fixtures::create_watcher_tree;
 pub use methodology::{FrozenThresholds, PERF_METHODOLOGY_REVISION};
+pub use process_tree::sample_process_tree;
 pub use runner::{
     BaselineRunOptions, PairedSide, interleaved_pair_order, measure_typescript_baseline,
     verify_typescript_oracle,
