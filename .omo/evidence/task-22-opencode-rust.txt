@@ -1,0 +1,380 @@
+Task 22 - crates/oc-db/src/message.rs: message/part persistence and hydration with
+JSON payload parity
+================================================================================
+Worktree : /config/workspace/ProdDir/AI/oc-wt/t22  (branch task-22, base f6d0dc2)
+Oracle   : /config/workspace/ProdDir/AI/opencode (opencode 1.18.13 sources)
+Binary   : /config/.local/share/mise/installs/opencode/1.18.12/opencode
+Files    : crates/oc-db/src/message.rs (new)
+           crates/oc-db/tests/message.rs (new)
+           crates/oc-db/tests/message_export.rs (new)
+           crates/oc-db/src/lib.rs (+1 line: `pub mod message;`)
+           crates/oc-db/Cargo.toml (+serde, +serde_json, rusqlite feature "trace")
+           Cargo.lock (+serde, +serde_json under the oc-db entry; cargo-generated)
+
+
+FINDING: THE PLAN'S NINE-VARIANT LIST IS INCOMPLETE
+================================================================================
+Todo 22 names nine part variants. The `Part` union declares TWELVE.
+
+  packages/schema/src/v1/session.ts:357-370
+    export const Part = Schema.Union([
+      TextPart, SubtaskPart, ReasoningPart, FilePart, ToolPart, StepStartPart,
+      StepFinishPart, SnapshotPart, PatchPart, AgentPart, RetryPart,
+      CompactionPart,
+    ]).annotate({ discriminator: "type", identifier: "Part" })
+
+The three the plan omits are `snapshot` (line 87), `agent` (line 181) and
+`retry` (line 220). They are not dead declarations: the real binary's
+`opencode export` decoded and re-emitted all three when handed rows this crate
+wrote (see QA HAPPY PATH below). All twelve are implemented and each has its own
+round-trip test.
+
+
+VARIANT CATALOG (oracle: packages/schema/src/v1/session.ts)
+================================================================================
+Discriminator is the `type` field of part.data in every case. "req" = required by
+the schema, "opt" = Schema.optional. Every part also carries id/sessionID/messageID
+in the SCHEMA type, but those three are stripped out of the stored blob.
+
+  text        (:102)  req text:string
+                      opt synthetic:bool, ignored:bool,
+                          time{start:int, opt end:int}, metadata:Record
+  subtask     (:204)  req prompt:string, description:string, agent:string
+                      opt model{providerID, modelID}, command:string
+  reasoning   (:118)  req text:string, time{start:int, opt end:int}
+                      opt metadata:Record
+  file        (:171)  req mime:string, url:string
+                      opt filename:string, source:FilePartSource
+                      FilePartSource = union on `type`:
+                        file{text{value,start,end}, path}
+                        symbol{text{...}, path, range{start{line,character},
+                               end{line,character}}, name, kind:int}
+                        resource{text{...}, clientName, uri}
+  tool        (:315)  req callID:string, tool:string, state:ToolState
+                      opt metadata:Record
+                      ToolState = union on `status` (:304-312):
+                        pending  { input:Record, raw:string }
+                        running  { input, time{start}, opt title, opt metadata }
+                        completed{ input, output:string, title:string,
+                                   metadata:Record,
+                                   time{start,end,opt compacted},
+                                   opt attachments:FilePart[] }
+                        error    { input, error:string, time{start,end},
+                                   opt metadata }
+  step-start  (:233)  opt snapshot:string          <- NO required field at all
+  step-finish (:240)  req reason:string, cost:float,
+                          tokens{input,output,reasoning,cache{read,write},
+                                 opt total}
+                      opt snapshot:string
+  snapshot    (:87)   req snapshot:string          <- NOT IN THE PLAN'S LIST
+  patch       (:94)   req hash:string, files:string[]
+  agent       (:181)  req name:string              <- NOT IN THE PLAN'S LIST
+                      opt source{value,start,end}
+  retry       (:220)  req attempt:int, error:APIError, time{created:int}
+                                                    <- NOT IN THE PLAN'S LIST
+  compaction  (:195)  req auto:bool
+                      opt overflow:bool, tail_start_id:MessageID
+
+Message `role` discriminator (Info union, :490):
+  user      (:332) req role, time{created}, agent, model{providerID, modelID,
+                       opt variant}
+                   opt format, summary{opt title, opt body, diffs[]}, system,
+                       tools:Record<string,bool>
+  assistant (:453) req role, time{created, opt completed}, parentID, modelID,
+                       providerID, mode, agent, path{cwd,root}, cost,
+                       tokens{input,output,reasoning,cache{read,write},opt total}
+                   opt error, summary:bool, structured, variant, finish
+
+
+VARIANTS PRESENT IN THE USER'S REAL DATABASE
+================================================================================
+Read-only, `mode=ro`, against /config/.local/share/opencode/opencode.db
+(51 GiB, 233 500 message rows). The file was NOT copied - at 51 GiB a copy would
+have cost the whole task budget and 51 GiB of a disk already at 27% - it was
+opened read-only instead, which is strictly safer than a copy (no write handle
+was ever created; the -wal was untouched).
+
+  $ sqlite3 "file:/config/.local/share/opencode/opencode.db?mode=ro" \
+      "SELECT json_extract(data,'\$.type') AS t, count(*) AS n
+       FROM part GROUP BY t ORDER BY n DESC;"
+  tool|317980
+  step-start|218899
+  step-finish|217066
+  reasoning|129099
+  text|108713
+  patch|42683
+  compaction|1255
+  file|37
+  subtask|1
+                                            total 1 035 733 parts
+
+Exactly the plan's nine appear; `snapshot`, `agent` and `retry` have count 0 in
+this install. Nine is therefore the right list for "what a real database holds"
+and the wrong list for "what the engine can emit" - the union is what a decoder
+must accept, and the export differential proves the binary round-trips all three
+of the absent ones.
+
+Note the tail: `file` = 37 and `subtask` = 1. A synthetic-fixture-only test suite
+would very plausibly have got those two wrong and nothing would have caught it.
+
+
+CRITERION 1: message.data / part.data hold the payload minus the identity keys
+================================================================================
+Contract, verbatim from packages/core/src/session/sql.ts:19-20
+    type V1MessageData = Omit<SessionV1.Info, "id" | "sessionID">
+    type V1PartData    = Omit<SessionV1.Part, "id" | "sessionID" | "messageID">
+Strip site mirrored from packages/core/src/session/projector.ts:78-88
+    const { id: _, sessionID: __, ...rest } = info
+    const { id: _, messageID: __, sessionID: ___, ...rest } = part
+Reassembly mirrored from packages/opencode/src/session/message-v2.ts:80-93.
+
+Asserted three ways, per variant and per role:
+  a) the stored blob does not contain the stripped keys (explicit contains_key
+     assertion on the raw column text, not on a re-parsed record);
+  b) the stored blob equals the input payload with exactly those keys removed
+     (byte comparison of the column against an independently-built expectation);
+  c) a blob that DOES carry one is rejected on read -
+     message_a_blob_carrying_a_stripped_key_is_rejected_on_read.
+
+  $ cargo test -p oc-db message
+  test message_part_text_round_trips_byte_identically ... ok
+  test message_part_reasoning_round_trips_byte_identically ... ok
+  test message_part_tool_round_trips_byte_identically ... ok
+  test message_part_step_start_round_trips_byte_identically ... ok
+  test message_part_step_finish_round_trips_byte_identically ... ok
+  test message_part_patch_round_trips_byte_identically ... ok
+  test message_part_file_round_trips_byte_identically ... ok
+  test message_part_compaction_round_trips_byte_identically ... ok
+  test message_part_subtask_round_trips_byte_identically ... ok
+  test message_part_snapshot_round_trips_byte_identically ... ok
+  test message_part_agent_round_trips_byte_identically ... ok
+  test message_part_retry_round_trips_byte_identically ... ok
+  test user_and_assistant_messages_round_trip_byte_identically ... ok
+  test message_a_blob_carrying_a_stripped_key_is_rejected_on_read ... ok
+
+
+CRITERION 2: batched hydration, no N+1
+================================================================================
+Shape from message-v2.ts:98-123: collect message ids, one `IN (...)` pass over
+part, group by message_id, zip. HYDRATION_CHUNK = 900 ids per statement.
+
+  test hydrating_500_messages_costs_two_statements_not_501 ... ok
+
+Measured, not inspected, and measured TWICE by independent mechanisms:
+  - MessageStore::query_count() - every statement in the module is prepared
+    through one private fn that increments a Cell; 500 messages x 3 parts
+    hydrates in 2.
+  - SQLite's own SQLITE_TRACE_STMT hook (rusqlite feature "trace", added to
+    oc-db only) counts statements as the engine begins them; it also reports 2.
+    A statement that escaped the wrapper would make the two numbers disagree and
+    fail the test.
+The counter is reset immediately before hydration so the 1500 setup writes are
+excluded from the measurement.
+
+  test message_hydrating_nothing_costs_one_statement_and_no_part_lookup ... ok
+    (an empty message set issues no part lookup at all - 1 statement)
+  test hydration_orders_messages_by_time_then_id_and_parts_by_id ... ok
+    (messages ORDER BY time_created, id per message_session_time_created_id_idx;
+     parts ORDER BY message_id, id per message-v2.ts:107; a message with no
+     parts hydrates to an empty vec, matching `?? []` at line 120)
+
+
+CRITERION 3: cargo test -p oc-db message
+================================================================================
+  $ cargo test -p oc-db message
+  Running unittests src/lib.rs
+    test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out
+  Running tests/message.rs
+    test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+  Running tests/message_export.rs
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+  Running tests/open.rs      -> 18 filtered out
+  Running tests/schema.rs    ->  5 filtered out
+
+29 tests, 0 failures. Every test name contains "message" so the bare filter in
+the acceptance criterion selects all of them.
+
+
+CRITERION 4: build, clippy, fmt
+================================================================================
+  $ cargo build --workspace
+      Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.36s
+
+  $ cargo clippy --workspace --all-targets
+      Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.25s
+  $ cargo clippy --workspace --all-targets 2>&1 | grep -cE "^(warning|error)"
+  0
+
+  $ cargo fmt --all -- --check
+  FMT: clean
+
+  $ cargo test --workspace
+  EXIT=0
+  985 tests passed, 0 FAILED
+  (955 on main before this task; +30 = 25 integration + 3 unit + 1 export
+   differential + 1 module doctest)
+
+Two clippy findings were raised and fixed rather than allowed:
+  assertions_on_constants   -> wrapped the fixture-size assertion in `const { }`
+  bool_assert_comparison    -> assert_eq!(x.is_empty(), false) -> assert!(!x...)
+
+
+QA HAPPY PATH - the strong direction: Rust writes, the real binary reads
+================================================================================
+The plan asks for "a session written by the Rust code is readable by the real
+binary's `opencode export`". That command exists in 1.18.12 and this is it, not
+the weaker fallback. Committed as
+crates/oc-db/tests/message_export.rs::message_a_rust_written_session_is_readable_by_the_real_binary
+(skips when the binary is absent).
+
+What it does: creates a database in an isolated XDG_DATA_HOME, applies the Rust
+schema, and writes - through MessageStore only - one project, one session, a user
+message, an assistant message, and ONE PART OF EVERY ONE OF THE TWELVE VARIANTS.
+Then runs the real binary:
+
+  opencode export ses_5jXqK8mNpQrStUvWxYz0123456789ab --pure
+    HOME/XDG_* redirected into a tempdir, OPENCODE_DB removed from the env
+
+  exit status: success
+  stdout: 6040 bytes of JSON
+
+  variants the real binary surfaced:
+    ["text", "subtask", "reasoning", "file", "tool", "step-start",
+     "step-finish", "snapshot", "patch", "agent", "retry", "compaction"]
+  part ids the real binary surfaced: 12
+
+  stdout excerpt (the {info, parts} hydration shape, verbatim):
+      "role": "user",
+      "time": { "created": 1780034795100 },
+      "id": "msg_5jXqK8mNpQrStUvWxYz0123456789ab",
+      "sessionID": "ses_5jXqK8mNpQrStUvWxYz0123456789ab"
+    },
+    "parts": []
+  },
+  {
+    "info": {
+      "agent": "build",
+      "cost": 0.00425,
+      "mode": "build",
+      "modelID": "claude-sonnet-4-5",
+      "parentID": "msg_5jXqK8mNpQrStUvWxYz0123456789ab",
+      "path": { "cwd": "/workspace", "root": "/workspace" },
+      "providerID": "anthropic",
+      "role...
+
+`export` decodes both blobs through the TypeScript schema before printing, so a
+wrong field name or a bad variant tag fails there. All 12 came back, including
+the three the plan does not list. Note also that the binary reinserted `id` and
+`sessionID` into `info` from the COLUMNS - direct confirmation that the strip is
+what the reader expects.
+
+
+QA HAPPY PATH - second direction: the real binary's rows, read by Rust
+================================================================================
+crates/oc-db/tests/message.rs::message_real_typescript_rows_hydrate_when_a_fixture_is_supplied
+Skipped unless OC_T22_REAL_ROWS names a fixture; the fixture is NOT committed
+because it is the user's own conversation content. Extraction query used:
+
+  WITH firsts AS (SELECT json_extract(data,'$.type') AS t, min(rowid) AS r
+                  FROM part GROUP BY t)
+  SELECT json_group_array(json_object(
+    'variant', f.t, 'part_id', p.id, 'message_id', p.message_id,
+    'session_id', p.session_id, 'part_time_created', p.time_created,
+    'part_time_updated', p.time_updated, 'part_data', json(p.data),
+    'msg_time_created', m.time_created, 'msg_time_updated', m.time_updated,
+    'msg_data', json(m.data)))
+  FROM firsts f JOIN part p ON p.rowid = f.r
+  LEFT JOIN message m ON m.id = p.message_id;
+
+  $ OC_T22_REAL_ROWS=/tmp/oc-t22/real_rows.json \
+      cargo test -p oc-db --test message message_real_typescript_rows -- --nocapture
+  test message_real_typescript_rows_hydrate_when_a_fixture_is_supplied ... ok
+
+9 genuine parts written by the TypeScript binary - one per variant present in the
+database, 182 411 bytes, the `tool` one 39 641 bytes and the `file` one 134 726 -
+each split, stored, read back and compared byte-for-byte against the original,
+then hydrated in 2 statements. The test also asserts up front that a real
+`part.data` does NOT already contain id/sessionID/messageID, which is the strip
+contract verified against production data rather than against this crate's own
+assumption.
+
+Field sets the real rows carry (this is what the fixture proved, per variant):
+  compaction   ['auto','type']
+  file         ['filename','mime','synthetic','type','url']
+  patch        ['files','hash','type']
+  reasoning    ['metadata','text','time','type']
+  step-finish  ['cost','reason','tokens','type']
+  step-start   ['type']                      <- a one-key blob, {"type":"step-start"}
+  subtask      ['agent','command','description','model','prompt','type']
+  text         ['text','type']
+  tool         ['callID','state','tool','type']
+
+
+QA FAILURE PATH - an unknown variant is a typed error, never dropped
+================================================================================
+Two entry points, both covered:
+
+1. Splitting a payload from a newer engine:
+     PartRecord::from_json({"type":"hologram", ...})
+
+   Display  : stored value in part could not be decoded
+   Debug    : Decode { table: "part", source: Error("unknown part variant
+              `hologram`; the Part union declares text, subtask, reasoning, file,
+              tool, step-start, step-finish, snapshot, patch, agent, retry,
+              compaction", line: 0, column: 0) }
+   source   : unknown part variant `hologram`; the Part union declares text,
+              subtask, reasoning, file, tool, step-start, step-finish, snapshot,
+              patch, agent, retry, compaction
+   retryable: false
+
+2. Hydrating a row a newer binary already wrote (planted with raw SQL, bypassing
+   every check in this module):
+
+   Display  : stored value in part could not be decoded
+   source   : unknown part variant `telepathy`; the Part union declares text,
+              subtask, reasoning, file, tool, step-start, step-finish, snapshot,
+              patch, agent, retry, compaction
+   parts still on disk after the failure: 1
+
+The row survives. Nothing swallowed it, nothing deleted it, and the error names
+both the tag it rejected and the set it expected - so the operator can tell
+"newer opencode wrote this" apart from "the blob is corrupt". Asserted by
+  test message_an_unknown_part_variant_is_a_typed_error_when_split ... ok
+  test message_an_unknown_part_variant_already_on_disk_surfaces_and_is_not_dropped ... ok
+  test a_message_with_an_unknown_role_is_a_typed_error ... ok
+PartKind and MessageRole carry no catch-all arm, so a thirteenth variant upstream
+breaks compilation at every match rather than being silently absorbed - the same
+discipline oc-error established in Todo 2.
+
+
+ADDITIONAL BEHAVIOUR PINNED
+================================================================================
+  test message_a_second_write_replaces_data_and_bumps_time_updated ... ok
+    ON CONFLICT(id) DO UPDATE SET data, time_updated - mirrors
+    projector.ts:271/322. time_created is NOT rewritten by a later upsert, and
+    the upsert updates rather than inserting a second row.
+    Sampled 20 000 real message rows: 0 have a NULL time_updated and only 2 have
+    time_updated == time_created, so the bump is what the real writer does.
+  test a_part_whose_message_does_not_exist_is_rejected_by_the_foreign_key ... ok
+    part.message_id IS a foreign key; part.session_id is only an index
+    (schema.rs:117-125, confirmed by Todo 20). A part therefore cannot precede
+    its message, but CAN carry a session_id no session row backs.
+  test message_a_missing_row_is_not_found_rather_than_empty ... ok
+    DbError::NotFound{table, id} rather than Option::None, so a caller cannot
+    mistake absence for an empty conversation.
+
+
+UNVERIFIED / OUT OF SCOPE
+================================================================================
+- `snapshot`, `agent` and `retry` were exercised with payloads built from the
+  schema, not from production rows, because this install has none of them. The
+  real binary accepted all three via `export`, which is the check that matters,
+  but the exact field sets a live engine emits for them are unconfirmed.
+- Cursor-paged reads (`message-v2.ts:63-78`, `older()` at :95-96) are not
+  implemented here; nothing in Todo 22 asks for them and Todo 34 owns the stream
+  side.
+- Session CRUD (Todo 21), stream projection (Todo 34) and FTS (Todo 101) were
+  not touched.
+- The usage accounting projector.ts:90-107 performs alongside each part write
+  (applyUsage, adjusting session token/cost totals) is deliberately NOT done
+  here - it is the projector's job, not the store's, and Todo 34 owns it.

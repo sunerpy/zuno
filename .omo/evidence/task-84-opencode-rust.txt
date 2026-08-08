@@ -1,0 +1,255 @@
+Task 84 — explicit VACUUM, integrity check, and stats
+Branch task-84 (worktree /config/workspace/ProdDir/AI/oc-wt/t84), from main c78d028.
+
+FILES
+  NEW  crates/oc-db/src/vacuum.rs            (vacuum / integrity_check / stats + DiskSpace seam)
+  NEW  crates/oc-db/tests/vacuum.rs          (14 integration tests)
+  NEW  crates/oc-cli/src/cmd/db_maint.rs     (db stats | db integrity-check | db vacuum)
+  MOD  crates/oc-db/src/lib.rs               (+1 pub mod, +1 re-export block; append-only)
+  MOD  crates/oc-db/Cargo.toml               (+[target.'cfg(unix)'.dependencies] rustix)
+  MOD  crates/oc-cli/src/cmd/mod.rs          (+1 mod line)
+  MOD  crates/oc-cli/src/cmd/db.rs           (+4 lines: keyword dispatch before the SQL path)
+  MOD  Cargo.lock                            (+1 line: rustix edge on oc-db; ZERO new packages)
+  NOT CREATED: crates/oc-db/src/artifact_gc.rs  (owned by sibling t83)
+
+TEST COUNTS
+  cargo test -p oc-db --offline
+    lib                    54 passed
+    tests/fts               6 passed
+    tests/message          25 passed
+    tests/message_export    1 passed
+    tests/open             18 passed
+    tests/prune             9 passed
+    tests/retention        12 passed
+    tests/schema            5 passed
+    tests/session          38 passed
+    tests/session_list     18 passed
+    tests/vacuum           14 passed   <- new
+    doc-tests               2 passed
+    TOTAL 202 passed, 0 failed
+
+  cargo test -p oc-cli --offline
+    lib                    30 passed
+    bin (main.rs)           0 passed
+    tests/differential     13 passed
+    tests/surface           6 passed
+    doc-tests               0 passed
+    TOTAL 49 passed, 0 failed
+
+  cargo test -p oc-db --offline vacuum   (the plan's literal filter)
+    lib          7 passed;  0 failed; 47 filtered out
+    tests/vacuum 14 passed; 0 failed;  0 filtered out
+    TOTAL 21 passed — NOT a vacuous "0 passed; N filtered out"
+
+GATES
+  cargo build --workspace --offline           clean (Finished dev profile)
+  cargo clippy --workspace --all-targets      0 warnings, 0 errors
+  cargo clippy -p oc-db -p oc-cli --all-targets  0 warnings, 0 errors
+  cargo fmt --all --check                     clean
+  cargo metadata --locked --offline           exit 0
+  oc-db/Cargo.toml tables                     [package] [dependencies] [dev-dependencies]
+                                              [target.'cfg(unix)'.dependencies] [lints]
+                                              — exactly one each
+
+CONCURRENCY (3 rounds x 6 parallel `cargo test -p oc-db --offline`, counting FAILED lines)
+  round 1: 0 0 0 0 0 0
+  round 2: 0 0 0 0 0 0
+  round 3: 0 0 0 0 0 0
+
+TRUE TABLE COUNT
+  20 tables in the live database. schema::TABLE_COUNT = 19 created by schema::up, plus the
+  `migration` bookkeeping table created by migration::apply. Read from sqlite_master, pinned
+  by name in tests/vacuum.rs:
+    account account_state control_account credential data_migration event event_sequence
+    message migration part permission project project_directory session
+    session_context_epoch session_input session_message session_share todo workspace
+  (Todo 82's PRUNE_TABLES is a different, correct number: 10 — the session-attributable
+  subset. The plan's "12" was already recorded as stale.)
+
+THE HEADLINE NUMBERS (tests/vacuum.rs, --nocapture)
+  seeded main file       2,125,824 bytes
+  after prune           2,125,824 bytes   -> prune reclaimed 0
+  freelist after prune  228 pages         (pages freed INSIDE the file)
+  after vacuum          1,179,648 bytes   -> vacuum reclaimed 946,176 bytes
+  PRAGMA auto_vacuum    0 (NONE)          asserted, so reclamation cannot be implicit
+
+LOW-DISK REFUSAL MESSAGE (verbatim, from VacuumError::InsufficientDiskSpace)
+  refusing to VACUUM /tmp/.tmpXXXXXX/opencode.db: rewriting the whole file needs 2.0 MiB
+  (2125824 bytes) free on its filesystem, but only 2.0 MiB (2060288 bytes) is available;
+  free at least 64.0 KiB (65536 bytes) there, or point OPENCODE_DB at a filesystem with
+  more room
+  Asserted to contain: the path, required bytes (exact + human), available bytes
+  (exact + human), the shortfall (exact + human), and "OPENCODE_DB".
+  Guard boundary: refuse iff available < required. Equality passes (own test).
+  Availability::Unknown proceeds and records the reason (own test).
+
+INTEGRITY CHECK ON A PRUNED DB
+  integrity_check        ["ok"]
+  foreign_key_check      [] (no violations)
+  Also asserted: a structurally sound file with a dangling part->message reference
+  reports integrity ["ok"] but is_ok() == false, because foreign_key_check catches it.
+
+MUTATION PROOF 1 — make the prune path vacuum implicitly
+  Added to prune::execute's Delete arm after transaction.commit():
+    crate::vacuum::vacuum(connection, &crate::vacuum::SystemDiskSpace).ok();
+  Result: test result: FAILED. 9 passed; 5 failed
+    vacuum_a_prune_alone_reclaims_nothing_and_an_explicit_vacuum_reclaims_bytes
+      assertion `left == right` failed: the prune alone must return nothing to the
+      filesystem (baseline main_bytes: 2125824, after prune main_bytes: 1179648)
+        left: 946176
+    vacuum_is_never_reachable_as_a_side_effect_of_another_module   (source scan)
+    vacuum_proceeds_when_free_space_is_exactly_the_database_size
+    vacuum_proceeds_when_free_space_cannot_be_established_and_says_why
+    vacuum_stats_reports_page_geometry_and_a_wal_size_separate_from_the_main_file
+  Restored; git diff on prune.rs empty; 14/14 green again.
+
+MUTATION PROOF 2 — remove the low-disk guard
+  Deleted the `if let Availability::Known { bytes } = available_bytes && bytes < ...` block.
+  Result: test result: FAILED. 13 passed; 1 failed
+    vacuum_refuses_when_free_disk_is_under_the_database_size
+      a filesystem smaller than the database must refuse the rewrite:
+      VacuumReport { ..., reclaimed_bytes: 8192, available_bytes: Known { bytes: 2060288 } }
+  Restored; 14/14 green; fmt clean.
+
+HANDS-ON CLI QA (target/debug/opencode-rust, HOME and OPENCODE_DB pointed at /tmp/oc-t84)
+  Fixture built through the CLI itself: 1 project, 200 sessions, 200 messages,
+  200 parts of ~6 KB each.
+
+  $ opencode-rust db stats
+  database	/tmp/oc-t84/opencode.db
+  file	1.4 MiB	1531904 bytes
+  wal	0 B	0 bytes
+  shm	32.0 KiB	32768 bytes
+  total	1.4 MiB	1564672 bytes
+  pages	374 x 4096 bytes	0 reclaimable by `db vacuum`
+
+  table	rows
+  account	0
+  account_state	0
+  control_account	0
+  credential	0
+  data_migration	0
+  event	0
+  event_sequence	0
+  message	200
+  migration	38
+  part	200
+  permission	0
+  project	1
+  project_directory	0
+  session	200
+  session_context_epoch	0
+  session_input	0
+  session_message	0
+  session_share	0
+  todo	0
+  workspace	0
+  TOTAL	639
+
+  session	parts	bytes	title
+  ses_001	1	5.9 KiB	QA session 1
+  ses_002	1	5.9 KiB	QA session 2
+  ses_003	1	5.9 KiB	QA session 3
+  ses_004	1	5.9 KiB	QA session 4
+  ses_005	1	5.9 KiB	QA session 5
+  ses_006	1	5.9 KiB	QA session 6
+  ses_007	1	5.9 KiB	QA session 7
+  ses_008	1	5.9 KiB	QA session 8
+  ses_009	1	5.9 KiB	QA session 9
+  ses_010	1	5.9 KiB	QA session 10
+  (exit 0)
+
+  $ opencode-rust db "DELETE FROM session WHERE CAST(substr(id,5) AS INTEGER) <= 100"
+  $ stat -c %s /tmp/oc-t84/opencode.db
+  1531904                                   <- unchanged: the delete reclaimed nothing
+  $ opencode-rust db stats | head -7
+  database	/tmp/oc-t84/opencode.db
+  file	1.4 MiB	1531904 bytes
+  wal	0 B	0 bytes
+  shm	32.0 KiB	32768 bytes
+  total	1.4 MiB	1564672 bytes
+  pages	374 x 4096 bytes	158 reclaimable by `db vacuum`
+
+  $ opencode-rust db integrity-check
+  integrity_check	ok
+  foreign_key_check	ok
+  (exit 0)
+
+  $ opencode-rust db vacuum
+  database	/tmp/oc-t84/opencode.db
+  before	1.4 MiB	1564672 bytes
+  after	892.0 KiB	913408 bytes
+  reclaimed	636.0 KiB	651264 bytes
+  freelist	158 pages -> 0 pages
+  free space	173.7 GiB	186529865728 bytes available before the rewrite
+  (exit 0)
+
+  $ stat -c %s /tmp/oc-t84/opencode.db
+  880640                                     <- the file really shrank
+  $ opencode-rust db stats | head -6
+  database	/tmp/oc-t84/opencode.db
+  file	860.0 KiB	880640 bytes
+  wal	0 B	0 bytes
+  shm	32.0 KiB	32768 bytes
+  total	892.0 KiB	913408 bytes
+  pages	215 x 4096 bytes	0 reclaimable by `db vacuum`
+
+  $ opencode-rust db integrity-check          (after the rewrite)
+  integrity_check	ok
+  foreign_key_check	ok
+
+  $ opencode-rust db vacuum --format json
+  {
+    "after":  { "main_bytes": 880640, "shm_bytes": 32768, "wal_bytes": 0 },
+    "available_bytes": { "bytes": 186530516992, "state": "known" },
+    "before": { "main_bytes": 880640, "shm_bytes": 32768, "wal_bytes": 0 },
+    "freelist_pages_after": 0,
+    "freelist_pages_before": 0,
+    "fts_rebuild_required": false,
+    "path": "/tmp/oc-t84/opencode.db",
+    "reclaimed_bytes": 0                     <- idempotent: nothing left to reclaim
+  }
+
+  $ opencode-rust db integrity-check --format json
+  { "foreign_key_violations": [], "integrity": [ "ok" ] }
+
+  $ env -i HOME=... OPENCODE_DB=... PATH= opencode-rust db vacuum
+  database	/tmp/oc-t84/opencode.db
+  before	892.0 KiB	913408 bytes
+  after	892.0 KiB	913408 bytes
+  reclaimed	0 B	0 bytes
+  freelist	0 pages -> 0 pages
+  free space	173.6 GiB	186498023424 bytes available before the rewrite
+  (exit 0)  -- todo 56's no-external-binary guarantee holds: no sqlite3, no df.
+
+  $ opencode-rust db --help
+  Long options: --format --version --print-logs --log-level --pure --help
+  Identical to before this change, so differential.rs's exact long-flag comparison
+  against the real binary stays green with no ADDED_LONG_FLAGS entry.
+
+  CLI failure path, partially verified: a genuinely damaged file (31 pages overwritten
+  with 0xAA) makes the CLI exit 1 with "database statement failed" on stderr rather
+  than print a false "ok" — but SQLite rejects it during migration::apply, before
+  integrity_check runs, so the damage-reporting branch of `db integrity-check` was NOT
+  reachable end-to-end. A readable-but-FK-inconsistent database cannot be produced
+  through the CLI at all, because every `db` connection opens with foreign_keys = ON.
+  That branch is covered by the oc-db test instead (see INTEGRITY CHECK above).
+
+FREE SPACE
+  vacuum::DiskSpace is an injected trait, matching todo 81's LivenessProbe and todo 82's
+  RemoteUnshare. SystemDiskSpace calls rustix::fs::statvfs and computes
+  f_bavail * (f_frsize or f_bsize). rustix 1.1.4 with feature "fs" was ALREADY in
+  Cargo.lock (tempfile pulls it), so the manifest gained an edge and Cargo.lock gained
+  ZERO packages. The syscall's unsafe stays inside the dependency, so oc-db still honours
+  unsafe_code = "forbid". No subprocess, so a stripped PATH is fine (verified above).
+  `cargo add fs4 --dry-run --offline` -> "could not be found in registry index";
+  `cargo search` is unusable here (aliyun mirror replacement), as the worktree notes say.
+
+WAL AND MEASUREMENT RELIABILITY
+  Every size is read by re-stat'ing the file; nothing is cached. vacuum() issues
+  PRAGMA wal_checkpoint(TRUNCATE) before it measures and again after the rewrite,
+  because open.rs's PRAGMA_SEQUENCE puts every connection in WAL mode
+  (database.ts:22-33) and a delete's pages land in -wal until a checkpoint. PASSIVE
+  would leave -wal at its high-water mark. One test asserts main_bytes ==
+  page_size * page_count after a truncating checkpoint, and another asserts an
+  uncheckpointed prune shows up as wal_bytes > 0 with main_bytes unchanged.

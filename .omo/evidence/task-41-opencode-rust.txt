@@ -1,0 +1,318 @@
+================================================================================
+Task 41 — crates/oc-tools/src/{glob,grep}.rs + crates/oc-search/
+embedded search engine with ripgrep parity
+worktree /config/workspace/ProdDir/AI/oc-wt/t41 (branch task-41), base main cfc5500
+recorded 2026-08-05T23:48:23+00:00
+rustc rustc 1.96.0 (ac68faa20 2026-05-25)
+oracle /config/.local/share/mise/installs/opencode/1.18.12/opencode -> 1.18.12
+system rg (fallback backend only) -> ripgrep 15.1.0 (rev af60c2de9d)
+================================================================================
+
+=== 1. THE EXACT rg FLAGS THE ORACLE PASSES (packages/core/src/ripgrep.ts) ===
+
+glob  (:160-168)  --no-config --files [--hidden] [--follow] --glob=<pattern> --glob=!**/.git/** .
+find  (:192-200)  --no-config --files [--hidden] [--follow] [--glob=<pattern> unless '*'] --glob=!**/.git/** .
+grep  (:221-231)  --no-config --json --hidden --no-messages [--glob=<include>] --glob=!**/.git/** -- <pattern> <file|.>
+
+binary source (packages/core/src/ripgrep/binary.ts:88-121): which('rg') -> $data/bin/rg ->
+DOWNLOAD ripgrep 15.1.0 from github.com/BurntSushi/ripgrep/releases, extract with tar or
+powershell.exe, chmod 0755.  THIS DOWNLOAD IS WHAT THE EMBEDDED ENGINE REMOVES.
+
+=== 2. ORDERING: THE ORACLE HAS NONE (measured, 10-file tree, unchanged between runs) ===
+  run 1: ignored.ts|.hidden_dir/e.ts|README.md|.gitignore|.hidden_file.ts|nested/deep/d.ts|lib/c.js|src/a.ts|src/b.ts|node_modules/pkg/f.ts|
+  run 2: ignored.ts|README.md|.hidden_dir/e.ts|.gitignore|.hidden_file.ts|src/a.ts|src/b.ts|lib/c.js|node_modules/pkg/f.ts|nested/deep/d.ts|
+  run 3: .hidden_dir/e.ts|README.md|nested/deep/d.ts|ignored.ts|.gitignore|.hidden_file.ts|src/a.ts|src/b.ts|lib/c.js|node_modules/pkg/f.ts|
+  run 4: .hidden_dir/e.ts|ignored.ts|README.md|.gitignore|.hidden_file.ts|nested/deep/d.ts|lib/c.js|node_modules/pkg/f.ts|src/a.ts|src/b.ts|
+  run 5: ignored.ts|README.md|.hidden_dir/e.ts|.gitignore|.hidden_file.ts|src/a.ts|src/b.ts|node_modules/pkg/f.ts|lib/c.js|nested/deep/d.ts|
+
+  Five runs, five orders.  No --sort is passed, so the walk is parallel and the order is
+  whatever the threads produce.  There is therefore no oracle order to preserve; both
+  oc-search backends emit PATH-SORTED results (= rg --sort=path), which makes truncation
+  deterministic and grep's grouped output correct.
+
+=== 3. OVERRIDE PRECEDENCE: --glob IS A WHITELIST, NOT A FILTER (oracle transcripts) ===
+
+$ opencode debug rg files                      # --glob=**/*
+  .gitignore
+  .hidden_dir/e.ts
+  .hidden_file.ts
+  ignored.ts
+  lib/c.js
+  nested/deep/d.ts
+  node_modules/pkg/f.ts
+  README.md
+  src/a.ts
+  src/b.ts
+
+$ opencode debug rg files --glob '**/*.ts'
+  .hidden_file.ts
+  ignored.ts
+  nested/deep/d.ts
+  src/a.ts
+  src/b.ts
+
+  .hidden_file.ts and ignored.ts are returned by BOTH: an override match outranks every
+  ignore file and the hidden-file rule (ignore-0.4.33/src/dir.rs:511-522, walk.rs:481).
+  .hidden_dir/e.ts and node_modules/pkg/f.ts appear under '**/*' but NOT under '**/*.ts':
+  their parent DIRECTORIES are not whitelisted by '**/*.ts', so the walk pruned them
+  before reaching the children.  That file-vs-directory asymmetry is load-bearing.
+
+$ opencode debug rg search needle --glob '*.ts'  # include reaches gitignored + hidden
+  .hidden_dir/e.ts:1
+  .hidden_file.ts:1
+  ignored.ts:1
+  nested/deep/d.ts:1
+  src/a.ts:1
+  src/b.ts:2
+
+=== 4. REPORTED DEFECT: THE ORACLE TRUNCATES ITS OWN STDOUT AT 64 KiB ===
+
+Found while building the differential.  5,007-file tree.  Under oc-testkit's ScriptedEnv
+(cleared env, temporary HOME) with stdout on a PIPE, 'debug rg files' writes exactly
+65536 bytes and loses the rest, deterministically.  The lost region cuts mid-directory,
+so it is a flush race on exit, not a search difference.
+
+  scripted env, stdout = pipe, run 1: 65536
+  scripted env, stdout = pipe, run 2: 65536
+  scripted env, stdout = FILE:        85108
+  host env,     stdout = pipe:        85108
+  files actually in the tree:         5007
+
+  Consequence for every differential in this project: oc-testkit's run_process captures
+  through a pipe, so ANY comparison whose oracle stdout exceeds 64 KiB silently compares
+  truncated data and can pass while being wrong.  This suite bounds every invocation
+  (STDOUT_BUDGET = 40000) and FAILS LOUDLY if one ever approaches the limit.
+
+=== 5. THE DIFFERENTIAL DESIGN THAT WORKS AROUND IT ===
+
+The 5,007-file tree is covered by 10 disjoint oracle invocations whose union is every
+file; each returns at most 1,000 paths (~17 KB).  The union is then compared against ONE
+engine call over the whole tree, so the full-tree comparison is not lost:
+
+  pkg000?/**                                 ->  1000 paths,  16999 bytes
+  pkg001?/**                                 ->  1000 paths,  16999 bytes
+  pkg002?/**                                 ->  1000 paths,  16999 bytes
+  pkg003?/**                                 ->  1000 paths,  16999 bytes
+  pkg004?/**                                 ->  1000 paths,  16999 bytes
+  **/*.md                                    ->     1 paths,      9 bytes
+  {.gitignore,.hidden_file.ts,ignored.ts}    ->     3 paths,     37 bytes
+  {.hidden_dir,.hidden_dir/**}               ->     1 paths,     20 bytes
+  {node_modules,node_modules/**}             ->     1 paths,     25 bytes
+  {build,build/**}                           ->     1 paths,     12 bytes
+
+  Note the brace forms.  '.hidden_dir/**' ALONE RETURNS NOTHING on both sides, because a
+  whitelist glob is matched against directories too and '.hidden_dir/**' does not match
+  '.hidden_dir' itself, so the hidden directory is pruned before its children are seen.
+  Verified against the real binary:
+    debug rg files --glob '.hidden_dir/**'          ->  (empty)
+    debug rg files --glob '{.hidden_dir,.hidden_dir/**}' -> .hidden_dir/inner.ts 
+
+================================================================================
+=== 6. ACCEPTANCE CRITERIA ===
+================================================================================
+
+--- (a) cargo test -p oc-tools search  [the plan's literal criterion] ---
+running 10 tests
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 0.00s
+running 1 test
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 4.83s
+
+    NOTE the 'filtered out' counts: a name filter is not a whole-suite run.  The full
+    per-target runs are (b) and (c) below.
+
+--- (b) cargo test -p oc-tools --test search_differential  [DIFFERENTIAL, 5007 files] ---
+running 5 tests
+test the_comparison_reports_a_real_divergence ... ok
+test a_pattern_with_no_matches_is_an_empty_result_on_both_sides ... ok
+test debug_rg_search_matches_the_embedded_engine_field_for_field ... ok
+test the_union_of_the_partition_is_the_whole_tree ... ok
+test debug_rg_files_matches_the_embedded_engine_partition_by_partition ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.24s
+
+--- (c) cargo test -p oc-search  (lib + engine_semantics) ---
+running 15 tests
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 23 tests
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+--- (d) cargo test -p oc-tools  (lib: glob, grep, search_common) ---
+running 24 tests
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+--- (e) cargo fmt --all --check ---
+    exit 0 (0 = clean, no output above)
+
+--- (f) cargo build --workspace ---
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.16s
+
+--- (g) cargo clippy --workspace --all-targets  (zero warnings) ---
+    warning lines: 0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.17s
+
+--- (h) cargo test --workspace ---
+    total tests passing: 1501
+    failing targets: 0  (every 'test result:' line in the run above reads 'ok')
+    (main at cfc5500 had 1434; this task adds 67: 15+23 oc-search, 24+5 oc-tools)
+
+================================================================================
+=== 7. QA SCENARIO — HAPPY: both differential comparisons empty, 5,000-file tree ===
+================================================================================
+
+$ cargo test -p oc-tools --test search_differential -- --nocapture
+
+running 5 tests
+test the_comparison_reports_a_real_divergence ... ok
+test a_pattern_with_no_matches_is_an_empty_result_on_both_sides ... ok
+test debug_rg_search_matches_the_embedded_engine_field_for_field ... ok
+test the_union_of_the_partition_is_the_whole_tree ... ok
+test debug_rg_files_matches_the_embedded_engine_partition_by_partition ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.08s
+
+
+  Zero divergences.  'files' is compared partition by partition AND as a union against one
+  whole-tree engine call (5007 paths); 'search' is compared over full JSON records — path,
+  line, absolute offset, line text, every submatch span.  The engine's own output is
+  asserted to be path-sorted BEFORE either side is sorted for comparison.
+  the_comparison_reports_a_real_divergence is the negative control: it feeds the same
+  comparison a dropped path, a renamed path and a submatch span off by one, and asserts
+  each is reported — so a green run above cannot be vacuous.
+
+================================================================================
+=== 8. QA SCENARIO — FAILURE: a pattern with no matches is an EMPTY RESULT, not an error
+================================================================================
+
+-- the oracle, for comparison --
+$ cd <5007-file fixture> && opencode debug rg search zzzznomatchzzzz
+  []
+  exit code: 0
+  exit code: 0
+
+-- the engine and both tools --
+$ cargo test -p oc-search --test engine_semantics -- --exact \
+    a_pattern_with_no_matches_is_an_empty_result_and_not_an_error \
+    a_glob_with_no_matches_is_an_empty_result_and_not_an_error
+running 2 tests
+test a_glob_with_no_matches_is_an_empty_result_and_not_an_error ... ok
+test a_pattern_with_no_matches_is_an_empty_result_and_not_an_error ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.00s
+
+$ cargo test -p oc-tools --lib -- --exact \
+    grep::tests::no_matches_renders_the_oracles_empty_output_and_is_not_an_error \
+    glob::tests::no_matches_renders_the_oracles_empty_output
+running 2 tests
+test glob::tests::no_matches_renders_the_oracles_empty_output ... ok
+test grep::tests::no_matches_renders_the_oracles_empty_output_and_is_not_an_error ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.00s
+
+  Rendered output on the empty path, asserted by those tests:
+    grep -> title 'zzzznomatchzzzz', output 'No files found', metadata {matches:0, truncated:false}
+    glob -> output 'No files found',                          metadata {count:0,   truncated:false}
+  ('No files found' is the oracle's wording for grep too — grep.ts:33 — even though the
+  search was over contents; reproduced because the model has been trained on it.)
+  Ok(...) in every case.  No ToolError, no panic, exit 0 on the oracle side as well.
+
+================================================================================
+=== 9. THE DOWNLOAD IS GONE — no network, no subprocess, on the default path ===
+================================================================================
+
+oc-search dependencies (crates/oc-search/Cargo.toml): globset, grep-regex, grep-searcher,
+ignore, grep-matcher, serde, serde_json, thiserror, tracing.  No HTTP client, no archive
+extractor.  The only std::process::Command in the crate is the OPT-IN ripgrep backend:
+  crates/oc-search/src/ripgrep.rs:33:use std::process::Command;
+  crates/oc-search/src/ripgrep.rs:171:        let output = Command::new(&self.program)
+
+Backend::from_env / Backend::select — the embedded engine unless OPENCODE_SEARCH_BACKEND
+names ripgrep, and it degrades back to embedded (with a warn) when no rg is on PATH:
+  22:pub const BACKEND_ENV: &str = "OPENCODE_SEARCH_BACKEND";
+  23-
+  24-/// Which engine answers a request.
+  25-#[derive(Debug, Clone)]
+  26-pub enum Backend {
+  27-    /// `ignore` + `grep-searcher`, in process.
+  28-    Embedded(EmbeddedEngine),
+
+================================================================================
+=== 10. FILES TOUCHED ===
+================================================================================
+   M Cargo.lock
+   M crates/oc-search/Cargo.toml
+   M crates/oc-search/src/lib.rs
+   M crates/oc-tools/Cargo.toml
+   M crates/oc-tools/src/lib.rs
+  ?? crates/oc-search/src/backend.rs
+  ?? crates/oc-search/src/cancel.rs
+  ?? crates/oc-search/src/embedded.rs
+  ?? crates/oc-search/src/error.rs
+  ?? crates/oc-search/src/ripgrep.rs
+  ?? crates/oc-search/src/types.rs
+  ?? crates/oc-search/tests/
+  ?? crates/oc-tools/src/glob.rs
+  ?? crates/oc-tools/src/grep.rs
+  ?? crates/oc-tools/src/search_common.rs
+  ?? crates/oc-tools/tests/
+
+  Nothing outside crates/oc-search and crates/oc-tools.  The root Cargo.toml is unchanged
+  (ignore/grep-searcher/grep-regex/globset were already pinned there and are inherited).
+
+================================================================================
+=== 11. COMMIT ===
+================================================================================
+  2fc93b97557ac1b5b8dcc2eff407cf9cb12add06  feat(tools): embedded glob and grep with ripgrep parity
+  branch task-41, parent cfc5500
+
+  Nothing under .omo/ is in the commit; notepads and this file live in the main worktree.
+
+================================================================================
+=== 12. POST-MERGE REPAIR ON main (found by rebuilding on main, not the worktree) ===
+================================================================================
+
+Wave 7 puts todos 39/41/42/43 in one crate.  The three-way union merge left oc-tools
+broken in THREE files.  A worktree-only verification cannot see any of them.
+
+(1) crates/oc-tools/src/lib.rs — error[E0753] x14, the crate did not compile.
+    Each task wrote its own leading //! block; unioned, blocks 2 and 3 land AFTER
+    pub mod items, and an inner doc comment may only precede items.
+    Repaired at 3efe436 (all prose merged into the single leading header).
+
+(2) crates/oc-tools/Cargo.toml — three separate [dev-dependencies] tables, with
+    reqwest/time/url stranded under one of them despite being runtime deps.
+    cargo metadata ACCEPTED this silently (later tables merge rather than error).
+    Repaired at f5c47c5 (one [dependencies] + one [dev-dependencies]).
+
+(3) Cargo.lock — the task-42 merge took its own side wholesale and DROPPED 8
+    packages task-41 had added; oc-search's entry was left with no dependency
+    list at all.  Repaired at 00d37c9, additions only, 0 real removals.
+
+    Proof it was a real breakage — ordinary 'cargo build' re-resolves and hides it,
+    a --locked build (i.e. CI) does not:
+      $ git show HEAD~1:Cargo.lock > Cargo.lock && cargo metadata --locked --offline
+      error: cannot update the lock file ... because --locked was passed to prevent this
+      exit=101
+    Dropped entries restored:
+      ignore  grep-searcher  grep-regex  grep-matcher
+      memmap2  encoding_rs_io  crossbeam-deque  crossbeam-epoch
+
+--- state of main at 00d37c9 after the repair ---
+  cargo metadata --locked --offline : OK
+  cargo fmt --all --check           : clean
+  cargo build --workspace --offline : Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.15s
+  clippy --all-targets warnings     : 0
+  cargo test --workspace --offline  : 1637 passing, 0 failing targets
+  oc-tools --lib                     : 100 tests (three tasks' worth, all passing)
+  task-41 differential vs 1.18.12    : 5/5 passing
+
+  Repair commits (deliberately separate from the task-41 feature commit):
+    f5c47c5  fix(tools): reconcile oc-tools manifest after three-way union merge
+    3efe436  fix(tools): consolidate stranded module docs after three-way union merge
+    00d37c9  fix(build): restore the search crates dropped from Cargo.lock by a merge
+
+  Recorded for todos 43 and 44 as issues.md item 7: add prose to the EXISTING //! header,
+  keep one [dependencies]/[dev-dependencies] pair, and verify a merge with
+  'cargo metadata --locked --offline' — plain 'cargo build' silently repairs a broken lock.
+
+================================================================================
+END OF EVIDENCE — task 41
+================================================================================

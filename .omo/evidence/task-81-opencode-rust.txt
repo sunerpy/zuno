@@ -1,0 +1,48 @@
+# Task 81 — retention selector with subtree closure and liveness guard
+
+Date: 2026-08-07
+Worktree: /config/workspace/ProdDir/AI/oc-wt/t81
+
+## Implemented contract
+- Read-only oc_db::retention::select; no DELETE is emitted.
+- Explicit scope: current project, named project, or all projects.
+- time_updated default age key; time_created opt-in; strict timestamp < cutoff boundary.
+- Every accepted age-eligible root expands to its transitive descendant closure with cycle-safe visited tracking.
+- Any shared, compacting, active, or no-server-recent descendant vetoes the ancestor candidate subtree.
+- time_archived is not a protection.
+- LivenessProbe is injectable. Reachable /api/session/active protects reported IDs; only Unreachable uses the default one-hour time_updated fallback, crossable with --include-recent.
+- Report includes selected inclusion reasons and direct/descendant exclusion reasons for preview consumers.
+
+## TDD red evidence
+- Initial selector skeleton compiled, then cargo test -p oc-db retention --offline ran 12 tests: 1 passed, 11 failed. Failures covered subtree closure, protections, liveness, scope/key, archive semantics, cycle handling, and boundary behavior.
+
+## Mutation proof 1 — transitive closure
+- Mutation: descendant_ids returned only the candidate root.
+- Command: cargo test -p oc-db retention_property_selected_forests_are_closed_under_descendants --offline -- --nocapture
+- Result: FAILED as required.
+- Shrunk counterexample: nodes = [(0, false), (0, false)].
+- Assertion: selected 1 row, expected 2; an old root stranded its newer child.
+- Implementation restored and generated retention.proptest-regressions removed.
+
+## Mutation proof 2 — no-server recency fallback
+- Mutation: removed the Liveness::Unreachable recency-protection branch.
+- Command: cargo test -p oc-db retention_unreachable_server_uses_recency_guard_and_names_override --offline -- --nocapture
+- Result: FAILED as required at protected.selected.is_empty(); the just-touched session was incorrectly selected.
+- Implementation restored.
+
+## Final validation
+- rust-analyzer diagnostics .: completed; changed oc-db retention.rs/lib.rs had no diagnostics (workspace output only contained pre-existing inactive-code weak warnings in cfg-disabled code).
+- cargo test -p oc-db retention --offline: 12 passed, 0 failed (non-vacuous literal filter).
+- cargo test -p oc-db --offline target counts: 47, 6, 25, 1, 18, 12, 5, 38, 18, 2 passed; every target 0 failed.
+- cargo build --workspace --offline: PASS.
+- cargo clippy --workspace --all-targets --offline: PASS, 0 warnings.
+- cargo fmt --all --check: PASS after formatting.
+- Concurrency command: three rounds × six parallel cargo test -p oc-db --offline runs produced exactly 18 lines of 0 failed-result counts.
+
+## Constraints confirmed
+- No schema, table, index, or migration change.
+- No crate other than oc-db changed in the task worktree.
+- No cargo test --workspace was run.
+- No DB-only running-session claim.
+- No plain DELETE statement.
+

@@ -1,0 +1,70 @@
+================================================================================
+Task 68 — goal tools, hidden SQL injection, guarded self-continuation
+Branch: task-68   Worktree: /config/workspace/ProdDir/AI/oc-wt/t68
+================================================================================
+
+SCOPE
+-----
+Only `crates/oc-goal/**` and the dependency edges recorded in `Cargo.lock` were
+changed. No engine, generic tool, database-schema, or tools-crate source was
+modified.
+
+WHAT WAS BUILT
+--------------
+- `GetGoalTool`, `CreateGoalTool`, and `UpdateGoalTool`, with structured output,
+  positive-budget validation, and model-correctable policy refusals.
+- A model-facing update schema that exposes only `blocked` and `complete`.
+- A persistent three-signal blocked audit: `blocked` is accepted only after three
+  matching failure signals survive in `goal_1.db`.
+- Hidden goal context regenerated from SQL for every request as a synthetic
+  pseudo-user `TranscriptEntry`; it is XML-escaped and is never persisted in the
+  conversation that compaction may discard.
+- Guarded self-continuation requiring all of: no process-local concurrent start,
+  no active engine turn, not in plan mode, no queued user input, no pending
+  one-shot deferral, and an active goal.
+- Persistent one-shot deferral and failure streaks in auxiliary tables in the
+  existing goal database, without changing the existing `goal` table.
+- Terminal provider/compaction failures immediately block an active goal so a
+  failed terminal turn cannot spin forever.
+
+PERSISTENCE
+-----------
+`GoalStore` creates two auxiliary tables in `goal_1.db`:
+
+  goal_continuation_deferral
+  goal_failure_streak
+
+They deliberately have no session foreign key, for the same restart/compaction
+survival reason as the `goal` table. Replacing or resuming a goal clears stale
+auxiliary state.
+
+GUARD AND AUDIT COVERAGE
+------------------------
+Tests cover SQL regeneration after transcript compaction, XML escaping, every
+continuation guard, one-shot deferral consumption, restart persistence, the
+three-matching-signal threshold, clearing mismatched streaks, and terminal-error
+blocking. Tool tests cover schemas, output metadata, ownership, invalid budgets,
+active-goal replacement refusal, and the blocked audit.
+
+VERIFICATION (first successful run; not repeated)
+-------------------------------------------------
+  cargo check -p oc-goal --all-targets ............... passed
+  cargo test -p oc-goal .............................. 57 passed; 0 failed
+  cargo clippy -p oc-goal --all-targets -- -D warnings passed; 0 warnings
+  cargo fmt --all .................................... completed
+  lsp_diagnostics, 10 changed Rust files ............. 0 diagnostics
+  git diff --check ................................... clean
+
+The LSP MCP is rooted at the main worktree and rejected direct paths under
+`/config/workspace/ProdDir/AI/oc-wt/t68`. The same files were copied into the
+temporary linked validation worktree
+`/config/workspace/ProdDir/AI/opencode-rust/.lsp-t68-copy`, where the MCP reported
+zero diagnostics. The temporary worktree is removed before commit.
+
+BOUNDARIES
+----------
+- The start lock is process-local; no cross-process exclusion is claimed.
+- Goal context is synthetic request context, not durable conversation history.
+- Model status ownership remains type-enforced by `ModelStatus` from Task 67.
+- No workspace-wide test command was run; verification was scoped to `oc-goal` as
+  required.

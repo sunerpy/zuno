@@ -1,0 +1,251 @@
+Task 74 - crates/oc-tui/src/keybind.rs: keybind engine, leader sequences, 184 bindings
+Worktree /config/workspace/ProdDir/AI/oc-wt/t74, branch task-74 from main (0999d02)
+Oracle (read-only): /config/workspace/ProdDir/AI/opencode @ 1.18.13 / aefaf140c1
+
+=====================================================================
+1. THE REAL TABLE SIZE, MEASURED
+=====================================================================
+$ grep -c 'keybind(' packages/tui/src/config/keybind.ts          -> 184
+$ grep -o 'keybind(' packages/tui/src/config/keybind.ts | wc -l  -> 184   (one per line)
+$ grep -cE '^\s+[A-Za-z_][A-Za-z0-9_]*: keybind\(' ...           -> 164
+$ grep -cE '^\s+"[^"]+": keybind\(' ...                          ->  20
+
+The prompt's "~20 calls in another position" are NOT nested or differently
+shaped calls. They are the twenty entries whose *name contains a dot* and so
+must be a quoted object key (keybind.ts:202-221):
+
+  dialog.select.prev / next / page_up / page_down / home / end / submit
+  dialog.prompt.submit          dialog.mcp.toggle
+  dialog.move_session.new / delete / refresh
+  prompt.autocomplete.prev / next / hide / select / complete
+  permission.prompt.fullscreen  plugins.toggle   dialog.plugins.install
+
+They are ordinary rows of the same `Definitions` object. So the table is
+184 entries: 183 actions + the `leader` row (keybind.ts:46), which configures
+the leader chord rather than an action.
+
+$ sed -n '256,420p' packages/tui/src/config/keybind.ts | grep -cE '^\s+[A-Za-z_"]'  -> 163
+CommandMap has 163 entries = 164 unquoted names minus `leader`. The 20 dotted
+names are absent from CommandMap and reach their command through
+`CommandMap[name] ?? name` (keybind.ts:423), i.e. the name IS the command.
+
+=====================================================================
+2. EXTRACTION COMMAND (fixture is mechanically regenerable)
+=====================================================================
+The committed oracle is crates/oc-tui/tests/fixtures/upstream-keybinds-1.18.13.tsv
+(184 rows, 5 columns: name, keys, command, prevent_default, description).
+
+Regenerate with (script body reproduced below, following todo 55's precedent):
+
+  python3 /tmp/oc-t74/extract.py \
+      /config/workspace/ProdDir/AI/opencode/packages/tui/src/config/keybind.ts \
+    > crates/oc-tui/tests/fixtures/upstream-keybinds-1.18.13.tsv
+
+extract.py (self-checking: exits non-zero on any unparsed row or a count != 184):
+
+  import re, sys
+  src = open(sys.argv[1], encoding="utf-8").read()
+  lines = src.splitlines()
+  def block(start_marker, end_marker):
+      a = next(i for i, l in enumerate(lines) if l.startswith(start_marker))
+      b = next(i for i, l in enumerate(lines[a:], a) if l.startswith(end_marker))
+      return lines[a + 1 : b]
+  cmd = {}
+  for l in block("export const CommandMap = {", "} satisfies BindingCommandMap"):
+      m = re.match(r'\s*("?)([A-Za-z0-9_.]+)\1:\s*"([^"]*)",\s*$', l)
+      if m: cmd[m.group(2)] = m.group(3)
+  entry = re.compile(r'^\s*("?)(?P<name>[A-Za-z0-9_.]+)\1:\s*keybind\((?P<val>.*?),\s*"(?P<desc>(?:[^"\\]|\\.)*)"\)\s*,?\s*$')
+  rows = []
+  for l in block("export const Definitions = {", "} satisfies Record<string, Definition>"):
+      if "keybind(" not in l: continue
+      m = entry.match(l)
+      if not m: sys.exit(f"unparsed keybind entry: {l!r}")
+      val, name, desc = m.group("val").strip(), m.group("name"), m.group("desc")
+      prevent = ""
+      if val.startswith("{"):
+          k = re.search(r'key:\s*"([^"]*)"', val); p = re.search(r'preventDefault:\s*(true|false)', val)
+          if not k: sys.exit(f"object default without a string key: {val!r}")
+          keys, prevent = k.group(1), (p.group(1) if p else "")
+      elif val == "LeaderDefault":
+          keys = re.search(r'export const LeaderDefault = "([^"]*)"', src).group(1)
+      elif val.startswith('"'): keys = val[1:-1]
+      else: sys.exit(f"unhandled default expression: {val!r}")
+      rows.append((name, keys, cmd.get(name, name), prevent, desc))
+  if len(rows) != 184: sys.exit(f"expected 184 entries, extracted {len(rows)}")
+  print("# name\tkeys\tcommand\tprevent_default\tdescription")
+  for r in rows: print("\t".join(r))
+
+The Rust `DEFINITIONS` table in src/keybind.rs was generated from the same TSV
+by gentable.py, which adds the derived `scope` column:
+
+  def scope(name):
+      return name.rsplit(".", 1)[0] if "." in name else name.split("_", 1)[0]
+
+Reproducibility check, this run:
+$ diff <(python3 extract.py <oracle>) <(grep -v '^#' fixtures/upstream-keybinds-1.18.13.tsv)
+  -> FIXTURE REPRODUCIBLE (byte-identical)
+
+=====================================================================
+3. MEASURED FACTS THAT DECIDED THE DESIGN
+=====================================================================
+Multi-key + leader-mixing (keybind.ts:48): app_exit = "ctrl+c,ctrl+d,<leader>q".
+  28 of 184 defaults contain "<leader>"; 28 carry more than one comma-separated
+  spelling. So the table is action -> [sequence...], never action -> key.
+
+Scope derivation, measured over the real table:
+  rule "first `_` segment"            -> 33 scopes,  1 conflicting (scope,key) pair
+                                         ('dialog','return'): dialog.select.submit
+                                         vs dialog.prompt.submit
+  rule "namespace before last `.`,
+        else first `_` segment"       -> 39 scopes,  0 conflicting pairs
+The second rule is what is implemented. The shipped defaults are therefore
+conflict-free by construction, so any conflict a build reports comes from user
+config -- which is what makes conflict reporting useful instead of noise.
+39 namespaces = 38 action scopes + `leader`.
+
+Modifier/base-key inventory over all defaults:
+  modifiers: LEADER, alt, ctrl, shift, super
+  base keys: - . 1..9 ? E [ ] a b backspace c d delete down e end escape enter f
+             f2 g h home i j k l left m n p pagedown pageup q r return right s
+             space t tab u up v w x y z
+`enter` and `return` both appear and are one physical key; `E` (bare uppercase)
+and `shift+i` are the same shape spelled two ways; `?` is a shifted glyph a
+terminal may report with or without the SHIFT flag. Chord::new normalizes all
+three so a config written either way resolves.
+
+43 of 184 defaults are "none" (unbound).
+
+=====================================================================
+4. VERIFICATION
+=====================================================================
+$ cargo build --workspace --offline
+  Finished `dev` profile [unoptimized + debuginfo] target(s) in 20.83s      CLEAN
+
+$ cargo test -p oc-tui --offline
+  Running unittests src/lib.rs
+  test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+  Doc-tests oc_tui
+  test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+  Per target: lib 45, doc-tests 0. No integration-test target (tests/ holds only fixtures/).
+  Todo 73's 10 app::tests::* are all present and green:
+    app_declares_bounded_lossless_channel_capacities
+    app_force_reclaim_surfaces_the_brokers_diagnostic_and_repaints
+    app_terminal_session_can_drop_while_a_panic_is_unwinding
+    app_terminal_guard_restores_on_an_early_error_return
+    app_event_loop_consumes_both_bounded_channels_and_resize_relays_out
+    app_event_loop_defers_engine_rendering_while_a_lease_owns_the_tty
+    app_panic_inside_the_event_loop_restores_before_reporting
+    app_component_tree_renders_into_an_offscreen_buffer
+    app_real_owner_keeps_the_brokers_refusal_policy
+    app_tty_yield_round_trip_reenters_and_repaints_the_tui
+  New: 25 keybind::tests::*, 10 config::tests::*.
+
+$ cargo test -p oc-tui --offline keybind        (the plan's literal filter)
+  running 25 tests
+  test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out
+  (NOT "0 passed; N filtered out")
+
+$ cargo clippy --workspace --all-targets --offline 2>&1 | grep -cE '^(warning|error)'
+  0
+
+$ cargo fmt --all --check
+  FMT CLEAN (no output)
+
+$ cargo metadata --locked --offline    -> see section 6 (run post-commit)
+
+Concurrency (3 rounds x 6 parallel `cargo test -p oc-tui`, counting FAILED lines):
+  round 1: 0 0 0 0 0 0
+  round 2: 0 0 0 0 0 0
+  round 3: 0 0 0 0 0 0
+  18/18 runs, zero failures. The keybind engine adds no process-global state, so
+  todo 73's panic-hook dispatcher (one permanent OnceLock hook + a session-lifetime
+  mutex) remains the only global and is untouched.
+
+No test requires a TTY: resolution is pure logic over an injected `Instant`, and
+the dispatcher test drives crossterm KeyEvent values directly.
+
+=====================================================================
+5. MUTATION PROOFS
+=====================================================================
+--- Mutation 1: delete `session_compact` from DEFINITIONS -----------
+test keybind::tests::table_matches_the_upstream_fixture_row_for_row ... FAILED
+test keybind::tests::every_binding_resolves_to_its_documented_action ... FAILED
+test result: FAILED. 16 passed; 9 failed; 0 ignored; 0 measured; 20 filtered out
+
+The deleted binding is named verbatim:
+  ---- keybind::tests::every_binding_resolves_to_its_documented_action stdout ----
+  thread '...' panicked at crates/oc-tui/src/keybind_tests.rs:163:32:
+  `session_compact` is missing from DEFINITIONS
+
+and the floor assertion also fires:
+  ---- keybind::tests::table_matches_the_upstream_fixture_row_for_row stdout ----
+  thread '...' panicked at crates/oc-tui/src/keybind_tests.rs:99:5:
+  assertion `left == right` failed: DEFINITIONS has 183 rows, expected 184
+    left: 183
+   right: 184
+
+--- Mutation 2: let a duplicate silently win ------------------------
+`if actions.len() > 1 {` -> `if false && actions.len() > 1 {` in collect_conflicts,
+i.e. the first binding wins and nothing is reported.
+
+test keybind::tests::a_duplicate_binding_is_reported_with_both_actions_named ... FAILED
+test keybind::tests::three_actions_on_one_key_all_appear_in_the_report ... FAILED
+test result: FAILED. 23 passed; 2 failed; 0 ignored; 0 measured; 20 filtered out
+
+  ---- keybind::tests::a_duplicate_binding_is_reported_with_both_actions_named stdout ----
+  thread '...' panicked at crates/oc-tui/src/keybind_tests.rs:402:46:
+  a duplicate must not build: Keymap { leader: Chord { modifiers: Modifiers(1),
+  key: Char('x') }, leader_timeout: 2s, scopes: {...}}     <- it built instead
+
+Both mutations reverted; the suite is back to 45/45.
+
+=====================================================================
+6. THE DUPLICATE REPORT, VERBATIM (QA failure scenario)
+=====================================================================
+User config: { "keybinds": { "session_new": "<leader>l" } }
+(session_list already holds <leader>l, same `session` scope)
+
+  Conflict::to_string()
+  `ctrl+x l` is bound to both `session_list` and `session_new` in scope `session`
+
+  KeybindError::to_string()
+  1 keybind conflict:
+    `ctrl+x l` is bound to both `session_list` and `session_new` in scope `session`
+
+Three actions on one key (both remain named, none is hidden):
+  `ctrl+x l` is bound to all of `session_fork`, `session_list`, and `session_new` in scope `session`
+
+A short binding that makes a longer sequence unreachable is reported too
+(config: { "keybinds": { "session_new": "ctrl+x" } }):
+  `ctrl+x` is bound to both `session_export` and `session_new` in scope `session`,
+  which shadows the longer sequence `ctrl+x x`
+
+=====================================================================
+7. TUI-ONLY CONFIG KEYS DEFINED (for merge reconciliation with t75)
+=====================================================================
+crates/oc-tui/src/config.rs, struct `TuiConfig` (oracle packages/tui/src/config/index.tsx:53-66):
+  $schema, keybinds, leader_timeout, prompt{max_height,max_width}, scroll_speed,
+  scroll_acceleration{enabled}, diff_style, mouse
+Resolved form `ResolvedTuiConfig` applies index.tsx:114-115 defaults
+(leader_timeout 2000ms, mouse true) and the index.tsx:90-98 terminal-suspend fork.
+DELIBERATELY ABSENT, one additive field each for their owner:
+  theme (todo 75), attention (todo 77), plugin / plugin_enabled (plugin wave)
+Unknown keys are IGNORED, not rejected (Effect Schema default onExcessProperty
+is "ignore"), so a config carrying `theme` already parses today.
+
+=====================================================================
+8. PLAN DISCREPANCIES FOUND
+=====================================================================
+a) The plan's QA "happy" scenario for todo 74 -- "a resize event re-lays out
+   without artifacts" -- belongs to todo 73's event loop, not the keybind engine.
+   Copy-paste slip. Substituted the scenario that matters here: a leader sequence
+   resolving end to end (test a_leader_sequence_resolves_end_to_end). Resize is
+   already covered by todo 73's app_event_loop_consumes_both_bounded_channels_and_resize_relays_out.
+b) "all 184 bindings resolve to their documented action" is not literally
+   achievable: 43 defaults are "none" and 1 (`leader`) is not an action. All 184
+   fixture rows ARE asserted -- 140 by replaying every spelling to its action, 43
+   by asserting they are unbound, 1 by asserting it configures the leader chord --
+   and the test carries explicit floor assertions (184 rows, 43 unbound,
+   >=170 sequences replayed) so it cannot pass vacuously.
+c) 184 itself is correct, and so is the draft's B14 note. No count discrepancy
+   this time.

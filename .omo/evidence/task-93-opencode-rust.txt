@@ -1,0 +1,155 @@
+================================================================================
+Task 93 - measure and freeze the TypeScript memory baseline
+worktree : /config/workspace/ProdDir/AI/oc-wt/t93
+branch   : task-93
+commit   : 69248a6e589c67e8be910e546778ca36921b8038  test(perf): measure and freeze the typescript memory baseline
+generated: 2026-08-05T15:59:24+00:00
+================================================================================
+
+--- 1. ORACLE UNDER MEASUREMENT ----------------------------------------------
+/config/.local/share/mise/installs/opencode/1.18.12/opencode (1.18.12)
+binary self-reported version : 1.18.12
+pinned source tree version   : 1.18.13
+NOTE the bare 'opencode' on PATH is a mise shim -> /config/.local/bin/mise;
+     the absolute installs path was measured so no launcher sits inside the tree.
+NOTE the binary measured is 1.18.12. The pinned oracle source tree is 1.18.13;
+     the released binary installed on this machine is what users run, so it is
+     what the baseline attributes.
+
+--- 2. MACHINE ---------------------------------------------------------------
+  hostname             ip-192-168-157-161
+  kernel               6.17.0-1019-aws
+  cpu_model            Intel(R) Xeon(R) 6975P-C
+  logical_cpus         32
+  ram_kib              64767892
+  typescript_binary    /config/.local/share/mise/installs/opencode/1.18.12/opencode
+  typescript_version   1.18.12
+  ram_gib              61.8
+
+--- 3. COMMITTED ARTIFACT: EVERY NUMBER RE-DERIVED FROM ITS OWN SAMPLES ------
+  schema_version=1  methodology_revision=2  subject=typescript-only
+  retained raw RSS samples: 1500
+
+  === w-idle   turns=1  window=150s  smoke_only=False
+      warm-up discard applied: 0s
+      rep1  peak=   878432 KiB =   857.8 MiB   samples=75  trace=148s  re-derived=878432 [OK]
+      rep2  peak=  1001568 KiB =   978.1 MiB   samples=75  trace=148s  re-derived=1001568 [OK]
+      rep3  peak=   954240 KiB =   931.9 MiB   samples=75  trace=148s  re-derived=954240 [OK]
+      rep4  peak=   888280 KiB =   867.5 MiB   samples=75  trace=148s  re-derived=888280 [OK]
+      rep5  peak=   990168 KiB =   967.0 MiB   samples=75  trace=148s  re-derived=990168 [OK]
+      median_peak_rss_kib = 954240 KiB = 931.9 MiB   [re-derived 954240: OK]
+      run-to-run spread   min/median/max = 878432/954240/1001568 KiB   max/min = 1.140
+
+  === w-real   turns=1  window=450s  smoke_only=False
+      session=ses_2bcaee257ffeFZNJrmtpi3ZglR
+      messages=931  parts=3620  part_data_bytes=105118812
+      warm-up discard applied: 0s
+      rep1  peak=  3465388 KiB =  3384.2 MiB   samples=225  trace=448s  re-derived=3465388 [OK]
+      rep2  peak=  3026992 KiB =  2956.0 MiB   samples=225  trace=448s  re-derived=3026992 [OK]
+      rep3  peak=  3016072 KiB =  2945.4 MiB   samples=225  trace=448s  re-derived=3016072 [OK]
+      rep4  peak=  3063628 KiB =  2991.8 MiB   samples=225  trace=448s  re-derived=3063628 [OK]
+      rep5  peak=  2939880 KiB =  2871.0 MiB   samples=225  trace=448s  re-derived=2939880 [OK]
+      median_peak_rss_kib = 3026992 KiB = 2956.0 MiB   [re-derived 3026992: OK]
+      run-to-run spread   min/median/max = 2939880/3026992/3465388 KiB   max/min = 1.179
+
+  === w-soak   turns=20  window=150s  smoke_only=True
+      median_peak_rss_kib = null   *** NOT MEASURED ***
+      deferred_reason: not measured: the 20-turn W-soak smoke is not a G3 input and was not pursued; the full W-soak of 500 turns over 2 hours remains owed by the G3 gate. Smoke attempt reported: TypeScript W-soak workload failed: only 0 of 20 cassette-backed turns completed; captured 2 provider request(s)
+
+--- 4. FROZEN FORMULAS: NOT TOUCHED, DIGEST VERIFIED -------------------------
+  sha256(formula section) = db49ffeb3a19a265a948e5545afe14e245f8ac7c8201ae1b1e1748e87f6922ad
+  digest registered for revisions 1 and 2 in methodology.rs:
+                            db49ffeb3a19a265a948e5545afe14e245f8ac7c8201ae1b1e1748e87f6922ad
+
+    **G1 pass** iff `median_peak(rust, W-idle) ≤ 0.50 × median_peak(ts, W-idle)`.
+    **G2 pass** iff `median_peak(rust, W-real) ≤ 0.50 × median_peak(ts, W-real)`.
+    **G3 pass** iff the Theil–Sen slope of RSS over the final 50% of samples is `≤ 1 MB / turn` **and** `peak(final 10%) ≤ 1.5 × peak(turns 40-60)`.
+    **G4 pass** iff no turn exceeds **120s without state progress** and no turn exceeds a **hard deadline of 1800s**.
+
+  git proof that no formula line changed in this task's commit:
+    (no matching +/- lines: the four formulas and both markers are byte-identical)
+
+--- 5. THRESHOLDS WAVE 14 INHERITS BY SUBSTITUTION ONLY ----------------------
+  G1  rust W-idle median peak  <=  0.50 x    931.9 MiB  =     465.9 MiB
+  G2  rust W-real median peak  <=  0.50 x   2956.0 MiB  =    1478.0 MiB
+  G3  Theil-Sen <= 1 MB/turn over final 50% AND peak(final 10%) <= 1.5 x peak(turns 40-60)
+      *** BLOCKED: no TypeScript W-soak measurement exists. See section 3. ***
+  G4  no turn > 120s without state progress, no turn > 1800s hard deadline
+      (G3 and G4 need no TypeScript median; they are absolute predicates.)
+
+--- 6. QA FAILURE PATH: THE HARNESS REFUSES TO INVENT NUMBERS ----------------
+  6a. $ env -i PATH=/usr/bin:/bin HOME=/config ts-baseline measure --output /config/tmp/oc-t93/masked.json
+      oracle binary not found.
+        expected at: opencode (via PATH)
+        also searched: /usr/bin:/bin
+        remedy: install the real opencode CLI, or set OC_TESTKIT_ORACLE to its path
+      exit=1
+      artifact NOT written: no zeros, no placeholder, nothing recorded.
+
+  6b. $ ... OC_TESTKIT_ORACLE=/nonexistent/opencode ts-baseline measure ...
+      oracle binary not found.
+        expected at: /nonexistent/opencode
+        also searched: (nothing else)
+        remedy: build or install the real opencode CLI at that path, or point OC_TESTKIT_ORACLE somewhere it exists
+      exit=1
+
+  6c. oracle present, but no user session history for W-real:
+      W-real database is unavailable at /config/tmp/oc-t93/empty-xdg/opencode/opencode.db: build a real session history with the TypeScript opencode CLI first
+      exit=1
+
+--- 7. TESTS -----------------------------------------------------------------
+  test perf::process_tree::tests::a_reaped_child_contributes_no_resident_memory_instead_of_failing_the_run ... ok
+  test perf::process_tree::tests::process_tree_walk_includes_transitive_children ... ok
+  test perf::process_tree::tests::status_parser_reads_rss_in_kib ... ok
+  test perf::runner::tests::a_restored_sessions_window_outlasts_its_post_hydration_turn ... ok
+  test perf::runner::tests::a_failed_soak_smoke_is_deferred_while_a_failed_full_soak_fails_the_report ... ok
+  test perf::runner::tests::only_the_soak_discards_warm_up_samples ... ok
+  test perf::runner::tests::only_real_workload_requires_database ... ok
+  test perf::runner::tests::paired_order_alternates_ab_then_ba ... ok
+  test perf::workload_tests::a_bounded_workloads_peak_includes_its_cold_start ... ok
+  test perf::workload_tests::a_restored_sessions_first_turn_waits_for_the_hydration_gate ... ok
+  test perf::workload_tests::baseline_tool_fixture_has_no_external_import ... ok
+  test perf::workload_tests::only_a_restored_session_needs_its_first_turn_typed ... ok
+  test perf::workload_tests::baseline_config_allows_custom_tool_without_ui_permission_flow ... ok
+  test perf::workload_tests::oracle_command_keeps_auto_approval_enabled_for_tool_turns ... ok
+  test perf::workload_tests::the_text_prelude_does_not_count_as_a_completed_tool_turn ... ok
+  test perf::workload_tests::baseline_tool_fixture_provisions_offline_dependency_state ... ok
+  test perf::methodology::tests::methodology_formula_section_matches_its_revision_hash ... ok
+  test perf::baseline::tests::baseline_artifact_contains_every_frozen_workload ... ok
+  test perf::baseline::tests::every_committed_peak_is_reproducible_from_its_retained_samples ... ok
+  test perf::baseline::tests::committed_baseline_records_the_spread_of_every_measured_workloads_peaks ... ok
+  test perf::methodology::tests::frozen_formulas_produce_finite_numeric_thresholds ... ok
+  test perf::database::tests::snapshot_contains_wal_rows_without_sidecars ... ok
+  test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 72 filtered out; finished in 0.09s
+
+  whole crate, every target:
+  test result: ok. 94 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+  test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.59s
+  test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+--- 8. WORKSPACE VERIFICATION ------------------------------------------------
+  $ cargo build --workspace
+          Finished `dev` profile [unoptimized + debuginfo] target(s) in 16.20s
+  $ cargo clippy --workspace --all-targets
+          Finished `dev` profile [unoptimized + debuginfo] target(s) in 20.61s
+  $ cargo fmt --all -- --check
+      (clean: no diff)
+
+--- 9. WHAT IS NOT MEASURED --------------------------------------------------
+  W-soak has no measurement. It is recorded as null with a reason, not as zero.
+  Todos 88-90 must still produce it: at least 500 turns over at least two hours,
+  cassette-backed, with a watcher on at least 50,000 files, at least two real LSP
+  servers, one tool result of at least 50 MB, one PTY emitting at least 100 MB, and
+  at least one compaction cycle. Until that exists, G3 has no evidence at all -
+  neither a pass nor a fail - because G3's predicate is about growth over a long
+  run and a 20-turn smoke cannot express it.
+
+  A second full measurement pass was attempted twice and completed neither time;
+  neither incomplete pass contributed a number to the artifact. Run-to-run
+  stability is therefore evidenced from the five per-run peaks inside the one
+  completed pass (section 3), which measures the same variance from data the
+  artifact retains. The measured spread is 1.140x for W-idle and 1.179x for
+  W-real, both wider than a two-pass 10% agreement criterion would have allowed,
+  so the spread is reported rather than a tolerance asserted.

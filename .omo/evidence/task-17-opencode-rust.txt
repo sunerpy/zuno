@@ -1,0 +1,135 @@
+==============================================================
+Task 17 — oc-permission visibility (hide fully-denied tools)
+worktree: /config/workspace/ProdDir/AI/oc-wt/t17  branch: task-17
+base main: 9e4017c   date: 2026-08-05T08:37:47Z
+==============================================================
+
+### ORACLE (packages/opencode/src/permission/index.ts:204-219)
+export function disabled(tools: string[], ruleset: PermissionV1.Ruleset): Set<string> {
+  const edits = ["edit", "write", "apply_patch"]
+  const reads = ["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"]
+  return new Set(
+    tools.filter((tool) => {
+      const permission = edits.includes(tool) ? "edit" : reads.includes(tool) ? "read" : tool
+      const rule = ruleset.findLast((rule) => Wildcard.match(permission, rule.permission))
+      return rule?.pattern === "*" && rule.action === "deny"
+    }),
+  )
+}
+
+export function visibleTools<T>(tools: Record<string, T>, ruleset: PermissionV1.Ruleset): Record<string, T> {
+  const hidden = disabled(Object.keys(tools), ruleset)
+  return Object.fromEntries(Object.entries(tools).filter(([name]) => !hidden.has(name)))
+}
+
+### ORACLE MCP_RESOURCE_TOOLS (session/tools.ts:28-32)
+  list: "list_mcp_resources",
+  listTemplates: "list_mcp_resource_templates",
+  read: "read_mcp_resource",
+} as const
+const MAX_MCP_RESOURCE_BLOB_BYTES = 10 * 1024 * 1024
+
+### ORACLE merge call sites (agent first, session last -> session wins under findLast)
+/config/workspace/ProdDir/AI/opencode/packages/opencode/src/session/tools.ts:87:          ruleset: Permission.merge(input.agent.permission, input.session.permission ?? []),
+/config/workspace/ProdDir/AI/opencode/packages/opencode/src/tool/registry.ts:280:      const ruleset = Permission.merge(input.agent.permission, input.permission ?? [])
+
+### AC1+AC2+AC4: cargo test -p oc-permission visibility
+   Compiling oc-permission v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t17/crates/oc-permission)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.56s
+     Running unittests src/lib.rs (/config/workspace/ProdDir/AI/opencode-rust/target/debug/deps/oc_permission-7fe7f2356a81140c)
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/evaluate.rs (/config/workspace/ProdDir/AI/opencode-rust/target/debug/deps/evaluate-d01630323e0afe32)
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+     Running tests/qa_scenarios.rs (/config/workspace/ProdDir/AI/opencode-rust/target/debug/deps/qa_scenarios-34d2633b1f3d73a7)
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+     Running tests/replies.rs (/config/workspace/ProdDir/AI/opencode-rust/target/debug/deps/replies-0a68aafe30ab2cc6)
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+     Running tests/visibility.rs (/config/workspace/ProdDir/AI/opencode-rust/target/debug/deps/visibility-31bae8f8e957ea5a)
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.00s
+     Running tests/wildcard.rs (/config/workspace/ProdDir/AI/opencode-rust/target/debug/deps/wildcard-5bc59e2759b350f7)
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+### AC4 (literal acceptance command): cargo test -p oc-permission visibility
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+running 23 tests
+test visibility_a_bare_deny_action_hides_every_tool ... ok
+test visibility_a_denied_tool_is_absent_from_the_resolved_tool_list ... ok
+test visibility_a_later_specific_allow_survives_an_earlier_wildcard_key_deny ... ok
+test visibility_a_narrower_deny_pattern_keeps_the_tool_visible_and_refuses_only_matches ... ok
+test visibility_a_plan_style_agent_exposes_no_write_capable_tools ... ok
+test visibility_a_session_deny_hides_a_tool_the_agent_allowed ... ok
+test visibility_a_specific_allow_after_a_wildcard_deny_keeps_the_tool_visible ... ok
+test visibility_a_wildcard_allow_after_a_narrow_deny_keeps_the_tool_visible ... ok
+test visibility_a_wildcard_key_deny_hides_aliases_through_their_permission_key ... ok
+test visibility_alias_keys_cover_exactly_the_oracle_groups ... ok
+test visibility_a_wildcard_key_deny_hides_every_tool ... ok
+test visibility_an_agent_deny_still_hides_when_the_session_says_nothing ... ok
+test visibility_an_ask_rule_never_hides_a_tool ... ok
+test visibility_an_earlier_specific_allow_loses_to_a_later_wildcard_key_deny ... ok
+test visibility_an_empty_ruleset_hides_nothing ... ok
+test visibility_denying_edit_removes_edit_write_and_apply_patch_together ... ok
+test visibility_disabled_tools_reports_every_hidden_name ... ok
+test visibility_merge_rulesets_concatenates_in_argument_order ... ok
+test visibility_denying_read_removes_all_three_mcp_resource_tools ... ok
+test visibility_retain_visible_tools_drops_hidden_entries_in_place ... ok
+test visibility_session_rules_are_appended_after_agent_rules_and_therefore_win ... ok
+test visibility_visible_tools_filters_records_and_preserves_order ... ok
+test visibility_a_hidden_tool_is_denied_for_every_input ... ok
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+### QA SCENARIO 1 (happy) — plan-style agent {"edit":"deny"} exposes no write-capable tools
+[QA-HAPPY] config              = {"edit": "deny"}
+[QA-HAPPY] registry tool list  = ["bash", "edit", "write", "apply_patch", "read", "grep", "glob", "list", "task", "webfetch", "todowrite", "skill", "list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"]
+[QA-HAPPY] tools sent to model = ["bash", "read", "grep", "glob", "list", "task", "webfetch", "todowrite", "skill", "list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"]
+[QA-HAPPY] list contains         edit = false
+[QA-HAPPY] list contains        write = false
+[QA-HAPPY] list contains  apply_patch = false
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+### QA SCENARIO 2 (failure path) — {"bash":{"rm *":"deny"}} stays VISIBLE, refused only on match
+[QA-FAIL] config                        = {"bash": {"rm *": "deny"}}
+[QA-FAIL] flattened rules               = [Rule { permission: "bash", pattern: "rm *", action: Deny }]
+[QA-FAIL] bash visible to model         = true
+[QA-FAIL] evaluate(bash,'rm -rf /tmp/x')= Deny
+[QA-FAIL] evaluate(bash,'git status')   = Ask
+[QA-FAIL] authorize('rm -rf /tmp/x')    -> Err(Denied { tool: "bash" })  <- refused at call time
+[QA-FAIL] authorize('git status')       -> Ok(Pending)  <- asks the user, not refused
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+### AC5: cargo fmt --all --check
+(no output = clean, exit 0)
+
+### AC5: cargo build --workspace
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.59s
+
+### AC5: cargo clippy --workspace --all-targets (zero warnings)
+    Checking oc-permission v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t17/crates/oc-permission)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.00s
+warning/error line count: 0
+
+### Full suite: cargo test --workspace
+aggregate: passed=556 failed=0  (main had 533; +23 new)
+
+### DEFECT FOUND IN TODO 16 wildcard_match (reported, NOT fixed here)
+rust : wildcard_match("*.txt", "*") = false      crates/oc-permission/src/wildcard.rs matches_units
+ts   : Wildcard.match("*.txt", "*") = true       packages/core/src/util/wildcard.ts
+cause: the literal/'?' branch is tested BEFORE the '*' branch, so a '*' in the INPUT is
+       consumed literally by the '*' in the PATTERN and backtracking never starts.
+impact: {"bash":"deny"} evaluates the command '*.txt' to Ask instead of Deny.
+        Tool VISIBILITY is unaffected (its input is a tool name, never containing '*').
+SHA: ad99fa14c2fa21779c76ebe5c449cc5544278ebb

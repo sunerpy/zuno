@@ -1,0 +1,49 @@
+Task 34 — stream projection with batched delta persistence
+Date: 2026-08-05
+Worktree: /config/workspace/ProdDir/AI/oc-wt/t34
+
+RED TEST
+Command: CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target cargo test -p oc-engine stream
+Output: error[E0432]: unresolved import `oc_engine::stream`; could not compile `oc-engine` (test "stream").
+
+TARGETED ACCEPTANCE
+Command: cargo fmt -p oc-engine && cargo fmt -p oc-engine -- --check && CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target cargo test -p oc-engine stream -- --nocapture
+Output: stream tests 7 passed, 0 failed; filtered loop interrupt regression 1 passed; fmt check exited 0.
+Measured batching transcript: BATCH_QA deltas=5000 delta_writes=2 bound=2 final_bytes=5000
+Happy QA transcript: HAPPY_QA response_bytes=51200 text_parts=1 delta_writes=13
+Failure QA transcript: FAILURE_QA synthesized_tool_part={callID:"call-incomplete", type:"tool", state:{status:"error", error:"provider stream ended before ToolUseEnd", input:{}, metadata:{synthetic:true}, raw:"{\"filePath\":\"README.md\""}}
+Rollback DB transcript: ROLLBACK_QA remaining_parts=[step-start, retry(attempt=2)]; no text/reasoning/tool/file attempt part remained.
+
+LSP/IDE DIAGNOSTICS
+MCP lsp_diagnostics limitation: rejected /config/workspace/ProdDir/AI/oc-wt/t34 as outside fixed request cwd.
+Equivalent command: CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target rust-analyzer diagnostics .
+Output: diagnostic scan complete; no diagnostic referenced changed oc-engine files. Only pre-existing inactive-code WeakWarnings appeared in other crates.
+
+WORKSPACE GATES
+Command: CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target cargo build --workspace
+Output: Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.60s
+Command: CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target cargo clippy --workspace --all-targets -- -D warnings
+Output: Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.66s; exit 0, zero compiler/clippy warnings
+Command: CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target cargo test --workspace
+Output: Finished `test` profile [unoptimized + debuginfo] target(s) in 1.26s; 118 result suites, 1405 passed, 0 failed (one pre-existing ignored doctest).
+
+COMPLETE PART MAPPING SUMMARY
+text <- TextDelta, terminal MessageEnd/finish_incomplete
+subtask <- no StreamEvent (delegation/user-input concern)
+reasoning <- ReasoningStart/Delta/SignatureDelta/End/Done, ProviderReasoningItem
+file <- GeneratedImage
+tool <- ToolUseStart/InputDelta/UseEnd/Signature, ToolResult, NativeToolCall, incomplete finish
+step-start <- projector start lifecycle
+step-finish <- MessageEnd
+snapshot <- no StreamEvent; hash embedded in step-start/step-finish per oracle
+patch <- MessageEnd terminal snapshot diff
+agent <- no StreamEvent (input/mention concern)
+retry <- RetryRollback
+compaction <- Compaction
+TokenUsage feeds step-finish/message accounting. ConnectionType, ConnectionPhase, StatusDetail, Error, SessionId, UpstreamProvider produce no part in this module.
+
+COMMIT AND CLEANUP
+Commit: e18b1e1e47b3eb980c4c84cb500d110719d42c36
+Message: feat(engine): stream projection with batched delta persistence
+Worktree status after commit: clean (`## task-34`)
+/tmp/oc-t34: removed and verified absent

@@ -1,0 +1,90 @@
+Task 51 — secure HTTP core, directory routing, and bounded fan-out
+Date: 2026-08-06
+Worktree: /config/workspace/ProdDir/AI/oc-wt/t51
+Branch: task-51
+
+Implemented
+===========
+- Axum server defaults to 127.0.0.1:0 and prints the kernel-selected URL.
+- --hostname/--port overrides are available through `oc-server serve`.
+- Empty/absent OPENCODE_SERVER_PASSWORD disables auth; a non-empty password gates every route.
+- OPENCODE_SERVER_USERNAME defaults to `opencode` only when absent.
+- Unauthenticated non-loopback startup is rejected before bind after DNS resolution.
+- Request directory precedence is query `directory`, header `x-opencode-directory`, startup fallback.
+- Turn events can be forwarded into fixed-capacity per-subscriber queues.
+- Overflow policy is drop-newest with explicit `Delivery::Lagged { dropped }` accounting.
+
+Targeted acceptance test
+========================
+Command:
+  cargo test -p oc-server core --offline
+
+Result:
+  6 passed; 0 failed
+
+Covered cases:
+  core_no_password_accepts_requests_without_credentials
+  core_non_empty_password_requires_matching_basic_credentials_on_every_route
+  core_directory_header_and_query_forms_reach_extension_routes
+  core_non_loopback_without_password_is_refused_before_binding
+  core_default_bind_uses_loopback_and_an_ephemeral_port
+  core_stalled_subscriber_hits_a_queue_ceiling_and_observes_the_drop
+
+Static and build verification
+=============================
+Commands:
+  rust-analyzer diagnostics . --severity warning
+  cargo fmt --all --check
+  cargo build --workspace --offline
+  cargo clippy --workspace --all-targets --offline -- -D warnings
+
+Result:
+  diagnostic scan complete; no oc-server diagnostics
+  fmt passed
+  workspace build passed
+  workspace all-target clippy passed with warnings denied
+
+Concurrency regression
+======================
+Command shape:
+  for batch in 1 2 3; do
+    seq 1 6 | xargs -P6 -I{} cargo test -p oc-server \
+      core_stalled_subscriber_hits_a_queue_ceiling_and_observes_the_drop \
+      --offline --quiet
+  done
+
+Result:
+  18/18 concurrent test processes passed.
+  Each test published 1,000 events into a capacity-4 stalled subscription,
+  observed queue depth <= 4 after every publish, retained events 0..3 in order,
+  then observed Delivery::Lagged { dropped: 996 }.
+
+Real-process HTTP QA
+====================
+Binary:
+  target/debug/oc-server
+
+1. No password, ephemeral loopback bind:
+   printed URL: http://127.0.0.1:42655
+   curl GET /health: HTTP 200, body `ok`
+
+2. OPENCODE_SERVER_PASSWORD=secret:
+   printed URL: http://127.0.0.1:41399
+   curl without credentials: HTTP 401
+   curl --user opencode:secret: HTTP 200, body `ok`
+
+3. Unsafe public startup:
+   oc-server serve --hostname 0.0.0.0 --port 0
+   exit status: 1
+   stderr:
+   refusing --hostname `0.0.0.0`: a non-loopback listener would expose the
+   unauthenticated server to the network; set OPENCODE_SERVER_PASSWORD to a
+   non-empty value before using this --hostname
+
+Comment review
+==============
+Public API documentation was retained because these types are the extension
+contract for Todos 52-62. Security comments document DNS validation/bind ordering;
+concurrency comments document the Notify lost-wakeup ordering and drop policy.
+The three self-evident CLI field doc comments added during implementation were
+removed after review.

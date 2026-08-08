@@ -1,0 +1,603 @@
+# Task 44 evidence — full conditional tool registry
+
+## Flag correction: literal --help transcript
+$ /config/.local/share/mise/installs/opencode/1.18.12/opencode debug agent --help
+opencode debug agent <name>
+
+show agent configuration details
+
+Positionals:
+  name  Agent name                                                               [string] [required]
+
+Options:
+  -h, --help        show help                                                              [boolean]
+  -v, --version     show version number                                                    [boolean]
+      --print-logs  print logs to stderr                                                   [boolean]
+      --log-level   log level                   [string] [choices: "DEBUG", "INFO", "WARN", "ERROR"]
+      --pure        run without external plugins                                           [boolean]
+      --tool        Tool id to execute                                                      [string]
+      --params      Tool params as JSON or a JS object literal                              [string]
+
+Conclusion: --tool is "Tool id to execute". The working list command is `debug agent <name> --pure`; its JSON `tools` object is the resolved registry.
+
+## Differential case 1: gpt patch baseline
+$ env -i ... OPENCODE_CONFIG_CONTENT={agent:{build:{model:openai/gpt-5.2}}} opencode debug agent build --pure
+{
+  "name": "build",
+  "description": "The default agent. Executes tools based on configured permissions.",
+  "options": {},
+  "permission": [
+    {
+      "permission": "*",
+      "action": "allow",
+      "pattern": "*"
+    },
+    {
+      "permission": "doom_loop",
+      "action": "ask",
+      "pattern": "*"
+    },
+    {
+      "permission": "external_directory",
+      "pattern": "*",
+      "action": "ask"
+    },
+    {
+      "permission": "external_directory",
+      "pattern": "/tmp/opencode/task44-e1-data/opencode/tool-output/*",
+      "action": "allow"
+    },
+    {
+      "permission": "external_directory",
+      "pattern": "/tmp/opencode/*",
+      "action": "allow"
+    },
+    {
+      "permission": "question",
+      "action": "deny",
+      "pattern": "*"
+    },
+    {
+      "permission": "plan_enter",
+      "action": "deny",
+      "pattern": "*"
+    },
+    {
+      "permission": "plan_exit",
+      "action": "deny",
+      "pattern": "*"
+    },
+    {
+      "permission": "read",
+      "pattern": "*",
+      "action": "allow"
+    },
+    {
+      "permission": "read",
+      "pattern": "*.env",
+      "action": "ask"
+    },
+    {
+      "permission": "read",
+      "pattern": "*.env.*",
+      "action": "ask"
+    },
+    {
+      "permission": "read",
+      "pattern": "*.env.example",
+      "action": "allow"
+    },
+    {
+      "permission": "question",
+      "action": "allow",
+      "pattern": "*"
+    },
+    {
+      "permission": "plan_enter",
+      "action": "allow",
+      "pattern": "*"
+    },
+    {
+      "permission": "external_directory",
+      "pattern": "/tmp/opencode/task44-e1-data/opencode/tool-output/*",
+      "action": "allow"
+    }
+  ],
+  "mode": "primary",
+  "native": true,
+  "model": {
+    "providerID": "openai",
+    "modelID": "gpt-5.2"
+  },
+  "tools": {
+    "invalid": true,
+    "question": true,
+    "bash": true,
+    "read": true,
+    "glob": true,
+    "grep": true,
+    "task": true,
+    "webfetch": true,
+    "todowrite": true,
+    "skill": true,
+    "apply_patch": true
+  }
+}
+
+## Differential case 2: non-gpt with narrow bash deny
+$ env -i ... OPENCODE_CONFIG_CONTENT={agent:{build:{model:anthropic/claude-sonnet-4-5,permission:{bash:{git push*:deny}}}}} opencode debug agent build --pure
+{
+  "name": "build",
+  "description": "The default agent. Executes tools based on configured permissions.",
+  "options": {},
+  "permission": [
+    {
+      "permission": "*",
+      "action": "allow",
+      "pattern": "*"
+    },
+    {
+      "permission": "doom_loop",
+      "action": "ask",
+      "pattern": "*"
+    },
+    {
+      "permission": "external_directory",
+      "pattern": "*",
+      "action": "ask"
+    },
+    {
+      "permission": "external_directory",
+      "pattern": "/tmp/opencode/task44-e2-data/opencode/tool-output/*",
+      "action": "allow"
+    },
+    {
+      "permission": "external_directory",
+      "pattern": "/tmp/opencode/*",
+      "action": "allow"
+    },
+    {
+      "permission": "question",
+      "action": "deny",
+      "pattern": "*"
+    },
+    {
+      "permission": "plan_enter",
+      "action": "deny",
+      "pattern": "*"
+    },
+    {
+      "permission": "plan_exit",
+      "action": "deny",
+      "pattern": "*"
+    },
+    {
+      "permission": "read",
+      "pattern": "*",
+      "action": "allow"
+    },
+    {
+      "permission": "read",
+      "pattern": "*.env",
+      "action": "ask"
+    },
+    {
+      "permission": "read",
+      "pattern": "*.env.*",
+      "action": "ask"
+    },
+    {
+      "permission": "read",
+      "pattern": "*.env.example",
+      "action": "allow"
+    },
+    {
+      "permission": "question",
+      "action": "allow",
+      "pattern": "*"
+    },
+    {
+      "permission": "plan_enter",
+      "action": "allow",
+      "pattern": "*"
+    },
+    {
+      "permission": "bash",
+      "pattern": "git push*",
+      "action": "deny"
+    },
+    {
+      "permission": "external_directory",
+      "pattern": "/tmp/opencode/task44-e2-data/opencode/tool-output/*",
+      "action": "allow"
+    }
+  ],
+  "mode": "primary",
+  "native": true,
+  "model": {
+    "providerID": "anthropic",
+    "modelID": "claude-sonnet-4-5"
+  },
+  "tools": {
+    "invalid": true,
+    "question": true,
+    "bash": true,
+    "read": true,
+    "glob": true,
+    "grep": true,
+    "edit": true,
+    "write": true,
+    "task": true,
+    "webfetch": true,
+    "todowrite": true,
+    "skill": true
+  }
+}
+
+## Differential case 3: gpt-4 carve-out with full bash deny
+$ env -i ... OPENCODE_CONFIG_CONTENT={agent:{build:{model:openai/gpt-4.1,permission:{bash:deny}}}} opencode debug agent build --pure
+{
+  "name": "build",
+  "description": "The default agent. Executes tools based on configured permissions.",
+  "options": {},
+  "permission": [
+    {
+      "permission": "*",
+      "action": "allow",
+      "pattern": "*"
+    },
+    {
+      "permission": "doom_loop",
+      "action": "ask",
+      "pattern": "*"
+    },
+    {
+      "permission": "external_directory",
+      "pattern": "*",
+      "action": "ask"
+    },
+    {
+      "permission": "external_directory",
+      "pattern": "/tmp/opencode/task44-e3-data/opencode/tool-output/*",
+      "action": "allow"
+    },
+    {
+      "permission": "external_directory",
+      "pattern": "/tmp/opencode/*",
+      "action": "allow"
+    },
+    {
+      "permission": "question",
+      "action": "deny",
+      "pattern": "*"
+    },
+    {
+      "permission": "plan_enter",
+      "action": "deny",
+      "pattern": "*"
+    },
+    {
+      "permission": "plan_exit",
+      "action": "deny",
+      "pattern": "*"
+    },
+    {
+      "permission": "read",
+      "pattern": "*",
+      "action": "allow"
+    },
+    {
+      "permission": "read",
+      "pattern": "*.env",
+      "action": "ask"
+    },
+    {
+      "permission": "read",
+      "pattern": "*.env.*",
+      "action": "ask"
+    },
+    {
+      "permission": "read",
+      "pattern": "*.env.example",
+      "action": "allow"
+    },
+    {
+      "permission": "question",
+      "action": "allow",
+      "pattern": "*"
+    },
+    {
+      "permission": "plan_enter",
+      "action": "allow",
+      "pattern": "*"
+    },
+    {
+      "permission": "bash",
+      "action": "deny",
+      "pattern": "*"
+    },
+    {
+      "permission": "external_directory",
+      "pattern": "/tmp/opencode/task44-e3-data/opencode/tool-output/*",
+      "action": "allow"
+    }
+  ],
+  "mode": "primary",
+  "native": true,
+  "model": {
+    "providerID": "openai",
+    "modelID": "gpt-4.1"
+  },
+  "tools": {
+    "invalid": true,
+    "question": true,
+    "bash": false,
+    "read": true,
+    "glob": true,
+    "grep": true,
+    "edit": true,
+    "write": true,
+    "task": true,
+    "webfetch": true,
+    "todowrite": true,
+    "skill": true
+  }
+}
+
+## Differential case 4: gpt-oss carve-out with websearch and lsp
+$ env -i ... OPENCODE_ENABLE_EXA=true OPENCODE_EXPERIMENTAL_LSP_TOOL=true OPENCODE_CONFIG_CONTENT={agent:{build:{model:openai/gpt-oss-120b}}} opencode debug agent build --pure
+{
+  "name": "build",
+  "description": "The default agent. Executes tools based on configured permissions.",
+  "options": {},
+  "permission": [
+    {
+      "permission": "*",
+      "action": "allow",
+      "pattern": "*"
+    },
+    {
+      "permission": "doom_loop",
+      "action": "ask",
+      "pattern": "*"
+    },
+    {
+      "permission": "external_directory",
+      "pattern": "*",
+      "action": "ask"
+    },
+    {
+      "permission": "external_directory",
+      "pattern": "/tmp/opencode/task44-e4-data/opencode/tool-output/*",
+      "action": "allow"
+    },
+    {
+      "permission": "external_directory",
+      "pattern": "/tmp/opencode/*",
+      "action": "allow"
+    },
+    {
+      "permission": "question",
+      "action": "deny",
+      "pattern": "*"
+    },
+    {
+      "permission": "plan_enter",
+      "action": "deny",
+      "pattern": "*"
+    },
+    {
+      "permission": "plan_exit",
+      "action": "deny",
+      "pattern": "*"
+    },
+    {
+      "permission": "read",
+      "pattern": "*",
+      "action": "allow"
+    },
+    {
+      "permission": "read",
+      "pattern": "*.env",
+      "action": "ask"
+    },
+    {
+      "permission": "read",
+      "pattern": "*.env.*",
+      "action": "ask"
+    },
+    {
+      "permission": "read",
+      "pattern": "*.env.example",
+      "action": "allow"
+    },
+    {
+      "permission": "question",
+      "action": "allow",
+      "pattern": "*"
+    },
+    {
+      "permission": "plan_enter",
+      "action": "allow",
+      "pattern": "*"
+    },
+    {
+      "permission": "external_directory",
+      "pattern": "/tmp/opencode/task44-e4-data/opencode/tool-output/*",
+      "action": "allow"
+    }
+  ],
+  "mode": "primary",
+  "native": true,
+  "model": {
+    "providerID": "openai",
+    "modelID": "gpt-oss-120b"
+  },
+  "tools": {
+    "invalid": true,
+    "question": true,
+    "bash": true,
+    "read": true,
+    "glob": true,
+    "grep": true,
+    "edit": true,
+    "write": true,
+    "task": true,
+    "webfetch": true,
+    "todowrite": true,
+    "websearch": true,
+    "skill": true,
+    "lsp": true
+  }
+}
+
+## Differential case 5: hosted provider plan agent
+$ env -i ... OPENCODE_EXPERIMENTAL_PLAN_MODE=true OPENCODE_CONFIG_CONTENT={agent:{plan:{model:opencode/gpt-5.2}}} opencode debug agent plan --pure
+{
+  "name": "plan",
+  "description": "Plan mode. Disallows all edit tools.",
+  "options": {},
+  "permission": [
+    {
+      "permission": "*",
+      "action": "allow",
+      "pattern": "*"
+    },
+    {
+      "permission": "doom_loop",
+      "action": "ask",
+      "pattern": "*"
+    },
+    {
+      "permission": "external_directory",
+      "pattern": "*",
+      "action": "ask"
+    },
+    {
+      "permission": "external_directory",
+      "pattern": "/tmp/opencode/task44-e5-data/opencode/tool-output/*",
+      "action": "allow"
+    },
+    {
+      "permission": "external_directory",
+      "pattern": "/tmp/opencode/*",
+      "action": "allow"
+    },
+    {
+      "permission": "question",
+      "action": "deny",
+      "pattern": "*"
+    },
+    {
+      "permission": "plan_enter",
+      "action": "deny",
+      "pattern": "*"
+    },
+    {
+      "permission": "plan_exit",
+      "action": "deny",
+      "pattern": "*"
+    },
+    {
+      "permission": "read",
+      "pattern": "*",
+      "action": "allow"
+    },
+    {
+      "permission": "read",
+      "pattern": "*.env",
+      "action": "ask"
+    },
+    {
+      "permission": "read",
+      "pattern": "*.env.*",
+      "action": "ask"
+    },
+    {
+      "permission": "read",
+      "pattern": "*.env.example",
+      "action": "allow"
+    },
+    {
+      "permission": "question",
+      "action": "allow",
+      "pattern": "*"
+    },
+    {
+      "permission": "plan_exit",
+      "action": "allow",
+      "pattern": "*"
+    },
+    {
+      "permission": "task",
+      "pattern": "general",
+      "action": "deny"
+    },
+    {
+      "permission": "external_directory",
+      "pattern": "/tmp/opencode/task44-e5-data/opencode/plans/*",
+      "action": "allow"
+    },
+    {
+      "permission": "edit",
+      "pattern": "*",
+      "action": "deny"
+    },
+    {
+      "permission": "edit",
+      "pattern": ".opencode/plans/*.md",
+      "action": "allow"
+    },
+    {
+      "permission": "edit",
+      "pattern": "../../../../../../tmp/opencode/task44-e5-data/opencode/plans/*.md",
+      "action": "allow"
+    },
+    {
+      "permission": "external_directory",
+      "pattern": "/tmp/opencode/task44-e5-data/opencode/tool-output/*",
+      "action": "allow"
+    }
+  ],
+  "mode": "primary",
+  "native": true,
+  "model": {
+    "providerID": "opencode",
+    "modelID": "gpt-5.2"
+  },
+  "tools": {
+    "invalid": true,
+    "question": true,
+    "bash": true,
+    "read": true,
+    "glob": true,
+    "grep": true,
+    "task": true,
+    "webfetch": true,
+    "todowrite": true,
+    "websearch": true,
+    "skill": true,
+    "apply_patch": true,
+    "plan_exit": true
+  }
+}
+
+## Resolved visible sets asserted by the differential
+1. openai/gpt-5.2: invalid, question, bash, read, glob, grep, task, webfetch, todowrite, skill, apply_patch
+2. anthropic/claude-sonnet-4-5 + bash git-push-only deny: invalid, question, bash, read, glob, grep, edit, write, task, webfetch, todowrite, skill
+3. openai/gpt-4.1 + blanket bash deny: invalid, question, read, glob, grep, edit, write, task, webfetch, todowrite, skill (`tools.bash` is present as false in the literal transcript and hidden by the Rust registry)
+4. openai/gpt-oss-120b + Exa + LSP: invalid, question, bash, read, glob, grep, edit, write, task, webfetch, todowrite, websearch, skill, lsp
+5. opencode/gpt-5.2 + plan mode + plan agent: invalid, question, bash, read, glob, grep, task, webfetch, todowrite, websearch, skill, apply_patch, plan_exit
+
+## Verification — literal result lines from the successful run
+cargo build --workspace --offline: Finished dev profile, exit 0
+cargo test -p oc-tools registry: 6 lib + 1 file_tools + 8 registry + 1 websearch gating passed; 0 failed
+cargo test -p oc-tools --lib: 181 passed; 0 failed; 0 ignored; 0 filtered out
+cargo test -p oc-tools --test registry: 8 passed; 0 failed; 0 ignored; 0 filtered out
+cargo clippy --workspace --all-targets --offline: Finished dev profile, 0 warnings
+cargo fmt --all --check: exit 0
+cargo metadata --locked --offline >/dev/null: exit 0 (Cargo emitted its existing --format-version advisory)
+rust-analyzer diagnostics crates/oc-tools --severity warning: diagnostic scan complete
+
+## Source finding
+`FileTools::exposed_for_model` delegates to `uses_apply_patch`, whose expression is exactly `contains("gpt-") && !contains("oss") && !contains("gpt-4")`, matching registry.ts:292-295.

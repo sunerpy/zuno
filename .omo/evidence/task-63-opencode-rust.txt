@@ -1,0 +1,151 @@
+==============================================================
+Task 63 — lean built-in agent roster (crates/oc-agent/src/builtin.rs)
+worktree: /config/workspace/ProdDir/AI/oc-wt/t63  branch: task-63
+commit:   a51d223 feat(agent): lean built-in roster with boundaries and envelopes
+date:     2026-08-06T12:45:38+00:00
+==============================================================
+
+--- FILES ---
+a51d223 feat(agent): lean built-in roster with boundaries and envelopes
+ Cargo.lock                           |    6 +
+ crates/oc-agent/Cargo.toml           |   14 +
+ crates/oc-agent/src/builtin.rs       | 1017 ++++++++++++++++++++++++++++++++++
+ crates/oc-agent/src/builtin/tests.rs |  735 ++++++++++++++++++++++++
+ crates/oc-agent/src/lib.rs           |    2 +
+ 5 files changed, 1774 insertions(+)
+
+--- 1. cargo test -p oc-agent --offline ---
+     Running unittests src/lib.rs (target/debug/deps/oc_agent-c9058844df16a027)
+running 21 tests
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests oc_agent
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+--- 2. cargo test -p oc-agent builtin --offline (the plan's literal filter) ---
+running 21 tests
+test builtin::tests::attachment_support_alone_does_not_make_a_model_vision_capable ... ok
+test builtin::tests::looker_is_present_exactly_when_a_vision_capable_model_resolves ... ok
+test builtin::tests::every_permission_set_gives_every_governed_tool_an_explicit_verdict ... ok
+test builtin::tests::every_agent_states_every_column ... ok
+test builtin::tests::every_envelope_tag_is_unique_within_its_agent_and_the_roots_are_distinct ... ok
+test builtin::tests::the_advisor_is_the_only_agent_above_the_low_band ... ok
+test builtin::tests::only_the_orchestrator_may_delegate ... ok
+test builtin::tests::external_research_is_the_librarians_lane_alone ... ok
+test builtin::tests::plan_mode_is_not_reproduced_and_no_agent_can_leave_it ... ok
+test builtin::tests::the_dropped_agents_stay_dropped ... ok
+test builtin::tests::the_envelope_renders_in_the_shape_the_reference_writes_by_hand ... ok
+test builtin::tests::the_lean_six_are_the_designed_six_and_nothing_else ... ok
+test builtin::tests::only_the_primary_agent_inherits_extension_tools ... ok
+test builtin::tests::the_allows_survive_the_catch_all_deny ... ok
+test builtin::tests::the_model_id_scanner_catches_model_ids_and_nothing_else ... ok
+test builtin::tests::read_only_agents_cannot_reach_a_writing_or_delegating_tool ... ok
+test builtin::tests::the_orchestrator_is_the_only_agent_a_caller_cannot_target ... ok
+test builtin::tests::the_worker_writes_researches_and_iterates_but_spawns_nothing ... ok
+test builtin::tests::the_internals_are_the_engines_hidden_agents_carried_unchanged ... ok
+test builtin::tests::the_rendered_list_shows_the_six_with_their_boundaries ... ok
+test builtin::tests::no_agent_names_a_model ... ok
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+--- 3. cargo build --workspace --offline ---
+   Compiling oc-agent v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t63/crates/oc-agent)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.56s
+
+--- 4. cargo clippy --workspace --all-targets --offline ---
+warning+error lines: 0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.20s
+
+--- 5. cargo fmt --all --check ---
+clean
+
+--- 6. cargo metadata --locked --offline (after commit) ---
+ok, packages: 505
+Cargo.lock [[package]] count  t63: 505   main: 505
+
+--- 7. THE ROSTER, rendered by builtin::render_list(true) ---
+running 1 test
+orchestrator  primary   temp=0.1  Owns the user's request end to end: decides what must be true, routes discovery and bounded execution to specialists, and synthesises the result. The only agent that may spawn children.
+              **Don't delegate when:** the whole task is smaller than the briefing it would take • you already have the file path and need its contents • the answer is in this conversation • explaining the task costs more than doing it • the work is one edit you are already mid-way through.
+explorer      subagent  temp=0.1  Fast recon inside this repository. Answers "where is X", "what exists under Y", "which call sites touch Z", and returns a compressed map instead of file contents.
+              **Don't delegate when:** you know the path and want the bytes • you will need the full file anyway to edit it • it is one lookup you can do in a single grep • the question is about an external library rather than this tree.
+librarian     subagent  temp=0.1  Authority on anything outside this repository: current library documentation, API surfaces, release notes, and how other people solved the failure you are looking at.
+              **Don't delegate when:** it is a language feature or a stable standard-library API • you are confident and the cost of being wrong is a compile error • the answer is already in this conversation • the question is about this repository's own code.
+advisor       subagent  temp=0.4  Second opinion on high-stakes calls, and hostile review of work already done. Architecture trade-offs, a bug that survived two fixes, and "tell me why this patch is wrong" are the same lane: read the code, argue with it, name what it costs.
+              **Don't delegate when:** it is your first attempt at the bug • the trade-off has an obvious answer • you want confirmation rather than disagreement • the decision is cheap to reverse • a test would settle it faster than an argument.
+worker        subagent  temp=0.1  Takes a bounded, well-specified change and finishes it: reads what it needs, edits, runs the checks, and iterates until they pass. Reports what it could not verify rather than claiming it did.
+              **Don't delegate when:** the requirements are still moving • it is one small edit in a file you have open • the work is tangled with the change you are already making • what you actually need is a decision, not an implementation • the task would need children of its own to finish.
+looker        subagent  temp=0.2  Reads images, screenshots, PDFs, and diagrams and returns text. Keeps megabytes of pixels out of the caller's context window and hands back only what was asked for.
+              **Don't delegate when:** the file is text a plain read handles • you need the exact bytes because you are about to edit the file • the artifact is already described in this conversation • one screenshot is the entire task and the round trip costs more than looking.
+
+orchestrator | temp=0.1 | Orchestrator
+explorer | temp=0.1 | Subagent
+librarian | temp=0.1 | Subagent
+advisor | temp=0.4 | Subagent
+worker | temp=0.1 | Subagent
+looker | temp=0.2 | Subagent
+compaction | temp=0.1 | Internal
+title | temp=0.5 | Internal
+summary | temp=0.1 | Internal
+test builtin::tests::tmp_print_roster ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.00s
+
+--- 8. QA FAILURE SCENARIO: seventh agent with no negative boundary ---
+(a temporary `scribe` was added to lean()/LEAN_NAMES with Boundary::DontDelegateWhen(""))
+running 21 tests
+test builtin::tests::attachment_support_alone_does_not_make_a_model_vision_capable ... ok
+test builtin::tests::looker_is_present_exactly_when_a_vision_capable_model_resolves ... ok
+test builtin::tests::every_envelope_tag_is_unique_within_its_agent_and_the_roots_are_distinct ... FAILED
+test builtin::tests::the_advisor_is_the_only_agent_above_the_low_band ... ok
+test builtin::tests::every_agent_states_every_column ... FAILED
+test builtin::tests::only_the_orchestrator_may_delegate ... ok
+test builtin::tests::the_dropped_agents_stay_dropped ... ok
+test builtin::tests::external_research_is_the_librarians_lane_alone ... ok
+test builtin::tests::only_the_primary_agent_inherits_extension_tools ... ok
+test builtin::tests::the_envelope_renders_in_the_shape_the_reference_writes_by_hand ... ok
+test builtin::tests::the_allows_survive_the_catch_all_deny ... ok
+test builtin::tests::the_lean_six_are_the_designed_six_and_nothing_else ... ok
+test builtin::tests::every_permission_set_gives_every_governed_tool_an_explicit_verdict ... ok
+test builtin::tests::plan_mode_is_not_reproduced_and_no_agent_can_leave_it ... ok
+test builtin::tests::the_model_id_scanner_catches_model_ids_and_nothing_else ... ok
+test builtin::tests::the_orchestrator_is_the_only_agent_a_caller_cannot_target ... FAILED
+test builtin::tests::the_worker_writes_researches_and_iterates_but_spawns_nothing ... ok
+test builtin::tests::the_rendered_list_shows_the_six_with_their_boundaries ... ok
+test builtin::tests::read_only_agents_cannot_reach_a_writing_or_delegating_tool ... ok
+test builtin::tests::the_internals_are_the_engines_hidden_agents_carried_unchanged ... ok
+test builtin::tests::no_agent_names_a_model ... ok
+
+failures:
+
+---- builtin::tests::every_envelope_tag_is_unique_within_its_agent_and_the_roots_are_distinct stdout ----
+
+thread 'builtin::tests::every_envelope_tag_is_unique_within_its_agent_and_the_roots_are_distinct' (3106998) panicked at crates/oc-agent/src/builtin/tests.rs:703:9:
+scribe: root `results` is already used by another agent, so a stray reply cannot be attributed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- builtin::tests::every_agent_states_every_column stdout ----
+
+thread 'builtin::tests::every_agent_states_every_column' (3106997) panicked at crates/oc-agent/src/builtin/tests.rs:54:17:
+scribe: negative boundary is 0 chars; "Don't delegate when…" must name real cases or it is decoration
+
+---- builtin::tests::the_orchestrator_is_the_only_agent_a_caller_cannot_target stdout ----
+
+thread 'builtin::tests::the_orchestrator_is_the_only_agent_a_caller_cannot_target' (3107014) panicked at crates/oc-agent/src/builtin/tests.rs:378:5:
+assertion `left == right` failed
+  left: ["explorer", "librarian", "advisor", "worker", "looker", "scribe"]
+ right: ["explorer", "librarian", "advisor", "worker", "looker"]
+
+
+failures:
+    builtin::tests::every_agent_states_every_column
+    builtin::tests::every_envelope_tag_is_unique_within_its_agent_and_the_roots_are_distinct
+    builtin::tests::the_orchestrator_is_the_only_agent_a_caller_cannot_target
+
+test result: FAILED. 18 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p oc-agent --lib`
+
+--- 8b. after removing the seventh agent ---
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

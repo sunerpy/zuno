@@ -1,0 +1,45 @@
+## Task 36 — typed retry, rollback, and recovery budgets
+
+Changed files:
+- crates/oc-engine/src/retry.rs
+- crates/oc-engine/src/lib.rs (only `pub mod retry;`)
+- crates/oc-engine/tests/retry.rs
+
+Budgets and exact enforcement:
+- context-limit retries = 5; accepted attempts 1,2,3,4,5; attempt 6 => typed `BudgetExhausted`.
+- incomplete-continuation attempts = 3; accepted attempts 1,2,3; attempt 4 => typed `BudgetExhausted`.
+- empty-post-tool-continuation attempts = 5; accepted attempts 1,2,3,4,5; sixth empty response => `empty-post-tool-continuation attempts budget exhausted after 5 attempts`.
+
+TDD red command:
+`CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target cargo test -p oc-engine retry`
+Real output: `error[E0432]: unresolved import oc_engine::retry`; test target failed before implementation, as intended.
+
+Changed-file diagnostics:
+- `cargo fmt --all`: exit 0, no output.
+- Scoped `lsp_diagnostics` could not address the sibling worktree because the tool request cwd is the main worktree.
+- Fallback `rust-analyzer diagnostics .`: exit 0, `diagnostic scan complete`; no `at crate oc_engine, file .../src/retry.rs`, `src/lib.rs`, or `tests/retry.rs` diagnostic was emitted.
+- `CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target cargo check -p oc-engine --all-targets`: exit 0; `Finished dev profile ... in 5.58s`.
+
+Targeted acceptance command:
+`CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target cargo test -p oc-engine retry -- --nocapture`
+Real output: `test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out`.
+Per-budget tests:
+- `retry_context_limit_budget_allows_exactly_five_compaction_retries ... ok`
+- `retry_incomplete_continuation_budget_allows_exactly_three_attempts ... ok`
+- `retry_empty_post_tool_budget_allows_exactly_five_attempts_then_names_the_budget ... ok`
+Additional behavior tests: rollback ordering, transient 503 success, carried retry-after, oracle backoff cap, terminal non-retryable variants, typed provider-attempt exhaustion — all ok.
+
+QA happy transcript:
+`HAPPY_QA transient_status=503 attempts=2 rollback=[RetryRollback { attempt: 2, max: 2 }] result=turn completed`
+
+QA failure transcript:
+`FAILURE_QA empty_responses=6 error=empty-post-tool-continuation attempts budget exhausted after 5 attempts`
+
+Full verification batch (single successful run):
+`cargo fmt --all -- --check && CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target cargo build --workspace && CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target cargo clippy --workspace --all-targets && CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target cargo test --workspace`
+Real output / exit: exit 0. Build: `Finished dev profile ... in 0.55s`. Clippy: `Finished dev profile ... in 3.64s`, no warnings. Tests: `Finished test profile ... in 1.20s`; oc-engine retry target `9 passed; 0 failed`; all workspace unit, integration, and doc-test results shown as ok.
+
+Oracle differences reported:
+- OpenCode uses unbounded Effect retry for retryable API errors; Todo 36 forbids indefinite retries, so this implementation keeps the 2x/30s oracle backoff but requires finite `NonZeroU32` total attempts.
+- Jcode lets exhausted incomplete/empty continuation recovery fall through to partial completion; Todo 36 requires typed failure, which this implementation returns.
+

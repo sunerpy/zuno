@@ -1,0 +1,344 @@
+Task 76 — crates/oc-tui/src/views/: chat view, dialogs, autocomplete, editor/clipboard
+Worktree: /config/workspace/ProdDir/AI/oc-wt/t76  branch task-76  (from main d34a42c)
+Date: 2026-08-07
+
+=======================================================================
+1. WHAT LANDED
+=======================================================================
+
+crates/oc-tui/src/views.rs                 +  12 modules under crates/oc-tui/src/views/
+Total new source: 10,633 lines (implementation + tests), 23 files.
+
+  views.rs            ViewContext (palette + resolved config), style vocabulary,
+                      diff_columns() fork, padded()/fill()/hint(), testkit
+  views/message.rs    Transcript fold over TurnEvent; text / reasoning / tool /
+                      attachment parts; TranscriptView, StatusView, ScrollbarView
+  views/dialog.rs     Dialog trait, DialogStep, DialogOutcome, DialogHost,
+                      ObservedBase — the non-blocking contract
+  views/permission.rs PermissionPrompt: once / always / reject, two escalations,
+                      per-permission describe(), PermissionDecision
+  views/question.rs   QuestionRequest/Option (todo 43's wire shape), QuestionPrompt
+  views/editor.rs     InputEditor: multi-line, selection anchor, undo/redo,
+                      history with stash, EditorSignal; PromptGutter
+  views/diff.rs       unified-diff parse + unified/split render honouring diff_style
+  views/autocomplete.rs detect() triggers, score() ranking, AutocompleteView,
+                      CompletionSource/StaticSource, WhichKeyView
+  views/picker.rs     SelectDialog + session / model / agent / theme pickers
+  views/help.rs       HelpView generated from the live Keymap
+  views/scroll.rs     ConstantSpeed / MacOsAccel / Scroller with accumulator
+  views/external.rs   ExternalEditor + Clipboard seams, copy_command ladder,
+                      osc52(), base64(), ScriptedEditor, MemoryClipboard
+
+Manifest: crates/oc-tui/Cargo.toml gained oc-llm and oc-permission (workspace
+deps, no new third-party crates). lib.rs gained `pub mod views;` and prose in the
+existing leading //! block.
+
+No other crate was modified. oc-engine, oc-permission, oc-tools untouched.
+app.rs / keybind.rs / theme.rs / attention.rs unchanged (0 diff lines).
+The 33 theme snapshots were not regenerated.
+
+=======================================================================
+2. TEST COUNTS
+=======================================================================
+
+$ cargo test -p oc-tui --offline
+  Running unittests src/lib.rs
+  test result: ok. 367 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+  Doc-tests oc_tui
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+  Baseline (main) was 114 lib + 1 doctest. 367 - 114 = 253 new lib tests.
+
+$ cargo test -p oc-tui --offline views          # the plan's literal filter
+  test result: ok. 253 passed; 0 failed; 0 ignored; 0 measured; 114 filtered out
+
+  Not "0 passed; N filtered out". The filter matches because every new test is in
+  a `views::*` module path.
+
+Per-module (from the `views` run):
+  views::message        27
+  views::dialog         12
+  views::permission     22
+  views::question       17
+  views::editor         42
+  views::diff           16
+  views::autocomplete   29
+  views::picker         19
+  views::help           15
+  views::scroll         24
+  views::external       23
+  views::views_tests    15   (cross-module guards + composition)
+  ----------------------------
+  total                253
+
+=======================================================================
+3. THE >=8 OFF-SCREEN ASSERTIONS (18 named `*_offscreen`, one per view)
+=======================================================================
+
+  1  views_chat_transcript_renders_every_part_kind_offscreen        chat view
+  2  views_permission_prompt_renders_offscreen                      permission
+  3  views_permission_always_stage_lists_the_patterns_offscreen     permission stage 2
+  4  views_question_prompt_renders_offscreen                        question
+  5  views_input_editor_renders_offscreen_with_its_cursor           editor
+  6  views_input_editor_renders_multiple_lines_offscreen            editor, multi-line
+  7  views_diff_renders_unified_offscreen                           diff (stacked)
+  8  views_diff_renders_split_offscreen_with_both_sides             diff (auto/split)
+  9  views_autocomplete_renders_offscreen                           autocomplete
+ 10  views_session_picker_renders_offscreen                         session picker
+ 11  views_model_picker_renders_offscreen                           model picker
+ 12  views_agent_picker_renders_offscreen                           agent picker
+ 13  views_theme_picker_renders_offscreen_with_a_palette_preview    theme picker
+ 14  views_help_renders_offscreen_naming_a_real_binding             help
+ 15  views_status_strip_renders_agent_model_and_step_offscreen      status strip
+ 16  views_which_key_renders_its_entries_offscreen                  which-key
+ 17  views_picker_filter_with_no_matches_says_so_offscreen          picker empty state
+ 18  views_picker_window_follows_the_cursor_offscreen               picker paging
+
+Every one asserts CONTENT (substrings / exact rows / cell colours), never just
+dimensions. Additional cell-level colour assertions:
+  views_chat_transcript_paints_from_the_palette_not_from_a_literal
+  views_permission_prompt_highlights_the_cursor_from_the_palette
+  views_input_editor_paints_from_the_palette
+  views_input_editor_renders_a_selection_from_the_palette
+  views_autocomplete_highlights_the_cursor_from_the_palette
+  views_diff_uses_the_dedicated_diff_palette_keys_not_the_status_colours
+  views_diff_hunk_header_uses_its_own_colour
+  views_help_unbound_row_is_muted_from_the_palette
+  views_fill_paints_every_cell_in_the_area
+
+=======================================================================
+4. THE PERMISSION PROMPT'S THREE RESOLUTIONS
+=======================================================================
+
+  views_permission_prompt_resolves_to_once
+      highlighted option is Once by default; submit -> ReplyKind::Once, message None
+  views_permission_prompt_resolves_to_always_after_confirming
+      submit on Always -> DialogStep::Redraw + Stage::ConfirmAlways (does NOT
+      resolve); second submit -> ReplyKind::Always
+  views_permission_prompt_resolves_to_reject
+      end -> Reject highlighted; submit -> ReplyKind::Reject
+
+  Plus the safety properties:
+  views_permission_escape_rejects_rather_than_allowing
+      escape with Once highlighted still yields Reject
+  views_permission_cancelling_the_always_confirmation_decides_nothing
+  views_permission_reject_message_is_only_offered_in_a_child_session
+  views_permission_reject_message_is_typed_and_carried  -> Some("use rea")
+  views_permission_empty_reject_message_is_none_not_an_empty_string
+  views_permission_decision_converts_to_the_engine_reply
+      PermissionDecision::into_reply() -> oc_permission::PermissionReply
+
+  Vocabulary is oc_permission::ReplyKind {Reject, Once, Always}, read from
+  crates/oc-permission/src/types.rs:41-45. Nothing was invented.
+
+=======================================================================
+5. INCREMENTAL STREAMING PROOF
+=======================================================================
+
+  views_streaming_message_renders_incrementally
+
+  Feeds AssistantMessageCreated then four TextDelta events
+  ("The", " quick", " brown", " fox"), rendering off-screen after each. Asserts:
+    - each delta returns EventResult{redraw:true} (an invisible stream is a bug)
+    - frame 1 contains "The" and NOT "quick"
+    - frame 2 contains "The quick" and NOT "brown"
+    - frame 4 contains "The quick brown fox"
+    - every frame's whitespace-stripped text is a PREFIX of the next one, i.e.
+      growth, not a re-render from scratch
+
+  Supporting:
+  views_streaming_reasoning_and_text_accumulate_into_separate_parts
+  views_retry_rollback_discards_the_interrupted_attempt
+      StreamEvent::RetryRollback clears the in-flight parts; without it the
+      model's answer renders twice
+  views_tool_call_walks_pending_running_and_terminal_states
+      Pending -> Running -> Error across ToolUseStart / ToolDispatchStarted /
+      ToolDispatchCompleted
+
+=======================================================================
+6. NO-STALL PROOF, AND ITS MUTATION
+=======================================================================
+
+  views_dialog_does_not_stall_event_processing  (#[tokio::test])
+
+  Drives the REAL crate::app::App::run loop with a DialogHost whose stack has one
+  dialog open. Sends 10 TurnEvents through the bounded channel, then a key the
+  dialog does not claim, then Shutdown. Asserts:
+    - the base observed all 10 engine events
+    - the loop drew >= 10 frames
+    - wait_until()'s 5s tokio timeout converts a block into a FAILURE, not a hang
+
+  MUTATION (make the host modal — the blocking shape):
+
+    _ if self.is_open() => {
+        // MUTATION: make the host modal.
+        EventResult::REDRAW
+    }
+
+  Result:
+    ---- views::dialog::tests::views_dialog_does_not_stall_event_processing stdout ----
+    thread '...views_dialog_does_not_stall_event_processing' panicked at
+      crates/oc-tui/src/views/dialog_tests.rs:328:6:
+      the event loop makes progress while a dialog is open: Elapsed(())
+
+    test result: FAILED. 9 passed; 3 failed; 0 ignored; 0 measured; 355 filtered out
+
+  Three tests caught it:
+    views_dialog_does_not_stall_event_processing
+    views_dialog_base_still_receives_engine_events_while_a_dialog_is_open
+    views_dialog_stack_survives_a_resize_without_losing_events
+  Reverted; 12 passed.
+
+=======================================================================
+7. PALETTE-DISCIPLINE MUTATION
+=======================================================================
+
+  Hardcoded a colour in one view (message.rs attachment row):
+
+    Style::new().fg(ratatui::style::Color::Rgb(255, 0, 255))
+
+  Result:
+    ---- views::views_tests::views_no_view_hardcodes_a_colour stdout ----
+    a view named a colour instead of reading the resolved palette:
+    .../crates/oc-tui/src/views/message.rs:658: Color::Rgb — paint from
+      `ViewContext`'s palette instead
+
+    test result: FAILED. 252 passed; 1 failed; 0 ignored; 0 measured
+
+  So the gap the prompt asked about does NOT exist: a hardcoded colour is caught
+  by name, with file:line. The scan covers 20 forbidden spellings (every named
+  ratatui Color variant, Color::Rgb, Color::Indexed, Rgba::opaque, Rgba::from_hex)
+  and asserts a FLOOR of >= 12 scanned view sources so it cannot pass vacuously.
+
+  Its complement, views_every_view_source_reaches_the_palette_through_the_context,
+  asserts each painting module actually reads ViewContext — because a view that
+  paints nothing also has no literals.
+
+=======================================================================
+8. ACTION-NAME MUTATION (a third guard, unprompted)
+=======================================================================
+
+  Typo'd one action name in picker.rs: "dialog.select.prev" -> "dialog.select.prevv"
+
+  Result:
+    ---- views::picker::tests::views_picker_cursor_wraps stdout ----
+    assertion `left == right` failed: moving up from the top did not wrap
+    ---- views::views_tests::views_every_action_a_view_names_exists_in_the_shipped_table ----
+    these views act on action names the shipped binding table does not have:
+    .../crates/oc-tui/src/views/picker.rs:279: `dialog.select.prevv`
+
+    test result: FAILED. 251 passed; 2 failed
+
+  The guard scans only match arms inside `fn handle_action` bodies (brace-depth
+  tracked), because a tool name and an action name are both snake_case strings in
+  a match arm — a whole-file scan reported `"bash" =>` from the tool-icon table.
+  Floor: >= 40 names checked.
+
+  views_no_view_matches_on_a_raw_key_spelling is the fourth guard: 15 forbidden
+  KeyCode/KeyModifiers spellings, floor >= 12 files.
+
+=======================================================================
+9. VERIFICATION
+=======================================================================
+
+$ cargo build --workspace --offline
+    Finished `dev` profile ... in 20.63s          (clean, 0 warnings)
+
+$ cargo clippy --workspace --all-targets --offline
+    0 warnings, 0 errors
+
+$ cargo fmt --all --check
+    clean
+
+$ cargo metadata --locked --offline
+    ok (see section 11)
+
+$ for r in 1 2 3; do for i in 1..6; do cargo test -p oc-tui --offline \
+    | grep -cE '^test result: FAILED' & done; wait; done
+    0 0 0 0 0 0
+    0 0 0 0 0 0
+    0 0 0 0 0 0
+    18 concurrent test processes across 3 rounds, all zero failures.
+    (Todo 73's process-global panic-hook mutex is what makes this safe; no test
+     here installs a hook.)
+
+=======================================================================
+10. CAPABILITY STATUS — all ten plan items
+=======================================================================
+
+ 1 message/part rendering                        DONE
+     text, reasoning (own affordance + thinkingOpacity composite), tool calls with
+     4 statuses and the oracle's 9 per-tool icons, attachments, generated images.
+     Fold is over TurnEvent; RetryRollback discards.
+ 2 permission prompt once/always/reject          DONE
+     both escalations, per-permission titles for all 12 oracle branches, embedded
+     diff for `edit`, 15-row cap, fullscreen toggle.
+ 3 question prompt                               DONE
+     todo 43's wire shape (parsed from the oracle JSON in a test), single/multi
+     select, custom answer, skip -> Unanswered, multi-question sequencing.
+ 4 input editor, history, multi-line             DONE
+     55 input_* actions, (line,column) cursor, selection anchor, undo/redo,
+     history with half-written-prompt stash, HISTORY_LIMIT cap,
+     normalize_prompt_content ported verbatim.
+ 5 incremental streaming                         DONE  (section 5)
+ 6 diffs honouring diff_style                    DONE
+     parse + unified + split, `stacked` always one column, `auto` splits above
+     width 120 exclusive, all 11 diff palette keys used.
+ 7 autocomplete commands/files/agents            DONE
+     both triggers with the oracle's open/close rules, ranking, replacement
+     completion, directory re-trigger, CompletionSource seam, which-key.
+ 8 pickers + help                                DONE
+     one SelectDialog + 4 constructors; theme picker previews the resolved palette;
+     help generated from the live Keymap, follows a rebind, shows unbound rows.
+ 9 scroll_speed / scroll_acceleration            DONE
+     precedence ported (acceleration wins, default is 3.0 not 1.0), MacOsAccel
+     curve ported exactly with both guards, fractional accumulator, sticky bottom.
+10 $EDITOR and clipboard                         PARTIAL — seams + pure logic only
+     DONE: ExternalEditor / Clipboard traits, ScriptedEditor, MemoryClipboard,
+       EditorInvocation + spec resolution, copy_command ladder (all 5 arms),
+       image_read_command (the 2 expressible arms), osc52 with tmux wrapping,
+       base64 (RFC 4648 vectors), lease_reason() naming the TUI.
+     ABSENT: no process-spawning implementation of either trait. Reason: the
+       prompt forbids a subprocess or a clipboard access in any test, so a real
+       implementation would ship untested. The pure parts — which is where the
+       bugs are — are fully covered. See issues.md.
+
+=======================================================================
+11. THINGS THE PLAN / SOURCE DISAGREED ABOUT
+=======================================================================
+
+a) `help_show` ships UNBOUND. keybind.rs:1024-1030 gives it `keys: "none"`, so it
+   is reachable only through the command palette. A help test written against it
+   asserted `keys != "(unbound)"` and failed; retargeted to `session_interrupt`
+   and a separate test now pins the unbound-by-default fact.
+
+b) The default scroll speed is 3, not 1. util/scroll.ts:26 returns
+   `new CustomSpeedScroll(3)`. Getting this wrong is a difference every user feels.
+
+c) The split-diff threshold is EXCLUSIVE (`width > 120`), so exactly 120 columns
+   is unified. Tested at both 120 and 121.
+
+d) `space` reaches a dialog only as `dialog.mcp.toggle` — the binding table's sole
+   `space` row. A multi-select question needs a toggle key and adding a second
+   `space` row would be a keybind conflict the table rejects at construction, so
+   the question prompt claims that row and also accepts the raw `' '` as a
+   fallback for a user who rebound it.
+
+e) `Dialog::desired_height` originally took only `available`, which made every
+   dialog full-height and hid the base behind it. Changed to
+   `(content_rows, available)` — the host passes the row count its `lines()` call
+   produced, because `lines()` takes `&mut self` and a size query must not mutate.
+
+=======================================================================
+12. DISCIPLINE SUMMARY
+=======================================================================
+
+- No view names a colour            enforced by scan, mutation-proven (section 7)
+- No view names a key               enforced by scan (15 spellings, floor 12)
+- Every action name is real         enforced by scan, mutation-proven (section 8)
+- No dialog blocks                  enforced by a real-event-loop test,
+                                    mutation-proven (section 6)
+- Rendering never calls the engine   TurnEvent is an input value; oc-tui -> oc-engine
+- No unwrap()/expect() outside tests  (grep clean in the 12 source modules)
+- No unsafe                          workspace `unsafe_code = "forbid"`
+- No test needs a TTY, an editor, or a clipboard

@@ -1,0 +1,86 @@
+Task 58 — out-of-process JSON-RPC plugin host and Rust SDK
+Date: 2026-08-06
+Worktree: /config/workspace/ProdDir/AI/oc-wt/t58
+
+Implemented
+-----------
+- Version-negotiated NDJSON JSON-RPC 2.0 over plugin stdin/stdout.
+- Concurrent process initialization with input-order registration and sequential
+  Task 57 HookBus mutation dispatch.
+- Typed hook request/response codecs, remote tool adaptation, and tool-name
+  conflict detection.
+- Per-request deadlines, crash/protocol isolation, typed diagnostics, bounded
+  shutdown, child reaping, and pending-request failure.
+- Reusable oc-plugin-sdk builder/server/conformance API.
+- examples/rust_plugin.rs (158 lines): rust_echo plus chat.params, shell.env, and
+  experimental.text.complete hooks.
+
+Acceptance and failure scenarios
+--------------------------------
+cargo test -p oc-plugin --test jsonrpc --offline
+  PASS — 5 tests:
+  - example tool resolves and executes;
+  - reserved tool shadowing is rejected;
+  - hung hook is disabled with TimedOut diagnostic while the turn completes;
+  - startup panic is failed-to-load while a healthy sibling remains available;
+  - parallel startup still dispatches in configuration order.
+
+cargo test -p oc-plugin-sdk --offline
+  PASS — 2 conformance tests.
+
+cargo test -p oc-plugin --offline
+  PASS — 12 tests total: 1 unit, 11 integration; Task 57 discovery, hook, and
+  manifest suites remain green.
+
+cargo run -p oc-plugin --bin oc-example-plugin --offline -- --conformance
+  PASS — conformance passed: 3 hooks, 1 tool.
+
+Mutation proof
+--------------
+1. Replaced the request timeout with two seconds while the fixture slept 500 ms.
+   jsonrpc_hung_hook_is_disabled_and_the_turn_completes FAILED: output became
+   "turn-completed!" instead of remaining "turn-completed". Exit 101.
+2. Reversed the vector returned from concurrent initialization.
+   jsonrpc_parallel_resolve_still_dispatches_in_configuration_order FAILED:
+   first loaded id was "second" rather than "first". Exit 101.
+3. Restored both implementations and reran the JSON-RPC integration target:
+   PASS — 5 passed, 0 failed.
+
+Final verification (single successful pass)
+-------------------------------------------
+cargo fmt --all -- --check
+  PASS.
+
+cargo clippy -p oc-plugin-sdk -p oc-plugin --all-targets --offline -- -D warnings
+  PASS — zero warnings.
+
+cargo test -p oc-plugin-sdk --offline
+  PASS — 2 passed.
+
+cargo test -p oc-plugin --offline
+  PASS — 12 passed.
+
+cargo run -p oc-plugin --bin oc-example-plugin --offline -- --conformance
+  PASS — 3 hooks, 1 tool.
+
+cargo build --workspace --offline
+  PASS.
+
+cargo metadata --locked --offline --no-deps --format-version 1
+  PASS — exact match with crates.expected: 34 packages.
+
+git diff --check
+  PASS.
+
+LSP note
+--------
+lsp_diagnostics rejected linked-worktree paths because the MCP is rooted at
+/config/workspace/ProdDir/AI/opencode-rust. Direct rust-analyzer diagnostics were
+run during implementation; final Clippy with -D warnings and the workspace build
+both passed. No LSP issue was hidden.
+
+Plan correction
+---------------
+oc-plugin-sdk already existed as an empty workspace member, so implementing it did
+not increase the package roster. cargo metadata and crates.expected authoritatively
+agree at 34 packages; no unrelated placeholder crate was invented to reach 35.

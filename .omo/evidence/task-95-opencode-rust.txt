@@ -1,0 +1,43 @@
+Task 95 — Amazon Bedrock SigV4 and EventStream
+Date: 2026-08-05
+Worktree: /config/workspace/ProdDir/AI/oc-wt/t95
+
+Implemented
+- AWS SigV4 request signing with canonical URI/query/header handling and temporary-session-token support.
+- Credential precedence: explicit config -> environment -> shared profile -> SSO cache -> container role -> IMDS.
+- Incremental AWS EventStream decoder with prelude/message CRC validation, all header value types, absolute error offsets, UTF-8 boundary handling, ConverseStream/native event projection, tool calls, reasoning, usage, and typed stream exceptions.
+- Bedrock ConverseStream and InvokeModelWithResponseStream request paths plus Mantle model routing.
+- Structured HTTP/Bedrock error classification into the shared ProviderError taxonomy.
+
+Known-answer proof
+- Published vector: AWS S3 SigV4 header-authentication example.
+- Canonical request hash: 7344ae5b7ee6c3e7e6b0fe0640412a37625d1fbfff95c48bbb2dc43964946972
+- Expected/actual signature: f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41
+- Test: aws_s3_get_object_known_answer_matches_byte_for_byte ... ok
+
+Acceptance and QA output
+- Recorded text and tool-call conversations replayed to the shared event vocabulary.
+- Byte-split sweep tested every split offset: 1077.
+- Corrupt-CRC failure remained typed and named the absolute offset:
+  EventStream message CRC mismatch at byte offset 149: expected 0x522f58cd, calculated 0xd22f58cd
+- Mantle table test routes only openai.gpt-oss-safeguard-20b and
+  openai.gpt-oss-safeguard-120b to ApiSurface::Chat.
+
+Final validation (all passed)
+1. rust-analyzer diagnostics crates/oc-provider-bedrock
+   Result: diagnostic scan complete; Bedrock emitted only expected inactive #[cfg(test)] notices and no actionable warning/error.
+2. cargo fmt --check
+   Result: exit 0.
+3. CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target \
+   cargo clippy -p oc-provider-bedrock --all-targets -- -D warnings
+   Result: Finished dev profile; zero warnings.
+4. OC_TESTKIT_ORACLE_SOURCE=/config/workspace/ProdDir/AI/opencode \
+   CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target \
+   cargo test -p oc-provider-bedrock --all-targets -- --nocapture
+   Result: 19 tests passed (11 unit, 3 EventStream/cassette, 3 routing/error, 2 SigV4); 0 failed.
+5. CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target cargo build --workspace
+   Result: Finished dev profile successfully.
+
+Scope
+- Changed only crates/oc-provider-bedrock/** and Cargo.lock in the task worktree.
+- Root Cargo.toml was not edited.

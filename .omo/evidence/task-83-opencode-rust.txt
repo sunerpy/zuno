@@ -1,0 +1,49 @@
+Task 83 evidence — 2026-08-07
+
+Scope
+- crates/oc-db/src/artifact_gc.rs
+- crates/oc-db/src/lib.rs
+- crates/oc-db/Cargo.toml
+- Cargo.lock
+
+Behavior
+- preview is the default; delete is explicit
+- survivor rows are re-read under an IMMEDIATE transaction
+- snapshot stores are removed only at zero references
+- ambiguous project/worktree metadata retains every affected store
+- Rust tool-output names use exact session attribution
+- upstream/unattributed tool output uses only the configurable mtime backstop
+- the default tool-output retention remains seven days
+- requested session ids still present in SQLite are never treated as deleted
+- legacy JSON cleanup is disabled unless explicitly opted in
+- message-derived part cleanup never guesses a session from a part path
+- managed-root and legacy-category symlinks are never followed
+- preview reports stable path-ordered logical file bytes
+
+TDD and mutation evidence
+- pre-implementation filtered suite: 4 failed, 2 passed
+- implementation filtered suite: 8 passed, 0 failed
+- mutation 1: removed snapshot reference protection; retained-store test failed
+- mutation 2: attributed every unattributed tool file; fresh-foreign-file test failed
+- mutation 3: enabled legacy sweep by default; inertness test failed
+- every mutation was restored before final verification
+
+Final verification
+- cargo build --workspace --offline: passed
+- cargo test -p oc-db --offline: passed
+  - lib 55; fts 6; message 25; message_export 1; open 18; prune 9;
+    retention 12; schema 5; session 38; session_list 18; doctests 2
+  - total: 189 passed, 0 failed
+- cargo test -p oc-db artifact_gc --offline: 8 passed, 0 failed
+- 3 runs at --test-threads=6: 24 artifact_gc executions, 0 failures
+- cargo clippy --workspace --all-targets --offline -- -D warnings: passed
+- cargo fmt --all --check: passed
+- lsp_diagnostics: no diagnostics in both changed Rust files
+- rust-analyzer diagnostics: no artifact_gc errors or warnings
+
+Known corrections and boundaries
+- snapshot identity uses project.worktree, not session.directory
+- the stale draft said tool output could not be session-attributed; task 38 intentionally
+  changed Rust filenames, and task 83 consumes that declared divergence
+- filesystem removal is intentionally separate from SQLite prune because it cannot roll back
+- no table, index, migration, oc-snapshot, or oc-tool source was changed

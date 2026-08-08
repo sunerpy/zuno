@@ -1,0 +1,246 @@
+================================================================================
+Task 106 — invoke the title, compaction and summary internals
+Worktree: /config/workspace/ProdDir/AI/oc-wt/t106 (branch task-106, from main)
+Date: 2026-08-07
+================================================================================
+
+THE DECISIVE NUMBER: 2 -> 3 captured provider requests for one tool turn.
+completed_tool_turns(3) = (3 - PRELUDE_REQUESTS) / RESPONSES_PER_TURN
+                        = (3 - 1) / 2 = 1        (was (2-1)/2 = 0)
+
+Nothing under crates/oc-testkit/src/perf/** or docs/perf-methodology.md changed.
+    $ git diff --name-only main..HEAD -- crates/oc-testkit docs/perf-methodology.md
+    (empty)
+
+--------------------------------------------------------------------------------
+1. REAL-BINARY EVIDENCE — headless `run` (crates/oc-cli/tests/tool_turn.rs)
+--------------------------------------------------------------------------------
+$ cargo test -p oc-cli --test tool_turn --offline
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+tool_turn_offers_the_assembled_registry_and_continues_after_a_tool_result now
+asserts, against the real `opencode-rust run` binary and a loopback MockProvider:
+
+    captured.len() == REQUESTS_FOR_ONE_TOOL_TURN            // 1 + 2 == 3
+    completed_tool_turns(captured.len()) == 1
+    captured[0] -> tools == []      (the tool-free title request)
+    captured[1] -> tools contains bash, read, glob, grep
+    captured[2] -> carries role:"tool" (the tool result went back)
+
+The captured prelude body, verbatim from the failing run before the assertions
+were updated (proving the request is real and carries the title agent's prompt):
+
+  messages[0].role  = "system"
+  messages[0].content = "You are a title generator. You output ONLY a thread
+                         title. Nothing else.\n\n<task>\nGenerate a brief
+                         title ..."      (crates/oc-catalog/src/agent/prompt/title.txt)
+  messages[1].role  = "user"
+  messages[1].content = "Generate a title for this conversation:\n"
+  messages[2].content = "What is the weather in Paris?"
+  tools             = []   <- tool-free, as all three internals deny every tool
+
+--------------------------------------------------------------------------------
+2. REAL-BINARY EVIDENCE — interactive `tui` under a real PTY (tests/tui_turn.rs)
+--------------------------------------------------------------------------------
+$ cargo test -p oc-cli --test tui_turn --offline -- --nocapture
+HAPPY_QA submission=Flag  pty_requests=3
+HAPPY_QA submission=Typed pty_requests=3
+test result: ok. 2 passed; 0 failed
+
+Both submission paths (the frozen harness's `--prompt` flag shape and keystrokes
+typed into the pty) produce 3. The prelude is on TurnHost, so `run` and `tui`
+get it from one call site; `only_this_module_composes_a_turn` still passes.
+
+The PTY transcript shows the prelude's own report reaching the screen:
+    "session titled: Hello!"
+(`Hello!` is what openai-chat/streams-text answers; the recording is replayed
+byte for byte, so the title is generated, not derived from the prompt.)
+
+--------------------------------------------------------------------------------
+3. MUTATION PROOFS
+--------------------------------------------------------------------------------
+(a) Revert the title wiring — `generate_title` returns Ok(None) unconditionally:
+
+    5 of 36 oc-engine lib tests fail, naming the missing request:
+      a_new_sessions_first_turn_issues_a_tool_free_title_request_and_persists_the_answer
+        assertion `left == right` failed: a new session's prelude is exactly one
+        request; got []
+          left: 0   right: 1
+      the_title_request_carries_the_agents_prompt_the_instruction_and_the_opening_exchange
+      a_thinking_block_is_stripped_and_an_over_long_line_is_truncated
+      a_provider_failure_skips_the_title_and_never_fails_the_turn
+      a_session_with_no_provider_for_the_internals_reports_both_and_runs_neither
+    test result: FAILED. 31 passed; 5 failed
+
+    And at the binary level:
+      tool_turn_offers_the_assembled_registry_and_continues_after_a_tool_result
+        assertion `left == right` failed: one tool turn must be one tool-free
+        prelude request plus two turn requests; the frozen gate scores 0
+        completed turn(s) from 1 captured
+          left: 1   right: 3
+    test result: FAILED. 1 passed; 2 failed
+
+    The session is NOT left silently untitled — the test fails and names it.
+
+(b) Remove the prelude call from TurnHost::drive entirely:
+      same tool_turn failure, "the frozen gate scores 0 completed turn(s)".
+
+(c) Revert auto-compaction — `compact_if_overflowing` returns Ok(false) before
+    the threshold check:
+      an_overflowing_session_is_compacted_before_the_turn      assertion failed: compacted
+      a_failed_compaction_leaves_the_full_history_in_place     matches!(.., Err(Reason))
+      a_session_with_no_provider_for_the_internals_reports_both_and_runs_neither
+    test result: FAILED. 33 passed; 3 failed
+
+All mutations reverted; the tree is back to the committed state.
+
+--------------------------------------------------------------------------------
+4. TODO 35's PROPTEST AND TODO 63's ROSTER STAY GREEN
+--------------------------------------------------------------------------------
+$ cargo test -p oc-engine --test compaction --offline
+test result: ok. 5 passed; 0 failed
+  includes compaction_boundary_never_splits_a_tool_use_and_result_pair
+
+$ cargo test -p oc-agent --offline
+oc-agent lib + tests/reflection.rs: all green in the workspace run below.
+
+New pinning test, over this module's own transcript rather than a synthetic one:
+  prelude::tests::the_boundary_this_module_selects_never_splits_a_tool_use_and_its_result
+It builds a transcript whose only tool pair straddles two stored messages, runs
+select_boundary over it, and asserts every retained tool_result still has its
+tool_use. That is the arrangement the proptest guards, exercised through the
+projection the request actually uses.
+
+--------------------------------------------------------------------------------
+5. THE CONTEXT-WINDOW SOURCE — found, not invented
+--------------------------------------------------------------------------------
+Field:  oc_llm::catalog::resolved::ModelLimit { context: f64, input: Option<f64>,
+        output: f64 }        (crates/oc-llm/src/catalog/resolved.rs:164-172)
+Origin: models.dev `limit.context` / `limit.output`
+        (crates/oc-llm/src/catalog/models_dev.rs:118-121), carried through
+        merge.rs:204 and merge.rs:486-490 so a config override wins.
+
+Read once, in TurnPlan::resolve:
+    let window = TokenWindow {
+        context:    token_count(catalog_model.limit.context),
+        max_output: token_count(catalog_model.limit.output),
+    };
+
+They are f64 because models.dev publishes JSON numbers. `token_count` maps a
+non-finite, negative or zero value to 0, and 0 already means "no threshold
+compaction" to CompactionPolicy — pinned by
+  turn_tests::a_catalog_limit_that_is_absent_or_negative_reads_as_no_window
+
+Upstream reads exactly the same two fields for the same decision
+(packages/opencode/src/session/overflow.ts:10-19: `input.model.limit.context`,
+`limit.input`, `maxOutputTokens`), so no constant was invented and none is
+needed. I did NOT use `limit.input`: TokenWindow has no field for it, and adding
+one would change todo 35's tested type. Recorded as a known gap — a model that
+declares a smaller input ceiling than its context window will compact slightly
+later than upstream would.
+
+--------------------------------------------------------------------------------
+6. NO HARDCODED MODEL ID
+--------------------------------------------------------------------------------
+$ cargo test -p oc-agent --offline   # includes:
+  no_source_file_in_this_crate_names_a_model    ok
+
+Every internal's model comes from oc_agent::model_policy::ModelPolicy::resolve:
+per-agent override > active preset > session model. resolve_internals iterates
+oc_agent::builtin::INTERNAL_NAMES, so a fourth internal is resolved with no
+edit, pinned by
+  turn_tests::the_resolved_set_is_exactly_what_the_roster_calls_internal
+
+An answer naming a model under a DIFFERENT provider is declined and reported,
+because TurnHost wires exactly one credential and honouring it would present
+the user's key to another vendor's endpoint. Pinned by
+  turn_tests::an_internal_pointed_at_another_provider_falls_back_and_says_why
+
+--------------------------------------------------------------------------------
+7. HOW THE APPEND-ONLY CACHE VIOLATION WAS AVOIDED
+--------------------------------------------------------------------------------
+Todo 105's first attempt died on
+  append-only cache violation on turn 2: stable history message 1 changed
+  (crates/oc-llm/src/cache.rs:153)
+and this task adds a request to the FRONT of every turn — the same shape.
+
+It does not fire, and the reason is structural rather than lucky:
+
+  * run_turn creates its PromptCache/CacheTracker INSIDE the call
+    (loop.rs:561 `let mut prompt_cache: Option<PromptCache<..>> = None`).
+    Every prelude write lands before that call, so the tracker's first
+    observation is already the post-prelude, post-compaction prefix. There is no
+    prefix for it to compare against and nothing to reset.
+  * The prelude's own two requests never touch that tracker at all. They are
+    built by prelude::collect_text as bare CompletionRequests with tools: [].
+    Compaction has its own CacheTracker + LockedTools, created and dropped
+    inside compact_if_overflowing.
+  * Compaction never mutates a stored message in place. It APPENDS a marker
+    user message, an assistant summary message and the summary text; honouring
+    it is loop::retained_history dropping a PREFIX of stored history. The
+    messages the tracker sees are therefore still append-only relative to each
+    other within the turn.
+  * The prompt is still stamped with oc_db::message::created_after (todo 105's
+    clamp), which the prelude did not disturb.
+
+Verified, not assumed: tool_turn.rs and tui_turn.rs both pass, and turn 2 of the
+tool loop (the continuation after the tool result) is exactly the step that
+failed before.
+
+--------------------------------------------------------------------------------
+8. WORKSPACE VERIFICATION
+--------------------------------------------------------------------------------
+$ cargo build --workspace --offline
+  Finished — 0 errors, 0 warnings.
+
+$ cargo test --workspace --offline
+  EXIT=0
+  sum of `test result: ok. N passed`  = 3077     (main: 3057, +20)
+  count of `test result: FAILED`       = 0
+  ignored                              = 1       (pre-existing)
+  grep -E '^error' on the captured output = no matches
+    (checked explicitly: a target that fails to COMPILE emits no
+     `test result:` line, so the absence of `^error` is the real gate)
+
+$ cargo clippy --workspace --all-targets --offline
+  grep -cE '^(warning|error)' = 0
+  Finished `dev` profile
+
+$ cargo fmt --all --check
+  clean
+
+$ make ci
+  advisories ok, bans ok, licenses ok, sources ok
+  OK    metadata + fmt + clippy + tests + cargo-deny
+
+$ cargo metadata --locked --offline
+  METADATA_EXIT=0        (re-run after committing)
+
+--------------------------------------------------------------------------------
+9. A REGRESSION `cargo build` COULD NOT SEE
+--------------------------------------------------------------------------------
+Widening compaction::run_compaction from &Connection to &mut Connection (needed
+so the future is Send and the interactive surface can spawn it) left
+`cargo build --workspace` GREEN while four test targets failed to compile:
+  crates/oc-memory/src/snapshot.rs:587
+  crates/oc-engine/tests/compaction.rs:371, :514, :534
+Exactly the hazard WORKTREE.md records: `cargo test --workspace` is the
+integration gate, not `cargo build`. All four updated.
+
+--------------------------------------------------------------------------------
+10. WHAT THE PLAN GOT WRONG / WHAT IS DELIBERATELY NOT DONE
+--------------------------------------------------------------------------------
+* The plan says "`summary` is available on the same path". It is resolved by the
+  same resolve_internals pass and reachable through the same PreludeContext via
+  oc_engine::prelude::summarize (tested), but NO surface requests one — there is
+  no session-summary view in this workspace, and inventing a `session summary`
+  subcommand would ship a command upstream does not have and would need a
+  divergence entry. Stated rather than narrowed.
+* An overflow discovered MID-turn (a step whose own usage crosses the window) is
+  not compacted until the next turn. Upstream re-checks after every step
+  (session/prompt.ts:1161-1167). Closing it means giving run_turn a small-model
+  provider, the hooks and a CompactionState. Recorded in the module docs.
+* The `preset` rung of the model-policy chain is reachable but unfed: nothing in
+  this workspace discovers a PresetLibrary yet, so only the per-agent override
+  and the session model can answer today.
+================================================================================

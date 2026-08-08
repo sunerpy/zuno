@@ -1,0 +1,43 @@
+Task 56 — headless CLI command set with differential parity
+Date: 2026-08-06
+Worktree: /config/workspace/ProdDir/AI/oc-wt/t56
+Branch: task-56
+
+IMPLEMENTATION
+- Added typed command trees and handlers for run, serve, session, agent, models,
+  providers, MCP, DB, and debug under crates/oc-cli.
+- Added the headless run pipeline: configuration and credential resolution,
+  provider registration, database migration, project/session/message persistence,
+  tool dispatch, concurrent bounded event draining, and text/JSON rendering.
+- Added oracle differential coverage for CLI syntax and supported behavior.
+- Unsupported upstream options fail explicitly rather than silently degrading.
+
+VALIDATION
+- cargo test -p oc-cli --offline
+  PASS: 23 unit tests, 11 differential tests, 6 surface tests; 0 failures.
+- cargo clippy -p oc-cli --all-targets --offline -- -D warnings
+  PASS: zero warnings and zero errors.
+- cargo build -p oc-cli --locked --offline
+  PASS.
+- cargo fmt --all -- --check
+  PASS.
+- git diff --check
+  PASS.
+- rust-analyzer diagnostics crates/oc-cli
+  PASS: scan completed with no Error/Warning diagnostics for oc_cli; only
+  inactive-code WeakWarning entries for cfg-disabled test modules were reported.
+- 3 rounds x 6 concurrent
+  `cargo test -p oc-cli cmd::run::tests --offline --quiet`
+  PASS: 18/18 processes succeeded, 0 failed.
+
+SCOPE AUDIT
+- Intended repository changes are limited to Cargo.lock and crates/oc-cli.
+- Shared .omo evidence is outside the task worktree and must not be staged.
+
+KNOWN INTENTIONAL LIMITS
+- Model-backed agent creation, provider plugin OAuth/custom methods,
+  comment-preserving JSONC MCP mutation, debug agent --tool, serve --mdns/--cors,
+  and advanced run flags remain explicit unsupported paths where the available
+  public crate facades do not provide parity.
+- No live provider-backed run was executed; run coverage is offline and verifies
+  parsing, persistence, event-channel concurrency, and differential CLI behavior.

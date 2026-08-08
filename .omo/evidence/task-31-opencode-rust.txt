@@ -1,0 +1,69 @@
+## Task 31 — reasoning effort resolution and prompt-cache stability
+Date: 2026-08-05
+Worktree: /config/workspace/ProdDir/AI/oc-wt/t31
+
+Implemented files:
+- crates/oc-llm/src/effort.rs
+- crates/oc-llm/src/cache.rs
+- crates/oc-llm/src/lib.rs (only `pub mod cache;` and `pub mod effort;`)
+
+Provider effort authority and emitted fields:
+- OpenAI/Azure/Mantle/OpenAI-compatible: `reasoningEffort` — oracle transform.ts:935-974 and :1750-1769. Generic `off` becomes `none`; generic `max` uses the strongest broadly supported `xhigh`; an exact declared model variant wins.
+- Anthropic/Vertex-Anthropic: `thinking.type` + `thinking.budgetTokens`, or adaptive `thinking` + top-level `effort` — oracle :976-1022, :1779-1800, :1807-1809. Generic budgets are low=1024, medium=4096, high=16000, xhigh=24000, max=31999, capped by declared model capability.
+- Bedrock: `reasoningConfig` with `maxReasoningEffort` or `budgetTokens` — oracle :1024-1069 and :1813-1814. `EffortCapabilities` selects adaptive or token-budget shape without inspecting a model id.
+- Google/Vertex: `thinkingConfig` with `thinkingLevel` or `thinkingBudget` — oracle :703-718, :1071-1075, :1810-1812. Generic xhigh/max clamp to native high; declared variants or token-budget capability preserve model-specific behavior.
+- OpenRouter: nested `reasoning.effort` — oracle :745-750 and :801-808. Generic `off` becomes `none`; generic `max` normalizes to `xhigh`.
+- GPT-family defaults read for downstream adapters: oracle :1273-1297 sets medium `reasoningEffort`, `reasoningSummary: auto`, and encrypted-reasoning `include` where supported; :1352-1410 applies the OpenAI reasoning gate and provider-options namespacing. No model-id policy was copied.
+
+Targeted verification:
+$ CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target cargo test -p oc-llm effort
+running 6 tests
+- capabilities_select_adaptive_and_budget_shapes_without_model_names ... ok
+- declared_variant_takes_precedence_over_generic_mapping ... ok
+- effort_table_covers_every_level_and_provider_family ... ok
+- invalid_effort_is_typed_and_actionable ... ok
+- switching_medium_to_xhigh_changes_only_the_effort_field ... ok
+- policy_sources_contain_no_model_id_literals ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out
+
+$ CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target cargo test -p oc-llm cache
+running 5 tests
+- cache_tracker_rejects_changed_or_removed_history ... ok
+- locked_tools_accept_exactly_one_late_mcp_rebuild ... ok
+- cache_tracker_catches_volatile_static_prefix_injection ... ok
+- empty_dynamic_context_adds_no_message ... ok
+- cache_static_prefix_is_byte_stable_across_three_dynamic_turns ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out
+
+Three-turn byte-stability proof:
+- Static bytes on turns 1, 2, and 3 all equal `You are a coding agent.\nProject instructions are stable.` byte-for-byte.
+- Dynamic suffixes changed from clock=10:00/memory generation one, to 10:01/two, to 10:02/three.
+- Every dynamic suffix was the final Role::User message; none appeared in `system_static`.
+- Stable history grew append-only on every turn.
+- Tool snapshots were [shell], then [shell, mcp-memory], then remained [shell, mcp-memory] even when mcp-late-second-wave appeared.
+- `LockedTools::rebuild_count()` was exactly 1.
+
+QA happy transcript — variant switch:
+Base body: {"model":"catalog-selected-model","store":false,"input":"hello"}
+medium:   {"model":"catalog-selected-model","store":false,"input":"hello","reasoningEffort":"medium"}
+xhigh:    {"model":"catalog-selected-model","store":false,"input":"hello","reasoningEffort":"xhigh"}
+Changed keys asserted by the passing test: ["reasoningEffort"]
+
+QA failure transcript — volatile prefix injection:
+turn 1 static prefix: clock=10:00 -> accepted baseline
+turn 2 static prefix: clock=10:01 -> rejected
+error: append-only cache violation on turn 2: static system prefix changed byte-for-byte
+The invalid turn does not redefine the last valid tracker baseline.
+
+Workspace verification:
+$ CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target cargo build --workspace
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.53s
+
+$ CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target cargo clippy --workspace --all-targets -- -D warnings
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.62s
+
+$ cargo fmt --all --check
+exit 0; no output
+
+LSP diagnostic attempt:
+`lsp_diagnostics` was invoked twice for each changed file, first with the direct worktree path and then with a lexical path through the main workspace. The tool rejected both before analysis because its request cwd is fixed to /config/workspace/ProdDir/AI/opencode-rust while the approved worktree is /config/workspace/ProdDir/AI/oc-wt/t31. Rust compiler and clippy diagnostics are clean, but an LSP result could not be obtained from this tool boundary.

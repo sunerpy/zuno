@@ -1,0 +1,43 @@
+Task 16 evidence — oc-permission findLast engine
+
+Oracle sources read:
+- packages/opencode/src/permission/index.ts:28-37,67-107,109-167,178-197
+- packages/core/src/util/wildcard.ts:3-13
+- packages/core/src/v1/config/permission.ts:5-48
+- packages/schema/src/v1/permission.ts:10-59
+
+QA order flip (real tests from `cargo test -p oc-permission`):
+Happy input: {"bash":{"git *":"allow","*":"ask"}}; evaluate("bash", "git push") => Ask
+  test later_ask_overrides_earlier_allow_for_the_same_command ... ok
+Failure-direction input: {"bash":{"*":"ask","git *":"allow"}}; evaluate("bash", "git push") => Allow
+  test later_allow_overrides_earlier_ask_for_the_same_command ... ok
+
+Acceptance evidence:
+- Config flattening source order: test config_conversion_preserves_outer_and_nested_source_order ... ok
+- Custom key evaluation: test arbitrary_custom_permission_keys_are_evaluated ... ok
+- Last-match property plus empty default ask: test random_rule_orders_use_the_last_match_and_empty_rules_ask ... ok
+- Typed deny and no pending: test deny_returns_a_typed_error_without_creating_a_pending ... ok
+- All allow executes: test all_allowed_patterns_authorize_without_creating_a_pending ... ok
+- Any ask becomes pending: test any_ask_pattern_creates_one_pending_request ... ok
+- Reject same-session siblings: test reject_resolves_the_target_and_all_same_session_siblings ... ok
+- Once target only: test once_resolves_only_the_target_without_installing_a_rule ... ok
+- Always exact coverage: test always_clears_exactly_covered_same_session_pendings ... ok
+- Runtime allow precedence: test always_rules_override_supplied_rules_for_subsequent_requests ... ok
+- Wildcard edge suite: 6 passed; 0 failed
+
+Verification transcript:
+$ cargo fmt --all -- --check
+(no output; exit 0)
+$ CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target cargo test -p oc-permission
+23 passed; 0 failed; doc-tests passed
+$ rust-analyzer diagnostics . --severity warning
+`diagnostic scan complete`; no diagnostics emitted
+$ bash .../check-no-excuse-rules.sh <8 changed Rust files>
+rust-programmer: no-excuse rules passed for 8 file(s).
+$ CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target cargo build --workspace
+Finished `dev` profile; exit 0
+$ CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target cargo clippy --workspace --all-targets -- -D warnings
+Finished `dev` profile; exit 0; zero warnings
+
+Todo 12 conclusion:
+The key-order allow-list rationale is not generally sound. Permission keys wildcard-match, so outer keys such as `bash` and `*` overlap and source-order reversal can alter the decision.

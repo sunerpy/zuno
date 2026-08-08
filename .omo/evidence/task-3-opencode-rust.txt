@@ -1,0 +1,136 @@
+Task 3 evidence — epoch-guarded InterruptSignal
+Date: 2026-08-05
+
+FORMAT AND DIAGNOSTICS
+
+$ cargo fmt -p oc-engine
+(no output)
+
+$ lsp_diagnostics /config/workspace/ProdDir/AI/opencode-rust/crates/oc-engine/src/interrupt.rs severity=all
+No diagnostics found
+
+$ lsp_diagnostics /config/workspace/ProdDir/AI/opencode-rust/crates/oc-engine/src/lib.rs severity=all
+No diagnostics found
+
+DELIBERATE ENABLE REMOVAL — EXACT REQUESTED HAMMER
+
+The `notified.as_mut().enable();` line was temporarily removed, then this exact
+hammer was run. On the workspace-pinned Tokio 1.53.1 it did not time out: this
+Tokio version records the `notify_waiters()` generation when `Notified` is
+created, before its first poll. The checked-in contract test records that exact
+behavior. This is real output rather than a claimed failure that did not occur.
+
+$ cargo test -p oc-engine interrupt_fire_never_loses_wakeup_while_notified_races -- --nocapture
+   Compiling oc-engine v0.1.0 (/config/workspace/ProdDir/AI/opencode-rust/crates/oc-engine)
+warning: variable does not need to be mutable
+   --> crates/oc-engine/src/interrupt.rs:102:13
+    |
+102 |         let mut notified = std::pin::pin!(self.notify.notified());
+    |             ----^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `oc-engine` (lib test) generated 1 warning (run `cargo fix --lib -p oc-engine --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.71s
+     Running unittests src/lib.rs (target/debug/deps/oc_engine-87ec4d56cce42ac3)
+
+running 1 test
+test interrupt::tests::interrupt_fire_never_loses_wakeup_while_notified_races ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.06s
+
+DELIBERATE ENABLE REMOVAL — FAILING ZERO-WARNING GATE
+
+With the same line still removed, the project zero-warning gate fails before
+the hammer can run because the pinned future no longer needs mutable access.
+This is the real deliberate-failure transcript. The line was restored
+immediately afterward.
+
+$ RUSTFLAGS="-D warnings" cargo test -p oc-engine interrupt_fire_never_loses_wakeup_while_notified_races -- --nocapture
+   Compiling libc v0.2.189
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+   Compiling parking_lot_core v0.9.12
+   Compiling cfg-if v1.0.4
+   Compiling smallvec v1.15.2
+   Compiling scopeguard v1.2.0
+   Compiling pin-project-lite v0.2.17
+   Compiling bytes v1.12.1
+   Compiling lock_api v0.4.14
+   Compiling syn v3.0.3
+   Compiling errno v0.3.14
+   Compiling socket2 v0.6.5
+   Compiling mio v1.2.2
+   Compiling signal-hook-registry v1.4.8
+   Compiling parking_lot v0.12.5
+   Compiling tokio-macros v2.7.2
+   Compiling tokio v1.53.1
+   Compiling oc-engine v0.1.0 (/config/workspace/ProdDir/AI/opencode-rust/crates/oc-engine)
+error: variable does not need to be mutable
+   --> crates/oc-engine/src/interrupt.rs:102:13
+    |
+102 |         let mut notified = std::pin::pin!(self.notify.notified());
+    |             ----^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `-D unused-mut` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(unused_mut)]`
+
+error: could not compile `oc-engine` (lib test) due to 1 previous error
+
+FINAL ACCEPTANCE — THREE CONSECUTIVE INTERRUPT RUNS, WORKSPACE BUILD, CLIPPY
+
+$ cargo test -p oc-engine interrupt -- --nocapture && cargo test -p oc-engine interrupt -- --nocapture && cargo test -p oc-engine interrupt -- --nocapture && cargo build --workspace && cargo clippy --workspace --all-targets
+   Compiling oc-engine v0.1.0 (/config/workspace/ProdDir/AI/opencode-rust/crates/oc-engine)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.31s
+     Running unittests src/lib.rs (target/debug/deps/oc_engine-87ec4d56cce42ac3)
+
+running 7 tests
+test interrupt::tests::interrupt_is_sync_readable_without_a_runtime ... ok
+test interrupt::tests::interrupt_reset_if_epoch_rejects_a_stale_reset ... ok
+test interrupt::tests::interrupt_roles_start_independent_and_empty ... ok
+test interrupt::tests::interrupt_same_instance_only_matches_clones ... ok
+test interrupt::tests::interrupt_notify_waiters_tracks_creation_and_stores_no_permit ... ok
+test interrupt::tests::interrupt_fire_never_loses_wakeup_while_notified_races ... ok
+test interrupt::tests::interrupt_reset_if_epoch_never_erases_concurrent_fire ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running unittests src/lib.rs (target/debug/deps/oc_engine-87ec4d56cce42ac3)
+
+running 7 tests
+test interrupt::tests::interrupt_is_sync_readable_without_a_runtime ... ok
+test interrupt::tests::interrupt_reset_if_epoch_rejects_a_stale_reset ... ok
+test interrupt::tests::interrupt_same_instance_only_matches_clones ... ok
+test interrupt::tests::interrupt_roles_start_independent_and_empty ... ok
+test interrupt::tests::interrupt_notify_waiters_tracks_creation_and_stores_no_permit ... ok
+test interrupt::tests::interrupt_fire_never_loses_wakeup_while_notified_races ... ok
+test interrupt::tests::interrupt_reset_if_epoch_never_erases_concurrent_fire ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running unittests src/lib.rs (target/debug/deps/oc_engine-87ec4d56cce42ac3)
+
+running 7 tests
+test interrupt::tests::interrupt_reset_if_epoch_rejects_a_stale_reset ... ok
+test interrupt::tests::interrupt_same_instance_only_matches_clones ... ok
+test interrupt::tests::interrupt_roles_start_independent_and_empty ... ok
+test interrupt::tests::interrupt_is_sync_readable_without_a_runtime ... ok
+test interrupt::tests::interrupt_notify_waiters_tracks_creation_and_stores_no_permit ... ok
+test interrupt::tests::interrupt_fire_never_loses_wakeup_while_notified_races ... ok
+test interrupt::tests::interrupt_reset_if_epoch_never_erases_concurrent_fire ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+   Compiling tokio v1.53.1
+   Compiling oc-engine v0.1.0 (/config/workspace/ProdDir/AI/opencode-rust/crates/oc-engine)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.15s
+    Checking oc-llm v0.1.0 (/config/workspace/ProdDir/AI/opencode-rust/crates/oc-llm)
+    Checking oc-engine v0.1.0 (/config/workspace/ProdDir/AI/opencode-rust/crates/oc-engine)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.36s

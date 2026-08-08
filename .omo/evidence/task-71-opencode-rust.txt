@@ -1,0 +1,82 @@
+Task 71 — deterministic destructive-command gate
+Date: 2026-08-06
+Worktree: /config/workspace/ProdDir/AI/oc-wt/t71
+Branch: task-71
+
+Implemented:
+- Added a pure tree-sitter-backed risk assessment with run, reflect, and permanent
+  deny outcomes. Assessment performs no command execution, filesystem probe, or
+  LLM call.
+- Permanently deny filesystem root, the current user's home, credential stores,
+  critical system paths, and device nodes. A justification cannot unlock these.
+- Reflect bounded and runtime-computed destructive operations until a substantive
+  justification identifies the actual user request served by the operation.
+- Integrated the gate before permission checks, environment hooks, process spawn,
+  explicit background adoption, and foreground timeout promotion.
+- Log every verdict through tracing and document explicitly that this is not a
+  sandbox: commands retain full filesystem, network, and credential access.
+
+Adversarial review:
+- Covered compound statements, subshells, shell/eval/su scripts, wrappers,
+  xargs/find, quote/backslash spelling, brace expansion, globs, dynamic commands
+  and targets, traversal, redirects, protected targets, and explicit background
+  dispatch.
+- Documented the static-analysis boundary: arbitrary interpreter/application
+  semantics, aliases/functions, encoded/downloaded scripts, and symlink/TOCTOU
+  behavior require a future confinement layer rather than heuristic claims.
+
+Final verification (single successful chain):
+- `cargo fmt -p oc-tools`: passed.
+- `rust-analyzer diagnostics crates/oc-tools --severity warning`: clean.
+- `cargo metadata --locked --offline --no-deps --format-version 1`: passed.
+- `cargo build -p oc-tools`: passed.
+- `cargo test -p oc-tools --lib`: 181 passed, 0 failed.
+- `cargo test -p oc-tools risk`: 12 risk tests passed, 0 failed; unrelated
+  integration binaries reported only filtered tests.
+- `cargo test -p oc-tools --test shell`: 7 passed, 0 failed.
+- `cargo clippy -p oc-tools --all-targets -- -D warnings`: passed with zero
+  warnings.
+- `cargo fmt --all --check`: passed.
+- `git diff --check`: passed.
+
+Adversarial correction after the first review:
+- The original “brace expansion” claim missed legal empty alternatives. Four
+  commands reached Allow with substantive justification: `rm -rf /{,}`,
+  `rm -rf /{a,}`, `rm -rf {/,}`, and `rm -rf /{.,}`. Fixed by preserving empty
+  alternatives during expansion; all four now Deny permanently.
+- The original “compound statements” claim missed cwd mutation. Seven commands
+  reached Allow with substantive justification: `cd / && rm -rf .`,
+  `cd / && rm -rf *`, `cd ~ && rm -rf .`, `cd / ; rm -rf .`,
+  `pushd / && rm -rf .`, `cd /etc && rm -rf .`, and
+  `cd / && rm -rf ./`. Fixed by ordered cwd/directory-stack simulation; all seven
+  now Deny permanently.
+- Unsupported brace syntax is documented as an unknown static target and Reflects.
+  Dynamic/unknown directory changes make later relative destructive targets
+  permanently Deny, because a justification cannot make the destination knowable.
+  Credential reads such as `cat ~/.ssh/id_rsa` are documented as outside this
+  destruction-only gate and remain Allow.
+
+Mutation proofs:
+- Reintroduced the old empty-alternative bailout. The brace regression failed on
+  `rm -rf /{,}`: expected Deny, observed Reflect against literal target `/{,}`.
+  Restored the fix.
+- Disabled ordered cwd tracking. The cwd regression failed on
+  `cd / && rm -rf .`: expected Deny, observed Reflect against the stale session
+  target `/work/project`. Restored the fix.
+
+Corrected final verification:
+- `rust-analyzer diagnostics crates/oc-tools --severity warning`: clean.
+- `cargo metadata --locked --offline --format-version 1`: passed.
+- `cargo build -p oc-tools --offline`: passed.
+- `cargo test -p oc-tools --lib --offline`: 181 passed, 0 failed.
+- `cargo test -p oc-tools --test risk --offline`: 15 passed, 0 failed.
+- `cargo test -p oc-tools --test shell --offline`: 7 passed, 0 failed.
+- `cargo test -p oc-tools risk --offline`: 15 passed, 0 failed; all other test
+  binaries reported only filtered tests.
+- `cargo clippy --workspace --all-targets --offline -- -D warnings`: passed with
+  zero warnings.
+- `cargo fmt --all --check`: passed.
+- `git diff --check`: passed.
+- Literal `lsp_diagnostics` could not run because the MCP rejects sibling-worktree
+  paths before starting the server; the direct rust-analyzer diagnostic above is
+  clean. This pre-existing tool-root limitation remains explicit.

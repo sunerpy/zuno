@@ -1,0 +1,413 @@
+Task 50 — crates/oc-watch: debounced file watching with a bounded channel
+========================================================================
+
+Worktree : /config/workspace/ProdDir/AI/oc-wt/t50   (branch task-50)
+Platform : Linux, notify 8.2.0 -> INotifyWatcher (inotify backend)
+Oracle   : /config/workspace/ProdDir/AI/opencode/packages/core/src/filesystem/watcher.ts
+Date     : 2026-08-06
+
+Kernel limits on this host, for context on the burst sizes below:
+  $ cat /proc/sys/fs/inotify/max_queued_events /proc/sys/fs/inotify/max_user_watches
+  16384
+  499233
+
+
+1. THE COALESCING MEASUREMENT — 1,000-FILE BURST
+------------------------------------------------
+
+Test: a_burst_of_one_thousand_files_is_coalesced_to_one_event_per_path
+Raw stdout from `cargo test -p oc-watch --offline -- --nocapture --test-threads=1`:
+
+  burst: files=1000 raw_notifications_accepted=2003 delivered_events=1000
+         distinct_paths=1000 bound=1000 overflow_dropped=0
+         rss_baseline_kib=Some(6616) rss_peak_kib=Some(6864)
+  burst: rss_delta_kib=248 ceiling_kib=8192
+
+  raw notifications accepted : 2003
+  events delivered           : 1000
+  documented bound           : 1000  (= one per distinct path)
+  coalescing ratio           : 2.00x
+  overflow drops             : 0
+
+The documented bound is `FILES`, i.e. one event per distinct path. There is
+nothing below it to reach: 1,000 *different* files carry 1,000 independent
+facts, and coalescing is keyed by path. What the measurement shows is that
+delivered sits exactly at that floor (1000) while inotify produced 2003 raw
+notifications for the same work — the 1,003 surplus notifications are the
+IN_CREATE / IN_MODIFY pairs (plus the fixture's own probe) that a
+one-event-per-notification port would have published.
+
+IN_CLOSE_WRITE also fires for every file. It arrives as
+EventKind::Access(Close(Write)) and is discarded before reaching the buffer
+(`classify`, lib.rs), because `@parcel/watcher` reports only create/update/delete
+(`watcher.ts:85-89`). So the true kernel notification count is ~3,000; 2,003 is
+what survived classification and was folded into the coalescing buffer.
+
+Assertions this test makes, all passing:
+  - overflow_dropped == 0        (the default 4096-path buffer absorbs the burst)
+  - every one of the 1,000 paths appears (no silent loss)
+  - delivered <= 1000            (the documented bound)
+  - accepted > delivered         (coalescing demonstrably happened)
+  - watcher.pending() <= DEFAULT_MAX_PENDING, checked after *every* one of the
+    1,000 writes, not once at the end
+  - stream.queued() <= stream.capacity(), likewise checked 1,000 times
+  - RSS delta <= 8192 KiB
+
+
+2. MEMORY DELTA AND ITS CEILING
+-------------------------------
+
+  burst test           : baseline 6616 KiB, peak 6864 KiB, delta  248 KiB
+  stalled-consumer test: baseline 7248 KiB, peak 7248 KiB, delta    0 KiB
+  ceiling asserted     : 8192 KiB (8 MiB) in both
+
+RSS is read from /proc/self/status VmRSS, sampled after every write during the
+burst plus once after the drain, peak retained. Read directly rather than via
+oc-testkit: `oc_testkit::perf::process_tree::sample` is `pub(crate)` and measures
+a *child* process tree, whereas this needs the test process's own RSS.
+
+Honest framing of what proves what. RSS is page-granular and the buffers here are
+tens of KiB, so the delta is a corroborating measurement, not the proof. The
+proof is structural and is asserted directly:
+
+  - stalled consumer held exactly 80 events = capacity 16 + max_pending 64.
+    That is the configured ceiling, hit exactly, with 4,000 files written and
+    nothing read.
+  - the same two invariants are re-checked after every single write in both
+    tests, so a transient excursion above the ceiling would fail the test even
+    if RSS never noticed it.
+
+An unbounded implementation would have held 4,000+ entries in the stalled case.
+
+
+3. HAPPY PATH — ONE EDIT IS EXACTLY ONE EVENT
+---------------------------------------------
+
+Test: editing_one_file_produces_exactly_one_coalesced_change_event
+
+  single edit: accepted=5 published=2 events=1
+
+  events for the edited path : 1     (asserted `== 1`, not `>= 1`)
+  kind                       : Add   (the file did not exist before)
+  overflow drops             : 0
+  accepted (5) > published (2)        -> coalescing asserted, not assumed
+
+accepted=5 and published=2 include the fixture's watch-arming probe write and
+its removal; the assertion that matters is the per-path count of exactly 1 for
+the file under test. Writing one file yields IN_CREATE + IN_MODIFY (2 accepted
+notifications after Access is discarded) and produces one Add event, because
+`ChangeKind::merge(Add, Change) == Add`.
+
+
+4. FAILURE PATH — A STALLED CONSUMER COALESCES, THEN DROPS VISIBLY
+-----------------------------------------------------------------
+
+Test: a_stalled_consumer_causes_coalescing_and_a_visible_drop_not_growth
+Configuration deliberately tiny so the give-up path is reached in under a second
+rather than by generating enough load to hit the production ceiling by luck.
+
+  stalled consumer: files=4000 capacity=16 max_pending=64
+                    raw_accepted=8003 published=16 dropped=7718 held_now=80
+                    rss_baseline_kib=Some(7248) rss_peak_kib=Some(7248)
+  stalled consumer: rss_delta_kib=0 ceiling_kib=8192
+
+  raw notifications accepted : 8003
+  published to the channel   : 16     (= the whole channel, then refused)
+  dropped, counted, surfaced : 7718
+  held at the end            : 80     == capacity(16) + max_pending(64), exactly
+  RSS delta                  : 0 KiB
+
+The consumer never calls try_recv during the burst. Sequence observed:
+
+  1. coalesce  — 8,003 notifications fold into at most 64 pending paths
+  2. hold      — the channel fills at 16; the rest of each batch is requeued
+                 into the buffer and retried one quiet period later, so the
+                 notify callback thread is never blocked
+  3. drop      — the 64-path buffer is full, so further *new* paths are
+                 discarded and counted (7,718 of them)
+
+Assertions, all passing:
+  - pending <= 64 and queued <= 16, checked after each of the 4,000 writes
+  - held (80) <= capacity + max_pending (80)
+  - dropped > 0  (the ceiling is genuinely enforced; a silent success here
+    would mean it was not)
+  - after the consumer resumes it receives WatchEvent::Overflow with a non-zero
+    count — the loss is *visible*, which is the difference between a drop that
+    is correct and a drop that is a bug
+  - RSS delta <= 8192 KiB (measured 0)
+
+`dropped` varies run to run (5648 / 6764 / 7718 observed) because it depends on
+how many flush cycles the loop completes during the burst. The test asserts
+`> 0` and asserts the bounds, never an exact drop count, which is why it does
+not flake.
+
+
+5. IGNORE AND FLAG COVERAGE
+---------------------------
+
+  built_in_ignored_folders_are_never_reported         node_modules pruned at depth
+  watcher_ignore_patterns_suppress_matching_paths     watcher.ignore honoured live
+  gitignored_paths_are_suppressed_when_gitignore_is_enabled
+                                                      .gitignore applied, `!` rule
+                                                      whitelisted, .git present so
+                                                      require_git is satisfied
+  the_disable_flag_yields_a_watcher_that_reports_nothing
+                                                      both flags true -> disabled
+  without_the_enable_flag_the_project_directory_is_not_watched
+  only_head_is_reported_from_the_vcs_directory        .git/HEAD in, .git/index out
+  a_deletion_is_reported_as_an_unlink
+  a_create_then_delete_within_one_window_collapses_to_a_single_unlink
+  dropping_the_watcher_closes_the_stream               flush thread is joined
+  a_path_the_filter_rejects_is_still_answerable_by_the_consumer
+
+
+6. VERIFICATION COMMANDS AND COUNTS
+-----------------------------------
+
+$ cargo build --workspace --offline
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 15.69s
+  -> clean
+
+$ cargo test -p oc-watch --offline
+     Running unittests src/lib.rs (target/debug/deps/oc_watch-1f3c8bd3edfcc385)
+  running 55 tests
+  test result: ok. 55 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/watch.rs (target/debug/deps/watch-0516d88d46934724)
+  running 13 tests
+  test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.02s
+     Doc-tests oc_watch
+  running 0 tests
+  test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+  Per-target counts:
+    lib unit tests   : 55 passed, 0 failed   (flags 7, debounce 22, ignore 16, lib 10)
+    tests/watch.rs   : 13 passed, 0 failed
+    doc-tests        :  0 (no doc examples in this crate)
+    TOTAL            : 68 passed, 0 failed, 0 ignored, 0 filtered out
+
+  No `N filtered out` above zero anywhere: the suite was run unfiltered.
+
+$ cargo clippy --workspace --all-targets --offline
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.18s
+  warning/error lines matching '^(warning|error)': 0
+  -> 0 warnings, workspace-wide, all targets
+
+$ cargo fmt --all --check
+  (no output)  exit 0
+
+$ cargo metadata --locked --offline >/dev/null
+  exit 0
+  (only the benign "please specify --format-version" notice on stderr)
+
+
+7. DETERMINISM: THREE CONSECUTIVE FULL RUNS
+-------------------------------------------
+
+Filesystem-watching tests are the classic source of flaky suites, so the suite
+was run three times back to back:
+
+  === RUN 1 ===  55 passed / 0 failed (0.00s) ; 13 passed / 0 failed (3.02s)
+  === RUN 2 ===  55 passed / 0 failed (0.00s) ; 13 passed / 0 failed (3.02s)
+  === RUN 3 ===  55 passed / 0 failed (0.00s) ; 13 passed / 0 failed (3.02s)
+
+  wall clock, default parallelism: 3.32s
+  wall clock, --test-threads=1   : 19.7s
+
+Zero failures across three runs, and the integration wall time is identical to
+10 ms across all three — the suite is gated on real conditions, not on races.
+
+How that determinism is achieved:
+
+  - No fixed `sleep` is used as a synchronisation primitive anywhere. Every wait
+    is `poll_until(budget, condition)` or `drain_until_quiet(stream, quiet,
+    budget)`: a condition polled on a 5 ms interval against a hard deadline,
+    failing with the observed state rather than a bare timeout.
+  - Every fixture arms the watch before asserting: it writes a probe file in a
+    retry loop and blocks until inotify reports it, then drains the probe's own
+    events. `notify::Watcher::watch` returns before the kernel is guaranteed to
+    be delivering, and skipping this step races the first assertion in every
+    test.
+  - The debounce is injectable and set to 250 ms in tests instead of the
+    production 100 ms/1 s, so "one flush" is structurally guaranteed for a burst
+    whose write phase is far shorter than that, while the whole suite still
+    finishes in seconds.
+  - Nothing in `debounce.rs` reads the clock. Every entry point takes an
+    `Instant`, so all 22 of its unit tests are pure functions of an explicit
+    timeline and cannot flake. That is where the coalescing rules are tested;
+    the filesystem tests only confirm the wiring.
+  - Assertions are on bounds and on per-path counts, never on a raw event total
+    that depends on kernel timing. `dropped` is asserted `> 0`, not `== 7718`.
+
+One genuine inotify race was found and fixed rather than papered over: a file
+written into a *just-created* subdirectory can be missed entirely, because
+inotify watches one directory at a time and `notify` only adds the watch for
+`src/` once it has processed `src/`'s own creation event. Anything written in
+that gap is never reported by the kernel. `built_in_ignored_folders_are_never_reported`
+failed on this the first time it ran. The fix is to retry the write until the
+watch is live; a real consumer has to handle this too.
+
+
+8. THE OVERFLOW POLICY, AS IMPLEMENTED
+--------------------------------------
+
+Channel: tokio::sync::mpsc, bounded, DEFAULT_CAPACITY = 1024 events.
+Buffer : path-keyed BTreeMap, DEFAULT_MAX_PENDING = 4096 distinct paths.
+
+Degradation order, and what each step costs:
+
+  1. Coalesce (information-preserving). Notifications for one path collapse to
+     one event. Nothing is lost. This is the ordinary case.
+  2. Hold (information-preserving). Channel full -> the batch goes back into the
+     coalescing buffer via `Debouncer::requeue` and is retried one quiet period
+     later. `requeue` sets `last_activity`, which is what makes the retry a
+     backoff rather than a hot loop. The requeued events are treated as *older*
+     than anything that arrived meanwhile, so a newer kind wins.
+  3. Drop (lossy, and therefore visible). Buffer full -> further *new* paths are
+     discarded and counted; the count is delivered as `WatchEvent::Overflow`
+     *ahead of* the surviving batch, so a consumer learns its view has a hole
+     before it acts on a partial one. Paths already held keep merging, because
+     merging costs no memory.
+
+No path in this crate calls a blocking or awaiting send. Every publish is
+`Sender::try_send`, performed with the buffer mutex *not* held, from the flush
+thread — never from notify's callback thread. Blocking that thread would stop
+the inotify queue being drained, and the kernel's queue is itself bounded at
+16384 here; overrunning it makes the kernel set IN_Q_OVERFLOW and silently
+discard events.
+
+
+9. CAPACITY NUMBERS AND WHY
+---------------------------
+
+  DEFAULT_CAPACITY    = 1024 events
+      One full flush of a branch switch. A large `git checkout` touching ~1,000
+      distinct files is the shape this has to survive; 1024 is the next power of
+      two above it, measured directly by the burst test (1,000 events delivered
+      with 0 drops). Cost is bounded and small. Raising it buys no correctness,
+      only staleness-for-memory; past this size a consumer that cannot keep up
+      wants Overflow and a rescan, not a longer queue.
+
+  DEFAULT_MAX_PENDING = 4096 distinct paths  (= 4 x capacity)
+      Four flush-windows of coalescing for a consumer that has stalled entirely,
+      before anything is discarded. Beyond that the honest answer is Overflow: a
+      buffer large enough to hold every path in a monorepo is an unbounded queue
+      with extra steps.
+
+  DEFAULT_DEBOUNCE    = 100 ms
+      Long enough that a multi-write save lands in one window on any filesystem,
+      short enough that a human sees the effect as immediate. The oracle never
+      configures @parcel/watcher's batching, so there is no number to port.
+
+  DEFAULT_MAX_WAIT    = 1 s
+      A build or `git checkout` touches something every few milliseconds for
+      seconds, so the trailing debounce alone would never elapse and the consumer
+      would starve for the length of the build. Bounds staleness without giving
+      up most of the coalescing. Unit-tested by
+      `max_wait_flushes_under_unending_activity`.
+
+
+10. FLAG PRECEDENCE FOUND IN THE ORACLE
+---------------------------------------
+
+`flag/flag.ts:37-42` declares both flags with Effect's `Config.boolean`, not with
+`Flag.truthy` (`flag.ts:3-6`, which accepts only lower-cased "true" or "1"):
+
+  OPENCODE_EXPERIMENTAL_FILEWATCHER: Config.boolean("OPENCODE_EXPERIMENTAL_FILEWATCHER")
+    .pipe(Config.withDefault(false)),
+  OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: Config.boolean(...)
+    .pipe(Config.withDefault(false)),
+
+Precedence, read off `watcher.ts`:
+
+  - DISABLE is read first, at `watcher.ts:59`, before the backend check and
+    before the binding load, and returns `Service.of({})` immediately. So with
+    BOTH flags set to true the watcher is OFF. Implemented in `flags::decide`
+    and asserted by `disable_wins_when_both_flags_are_set` plus the live test
+    `the_disable_flag_yields_a_watcher_that_reports_nothing`.
+
+  - The ENABLE flag is NOT a master switch. It gates only the project-directory
+    subscription (`watcher.ts:107`). The `.git` subscription at `watcher.ts:112`
+    is gated on nothing but the repository being git. With no flags set at all
+    the oracle therefore still watches `.git`. Modelled as `Decision::VcsOnly`;
+    a port that treated the enable flag as a master switch would silently stop
+    noticing branch switches. Asserted by
+    `without_the_enable_flag_the_project_directory_is_not_watched` and
+    `only_head_is_reported_from_the_vcs_directory`.
+
+  - `Config.withDefault(false)` supplies false only when the variable is
+    ABSENT. A present-but-unparseable value yields an Effect InvalidData failure
+    which propagates into the `Effect.catchCause` wrapping the layer body
+    (`watcher.ts:130-136`), whose handler logs and returns an empty service. So
+    a typo in either variable takes the whole layer down including the `.git`
+    subscription, rather than falling back to "enable off". Implemented as
+    `Decision::Disabled(DisabledReason::UnparseableFlag { .. })`.
+
+  Not confirmable against the 1.18.12 binary: `opencode debug paths` produced
+  byte-identical output for FILEWATCHER=yes / on / bogus / 2 / TRUE, because the
+  watcher layer is not constructed on that code path and its failure is logged
+  rather than surfaced. The truthy value set (true/1/yes/on vs
+  false/0/no/off) and the unparseable-value behaviour are therefore read off
+  Effect's Config.boolean contract and the oracle source, not measured. Recorded
+  in .omo/notepads/opencode-rust/issues.md.
+
+
+11. DIVERGENCES FROM THE ORACLE, DELIBERATE
+-------------------------------------------
+
+  a) Folder pruning is per-component, not top-level-only.
+     The oracle passes bare basenames ("node_modules", "target", "dist") to
+     @parcel/watcher's `ignore` option, where a bare name is a path relative to
+     the watched directory — so parcel prunes only a TOP-LEVEL node_modules. The
+     same module's own matcher, `Ignore.match` (`ignore.ts:55-58`), instead tests
+     the basename set against EVERY component. This port implements
+     `Ignore.match`'s rule. A monorepo has node_modules/target inside every
+     package, and reporting them defeats the watcher's purpose.
+
+  b) `.gitignore` support is an addition, not a port.
+     @parcel/watcher has no gitignore support; `Ignore.PATTERNS` is a hard-coded
+     stand-in. Because it is an addition it is opt-in
+     (`WatchOptions::gitignore(true)`), off by default.
+
+  c) The `.git` filter states its intent instead of snapshotting.
+     The oracle reads `.git`'s directory entries at subscribe time and ignores
+     all of them except HEAD (`watcher.ts:117-120`). Because that list is a
+     snapshot, an entry created in `.git` AFTER subscribing slips through the
+     oracle's filter. `is_vcs_reportable` states "only HEAD" directly, which is
+     a strict narrowing.
+
+  d) FOLDERS has 28 entries, not 29.
+     Counted from `ignore.ts:3-32`. A `[&str; 29]` array was the first thing the
+     compiler rejected, which is why the count is now pinned by a test
+     (`the_pattern_counts_match_the_oracle`).
+
+  All four are recorded in .omo/notepads/opencode-rust/issues.md.
+
+
+12. WHAT THE PLAN GOT WRONG
+---------------------------
+
+  - "publish events on a bounded channel with a documented overflow policy
+     (coalesce-and-drop, never grow)" is right, but coalesce-and-drop is two
+     distinct outcomes with different consumer consequences, and the plan treats
+     them as one. A drop because an event was SUPERSEDED loses nothing; a drop
+     because the buffer gave up loses information. They are implemented and
+     surfaced differently here: the first is silent, the second is
+     WatchEvent::Overflow. The plan's own QA text hints at this ("coalescing
+     rather than unbounded queue growth") without naming the split.
+
+  - The suggested module split named `flags.rs` for "the two experimental
+     flags", implying a boolean gate. The oracle's enable flag is not a gate on
+     watching — it gates one of two subscriptions. Following the plan's framing
+     literally would have produced a watcher that stops noticing branch switches
+     whenever the flag is unset, which is the default.
+
+  - The acceptance criterion asks for "a coalesced event count under a
+     documented bound". For a burst of N *distinct* files the achievable floor is
+     exactly N, so the only honest bound is N itself, and the coalescing evidence
+     has to come from the raw-vs-delivered ratio (2003 -> 1000) rather than from
+     the delivered count being small. Reported both ways above.
+
+  - `oc-testkit`'s memory helper could not be reused as the prompt suggested:
+     `perf::process_tree::sample` is `pub(crate)` and measures a child process
+     tree, not the caller's own RSS. Reading /proc/self/status VmRSS directly is
+     four lines and adds no dependency.

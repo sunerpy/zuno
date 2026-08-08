@@ -1,0 +1,53 @@
+Task 87 — registry-derived provider-family cassette suite
+Worktree: /config/workspace/ProdDir/AI/oc-wt/t87 (branch task-87)
+Date: 2026-08-07
+
+SCOPE
+  Added crates/oc-testkit/src/cassettes.rs.
+  Appended the cfg(test) module declaration to crates/oc-testkit/src/lib.rs.
+  Appended provider/LLM/error dev-dependencies to crates/oc-testkit/Cargo.toml.
+  Updated Cargo.lock for those direct dev-dependency edges.
+  No provider crate, tests/memory.rs, src/perf/**, or .github/** file was modified.
+
+MATRIX
+  Provider families: Anthropic, OpenAI, OpenAI-compatible, Bedrock, Gemini.
+  Scenarios per family: 8.
+  Required cells: 5 × 8 = 40; uniqueness and completeness asserted.
+  Provenance: 5 Recorded, 30 Authored, 5 Gap.
+  Every non-gap cell replays through CassettePlayer and a production decoder, then
+  compares the exact ordered Vec<StreamEvent>.
+
+EXPLICIT GAPS
+  OpenAI signed thinking.
+  OpenAI-compatible signed thinking.
+  OpenAI-compatible encrypted reasoning item.
+  Bedrock encrypted reasoning item.
+  Gemini encrypted reasoning item.
+
+ANTI-VACUITY / MUTATION PROOF
+  A registry containing synthetic id `new-provider` is rejected with:
+    registered provider `new-provider` has no cassette family
+  Therefore adding a registered provider cannot leave the matrix silently unchanged.
+
+TDD RED BASELINE
+  Before the matrix implementation, the coverage assertion failed as intended:
+    implemented matrix length: 0
+    required matrix length: 40
+
+FINAL DIAGNOSTICS
+  lsp_diagnostics crates/oc-testkit/src/cassettes.rs  clean
+  lsp_diagnostics crates/oc-testkit/src/lib.rs        clean
+
+FINAL VERIFICATION — all passed
+  cargo fmt --all -- --check
+  cargo test -p oc-testkit cassettes                  6 passed
+  cargo test -p oc-testkit --test no_http_client
+  cargo test -p oc-testkit
+  cargo clippy -p oc-testkit --all-targets -- -D warnings
+  cargo build -p oc-testkit
+
+ENVIRONMENT NOTE
+  An earlier attempt failed only after the worktree had been temporarily relocated:
+  a cached path-sensitive test binary retained the original CARGO_MANIFEST_DIR. The
+  worktree was restored to /config/workspace/ProdDir/AI/oc-wt/t87 and the complete
+  final verification above passed. No source workaround was added.

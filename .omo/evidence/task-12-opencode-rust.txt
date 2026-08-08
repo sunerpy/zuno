@@ -1,0 +1,564 @@
+
+## Task 12 deliberate layer-swap failure
+Before SHA-256: 44fe6bd8f47b86fe6a87e3cab32b46deae64570b856342d0948237151110eb8c
+Command: cargo test -p oc-config --test differential -- --nocapture
+   Compiling oc-config v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.91s
+     Running tests/differential.rs (/config/workspace/ProdDir/AI/opencode-rust/target/debug/deps/differential-2c142940ea7bbfd2)
+
+running 2 tests
+OPENCODE_PURE=true: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+$ /config/.local/share/mise/installs/opencode/1.18.12/opencode debug info
+  provenance: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+  cwd: /tmp/oc-testkit-j2P0y8/project
+  exit: Some(0)
+  stdout: "opencode version: 1.18.12\nos: Linux 6.17.0-1019-aws x64\nterminal: unknown\nplugins:\nexternal plugins disabled (--pure)\n"
+  stderr: ""
+
+--pure: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+$ /config/.local/share/mise/installs/opencode/1.18.12/opencode --pure debug info
+  provenance: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+  cwd: /tmp/oc-testkit-h4nMve/project
+  exit: Some(0)
+  stdout: "opencode version: 1.18.12\nos: Linux 6.17.0-1019-aws x64\nterminal: unknown\nplugins:\nexternal plugins disabled (--pure)\n"
+  stderr: ""
+
+test pure_env_and_cli_flag_disable_external_plugins_without_suppressing_config ... ok
+config differential matrix: 14 trees
+global-only: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case global-only
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+project-only: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case project-only
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+global-and-project: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case global-and-project
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+dot-opencode-chain: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case dot-opencode-chain
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+env-config-content-after-project: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case env-config-content-after-project
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+home-and-env-config-dir: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case home-and-env-config-dir
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+permission-env-object: intentional divergence (remeda reverses new OPENCODE_PERMISSION keys while Rust preserves JSON insertion order; the distinct permission names have no precedence interaction)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case permission-env-object
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: 3 divergence(s)
+  @ L9 (missing on the right)
+    -     "bash": "deny",
+  @ L10/R9
+    -     "read": "allow"
+    +     "read": "allow",
+  @ R10 (extra on the right)
+    +     "bash": "deny"
+
+project-disabled-uppercase-true: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case project-disabled-uppercase-true
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+pure-env-keeps-config-layers: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case pure-env-keeps-config-layers
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+pure-cli-flag-keeps-config-layers: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case pure-cli-flag-keeps-config-layers
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+jsonc-comments-and-trailing-commas: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case jsonc-comments-and-trailing-commas
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+Error: "3 of 14 config trees diverged:\ncase env-config-file-before-project:\ndifferential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case env-config-file-before-project\n  normalization rules available: (none — byte-exact comparison)\n  normalization masked: nothing\n  result: 4 divergence(s)\n  @ L5/R5\n    -   \"model\": \"matrix/project\",\n    +   \"model\": \"matrix/env-file\",\n  @ L10 (missing on the right)\n    -     \"env-file\",\n  @ L11/R10\n    -     \"project\"\n    +     \"project\",\n  @ R11 (extra on the right)\n    +     \"env-file\"\n\ncase deep-ancestor-walk-with-env-file:\ndifferential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case deep-ancestor-walk-with-env-file\n  normalization rules available: (none — byte-exact comparison)\n  normalization masked: nothing\n  result: 4 divergence(s)\n  @ L5/R5\n    -   \"model\": \"matrix/abcd\",\n    +   \"model\": \"matrix/env-file\",\n  @ L10 (missing on the right)\n    -     \"env-file\",\n  @ L14/R13\n    -     \"abcd\"\n    +     \"abcd\",\n  @ R14 (extra on the right)\n    +     \"env-file\"\n\ncase all-config-env-layers:\ndifferential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case all-config-env-layers\n  normalization rules available: (none — byte-exact comparison)\n  normalization masked: nothing\n  result: 2 divergence(s)\n  @ L10 (missing on the right)\n    -     \"env-file\",\n  @ R11 (extra on the right)\n    +     \"env-file\",\n"
+test merged_config_matches_real_opencode_across_the_full_matrix ... FAILED
+
+failures:
+
+failures:
+    merged_config_matches_real_opencode_across_the_full_matrix
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 23.01s
+
+error: test failed, to rerun pass `-p oc-config --test differential`
+
+## Task 12 restoration and happy path
+After SHA-256: 44fe6bd8f47b86fe6a87e3cab32b46deae64570b856342d0948237151110eb8c  crates/oc-config/src/discovery.rs
+Command: git diff --exit-code -- crates/oc-config/src/discovery.rs
+<empty diff; discovery.rs restored byte-identically>
+Command: cargo test -p oc-config --test differential -- --nocapture
+   Compiling oc-config v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.98s
+     Running tests/differential.rs (/config/workspace/ProdDir/AI/opencode-rust/target/debug/deps/differential-2c142940ea7bbfd2)
+
+running 2 tests
+OPENCODE_PURE=true: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+$ /config/.local/share/mise/installs/opencode/1.18.12/opencode debug info
+  provenance: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+  cwd: /tmp/oc-testkit-wYe7RM/project
+  exit: Some(0)
+  stdout: "opencode version: 1.18.12\nos: Linux 6.17.0-1019-aws x64\nterminal: unknown\nplugins:\nexternal plugins disabled (--pure)\n"
+  stderr: ""
+
+--pure: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+$ /config/.local/share/mise/installs/opencode/1.18.12/opencode --pure debug info
+  provenance: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+  cwd: /tmp/oc-testkit-Tifevv/project
+  exit: Some(0)
+  stdout: "opencode version: 1.18.12\nos: Linux 6.17.0-1019-aws x64\nterminal: unknown\nplugins:\nexternal plugins disabled (--pure)\n"
+  stderr: ""
+
+test pure_env_and_cli_flag_disable_external_plugins_without_suppressing_config ... ok
+config differential matrix: 14 trees
+global-only: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case global-only
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+project-only: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case project-only
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+global-and-project: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case global-and-project
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+dot-opencode-chain: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case dot-opencode-chain
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+env-config-file-before-project: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case env-config-file-before-project
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+env-config-content-after-project: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case env-config-content-after-project
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+home-and-env-config-dir: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case home-and-env-config-dir
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+permission-env-object: intentional divergence (remeda reverses new OPENCODE_PERMISSION keys while Rust preserves JSON insertion order; the distinct permission names have no precedence interaction)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case permission-env-object
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: 3 divergence(s)
+  @ L9 (missing on the right)
+    -     "bash": "deny",
+  @ L10/R9
+    -     "read": "allow"
+    +     "read": "allow",
+  @ R10 (extra on the right)
+    +     "bash": "deny"
+
+project-disabled-uppercase-true: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case project-disabled-uppercase-true
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+pure-env-keeps-config-layers: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case pure-env-keeps-config-layers
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+pure-cli-flag-keeps-config-layers: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case pure-cli-flag-keeps-config-layers
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+jsonc-comments-and-trailing-commas: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case jsonc-comments-and-trailing-commas
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+deep-ancestor-walk-with-env-file: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case deep-ancestor-walk-with-env-file
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+all-config-env-layers: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case all-config-env-layers
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+test merged_config_matches_real_opencode_across_the_full_matrix ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 21.28s
+
+
+## Task 12 pinned-source oracle 1.18.13
+Command: OC_TESTKIT_ORACLE_FLAVOUR=source OC_TESTKIT_ORACLE_SOURCE=/config/workspace/ProdDir/AI/opencode cargo test -p oc-config --test differential merged_config_matches_real_opencode_across_the_full_matrix -- --nocapture
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.20s
+     Running tests/differential.rs (/config/workspace/ProdDir/AI/opencode-rust/target/debug/deps/differential-2c142940ea7bbfd2)
+
+running 1 test
+config differential matrix: 14 trees
+global-only: oracle(from-source /config/workspace/ProdDir/AI/opencode, reports local, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(from-source /config/workspace/ProdDir/AI/opencode, reports local, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case global-only
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+project-only: oracle(from-source /config/workspace/ProdDir/AI/opencode, reports local, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(from-source /config/workspace/ProdDir/AI/opencode, reports local, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case project-only
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+global-and-project: oracle(from-source /config/workspace/ProdDir/AI/opencode, reports local, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(from-source /config/workspace/ProdDir/AI/opencode, reports local, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case global-and-project
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+dot-opencode-chain: oracle(from-source /config/workspace/ProdDir/AI/opencode, reports local, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(from-source /config/workspace/ProdDir/AI/opencode, reports local, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case dot-opencode-chain
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+env-config-file-before-project: oracle(from-source /config/workspace/ProdDir/AI/opencode, reports local, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(from-source /config/workspace/ProdDir/AI/opencode, reports local, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case env-config-file-before-project
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+env-config-content-after-project: oracle(from-source /config/workspace/ProdDir/AI/opencode, reports local, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(from-source /config/workspace/ProdDir/AI/opencode, reports local, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case env-config-content-after-project
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+home-and-env-config-dir: oracle(from-source /config/workspace/ProdDir/AI/opencode, reports local, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(from-source /config/workspace/ProdDir/AI/opencode, reports local, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case home-and-env-config-dir
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+permission-env-object: intentional divergence (remeda reverses new OPENCODE_PERMISSION keys while Rust preserves JSON insertion order; the distinct permission names have no precedence interaction)
+differential: oracle(from-source /config/workspace/ProdDir/AI/opencode, reports local, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case permission-env-object
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: 3 divergence(s)
+  @ L9 (missing on the right)
+    -     "bash": "deny",
+  @ L10/R9
+    -     "read": "allow"
+    +     "read": "allow",
+  @ R10 (extra on the right)
+    +     "bash": "deny"
+
+project-disabled-uppercase-true: oracle(from-source /config/workspace/ProdDir/AI/opencode, reports local, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(from-source /config/workspace/ProdDir/AI/opencode, reports local, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case project-disabled-uppercase-true
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+pure-env-keeps-config-layers: oracle(from-source /config/workspace/ProdDir/AI/opencode, reports local, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(from-source /config/workspace/ProdDir/AI/opencode, reports local, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case pure-env-keeps-config-layers
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+pure-cli-flag-keeps-config-layers: oracle(from-source /config/workspace/ProdDir/AI/opencode, reports local, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(from-source /config/workspace/ProdDir/AI/opencode, reports local, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case pure-cli-flag-keeps-config-layers
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+jsonc-comments-and-trailing-commas: oracle(from-source /config/workspace/ProdDir/AI/opencode, reports local, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(from-source /config/workspace/ProdDir/AI/opencode, reports local, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case jsonc-comments-and-trailing-commas
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+deep-ancestor-walk-with-env-file: oracle(from-source /config/workspace/ProdDir/AI/opencode, reports local, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(from-source /config/workspace/ProdDir/AI/opencode, reports local, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case deep-ancestor-walk-with-env-file
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+all-config-env-layers: oracle(from-source /config/workspace/ProdDir/AI/opencode, reports local, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(from-source /config/workspace/ProdDir/AI/opencode, reports local, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case all-config-env-layers
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+test merged_config_matches_real_opencode_across_the_full_matrix ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 39.22s
+
+
+## Task 12 workspace gates
+Command: cargo fmt --all -- --check
+Command: cargo build --workspace
+Command: cargo clippy --workspace --all-targets -- -D warnings
+   Compiling oc-tools v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-tools)
+   Compiling oc-goal v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-goal)
+   Compiling oc-snapshot v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-snapshot)
+   Compiling oc-provider-bedrock v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-provider-bedrock)
+   Compiling oc-permission v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-permission)
+   Compiling oc-provider-compatible v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-provider-compatible)
+   Compiling oc-watch v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-watch)
+   Compiling oc-llm v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-llm)
+   Compiling oc-provider-anthropic v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-provider-anthropic)
+   Compiling oc-search v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-search)
+   Compiling oc-db v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-db)
+   Compiling oc-error v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-error)
+   Compiling oc-engine v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-engine)
+   Compiling oc-server v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-server)
+   Compiling oc-auth v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-auth)
+   Compiling oc-cli v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-cli)
+   Compiling oc-provider-openai v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-provider-openai)
+   Compiling oc-lsp v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-lsp)
+   Compiling oc-provider-google v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-provider-google)
+   Compiling oc-acp v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-acp)
+   Compiling oc-tool v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-tool)
+   Compiling oc-agent v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-agent)
+   Compiling oc-mcp v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-mcp)
+   Compiling oc-plugin-sdk v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-plugin-sdk)
+   Compiling oc-pty v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-pty)
+   Compiling oc-catalog v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-catalog)
+   Compiling oc-plugin v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-plugin)
+   Compiling oc-tui v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-tui)
+   Compiling oc-testkit v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-testkit)
+   Compiling oc-types v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-types)
+   Compiling oc-paths v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-paths)
+   Compiling oc-observability v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-observability)
+   Compiling oc-config v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.31s
+    Checking oc-error v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-error)
+    Checking oc-engine v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-engine)
+    Checking oc-server v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-server)
+    Checking oc-provider-google v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-provider-google)
+    Checking oc-permission v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-permission)
+    Checking oc-types v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-types)
+    Checking oc-acp v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-acp)
+    Checking oc-watch v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-watch)
+    Checking oc-lsp v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-lsp)
+    Checking oc-provider-bedrock v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-provider-bedrock)
+    Checking oc-tool v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-tool)
+    Checking oc-search v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-search)
+    Checking oc-mcp v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-mcp)
+    Checking oc-agent v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-agent)
+    Checking oc-snapshot v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-snapshot)
+    Checking oc-pty v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-pty)
+    Checking oc-catalog v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-catalog)
+    Checking oc-db v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-db)
+    Checking oc-provider-compatible v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-provider-compatible)
+    Checking oc-auth v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-auth)
+    Checking oc-llm v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-llm)
+    Checking oc-testkit v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-testkit)
+    Checking oc-tools v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-tools)
+    Checking oc-tui v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-tui)
+    Checking oc-paths v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-paths)
+    Checking oc-goal v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-goal)
+    Checking oc-plugin-sdk v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-plugin-sdk)
+    Checking oc-provider-openai v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-provider-openai)
+    Checking oc-plugin v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-plugin)
+    Checking oc-provider-anthropic v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-provider-anthropic)
+    Checking oc-cli v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-cli)
+    Checking oc-observability v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-observability)
+    Checking oc-config v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.09s
+
+## Task 12 final happy matrix and isolated allow-list probe
+Command: cargo fmt --all && cargo test -p oc-config --test differential -- --nocapture
+   Compiling oc-config v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.50s
+     Running tests/differential.rs (/config/workspace/ProdDir/AI/opencode-rust/target/debug/deps/differential-2c142940ea7bbfd2)
+
+running 3 tests
+permission-env-object-key-order: remeda reverses new OPENCODE_PERMISSION keys while Rust preserves JSON insertion order; the distinct permission names have no precedence interaction
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config intentional permission key-order divergence
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: 3 divergence(s)
+  @ L9 (missing on the right)
+    -     "bash": "deny",
+  @ L10/R9
+    -     "read": "allow"
+    +     "read": "allow",
+  @ R10 (extra on the right)
+    +     "bash": "deny"
+
+test permission_object_key_order_divergence_is_explicitly_allow_listed ... ok
+OPENCODE_PURE=true: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+$ /config/.local/share/mise/installs/opencode/1.18.12/opencode debug info
+  provenance: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+  cwd: /tmp/oc-testkit-bx3wIY/project
+  exit: Some(0)
+  stdout: "opencode version: 1.18.12\nos: Linux 6.17.0-1019-aws x64\nterminal: unknown\nplugins:\nexternal plugins disabled (--pure)\n"
+  stderr: ""
+
+--pure: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+$ /config/.local/share/mise/installs/opencode/1.18.12/opencode --pure debug info
+  provenance: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+  cwd: /tmp/oc-testkit-onGylB/project
+  exit: Some(0)
+  stdout: "opencode version: 1.18.12\nos: Linux 6.17.0-1019-aws x64\nterminal: unknown\nplugins:\nexternal plugins disabled (--pure)\n"
+  stderr: ""
+
+test pure_env_and_cli_flag_disable_external_plugins_without_suppressing_config ... ok
+config differential matrix: 14 trees
+global-only: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case global-only
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+project-only: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case project-only
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+global-and-project: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case global-and-project
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+dot-opencode-chain: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case dot-opencode-chain
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+env-config-file-before-project: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case env-config-file-before-project
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+env-config-content-after-project: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case env-config-content-after-project
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+home-and-env-config-dir: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case home-and-env-config-dir
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+permission-env-object: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case permission-env-object
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+project-disabled-uppercase-true: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case project-disabled-uppercase-true
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+pure-env-keeps-config-layers: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case pure-env-keeps-config-layers
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+pure-cli-flag-keeps-config-layers: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case pure-cli-flag-keeps-config-layers
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+jsonc-comments-and-trailing-commas: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case jsonc-comments-and-trailing-commas
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+deep-ancestor-walk-with-env-file: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case deep-ancestor-walk-with-env-file
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+all-config-env-layers: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1)
+differential: oracle(installed-binary /config/.local/share/mise/installs/opencode/1.18.12/opencode, reports 1.18.12, pinned source 1.18.13 @ aefaf140c1) vs oc-config differential case all-config-env-layers
+  normalization rules available: (none — byte-exact comparison)
+  normalization masked: nothing
+  result: identical
+
+test merged_config_matches_real_opencode_across_the_full_matrix ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.66s
+
+
+## Task 12 final diagnostics and workspace gates
+Command: rust-analyzer diagnostics . --severity warning
+Command: cargo fmt --all -- --check
+Command: cargo build --workspace
+Command: cargo clippy --workspace --all-targets -- -D warnings
+0/98 0% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-watch/src/lib.rs1/98 1% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-watch/src/lib.rstypes/src/lib.rs2/98 2% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-types/src/lib.rsui/src/lib.rs  3/98 3% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-tui/src/lib.rsools/src/lib.rs4/98 4% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-tools/src/lib.rs/src/lib.rs 5/98 5% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-tool/src/lib.rsestkit/tests/no_http_client.rs6/98 6% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-testkit/tests/no_http_client.rsdifferential_self_test.rs7/98 7% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-testkit/tests/differential_self_test.rssnapshot/src/lib.rs                    8/98 8% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-snapshot/src/lib.rserver/src/lib.rs  9/98 9% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-server/src/lib.rsarch/src/lib.rs10/98 10% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-search/src/lib.rspty/src/lib.rs   1/98 11% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-pty/src/lib.rsrovider-openai/src/lib.rs2/98 12% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-provider-openai/src/lib.rsgoogle/src/lib.rs3/98 13% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-provider-google/src/lib.rscompatible/src/lib.rs4/98 14% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-provider-compatible/src/lib.rsbedrock/src/lib.rs   5/98 15% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-provider-bedrock/src/lib.rsanthropic/src/lib.rs6/98 16% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-provider-anthropic/src/lib.rslugin-sdk/src/lib.rs        7/98 17% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-plugin-sdk/src/lib.rs/src/lib.rs    8/98 18% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-plugin/src/lib.rsermission/src/lib.rs9/98 19% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-permission/src/lib.rsaths/tests/differential.rs20/98 20% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-paths/tests/differential.rsexamples/dump_paths.rs1/98 21% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-paths/examples/dump_paths.rsobservability/tests/stdout_purity.rs2/98 22% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-observability/tests/stdout_purity.rsno_stdout_in_library.rs3/98 23% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-observability/tests/no_stdout_in_library.rssrc/bin/oc-log-probe.rs      4/98 24% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-observability/src/bin/oc-log-probe.rslib.rs             5/98 25% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-observability/src/lib.rstool.rs6/98 26% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-observability/src/tool.rsspan.rs7/98 27% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-observability/src/span.rserror.rs8/98 28% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-observability/src/error.rsconfig.rs9/98 29% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-observability/src/config.rsmcp/src/lib.rs             30/98 30% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-mcp/src/lib.rslsp/src/lib.rs1/98 31% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-lsp/src/lib.rslm/src/lib.rs2/98 32% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-llm/src/lib.rsgoal/src/lib.rs3/98 33% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-goal/src/lib.rserror/tests/taxonomy.rs4/98 34% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-error/tests/taxonomy.rsno_anyhow_in_libraries.rs5/98 35% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-error/tests/no_anyhow_in_libraries.rsngine/src/lib.rs                    6/98 36% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-engine/src/lib.rsinterrupt.rs7/98 37% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-engine/src/interrupt.rsdb/src/lib.rs          8/98 38% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-db/src/lib.rsconfig/tests/variable_substitution.rs9/98 39% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config/tests/variable_substitution.rslegacy.rs               40/98 40% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config/tests/legacy.rsinstructions.rs1/98 41% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config/tests/instructions.rs2/98 42% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config/tests/instructions.rsdiscovery_differential.rs3/98 43% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config/tests/discovery_differential.rs.rs             4/98 44% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config/tests/discovery.rsfferential.rs5/98 45% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config/tests/differential.rssrc/lib.rs           6/98 46% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config/src/lib.rsvariable.rs7/98 47% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config/src/variable.rsschema.rs  8/98 48% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config/src/schema.rs/reference.rs9/98 50% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config/src/schema/reference.rsprovider.rs 50/98 51% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config/src/schema/provider.rslugin.rs  1/98 52% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config/src/schema/plugin.rsermission.rs2/98 53% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config/src/schema/permission.rsarse.rs     3/98 54% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config/src/schema/parse.rsordered.rs4/98 55% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config/src/schema/ordered.rsmcp.rs    5/98 56% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config/src/schema/mcp.rslsp.rs6/98 57% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config/src/schema/lsp.rsformatter.rs7/98 58% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config/src/schema/formatter.rsagent.rs    8/98 59% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config/src/schema/agent.rslegacy.rs      9/98 60% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config/src/legacy.rsinstructions.rs60/98 61% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config/src/instructions.rs/glob.rs1/98 62% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config/src/instructions/glob.rsdiscovery.rs        2/98 63% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config/src/discovery.rstestkit/src/lib.rs     3/98 64% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-testkit/src/lib.rssubject.rs4/98 65% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-testkit/src/subject.rsrun.rs    5/98 66% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-testkit/src/run.rsoracle.rs6/98 67% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-testkit/src/oracle.rsnormalize.rs7/98 68% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-testkit/src/normalize.rsmock_provider.rs8/98 69% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-testkit/src/mock_provider.rserror.rs        9/98 70% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-testkit/src/error.rsnv.rs  70/98 71% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-testkit/src/env.rsdiff.rs1/98 72% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-testkit/src/diff.rsconfig_fixture.rs2/98 73% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-testkit/src/config_fixture.rsassette.rs      3/98 74% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-testkit/src/cassette.rspaths/src/lib.rs       4/98 75% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-paths/src/lib.rswalk.rs5/98 76% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-paths/src/walk.rssha1.rs6/98 77% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-paths/src/sha1.rsproject.rs7/98 78% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-paths/src/project.rsnode_path.rs8/98 79% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-paths/src/node_path.rslayout.rs   9/98 80% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-paths/src/layout.rsfiles.rs 80/98 81% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-paths/src/files.rsenv.rs  1/98 82% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-paths/src/env.rssure.rs2/98 83% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-paths/src/ensure.rsconfig_chain.rs3/98 84% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-paths/src/config_chain.rserror/src/lib.rs         4/98 85% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-error/src/lib.rstool.rs5/98 86% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-error/src/tool.rssource.rs6/98 87% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-error/src/source.rsrecovery.rs7/98 88% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-error/src/recovery.rsprovider.rs8/98 89% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-error/src/provider.rslugin.rs  9/98 90% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-error/src/plugin.rsmcp.rs   90/98 91% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-error/src/mcp.rslsp.rs1/98 92% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-error/src/lsp.rsdb.rs 2/98 93% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-error/src/db.rsconfig.rs3/98 94% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-error/src/config.rscli/src/main.rs    4/98 95% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-cli/src/main.rsatalog/src/lib.rs5/98 96% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-catalog/src/lib.rsauth/src/lib.rs   6/98 97% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-auth/src/lib.rsgent/src/lib.rs7/98 98% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-agent/src/lib.rscp/src/lib.rs  8/98 100% processing /config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-acp/src/lib.rs                                                                                     
+diagnostic scan complete
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.56s
+    Checking oc-config v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t12/crates/oc-config)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.39s
+
+## Task 12 summary
+- Final happy matrix: 14/14 tree diffs identical with `Normalizer::none()`.
+- Separate allow-list probe: `permission-env-object-key-order`, exact 3-line ordering divergence, one-line reason present.
+- Pure semantics: both `OPENCODE_PURE=true` and `--pure` print `external plugins disabled (--pure)` while their config trees remain byte-identical.
+- Deliberate swap detected exactly 3 affected trees: `env-config-file-before-project`, `deep-ancestor-walk-with-env-file`, `all-config-env-layers`.
+- `discovery.rs` SHA-256 before and after: `44fe6bd8f47b86fe6a87e3cab32b46deae64570b856342d0948237151110eb8c`; scoped `git diff --exit-code` was empty.
+- Final diagnostics: `rust-analyzer diagnostics . --severity warning` => `diagnostic scan complete`, no diagnostics.
+- Final gates: targeted differential 3 passed; fmt check passed; workspace build passed; workspace all-target clippy with `-D warnings` passed.
+
+## Task 12 commit
+- Commit: `3c8211fc66a12fd3dcda0a98eaa446b7b6e9fffc`
+- Subject: `test(config): differential config parity against opencode 1.18.13`
+- Scoped change: added only `crates/oc-config/tests/differential.rs`; `crates/oc-config/src/discovery.rs` remained unchanged.

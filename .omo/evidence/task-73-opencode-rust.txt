@@ -1,0 +1,52 @@
+Task 73 evidence — 2026-08-06
+
+Scope
+- Modified only crates/oc-tui plus Cargo.lock dependency closure.
+- Root Cargo.toml already optimized ratatui, ratatui-core, ratatui-widgets,
+  ratatui-crossterm, crossterm, unicode-width, unicode-segmentation, and
+  unicode-truncate in dev/test; no profile edit was required.
+
+TDD and mutation proofs
+- Initial `cargo test -p oc-tui app --offline`: compile failed with 42 missing
+  symbols because app.rs contained only the test module declaration.
+- Panic-hook mutation: removed `context.lifecycle.restore()` and ran
+  `cargo test -p oc-tui app_panic_inside_the_event_loop_restores_before_reporting --offline`.
+  Result: 0 passed, 1 failed, 9 filtered out; restoration assertion failed. Restored source.
+- Guard mutation: removed `TerminalSession::drop` restoration and ran
+  `cargo test -p oc-tui app_terminal_guard_restores_on_an_early_error_return --offline`.
+  Result: 0 passed, 1 failed, 9 filtered out; `!lifecycle.is_active()` failed. Restored source.
+
+Final verification
+- `cargo build --workspace --offline`: PASS.
+- `cargo test -p oc-tui --offline`: unit target 10 passed, 0 failed, 0 ignored;
+  doc-test target 0 passed, 0 failed.
+- `cargo test -p oc-tui app --offline`: 10 passed, 0 failed, 0 ignored,
+  0 filtered out.
+- Exact 3x6 loop from the task: 18 outputs, all `0`; no load-correlated failure.
+- `cargo clippy --workspace --all-targets --offline -- -D warnings`: PASS,
+  0 warnings.
+- `cargo fmt --all --check`: PASS.
+- `git diff --check`: PASS.
+- `rust-analyzer diagnostics .`: completed; no changed oc-tui error diagnostics.
+- Post-commit `cargo metadata --locked --offline`: recorded after commit below.
+
+Commit
+- `a09a5fd2e3337773ab25e7ea567d2fbb68db3813`
+- Message: `feat(tui): terminal lifecycle, event loop, component model, tty yielding`
+- `cargo metadata --locked --offline --format-version 1`: PASS.
+- Worktree status after metadata: clean.
+
+What the no-TTY tests prove
+- A component panic invokes restoration before the readable panic reporter and
+  a later guard drop is idempotent.
+- Early `?`/error return restores through the lifecycle guard.
+- The component tree renders exact content through ratatui TestBackend.
+- Resize replaces the off-screen frame without stale cells.
+- Lease yield/release orders restore -> child ownership -> enter/clear/repaint.
+- Broker live-holder refusal and forced-reclaim diagnostic remain unchanged.
+- Engine rendering is not dispatched while the lease owns the terminal.
+
+Boundary
+- No controlling TTY is available, so these tests do not claim to observe real
+  termios flags, terminal-emulator escape handling, or a live readline child.
+  That needs the deferred pty/compat integration case.

@@ -1,0 +1,37 @@
+## Task 39
+
+### Scope
+Implemented read, write, edit, and apply_patch in oc-tools with schemas derived from typed params, argument-derived path permissions, session-scoped read-before-edit state, cancellation polling, image/PDF attachments, patch add/update/move/delete support, and the formatter seam.
+
+### Acceptance commands and real results
+- `cargo fmt --all --check` -> exit 0, no diff.
+- `CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target cargo test -p oc-tools file` -> exit 0; oc-tools unit target: 0 passed; file_tools integration target: 12 passed, 0 failed, 0 ignored, 0 measured, 0 filtered out.
+- `CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target cargo build --workspace` -> exit 0; `Finished dev profile`.
+- `CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target cargo clippy --workspace --all-targets -- -D warnings` -> exit 0; zero warnings.
+- `CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target cargo test --workspace` -> exit 0; every unit, integration, differential, and doctest suite passed. The oc-tools file_tools target again reported 12 passed, 0 failed.
+- `lsp_diagnostics` was attempted for both `crates/oc-tools/src` and `tests/file_tools.rs`; the tool rejected the worktree path with `LSP file path must be inside request cwd` because its request cwd is the main worktree. No LSP result could be produced; rustc and clippy diagnostics are clean.
+
+### Permission escalation transcript
+Inside call: `read({"filePath":"<workspace>/inside.txt"})`
+Permission asks: `read` pattern `inside.txt` only.
+Outside call: `read({"filePath":"/etc/hosts"})`
+Permission asks in order: `external_directory` pattern `/etc/*`, always `/etc/*`, metadata filepath `/etc/hosts`, parentDir `/etc`; then `read` pattern `/etc/hosts`.
+
+### Read-before-edit transcript
+Call: `edit({"filePath":"<workspace>/unread.txt","oldString":"before","newString":"after"})` without a prior read in session `session-file`.
+Result: `File must be read before editing. Use the read tool on <workspace>/unread.txt, then retry the edit.`
+File remained `before\n`.
+
+### QA happy transcript
+Fixture before: `alpha\nbeta\n`.
+Call sequence: `read(unique.txt)` then `edit({"oldString":"beta","newString":"gamma"})`.
+Result output: `Edit applied successfully.`; metadata replacements: `1`; fixture after: `alpha\ngamma\n`; RecordingFormatter calls: `[unique.txt]`.
+
+### QA failure transcript
+Fixture: `same\nsame\n`; call sequence: `read(duplicate.txt)` then `edit({"oldString":"same","newString":"changed"})`.
+Result: `Found multiple matches for oldString; provide more context or use replaceAll.`
+Fixture remained unchanged.
+
+### Model exposure
+Oracle `packages/opencode/src/tool/registry.ts:292-295`: `usePatch = modelID.includes("gpt-") && !modelID.includes("oss") && !modelID.includes("gpt-4")`; apply_patch is exposed iff usePatch; edit and write are exposed iff not usePatch. Tests cover gpt-5, gpt-5.2-codex, gpt-4.1, gpt-oss-120b, and Claude.
+

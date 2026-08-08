@@ -1,0 +1,240 @@
+======================================================================
+Task 7 — crates/oc-config/src/schema.rs: serde types for the full opencode config schema
+Worktree: /config/workspace/ProdDir/AI/oc-wt/t7 (branch task-7)
+Date: 2026-08-05T04:30:22Z   rustc: rustc 1.96.0 (ac68faa20 2026-05-25)
+CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target
+======================================================================
+
+### AC1 — cargo test -p oc-config schema
+$ cargo test -p oc-config schema
+running 42 tests
+test schema::tests::a_bare_permission_action_normalizes_to_a_star_rule ... ok
+test schema::tests::a_bad_server_port_names_the_key_path_instead_of_panicking ... ok
+test schema::tests::a_broken_mcp_entry_reports_the_arm_its_type_names ... ok
+test schema::tests::a_custom_lsp_server_must_declare_extensions ... ok
+test schema::tests::a_provider_timeout_is_millis_or_the_literal_false ... ok
+test schema::tests::action_only_permissions_reject_per_pattern_rules ... ok
+test schema::tests::agent_colour_takes_hex_and_theme_names_only ... ok
+test schema::tests::a_nested_unknown_agent_key_lands_in_options_intact ... ok
+test schema::tests::agent_named_fields_are_not_swept ... ok
+test schema::tests::an_agent_without_unknown_keys_keeps_options_absent ... ok
+test schema::tests::an_agent_with_swept_keys_loses_nothing_on_round_trip ... ok
+test schema::tests::an_explicit_empty_options_object_survives ... ok
+test schema::tests::an_empty_config_round_trips_to_an_empty_object ... ok
+test schema::tests::an_unknown_agent_key_lands_in_options ... ok
+test schema::tests::an_lsp_server_needs_a_command_unless_disabled ... ok
+test schema::tests::an_unknown_permission_key_is_kept ... ok
+test schema::tests::an_mcp_callback_port_stays_inside_the_port_range ... ok
+test schema::tests::autoupdate_is_a_bool_or_notify ... ok
+test schema::tests::deprecated_agent_keys_stay_visible_but_unnamed ... ok
+test schema::tests::deprecated_top_level_keys_are_not_accepted ... ok
+test schema::tests::every_unrecognized_top_level_key_gets_its_own_issue ... ok
+test schema::tests::lsp_is_a_bool_or_a_map ... ok
+test schema::tests::malformed_json_is_reported_as_json_not_validation ... ok
+test schema::tests::formatter_is_a_bool_or_a_map ... ok
+test schema::tests::nested_unknown_keys_are_ignored_like_the_oracle ... ok
+test schema::tests::parsing_through_a_json_value_forfeits_key_order ... ok
+test schema::tests::permission_keeps_the_authors_key_order ... ok
+test schema::tests::plugin_entries_are_a_string_or_a_string_and_options ... ok
+test schema::tests::positive_int_fields_reject_zero_and_negatives ... ok
+test schema::tests::sweep_exempt_keys_never_become_provider_options ... ok
+test schema::tests::the_false_literal_rejects_true ... ok
+test schema::tests::unknown_provider_options_are_kept_for_the_sdk ... ok
+test schema::tests::the_ordered_map_preserves_order_and_resolves_duplicates_last_wins ... ok
+test schema::tests::the_all_keys_fixture_uses_every_top_level_key ... ok
+test schema::tests::the_sweep_merges_into_declared_options_without_dropping_them ... ok
+test schema::tests::mcp_entries_cover_local_remote_and_the_enabled_only_toggle ... ok
+test schema::tests::the_key_path_reaches_through_maps_and_arrays ... ok
+test schema::tests::references_is_a_three_way_union ... ok
+test schema::tests::every_top_level_key_round_trips_without_field_loss ... ok
+test schema::tests::round_trip_is_stable_on_a_second_pass ... ok
+test schema::tests::the_real_user_config_deserializes ... ok
+test schema::tests::the_documented_examples_all_deserialize ... ok
+
+test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/qa_transcript.rs (/config/workspace/ProdDir/AI/opencode-rust/target/debug/deps/qa_transcript-d70b0366dbbacb1c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+
+### AC2 — round-trip over every top-level key, no field loss
+$ cargo test -p oc-config schema::tests::the_all_keys_fixture -- --exact --nocapture
+running 1 test
+test schema::tests::the_all_keys_fixture_uses_every_top_level_key ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 41 filtered out; finished in 0.00s
+running 0 tests
+
+$ cargo test -p oc-config schema::tests::every_top_level_key_round_trips_without_field_loss -- --exact
+running 1 test
+test schema::tests::every_top_level_key_round_trips_without_field_loss ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 41 filtered out; finished in 0.00s
+running 0 tests
+
+# The fixture is crates/oc-config/tests/fixtures/all-keys.json; the first test proves
+# its key set equals KNOWN_TOP_LEVEL_KEYS (33 keys), the second proves
+# JSON -> Config -> JSON is semantically identical (numbers canonicalized to f64,
+# key order not part of the contract).
+$ python3 -c "print(len(json.load(open(fixture)).keys()))"
+33 top-level keys in the fixture
+
+### AC3 — an agent key reasoningEffort:"high" lands in agent.options["reasoningEffort"]
+$ cargo test -p oc-config schema::tests::an_unknown_agent_key_lands_in_options -- --exact
+running 1 test
+test schema::tests::an_unknown_agent_key_lands_in_options ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 41 filtered out; finished in 0.00s
+running 0 tests
+
+$ cargo test -p oc-config schema::tests::a_nested_unknown_agent_key_lands_in_options_intact -- --exact
+running 1 test
+test schema::tests::a_nested_unknown_agent_key_lands_in_options_intact ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 41 filtered out; finished in 0.00s
+running 0 tests
+
+
+### AC4 — cargo build --workspace
+$ cargo build --workspace
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.69s
+
+### AC5 — cargo clippy --workspace --all-targets (zero warnings)
+$ cargo clippy --workspace --all-targets 2>&1 | grep -c "^warning"
+0
+$ cargo clippy --workspace --all-targets 2>&1 | tail -2
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.09s
+
+### AC6 — cargo fmt -p oc-config --check
+$ cargo fmt -p oc-config -- --check && echo CLEAN
+CLEAN
+
+### Regression — whole workspace test suite still green (298 before, +42 new)
+$ cargo test --workspace 2>&1 | grep "^test result" | sum passed/failed
+passed: 340  failed: 0
+
+======================================================================
+QA SCENARIO 1 (happy) — the documented examples and the user's real config
+======================================================================
+
+# Fixture provenance. 36 titled fenced blocks in
+# packages/web/src/content/docs/config.mdx; 3 are titled tui.json (the TUI's own
+# config file, whose keys theme/keybinds/attention/diff_style/mouse/scroll_* are
+# NOT opencode.json keys) and are excluded. The remaining 33 are the corpus.
+# 3 of the 33 are .jsonc; comments and trailing commas were stripped when the
+# fixture was written, because JSONC reading belongs to todo 8, not to the types.
+$ ls crates/oc-config/tests/fixtures/docs | wc -l
+33
+$ cargo test -p oc-config schema::tests::the_documented_examples_all_deserialize -- --exact
+running 1 test
+test schema::tests::the_documented_examples_all_deserialize ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 41 filtered out; finished in 0.00s
+
+# The user's real config: /config/.config/opencode/opencode.json, read-only.
+# Copied to crates/oc-config/tests/fixtures/user-config.json with two changes,
+# both of which the oracle also makes before validation:
+#   1. the // comment on the plugin array stripped (JSONC -> JSON, todo 8's job);
+#   2. the legacy TUI key "theme" removed — packages/opencode/src/config/config.ts:53-62
+#      normalizeLoadedConfig() deletes theme/keybinds/tui BEFORE ConfigParse.schema
+#      runs, so the oracle's own schema never sees it either. Todo 10 owns that strip.
+$ diff <(python3 -c "print keys of real config") <(python3 -c "print keys of fixture")
+real config keys   : ['$schema', 'compaction', 'mcp', 'permission', 'plugin', 'provider', 'theme']
+fixture keys       : ['$schema', 'compaction', 'mcp', 'permission', 'plugin', 'provider']
+removed            : ['theme']
+otherwise identical: True
+$ cargo test -p oc-config schema::tests::the_real_user_config_deserializes -- --exact
+running 1 test
+test schema::tests::the_real_user_config_deserializes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 41 filtered out; finished in 0.00s
+$ md5sum of the untouched real config before and after this task
+7344cf233b7217eaac21d68bf99e26ba  /config/.config/opencode/opencode.json
+
+======================================================================
+QA SCENARIO 2 (failure) — a bad type names the key path, never panics
+======================================================================
+# Produced by a throwaway integration test (crates/oc-config/tests/qa_transcript.rs,
+# removed before the commit) that prints the real ConfigError for each input.
+$ cargo test -p oc-config --test qa_transcript -- --nocapture
+--- failure QA: server.port is a string
+input : {"server": {"port": "not-a-number"}}
+error : config file opencode.json failed validation (1 issue(s))
+issue : key_path=["server", "port"] detail="invalid type: string \"not-a-number\", expected a nonzero u32 at line 1 column 34"
+
+--- failure: port 0 (PositiveInt excludes it)
+input : {"server": {"port": 0}}
+error : config file opencode.json failed validation (1 issue(s))
+issue : key_path=["server", "port"] detail="invalid value: integer `0`, expected a nonzero u32 at line 1 column 21"
+
+--- failure: deprecated top-level keys (todo 10's list)
+input : {"mode": {}, "layout": "auto", "autoshare": true}
+error : config file opencode.json failed validation (3 issue(s))
+issue : key_path=["autoshare"] detail="unrecognized key"
+issue : key_path=["layout"] detail="unrecognized key"
+issue : key_path=["mode"] detail="unrecognized key"
+
+--- failure: deep path through a map
+input : {"provider":{"anthropic":{"models":{"m":{"limit":{"context":"big","output":64000}}}}}}
+error : config file opencode.json failed validation (1 issue(s))
+issue : key_path=["provider", "anthropic", "models", "m", "limit", "context"] detail="invalid type: string \"big\", expected f64 at line 1 column 65"
+
+--- failure: array index in the path
+input : {"plugin": ["ok", 7]}
+error : config file opencode.json failed validation (1 issue(s))
+issue : key_path=["plugin", "1"] detail="data did not match any variant of untagged enum PluginSpec at line 1 column 20"
+
+--- failure: custom lsp server without extensions
+input : {"lsp":{"my-lsp":{"command":["my-lsp"]}}}
+error : config file opencode.json failed validation (1 issue(s))
+issue : key_path=["lsp", "my-lsp"] detail="custom LSP server \"my-lsp\" must declare an 'extensions' array at line 1 column 40"
+
+--- happy: the agent options sweep
+input : {"agent":{"build":{"reasoningEffort":"high","thinking":{"type":"enabled","budgetTokens":32000}}}}
+ok    : {"agent":{"build":{"options":{"reasoningEffort":"high","thinking":{"budgetTokens":32000,"type":"enabled"}},"reasoningEffort":"high","thinking":{"budgetTokens":32000,"type":"enabled"}}}}
+
+--- happy: agent maxSteps/tools reach extra, never options
+input : {"agent":{"build":{"maxSteps":40,"tools":{"write":false},"reasoningEffort":"high"}}}
+ok    : {"agent":{"build":{"options":{"reasoningEffort":"high"},"maxSteps":40,"reasoningEffort":"high","tools":{"write":false}}}}
+test print_transcript ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+======================================================================
+FILES ADDED
+======================================================================
+$ git status --short -- crates/oc-config
+ M crates/oc-config/Cargo.toml
+ M crates/oc-config/src/lib.rs
+?? crates/oc-config/src/schema.rs
+?? crates/oc-config/src/schema/
+?? crates/oc-config/tests/
+
+$ wc -l crates/oc-config/src/schema.rs crates/oc-config/src/schema/*.rs
+   448 crates/oc-config/src/schema.rs
+   233 crates/oc-config/src/schema/agent.rs
+    38 crates/oc-config/src/schema/formatter.rs
+   167 crates/oc-config/src/schema/lsp.rs
+   154 crates/oc-config/src/schema/mcp.rs
+   172 crates/oc-config/src/schema/ordered.rs
+   218 crates/oc-config/src/schema/parse.rs
+   183 crates/oc-config/src/schema/permission.rs
+    36 crates/oc-config/src/schema/plugin.rs
+   280 crates/oc-config/src/schema/provider.rs
+    50 crates/oc-config/src/schema/reference.rs
+   807 crates/oc-config/src/schema/tests.rs
+  2786 total
+
+NOT DONE (out of scope, later todos own them):
+  - discovery / 10-layer merge / instructions concat  -> todo 8
+  - {env:} and {file:} variable substitution          -> todo 9
+  - JSONC (comments, trailing commas)                 -> todo 8
+  - rejection of mode/layout/autoshare/tools/maxSteps  -> todo 10 (this schema
+    refuses them as unrecognized keys; todo 10 replaces that with an actionable
+    message. Agent-level tools/maxSteps land in AgentConfig::extra unswept.)
+  - normalizeLoadedConfig()'s theme/keybinds/tui strip -> todo 8 or 10
+  - JSON Schema generation (schemars) — not required by this todo, dep not added

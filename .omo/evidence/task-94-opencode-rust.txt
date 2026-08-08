@@ -1,0 +1,295 @@
+================================================================================
+TASK 94 — crates/oc-provider-compatible: the OpenAI-compatible profile
+worktree : /config/workspace/ProdDir/AI/oc-wt/t94  (branch task-94, base d7af235)
+recorded : 2026-08-05T20:09:22Z
+rustc    : rustc 1.96.0 (ac68faa20 2026-05-25)
+================================================================================
+
+### AC1 — cargo test -p oc-provider-compatible
+$ cargo test -p oc-provider-compatible
+running 58 tests
+test result: ok. 58 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 9 tests
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 6 tests
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 12 tests
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 2 tests
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+  87 tests total = 58 unit + 9 cassette parity + 6 discipline guards
+                   + 12 rule/refusal + 2 doctests
+
+### AC2 — cassette replay across >=4 distinct compatible providers
+Six vendors whose provider id THIS profile claims, replayed through the
+production path (Provider::stream -> Transport -> oc_llm::sse::SseParser),
+with each recorded body re-sliced into 7-byte chunks:
+
+$ cargo test -p oc-provider-compatible --test cassette_parity -- --nocapture
+running 9 tests
+test every_claimed_provider_id_constructs_with_only_a_base_url ... ok
+test deepseek_text_replays_to_the_recorded_event_sequence ... ok
+test openrouter_text_reports_its_upstream_and_ignores_the_comment_frame ... ok
+test togetherai_tool_call_survives_a_split_tool_fragment ... ok
+test the_canonical_openai_chat_shape_parses_under_a_declared_compatible_id ... ok
+test groq_tool_call_replays_to_the_recorded_event_sequence ... ok
+test cloudflare_ai_gateway_reasoning_content_becomes_reasoning_events ... ok
+test cloudflare_workers_ai_reasoning_content_becomes_reasoning_events ... ok
+test a_one_byte_at_a_time_stream_produces_the_identical_sequence ... ok
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+  vendor                 host                        cassette
+  ---------------------- --------------------------- --------------------------------------------------
+  1 DeepSeek             api.deepseek.com            openai-compatible-chat/deepseek-streams-text
+  2 Groq                 api.groq.com                openai-compatible-chat/groq-streams-tool-call
+  3 OpenRouter           openrouter.ai               openai-compatible-chat/openrouter-streams-text
+  4 TogetherAI           api.together.xyz            openai-compatible-chat/togetherai-streams-tool-call
+  5 Cloudflare WorkersAI api.cloudflare.com          cloudflare-workers-ai/...gpt-oss-20b-tools-tool-call
+  6 Cloudflare AIGateway gateway.ai.cloudflare.com   cloudflare-ai-gateway/...gpt-oss-20b-tools-tool-call
+
+  NOT counted: openai-chat/streams-text (api.openai.com). Its provider id is
+  REFUSED by this profile — it belongs to oc-provider-openai — so it is
+  replayed only under a user-declared compatible id, as canonical-shape
+  evidence, in the test named accordingly.
+
+  The corpus holds 7 OpenAI-compatible endpoints in total (11 route dirs,
+  40 files). 6 of the 7 have an id this profile claims; all 6 are replayed.
+
+### AC3 — Azure's model selection and Copilot's endpoint rule, per model id
+$ cargo test -p oc-provider-compatible --test rules
+running 12 tests
+test a_request_pinned_surface_overrides_both_rules ... ok
+test an_unknown_provider_id_is_never_silently_attempted ... ok
+test a_copilot_model_declaring_its_endpoint_overrides_the_version_check ... ok
+test azure_selects_its_endpoint_by_the_documented_walk ... ok
+test config_can_declare_a_new_model_as_requiring_the_protocol ... ok
+test each_foreign_family_is_refused_and_names_its_own_crate ... ok
+test azure_picks_the_same_endpoint_for_every_model_id ... ok
+test extra_body_cannot_disable_the_forced_thinking_opt_in ... ok
+test copilot_selects_its_endpoint_per_model_id ... ok
+test amazon_bedrock_is_refused_with_a_pointer_at_the_bedrock_crate ... ok
+test reasoning_content_is_echoed_only_for_a_model_that_requires_it ... ok
+test sampling_params_are_stripped_by_declared_capability ... ok
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+VERIFIED AZURE RULE — packages/opencode/src/provider/provider.ts:154-160
+  function selectAzureLanguageModel(sdk, modelID, useChat) {
+    if (useChat && sdk.chat) return sdk.chat(modelID)
+    if (sdk.responses)       return sdk.responses(modelID)
+    if (sdk.messages)        return sdk.messages(modelID)
+    if (sdk.chat)            return sdk.chat(modelID)
+    return sdk.languageModel(modelID)
+  }
+  called from :265 (azure) and :285 (azure-cognitive-services), both with
+  useChat = Boolean(options?.["useCompletionUrls"]).
+
+  *** CORRECTION TO THE TASK BRIEF ***
+  The brief calls this "Azure's own model selector" and the acceptance
+  criterion asks that it "pick the documented endpoint per model id".
+  The oracle's function ACCEPTS modelID AND NEVER READS IT. Azure's rule is
+  a surface-availability walk gated by one provider option; it is NOT a
+  model-id rule. Implementing it as one would invent behaviour the oracle
+  does not have. crates/oc-provider-compatible/src/surface.rs::azure_surface
+  therefore takes no model_id parameter, and the test
+  azure_picks_the_same_endpoint_for_every_model_id asserts the ABSENCE of
+  that dependency across 6 model ids. Only Copilot is per-model.
+
+VERIFIED COPILOT RULE — provider.ts:225-239
+  if (sdk.responses === undefined && sdk.chat === undefined) return sdk.languageModel(modelID)
+  if (model && "endpoint" in model.api) {
+    if (model.api.endpoint === "responses" && sdk.responses) return sdk.responses(modelID)
+    if (model.api.endpoint === "chat"      && sdk.chat)      return sdk.chat(modelID)
+  }
+  const match = /^gpt-(\d+)/.exec(modelID)
+  if (match && Number(match[1]) >= 5 && !modelID.startsWith("gpt-5-mini")) return sdk.responses(modelID)
+  return sdk.chat(modelID)
+
+  Ported model-by-model (copilot_selects_its_endpoint_per_model_id):
+    -> /responses        gpt-5, gpt-5.5, gpt-6, gpt-41
+    -> /chat/completions gpt-5-mini, gpt-5-mini-2025-08-07, gpt-4o, gpt-4.1,
+                         gpt-oss-20b, claude-sonnet-4.5, o3-mini, gemini-2.5-pro
+
+  ONE DELIBERATE DIVERGENCE: after the declared-endpoint block the oracle
+  calls sdk.responses/sdk.chat without re-checking presence, so a
+  chat-only SDK plus model id "gpt-5" dereferences undefined and throws a
+  TypeError. This port falls back to the available surface. No config the
+  first guard admits can observe a different SUCCESSFUL answer; only the
+  crash is removed. Documented at surface.rs::copilot_surface.
+
+### AC4 — amazon-bedrock configured against this profile is REFUSED
+$ cargo test -p oc-provider-compatible --test rules amazon_bedrock -- --exact \
+    amazon_bedrock_is_refused_with_a_pointer_at_the_bedrock_crate
+running 1 test
+test amazon_bedrock_is_refused_with_a_pointer_at_the_bedrock_crate ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+### QA TRANSCRIPTS (reproducible)
+$ cargo run -p oc-provider-compatible --example qa_scenarios
+--------------------------------------------------------------------------------
+== HAPPY: reasoning_content is echoed only when the model requires it ==
+
+-- model `deepseek-v4-flash` --
+reasoning_protocol : true
+assistant message  : {"content":"No.","reasoning_content":"check the forecast for Paris","role":"assistant"}
+body.thinking      : {"type":"enabled"}
+
+-- model `deepseek-chat` --
+reasoning_protocol : false
+assistant message  : {"content":"No.","role":"assistant"}
+body.thinking      : <absent>
+
+OK: echoed for deepseek-v4-flash, omitted for deepseek-chat.
+
+== FAILURE: amazon-bedrock configured against the compatible profile ==
+
+ProviderError variant : Fatal { status: None, source: Some(UnsupportedProvider { provider: "amazon-bedrock", carried_by: Some(Bedrock) }) }
+recovery              : Fail
+rendered              :
+  unrecoverable provider failure (status=None)
+    provider `amazon-bedrock` is unsupported by the openai-compatible profile: it speaks Bedrock's invoke-with-response-stream API over SigV4-signed requests, framed as binary EventStream with preludes, headers and CRCs rather than SSE, so it is carried by the `oc-provider-bedrock` crate (bedrock family) — configure it there instead of through this profile
+
+OK: refused before any request was built, and never retried.
+--------------------------------------------------------------------------------
+
+### AC5 — workspace build, clippy at zero warnings, fmt clean
+$ cargo build --workspace
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.13s
+
+$ cargo clippy --workspace --all-targets 2>&1 | grep -cE "^(warning|error)"
+0
+  (0 = zero warnings across every target in the workspace)
+
+$ cargo fmt --all -- --check ; echo "exit=$?"
+exit=0
+
+$ cargo test --workspace   # not just build: a shared-type change can break only test code
+  TOTAL PASSED: 1334  TOTAL FAILED: 0
+  main was 1247 before this task; +87 new tests = 1334.
+
+### The 21 provider ids this profile CLAIMS (src/family.rs::CLAIMED)
+  alibaba, azure, azure-cognitive-services, cerebras, cloudflare-ai-gateway,
+  cloudflare-workers-ai, cohere, deepinfra, deepseek, github-copilot, gitlab,
+  groq, meta, mistral, openai-compatible, openrouter, perplexity, togetherai,
+  venice, vercel, xai
+  + any id whose config declares provider.<id>.options.npm =
+    "@ai-sdk/openai-compatible" (the same opt-in the oracle reads at
+    provider.ts:108 / :1198 / :1485). Silence is never taken as consent.
+
+### The 6 ids this profile REFUSES, with their destinations
+  amazon-bedrock          -> oc-provider-bedrock  (todo 95)
+  anthropic               -> oc-provider-anthropic (todo 29)
+  google                  -> oc-provider-google   (todo 96)
+  google-vertex           -> oc-provider-google   (todo 96)
+  google-vertex-anthropic -> oc-provider-google   (todo 96)
+  openai                  -> oc-provider-openai   (todo 30)
+
+### Structural guards (tests/discipline.rs, 6 tests)
+  no_source_file_decodes_bytes_lossily          — no from_utf8_lossy anywhere
+  no_source_file_frames_sse_itself              — no 
+
+ / 
+
+ search
+  no_source_file_lowercases_a_message_to_classify_it
+  no_source_file_contains_a_placeholder         — no todo!()/unimplemented!()
+  the_manifest_declares_no_anyhow_and_only_one_http_client
+  model_id_literals_appear_only_in_the_two_named_rule_tables
+
+$ grep -rn "from_utf8_lossy" crates/oc-provider-compatible/src/
+crates/oc-provider-compatible/src/stream.rs:7://! already-complete frames. There is no `from_utf8_lossy` here, and no `\n\n`
+crates/oc-provider-compatible/src/lib.rs:40://!   intact. There is no `from_utf8_lossy` anywhere in this crate.
+
+$ grep -rn "anyhow" crates/oc-provider-compatible/
+crates/oc-provider-compatible/tests/discipline.rs:145:/// `anyhow` would let a typed [`oc_error::ProviderError`] be flattened into a
+crates/oc-provider-compatible/tests/discipline.rs:148:fn the_manifest_declares_no_anyhow_and_only_one_http_client() {
+crates/oc-provider-compatible/tests/discipline.rs:161:        !declared.iter().any(|name| name == "anyhow"),
+crates/oc-provider-compatible/tests/discipline.rs:162:        "anyhow erases the typed error taxonomy this workspace relies on"
+
+### Files added
+ M crates/oc-provider-compatible/Cargo.toml
+ M crates/oc-provider-compatible/src/lib.rs
+?? crates/oc-provider-compatible/examples/
+?? crates/oc-provider-compatible/src/family.rs
+?? crates/oc-provider-compatible/src/provider.rs
+?? crates/oc-provider-compatible/src/quirks.rs
+?? crates/oc-provider-compatible/src/request.rs
+?? crates/oc-provider-compatible/src/stream.rs
+?? crates/oc-provider-compatible/src/surface.rs
+?? crates/oc-provider-compatible/src/transport.rs
+?? crates/oc-provider-compatible/src/wire.rs
+?? crates/oc-provider-compatible/tests/
+
+### Line counts
+   434 crates/oc-provider-compatible/src/family.rs
+   100 crates/oc-provider-compatible/src/lib.rs
+   523 crates/oc-provider-compatible/src/provider.rs
+   254 crates/oc-provider-compatible/src/quirks.rs
+   534 crates/oc-provider-compatible/src/request.rs
+   494 crates/oc-provider-compatible/src/stream.rs
+   422 crates/oc-provider-compatible/src/surface.rs
+   317 crates/oc-provider-compatible/src/transport.rs
+   284 crates/oc-provider-compatible/src/wire.rs
+   490 crates/oc-provider-compatible/tests/cassette_parity.rs
+   209 crates/oc-provider-compatible/tests/discipline.rs
+   452 crates/oc-provider-compatible/tests/rules.rs
+   126 crates/oc-provider-compatible/examples/qa_scenarios.rs
+  4639 total
+
+  NOTE on the two greps above: every hit is inside a doc comment that
+  EXPLAINS the rule. The guards ignore lines beginning with // for exactly
+  that reason — a grep that could not tell code from prose would force the
+  explanation to be deleted to keep the guard green. Code-only greps:
+
+$ grep -rn "from_utf8_lossy" crates/oc-provider-compatible/src/ | grep -v "//"
+  (no code matches)
+$ grep -n "anyhow" crates/oc-provider-compatible/Cargo.toml
+  (not a declared dependency)
+
+### NOT VERIFIED / OUT OF SCOPE
+  * No live network call was made, by construction: every test reaches bytes
+    only through the Transport trait, and oc-testkit has no HTTP client.
+    The ReqwestTransport code path is therefore compiled and clippy-clean but
+    NOT exercised end-to-end against a real server by this task.
+  * Request bodies are not byte-compared to the recorded requests. Those were
+    produced by the Vercel AI SDK and carry fields this profile does not
+    originate (stream_options.include_usage, its own max_tokens default), so
+    request parity would be a false claim. Recorded URLs ARE compared, wherever
+    the recorder did not redact them (both Cloudflare URLs carry {account}
+    placeholders and are excluded, which the test states explicitly).
+  * Catalog integration (todo 26) is not wired here: capabilities arrive via
+    Spec.options.capabilities / .modelCapabilities. The composition root (todo
+    30's registration site) has to populate them from the catalog.
+  * Effort resolution is not re-implemented: oc_llm::effort writes into a Map
+    that arrives as Spec.options.extraBody.
+  * Cargo.lock gained 98 lines. 10 are this crate's own dependency list; the
+    rest are oc-tool's async-trait/schemars closure, which its manifest already
+    declared at d7af235 while the committed lock had no deps recorded for it.
+    Cargo repaired that as a side effect. Insertions only, no removals.
+
+================================================================================
+END OF EVIDENCE — task 94
+================================================================================
+
+### COMMIT
+c1b4b69 feat(provider): openai-compatible profile with azure and copilot rules
+  full SHA: c1b4b693dc90018e0c215c98a0e3fb8f5c2340e4
+
+$ git show --stat --oneline HEAD
+c1b4b69 feat(provider): openai-compatible profile with azure and copilot rules
+ Cargo.lock                                         |  99 ++++
+ crates/oc-provider-compatible/Cargo.toml           |  23 +
+ .../examples/qa_scenarios.rs                       | 126 +++++
+ crates/oc-provider-compatible/src/family.rs        | 434 +++++++++++++++++
+ crates/oc-provider-compatible/src/lib.rs           | 101 +++-
+ crates/oc-provider-compatible/src/provider.rs      | 523 ++++++++++++++++++++
+ crates/oc-provider-compatible/src/quirks.rs        | 254 ++++++++++
+ crates/oc-provider-compatible/src/request.rs       | 534 +++++++++++++++++++++
+ crates/oc-provider-compatible/src/stream.rs        | 494 +++++++++++++++++++
+ crates/oc-provider-compatible/src/surface.rs       | 422 ++++++++++++++++
+ crates/oc-provider-compatible/src/transport.rs     | 317 ++++++++++++
+ crates/oc-provider-compatible/src/wire.rs          | 284 +++++++++++
+ .../tests/cassette_parity.rs                       | 490 +++++++++++++++++++
+ crates/oc-provider-compatible/tests/discipline.rs  | 209 ++++++++
+ crates/oc-provider-compatible/tests/rules.rs       | 452 +++++++++++++++++
+ 15 files changed, 4761 insertions(+), 1 deletion(-)

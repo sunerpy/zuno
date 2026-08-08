@@ -1,0 +1,104 @@
+## Task 20 — schema and migration-journal parity
+
+### Contract verification
+- Oracle: `/config/workspace/ProdDir/AI/opencode/packages/core/src/database/schema.gen.ts` creates **19 application tables** in one `schema.up(tx)`, not 19 total database tables. Adding `migration` yields 20 tables in a fresh database. A legacy user database also retains `__drizzle_migrations`, yielding 21.
+- Generated-order migration count: 38. First: `20260127222353_familiar_lady_ursula`. Last: `20260622202450_simplify_session_input`.
+- Schema tables in generated order: `workspace`, `data_migration`, `account_state`, `account`, `control_account`, `credential`, `event_sequence`, `event`, `permission`, `project_directory`, `project`, `message`, `part`, `session_context_epoch`, `session_input`, `session_message`, `session`, `todo`, `session_share`.
+- Explicit index names: `event_aggregate_seq_idx`, `event_aggregate_type_seq_idx`, `permission_project_action_resource_idx`, `message_session_time_created_id_idx`, `part_message_id_id_idx`, `part_session_idx`, `session_input_session_pending_delivery_seq_idx`, `session_input_session_admitted_seq_idx`, `session_input_session_promoted_seq_idx`, `session_message_session_seq_idx`, `session_message_session_type_seq_idx`, `session_message_session_time_created_id_idx`, `session_message_time_created_idx`, `session_project_idx`, `session_workspace_idx`, `session_parent_idx`, `todo_session_idx`.
+
+### Real user journal ground truth
+The source was opened read-only with URI `file:/config/.local/share/opencode/opencode.db?mode=ro` plus `PRAGMA query_only=ON`; no statement wrote to it. Source size was 54,041,645,056 bytes (51 GiB), with an 815,224,432-byte WAL. Reflink copy failed (`Operation not supported`), and a SQLite online full backup reached 10,938,744,832 bytes but did not finish within 1,200 seconds; the partial backup was deleted. This is a plainly reported exception to the requested full-file copy. A read-only extraction of the exact journal was preserved instead at `/config/workspace/ProdDir/AI/opencode-rust/.omo/task20-real-journal-copy.db` with 38 rows.
+
+Exact real-database `migration` ids in `rowid` order:
+1. `20260127222353_familiar_lady_ursula`
+2. `20260211171708_add_project_commands`
+3. `20260213144116_wakeful_the_professor`
+4. `20260225215848_workspace`
+5. `20260227213759_add_session_workspace_id`
+6. `20260303231226_add_workspace_fields`
+7. `20260228203230_blue_harpoon`
+8. `20260309230000_move_org_to_state`
+9. `20260312043431_session_message_cursor`
+10. `20260323234822_events`
+11. `20260410174513_workspace-name`
+12. `20260413175956_chief_energizer`
+13. `20260423070820_add_icon_url_override`
+14. `20260428004200_add_session_path`
+15. `20260427172553_slow_nightmare`
+16. `20260501142318_next_venus`
+17. `20260504145000_add_sync_owner`
+18. `20260507164347_add_workspace_time`
+19. `20260511000411_data_migration_state`
+20. `20260510033149_session_usage`
+21. `20260511173437_session-metadata`
+22. `20260601010001_normalize_storage_paths`
+23. `20260601202201_amazing_prowler`
+24. `20260602002951_lowly_union_jack`
+25. `20260602182828_add_project_directories`
+26. `20260603001617_session_message_projection_indexes`
+27. `20260603040000_session_message_projection_order`
+28. `20260603141458_session_input_inbox`
+29. `20260603160727_jittery_ezekiel_stane`
+30. `20260604172448_event_sourced_session_input`
+31. `20260605003541_add_session_context_snapshot`
+32. `20260605042240_add_context_epoch_agent`
+33. `20260611035744_credential`
+34. `20260611192811_lush_chimera`
+35. `20260612174303_project_dir_strategy`
+36. `20260622142730_simplify_session_context_epoch`
+37. `20260622170816_reset_v2_session_state`
+38. `20260622202450_simplify_session_input`
+
+The real user's historical row order differs from current `migration.gen.ts` at three rollout pairs (`add_workspace_fields`/`blue_harpoon`, `add_session_path`/`slow_nightmare`, `data_migration_state`/`session_usage`). The compatibility contract is the completed-id set. Fresh Rust and fresh real-binary databases both seed current generated order.
+
+### TDD proof
+Command: `CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target cargo test -p oc-db schema`
+Initial output before implementation:
+```text
+error[E0432]: unresolved import `oc_db::migration`
+ --> crates/oc-db/tests/schema.rs:1:25
+  |
+1 | use oc_db::{Connection, migration, open};
+  |                         ^^^^^^^^^ no `migration` in the root
+error: could not compile `oc-db` (test "schema") due to 1 previous error
+```
+
+### Targeted tests and real-binary QA
+Command: `CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target cargo test -p oc-db schema_ -- --nocapture`
+```text
+running 5 tests
+cascade counts before: [("message", 1), ("part", 1), ("todo", 1), ("session_message", 1), ("session_input", 1), ("session_context_epoch", 1), ("session_share", 1)]
+cascade counts after: [("message", 0), ("part", 0), ("todo", 0), ("session_message", 0), ("session_input", 0), ("session_context_epoch", 0), ("session_share", 0)]
+test schema_session_delete_cascades_through_every_declared_dependent_table ... ok
+test schema_part_session_id_is_indexed_but_is_not_a_foreign_key ... ok
+test schema_prefills_every_current_migration_id_in_generated_order ... ok
+real opencode status=exit status: 0 stdout=[
+  {
+    "migration_count": 38
+  }
+] stderr=
+migration journal count before=38 after=38
+test schema_journal_round_trip_through_the_real_binary_does_not_replay_migrations ... ok
+normalized schema diff: empty; tables=20 objects=37 columns=142 foreign_keys=13
+test schema_matches_a_database_created_by_the_real_opencode_binary ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+The real binary invocation was `/config/.local/share/mise/installs/opencode/1.18.12/opencode db --pure --format json "SELECT count(*) AS migration_count FROM migration"` under an isolated `HOME`/XDG tree containing the Rust-created database. It exited 0, returned 38, and left the exact 38-id sequence unchanged.
+
+### Diagnostics and workspace gates
+`lsp_diagnostics` was run against a physical mirror of all four changed files under the request workspace, because the MCP rejects sibling-worktree paths. Result for `src/schema.rs`, `src/migration/mod.rs`, `src/lib.rs`, and `tests/schema.rs`: `No diagnostics found`.
+
+Command: `CARGO_TARGET_DIR=/config/workspace/ProdDir/AI/opencode-rust/target cargo fmt --all -- --check && cargo build --workspace && cargo clippy --workspace --all-targets -- -D warnings`
+First clippy run found one `collapsible_str_replace` warning in the test normalizer; fixed with `replace(['`', '"'], "")`. Final output:
+```text
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.16s
+Checking oc-testkit v0.1.0
+Checking oc-snapshot v0.1.0
+Checking oc-config v0.1.0
+Checking oc-db v0.1.0
+Checking oc-catalog v0.1.0
+Checking oc-permission v0.1.0
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.19s
+```
+Zero warnings.
+

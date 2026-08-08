@@ -1,0 +1,630 @@
+================================================================================
+TASK 24 — crates/oc-auth: credential stores at mode 0600 with env override
+worktree /config/workspace/ProdDir/AI/oc-wt/t24 (branch task-24), base main=20b0564
+oracle   /config/workspace/ProdDir/AI/opencode (TypeScript opencode)
+binary   /config/.local/share/mise/installs/opencode/1.18.12/opencode  (reports 1.18.12)
+date     2026-08-05T10:28:58+00:00
+================================================================================
+
+### 1. THE THREE CREDENTIAL SHAPES, WITH ORACLE CITATIONS ######################
+
+packages/opencode/src/auth/index.ts:14-21  ->  type="oauth"
+export class Oauth extends Schema.Class<Oauth>("OAuth")({
+  type: Schema.Literal("oauth"),
+  refresh: Schema.String,
+  access: Schema.String,
+  expires: NonNegativeInt,
+  accountId: Schema.optional(Schema.String),
+  enterpriseUrl: Schema.optional(Schema.String),
+}) {}
+
+packages/opencode/src/auth/index.ts:23-27  ->  type="api"
+export class Api extends Schema.Class<Api>("ApiAuth")({
+  type: Schema.Literal("api"),
+  key: Schema.String,
+  metadata: Schema.optional(Schema.Record(Schema.String, Schema.String)),
+}) {}
+
+packages/opencode/src/auth/index.ts:29-33  ->  type="wellknown"
+export class WellKnown extends Schema.Class<WellKnown>("WellKnownAuth")({
+  type: Schema.Literal("wellknown"),
+  key: Schema.String,
+  token: Schema.String,
+}) {}
+
+packages/opencode/src/auth/index.ts:35      ->  discriminated union on "type"
+export const Info = Schema.Union([Oauth, Api, WellKnown]).annotate({ discriminator: "type", identifier: "Auth" })
+
+packages/opencode/src/mcp/auth.ts:9-32      ->  Tokens / ClientInfo / Entry
+export const Tokens = Schema.Struct({
+  accessToken: Schema.mutableKey(Schema.String),
+  refreshToken: Schema.mutableKey(Schema.optional(Schema.String)),
+  expiresAt: Schema.mutableKey(Schema.optional(Schema.Number)),
+  scope: Schema.mutableKey(Schema.optional(Schema.String)),
+})
+export type Tokens = Schema.Schema.Type<typeof Tokens>
+
+export const ClientInfo = Schema.Struct({
+  clientId: Schema.mutableKey(Schema.String),
+  clientSecret: Schema.mutableKey(Schema.optional(Schema.String)),
+  clientIdIssuedAt: Schema.mutableKey(Schema.optional(Schema.Number)),
+  clientSecretExpiresAt: Schema.mutableKey(Schema.optional(Schema.Number)),
+})
+export type ClientInfo = Schema.Schema.Type<typeof ClientInfo>
+
+export const Entry = Schema.Struct({
+  tokens: Schema.mutableKey(Schema.optional(Tokens)),
+  clientInfo: Schema.mutableKey(Schema.optional(ClientInfo)),
+  codeVerifier: Schema.mutableKey(Schema.optional(Schema.String)),
+  oauthState: Schema.mutableKey(Schema.optional(Schema.String)),
+  serverUrl: Schema.mutableKey(Schema.optional(Schema.String)),
+})
+export type Entry = Schema.Schema.Type<typeof Entry>
+
+packages/opencode/src/auth/index.ts:58-67   ->  OPENCODE_AUTH_CONTENT + read
+    const all = Effect.fn("Auth.all")(function* () {
+      if (process.env.OPENCODE_AUTH_CONTENT) {
+        try {
+          return JSON.parse(process.env.OPENCODE_AUTH_CONTENT)
+        } catch (err) {}
+      }
+
+      const data = (yield* fsys.readJson(file).pipe(Effect.orElseSucceed(() => ({})))) as Record<string, unknown>
+      return Record.filterMap(data, (value) => Result.fromOption(decode(value), () => undefined))
+    })
+
+packages/opencode/src/auth/index.ts:73-89   ->  set / remove, both 0o600
+    const set = Effect.fn("Auth.set")(function* (key: string, info: Info) {
+      const norm = key.replace(/\/+$/, "")
+      const data = yield* all()
+      if (norm !== key) delete data[key]
+      delete data[norm + "/"]
+      yield* fsys
+        .writeJson(file, { ...data, [norm]: info }, 0o600)
+        .pipe(Effect.mapError(fail("Failed to write auth data")))
+    })
+
+    const remove = Effect.fn("Auth.remove")(function* (key: string) {
+      const norm = key.replace(/\/+$/, "")
+      const data = yield* all()
+      delete data[key]
+      delete data[norm]
+      yield* fsys.writeJson(file, data, 0o600).pipe(Effect.mapError(fail("Failed to write auth data")))
+    })
+
+packages/opencode/src/mcp/auth.ts:65-82     ->  mcp read / mutate, 0o600
+    const read = Effect.fn("McpAuth.read")(function* () {
+      return yield* fs.readJson(filepath).pipe(
+        Effect.map((data): AuthData => Option.getOrElse(decodeAuthData(data), () => ({}) as AuthData) as AuthData),
+        Effect.catch(() => Effect.succeed({} as AuthData)),
+      )
+    })
+
+    const all = Effect.fn("McpAuth.all")(function* () {
+      return yield* read().pipe(flock.withLock(lockKey), Effect.orDie)
+    })
+
+    const mutate = Effect.fn("McpAuth.mutate")(function* (update: (data: AuthData) => AuthData | undefined) {
+      yield* Effect.gen(function* () {
+        const next = update(yield* read())
+        if (!next) return
+        yield* fs.writeJson(filepath, next, 0o600).pipe(Effect.orDie)
+      }).pipe(flock.withLock(lockKey), Effect.orDie)
+    })
+
+packages/core/src/fs-util.ts:110-113        ->  write-THEN-chmod (the window we close)
+      const writeJson = Effect.fn("FileSystem.writeJson")(function* (path: string, data: unknown, mode?: number) {
+        const content = JSON.stringify(data, null, 2)
+        yield* fs.writeFileString(path, content)
+        if (mode) yield* fs.chmod(path, mode)
+
+### 2. THE COUNTER-EXAMPLE #####################################################
+
+$ grep -n 'set_permissions|PermissionsExt|0o600|\.mode(' .omo/refs/claw-code/rust/crates/runtime/src/oauth.rs
+(no match — the whole file sets no mode; credentials.json lands at the umask)
+
+claw-code save_oauth_credentials, .omo/refs/claw-code/rust/crates/runtime/src/oauth.rs:283-300:
+pub fn save_oauth_credentials(token_set: &OAuthTokenSet) -> io::Result<()> {
+    let path = credentials_path()?;
+    let mut root = read_credentials_root(&path)?;
+    root.insert(
+        "oauth".to_string(),
+        serde_json::to_value(StoredOAuthCredentials::from(token_set.clone()))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+    );
+    write_credentials_root(&path, &root)
+}
+
+pub fn clear_oauth_credentials() -> io::Result<()> {
+    let path = credentials_path()?;
+    let mut root = read_credentials_root(&path)?;
+    root.remove("oauth");
+    write_credentials_root(&path, &root)
+}
+
+
+### 3. ACCEPTANCE: cargo test -p oc-auth #######################################
+
+$ cargo test -p oc-auth
+     Running unittests src/lib.rs (/config/workspace/ProdDir/AI/opencode-rust/target/debug/deps/oc_auth-fb46a2152178007e)
+
+running 66 tests
+test error::tests::the_io_kind_survives_in_the_source ... ok
+test error::tests::every_variant_names_its_file_and_fails ... ok
+test mcp::tests::debug_of_an_entry_hides_every_secret_but_not_the_client_id ... ok
+test mcp::tests::resolve_points_at_the_layouts_mcp_auth_file ... ok
+test provider::tests::debug_of_every_shape_hides_every_secret ... ok
+test provider::tests::normalize_key_strips_only_trailing_slashes ... ok
+test provider::tests::an_undecodable_override_entry_is_dropped ... ok
+test mcp::tests::absent_optional_fields_are_omitted_not_null ... ok
+test mcp::tests::clearing_an_absent_entry_writes_nothing ... ok
+test mcp::tests::a_full_entry_round_trips_field_for_field ... ok
+test mcp::tests::a_permissive_file_warns_and_still_yields_its_entries ... ok
+test provider::tests::resolve_points_at_the_layouts_auth_file ... ok
+test provider::tests::remove_of_an_absent_provider_is_not_an_error ... ok
+test mcp::tests::an_absent_file_reads_as_empty ... ok
+test provider::tests::the_env_override_replaces_the_file_entirely ... ok
+test secret::tests::a_derived_debug_on_an_enclosing_type_cannot_leak ... ok
+test provider::tests::undecodable_entries_are_skipped_and_reported ... ok
+test secret::tests::debug_and_display_both_redact ... ok
+test secret::tests::expose_is_the_only_way_out ... ok
+test mcp::tests::debug_of_the_whole_loaded_set_hides_every_secret ... ok
+test secret::tests::hint_is_char_boundary_safe ... ok
+test provider::tests::the_env_override_serves_get_too ... ok
+test secret::tests::hint_refuses_short_values ... ok
+test secret::tests::hint_reveals_a_bounded_prefix_and_suffix ... ok
+test secret::tests::is_empty_reports_without_revealing ... ok
+test secret::tests::serializes_as_a_bare_string ... ok
+test mcp::tests::a_file_the_typescript_binary_would_write_decodes ... ok
+test provider::tests::a_file_the_typescript_binary_would_write_decodes ... ok
+test mcp::tests::update_tokens_creates_the_entry_for_an_unknown_server ... ok
+test provider::tests::a_permissive_file_warns_and_still_yields_its_credentials ... ok
+test store::tests::an_empty_file_reads_as_the_default ... ok
+test store::tests::malformed_json_is_a_typed_error_naming_the_file ... ok
+test provider::tests::get_returns_none_for_an_absent_provider_and_an_absent_file ... ok
+test provider::tests::no_env_key_means_no_override ... ok
+test provider::tests::an_error_over_a_secret_bearing_file_carries_no_secret ... ok
+test provider::tests::a_malformed_env_override_falls_back_to_the_file ... ok
+test mcp::tests::get_for_url_rejects_an_entry_with_no_recorded_url ... ok
+test provider::tests::every_write_lands_at_0600 ... ok
+test provider::tests::absent_optional_fields_are_omitted_not_null ... ok
+test mcp::tests::get_oauth_state_reads_the_stored_state ... ok
+test mcp::tests::get_for_url_matches_only_the_recorded_url ... ok
+test store::tests::the_permission_warning_reaches_the_log_naming_the_file ... ok
+test store::tests::a_fresh_write_lands_at_0600 ... ok
+test store::tests::a_group_readable_file_warns_and_still_reads ... ok
+test mcp::tests::set_stamps_the_server_url_when_given_one ... ok
+test store::tests::an_absent_file_reads_as_the_default ... ok
+test mcp::tests::the_serialized_field_names_are_the_oracle_spellings ... ok
+test mcp::tests::undecodable_entries_are_skipped_and_reported ... ok
+test provider::tests::unknown_fields_are_tolerated_on_read_and_dropped_on_write ... ok
+test mcp::tests::clearing_removes_only_the_named_field ... ok
+test store::tests::only_group_and_other_bits_trigger_the_warning ... ok
+test provider::tests::set_normalizes_trailing_slashes_and_collapses_duplicates ... ok
+test store::tests::round_trip_preserves_contents ... ok
+test provider::tests::the_serialized_field_names_are_the_oracle_spellings ... ok
+test store::tests::the_encoding_matches_the_oracle_byte_for_byte ... ok
+test store::tests::the_permission_warning_carries_no_credential ... ok
+test provider::tests::remove_accepts_either_spelling ... ok
+test store::tests::a_write_over_a_permissive_file_repairs_the_mode ... ok
+test provider::tests::all_three_shapes_round_trip_field_for_field ... ok
+test provider::tests::debug_of_the_whole_loaded_set_hides_every_secret ... ok
+test provider::tests::remove_leaves_the_other_providers_alone ... ok
+test provider::tests::a_mutation_under_an_override_overwrites_the_file ... ok
+test mcp::tests::remove_leaves_the_other_servers_alone ... ok
+test tests::both_stores_keep_their_secrets_and_their_mode ... ok
+test mcp::tests::each_update_leaves_the_other_fields_intact ... ok
+test mcp::tests::every_write_lands_at_0600 ... ok
+
+test result: ok. 66 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests oc_auth
+
+running 3 tests
+test crates/oc-auth/src/secret.rs - secret::Secret::hint (line 103) ... ok
+test crates/oc-auth/src/secret.rs - secret::Secret (line 57) ... ok
+test crates/oc-auth/src/lib.rs - (line 42) ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 0.30s; merged doctests compilation took 0.29s
+
+### 3a. the permissions assertion, by name #####################################
+
+$ cargo test -p oc-auth -- 0600 --nocapture
+     Running unittests src/lib.rs (/config/workspace/ProdDir/AI/opencode-rust/target/debug/deps/oc_auth-fb46a2152178007e)
+
+running 3 tests
+test store::tests::a_fresh_write_lands_at_0600 ... ok
+test provider::tests::every_write_lands_at_0600 ... ok
+test mcp::tests::every_write_lands_at_0600 ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 63 filtered out; finished in 0.01s
+
+   Doc-tests oc_auth
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+all doctests ran in 0.20s; merged doctests compilation took 0.20s
+
+### 3b. the redaction assertions, by name ######################################
+
+$ cargo test -p oc-auth -- redact hides leak secret --nocapture
+-- filter: redact
+test secret::tests::debug_and_display_both_redact ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 65 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+-- filter: hides
+test mcp::tests::debug_of_an_entry_hides_every_secret_but_not_the_client_id ... ok
+test provider::tests::debug_of_every_shape_hides_every_secret ... ok
+test mcp::tests::debug_of_the_whole_loaded_set_hides_every_secret ... ok
+test provider::tests::debug_of_the_whole_loaded_set_hides_every_secret ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 62 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+-- filter: secret
+test mcp::tests::debug_of_an_entry_hides_every_secret_but_not_the_client_id ... ok
+test provider::tests::debug_of_every_shape_hides_every_secret ... ok
+test secret::tests::a_derived_debug_on_an_enclosing_type_cannot_leak ... ok
+test secret::tests::debug_and_display_both_redact ... ok
+test secret::tests::expose_is_the_only_way_out ... ok
+test secret::tests::hint_is_char_boundary_safe ... ok
+test secret::tests::hint_refuses_short_values ... ok
+test secret::tests::hint_reveals_a_bounded_prefix_and_suffix ... ok
+test provider::tests::an_error_over_a_secret_bearing_file_carries_no_secret ... ok
+test mcp::tests::debug_of_the_whole_loaded_set_hides_every_secret ... ok
+test secret::tests::is_empty_reports_without_revealing ... ok
+test secret::tests::serializes_as_a_bare_string ... ok
+test provider::tests::debug_of_the_whole_loaded_set_hides_every_secret ... ok
+test tests::both_stores_keep_their_secrets_and_their_mode ... ok
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 52 filtered out; finished in 0.00s
+test crates/oc-auth/src/secret.rs - secret::Secret (line 57) ... ok
+test crates/oc-auth/src/secret.rs - secret::Secret::hint (line 103) ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+### 4. QA HAPPY — all three kinds round-trip AND the real binary reads them #####
+
+Harness: crates/oc-auth/tests/qa_interop.rs (temporary; deleted before commit).
+
+$ T24_QA_DATA=/tmp/t24-qa/xdg/opencode cargo test -p oc-auth --test qa_interop -- --exact write_both_files_with_oc_auth --nocapture
+     Running tests/qa_interop.rs (/config/workspace/ProdDir/AI/opencode-rust/target/debug/deps/qa_interop-d97e591b04c0ceea)
+
+running 1 test
+WROTE /tmp/t24-qa/xdg/opencode/auth.json
+WROTE /tmp/t24-qa/xdg/opencode/mcp-auth.json
+test write_both_files_with_oc_auth ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.01s
+
+
+$ stat -c '%a %n' /tmp/t24-qa/xdg/opencode/*.json
+600 /tmp/t24-qa/xdg/opencode/auth.json
+600 /tmp/t24-qa/xdg/opencode/mcp-auth.json
+
+$ cat /tmp/t24-qa/xdg/opencode/auth.json                       # written by oc-auth
+{
+  "acme": {
+    "type": "wellknown",
+    "key": "wk-rust-key-0003",
+    "token": "wk-rust-token-0003"
+  },
+  "anthropic": {
+    "type": "oauth",
+    "refresh": "rt-rust-refresh-0001",
+    "access": "at-rust-access-0001",
+    "expires": 1893456000000,
+    "accountId": "acct-rust-42",
+    "enterpriseUrl": "https://enterprise.example.test"
+  },
+  "openai": {
+    "type": "api",
+    "key": "sk-rust-api-key-0002",
+    "metadata": {
+      "label": "written-by-rust",
+      "region": "us-east-2"
+    }
+  }
+}
+
+$ cat /tmp/t24-qa/xdg/opencode/mcp-auth.json                   # written by oc-auth
+{
+  "acme-mcp": {
+    "tokens": {
+      "accessToken": "mcp-rust-access-0005",
+      "refreshToken": "mcp-rust-refresh-0005",
+      "expiresAt": 1893456000000,
+      "scope": "read write"
+    },
+    "clientInfo": {
+      "clientId": "client-rust-public",
+      "clientSecret": "cs-rust-0004",
+      "clientIdIssuedAt": 1700000000,
+      "clientSecretExpiresAt": 0
+    },
+    "codeVerifier": "pkce-rust-verifier-0006",
+    "oauthState": "csrf-rust-state-0007",
+    "serverUrl": "https://mcp.example.test/sse"
+  }
+}
+
+-- the real 1.18.12 TypeScript binary, pointed at that directory ---------------
+$ cd /tmp/t24-qa/cwd && XDG_DATA_HOME=/tmp/t24-qa/xdg opencode auth list
+^[[0m
+M-bM-^TM-^L  Credentials ^[[90m/tmp/t24-qa/xdg/opencode/auth.json
+M-bM-^TM-^B
+M-bM-^WM-^O  acme ^[[90mwellknown
+M-bM-^TM-^B
+M-bM-^WM-^O  Anthropic ^[[90moauth
+M-bM-^TM-^B
+M-bM-^WM-^O  OpenAI ^[[90mapi
+M-bM-^TM-^B
+M-bM-^TM-^T  3 credentials
+
+M-bM-^TM-^L  Environment
+M-bM-^TM-^B
+M-bM-^WM-^O  Amazon Bedrock ^[[90mAWS_REGION
+
+  => all three shapes recognized, each with the right type label.
+
+-- and it writes them back unchanged: logout acme, keep the other two ----------
+$ XDG_DATA_HOME=/tmp/t24-qa/xdg opencode auth logout acme
+M-bM-^TM-^B
+M-bM-^TM-^T  Logout successful
+
+
+$ stat -c '%a %n' /tmp/t24-qa/xdg/opencode/auth.json           # after the TS write
+600 /tmp/t24-qa/xdg/opencode/auth.json
+$ cat /tmp/t24-qa/xdg/opencode/auth.json                       # rewritten by TypeScript
+{
+  "anthropic": {
+    "type": "oauth",
+    "refresh": "rt-rust-refresh-0001",
+    "access": "at-rust-access-0001",
+    "expires": 1893456000000,
+    "accountId": "acct-rust-42",
+    "enterpriseUrl": "https://enterprise.example.test"
+  },
+  "openai": {
+    "type": "api",
+    "key": "sk-rust-api-key-0002",
+    "metadata": {
+      "label": "written-by-rust",
+      "region": "us-east-2"
+    }
+  }
+}
+
+  => every field oc-auth wrote survived the TypeScript rewrite verbatim,
+     including accountId, enterpriseUrl and the nested metadata object.
+
+-- oc-auth reads the TypeScript-written file back ------------------------------
+$ T24_QA_DATA=/tmp/t24-qa/xdg/opencode cargo test -p oc-auth --test qa_interop -- --exact read_both_files_back_with_oc_auth --nocapture
+     Running tests/qa_interop.rs (/config/workspace/ProdDir/AI/opencode-rust/target/debug/deps/qa_interop-d97e591b04c0ceea)
+
+running 1 test
+auth entries=2 skipped=[]
+  anthropic -> oauth | Oauth { refresh: <redacted>, access: <redacted>, expires: 1893456000000, account_id: Some("acct-rust-42"), enterprise_url: Some("https://enterprise.example.test") }
+  openai -> api | Api { key: <redacted>, metadata: Some({"label": <redacted>, "region": <redacted>}) }
+mcp entries=1 skipped=[]
+  acme-mcp -> Entry { tokens: Some(Tokens { access_token: <redacted>, refresh_token: Some(<redacted>), expires_at: Some(1893456000000), scope: Some("read write") }), client_info: Some(ClientInfo { client_id: "client-rust-public", client_secret: Some(<redacted>), client_id_issued_at: Some(1700000000), client_secret_expires_at: Some(0) }), code_verifier: Some(<redacted>), oauth_state: Some(<redacted>), server_url: Some("https://mcp.example.test/sse") }
+test read_both_files_back_with_oc_auth ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+
+  => note every secret prints as <redacted> even here, while account_id,
+     client_id, scope, server_url and the metadata KEYS stay legible.
+
+### 5. QA FAILURE — a pre-existing auth.json at mode 0644 ######################
+
+Harness: crates/oc-auth/tests/qa_warn.rs (temporary; deleted before commit).
+
+$ stat -c '%a %n' /tmp/t24-qa-warn/opencode/auth.json    # seeded permissive, as a restore-from-backup would leave it
+644 /tmp/t24-qa-warn/opencode/auth.json
+
+$ T24_QA_DATA=/tmp/t24-qa-warn/opencode cargo test -p oc-auth --test qa_warn -- --nocapture
+     Running tests/qa_warn.rs (/config/workspace/ProdDir/AI/opencode-rust/target/debug/deps/qa_warn-41937527b726d9cd)
+
+running 1 test
+ WARN oc_auth::store: credential file /tmp/t24-qa-warn/opencode/auth.json is mode 0644; it should be 0600 so only you can read it path=/tmp/t24-qa-warn/opencode/auth.json mode=0644 expected=0600
+-- returned data --
+entries=2 providers=["anthropic", "openai"]
+permissions=Some(PermissionWarning { path: "/tmp/t24-qa-warn/opencode/auth.json", mode: 0644 })
+Display: credential file /tmp/t24-qa-warn/opencode/auth.json is mode 0644; it should be 0600 so only you can read it
+offending group/other bits: 0044
+test a_preexisting_0644_auth_json_warns_by_name_and_still_reads ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+$ stat -c '%a %n' /tmp/t24-qa-warn/opencode/auth.json    # a READ leaves the mode alone — parity with 1.18.12
+644 /tmp/t24-qa-warn/opencode/auth.json
+
+  => the warning fires, names the file, gives both the found and the wanted
+     mode, and the two credentials are still returned. Reading is NOT refused:
+     see section 6 for the observation that the real binary reads 0644 happily,
+     so refusing would lock a user out of every provider they have configured.
+
+### 6. BEHAVIOURS PINNED BY OBSERVING THE 1.18.12 BINARY #######################
+
+-- 6a. a 0644 auth.json is READ, and its mode is left alone (=> warn, not refuse)
+$ stat -c %a auth.json  ->  644
+$ XDG_DATA_HOME=/tmp/t24-probe/xdg opencode auth list
+M-bM-^TM-^L  Credentials ^[[90m/tmp/t24-probe/xdg/opencode/auth.json
+M-bM-^TM-^B
+M-bM-^WM-^O  OpenAI ^[[90mapi
+M-bM-^TM-^B
+M-bM-^WM-^O  acme ^[[90mwellknown
+M-bM-^TM-^B
+M-bM-^TM-^T  2 credentials
+
+M-bM-^TM-^L  Environment
+$ stat -c %a auth.json  ->  644   (unchanged)
+
+-- 6b. a WRITE repairs a 0644 file to 0600 (fs-util.ts:113 chmod)
+$ XDG_DATA_HOME=/tmp/t24-probe/xdg opencode auth logout acme
+M-bM-^TM-^T  Logout successful
+
+$ stat -c %a auth.json  ->  600   (repaired)
+
+-- 6c. OPENCODE_AUTH_CONTENT fully replaces the file for reads
+$ OPENCODE_AUTH_CONTENT='{"envonly":{"type":"api","key":"sk-env"}}' opencode auth list
+M-bM-^TM-^L  Credentials ^[[90m/tmp/t24-probe/xdg/opencode/auth.json
+M-bM-^TM-^B
+M-bM-^WM-^O  envonly ^[[90mapi
+M-bM-^TM-^B
+M-bM-^TM-^T  1 credentials
+
+M-bM-^TM-^L  Environment
+   => 1 credential, and it is the env one; the file's openai is not listed.
+
+-- 6d. a MALFORMED OPENCODE_AUTH_CONTENT falls back to the file (auth/index.ts:62)
+$ OPENCODE_AUTH_CONTENT='{not json' opencode auth list
+M-bM-^TM-^L  Credentials ^[[90m/tmp/t24-probe/xdg/opencode/auth.json
+M-bM-^TM-^B
+M-bM-^WM-^O  OpenAI ^[[90mapi
+M-bM-^TM-^B
+M-bM-^TM-^T  1 credentials
+
+M-bM-^TM-^L  Environment
+   => back to the file's openai.
+
+-- 6e. a MUTATION under an active override WRITES THE OVERRIDE TO THE FILE ------
+        and the file's own entries are destroyed. This is the sharp edge.
+$ cat auth.json   (before)
+{ "filealpha": { "type": "api", "key": "sk-file-alpha" },
+  "filebeta":  { "type": "api", "key": "sk-file-beta" } }
+$ OPENCODE_AUTH_CONTENT='{"envgamma":{...},"filebeta":{...}}' opencode auth logout filebeta
+M-bM-^TM-^T  Logout successful
+
+$ cat auth.json   (after)
+{
+  "envgamma": {
+    "type": "api",
+    "key": "sk-env-gamma"
+  }
+}
+   => filealpha is GONE. oc-auth reproduces this rather than diverging; the
+      test is provider::tests::a_mutation_under_an_override_overwrites_the_file.
+
+-- 6f. an entry that does not decode is dropped on read AND lost on write -------
+$ opencode auth list   (5 entries seeded)
+M-bM-^TM-^L  Credentials ^[[90m/tmp/t24-probe2/xdg/opencode/auth.json
+M-bM-^TM-^B
+M-bM-^WM-^O  goodapi ^[[90mapi
+M-bM-^TM-^B
+M-bM-^WM-^O  extrafields ^[[90mapi
+M-bM-^TM-^B
+M-bM-^TM-^T  2 credentials
+
+M-bM-^TM-^L  Environment
+   => only goodapi and extrafields; the three malformed ones are invisible.
+$ opencode auth logout goodapi
+M-bM-^TM-^T  Logout successful
+
+$ cat auth.json   (after)
+{
+  "extrafields": {
+    "type": "api",
+    "key": "sk-extra"
+  }
+}
+   => the three malformed entries are destroyed, and the unknown field
+      'surprise' is stripped. oc-auth matches, and additionally reports the
+      casualties in Credentials::skipped so a caller can decline to write.
+
+-- 6g. the byte encoding: two-space indent, NO trailing newline ----------------
+$ tail -c 20 auth.json | xxd
+00000000: 7922 3a20 2273 6b2d 6578 7472 6122 0a20  y": "sk-extra". 
+00000010: 207d 0a7d                                 }.}
+   => ends '}
+}' with no final 0a. Matches serde_json::to_vec_pretty and is
+      asserted by store::tests::the_encoding_matches_the_oracle_byte_for_byte.
+
+### 7. THE REAL auth.json WAS NEVER TOUCHED ####################################
+
+Read structurally, without its values, to confirm the shapes this crate models
+are the shapes actually in use on this machine. Never written, never copied.
+
+$ stat -c '%a %n' $HOME/.local/share/opencode/auth.json
+600 /config/.local/share/opencode/auth.json
+
+$ python3 -c 'print provider, sorted(keys), type'   # values deliberately omitted
+  myopenai                 keys=['key', 'type'] type='api'
+  google                   keys=['access', 'expires', 'refresh', 'type'] type='oauth'
+  zhipuai                  keys=['key', 'type'] type='api'
+  zhipuai-coding-plan      keys=['key', 'type'] type='api'
+  nwcdai                   keys=['key', 'type'] type='api'
+  openai                   keys=['access', 'accountId', 'expires', 'refresh', 'type'] type='oauth'
+  newapi                   keys=['key', 'type'] type='api'
+  dev-openai               keys=['key', 'type'] type='api'
+  alb-openai               keys=['key', 'type'] type='api'
+  awsopenai                keys=['key', 'type'] type='api'
+  kiro-auth                keys=['key', 'type'] type='api'
+  amazon-bedrock           keys=['key', 'type'] type='api'
+
+  => 10 api + 2 oauth entries in the wild, one of them carrying accountId.
+     Every QA scenario above ran against a scratch XDG_DATA_HOME under /tmp.
+
+### 8. WORKSPACE GATES #########################################################
+
+$ cargo fmt --all --check
+(clean — no output)
+
+$ cargo build --workspace
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.47s
+
+$ cargo clippy --workspace --all-targets
+warnings+errors: 0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.17s
+
+$ cargo test --workspace   (per-target results summed)
+  TOTAL passed=858 failed=0
+  (main at 20b0564 had 789; oc-auth adds 66 unit + 3 doc = 858)
+
+$ cargo test -p oc-auth   (final, after the temporary QA harnesses were deleted)
+running 66 tests
+test result: ok. 66 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+running 3 tests
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+$ ls crates/oc-auth/src crates/oc-auth
+crates/oc-auth:
+Cargo.toml
+src
+
+crates/oc-auth/src:
+error.rs
+lib.rs
+mcp.rs
+provider.rs
+secret.rs
+store.rs
+
+### 9. COMMIT ##################################################################
+
+$ git log --oneline -1
+f3abcc0 feat(auth): credential stores at 0600 with env override
+
+$ git show --stat HEAD
+f3abcc0b9b852c02d8a9592e7aeeba5fadd49e8c
+feat(auth): credential stores at 0600 with env override
+
+
+ Cargo.lock                     |  83 ++++
+ crates/oc-auth/Cargo.toml      |  10 +
+ crates/oc-auth/src/error.rs    | 201 ++++++++++
+ crates/oc-auth/src/lib.rs      | 185 ++++++++-
+ crates/oc-auth/src/mcp.rs      | 848 +++++++++++++++++++++++++++++++++++++++++
+ crates/oc-auth/src/provider.rs | 835 ++++++++++++++++++++++++++++++++++++++++
+ crates/oc-auth/src/secret.rs   | 229 +++++++++++
+ crates/oc-auth/src/store.rs    | 538 ++++++++++++++++++++++++++
+ 8 files changed, 2928 insertions(+), 1 deletion(-)
+
+$ git status --short   (worktree clean; notepads and evidence live in the main tree)
+(no output above = clean)
+
+================================================================================
+END OF EVIDENCE — task 24
+================================================================================

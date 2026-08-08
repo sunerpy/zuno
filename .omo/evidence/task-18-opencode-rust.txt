@@ -1,0 +1,73 @@
+=== Task 18 — references / formatter / lsp config surfaces ===
+worktree: /config/workspace/ProdDir/AI/oc-wt/t18 (branch task-18)
+
+--- cargo test -p oc-catalog ---
+running 33 tests
+test formatter::tests::arm_one_boolean_round_trips_both_ways ... ok
+test formatter::tests::an_absent_key_disables_every_formatter ... ok
+test formatter::tests::a_record_disables_exactly_the_listed_formatter ... ok
+test formatter::tests::an_empty_entry_round_trips_to_an_empty_object ... ok
+test formatter::tests::disabling_ruff_also_disables_uv_because_they_share_a_backend ... ok
+test formatter::tests::disabling_uv_also_disables_ruff_and_drops_a_ruff_override ... ok
+test formatter::tests::arm_two_record_round_trips_with_every_field ... ok
+test formatter::tests::false_disables_every_formatter ... ok
+test formatter::tests::for_extension_matches_the_leading_dot_form_the_runtime_uses ... ok
+test formatter::tests::true_enables_the_builtins_with_no_overrides ... ok
+test lsp_config::tests::a_builtin_override_without_extensions_reports_none_not_an_empty_slice ... ok
+test lsp_config::tests::a_disabled_server_reports_nothing_from_the_resolved_view ... ok
+test lsp_config::tests::an_absent_key_disables_every_server ... ok
+test formatter::tests::overrides_keep_declaration_order_and_default_an_absent_environment ... ok
+test lsp_config::tests::inner_arm_one_disabled_only_round_trips ... ok
+test lsp_config::tests::lsp_false_disables_all_while_one_disabled_entry_disables_exactly_one ... ok
+test lsp_config::tests::inner_arm_two_full_entry_round_trips_with_every_field ... ok
+test lsp_config::tests::outer_arm_one_boolean_round_trips_both_ways ... ok
+test lsp_config::tests::outer_arm_two_record_round_trips ... ok
+test lsp_config::tests::the_builtin_id_list_is_the_oracles_thirty_eight ... ok
+test lsp_config::tests::overrides_keep_declaration_order ... ok
+test lsp_config::tests::true_enables_the_builtins_with_no_overrides ... ok
+test lsp_config::tests::the_resolved_view_answers_command_extensions_and_initialization ... ok
+test reference::tests::a_whole_map_round_trips_and_keeps_declaration_order ... ok
+test reference::tests::arm_one_bare_string_round_trips ... ok
+test reference::tests::an_entry_with_neither_repository_nor_path_names_the_entry ... ok
+test reference::tests::arm_three_local_reference_round_trips ... ok
+test reference::tests::arm_two_git_reference_round_trips_with_every_field ... ok
+test reference::tests::arm_two_git_reference_round_trips_with_only_repository ... ok
+test reference::tests::every_bad_entry_is_reported_not_just_the_first ... ok
+test reference::tests::hidden_references_are_kept_but_not_visible ... ok
+test reference::tests::malformed_json_is_reported_as_json_not_validation ... ok
+test reference::tests::resolve_of_an_absent_key_yields_nothing ... ok
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+--- QA happy: all seven union arms round-trip (JSON -> struct -> JSON, equal) ---
+formatter::tests::arm_one_boolean_round_trips_both_ways: test
+formatter::tests::arm_two_record_round_trips_with_every_field: test
+lsp_config::tests::inner_arm_one_disabled_only_round_trips: test
+lsp_config::tests::inner_arm_two_full_entry_round_trips_with_every_field: test
+lsp_config::tests::outer_arm_one_boolean_round_trips_both_ways: test
+lsp_config::tests::outer_arm_two_record_round_trips: test
+reference::tests::arm_one_bare_string_round_trips: test
+reference::tests::arm_three_local_reference_round_trips: test
+reference::tests::arm_two_git_reference_round_trips_with_every_field: test
+reference::tests::arm_two_git_reference_round_trips_with_only_repository: test
+
+--- QA failure: references {"x": {}} names the entry ---
+display: config file opencode.json failed validation (1 issue(s))
+issue: ["references", "x"] -> reference "x" is neither a string, a git reference with 'repository', nor a local reference with 'path': data did not match any variant of untagged enum ReferenceEntry
+
+--- lsp false disables all vs gopls disabled disables exactly one ---
+test lsp_config::tests::lsp_false_disables_all_while_one_disabled_entry_disables_exactly_one ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.00s
+
+--- cargo fmt --all --check ---
+clean
+
+--- cargo build --workspace ---
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.81s
+
+--- cargo clippy --workspace --all-targets (zero warnings) ---
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.87s
+
+--- cargo test --workspace total ---
+TOTAL PASSED: 510

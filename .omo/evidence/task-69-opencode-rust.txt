@@ -1,0 +1,348 @@
+Task 69 — crates/oc-goal/src/projection.rs: markdown goal projection with a documented conflict rule
+Worktree /config/workspace/ProdDir/AI/oc-wt/t69, branch task-69, commit 1541d809fc85d357d34c338121be84d3b9bc184e
+Date 2026-08-06
+
+================================================================================
+1. VERIFICATION NUMBERS
+================================================================================
+
+cargo build --workspace --offline
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 16.66s
+
+cargo test -p oc-goal --offline
+    lib:       test result: ok. 84 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+    doc-tests: test result: ok. 1 passed;  0 failed; 0 ignored; 0 measured; 0 filtered out
+    84 = 57 from todos 67+68 (58 including the doctest) + 27 new projection tests
+
+cargo test -p oc-goal --offline projection      <- the plan's literal filter
+    test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out
+    (27 PASSED, not "0 passed; N filtered out")
+
+cargo clippy --workspace --all-targets --offline
+    0 warnings, 0 errors
+
+cargo fmt --all --check
+    clean
+
+cargo metadata --locked --offline   (after committing)
+    OK
+    crates/oc-goal/Cargo.toml: exactly 1 [dependencies], exactly 1 [dev-dependencies]
+
+Concurrency check, 3 rounds x 6 concurrent `cargo test -p oc-goal --offline`,
+counting lines matching '^test result: FAILED':
+    round 1: 0 0 0 0 0 0
+    round 2: 0 0 0 0 0 0
+    round 3: 0 0 0 0 0 0
+
+================================================================================
+2. THE 27 PROJECTION TESTS
+================================================================================
+
+a_completed_goal_projects_a_ticked_completion_box
+a_deleted_document_is_restored_from_sql
+a_hand_edited_objective_over_the_cap_spills_and_the_document_shows_the_pointer
+a_render_does_not_trigger_a_re_ingest
+a_save_that_changed_nothing_is_not_an_edit
+a_session_id_that_would_escape_the_directory_is_refused
+a_session_without_a_goal_leaves_the_document_alone
+a_system_status_change_is_projected_and_survives_a_round_trip
+a_ticked_completion_checkbox_does_not_complete_the_goal
+an_edited_counter_is_rejected_the_same_way_as_status
+an_edited_objective_is_adopted_and_the_next_turns_injection_carries_it
+an_edited_status_is_rejected_and_the_rejection_is_written_into_the_document
+an_objective_cleared_to_nothing_is_refused_and_the_document_says_why
+an_objective_containing_the_closing_marker_round_trips
+an_objective_edit_and_a_status_edit_in_one_save_are_handled_independently
+an_unbounded_budget_renders_as_none_and_unbounded
+an_unparsable_document_is_preserved_and_the_rebuild_says_where
+an_untouched_field_is_not_reported_when_sql_moved_on_since_the_render
+every_projected_field_and_checkbox_is_guarded
+every_watch_kind_for_this_document_ingests_and_other_paths_are_ignored
+parse_refuses_a_document_missing_any_projected_key
+the_document_path_parallels_the_oracles_plans_convention
+the_document_renders_the_objective_status_budget_counters_and_checklist
+the_gitignore_snippet_names_the_projection_directory
+the_re_render_that_follows_an_adopted_edit_is_also_recognised_as_our_own
+the_render_is_atomic_under_a_concurrent_reader
+the_render_is_deterministic_so_two_renders_of_one_state_are_identical
+
+Acceptance criteria mapping:
+  edited objective adopted on the next turn
+    -> an_edited_objective_is_adopted_and_the_next_turns_injection_carries_it
+       (asserts through todo 68's GoalContinuation::injection, not just the store)
+  edited status rejected AND the rejection written back into the document
+    -> an_edited_status_is_rejected_and_the_rejection_is_written_into_the_document
+  atomic under a concurrent reader, 1,000 iterations
+    -> the_render_is_atomic_under_a_concurrent_reader
+
+================================================================================
+3. THE RENDERED DOCUMENT, LITERALLY
+================================================================================
+(goal_id substituted with a fixed UUID; everything else is real output. This is
+the state after a hand-edited `status: complete` was ingested and refused.)
+
+--------------------------------------------------------------------------------
+# Goal
+
+<!--
+This document is a projection of opencode's goal database.
+
+The objective between the two `goal:objective` markers is yours to edit: the next
+turn adopts whatever you leave there, spilling it to a file if it is longer than
+the objective cap. Everything below it is read-only. The status, the budget, the
+counters and the checklist are the system's to set, and an edit to one of them is
+reported under `## Rejected edits` rather than applied -- a document that could
+complete a goal would let an editor left open on a stale copy resurrect a
+finished run by saving.
+
+Nothing you write here is discarded quietly. If an edit is refused, this file
+says which one and why.
+-->
+
+## Objective
+
+<!-- goal:objective:begin -->
+ship the markdown projection with a documented conflict rule
+<!-- goal:objective:end -->
+
+## State
+
+- `session_id`: ses_projection
+- `goal_id`: 3f0a9c21-6d4e-4b18-9a77-2c5e8b1d0f43
+- `status`: active
+- `created_at_ms`: 1786010235620
+- `updated_at_ms`: 1786010235620
+
+## Budget
+
+- `token_budget`: 200000
+- `tokens_used`: 48120
+- `tokens_remaining`: 151880
+- `time_used_seconds`: 903
+
+## Checklist
+
+- [x] `active`: the agent should keep working toward the objective
+- [x] `within_budget`: the token budget has room left
+- [ ] `complete`: the model reported the objective met
+
+## Rejected edits
+
+The last turn did not apply these edits.
+
+- `status` was edited to `complete`, but the status is the system's to set, not the document's; the goal database still says `active`.
+--------------------------------------------------------------------------------
+
+================================================================================
+4. THE REJECTION MESSAGE, VERBATIM
+================================================================================
+
+status (system-owned, singular noun):
+- `status` was edited to `complete`, but the status is the system's to set, not the document's; the goal database still says `active`.
+
+a counter (system-owned, plural noun):
+- `tokens_used` was edited to `0`, but the counters are the system's to set, not the document's; the goal database still says `1200`.
+
+a checklist checkbox:
+- the `complete` checklist item was edited to `[x]`, but the checklist is the system's to set, not the document's; the goal database still says `[ ]`.
+
+the objective, when the document owns it but the value is unstorable:
+- `objective` was edited to ``, but a goal objective must not be empty; the goal database still says `keep me`.
+
+an unparsable document:
+This document could not be parsed, so it was rebuilt from the goal database. Your version was kept at `<path>.bak.<unix-seconds>`.
+
+Each message names four things: what was edited, what it was set to, who owns it,
+and what the goal database actually says. Singular/plural is carried by
+`Refusal::SystemOwned { noun, plural }`, built only via `Field::owner()`, after the
+first draft emitted "the counters IS the system's to set".
+
+================================================================================
+5. THE 1,000-ITERATION ATOMICITY RESULT
+================================================================================
+
+`the_render_is_atomic_under_a_concurrent_reader`:
+  writer: 1,000 renders of a ~3,100-byte document (3,000-char objective), each a
+          temp-file-then-rename in the document's own directory
+  reader: a separate OS thread reading and FULLY PARSING the file in a loop,
+          bounded by a 60s deadline, asserting on every read that
+            (a) `parse()` returns Some  -> every marker and all 9 fields and all
+                3 checkboxes present
+            (b) the objective is the full 3,000 characters
+            (c) `tokens_used` parses as i64
+
+  PASS. 0 partial or wrong documents observed.
+  Reader completed ~294,000 reads across the 1,000 renders (measured during the
+  mutation run below: 293,732). Test wall time ~0.5s for the whole filtered target.
+  Floor assertion: the test fails if the reader completed < 50 reads, so it cannot
+  pass vacuously by never having raced anything.
+  Also asserts no `*.tmp.*` file survives in the goal directory.
+
+================================================================================
+6. MUTATION PROOFS (both restored afterwards; suite re-verified green)
+================================================================================
+
+--- MUTATION A: make status document-authoritative -----------------------------
+Patch (crates/oc-goal/src/projection.rs, inside `ingest`'s field loop):
+
+    // MUTATION A: the document is authoritative for status.
+    if field == Field::Status && *observed != field.value(&baseline) {
+        if let Ok(status) = crate::status::ModelStatus::parse(observed) {
+            drop(store.update_status_as_model(&self.session_id, status));
+        }
+        continue;
+    }
+
+Result: `cargo test -p oc-goal --offline projection`
+    test result: FAILED. 24 passed; 3 failed; 0 ignored; 0 measured; 57 filtered out
+
+    an_edited_status_is_rejected_and_the_rejection_is_written_into_the_document FAILED
+      panicked at crates/oc-goal/src/projection_tests.rs:226:5:
+      assertion `left == right` failed: a hand-edited status must not complete a goal
+        left: Complete
+       right: Active
+
+    every_projected_field_and_checkbox_is_guarded FAILED
+      panicked at crates/oc-goal/src/projection_tests.rs:307:9:
+      assertion `left == right` failed: editing `status` must be refused exactly once: Applied { adopted: None, rejected: [] }
+        left: 0
+       right: 1
+
+    an_objective_edit_and_a_status_edit_in_one_save_are_handled_independently FAILED
+      panicked at crates/oc-goal/src/projection_tests.rs:355:5:
+      assertion `left == right` failed
+        left: 0
+       right: 1
+
+The first failure is the exact plan hazard: a hand-edited `status: complete`
+completed an active goal.
+
+--- MUTATION B: replace the atomic rename with a direct write ------------------
+Patch (crates/oc-goal/src/projection.rs, `write_atomic`):
+
+    drop(&temporary);
+    // MUTATION B: direct write instead of temp + rename.
+    std::fs::write(path, body).map_err(|source| GoalError::Document {
+        operation: "write",
+        path: path.to_path_buf(),
+        source,
+    })
+
+Result: `cargo test -p oc-goal --offline projection`
+    test result: FAILED. 26 passed; 1 failed; 0 ignored; 0 measured; 57 filtered out
+
+    the_render_is_atomic_under_a_concurrent_reader FAILED
+      panicked at crates/oc-goal/src/projection_tests.rs:824:5:
+      292699 of 293732 reads observed a partial or wrong document; first three:
+      ["a partial document was observed: 0 bytes, starts \"\"",
+       "a partial document was observed: 0 bytes, starts \"\"",
+       "a partial document was observed: 0 bytes, starts \"\""]
+
+99.6% of reads observed a partial document, all at the truncate window. This also
+measures the reader's coverage: 293,732 reads against 1,000 renders.
+
+--- restored ------------------------------------------------------------------
+    cargo test -p oc-goal --offline    -> 84 passed; 0 failed  /  1 passed; 0 failed
+    cargo clippy -p oc-goal --all-targets --offline -> 0 warnings
+    cargo fmt --all --check -> clean
+
+================================================================================
+7. HOW THE RENDER IS STOPPED FROM RE-INGESTING ITSELF
+================================================================================
+
+`GoalProjection` retains the exact bytes of its last render plus the `Goal` they
+were rendered from (`Mutex<Option<LastRender>>`). An ingest that finds the file
+byte-identical to those bytes returns `Ingest::OwnRender` and does nothing: no SQL
+write, no rewrite.
+
+Chosen over the two alternatives:
+  * an mtime+len stamp (oc-memory's approach) — exact byte equality is available
+    here because the projection just produced the bytes, so a stamp only adds a
+    same-size-within-one-timestamp-tick false negative, and it would misread a
+    no-op editor autosave as an edit;
+  * an ignore-next-event token — oc-watch coalesces, so one token can be consumed
+    by the first of N merged events and let the rest through.
+
+Tested by:
+  a_render_does_not_trigger_a_re_ingest                        (6 consecutive
+    ingests all OwnRender; also asserts the file bytes and `updated_at_ms` are
+    unchanged, so no SQL write followed)
+  the_re_render_that_follows_an_adopted_edit_is_also_recognised_as_our_own
+  a_save_that_changed_nothing_is_not_an_edit
+  a_hand_edited_objective_over_the_cap_spills_...              (the pointer
+    sentence round trips as OwnRender)
+
+Related, and the subtler half of the same mechanism: the rejection baseline is the
+**last render**, not live SQL. SQL moves on between render and save (`record_usage`
+changes tokens_used, tokens_remaining and updated_at_ms in one statement), so
+diffing against current SQL would report three edits the user never made. Guarded by
+`an_untouched_field_is_not_reported_when_sql_moved_on_since_the_render`.
+
+================================================================================
+8. NO SECOND WATCHER, NO SECOND ATOMIC-WRITE HELPER
+================================================================================
+
+Watcher: none built. `oc-goal` depends on `oc-watch` only to consume its
+`FileEvent`/`ChangeKind`; `GoalProjection::ingest_event` is the seam and whoever
+already runs a `Watcher` routes matching events in. Two reasons this is not a
+shortcut:
+  1. `oc-watch`'s default flag resolution is `Decision::VcsOnly` — the project
+     directory is NOT watched unless OPENCODE_EXPERIMENTAL_FILEWATCHER is set — so
+     a Watcher built inside oc-goal would be silently inert by default, and forcing
+     the flag from here would override the user.
+  2. `oc-watch` has no suppression API (no per-event token, no ignore-next-event),
+     so the self-render problem had to be solved on this side regardless.
+Recorded in issues.md as a resolved design question rather than a request to change
+`oc-watch` (which this task may not edit).
+
+Atomic write: the same technique as `oc-memory/src/store.rs`'s `write_atomic`
+(temp in the destination's own directory, then rename) rather than a second design.
+That helper is private to `oc-memory` and returns a private `FileStamp`, so it is
+not callable; `oc-memory` is also not a dependency of any crate. Two deliberate
+deltas, both documented in the source:
+  * `with_file_name(format!("{name}.tmp.{nanos}"))` instead of `with_extension`.
+    `with_extension` REPLACES the extension, so `ses_1.md` -> `ses_1.tmp.<nanos>`;
+    a session id containing a dot could then collide with another session's target.
+  * nanos in the temp name, so two concurrent renders cannot share a temp file.
+Neither implementation calls `sync_all`; for derived state that is the right trade
+(regenerated from SQL on the next material change).
+
+================================================================================
+9. WHAT THE PLAN GOT WRONG / NEEDED A DECISION
+================================================================================
+
+* "add the directory to the recommended gitignore snippet" — no such snippet
+  exists. Every `.gitignore` hit in the workspace is gitignore *parsing*
+  (oc-watch/src/ignore.rs, oc-search, oc-snapshot/src/store.rs) or the repository's
+  own `.gitignore`. The oracle has none either: its only `.gitignore`-writing code
+  is `config.ts:295-312`, which seeds the config directory's internal ignore file
+  and never mentions `.opencode/plans`. Per the prompt's instruction the
+  recommendation is `projection::GITIGNORE_SNIPPET` plus a module-docs section
+  saying why; no new file was invented.
+
+* "watch the file" cannot be satisfied inside this crate — see section 8.
+
+* Additions the plan did not name but the conflict rule requires:
+  - a hostile session id must not become a path (`..` -> `.opencode/goal/...md`);
+  - an objective edited to whitespace is document-authoritative but unstorable, so
+    it needs its own refusal shape (`Refusal::Unstorable`);
+  - an unparsable document must be preserved before being rebuilt, or a user's
+    prose is destroyed by the very mechanism meant not to lose their edits;
+  - `## Rejected edits` renders even when empty (`_Nothing has been rejected._`),
+    because an absent section is ambiguous between "nothing rejected" and "this
+    build does not report rejections".
+
+================================================================================
+10. UNVERIFIED
+================================================================================
+
+* No end-to-end test drives a real `oc_watch::Watcher` against a real inotify
+  event. The tests construct `FileEvent`s directly, which is deterministic and
+  covers every `ChangeKind` plus a foreign path. Live wiring belongs to whoever
+  integrates the watcher (todo 86 consumes this module).
+* `cargo test --workspace` was NOT run: the task prompt scopes verification to
+  `-p oc-goal`. Workspace build and workspace clippy were both run and are clean.
+* lsp_diagnostics could not be used: the session MCP is rooted at the main worktree
+  and rejects paths under oc-wt/t69, the same limitation recorded by tasks 12, 68,
+  98 and 99. `cargo clippy -p oc-goal --all-targets` and the workspace clippy run
+  are the authoritative lint gates here.

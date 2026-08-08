@@ -9,8 +9,18 @@
 # are other people's repositories and must never enter this history.
 .omo/refs/
 
-# Per-task verification transcripts: local proof, not shared source.
-.omo/evidence/
+# Per-task verification transcripts. Originally ignored as "local proof, not
+# shared source"; that was wrong once the gates became expensive. Todo 88's
+# transcript is the only record of a ~100-minute paired memory measurement, 89's
+# of a 2-hour soak, and 90/113/114's of results no reader can reproduce cheaply.
+# Agents force-added the five costliest for exactly that reason, which left the
+# directory half-tracked and silently dropped todo 112's file. Decisive argument:
+# untracked files do not propagate into a `git worktree`, so a worktree-based
+# Final-Wave audit would see NO evidence at all. 1.5 MB for a durable audit trail
+# is the cheaper trade. Only the throwaway generator scripts stay ignored.
+.omo/evidence/*.sh
+.omo/evidence/*.mjs
+.omo/evidence/*.json
 
 .omo/run-continuation/
 .omo/delegated-runtime/

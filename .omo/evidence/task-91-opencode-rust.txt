@@ -1,0 +1,429 @@
+================================================================================
+TASK 91 — cross-platform release pipeline with per-artifact smoke tests
+Worktree /config/workspace/ProdDir/AI/oc-wt/t91  branch task-91  commit 8cd05f6
+Host: x86_64 Linux, rustc 1.96.0, cargo 1.96.0, zig 0.13.0, cargo-deny 0.19.9,
+      actionlint 1.7.12. Registry: aliyun mirror (cargo search unusable).
+================================================================================
+
+WHAT SHIPPED
+  .github/workflows/ci.yml               207 lines   push/PR gate
+  .github/workflows/release.yml          418 lines   tag + manual, six targets
+  Makefile                               189 lines   fmt lint test ci release +
+  deny.toml                              133 lines   supply-chain gate
+  crates/oc-cli/tests/release_surface.rs 985 lines   21 assertions
+  crates/oc-testkit/src/bin/oc-smoke.rs  446 lines   per-artifact smoke driver
+  packaging/smoke/cassettes/…            2 files     committed oracle recording
+  .gitignore                             +4          /dist
+  TOTAL 2476 insertions, 0 deletions. No existing test weakened.
+
+================================================================================
+1. GATES — every number executed here
+================================================================================
+
+$ make ci
+cargo metadata --locked --offline --format-version 1 > /dev/null
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --offline -- -D warnings
+cargo test --workspace --offline
+advisories ok, bans ok, licenses ok, sources ok
+OK    metadata + fmt + clippy + tests + cargo-deny
+[exit 0]
+
+$ cargo test --workspace --offline
+  test result: ok totals summed  ->  3045 passing
+  ^test result: FAILED           ->  0
+  ^error: doctest failed         ->  0
+  ^error: could not compile      ->  0
+  ^error: test failed            ->  0
+  ^error\[E[0-9]+\]              ->  0
+  ^error                         ->  0
+  ignored                        ->  1  (pre-existing)
+  Baseline before this task was 3024; this task adds 21.
+
+$ cargo clippy --workspace --all-targets --offline
+  ^(warning|error) lines: 0        [exit 0]
+
+$ cargo fmt --all --check         [exit 0]
+
+$ cargo metadata --locked --offline --format-version 1   [exit 0], re-run AFTER commit
+
+$ cargo deny --offline check
+  advisories ok, bans ok, licenses ok, sources ok      [exit 0]
+  Stock cargo-deny (no deny.toml) produced 392 `error[rejected]: failed to
+  satisfy license requirements`. The allow list was derived from
+  `cargo metadata` licence census, then narrowed until cargo-deny reported no
+  unmatched allowance or exception — so nothing in it is speculative.
+  Advisories: ZERO `ignore` entries. Nothing acknowledged, nothing suppressed.
+  `unmaintained = "workspace"`, `yanked = "deny"`.
+  Three per-crate licence exceptions, each a crate with one non-standard
+  licence and no alternative: notify (CC0-1.0), webpki-root-certs
+  (CDLA-Permissive-2.0, the Mozilla CA bundle), option-ext (MPL-2.0).
+  `multiple-versions = "warn"` — 12 duplicate pairs today, reported not fatal.
+
+$ actionlint .github/workflows/*.yml   [exit 0], no output
+
+$ python3 -c 'yaml.safe_load(...)'  — a real YAML parse agrees with the textual
+  parser used by the tests:
+    ci.yml      jobs: test, supply-chain, artifact, windows, ci-success
+                ci-success needs: [test, supply-chain, artifact, windows]
+    release.yml jobs: version, build, smoke, checksums, publish
+                build  matrix: the six targets
+                smoke  matrix: the same six targets
+                publish needs: [version, build, smoke, checksums]
+
+================================================================================
+2. THE THREE ASSERTIONS
+================================================================================
+
+--- (1) NO OPENSSL, verified via cargo tree -------------------------------------
+
+$ cargo tree --locked --offline -p oc-cli -e normal --prefix none | sort -u
+  total unique graph lines: 394
+
+  exact-name OpenSSL packages (openssl|openssl-sys|openssl-src|native-tls):
+    count: 0
+
+  the one openssl-shaped name present, and legitimate:
+    openssl-probe v0.2.1
+    (locates the host certificate store, links nothing; reached via
+     rustls-native-certs <- rustls-platform-verifier <- reqwest. A naive
+     `grep -i openssl` flags it. The test matches "<name> " exactly and does not.)
+
+  the rustls stack that IS present (the positive half):
+    reqwest v0.13.4   rustls v0.23.43   rustls-webpki v0.103.13
+    hyper-rustls v0.27.9   tokio-rustls v0.26.4
+    aws-lc-rs v1.17.3   aws-lc-sys v0.43.0
+
+--- (2) NO WASMTIME by default -------------------------------------------------
+
+$ cargo tree --locked --offline -p oc-cli    -e normal --prefix none | sort -u
+  wasmtime|cranelift|wasmparser|wasm-encoder family hits: 0
+
+$ cargo tree --locked --offline --workspace  -e normal --prefix none | sort -u
+  431 unique lines; oc-plugin present: 1; wasm family hits: 0; openssl hits: 0
+
+  POSITIVE CONTROL, so this cannot pass vacuously:
+$ cargo tree --locked --offline -p oc-plugin --features wasm -e normal
+  wasm family hits: 32
+  (asserted by the_graph_query_does_detect_the_runtime_when_the_feature_is_on)
+
+  Finding: `oc-plugin` is NOT in `oc-cli`'s dependency graph at all today — the
+  CLI has no plugin host wired in. So the `-p oc-cli` no-wasmtime test cannot
+  carry a meaningful positive half; the workspace-level test does, and the
+  source comment says why rather than papering over it.
+
+--- (3) THE MUSL LEGS NEED NO CROSS-GCC AND NO DOCKER --------------------------
+
+Asserted (the_musl_legs_use_zig_and_no_cross_toolchain), AND executed:
+
+  Host inventory before building:
+    /usr/bin/aarch64-linux-gnu-gcc     -> does not exist
+    /usr/bin/aarch64-linux-musl-gcc    -> does not exist
+    any *-w64-mingw32-gcc              -> does not exist
+    qemu-aarch64 / qemu-aarch64-static -> not on PATH
+    docker                             -> present and running, NOT invoked
+    zig 0.13.0                         -> present
+    cargo-zigbuild                     -> present
+
+$ cargo zigbuild --release -p oc-cli --bin opencode-rust \
+      --target x86_64-unknown-linux-musl --offline
+    Finished `release` profile [optimized] target(s) in 1m 04s
+$ file target/x86_64-unknown-linux-musl/release/opencode-rust
+  ELF 64-bit LSB executable, x86-64, statically linked, stripped   (26,724,064 B)
+$ ldd  target/x86_64-unknown-linux-musl/release/opencode-rust
+  not a dynamic executable
+
+$ cargo zigbuild --release -p oc-cli --bin opencode-rust \
+      --target aarch64-unknown-linux-musl --offline
+    Finished `release` profile [optimized] target(s) in 1m 03s
+$ file target/aarch64-unknown-linux-musl/release/opencode-rust
+  ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped
+                                                                 (23,699,680 B)
+
+  THE DECISIVE POINT: there is no aarch64 C compiler of any kind on this host,
+  yet a statically linked aarch64 binary linked — including the SQLite C
+  amalgamation and aws-lc-sys's C. Only Zig can have done that. No docker
+  container was started; no apt package was installed; the build ran --offline.
+
+================================================================================
+3. SMOKE — what each check does, and where it actually ran
+================================================================================
+
+oc-smoke runs three checks against a binary given by --binary:
+  1. --version   the binary loads and its linkage resolves on this platform;
+                 asserts stdout contains an x.y.z token, not just exit 0
+  2. --help      the command tree is registered; asserts `run` and `serve` listed
+  3. run …       a headless turn against a committed cassette. Asserts: exit 0;
+                 exactly 2 provider requests (so the tool result went back);
+                 the first request advertised bash/read/glob/grep (the assembled
+                 registry reached the wire); the second carries a role=tool
+                 message; stderr names the unknown recorded tool `get_weather`;
+                 and MockProvider::authored_scenarios() is EMPTY, so every
+                 provider byte is a real recording.
+
+EXECUTED HERE, three times, all PASS:
+
+$ ./target/debug/oc-smoke --binary ./target/debug/opencode-rust
+  ok --version -> 1.18.13
+  ok --help lists run + serve
+  ok headless run replayed openai-chat/drives-a-tool-loop-end-to-end:
+     2 requests, 9 tools offered
+  PASS
+
+$ make smoke-artifact        (release build -> tar.gz -> untar -> smoke)
+  Finished `release` profile [optimized] target(s) in 21.24s
+  tar -czf dist/host/opencode-rust.tar.gz -C target/release opencode-rust
+  tar -xzf dist/host/opencode-rust.tar.gz -C dist/unpacked
+  ./target/release/oc-smoke --binary dist/unpacked/opencode-rust
+  ok --version -> 1.18.13
+  ok --help lists run + serve
+  ok headless run replayed …: 2 requests, 9 tools offered
+  PASS  dist/unpacked/opencode-rust
+
+$ ./target/release/oc-smoke \
+    --binary target/x86_64-unknown-linux-musl/release/opencode-rust
+  ok --version -> 1.18.13
+  ok --help lists run + serve
+  ok headless run replayed …: 2 requests, 9 tools offered
+  PASS      <-- a cross-linked static musl artifact, fully executed
+
+$ ./target/aarch64-unknown-linux-musl/release/opencode-rust --version
+  zsh: exec format error         <-- THE HONEST LIMIT, see below
+
+--- PER-LEG TRUTH IN CI (unexecuted here; correct by construction) -------------
+
+release.yml separates `build` from `smoke` and gives each smoke leg a runner of
+the artifact's own architecture, so all six are EXECUTED in CI:
+
+  target                        built on         smoked on         executes?
+  x86_64-unknown-linux-musl     ubuntu-latest    ubuntu-latest     YES (static
+                                (cargo zigbuild)                    musl runs on
+                                                                    a glibc host)
+  aarch64-unknown-linux-musl    ubuntu-latest    ubuntu-24.04-arm  YES (the
+                                (cargo zigbuild)                    runner-crossing
+                                                                    handoff is why
+                                                                    smoke is a
+                                                                    separate job)
+  x86_64-apple-darwin           macos-15-intel   macos-15-intel    YES (native)
+  aarch64-apple-darwin          macos-latest     macos-latest      YES (native)
+  x86_64-pc-windows-msvc        windows-latest   windows-latest    YES (native)
+  aarch64-pc-windows-msvc       windows-11-arm   windows-11-arm    YES (native)
+
+No leg is inspection-only. The prompt anticipated that a cross-compiled
+aarch64/Windows artifact cannot run on an x86_64 Linux runner — true, and the
+answer is not an emulator but an arm64 runner. Only ONE artifact is
+cross-compiled at all (aarch64-musl), and it is the one handed to
+ubuntu-24.04-arm. `publish` needs [version, build, smoke, checksums], so a
+single failed or skipped smoke leg blocks publication of all six.
+
+WHAT I COULD NOT EXECUTE, stated plainly:
+  * No GitHub Actions run of either workflow. I cannot run Actions here. Both
+    are actionlint-clean and their structure is asserted by six tests, but no
+    macOS, Windows, or arm64 leg has ever run.
+  * The four macOS/Windows legs were never built here — no such host.
+  * `aarch64-unknown-linux-musl` was BUILT and inspected here but NOT executed
+    (`exec format error`, quoted above).
+  * `checksums` and `publish` never ran; no release has ever been cut.
+
+================================================================================
+4. MUTATION PROOFS — six, all bit correctly, all reverted
+================================================================================
+
+--- M1 (the one the prompt asked for): reqwest rustls -> native-tls -----------
+
+  Cargo.toml, features = [... "native-tls" ...]. `cargo fetch` then added
+  openssl v0.10.81, openssl-macros, openssl-sys v0.9.117, tokio-native-tls.
+
+  Note: the mutated tree cannot even COMPILE on this host — openssl-sys fails
+  with "The system library `openssl` required by crate `openssl-sys` was not
+  found … PKG_CONFIG_PATH is not set". That is itself the constraint's
+  justification (no static musl build can have it). The assertion shells out to
+  `cargo tree`, not to a build, so the pre-mutation test binary reads the
+  mutated manifest and reports:
+
+  ---- the_shipped_binary_pulls_in_no_openssl stdout ----
+  panicked at crates/oc-cli/tests/release_surface.rs:184:5:
+  the default oc-cli graph contains OpenSSL: ["native-tls v0.2.18",
+    "native-tls v0.2.18 (*)", "openssl v0.10.81", "openssl-sys v0.9.117",
+    "openssl-sys v0.9.117 (*)"]
+  TLS in this workspace is rustls only (plan todo 1: reqwest carries
+  `default-features = false` and the `rustls` feature).
+  How each one got in:
+  --- cargo tree -i native-tls ---
+  native-tls v0.2.18
+  ├── hyper-tls v0.6.0
+  │   └── reqwest v0.13.4
+  │       ├── oc-catalog v0.1.0 (…/crates/oc-catalog)
+  │       │   ├── oc-agent v0.1.0 (…/crates/oc-agent)
+  │       │   │   ├── oc-cli v0.1.0 (…/crates/oc-cli)
+  …
+  test result: FAILED. 0 passed; 1 failed
+
+  And the second, independent mechanism also bit:
+  $ cargo deny --offline check bans
+    error[banned]: crate 'native-tls = 0.2.18' is explicitly banned
+    error[banned]: crate 'openssl = 0.10.81' is explicitly banned
+    error[banned]: crate 'openssl-sys = 0.9.117' is explicitly banned
+    bans FAILED
+
+  Reverted; `git diff --stat Cargo.toml Cargo.lock` empty;
+  `cargo metadata --locked --offline` OK; 21/21 green again.
+
+--- M2: oc-plugin `default = []` -> `default = ["wasm"]` ----------------------
+
+  ---- the_default_workspace_graph_pulls_in_no_wasm_runtime ----
+  panicked at crates/oc-cli/tests/release_surface.rs:268:5:
+  the default workspace graph contains a WebAssembly runtime:
+  ["cranelift-assembler-x64 v0.134.3", "cranelift-bforest v0.134.3", …,
+   "wasmtime v47.0.3", "wasmtime-environ v47.0.3", …]   (32 packages)
+  Reverted.
+
+--- M3: drop aarch64-pc-windows-msvc from release.yml's `smoke` matrix ---------
+
+  ---- every_built_target_is_also_smoke_tested ----
+  panicked at crates/oc-cli/tests/release_surface.rs:579:5:
+  release.yml builds ["aarch64-pc-windows-msvc"] but never runs the resulting
+  binary. An artifact that was never executed must not ship: add it to the
+  `smoke` matrix with a runner of its own architecture.
+  Reverted.
+
+--- M4: publish needs [version, build, smoke, checksums] -> drop `smoke` -------
+
+  ---- publication_depends_on_the_smoke_job ----
+  panicked at crates/oc-cli/tests/release_surface.rs:604:9:
+  release.yml's publish job does not need `smoke` (needs: {"build",
+  "checksums", "version"}); an unexecuted artifact could then be published
+  Reverted.
+
+--- M5: replace the Install Zig step with apt-get cross packages ---------------
+
+  ---- the_musl_legs_use_zig_and_no_cross_toolchain ----
+  panicked at crates/oc-cli/tests/release_surface.rs:643:5:
+  release.yml reaches for a per-target C cross-toolchain. Zig plus
+  cargo-zigbuild is a hermetic C cross-compiler in one download and is the only
+  cross mechanism this pipeline may use:
+    release.yml:189: a per-target apt package (matched "apt-get")
+    release.yml:189: a system cross-gcc (matched "gcc-aarch64")
+    release.yml:189: a system musl toolchain (matched "musl-tools")
+  Reverted.
+
+--- M6: add a `coverage` job to ci.yml without adding it to ci-success needs ---
+
+  ---- the_ci_gate_requires_every_job_in_the_workflow ----
+  panicked at crates/oc-cli/tests/release_surface.rs:698:5:
+  ci.yml defines job(s) ["coverage"] that `ci-success` does not require, so they
+  could fail without turning the required check red. Add them to `needs:`, or
+  state here why one is informational.
+  Reverted.
+
+================================================================================
+5. THE 21 ASSERTIONS in crates/oc-cli/tests/release_surface.rs
+================================================================================
+
+  the_shipped_binary_pulls_in_no_openssl                      (+ TLS positive)
+  the_shipped_binary_pulls_in_no_wasm_runtime
+  the_default_workspace_graph_pulls_in_no_wasm_runtime         (+ oc-plugin positive)
+  the_graph_query_does_detect_the_runtime_when_the_feature_is_on   POSITIVE CONTROL
+  no_first_party_source_file_uses_unsafe                      floor >= 300 files
+  every_workspace_member_inherits_the_workspace_lints         floor >= 34 manifests
+  the_release_matrix_builds_every_target_the_project_ships
+  every_built_target_is_also_smoke_tested
+  publication_depends_on_the_smoke_job
+  the_musl_legs_use_zig_and_no_cross_toolchain                 (+ zig positive)
+  the_ci_gate_requires_every_job_in_the_workflow
+  the_makefile_exposes_every_target_the_plan_and_ci_require
+  committed_smoke_cassette_matches_the_oracle_recording        byte-for-byte
+  the_committed_smoke_cassette_is_a_two_turn_recording
+  + 7 scanner self-tests, both directions:
+    the_unsafe_scanner_detects_every_keyword_position
+    the_unsafe_scanner_ignores_prose_and_identifiers
+    a_string_literal_containing_a_comment_marker_does_not_hide_an_unsafe_block
+    the_lint_inheritance_scanner_accepts_both_spellings_and_rejects_absence
+    the_matrix_parser_reads_only_the_named_job
+    the_package_matcher_does_not_confuse_a_prefix_for_a_package
+    the_package_matcher_catches_a_real_openssl_entry
+
+  $ cargo test -p oc-cli --test release_surface --offline
+    test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+  THE UNSAFE GATE, reusing rather than duplicating: no unsafe-grep test existed
+  before. `[workspace.lints.rust] unsafe_code = "forbid"` did, but a workspace
+  lint applies only to crates writing `[lints] workspace = true`. Measured: all
+  34 opt in, and 0 source lines use `unsafe` in a keyword position (22 textual
+  mentions, all in doc comments; the scanner strips comments and ignores them).
+  The two tests together are the gate: the lint-inheritance one is the
+  load-bearing half, because a crate that omits the key would accept unsafe code
+  silently and no amount of scanning the other 33 would see it.
+
+================================================================================
+6. DECISIONS THIS TASK OWNED
+================================================================================
+
+WHAT SHIPS: `opencode-rust` only. NOT `oc-server`. `opencode-rust serve` wraps
+  `oc_server::ServerBuilder` as a library rather than spawning that binary
+  (oc-cli/src/command.rs:552-554), and decisions.md records oc-server's binary
+  as "Task 51's executable QA surface". Shipping both would invite users to run
+  the wrong one. Also not shipped: oc-example-plugin, oc-acp-conformance,
+  oc-log-probe, ts-baseline — the workspace has SIX binary targets, not two.
+
+WHEN IT RUNS: release.yml on `v*` tags plus `workflow_dispatch`. NOT on every
+  push — six builds plus six smokes is far too slow for a per-commit gate. The
+  gap the prompt flagged is closed two ways: (a) `workflow_dispatch` runs the
+  full matrix with `publish` skipped, so the whole pipeline is exercisable
+  before any tag exists; (b) ci.yml's `artifact` job runs the same
+  package-unpack-smoke path on the host leg for every push and PR, so a break
+  in the smoke driver or the cassette surfaces on the PR that caused it.
+  No release-please: this project has no release process yet and inventing one
+  is todo 92's territory, not mine. A `version` job cross-checks the tag against
+  oc-cli's manifest version and fails on a mismatch.
+
+CASSETTE: committed at packaging/smoke/cassettes/, sha256
+  fab3c2b9991544004e02a101c4bbe5843f887d2084d96353a684fba4f0e5acd4, byte-identical
+  to the oracle's copy. A CI runner has this repo and nothing else, so
+  `oc_testkit::recordings_root()` (which walks up looking for a sibling opencode
+  checkout) cannot work there. The drift test compares the two whenever an
+  oracle tree is reachable and prints a named skip otherwise.
+
+CARGO-DENY: offline in `make ci` (so the local gate needs no network), online in
+  the CI `supply-chain` job (so the advisory database is current). `make deny`
+  prints a named skip if cargo-deny is absent; the CI job does not skip.
+
+OFFLINE: every Makefile cargo invocation passes `$(OFFLINE)` = `--offline`,
+  overridable with `OFFLINE=`. `make ci` runs entirely offline; verified.
+
+WHAT CI WOULD FETCH THAT THIS ENVIRONMENT CANNOT: nothing unusual — the
+  toolchain, the crate index, the RUSTSEC database, Zig 0.13.0 (mlugg/setup-zig),
+  and cargo-zigbuild / cargo-deny (taiki-e/install-action). All are ordinary
+  network fetches on a hosted runner. Locally, `cargo fetch --locked --target
+  x86_64-apple-darwin` was needed once to pull `mach2 v0.6.0` so
+  `cargo deny check advisories` could resolve all targets offline; that is the
+  same Windows-only-transitive-dep hazard learnings.md already records.
+
+================================================================================
+7. WHAT THE PLAN GOT WRONG OR LEFT OPEN
+================================================================================
+
+1. "each passes its smoke test" for six targets is achievable, but not by
+   executing all six on one runner. It needs six runners; the aarch64-musl
+   artifact is the only cross-compiled one and needs ubuntu-24.04-arm.
+2. codegraph-rust uses `macos-latest` for BOTH darwin targets. `macos-latest` is
+   now Apple Silicon, so an x86_64-apple-darwin binary built there is
+   cross-compiled and cannot be executed on it. This pipeline uses
+   `macos-15-intel` for the x86_64 leg so that leg is native and executable.
+   Copying codegraph's matrix verbatim would have produced an unexecutable
+   artifact — the precise failure this todo forbids.
+3. The plan says "a test asserts the default feature set pulls no OpenSSL and no
+   wasmtime". `oc-plugin` is not in `oc-cli`'s graph at all, so those are two
+   different questions with two different positive halves; both are asserted.
+4. No unsafe-grep test existed to reuse (the plan suggested one might). The
+   workspace lint table existed; the missing piece was proving all 34 crates
+   inherit it, which is where the real hole was.
+5. The plan's five Makefile targets (fmt, lint, test, ci, release) do not include
+   fmt-check, which is what CI actually needs; both exist.
+
+================================================================================
+8. CLEANUP
+================================================================================
+  /tmp/oc-t91/  removed on success.
+  dist/ is gitignored; target/{x86_64,aarch64}-unknown-linux-musl left in place
+  (build cache, not source).

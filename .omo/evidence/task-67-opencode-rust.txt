@@ -1,0 +1,591 @@
+================================================================================
+Task 67 — crates/oc-goal/src/store.rs: the goal store, split status ownership,
+objective spill, SQL budget flip, SQL-guarded replace
+Branch: task-67   Worktree: /config/workspace/ProdDir/AI/oc-wt/t67
+================================================================================
+
+WHAT WAS BUILT
+--------------
+crates/oc-goal/src/lib.rs          crate docs + re-exports (was a 1-line stub)
+crates/oc-goal/src/status.rs       GoalStatus (6) + ModelStatus (2) + SystemStatus (4)
+crates/oc-goal/src/error.rs        GoalError, incl. the two model-visible refusals
+crates/oc-goal/src/spill.rs        4,000-char cap, spill file, pointer sentence
+crates/oc-goal/src/store.rs        the `goal` table and every write against it
+crates/oc-goal/src/store_tests.rs  the store's tests (#[path] sibling module)
+crates/oc-goal/Cargo.toml          [dependencies] filled from workspace deps
+
+WHERE THE GOAL TABLE LIVES, AND WHY
+-----------------------------------
+Its own SQLite file: `$XDG_DATA_HOME/opencode/goal_1.db`, beside `opencode.db`
+and not inside it. Objective spill files: `$XDG_DATA_HOME/opencode/goal-objective/<uuid-v4>/goal-objective.md`.
+
+Two independent reasons, either sufficient:
+
+1. `opencode.db` is not ours to extend. oc-db reproduces the TypeScript
+   `opencode.db` byte-for-byte — 19 application tables plus the `migration`
+   journal — and proves it with a differential test against a real database
+   (crates/oc-db/src/schema.rs, crates/oc-db/tests/schema.rs) plus a 38-entry
+   journal contract (crates/oc-db/src/migration/mod.rs:10-52). A 20th table
+   breaks that test, and the promise it guards: that a user can switch between
+   the two binaries and keep their sessions. A goal is a feature the TypeScript
+   binary does not have.
+2. A goal must outlive session churn. Its whole purpose is to survive the
+   compaction that discards the conversation which set it, so it must not share
+   a file with state that gets pruned, vacuumed and cascaded. There is therefore
+   deliberately NO `FOREIGN KEY (session_id) REFERENCES session(id) ON DELETE
+   CASCADE` — a goal is keyed *by* a session id, not owned by a session row.
+   Proven by store::tests::the_table_declares_the_check_constraint_and_deliberately_no_foreign_key
+   (`pragma_foreign_key_list('goal')` returns 0 rows; the DDL contains no
+   "FOREIGN KEY"; the database holds exactly 1 table).
+
+codex reached the same place by the same route: goals live in their own
+`goals_1.sqlite` (codex-rs/state/src/sqlite.rs:30) and there is a
+`0034_drop_thread_goals.sql` in the *main* migration set recording the move out
+of the shared state database.
+
+THE OWNERSHIP SPLIT, AND HOW IT IS ENFORCED
+-------------------------------------------
+Structurally, by two distinct types — not by a runtime check a future caller can
+forget, and not by a doc comment:
+
+  ModelStatus  = { blocked, complete }                       (status.rs)
+  SystemStatus = { active, paused, usage_limited, budget_limited }
+
+`GoalStore::update_status_as_model` takes a `ModelStatus`. There is no `paused`
+variant to pass; the type cannot represent the request. `set_status_as_system`
+takes a `SystemStatus`, and no model-facing API produces one.
+
+`active` is SYSTEM-owned. The model already obtains `active` by creating a goal,
+so making it model-writable buys nothing and opens a hole: a model on a
+`budget_limited` goal could set `active` and keep spending. Recorded in
+decisions.md.
+
+Belt and braces: both status statements re-derive the budget limit in SQL, so
+even a *system* reactivation of an over-budget goal lands back on
+`budget_limited` (see section 4 of the matrix below). The type system stops the
+model from asking; the SQL stops anyone from succeeding.
+
+THE REFUSAL MESSAGES, VERBATIM
+------------------------------
+  goal status `paused` is the system's to set, not the model's; the model may set only `blocked` or `complete`
+  unknown goal status `halted`; expected `blocked` or `complete`
+  session ses_goal_matrix already has a goal with status `active`; create_goal may replace a goal only once it is `complete`
+
+HOW THE TWO INVARIANTS WERE MADE ATOMIC IN SQL
+----------------------------------------------
+Guarded replace — one upsert whose DO UPDATE carries the guard, ports
+codex-rs/state/src/runtime/goals.rs:245. When the WHERE is false SQLite skips
+the row, RETURNING yields nothing, and there is no separate read a concurrent
+writer could slip between:
+
+  INSERT INTO goal (...) VALUES (?1, ?2, ?3,
+      CASE WHEN ?4 IS NOT NULL AND 0 >= ?4 THEN 'budget_limited' ELSE 'active' END,
+      ?4, 0, 0, ?5, ?5)
+  ON CONFLICT(session_id) DO UPDATE SET
+      goal_id = excluded.goal_id, objective = excluded.objective,
+      status = excluded.status, token_budget = excluded.token_budget,
+      tokens_used = 0, time_used_seconds = 0,
+      created_at_ms = excluded.created_at_ms, updated_at_ms = excluded.updated_at_ms
+  WHERE goal.status = 'complete'
+  RETURNING ...
+
+The subsequent read of the blocking status happens inside the SAME transaction
+as the refusing statement, so it only *names* the blocker; it never decides.
+
+Budget flip — carried by every statement that can move `tokens_used` or
+`token_budget`, ports goals.rs:546-566 and goals.rs:618-630. `tokens_used + ?1`
+reads the pre-update value, so the flip decides on the post-increment total
+inside the statement performing the increment:
+
+  UPDATE goal
+  SET tokens_used = tokens_used + ?1,
+      time_used_seconds = time_used_seconds + ?2,
+      status = CASE
+          WHEN status = 'active' AND token_budget IS NOT NULL
+               AND tokens_used + ?1 >= token_budget THEN 'budget_limited'
+          ELSE status
+      END,
+      updated_at_ms = ?3
+  WHERE session_id = ?4
+  RETURNING ...
+
+The same CASE appears in `set_token_budget` (lowering a budget below the spend
+stops the goal in one statement) and in `set_status_as_system` (an `active`
+request on an over-budget goal resolves to `budget_limited`). And the upsert's
+`0 >= ?4` is `status_after_budget_limit(Active, 0, budget)` in SQL, so a budget
+of Some(0) can never be observed as an `active` goal.
+
+Two tests run the statement text DIRECTLY against a connection, with none of
+this crate's Rust in the path, because a test that only calls the store cannot
+tell a SQL `WHERE` from a Rust `if` wrapped around an unguarded statement:
+  store::tests::the_replacement_guard_is_in_the_statement_and_not_around_it
+  store::tests::the_budget_flip_is_in_the_recording_statement_and_not_around_it
+
+THE OBJECTIVE CAP AND SPILL
+---------------------------
+MAX_OBJECTIVE_CHARS = 4,000, counted with `chars().count()` (not bytes), porting
+codex-rs/protocol/src/protocol.rs:4076-4082. codex splits this across two layers
+— the protocol *rejects* an oversized objective and the TUI
+(codex-rs/tui/src/goal_files.rs:121-136) spills before calling — which means
+every future caller must remember to spill. Here both live BELOW the store's
+API, so the column's contract (never longer than 4,000 chars) holds for callers
+that have never heard of a spill file.
+
+The pointer sentence written into the column:
+
+  Read the full goal objective at <spill_dir>/<uuid-v4>/goal-objective.md before continuing.
+
+Observed for a 5,500-character objective (section 5 below):
+
+  submitted objective: 5500 characters
+  stored objective:    121 characters
+  stored objective:    Read the full goal objective at /tmp/.tmpoWHZbT/80d708da-926e-433e-a72d-9729a6219cfe/goal-objective.md before continuing.
+
+Reading the pointer back VALIDATES rather than merely parses — inside the spill
+dir, named `goal-objective.md`, parent directory a v4 UUID (porting
+goal_files.rs:164-171). Without those three checks a model-authored objective
+would be an arbitrary-file-read primitive; spill::tests::a_pointer_the_model_forged_is_refused_on_all_three_checks
+covers all four forgeries.
+
+TEST COUNTS PER TARGET
+----------------------
+  unittests src/lib.rs (oc_goal lib)      44 passed; 0 failed; 0 ignored; 0 filtered out
+  Doc-tests oc_goal                        1 passed; 0 failed; 0 ignored; 0 filtered out
+  ---------------------------------------------------------------------------
+  total                                   45 passed; 0 failed
+
+  `cargo test -p oc-goal store` (the plan's acceptance command):
+                                          26 passed; 0 failed; 16 filtered out
+  — 26 ran, so this is NOT the "0 passed; N filtered out" vacuous-filter hazard;
+    the unfiltered form above is reported alongside it as the real gate.
+
+There are no integration-test targets and no benches in this crate, so the lib
+target and the doctest are every target `cargo test -p oc-goal` builds.
+
+GATE STATUS
+-----------
+  cargo build --workspace --offline ................ clean
+  cargo test -p oc-goal --offline .................. 45 passed, 0 failed
+  cargo clippy --workspace --all-targets --offline .. 0 warnings (grep -c on ^warning|^error = 0)
+  cargo fmt --all --check .......................... clean (exit 0)
+  cargo metadata --locked --offline ................ exit 0, twice (stale-exit-code guard)
+
+Wall clock for the whole oc-goal suite: 0.08s lib + 0.23s doctests. No sleeps,
+no clock dependence: in-memory SQLite for every test except the four that must
+touch a real file to prove restart survival.
+
+TRANSITION MATRIX
+-----------------
+Sections 3 and 4 below are the machine-generated matrix, one line per
+(from-status, to-status, actor). 72 rows with no budget (6 x 6 x 2) and 60 rows
+with the budget already spent (5 x 6 x 2; `active` is not a reachable seed under
+a spent budget, because the flip fires the moment the counters cross). 132 rows
+total, 66 of them refusals. Every refused write is additionally asserted to have
+left the row untouched.
+
+Summary of the shape, per from-status:
+  model  -> blocked, complete                      ALLOWED
+  model  -> active, paused, usage_limited, budget_limited
+                                                   REFUSED, naming `blocked` or `complete`
+  system -> active, paused, usage_limited, budget_limited
+                                                   ALLOWED
+  system -> blocked, complete                      REFUSED (model-owned; SystemStatus cannot represent them)
+Two SQL guards then modify the ALLOWED outcomes:
+  budget_limited -> blocked (model)  stores budget_limited  (goals.rs:328)
+  budget_limited -> paused  (system) stores budget_limited  (goals.rs:293)
+  * -> active (system), counters over budget, stores budget_limited  (goals.rs:329)
+  budget_limited -> complete (model) stores complete — finishing the work is true
+  regardless of what it cost.
+
+WHAT THE PLAN GOT WRONG, AND WHAT IT DELIBERATELY DIVERGED ON
+-------------------------------------------------------------
+Nothing in the plan was wrong. Two deliberate divergences from codex, both of
+which the plan is right about:
+
+1. The plan requires `create_goal` to replace only a `complete` goal. The prompt
+   says codex's `replace_thread_goal` (goals.rs:156-210) has no status guard —
+   true, but codex has a SECOND function, `insert_thread_goal` (goals.rs:213-269),
+   whose upsert carries exactly `WHERE thread_goals.status = 'complete'`
+   (goals.rs:245). So the guard the plan asks for is codex's, in codex's own SQL;
+   what codex leaves to convention is *which* function the model reaches. This
+   crate moves that from convention into the API's names: `create_goal`
+   (guarded, model-facing) versus `replace_goal_as_system` (unguarded, the
+   user's escape hatch — without it a `blocked` goal would be permanent, since
+   no system status is `complete` and `create_goal` refuses).
+2. The two-scope ownership split is genuinely absent from codex; codex lets any
+   caller name any status and repairs the outcome in SQL. The plan wins.
+
+One nuance worth recording: codex needs a four-valued
+`GoalAccountingMode` (goals.rs:33-38) to decide whether a non-active goal
+accrues usage. Here the counters always accrue — a counter that stops counting
+is a counter nobody can trust, and a turn that finished the goal still had a
+cost — while only the FLIP is restricted to `active`, matching
+goals.rs:526-531. So a completed goal records its final cost without being
+relabelled `budget_limited`
+(store::tests::usage_accumulates_for_a_finished_goal_without_reviving_the_budget_flip).
+
+SCOPE HELD
+----------
+No file outside crates/oc-goal/ was modified except Cargo.lock, which cargo
+regenerated for oc-goal's new dependency list (diff in section 12). oc-db,
+oc-paths, oc-error, oc-engine, oc-tools untouched. No table added to oc-db's
+19-table schema and no migration added there. The goal *tools*, the continuation
+board, the self-restarting loop and the completion-audit rubric are todos 68/69
+and were not built; the store's API is named and doc-commented for those callers
+(`goal`, `create_goal`, `update_status_as_model`, `record_usage`,
+`objective_file`).
+
+================================================================================
+RAW COMMAND OUTPUT FOLLOWS
+================================================================================
+
+########## 1. cargo test -p oc-goal --offline  (unfiltered, every target) ##########
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running unittests src/lib.rs (target/debug/deps/oc_goal-c72b03e71831e27f)
+
+running 44 tests
+test error::tests::a_database_failure_is_not_presented_to_the_model_as_a_refusal ... ok
+test error::tests::a_refused_replacement_names_the_blocking_status_and_the_only_status_that_would_work ... ok
+test status::tests::a_status_outside_the_check_constraint_is_reported_as_unknown ... ok
+test spill::tests::a_pointer_the_model_forged_is_refused_on_all_three_checks ... ok
+test spill::tests::an_objective_that_is_not_a_pointer_resolves_to_no_path ... ok
+test spill::tests::an_empty_or_whitespace_only_objective_is_refused ... ok
+test spill::tests::one_character_over_the_cap_spills_and_the_pointer_round_trips_to_the_file ... ok
+test status::tests::an_unknown_status_from_the_model_is_refused_with_the_model_allowed_values ... ok
+test spill::tests::the_cap_counts_characters_so_a_multibyte_objective_is_not_cut_short ... ok
+test status::tests::every_status_string_round_trips_through_parse_and_serde ... ok
+test spill::tests::a_spill_directory_too_deep_for_the_pointer_fails_without_writing_anything ... ok
+test spill::tests::an_objective_at_the_cap_is_stored_verbatim_and_writes_no_file ... ok
+test status::tests::rendering_one_two_and_many_values_reads_as_a_sentence ... ok
+test status::tests::the_model_scope_is_exactly_blocked_and_complete ... ok
+test status::tests::the_terminal_set_excludes_the_two_statuses_that_are_expected_to_resume ... ok
+test status::tests::the_refusal_for_a_system_owned_status_names_the_two_the_model_may_set ... ok
+test status::tests::the_two_scopes_partition_the_six_statuses_with_no_overlap_and_no_gap ... ok
+test store::tests::the_default_locations_sit_beside_the_session_database_without_being_in_it ... ok
+test store::tests::the_table_declares_the_check_constraint_and_deliberately_no_foreign_key ... ok
+test store::tests::the_budget_flip_is_in_the_recording_statement_and_not_around_it ... ok
+test store::tests::an_empty_objective_is_refused_on_creation_and_on_rewrite ... ok
+test store::tests::exceeding_the_token_budget_flips_the_status_inside_the_recording_statement ... ok
+test store::tests::a_five_thousand_character_objective_spills_and_the_column_holds_the_pointer ... ok
+test store::tests::a_session_with_no_goal_reads_none_and_every_write_reports_none ... ok
+test store::tests::a_budget_of_zero_is_never_observed_as_an_active_goal ... ok
+test store::tests::rewriting_the_objective_keeps_the_goal_instance_and_its_counters ... ok
+test store::tests::the_model_attempting_paused_is_refused_by_name_and_the_goal_is_untouched ... ok
+test store::tests::a_status_outside_the_check_constraint_cannot_be_written_at_all ... ok
+test store::tests::lowering_the_budget_below_what_is_spent_stops_the_goal_in_the_same_statement ... ok
+test store::tests::usage_accumulates_for_a_finished_goal_without_reviving_the_budget_flip ... ok
+test store::tests::two_sessions_keep_independent_goals ... ok
+test store::tests::create_goal_over_an_active_goal_is_refused_and_changes_nothing ... ok
+test store::tests::an_active_goal_is_never_observed_over_its_budget ... ok
+test store::tests::an_oversized_rewrite_spills_just_as_creation_does ... ok
+test store::tests::the_replacement_guard_is_in_the_statement_and_not_around_it ... ok
+test store::tests::replacing_a_complete_goal_resets_both_counters_and_mints_a_new_goal_id ... ok
+test store::tests::negative_deltas_are_clamped_rather_than_persisted ... ok
+test store::tests::only_the_system_replacement_gets_past_a_blocked_goal ... ok
+test store::tests::create_goal_is_refused_over_every_status_except_complete ... ok
+test store::tests::a_goal_survives_a_process_restart_with_its_counters_intact ... ok
+test store::tests::reopening_the_same_file_does_not_disturb_the_stored_goal ... ok
+test store::tests::a_spilled_objective_still_resolves_after_a_restart ... ok
+test store::tests::the_same_matrix_over_a_spent_budget_never_lets_either_scope_clear_the_limit ... ok
+test store::tests::every_transition_from_both_scopes_obeys_the_ownership_split ... ok
+
+test result: ok. 44 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+   Doc-tests oc_goal
+
+running 1 test
+test crates/oc-goal/src/lib.rs - (line 35) ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 0.21s; merged doctests compilation took 0.21s
+
+########## 2. cargo test -p oc-goal store  (the plan's acceptance command) ##########
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running unittests src/lib.rs (target/debug/deps/oc_goal-c72b03e71831e27f)
+
+running 28 tests
+test spill::tests::an_objective_at_the_cap_is_stored_verbatim_and_writes_no_file ... ok
+test store::tests::the_default_locations_sit_beside_the_session_database_without_being_in_it ... ok
+test store::tests::the_table_declares_the_check_constraint_and_deliberately_no_foreign_key ... ok
+test store::tests::an_empty_objective_is_refused_on_creation_and_on_rewrite ... ok
+test store::tests::a_session_with_no_goal_reads_none_and_every_write_reports_none ... ok
+test store::tests::a_five_thousand_character_objective_spills_and_the_column_holds_the_pointer ... ok
+test store::tests::a_budget_of_zero_is_never_observed_as_an_active_goal ... ok
+test store::tests::exceeding_the_token_budget_flips_the_status_inside_the_recording_statement ... ok
+test store::tests::a_status_outside_the_check_constraint_cannot_be_written_at_all ... ok
+test store::tests::the_model_attempting_paused_is_refused_by_name_and_the_goal_is_untouched ... ok
+test store::tests::usage_accumulates_for_a_finished_goal_without_reviving_the_budget_flip ... ok
+test store::tests::an_oversized_rewrite_spills_just_as_creation_does ... ok
+test store::tests::rewriting_the_objective_keeps_the_goal_instance_and_its_counters ... ok
+test store::tests::negative_deltas_are_clamped_rather_than_persisted ... ok
+test store::tests::the_budget_flip_is_in_the_recording_statement_and_not_around_it ... ok
+test store::tests::an_active_goal_is_never_observed_over_its_budget ... ok
+test store::tests::only_the_system_replacement_gets_past_a_blocked_goal ... ok
+test store::tests::replacing_a_complete_goal_resets_both_counters_and_mints_a_new_goal_id ... ok
+test store::tests::the_replacement_guard_is_in_the_statement_and_not_around_it ... ok
+test store::tests::two_sessions_keep_independent_goals ... ok
+test store::tests::create_goal_over_an_active_goal_is_refused_and_changes_nothing ... ok
+test store::tests::lowering_the_budget_below_what_is_spent_stops_the_goal_in_the_same_statement ... ok
+test store::tests::create_goal_is_refused_over_every_status_except_complete ... ok
+test store::tests::a_spilled_objective_still_resolves_after_a_restart ... ok
+test store::tests::a_goal_survives_a_process_restart_with_its_counters_intact ... ok
+test store::tests::reopening_the_same_file_does_not_disturb_the_stored_goal ... ok
+test store::tests::the_same_matrix_over_a_spent_budget_never_lets_either_scope_clear_the_limit ... ok
+test store::tests::every_transition_from_both_scopes_obeys_the_ownership_split ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 16 filtered out; finished in 0.09s
+
+
+########## 3. transition matrix, no budget: 6 from-states x 6 to-states x 2 actors = 72 rows ##########
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running unittests src/lib.rs (target/debug/deps/oc_goal-c72b03e71831e27f)
+
+running 1 test
+Active -> Active | model  | REFUSED (goal status `active` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+Active -> Active | system | allowed, stored Active
+Active -> Paused | model  | REFUSED (goal status `paused` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+Active -> Paused | system | allowed, stored Paused
+Active -> Blocked | model  | allowed, stored Blocked
+Active -> Blocked | system | REFUSED (model-owned status)
+Active -> UsageLimited | model  | REFUSED (goal status `usage_limited` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+Active -> UsageLimited | system | allowed, stored UsageLimited
+Active -> BudgetLimited | model  | REFUSED (goal status `budget_limited` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+Active -> BudgetLimited | system | allowed, stored BudgetLimited
+Active -> Complete | model  | allowed, stored Complete
+Active -> Complete | system | REFUSED (model-owned status)
+Paused -> Active | model  | REFUSED (goal status `active` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+Paused -> Active | system | allowed, stored Active
+Paused -> Paused | model  | REFUSED (goal status `paused` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+Paused -> Paused | system | allowed, stored Paused
+Paused -> Blocked | model  | allowed, stored Blocked
+Paused -> Blocked | system | REFUSED (model-owned status)
+Paused -> UsageLimited | model  | REFUSED (goal status `usage_limited` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+Paused -> UsageLimited | system | allowed, stored UsageLimited
+Paused -> BudgetLimited | model  | REFUSED (goal status `budget_limited` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+Paused -> BudgetLimited | system | allowed, stored BudgetLimited
+Paused -> Complete | model  | allowed, stored Complete
+Paused -> Complete | system | REFUSED (model-owned status)
+Blocked -> Active | model  | REFUSED (goal status `active` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+Blocked -> Active | system | allowed, stored Active
+Blocked -> Paused | model  | REFUSED (goal status `paused` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+Blocked -> Paused | system | allowed, stored Paused
+Blocked -> Blocked | model  | allowed, stored Blocked
+Blocked -> Blocked | system | REFUSED (model-owned status)
+Blocked -> UsageLimited | model  | REFUSED (goal status `usage_limited` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+Blocked -> UsageLimited | system | allowed, stored UsageLimited
+Blocked -> BudgetLimited | model  | REFUSED (goal status `budget_limited` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+Blocked -> BudgetLimited | system | allowed, stored BudgetLimited
+Blocked -> Complete | model  | allowed, stored Complete
+Blocked -> Complete | system | REFUSED (model-owned status)
+UsageLimited -> Active | model  | REFUSED (goal status `active` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+UsageLimited -> Active | system | allowed, stored Active
+UsageLimited -> Paused | model  | REFUSED (goal status `paused` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+UsageLimited -> Paused | system | allowed, stored Paused
+UsageLimited -> Blocked | model  | allowed, stored Blocked
+UsageLimited -> Blocked | system | REFUSED (model-owned status)
+UsageLimited -> UsageLimited | model  | REFUSED (goal status `usage_limited` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+UsageLimited -> UsageLimited | system | allowed, stored UsageLimited
+UsageLimited -> BudgetLimited | model  | REFUSED (goal status `budget_limited` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+UsageLimited -> BudgetLimited | system | allowed, stored BudgetLimited
+UsageLimited -> Complete | model  | allowed, stored Complete
+UsageLimited -> Complete | system | REFUSED (model-owned status)
+BudgetLimited -> Active | model  | REFUSED (goal status `active` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+BudgetLimited -> Active | system | allowed, stored Active
+BudgetLimited -> Paused | model  | REFUSED (goal status `paused` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+BudgetLimited -> Paused | system | allowed, stored BudgetLimited
+BudgetLimited -> Blocked | model  | allowed, stored BudgetLimited
+BudgetLimited -> Blocked | system | REFUSED (model-owned status)
+BudgetLimited -> UsageLimited | model  | REFUSED (goal status `usage_limited` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+BudgetLimited -> UsageLimited | system | allowed, stored UsageLimited
+BudgetLimited -> BudgetLimited | model  | REFUSED (goal status `budget_limited` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+BudgetLimited -> BudgetLimited | system | allowed, stored BudgetLimited
+BudgetLimited -> Complete | model  | allowed, stored Complete
+BudgetLimited -> Complete | system | REFUSED (model-owned status)
+Complete -> Active | model  | REFUSED (goal status `active` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+Complete -> Active | system | allowed, stored Active
+Complete -> Paused | model  | REFUSED (goal status `paused` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+Complete -> Paused | system | allowed, stored Paused
+Complete -> Blocked | model  | allowed, stored Blocked
+Complete -> Blocked | system | REFUSED (model-owned status)
+Complete -> UsageLimited | model  | REFUSED (goal status `usage_limited` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+Complete -> UsageLimited | system | allowed, stored UsageLimited
+Complete -> BudgetLimited | model  | REFUSED (goal status `budget_limited` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+Complete -> BudgetLimited | system | allowed, stored BudgetLimited
+Complete -> Complete | model  | allowed, stored Complete
+Complete -> Complete | system | REFUSED (model-owned status)
+test store::tests::every_transition_from_both_scopes_obeys_the_ownership_split ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 43 filtered out; finished in 0.04s
+
+
+########## 4. transition matrix, budget already spent: 5 from-states x 6 to-states x 2 actors = 60 rows ##########
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running unittests src/lib.rs (target/debug/deps/oc_goal-c72b03e71831e27f)
+
+running 1 test
+Paused -> Active | model  | REFUSED (goal status `active` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+Paused -> Active | system | allowed, stored BudgetLimited
+Paused -> Paused | model  | REFUSED (goal status `paused` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+Paused -> Paused | system | allowed, stored Paused
+Paused -> Blocked | model  | allowed, stored Blocked
+Paused -> Blocked | system | REFUSED (model-owned status)
+Paused -> UsageLimited | model  | REFUSED (goal status `usage_limited` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+Paused -> UsageLimited | system | allowed, stored UsageLimited
+Paused -> BudgetLimited | model  | REFUSED (goal status `budget_limited` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+Paused -> BudgetLimited | system | allowed, stored BudgetLimited
+Paused -> Complete | model  | allowed, stored Complete
+Paused -> Complete | system | REFUSED (model-owned status)
+Blocked -> Active | model  | REFUSED (goal status `active` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+Blocked -> Active | system | allowed, stored BudgetLimited
+Blocked -> Paused | model  | REFUSED (goal status `paused` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+Blocked -> Paused | system | allowed, stored Paused
+Blocked -> Blocked | model  | allowed, stored Blocked
+Blocked -> Blocked | system | REFUSED (model-owned status)
+Blocked -> UsageLimited | model  | REFUSED (goal status `usage_limited` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+Blocked -> UsageLimited | system | allowed, stored UsageLimited
+Blocked -> BudgetLimited | model  | REFUSED (goal status `budget_limited` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+Blocked -> BudgetLimited | system | allowed, stored BudgetLimited
+Blocked -> Complete | model  | allowed, stored Complete
+Blocked -> Complete | system | REFUSED (model-owned status)
+UsageLimited -> Active | model  | REFUSED (goal status `active` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+UsageLimited -> Active | system | allowed, stored BudgetLimited
+UsageLimited -> Paused | model  | REFUSED (goal status `paused` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+UsageLimited -> Paused | system | allowed, stored Paused
+UsageLimited -> Blocked | model  | allowed, stored Blocked
+UsageLimited -> Blocked | system | REFUSED (model-owned status)
+UsageLimited -> UsageLimited | model  | REFUSED (goal status `usage_limited` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+UsageLimited -> UsageLimited | system | allowed, stored UsageLimited
+UsageLimited -> BudgetLimited | model  | REFUSED (goal status `budget_limited` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+UsageLimited -> BudgetLimited | system | allowed, stored BudgetLimited
+UsageLimited -> Complete | model  | allowed, stored Complete
+UsageLimited -> Complete | system | REFUSED (model-owned status)
+BudgetLimited -> Active | model  | REFUSED (goal status `active` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+BudgetLimited -> Active | system | allowed, stored BudgetLimited
+BudgetLimited -> Paused | model  | REFUSED (goal status `paused` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+BudgetLimited -> Paused | system | allowed, stored BudgetLimited
+BudgetLimited -> Blocked | model  | allowed, stored BudgetLimited
+BudgetLimited -> Blocked | system | REFUSED (model-owned status)
+BudgetLimited -> UsageLimited | model  | REFUSED (goal status `usage_limited` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+BudgetLimited -> UsageLimited | system | allowed, stored UsageLimited
+BudgetLimited -> BudgetLimited | model  | REFUSED (goal status `budget_limited` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+BudgetLimited -> BudgetLimited | system | allowed, stored BudgetLimited
+BudgetLimited -> Complete | model  | allowed, stored Complete
+BudgetLimited -> Complete | system | REFUSED (model-owned status)
+Complete -> Active | model  | REFUSED (goal status `active` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+Complete -> Active | system | allowed, stored BudgetLimited
+Complete -> Paused | model  | REFUSED (goal status `paused` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+Complete -> Paused | system | allowed, stored Paused
+Complete -> Blocked | model  | allowed, stored Blocked
+Complete -> Blocked | system | REFUSED (model-owned status)
+Complete -> UsageLimited | model  | REFUSED (goal status `usage_limited` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+Complete -> UsageLimited | system | allowed, stored UsageLimited
+Complete -> BudgetLimited | model  | REFUSED (goal status `budget_limited` is the system's to set, not the model's; the model may set only `blocked` or `complete`)
+Complete -> BudgetLimited | system | allowed, stored BudgetLimited
+Complete -> Complete | model  | allowed, stored Complete
+Complete -> Complete | system | REFUSED (model-owned status)
+test store::tests::the_same_matrix_over_a_spent_budget_never_lets_either_scope_clear_the_limit ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 43 filtered out; finished in 0.03s
+
+
+########## 5. 5,000-character objective spills; the stored pointer sentence, verbatim ##########
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running unittests src/lib.rs (target/debug/deps/oc_goal-c72b03e71831e27f)
+
+running 1 test
+submitted objective: 5500 characters
+stored objective:    121 characters
+stored objective:    Read the full goal objective at /tmp/.tmpSBrfOX/00580acc-d65a-4d06-86ab-8a7a4ce337e7/goal-objective.md before continuing.
+test store::tests::a_five_thousand_character_objective_spills_and_the_column_holds_the_pointer ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 43 filtered out; finished in 0.00s
+
+
+########## 6. restart survival with counters intact ##########
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running unittests src/lib.rs (target/debug/deps/oc_goal-c72b03e71831e27f)
+
+running 2 tests
+test store::tests::a_spilled_objective_still_resolves_after_a_restart ... ok
+before restart: Goal { session_id: "ses_goal_matrix", goal_id: "d7cf4a1b-972d-4166-a224-b405faa7d04a", objective: "outlive the process", status: Paused, token_budget: Some(1000), tokens_used: 250, time_used_seconds: 61, created_at_ms: 1785982410163, updated_at_ms: 1785982410163 }
+after restart:  Goal { session_id: "ses_goal_matrix", goal_id: "d7cf4a1b-972d-4166-a224-b405faa7d04a", objective: "outlive the process", status: Paused, token_budget: Some(1000), tokens_used: 250, time_used_seconds: 61, created_at_ms: 1785982410163, updated_at_ms: 1785982410163 }
+test store::tests::a_goal_survives_a_process_restart_with_its_counters_intact ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.03s
+
+
+########## 7. the budget flip and the guarded replace, proven at the SQL level ##########
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running unittests src/lib.rs (target/debug/deps/oc_goal-c72b03e71831e27f)
+
+running 5 tests
+test store::tests::create_goal_over_an_active_goal_is_refused_and_changes_nothing ... ok
+test store::tests::the_budget_flip_is_in_the_recording_statement_and_not_around_it ... ok
+test store::tests::exceeding_the_token_budget_flips_the_status_inside_the_recording_statement ... ok
+test store::tests::the_replacement_guard_is_in_the_statement_and_not_around_it ... ok
+test store::tests::create_goal_is_refused_over_every_status_except_complete ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 39 filtered out; finished in 0.01s
+
+
+########## 8. the table: CHECK constraint present, no FOREIGN KEY, one table in its own file ##########
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running unittests src/lib.rs (target/debug/deps/oc_goal-c72b03e71831e27f)
+
+running 3 tests
+test store::tests::the_default_locations_sit_beside_the_session_database_without_being_in_it ... ok
+test store::tests::the_table_declares_the_check_constraint_and_deliberately_no_foreign_key ... ok
+test store::tests::a_status_outside_the_check_constraint_cannot_be_written_at_all ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 41 filtered out; finished in 0.00s
+
+
+########## 9. cargo build --workspace --offline ##########
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.57s
+
+########## 10. cargo clippy --workspace --all-targets --offline ##########
+    Checking oc-goal v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t67/crates/oc-goal)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.97s
+clippy warning/error lines: 0
+
+########## 11. cargo fmt --all --check ##########
+fmt exit: 0
+
+########## 12. cargo metadata --locked --offline ##########
+metadata --locked exit: 0
+metadata --locked exit (re-run, stale-exit-code guard): 0
+
+--- oc-goal's Cargo.lock entry ---
+diff --git a/Cargo.lock b/Cargo.lock
+index d1d75e7..ebc6a12 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2022,6 +2022,17 @@ dependencies = [
+ [[package]]
+ name = "oc-goal"
+ version = "0.1.0"
++dependencies = [
++ "oc-db",
++ "oc-error",
++ "oc-paths",
++ "rusqlite",
++ "serde",
++ "serde_json",
++ "tempfile",
++ "thiserror 2.0.19",
++ "uuid",
++]
+ 
+ [[package]]
+ name = "oc-llm"
+
+--- git status ---
+ M Cargo.lock
+ M crates/oc-goal/Cargo.toml
+ M crates/oc-goal/src/lib.rs
+?? crates/oc-goal/src/error.rs
+?? crates/oc-goal/src/spill.rs
+?? crates/oc-goal/src/status.rs
+?? crates/oc-goal/src/store.rs
+?? crates/oc-goal/src/store_tests.rs

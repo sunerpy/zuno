@@ -1,0 +1,214 @@
+================================================================================
+TASK 38 — crates/oc-tool: tool trait with schemars schemas + central augmentation
+worktree /config/workspace/ProdDir/AI/oc-wt/t38  branch task-38  base 60c1d4c
+date 2026-08-05T18:10:43+00:00   rustc rustc 1.96.0 (ac68faa20 2026-05-25)
+================================================================================
+
+### AC1  cargo test -p oc-tool
+running 47 tests
+test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 8 tests
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 7 tests
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 8 tests
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 2 tests
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+### AC2  the injected intent is present AND in required
+test the_injected_intent_is_present_and_required ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+### AC3  the guard-key suite (tests/guard_key.rs)
+test no_guard_reads_a_key_the_schema_does_not_advertise ... ok
+test every_injected_key_is_read_by_a_guard ... ok
+test stripping_removes_exactly_the_advertised_keys_and_leaves_the_tools_own ... ok
+test the_declared_key_list_matches_what_augmentation_actually_injects ... ok
+test the_intent_guard_reads_exactly_the_injected_intent_key ... ok
+test the_guarded_keys_reach_proxied_tools_too ... ok
+test the_wire_spelling_of_both_keys_is_pinned ... ok
+test the_oversized_output_guard_reads_exactly_the_injected_escape_hatch_key ... ok
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+### AC4  oversized output DETECTED + full text RETRIEVABLE (no truncation asserted)
+test a_byte_overflow_is_detected_even_when_the_line_count_fits ... ok
+test multibyte_output_is_measured_in_bytes_so_a_budget_cannot_be_overrun ... ok
+test output_within_the_limits_is_not_flagged ... ok
+test detection_and_storage_leave_the_text_exactly_as_produced ... ok
+test the_thresholds_come_from_configuration_and_default_to_the_oracles ... ok
+test several_spills_in_one_result_are_all_retrievable ... ok
+test oversized_output_is_detected_and_the_full_text_is_retrievable_afterwards ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+### AC5  augmentation byte cost per tool per request
+augmentation cost: 237 bytes (373 -> 610)
+
+### AC6  cargo build --workspace
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.18s
+
+### AC7  cargo clippy --workspace --all-targets  (empty == zero warnings)
+warning+error lines: 0
+
+### AC8  cargo fmt --all --check  (empty == clean)
+diff lines: 0
+
+### AC9  no workspace regression
+workspace passed: 1152  failed: 0  (main was 1081)
+
+================================================================================
+QA SCENARIO 1 (happy) — a tool defined with ONLY a params struct produces a
+valid JSON Schema, with no hand-written JSON anywhere in the tool's source.
+Scratch test file used: crates/oc-tool/tests/qa_happy.rs (removed after the run).
+================================================================================
+
+--- the entire tool definition (note: zero json! / zero schema literals) ---
+//! QA happy path: a tool defined with ONLY a params struct produces a valid JSON
+//! Schema. Not one line of hand-written JSON appears anywhere in this file.
+use async_trait::async_trait;
+use oc_error::ToolError;
+use oc_tool::{ToolContext, ToolOutput, TypedTool, erase};
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GrepParams {
+    /// The regex to search for.
+    pattern: String,
+    /// Restrict to files matching this glob.
+    #[serde(default)]
+    include: Option<String>,
+    /// Cap the number of matches.
+    #[serde(default)]
+    head_limit: Option<u32>,
+}
+
+struct Grep;
+
+#[async_trait]
+impl TypedTool for Grep {
+    type Params = GrepParams;
+    fn id(&self) -> &str { "grep" }
+    fn description(&self) -> &str { "Search file contents with a regex." }
+    async fn run(&self, p: GrepParams, _c: ToolContext) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text("grep", format!("{} {:?} {:?}", p.pattern, p.include, p.head_limit)))
+    }
+}
+
+#[test]
+fn qa_happy_schema_from_a_params_struct_alone() {
+    let d = erase(Grep).definition();
+    println!("id          = {}", d.id);
+    println!("description = {}", d.description);
+    println!("{}", serde_json::to_string_pretty(&d.parameters).unwrap());
+
+    assert_eq!(d.parameters["type"], "object");
+    assert_eq!(d.parameters["properties"]["pattern"]["type"], "string");
+    assert_eq!(d.parameters["properties"]["intent"]["type"], "string");
+    assert_eq!(d.parameters["properties"]["accept_large_output"]["type"], "boolean");
+    let required: Vec<&str> = d.parameters["required"].as_array().unwrap()
+        .iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(required, vec!["pattern", "intent"]);
+    println!("\nVERDICT: valid object schema, zero hand-written JSON in this file.");
+}
+
+--- cargo test -p oc-tool --test qa_happy -- --nocapture ---
+running 1 test
+id          = grep
+description = Search file contents with a regex.
+{
+  "additionalProperties": false,
+  "properties": {
+    "accept_large_output": {
+      "description": "Re-run accepting the stated token cost of a withheld result.",
+      "type": "boolean"
+    },
+    "head_limit": {
+      "default": null,
+      "description": "Cap the number of matches.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "include": {
+      "default": null,
+      "description": "Restrict to files matching this glob.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "intent": {
+      "description": "Required short label shown in the UI: why this call is being made.",
+      "type": "string"
+    },
+    "pattern": {
+      "description": "The regex to search for.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "pattern",
+    "intent"
+  ],
+  "type": "object"
+}
+
+VERDICT: valid object schema, zero hand-written JSON in this file.
+test qa_happy_schema_from_a_params_struct_alone ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+OBSERVATION: schemars derived pattern/include/head_limit, their descriptions from
+the doc comments, optionality from Option<T>, and additionalProperties:false from
+#[serde(deny_unknown_fields)]. intent + accept_large_output were injected centrally
+by Tool::definition, not by the tool. required == ["pattern","intent"].
+
+================================================================================
+QA SCENARIO 2 (failure) — a params struct field renamed WITHOUT updating callers
+fails to compile rather than drifting silently.
+Rename applied: GrepParams.pattern -> GrepParams.query; the consumer in run() was
+left reaching for the old name. Scratch file crates/oc-tool/tests/qa_drift.rs.
+================================================================================
+
+--- cargo test -p oc-tool --test qa_drift --no-run ---
+   Compiling oc-tool v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t38/crates/oc-tool)
+error[E0609]: no field `pattern` on type `GrepParams`
+  --> crates/oc-tool/tests/qa_drift.rs:25:39
+   |
+25 |         Ok(ToolOutput::text("grep", p.pattern))
+   |                                       ^^^^^^^ unknown field
+   |
+   = note: available field is: `query`
+
+For more information about this error, try `rustc --explain E0609`.
+error: could not compile `oc-tool` (test "qa_drift") due to 1 previous error
+
+OBSERVATION: E0609 at the consumer. Because the schema is DERIVED from GrepParams,
+renaming the field moved the schema and the deserializer in one edit; the only
+thing left stale was code, and code is what the compiler checks.
+
+--- CONTRAST: the same rename under claw-code's two-artifact pattern ---
+(hand-written json! schema beside an independent serde struct)
+
+running 1 test
+compiled cleanly       : yes
+schema advertises      : pattern
+deserializer expects   : query
+advertised == accepted : false
+decode of a schema-valid call: Some("missing field `query`")
+test qa_the_anti_pattern_drifts_silently ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+OBSERVATION: it COMPILES CLEANLY. The schema still advertises `pattern`, the
+deserializer now wants `query`, and every schema-valid call the model makes is
+rejected at runtime with "missing field `query`". Nothing fails at build time.
+That is the defect this todo exists to prevent; claw-code has 250 json! literals
+and 61 "type": "object" schemas exposed to it in one file.

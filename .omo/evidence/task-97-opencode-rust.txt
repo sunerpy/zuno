@@ -1,0 +1,106 @@
+Task 97 — terminal-lease protocol with fake-owner verification
+Branch task-97, worktree /config/workspace/ProdDir/AI/oc-wt/t97, base f0636b6
+
+PLAN DEFECT
+The todo title says crates/oc-tui/src/terminal_lease.rs. Its own body says
+"Must NOT put the trait in oc-tui", its parenthetical says "interface defined in
+oc-engine", and its acceptance criterion requires cargo tree -p oc-plugin to show
+no oc-tui and no ratatui. Title is wrong; the trait went to oc-engine. No file was
+created under crates/oc-tui/.
+
+WHERE THE PIECES LANDED
+  crates/oc-engine/src/terminal_lease.rs   protocol (new, 786 lines incl. tests)
+  crates/oc-engine/src/lib.rs              + pub mod terminal_lease;
+  crates/oc-testkit/src/terminal_owner.rs  FakeTerminalOwner (new)
+  crates/oc-testkit/src/lib.rs             + mod + re-export
+  crates/oc-testkit/Cargo.toml             + async-trait, oc-engine
+  crates/oc-plugin/tests/terminal_lease.rs 11 tests (new)
+  crates/oc-plugin/Cargo.toml              + oc-testkit, toml (dev only)
+oc-plugin/src/*.rs untouched (t58 is live there).
+
+CONCURRENT-ACQUIRE POLICY: REFUSAL
+A second acquire against a live lease returns TerminalLeaseError::Busy naming the
+holder. Not queueing (a queued device-code prompt arrives with no context on a
+terminal the user left, and a never-releasing host would turn every later acquire
+back into a hang — the exact defect the lease removes). Not preemption (revoking
+mid-prompt yanks the terminal from under half-typed input). The only involuntary
+transition is the deadline.
+
+FORCE-RECLAIM OWNER: TWO PATHS, ONE SETTLE-ONCE FLAG
+1. A watchdog tokio task spawned per grant, cancelled by the guard's oneshot
+   sender being dropped (so a panic unwind also cancels it).
+2. A sweep at the top of acquire, plus the public reclaim_if_expired().
+Both AtomicBool::swap the same flag, so reclaim_terminal runs exactly once per
+grant. Path 2 exists because path 1 needs a live Tokio runtime; acquire uses
+Handle::try_current and degrades to sweep-only rather than panicking.
+
+FORCE-RECLAIM DIAGNOSTIC (verbatim, ForcedReclaim::Display)
+plugin `kiro` held the terminal for `device-code prompt` past its 0 ms deadline and did not release it; the terminal was reclaimed by force
+
+NO-oc-tui CHECK IS MECHANICAL
+terminal_lease_keeps_the_plugin_crate_away_from_the_tui_and_ratatui walks every
+crates/*/Cargo.toml, builds the first-party dependency graph (runtime + dev +
+build), BFS-closes it from oc-plugin, and fails if oc-tui, ratatui or crossterm
+appears. Three floor assertions stop a vacuous pass: >=33 crates scanned, both
+oc-plugin and oc-tui present, and ratatui+crossterm reachable from oc-tui. It
+reads manifests instead of shelling out to cargo tree because spawning cargo
+inside a cargo test run can block on the shared build-directory lock.
+
+TEST COUNTS
+  cargo test -p oc-plugin   0+2+2+2+11+0  = 17 (was 6 from t57; +11 new)
+  cargo test -p oc-engine   20+5+9+2+5+3+9+4+7+0 = 64 (lib was 12, now 20; +8 new)
+  cargo test -p oc-testkit  98+0+7+3+2 = 110 (lib was 94, now 98; +4 new)
+  cargo test -p oc-plugin terminal_lease -> 11 passed; 0 failed; 0 filtered out
+  cargo test -p oc-engine terminal_lease -> 8 passed; 0 failed; 12 filtered out
+
+cargo tree -p oc-plugin  (559 lines; first-party subset, full grep below)
+  oc-plugin -> oc-auth oc-config oc-db oc-engine oc-error oc-llm oc-paths
+               oc-permission oc-tool  (+dev: oc-testkit)
+  $ cargo tree -p oc-plugin -e normal,build,dev | grep -iE 'oc-tui|ratatui|crossterm'
+  (no matches)
+
+GATES
+  cargo build --workspace --offline            Finished, clean
+  cargo clippy --workspace --all-targets       0 warning/error lines
+  cargo fmt --all --check                      clean
+  cargo metadata --locked --offline            OK
+  [dev-]dependencies table count per manifest  2 each (no duplicates)
+  Also green: oc-catalog oc-config oc-llm oc-provider-{anthropic,bedrock,
+  compatible,google,openai} oc-tools — every crate that dev-depends on oc-testkit,
+  since oc-testkit gained an oc-engine edge (dev-dep cycles, cargo-legal).
+
+MUTATION PROOF 1 — disable force-reclaim
+  SharedSlot::reclaim_if_expired -> `return None;`
+  test result: FAILED. 8 passed; 3 failed
+    terminal_lease_force_reclaims_a_host_that_never_releases FAILED
+      "a lease held past its deadline must be reclaimed"
+    terminal_lease_watchdog_reclaims_without_anyone_asking FAILED
+    terminal_lease_expired_holder_does_not_block_the_next_host FAILED
+  restored -> 11 passed
+
+MUTATION PROOF 2 — break the Drop release
+  removed the reclaim_terminal call from TerminalLeaseGuard::drop
+  test result: FAILED. 7 passed; 4 failed
+    terminal_lease_acquire_and_release_are_observed_in_order FAILED
+      assertion `left == right` failed: release must follow acquire, and must not be a force-reclaim
+        left: [Acquired { plugin: "kiro", purpose: "device-code prompt" }]
+       right: [Acquired { plugin: "kiro", purpose: "device-code prompt" }, Released { plugin: "kiro" }]
+    terminal_lease_releases_when_the_guard_goes_out_of_scope FAILED
+    terminal_lease_happy_path_runs_a_fake_prompt_between_both_transitions FAILED
+    terminal_lease_expired_holder_does_not_block_the_next_host FAILED
+  restored -> 11 passed
+
+CONCURRENCY 3x6
+  oc-plugin: 18 runs, all `0` FAILED suites
+  oc-engine: 18 runs, all `0` FAILED suites
+  No bare sleep as synchronisation. Timeout is injected via
+  TerminalBroker::with_timeout; the deterministic reclaim tests use
+  Duration::ZERO (already expired on return, no timer at all), the watchdog test
+  uses a 5 ms lease with a 10 s bounded-poll observation budget, and the
+  must-not-reclaim tests use a 3600 s deadline. Load can only make a timer late,
+  so every direction is one-sided.
+
+NOT PROVEN HERE (by design)
+Suspending ratatui, restoring cooked mode, a real bun/node child seeing the freed
+TTY, and the redraw after reclaim. Those need a terminal and are todo 73 / the
+compat suite. No test here touches a TTY or a pty.

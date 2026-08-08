@@ -1,0 +1,400 @@
+================================================================================
+TASK 23 — crates/oc-snapshot: per-project git object store, patch/diff, hourly GC
+worktree /config/workspace/ProdDir/AI/oc-wt/t23  branch task-23
+date 2026-08-05T10:40:33Z
+oracle /config/workspace/ProdDir/AI/opencode @ aefaf140c1 (v1.18.13)
+real binary /config/.local/share/mise/installs/opencode/1.18.12/opencode (reports 1.18.12)
+rustc rustc 1.96.0 (ac68faa20 2026-05-25)  git git version 2.43.0
+================================================================================
+
+== A. OBSERVED STORE PATH (ground truth, not inferred) =========================
+fixture worktree: /tmp/opencode/obs23/wt (git repo, one commit, no remote)
+command: cd $WT && XDG_DATA_HOME=/tmp/opencode/obs23/xdg-data opencode debug snapshot track
+stdout : 2e81171448eb9f2ee3821e3d447aa6b2fe3ddba1
+directory the real binary created:
+/tmp/opencode/obs23/xdg-data/opencode/snapshot
+/tmp/opencode/obs23/xdg-data/opencode/snapshot/441e482eeb9a551532d4ef8320edce003aad21d3
+/tmp/opencode/obs23/xdg-data/opencode/snapshot/441e482eeb9a551532d4ef8320edce003aad21d3/8aef7515c5d209dba568d82622ef121a8e84cd17
+
+component 1 = projectID = 441e482eeb9a551532d4ef8320edce003aad21d3
+  $ git -C /tmp/opencode/obs23/wt rev-list --max-parents=0 HEAD
+441e482eeb9a551532d4ef8320edce003aad21d3
+  (no remote => root-commit id; also cached at .git/opencode)
+component 2 = 8aef7515c5d209dba568d82622ef121a8e84cd17
+  $ printf '%s' '/tmp/opencode/obs23/wt' | sha1sum
+8aef7515c5d209dba568d82622ef121a8e84cd17  -
+  => sha1(worktree absolute path STRING), lowercase hex, NOT normalized, NOT canonicalized.
+  oracle: packages/opencode/src/snapshot/index.ts:71
+    path.join(Global.Path.data, "snapshot", ctx.project.id, Hash.fast(ctx.worktree))
+  packages/core/src/util/hash.ts: Hash.fast = createHash("sha1").digest("hex")
+  => oc_paths::Layout::snapshot_store() already implements this; consumed, not re-derived.
+
+store config the real binary wrote:
+[core]
+	repositoryformatversion = 0
+	filemode = true
+	bare = false
+	logallrefupdates = true
+	worktree = /tmp/opencode/obs23/wt
+	autocrlf = false
+	longpaths = true
+	symlinks = true
+	fsmonitor = false
+	untrackedCache = true
+[feature]
+	manyFiles = true
+[index]
+	version = 4
+	threads = true
+objects/info/alternates:
+/tmp/opencode/obs23/wt/.git/objects
+
+== B. ACCEPTANCE: cargo test -p oc-snapshot ====================================
+$ cargo test -p oc-snapshot
+running 29 tests
+test gc::tests::the_default_cadence_is_the_oracle_cadence ... ok
+test refcount::tests::a_worktree_hash_is_forty_lowercase_hex_digits ... ok
+test git::tests::split_nul_drops_the_trailing_empty_field ... ok
+test git::tests::oracle_flag_sets_match_index_ts_25_to_27 ... ok
+test store::tests::init_config_matches_the_oracle_list_and_order ... ok
+test store::tests::oracle_gc_parameters_are_carried_verbatim ... ok
+test git::tests::pathspecs_are_nul_separated_and_literal ... ok
+test refcount::tests::the_key_matches_the_observed_store_path ... ok
+test git::tests::a_path_with_a_space_and_a_quote_stays_one_argument ... ok
+test store::tests::scoped_puts_config_flags_before_the_git_dir ... ok
+test store::tests::gc_on_a_missing_store_is_a_no_op ... ok
+test store::tests::the_store_path_is_project_id_then_worktree_hash ... ok
+test error::tests::store_failures_name_the_operation_and_the_path ... ok
+test error::tests::a_signal_death_is_reported_as_a_signal ... ok
+test error::tests::git_failure_names_the_command_and_the_code ... ok
+test store::tests::disabled_locations_do_not_track_or_gc ... ok
+test refcount::tests::a_missing_root_has_no_stores ... ok
+test refcount::tests::a_referenced_store_that_does_not_exist_yet_is_reported_as_absent ... ok
+test refcount::tests::discovery_skips_directories_that_are_not_store_shaped ... ok
+test refcount::tests::a_different_worktree_in_the_same_project_is_a_different_store ... ok
+test refcount::tests::two_sessions_in_one_worktree_share_one_store ... ok
+test refcount::tests::an_unreferenced_store_is_reported_but_not_removed ... ok
+test lock::tests::different_directories_do_not_block_each_other ... ok
+test lock::tests::the_same_directory_maps_to_the_same_mutex ... ok
+test lock::tests::a_second_acquire_of_one_directory_waits ... ok
+test git::tests::run_captures_stdout_and_reports_the_exit_status ... ok
+test git::tests::run_forwards_stdin_to_the_child ... ok
+test gc::tests::the_first_pass_waits_a_minute_then_repeats_hourly ... ok
+test gc::tests::shutdown_stops_the_loop ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/store.rs (/config/workspace/ProdDir/AI/opencode-rust/target/debug/deps/store-9d190b01bb2e1f7b)
+
+running 13 tests
+test a_store_is_reference_counted_across_projects_without_being_touched ... ok
+test discovery_keys_the_store_on_the_projects_root_commit ... ok
+test diff_is_empty_when_the_worktree_is_unchanged ... ok
+test one_store_serves_every_session_in_a_worktree ... ok
+test gitignored_files_stay_out_of_the_snapshot ... ok
+test a_second_track_records_the_mutation ... ok
+test restore_keeps_files_created_after_the_snapshot ... ok
+test a_hostile_worktree_path_is_not_interpreted_by_a_shell ... ok
+test large_untracked_files_are_excluded_instead_of_stored ... ok
+test gc_prunes_unreachable_objects_and_never_removes_the_store ... ok
+test tracks_mutates_diffs_and_restores ... ok
+test gc_keeps_an_unreachable_object_inside_the_prune_window ... ok
+test gc_reclaims_a_snapshot_superseded_more_than_the_prune_window_ago ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+   Doc-tests oc_snapshot
+
+running 1 test
+test crates/oc-snapshot/src/lib.rs - (line 23) - compile ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 0.53s; merged doctests compilation took 0.53s
+
+== C. ZERO-WARNING GATES =======================================================
+$ cargo build --workspace
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.19s
+$ cargo clippy --workspace --all-targets
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.25s
+(no 'warning:' lines in the above => zero warnings)
+$ cargo clippy --workspace --all-targets 2>&1 | grep -c '^warning'
+0
+$ cargo fmt --all -- --check ; echo exit=$?
+exit=0
+
+$ cargo test --workspace   (regression: 789 on main -> now)
+total passed: 832
+suites with failures: 0
+(789 baseline + 43 new oc-snapshot tests = 832)
+
+== D. QA HAPPY PATH — differential vs the real binary ==========================
+driver: /tmp/opencode/diffqa (throwaway crate, path-dep on this worktree's oc-snapshot),
+        argv = <snapshot-root> <cwd> <track|diff|patch|restore|store|gc> [hash]
+        it is the same surface as debug/snapshot.ts:7-41 (track / patch <hash> / diff <hash>).
+fixture: /tmp/opencode/qa2/wt  (a.txt, src/main.rs, .gitignore with build/)
+
+-- store path agreement (same data root, both implementations) --
+$ XDG_DATA_HOME=/tmp/opencode/qa2/ts opencode debug snapshot track
+16b16b2e24aca0b47146e43f3162a4f87e27ae47
+real binary store dir : /tmp/opencode/qa2/ts/opencode/snapshot/f45f1ce5e114bed9249ebd52eae0123f8b78c86b/68913258e2cd13b5e8a57c42232f694c042c9444
+rust store dir        : /tmp/opencode/qa2/ts/opencode/snapshot/f45f1ce5e114bed9249ebd52eae0123f8b78c86b/68913258e2cd13b5e8a57c42232f694c042c9444
+RESULT: PATHS MATCH
+
+-- track hash agreement (independent roots, identical worktree state) --
+real binary track: 16b16b2e24aca0b47146e43f3162a4f87e27ae47
+rust track       : 16b16b2e24aca0b47146e43f3162a4f87e27ae47
+RESULT: TREE HASHES MATCH
+
+-- mutation: edit a.txt, edit src/main.rs, add added.txt, add ignored build/out.o --
+$ opencode debug snapshot diff 16b16b2e24aca0b47146e43f3162a4f87e27ae47   >  ts.diff
+$ diffqa <root> <wt> diff 16b16b2e24aca0b47146e43f3162a4f87e27ae47        >  rs.diff
+$ diff -u ts.diff rs.diff
+(no output) RESULT: DIFFS BYTE-IDENTICAL, 426 bytes
+
+the shared diff text:
+diff --git a/a.txt b/a.txt
+index 85c3040..3cc64f7 100644
+--- a/a.txt
++++ b/a.txt
+@@ -1,3 +1,4 @@
+ alpha
+-beta
++BETA
+ gamma
++delta
+diff --git a/added.txt b/added.txt
+new file mode 100644
+index 0000000..d5a09df
+--- /dev/null
++++ b/added.txt
+@@ -0,0 +1 @@
++brand new
+diff --git a/src/main.rs b/src/main.rs
+index f328e4d..7b16f1f 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1 +1 @@
+-fn main() {}
++fn main() { println!("hi"); }
+
+note: gitignored build/out.o is absent from both, as required.
+
+-- patch <hash>: same file set (real binary prints a JS object literal, rust prints JSON) --
+$ opencode debug snapshot patch 16b16b2e24aca0b47146e43f3162a4f87e27ae47
+{
+  hash: "16b16b2e24aca0b47146e43f3162a4f87e27ae47",
+  files: [ "/tmp/opencode/qa2/wt/a.txt", "/tmp/opencode/qa2/wt/added.txt", "/tmp/opencode/qa2/wt/src/main.rs" ],
+}
+$ diffqa <root> <wt> patch 16b16b2e24aca0b47146e43f3162a4f87e27ae47
+{
+  "hash": "16b16b2e24aca0b47146e43f3162a4f87e27ae47",
+  "files": [
+    "/tmp/opencode/qa2/wt/a.txt",
+    "/tmp/opencode/qa2/wt/added.txt",
+    "/tmp/opencode/qa2/wt/src/main.rs"
+  ]
+}
+RESULT: PATCH FILE SETS IDENTICAL (3 files, ignored build/out.o excluded)
+
+-- deletion is represented identically --
+RESULT: DELETION DIFFS BYTE-IDENTICAL
+diff --git a/a.txt b/a.txt
+deleted file mode 100644
+index 85c3040..0000000
+--- a/a.txt
++++ /dev/null
+
+-- rust restore brings content back --
+$ diffqa <root> <wt> restore 16b16b2e24aca0b47146e43f3162a4f87e27ae47
+a.txt      : alpha|beta|gamma|   (was deleted, now restored)
+src/main.rs: fn main() {}
+added.txt still present: yes   (restore = read-tree + checkout-index; deleting extras is revert's job, todo 74)
+diff after restore lists only added.txt:
+diff --git a/added.txt b/added.txt
+new file mode 100644
+index 0000000..d5a09df
+--- /dev/null
++++ b/added.txt
+@@ -0,0 +1 @@
++brand new
+
+== E. QA FAILURE PATH — hostile worktree path, no injection, no breakage ========
+worktree path (contains a space, a single quote, a double quote, $(...), a backtick target, and a ; rm -rf .):
+  [/tmp/opencode/hostile3/it's a $(touch pwned) "work" tree; rm -rf .]
+
+$ opencode debug snapshot track   -> 42d4c5245460645340a0b5b189f055b93cca0f7e
+$ diffqa <root> <wt> track        -> 42d4c5245460645340a0b5b189f055b93cca0f7e
+RESULT: HOSTILE-PATH TREE HASHES MATCH
+real store dir: /tmp/opencode/hostile3/tsdata/opencode/snapshot/f150426d7c8cc67fd7fcae8902efa187cd95a5f0/530e2387e71bafbe7cafe8a1b46f57de3d7e5af5
+rust store dir: /tmp/opencode/hostile3/rsdata/snapshot/f150426d7c8cc67fd7fcae8902efa187cd95a5f0/530e2387e71bafbe7cafe8a1b46f57de3d7e5af5
+  (same two components: projectID / sha1(worktree))
+
+-- second injection surface: a hostile FILENAME inside the worktree --
+created: [a file's; rm -rf $HOME `id`.txt]
+$ diff -u ts.diff rs.diff
+(no output) RESULT: HOSTILE-PATH DIFFS BYTE-IDENTICAL, 307 bytes
+diff --git a/a file's; rm -rf $HOME `id`.txt b/a file's; rm -rf $HOME `id`.txt
+new file mode 100644
+index 0000000..c2981a9
+--- /dev/null
++++ b/a file's; rm -rf $HOME `id`.txt	
+@@ -0,0 +1 @@
++payload
+diff --git a/a.txt b/a.txt
+index 4a58007..fbbee86 100644
+--- a/a.txt
++++ b/a.txt
+@@ -1 +1,2 @@
+ alpha
++beta
+
+-- restore and gc on the hostile path --
+a.txt after restore        : alpha
+hostile filename preserved : payload
+$ diffqa <root> <wt> gc -> Collected
+store dir after gc         : present
+
+-- canaries: nothing was interpreted by a shell --
+  $(touch pwned) in worktree : absent
+  $(touch pwned) in $H       : absent
+  $(touch pwned) in $PWD     : absent
+  '; rm -rf .' did not run    : a.txt present = yes
+  'rm -rf $HOME' did not run  : $HOME present = yes
+RESULT: no command substitution, no word splitting, no injection.
+mechanism: std::process::Command::args(&[OsString]) -> execvp argv; filenames never become
+  arguments at all, they travel on stdin as NUL-separated :(top,literal) pathspecs.
+
+== F. GC BEHAVIOUR, MEASURED ===================================================
+oracle parameters: index.ts:23 prune = "7.days"; :300-316 cleanup() = git gc --prune=7.days,
+  guarded by exists(gitdir) and enabled(), failure logged and tolerated;
+  :761-766 cadence = Effect.delay(1 minute) then Schedule.spaced(1 hour), forkScoped.
+
+measured with real git 2.43.0 (drives the two gc tests):
+  1. git gc REPACKS loose objects, unreachable ones into a cruft pack (.mtimes),
+     so a vanished loose file is NOT evidence of reclamation. Tests use cat-file -e.
+  2. an unreachable object inside the 7-day window survives (repacked, retrievable).
+  3. an unreachable object older than 7 days is reclaimed (cat-file -e fails).
+  4. the LATEST snapshot tree is reachable via the index cache-tree and always survives;
+     a SUPERSEDED tree older than 7 days is reclaimed  => a de-facto 7-day revert horizon.
+  5. the store directory, objects/, config and index survive every gc.
+
+the three gc tests that encode the above:
+  gc_prunes_unreachable_objects_and_never_removes_the_store
+  gc_keeps_an_unreachable_object_inside_the_prune_window
+  gc_reclaims_a_snapshot_superseded_more_than_the_prune_window_ago
+cadence tests (tokio paused clock, no real waiting):
+  gc::tests::the_first_pass_waits_a_minute_then_repeats_hourly  (0s:0, 61s:1, +1h:2, +1h:3)
+  gc::tests::the_default_cadence_is_the_oracle_cadence
+
+== G. REFERENCE-COUNT QUERY (consumed by todo 83) ==============================
+pub struct StoreKey       { pub project_id: String, pub worktree_hash: String }
+pub struct SessionRef     { pub session_id: String, pub project_id: String, pub worktree: PathBuf }
+pub struct StoreReferences{ pub key: StoreKey, pub path: PathBuf, pub on_disk: bool,
+                            pub sessions: BTreeSet<String> }
+impl StoreReferences { pub fn count(&self) -> usize; pub fn is_referenced(&self) -> bool }
+
+pub fn discover_stores(root: &Path) -> Result<Vec<StoreKey>>;
+pub fn reference_counts<I: IntoIterator<Item = SessionRef>>(root: &Path, sessions: I)
+    -> Result<Vec<StoreReferences>>;
+pub fn unreferenced_stores<I: IntoIterator<Item = SessionRef>>(root: &Path, sessions: I)
+    -> Result<Vec<StoreReferences>>;
+pub fn is_worktree_hash(name: &str) -> bool;   // 40 lowercase hex, strict
+
+properties proven by test:
+  two sessions in one worktree yield ONE StoreReferences with count()==2 (not one store each)
+  a different worktree in the same project is a different store
+  a store no surviving session references is REPORTED and still on disk afterwards
+  a referenced store not yet created is reported with on_disk == false
+  non-store-shaped directories under the root are ignored, never reported as candidates
+  the query performs no deletion whatsoever - todo 83 owns the decision and the delete
+
+== H. ORACLE INVOCATIONS REPRODUCED ============================================
+flag sets (index.ts:25-27), carried verbatim as git::CORE / CFG / QUOTE:
+  core  = -c core.longpaths=true -c core.symlinks=true
+  cfg   = -c core.autocrlf=false <core>
+  quote = <cfg> -c core.quotepath=false
+
+init (index.ts:318-333):
+  git init                        with env GIT_DIR=<store> GIT_WORK_TREE=<worktree>, cwd=<worktree>
+  git --git-dir <store> config core.autocrlf false
+                                        core.longpaths true
+                                        core.symlinks true
+                                        core.fsmonitor false
+                                        feature.manyFiles true
+                                        index.version 4
+                                        index.threads true
+                                        core.untrackedCache true
+  then seed(): objects/info/alternates <- source objects dir (+ its own live alternates),
+               index <- copy of the source repo index (best effort)
+
+add (index.ts:236-311):
+  <quote> --git-dir S --work-tree W diff-files --name-only -z -- .            cwd=<directory>
+  <quote> --git-dir S --work-tree W ls-files --full-name --others --exclude-standard -z -- .
+  <quote> --git-dir W/.git --work-tree W check-ignore --no-index --stdin -z   stdin=NUL paths
+  <cfg>   --git-dir S --work-tree W rm --cached -f --ignore-unmatch --pathspec-from-file=- --pathspec-file-nul
+  <cfg>   --git-dir S --work-tree W add --all --sparse --pathspec-from-file=- --pathspec-file-nul
+
+track   : ... add() then  --git-dir S --work-tree W write-tree                cwd=<directory>
+patch   : ... add() then <quote> ... diff --cached --no-ext-diff --name-only <hash> -- .
+diff    : ... add() then <quote> ... diff --cached --no-ext-diff <hash> -- .  cwd=<worktree>
+restore : <core> ... read-tree <hash>  then  <core> ... checkout-index -a -f  cwd=<worktree>
+gc      : --git-dir S --work-tree W gc --prune=7.days                         cwd=<directory>
+
+== I. DELIBERATE DIVERGENCES ===================================================
+1. track/restore report failure instead of swallowing it.
+   Oracle logs and continues, so track() can return "" as if it were a hash and restore()
+   can be a silent no-op. Both surface as SnapshotError here: a silently-empty snapshot
+   hash breaks revert much later, far from the cause. Failures the oracle tolerates BY
+   DESIGN (partial add, failed diff, failed gc) stay tolerated and logged.
+2. SnapshotError is crate-local, not an oc-error variant. oc-error has no process/exec
+   variant, its aggregate Error is not #[non_exhaustive], and oc-paths set the precedent
+   with PathsError. Misfiling a git failure as ToolError::Failed would claim a model tool
+   failed. No anyhow anywhere; oc-error's guard test still passes.
+3. The store lock is in-process only (one Mutex per git dir, mirroring the oracle's
+   Semaphore keyed by gitdir). Cross-process exclusion is Git's own index.lock; adding a
+   second lock file would invent a protocol the TypeScript binary does not speak.
+
+== J. FILES ====================================================================
+   27 crates/oc-snapshot/Cargo.toml
+  140 crates/oc-snapshot/src/error.rs
+  208 crates/oc-snapshot/src/gc.rs
+  291 crates/oc-snapshot/src/git.rs
+   50 crates/oc-snapshot/src/lib.rs
+   81 crates/oc-snapshot/src/lock.rs
+  373 crates/oc-snapshot/src/refcount.rs
+  812 crates/oc-snapshot/src/store.rs
+  548 crates/oc-snapshot/tests/store.rs
+ 2530 total
+
+== K. NOTEPAD ENTRIES ==========================================================
+learnings.md  ## Task 23 — observed store path + hash input, oracle git commands/env, gc params
+decisions.md  ## Task 23 — shell-out vs library, std vs tokio process, crate-local error,
+                            reference-count API shape
+issues.md     ## Task 23 — what todo 83 may/may not delete (alternates!), the 7-day revert
+                            horizon for todo 82/74, the broken PATH opencode shim
+
+== L. UNVERIFIED ===============================================================
+- Windows behaviour: core.longpaths/core.symlinks/index.version=4 are carried verbatim but only
+  exercised on Linux with git 2.43.0.
+- seed() alternate chaining past one level, and the source-index copy being rejected as
+  incompatible, are both best-effort paths with no dedicated test; they degrade to a full
+  rehash by construction.
+- diffFull()/revert() from the oracle are NOT implemented here; they belong to todo 74.
+- the differential driver is a throwaway crate in /tmp, not committed; the committed surface is
+  the library. Todo 71 owns the real `debug snapshot` CLI.
+
+== M. COMMIT ===================================================================
+7a6cf2d feat(snapshot): per-project git object store with gc
+7a6cf2d feat(snapshot): per-project git object store with gc
+ Cargo.lock                         |  82 ++++
+ crates/oc-snapshot/Cargo.toml      |  12 +
+ crates/oc-snapshot/src/error.rs    | 140 +++++++
+ crates/oc-snapshot/src/gc.rs       | 208 ++++++++++
+ crates/oc-snapshot/src/git.rs      | 291 +++++++++++++
+ crates/oc-snapshot/src/lib.rs      |  51 ++-
+ crates/oc-snapshot/src/lock.rs     |  81 ++++
+ crates/oc-snapshot/src/refcount.rs | 373 +++++++++++++++++
+ crates/oc-snapshot/src/store.rs    | 812 +++++++++++++++++++++++++++++++++++++
+ crates/oc-snapshot/tests/store.rs  | 548 +++++++++++++++++++++++++
+ 10 files changed, 2597 insertions(+), 1 deletion(-)

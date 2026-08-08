@@ -1,0 +1,402 @@
+================================================================================
+Task 19 — crates/oc-db: open SQLite with opencode's exact pragmas and path rules
+================================================================================
+worktree : /config/workspace/ProdDir/AI/oc-wt/t19  (branch task-19)
+base     : 20b0564 fix(catalog): reconcile oc-catalog manifest after three-way union merge
+date     : 2026-08-05T10:34:11+00:00
+toolchain: rustc 1.96.0 (ac68faa20 2026-05-25) / cargo 1.96.0 (30a34c682 2026-05-25)
+oracle   : /config/workspace/ProdDir/AI/opencode  packages/core/src/database/database.ts
+
+Sections 1-7 and 10-13 run against the exact tree that is committed, with no
+scratch files present. Section 8 temporarily adds a QA driver example, runs it, and
+deletes it; the same two scenarios are covered permanently by tests/open.rs, so the
+gates above are never measured with that file in the tree.
+
+--------------------------------------------------------------------------------
+1. ORACLE — database.ts:22-33 (the pragmas), :43-55 (path rules)
+--------------------------------------------------------------------------------
+const layer = Layer.effect(
+  Service,
+  Effect.gen(function* () {
+    const db = yield* makeDatabase
+
+    yield* db.run("PRAGMA journal_mode = WAL")
+    yield* db.run("PRAGMA synchronous = NORMAL")
+    yield* db.run("PRAGMA busy_timeout = 5000")
+    yield* db.run("PRAGMA cache_size = -64000")
+    yield* db.run("PRAGMA foreign_keys = ON")
+    yield* db.run("PRAGMA wal_checkpoint(PASSIVE)")
+    yield* DatabaseMigration.apply(db)
+  ...
+export function path() {
+  if (Flag.OPENCODE_DB) {
+    if (Flag.OPENCODE_DB === ":memory:" || isAbsolute(Flag.OPENCODE_DB)) return Flag.OPENCODE_DB
+    return join(Global.Path.data, Flag.OPENCODE_DB)
+  }
+  if (
+    ["latest", "beta", "prod"].includes(InstallationChannel) ||
+    process.env.OPENCODE_DISABLE_CHANNEL_DB === "1" ||
+    process.env.OPENCODE_DISABLE_CHANNEL_DB === "true"
+  )
+    return join(Global.Path.data, "opencode.db")
+  return join(Global.Path.data, `opencode-${InstallationChannel.replace(/[^a-zA-Z0-9._-]/g, "-")}.db`)
+}
+
+PRAGMA_SEQUENCE as ported (crates/oc-db/src/open.rs), asserted line-for-line by
+open::tests::pragma_sequence_matches_the_oracle_line_for_line:
+pub const PRAGMA_SEQUENCE: &str = "\
+PRAGMA journal_mode = WAL;\n\
+PRAGMA synchronous = NORMAL;\n\
+PRAGMA busy_timeout = 5000;\n\
+PRAGMA cache_size = -64000;\n\
+PRAGMA foreign_keys = ON;\n\
+PRAGMA wal_checkpoint(PASSIVE);\n";
+
+Path rules are NOT re-derived here. oc_paths::db_path() owns all three OPENCODE_DB
+forms (crates/oc-paths/src/files.rs:237-253); oc-db consumes the DbLocation it returns.
+
+--------------------------------------------------------------------------------
+2. ACCEPTANCE — cargo test -p oc-db
+--------------------------------------------------------------------------------
+    Blocking waiting for file lock on build directory
+   Compiling oc-db v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t19/crates/oc-db)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.12s
+     Running unittests src/lib.rs (/config/workspace/ProdDir/AI/opencode-rust/target/debug/deps/oc_db-91685aedf8875d57)
+
+running 8 tests
+test open::tests::busy_is_classified_as_retryable_and_nothing_else_is ... ok
+test open::tests::shared_memory_uri_names_a_shared_cache_database ... ok
+test open::tests::pragma_sequence_matches_the_oracle_line_for_line ... ok
+test open::tests::sidecar_files_append_rather_than_replace_the_extension ... ok
+test pool::tests::memory_names_are_unique_per_pool ... ok
+test pool::tests::a_connection_returns_to_the_pool_on_drop ... ok
+test pool::tests::a_pool_over_max_idle_closes_returned_connections ... ok
+test pool::tests::an_in_memory_pool_shares_one_database_across_connections ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/open.rs (/config/workspace/ProdDir/AI/opencode-rust/target/debug/deps/open-47552d3d316bb9a0)
+
+running 18 tests
+test an_in_memory_database_reports_memory_journalling_and_still_enforces_foreign_keys ... ok
+test a_transaction_that_fails_leaves_nothing_behind ... ok
+test a_transaction_that_succeeds_commits ... ok
+test a_cascade_declared_on_the_child_actually_fires ... ok
+test opencode_db_memory_is_transient_between_pools ... ok
+test opencode_db_memory_yields_an_in_memory_database_and_writes_no_file ... ok
+test the_stack_below_this_crate_already_defaults_two_pragmas_to_the_oracle_values ... ok
+test verify_pragmas_rejects_a_connection_whose_foreign_keys_were_turned_off ... ok
+test a_fresh_file_database_reports_all_four_pragmas_active ... ok
+test every_pooled_connection_carries_the_pragmas ... ok
+test wal_survives_a_close_but_the_per_connection_pragmas_do_not ... ok
+test a_child_row_with_a_dangling_foreign_key_is_rejected ... ok
+test wal_creates_a_wal_and_shm_sidecar_beside_the_database ... ok
+test the_same_insert_succeeds_once_foreign_keys_are_turned_off ... ok
+test opencode_db_absolute_is_used_verbatim ... ok
+test opencode_db_relative_resolves_under_data_and_the_file_lands_there ... ok
+test a_reader_is_not_blocked_by_an_open_writer_under_wal ... ok
+test two_concurrent_writers_both_succeed_within_the_busy_timeout ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+
+   Doc-tests oc_db
+
+running 1 test
+test crates/oc-db/src/lib.rs - (line 34) ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 0.25s; merged doctests compilation took 0.25s
+
+--------------------------------------------------------------------------------
+3. ACCEPTANCE — cargo build --workspace
+--------------------------------------------------------------------------------
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.15s
+
+--------------------------------------------------------------------------------
+4. ACCEPTANCE — cargo clippy --workspace --all-targets (zero warnings)
+--------------------------------------------------------------------------------
+    Checking oc-db v0.1.0 (/config/workspace/ProdDir/AI/oc-wt/t19/crates/oc-db)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.41s
+lines matching ^(warning|error): 0
+
+--------------------------------------------------------------------------------
+5. ACCEPTANCE — cargo fmt --all -- --check
+--------------------------------------------------------------------------------
+exit=0  (no diff above and exit=0 means clean)
+
+--------------------------------------------------------------------------------
+6. NO REGRESSION — cargo test --workspace
+--------------------------------------------------------------------------------
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 201 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.55s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.66s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.13s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 141 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.60s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.66s
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.02s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 81 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.97s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 72 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.06s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+total passing: 816
+baseline on main was 789; oc-db adds 8 unit + 18 integration + 1 doctest = 27.
+789 + 27 = 816, so no pre-existing test was changed or lost.
+
+--------------------------------------------------------------------------------
+7. ACCEPTANCE — the anyhow guard still passes
+--------------------------------------------------------------------------------
+
+running 6 tests
+test a_url_before_a_violation_does_not_hide_it ... ok
+test the_manifest_scanner_detects_every_spelling_cargo_accepts ... ok
+test the_scanner_detects_a_violation_when_one_is_present ... ok
+test the_scanner_ignores_prose_about_the_ban ... ok
+test no_library_crate_declares_the_dependency_at_all ... ok
+test no_library_crate_uses_a_dynamically_typed_error ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+grep -rn anyhow crates/oc-db/ : 0 hits
+
+--------------------------------------------------------------------------------
+8. QA SCENARIOS — real output (scratch driver, deleted immediately after)
+--------------------------------------------------------------------------------
+### QA HAPPY: two concurrent writers under WAL
+pool = Pool { location: File("/tmp/t19qa/db/opencode.db"), target: "/tmp/t19qa/db/opencode.db", max_idle: 4, idle: 1, memory_anchor: false }
+PRAGMA journal_mode = wal
+PRAGMA synchronous = 1
+PRAGMA busy_timeout = 5000
+PRAGMA cache_size = -64000
+PRAGMA foreign_keys = 1
+writer A (holds the write lock 300ms): Ok(()) after 300.240418ms
+writer B (contends, waits out the lock): Ok(1) after 335.945791ms
+wall clock for both: 336.268624ms
+committed rows = 2 (slow,fast)
+busy_timeout budget = 5000ms, both writers finished in 336.416921ms -> WITHIN BUDGET
+
+on-disk file set while the pool is open:
+  opencode.db  (8192 bytes)
+  opencode.db-shm  (32768 bytes)
+  opencode.db-wal  (16512 bytes)
+pool.sidecar_files() = ["/tmp/t19qa/db/opencode.db-wal", "/tmp/t19qa/db/opencode.db-shm"]
+
+### QA FAILURE: a child row with a dangling foreign key
+PRAGMA foreign_keys = 1
+INSERT rejected
+  rusqlite Display : FOREIGN KEY constraint failed
+  rusqlite Debug   : SqliteFailure(Error { code: ConstraintViolation, extended_code: 787 }, Some("FOREIGN KEY constraint failed"))
+  is_constraint_violation = true
+  is_busy                 = false
+  mapped DbError   : database statement failed
+  is_retryable     = false
+child rows after the rejected insert = 0
+
+control: the same insert with foreign_keys = OFF
+  accepted, 1 row(s) -> the pragma, not the schema, is what rejects it
+
+--------------------------------------------------------------------------------
+9. CROSS-CHECK — an external sqlite3 reads the file the Rust code just wrote
+--------------------------------------------------------------------------------
+external CLI: 3.53.4 2026-07-24 19:02:57 bf7c7f30031888f4e796e429ab3978879485813aaca6f641c7b33e4e09459bcc (64-bit)
+(this is a DIFFERENT SQLite from the bundled 3.53.2, standing in for the TypeScript
+ binary opening the same file)
+PRAGMA journal_mode          -> wal
+SELECT count(*) FROM writes  -> 2
+SELECT group_concat(who)     -> slow,fast
+.schema                      -> CREATE TABLE writes (id integer primary key, who text not null);
+
+file header bytes 18-19 (write/read format version; 2 = WAL). This lives in the FILE,
+not on the connection, which is what makes the other binary see a WAL database:
+   2   2
+
+on-disk file set AFTER every connection closed. A clean shutdown checkpoints and
+REMOVES the sidecars, so their absence is NOT evidence of a missing WAL — todos 82
+and 84 must handle both states:
+opencode.db
+(section 8 above lists the same directory while the pool was still open: three files)
+
+--------------------------------------------------------------------------------
+10. WHAT WAS ADDED TO THE ROOT Cargo.toml — additions only; sha2 pin untouched
+--------------------------------------------------------------------------------
+diff --git a/Cargo.toml b/Cargo.toml
+index 8bc10cc..5c4ad38 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -128,6 +128,18 @@ notify = "8.2.0"
+ walkdir = "2.5.0"
+ which = "8.0.5"
+ 
++# -- storage ----------------------------------------------------------------
++# `bundled` compiles the SQLite C amalgamation, which is the point: the session
++# store must be byte-compatible with an `opencode.db` the TypeScript binary also
++# opens, so the SQLite version has to be pinned by us rather than by whatever the
++# host happens to ship. A *system* `libsqlite3` would trade this build-time C
++# dependency for a runtime version-skew hazard against a file another binary
++# writes, which is strictly worse. `cc` is therefore an accepted build
++# requirement; see `.omo/notepads/opencode-rust/issues.md` ("RESOLVED"), and
++# todo 91 crosses to musl/aarch64 with `cargo-zigbuild` rather than a per-target
++# C cross-toolchain.
++rusqlite = { version = "0.40.1", features = ["bundled"] }
++
+ # -- primitives -------------------------------------------------------------
+ base64 = "0.23.1"
+ sha2 = "0.11.0"
+ Cargo.toml | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+bundled SQLite identity, measured through the driver:
+  rusqlite 0.40.1 -> libsqlite3-sys 0.38.1 -> SQLite 3.53.2
+  sqlite_source_id() = 2026-06-03 19:12:13 d6e03d8c777cfa2d35e3b60d8ec3e0187f3e9f99d8e2ee9cac695fd6fcdf1a24
+  cc on this machine: cc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+  -> the accepted C build requirement was satisfiable here; no cmake was needed
+  -> FTS5 is compiled in (ENABLE_FTS5), which todos 101-102 will need
+
+--------------------------------------------------------------------------------
+11. FINDING — 2 of the 4 pragmas would pass a naive readback test even if unset
+--------------------------------------------------------------------------------
+libsqlite3-sys build.rs passes -DSQLITE_DEFAULT_FOREIGN_KEYS=1:
+126:            .flag("-DSQLITE_DEFAULT_FOREIGN_KEYS=1")
+rusqlite calls sqlite3_busy_timeout(db, 5000) on every connection it opens:
+118:            let r = ffi::sqlite3_busy_timeout(db, 5000);
+Stock SQLite defaults foreign_keys OFF — measured on the system CLI:
+  system sqlite3 3.53.4, fresh db, PRAGMA foreign_keys -> 0
+
+Consequence: on THIS driver, foreign_keys and busy_timeout read back correct even if
+the crate never issued them, so the acceptance criterion alone does not prove the
+code works. Three things close that gap:
+  - tests/open.rs::the_stack_below_this_crate_already_defaults_two_pragmas_to_the_
+    oracle_values pins both environment defaults, so a driver bump that flips either
+    one fails loudly instead of silently disabling cascades.
+  - synchronous and cache_size do NOT default to the oracle values;
+    wal_survives_a_close_but_the_per_connection_pragmas_do_not proves they reset on
+    reopen, so this crate's pragma application is load-bearing for those two.
+  - the behavioural FK proof in section 8 demonstrates enforcement rather than
+    configuration, with a foreign_keys=OFF control showing the same insert accepted.
+
+--------------------------------------------------------------------------------
+12. PRE-EXISTING DEFECT ON main — stale Cargo.lock (reported, not worked around)
+--------------------------------------------------------------------------------
+crates/oc-catalog/Cargo.toml declares a dev-dependency on insta:
+33:insta = { workspace = true }
+occurrences of insta in main (20b0564) Cargo.lock: 0
+main's lockfile therefore omits a package a manifest requires. My build refreshed it,
+which is why this commit's Cargo.lock adds 15 packages rather than 9:
+  SQLite (9): rusqlite, libsqlite3-sys, hashlink x2, fallible-iterator,
+              fallible-streaming-iterator, vcpkg, sqlite-wasm-rs, rsqlite-vfs
+  insta  (6): insta, similar, console, encode_unicode, yaml-rust2, arraydeque
+Nothing was removed from the lock. Verified self-consistent:
+  cargo metadata --locked: OK
+
+--------------------------------------------------------------------------------
+13. FILES CHANGED
+--------------------------------------------------------------------------------
+ M Cargo.lock
+ M Cargo.toml
+ M crates/oc-db/Cargo.toml
+ M crates/oc-db/src/lib.rs
+?? crates/oc-db/src/open.rs
+?? crates/oc-db/src/pool.rs
+?? crates/oc-db/tests/
+
+line counts:
+   56 crates/oc-db/src/lib.rs
+  386 crates/oc-db/src/open.rs
+  360 crates/oc-db/src/pool.rs
+  600 crates/oc-db/tests/open.rs
+ 1402 total
+
+guards:
+  todo!/unimplemented!/FIXME anywhere in crates/oc-db : 0 (must be 0)
+  files touched outside crates/oc-db + root manifest/lock : 0 (must be 0)
+  every CREATE TABLE in crates/oc-db/src — todo 20 owns the real schema, so these
+  must all be a doc example or a unit-test fixture and none may be a session table:
+crates/oc-db/src/lib.rs:40://!     tx.execute_batch("CREATE TABLE demo (id integer primary key)")
+crates/oc-db/src/pool.rs:327:                .execute_batch("CREATE TABLE t (id integer primary key)")
+  ^ lib.rs:40 is the crate doc example; pool.rs:327 is a unit-test fixture table.
+  session-family table names in crates/oc-db/src : 0 (must be 0)
+
+================================================================================
+END Task 19 evidence
+================================================================================

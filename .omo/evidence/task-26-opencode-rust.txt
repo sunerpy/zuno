@@ -1,0 +1,236 @@
+Task 26 — crates/oc-llm/src/catalog.rs: provider/model catalog resolution
+=========================================================================
+Worktree /config/workspace/ProdDir/AI/oc-wt/t26 (branch task-26), base 60c1d4c.
+Oracle: /config/.local/share/mise/installs/opencode/1.18.12/opencode  → 1.18.12
+(the bare `opencode` shim on PATH fails under a cleared env; the absolute path works)
+
+FILES ADDED
+  crates/oc-llm/src/catalog.rs                       pipeline + Catalog/ResolveInput
+  crates/oc-llm/src/catalog/source.rs                3 env vars, cache, fetch
+  crates/oc-llm/src/catalog/models_dev.rs            models.dev document shapes
+  crates/oc-llm/src/catalog/merge.rs                 provider.* config merge + filters
+  crates/oc-llm/src/catalog/availability.rs          the 3 independent sources
+  crates/oc-llm/src/catalog/resolved.rs              resolved provider/model shape
+  crates/oc-llm/src/catalog/collate.rs               localeCompare port
+  crates/oc-llm/src/catalog/error.rs                 CatalogError
+  crates/oc-llm/tests/catalog_resolution.rs          14 tests
+  crates/oc-llm/tests/catalog_source.rs              10 tests
+  crates/oc-llm/tests/catalog_differential.rs        13 tests (12 vs real binary)
+  crates/oc-llm/tests/fixtures/models-dev-pinned.json  sha256 a11b7af8395945c2...
+MODIFIED
+  crates/oc-llm/src/lib.rs      + pub mod catalog;
+  crates/oc-llm/Cargo.toml      + oc-auth, oc-config, oc-paths, reqwest, tempfile(dev)
+NOT TOUCHED: root Cargo.toml, event.rs, stream.rs, effort.rs, cache.rs, sse.rs,
+registry.rs, any crate other than oc-llm, the user's real opencode.json.
+
+
+ACCEPTANCE CRITERIA
+===================
+
+[PASS] cargo test -p oc-llm catalog
+-----------------------------------
+$ cargo test -p oc-llm catalog
+running 41 tests
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out
+test result: ok. 1 passed; ...   (name-filtered across the other targets)
+test result: ok. 1 passed; ...
+(the filter matches test NAMES, so the full crate suite is below)
+
+[PASS] full oc-llm suite — 110 tests, 0 failed
+----------------------------------------------
+$ cargo test -p oc-llm
+test result: ok. 43 passed  (lib: 41 catalog + 2 pre-existing)
+test result: ok. 13 passed  (catalog_differential)
+test result: ok. 14 passed  (catalog_resolution)
+test result: ok. 10 passed  (catalog_source)
+test result: ok. 4 passed   (registry_dependency_direction)
+test result: ok. 16 passed  (registry_diagnostics)
+test result: ok. 9 passed   (sse)
+test result: ok. 1 passed   (doc-test)
+$ cargo test --doc -p oc-llm
+test result: ok. 1 passed; 0 failed
+
+[PASS] cargo build --workspace — zero warnings
+[PASS] cargo clippy --workspace --all-targets — zero warnings
+[PASS] cargo fmt --all --check — clean
+[PASS] cargo tree -p oc-llm | grep oc-provider-  → no match (todo 25's guard holds)
+
+[PASS] differential vs the real binary, pinned offline fixture
+--------------------------------------------------------------
+$ cargo test -p oc-llm --test catalog_differential -- --nocapture --test-threads=1
+differential `empty environment`          ran against oracle version 1.18.12
+differential `one env var`                ran against oracle version 1.18.12
+differential `three env vars`             ran against oracle version 1.18.12
+differential `bare config block`          ran against oracle version 1.18.12
+differential `config models and overrides` ran against oracle version 1.18.12
+differential `whitelist and blacklist`    ran against oracle version 1.18.12
+differential `config-only provider`       ran against oracle version 1.18.12
+differential `experimental modes`         ran against oracle version 1.18.12
+differential `disabled_providers`         ran against oracle version 1.18.12
+differential `enabled_providers`          ran against oracle version 1.18.12
+differential `alpha only`                 ran against oracle version 1.18.12
+differential `all seven providers`        ran against oracle version 1.18.12
+test result: ok. 13 passed; 0 failed; finished in 16.89s
+
+All 12 scenarios ACTUALLY RAN (each printed the oracle version); none skipped.
+Comparison is Normalizer::none() — byte-for-byte, nothing masked. A model list has
+no timestamps/ids/ports/pids, so masking anything would mask a real difference.
+The 13th test (`the_differential_harness_can_actually_see_a_difference`) proves the
+harness is load-bearing: a list with one model removed, and a reordered list, both
+survive normalization as divergences.
+
+NO TEST TOUCHES THE NETWORK. Both sides read the same pinned fixture: the oracle via
+OPENCODE_MODELS_PATH, this crate via include_str!. OPENCODE_DISABLE_MODELS_FETCH=1 is
+set on the oracle side too (belt and braces), so it could not reach models.dev even
+if the path were ignored.
+
+[PASS] availability from env vars, config options, and stored auth
+------------------------------------------------------------------
+Three tests, each supplying EXACTLY ONE source in isolation, so a later refactor
+merging them into one is_available() breaks one of them:
+  availability_from_an_env_var_alone       DEEPSEEK_API_KEY=sk-x   → deepseek/*
+  availability_from_stored_auth_alone      auth.json type:"api"    → deepseek/*
+  availability_from_a_config_block_alone   {"provider":{"groq":{}}} → groq/*
+Each verified against 1.18.12 with the same fixture and an isolated HOME:
+  (baseline, nothing set)                        → 0 lines
+  DEEPSEEK_API_KEY=sk-x                          → deepseek/deepseek-chat, -reasoner
+  auth.json {"deepseek":{"type":"api",...}}      → deepseek/deepseek-chat, -reasoner
+  auth.json {"mistral":{"type":"oauth",...}}     → 0 lines   ← oauth is NOT enough
+  config {"provider":{"groq":{}}}                → groq/allam-2-7b, groq/canopy...
+
+[PASS] cache path rules honoring the three env vars
+----------------------------------------------------
+Default source  → <cache>/opencode/models.json
+Custom source   → <cache>/opencode/models-<sha1(source)>.json  (asserted equal to
+                  oc_paths::sha1::hex(b"https://mirror.example.com"), so a mirror
+                  cannot poison the default cache)
+OPENCODE_MODELS_URL=""            → treated as UNSET (JavaScript `||`, models-dev.ts:160)
+OPENCODE_MODELS_PATH              → replaces the cache as the read target
+OPENCODE_DISABLE_MODELS_FETCH     → Flag.truthy only: "1"/"true"/"TRUE"/"True" disable;
+                                    "0"/"false"/"no"/"yes"/""/"2" leave fetching ON
+
+[PASS] provider.* merge: api override, npm/id, whitelist/blacklist, options,
+       headers, models with capabilities/cost/limit/modalities/variants
+[PASS] disabled_providers / enabled_providers
+
+
+QA SCENARIO 1 — HAPPY: the user's REAL provider config block
+=============================================================
+Source: /config/.config/opencode/opencode.json  (COPIED to /tmp/oc-t26, never modified;
+it is JSONC with // comments, so comments were stripped for the resolver — that is
+oc-config's concern, not this crate's). 7 declared providers.
+
+$ (oracle, pinned to the real cached catalog, isolated HOME)
+  260 model lines: amazon-bedrock 114, awsopenai 2, google 44, myopenai 25,
+                   nwcdai 2, openai 52, zhipuai 13, opencode 8
+
+$ (this crate, same catalog, same config)
+  252 model lines: amazon-bedrock 114, awsopenai 2, google 44, myopenai 25,
+                   nwcdai 2, openai 52, zhipuai 13
+
+$ diff <(rust lines) <(oracle lines minus opencode/*)
+  IDENTICAL including order   ← all 252 lines byte-for-byte, all 7 user providers
+
+DID THE USER'S REAL MODELS RESOLVE? YES — every model in every one of their 7
+declared providers, including the ones they actually run on, with identical ordering.
+Spot checks that exercise the merge:
+  awsopenai/openai.gpt-5.4   (config-declared limit over an @ai-sdk/openai provider)
+  myopenai/*                 (25 config-declared models, incl. ':'-bearing bedrock ids)
+  google/antigravity-*       (12 config-declared + catalog models merged)
+  amazon-bedrock/*           (114, options-only config block: endpoint/profile/region)
+  zhipuai/*                  (13, api-override-only config block)
+  nwcdai/*                   (2, @ai-sdk/openai-compatible + baseURL)
+
+DELTA, and why it is NOT a catalog-resolution defect: the 8 extra oracle lines are
+all opencode/* — big-pickle and seven *-free models. They come from the hosted-zen
+`custom()` loader at provider.ts:179-206, which on no-credential DELETES every model
+whose cost.input != 0 and autoloads the remainder with apiKey:"public". That is
+provider-specific autoload logic, explicitly out of Todo 26's scope and owned by
+todos 29/30/94/95/96. Recorded in issues.md as a hard requirement for them.
+
+
+QA SCENARIO 2 — FAILURE: OPENCODE_DISABLE_MODELS_FETCH=1 with no cache
+=======================================================================
+QA cache path  : /tmp/.tmp1X40i6/cache/opencode/models.json
+QA cache exists: false
+QA elapsed     : 10.39µs                ← returns, does not hang
+QA is_policy   : true                   ← matchable, not text-scraped
+QA ERROR       : the model catalog is unavailable: OPENCODE_DISABLE_MODELS_FETCH is
+set, so no fetch from `https://models.opencode.ai` was attempted, and no cached
+catalog exists at `/tmp/.tmp1X40i6/cache/opencode/models.json`. Unset
+OPENCODE_DISABLE_MODELS_FETCH to fetch it, or set OPENCODE_MODELS_PATH to a catalog
+file on disk
+
+The message names all four things needed to fix it: the flag that caused it, the
+source not contacted, the cache path looked for, and the alternative. Asserted
+individually in `fetch_disabled_with_no_cache_fails_immediately_and_actionably`,
+under a 5-second tokio::time::timeout so a regression to hanging fails the test.
+`refresh_with_the_fetch_disabled_says_so_rather_than_doing_nothing` covers
+`models --refresh`, which must report rather than silently no-op.
+
+What the ORACLE does in the same scenario, for the record:
+$ env -i HOME=<tmp> XDG_CACHE_HOME=<tmp> OPENCODE_DISABLE_MODELS_FETCH=1 opencode models
+  exit=0, 7 lines, all opencode/*-free, and NO cache file written.
+It did not return an empty catalog: it fell back to a catalog SNAPSHOT COMPILED INTO
+THE BINARY (the OPENCODE_MODELS_DEV global, models-dev.ts:198-200, read at :220-221).
+`return {}` at :222 is rung 3 and is essentially unreachable in a released build.
+This crate has no snapshot, so rung 2 does not exist and landing silently on rung 3
+would be the worst outcome. The divergence and the exact seam a future
+snapshot-baking todo should use are documented in catalog/source.rs.
+
+
+TWO PLAN CLAIMS CORRECTED
+==========================
+1. `opencode models --format json` DOES NOT EXIST on 1.18.12. Both the plan
+   (.omo/plans/opencode-rust.md:376) and the task brief name it.
+   $ opencode models --help
+     Options:
+       -h, --help / -v, --version / --print-logs / --log-level / --pure
+           --verbose     use more verbose model output (includes metadata like costs)
+           --refresh     refresh the models cache from models.dev
+   `--format json` prints this help text and lists nothing. models.ts:36-47 writes
+   plain `provider/model` lines. The differential therefore compares against
+   `opencode models`, which is the list the criterion means. `--verbose` is NOT the
+   target on purpose: its JSON key order differs between catalog-derived and
+   config-derived models (spread-merge vs object literal in the oracle), so diffing
+   it would fail on key order and say nothing about which models resolved.
+2. The brief says the bundled provider set is at provider.ts:107-134 — correct; and
+   per todo 25's notepad the count is 24, not 23. Not re-derived here; nothing in
+   this todo depends on the number, since resolution is keyed by string.
+
+
+NOTE ON A THING THAT WOULD HAVE SILENTLY BROKEN PARITY
+=======================================================
+`models.ts:38` and `:56-62` sort with JavaScript `localeCompare`, which is ICU
+collation, not byte order. They disagree on real catalog data:
+  localeCompare:  "glm-5-turbo" < "glm-5.1"      byte order: the reverse
+  localeCompare:  "Gemma-4-31B-DarkIdol" < "glm-5"  (case-folded primary)
+catalog/collate.rs ports it. Derivation: every provider and model id in the whole
+180-provider catalog is ASCII over exactly 68 characters; against that alphabet
+localeCompare is reproduced by a primary level (punctuation `_ - : . @ / ~`, then
+digits, then case-folded letters, prefix-first) plus a tertiary case level
+(lowercase before uppercase). Checked EXHAUSTIVELY: all 4,753,986 pairs of the 3,084
+distinct ids, against Node's localeCompare — zero disagreements. Two rejected models
+(plain byte order; and a UCA-style variable-weight model with punctuation ignorable
+at the primary level) produced 25,161 and 75,289 mismatching pairs respectively.
+Parity is proven only for that 68-character alphabet; ids outside it fall back to
+code point order after the in-alphabet levels, and no test claims that is ICU.
+
+
+UNVERIFIED / OUT OF SCOPE
+==========================
+- The network fetch path (CatalogSource::fetch) is NOT exercised by any test, by
+  design — no test may reach the network. Its timeout (10s), retry budget (2), and
+  backoff (exponential from 200ms) are ports of models-dev.ts:152-156/:180 read from
+  source, not measured. A future todo wanting coverage should use the workspace's
+  `wiremock` against a local socket.
+- Cross-process cache locking (models-dev.ts:223-229 uses a Flock) is not ported.
+  The atomic temp-file-then-rename write is, which is what protects a reader; the
+  lock only avoids duplicate concurrent fetches.
+- ProviderTransform.variants (the DERIVED reasoning-effort variant set) is todo 31's
+  effort.rs, running concurrently. This crate MERGES config variants and drops
+  disabled ones; MergeOutcome::variant_derivation_pending names the providers where a
+  derived set would apply, as the seam.
+- Plugin-contributed providers and the plugin auth loader (provider.ts:1397-1422,
+  :1549-1567) are not resolved here.
+- The 24 provider-specific custom() loaders are not implemented (todos 29/30/94/95/96).

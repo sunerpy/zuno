@@ -1,0 +1,58 @@
+## Task 104 — OPENCODE_PERMISSION key-order parity
+
+Worktree: /config/workspace/ProdDir/AI/oc-wt/t104
+Branch: task-104
+Oracle binary: installed 1.18.12
+Oracle source: 1.18.13 @ aefaf140c1
+
+### Oracle and dependency probes
+
+Raw JSON probes against both oracles covered:
+- one newly added permission key;
+- four newly added permission keys;
+- overwrite of an existing key followed by new keys;
+- nested permission objects.
+
+Both oracles preserved source order. Existing keys retained their positions,
+overwritten values changed in place, and source-only keys appended in source
+order. The same rule held recursively for nested objects.
+
+Inspection of remeda 2.26.0's mergeDeep implementation confirmed that it does
+not reverse newly added keys. The previously reported reversal was introduced
+by the differential harness: parsing oracle output through serde_json::Value
+sorted object keys before comparison.
+
+### TDD regression proof
+
+The focused raw-order test was first added while the old Value-based
+canonicalization remained in place. It failed on the four-new-keys case,
+proving the harness could not observe the oracle's raw order.
+
+After replacing that canonicalization with a flattened typed deserializer that
+removes only the top-level mode field, the focused test passed for single,
+four-new, existing-key, and nested-key cases.
+
+Deliberate regression: restoring the old Value-based canonicalization made the
+14-tree differential fail only for permission-env-object. Restoring the typed
+deserializer returned the entire matrix to byte-identical output.
+
+### Final verification
+
+PASS: cargo test -p oc-config --test differential -- --nocapture
+  - 14/14 config trees byte-identical
+  - INTENTIONAL_DIVERGENCES is empty
+
+PASS: OC_TESTKIT_ORACLE_FLAVOUR=source OC_TESTKIT_ORACLE_SOURCE=/config/workspace/ProdDir/AI/opencode cargo test -p oc-config --test differential permission_env_object_key_order_matches_raw_oracle -- --nocapture
+  - pinned-source oracle matched all focused ordering cases
+
+PASS: cargo fmt --all -- --check
+PASS: cargo test -p oc-config
+PASS: cargo test -p oc-permission
+PASS: cargo build --workspace
+PASS: cargo clippy --workspace --all-targets -- -D warnings
+PASS: rust-analyzer diagnostics crates/oc-config/tests/differential.rs
+  - no diagnostics for the changed file
+
+The lsp_diagnostics MCP rejected the sibling-worktree path because its request
+root is the main worktree. The same rust-analyzer diagnostics engine was run
+directly from t104 instead.

@@ -1,0 +1,71 @@
+Task 59 — optional Wasmtime component hook tier
+Date: 2026-08-07
+Worktree: /config/workspace/ProdDir/AI/oc-wt/t59
+
+Implemented
+-----------
+- Exact-pinned optional wasmtime 47.0.3 behind oc-plugin/wasm; default features are
+  disabled and the oc-plugin default feature set remains empty.
+- Component-model WIT/JSON hook contract with one export for all 21 HookName entries.
+- Ordered adaptation into the existing sequential HookBus; no parallel hook dispatch.
+- Per-invocation fuel, epoch deadline, linear-memory and object-count limits.
+- Empty linker and pre-instantiation import rejection: no WASI, filesystem, network,
+  environment, clocks, inherited stdio, or other ambient capabilities.
+- Startup and runtime failure containment through PluginDiagnostic; runtime failure
+  disables only the offending component.
+- Observable ChatSystemTransform replacement-output mutation.
+
+Targeted behavior
+-----------------
+cargo test -p oc-plugin wasm --features wasm --locked
+  PASS — 5 WASM unit tests:
+  - WIT/export table mirrors every authoritative HookName;
+  - system hook replacement output mutates the host payload;
+  - runaway component is halted and diagnosed as TimedOut;
+  - memory growth beyond the configured limit disables only the component;
+  - a WASI filesystem import is rejected before instantiation.
+
+cargo test -p oc-plugin --locked
+  PASS — package suite including the default dependency-graph feature gate.
+
+Mutation proof
+--------------
+1. Changed Config::consume_fuel(true) to false.
+   wasm_runaway_is_fuel_halted_within_a_bounded_time FAILED because the bounded
+   loader could not configure fuel in the store. Exit 101. Restored true.
+2. Removed optional=true and the dep:wasmtime feature edge from oc-plugin.
+   wasm_runtime_is_absent_from_the_default_dependency_graph FAILED and printed
+   wasmtime v47.0.3 in the default graph. Exit 101. Restored the feature gate.
+3. After restoration, ran three rounds of six concurrent invocations of:
+   cargo test -p oc-plugin wasm --features wasm --locked --quiet
+   PASS — 18/18 processes, zero failures. Each process passed all 5 WASM unit
+   tests and the dependency-graph test selected by the `wasm` filter.
+
+Build and static validation
+---------------------------
+cargo fmt --all --check
+  PASS.
+
+cargo build --workspace --locked
+  PASS — default workspace build.
+
+cargo build -p oc-plugin --features wasm --locked
+  PASS — optional runtime build.
+
+cargo clippy -p oc-plugin --all-targets --no-default-features --locked -- -D warnings
+  PASS — zero warnings.
+
+cargo clippy -p oc-plugin --all-targets --features wasm --locked -- -D warnings
+  PASS — zero warnings.
+
+cargo metadata --locked --offline --no-deps --format-version 1
+  PASS.
+
+git diff --check
+  PASS.
+
+LSP note
+--------
+lsp_diagnostics rejected sibling-worktree paths because its request cwd is the main
+checkout. Both feature configurations were compiler-checked by successful builds and
+strict all-target Clippy with -D warnings; no compiler diagnostic remains.

@@ -1,0 +1,238 @@
+Task 47 — crates/oc-mcp/src/catalog.rs: namespaced MCP tool merge and the three resource tools
+Worktree: /config/workspace/ProdDir/AI/oc-wt/t47  (branch task-47, from main f0636b6)
+Crate owned: oc-mcp ONLY. No other crate was modified.
+
+================================================================================
+1. FILES
+================================================================================
+new  crates/oc-mcp/src/catalog.rs      (merge, 3 resource tools, events, loader, prompts)
+new  crates/oc-mcp/tests/catalog.rs    (31 tests)
+mod  crates/oc-mcp/src/lib.rs          (pub mod catalog + re-exports)
+mod  crates/oc-mcp/src/stdio.rs        (resources/prompts requests + shared fetch_list)
+mod  crates/oc-mcp/src/remote/client.rs(resources/prompts requests + server_name())
+mod  crates/oc-mcp/Cargo.toml          (6 deps added to the ONE [dependencies] table)
+
+Untouched: oc-tools, oc-permission, oc-llm, oc-catalog. Verified by `git status`.
+
+================================================================================
+2. ACCEPTANCE CRITERION — the namespaced id for `search` on `docs`
+================================================================================
+Verbatim id:  docs_search
+
+Asserted twice in catalog_namespaces_a_tool_under_the_upstream_id:
+  assert_eq!(catalog.tool_ids(), vec!["docs_search".to_owned()]);
+  assert_eq!(catalog.tool_ids(), vec![oc_mcp::tool_name("docs", "search")]);
+The second assertion is what forbids a second namespacing rule: the id must come
+out of todo 45's tool_name(), which is `sanitize(server) + "_" + sanitize(tool)`
+(oracle: packages/opencode/src/mcp/catalog.ts:117-119).
+
+Sanitizer behaviour proven separately (catalog_namespacing_sanitizes_both_halves_of_the_id):
+  server "my docs", tool "search/all"  ->  my_docs_search_all
+
+================================================================================
+3. ACCEPTANCE CRITERION — {"read": "deny"} removes all three resource tools
+================================================================================
+catalog_read_deny_removes_all_three_resource_tools_together
+
+Before the deny, tool_ids() =
+  ["docs_search", "list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"]
+After rules_from_config(json!({"read": "deny"})) and visible_tools(), it is
+  ["docs_search"]
+i.e. exactly the three resource tools were removed, together, and nothing else.
+
+The collapse is oc-permission's, not a local copy. catalog_resource_tool_names_are_the_names_permission_collapses
+asserts:
+  RESOURCE_TOOLS == oc_permission::visibility::READ_TOOLS
+  permission_key("list_mcp_resources")          == "read"
+  permission_key("list_mcp_resource_templates") == "read"
+  permission_key("read_mcp_resource")           == "read"
+
+Boundary also pinned: catalog_narrow_read_deny_leaves_the_resource_tools_visible
+shows {"read": {"mcp:docs:*": "deny"}} does NOT hide them (pattern-scoped deny is
+enforced at call time — oracle permission/index.ts:204-219 requires pattern == "*").
+
+================================================================================
+4. QA — failed server contributes zero tools, diagnostic names it
+================================================================================
+catalog_failed_server_contributes_zero_tools_and_a_named_diagnostic
+
+The test connects `broken` WITH a tool (`dangerous`), then marks it failed. The
+retained snapshot is deliberate: `unavailable` clears neither the tools nor the
+handle, so ServerStatus::is_connected() is the single decision point and removing
+it leaks immediately (see mutation 1).
+
+  tool_ids()          == ["docs_search"]
+  connected_servers() == ["docs"]
+
+Diagnostic, verbatim:
+  MCP server broken is unavailable and contributes no tools: Connection closed
+
+Never-connected variant (catalog_never_connected_server_contributes_zero_tools_and_names_itself):
+  MCP server absent is unavailable and contributes no tools: could not spawn absent-server
+
+Other reasons carry their own label and remedy
+(catalog_diagnostics_distinguish_every_unavailable_reason):
+  disabled / needs_auth / needs_client_registration; the needs_auth message contains
+  "opencode mcp auth auth".
+
+================================================================================
+5. QA — two servers exposing an identically-named tool do not collide
+================================================================================
+catalog_two_servers_sharing_a_tool_name_do_not_collide
+  docs.search + wiki.search  ->  ["docs_search", "wiki_search"]
+
+catalog_namespaced_call_reaches_the_right_server_under_the_local_name proves the
+routing, not just the naming: calling `wiki_search` increments wiki's counter to 1,
+leaves docs at 0, and the server is addressed as `search` — never the namespaced id.
+(The sanitizer is not injective, so splitting the id back apart would be guesswork;
+the oracle captures the original definition instead — mcp/catalog.ts:42-67.)
+
+================================================================================
+6. Tools-changed refresh publishes an event
+================================================================================
+catalog_refresh_republishes_the_changed_server_and_replaces_its_tools
+  connect                 -> CatalogEvent::ToolsChanged { server: "docs" }
+  re-register             -> CatalogEvent::ToolsChanged { server: "docs" }
+  refresh("docs")         -> CatalogEvent::ToolsChanged { server: "docs" }
+Payload is the server name only, matching mcp/index.ts:461-471.
+
+catalog_refresh_refuses_a_server_that_is_not_connected
+  refresh on a failed server        -> "mcp server docs is not connected"
+  refresh on an unknown server      -> "mcp server never-configured is not connected"
+A failed tools/list leaves the previous snapshot in place (mcp/index.ts:465-466).
+
+================================================================================
+7. Locked-list rebuild happens AT MOST ONCE
+================================================================================
+catalog_late_connection_rebuilds_the_locked_tool_list_exactly_once
+  request 1 (0 servers, Pending)     -> [],                            rebuilt=false, count=0
+  docs connects; request 2 (Pending) -> [],                            rebuilt=false, count=0
+  wiki connects -> Ready; request 3  -> [docs_search, wiki_search],    rebuilt=true,  count=1
+  a THIRD server connects; request 4 -> [docs_search, wiki_search],    rebuilt=false, count=1
+  five further requests              -> unchanged,                     rebuilt=false, count=1
+
+catalog_settled_first_request_never_spends_the_rebuild
+  discovery already Ready on request 1 -> a later connection never rebuilds; count stays 0.
+
+The once-only property belongs to todo 31's LockedTools. Catalog::tools_for_request
+feeds it the whole id list plus discovery_status() and NEVER calls reset() — a reset
+would re-arm the allowance (mutation 2).
+
+discovery_status() gating (catalog_discovery_stays_pending_until_every_expected_server_reports):
+  Pending until every expected server has reported success OR failure;
+  a failure counts as a report; zero configured servers is immediately Ready.
+
+================================================================================
+8. MUTATION PROOFS (each applied, run, then reverted; suite re-verified green)
+================================================================================
+--- MUTATION 1: include a failed server's tools (delete the connected-only gate)
+    edit: removed `if !entry.status.is_connected() { continue; }` from Catalog::tools
+    result: test result: FAILED. 29 passed; 2 failed
+      catalog_failed_server_contributes_zero_tools_and_a_named_diagnostic FAILED
+        assertion `left == right` failed: a server that failed must contribute zero
+        tools even though its snapshot is retained
+          left: ["broken_dangerous", "docs_search"]
+         right: ["docs_search"]
+      catalog_resource_tools_withdrawn_when_the_resource_server_fails FAILED
+        the resource tools have nothing to read once no connected server serves resources
+
+    NOTE, recorded honestly: on the FIRST attempt this mutation did not fail,
+    because `unavailable` also cleared `entry.handle`, so the tools vanished for a
+    second, accidental reason. That is a hole in the test, not in the code, and I
+    fixed the code to keep the handle so the gate is the only thing removing them.
+    Mutation testing found a vacuous pass; the numbers above are after the fix.
+
+--- MUTATION 2: allow a second rebuild
+    2a edit: `locked.reset();` before every tools_for_request
+       result: test result: FAILED. 29 passed; 2 failed
+         catalog_late_connection_rebuilds_the_locked_tool_list_exactly_once FAILED
+           while discovery is pending the frozen list must not move
+         catalog_settled_first_request_never_spends_the_rebuild FAILED
+           left: ["docs_search", "late_search"]  right: ["docs_search"]
+    2b edit (sharpened — reset only after the allowance is already spent):
+         if status == Ready && locked.rebuild_count() > 0 { locked.reset(); }
+       result: test result: FAILED. 30 passed; 1 failed
+         catalog_late_connection_rebuilds_the_locked_tool_list_exactly_once FAILED
+           assertion `left == right` failed: the frozen list must still exclude the
+           late server's tools
+             left: ["docs_search", "late_search", "wiki_search"]
+            right: ["docs_search", "wiki_search"]
+       This is the sharper proof: even a mutation that only permits a SECOND rebuild
+       (leaving the first-request behaviour intact) is caught.
+
+--- MUTATION 3: break the read alias collapse
+    edit: LIST_RESOURCE_TEMPLATES_TOOL = "list_mcp_resourcetemplates" (one char removed)
+    result: test result: FAILED. 29 passed; 2 failed
+      catalog_read_deny_removes_all_three_resource_tools_together FAILED
+        {"read": "deny"} must remove list_mcp_resourcetemplates:
+          ["docs_search", "list_mcp_resourcetemplates"]
+      catalog_resource_tool_names_are_the_names_permission_collapses FAILED
+        renaming a resource tool silently breaks the `read` collapse in oc-permission
+          left:  ["list_mcp_resources", "list_mcp_resourcetemplates", "read_mcp_resource"]
+         right: ["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"]
+
+After each revert: test result: ok. 31 passed; 0 failed.
+
+================================================================================
+9. VERIFICATION NUMBERS
+================================================================================
+cargo build --workspace --offline
+  BUILD_EXIT=0, 0 warning/error lines
+
+cargo test -p oc-mcp --offline   (per target)
+  unittests src/lib.rs   9 passed; 0 failed; 0 ignored; 0 filtered out   <- todo 45's 9
+  tests/catalog.rs      31 passed; 0 failed; 0 ignored; 0 filtered out   <- NEW
+  tests/remote.rs        8 passed; 0 failed; 0 ignored; 0 filtered out   <- todo 46's 8
+  tests/remote_live.rs   1 passed; 0 failed; 0 ignored; 0 filtered out   <- todo 46's live
+  tests/remote_support.rs 0 passed (support module, no tests)
+  TOTAL 49 passed, 0 failed. The pre-existing 18 (9+8+1) are all still green.
+
+cargo test -p oc-mcp catalog --offline   (the plan's literal filter)
+  tests/catalog.rs: 31 passed; 0 failed; 0 filtered out   <- a real pass, not 0-of-N
+  other targets correctly report 9 / 8 / 1 filtered out
+
+cargo clippy --workspace --all-targets --offline
+  CLIPPY_EXIT=0, warning/error lines = 0
+  (forced a real recompile of oc-mcp first: "Checking oc-mcp v0.1.0" present in the log)
+
+cargo fmt --all --check   -> clean (FMT_CLEAN)
+cargo metadata --locked --offline  -> METADATA_EXIT=0
+  (one `[dependencies]` table, one `[dev-dependencies]` table; no duplicates)
+
+CONCURRENCY 3x6, full `cargo test -p oc-mcp --offline` including todo 46's live target:
+  round 1: 0 0 0 0 0 0
+  round 2: 0 0 0 0 0 0
+  round 3: 0 0 0 0 0 0
+All 18 runs produced zero `test result: FAILED` lines. The live remote target was NOT
+excluded and did not flake under 6x concurrency.
+
+================================================================================
+10. WHAT THE PLAN GOT WRONG / NEEDED INTERPRETATION
+================================================================================
+a) "all three mapped onto the `read` permission key" — already done. oc-permission's
+   READ_TOOLS (visibility.rs:30-34) contains exactly those three literals and
+   permission_key collapses them. Nothing to add; I assert against it instead of
+   copying it. No oc-permission edit was needed or made.
+
+b) "expose MCP prompts to the command resolver (wave 3 precedence)" — the seam
+   existed and is richer than the plan implies: oc_catalog::command::Sources has
+   with_mcp_prompts(&[McpPrompt]) at level 3, plus a two-phase Resolution::PendingMcp
+   for the deferred prompts/get. What did NOT exist was any way to obtain prompts:
+   neither StdioClient nor RemoteClient had prompts/list. I added it in oc-mcp.
+
+c) Same gap for resources: the crate's own lib.rs doc line said "tools, resources,
+   prompts" but only tools existed. resources/list, resources/templates/list,
+   resources/read and prompts/list are new here; without them the three resource
+   tools would have had no transport.
+
+d) The plan's reference `packages/opencode/src/session/tools.ts:388-492` describes
+   "dynamic registration and execution" as splitting the namespaced id back into
+   server+tool at call time. It does not. The oracle captures the original
+   definition and client in a closure (mcp/catalog.ts:42-67); only code-mode
+   approximates a split, and only for display (tool/code-mode.ts:39-55). I follow
+   the oracle, not the plan's prose — splitting would be unsound because the
+   sanitizer is not injective.
+
+e) The three resource tools are gated on a connected server declaring a `resources`
+   capability (session/tools.ts:155-157). The plan does not mention this gate; without
+   it a config with no resource-capable server advertises three tools that can only fail.

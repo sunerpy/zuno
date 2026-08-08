@@ -1,0 +1,43 @@
+Task 70 — execute as bounded parallel composition with variable binding
+Date: 2026-08-06
+Worktree: /config/workspace/ProdDir/AI/oc-wt/t70
+Branch: task-70
+
+Implemented:
+- Added the `execute` tool with derived inline schema, dependency-level scheduling,
+  bounded concurrent execution, deterministic submission-order rendering, sibling
+  failure isolation, and per-result fractional output budgets.
+- Added `$ref` binding and `$each` fan-out over structured tool metadata, including
+  real `grep.metadata.files[*] -> read` composition.
+- Added registry re-entry through a weak self-reference so nested calls use the
+  same lookup, alias normalization, context derivation, and permission gate as
+  ordinary tool calls.
+- Enforced a maximum of 10 expanded calls and rejected recursive execute calls
+  after alias normalization.
+- Added structured unique `metadata.files` to grep for bindable composition.
+
+Acceptance tests:
+- 10 integration tests cover schema, call cap, recursion, permission-denial
+  isolation, references, real grep-to-read fan-out, missing bindings, output
+  budgets, deterministic ten-call concurrency, and 3 rounds x 6 concurrent runs.
+- `cargo test -p oc-tools batch --locked`: passed.
+- 3 x 6 concurrent filtered test runs: all passed with zero failures.
+
+Mutation proofs (both restored before final verification):
+- Removed final result sorting: the deterministic-order test failed.
+- Broke `Execute` alias normalization: the recursion-guard test failed.
+
+Final verification:
+- `cargo fmt --all --check`: passed.
+- `cargo test -p oc-tools batch --locked`: passed; 10 task tests passed.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
+- `cargo build --workspace --locked`: passed.
+- `cargo metadata --locked --offline --format-version 1`: passed.
+- Rust no-excuse checker: passed for every modified Rust file.
+- `rust-analyzer diagnostics crates/oc-tools`: no errors on changed files. The
+  only changed-file diagnostic is the inherited inactive-test WeakWarning over
+  `grep.rs`'s `#[cfg(test)]` block.
+- Literal `lsp_diagnostics` could not run because the MCP rejects sibling-worktree
+  paths before starting the server; direct rust-analyzer diagnostics were used.
+
+Commit: 94c66ad — feat(tools): execute as parallel composition with variable binding
