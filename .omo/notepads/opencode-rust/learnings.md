@@ -5868,3 +5868,74 @@ exercises library code the unit tests already cover, and mutation M9 (neutering 
 function) is caught. The honest residual — deleting the *call* from the gate — is not
 unit-caught, but it is also not a correctness regression, because the capture path enforces the
 same check unconditionally. Worth stating explicitly rather than claiming full coverage.
+
+## [2026-08-08] Todo 90: a backpressure registry must be source-derived and behavior-backed
+
+A hand-maintained list can prove every listed channel has a policy while silently missing the
+one channel that matters. The G5 registry therefore scans production Rust source and compares
+the exact constructor set with its declarations. It recognizes bounded and unbounded Tokio,
+standard-library, async-channel, crossbeam and flume spellings, including multiline calls; adding
+one unregistered construction fails before its behavior can be forgotten.
+
+The registry check alone is still insufficient. Each of the 17 persistent bounded channels has
+an independent probe that fills or closes the channel, checks the declared policy, and requires
+an unrelated task to increment a progress counter. Removing that increment makes the gate fail
+with `no independent progress was observed`; "the send eventually returned" is not evidence that
+the rest of the runtime remained live.
+
+G6 also needs an enumerator self-test. A cleanup test whose PID enumerator accidentally returns
+an empty set passes every scenario vacuously. `orphan_enumerator_reports_a_live_pid` first proves
+the current process is visible, and a mutation returning no PIDs is rejected before either
+containment scenario can claim zero survivors.
+
+## [2026-08-08] Todo 90: killing only the direct host is not process-tree containment
+
+The first abnormal-termination fixture exposed a race where the host exited before its
+grandchild. A monitor that stops when the direct child exits leaves that grandchild alive. The
+Linux guard must own a process group and kill that group on both branches: caller death and direct
+host exit. The real G6 fixture deliberately gives every LSP/MCP/PTY/plugin host a grandchild and
+asserts at least 33 enumerated PIDs, preventing a direct-child-only fixture from passing.
+
+## [2026-08-08] Todo 90 review correction: do not convert a design argument into a measured defect
+
+The pre-`oc-process` launch paths were never run under the final real-host G6 fixture. There is
+therefore no pre-guard survivor count and no measured before/after pair to cite. The durable
+numbers begin after containment exists: at least 33 fixture PIDs and zero survivors after both
+clean shutdown and parent `SIGKILL`. An intermediate guard revision exposed the need to kill the
+host process group when the direct host exits first, but its exact survivor list was not retained.
+The accurate claim is that `oc-process` enforces the new abnormal-exit contract, not that it fixes
+a quantified old orphan count.
+
+This distinction also sharpens scope review. LSP, MCP, PTY and JSON-RPC plugin launch wrapping are
+directly exercised by G6. `oc-cli` activation is the production composition-root integration; the
+fixture activates itself. The JavaScript plugin host wrapping is uniform coverage of the plugin
+crate's second persistent host implementation and is not exercised by this G6 fixture. Calling all
+six changes “required by the observed failure” would be false.
+
+## [2026-08-08] Todo 90 review correction: warning provenance is part of verification
+
+The first final report described Clippy's `useless_conversion` as a non-blocking pre-existing
+warning. Both adjectives were wrong: the merge gate rejects every warning, `main` was clean, and
+this commit introduced `.map(OsString::from)` over an iterator already yielding `OsString`.
+
+Rule for future gates: before calling a diagnostic pre-existing, compare the warning line against
+the branch base (or run the exact command on the base). A successful exit code is not a clean
+Clippy gate when stdout/stderr contains `warning:`. The fix is the mechanism, not an allow: take
+the `Vec<OsString>` returned by `memory_flags` directly.
+
+The `lsp_diagnostics` limitation remains correctly attributed: its MCP request cwd is fixed to the
+orchestrator checkout and rejects sibling-worktree paths before analysis. Running
+`rust-analyzer diagnostics .` from the worktree is the appropriate same-backend fallback.
+
+## [2026-08-08] Todo 90 review correction: full-graph offline metadata is a dependency gate
+
+A target-gated dependency is invisible to checks that only build the host target. On Linux,
+`cargo build`, `cargo test`, and `cargo clippy` all passed while the uncached Windows-only
+`process-wrap = 9.1.0` still made the workspace impossible to resolve offline. The repository's
+`make ci` path and merge gate use `cargo metadata --locked --offline --format-version 1`, which
+resolves the complete dependency graph across targets and exposed the failure.
+
+Rule for future dependency changes: run locked offline metadata before claiming the change is
+safe. It is the gate that sees `cfg(windows)` dependencies from a Linux host. A host-target build
+proves only that target's selected graph; it does not prove the lock can be consumed under the
+repository's offline invariant.

@@ -13,6 +13,7 @@ publish.workspace = true
 async-trait = { workspace = true }
 oc-catalog = { workspace = true }
 oc-error = { workspace = true }
+oc-process = { workspace = true }
 oc-tool = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }

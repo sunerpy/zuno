@@ -196,9 +196,10 @@ struct Transport {
 
 impl Transport {
     async fn spawn(spec: &PluginProcessSpec) -> io::Result<Arc<Self>> {
-        let mut command = Command::new(&spec.program);
+        let (program, arguments) = oc_process::guarded_argv(&spec.program, &spec.arguments);
+        let mut command = Command::new(program);
         command
-            .args(&spec.arguments)
+            .args(arguments)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
