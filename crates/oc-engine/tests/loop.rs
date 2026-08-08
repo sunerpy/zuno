@@ -10,7 +10,8 @@ use oc_engine::interrupt::InterruptSignal;
 use oc_engine::r#loop::{
     AgentModelResolver, AvailableTools, DispatchRequest, ResolvedAgent, ResolvedModel,
     RunTurnRequest, ToolDispatchResult, ToolDispatcher, TurnContext, TurnEvent, TurnOutcome,
-    event_channel, run_turn,
+    event_channel, hydrate_retained_history, project_history, project_history_owned,
+    retained_history, run_turn,
 };
 use oc_error::ProviderError;
 use oc_llm::cache::{DynamicContext, McpToolStatus};
@@ -246,6 +247,314 @@ fn put_pending_tool(
     store
         .put_part_at(&part, created)
         .expect("persist pending tool part");
+}
+
+fn put_assistant_text(
+    connection: &Connection,
+    id: &str,
+    created: i64,
+    parent_id: &str,
+    text: &str,
+) {
+    let message = MessageRecord::from_json(json!({
+        "id": id,
+        "sessionID": SESSION_ID,
+        "role": "assistant",
+        "time": { "created": created, "completed": created + 1 },
+        "parentID": parent_id,
+        "modelID": "fake-model",
+        "providerID": "fake",
+        "mode": "build",
+        "agent": "build",
+        "path": { "cwd": "/workspace", "root": "/workspace" },
+        "cost": 0.0,
+        "tokens": {
+            "input": 1,
+            "output": 1,
+            "reasoning": 0,
+            "cache": { "read": 0, "write": 0 }
+        },
+        "finish": "stop"
+    }))
+    .expect("valid assistant message");
+    let part = PartRecord::from_json(
+        json!({
+            "id": format!("prt_{id}"),
+            "sessionID": SESSION_ID,
+            "messageID": id,
+            "type": "text",
+            "text": text
+        }),
+        created,
+    )
+    .expect("valid assistant text");
+    let store = MessageStore::new(connection);
+    store
+        .put_message_at(&message, created)
+        .expect("persist assistant message");
+    store
+        .put_part_at(&part, created)
+        .expect("persist assistant text");
+}
+
+fn put_completed_tool_output(
+    connection: &Connection,
+    message_id: &str,
+    part_id: &str,
+    created: i64,
+    output: &str,
+) {
+    let message = MessageRecord::from_json(json!({
+        "id": message_id,
+        "sessionID": SESSION_ID,
+        "role": "assistant",
+        "time": { "created": created, "completed": created + 1 },
+        "parentID": "msg_old_user",
+        "modelID": "fake-model",
+        "providerID": "fake",
+        "mode": "build",
+        "agent": "build",
+        "path": { "cwd": "/workspace", "root": "/workspace" },
+        "cost": 0.0,
+        "tokens": {
+            "input": 1,
+            "output": 1,
+            "reasoning": 0,
+            "cache": { "read": 0, "write": 0 }
+        },
+        "finish": "tool-calls"
+    }))
+    .expect("valid assistant message");
+    let part = PartRecord::from_json(
+        json!({
+            "id": part_id,
+            "sessionID": SESSION_ID,
+            "messageID": message_id,
+            "type": "tool",
+            "callID": "call-large",
+            "tool": "read",
+            "state": {
+                "status": "completed",
+                "input": { "filePath": "/large.txt" },
+                "output": output
+            }
+        }),
+        created,
+    )
+    .expect("valid completed tool part");
+    let store = MessageStore::new(connection);
+    store
+        .put_message_at(&message, created)
+        .expect("persist assistant message");
+    store
+        .put_part_at(&part, created)
+        .expect("persist completed tool part");
+}
+
+fn put_successful_compaction(
+    connection: &Connection,
+    marker_id: &str,
+    summary_id: &str,
+    tail_start_id: &str,
+    created: i64,
+) {
+    let marker = MessageRecord::from_json(json!({
+        "id": marker_id,
+        "sessionID": SESSION_ID,
+        "role": "user",
+        "time": { "created": created },
+        "agent": "compaction",
+        "model": { "providerID": "fake", "modelID": "fake-model" }
+    }))
+    .expect("valid compaction marker");
+    let marker_part = PartRecord::from_json(
+        json!({
+            "id": format!("prt_{marker_id}"),
+            "sessionID": SESSION_ID,
+            "messageID": marker_id,
+            "type": "compaction",
+            "auto": true,
+            "overflow": true,
+            "tail_start_id": tail_start_id
+        }),
+        created,
+    )
+    .expect("valid compaction part");
+    let summary = MessageRecord::from_json(json!({
+        "id": summary_id,
+        "sessionID": SESSION_ID,
+        "role": "assistant",
+        "parentID": marker_id,
+        "time": { "created": created + 1, "completed": created + 2 },
+        "modelID": "fake-model",
+        "providerID": "fake",
+        "mode": "compaction",
+        "agent": "compaction",
+        "summary": true,
+        "cost": 0.0,
+        "tokens": {
+            "input": 1,
+            "output": 1,
+            "reasoning": 0,
+            "cache": { "read": 0, "write": 0 }
+        },
+        "finish": "stop"
+    }))
+    .expect("valid compaction summary");
+    let summary_part = PartRecord::from_json(
+        json!({
+            "id": format!("prt_{summary_id}"),
+            "sessionID": SESSION_ID,
+            "messageID": summary_id,
+            "type": "text",
+            "text": "Earlier work was summarized without changing the retained tail."
+        }),
+        created + 1,
+    )
+    .expect("valid summary text");
+    let store = MessageStore::new(connection);
+    store
+        .put_message_at(&marker, created)
+        .expect("persist compaction marker");
+    store
+        .put_part_at(&marker_part, created)
+        .expect("persist compaction part");
+    store
+        .put_message_at(&summary, created + 2)
+        .expect("persist compaction summary");
+    store
+        .put_part_at(&summary_part, created + 2)
+        .expect("persist summary text");
+}
+
+fn put_incomplete_compaction(
+    connection: &Connection,
+    marker_id: &str,
+    summary_id: &str,
+    tail_start_id: &str,
+    created: i64,
+    summary_text: Option<&str>,
+    failed: bool,
+) {
+    let marker = MessageRecord::from_json(json!({
+        "id": marker_id,
+        "sessionID": SESSION_ID,
+        "role": "user",
+        "time": { "created": created },
+        "agent": "compaction",
+        "model": { "providerID": "fake", "modelID": "fake-model" }
+    }))
+    .expect("valid compaction marker");
+    let marker_part = PartRecord::from_json(
+        json!({
+            "id": format!("prt_{marker_id}"),
+            "sessionID": SESSION_ID,
+            "messageID": marker_id,
+            "type": "compaction",
+            "auto": true,
+            "overflow": true,
+            "tail_start_id": tail_start_id
+        }),
+        created,
+    )
+    .expect("valid compaction part");
+    let mut summary_data = json!({
+        "id": summary_id,
+        "sessionID": SESSION_ID,
+        "role": "assistant",
+        "parentID": marker_id,
+        "time": { "created": created + 1, "completed": created + 2 },
+        "modelID": "fake-model",
+        "providerID": "fake",
+        "mode": "compaction",
+        "agent": "compaction",
+        "summary": true,
+        "cost": 0.0,
+        "tokens": {
+            "input": 1,
+            "output": 1,
+            "reasoning": 0,
+            "cache": { "read": 0, "write": 0 }
+        },
+        "finish": if failed { "error" } else { "stop" }
+    });
+    if failed {
+        summary_data["error"] = json!({
+            "name": "CompactionError",
+            "data": { "message": "summary failed", "isRetryable": false }
+        });
+    }
+    let summary = MessageRecord::from_json(summary_data).expect("valid compaction summary");
+    let store = MessageStore::new(connection);
+    store
+        .put_message_at(&marker, created)
+        .expect("persist compaction marker");
+    store
+        .put_part_at(&marker_part, created)
+        .expect("persist compaction part");
+    store
+        .put_message_at(&summary, created + 2)
+        .expect("persist compaction summary");
+    if let Some(text) = summary_text {
+        let part = PartRecord::from_json(
+            json!({
+                "id": format!("prt_{summary_id}"),
+                "sessionID": SESSION_ID,
+                "messageID": summary_id,
+                "type": "text",
+                "text": text
+            }),
+            created + 1,
+        )
+        .expect("valid summary text");
+        store
+            .put_part_at(&part, created + 2)
+            .expect("persist summary text");
+    }
+}
+
+fn assert_loader_projection_matches_full_reference(connection: &Connection) {
+    const SYSTEM: &str = "You are a deterministic test agent.";
+    let full = MessageStore::new(connection)
+        .hydrate_session(SESSION_ID)
+        .expect("full reference history");
+    let expected = project_history(SYSTEM, retained_history(&full))
+        .into_iter()
+        .map(|projected| projected.message)
+        .collect::<Vec<_>>();
+    let optimized = hydrate_retained_history(connection, SESSION_ID).expect("optimized history");
+    let actual = project_history_owned(SYSTEM, optimized);
+
+    assert_eq!(
+        serde_json::to_vec(&actual).expect("serialize optimized projection"),
+        serde_json::to_vec(&expected).expect("serialize reference projection"),
+        "optimized loader changed provider-visible history bytes"
+    );
+}
+
+fn assert_dropping_first_history_message_changes_projection(connection: &Connection) {
+    const SYSTEM: &str = "You are a deterministic test agent.";
+    let full = MessageStore::new(connection)
+        .hydrate_session(SESSION_ID)
+        .expect("full reference history");
+    assert!(
+        full.len() > 1,
+        "the sensitivity fixture needs a non-empty history prefix"
+    );
+    let complete = project_history(SYSTEM, &full)
+        .into_iter()
+        .map(|projected| projected.message)
+        .collect::<Vec<_>>();
+    let without_first = project_history(SYSTEM, &full[1..])
+        .into_iter()
+        .map(|projected| projected.message)
+        .collect::<Vec<_>>();
+
+    assert_ne!(
+        serde_json::to_vec(&without_first).expect("serialize truncated projection"),
+        serde_json::to_vec(&complete).expect("serialize full projection"),
+        "fixture is vacuous: dropping its first history message did not change provider-visible bytes"
+    );
 }
 
 fn registry(provider: &Arc<FakeProvider>) -> ProviderRegistry {
@@ -598,6 +907,258 @@ async fn loop_repairs_a_missing_tool_result_before_the_provider_sees_history() {
         "REPAIR_QA provider_request={request:#?} db_part={:#?}",
         repaired.to_json()
     );
+}
+
+/// Todo 113's two-phase loader is allowed to avoid decoding only the history that
+/// [`retained_history`] would discard. The provider-visible bytes are the invariant:
+/// changing their order loses the append-only prompt-cache hit, while omitting any
+/// retained block changes the model's prompt. The pending tool before the boundary
+/// separately proves repair still scans beyond the retained suffix.
+#[tokio::test]
+async fn loop_compacted_prefix_is_byte_identical_without_decoding_the_discarded_head() {
+    const SYSTEM: &str = "You are a deterministic test agent.";
+    let mut connection = seeded();
+    put_user(&connection, "msg_old_user", 10, "old request");
+    put_pending_tool(
+        &connection,
+        "msg_old_pending",
+        "prt_old_pending",
+        15,
+        "call-old-pending",
+    );
+    let large_output = "x".repeat(2 * 1024 * 1024);
+    put_completed_tool_output(
+        &connection,
+        "msg_old_large",
+        "prt_old_large",
+        20,
+        &large_output,
+    );
+    put_user(&connection, "msg_tail_user", 30, "retained request");
+    put_assistant_text(
+        &connection,
+        "msg_tail_assistant",
+        40,
+        "msg_tail_user",
+        "retained answer",
+    );
+    put_successful_compaction(
+        &connection,
+        "msg_compaction_marker",
+        "msg_compaction_summary",
+        "msg_tail_user",
+        50,
+    );
+    put_user(&connection, "msg_current_user", 60, "current request");
+
+    // Reference path: the pre-113 implementation decoded every part and trimmed
+    // only afterwards. Its serialized projection is the byte-level oracle.
+    let full = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .expect("full reference history");
+    let expected_messages = project_history(SYSTEM, retained_history(&full))
+        .into_iter()
+        .map(|projected| projected.message)
+        .collect::<Vec<_>>();
+    let expected_prefix = serde_json::to_vec(&expected_messages).expect("serialize reference");
+    let full_part_bytes = full
+        .iter()
+        .flat_map(|message| &message.parts)
+        .map(|part| {
+            serde_json::to_vec(&part.data)
+                .expect("serialize part")
+                .len()
+        })
+        .sum::<usize>();
+
+    // Optimized path: all retained prompt messages must remain, in byte-identical
+    // order, while the multi-megabyte pre-compaction tool blob is never resident.
+    let optimized = hydrate_retained_history(&connection, SESSION_ID).expect("retained history");
+    let optimized_messages = project_history(SYSTEM, retained_history(&optimized))
+        .into_iter()
+        .map(|projected| projected.message)
+        .collect::<Vec<_>>();
+    let owned_messages = project_history_owned(SYSTEM, optimized.clone());
+    let optimized_prefix =
+        serde_json::to_vec(&optimized_messages).expect("serialize optimized prefix");
+    let optimized_part_bytes = optimized
+        .iter()
+        .flat_map(|message| &message.parts)
+        .map(|part| {
+            serde_json::to_vec(&part.data)
+                .expect("serialize part")
+                .len()
+        })
+        .sum::<usize>();
+
+    assert_eq!(
+        optimized_prefix, expected_prefix,
+        "the request prefix changed byte-for-byte"
+    );
+    assert_eq!(
+        optimized_messages, expected_messages,
+        "a prompt-bearing message was dropped or reordered"
+    );
+    assert_eq!(
+        serde_json::to_vec(&owned_messages).expect("serialize consuming projection"),
+        expected_prefix,
+        "the consuming projection changed the provider-visible bytes"
+    );
+    assert!(
+        optimized_part_bytes * 100 < full_part_bytes,
+        "the discarded head was still decoded: full={full_part_bytes}, optimized={optimized_part_bytes}"
+    );
+    assert!(
+        optimized
+            .iter()
+            .all(|message| message.info.id != "msg_old_large"),
+        "the pre-compaction large tool message remains resident"
+    );
+
+    let provider = Arc::new(FakeProvider::new(vec![ScriptedResponse::complete(vec![
+        StreamEvent::TextDelta("done".to_owned()),
+        StreamEvent::MessageEnd {
+            stop_reason: Some(FinishReason::Stop),
+        },
+    ])]));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+    let turn = run_turn(
+        request("turn-compacted-prefix"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, _events) = tokio::join!(turn, collect_events(receiver));
+    assert!(matches!(
+        outcome,
+        Ok(TurnOutcome::Completed { steps: 1, .. })
+    ));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        serde_json::to_vec(&requests[0].messages).expect("serialize provider request"),
+        expected_prefix,
+        "run_turn did not send the reference prefix"
+    );
+
+    let repaired = MessageStore::new(&connection)
+        .part("prt_old_pending")
+        .expect("read pre-boundary pending tool");
+    assert_eq!(
+        repaired.data["state"]["status"], "error",
+        "tool repair stopped at the compaction boundary"
+    );
+}
+
+#[test]
+fn loop_failed_compaction_falls_back_to_byte_identical_full_history() {
+    let connection = seeded();
+    put_user(
+        &connection,
+        "msg_old_user",
+        10,
+        "history before failed summary",
+    );
+    put_user(
+        &connection,
+        "msg_tail_user",
+        20,
+        "tail that must not replace history",
+    );
+    put_incomplete_compaction(
+        &connection,
+        "msg_failed_marker",
+        "msg_failed_summary",
+        "msg_tail_user",
+        30,
+        None,
+        true,
+    );
+    put_user(&connection, "msg_current_user", 40, "current request");
+
+    assert_loader_projection_matches_full_reference(&connection);
+}
+
+#[test]
+fn loop_empty_compaction_summary_falls_back_to_byte_identical_full_history() {
+    let connection = seeded();
+    put_user(
+        &connection,
+        "msg_old_user",
+        10,
+        "history before empty summary",
+    );
+    put_user(
+        &connection,
+        "msg_tail_user",
+        20,
+        "tail that must not replace history",
+    );
+    put_incomplete_compaction(
+        &connection,
+        "msg_empty_marker",
+        "msg_empty_summary",
+        "msg_tail_user",
+        30,
+        Some(""),
+        false,
+    );
+    put_user(&connection, "msg_current_user", 40, "current request");
+
+    assert_loader_projection_matches_full_reference(&connection);
+}
+
+#[test]
+fn loop_successful_compaction_with_missing_tail_falls_back_to_byte_identical_full_history() {
+    let connection = seeded();
+    put_user(
+        &connection,
+        "msg_old_user",
+        10,
+        "history before dangling boundary",
+    );
+    put_user(
+        &connection,
+        "msg_tail_user",
+        20,
+        "real tail remains part of history",
+    );
+    put_successful_compaction(
+        &connection,
+        "msg_dangling_marker",
+        "msg_dangling_summary",
+        "msg_missing_tail",
+        30,
+    );
+    put_user(&connection, "msg_current_user", 40, "current request");
+
+    assert_dropping_first_history_message_changes_projection(&connection);
+    assert_loader_projection_matches_full_reference(&connection);
+}
+
+#[test]
+fn loop_without_compaction_marker_is_byte_identical_to_full_history() {
+    let connection = seeded();
+    put_user(&connection, "msg_first_user", 10, "first request");
+    put_assistant_text(
+        &connection,
+        "msg_first_assistant",
+        20,
+        "msg_first_user",
+        "first answer",
+    );
+    put_user(&connection, "msg_current_user", 30, "current request");
+
+    assert_loader_projection_matches_full_reference(&connection);
 }
 
 async fn collect_and_interrupt(

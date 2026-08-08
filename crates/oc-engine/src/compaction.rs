@@ -395,14 +395,14 @@ impl CompactionState {
 }
 
 /// Inputs for one compaction attempt.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CompactionRequest<'a> {
     pub session_id: &'a str,
     pub attempt_id: &'a str,
     pub agent: &'a str,
     pub provider_id: &'a str,
     pub small_model_id: &'a str,
-    pub entries: &'a [TranscriptEntry],
+    pub entries: Vec<TranscriptEntry>,
     pub config: &'a CompactionConfig,
     pub window: TokenWindow,
     pub trigger: CompactionTrigger,
@@ -420,7 +420,7 @@ impl<'a> CompactionRequest<'a> {
         agent: &'a str,
         provider_id: &'a str,
         small_model_id: &'a str,
-        entries: &'a [TranscriptEntry],
+        entries: Vec<TranscriptEntry>,
         config: &'a CompactionConfig,
         window: TokenWindow,
         trigger: CompactionTrigger,
@@ -524,7 +524,7 @@ where
         return Ok(CompactionOutcome::NotNeeded);
     }
     let Some(boundary) = select_boundary(
-        request.entries,
+        &request.entries,
         policy.tail_turns,
         u32::try_from(policy.preserve_recent_tokens).unwrap_or(u32::MAX),
     ) else {
@@ -572,9 +572,13 @@ where
     let summary_prompt = prompt.prompt.unwrap_or_else(|| {
         build_summary_prompt(request.previous_summary, prompt.context.as_slice())
     });
-    let mut model_messages = request.entries[boundary.initial_context_end..boundary.retained_from]
-        .iter()
-        .map(|entry| summary_safe_message(&entry.message))
+    let mut entries = request.entries;
+    let retained = entries.split_off(boundary.retained_from);
+    let summarized = entries.split_off(boundary.initial_context_end);
+    let initial = entries;
+    let mut model_messages = summarized
+        .into_iter()
+        .map(|entry| summary_safe_message_owned(entry.message))
         .collect::<Vec<_>>();
     model_messages.push(Message::new(Role::User, summary_prompt));
     let mut stream = provider.stream(CompletionRequest::new(
@@ -652,16 +656,12 @@ where
         false
     };
 
-    let mut messages = request.entries[..boundary.initial_context_end]
-        .iter()
-        .map(|entry| entry.message.clone())
+    let mut messages = initial
+        .into_iter()
+        .map(|entry| entry.message)
         .collect::<Vec<_>>();
     messages.push(Message::new(Role::Assistant, summary.clone()));
-    messages.extend(
-        request.entries[boundary.retained_from..]
-            .iter()
-            .map(|entry| entry.message.clone()),
-    );
+    messages.extend(retained.into_iter().map(|entry| entry.message));
 
     Ok(CompactionOutcome::Compacted(CompactedTranscript {
         summary,
@@ -692,34 +692,32 @@ pub fn build_summary_prompt(previous_summary: Option<&str>, context: &[String]) 
         .join("\n\n")
 }
 
-fn summary_safe_message(message: &Message) -> Message {
+fn summary_safe_message_owned(message: Message) -> Message {
     Message::from_content(
         message.role,
         message
             .content
-            .iter()
+            .into_iter()
             .map(|block| match block {
                 RequestContentBlock::ToolResult {
                     tool_use_id,
                     content,
                     is_error,
                 } => RequestContentBlock::ToolResult {
-                    tool_use_id: tool_use_id.clone(),
-                    content: truncate_tool_output(content),
-                    is_error: *is_error,
+                    tool_use_id,
+                    content: truncate_tool_output_owned(content),
+                    is_error,
                 },
                 RequestContentBlock::Image { media_type, .. } => RequestContentBlock::Text {
                     text: format!("[Attached {media_type}]"),
                 },
-                RequestContentBlock::Text { text } => {
-                    RequestContentBlock::Text { text: text.clone() }
-                }
+                RequestContentBlock::Text { text } => RequestContentBlock::Text { text },
                 RequestContentBlock::SignedThinking {
                     thinking,
                     signature,
                 } => RequestContentBlock::SignedThinking {
-                    thinking: thinking.clone(),
-                    signature: signature.clone(),
+                    thinking,
+                    signature,
                 },
                 RequestContentBlock::ProviderEncryptedReasoning {
                     id,
@@ -727,10 +725,10 @@ fn summary_safe_message(message: &Message) -> Message {
                     encrypted_content,
                     status,
                 } => RequestContentBlock::ProviderEncryptedReasoning {
-                    id: id.clone(),
-                    summary: summary.clone(),
-                    encrypted_content: encrypted_content.clone(),
-                    status: status.clone(),
+                    id,
+                    summary,
+                    encrypted_content,
+                    status,
                 },
                 RequestContentBlock::ToolUse {
                     id,
@@ -738,19 +736,19 @@ fn summary_safe_message(message: &Message) -> Message {
                     input,
                     thought_signature,
                 } => RequestContentBlock::ToolUse {
-                    id: id.clone(),
-                    name: name.clone(),
-                    input: input.clone(),
-                    thought_signature: thought_signature.clone(),
+                    id,
+                    name,
+                    input,
+                    thought_signature,
                 },
             })
             .collect(),
     )
 }
 
-fn truncate_tool_output(content: &str) -> String {
+fn truncate_tool_output_owned(content: String) -> String {
     if content.chars().count() <= TOOL_OUTPUT_MAX_CHARS {
-        return content.to_owned();
+        return content;
     }
     let mut truncated = content
         .chars()

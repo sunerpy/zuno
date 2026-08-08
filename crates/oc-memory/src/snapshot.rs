@@ -572,7 +572,7 @@ mod tests {
             "build",
             provider.id(),
             "small-model",
-            entries,
+            entries.to_vec(),
             &config,
             TokenWindow {
                 context: 100_000,

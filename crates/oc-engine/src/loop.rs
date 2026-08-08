@@ -575,9 +575,7 @@ pub async fn run_turn(
             return Ok(outcome);
         }
 
-        let mut history =
-            MessageStore::new(context.connection).hydrate_session(&request.session_id)?;
-        let repaired = repair_missing_tool_outputs(context.connection, &mut history)?;
+        let repaired = repair_missing_tool_outputs(context.connection, &request.session_id)?;
         if repaired > 0 {
             events
                 .send(TurnEvent::HistoryRepaired {
@@ -586,7 +584,7 @@ pub async fn run_turn(
                 .await?;
         }
 
-        let retained = retained_history(&history);
+        let history = hydrate_retained_history(context.connection, &request.session_id)?;
         let requested = requested_turn(&request.session_id, &history)?;
         let agent = context
             .resolver
@@ -629,10 +627,13 @@ pub async fn run_turn(
             .resolve(model.provider.clone())
             .map_err(ProviderError::from)?;
         let capabilities = provider.capabilities();
-        let stable_history = provider_messages(&agent.system_prompt, retained);
         let mut assistant = assistant_message(
             &request, &session, &requested, &agent, &model, step, &history,
         )?;
+        // Project by consuming the decoded records. Large text, image and tool
+        // payloads move from SQLite JSON trees into provider blocks instead of
+        // existing in both representations at the same time.
+        let stable_history = project_history_owned(&agent.system_prompt, history);
         let assistant_id = assistant.id.clone();
         MessageStore::new(context.connection).put_message(&assistant)?;
         last_assistant_id = Some(assistant_id.clone());
@@ -651,8 +652,8 @@ pub async fn run_turn(
         };
         let cache =
             prompt_cache.get_or_insert_with(|| PromptCache::new(agent.system_prompt.clone()));
-        let prepared = cache.prepare_turn(
-            &stable_history,
+        let prepared = cache.prepare_turn_owned(
+            stable_history,
             request.dynamic_context.clone(),
             &definitions,
             available.mcp_status,
@@ -672,7 +673,7 @@ pub async fn run_turn(
             })
             .await?;
 
-        let completion = completion_request(&model, &prepared);
+        let completion = completion_request(&model, prepared);
         let mut stream = provider.stream(completion);
         let mut accumulator = StepAccumulator::default();
         let mut interrupted = false;
@@ -889,35 +890,97 @@ fn required_string(record: &MessageRecord, field: &'static str) -> Result<String
 
 fn repair_missing_tool_outputs(
     connection: &Connection,
-    history: &mut [MessageWithParts],
+    session_id: &str,
 ) -> Result<usize, TurnError> {
     let store = MessageStore::new(connection);
     let mut repaired = 0;
-    for message in history {
-        for part in &mut message.parts {
-            if part.kind != PartKind::Tool {
-                continue;
-            }
-            let Some(state) = part.data.get_mut("state").and_then(Value::as_object_mut) else {
-                continue;
-            };
-            let status = state.get("status").and_then(Value::as_str);
-            if matches!(status, Some("completed" | "error")) {
-                continue;
-            }
-            state.insert("status".to_owned(), Value::String("error".to_owned()));
-            state.insert(
-                "error".to_owned(),
-                Value::String(INTERRUPTED_TOOL_RESULT.to_owned()),
-            );
-            let mut metadata = Map::new();
-            metadata.insert("interrupted".to_owned(), Value::Bool(true));
-            state.insert("metadata".to_owned(), Value::Object(metadata));
-            store.put_part(part)?;
-            repaired += 1;
-        }
+    for mut part in store.unfinished_tool_parts_for_session(session_id)? {
+        let Some(state) = part.data.get_mut("state").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        state.insert("status".to_owned(), Value::String("error".to_owned()));
+        state.insert(
+            "error".to_owned(),
+            Value::String(INTERRUPTED_TOOL_RESULT.to_owned()),
+        );
+        let mut metadata = Map::new();
+        metadata.insert("interrupted".to_owned(), Value::Bool(true));
+        state.insert("metadata".to_owned(), Value::Object(metadata));
+        store.put_part(&part)?;
+        repaired += 1;
     }
     Ok(repaired)
+}
+
+/// Hydrate exactly the suffix that [`retained_history`] permits a request to carry.
+///
+/// The first phase decodes only message metadata, compaction markers, and candidate
+/// summary text. Full part hydration starts only after a successful marker's
+/// `tail_start_id`; a failed or dangling compaction still falls back to the complete
+/// session. Message and part ordering remains the database's `(time_created, id)` /
+/// `part.id` order, which protects the byte-stable prefix checked by
+/// `loop_compacted_prefix_is_byte_identical_without_decoding_the_discarded_head`.
+///
+/// # Errors
+///
+/// Database query or decode failures from either phase.
+pub fn hydrate_retained_history(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Vec<MessageWithParts>, DbError> {
+    let store = MessageStore::new(connection);
+    let mut messages = store.messages_for_session(session_id)?;
+    if messages.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let compaction_parts = store.parts_for_session_by_kind(session_id, PartKind::Compaction)?;
+    let marker = messages.iter().rev().find_map(|message| {
+        compaction_parts
+            .iter()
+            .filter(|part| part.message_id == message.id)
+            .find_map(|part| {
+                part.data
+                    .get("tail_start_id")
+                    .and_then(Value::as_str)
+                    .map(|tail_start_id| (message.id.clone(), tail_start_id.to_owned()))
+            })
+    });
+
+    let Some((marker_id, tail_start_id)) = marker else {
+        return store.hydrate(messages);
+    };
+    let summary_ids = messages
+        .iter()
+        .filter(|message| {
+            message.data.get("parentID").and_then(Value::as_str) == Some(marker_id.as_str())
+                && !message.data.contains_key("error")
+        })
+        .map(|message| message.id.clone())
+        .collect::<Vec<_>>();
+    let summary_text = store.parts_by_message_kind(&summary_ids, PartKind::Text)?;
+    let summary_succeeded = summary_ids.iter().any(|id| {
+        summary_text.get(id).is_some_and(|parts| {
+            parts.iter().any(|part| {
+                part.data
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.trim().is_empty())
+            })
+        })
+    });
+    if !summary_succeeded {
+        return store.hydrate(messages);
+    }
+    let Some(tail_index) = messages
+        .iter()
+        .position(|message| message.id == tail_start_id)
+    else {
+        return store.hydrate(messages);
+    };
+
+    messages.drain(..tail_index);
+    store.hydrate(messages)
 }
 
 /// One provider-bound message, and the stored message it was projected from.
@@ -939,10 +1002,11 @@ pub struct ProjectedMessage {
 
 /// Project stored history into the exact message list a request carries.
 ///
-/// The single projection. A caller that wants only the messages uses
-/// [`provider_messages`]; a caller that has to reason about *which* stored message
-/// produced one uses this. Two projections would be free to drift, and the one that
-/// drifted would be the one compaction measured.
+/// The provenance-preserving projection used by compaction and byte-level tests.
+/// Runtime provider requests use [`project_history_owned`] so large payloads move
+/// rather than clone; the two paths are kept byte-equivalent by the loop regression
+/// test. Keeping this projection single-sourced prevents compaction boundaries from
+/// drifting away from the messages they measure.
 #[must_use]
 pub fn project_history(system_prompt: &str, history: &[MessageWithParts]) -> Vec<ProjectedMessage> {
     let mut projected = vec![ProjectedMessage {
@@ -963,11 +1027,54 @@ pub fn project_history(system_prompt: &str, history: &[MessageWithParts]) -> Vec
     projected
 }
 
-fn provider_messages(system_prompt: &str, history: &[MessageWithParts]) -> Vec<Message> {
-    project_history(system_prompt, history)
+/// Consume retained history into the exact provider message list.
+///
+/// The output is byte-equivalent to [`project_history`], but large strings and
+/// JSON values are moved out of stored parts rather than cloned. The retained
+/// boundary is computed before ownership is consumed, preserving failed and
+/// dangling compaction semantics.
+#[must_use]
+pub fn project_history_owned(system_prompt: &str, history: Vec<MessageWithParts>) -> Vec<Message> {
+    project_history_owned_with_ids(system_prompt, history)
         .into_iter()
         .map(|projected| projected.message)
         .collect()
+}
+
+/// Consume retained history while preserving each provider message's stored id.
+///
+/// This is the ownership-moving counterpart to [`project_history`]. Compaction uses
+/// the ids to persist its tail boundary, while moving large part payloads directly
+/// into transcript entries instead of keeping both hydrated and projected copies.
+#[must_use]
+pub fn project_history_owned_with_ids(
+    system_prompt: &str,
+    mut history: Vec<MessageWithParts>,
+) -> Vec<ProjectedMessage> {
+    let retained_start = retained_history(&history).as_ptr_range().start;
+    let tail_index = history
+        .iter()
+        .position(|message| std::ptr::eq(message, retained_start))
+        .unwrap_or(history.len());
+    let mut projected = vec![ProjectedMessage {
+        message_id: None,
+        message: Message::new(Role::System, system_prompt),
+    }];
+    for message in history.drain(tail_index..) {
+        let message_id = message.info.id;
+        let mut messages = Vec::new();
+        match message.info.role {
+            MessageRole::User => append_user_message_owned(&mut messages, message.parts),
+            MessageRole::Assistant => {
+                append_assistant_message_owned(&mut messages, message.parts);
+            }
+        }
+        projected.extend(messages.into_iter().map(|message| ProjectedMessage {
+            message_id: Some(message_id.clone()),
+            message,
+        }));
+    }
+    projected
 }
 
 /// The suffix of `history` a request may carry, honouring the newest compaction.
@@ -1094,6 +1201,46 @@ fn append_user_message(messages: &mut Vec<Message>, message: &MessageWithParts) 
     }
 }
 
+fn take_string(data: &mut Map<String, Value>, key: &str) -> Option<String> {
+    match data.remove(key) {
+        Some(Value::String(value)) => Some(value),
+        Some(_) | None => None,
+    }
+}
+
+fn append_user_message_owned(messages: &mut Vec<Message>, parts: Vec<PartRecord>) {
+    let mut content = Vec::new();
+    for mut part in parts {
+        match part.kind {
+            PartKind::Text => {
+                if let Some(text) = take_string(&mut part.data, "text") {
+                    content.push(RequestContentBlock::Text { text });
+                }
+            }
+            PartKind::File => {
+                let media_type = take_string(&mut part.data, "mime");
+                let data = take_string(&mut part.data, "data");
+                if let (Some(media_type), Some(data)) = (media_type, data) {
+                    content.push(RequestContentBlock::Image { media_type, data });
+                }
+            }
+            PartKind::Subtask
+            | PartKind::Reasoning
+            | PartKind::Tool
+            | PartKind::StepStart
+            | PartKind::StepFinish
+            | PartKind::Snapshot
+            | PartKind::Patch
+            | PartKind::Agent
+            | PartKind::Retry
+            | PartKind::Compaction => {}
+        }
+    }
+    if !content.is_empty() {
+        messages.push(Message::from_content(Role::User, content));
+    }
+}
+
 fn append_assistant_message(messages: &mut Vec<Message>, message: &MessageWithParts) {
     let mut assistant = Vec::new();
     let mut results = Vec::new();
@@ -1124,6 +1271,94 @@ fn append_assistant_message(messages: &mut Vec<Message>, message: &MessageWithPa
     }
     if !results.is_empty() {
         messages.push(Message::from_content(Role::Tool, results));
+    }
+}
+
+fn append_assistant_message_owned(messages: &mut Vec<Message>, parts: Vec<PartRecord>) {
+    let mut assistant = Vec::new();
+    let mut results = Vec::new();
+    for mut part in parts {
+        match part.kind {
+            PartKind::Text => {
+                if let Some(text) = take_string(&mut part.data, "text") {
+                    assistant.push(RequestContentBlock::Text { text });
+                }
+            }
+            PartKind::Reasoning => append_reasoning_owned(&mut assistant, part.data),
+            PartKind::Tool => append_tool_pair_owned(&mut assistant, &mut results, part.data),
+            PartKind::Subtask
+            | PartKind::File
+            | PartKind::StepStart
+            | PartKind::StepFinish
+            | PartKind::Snapshot
+            | PartKind::Patch
+            | PartKind::Agent
+            | PartKind::Retry
+            | PartKind::Compaction => {}
+        }
+    }
+    if !assistant.is_empty() {
+        messages.push(Message::from_content(Role::Assistant, assistant));
+    }
+    if !results.is_empty() {
+        messages.push(Message::from_content(Role::Tool, results));
+    }
+}
+
+fn append_reasoning_owned(content: &mut Vec<RequestContentBlock>, mut data: Map<String, Value>) {
+    let thinking = take_string(&mut data, "text");
+    let signature = match data.remove("metadata") {
+        Some(Value::Object(mut metadata)) => take_string(&mut metadata, "signature"),
+        Some(_) | None => None,
+    };
+    if let (Some(thinking), Some(signature)) = (thinking, signature) {
+        content.push(RequestContentBlock::SignedThinking {
+            thinking,
+            signature,
+        });
+    }
+}
+
+fn append_tool_pair_owned(
+    assistant: &mut Vec<RequestContentBlock>,
+    results: &mut Vec<RequestContentBlock>,
+    mut data: Map<String, Value>,
+) {
+    let Some(call_id) = take_string(&mut data, "callID") else {
+        return;
+    };
+    let Some(name) = take_string(&mut data, "tool") else {
+        return;
+    };
+    let Some(Value::Object(mut state)) = data.remove("state") else {
+        return;
+    };
+    let input = state.remove("input").unwrap_or_else(|| json!({}));
+    let thought_signature = match data.remove("metadata") {
+        Some(Value::Object(mut metadata)) => take_string(&mut metadata, "thoughtSignature"),
+        Some(_) | None => None,
+    }
+    .map(ThoughtSignature::new);
+    assistant.push(RequestContentBlock::ToolUse {
+        id: call_id.clone(),
+        name,
+        input,
+        thought_signature,
+    });
+
+    match take_string(&mut state, "status").as_deref() {
+        Some("completed") => results.push(RequestContentBlock::ToolResult {
+            tool_use_id: call_id,
+            content: take_string(&mut state, "output").unwrap_or_default(),
+            is_error: Some(false),
+        }),
+        Some("error") => results.push(RequestContentBlock::ToolResult {
+            tool_use_id: call_id,
+            content: take_string(&mut state, "error")
+                .unwrap_or_else(|| INTERRUPTED_TOOL_RESULT.to_owned()),
+            is_error: Some(true),
+        }),
+        Some(_) | None => {}
     }
 }
 
@@ -1241,14 +1476,14 @@ fn assistant_message(
 
 fn completion_request(
     model: &ResolvedModel,
-    prepared: &PreparedTurn<ToolDefinition>,
+    prepared: PreparedTurn<ToolDefinition>,
 ) -> oc_llm::registry::CompletionRequest {
+    let (messages, tools) = prepared.into_request_parts();
     oc_llm::registry::CompletionRequest {
         model_id: model.model_id.clone(),
         surface: model.surface,
-        messages: prepared.messages().to_vec(),
-        tools: prepared
-            .tools()
+        messages,
+        tools: tools
             .iter()
             .map(|tool| oc_llm::registry::ToolSchema {
                 name: tool.id.clone(),

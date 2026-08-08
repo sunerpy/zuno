@@ -47,7 +47,10 @@ use crate::compaction::{
     CompactionCache, CompactionError, CompactionOutcome, CompactionPolicy, CompactionRequest,
     CompactionState, CompactionTrigger, TokenWindow, TranscriptEntry, run_compaction,
 };
-use crate::r#loop::{ResolvedModel, project_history, retained_history};
+use crate::r#loop::{
+    ResolvedModel, hydrate_retained_history, project_history, project_history_owned_with_ids,
+    retained_history,
+};
 use futures::StreamExt;
 
 /// Characters per token in upstream's estimator (`core/src/util/token.ts:3`).
@@ -303,8 +306,7 @@ pub async fn compact_if_overflowing(
     session_id: &str,
     context: &mut PreludeContext<'_>,
 ) -> Result<bool, CompactionSkipped> {
-    let store_history = MessageStore::new(context.connection)
-        .hydrate_session(session_id)
+    let store_history = hydrate_retained_history(context.connection, session_id)
         .map_err(CompactionSkipped::Database)?;
     let retained = retained_history(&store_history);
     let Some(used_tokens) = measured_tokens(retained) else {
@@ -316,7 +318,6 @@ pub async fn compact_if_overflowing(
     }
 
     let agent = &context.internals.compaction;
-    let entries = transcript(&agent.prompt, retained);
     let provider = context
         .providers
         .provider_for(agent)
@@ -327,13 +328,14 @@ pub async fn compact_if_overflowing(
     let mut cache = CompactionCache::new(&mut tracker, &mut locked);
     let attempt_id = format!("compact_{}", oc_db::message::now_millis());
     let requested_agent = requested_agent(retained).unwrap_or_else(|| agent.name.clone());
+    let entries = transcript_owned(&agent.prompt, store_history);
     let request = CompactionRequest::new(
         session_id,
         &attempt_id,
         &requested_agent,
         &agent.model.provider.provider,
         &agent.model.model_id,
-        &entries,
+        entries,
         context.compaction,
         context.window,
         trigger,
@@ -376,8 +378,7 @@ pub async fn summarize(
     session_id: &str,
     context: &mut PreludeContext<'_>,
 ) -> Result<String, String> {
-    let history = MessageStore::new(context.connection)
-        .hydrate_session(session_id)
+    let history = hydrate_retained_history(context.connection, session_id)
         .map_err(|error| error.to_string())?;
     let agent = &context.internals.summary;
     let provider = context.providers.provider_for(agent)?;
@@ -446,6 +447,29 @@ pub fn measured_tokens(history: &[MessageWithParts]) -> Option<u64> {
 #[must_use]
 pub fn transcript(system_prompt: &str, history: &[MessageWithParts]) -> Vec<TranscriptEntry> {
     project_history(system_prompt, history)
+        .into_iter()
+        .map(|projected| {
+            let estimated = estimate_tokens(&projected.message);
+            TranscriptEntry::new(
+                projected.message_id.unwrap_or_default(),
+                projected.message,
+                estimated,
+            )
+        })
+        .collect()
+}
+
+/// Consume stored history into the transcript selected and summarized by compaction.
+///
+/// Byte-equivalent to [`transcript`], but part strings and JSON values move into the
+/// provider messages. This prevents startup compaction from retaining hydrated
+/// history beside a second full projected transcript.
+#[must_use]
+pub fn transcript_owned(
+    system_prompt: &str,
+    history: Vec<MessageWithParts>,
+) -> Vec<TranscriptEntry> {
+    project_history_owned_with_ids(system_prompt, history)
         .into_iter()
         .map(|projected| {
             let estimated = estimate_tokens(&projected.message);

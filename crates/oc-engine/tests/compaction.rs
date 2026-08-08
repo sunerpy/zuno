@@ -343,7 +343,7 @@ async fn compaction_summarizes_two_hundred_messages_with_the_small_model_and_res
         "build",
         "cassette",
         "small-cassette-model",
-        &entries,
+        entries.clone(),
         &config,
         TokenWindow {
             context: 120_000,
@@ -494,7 +494,7 @@ async fn compaction_failure_marks_the_summary_message_and_never_reenters() {
         "build",
         "cassette",
         "small-cassette-model",
-        &entries,
+        entries.clone(),
         &config,
         TokenWindow {
             context: 100_000,
@@ -516,7 +516,7 @@ async fn compaction_failure_marks_the_summary_message_and_never_reenters() {
         &hooks,
         &mut state,
         &mut cache,
-        request,
+        request.clone(),
     )
     .await
     .expect("provider failure is converted to a terminal outcome");

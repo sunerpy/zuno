@@ -5762,3 +5762,68 @@ This is the seventh useful outcome from a gate that refused to manufacture a
 number. The prior six defects are gone; the remaining failure is now the product's
 measured memory behavior on the 931-message / 3,620-part session, not an execution
 seam. A tiny fresh session is not evidence about history hydration.
+
+## [2026-08-08] Task 113: ownership, selective hydration, and fixed-size cache state make the W-real gate pass
+
+The memory defect was not one oversized allocation. It was the overlap of several
+semantically equivalent representations: fully decoded database history, retained
+history, projected history, provider messages, and prompt-cache prefix bytes. Moving
+only the history path reduced G2 from 3,249,508 KiB to 1,680,888 KiB, but still failed
+the 1,513,496 KiB ceiling. The last 186,652 KiB came from removing another full-prefix
+lifetime: the append-only cache now retains a fixed-size SHA-256 fingerprint rather
+than the serialized prefix itself.
+
+The final unchanged-gate chain is therefore useful diagnostic evidence:
+
+- Task 88: 3,249,508 KiB median — FAIL.
+- First Task 113 implementation: 1,680,888 KiB median — FAIL.
+- Final Task 113 implementation: 1,494,236 KiB median — PASS.
+
+The final W-real peaks were `[1659152, 1495272, 1494236, 1493788, 1493900]`
+KiB. The median is only 19,260 KiB (1.27%) below the ceiling. This is a valid
+numeric pass, but it is fragile: future work should treat any new full-history or
+full-prefix resident copy as likely to consume the entire margin. W-idle remained
+healthy at a 19,776 KiB median.
+
+Selective hydration must begin from metadata, not decoded parts. The database path
+first discovers message ordering and compaction boundaries from cheap rows, then
+hydrates only the required ranges. From there the engine moves owned payloads through
+compaction, prelude construction, projection, and provider conversion. An API can be
+logically zero-copy at one function boundary and still retain the source collection
+at its caller; the useful question is which complete representations are live at the
+same peak, not how many `.clone()` calls appear locally.
+
+Correctness needs a pre-optimization oracle at the provider boundary. The shared
+fallback oracle fully hydrates the session using the old path and compares serialized
+provider-visible JSON bytes. It covers failed and empty summaries, a dangling
+compaction tail, and no compaction marker. This is stronger than comparing internal
+message structs because it pins the exact bytes prompt caching and the provider see.
+
+Mutation testing exposed an important distinction: replacing explicit dangling-tail
+handling with `.unwrap_or(0)` still passes because draining `..0` drops nothing and
+therefore has identical behavior. A test cannot kill an observationally equivalent
+mutation. Replacing it with `.unwrap_or(messages.len())` is the meaningful mutation;
+it drops history and the byte-equivalence oracle fails. Record equivalent mutations
+honestly rather than weakening a test or claiming sensitivity it cannot have.
+
+## [2026-08-08] Task 113 follow-up: a zero exclusive drain is not a trimmed window
+
+The exact `.position(...).unwrap_or(0)` mutation was re-run after a reviewer reported
+it as a remaining gap. It still passes, and the reason is a Rust range identity, not
+fixture data: `messages.drain(..0)` drains the empty half-open range `0..0`. Both the
+explicit `None` fallback and the mutation therefore call `store.hydrate(messages)`
+with every element in the same order. There is no session shape that can make those
+provider bytes differ.
+
+The successful-compaction/missing-tail fixture now contains an explicit sensitivity
+check that projecting `full` differs from projecting `&full[1..]`. This proves the
+first message is prompt-bearing and the fixture detects a real first-message drop.
+`.unwrap_or(1)` fails the renamed test
+`loop_successful_compaction_with_missing_tail_falls_back_to_byte_identical_full_history`
+with `optimized loader changed provider-visible history bytes` (exit 101).
+
+The third branch was also mutation-tested directly. Adding `messages.drain(..1)` to
+the no-marker `None` arm fails
+`loop_without_compaction_marker_is_byte_identical_to_full_history` with the same byte
+oracle (exit 101). Thus no-marker fallback is covered; the only surviving mutation is
+the one that performs no mutation to observable state.

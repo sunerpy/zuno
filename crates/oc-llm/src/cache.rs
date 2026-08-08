@@ -8,7 +8,31 @@
 //! finishes and then freezes again.
 
 use crate::registry::{Message, Role};
+use sha2::{Digest as _, Sha256};
+use std::io;
 use std::sync::Arc;
+
+type MessageFingerprint = [u8; 32];
+
+struct DigestWriter<'digest>(&'digest mut Sha256);
+
+impl io::Write for DigestWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn message_fingerprint(message: &Message) -> MessageFingerprint {
+    let mut digest = Sha256::new();
+    serde_json::to_writer(DigestWriter(&mut digest), message)
+        .expect("serializing a provider message into SHA-256 cannot fail");
+    digest.finalize().into()
+}
 
 /// Immutable, cacheable system instructions for one session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +148,12 @@ impl SplitSystemPrompt {
         }
         messages
     }
+
+    fn append_dynamic_tail(&self, messages: &mut Vec<Message>, dynamic: DynamicContext) {
+        if let Some(message) = dynamic.into_trailing_message() {
+            messages.push(message);
+        }
+    }
 }
 
 /// Why the stable request prefix was not append-only.
@@ -166,7 +196,7 @@ pub enum CacheViolation {
 #[derive(Debug, Clone, Default)]
 pub struct CacheTracker {
     previous_static: Option<Vec<u8>>,
-    previous_history: Vec<Message>,
+    previous_history: Vec<MessageFingerprint>,
     turn: u64,
 }
 
@@ -202,7 +232,7 @@ impl CacheTracker {
                 .previous_history
                 .iter()
                 .zip(stable_history)
-                .position(|(previous, current)| previous != current)
+                .position(|(previous, current)| *previous != message_fingerprint(current))
             {
                 return Err(CacheViolation::HistoryPrefixChanged {
                     turn: self.turn,
@@ -212,7 +242,7 @@ impl CacheTracker {
         }
 
         self.previous_static = Some(static_prefix.as_bytes().to_vec());
-        self.previous_history = stable_history.to_vec();
+        self.previous_history = stable_history.iter().map(message_fingerprint).collect();
         Ok(())
     }
 
@@ -379,6 +409,16 @@ impl<T> PreparedTurn<T> {
     pub const fn rebuilt_tools(&self) -> bool {
         self.rebuilt_tools
     }
+
+    /// Consume the prepared snapshot without cloning its potentially large history.
+    ///
+    /// Provider requests own their messages and tools. Callers that have finished
+    /// observing request metadata should move both vectors into that request rather
+    /// than retaining this snapshot and cloning the complete prompt again.
+    #[must_use]
+    pub fn into_request_parts(self) -> (Vec<Message>, Vec<T>) {
+        (self.messages, self.tools)
+    }
 }
 
 /// Session-owned prompt-cache discipline combining all four stability mechanisms.
@@ -423,6 +463,35 @@ impl<T: Clone + PartialEq> PromptCache<T> {
             messages: self
                 .prompt
                 .messages_with_dynamic_tail(stable_history, dynamic),
+            tools: tool_snapshot.into_tools(),
+            rebuilt_tools: self.tools.rebuild_count() == 1 && self.tracker.turn() == 1,
+        })
+    }
+
+    /// Assemble a provider request by taking ownership of its stable history.
+    ///
+    /// This is equivalent to [`Self::prepare_turn`], but avoids cloning a large
+    /// provider projection into the prepared request. The cache tracker records
+    /// fixed-size fingerprints before the volatile suffix is appended, so moving
+    /// the vector does not weaken append-only validation.
+    pub fn prepare_turn_owned(
+        &mut self,
+        mut stable_history: Vec<Message>,
+        dynamic: DynamicContext,
+        available_tools: &[T],
+        mcp_status: McpToolStatus,
+    ) -> Result<PreparedTurn<T>, CacheViolation> {
+        let tool_snapshot = self.tools.tools_for_request(available_tools, mcp_status);
+        if tool_snapshot.rebuilt_for_late_mcp() {
+            self.tracker.reset();
+        }
+        self.tracker
+            .record(self.prompt.static_prefix(), &stable_history)?;
+        self.prompt
+            .append_dynamic_tail(&mut stable_history, dynamic);
+        Ok(PreparedTurn {
+            system_static: self.prompt.static_prefix().clone(),
+            messages: stable_history,
             tools: tool_snapshot.into_tools(),
             rebuilt_tools: self.tools.rebuild_count() == 1 && self.tracker.turn() == 1,
         })
@@ -566,6 +635,52 @@ mod tests {
         assert_eq!(
             violation.to_string(),
             "append-only cache violation on turn 2: static system prefix changed byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn cache_tracker_retains_only_fixed_size_message_fingerprints() {
+        let static_prompt = StaticSystemPrompt::new("stable");
+        let large_history = [message(Role::User, &"x".repeat(2 * 1024 * 1024))];
+        let mut tracker = CacheTracker::new();
+
+        tracker.record(&static_prompt, &large_history).unwrap();
+
+        fn assert_fingerprint_storage(_: &[MessageFingerprint]) {}
+        assert_fingerprint_storage(&tracker.previous_history);
+        assert_eq!(tracker.previous_history.len(), 1);
+        assert!(
+            tracker.previous_history.capacity() * std::mem::size_of::<[u8; 32]>() <= 128,
+            "the append-only baseline must not retain the multi-megabyte message body"
+        );
+    }
+
+    #[test]
+    fn owned_prepare_moves_large_history_into_the_request() {
+        let body = "x".repeat(2 * 1024 * 1024);
+        let history = vec![message(Role::User, &body)];
+        let original_ptr = match &history[0].content[0] {
+            RequestContentBlock::Text { text } => text.as_ptr(),
+            other => panic!("unexpected request block: {other:?}"),
+        };
+        let mut cache = PromptCache::new("stable");
+
+        let prepared = cache
+            .prepare_turn_owned(
+                history,
+                DynamicContext::default(),
+                &["shell"],
+                McpToolStatus::Ready,
+            )
+            .unwrap();
+
+        let moved_ptr = match &prepared.messages()[0].content[0] {
+            RequestContentBlock::Text { text } => text.as_ptr(),
+            other => panic!("unexpected request block: {other:?}"),
+        };
+        assert_eq!(
+            moved_ptr, original_ptr,
+            "the owned path cloned the multi-megabyte message body"
         );
     }
 
