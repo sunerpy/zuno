@@ -1362,3 +1362,51 @@ which is a different todo, not a rider on `${VAR}` expansion. → todo **112**, 
   than the criterion.
 - *Fixing one instance of a rendering defect per site hides the class.* Three sites in one
   wave is the signal to go up a level.
+
+## Wave 32 (2026-08-08): THE MEASUREMENT LANDED. G1 PASS 0.021 · G2 FAIL 1.074
+
+`main` = `e1d6736`, **3130 tests**, 107/117 done. Todo 88 merged after seven attempts.
+
+### The result, recomputed by me from raw samples (not taken from the report)
+
+| gate | Rust median | committed TS | ceiling | ratio | verdict |
+|---|---|---|---|---|---|
+| G1 `W-idle` | **20,040 KiB** | 954,240 | 477,120 | **0.021** | **PASS** |
+| G2 `W-real` | **3,249,508 KiB** | 3,026,992 | 1,513,496 | **1.074** | **FAIL** |
+
+All four medians reproduce exactly from the per-sample data. The paired TS runs reproduced
+the committed baseline to within 5.1% / 2.5%, so this is **not** an unmeasurable-baseline
+excuse — the TS side behaved. The 0.50 factor is still in frozen `methodology.rs:54-55`,
+and 0.50 × 3,026,992 = 1,513,496 exactly.
+
+**G1 is the thesis proven: 20 MB against 954 MB, a 47× reduction idle.**
+
+### G2's root cause, traced by me
+
+`run_turn` opens every turn with `hydrate_session` — the **whole** session, 931 messages /
+3,620 parts / 105 MB — and `retained_history` only trims at a compaction marker. That set
+is then re-represented twice more in the same turn (`project_history`,
+`provider_messages`). Three-plus live fully-decoded copies of 105 MB explains a 3.2 GB peak.
+Upstream does the same thing, which is why TS also sits near 3 GB and the two are within
+10%. We ported the architecture faithfully, memory behaviour included. → todo **113**.
+
+### The gate is invisible to CI — a finding in its own right
+
+`should_run_expensive_gate` returns false unless `OC_MEMORY_GATE_MODE=run` or the parent
+cargo command names the memory target. Under `cargo test --workspace` (premerge, CI) the
+gate prints **`ok`**. Confirmed both ways: `--workspace` → ok; `-p oc-testkit --test memory`
+→ FAILED in 2.21s from cache. Defensible for a 100-minute test, but **a green suite does not
+mean G2 passes.** Todo 92 must say so and F1 must not read a green `make ci` as compliance.
+
+### HAZARD for future waves: measurement pollution
+
+88's agent deliberately refused to run any other repo command during its measurement. The
+artifact also lives in the worktree's own `target/`, which is not shared — replaying the
+gate on `main` silently re-runs the full 100 minutes. **I hit that and had to kill it.**
+Use `OC_MEMORY_GATE_MODE=skip` unless you mean to spend the time.
+
+Consequence: **113, 89 and 90 must not measure concurrently.** They are in disjoint files
+but share one machine, so they are serialized by that resource, not by their inputs.
+113 goes first because it owns the project's headline claim.
+
+worktree: oc-wt/t113 (task-113)
