@@ -6285,3 +6285,36 @@ four real host kinds exercised by G6. `oc-cli` is the production integration roo
 fixture dependency. The JavaScript half of `oc-plugin` was changed for uniform containment of its
 second persistent host path, not because this fixture exercised it. No pre-guard orphan count was
 measured, so this is a contract-enforcement decision rather than a measured old-defect fix.
+
+## [2026-08-08] Todo 112 — the cause chain is rendered at one seam, and scrubbed there
+
+**Decided.** `oc_error::source::describe(&dyn Error)` is the single chain walk: it appends
+each `source()` after `": "`, innermost last, skipping a cause the message already carries,
+capped at 8 links with a `…` when it truncates. `describe_turn_failure` calls it, appends
+todo 110's auth advice with `;` (not `:`, which would present guidance as one more cause),
+then filters the result through `without_credential`.
+
+**Invariants any later change must preserve:**
+
+1. **The category leads.** Every `TurnError` variant renders with `error.to_string()` as
+   the prefix. Existing assertions read the front of the line — `unrecoverable provider
+   failure` in the compaction suite, `baseURL` / `provider.test.options` in
+   provider_endpoint, `provider.test.options.apiKey` / `auth login` in provider_options.
+   Pinned for all 12 variants, plus an exhaustive match with no wildcard so a 13th does not
+   compile until someone decides what it renders.
+2. **No credential in a rendered failure.** Todo 110's guarantee no longer follows from how
+   the message is built, because the chain now carries whatever a peer sent. It is enforced
+   by exact removal of the credential the turn presented, seeded from the same value the
+   provider factory closes over so both of `resolved_credential`'s sources are covered.
+   An empty credential is skipped (`str::replace` with an empty pattern corrupts the whole
+   message, and `apiKey: ""` is legitimate).
+3. **One seam.** `describe_turn_failure` is the only user-facing renderer of a `TurnError`.
+   A second one is how this defect returns.
+
+**Rejected:** per-variant cause handling (the thing 109 and 110 did, which is why there was
+a third instance); a credential-shaped pattern scrub (weaker than exact removal for the
+value that matters here, and prone to redacting a user's prose); asserting the verbatim
+`${VAR}` casing (impossible at this seam — `url::Url` lowercases the host before the error
+value exists).
+
+No dependency added; `cargo metadata --locked --offline` clean.

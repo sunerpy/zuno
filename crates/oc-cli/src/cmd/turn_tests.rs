@@ -1069,3 +1069,196 @@ fn only_this_module_composes_a_turn() {
         directory.display()
     );
 }
+
+/// One value of every [`TurnError`] variant, so a claim about rendering covers all of
+/// them rather than the two a bug report happened to name.
+///
+/// Each carries a distinctive payload — `session-in-the-message`, `agent-in-the-message`
+/// — because the assertions below check that the payload survives, and a shared
+/// placeholder would let one variant pass on another's text.
+fn every_turn_error() -> Vec<TurnError> {
+    vec![
+        TurnError::NoUserMessage {
+            session_id: "ses_in-the-message".to_owned(),
+        },
+        TurnError::MissingUserField {
+            message_id: "msg_in-the-message".to_owned(),
+            field: "agent",
+        },
+        TurnError::AgentNotFound {
+            agent: "agent-in-the-message".to_owned(),
+        },
+        TurnError::ModelNotFound {
+            provider_id: "provider-in-the-message".to_owned(),
+            model_id: "model-in-the-message".to_owned(),
+        },
+        TurnError::StepLimit {
+            agent: "agent-in-the-message".to_owned(),
+            max_steps: 100,
+        },
+        TurnError::StreamEndedWithoutMessageEnd { step: 3 },
+        TurnError::NestedToolUse { step: 4 },
+        TurnError::ToolUseEndWithoutStart { step: 5 },
+        TurnError::EventConsumerClosed,
+        TurnError::Database(oc_error::DbError::Busy { retry_after: None }),
+        TurnError::Provider(ProviderError::ContextLimit {
+            limit_tokens: Some(200_000),
+            used_tokens: Some(214_311),
+        }),
+        TurnError::Provider(ProviderError::RateLimited { retry_after: None }),
+        TurnError::Provider(ProviderError::Transient {
+            status: None,
+            source: Some(Box::new(std::io::Error::other(
+                "error sending request for url (http://gateway.invalid/v1)",
+            ))),
+        }),
+        TurnError::Provider(ProviderError::Auth {
+            provider: "test".to_owned(),
+            source: None,
+        }),
+        TurnError::Provider(ProviderError::Refused {
+            provider: "test".to_owned(),
+            provider_text: None,
+        }),
+        TurnError::Provider(ProviderError::Fatal {
+            status: Some(400),
+            source: None,
+        }),
+        TurnError::Cache(oc_llm::cache::CacheViolation::StaticPrefixChanged { turn: 2 }),
+    ]
+}
+
+/// The category every existing assertion reads still leads the message.
+///
+/// This is the guarantee the chain walk had to keep. Todo 109's and 110's tests, the
+/// compaction suite's `unrecoverable provider failure` check and anything a user has
+/// scripted all read the front of the line; appending causes must not move it. Asserted
+/// for every variant rather than the ones with known assertions, because the next
+/// assertion will be written against whichever variant this test did not cover.
+#[test]
+fn every_variant_keeps_its_category_at_the_front_of_the_message() {
+    for error in every_turn_error() {
+        let category = error.to_string();
+        let rendered = describe_turn_failure(&error, None);
+
+        assert!(
+            rendered.starts_with(&category),
+            "the category moved: expected `{rendered}` to start with `{category}`"
+        );
+    }
+}
+
+/// A new [`TurnError`] variant must break this, so its author decides what is rendered.
+///
+/// `every_turn_error` is a hand-written list, and a hand-written list of an enum's
+/// variants silently goes stale — which is exactly how a new failure class would arrive
+/// rendering as a bare category again. The match is exhaustive with no wildcard arm, so
+/// the compiler refuses to build this file until the new variant is named, and the count
+/// refuses to pass until it is also constructed.
+#[test]
+fn the_variant_table_covers_the_whole_enum() {
+    let mut named = std::collections::BTreeSet::new();
+    for error in every_turn_error() {
+        let name = match &error {
+            TurnError::NoUserMessage { .. } => "NoUserMessage",
+            TurnError::MissingUserField { .. } => "MissingUserField",
+            TurnError::AgentNotFound { .. } => "AgentNotFound",
+            TurnError::ModelNotFound { .. } => "ModelNotFound",
+            TurnError::StepLimit { .. } => "StepLimit",
+            TurnError::StreamEndedWithoutMessageEnd { .. } => "StreamEndedWithoutMessageEnd",
+            TurnError::NestedToolUse { .. } => "NestedToolUse",
+            TurnError::ToolUseEndWithoutStart { .. } => "ToolUseEndWithoutStart",
+            TurnError::EventConsumerClosed => "EventConsumerClosed",
+            TurnError::Database(_) => "Database",
+            TurnError::Provider(_) => "Provider",
+            TurnError::Cache(_) => "Cache",
+        };
+        named.insert(name);
+    }
+
+    assert_eq!(
+        named.len(),
+        12,
+        "the table covers only {named:?}; every variant needs a value or the rendering \
+         claims above are vacuous for the ones missing"
+    );
+}
+
+/// A wrapped failure names its cause instead of only its class.
+///
+/// The measured defect: an unreachable endpoint, a dead port, a TLS refusal and an
+/// unexpanded `${VAR}` all rendered as `transient provider failure (status=None)`, with
+/// the URL one `source()` call away the whole time.
+#[test]
+fn a_transport_failure_names_the_url_it_could_not_reach() {
+    let error = TurnError::Provider(ProviderError::transient(std::io::Error::other(
+        "error sending request for url (http://${GW_HOST}/v1/chat/completions)",
+    )));
+
+    let rendered = describe_turn_failure(&error, None);
+
+    assert!(
+        rendered.contains("http://${GW_HOST}/v1/chat/completions"),
+        "the transport error's URL was dropped: {rendered}"
+    );
+    assert!(
+        rendered.starts_with("transient provider failure (status=None)"),
+        "the category must still lead: {rendered}"
+    );
+}
+
+/// The credential the turn presented never reaches the message, even echoed verbatim.
+///
+/// Todo 110 guaranteed no key material on the auth path by building its message from
+/// the provider id alone. Walking the `#[source]` chain renders whatever the gateway put
+/// in its 401 body, and a gateway answering `Incorrect API key provided: sk-…` is a real
+/// shape — so the guarantee now needs enforcing rather than following from the message's
+/// construction.
+#[test]
+fn a_rejected_credential_is_scrubbed_from_the_body_that_echoed_it() {
+    let secret = "sk-SUPERSECRET-DO-NOT-ECHO";
+    let error = TurnError::Provider(ProviderError::Auth {
+        provider: "test".to_owned(),
+        source: Some(Box::new(std::io::Error::other(format!(
+            "provider `test` returned HTTP 401: {{\"error\":{{\"message\":\"Incorrect API \
+             key provided: {secret}\"}}}}"
+        )))),
+    });
+
+    let rendered = describe_turn_failure(&error, Some(secret));
+
+    assert!(
+        !rendered.contains(secret),
+        "the rendered failure echoed the key it presented: {rendered}"
+    );
+    assert!(
+        rendered.contains(REDACTED),
+        "the key was dropped without a trace, so the message reads as if the gateway \
+         said nothing: {rendered}"
+    );
+    for needle in ["provider.test.options.apiKey", "auth login test"] {
+        assert!(
+            rendered.contains(needle),
+            "scrubbing cost the advice `{needle}`: {rendered}"
+        );
+    }
+}
+
+/// An empty credential is a legitimate configuration and must not corrupt the message.
+///
+/// `provider_api_key` documents why `apiKey: ""` reaches this path: it means "this
+/// endpoint takes no key". `str::replace` with an empty pattern inserts its replacement
+/// between every character, so an unguarded scrub would turn every failure a keyless
+/// local endpoint produces into unreadable noise.
+#[test]
+fn an_empty_credential_scrubs_nothing() {
+    let error = TurnError::Provider(ProviderError::transient(std::io::Error::other(
+        "tcp connect error: Connection refused",
+    )));
+
+    assert_eq!(
+        describe_turn_failure(&error, Some("")),
+        describe_turn_failure(&error, None),
+        "an empty credential changed the message it appears in"
+    );
+}

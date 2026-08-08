@@ -5939,3 +5939,41 @@ Rule for future dependency changes: run locked offline metadata before claiming 
 safe. It is the gate that sees `cfg(windows)` dependencies from a Linux host. A host-target build
 proves only that target's selected graph; it does not prove the lock can be consumed under the
 repository's offline invariant.
+
+## [2026-08-08] Todo 112 — when the same defect appears three times, the fix is one level up
+
+Nine seams have now been found by tests written for adjacent todos. Three of them were
+one class: *our error rendering drops the `#[source]` chain, so a wrapped failure surfaces
+as a category name with no detail.* Todo 109 fixed instance one, todo 110 instance two,
+each correctly and each locally. Instance three still reached a user.
+
+The generalisable lesson is about **where** a fix goes, not about errors:
+
+> A per-site fix to a rendering, formatting or reporting defect requires every future
+> author to remember the defect exists. A fix at the seam requires nobody to remember
+> anything. When the second instance appears, the seam fix is already overdue.
+
+`oc_error::source::describe` is 20 lines. The two per-site fixes it generalises are
+smaller still — which is exactly why they got written twice.
+
+### The counterweight: a blanket walk is not automatically better
+
+`foo: bar: baz: qux` for every error would be a regression in legibility. What made the
+walk safe was deciding three things explicitly rather than defaulting them:
+depth (8, because a real transport failure is already 3-4 links deep), separator (`": "`,
+matching how the messages already read), and duplicate suppression (so an
+`#[error(transparent)]` wrapper and a variant that interpolates its own source do not say
+the same words twice — while a *skipped* link does not end the walk, because the detail
+may be beneath it). Each of the three is pinned by a test that a mutation breaks.
+
+### Widening a message surface safely
+
+Two tests made this a text change instead of a text gamble:
+- one asserting the category still leads the message, for **every** variant of the enum
+  rather than the ones with known assertions — the next assertion will be written against
+  whichever variant a table skipped;
+- one matching the enum exhaustively with no wildcard arm, so a new variant fails to
+  compile until its author decides what the seam renders.
+
+Neither needed an existing expectation re-worded. That is the evidence the widening was
+additive.

@@ -184,9 +184,13 @@ async fn mock() -> MockProvider {
 }
 
 fn describe(output: &Output) -> String {
+    format!("status: {:?}\n{}", output.status, combined(output))
+}
+
+/// Everything the user actually reads, whichever stream it left on.
+fn combined(output: &Output) -> String {
     format!(
-        "status: {:?}\nstdout:\n{}\nstderr:\n{}",
-        output.status,
+        "stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
@@ -340,13 +344,18 @@ async fn a_placeholder_arriving_via_options_base_url_reaches_the_substituted_hos
 /// unset variable and an empty one both fail to dial, so this layer cannot tell them
 /// apart and does not pretend to.
 ///
-/// The literal does travel into the failure — `ProviderError::transient` attaches the
-/// transport error, and reqwest's own message names the URL — but
-/// `describe_turn_failure` renders `error.to_string()` and drops the `#[source]`
-/// chain, so the user reads `transient provider failure (status=None)` and sees neither
-/// the URL nor the misspelled name. That is a pre-existing gap in the CLI's rendering of
-/// *every* transport failure, not something `${VAR}` expansion introduced or can fix
-/// here; see `.omo/notepads/opencode-rust/issues.md`.
+/// The user also learns *which* name went unexpanded. Todo 111 measured that they did
+/// not: the literal travelled into the failure — `ProviderError::transient` attaches the
+/// transport error and reqwest's own message names the URL — but `describe_turn_failure`
+/// rendered `error.to_string()` and dropped the `#[source]` chain, so the whole report
+/// was `transient provider failure (status=None)`. Todo 112 walks the chain at that
+/// seam, which is why this test now asserts on the message as well as on the socket.
+///
+/// The comparison is case-insensitive because the authority reaches the message through
+/// URL parsing, and the `url` crate lowercases a host: `${PROBE_HOST}` is reported as
+/// `${probe_host}`. The name is legible and the fold is not something this seam can undo
+/// — the case is gone before the error exists. Asserting case-insensitively also keeps
+/// the test honest if a later change carries the config's verbatim spelling instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unset_variable_reaches_no_endpoint_rather_than_a_collapsed_one() {
     let env = ScriptedEnv::new().expect("isolated environment");
@@ -374,6 +383,41 @@ async fn an_unset_variable_reaches_no_endpoint_rather_than_a_collapsed_one() {
          `PROBE_HOST`, so the unexpanded authority resolved to something\n{}",
         describe(&output)
     );
+    let message = combined(&output);
+    assert!(
+        message
+            .to_lowercase()
+            .contains(&format!("${{{}}}", PROBE_HOST.to_lowercase())),
+        "the failure never named the unexpanded `${{{PROBE_HOST}}}`, so the user cannot \
+         tell a misspelled variable from a dead gateway\n{message}"
+    );
+}
+
+/// An endpoint nothing answers on names the URL it could not reach.
+///
+/// The QA scenario this todo exists for: a user typos a hostname or a port and the
+/// message has to name the host, because every connection-level failure — wrong host,
+/// dead port, TLS refusal, unexpanded placeholder — is otherwise the same seven words.
+/// No mock is started: the whole point is that nothing is listening.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreachable_endpoint_names_the_url_it_could_not_reach() {
+    let env = ScriptedEnv::new().expect("isolated environment");
+
+    let output = run_prompt(&env, provider_config(None, None, Some(DEAD_ENDPOINT))).await;
+
+    assert!(
+        !output.status.success(),
+        "a dial that never connected must not report success\n{}",
+        describe(&output)
+    );
+    let message = combined(&output);
+    for needle in ["127.0.0.1:1", "/v1/"] {
+        assert!(
+            message.contains(needle),
+            "the failure did not name `{needle}`, so it cannot be told apart from any \
+             other transport failure\n{message}"
+        );
+    }
 }
 
 /// No endpoint in either place fails fast and names the key to set.
@@ -392,11 +436,7 @@ async fn no_endpoint_anywhere_fails_fast_and_names_the_key() {
         "a provider with no endpoint anywhere must not report success\n{}",
         describe(&output)
     );
-    let message = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let message = combined(&output);
     for needle in ["baseURL", "provider.test.options"] {
         assert!(
             message.contains(needle),

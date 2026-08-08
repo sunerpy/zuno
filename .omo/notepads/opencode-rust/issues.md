@@ -5711,3 +5711,54 @@ it either way.
 
 Ground truth for todo 90's registry test, so it cannot be written to match itself:
 **23 bounded sites across 14 files, 1 unbounded site in `oc-acp/src/transport.rs`.**
+
+## [2026-08-08] RESOLVED (todo 112): the ninth seam is closed at the rendering seam, once
+
+`describe_turn_failure` now calls `oc_error::source::describe`, which walks `#[source]`
+and appends every cause after `": "`. The three failure kinds that were byte-identical
+before — unset `${VAR}`, typo'd hostname, dead port — are now distinguishable and each
+names the address the user got wrong. Verified on the real binary:
+
+```
+transient provider failure (status=None): error sending request for url
+(http://gatway.example.com/v1/chat/completions): client error (Connect): dns error:
+failed to lookup address information: No address associated with hostname
+```
+
+**`describe_turn_failure` is the only place in the workspace that renders a `TurnError`
+for a user** (grep-verified), so "one seam" is a property of the code, not a hope. A
+variant added later gains its cause with no edit, which is the thing 109 and 110 could
+not give.
+
+### The leak this opened, and what closes it
+
+The notepad's own warning was right to be unsatisfied with "probably not". Walking the
+chain renders the vendor's 401 body, and `Incorrect API key provided: sk-…` is how real
+gateways word it — measured against a listener that echoes the `Authorization` header it
+received. The credential the turn presented is now scrubbed at the seam
+(`without_credential`), taken from the same value the provider factory closes over, so it
+covers both sources `resolved_credential` can pick. Measured: 0 occurrences in
+stdout+stderr and 0 anywhere under the isolated HOME/XDG/TMPDIR.
+
+Two shapes worth remembering if this is ever touched again:
+- `str::replace` with an **empty** pattern inserts its replacement between every
+  character, and `apiKey: ""` is a documented legitimate configuration, so the empty case
+  must be guarded — a mutation confirms `an_empty_credential_scrubs_nothing` catches it.
+- `str::contains("")` is **vacuously true**, which makes the emptiness test in the chain
+  walk's skip condition look redundant. Dropping it is a behaviourally-equivalent mutant,
+  not an uncaught gap — same shape as the `drain(..0)` false positive above.
+
+### What the todo's own wording got wrong
+
+It expected the unexpanded literal to surface as `${GW_HOST}`. It surfaces as
+`${gw_host}`: reqwest reports the URL through `url::Url`, which lowercases the host, and
+the case is gone before the error value exists. The intent holds — the user can see which
+variable went unexpanded — but the exact spelling cannot be asserted at this seam. The
+test compares case-insensitively and says why.
+
+### Process note that cost a round
+
+`git checkout <path>` on a file that is new and uncommitted **deletes the work**. Used it
+to revert a mutation and lost the whole of `source.rs`; recovered from a `/tmp` copy taken
+beforehand. Revert mutations from a copy, not from the index, until the first commit
+exists.
