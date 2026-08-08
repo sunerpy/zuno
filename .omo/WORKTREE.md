@@ -1644,3 +1644,58 @@ Not by file conflict but by content dependency: 103's own text says to *"documen
 92's compatibility matrix"*, and 92 documents the error rendering 112 changes.
 
 worktree: oc-wt/t112 (task-112)
+
+## Wave 37 (2026-08-08): todo 112 merged — the error-rendering class fixed at one seam
+
+`main` = `0ff3a3a`, **3196 tests**, 112/118 done. Only 92, 103 and F1-F4 remain.
+
+### The transformation, verified by me with the real binary
+
+Three failure kinds that were **byte-identical** before (`transient provider failure
+(status=None)`) now each name their cause:
+
+| kind | after |
+|---|---|
+| unset `${GW_HOST}` | `…: builder error for url (http://${gw_host}/v1/chat/completions): Parsed Url is not a valid Uri` |
+| typo'd host | `…: error sending request for url (http://gatway.example.com/…): dns error: … No address associated with hostname` |
+| dead port | `…: tcp connect error: Connection refused (os error 111)` |
+
+One seam, not per-variant: it verified `describe_turn_failure` is the **only** user-facing
+renderer of a `TurnError` in the workspace, so "one seam" is a property of the code rather
+than a hope. Depth 8, `": "` separator, and duplicate suppression that does **not** end the
+walk on a skipped link — each pinned by a test a mutation breaks.
+
+### The security requirement, tested against a hostile server
+
+I stood up a listener that **echoes the `Authorization` header back inside its 401 body** —
+the actual leak vector — with `apiKey = sk-SUPERSECRET-DO-NOT-ECHO`. Output:
+
+> `authentication rejected by provider test: provider `test` returned HTTP 401: {"error": {"message": "Incorrect API key provided: Bearer <redacted>", …}}; set `provider.test.options.apiKey`, or run `opencode auth login test``
+
+**0 occurrences** of the secret in stdout+stderr and **0** anywhere under the isolated
+HOME/XDG/TMPDIR. Todo 110's guarantee survives the chain walk.
+
+Three mutations of mine, all caught: redaction disabled → the scrub test; seam reverted to
+`to_string()` → the URL test *and* the leak test (proving the leak test cannot pass
+vacuously); `MAX_CAUSES` 8 → 1 → three chain tests.
+
+### It reported an equivalent mutant correctly — the lesson took
+
+Dropping `!text.is_empty()` changes nothing, because `str::contains("")` is vacuously true.
+It said so explicitly and kept the guard with a comment. That is the exact trap **I** fell
+into two waves ago with `.unwrap_or(0)`, now avoided by an agent that read the notepad.
+
+### A real infrastructure defect it surfaced, which I then fixed
+
+`.omo/evidence/` was gitignored as *"local proof, not shared source"* while **5** files had
+been force-added — so the directory was half-tracked and todo 112's evidence was silently
+dropped from its first commit.
+
+That policy stopped being right once the gates got expensive: todo 88's transcript is the
+only record of a ~100-minute paired measurement, 89's of a 2-hour soak. The decisive
+argument is mechanical — **untracked files do not propagate into a `git worktree`, so the
+Final Wave (which runs in worktrees) would have audited plan compliance against zero
+evidence.** Now 104 files tracked, 1.5 MB, generators and probe JSON still ignored. I swept
+for credentials first; every `sk-` hit was synthetic or an artifact of the word "ta**sk-**".
+
+worktree: oc-wt/t92 (task-92)
