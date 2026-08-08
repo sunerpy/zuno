@@ -1755,3 +1755,49 @@ per-operation `/api` response-shape parity. *Refusing to document an untested ca
 the same discipline as refusing to fake a measurement.*
 
 worktree: oc-wt/t103 (task-103) — the last implementation todo
+
+## Wave 39 (2026-08-08): ALL 114 IMPLEMENTATION TODOS COMPLETE. Final Wave dispatched.
+
+`main` = `70114aa`, **3214 tests**, 0 clippy warnings, fmt clean, lock reproducible offline.
+**114/118 done — only F1-F4 remain.**
+
+### Todo 103 closed the loop, and closed the vacuity trap
+
+The kill switch: `memory: false` disables resident injection, the tool **and** reflection
+together. Three mutations of mine, all caught:
+
+- resident stays live → `production_prompt_composition_honours_the_memory_master_switch`
+- reflection stays live → `schema::tests::memory_false_dominates_every_enabled_default`
+- **the seeded fixture emptied** → `memory_false_matches_a_real_upstream_control_and_spawns_no_reflection`
+
+That third one is the important one. I warned this todo that its byte-identity test was the
+fourth chance to repeat the vacuous-fixture failure. Its control is genuinely
+subsystem-absent — raw `BASE_PROMPT` bytes, never calling a memory constructor — **and** it
+carries an independent sensitivity guard asserting the enabled path *differs*. So emptying
+the fixture fails the test instead of passing silently. It also isolated the reflection gate
+by deliberately providing a working memory tool underneath a disabled fork, so only
+`enabled: false` can explain no spawn, and asserted the absence by timing out on a
+notification rather than inferring it.
+
+The 8th divergence (the memory subsystem) is declared, `DECLARED_COUNT = 8`, and todo 92's
+generated doc blocks were regenerated rather than hand-edited — exactly as designed.
+
+### The Final Wave, four reviewers in parallel
+
+Read-only audits in separate worktrees, no shared files, so they fan out together:
+
+- **F1** plan compliance — 114 todos + 18 success criteria, each "a test or a command".
+  Warned explicitly that a green `--workspace` does **not** mean G1-G6 pass.
+- **F2** code quality — hunting a tenth vacuous test, with the four prior instances named.
+- **F3** real manual QA — running the binary as a user. Given the three first-launch
+  defects that only running found, and told the tenth is what it is looking for.
+- **F4** scope fidelity — handed the `oc-process` scope question directly, including that
+  criterion 15 *names* `PR_SET_PDEATHSIG` and Job Objects, so it must judge whether that was
+  creep or the criterion being honoured.
+
+Each was given the known gaps up front — `/api/event` 404, the channel-DB divergence, G2's
+1.27% margin, the pinned subject, "NOT MEASURED" on pre-`oc-process` orphans, and the three
+deliberately-undocumented capabilities — so they audit **disclosure** rather than
+rediscovering. Each was told an honest `UNVERIFIABLE` outranks a generous `SATISFIED`.
+
+worktrees: oc-wt/tF1, tF2, tF3, tF4
