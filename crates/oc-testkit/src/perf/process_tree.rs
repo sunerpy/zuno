@@ -41,6 +41,15 @@ pub(crate) fn sample(root: u32, started: Instant) -> Result<RssSample> {
     })
 }
 
+/// Sample total RSS for `root` and every transitive child through Linux `/proc`.
+///
+/// This exposes the frozen runner's sampler to the standalone G3 soak so both
+/// gates use the same process-tree accounting rather than two subtly different
+/// implementations.
+pub fn sample_process_tree(root: u32, started: Instant) -> Result<RssSample> {
+    sample(root, started)
+}
+
 pub(crate) fn collect_transitive_pids<F>(root: u32, mut children: F) -> Result<Vec<u32>>
 where
     F: FnMut(u32) -> Result<Vec<u32>>,
