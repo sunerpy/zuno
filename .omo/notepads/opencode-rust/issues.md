@@ -5535,3 +5535,71 @@ recorded id with a documented recapture procedure — and state how the committe
 relates to it. This is a **methodology** change touching frozen files, so it needs its own
 todo, an explicit unfreeze decision, and a methodology-revision bump. It is not a licence
 for 113 to edit the frozen crate.
+
+## [2026-08-08] G2 PASSES. Both memory gates are green — and I was wrong about one of my own mutations.
+
+### The result
+
+| gate | before (todo 88) | after (todo 113) | ceiling | verdict |
+|---|---|---|---|---|
+| G1 `W-idle` | 20,040 KiB | **19,776 KiB** | 477,120 | **PASS** (0.0207) |
+| G2 `W-real` | 3,249,508 KiB | **1,494,236 KiB** | 1,513,496 | **PASS** (0.4936) |
+
+**A 2.17x reduction on W-real**, same immutable subject, and the project's core claim —
+≤50% of the TypeScript peak — is now measured true on both gates.
+
+**The comparison is valid, and my "moving target" alarm did not apply.** `context.json`
+records the measured database as `/config/.local/share/opencode/opencode.db.bak.20260408`,
+an immutable April snapshot whose sha256 matches `e2cde4df…` exactly, in which
+`ses_2bcaee257ffeFZNJrmtpi3ZglR` genuinely is the largest session (931/3620/105,118,812) —
+identical to todo 88's subject. Todo 114 is still worth doing, because nothing in the repo
+*pins* that choice: it came from an ambient `OPENCODE_DB`, and a fresh checkout would select
+today's 300 MB session instead.
+
+**The margin is 19,260 KiB — 1.27%.** Recorded deliberately: this gate will flip to FAIL on
+a slightly larger session, and the ceiling does not scale with the subject.
+
+### The fix
+
+Two-phase hydration. Phase one decodes only message metadata, compaction markers and
+candidate summary text; full part hydration begins only after a successful marker's
+`tail_start_id`. The JSON predicates run **inside SQLite**, so the 99.98% of bytes that are
+completed `tool` output never become Rust JSON trees. Repair still scans the whole session
+via `unfinished_tool_parts_for_session`, so a pending tool call hidden behind a valid
+compaction is still fixed. `retained_history`'s three fallback rules are reproduced exactly:
+no marker, failed/empty summary, and dangling `tail_start_id` all return the full session.
+
+### MY ERROR: I reported an equivalent mutant as an uncaught gap
+
+I claimed the dangling-`tail_start_id` fallback was untested because replacing it with
+`.unwrap_or(0)` passed all 3138 tests. **That mutation cannot fail**: `tail_index = 0` makes
+the subsequent `messages.drain(..0)` a no-op, so the mutant is *semantically identical* to
+the early return. I sent an agent back to write a test for a mutation that no test could
+ever catch.
+
+A real mutation of that branch — `.unwrap_or(messages.len())`, which drains everything —
+**is** caught, by the very test it had already added:
+```
+test loop_successful_compaction_with_missing_tail_falls_back_to_byte_identical_full_history ... FAILED
+```
+And mutating the no-marker branch to trim breaks four integration tests. All three fallbacks
+are genuinely guarded.
+
+**The rule I violated, which I had written myself two waves earlier**: *a check that can only
+detect one shape of failure is not a check.* I inverted it — I treated a mutation that
+changes no behaviour as evidence of a missing test. Recorded as:
+
+> *Before reporting a mutation as uncaught, prove the mutant actually changes behaviour.
+> An equivalent mutant is not a test gap; it is a no-op refactor, and chasing it wastes a
+> whole round.*
+
+The round was not wasted overall — the same push produced the two genuinely-missing
+failed-summary tests, which a real mutation had shown were absent. But M1 was the real
+finding and M2 was my mistake, and the record should say so.
+
+### Also worth noting
+
+The agent added `sha2` to `oc-llm` (already a workspace dependency, no new external crate) to
+replace full `Message` clones in the prompt-cache tracker with fixed-size SHA-256
+fingerprints. That is a scope expansion beyond the stated task, justified in its commit body,
+and it is part of why the peak fell. Flagging it so it is not mistaken for drift.
