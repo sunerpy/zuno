@@ -5616,3 +5616,54 @@ model-level ones are — although upstream hands `{ ...provider.options }` to th
 (`:1673`). So provider-level `useCompletionUrls`, `timeout`, `headerTimeout`,
 `chunkTimeout`, `setCacheKey` are silently inert here even where `Spec::options`
 readers for them exist (`oc-provider-compatible/src/surface.rs:306`, `quirks.rs:148`).
+
+## [2026-08-07] Task 110: the SDK option bag is seeded from the provider, and a config key beats a stored one
+
+Two independent defects lived in one line of omission. `model_spec` forwarded only
+`model.options`, so (a) every provider-level option was dropped and (b) `apiKey` — one
+of those options — never reached the transport, leaving the stored credential as the
+only auth source. Upstream: `provider.ts:1676` seeds the bag from the *provider*
+(`const options = { ...provider.options }`), `:1497` overlays the model's deep with the
+model winning, and `:1719` makes `options.apiKey` primary with the credential as
+fallback. Ours had (a) missing and (b) inverted.
+
+**A dropped option and a dropped credential look identical in a green suite, and they
+are not the same severity.** `useCompletionUrls`, `capabilities` and `extraBody` being
+inert is a config bug. `apiKey` being inert is a 401 for every correctly-configured
+user. They were one omission, and only the second one is a launch blocker — worth
+remembering when a "plumbing" gap is triaged as cosmetic.
+
+**Presence tests and emptiness tests are not interchangeable, and upstream is precise
+about which is which.** `:1699` requires `baseURL !== ""`; `:1719` only asks whether
+`apiKey === undefined`. Both readings are right for their field: an empty URL cannot be
+dialled, whereas an empty key is a user declaring the endpoint takes none — and
+falling back there would present a real vendor key to an endpoint the user never named.
+Copying `baseURL`'s emptiness test onto `apiKey` was mutation M7 and it is caught.
+
+**The oracle's own schema can make a defensive branch unreachable — assert that rather
+than test the branch.** `provider_api_key`'s `as_str` guard cannot be reached from a
+config file, because `ProviderOptions::api_key` is typed `Option<String>`
+(`oc-config/src/schema/provider.rs:54`) and `{"apiKey": 7}` is refused at load. The
+guard stays (the resolved options are a free-form JSON map), but the test asserts the
+*unreachability* — so a schema loosening fails a named test instead of turning a number
+into `Bearer 7` at a gateway.
+
+**"Reaches the surface that reads it" is not always "reaches the wire".** The todo
+expected a provider-level `useCompletionUrls` to be observable on a request. It cannot
+be for this transport: it gates `SurfaceRule::Azure` only, and `openai-compatible` is
+`Fixed(Chat)`, so `resolve_surface` returns before consulting it
+(`surface.rs:279-286`). The reader is still worth asserting through — directly — and
+the wire-observable proof of the seed has to come from a different option. `extraBody`
+is the one, because it becomes request-body keys (`provider.rs:185`), which a mock
+server parses and a test can read. Pick the forwarded option whose effect is visible at
+the layer you are willing to assert at.
+
+**Assert on every captured request, not the first.** The measured symptom was
+`AUTH=None` **twice** — the title prelude and the turn are two separate provider
+requests through two separate `EngineModel`s. A fix that authenticated only the turn
+would still 401 the prelude, and a test reading `captured[0]` would not notice.
+
+**Nine mutations, nine caught, no vacuous test this round** — and M1 is what proves
+it: removing the provider seed fails the `useCompletionUrls` test, so that test cannot
+be planting the key in a map the code never reads. That is the trap todo 109 fell into,
+and dropping the seed is the cheap check for it.

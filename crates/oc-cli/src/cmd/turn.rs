@@ -37,11 +37,12 @@ use oc_engine::dispatch::ToolRegistryDispatcher;
 use oc_engine::interrupt::InterruptSignal;
 use oc_engine::r#loop::{
     AgentModelResolver, ResolvedAgent, ResolvedModel as EngineModel, RunTurnRequest, TurnContext,
-    TurnEvent, TurnEventSender, run_turn,
+    TurnError, TurnEvent, TurnEventSender, run_turn,
 };
 use oc_engine::prelude::{
     InternalAgent, InternalProviders, Internals, PreludeContext, PreludeOutcome, run_prelude,
 };
+use oc_error::ProviderError;
 use oc_llm::cache::{DynamicContext, McpToolStatus};
 use oc_llm::catalog::{Catalog, CatalogProvenance, CatalogSource, ResolveInput};
 use oc_llm::event::StreamEvent;
@@ -211,7 +212,10 @@ impl TurnPlan {
             project,
             config,
             agent,
-            credential: credentials.get(&provider_id).map(credential_value),
+            credential: resolved_credential(
+                catalog.provider(&provider_id),
+                credentials.get(&provider_id),
+            ),
             provider_id,
             model_id,
             resolver,
@@ -541,7 +545,7 @@ impl TurnHost {
             events,
         )
         .await
-        .map_err(to_string)?;
+        .map_err(describe_turn_failure)?;
         Ok(())
     }
 
@@ -568,6 +572,28 @@ impl TurnHost {
         run_prelude(&self.session_id, &mut context)
             .await
             .map_err(to_string)
+    }
+}
+
+/// Render a failed turn, naming where a rejected credential is configured.
+///
+/// `authentication rejected by provider test` is accurate and useless: it names the
+/// provider and not one place a user can act. Both places are named here because both
+/// are legitimate — [`provider_api_key`] reads the first and [`oc_auth::AuthStore`] the
+/// second — and neither the key nor any part of it is echoed, because the message is
+/// built from the provider id alone.
+///
+/// A keyless provider is deliberately **not** refused earlier:
+/// [`oc_provider_compatible::CompatibleProvider::new`] documents that a local endpoint
+/// legitimately has no credential, so the gateway's rejection is the first moment a
+/// missing key is known to be a problem.
+fn describe_turn_failure(error: TurnError) -> String {
+    match &error {
+        TurnError::Provider(ProviderError::Auth { provider, .. }) => format!(
+            "{error}: set `provider.{provider}.options.apiKey`, or run \
+             `opencode auth login {provider}`"
+        ),
+        _ => error.to_string(),
     }
 }
 
@@ -667,9 +693,135 @@ fn supports_compatible_transport(npm: &str) -> bool {
 ///
 /// `endpoint` first — `provider.ts:355-358` spells the fallback
 /// `options?.endpoint ?? options?.baseURL`, so a provider carrying both is dialled at
-/// `endpoint`. Both are also excluded from the SDK option bag by [`model_spec`]: they
-/// are a URL, not a parameter, and they travel as [`Spec::base_url`].
+/// `endpoint`. Both are also excluded from the SDK option bag by [`forwarded_options`]:
+/// they are a URL, not a parameter, and they travel as [`Spec::base_url`].
 const ENDPOINT_OPTIONS: [&str; 2] = ["endpoint", "baseURL"];
+
+/// The option key carrying a configured API key.
+///
+/// Spelled as the oracle spells it (`provider.ts:1719`), so an existing
+/// `opencode.json` keeps working. Like the endpoint keys it is **excluded** from the
+/// forwarded SDK bag — see [`resolved_elsewhere`] — because it is the credential, and
+/// the credential travels one way only, through [`oc_provider_compatible::factory`]'s
+/// lookup.
+const API_KEY_OPTION: &str = "apiKey";
+
+/// Whether an option is resolved into a dedicated [`Spec`] field or into the credential,
+/// and therefore must never also be forwarded in the SDK option bag.
+///
+/// Each such key has exactly one answerer: `endpoint`/`baseURL` answer
+/// [`Spec::base_url`] via [`provider_endpoint`], and `apiKey` answers the credential via
+/// [`provider_api_key`]. Forwarding them as well would be inert today — `Spec::options`
+/// is read by allow-listed key — and inert-today is precisely how a request body grows a
+/// field named after a URL, or worse a field carrying key material, the moment somebody
+/// widens that read.
+///
+/// Derived from [`ENDPOINT_OPTIONS`] rather than restating its entries, so a third
+/// endpoint spelling added there is excluded here with no second edit.
+fn resolved_elsewhere(name: &str) -> bool {
+    ENDPOINT_OPTIONS.contains(&name) || name == API_KEY_OPTION
+}
+
+/// The key a provider's own options declare, if any.
+///
+/// # Why this is primary and the stored credential is the fallback
+///
+/// `provider.ts:1719` is
+/// `if (options["apiKey"] === undefined && provider.key) options["apiKey"] = provider.key`
+/// — the config's key is consulted first and the credential fills in only when the
+/// option is absent. Ours had it inverted: [`credential_value`] was the *only* source,
+/// so a user who followed the upstream docs and put `baseURL` and `apiKey` together in
+/// `provider.<id>.options` sent no `Authorization` header at all. Measured against a
+/// real listener before the fix: `AUTH=None`, twice.
+///
+/// # An explicitly empty key is a key, not an absence
+///
+/// The oracle tests `apiKey` for `=== undefined`, not for `!== ""` as it tests
+/// `baseURL` at `:1699`. The asymmetry is right on both sides: an empty `baseURL`
+/// cannot be dialled, whereas an empty `apiKey` is a user saying "this endpoint takes
+/// no key" — and falling back to a stored credential there would present a real vendor
+/// key to a local endpoint the user never authorised. A non-string value falls through
+/// instead, because it cannot be a bearer token.
+fn provider_api_key(provider: Option<&oc_llm::catalog::ResolvedProvider>) -> Option<String> {
+    provider
+        .and_then(|provider| provider.options.get(API_KEY_OPTION))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+/// The credential one turn presents, config first.
+///
+/// See [`provider_api_key`] for the precedence and why it is that way round.
+fn resolved_credential(
+    provider: Option<&oc_llm::catalog::ResolvedProvider>,
+    stored: Option<&Credential>,
+) -> Option<String> {
+    provider_api_key(provider).or_else(|| stored.map(credential_value))
+}
+
+/// The SDK option bag for one model: the provider's options, with the model's on top.
+///
+/// `provider.ts:1676` seeds the bag from the provider — `const options = {
+/// ...provider.options }` — and model-level options are overlaid deep, the model
+/// winning at each colliding leaf (`:1497`). [`model_spec`] forwarded only
+/// `model.options`, so every provider-level option was silently dropped:
+/// `useCompletionUrls`
+/// ([`oc_provider_compatible::surface::use_completion_urls`]), `capabilities` and
+/// `extraBody` ([`oc_provider_compatible::provider`]) all have readers, and all were
+/// inert when set where the docs say to set them.
+///
+/// # Why the overlay is deep rather than a replace
+///
+/// The bag's values are objects — `extraBody`, `capabilities`, `modelCapabilities` — so
+/// a shallow overlay would make a model that narrows one `extraBody` key discard every
+/// other key the provider set. Upstream's `mergeDeep` does not, and neither does this.
+///
+/// # Direction is load-bearing
+///
+/// Provider first, model second, because the later write wins. Swapping the two is
+/// caught by `turn_tests::a_model_option_wins_over_a_provider_option_of_the_same_name`
+/// and, on the wire, by
+/// `provider_options::a_model_level_option_overrides_the_provider_level_one_of_the_same_name`.
+fn forwarded_options(
+    provider: Option<&oc_llm::catalog::ResolvedProvider>,
+    model: &oc_llm::catalog::ResolvedModel,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut bag = serde_json::Map::new();
+    let sources = provider
+        .map(|provider| &provider.options)
+        .into_iter()
+        .chain(std::iter::once(&model.options));
+    for source in sources {
+        for (name, value) in source {
+            if resolved_elsewhere(name) {
+                continue;
+            }
+            overlay(&mut bag, name, value);
+        }
+    }
+    bag
+}
+
+/// Write `value` at `name`, merging two objects rather than replacing one with the other.
+///
+/// `value` is the overlay, so it wins at every leaf it names and leaves the rest of an
+/// existing object intact. This is `mergeDeep(existing, incoming)` (`provider.ts:1497`)
+/// narrowed to the one direction this module needs.
+fn overlay(
+    bag: &mut serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    value: &serde_json::Value,
+) {
+    if let (Some(serde_json::Value::Object(target)), serde_json::Value::Object(source)) =
+        (bag.get_mut(name), value)
+    {
+        for (key, value) in source {
+            overlay(target, key, value);
+        }
+        return;
+    }
+    bag.insert(name.to_owned(), value.clone());
+}
 
 /// Where a provider's transport endpoint comes from, in the oracle's order.
 ///
@@ -723,7 +875,11 @@ fn provider_endpoint(
         .find(|url| !url.is_empty())
 }
 
-/// The transport spec for one model, endpoint included.
+/// The transport spec for one model: endpoint, headers and forwarded options.
+///
+/// The option bag comes from [`forwarded_options`], which seeds it from the provider
+/// and overlays the model's on top. It does **not** carry the endpoint keys or `apiKey`;
+/// see [`resolved_elsewhere`].
 ///
 /// # Errors
 ///
@@ -748,15 +904,8 @@ fn model_spec(catalog: &Catalog, model: &oc_llm::catalog::ResolvedModel) -> Resu
     for (name, value) in &model.headers {
         spec = spec.with_header(name, value);
     }
-    for (name, value) in &model.options {
-        // An endpoint is a URL, not an SDK parameter. `Spec::options` is read by
-        // allow-listed key — `capabilities`, `extraBody`, `useCompletionUrls` — so
-        // forwarding these would be inert today, and inert-today is how a body field
-        // named `baseURL` appears the moment someone widens that read.
-        if ENDPOINT_OPTIONS.contains(&name.as_str()) {
-            continue;
-        }
-        spec = spec.with_option(name, value.clone());
+    for (name, value) in forwarded_options(provider, model) {
+        spec = spec.with_option(name, value);
     }
     Ok(spec)
 }
