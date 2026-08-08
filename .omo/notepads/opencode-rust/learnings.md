@@ -5616,3 +5616,28 @@ model-level ones are — although upstream hands `{ ...provider.options }` to th
 (`:1673`). So provider-level `useCompletionUrls`, `timeout`, `headerTimeout`,
 `chunkTimeout`, `setCacheKey` are silently inert here even where `Spec::options`
 readers for them exist (`oc-provider-compatible/src/surface.rs:306`, `quirks.rs:148`).
+
+## [2026-08-08] Task 88 attempt 7: the number finally exists, and W-real reverses the idle result
+
+The exact preflight that failed before todo 109 now completes in 0.08 s: a real
+`opencode-rust run`, config-only model, endpoint only in `provider.options.baseURL`,
+and cassette-backed provider produced all three frozen requests. No `apiKey`
+workaround and no top-level `api` key were added.
+
+The unchanged revision-2 runner then completed both durable passes in 6,420.95 s.
+W-idle is dramatically below the gate: Rust peaks `[20572, 20528, 19632, 20040,
+19588]` KiB (median 20,040) versus paired TypeScript `[1003276, 1025708,
+1018024, 931436, 997892]` KiB (median 1,003,276), and the committed 954,240 KiB
+baseline gives a 477,120 KiB ceiling. Rust/committed is 0.021001: G1 PASS.
+
+W-real reverses the outcome. Rust peaks `[3078088, 3250116, 3249508, 3077236,
+3249624]` KiB (median 3,249,508) versus paired TypeScript `[2951288, 2466488,
+2877584, 3140184, 3134244]` KiB (median 2,951,288). Against the committed
+3,026,992 KiB median and 1,513,496 KiB ceiling, Rust/committed is 1.073511 and
+Rust/paired is 1.101047: G2 FAIL. The paired TS median is within 2.50% of the
+committed baseline, so the failure is not explained by a stale TypeScript baseline.
+
+This is the seventh useful outcome from a gate that refused to manufacture a
+number. The prior six defects are gone; the remaining failure is now the product's
+measured memory behavior on the 931-message / 3,620-part session, not an execution
+seam. A tiny fresh session is not evidence about history hydration.
