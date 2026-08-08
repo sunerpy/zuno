@@ -1473,3 +1473,58 @@ Not by input dependency but by two shared resources: `oc-testkit`'s methodology 
 hash test), and one machine for measurements that must not run concurrently.
 
 worktree: oc-wt/t114 (task-114)
+
+## Wave 34 (2026-08-08): todo 114 merged — the gate is now reproducible
+
+`main` = `9bdc26c`, **3149 tests**, 109/118 done.
+
+### The pin, verified field by field against ground truth
+
+`crates/oc-testkit/src/perf/subject.rs` commits **seven** fields. I checked every one
+directly rather than trusting the report:
+
+| field | pinned | measured by me |
+|---|---|---|
+| session | `ses_2bcaee257ffe…` | same |
+| messages / parts / bytes | 931 / 3,620 / 105,118,812 | **exact match** |
+| db bytes | 2,630,582,272 | `stat` agrees |
+| db sha256 | `e2cde4df08cd580d…` | `sha256sum` agrees |
+
+`select_largest_session` is **deleted** as a subject source. The heaviest session is still
+queried, but only to describe what a wrong database contains inside the failure message —
+never to become the subject. Three typed errors make every mismatch loud.
+
+### It kept revision 2, as the corrected plan required
+
+`PERF_METHODOLOGY_REVISION` is still `2`; the diff to `methodology.rs` is **pure addition**
+(nothing removed), so the `0.50` factor and the hashed formula section are untouched and the
+committed baseline still loads. It also added a test proving a **one-byte** drift in the
+formula section no longer matches its digest — turning the hash from decoration into a lock.
+
+### Three mutations, all caught
+
+Silent fallback to the heaviest session · that fallback **plus** the drift comparison removed
+(the true silent swap) · the sha256 comparison neutered. Each fails a named test. My first
+attempt at M1 didn't compile because I invented a helper that doesn't exist — worth noting
+that *my* mutation was wrong before the code was.
+
+### Five corrections it made to my analysis, all correct
+
+1. My acceptance criteria **contradicted my own correction** — they still demanded the hash
+   "fails at the old revision", which presupposes the bump the correction forbids. It
+   satisfied the intent (a falsifiable lock) over the letter. Right call.
+2. The notepad's "Owed: todo 114" line still said the pin *needs* a revision bump. Dangerous
+   as written; I have now annotated it **at its source** so no future reader acts on it.
+3. Database identity is **not optional**, as my plan implied — a session id alone can be
+   satisfied by a same-id session in a different database, and `part.data` bytes drive the
+   peak. Correct, and now part of the pin.
+4. The real drift is **24.7×**, not 2.85×: the live DB is 65,092,177,920 bytes against the
+   snapshot's 2,630,582,272. I had only compared sessions.
+5. One unreproduced flake in `dispatcher_routes_every_launch_without_a_waiting_window`
+   (passed 5/5 in isolation), recorded not hidden.
+
+That is **four separate agents** who have now corrected criteria I wrote. Confirmed rule:
+*verify the mechanism before writing the instruction — and say so when a criterion is wrong
+rather than satisfying it badly.*
+
+worktree: oc-wt/t89 (task-89)
