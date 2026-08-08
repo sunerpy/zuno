@@ -1699,3 +1699,59 @@ evidence.** Now 104 files tracked, 1.5 MB, generators and probe JSON still ignor
 for credentials first; every `sk-` hit was synthetic or an artifact of the word "ta**sk-**".
 
 worktree: oc-wt/t92 (task-92)
+
+## Wave 38 (2026-08-08): todo 92 merged — the docs are code-derived, not typed
+
+`main` = `959c310`, **3206 tests**, 113/118 done. Only **103** and **F1-F4** remain.
+
+### The anti-vacuity mechanism, proven with todo 103's exact future edit
+
+Every generated block takes its *expected* side from a live artifact, delimited by
+`<!-- generated:BEGIN name -->`. Sources: `DivergenceList` over `divergences.toml`,
+`oc_cli::dispositions()`, `oc_server::V1_SURFACE`, `oc_plugin::HookName::ALL`,
+`oc_db::prune::DELETE_ORDER`, `oc_db::migration::MIGRATION_IDS`, and the rejection
+messages **rendered by** `oc_config::legacy`'s detectors.
+
+I simulated todo 103 precisely — appended an 8th `[[divergence]]` **and** bumped
+`DECLARED_COUNT` to 8, leaving the docs untouched:
+
+```
+docs_every_declared_divergence_is_documented_with_its_reason ... FAILED
+docs_compatibility_matrix_matches_every_code_table ... FAILED
+```
+
+Two tests, not one. The docs cannot silently go stale. `OC_DOCS_REGENERATE=1` rewrites the
+blocks from code, so the fix for a stale page is to take the generated version.
+
+**The `/api` block is the best part**: it does not read registration source, it issues a
+request per operation through the assembled router and classifies a `501` as a stub. So
+"registered but does nothing" is *measured*, and a stub that gains a handler reclassifies
+itself.
+
+### THREE corrections to my briefing, all verified and all mine
+
+1. **G6 is not `#[ignore]`d.** The workspace has exactly **one** `#[ignore]`:
+   `soak.rs:683`. G5 *and* G6 run in the ordinary suite; only G1/G2
+   (`OC_MEMORY_GATE_MODE=run`) and the G3/G4 soak are opt-in. Following my briefing would
+   have told readers to opt into a gate they already run.
+2. **G4's "120 s / 1800 s" are two bounds**, not a measurement and a limit — a progress
+   timeout and a per-turn hard deadline. Reporting 120 as measured would have been a
+   fabricated number.
+3. **Todo 10's rejection list is not a table.** Ten `DeprecatedForm` variants build messages
+   per input, embedding the file path, so no table-vs-table comparison exists. Running the
+   detectors is a *stronger* assertion than my criterion implied — and it revealed three
+   forms render from two detectors each, with `AuthPromptCondition` giving two different
+   replacements. A table-shaped assumption would have documented one and been wrong.
+
+Also: my own grep for two of the four compatibility gaps returned zero hits and I nearly
+flagged them missing — the docs covered both under better wording. *Check the wording before
+disbelieving the deliverable.*
+
+### Three capabilities left undocumented for lack of a test — correctly
+
+G6's "≥33 PIDs" (the test asserts `>= 5`; my figure came from evidence not present in that
+worktree), CLI/HTTP archive restore (library-only, documented as an asymmetry), and
+per-operation `/api` response-shape parity. *Refusing to document an untested capability is
+the same discipline as refusing to fake a measurement.*
+
+worktree: oc-wt/t103 (task-103) — the last implementation todo
