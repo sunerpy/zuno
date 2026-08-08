@@ -1315,3 +1315,50 @@ badly. Recorded as: *an acceptance criterion that names a mechanism can be wrong
 the mechanism; the agent that checks is worth more than the criterion.*
 
 worktree: oc-wt/t111 (task-111) | 88 still running in oc-wt/t88
+
+## Wave 31 (2026-08-07): todo 111 merged and verified; seam #8 found and deliberately deferred
+
+`main` = `8a46d9d`, **3130 tests**, 106/114 done. Todo 88 still measuring in oc-wt/t88.
+
+### 111 verified by mutation, four ways
+
+Substitute empty for an unset variable · drop the `offset > 0` guard · swap `value` for
+`truthy_value` · expand before choosing the rung. All four caught.
+
+The empty-substitution mutation is caught at the **unit** layer only, and that is correct
+rather than a gap: a literal `${VAR}` host and a collapsed empty host both fail to dial, so
+the wire layer genuinely cannot tell them apart. Its test's doc comment says exactly that
+and *"does not pretend to"*. An honest test boundary beats a test that appears to prove more
+than it can.
+
+I checked the one claim a doc comment could have been wrong about: `Env::value` really is
+the nullish read (`env.rs:128`), and `truthy_value` (`:134`) is the `||` variant. Using
+`value` matches the oracle's `?? item`, so a variable set to `""` substitutes empty while an
+*unset* one keeps its placeholder. That asymmetry is upstream's, and the swap mutation
+fails two tests.
+
+### Hands-on QA, three scenarios
+
+`${GW_HOST}` exported the way a shell export reaches a child → server observed
+`host='127.0.0.1:8801'` twice. Unset → exit 1, nothing dialled. Plain URL → unaffected,
+2 requests.
+
+### Seam #8, and the pattern behind three of them
+
+111 found that **every** connection-level failure renders as
+`transient provider failure (status=None)`. The URL is in the error value; `#[error]` does
+not walk `#[source]`, so it is dropped before the user sees it.
+
+This is the **third instance of one class**. Todo 109 fixed it at one site, todo 110 at a
+second. Fixing site three the same way leaves site four broken — it wants one fix at the
+rendering seam. 111 correctly declined: it changes user-visible text across the whole CLI,
+which is a different todo, not a rider on `${VAR}` expansion. → todo **112**, blocked by
+88/89/90 on purpose, since it touches a surface every in-flight branch renders through.
+
+### Two rules earned this wave
+
+- *An acceptance criterion that names a mechanism can be wrong about the mechanism.* Todo
+  110 corrected three of mine; 111 corrected a fourth. The agent that checks is worth more
+  than the criterion.
+- *Fixing one instance of a rendering defect per site hides the class.* Three sites in one
+  wave is the signal to go up a level.
