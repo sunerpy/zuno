@@ -5603,3 +5603,68 @@ The agent added `sha2` to `oc-llm` (already a workspace dependency, no new exter
 replace full `Message` clones in the prompt-cache tracker with fixed-size SHA-256
 fingerprints. That is a scope expansion beyond the stated task, justified in its commit body,
 and it is part of why the peak fell. Flagging it so it is not mistaken for drift.
+
+## [2026-08-08] Todo 114: W-real's subject is now pinned — and the "needs a revision bump" line above is WRONG
+
+**Correcting an earlier entry in this file.** Under *"Owed: todo 114"* I wrote that pinning
+the subject *"needs its own todo, an explicit unfreeze decision, and a methodology-revision
+bump"*. The first two are right. **The third would have been destructive.**
+
+`BaselineReport::validate` (`perf/baseline.rs:165`) enforces
+`baseline.methodology_revision == PERF_METHODOLOGY_REVISION` as a **hard equality**, and the
+committed `benchmarks/ts-baseline.json` records revision **2**. Bumping the constant to 3
+without regenerating the baseline makes every gate fail to *load* it — destroying the G1
+PASS (0.0207) and G2 PASS (0.4936) that todos 88 and 113 measured, at a cost of ~100 minutes
+of TypeScript re-measurement to recover. Anyone reading the older line and acting on it
+would have broken both green gates.
+
+**What was actually done: revision stays at 2.** Pinning *which* session is measured changes
+no formula, no threshold, no repetition count, no sampling interval, no process-tree rule and
+no warm-up scoping — so the hashed formula section is byte-identical
+(`db49ffeb3a19a265a948e5545afe14e245f8ac7c8201ae1b1e1748e87f6922ad`, re-verified) and revision
+2 still describes exactly how the measurement is taken. The subject is **data** the repo owns,
+not methodology.
+
+That argument is only safe while the digest can still catch a real change to *how* it is
+measured, so the lock was made falsifiable:
+`a_formula_section_that_drifted_by_one_byte_no_longer_matches_its_digest` and
+`an_unregistered_revision_cannot_match_any_formula_section`.
+
+### The pin
+
+`crates/oc-testkit/src/perf/subject.rs` — `W_REAL_SUBJECT` carries **seven** committed fields:
+session `ses_2bcaee257ffeFZNJrmtpi3ZglR` (931 msgs / 3,620 parts / 105,118,812 part bytes)
+plus the snapshot's path, `2,630,582,272` bytes and sha256 `e2cde4df08cd580d…`. Alongside it,
+`W_REAL_RECAPTURE` — a four-step procedure printed by every pin failure, whose **step 4 is
+re-measuring the baseline**, because the subject and the ceiling must come from one
+measurement.
+
+`select_largest_session` is **deleted**. The session is read *by id*; its three counts are
+compared; the database's byte length and digest are checked *before* the 2.6 GB `.backup`
+runs. `OPENCODE_DB` still locates a candidate file, but it no longer *defines* the subject —
+a byte-identical copy at any path is accepted and a mutated database at the pinned path is
+not.
+
+Mismatches are three typed variants (`WRealDatabaseMismatch`, `WRealSubjectMissing`,
+`WRealSubjectDrifted`), each naming expected, found and the recapture procedure. The heaviest
+session is still queried, but **only to describe what the database holds inside the failure
+message** — it can never become the measured subject.
+
+### Two things my analysis got wrong or missed
+
+1. **The plan's own acceptance criteria contradicted its own correction.** The criteria said
+   *"the methodology-hash test passes at the new revision and fails at the old one, proving
+   the bump is real"* — which presupposes the bump the correction later forbids. Satisfied the
+   intent (a falsifiable lock) rather than the letter. Worth noting because this is now the
+   fourth time a criterion has named a mechanism that turned out to be wrong.
+
+2. **The live database is 65 GB, not "a bit bigger".** `65,092,177,920` bytes today against
+   the April snapshot's `2,630,582,272` — a **24.7x** growth. The moving-target problem was
+   materially worse than the 2.85x *session* figure alone suggested.
+
+### For todos 89/90 (G3/G4)
+
+The pin lives in its own module and is re-exported from `perf`. Adding gates touches
+`methodology.rs` thresholds and `baseline.rs` workloads, neither of which the pin constrains.
+G3/G4 do not use a real database (`uses_real_database` is W-real only), so no new pinning is
+owed. Adding them requires undoing none of this.

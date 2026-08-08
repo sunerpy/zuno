@@ -24,8 +24,8 @@ retained raw samples under the revision it declares.
 
 - **W-idle:** cold start, one cassette-backed prompt containing one tool call,
   then a 60-second settle period.
-- **W-real:** copy the user's `opencode.db`, select the largest session by
-  `SUM(LENGTH(part.data))`, record its ID and message/part counts, render it,
+- **W-real:** copy the pinned database snapshot, restore the **pinned session**
+  (see *W-real subject pin*), record its ID and message/part counts, render it,
   then execute one turn. The source database is never opened writable.
 - **W-soak:** at least 500 turns over at least two hours, cassette-backed, with
   a watcher on at least 50,000 files, at least two real LSP servers, one tool
@@ -78,6 +78,54 @@ the same quantity from data the artifact already holds, and the measured spread
 is wider than a two-pass 10% agreement criterion would have tolerated — 1.14x
 for `W-idle` and 1.18x for `W-real`. Reporting the spread states that variance
 instead of asserting a tolerance the machine does not meet.
+
+## W-real subject pin
+
+`W-real` measures one specific session in one specific database snapshot. Both
+are recorded as `W_REAL_SUBJECT` in `crates/oc-testkit/src/perf/subject.rs`:
+
+| field | value |
+| --- | --- |
+| session | `ses_2bcaee257ffeFZNJrmtpi3ZglR` |
+| messages | 931 |
+| parts | 3,620 |
+| `SUM(LENGTH(part.data))` | 105,118,812 |
+| snapshot | `/config/.local/share/opencode/opencode.db.bak.20260408` |
+| snapshot bytes | 2,630,582,272 |
+| snapshot SHA-256 | `e2cde4df08cd580d0a4f03068b2d861275ca8aef983fef6578968f7f7a2a18a7` |
+
+Selection used to be *"whichever session holds the most `part.data` bytes at
+measurement time"* against whatever database `OPENCODE_DB` resolved to. That made
+the workload a moving target while the G2 ceiling stayed fixed at `0.50 x` the
+TypeScript median measured for **one** session, so the gate became arbitrarily
+harder or easier with no change in the code. Measured on 2026-08-08: the session
+the committed baseline describes had been deleted from the live database
+altogether, and the then-heaviest session was 299,771,941 bytes — 2.85x larger —
+against an unchanged 1,513,496 KiB ceiling.
+
+The pin is enforced, not documented:
+
+- The resolved database is checked against the pinned byte length and SHA-256
+  **before** it is copied. The path is only where to look; a byte-identical copy
+  elsewhere is accepted and a mutated database at the pinned path is not.
+- The session is read **by ID**, and its message count, part count and part bytes
+  must equal the pinned values.
+- Any mismatch is a typed error naming what was expected, what was found, and the
+  recapture procedure. The heaviest session present is reported in that message
+  as information; it is never substituted for the pin.
+- Every report's recorded subject — the committed baseline included — is compared
+  against the pin, and a disagreement fails the gate.
+
+**Re-pinning requires re-measuring.** The subject and the ceiling come from one
+measurement, so changing `W_REAL_SUBJECT` without regenerating
+`benchmarks/ts-baseline.json` reintroduces exactly the defect the pin closes. The
+full procedure is in `W_REAL_RECAPTURE`, which every pin failure prints.
+
+This is **not** a `PERF_METHODOLOGY_REVISION` bump. Pinning *which* session is
+measured changes no formula, no threshold, no repetition count and no sampling
+rule, so the hashed section below is byte-identical and revision 2 still describes
+this measurement. A bump would instead make the revision-2 baseline unloadable and
+discard the measured G1/G2 results.
 
 ## Liveness progress
 
