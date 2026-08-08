@@ -377,6 +377,14 @@ fn internal_prompt(name: &str) -> Result<String, String> {
 pub(crate) struct TurnHost {
     connection: rusqlite::Connection,
     providers: ProviderRegistry,
+    /// The credential this host presents, kept only so [`describe_turn_failure`]
+    /// can prove it never echoes it.
+    ///
+    /// This is not a second copy of a secret: `providers` already closes over the
+    /// same string, because that is how it authenticates. Holding it here names the
+    /// one value the rendering seam must scrub, which is otherwise unknowable at
+    /// the moment a failure is printed — see [`without_credential`].
+    credential: Option<String>,
     resolver: Resolver,
     dispatcher: ToolRegistryDispatcher,
     interrupt: InterruptSignal,
@@ -431,6 +439,7 @@ impl TurnHost {
             .map(|_| plan.project.directory.clone());
         let mut providers = ProviderRegistry::new();
         let transport: Arc<dyn Transport> = Arc::new(ReqwestTransport::new(&plan.provider_id));
+        let presented = plan.credential.clone();
         let credential = plan.credential.clone();
         providers.register_fallible(
             COMPATIBLE_PROVIDER,
@@ -463,6 +472,7 @@ impl TurnHost {
         Ok(Self {
             connection,
             providers,
+            credential: presented,
             resolver: plan.resolver,
             dispatcher,
             interrupt,
@@ -547,7 +557,7 @@ impl TurnHost {
             events,
         )
         .await
-        .map_err(describe_turn_failure)?;
+        .map_err(|error| describe_turn_failure(&error, self.credential.as_deref()))?;
         Ok(())
     }
 
@@ -577,25 +587,75 @@ impl TurnHost {
     }
 }
 
-/// Render a failed turn, naming where a rejected credential is configured.
+/// Render a failed turn: its category, then every cause it wraps, then what to do.
+///
+/// # Why the cause chain is walked here and not per variant
+///
+/// A [`TurnError`] classifies; the detail hangs off it as a `#[source]`. Rendering
+/// `error.to_string()` prints the classification and discards the detail, so a wrong
+/// hostname, a dead port, a TLS refusal and an unexpanded `${VAR}` all read
+/// `transient provider failure (status=None)` — seven words naming nothing the user
+/// can act on, with the URL sitting one `source()` call away the whole time.
+///
+/// That defect was fixed twice by hand before this: once for a missing endpoint and
+/// once for a rejected credential, each by composing a better message for that one
+/// variant. Both fixes were correct and neither generalised, so the third instance
+/// reached a user anyway. [`oc_error::source::describe`] walks the chain once for
+/// every variant, so there is no fourth instance to find.
+///
+/// # Naming where a rejected credential is configured
 ///
 /// `authentication rejected by provider test` is accurate and useless: it names the
-/// provider and not one place a user can act. Both places are named here because both
-/// are legitimate — [`provider_api_key`] reads the first and [`oc_auth::AuthStore`] the
-/// second — and neither the key nor any part of it is echoed, because the message is
-/// built from the provider id alone.
+/// provider and not one place a user can act. Both places are named because both are
+/// legitimate — [`provider_api_key`] reads the first and [`oc_auth::AuthStore`] the
+/// second. The advice is separated by `;` rather than `:` because everything before
+/// it is now a chain of causes, and a colon would present guidance as one more cause.
 ///
 /// A keyless provider is deliberately **not** refused earlier:
 /// [`oc_provider_compatible::CompatibleProvider::new`] documents that a local endpoint
 /// legitimately has no credential, so the gateway's rejection is the first moment a
 /// missing key is known to be a problem.
-fn describe_turn_failure(error: TurnError) -> String {
-    match &error {
-        TurnError::Provider(ProviderError::Auth { provider, .. }) => format!(
-            "{error}: set `provider.{provider}.options.apiKey`, or run \
+///
+/// # The chain is scrubbed before anyone reads it
+///
+/// Walking causes means rendering whatever a peer put in a 401 body, and a gateway
+/// that echoes the key it rejected is a real shape — a vendor answering `Incorrect
+/// API key provided: sk-…` turns a diagnostic into a disclosure. The message the
+/// credential travelled in is therefore filtered through [`without_credential`]
+/// before it is returned, so the guarantee that no key material reaches a terminal
+/// survives the walk that made the rest of the failure legible.
+fn describe_turn_failure(error: &TurnError, credential: Option<&str>) -> String {
+    let mut message = oc_error::source::describe(error);
+    if let TurnError::Provider(ProviderError::Auth { provider, .. }) = error {
+        message.push_str(&format!(
+            "; set `provider.{provider}.options.apiKey`, or run \
              `opencode auth login {provider}`"
-        ),
-        _ => error.to_string(),
+        ));
+    }
+    without_credential(message, credential)
+}
+
+/// What stands in for a credential that would otherwise have been printed.
+const REDACTED: &str = "<redacted>";
+
+/// Remove every occurrence of `credential` from `message`.
+///
+/// Exact removal rather than a search for credential-shaped text: this is the one
+/// secret the turn actually presented, so matching it is complete for the value that
+/// matters and cannot be defeated by a vendor formatting it unexpectedly. A pattern
+/// guess would be both weaker here and prone to redacting a user's prose.
+///
+/// A short credential over-redacts — a one-character key blanks every occurrence of
+/// that character. That is the deliberate direction to fail in: a mangled message is
+/// a cosmetic loss and a leaked key is not, and no real credential is short enough
+/// for it to happen. An **empty** credential is skipped, because `str::replace` with
+/// an empty pattern inserts the replacement between every character;
+/// [`provider_api_key`] documents why an empty key is a legitimate configuration and
+/// therefore reaches this function.
+fn without_credential(message: String, credential: Option<&str>) -> String {
+    match credential {
+        Some(secret) if !secret.is_empty() => message.replace(secret, REDACTED),
+        Some(_) | None => message,
     }
 }
 

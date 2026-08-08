@@ -63,6 +63,21 @@ const OPTIONS_KEY: &str = "sk-from-options";
 /// The key the auth store holds for `test`.
 const STORED_KEY: &str = "sk-from-the-auth-store";
 
+/// A key planted where a leak would be unmistakable.
+///
+/// Deliberately loud: a partial match, a truncation or a case change all still contain
+/// `SUPERSECRET`, so a scrub that only half worked cannot pass by looking tidy.
+const ECHOED_KEY: &str = "sk-SUPERSECRET-DO-NOT-ECHO";
+
+/// A 401 body wording its rejection the way real gateways do: by quoting the key.
+fn echoed_key_body() -> Vec<u8> {
+    serde_json::json!({
+        "error": {"message": format!("Incorrect API key provided: {ECHOED_KEY}")}
+    })
+    .to_string()
+    .into_bytes()
+}
+
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_opencode-rust"))
 }
@@ -174,11 +189,20 @@ async fn mock() -> MockProvider {
 
 /// A mock that rejects everything, so the auth failure path can be observed.
 async fn unauthorized_mock() -> MockProvider {
+    rejecting_mock(br#"{"error":{"message":"missing credentials"}}"#.to_vec()).await
+}
+
+/// The same rejection, with `body` as the vendor's own error text.
+///
+/// Parameterised so one test can plant a body that echoes the rejected key — the shape
+/// real gateways use (`Incorrect API key provided: sk-…`) and the one that turns a cause
+/// chain into a disclosure.
+async fn rejecting_mock(body: Vec<u8>) -> MockProvider {
     let reject = || {
         MockResponse::authored(
             401,
             "application/json",
-            br#"{"error":{"message":"missing credentials"}}"#.to_vec(),
+            body.clone(),
             "todo 110: the keyless failure path needs a gateway that checks auth",
         )
     };
@@ -454,5 +478,71 @@ async fn no_key_anywhere_names_where_to_put_one_and_never_prints_a_key() {
             !message.contains(secret),
             "the failure path echoed key material (`{secret}`):\n{message}"
         );
+    }
+}
+
+/// A gateway that echoes the key it rejected still leaks nothing to the user.
+///
+/// Todo 110's no-key-material guarantee held because the message was *composed* from the
+/// provider id: there was no channel for a secret to travel down. Todo 112 opened one —
+/// rendering a failure now walks its `#[source]` chain, and the innermost link on this
+/// path is the vendor's own 401 body. `Incorrect API key provided: sk-…` is how real
+/// gateways word it, so the body here is that shape with a key impossible to mistake for
+/// anything else.
+///
+/// Both key sources are exercised, because [`resolved_credential`]'s precedence means a
+/// scrub seeded from only one of them would pass with the config key and leak the stored
+/// one — the more sensitive of the two, since `opencode auth login` is where a real
+/// vendor key lives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gateway_that_echoes_the_rejected_key_still_prints_no_key_material() {
+    let sources = [
+        (
+            Keys {
+                options: Some(ECHOED_KEY),
+                stored: None,
+            },
+            "provider.test.options.apiKey",
+        ),
+        (
+            Keys {
+                options: None,
+                stored: Some(ECHOED_KEY),
+            },
+            "the auth store",
+        ),
+    ];
+
+    for (keys, source) in sources {
+        let env = ScriptedEnv::new().expect("isolated environment");
+        let provider = rejecting_mock(echoed_key_body()).await;
+        let base_url = format!("{}/v1", provider.base_url());
+        let config = provider_config(&base_url, keys, no_options(), no_options());
+
+        let output = run_prompt(&env, config, keys.stored).await;
+        provider.shutdown().await;
+
+        assert!(
+            !output.status.success(),
+            "a rejected turn must not report success ({source})\n{}",
+            describe(&output)
+        );
+        let message = combined(&output);
+        assert!(
+            !message.contains(ECHOED_KEY),
+            "the key from {source} reached the terminal through the vendor's error \
+             body:\n{message}"
+        );
+        assert!(
+            message.contains("Incorrect API key provided"),
+            "the vendor's wording never reached the user, so this run would pass even \
+             with no scrubbing at all ({source}):\n{message}"
+        );
+        for needle in ["provider.test.options.apiKey", "auth login"] {
+            assert!(
+                message.contains(needle),
+                "scrubbing cost the advice `{needle}` ({source}):\n{message}"
+            );
+        }
     }
 }
