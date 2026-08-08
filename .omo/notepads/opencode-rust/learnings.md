@@ -5977,3 +5977,58 @@ Two tests made this a text change instead of a text gamble:
 
 Neither needed an existing expectation re-worded. That is the evidence the widening was
 additive.
+
+## [2026-08-08] Todo 92: how to write a docs test that is not vacuous, and one race it hides
+
+### The shape that proves nothing, and the shape that works
+
+A hand-written Markdown table plus a test that reads that same Markdown is the
+vacuous-fixture failure in documentation form — both sides are one artifact, so it
+passes for any content including content that contradicts the code. The fix is
+mechanical and worth reusing: delimit each table with
+`<!-- generated:BEGIN name --> / <!-- generated:END name -->`, derive the EXPECTED
+side from a live code artifact, compare against the committed bytes, and offer
+`OC_DOCS_REGENERATE=1` so the correct response to a failure is *taking the code's
+version*, not retyping it. Prose outside the markers is never touched, so a page
+stays readable while its tables cannot drift.
+
+**The strongest block in `crates/oc-cli/tests/docs.rs` is the `/api` one, and the
+reason generalises.** It does not read the route-registration source; it builds the
+real router and issues one request per operation, classifying anything that answers
+`501` as a stub. So "registered but does nothing" is *measured*, and a stub that
+gains a handler is reclassified without anyone editing a table. Reading the source
+would have produced the same table today and a wrong one after the next handler
+lands.
+
+### The race: one test per generated block is wrong when blocks share a file
+
+First draft had a test per block. Under regeneration two tests writing two blocks
+of the same page each did read-modify-write and silently discarded the other's
+write — surfacing as `has no <!-- generated:BEGIN divergence-index --> marker` on a
+file that plainly had it. **One test per FILE, not per block.** Recorded in a doc
+comment on the consolidated test, because splitting it back into four is the
+obvious refactor and reintroduces the bug invisibly.
+
+### Todo 10's "rejection list" is not a table, and that is better
+
+There is no const array of rejected forms. There are 10 `DeprecatedForm` variants
+whose messages are *constructed per input* by `Deprecation::message()`, embedding
+the offending file's absolute path. So no table-vs-table comparison is possible —
+the test has to run the detectors and compare rendered output. That is a stronger
+assertion than the plan's framing implied: it is against behaviour, not against a
+literal. Two forms render from two different detectors with two different
+replacements (`AuthPromptCondition` most notably), which a table-shaped assumption
+would have documented as one.
+
+Generalised: **when an acceptance criterion says "compare the documented table to
+the code's table", check first whether the code has a table.** If the values are
+computed, comparing rendered output is the honest translation of the intent.
+
+### Four mutations, and why M2 was the one that mattered
+
+M1 (8th entry, count left at 7) fails on the count guard the compat suite already
+had — it proves nothing new. **M2 is the acceptance scenario: 8th entry AND
+`DECLARED_COUNT` bumped to 8, i.e. exactly the edit todo 103 will make.** It fails
+with `divergence-detail is stale` and prints all eight entries. Choosing the
+mutation the *next* task performs, rather than a mutation that trips an existing
+guard, is what made the proof worth the round.
