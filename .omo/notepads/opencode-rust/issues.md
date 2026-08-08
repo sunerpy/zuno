@@ -5350,3 +5350,42 @@ Worth checking when it is picked up: whether the source body is ever a place ven
 error text could carry key material. `ResponseBody` truncates at 512 bytes
 (`oc-provider-compatible/src/transport.rs`) and is a *response* body, so probably not —
 but "probably" is not the standard todo 110 set for anything adjacent to credentials.
+
+## [2026-08-07] Todo 111 found an EIGHTH seam it correctly refused to fix: transport errors name nothing
+
+While proving the `${VAR}` failure path, 111 discovered that a wrong endpoint —
+misspelled variable, wrong hostname, dead port, anything at the connection level — renders as:
+
+```
+transient provider failure (status=None)
+```
+
+The URL *is* in the error value: `ProviderError::transient` attaches the transport error
+and reqwest's own message names the URL. But `describe_turn_failure` renders
+`error.to_string()`, and `Transient`'s `#[error]` attribute does not walk the `#[source]`
+chain, so everything useful is dropped before the user sees it.
+
+I confirmed this myself in QA: an unset `${GW_HOST}` exits 1 with exactly that string and
+nothing else — not the URL, not the variable name.
+
+**This is the third instance of one class**, and the first two were already fixed this
+wave: todo 109 replaced `unrecoverable provider failure (status=None)` with a message
+naming `provider.<id>.options.baseURL`; todo 110 replaced `authentication rejected by
+provider test` with one naming both places a key can live. The pattern is now explicit:
+
+> *Our error rendering drops the `#[source]` chain, so every wrapped failure surfaces as
+> a category name with no actionable detail. Fixing it per-site — as 109 and 110 each did
+> — leaves the next site broken. It wants one fix at the rendering seam.*
+
+111 **correctly declined to fix it**: it changes user-visible text for every provider
+failure across the whole CLI, which is a different todo, not a rider on `${VAR}`
+expansion. It reframed its own test to assert only what loopback can prove — nothing
+dialled, specifically not the intended gateway — and put the verbatim-literal claim at the
+unit layer where the URL is actually observable. That is the right split.
+
+### Owed: todo 112, and a note for todo 92
+
+One `#[source]`-chain walk at the rendering seam. Deliberately deferred until after the
+perf gates (88/89/90), because it touches a shared surface every in-flight branch renders
+through, and a conflict there would cost more than the fix. Todo 92's divergence
+documentation should note it too.
