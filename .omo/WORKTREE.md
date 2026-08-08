@@ -1801,3 +1801,74 @@ deliberately-undocumented capabilities — so they audit **disclosure** rather t
 rediscovering. Each was told an honest `UNVERIFIABLE` outranks a generous `SATISFIED`.
 
 worktrees: oc-wt/tF1, tF2, tF3, tF4
+
+## Wave 40 (2026-08-08): THE FINAL WAVE REJECTED 4/4 — and it was right every time
+
+`main` = `8a04f19`. 114 implementation todos green, **3214 tests**, 0 clippy warnings — and the
+wave still found **12 blocking findings**. That is the whole argument for having it.
+
+Reports preserved as tracked evidence: `.omo/evidence/F{1,2,3,4}-REPORT.md`.
+
+### SEAM #10, verified by me from scratch
+
+**A normal Rust turn writes a session row the released TypeScript binary cannot read.**
+```
+Error: Unexpected error
+Expected string, got undefined      [exit=1]
+```
+One line: `turn.rs:1175` writes `{"providerID","modelID"}` into `session.model`. Against the real
+62 GB TypeScript database:
+
+| table | upstream key | rows |
+|---|---|---|
+| `session.model` | **`id`** (+`providerID`,`variant`) | 5,959/5,959 |
+| `message.model` | **`modelID`** | 17,438/17,438 |
+
+**The two tables differ upstream and we used the message spelling for both.** `turn.rs:1198` is
+correct and must not move. This breaks criterion 1 — the round-trip that makes rollback real —
+and the compat suite missed it because its journal round-trip checks the `migration` table, not
+whether TS can decode a Rust-written *session*.
+
+### The reviewers each found what they were sent for
+
+- **F3** found seam #10 and the `export` lie by *using the product* — following `--help` to back
+  up a session, and crossing the boundary the README promises.
+- **F2** found a **vacuous G5 gate and proved it by mutation**: `engine_turn_events_apply_backpressure`
+  probes a toy channel, so breaking `TurnEventSender::send` left the gate green. It built a
+  production-channel test to prove the mutant was real *before* reporting — the discipline I
+  failed at with `.unwrap_or(0)`.
+- **F4** caught the frozen 34-crate roster silently becoming 36, invisible because
+  `members = ["crates/*"]` globs.
+- **F1** caught that **my own evidence chain is broken** (below).
+
+### My error, and its full cost
+
+`.omo/evidence/` was gitignored while five files had been force-added. Todos 113 and 114 wrote
+evidence into *their worktrees*; the merge never carried it because the path was ignored; my
+`cleanup.sh` deleted the worktrees. I fixed `.gitignore` in wave **37** — three waves too late.
+
+So the only committed G1/G2 evidence (`task-88`) says **G2 FAIL at 3,249,508 KiB**, while the
+PASS I personally verified (1,494,236 KiB) has no artefact. My verification is committed in this
+ledger and the notepad, but **a verification I performed is not the evidence the plan requires.**
+F1 is right; todo 122 re-measures (~100 min).
+
+*Rule: fix an infrastructure defect the moment it is found. Deferring three waves cost a
+100-minute re-measurement.*
+
+### The remediation, dispatched
+
+Six fixes in parallel across disjoint crates — 115 (session model), 116 (export), 117 (config
+validation), 118 (SSE + behaviour matrix), 120 (vacuous gate + swallowed body read), 121 (PTY
+foreground group + Windows job). Then **119** (reconcile 6 nominated divergences + the crate
+roster + stale counts) once those land, then **122** alone (regenerate the G1/G2 artefact;
+measurement must not run concurrently with anything).
+
+### The rule this wave earned
+
+**A source-text assertion proves a line exists, never that it runs.** The G5 registry grepped for
+`mpsc::channel(...)` and `self.sender.send(event)`; the mutation kept both needles and removed the
+`.await`. Sixth instance of *a fixture friendlier than reality*: injected env var, injected config
+key, converging byte-identity fixture, toy channel, a PTY fixture that only sleeps, and a
+round-trip test that checks the wrong table.
+
+worktrees: oc-wt/t{115,116,117,118,120,121}
