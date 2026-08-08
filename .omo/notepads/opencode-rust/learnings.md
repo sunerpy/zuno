@@ -5827,3 +5827,44 @@ the no-marker `None` arm fails
 `loop_without_compaction_marker_is_byte_identical_to_full_history` with the same byte
 oracle (exit 101). Thus no-marker fallback is covered; the only surviving mutation is
 the one that performs no mutation to observable state.
+
+## [2026-08-08] Todo 114: a fixture that cannot disagree with the code proves nothing — build the decoy in
+
+The recurring trap on this project is a fixture that supplies something the real input shape
+does not have, so both code paths converge and the test passes vacuously. Todo 114 was
+maximally exposed to it: the whole task is *"which session gets selected"*, so a fixture
+database containing only the pinned session would pass identically under the pin and under the
+old largest-session rule.
+
+**The technique that closes it: make the fixture able to disagree, then assert it does.**
+The determinism fixture seeds a **heavier decoy** (1,280 part bytes vs the pinned 96) and ends
+with an explicit guard:
+
+```rust
+assert!(
+    heavier_decoy().part_data_bytes() > first.session.part_data_bytes,
+    "the decoy must be heavier or this test proves nothing"
+);
+```
+
+That assertion is not decoration — it fails if a future edit shrinks the decoy and silently
+turns the test vacuous. Mutation M3 (revert to largest-session selection) is caught **only**
+because of the decoy.
+
+Same principle applied to the identity check: the test asserts wrong-length-right-digest and
+right-length-wrong-digest **independently**, then adds a **positive** case with the honest pin.
+Without that positive case, `return Ok(())` at the top of the function and `return Err(...)`
+at the top would both look identical to a test that only ever expects failure.
+
+## [2026-08-08] Todo 114: extract a duplicated check instead of testing it twice
+
+The gate needed a fast-fail identity check (reject a wrong database in seconds rather than
+after a 100-minute pass), and the capture path needed the same check for correctness. Writing
+it twice would have meant two implementations that can drift, and only one of them reachable
+from a unit test.
+
+Extracted it as one public `verify_pinned_database` that both call. Result: the gate path now
+exercises library code the unit tests already cover, and mutation M9 (neutering the shared
+function) is caught. The honest residual — deleting the *call* from the gate — is not
+unit-caught, but it is also not a correctness regression, because the capture path enforces the
+same check unconditionally. Worth stating explicitly rather than claiming full coverage.

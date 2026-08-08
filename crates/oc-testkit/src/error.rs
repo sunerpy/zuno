@@ -296,6 +296,44 @@ pub enum TestkitError {
         detail: String,
     },
 
+    /// The resolved database is not the snapshot the W-real subject was pinned to.
+    ///
+    /// Raised before anything is copied or measured, so a mutated or substituted
+    /// database costs seconds rather than a full paired measurement pass.
+    #[error("W-real database at {path} is not the pinned snapshot: {detail}")]
+    WRealDatabaseMismatch {
+        /// Database that was resolved and rejected.
+        path: PathBuf,
+        /// Expected-versus-found identity plus the recapture procedure.
+        detail: String,
+    },
+
+    /// The pinned W-real session does not exist in the resolved database.
+    ///
+    /// A distinct variant from [`Self::WRealSubjectDrifted`] because the remedies
+    /// differ: an absent session means the wrong database, a drifted one means the
+    /// right database was written to.
+    #[error("W-real pinned session {session_id} is absent from {path}: {detail}")]
+    WRealSubjectMissing {
+        /// Session the pin names.
+        session_id: String,
+        /// Database searched for it.
+        path: PathBuf,
+        /// What was found instead plus the recapture procedure.
+        detail: String,
+    },
+
+    /// The pinned W-real session exists but no longer holds the pinned content.
+    #[error("W-real pinned session {session_id} in {path} drifted: {detail}")]
+    WRealSubjectDrifted {
+        /// Session the pin names.
+        session_id: String,
+        /// Database it was read from.
+        path: PathBuf,
+        /// Expected-versus-found counts plus the recapture procedure.
+        detail: String,
+    },
+
     /// A required local helper command is unavailable.
     #[error("required command {command:?} was not found; {remedy}")]
     HelperCommandNotFound {

@@ -6200,3 +6200,42 @@ provider-byte test. The no-marker arm was separately changed to drain its first 
 and was caught by `loop_without_compaction_marker_is_byte_identical_to_full_history`.
 This distinguishes a surviving equivalent mutant from the vacuous-fixture failures in
 which a genuinely different result escaped the oracle.
+
+## [2026-08-08] Todo 114: the W-real subject is data, not methodology — revision stays at 2
+
+**Decision.** `PERF_METHODOLOGY_REVISION` remains `2`. The W-real subject is pinned as a
+committed constant (`W_REAL_SUBJECT` in `crates/oc-testkit/src/perf/subject.rs`) compared
+against at run time, and `docs/perf-methodology.md`'s hashed formula section is byte-identical.
+
+**Why.** Pinning *which* session is measured changes nothing about *how* it is measured: the
+`0.50` factor, the five repetitions, the 2-second sampling interval, the AB/BA schedule, the
+process-tree walk and the W-soak-only warm-up discard are all untouched. A revision exists to
+mark numbers from two revisions as non-comparable; these numbers stay comparable.
+
+**Why not bump.** `BaselineReport::validate` enforces revision equality against the committed
+baseline, which records 2. A bump without regenerating the baseline makes every gate fail to
+load it, discarding G1 `0.0207` and G2 `0.4936` and costing ~100 minutes of TypeScript
+re-measurement.
+
+**What still requires a bump.** Changing a frozen formula. Proven falsifiable by
+`a_formula_section_that_drifted_by_one_byte_no_longer_matches_its_digest` and
+`an_unregistered_revision_cannot_match_any_formula_section`.
+
+**What requires re-measuring the baseline.** Changing the pin. `W_REAL_RECAPTURE`'s step 4 is
+regenerating `benchmarks/ts-baseline.json`, because G2's ceiling is `0.50 x` the TypeScript
+median *for the pinned subject* and does not scale to a different one. Changing the pin
+without step 4 reintroduces exactly the defect the pin closes.
+
+## [2026-08-08] Todo 114: the pin includes database identity, and the environment no longer defines the subject
+
+**Decision.** A pinned session id alone is not a pin. `W_REAL_SUBJECT` also carries the source
+snapshot's byte length and SHA-256, checked *before* the 2.6 GB copy.
+
+**Why.** A session id can be satisfied by a same-id session in a different database, and it is
+`part.data` bytes that drive the measured peak. `target/perf/task-88-work/context.json` already
+recorded `database_sha256` for resumability; this promotes that precedent into the definition.
+
+**Corollary — path versus identity.** `OPENCODE_DB` / `OC_MEMORY_GATE_DATABASE` still say where
+to *look*, but identity is what makes a located file acceptable. A byte-identical copy at any
+path is accepted; a mutated database at the pinned path is rejected. The ambient environment is
+how the current value was originally obtained, never what makes it correct.

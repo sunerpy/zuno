@@ -153,4 +153,51 @@ mod tests {
         // Then: it matches the immutable digest assigned to this revision.
         assert_eq!(actual, expected_methodology_hash(PERF_METHODOLOGY_REVISION));
     }
+
+    /// The lock above is only evidence if it can fail.
+    ///
+    /// Todo 114 pinned W-real's subject without bumping the revision, on the
+    /// argument that *which* session is measured is data rather than methodology.
+    /// That argument is only safe while the digest still catches a real change to
+    /// *how* it is measured, so this asserts the comparison is sensitive to the
+    /// smallest possible drift in the formula section.
+    #[test]
+    fn a_formula_section_that_drifted_by_one_byte_no_longer_matches_its_digest() {
+        // Given: the committed formula section and a copy differing by one byte.
+        let section = methodology_formula_section().expect("formula section must be delimited");
+        let drifted = format!("{section} ");
+
+        // When: both are hashed.
+        let committed = methodology_hash(section.as_bytes());
+        let after_drift = methodology_hash(drifted.as_bytes());
+
+        // Then: only the committed text satisfies this revision's registered digest,
+        // so changing a frozen formula cannot pass as an unbumped revision.
+        assert_eq!(
+            committed,
+            expected_methodology_hash(PERF_METHODOLOGY_REVISION)
+        );
+        assert_ne!(
+            after_drift,
+            expected_methodology_hash(PERF_METHODOLOGY_REVISION)
+        );
+    }
+
+    #[test]
+    fn an_unregistered_revision_cannot_match_any_formula_section() {
+        // Given: a revision number no digest was ever registered for.
+        let unregistered = expected_methodology_hash(PERF_METHODOLOGY_REVISION + 1);
+
+        // When/Then: it is a sentinel rather than a hash, so bumping the revision
+        // without registering a digest fails the lock instead of silently passing.
+        assert_eq!(unregistered, "UNREGISTERED_METHODOLOGY_REVISION");
+        assert_ne!(
+            methodology_hash(
+                methodology_formula_section()
+                    .expect("formula section")
+                    .as_bytes()
+            ),
+            unregistered
+        );
+    }
 }

@@ -15,18 +15,14 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use oc_testkit::perf::{
-    BaselineReport, BaselineRunOptions, FrozenThresholds, PairedSide, RunMeasurement, WorkloadName,
-    interleaved_pair_order, load_committed_baseline, measure_typescript_baseline,
+    BaselineReport, BaselineRunOptions, FrozenThresholds, PairedSide, RunMeasurement,
+    W_REAL_RECAPTURE, W_REAL_SUBJECT, WorkloadName, interleaved_pair_order,
+    load_committed_baseline, measure_typescript_baseline, verify_pinned_database,
 };
 
 const MEMORY_GATE_MODE: &str = "OC_MEMORY_GATE_MODE";
 const MEMORY_GATE_WORKER_OUTPUT: &str = "OC_MEMORY_GATE_WORKER_OUTPUT";
 const MEMORY_GATE_DATABASE: &str = "OC_MEMORY_GATE_DATABASE";
-const DEFAULT_REAL_DATABASE: &str = "/config/.local/share/opencode/opencode.db.bak.20260408";
-const EXPECTED_SESSION_ID: &str = "ses_2bcaee257ffeFZNJrmtpi3ZglR";
-const EXPECTED_MESSAGE_COUNT: u64 = 931;
-const EXPECTED_PART_COUNT: u64 = 3_620;
-const EXPECTED_PART_DATA_BYTES: u64 = 105_118_812;
 const WORKER_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 
 #[derive(Debug, Clone, Copy)]
@@ -103,12 +99,7 @@ fn g1_and_g2_use_at_most_half_the_committed_typescript_baseline() {
     let rust_release = build_release_subject(&workspace, &target);
     let rust_version = binary_version(&rust_release);
     let database = database_path();
-    assert!(
-        database.is_file(),
-        "W-real source database is missing at {}; set {MEMORY_GATE_DATABASE} to the immutable \
-         database used for the committed baseline",
-        database.display()
-    );
+    assert_pinned_database(&database);
 
     let typescript_binary = baseline.machine.typescript_binary.clone();
     assert!(
@@ -240,6 +231,49 @@ async fn frozen_measurement_worker() {
     measure_typescript_baseline(&options)
         .await
         .expect("the frozen runner must complete every G1/G2 repetition");
+}
+
+#[test]
+fn the_committed_baseline_measures_the_pinned_w_real_subject() {
+    // Given: the committed TypeScript baseline that supplies G2's ceiling.
+    let baseline = load_committed_baseline().expect("committed baseline");
+
+    // When/Then: its recorded subject is the pinned one, so `0.50 x` its W-real
+    // median is a ceiling for the same workload the gate will run.
+    assert_w_real_provenance("committed TypeScript baseline", &baseline);
+}
+
+#[test]
+fn a_report_about_another_session_fails_the_provenance_check() {
+    // Given: the committed baseline with its W-real session id replaced.
+    let mut substituted = load_committed_baseline().expect("committed baseline");
+    let real = substituted
+        .workloads
+        .iter_mut()
+        .find(|workload| workload.name == WorkloadName::WReal)
+        .expect("W-real must exist");
+    real.session_id = Some("ses_024892384ffe0oExC895WV7lhE".to_owned());
+    real.part_data_bytes = Some(299_771_941);
+
+    // When: the provenance check runs against it.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_w_real_provenance("substituted pass", &substituted);
+    }));
+
+    // Then: it fails rather than reporting a note, and the message names the pin,
+    // the substituted session and the recapture procedure. A gate that accepted
+    // this would compare a heavier workload against an unchanged ceiling.
+    let payload = outcome.expect_err("a substituted subject must fail the gate");
+    let message = payload
+        .downcast_ref::<String>()
+        .map_or_else(String::new, String::clone);
+    assert!(message.contains(W_REAL_SUBJECT.session_id), "{message}");
+    assert!(
+        message.contains("ses_024892384ffe0oExC895WV7lhE"),
+        "{message}"
+    );
+    assert!(message.contains("W_REAL_SUBJECT"), "{message}");
+    assert!(message.contains("benchmarks/ts-baseline.json"), "{message}");
 }
 
 #[test]
@@ -520,7 +554,19 @@ fn binary_version(binary: &Path) -> String {
 fn database_path() -> PathBuf {
     std::env::var_os(MEMORY_GATE_DATABASE)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_REAL_DATABASE))
+        .unwrap_or_else(|| PathBuf::from(W_REAL_SUBJECT.database_path))
+}
+
+/// Reject an unpinned database in seconds instead of after a 100-minute pass.
+///
+/// Delegates to the same comparison the capture path uses, so this fast-fail
+/// cannot disagree with the check that actually guards the measurement. The
+/// override names a path, never an identity: a byte-identical copy elsewhere is
+/// accepted and a mutated database at the pinned path is not.
+fn assert_pinned_database(database: &Path) {
+    if let Err(error) = verify_pinned_database(database, &W_REAL_SUBJECT) {
+        panic!("{error}\nset {MEMORY_GATE_DATABASE} to the pinned snapshot");
+    }
 }
 
 fn copy_subject(source: &Path, target: &Path) {
@@ -767,21 +813,31 @@ fn assert_same_machine(left: &BaselineReport, right: &BaselineReport) {
     assert_eq!(left.machine.ram_kib, right.machine.ram_kib, "RAM drift");
 }
 
+/// Compare a report's recorded subject against the pin, naming both on mismatch.
+///
+/// Applied to the committed baseline as well as to each measured pass, because
+/// G2's ceiling is `0.50 x` the TypeScript median **for the pinned subject**: a
+/// report about any other session is not comparable to it at all.
 fn assert_w_real_provenance(label: &str, report: &BaselineReport) {
     let real = report
         .workload(WorkloadName::WReal)
         .expect("W-real must exist");
-    assert_eq!(
+    let found = (
         real.session_id.as_deref(),
-        Some(EXPECTED_SESSION_ID),
-        "{label}"
-    );
-    assert_eq!(real.message_count, Some(EXPECTED_MESSAGE_COUNT), "{label}");
-    assert_eq!(real.part_count, Some(EXPECTED_PART_COUNT), "{label}");
-    assert_eq!(
+        real.message_count,
+        real.part_count,
         real.part_data_bytes,
-        Some(EXPECTED_PART_DATA_BYTES),
-        "{label}"
+    );
+    let expected = (
+        Some(W_REAL_SUBJECT.session_id),
+        Some(W_REAL_SUBJECT.message_count),
+        Some(W_REAL_SUBJECT.part_count),
+        Some(W_REAL_SUBJECT.part_data_bytes),
+    );
+    assert_eq!(
+        found, expected,
+        "{label} records a W-real subject the pin does not describe; expected {expected:?}, \
+         found {found:?}. {W_REAL_RECAPTURE}"
     );
 }
 
@@ -829,10 +885,13 @@ fn write_gate_artifact(
         "rust_version": rust_version,
         "w_real_database": database,
         "w_real_provenance": {
-            "session_id": EXPECTED_SESSION_ID,
-            "message_count": EXPECTED_MESSAGE_COUNT,
-            "part_count": EXPECTED_PART_COUNT,
-            "part_data_bytes": EXPECTED_PART_DATA_BYTES,
+            "session_id": W_REAL_SUBJECT.session_id,
+            "message_count": W_REAL_SUBJECT.message_count,
+            "part_count": W_REAL_SUBJECT.part_count,
+            "part_data_bytes": W_REAL_SUBJECT.part_data_bytes,
+            "pinned_database_path": W_REAL_SUBJECT.database_path,
+            "pinned_database_bytes": W_REAL_SUBJECT.database_bytes,
+            "pinned_database_sha256": W_REAL_SUBJECT.database_sha256,
         },
         "g1": gate(g1, paired_ts.median(WorkloadName::WIdle)),
         "g2": gate(g2, paired_ts.median(WorkloadName::WReal)),
