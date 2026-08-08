@@ -1410,3 +1410,66 @@ but share one machine, so they are serialized by that resource, not by their inp
 113 goes first because it owns the project's headline claim.
 
 worktree: oc-wt/t113 (task-113)
+
+## Wave 33 (2026-08-08): G2 PASSES. Both memory gates green — the project's core claim is proven.
+
+`main` = `c0baeb8`, **3138 tests**, 108/118 done.
+
+| gate | todo 88 | todo 113 | ceiling | verdict |
+|---|---|---|---|---|
+| G1 `W-idle` | 20,040 KiB | **19,776** | 477,120 | **PASS** 0.0207 |
+| G2 `W-real` | 3,249,508 KiB | **1,494,236** | 1,513,496 | **PASS** 0.4936 |
+
+**2.17x reduction on W-real**, same immutable subject. ≤50% of the TS peak is now measured
+true on both gates.
+
+### The fix
+
+Two-phase hydration: decode metadata + compaction markers + candidate summary text first,
+hydrate parts only after a *successful* marker's `tail_start_id`. The JSON predicates run
+**inside SQLite**, so the 99.98% of bytes that are completed `tool` output never become Rust
+JSON trees. Repair still scans the whole session, so a pending call hidden behind a valid
+compaction is still fixed. All three `retained_history` fallbacks reproduced exactly.
+
+### My "moving target" alarm was a false alarm — but 114 still matters
+
+`context.json` records the measured DB as `opencode.db.bak.20260408`, an **immutable** April
+snapshot (sha256 matches `e2cde4df…`) in which our subject genuinely is the largest. 88 and
+113 measured the same thing; the comparison holds. But nothing in the repo *pins* that — it
+came from an ambient `OPENCODE_DB`, and a fresh checkout would pick today's 300 MB session.
+That is what 114 fixes.
+
+### MY ERROR, recorded: I reported an equivalent mutant as an uncaught gap
+
+I claimed the dangling-`tail_start_id` fallback was untested because `.unwrap_or(0)` passed
+all 3138 tests. **That mutant cannot fail** — `tail_index = 0` makes the following
+`drain(..0)` a no-op, so it is semantically identical to the early return. I sent an agent
+back to write a test for a mutation no test could ever catch.
+
+A *real* mutation, `.unwrap_or(messages.len())`, **is** caught by the test it had already
+written. Mutating the no-marker branch breaks four integration tests. All three fallbacks
+are genuinely guarded.
+
+New rule: *before reporting a mutation as uncaught, prove the mutant changes behaviour. An
+equivalent mutant is a no-op refactor, not a test gap.* The round still paid for itself —
+the same push produced the two genuinely-missing failed-summary tests — but M1 was the real
+finding and M2 was my mistake.
+
+### Caught before dispatch: todo 114's instructions would have broken both gates
+
+My own plan text told 114 to bump `methodology_revision`. `BaselineReport::validate`
+(`baseline.rs:165`) enforces `baseline.methodology_revision == PERF_METHODOLOGY_REVISION` as
+a **hard equality**, and the committed baseline records **2**. Bumping to 3 without
+regenerating the baseline makes every gate fail to load it — destroying the two PASSes and
+costing a ~100-minute TS re-measurement. Plan corrected: prefer keeping revision 2 and
+recording the subject as *data*, not methodology.
+
+*Second time this wave that a plan criterion of mine was wrong about a mechanism. The
+pattern is now unmistakable: verify the mechanism before writing the instruction.*
+
+### Ordering: 114 → 89 → 90, strictly sequential
+
+Not by input dependency but by two shared resources: `oc-testkit`'s methodology surface (the
+hash test), and one machine for measurements that must not run concurrently.
+
+worktree: oc-wt/t114 (task-114)
