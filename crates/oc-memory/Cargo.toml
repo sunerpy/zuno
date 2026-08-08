@@ -16,12 +16,17 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 futures = { workspace = true }
+oc-agent = { workspace = true }
 oc-config = { workspace = true }
 oc-db = { workspace = true }
 oc-engine = { workspace = true }
 oc-error = { workspace = true }
 oc-llm = { workspace = true }
+oc-tool = { workspace = true }
+oc-tools = { workspace = true }
+serde_json = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }

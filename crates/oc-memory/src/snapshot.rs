@@ -9,7 +9,7 @@
 //! session must be visible to the next session without changing a single byte of
 //! this session's static system-prompt prefix.
 
-use crate::{MemoryError, MemoryStore, Scope};
+use crate::{MemoryError, MemoryStore, Scope, ScopeLimits};
 use regex::Regex;
 use std::path::{Path, PathBuf};
 
@@ -88,8 +88,29 @@ impl SessionMemory {
         global_path: impl Into<PathBuf>,
         project_path: impl Into<PathBuf>,
     ) -> Result<Self, MemoryError> {
-        let global = MemoryStore::open(Scope::Global, global_path.into())?;
-        let project = MemoryStore::open(Scope::Project, project_path.into())?;
+        Self::open_with_limits(global_path, project_path, ScopeLimits::default())
+    }
+
+    /// Load explicit paths under explicit per-scope character budgets.
+    ///
+    /// # Errors
+    ///
+    /// As [`MemoryStore::open_with_limit`].
+    pub fn open_with_limits(
+        global_path: impl Into<PathBuf>,
+        project_path: impl Into<PathBuf>,
+        limits: ScopeLimits,
+    ) -> Result<Self, MemoryError> {
+        let global = MemoryStore::open_with_limit(
+            Scope::Global,
+            global_path.into(),
+            limits.for_scope(Scope::Global),
+        )?;
+        let project = MemoryStore::open_with_limit(
+            Scope::Project,
+            project_path.into(),
+            limits.for_scope(Scope::Project),
+        )?;
         let frozen_global = global.render_block();
         let frozen_project = project.render_block();
         Ok(Self {
@@ -98,6 +119,24 @@ impl SessionMemory {
             frozen_global,
             frozen_project,
         })
+    }
+
+    /// Open and freeze both stores only when resident injection is enabled.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open_with_limits`] when enabled. The disabled path performs no
+    /// filesystem access and returns `Ok(None)`.
+    pub fn open_configured(
+        enabled: bool,
+        global_path: impl Into<PathBuf>,
+        project_path: impl Into<PathBuf>,
+        limits: ScopeLimits,
+    ) -> Result<Option<Self>, MemoryError> {
+        if !enabled {
+            return Ok(None);
+        }
+        Self::open_with_limits(global_path, project_path, limits).map(Some)
     }
 
     /// Append the session-start blocks to `base_prompt` in stable scope order.
@@ -157,7 +196,11 @@ impl SessionMemory {
                 continue;
             }
 
-            let current = match MemoryStore::open(scope, self.store(scope).path().to_path_buf()) {
+            let current = match MemoryStore::open_with_limit(
+                scope,
+                self.store(scope).path().to_path_buf(),
+                self.store(scope).limit(),
+            ) {
                 Ok(store) => store.render_block(),
                 Err(error) => {
                     tracing::warn!(scope = %scope, %error, "resident memory cache check is unreadable");
@@ -189,6 +232,15 @@ impl SessionMemory {
         }
         CacheConsistency::Fresh
     }
+}
+
+/// Compose a system prompt while preserving the base bytes when memory is absent.
+#[must_use]
+pub fn assemble_system_prompt(base_prompt: &str, memory: Option<&SessionMemory>) -> String {
+    memory.map_or_else(
+        || base_prompt.to_owned(),
+        |memory| memory.inject_into(base_prompt),
+    )
 }
 
 /// Sanitize and fence context recalled from an external memory provider.

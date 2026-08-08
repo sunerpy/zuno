@@ -65,6 +65,8 @@ pub enum CompactionMode {
 /// Reflection trigger configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReflectionConfig {
+    /// Master switch for all reflection triggers and task creation.
+    pub enabled: bool,
     /// Reflect every N delivered user turns; zero disables this trigger.
     pub turn_interval: u64,
 }
@@ -72,6 +74,7 @@ pub struct ReflectionConfig {
 impl Default for ReflectionConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             turn_interval: DEFAULT_TURN_INTERVAL,
         }
     }
@@ -273,7 +276,7 @@ impl ReflectionFork {
     /// Spawn only when delivery, trigger, and negative-learning policy all permit it.
     #[must_use]
     pub fn spawn_after_turn(&self, turn: ReflectionTurn) -> Option<JoinHandle<()>> {
-        if !turn.delivery.permits_reflection() {
+        if !self.config.enabled || !turn.delivery.permits_reflection() {
             return None;
         }
 

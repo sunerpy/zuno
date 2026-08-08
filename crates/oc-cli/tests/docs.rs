@@ -21,6 +21,7 @@
 //! | `plugin-hooks` | [`oc_plugin::HookName::ALL`] |
 //! | `prune-tables` | [`oc_db::prune::PRUNE_TABLES`] and [`oc_db::prune::DELETE_ORDER`] |
 //! | `migration-journal` | [`oc_db::migration::MIGRATION_IDS`] and [`oc_db::migration::CURRENT_VERSION`] |
+//! | `cross-session-memory` | [`oc_config::schema::ResolvedMemoryConfig`], [`oc_memory::Scope`] and [`oc_agent::reflection::NEGATIVE_LEARNING_LIST`] |
 //!
 //! So adding a divergence entry, registering a command, renaming a rejection
 //! message, serving a new `/api` operation, or adding a migration all fail here
@@ -215,6 +216,46 @@ fn divergence_detail(list: &DivergenceList) -> String {
         let _ = writeln!(out, "### {}\n", entry.id);
         let _ = writeln!(out, "**Surface.** {}\n", entry.surface);
         let _ = writeln!(out, "**Why.** {}", entry.reason);
+    }
+    out
+}
+
+fn cross_session_memory_block() -> String {
+    use oc_agent::reflection::NEGATIVE_LEARNING_LIST;
+    use oc_config::schema::ResolvedMemoryConfig;
+    use oc_memory::Scope;
+
+    let defaults = ResolvedMemoryConfig::default();
+    assert_eq!(defaults.global_char_limit, Scope::Global.cap());
+    assert_eq!(defaults.project_char_limit, Scope::Project.cap());
+    let resident_budget = defaults.global_char_limit + defaults.project_char_limit;
+    let mut out = format!(
+        "Persistent memory is **enabled by default**. With both non-empty scopes, the default \
+resident prompt budget is up to **{resident_budget} stored characters** \
+(`{global}` global + `{project}` project), plus two rendered scope headers. The \
+model-facing tool schema also adds request metadata while enabled. No embedding model, vector \
+database, or external memory service is used.\n\n\
+`memory: false` is the only supported strict-parity mode: resident files are not opened, the \
+`memory` tool is not advertised, reflection cannot spawn, and the original system-prompt bytes \
+are returned unchanged.\n\n\
+| key | default | effect |\n|---|---:|---|\n\
+| `memory` | `true` | master switch for all three surfaces |\n\
+| `memory.resident` | `{resident}` | inject session-frozen global and project blocks |\n\
+| `memory.tool` | `{tool}` | advertise the model-facing `memory` tool |\n\
+| `memory.reflection` | `{reflection}` | permit post-response reflection tasks |\n\
+| `memory.global_char_limit` | `{global}` | cap `$CONFIG/memory/MEMORY.md` in Unicode scalar values |\n\
+| `memory.project_char_limit` | `{project}` | cap `<worktree>/.opencode/RULES.md` in Unicode scalar values |\n\
+| `memory.nudge_interval` | `{interval}` | periodic reflection cadence in delivered turns; `0` disables only that trigger |\n\n\
+Reflection must not learn any of these negative cases:\n",
+        global = defaults.global_char_limit,
+        project = defaults.project_char_limit,
+        resident = defaults.resident,
+        tool = defaults.tool,
+        reflection = defaults.reflection,
+        interval = defaults.nudge_interval,
+    );
+    for exclusion in NEGATIVE_LEARNING_LIST {
+        let _ = writeln!(out, "- {exclusion}");
     }
     out
 }
@@ -451,6 +492,7 @@ fn docs_compatibility_matrix_matches_every_code_table() {
 
     let list = allow_list();
     check_block(PAGE, "divergence-index", &divergence_index(&list));
+    check_block(PAGE, "cross-session-memory", &cross_session_memory_block());
     check_block(PAGE, "cli-disposition", &cli_disposition_block());
 
     let upstream = oracle_api_operations();
@@ -471,6 +513,7 @@ fn docs_compatibility_matrix_matches_every_code_table() {
     assert_cli_disposition_counts();
     assert_api_counts(&upstream, &served, &stubs);
     contains_all(PAGE, &[&format!("{} v1 route", V1_SURFACE.len())]);
+    contains_all(PAGE, &oc_agent::reflection::NEGATIVE_LEARNING_LIST);
 }
 
 // ---------------------------------------------------------------------------

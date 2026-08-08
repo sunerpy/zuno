@@ -36,7 +36,7 @@
 //! consolidates on purpose.
 
 use crate::error::{DriftReason, MemoryError};
-use crate::render::{Usage, parse, serialize, usage_of};
+use crate::render::{Usage, parse, serialize};
 use crate::scope::{Scope, char_count};
 use crate::threat::first_threat;
 use std::fs;
@@ -192,6 +192,7 @@ struct FileStamp {
 #[derive(Debug, Clone)]
 pub struct MemoryStore {
     scope: Scope,
+    limit: usize,
     path: PathBuf,
     entries: Vec<String>,
     stamp: Option<FileStamp>,
@@ -218,8 +219,18 @@ impl MemoryStore {
     ///
     /// As [`MemoryStore::discover`].
     pub fn open(scope: Scope, path: PathBuf) -> Result<Self, MemoryError> {
+        Self::open_with_limit(scope, path, scope.cap())
+    }
+
+    /// Load a store with an explicit character budget.
+    ///
+    /// # Errors
+    ///
+    /// As [`MemoryStore::discover`].
+    pub fn open_with_limit(scope: Scope, path: PathBuf, limit: usize) -> Result<Self, MemoryError> {
         let mut store = Self {
             scope,
+            limit,
             path,
             entries: Vec::new(),
             stamp: None,
@@ -257,6 +268,12 @@ impl MemoryStore {
         self.scope
     }
 
+    /// The configured character budget for this store.
+    #[must_use]
+    pub const fn limit(&self) -> usize {
+        self.limit
+    }
+
     /// Where it lives.
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -272,7 +289,7 @@ impl MemoryStore {
     /// How full the store is right now.
     #[must_use]
     pub fn usage(&self) -> Usage {
-        usage_of(self.scope, &self.entries)
+        crate::render::usage_of_with_limit(self.scope, &self.entries, self.limit)
     }
 
     /// The system-prompt block for this store, empty when it holds nothing.
@@ -280,7 +297,7 @@ impl MemoryStore {
     /// See [`crate::render::render_block`].
     #[must_use]
     pub fn render_block(&self) -> String {
-        crate::render::render_block(self.scope, &self.entries)
+        crate::render::render_block_with_limit(self.scope, &self.entries, self.limit)
     }
 
     /// Apply every operation, or none of them.
@@ -361,7 +378,7 @@ impl MemoryStore {
         }
 
         let projected = char_count(&serialize(&candidate));
-        let limit = self.scope.cap();
+        let limit = self.limit;
         if projected > limit {
             return Err(MemoryError::CapExceeded {
                 scope: self.scope,
@@ -426,10 +443,7 @@ impl MemoryStore {
                 if serialize(&parsed) != trimmed {
                     return Some(DriftReason::RoundTrip);
                 }
-                if parsed
-                    .iter()
-                    .any(|entry| char_count(entry) > self.scope.cap())
-                {
+                if parsed.iter().any(|entry| char_count(entry) > self.limit) {
                     return Some(DriftReason::EntryOverflow);
                 }
             }

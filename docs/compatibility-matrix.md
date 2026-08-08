@@ -31,7 +31,33 @@ OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs
 | 5 | [`execute-parameter-contract`](divergences.md#execute-parameter-contract) | tool `execute` — the model-facing parameter schema |
 | 6 | [`c8-maintenance-endpoints`](divergences.md#c8-maintenance-endpoints) | HTTP `GET /api/session/prune`, `POST /api/session/prune` |
 | 7 | [`provider-coverage-by-wire-family`](divergences.md#provider-coverage-by-wire-family) | provider selection; `oc-provider-compatible` family routing and its diagnostics |
+| 8 | [`cross-session-resident-memory`](divergences.md#cross-session-resident-memory) | system-prompt resident blocks; model-facing `memory` tool; post-response reflection |
 <!-- generated:END divergence-index -->
+
+## Cross-session resident memory
+
+<!-- generated:BEGIN cross-session-memory -->
+Persistent memory is **enabled by default**. With both non-empty scopes, the default resident prompt budget is up to **5200 stored characters** (`2200` global + `3000` project), plus two rendered scope headers. The model-facing tool schema also adds request metadata while enabled. No embedding model, vector database, or external memory service is used.
+
+`memory: false` is the only supported strict-parity mode: resident files are not opened, the `memory` tool is not advertised, reflection cannot spawn, and the original system-prompt bytes are returned unchanged.
+
+| key | default | effect |
+|---|---:|---|
+| `memory` | `true` | master switch for all three surfaces |
+| `memory.resident` | `true` | inject session-frozen global and project blocks |
+| `memory.tool` | `true` | advertise the model-facing `memory` tool |
+| `memory.reflection` | `true` | permit post-response reflection tasks |
+| `memory.global_char_limit` | `2200` | cap `$CONFIG/memory/MEMORY.md` in Unicode scalar values |
+| `memory.project_char_limit` | `3000` | cap `<worktree>/.opencode/RULES.md` in Unicode scalar values |
+| `memory.nudge_interval` | `10` | periodic reflection cadence in delivered turns; `0` disables only that trigger |
+
+Reflection must not learn any of these negative cases:
+- Environment-dependent failures: missing binaries, fresh-install errors, post-migration path mismatches, 'command not found', unconfigured credentials, uninstalled packages. The user can fix these — they are not durable rules.
+- Negative claims about tools or features ('browser tools do not work', 'X tool is broken', 'cannot use Y from execute_code'). These harden into refusals the agent cites against itself for months after the actual problem was fixed.
+- Session-specific transient errors that resolved before the conversation ended. If retrying worked, the lesson is the retry pattern, not the original failure.
+- One-off task narratives. A user asking 'summarize today's market' or 'analyze this PR' is not a class of work that warrants a skill.
+- Unresolved failures: if the session ended WITHOUT actually finding a working method — you tried several things, none worked, and told the user to check manually — do NOT write those attempts up as a 'reliable workflow' or 'recommended approach'. That presents an untested sequence of failures as validated guidance a future session will trust and repeat. Either say 'Nothing to save', or, only if you are independently confident of a real working alternative (not something you are merely guessing might work), capture ONLY that alternative — never the dead ends, and never dressed up as best practice.
+<!-- generated:END cross-session-memory -->
 
 ## CLI commands
 

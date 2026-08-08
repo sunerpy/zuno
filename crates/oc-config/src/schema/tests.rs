@@ -148,6 +148,44 @@ fn round_trip_is_stable_on_a_second_pass() {
     assert_eq!(once, twice);
 }
 
+#[test]
+fn memory_false_dominates_every_enabled_default() {
+    let config = parse(r#"{"memory":false}"#).expect("master switch parses");
+    let memory = config.resolved_memory();
+
+    assert!(!memory.enabled);
+    assert!(!memory.resident);
+    assert!(!memory.tool);
+    assert!(!memory.reflection);
+    assert_eq!(memory.global_char_limit, 2_200);
+    assert_eq!(memory.project_char_limit, 3_000);
+    assert_eq!(memory.nudge_interval, 10);
+}
+
+#[test]
+fn memory_options_resolve_caps_cadence_and_component_flags() {
+    let config = parse(
+        r#"{"memory":{"resident":false,"tool":false,"reflection":false,"global_char_limit":1200,"project_char_limit":2400,"nudge_interval":0}}"#,
+    )
+    .expect("memory options parse");
+    let memory = config.resolved_memory();
+
+    assert!(memory.enabled);
+    assert!(!memory.resident);
+    assert!(!memory.tool);
+    assert!(!memory.reflection);
+    assert_eq!(memory.global_char_limit, 1_200);
+    assert_eq!(memory.project_char_limit, 2_400);
+    assert_eq!(memory.nudge_interval, 0);
+}
+
+#[test]
+fn memory_character_caps_must_be_positive() {
+    let error = parse(r#"{"memory":{"global_char_limit":0}}"#)
+        .expect_err("a zero character budget is not usable");
+    assert_eq!(issue_path(&error), "memory.global_char_limit");
+}
+
 // ---------------------------------------------------------------------------
 // Acceptance: the agent unknown-key sweep.
 // ---------------------------------------------------------------------------

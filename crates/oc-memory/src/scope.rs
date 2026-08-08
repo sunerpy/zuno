@@ -64,6 +64,36 @@ pub enum Scope {
     Project,
 }
 
+/// Character budgets for both resident-memory scopes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScopeLimits {
+    global: usize,
+    project: usize,
+}
+
+impl ScopeLimits {
+    /// Construct explicit global and project character budgets.
+    #[must_use]
+    pub const fn new(global: usize, project: usize) -> Self {
+        Self { global, project }
+    }
+
+    /// Return the configured budget for one scope.
+    #[must_use]
+    pub const fn for_scope(self, scope: Scope) -> usize {
+        match scope {
+            Scope::Global => self.global,
+            Scope::Project => self.project,
+        }
+    }
+}
+
+impl Default for ScopeLimits {
+    fn default() -> Self {
+        Self::new(Scope::Global.cap(), Scope::Project.cap())
+    }
+}
+
 impl Scope {
     /// Both scopes, for callers that render or audit every store.
     pub const ALL: [Self; 2] = [Self::Global, Self::Project];
