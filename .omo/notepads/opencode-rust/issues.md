@@ -5389,3 +5389,70 @@ One `#[source]`-chain walk at the rendering seam. Deliberately deferred until af
 perf gates (88/89/90), because it touches a shared surface every in-flight branch renders
 through, and a conflict there would cost more than the fix. Todo 92's divergence
 documentation should note it too.
+
+## [2026-08-08] THE HEADLINE RESULT: G1 passes at 2.1%, G2 fails at 107%. The project's core claim is half-true.
+
+Seven attempts, ~100 minutes of paired measurement, and the number is finally real.
+
+### The measurement (verified independently by me, not taken from the report)
+
+I recomputed every median straight from the raw per-sample data in
+`target/perf/task-88-memory.json` rather than trusting the reported `g1`/`g2` blocks. All
+four medians reproduce exactly.
+
+| gate | Rust median | committed TS | ceiling (0.50×) | ratio | verdict |
+|---|---|---|---|---|---|
+| G1 `W-idle` | **20,040 KiB** | 954,240 | 477,120 | **0.021** | **PASS** |
+| G2 `W-real` | **3,249,508 KiB** | 3,026,992 | 1,513,496 | **1.074** | **FAIL** |
+
+**The baseline is trustworthy.** The paired TS runs, measured in the same interleaved
+schedule on the same machine, reproduced the committed medians to within 5.1% (W-idle) and
+2.5% (W-real). This is not an unmeasurable-baseline excuse; the TS side behaved.
+
+The 0.50 factor lives in the **frozen** `perf/methodology.rs:54-55` and 0.50 × 3,026,992 =
+1,513,496 — exactly the ceiling reported. Nothing drifted.
+
+### G1 is the real story of this port
+
+20 MB against ~954 MB — a **47× reduction**, idle. That is the memory thesis, proven.
+
+### G2's root cause, which I traced myself
+
+`run_turn` (`oc-engine/src/loop.rs:578`) opens every turn with:
+```rust
+let mut history = MessageStore::new(context.connection).hydrate_session(&request.session_id)?;
+```
+`hydrate_session` loads **every message and every part of the entire session** — for W-real
+that is 931 messages / 3,620 parts / 105 MB of part bytes — and `retained_history` only
+trims at a compaction marker, so an uncompacted session keeps all of it. That set is then
+re-represented at least twice more in the same turn: `project_history` → `Vec<Projected>`,
+then `provider_messages` → `Vec<Message>` (`:632`). 105 MB of parts becoming a 3.2 GB peak
+is ~31× amplification, and three-plus simultaneous full representations of a fully-decoded
+history explains that shape.
+
+**Upstream does the same thing** — that is why TS also sits at ~3 GB on this workload and
+why the two are within 10% of each other. We ported the architecture faithfully, including
+its memory behaviour. G1 passes because our *idle* baseline is genuinely tiny; G2 fails
+because on a large session both implementations are dominated by the same design.
+
+### A second finding: the gate is invisible to CI
+
+`should_run_expensive_gate` returns false unless `OC_MEMORY_GATE_MODE=run` or the parent
+cargo invocation literally names the memory target. Under `cargo test --workspace` — what
+`premerge.sh` and CI run — the gate prints **`ok`**. I confirmed this directly: `--workspace`
+says ok, `-p oc-testkit --test memory` says FAILED in 2.21s from cache.
+
+That is defensible (a 100-minute test cannot sit in CI) but it means **a green suite does
+not mean G2 passes**, and nothing currently tells a reader that. Todo 92 must document it,
+and F1 must not read a green `make ci` as gate compliance.
+
+Also worth noting: the merged artifact lives in the worktree's `target/`, which is not
+shared, so replaying the gate on `main` re-runs the full measurement. I hit that and had to
+kill it. Anyone verifying should use `OC_MEMORY_GATE_MODE=skip` unless they intend to spend
+100 minutes.
+
+### Owed: todo 113
+
+Windowing/streaming so a turn does not hold the whole session decoded three times over.
+This is the one remaining piece of the project's headline claim, and it is a real
+engineering task, not a test fix.
