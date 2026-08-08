@@ -1528,3 +1528,49 @@ That is **four separate agents** who have now corrected criteria I wrote. Confir
 rather than satisfying it badly.*
 
 worktree: oc-wt/t89 (task-89)
+
+## Wave 35 (2026-08-08): todo 89 merged — G3/G4 measured over a real 2-hour soak
+
+`main` = `2778843`, **3156 tests**, 110/118 done.
+
+### The measurement, recomputed by me from the 500 raw samples
+
+| gate | measured | bound | verdict |
+|---|---|---|---|
+| G3 slope | **0.0001775568 MiB/turn** | 1.0 | **PASS** |
+| G3 peak ratio | **0.9938255268** | 1.5 | **PASS** |
+| G4 | no trip | 120s progress / 1800s hard | **PASS** |
+
+Both statistics reproduce **exactly** — the Theil–Sen slope to ten decimals. My first peak-ratio
+attempt disagreed (0.9224) because I guessed the windows; theirs is *stricter* than mine —
+final **tenth** against turns **40–60**, i.e. compared against the early-life plateau where a
+leak would first show. Recomputing with their spec reproduced `0.9938255268` exactly. Note the
+final peak is *below* the mid-life peak, so memory ended lower than it started.
+
+### It really drove the real drivers
+
+Two LSP servers **connected with live PIDs** (`rust` 2668273, `typescript` 2668292, zero
+failures), 50,000 watched files, 713 watch events accepted / 506 published, 52 MB tool output,
+**111 MB PTY output**, and one real compaction — over 500 turns / 7,200 seconds. This is the
+opposite of the cassette-only soak the plan forbade.
+
+### Three mutations, all caught by precisely-named tests
+
+Blind the slope to growth → `a_deliberate_two_mib_per_turn_slope_fails_and_reports_the_measurement`
++ `only_the_final_half_determines_the_theil_sen_slope`. Watchdog never fires →
+`a_stalled_turn_trips_the_progress_watchdog`. Any event counts as progress →
+`heartbeats_raw_bytes_and_repeated_state_do_not_reset_g4_progress`. That last test name is the
+one that matters: it pins the *semantics* of progress, which is exactly the subtle failure the
+inherited wisdom warned about.
+
+### The frozen-crate edits are legitimate
+
+Only two, both **visibility-only** (`pub(crate)` → `pub`) with no behaviour change, plus the
+re-exports. Critically, `sample_process_tree` *delegates to the same sampler* the memory gate
+uses rather than forking a second implementation — its doc comment says so explicitly. The four
+frozen thresholds, `subject.rs`, and `ts-baseline.json` are untouched.
+
+The expensive gate is `#[ignore]`d with a reason string, so it stays out of the normal suite —
+consistent with `memory.rs`'s convention of keeping ~hours-long gates opt-in.
+
+worktree: oc-wt/t90 (task-90)
