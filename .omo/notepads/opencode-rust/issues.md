@@ -5536,6 +5536,15 @@ relates to it. This is a **methodology** change touching frozen files, so it nee
 todo, an explicit unfreeze decision, and a methodology-revision bump. It is not a licence
 for 113 to edit the frozen crate.
 
+> **CORRECTED 2026-08-08 — do not act on the words "methodology-revision bump" above.**
+> `BaselineReport::validate` (`perf/baseline.rs:165`) enforces
+> `baseline.methodology_revision == PERF_METHODOLOGY_REVISION` as a hard equality, and the
+> committed `benchmarks/ts-baseline.json` records revision **2**. Bumping the constant
+> without regenerating the baseline makes every gate fail to load it, destroying the
+> measured G1 PASS (0.0207) and G2 PASS (0.4936) and costing a ~100-minute TypeScript
+> re-measurement. Todo 114 shipped keeping revision **2**, on the argument that pinning
+> *which* session is measured does not change *how* it is measured. See its entry below.
+
 ## [2026-08-08] G2 PASSES. Both memory gates are green — and I was wrong about one of my own mutations.
 
 ### The result
