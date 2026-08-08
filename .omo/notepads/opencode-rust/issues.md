@@ -5818,3 +5818,79 @@ Skipping step 2 fails `docs_every_declared_divergence_is_documented_with_its_rea
 with `divergence-detail is stale` and prints the expected block in full. Verified by
 performing exactly that mutation and reverting it (see
 `.omo/evidence/task-92-opencode-rust.txt`, M2).
+
+## [2026-08-08] THE FINAL WAVE REJECTED, 4/4 — and it found the tenth seam
+
+All four reviewers returned REJECT. This is the wave working exactly as intended: **12 blocking
+findings that 3,214 passing tests, 0 clippy warnings and a green `make ci` did not surface.**
+Reports preserved at `.omo/evidence/F{1,2,3,4}-REPORT.md`.
+
+### SEAM #10 — the one that matters most. Verified independently by me.
+
+**A normal Rust turn writes a session row the released TypeScript binary cannot read.**
+
+F3 reproduced it; I reproduced it from scratch. TypeScript lists a database fine, Rust writes
+one session into it, and then:
+```
+$ OPENCODE_DB=… /config/.local/share/mise/installs/opencode/1.18.12/opencode session list
+Error: Unexpected error
+Expected string, got undefined          [exit=1]
+```
+
+**Root cause, pinned to one line.** `crates/oc-cli/src/cmd/turn.rs:1175`:
+```rust
+input.model = Some(json!({"providerID": plan.provider_id, "modelID": plan.model_id}).to_string());
+```
+Measured against the real 62 GB TypeScript-written database:
+
+| table | key upstream uses | rows |
+|---|---|---|
+| `session.model` | **`id`** (+`providerID`,`variant`) | 5,959 / 5,959 |
+| `message.model` | **`modelID`** | 17,438 / 17,438 |
+
+**The two tables use different key names upstream, and we used `message`'s spelling for both.**
+`turn.rs:1198` (the message record) is *correct*; only the session writer is wrong.
+
+This breaks **success criterion 1** — the round-trip that "makes side-by-side use and rollback
+real rather than claimed." The compat suite's journal round-trip passes because it checks the
+`migration` table, not whether TS can decode a Rust-written *session*.
+
+### The other eleven blockers
+
+| # | finding | source |
+|---|---|---|
+| 2 | `export` is disposition-`implemented` and documented as implemented, but the handler is a stub — exits 1. Todo 56 is `- [x]`. **Verified by me.** | F3 |
+| 3 | `debug config` exits 1 on the user's real `/config/.config/opencode/opencode.json` ("failed validation"); TS exits 0 → criterion 2 unmet | F1 |
+| 4 | `GET /api/event` and `GET /api/session/{id}/event` unserved — 56 of 58 upstream ops → criterion 4 unmet | F1+F4 |
+| 5 | **6 nominated divergences deliberately kept OUTSIDE the allow-list**, with a test asserting they stay out → criterion 17 unmet | F1+F4 |
+| 6 | **The G2 evidence chain is broken**: `task-113` and `task-114` evidence files do not exist. The only committed G1/G2 evidence (`task-88`) says **G2 FAIL at 3,249,508 KiB** | F1 |
+| 7 | The frozen 34-crate roster silently became 36 (`oc-process`, `oc-reaping-fixture`); `crates.expected` unchanged, `members = ["crates/*"]` hid it | F4 |
+| 8 | **A vacuous test, proven by mutation**: `engine_turn_events_apply_backpressure` probes a *toy* channel, not `oc_engine::event_channel()`. Breaking `TurnEventSender::send` left the gate green | F2 |
+| 9 | `response.bytes().await.unwrap_or_default()` turns a failed error-body read into a valid empty body, losing the cause and the `context_length_exceeded`/`content_filter` distinction | F2 |
+| 10 | **`oc-process` breaks interactive PTY**: unconditional `setpgid` moves the payload out of the terminal's foreground group, so a PTY read is stopped by `SIGTTIN`. The G6 PTY fixture only sleeps, so it cannot see this | F2 |
+| 11 | Windows Job Object lacks `KILL_ON_JOB_CLOSE`; a host that exits with a live grandchild leaks it. No Windows runtime test exists | F2 |
+| 12 | Four `#[allow(...)]` with no justification | F2 |
+
+### My own error, and its full cost
+
+**Finding 6 is mine.** `.omo/evidence/` was gitignored while agents force-added five files.
+Todos 113 and 114 wrote evidence into *their worktrees*, the merge never carried it because the
+path was ignored, and my `cleanup.sh` deleted the worktrees. I fixed the `.gitignore` in wave
+**37** — three waves too late for 113 (wave 33) and 114 (wave 34).
+
+I did verify those numbers myself, and that verification is committed in `WORKTREE.md` and this
+notepad. But **a verification I performed is not the evidence artefact the plan requires**, and
+the artefact is unrecoverable without re-measuring. F1 is right to reject on it.
+
+*Rule: fix an infrastructure defect the moment it is found, not after the next deliverable. The
+three waves I deferred cost a ~100-minute re-measurement.*
+
+### What the reviewers got right that I had not asked for
+
+F2 **proved** its vacuous-test finding by mutation rather than inferring it from shape — the
+exact discipline this project demands, applied to the project's own tests. F4 caught the crate
+roster drift, which no test could see because `members = ["crates/*"]` globs. F3 found seam #10
+by simply *using the product across the boundary the README promises.*
+
+Nine seams were found during execution. The Final Wave found a tenth, and eleven more blockers.
+**Every one was invisible to a green suite.**
