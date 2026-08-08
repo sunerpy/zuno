@@ -1259,3 +1259,59 @@ after 110 (same file region). Separate worktrees mean 88 measures its own build,
 context fingerprint invalidates a stale pass if the binary moves under it.
 
 worktrees: oc-wt/t88 (task-88), oc-wt/t110 (task-110)
+
+## Wave 30 (2026-08-07): todo 110 merged and verified; 111 dispatched
+
+**3123 tests** on `main` (`6543a2c`), 105/113 done. Todo 88 still measuring in oc-wt/t88.
+
+### 110 verified against the oracle, not against its own report
+
+I checked the one thing a doc comment could have been wrong about. The agent claimed an
+asymmetry — `apiKey` tests `=== undefined` while `baseURL` tests `!== ""` — so an
+explicitly-empty key must NOT fall back to a stored credential. Confirmed at
+`provider.ts:1720`:
+
+```ts
+if (options["apiKey"] === undefined && provider.key) options["apiKey"] = provider.key
+```
+
+That is `undefined`, not `""`. The asymmetry is upstream's, and 110 reproduced it.
+Hands-on, an empty key really does send `AUTH='Bearer '` rather than falling back —
+which is the safe behaviour: falling back would present a real vendor key to a local
+endpoint the user never authorised.
+
+### Five mutations, all caught
+
+Invert the apiKey precedence · drop the provider seed · swap the overlay direction ·
+shallow instead of deep overlay · drop `apiKey` from the exclusion. The seed mutation
+fails 2 integration + 3 unit tests, which is the proof the tests are not vacuous — a
+test planting keys in a map the code never reads could not fail that way.
+
+### Hands-on QA, five scenarios
+
+`AUTH='Bearer sk-from-options'` where it used to be `AUTH=None` (twice — the title
+prelude is a second, separately-authenticated request). A provider-level `extraBody`
+now reaches the request body, proving the seed. **The 401 message needed a real 401** to
+test: dead port 1 gives a connection failure, and `describe_turn_failure` only fires on
+`ProviderError::Auth`. Against a server that actually replies 401:
+
+> `authentication rejected by provider test: set `provider.test.options.apiKey`, or run `opencode auth login test``
+
+And a deliberately-secret key is echoed **zero** times, in the message or the data dir.
+
+### 110's three corrections to my plan text
+
+1. `useCompletionUrls` cannot reach the wire for this transport — it gates
+   `SurfaceRule::Azure`, and `openai-compatible` is `Fixed(Chat)`, so `resolve_surface`
+   returns before consulting it. The wire-observable proof of the seed is `extraBody`.
+2. A non-string `apiKey` is unreachable from config: `ProviderOptions::api_key` is
+   `Option<String>`, so `{"apiKey": 7}` is refused at load. It asserts the
+   unreachability instead, so loosening the schema fails a named test.
+3. A keyless provider must NOT be refused at plan time, unlike a missing endpoint — a
+   local endpoint legitimately has none.
+
+All three are right, and I had written the criterion loosely enough to be satisfied
+badly. Recorded as: *an acceptance criterion that names a mechanism can be wrong about
+the mechanism; the agent that checks is worth more than the criterion.*
+
+worktree: oc-wt/t111 (task-111) | 88 still running in oc-wt/t88
