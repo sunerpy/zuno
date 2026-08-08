@@ -6146,3 +6146,57 @@ The mutation proof remains `deliberately_inflated_rust_measurements_fail_both_ga
 it feeds committed TypeScript median + 1 KiB as Rust data and requires both verdicts
 to fail. No threshold, workload, sample window, repetition count, process-tree rule,
 or frozen perf source was edited after seeing the failure.
+
+## [2026-08-08] Task 113: optimize representation lifetimes without changing retained-history semantics
+
+Decision: preserve the existing compaction contract exactly and reduce memory by
+changing when data is decoded and who owns it. `oc-db` exposes metadata-first,
+range-oriented hydration; `oc-engine` moves owned history through compaction,
+prelude, projection, and provider conversion. Failed/empty compaction summaries,
+dangling tails, and sessions with no marker still fall back to the same full-history
+bytes as the pre-113 implementation. No threshold, workload, sampling rule,
+repetition count, baseline, or frozen perf source is changed.
+
+Decision: extend the implementation scope to `oc-llm` and add its already-pinned
+workspace `sha2` dependency. The first engine/database-only implementation reduced
+G2 to 1,680,888 KiB but still failed. The append-only prompt-cache tracker retained
+another complete serialized request prefix, overlapping the provider request at the
+peak. Keeping only a SHA-256 fingerprint preserves the byte-stability/equality check
+with fixed-size state and brought the median to 1,494,236 KiB. This is not a cache-key
+semantic change: the digest is used only as an exact-content fingerprint inside the
+same ordered-prefix validation, not as an authentication or trust boundary.
+
+Decision: use provider-visible serialized bytes as the regression boundary. Internal
+types may change shape or ownership as part of this optimization; the provider request
+and prompt-cache prefix may not. The four fallback tests therefore compare the
+optimized path with a deliberately retained full-hydration reference rather than
+asserting implementation details.
+
+Decision: classify `.unwrap_or(0)` on the dangling-tail index as an equivalent
+mutation, not a missed regression. Both the explicit fallback and `drain(..0)` retain
+and hydrate every message, so no oracle can distinguish them without asserting syntax.
+The non-equivalent `.unwrap_or(messages.len())` mutation proves the intended property:
+when the fallback actually drops history, the provider-byte oracle fails. Tests will
+not be weakened or made implementation-coupled merely to kill an equivalent mutant.
+
+Decision: accept the measured G2 result as PASS while recording its narrow margin as
+a risk. The unchanged ceiling is 1,513,496 KiB and the median is 1,494,236 KiB, only
+19,260 KiB (1.27%) below it. Downstream work must not treat that margin as a budget for
+another full-history/full-prefix copy; a future regression is allowed to fail the same
+frozen gate rather than trigger threshold retuning.
+
+## [2026-08-08] Task 113 follow-up: do not redesign correct range semantics to kill an equivalent mutant
+
+Decision reaffirmed with runtime evidence: `.unwrap_or(0)` followed by
+`messages.drain(..tail_index)` is observationally equivalent to the explicit missing-id
+fallback because `drain(..0)` removes nothing. We will not change an exclusive boundary,
+reject a legitimate tail at the first message, or add a source-text assertion merely to
+make that mutant red. Those changes would couple tests to syntax or alter valid history
+semantics without catching a user-visible defect.
+
+Instead, the fixture now asserts its own sensitivity to an actual first-message drop,
+and `.unwrap_or(1)` is the smallest non-equivalent mutation. It fails the named
+provider-byte test. The no-marker arm was separately changed to drain its first message
+and was caught by `loop_without_compaction_marker_is_byte_identical_to_full_history`.
+This distinguishes a surviving equivalent mutant from the vacuous-fixture failures in
+which a genuinely different result escaped the oracle.

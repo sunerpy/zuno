@@ -16,7 +16,7 @@ use oc_llm::registry::{
 use super::{
     CompactionSkipped, InternalAgent, InternalProviders, Internals, PreludeContext,
     TITLE_INSTRUCTION, TitleSkipped, compact_if_overflowing, estimate_tokens, generate_title,
-    run_prelude, summarize, transcript,
+    run_prelude, summarize, transcript, transcript_owned,
 };
 use crate::compaction::{CompactionState, TokenWindow, select_boundary};
 use crate::r#loop::retained_history;
@@ -37,6 +37,42 @@ const ROOMY_WINDOW: TokenWindow = TokenWindow {
     context: 1_000_000,
     max_output: 10_000,
 };
+
+#[test]
+fn owned_transcript_is_byte_identical_and_moves_large_payload() {
+    let connection = seeded("A named session", None);
+    let large_text = "x".repeat(2 * 1024 * 1024);
+    put_user(&connection, "msg_large", 10, &large_text);
+    let history = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .expect("hydrate large history");
+    let source_pointer = history[0].parts[0].data["text"]
+        .as_str()
+        .expect("large text")
+        .as_ptr();
+    let expected = transcript(COMPACTION_PROMPT, &history);
+
+    let actual = transcript_owned(COMPACTION_PROMPT, history);
+    let moved_pointer = actual
+        .iter()
+        .flat_map(|entry| &entry.message.content)
+        .find_map(|block| match block {
+            RequestContentBlock::Text { text } if text.len() == large_text.len() => {
+                Some(text.as_ptr())
+            }
+            _ => None,
+        })
+        .expect("large text remains in the transcript");
+
+    assert_eq!(
+        actual, expected,
+        "owned projection changed transcript bytes"
+    );
+    assert_eq!(
+        moved_pointer, source_pointer,
+        "owned projection copied the large payload instead of moving it"
+    );
+}
 
 #[derive(Debug)]
 struct RecordingProvider {

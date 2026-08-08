@@ -743,6 +743,120 @@ impl<'conn> MessageStore<'conn> {
         Ok(grouped)
     }
 
+    /// Parts of one kind belonging to any of `message_ids`, grouped by message id.
+    ///
+    /// This is the metadata phase of retained-history hydration: callers can inspect
+    /// compaction markers or summary text without decoding unrelated tool outputs.
+    /// The result keeps the same `part.id` order as [`Self::parts_by_message`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::parts_by_message`].
+    pub fn parts_by_message_kind(
+        &self,
+        message_ids: &[String],
+        kind: PartKind,
+    ) -> Result<HashMap<String, Vec<PartRecord>>, DbError> {
+        let mut grouped: HashMap<String, Vec<PartRecord>> = HashMap::new();
+        for chunk in message_ids.chunks(HYDRATION_CHUNK) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = (1..=chunk.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let kind_parameter = chunk.len() + 1;
+            let sql = format!(
+                "SELECT id, message_id, session_id, time_created, time_updated, data FROM part \
+                 WHERE message_id IN ({placeholders}) \
+                 AND json_extract(data, '$.type') = ?{kind_parameter} \
+                 ORDER BY message_id ASC, id ASC"
+            );
+            let mut statement = self.prepare(&sql)?;
+            let parameters = chunk
+                .iter()
+                .map(String::as_str)
+                .chain(std::iter::once(kind.as_str()));
+            let rows = statement
+                .query_map(params_from_iter(parameters), |row| {
+                    Ok(PartRecord::from_row(row))
+                })
+                .map_err(map_error)?;
+            for row in rows {
+                let record = row.map_err(map_error)??;
+                grouped
+                    .entry(record.message_id.clone())
+                    .or_default()
+                    .push(record);
+            }
+        }
+        Ok(grouped)
+    }
+
+    /// Every part of `kind` in a session, ordered by message id and part id.
+    ///
+    /// The JSON predicate runs inside SQLite so non-matching payloads never become
+    /// Rust JSON trees. This is intentionally not a replacement for full hydration;
+    /// it is the lightweight first phase used to discover a compaction boundary.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError::Decode`] for a matching row that cannot be decoded;
+    /// [`DbError::Query`] or [`DbError::Busy`] from SQLite.
+    pub fn parts_for_session_by_kind(
+        &self,
+        session_id: &str,
+        kind: PartKind,
+    ) -> Result<Vec<PartRecord>, DbError> {
+        let mut statement = self.prepare(
+            "SELECT id, message_id, session_id, time_created, time_updated, data FROM part \
+             WHERE session_id = ?1 AND json_extract(data, '$.type') = ?2 \
+             ORDER BY message_id ASC, id ASC",
+        )?;
+        let rows = statement
+            .query_map((session_id, kind.as_str()), |row| {
+                Ok(PartRecord::from_row(row))
+            })
+            .map_err(map_error)?;
+        let mut parts = Vec::new();
+        for row in rows {
+            parts.push(row.map_err(map_error)??);
+        }
+        Ok(parts)
+    }
+
+    /// Tool parts whose state is neither `completed` nor `error`.
+    ///
+    /// Repair must cover the entire session, including the head hidden by a valid
+    /// compaction. Filtering in SQLite avoids decoding completed tool outputs, which
+    /// are commonly the largest blobs in the database.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError::Decode`] for a matching row that cannot be decoded;
+    /// [`DbError::Query`] or [`DbError::Busy`] from SQLite.
+    pub fn unfinished_tool_parts_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<PartRecord>, DbError> {
+        let mut statement = self.prepare(
+            "SELECT id, message_id, session_id, time_created, time_updated, data FROM part \
+             WHERE session_id = ?1 AND json_extract(data, '$.type') = 'tool' \
+             AND (json_extract(data, '$.state.status') IS NULL \
+                  OR json_extract(data, '$.state.status') NOT IN ('completed', 'error')) \
+             ORDER BY message_id ASC, id ASC",
+        )?;
+        let rows = statement
+            .query_map([session_id], |row| Ok(PartRecord::from_row(row)))
+            .map_err(map_error)?;
+        let mut parts = Vec::new();
+        for row in rows {
+            parts.push(row.map_err(map_error)??);
+        }
+        Ok(parts)
+    }
+
     /// Attach parts to messages already in hand.
     ///
     /// The batched half of `hydrate` (`message-v2.ts:98-123`): one part lookup
