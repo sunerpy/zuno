@@ -1574,3 +1574,73 @@ The expensive gate is `#[ignore]`d with a reason string, so it stays out of the 
 consistent with `memory.rs`'s convention of keeping ~hours-long gates opt-in.
 
 worktree: oc-wt/t90 (task-90)
+
+## Wave 36 (2026-08-08): todo 90 merged — all six gates G1-G6 now exist
+
+`main` = `632099b`, **3179 tests**, 111/118 done. Every non-functional gate in the plan is
+implemented and measured.
+
+### G5/G6 results
+
+G5: **17** persistent bounded channels, each with a declared policy and its own behaviour
+test; 2 documented single-completion exclusions; **0** undeclared constructions.
+G6: LSP/MCP/PTY/plugin × 2 sessions, ≥33 enumerated fixture PIDs → **0 orphans** in both
+clean shutdown and parent `SIGKILL`.
+
+### The registry is genuinely anti-vacuous — I mutation-tested it twice
+
+Added an undeclared bounded channel to `oc-acp` production source →
+`source_channel_inventory_matches_the_declared_registry` FAILED. Reintroduced an
+**unbounded** channel → same test FAILED. One side is walked from source, so **the ninth
+seam cannot silently return.** That is the most valuable artefact in this commit.
+
+### The ninth seam is properly closed
+
+`oc-acp/src/transport.rs` went from `mpsc::unbounded_channel()` to
+`mpsc::channel(OUTBOUND_FRAME_CHANNEL_CAPACITY)` with capacity 64, a doc comment declaring
+the lossless-block policy, and `.await` at the send site so producers wait rather than
+allocate.
+
+### THREE defects I caught that its own green gates did not
+
+1. **A clippy warning it introduced and mislabelled.** It reported a `useless_conversion` in
+   `oc-plugin/src/js/host.rs` as *"非阻塞的既有 warning"* — non-blocking and pre-existing. It
+   was neither: `main` had 0 warnings and this commit wrote it. One command attributes a
+   warning to a commit; do it before calling one pre-existing.
+2. **A `cfg(windows)` dependency that broke offline verification.** It pinned
+   `process-wrap =9.1.0`, absent from this machine's cache. On Linux `build`/`test`/`clippy`
+   never resolve a Windows-gated dep, so all three were green — but
+   `cargo metadata --locked --offline` resolves the **full graph** and failed, which is
+   `Makefile:74` and my merge gate, i.e. **`make ci` would have been broken for every future
+   task**. GitHub CI has network and would have passed, hiding it further. I verified the
+   cached `=9.0.1` carries the `job-object` feature and the exact API used
+   (`process_wrap::std::{ChildWrapper, CommandWrap, JobObject}`) before instructing the
+   downgrade, and checked the transitive `nix 0.30.1` was cached too.
+   → New rule: *`cargo metadata --locked --offline` is the only gate on a Linux host that
+   sees `cfg(windows)` deps. Run it before claiming a dependency change is safe.*
+3. **I had to revert a merge from `main`.** `premerge.sh` merges *then* gates, so the failed
+   lock check left `main` at a commit whose `make ci` was broken. I reset to `68cddf6`,
+   confirmed the lock healthy again, and only re-merged after the fix. Worth hardening the
+   script eventually: gate on a scratch ref before touching `main`.
+
+### Scope: two new crates, and an honest record of why
+
+It created `oc-process` (a real child-containment supervisor using `PR_SET_PDEATHSIG` +
+process groups on Linux, Job Objects on Windows) and `oc-reaping-fixture`, and wired
+`oc-process` into five production crates. That is far beyond "write a test file".
+
+I asked whether G6 was *measured* failing beforehand. It answered honestly:
+
+> before `oc-process`: **NOT MEASURED; orphan count unknown**
+
+and labelled the `oc-plugin` JavaScript-host change as *uniformity, not necessity*. It also
+declined to promote a remembered intermediate failure into a numeric before-measurement. An
+accurate record beats a flattering one — but note for F1: **the production supervisor is
+enforcement for a new contract, not a fix for a quantified pre-existing defect.**
+
+### Remaining chain is strictly sequential: 112 → 92 → 103 → F1-F4
+
+Not by file conflict but by content dependency: 103's own text says to *"document it in Todo
+92's compatibility matrix"*, and 92 documents the error rendering 112 changes.
+
+worktree: oc-wt/t112 (task-112)
