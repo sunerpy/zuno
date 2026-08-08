@@ -5762,3 +5762,59 @@ test compares case-insensitively and says why.
 to revert a mutation and lost the whole of `source.rs`; recovered from a `/tmp` copy taken
 beforehand. Revert mutations from a copy, not from the index, until the first commit
 exists.
+
+## [2026-08-08] Todo 92: two briefing facts about the gates were wrong, and G6 is cheaper than believed
+
+Documenting the six gates required checking each claim, and two did not hold.
+
+**1. G6 is NOT `#[ignore]`d.** `grep -rn '#\[ignore' crates/` finds exactly one
+site in the whole workspace: `crates/oc-testkit/tests/soak.rs:683`, the 500-turn
+real-driver soak. `crates/oc-process/tests/containment.rs` — both
+`clean_parent_shutdown_reaps_the_guarded_process_tree` and
+`parent_sigkill_reaps_the_guarded_process_tree` — runs in the ordinary suite. So
+the honest statement is: **G5 and G6 run in `cargo test --workspace`; G1/G2 need
+`OC_MEMORY_GATE_MODE=run`; G3/G4's real-driver soak needs `--ignored`.** The
+briefing's "soak.rs and G6 are `#[ignore]`d" would have told a reader to run an
+opt-in command for a gate they already have.
+
+**2. "G4 | 120 s / 1800 s" is two bounds, not a measurement and a limit.**
+`perf/methodology.rs:58-59` sets `g4_progress_timeout_seconds: 120.0` and
+`g4_hard_deadline_seconds: 1800.0`, and `docs/perf-methodology.md:149` states the
+pass condition as *both*: no turn exceeds 120 s without state progress AND no turn
+exceeds the 1800 s hard deadline. Reporting 120 as the measured value would have
+been a fabricated number — nothing measured 120 s of anything.
+
+**3. No test asserts G6's "≥33 PIDs".** `containment.rs` asserts `pids.len() >= 5`
+(parent, guard, monitor, payload, grandchild) and that every collected pid exits.
+There is no task-114 evidence file in this worktree to cite a 33 against, so the
+README claims only what is tested: 0 orphans after clean shutdown and after
+`SIGKILL`. Flagging rather than fixing — if 33 was really measured, the evidence
+belongs in `.omo/evidence/` and then the figure can be documented.
+
+### One asymmetry the C8 guide had to state rather than smooth over
+
+`--archive` is reversible *in the library* — `PruneRequest::restore_archive` clears
+`session.time_archived`, and `prune_archive_is_reversible_without_deleting_session_data`
+proves it. But **neither the CLI nor the HTTP surface exposes the clear.** So
+"reversible" is true and not yet actionable: reversing an archive today means
+calling `restore_archive` from Rust or clearing the column by hand.
+`docs/session-retention.md` says exactly that. Whoever adds `--unarchive` or a
+`restore` action to `POST /api/session/prune` closes the gap; until then the guide
+must not read as though a flag exists.
+
+### For todo 103
+
+Adding the eighth (memory) divergence is now a two-step mechanical edit and the
+build tells you both steps:
+
+1. Append the entry to `docs/divergences.toml` and bump
+   `oc_testkit::divergence::DECLARED_COUNT` to 8 in the same commit — the compat
+   suite refuses either alone, as before.
+2. Run `OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs`. That regenerates
+   `divergence-detail` in `docs/divergences.md` and `divergence-index` in
+   `docs/compatibility-matrix.md` from the file. No prose rewrite; review the diff.
+
+Skipping step 2 fails `docs_every_declared_divergence_is_documented_with_its_reason`
+with `divergence-detail is stale` and prints the expected block in full. Verified by
+performing exactly that mutation and reverting it (see
+`.omo/evidence/task-92-opencode-rust.txt`, M2).

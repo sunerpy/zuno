@@ -1,0 +1,258 @@
+Task 92 — README + docs/: compatibility, divergences, migration, plugin authoring
+================================================================================
+
+Worktree: /config/workspace/ProdDir/AI/oc-wt/t92   Branch: task-92
+Base:     0ff3a3a chore(omo): track per-task evidence so a worktree audit can read it
+
+
+WHAT WAS BUILT
+==============
+
+New documentation test target: crates/oc-cli/tests/docs.rs  (10 tests)
+New pages:  README.md
+            docs/compatibility-matrix.md
+            docs/divergences.md
+            docs/rejected-inputs.md
+            docs/migration.md
+            docs/session-retention.md
+            docs/plugin-authoring.md
+Changed:    crates/oc-cli/Cargo.toml  (+oc-plugin dev-dependency, first-party path dep)
+            Cargo.lock                (one first-party edge; no new external crate)
+
+Nothing in the frozen perf surface was touched. DECLARED_COUNT is unchanged at 7
+and no divergence entry was added — the eighth belongs to todo 103.
+
+
+EVERY TABLE IS DERIVED FROM CODE, NOT TRANSCRIBED
+=================================================
+
+The prohibition is "must NOT hand-maintain any table the code also asserts", and a
+docs test that reads its own prose proves nothing. Each generated block therefore
+takes its EXPECTED side from a live code artifact and its ACTUAL side from the
+committed Markdown, delimited by `<!-- generated:BEGIN/END name -->`:
+
+| block                | source of truth                                            |
+|----------------------|------------------------------------------------------------|
+| divergence-detail    | oc_testkit::DivergenceList over docs/divergences.toml       |
+| divergence-index     | same list, cross-checked vs divergence::DECLARED_COUNT      |
+| cli-disposition      | oc_cli::dispositions()  (23 rows)                           |
+| api-operations       | oc_server::api::openapi() minus the committed 1.18.12       |
+|                      | oracle capture, then each served route PROBED through the    |
+|                      | real router for a 501                                       |
+| v1-routes            | oc_server::V1_SURFACE  (20 routes)                          |
+| rejected-inputs      | messages RENDERED BY oc_config::legacy's inspect_* fns      |
+| plugin-hooks         | oc_plugin::HookName::ALL  (21 hooks)                        |
+| prune-tables         | oc_db::prune::DELETE_ORDER  (10 tables)                     |
+| migration-journal    | oc_db::migration::MIGRATION_IDS  (38 ids)                   |
+
+`OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs` rewrites each block from
+the code and re-asserts. Prose outside the markers is never touched.
+
+The api-operations block is the strongest of these: it does not read the route
+registration source, it drives the assembled axum router with a request per
+operation and records which answer 501. So "registered (501 stub)" cannot be
+claimed for a route that gained a handler, or withheld from one that lost it.
+
+
+THE DOCS TEST BITES — FOUR MUTATIONS, FOUR CATCHES, ALL REVERTED
+================================================================
+
+M1. An 8th entry appended to docs/divergences.toml, DECLARED_COUNT left at 7.
+
+  docs_every_declared_divergence_is_documented_with_its_reason ... FAILED
+    assertion `left == right` failed: the allow-list declares 8 entries but
+    oc_testkit::divergence::DECLARED_COUNT expects 7; the documentation gate
+    refuses to render a list the compatibility gate rejects
+      left: 8   right: 7
+
+M2. THE ACCEPTANCE SCENARIO. Same 8th entry AND DECLARED_COUNT bumped to 8 —
+    exactly the edit todo 103 will make — with the documentation not updated.
+
+  docs_every_declared_divergence_is_documented_with_its_reason ... FAILED
+    docs/divergences.md block `divergence-detail` is stale.
+    The code changed and the documentation did not. Run
+        OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs
+    to take the generated version, then review the diff. Expected:
+    ----- BEGIN GENERATED -----
+    ### session-list-default-sort
+    ... (all eight entries, including the new one, printed in full)
+
+  This is the criterion "adding a divergence without documenting it fails the
+  docs test", proven at the exact mutation the next todo performs.
+
+M3. A rejection message reworded in production code:
+    ("maxSteps", DeprecatedForm::AgentMaxSteps, "use `steps`")
+      -> ("maxSteps", DeprecatedForm::AgentMaxSteps, "use `stepLimit`")
+
+  docs_every_rejected_form_is_documented_with_the_message_the_code_renders ... FAILED
+    docs/rejected-inputs.md block `rejected-inputs` is stale.
+    Expected: - Rejected: `agent.build.maxSteps` — use `stepLimit`
+
+  Proves the documented messages come from the detector, not from prose.
+
+M4. A 24th row added to COMMAND_DISPOSITIONS.
+
+  docs_compatibility_matrix_matches_every_code_table ... FAILED
+    docs/compatibility-matrix.md block `cli-disposition` is stale.
+
+All four reverted; `git status` shows no modification to divergences.toml,
+divergence.rs, legacy.rs, or disposition.rs. Suite green after each revert.
+
+
+A RACE THE FIRST DRAFT HAD, AND THE STRUCTURE THAT FIXES IT
+===========================================================
+
+The first version had one test per generated block. Under regeneration, two tests
+writing two blocks of the SAME page each did read-modify-write and silently
+discarded the other's write — observed as `has no <!-- generated:BEGIN
+divergence-index --> marker` on a file that did have it. Consolidated to one test
+per file (docs_compatibility_matrix_matches_every_code_table checks all four
+matrix blocks). The constraint is recorded in a doc comment on that test, because
+splitting it back into four is the natural refactor and would reintroduce the bug.
+
+
+REQUIRED CONTENT, ALL PRESENT AND ASSERTED
+==========================================
+
+README.md
+  - pinned baseline 1.18.13, and the asserted claim that `--version` reports it,
+    with `--version --long` showing the real build identity
+  - side-by-side procedure: back up, `debug paths`, `OPENCODE_DISABLE_CHANNEL_DB=1
+    session list` on both binaries
+  - "Rolling back" section: no uninstall/upgrade command exists (both rejected),
+    so rollback is stopping use of the binary plus the backup restore; states that
+    the release can reopen a migrated database and that this is tested only at the
+    schema and journal level
+  - the §3 gate table verbatim, with all three caveats stated as headings, not
+    footnotes: the 1.27% G2 margin, "A green cargo test --workspace does not mean
+    G1-G6 pass" with the opt-in command for each, and the pinned W-real subject
+  - the four side-by-side gaps as the first substantive section
+
+docs/compatibility-matrix.md
+  - four states defined: implemented / registered (501 stub) / added / rejected /
+    not-registered
+  - 12 implemented, 8 rejected, 3 not-registered of upstream's 23 commands
+  - 56 of the 58 upstream /api operations served, 2 added (C8), 45 registered as
+    a 501 stub — the stub count named as remaining work, not coverage
+  - the two absent SSE operations named, with the suite assertion that the absent
+    set is exactly those two
+  - the three never-compared surfaces named as never-compared
+
+docs/divergences.md
+  - all 7 entries with surface and reason, generated. An 8th is a mechanical
+    append to divergences.toml plus one regeneration command; no page rewrite.
+  - notes the six further in-code divergences the compat report emits as
+    nominated_divergences rather than laundering into the file
+
+docs/rejected-inputs.md
+  - all 10 DeprecatedForm variants, 12 rows (AgentTools, AgentMaxSteps and
+    AuthPromptCondition each render from two detectors)
+  - every message byte-exact from Deprecation::message(); `<file>` substitutes
+    only for the scratch directory a directory-scan form needs
+  - documents that AuthPromptCondition genuinely has two replacements, and that
+    the legacy TOML config is reported and never rewritten
+
+docs/plugin-authoring.md
+  - three tiers with a selection table: JavaScript, WebAssembly component
+    (import-free linker; WASI rejected before instantiation), out-of-process
+  - JSON-RPC contract: protocol 1.0, three methods, the four error codes, the
+    independent per-phase deadlines
+  - the Rust example, with a test asserting examples/rust_plugin.rs exists and
+    still uses Plugin::new, ToolDefinition::new and ConformanceSuite
+  - all 21 hooks, generated
+  - states that `plugin` is not registered and why
+
+docs/session-retention.md
+  - --delete IRREVERSIBLE, --archive REVERSIBLE, with the code behind each:
+    archive writes session.time_archived, restore_archive clears it
+  - states the asymmetry honestly: the CLI and HTTP can SET the archive marker
+    but cannot yet CLEAR it, so reversing today means calling restore_archive
+  - full flag table, both refusal messages verbatim, the --force remote-survival
+    warning verbatim, the apply:true gate
+  - the 10 delete-order tables, generated
+  - how to read the artifact warning, including that "0 sessions" means wrong
+    database rather than lost data
+
+docs/migration.md
+  - the channel-database precedence table, both escape hatches, and the
+    case-sensitivity of OPENCODE_DISABLE_CHANNEL_DB
+  - the three database states apply() handles, with state 3 (Drizzle journal)
+    called out as the one an older install is on
+  - "Before you migrate": forward-only, copy the file
+  - the 38 migrations, generated
+  - provider coverage by wire family and what it means for an unnamed provider
+
+
+VERIFICATION
+============
+
+$ cargo test -p oc-cli --test docs --offline
+  test result: ok. 10 passed; 0 failed; 0 ignored.
+
+$ cargo test --workspace --offline
+  passed=3206 failed=0 ignored=2
+  (3196 baseline + 10 new; the 2 ignored are pre-existing)
+
+$ cargo clippy --workspace --all-targets --offline
+  0 warnings, 0 errors  (re-run after touching docs.rs to defeat caching)
+
+$ cargo fmt --all --check
+  clean
+
+$ cargo metadata --locked --offline --format-version 1
+  OK. Cargo.lock's only change is the oc-cli -> oc-plugin first-party path edge.
+  No new external crate; oc-plugin's `wasm` feature is not default so no wasmtime.
+
+
+CAPABILITIES DELIBERATELY LEFT OUT FOR LACK OF A TEST
+=====================================================
+
+1. A "G6 reaped >=33 PIDs" figure. crates/oc-process/tests/containment.rs asserts
+   the guarded tree has at least 5 processes and that every one exits, after both
+   clean shutdown and SIGKILL. No test asserts 33, and .omo/evidence/ in this
+   worktree has no task-114 file to cite. The README states what is tested:
+   0 orphans on both paths.
+
+2. Restoring an archive from the CLI or over HTTP. The library operation exists
+   and is tested; no surface exposes it. Documented as an asymmetry rather than
+   as a feature.
+
+3. Per-operation /api response-shape parity. crates/oc-server/tests/api.rs
+   compares shapes per group; the matrix claims only the path+method set plus the
+   probed 501 state, which is what this target measures.
+
+4. Any claim that the six gates run in normal CI. Two of them do (G5, G6); the
+   README says which, and says the others are opt-in.
+
+
+THINGS THE BRIEFING OR THE PLAN GOT WRONG
+=========================================
+
+1. "soak.rs and G6 are #[ignore]d". Only one test in the workspace carries
+   #[ignore]: crates/oc-testkit/tests/soak.rs:683, the 500-turn real-driver soak.
+   G6 (crates/oc-process/tests/containment.rs) is NOT ignored — both its tests
+   run in the ordinary suite. Documented as measured: G5 and G6 run, G1/G2 need
+   OC_MEMORY_GATE_MODE=run, G3/G4's real-driver soak needs --ignored.
+
+2. "G4 | no trip | 120 s / 1800 s". Those are two separate bounds, not a value
+   and a limit: a 120 s meaningful-progress timeout and an 1800 s per-turn hard
+   deadline (crates/oc-testkit/src/perf/methodology.rs:58-59,
+   docs/perf-methodology.md:149). The README states both.
+
+3. "todo 10's rejection list" is not a table. There is no const array of rows;
+   there are 10 DeprecatedForm variants whose messages are CONSTRUCTED per input
+   by Deprecation::message(), embedding the offending file's path. So a
+   documentation test cannot compare a documented table against a code table —
+   it has to RUN the detectors and compare rendered output, which is what
+   docs.rs does. This is a better outcome than the plan's framing: the assertion
+   is against behaviour rather than against a literal.
+
+4. The CLI disposition table has no `Renamed` disposition. `providers` keeps
+   upstream's `auth` alias and `TuiThreadCommand` gains the explicit spelling
+   `tui`; both are expressed through the command and reason fields. The matrix
+   therefore documents three states for CLI commands, not four.
+
+5. "docs/ currently holds divergences.toml, perf-methodology.md,
+   v1-surface-capture.md" — correct, and v1-surface-capture.md was left alone.
+   It is a capture record, not a compatibility page; the matrix links to
+   V1_SURFACE's generated table instead so the two cannot disagree.

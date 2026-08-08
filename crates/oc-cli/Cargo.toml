@@ -52,6 +52,9 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+# `tests/docs.rs` renders the plugin-authoring guide's hook table from
+# `oc_plugin::HookName::ALL` rather than transcribing 21 names into Markdown.
+oc-plugin = { workspace = true }
 oc-testkit = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
