@@ -3,6 +3,7 @@
 use super::*;
 
 use oc_catalog::agent::{Agent, AgentMode, AgentSource};
+use oc_paths::Env;
 
 fn agent(name: &str) -> Agent {
     Agent {
@@ -302,8 +303,16 @@ fn all_three_internals_resolve_with_the_roster_prompt_and_a_reachable_model() {
     let mut notes = Vec::new();
 
     // When: the internals are resolved.
-    let internals = resolve_internals(&config, &catalog, "test", "big", session_model, &mut notes)
-        .expect("every internal resolves");
+    let internals = resolve_internals(
+        &config,
+        &catalog,
+        "test",
+        "big",
+        session_model,
+        &Env::empty(),
+        &mut notes,
+    )
+    .expect("every internal resolves");
 
     // Then: the overridden one took its override, the other two inherited the
     // session's model, and all three carry the roster's prompt.
@@ -335,8 +344,16 @@ fn the_resolved_set_is_exactly_what_the_roster_calls_internal() {
     let (catalog, config) = catalog_with_two_models_and_a_title_override();
     let session_model = catalog.model("test", "big").expect("the session model");
     let mut notes = Vec::new();
-    let internals = resolve_internals(&config, &catalog, "test", "big", session_model, &mut notes)
-        .expect("every internal resolves");
+    let internals = resolve_internals(
+        &config,
+        &catalog,
+        "test",
+        "big",
+        session_model,
+        &Env::empty(),
+        &mut notes,
+    )
+    .expect("every internal resolves");
 
     let resolved: std::collections::BTreeSet<&str> = [
         internals.title.name.as_str(),
@@ -364,8 +381,16 @@ fn an_internal_pointed_at_another_provider_falls_back_and_says_why() {
     let session_model = catalog.model("test", "big").expect("the session model");
     let mut notes = Vec::new();
 
-    let internals = resolve_internals(&config, &catalog, "test", "big", session_model, &mut notes)
-        .expect("a declined override is not a failure");
+    let internals = resolve_internals(
+        &config,
+        &catalog,
+        "test",
+        "big",
+        session_model,
+        &Env::empty(),
+        &mut notes,
+    )
+    .expect("a declined override is not a failure");
 
     assert_eq!(internals.summary.model.model_id, "big");
     assert!(
@@ -414,11 +439,26 @@ fn probe_spec(
     endpoint: Option<&str>,
     base_url: Option<&str>,
 ) -> Result<Spec, String> {
+    probe_spec_in(api, endpoint, base_url, &Env::empty())
+}
+
+/// The same probe, resolved against an explicit environment.
+///
+/// Separate from [`probe_spec`] so the ladder cases keep asserting against an
+/// environment that carries nothing: a placeholder-free URL must resolve identically
+/// whatever is set, and a fixture that quietly supplied variables would hide a fix that
+/// only worked when they happened to be present.
+fn probe_spec_in(
+    api: Option<&str>,
+    endpoint: Option<&str>,
+    base_url: Option<&str>,
+    env: &Env,
+) -> Result<Spec, String> {
     let catalog = endpoint_catalog(api, endpoint, base_url);
     let model = catalog
         .model("probe", "probe-model")
         .expect("the config declares the model");
-    model_spec(&catalog, model)
+    model_spec(&catalog, model, env)
 }
 
 /// The whole ladder, rung by rung — `provider.ts:1698-1700` plus `:355-358`.
@@ -496,6 +536,145 @@ fn an_empty_endpoint_option_falls_through_to_the_next_rung() {
     assert_eq!(spec.base_url.as_deref(), Some("https://from-api/v1"));
 }
 
+/// A URL naming no variable is returned byte for byte — `provider.ts:1712-1715`.
+///
+/// The expansion pass runs on every turn, so the case that must not change anything is
+/// the case that runs almost always. The awkward inputs are here on purpose: `${}` has
+/// an empty name and the oracle's `[^}]+` needs at least one character, `${unclosed` has
+/// no terminator, and a bare `$` or `{` is not a placeholder at all. Each would be an
+/// easy off-by-one in a hand-rolled scan, and each would corrupt a perfectly ordinary
+/// URL that happens to contain a brace.
+///
+/// The environment binds the **empty name** as well as `SET`, and that is not
+/// decoration: with only `SET` bound, dropping the scan's `offset > 0` guard left `${}`
+/// looking up a name nothing carried, which fell back to the literal and produced a
+/// byte-identical answer — the test passed while the guard was gone. A binding for `""`
+/// is what makes `${}` staying literal an observable claim rather than a coincidence.
+/// Nothing can export an empty-named variable through a POSIX `environ`, so this only
+/// ever comes from a constructed [`Env`]; the guard exists because the oracle's `[^}]+`
+/// demands at least one character, not because the input is reachable.
+#[test]
+fn a_url_naming_no_variable_is_unchanged_by_expansion() {
+    let env = Env::from_pairs([("SET", "substituted"), ("", "empty-name")]);
+    for url in [
+        "https://api.example.com/v1",
+        "http://127.0.0.1:8080/v1",
+        "https://api.example.com/v1?filter=a{b}c",
+        "https://api.example.com/${}/v1",
+        "https://api.example.com/${unclosed/v1",
+        "https://api.example.com/$SET/v1",
+        "https://api.example.com/{SET}/v1",
+        "",
+    ] {
+        assert_eq!(
+            expand_variables(url, &env),
+            url,
+            "expansion must not alter a URL that names no variable"
+        );
+    }
+}
+
+/// A set variable substitutes; an unset one keeps its literal `${VAR}`.
+///
+/// `?? item` (`provider.ts:1714`) is the whole of the second half. Substituting the
+/// empty string for an unset name would turn `https://${REGION}.api.example.com/v1`
+/// into `https://.api.example.com/v1` — a *different host*, silently — so this is the
+/// one case where the wrong answer is worse than no answer.
+#[test]
+fn an_unset_variable_keeps_its_placeholder_while_a_set_one_substitutes() {
+    let env = Env::empty()
+        .with("REGION", "eu-west-1")
+        .with("SUFFIX", "example.com")
+        .with("BLANK", "");
+    let cases = [
+        (
+            "https://${REGION}.api.example.com/v1",
+            "https://eu-west-1.api.example.com/v1",
+            "a set variable must substitute",
+        ),
+        (
+            "https://${MISSING}.api.example.com/v1",
+            "https://${MISSING}.api.example.com/v1",
+            "an unset variable must keep its literal placeholder, not collapse the host",
+        ),
+        (
+            "https://${REGION}.api.${SUFFIX}/v1",
+            "https://eu-west-1.api.example.com/v1",
+            "every placeholder in one URL must be expanded",
+        ),
+        (
+            "https://${REGION}.api.${MISSING}/v1",
+            "https://eu-west-1.api.${MISSING}/v1",
+            "one unset variable must not stop the others from expanding",
+        ),
+        (
+            "https://api.${BLANK}example.com/v1",
+            "https://api.example.com/v1",
+            "a variable set to the empty string substitutes empty — `\"\"` is not \
+             nullish in the oracle either",
+        ),
+    ];
+
+    for (url, expected, why) in cases {
+        assert_eq!(expand_variables(url, &env), expected, "{why}");
+    }
+}
+
+/// Expansion applies to whichever rung the ladder chose, all three of them.
+///
+/// The defect is one step past todo 109: the ladder was already correct, and every rung
+/// it could choose was then dialled literally. A fix that only expanded `model.api.url`
+/// — the field whose doc comment promised expansion — would leave the two option rungs
+/// broken, so each is asserted separately here.
+#[test]
+fn every_endpoint_rung_is_expanded_after_it_wins() {
+    let env = Env::empty().with("HOST", "gateway.internal");
+    let cases = [
+        (
+            (Some("https://${HOST}/v1"), None, None),
+            "the catalog's `api.url` must be expanded",
+        ),
+        (
+            (None, Some("https://${HOST}/v1"), None),
+            "`options.endpoint` must be expanded",
+        ),
+        (
+            (None, None, Some("https://${HOST}/v1")),
+            "`options.baseURL` must be expanded",
+        ),
+    ];
+
+    for ((api, endpoint, base_url), why) in cases {
+        let spec = probe_spec_in(api, endpoint, base_url, &env).expect("an endpoint resolves");
+        assert_eq!(
+            spec.base_url.as_deref(),
+            Some("https://gateway.internal/v1"),
+            "{why}"
+        );
+    }
+}
+
+/// A rung is chosen on its unexpanded text, and expanded only afterwards.
+///
+/// The oracle tests `options["baseURL"] !== ""` at `:1699-1700` and expands at `:1712`, in
+/// that order. `BLANK` is set to the empty string, so `"baseURL": "${BLANK}"` is a
+/// non-empty rung that wins the ladder and *then* becomes empty — it does not fall
+/// through to the catalog's `api.url`. Moving expansion ahead of
+/// [`super::provider_endpoint`] would produce `https://from-api/v1` here, which is why
+/// this case exists rather than a second happy-path one.
+#[test]
+fn a_rung_is_chosen_before_expansion_not_after() {
+    let env = Env::empty().with("BLANK", "");
+    let spec = probe_spec_in(Some("https://from-api/v1"), None, Some("${BLANK}"), &env)
+        .expect("a non-empty rung was available before expansion");
+    assert_eq!(
+        spec.base_url.as_deref(),
+        Some(""),
+        "`options.baseURL` was non-empty when the ladder read it, so it must win and \
+         then expand to nothing; falling through to `api.url` means expansion ran first"
+    );
+}
+
 /// Neither an endpoint key nor `apiKey` is ever forwarded as an SDK option.
 ///
 /// [`model_spec`] now forwards **both** bags — the provider's, seeded first, and the
@@ -540,7 +719,8 @@ fn the_endpoint_keys_do_not_also_travel_in_the_option_bag() {
         }
     }
 
-    let spec = model_spec(&catalog, model).expect("the provider option supplies the endpoint");
+    let spec = model_spec(&catalog, model, &Env::empty())
+        .expect("the provider option supplies the endpoint");
 
     assert_eq!(
         spec.base_url.as_deref(),
@@ -617,7 +797,7 @@ fn options_spec(provider_options: &serde_json::Value, model_options: &serde_json
     .expect("config");
     let catalog = Catalog::resolve(&document, &ResolveInput::new().with_config(&config));
     let model = catalog.model("probe", "probe-model").expect("the model");
-    model_spec(&catalog, model).expect("the injected endpoint resolves")
+    model_spec(&catalog, model, &Env::empty()).expect("the injected endpoint resolves")
 }
 
 /// A resolved provider carrying exactly `options`, for the credential precedence table.
@@ -813,8 +993,16 @@ fn an_internal_whose_model_has_no_endpoint_falls_back_and_says_why() {
     let mut notes = Vec::new();
 
     // When: the internals resolve.
-    let internals = resolve_internals(&config, &catalog, "test", "big", session_model, &mut notes)
-        .expect("an unreachable override is a downgrade, not a failure");
+    let internals = resolve_internals(
+        &config,
+        &catalog,
+        "test",
+        "big",
+        session_model,
+        &Env::empty(),
+        &mut notes,
+    )
+    .expect("an unreachable override is a downgrade, not a failure");
 
     // Then: title fell back to the session model and said so.
     assert_eq!(internals.title.model.model_id, "big");

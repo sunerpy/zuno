@@ -6057,3 +6057,74 @@ predicate that derives from `ENDPOINT_OPTIONS`, and each half of the predicate w
 mutated separately (M5a: drop the `apiKey` clause; M5b: drop the `ENDPOINT_OPTIONS`
 clause). Both fail `the_endpoint_keys_do_not_also_travel_in_the_option_bag`, so neither
 half masks the other. Nine mutations tried in total, nine caught.
+
+## [2026-08-08] Task 111: `${VAR}` expansion is a post-processing step on the rung the ladder already chose
+
+**Decision.** `crates/oc-cli/src/cmd/turn.rs` gains `expand_variables(url, env)`, called
+by `model_spec` on the URL `provider_endpoint` returned — never before it, and nowhere
+else. It ports `resolveSDK`'s environment pass (`provider.ts:1712-1715`).
+
+**Selection first, expansion second, and the order is load-bearing.** The oracle tests
+`options["baseURL"] !== ""` at `:1699` and expands at `:1712`, in that order, so a rung
+is accepted or skipped on its **unexpanded** text. `"baseURL": "${BLANK}"` with `BLANK`
+set to the empty string is therefore a non-empty rung that wins todo 109's ladder and
+*then* expands to nothing — it does **not** fall through to `model.api.url`. That is the
+one case where the two possible orderings disagree observably, which is why
+`turn_tests::a_rung_is_chosen_before_expansion_not_after` asserts it rather than a
+second happy path. Documented on `model_spec` under a "The two endpoint steps are
+ordered" heading naming that test, the same shape todos 109 and 110 used for the
+endpoint ladder and the option-overlay direction. Mutation M2 (expanding every candidate
+before the emptiness filter) fails it; M3 and M4 fail it too, at both layers.
+
+**An unset variable keeps its literal `${VAR}`; it is never replaced with the empty
+string.** `?? item` at `:1714` is the whole of it, and the alternative is actively
+dangerous rather than merely unfaithful: `https://${REGION}.api.example.com/v1` with
+`REGION` unset would become `https://.api.example.com/v1` — a *different host*,
+silently, from one typo. Pinned by
+`turn_tests::an_unset_variable_keeps_its_placeholder_while_a_set_one_substitutes` (M1)
+and, on the wire, by
+`provider_endpoint::an_unset_variable_reaches_no_endpoint_rather_than_a_collapsed_one`.
+
+**`Env::value`, not `Env::truthy_value`.** `envs[key] ?? item` is JavaScript's nullish
+check, so a variable set to `""` **does** substitute empty — `""` is not nullish. The
+truthy read would keep the literal instead. This is the `||`-versus-`??` distinction
+`oc-paths::env` already documents at length, and M7 pins which side of it this call is
+on.
+
+**The resolved `Env` is threaded, not `std::env`.** `TurnPlan::resolve` already holds
+`environment.resolved()`, so it is passed into `model_spec` and `resolve_internals`.
+This is not merely tidier: `unsafe_code = "forbid"` plus edition 2024's unsafe `set_var`
+means no in-process test could set up a `std::env` read at all.
+
+**No `varsLoaders` equivalent is invented.** Upstream expands twice and the first pass
+is a provider-specific hook (`:1703-1710`) registered by four custom loaders. This
+workspace has no custom-loader registry; searched exhaustively, the only near-hit is
+`oc-provider-bedrock`'s own ambient `AWS_REGION` default, which does not feed URL
+expansion. Only the environment pass is ported, and `expand_variables`' doc records that
+a future loader pass belongs **before** it — upstream's environment pass runs last and
+therefore cannot be overridden by a loader, and getting that backwards would invert
+precedence with no test to notice.
+
+**A hand-rolled scan rather than a regex dependency.** `oc-cli` depends on no regex
+crate and one bracket form does not justify adding one. The scan reproduces `[^}]+`
+exactly: at least one character, none of them `}`, so `${}` is not a placeholder and an
+unterminated `${` is not one either. That `offset > 0` guard is the port's fidelity to
+the oracle and is pinned by
+`turn_tests::a_url_naming_no_variable_is_unchanged_by_expansion` — whose environment
+binds the **empty name** on purpose, because without that binding the guard could be
+deleted and the test still passed (see the learnings entry; this was mutation M5, the
+one that was not caught first time).
+
+**Scope held to the base URL.** Headers, credentials and forwarded option values are
+*not* expanded, matching the oracle, which expands only the URL inside that `iife`.
+
+**The QA failure scenario is met in the data and not in the rendering, and that is
+recorded rather than papered over.** The literal survives verbatim, and it does reach
+the error value — `ProviderError::transient` attaches the transport error and reqwest's
+message names the URL. But `describe_turn_failure` renders `error.to_string()`, and
+`Transient`'s `#[error]` does not walk the source chain, so the user still reads
+`transient provider failure (status=None)`. That is a pre-existing gap in the rendering
+of *every* connection-level provider failure — a wrong hostname is equally
+undiagnosable — so fixing it changes user-visible text for every provider failure and
+belongs in its own change. Reported in `issues.md` and on the test; not implemented
+here.

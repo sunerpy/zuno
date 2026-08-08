@@ -5312,3 +5312,41 @@ placeholders"* and nothing anywhere expands them. Upstream expands twice at
 
 Both land in the same region of `turn.rs`, so they are sequential with respect to each
 other — a real file conflict, not a guess.
+
+## [2026-08-08] OPEN: every connection-level provider failure renders as seven words naming nothing
+
+Found while writing todo 111's failure-path test, which asserted the CLI still names a
+misspelled `${VAR}` in the base URL. It does not, and expansion is not at fault.
+
+**The data is there.** `ProviderError::transient` (`oc-error/src/provider.rs:115`)
+attaches the transport error as `#[source]`, and reqwest's own Display names the URL it
+tried to reach.
+
+**The rendering throws it away.** `describe_turn_failure` (`oc-cli/src/cmd/turn.rs`)
+returns `error.to_string()`, and `Transient` is
+`#[error("transient provider failure (status={status:?})")]` — no source walk. So a
+wrong hostname, a wrong port, a dead gateway, a TLS refusal and an unexpanded
+`${REGION}` all print the identical, actionless:
+
+    transient provider failure (status=None)
+
+Measured: that is the exact stderr from a run whose base URL was
+`http://${PROBE_HOST}/v1` with `PROBE_HOST` unset.
+
+**Why this is the same defect twice already fixed elsewhere.** Todo 109 fixed the
+plan-time version (a missing endpoint said `unrecoverable provider failure (status=None)`
+and now names `provider.<id>.options.baseURL`). Todo 110 fixed the auth version
+(`describe_turn_failure` now names both places a key can live). The transport-level
+version is the remaining instance of the same class: correctly classified, uselessly
+rendered.
+
+**The fix is small; the blast radius is not.** One source-chain walk in
+`describe_turn_failure`. But it changes the user-visible text of *every* provider
+failure, so it wants its own todo and its own review rather than riding along in a
+URL-expansion commit. Deliberately left undone by 111 and documented on
+`provider_endpoint::an_unset_variable_reaches_no_endpoint_rather_than_a_collapsed_one`.
+
+Worth checking when it is picked up: whether the source body is ever a place vendor
+error text could carry key material. `ResponseBody` truncates at 512 bytes
+(`oc-provider-compatible/src/transport.rs`) and is a *response* body, so probably not —
+but "probably" is not the standard todo 110 set for anything adjacent to credentials.

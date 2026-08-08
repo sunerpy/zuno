@@ -192,7 +192,7 @@ impl TurnPlan {
             requested_provider: provider_id.clone(),
             requested_model: model_id.clone(),
             wire_model: catalog_model.api.id.clone(),
-            spec: model_spec(&catalog, catalog_model)?,
+            spec: model_spec(&catalog, catalog_model, env)?,
         };
         let window = TokenWindow {
             context: token_count(catalog_model.limit.context),
@@ -205,6 +205,7 @@ impl TurnPlan {
             &provider_id,
             &model_id,
             catalog_model,
+            env,
             &mut notes,
         )?;
         Ok(Self {
@@ -271,6 +272,7 @@ fn resolve_internals(
     provider_id: &str,
     model_id: &str,
     session_model: &oc_llm::catalog::ResolvedModel,
+    env: &oc_paths::Env,
     notes: &mut Vec<String>,
 ) -> Result<Internals, String> {
     let session_choice = ModelChoice::new(format!("{provider_id}/{model_id}"));
@@ -311,7 +313,7 @@ fn resolve_internals(
                 // per-model `provider.api` can leave one model in a provider without an
                 // endpoint while the session's has one, and losing the whole turn over a
                 // title agent is worse than downgrading it audibly.
-                if let Err(why) = model_spec(catalog, model) {
+                if let Err(why) = model_spec(catalog, model, env) {
                     notes.push(format!(
                         "{name}: `{}` cannot be reached ({why}); using \
                          `{provider_id}/{model_id}` instead",
@@ -329,7 +331,7 @@ fn resolve_internals(
                 name: name.to_owned(),
                 prompt,
                 model: EngineModel::new(
-                    model_spec(catalog, catalog_model)?,
+                    model_spec(catalog, catalog_model, env)?,
                     catalog_model.api.id.clone(),
                     ApiSurface::Chat,
                 ),
@@ -875,11 +877,80 @@ fn provider_endpoint(
         .find(|url| !url.is_empty())
 }
 
+/// Substitute every `${VAR}` in a chosen base URL from the resolved environment.
+///
+/// `oc_llm::catalog::ModelApi::url` has documented itself as *"possibly containing
+/// `${VAR}` placeholders"* since the catalog was ported, and nothing expanded them:
+/// `https://${REGION}.api.example.com/v1` was handed to the transport with the braces
+/// still in it, so a parameterised gateway could not be dialled at all. This is
+/// `resolveSDK`'s second pass (`provider.ts:1712-1715`).
+///
+/// # An unset variable keeps its placeholder
+///
+/// The oracle's replacer is `(item, key) => envs[String(key)] ?? item` — `?? item`, so a
+/// name the environment does not carry yields the original `${VAR}` text. Substituting
+/// the empty string instead would turn one typo into `http:///v1`, a URL that fails
+/// naming nothing the user wrote, and would silently collapse the authority of any URL
+/// whose host *is* the placeholder. [`oc_paths::Env::value`] is the nullish read that
+/// matches `envs[key]`, which also means a variable set to the empty string **does**
+/// substitute empty — `""` is not nullish in JavaScript either.
+///
+/// # Where the two passes went
+///
+/// Upstream expands twice, and the first pass is
+/// `varsLoaders[model.providerID]` — a provider-specific hook registered by the
+/// `azure`, `amazon-bedrock`, `google-vertex` and `cloudflare` custom loaders
+/// (`provider.ts:270`, `:364`, `:521`, `:760`) so that, for example, a bedrock URL can
+/// name `${AWS_REGION}` and be filled from `options.region`. **This workspace has no
+/// custom-loader registry at all**, so there is no second source to consult and
+/// inventing one to mirror the shape would ship a hook with nothing behind it. Only the
+/// environment pass is ported. When a loader registry does arrive it belongs *before*
+/// this call, because upstream's environment pass runs last and therefore cannot be
+/// overridden by a loader.
+fn expand_variables(url: &str, env: &oc_paths::Env) -> String {
+    let bytes = url.as_bytes();
+    let mut expanded = String::with_capacity(url.len());
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        // `[^}]+` in the oracle's regex: at least one character, none of them `}`, so
+        // `${}` is not a placeholder and an unterminated `${` is not one either.
+        if bytes[cursor] == b'$'
+            && bytes.get(cursor + 1) == Some(&b'{')
+            && let Some(offset) = url[cursor + 2..].find('}')
+            && offset > 0
+        {
+            let key = &url[cursor + 2..cursor + 2 + offset];
+            let end = cursor + 3 + offset;
+            expanded.push_str(env.value(key).unwrap_or(&url[cursor..end]));
+            cursor = end;
+            continue;
+        }
+        let character = url[cursor..]
+            .chars()
+            .next()
+            .unwrap_or_else(|| unreachable!("cursor is inside the string and aligned"));
+        expanded.push(character);
+        cursor += character.len_utf8();
+    }
+    expanded
+}
+
 /// The transport spec for one model: endpoint, headers and forwarded options.
 ///
 /// The option bag comes from [`forwarded_options`], which seeds it from the provider
 /// and overlays the model's on top. It does **not** carry the endpoint keys or `apiKey`;
 /// see [`resolved_elsewhere`].
+///
+/// # The two endpoint steps are ordered, and the order is load-bearing
+///
+/// [`provider_endpoint`] chooses a rung and [`expand_variables`] then substitutes into
+/// whatever it chose — never the reverse. The oracle's `iife` reads
+/// `options["baseURL"] !== ""` *before* expanding (`provider.ts:1699-1700` then `:1712`), so a
+/// rung is accepted or skipped on its **unexpanded** text: `"baseURL": "${EMPTY}"` with
+/// `EMPTY=""` set is a non-empty rung that wins the ladder and then expands to nothing,
+/// rather than an empty rung that falls through to the catalog. Expanding first would
+/// invert that, and is caught by
+/// `turn_tests::a_rung_is_chosen_before_expansion_not_after`.
 ///
 /// # Errors
 ///
@@ -889,7 +960,11 @@ fn provider_endpoint(
 /// URL with `IncompleteConfiguration`, which surfaces as `unrecoverable provider
 /// failure (status=None)` after a turn has already been composed and names nothing a
 /// user can act on.
-fn model_spec(catalog: &Catalog, model: &oc_llm::catalog::ResolvedModel) -> Result<Spec, String> {
+fn model_spec(
+    catalog: &Catalog,
+    model: &oc_llm::catalog::ResolvedModel,
+    env: &oc_paths::Env,
+) -> Result<Spec, String> {
     let provider = catalog.provider(&model.provider_id);
     let endpoint = provider_endpoint(provider, model).ok_or_else(|| {
         format!(
@@ -900,7 +975,7 @@ fn model_spec(catalog: &Catalog, model: &oc_llm::catalog::ResolvedModel) -> Resu
     })?;
     let mut spec = Spec::new(COMPATIBLE_PROVIDER)
         .with_surface(ApiSurface::Chat)
-        .with_base_url(endpoint);
+        .with_base_url(expand_variables(&endpoint, env));
     for (name, value) in &model.headers {
         spec = spec.with_header(name, value);
     }

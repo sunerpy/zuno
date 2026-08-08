@@ -5667,3 +5667,74 @@ would still 401 the prelude, and a test reading `captured[0]` would not notice.
 it: removing the provider seed fails the `useCompletionUrls` test, so that test cannot
 be planting the key in a map the code never reads. That is the trap todo 109 fell into,
 and dropping the seed is the cheap check for it.
+
+## [2026-08-08] Task 111: a byte-identity test can pass while the guard it exists for is gone
+
+`expand_variables` is a hand-rolled port of `/\$\{([^}]+)\}/g`, and `[^}]+` needs at
+least one character — so `${}` must stay literal. The scan enforces that with an
+`offset > 0` guard. I wrote a byte-identity test listing `${}` among the inputs and it
+passed. **Then I deleted the guard and it still passed.**
+
+The reason is worth remembering because it generalises past this function: with the
+guard gone the mutant treated `${}` as a placeholder named `""`, looked `""` up in an
+environment that did not bind it, hit the `?? item` fallback, and emitted the original
+`${}` — byte-identical. The test asserted the right output for the wrong reason, and it
+could not have distinguished the two implementations no matter how many inputs I added,
+because the *fixture* made both paths converge.
+
+Binding `""` in the fixture (`Env::from_pairs([("SET", …), ("", "empty-name")])`) is
+what makes the claim observable: now the mutant substitutes `empty-name` and the test
+fails. Nothing can export an empty-named variable through a POSIX `environ`, so the
+input is unreachable in production — but the *guard* is the port's fidelity to the
+oracle's regex, and a guard nothing tests is a guard that will be deleted during a
+future "simplification".
+
+The general shape: **a fallback path and a correct path that produce the same bytes for
+a given fixture are indistinguishable, and adding more inputs does not help — you have
+to change the fixture so the two paths diverge.** Todo 109's agent found one of these in
+its own work (values planted in the wrong map, passing vacuously); this is the same
+failure with a different mechanism. Mutating your own fix is how you find it; asserting
+harder is not.
+
+## [2026-08-08] Task 111: the resolved base URL is diagnosable data that the CLI throws away
+
+While writing todo 111's failure-path test I asserted the CLI's output still names the
+misspelled variable, because the todo's QA scenario asks for "a diagnosable literal".
+It does not, and the fix is not at fault:
+
+* `ProviderError::transient` (`oc-error/src/provider.rs:115`) attaches the transport
+  error as `#[source]`, and reqwest's own message names the URL. The literal `${VAR}`
+  therefore *is* in the error value.
+* `describe_turn_failure` renders `error.to_string()`, and `Transient`'s
+  `#[error("transient provider failure (status={status:?})")]` does not walk the source
+  chain. The user reads `transient provider failure (status=None)`.
+
+So every connection-level provider failure — wrong host, wrong port, dead gateway, TLS
+refusal, and now an unexpanded placeholder — renders as the same seven words naming
+nothing actionable. This is the same class of defect todo 109 fixed at plan time
+(`unrecoverable provider failure (status=None)` for a missing endpoint) and todo 110
+fixed for auth: a correctly-classified error whose *rendering* discards the one detail
+the user needs. The remaining instance is the transport-level one, and it is one
+source-chain walk in `describe_turn_failure` away from being fixed. Recorded in
+`issues.md`; deliberately not done inside a URL-expansion commit because it changes the
+user-visible text of every provider failure.
+
+## [2026-08-08] Task 111: upstream's `varsLoaders` has no equivalent here, and the order it would occupy matters
+
+`resolveSDK` expands base URLs **twice** (`provider.ts:1698-1717`): first through
+`varsLoaders[model.providerID]`, then from the environment. The loader pass is how
+`azure` injects `AZURE_RESOURCE_NAME` (`:270`), `amazon-bedrock` turns `options.region`
+into `AWS_REGION` (`:364`), `google-vertex` supplies `GOOGLE_VERTEX_{PROJECT,LOCATION,
+ENDPOINT}` (`:521`) and `cloudflare` supplies `CLOUDFLARE_ACCOUNT_ID` (`:760`).
+
+**This workspace has no custom-loader registry at all.** Searched for `CustomLoader`,
+`vars_loader`, `VarsLoader` and each of those variable names: the only `AWS_REGION` hit
+is `oc-provider-bedrock/src/provider.rs:63` reading the ambient process environment for
+its own region default, which is not a vars loader and does not feed URL expansion. The
+`custom_loader` hits are `oc-tools`' unrelated plugin-tool loader.
+
+Only the environment pass was ported. What is worth writing down is the *order* for
+whoever adds a loader registry later: the loader pass runs **first**, so the environment
+wins on any name both supply. Adding a loader after the environment pass would silently
+invert that precedence, and nothing in the current tests would notice because there is
+no loader to conflict with. `expand_variables`' doc comment says so at the call site.

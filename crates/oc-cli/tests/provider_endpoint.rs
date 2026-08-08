@@ -30,6 +30,15 @@
 //! [`endpoint_wins_over_base_url_when_both_are_set`] is the one that needs a decoy: it
 //! points `baseURL` at a port nothing listens on, so the request can only be observed
 //! if `endpoint` was preferred.
+//!
+//! # `${VAR}` expansion, on the same evidence standard
+//!
+//! Todo 111's defect sat one step later: whichever rung won, the URL was dialled
+//! **literally**, so `http://${PROBE_HOST}/v1` was handed to the transport with the
+//! braces still in it. `resolveSDK` expands the chosen rung against the process
+//! environment (`:1712-1715`), and the two tests here that parameterise a host prove
+//! it the only way that matters — the substituted address is a real loopback port and
+//! the mock either saw the request or it did not.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -49,6 +58,13 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Port 1 is privileged and unbound in every environment this suite runs in, so a
 /// request routed here cannot be silently answered by something else.
 const DEAD_ENDPOINT: &str = "http://127.0.0.1:1/v1";
+
+/// The variable the placeholder tests parameterise the gateway's authority with.
+///
+/// Deliberately not an `OPENCODE_*` name: expansion reads the whole resolved
+/// environment, exactly as `resolveSDK` reads `env.all()`, so a test that could only
+/// pass through a name this program already knows would be proving the wrong thing.
+const PROBE_HOST: &str = "PROBE_HOST";
 
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_opencode-rust"))
@@ -104,8 +120,17 @@ fn provider_config(api: Option<&str>, endpoint: Option<&str>, base_url: Option<&
     .to_string()
 }
 
-fn variables(env: &ScriptedEnv, config: String) -> BTreeMap<String, String> {
+fn variables(
+    env: &ScriptedEnv,
+    config: String,
+    extra: &[(&str, &str)],
+) -> BTreeMap<String, String> {
     let mut variables = env.env_vars();
+    variables.extend(
+        extra
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
+    );
     variables.extend([
         ("NO_COLOR".to_owned(), "1".to_owned()),
         ("TERM".to_owned(), "dumb".to_owned()),
@@ -124,12 +149,22 @@ fn variables(env: &ScriptedEnv, config: String) -> BTreeMap<String, String> {
 
 /// Launch the real binary against the real config and wait for it, bounded.
 async fn run_prompt(env: &ScriptedEnv, config: String) -> Output {
+    run_prompt_with(env, config, &[]).await
+}
+
+/// The same launch, with `extra` added to the child's environment.
+///
+/// `env_clear` means a placeholder's variable can only reach the child through this
+/// argument, which is the same route a user's shell export takes: the process
+/// environment `oc_paths::Env::from_process` snapshots. Nothing here injects the value
+/// into the config or into a name the program already reads.
+async fn run_prompt_with(env: &ScriptedEnv, config: String, extra: &[(&str, &str)]) -> Output {
     let mut command = tokio::process::Command::new(binary());
     command
         .args(["run", "--model", "test/test-model", "hello"])
         .current_dir(env.working_dir())
         .env_clear()
-        .envs(variables(env, config));
+        .envs(variables(env, config, extra));
     tokio::time::timeout(RUN_TIMEOUT, command.output())
         .await
         .expect("the run must finish inside its budget")
@@ -231,6 +266,114 @@ async fn a_catalog_supplied_api_url_still_reaches_the_endpoint() {
         describe(&output)
     );
     assert!(output.status.success(), "{}", describe(&output));
+}
+
+/// A `${VAR}` in the catalog's `api.url` is dialled at the substituted authority.
+///
+/// The user-facing shape is a regional gateway written once and pointed at whichever
+/// region the environment names. `PROBE_HOST` carries the mock's real loopback
+/// authority, so the request can only arrive if the placeholder was expanded — an
+/// unexpanded `http://${PROBE_HOST}/v1` has no host a socket can be opened to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_placeholder_in_the_catalog_api_url_reaches_the_substituted_host() {
+    let env = ScriptedEnv::new().expect("isolated environment");
+    let provider = mock().await;
+    let authority = provider.addr().to_string();
+
+    let output = run_prompt_with(
+        &env,
+        provider_config(Some("http://${PROBE_HOST}/v1"), None, None),
+        &[(PROBE_HOST, authority.as_str())],
+    )
+    .await;
+    let captured = provider.captured().await;
+    provider.shutdown().await;
+
+    assert!(
+        !captured.is_empty(),
+        "the server observed no request, so `${{PROBE_HOST}}` in the catalog's \
+         `api.url` was never expanded to `{authority}`\n{}",
+        describe(&output)
+    );
+    assert!(output.status.success(), "{}", describe(&output));
+}
+
+/// The same expansion, arriving by the other route: `provider.<id>.options.baseURL`.
+///
+/// Expansion applies to whichever rung todo 109's ladder chose, not only to the
+/// catalog's. A fix that expanded `model.api.url` alone would pass the test above and
+/// leave the documented configuration shape — endpoint in `options.baseURL` — dialling
+/// braces.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_placeholder_arriving_via_options_base_url_reaches_the_substituted_host() {
+    let env = ScriptedEnv::new().expect("isolated environment");
+    let provider = mock().await;
+    let authority = provider.addr().to_string();
+
+    let output = run_prompt_with(
+        &env,
+        provider_config(None, None, Some("http://${PROBE_HOST}/v1")),
+        &[(PROBE_HOST, authority.as_str())],
+    )
+    .await;
+    let captured = provider.captured().await;
+    provider.shutdown().await;
+
+    assert!(
+        !captured.is_empty(),
+        "the server observed no request, so `${{PROBE_HOST}}` in \
+         `provider.test.options.baseURL` was never expanded to `{authority}`\n{}",
+        describe(&output)
+    );
+    assert!(output.status.success(), "{}", describe(&output));
+}
+
+/// A typo'd variable name reaches no endpoint at all, rather than a wrong one.
+///
+/// The failure half of the todo's QA pair, asserted on the only thing loopback can
+/// prove: the mock is listening on the authority the *correct* spelling would have
+/// produced, and it sees nothing, so the run neither reached the intended gateway by
+/// accident nor collapsed the authority into something that happened to resolve. That
+/// the placeholder is preserved *verbatim* rather than replaced with the empty string is
+/// asserted where the resolved URL is observable, by
+/// `turn_tests::an_unset_variable_keeps_its_placeholder_while_a_set_one_substitutes`; an
+/// unset variable and an empty one both fail to dial, so this layer cannot tell them
+/// apart and does not pretend to.
+///
+/// The literal does travel into the failure — `ProviderError::transient` attaches the
+/// transport error, and reqwest's own message names the URL — but
+/// `describe_turn_failure` renders `error.to_string()` and drops the `#[source]`
+/// chain, so the user reads `transient provider failure (status=None)` and sees neither
+/// the URL nor the misspelled name. That is a pre-existing gap in the CLI's rendering of
+/// *every* transport failure, not something `${VAR}` expansion introduced or can fix
+/// here; see `.omo/notepads/opencode-rust/issues.md`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unset_variable_reaches_no_endpoint_rather_than_a_collapsed_one() {
+    let env = ScriptedEnv::new().expect("isolated environment");
+    let provider = mock().await;
+    let authority = provider.addr().to_string();
+
+    // `PROBE_HOST` is deliberately not exported: the config names it, nothing sets it.
+    let output = run_prompt(
+        &env,
+        provider_config(None, None, Some("http://${PROBE_HOST}/v1")),
+    )
+    .await;
+    let captured = provider.captured().await;
+    provider.shutdown().await;
+
+    assert!(
+        !output.status.success(),
+        "a base URL naming an unset variable cannot be dialled and must not report \
+         success\n{}",
+        describe(&output)
+    );
+    assert!(
+        captured.is_empty(),
+        "the server on `{authority}` observed a request even though nothing set \
+         `PROBE_HOST`, so the unexpanded authority resolved to something\n{}",
+        describe(&output)
+    );
 }
 
 /// No endpoint in either place fails fast and names the key to set.
