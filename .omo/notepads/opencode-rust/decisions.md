@@ -6128,3 +6128,21 @@ of *every* connection-level provider failure — a wrong hostname is equally
 undiagnosable — so fixing it changes user-visible text for every provider failure and
 belongs in its own change. Reported in `issues.md` and on the test; not implemented
 here.
+## [2026-08-08] Task 88 attempt 7: publish the numeric FAIL without retuning the gate
+
+Decision: Task 88 is complete because both frozen formulas now have numeric
+verdicts. G1 passes at 20,040 KiB / 954,240 KiB = 0.021001. G2 fails at
+3,249,508 KiB / 3,026,992 KiB = 1.073511, above the frozen 1,513,496 KiB ceiling.
+Do not reinterpret task completion as product acceptance: G2 remains a blocking
+performance result for downstream release work.
+
+The committed TypeScript baseline remains the formula input, while the paired TS
+runs remain a drift control. We do not substitute the paired 2,951,288 KiB median
+into the ceiling: that would change the already-frozen formula. Both comparisons
+are reported, and paired/committed = 0.974990 shows the same-machine reproduction
+is close enough to support the committed baseline rather than undermine it.
+
+The mutation proof remains `deliberately_inflated_rust_measurements_fail_both_gates`:
+it feeds committed TypeScript median + 1 KiB as Rust data and requires both verdicts
+to fail. No threshold, workload, sample window, repetition count, process-tree rule,
+or frozen perf source was edited after seeing the failure.
