@@ -24,6 +24,7 @@ oc-db = { workspace = true }
 oc-engine = { workspace = true }
 oc-error = { workspace = true }
 oc-llm = { workspace = true }
+oc-memory = { workspace = true }
 oc-lsp = { workspace = true }
 oc-mcp = { workspace = true }
 oc-observability = { workspace = true }

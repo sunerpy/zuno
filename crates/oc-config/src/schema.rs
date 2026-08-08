@@ -98,6 +98,7 @@ pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "enterprise",
     "tool_output",
     "compaction",
+    "memory",
     "experimental",
 ];
 
@@ -213,9 +214,22 @@ pub struct Config {
     /// Context-compaction behaviour.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compaction: Option<CompactionConfig>,
+    /// Persistent resident-memory configuration. Absent defaults to enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryConfig>,
     /// Options under active development.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub experimental: Option<ExperimentalConfig>,
+}
+
+impl Config {
+    /// Resolve the memory master switch and all component defaults.
+    #[must_use]
+    pub fn resolved_memory(&self) -> ResolvedMemoryConfig {
+        self.memory
+            .as_ref()
+            .map_or_else(ResolvedMemoryConfig::default, MemoryConfig::resolved)
+    }
 }
 
 /// Log level (`config/config.ts:27-30`).
@@ -385,6 +399,118 @@ pub struct CompactionConfig {
     /// Token buffer left free so compaction itself cannot overflow.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reserved: Option<u32>,
+}
+
+/// Default characters available to cross-project agent notes.
+pub const DEFAULT_GLOBAL_MEMORY_CHAR_LIMIT: u32 = 2_200;
+
+/// Default characters available to repository-local rules.
+pub const DEFAULT_PROJECT_MEMORY_CHAR_LIMIT: u32 = 3_000;
+
+/// Default delivered-turn interval for background reflection.
+pub const DEFAULT_MEMORY_NUDGE_INTERVAL: u32 = 10;
+
+/// Persistent memory: a master boolean, or component settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MemoryConfig {
+    /// `false` is the strict-parity kill switch; `true` selects all defaults.
+    Enabled(bool),
+    /// Fine-grained settings for an enabled subsystem.
+    Options(MemoryOptions),
+}
+
+impl MemoryConfig {
+    /// Resolve absent fields and make a false master switch dominate every flag.
+    #[must_use]
+    pub fn resolved(&self) -> ResolvedMemoryConfig {
+        match self {
+            Self::Enabled(false) => ResolvedMemoryConfig {
+                enabled: false,
+                resident: false,
+                tool: false,
+                reflection: false,
+                ..ResolvedMemoryConfig::default()
+            },
+            Self::Enabled(true) => ResolvedMemoryConfig::default(),
+            Self::Options(options) => ResolvedMemoryConfig {
+                enabled: true,
+                resident: options.resident.unwrap_or(true),
+                tool: options.tool.unwrap_or(true),
+                reflection: options.reflection.unwrap_or(true),
+                global_char_limit: options
+                    .global_char_limit
+                    .map_or(DEFAULT_GLOBAL_MEMORY_CHAR_LIMIT as usize, |limit| {
+                        limit.get() as usize
+                    }),
+                project_char_limit: options
+                    .project_char_limit
+                    .map_or(DEFAULT_PROJECT_MEMORY_CHAR_LIMIT as usize, |limit| {
+                        limit.get() as usize
+                    }),
+                nudge_interval: options
+                    .nudge_interval
+                    .unwrap_or(DEFAULT_MEMORY_NUDGE_INTERVAL)
+                    as u64,
+            },
+        }
+    }
+}
+
+/// Fine-grained settings under the `memory` top-level key.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct MemoryOptions {
+    /// Inject frozen resident blocks into each session's system prompt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resident: Option<bool>,
+    /// Expose the model-facing `memory` tool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<bool>,
+    /// Run post-response background reflection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reflection: Option<bool>,
+    /// Character cap for global agent notes. Defaults to 2200.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_char_limit: Option<NonZeroU32>,
+    /// Character cap for project rules. Defaults to 3000.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_char_limit: Option<NonZeroU32>,
+    /// Reflect every N delivered turns; zero disables only the periodic trigger.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nudge_interval: Option<u32>,
+}
+
+/// Fully defaulted memory settings consumed by runtime composition roots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedMemoryConfig {
+    /// Whether the master switch is on.
+    pub enabled: bool,
+    /// Whether resident prompt injection is on.
+    pub resident: bool,
+    /// Whether the model-facing tool is on.
+    pub tool: bool,
+    /// Whether background reflection is on.
+    pub reflection: bool,
+    /// Global store cap in Unicode scalar values.
+    pub global_char_limit: usize,
+    /// Project store cap in Unicode scalar values.
+    pub project_char_limit: usize,
+    /// Delivered-turn reflection cadence; zero disables the periodic trigger.
+    pub nudge_interval: u64,
+}
+
+impl Default for ResolvedMemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            resident: true,
+            tool: true,
+            reflection: true,
+            global_char_limit: DEFAULT_GLOBAL_MEMORY_CHAR_LIMIT as usize,
+            project_char_limit: DEFAULT_PROJECT_MEMORY_CHAR_LIMIT as usize,
+            nudge_interval: u64::from(DEFAULT_MEMORY_NUDGE_INTERVAL),
+        }
+    }
 }
 
 /// Options under active development (`config/config.ts:173-188`).

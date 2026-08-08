@@ -1,6 +1,6 @@
 # Divergences
 
-Seven deliberate differences from upstream `opencode` 1.18.13. Each one is a
+Eight deliberate differences from upstream `opencode` 1.18.13. Each one is a
 **decision**, not an omission: a surface that is merely unimplemented is a gap,
 recorded in the compatibility report's `known_gaps` and listed in the
 [compatibility matrix](compatibility-matrix.md), never here.
@@ -62,6 +62,12 @@ each entry's stated reason. Do not edit it by hand.
 **Surface.** provider selection; `oc-provider-compatible` family routing and its diagnostics
 
 **Why.** Upstream bundles 23 SDK factories behind one config surface; SigV4+EventStream, Gemini's wire format and Vertex auth cannot share an OpenAI-compatible request builder, so coverage is stated per wire-protocol family and an id no family claims is named in an error instead of being silently routed through the compatible profile.
+
+### cross-session-resident-memory
+
+**Surface.** system-prompt resident blocks; model-facing `memory` tool; post-response reflection
+
+**Why.** Upstream opencode 1.18.13 has no cross-session memory subsystem; this implementation carries character-capped global notes and project rules into later sessions and can reflect after delivery, so `memory: false` is the single strict-parity switch that removes all three surfaces and preserves the original prompt bytes.
 <!-- generated:END divergence-detail -->
 
 ## What is deliberately not on this page

@@ -167,7 +167,10 @@ where
     R: ReflectionRunner + 'static,
 {
     ReflectionFork::new(
-        ReflectionConfig { turn_interval },
+        ReflectionConfig {
+            enabled: true,
+            turn_interval,
+        },
         runner,
         Arc::new(memory.clone()),
     )

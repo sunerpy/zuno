@@ -74,6 +74,48 @@ fn stub_internals() -> Internals {
     }
 }
 
+#[test]
+fn production_prompt_composition_honours_the_memory_master_switch() {
+    let directory = tempfile::TempDir::new().expect("temporary memory paths");
+    let paths = oc_tools::ScopePaths::at(
+        directory.path().join("global/MEMORY.md"),
+        directory.path().join("project/RULES.md"),
+    );
+    let mut seeded = oc_memory::MemoryStore::open(
+        oc_memory::Scope::Project,
+        paths.for_scope(oc_memory::Scope::Project).to_path_buf(),
+    )
+    .expect("seeded project memory");
+    seeded
+        .apply_batch(&[oc_memory::Operation::add("production composition sentinel")])
+        .expect("seed memory");
+    let base = "SYSTEM\r\n${UNCHANGED}\n终";
+    let resolver = || Resolver {
+        requested_agent: "build".to_owned(),
+        system_prompt: base.to_owned(),
+        max_steps: DEFAULT_MAX_STEPS,
+        requested_provider: "provider".to_owned(),
+        requested_model: "model".to_owned(),
+        wire_model: "model".to_owned(),
+        spec: Spec::new(COMPATIBLE_PROVIDER),
+    };
+
+    let mut disabled = resolver();
+    let config = serde_json::from_str(r#"{"memory":false}"#).expect("disabled config");
+    configure_resident_memory(&mut disabled, &config, paths.clone()).expect("disabled path");
+    assert_eq!(disabled.system_prompt.as_bytes(), base.as_bytes());
+
+    let mut enabled = resolver();
+    configure_resident_memory(&mut enabled, &oc_config::schema::Config::default(), paths)
+        .expect("enabled path");
+    assert!(
+        enabled
+            .system_prompt
+            .contains("production composition sentinel")
+    );
+    assert_ne!(enabled.system_prompt.as_bytes(), base.as_bytes());
+}
+
 /// Two models under one provider, with `title` overridden to the smaller one.
 ///
 /// The provider carries an endpoint in `options.baseURL`. It has to: a provider with no

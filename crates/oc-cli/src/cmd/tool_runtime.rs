@@ -36,15 +36,16 @@ use async_trait::async_trait;
 use oc_catalog::agent;
 use oc_config::schema::Config;
 use oc_error::ToolError;
+use oc_memory::ScopeLimits;
 use oc_paths::Env;
 use oc_permission::Rule;
 use oc_permission::visibility::permission_key;
 use oc_tool::{PermissionAsk, PermissionAsker, Tool, erase};
-use oc_tools::FileTools;
 use oc_tools::exposure::ExposureFlags;
 use oc_tools::registry::{BuiltinSlot, RegistryFlags, ResolveInput, ToolRegistryBuilder};
 use oc_tools::search_common::{SearchScope, SearchTooling};
 use oc_tools::websearch::gating::SearchConfig;
+use oc_tools::{FileTools, MemoryTool, ScopePaths};
 
 /// The executable tools and the ruleset that governs them, for one turn.
 pub(crate) struct ToolRuntime {
@@ -124,8 +125,18 @@ pub(crate) fn assemble(
     }
 
     let registry = builder.build();
-    let tools = registry.resolve(ResolveInput::new(model_id, provider_id, &rules));
+    let mut tools = registry.resolve(ResolveInput::new(model_id, provider_id, &rules));
+    let memory_root = worktree.unwrap_or(directory);
+    if let Some(memory) = configured_memory_tool(memory_root, config) {
+        tools.push(memory);
+    }
     Ok(ToolRuntime { tools, rules })
+}
+
+fn configured_memory_tool(root: &Path, config: &Config) -> Option<Arc<dyn Tool>> {
+    let memory = config.resolved_memory();
+    let limits = ScopeLimits::new(memory.global_char_limit, memory.project_char_limit);
+    MemoryTool::configured(memory.tool, ScopePaths::discover(root), limits).map(erase)
 }
 
 /// The approval collaborator for a surface with no user attached.
@@ -155,4 +166,33 @@ impl PermissionAsker for HeadlessApproval {
 
 fn to_string(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(text: &str) -> Config {
+        Config::from_json_str(Path::new("opencode.json"), text).expect("memory config")
+    }
+
+    #[test]
+    fn memory_tool_is_present_by_default_and_absent_under_master_switch() {
+        let root = Path::new("/tmp/memory-tool-gate");
+        let enabled = configured_memory_tool(root, &Config::default());
+        let disabled = configured_memory_tool(root, &config(r#"{"memory":false}"#));
+
+        assert_eq!(enabled.as_ref().map(|tool| tool.id()), Some("memory"));
+        assert!(disabled.is_none());
+    }
+
+    #[test]
+    fn component_tool_switch_can_disable_only_model_facing_access() {
+        let memory = configured_memory_tool(
+            Path::new("/tmp/memory-tool-component-gate"),
+            &config(r#"{"memory":{"tool":false}}"#),
+        );
+
+        assert!(memory.is_none());
+    }
 }

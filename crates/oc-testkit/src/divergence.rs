@@ -41,7 +41,7 @@ use crate::error::{Result, TestkitError};
 ///
 /// Bumping this without adding an entry — or adding an entry without bumping this
 /// — fails the compatibility suite. That is the point.
-pub const DECLARED_COUNT: usize = 7;
+pub const DECLARED_COUNT: usize = 8;
 
 /// The allow-list's path, relative to the workspace root.
 pub const RELATIVE_PATH: &str = "docs/divergences.toml";

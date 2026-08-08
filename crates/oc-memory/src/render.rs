@@ -80,10 +80,16 @@ fn group_thousands(value: usize) -> String {
 /// The current size of a store holding `entries`.
 #[must_use]
 pub fn usage_of(scope: Scope, entries: &[String]) -> Usage {
+    usage_of_with_limit(scope, entries, scope.cap())
+}
+
+/// The current size of a store under an explicit character budget.
+#[must_use]
+pub fn usage_of_with_limit(scope: Scope, entries: &[String], limit: usize) -> Usage {
     Usage {
         scope,
         current: char_count(&serialize(entries)),
-        limit: scope.cap(),
+        limit,
         entries: entries.len(),
     }
 }
@@ -131,6 +137,12 @@ pub fn parse(raw: &str) -> Vec<String> {
 /// the next session's header, never this one.
 #[must_use]
 pub fn render_block(scope: Scope, entries: &[String]) -> String {
+    render_block_with_limit(scope, entries, scope.cap())
+}
+
+/// Render a block whose header reports an explicit character budget.
+#[must_use]
+pub fn render_block_with_limit(scope: Scope, entries: &[String], limit: usize) -> String {
     if entries.is_empty() {
         return String::new();
     }
@@ -139,7 +151,7 @@ pub fn render_block(scope: Scope, entries: &[String]) -> String {
     let usage = Usage {
         scope,
         current: char_count(&body),
-        limit: scope.cap(),
+        limit,
         entries: entries.len(),
     };
     format!("{rule}\n{} [{usage}]\n{rule}\n{body}", scope.label())

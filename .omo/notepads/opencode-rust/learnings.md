@@ -6032,3 +6032,22 @@ had — it proves nothing new. **M2 is the acceptance scenario: 8th entry AND
 with `divergence-detail is stale` and prints all eight entries. Choosing the
 mutation the *next* task performs, rather than a mutation that trips an existing
 guard, is what made the proof worth the round.
+
+## [2026-08-08] Todo 103: a strict kill-switch test needs a non-empty control
+
+The byte-parity assertion would be vacuous if both memory files were empty: an
+implementation that accidentally opened them would still return the base prompt.
+The integration test therefore seeds a real project entry, proves the enabled path
+changes the prompt, and only then compares `memory: false` with bytes copied from a
+subsystem-absent control. Mutating the disabled path to append one newline was
+caught at the byte-vector comparison.
+
+The same isolation pattern applies to reflection. The disabled test deliberately
+constructs a usable `MemoryTool` underneath `ReflectionFork`; therefore the absence
+of a task handle and runner notification can only be explained by
+`ReflectionConfig.enabled`, not by a missing dependency or an untriggered cadence.
+
+One more reusable boundary: configurable budgets must travel with the opened
+store, not be consulted only during config parsing. Rendering, usage reporting,
+batch validation, and snapshot consistency all need the same resolved limit or the
+prompt header can advertise a value different from the value writes enforce.

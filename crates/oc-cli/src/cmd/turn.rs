@@ -47,6 +47,7 @@ use oc_llm::cache::{DynamicContext, McpToolStatus};
 use oc_llm::catalog::{Catalog, CatalogProvenance, CatalogSource, ResolveInput};
 use oc_llm::event::StreamEvent;
 use oc_llm::registry::{ApiSurface, Provider, ProviderRegistry, Spec};
+use oc_memory::{ScopeLimits, SessionMemory, assemble_system_prompt};
 use oc_provider_compatible::{ReqwestTransport, Transport, factory};
 use oc_tool::PermissionAsker;
 use serde_json::json;
@@ -427,7 +428,7 @@ impl TurnHost {
     /// Returns a message when the database cannot be opened or migrated, when the
     /// session cannot be resolved, or when the tools cannot be assembled.
     pub(crate) fn open(
-        plan: TurnPlan,
+        mut plan: TurnPlan,
         environment: &StartupEnvironment,
         approval: Arc<dyn PermissionAsker>,
     ) -> Result<Self, String> {
@@ -451,6 +452,13 @@ impl TurnHost {
         let now = oc_db::message::now_millis();
         ensure_project(&connection, &plan.project, now)?;
         let session = resolve_session(&mut connection, &plan, now)?;
+
+        let memory_root = worktree.as_deref().unwrap_or(&plan.directory);
+        configure_resident_memory(
+            &mut plan.resolver,
+            &plan.config,
+            oc_tools::ScopePaths::discover(memory_root),
+        )?;
 
         let runtime_tools = super::tool_runtime::assemble(
             &plan.directory,
@@ -585,6 +593,24 @@ impl TurnHost {
             .await
             .map_err(to_string)
     }
+}
+
+fn configure_resident_memory(
+    resolver: &mut Resolver,
+    config: &oc_config::schema::Config,
+    paths: oc_tools::ScopePaths,
+) -> Result<(), String> {
+    let memory = config.resolved_memory();
+    let limits = ScopeLimits::new(memory.global_char_limit, memory.project_char_limit);
+    let session = SessionMemory::open_configured(
+        memory.resident,
+        paths.for_scope(oc_memory::Scope::Global),
+        paths.for_scope(oc_memory::Scope::Project),
+        limits,
+    )
+    .map_err(to_string)?;
+    resolver.system_prompt = assemble_system_prompt(&resolver.system_prompt, session.as_ref());
+    Ok(())
 }
 
 /// Render a failed turn: its category, then every cause it wraps, then what to do.

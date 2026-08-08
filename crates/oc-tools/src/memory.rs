@@ -67,7 +67,7 @@
 
 use async_trait::async_trait;
 use oc_error::ToolError;
-use oc_memory::{MemoryError, MemoryStore, Operation, Scope, Usage};
+use oc_memory::{MemoryError, MemoryStore, Operation, Scope, ScopeLimits, Usage};
 use oc_tool::{ToolContext, ToolOutput, TypedTool};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -409,6 +409,7 @@ impl ConsolidationBreaker {
 #[derive(Debug)]
 pub struct MemoryTool {
     paths: ScopePaths,
+    limits: ScopeLimits,
     breaker: ConsolidationBreaker,
 }
 
@@ -423,10 +424,23 @@ impl MemoryTool {
     /// directory.
     #[must_use]
     pub fn with_paths(paths: ScopePaths) -> Self {
+        Self::with_paths_and_limits(paths, ScopeLimits::default())
+    }
+
+    /// A tool writing explicit locations under explicit character budgets.
+    #[must_use]
+    pub fn with_paths_and_limits(paths: ScopePaths, limits: ScopeLimits) -> Self {
         Self {
             paths,
+            limits,
             breaker: ConsolidationBreaker::default(),
         }
+    }
+
+    /// Construct the model-facing tool only when its configuration enables it.
+    #[must_use]
+    pub fn configured(enabled: bool, paths: ScopePaths, limits: ScopeLimits) -> Option<Self> {
+        enabled.then(|| Self::with_paths_and_limits(paths, limits))
     }
 
     /// Clear a session's consolidation-failure streak at a turn boundary.
@@ -441,7 +455,11 @@ impl MemoryTool {
 
     /// Open the store for `scope`, mapping a load failure into a refusal response.
     fn open(&self, scope: Scope) -> Result<MemoryStore, MemoryError> {
-        MemoryStore::open(scope, self.paths.for_scope(scope).to_path_buf())
+        MemoryStore::open_with_limit(
+            scope,
+            self.paths.for_scope(scope).to_path_buf(),
+            self.limits.for_scope(scope),
+        )
     }
 }
 

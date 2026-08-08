@@ -6318,3 +6318,31 @@ value that matters here, and prone to redacting a user's prose); asserting the v
 value exists).
 
 No dependency added; `cargo metadata --locked --offline` clean.
+
+## [2026-08-08] Todo 103 — one master switch dominates three memory surfaces
+
+**Decision.** `memory: false` resolves `resident`, `tool`, and `reflection` to
+false before any composition root acts. Resident construction returns `None`
+without filesystem access, tool assembly omits the schema entirely, and
+`ReflectionFork` checks `enabled` before incrementing cadence state or creating a
+Tokio task. This is the only strict-parity mode; component flags remain available
+for users who accept the divergence but want one surface disabled.
+
+**Defaults and cost.** Memory remains enabled by default with 2,200 global and
+3,000 project Unicode scalar values, so two non-empty scopes can add up to 5,200
+stored characters plus rendered headers to each session-frozen prompt. Reflection
+runs every 10 delivered turns by default. The compatibility matrix derives these
+numbers from code and states the prompt-size cost explicitly.
+
+**Composition boundary.** `TurnHost::open` owns production resident-prompt
+composition and `tool_runtime::assemble` owns model-facing tool registration. The
+repository contains no production `ReflectionRunner` implementation or reusable
+CLI reflection composition root; Todo 103 therefore proves the complete public
+cross-crate loop in `oc-memory/tests/integration.rs` and adds only the pre-spawn
+configuration gate to Todo 101's fork. Inventing a second provider loop here would
+duplicate the foreground turn loop and exceed this task's integration boundary.
+
+**Declared divergence.** Cross-session resident memory is divergence 8 because
+upstream 1.18.13 has no corresponding subsystem. The declaration, count, generated
+detail/index, config table, negative-learning list, and no-embedding/no-external-
+service statement are all code-derived or test-guarded.

@@ -2471,6 +2471,7 @@ dependencies = [
  "oc-llm",
  "oc-lsp",
  "oc-mcp",
+ "oc-memory",
  "oc-observability",
  "oc-paths",
  "oc-permission",
@@ -2663,14 +2664,19 @@ dependencies = [
 name = "oc-memory"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "futures",
+ "oc-agent",
  "oc-config",
  "oc-db",
  "oc-engine",
  "oc-error",
  "oc-llm",
  "oc-paths",
+ "oc-tool",
+ "oc-tools",
  "regex",
+ "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.19",

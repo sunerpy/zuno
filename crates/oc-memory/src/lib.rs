@@ -77,12 +77,15 @@ pub mod store;
 pub mod threat;
 
 pub use crate::error::{DriftReason, MemoryError};
-pub use crate::render::{Usage, parse, render_block, serialize, usage_of};
+pub use crate::render::{
+    Usage, parse, render_block, render_block_with_limit, serialize, usage_of, usage_of_with_limit,
+};
 pub use crate::scope::{
-    ENTRY_DELIMITER, GLOBAL_FILE, MEMORY_DIRECTORY, PROJECT_FILE, Scope, char_count,
+    ENTRY_DELIMITER, GLOBAL_FILE, MEMORY_DIRECTORY, PROJECT_FILE, Scope, ScopeLimits, char_count,
 };
 pub use crate::snapshot::{
-    CacheConsistency, EXTERNAL_MEMORY_NOTE, ScopeEnablement, SessionMemory, fence_external_context,
+    CacheConsistency, EXTERNAL_MEMORY_NOTE, ScopeEnablement, SessionMemory, assemble_system_prompt,
+    fence_external_context,
 };
 pub use crate::store::{MemoryStore, Operation};
 pub use crate::threat::{Threat, first_threat, scan_for_threats};
