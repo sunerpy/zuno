@@ -7,7 +7,11 @@
 //! error rather than an assumption that a hostname is local.
 
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
@@ -16,13 +20,55 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
 use oc_db::session_prune::SessionPruneProgress;
-use oc_engine::r#loop::TurnEvent;
+use oc_engine::interrupt::InterruptSignal;
+use oc_engine::r#loop::{TurnEvent, TurnEventSender};
 use oc_engine::status::SessionRunRegistry;
 use tokio::net::{TcpListener, lookup_host};
 
 use crate::auth::WWW_AUTHENTICATE_VALUE;
 use crate::discovery::{self, LocalServerRegistration};
 use crate::{AuthConfig, EventFanout};
+
+pub type SessionMutationFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'static>>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionModelSelection {
+    pub provider_id: String,
+    pub model_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionPromptExecution {
+    pub session_id: String,
+    pub directory: PathBuf,
+    pub message_id: String,
+    pub prompt: String,
+    pub agent: Option<String>,
+    pub model: Option<SessionModelSelection>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionCompactExecution {
+    pub session_id: String,
+    pub directory: PathBuf,
+    pub agent: Option<String>,
+    pub model: Option<SessionModelSelection>,
+}
+
+pub trait SessionMutationExecutor: Send + Sync + std::fmt::Debug {
+    fn prompt(
+        &self,
+        request: SessionPromptExecution,
+        interrupt: InterruptSignal,
+        events: TurnEventSender,
+    ) -> SessionMutationFuture;
+
+    fn compact(
+        &self,
+        request: SessionCompactExecution,
+        interrupt: InterruptSignal,
+    ) -> SessionMutationFuture;
+}
 
 /// Bind, middleware, and fan-out settings.
 #[derive(Clone, Debug)]
@@ -108,6 +154,7 @@ pub struct ServerServices {
     pub events: EventFanout<TurnEvent>,
     /// Bounded destination for session-maintenance progress.
     pub maintenance_events: EventFanout<SessionPruneProgress>,
+    pub mutations: Option<Arc<dyn SessionMutationExecutor>>,
 }
 
 impl ServerServices {
@@ -118,7 +165,14 @@ impl ServerServices {
             runs: SessionRunRegistry::new(),
             events: EventFanout::with_capacity(event_capacity),
             maintenance_events: EventFanout::with_capacity(event_capacity),
+            mutations: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_mutations(mut self, mutations: Arc<dyn SessionMutationExecutor>) -> Self {
+        self.mutations = Some(mutations);
+        self
     }
 }
 

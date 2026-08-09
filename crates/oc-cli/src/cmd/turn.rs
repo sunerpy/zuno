@@ -40,7 +40,8 @@ use oc_engine::r#loop::{
     TurnError, TurnEvent, TurnEventSender, run_turn,
 };
 use oc_engine::prelude::{
-    InternalAgent, InternalProviders, Internals, PreludeContext, PreludeOutcome, run_prelude,
+    InternalAgent, InternalProviders, Internals, PreludeContext, PreludeOutcome, compact_manually,
+    run_prelude,
 };
 use oc_error::ProviderError;
 use oc_llm::cache::{DynamicContext, McpToolStatus};
@@ -428,9 +429,18 @@ impl TurnHost {
     /// Returns a message when the database cannot be opened or migrated, when the
     /// session cannot be resolved, or when the tools cannot be assembled.
     pub(crate) fn open(
+        plan: TurnPlan,
+        environment: &StartupEnvironment,
+        approval: Arc<dyn PermissionAsker>,
+    ) -> Result<Self, String> {
+        Self::open_with_interrupt(plan, environment, approval, InterruptSignal::new())
+    }
+
+    pub(crate) fn open_with_interrupt(
         mut plan: TurnPlan,
         environment: &StartupEnvironment,
         approval: Arc<dyn PermissionAsker>,
+        interrupt: InterruptSignal,
     ) -> Result<Self, String> {
         let env = environment.resolved();
         let worktree = plan
@@ -469,12 +479,11 @@ impl TurnHost {
             &plan.provider_id,
             &plan.model_id,
         )?;
-        let interrupt = InterruptSignal::new();
         let dispatcher = ToolRegistryDispatcher::new(
             runtime_tools.tools,
             runtime_tools.rules,
             approval,
-            InterruptSignal::new(),
+            interrupt.clone(),
             McpToolStatus::Ready,
         );
         Ok(Self {
@@ -535,17 +544,29 @@ impl TurnHost {
         prompt: &str,
         events: TurnEventSender,
     ) -> Result<(), String> {
+        self.drive_with_message_id(prompt, None, events).await
+    }
+
+    pub(crate) async fn drive_with_message_id(
+        &mut self,
+        prompt: &str,
+        message_id: Option<&str>,
+        events: TurnEventSender,
+    ) -> Result<(), String> {
         let latest = oc_db::message::MessageStore::new(&self.connection)
             .latest_time_created(&self.session_id)
             .map_err(to_string)?;
         persist_user_message(
             &self.connection,
-            &self.session_id,
-            &self.agent,
-            &self.provider_id,
-            &self.model_id,
-            prompt,
-            oc_db::message::created_after(oc_db::message::now_millis(), latest),
+            UserMessageInput {
+                session_id: &self.session_id,
+                agent: &self.agent,
+                provider_id: &self.provider_id,
+                model_id: &self.model_id,
+                text: prompt,
+                message_id,
+                now: oc_db::message::created_after(oc_db::message::now_millis(), latest),
+            },
         )?;
         let outcome = self.run_prelude().await?;
         report_prelude(&events, &self.notes, &outcome).await?;
@@ -567,6 +588,22 @@ impl TurnHost {
         .await
         .map_err(|error| describe_turn_failure(&error, self.credential.as_deref()))?;
         Ok(())
+    }
+
+    pub(crate) async fn compact(&mut self) -> Result<(), String> {
+        let providers = RegistryProviders(&self.providers);
+        let mut context = PreludeContext {
+            connection: &mut self.connection,
+            providers: &providers,
+            internals: &self.internals,
+            compaction: &self.compaction_config,
+            window: self.window,
+            state: &mut self.compaction_state,
+        };
+        compact_manually(&self.session_id, &mut context)
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("manual compaction failed: {error:?}"))
     }
 
     /// Run every internal that applies before this turn.
@@ -1181,39 +1218,48 @@ fn resolve_session(
     Ok(creation.into_session())
 }
 
+struct UserMessageInput<'a> {
+    session_id: &'a str,
+    agent: &'a str,
+    provider_id: &'a str,
+    model_id: &'a str,
+    text: &'a str,
+    message_id: Option<&'a str>,
+    now: i64,
+}
+
 fn persist_user_message(
     connection: &rusqlite::Connection,
-    session_id: &str,
-    agent: &str,
-    provider_id: &str,
-    model_id: &str,
-    text: &str,
-    now: i64,
+    input: UserMessageInput<'_>,
 ) -> Result<(), String> {
-    let message_id = prefixed_id("msg");
+    let message_id = input
+        .message_id
+        .map_or_else(|| prefixed_id("msg"), str::to_owned);
     let message = oc_db::message::MessageRecord::from_json(json!({
         "id": message_id,
-        "sessionID": session_id,
+        "sessionID": input.session_id,
         "role": "user",
-        "time": {"created": now},
-        "agent": agent,
-        "model": {"providerID": provider_id, "modelID": model_id}
+        "time": {"created": input.now},
+        "agent": input.agent,
+        "model": {"providerID": input.provider_id, "modelID": input.model_id}
     }))
     .map_err(to_string)?;
     let part = oc_db::message::PartRecord::from_json(
         json!({
             "id": prefixed_id("prt"),
-            "sessionID": session_id,
+            "sessionID": input.session_id,
             "messageID": message.id,
             "type": "text",
-            "text": text
+            "text": input.text
         }),
-        now,
+        input.now,
     )
     .map_err(to_string)?;
     let store = oc_db::message::MessageStore::new(connection);
-    store.put_message_at(&message, now).map_err(to_string)?;
-    store.put_part_at(&part, now).map_err(to_string)?;
+    store
+        .put_message_at(&message, input.now)
+        .map_err(to_string)?;
+    store.put_part_at(&part, input.now).map_err(to_string)?;
     Ok(())
 }
 

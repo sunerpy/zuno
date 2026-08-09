@@ -405,6 +405,133 @@ fn touch_of_a_missing_session_reports_not_found_rather_than_succeeding() {
 }
 
 #[test]
+fn session_mutation_fields_and_revert_commit_are_atomic() {
+    let pool = pool();
+    {
+        let connection = pool.get().expect("check out a connection");
+        insert_project(&connection, "prj_a", WORKTREE, None);
+    }
+    let store = Store::new(&pool);
+    store
+        .create(&draft("ses_a", "prj_a", WORKTREE, "root").at(1_000))
+        .expect("create");
+    {
+        let connection = pool.get().expect("check out a connection");
+        for (index, id) in ["msg_1", "msg_2", "msg_3"].iter().enumerate() {
+            let seq = i64::try_from(index + 1).expect("small sequence");
+            connection
+                .execute(
+                    "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+                     VALUES (?1, 'ses_a', ?2, ?2, '{\"role\":\"user\"}')",
+                    rusqlite::params![id, seq],
+                )
+                .expect("insert legacy message");
+            insert_session_message(&connection, id, "ses_a", seq);
+            insert_session_input(&connection, &format!("input_{seq}"), "ses_a", seq);
+        }
+        insert_context_epoch(&connection, "ses_a");
+    }
+
+    store
+        .switch_agent_at("ses_a", "msg_agent", "explore", 2_000)
+        .expect("set agent");
+    let model = session::model_reference("provider", "model");
+    store
+        .switch_model_at("ses_a", "msg_model", &model, 3_000)
+        .expect("set model");
+    store
+        .clear_revert_at("ses_a", 3_500)
+        .expect("clearing an unstaged revert is a no-op");
+    assert_eq!(
+        store.get("ses_a").expect("session").time_updated,
+        3_000,
+        "an unstaged clear must not make the session observably newer"
+    );
+
+    let revert = r#"{"messageID":"msg_2"}"#;
+    store
+        .stage_revert_at("ses_a", "msg_2", revert, 4_000)
+        .expect("stage revert");
+    assert_eq!(
+        store.get("ses_a").expect("session").revert.as_deref(),
+        Some(revert)
+    );
+    assert!(
+        store
+            .commit_revert_at("ses_a", 5_000)
+            .expect("commit revert")
+    );
+
+    let connection = pool.get().expect("check out a connection");
+    assert_eq!(
+        count_for(
+            &connection,
+            "SELECT count(*) FROM message WHERE session_id = ?1",
+            "ses_a"
+        ),
+        2
+    );
+    assert_eq!(
+        count_for(
+            &connection,
+            "SELECT count(*) FROM session_message WHERE session_id = ?1",
+            "ses_a"
+        ),
+        2
+    );
+    assert_eq!(
+        count_for(
+            &connection,
+            "SELECT count(*) FROM session_input WHERE session_id = ?1",
+            "ses_a"
+        ),
+        2
+    );
+    assert_eq!(
+        count_for(
+            &connection,
+            "SELECT count(*) FROM session_context_epoch WHERE session_id = ?1",
+            "ses_a"
+        ),
+        0
+    );
+    drop(connection);
+    let session = store.get("ses_a").expect("session");
+    assert_eq!(session.agent.as_deref(), Some("explore"));
+    assert_eq!(session.model.as_deref(), Some(model.as_str()));
+    assert_eq!(session.revert, None);
+    assert_eq!(session.time_updated, 5_000);
+    assert!(
+        !store
+            .commit_revert_at("ses_a", 6_000)
+            .expect("guarded no-op")
+    );
+}
+
+#[test]
+fn staging_revert_requires_a_real_boundary_message() {
+    let pool = pool();
+    {
+        let connection = pool.get().expect("check out a connection");
+        insert_project(&connection, "prj_a", WORKTREE, None);
+    }
+    let store = Store::new(&pool);
+    store
+        .create(&draft("ses_a", "prj_a", WORKTREE, "root"))
+        .expect("create");
+    let error = store
+        .stage_revert_at(
+            "ses_a",
+            "msg_missing",
+            r#"{"messageID":"msg_missing"}"#,
+            2_000,
+        )
+        .expect_err("missing boundary must fail");
+    assert!(matches!(error, DbError::NotFound { ref table, .. } if table == "message"));
+    assert_eq!(store.get("ses_a").expect("session").revert, None);
+}
+
+#[test]
 fn session_path_matches_the_oracles_relative_computation() {
     assert_eq!(
         session_path(Path::new(WORKTREE), Path::new("/srv/app/pkg/core")),

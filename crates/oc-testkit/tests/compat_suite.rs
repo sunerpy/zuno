@@ -140,7 +140,7 @@ const SURFACES: &[SurfaceRow] = &[
         verdict: Verdict::PartiallyCompared,
         oracle: OracleKind::LiveBinary,
         evidence: "crates/oc-testkit/tests/compat_suite.rs::api_behaviour_matrix_compares_live_status_body_and_side_effects",
-        detail: "58 of 58 upstream operations are invoked against both processes with status, normalized body, and side-effect delta captured; 17 operations are exact live differentials — todo 122's five including both SSE streams, plus todo 127's twelve read-only catalogue and filesystem operations — and todo 128's ten session-read, request and PTY-attach operations compare status and normalized body; 23 missing local backends remain explicit 503 gaps and 8 backed operations carry visible cross-process fixture exemptions; 2 C8 operations are added",
+        detail: "58 of 58 upstream operations are invoked against both processes with status, normalized body, and side-effect delta captured; 17 operations are exact live differentials — todo 122's five including both SSE streams, plus todo 127's twelve read-only catalogue and filesystem operations — while todos 128 and 129 compare status and normalized body for nineteen more operations; 14 missing local backends remain explicit 503 gaps and 8 backed operations carry visible cross-process fixture exemptions; 2 C8 operations are added",
     },
     SurfaceRow {
         id: "config-merge",
@@ -926,6 +926,21 @@ fn api_behaviour_matrix(document: &serde_json::Value) -> Vec<ApiBehaviourRow> {
         ("/api/pty/{ptyID}/connect-token", "post"),
         ("/api/pty/{ptyID}/connect", "get"),
     ]);
+    // `/compact` and `/wait` are deliberately absent. The isolated oracle answers 503
+    // for both in this fixture -- each needs a provider-backed run the harness does not
+    // give it -- so a Compared status dimension would assert against the oracle's own
+    // gap rather than against upstream behaviour. Our 204s are covered by the dedicated
+    // server and CLI tests instead. Claiming a comparison the fixture cannot support is
+    // exactly the "honest gap reported as parity" defect the Final Wave rejected.
+    let task_129_compared = BTreeSet::from([
+        ("/api/session/{sessionID}/prompt", "post"),
+        ("/api/session/{sessionID}/interrupt", "post"),
+        ("/api/session/{sessionID}/agent", "post"),
+        ("/api/session/{sessionID}/model", "post"),
+        ("/api/session/{sessionID}/revert/stage", "post"),
+        ("/api/session/{sessionID}/revert/clear", "post"),
+        ("/api/session/{sessionID}/revert/commit", "post"),
+    ]);
     let mut rows = Vec::new();
     for (path, item) in document["paths"]
         .as_object()
@@ -986,6 +1001,16 @@ fn api_behaviour_matrix(document: &serde_json::Value) -> Vec<ApiBehaviourRow> {
                         "process-local request and PTY state is verified by dedicated oc-server API tests",
                     ),
                 )
+            } else if task_129_compared.contains(&key) {
+                (
+                    ApiDimension::Compared("live status against the isolated upstream process"),
+                    ApiDimension::Compared(
+                        "live operation-scoped normalized body against the isolated upstream process",
+                    ),
+                    ApiDimension::Exempt(
+                        "turn execution, cancellation, waiting, and durable mutation are verified by dedicated server and CLI tests",
+                    ),
+                )
             } else {
                 let reason = api_exemption_reason(path, method, &group);
                 (
@@ -1009,6 +1034,9 @@ fn api_behaviour_matrix(document: &serde_json::Value) -> Vec<ApiBehaviourRow> {
 }
 
 fn api_exemption_reason(path: &str, method: &str, group: &str) -> &'static str {
+    if (path, method) == ("/api/session/{sessionID}/compact", "post") {
+        return "the isolated upstream oracle returns 503 without a provider, so its unavailable path cannot prove compaction status or side-effect parity";
+    }
     match group {
         "integrations" => {
             "requires provider credentials, OAuth callbacks, or an attempt identity that cannot be shared between isolated processes"
@@ -1054,6 +1082,28 @@ struct SubjectServer {
     task: tokio::task::JoinHandle<()>,
 }
 
+#[derive(Debug)]
+struct MatrixMutationExecutor;
+
+impl oc_server::SessionMutationExecutor for MatrixMutationExecutor {
+    fn prompt(
+        &self,
+        _request: oc_server::SessionPromptExecution,
+        _interrupt: oc_engine::interrupt::InterruptSignal,
+        _events: oc_engine::r#loop::TurnEventSender,
+    ) -> oc_server::SessionMutationFuture {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn compact(
+        &self,
+        _request: oc_server::SessionCompactExecution,
+        _interrupt: oc_engine::interrupt::InterruptSignal,
+    ) -> oc_server::SessionMutationFuture {
+        Box::pin(async { Ok(()) })
+    }
+}
+
 impl Drop for SubjectServer {
     fn drop(&mut self) {
         self.task.abort();
@@ -1064,28 +1114,6 @@ async fn start_subject_server(root: &Path) -> SubjectServer {
     let event_pool =
         Arc::new(oc_db::Pool::open(&oc_paths::DbLocation::Memory).expect("subject event database"));
     let events = oc_server::EventService::new(Arc::clone(&event_pool), 8);
-    let created =
-        serde_json::Map::from_iter([("sessionID".to_owned(), serde_json::json!("ses_matrix"))]);
-    events
-        .publish(
-            "ses_matrix",
-            oc_server::NewEvent::new("session.created", created).expect("created event"),
-        )
-        .await
-        .expect("publish sequence zero");
-    let switched = serde_json::Map::from_iter([
-        ("timestamp".to_owned(), serde_json::json!(1)),
-        ("sessionID".to_owned(), serde_json::json!("ses_matrix")),
-        ("messageID".to_owned(), serde_json::json!("msg_matrix")),
-        ("agent".to_owned(), serde_json::json!("plan")),
-    ]);
-    events
-        .publish(
-            "ses_matrix",
-            oc_server::NewEvent::new("session.next.agent.switched", switched).expect("agent event"),
-        )
-        .await
-        .expect("publish sequence one");
     let work = matrix_worktree(root);
     let state = oc_server::api::ApiState::memory(work.to_string_lossy())
         .expect("subject API state")
@@ -1095,6 +1123,9 @@ async fn start_subject_server(root: &Path) -> SubjectServer {
         oc_server::ServerConfig::default()
             .with_port(0)
             .with_default_directory(work.to_string_lossy()),
+    )
+    .with_services(
+        oc_server::ServerServices::new(8).with_mutations(Arc::new(MatrixMutationExecutor)),
     )
     .with_routes(oc_server::api::router(state).merge(oc_server::events_router(events)))
     .bind()
@@ -1362,7 +1393,17 @@ fn concrete_api_path(path: &str) -> String {
 
 fn api_request_body(row: &ApiBehaviourRow) -> Option<&'static str> {
     match (row.method.as_str(), row.path.as_str()) {
-        ("post", "/api/session") => Some(r#"{"id":"ses_matrix_created"}"#),
+        ("post", "/api/session") => Some(r#"{"id":"ses_matrix"}"#),
+        ("post", "/api/session/{sessionID}/agent") => Some(r#"{"agent":"plan"}"#),
+        ("post", "/api/session/{sessionID}/model") => {
+            Some(r#"{"model":{"providerID":"deepseek","id":"deepseek-chat"}}"#)
+        }
+        ("post", "/api/session/{sessionID}/prompt") => Some(
+            r#"{"id":"msg_matrix_prompt","prompt":{"text":"matrix","files":[],"agents":[]},"delivery":"steer","resume":false}"#,
+        ),
+        ("post", "/api/session/{sessionID}/revert/stage") => {
+            Some(r#"{"messageID":"msg_matrix","files":false}"#)
+        }
         ("post", "/api/pty") => Some(r#"{"command":"/definitely/not-an-executable"}"#),
         ("post" | "put" | "patch", _) => Some("{}"),
         _ => None,
@@ -1381,7 +1422,7 @@ fn normalize_http_body(body: &str, sse: bool) -> serde_json::Value {
     }
 }
 
-fn normalize_task_128_body(
+fn normalize_scoped_api_body(
     row: &ApiBehaviourRow,
     status: u16,
     body: &str,
@@ -1401,7 +1442,19 @@ fn normalize_task_128_body(
             | ("post", "/api/pty/{ptyID}/connect-token")
             | ("get", "/api/pty/{ptyID}/connect")
     );
-    if !task_128 {
+    let task_129 = matches!(
+        (row.method.as_str(), row.path.as_str()),
+        ("post", "/api/session/{sessionID}/prompt")
+            | ("post", "/api/session/{sessionID}/compact")
+            | ("post", "/api/session/{sessionID}/wait")
+            | ("post", "/api/session/{sessionID}/interrupt")
+            | ("post", "/api/session/{sessionID}/agent")
+            | ("post", "/api/session/{sessionID}/model")
+            | ("post", "/api/session/{sessionID}/revert/stage")
+            | ("post", "/api/session/{sessionID}/revert/clear")
+            | ("post", "/api/session/{sessionID}/revert/commit")
+    );
+    if !task_128 && !task_129 {
         return value;
     }
     if status >= 400 {
@@ -1412,16 +1465,86 @@ fn normalize_task_128_body(
         });
     }
     if let Some(object) = value.as_object_mut() {
-        object.remove("location");
-        if row.path == "/api/pty/{ptyID}/connect-token"
+        if task_128 {
+            object.remove("location");
+        }
+        if task_128
+            && row.path == "/api/pty/{ptyID}/connect-token"
             && let Some(data) = object
                 .get_mut("data")
                 .and_then(serde_json::Value::as_object_mut)
         {
             data.remove("ticket");
         }
+        if task_128
+            && matches!(
+                row.path.as_str(),
+                "/api/session/{sessionID}/context" | "/api/session/{sessionID}/message"
+            )
+        {
+            let has_switch_message = object
+                .get_mut("data")
+                .and_then(serde_json::Value::as_array_mut)
+                .is_some_and(|messages| normalize_switch_messages(messages));
+            if has_switch_message && row.path == "/api/session/{sessionID}/message" {
+                object.remove("cursor");
+            }
+        }
+        if task_128
+            && row.path == "/api/session/{sessionID}/history"
+            && let Some(events) = object
+                .get_mut("data")
+                .and_then(serde_json::Value::as_array_mut)
+        {
+            for event in events {
+                if matches!(
+                    event.get("type").and_then(serde_json::Value::as_str),
+                    Some("session.next.agent.switched" | "session.next.model.switched")
+                ) && let Some(event) = event.as_object_mut()
+                {
+                    event.remove("id");
+                    if let Some(data) = event
+                        .get_mut("data")
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        data.remove("timestamp");
+                        data.remove("messageID");
+                    }
+                }
+            }
+        }
+        if task_129
+            && row.path == "/api/session/{sessionID}/prompt"
+            && let Some(data) = object
+                .get_mut("data")
+                .and_then(serde_json::Value::as_object_mut)
+        {
+            data.remove("admittedSeq");
+            data.remove("timeCreated");
+        }
     }
     value
+}
+
+fn normalize_switch_messages(messages: &mut [serde_json::Value]) -> bool {
+    let mut found = false;
+    for message in messages {
+        if matches!(
+            message.get("type").and_then(serde_json::Value::as_str),
+            Some("agent-switched" | "model-switched")
+        ) && let Some(message) = message.as_object_mut()
+        {
+            found = true;
+            message.remove("id");
+            if let Some(time) = message
+                .get_mut("time")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                time.remove("created");
+            }
+        }
+    }
+    found
 }
 
 async fn observable_api_state(addr: SocketAddr) -> serde_json::Value {
@@ -1532,7 +1655,7 @@ async fn observe_api_operation(
     ApiObservation {
         status: response.0,
         normalized_body: normalize_state_paths(
-            normalize_task_128_body(row, response.0, &response.1, sse),
+            normalize_scoped_api_body(row, response.0, &response.1, sse),
             root,
         ),
         side_effect: serde_json::json!({"changed": before != after}),
@@ -1676,13 +1799,12 @@ fn api_behaviour_matrix_accounts_for_status_body_and_side_effect_per_operation()
         }
     }
     assert_eq!(
-        compared, 71,
-        "twenty-seven live operations are compared: todo 122's five and todo 127's twelve compare all three \
-         dimensions, and todo 128's ten compare status and normalized body"
+        compared, 85,
+        "thirty-four live operations are compared: todo 122's five and todo 127's twelve compare all three dimensions, while todo 128's ten and todo 129's seven compare status and normalized body -- /compact and /wait are exempt because the isolated oracle answers 503 for both"
     );
     assert_eq!(
-        exempted, 103,
-        "every other dimension must carry a visible reason; todo 127 removed thirty-six exemptions"
+        exempted, 89,
+        "every other dimension must carry a visible reason, including all three compact dimensions"
     );
 }
 
@@ -1698,10 +1820,25 @@ async fn api_behaviour_matrix_invokes_every_subject_operation_and_rejects_501() 
     let subject = start_subject_server(subject_root.path()).await;
     let mut invoked = BTreeSet::new();
     let mut unavailable = 0;
+    let mut task_129_unavailable = 0;
     for row in &matrix {
         let observation = observe_api_operation(subject.addr, row, subject_root.path()).await;
         assert_subject_operation_is_accounted(row, &observation);
         unavailable += usize::from(observation.status == 503);
+        if matches!(
+            row.path.as_str(),
+            "/api/session/{sessionID}/prompt"
+                | "/api/session/{sessionID}/compact"
+                | "/api/session/{sessionID}/wait"
+                | "/api/session/{sessionID}/interrupt"
+                | "/api/session/{sessionID}/agent"
+                | "/api/session/{sessionID}/model"
+                | "/api/session/{sessionID}/revert/stage"
+                | "/api/session/{sessionID}/revert/clear"
+                | "/api/session/{sessionID}/revert/commit"
+        ) {
+            task_129_unavailable += usize::from(observation.status == 503);
+        }
         assert!(
             invoked.insert((row.path.clone(), row.method.clone())),
             "matrix invoked an operation twice"
@@ -1713,14 +1850,17 @@ async fn api_behaviour_matrix_invokes_every_subject_operation_and_rejects_501() 
         "every upstream operation must run"
     );
     assert_eq!(
-        unavailable, 23,
-        "the explicit API gap inventory drifted; todos 127 and 128 backed twenty-two of the forty-five, \
-         leaving the nine session-mutating operations todo 129 owns"
+        task_129_unavailable, 0,
+        "none of todo 129's nine session-mutating operations may remain backend-unavailable"
+    );
+    assert_eq!(
+        unavailable, 14,
+        "the explicit API gap inventory drifted; todo 129 removes its nine backend-unavailable routes"
     );
     assert_eq!(
         invoked.len() - unavailable,
-        35,
-        "backed operation count drifted; 58 upstream operations minus the 23 remaining 503 gaps"
+        44,
+        "backed operation count drifted; 58 upstream operations minus the 14 remaining 503 gaps"
     );
 }
 
@@ -2538,8 +2678,8 @@ fn known_gaps() -> Vec<KnownGap> {
     vec![
         KnownGap {
             id: "api-backends-unavailable".to_owned(),
-            surface: "33 of the 58 upstream /api operations".to_owned(),
-            detail: "Every upstream operation is invoked against both processes and its status, normalized body, and observable session/PTY state delta are captured. Twenty-five operations have local backends and seventeen of those are compared exactly against the released binary; the other 33 return an operation-specific 503 backend_unavailable response and are never counted as parity. The matrix rejects any 501 before applying a differential exemption. This remains a compatibility gap, not a declared behavioral difference."
+            surface: "14 of the 58 upstream /api operations".to_owned(),
+            detail: "Every upstream operation is invoked against both processes and its status, normalized body, and observable session/PTY state delta are captured. Forty-four operations have local backends; 17 compare all dimensions and 19 more compare status and normalized body. The remaining 14 return an operation-specific 503 backend_unavailable response and are never counted as parity. The matrix rejects any 501 before applying a differential exemption. This remains a compatibility gap, not a declared behavioral difference."
                 .to_owned(),
         },
         KnownGap {

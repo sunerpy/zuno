@@ -17,6 +17,10 @@ pub enum ApiError {
     Forbidden,
     #[error("backend unavailable for {0}")]
     BackendUnavailable(String),
+    #[error("{0}")]
+    Conflict(String),
+    #[error("{0}")]
+    MutationFailed(String),
     /// A filesystem path left the session directory.
     ///
     /// Upstream turns this into an opaque `500 UnknownError` with a random ref
@@ -132,6 +136,12 @@ impl IntoResponse for ApiError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "backend_unavailable",
                 format!("backend unavailable for {operation}"),
+            ),
+            Self::Conflict(message) => (StatusCode::CONFLICT, "conflict", message),
+            Self::MutationFailed(message) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "mutation_failed",
+                message,
             ),
             Self::Database(DbError::NotFound { table, id }) => (
                 StatusCode::NOT_FOUND,

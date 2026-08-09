@@ -113,7 +113,8 @@ impl Store {
         let mut statement = connection
             .prepare(
                 "SELECT id, seq, type, data FROM event \
-                 WHERE aggregate_id = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3",
+                 WHERE aggregate_id = ?1 AND seq > ?2 AND type NOT LIKE 'session.created.%' \
+                 ORDER BY seq ASC LIMIT ?3",
             )
             .map_err(open::map_error)?;
         let rows = statement

@@ -71,6 +71,33 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/session/{sessionID}/history", get(session::history))
         .route("/api/session/{sessionID}/message", get(session::messages))
         .route(
+            "/api/session/{sessionID}/agent",
+            post(session::switch_agent),
+        )
+        .route(
+            "/api/session/{sessionID}/model",
+            post(session::switch_model),
+        )
+        .route("/api/session/{sessionID}/prompt", post(session::prompt))
+        .route("/api/session/{sessionID}/compact", post(session::compact))
+        .route("/api/session/{sessionID}/wait", post(session::wait))
+        .route(
+            "/api/session/{sessionID}/revert/stage",
+            post(session::revert_stage),
+        )
+        .route(
+            "/api/session/{sessionID}/revert/clear",
+            post(session::revert_clear),
+        )
+        .route(
+            "/api/session/{sessionID}/revert/commit",
+            post(session::revert_commit),
+        )
+        .route(
+            "/api/session/{sessionID}/interrupt",
+            post(session::interrupt),
+        )
+        .route(
             "/api/session/{sessionID}/question",
             get(request::session_questions),
         )
@@ -160,15 +187,6 @@ fn unsupported_routes() -> Router<ApiState> {
             "/api/session/{sessionID}/question/{requestID}/reject",
             post(unsupported),
         )
-        .route("/api/session/{sessionID}/agent", post(unsupported))
-        .route("/api/session/{sessionID}/model", post(unsupported))
-        .route("/api/session/{sessionID}/prompt", post(unsupported))
-        .route("/api/session/{sessionID}/compact", post(unsupported))
-        .route("/api/session/{sessionID}/wait", post(unsupported))
-        .route("/api/session/{sessionID}/revert/stage", post(unsupported))
-        .route("/api/session/{sessionID}/revert/clear", post(unsupported))
-        .route("/api/session/{sessionID}/revert/commit", post(unsupported))
-        .route("/api/session/{sessionID}/interrupt", post(unsupported))
         .route(
             "/api/session/{sessionID}/message/{messageID}",
             get(unsupported),

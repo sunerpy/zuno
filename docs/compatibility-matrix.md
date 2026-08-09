@@ -119,7 +119,7 @@ through the real router and recording which explicitly answer
 
 **58 of the 58 upstream operations are registered**, plus **2 operations added**
 for session retention (the declared `c8-maintenance-endpoints` divergence).
-Thirty-five have local backends; **23 explicit 503 backend gaps** name the missing
+Forty-four have local backends; **14 explicit 503 backend gaps** name the missing
 capability and remain reported as gaps rather than compatibility.
 
 The two SSE operations are implemented: `GET /api/event` immediately emits
@@ -174,27 +174,27 @@ scope-bound, and are never included in error responses.
 | GET | `/api/session/prune` | added |
 | POST | `/api/session/prune` | added |
 | GET | `/api/session/{sessionID}` | implemented |
-| POST | `/api/session/{sessionID}/agent` | explicit gap (503 backend unavailable) |
-| POST | `/api/session/{sessionID}/compact` | explicit gap (503 backend unavailable) |
+| POST | `/api/session/{sessionID}/agent` | implemented |
+| POST | `/api/session/{sessionID}/compact` | implemented |
 | GET | `/api/session/{sessionID}/context` | implemented |
 | GET | `/api/session/{sessionID}/event` | implemented |
 | GET | `/api/session/{sessionID}/history` | implemented |
-| POST | `/api/session/{sessionID}/interrupt` | explicit gap (503 backend unavailable) |
+| POST | `/api/session/{sessionID}/interrupt` | implemented |
 | GET | `/api/session/{sessionID}/message` | implemented |
 | GET | `/api/session/{sessionID}/message/{messageID}` | explicit gap (503 backend unavailable) |
-| POST | `/api/session/{sessionID}/model` | explicit gap (503 backend unavailable) |
+| POST | `/api/session/{sessionID}/model` | implemented |
 | GET | `/api/session/{sessionID}/permission` | explicit gap (503 backend unavailable) |
 | POST | `/api/session/{sessionID}/permission` | explicit gap (503 backend unavailable) |
 | GET | `/api/session/{sessionID}/permission/{requestID}` | explicit gap (503 backend unavailable) |
 | POST | `/api/session/{sessionID}/permission/{requestID}/reply` | explicit gap (503 backend unavailable) |
-| POST | `/api/session/{sessionID}/prompt` | explicit gap (503 backend unavailable) |
+| POST | `/api/session/{sessionID}/prompt` | implemented |
 | GET | `/api/session/{sessionID}/question` | implemented |
 | POST | `/api/session/{sessionID}/question/{requestID}/reject` | explicit gap (503 backend unavailable) |
 | POST | `/api/session/{sessionID}/question/{requestID}/reply` | explicit gap (503 backend unavailable) |
-| POST | `/api/session/{sessionID}/revert/clear` | explicit gap (503 backend unavailable) |
-| POST | `/api/session/{sessionID}/revert/commit` | explicit gap (503 backend unavailable) |
-| POST | `/api/session/{sessionID}/revert/stage` | explicit gap (503 backend unavailable) |
-| POST | `/api/session/{sessionID}/wait` | explicit gap (503 backend unavailable) |
+| POST | `/api/session/{sessionID}/revert/clear` | implemented |
+| POST | `/api/session/{sessionID}/revert/commit` | implemented |
+| POST | `/api/session/{sessionID}/revert/stage` | implemented |
+| POST | `/api/session/{sessionID}/wait` | implemented |
 | GET | `/api/skill` | implemented |
 <!-- generated:END api-operations -->
 

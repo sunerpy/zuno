@@ -78,12 +78,15 @@ pub struct TokenWindow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionTrigger {
     /// Proactive compaction after measured usage crosses the configured window.
-    Threshold { used_tokens: u64 },
+    Threshold {
+        used_tokens: u64,
+    },
     /// Reactive compaction after a typed provider context-limit failure.
     ContextLimit {
         used_tokens: Option<u64>,
         limit_tokens: Option<u64>,
     },
+    Manual,
 }
 
 /// Fully resolved compaction settings for one model window.
@@ -137,6 +140,7 @@ impl CompactionPolicy {
                 self.context_enabled && self.auto && used_tokens >= self.usable_tokens
             }
             CompactionTrigger::ContextLimit { .. } => true,
+            CompactionTrigger::Manual => true,
         }
     }
 }

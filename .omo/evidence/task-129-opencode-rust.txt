@@ -1,0 +1,111 @@
+Task 129 — session-mutating API operations and real HTTP turns
+Verified: 2026-08-09
+
+IMPLEMENTED OPERATIONS
+
+  POST /api/session/{sessionID}/prompt
+  POST /api/session/{sessionID}/compact
+  POST /api/session/{sessionID}/wait
+  POST /api/session/{sessionID}/interrupt
+  POST /api/session/{sessionID}/agent
+  POST /api/session/{sessionID}/model
+  POST /api/session/{sessionID}/revert/stage
+  POST /api/session/{sessionID}/revert/clear
+  POST /api/session/{sessionID}/revert/commit
+
+SHARED TURN AND COMPACTION PATHS
+
+`oc-server` owns the `SessionMutationExecutor` boundary. The production `serve`
+composition root injects an executor implemented with `TurnPlan` and `TurnHost`.
+HTTP prompt execution calls `TurnHost::drive_with_message_id`, which persists the
+user message and invokes the existing `oc_engine::loop::run_turn`; no turn logic is
+copied into the server. HTTP compaction calls `TurnHost::compact`, which reaches
+`compact_manually` and the existing `run_compaction` implementation.
+
+Prompt execution holds one `SessionRunGuard`, passes that guard's exact interrupt
+signal into the production turn host, and forwards the bounded engine event channel
+through `EventFanout`. The guard is released only when both execution and event
+forwarding finish.
+
+WAIT AND INTERRUPT
+
+`SessionRunRegistry::wait_until_idle` uses `tokio::sync::Notify` with a
+register-before-recheck loop, so it neither busy-polls nor loses a completion that
+races registration. Guard drop notifies waiters. `/interrupt` fires the same live
+guard signal that `run_turn` selects against while reading the provider stream.
+
+The production-binary regression test starts a provider that sends HTTP/SSE headers
+and then leaves its body open. It proves `/wait` remains pending while the turn is
+active, `/interrupt` releases it, and persistence contains exactly one user row and
+one completed assistant abort checkpoint. The assistant points to the real user row,
+has `AbortError` plus `time.completed`, has no invented partial part, and the database
+contains zero orphan parts.
+
+CLI / HTTP ENTRY-POINT EQUIVALENCE
+
+`crates/oc-cli/tests/session_mutation.rs` launches the real `opencode-rust run` and
+`opencode-rust serve` binaries against two isolated databases containing the same
+fixed session. Both entry points consume the same recorded
+`openai-chat/streams-text` cassette. The test asserts:
+
+  * both entry points produce the same assistant text;
+  * the CLI stdout equals the persisted assistant text;
+  * normalized session, message, and part semantics are identical; and
+  * each entry point issues exactly one real provider request.
+
+AGENT, MODEL, AND REVERT GUARDS
+
+Agent, model, revert stage, revert clear, and revert commit all require an idle
+session. Agent/model selection is persisted with the session update timestamp.
+Revert stage validates that its boundary message exists and stores the marker;
+clear removes it; commit atomically truncates legacy and projected history plus
+context/input state after the staged boundary. Commit without a staged marker is an
+idempotent 204 no-op rather than an unguarded destructive action.
+
+DIFFERENTIAL MATRIX
+
+All nine operations were removed from `unsupported_routes()`. The compatibility
+matrix now compares their status and operation-normalized body. Its dedicated
+`task_129_unavailable` assertion is zero. The complete upstream inventory remains
+58 operations: 44 have local backends and 14 explicitly remain
+`503 backend_unavailable` outside Todo 129. A 501 still fails accounting and a 503
+is never accepted as parity.
+
+FINAL VALIDATION
+
+The following final worktree-local chain exited 0:
+
+  cargo fmt --all -- --check
+  OC_MEMORY_GATE_MODE=skip cargo test -p oc-cli --test session_mutation
+  OC_MEMORY_GATE_MODE=skip cargo test -p oc-db --test session \
+    session_mutation_fields_and_revert_commit_are_atomic -- --exact
+  OC_MEMORY_GATE_MODE=skip cargo test -p oc-server --test api \
+    api_prompt_wait_and_interrupt_share_one_live_turn_signal -- --exact
+  OC_MEMORY_GATE_MODE=skip cargo test -p oc-server --test api \
+    api_agent_model_compact_and_revert_mutations_are_guarded_and_persisted -- --exact
+  OC_MEMORY_GATE_MODE=skip cargo test -p oc-testkit --test compat_suite \
+    api_behaviour_matrix_invokes_every_subject_operation_and_rejects_501 \
+    -- --exact --nocapture
+  cargo clippy -p oc-server -p oc-cli -p oc-testkit --tests -- -D warnings
+  cargo build --workspace
+
+Results:
+
+  * both real-binary session-mutation tests passed;
+  * the atomic DB mutation regression passed;
+  * both server mutation/lifecycle regressions passed;
+  * the 58-operation matrix passed with Todo 129 unavailable count zero;
+  * Clippy passed with warnings denied;
+  * the complete workspace build passed; and
+  * rustfmt check passed with zero output.
+
+The MCP `lsp_diagnostics` endpoint is rooted at the main checkout and rejected the
+sibling `t129` worktree path. Worktree-local `rust-analyzer diagnostics .` completed
+without errors; it reported only existing `#[cfg]` inactive-code weak warnings.
+`cargo check -p oc-server -p oc-cli -p oc-testkit --tests` also passed.
+
+The multi-hour G1/G2 measurement was not rerun because this task environment
+explicitly forbids the approximately 100-minute memory gate and two-hour soak.
+The HTTP path reuses the measured `run_turn` and `run_compaction` implementations
+rather than introducing a second retained-history or response-buffer path; all
+permitted build, lint, compatibility, and real-entry validation is recorded above.
