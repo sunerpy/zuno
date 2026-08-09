@@ -119,8 +119,9 @@ through the real router and recording which explicitly answer
 
 **58 of the 58 upstream operations are registered**, plus **2 operations added**
 for session retention (the declared `c8-maintenance-endpoints` divergence).
-Thirteen have local backends; **45 explicit 503 backend gaps** name the missing
-capability and remain reported as gaps rather than compatibility.
+Twenty-five have local backends and seventeen of those are compared exactly against
+the released binary; **33 explicit 503 backend gaps** name the missing capability and
+remain reported as gaps rather than compatibility.
 
 The two SSE operations are implemented: `GET /api/event` immediately emits
 `server.connected`, while `GET /api/session/{sessionID}/event` replays durable
@@ -131,29 +132,29 @@ body, and observable side-effect delta, and rejects a `501` before any exemption
 <!-- generated:BEGIN api-operations -->
 | method | path | state |
 |---|---|---|
-| GET | `/api/agent` | explicit gap (503 backend unavailable) |
-| GET | `/api/command` | explicit gap (503 backend unavailable) |
+| GET | `/api/agent` | implemented |
+| GET | `/api/command` | implemented |
 | DELETE | `/api/credential/{credentialID}` | explicit gap (503 backend unavailable) |
 | PATCH | `/api/credential/{credentialID}` | explicit gap (503 backend unavailable) |
 | GET | `/api/event` | implemented |
-| GET | `/api/fs/find` | explicit gap (503 backend unavailable) |
-| GET | `/api/fs/list` | explicit gap (503 backend unavailable) |
-| GET | `/api/fs/read/*` | explicit gap (503 backend unavailable) |
+| GET | `/api/fs/find` | implemented |
+| GET | `/api/fs/list` | implemented |
+| GET | `/api/fs/read/*` | implemented |
 | GET | `/api/health` | implemented |
-| GET | `/api/integration` | explicit gap (503 backend unavailable) |
+| GET | `/api/integration` | implemented |
 | DELETE | `/api/integration/attempt/{attemptID}` | explicit gap (503 backend unavailable) |
 | GET | `/api/integration/attempt/{attemptID}` | explicit gap (503 backend unavailable) |
 | POST | `/api/integration/attempt/{attemptID}/complete` | explicit gap (503 backend unavailable) |
-| GET | `/api/integration/{integrationID}` | explicit gap (503 backend unavailable) |
+| GET | `/api/integration/{integrationID}` | implemented |
 | POST | `/api/integration/{integrationID}/connect/key` | explicit gap (503 backend unavailable) |
 | POST | `/api/integration/{integrationID}/connect/oauth` | explicit gap (503 backend unavailable) |
 | GET | `/api/location` | implemented |
-| GET | `/api/model` | explicit gap (503 backend unavailable) |
+| GET | `/api/model` | implemented |
 | GET | `/api/permission/request` | explicit gap (503 backend unavailable) |
 | GET | `/api/permission/saved` | explicit gap (503 backend unavailable) |
 | DELETE | `/api/permission/saved/{id}` | explicit gap (503 backend unavailable) |
-| GET | `/api/provider` | explicit gap (503 backend unavailable) |
-| GET | `/api/provider/{providerID}` | explicit gap (503 backend unavailable) |
+| GET | `/api/provider` | implemented |
+| GET | `/api/provider/{providerID}` | implemented |
 | GET | `/api/pty` | implemented |
 | POST | `/api/pty` | implemented |
 | DELETE | `/api/pty/{ptyID}` | implemented |
@@ -162,7 +163,7 @@ body, and observable side-effect delta, and rejects a `501` before any exemption
 | GET | `/api/pty/{ptyID}/connect` | explicit gap (503 backend unavailable) |
 | POST | `/api/pty/{ptyID}/connect-token` | explicit gap (503 backend unavailable) |
 | GET | `/api/question/request` | explicit gap (503 backend unavailable) |
-| GET | `/api/reference` | explicit gap (503 backend unavailable) |
+| GET | `/api/reference` | implemented |
 | GET | `/api/session` | implemented |
 | POST | `/api/session` | implemented |
 | GET | `/api/session/active` | implemented |
@@ -190,7 +191,7 @@ body, and observable side-effect delta, and rejects a `501` before any exemption
 | POST | `/api/session/{sessionID}/revert/commit` | explicit gap (503 backend unavailable) |
 | POST | `/api/session/{sessionID}/revert/stage` | explicit gap (503 backend unavailable) |
 | POST | `/api/session/{sessionID}/wait` | explicit gap (503 backend unavailable) |
-| GET | `/api/skill` | explicit gap (503 backend unavailable) |
+| GET | `/api/skill` | implemented |
 <!-- generated:END api-operations -->
 
 ## v1 plugin compatibility routes
