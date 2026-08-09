@@ -75,6 +75,25 @@ done
 echo
 echo "=== gate ==="
 
+# Wave 45: I resolved a code conflict with a script that only understood
+# append-only prose, then ran `git add -A && git commit` anyway -- so a file with
+# `<<<<<<<` markers landed on main. Nothing in the gate noticed, because a
+# conflict marker inside a Rust file is a *parse* error only if that file is
+# compiled, and the file in question was a test helper.
+#
+# This check runs before anything expensive and refuses to proceed while a marker
+# exists anywhere in the tree, staged or not.
+note "no conflict markers anywhere"
+marked=$(grep -rlE '^(<{7}|={7}|>{7})( |$)' \
+  --include='*.rs' --include='*.toml' --include='*.md' --include='*.json' \
+  --include='*.sh' --include='*.yml' --include='*.yaml' \
+  crates docs .omo Cargo.toml 2>/dev/null || true)
+if [ -n "$marked" ]; then
+  printf '%s\n' "$marked" | sed 's/^/    /'
+  die "conflict markers present -- resolve them before the gate runs, and never blind-commit a merge"
+fi
+ok "no conflict markers"
+
 # Order matters: metadata --locked first, because a broken lock makes every
 # later failure look like a code problem. `cargo build` would silently repair it.
 note "cargo metadata --locked --offline"
