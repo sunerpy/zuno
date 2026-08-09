@@ -41,7 +41,9 @@ pub(super) fn execute(args: &ServeArgs) -> Result<(), String> {
             .with_port(args.port)
             .with_auth(auth)
             .with_default_directory(&directory);
-        let state = ApiState::open_default(&directory).map_err(|error| error.to_string())?;
+        let state = ApiState::open_default(&directory)
+            .map_err(|error| error.to_string())?
+            .with_events(events.clone());
         let server = ServerBuilder::new(config)
             .with_routes(
                 api::router(state)

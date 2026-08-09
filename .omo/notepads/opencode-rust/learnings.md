@@ -6051,3 +6051,20 @@ One more reusable boundary: configurable budgets must travel with the opened
 store, not be consulted only during config parsing. Rendering, usage reporting,
 batch validation, and snapshot consistency all need the same resolved limit or the
 prompt header can advertise a value different from the value writes enforce.
+
+## [2026-08-09] Todo 118: a compatibility matrix needs dispositions, not just rows
+
+A complete path list can prove only that a client will not get 404. It cannot tell
+an implementation, a 501 stub, and a deliberately visible backend gap apart. The
+reusable shape is one executable row per operation with independently reviewable
+status, normalized body, and side-effect dimensions. Hard cases may be exempt, but
+the exemption must be attached to the row and the operation must still be invoked.
+
+The strongest negative assertion runs before exemptions: reject 501 first. If an
+exemption is consulted first, adding a stub to a hard operation can make a matrix
+green without adding any capability — exactly the failure this todo closed.
+
+For streaming APIs, route registration and content type are also insufficient.
+The smallest non-vacuous test must observe one semantic frame and one event caused
+through the public mutation path. Sharing the EventService at the composition root
+is what makes that second assertion test the product rather than a private fixture.

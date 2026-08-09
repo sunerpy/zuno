@@ -7,6 +7,8 @@ mod state;
 
 use axum::Json;
 use axum::Router;
+use axum::extract::MatchedPath;
+use axum::http::Method;
 use axum::routing::{delete, get, patch, post};
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -77,8 +79,8 @@ async fn location(
     })
 }
 
-async fn unsupported() -> error::ApiError {
-    error::ApiError::NotImplemented("operation is registered but its backend is not available")
+async fn unsupported(method: Method, path: MatchedPath) -> error::ApiError {
+    error::ApiError::BackendUnavailable(format!("{} {}", method.as_str(), path.as_str()))
 }
 
 fn unsupported_routes() -> Router<ApiState> {

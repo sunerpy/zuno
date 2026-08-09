@@ -6346,3 +6346,24 @@ duplicate the foreground turn loop and exceed this task's integration boundary.
 upstream 1.18.13 has no corresponding subsystem. The declaration, count, generated
 detail/index, config table, negative-learning list, and no-embedding/no-external-
 service statement are all code-derived or test-guarded.
+
+## [2026-08-09] Todo 118 — serve both SSE operations; keep unavailable backends explicit
+
+**Decision.** Serve `GET /api/event` and
+`GET /api/session/{sessionID}/event` through the existing EventService rather than
+declare a divergence. The global stream emits `server.connected` then shared live
+events. The session stream replays durable events after `?after=<sequence>`, filters
+the legacy creation row, and continues live. ApiState and every composition root
+share the same service so a successful session mutation is observable.
+
+**Compatibility claim.** Registration is inventory, never parity. The matrix has
+one row per 58 upstream operations and one disposition per status/body/side-effect
+dimension. Five deterministic operations compare exactly. Every other observation
+is still executed against both processes but names its fixture exemption; 45 local
+responses are explicit `503 backend_unavailable` gaps, not implementations. A 501
+is rejected before either equality or exemption can be considered.
+
+**Normalization boundary.** Only independently generated SSE id, timestamp, and
+messageID are removed. Event type, durable aggregate/sequence/version, stable data,
+HTTP status and observable side effect remain in the comparison. Widening this
+normalizer requires a new visible per-operation reason.

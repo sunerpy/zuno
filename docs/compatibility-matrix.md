@@ -1,12 +1,12 @@
 # Compatibility matrix
 
 Every surface this port claims, and its state against upstream `opencode`
-1.18.13. Four states are used throughout:
+1.18.13. Five states are used throughout:
 
 - **implemented** — registered and backed by a handler that does the work.
-- **registered (501 stub)** — the path and method exist so a client binds, but
-  the handler answers `501 Not Implemented`. A route in this state is a
-  compatibility seam, not a capability.
+- **explicit gap (503 backend unavailable)** — the path and method exist, but
+  the operation-specific response names the unavailable backend. It remains a
+  compatibility gap and is never counted as parity; a `501` fails the matrix.
 - **diverged / added** — present here and deliberately different from, or absent
   in, upstream. Every one is an entry in [divergences.md](divergences.md).
 - **rejected** — registered so that invoking it produces a migration message
@@ -110,84 +110,83 @@ as identifiers for the work that owns a surface, not as anything a user needs.
 Derived by set-differencing the document `oc_server::api::openapi()` serves
 against the committed capture of the 1.18.12 release's document
 (`.omo/fixtures/oracle-openapi-1.18.12.json`), then probing each served route
-through the real router and recording which answer `501`.
+through the real router and recording which explicitly answer
+`503 backend_unavailable`. Any `501` fails the gate.
 
-**56 of the 58 upstream operations are served**, plus **2 operations added** for
-session retention (the declared `c8-maintenance-endpoints` divergence). Of the
-served set, **45 registered as a 501 stub**: the path and method exist so an SDK
-binds and does not 404, but no handler does the work yet. Read the stub count as
-the honest size of the remaining work, not as coverage.
+**58 of the 58 upstream operations are registered**, plus **2 operations added**
+for session retention (the declared `c8-maintenance-endpoints` divergence).
+Thirteen have local backends; **45 explicit 503 backend gaps** name the missing
+capability and remain reported as gaps rather than compatibility.
 
-The two absent operations are both SSE event streams — `GET /api/event` and
-`GET /api/session/{sessionID}/event`. An equivalent stream is served at `/event`,
-so the capability exists while the upstream paths do not. That is a gap, and
-`crates/oc-testkit/tests/compat_suite.rs::api_operations_are_a_superset_of_upstream_minus_the_two_known_gaps`
-asserts the absent set is *exactly* those two, so a third absence fails rather
-than quietly widening the exemption.
+The two SSE operations are implemented: `GET /api/event` immediately emits
+`server.connected`, while `GET /api/session/{sessionID}/event` replays durable
+events after `?after=<sequence>` and continues live. The differential matrix
+invokes all 58 operations against both binaries, captures status, normalized
+body, and observable side-effect delta, and rejects a `501` before any exemption.
 
 <!-- generated:BEGIN api-operations -->
 | method | path | state |
 |---|---|---|
-| GET | `/api/agent` | registered (501 stub) |
-| GET | `/api/command` | registered (501 stub) |
-| DELETE | `/api/credential/{credentialID}` | registered (501 stub) |
-| PATCH | `/api/credential/{credentialID}` | registered (501 stub) |
-| GET | `/api/event` | not-registered |
-| GET | `/api/fs/find` | registered (501 stub) |
-| GET | `/api/fs/list` | registered (501 stub) |
-| GET | `/api/fs/read/*` | registered (501 stub) |
+| GET | `/api/agent` | explicit gap (503 backend unavailable) |
+| GET | `/api/command` | explicit gap (503 backend unavailable) |
+| DELETE | `/api/credential/{credentialID}` | explicit gap (503 backend unavailable) |
+| PATCH | `/api/credential/{credentialID}` | explicit gap (503 backend unavailable) |
+| GET | `/api/event` | implemented |
+| GET | `/api/fs/find` | explicit gap (503 backend unavailable) |
+| GET | `/api/fs/list` | explicit gap (503 backend unavailable) |
+| GET | `/api/fs/read/*` | explicit gap (503 backend unavailable) |
 | GET | `/api/health` | implemented |
-| GET | `/api/integration` | registered (501 stub) |
-| DELETE | `/api/integration/attempt/{attemptID}` | registered (501 stub) |
-| GET | `/api/integration/attempt/{attemptID}` | registered (501 stub) |
-| POST | `/api/integration/attempt/{attemptID}/complete` | registered (501 stub) |
-| GET | `/api/integration/{integrationID}` | registered (501 stub) |
-| POST | `/api/integration/{integrationID}/connect/key` | registered (501 stub) |
-| POST | `/api/integration/{integrationID}/connect/oauth` | registered (501 stub) |
+| GET | `/api/integration` | explicit gap (503 backend unavailable) |
+| DELETE | `/api/integration/attempt/{attemptID}` | explicit gap (503 backend unavailable) |
+| GET | `/api/integration/attempt/{attemptID}` | explicit gap (503 backend unavailable) |
+| POST | `/api/integration/attempt/{attemptID}/complete` | explicit gap (503 backend unavailable) |
+| GET | `/api/integration/{integrationID}` | explicit gap (503 backend unavailable) |
+| POST | `/api/integration/{integrationID}/connect/key` | explicit gap (503 backend unavailable) |
+| POST | `/api/integration/{integrationID}/connect/oauth` | explicit gap (503 backend unavailable) |
 | GET | `/api/location` | implemented |
-| GET | `/api/model` | registered (501 stub) |
-| GET | `/api/permission/request` | registered (501 stub) |
-| GET | `/api/permission/saved` | registered (501 stub) |
-| DELETE | `/api/permission/saved/{id}` | registered (501 stub) |
-| GET | `/api/provider` | registered (501 stub) |
-| GET | `/api/provider/{providerID}` | registered (501 stub) |
+| GET | `/api/model` | explicit gap (503 backend unavailable) |
+| GET | `/api/permission/request` | explicit gap (503 backend unavailable) |
+| GET | `/api/permission/saved` | explicit gap (503 backend unavailable) |
+| DELETE | `/api/permission/saved/{id}` | explicit gap (503 backend unavailable) |
+| GET | `/api/provider` | explicit gap (503 backend unavailable) |
+| GET | `/api/provider/{providerID}` | explicit gap (503 backend unavailable) |
 | GET | `/api/pty` | implemented |
 | POST | `/api/pty` | implemented |
 | DELETE | `/api/pty/{ptyID}` | implemented |
 | GET | `/api/pty/{ptyID}` | implemented |
 | PUT | `/api/pty/{ptyID}` | implemented |
-| GET | `/api/pty/{ptyID}/connect` | registered (501 stub) |
-| POST | `/api/pty/{ptyID}/connect-token` | registered (501 stub) |
-| GET | `/api/question/request` | registered (501 stub) |
-| GET | `/api/reference` | registered (501 stub) |
+| GET | `/api/pty/{ptyID}/connect` | explicit gap (503 backend unavailable) |
+| POST | `/api/pty/{ptyID}/connect-token` | explicit gap (503 backend unavailable) |
+| GET | `/api/question/request` | explicit gap (503 backend unavailable) |
+| GET | `/api/reference` | explicit gap (503 backend unavailable) |
 | GET | `/api/session` | implemented |
 | POST | `/api/session` | implemented |
 | GET | `/api/session/active` | implemented |
 | GET | `/api/session/prune` | added |
 | POST | `/api/session/prune` | added |
 | GET | `/api/session/{sessionID}` | implemented |
-| POST | `/api/session/{sessionID}/agent` | registered (501 stub) |
-| POST | `/api/session/{sessionID}/compact` | registered (501 stub) |
-| GET | `/api/session/{sessionID}/context` | registered (501 stub) |
-| GET | `/api/session/{sessionID}/event` | not-registered |
-| GET | `/api/session/{sessionID}/history` | registered (501 stub) |
-| POST | `/api/session/{sessionID}/interrupt` | registered (501 stub) |
-| GET | `/api/session/{sessionID}/message` | registered (501 stub) |
-| GET | `/api/session/{sessionID}/message/{messageID}` | registered (501 stub) |
-| POST | `/api/session/{sessionID}/model` | registered (501 stub) |
-| GET | `/api/session/{sessionID}/permission` | registered (501 stub) |
-| POST | `/api/session/{sessionID}/permission` | registered (501 stub) |
-| GET | `/api/session/{sessionID}/permission/{requestID}` | registered (501 stub) |
-| POST | `/api/session/{sessionID}/permission/{requestID}/reply` | registered (501 stub) |
-| POST | `/api/session/{sessionID}/prompt` | registered (501 stub) |
-| GET | `/api/session/{sessionID}/question` | registered (501 stub) |
-| POST | `/api/session/{sessionID}/question/{requestID}/reject` | registered (501 stub) |
-| POST | `/api/session/{sessionID}/question/{requestID}/reply` | registered (501 stub) |
-| POST | `/api/session/{sessionID}/revert/clear` | registered (501 stub) |
-| POST | `/api/session/{sessionID}/revert/commit` | registered (501 stub) |
-| POST | `/api/session/{sessionID}/revert/stage` | registered (501 stub) |
-| POST | `/api/session/{sessionID}/wait` | registered (501 stub) |
-| GET | `/api/skill` | registered (501 stub) |
+| POST | `/api/session/{sessionID}/agent` | explicit gap (503 backend unavailable) |
+| POST | `/api/session/{sessionID}/compact` | explicit gap (503 backend unavailable) |
+| GET | `/api/session/{sessionID}/context` | explicit gap (503 backend unavailable) |
+| GET | `/api/session/{sessionID}/event` | implemented |
+| GET | `/api/session/{sessionID}/history` | explicit gap (503 backend unavailable) |
+| POST | `/api/session/{sessionID}/interrupt` | explicit gap (503 backend unavailable) |
+| GET | `/api/session/{sessionID}/message` | explicit gap (503 backend unavailable) |
+| GET | `/api/session/{sessionID}/message/{messageID}` | explicit gap (503 backend unavailable) |
+| POST | `/api/session/{sessionID}/model` | explicit gap (503 backend unavailable) |
+| GET | `/api/session/{sessionID}/permission` | explicit gap (503 backend unavailable) |
+| POST | `/api/session/{sessionID}/permission` | explicit gap (503 backend unavailable) |
+| GET | `/api/session/{sessionID}/permission/{requestID}` | explicit gap (503 backend unavailable) |
+| POST | `/api/session/{sessionID}/permission/{requestID}/reply` | explicit gap (503 backend unavailable) |
+| POST | `/api/session/{sessionID}/prompt` | explicit gap (503 backend unavailable) |
+| GET | `/api/session/{sessionID}/question` | explicit gap (503 backend unavailable) |
+| POST | `/api/session/{sessionID}/question/{requestID}/reject` | explicit gap (503 backend unavailable) |
+| POST | `/api/session/{sessionID}/question/{requestID}/reply` | explicit gap (503 backend unavailable) |
+| POST | `/api/session/{sessionID}/revert/clear` | explicit gap (503 backend unavailable) |
+| POST | `/api/session/{sessionID}/revert/commit` | explicit gap (503 backend unavailable) |
+| POST | `/api/session/{sessionID}/revert/stage` | explicit gap (503 backend unavailable) |
+| POST | `/api/session/{sessionID}/wait` | explicit gap (503 backend unavailable) |
+| GET | `/api/skill` | explicit gap (503 backend unavailable) |
 <!-- generated:END api-operations -->
 
 ## v1 plugin compatibility routes

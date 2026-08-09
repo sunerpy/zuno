@@ -6118,3 +6118,20 @@ diagnostics passed. Evidence: `.omo/evidence/task-120-opencode-rust.txt`.
 - The new real-PTY read test failed before the fix after five seconds with output exactly `"hello\r\n"`; after the handoff it exits successfully and includes `READ:hello`. The terminal Ctrl-C test failed before the fix with `"READY\r\n^C"` and guard status 1; after the fix the foreground payload receives SIGINT, prints `INTERRUPTED`, and preserves its trap exit status 42.
 - `process-wrap` remains pinned at `=9.0.1`. On Windows, observing top-level exit now explicitly calls `start_kill()` on the Job Object and then `wait()`, terminating and waiting for any live descendants before returning the saved top-level status. A `cfg(windows)` natural-parent-exit/live-grandchild test was added. This Linux machine did not execute that test; no Windows runtime pass is claimed.
 - Post-fix G6 targeted reaping passed both clean shutdown and parent `SIGKILL` (2/2), with the existing assertions observing no owned PID left behind. Full offline workspace tests, zero-warning clippy, fmt check, and locked offline metadata all passed. The sibling-worktree path was rejected by the `lsp_diagnostics` MCP root guard; `rust-analyzer diagnostics . --severity warning` ran in `t121` and returned clean instead.
+## [2026-08-09] Todo 118 closeout — remaining API gaps are now explicit, not stubs
+
+The two SSE operations from final-wave finding #4 are served and behaviour-tested;
+the upstream operation set is now 58/58. This does **not** mean 58/58 behavioural
+parity: only 13 operations have local backends, five deterministic operations are
+exact live differentials, and 45 operations explicitly return
+`503 backend_unavailable`. The matrix invokes every operation against both
+processes and records a reason on all three dimensions for each non-exact row.
+
+Remaining work is capability implementation for those 45 explicit backend gaps and
+better deterministic cross-process fixtures for eight backed-but-exempt operations.
+They are deliberately visible in the generated compatibility matrix and in
+`.omo/evidence/task-118-opencode-rust.txt`; no 501 or route-only claim remains.
+
+Tool limitation: MCP `lsp_diagnostics` is rooted at the main checkout and cannot
+open sibling worktree `t118`. Direct `rust-analyzer diagnostics . --severity warning`
+from the task worktree used the same engine and completed without diagnostics.

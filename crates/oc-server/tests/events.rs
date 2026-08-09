@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::{Body, BodyDataStream};
-use axum::http::{Request, StatusCode, header};
+use axum::http::{Method, Request, StatusCode, header};
 use futures::StreamExt;
 use oc_db::Pool;
 use oc_llm::sse::SseParser;
@@ -13,6 +13,8 @@ use oc_server::{
 };
 use serde_json::{Map, Value, json};
 use tower::ServiceExt;
+
+use oc_server::api::{self, ApiState};
 
 fn event(ordinal: u64) -> NewEvent {
     let mut properties = Map::new();
@@ -32,12 +34,26 @@ fn event_app(events: EventService) -> axum::Router {
         .router()
 }
 
+fn api_event_app(state: ApiState, events: EventService) -> axum::Router {
+    ServerBuilder::new(ServerConfig::default())
+        .with_routes(api::router(state.with_events(events.clone())).merge(events_router(events)))
+        .router()
+}
+
 async fn open_stream(
     app: &axum::Router,
     session_id: &str,
     cursor: Option<&EventCursor>,
 ) -> BodyDataStream {
     let uri = format!("/event?sessionID={session_id}");
+    open_stream_at(app, &uri, cursor).await
+}
+
+async fn open_stream_at(
+    app: &axum::Router,
+    uri: &str,
+    cursor: Option<&EventCursor>,
+) -> BodyDataStream {
     let mut request = Request::builder().uri(uri);
     if let Some(cursor) = cursor {
         request = request.header("last-event-id", cursor.to_string());
@@ -58,6 +74,131 @@ async fn open_stream(
     );
     assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
     response.into_body().into_data_stream()
+}
+
+#[tokio::test]
+async fn upstream_global_event_stream_emits_connected_then_published_events() {
+    // Given: a client on the upstream global event path.
+    let (_pool, events) = event_service(8);
+    let app = event_app(events.clone());
+    let mut stream = open_stream_at(&app, "/api/event", None).await;
+
+    // Then: connection establishment is immediately observable, matching 1.18.12.
+    let (_, connected) = decode_frame(&next_frame(&mut stream).await);
+    assert_eq!(connected["type"], "server.connected");
+    assert_eq!(connected["data"], json!({}));
+
+    // When: a durable event is published for any session.
+    events
+        .publish("ses_global", event(7))
+        .await
+        .expect("publish the global fixture event");
+    let (_, published) = decode_frame(&next_frame(&mut stream).await);
+
+    // Then: the global stream carries asynchronous events, not only a route or heartbeat.
+    assert_eq!(published["type"], "test.event");
+    assert_eq!(published["data"]["ordinal"], json!(7));
+}
+
+#[tokio::test]
+async fn creating_a_session_is_observable_on_the_upstream_global_stream() {
+    // Given: one upstream global subscriber sharing the API's event service.
+    let (_pool, events) = event_service(8);
+    let state = ApiState::memory("/repo").expect("in-memory API state initializes");
+    let app = api_event_app(state.clone(), events);
+    let mut stream = open_stream_at(&app, "/api/event", None).await;
+    let (_, connected) = decode_frame(&next_frame(&mut stream).await);
+    assert_eq!(connected["type"], "server.connected");
+
+    // When: a client creates a session through the public API.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/session")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"id":"ses_observable"}"#))
+                .expect("session request is valid"),
+        )
+        .await
+        .expect("session create responds");
+
+    // Then: the row exists and the asynchronous event is delivered with its payload.
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        state
+            .sessions()
+            .find("ses_observable")
+            .expect("read created session")
+            .is_some()
+    );
+    let (_, created) = decode_frame(&next_frame(&mut stream).await);
+    assert_eq!(created["type"], "session.created");
+    assert_eq!(created["data"]["sessionID"], "ses_observable");
+    assert_eq!(created["data"]["info"]["id"], "ses_observable");
+}
+
+#[tokio::test]
+async fn upstream_session_event_stream_replays_after_sequence_with_durable_shape() {
+    // Given: two committed events in one session and one event in another session.
+    let (_pool, events) = event_service(8);
+    events
+        .publish("ses_target", event(0))
+        .await
+        .expect("publish the sequence-zero event");
+    events
+        .publish("ses_target", event(1))
+        .await
+        .expect("publish the sequence-one event");
+    events
+        .publish("ses_other", event(99))
+        .await
+        .expect("publish the other session event");
+    let app = event_app(events);
+
+    // When: the upstream route resumes after aggregate sequence zero.
+    let mut stream = open_stream_at(&app, "/api/session/ses_target/event?after=0", None).await;
+    let (cursor, replayed) = decode_frame(&next_frame(&mut stream).await);
+
+    // Then: the body is the upstream durable-event shape and stays session-scoped.
+    assert!(
+        cursor.is_none(),
+        "the upstream stream keeps the cursor in JSON"
+    );
+    assert_eq!(replayed["type"], "test.event");
+    assert_eq!(replayed["durable"]["aggregateID"], "ses_target");
+    assert_eq!(replayed["durable"]["seq"], json!(1));
+    assert_eq!(replayed["durable"]["version"], json!(1));
+    assert_eq!(replayed["data"]["ordinal"], json!(1));
+}
+
+#[tokio::test]
+async fn upstream_session_event_stream_omits_legacy_creation_rows() {
+    // Given: the legacy creation row at sequence zero and a durable v2 event after it.
+    let (_pool, events) = event_service(8);
+    events
+        .publish(
+            "ses_target",
+            NewEvent::new("session.created", Map::new()).expect("created event type"),
+        )
+        .await
+        .expect("publish legacy creation event");
+    events
+        .publish(
+            "ses_target",
+            NewEvent::new("session.next.agent.switched", Map::new()).expect("durable event type"),
+        )
+        .await
+        .expect("publish durable event");
+
+    // When: a fresh session-event subscription replays from the beginning.
+    let app = event_app(events);
+    let mut stream = open_stream_at(&app, "/api/session/ses_target/event", None).await;
+    let (_, replayed) = decode_frame(&next_frame(&mut stream).await);
+
+    // Then: the first public frame is the v2 durable event, not session.created.
+    assert_eq!(replayed["type"], "session.next.agent.switched");
+    assert_eq!(replayed["durable"]["seq"], json!(1));
 }
 
 async fn next_frame(stream: &mut BodyDataStream) -> String {

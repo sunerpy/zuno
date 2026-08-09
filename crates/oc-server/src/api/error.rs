@@ -7,18 +7,22 @@ use oc_error::DbError;
 use oc_pty::PtyError;
 use serde::Serialize;
 
+use crate::EventStreamError;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
     #[error("{0}")]
     InvalidRequest(&'static str),
-    #[error("{0}")]
-    NotImplemented(&'static str),
+    #[error("backend unavailable for {0}")]
+    BackendUnavailable(String),
     #[error(transparent)]
     Database(#[from] DbError),
     #[error(transparent)]
     Pty(#[from] PtyError),
     #[error(transparent)]
     Maintenance(#[from] SessionPruneError),
+    #[error(transparent)]
+    Event(#[from] EventStreamError),
 }
 
 #[derive(Serialize)]
@@ -40,10 +44,10 @@ impl IntoResponse for ApiError {
                 "invalid_request",
                 message.to_owned(),
             ),
-            Self::NotImplemented(message) => (
-                StatusCode::NOT_IMPLEMENTED,
-                "not_implemented",
-                message.to_owned(),
+            Self::BackendUnavailable(operation) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "backend_unavailable",
+                format!("backend unavailable for {operation}"),
             ),
             Self::Database(DbError::NotFound { table, id }) => (
                 StatusCode::NOT_FOUND,
@@ -84,6 +88,11 @@ impl IntoResponse for ApiError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "maintenance_failed",
                 "session maintenance failed".to_owned(),
+            ),
+            Self::Event(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "event_stream_failed",
+                "session was created but its event could not be published".to_owned(),
             ),
         };
         (

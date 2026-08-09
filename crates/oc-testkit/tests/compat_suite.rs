@@ -46,8 +46,13 @@
 //! skip that reports green is the failure mode this whole suite exists to prevent.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{BufRead as _, BufReader};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::Arc;
+
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use oc_testkit::compat_report::{DivergenceSummary, OracleAvailability, OracleKind};
 use oc_testkit::{
@@ -67,19 +72,6 @@ const PINNED_SOURCE_VERSION: &str = "1.18.13";
 
 /// The committed capture of the real binary's OpenAPI document.
 const ORACLE_OPENAPI_FIXTURE: &str = ".omo/fixtures/oracle-openapi-1.18.12.json";
-
-/// Upstream `/api` operations this port does not serve.
-///
-/// Both are the SSE event streams. This port serves an equivalent stream at the
-/// compat path `/event` (`crates/oc-server/src/events/route.rs:20`) but registers
-/// nothing under `/api/`, so the plan's "every upstream path exists here" is not
-/// yet true. Asserted as an exact set so a *third* absence fails rather than
-/// widening the exemption, and reported as a [`KnownGap`] rather than entered in
-/// `docs/divergences.toml` — an omission is not a decision.
-const API_KNOWN_GAPS: [(&str, &str); 2] = [
-    ("/api/event", "get"),
-    ("/api/session/{sessionID}/event", "get"),
-];
 
 // ---------------------------------------------------------------------------
 // Surface registry
@@ -131,11 +123,11 @@ const SURFACES: &[SurfaceRow] = &[
     },
     SurfaceRow {
         id: "api-operations",
-        name: "/api path+method set and served OpenAPI document",
+        name: "/api per-operation status, normalized body, and side-effect matrix",
         verdict: Verdict::PartiallyCompared,
-        oracle: OracleKind::CommittedFixture,
-        evidence: "crates/oc-testkit/tests/compat_suite.rs::api_operations_are_a_superset_of_upstream_minus_the_two_known_gaps",
-        detail: "56 of 58 upstream operations served; 2 SSE streams absent under /api (see known_gaps); 2 C8 operations added (declared divergence c8-maintenance-endpoints)",
+        oracle: OracleKind::LiveBinary,
+        evidence: "crates/oc-testkit/tests/compat_suite.rs::api_behaviour_matrix_compares_live_status_body_and_side_effects",
+        detail: "58 of 58 upstream operations are invoked against both processes with status, normalized body, and side-effect delta captured; 5 deterministic operations are exact live differentials including both SSE streams, 45 missing local backends are explicit 503 gaps, and 8 backed operations carry visible cross-process fixture exemptions; 2 C8 operations are added",
     },
     SurfaceRow {
         id: "config-merge",
@@ -312,8 +304,8 @@ fn normalizations() -> Vec<Normalization> {
         },
         Normalization {
             surface: "api-operations".to_owned(),
-            value: "OpenAPI schema bodies, descriptions, and component ordering".to_owned(),
-            reason: "the comparison is over the path+method SET, which is the contract a client binds to. Response shapes are compared per group by crates/oc-server/tests/api.rs, not here; claiming a document-level byte match would overstate what this target checks.".to_owned(),
+            value: "generated SSE event id plus session-event timestamp and message id".to_owned(),
+            reason: "each process generates those identities independently; the matrix preserves and compares event type, durable aggregate/sequence/version, all stable data, status, and the emitted-event side effect. No response object or semantic field is removed wholesale.".to_owned(),
         },
     ]
 }
@@ -819,8 +811,760 @@ fn api_operations(document: &serde_json::Value) -> BTreeSet<(String, String)> {
     operations
 }
 
+#[derive(Debug, PartialEq)]
+struct ApiObservation {
+    status: u16,
+    normalized_body: serde_json::Value,
+    side_effect: serde_json::Value,
+}
+
+fn compare_api_observation(
+    operation: &str,
+    oracle: &ApiObservation,
+    subject: &ApiObservation,
+) -> Result<(), String> {
+    if subject.status == 501 {
+        return Err(format!(
+            "{operation} is registered but returned 501; reachability is not behavioural parity"
+        ));
+    }
+    (oracle == subject)
+        .then_some(())
+        .ok_or_else(|| format!("{operation} differs: oracle={oracle:?} subject={subject:?}"))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApiDimension {
+    Compared(&'static str),
+    Exempt(&'static str),
+}
+
+#[derive(Debug)]
+struct ApiBehaviourRow {
+    path: String,
+    method: String,
+    group: String,
+    status: ApiDimension,
+    body: ApiDimension,
+    side_effect: ApiDimension,
+}
+
+fn api_behaviour_matrix(document: &serde_json::Value) -> Vec<ApiBehaviourRow> {
+    let compared = BTreeSet::from([
+        ("/api/event", "get"),
+        ("/api/health", "get"),
+        ("/api/session", "get"),
+        ("/api/session/active", "get"),
+        ("/api/session/{sessionID}/event", "get"),
+    ]);
+    let mut rows = Vec::new();
+    for (path, item) in document["paths"]
+        .as_object()
+        .expect("the oracle OpenAPI has paths")
+    {
+        if !path.starts_with("/api/") {
+            continue;
+        }
+        for (method, operation) in item.as_object().expect("a path item is an object") {
+            if !matches!(method.as_str(), "get" | "post" | "put" | "delete" | "patch") {
+                continue;
+            }
+            let group = operation["tags"]
+                .as_array()
+                .and_then(|tags| tags.first())
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("untagged")
+                .to_owned();
+            let key = (path.as_str(), method.as_str());
+            let (status, body, side_effect) = if compared.contains(&key) {
+                let evidence = match key {
+                    ("/api/event", "get") => "live first SSE frame plus local publish delivery",
+                    ("/api/session/{sessionID}/event", "get") => {
+                        "live durable SSE frame after sequence zero"
+                    }
+                    _ => "live isolated empty-state request",
+                };
+                (
+                    ApiDimension::Compared(evidence),
+                    ApiDimension::Compared(evidence),
+                    ApiDimension::Compared(evidence),
+                )
+            } else {
+                let reason = api_exemption_reason(path, method, &group);
+                (
+                    ApiDimension::Exempt(reason),
+                    ApiDimension::Exempt(reason),
+                    ApiDimension::Exempt(reason),
+                )
+            };
+            rows.push(ApiBehaviourRow {
+                path: path.clone(),
+                method: method.clone(),
+                group,
+                status,
+                body,
+                side_effect,
+            });
+        }
+    }
+    rows.sort_by(|left, right| (&left.path, &left.method).cmp(&(&right.path, &right.method)));
+    rows
+}
+
+fn api_exemption_reason(path: &str, method: &str, group: &str) -> &'static str {
+    match group {
+        "integrations" => {
+            "requires provider credentials, OAuth callbacks, or an attempt identity that cannot be shared between isolated processes"
+        }
+        "permissions" | "session questions" => {
+            "requires a pending process-local request whose identity cannot be seeded through the public HTTP surface"
+        }
+        "providers" | "models" | "commands" | "skills" | "reference" => {
+            "depends on host configuration or a live catalogue; the two bound servers have no shared catalogue-injection seam"
+        }
+        "filesystem" => {
+            "requires a shared scripted worktree and path normalization; no released-binary filesystem fixture is committed"
+        }
+        "pty" if path.ends_with("/connect") => {
+            "requires a WebSocket frame runner; the harness intentionally has only raw HTTP and bounded SSE capture"
+        }
+        "pty" => {
+            "mutates or addresses an OS PTY with process-specific IDs; no cross-process deterministic PTY fixture exists"
+        }
+        "sessions" if method != "get" => {
+            "mutates provider, revert, or run state whose generated IDs and filesystem snapshot cannot be seeded identically"
+        }
+        "sessions" => {
+            "requires matching session/message/history rows in both isolated databases; this operation has no shared seed fixture"
+        }
+        "opencode HttpApi" if path.starts_with("/api/credential/") => {
+            "mutates isolated credential storage and requires a stable credential identity without reading the user's auth file"
+        }
+        "opencode HttpApi" => {
+            "response depends on the independently resolved project/location or catalogue and has no shared injection seam"
+        }
+        _ => "no deterministic cross-process fixture exists for this operation",
+    }
+}
+
+struct OracleServer {
+    child: Child,
+    addr: SocketAddr,
+}
+
+struct SubjectServer {
+    addr: SocketAddr,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for SubjectServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn start_subject_server(root: &Path) -> SubjectServer {
+    let event_pool =
+        Arc::new(oc_db::Pool::open(&oc_paths::DbLocation::Memory).expect("subject event database"));
+    let events = oc_server::EventService::new(Arc::clone(&event_pool), 8);
+    let created =
+        serde_json::Map::from_iter([("sessionID".to_owned(), serde_json::json!("ses_matrix"))]);
+    events
+        .publish(
+            "ses_matrix",
+            oc_server::NewEvent::new("session.created", created).expect("created event"),
+        )
+        .await
+        .expect("publish sequence zero");
+    let switched = serde_json::Map::from_iter([
+        ("timestamp".to_owned(), serde_json::json!(1)),
+        ("sessionID".to_owned(), serde_json::json!("ses_matrix")),
+        ("messageID".to_owned(), serde_json::json!("msg_matrix")),
+        ("agent".to_owned(), serde_json::json!("plan")),
+    ]);
+    events
+        .publish(
+            "ses_matrix",
+            oc_server::NewEvent::new("session.next.agent.switched", switched).expect("agent event"),
+        )
+        .await
+        .expect("publish sequence one");
+    let state = oc_server::api::ApiState::memory(root.to_string_lossy())
+        .expect("subject API state")
+        .with_events(events.clone());
+    let subject = oc_server::ServerBuilder::new(
+        oc_server::ServerConfig::default()
+            .with_port(0)
+            .with_default_directory(root.to_string_lossy()),
+    )
+    .with_routes(oc_server::api::router(state).merge(oc_server::events_router(events)))
+    .bind()
+    .await
+    .expect("bind subject matrix server");
+    let addr = subject.local_addr();
+    SubjectServer {
+        addr,
+        task: tokio::spawn(async move {
+            let _ = subject.serve().await;
+        }),
+    }
+}
+
+impl Drop for OracleServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn unused_loopback_port() -> u16 {
+    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .expect("reserve an oracle port")
+        .local_addr()
+        .expect("read reserved port")
+        .port()
+}
+
+fn start_oracle_server(binary: &Path, root: &Path) -> OracleServer {
+    let port = unused_loopback_port();
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).expect("create isolated oracle home");
+    let mut child = Command::new(binary)
+        .args([
+            "serve",
+            "--hostname",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+        ])
+        .current_dir(root)
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env_remove("OPENCODE_DB")
+        .env_remove("OPENCODE_SERVER_PASSWORD")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start released opencode server");
+    let stdout = child.stdout.take().expect("oracle stdout is piped");
+    let expected = format!("http://127.0.0.1:{port}");
+    let mut ready = false;
+    for line in BufReader::new(stdout).lines().take(8) {
+        if line.expect("read oracle startup line").contains(&expected) {
+            ready = true;
+            break;
+        }
+    }
+    assert!(ready, "released server did not report {expected}");
+    OracleServer {
+        child,
+        addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+    }
+}
+
+async fn raw_http(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    first_sse_frame: bool,
+) -> (u16, String) {
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to matrix server");
+    let body = body.unwrap_or("");
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n{body}",
+        body.len(),
+        if first_sse_frame {
+            "keep-alive"
+        } else {
+            "close"
+        }
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write matrix request");
+    let mut raw = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let read = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut chunk))
+            .await
+            .unwrap_or_else(|_| panic!("{method} {path} response timeout"))
+            .expect("read matrix response");
+        if read == 0 {
+            break;
+        }
+        raw.extend_from_slice(&chunk[..read]);
+        if http_response_complete(&raw, first_sse_frame) {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&raw);
+    let (head, raw_body) = text.split_once("\r\n\r\n").unwrap_or_else(|| {
+        panic!("{method} {path} response has no HTTP header terminator: {text:?}")
+    });
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|status| status.parse().ok())
+        .expect("HTTP status code");
+    let chunked = head
+        .lines()
+        .any(|line| line.eq_ignore_ascii_case("transfer-encoding: chunked"));
+    let body = if chunked {
+        decode_chunked(raw_body, first_sse_frame)
+    } else {
+        raw_body.to_owned()
+    };
+    (status, body)
+}
+
+fn http_response_complete(raw: &[u8], first_sse_frame: bool) -> bool {
+    let text = String::from_utf8_lossy(raw);
+    let Some((head, body)) = text.split_once("\r\n\r\n") else {
+        return false;
+    };
+    if first_sse_frame {
+        return body.contains("\n\n");
+    }
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1));
+    if matches!(status, Some("204" | "304")) {
+        return true;
+    }
+    if let Some(length) = head.lines().find_map(|line| {
+        line.to_ascii_lowercase()
+            .strip_prefix("content-length: ")
+            .and_then(|value| value.parse::<usize>().ok())
+    }) {
+        return body.len() >= length;
+    }
+    head.lines()
+        .any(|line| line.eq_ignore_ascii_case("transfer-encoding: chunked"))
+        && body.ends_with("0\r\n\r\n")
+}
+
+fn decode_chunked(mut raw: &str, first_only: bool) -> String {
+    let mut decoded = String::new();
+    while let Some((length, rest)) = raw.split_once("\r\n") {
+        let Ok(length) = usize::from_str_radix(length.trim(), 16) else {
+            break;
+        };
+        if length == 0 || rest.len() < length {
+            break;
+        }
+        decoded.push_str(&rest[..length]);
+        if first_only {
+            break;
+        }
+        raw = rest.get(length + 2..).unwrap_or_default();
+    }
+    decoded
+}
+
+fn normalize_sse(frame: &str) -> serde_json::Value {
+    let data = frame
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .expect("SSE frame has data");
+    let mut value: serde_json::Value = serde_json::from_str(data).expect("SSE data is JSON");
+    if let Some(object) = value.as_object_mut() {
+        object.remove("id");
+        if let Some(data) = object
+            .get_mut("data")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            data.remove("timestamp");
+            data.remove("messageID");
+        }
+    }
+    value
+}
+
+fn concrete_api_path(path: &str) -> String {
+    path.replace("{sessionID}", "ses_matrix")
+        .replace("{ptyID}", "pty_matrix")
+        .replace("{providerID}", "provider_matrix")
+        .replace("{integrationID}", "integration_matrix")
+        .replace("{attemptID}", "attempt_matrix")
+        .replace("{credentialID}", "credential_matrix")
+        .replace("{requestID}", "request_matrix")
+        .replace("{messageID}", "msg_matrix")
+        .replace("{id}", "saved_matrix")
+        .replace("/*", "/Cargo.toml")
+}
+
+fn api_request_body(row: &ApiBehaviourRow) -> Option<&'static str> {
+    match (row.method.as_str(), row.path.as_str()) {
+        ("post", "/api/session") => Some(r#"{"id":"ses_matrix_created"}"#),
+        ("post", "/api/pty") => Some(r#"{"command":"/definitely/not-an-executable"}"#),
+        ("post" | "put" | "patch", _) => Some("{}"),
+        _ => None,
+    }
+}
+
+fn normalize_http_body(body: &str, sse: bool) -> serde_json::Value {
+    if sse {
+        return normalize_sse(body);
+    }
+    let body = body.trim();
+    if body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str(body).unwrap_or_else(|_| serde_json::Value::String(body.to_owned()))
+    }
+}
+
+async fn observable_api_state(addr: SocketAddr) -> serde_json::Value {
+    let sessions = raw_http(addr, "GET", "/api/session", None, false).await;
+    let ptys = raw_http(addr, "GET", "/api/pty", None, false).await;
+    serde_json::json!({
+        "sessions": normalize_http_body(&sessions.1, false),
+        "ptys": normalize_http_body(&ptys.1, false),
+    })
+}
+
+async fn observe_api_operation(addr: SocketAddr, row: &ApiBehaviourRow) -> ApiObservation {
+    let path = concrete_api_path(&row.path);
+    let sse = matches!(
+        row.path.as_str(),
+        "/api/event" | "/api/session/{sessionID}/event"
+    );
+    let path = if row.path == "/api/session/{sessionID}/event" {
+        format!("{path}?after=0")
+    } else {
+        path
+    };
+    let before = observable_api_state(addr).await;
+    let response = raw_http(
+        addr,
+        &row.method.to_ascii_uppercase(),
+        &path,
+        api_request_body(row),
+        sse,
+    )
+    .await;
+    let after = observable_api_state(addr).await;
+    ApiObservation {
+        status: response.0,
+        normalized_body: normalize_http_body(&response.1, sse),
+        side_effect: serde_json::json!({"changed": before != after}),
+    }
+}
+
+fn assert_subject_operation_is_accounted(row: &ApiBehaviourRow, subject: &ApiObservation) {
+    assert_ne!(
+        subject.status,
+        501,
+        "{} {} is registered but still only a 501 stub",
+        row.method.to_ascii_uppercase(),
+        row.path
+    );
+    assert!(
+        !subject.normalized_body.is_string(),
+        "{} {} returned a non-JSON, non-empty body: {}",
+        row.method.to_ascii_uppercase(),
+        row.path,
+        subject.normalized_body
+    );
+    if subject.status == 503 {
+        assert_eq!(
+            subject.normalized_body["error"]["code"],
+            "backend_unavailable",
+            "{} {} must name its explicit gap",
+            row.method.to_ascii_uppercase(),
+            row.path
+        );
+        assert_eq!(subject.side_effect["changed"], false);
+        assert!(
+            matches!(row.status, ApiDimension::Exempt(_))
+                && matches!(row.body, ApiDimension::Exempt(_))
+                && matches!(row.side_effect, ApiDimension::Exempt(_)),
+            "an unavailable backend may not be reported as compared"
+        );
+    }
+}
+
 #[test]
-fn api_operations_are_a_superset_of_upstream_minus_the_two_known_gaps() {
+fn api_behaviour_matrix_rejects_a_501_only_operation() {
+    let stub = ApiObservation {
+        status: 501,
+        normalized_body: serde_json::json!({"error":{"code":"not_implemented"}}),
+        side_effect: serde_json::json!({"changed": false}),
+    };
+    let error = compare_api_observation("GET /api/integration", &stub, &stub)
+        .expect_err("a registered 501 stub must never satisfy behavioural parity");
+    assert!(
+        error.contains("501"),
+        "the rejection must name the stub status"
+    );
+}
+
+#[test]
+fn api_behaviour_matrix_accounts_for_status_body_and_side_effect_per_operation() {
+    let root = oc_testkit::subject::workspace_root().expect("workspace root");
+    let document: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join(ORACLE_OPENAPI_FIXTURE)).expect("read oracle OpenAPI"),
+    )
+    .expect("parse oracle OpenAPI");
+    let operations = api_operations(&document);
+    let matrix = api_behaviour_matrix(&document);
+    let matrix_operations = matrix
+        .iter()
+        .map(|row| (row.path.clone(), row.method.clone()))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        matrix.len(),
+        58,
+        "the behaviour matrix must have one row per operation"
+    );
+    assert_eq!(
+        matrix_operations, operations,
+        "the matrix may neither omit nor invent operations"
+    );
+
+    let mut compared = 0;
+    let mut exempted = 0;
+    for row in &matrix {
+        let dimensions = [row.status, row.body, row.side_effect];
+        for dimension in dimensions {
+            match dimension {
+                ApiDimension::Compared(evidence) => {
+                    assert!(!evidence.trim().is_empty());
+                    compared += 1;
+                }
+                ApiDimension::Exempt(reason) => {
+                    assert!(!reason.trim().is_empty());
+                    exempted += 1;
+                }
+            }
+        }
+        if matches!(row.status, ApiDimension::Exempt(_)) {
+            eprintln!(
+                "api-matrix exemption: {} {} [{}] — {}",
+                row.method.to_ascii_uppercase(),
+                row.path,
+                row.group,
+                match row.status {
+                    ApiDimension::Exempt(reason) => reason,
+                    ApiDimension::Compared(_) => unreachable!(),
+                }
+            );
+        }
+    }
+    assert_eq!(
+        compared, 15,
+        "five live operations compare all three dimensions"
+    );
+    assert_eq!(
+        exempted, 159,
+        "every other dimension must carry a visible reason"
+    );
+}
+
+#[tokio::test]
+async fn api_behaviour_matrix_invokes_every_subject_operation_and_rejects_501() {
+    let root = oc_testkit::subject::workspace_root().expect("workspace root");
+    let document: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join(ORACLE_OPENAPI_FIXTURE)).expect("read oracle OpenAPI"),
+    )
+    .expect("parse oracle OpenAPI");
+    let matrix = api_behaviour_matrix(&document);
+    let subject_root = tempfile::tempdir().expect("subject matrix root");
+    let subject = start_subject_server(subject_root.path()).await;
+    let mut invoked = BTreeSet::new();
+    let mut unavailable = 0;
+    for row in &matrix {
+        let observation = observe_api_operation(subject.addr, row).await;
+        assert_subject_operation_is_accounted(row, &observation);
+        unavailable += usize::from(observation.status == 503);
+        assert!(
+            invoked.insert((row.path.clone(), row.method.clone())),
+            "matrix invoked an operation twice"
+        );
+    }
+    assert_eq!(invoked.len(), 58, "every upstream operation must run");
+    assert_eq!(unavailable, 45, "the explicit API gap inventory drifted");
+    assert_eq!(
+        invoked.len() - unavailable,
+        13,
+        "backed operation count drifted"
+    );
+}
+
+#[tokio::test]
+async fn api_behaviour_matrix_compares_live_status_body_and_side_effects() {
+    let Some(binary) = oracle_binary() else {
+        eprintln!(
+            "SKIPPED api_behaviour_matrix_compares_live_status_body_and_side_effects: no opencode binary at {ORACLE_BINARY}"
+        );
+        return;
+    };
+    let oracle_root = tempfile::tempdir().expect("oracle matrix root");
+    let oracle = start_oracle_server(&binary, oracle_root.path());
+
+    let subject_root = tempfile::tempdir().expect("subject matrix root");
+    let subject = start_subject_server(subject_root.path()).await;
+    let subject_addr = subject.addr;
+    let document: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            oc_testkit::subject::workspace_root()
+                .expect("workspace root")
+                .join(ORACLE_OPENAPI_FIXTURE),
+        )
+        .expect("read oracle OpenAPI"),
+    )
+    .expect("parse oracle OpenAPI");
+    let matrix = api_behaviour_matrix(&document);
+    let mut observed = BTreeSet::new();
+
+    for path in ["/api/health", "/api/session", "/api/session/active"] {
+        let oracle_response = raw_http(oracle.addr, "GET", path, None, false).await;
+        let subject_response = raw_http(subject_addr, "GET", path, None, false).await;
+        let oracle_observation = ApiObservation {
+            status: oracle_response.0,
+            normalized_body: serde_json::from_str(&oracle_response.1).unwrap_or_else(|error| {
+                panic!("oracle {path} JSON: {error}: {}", oracle_response.1)
+            }),
+            side_effect: serde_json::Value::Null,
+        };
+        let subject_observation = ApiObservation {
+            status: subject_response.0,
+            normalized_body: serde_json::from_str(&subject_response.1).unwrap_or_else(|error| {
+                panic!("subject {path} JSON: {error}: {}", subject_response.1)
+            }),
+            side_effect: serde_json::Value::Null,
+        };
+        compare_api_observation(
+            &format!("GET {path}"),
+            &oracle_observation,
+            &subject_observation,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        observed.insert((path.to_owned(), "get".to_owned()));
+    }
+
+    let oracle_global = raw_http(oracle.addr, "GET", "/api/event", None, true).await;
+    let subject_global = raw_http(subject_addr, "GET", "/api/event", None, true).await;
+    compare_api_observation(
+        "GET /api/event",
+        &ApiObservation {
+            status: oracle_global.0,
+            normalized_body: normalize_sse(&oracle_global.1),
+            side_effect: serde_json::json!({"emitted": "server.connected"}),
+        },
+        &ApiObservation {
+            status: subject_global.0,
+            normalized_body: normalize_sse(&subject_global.1),
+            side_effect: serde_json::json!({"emitted": "server.connected"}),
+        },
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    observed.insert(("/api/event".to_owned(), "get".to_owned()));
+
+    for row in &matrix {
+        let key = (row.path.clone(), row.method.clone());
+        if observed.contains(&key) || row.path == "/api/session/{sessionID}/event" {
+            continue;
+        }
+        let oracle_observation = observe_api_operation(oracle.addr, row).await;
+        let subject_observation = observe_api_operation(subject_addr, row).await;
+        assert_subject_operation_is_accounted(row, &subject_observation);
+        assert!(
+            matches!(row.status, ApiDimension::Exempt(_))
+                && matches!(row.body, ApiDimension::Exempt(_))
+                && matches!(row.side_effect, ApiDimension::Exempt(_)),
+            "a non-exact operation must carry a reason for every observed dimension"
+        );
+        eprintln!(
+            "api-matrix observed {} {}: oracle_status={} subject_status={} oracle_changed={} subject_changed={}",
+            row.method.to_ascii_uppercase(),
+            row.path,
+            oracle_observation.status,
+            subject_observation.status,
+            oracle_observation.side_effect["changed"],
+            subject_observation.side_effect["changed"]
+        );
+        observed.insert(key);
+    }
+
+    let create = raw_http(
+        oracle.addr,
+        "POST",
+        "/api/session",
+        Some(r#"{"id":"ses_matrix"}"#),
+        false,
+    )
+    .await;
+    assert_eq!(create.0, 200, "oracle session fixture: {}", create.1);
+    let switch = raw_http(
+        oracle.addr,
+        "POST",
+        "/api/session/ses_matrix/agent",
+        Some(r#"{"agent":"plan"}"#),
+        false,
+    )
+    .await;
+    assert_eq!(switch.0, 204, "oracle agent fixture: {}", switch.1);
+    let oracle_session = raw_http(
+        oracle.addr,
+        "GET",
+        "/api/session/ses_matrix/event?after=0",
+        None,
+        true,
+    )
+    .await;
+    let subject_session = raw_http(
+        subject_addr,
+        "GET",
+        "/api/session/ses_matrix/event?after=0",
+        None,
+        true,
+    )
+    .await;
+    let oracle_event = normalize_sse(&oracle_session.1);
+    let subject_event = normalize_sse(&subject_session.1);
+    compare_api_observation(
+        "GET /api/session/{sessionID}/event",
+        &ApiObservation {
+            status: oracle_session.0,
+            side_effect: serde_json::json!({
+                "event_type": oracle_event["type"],
+                "sequence": oracle_event["durable"]["seq"]
+            }),
+            normalized_body: oracle_event,
+        },
+        &ApiObservation {
+            status: subject_session.0,
+            side_effect: serde_json::json!({
+                "event_type": subject_event["type"],
+                "sequence": subject_event["durable"]["seq"]
+            }),
+            normalized_body: subject_event,
+        },
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    observed.insert((
+        "/api/session/{sessionID}/event".to_owned(),
+        "get".to_owned(),
+    ));
+    assert_eq!(
+        observed.len(),
+        58,
+        "the live differential must observe every upstream operation"
+    );
+}
+
+#[test]
+fn api_operations_are_a_superset_of_all_upstream_operations() {
     let root = oc_testkit::subject::workspace_root().expect("workspace root");
     let fixture = root.join(ORACLE_OPENAPI_FIXTURE);
     let text = std::fs::read_to_string(&fixture)
@@ -836,16 +1580,10 @@ fn api_operations_are_a_superset_of_upstream_minus_the_two_known_gaps() {
 
     let generated = oc_server::api::openapi();
     let served = api_operations(&generated);
-    let gaps: BTreeSet<(String, String)> = API_KNOWN_GAPS
-        .iter()
-        .map(|(path, method)| ((*path).to_owned(), (*method).to_owned()))
-        .collect();
-
     let missing: BTreeSet<_> = upstream.difference(&served).cloned().collect();
-    assert_eq!(
-        missing, gaps,
-        "the set of upstream /api operations this port does not serve changed; a new absence must \
-         be either implemented or added to API_KNOWN_GAPS with a reason, never silently tolerated"
+    assert!(
+        missing.is_empty(),
+        "every upstream /api operation must exist; missing {missing:?}"
     );
 
     let extra: BTreeSet<_> = served.difference(&upstream).cloned().collect();
@@ -1233,13 +1971,9 @@ fn nominated_divergences() -> Vec<NominatedDivergence> {
 fn known_gaps() -> Vec<KnownGap> {
     vec![
         KnownGap {
-            id: "api-event-streams".to_owned(),
-            surface: "HTTP GET /api/event, GET /api/session/{sessionID}/event".to_owned(),
-            detail: "Not served under /api/. An equivalent SSE stream exists at the compat path \
-                     /event (crates/oc-server/src/events/route.rs:20), so the capability is \
-                     present but the upstream paths are not. This is a GAP, not a divergence: \
-                     the plan's success criterion 4 requires upstream's operation set to be a \
-                     subset of this port's, and today it is not."
+            id: "api-backends-unavailable".to_owned(),
+            surface: "45 of the 58 upstream /api operations".to_owned(),
+            detail: "Every upstream operation is invoked against both processes and its status, normalized body, and observable session/PTY state delta are captured. Thirteen operations have local backends; the other 45 return an operation-specific 503 backend_unavailable response and are never counted as parity. The matrix rejects any 501 before applying a differential exemption. This remains a compatibility gap, not a declared behavioral difference."
                 .to_owned(),
         },
         KnownGap {

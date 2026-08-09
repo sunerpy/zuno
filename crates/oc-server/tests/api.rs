@@ -69,15 +69,10 @@ fn api_openapi_contains_every_owned_oracle_operation() {
     ))
     .expect("checked-in oracle OpenAPI parses");
     let generated = api::openapi();
-    let mut expected = fixture_operations(&oracle);
-    expected.remove(&("/api/event".to_owned(), "get".to_owned()));
-    expected.remove(&(
-        "/api/session/{sessionID}/event".to_owned(),
-        "get".to_owned(),
-    ));
+    let expected = fixture_operations(&oracle);
     assert_eq!(
         expected.len(),
-        56,
+        58,
         "the measured task-owned surface changed"
     );
 
@@ -231,15 +226,20 @@ async fn api_session_active_reports_only_process_local_running_sessions_in_stabl
 }
 
 #[tokio::test]
-async fn api_unbacked_endpoint_is_explicit_instead_of_fabricating_data() {
+async fn api_unbacked_endpoint_is_an_explicit_gap_not_a_501_compatibility_claim() {
     let state = ApiState::memory("/repo").expect("in-memory API state initializes");
     let response = api_app(state)
         .oneshot(request(Method::GET, "/api/integration", None))
         .await
         .expect("registered endpoint responds");
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    let status = response.status();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     let body = response_json(response).await;
-    assert_eq!(body["error"]["code"], "not_implemented");
+    assert_eq!(body["error"]["code"], "backend_unavailable");
+    assert_eq!(
+        body["error"]["message"],
+        "backend unavailable for GET /api/integration"
+    );
 }
 
 #[tokio::test]
