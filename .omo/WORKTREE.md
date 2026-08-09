@@ -2098,3 +2098,43 @@ worktrees：oc-wt/t{124,125,126,127,128,130}
 我在注释里写明了终局：**一旦 `unsupported_routes()` 为空，该测试应改成断言「该函数为空」**——那才是不随实现进度腐坏的断言形式。这件事已交给 todo 129。
 
 worktrees：oc-wt/t{124,125,126,129}
+
+## Wave 46 (2026-08-09)：133 个实现任务全部完成，API 缺口 45 → 14
+
+`main` = `97284fd`，**3306 测试通过**，clippy 0，fmt 干净，锁可离线复现。**133/137，只剩 F1-F4。**
+
+### 「补齐操作」的最终结果
+
+| 阶段 | 缺口 |
+|---|---|
+| 第二轮 Final Wave 拒绝时 | **45** |
+| todo 127（catalog + fs 12 个） | 33 |
+| todo 128（session 只读 + permission/question + PTY 10 个） | 23 |
+| todo 129（session 变更 9 个） | **14** |
+
+剩下 14 个是我此前枚举遗漏的操作（integration 连接流、credential、permission/question 的 reply/reject、单条 message），不在这三个 todo 的范围内。`unsupported_routes()` 里我列的 9 条已全部实现。
+
+### 129 最关键的一点，我用变异证明了
+
+`/prompt` 真的驱动 `run_turn`：`serve.rs:71` 注入的执行器 → `drive_with_message_id` → `turn.rs:573` 的 `run_turn`。把 `drive_with_message_id` 换成直接 `Ok(())`，**两个测试失败**。所以 todo 109-115、112、113/123 的成果（endpoint ladder、apiKey 优先级、凭证脱敏、两阶段 hydration）都被继承，没有第二份实现。
+
+### 第 11 个缝隙关闭：守卫现在真的经过生产分发器
+
+F2 的原始变异——把 `DispatchArguments::Agent` 指向 `PendingCommandDispatcher`——现在失败于
+`surface_every_implemented_command_reaches_its_handler_through_the_production_dispatcher`。测试名本身就说明了修法。
+
+### 我自己在矩阵上做的两个判断
+
+`/compact` 和 `/wait` 被我移出 `task_129_compared`：**隔离的 oracle 对这两个都答 503**（夹具没给它 provider）。把 status 标成 Compared 等于拿「oracle 自己的缺口」当 parity 断言——正是 F1/F4 拒绝的那类「把诚实缺口报成 parity」，只是方向反了。理由已写进代码注释。
+
+四个计数全部按实测改：`compared` 85、`exempted` 89、`unavailable` 14、`backed` 44。**每一个都是跑测试读出来的，没有一个是猜的**——两个分支各自报的数字（33 和 35）都不对。
+
+### 只在操作真的被执行后才暴露的差异
+
+`/agent` 和 `/model` 返回 204、路由存在、测试全绿，却少写了上游会写的 `agent-switched` / `model-switched` 消息。我对照 `packages/core/src/session/message-updater.ts:103-113` 确认后退回，129 补上了事件发布，改错事件名会失败一个具名测试。
+
+**「已注册且返回成功」不等于「行为一致」**——这正是 F1/F4 拒绝「45 个 503 被诚实归类」的论点，现在轮到成功路径上。
+
+### 126 的测试立刻证明了自己有用
+
+它从 `task-123` 产物派生期望值而非复述数字，合并后马上抓到 `README.md` 的操作数过期（35/23 → 44/14）。**一个从产物派生的断言，在写完的当天就挡住了一次文档漂移。**
