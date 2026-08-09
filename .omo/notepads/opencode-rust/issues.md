@@ -6318,3 +6318,55 @@ Final review removed an accidental summary-safe conversion from the borrowed
 Workspace tests, build, Clippy `-D warnings`, fmt, locked/offline metadata, the
 methodology hash tests, and worktree-local rust-analyzer diagnostics all passed
 after that scope correction.
+
+## [2026-08-09] SECOND Final Wave: 4/4 REJECT again — the 13 blockers are closed, but deeper gaps surfaced
+
+Reports: `.omo/evidence/F{1,2,3,4}-REPORT-wave2.md`. **Every wave-1 blocker was confirmed closed
+by the reviewer who raised it** — F2 re-ran its own mutations, F4 confirmed all three of its
+blockers closed, F1 confirmed B4 fully and B2/B3 as routing/evidence defects. The new REJECTs are
+*deeper* findings, not regressions.
+
+### SEAM #11, found by F2 — the seventh vacuous test, and the same class as `export`
+
+`crates/oc-cli/tests/surface.rs:145-153`'s `dispatch_request` **stops after parsing**. Both
+"structural" guards inspect only `request.args.is_pending()` and the static `PENDING_COMMANDS`
+roster; neither invokes `cmd/mod.rs:35-66` where the production `HeadlessCommandDispatcher`
+actually selects a handler.
+
+Proven by production mutation — routing `DispatchArguments::Agent(_)` to
+`PendingCommandDispatcher`:
+- `surface_no_implemented_disposition_routes_to_the_pending_handler` **passed**
+- `surface_every_implemented_command_actually_has_a_handler` **passed**
+- the real binary: ``agent list`` → ``\`agent\` is registered, but its handler is pending todo 57``, exit 1
+
+**Todo 116's guard tested the parse, not the dispatch.** I accepted it because a mutation of
+`PENDING_COMMANDS` failed two tests — but that mutation exercised the roster, not the dispatcher.
+*Seventh instance of a fixture friendlier than reality, and the second time in this exact area.*
+
+### SEAM #12, found by F3 — `completion` advertised as working, emits zero bytes
+
+`completion`, `completion bash|zsh|fish` all exit 1 with no output, while `--help` advertises
+"Generate shell completion output" **twice**. The disposition table is honest (it is in
+`PENDING_COMMANDS`), so this is not the `export` defect again — it is `--help` promising what the
+handler refuses. A user following help to generate completions cannot proceed.
+
+### The rest are plan-versus-reality contradictions, and several need a decision
+
+| finding | reviewers | why it is not just a fix |
+|---|---|---|
+| Criterion 1 names **opencode 1.18.13**; `compat_suite.rs` hard-codes the installed **1.18.12** and its capture | F1 | the 1.18.13 binary is not installed — external dependency |
+| Criterion 4: all 58 ops invoked, but **45 return local `503 backend_unavailable`** and only **5** compare status+body+side-effect exactly | F1, F4 | implementing 45 harness backends is a large scope expansion, not a fix |
+| Criterion 2: `debug config` now exits 0, but the committed differential sets `OPENCODE_PURE=1`, excluding the plugin-generated trees the criterion names. Live non-pure outputs differ — Rust has empty `agent`/`command`, released has a **221,818-byte** agent tree | F1 | real work, and arguably a different feature |
+| Criterion 13 says **twelve** prune tables; the schema has **ten** session-attributable ones and the implementation correctly pins ten | F1, F4 | *the plan is wrong.* F1: "Correcting an inaccurate source count is defensible engineering; it is not a plan amendment, so F1 cannot silently rewrite the frozen criterion" |
+| Criterion 6 requires kiro-auth **0.18.0**; installed is **0.20.1** | F1 | external dependency |
+| Criterion 11: goal survives **two** compactions — tested for one | F1 | real work |
+| G6 Windows half fixed in source, **never executed** (Linux host) | F1, F2, F4 | cannot be executed here |
+| `README.md:128-140` still prints todo 113's G2 figures, not todo 123's | F1, F4 | trivial |
+
+### The pattern worth recording
+
+**Wave 1 found defects; wave 2 found the plan's own contradictions.** Six plan counts were already
+proven wrong during execution; this wave adds the prune-table count, the pinned oracle version, and
+a plugin version. *A frozen contract written before the code existed will contain claims the code
+later proves false — and an auditor cannot amend the contract it is auditing.* That is a decision
+for the plan's owner, not for F1 or for me.
