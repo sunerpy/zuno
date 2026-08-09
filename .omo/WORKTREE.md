@@ -1989,3 +1989,39 @@ I also removed a stray empty `.omo/notepadsFIX` created by my own mistyped redir
 All 12 Final-Wave blockers are now closed (115-122 for the findings, 123 for the regression they
 exposed). The wave must be re-run in full rather than spot-checked — F1 rejected partly on
 evidence that no longer applies, and F2/F3/F4 each need to see the fixes.
+
+## Wave 43 (2026-08-09): Final Wave re-run — all 12 blockers closed
+
+`main` = `3d68d7a`, **3260 tests**, 0 clippy, fmt clean, lock reproducible offline. 123/128 done.
+
+### The twelve blockers and their fixes
+
+| # | blocker | closed by | verified by me |
+|---|---|---|---|
+| 1 | Rust session row unreadable by TS | 115 | `TS-exit=0`, column reads `{"id":"m","providerID":"lq"}` |
+| 2 | `export` advertised, never worked | 116 | 58,011 canonical bytes, **identical** to 1.18.12 |
+| 3 | `debug config` exit 1 on user's config | 117 | both binaries exit 0; bogus keys still rejected *and named* |
+| 4 | 2 of 58 `/api` ops unserved | 118 | `200 text/event-stream` + `server.connected` |
+| 5 | 6 divergences outside the allow-list | 119 | removing one **and** lowering the count still fires 2 assertions |
+| 6 | G1/G2 evidence chain broken | 122 | artefact tracked, honest **FAIL** recorded |
+| 7 | crate roster 34→36 unnoticed | 119 | throwaway crate fails the roster gate |
+| 8 | vacuous G5 turn-event gate | 120 | F2's exact mutation now **FAILS** |
+| 9 | failed body read → empty body | 120 | routed through `transient`, cause retained |
+| 10 | PTY broken by containment | 121 | both PTY tests fail without `tcsetpgrp`; reaping still passes |
+| 11 | Windows job leak | 121 | fixed; **honestly marked NOT EXECUTED** on Linux |
+| 12 | 4 unjustified `#[allow]` | 122 | stripping a `reason` fails the guard by name |
+
+Plus **13**: the G2 regression those fixes introduced, found by 122 and fixed by 123.
+
+### Why the whole wave is re-run rather than spot-checked
+
+F1 rejected partly on evidence that no longer exists in that form; F2's blockers each need their
+mutation re-run; F3's two blockers were product defects that need re-running as a *user*; F4 must
+judge whether the remediation itself crept. Each reviewer was given its own prior report, the
+specific fix, and **how I already verified it** — so it can disagree with me rather than restate me.
+
+Each was also handed the disclosed gaps up front (Windows NOT EXECUTED, `oc-process`'s
+NOT MEASURED baseline, the three untested-and-undocumented capabilities, G2's 1.29% margin) so it
+audits *disclosure* rather than rediscovering.
+
+worktrees: oc-wt/tF{1,2,3,4}
