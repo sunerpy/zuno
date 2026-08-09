@@ -380,6 +380,74 @@ fn library_sources(root: &Path) -> Vec<(String, PathBuf)> {
     found
 }
 
+fn first_party_rust_sources(root: &Path) -> Vec<(String, PathBuf)> {
+    let crates_dir = root.join("crates");
+    let mut found = Vec::new();
+    let entries = std::fs::read_dir(&crates_dir).expect("crates/ is readable");
+    for entry in entries.flatten() {
+        let crate_dir = entry.path();
+        if !crate_dir.is_dir() {
+            continue;
+        }
+        let name = crate_dir
+            .file_name()
+            .expect("crate directory has a name")
+            .to_string_lossy()
+            .into_owned();
+        collect_rust_files(&crate_dir, &name, &mut found);
+    }
+    found.sort();
+    found
+}
+
+fn allow_attributes(text: &str) -> Vec<(usize, String)> {
+    let lines: Vec<_> = text.lines().collect();
+    let mut attributes = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let trimmed = lines[index].trim_start();
+        if !trimmed.starts_with("#[allow(") && !trimmed.starts_with("#![allow(") {
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        let mut attribute = trimmed.to_owned();
+        while !attribute.trim_end().ends_with(")]") {
+            index += 1;
+            assert!(
+                index < lines.len(),
+                "unterminated allow attribute beginning on line {}",
+                start + 1
+            );
+            attribute.push('\n');
+            attribute.push_str(lines[index].trim());
+        }
+        attributes.push((start + 1, attribute));
+        index += 1;
+    }
+    attributes
+}
+
+fn allow_has_reason(attribute: &str) -> bool {
+    attribute
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>()
+        .contains("reason=")
+}
+
+/// The memory harness is frozen by the performance methodology. Its writer takes
+/// all immutable report inputs explicitly; replacing them with an options object
+/// solely to satisfy Clippy would alter the file whose executable hash keys the
+/// resumable measurement cache. Todo 122 therefore records this one exact legacy
+/// attribute here instead of changing `tests/memory.rs` after the measured run.
+const FROZEN_ALLOW_WITH_EXTERNAL_REASON: (&str, usize, &str) = (
+    "crates/oc-testkit/tests/memory.rs",
+    844,
+    "#[allow(clippy::too_many_arguments)]",
+);
+
 fn collect_rust_files(dir: &Path, crate_name: &str, out: &mut Vec<(String, PathBuf)>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -427,6 +495,55 @@ fn no_first_party_source_file_uses_unsafe() {
          `unsafe_code = \"forbid\"`, so the shipped artifact contains no \
          first-party unsafe code and this scan keeps that true even for a crate \
          that has not inherited the lint:\n{}",
+        offenders.len(),
+        offenders.join("\n")
+    );
+}
+
+#[test]
+fn every_first_party_lint_suppression_has_a_reason() {
+    let root = workspace_root();
+    let sources = first_party_rust_sources(&root);
+    assert!(
+        sources.len() >= MINIMUM_SOURCE_FILES,
+        "scanned only {} Rust files under {}; the scan is looking in the wrong place",
+        sources.len(),
+        root.join("crates").display()
+    );
+
+    let mut offenders = Vec::new();
+    let mut frozen_exception_seen = false;
+    for (crate_name, path) in &sources {
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let relative = path
+            .strip_prefix(&root)
+            .expect("first-party source is below workspace root")
+            .to_string_lossy();
+        for (line, attribute) in allow_attributes(&text) {
+            if allow_has_reason(&attribute) {
+                continue;
+            }
+            if (relative.as_ref(), line, attribute.as_str()) == FROZEN_ALLOW_WITH_EXTERNAL_REASON {
+                frozen_exception_seen = true;
+                continue;
+            }
+            offenders.push(format!(
+                "  {relative}:{line} [crate {crate_name}]\n    {}",
+                attribute.replace('\n', " ")
+            ));
+        }
+    }
+
+    assert!(
+        frozen_exception_seen,
+        "the single documented frozen-harness exception moved or disappeared; remove or update \
+         FROZEN_ALLOW_WITH_EXTERNAL_REASON deliberately"
+    );
+    assert!(
+        offenders.is_empty(),
+        "{} first-party `allow` attribute(s) lack `reason = ...`; justify each suppression at \
+         the attribute rather than silently expanding the exception list:\n{}",
         offenders.len(),
         offenders.join("\n")
     );

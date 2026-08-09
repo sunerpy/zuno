@@ -200,7 +200,10 @@ mod tests {
     use super::*;
 
     #[derive(JsonSchema)]
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "the fields are consumed only by the JsonSchema derive in this schema fixture"
+    )]
     struct Params {
         command: String,
         timeout: Option<u32>,
