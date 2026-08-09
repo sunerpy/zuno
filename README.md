@@ -92,7 +92,7 @@ cursor stream remains available for compatibility. Slow subscribers stay bounded
 and receive an explicit lag diagnostic rather than growing memory.
 
 The API differential invokes all 58 upstream operations against both binaries.
-35 of the 58 upstream operations have local backends; the remaining 23 return an
+44 of the 58 upstream operations have local backends; the remaining 14 return an
 operation-specific `503 backend_unavailable` and remain reported as compatibility
 gaps. A registered `501` can never satisfy the matrix.
 
