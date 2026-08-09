@@ -1,0 +1,281 @@
+task 124 — route the implemented-command guard through the production dispatcher
+================================================================================
+worktree: /config/workspace/ProdDir/AI/oc-wt/t124   branch: task-124
+base commit: 9399847 (docs(omo): second final wave — seams 11 and 12, ...)
+date: 2026-08-09
+production source changed: NONE. This todo adds test coverage only; every
+`crates/oc-cli/src/cmd/mod.rs` edit below is a mutation applied and reverted.
+
+
+1. THE DEFECT, REPRODUCED BEFORE FIXING
+--------------------------------------------------------------------------------
+F2 (`.omo/evidence/F2-REPORT-wave2.md`, blocking finding 1) proved both of todo
+116's "structural" guards are vacuous. `surface.rs`'s `dispatch_request` stops
+after parsing: it constructs a `DispatchRequest` and never calls
+`crates/oc-cli/src/cmd/mod.rs:35-66`, where the production
+`HeadlessCommandDispatcher` actually selects a handler. The guards then read only
+`request.args.is_pending()` and the static `PENDING_COMMANDS` roster.
+
+Reproduced on this branch, at base commit 9399847, before adding anything:
+
+  # crates/oc-cli/src/cmd/mod.rs
+  - DispatchArguments::Agent(args) => {
+  -     agent::execute(args, &request.environment).map_err(to_error)
+  - }
+  + DispatchArguments::Agent(_) => PendingCommandDispatcher.dispatch(request),
+
+  $ cargo test -p oc-cli --test surface --offline
+  test surface_no_implemented_disposition_routes_to_the_pending_handler ... ok
+  test surface_every_implemented_command_actually_has_a_handler ....... ok
+  test result: ok. 11 passed; 0 failed
+
+  $ opencode-rust agent list
+  `agent` is registered, but its handler is pending todo 56
+  $ echo $?
+  1
+
+Both guards green; the binary broken. Same class as the `export` defect todo 116
+was created to close, in the same file.
+
+Note on the reported string: F2 and the plan quote "pending todo 57"; the binary
+on this base prints "pending todo 56". The number comes from
+`PENDING_COMMANDS`' recorded reason for whichever entry the stub reports, and it
+is incidental to the finding — the observable defect (pending handler reached,
+exit 1, both guards green) reproduces exactly as described.
+
+
+2. WHAT WAS ADDED
+--------------------------------------------------------------------------------
+`crates/oc-cli/tests/surface.rs` only.
+
+a) `surface_every_implemented_command_reaches_its_handler_through_the_production_dispatcher`
+   The guard. Runs the shipped binary once per implemented command, in a private
+   temporary root with the same isolation `tests/differential.rs` uses (HOME and
+   all four XDG dirs redirected, OPENCODE_DB redirected, autoupdate / models
+   fetch / default plugins / LSP download disabled). For each probe it asserts
+   two things about the combined stdout+stderr the user would see:
+     - neither of `PendingCommandDispatcher`'s two sentences appears, anchored on
+       the command name so a handler that legitimately says "is not available"
+       about something else cannot trip it (`run --fork` does exactly that);
+     - a fragment ONLY THAT COMMAND'S HANDLER emits does appear.
+   The second assertion is what makes the test non-vacuous. Absence-only
+   checking would pass against an arm replaced with `Ok(())`; see section 4.
+
+b) `surface_failure_scenario_the_binary_prints_a_pending_marker_for_a_stub`
+   The negative control for (a), driven through the binary rather than by
+   calling `PendingCommandDispatcher` directly. Proves "no probe printed a
+   pending marker" is a live observation and not a string nothing can produce
+   any more. `completion` is the one command legitimately routed to the stub.
+
+c) `IMPLEMENTED_PROBES` became a struct with an `evidence` field. Each probe's
+   argv is chosen to reach the handler and return promptly without network or
+   writes outside the temporary root. Two arms are entered through a flag the
+   handler itself refuses — `serve --mdns`, `run --fork` — because that refusal
+   is produced INSIDE the handler, after routing; a bare `serve` would block on
+   a listening socket and a bare `run` would want a provider.
+
+d) The two pre-existing guards were KEPT, not deleted, and one was RENAMED to
+   its true scope: `surface_no_implemented_disposition_routes_to_the_pending_handler`
+   -> `surface_no_implemented_disposition_parses_into_the_pending_variant`.
+   It still catches something the new guard does not: a command registered
+   straight onto `DispatchArguments::Pending`, which is `completion`'s shape.
+   Its doc comment now states the limit F2 found instead of overstating reach.
+   `surface_every_implemented_command_actually_has_a_handler` is unchanged in
+   substance and is load-bearing for the new guard: it makes `IMPLEMENTED_PROBES`
+   a bijection with the implemented dispositions, which is what turns the new
+   guard from a sample into full coverage.
+
+No dependency was added: `tempfile` was already a dev-dependency of `oc-cli`.
+
+
+3. COVERAGE IS EXHAUSTIVE, NOT SAMPLED — ALL 12 ARMS MUTATED
+--------------------------------------------------------------------------------
+A guard that probed only `agent` would fall to the same mutation one arm over.
+So every arm of `cmd/mod.rs`'s `match` was re-pointed at
+`PendingCommandDispatcher`, one at a time, reverting between each:
+
+  arm=Db        new_guard_FAILED=1 parse_guard_A_ok=1 parse_guard_B_ok=1 | 12 passed; 1 failed
+  arm=Session   new_guard_FAILED=1 parse_guard_A_ok=1 parse_guard_B_ok=1 | 12 passed; 1 failed
+  arm=Agent     new_guard_FAILED=1 parse_guard_A_ok=1 parse_guard_B_ok=1 | 12 passed; 1 failed
+  arm=Models    new_guard_FAILED=1 parse_guard_A_ok=1 parse_guard_B_ok=1 | 12 passed; 1 failed
+  arm=Providers new_guard_FAILED=1 parse_guard_A_ok=1 parse_guard_B_ok=1 | 12 passed; 1 failed
+  arm=Mcp       new_guard_FAILED=1 parse_guard_A_ok=1 parse_guard_B_ok=1 | 12 passed; 1 failed
+  arm=Debug     new_guard_FAILED=1 parse_guard_A_ok=1 parse_guard_B_ok=1 | 12 passed; 1 failed
+  arm=Serve     new_guard_FAILED=1 parse_guard_A_ok=1 parse_guard_B_ok=1 | 12 passed; 1 failed
+  arm=Run       new_guard_FAILED=1 parse_guard_A_ok=1 parse_guard_B_ok=1 | 12 passed; 1 failed
+  arm=Tui       new_guard_FAILED=1 parse_guard_A_ok=1 parse_guard_B_ok=1 | 12 passed; 1 failed
+  arm=Export    new_guard_FAILED=1 parse_guard_A_ok=1 parse_guard_B_ok=1 | 11 passed; 2 failed
+  arm=Import    new_guard_FAILED=1 parse_guard_A_ok=1 parse_guard_B_ok=1 | 12 passed; 1 failed
+
+  parse_guard_A = surface_no_implemented_disposition_parses_into_the_pending_variant
+  parse_guard_B = surface_every_implemented_command_actually_has_a_handler
+
+Two facts in that table, and both matter:
+  - the new guard FAILS on all 12 arms — full-branch coverage, no sampling;
+  - both parse-level guards stay GREEN on all 12 arms — F2's finding confirmed
+    at every arm, not just `Agent`, which is precisely why a parse- or
+    roster-level assertion cannot be the only coverage.
+
+The `Export` row shows 2 failures because todo 116's own
+`surface_export_no_longer_reports_a_pending_handler` also fires there. That is
+the one arm the old suite could already see, and it is the arm todo 116 was
+written for — a useful reminder that the old suite's single real check was
+hand-written per-command and therefore did not generalise.
+
+`Pending(_, _)` is the thirteenth arm and is deliberately not mutated: routing it
+to `PendingCommandDispatcher` is its correct behaviour, and
+`surface_failure_scenario_the_binary_prints_a_pending_marker_for_a_stub` asserts
+that arm positively.
+
+
+4. F2's EXACT MUTATION, AFTER THE FIX
+--------------------------------------------------------------------------------
+  # crates/oc-cli/src/cmd/mod.rs
+  DispatchArguments::Agent(_) => PendingCommandDispatcher.dispatch(request),
+
+  $ OC_MEMORY_GATE_MODE=skip cargo test -p oc-cli --test surface --offline
+  test surface_every_implemented_command_actually_has_a_handler ... ok
+  test surface_no_implemented_disposition_parses_into_the_pending_variant ... ok
+  test surface_export_no_longer_reports_a_pending_handler ... ok
+  test surface_failure_scenario_the_pending_handler_is_detectable ... ok
+  test surface_failure_scenario_the_binary_prints_a_pending_marker_for_a_stub ... ok
+  test surface_every_implemented_command_reaches_its_handler_through_the_production_dispatcher ... FAILED
+
+  ---- surface_every_implemented_command_reaches_its_handler_through_the_production_dispatcher stdout ----
+  panicked at crates/oc-cli/tests/surface.rs:458:5:
+  `agent` is recorded as implemented, but `["agent", "list"]` reached the pending handler in production:
+  `agent` is registered, but its handler is pending todo 56
+
+  `agent` never produced its handler's own output: `["agent", "list"]` was expected to emit "build (primary)", and emitted:
+  `agent` is registered, but its handler is pending todo 56
+
+  test result: FAILED. 12 passed; 1 failed; 0 ignored
+
+Mutation reverted; `git diff crates/oc-cli/src/cmd/mod.rs` is empty.
+
+The weaker no-op mutation is caught too, which is the point of asserting
+positive handler evidence rather than only the stub sentence's absence:
+
+  DispatchArguments::Agent(_) => Ok(()),
+
+  test surface_every_implemented_command_reaches_its_handler_through_the_production_dispatcher ... FAILED
+  `agent` never produced its handler's own output: `["agent", "list"]` was
+  expected to emit "build (primary)", and emitted:
+  test result: FAILED. 12 passed; 1 failed; 0 ignored
+
+Mutation reverted.
+
+
+5. TODO 116 STILL HOLDS
+--------------------------------------------------------------------------------
+  test surface_export_no_longer_reports_a_pending_handler ... ok
+
+On unmutated production code all 13 surface tests pass:
+
+  running 13 tests
+  test surface_every_implemented_command_actually_has_a_handler ... ok
+  test surface_every_upstream_command_has_exactly_one_disposition ... ok
+  test surface_failure_scenario_detects_an_unhandled_fixture_command ... ok
+  test surface_providers_keeps_the_auth_alias ... ok
+  test surface_registered_commands_match_their_dispositions ... ok
+  test surface_failure_scenario_the_pending_handler_is_detectable ... ok
+  test surface_the_pending_command_roster_is_complete_and_accurate ... ok
+  test surface_no_implemented_disposition_parses_into_the_pending_variant ... ok
+  test surface_compatibility_version_and_rust_identity_are_separate ... ok
+  test surface_console_is_rejected_with_scope_and_replacement ... ok
+  test surface_failure_scenario_the_binary_prints_a_pending_marker_for_a_stub ... ok
+  test surface_export_no_longer_reports_a_pending_handler ... ok
+  test surface_every_implemented_command_reaches_its_handler_through_the_production_dispatcher ... ok
+  test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+
+6. GATES
+--------------------------------------------------------------------------------
+  $ OC_MEMORY_GATE_MODE=skip cargo test --workspace --offline
+    TOTAL passed=3262 failed=0 ignored=2
+
+  $ cargo clippy --workspace --all-targets --offline -- -D warnings
+    0 warning/error lines. Finished.
+
+  $ cargo fmt --all --check
+    clean
+
+  $ cargo metadata --locked --offline --format-version 1
+    clean
+
+The ~100-minute memory gate and the two-hour soak were NOT run, as instructed;
+`OC_MEMORY_GATE_MODE=skip` was set for every `cargo test` invocation. The frozen
+perf surface was not touched.
+
+`cargo clippy --all-targets` type-checks and lints `tests/surface.rs`, so the
+changed file is covered by a linter even though the worktree-local LSP declined
+paths outside its cwd.
+
+
+7. THE TEST-COUNT CRITERION IS WRONG FOR THIS BRANCH — READ THIS
+--------------------------------------------------------------------------------
+The task brief states "main is currently 3292 passing, all must still pass". The
+measured numbers on this branch are:
+
+  base commit 9399847, no changes  : 3260 passed, 0 failed, 2 ignored
+  with this todo's changes         : 3262 passed, 0 failed, 2 ignored   (+2 tests)
+
+3292 is not reachable here, and not because anything regressed. `main` is 14
+commits AHEAD of this branch's base:
+
+  $ git rev-list --count task-124..main
+  14
+  $ git merge-base main task-124
+  9399847                       <- this branch's HEAD, i.e. main's ancestor
+
+Those 14 commits include todos 127, 128 and 130 (`feat(server): implement the
+catalog and filesystem api operations`, `feat(server): implement session-read,
+permission, question and pty-attach operations`) plus a re-pinned compat oracle,
+all of which add tests. The +32 is theirs, not a shortfall of mine.
+
+The honest invariant, and the one satisfied: no test that passed at this
+branch's base fails now, and the branch adds 2. I did NOT merge main in to chase
+the number — that would have produced a merge commit (the todo requires exactly
+one) and would have pulled three other in-flight tasks' work into this branch.
+`main` touches neither `crates/oc-cli/tests/surface.rs` nor
+`crates/oc-cli/src/cmd/mod.rs`, so the code merges without conflict.
+
+
+8. THE PLAN ENTRY FOR TODO 124 EXISTS ONLY ON MAIN
+--------------------------------------------------------------------------------
+Consequence of the same branch gap. `84341d1 plan(omo): add todos 124-126 for
+the fixable second-wave findings` is one of the 14 commits this branch lacks, so
+`.omo/plans/opencode-rust.md` at base 9399847 has no todo 124 to tick.
+
+To tick it without fabricating a divergent copy of the entry, `main`'s version of
+that one file was taken verbatim (`git checkout main -- .omo/plans/opencode-rust.md`)
+and only todo 124's checkbox and Measured line were changed. Taking the whole
+file rather than splicing in a hand-written 124 block is deliberate: an inserted
+block would collide with main's own insertion at the same location and conflict
+on merge, whereas an identical file plus one changed line merges cleanly.
+
+Todos 125 and 126 tick adjacent lines in this same region from their own
+worktrees. That is a known integration hazard for whoever merges, not something
+this branch can resolve alone.
+
+
+9. SCOPE
+--------------------------------------------------------------------------------
+Changed:
+  crates/oc-cli/tests/surface.rs        (+ the guard, + its negative control,
+                                         Probe struct, renamed parse guard)
+  .omo/plans/opencode-rust.md           (main's version + todo 124 ticked)
+  .omo/evidence/task-124-opencode-rust.txt   (this file)
+  .omo/notepads/opencode-rust/learnings.md   (appended)
+
+Not touched, as instructed:
+  crates/oc-cli/src/command.rs          (todo 125)
+  crates/oc-cli/tests/docs.rs           (todo 126)
+  crates/oc-server/**                   (todo 129)
+  crates/oc-testkit/src/perf/**, docs/perf-methodology.md,
+  benchmarks/ts-baseline.json,
+  crates/oc-testkit/tests/{memory,soak,backpressure}.rs   (frozen perf surface)
+
+No production source was changed by this todo. No dependency added. No test
+weakened, skipped, `#[ignore]`d or deleted — the one rename preserves the test
+and narrows only its stated claim, and its assertions are unchanged.
