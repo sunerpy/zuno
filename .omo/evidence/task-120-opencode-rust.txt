@@ -1,0 +1,73 @@
+Task 120 evidence — production turn-event backpressure and failed error-body reads
+Date: 2026-08-09
+Baseline HEAD: 8a04f19d6befb4322938dd578ce72c65b9d581e4
+
+IMPLEMENTATION
+
+1. crates/oc-testkit/tests/backpressure.rs
+   - engine_turn_events_apply_backpressure now constructs the production queue with
+     oc_engine::event_channel().
+   - The gate fills TURN_EVENT_CHANNEL_CAPACITY through TurnEventSender::publish,
+     observes the next production send block while an independent task progresses,
+     drains one event, and observes the blocked producer resume.
+   - The source inventory remains unchanged at 17 bounded channels, 2 declared
+     single-completion exclusions, and 0 undeclared channels.
+
+2. crates/oc-provider-compatible/src/transport.rs
+   - A failed response.bytes().await on a non-2xx response is mapped through
+     ProviderError::transient rather than replaced with empty bytes.
+   - The regression fixture returns HTTP 400 with Content-Length larger than the
+     transmitted JSON body, then closes. The test requires a retryable Transient
+     error with the reqwest body-read failure retained as its source.
+
+TDD / MUTATION EVIDENCE
+
+Turn-event good source:
+  OC_MEMORY_GATE_MODE=skip cargo test -p oc-testkit --test backpressure \
+    engine_turn_events_apply_backpressure --offline -- --exact --nocapture
+  Result: PASS, 1 passed; 0 failed.
+
+Turn-event mutant:
+  Temporarily replaced the awaited production send with a constructed-and-dropped
+  self.sender.send(event) future while retaining the registry source needle.
+  Result: FAIL as required:
+    TurnEventSender did not block when the production channel reached capacity
+    0 passed; 1 failed.
+  The mutation was reverted immediately.
+
+Undeclared-channel mutant:
+  Temporarily added mpsc::channel::<u8>(1) beside event_channel() without a registry
+  entry.
+  Result: source_channel_inventory_matches_the_declared_registry FAIL as required;
+  the undeclared construction appeared only in the actual set.
+  The mutation was reverted immediately.
+
+Provider red test:
+  cargo test -p oc-provider-compatible \
+    transport::tests::a_truncated_error_body_surfaces_the_read_failure_as_transient \
+    --offline -- --exact --nocapture
+  Before the fix: FAIL with Fatal { status: Some(400), ... body: Some("") }.
+  After the fix: PASS, 1 passed; 0 failed.
+
+STATIC DIAGNOSTICS
+
+  lsp_diagnostics crates/oc-testkit/tests/backpressure.rs: no diagnostics
+  lsp_diagnostics crates/oc-provider-compatible/src/transport.rs: no diagnostics
+
+FINAL OFFLINE VERIFICATION
+
+Command (single chained run after the final fixture correction):
+  OC_MEMORY_GATE_MODE=skip cargo test --workspace --offline &&
+  cargo clippy --workspace --all-targets --offline &&
+  cargo fmt --all --check &&
+  cargo metadata --locked --offline --format-version 1 >/dev/null
+
+Result: PASS.
+  - Workspace tests and doctests passed; the new provider regression passed.
+  - Clippy completed with no warnings or errors.
+  - rustfmt check passed.
+  - Locked offline metadata resolution passed.
+
+The real memory and two-hour soak gates were not run. OC_MEMORY_GATE_MODE=skip
+kept the ordinary workspace suite from invoking the opt-in memory measurement, as
+required for this task.

@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use oc_engine::r#loop::{TURN_EVENT_CHANNEL_CAPACITY, TurnEvent, event_channel};
 use tokio::sync::{broadcast, mpsc, watch};
 
 const PROGRESS_TIMEOUT: Duration = Duration::from_secs(1);
@@ -339,7 +340,37 @@ channel_gate!(
 );
 channel_gate!(lsp_client_closed_keeps_latest_value, "lsp-client-closed");
 channel_gate!(watch_events_coalesce_when_full, "watch-events");
-channel_gate!(engine_turn_events_apply_backpressure, "engine-turn-events");
+#[tokio::test]
+async fn engine_turn_events_apply_backpressure() {
+    let (sender, mut receiver) = event_channel();
+    for index in 0..TURN_EVENT_CHANNEL_CAPACITY {
+        sender
+            .publish(turn_started(index))
+            .await
+            .expect("consumer remains open while filling the production channel");
+    }
+
+    let blocked_sender = sender.clone();
+    let blocked = tokio::spawn(async move {
+        blocked_sender
+            .publish(turn_started(TURN_EVENT_CHANNEL_CAPACITY))
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !blocked.is_finished(),
+        "TurnEventSender did not block when the production channel reached capacity"
+    );
+    observe_independent_progress().await;
+
+    assert_eq!(receiver.recv().await, Some(turn_started(0)));
+    tokio::time::timeout(PROGRESS_TIMEOUT, blocked)
+        .await
+        .expect("blocked TurnEventSender resumes after the consumer advances")
+        .expect("producer task succeeds")
+        .expect("production consumer remains open");
+    assert_eq!(receiver.recv().await, Some(turn_started(1)));
+}
 channel_gate!(pty_subscriber_output_reports_lag, "pty-subscriber-output");
 channel_gate!(
     pty_lifecycle_events_lag_one_subscriber,
@@ -398,6 +429,12 @@ async fn run_channel_gate(id: &str) {
         }
         Policy::ClosedDrop => probe_closed_drop().await,
         Policy::SingleCompletion => panic!("single-completion channel cannot accumulate: {id}"),
+    }
+}
+
+fn turn_started(index: usize) -> TurnEvent {
+    TurnEvent::TurnStarted {
+        session_id: format!("backpressure-{index}"),
     }
 }
 
