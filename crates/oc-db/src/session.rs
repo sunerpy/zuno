@@ -204,6 +204,45 @@ pub struct Summary {
     pub diffs: Option<String>,
 }
 
+/// The `session.model` column's payload, in the one shape upstream decodes.
+///
+/// # The key the `session` table uses is not the key the `message` table uses
+///
+/// A session's model is
+/// `Schema.Struct({ id: ModelV2.ID, providerID: ProviderV2.ID, variant: optional(Schema.String) })`
+/// (`packages/opencode/src/session/session.ts:220-224`), read back as `row.model.id`
+/// (`:88-93`). A *message's* model names the same thing `modelID`
+/// (`packages/opencode/src/session/message.ts:121-125`). A session row written with
+/// `modelID` therefore has no `id`, and the released binary rejects the entire
+/// listing with `Expected string, got undefined` and exit 1 — a Rust turn leaving a
+/// database the binary a user rolls back to cannot read.
+///
+/// Measured against a 5,961-row TypeScript-written `session` table: `id` present in
+/// 5,961 rows, `modelID` in 0.
+///
+/// `variant` is `optional` in that schema and absent from 197 of those rows, so it
+/// is omitted rather than emitted as `null` — upstream's writer passes `info.model`
+/// through unchanged (`session.ts:130`) and its decoder distinguishes a missing key
+/// from an explicit `null`. Nothing in this port has a variant to record at
+/// session-creation time.
+///
+/// Stated once here, beside the column, because a `json!` at each call site is how
+/// the two spellings diverged in the first place.
+#[must_use]
+pub fn model_reference(provider_id: &str, model_id: &str) -> String {
+    #[derive(serde::Serialize)]
+    struct ModelReference<'a> {
+        id: &'a str,
+        #[serde(rename = "providerID")]
+        provider_id: &'a str,
+    }
+    serde_json::to_string(&ModelReference {
+        id: model_id,
+        provider_id,
+    })
+    .expect("two string fields always serialize")
+}
+
 /// Everything [`create`] needs to write a row.
 ///
 /// `id` and `slug` are supplied by the caller rather than generated here.
@@ -1441,5 +1480,18 @@ mod tests {
             SessionCreate::default_title_prefix(Some("ses_parent")),
             "Child session - "
         );
+    }
+
+    #[test]
+    fn a_model_reference_uses_the_session_spelling_and_omits_the_variant() {
+        assert_eq!(
+            model_reference("anthropic", "claude-sonnet-4-5"),
+            r#"{"id":"claude-sonnet-4-5","providerID":"anthropic"}"#
+        );
+        let quoted = model_reference("a\"b", "c\\d");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&quoted).expect("a quoted id still produces JSON");
+        assert_eq!(parsed["id"], "c\\d");
+        assert_eq!(parsed["providerID"], "a\"b");
     }
 }

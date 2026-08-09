@@ -122,6 +122,14 @@ const SURFACES: &[SurfaceRow] = &[
         detail: "the headline case: a Rust-created database is opened by the real binary, which must not die and must leave the 38 completed ids unchanged",
     },
     SurfaceRow {
+        id: "db-session-decode",
+        name: "a session row this port wrote, decoded by the real binary",
+        verdict: Verdict::Compared,
+        oracle: OracleKind::LiveBinary,
+        evidence: "crates/oc-testkit/tests/compat_suite.rs::a_session_written_by_this_port_is_decodable_by_the_real_binary",
+        detail: "the journal round-trip above proves the real binary survives opening a Rust database; it does not prove the binary can read the rows a Rust turn writes. This one hands it a session written through oc_db::session::create and requires `session list` to exit 0 — the gap that let a `modelID`-spelled session.model reach a release. End-to-end through the production binary in crates/oc-cli/tests/rollback.rs::the_released_binary_lists_a_session_this_port_wrote",
+    },
+    SurfaceRow {
         id: "api-operations",
         name: "/api path+method set and served OpenAPI document",
         verdict: Verdict::PartiallyCompared,
@@ -667,6 +675,128 @@ fn journal_round_trip_through_the_real_binary_does_not_replay_migrations() {
     assert_eq!(
         after, before,
         "the real binary changed the completed migration set"
+    );
+}
+
+/// Write one session into a database the oracle already created, and return its id.
+///
+/// The project row is the **oracle's own**, read back rather than invented, because
+/// `session list` is scoped to the project it resolves for the directory it runs in:
+/// a session under a project id this test made up produces exit 0 and an empty
+/// listing, which would silently stop exercising the decoder. Reusing the oracle's
+/// project makes the session row the only thing under test.
+///
+/// `oc_db::session::create` and [`oc_db::session::model_reference`] are the
+/// production writers, called directly. Hand-building the `model` JSON here would
+/// make this test agree with a fixture rather than with the binary, which is the
+/// failure this whole target exists to prevent.
+fn write_session_through_this_port(path: &Path) -> String {
+    let mut connection = oc_db::open::open_at(path).expect("open the oracle's database");
+    let (project_id, worktree): (String, String) = connection
+        .query_row(
+            "SELECT id, worktree FROM project ORDER BY rowid LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("the oracle resolved a project when it created the database");
+    let mut input = oc_db::session::SessionCreate::new(
+        "ses_rollbackrollbackrollbackrollb",
+        "rollback",
+        &project_id,
+        &worktree,
+        &worktree,
+        "Rollback",
+        "0.1.0",
+    )
+    .at(1_780_000_000_000);
+    input.agent = Some("build".to_owned());
+    input.model = Some(oc_db::session::model_reference("test", "test-model"));
+    let transaction = connection.transaction().expect("begin");
+    let created = oc_db::session::create(&transaction, &input).expect("write the session");
+    transaction.commit().expect("commit");
+    created.into_session().id
+}
+
+/// Run `session list --format json` on the released binary against `database`.
+fn oracle_session_list(binary: &Path, root: &Path, database: &Path) -> Output {
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).expect("create isolated oracle home");
+    Command::new(binary)
+        .args(["session", "list", "--format", "json"])
+        .current_dir(root)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", home)
+        .env("OPENCODE_DB", database)
+        .env("OPENCODE_DISABLE_AUTOUPDATE", "1")
+        .output()
+        .expect("run the real opencode binary")
+}
+
+/// Surviving a Rust database is not the same as reading the rows a Rust turn wrote.
+///
+/// [`journal_round_trip_through_the_real_binary_does_not_replay_migrations`] opens an
+/// **empty** Rust database and checks the `migration` table. That passes whatever
+/// this port later writes into `session`, which is precisely how a session row
+/// spelled `{"providerID","modelID"}` reached a release: upstream decodes
+/// `row.model.id` (`packages/opencode/src/session/session.ts:88-93`), so the missing
+/// key fails the whole listing with `Expected string, got undefined` and exit 1.
+///
+/// This test closes that gap at the suite level, so the suite is the thing that
+/// fails. The end-to-end version — a real turn through the production binary, then
+/// this same rollback — is `crates/oc-cli/tests/rollback.rs`.
+#[test]
+fn a_session_written_by_this_port_is_decodable_by_the_real_binary() {
+    let Some(binary) = oracle_binary() else {
+        eprintln!(
+            "SKIPPED a_session_written_by_this_port_is_decodable_by_the_real_binary: no opencode \
+             binary at {ORACLE_BINARY}; the session-decode seam was NOT compared"
+        );
+        return;
+    };
+    let root = tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("rollback.db");
+
+    let initial = oracle_session_list(&binary, root.path(), &path);
+    assert!(
+        initial.status.success(),
+        "the real binary could not create its own database, so this test never \
+         reached the seam it exists for:\n{}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    let session_id = write_session_through_this_port(&path);
+
+    let stored: String = {
+        let connection = oc_db::Connection::open(&path).expect("reopen the written database");
+        connection
+            .query_row(
+                "SELECT model FROM session WHERE id = ?1",
+                [&session_id],
+                |row| row.get(0),
+            )
+            .expect("read the persisted model column")
+    };
+
+    let output = oracle_session_list(&binary, root.path(), &path);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!(
+        "db-session-decode: real opencode exited {} session.model={stored} stdout={} stderr={}",
+        output.status,
+        stdout.trim(),
+        stderr.trim()
+    );
+    assert!(
+        output.status.success(),
+        "the real binary could not read a session this port wrote. `session.model` \
+         was {stored}; upstream decodes it as `row.model.id` (session.ts:88-93), so a \
+         row spelled `modelID` takes the whole listing down.\nexit: {}\nstdout:\n\
+         {stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+    assert!(
+        stdout.contains(session_id.as_str()),
+        "the real binary exited 0 but did not list the session this port wrote:\n{stdout}"
     );
 }
 

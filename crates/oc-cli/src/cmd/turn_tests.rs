@@ -298,6 +298,95 @@ fn new_session_and_user_message_are_persisted_together() {
     assert_eq!(parts[0].data["text"], "hello");
 }
 
+/// The two tables that name a model do not name it the same way, and only a test
+/// that reads the persisted bytes can tell.
+///
+/// A session row spelled `modelID` has no `id`, which is what the released
+/// TypeScript binary decodes (`session.ts:88-93`); it rejects the whole listing with
+/// `Expected string, got undefined` and exit 1. Writing and reading the row through
+/// this port alone passes with either spelling, so these assert on the stored JSON's
+/// **keys** rather than on a round trip.
+#[test]
+fn a_persisted_session_names_its_model_id_the_way_upstream_reads_it() {
+    let mut connection =
+        oc_db::open::open(&oc_paths::DbLocation::Memory).expect("open memory database");
+    oc_db::migration::apply(&mut connection).expect("apply schema");
+    let plan = plan("/workspace", SessionChoice::New);
+    let now = 1_780_000_000_000;
+    ensure_project(&connection, &plan.project, now).expect("persist project");
+    let session = resolve_session(&mut connection, &plan, now).expect("create session");
+
+    let stored: String = connection
+        .query_row(
+            "SELECT model FROM session WHERE id = ?1",
+            [&session.id],
+            |row| row.get(0),
+        )
+        .expect("read the persisted model column");
+    let model: serde_json::Value = serde_json::from_str(&stored).expect("the column holds JSON");
+    let keys = model.as_object().expect("a model object");
+
+    assert_eq!(
+        model["id"], "model",
+        "upstream's session decoder reads `row.model.id` (session.ts:88-93); a \
+         session_list on the released binary dies without it. Stored: {stored}"
+    );
+    assert!(
+        !keys.contains_key("modelID"),
+        "`modelID` is the *message* spelling (message.ts:121-125). A session row \
+         carrying it is the defect this test exists for. Stored: {stored}"
+    );
+    assert_eq!(model["providerID"], "provider");
+    assert!(
+        !keys.contains_key("variant"),
+        "`variant` is optional upstream and this port has none to record, so it must \
+         be omitted rather than written as null. Stored: {stored}"
+    );
+}
+
+/// The mirror of the test above, so a later edit cannot "unify" the two shapes.
+///
+/// A message's model is `{modelID, providerID}` (`message.ts:121-125`). Renaming this
+/// to `id` to match the session row would break the sibling boundary in exactly the
+/// same way, and nothing else in the suite would notice.
+#[test]
+fn a_persisted_message_keeps_the_message_spelling_of_its_model() {
+    let mut connection =
+        oc_db::open::open(&oc_paths::DbLocation::Memory).expect("open memory database");
+    oc_db::migration::apply(&mut connection).expect("apply schema");
+    let plan = plan("/workspace", SessionChoice::New);
+    let now = 1_780_000_000_000;
+    ensure_project(&connection, &plan.project, now).expect("persist project");
+    let session = resolve_session(&mut connection, &plan, now).expect("create session");
+    persist_user_message(
+        &connection,
+        &session.id,
+        "build",
+        "provider",
+        "model",
+        "hello",
+        now,
+    )
+    .expect("persist prompt");
+
+    let store = oc_db::message::MessageStore::new(&connection);
+    let messages = store
+        .messages_for_session(&session.id)
+        .expect("load messages");
+    let model = &messages[0].data["model"];
+    let keys = model.as_object().expect("a model object");
+
+    assert_eq!(
+        model["modelID"], "model",
+        "a message names the model `modelID` (message.ts:121-125): {model}"
+    );
+    assert_eq!(model["providerID"], "provider");
+    assert!(
+        !keys.contains_key("id"),
+        "the session spelling must not leak into a message: {model}"
+    );
+}
+
 #[test]
 fn an_explicit_session_is_reused_rather_than_created() {
     let mut connection =
