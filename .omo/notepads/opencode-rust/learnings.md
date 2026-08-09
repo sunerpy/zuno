@@ -6068,3 +6068,47 @@ For streaming APIs, route registration and content type are also insufficient.
 The smallest non-vacuous test must observe one semantic frame and one event caused
 through the public mutation path. Sharing the EventService at the composition root
 is what makes that second assertion test the product rather than a private fixture.
+
+## [2026-08-09] todo 124 — parse-layer assertions cannot prove routing (SEAM #11 closed)
+
+**The rule, stated so it generalises past this file:** an assertion on source
+text, on a parse result, or on a static roster proves only that a *declaration*
+exists. It can never prove which *code path runs*. Todo 116's two guards read
+`DispatchArguments::is_pending()` — the enum variant parsing produced — and the
+routing decision is one step later, in `cmd/mod.rs`'s `match`. Re-pointing any
+arm at `PendingCommandDispatcher` left both guards green while the binary exited
+1. **A guard must name the handler that executed, not the variant that parsed.**
+
+**Why todo 116's mutation check was not enough, and this is the reusable part:**
+I did mutate before accepting 116 — but I mutated `PENDING_COMMANDS`, the
+*roster*, and two roster-reading tests duly failed. The mutation and the test
+read the same layer, so it proved only self-consistency. **A mutation only
+validates a test if it is applied at the layer the production code decides at,
+not at the layer the test reads.** Ask, before accepting: does this mutation
+change what a *user* observes? F2's did — it ran the binary.
+
+**Sampling one arm would have failed the same way.** Verified here by mutating
+**all 12** arms of the `match` one at a time: the new binary-driving guard fails
+on every one, and both parse-level guards stay green on every one. A guard
+covering only `agent` would have fallen to the identical mutation one arm over.
+The bijection test (`every_implemented_command_actually_has_a_handler`) is what
+promotes the probe table from a sample to full coverage — it is load-bearing, not
+decoration.
+
+**Absence assertions are half a test.** "The stub sentence did not appear" also
+passes for an arm replaced with `Ok(())`. Each probe therefore asserts a fragment
+**only that command's handler emits**. Confirmed by mutating an arm to `Ok(())`
+and watching the guard fail on the missing-evidence branch.
+
+**Keep the weak guard, rename it to its true scope.** The parse-level check still
+catches a command registered directly onto `DispatchArguments::Pending`
+(`completion`'s shape), which the binary-driving guard does not. Deleting it
+would have lost real coverage; leaving its name overstating its reach is how the
+next reader gets misled. Renaming it and documenting the limit in place costs
+nothing and stops the claim from drifting again.
+
+**Seventh fixture-friendlier-than-reality defect, second in this exact file.**
+Two in one file says the file's *idiom* was wrong, not that one test was sloppy:
+`dispatch_request` made parse-level assertions the path of least resistance.
+Fixing the idiom (a `Probe` that carries its own observable, and a helper that
+drives the real binary) is what stops a third.
