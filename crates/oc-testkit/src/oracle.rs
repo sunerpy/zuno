@@ -26,6 +26,18 @@
 //! numbers, so a differential failure can never be silently attributed to a
 //! compatibility defect when it was a patch-level difference. A caller that needs
 //! the pinned code exactly asks for [`Oracle::from_source`].
+//!
+//! # Two pins, and they are not the same number
+//!
+//! | pin | what it names | where it lives |
+//! |---|---|---|
+//! | [`PINNED_RELEASE`] | the installed binary every differential runs against | this module, verified by [`Oracle::discover_pinned`] |
+//! | the source baseline | the TypeScript tree this port was read from, and the version it reports to the npm plugin gate | `packages/opencode/package.json` in the located tree, and `oc_plugin::js::spec::REPORTED_PLUGIN_API_VERSION` |
+//!
+//! They are currently `1.18.15` and `1.18.13`. Conflating them is what produced
+//! the artifact F1 rejected — a report recording the source baseline as though it
+//! were the binary that ran. [`Oracle::version_gap`] exists to keep the difference
+//! visible rather than to excuse it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -42,6 +54,29 @@ pub enum OracleFlavour {
     /// The pinned TypeScript source tree, executed with Bun.
     FromSource,
 }
+
+/// The installed release every compatibility claim in this workspace is measured
+/// against: the newest `opencode` release installed on this machine.
+///
+/// # Why this is declared here and verified, rather than discovered
+///
+/// A differential against "whatever `opencode` is on `PATH`" is a differential
+/// against an unknown, so a report that cannot name a version cannot support a
+/// compatibility claim. But a *named* version that nothing checks is worse than
+/// no name at all: until plan todo 130 the harness recorded `1.18.13` while
+/// resolving the installed `1.18.12`, and every artifact produced under that
+/// recording attributed its measurements to a build that never ran.
+///
+/// So the version is declared once, here, and [`Oracle::discover_pinned`] refuses
+/// any binary that does not self-report it. The binary is still *found* by
+/// [`Oracle::discover`] — by [`ENV_ORACLE_BINARY`], else on `PATH` — because
+/// hard-coding an installation path pins the harness to one machine's package
+/// manager. What is pinned is the release, not the route to it.
+///
+/// Moving this constant means recapturing every artifact measured against it. See
+/// `.omo/evidence/task-130-opencode-rust.txt` for what 1.18.15 was measured to
+/// produce.
+pub const PINNED_RELEASE: &str = "1.18.15";
 
 /// Override the discovered oracle binary with an explicit path.
 pub const ENV_ORACLE_BINARY: &str = "OC_TESTKIT_ORACLE";
@@ -82,6 +117,24 @@ impl Oracle {
             Some(OracleFlavour::InstalledBinary) => Self::installed_binary(),
             None => Self::auto(),
         }
+    }
+
+    /// [`Self::discover`], then refuse the result unless it reports [`PINNED_RELEASE`].
+    ///
+    /// This is the constructor every gate should use. [`Self::discover`] answers
+    /// "is there an oracle?"; this one answers "is it *the* oracle?", which is the
+    /// question a recorded version has to be able to survive.
+    ///
+    /// # Errors
+    ///
+    /// [`TestkitError::BinaryNotFound`] when no oracle exists at all, so a caller
+    /// can still distinguish absence (skippable) from disagreement (not), and
+    /// [`TestkitError::OraclePinMismatch`] naming both versions and the program when
+    /// the resolved binary is a different release.
+    pub fn discover_pinned() -> Result<Self> {
+        let oracle = Self::discover()?;
+        check_pin(&oracle.reported_version, &oracle.program)?;
+        Ok(oracle)
     }
 
     fn auto() -> Result<Self> {
@@ -358,6 +411,28 @@ pub fn requested_flavour(value: Option<&str>) -> Result<Option<OracleFlavour>> {
     }
 }
 
+/// Accept `reported` only if it is [`PINNED_RELEASE`].
+///
+/// Split out of [`Oracle::discover_pinned`] as a pure function for the same reason
+/// [`requested_flavour`] is one: a test cannot set an environment variable in this
+/// workspace to redirect discovery, so the refusal has to be reachable with a
+/// version string a test produced from a real process it controls.
+///
+/// # Errors
+///
+/// [`TestkitError::OraclePinMismatch`] naming both versions and `program`.
+pub fn check_pin(reported: &str, program: &Path) -> Result<()> {
+    if reported == PINNED_RELEASE {
+        return Ok(());
+    }
+    Err(TestkitError::OraclePinMismatch {
+        pinned: PINNED_RELEASE,
+        reported: reported.to_owned(),
+        program: program.to_path_buf(),
+        binary_env: ENV_ORACLE_BINARY,
+    })
+}
+
 pub(crate) fn ensure_executable(
     role: &'static str,
     path: &Path,
@@ -497,9 +572,11 @@ mod tests {
         }
     }
 
-    /// The oracle tree is a hard requirement of this project: the plan pins it at
-    /// 1.18.13 and ninety later tasks read fixtures out of it. A machine without
-    /// it cannot verify anything, so this fails loudly rather than skipping.
+    /// The oracle tree is a hard requirement of this project: it is the source
+    /// baseline this port was read from and ninety later tasks read fixtures out of
+    /// it. A machine without it cannot verify anything, so this fails loudly rather
+    /// than skipping. Note this is the *source* pin, not [`PINNED_RELEASE`] — see
+    /// the module docs' "two pins" table.
     #[test]
     fn the_pinned_source_tree_is_locatable_and_states_its_version() {
         let tree = locate_source_tree()
@@ -513,6 +590,89 @@ mod tests {
         assert!(
             tree.join("packages/llm/test/fixtures/recordings").is_dir(),
             "the tree must carry the recorded provider traffic"
+        );
+    }
+
+    /// The mismatch F1 rejected on, made a test.
+    ///
+    /// The assertion is deliberately **not** between two written-down constants:
+    /// that would only prove two hand-typed strings match. The right-hand side is
+    /// [`Oracle::reported_version`], which is the trimmed first line of stdout from
+    /// actually executing the resolved binary with `--version` in
+    /// [`Oracle::probe_version`]. So the only way to pass is for the declared pin to
+    /// equal what the binary says about itself.
+    ///
+    /// Absence is skipped and disagreement is fatal, because those are different
+    /// facts: a machine without `opencode` cannot verify anything, while a machine
+    /// with the *wrong* `opencode` will produce artifacts that name a build that
+    /// never ran.
+    #[test]
+    fn the_declared_pin_equals_the_version_the_resolved_binary_reports() {
+        let oracle = match Oracle::discover() {
+            Ok(oracle) => oracle,
+            Err(TestkitError::BinaryNotFound { .. }) => {
+                eprintln!(
+                    "SKIPPED the_declared_pin_equals_the_version_the_resolved_binary_reports: no \
+                     opencode on PATH and no {ENV_ORACLE_BINARY}; the pin was NOT verified"
+                );
+                return;
+            }
+            Err(other) => {
+                panic!("resolving the oracle failed for a reason other than absence: {other}")
+            }
+        };
+        assert_eq!(
+            oracle.reported_version(),
+            PINNED_RELEASE,
+            "PINNED_RELEASE claims {PINNED_RELEASE} but {} reports {}. Every artifact in this \
+             workspace attributes its measurements to PINNED_RELEASE, so this disagreement makes \
+             all of them name a build that did not run. Install {PINNED_RELEASE}, or move the \
+             constant and recapture.",
+            oracle.program().display(),
+            oracle.reported_version()
+        );
+
+        let pinned =
+            Oracle::discover_pinned().expect("the agreeing oracle must also pass the gate");
+        assert_eq!(pinned.reported_version(), PINNED_RELEASE);
+    }
+
+    /// The failure QA scenario for the pin: a binary that reports another release is
+    /// refused and named, not accepted with a warning.
+    ///
+    /// The wrong-release binary is a real executable this test writes and
+    /// [`Oracle::at_binary`] really runs, so the refused version string comes out of
+    /// [`Oracle::probe_version`]'s stdout rather than being handed to [`check_pin`]
+    /// as a literal. That is what makes this a test of the gate and not of
+    /// [`TestkitError`]'s `Display`.
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_reporting_another_release_is_named_and_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = dir.path().join("opencode");
+        std::fs::write(&fake, "#!/bin/sh\necho 1.18.12\n").expect("write the stand-in release");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stand-in executable");
+
+        let oracle = Oracle::at_binary(&fake).expect("a runnable file is an oracle");
+        assert_eq!(
+            oracle.reported_version(),
+            "1.18.12",
+            "the probe must read the stand-in's own output"
+        );
+
+        let err = check_pin(oracle.reported_version(), oracle.program())
+            .expect_err("a release other than the pin must be refused");
+        let rendered = err.to_string();
+        assert!(rendered.contains(PINNED_RELEASE), "{rendered}");
+        assert!(rendered.contains("1.18.12"), "{rendered}");
+        assert!(rendered.contains("opencode"), "{rendered}");
+        assert!(rendered.contains(ENV_ORACLE_BINARY), "{rendered}");
+        assert!(
+            matches!(err, TestkitError::OraclePinMismatch { .. }),
+            "{err:?}"
         );
     }
 }

@@ -6367,3 +6367,41 @@ is rejected before either equality or exemption can be considered.
 messageID are removed. Event type, durable aggregate/sequence/version, stable data,
 HTTP status and observable side effect remain in the comparison. Widening this
 normalizer requires a new visible per-operation reason.
+
+## [2026-08-09] Todo 130: the oracle is pinned to 1.18.15, and the OpenAPI fixture keeps its 1.18.12 name
+
+**Pinned release: 1.18.15.** The plan owner's amendment is "opencode 版本使用最新即可" and
+1.18.15 is the newest installed (`latest` symlinks to it). 1.18.13 — the version criterion 1
+literally names, and which F1 reported as uninstalled — *is* now installed, so that literal
+reading was reachable. It was not chosen, because the owner's instruction supersedes it.
+`oc_testkit::oracle::PINNED_RELEASE` is the single declaration; the binary's *path* stays
+discovered so the harness is not bound to this host's package manager.
+
+**`oc_plugin::js::spec::REPORTED_PLUGIN_API_VERSION` stays 1.18.13.** It is compared against
+npm `peerDependencies` ranges by the plugin loader; it is a statement about the source tree
+this port was read from, not about which binary executed a differential. Moving it to
+1.18.15 would change plugin-gate behaviour for no compatibility reason. The two numbers are
+now documented as separate pins in the `oracle` module header, which is the part that was
+missing when they were conflated.
+
+**`.omo/fixtures/oracle-openapi-1.18.12.json` keeps its filename**, with its bytes verified
+against 1.18.15. All four installed releases (1.18.12/13/14/15) serve a byte-identical
+478,747-byte document, sha256 `c3a9f94af0c3324d97b482b14c692e810ce7ccac3136319ba46334de972b4cf1`,
+so the recapture changed nothing. Renaming would require editing
+`crates/oc-server/{src/compat_v1.rs,tests/api.rs,tests/compat_v1.rs}` and `docs/`, all owned
+by concurrent todos 126–129. Instead the name is documented as the capture's *provenance*
+rather than a version claim, and `the_committed_openapi_capture_is_what_the_pinned_release_serves`
+re-derives the bytes from the pinned release on every run so the name cannot go stale
+silently. A later task that owns those files should rename it.
+
+**Operation count unchanged at 58** — no upstream operation was added or removed between
+1.18.12 and 1.18.15, so no count in the repo needed restating (matrix rows, invoked,
+observed, upstream superset, the 45 503-gaps, the 13 backed, the 5 exactly compared, the 2
+added C8). The four literal `58`s in `compat_suite.rs` were consolidated into
+`UPSTREAM_API_OPERATIONS`, checked against the live document, so a future delta has one
+place to change.
+
+**`compat_suite.rs` no longer honours `OPENCODE_TEST_BINARY`.** It resolves through
+`Oracle::discover()`, whose override is `OC_TESTKIT_ORACLE` — the harness's own documented
+variable, named in the mismatch error's remedy. Other crates' `OPENCODE_TEST_BINARY`
+handling is untouched.
