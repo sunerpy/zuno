@@ -1,0 +1,157 @@
+Task 123 — remove the intermittent allocation that breached G2
+Measured: 2026-08-09
+
+ROOT CAUSE
+
+The suspected shared EventService was not the source. The intermittent roughly
+164 MiB step came from startup compaction's owned transcript construction.
+`transcript_owned` first let `project_history_owned_with_ids` aggregate every
+complete provider-projected message, including all complete tool results, and
+only the later compaction representation reduced those results. On the pinned
+W-real session, that made the complete projected tool payloads coexist long
+enough for the frozen two-second sampler to observe the extra allocation.
+
+The fix adds `map_project_history_owned_with_ids`, which transforms each
+projected message before projecting the next stored message. `transcript_owned`
+estimates tokens from the complete provider-visible message first, then converts
+that message immediately to the existing summary-safe representation. Therefore:
+
+  * boundary selection still charges the complete provider-visible history;
+  * no prompt-required history or token weight is dropped;
+  * ordinary borrowed and owned provider projection remains complete and
+    byte-equivalent; and
+  * startup compaction retains at most one complete projected stored message
+    before reducing its tool output.
+
+REGRESSION AND MUTATION PROOF
+
+`owned_compaction_transcript_charges_full_tool_output_before_truncating_it`
+hydrates a 2 MiB completed tool result and pins both sides of the invariant: the
+owned compaction entry has the same estimated token charge as the complete
+borrowed transcript, while its retained tool result is exactly
+`TOOL_OUTPUT_MAX_CHARS` plus the existing `\n[truncated]` marker.
+
+Mutation proof was run before the final gate. Restoring the old aggregate-first
+path made the test fail because the retained tool result had 2,097,152 chars
+instead of 2,012. Restoring the fix made the test pass. A temporary 1 ms RSS
+probe then measured projection increments of only 20, 16, and 20 KiB over
+hydration in three runs, versus the prior 169,944–169,960 KiB increment. The
+probe and its outputs were removed before final validation.
+
+FROZEN COMMAND AND OUTCOME
+
+  OC_MEMORY_GATE_MODE=run cargo test -p oc-testkit --test memory --offline -- --nocapture
+
+The unchanged revision-2 runner exited 0 after 6,320.65 seconds:
+
+  test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+Raw generated artefact:
+  path: target/perf/task-88-memory.json
+  sha256: 4b5ccf725f47ab6ebd80716e2695c4cc6722ad8f90f703a013508800100c87bb
+  measured Rust binary sha256: 4bf2343c8cbef065487cd45c43fef8df738961c488221db9fb8babecb5a401b0
+  topology: released TypeScript TUI vs release-profile Rust TUI under the frozen real PTY runner
+  pairing: five AB/BA pairs per workload from interleaved_pair_order(5)
+  methodology revision: 2 (unchanged)
+
+MEASURED SUBJECT AND DATABASE IDENTITY
+
+  session_id: ses_2bcaee257ffeFZNJrmtpi3ZglR
+  message_count: 931
+  part_count: 3,620
+  part_data_bytes: 105,118,812
+  pinned database: /config/.local/share/opencode/opencode.db.bak.20260408
+  database bytes: 2,630,582,272
+  database sha256: e2cde4df08cd580d0a4f03068b2d861275ca8aef983fef6578968f7f7a2a18a7
+
+RAW PER-REPETITION PEAK RSS (KiB)
+
+                         repetition 1   repetition 2   repetition 3   repetition 4   repetition 5    median
+  TypeScript W-idle        1,023,544         968,376       1,020,724         891,308         919,672     968,376
+  Rust W-idle                 20,444          20,504          20,060          20,356          20,380      20,380
+  TypeScript W-real        3,044,976       3,200,152       2,797,236       3,063,140       3,071,380   3,063,140
+  Rust W-real              1,493,496       1,493,948       1,510,444       1,494,024       1,510,528   1,494,024
+
+FROZEN GATE RESULTS
+
+G1 / W-idle
+  Rust median: 20,380 KiB
+  committed TypeScript median: 954,240 KiB
+  paired TypeScript median: 968,376 KiB
+  frozen ceiling (0.50 x committed): 477,120 KiB
+  Rust / committed TypeScript: 0.0213573105 (reported 0.0214)
+  Rust / paired TypeScript: 0.0210455443
+  paired / committed TypeScript: 1.0148138833 (reported 1.0148)
+  verdict under the frozen formula: PASS
+
+G2 / W-real
+  Rust median: 1,494,024 KiB
+  committed TypeScript median: 3,026,992 KiB
+  paired TypeScript median: 3,063,140 KiB
+  frozen ceiling (0.50 x committed): 1,513,496 KiB
+  Rust / committed TypeScript: 0.4935672113 (reported 0.4936)
+  Rust / paired TypeScript: 0.4877426432
+  paired / committed TypeScript: 1.0119418882 (reported 1.0119)
+  margin under frozen ceiling: 19,472 KiB
+  verdict under the frozen formula: PASS
+
+ROBUSTNESS AGAINST RUN-TO-RUN SPREAD
+
+Sorted Rust W-real peaks:
+
+  1,493,496  1,493,948  1,494,024  1,510,444  1,510,528 KiB
+
+All five runs are below the 1,513,496 KiB ceiling. The five-run spread is
+17,032 KiB (`1,510,528 - 1,493,496`). The median margin is 19,472 KiB, which
+exceeds that spread by 2,440 KiB. Even the worst individual run passes, with
+2,968 KiB remaining. This meets Todo 123's robustness criterion rather than
+relying on a median narrower than observed variance.
+
+For direct before/after comparison on the same pinned subject, Todo 122 recorded
+Rust W-real peaks `[1,527,188, 1,657,244, 1,658,468, 1,493,916, 1,494,048]`
+KiB, median 1,527,188 KiB, ratio 0.5045, and FAIL by 13,692 KiB. The new vector
+contains no roughly 1,658 MiB high cluster and its median returns to Todo 113's
+pre-regression range.
+
+SCOPE CORRECTION AFTER MEASUREMENT
+
+Final diff review found that the borrowed `transcript()` path had also been
+changed to summary-safe messages even though the allocation only belonged to the
+owned startup path. That unrelated semantic change was removed: borrowed
+transcripts again retain complete provider projection, while the measured
+`transcript_owned` optimization is unchanged. W-real startup compaction calls the
+owned path. The complete validation below was run after this scope correction;
+the expensive frozen measurement itself was not repeated because the measured
+owned path did not change.
+
+FINAL VALIDATION AFTER THE SCOPE CORRECTION
+
+  cargo test -p oc-engine --offline
+    PASS — all oc-engine unit, integration, and doc tests; the new regression
+    test passed in the 38-test prelude unit-test binary.
+
+  cargo test -p oc-testkit --offline methodology
+    PASS — 4 methodology tests, including the frozen revision hash.
+
+  cargo build --workspace --offline
+    PASS.
+
+  cargo test --workspace --offline
+    PASS — no failed test result groups.
+
+  cargo clippy --workspace --all-targets --offline -- -D warnings
+    PASS — zero warnings and zero errors.
+
+  cargo fmt --all --check
+    PASS — zero output.
+
+  cargo metadata --locked --offline --format-version 1
+    PASS.
+
+  rust-analyzer diagnostics . --severity warning
+    Completed with no source diagnostics. It emitted the same existing internal
+    analyzer inference logs (`Overloaded deref on type str is not a projection`)
+    while scanning unchanged code, then reported `diagnostic scan complete`.
+    The MCP `lsp_diagnostics` endpoint is rooted at the main checkout and rejected
+    sibling-worktree paths before analysis, so this worktree-local invocation was
+    used for the required changed-source diagnostic pass.

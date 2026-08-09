@@ -18,7 +18,7 @@ use super::{
     TITLE_INSTRUCTION, TitleSkipped, compact_if_overflowing, estimate_tokens, generate_title,
     run_prelude, summarize, transcript, transcript_owned,
 };
-use crate::compaction::{CompactionState, TokenWindow, select_boundary};
+use crate::compaction::{CompactionState, TOOL_OUTPUT_MAX_CHARS, TokenWindow, select_boundary};
 use crate::r#loop::retained_history;
 
 const SESSION_ID: &str = "ses_prelude_test";
@@ -263,6 +263,16 @@ fn put_assistant(connection: &Connection, id: &str, created: i64, text: &str, us
 
 /// An assistant message calling one tool, and the completed result for it.
 fn put_tool_exchange(connection: &Connection, id: &str, created: i64, call_id: &str) {
+    put_tool_exchange_with_output(connection, id, created, call_id, "fn main() {}");
+}
+
+fn put_tool_exchange_with_output(
+    connection: &Connection,
+    id: &str,
+    created: i64,
+    call_id: &str,
+    output: &str,
+) {
     let message = MessageRecord::from_json(serde_json::json!({
         "id": id,
         "sessionID": SESSION_ID,
@@ -289,7 +299,7 @@ fn put_tool_exchange(connection: &Connection, id: &str, created: i64, call_id: &
                 "status": "completed",
                 "input": { "filePath": "/workspace/main.rs" },
                 "raw": "{}",
-                "output": "fn main() {}",
+                "output": output,
                 "title": "read main.rs"
             }
         }),
@@ -303,6 +313,43 @@ fn put_tool_exchange(connection: &Connection, id: &str, created: i64, call_id: &
     store
         .put_part_at(&part, created)
         .expect("persist tool part");
+}
+
+#[test]
+fn owned_compaction_transcript_charges_full_tool_output_before_truncating_it() {
+    let connection = seeded("A named session", None);
+    put_user(&connection, "msg_001", 10, "Read the generated file");
+    let large_output = "x".repeat(2 * 1024 * 1024);
+    put_tool_exchange_with_output(&connection, "msg_002", 20, "call_1", &large_output);
+    let history = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .expect("hydrate large tool output");
+    let full = transcript(COMPACTION_PROMPT, &history);
+    let full_tool_tokens = full
+        .iter()
+        .find(|entry| entry.message.role == Role::Tool)
+        .expect("full transcript contains the tool result")
+        .estimated_tokens;
+
+    let compactable = transcript_owned(COMPACTION_PROMPT, history);
+    let tool_entry = compactable
+        .iter()
+        .find(|entry| entry.message.role == Role::Tool)
+        .expect("owned transcript contains the tool result");
+    let RequestContentBlock::ToolResult { content, .. } = &tool_entry.message.content[0] else {
+        panic!("tool message did not contain a tool result");
+    };
+
+    assert_eq!(
+        tool_entry.estimated_tokens, full_tool_tokens,
+        "tail selection must still charge the complete provider-visible result"
+    );
+    assert_eq!(
+        content.chars().count(),
+        TOOL_OUTPUT_MAX_CHARS + "\n[truncated]".chars().count(),
+        "the compaction transcript retained the full tool allocation"
+    );
+    assert!(content.ends_with("\n[truncated]"));
 }
 
 fn context<'a>(
