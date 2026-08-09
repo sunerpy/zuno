@@ -119,15 +119,19 @@ through the real router and recording which explicitly answer
 
 **58 of the 58 upstream operations are registered**, plus **2 operations added**
 for session retention (the declared `c8-maintenance-endpoints` divergence).
-Twenty-five have local backends and seventeen of those are compared exactly against
-the released binary; **33 explicit 503 backend gaps** name the missing capability and
-remain reported as gaps rather than compatibility.
+Thirty-five have local backends; **23 explicit 503 backend gaps** name the missing
+capability and remain reported as gaps rather than compatibility.
 
 The two SSE operations are implemented: `GET /api/event` immediately emits
 `server.connected`, while `GET /api/session/{sessionID}/event` replays durable
 events after `?after=<sequence>` and continues live. The differential matrix
 invokes all 58 operations against both binaries, captures status, normalized
 body, and observable side-effect delta, and rejects a `501` before any exemption.
+The ten session-read, request-state, and PTY-attach operations added in task 128
+compare status and operation-scoped normalized bodies. Session message pages
+default to 50 entries and cap at 200; durable history defaults to 50 and caps at
+100. PTY attach credentials expire after 60 seconds, are single-use and
+scope-bound, and are never included in error responses.
 
 <!-- generated:BEGIN api-operations -->
 | method | path | state |
@@ -150,9 +154,9 @@ body, and observable side-effect delta, and rejects a `501` before any exemption
 | POST | `/api/integration/{integrationID}/connect/oauth` | explicit gap (503 backend unavailable) |
 | GET | `/api/location` | implemented |
 | GET | `/api/model` | implemented |
-| GET | `/api/permission/request` | explicit gap (503 backend unavailable) |
-| GET | `/api/permission/saved` | explicit gap (503 backend unavailable) |
-| DELETE | `/api/permission/saved/{id}` | explicit gap (503 backend unavailable) |
+| GET | `/api/permission/request` | implemented |
+| GET | `/api/permission/saved` | implemented |
+| DELETE | `/api/permission/saved/{id}` | implemented |
 | GET | `/api/provider` | implemented |
 | GET | `/api/provider/{providerID}` | implemented |
 | GET | `/api/pty` | implemented |
@@ -160,9 +164,9 @@ body, and observable side-effect delta, and rejects a `501` before any exemption
 | DELETE | `/api/pty/{ptyID}` | implemented |
 | GET | `/api/pty/{ptyID}` | implemented |
 | PUT | `/api/pty/{ptyID}` | implemented |
-| GET | `/api/pty/{ptyID}/connect` | explicit gap (503 backend unavailable) |
-| POST | `/api/pty/{ptyID}/connect-token` | explicit gap (503 backend unavailable) |
-| GET | `/api/question/request` | explicit gap (503 backend unavailable) |
+| GET | `/api/pty/{ptyID}/connect` | implemented |
+| POST | `/api/pty/{ptyID}/connect-token` | implemented |
+| GET | `/api/question/request` | implemented |
 | GET | `/api/reference` | implemented |
 | GET | `/api/session` | implemented |
 | POST | `/api/session` | implemented |
@@ -172,11 +176,11 @@ body, and observable side-effect delta, and rejects a `501` before any exemption
 | GET | `/api/session/{sessionID}` | implemented |
 | POST | `/api/session/{sessionID}/agent` | explicit gap (503 backend unavailable) |
 | POST | `/api/session/{sessionID}/compact` | explicit gap (503 backend unavailable) |
-| GET | `/api/session/{sessionID}/context` | explicit gap (503 backend unavailable) |
+| GET | `/api/session/{sessionID}/context` | implemented |
 | GET | `/api/session/{sessionID}/event` | implemented |
-| GET | `/api/session/{sessionID}/history` | explicit gap (503 backend unavailable) |
+| GET | `/api/session/{sessionID}/history` | implemented |
 | POST | `/api/session/{sessionID}/interrupt` | explicit gap (503 backend unavailable) |
-| GET | `/api/session/{sessionID}/message` | explicit gap (503 backend unavailable) |
+| GET | `/api/session/{sessionID}/message` | implemented |
 | GET | `/api/session/{sessionID}/message/{messageID}` | explicit gap (503 backend unavailable) |
 | POST | `/api/session/{sessionID}/model` | explicit gap (503 backend unavailable) |
 | GET | `/api/session/{sessionID}/permission` | explicit gap (503 backend unavailable) |
@@ -184,7 +188,7 @@ body, and observable side-effect delta, and rejects a `501` before any exemption
 | GET | `/api/session/{sessionID}/permission/{requestID}` | explicit gap (503 backend unavailable) |
 | POST | `/api/session/{sessionID}/permission/{requestID}/reply` | explicit gap (503 backend unavailable) |
 | POST | `/api/session/{sessionID}/prompt` | explicit gap (503 backend unavailable) |
-| GET | `/api/session/{sessionID}/question` | explicit gap (503 backend unavailable) |
+| GET | `/api/session/{sessionID}/question` | implemented |
 | POST | `/api/session/{sessionID}/question/{requestID}/reject` | explicit gap (503 backend unavailable) |
 | POST | `/api/session/{sessionID}/question/{requestID}/reply` | explicit gap (503 backend unavailable) |
 | POST | `/api/session/{sessionID}/revert/clear` | explicit gap (503 backend unavailable) |

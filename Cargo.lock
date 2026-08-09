@@ -2912,10 +2912,13 @@ dependencies = [
 name = "oc-server"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "axum",
  "base64 0.23.1",
  "clap",
  "futures",
+ "hyper",
+ "hyper-util",
  "oc-auth",
  "oc-catalog",
  "oc-config",

@@ -95,6 +95,21 @@ impl StreamEvent {
     pub const fn properties(&self) -> &Map<String, Value> {
         &self.properties
     }
+
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn event_type(&self) -> &str {
+        &self.event_type
+    }
+
+    #[must_use]
+    pub const fn version(&self) -> u32 {
+        self.version
+    }
 }
 
 pub(super) fn checked_sequence(
