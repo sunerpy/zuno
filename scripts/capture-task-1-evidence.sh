@@ -26,7 +26,7 @@ section() { printf '\n%s\n%s\n' "$1" "$(printf '%.0s-' $(seq 1 ${#1}))" >>"$OUT"
 
 : >"$OUT"
 {
-  echo "task 1 — 34-crate cargo workspace with unsafe forbidden"
+  echo "task 1 — 36-crate cargo workspace with unsafe forbidden"
   echo "repo:      $(pwd)"
   echo "captured:  $(date -Is)"
   echo "host:      $(uname -srm)"
@@ -43,7 +43,7 @@ run jq --version
 sh_run 'bun --version 2>/dev/null || node --version'
 run cat rust-toolchain.toml
 
-section "ACCEPTANCE 1 — cargo metadata lists exactly the 34 named crates"
+section "ACCEPTANCE 1 — cargo metadata lists exactly the named crates in crates.expected"
 sh_run "cargo metadata --format-version 1 --no-deps | jq -r '.packages[].name' | sort | tee /tmp/t1-roster.txt | nl -ba"
 sh_run 'wc -l < /tmp/t1-roster.txt'
 sh_run 'diff /tmp/t1-roster.txt crates.expected && echo "IDENTICAL: cargo metadata roster == crates.expected"'
@@ -52,7 +52,7 @@ sh_run 'cmp /tmp/t1-roster.txt crates.expected && echo "cmp: byte-for-byte ident
 section "ACCEPTANCE 2 / QA HAPPY — cold cargo build --workspace, zero warnings"
 printf '\n(target/ is removed first so this is a real full build, not a cache hit.\n Registry "Adding"/"Locking" lines are dropped from the transcript only;\n the warning count below is taken from the unfiltered log.)\n' >>"$OUT"
 sh_run 'rm -rf target && cargo build --workspace 2>&1 | tee /tmp/t1-build.log | grep -vE "^ +(Adding|Locking|Updating) "; exit ${PIPESTATUS[0]}'
-sh_run 'grep -c "^   Compiling oc-" /tmp/t1-build.log; echo "first-party crates compiled (expect 34)"'
+sh_run 'grep -c "^   Compiling oc-" /tmp/t1-build.log; echo "first-party crates compiled (expect $(wc -l < crates.expected))"'
 sh_run 'grep -in "warning" /tmp/t1-build.log; echo "grep -i warning over the UNFILTERED log exited $? (1 == no match == zero warnings)"'
 sh_run 'tail -1 /tmp/t1-build.log'
 

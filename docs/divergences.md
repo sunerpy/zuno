@@ -1,9 +1,15 @@
 # Divergences
 
-Eight deliberate differences from upstream `opencode` 1.18.13. Each one is a
+Twelve deliberate differences from upstream `opencode` 1.18.13. Each one is a
 **decision**, not an omission: a surface that is merely unimplemented is a gap,
 recorded in the compatibility report's `known_gaps` and listed in the
 [compatibility matrix](compatibility-matrix.md), never here.
+
+This page is the **single place** a behavioural difference is declared. Four of the
+twelve arrived late, in plan todo 119: they had been recorded in
+`compat_suite.rs::nominated_divergences`, a second structure that asserted they
+stayed *out* of the allow-list, so a reader consulting this page could not learn
+about them and no gate could fail while they went undeclared.
 
 ## How this page cannot drift
 
@@ -67,13 +73,54 @@ each entry's stated reason. Do not edit it by hand.
 
 **Surface.** system-prompt resident blocks; model-facing `memory` tool; post-response reflection
 
-**Why.** Upstream opencode 1.18.13 has no cross-session memory subsystem; this implementation carries character-capped global notes and project rules into later sessions and can reflect after delivery, so `memory: false` is the single strict-parity switch that removes all three surfaces and preserves the original prompt bytes.
+**Why.** Upstream opencode 1.18.13 has no cross-session memory subsystem; this implementation carries character-capped global notes and project rules into later sessions and can reflect after delivery, so `memory: false` is the single strict-parity switch that removes all three surfaces and preserves the original prompt bytes. Absorbs the former `memory-subsystem` nomination, which named these same three surfaces.
+
+### session-subpath-is-applied
+
+**Surface.** HTTP `GET /api/session?project=…&subpath=…`; `oc-db` session listing in project scope
+
+**Why.** Upstream declares `subpath` in the v2 list union (`packages/core/src/session.ts:68-76`), the HTTP query schema (`packages/protocol/src/groups/session.ts:98-110`), the generated client and the SDK, and the handler even forwards it (`packages/server/src/handlers/session.ts:23-37`) — but `session.list` builds its conditions from `directory`, `workspaceID`, `project` and `search` only (`packages/core/src/session.ts:268-277`), so the parameter changes nothing upstream. This port applies it, which narrows the result set for a request upstream answers unfiltered. It is matched as a literal tree prefix (`path = s OR path LIKE s || '/%'` with the pattern bound, not interpolated), so a subpath containing `_` or `%` selects that directory and not a wildcard family; upstream's un-escaped `LIKE '${path}/%'` lives on the LEGACY `/session?path=` handler (`packages/opencode/src/session/session.ts:969-980`), a route this port does not serve, so literal matching is a property of the applied filter rather than a second divergence. Absorbs the former `subpath-matches-literally` nomination.
+
+### context-md-excluded
+
+**Surface.** project instruction cascade — the filename list probed by `findUp`
+
+**Why.** Upstream's `instructionFiles` still lists `CONTEXT.md` behind a `// deprecated` marker (`packages/opencode/src/session/instruction.ts:60-68`) and genuinely loads it: the cascade probes each name in order and the first project-level match wins (`:122-132`), then every resolved path is read and injected as `Instructions from: …` (`:155-168`). This port stops at `AGENTS.md` and `CLAUDE.md`, so a repository whose only instruction file is `CONTEXT.md` contributes one instruction block under the TypeScript binary and zero here.
+
+### malformed-auth-json-is-an-error
+
+**Surface.** `$XDG_DATA_HOME/opencode/auth.json` — reading the credential store
+
+**Why.** Upstream funnels every read and parse failure into an empty store: `readJson(file).pipe(Effect.orElseSucceed(() => ({})))` (`packages/opencode/src/auth/index.ts:58-67`), and the next `set` writes `{ ...data, [norm]: info }` over the file (`:73-80`) — so one truncated `auth.json` silently destroys every other credential in it. This port returns a typed `Malformed` error naming the file instead, which fails the read a user can retry rather than losing data they cannot recover. An empty or whitespace-only file still reads as an empty store, because that is a crash mid-create rather than corruption.
+
+### failed-format-restores-pre-format-bytes
+
+**Surface.** post-edit formatter execution — the file's bytes after a formatter exits non-zero
+
+**Why.** Upstream inspects the exit code and only logs: `if (result && result.exitCode !== 0) yield* Effect.logError("failed", …)`, with a spawn failure mapped to `undefined` and the loop continuing (`packages/opencode/src/format/index.ts:73-114`). Nothing is snapshotted or written back, so whatever a failing formatter left on disk — including a truncated file — stands. This port keeps the bytes the edit wrote and restores them when a formatter exits non-zero, reports `editRestored` in the tool metadata and says so in the tool output. The cost is deliberate: useful partial work from a formatter that exits non-zero after reformatting is discarded.
 <!-- generated:END divergence-detail -->
 
 ## What is deliberately not on this page
 
-Six further deliberate differences are declared in code but sit outside the
-count the plan asserts, and the compatibility report emits them as
-`nominated_divergences` with a citation for each rather than laundering them into
-this file. See `crates/oc-testkit/tests/compat_suite.rs::nominated_divergences`
-and `.omo/notepads/opencode-rust/issues.md`.
+**Gaps.** A surface that is merely unimplemented is not a decision, so writing it
+here would convert an omission into a divergence by fiat. Those are reported as
+`known_gaps` by the compatibility report and listed in the
+[compatibility matrix](compatibility-matrix.md).
+
+Nothing else. Every behavioural difference is on this page. The compatibility
+report's `behavioural_differences` section indexes them: each record names the
+entry above that declares it, the upstream file and lines that make it a
+difference, and the test that proves the behaviour is live. The compatibility
+suite resolves each `declared_as` against this file and **fails when one is
+undeclared** — the assertion that used to run the other way. Two of the six
+records share an entry rather than being declared twice, because neither was an
+independent difference from upstream:
+
+- `subpath-matches-literally` belongs to `session-subpath-is-applied`. Upstream's
+  un-escaped `LIKE '${path}/%'` is on the legacy `/session?path=` handler
+  (`packages/opencode/src/session/session.ts:969-980`), which this port does not
+  serve; the v2 `/api/session?subpath=` surface ignores `subpath` entirely
+  (`packages/core/src/session.ts:268-277`), so there is no upstream pattern-match
+  to differ from — literal matching is a property of applying the parameter at all.
+- `memory-subsystem` belongs to `cross-session-resident-memory`, which already
+  declares the same three surfaces.

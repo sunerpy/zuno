@@ -32,6 +32,10 @@ OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs
 | 6 | [`c8-maintenance-endpoints`](divergences.md#c8-maintenance-endpoints) | HTTP `GET /api/session/prune`, `POST /api/session/prune` |
 | 7 | [`provider-coverage-by-wire-family`](divergences.md#provider-coverage-by-wire-family) | provider selection; `oc-provider-compatible` family routing and its diagnostics |
 | 8 | [`cross-session-resident-memory`](divergences.md#cross-session-resident-memory) | system-prompt resident blocks; model-facing `memory` tool; post-response reflection |
+| 9 | [`session-subpath-is-applied`](divergences.md#session-subpath-is-applied) | HTTP `GET /api/session?project=…&subpath=…`; `oc-db` session listing in project scope |
+| 10 | [`context-md-excluded`](divergences.md#context-md-excluded) | project instruction cascade — the filename list probed by `findUp` |
+| 11 | [`malformed-auth-json-is-an-error`](divergences.md#malformed-auth-json-is-an-error) | `$XDG_DATA_HOME/opencode/auth.json` — reading the credential store |
+| 12 | [`failed-format-restores-pre-format-bytes`](divergences.md#failed-format-restores-pre-format-bytes) | post-edit formatter execution — the file's bytes after a formatter exits non-zero |
 <!-- generated:END divergence-index -->
 
 ## Cross-session resident memory

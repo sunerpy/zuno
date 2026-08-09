@@ -56,7 +56,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use oc_testkit::compat_report::{DivergenceSummary, OracleAvailability, OracleKind};
 use oc_testkit::{
-    ComparedSurface, CompatReport, DivergenceList, KnownGap, NominatedDivergence, Normalization,
+    BehaviouralDifference, ComparedSurface, CompatReport, DivergenceList, KnownGap, Normalization,
     Verdict, compat_report::SCHEMA_VERSION, divergence,
 };
 
@@ -1640,20 +1640,43 @@ fn the_divergence_allow_list_declares_exactly_the_expected_entries() {
     }
 
     let declared: BTreeSet<&str> = list.ids().into_iter().collect();
-    for nominated in nominated_divergences() {
-        assert!(
-            !declared.contains(nominated.id.as_str()),
-            "{} is both declared in {} and listed as a nomination outside the plan's count; it \
-             must be one or the other",
-            nominated.id,
-            list.path().display()
-        );
+    let mut undeclared = Vec::new();
+    for difference in behavioural_differences() {
+        if !declared.contains(difference.declared_as.as_str()) {
+            undeclared.push(format!(
+                "  {} (surface: {})\n    must be declared as {:?}, which {} does not \
+                 contain\n    upstream: {}\n    asserted by: {}",
+                difference.id,
+                difference.surface,
+                difference.declared_as,
+                list.path().display(),
+                difference.upstream_evidence,
+                difference.asserted_by
+            ));
+        }
     }
+    assert!(
+        undeclared.is_empty(),
+        "{} behavioural difference(s) from upstream are NOT declared in {}:\n{}\n\n\
+         The allow-list is the single place a reader consults for behavioural \
+         differences. Until plan todo 119 this assertion ran the other way — it \
+         required each of these to stay OUT of the file — which made the omission \
+         criterion 17 forbids into something no gate could ever fail. Declare the \
+         difference (and bump `divergence::DECLARED_COUNT` in the same commit), or \
+         merge it into the entry that already covers it by pointing `declared_as` at \
+         that entry. Do not delete the record to make this pass.\n\
+         declared ids: {:?}",
+        undeclared.len(),
+        list.path().display(),
+        undeclared.join("\n"),
+        list.ids()
+    );
     eprintln!(
-        "divergences: {} declared: {:?}; {} further declared in code but outside the plan's count",
+        "divergences: {} declared: {:?}; {} behavioural difference(s) each resolved to a \
+         declared entry",
         list.len(),
         list.ids(),
-        nominated_divergences().len()
+        behavioural_differences().len()
     );
 }
 
@@ -1788,6 +1811,70 @@ fn every_registered_evidence_test_still_exists() {
     );
 }
 
+/// The behavioural assertion each declared difference names must exist and run.
+///
+/// A declared divergence whose behaviour has silently reverted is worse than an
+/// undeclared one: the allow-list then states, with a reason and an upstream
+/// citation, something the binary no longer does. So the named test must both be
+/// defined and be collected — `#[ignore]` is checked because it is the way a test
+/// stops running while its name stays exactly where a search would find it.
+#[test]
+fn every_declared_behavioural_difference_names_a_test_that_exists_and_runs() {
+    let root = oc_testkit::subject::workspace_root().expect("workspace root");
+    let differences = behavioural_differences();
+    for difference in &differences {
+        let (file, test_name) = difference.asserted_by.split_once("::").unwrap_or_else(|| {
+            panic!(
+                "behavioural difference {}: asserted_by must be `path::test_name`, got {:?}",
+                difference.id, difference.asserted_by
+            )
+        });
+        let path = root.join(file);
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!(
+                "behavioural difference {} names its assertion in {} which cannot be read: \
+                 {error}",
+                difference.id,
+                path.display()
+            )
+        });
+        let signature = format!("fn {test_name}(");
+        let offset = text.find(&signature).unwrap_or_else(|| {
+            panic!(
+                "behavioural difference {} names test `{test_name}` in {}, which no longer \
+                 defines it. The allow-list entry {:?} would then declare a behaviour nothing \
+                 proves. Either the assertion was renamed (update this row) or the behaviour \
+                 changed (the declaration must change with it).",
+                difference.id,
+                path.display(),
+                difference.declared_as
+            )
+        });
+        let attributes = &text[..offset];
+        let recent = attributes
+            .rfind("\n\n")
+            .map_or(attributes, |blank| &attributes[blank..]);
+        assert!(
+            !recent.contains("#[ignore"),
+            "behavioural difference {} names test `{test_name}` in {}, which is `#[ignore]`d. An \
+             ignored test keeps the name a search finds while proving nothing, so the declared \
+             difference would be unverified.",
+            difference.id,
+            path.display()
+        );
+    }
+    assert!(
+        differences.len() >= 6,
+        "only {} behavioural difference(s) were checked; the six reconciled by plan todo 119 are \
+         the floor, and a shrinking list is how a difference stops being reported",
+        differences.len()
+    );
+    eprintln!(
+        "behavioural differences: {} checked, each naming a live assertion",
+        differences.len()
+    );
+}
+
 #[test]
 fn every_surface_id_is_unique_and_every_verdict_is_explained() {
     let mut seen = BTreeSet::new();
@@ -1818,17 +1905,35 @@ fn every_surface_id_is_unique_and_every_verdict_is_explained() {
             );
         }
     }
-    for nominated in nominated_divergences() {
+    let allow_list = DivergenceList::load().expect("docs/divergences.toml must load");
+    for difference in behavioural_differences() {
         assert!(
-            !nominated.declared_at.trim().is_empty(),
-            "nominated divergence {} cites no source; a nomination without one is a claim, not a \
-             record",
-            nominated.id
+            !difference.upstream_evidence.trim().is_empty(),
+            "behavioural difference {} cites no upstream source; without one it is a claim, not a \
+             difference",
+            difference.id
         );
         assert!(
-            !nominated.reason.trim().is_empty(),
-            "nominated divergence {} has no reason",
-            nominated.id
+            !difference.asserted_by.trim().is_empty(),
+            "behavioural difference {} names no test, so nothing proves the behaviour is live",
+            difference.id
+        );
+        let entry = allow_list
+            .find(difference.declared_as.as_str())
+            .unwrap_or_else(|| {
+                panic!(
+                    "behavioural difference {} points at allow-list entry {:?}, which {} does \
+                     not declare",
+                    difference.id,
+                    difference.declared_as,
+                    allow_list.path().display()
+                )
+            });
+        assert!(
+            !entry.reason.trim().is_empty(),
+            "the entry {:?} declaring behavioural difference {} carries no reason",
+            difference.declared_as,
+            difference.id
         );
     }
     for normalization in normalizations() {
@@ -1895,7 +2000,7 @@ fn the_suite_emits_a_machine_readable_report() {
         },
         surfaces,
         normalizations: normalizations(),
-        nominated_divergences: nominated_divergences(),
+        behavioural_differences: behavioural_differences(),
         known_gaps: known_gaps(),
     };
 
@@ -1920,50 +2025,72 @@ fn the_suite_emits_a_machine_readable_report() {
     }
 }
 
-/// Deliberate differences declared in code that the plan's seven does not cover.
+/// Every behavioural difference from upstream, each bound to its allow-list entry.
 ///
-/// The plan's count is asserted, so these cannot be added to
-/// `docs/divergences.toml` without contradicting it. They are reported instead,
-/// each citing where it is already declared, so the omission is data rather than
-/// something a reader has to notice. `subpath` is the sharpest case: todo 21's
-/// decision record nominates it for this very allow-list, by name.
-fn nominated_divergences() -> Vec<NominatedDivergence> {
+/// # What this replaced, and why the inversion matters
+///
+/// This was `nominated_divergences()`: six deliberate differences recorded here
+/// *because* they were not in `docs/divergences.toml`, with
+/// [`the_divergence_allow_list_is_loadable_and_counted`] asserting each one stayed
+/// **outside** the file so the plan's declared count of eight kept holding. Two
+/// structures then reported the same kind of fact, and the direction of the
+/// assertion made the omission permanent: the only way to fail was to *declare* a
+/// difference. F1 and F4 both rejected on it.
+///
+/// Every record now names the entry in the allow-list that must cover it, the
+/// upstream evidence that makes it a difference rather than a guess, and the test
+/// that proves the behaviour is live. The gate resolves `declared_as` against the
+/// loaded file, so deleting or renaming an entry fails here — which is the
+/// assertion the previous shape could not express.
+///
+/// Six nominations became four entries. `subpath-matches-literally` and
+/// `memory-subsystem` were not independent differences, so they share a
+/// `declared_as` with the difference they belong to instead of being declared
+/// twice; both merges are recorded in the allow-list's own header with their
+/// upstream evidence.
+fn behavioural_differences() -> Vec<BehaviouralDifference> {
     vec![
-        NominatedDivergence {
+        BehaviouralDifference {
             id: "subpath-is-implemented".to_owned(),
             surface: "GET /api/session?project=…&subpath=…; oc-db session listing".to_owned(),
-            reason: "Upstream declares `subpath` in the union, the HTTP schema, the generated client and the SDK, then never reads it in the handler; this port applies it, which changes results for a request upstream silently ignores.".to_owned(),
-            declared_at: ".omo/notepads/opencode-rust/decisions.md:1969-2008 (\"DIVERGENCE CANDIDATE #1 … for Todo 86's allow-list\")".to_owned(),
+            declared_as: "session-subpath-is-applied".to_owned(),
+            upstream_evidence: "declared in packages/core/src/session.ts:68-76, packages/protocol/src/groups/session.ts:98-110 and the generated SDK; forwarded by packages/server/src/handlers/session.ts:23-37; never read by the query in packages/core/src/session.ts:268-277".to_owned(),
+            asserted_by: "crates/oc-db/tests/session.rs::the_project_scope_with_a_subpath_actually_filters".to_owned(),
         },
-        NominatedDivergence {
+        BehaviouralDifference {
             id: "subpath-matches-literally".to_owned(),
             surface: "GET /api/session?project=…&subpath=…".to_owned(),
-            reason: "Matched as a literal tree prefix rather than a SQL LIKE pattern, so a path containing `_` or `%` cannot act as a wildcard the way upstream's v1 interpolation allows.".to_owned(),
-            declared_at: ".omo/notepads/opencode-rust/decisions.md:1990-1999 (\"a second, smaller divergence … should go on the allow-list with the first\")".to_owned(),
+            declared_as: "session-subpath-is-applied".to_owned(),
+            upstream_evidence: "the un-escaped `like(SessionTable.path, sql.param(`${input.path}/%`))` is on the legacy /session?path= handler at packages/opencode/src/session/session.ts:969-980, a route this port does not serve; the v2 surface ignores subpath entirely".to_owned(),
+            asserted_by: "crates/oc-db/tests/session.rs::a_subpath_containing_a_like_wildcard_is_not_treated_as_a_pattern".to_owned(),
         },
-        NominatedDivergence {
+        BehaviouralDifference {
             id: "context-md-excluded".to_owned(),
             surface: "project instruction cascade".to_owned(),
-            reason: "`CONTEXT.md` is deprecated upstream and is not read here, so a repository whose only instruction file is CONTEXT.md loads zero project instructions under this binary and one under the TypeScript binary.".to_owned(),
-            declared_at: ".omo/notepads/opencode-rust/decisions.md:925-939".to_owned(),
+            declared_as: "context-md-excluded".to_owned(),
+            upstream_evidence: "packages/opencode/src/session/instruction.ts:60-68 lists CONTEXT.md in `instructionFiles`; :122-132 probes it through findUp; :155-168 reads and injects every resolved path".to_owned(),
+            asserted_by: "crates/oc-config/tests/instructions.rs::context_md_is_never_loaded".to_owned(),
         },
-        NominatedDivergence {
+        BehaviouralDifference {
             id: "malformed-auth-json-is-an-error".to_owned(),
             surface: "$XDG_DATA_HOME/opencode/auth.json".to_owned(),
-            reason: "Upstream funnels a read failure into an empty store, so the next write destroys every credential in a truncated file; this port returns an error instead.".to_owned(),
-            declared_at: ".omo/notepads/opencode-rust/decisions.md:1524-1537".to_owned(),
+            declared_as: "malformed-auth-json-is-an-error".to_owned(),
+            upstream_evidence: "packages/opencode/src/auth/index.ts:58-67 maps any read or parse failure to `{}` via orElseSucceed; :73-80 then writes `{ ...data, [norm]: info }` over the file".to_owned(),
+            asserted_by: "crates/oc-auth/src/store.rs::malformed_json_is_a_typed_error_naming_the_file".to_owned(),
         },
-        NominatedDivergence {
+        BehaviouralDifference {
             id: "failed-format-restores-pre-format-bytes".to_owned(),
             surface: "post-edit formatter execution".to_owned(),
-            reason: "Upstream keeps whatever a failing formatter left on disk; this port restores the bytes the edit wrote, at the price of discarding useful partial work from a formatter that exits non-zero after doing some.".to_owned(),
-            declared_at: ".omo/notepads/opencode-rust/decisions.md:4075-4090".to_owned(),
+            declared_as: "failed-format-restores-pre-format-bytes".to_owned(),
+            upstream_evidence: "packages/opencode/src/format/index.ts:73-114 checks `result.exitCode !== 0` and only logs; a spawn failure is mapped to undefined; nothing is snapshotted or written back".to_owned(),
+            asserted_by: "crates/oc-tools/tests/format.rs::a_formatter_that_truncates_the_file_before_failing_has_its_damage_undone".to_owned(),
         },
-        NominatedDivergence {
+        BehaviouralDifference {
             id: "memory-subsystem".to_owned(),
             surface: "system prompt, `memory` tool, reflection fork".to_owned(),
-            reason: "Upstream has no memory subsystem at all, so nothing here is justifiable as compatibility; plan todo 103 is the todo required to add this entry and bump the asserted count to eight.".to_owned(),
-            declared_at: ".omo/plans/opencode-rust.md:1017-1020; .omo/notepads/opencode-rust/learnings.md:1188".to_owned(),
+            declared_as: "cross-session-resident-memory".to_owned(),
+            upstream_evidence: "upstream opencode 1.18.13 has no cross-session memory subsystem at all, so no upstream behaviour to compare against".to_owned(),
+            asserted_by: "crates/oc-memory/tests/integration.rs::memory_false_matches_a_real_upstream_control_and_spawns_no_reflection".to_owned(),
         },
     ]
 }
