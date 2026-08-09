@@ -196,7 +196,10 @@ fn seeded() -> Pool {
 }
 
 fn ids(listed: &[session_list::ListedSession]) -> Vec<String> {
-    listed.iter().map(|entry| entry.info.id.clone()).collect()
+    listed
+        .iter()
+        .map(|entry| entry.info.session.id.clone())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -252,7 +255,7 @@ fn session_list_all_projects_returns_every_root_with_its_project_summary() {
 
     let distinct: BTreeSet<&str> = listed
         .iter()
-        .map(|entry| entry.info.project_id.as_str())
+        .map(|entry| entry.info.session.project_id.as_str())
         .collect();
     assert_eq!(distinct.len(), 3, "the listing spans all three projects");
 }
@@ -275,9 +278,9 @@ fn session_list_all_projects_includes_children_unless_roots_is_asked_for() {
     );
     let kid = everything
         .iter()
-        .find(|entry| entry.info.id == "ses_one_kid")
+        .find(|entry| entry.info.session.id == "ses_one_kid")
         .expect("the child session");
-    assert_eq!(kid.info.parent_id.as_deref(), Some("ses_one_root"));
+    assert_eq!(kid.info.session.parent_id.as_deref(), Some("ses_one_root"));
 }
 
 #[test]
@@ -293,7 +296,9 @@ fn session_list_one_project_narrows_to_that_project_only() {
             list(&connection, &GlobalListRequest::project(project)).expect("list one project");
         assert_eq!(ids(&listed), expected, "{project}");
         assert!(
-            listed.iter().all(|entry| entry.info.project_id == project),
+            listed
+                .iter()
+                .all(|entry| entry.info.session.project_id == project),
             "{project} leaked a foreign session"
         );
     }
@@ -345,7 +350,7 @@ fn session_list_hides_archived_sessions_by_default() {
     assert!(
         listed
             .iter()
-            .all(|entry| entry.info.time.archived.is_none())
+            .all(|entry| entry.info.session.time.archived.is_none())
     );
 }
 
@@ -508,7 +513,13 @@ fn session_list_carries_the_message_count_and_the_row_cost() {
 
     let observed: Vec<(String, i64, f64)> = listed
         .iter()
-        .map(|entry| (entry.info.id.clone(), entry.messages, entry.info.cost))
+        .map(|entry| {
+            (
+                entry.info.session.id.clone(),
+                entry.messages,
+                entry.info.session.cost,
+            )
+        })
         .collect();
     assert_eq!(
         observed,
@@ -531,11 +542,11 @@ fn session_list_message_counts_agree_with_the_composed_query() {
     let counts = message_counts(&connection, &session_ids).expect("count messages");
 
     for entry in &listed {
-        let separate = counts.get(&entry.info.id).copied().unwrap_or(0);
+        let separate = counts.get(&entry.info.session.id).copied().unwrap_or(0);
         assert_eq!(
             entry.messages, separate,
             "{} disagreed between the joined count and the grouped one",
-            entry.info.id
+            entry.info.session.id
         );
     }
     assert!(

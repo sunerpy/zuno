@@ -185,6 +185,8 @@ fn every_headless_command_keeps_the_oracle_long_option_surface() {
         &["debug", "rg"][..],
         &["debug", "lsp"][..],
         &["debug", "snapshot"][..],
+        &["export"][..],
+        &["import"][..],
     ] {
         assert_help_flags(args);
     }
@@ -906,4 +908,416 @@ fn session_list_all_projects_matches_the_experimental_endpoint_on_one_database()
     let _ = server.kill();
     let _ = server.wait();
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+// ---------------------------------------------------------------------------
+// export / import
+// ---------------------------------------------------------------------------
+
+const EXPORT_SESSION: &str = "ses_diffexport0000000000000000ab";
+const EXPORT_USER: &str = "msg_diffexport0000000000000000us";
+const EXPORT_ASSISTANT: &str = "msg_diffexport0000000000000000as";
+
+/// Seed one project, one session, two messages, and one part of every variant.
+///
+/// Every variant is present because `export` is what decodes the two opaque
+/// `data` blobs through a schema: a fixture carrying only `text` parts would let
+/// a whole family of payloads diverge from the oracle unobserved. The payloads
+/// are the ones `oc-db/tests/message_export.rs` already proved the real binary
+/// accepts, so a failure here is about the *envelope*, not about the blobs.
+fn seed_export_database(path: &Path) {
+    use oc_db::message::{MessageRecord, MessageStore, PartKind, PartRecord};
+
+    std::fs::create_dir_all(path.parent().expect("database has a parent"))
+        .expect("create the data directory");
+    let mut connection = oc_db::open::open_at(path).expect("create the export database");
+    oc_db::migration::apply(&mut connection).expect("apply the schema");
+    connection
+        .execute_batch(&format!(
+            "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) \
+             VALUES ('prj_diffexport', '/srv/diffexport', 1780034795000, 1780034795000, '[]');
+             INSERT INTO session \
+               (id, project_id, slug, directory, path, title, version, cost, tokens_input, \
+                tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, agent, \
+                model, metadata, time_created, time_updated) \
+             VALUES ('{EXPORT_SESSION}', 'prj_diffexport', 'diff-export', '/srv/diffexport', '', \
+                     'a differential export', '1.18.13', 2.0, 10, 20, 0, 1, 2, 'build', \
+                     '{{\"id\":\"claude-sonnet-4-5\",\"providerID\":\"anthropic\"}}', \
+                     '{{\"ticket\":\"OC-116\"}}', 1780034795000, 1780034796000);"
+        ))
+        .expect("seed a project and a session");
+
+    let store = MessageStore::new(&connection);
+    let user = MessageRecord::from_json(serde_json::json!({
+        "id": EXPORT_USER,
+        "sessionID": EXPORT_SESSION,
+        "role": "user",
+        "time": { "created": 1_780_034_795_100_i64 },
+        "agent": "build",
+        "model": { "providerID": "anthropic", "modelID": "claude-sonnet-4-5" },
+    }))
+    .expect("split the user message");
+    store
+        .put_message_at(&user, 1_780_034_795_100)
+        .expect("write the user message");
+
+    let assistant = MessageRecord::from_json(serde_json::json!({
+        "id": EXPORT_ASSISTANT,
+        "sessionID": EXPORT_SESSION,
+        "role": "assistant",
+        "time": { "created": 1_780_034_795_200_i64, "completed": 1_780_034_796_000_i64 },
+        "parentID": EXPORT_USER,
+        "modelID": "claude-sonnet-4-5",
+        "providerID": "anthropic",
+        "mode": "build",
+        "agent": "build",
+        "path": { "cwd": "/srv/diffexport", "root": "/srv/diffexport" },
+        "cost": 0.004_25,
+        "tokens": {
+            "input": 1_024.0,
+            "output": 256.0,
+            "reasoning": 0.0,
+            "cache": { "read": 0.0, "write": 0.0 },
+        },
+    }))
+    .expect("split the assistant message");
+    store
+        .put_message_at(&assistant, 1_780_034_795_200)
+        .expect("write the assistant message");
+
+    for (index, kind) in PartKind::ALL.into_iter().enumerate() {
+        let part_id = format!("prt_diffexport000000000000000{index:03}");
+        let mut payload = export_part_payload(kind);
+        let object = payload.as_object_mut().expect("payload is an object");
+        object.insert("id".to_owned(), serde_json::json!(part_id));
+        object.insert("sessionID".to_owned(), serde_json::json!(EXPORT_SESSION));
+        object.insert("messageID".to_owned(), serde_json::json!(EXPORT_ASSISTANT));
+        let created = 1_780_034_795_300 + i64::try_from(index).expect("index fits");
+        let record = PartRecord::from_json(payload, created)
+            .unwrap_or_else(|error| panic!("{kind}: split: {error}"));
+        store
+            .put_part_at(&record, created)
+            .unwrap_or_else(|error| panic!("{kind}: write: {error}"));
+    }
+}
+
+fn export_part_payload(kind: oc_db::message::PartKind) -> serde_json::Value {
+    use oc_db::message::PartKind;
+    use serde_json::json;
+
+    match kind {
+        PartKind::Text => json!({ "type": "text", "text": "hello from rust" }),
+        PartKind::Reasoning => json!({
+            "type": "reasoning",
+            "text": "weighing the index order",
+            "time": { "start": 1_780_034_795_239_i64, "end": 1_780_034_795_999_i64 },
+        }),
+        PartKind::Tool => json!({
+            "type": "tool",
+            "callID": "toolu_01RUST",
+            "tool": "read",
+            "state": {
+                "status": "completed",
+                "input": { "filePath": "/workspace/src/lib.rs" },
+                "output": "pub mod message;",
+                "title": "src/lib.rs",
+                "metadata": { "lines": 1 },
+                "time": { "start": 1_780_034_795_239_i64, "end": 1_780_034_795_512_i64 },
+            },
+        }),
+        PartKind::StepStart => json!({ "type": "step-start" }),
+        PartKind::StepFinish => json!({
+            "type": "step-finish",
+            "reason": "stop",
+            "cost": 0.001_25,
+            "tokens": {
+                "input": 100.0,
+                "output": 20.0,
+                "reasoning": 0.0,
+                "cache": { "read": 0.0, "write": 0.0 },
+            },
+        }),
+        PartKind::Patch => json!({
+            "type": "patch",
+            "hash": "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00",
+            "files": ["crates/oc-db/src/message.rs"],
+        }),
+        PartKind::File => json!({
+            "type": "file",
+            "mime": "text/plain",
+            "filename": "note.txt",
+            "url": "data:text/plain;base64,aGVsbG8=",
+        }),
+        PartKind::Compaction => json!({ "type": "compaction", "auto": false }),
+        PartKind::Subtask => json!({
+            "type": "subtask",
+            "prompt": "audit the parser",
+            "description": "parser audit",
+            "agent": "explore",
+        }),
+        PartKind::Snapshot => json!({
+            "type": "snapshot",
+            "snapshot": "9f2c1ab0d3e4f5061728394a5b6c7d8e9f001122",
+        }),
+        PartKind::Agent => json!({ "type": "agent", "name": "explore" }),
+        PartKind::Retry => json!({
+            "type": "retry",
+            "attempt": 1,
+            "error": {
+                "name": "APIError",
+                "data": { "message": "overloaded", "isRetryable": true },
+            },
+            "time": { "created": 1_780_034_795_239_i64 },
+        }),
+    }
+}
+
+/// Run one binary's `export` against `database` and parse its stdout.
+fn export_document(
+    binary: &Path,
+    root: &Path,
+    database: &Path,
+    args: &[&str],
+) -> serde_json::Value {
+    let mut command = Command::new(binary);
+    command.args(args);
+    isolated(&mut command, root);
+    command.env("OPENCODE_DB", database);
+    let output = command.output().expect("run export");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "{} export exited with {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        binary.display(),
+        output.status,
+    );
+    serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|error| panic!("export did not print JSON ({error}):\n{stdout}"))
+}
+
+/// The single acceptance test for todo 116: a seeded session exports with exit 0
+/// and a payload the real binary also produces.
+///
+/// This is the reason the check is a differential rather than a shape assertion.
+/// `export` was already *documented* as implemented and *recorded* as implemented
+/// while exiting 1, so any test that consults this port's own description of
+/// itself would have passed then too. Comparing against the released binary's
+/// bytes is the only assertion that cannot agree with a mistake in this repo.
+#[test]
+fn export_matches_the_oracle_on_one_seeded_session() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let database = root.path().join("data").join("opencode").join("export.db");
+    seed_export_database(&database);
+
+    let actual = export_document(
+        &rust_path(),
+        root.path(),
+        &database,
+        &["export", EXPORT_SESSION],
+    );
+
+    let messages = actual
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .expect("the export carries a messages array");
+    assert_eq!(messages.len(), 2, "{actual}");
+    assert_eq!(
+        actual
+            .pointer("/info/id")
+            .and_then(serde_json::Value::as_str),
+        Some(EXPORT_SESSION)
+    );
+    assert_eq!(
+        messages[1]
+            .pointer("/parts")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
+        Some(oc_db::message::PART_KIND_COUNT),
+        "every seeded part variant must survive the export"
+    );
+
+    if !Path::new(ORACLE).is_file() {
+        eprintln!(
+            "PARTIAL export_matches_the_oracle_on_one_seeded_session: the real opencode binary is \
+             absent at {ORACLE}; the payload was NOT compared against it"
+        );
+        return;
+    }
+    let oracle = export_document(
+        Path::new(ORACLE),
+        root.path(),
+        &database,
+        &["export", EXPORT_SESSION, "--pure"],
+    );
+    assert_eq!(
+        actual,
+        oracle,
+        "export payloads differ\nRust:\n{}\nOracle:\n{}",
+        serde_json::to_string_pretty(&actual).expect("render"),
+        serde_json::to_string_pretty(&oracle).expect("render"),
+    );
+}
+
+#[test]
+fn export_sanitize_matches_the_oracle_on_one_seeded_session() {
+    if !Path::new(ORACLE).is_file() {
+        eprintln!(
+            "SKIPPED export_sanitize_matches_the_oracle_on_one_seeded_session: the real opencode \
+             binary is absent at {ORACLE}; the redaction pass was NOT compared against it"
+        );
+        return;
+    }
+    let root = tempfile::tempdir().expect("tempdir");
+    let database = root.path().join("data").join("opencode").join("export.db");
+    seed_export_database(&database);
+
+    let actual = export_document(
+        &rust_path(),
+        root.path(),
+        &database,
+        &["export", EXPORT_SESSION, "--sanitize"],
+    );
+    let oracle = export_document(
+        Path::new(ORACLE),
+        root.path(),
+        &database,
+        &["export", EXPORT_SESSION, "--sanitize", "--pure"],
+    );
+    assert_eq!(
+        actual,
+        oracle,
+        "redacted export payloads differ\nRust:\n{}\nOracle:\n{}",
+        serde_json::to_string_pretty(&actual).expect("render"),
+        serde_json::to_string_pretty(&oracle).expect("render"),
+    );
+}
+
+/// `export | import` restores the transcript into a second database.
+///
+/// The assertion is on the *re-export* rather than on row counts, because a row
+/// count cannot tell a restored part from an empty one.
+#[test]
+fn export_then_import_restores_the_session_into_another_database() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let source = root.path().join("data").join("opencode").join("source.db");
+    seed_export_database(&source);
+    let exported = export_document(
+        &rust_path(),
+        root.path(),
+        &source,
+        &["export", EXPORT_SESSION],
+    );
+
+    let file = root.path().join("exported.json");
+    std::fs::write(
+        &file,
+        serde_json::to_string_pretty(&exported).expect("render"),
+    )
+    .expect("write the export");
+
+    let target = root.path().join("data").join("opencode").join("target.db");
+    let mut command = rust_binary();
+    command.args(["import", &file.to_string_lossy()]);
+    isolated(&mut command, root.path());
+    command.env("OPENCODE_DB", &target).current_dir(root.path());
+    let output = command.output().expect("run import");
+    assert!(
+        output.status.success(),
+        "import exited with {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(EXPORT_SESSION),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let restored = export_document(
+        &rust_path(),
+        root.path(),
+        &target,
+        &["export", EXPORT_SESSION],
+    );
+    // `directory` and `path` are re-homed onto the importing checkout by design
+    // (`cli/cmd/import.ts:178-183`); everything else must come back verbatim.
+    let mut expected = exported;
+    let info = expected
+        .get_mut("info")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("info");
+    info.insert(
+        "directory".to_owned(),
+        restored
+            .pointer("/info/directory")
+            .cloned()
+            .expect("a restored directory"),
+    );
+    info.insert(
+        "projectID".to_owned(),
+        restored
+            .pointer("/info/projectID")
+            .cloned()
+            .expect("a restored projectID"),
+    );
+    if let Some(path) = restored.pointer("/info/path").cloned() {
+        info.insert("path".to_owned(), path);
+    } else {
+        info.remove("path");
+    }
+    assert_eq!(
+        restored,
+        expected,
+        "the imported session did not round-trip\nrestored:\n{}\nexpected:\n{}",
+        serde_json::to_string_pretty(&restored).expect("render"),
+        serde_json::to_string_pretty(&expected).expect("render"),
+    );
+}
+
+#[test]
+fn export_without_a_session_id_explains_the_interactive_selection() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let output = run(&rust_path(), &["export"], root.path());
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("interactive"), "{stderr}");
+    assert!(
+        !stderr.contains("pending"),
+        "a missing argument must not report a missing handler: {stderr}"
+    );
+}
+
+#[test]
+fn export_reports_an_unknown_session_the_way_the_oracle_does() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let database = root.path().join("data").join("opencode").join("export.db");
+    seed_export_database(&database);
+    let missing = "ses_diffexport0000000000000000zz";
+
+    let mut command = rust_binary();
+    command.args(["export", missing]);
+    isolated(&mut command, root.path());
+    command.env("OPENCODE_DB", &database);
+    let output = command.output().expect("run export");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("Session not found: {missing}")),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn import_reports_a_missing_file_the_way_the_oracle_does() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mut command = rust_binary();
+    command.args(["import", "/definitely/absent/export.json"]);
+    isolated(&mut command, root.path());
+    command.current_dir(root.path());
+    let output = command.output().expect("run import");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("File not found"), "{stderr}");
 }

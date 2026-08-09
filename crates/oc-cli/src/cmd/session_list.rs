@@ -135,7 +135,7 @@ fn render_table(listed: &[ListedSession]) -> Result<(), String> {
     }
     let id_width = listed
         .iter()
-        .map(|entry| entry.info.id.len())
+        .map(|entry| entry.info.session.id.len())
         .max()
         .unwrap_or(ID_WIDTH)
         .max(ID_WIDTH);
@@ -152,13 +152,16 @@ fn render_table(listed: &[ListedSession]) -> Result<(), String> {
         println!(
             "{:<id_width$}  {:<PROJECT_WIDTH$}  {:<TITLE_WIDTH$}  {:<AGENT_WIDTH$}  \
              {:<ACTIVITY_WIDTH$}  {:>MESSAGES_WIDTH$}  {:>COST_WIDTH$}",
-            entry.info.id,
+            entry.info.session.id,
             truncate(&project_label(entry), PROJECT_WIDTH),
-            truncate(&entry.info.title, TITLE_WIDTH),
-            truncate(entry.info.agent.as_deref().unwrap_or("-"), AGENT_WIDTH),
+            truncate(&entry.info.session.title, TITLE_WIDTH),
+            truncate(
+                entry.info.session.agent.as_deref().unwrap_or("-"),
+                AGENT_WIDTH
+            ),
             activity(entry)?,
             entry.messages,
-            cost(entry.info.cost),
+            cost(entry.info.session.cost),
         );
     }
     Ok(())
@@ -179,7 +182,7 @@ fn project_label(entry: &ListedSession) -> String {
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| project.id.clone())
         }),
-        None => entry.info.project_id.clone(),
+        None => entry.info.session.project_id.clone(),
     }
 }
 
@@ -196,8 +199,8 @@ fn cost(dollars: f64) -> String {
 /// The last-activity cell: whichever timestamp the listing sorted on, with an
 /// archive marker when the row is one `--archived` widened the result with.
 fn activity(entry: &ListedSession) -> Result<String, String> {
-    let stamp = today_time_or_date_time(entry.info.time.updated)?;
-    if entry.info.time.archived.is_some() {
+    let stamp = today_time_or_date_time(entry.info.session.time.updated)?;
+    if entry.info.session.time.archived.is_some() {
         return Ok(truncate(&format!("{stamp} (archived)"), ACTIVITY_WIDTH));
     }
     Ok(stamp)
@@ -265,38 +268,40 @@ fn utf16_len(value: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oc_db::session_list::{CacheUsage, GlobalInfo, TimeInfo, TokenUsage};
+    use oc_db::session_list::{CacheUsage, GlobalInfo, SessionInfo, TimeInfo, TokenUsage};
 
     fn info(id: &str, project: Option<ProjectInfo>) -> GlobalInfo {
         GlobalInfo {
-            id: id.to_owned(),
-            slug: id.to_owned(),
-            project_id: String::from("prj_one"),
-            workspace_id: None,
-            directory: String::from("/srv/one"),
-            path: Some(String::new()),
-            parent_id: None,
-            title: String::from("A title"),
-            agent: Some(String::from("build")),
-            model: None,
-            version: String::from("1.18.13"),
-            summary: None,
-            cost: 0.0,
-            tokens: TokenUsage {
-                input: 0,
-                output: 0,
-                reasoning: 0,
-                cache: CacheUsage { read: 0, write: 0 },
-            },
-            share: None,
-            metadata: None,
-            revert: None,
-            permission: None,
-            time: TimeInfo {
-                created: 0,
-                updated: 0,
-                compacting: None,
-                archived: None,
+            session: SessionInfo {
+                id: id.to_owned(),
+                slug: id.to_owned(),
+                project_id: String::from("prj_one"),
+                workspace_id: None,
+                directory: String::from("/srv/one"),
+                path: Some(String::new()),
+                parent_id: None,
+                title: String::from("A title"),
+                agent: Some(String::from("build")),
+                model: None,
+                version: String::from("1.18.13"),
+                summary: None,
+                cost: 0.0,
+                tokens: TokenUsage {
+                    input: 0,
+                    output: 0,
+                    reasoning: 0,
+                    cache: CacheUsage { read: 0, write: 0 },
+                },
+                share: None,
+                metadata: None,
+                revert: None,
+                permission: None,
+                time: TimeInfo {
+                    created: 0,
+                    updated: 0,
+                    compacting: None,
+                    archived: None,
+                },
             },
             project,
         }
@@ -372,12 +377,12 @@ mod tests {
     #[test]
     fn an_archived_row_keeps_its_marker_at_the_widest_timestamp() {
         let mut listed = entry(None);
-        listed.info.time.archived = Some(1);
+        listed.info.session.time.archived = Some(1);
         // The widest stamp the formatter emits: a two-digit hour, a two-digit
         // month and a two-digit day, i.e. `11:38 PM · 12/31/2026`. Truncating
         // this cell was the defect the column width was sized against, so the
         // assertion is on the marker surviving, not on the cell fitting.
-        listed.info.time.updated = 1_798_800_000_000;
+        listed.info.session.time.updated = 1_798_800_000_000;
         let cell = activity(&listed).expect("format the activity cell");
         assert!(
             cell.ends_with("(archived)"),
