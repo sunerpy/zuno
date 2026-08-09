@@ -10,7 +10,10 @@
 //! used by two of the three is unavoidably dead in the third — hence the blanket
 //! allow. The alternative is three divergent copies of the polling rules, which is
 //! exactly the duplication that lets one copy drift back to a fixed sleep.
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "this shared module is compiled separately by tests that use different helper subsets"
+)]
 
 use std::time::{Duration, Instant};
 

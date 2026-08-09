@@ -6188,3 +6188,45 @@ found in the same sweep (four more `61 /api` claims including a *frozen success
 criterion*, the roster count in two scripts, and two prose counts in
 `docs/divergences.md`). One `Commit:` line was deliberately left stale because it
 records the message of a commit that exists in git history.
+
+## [2026-08-09] Todo 122 — regenerated artefact records G2 FAIL and a bimodal regression lead
+
+The frozen gate was re-run for real with `OC_MEMORY_GATE_MODE=run`, alone in tmux,
+against pinned session `ses_2bcaee257ffeFZNJrmtpi3ZglR` (931 messages / 3,620
+parts / 105,118,812 part bytes) in the immutable 2,630,582,272-byte snapshot
+`/config/.local/share/opencode/opencode.db.bak.20260408` (sha256
+`e2cde4df08cd580d0a4f03068b2d861275ca8aef983fef6578968f7f7a2a18a7`).
+This fresh worktree had no `target/perf/` cache, so no pass resumed; both frozen
+passes ran in full.
+
+- G1: Rust median **19,940 KiB**, ceiling 477,120, Rust/committed **0.0209**,
+  Rust/paired 0.0201 — **PASS**.
+- G2: Rust median **1,527,188 KiB**, ceiling 1,513,496, Rust/committed
+  **0.5045** — **FAIL** by 13,692 KiB (0.905%). Rust/paired is **0.4914**;
+  paired TS measured 3,107,692 KiB, 2.67% above the committed 3,026,992 KiB.
+  Revision 2 uses the committed baseline, so the paired ratio does not waive the
+  failure.
+
+Sorted Rust W-real peaks are `[1,493,916, 1,494,048 | 1,527,188 | 1,657,244,
+1,658,468]`. Todo 113's 1,494,236-KiB passing median matches the low cluster to
+within 320 KiB. The two high runs add about 163,874 KiB over that cluster, while
+the median run adds 33,140 KiB over its upper member: structured intermittent
+retention after todos 115–121, not a basis for calling the result noise. Every
+Rust W-real peak sample contained exactly one PID, eliminating guard/monitor
+children as the source of the whole-tree increase. A retained `EventService`
+broadcast/event buffer introduced around todo 118 is recorded only as an
+unverified follow-up candidate; todo 122 did not chase or tune the regression.
+
+The committed audit is `.omo/evidence/task-122-opencode-rust.txt`; it includes all
+four raw run vectors, medians, committed and paired ratios, ceilings, fingerprints,
+and this analysis. It was explicitly staged before completion so the old ignored-
+worktree evidence loss cannot recur.
+
+The suppression scan also corrected the review/user enumerations. Editor and theme
+already carried `reason = ...`; the four newly exposed local gaps were
+`oc-engine` compaction, `oc-server` maintenance, `oc-tool`'s schema fixture, and
+the shared `oc-pty` test helper. All now have local reasons. The prohibited frozen
+`oc-testkit/tests/memory.rs` edit is represented by one exact path+line+attribute
+exception whose rationale lives in the scanner. The new
+`every_first_party_lint_suppression_has_a_reason` test scans all crate Rust files,
+failed red on those four gaps, and passed green after the reasons were added.

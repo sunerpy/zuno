@@ -412,7 +412,10 @@ pub struct CompactionRequest<'a> {
 }
 
 impl<'a> CompactionRequest<'a> {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the constructor keeps every required compaction invariant explicit; optional state uses builders"
+    )]
     #[must_use]
     pub const fn new(
         session_id: &'a str,

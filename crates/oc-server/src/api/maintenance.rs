@@ -140,7 +140,10 @@ pub async fn mutate(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "preview and mutate share this policy path, whose inputs mirror the request plus execution context"
+)]
 fn run(
     state: &ApiState,
     older_than_days: u64,
