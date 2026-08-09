@@ -6370,3 +6370,31 @@ proven wrong during execution; this wave adds the prune-table count, the pinned 
 a plugin version. *A frozen contract written before the code existed will contain claims the code
 later proves false — and an auditor cannot amend the contract it is auditing.* That is a decision
 for the plan's owner, not for F1 or for me.
+
+### [2026-08-09] What I checked about the three "external dependency" findings
+
+Before calling anything blocked, I verified each:
+
+- **Criterion 1's oracle.** `1.18.13` is **NOT installed** (`mise ls` shows 1.18.12, 1.18.14, 1.18.15
+  among others) — but `mise ls-remote opencode` **does list 1.18.13**, so it is installable. This is
+  therefore *not* an immovable external blocker: `mise install opencode@1.18.13` plus re-pointing
+  `compat_suite.rs` and recapturing the OpenAPI document would close it properly. That is a real
+  task, not a plan amendment, and it needs network access.
+- **Criterion 6's plugin version.** The criterion names `@sunerpy/opencode-kiro-auth@0.18.0`; the
+  user's own config pins **`0.20.6`**, and the JS host was built against `0.20.1`. The criterion
+  named a version that has since moved three times. Testing against a version the user does not use
+  would satisfy the letter and miss the point.
+- **G6's Windows half.** Cannot be executed on this Linux host. Fixed in source, `cfg(windows)`
+  test written, honestly marked NOT EXECUTED. Genuinely immovable here.
+
+### The prune-table count is the cleanest example of the plan being wrong
+
+Criterion 13 says a delete must leave "zero orphaned rows in any of the **twelve** related tables".
+The schema has **ten** session-attributable tables and the implementation correctly pins ten — this
+was already measured back in wave 12 ("12→10 prune tables" is one of the six original count
+contradictions). F1's position is exactly right and worth quoting:
+
+> "Correcting an inaccurate source count is defensible engineering; it is not a plan amendment, so
+> F1 cannot silently rewrite the frozen criterion."
+
+**An auditor cannot amend the contract it audits.** Neither can I, on the plan owner's behalf.
