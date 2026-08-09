@@ -92,9 +92,9 @@ cursor stream remains available for compatibility. Slow subscribers stay bounded
 and receive an explicit lag diagnostic rather than growing memory.
 
 The API differential invokes all 58 upstream operations against both binaries.
-Twenty-three currently have local backends; the other 35 return an operation-specific
-`503 backend_unavailable` and remain reported as compatibility gaps. A registered
-`501` can never satisfy the matrix.
+35 of the 58 upstream operations have local backends; the remaining 23 return an
+operation-specific `503 backend_unavailable` and remain reported as compatibility
+gaps. A registered `501` can never satisfy the matrix.
 
 **3. An old install needs a migration you should know about.** A database
 predating the `migration` table carries a `__drizzle_migrations` journal instead.
@@ -120,24 +120,62 @@ cargo fmt --all --check
 
 ## Non-functional gates
 
-Six gates back the port's resource claims. All six are measured; none is a
-projection.
+Six gates back the port's resource claims. Every figure below was measured on
+Linux; none is a projection. Two of the six are opt-in rather than part of the
+ordinary suite, and one has a half that has never run here — both stated in the
+caveats.
+
+### G1 and G2 — peak resident memory
+
+<!-- generated:BEGIN memory-gate-measurement -->
+Derived from the newest committed measurement artefact,
+[`.omo/evidence/task-123-opencode-rust.txt`](.omo/evidence/task-123-opencode-rust.txt).
+The ceilings are not measured here:
+[`benchmarks/ts-baseline.json`](benchmarks/ts-baseline.json) freezes each one
+at half the TypeScript median for the same workload, and every other column
+below is computed from the five per-repetition Rust peaks the artefact records.
+
+| gate | workload | Rust median peak | frozen ceiling | margin | five-run spread | Rust / TypeScript | verdict |
+|---|---|---:|---:|---:|---:|---:|---|
+| G1 | `W-idle` | 20,380 KiB | 477,120 KiB | 456,740 KiB | 444 KiB | 0.0214 | PASS |
+| G2 | `W-real` | 1,494,024 KiB | 1,513,496 KiB | 19,472 KiB | 17,032 KiB | 0.4936 | PASS |
+
+G2's five `W-real` peaks were 1,493,496 · 1,493,948 · 1,494,024 · 1,510,444 ·
+1,510,528 KiB. Every one of the five is under the ceiling, and the median's
+19,472 KiB margin — 1.29% of the ceiling — is 2,440 KiB wider than the 17,032
+KiB five-run spread. That ordering is the claim worth checking: a margin
+narrower than the spread is a coin flip that landed, not a pass. The superseded
+measurement in
+[`.omo/evidence/task-122-opencode-rust.txt`](.omo/evidence/task-122-opencode-rust.txt)
+is the shape being avoided: a 164,552 KiB spread around a median that finished
+13,692 KiB over the same ceiling — FAIL.
+<!-- generated:END memory-gate-measurement -->
+
+### G3 to G6
 
 | gate | what it bounds | measured | bound | verdict |
 |---|---|---|---|---|
-| G1 | peak RSS, idle workload (`W-idle`) | 19,776 KiB | 477,120 KiB | PASS, ratio 0.0207 |
-| G2 | peak RSS, real-session workload (`W-real`) | 1,494,236 KiB | 1,513,496 KiB | PASS, ratio 0.4936 |
 | G3 | memory growth per turn over a 500-turn soak | 0.0001775568 MiB/turn | 1.0 MiB/turn | PASS |
 | G3 | final/middle peak ratio | 0.9938255268 | 1.5 | PASS |
 | G4 | liveness during the soak | neither bound tripped | 120 s without state progress; 1800 s hard deadline per turn | PASS |
 | G5 | unbounded channels on producer/consumer boundaries | 17 bounded + 2 declared exclusions, 0 undeclared | — | PASS |
-| G6 | orphaned processes after the parent dies | 0 orphans, clean shutdown **and** `SIGKILL` | — | PASS |
+| G6 | orphaned processes after the parent dies | 0 orphans on Linux, clean shutdown **and** `SIGKILL` | — | PASS on Linux; Windows half unexecuted |
 
-### Three caveats, stated rather than buried
+### Four caveats, stated rather than buried
 
-**G2 passes by 19,260 KiB — 1.27%.** That is the whole margin. The gate will flip
-to FAIL on a materially larger session, and the ceiling does not scale with the
-subject: it is a fixed number from one TypeScript measurement.
+**The G2 ceiling does not scale with the subject.** It is a fixed number — half
+one TypeScript median, measured once, on one session — so the gate can flip to
+FAIL on a materially larger session with no change in this code. The margin and
+the five-run spread above are what decide how much room there actually is, and
+the ordering between the two matters more than either on its own.
+
+**G6's Windows half has never been executed.** The measured result above comes
+from `crates/oc-process/tests/containment.rs`, which is
+`#![cfg(target_os = "linux")]`. The Windows Job-object path lives in
+`crates/oc-process/tests/windows_containment.rs` behind `#![cfg(windows)]`, and
+on a Linux host it is **NOT EXECUTED** — not skipped-but-fine, not inferred from
+the Linux result. It needs native Windows CI or a Windows machine before G6 can
+be claimed cross-platform.
 
 **A green `cargo test --workspace` does not mean G1-G6 pass.** The expensive gates
 are opt-in, and the ordinary suite skips or ignores them:

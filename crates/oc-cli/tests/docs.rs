@@ -477,6 +477,33 @@ fn assert_api_counts(
             &format!("{} explicit 503 backend gaps", gaps.len()),
         ],
     );
+
+    // The README restates this split, and once shipped it inverted: 23 backed
+    // against the table's 35. Both halves now come from the same probe.
+    let backed = upstream
+        .iter()
+        .filter(|operation| served.contains(*operation) && !gaps.contains(*operation))
+        .count();
+    let gapped = upstream
+        .iter()
+        .filter(|operation| gaps.contains(*operation))
+        .count();
+    assert_eq!(
+        backed + gapped + missing,
+        upstream.len(),
+        "every upstream operation is backed, gapped, or unregistered"
+    );
+    contains_all(
+        "README.md",
+        &[
+            &format!("all {} upstream operations", upstream.len()),
+            &format!(
+                "{backed} of the {} upstream operations have local backends",
+                upstream.len()
+            ),
+            &format!("the remaining {gapped} return an"),
+        ],
+    );
 }
 
 fn v1_block() -> String {
@@ -774,6 +801,494 @@ fn docs_migration_guide_lists_every_migration_in_execution_order() {
 }
 
 // ---------------------------------------------------------------------------
+// The resident-memory gates, G1 and G2
+// ---------------------------------------------------------------------------
+//
+// The README publishes measured numbers. A table of numbers checked against a
+// hand-typed expectation proves only that two hand-typed things agree, so
+// nothing below restates a figure. Every published value is computed from two
+// live artifacts:
+//
+//   * `benchmarks/ts-baseline.json`, via [`oc_testkit::perf::FrozenThresholds`],
+//     supplies the ceilings; and
+//   * the newest committed measurement artefact under `.omo/evidence` supplies
+//     the five per-repetition Rust peaks.
+//
+// Median, margin, spread, ratio and verdict are then derived here and rendered
+// into a generated README block. The artefact's own narrative is used only as a
+// cross-check: where its prose disagrees with its own table or with the
+// committed baseline, this target fails instead of republishing either.
+
+/// Directory holding the committed measurement artefacts.
+const EVIDENCE_DIR: &str = ".omo/evidence";
+
+/// Prefix and suffix of an evidence artefact's filename, around its task number.
+const EVIDENCE_PREFIX: &str = "task-";
+const EVIDENCE_SUFFIX: &str = "-opencode-rust.txt";
+
+/// Column width the README's hand-written prose wraps at.
+const PROSE_WIDTH: usize = 79;
+
+/// Parses `1,494,024` into `1494024`.
+fn parse_grouped(token: &str) -> Option<u64> {
+    let digits: String = token.chars().filter(|c| *c != ',').collect();
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Renders `1494024` as `1,494,024`.
+fn grouped(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Greedy wrap so generated prose matches the README's hand-written width.
+fn wrap(text: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut column = 0usize;
+    for word in text.split_whitespace() {
+        if column == 0 {
+            out.push_str(word);
+            column = word.chars().count();
+        } else if column + 1 + word.chars().count() <= width {
+            out.push(' ');
+            out.push_str(word);
+            column += 1 + word.chars().count();
+        } else {
+            out.push('\n');
+            out.push_str(word);
+            column = word.chars().count();
+        }
+    }
+    out
+}
+
+/// One gate's figures. Only `peaks` and `committed_ts_median_kib` are read from
+/// the artefact; every other quantity the README prints is derived below.
+#[derive(Debug, Clone, Copy)]
+struct GateFigures {
+    /// The five per-repetition Rust peaks, ascending.
+    peaks: [u64; 5],
+    /// The TypeScript median the frozen baseline committed for this workload.
+    committed_ts_median_kib: u64,
+    /// `0.50 x` that median, taken from [`oc_testkit::perf::FrozenThresholds`].
+    ceiling_kib: u64,
+}
+
+impl GateFigures {
+    /// The reported value: the median of the five retained peaks.
+    fn median_kib(self) -> u64 {
+        self.peaks[2]
+    }
+
+    /// Widest pair of per-run peaks — the run-to-run variance the median hides.
+    fn spread_kib(self) -> u64 {
+        self.peaks[4] - self.peaks[0]
+    }
+
+    /// How far the median sits under the ceiling, `None` when it does not.
+    fn margin_kib(self) -> Option<u64> {
+        self.ceiling_kib.checked_sub(self.median_kib())
+    }
+
+    /// How far the median sits *over* the ceiling, `None` when it does not.
+    fn excess_kib(self) -> Option<u64> {
+        self.median_kib().checked_sub(self.ceiling_kib)
+    }
+
+    /// The frozen predicate itself: median at or under the ceiling.
+    fn passes(self) -> bool {
+        self.median_kib() <= self.ceiling_kib
+    }
+
+    /// The verdict the frozen predicate implies, independent of any prose.
+    fn verdict(self) -> &'static str {
+        if self.passes() { "PASS" } else { "FAIL" }
+    }
+
+    /// Rust median as a fraction of the committed TypeScript median.
+    fn ratio(self) -> f64 {
+        self.median_kib() as f64 / self.committed_ts_median_kib as f64
+    }
+
+    /// The margin as a percentage of the ceiling, the form the README quotes.
+    fn margin_percent(self) -> Option<f64> {
+        self.margin_kib()
+            .map(|margin| margin as f64 * 100.0 / self.ceiling_kib as f64)
+    }
+
+    /// The per-run peaks that exceeded the ceiling. Empty is the strong claim.
+    fn peaks_over_ceiling(self) -> Vec<u64> {
+        self.peaks
+            .into_iter()
+            .filter(|peak| *peak > self.ceiling_kib)
+            .collect()
+    }
+}
+
+/// A whole G1 + G2 measurement, attributed to the artefact it came from.
+#[derive(Debug, Clone)]
+struct MemoryGateMeasurement {
+    /// Repository-relative path of the artefact, as the README cites it.
+    artefact: String,
+    g1: GateFigures,
+    g2: GateFigures,
+}
+
+/// Slices one `FROZEN GATE RESULTS` subsection, which is blank-line delimited.
+fn gate_section<'text>(text: &'text str, header: &str) -> Option<&'text str> {
+    let start = text.find(&format!("\n{header}\n"))? + 1;
+    let rest = &text[start..];
+    let end = rest.find("\n\n").unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+/// Reads `  committed TypeScript median: 954,240 KiB` from a gate subsection.
+fn section_kib(section: &str, key: &str) -> Option<u64> {
+    section
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix(key))
+        .and_then(|value| parse_grouped(value.trim().trim_end_matches("KiB").trim()))
+}
+
+/// Reads the five per-repetition peaks and the restated median from a raw row.
+fn raw_peaks(text: &str, label: &str) -> Option<([u64; 5], u64)> {
+    let row = text
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix(label))?;
+    let values: Vec<u64> = row
+        .split_whitespace()
+        .map(parse_grouped)
+        .collect::<Option<Vec<u64>>>()?;
+    let [r1, r2, r3, r4, r5, median] = <[u64; 6]>::try_from(values).ok()?;
+    Some(([r1, r2, r3, r4, r5], median))
+}
+
+/// Parses one artefact, or `None` when it is not a G1/G2 measurement at all.
+///
+/// Every derived quantity is cross-checked against the artefact's own narrative:
+/// the median it restates, the ceiling it prints, and the verdict it records must
+/// all agree with what the raw five peaks and the frozen baseline imply. An
+/// artefact whose prose contradicts its own table fails here rather than being
+/// republished, and the *derived* value is what the README then carries.
+fn parse_gate_figures(
+    text: &str,
+    thresholds: &oc_testkit::perf::FrozenThresholds,
+) -> Option<[GateFigures; 2]> {
+    let mut parsed = Vec::with_capacity(2);
+    for (label, header, ceiling_mib) in [
+        ("Rust W-idle", "G1 / W-idle", thresholds.g1_max_mib),
+        ("Rust W-real", "G2 / W-real", thresholds.g2_max_mib),
+    ] {
+        let (mut peaks, restated_median) = raw_peaks(text, label)?;
+        let section = gate_section(text, header)?;
+        let committed_ts_median_kib = section_kib(section, "committed TypeScript median:")?;
+        let recorded_ceiling = section_kib(section, "frozen ceiling (0.50 x committed):")?;
+        let recorded_median = section_kib(section, "Rust median:")?;
+        let recorded_verdict = section
+            .lines()
+            .map(str::trim)
+            .find_map(|line| line.strip_prefix("verdict under the frozen formula:"))?
+            .trim()
+            .to_owned();
+
+        let ceiling_kib_exact = ceiling_mib * 1024.0;
+        let ceiling_kib = ceiling_kib_exact.round() as u64;
+        assert!(
+            (ceiling_kib_exact - ceiling_kib as f64).abs() < 0.5,
+            "the frozen {header} ceiling {ceiling_kib_exact} KiB is not a whole number of KiB"
+        );
+        assert_eq!(
+            recorded_ceiling, ceiling_kib,
+            "{header}: the artefact prints a {recorded_ceiling} KiB ceiling but the frozen \
+             baseline and formula give {ceiling_kib} KiB — the artefact was measured against a \
+             different baseline than the one this repository commits"
+        );
+
+        peaks.sort_unstable();
+        let figures = GateFigures {
+            peaks,
+            committed_ts_median_kib,
+            ceiling_kib,
+        };
+        assert_eq!(
+            figures.median_kib(),
+            restated_median,
+            "{header}: the artefact's raw row restates a median that is not the median of its own \
+             five peaks {peaks:?}"
+        );
+        assert_eq!(
+            figures.median_kib(),
+            recorded_median,
+            "{header}: the artefact's gate section reports a median its raw row contradicts"
+        );
+        assert_eq!(
+            recorded_verdict,
+            figures.verdict(),
+            "{header}: the artefact records `{recorded_verdict}` but its own median {} KiB \
+             against the frozen {ceiling_kib} KiB ceiling is a {}",
+            figures.median_kib(),
+            figures.verdict()
+        );
+        parsed.push(figures);
+    }
+    <[GateFigures; 2]>::try_from(parsed).ok()
+}
+
+/// Every committed G1/G2 measurement, oldest task number first.
+///
+/// Discovered rather than named, so a later re-measurement becomes the source of
+/// truth the moment it is committed and a README left behind fails this target.
+fn memory_gate_measurements() -> Vec<MemoryGateMeasurement> {
+    let thresholds = oc_testkit::perf::FrozenThresholds::from_baseline(
+        &oc_testkit::perf::load_committed_baseline()
+            .expect("the committed TypeScript baseline must load"),
+    )
+    .expect("the frozen thresholds must substitute from the committed baseline");
+    assert!(
+        thresholds.all_finite(),
+        "a non-finite frozen threshold would make every figure below meaningless"
+    );
+
+    let dir = workspace_root().join(EVIDENCE_DIR);
+    let entries =
+        std::fs::read_dir(&dir).unwrap_or_else(|error| panic!("read {}: {error}", dir.display()));
+    let mut candidates: BTreeMap<u64, MemoryGateMeasurement> = BTreeMap::new();
+    for entry in entries {
+        let path = entry
+            .expect("an evidence directory entry must be readable")
+            .path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(task) = name
+            .strip_prefix(EVIDENCE_PREFIX)
+            .and_then(|rest| rest.strip_suffix(EVIDENCE_SUFFIX))
+            .and_then(|number| number.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        if let Some([g1, g2]) = parse_gate_figures(&text, &thresholds) {
+            candidates.insert(
+                task,
+                MemoryGateMeasurement {
+                    artefact: format!("{EVIDENCE_DIR}/{name}"),
+                    g1,
+                    g2,
+                },
+            );
+        }
+    }
+    assert!(
+        !candidates.is_empty(),
+        "no artefact in {} records a G1/G2 measurement; the README's memory figures would have \
+         no source",
+        dir.display()
+    );
+    candidates.into_values().collect()
+}
+
+/// The G2 paragraph: the five raw peaks, then the margin-versus-spread ordering.
+///
+/// The *judgement* is generated too, not just the digits. Whether every run
+/// passed, and whether the margin beats the spread, are both decided from the
+/// peaks here — so a weaker future measurement produces weaker prose instead of
+/// an unchanged boast.
+fn g2_robustness_prose(
+    current: &MemoryGateMeasurement,
+    superseded: Option<&MemoryGateMeasurement>,
+) -> String {
+    let g2 = current.g2;
+    let peaks = g2
+        .peaks
+        .iter()
+        .map(|peak| grouped(*peak))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let over = g2.peaks_over_ceiling();
+    let coverage = if over.is_empty() {
+        "Every one of the five is under the ceiling".to_owned()
+    } else {
+        format!(
+            "**{} of the five sit over the ceiling**, so the median passes only because the \
+             distribution is skewed",
+            over.len()
+        )
+    };
+    let spread = g2.spread_kib();
+    let ordering = match (g2.margin_kib(), g2.excess_kib()) {
+        (Some(margin), _) if margin > spread => format!(
+            "and the median's {} KiB margin — {:.2}% of the ceiling — is {} KiB wider than the \
+             {} KiB five-run spread. That ordering is the claim worth checking: a margin \
+             narrower than the spread is a coin flip that landed, not a pass.",
+            grouped(margin),
+            g2.margin_percent().unwrap_or_default(),
+            grouped(margin - spread),
+            grouped(spread),
+        ),
+        (Some(margin), _) => format!(
+            "but the median's {} KiB margin — {:.2}% of the ceiling — is **narrower than** the \
+             {} KiB five-run spread. Read that as a coin flip that landed rather than a pass.",
+            grouped(margin),
+            g2.margin_percent().unwrap_or_default(),
+            grouped(spread),
+        ),
+        (None, Some(excess)) => format!(
+            "and the median finishes {} KiB **over** the ceiling against a {} KiB five-run \
+             spread: G2 does not pass.",
+            grouped(excess),
+            grouped(spread),
+        ),
+        (None, None) => unreachable!("a median is either under or over its ceiling"),
+    };
+
+    let history = match superseded {
+        Some(previous) if !previous.g2.passes() => format!(
+            " The superseded measurement in [`{path}`]({path}) is the shape being avoided: a {} \
+             KiB spread around a median that finished {} KiB over the same ceiling — {}.",
+            grouped(previous.g2.spread_kib()),
+            grouped(previous.g2.excess_kib().unwrap_or_default()),
+            previous.g2.verdict(),
+            path = previous.artefact,
+        ),
+        Some(previous) => format!(
+            " The superseded measurement in [`{path}`]({path}) recorded a {} KiB median against a \
+             {} KiB spread — {}.",
+            grouped(previous.g2.median_kib()),
+            grouped(previous.g2.spread_kib()),
+            previous.g2.verdict(),
+            path = previous.artefact,
+        ),
+        None => String::new(),
+    };
+
+    wrap(
+        &format!("G2's five `W-real` peaks were {peaks} KiB. {coverage}, {ordering}{history}"),
+        PROSE_WIDTH,
+    )
+}
+
+/// Renders the README's memory-gate block from a measurement.
+fn memory_gate_block(
+    current: &MemoryGateMeasurement,
+    superseded: Option<&MemoryGateMeasurement>,
+) -> String {
+    let artefact = &current.artefact;
+    let mut out = wrap(
+        &format!(
+            "Derived from the newest committed measurement artefact, \
+             [`{artefact}`]({artefact}). The ceilings are not measured here: \
+             [`benchmarks/ts-baseline.json`](benchmarks/ts-baseline.json) freezes each one at \
+             half the TypeScript median for the same workload, and every other column below is \
+             computed from the five per-repetition Rust peaks the artefact records."
+        ),
+        PROSE_WIDTH,
+    );
+    out.push_str(
+        "\n\n| gate | workload | Rust median peak | frozen ceiling | margin | five-run spread \
+         | Rust / TypeScript | verdict |\n|---|---|---:|---:|---:|---:|---:|---|\n",
+    );
+    for (gate, workload, figures) in [("G1", "W-idle", current.g1), ("G2", "W-real", current.g2)] {
+        let margin = match (figures.margin_kib(), figures.excess_kib()) {
+            (Some(margin), _) => format!("{} KiB", grouped(margin)),
+            (None, Some(excess)) => format!("−{} KiB", grouped(excess)),
+            (None, None) => unreachable!("a median is either under or over its ceiling"),
+        };
+        let _ = writeln!(
+            out,
+            "| {gate} | `{workload}` | {} KiB | {} KiB | {margin} | {} KiB | {:.4} | {} |",
+            grouped(figures.median_kib()),
+            grouped(figures.ceiling_kib),
+            grouped(figures.spread_kib()),
+            figures.ratio(),
+            figures.verdict(),
+        );
+    }
+    out.push('\n');
+    out.push_str(&g2_robustness_prose(current, superseded));
+    out.push('\n');
+    out
+}
+
+#[test]
+fn readme_publishes_the_newest_measured_memory_figures_not_a_remembered_one() {
+    let mut measurements = memory_gate_measurements();
+    let current = measurements
+        .pop()
+        .expect("memory_gate_measurements asserts the list is non-empty");
+    let superseded = measurements.pop();
+
+    // The block is derived end to end, so a stale digit in the README fails here.
+    check_block(
+        "README.md",
+        "memory-gate-measurement",
+        &memory_gate_block(&current, superseded.as_ref()),
+    );
+
+    // Both cited artefacts must actually be present, so the README cannot point a
+    // reader at a measurement that was never committed.
+    for measurement in std::iter::once(&current).chain(superseded.as_ref()) {
+        let path = workspace_root().join(&measurement.artefact);
+        assert!(
+            path.is_file(),
+            "{} is cited by the README's memory block but absent",
+            path.display()
+        );
+    }
+}
+
+/// The derived side has to dominate the artefact's prose, not defer to it.
+///
+/// Without this, `parse_gate_figures` could quietly trust a narrative that says
+/// `PASS` while its own peaks say otherwise — the exact failure mode of a test
+/// whose expected and actual sides come from the same hand-written source.
+#[test]
+#[should_panic(expected = "records `PASS` but its own median")]
+fn a_measurement_whose_prose_contradicts_its_own_peaks_is_rejected() {
+    let thresholds = oc_testkit::perf::FrozenThresholds::from_baseline(
+        &oc_testkit::perf::load_committed_baseline()
+            .expect("the committed TypeScript baseline must load"),
+    )
+    .expect("the frozen thresholds must substitute from the committed baseline");
+    let g1_ceiling = grouped((thresholds.g1_max_mib * 1024.0).round() as u64);
+    let g2_ceiling = grouped((thresholds.g2_max_mib * 1024.0).round() as u64);
+
+    // Five W-real peaks an order of magnitude over the ceiling, with prose that
+    // nonetheless claims the gate passed.
+    let forged = format!(
+        "\nRAW PER-REPETITION PEAK RSS (KiB)\n\
+         \n  Rust W-idle   20,060  20,356  20,380  20,444  20,504  20,380\n\
+         \n  Rust W-real   90,000,000  90,000,000  90,000,000  90,000,000  90,000,000  \
+         90,000,000\n\
+         \nG1 / W-idle\n\
+         \u{20}\u{20}Rust median: 20,380 KiB\n\
+         \u{20}\u{20}committed TypeScript median: 954,240 KiB\n\
+         \u{20}\u{20}frozen ceiling (0.50 x committed): {g1_ceiling} KiB\n\
+         \u{20}\u{20}verdict under the frozen formula: PASS\n\
+         \nG2 / W-real\n\
+         \u{20}\u{20}Rust median: 90,000,000 KiB\n\
+         \u{20}\u{20}committed TypeScript median: 3,026,992 KiB\n\
+         \u{20}\u{20}frozen ceiling (0.50 x committed): {g2_ceiling} KiB\n\
+         \u{20}\u{20}verdict under the frozen formula: PASS\n\n"
+    );
+
+    let _ = parse_gate_figures(&forged, &thresholds);
+}
+
+// ---------------------------------------------------------------------------
 // README
 // ---------------------------------------------------------------------------
 
@@ -816,10 +1331,16 @@ fn readme_reports_every_non_functional_gate_with_its_opt_in_command() {
             "OC_MEMORY_GATE_MODE=run",
             "--ignored",
             "cargo test --workspace",
-            // the three caveats, each as a claim a reader can check
-            "1.27%",
+            // the four caveats, each as a claim a reader can check. The G1/G2
+            // margin and spread are deliberately absent from this list: they are
+            // measured values, so they are checked by
+            // `readme_publishes_the_newest_measured_memory_figures_not_a_remembered_one`
+            // against the artefact instead of pinned to a literal here.
             "does not mean G1-G6 pass",
             "ses_2bcaee257ffeFZNJrmtpi3ZglR",
+            // G6's unexecuted Windows half, named by the file that would run it.
+            "windows_containment.rs",
+            "NOT EXECUTED",
         ],
     );
 }

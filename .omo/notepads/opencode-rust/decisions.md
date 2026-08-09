@@ -6432,3 +6432,53 @@ small text files keeps each surface byte-correct against its own upstream. The f
 prompts were captured from a live `GET /api/agent` on 1.18.12 — the authority for what
 that endpoint answers — and the two templates are byte copies of
 `packages/core/src/plugin/command/*.txt`.
+
+## Todo 126 — where the README's memory figures come from, and what is deliberately not derived
+
+**Decision: G1/G2 go in a generated block; G3-G6 stay hand-written.** G1 and G2
+are the only gates whose figures come from a re-runnable measurement that has
+already changed three times (todos 88, 113, 122, 123) and already gone stale in
+public prose once. They are now inside
+`<!-- generated:BEGIN memory-gate-measurement -->`, derived from
+`benchmarks/ts-baseline.json` (ceilings) and the newest committed evidence
+artefact (peaks). G3-G6's numbers come from the two-hour soak and the
+backpressure/containment suites, which no doc test can cheaply re-derive; they
+stay a hand table rather than pretending to be generated. Stating which half is
+generated is more honest than generating a block whose expected side is also
+hand-typed.
+
+**Decision: publish the margin and the spread together, always.** A median alone
+cannot distinguish todo 123's pass (19,472 KiB margin over a 17,032 KiB spread,
+all five runs under the ceiling) from todo 113's (19,260 KiB margin over a
+~165,000 KiB bimodal spread, which later regressed to FAIL). The table carries
+both columns for both gates and the prose states the ordering. The superseded
+artefact is cited by path with its own spread and excess, both derived, so the
+contrast is visible rather than remembered.
+
+**Decision: the caveat count went from three to four, naming G6's unexecuted
+Windows half.** `crates/oc-process/tests/containment.rs` is
+`#![cfg(target_os = "linux")]`; the Job-object path is
+`crates/oc-process/tests/windows_containment.rs` behind `#![cfg(windows)]` and
+is **NOT EXECUTED** on this host. The G6 table row says "PASS on Linux; Windows
+half unexecuted". Todo 121 already recorded this honestly in its evidence; the
+README was the surface where it was still invisible.
+
+**Decision: drop `"1.27%"` from `readme_reports_every_non_functional_gate_with_its_opt_in_command`.**
+That needle pinned a *measured* value with a literal, which is precisely the
+staleness this todo exists to remove — it would have had to be hand-edited to
+`1.29%` and again on the next measurement. The margin percentage is now checked
+by the generated block against the artefact. The needles that remain are claims
+of *kind*, not of measurement: the opt-in commands, "does not mean G1-G6 pass",
+the pinned session id, `windows_containment.rs`, `NOT EXECUTED`.
+
+**Decision: fix README's inverted API split inside this commit rather than defer
+it.** Out of todo 126's literal scope, but it is a wrong number in the same
+public file, verified against `docs/compatibility-matrix.md`'s generated
+`api-operations` block (35 implemented, 23 gaps) — and shipping an accuracy pass
+that steps over a known contradiction would be worse. Fixed by derivation, not
+retyping, so it cannot invert again.
+
+**Decision: rebase onto main before validating.** The branch base predated todos
+127/128, so the API surface — and therefore the 35/23 split — differed. Rebased
+onto 1dee81c, auto-merged `README.md` with no conflict markers, then validated:
+3,294 workspace tests pass (main's 3,292 plus the two added here).
