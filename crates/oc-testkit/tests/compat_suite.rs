@@ -127,7 +127,7 @@ const SURFACES: &[SurfaceRow] = &[
         verdict: Verdict::PartiallyCompared,
         oracle: OracleKind::LiveBinary,
         evidence: "crates/oc-testkit/tests/compat_suite.rs::api_behaviour_matrix_compares_live_status_body_and_side_effects",
-        detail: "58 of 58 upstream operations are invoked against both processes with status, normalized body, and side-effect delta captured; 5 deterministic operations are exact live differentials including both SSE streams, 45 missing local backends are explicit 503 gaps, and 8 backed operations carry visible cross-process fixture exemptions; 2 C8 operations are added",
+        detail: "58 of 58 upstream operations are invoked against both processes with status, normalized body, and side-effect delta captured; 17 operations are exact live differentials — todo 122's five including both SSE streams, plus todo 127's twelve read-only catalogue and filesystem operations; 33 missing local backends remain explicit 503 gaps and 8 backed operations carry visible cross-process fixture exemptions; 2 C8 operations are added",
     },
     SurfaceRow {
         id: "config-merge",
@@ -856,6 +856,21 @@ fn api_behaviour_matrix(document: &serde_json::Value) -> Vec<ApiBehaviourRow> {
         ("/api/session", "get"),
         ("/api/session/active", "get"),
         ("/api/session/{sessionID}/event", "get"),
+        // Todo 127's twelve. Each is a real backend answering a real body, and each
+        // is compared against the released binary for status *and* normalized body
+        // rather than exempted, which is the whole point of implementing them.
+        ("/api/agent", "get"),
+        ("/api/model", "get"),
+        ("/api/command", "get"),
+        ("/api/skill", "get"),
+        ("/api/reference", "get"),
+        ("/api/provider", "get"),
+        ("/api/provider/{providerID}", "get"),
+        ("/api/integration", "get"),
+        ("/api/integration/{integrationID}", "get"),
+        ("/api/fs/read/*", "get"),
+        ("/api/fs/list", "get"),
+        ("/api/fs/find", "get"),
     ]);
     let mut rows = Vec::new();
     for (path, item) in document["paths"]
@@ -881,6 +896,24 @@ fn api_behaviour_matrix(document: &serde_json::Value) -> Vec<ApiBehaviourRow> {
                     ("/api/event", "get") => "live first SSE frame plus local publish delivery",
                     ("/api/session/{sessionID}/event", "get") => {
                         "live durable SSE frame after sequence zero"
+                    }
+                    ("/api/agent", "get")
+                    | ("/api/command", "get")
+                    | ("/api/skill", "get")
+                    | ("/api/reference", "get") => {
+                        "live catalogue request against a shared isolated config world"
+                    }
+                    ("/api/model", "get")
+                    | ("/api/provider", "get")
+                    | ("/api/provider/{providerID}", "get")
+                    | ("/api/integration", "get")
+                    | ("/api/integration/{integrationID}", "get") => {
+                        "live catalogue request against a pinned models.dev document and one declared credential"
+                    }
+                    ("/api/fs/read/*", "get")
+                    | ("/api/fs/list", "get")
+                    | ("/api/fs/find", "get") => {
+                        "live filesystem request against an identically seeded worktree"
                     }
                     _ => "live isolated empty-state request",
                 };
@@ -989,13 +1022,15 @@ async fn start_subject_server(root: &Path) -> SubjectServer {
         )
         .await
         .expect("publish sequence one");
-    let state = oc_server::api::ApiState::memory(root.to_string_lossy())
+    let work = matrix_worktree(root);
+    let state = oc_server::api::ApiState::memory(work.to_string_lossy())
         .expect("subject API state")
+        .with_env(oc_paths::Env::from_pairs(matrix_env(root)))
         .with_events(events.clone());
     let subject = oc_server::ServerBuilder::new(
         oc_server::ServerConfig::default()
             .with_port(0)
-            .with_default_directory(root.to_string_lossy()),
+            .with_default_directory(work.to_string_lossy()),
     )
     .with_routes(oc_server::api::router(state).merge(oc_server::events_router(events)))
     .bind()
@@ -1017,6 +1052,68 @@ impl Drop for OracleServer {
     }
 }
 
+/// The pinned models.dev document both matrix servers resolve their catalogue from.
+///
+/// Without it the two processes read different caches — the oracle would fetch from
+/// models.dev and the subject would find an empty cache — and `/api/provider`,
+/// `/api/model` and `/api/integration` would differ for reasons that have nothing
+/// to do with this port.
+const MATRIX_CATALOGUE_FIXTURE: &str = "crates/oc-llm/tests/fixtures/models-dev-pinned.json";
+
+/// The one credential the matrix world declares, so exactly one provider resolves
+/// as available on both sides.
+const MATRIX_CREDENTIAL_ENV: (&str, &str) = ("DEEPSEEK_API_KEY", "matrix-fixture-key");
+
+/// Seeds the directory both matrix servers serve and returns it.
+///
+/// The served worktree is a `work/` **subdirectory** rather than the state root:
+/// the oracle creates `home/`, `data/` and `cache/` inside its root, the subject
+/// does not, and `/api/fs/list` would then disagree about the contents of a
+/// directory whose difference is the harness's own doing.
+fn matrix_worktree(root: &Path) -> PathBuf {
+    let work = root.join("work");
+    std::fs::create_dir_all(work.join("nested")).expect("create the matrix worktree");
+    std::fs::write(work.join("Cargo.toml"), b"[package]\nname = \"matrix\"\n")
+        .expect("seed the matrix file the fs/read path names");
+    std::fs::write(work.join("alpha.txt"), b"alpha\n").expect("seed a matrix file");
+    std::fs::write(work.join("nested").join("deep.txt"), b"deep\n")
+        .expect("seed a nested matrix file");
+    work
+}
+
+/// The `(key, value)` environment both matrix servers run under.
+fn matrix_env(root: &Path) -> Vec<(String, String)> {
+    let catalogue = oc_testkit::subject::workspace_root()
+        .expect("workspace root")
+        .join(MATRIX_CATALOGUE_FIXTURE);
+    vec![
+        ("HOME".to_owned(), path_string(&root.join("home"))),
+        ("XDG_DATA_HOME".to_owned(), path_string(&root.join("data"))),
+        (
+            "XDG_CONFIG_HOME".to_owned(),
+            path_string(&root.join("config")),
+        ),
+        (
+            "XDG_CACHE_HOME".to_owned(),
+            path_string(&root.join("cache")),
+        ),
+        (
+            "XDG_STATE_HOME".to_owned(),
+            path_string(&root.join("state")),
+        ),
+        ("OPENCODE_MODELS_PATH".to_owned(), path_string(&catalogue)),
+        ("OPENCODE_DISABLE_MODELS_FETCH".to_owned(), "1".to_owned()),
+        (
+            MATRIX_CREDENTIAL_ENV.0.to_owned(),
+            MATRIX_CREDENTIAL_ENV.1.to_owned(),
+        ),
+    ]
+}
+
+fn path_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
 fn unused_loopback_port() -> u16 {
     StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .expect("reserve an oracle port")
@@ -1029,6 +1126,7 @@ fn start_oracle_server(binary: &Path, root: &Path) -> OracleServer {
     let port = unused_loopback_port();
     let home = root.join("home");
     std::fs::create_dir_all(&home).expect("create isolated oracle home");
+    let work = matrix_worktree(root);
     let mut child = Command::new(binary)
         .args([
             "serve",
@@ -1037,12 +1135,8 @@ fn start_oracle_server(binary: &Path, root: &Path) -> OracleServer {
             "--port",
             &port.to_string(),
         ])
-        .current_dir(root)
-        .env("HOME", &home)
-        .env("XDG_DATA_HOME", root.join("data"))
-        .env("XDG_CONFIG_HOME", root.join("config"))
-        .env("XDG_CACHE_HOME", root.join("cache"))
-        .env("XDG_STATE_HOME", root.join("state"))
+        .current_dir(&work)
+        .envs(matrix_env(root))
         .env_remove("OPENCODE_DB")
         .env_remove("OPENCODE_SERVER_PASSWORD")
         .stdout(Stdio::piped())
@@ -1232,7 +1326,82 @@ async fn observable_api_state(addr: SocketAddr) -> serde_json::Value {
     })
 }
 
-async fn observe_api_operation(addr: SocketAddr, row: &ApiBehaviourRow) -> ApiObservation {
+/// Replaces one process's own state root with a token so the two can be compared.
+///
+/// Both servers report absolute paths that name their own tempdir — the agent
+/// ruleset names the tool-output and plans directories, and `location.directory`
+/// names the served worktree. Those differ *by construction*, so the root and its
+/// final component are tokenized. Nothing else is normalized: this is a substitution
+/// of the harness's own two variables, not a smoother that would make unequal
+/// bodies compare equal.
+fn normalize_state_paths(value: serde_json::Value, root: &Path) -> serde_json::Value {
+    let root = root.to_string_lossy().into_owned();
+    let leaf = Path::new(&root)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    fn walk(value: serde_json::Value, root: &str, leaf: &str) -> serde_json::Value {
+        match value {
+            serde_json::Value::String(text) => {
+                let text = text.replace(root, "<MATRIX_ROOT>");
+                // The plan-edit rule is `path.relative(worktree, …)`, which drops the
+                // absolute prefix and leaves only `../<leaf>/…`.
+                let text = if leaf.is_empty() {
+                    text
+                } else {
+                    text.replace(&format!("../{leaf}/"), "../<MATRIX_ROOT>/")
+                };
+                serde_json::Value::String(text)
+            }
+            serde_json::Value::Array(items) => serde_json::Value::Array(
+                items
+                    .into_iter()
+                    .map(|item| walk(item, root, leaf))
+                    .collect(),
+            ),
+            serde_json::Value::Object(fields) => serde_json::Value::Object(
+                fields
+                    .into_iter()
+                    .map(|(key, item)| (key, walk(item, root, leaf)))
+                    .collect(),
+            ),
+            other => other,
+        }
+    }
+    walk(value, &root, &leaf)
+}
+
+/// Waits until the oracle's catalogue services have finished initializing.
+///
+/// **The released binary answers `[]` for `/api/agent`, `/api/command` and
+/// `/api/provider` for the first moments after it starts listening**, then converges
+/// on the real roster. Measured on 1.18.12: the first request after startup returned
+/// zero agents and zero commands, and a later one returned seven and two. A
+/// differential that queries it cold therefore reports differences that are the
+/// oracle disagreeing with itself, so it is warmed before anything is compared.
+async fn warm_oracle(addr: SocketAddr) {
+    for _ in 0..40 {
+        let agents = raw_http(addr, "GET", "/api/agent", None, false).await;
+        let commands = raw_http(addr, "GET", "/api/command", None, false).await;
+        let seeded = |body: &str| {
+            serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|value| value["data"].as_array().map(|items| !items.is_empty()))
+                .unwrap_or(false)
+        };
+        if seeded(&agents.1) && seeded(&commands.1) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    panic!("the released server never populated its agent and command catalogues");
+}
+
+async fn observe_api_operation(
+    addr: SocketAddr,
+    row: &ApiBehaviourRow,
+    root: &Path,
+) -> ApiObservation {
     let path = concrete_api_path(&row.path);
     let sse = matches!(
         row.path.as_str(),
@@ -1255,7 +1424,7 @@ async fn observe_api_operation(addr: SocketAddr, row: &ApiBehaviourRow) -> ApiOb
     let after = observable_api_state(addr).await;
     ApiObservation {
         status: response.0,
-        normalized_body: normalize_http_body(&response.1, sse),
+        normalized_body: normalize_state_paths(normalize_http_body(&response.1, sse), root),
         side_effect: serde_json::json!({"changed": before != after}),
     }
 }
@@ -1268,13 +1437,18 @@ fn assert_subject_operation_is_accounted(row: &ApiBehaviourRow, subject: &ApiObs
         row.method.to_ascii_uppercase(),
         row.path
     );
-    assert!(
-        !subject.normalized_body.is_string(),
-        "{} {} returned a non-JSON, non-empty body: {}",
-        row.method.to_ascii_uppercase(),
-        row.path,
-        subject.normalized_body
-    );
+    // `fs/read` answers raw file bytes by design (`protocol/src/groups/fs.ts:22-24`
+    // declares its success as `Uint8Array`), so it is the one operation whose body is
+    // legitimately not JSON. Every other route must still answer JSON or nothing.
+    if row.path != "/api/fs/read/*" {
+        assert!(
+            !subject.normalized_body.is_string(),
+            "{} {} returned a non-JSON, non-empty body: {}",
+            row.method.to_ascii_uppercase(),
+            row.path,
+            subject.normalized_body
+        );
+    }
     if subject.status == 503 {
         assert_eq!(
             subject.normalized_body["error"]["code"],
@@ -1361,12 +1535,12 @@ fn api_behaviour_matrix_accounts_for_status_body_and_side_effect_per_operation()
         }
     }
     assert_eq!(
-        compared, 15,
-        "five live operations compare all three dimensions"
+        compared, 51,
+        "seventeen live operations compare all three dimensions: five from todo 122 plus todo 127's twelve"
     );
     assert_eq!(
-        exempted, 159,
-        "every other dimension must carry a visible reason"
+        exempted, 123,
+        "every other dimension must carry a visible reason; todo 127 removed thirty-six exemptions"
     );
 }
 
@@ -1383,7 +1557,7 @@ async fn api_behaviour_matrix_invokes_every_subject_operation_and_rejects_501() 
     let mut invoked = BTreeSet::new();
     let mut unavailable = 0;
     for row in &matrix {
-        let observation = observe_api_operation(subject.addr, row).await;
+        let observation = observe_api_operation(subject.addr, row, subject_root.path()).await;
         assert_subject_operation_is_accounted(row, &observation);
         unavailable += usize::from(observation.status == 503);
         assert!(
@@ -1392,10 +1566,13 @@ async fn api_behaviour_matrix_invokes_every_subject_operation_and_rejects_501() 
         );
     }
     assert_eq!(invoked.len(), 58, "every upstream operation must run");
-    assert_eq!(unavailable, 45, "the explicit API gap inventory drifted");
+    assert_eq!(
+        unavailable, 33,
+        "the explicit API gap inventory drifted; todo 127 backed twelve of the forty-five"
+    );
     assert_eq!(
         invoked.len() - unavailable,
-        13,
+        25,
         "backed operation count drifted"
     );
 }
@@ -1410,6 +1587,7 @@ async fn api_behaviour_matrix_compares_live_status_body_and_side_effects() {
     };
     let oracle_root = tempfile::tempdir().expect("oracle matrix root");
     let oracle = start_oracle_server(&binary, oracle_root.path());
+    warm_oracle(oracle.addr).await;
 
     let subject_root = tempfile::tempdir().expect("subject matrix root");
     let subject = start_subject_server(subject_root.path()).await;
@@ -1475,9 +1653,24 @@ async fn api_behaviour_matrix_compares_live_status_body_and_side_effects() {
         if observed.contains(&key) || row.path == "/api/session/{sessionID}/event" {
             continue;
         }
-        let oracle_observation = observe_api_operation(oracle.addr, row).await;
-        let subject_observation = observe_api_operation(subject_addr, row).await;
+        let oracle_observation = observe_api_operation(oracle.addr, row, oracle_root.path()).await;
+        let subject_observation =
+            observe_api_operation(subject_addr, row, subject_root.path()).await;
         assert_subject_operation_is_accounted(row, &subject_observation);
+        if matches!(row.status, ApiDimension::Compared(_)) {
+            // A row the matrix declares Compared must actually agree with the
+            // released binary on status, normalized body and side effect. Reaching
+            // this arm without comparing would be the accounting defect the Final
+            // Wave reviewers rejected: a claim of parity backed by an invocation.
+            compare_api_observation(
+                &format!("{} {}", row.method.to_ascii_uppercase(), row.path),
+                &oracle_observation,
+                &subject_observation,
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+            observed.insert(key);
+            continue;
+        }
         assert!(
             matches!(row.status, ApiDimension::Exempt(_))
                 && matches!(row.body, ApiDimension::Exempt(_))
@@ -2099,8 +2292,8 @@ fn known_gaps() -> Vec<KnownGap> {
     vec![
         KnownGap {
             id: "api-backends-unavailable".to_owned(),
-            surface: "45 of the 58 upstream /api operations".to_owned(),
-            detail: "Every upstream operation is invoked against both processes and its status, normalized body, and observable session/PTY state delta are captured. Thirteen operations have local backends; the other 45 return an operation-specific 503 backend_unavailable response and are never counted as parity. The matrix rejects any 501 before applying a differential exemption. This remains a compatibility gap, not a declared behavioral difference."
+            surface: "33 of the 58 upstream /api operations".to_owned(),
+            detail: "Every upstream operation is invoked against both processes and its status, normalized body, and observable session/PTY state delta are captured. Twenty-five operations have local backends and seventeen of those are compared exactly against the released binary; the other 33 return an operation-specific 503 backend_unavailable response and are never counted as parity. The matrix rejects any 501 before applying a differential exemption. This remains a compatibility gap, not a declared behavioral difference."
                 .to_owned(),
         },
         KnownGap {

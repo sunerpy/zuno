@@ -6068,3 +6068,60 @@ For streaming APIs, route registration and content type are also insufficient.
 The smallest non-vacuous test must observe one semantic frame and one event caused
 through the public mutation path. Sharing the EventService at the composition root
 is what makes that second assertion test the product rather than a private fixture.
+
+## [2026-08-09] Todo 127 — five things the source said and the binary contradicted
+
+Implemented the twelve read-only catalogue and filesystem API operations. Every one of
+the five corrections below came from **running the 1.18.12 binary and diffing**, not
+from reading `packages/`. Reading the source got each of them wrong first.
+
+1. **`Schema.UndefinedOr` does not omit the key.** `GET /api/integration/{unknown}`
+   answers `{"location":…,"data":null}`. I implemented "skip the key when absent"
+   because that is what the schema reads like; the Effect encoder emits the declared
+   property regardless.
+2. **`localeCompare` is not byte order, and it is observable twice.** `fs/list` lists
+   `alpha.txt` before `Cargo.toml`; integration names put `openai` before `OpenCode`.
+   Byte order inverts both. Any port of a JS sort needs a case-insensitive-first
+   comparator or a differential that catches it.
+3. **v1 and V2 serve different bytes for the same asset — three times now.** The
+   built-in skill's description (V2 lists `commands`), four agent system prompts (V2's
+   `title` writes `->`/`<=50` where v1 writes `→`/`≤50`), and both built-in command
+   templates. `oc-catalog` is byte-correct **for v1** — verified by diffing against
+   `packages/opencode/src/**` — and `packages/core/src/plugin/**` carries its own
+   revision. A port that mirrors v1 must keep V2 assets separately rather than
+   "fixing" the v1 files.
+4. **V2's command roster has three levels, not four.** v1 promotes every skill to a
+   command; V2 has no such transform. Serving the v1 registry over `/api/command`
+   offered `customize-opencode`, a command the oracle does not have.
+5. **The released binary disagrees with itself for the first seconds after
+   startup.** `/api/agent`, `/api/command` and `/api/provider` answer `[]` right after
+   it prints "listening", then converge on seven agents and two commands. A cold
+   differential reports differences that are entirely the oracle's own initialization
+   race. Warm it and *assert* the warm-up, or the flake reads as a port defect.
+
+**The transferable rule:** for any operation whose body is a projection, the source
+tells you the field names and the binary tells you the values. Both are needed, and
+where they disagree the binary wins.
+
+### The matrix was comparing nothing, and that is a distinct failure from a stub
+
+Before this todo, `api_behaviour_matrix_compares_live_status_body_and_side_effects`
+looped over every row and asserted only that non-exact rows *carried an exemption
+reason*. A row marked `Compared` was never actually compared in that loop. So the
+suite could report "58 of 58 invoked" while comparing five. Fixed by calling
+`compare_api_observation` inside the loop for `Compared` rows — and then verified by
+mutation: four deliberate body/status changes now fail it, where before they would
+have passed. **An exemption ledger that nothing checks is worse than no ledger: it
+reads as coverage.**
+
+### Two harness details that would have made the differential lie
+
+- Both matrix servers now serve a `work/` subdirectory instead of the state root. The
+  oracle creates `home/`, `data/`, `cache/` inside its root; the subject does not, so
+  `/api/fs/list` disagreed about a directory whose difference the harness itself
+  created. The fix is to move the state out of the served tree, not to normalize the
+  entries away.
+- The subject read the developer's real `HOME` and `auth.json` through
+  `Env::from_process()`, so `/api/provider` depended on which credentials the machine
+  happened to hold. `ApiState::with_env` now pins it. *A catalogue endpoint that reads
+  ambient credentials is a test that passes or fails by machine.*

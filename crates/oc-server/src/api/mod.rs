@@ -1,6 +1,9 @@
+mod catalog;
 mod error;
+mod fs;
 mod maintenance;
 mod openapi;
+mod provider;
 mod pty;
 mod session;
 mod state;
@@ -48,6 +51,21 @@ pub fn router(state: ApiState) -> Router {
             get(maintenance::preview).post(maintenance::mutate),
         )
         .route("/api/session/{sessionID}", get(session::get))
+        .route("/api/agent", get(catalog::agents))
+        .route("/api/command", get(catalog::commands))
+        .route("/api/skill", get(catalog::skills))
+        .route("/api/reference", get(catalog::references))
+        .route("/api/model", get(provider::models))
+        .route("/api/provider", get(provider::providers))
+        .route("/api/provider/{providerID}", get(provider::provider))
+        .route("/api/integration", get(provider::integrations))
+        .route(
+            "/api/integration/{integrationID}",
+            get(provider::integration),
+        )
+        .route("/api/fs/read/{*path}", get(fs::read))
+        .route("/api/fs/list", get(fs::list))
+        .route("/api/fs/find", get(fs::find))
         .route("/api/pty", get(pty::list).post(pty::create))
         .route(
             "/api/pty/{ptyID}",
@@ -85,15 +103,6 @@ async fn unsupported(method: Method, path: MatchedPath) -> error::ApiError {
 
 fn unsupported_routes() -> Router<ApiState> {
     Router::new()
-        .route("/api/agent", get(unsupported))
-        .route("/api/model", get(unsupported))
-        .route("/api/command", get(unsupported))
-        .route("/api/skill", get(unsupported))
-        .route("/api/reference", get(unsupported))
-        .route("/api/provider", get(unsupported))
-        .route("/api/provider/{providerID}", get(unsupported))
-        .route("/api/integration", get(unsupported))
-        .route("/api/integration/{integrationID}", get(unsupported))
         .route(
             "/api/integration/{integrationID}/connect/key",
             post(unsupported),
@@ -114,9 +123,6 @@ fn unsupported_routes() -> Router<ApiState> {
             "/api/credential/{credentialID}",
             patch(unsupported).delete(unsupported),
         )
-        .route("/api/fs/read/{*path}", get(unsupported))
-        .route("/api/fs/list", get(unsupported))
-        .route("/api/fs/find", get(unsupported))
         .route("/api/pty/{ptyID}/connect-token", post(unsupported))
         .route("/api/pty/{ptyID}/connect", get(unsupported))
         .route("/api/permission/request", get(unsupported))

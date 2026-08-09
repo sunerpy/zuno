@@ -6367,3 +6367,31 @@ is rejected before either equality or exemption can be considered.
 messageID are removed. Event type, durable aggregate/sequence/version, stable data,
 HTTP status and observable side effect remain in the comparison. Widening this
 normalizer requires a new visible per-operation reason.
+
+## [2026-08-09] Todo 127 — three decisions on the read-only API surface
+
+**1. `/api/fs/*` answers `403 path_escaped_root`, where upstream answers an opaque
+`500`.** Upstream `Effect.die`s on a containment failure and the HTTP layer renders a
+random-ref `UnknownError` — measured, not inferred. This port names the violation.
+The refusal itself is identical; only the diagnosis differs, so this is the stricter
+of the two behaviours and it is the direction the task mandates. Recorded in
+`api/fs.rs`'s module docs and in the evidence as the one intentional divergence in the
+group.
+
+**2. `/api/integration` reports environment-derived connections only, not stored
+credentials.** Upstream also reports a connection for each credential in `auth.json`.
+An unauthenticated loopback endpoint that enumerates which providers the user holds
+credentials for is a disclosure I am not willing to add without it being asked for.
+The availability decision that actually matters still consults the auth store through
+`Catalog::resolve`, so nothing the user can select changes. Declared as a gap rather
+than hidden behind a normalizer.
+
+**3. The V2 assets live in `crates/oc-server/src/api/v2/` rather than replacing
+`oc-catalog`'s.** `oc-catalog`'s prompt and command-template files are byte-identical
+to upstream's **v1** files and other differentials pin them. V2 serves a different
+revision of the same six assets. Editing the v1 files to satisfy the HTTP differential
+would have broken the CLI differentials and made both surfaces wrong; duplicating six
+small text files keeps each surface byte-correct against its own upstream. The four
+prompts were captured from a live `GET /api/agent` on 1.18.12 — the authority for what
+that endpoint answers — and the two templates are byte copies of
+`packages/core/src/plugin/command/*.txt`.
