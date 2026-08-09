@@ -6209,3 +6209,38 @@ Two in one file says the file's *idiom* was wrong, not that one test was sloppy:
 `dispatch_request` made parse-level assertions the path of least resistance.
 Fixing the idiom (a `Probe` that carries its own observable, and a helper that
 drives the real binary) is what stops a third.
+## [2026-08-09] Todo 125: help text is a surface, and no consistency test was reading it
+
+`completion` sat in `PENDING_COMMANDS` with an honest recorded reason while `--help`
+advertised "Generate shell completion output" in both the root listing and the
+command's own help. Five disposition tests in `tests/surface.rs` passed throughout,
+because every one of them compares the disposition table, the pending roster, and the
+dispatch arm against each other — and all three were correct and mutually consistent.
+The one inconsistency that reached a user was between the roster and the *help*, and
+nothing read help.
+
+This is the `export`/SEAM #11 shape again with a new surface: several mechanisms
+agreeing with one another while none of them touches what the user touches. The
+generalisable rule is that **an entry in a "does not work" roster is also a claim
+about every surface that describes the command**, and each such surface needs its own
+assertion. Recording the reason in one place is necessary and not sufficient.
+
+Two design points worth reusing:
+
+- Assert on the *structured* description (`clap::Command::get_about` /
+  `get_long_about`) and then assert the rendered `--help` contains it, whitespace
+  normalized. Parsing help columns is fragile against wrapping; reading the struct
+  alone proves a field rather than a user-visible line. Doing both gets exactness and
+  rendered truth without a parser.
+- Encode the *shape* of the lie, not its wording. The rule "a pending command's
+  description must not open with a capability verb" catches "Generate shell completion
+  output" and also catches the next "Print the …" or "Export the …" on a stub. A rule
+  matching the literal string would have caught nothing new.
+
+Second, independent reason no test could have caught it: `completion` has no row in
+`disposition.rs` at all, because upstream registers it through yargs' built-in
+`.completion()` rather than as a `*Command` class, so it is absent from the frozen
+23-symbol upstream fixture and `disposition_for("completion")` returns `None`. Every
+disposition assertion about it was vacuously satisfied. **A command whose disposition
+lookup returns `None` is unguarded by the entire disposition suite** — worth checking
+for the other surfaces that key off that table.

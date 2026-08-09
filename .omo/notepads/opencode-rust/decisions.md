@@ -6432,3 +6432,33 @@ small text files keeps each surface byte-correct against its own upstream. The f
 prompts were captured from a live `GET /api/agent` on 1.18.12 — the authority for what
 that endpoint answers — and the two templates are byte copies of
 `packages/core/src/plugin/command/*.txt`.
+## [2026-08-09] Todo 125: `completion` stays unimplemented, and its help says so
+
+**Decision.** Resolve SEAM #12 by making the help text and the error agree that
+`completion` cannot emit a script, rather than by generating real completions.
+
+**Why not implement it.** `clap_complete` was probed first and is *not* the obstacle:
+it resolves fully offline (`4.6.7`, `clap` its only dependency, `cargo metadata
+--locked --offline` rc=0). The obstacle is file ownership. `completion` is the negative
+control in `crates/oc-cli/tests/surface.rs:271-287` — the subject that proves the
+pending-stub detector is live — and the dispatch arm would land in
+`crates/oc-cli/src/cmd/mod.rs`. Both belong to todo 124 this wave. Implementing
+`completion` empties `PENDING_COMMANDS`, which leaves that control without a subject
+and makes the roster test iterate nothing; that rewrite is todo 124's to make.
+
+**Consequence, stated plainly.** The capability is still absent. This change removes a
+misleading promise; it does not add a completion generator. Implementing it later needs
+no dependency work and no new decision — only the two files above.
+
+**The guard is roster-driven, not command-driven.** `tests/help_honesty.rs` iterates
+`PENDING_COMMANDS` and requires, for every entry, an unavailability marker and no
+opening capability verb on both help surfaces. The promise-verb half additionally
+covers every `Disposition::Rejected` command, which cost no rewording because they all
+already open with "Explain". Adding a command to either set therefore inherits the
+guard; nothing about the check mentions `completion`.
+
+**Vocabulary is a bounded judgement surface.** Four unavailability markers
+(`unavailable`, `not available`, `cannot`, `unsupported`) and thirty capability verbs.
+Kept deliberately short: a longer marker list starts accepting text that merely sounds
+cautious. The negative control pins that both predicates reject the literal line known
+to have misled a reader, so weakening them fails a test rather than passing silently.

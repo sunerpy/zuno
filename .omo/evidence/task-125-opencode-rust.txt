@@ -1,0 +1,332 @@
+Task 125 — make `completion`'s help text and behaviour agree
+Measured: 2026-08-09 (worktree /config/workspace/ProdDir/AI/oc-wt/t125, branch task-125)
+Base commit: 939984798b1999d9c74c815000d53792e9e85b06
+
+VERDICT
+-------
+resolution chosen:                                      (b) HONEST HELP — the help text
+                                                        and the error now both say the
+                                                        command cannot emit a script
+`clap_complete` offline-resolvable:                     YES (see DEPENDENCY below) — so
+                                                        (a) was rejected on file
+                                                        ownership, NOT on the dependency
+no `--help` line promises what a stub refuses:          DONE (generic, roster-driven,
+                                                        mutation-proved three ways)
+`completion --help` exits 0 and states the reason:      DONE
+`completion bash|zsh|fish` and bare `completion`:       0 stdout bytes, exit 1, reason on
+                                                        stderr (unchanged behaviour; only
+                                                        the wording and the help agree now)
+
+GATES
+-----
+cargo test --workspace --offline (OC_MEMORY_GATE_MODE=skip)
+    baseline, same worktree, changes stashed             3260 passed, 0 failed, 2 ignored
+    with this change                                    3265 passed, 0 failed, 2 ignored
+    delta                                               +5, exactly the new test file;
+                                                        nothing lost, nothing skipped
+cargo clippy --workspace --all-targets --offline         0 warnings, 0 errors
+cargo fmt --all --check                                  clean
+cargo metadata --locked --offline --format-version 1     clean
+
+NOTE ON THE STATED BASELINE
+---------------------------
+The dispatch brief said main is at 3292 passing. Measured at this worktree's HEAD
+(939984798b1999d9c74c815000d53792e9e85b06) with `OC_MEMORY_GATE_MODE=skip`, the
+baseline is 3260. The 3292 figure does not reproduce here and was not used as the
+comparison; the baseline was re-measured in this worktree, with the change stashed,
+so the +5 delta is against a number produced by the same command on the same tree.
+
+
+WHY (b) AND NOT (a)
+-------------------
+(a) — generate real completions with `clap_complete` — was the preferred path and was
+investigated first. It is blocked by file ownership, not by capability:
+
+  `completion` is pinned as pending in two places inside `crates/oc-cli/tests/surface.rs`,
+  which todo 124 owns and is concurrently rewriting:
+
+    surface.rs:273  let request = dispatch_request(&["completion"]);
+    surface.rs:274  assert!(request.args.is_pending());
+    surface.rs:280  assert_eq!(error.command, "completion");
+
+  `surface_failure_scenario_the_pending_handler_is_detectable` uses `completion` as the
+  *negative control* that proves the pending-stub detector is live. Implementing
+  `completion` empties `PENDING_COMMANDS`, which makes that control lose its subject and
+  makes `surface_the_pending_command_roster_is_complete_and_accurate` iterate an empty
+  roster. Both would have to be rewritten in a file this task must not touch, and
+  `crates/oc-cli/src/cmd/mod.rs` — where the new dispatch arm would go — is also todo
+  124's. Coordinating through the report is the instruction; editing them is not.
+
+The narrower reading also holds: the defect QA reported is that **`--help` promised what
+the handler refused**, and that is fixable entirely inside `command.rs`, which is this
+task's. Fixing it here does not foreclose (a); it makes the promise honest until whoever
+owns the dispatcher surface can implement it.
+
+
+DEPENDENCY: `clap_complete` IS offline-resolvable
+-------------------------------------------------
+Checked before deciding, because the brief required it and because a `cfg(windows)`
+dependency once passed build/test/clippy and still broke `make ci`. Added
+`clap_complete = { version = "4.6.5" }` to the workspace and to `oc-cli`, then:
+
+    $ cargo metadata --offline --format-version 1
+    Locking 1 package to latest Rust 1.96 compatible version
+      Adding clap_complete v4.6.7
+    rc=0
+
+    $ cargo metadata --locked --offline --format-version 1
+    rc=0
+
+    Cargo.lock:435  name = "clap_complete"
+    Cargo.lock:436  version = "4.6.7"
+    Cargo.lock:437  source = "registry+https://github.com/rust-lang/crates.io-index"
+    Cargo.lock:438  checksum = "db8b397918185f0161ff3d6fcaa9e4bfc09b8367caf6e1d4a2848e5477ed027b"
+
+It resolves fully offline from the local registry cache and pulls in nothing but `clap`,
+which is already a dependency. `clap_complete-4.6.5` and `4.6.7` are both cached under
+`~/.cargo/registry/cache/`. All three files were then restored and
+`cargo metadata --locked --offline` re-verified clean, so this probe left no trace:
+
+    $ git status --short
+     M crates/oc-cli/src/command.rs
+    metadata-clean-after-revert=OK
+
+Recorded so whoever implements (a) does not have to re-derive it: the dependency is not
+the obstacle.
+
+
+BEFORE — reproduced exactly as F3 reported (binary built at HEAD)
+-----------------------------------------------------------------
+Isolated environment: env -i with HOME/XDG_{CONFIG,DATA,CACHE,STATE}_HOME/TMPDIR under
+/tmp/t125-before, PATH=/usr/bin:/bin, TERM=xterm-256color.
+
+$ opencode-rust --help | grep completion
+  completion  Generate shell completion output
+
+$ opencode-rust completion --help
+Generate shell completion output
+
+Usage: opencode-rust completion [OPTIONS] [ARGS]...
+
+[exit=0]
+
+$ opencode-rust completion bash > out.bash
+`completion` is not available: upstream's completion script is a yargs shell function that calls back into `--get-yargs-completions`, a protocol this port does not implement; generate completions from your shell against `--help` instead
+[stdout bytes=0, exit=1]
+
+$ opencode-rust completion zsh > out.zsh
+`completion` is not available: upstream's completion script is a yargs shell function that calls back into `--get-yargs-completions`, a protocol this port does not implement; generate completions from your shell against `--help` instead
+[stdout bytes=0, exit=1]
+
+$ opencode-rust completion fish > out.fish
+`completion` is not available: upstream's completion script is a yargs shell function that calls back into `--get-yargs-completions`, a protocol this port does not implement; generate completions from your shell against `--help` instead
+[stdout bytes=0, exit=1]
+
+$ opencode-rust completion
+`completion` is not available: upstream's completion script is a yargs shell function that calls back into `--get-yargs-completions`, a protocol this port does not implement; generate completions from your shell against `--help` instead
+[exit=1]
+
+Both help surfaces said "Generate shell completion output". Neither said the command
+cannot work. That is the defect: a reader following either one gets 0 bytes and exit 1.
+
+
+AFTER
+-----
+Same isolation, under /tmp/t125-after.
+
+$ opencode-rust --help          (Commands section)
+  completion  Explain why shell completion output is unavailable, and what to use instead
+  export      Export session data as JSON
+[exit=0]
+
+$ opencode-rust completion --help
+Explain why shell completion output is unavailable, and what to use instead.
+
+Registered because upstream registers it, but it cannot emit a completion script. Upstream's script is a yargs shell function that asks the binary back for candidates over `--get-yargs-completions`; this port serves no such protocol, so a script emitted here would answer every request with nothing. Every invocation therefore prints that reason on stderr and exits 1 instead of writing a file that cannot work.
+
+To read the command tree and its flags — everything a completion would have to know — run `--help` on the binary and on each subcommand.
+
+Usage: opencode-rust completion [OPTIONS] [ARGS]...
+[exit=0]
+
+$ opencode-rust completion bash > out.bash
+`completion` is not available: upstream's completion script is a yargs shell function that asks the binary back for candidates over `--get-yargs-completions`, a protocol this port does not serve, so a script generated here would answer every request with nothing; run `--help` on the binary and on each subcommand to read the command tree and its flags instead
+[stdout bytes=0, exit=1]
+
+$ opencode-rust completion zsh > out.zsh
+`completion` is not available: upstream's completion script is a yargs shell function that asks the binary back for candidates over `--get-yargs-completions`, a protocol this port does not serve, so a script generated here would answer every request with nothing; run `--help` on the binary and on each subcommand to read the command tree and its flags instead
+[stdout bytes=0, exit=1]
+
+$ opencode-rust completion fish > out.fish
+`completion` is not available: upstream's completion script is a yargs shell function that asks the binary back for candidates over `--get-yargs-completions`, a protocol this port does not serve, so a script generated here would answer every request with nothing; run `--help` on the binary and on each subcommand to read the command tree and its flags instead
+[stdout bytes=0, exit=1]
+
+$ opencode-rust completion
+`completion` is not available: upstream's completion script is a yargs shell function that asks the binary back for candidates over `--get-yargs-completions`, a protocol this port does not serve, so a script generated here would answer every request with nothing; run `--help` on the binary and on each subcommand to read the command tree and its flags instead
+[exit=1]
+
+Behaviour is deliberately unchanged: still 0 stdout bytes and exit 1. What changed is
+that both help surfaces now say so before the user redirects anything to a file, and the
+error names the same replacement the help names. `completion --help` also now prints the
+full explanation rather than a single promising line, because the description became a
+multi-paragraph doc comment and clap renders it as the long help.
+
+
+THE GENERIC ASSERTION — crates/oc-cli/tests/help_honesty.rs
+------------------------------------------------------------
+Deliberately not a `completion` special case. Every check iterates
+`oc_cli::PENDING_COMMANDS`, so the next command added to that roster inherits all of
+them without anyone remembering to.
+
+Two predicates, applied to the description clap renders:
+
+  states_unavailability(text)         — text contains one of
+                                        ["unavailable", "not available", "cannot",
+                                         "unsupported"]
+  opening_capability_promise(text)    — text's first word is one of 30 capability verbs
+                                        ("generate", "print", "export", "emit", "write",
+                                         "create", "output", ...)
+
+Five tests:
+
+  help_no_pending_command_advertises_a_capability_it_refuses
+      For every PENDING_COMMANDS entry, both the root-listing description (`get_about`)
+      and the own-help description (`get_long_about` falling back to `get_about`) must
+      state unavailability and must NOT open with a capability verb. Both surfaces are
+      checked because the defect appeared on both independently.
+
+  help_no_rejected_command_opens_with_a_capability_promise
+      The promise-verb half also applies to every `Disposition::Rejected` command. They
+      all already open with "Explain", so this cost no rewording and closes the cheaper
+      half of the same hole — a rejected command is registered and its listing reads
+      exactly like a working one's.
+
+  help_the_checked_claims_are_the_rendered_ones
+      Runs the real binary. Asserts `--help` exits 0 and its whitespace-normalized
+      output contains the checked root description, and that `<cmd> --help` exits 0 and
+      contains the checked long description. Without this the predicates would prove a
+      struct field, not a user-visible line: a hidden or overridden description could
+      satisfy them while the terminal showed something else.
+
+  help_every_pending_command_behaves_as_its_help_describes
+      Runs the real binary twice per pending command — bare, and with one argument,
+      because the reported defect was found by passing one. Asserts: exit != 0, stdout
+      empty, stderr contains the recorded `PENDING_COMMANDS` reason verbatim, and stderr
+      itself states unavailability. This is the "help and behaviour agree" direction.
+
+  help_failure_scenario_the_shipped_promise_is_rejected
+      The negative control, in the repo's established convention. Feeds the literal
+      shipped string "Generate shell completion output" through both predicates and
+      asserts the marker check rejects it and the promise check identifies "generate";
+      then feeds the current description and asserts the opposite. Without it, both
+      checks above would keep passing if the predicates were weakened to accept
+      anything, since the roster's only entry happens to be worded correctly today.
+
+Why the description is read structurally (`get_about` / `get_long_about`) rather than by
+parsing the rendered `--help` columns: column parsing is fragile against clap's wrapping
+and would have to guess where one command's entry ends. Reading the structured value and
+then asserting the rendered output *contains* it, whitespace-normalized, gets both
+exactness and rendered-truth without a parser.
+
+
+MUTATION PROOF — the guard is live, three ways
+-----------------------------------------------
+1. Restore the exact shipped promise as the description (the historical defect):
+
+     -    /// Explain why shell completion output is unavailable, and what to use instead.
+     -    ///  ... (the full explanation)
+     +    /// Generate shell completion output.
+
+   Result: 3 passed, 2 FAILED.
+
+     ---- help_no_pending_command_advertises_a_capability_it_refuses ----
+     `completion` is pending, but the root command listing never says so: "Generate shell completion output"
+     `completion` is pending, but the root command listing opens with the capability verb "generate": "Generate shell completion output"
+     `completion` is pending, but its own `--help` never says so: "Generate shell completion output"
+     `completion` is pending, but its own `--help` opens with the capability verb "generate": "Generate shell completion output"
+
+     ---- help_failure_scenario_the_shipped_promise_is_rejected ----
+     panicked at help_honesty.rs:240: Generate shell completion output
+
+   All four surface/predicate combinations fire, and the negative control notices that
+   the current text became the shipped text.
+
+2. Break a command that is NOT `completion`, to prove the rule is roster-driven rather
+   than name-driven — reword the rejected `stats` description:
+
+     -    /// Explain the supported statistics replacement.
+     +    /// Print session statistics.
+
+   Result: 4 passed, 1 FAILED.
+
+     ---- help_no_rejected_command_opens_with_a_capability_promise ----
+     `stats` is rejected, but its listing opens with the capability verb "print": "Print session statistics"
+
+3. Make the pending handler succeed silently, to prove the help-versus-behaviour check
+   is live rather than trivially true — `PendingCommandDispatcher::dispatch` returns
+   `Ok(())` after printing to stdout:
+
+   Result: 4 passed, 1 FAILED.
+
+     ---- help_every_pending_command_behaves_as_its_help_describes ----
+     ["completion"] must not report success while its help says it cannot work
+
+All three mutations were reverted; `git diff --stat` after restoration showed only the
+intended `command.rs` change.
+
+
+WHY THE EXISTING TESTS COULD NOT SEE THIS
+------------------------------------------
+`crates/oc-cli/tests/surface.rs` has five disposition tests and every one of them passed
+throughout the defect. They compare the disposition table, `PENDING_COMMANDS`, and the
+dispatch arm against each other. All three were correct and mutually consistent:
+`completion` really is pending, really is recorded as pending, and really does reach
+`PendingCommandDispatcher`. None of them reads the help a user reads first, so the one
+inconsistency that mattered — the description promising output — was invisible to all
+five. This is the same shape as the `export` defect (todo 116) and as SEAM #11: several
+mechanisms agreeing with each other while none of them touches the surface the user
+touches.
+
+Note also that `completion` has no row in `crates/oc-cli/src/disposition.rs` at all,
+because upstream registers it through yargs' built-in `.completion()` rather than as a
+`*Command` class, so it is absent from `tests/fixtures/upstream-commands-1.18.13.txt`
+(23 symbols, none of them `CompletionCommand`). `disposition_for("completion")` returns
+`None`. Every disposition assertion about it is therefore vacuously satisfied — a second,
+independent reason no existing test could have caught this.
+
+
+FILES CHANGED
+-------------
+crates/oc-cli/src/command.rs        the `Command::Completion` description (which IS the
+                                    rendered help text under clap's derive API), the
+                                    `PENDING_COMMANDS` reason, and the doc comment on
+                                    `PENDING_COMMANDS` recording that an entry there is
+                                    also a claim about the command's help
+crates/oc-cli/tests/help_honesty.rs new — the five generic tests above
+
+Not touched, per the dispatch constraints: crates/oc-cli/tests/surface.rs and
+crates/oc-cli/src/cmd/mod.rs (todo 124), crates/oc-cli/tests/docs.rs (todo 126),
+crates/oc-server/** (todo 129), and the frozen perf surface
+(crates/oc-testkit/src/perf/**, docs/perf-methodology.md, benchmarks/ts-baseline.json,
+crates/oc-testkit/tests/{memory,soak,backpressure}.rs). No existing test was weakened,
+skipped, `#[ignore]`d, or deleted. Cargo.toml and Cargo.lock are byte-identical to HEAD.
+
+
+HONEST GAPS
+-----------
+- `completion` still emits no completion script. This change makes the promise honest;
+  it does not deliver the capability. (a) remains the better end state and is unblocked
+  on the dependency question — it needs `tests/surface.rs` and `src/cmd/mod.rs`, which
+  todo 124 owns this wave.
+- The ~100-minute memory gate and the 2-hour soak were not run; `oc-testkit` suites ran
+  with `OC_MEMORY_GATE_MODE=skip` as instructed.
+- The marker vocabulary is four phrases and the verb list is thirty words. Both are
+  judgement surfaces: a pending command whose help says only "this is a no-op" would
+  pass the marker check while arguably still misleading. The lists are deliberately
+  short — a longer marker list starts accepting text that merely sounds cautious — and
+  the negative control pins that they reject the one line known to have misled a reader.
+- `help_every_pending_command_behaves_as_its_help_describes` invokes each pending command
+  bare. A future pending command with a *required* positional would exit 2 from clap and
+  fail this test rather than reporting the recorded reason. That failure is the correct
+  outcome: it forces the decision about what such a command should print, instead of
+  silently exempting it.
