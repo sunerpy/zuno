@@ -18,6 +18,11 @@ pub(super) struct Snapshot {
     pub(super) boundary: i64,
 }
 
+pub(super) struct Page {
+    pub(super) events: Vec<StreamEvent>,
+    pub(super) has_more: bool,
+}
+
 struct StoredRow {
     id: String,
     sequence: i64,
@@ -93,6 +98,43 @@ impl Store {
         after: Option<i64>,
     ) -> Result<Vec<StreamEvent>, EventStreamError> {
         Ok(self.snapshot(session_id, after)?.events)
+    }
+
+    pub(super) fn page(
+        &self,
+        session_id: &str,
+        after: Option<i64>,
+        limit: usize,
+    ) -> Result<Page, EventStreamError> {
+        self.ensure_initialized()?;
+        let after = after.unwrap_or(-1);
+        let row_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        let connection = self.pool.get()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, seq, type, data FROM event \
+                 WHERE aggregate_id = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3",
+            )
+            .map_err(open::map_error)?;
+        let rows = statement
+            .query_map(rusqlite::params![session_id, after, row_limit], |row| {
+                Ok(StoredRow {
+                    id: row.get(0)?,
+                    sequence: row.get(1)?,
+                    event_type: row.get(2)?,
+                    data: row.get(3)?,
+                })
+            })
+            .map_err(open::map_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(open::map_error)?;
+        let has_more = rows.len() > limit;
+        let events = rows
+            .into_iter()
+            .take(limit)
+            .map(|row| decode_row(session_id, row))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Page { events, has_more })
     }
 
     pub(super) fn snapshot(

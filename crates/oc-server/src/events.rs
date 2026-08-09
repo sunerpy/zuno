@@ -12,10 +12,16 @@ use std::time::Duration;
 use oc_db::Pool;
 
 use crate::{EventFanout, EventSubscription};
-use store::{Snapshot, Store};
+use store::{Page, Snapshot, Store};
 
 pub use route::events_router;
 pub use types::{EventCursor, EventStreamError, NewEvent, StreamEvent};
+
+#[derive(Debug)]
+pub struct EventPage {
+    pub events: Vec<StreamEvent>,
+    pub has_more: bool,
+}
 
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -78,6 +84,21 @@ impl EventService {
         tokio::task::spawn_blocking(move || store.replay(&session_id, after))
             .await
             .map_err(|source| EventStreamError::Worker { source })?
+    }
+
+    pub async fn history_page(
+        &self,
+        session_id: &str,
+        after: Option<i64>,
+        limit: usize,
+    ) -> Result<EventPage, EventStreamError> {
+        let session_id = types::validate_session_id(session_id)?.to_owned();
+        let store = Arc::clone(&self.store);
+        let Page { events, has_more } =
+            tokio::task::spawn_blocking(move || store.page(&session_id, after, limit))
+                .await
+                .map_err(|source| EventStreamError::Worker { source })??;
+        Ok(EventPage { events, has_more })
     }
 
     async fn subscribe(

@@ -2,6 +2,7 @@ mod error;
 mod maintenance;
 mod openapi;
 mod pty;
+mod request;
 mod session;
 mod state;
 
@@ -48,11 +49,27 @@ pub fn router(state: ApiState) -> Router {
             get(maintenance::preview).post(maintenance::mutate),
         )
         .route("/api/session/{sessionID}", get(session::get))
+        .route("/api/session/{sessionID}/context", get(session::context))
+        .route("/api/session/{sessionID}/history", get(session::history))
+        .route("/api/session/{sessionID}/message", get(session::messages))
+        .route(
+            "/api/session/{sessionID}/question",
+            get(request::session_questions),
+        )
+        .route("/api/permission/request", get(request::permission_requests))
+        .route("/api/permission/saved", get(request::saved_permissions))
+        .route(
+            "/api/permission/saved/{id}",
+            delete(request::remove_saved_permission),
+        )
+        .route("/api/question/request", get(request::question_requests))
         .route("/api/pty", get(pty::list).post(pty::create))
         .route(
             "/api/pty/{ptyID}",
             get(pty::get).put(pty::update).delete(pty::remove),
         )
+        .route("/api/pty/{ptyID}/connect-token", post(pty::connect_token))
+        .route("/api/pty/{ptyID}/connect", get(pty::connect))
         .merge(unsupported_routes())
         .with_state(state)
 }
@@ -117,11 +134,6 @@ fn unsupported_routes() -> Router<ApiState> {
         .route("/api/fs/read/{*path}", get(unsupported))
         .route("/api/fs/list", get(unsupported))
         .route("/api/fs/find", get(unsupported))
-        .route("/api/pty/{ptyID}/connect-token", post(unsupported))
-        .route("/api/pty/{ptyID}/connect", get(unsupported))
-        .route("/api/permission/request", get(unsupported))
-        .route("/api/permission/saved", get(unsupported))
-        .route("/api/permission/saved/{id}", delete(unsupported))
         .route(
             "/api/session/{sessionID}/permission",
             get(unsupported).post(unsupported),
@@ -134,8 +146,6 @@ fn unsupported_routes() -> Router<ApiState> {
             "/api/session/{sessionID}/permission/{requestID}/reply",
             post(unsupported),
         )
-        .route("/api/question/request", get(unsupported))
-        .route("/api/session/{sessionID}/question", get(unsupported))
         .route(
             "/api/session/{sessionID}/question/{requestID}/reply",
             post(unsupported),
@@ -152,12 +162,9 @@ fn unsupported_routes() -> Router<ApiState> {
         .route("/api/session/{sessionID}/revert/stage", post(unsupported))
         .route("/api/session/{sessionID}/revert/clear", post(unsupported))
         .route("/api/session/{sessionID}/revert/commit", post(unsupported))
-        .route("/api/session/{sessionID}/context", get(unsupported))
-        .route("/api/session/{sessionID}/history", get(unsupported))
         .route("/api/session/{sessionID}/interrupt", post(unsupported))
         .route(
             "/api/session/{sessionID}/message/{messageID}",
             get(unsupported),
         )
-        .route("/api/session/{sessionID}/message", get(unsupported))
 }

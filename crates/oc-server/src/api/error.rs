@@ -13,6 +13,8 @@ use crate::EventStreamError;
 pub enum ApiError {
     #[error("{0}")]
     InvalidRequest(&'static str),
+    #[error("forbidden")]
+    Forbidden,
     #[error("backend unavailable for {0}")]
     BackendUnavailable(String),
     #[error(transparent)]
@@ -43,6 +45,11 @@ impl IntoResponse for ApiError {
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
                 message.to_owned(),
+            ),
+            Self::Forbidden => (
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "request is not authorized".to_owned(),
             ),
             Self::BackendUnavailable(operation) => (
                 StatusCode::SERVICE_UNAVAILABLE,

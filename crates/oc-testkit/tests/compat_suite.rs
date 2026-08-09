@@ -127,7 +127,7 @@ const SURFACES: &[SurfaceRow] = &[
         verdict: Verdict::PartiallyCompared,
         oracle: OracleKind::LiveBinary,
         evidence: "crates/oc-testkit/tests/compat_suite.rs::api_behaviour_matrix_compares_live_status_body_and_side_effects",
-        detail: "58 of 58 upstream operations are invoked against both processes with status, normalized body, and side-effect delta captured; 5 deterministic operations are exact live differentials including both SSE streams, 45 missing local backends are explicit 503 gaps, and 8 backed operations carry visible cross-process fixture exemptions; 2 C8 operations are added",
+        detail: "58 of 58 upstream operations are invoked against both processes with status, normalized body, and side-effect delta captured; 5 deterministic operations are exact live differentials including both SSE streams, 10 session-read/request/PTY-attach operations compare status and normalized body, 35 missing local backends are explicit 503 gaps, and 8 backed operations carry visible cross-process fixture exemptions; 2 C8 operations are added",
     },
     SurfaceRow {
         id: "config-merge",
@@ -306,6 +306,11 @@ fn normalizations() -> Vec<Normalization> {
             surface: "api-operations".to_owned(),
             value: "generated SSE event id plus session-event timestamp and message id".to_owned(),
             reason: "each process generates those identities independently; the matrix preserves and compares event type, durable aggregate/sequence/version, all stable data, status, and the emitted-event side effect. No response object or semantic field is removed wholesale.".to_owned(),
+        },
+        Normalization {
+            surface: "api-operations: task 128 session-read, request, and PTY attach operations".to_owned(),
+            value: "temporary location identity and implementation-specific error envelope".to_owned(),
+            reason: "the two isolated servers resolve different temporary roots and encode typed HTTP errors differently; the matrix preserves success data, HTTP status, and whether an error body was returned while dedicated API tests assert exact local payloads, pagination, ticket lifetime, replay rejection, redaction, and terminal I/O.".to_owned(),
         },
     ]
 }
@@ -857,6 +862,18 @@ fn api_behaviour_matrix(document: &serde_json::Value) -> Vec<ApiBehaviourRow> {
         ("/api/session/active", "get"),
         ("/api/session/{sessionID}/event", "get"),
     ]);
+    let task_128_compared = BTreeSet::from([
+        ("/api/session/{sessionID}/context", "get"),
+        ("/api/session/{sessionID}/history", "get"),
+        ("/api/session/{sessionID}/message", "get"),
+        ("/api/session/{sessionID}/question", "get"),
+        ("/api/permission/request", "get"),
+        ("/api/permission/saved", "get"),
+        ("/api/permission/saved/{id}", "delete"),
+        ("/api/question/request", "get"),
+        ("/api/pty/{ptyID}/connect-token", "post"),
+        ("/api/pty/{ptyID}/connect", "get"),
+    ]);
     let mut rows = Vec::new();
     for (path, item) in document["paths"]
         .as_object()
@@ -888,6 +905,16 @@ fn api_behaviour_matrix(document: &serde_json::Value) -> Vec<ApiBehaviourRow> {
                     ApiDimension::Compared(evidence),
                     ApiDimension::Compared(evidence),
                     ApiDimension::Compared(evidence),
+                )
+            } else if task_128_compared.contains(&key) {
+                (
+                    ApiDimension::Compared("live status against the isolated upstream process"),
+                    ApiDimension::Compared(
+                        "live operation-scoped normalized body against the isolated upstream process",
+                    ),
+                    ApiDimension::Exempt(
+                        "process-local request and PTY state is verified by dedicated oc-server API tests",
+                    ),
                 )
             } else {
                 let reason = api_exemption_reason(path, method, &group);
@@ -1223,6 +1250,49 @@ fn normalize_http_body(body: &str, sse: bool) -> serde_json::Value {
     }
 }
 
+fn normalize_task_128_body(
+    row: &ApiBehaviourRow,
+    status: u16,
+    body: &str,
+    sse: bool,
+) -> serde_json::Value {
+    let mut value = normalize_http_body(body, sse);
+    let task_128 = matches!(
+        (row.method.as_str(), row.path.as_str()),
+        ("get", "/api/session/{sessionID}/context")
+            | ("get", "/api/session/{sessionID}/history")
+            | ("get", "/api/session/{sessionID}/message")
+            | ("get", "/api/session/{sessionID}/question")
+            | ("get", "/api/permission/request")
+            | ("get", "/api/permission/saved")
+            | ("delete", "/api/permission/saved/{id}")
+            | ("get", "/api/question/request")
+            | ("post", "/api/pty/{ptyID}/connect-token")
+            | ("get", "/api/pty/{ptyID}/connect")
+    );
+    if !task_128 {
+        return value;
+    }
+    if status >= 400 {
+        return serde_json::json!({
+            "error": {
+                "status": status
+            }
+        });
+    }
+    if let Some(object) = value.as_object_mut() {
+        object.remove("location");
+        if row.path == "/api/pty/{ptyID}/connect-token"
+            && let Some(data) = object
+                .get_mut("data")
+                .and_then(serde_json::Value::as_object_mut)
+        {
+            data.remove("ticket");
+        }
+    }
+    value
+}
+
 async fn observable_api_state(addr: SocketAddr) -> serde_json::Value {
     let sessions = raw_http(addr, "GET", "/api/session", None, false).await;
     let ptys = raw_http(addr, "GET", "/api/pty", None, false).await;
@@ -1255,9 +1325,40 @@ async fn observe_api_operation(addr: SocketAddr, row: &ApiBehaviourRow) -> ApiOb
     let after = observable_api_state(addr).await;
     ApiObservation {
         status: response.0,
-        normalized_body: normalize_http_body(&response.1, sse),
+        normalized_body: normalize_task_128_body(row, response.0, &response.1, sse),
         side_effect: serde_json::json!({"changed": before != after}),
     }
+}
+
+fn compare_selected_api_dimensions(
+    row: &ApiBehaviourRow,
+    oracle: &ApiObservation,
+    subject: &ApiObservation,
+) -> Result<(), String> {
+    let operation = format!("{} {}", row.method.to_ascii_uppercase(), row.path);
+    if matches!(row.status, ApiDimension::Compared(_)) && oracle.status != subject.status {
+        return Err(format!(
+            "{operation} status differs: oracle={} subject={}",
+            oracle.status, subject.status
+        ));
+    }
+    if matches!(row.body, ApiDimension::Compared(_))
+        && oracle.normalized_body != subject.normalized_body
+    {
+        return Err(format!(
+            "{operation} body differs: oracle={} subject={}",
+            oracle.normalized_body, subject.normalized_body
+        ));
+    }
+    if matches!(row.side_effect, ApiDimension::Compared(_))
+        && oracle.side_effect != subject.side_effect
+    {
+        return Err(format!(
+            "{operation} side effect differs: oracle={} subject={}",
+            oracle.side_effect, subject.side_effect
+        ));
+    }
+    Ok(())
 }
 
 fn assert_subject_operation_is_accounted(row: &ApiBehaviourRow, subject: &ApiObservation) {
@@ -1361,11 +1462,11 @@ fn api_behaviour_matrix_accounts_for_status_body_and_side_effect_per_operation()
         }
     }
     assert_eq!(
-        compared, 15,
-        "five live operations compare all three dimensions"
+        compared, 35,
+        "five live operations compare all dimensions and ten task-128 operations compare status and body"
     );
     assert_eq!(
-        exempted, 159,
+        exempted, 139,
         "every other dimension must carry a visible reason"
     );
 }
@@ -1392,10 +1493,10 @@ async fn api_behaviour_matrix_invokes_every_subject_operation_and_rejects_501() 
         );
     }
     assert_eq!(invoked.len(), 58, "every upstream operation must run");
-    assert_eq!(unavailable, 45, "the explicit API gap inventory drifted");
+    assert_eq!(unavailable, 35, "the explicit API gap inventory drifted");
     assert_eq!(
         invoked.len() - unavailable,
-        13,
+        23,
         "backed operation count drifted"
     );
 }
@@ -1478,12 +1579,8 @@ async fn api_behaviour_matrix_compares_live_status_body_and_side_effects() {
         let oracle_observation = observe_api_operation(oracle.addr, row).await;
         let subject_observation = observe_api_operation(subject_addr, row).await;
         assert_subject_operation_is_accounted(row, &subject_observation);
-        assert!(
-            matches!(row.status, ApiDimension::Exempt(_))
-                && matches!(row.body, ApiDimension::Exempt(_))
-                && matches!(row.side_effect, ApiDimension::Exempt(_)),
-            "a non-exact operation must carry a reason for every observed dimension"
-        );
+        compare_selected_api_dimensions(row, &oracle_observation, &subject_observation)
+            .unwrap_or_else(|error| panic!("{error}"));
         eprintln!(
             "api-matrix observed {} {}: oracle_status={} subject_status={} oracle_changed={} subject_changed={}",
             row.method.to_ascii_uppercase(),
@@ -2099,8 +2196,8 @@ fn known_gaps() -> Vec<KnownGap> {
     vec![
         KnownGap {
             id: "api-backends-unavailable".to_owned(),
-            surface: "45 of the 58 upstream /api operations".to_owned(),
-            detail: "Every upstream operation is invoked against both processes and its status, normalized body, and observable session/PTY state delta are captured. Thirteen operations have local backends; the other 45 return an operation-specific 503 backend_unavailable response and are never counted as parity. The matrix rejects any 501 before applying a differential exemption. This remains a compatibility gap, not a declared behavioral difference."
+            surface: "35 of the 58 upstream /api operations".to_owned(),
+            detail: "Every upstream operation is invoked against both processes and its status, normalized body, and observable session/PTY state delta are captured. Twenty-three operations have local backends; the other 35 return an operation-specific 503 backend_unavailable response and are never counted as parity. The matrix rejects any 501 before applying a differential exemption. This remains a compatibility gap, not a declared behavioral difference."
                 .to_owned(),
         },
         KnownGap {
