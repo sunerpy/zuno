@@ -111,28 +111,38 @@ pub struct Normalization {
     pub reason: String,
 }
 
-/// A difference that IS a decision but is not in the plan's declared seven.
+/// A behavioural difference from upstream, bound to the allow-list entry for it.
 ///
-/// The plan enumerates seven divergences and asserts that count. Along the way,
-/// individual tasks recorded further deliberate differences in their own code and
-/// notepad entries — two of them (`subpath`) explicitly nominated for this
-/// allow-list by the task that made them. Silently adding them would break the
-/// count assertion the plan built to force exactly this conversation; silently
-/// dropping them would lose the record.
+/// # Why this type replaced `NominatedDivergence`
 ///
-/// So they are reported here, each citing where it is declared, and
-/// `docs/divergences.toml` stays at seven until the plan's count is revised.
+/// Until plan todo 119 this was a *nomination*: a difference recorded here
+/// precisely because it was NOT in `docs/divergences.toml`, with the suite
+/// asserting it stayed out so the plan's declared count kept holding. That made a
+/// second reporting structure for the same kind of fact, and — because the
+/// assertion was that the id is *absent* from the allow-list — no gate could ever
+/// fail when a real behavioural difference went undeclared. A reader consulting the
+/// declared allow-list learned nothing about six of them.
+///
+/// Now every record names, in [`BehaviouralDifference::declared_as`], the entry in
+/// the allow-list that must cover it. The gate resolves that id against the loaded
+/// file and fails when it is missing, so the allow-list is the single place and this
+/// list is only the index into it. Where two differences turned out to be one
+/// decision, they share a `declared_as` rather than being declared twice.
 #[derive(Debug, Clone, Serialize)]
-pub struct NominatedDivergence {
-    /// Proposed stable id, matching the naming of the declared entries.
+pub struct BehaviouralDifference {
+    /// Stable id of the difference, kept from the nomination it replaces.
     pub id: String,
     /// The surface affected.
     pub surface: String,
-    /// One line saying what the difference is and why it exists.
-    pub reason: String,
-    /// Where it is already declared, as `path:line` or a notepad citation. A
-    /// nomination without a source is a claim, not a record.
-    pub declared_at: String,
+    /// The id in `docs/divergences.toml` that must declare this difference.
+    ///
+    /// Resolved against the loaded allow-list by the gate. A difference whose entry
+    /// is absent, renamed or deleted fails there.
+    pub declared_as: String,
+    /// The upstream file and lines that make this a difference rather than a guess.
+    pub upstream_evidence: String,
+    /// The test that proves the divergent behaviour is live, not merely written down.
+    pub asserted_by: String,
 }
 
 /// A surface where this implementation is behind upstream, with no decision behind it.
@@ -187,8 +197,8 @@ pub struct CompatReport {
     pub surfaces: Vec<ComparedSurface>,
     /// Every normalization applied anywhere in the suite.
     pub normalizations: Vec<Normalization>,
-    /// Deliberate differences declared in code but absent from the plan's seven.
-    pub nominated_divergences: Vec<NominatedDivergence>,
+    /// Every behavioural difference, each naming the allow-list entry declaring it.
+    pub behavioural_differences: Vec<BehaviouralDifference>,
     /// Every surface where this port is behind upstream.
     pub known_gaps: Vec<KnownGap>,
 }
@@ -273,11 +283,11 @@ impl CompatReport {
         }
         out.push_str(&format!(
             "  {} normalization(s), {} known gap(s), {} declared divergence(s), \
-             {} further divergence(s) declared in code but outside the plan's count\n",
+             {} behavioural difference(s) each resolved to a declared entry\n",
             self.normalizations.len(),
             self.known_gaps.len(),
             self.divergences.declared_count,
-            self.nominated_divergences.len()
+            self.behavioural_differences.len()
         ));
         out
     }
@@ -319,7 +329,7 @@ mod tests {
                 surface("two", Verdict::NotCompared),
             ],
             normalizations: Vec::new(),
-            nominated_divergences: Vec::new(),
+            behavioural_differences: Vec::new(),
             known_gaps: Vec::new(),
         }
     }

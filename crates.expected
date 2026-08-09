@@ -17,12 +17,14 @@ oc-paths
 oc-permission
 oc-plugin
 oc-plugin-sdk
+oc-process
 oc-provider-anthropic
 oc-provider-bedrock
 oc-provider-compatible
 oc-provider-google
 oc-provider-openai
 oc-pty
+oc-reaping-fixture
 oc-search
 oc-server
 oc-snapshot

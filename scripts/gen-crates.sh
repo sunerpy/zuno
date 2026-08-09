@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
-# One-shot generator for the 34 crate skeletons. Kept in the tree as the record
-# of how the roster was materialised; it is idempotent and safe to re-run.
+# One-shot generator for the original crate skeletons. Kept in the tree as the
+# record of how the roster was materialised; it is idempotent and safe to re-run.
+#
+# It is NOT the roster's source of truth: `crates.expected` is, and
+# `crates/oc-cli/tests/release_surface.rs::the_workspace_roster_matches_the_declared_crate_list`
+# asserts the workspace matches it. The two crates todo 90 added (`oc-process`,
+# `oc-reaping-fixture`) are deliberately absent below, because this script records
+# what todo 1 generated, not what the workspace now contains.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

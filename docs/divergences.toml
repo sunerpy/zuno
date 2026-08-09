@@ -13,8 +13,31 @@
 # `not_compared` / `known_gaps` sections and must never be laundered into an
 # entry here. See `.omo/notepads/opencode-rust/decisions.md`.
 #
-# Count discipline: this file has EIGHT entries, which is the count plan todo 86
-# asserts. The eighth is plan todo 103's cross-session memory subsystem.
+# Count discipline: this file has TWELVE entries. Eight were the count plan todo
+# 86 asserted (the eighth being todo 103's cross-session memory subsystem); todo
+# 119 added four more by reconciling the "nominated divergences" that had been
+# kept in a SECOND reporting structure inside `compat_suite.rs`. That structure
+# positively asserted those differences stayed *outside* this file, which
+# institutionalised the omission criterion 17 forbids: a reader consulting the
+# declared allow-list could not learn about them, and no gate could ever fail.
+# The nomination list is now a list of behavioural differences that each name the
+# entry here which must cover them, and the gate fails when one is undeclared.
+#
+# Two nominations were merged rather than declared separately, because neither was
+# an independent difference from upstream:
+#
+#   * `subpath-matches-literally` folded into `session-subpath-is-applied`. The
+#     un-escaped `LIKE '${path}/%'` that would make `_` and `%` act as wildcards
+#     is in upstream's LEGACY `/session?path=` handler
+#     (`packages/opencode/src/session/session.ts:969-980`), not in the v2
+#     `/api/session?subpath=` surface, which ignores `subpath` entirely
+#     (`packages/core/src/session.ts:268-277`). This port accepts `subpath` only on
+#     `/api/session` in project scope and does not serve the legacy `path` query at
+#     all, so there is no upstream pattern-match to differ from — only one
+#     difference (the parameter is applied), of which literal matching is a
+#     property. Both facts are stated in that entry's reason.
+#   * `memory-subsystem` folded into `cross-session-resident-memory`, which already
+#     declares the same three surfaces.
 
 [[divergence]]
 id = "session-list-default-sort"
@@ -64,4 +87,24 @@ reason = "Upstream bundles 23 SDK factories behind one config surface; SigV4+Eve
 [[divergence]]
 id = "cross-session-resident-memory"
 surface = "system-prompt resident blocks; model-facing `memory` tool; post-response reflection"
-reason = "Upstream opencode 1.18.13 has no cross-session memory subsystem; this implementation carries character-capped global notes and project rules into later sessions and can reflect after delivery, so `memory: false` is the single strict-parity switch that removes all three surfaces and preserves the original prompt bytes."
+reason = "Upstream opencode 1.18.13 has no cross-session memory subsystem; this implementation carries character-capped global notes and project rules into later sessions and can reflect after delivery, so `memory: false` is the single strict-parity switch that removes all three surfaces and preserves the original prompt bytes. Absorbs the former `memory-subsystem` nomination, which named these same three surfaces."
+
+[[divergence]]
+id = "session-subpath-is-applied"
+surface = "HTTP `GET /api/session?project=…&subpath=…`; `oc-db` session listing in project scope"
+reason = "Upstream declares `subpath` in the v2 list union (`packages/core/src/session.ts:68-76`), the HTTP query schema (`packages/protocol/src/groups/session.ts:98-110`), the generated client and the SDK, and the handler even forwards it (`packages/server/src/handlers/session.ts:23-37`) — but `session.list` builds its conditions from `directory`, `workspaceID`, `project` and `search` only (`packages/core/src/session.ts:268-277`), so the parameter changes nothing upstream. This port applies it, which narrows the result set for a request upstream answers unfiltered. It is matched as a literal tree prefix (`path = s OR path LIKE s || '/%'` with the pattern bound, not interpolated), so a subpath containing `_` or `%` selects that directory and not a wildcard family; upstream's un-escaped `LIKE '${path}/%'` lives on the LEGACY `/session?path=` handler (`packages/opencode/src/session/session.ts:969-980`), a route this port does not serve, so literal matching is a property of the applied filter rather than a second divergence. Absorbs the former `subpath-matches-literally` nomination."
+
+[[divergence]]
+id = "context-md-excluded"
+surface = "project instruction cascade — the filename list probed by `findUp`"
+reason = "Upstream's `instructionFiles` still lists `CONTEXT.md` behind a `// deprecated` marker (`packages/opencode/src/session/instruction.ts:60-68`) and genuinely loads it: the cascade probes each name in order and the first project-level match wins (`:122-132`), then every resolved path is read and injected as `Instructions from: …` (`:155-168`). This port stops at `AGENTS.md` and `CLAUDE.md`, so a repository whose only instruction file is `CONTEXT.md` contributes one instruction block under the TypeScript binary and zero here."
+
+[[divergence]]
+id = "malformed-auth-json-is-an-error"
+surface = "`$XDG_DATA_HOME/opencode/auth.json` — reading the credential store"
+reason = "Upstream funnels every read and parse failure into an empty store: `readJson(file).pipe(Effect.orElseSucceed(() => ({})))` (`packages/opencode/src/auth/index.ts:58-67`), and the next `set` writes `{ ...data, [norm]: info }` over the file (`:73-80`) — so one truncated `auth.json` silently destroys every other credential in it. This port returns a typed `Malformed` error naming the file instead, which fails the read a user can retry rather than losing data they cannot recover. An empty or whitespace-only file still reads as an empty store, because that is a crash mid-create rather than corruption."
+
+[[divergence]]
+id = "failed-format-restores-pre-format-bytes"
+surface = "post-edit formatter execution — the file's bytes after a formatter exits non-zero"
+reason = "Upstream inspects the exit code and only logs: `if (result && result.exitCode !== 0) yield* Effect.logError(\"failed\", …)`, with a spawn failure mapped to `undefined` and the loop continuing (`packages/opencode/src/format/index.ts:73-114`). Nothing is snapshotted or written back, so whatever a failing formatter left on disk — including a truncated file — stands. This port keeps the bytes the edit wrote and restores them when a formatter exits non-zero, reports `editRestored` in the tool metadata and says so in the tool output. The cost is deliberate: useful partial work from a formatter that exits non-zero after reformatting is discarded."

@@ -65,9 +65,17 @@ const SMOKE_CASSETTE: &str = "openai-chat/drives-a-tool-loop-end-to-end";
 /// Floors, not exact counts. They exist so that a scan pointed at the wrong
 /// directory — which a shared `CARGO_TARGET_DIR` across git worktrees really does
 /// cause — fails loudly instead of passing vacuously.
-const MINIMUM_CRATES: usize = 34;
+///
+/// `MINIMUM_CRATES` is deliberately *not* the roster gate. A floor cannot notice
+/// an addition, which is exactly how `oc-process` and `oc-reaping-fixture` entered
+/// the workspace unremarked; the exact roster is asserted against `crates.expected`
+/// by [`the_workspace_roster_matches_the_declared_crate_list`].
+const MINIMUM_CRATES: usize = 36;
 const MINIMUM_SOURCE_FILES: usize = 300;
 const MINIMUM_GRAPH_PACKAGES: usize = 100;
+
+/// The declared roster, relative to the workspace root.
+const ROSTER_FIXTURE: &str = "crates.expected";
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -461,6 +469,97 @@ fn every_workspace_member_inherits_the_workspace_lints() {
          `unsafe_code = \"forbid\"` does not apply to them:\n  {}",
         offenders.len(),
         offenders.join("\n  ")
+    );
+}
+
+/// The workspace's actual members, as sorted package names.
+///
+/// `cargo metadata --no-deps` rather than a `crates/` directory listing: membership
+/// is what `[workspace] members` resolves to, so a directory without a manifest, or
+/// one named in `exclude`, is correctly absent, and a member added from outside
+/// `crates/*` is correctly present.
+fn workspace_member_names() -> Vec<String> {
+    let output = Command::new(env!("CARGO"))
+        .current_dir(workspace_root())
+        .env("CARGO_NET_OFFLINE", "true")
+        .args([
+            "metadata",
+            "--locked",
+            "--offline",
+            "--no-deps",
+            "--format-version",
+            "1",
+        ])
+        .output()
+        .expect("cargo metadata must be runnable");
+    assert!(
+        output.status.success(),
+        "cargo metadata failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("cargo metadata emits JSON");
+    let mut names: Vec<String> = document["packages"]
+        .as_array()
+        .expect("cargo metadata --no-deps lists packages")
+        .iter()
+        .map(|package| {
+            package["name"]
+                .as_str()
+                .expect("every package has a name")
+                .to_owned()
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// The roster is a closed list, and `members = ["crates/*"]` cannot keep one.
+///
+/// The plan freezes an enumerated roster and requires any addition to be a
+/// deliberate change with a matching count and fixture update. The glob makes an
+/// addition invisible: `oc-process` and `oc-reaping-fixture` joined the workspace
+/// with `crates.expected` untouched and every gate still green, because the only
+/// crate-count assertion in this file was a *floor*. This compares the two sets
+/// exactly, in both directions, so the next addition fails here until the roster is
+/// amended on purpose.
+#[test]
+fn the_workspace_roster_matches_the_declared_crate_list() {
+    let root = workspace_root();
+    let fixture = root.join(ROSTER_FIXTURE);
+    let declared_text = std::fs::read_to_string(&fixture)
+        .unwrap_or_else(|e| panic!("read {}: {e}", fixture.display()));
+    let declared: BTreeSet<&str> = declared_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let actual_names = workspace_member_names();
+    let actual: BTreeSet<&str> = actual_names.iter().map(String::as_str).collect();
+
+    assert!(
+        actual.len() >= MINIMUM_CRATES,
+        "cargo metadata reported only {} workspace members; the query is pointed at \
+         the wrong workspace and this assertion would pass vacuously",
+        actual.len()
+    );
+
+    let undeclared: Vec<&&str> = actual.difference(&declared).collect();
+    let missing: Vec<&&str> = declared.difference(&actual).collect();
+    assert!(
+        undeclared.is_empty() && missing.is_empty(),
+        "the workspace roster and {} disagree. The roster is a closed list: a new \
+         crate is a deliberate amendment to {}, to the enumeration in \
+         `.omo/plans/opencode-rust.md` and to its stated count, in the same commit \
+         — never a silent consequence of `members = [\"crates/*\"]`.\n  \
+         in the workspace but not declared: {undeclared:?}\n  \
+         declared but not in the workspace: {missing:?}\n  \
+         declared {} / actual {}",
+        ROSTER_FIXTURE,
+        ROSTER_FIXTURE,
+        declared.len(),
+        actual.len()
     );
 }
 

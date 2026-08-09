@@ -96,8 +96,8 @@ pub use crate::cassette::{
     ResponseSnapshot, SseFrame, canonical_snapshot, list_cassettes, recordings_root,
 };
 pub use crate::compat_report::{
-    ComparedSurface, CompatReport, DivergenceSummary, KnownGap, NominatedDivergence, Normalization,
-    OracleAvailability, OracleKind, Verdict,
+    BehaviouralDifference, ComparedSurface, CompatReport, DivergenceSummary, KnownGap,
+    Normalization, OracleAvailability, OracleKind, Verdict,
 };
 pub use crate::config_fixture::{ConfigFixture, ConfigLayer, PlacedLayer};
 pub use crate::diff::{DiffReport, Divergence, diff_normalized};

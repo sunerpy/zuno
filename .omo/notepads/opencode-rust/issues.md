@@ -6135,3 +6135,56 @@ They are deliberately visible in the generated compatibility matrix and in
 Tool limitation: MCP `lsp_diagnostics` is rooted at the main checkout and cannot
 open sibling worktree `t118`. Direct `rust-analyzer diagnostics . --severity warning`
 from the task worktree used the same engine and completed without diagnostics.
+
+## Todo 119 — both Final-Wave reporting-structure blockers closed (F1 B4, F4 blockers 2 and 3)
+
+Two defects, one shape: **a second reporting structure lets a system agree with
+itself while contradicting its contract.** Neither could ever fail, because both
+asserted in the direction nobody was travelling.
+
+**1. Six "nominated divergences" asserted to stay OUT of the allow-list.**
+`compat_suite.rs` recorded them and asserted `!declared.contains(id)` — so the only
+way to fail was to *declare* a difference. Inverted: each record now carries
+`declared_as` naming the allow-list entry that must cover it, resolved through
+`DivergenceList::find` against the loaded file. Removing an entry now fails two
+independent assertions. `docs/divergences.toml` 8 -> 12, `DECLARED_COUNT` 8 -> 12
+in the same commit.
+
+Dispositions, each checked against upstream 1.18.13 source, not against the
+nomination's own prose:
+- `subpath-is-implemented` -> declared as `session-subpath-is-applied`. Upstream
+  declares the parameter in four places and even forwards it through the handler,
+  but `session.list` never reads it (`packages/core/src/session.ts:268-277`).
+- `subpath-matches-literally` -> **merged**, and this one required correcting the
+  criterion. The un-escaped `LIKE '${path}/%'` is on the **legacy** `/session?path=`
+  handler (`session/session.ts:969-980`), a different endpoint and a different
+  parameter, which this port does not serve. On the v2 surface upstream performs no
+  path filtering at all, so there is no upstream pattern-match for literal matching
+  to differ *from*. It is a property of applying the parameter, not a second
+  difference. Merged into the entry's reason with the evidence — not deleted.
+- `context-md-excluded`, `malformed-auth-json-is-an-error`,
+  `failed-format-restores-pre-format-bytes` -> declared, all three real, each with
+  the upstream lines that prove upstream does the other thing.
+- `memory-subsystem` -> merged into `cross-session-resident-memory` (same three
+  surfaces).
+
+**2. The frozen 34-crate roster had silently become 36.** `members = ["crates/*"]`
+globbed in todo 90's `oc-process` and `oc-reaping-fixture`. The only crate-count
+assertion in the tree was a **floor** (`MINIMUM_CRATES = 34`) — and *a floor cannot
+notice an addition*. Same failure shape as #1. Roster amended to 36 in
+`crates.expected`, the plan enumeration and the plan's count; new
+`the_workspace_roster_matches_the_declared_crate_list` set-differences
+`cargo metadata --no-deps` against the fixture in both directions.
+
+**Lesson worth carrying: check the direction of every guard, not just its presence.**
+A floor, a `!contains`, and a `>=` all read like protection and all pass forever
+while the quantity moves the way nobody asserted. Ask of each guard: *what change
+makes this fail?* If the answer is "the change nobody will make", it is decoration.
+This is now the third instance recorded (with the G5 grep-for-a-needle gate and the
+`probe_blocking_send` toy channel) of an assertion that could not fail.
+
+**Also: a stale count is never alone.** The criterion named two; nine more were
+found in the same sweep (four more `61 /api` claims including a *frozen success
+criterion*, the roster count in two scripts, and two prose counts in
+`docs/divergences.md`). One `Commit:` line was deliberately left stale because it
+records the message of a commit that exists in git history.

@@ -41,7 +41,13 @@ use crate::error::{Result, TestkitError};
 ///
 /// Bumping this without adding an entry — or adding an entry without bumping this
 /// — fails the compatibility suite. That is the point.
-pub const DECLARED_COUNT: usize = 8;
+///
+/// Went from eight to twelve in plan todo 119, which reconciled the four
+/// behavioural differences that had been kept in a second reporting structure
+/// (`compat_suite.rs::nominated_divergences`) that positively asserted they stayed
+/// *out* of the allow-list. Two of the six nominations were merged into entries
+/// that already covered them rather than declared twice.
+pub const DECLARED_COUNT: usize = 12;
 
 /// The allow-list's path, relative to the workspace root.
 pub const RELATIVE_PATH: &str = "docs/divergences.toml";
