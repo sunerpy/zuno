@@ -626,7 +626,17 @@ pub enum Command {
     Db(DbArgs),
     /// Diagnostics and introspection.
     Debug(DebugArgs),
-    /// Generate shell completion output.
+    /// Explain why shell completion output is unavailable, and what to use instead.
+    ///
+    /// Registered because upstream registers it, but it cannot emit a completion
+    /// script. Upstream's script is a yargs shell function that asks the binary
+    /// back for candidates over `--get-yargs-completions`; this port serves no such
+    /// protocol, so a script emitted here would answer every request with nothing.
+    /// Every invocation therefore prints that reason on stderr and exits 1 instead
+    /// of writing a file that cannot work.
+    ///
+    /// To read the command tree and its flags — everything a completion would have
+    /// to know — run `--help` on the binary and on each subcommand.
     Completion(PendingArgs),
     /// Export session data as JSON.
     Export(ExportArgs),
@@ -844,12 +854,23 @@ pub enum Action {
 /// A command listed here must not carry [`Disposition::Implemented`], which is the
 /// invariant the same test enforces.
 ///
+/// An entry here is also a claim about the command's **help text**, because help is
+/// the surface a user reads before running anything: a reader who only ever runs
+/// `--help` must learn the command does not work. Recording the reason here is not
+/// sufficient on its own — `completion` was recorded honestly in this table while
+/// `--help` advertised "Generate shell completion output" in both the root listing
+/// and the command's own help, and a reader following that help could not proceed.
+/// `oc-cli/tests/help_honesty.rs` enforces the help side for every entry, so a
+/// future addition cannot repeat it.
+///
 /// [`Disposition::Implemented`]: crate::Disposition::Implemented
 pub const PENDING_COMMANDS: &[(&str, &str)] = &[(
     "completion",
-    "upstream's completion script is a yargs shell function that calls back into \
-     `--get-yargs-completions`, a protocol this port does not implement; generate \
-     completions from your shell against `--help` instead",
+    "upstream's completion script is a yargs shell function that asks the binary \
+     back for candidates over `--get-yargs-completions`, a protocol this port does \
+     not serve, so a script generated here would answer every request with nothing; \
+     run `--help` on the binary and on each subcommand to read the command tree and \
+     its flags instead",
 )];
 
 /// The recorded reason one registered command has no handler.
