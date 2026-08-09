@@ -1,0 +1,263 @@
+Task 130 — re-pin the compatibility oracle to the newest installed release
+Measured: 2026-08-09 (worktree /config/workspace/ProdDir/AI/oc-wt/t130, branch task-130)
+Base commit: 2818bde97f8943500f28c6620e56ded0261bb549
+
+VERDICT
+-------
+re-pinned to the newest installed release:              DONE — 1.18.15
+recorded value bound to the binary's self-report:        DONE — asserted, mutation-proved twice
+OpenAPI document recaptured from the pinned release:     DONE — live /doc, byte-identical
+operation count restated:                               58 → 58, NO DELTA (see "OPERATION COUNT")
+a test fails when recorded and reported disagree:        DONE — mutation-proved at two layers
+no hard-coded mise path anywhere in the harness:         DONE — the path is discovered
+
+WHICH VERSION, AND WHY THIS ONE
+-------------------------------
+Installed on this host: 1.18.12, 1.18.13, 1.18.14, 1.18.15 (plus older 1.17.x/1.18.x).
+`latest` symlinks to 1.18.15. The plan owner's instruction is "opencode 版本使用最新即可",
+so the pin is the newest: **1.18.15**.
+
+  oc_testkit::oracle::PINNED_RELEASE = "1.18.15"          (crates/oc-testkit/src/oracle.rs:79)
+
+Note 1.18.13 IS now installed, so the literal criterion-1 pin was reachable. It was not
+chosen: the plan owner's amendment says newest, and 1.18.15 is newest. Every artifact
+below was measured against 1.18.15 and nothing records 1.18.13 as the executed binary.
+
+TWO PINS, DELIBERATELY DIFFERENT NUMBERS
+----------------------------------------
+The F1/B1 defect was one number doing two jobs. They are now separated and both are
+documented in the `oracle` module header:
+
+  pin              | value    | what it names                        | where
+  -----------------|----------|--------------------------------------|--------------------------
+  PINNED_RELEASE   | 1.18.15  | the binary every differential EXECUTES| src/oracle.rs (verified)
+  source baseline  | 1.18.13  | the TS tree this port was READ from,  | the located tree's
+                   |          | and the version reported to the npm   | packages/opencode/
+                   |          | plugin compatibility gate             | package.json (aefaf140c1)
+
+`oc_plugin::js::spec::REPORTED_PLUGIN_API_VERSION` stays 1.18.13 — that is a wire value
+the plugin loader compares against npm `peerDependencies` ranges, not a statement about
+which binary ran. It was NOT touched.
+
+HOW THE RECORDED VALUE IS BOUND TO THE BINARY (the F1/B1 fix)
+------------------------------------------------------------
+Before: `compat_suite.rs:68` hard-coded
+        /config/.local/share/mise/installs/opencode/1.18.12/opencode
+        while `compat_suite.rs:71` and `compat_report.rs:320` recorded "1.18.13".
+        Nothing could fail over the gap.
+
+After:  the *release* is declared once; the *path* is discovered.
+
+  Oracle::discover_pinned()            src/oracle.rs — discover() (OC_TESTKIT_ORACLE, else
+                                       PATH, else source tree), then check_pin() against
+                                       Oracle::reported_version(), which is the trimmed
+                                       first stdout line of really executing `--version`
+                                       in probe_version().
+  resolved_oracle()                    tests/compat_suite.rs — resolves once; absence →
+                                       None (skip contract preserved); WRONG RELEASE →
+                                       panic, so no report can be produced by a build
+                                       other than the pin.
+  report assertion                     tests/compat_suite.rs — report.oracle.version
+                                       (probed) == report.oracle.pinned_source_version
+                                       (claimed), whenever the oracle was available.
+
+The assertion is NOT between two written-down constants. The right-hand side of the unit
+gate is process stdout. That was the trap this task was warned about and it is avoided.
+
+Resolved on this host:
+  which("opencode") → /config/.local/share/mise/installs/opencode/1.18.15/opencode
+  `--version`       → 1.18.15
+(The mise shim /config/.local/share/mise/shims/opencode also reports 1.18.15; discovery
+lands on the real install directly. No absolute path is written in any source file.)
+
+Emitted artifact target/compat/compat-report.json, `oracle` object:
+  { "available": true,
+    "path": "/config/.local/share/mise/installs/opencode/1.18.15/opencode",
+    "version": "1.18.15",
+    "pinned_source_version": "1.18.15" }
+version == pinned_source_version. That equality is what F1 could not previously assert.
+
+MUTATION PROOF — the inconsistency test really fails
+----------------------------------------------------
+M1. PINNED_RELEASE "1.18.15" → "1.18.13" (recreating exactly the rejected state:
+    record 1.18.13, execute something else).
+
+    oracle::tests::the_declared_pin_equals_the_version_the_resolved_binary_reports
+      FAILED: PINNED_RELEASE claims 1.18.13 but
+              /config/.local/share/mise/installs/opencode/1.18.15/opencode reports
+              1.18.15. ... Install 1.18.13, or move the constant and recapture.
+        left: "1.18.15"   right: "1.18.13"
+
+    the_suite_emits_a_machine_readable_report
+      FAILED: the resolved oracle is not the pinned release.
+                pinned:   1.18.13
+                reported: 1.18.15
+                program:  /config/.local/share/mise/installs/opencode/1.18.15/opencode
+                remedy: install 1.18.13 and put it first on PATH, point OC_TESTKIT_ORACLE
+                        at it, or move `oc_testkit::oracle::PINNED_RELEASE` to 1.18.15 and
+                        recapture every artifact measured against it
+
+    Two layers fail, and the second one prevents the artifact from being WRITTEN at all
+    rather than written with a wrong claim. Restored → both pass.
+
+M2. one byte of the committed OpenAPI capture: "opencode api" → "opencode API"
+    (sha256 c3a9f94a… → 10329895…, same 478,747 bytes, so a length check alone would
+    have missed it).
+
+    the_committed_openapi_capture_is_what_the_pinned_release_serves
+      FAILED: the committed capture is not byte-identical to what 1.18.15 serves at /doc,
+              even though both are 478747 bytes; the /api assertions in this file are
+              reading a stale oracle
+
+    Fixture restored; sha256 back to c3a9f94af0c3324d97b482b14c692e810ce7ccac3136319ba46334de972b4cf1
+    and `git status .omo/fixtures/` clean.
+
+M3. UPSTREAM_API_OPERATIONS 58 → 57.
+
+    the_committed_openapi_capture_is_what_the_pinned_release_serves
+      FAILED: 1.18.15 serves a different number of /api operations than
+              UPSTREAM_API_OPERATIONS declares; report the delta and update every count
+              that references it
+
+    This is the count guard the brief asked for, and it reads the LIVE document, not the
+    committed file, so a stale fixture cannot satisfy it. Restored → passes.
+
+M4. A real executable of the wrong release, refused by name.
+    oracle::tests::a_binary_reporting_another_release_is_named_and_refused writes a
+    runnable stand-in that prints `1.18.12`, has Oracle::at_binary really run it, asserts
+    reported_version()=="1.18.12" (so the string came from the process, not a literal),
+    then requires check_pin to reject it naming both versions, the program, and
+    OC_TESTKIT_ORACLE. This is the plan's failure QA scenario: "pinning a version that is
+    not installed fails loudly, naming what was found."
+
+OPENAPI RECAPTURE
+-----------------
+Captured by serving `/doc` from each installed release under a fully isolated XDG world
+(HOME/XDG_{DATA,CONFIG,CACHE,STATE}_HOME per-release temp dirs,
+OPENCODE_DISABLE_AUTOUPDATE=1, OPENCODE_DISABLE_MODELS_FETCH=1):
+
+  release   http  bytes    sha256 (first 16)
+  1.18.12   200   478747   c3a9f94af0c3324d
+  1.18.13   200   478747   c3a9f94af0c3324d
+  1.18.14   200   478747   c3a9f94af0c3324d
+  1.18.15   200   478747   c3a9f94af0c3324d   ← the pin
+  committed .omo/fixtures/oracle-openapi-1.18.12.json
+            —     478747   c3a9f94af0c3324d
+
+All four installed releases emit a BYTE-IDENTICAL document, and it equals the committed
+capture. So the recapture is real and its result is that the file did not need to change.
+
+FILENAME NOTE, stated rather than hidden: the fixture is still named
+`oracle-openapi-1.18.12.json` and its bytes are now verified against 1.18.15. Renaming it
+would require editing crates/oc-server/{src/compat_v1.rs,tests/api.rs,tests/compat_v1.rs}
+and docs/, all of which are owned by concurrent todos 126–129 and are off-limits to this
+task. Instead the name is documented as the capture's provenance, not a version claim, and
+`the_committed_openapi_capture_is_what_the_pinned_release_serves` re-derives the bytes from
+PINNED_RELEASE on every run, so the name cannot go stale silently. A later task that owns
+those files can rename it.
+
+OPERATION COUNT — 58, UNCHANGED
+-------------------------------
+Live count from 1.18.15's own `/doc`:
+  operations under /api/ (get|post|put|delete|patch)      58
+  operations at every path (all verbs)                   188
+
+  openapi-recapture: 1.18.15 served 478747 bytes at /doc, byte-identical to
+  .omo/fixtures/oracle-openapi-1.18.12.json, declaring 58 /api operations
+
+DELTA vs the 58 baseline: **none. No operation was added and none was removed.** The
+document is byte-identical across 1.18.12→1.18.15, so no count anywhere in the repo needed
+restating. Concretely, none of these moved: the matrix row count, the invoked count, the
+observed count, the upstream superset count, the 45 explicit 503 gaps, the 13 locally
+backed, the 5 exactly compared, the 2 added C8 operations. The five "61 /api" corrections
+made in the previous wave stay correct at 58; this task adds no new stale count. The four
+literal `58`s in compat_suite.rs assertions were replaced with a single
+UPSTREAM_API_OPERATIONS constant so a future delta has exactly one place to change, and M3
+proves that constant is checked against the live document.
+
+JOURNAL ROUND-TRIP AGAINST THE PIN
+----------------------------------
+journal_round_trip_through_the_real_binary_does_not_replay_migrations now runs against
+1.18.15 (previously the hard-coded 1.18.12): a Rust-created database prefilled with 38
+completed migrations is opened by the real 1.18.15 binary, which must survive and must
+leave the completed set unchanged. PASSES.
+
+Independently measured by hand, same isolated-XDG method, both releases:
+  1.18.12  `db --pure --format json "SELECT count(*) FROM migration"` → 38
+  1.18.15  same                                                      → 38
+  1.18.12  ordered id list: 38 ids, sha256 5f943d4c5bf5c217…
+  1.18.15  ordered id list: 38 ids, sha256 5f943d4c5bf5c217…  (identical)
+So the migration journal is unchanged between the old and new pin, and the 38 in the
+assertion needs no restating either.
+
+The other three oracle-gated comparisons also now run against 1.18.15 and pass:
+  db_schema_matches_a_database_the_real_binary_created            (20 tables)
+  a_session_written_by_this_port_is_decodable_by_the_real_binary
+  api_behaviour_matrix_compares_live_status_body_and_side_effects (58 operations)
+
+WHAT CHANGED
+------------
+crates/oc-testkit/src/oracle.rs
+  + PINNED_RELEASE ("1.18.15"), the single declaration of the executed release
+  + Oracle::discover_pinned() — discovery, then refusal of any other release
+  + check_pin() — pure, so the refusal is reachable from a test (std::env::set_var is
+    unsafe under Rust 2024 and this workspace forbids unsafe_code; requested_flavour() is
+    split for the same reason)
+  + module header: the two-pins table
+  + 2 tests (the pin gate, the wrong-release refusal)
+crates/oc-testkit/src/error.rs
+  + TestkitError::OraclePinMismatch { pinned, reported, program, binary_env }
+crates/oc-testkit/src/lib.rs
+  ~ crate header distinguishes the source baseline from the executed release
+  ~ the provenance fixture uses this machine's real (1.18.15 binary, 1.18.13 tree) pair
+    instead of a stale invented one
+  + PINNED_RELEASE, check_pin re-exported
+crates/oc-testkit/src/compat_report.rs
+  ~ pinned_source_version documents the must-equal-`version` invariant and why the field
+    name is kept (schema compatibility with committed reports at SCHEMA_VERSION 1)
+  ~ its test fixture uses PINNED_RELEASE
+crates/oc-testkit/tests/compat_suite.rs
+  - the hard-coded /config/.local/share/mise/installs/opencode/1.18.12/opencode
+  - oracle_version() (folded into the cached resolution)
+  + resolved_oracle() + ResolvedOracle, UPSTREAM_API_OPERATIONS, NO_ORACLE
+  + the recorded-vs-probed assertion in the report test
+  + the_committed_openapi_capture_is_what_the_pinned_release_serves
+  ~ four literal 58s → UPSTREAM_API_OPERATIONS
+
+Behaviour change worth flagging: this file previously also honoured OPENCODE_TEST_BINARY.
+It now resolves through Oracle::discover(), whose override is OC_TESTKIT_ORACLE — the
+harness's own documented variable, named in the mismatch error's remedy. Other crates'
+OPENCODE_TEST_BINARY handling is untouched.
+
+No new dependency. `cargo metadata --locked --offline` resolves.
+Frozen perf surface untouched: crates/oc-testkit/src/perf/**, docs/perf-methodology.md,
+benchmarks/ts-baseline.json, crates/oc-testkit/tests/{memory,soak,backpressure}.rs.
+Concurrently-owned files untouched: crates/oc-server/**, crates/oc-cli/**, README.md,
+docs/**. The memory gate was never armed (OC_MEMORY_GATE_MODE=skip on every run).
+
+GATES
+-----
+cargo test --workspace --offline                    3263 passed, 0 failed, 1 ignored
+    decomposed, because `cargo test --workspace` FINGERPRINTS DOCTEST TARGETS and
+    silently skips fresh ones (recorded in .omo/evidence/task-116-opencode-rust.txt);
+    an undecomposed run here reported only 131 of 169 code suites and 0 doc suites.
+      --lib --bins --tests   169 suites   3233 passed, 0 failed, 1 ignored
+      --doc                   35 suites     30 passed, 0 failed, 1 ignored
+                                         3233 + 30 = 3263, and
+                                         baseline 3260 + 3 added = 3263 — exact.
+    The 3 added: oracle::the_declared_pin_equals_the_version_the_resolved_binary_reports,
+    oracle::a_binary_reporting_another_release_is_named_and_refused,
+    compat_suite::the_committed_openapi_capture_is_what_the_pinned_release_serves.
+cargo clippy --workspace --all-targets --offline    0 warnings, 0 errors
+cargo fmt --all --check                             clean
+cargo metadata --locked --offline --format-version 1 clean
+
+QA SCENARIOS
+------------
+happy — a reader can tell exactly which upstream build the claim was measured against:
+  target/compat/compat-report.json names path, version, and pinned_source_version, and all
+  three agree on 1.18.15. `openapi-recapture:` on stderr states the bytes and the operation
+  count. The two-pins table in the oracle module says why 1.18.13 still appears elsewhere.
+failure — pinning a version that is not installed fails loudly, naming what was found:
+  M1 above. The error names the pin, what was actually reported, the program that reported
+  it, and three remedies. M4 covers the same refusal driven by a real wrong-release process.

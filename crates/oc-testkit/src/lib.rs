@@ -7,6 +7,12 @@
 //! decision here is made in favour of *detecting* a difference rather than
 //! producing a green run.
 //!
+//! That `1.18.13` is the **source baseline** — the tree this port was read from and
+//! the version it reports to the npm plugin gate. The binary the differentials
+//! actually execute is [`PINNED_RELEASE`], the newest installed release, currently
+//! `1.18.15`. The two numbers are separate pins and [`oracle`] documents why;
+//! recording one as though it were the other is the defect plan todo 130 closed.
+//!
 //! # The failure this crate exists to prevent
 //!
 //! A reference Rust agent shipped an MCP stdio client that framed messages with
@@ -110,7 +116,7 @@ pub use crate::mock_provider::{
     CapturedRequest, MockProvider, MockResponse, ResponseOrigin, Scenario, StreamSignal,
 };
 pub use crate::normalize::{NormalizationRule, Normalizer};
-pub use crate::oracle::{Oracle, OracleFlavour, requested_flavour};
+pub use crate::oracle::{Oracle, OracleFlavour, PINNED_RELEASE, check_pin, requested_flavour};
 pub use crate::run::{Provenance, RunOutcome, VersionGap};
 pub use crate::subject::{SUBJECT_BIN, SUBJECT_PACKAGE, Subject};
 pub use crate::terminal_owner::{FakeTerminalOwner, TerminalTranscript, TerminalTransition};
@@ -150,16 +156,23 @@ mod tests {
         }
     }
 
+    /// The two provenance version numbers must both survive into the report, which is
+    /// what stops a patch-level gap being read as a compatibility defect.
+    ///
+    /// The pair used here is this machine's real one — the installed release
+    /// [`PINNED_RELEASE`] against the `1.18.13` source tree at `aefaf140c1` — rather
+    /// than an invented pair, so the fixture cannot go on depicting a gap the machine
+    /// no longer has.
     #[test]
     fn diff_runs_carries_both_provenances_into_the_report() {
         let left = outcome(
             Provenance::OracleInstalledBinary {
                 program: PathBuf::from("/usr/bin/opencode"),
-                reported_version: "1.18.12".to_owned(),
+                reported_version: PINNED_RELEASE.to_owned(),
                 pinned_source_version: Some("1.18.13".to_owned()),
                 pinned_source_commit: Some("aefaf140c1".to_owned()),
             },
-            "1.18.12\n",
+            format!("{PINNED_RELEASE}\n").as_str(),
         );
         let right = outcome(
             Provenance::Subject {

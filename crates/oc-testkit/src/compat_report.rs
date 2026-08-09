@@ -167,7 +167,16 @@ pub struct OracleAvailability {
     /// The version it reported, when it was found.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    /// The version this port is pinned to compare against.
+    /// The release this report claims its comparisons were measured against.
+    ///
+    /// Must equal [`Self::version`] whenever the oracle was available — the suite
+    /// asserts it. The two disagreeing (`1.18.13` recorded, `1.18.12` executed) is
+    /// what the first final-verification wave rejected: a reader could not tell which
+    /// upstream build the compatibility claim rested on. Set from
+    /// [`PINNED_RELEASE`](crate::oracle::PINNED_RELEASE).
+    ///
+    /// The name is kept for schema compatibility with reports already committed
+    /// under [`SCHEMA_VERSION`].
     pub pinned_source_version: String,
 }
 
@@ -317,7 +326,7 @@ mod tests {
                 available: false,
                 path: None,
                 version: None,
-                pinned_source_version: "1.18.13".to_owned(),
+                pinned_source_version: crate::oracle::PINNED_RELEASE.to_owned(),
             },
             divergences: DivergenceSummary {
                 declared_count: 7,

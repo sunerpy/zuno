@@ -202,6 +202,29 @@ pub enum TestkitError {
         stderr: String,
     },
 
+    /// The resolved oracle is not the release this port is pinned to compare against.
+    ///
+    /// Hard rather than advisory: a pin only means something if a recorded version
+    /// cannot drift away from the binary that produced the measurement. Recording
+    /// `1.18.13` while resolving `1.18.12` is the inconsistency F1 rejected on.
+    #[error(
+        "the resolved oracle is not the pinned release.\n  pinned:   {pinned}\n  \
+         reported: {reported}\n  program:  {program}\n  remedy: install {pinned} and put it \
+         first on PATH, point {binary_env} at it, or move \
+         `oc_testkit::oracle::PINNED_RELEASE` to {reported} and recapture every artifact \
+         measured against it"
+    )]
+    OraclePinMismatch {
+        /// The release [`PINNED_RELEASE`](crate::oracle::PINNED_RELEASE) declares.
+        pinned: &'static str,
+        /// What the resolved binary said when asked for its own version.
+        reported: String,
+        /// The binary that was resolved and probed.
+        program: PathBuf,
+        /// The variable that overrides discovery, restated so the error is actionable.
+        binary_env: &'static str,
+    },
+
     /// `OC_TESTKIT_ORACLE_FLAVOUR` named something the harness does not implement.
     #[error("unknown oracle flavour {requested:?}; accepted values are {}", accepted.join(", "))]
     UnknownOracleFlavour {

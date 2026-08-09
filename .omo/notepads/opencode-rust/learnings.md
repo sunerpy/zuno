@@ -6068,3 +6068,45 @@ For streaming APIs, route registration and content type are also insufficient.
 The smallest non-vacuous test must observe one semantic frame and one event caused
 through the public mutation path. Sharing the EventService at the composition root
 is what makes that second assertion test the product rather than a private fixture.
+
+## [2026-08-09] Todo 130: a version pin must be checked against a running process, not against another constant
+
+F1's finding B1 was one number doing two jobs. `PINNED_SOURCE_VERSION = "1.18.13"` was
+the version reported to the npm plugin gate — a wire value about the *source tree* this
+port was read from — and it was also being written into the compatibility report's
+`pinned_source_version` as the version the differential was *measured against*, while
+the hard-coded oracle path pointed at 1.18.12. Both statements were individually
+defensible. Together they made every artifact name a build that never ran.
+
+The reusable shape is two named pins with different jobs, and only one of them verified:
+
+- the **executed release** (`oracle::PINNED_RELEASE`), declared once, and refused by
+  `Oracle::discover_pinned()` unless the resolved binary self-reports it;
+- the **source baseline** (the located tree's `package.json`, and
+  `oc_plugin::js::spec::REPORTED_PLUGIN_API_VERSION`), which is a wire value and has no
+  business agreeing with the binary on disk.
+
+The load-bearing detail is what the assertion compares. A test that checks a recorded
+version against another hard-coded version proves two hand-typed strings match — the
+same vacuity class as this project's other eleven seams. The right-hand side has to be
+process output: here `Oracle::reported_version()`, the trimmed first stdout line of
+really executing `--version`. Mutating the constant to the old 1.18.13 fails both the
+unit gate and, one layer up, the report assembly — and the second failure prevents the
+artifact from being *written* rather than written with a wrong claim.
+
+Same principle for a committed capture. Pinning `.omo/fixtures/oracle-openapi-*.json`
+by a sha256 constant would again be two committed values agreeing. Refetching `/doc`
+from the running pinned release and requiring byte-equality is what makes a "recapture"
+a fact instead of a commit-message claim. A one-byte mutation that preserved the file's
+length (`"opencode api"` → `"opencode API"`) proves a length check alone would have
+missed it.
+
+**Declare the release; discover the path.** Hard-coding `…/mise/installs/opencode/X/…`
+pins the harness to one machine's package manager, and the existing `Oracle::discover()`
+already honoured `OC_TESTKIT_ORACLE` then `PATH`. What deserves pinning is the release
+identity, not the route to it.
+
+Also worth reusing: absence and disagreement are different facts and need different
+handling. A machine without `opencode` cannot verify anything, so it skips (loudly). A
+machine with the *wrong* `opencode` will happily produce green artifacts attributing
+their measurements to a build that did not run, so it must be fatal.

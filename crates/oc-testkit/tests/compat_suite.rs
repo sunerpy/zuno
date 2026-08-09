@@ -50,7 +50,7 @@ use std::io::{BufRead as _, BufReader};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -62,16 +62,29 @@ use oc_testkit::{
 
 /// The installed release the whole port is measured against.
 ///
-/// Hard-coded, not discovered, for the same reason `oc-db/tests/schema.rs` does
-/// it: a differential against "whatever `opencode` is on `PATH`" is a differential
-/// against an unknown, and the version gap is then unreportable.
-const ORACLE_BINARY: &str = "/config/.local/share/mise/installs/opencode/1.18.12/opencode";
-
-/// The version this port reports to the npm plugin compatibility gate.
-const PINNED_SOURCE_VERSION: &str = "1.18.13";
+/// Re-exported rather than restated so the report, the DB round-trips and the pin
+/// gate cannot name three different builds. The *path* is discovered by
+/// [`Oracle::discover_pinned`]; only the release is declared. Before plan todo 130
+/// this file hard-coded `…/mise/installs/opencode/1.18.12/opencode` while recording
+/// `1.18.13`, and nothing could fail over the difference.
+const PINNED_RELEASE: &str = oc_testkit::PINNED_RELEASE;
 
 /// The committed capture of the real binary's OpenAPI document.
+///
+/// Recaptured from [`PINNED_RELEASE`] for todo 130 by serving `/doc` under an
+/// isolated XDG world. The bytes are **identical** to the 1.18.12 capture the name
+/// records — 1.18.12, 1.18.13, 1.18.14 and 1.18.15 all emit the same 478,747-byte
+/// document, sha256 `c3a9f94af0c3324d97b482b14c692e810ce7ccac3136319ba46334de972b4cf1`
+/// — so the filename is the capture's provenance, not a claim that the document is
+/// version-specific. That equality is not taken on trust:
+/// [`the_committed_openapi_capture_is_what_the_pinned_release_serves`] refetches
+/// `/doc` from the running release and compares.
 const ORACLE_OPENAPI_FIXTURE: &str = ".omo/fixtures/oracle-openapi-1.18.12.json";
+
+/// Upstream `/api` operations the capture declares. Unchanged from the 1.18.12
+/// capture, because the document is byte-identical across all four installed
+/// releases.
+const UPSTREAM_API_OPERATIONS: usize = 58;
 
 // ---------------------------------------------------------------------------
 // Surface registry
@@ -314,21 +327,45 @@ fn normalizations() -> Vec<Normalization> {
 // Oracle plumbing
 // ---------------------------------------------------------------------------
 
-fn oracle_binary() -> Option<PathBuf> {
-    std::env::var_os("OPENCODE_TEST_BINARY")
-        .map(PathBuf::from)
-        .or_else(|| {
-            Path::new(ORACLE_BINARY)
-                .is_file()
-                .then(|| ORACLE_BINARY.into())
+/// The pinned oracle, resolved once per test process, or `None` when absent.
+///
+/// Absence yields `None` so the skip contract still holds. A binary that resolves
+/// but reports another release **panics here**, on purpose: continuing would
+/// produce a report attributing its measurements to [`PINNED_RELEASE`] while a
+/// different build did the work, which is exactly what was rejected. The remedy is
+/// in the error.
+///
+/// Cached because four tests need it and each resolution executes `--version`.
+fn resolved_oracle() -> Option<&'static ResolvedOracle> {
+    static RESOLVED: OnceLock<Option<ResolvedOracle>> = OnceLock::new();
+    RESOLVED
+        .get_or_init(|| match oc_testkit::Oracle::discover_pinned() {
+            Ok(oracle) => Some(ResolvedOracle {
+                program: oracle.program().to_path_buf(),
+                version: oracle.reported_version().to_owned(),
+            }),
+            Err(oc_testkit::TestkitError::BinaryNotFound { .. }) => None,
+            Err(mismatch) => panic!("{mismatch}"),
         })
+        .as_ref()
 }
 
-fn oracle_version(binary: &Path) -> Option<String> {
-    let output = Command::new(binary).arg("--version").output().ok()?;
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    (!text.is_empty()).then_some(text)
+/// A resolved oracle reduced to the two facts the suite records.
+///
+/// [`oc_testkit::Oracle`] owns a [`oc_testkit::ScriptedEnv`] whose temporary tree is
+/// deleted on drop, so it cannot be cached; the program path and the probed version
+/// can be.
+struct ResolvedOracle {
+    program: PathBuf,
+    version: String,
 }
+
+fn oracle_binary() -> Option<PathBuf> {
+    resolved_oracle().map(|oracle| oracle.program.clone())
+}
+
+/// Restated wherever a test skips, so a reader of the output knows what was wanted.
+const NO_ORACLE: &str = "no opencode on PATH and no OC_TESTKIT_ORACLE override";
 
 /// Runs `opencode db` under an isolated XDG world, which is what makes it create
 /// its database where [`oracle_database`] expects it.
@@ -570,8 +607,8 @@ fn journal_ids(connection: &oc_db::Connection) -> Vec<String> {
 fn db_schema_matches_a_database_the_real_binary_created() {
     let Some(binary) = oracle_binary() else {
         eprintln!(
-            "SKIPPED db_schema_matches_a_database_the_real_binary_created: no opencode binary at \
-             {ORACLE_BINARY}; the SQLite schema was NOT compared"
+            "SKIPPED db_schema_matches_a_database_the_real_binary_created: {NO_ORACLE}; the \
+             SQLite schema was NOT compared"
         );
         return;
     };
@@ -617,8 +654,8 @@ fn db_schema_matches_a_database_the_real_binary_created() {
 fn journal_round_trip_through_the_real_binary_does_not_replay_migrations() {
     let Some(binary) = oracle_binary() else {
         eprintln!(
-            "SKIPPED journal_round_trip_through_the_real_binary_does_not_replay_migrations: no \
-             opencode binary at {ORACLE_BINARY}; the journal round-trip was NOT run"
+            "SKIPPED journal_round_trip_through_the_real_binary_does_not_replay_migrations: \
+             {NO_ORACLE}; the journal round-trip was NOT run"
         );
         return;
     };
@@ -741,8 +778,8 @@ fn oracle_session_list(binary: &Path, root: &Path, database: &Path) -> Output {
 fn a_session_written_by_this_port_is_decodable_by_the_real_binary() {
     let Some(binary) = oracle_binary() else {
         eprintln!(
-            "SKIPPED a_session_written_by_this_port_is_decodable_by_the_real_binary: no opencode \
-             binary at {ORACLE_BINARY}; the session-decode seam was NOT compared"
+            "SKIPPED a_session_written_by_this_port_is_decodable_by_the_real_binary: \
+             {NO_ORACLE}; the session-decode seam was NOT compared"
         );
         return;
     };
@@ -1323,7 +1360,7 @@ fn api_behaviour_matrix_accounts_for_status_body_and_side_effect_per_operation()
         .collect::<BTreeSet<_>>();
     assert_eq!(
         matrix.len(),
-        58,
+        UPSTREAM_API_OPERATIONS,
         "the behaviour matrix must have one row per operation"
     );
     assert_eq!(
@@ -1391,7 +1428,11 @@ async fn api_behaviour_matrix_invokes_every_subject_operation_and_rejects_501() 
             "matrix invoked an operation twice"
         );
     }
-    assert_eq!(invoked.len(), 58, "every upstream operation must run");
+    assert_eq!(
+        invoked.len(),
+        UPSTREAM_API_OPERATIONS,
+        "every upstream operation must run"
+    );
     assert_eq!(unavailable, 45, "the explicit API gap inventory drifted");
     assert_eq!(
         invoked.len() - unavailable,
@@ -1404,7 +1445,7 @@ async fn api_behaviour_matrix_invokes_every_subject_operation_and_rejects_501() 
 async fn api_behaviour_matrix_compares_live_status_body_and_side_effects() {
     let Some(binary) = oracle_binary() else {
         eprintln!(
-            "SKIPPED api_behaviour_matrix_compares_live_status_body_and_side_effects: no opencode binary at {ORACLE_BINARY}"
+            "SKIPPED api_behaviour_matrix_compares_live_status_body_and_side_effects: {NO_ORACLE}"
         );
         return;
     };
@@ -1558,8 +1599,74 @@ async fn api_behaviour_matrix_compares_live_status_body_and_side_effects() {
     ));
     assert_eq!(
         observed.len(),
-        58,
+        UPSTREAM_API_OPERATIONS,
         "the live differential must observe every upstream operation"
+    );
+}
+
+/// Refetch `/doc` from the pinned release and require the committed capture to be
+/// exactly what it serves.
+///
+/// Every `/api` assertion in this suite reads the committed file. A capture taken
+/// from one release and then compared against a differently-versioned binary is a
+/// stale oracle that no other test in this file can detect — it would simply keep
+/// agreeing with itself. This is the test that makes the recapture a fact rather
+/// than a claim in a commit message, and it is why the `1.18.12` in the filename is
+/// harmless: the bytes are re-derived from [`PINNED_RELEASE`] on every run.
+#[tokio::test]
+async fn the_committed_openapi_capture_is_what_the_pinned_release_serves() {
+    let Some(binary) = oracle_binary() else {
+        eprintln!(
+            "SKIPPED the_committed_openapi_capture_is_what_the_pinned_release_serves: \
+             {NO_ORACLE}; the committed capture was NOT re-derived from the pinned release"
+        );
+        return;
+    };
+    let root = tempfile::tempdir().expect("openapi recapture root");
+    let server = start_oracle_server(&binary, root.path());
+    let (status, served) = raw_http(server.addr, "GET", "/doc", None, false).await;
+    assert_eq!(
+        status, 200,
+        "the release must serve its own OpenAPI document"
+    );
+
+    let fixture = oc_testkit::subject::workspace_root()
+        .expect("workspace root")
+        .join(ORACLE_OPENAPI_FIXTURE);
+    let committed = std::fs::read_to_string(&fixture)
+        .unwrap_or_else(|error| panic!("read {}: {error}", fixture.display()));
+
+    assert_eq!(
+        served.len(),
+        committed.len(),
+        "the committed capture is {} bytes but {} serves {} — recapture {} from the pinned \
+         release and restate every count derived from it",
+        committed.len(),
+        PINNED_RELEASE,
+        served.len(),
+        ORACLE_OPENAPI_FIXTURE
+    );
+    assert!(
+        served == committed,
+        "the committed capture is not byte-identical to what {PINNED_RELEASE} serves at /doc, \
+         even though both are {} bytes; the /api assertions in this file are reading a stale \
+         oracle",
+        committed.len()
+    );
+
+    let live: serde_json::Value = serde_json::from_str(&served).expect("the served /doc is JSON");
+    assert_eq!(
+        api_operations(&live).len(),
+        UPSTREAM_API_OPERATIONS,
+        "{PINNED_RELEASE} serves a different number of /api operations than \
+         UPSTREAM_API_OPERATIONS declares; report the delta and update every count that \
+         references it"
+    );
+    eprintln!(
+        "openapi-recapture: {PINNED_RELEASE} served {} bytes at /doc, byte-identical to {}, \
+         declaring {UPSTREAM_API_OPERATIONS} /api operations",
+        served.len(),
+        ORACLE_OPENAPI_FIXTURE
     );
 }
 
@@ -1574,8 +1681,8 @@ fn api_operations_are_a_superset_of_all_upstream_operations() {
     let upstream = api_operations(&document);
     assert_eq!(
         upstream.len(),
-        58,
-        "the committed oracle capture no longer declares 58 /api operations"
+        UPSTREAM_API_OPERATIONS,
+        "the committed oracle capture no longer declares {UPSTREAM_API_OPERATIONS} /api operations"
     );
 
     let generated = oc_server::api::openapi();
@@ -1953,18 +2060,17 @@ fn every_surface_id_is_unique_and_every_verdict_is_explained() {
 
 #[test]
 fn the_suite_emits_a_machine_readable_report() {
-    let binary = oracle_binary();
+    let resolved = resolved_oracle();
     let list = DivergenceList::load().expect("docs/divergences.toml must load");
 
     let surfaces = SURFACES
         .iter()
         .map(|row| {
-            let verdict = match (row.verdict, row.oracle, binary.is_some()) {
+            let verdict = match (row.verdict, row.oracle, resolved.is_some()) {
                 (Verdict::NotCompared, _, _) => Verdict::NotCompared,
                 (verdict, OracleKind::LiveBinary, false) => {
                     eprintln!(
-                        "SKIPPED surface {}: no opencode binary at {ORACLE_BINARY}; recorded as \
-                         skipped rather than compared",
+                        "SKIPPED surface {}: {NO_ORACLE}; recorded as skipped rather than compared",
                         row.id
                     );
                     let _ = verdict;
@@ -1988,10 +2094,10 @@ fn the_suite_emits_a_machine_readable_report() {
         schema_version: SCHEMA_VERSION,
         generated_by: "cargo test -p oc-testkit --test compat_suite",
         oracle: OracleAvailability {
-            available: binary.is_some(),
-            version: binary.as_deref().and_then(oracle_version),
-            path: binary,
-            pinned_source_version: PINNED_SOURCE_VERSION.to_owned(),
+            available: resolved.is_some(),
+            version: resolved.map(|oracle| oracle.version.clone()),
+            path: resolved.map(|oracle| oracle.program.clone()),
+            pinned_source_version: PINNED_RELEASE.to_owned(),
         },
         divergences: DivergenceSummary {
             declared_count: list.len(),
@@ -2009,6 +2115,38 @@ fn the_suite_emits_a_machine_readable_report() {
             || !report.with_verdict(Verdict::Skipped).is_empty(),
         "a report claiming nothing was compared and nothing was skipped is a bug in the suite"
     );
+
+    // The artifact must not claim a build that did not run. `version` is what the
+    // resolved binary printed for `--version`; `pinned_source_version` is what the
+    // artifact tells its readers the comparison was made against. F1's finding B1 was
+    // that these two disagreed — 1.18.13 recorded, 1.18.12 executed — and no gate
+    // could fail over it.
+    if let Some(probed) = report.oracle.version.as_deref() {
+        assert_eq!(
+            probed,
+            report.oracle.pinned_source_version,
+            "the report records pinned_source_version={} while the binary it measured against, \
+             {}, reports {probed}. A reader cannot tell which upstream build the compatibility \
+             claim was measured against, which is what F1 rejected.",
+            report.oracle.pinned_source_version,
+            report
+                .oracle
+                .path
+                .as_deref()
+                .unwrap_or(Path::new("<unknown>"))
+                .display()
+        );
+    } else {
+        assert!(
+            !report.oracle.available,
+            "the report claims an available oracle but recorded no version for it"
+        );
+        eprintln!(
+            "SKIPPED the recorded-version agreement check: {NO_ORACLE}; the report records \
+             pinned_source_version={} with no measured version to compare it to",
+            report.oracle.pinned_source_version
+        );
+    }
 
     let destination = CompatReport::destination().expect("resolve the report destination");
     report.write(&destination).expect("write the report");
