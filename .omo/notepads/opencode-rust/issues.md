@@ -5894,3 +5894,21 @@ by simply *using the product across the boundary the README promises.*
 
 Nine seams were found during execution. The Final Wave found a tenth, and eleven more blockers.
 **Every one was invisible to a green suite.**
+
+## [2026-08-09] Todo 118 closeout — remaining API gaps are now explicit, not stubs
+
+The two SSE operations from final-wave finding #4 are served and behaviour-tested;
+the upstream operation set is now 58/58. This does **not** mean 58/58 behavioural
+parity: only 13 operations have local backends, five deterministic operations are
+exact live differentials, and 45 operations explicitly return
+`503 backend_unavailable`. The matrix invokes every operation against both
+processes and records a reason on all three dimensions for each non-exact row.
+
+Remaining work is capability implementation for those 45 explicit backend gaps and
+better deterministic cross-process fixtures for eight backed-but-exempt operations.
+They are deliberately visible in the generated compatibility matrix and in
+`.omo/evidence/task-118-opencode-rust.txt`; no 501 or route-only claim remains.
+
+Tool limitation: MCP `lsp_diagnostics` is rooted at the main checkout and cannot
+open sibling worktree `t118`. Direct `rust-analyzer diagnostics . --severity warning`
+from the task worktree used the same engine and completed without diagnostics.

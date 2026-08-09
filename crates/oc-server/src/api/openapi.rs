@@ -3,6 +3,7 @@ use serde_json::{Map, Value, json};
 pub const OPERATIONS: &[(&str, &str)] = &[
     ("/api/health", "get"),
     ("/api/location", "get"),
+    ("/api/event", "get"),
     ("/api/agent", "get"),
     ("/api/model", "get"),
     ("/api/command", "get"),
@@ -55,6 +56,7 @@ pub const OPERATIONS: &[(&str, &str)] = &[
     ("/api/session/prune", "post"),
     ("/api/session/active", "get"),
     ("/api/session/{sessionID}", "get"),
+    ("/api/session/{sessionID}/event", "get"),
     ("/api/session/{sessionID}/agent", "post"),
     ("/api/session/{sessionID}/model", "post"),
     ("/api/session/{sessionID}/prompt", "post"),
@@ -84,7 +86,7 @@ pub fn document() -> Value {
                     "operationId": operation_id(method, path),
                     "responses": {
                         "200": {"description": "Success"},
-                        "501": {"description": "Known operation without a local backend"}
+                        "503": {"description": "Operation is known but its local backend is explicitly unavailable"}
                     }
                 }),
             );

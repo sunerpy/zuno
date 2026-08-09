@@ -73,6 +73,7 @@ pub struct StreamEvent {
     pub(super) cursor: EventCursor,
     pub(super) id: String,
     pub(super) event_type: String,
+    pub(super) version: u32,
     pub(super) properties: Map<String, Value>,
 }
 

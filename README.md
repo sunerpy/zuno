@@ -23,7 +23,7 @@ or lie to an operator. It is a declared divergence
 
 | page | what it answers |
 |---|---|
-| [docs/compatibility-matrix.md](docs/compatibility-matrix.md) | every surface's state: implemented, 501 stub, added, rejected, not-registered |
+| [docs/compatibility-matrix.md](docs/compatibility-matrix.md) | every surface's state: implemented, explicit 503 gap, added, rejected, not-registered |
 | [docs/divergences.md](docs/divergences.md) | the seven deliberate differences, each with its reason |
 | [docs/rejected-inputs.md](docs/rejected-inputs.md) | every deprecated config form, its replacement, and the exact error message |
 | [docs/migration.md](docs/migration.md) | opening an existing database, the channel-database rule, the 38 migrations |
@@ -85,12 +85,16 @@ symptom is an empty session list. Use `OPENCODE_DISABLE_CHANNEL_DB=1` or point
 `OPENCODE_DB` at the file you mean. Details and the full precedence order:
 [docs/migration.md](docs/migration.md#the-channel-database).
 
-**2. `/api/event` returns 404.** The upstream SSE streams `/api/event` and
-`/api/session/{sessionID}/event` are not registered. An equivalent stream is
-served at `/event`, so the capability exists and the upstream paths do not. This
-is a gap, not a decision, and the compatibility suite asserts the set of absent
-operations is *exactly* those two so a third absence fails rather than widening
-silently.
+**2. Event subscriptions use SSE.** `/api/event` immediately emits
+`server.connected` and then live events; `/api/session/{sessionID}/event` replays
+durable events after `?after=<sequence>` and continues live. The older `/event`
+cursor stream remains available for compatibility. Slow subscribers stay bounded
+and receive an explicit lag diagnostic rather than growing memory.
+
+The API differential invokes all 58 upstream operations against both binaries.
+Thirteen currently have local backends; the other 45 return an operation-specific
+`503 backend_unavailable` and remain reported as compatibility gaps. A registered
+`501` can never satisfy the matrix.
 
 **3. An old install needs a migration you should know about.** A database
 predating the `migration` table carries a `__drizzle_migrations` journal instead.

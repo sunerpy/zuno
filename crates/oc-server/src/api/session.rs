@@ -6,6 +6,7 @@ use oc_db::session::{ListQuery, Session, SessionCreate, SortDirection};
 use oc_paths::GLOBAL_PROJECT_ID;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use uuid::Uuid;
 
 use super::Data;
@@ -76,9 +77,7 @@ pub struct SessionTime {
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct SessionCursor {
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub previous: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
 }
 
@@ -199,7 +198,20 @@ pub async fn create(
     );
     create.agent = input.agent;
     let session = state.sessions().create(&create)?.into_session();
-    Ok(Json(Data::new(SessionInfo::from(session))))
+    let info = SessionInfo::from(session);
+    if let Some(events) = state.events() {
+        let properties = json!({"sessionID": id, "info": &info})
+            .as_object()
+            .expect("the session-created payload is an object")
+            .clone();
+        events
+            .publish(
+                &info.id,
+                crate::NewEvent::new("session.created", properties)?,
+            )
+            .await?;
+    }
+    Ok(Json(Data::new(info)))
 }
 
 pub async fn active(Extension(services): Extension<ServerServices>) -> Json<SessionActiveResponse> {

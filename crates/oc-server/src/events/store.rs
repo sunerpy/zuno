@@ -7,8 +7,6 @@ use serde_json::{Map, Value};
 
 use super::{EventCursor, EventStreamError, NewEvent, StreamEvent};
 
-const AGGREGATE_PREFIX: &str = "sse:";
-
 pub(super) struct Store {
     pool: Arc<Pool>,
     subscriber_capacity: usize,
@@ -46,9 +44,10 @@ impl Store {
         event: NewEvent,
     ) -> Result<StreamEvent, EventStreamError> {
         self.ensure_initialized()?;
-        let aggregate_id = aggregate_id(session_id);
+        let aggregate_id = session_id.to_owned();
         let id = format!("evt_{}", uuid::Uuid::now_v7().simple());
         let data = serde_json::to_string(&event.properties)?;
+        let stored_type = format!("{}.1", event.event_type);
         let sequence = self.pool.transaction(|transaction| {
             let latest = latest_sequence(transaction, &aggregate_id)?;
             let sequence = latest.checked_add(1).ok_or_else(|| DbError::Query {
@@ -69,7 +68,7 @@ impl Store {
                         id,
                         aggregate_id,
                         sequence,
-                        event.event_type,
+                        stored_type,
                         data
                     ],
                 )
@@ -83,6 +82,7 @@ impl Store {
             },
             id,
             event_type: event.event_type,
+            version: 1,
             properties: event.properties,
         })
     }
@@ -101,7 +101,7 @@ impl Store {
         after: Option<i64>,
     ) -> Result<Snapshot, EventStreamError> {
         self.ensure_initialized()?;
-        let aggregate_id = aggregate_id(session_id);
+        let aggregate_id = session_id.to_owned();
         let after = after.unwrap_or(-1);
         let (boundary, rows) =
             self.pool
@@ -167,17 +167,24 @@ fn decode_row(session_id: &str, row: StoredRow) -> Result<StreamEvent, EventStre
             source,
         }
     })?;
+    let (event_type, version) = row
+        .event_type
+        .rsplit_once('.')
+        .and_then(|(event_type, version)| {
+            version
+                .parse::<u32>()
+                .ok()
+                .map(|version| (event_type.to_owned(), version))
+        })
+        .unwrap_or((row.event_type, 1));
     Ok(StreamEvent {
         cursor: EventCursor {
             session_id: session_id.to_owned(),
             sequence: row.sequence,
         },
         id: row.id,
-        event_type: row.event_type,
+        event_type,
+        version,
         properties,
     })
-}
-
-fn aggregate_id(session_id: &str) -> String {
-    format!("{AGGREGATE_PREFIX}{session_id}")
 }

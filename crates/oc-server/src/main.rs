@@ -48,7 +48,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .with_port(port)
                 .with_auth(AuthConfig::from_env())
                 .with_default_directory(&directory);
-            let state = ApiState::open_default(directory)?;
+            let state = ApiState::open_default(directory)?.with_events(events.clone());
             let server = ServerBuilder::new(config)
                 .with_routes(
                     api::router(state)

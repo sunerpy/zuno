@@ -15,7 +15,7 @@
 //! |---|---|
 //! | `divergence-index`, `divergence-detail` | [`oc_testkit::DivergenceList`] over `docs/divergences.toml`, cross-checked against [`oc_testkit::divergence::DECLARED_COUNT`] |
 //! | `cli-disposition` | [`oc_cli::dispositions`] — the same table `oc-cli/tests/surface.rs` asserts against the registered `clap` tree |
-//! | `api-operations` | the served document from [`oc_server::api::openapi`] set-differenced against the committed 1.18.12 oracle capture, then **probed route by route** for a `501` stub |
+//! | `api-operations` | the served document from [`oc_server::api::openapi`] set-differenced against the committed 1.18.12 oracle capture, then **probed route by route** for an explicit `503 backend_unavailable` gap; any `501` fails the gate |
 //! | `v1-routes` | [`oc_server::V1_SURFACE`] |
 //! | `rejected-inputs` | messages *rendered by* [`oc_config::legacy`]'s detectors, so a reworded message fails |
 //! | `plugin-hooks` | [`oc_plugin::HookName::ALL`] |
@@ -37,6 +37,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
@@ -385,20 +386,26 @@ fn concrete_uri(path: &str) -> String {
         .join("/")
 }
 
-/// Whether each served operation answers `501 Not Implemented`.
+/// Which served operations explicitly report an unavailable backend.
 ///
 /// This is the difference between "the route exists" and "the route does
 /// something", and it is the difference the plan's "must not document a
 /// capability that has no passing test" turns on. Measured by driving the real
-/// router rather than by reading the registration code, so a stub that gains a
+/// router rather than by reading the registration code, so a gap that gains a
 /// handler is reclassified automatically.
-async fn probe_stubs(served: &BTreeSet<(String, String)>) -> BTreeSet<(String, String)> {
-    let state = ApiState::memory("/repo").expect("in-memory API state");
+async fn probe_gaps(served: &BTreeSet<(String, String)>) -> BTreeSet<(String, String)> {
+    let pool = Arc::new(
+        oc_db::Pool::open(&oc_paths::DbLocation::Memory).expect("in-memory event database"),
+    );
+    let events = oc_server::EventService::new(pool, 8);
+    let state = ApiState::memory("/repo")
+        .expect("in-memory API state")
+        .with_events(events.clone());
     let app: Router = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
-        .with_routes(api::router(state))
+        .with_routes(api::router(state).merge(oc_server::events_router(events)))
         .router();
 
-    let mut stubs = BTreeSet::new();
+    let mut gaps = BTreeSet::new();
     for (path, method) in served {
         let verb = Method::from_bytes(method.to_uppercase().as_bytes()).expect("known HTTP verb");
         let request = Request::builder()
@@ -411,26 +418,31 @@ async fn probe_stubs(served: &BTreeSet<(String, String)>) -> BTreeSet<(String, S
             .oneshot(request)
             .await
             .expect("the router answers every registered route");
-        if response.status() == StatusCode::NOT_IMPLEMENTED {
-            stubs.insert((path.clone(), method.clone()));
+        assert_ne!(
+            response.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "{method} {path} is a registered 501 stub, not an implemented operation or explicit gap"
+        );
+        if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+            gaps.insert((path.clone(), method.clone()));
         }
     }
-    stubs
+    gaps
 }
 
 fn api_block(
     upstream: &BTreeSet<(String, String)>,
     served: &BTreeSet<(String, String)>,
-    stubs: &BTreeSet<(String, String)>,
+    gaps: &BTreeSet<(String, String)>,
 ) -> String {
     let mut rows: BTreeMap<(String, String), &'static str> = BTreeMap::new();
     for operation in upstream.union(served) {
         let state = match (
             upstream.contains(operation),
             served.contains(operation),
-            stubs.contains(operation),
+            gaps.contains(operation),
         ) {
-            (_, true, true) => "registered (501 stub)",
+            (_, true, true) => "explicit gap (503 backend unavailable)",
             (true, true, false) => "implemented",
             (false, true, false) => "added",
             (true, false, _) => "not-registered",
@@ -449,7 +461,7 @@ fn api_block(
 fn assert_api_counts(
     upstream: &BTreeSet<(String, String)>,
     served: &BTreeSet<(String, String)>,
-    stubs: &BTreeSet<(String, String)>,
+    gaps: &BTreeSet<(String, String)>,
 ) {
     let missing = upstream.difference(served).count();
     let added = served.difference(upstream).count();
@@ -462,7 +474,7 @@ fn assert_api_counts(
                 upstream.len()
             ),
             &format!("{added} operation"),
-            &format!("{} registered as a 501 stub", stubs.len()),
+            &format!("{} explicit 503 backend gaps", gaps.len()),
         ],
     );
 }
@@ -497,21 +509,21 @@ fn docs_compatibility_matrix_matches_every_code_table() {
 
     let upstream = oracle_api_operations();
     let served = api_operations(&oc_server::api::openapi());
-    let stubs = tokio::runtime::Builder::new_current_thread()
+    let gaps = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("probe runtime")
-        .block_on(probe_stubs(&served));
+        .block_on(probe_gaps(&served));
     check_block(
         PAGE,
         "api-operations",
-        &api_block(&upstream, &served, &stubs),
+        &api_block(&upstream, &served, &gaps),
     );
 
     check_block(PAGE, "v1-routes", &v1_block());
 
     assert_cli_disposition_counts();
-    assert_api_counts(&upstream, &served, &stubs);
+    assert_api_counts(&upstream, &served, &gaps);
     contains_all(PAGE, &[&format!("{} v1 route", V1_SURFACE.len())]);
     contains_all(PAGE, &oc_agent::reflection::NEGATIVE_LEARNING_LIST);
 }

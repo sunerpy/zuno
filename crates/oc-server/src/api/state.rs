@@ -7,12 +7,15 @@ use oc_error::DbError;
 use oc_paths::{DbLocation, GLOBAL_PROJECT_ID};
 use oc_pty::PtyService;
 
+use crate::EventService;
+
 #[derive(Clone, Debug)]
 pub struct ApiState {
     pool: Arc<Pool>,
     pty: PtyService,
     directory: Arc<str>,
     artifact_paths: ArtifactGcPaths,
+    events: Option<EventService>,
 }
 
 impl ApiState {
@@ -78,7 +81,14 @@ impl ApiState {
             directory: Arc::from(directory),
             pool: Arc::new(pool),
             artifact_paths,
+            events: None,
         })
+    }
+
+    #[must_use]
+    pub fn with_events(mut self, events: EventService) -> Self {
+        self.events = Some(events);
+        self
     }
 
     #[must_use]
@@ -94,6 +104,10 @@ impl ApiState {
     #[must_use]
     pub fn directory(&self) -> &str {
         &self.directory
+    }
+
+    pub(super) fn events(&self) -> Option<&EventService> {
+        self.events.as_ref()
     }
 
     pub(super) fn pool(&self) -> &Pool {

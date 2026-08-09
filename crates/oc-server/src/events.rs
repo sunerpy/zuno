@@ -24,6 +24,7 @@ const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 pub struct EventService {
     store: Arc<Store>,
     fanouts: Arc<Mutex<HashMap<String, EventFanout<StreamEvent>>>>,
+    global: EventFanout<StreamEvent>,
     heartbeat_interval: Duration,
 }
 
@@ -34,6 +35,7 @@ impl EventService {
         Self {
             store: Arc::new(Store::new(pool, subscriber_capacity.max(1))),
             fanouts: Arc::new(Mutex::new(HashMap::new())),
+            global: EventFanout::with_capacity(subscriber_capacity),
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
         }
     }
@@ -60,6 +62,7 @@ impl EventService {
         .await
         .map_err(|source| EventStreamError::Worker { source })??;
         self.fanout(&session_id).publish(stored.clone());
+        self.global.publish(stored.clone());
         Ok(stored)
     }
 
@@ -105,6 +108,10 @@ impl EventService {
             .entry(session_id.to_owned())
             .or_insert_with(|| EventFanout::with_capacity(self.store.subscriber_capacity()))
             .clone()
+    }
+
+    fn subscribe_global(&self) -> EventSubscription<StreamEvent> {
+        self.global.subscribe()
     }
 
     fn lock_fanouts(&self) -> MutexGuard<'_, HashMap<String, EventFanout<StreamEvent>>> {
