@@ -6398,3 +6398,47 @@ contradictions). F1's position is exactly right and worth quoting:
 > F1 cannot silently rewrite the frozen criterion."
 
 **An auditor cannot amend the contract it audits.** Neither can I, on the plan owner's behalf.
+
+## [2026-08-09] 我把带冲突标记的代码提交进了 main —— 以及 premerge.sh 的真实缺陷
+
+### 险情
+
+合并 task-127 时，`premerge.sh` 报了三个冲突文件，其中包含 **`crates/oc-testkit/tests/compat_suite.rs`**。
+我的自动解决脚本只处理 `.omo/notepads/*.md` 与 `plans/*.md`，却紧接着无条件执行了
+`git add -A && git commit`——**于是带 `<<<<<<<` 标记的 Rust 源码进了 `main`**。
+
+抓到它的不是测试，是我提交后顺手看 `git show --stat`，发现 commit message 里 git 自己列出了
+`# Conflicts:` 段。立刻 `git reset --hard` 回退，确认 `main` 无标记、锁可解析，然后手工重做。
+
+**根因是我自己的脚本**：`premerge.sh` 先合并再验证，所以一旦冲突解决不完整，`main` 就已经脏了。
+第 36 波我就记过这个问题（"worth hardening the script eventually: gate on a scratch ref before
+touching main"），当时没改——这次它咬了我。
+
+### 手工解决暴露的四类真实冲突（自动脚本都处理不了）
+
+| 文件 | 冲突性质 | 正确解法 |
+|---|---|---|
+| `oc-server/Cargo.toml` | 127 加 `oc-auth`，128 加 `hyper`/`hyper-util` | **两侧都要** |
+| `api/mod.rs` | 各自删掉自己那批 `unsupported` 行、各自加路由 | 保留两侧路由，**再手工从 `unsupported_routes()` 删掉 22 条**——git 把两侧的删除都"恢复"了，导致路由重复注册 |
+| `compat_suite.rs` 计数 | 127 说 33 缺口，128 说 35 | **都不对**：实测 23。必须跑测试读真值 |
+| `compat_suite.rs` 调用点 | 我取了 HEAD 侧，丢掉 128 的 `compare_selected_api_dimensions` 调用 | clippy 的 `never used` 警告救了我——**那 10 个操作的维度比较根本没在跑** |
+
+最后一条最危险：如果 clippy 没报 dead_code，我会合并一个"实现了但从不比较"的假绿。**一个没有调用点的
+测试辅助函数，和一个空转的测试是同一种谎言。**
+
+### 跨分支夹具碰撞：第 8 次"测试替身比现实更友善"
+
+127 的 `api_unbacked_endpoint_is_an_explicit_gap_not_a_501_compatibility_claim` 挑了
+`/api/permission/saved` 当"仍未实现"的样本——而 128 正好实现了它。测试失败在
+`left: 200, right: 503`。
+
+这个测试的样本已经被迫搬了两次（`/api/integration` → `/api/permission/saved` → `/interrupt`）。
+我在注释里写明了它还得再搬一次，**并且一旦 `unsupported_routes()` 空了，它应该改成断言"该函数为空"**
+——那才是不会随实现进度腐坏的断言形式。
+
+### 规则
+
+- **`premerge.sh` 必须在临时 ref 上先验证再动 `main`。** 已知缺陷，第二次咬人，下一波必须修。
+- **自动冲突解决只对 append-only 文本安全。** 代码冲突必须人工，且解决后必须重跑测试读真值——两侧的
+  数字都可能是错的。
+- **一个"当前仍未实现"的样本会随进度腐坏。** 断言应该指向不变量（"该集合为空"），而不是某个具体成员。
