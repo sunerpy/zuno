@@ -2764,6 +2764,7 @@ dependencies = [
 name = "oc-process"
 version = "0.1.0"
 dependencies = [
+ "portable-pty",
  "process-wrap",
  "rustix 1.1.4",
  "signal-hook 0.4.1",
