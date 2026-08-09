@@ -1872,3 +1872,67 @@ key, converging byte-identity fixture, toy channel, a PTY fixture that only slee
 round-trip test that checks the wrong table.
 
 worktrees: oc-wt/t{115,116,117,118,120,121}
+
+## Wave 41 (2026-08-09): seven of eight remediation todos merged — 3258 tests
+
+`main` = `d732123`, **3258 tests**, 0 clippy, fmt clean, lock reproducible offline.
+120/126 done. Only **122** (the re-measurement) and **F1-F4** remain.
+
+### SEAM #10 is closed, verified end to end by me
+
+```
+rust-turn-exit=0
+TS-exit=0        <- was 1 with "Expected string, got undefined"
+{"id":"m","providerID":"lq"}
+```
+The released 1.18.12 binary now lists a Rust-written session. `variant` is correctly omitted:
+upstream's schema marks it `optional`, and **197 of 5,978** real rows omit it. Reverting to
+`modelID` fails `a_persisted_session_names_its_model_id_the_way_upstream_reads_it`.
+
+### `export` implemented, and canonically identical to upstream
+
+61,455 bytes from both binaries. A naive `cmp` differs at byte 70 — **JSON key ordering only**;
+canonicalised, both sides are 58,011 bytes and **identical**. It also found a *second* liar,
+`completion`, and the structural test dispatches real argv rather than comparing two tables.
+Emptying `PENDING_COMMANDS` fails two tests.
+
+### The vacuous G5 gate is fixed — F2's exact mutation now fails
+
+Replacing `self.sender.send(event).await` with a constructed-and-dropped future previously left
+the gate green. Now: `engine_turn_events_apply_backpressure ... FAILED`. The registry still
+rejects an undeclared channel, and the 17+2+0 accounting is unchanged.
+
+### PTY containment fixed without losing containment
+
+`guarded_pty_payload_can_read_from_the_terminal` and `terminal_ctrl_c_reaches_the_guarded_payload`
+both **fail** when the `tcsetpgrp` handshake is removed, while both reaping tests still pass —
+so the fix is load-bearing *and* the tree stays killable. Windows honestly marked NOT EXECUTED.
+
+### `/api/event` streams
+
+`HTTP/1.1 200`, `content-type: text/event-stream`, and
+`data: {"data":{},"id":"evt_…","type":"server.connected"}`. 58 of 58 upstream operations served,
+plus the 2 declared C8 ops.
+
+### `theme` was the config blocker
+
+One key, rejected by our schema, accepted by upstream — `debug config` now exits 0 on the user's
+real file, as does the released binary. Validation was *narrowed*: a bogus key is still rejected
+and now **named**, which is better than before.
+
+### 119: 8 → 12 divergences, and it corrected me
+
+It declared four nominations, merged two, and **rejected one of my criteria with evidence**:
+`subpath-matches-literally` is not a divergence, because upstream's un-escaped `LIKE` lives on
+the *legacy* `/session?path=` endpoint this port does not serve, and the v2 surface does no path
+filtering at all. It merged it rather than deleting it.
+
+Its inverted gate is real: removing an entry **and lowering `DECLARED_COUNT` in step** still
+fires two assertions naming the missing entry. It also found `MINIMUM_CRATES = 34` was a
+**floor** — structurally unable to notice an addition, the same shape as the defect it was
+guarding. Roster now set-differenced both ways; my throwaway crate failed it.
+
+Eleven stale counts corrected, not the two I named — including **five** separate "61 `/api`"
+claims, one inside a frozen success criterion.
+
+worktree: oc-wt/t122 (the ~100-minute re-measurement, must run alone)
