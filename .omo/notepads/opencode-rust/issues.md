@@ -6230,3 +6230,61 @@ the shared `oc-pty` test helper. All now have local reasons. The prohibited froz
 exception whose rationale lives in the scanner. The new
 `every_first_party_lint_suppression_has_a_reason` test scans all crate Rust files,
 failed red on those four gaps, and passed green after the reasons were added.
+
+## [2026-08-09] G2 REGRESSED to FAIL — and the gate caught it a fourth time
+
+Todo 122 re-measured the frozen gate after the eight remediation todos. **Recomputed by me from
+the raw per-sample data; all four medians reproduce exactly.**
+
+| gate | Rust median | ceiling | vs committed | vs paired TS | verdict |
+|---|---|---|---|---|---|
+| G1 W-idle | 19,940 KiB | 477,120 | **0.0209** | 0.0201 | **PASS** |
+| G2 W-real | **1,527,188 KiB** | 1,513,496 | **0.5045** | **0.4914** | **FAIL** |
+
+Over the ceiling by **13,692 KiB — 0.905%**.
+
+### The nuance that matters
+
+Against the **paired** TypeScript measured in the same interleaved run, the ratio is
+**0.4914 — under 0.50**. It fails only against the **committed frozen baseline**, because this
+run's paired TS came in 2.67% *higher* (3,107,692 vs 3,026,992). The frozen formula uses the
+committed baseline, so the verdict is **FAIL** — and that is correct: a baseline you re-measure
+alongside your subject is not a baseline, it is a moving target. But a reader deserves both
+numbers.
+
+### The diagnosis is in the distribution, not in the median
+
+Sorted W-real peaks:
+```
+1,493,916   1,494,048   |   1,527,188   |   1,657,244   1,658,468
+```
+Two tight clusters **~163,874 KiB apart**. Todo 113's passing median was 1,494,236 — within
+**320 KiB** of the low cluster. So the low cluster is the pre-existing behaviour and the ~164 MiB
+step is **new and intermittent**, appearing in 3 of 5 runs. Structured and repeatable, not noise.
+
+**One hypothesis eliminated by me**: `pids_at_peak == 1` on every run, so the new `oc-process`
+guard/monitor processes are *not* inflating the whole-tree total in this workload. My candidate
+for todo 123 to check first, unverified: todo 118 wired an `EventService` shared with `ApiState`,
+and W-real emits ~3,620 parts' worth of events — a retained broadcast buffer is the right order
+of magnitude.
+
+### The pass was always fragile, and I recorded that
+
+Todo 113's margin was **1.27%**; I wrote at the time that it "will flip to FAIL on a materially
+larger session, and the ceiling does not scale with the subject." It flipped on a slightly
+larger *binary* instead. **A margin narrower than the run-to-run spread is a coin flip, not a
+pass** — todo 123's acceptance criteria now demand the margin exceed the spread, which the
+original G2 pass never did (its spread was ~165 MB against a 19 MB margin).
+
+### Fourth time this gate has exposed a real defect by refusing to fake a number
+
+Six failed attempts in todo 88 found three product defects; now a completed measurement found a
+regression that 3,259 passing tests, 0 clippy warnings and a green `make ci` all missed —
+**because the gate is opt-in and CI never runs it.** That trade is defensible for a 100-minute
+test, but it means the memory claim is only ever as current as the last manual run.
+
+### My own error, now closed
+
+The reason this re-measurement was needed at all is that I gitignored `.omo/evidence/` while five
+files had been force-added, so todos 113 and 114 wrote their artefacts into worktrees I later
+deleted. Cost: one ~2h17m re-measurement. The artefact is now tracked and verified tracked.
