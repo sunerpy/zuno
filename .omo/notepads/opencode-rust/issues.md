@@ -5894,3 +5894,10 @@ by simply *using the product across the boundary the README promises.*
 
 Nine seams were found during execution. The Final Wave found a tenth, and eleven more blockers.
 **Every one was invisible to a green suite.**
+
+## Task 121 — PTY foreground handoff and Windows Job cleanup
+
+- The guard still puts every Unix payload into its own process group, preserving the group-kill boundary measured by G6. When the monitor detects that its supervisor owns an inherited controlling terminal's foreground group, the new `exec-foreground` handshake stops immediately after `setpgid`; the monitor waits for that stop, transfers the terminal foreground group with `tcsetpgrp`, then resumes the payload. Ordinary non-terminal pipe launches keep the original path.
+- The new real-PTY read test failed before the fix after five seconds with output exactly `"hello\r\n"`; after the handoff it exits successfully and includes `READ:hello`. The terminal Ctrl-C test failed before the fix with `"READY\r\n^C"` and guard status 1; after the fix the foreground payload receives SIGINT, prints `INTERRUPTED`, and preserves its trap exit status 42.
+- `process-wrap` remains pinned at `=9.0.1`. On Windows, observing top-level exit now explicitly calls `start_kill()` on the Job Object and then `wait()`, terminating and waiting for any live descendants before returning the saved top-level status. A `cfg(windows)` natural-parent-exit/live-grandchild test was added. This Linux machine did not execute that test; no Windows runtime pass is claimed.
+- Post-fix G6 targeted reaping passed both clean shutdown and parent `SIGKILL` (2/2), with the existing assertions observing no owned PID left behind. Full offline workspace tests, zero-warning clippy, fmt check, and locked offline metadata all passed. The sibling-worktree path was rejected by the `lsp_diagnostics` MCP root guard; `rust-analyzer diagnostics . --severity warning` ran in `t121` and returned clean instead.

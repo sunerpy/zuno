@@ -30,6 +30,7 @@ fn run() -> io::Result<()> {
     match mode.as_str() {
         "parent" => parent(Path::new(&ready), stop.as_deref().map(Path::new)),
         "payload" => payload(Path::new(&ready)),
+        "exiting-payload" => exiting_payload(Path::new(&ready)),
         "grandchild" => grandchild(),
         _ => Err(io::Error::other("invalid fixture mode")),
     }
@@ -74,6 +75,18 @@ fn payload(ready: &Path) -> io::Result<()> {
     loop {
         std::thread::sleep(Duration::from_secs(60));
     }
+}
+
+fn exiting_payload(ready: &Path) -> io::Result<()> {
+    let executable = std::env::current_exe()?;
+    let child = Command::new(executable)
+        .arg("grandchild")
+        .arg(ready)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    std::fs::write(ready, child.id().to_string())
 }
 
 fn grandchild() -> io::Result<()> {

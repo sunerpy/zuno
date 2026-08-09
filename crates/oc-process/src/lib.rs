@@ -11,6 +11,7 @@ const GUARD_MARKER: &str = "__oc_child_guard";
 const SUPERVISE_MODE: &str = "supervise";
 const MONITOR_MODE: &str = "monitor";
 const EXEC_MODE: &str = "exec";
+const EXEC_FOREGROUND_MODE: &str = "exec-foreground";
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 static GUARD_EXECUTABLE: OnceLock<PathBuf> = OnceLock::new();
 
@@ -89,6 +90,7 @@ fn parse_guard(arguments: &[OsString]) -> io::Result<GuardRequest> {
         Some(SUPERVISE_MODE) => SUPERVISE_MODE,
         Some(MONITOR_MODE) => MONITOR_MODE,
         Some(EXEC_MODE) => EXEC_MODE,
+        Some(EXEC_FOREGROUND_MODE) => EXEC_FOREGROUND_MODE,
         _ => return Err(io::Error::other("invalid child-process guard mode")),
     };
     let expected_parent = arguments
@@ -116,7 +118,7 @@ fn run_guard(request: GuardRequest) -> io::Result<ExitStatus> {
     match request.mode {
         SUPERVISE_MODE => supervise(request),
         MONITOR_MODE => monitor(request),
-        EXEC_MODE => exec_guarded(request),
+        EXEC_MODE | EXEC_FOREGROUND_MODE => exec_guarded(request),
         _ => unreachable!("guard mode was validated while parsing"),
     }
 }
@@ -171,10 +173,15 @@ fn monitor(request: GuardRequest) -> io::Result<ExitStatus> {
         ));
     }
 
+    let transfer_foreground = terminal_foreground_is(request.expected_parent)?;
     let executable = std::env::current_exe()?;
     let mut child = Command::new(executable)
         .arg(GUARD_MARKER)
-        .arg(EXEC_MODE)
+        .arg(if transfer_foreground {
+            EXEC_FOREGROUND_MODE
+        } else {
+            EXEC_MODE
+        })
         .arg(std::process::id().to_string())
         .arg("--")
         .arg(&request.program)
@@ -184,6 +191,11 @@ fn monitor(request: GuardRequest) -> io::Result<ExitStatus> {
         .stderr(Stdio::inherit())
         .spawn()?;
     let child_pid = child.id();
+    if transfer_foreground && let Err(error) = transfer_terminal_foreground(child_pid) {
+        terminate_process_group(child_pid);
+        let _status = child.wait();
+        return Err(error);
+    }
 
     loop {
         if let Some(status) = child.try_wait()? {
@@ -212,6 +224,9 @@ fn exec_guarded(request: GuardRequest) -> io::Result<ExitStatus> {
         ));
     }
     rustix::process::setpgid(None, None)?;
+    if request.mode == EXEC_FOREGROUND_MODE {
+        rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::STOP)?;
+    }
     let error = Command::new(request.program).args(request.arguments).exec();
     Err(error)
 }
@@ -235,6 +250,35 @@ fn termination_flag() -> io::Result<std::sync::Arc<std::sync::atomic::AtomicBool
 #[cfg(unix)]
 fn parent_pid() -> Option<u32> {
     rustix::process::getppid().map(|pid| pid.as_raw_nonzero().get() as u32)
+}
+
+#[cfg(unix)]
+fn terminal_foreground_is(process_group: u32) -> io::Result<bool> {
+    use std::io::IsTerminal as _;
+
+    if !std::io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    let process_group = rustix::process::Pid::from_raw(process_group as i32)
+        .ok_or_else(|| io::Error::other("terminal foreground process group is invalid"))?;
+    Ok(rustix::termios::tcgetpgrp(std::io::stdin())? == process_group)
+}
+
+#[cfg(unix)]
+fn transfer_terminal_foreground(child_pid: u32) -> io::Result<()> {
+    let child_pid = rustix::process::Pid::from_raw(child_pid as i32)
+        .ok_or_else(|| io::Error::other("guarded child PID is invalid"))?;
+    let (_, status) =
+        rustix::process::waitpid(Some(child_pid), rustix::process::WaitOptions::UNTRACED)?
+            .ok_or_else(|| io::Error::other("guarded child did not stop for terminal handoff"))?;
+    if !status.stopped() {
+        return Err(io::Error::other(format!(
+            "guarded child exited before terminal handoff: {status:?}"
+        )));
+    }
+    rustix::termios::tcsetpgrp(std::io::stdin(), child_pid)?;
+    rustix::process::kill_process(child_pid, rustix::process::Signal::CONT)?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -266,6 +310,10 @@ fn supervise(request: GuardRequest) -> io::Result<ExitStatus> {
     let mut child = command.spawn()?;
     loop {
         if let Some(status) = child.try_wait()? {
+            // process-wrap 9.0.1's std JobObject is not kill-on-close. The
+            // top-level process may be gone while descendants still own the job.
+            child.start_kill()?;
+            let _reaped_status = child.wait()?;
             return Ok(status);
         }
         if !windows_process_exists(request.expected_parent) {
