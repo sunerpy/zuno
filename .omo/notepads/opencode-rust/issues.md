@@ -6442,3 +6442,55 @@ touching main"），当时没改——这次它咬了我。
 - **自动冲突解决只对 append-only 文本安全。** 代码冲突必须人工，且解决后必须重跑测试读真值——两侧的
   数字都可能是错的。
 - **一个"当前仍未实现"的样本会随进度腐坏。** 断言应该指向不变量（"该集合为空"），而不是某个具体成员。
+
+## [2026-08-09] 第三轮 Final Wave：4/4 REJECT，但收敛到一个共同根源
+
+报告：`.omo/evidence/F{1,2,3,4}-REPORT-wave3.md`。**三轮的既有阻塞项全部由提出者本人确认关闭**——
+F1 确认 oracle 已钉且校验（1.18.15）、prune 十表已正式修正、分发器已被变异覆盖；F2 确认 fs / 有界历史 /
+session 变更 / 生产分发四类守卫「materially improved and mostly sensitive」；F3 确认两个原始 blocker
+与 `completion` 全部修好；F4 确认 44/58 有后端、session 变更走生产轮次路径、名册漂移已闭合。
+
+### SEAM #13：HTTP 表面「成功的空状态」——F2 与 F3 从两端撞到同一个洞
+
+**F3 从用户侧**：一次真实的 HTTP 轮次执行了、`HTTP_ASSISTANT_OK` 真的写进了规范数据库，但
+**每一条 HTTP 读路径都看不到它**——session SSE 零字节、全局 SSE 只有 `server.connected`、
+`/message` 与 `/history` 都返回空数组。客户端只拿到 admission 与 `/wait` 的 204，**无法取回它请求的答案**。
+
+**F2 从代码侧**：`api/request.rs:44-65` 无条件返回空 `data`；`server.rs:148-176` 的 `ServerServices`
+根本没有 permission/question broker；`serve.rs:33-50` 让每个 HTTP 轮次都用 `HeadlessApproval`，而
+`tool_runtime.rs:142-164` 立即拒绝所有 permission ask。唯一真实的 broker 是 TUI 本地的
+（`tui_permission.rs:69-149`），没有共享给 server。
+
+**两者是同一个缺陷的两面**：路由存在、返回 200/204、测试全绿，但**没有把生产状态桥接到 HTTP 表面**。
+
+### 为什么我上一轮验证 129 时漏了它
+
+我验证了「`/prompt` 是否驱动真实 `run_turn`」——变异 `drive_with_message_id` 为 `Ok(())`，两个测试失败，
+链是真的。**但我只验了写入侧，没验读回侧。** 一个 HTTP 客户端要完成一轮对话需要两半：提交能跑，
+以及**能读到结果**。我确认了前一半就收工了。
+
+这正是本项目反复出现的那条规则的又一次实例，只是主体变成了我：**「已注册且返回成功」不等于「行为一致」。**
+F2 说得更准：*successful empty-state responses classified as implemented*。
+
+### F2 还发现一个测试为错误原因通过
+
+路由级的 PTY 过期票测试其实是因为 **scope 不匹配**而被拒，不是因为过期。这是第 10 次
+「测试替身比现实更友善」——测试通过，但守的不是它声称守的东西。
+
+### 剩下的是三轮一致、已披露的契约缺口
+
+F1：SATISFIED 9 / NOT SATISFIED 8 / UNVERIFIABLE 1。F4 的三条 blocker 与之重合：
+
+1. **14 个 API 操作无后端**，89/174 个比较维度仍豁免（准则 4）。
+2. **准则 6 的 Kiro 契约内部不自洽**：准则写 `0.18.0`，用户配置钉 `0.20.6`，而已提交的 surface capture
+   与可执行测试用 `0.20.1`。**按裁决修正后仍未收敛成单一一致的验收契约**——这条是我改准则时留下的尾巴。
+3. **准则 2 的插件生成树差异未修**（差分跑 `OPENCODE_PURE=1`）；goal 的两次连续 compaction 未测；
+   G6 的 Windows 半边在 Linux 主机无法执行。
+
+### F4 对我两个判断的裁定
+
+- 把 `/compact` 与 `/wait` 移出 Compared：**「That is the correct evidentiary choice: comparing two
+  unavailable fixture paths would be false parity.」** 判断成立，但它同时指出这让两者的跨进程 parity
+  仍未被证明——这是对的，我的注释只解释了为何不能比，没解释何时才能比。
+- prune 十表修正：F4 认定为 **「explicit owner-approved contract amendment」**，即「代码证伪契约」，
+  不是「把契约改成代码的样子」。
