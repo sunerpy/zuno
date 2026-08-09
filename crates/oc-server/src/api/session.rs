@@ -1,9 +1,14 @@
 use std::collections::BTreeMap;
 
+use std::sync::Arc;
+
 use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
+use axum::http::StatusCode;
 use base64::Engine as _;
 use oc_db::session::{ListQuery, Session, SessionCreate, SortDirection};
+use oc_engine::r#loop::event_channel;
+use oc_engine::status::SessionStatus;
 use oc_error::DbError;
 use oc_paths::GLOBAL_PROJECT_ID;
 use rusqlite::OptionalExtension;
@@ -15,7 +20,9 @@ use uuid::Uuid;
 use super::Data;
 use super::error::ApiError;
 use super::state::ApiState;
-use crate::ServerServices;
+use crate::{
+    ServerServices, SessionCompactExecution, SessionModelSelection, SessionPromptExecution,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct SessionListQuery {
@@ -157,6 +164,69 @@ pub struct HistoryQuery {
 pub struct HistoryResponse {
     data: Vec<Value>,
     has_more: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AgentBody {
+    agent: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ModelRefBody {
+    id: String,
+    #[serde(rename = "providerID")]
+    provider_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    variant: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ModelBody {
+    model: ModelRefBody,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PromptInputBody {
+    text: String,
+    #[serde(default)]
+    files: Vec<Value>,
+    #[serde(default)]
+    agents: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptDelivery {
+    Steer,
+    Queue,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PromptBody {
+    id: Option<String>,
+    prompt: PromptInputBody,
+    delivery: Option<PromptDelivery>,
+    resume: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptAdmitted {
+    admitted_seq: u64,
+    id: String,
+    #[serde(rename = "sessionID")]
+    session_id: String,
+    prompt: PromptInputBody,
+    delivery: PromptDelivery,
+    time_created: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevertStageBody {
+    #[serde(rename = "messageID")]
+    message_id: String,
+    files: Option<bool>,
 }
 
 struct MessageRow {
@@ -495,6 +565,251 @@ pub async fn history(
     Ok(Json(HistoryResponse {
         data,
         has_more: page.has_more,
+    }))
+}
+
+pub async fn switch_agent(
+    State(state): State<ApiState>,
+    Extension(services): Extension<ServerServices>,
+    Path(session_id): Path<String>,
+    Json(input): Json<AgentBody>,
+) -> Result<StatusCode, ApiError> {
+    require_idle(&state, &services, &session_id)?;
+    let message_id = format!("msg_{}", Uuid::new_v4().simple());
+    let switched = oc_db::message::now_millis();
+    if let Some(events) = state.events() {
+        let properties = json!({
+            "timestamp": switched,
+            "sessionID": session_id,
+            "messageID": message_id,
+            "agent": input.agent,
+        })
+        .as_object()
+        .expect("the agent switch event is an object")
+        .clone();
+        events
+            .publish(
+                &session_id,
+                crate::NewEvent::new("session.next.agent.switched", properties)?,
+            )
+            .await?;
+    }
+    state
+        .sessions()
+        .switch_agent_at(&session_id, &message_id, &input.agent, switched)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn switch_model(
+    State(state): State<ApiState>,
+    Extension(services): Extension<ServerServices>,
+    Path(session_id): Path<String>,
+    Json(input): Json<ModelBody>,
+) -> Result<StatusCode, ApiError> {
+    require_idle(&state, &services, &session_id)?;
+    let model = serde_json::to_string(&input.model)
+        .map_err(|error| ApiError::MutationFailed(error.to_string()))?;
+    let message_id = format!("msg_{}", Uuid::new_v4().simple());
+    let switched = oc_db::message::now_millis();
+    if let Some(events) = state.events() {
+        let properties = json!({
+            "timestamp": switched,
+            "sessionID": session_id,
+            "messageID": message_id,
+            "model": input.model,
+        })
+        .as_object()
+        .expect("the model switch event is an object")
+        .clone();
+        events
+            .publish(
+                &session_id,
+                crate::NewEvent::new("session.next.model.switched", properties)?,
+            )
+            .await?;
+    }
+    state
+        .sessions()
+        .switch_model_at(&session_id, &message_id, &model, switched)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn prompt(
+    State(state): State<ApiState>,
+    Extension(services): Extension<ServerServices>,
+    Path(session_id): Path<String>,
+    Json(input): Json<PromptBody>,
+) -> Result<Json<Data<PromptAdmitted>>, ApiError> {
+    let session = state.sessions().get(&session_id)?;
+    let executor = services.mutations.as_ref().ok_or_else(|| {
+        ApiError::BackendUnavailable("POST /api/session/{sessionID}/prompt".to_owned())
+    })?;
+    let guard = services
+        .runs
+        .begin_turn(&session_id)
+        .map_err(|error| ApiError::Conflict(error.to_string()))?;
+    let message_id = input
+        .id
+        .unwrap_or_else(|| format!("msg_{}", Uuid::new_v4().simple()));
+    let delivery = input.delivery.unwrap_or(PromptDelivery::Steer);
+    let created = oc_db::message::now_millis();
+    let admitted = PromptAdmitted {
+        admitted_seq: 0,
+        id: message_id.clone(),
+        session_id: session_id.clone(),
+        prompt: input.prompt.clone(),
+        delivery,
+        time_created: created,
+    };
+
+    if input.resume != Some(false) {
+        let request = SessionPromptExecution {
+            session_id,
+            directory: session.directory.into(),
+            message_id,
+            prompt: input.prompt.text,
+            agent: session.agent,
+            model: session_model(session.model.as_deref())?,
+        };
+        let signal = guard.interrupt_signal().clone();
+        let executor = Arc::clone(executor);
+        let fanout = services.events.clone();
+        let (sender, receiver) = event_channel();
+        tokio::spawn(async move {
+            let (outcome, ()) = tokio::join!(
+                executor.prompt(request, signal, sender),
+                fanout.forward_engine_events(receiver)
+            );
+            if let Err(error) = outcome {
+                eprintln!("session prompt execution failed: {error}");
+            }
+            drop(guard);
+        });
+    } else {
+        drop(guard);
+    }
+    Ok(Json(Data::new(admitted)))
+}
+
+pub async fn compact(
+    State(state): State<ApiState>,
+    Extension(services): Extension<ServerServices>,
+    Path(session_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let session = state.sessions().get(&session_id)?;
+    let executor = services.mutations.as_ref().ok_or_else(|| {
+        ApiError::BackendUnavailable("POST /api/session/{sessionID}/compact".to_owned())
+    })?;
+    let guard = services
+        .runs
+        .begin_turn(&session_id)
+        .map_err(|error| ApiError::Conflict(error.to_string()))?;
+    let request = SessionCompactExecution {
+        session_id,
+        directory: session.directory.into(),
+        agent: session.agent,
+        model: session_model(session.model.as_deref())?,
+    };
+    executor
+        .compact(request, guard.interrupt_signal().clone())
+        .await
+        .map_err(ApiError::MutationFailed)?;
+    drop(guard);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn wait(
+    State(state): State<ApiState>,
+    Extension(services): Extension<ServerServices>,
+    Path(session_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    state.sessions().get(&session_id)?;
+    services.runs.wait_until_idle(&session_id).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn interrupt(
+    State(state): State<ApiState>,
+    Extension(services): Extension<ServerServices>,
+    Path(session_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    state.sessions().get(&session_id)?;
+    services.runs.abort(&session_id);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn revert_stage(
+    State(state): State<ApiState>,
+    Extension(services): Extension<ServerServices>,
+    Path(session_id): Path<String>,
+    Json(input): Json<RevertStageBody>,
+) -> Result<Json<Data<Value>>, ApiError> {
+    require_idle(&state, &services, &session_id)?;
+    let mut revert = json!({"messageID": input.message_id});
+    if input.files == Some(false) {
+        revert["files"] = Value::Array(Vec::new());
+    }
+    let raw = serde_json::to_string(&revert)
+        .map_err(|error| ApiError::MutationFailed(error.to_string()))?;
+    state.sessions().stage_revert_at(
+        &session_id,
+        revert["messageID"]
+            .as_str()
+            .expect("the marker contains a string"),
+        &raw,
+        oc_db::message::now_millis(),
+    )?;
+    Ok(Json(Data::new(revert)))
+}
+
+pub async fn revert_clear(
+    State(state): State<ApiState>,
+    Extension(services): Extension<ServerServices>,
+    Path(session_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_idle(&state, &services, &session_id)?;
+    state
+        .sessions()
+        .clear_revert_at(&session_id, oc_db::message::now_millis())?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn revert_commit(
+    State(state): State<ApiState>,
+    Extension(services): Extension<ServerServices>,
+    Path(session_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_idle(&state, &services, &session_id)?;
+    let committed = state
+        .sessions()
+        .commit_revert_at(&session_id, oc_db::message::now_millis())?;
+    let _ = committed;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn require_idle(
+    state: &ApiState,
+    services: &ServerServices,
+    session_id: &str,
+) -> Result<Session, ApiError> {
+    let session = state.sessions().get(session_id)?;
+    if services.runs.status(session_id) == SessionStatus::Busy {
+        return Err(ApiError::Conflict(format!(
+            "session `{session_id}` already has an active turn"
+        )));
+    }
+    Ok(session)
+}
+
+fn session_model(raw: Option<&str>) -> Result<Option<SessionModelSelection>, ApiError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let model: ModelRefBody =
+        serde_json::from_str(raw).map_err(|error| ApiError::MutationFailed(error.to_string()))?;
+    Ok(Some(SessionModelSelection {
+        provider_id: model.provider_id,
+        model_id: model.id,
     }))
 }
 

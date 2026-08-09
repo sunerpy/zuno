@@ -318,6 +318,34 @@ pub async fn compact_if_overflowing(
         return Ok(false);
     }
 
+    compact_history(session_id, context, store_history, trigger, true).await
+}
+
+pub async fn compact_manually(
+    session_id: &str,
+    context: &mut PreludeContext<'_>,
+) -> Result<bool, CompactionSkipped> {
+    let store_history = hydrate_retained_history(context.connection, session_id)
+        .map_err(CompactionSkipped::Database)?;
+    compact_history(
+        session_id,
+        context,
+        store_history,
+        CompactionTrigger::Manual,
+        false,
+    )
+    .await
+}
+
+async fn compact_history(
+    session_id: &str,
+    context: &mut PreludeContext<'_>,
+    store_history: Vec<MessageWithParts>,
+    trigger: CompactionTrigger,
+    automatic: bool,
+) -> Result<bool, CompactionSkipped> {
+    let retained = retained_history(&store_history);
+
     let agent = &context.internals.compaction;
     let provider = context
         .providers
@@ -341,6 +369,7 @@ pub async fn compact_if_overflowing(
         context.window,
         trigger,
     );
+    let request = if automatic { request } else { request.manual() };
     let outcome = run_compaction(
         context.connection,
         provider.as_ref(),

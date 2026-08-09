@@ -274,12 +274,15 @@ fn new_session_and_user_message_are_persisted_together() {
     let session = resolve_session(&mut connection, &plan, now).expect("create session");
     persist_user_message(
         &connection,
-        &session.id,
-        "build",
-        "provider",
-        "model",
-        "hello",
-        now,
+        UserMessageInput {
+            session_id: &session.id,
+            agent: "build",
+            provider_id: "provider",
+            model_id: "model",
+            text: "hello",
+            message_id: None,
+            now,
+        },
     )
     .expect("persist prompt");
 
@@ -360,12 +363,15 @@ fn a_persisted_message_keeps_the_message_spelling_of_its_model() {
     let session = resolve_session(&mut connection, &plan, now).expect("create session");
     persist_user_message(
         &connection,
-        &session.id,
-        "build",
-        "provider",
-        "model",
-        "hello",
-        now,
+        UserMessageInput {
+            session_id: &session.id,
+            agent: "build",
+            provider_id: "provider",
+            model_id: "model",
+            text: "hello",
+            message_id: None,
+            now,
+        },
     )
     .expect("persist prompt");
 

@@ -58,7 +58,7 @@ use crate::open;
 use crate::pool::Pool;
 use oc_error::DbError;
 use rusqlite::types::Value;
-use rusqlite::{Connection, Row, Transaction, params, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, params, params_from_iter};
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -770,6 +770,233 @@ pub fn set_title(transaction: &Transaction<'_>, id: &str, title: &str) -> Result
     Ok(now)
 }
 
+/// Replace the agent and append the corresponding projected switch message.
+pub fn switch_agent_at(
+    transaction: &Transaction<'_>,
+    id: &str,
+    message_id: &str,
+    agent: &str,
+    millis: i64,
+) -> Result<(), DbError> {
+    update_session_column(transaction, id, "agent", agent, millis)?;
+    append_switch_message(
+        transaction,
+        id,
+        message_id,
+        "agent-switched",
+        &serde_json::json!({
+            "agent": agent,
+            "time": {"created": millis},
+        }),
+        millis,
+    )
+}
+
+/// Replace the serialized model reference and append its projected switch message.
+pub fn switch_model_at(
+    transaction: &Transaction<'_>,
+    id: &str,
+    message_id: &str,
+    model: &str,
+    millis: i64,
+) -> Result<(), DbError> {
+    let model_value =
+        serde_json::from_str::<serde_json::Value>(model).map_err(|source| DbError::Decode {
+            table: TABLE.to_owned(),
+            source,
+        })?;
+    update_session_column(transaction, id, "model", model, millis)?;
+    append_switch_message(
+        transaction,
+        id,
+        message_id,
+        "model-switched",
+        &serde_json::json!({
+            "model": model_value,
+            "time": {"created": millis},
+        }),
+        millis,
+    )
+}
+
+fn append_switch_message(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    message_id: &str,
+    kind: &str,
+    data: &serde_json::Value,
+    millis: i64,
+) -> Result<(), DbError> {
+    let data = serde_json::to_string(data).expect("JSON values always serialize");
+    transaction
+        .execute(
+            "INSERT INTO session_message \
+             (id, session_id, type, seq, time_created, time_updated, data) \
+             VALUES (?1, ?2, ?3, \
+               (SELECT COALESCE(MAX(seq), -1) + 1 FROM session_message WHERE session_id = ?2), \
+               ?4, ?4, ?5)",
+            params![message_id, session_id, kind, millis, data],
+        )
+        .map_err(open::map_error)?;
+    Ok(())
+}
+
+/// Stage a reversible transcript boundary after proving the boundary exists.
+pub fn stage_revert_at(
+    transaction: &Transaction<'_>,
+    id: &str,
+    message_id: &str,
+    revert: &str,
+    millis: i64,
+) -> Result<(), DbError> {
+    get(transaction, id)?;
+    let exists = transaction
+        .query_row(
+            "SELECT 1 FROM session_message WHERE session_id = ?1 AND id = ?2 \
+             UNION ALL SELECT 1 FROM message WHERE session_id = ?1 AND id = ?2 LIMIT 1",
+            params![id, message_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(open::map_error)?
+        .is_some();
+    if !exists {
+        return Err(DbError::NotFound {
+            table: "message".to_owned(),
+            id: message_id.to_owned(),
+        });
+    }
+    update_session_column(transaction, id, "revert", revert, millis)
+}
+
+/// Clear a staged boundary without deleting transcript rows.
+pub fn clear_revert_at(
+    transaction: &Transaction<'_>,
+    id: &str,
+    millis: i64,
+) -> Result<(), DbError> {
+    if get(transaction, id)?.revert.is_none() {
+        return Ok(());
+    }
+    let updated = transaction
+        .execute(
+            "UPDATE session SET revert = NULL, time_updated = ?2 WHERE id = ?1",
+            params![id, millis],
+        )
+        .map_err(open::map_error)?;
+    require_updated(updated, id)
+}
+
+/// Permanently discard transcript rows after the staged boundary.
+///
+/// Returns `false` when the session exists but has no staged boundary. Callers use
+/// that result as the destructive-operation confirmation guard.
+pub fn commit_revert_at(
+    transaction: &Transaction<'_>,
+    id: &str,
+    millis: i64,
+) -> Result<bool, DbError> {
+    let session = get(transaction, id)?;
+    let Some(raw) = session.revert else {
+        return Ok(false);
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|source| DbError::Decode {
+            table: TABLE.to_owned(),
+            source,
+        })?;
+    let message_id = value
+        .get("messageID")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| DbError::Decode {
+            table: TABLE.to_owned(),
+            source: serde_json::from_str::<serde_json::Value>("{").expect_err("invalid JSON"),
+        })?;
+
+    let projected_seq = transaction
+        .query_row(
+            "SELECT seq FROM session_message WHERE session_id = ?1 AND id = ?2",
+            params![id, message_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(open::map_error)?;
+    let legacy_boundary = transaction
+        .query_row(
+            "SELECT time_created, id FROM message WHERE session_id = ?1 AND id = ?2",
+            params![id, message_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(open::map_error)?;
+    if projected_seq.is_none() && legacy_boundary.is_none() {
+        return Err(DbError::NotFound {
+            table: "message".to_owned(),
+            id: message_id.to_owned(),
+        });
+    }
+
+    if let Some(seq) = projected_seq {
+        transaction
+            .execute(
+                "DELETE FROM session_message WHERE session_id = ?1 AND seq > ?2",
+                params![id, seq],
+            )
+            .map_err(open::map_error)?;
+        transaction
+            .execute(
+                "DELETE FROM session_input WHERE session_id = ?1 \
+                 AND (admitted_seq > ?2 OR promoted_seq > ?2)",
+                params![id, seq],
+            )
+            .map_err(open::map_error)?;
+    }
+    if let Some((created, boundary_id)) = legacy_boundary {
+        transaction
+            .execute(
+                "DELETE FROM message WHERE session_id = ?1 \
+                 AND (time_created > ?2 OR (time_created = ?2 AND id > ?3))",
+                params![id, created, boundary_id],
+            )
+            .map_err(open::map_error)?;
+    }
+    transaction
+        .execute(
+            "DELETE FROM session_context_epoch WHERE session_id = ?1",
+            params![id],
+        )
+        .map_err(open::map_error)?;
+    clear_revert_at(transaction, id, millis)?;
+    Ok(true)
+}
+
+fn update_session_column(
+    transaction: &Transaction<'_>,
+    id: &str,
+    column: &'static str,
+    value: &str,
+    millis: i64,
+) -> Result<(), DbError> {
+    debug_assert!(matches!(column, "agent" | "model" | "revert"));
+    let updated = transaction
+        .execute(
+            &format!("UPDATE session SET {column} = ?2, time_updated = ?3 WHERE id = ?1"),
+            params![id, value, millis],
+        )
+        .map_err(open::map_error)?;
+    require_updated(updated, id)
+}
+
+fn require_updated(updated: usize, id: &str) -> Result<(), DbError> {
+    if updated == 0 {
+        return Err(DbError::NotFound {
+            table: TABLE.to_owned(),
+            id: id.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// Whether `title` is still the one [`create`] invented, and so may be replaced.
 ///
 /// Lives next to [`SessionCreate::default_title_prefix`] for the same reason
@@ -1085,6 +1312,49 @@ impl<'pool> Store<'pool> {
     pub fn touch_at(&self, id: &str, millis: i64) -> Result<i64, DbError> {
         self.pool
             .transaction(|transaction| touch_at(transaction, id, millis))
+    }
+
+    pub fn switch_agent_at(
+        &self,
+        id: &str,
+        message_id: &str,
+        agent: &str,
+        millis: i64,
+    ) -> Result<(), DbError> {
+        self.pool
+            .transaction(|transaction| switch_agent_at(transaction, id, message_id, agent, millis))
+    }
+
+    pub fn switch_model_at(
+        &self,
+        id: &str,
+        message_id: &str,
+        model: &str,
+        millis: i64,
+    ) -> Result<(), DbError> {
+        self.pool
+            .transaction(|transaction| switch_model_at(transaction, id, message_id, model, millis))
+    }
+
+    pub fn stage_revert_at(
+        &self,
+        id: &str,
+        message_id: &str,
+        revert: &str,
+        millis: i64,
+    ) -> Result<(), DbError> {
+        self.pool
+            .transaction(|transaction| stage_revert_at(transaction, id, message_id, revert, millis))
+    }
+
+    pub fn clear_revert_at(&self, id: &str, millis: i64) -> Result<(), DbError> {
+        self.pool
+            .transaction(|transaction| clear_revert_at(transaction, id, millis))
+    }
+
+    pub fn commit_revert_at(&self, id: &str, millis: i64) -> Result<bool, DbError> {
+        self.pool
+            .transaction(|transaction| commit_revert_at(transaction, id, millis))
     }
 
     /// See [`remove`]. The whole subtree lands in one transaction.

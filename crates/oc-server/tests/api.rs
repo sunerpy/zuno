@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -8,14 +10,22 @@ use axum::http::{Method, Request, StatusCode};
 use oc_db::Pool;
 use oc_db::artifact_gc::ArtifactGcPaths;
 use oc_db::session::SessionCreate;
+use oc_engine::interrupt::InterruptSignal;
+use oc_engine::r#loop::TurnEventSender;
+use oc_engine::status::SessionStatus;
 use oc_paths::DbLocation;
 use oc_pty::{CreateInput, PtyId, TicketScope};
 use oc_server::api::{self, ApiState};
-use oc_server::{Delivery, EventService, NewEvent, ServerBuilder, ServerConfig, ServerServices};
+use oc_server::{
+    Delivery, EventService, NewEvent, ServerBuilder, ServerConfig, ServerServices,
+    SessionCompactExecution, SessionMutationExecutor, SessionMutationFuture,
+    SessionPromptExecution,
+};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::Notify;
 use tower::ServiceExt;
 
 fn api_app(state: ApiState) -> Router {
@@ -31,6 +41,65 @@ fn api_app_with_services(state: ApiState) -> (Router, ServerServices) {
         .with_routes(api::router(state))
         .router();
     (app, services)
+}
+
+#[derive(Debug, Default)]
+struct BlockingMutationExecutor {
+    prompt_started: Arc<AtomicBool>,
+    prompt_started_notify: Arc<Notify>,
+    prompts: Mutex<Vec<SessionPromptExecution>>,
+    compact_calls: AtomicUsize,
+}
+
+impl BlockingMutationExecutor {
+    async fn wait_until_prompt_started(&self) {
+        loop {
+            let mut notified = std::pin::pin!(self.prompt_started_notify.notified());
+            notified.as_mut().enable();
+            if self.prompt_started.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn prompts(&self) -> Vec<SessionPromptExecution> {
+        self.prompts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+impl SessionMutationExecutor for BlockingMutationExecutor {
+    fn prompt(
+        &self,
+        request: SessionPromptExecution,
+        interrupt: InterruptSignal,
+        _events: TurnEventSender,
+    ) -> SessionMutationFuture {
+        self.prompts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(request);
+        let started = Arc::clone(&self.prompt_started);
+        let started_notify = Arc::clone(&self.prompt_started_notify);
+        Box::pin(async move {
+            started.store(true, Ordering::SeqCst);
+            started_notify.notify_waiters();
+            interrupt.notified().await;
+            Ok(())
+        })
+    }
+
+    fn compact(
+        &self,
+        _request: SessionCompactExecution,
+        _interrupt: InterruptSignal,
+    ) -> SessionMutationFuture {
+        self.compact_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
+    }
 }
 
 fn request(method: Method, uri: &str, body: Option<Value>) -> Request<Body> {
@@ -521,26 +590,319 @@ async fn api_permission_and_question_read_routes_match_the_empty_process_state()
 }
 
 #[tokio::test]
-async fn api_unbacked_endpoint_is_an_explicit_gap_not_a_501_compatibility_claim() {
-    // This test names a still-unbacked operation, and that name has had to move
-    // twice: `/api/integration` was backed by todo 127, then `/api/permission/saved`
-    // by todo 128. It now points at a session-mutating route, which todo 129 owns.
-    // When 129 lands, this must move again -- or, once no operation is unbacked,
-    // be replaced by an assertion that `unsupported_routes()` is empty. The property
-    // under test is unchanged: a registered route with no backend answers an
-    // explicit 503 naming the gap, never a 501.
+async fn api_prompt_wait_and_interrupt_share_one_live_turn_signal() {
     let state = ApiState::memory("/repo").expect("in-memory API state initializes");
-    let response = api_app(state)
-        .oneshot(request(Method::POST, "/api/session/ses_x/interrupt", None))
+    state
+        .sessions()
+        .create(&SessionCreate::new(
+            "ses_mutation",
+            "ses_mutation",
+            "global",
+            "/repo",
+            "/repo",
+            "mutation",
+            "test",
+        ))
+        .expect("fixture session inserts");
+    let executor = Arc::new(BlockingMutationExecutor::default());
+    let services = ServerServices::new(64).with_mutations(executor.clone());
+    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
+        .with_services(services.clone())
+        .with_routes(api::router(state))
+        .router();
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_mutation/prompt",
+            Some(json!({
+                "id": "msg_http",
+                "prompt": {"text": "hello", "files": [], "agents": []},
+                "delivery": "steer"
+            })),
+        ))
         .await
-        .expect("registered endpoint responds");
-    let status = response.status();
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        .expect("prompt responds");
+    assert_eq!(response.status(), StatusCode::OK);
     let body = response_json(response).await;
-    assert_eq!(body["error"]["code"], "backend_unavailable");
+    assert_eq!(body["data"]["id"], "msg_http");
+    assert_eq!(body["data"]["sessionID"], "ses_mutation");
+    assert_eq!(body["data"]["prompt"]["files"], json!([]));
+    assert_eq!(body["data"]["prompt"]["agents"], json!([]));
+    executor.wait_until_prompt_started().await;
+    assert_eq!(services.runs.status("ses_mutation"), SessionStatus::Busy);
+
+    let mut wait_task = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.oneshot(request(
+                Method::POST,
+                "/api/session/ses_mutation/wait",
+                None,
+            ))
+            .await
+            .expect("wait responds")
+        }
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut wait_task)
+            .await
+            .is_err(),
+        "wait must remain suspended while the turn is active"
+    );
+
+    let conflict = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_mutation/agent",
+            Some(json!({"agent": "explore"})),
+        ))
+        .await
+        .expect("busy mutation responds");
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+    let interrupted = app
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_mutation/interrupt",
+            None,
+        ))
+        .await
+        .expect("interrupt responds");
+    assert_eq!(interrupted.status(), StatusCode::NO_CONTENT);
+    let waited = tokio::time::timeout(Duration::from_secs(1), &mut wait_task)
+        .await
+        .expect("wait wakes after interrupt")
+        .expect("wait task does not panic");
+    assert_eq!(waited.status(), StatusCode::NO_CONTENT);
+    assert_eq!(services.runs.status("ses_mutation"), SessionStatus::Idle);
     assert_eq!(
-        body["error"]["message"],
-        "backend unavailable for POST /api/session/{sessionID}/interrupt"
+        executor.prompts(),
+        vec![SessionPromptExecution {
+            session_id: "ses_mutation".to_owned(),
+            directory: "/repo".into(),
+            message_id: "msg_http".to_owned(),
+            prompt: "hello".to_owned(),
+            agent: None,
+            model: None,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn api_agent_model_compact_and_revert_mutations_are_guarded_and_persisted() {
+    let fixture = ReadApiFixture::new();
+    fixture.seed_session_messages(3, -1);
+    fixture
+        .events
+        .publish(
+            "ses_reads",
+            NewEvent::new(
+                "session.created",
+                serde_json::Map::from_iter([("sessionID".to_owned(), json!("ses_reads"))]),
+            )
+            .expect("created event is valid"),
+        )
+        .await
+        .expect("created event inserts");
+    let executor = Arc::new(BlockingMutationExecutor::default());
+    let services = ServerServices::new(64).with_mutations(executor.clone());
+    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
+        .with_services(services)
+        .with_routes(api::router(fixture.state.clone()))
+        .router();
+
+    for (path, body) in [
+        ("/api/session/ses_reads/agent", json!({"agent": "explore"})),
+        (
+            "/api/session/ses_reads/model",
+            json!({"model": {"providerID": "provider", "id": "model", "variant": "fast"}}),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request(Method::POST, path, Some(body)))
+            .await
+            .expect("session switch responds");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT, "{path}");
+    }
+    let session = fixture
+        .state
+        .sessions()
+        .get("ses_reads")
+        .expect("session reads");
+    assert_eq!(session.agent.as_deref(), Some("explore"));
+    assert_eq!(
+        session.model.as_deref(),
+        Some(r#"{"id":"model","providerID":"provider","variant":"fast"}"#)
+    );
+
+    let context = app
+        .clone()
+        .oneshot(request(Method::GET, "/api/session/ses_reads/context", None))
+        .await
+        .expect("context responds after session switches");
+    assert_eq!(context.status(), StatusCode::OK);
+    let context = response_json(context).await;
+    let switched = context["data"]
+        .as_array()
+        .expect("context data is an array")
+        .iter()
+        .filter(|message| {
+            matches!(
+                message["type"].as_str(),
+                Some("agent-switched" | "model-switched")
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        switched.len(),
+        2,
+        "both successful switch operations must append their projected messages: {context}"
+    );
+    assert_eq!(switched[0]["type"], "agent-switched");
+    assert_eq!(switched[0]["agent"], "explore");
+    assert!(
+        switched[0]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("msg_")),
+        "agent switch uses an upstream-compatible message ID: {}",
+        switched[0]
+    );
+    assert!(switched[0]["time"]["created"].is_i64());
+    assert_eq!(switched[1]["type"], "model-switched");
+    assert_eq!(
+        switched[1]["model"],
+        json!({"providerID": "provider", "id": "model", "variant": "fast"})
+    );
+    assert!(
+        switched[1]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("msg_")),
+        "model switch uses an upstream-compatible message ID: {}",
+        switched[1]
+    );
+    assert!(switched[1]["time"]["created"].is_i64());
+
+    let history = app
+        .clone()
+        .oneshot(request(Method::GET, "/api/session/ses_reads/history", None))
+        .await
+        .expect("history responds after session switches");
+    assert_eq!(history.status(), StatusCode::OK);
+    let history = response_json(history).await;
+    let events = history["data"]
+        .as_array()
+        .expect("history data is an array");
+    assert_eq!(events.len(), 2, "both switch events are durable: {history}");
+    assert_eq!(events[0]["type"], "session.next.agent.switched");
+    assert_eq!(events[0]["data"]["sessionID"], "ses_reads");
+    assert_eq!(events[0]["data"]["agent"], "explore");
+    assert!(events[0]["data"]["timestamp"].is_i64());
+    assert!(
+        events[0]["data"]["messageID"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("msg_"))
+    );
+    assert_eq!(events[1]["type"], "session.next.model.switched");
+    assert_eq!(events[1]["data"]["sessionID"], "ses_reads");
+    assert_eq!(
+        events[1]["data"]["model"],
+        json!({"providerID": "provider", "id": "model", "variant": "fast"})
+    );
+    assert!(events[1]["data"]["timestamp"].is_i64());
+    assert!(
+        events[1]["data"]["messageID"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("msg_"))
+    );
+
+    let compact = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_reads/compact",
+            None,
+        ))
+        .await
+        .expect("compact responds");
+    assert_eq!(compact.status(), StatusCode::NO_CONTENT);
+    assert_eq!(executor.compact_calls.load(Ordering::SeqCst), 1);
+
+    let unstaged = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_reads/revert/commit",
+            None,
+        ))
+        .await
+        .expect("unstaged commit responds");
+    assert_eq!(unstaged.status(), StatusCode::NO_CONTENT);
+
+    let staged = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_reads/revert/stage",
+            Some(json!({"messageID": "msg_0001", "files": false})),
+        ))
+        .await
+        .expect("revert stage responds");
+    assert_eq!(staged.status(), StatusCode::OK);
+    assert_eq!(response_json(staged).await["data"]["messageID"], "msg_0001");
+    let cleared = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_reads/revert/clear",
+            None,
+        ))
+        .await
+        .expect("revert clear responds");
+    assert_eq!(cleared.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        fixture
+            .state
+            .sessions()
+            .get("ses_reads")
+            .expect("session")
+            .revert,
+        None
+    );
+
+    let staged = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_reads/revert/stage",
+            Some(json!({"messageID": "msg_0001", "files": false})),
+        ))
+        .await
+        .expect("revert restage responds");
+    assert_eq!(staged.status(), StatusCode::OK);
+    let committed = app
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_reads/revert/commit",
+            None,
+        ))
+        .await
+        .expect("revert commit responds");
+    assert_eq!(committed.status(), StatusCode::NO_CONTENT);
+    let connection = fixture.pool.get().expect("fixture database connection");
+    let remaining: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM session_message WHERE session_id = 'ses_reads'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count projected messages");
+    assert_eq!(
+        remaining, 2,
+        "commit removes only rows after the staged boundary"
     );
 }
 

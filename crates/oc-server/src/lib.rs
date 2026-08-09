@@ -39,4 +39,7 @@ pub use event::{DEFAULT_EVENT_SUBSCRIBER_CAPACITY, Delivery, EventFanout, EventS
 pub use events::{
     EventCursor, EventService, EventStreamError, NewEvent, StreamEvent, events_router,
 };
-pub use server::{BoundServer, ServerBuilder, ServerConfig, ServerError, ServerServices};
+pub use server::{
+    BoundServer, ServerBuilder, ServerConfig, ServerError, ServerServices, SessionCompactExecution,
+    SessionModelSelection, SessionMutationExecutor, SessionMutationFuture, SessionPromptExecution,
+};

@@ -9,6 +9,8 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use tokio::sync::Notify;
+
 use crate::interrupt::{InterruptSignal, SoftInterruptMessage};
 
 /// The process-local state exposed to CLI, TUI, HTTP, and ACP surfaces.
@@ -79,6 +81,7 @@ pub struct SessionRunRegistry {
 struct RegistryInner {
     next_token: AtomicU64,
     state: Mutex<RegistryState>,
+    idle: Notify,
 }
 
 #[derive(Debug, Default)]
@@ -101,6 +104,7 @@ impl SessionRunRegistry {
             inner: Arc::new(RegistryInner {
                 next_token: AtomicU64::new(1),
                 state: Mutex::new(RegistryState::default()),
+                idle: Notify::new(),
             }),
         }
     }
@@ -166,6 +170,21 @@ impl SessionRunRegistry {
         self.lock_state().active.keys().cloned().collect()
     }
 
+    /// Wait until `session_id` has no live turn without polling.
+    ///
+    /// The waiter is registered before the status re-check, so a guard dropped
+    /// between observation and suspension cannot lose its wake-up.
+    pub async fn wait_until_idle(&self, session_id: &str) {
+        loop {
+            let mut notified = std::pin::pin!(self.inner.idle.notified());
+            notified.as_mut().enable();
+            if self.status(session_id) == SessionStatus::Idle {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     /// Fires the live turn's interrupt signal without waiting for an event consumer.
     ///
     /// The signal is fired while the registry lock still protects the active entry,
@@ -222,6 +241,8 @@ impl SessionRunRegistry {
             .is_some_and(|active| active.token == token)
         {
             state.active.remove(session_id);
+            drop(state);
+            self.inner.idle.notify_waiters();
         }
     }
 

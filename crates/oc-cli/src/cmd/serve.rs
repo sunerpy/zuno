@@ -1,13 +1,98 @@
 use std::io::Write as _;
 use std::sync::Arc;
 
+use oc_engine::interrupt::InterruptSignal;
+use oc_engine::r#loop::TurnEventSender;
 use oc_server::api::{self, ApiState};
 use oc_server::{
     AuthConfig, CompatV1State, DEFAULT_EVENT_SUBSCRIBER_CAPACITY, EventService, ServerBuilder,
-    ServerConfig, compat_v1_router, events_router,
+    ServerConfig, ServerServices, SessionCompactExecution, SessionMutationExecutor,
+    SessionMutationFuture, SessionPromptExecution, compat_v1_router, events_router,
 };
 
+use super::tool_runtime::HeadlessApproval;
+use super::turn::{SessionChoice, TurnHost, TurnOptions, TurnPlan};
 use crate::command::ServeArgs;
+use crate::environment::StartupEnvironment;
+
+#[derive(Clone, Debug)]
+struct ServerSessionMutationExecutor {
+    environment: StartupEnvironment,
+}
+
+impl ServerSessionMutationExecutor {
+    fn new() -> Self {
+        Self {
+            environment: StartupEnvironment::resolve(
+                &oc_paths::Env::from_process(),
+                &crate::command::GlobalOptions::default(),
+            ),
+        }
+    }
+
+    async fn open(
+        environment: StartupEnvironment,
+        session_id: String,
+        directory: std::path::PathBuf,
+        agent: Option<String>,
+        model: Option<oc_server::SessionModelSelection>,
+        interrupt: InterruptSignal,
+    ) -> Result<TurnHost, String> {
+        let options = TurnOptions {
+            directory: Some(directory),
+            model: model.map(|model| format!("{}/{}", model.provider_id, model.model_id)),
+            agent,
+            session: SessionChoice::Existing(session_id),
+            title: None,
+        };
+        let plan = TurnPlan::resolve(&options, &environment).await?;
+        TurnHost::open_with_interrupt(plan, &environment, Arc::new(HeadlessApproval), interrupt)
+    }
+}
+
+impl SessionMutationExecutor for ServerSessionMutationExecutor {
+    fn prompt(
+        &self,
+        request: SessionPromptExecution,
+        interrupt: InterruptSignal,
+        events: TurnEventSender,
+    ) -> SessionMutationFuture {
+        let environment = self.environment.clone();
+        Box::pin(async move {
+            let mut host = Self::open(
+                environment,
+                request.session_id,
+                request.directory,
+                request.agent,
+                request.model,
+                interrupt,
+            )
+            .await?;
+            host.drive_with_message_id(&request.prompt, Some(&request.message_id), events)
+                .await
+        })
+    }
+
+    fn compact(
+        &self,
+        request: SessionCompactExecution,
+        interrupt: InterruptSignal,
+    ) -> SessionMutationFuture {
+        let environment = self.environment.clone();
+        Box::pin(async move {
+            let mut host = Self::open(
+                environment,
+                request.session_id,
+                request.directory,
+                request.agent,
+                request.model,
+                interrupt,
+            )
+            .await?;
+            host.compact().await
+        })
+    }
+}
 
 pub(super) fn execute(args: &ServeArgs) -> Result<(), String> {
     if args.mdns {
@@ -44,7 +129,10 @@ pub(super) fn execute(args: &ServeArgs) -> Result<(), String> {
         let state = ApiState::open_default(&directory)
             .map_err(|error| error.to_string())?
             .with_events(events.clone());
+        let services = ServerServices::new(DEFAULT_EVENT_SUBSCRIBER_CAPACITY)
+            .with_mutations(Arc::new(ServerSessionMutationExecutor::new()));
         let server = ServerBuilder::new(config)
+            .with_services(services)
             .with_routes(
                 api::router(state)
                     .merge(events_router(events))
