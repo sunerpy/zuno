@@ -5894,3 +5894,76 @@ by simply *using the product across the boundary the README promises.*
 
 Nine seams were found during execution. The Final Wave found a tenth, and eleven more blockers.
 **Every one was invisible to a green suite.**
+
+### SEAM #10 CLOSED (todo 115) — and what the closing taught
+
+`session.model` now goes through one named writer, `oc_db::session::model_reference`
+(`crates/oc-db/src/session.rs`), which emits `{"id","providerID"}`. `turn.rs:1198`
+(the message record, `{"providerID","modelID"}`) is untouched and now pinned by its
+own test. Evidence: `.omo/evidence/task-115-opencode-rust.txt`.
+
+**Measurements confirmed independently, with one correction.** `session.model` carries
+`id` in 5,961/5,961 rows and `modelID` in 0 — as reported. The `message` figure needed
+a corrected query: **the released schema has no `message.model` column**. A message's
+model lives inside `message.data` JSON, so `SELECT … FROM message, json_each(message.model)`
+errors with `no such column: model`. The working form is
+`json_extract(data,'$.model.modelID')`, which gives `modelID` in 17,442/17,442 rows that
+carry a model (of 278,234 messages). Finding unaffected.
+
+**`variant` is optional, and is omitted rather than written as `null`.**
+`packages/opencode/src/session/session.ts:220-224`:
+
+```ts
+const Model = Schema.Struct({
+  id: ModelV2.ID,
+  providerID: ProviderV2.ID,
+  variant: optional(Schema.String),
+})
+```
+
+`id` and `providerID` required, `variant` `optional(...)`. Corroborated in the data:
+absent from 197 of 5,961 rows, and — the load-bearing detail — **zero rows contain
+`"variant":null"`**. Upstream writes a string or omits the key; `session.ts:130` passes
+`info.model` through unchanged, so an absent TS field never becomes `null` on disk.
+Writing `null` would have been a shape no upstream row has: the same bug one field over.
+Pinned by a named assertion so a later edit cannot start emitting it.
+
+**Exactly one production writer of the column.** `oc-db/src/session.rs` carries it as
+opaque JSON, so this had to be enumerated rather than assumed: 199 `"model"`-ish matches
+across 55 files triaged down to `turn.rs:1175` (the session column) and `turn.rs:1198`
+(a message). Everything else reads it, re-emits it verbatim, or means the config key or
+the HTTP request field. Test fixtures already used the right shape per table.
+
+#### The suite blind spot is closed, and it now bites
+
+`journal_round_trip_…` passed for this defect's whole life because it opens an **empty**
+Rust database and checks the `migration` table — it never asked the release to decode a
+row a Rust turn wrote. Added
+`compat_suite.rs::a_session_written_by_this_port_is_decodable_by_the_real_binary`
+(registry surface `db-session-decode`) plus an end-to-end
+`crates/oc-cli/tests/rollback.rs::the_released_binary_lists_a_session_this_port_wrote`,
+which runs a real turn through the production binary and then `session list` on 1.18.12.
+Both were proven RED before the fix with the exact reported failure
+(`Expected string, got undefined`, exit 1) and GREEN after. No existing assertion was
+weakened, skipped or deleted.
+
+#### A NEW instance of the fixture-hides-the-defect trap — the fifth
+
+The first draft of the suite test **invented its own project row**. It exited **0 with an
+empty listing** and asserted nothing: `session list` is scoped to the project resolved for
+the directory it runs in, so a made-up project id silently disarms the test. Caught only
+because a second assertion checked the session id appeared in stdout. The fix is to let
+the oracle create the database and resolve its own project, then write the session under
+*that* project — recorded in the helper's doc comment so a later "simplification" cannot
+re-disarm it.
+
+**Generalised lesson: an oracle exiting 0 is not evidence it decoded anything.** A
+cross-boundary test needs a positive assertion that the specific row under test appeared
+in the output. Exit status alone passes when the oracle looked at nothing.
+
+#### Incidental: how to reproduce a Rust turn with no network
+
+A session row is written **before** the provider is dialled, so pointing `baseURL` at
+`http://127.0.0.1:1/v1` produces a complete session row and a clean
+`Connection refused` — enough to reproduce this class of seam manually with no cassette
+and no mock server. Used for the `env -i` reproduction in the evidence file.

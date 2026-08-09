@@ -1171,8 +1171,10 @@ fn resolve_session(
     )
     .at(now);
     input.agent = Some(plan.agent.name.clone());
-    input.model =
-        Some(json!({"providerID": plan.provider_id, "modelID": plan.model_id}).to_string());
+    input.model = Some(oc_db::session::model_reference(
+        &plan.provider_id,
+        &plan.model_id,
+    ));
     let transaction = connection.transaction().map_err(to_string)?;
     let creation = oc_db::session::create(&transaction, &input).map_err(to_string)?;
     transaction.commit().map_err(to_string)?;
