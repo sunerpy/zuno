@@ -34,7 +34,7 @@ fn list(environment: &StartupEnvironment) -> Result<(), String> {
         worktree,
         env.clone(),
     ))
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| error.report())?;
     let agents = agent::load(&directory, worktree, env).map_err(|error| error.to_string())?;
     let dynamic = DynamicRules::resolve(&directory, worktree, env, &config);
 

@@ -54,7 +54,7 @@ impl Context {
         let config = oc_config::discovery::discover_with(
             &oc_config::discovery::DiscoveryOptions::new(&directory, worktree, env.clone()),
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.report())?;
         let auth = McpAuthStore::resolve(&layout);
         Ok(Self { config, auth })
     }

@@ -333,14 +333,78 @@ fn deprecated_top_level_keys_are_not_accepted() {
 
 #[test]
 fn every_unrecognized_top_level_key_gets_its_own_issue() {
-    let error = parse_value(json!({ "theme": "system", "keybinds": {}, "model": "a/b" }))
+    // Near-misses of the exempt legacy keys, so a substring or prefix match in the
+    // exemption would fail here rather than silently widen it.
+    let error = parse_value(json!({ "themes": "system", "keybind": {}, "model": "a/b" }))
         .expect_err("must be rejected");
     let ConfigError::Invalid { issues, .. } = &error else {
         panic!("expected Invalid, got {error:?}");
     };
     let mut paths: Vec<String> = issues.iter().map(|i| i.key_path.join(".")).collect();
     paths.sort();
-    assert_eq!(paths, vec!["keybinds".to_owned(), "theme".to_owned()]);
+    assert_eq!(paths, vec!["keybind".to_owned(), "themes".to_owned()]);
+    for issue in issues {
+        assert_eq!(issue.detail, "unrecognized key");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Acceptance: the legacy TUI keys are accepted and discarded, as upstream does.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_legacy_tui_keys_are_accepted_and_do_not_survive() {
+    let config = parse_value(json!({
+        "model": "a/b",
+        "theme": "system",
+        "keybinds": { "leader": "ctrl+x" },
+        "tui": { "scroll_speed": 3, "diff_style": "stacked" },
+    }))
+    .expect("a live config carrying the legacy TUI keys must load");
+    assert_eq!(config.model.as_deref(), Some("a/b"));
+
+    let serialized = serde_json::to_value(&config).expect("serializes");
+    let keys: Vec<&str> = serialized
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, vec!["model"], "the legacy keys must be dropped");
+
+    // Equal to the same config without them, because the oracle deletes them.
+    assert_eq!(
+        config,
+        parse_value(json!({ "model": "a/b" })).expect("loads")
+    );
+}
+
+#[test]
+fn the_legacy_tui_keys_accept_any_shape_the_oracle_would_have_deleted() {
+    for shape in [
+        json!("system"),
+        json!(null),
+        json!(7),
+        json!(false),
+        json!([1, 2]),
+        json!({ "nested": { "deep": true } }),
+    ] {
+        for key in LEGACY_TUI_KEYS {
+            parse_value(json!({ *key: shape.clone() }))
+                .unwrap_or_else(|e| panic!("{key} = {shape} must load: {e:?}"));
+        }
+    }
+}
+
+#[test]
+fn the_legacy_exemption_covers_exactly_three_keys() {
+    assert_eq!(LEGACY_TUI_KEYS, &["theme", "keybinds", "tui"]);
+    for key in LEGACY_TUI_KEYS {
+        assert!(
+            !KNOWN_TOP_LEVEL_KEYS.contains(key),
+            "{key} must not join the set that survives the merge"
+        );
+    }
 }
 
 #[test]
@@ -789,9 +853,18 @@ fn the_documented_examples_all_deserialize() {
 #[test]
 fn the_real_user_config_deserializes() {
     let text = fixture("user-config.json");
-    let before: Value = serde_json::from_str(&text).expect("valid JSON");
+    let mut before: Value = serde_json::from_str(&text).expect("valid JSON");
     let config = parse(&text).expect("the user's own config must load");
     let after = serde_json::to_value(&config).expect("serializes");
+
+    // `theme` stays in the fixture: a copy that omits it is friendlier than the
+    // live file and hides this defect. It is expected not to survive the parse.
+    let stripped = before
+        .as_object_mut()
+        .expect("fixture is an object")
+        .remove("theme");
+    assert_eq!(stripped, Some(Value::from("system")));
+    assert!(after.get("theme").is_none(), "theme must not survive");
     assert_contains(&after, &before, "user-config.json");
     assert!(config.mcp.as_ref().expect("mcp present").len() >= 8);
     assert!(config.plugin.as_ref().expect("plugin present").len() == 3);

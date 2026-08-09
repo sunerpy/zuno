@@ -6046,3 +6046,45 @@ phantom regression or a phantom gain. The stable decomposition is:
 
 Which reconciles exactly: **baseline 3214 + 20 added = 3234.** Future waves should report both
 halves rather than one summed figure.
+## SEAM #12 — the third fixture-friendlier-than-reality defect (todo 117)
+
+`debug config` exited 1 on the user's own `/config/.config/opencode/opencode.json` while both
+released binaries (1.18.12, 1.18.15) exited 0. One offending key: **`theme`**.
+
+Upstream does not have `theme` in its schema either. It *deletes* it — along with `keybinds` and
+`tui` — from the loaded document **before** the unrecognized-key check runs:
+`packages/opencode/src/config/config.ts:53-61` (`normalizeLoadedConfig`), applied at `:227`,
+immediately inside the argument to `ConfigParse.schema`. So upstream's policy is not "ignore
+unknown keys"; it is "strip these three named keys, then reject every other unknown key". The
+keys moved to `tui.json`, and `tui-migrate.ts` skips any directory that already has one — so on a
+long-lived install they stay in `opencode.json` forever, ignored.
+
+**Why every test passed.** `crates/oc-config/tests/fixtures/user-config.json` was the user's file
+**with `theme` removed**, and `tests/legacy.rs` documented the omission as harmless: "its one
+difference from the live file is the `theme` key, which v1.18.13 does not define". Both clauses
+were true; the conclusion was wrong. v1.18.13 does not *define* it and does not *reject* it.
+
+This is the third instance of the same shape, after `OPENCODE_MODELS_PATH` (a variable no real
+user sets, injected by every test) and the legacy database (every test used a fresh one). The
+rule generalises further than "friendlier": **a fixture that differs from the live input in ANY
+way its own comment calls harmless is a defect until that harmlessness is asserted, not
+asserted-in-prose.** The fixture now carries `theme` and `the_real_user_config_deserializes`
+asserts it is present in the input and absent from the output, so deleting it again fails.
+
+**Corollary for the differential matrix.** Twelve synthetic trees were all byte-identical to the
+oracle and none carried the key. A matrix built from hand-written minimal layers cannot catch
+this class; the matrix now includes `real-user-global-config`, the live file byte-for-byte.
+
+**Also fixed, second-order:** `failed validation (1 issue(s))` named no key. `ConfigIssue`
+carried the key path all along; nothing rendered it. `ConfigError::report()` now does, and the
+four user-reachable discovery call sites use it (`debug`, `agent`, `models`, `mcp`). `Display`
+was left single-line because four tests pin it. This is the fourth unhelpful-message fix after
+todos 109, 110, 112 — the pattern is always the same: the structured detail exists and the
+rendering throws it away.
+
+**Pre-existing gap found, not in scope:** `mode` is rejected by the schema's generic
+`unrecognized key`, not by `legacy::check_config`'s actionable "use `agent.build` with
+`mode: \"primary\"`" message, because discovery never calls the legacy pass — even though
+`legacy.rs`'s own module doc states the pass "must therefore run before the strict parse". So
+todo 10's ten forms are reachable only through the library API, never through the CLI. Verified
+identical before and after this change.

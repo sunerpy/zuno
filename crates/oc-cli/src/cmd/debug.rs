@@ -82,7 +82,7 @@ impl Context {
                 worktree.as_deref(),
                 env.clone(),
             ))
-            .map_err(to_string)?;
+            .map_err(|error| error.report())?;
         Ok(Self {
             directory,
             worktree,

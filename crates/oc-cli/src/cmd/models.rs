@@ -22,7 +22,7 @@ pub(super) fn execute(args: &ModelsArgs, environment: &StartupEnvironment) -> Re
         worktree,
         env.clone(),
     ))
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| error.report())?;
     let credentials = oc_auth::AuthStore::resolve(&layout, env)
         .all()
         .map_err(|error| error.to_string())?

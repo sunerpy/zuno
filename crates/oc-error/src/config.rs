@@ -97,6 +97,30 @@ impl ConfigError {
     pub fn recovery(&self) -> Recovery {
         Recoverable::recovery(self)
     }
+
+    /// The failure as a user should read it: the [`Display`](std::fmt::Display) line,
+    /// then one line per issue naming its key path.
+    ///
+    /// `Display` deliberately stays a single summary line — several tests pin it, and
+    /// a `{error}` interpolation should not spill across lines. But a summary alone
+    /// makes `failed validation (1 issue(s))` an unactionable message, because the one
+    /// thing the reader needs is *which* key. Anything reporting to a human should use
+    /// this instead.
+    #[must_use]
+    pub fn report(&self) -> String {
+        let mut out = self.to_string();
+        if let Self::Invalid { issues, .. } = self {
+            for issue in issues {
+                let key = if issue.key_path.is_empty() {
+                    "<document>".to_owned()
+                } else {
+                    issue.key_path.join(".")
+                };
+                out.push_str(&format!("\n  {key}: {}", issue.detail));
+            }
+        }
+        out
+    }
 }
 
 impl Recoverable for ConfigError {
@@ -166,6 +190,35 @@ mod tests {
         };
         assert_eq!(issues[0].key_path, vec!["provider", "anthropic", "options"]);
         assert_eq!(issues[1].detail, "unknown model");
+    }
+
+    #[test]
+    fn report_names_every_offending_key_while_display_stays_one_line() {
+        let e = ConfigError::Invalid {
+            path: PathBuf::from("opencode.json"),
+            issues: vec![
+                ConfigIssue::new(["themes"], "unrecognized key"),
+                ConfigIssue::new(["provider", "x", "options"], "expected object"),
+                ConfigIssue::new(Vec::<String>::new(), "not an object"),
+            ],
+        };
+        assert!(!e.to_string().contains('\n'));
+        assert_eq!(
+            e.report(),
+            "config file opencode.json failed validation (3 issue(s))\n  \
+             themes: unrecognized key\n  \
+             provider.x.options: expected object\n  \
+             <document>: not an object"
+        );
+    }
+
+    #[test]
+    fn report_of_a_non_validation_failure_is_just_its_display() {
+        let e = ConfigError::Io {
+            path: PathBuf::from("opencode.json"),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
+        };
+        assert_eq!(e.report(), e.to_string());
     }
 
     #[test]

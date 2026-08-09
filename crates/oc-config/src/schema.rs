@@ -31,6 +31,22 @@
 //! with an actionable message rather than be silently accepted, and producing that
 //! message is the legacy-rejection pass's job — which is only possible if this
 //! schema does not quietly absorb them.
+//!
+//! # The legacy TUI keys are the one exception
+//!
+//! `theme`, `keybinds`, and `tui` are *also* absent from the oracle's top-level
+//! schema, and yet a config that carries them loads without complaint: the oracle
+//! deletes all three from the loaded document **before** the unrecognized-key check
+//! runs (`packages/opencode/src/config/config.ts:53-61`, applied at `:227`). They
+//! belong to `tui.json` now, and the migration that relocates them
+//! (`packages/opencode/src/config/tui-migrate.ts`) skips any directory that already
+//! has a `tui.json` — so on a long-lived installation the keys stay in
+//! `opencode.json` forever while the oracle keeps ignoring them.
+//!
+//! This port matches that exactly: [`LEGACY_TUI_KEYS`] is accepted, carried by a
+//! [`LegacyTuiKey`] field that holds nothing, and never serialized. Nothing else is
+//! relaxed — every other unrecognized top-level key is still rejected, and every
+//! form on the legacy-rejection list still fails.
 
 pub mod agent;
 pub mod formatter;
@@ -101,6 +117,30 @@ pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "memory",
     "experimental",
 ];
+
+/// The keys the oracle deletes from a loaded config before it checks for
+/// unrecognized keys (`packages/opencode/src/config/config.ts:53-61`).
+///
+/// Deliberately not part of [`KNOWN_TOP_LEVEL_KEYS`], which is the set that
+/// survives into the merged result. These are accepted and then dropped, which is
+/// why the two lists are separate rather than one.
+pub const LEGACY_TUI_KEYS: &[&str] = &["theme", "keybinds", "tui"];
+
+/// A legacy TUI key's value, accepted and discarded.
+///
+/// Any JSON shape deserializes into this, and it carries nothing — so a config
+/// that sets `theme` compares equal to one that does not, exactly as it would
+/// after the oracle's `delete copy.theme`. The field is never serialized, so the
+/// merged document matches the oracle's, which no longer has the key either.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LegacyTuiKey;
+
+impl<'de> Deserialize<'de> for LegacyTuiKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        serde::de::IgnoredAny::deserialize(deserializer)?;
+        Ok(Self)
+    }
+}
 
 /// A parsed opencode config file — one layer, not a merged result.
 ///
@@ -220,6 +260,15 @@ pub struct Config {
     /// Options under active development.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub experimental: Option<ExperimentalConfig>,
+    /// Legacy TUI theme, moved to `tui.json`. Accepted, then discarded.
+    #[serde(default, skip_serializing)]
+    pub theme: LegacyTuiKey,
+    /// Legacy TUI keybinds, moved to `tui.json`. Accepted, then discarded.
+    #[serde(default, skip_serializing)]
+    pub keybinds: LegacyTuiKey,
+    /// Legacy TUI block, moved to `tui.json`. Accepted, then discarded.
+    #[serde(default, skip_serializing)]
+    pub tui: LegacyTuiKey,
 }
 
 impl Config {

@@ -22,7 +22,7 @@
 //! enclosing object and the deserializer's own message ("unknown variant `maybe`,
 //! expected `allow` or `deny`") supplies the rest.
 
-use crate::schema::{Config, KNOWN_TOP_LEVEL_KEYS};
+use crate::schema::{Config, KNOWN_TOP_LEVEL_KEYS, LEGACY_TUI_KEYS};
 use oc_error::{ConfigError, ConfigIssue};
 use serde_json::Value;
 use std::path::Path;
@@ -63,13 +63,20 @@ impl Config {
 
 /// The oracle's `topLevelExtraKeys` check (`config/parse.ts:40-53,74-78`), reported
 /// one issue per offending key so a fixer can act on each.
+///
+/// [`LEGACY_TUI_KEYS`] are exempt because the oracle deletes them from the document
+/// before this check runs (`config/config.ts:53-61,227`). The exemption is that
+/// three-name list and nothing wider: every other unnamed key is still an issue.
 fn reject_unknown_top_level_keys(path: &Path, value: &Value) -> Result<(), ConfigError> {
     let Some(object) = value.as_object() else {
         return Ok(());
     };
     let issues: Vec<ConfigIssue> = object
         .keys()
-        .filter(|key| !KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str()))
+        .filter(|key| {
+            !KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str())
+                && !LEGACY_TUI_KEYS.contains(&key.as_str())
+        })
         .map(|key| ConfigIssue::new([key.as_str()], "unrecognized key"))
         .collect();
     if issues.is_empty() {
