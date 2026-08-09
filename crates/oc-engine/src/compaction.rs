@@ -695,7 +695,7 @@ pub fn build_summary_prompt(previous_summary: Option<&str>, context: &[String]) 
         .join("\n\n")
 }
 
-fn summary_safe_message_owned(message: Message) -> Message {
+pub(crate) fn summary_safe_message_owned(message: Message) -> Message {
     Message::from_content(
         message.role,
         message

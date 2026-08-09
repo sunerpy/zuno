@@ -1049,17 +1049,33 @@ pub fn project_history_owned(system_prompt: &str, history: Vec<MessageWithParts>
 #[must_use]
 pub fn project_history_owned_with_ids(
     system_prompt: &str,
-    mut history: Vec<MessageWithParts>,
+    history: Vec<MessageWithParts>,
 ) -> Vec<ProjectedMessage> {
+    map_project_history_owned_with_ids(system_prompt, history, std::convert::identity)
+}
+
+/// Consume retained history and transform each projected message before the next
+/// stored message is projected.
+///
+/// Unlike mapping the [`Vec`] returned by [`project_history_owned_with_ids`], this
+/// keeps at most one stored message's projected payloads alive before `map` can
+/// reduce them. Compaction uses that property to charge a complete tool result and
+/// immediately truncate it instead of first aggregating every complete result in
+/// the session.
+pub(crate) fn map_project_history_owned_with_ids<T>(
+    system_prompt: &str,
+    mut history: Vec<MessageWithParts>,
+    mut map: impl FnMut(ProjectedMessage) -> T,
+) -> Vec<T> {
     let retained_start = retained_history(&history).as_ptr_range().start;
     let tail_index = history
         .iter()
         .position(|message| std::ptr::eq(message, retained_start))
         .unwrap_or(history.len());
-    let mut projected = vec![ProjectedMessage {
+    let mut projected = vec![map(ProjectedMessage {
         message_id: None,
         message: Message::new(Role::System, system_prompt),
-    }];
+    })];
     for message in history.drain(tail_index..) {
         let message_id = message.info.id;
         let mut messages = Vec::new();
@@ -1069,9 +1085,11 @@ pub fn project_history_owned_with_ids(
                 append_assistant_message_owned(&mut messages, message.parts);
             }
         }
-        projected.extend(messages.into_iter().map(|message| ProjectedMessage {
-            message_id: Some(message_id.clone()),
-            message,
+        projected.extend(messages.into_iter().map(|message| {
+            map(ProjectedMessage {
+                message_id: Some(message_id.clone()),
+                message,
+            })
         }));
     }
     projected

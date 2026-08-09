@@ -6230,3 +6230,34 @@ the shared `oc-pty` test helper. All now have local reasons. The prohibited froz
 exception whose rationale lives in the scanner. The new
 `every_first_party_lint_suppression_has_a_reason` test scans all crate Rust files,
 failed red on those four gaps, and passed green after the reasons were added.
+
+## [2026-08-09] Todo 123 — G2's intermittent allocation was the aggregate-first owned compaction transcript
+
+The Todo 122 EventService lead was disproved. The roughly 164 MiB step came from
+startup compaction: `transcript_owned` first collected every complete
+provider-projected message (including complete tool results) and reduced tool
+output only later. On the 105,118,812-part-byte W-real subject, that complete
+projected payload survived long enough for the two-second sampler to catch it.
+
+The fix transforms each owned projected message before projecting the next stored
+message. It still estimates the complete provider-visible message, so compaction
+boundary weighting is unchanged, then immediately applies the existing
+summary-safe tool-output representation. Ordinary provider projection and the
+borrowed transcript remain complete. The regression test pins both facts with a
+2 MiB tool result; restoring the aggregate-first path made it fail with 2,097,152
+retained chars instead of 2,012. A temporary 1 ms proxy measured only 20/16/20
+KiB projection increments after the fix instead of 169,944–169,960 KiB.
+
+The unchanged revision-2 frozen gate passed. G1 was 20,380 KiB (ratio 0.0214).
+G2 peaks were `[1,493,496, 1,493,948, 1,510,444, 1,494,024, 1,510,528]` KiB,
+median 1,494,024 KiB and ratio 0.4936 against the 1,513,496 KiB ceiling. All five
+runs passed. Spread was 17,032 KiB; median margin was 19,472 KiB, exceeding the
+spread by 2,440 KiB. The raw artefact sha256 is
+`4b5ccf725f47ab6ebd80716e2695c4cc6722ad8f90f703a013508800100c87bb`;
+the full audit is `.omo/evidence/task-123-opencode-rust.txt`.
+
+Final review removed an accidental summary-safe conversion from the borrowed
+`transcript()` path; only the owned W-real startup path retains the optimization.
+Workspace tests, build, Clippy `-D warnings`, fmt, locked/offline metadata, the
+methodology hash tests, and worktree-local rust-analyzer diagnostics all passed
+after that scope correction.

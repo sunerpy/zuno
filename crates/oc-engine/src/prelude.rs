@@ -46,9 +46,10 @@ use serde_json::Value;
 use crate::compaction::{
     CompactionCache, CompactionError, CompactionOutcome, CompactionPolicy, CompactionRequest,
     CompactionState, CompactionTrigger, TokenWindow, TranscriptEntry, run_compaction,
+    summary_safe_message_owned,
 };
 use crate::r#loop::{
-    ResolvedModel, hydrate_retained_history, project_history, project_history_owned_with_ids,
+    ResolvedModel, hydrate_retained_history, map_project_history_owned_with_ids, project_history,
     retained_history,
 };
 use futures::StreamExt;
@@ -461,25 +462,23 @@ pub fn transcript(system_prompt: &str, history: &[MessageWithParts]) -> Vec<Tran
 
 /// Consume stored history into the transcript selected and summarized by compaction.
 ///
-/// Byte-equivalent to [`transcript`], but part strings and JSON values move into the
-/// provider messages. This prevents startup compaction from retaining hydrated
-/// history beside a second full projected transcript.
+/// Part strings and JSON values move into provider messages. Each complete message
+/// is charged before tool output is reduced to the summary-safe representation, so
+/// boundary selection remains based on the provider-visible history without ever
+/// collecting every complete tool result into a second transcript.
 #[must_use]
 pub fn transcript_owned(
     system_prompt: &str,
     history: Vec<MessageWithParts>,
 ) -> Vec<TranscriptEntry> {
-    project_history_owned_with_ids(system_prompt, history)
-        .into_iter()
-        .map(|projected| {
-            let estimated = estimate_tokens(&projected.message);
-            TranscriptEntry::new(
-                projected.message_id.unwrap_or_default(),
-                projected.message,
-                estimated,
-            )
-        })
-        .collect()
+    map_project_history_owned_with_ids(system_prompt, history, |projected| {
+        let estimated = estimate_tokens(&projected.message);
+        TranscriptEntry::new(
+            projected.message_id.unwrap_or_default(),
+            summary_safe_message_owned(projected.message),
+            estimated,
+        )
+    })
 }
 
 /// Estimate one message's token cost the way upstream does.
