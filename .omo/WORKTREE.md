@@ -2059,3 +2059,42 @@ worktrees: oc-wt/tF{1,2,3,4}
 G6 的 PTY 夹具只启动一个 **sleep** 的子进程，所以完全看不见「被 `SIGTTIN` 停住、读不到终端」——真实用户启动的进程是**会读**的。这是「测试替身比现实更友善」的第 5 个实例，也正是它要写的那类测试。
 
 worktrees：oc-wt/t{124,125,126,127,128,130}
+
+## Wave 45 (2026-08-09)：补齐 22 个 API 操作，缺口 45 → 23
+
+`main` = `7c44013`，**3292 测试通过**，clippy 0，fmt 干净，锁可离线复现。126/134 完成。
+
+### 三个任务合并，但过程比结果值得记
+
+| todo | 结果 | 我亲手验证的 |
+|---|---|---|
+| **130** | oracle 重钉 **1.18.15** | 它做了个我没想到的区分：**运行时 oracle（1.18.15）与源码基线（1.18.13）是两个独立的钉**，并写了 `version_gap` 让差异可见而不是被掩盖。把 `PINNED_RELEASE` 改成未安装的版本，两个具名测试失败 |
+| **127** | catalog + fs 12 个操作 | 实机起服务测目录逃逸：`../` → 404、`%2e%2e/` → 403、`/etc/hostname` → 403，**泄露 0**，合法读取 200 |
+| **128** | session 只读 + permission/question + PTY 10 个 | `/history` 默认 50 上限 200；把票据的 `entries.remove` 改成 `get`（可重放），`a_ticket_is_valid_once` 失败 |
+
+`unsupported_routes()` 从 31 条降到 **9 条**——只剩 todo 129 的 session 变更操作。
+
+### 我把带冲突标记的代码提交进了 main
+
+合并 127 时脚本报了三个冲突文件，其中包括 **`compat_suite.rs`**。我的自动解决脚本只认 append-only 散文，却紧接着 `git add -A && git commit`——**带 `<<<<<<<` 的 Rust 源码进了 `main`**。
+
+抓到它的不是测试，是我提交后看 `git show --stat`，发现 git 自己在 commit message 里列了 `# Conflicts:`。立刻 `reset --hard` 回退、确认干净、手工重做。
+
+**根因是我自己的 `premerge.sh`**：先合并再验证，冲突解决不完整时 `main` 已经脏了。**第 36 波我就记下要修，当时没改——这次它咬了我。** 已修：新增闸门，任何 `crates/ docs/ .omo/` 里存在冲突标记就在跑任何昂贵检查前拒绝继续，并已用植入标记自测命中。
+
+### 手工解决暴露的四类冲突，自动脚本一个都处理不了
+
+1. **`Cargo.toml`**：127 加 `oc-auth`，128 加 `hyper`——**两侧都要**。
+2. **`api/mod.rs`**：两侧各自从 `unsupported_routes()` 删了自己那批行，git 把**两侧的删除都"恢复"了**，导致路由重复注册。必须手工再删 22 条。
+3. **计数**：127 说 33 缺口，128 说 35——**都不对**，实测 23。`compared` 51→71、`exempted` 123→103、`backed` 25→35，全部得跑测试读真值。
+4. **调用点**：我取了 HEAD 侧，丢掉 128 的 `compare_selected_api_dimensions` **唯一调用点**——那 10 个操作的维度比较根本没在跑。**是 clippy 的 `never used` 救了我。**
+
+第 4 条最危险。若 clippy 没报 dead_code，我会合并一个「实现了但从不比较」的假绿。**一个没有调用点的测试辅助函数，和一个空转的测试是同一种谎言。**
+
+### 第 8 次「测试替身比现实更友善」：跨分支夹具腐坏
+
+127 的 `api_unbacked_endpoint_...` 挑了 `/api/permission/saved` 当"仍未实现"样本，而 128 正好实现了它 → `left: 200, right: 503`。这个样本已被迫搬两次（`/api/integration` → `/api/permission/saved` → `/interrupt`）。
+
+我在注释里写明了终局：**一旦 `unsupported_routes()` 为空，该测试应改成断言「该函数为空」**——那才是不随实现进度腐坏的断言形式。这件事已交给 todo 129。
+
+worktrees：oc-wt/t{124,125,126,129}
