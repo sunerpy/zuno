@@ -493,6 +493,31 @@ pub struct DbArgs {
     pub format: DbFormat,
 }
 
+/// `export [sessionID] [--sanitize]` (`cli/cmd/export.ts:222-234`).
+///
+/// The id stays optional so the argument shape matches upstream's, but omitting
+/// it upstream opens a `@clack/prompts` picker (`export.ts:259-270`). This port
+/// has no picker, so the absent case fails with the same kind of message
+/// `providers login` already uses for its interactive selection rather than
+/// silently choosing a session for the caller.
+#[derive(Debug, Clone, Args)]
+pub struct ExportArgs {
+    /// Session id to export.
+    #[arg(value_name = "sessionID")]
+    pub session_id: Option<String>,
+    /// Redact sensitive transcript and file data.
+    #[arg(long)]
+    pub sanitize: bool,
+}
+
+/// `import <file>` (`cli/cmd/import.ts:94-107`).
+#[derive(Debug, Clone, Args)]
+pub struct ImportArgs {
+    /// Path to a JSON file produced by `export`.
+    #[arg(value_name = "file")]
+    pub file: String,
+}
+
 #[derive(Debug, Clone, Args)]
 #[command(subcommand_required = true)]
 pub struct DebugArgs {
@@ -603,10 +628,10 @@ pub enum Command {
     Debug(DebugArgs),
     /// Generate shell completion output.
     Completion(PendingArgs),
-    /// Export session data.
-    Export(PendingArgs),
-    /// Import session data.
-    Import(PendingArgs),
+    /// Export session data as JSON.
+    Export(ExportArgs),
+    /// Import session data from a JSON file.
+    Import(ImportArgs),
 
     /// Explain why the hosted Console is excluded.
     Console(RejectedArgs),
@@ -643,14 +668,8 @@ impl Command {
                 DispatchArguments::Pending(ImplementedCommand::Completion, args.args),
                 environment,
             ),
-            Self::Export(args) => dispatch(
-                DispatchArguments::Pending(ImplementedCommand::Export, args.args),
-                environment,
-            ),
-            Self::Import(args) => dispatch(
-                DispatchArguments::Pending(ImplementedCommand::Import, args.args),
-                environment,
-            ),
+            Self::Export(args) => dispatch(DispatchArguments::Export(args), environment),
+            Self::Import(args) => dispatch(DispatchArguments::Import(args), environment),
             Self::Console(_) => reject("console", environment),
             Self::Web(_) => reject("web", environment),
             Self::Stats(_) => reject("stats", environment),
@@ -747,6 +766,8 @@ pub enum DispatchArguments {
     Mcp(McpArgs),
     Db(DbArgs),
     Debug(DebugArgs),
+    Export(ExportArgs),
+    Import(ImportArgs),
     Pending(ImplementedCommand, Vec<OsString>),
 }
 
@@ -764,8 +785,25 @@ impl DispatchArguments {
             Self::Mcp(_) => ImplementedCommand::Mcp,
             Self::Db(_) => ImplementedCommand::Db,
             Self::Debug(_) => ImplementedCommand::Debug,
+            Self::Export(_) => ImplementedCommand::Export,
+            Self::Import(_) => ImplementedCommand::Import,
             Self::Pending(command, _) => *command,
         }
+    }
+
+    /// Whether this command still routes to [`PendingCommandDispatcher`].
+    ///
+    /// This is the *behavioural* answer to "is there a handler", and it is what
+    /// `oc-cli/tests/surface.rs` asserts against [`Disposition::Implemented`].
+    /// Reading it off the disposition table instead would make the table agree
+    /// with itself: a row saying `implemented` next to a stub handler is exactly
+    /// the defect todo 116 fixed, and only a check anchored on the dispatch arm
+    /// can see it.
+    ///
+    /// [`Disposition::Implemented`]: crate::Disposition::Implemented
+    #[must_use]
+    pub const fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending(_, _))
     }
 }
 
@@ -792,6 +830,34 @@ pub enum Action {
         message: &'static str,
         environment: StartupEnvironment,
     },
+}
+
+/// Every command this binary registers without a handler behind it, and why.
+///
+/// This exists so the set is enumerable rather than discoverable only by running
+/// each command. `oc-cli/tests/surface.rs` asserts it in **both** directions: each
+/// entry really does reach [`PendingCommandDispatcher`], and no command outside it
+/// does. That is the check `export` needed and did not have — its disposition, the
+/// generated matrix and a checked-off todo all agreed it worked, because all three
+/// described intent and none of them ran the handler.
+///
+/// A command listed here must not carry [`Disposition::Implemented`], which is the
+/// invariant the same test enforces.
+///
+/// [`Disposition::Implemented`]: crate::Disposition::Implemented
+pub const PENDING_COMMANDS: &[(&str, &str)] = &[(
+    "completion",
+    "upstream's completion script is a yargs shell function that calls back into \
+     `--get-yargs-completions`, a protocol this port does not implement; generate \
+     completions from your shell against `--help` instead",
+)];
+
+/// The recorded reason one registered command has no handler.
+#[must_use]
+pub fn pending_reason(command: &str) -> Option<&'static str> {
+    PENDING_COMMANDS
+        .iter()
+        .find_map(|(name, reason)| (*name == command).then_some(*reason))
 }
 
 /// Behavior supplied by todo 56 and later command-owning todos.
@@ -836,16 +902,22 @@ impl std::fmt::Display for DispatchError {
 
 impl std::error::Error for DispatchError {}
 
-/// Honest default while todo 56 has not supplied the command handlers.
+/// The failure a command registered without a handler produces.
+///
+/// It reports the recorded reason from [`PENDING_COMMANDS`] when there is one, so
+/// a user reads why the command cannot work rather than the number of a build
+/// task that has since been closed.
 #[derive(Debug, Default)]
 pub struct PendingCommandDispatcher;
 
 impl CommandDispatcher for PendingCommandDispatcher {
     fn dispatch(&mut self, request: DispatchRequest) -> Result<(), DispatchError> {
+        let command = request.command.as_str();
         Err(DispatchError {
-            command: request.command.as_str(),
+            command,
             owner: "todo 56",
-            detail: None,
+            detail: pending_reason(command)
+                .map(|reason| format!("`{command}` is not available: {reason}")),
         })
     }
 }
@@ -870,7 +942,11 @@ mod tests {
             &["tui"],
             &["completion"],
             &["export"],
-            &["import"],
+            // `<file>` is required, as upstream's `demandOption: true`
+            // (`cli/cmd/import.ts:98-102`) makes it; a bare `import` exits 1 on
+            // the released binary too, so this names a valid invocation rather
+            // than relaxing the requirement.
+            &["import", "exported.json"],
         ] {
             let cli =
                 Cli::try_parse_from(std::iter::once("opencode-rust").chain(args.iter().copied()))

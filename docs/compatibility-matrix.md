@@ -86,10 +86,10 @@ as identifiers for the work that owns a surface, not as anything a user needs.
 | `ConsoleCommand` | `console` | rejected | the hosted OpenCode Console is excluded from this Rust port's local-agent scope; use `providers` (alias `auth`) for local credentials instead |
 | `DbCommand` | `db` | implemented | registered through the headless-command seam for todo 56 and the maintenance extensions in todo 84 |
 | `DebugCommand` | `debug` | implemented | registered through the headless-command seam for todo 56 |
-| `ExportCommand` | `export` | implemented | registered through the headless-command seam for todo 56 |
+| `ExportCommand` | `export` | implemented | prints one session's whole transcript as JSON, byte-compared against the released binary's own export, with `--sanitize` redacting the same fields |
 | `GenerateCommand` | `generate` | rejected | the command is a TypeScript source-tree SDK/OpenAPI generator that depends on Prettier and is excluded from the runtime binary; use the server's `/openapi.json` document instead |
 | `GithubCommand` | `github` | rejected | the hosted GitHub agent is outside the local-agent scope; run `opencode-rust run` from the CI workflow instead |
-| `ImportCommand` | `import` | implemented | registered through the headless-command seam for todo 56 |
+| `ImportCommand` | `import` | implemented | reads a document `export` produced back into this checkout's database; share-URL imports are not accepted because the hosted share service is outside this port's scope |
 | `McpCommand` | `mcp` | implemented | registered through the headless-command seam for todo 56 |
 | `ModelsCommand` | `models` | implemented | registered through the headless-command seam for todo 56 |
 | `PluginCommand` | `plugin` | not-registered | plugin installation must wait for todo 60's resident JavaScript host and compatibility gate; accepting installs before plugins can load would corrupt configuration |

@@ -2,6 +2,7 @@ mod agent;
 mod db;
 mod db_maint;
 mod debug;
+mod export;
 mod mcp;
 mod models;
 mod providers;
@@ -23,48 +24,45 @@ use crate::{
 pub(crate) struct HeadlessCommandDispatcher;
 
 impl CommandDispatcher for HeadlessCommandDispatcher {
+    /// Route one request to its handler.
+    ///
+    /// This is one exhaustive `match` rather than a chain of `if let` probes so
+    /// that adding a [`DispatchArguments`] variant without a handler fails to
+    /// compile. The previous chain fell through to [`PendingCommandDispatcher`]
+    /// for anything it did not recognise, which is how `export` came to be
+    /// registered, documented and advertised as implemented while every
+    /// invocation exited 1.
     fn dispatch(&mut self, request: DispatchRequest) -> Result<(), DispatchError> {
-        if let DispatchArguments::Db(args) = &request.args {
-            return db::execute(args)
-                .map_err(|error| DispatchError::command(request.command, error));
+        let command = request.command;
+        let to_error = |error: String| DispatchError::command(command, error);
+        match &request.args {
+            DispatchArguments::Db(args) => db::execute(args).map_err(to_error),
+            DispatchArguments::Session(args) => session::execute(args).map_err(to_error),
+            DispatchArguments::Agent(args) => {
+                agent::execute(args, &request.environment).map_err(to_error)
+            }
+            DispatchArguments::Models(args) => {
+                models::execute(args, &request.environment).map_err(to_error)
+            }
+            DispatchArguments::Providers(args) => {
+                providers::execute(args, &request.environment).map_err(to_error)
+            }
+            DispatchArguments::Mcp(args) => {
+                mcp::execute(args, &request.environment).map_err(to_error)
+            }
+            DispatchArguments::Debug(args) => {
+                debug::execute(args, &request.environment).map_err(to_error)
+            }
+            DispatchArguments::Serve(args) => serve::execute(args).map_err(to_error),
+            DispatchArguments::Run(args) => {
+                run::execute(args, &request.environment).map_err(to_error)
+            }
+            DispatchArguments::Tui(args) => {
+                tui::execute(args, &request.environment).map_err(to_error)
+            }
+            DispatchArguments::Export(args) => export::export(args).map_err(to_error),
+            DispatchArguments::Import(args) => export::import(args).map_err(to_error),
+            DispatchArguments::Pending(_, _) => PendingCommandDispatcher.dispatch(request),
         }
-        if let DispatchArguments::Session(args) = &request.args {
-            return session::execute(args)
-                .map_err(|error| DispatchError::command(request.command, error));
-        }
-        if let DispatchArguments::Agent(args) = &request.args {
-            return agent::execute(args, &request.environment)
-                .map_err(|error| DispatchError::command(request.command, error));
-        }
-        if let DispatchArguments::Models(args) = &request.args {
-            return models::execute(args, &request.environment)
-                .map_err(|error| DispatchError::command(request.command, error));
-        }
-        if let DispatchArguments::Providers(args) = &request.args {
-            return providers::execute(args, &request.environment)
-                .map_err(|error| DispatchError::command(request.command, error));
-        }
-        if let DispatchArguments::Mcp(args) = &request.args {
-            return mcp::execute(args, &request.environment)
-                .map_err(|error| DispatchError::command(request.command, error));
-        }
-        if let DispatchArguments::Debug(args) = &request.args {
-            return debug::execute(args, &request.environment)
-                .map_err(|error| DispatchError::command(request.command, error));
-        }
-        if let DispatchArguments::Serve(args) = &request.args {
-            return serve::execute(args)
-                .map_err(|error| DispatchError::command(request.command, error));
-        }
-        if let DispatchArguments::Run(args) = &request.args {
-            return run::execute(args, &request.environment)
-                .map_err(|error| DispatchError::command(request.command, error));
-        }
-        if let DispatchArguments::Tui(args) = &request.args {
-            return tui::execute(args, &request.environment)
-                .map_err(|error| DispatchError::command(request.command, error));
-        }
-
-        PendingCommandDispatcher.dispatch(request)
     }
 }

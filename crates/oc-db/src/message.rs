@@ -567,6 +567,61 @@ impl<'conn> MessageStore<'conn> {
         self.put_message_at(record, now_millis())
     }
 
+    /// Insert a message only if its id is free, leaving any existing row alone.
+    ///
+    /// This is the writer `import` needs and [`Self::put_message_at`] cannot be:
+    /// upstream imports with `onConflictDoNothing` (`cli/cmd/import.ts:196-204`),
+    /// so re-importing a file is not a way to overwrite a live transcript. Using
+    /// the upserting writer there would make `import` a silent editor of history.
+    ///
+    /// Returns whether a row was written.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::put_message_at`].
+    pub fn insert_message_if_absent(&self, record: &MessageRecord) -> Result<bool, DbError> {
+        let data = record.data_json()?;
+        let written = self
+            .prepare(
+                "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+                 VALUES (?1, ?2, ?3, ?3, ?4) \
+                 ON CONFLICT(id) DO NOTHING",
+            )?
+            .execute(rusqlite::params![
+                &record.id,
+                &record.session_id,
+                record.time_created,
+                &data,
+            ])
+            .map_err(map_error)?;
+        Ok(written > 0)
+    }
+
+    /// Insert a part only if its id is free. The counterpart of
+    /// [`Self::insert_message_if_absent`], for the same reason.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::put_part_at`].
+    pub fn insert_part_if_absent(&self, record: &PartRecord) -> Result<bool, DbError> {
+        let data = record.data_json()?;
+        let written = self
+            .prepare(
+                "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
+                 VALUES (?1, ?2, ?3, ?4, ?4, ?5) \
+                 ON CONFLICT(id) DO NOTHING",
+            )?
+            .execute(rusqlite::params![
+                &record.id,
+                &record.message_id,
+                &record.session_id,
+                record.time_created,
+                &data,
+            ])
+            .map_err(map_error)?;
+        Ok(written > 0)
+    }
+
     /// Upsert a part, stamping `time_updated` with `now`.
     ///
     /// Mirrors `projector.ts:319-323`.

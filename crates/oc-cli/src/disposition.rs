@@ -75,7 +75,7 @@ const COMMAND_DISPOSITIONS: [CommandDisposition; 23] = [
         upstream_symbol: "ExportCommand",
         command: "export",
         disposition: Disposition::Implemented,
-        reason: "registered through the headless-command seam for todo 56",
+        reason: "prints one session's whole transcript as JSON, byte-compared against the released binary's own export, with `--sanitize` redacting the same fields",
     },
     CommandDisposition {
         upstream_symbol: "GenerateCommand",
@@ -93,7 +93,7 @@ const COMMAND_DISPOSITIONS: [CommandDisposition; 23] = [
         upstream_symbol: "ImportCommand",
         command: "import",
         disposition: Disposition::Implemented,
-        reason: "registered through the headless-command seam for todo 56",
+        reason: "reads a document `export` produced back into this checkout's database; share-URL imports are not accepted because the hosted share service is outside this port's scope",
     },
     CommandDisposition {
         upstream_symbol: "McpCommand",

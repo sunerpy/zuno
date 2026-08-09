@@ -54,8 +54,8 @@ use serde_json::Value as Json;
 
 use crate::open;
 use crate::session::{
-    ArchivedFilter, ListQuery, ListScope, SessionSort, Summary, Tokens, UPSTREAM_LIST_LIMIT,
-    list_sql,
+    ArchivedFilter, ListQuery, ListScope, Session, SessionSort, Summary, Tokens,
+    UPSTREAM_LIST_LIMIT, list_sql,
 };
 
 /// Which projects a listing covers.
@@ -259,17 +259,22 @@ pub struct TimeInfo {
     pub archived: Option<i64>,
 }
 
-/// A session plus its project summary — upstream's `GlobalInfo`
-/// (`session.ts:254-258`), which is `Info` spread with a nullable `project`.
+/// One session in the shape upstream's `Session.Info` declares
+/// (`session.ts:224-245`), as `fromRow` (`session.ts:59-118`) builds it.
 ///
 /// Field names are upstream's, not Rust's: `projectID`, `workspaceID` and
 /// `parentID` keep their capitalisation because a client reading
 /// `/experimental/session` and a client reading this CLI must not have to know
 /// which produced the bytes. Absent optional fields are **omitted**, not null,
-/// because that is what `JSON.stringify` does to an `undefined` property; only
-/// `project` is explicitly nullable, from `?? null` (`session.ts:595`).
+/// because that is what `JSON.stringify` does to an `undefined` property.
+///
+/// This is deliberately separate from [`GlobalInfo`] and reused by
+/// [`crate::session_export`]. Upstream spreads `Info.fields` into `GlobalInfo`
+/// and `export` emits a bare `Info`, so the two shapes share one field list
+/// there; restating those nineteen fields per consumer here would let a listing
+/// and an export disagree about the same session without any test noticing.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct GlobalInfo {
+pub struct SessionInfo {
     /// `ses_`-prefixed identifier.
     pub id: String,
     /// Short human-facing token.
@@ -323,8 +328,55 @@ pub struct GlobalInfo {
     pub permission: Option<Json>,
     /// Timestamps.
     pub time: TimeInfo,
+}
+
+/// A session plus its project summary — upstream's `GlobalInfo`
+/// (`session.ts:254-258`), which is `Info` spread with a nullable `project`.
+///
+/// `project` is explicitly nullable rather than omitted, from `?? null`
+/// (`session.ts:595`). The spread is a `serde` flatten, so the emitted key order
+/// is [`SessionInfo`]'s followed by `project` — exactly what the endpoint sends.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GlobalInfo {
+    /// The session's own nineteen fields.
+    #[serde(flatten)]
+    pub session: SessionInfo,
     /// The project that owns this session, or `null` when its row is gone.
     pub project: Option<ProjectInfo>,
+}
+
+/// Build the wire shape of one session row.
+///
+/// This is the single decode from storage to upstream's `Info`, shared by the
+/// listing and by [`crate::session_export`].
+#[must_use]
+pub fn session_info(session: Session) -> SessionInfo {
+    SessionInfo {
+        id: session.id,
+        slug: session.slug,
+        project_id: session.project_id,
+        workspace_id: session.workspace_id,
+        directory: session.directory,
+        path: session.path,
+        parent_id: session.parent_id,
+        title: session.title,
+        agent: session.agent,
+        model: opaque(session.model.as_deref()),
+        version: session.version,
+        summary: session.summary.map(summary_info),
+        cost: session.cost,
+        tokens: token_usage(session.tokens),
+        share: session.share_url.map(|url| ShareInfo { url }),
+        metadata: opaque(session.metadata.as_deref()),
+        revert: opaque(session.revert.as_deref()),
+        permission: opaque(session.permission.as_deref()),
+        time: TimeInfo {
+            created: session.time_created,
+            updated: session.time_updated,
+            compacting: session.time_compacting,
+            archived: session.time_archived,
+        },
+    }
 }
 
 /// One listed session: the wire shape, plus the counts a table needs.
@@ -502,30 +554,7 @@ fn decode(row: &Row<'_>) -> rusqlite::Result<ListedSession> {
 
     Ok(ListedSession {
         info: GlobalInfo {
-            id: session.id,
-            slug: session.slug,
-            project_id: session.project_id,
-            workspace_id: session.workspace_id,
-            directory: session.directory,
-            path: session.path,
-            parent_id: session.parent_id,
-            title: session.title,
-            agent: session.agent,
-            model: opaque(session.model.as_deref()),
-            version: session.version,
-            summary: session.summary.map(summary_info),
-            cost: session.cost,
-            tokens: token_usage(session.tokens),
-            share: session.share_url.map(|url| ShareInfo { url }),
-            metadata: opaque(session.metadata.as_deref()),
-            revert: opaque(session.revert.as_deref()),
-            permission: opaque(session.permission.as_deref()),
-            time: TimeInfo {
-                created: session.time_created,
-                updated: session.time_updated,
-                compacting: session.time_compacting,
-                archived: session.time_archived,
-            },
+            session: session_info(session),
             project,
         },
         messages,

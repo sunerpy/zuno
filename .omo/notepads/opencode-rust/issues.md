@@ -5967,3 +5967,82 @@ A session row is written **before** the provider is dialled, so pointing `baseUR
 `http://127.0.0.1:1/v1` produces a complete session row and a clean
 `Connection refused` — enough to reproduce this class of seam manually with no cassette
 and no mock server. Used for the `env -i` reproduction in the evidence file.
+## [2026-08-09] Todo 116 — `export` implemented; the liar class was two commands wide
+
+Resolution: **(a) implement**, not (b) correct the docs. `export` and `import` both work and both
+are byte-compared against the released 1.18.12 binary on one shared database. Evidence
+`.omo/evidence/task-116-opencode-rust.txt`.
+
+### The lesson, stated as a rule
+
+**The disposition table and the generated matrix could never have caught this, because the matrix
+is generated FROM the table.** Any test comparing the two proves only that two documents derived
+from one source agree. The check has to read the *dispatch arm the parsed command lands on*.
+
+That is now `DispatchArguments::is_pending()`, asserted against every
+`Disposition::Implemented` row in `oc-cli/tests/surface.rs`, with:
+- **coverage in both directions** so it cannot be narrowed by omitting a probe (12 implemented, 12
+  probes, length equality);
+- **roster closure** so a newly stubbed command cannot hide by being absent from `PENDING_COMMANDS`;
+- **a negative control** that drives a real request through `PendingCommandDispatcher`, because
+  "nothing is pending" passes trivially once nothing is;
+- **mutation proof**: reintroducing the exact shipped defect fails it with
+  `` `export` (ExportCommand) is recorded as implemented but routes to the pending handler ``.
+
+The routing cause is worth recording too: `cmd/mod.rs` was a chain of `if let` probes that sent
+anything unrecognised to the pending handler. It is now **one exhaustive `match`**, so a
+`DispatchArguments` variant without a handler fails to compile. A fall-through default is how a
+registered command becomes invisible to its own dispatcher.
+
+### The sibling audit changed the count
+
+`disposition.rs` cites "pending todo 56" at lines 48/66/72 (`agent`, `db`, `debug`). Those are
+**stale prose, not stubs** — all three have had handlers since todo 56. Probed and confirmed.
+
+The actual liars were **two**: `export` and `import`. Both fixed by implementing.
+
+`completion` is the only remaining stub and is **not** a disposition liar: upstream registers it
+through yargs's `.completion()` builtin, not as a `*Command` symbol, so it is absent from the
+symbol-keyed fixture and has no row and no matrix entry. Nothing claimed it worked. It was however
+printing "pending todo 56" — a closed task — so it now prints its recorded reason.
+
+**For todo 119:** the disposition table is keyed on the upstream `*Command` symbol, so any command
+upstream registers by another route is structurally outside both the table and the "of upstream's
+23 commands" counts the matrix asserts. `completion` is that case today. Left alone here because
+changing the fixture key moves the matrix counts and the release-surface assertions.
+
+### The differential earned its keep on the first run
+
+It failed on **numbers, not structure**: Rust emitted `"input": 1024.0` / `"cost": 0.0` where the
+oracle emits `1024` / `0`. Not a fixture artefact — `oc-engine/src/loop.rs:1466` writes
+`"cost": 0.0` into the message blob where upstream writes `0`, so `export` printed different bytes
+than the released binary printed **from the same row**. `session_list.rs` already had this rule for
+the one `cost` column it serialises (`serialize_cost`); the export needed it for the whole tree
+because the two `data` blobs pass through untyped.
+
+*A test asserting "the payload has an `info` and a `messages` array" would have passed with
+`1024.0` in it.* This is the same class as SEAM #10: Rust writing a shape TypeScript renders
+differently.
+
+### One shared decode, not two
+
+`SessionInfo` was extracted out of `session_list::GlobalInfo` (which now holds it behind
+`#[serde(flatten)]` plus `project`) and `session_info()` is the single row→wire decode the listing
+and the export share. Restating those 19 fields per consumer would let a listing and an export
+disagree about one session with no test noticing.
+
+### Incidental finding: the workspace test total is not a stable gate number
+
+`cargo test --workspace` **fingerprints doctest targets and silently skips fresh ones.** Two
+consecutive runs of an unchanged tree here reported **3241/3 and 3234/2** — one skipped 14 doctest
+suites (7 tests). Nothing was lost either time; the second run just did less work.
+
+Anyone comparing a summed workspace total against a previous wave's number can therefore see a
+phantom regression or a phantom gain. The stable decomposition is:
+
+    cargo test --workspace --offline --lib --bins --tests   167 suites   3204 passed, 1 ignored
+    cargo test --workspace --offline --doc                   35 suites     30 passed, 1 ignored
+                                                                        = 3234 passed, 2 ignored
+
+Which reconciles exactly: **baseline 3214 + 20 added = 3234.** Future waves should report both
+halves rather than one summed figure.
