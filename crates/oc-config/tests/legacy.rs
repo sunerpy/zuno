@@ -11,9 +11,9 @@ use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
-/// The real user config this port is being validated against, checked in by the
-/// discovery task. Its one difference from the live file is the `theme` key, which
-/// v1.18.13 does not define and which is not a deprecated form either way.
+/// The real user config this port is being validated against, checked in byte-for-byte
+/// including the legacy `theme` key. It once omitted `theme`, and that omission is
+/// what let the schema reject a live config while every test passed.
 fn real_user_config() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/user-config.json")
 }
@@ -87,4 +87,58 @@ fn legacy_a_mode_block_is_rejected_naming_agent_build_and_primary() {
     let found = legacy::inspect_config(&path, &value);
     assert_eq!(found[0].form(), DeprecatedForm::ModeBlock);
     assert_eq!(found[0].message(), *message);
+}
+
+/// The exemption that lets a live config load must not have swallowed a deprecated
+/// form. Both directions: no exempt key is a deprecated form, and every deprecated
+/// form still produces its actionable message.
+#[test]
+fn legacy_the_tui_exemption_rejects_nothing_the_deprecation_pass_owns() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("opencode.json");
+
+    for key in oc_config::LEGACY_TUI_KEYS {
+        let value = json!({ *key: { "anything": true } });
+        assert_eq!(
+            legacy::inspect_config(&path, &value),
+            Vec::new(),
+            "{key} must not be a deprecated form"
+        );
+        oc_config::Config::from_json_value(&path, value.clone())
+            .unwrap_or_else(|e| panic!("{key} must still load: {e:?}"));
+    }
+
+    let still_rejected = [
+        (
+            json!({ "mode": { "build": {} } }),
+            DeprecatedForm::ModeBlock,
+        ),
+        (json!({ "layout": "stretch" }), DeprecatedForm::Layout),
+        (json!({ "autoshare": true }), DeprecatedForm::Autoshare),
+        (json!({ "reference": {} }), DeprecatedForm::Reference),
+        (
+            json!({ "agent": { "build": { "tools": { "write": false } } } }),
+            DeprecatedForm::AgentTools,
+        ),
+        (
+            json!({ "agent": { "build": { "maxSteps": 40 } } }),
+            DeprecatedForm::AgentMaxSteps,
+        ),
+    ];
+    for (value, form) in still_rejected {
+        let found = legacy::inspect_config(&path, &value);
+        assert!(
+            found.iter().any(|d| d.form() == form),
+            "{form:?} stopped being detected in {value}"
+        );
+        let error = legacy::check_config(&path, &value)
+            .expect_err(&format!("{form:?} must still be rejected"));
+        let ConfigError::Invalid { issues, .. } = &error else {
+            panic!("expected Invalid for {form:?}, got {error:?}");
+        };
+        assert!(
+            !issues[0].key_path.is_empty(),
+            "{form:?} must name its key path"
+        );
+    }
 }

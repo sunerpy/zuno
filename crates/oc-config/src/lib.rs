@@ -12,5 +12,5 @@ pub use crate::instructions::{
     LoadedInstructions, Origin, UpwardClaims, WarningKind,
 };
 pub use crate::legacy::{DeprecatedForm, Deprecation};
-pub use crate::schema::{Config, KNOWN_TOP_LEVEL_KEYS};
+pub use crate::schema::{Config, KNOWN_TOP_LEVEL_KEYS, LEGACY_TUI_KEYS, LegacyTuiKey};
 pub use crate::variable::{Missing, Source, Substitution};

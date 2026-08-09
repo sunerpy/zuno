@@ -25,6 +25,8 @@ const REQUIRED_COVERAGE: &[&str] = &[
     "--pure",
     "jsonc-comments",
     "deep-ancestor-walk",
+    "real-user-config",
+    "legacy-tui-keys",
 ];
 
 const INTENTIONAL_DIVERGENCES: &[(&str, &str)] = &[];
@@ -290,7 +292,22 @@ fn matrix() -> Result<Vec<MatrixCase>, Box<dyn Error>> {
                 "OPENCODE_PURE",
             ],
         ),
+        // The live file, byte-for-byte, legacy `theme` included. Rust used to exit 1
+        // on it while the released binary exited 0; nothing in the synthetic trees
+        // above carries that key, which is why every test passed anyway.
+        MatrixCase::config(
+            "real-user-global-config",
+            base_fixture()?
+                .global(&real_user_config())?
+                .env_var("OPENCODE_PURE", "1"),
+            &["real-user-config", "legacy-tui-keys"],
+        ),
     ])
+}
+
+fn real_user_config() -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/user-config.json");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
 #[test]
