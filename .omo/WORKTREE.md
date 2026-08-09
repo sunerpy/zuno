@@ -1936,3 +1936,56 @@ Eleven stale counts corrected, not the two I named — including **five** separa
 claims, one inside a frozen success criterion.
 
 worktree: oc-wt/t122 (the ~100-minute re-measurement, must run alone)
+
+## Wave 42 (2026-08-09): G2 fixed properly — the margin now exceeds the spread
+
+`main` = `26b3921`, **3260 tests**, 0 clippy, fmt clean, lock reproducible offline.
+123/128 done. Only **F1-F4** remain.
+
+### The regression, diagnosed from the distribution rather than guessed
+
+Todo 122's honest FAIL (median 1,527,188 KiB, over by 0.905%) came with a **bimodal**
+distribution — two clusters ~164 MiB apart, the low one matching todo 113's passing median to
+within 320 KiB. That shape is what identified it as a new intermittent allocation rather than
+noise.
+
+**My hypothesis was wrong and the agent disproved it.** I suspected todo 118's shared
+`EventService` retaining ~3,620 parts' worth of events. The real cause: startup compaction's
+`transcript_owned` **aggregated every complete provider-projected message — including complete
+tool results — and only reduced tool output afterwards.** On a 105 MB subject that intermediate
+collection is the 164 MiB. Fixed by streaming through a mapping callback and reducing each
+message immediately after billing it, so the full transcript never exists at once.
+
+### Verified by me from the raw artefact
+
+| gate | median | ceiling | ratio | verdict |
+|---|---|---|---|---|
+| G1 | 20,380 KiB | 477,120 | **0.0214** | **PASS** |
+| G2 | **1,494,024 KiB** | 1,513,496 | **0.4936** | **PASS** |
+
+W-real peaks `[1493496, 1493948, 1510444, 1494024, 1510528]` — **all five under the ceiling**,
+spread **17,032 KiB**, margin **19,472 KiB**. *The margin now exceeds the spread*, which the
+original G2 pass never did (19 MB margin against a 165 MB spread — a coin flip that duly
+flipped). The bimodality is gone: the old 164 MiB step no longer appears in any run.
+
+Mutation: dropping the immediate reduction fails
+`owned_compaction_transcript_charges_full_tool_output_before_truncating_it` — the invariant is
+pinned by name.
+
+### A process defect I caused and fixed
+
+Todo 123 branched from `189a72b`, *before* I appended the "G2 REGRESSED" notepad entry, so its
+commit carried a stale copy that dropped 58 lines of mine. Not a deliberate deletion — a
+**stale-base overwrite**. The merge conflict caught it and I kept both entries.
+
+*Rule: append-only files still conflict when a branch predates the append. Worktrees created
+before a notepad write will silently carry the older file; always resolve those conflicts by
+keeping both sides, never by taking one.*
+
+I also removed a stray empty `.omo/notepadsFIX` created by my own mistyped redirect.
+
+### Next: re-run F1-F4
+
+All 12 Final-Wave blockers are now closed (115-122 for the findings, 123 for the regression they
+exposed). The wave must be re-run in full rather than spot-checked — F1 rejected partly on
+evidence that no longer applies, and F2/F3/F4 each need to see the fixes.
