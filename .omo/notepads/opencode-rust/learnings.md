@@ -6244,3 +6244,50 @@ Second, independent reason no test could have caught it: `completion` has no row
 disposition assertion about it was vacuously satisfied. **A command whose disposition
 lookup returns `None` is unguarded by the entire disposition suite** — worth checking
 for the other surfaces that key off that table.
+## Todo 126 — a doc test that reads the artefact, and two defects in the handover
+
+**The handover did not compile.** 371 uncommitted lines of docs-test machinery
+used `oc_testkit::FrozenThresholds` and `oc_testkit::load_committed_baseline`;
+both live under `oc_testkit::perf::`. `--no-run` failed with three
+E0425/E0433. The mechanism had therefore never executed once. First move on any
+resumed work: build it before reading it for correctness.
+
+**A generator can restate the number it exists to derive.** The same handover
+interpolated `grouped(19_260)` and the literal "about 165,000 KiB" into the G2
+prose — todo 113's superseded margin and todo 122's spread, hand-typed inside
+the code that was supposed to end hand-typing. Seam class 8 ("the test double is
+friendlier than reality") has a sibling: *the generator is friendlier than the
+data*. Both halves of a comparison being computed is not enough; the **prose
+around them** has to be computed too, or it keeps asserting a conclusion the
+data no longer supports.
+
+The fix that actually holds: `g2_robustness_prose` branches on
+`margin > spread`, `margin <= spread`, and `median > ceiling`, so a weaker
+measurement produces weaker wording. Mutation-proved by editing one artefact
+peak — the regenerated sentence flipped to "**narrower than** the 27,032 KiB
+five-run spread" on its own.
+
+**Discovery beats naming.** `memory_gate_measurements` scans
+`.omo/evidence/task-<n>-opencode-rust.txt`, keeps whichever parse as G1/G2
+measurements, and takes the highest task number. Proved with a synthetic
+`task-999` artefact: the test immediately demanded a README citing it. A test
+that hardcodes `task-123-...` would have gone stale the same way the README did.
+
+**The artefact's narrative is a cross-check, never the source.** Three
+assertions make the derived side dominate: the ceiling it prints must equal
+`0.50 x` the committed baseline median; the median it restates twice must equal
+the median of its own five peaks; the verdict it records must equal the verdict
+its median implies. `a_measurement_whose_prose_contradicts_its_own_peaks_is_rejected`
+feeds 90,000,000 KiB peaks under a `PASS` narrative and requires the panic.
+
+**Found while there: README's API split was inverted.** "Twenty-three currently
+have local backends; the other 35 return 503" against the generated
+`api-operations` block's 35 implemented / 23 gaps. Two docs in the same repo
+contradicting each other after todos 127/128. Fixed by deriving both halves from
+the same route probe the matrix already runs, not by retyping the corrected
+pair — `assert_api_counts` now covers `README.md` too.
+
+**Every new helper has a caller.** Checked deliberately after last wave's
+near-miss where a helper lost its only call site and clippy caught it. Clippy at
+`-D warnings` confirms; a helper with no caller is the same lie as a test that
+does not assert.
