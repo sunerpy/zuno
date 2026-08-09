@@ -5894,3 +5894,28 @@ by simply *using the product across the boundary the README promises.*
 
 Nine seams were found during execution. The Final Wave found a tenth, and eleven more blockers.
 **Every one was invisible to a green suite.**
+
+## [2026-08-09] RESOLVED (todo 120): G5 now reaches the production turn-event boundary, and truncated error bodies keep their cause
+
+The named `engine_turn_events_apply_backpressure` gate now fills
+`oc_engine::event_channel()` through `TurnEventSender::publish`, proves the next
+send waits while unrelated Tokio work still progresses, and proves it resumes
+when the consumer advances. Repeating F2's dropped-send-future mutation now fails
+on the missing block. The registry independently still rejects an undeclared
+bounded channel; its declared inventory remains 17 bounded plus 2 justified
+single-completion exclusions.
+
+`ReqwestTransport` no longer turns a failed non-2xx `response.bytes()` read into
+an empty body. A loopback HTTP 400 fixture advertises more bytes than it sends and
+closes; before the fix it produced `Fatal(400)` with an empty `ResponseBody`, and
+after the fix it produces a retryable `Transient` retaining reqwest's body-read
+error as `#[source]`. This preserves both the failure cause and the rule that a
+400 can be classified as context-limit/refusal only after its full structured
+body was actually read.
+
+One useful guardrail surfaced during final verification: the provider discipline
+test rejects the HTTP/SSE frame-separator literal even inside an inline transport
+fixture. The request-side fixture assertion therefore checks the `POST` request
+line instead; the deliberately truncated response remains unchanged. Final
+workspace tests, all-target clippy, rustfmt, locked offline metadata, and LSP
+diagnostics passed. Evidence: `.omo/evidence/task-120-opencode-rust.txt`.

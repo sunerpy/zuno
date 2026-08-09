@@ -109,7 +109,7 @@ impl Transport for ReqwestTransport {
                 // Read as bytes and decode strictly: a non-UTF-8 error body loses
                 // its detail rather than being rendered with replacement
                 // characters that could be mistaken for the vendor's own text.
-                let bytes = response.bytes().await.unwrap_or_default();
+                let bytes = response.bytes().await.map_err(ProviderError::transient)?;
                 let text = std::str::from_utf8(&bytes).ok().map(str::to_owned);
                 return Err(classify_response(
                     &provider,
@@ -249,7 +249,9 @@ impl std::error::Error for ResponseBody {}
 mod tests {
     use super::*;
     use oc_error::Recovery;
+    use std::error::Error as _;
     use std::time::Duration;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     #[test]
     fn a_429_carries_the_delay_the_vendor_named() {
@@ -313,5 +315,61 @@ mod tests {
         assert!(cut.len() <= BODY_LIMIT + 4, "{}", cut.len());
         assert!(cut.ends_with('…'));
         assert!(std::str::from_utf8(cut.as_bytes()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_truncated_error_body_surfaces_the_read_failure_as_transient() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind truncated-body fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = vec![0_u8; 4096];
+            let bytes = socket.read(&mut request).await.expect("read request");
+            assert!(
+                request[..bytes].starts_with(b"POST "),
+                "fixture received an unexpected HTTP request"
+            );
+            socket
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\n\
+                      Content-Type: application/json\r\n\
+                      Content-Length: 128\r\n\
+                      Connection: close\r\n\
+                      \r\n\
+                      {\"error\":{\"code\":\"context_length_exceeded\"}}",
+                )
+                .await
+                .expect("write deliberately truncated response");
+        });
+
+        let transport = ReqwestTransport::new("truncated-fixture");
+        let result = transport
+            .send(HttpRequest {
+                url: format!("http://{address}/chat/completions"),
+                headers: BTreeMap::new(),
+                body: serde_json::json!({}),
+            })
+            .await;
+        server.await.expect("fixture task");
+
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a truncated error body must not become a response stream"),
+        };
+        assert!(error.is_retryable(), "{error:?}");
+        assert!(matches!(
+            error,
+            ProviderError::Transient {
+                status: None,
+                source: Some(_)
+            }
+        ));
+        let cause = error.source().expect("body read cause").to_string();
+        assert!(
+            cause.contains("body") || cause.contains("connection"),
+            "unexpected body read cause: {cause}"
+        );
     }
 }
