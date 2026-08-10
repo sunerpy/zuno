@@ -2259,3 +2259,71 @@ F2 仍在审计中。
 `the_comparison_cannot_shrink_into_exemptions` 用**按名冻结的集合**加地板值（≥9 个命令全流比较），注释写着：*"a table that exempts its way to green is what two earlier reviews rejected"*。**它把评审历史编码进了断言。**
 
 divergence 从 13 涨到 **17**，`DECLARED_COUNT` 同步——新增的是 CLI 呈现层的真实差异，而不是给豁免找的说法。
+
+## Wave 51 (2026-08-10)：第五轮三份裁决，我修了两条、复现了两条、派出四个任务
+
+`main` = `7177545`，**3349 测试通过**，clippy 0，fmt 干净。140/148。
+
+### 第五轮：F1/F2/F4 三份 REJECT，F3 又被超时取消
+
+| 评审员 | 裁决 | 结果 |
+|---|---|---|
+| **F1** | REJECT | SATISFIED **14** / NOT SATISFIED 4（上轮 12/6，再上轮 9/8/1）|
+| **F2** | REJECT | **首次完成**（前一轮被取消），四条全是「守卫可被绕过」|
+| **F4** | REJECT | 四条，两条与 F1 重合 |
+| **F3** | 未完成 | 又被 90 分钟窗口取消 |
+
+### 我这一轮亲手修的两条：过期散文
+
+F1 与 F4 同时抓住**同一类缺陷的两个实例**——数字在计划里对、在可执行门里对，却在**没有任何东西派生的散文里**过期：
+
+- `compat_suite.rs` 的 `known_gaps()` 仍发布 `"14 of the 58"` 与 `"Forty-four operations"`，而活门早已是 10/48。**已改为从 `FROZEN_API_GAPS` 与 `UPSTREAM_API_OPERATIONS` 派生。**
+- README 说 `"the thirteen deliberate differences"`，清单有 17 条。**已改为从活 `DivergenceList` 拼出**，并加了断言——把 README 退回 `thirteen` 会失败（我变异验证过）。
+
+### SEAM #15：测试台跑过期二进制，产出假绿（我两方向复现）
+
+`subject.rs:68` 的 `discover_or_build()` 找到二进制就用，**从不检查新鲜度**。我把 `hydrate_retained_history` 变异成返回空历史、**不重建**：
+
+```
+4 passed   ← 假绿
+```
+显式 `cargo build` 之后：
+```
+3 failed — session `ses_...` has no user message to answer
+```
+
+**这条比任何单个产品缺陷都重要**：我整轮做的变异验证，只要目标是 subject 二进制而非库代码，都可能无效。134-137 的变异恰好改的是库或测试内部代码（会编译进测试二进制），结论仍成立——**但那是运气，不是设计。**
+
+### SEAM #16：kiro-auth 的 provider 从未到达 `models`（我实测确认）
+
+两个真实二进制、用户自己的配置：
+
+```
+rust providers = 8    ts providers = 10
+只在 TS 有的：kiro-auth, opencode
+```
+
+`google`（antigravity 贡献）**两边都有**，所以准则 6 的一半已满足。`kiro-auth` 缺失，且 `--print-logs` 里 **0 次** kiro 提及——贡献路径根本没走到。`opencode` 是上游自带托管 provider，另一件事。
+
+**todo 137 证明的是三层共存与调度顺序，从未断言 hook 贡献的 provider 出现在用户可见输出里。hook 跑了 ≠ 用户看得到。**
+
+### 顺带发现：准则 6 的第三个不可满足断言
+
+准则 6 写「providers appear in `models --format json`」。实测上游 1.18.15 的 `models --help` **只有** `--verbose`/`--refresh`/`--pure` 加 clap 内建——**`--format` 不存在**，而我们的 flag 集合与上游一致（正确）。
+
+这是继 `middlewareStack.add`、`effort` 之后**同一条准则里第三个不可满足的断言**。
+
+### 我这一轮犯的错：改配置改错了位置
+
+我把 stale timeout 加到项目级 `.omo/omo.jsonc`，**而生效位置是 `/config/.omo/omo.jsonc`**——后者注释里明确写着 *"Project-level .omo/omo.jsonc files are NOT honored for this setting"*。所以提高从未生效，F3 又在同一个 90 分钟窗口被取消。已改到正确位置（4 小时）并删掉放错的那份。
+
+> **动作完成不等于效果生效。** 文件写出去了不等于被读取；测试跑绿了不等于跑的是新代码。**这与 SEAM #15 是同一种错误。**
+
+### 派出的四个任务
+
+| todo | 来源 | 要点 |
+|---|---|---|
+| **138** | SEAM #15 | 拒绝过期 subject 二进制；要测量成本并说明 |
+| **139** | SEAM #16 | 让 kiro 的 provider 真的流到 `models`；**禁止硬编码**，禁止用不存在的 `--format` |
+| **140** | F4#3 | 把 turn-part 差异（`step-start`/`step-finish`，生产库里 280,859 行）归类进**当前**产物 |
+| **141** | F2 B1/B2/B4 | persist-before-live 路由测试、question 侧三道 fail-closed、wasm 进 CI |
