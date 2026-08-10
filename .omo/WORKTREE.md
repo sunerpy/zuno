@@ -2368,3 +2368,47 @@ rust providers = 8    ts providers = 10
 它认定 135 的四条 divergence「都是真实差异，没有一条是把未实现的命令改个标签来让套件变绿」，134 的 5 分钟 deadline 是「忠实履约」，`effort` 划界是「诚实且恰当」。
 
 但它指出 `diagnostics-name-their-cause` 的见证只断言「两边都失败」——**无法区分「因我们记录的原因失败」与「因别的原因失败」**。我核实后确认更强档位本就存在，已由 todo 142 升级：`BothFail` 现在归零。
+
+## Wave 53-54 (2026-08-10)：第六轮 F3 首次 APPROVE，SEAM #17 修复
+
+`main` = `09ca897d`，**3365 测试通过**，clippy 0，fmt 干净，锁可离线复现。**144/148，只剩 F1-F4。**
+
+### 第六轮：F3 首次 APPROVE
+
+| 评审员 | 裁决 | 结果 |
+|---|---|---|
+| **F3** | **APPROVE** | 四项优先复验全过，含我两轮没测的**符号链接**。超时修正后首次跑完 |
+| **F1** | REJECT | SATISFIED **15** / NOT SATISFIED 3（轨迹 9/8/1 → 12/6 → 14/4 → 15/3）|
+| **F2** | REJECT | 一条阻塞项（F2-B1）|
+| **F4** | REJECT | 两条 + 一条计数错误 |
+
+F3 的原话：*"the user's configured `kiro-auth` provider appears in `models`; HTTP answers are visible through pre-opened session SSE, `/message`, and `/history`; disconnecting the only session SSE observer rejects a pending permission immediately without running the tool; and `/api/fs/*` blocks outward file and directory symlinks."*
+
+### 我当场修的四条合约缺陷（全是同一类：可执行门对、散文过期）
+
+- `compat_suite.rs` 的 `SurfaceRow.detail` 还写 "14 missing local backends"。它是 `&'static str` 无法内插运行时值——**改为指向 `FROZEN_API_GAPS` 与 `known_gaps()`，不再重述会过期的数字**。
+- 准则 6 仍要求 `models --format json`。**上游 1.18.15 根本没有 `--format`**，F1 的判断很准：*"a subject-only JSON flag would itself violate command parity"*。已改为纯 `models` 表面。
+- `docs/divergences.md` 开头写 "Thirteen deliberate differences" 而清单 17 条——**在那个自称唯一声明点的页面上**。已改为从 `DECLARED_COUNT` 派生，并保留计数增长的历史沿革。
+- 计划账本 145 行但只有 142 个唯一 id：**我自己的冲突解决重复了 124 与 129，125 存在两条不同措辞**。现在 142 行 = 142 id。
+
+### F2-B1：`google` 来自夹具，不是 antigravity 贡献的
+
+我独立复现：移除 `supported_spec(ANTIGRAVITY_PACKAGE)` 后测试**依然 1 passed**。
+
+**143 纠正了我一处判断**：我给的路线 (a)「从初始 catalog 去掉 google」做不到——`models.rs:109-111` 要求 provider **已在 resolved catalog 中**才应用 provider hook。它顺手证出更强的结论：**antigravity 对 `models` 的贡献是 0 字节**（同一 `env -i`，`models --verbose` 两次都是 2944 行、diff 为空）。**病根不是断言写弱了，是断言选错了 surface。**
+
+### SEAM #17：`Auth` 与 `Tool` hook 在生产路径从未 dispatch
+
+143 顺带发现，我核实：两者在非测试代码里只出现于 hook 分发器定义与 JSON-RPC 枚举，**`oc-cli`/`oc-engine` 零引用**。后果是 antigravity 的 auth loader 不跑（google cost 与上游不一致）、`google_search` 工具完全不可达。
+
+**这是本项目第一次出现「反向」的测试替身问题**：`hooks.rs` 自己的测试确实 dispatch 了两者，所以套件全绿，**生产却少接一段**。前 13 次都是夹具比现实友善，这次是**测试比生产完整**。
+
+todo 144 接进 `plugin_runtime.rs:82,137`，插件工具走与 config-directory / MCP 工具**同一条 `tools.extend`**，因此自动继承治理。三个变异各被具名测试抓住，其中 Auth 那条断言的是上游产生的**具体后果**（google cost 归零）而非「hook 跑了」。
+
+### 我把 48,148 个 target/ 文件提交进了 main
+
+补 144 的证据时我写了 `git add -A -f`——`-f` 为越过 `.omo` 的忽略规则，却**同时越过了 `/target`**。门全绿（3365 通过），是我合并后看 `git status` 发现 `target/.rustc_info.json` 显示为 `M` 才抓到。
+
+已回退、拆提交、改为 `git add crates/` 加逐个点名的 `.omo` 文件、确认暂存区零 `target/` 后重做。
+
+**这是同一种错误的第二次**（第一次是带冲突标记的提交）：**我用了一个比意图更宽的操作**。`-A` 比「我改的文件」宽，`-f` 比「只越过 `.omo` 这一条」宽。已给 `premerge.sh` 加第二道闸门：暂存区或索引里出现 `target/` 就拒绝合并——因为**闸门只能挡它认识的那一种脏**。
