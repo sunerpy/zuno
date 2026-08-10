@@ -68,6 +68,9 @@ jobs:
       - name: Test suite
         run: make test
 
+      - name: WASM plugin integration suite
+        run: cargo test -p oc-plugin --features wasm --test integration
+
   # The supply-chain gate is its own job so a licence or advisory failure is
   # legible at a glance instead of buried in a 3000-test log.
   supply-chain:

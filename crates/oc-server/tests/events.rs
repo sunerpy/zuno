@@ -1,15 +1,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::{Body, BodyDataStream};
+use axum::body::{Body, BodyDataStream, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
 use futures::StreamExt;
 use oc_db::Pool;
+use oc_db::session::SessionCreate;
+use oc_engine::r#loop::TurnEvent;
 use oc_llm::sse::SseParser;
 use oc_paths::DbLocation;
 use oc_server::{
-    EventCursor, EventService, EventStreamError, NewEvent, ServerBuilder, ServerConfig,
-    events_router,
+    EventCursor, EventFanout, EventService, EventStreamError, NewEvent, QuestionDecision,
+    QuestionRequest, RequestBroker, ServerBuilder, ServerConfig, ServerServices, events_router,
 };
 use serde_json::{Map, Value, json};
 use tower::ServiceExt;
@@ -170,6 +172,119 @@ async fn upstream_session_event_stream_replays_after_sequence_with_durable_shape
     assert_eq!(replayed["durable"]["seq"], json!(1));
     assert_eq!(replayed["durable"]["version"], json!(1));
     assert_eq!(replayed["data"]["ordinal"], json!(1));
+}
+
+#[tokio::test]
+async fn session_sse_never_outpaces_the_history_route() {
+    // Given: a persisted session with its public SSE and history routes sharing one event service.
+    let (_pool, events) = event_service(8);
+    let state = ApiState::memory("/repo").expect("in-memory API state initializes");
+    state
+        .sessions()
+        .create(&SessionCreate::new(
+            "ses_order",
+            "ses_order",
+            "global",
+            "/repo",
+            "/repo",
+            "order",
+            "test",
+        ))
+        .expect("fixture session inserts");
+    let app = api_event_app(state, events.clone());
+    let mut stream = open_stream_at(&app, "/api/session/ses_order/event", None).await;
+
+    // When: an engine event crosses the production projection into the session SSE stream.
+    let legacy = EventFanout::with_capacity(8);
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    let forwarder = tokio::spawn({
+        let events = events.clone();
+        async move {
+            events
+                .forward_engine_events("ses_order", &legacy, receiver)
+                .await;
+        }
+    });
+    sender
+        .send(TurnEvent::TurnStarted {
+            session_id: "ses_order".to_owned(),
+        })
+        .await
+        .expect("engine event enters the projection");
+    drop(sender);
+    let (_, observed) = decode_frame(&next_frame(&mut stream).await);
+    let observed_sequence = observed["durable"]["seq"]
+        .as_i64()
+        .expect("session SSE carries a durable sequence");
+
+    // Then: the same sequence is already committed when the client can observe it live.
+    let history = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/session/ses_order/history")
+                .body(Body::empty())
+                .expect("history request is valid"),
+        )
+        .await
+        .expect("history route responds");
+    assert_eq!(history.status(), StatusCode::OK);
+    let bytes = to_bytes(history.into_body(), 1024 * 1024)
+        .await
+        .expect("history response is bounded and readable");
+    let history: Value = serde_json::from_slice(&bytes).expect("history response is JSON");
+    assert!(
+        history["data"].as_array().is_some_and(|events| {
+            events.iter().any(|event| {
+                event["durable"]["seq"] == observed_sequence && event["type"] == observed["type"]
+            })
+        }),
+        "history must already contain SSE sequence {observed_sequence}: {history}"
+    );
+
+    forwarder.await.expect("event forwarder does not panic");
+}
+
+#[tokio::test]
+async fn dropping_the_only_session_observer_rejects_a_question() {
+    let (_pool, events) = event_service(8);
+    let requests = RequestBroker::default();
+    let services = ServerServices::new(8).with_requests(requests.clone());
+    let app = ServerBuilder::new(ServerConfig::default())
+        .with_services(services)
+        .with_routes(events_router(events))
+        .router();
+    let observer = open_stream(&app, "ses_observed", None).await;
+    let mut answer = tokio::spawn({
+        let requests = requests.clone();
+        async move {
+            requests
+                .ask_question(QuestionRequest {
+                    id: "que_observed".to_owned(),
+                    session_id: "ses_observed".to_owned(),
+                    questions: vec![json!({"question": "Continue?"})],
+                    tool: None,
+                })
+                .await
+        }
+    });
+    while requests.questions(None).is_empty() {
+        tokio::task::yield_now().await;
+    }
+
+    drop(observer);
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), &mut answer)
+            .await
+            .expect("dropping the only observer must release the question asker")
+            .expect("question asker task does not panic"),
+        QuestionDecision::Rejected
+    );
+    assert!(
+        requests.questions(None).is_empty(),
+        "observer-zero cleanup must remove the rejected question"
+    );
 }
 
 #[tokio::test]

@@ -1,0 +1,102 @@
+Task 141 evidence — persist order, question fail-closed, and WASM CI
+Date: 2026-08-10
+Branch: task-141
+Baseline: 7177545 plan(omo): add todos 138-141 for the fifth wave's verified blockers
+
+Scope
+-----
+Changed only:
+- .github/workflows/ci.yml
+- crates/oc-server/tests/api.rs
+- crates/oc-server/tests/events.rs
+- this evidence, the Todo 141 checkbox, and append-only task notes
+
+No production implementation was changed. In particular, all temporary mutations to
+crates/oc-server/src/events.rs, crates/oc-server/src/request_broker.rs, and
+crates/oc-server/src/api/request.rs were restored before final verification.
+
+B1 — persist-before-live route guard
+------------------------------------
+Permanent test:
+  session_sse_never_outpaces_the_history_route
+  (crates/oc-server/tests/events.rs)
+
+The test creates a real session, opens /api/session/{id}/event, sends one TurnEvent
+through EventService::forward_engine_events, reads the live SSE frame, and immediately
+queries /api/session/{id}/history. It requires the exact durable sequence and event
+type observed over SSE to already exist in the history response.
+
+Discriminating mutation:
+- Temporarily moved live fan-out before durable append and delayed append by 250 ms.
+- The permanent test failed deterministically with:
+    history must already contain SSE sequence 0: {"data":[],"hasMore":false}
+- Restored persist-before-live order; the test passed.
+
+B2 — question fail-closed guards
+--------------------------------
+Permanent tests:
+1. malformed_owned_question_reply_rejects_and_removes_the_request
+   - owns a live question request, submits a malformed reply, requires HTTP 400,
+     QuestionDecision::Rejected, and removal from the broker.
+2. dropping_the_only_session_observer_rejects_a_question
+   - keeps the broker and asker alive, drops only the session SSE observer, and
+     requires rejection plus removal.
+3. question_without_an_observer_is_rejected_by_the_deadline
+   - uses paused Tokio time, keeps the broker and asker alive, advances the finite
+     deadline, and requires rejection plus removal.
+
+Each trigger was isolated: the RequestBroker and asker task remained alive, so channel
+closure could not satisfy the assertions. Only the guard named below was removed in
+each mutation.
+
+Discriminating mutations:
+- Removed malformed owned-question claim/drop:
+    malformed_owned_question_reply_rejects_and_removes_the_request failed by timeout
+    (Elapsed(())); restored implementation passed.
+- Removed question IDs from observer-zero reclamation:
+    dropping_the_only_session_observer_rejects_a_question failed by timeout
+    (Elapsed(())); restored implementation passed.
+- Removed self.spawn_question_watchdog(&request):
+    question_without_an_observer_is_rejected_by_the_deadline failed by timeout
+    (Elapsed(())); restored implementation passed.
+
+B4 — required CI executes the feature-enabled WASM suite
+---------------------------------------------------------
+The required Unix `test` job now has an explicit step:
+  cargo test -p oc-plugin --features wasm --test integration
+
+Local execution:
+  cargo test -p oc-plugin --features wasm --test integration --offline -- --nocapture
+
+Result: PASS. All 11 feature-enabled `enabled::*` integration tests ran; 0 failed and
+0 were filtered out. This is actual feature-enabled host execution, not the default
+feature gate's skip report.
+
+"Skip-reporting tests are useful diagnostics but are not execution of the gated behavior."
+
+Final validation
+----------------
+PASS  cargo fmt --all --check
+PASS  cargo clippy --workspace --all-targets --offline
+PASS  cargo metadata --locked --offline --format-version 1
+PASS  RUST_TEST_THREADS=2 OC_MEMORY_GATE_MODE=skip cargo test --workspace --offline
+PASS  cargo test -p oc-plugin --features wasm --test integration --offline -- --nocapture
+
+The first unrestricted workspace-test attempt encountered a host process-limit EAGAIN
+(`Resource temporarily unavailable`). Re-running with RUST_TEST_THREADS=2 passed. The
+required oc-testkit memory-gate override remained OC_MEMORY_GATE_MODE=skip; no soak or
+long memory gate was run.
+
+The built-in lsp_diagnostics request could not address this worktree because the tool's
+request cwd was another worktree (`LSP file path must be inside request cwd`). The
+workspace-local fallback `rust-analyzer diagnostics .` completed all 517 targets.
+It reported only unrelated cfg-inactive WeakWarnings and no diagnostic for either
+changed Rust file:
+- crates/oc-server/tests/api.rs
+- crates/oc-server/tests/events.rs
+
+Acceptance result
+-----------------
+PASS: the route guard bites when live delivery outruns persistence; all three question
+fail-closed guards bite only when their own trigger is removed; and required Unix CI
+executes the real feature-enabled WASM integration suite.

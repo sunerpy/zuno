@@ -832,6 +832,55 @@ async fn api_reply_routes_validate_bodies_before_rejecting_cross_session_request
     }
 }
 
+#[tokio::test]
+async fn malformed_owned_question_reply_rejects_and_removes_the_request() {
+    let state = ApiState::memory("/repo").expect("in-memory API state initializes");
+    let requests = RequestBroker::default();
+    let services = ServerServices::new(64).with_requests(requests.clone());
+    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
+        .with_services(services)
+        .with_routes(api::router(state))
+        .router();
+    let mut answer = tokio::spawn({
+        let requests = requests.clone();
+        async move {
+            requests
+                .ask_question(QuestionRequest {
+                    id: "que_malformed_owned".to_owned(),
+                    session_id: "ses_owner".to_owned(),
+                    questions: vec![json!({"question": "Continue?"})],
+                    tool: None,
+                })
+                .await
+        }
+    });
+    while requests.questions(None).is_empty() {
+        tokio::task::yield_now().await;
+    }
+
+    let malformed = app
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_owner/question/que_malformed_owned/reply",
+            Some(json!("malformed for QuestionReplyBody")),
+        ))
+        .await
+        .expect("malformed owned question reply responds");
+
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), &mut answer)
+            .await
+            .expect("owned malformed cleanup must release the question asker")
+            .expect("question asker task does not panic"),
+        QuestionDecision::Rejected
+    );
+    assert!(
+        requests.questions(None).is_empty(),
+        "owned malformed cleanup must remove the rejected question"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn permission_without_an_observer_is_rejected_by_the_deadline() {
     let requests = RequestBroker::default();
@@ -869,6 +918,43 @@ async fn permission_without_an_observer_is_rejected_by_the_deadline() {
     assert!(
         requests.permissions(None).is_empty(),
         "the deadline must remove the stale permission request"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn question_without_an_observer_is_rejected_by_the_deadline() {
+    let requests = RequestBroker::default();
+    let mut answer = tokio::spawn({
+        let requests = requests.clone();
+        async move {
+            requests
+                .ask_question(QuestionRequest {
+                    id: "que_unobserved".to_owned(),
+                    session_id: "ses_unobserved".to_owned(),
+                    questions: vec![json!({"question": "Continue?"})],
+                    tool: None,
+                })
+                .await
+        }
+    });
+    while requests.questions(None).is_empty() {
+        tokio::task::yield_now().await;
+    }
+
+    tokio::time::advance(Duration::from_secs(24 * 60 * 60)).await;
+    tokio::task::yield_now().await;
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), &mut answer)
+            .await
+            .expect("an unobserved question request must have a finite deadline")
+            .expect("question asker task does not panic"),
+        QuestionDecision::Rejected,
+        "the deadline must fail closed rather than invent an answer"
+    );
+    assert!(
+        requests.questions(None).is_empty(),
+        "the deadline must remove the stale question request"
     );
 }
 

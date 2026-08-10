@@ -6631,3 +6631,18 @@ it the witness measures the previous binary and reports a false green.
 
 Rule for any future behaviour-mutation proof in this repo: rebuild the subject
 explicitly, never rely on `discover_or_build`.
+## [2026-08-10] Task 141: observe the public boundary, then mutate one release trigger
+
+- A persist-before-live unit assertion is weaker than the user-visible guarantee. The
+  discriminating guard must first consume the public session SSE frame and only then
+  ask the public history route for that exact durable sequence. Moving fan-out before
+  append with a bounded delay made the otherwise tiny race deterministic and proved
+  that the route-level assertion, rather than scheduler luck, catches the inversion.
+- Fail-closed lifecycle tests need to keep every unrelated release mechanism alive.
+  Holding both `RequestBroker` and the asker task while independently removing the
+  malformed-reply claim, observer-zero collection, or watchdog made each test time out
+  only for its named trigger. Letting the broker or sender drop would turn channel
+  closure into a false positive.
+- A feature-gate skip is a diagnostic, not coverage. The default workspace run can say
+  why WASM integration did not run while remaining green; the required CI job must
+  invoke the feature-enabled integration target itself.
