@@ -7,11 +7,12 @@
 //! [`Subject::discover_or_build`] runs that command for the caller.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use crate::env::ScriptedEnv;
 use crate::error::{Result, TestkitError};
 use crate::oracle::ensure_executable;
-use crate::run::{Provenance, RunOutcome, run_process};
+use crate::run::{Provenance, RunOutcome, SubjectSource, run_process};
 
 /// The binary `oc-cli` produces, and the name a drop-in replacement is invoked by.
 pub const SUBJECT_BIN: &str = "opencode-rust";
@@ -20,10 +21,14 @@ pub const SUBJECT_PACKAGE: &str = "oc-cli";
 /// Override the discovered subject binary with an explicit path.
 pub const ENV_SUBJECT_BINARY: &str = "OC_TESTKIT_SUBJECT";
 
+static BUILT_SUBJECT: OnceLock<PathBuf> = OnceLock::new();
+static SUBJECT_BUILD_LOCK: Mutex<()> = Mutex::new(());
+
 /// This project's binary, ready to run under a scripted environment.
 #[derive(Debug)]
 pub struct Subject {
     program: PathBuf,
+    source: SubjectSource,
     reported_version: Option<String>,
     env: ScriptedEnv,
 }
@@ -36,13 +41,22 @@ impl Subject {
     /// [`TestkitError::BinaryNotFound`] naming the expected path and the `cargo
     /// build` command that produces it.
     pub fn discover() -> Result<Self> {
-        let mut searched = Vec::new();
-        if let Ok(explicit) = std::env::var(ENV_SUBJECT_BINARY) {
-            return Self::at(PathBuf::from(explicit));
+        if let Some(explicit) = std::env::var_os(ENV_SUBJECT_BINARY) {
+            return Self::at_with_source(
+                PathBuf::from(explicit),
+                SubjectSource::ExplicitEnvironment {
+                    variable: ENV_SUBJECT_BINARY,
+                },
+            );
         }
+        Self::discover_workspace(SubjectSource::WorkspaceArtifact)
+    }
+
+    fn discover_workspace(source: SubjectSource) -> Result<Self> {
+        let mut searched = Vec::new();
         for candidate in candidate_paths() {
             if candidate.is_file() {
-                return Self::at(candidate);
+                return Self::at_with_source(candidate, source);
             }
             searched.push(candidate);
         }
@@ -58,7 +72,11 @@ impl Subject {
         })
     }
 
-    /// Locate the subject binary, building it first if it is missing.
+    /// Ask Cargo to refresh the subject binary, then locate it.
+    ///
+    /// The Cargo check happens once per test process. That is enough to catch a
+    /// source edit between test runs without making parallel cases contend on a
+    /// separate build for every call.
     ///
     /// # Errors
     ///
@@ -66,14 +84,34 @@ impl Subject {
     /// [`TestkitError::BinaryNotFound`] if the build reports success but produces
     /// nothing at any expected path.
     pub fn discover_or_build() -> Result<Self> {
-        match Self::discover() {
-            Ok(subject) => Ok(subject),
-            Err(TestkitError::BinaryNotFound { .. }) => {
-                build_subject()?;
-                Self::discover()
-            }
-            Err(other) => Err(other),
+        if let Some(explicit) = std::env::var_os(ENV_SUBJECT_BINARY) {
+            return Self::at_with_source(
+                PathBuf::from(explicit),
+                SubjectSource::ExplicitEnvironment {
+                    variable: ENV_SUBJECT_BINARY,
+                },
+            );
         }
+
+        let source = SubjectSource::CargoBuild {
+            package: SUBJECT_PACKAGE,
+            binary: SUBJECT_BIN,
+        };
+        if let Some(program) = BUILT_SUBJECT.get() {
+            return Self::at_with_source(program.clone(), source);
+        }
+
+        let _build = SUBJECT_BUILD_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(program) = BUILT_SUBJECT.get() {
+            return Self::at_with_source(program.clone(), source);
+        }
+
+        build_subject()?;
+        let subject = Self::discover_workspace(source)?;
+        let _already_set = BUILT_SUBJECT.set(subject.program.clone());
+        Ok(subject)
     }
 
     /// Use the subject binary at an exact path.
@@ -82,12 +120,16 @@ impl Subject {
     ///
     /// [`TestkitError::BinaryNotFound`] naming `path` when it does not exist.
     pub fn at(path: impl Into<PathBuf>) -> Result<Self> {
-        let path = path.into();
+        Self::at_with_source(path.into(), SubjectSource::ExplicitPath)
+    }
+
+    fn at_with_source(path: PathBuf, source: SubjectSource) -> Result<Self> {
         ensure_executable("subject", &path, || {
             format!("run `cargo build -p {SUBJECT_PACKAGE} --bin {SUBJECT_BIN}`")
         })?;
         Ok(Self {
             program: path,
+            source,
             reported_version: None,
             env: ScriptedEnv::new()?,
         })
@@ -136,6 +178,7 @@ impl Subject {
     pub fn provenance(&self) -> Provenance {
         Provenance::Subject {
             program: self.program.clone(),
+            source: self.source.clone(),
             reported_version: self.reported_version.clone(),
         }
     }

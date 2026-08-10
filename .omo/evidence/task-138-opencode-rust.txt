@@ -1,0 +1,113 @@
+Task 138 evidence — stale subject binaries can no longer report a false green
+Date: 2026-08-10
+
+BOTTOM LINE
+
+`Subject::discover_or_build` now asks Cargo to refresh `oc-cli` before a
+source-coupled test process uses the subject. The refresh is serialized and
+cached once per test process, so parallel cases do not rebuild repeatedly.
+`OC_TESTKIT_SUBJECT` remains a deliberate caller-owned override: it bypasses the
+workspace build, is honoured exactly, and is named in subject provenance.
+
+DESIGN AND COST
+
+- Automatic workspace subject: run
+  `cargo build -p oc-cli --bin opencode-rust`, locate the resulting candidate,
+  and report `cargo build -p oc-cli --bin opencode-rust` as its source.
+- Repeated calls in one test process: one Cargo invocation, guarded by
+  `Mutex` + `OnceLock<PathBuf>`.
+- Explicit subject: use `OC_TESTKIT_SUBJECT` without invoking Cargo and report
+  `explicit environment OC_TESTKIT_SUBJECT` in the provenance label.
+- Why Cargo rather than mtime/revision: Cargo already owns the complete
+  dependency graph, including dirty source and the shared worktree target.
+  Comparing one timestamp or Git revision would miss content states Cargo knows
+  about and would recreate an incomplete build system in the harness.
+- Warm no-op Cargo freshness checks, measured five times after the workspace was
+  built: 0.29, 0.28, 0.27, 0.27, 0.26 seconds; median 0.27 seconds, range
+  0.26–0.29 seconds. The old path did no Cargo check, so the steady-state added
+  cost is 0.27 seconds per source-coupled test process, not per test case.
+  The first cold build in this worktree took 27.00 seconds because it compiled
+  dependencies; a real source edit necessarily pays the corresponding rebuild
+  cost to make the tested binary truthful.
+
+FAILING-FIRST REGRESSION
+
+Command:
+  OC_MEMORY_GATE_MODE=skip cargo test -p oc-testkit --test subject_freshness --offline -- --nocapture
+
+Before the implementation both new tests failed:
+
+1. Stale automatic candidate:
+   `discover_or_build reused the stale candidate without asking Cargo to refresh it`
+2. Explicit override provenance:
+   `the explicit override's source must be visible: subject(..., reports unprobed)`
+
+After the implementation:
+  test result: ok. 2 passed; 0 failed; 0 ignored
+
+The stale-candidate test uses an isolated child test process and a fake Cargo
+executable. It starts with stale bytes, requires Cargo to replace them, calls
+`discover_or_build` twice, and asserts the fake Cargo build count is exactly one.
+The explicit-override test points `CARGO` at a nonexistent path, proving the
+override is respected rather than rebuilt, then asserts the environment variable
+is present in the provenance label.
+
+REQUIRED HYDRATE_RETAINED_HISTORY MUTATION
+
+Temporary mutation (restored immediately after the run):
+  `hydrate_retained_history(...) { return Ok(Vec::new()); ... }`
+
+No manual `cargo build` was run after applying the mutation. Command:
+  OC_MEMORY_GATE_MODE=skip cargo test -p oc-testkit --test session_interop --offline -- --nocapture
+
+Observed result:
+  test result: FAILED. 1 passed; 3 failed; 0 ignored
+
+All three lifecycle tests failed through the refreshed production subject with:
+  `session ses_... has no user message to answer`
+
+This is the inverse of the reported false green: the same source mutation can no
+longer leave `session_interop` at 4 passed by reusing the pre-mutation executable.
+After restoring the source, the harness rebuilt without a manual build and the
+four tests returned to green.
+
+REQUIRED TARGETED SUITES
+
+1. `OC_MEMORY_GATE_MODE=skip cargo test -p oc-testkit --test session_interop --offline -- --nocapture`
+   PASS — 4 passed, 0 failed.
+2. `OC_MEMORY_GATE_MODE=skip cargo test -p oc-cli --test cli_parity --offline -- --nocapture`
+   PASS — 9 passed, 0 failed, including all twelve implemented-command rows.
+
+WORKSPACE AND STATIC GATES
+
+The first unconstrained workspace attempt reached `oc-tools` and encountered a
+host-level thread-creation `EAGAIN: Resource temporarily unavailable` while
+three sibling tasks were running. It was not an assertion failure. The final
+attempt bounded Cargo and libtest concurrency to two without skipping tests:
+
+  CARGO_BUILD_JOBS=2 OC_MEMORY_GATE_MODE=skip \
+    cargo test --workspace --offline -- --test-threads=2
+  PASS — 3351 passed, 0 failed, 2 pre-existing ignored tests across 209 summaries.
+
+  CARGO_BUILD_JOBS=2 cargo clippy --workspace --all-targets --offline
+  PASS — 0 warnings.
+
+  cargo fmt --all --check
+  PASS.
+
+  cargo metadata --locked --offline --format-version 1 >/dev/null
+  PASS.
+
+`rust-analyzer diagnostics crates/oc-testkit --severity warning` completed its
+scan with no source diagnostics; rust-analyzer emitted internal overloaded-deref
+log messages while indexing unrelated workspace files. The focused compiler
+fallback `cargo check -p oc-testkit --all-targets --offline` passed cleanly.
+
+ANALYSIS CHECK
+
+The reported false-green mechanism and `hydrate_retained_history` reproduction
+were correct. The only refinement is that “binary older than source” should not
+be implemented as a raw timestamp comparison: dirty trees, dependency sources,
+and shared target directories make that proxy incomplete. Letting Cargo decide
+whether rebuilding is necessary satisfies the intent with a measured 0.27-second
+warm cost and avoids inventing a second dependency graph.

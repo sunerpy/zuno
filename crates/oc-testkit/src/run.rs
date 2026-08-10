@@ -43,9 +43,47 @@ pub enum Provenance {
     Subject {
         /// The binary that ran.
         program: PathBuf,
+        /// How the harness obtained the binary.
+        source: SubjectSource,
         /// What `--version` printed, when it was probed.
         reported_version: Option<String>,
     },
+}
+
+/// How the subject binary entered the harness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubjectSource {
+    /// A caller deliberately supplied an environment override.
+    ExplicitEnvironment {
+        /// The environment variable naming the binary.
+        variable: &'static str,
+    },
+    /// A caller deliberately supplied a path to [`crate::Subject::at`].
+    ExplicitPath,
+    /// [`crate::Subject::discover`] found an existing, caller-managed artifact.
+    WorkspaceArtifact,
+    /// Cargo checked the current workspace sources before the binary was used.
+    CargoBuild {
+        /// The Cargo package that owns the binary.
+        package: &'static str,
+        /// The binary target Cargo built.
+        binary: &'static str,
+    },
+}
+
+impl SubjectSource {
+    fn label(&self) -> String {
+        match self {
+            Self::ExplicitEnvironment { variable } => {
+                format!("explicit environment {variable}")
+            }
+            Self::ExplicitPath => "explicit path".to_owned(),
+            Self::WorkspaceArtifact => "pre-existing workspace artifact".to_owned(),
+            Self::CargoBuild { package, binary } => {
+                format!("cargo build -p {package} --bin {binary}")
+            }
+        }
+    }
 }
 
 impl Provenance {
@@ -77,9 +115,11 @@ impl Provenance {
             ),
             Self::Subject {
                 program,
+                source,
                 reported_version,
             } => format!(
-                "subject({}, reports {})",
+                "subject({} -> {}, reports {})",
+                source.label(),
                 program.display(),
                 reported_version.as_deref().unwrap_or("unprobed"),
             ),
@@ -321,6 +361,7 @@ mod tests {
         let outcome = run_process(
             Provenance::Subject {
                 program: PathBuf::from("/usr/bin/env"),
+                source: SubjectSource::ExplicitPath,
                 reported_version: None,
             },
             Path::new("/usr/bin/env"),
@@ -349,6 +390,7 @@ mod tests {
         let err = run_process(
             Provenance::Subject {
                 program: PathBuf::from("/nonexistent/oc-testkit-probe"),
+                source: SubjectSource::ExplicitPath,
                 reported_version: None,
             },
             Path::new("/nonexistent/oc-testkit-probe"),
