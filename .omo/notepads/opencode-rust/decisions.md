@@ -6729,3 +6729,20 @@ F4 的第 3 条裁定给了我一个有用的区分：它把「默认套件跳�
 > 「当前已被证明」与「未来不会回归」是两个不同的问题。前者可以用一次已跟踪的运行满足，后者必须靠门。
 
 我给 todo 141 的 (c) 正是做后者，方向一致。
+## Task 138 — subject freshness policy
+
+- **Source-coupled callers build once per test process; `discover` stays
+  locate-only.** `discover_or_build` runs Cargo before accepting an automatic
+  workspace candidate, then shares that result through a poisoned-lock-tolerant
+  `Mutex` and `OnceLock`. This catches edits between test runs without multiplying
+  a 0.27-second warm check by every parallel test case, while preserving
+  `discover` for callers that intentionally only locate an artifact.
+- **`OC_TESTKIT_SUBJECT` is caller-owned and intentionally bypasses freshness.**
+  Rebuilding an arbitrary external binary is impossible and would violate the
+  override contract. The harness instead honours it exactly and stamps
+  `explicit environment OC_TESTKIT_SUBJECT` into `SubjectSource`, making that
+  trust decision visible in every provenance label.
+- **Do not add an mtime or HEAD comparison.** Neither identifies dirty dependency
+  content, and shared worktree targets make both especially misleading. Cargo's
+  dependency graph is the identity authority; its measured warm cost is low
+  enough that a weaker hand-rolled check has no defensible trade-off here.

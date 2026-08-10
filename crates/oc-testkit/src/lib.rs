@@ -183,6 +183,7 @@ mod tests {
         let right = outcome(
             Provenance::Subject {
                 program: PathBuf::from("/t/opencode-rust"),
+                source: crate::run::SubjectSource::ExplicitPath,
                 reported_version: Some("0.1.0".to_owned()),
             },
             "0.1.0\n",

@@ -6546,3 +6546,21 @@ is itself worth knowing, but it is undeclared in `docs/divergences.toml` (13 ent
   tested": the `tui` exemption, for instance, stands or falls on upstream really
   printing `Failed to change directory`, which is what proves the two binaries
   were asked different questions rather than behaving differently.
+
+## Task 138 — stale subject binaries
+
+- **Cargo's no-op build is the cheap identity check the harness was missing.** A
+  warm `cargo build -p oc-cli --bin opencode-rust` measured 0.29, 0.28, 0.27,
+  0.27 and 0.26 seconds (0.27-second median). Running it once per test process is
+  cheap enough to keep enabled and strictly stronger than comparing one mtime or
+  Git revision, because Cargo tracks the whole dirty dependency graph.
+- **A source mutation is proven only when the process under test changes.** With
+  `hydrate_retained_history` temporarily returning an empty vector and no manual
+  build, the repaired harness rebuilt the subject and `session_interop` failed
+  three lifecycle tests with `has no user message to answer`; restoring source
+  let the same harness rebuild back to four passing tests.
+- **An override path alone is not provenance.** The previous subject label named
+  only the executable, so nobody reading a report could tell whether it came from
+  workspace discovery or `OC_TESTKIT_SUBJECT`. Provenance now names automatic
+  Cargo builds, explicit paths, pre-existing discovery, and the environment
+  override separately.
