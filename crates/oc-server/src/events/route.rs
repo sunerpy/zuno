@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -10,7 +10,8 @@ use futures::stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::Delivery;
+use crate::request_broker::SessionRequestObserver;
+use crate::{Delivery, ServerServices};
 
 use super::{EventCursor, EventService, EventStreamError, SessionSubscription, StreamEvent};
 
@@ -47,6 +48,7 @@ async fn stream_global_events(State(service): State<EventService>) -> Response {
 
 async fn stream_session_events(
     State(service): State<EventService>,
+    Extension(services): Extension<ServerServices>,
     Path(session_id): Path<String>,
     Query(query): Query<SessionEventQuery>,
 ) -> Result<Response, EventStreamError> {
@@ -60,7 +62,8 @@ async fn stream_session_events(
         sequence: query.after.unwrap_or(0),
     });
     let subscription = service.subscribe(&session_id, cursor.as_ref()).await?;
-    let connection = SessionStream::from(subscription);
+    let observer = services.requests.observe_session(&session_id);
+    let connection = SessionStream::new(subscription, observer);
     let stream = stream::unfold(connection, |mut connection| async move {
         connection
             .next_upstream_sse()
@@ -72,6 +75,7 @@ async fn stream_session_events(
 
 async fn stream_events(
     State(service): State<EventService>,
+    Extension(services): Extension<ServerServices>,
     Query(query): Query<EventQuery>,
     headers: HeaderMap,
 ) -> Result<Response, EventStreamError> {
@@ -89,7 +93,8 @@ async fn stream_events(
     let subscription = service
         .subscribe(&query.session_id, cursor.as_ref())
         .await?;
-    let connection = SessionStream::from(subscription);
+    let observer = services.requests.observe_session(&query.session_id);
+    let connection = SessionStream::new(subscription, observer);
     let stream = stream::unfold(connection, |mut connection| async move {
         connection.next_sse().await.map(|event| (event, connection))
     });
@@ -144,10 +149,11 @@ struct SessionStream {
     live: crate::EventSubscription<StreamEvent>,
     last_cursor: Option<EventCursor>,
     finished: bool,
+    _observer: SessionRequestObserver,
 }
 
-impl From<SessionSubscription> for SessionStream {
-    fn from(subscription: SessionSubscription) -> Self {
+impl SessionStream {
+    fn new(subscription: SessionSubscription, observer: SessionRequestObserver) -> Self {
         Self {
             session_id: subscription.session_id,
             replay: subscription.events.into(),
@@ -155,11 +161,10 @@ impl From<SessionSubscription> for SessionStream {
             live: subscription.live,
             last_cursor: subscription.cursor,
             finished: false,
+            _observer: observer,
         }
     }
-}
 
-impl SessionStream {
     async fn next_sse(&mut self) -> Option<Result<SseEvent, EventStreamError>> {
         if self.finished {
             return None;

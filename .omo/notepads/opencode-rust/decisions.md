@@ -6564,3 +6564,28 @@ onto 1dee81c, auto-merged `README.md` with no conflict markers, then validated:
   side effects covered by dedicated production-path tests.** `FROZEN_API_GAPS`
   drops from 14 to 10, backed operations rise from 44 to 48, and generated docs
   are updated through the sanctioned docs test.
+
+## Wave 49 — todo 134
+
+- **Session SSE owns a counted `SessionRequestObserver` guard.** Both session-scoped
+  event routes acquire it after subscribing and retain it inside the response
+  stream. Dropping the last guard atomically removes all pending permission and
+  question requests for that session, then resolves them as rejected outside the
+  mutex. Global SSE is deliberately excluded because it does not identify one
+  answerable session.
+- **Every brokered request has an independent five-minute watchdog.** It holds only
+  a `Weak` reference to broker state, checks the original `(session_id, request_id)`
+  pair, and becomes a no-op after a normal reply or broker shutdown. Five minutes
+  bounds unattended requests without letting observer-loss users wait for the
+  deadline; timeout resolution is always `Reject`/`Rejected`.
+- **Existing ownership checks remain the only authority for targeted claims.** The
+  observer and watchdog cleanup paths repeat the same session-id equality check.
+  Removing it from `claim_permission` made
+  `api_reply_routes_validate_bodies_before_rejecting_cross_session_requests` fail
+  at the pending-count assertion (`left: 0`, `right: 1`), so the prior mutation
+  guard remains effective.
+- **Questions receive the same lifecycle cleanup as permissions.** Although F3
+  exercised a privileged permission request, leaving a brokered question stranded
+  would preserve the same permanent `/wait` deadlock. Applying one invariant to
+  both pending maps avoids a second asymmetric disconnect seam without changing
+  either reply contract.

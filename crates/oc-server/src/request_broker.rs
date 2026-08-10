@@ -9,7 +9,8 @@
 //! reply can never authorize a tool by accident or consume another session's request.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::time::Duration;
 
 use oc_permission::ReplyKind;
 use serde::Serialize;
@@ -19,6 +20,8 @@ use tokio::sync::oneshot;
 use crate::{EventService, EventStreamError, NewEvent};
 
 pub type QuestionAnswers = Vec<Vec<String>>;
+
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -88,12 +91,24 @@ struct Pending {
     permissions: HashMap<String, PendingPermission>,
     questions: HashMap<String, PendingQuestion>,
     standing: Vec<(String, Vec<String>)>,
+    observers: HashMap<String, usize>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct RequestBroker {
     pending: Arc<Mutex<Pending>>,
     events: Option<EventService>,
+    request_timeout: Duration,
+}
+
+impl Default for RequestBroker {
+    fn default() -> Self {
+        Self {
+            pending: Arc::new(Mutex::new(Pending::default())),
+            events: None,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+        }
+    }
 }
 
 impl std::fmt::Debug for RequestBroker {
@@ -104,7 +119,9 @@ impl std::fmt::Debug for RequestBroker {
             .field("pending_permissions", &pending.permissions.len())
             .field("pending_questions", &pending.questions.len())
             .field("standing_permissions", &pending.standing.len())
+            .field("observed_sessions", &pending.observers.len())
             .field("publishes_events", &self.events.is_some())
+            .field("request_timeout", &self.request_timeout)
             .finish()
     }
 }
@@ -134,6 +151,7 @@ impl RequestBroker {
                 },
             );
         }
+        self.spawn_permission_watchdog(&request);
         if let Err(error) = self.publish("permission.v2.asked", &request).await {
             eprintln!(
                 "failed to publish HTTP permission request `{}`: {error}",
@@ -155,6 +173,7 @@ impl RequestBroker {
                 },
             );
         }
+        self.spawn_question_watchdog(&request);
         if let Err(error) = self.publish("question.v2.asked", &request).await {
             eprintln!(
                 "failed to publish HTTP question request `{}`: {error}",
@@ -193,6 +212,18 @@ impl RequestBroker {
             .collect::<Vec<_>>();
         requests.sort_by(|left, right| left.id.cmp(&right.id));
         requests
+    }
+
+    pub(crate) fn observe_session(&self, session_id: &str) -> SessionRequestObserver {
+        *self
+            .lock()
+            .observers
+            .entry(session_id.to_owned())
+            .or_default() += 1;
+        SessionRequestObserver {
+            session_id: session_id.to_owned(),
+            pending: Arc::downgrade(&self.pending),
+        }
     }
 
     #[must_use]
@@ -277,15 +308,37 @@ impl RequestBroker {
     }
 
     fn reject_permission(&self, session_id: &str, request_id: &str) {
-        if let Some(resolution) = self.claim_permission(session_id, request_id) {
-            let _delivered = resolution.resolve(ReplyKind::Reject);
-        }
+        reject_permission(&self.pending, session_id, request_id);
     }
 
     fn reject_question(&self, session_id: &str, request_id: &str) {
-        if let Some(resolution) = self.claim_question(session_id, request_id) {
-            let _delivered = resolution.resolve(QuestionDecision::Rejected);
-        }
+        reject_question(&self.pending, session_id, request_id);
+    }
+
+    fn spawn_permission_watchdog(&self, request: &PermissionRequest) {
+        let pending = Arc::downgrade(&self.pending);
+        let session_id = request.session_id.clone();
+        let request_id = request.id.clone();
+        let timeout = self.request_timeout;
+        let _watchdog = tokio::spawn(async move {
+            tokio::time::sleep(timeout).await;
+            if let Some(pending) = pending.upgrade() {
+                reject_permission(&pending, &session_id, &request_id);
+            }
+        });
+    }
+
+    fn spawn_question_watchdog(&self, request: &QuestionRequest) {
+        let pending = Arc::downgrade(&self.pending);
+        let session_id = request.session_id.clone();
+        let request_id = request.id.clone();
+        let timeout = self.request_timeout;
+        let _watchdog = tokio::spawn(async move {
+            tokio::time::sleep(timeout).await;
+            if let Some(pending) = pending.upgrade() {
+                reject_question(&pending, &session_id, &request_id);
+            }
+        });
     }
 
     async fn publish<T: Serialize>(
@@ -315,6 +368,100 @@ impl RequestBroker {
     fn lock(&self) -> MutexGuard<'_, Pending> {
         self.pending.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+pub(crate) struct SessionRequestObserver {
+    session_id: String,
+    pending: Weak<Mutex<Pending>>,
+}
+
+impl Drop for SessionRequestObserver {
+    fn drop(&mut self) {
+        let Some(pending) = self.pending.upgrade() else {
+            return;
+        };
+        let (permissions, questions) = {
+            let mut pending = pending.lock().unwrap_or_else(PoisonError::into_inner);
+            match pending.observers.get_mut(&self.session_id) {
+                Some(count) if *count > 1 => {
+                    *count -= 1;
+                    return;
+                }
+                Some(_) => {
+                    pending.observers.remove(&self.session_id);
+                }
+                None => return,
+            }
+            take_session_requests(&mut pending, &self.session_id)
+        };
+        for permission in permissions {
+            let _delivered = permission.answer.send(ReplyKind::Reject);
+        }
+        for question in questions {
+            let _delivered = question.answer.send(QuestionDecision::Rejected);
+        }
+    }
+}
+
+fn reject_permission(pending: &Mutex<Pending>, session_id: &str, request_id: &str) {
+    let request = {
+        let mut pending = pending.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(request) = pending.permissions.get(request_id) else {
+            return;
+        };
+        if request.request.session_id != session_id {
+            return;
+        }
+        pending
+            .permissions
+            .remove(request_id)
+            .expect("the request was checked while holding the same lock")
+    };
+    let _delivered = request.answer.send(ReplyKind::Reject);
+}
+
+fn reject_question(pending: &Mutex<Pending>, session_id: &str, request_id: &str) {
+    let request = {
+        let mut pending = pending.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(request) = pending.questions.get(request_id) else {
+            return;
+        };
+        if request.request.session_id != session_id {
+            return;
+        }
+        pending
+            .questions
+            .remove(request_id)
+            .expect("the request was checked while holding the same lock")
+    };
+    let _delivered = request.answer.send(QuestionDecision::Rejected);
+}
+
+fn take_session_requests(
+    pending: &mut Pending,
+    session_id: &str,
+) -> (Vec<PendingPermission>, Vec<PendingQuestion>) {
+    let permission_ids = pending
+        .permissions
+        .iter()
+        .filter(|(_, request)| request.request.session_id == session_id)
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    let question_ids = pending
+        .questions
+        .iter()
+        .filter(|(_, request)| request.request.session_id == session_id)
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    let permissions = permission_ids
+        .into_iter()
+        .filter_map(|id| pending.permissions.remove(&id))
+        .collect();
+    let questions = question_ids
+        .into_iter()
+        .filter_map(|id| pending.questions.remove(&id))
+        .collect();
+    (permissions, questions)
 }
 
 pub struct PermissionResolution {
