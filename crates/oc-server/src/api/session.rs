@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use std::sync::Arc;
 
@@ -235,6 +235,11 @@ struct MessageRow {
     data: String,
 }
 
+struct MessageCandidate {
+    id: String,
+    canonical: bool,
+}
+
 impl From<Session> for SessionInfo {
     fn from(session: Session) -> Self {
         Self {
@@ -409,73 +414,61 @@ pub async fn messages(
     };
 
     let connection = state.pool().get()?;
-    let anchor = decoded
-        .as_ref()
-        .map(|cursor| {
-            connection
-                .query_row(
-                    "SELECT seq FROM session_message WHERE session_id = ?1 AND id = ?2",
-                    rusqlite::params![session_id, cursor.id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()
-                .map_err(oc_db::map_error)
+    let candidates = message_candidates(
+        &connection,
+        &session_id,
+        decoded.as_ref().map(|cursor| cursor.id.as_str()),
+        limit,
+        query_order,
+    )?;
+    let canonical_ids = candidates
+        .iter()
+        .filter(|candidate| candidate.canonical)
+        .map(|candidate| candidate.id.clone())
+        .collect::<Vec<_>>();
+    let projected_ids = candidates
+        .iter()
+        .filter(|candidate| !candidate.canonical)
+        .map(|candidate| candidate.id.clone())
+        .collect::<Vec<_>>();
+    let store = oc_db::message::MessageStore::new(&connection);
+    let canonical = store.hydrate(store.messages_by_id(&canonical_ids)?)?;
+    let mut canonical = canonical
+        .into_iter()
+        .map(|message| {
+            let id = message.info.id.clone();
+            let value = json!({
+                "info": message.info.to_json(),
+                "parts": message
+                    .parts
+                    .into_iter()
+                    .map(|part| part.to_json())
+                    .collect::<Vec<_>>(),
+            });
+            (id, value)
         })
-        .transpose()?
-        .flatten();
-    if decoded.is_some() && anchor.is_none() {
-        return Ok(Json(MessagesResponse {
-            data: Vec::new(),
-            cursor: MessageCursor {
-                previous: None,
-                next: None,
-            },
-        }));
+        .collect::<HashMap<_, _>>();
+    let mut projected = projected_messages(&connection, &projected_ids)?;
+    let mut data = candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            if candidate.canonical {
+                canonical.remove(&candidate.id)
+            } else {
+                projected.remove(&candidate.id)
+            }
+        })
+        .collect::<Vec<_>>();
+    if matches!(direction, CursorDirection::Previous) {
+        data.reverse();
     }
-    let comparison = if query_order == "ASC" { ">" } else { "<" };
-    let sql = if anchor.is_some() {
-        format!(
-            "SELECT id, type, data FROM session_message \
-             WHERE session_id = ?1 AND seq {comparison} ?2 ORDER BY seq {query_order} LIMIT ?3"
-        )
-    } else {
-        format!(
-            "SELECT id, type, data FROM session_message \
-             WHERE session_id = ?1 ORDER BY seq {query_order} LIMIT ?2"
-        )
-    };
-    let mut statement = connection.prepare(&sql).map_err(oc_db::map_error)?;
-    let rows = if let Some(anchor) = anchor {
-        statement
-            .query_map(
-                rusqlite::params![session_id, anchor, limit as i64],
-                message_row,
-            )
-            .map_err(oc_db::map_error)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(oc_db::map_error)?
-    } else {
-        statement
-            .query_map(rusqlite::params![session_id, limit as i64], message_row)
-            .map_err(oc_db::map_error)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(oc_db::map_error)?
-    };
-    let ordered = if matches!(direction, CursorDirection::Previous) {
-        rows.into_iter().rev().collect()
-    } else {
-        rows
-    };
-    let data = decode_messages(ordered)?;
     let previous = data
         .first()
-        .and_then(|message| message.get("id"))
-        .and_then(Value::as_str)
+        .and_then(message_id)
         .map(|id| encode_message_cursor(id, order, CursorDirection::Previous));
     let next = data
         .last()
-        .and_then(|message| message.get("id"))
-        .and_then(Value::as_str)
+        .and_then(message_id)
         .map(|id| encode_message_cursor(id, order, CursorDirection::Next));
     Ok(Json(MessagesResponse {
         data,
@@ -674,14 +667,43 @@ pub async fn prompt(
         let signal = guard.interrupt_signal().clone();
         let executor = Arc::clone(executor);
         let fanout = services.events.clone();
+        let durable_events = state.events().cloned();
+        let event_session_id = request.session_id.clone();
         let (sender, receiver) = event_channel();
         tokio::spawn(async move {
-            let (outcome, ()) = tokio::join!(
-                executor.prompt(request, signal, sender),
-                fanout.forward_engine_events(receiver)
-            );
+            let outcome = if let Some(events) = durable_events.as_ref() {
+                let (outcome, ()) = tokio::join!(
+                    executor.prompt(request, signal, sender),
+                    events.forward_engine_events(&event_session_id, &fanout, receiver)
+                );
+                outcome
+            } else {
+                let (outcome, ()) = tokio::join!(
+                    executor.prompt(request, signal, sender),
+                    fanout.forward_engine_events(receiver)
+                );
+                outcome
+            };
             if let Err(error) = outcome {
                 eprintln!("session prompt execution failed: {error}");
+                if let Some(events) = durable_events {
+                    let properties = object(json!({
+                        "sessionID": event_session_id,
+                        "message": error,
+                    }));
+                    if let Err(publish_error) = events
+                        .publish(
+                            &event_session_id,
+                            crate::NewEvent::new("session.error", properties)
+                                .expect("fixed session error type is valid"),
+                        )
+                        .await
+                    {
+                        eprintln!(
+                            "failed to publish HTTP turn error for `{event_session_id}`: {publish_error}"
+                        );
+                    }
+                }
             }
             drop(guard);
         });
@@ -835,6 +857,109 @@ fn decode_message(row: MessageRow) -> Result<Value, ApiError> {
     data.insert("id".to_owned(), Value::String(row.id));
     data.insert("type".to_owned(), Value::String(row.kind));
     Ok(Value::Object(data))
+}
+
+fn message_candidates(
+    connection: &rusqlite::Connection,
+    session_id: &str,
+    anchor_id: Option<&str>,
+    limit: usize,
+    query_order: &str,
+) -> Result<Vec<MessageCandidate>, ApiError> {
+    let comparison = if query_order == "ASC" { ">" } else { "<" };
+    let combined = "SELECT id, time_created, 1 AS canonical FROM message WHERE session_id = ?1 \
+                    UNION ALL \
+                    SELECT projected.id, projected.time_created, 0 AS canonical \
+                    FROM session_message AS projected WHERE projected.session_id = ?1 \
+                      AND NOT EXISTS (SELECT 1 FROM message AS canonical \
+                                      WHERE canonical.session_id = ?1 \
+                                        AND canonical.id = projected.id)";
+    let sql = if anchor_id.is_some() {
+        format!(
+            "WITH combined AS ({combined}), \
+             anchor AS (SELECT time_created, id FROM combined WHERE id = ?2 LIMIT 1) \
+             SELECT combined.id, combined.canonical FROM combined, anchor \
+             WHERE combined.time_created {comparison} anchor.time_created \
+                OR (combined.time_created = anchor.time_created \
+                    AND combined.id {comparison} anchor.id) \
+             ORDER BY combined.time_created {query_order}, combined.id {query_order} LIMIT ?3"
+        )
+    } else {
+        format!(
+            "WITH combined AS ({combined}) \
+             SELECT id, canonical FROM combined \
+             ORDER BY time_created {query_order}, id {query_order} LIMIT ?2"
+        )
+    };
+    let mut statement = connection.prepare(&sql).map_err(oc_db::map_error)?;
+    let rows = if let Some(anchor_id) = anchor_id {
+        statement
+            .query_map(
+                rusqlite::params![session_id, anchor_id, limit as i64],
+                |row| {
+                    Ok(MessageCandidate {
+                        id: row.get(0)?,
+                        canonical: row.get(1)?,
+                    })
+                },
+            )
+            .map_err(oc_db::map_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(oc_db::map_error)?
+    } else {
+        statement
+            .query_map(rusqlite::params![session_id, limit as i64], |row| {
+                Ok(MessageCandidate {
+                    id: row.get(0)?,
+                    canonical: row.get(1)?,
+                })
+            })
+            .map_err(oc_db::map_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(oc_db::map_error)?
+    };
+    Ok(rows)
+}
+
+fn projected_messages(
+    connection: &rusqlite::Connection,
+    message_ids: &[String],
+) -> Result<HashMap<String, Value>, ApiError> {
+    if message_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = (1..=message_ids.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("SELECT id, type, data FROM session_message WHERE id IN ({placeholders})");
+    let mut statement = connection.prepare(&sql).map_err(oc_db::map_error)?;
+    let rows = statement
+        .query_map(rusqlite::params_from_iter(message_ids.iter()), message_row)
+        .map_err(oc_db::map_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(oc_db::map_error)?;
+    rows.into_iter()
+        .map(|row| {
+            let id = row.id.clone();
+            decode_message(row).map(|value| (id, value))
+        })
+        .collect()
+}
+
+fn message_id(message: &Value) -> Option<&str> {
+    message
+        .get("info")
+        .and_then(|info| info.get("id"))
+        .or_else(|| message.get("id"))
+        .and_then(Value::as_str)
+}
+
+fn object(value: Value) -> Map<String, Value> {
+    value
+        .as_object()
+        .expect("fixed session event payloads are objects")
+        .clone()
 }
 
 fn decode_message_cursor(input: &str) -> Result<MessageCursorValue, ApiError> {
