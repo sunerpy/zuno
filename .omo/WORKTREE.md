@@ -2138,3 +2138,54 @@ F2 的原始变异——把 `DispatchArguments::Agent` 指向 `PendingCommandDis
 ### 126 的测试立刻证明了自己有用
 
 它从 `task-123` 产物派生期望值而非复述数字，合并后马上抓到 `README.md` 的操作数过期（35/23 → 44/14）。**一个从产物派生的断言，在写完的当天就挡住了一次文档漂移。**
+
+## Wave 47-48 (2026-08-09)：收窄四条准则 + 修掉 seam #13，136 个任务全完成
+
+`main` = `d3e4177`，**3319 测试通过**，clippy 0，fmt 干净，锁可离线复现。**136/140，只剩 F1-F4。**
+
+### 计划所有者裁决「收窄准则」，我收窄了 2/4/6/15，每条都留了可证伪的钩子
+
+| 准则 | 收窄 | 钉住它的东西 |
+|---|---|---|
+| 2 | byte-identical 只要求 `OPENCODE_PURE=1` | 非 pure 插件树差异成为第 13 条 divergence，带实测字节数（221,818 / 17,970） |
+| 4 | 有后端者比较状态与响应体；无后端者答 `503` 并点名 | `FROZEN_API_GAPS` 按名冻结，集合变大即失败 |
+| 6 | 收敕到用户配置实际钉的 **0.20.6** | 三处版本号统一；去掉不可满足的 `middlewareStack.add` |
+| 15 | G6 Linux 已执行，Windows 仅源码 | README 与证据都必须写明 NOT EXECUTED |
+
+收窄准则 6 时我核实到一件事：它原本点名三个互不一致的版本，而**这台机器上只有 0.20.2 和 0.20.6，`0.20.1` 根本不存在**——capture 与测试一直引用着一个加载不了的版本。这不是收窄，是修正一个早已失效的契约。
+
+### SEAM #13 关闭：HTTP 轮次的结果现在读得回来
+
+F3 实测过三条路径全瞎（SSE 0 字节、`/message` 与 `/history` 空数组）。todo 131 用
+`events.rs::forward_engine_events` 把引擎事件桥接到 HTTP 表面，且**持久化先于实时投递**，所以
+`/history` 总能重放 SSE 上看到的事件。
+
+我亲手复现：**SSE 从 0 字节变成 2606 字节，带 12 类真实轮次事件**（`turn.started` … `turn.completed`）。
+变异掉桥接后两个测试立刻失败。
+
+顺带一个教训：我第一次复现时假 provider 对 title 与 chat 请求返回同一个 body，于是标题请求把
+它消化掉了（`title model returned no usable line`），害我以为还有缺陷。**夹具太粗糙会伪造缺陷，
+和夹具太友善会隐藏缺陷是同一类错误。**
+
+### API 缺口 45 → 10，且 permission/question 真的能停下来又恢复
+
+todo 132 加了进程内 broker，HTTP 轮次撞到 `ask` 规则时会**真的停住**，客户端能观察、能回复、
+同一轮次**恢复并完成**。跨会话 reply 被拒（变异掉归属校验，`api_reply_routes_validate_bodies_before_rejecting_cross_session_requests` 立刻失败），断连 fail-closed。
+
+### 我又下错了一条指令
+
+我要求「归属校验先于 body 解析」，132 照做并专门写测试钉住。结果矩阵发现
+`reply` 的状态码与 oracle 不符：**oracle 400，我们 404**。我核对上游
+`packages/core/src/permission.ts:45-49`，`ReplyInput` 的 `requestID` 与 `reply` 都是必填，
+所以空 `{}` 在 **schema 层**就被拒，走不到存在性检查。**我的顺序在安全上讲得通，在 parity 上讲不通。**
+
+132 的最终解法比我建议的更细：畸形 body 时**仍然 claim 并 drop**，让 RAII fail-closed 生效，
+但只对本会话拥有的请求——所以 400 与不泄露存在性同时成立。这是第 11 次「验收标准点名的机制本身
+可能是错的」。
+
+### 两次瞬时宿主故障，都不是代码问题
+
+132 报告它的全量门两次遇到 `EAGAIN: Resource temporarily unavailable`；我这边跑同一个提交
+**3319 通过 / 0 失败 / 0 EAGAIN**。合并时又遇到一次 `ExecutableFileBusy`（并发构建争用二进制），
+单独重跑即通过。**如实记录：这两次都是宿主瞬时资源问题，不是缺陷，但也不能当成"测试通过"——
+必须由编排器自己复跑确认。**
