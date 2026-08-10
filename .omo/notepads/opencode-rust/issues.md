@@ -6636,3 +6636,34 @@ match Self::discover() {
 我把 stale timeout 加到了 `.omo/omo.jsonc`（项目级），**而生效位置是 `/config/.omo/omo.jsonc`**——后者的注释里明确写着 *"Project-level .omo/omo.jsonc files are NOT honored for this setting"*。所以提高从未生效，F3 这一轮又在同一个 90 分钟窗口被取消。已改到正确位置并删除放错的那份。
 
 **教训：改配置后要验证它真的被读取，而不是只确认文件写出去了。** 这与「测试跑了旧二进制」是同一种错误——**动作完成不等于效果生效。**
+
+## [2026-08-10] SEAM #16：kiro-auth 的 provider 从未出现在 `models` 里 —— 我用真实二进制确认
+
+F1#2 与 F4#4 都指向准则 6 的「provider 可见性」。**我用两个真实二进制在用户自己的配置下比对，确认它成立**：
+
+```
+rust providers = 8   ts providers = 10
+只在 TS 有的：kiro-auth, opencode
+```
+
+- **`google`（antigravity 贡献的）两边都有** → 准则 6 的一半确实满足。
+- **`kiro-auth` 只在上游有** → 另一半不满足，而这正是准则 6 点名的插件。
+- 加 `--print-logs` 后日志里 **0 次** kiro 提及，所以不是「加载了但没贡献」，更像是根本没走到贡献 provider 那一步。
+- `opencode` 是上游自带的托管 provider（`opencode/big-pickle` 等），与插件无关，属另一件事。
+
+**为什么之前所有测试都没抓到**：todo 137 证明的是三层**共存与调度顺序**（`auth`/`provider` hook 被调用、配置顺序生效、杀一层只降级一层），而**从未断言这些 hook 贡献的 provider 最终出现在 `models` 的用户可见输出里**。hook 跑了 ≠ 用户看得到。
+
+这是第 12 次「测试替身比现实更友善」的变体：**测的是机制被调用，不是效果被用户看见。**
+
+### 顺带发现：准则 6 引用了一个上游不存在的 flag
+
+准则 6 写「providers appear in `models --format json`」。实测上游 1.18.15：
+
+```
+$ opencode models --help
+Options: -h --help  -v --version  --print-logs  --log-level  --pure  --verbose  --refresh
+```
+
+**没有 `--format`。** 我们的 `models` flag 集合与上游一致（都是 `--verbose`/`--refresh`/`--pure`），所以我们**正确地**也没有它。准则要求用一个不存在的 flag 去证明可见性——这是继 `middlewareStack.add` 与 `effort` 之后，**同一条准则里第三个不可满足的断言**。
+
+F1 的措辞「Implement and prove the required model user surface」预设了 `--format json` 该存在；正确的做法是用**上游真实存在的**表面（纯 `models` 输出）来断言 provider 可见性。
