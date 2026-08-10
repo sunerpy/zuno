@@ -6357,3 +6357,56 @@ does not assert.
   asked/replied events remain observable through the existing session/global SSE
   streams. Keeping these concerns separate avoids pretending a restored event can
   resume a missing turn.
+
+## Task 137 — "the test names a version" is not "the test loads that plugin"
+
+Wave 49. The 12th instance of **a test double being friendlier than reality**,
+and the second time the *same* gap in criterion 7 hid behind a green suite.
+
+`three_tiers_follow_configuration_order` was green for many waves while proving
+nothing about the two real auth plugins criterion 7 names. It loaded a synthetic
+`integration-js` fixture whose id was literally `integration-js`. Nothing in the
+test even referenced the real packages, so no amount of reading the assertions
+would reveal the gap — only reading the *fixture* would.
+
+**Three things only a runtime probe could tell me**, each of which changed the
+test design:
+
+1. **The four tiers share NO mutating hook.** Measured: antigravity registers
+   `event`/`tool`/`auth`; kiro registers `config`/`auth`/`provider`/
+   `chat.headers`; the Rust example registers `chat.params`/`shell.env`/
+   `experimental.text.complete`; a WASM component can only mutate
+   `experimental.chat.system.transform` (`wasm.rs::apply_hook_output` — every
+   other arm is `Ok(())`). So the obvious design — "dispatch one hook, watch the
+   string accumulate through four tiers" — is **impossible with real plugins**.
+   `HookBus::dispatch` filters by manifest, so an unshared hook reaches one
+   plugin. The synthetic fixture existed precisely because it *did* implement the
+   shared hook. That is the whole reason the shortcut was taken.
+
+   The fix: assert order on the one thing both real plugins *do* mutate — the
+   `auth` vector, which `HookBus` appends in configuration order — and pin
+   position with a wrapper that records dispatch order without changing
+   behaviour. Plus a negative test in reverse order, so no single ordering
+   satisfies both.
+
+2. **Antigravity emits a Compatibility diagnostic on every load** — "plugin
+   declares @opencode-ai/plugin ^0.15.30; host reports 1.18.13" — and keeps
+   serving. The pre-existing health predicate in `TierSession` was
+   `diagnostics().is_empty()`, which for the real antigravity plugin means
+   **permanently unhealthy from load**. Copying that predicate would have made
+   every real-plugin test assert against a plugin the wrapper had already
+   silenced, and it would still have been green. Health must narrow to fault
+   kinds (`Crashed`/`TimedOut`/`Protocol`/`FailedToLoad`).
+
+3. **Kiro's real `config` hook writes to the user's credential store.**
+   `bootstrapAuthIfNeeded` (`dist/plugin/auth-bootstrap.js:44`) inserts
+   `{type:'api', key:'kiro-bootstrap-placeholder'}` into
+   `~/.local/share/opencode/auth.json` when a Kiro CLI DB exists. `config` is one
+   of only four hooks kiro registers, so "dispatch every hook the plugin
+   declares" — the natural thoroughness instinct — **mutates real user
+   credentials from a unit test**. Recorded in the test's docstring so a future
+   coverage-increasing edit trips over it.
+
+**The transferable lesson:** when a test uses a fixture *in a slot where the
+criterion names a real artifact*, the fixture is not a simplification — it is the
+gap. Grep the fixture's id, not the test's assertions.

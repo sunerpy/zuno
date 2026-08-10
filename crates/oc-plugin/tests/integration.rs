@@ -1,5 +1,6 @@
 #[cfg(all(feature = "wasm", unix))]
 mod enabled {
+    use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
@@ -9,13 +10,20 @@ mod enabled {
     use async_trait::async_trait;
     use oc_engine::terminal_lease::{TerminalBroker, TerminalLease};
     use oc_error::BoxSource;
+    use oc_llm::catalog::availability::Availability;
+    use oc_llm::catalog::models_dev::CatalogStatus;
+    use oc_llm::catalog::resolved::{
+        ModelApi, ModelCapabilities, ModelCost, ModelLimit, ResolvedModel, ResolvedProvider,
+    };
+    use oc_llm::event::{Message, Role};
     use oc_paths::ResolvedProject;
     use oc_plugin::{
-        HookBus, HookInvocation, HookName, JsDiagnosticKind, JsHostConfig, JsHostPolicy,
-        JsPluginLoad, JsPluginSpec, Plugin, PluginDiagnosticKind, PluginLoad, PluginManifest,
-        PluginProcessSpec, TextCompleteInput, TextCompleteOutput, WasmPluginLoad, WasmPluginSpec,
-        WasmResourceLimits, load_js_plugins_ordered, load_plugins_ordered,
-        load_wasm_plugins_ordered,
+        AuthHook, ChatContext, ChatHeadersOutput, HookBus, HookInvocation, HookName,
+        JsDiagnosticKind, JsHostConfig, JsHostPolicy, JsPluginLoad, JsPluginSpec, Plugin,
+        PluginDiagnosticKind, PluginLoad, PluginManifest, PluginProcessSpec, PluginTools,
+        ProviderContext, ProviderHook, ProviderSource, SUPPORTED_JS_PLUGINS, TextCompleteInput,
+        TextCompleteOutput, WasmPluginLoad, WasmPluginSpec, WasmResourceLimits,
+        load_js_plugins_ordered, load_plugins_ordered, load_wasm_plugins_ordered,
     };
     use oc_testkit::FakeTerminalOwner;
     use url::Url;
@@ -40,11 +48,22 @@ export default {
     type HealthCheck = Arc<dyn Fn() -> bool + Send + Sync>;
     type TextMutation = fn(&mut TextCompleteOutput);
 
+    /// An observation wrapper, not a stand-in for the plugin it wraps.
+    ///
+    /// It forwards every hook to `inner` — and only ever to hooks `inner`'s own
+    /// manifest declares — while recording *where in configuration order the bus
+    /// reached this plugin*. The recording is the only synthetic thing here:
+    /// [`HookBus`] filters dispatch by manifest, so a hook no plugin shares
+    /// (and the four plugins in the real coexistence tests share none, see
+    /// [`three_tiers_follow_configuration_order`]) would otherwise leave order
+    /// unobservable. The wrapped plugins' own behaviour is asserted separately,
+    /// from the hooks they really implement.
     struct TrackedPlugin {
         inner: Arc<dyn Plugin>,
         manifest: PluginManifest,
         tier: &'static str,
         disposed: Arc<Mutex<Vec<&'static str>>>,
+        observed: Arc<Mutex<Vec<String>>>,
         health: HealthCheck,
         text_mutation: Option<TextMutation>,
     }
@@ -54,20 +73,27 @@ export default {
             inner: Arc<dyn Plugin>,
             tier: &'static str,
             disposed: Arc<Mutex<Vec<&'static str>>>,
+            observed: Arc<Mutex<Vec<String>>>,
             health: HealthCheck,
             text_mutation: Option<TextMutation>,
         ) -> Arc<Self> {
             let mut hooks = inner.manifest().hooks().to_vec();
-            if !hooks.contains(&HookName::Dispose) {
-                hooks.push(HookName::Dispose);
+            // Dispose so a surviving tier is provably reached at teardown, and
+            // TextComplete so one dispatch crosses every tier — including tiers
+            // whose real hook set omits it, which `call` never forwards to.
+            for required in [HookName::Dispose, HookName::TextComplete] {
+                if !hooks.contains(&required) {
+                    hooks.push(required);
+                }
             }
-            let manifest = PluginManifest::new(format!("integration-{tier}"), hooks)
-                .expect("tracked plugin manifest");
+            let manifest =
+                PluginManifest::new(inner.manifest().id(), hooks).expect("tracked plugin manifest");
             Arc::new(Self {
                 inner,
                 manifest,
                 tier,
                 disposed,
+                observed,
                 health,
                 text_mutation,
             })
@@ -80,11 +106,28 @@ export default {
             &self.manifest
         }
 
+        fn tools(&self) -> PluginTools {
+            if (self.health)() {
+                self.inner.tools()
+            } else {
+                PluginTools::new()
+            }
+        }
+
+        fn auth(&self) -> Option<AuthHook> {
+            (self.health)().then(|| self.inner.auth()).flatten()
+        }
+
+        fn provider(&self) -> Option<ProviderHook> {
+            (self.health)().then(|| self.inner.provider()).flatten()
+        }
+
         async fn call(&self, hook: &mut HookInvocation<'_>) -> Result<(), BoxSource> {
             if !(self.health)() {
                 return Ok(());
             }
             let name = hook.name();
+            lock(&self.observed).push(format!("{}:{name}", self.tier));
             if self.inner.manifest().supports(name) {
                 self.inner.call(hook).await?;
             }
@@ -168,12 +211,14 @@ export default {
             assert_eq!(wasm.plugins().len(), 1, "{:?}", wasm.diagnostics());
 
             let disposed = Arc::new(Mutex::new(Vec::new()));
+            let observed = Arc::new(Mutex::new(Vec::new()));
             let rust_plugin = Arc::clone(&rust.plugins()[0]);
             let rust_health_plugin = Arc::clone(&rust_plugin);
             let rust_tracked: Arc<dyn Plugin> = TrackedPlugin::new(
                 rust_plugin,
                 "rust",
                 Arc::clone(&disposed),
+                Arc::clone(&observed),
                 Arc::new(move || rust_health_plugin.is_enabled()),
                 None,
             );
@@ -184,6 +229,7 @@ export default {
                 wasm_plugin,
                 "wasm",
                 Arc::clone(&disposed),
+                Arc::clone(&observed),
                 Arc::new(move || wasm_health_plugin.is_enabled()),
                 Some(duplicate_text),
             );
@@ -195,6 +241,7 @@ export default {
                     plugin,
                     "js",
                     Arc::clone(&disposed),
+                    Arc::clone(&observed),
                     Arc::new(move || health_plugin.diagnostics().is_empty()),
                     None,
                 ) as Arc<dyn Plugin>
@@ -257,8 +304,340 @@ export default {
         }
     }
 
+    /// Criterion 7 against the user's own auth plugins rather than a fixture.
+    ///
+    /// The four tiers share no mutating hook, and that is a property of the real
+    /// packages, not a shortcut: measured on this host, antigravity registers
+    /// `event`/`tool`/`auth`, kiro registers `config`/`auth`/`provider`/
+    /// `chat.headers`, the example Rust plugin registers `chat.params`/
+    /// `shell.env`/`experimental.text.complete`, and a WebAssembly component can
+    /// only mutate `experimental.chat.system.transform` (`wasm.rs`'s
+    /// `apply_hook_output`). So configuration order is asserted three ways: the
+    /// bus's own plugin sequence, one dispatch crossing all four
+    /// ([`TrackedPlugin`] records position), and the two real `auth` hooks
+    /// composing into an order-sensitive vector — that last one being a real
+    /// mutation by both real plugins.
+    ///
+    /// `config` is deliberately never dispatched. Kiro's real `config` hook calls
+    /// `bootstrapAuthIfNeeded` (`dist/plugin/auth-bootstrap.js:44`), which writes
+    /// a placeholder entry into the user's `~/.local/share/opencode/auth.json`.
+    /// `effort` is likewise not asserted, for the reason recorded at
+    /// `tests/js.rs`'s real-kiro header test: it is chosen inside the plugin's own
+    /// AWS client on an outbound request needing live credentials and network.
     #[tokio::test]
     async fn three_tiers_follow_configuration_order() {
+        let temp = tempfile::tempdir().expect("integration tempdir");
+        let order = [
+            RealTier::Antigravity,
+            RealTier::Rust,
+            RealTier::Kiro,
+            RealTier::Wasm,
+        ];
+        let Some(session) = real_tiers_or_skip(
+            "three_tiers_follow_configuration_order",
+            temp.path(),
+            healthy_wasm_component(),
+            &order,
+            None,
+        )
+        .await
+        else {
+            return;
+        };
+        assert!(session.rust.diagnostics().is_empty());
+        assert!(session.wasm.diagnostics().is_empty());
+        assert_eq!(
+            session.ids(),
+            [
+                supported_spec(ANTIGRAVITY_PACKAGE).as_str(),
+                "integration-rust",
+                KIRO_PROVIDER,
+                "integration-wasm",
+            ],
+            "the bus must hold the four real identities in configuration order"
+        );
+        assert!(
+            HookName::ALL.iter().all(|hook| {
+                session
+                    .bus
+                    .plugins()
+                    .iter()
+                    .filter(|plugin| {
+                        plugin.manifest().supports(*hook)
+                            && *hook != HookName::Dispose
+                            && *hook != HookName::TextComplete
+                    })
+                    .count()
+                    < 4
+            }),
+            "a hook shared by all four tiers would make the position log redundant; assert the \
+             shared mutation directly instead"
+        );
+
+        let output = session.complete("x").await;
+
+        assert_eq!(
+            session.take_observed(),
+            observations(&order, HookName::TextComplete),
+            "one dispatch must reach all four tiers in configuration order"
+        );
+        assert_eq!(
+            output, "x!|x!",
+            "the example Rust plugin's real suffix must land before the WebAssembly tier doubles \
+             the text, because that is the configured order"
+        );
+        assert_eq!(
+            session.auth_providers().await,
+            [ANTIGRAVITY_PROVIDER, KIRO_PROVIDER],
+            "both real auth hooks must compose in configuration order"
+        );
+        assert_eq!(
+            session.kiro_request_kind("compaction").await.as_deref(),
+            Some("compaction"),
+            "the real kiro chat.headers hook must still serve from inside the four-plugin bus"
+        );
+        assert_eq!(
+            session.kiro_request_kind("build").await,
+            None,
+            "a non-compaction turn must not receive the request-kind header, otherwise the \
+             assertion above would pass for any input"
+        );
+
+        session.dispose().await;
+        assert_eq!(
+            lock(&session.disposed).clone(),
+            order.map(RealTier::label),
+            "teardown must reach every tier in configuration order"
+        );
+        session.shutdown().await;
+        wait_for_processes_to_exit(&[session.rust_pid]).await;
+    }
+
+    #[tokio::test]
+    async fn reversing_configuration_order_reverses_real_plugin_dispatch() {
+        let temp = tempfile::tempdir().expect("integration tempdir");
+        let order = [
+            RealTier::Wasm,
+            RealTier::Kiro,
+            RealTier::Rust,
+            RealTier::Antigravity,
+        ];
+        let Some(session) = real_tiers_or_skip(
+            "reversing_configuration_order_reverses_real_plugin_dispatch",
+            temp.path(),
+            healthy_wasm_component(),
+            &order,
+            None,
+        )
+        .await
+        else {
+            return;
+        };
+
+        let output = session.complete("x").await;
+
+        assert_eq!(
+            session.take_observed(),
+            observations(&order, HookName::TextComplete)
+        );
+        assert_eq!(
+            output, "x|x!",
+            "doubling now precedes the Rust suffix, so the order assertion cannot pass for any \
+             configuration"
+        );
+        assert_eq!(
+            session.auth_providers().await,
+            [KIRO_PROVIDER, ANTIGRAVITY_PROVIDER],
+            "the real auth vector must follow the reversed configuration too"
+        );
+        session.dispose().await;
+        session.shutdown().await;
+        wait_for_processes_to_exit(&[session.rust_pid]).await;
+    }
+
+    #[tokio::test]
+    async fn killing_the_rust_tier_leaves_the_real_auth_plugins_serving() {
+        let temp = tempfile::tempdir().expect("integration tempdir");
+        let order = [
+            RealTier::Rust,
+            RealTier::Wasm,
+            RealTier::Kiro,
+            RealTier::Antigravity,
+        ];
+        let Some(session) = real_tiers_or_skip(
+            "killing_the_rust_tier_leaves_the_real_auth_plugins_serving",
+            temp.path(),
+            healthy_wasm_component(),
+            &order,
+            None,
+        )
+        .await
+        else {
+            return;
+        };
+        kill_process(session.rust_pid);
+        wait_until(Duration::from_secs(3), || {
+            !session.rust.plugins()[0].is_enabled()
+        })
+        .await;
+        session.take_observed();
+
+        let output = session.complete("x").await;
+
+        assert_eq!(
+            session.take_observed(),
+            observations(
+                &[RealTier::Wasm, RealTier::Kiro, RealTier::Antigravity],
+                HookName::TextComplete
+            ),
+            "only the killed tier may drop out of dispatch"
+        );
+        assert_eq!(
+            output, "x|x",
+            "the killed tier's suffix must be the only loss"
+        );
+        let diagnostics = session.rust.diagnostics();
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].kind, PluginDiagnosticKind::Crashed);
+        assert_eq!(
+            session.auth_providers().await,
+            [KIRO_PROVIDER, ANTIGRAVITY_PROVIDER],
+            "both real auth plugins must survive a sibling crash"
+        );
+        assert_eq!(
+            session.kiro_request_kind("compaction").await.as_deref(),
+            Some("compaction"),
+            "the real kiro hook must still inject its header after the Rust tier died"
+        );
+        assert!(session.wasm.plugins()[0].is_enabled());
+        session.dispose().await;
+        session.shutdown().await;
+        wait_for_processes_to_exit(&[session.rust_pid]).await;
+    }
+
+    #[tokio::test]
+    async fn a_runaway_wasm_tier_leaves_the_real_auth_plugins_serving() {
+        let temp = tempfile::tempdir().expect("integration tempdir");
+        let order = [
+            RealTier::Antigravity,
+            RealTier::Wasm,
+            RealTier::Kiro,
+            RealTier::Rust,
+        ];
+        let Some(session) = real_tiers_or_skip(
+            "a_runaway_wasm_tier_leaves_the_real_auth_plugins_serving",
+            temp.path(),
+            runaway_wasm_component(),
+            &order,
+            None,
+        )
+        .await
+        else {
+            return;
+        };
+
+        let first = session.complete("x").await;
+        session.take_observed();
+        let second = session.complete("x").await;
+
+        assert_eq!(first, "x!", "the runaway tier must not mutate the text");
+        assert_eq!(second, "x!");
+        assert_eq!(
+            session.take_observed(),
+            observations(
+                &[RealTier::Antigravity, RealTier::Kiro, RealTier::Rust],
+                HookName::TextComplete
+            ),
+            "only the runaway tier may drop out of dispatch"
+        );
+        let diagnostics = session.wasm.diagnostics();
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].kind, PluginDiagnosticKind::TimedOut);
+        assert!(!session.wasm.plugins()[0].is_enabled());
+        assert!(session.rust.plugins()[0].is_enabled());
+        assert_eq!(
+            session.auth_providers().await,
+            [ANTIGRAVITY_PROVIDER, KIRO_PROVIDER]
+        );
+        assert_eq!(
+            session.kiro_request_kind("compaction").await.as_deref(),
+            Some("compaction")
+        );
+        session.dispose().await;
+        session.shutdown().await;
+        wait_for_processes_to_exit(&[session.rust_pid]).await;
+    }
+
+    #[tokio::test]
+    async fn starving_one_real_auth_plugin_leaves_its_javascript_sibling_serving() {
+        let temp = tempfile::tempdir().expect("integration tempdir");
+        let order = [
+            RealTier::Antigravity,
+            RealTier::Kiro,
+            RealTier::Rust,
+            RealTier::Wasm,
+        ];
+        let Some(session) = real_tiers_or_skip(
+            "starving_one_real_auth_plugin_leaves_its_javascript_sibling_serving",
+            temp.path(),
+            healthy_wasm_component(),
+            &order,
+            Some(RealTier::Kiro),
+        )
+        .await
+        else {
+            return;
+        };
+        let starved = session.js_load(RealTier::Kiro);
+        assert!(starved.plugins().is_empty());
+        assert_eq!(
+            starved.diagnostics().len(),
+            1,
+            "{:?}",
+            starved.diagnostics()
+        );
+        assert_eq!(
+            starved.diagnostics()[0].kind,
+            JsDiagnosticKind::MissingRuntime
+        );
+        assert_eq!(
+            session.ids(),
+            [
+                supported_spec(ANTIGRAVITY_PACKAGE).as_str(),
+                "integration-rust",
+                "integration-wasm",
+            ],
+            "the starved plugin must be the only one missing from the bus"
+        );
+
+        let output = session.complete("x").await;
+
+        assert_eq!(
+            session.take_observed(),
+            observations(
+                &[RealTier::Antigravity, RealTier::Rust, RealTier::Wasm],
+                HookName::TextComplete
+            )
+        );
+        assert_eq!(output, "x!|x!");
+        assert_eq!(
+            session.auth_providers().await,
+            [ANTIGRAVITY_PROVIDER],
+            "the surviving real auth plugin must still register its provider"
+        );
+        assert_eq!(
+            session.kiro_request_kind("compaction").await,
+            None,
+            "nothing may inject kiro's header once kiro is gone, otherwise the positive \
+             assertions elsewhere prove nothing about kiro"
+        );
+        session.dispose().await;
+        session.shutdown().await;
+        wait_for_processes_to_exit(&[session.rust_pid]).await;
+    }
+
+    #[tokio::test]
+    async fn three_synthetic_tiers_follow_configuration_order() {
         let temp = tempfile::tempdir().expect("integration tempdir");
         let session = TierSession::load(
             temp.path(),
@@ -461,6 +840,363 @@ export default {
         wait_for_processes_to_exit(&pids).await;
     }
 
+    const PLUGIN_CACHE: &str = "/config/.cache/opencode";
+    const ANTIGRAVITY_PACKAGE: &str = "opencode-antigravity-auth";
+    const KIRO_PACKAGE: &str = "@sunerpy/opencode-kiro-auth";
+    const ANTIGRAVITY_PROVIDER: &str = "google";
+    const KIRO_PROVIDER: &str = "kiro-auth";
+    const KIRO_REQUEST_KIND_HEADER: &str = "x-opencode-kiro-request-kind";
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RealTier {
+        Antigravity,
+        Kiro,
+        Rust,
+        Wasm,
+    }
+
+    impl RealTier {
+        const fn package(self) -> Option<&'static str> {
+            match self {
+                Self::Antigravity => Some(ANTIGRAVITY_PACKAGE),
+                Self::Kiro => Some(KIRO_PACKAGE),
+                Self::Rust | Self::Wasm => None,
+            }
+        }
+
+        const fn label(self) -> &'static str {
+            match self {
+                Self::Antigravity => "antigravity",
+                Self::Kiro => "kiro",
+                Self::Rust => "rust",
+                Self::Wasm => "wasm",
+            }
+        }
+    }
+
+    struct RealTiers {
+        bus: HookBus,
+        rust: PluginLoad,
+        wasm: WasmPluginLoad,
+        js: Vec<(RealTier, JsPluginLoad)>,
+        rust_pid: u32,
+        observed: Arc<Mutex<Vec<String>>>,
+        disposed: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl RealTiers {
+        async fn load(
+            root: &Path,
+            wasm_component: Vec<u8>,
+            order: &[RealTier],
+            starved: Option<RealTier>,
+        ) -> Result<Self, String> {
+            let absent = [ANTIGRAVITY_PACKAGE, KIRO_PACKAGE]
+                .into_iter()
+                .map(installed_package)
+                .filter(|path| !path.is_dir())
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>();
+            if !absent.is_empty() {
+                return Err(format!(
+                    "the real auth plugin package(s) {} are absent, so real three-tier \
+                     coexistence was NOT verified on this host",
+                    absent.join(", ")
+                ));
+            }
+
+            let rust_pid_file = root.join("rust.pid");
+            let rust = load_plugins_ordered(vec![rust_spec(&rust_pid_file, Duration::ZERO)]).await;
+            assert_eq!(rust.plugins().len(), 1, "{:?}", rust.diagnostics());
+            let rust_pid = read_pid(&rust_pid_file);
+
+            let wasm = load_wasm_plugins_ordered(vec![
+                WasmPluginSpec::new("integration-wasm", wasm_component).limits(
+                    WasmResourceLimits {
+                        fuel: 10_000,
+                        epoch_deadline: Duration::from_millis(200),
+                        memory_bytes: 1024 * 1024,
+                    },
+                ),
+            ]);
+            assert_eq!(wasm.plugins().len(), 1, "{:?}", wasm.diagnostics());
+
+            let mut js = Vec::new();
+            for tier in [RealTier::Antigravity, RealTier::Kiro] {
+                let package = tier.package().expect("a JavaScript tier names its package");
+                let starve = starved == Some(tier);
+                js.push((tier, load_real_js(root, package, starve).await));
+            }
+
+            for (tier, load) in &js {
+                if starved == Some(*tier) {
+                    continue;
+                }
+                if load.plugins().is_empty() {
+                    let reason = format!(
+                        "{} did not load ({:?}), so real three-tier coexistence was NOT verified \
+                         on this host",
+                        tier.package().unwrap_or(tier.label()),
+                        load.diagnostics()
+                    );
+                    rust.shutdown().await;
+                    for (_, load) in &js {
+                        load.shutdown().await;
+                    }
+                    return Err(reason);
+                }
+            }
+
+            let disposed = Arc::new(Mutex::new(Vec::new()));
+            let observed = Arc::new(Mutex::new(Vec::new()));
+
+            let rust_plugin = Arc::clone(&rust.plugins()[0]);
+            let rust_health = Arc::clone(&rust_plugin);
+            let rust_tracked: Arc<dyn Plugin> = TrackedPlugin::new(
+                rust_plugin,
+                RealTier::Rust.label(),
+                Arc::clone(&disposed),
+                Arc::clone(&observed),
+                Arc::new(move || rust_health.is_enabled()),
+                None,
+            );
+
+            let wasm_plugin = Arc::clone(&wasm.plugins()[0]);
+            let wasm_health = Arc::clone(&wasm_plugin);
+            let wasm_tracked: Arc<dyn Plugin> = TrackedPlugin::new(
+                wasm_plugin,
+                RealTier::Wasm.label(),
+                Arc::clone(&disposed),
+                Arc::clone(&observed),
+                Arc::new(move || wasm_health.is_enabled()),
+                Some(duplicate_text),
+            );
+
+            let mut tracked_js = Vec::new();
+            for (tier, load) in &js {
+                if let Some(plugin) = load.plugins().first() {
+                    let plugin = Arc::clone(plugin);
+                    let health = Arc::clone(&plugin);
+                    tracked_js.push((
+                        *tier,
+                        TrackedPlugin::new(
+                            plugin,
+                            tier.label(),
+                            Arc::clone(&disposed),
+                            Arc::clone(&observed),
+                            // A version-compatibility warning is not a crash:
+                            // antigravity declares `@opencode-ai/plugin ^0.15.30`
+                            // against a host reporting 1.18.13 and still serves,
+                            // so only fault kinds may mark it unhealthy.
+                            Arc::new(move || {
+                                !health.diagnostics().iter().any(|diagnostic| {
+                                    matches!(
+                                        diagnostic.kind,
+                                        JsDiagnosticKind::Crashed
+                                            | JsDiagnosticKind::TimedOut
+                                            | JsDiagnosticKind::Protocol
+                                            | JsDiagnosticKind::FailedToLoad
+                                    )
+                                })
+                            }),
+                            None,
+                        ) as Arc<dyn Plugin>,
+                    ));
+                }
+            }
+
+            let plugins = order
+                .iter()
+                .filter_map(|tier| match tier {
+                    RealTier::Rust => Some(Arc::clone(&rust_tracked)),
+                    RealTier::Wasm => Some(Arc::clone(&wasm_tracked)),
+                    RealTier::Antigravity | RealTier::Kiro => tracked_js
+                        .iter()
+                        .find(|(loaded, _)| loaded == tier)
+                        .map(|(_, plugin)| Arc::clone(plugin)),
+                })
+                .collect();
+
+            Ok(Self {
+                bus: HookBus::new(plugins),
+                rust,
+                wasm,
+                js,
+                rust_pid,
+                observed,
+                disposed,
+            })
+        }
+
+        fn ids(&self) -> Vec<&str> {
+            self.bus
+                .plugins()
+                .iter()
+                .map(|plugin| plugin.manifest().id())
+                .collect()
+        }
+
+        fn take_observed(&self) -> Vec<String> {
+            std::mem::take(&mut *lock(&self.observed))
+        }
+
+        fn js_load(&self, tier: RealTier) -> &JsPluginLoad {
+            self.js
+                .iter()
+                .find(|(loaded, _)| *loaded == tier)
+                .map(|(_, load)| load)
+                .unwrap_or_else(|| panic!("{tier:?} has a JavaScript load"))
+        }
+
+        async fn complete(&self, initial: &str) -> String {
+            let mut output = TextCompleteOutput {
+                text: initial.to_owned(),
+            };
+            self.bus
+                .dispatch(HookInvocation::TextComplete {
+                    input: &TextCompleteInput {
+                        session_id: "session",
+                        message_id: "message",
+                        part_id: "part",
+                    },
+                    output: &mut output,
+                })
+                .await
+                .expect("tier failures are contained by their hosts");
+            output.text
+        }
+
+        async fn auth_providers(&self) -> Vec<String> {
+            let mut output = Vec::new();
+            self.bus
+                .dispatch(HookInvocation::Auth {
+                    output: &mut output,
+                })
+                .await
+                .expect("collecting auth hooks");
+            output.into_iter().map(|auth| auth.provider).collect()
+        }
+
+        async fn kiro_request_kind(&self, agent: &str) -> Option<String> {
+            let model = kiro_model();
+            let provider = ProviderContext {
+                source: ProviderSource::Config,
+                info: kiro_provider(),
+                options: serde_json::Map::new(),
+            };
+            let context = ChatContext {
+                session_id: "ses_criterion_seven",
+                agent,
+                model: &model,
+                provider: &provider,
+                message: Message::new(Role::User, "summarize"),
+            };
+            let mut output = ChatHeadersOutput::default();
+            self.bus
+                .dispatch(HookInvocation::ChatHeaders {
+                    input: &context,
+                    output: &mut output,
+                })
+                .await
+                .expect("the real kiro chat.headers hook runs through the bus");
+            output.headers.get(KIRO_REQUEST_KIND_HEADER).cloned()
+        }
+
+        async fn dispose(&self) {
+            self.bus
+                .dispatch(HookInvocation::Dispose)
+                .await
+                .expect("dispose surviving tiers");
+        }
+
+        async fn shutdown(&self) {
+            self.rust.shutdown().await;
+            for (_, load) in &self.js {
+                load.shutdown().await;
+            }
+        }
+    }
+
+    /// Loads the four real tiers, or prints a named skip and yields `None`.
+    ///
+    /// A silent `return` here would let a green suite imply coverage of the two
+    /// real auth plugins that it never had — the exact failure this test exists
+    /// to close — so an absent package is announced with the test's own name.
+    async fn real_tiers_or_skip(
+        test: &str,
+        root: &Path,
+        wasm_component: Vec<u8>,
+        order: &[RealTier],
+        starved: Option<RealTier>,
+    ) -> Option<RealTiers> {
+        match RealTiers::load(root, wasm_component, order, starved).await {
+            Ok(session) => Some(session),
+            Err(reason) => {
+                eprintln!("SKIPPED {test}: {reason}");
+                None
+            }
+        }
+    }
+
+    fn observations(order: &[RealTier], hook: HookName) -> Vec<String> {
+        order
+            .iter()
+            .map(|tier| format!("{}:{hook}", tier.label()))
+            .collect()
+    }
+
+    fn supported_spec(package: &str) -> String {
+        let entry = SUPPORTED_JS_PLUGINS
+            .iter()
+            .find(|supported| supported.package == package)
+            .unwrap_or_else(|| panic!("oc_plugin::SUPPORTED_JS_PLUGINS no longer lists {package}"));
+        format!("{}@{}", entry.package, entry.version)
+    }
+
+    fn installed_package(package: &str) -> PathBuf {
+        Path::new(PLUGIN_CACHE).join(format!(
+            "packages/{}/node_modules/{package}",
+            supported_spec(package)
+        ))
+    }
+
+    async fn load_real_js(root: &Path, package: &str, starve_runtime: bool) -> JsPluginLoad {
+        let mut config = host_config(root).cache_dir(PathBuf::from(PLUGIN_CACHE));
+        if starve_runtime {
+            config = config.runtime_search_path(OsString::new());
+        }
+        load_js_plugins_ordered(vec![JsPluginSpec::new(supported_spec(package))], config).await
+    }
+
+    fn kiro_model() -> ResolvedModel {
+        ResolvedModel {
+            id: "claude-sonnet-4-5".to_owned(),
+            provider_id: KIRO_PROVIDER.to_owned(),
+            name: "Claude Sonnet 4.5".to_owned(),
+            family: "claude".to_owned(),
+            release_date: String::new(),
+            status: CatalogStatus::Active,
+            api: ModelApi::default(),
+            capabilities: ModelCapabilities::default(),
+            cost: ModelCost::default(),
+            limit: ModelLimit::default(),
+            options: serde_json::Map::new(),
+            headers: BTreeMap::new(),
+            variants: BTreeMap::new(),
+        }
+    }
+
+    fn kiro_provider() -> ResolvedProvider {
+        ResolvedProvider {
+            id: KIRO_PROVIDER.to_owned(),
+            name: "Kiro".to_owned(),
+            env: Vec::new(),
+            options: serde_json::Map::new(),
+            availability: Availability::none(),
+            models: BTreeMap::new(),
+        }
+    }
+
     fn rust_spec(pid_file: &Path, hook_sleep: Duration) -> PluginProcessSpec {
         PluginProcessSpec::new("integration-rust", "/bin/sh")
             .arg("-c")
@@ -623,6 +1359,16 @@ macro_rules! wasm_integration_skip {
 
 #[cfg(not(all(feature = "wasm", unix)))]
 wasm_integration_skip!(three_tiers_follow_configuration_order);
+#[cfg(not(all(feature = "wasm", unix)))]
+wasm_integration_skip!(three_synthetic_tiers_follow_configuration_order);
+#[cfg(not(all(feature = "wasm", unix)))]
+wasm_integration_skip!(reversing_configuration_order_reverses_real_plugin_dispatch);
+#[cfg(not(all(feature = "wasm", unix)))]
+wasm_integration_skip!(killing_the_rust_tier_leaves_the_real_auth_plugins_serving);
+#[cfg(not(all(feature = "wasm", unix)))]
+wasm_integration_skip!(a_runaway_wasm_tier_leaves_the_real_auth_plugins_serving);
+#[cfg(not(all(feature = "wasm", unix)))]
+wasm_integration_skip!(starving_one_real_auth_plugin_leaves_its_javascript_sibling_serving);
 #[cfg(not(all(feature = "wasm", unix)))]
 wasm_integration_skip!(killed_jsonrpc_degrades_only_the_rust_tier);
 #[cfg(not(all(feature = "wasm", unix)))]

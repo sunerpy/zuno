@@ -321,7 +321,17 @@ async fn js_real_supported_plugins_load_with_their_own_sdk_clients() {
     let cache = PathBuf::from(PLUGIN_CACHE);
     let antigravity = installed_package(&cache, ANTIGRAVITY_PACKAGE);
     let kiro = installed_package(&cache, KIRO_PACKAGE);
-    if !antigravity.is_dir() || !kiro.is_dir() {
+    let absent = [&antigravity, &kiro]
+        .into_iter()
+        .filter(|path| !path.is_dir())
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    if !absent.is_empty() {
+        eprintln!(
+            "SKIPPED js_real_supported_plugins_load_with_their_own_sdk_clients: {} is absent, so \
+             the real supported plugins were NOT loaded on this host",
+            absent.join(", ")
+        );
         return;
     }
     let temp = tempfile::tempdir().expect("tempdir");
@@ -397,6 +407,10 @@ fn criterion_6_converges_the_plan_the_capture_and_this_test_on_one_kiro_auth_ver
             include_str!("../../oc-server/src/compat_v1.rs"),
         ),
         ("crates/oc-plugin/tests/js.rs", include_str!("js.rs")),
+        (
+            "crates/oc-plugin/tests/integration.rs",
+            include_str!("integration.rs"),
+        ),
     ] {
         let stale = text
             .match_indices("opencode-kiro-auth@")
