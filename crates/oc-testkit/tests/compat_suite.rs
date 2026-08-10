@@ -57,7 +57,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use oc_testkit::compat_report::{DivergenceSummary, OracleAvailability, OracleKind};
 use oc_testkit::{
     BehaviouralDifference, ComparedSurface, CompatReport, DivergenceList, KnownGap, Normalization,
-    Verdict, compat_report::SCHEMA_VERSION, divergence,
+    Verdict, compat_report, compat_report::SCHEMA_VERSION, divergence,
 };
 
 /// The installed release the whole port is measured against.
@@ -2838,45 +2838,13 @@ fn behavioural_differences() -> Vec<BehaviouralDifference> {
     ]
 }
 
+/// The gap list, rendered from the live gate's own counts.
+///
+/// The entries moved to [`oc_testkit::compat_report::known_gaps`] so that the
+/// committed compatibility matrix can render the same list this report carries;
+/// before that they existed only inside `target/compat/compat-report.json`, which
+/// nothing commits, while `docs/divergences.md` told readers twice that a gap is
+/// "listed in the compatibility matrix".
 fn known_gaps() -> Vec<KnownGap> {
-    vec![
-        KnownGap {
-            id: "api-backends-unavailable".to_owned(),
-            surface: format!(
-                "{} of the {UPSTREAM_API_OPERATIONS} upstream /api operations",
-                FROZEN_API_GAPS.len()
-            ),
-            detail: format!(
-                "Every upstream operation is invoked against both processes and its status, \
-                 normalized body, and observable session/PTY state delta are captured. {} \
-                 operations have local backends. The remaining {} return an operation-specific \
-                 503 backend_unavailable response and are never counted as parity. The matrix \
-                 rejects any 501 before applying a differential exemption. This remains a \
-                 compatibility gap, not a declared behavioral difference.",
-                UPSTREAM_API_OPERATIONS - FROZEN_API_GAPS.len(),
-                FROZEN_API_GAPS.len()
-            )
-            .to_owned(),
-        },
-        KnownGap {
-            id: "permission-evaluation-semantics".to_owned(),
-            surface: "permission resolution (`findLast` wildcard matching)".to_owned(),
-            detail: "The merged permission CONFIG is compared against the real binary; the \
-                     evaluation order that turns it into an allow/ask/deny decision is verified \
-                     against the upstream source by unit tests, not differentially, because the \
-                     binary exposes no command that prints a resolved decision."
-                .to_owned(),
-        },
-        KnownGap {
-            id: "channel-dependent-database-filename".to_owned(),
-            surface: "$XDG_DATA_HOME/opencode/opencode-<channel>.db".to_owned(),
-            detail: "A source build of either implementation resolves opencode-local.db while an \
-                     installed release resolves opencode.db, so a `cargo build` does not see the \
-                     user's sessions. This port mirrors the oracle's rule \
-                     (packages/core/src/database/database.ts:45-55) exactly, so it is FAITHFUL \
-                     BEHAVIOUR and not a divergence — recorded here because it presents as a \
-                     parity bug the first time anyone tries it. Plan todo 92 owns documenting it."
-                .to_owned(),
-        },
-    ]
+    compat_report::known_gaps(FROZEN_API_GAPS.len(), UPSTREAM_API_OPERATIONS)
 }

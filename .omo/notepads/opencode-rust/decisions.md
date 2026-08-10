@@ -6699,3 +6699,29 @@ Todo 130 removed exactly that hard-coding from `compat_suite.rs`, where the file
   in principle make both binaries fail in matching ways — parity would pass and
   the guard would not. Both were re-verified against their own mutations in the
   same session.
+
+## Todo 140 — the assistant turn-part difference is a GAP, not divergence 18
+
+Route chosen: named compatibility gap `assistant-turn-step-parts`, in
+`oc_testkit::compat_report::known_gaps`. `DECLARED_COUNT` stays 17 and
+`docs/divergences.toml` is untouched.
+
+The deciding fact is not scheduling but ownership: the port already HAS the
+implementation and never wired it up. `oc-db` models `step-start`/`step-finish` as
+first-class serialized wire tags (`crates/oc-db/src/message.rs:139-142,181-182`) and
+`oc_engine::stream::StreamProjector` already writes upstream's exact shape including
+both snapshot hashes (`crates/oc-engine/src/stream.rs:211-265,869-977`) — but
+`StreamProjector::start` has no production caller. The live path is
+`run_turn` → `checkpoint_assistant`, which can only write `text`, `reasoning` and
+`tool` (`crates/oc-engine/src/loop.rs:1547-1588`).
+
+An unwired implementation is work outstanding. Declaring it in
+`docs/divergences.toml` would be precisely the laundering that file's own header
+forbids ("A surface that is merely unimplemented is a gap, not a divergence … must
+never be laundered into an entry here"), repeated at `divergence.rs:26-31`.
+
+Implementing it was rejected as the wrong task rather than as too large:
+`step-finish` requires `reason`, `cost` and a structured `tokens` object
+(`packages/schema/src/v1/session.ts:240-257`), and wiring `StreamProjector` into
+`run_turn` replaces the production turn loop's persistence path — a feature commit
+under a `docs:` subject, in a wave with three parallel tasks over the same crates.

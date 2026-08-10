@@ -6546,3 +6546,48 @@ is itself worth knowing, but it is undeclared in `docs/divergences.toml` (13 ent
   tested": the `tui` exemption, for instance, stands or falls on upstream really
   printing `Failed to change directory`, which is what proves the two binaries
   were asked different questions rather than behaving differently.
+
+## Todo 140 — upstream writes `step-start` unconditionally, which settles todo 136's doubt
+
+Re-derived from the oracle tree rather than inherited from todo 136's evidence.
+
+Upstream's processor calls `snapshot.track()` first, but the `session.updatePart(...)`
+on the NEXT line runs whether that returned a hash or `undefined`
+(`packages/opencode/src/session/processor.ts:424-432`). Snapshots are enabled only for
+a git project with snapshots not disabled (`packages/opencode/src/snapshot/index.ts:167-170`)
+and `track()` returns `undefined` otherwise (`:318-323`). So a non-git project still
+persists `step-start`, just without the `snapshot` field.
+
+That independently confirms todo 136's "reproduced in a git repository and outside
+one" and closes the "step-start only carries a snapshot" hypothesis from the source
+rather than from repetition.
+
+One plain single-step turn upstream: `step-start`, `text`, `step-finish`. The text
+deltas accumulate into ONE `text` part (`:486-530`), not several. `patch` appears only
+when `patch.files.length > 0` (`:457-468`).
+
+What is actually lost by not writing them:
+  * `step-finish.cost`/`.tokens` is the ONLY source upstream's projector reads to
+    aggregate session usage (`packages/core/src/session/projector.ts:36-42`, applied
+    `:90-108`, `:325-328`).
+  * the first `step-start.snapshot` and last `step-finish.snapshot` are the two bounds
+    of a turn's DISPLAYED diff (`packages/opencode/src/session/summary.ts:82-99`),
+    refreshed by `revert` (`packages/opencode/src/session/revert.ts:70-77`). The file
+    restore itself uses `patch` parts (`:45-52`), so revert's correctness does not
+    depend on them.
+  * `run --format json` emits both as `step_start`/`step_finish`
+    (`packages/opencode/src/cli/cmd/run.ts:740-746`).
+  * the current App SKIPS both when rendering
+    (`packages/app/src/context/server-session.ts:26-31`) — so no TUI consequence.
+
+## Todo 140 — SEAM #15 bit again, and the mutation was designed around it
+
+Mutating the gap's CONSTANT would have proved nothing (the constant is the record, not
+the behaviour). The stale-direction mutation had to change the real production path:
+`checkpoint_assistant` was made to persist a `step-start` part. That requires an
+explicit `cargo build -p oc-cli` first, because `Subject::discover_or_build` only
+builds when the binary is ABSENT (`crates/oc-testkit/src/subject.rs:68-77`) — without
+it the witness measures the previous binary and reports a false green.
+
+Rule for any future behaviour-mutation proof in this repo: rebuild the subject
+explicitly, never rely on `discover_or_build`.

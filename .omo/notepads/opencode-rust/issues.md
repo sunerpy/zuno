@@ -6667,3 +6667,37 @@ Options: -h --help  -v --version  --print-logs  --log-level  --pure  --verbose  
 **没有 `--format`。** 我们的 `models` flag 集合与上游一致（都是 `--verbose`/`--refresh`/`--pure`），所以我们**正确地**也没有它。准则要求用一个不存在的 flag 去证明可见性——这是继 `middlewareStack.add` 与 `effort` 之后，**同一条准则里第三个不可满足的断言**。
 
 F1 的措辞「Implement and prove the required model user surface」预设了 `--format json` 该存在；正确的做法是用**上游真实存在的**表面（纯 `models` 输出）来断言 provider 可见性。
+
+## SEAM #17 — the gap section `docs/divergences.md` promised twice never existed
+
+Found while doing todo 140, not named by it.
+
+`docs/divergences.md` tells readers TWICE that a merely-unimplemented surface is
+"reported as `known_gaps` by the compatibility report **and listed in the
+[compatibility matrix](compatibility-matrix.md)**" — at `:3-6` and again at
+`:135-140`. `docs/compatibility-matrix.md` had **no gap section at all**. The list
+was a private `fn known_gaps()` inside `crates/oc-testkit/tests/compat_suite.rs`,
+reachable only through `target/compat/compat-report.json` — a build artifact nothing
+commits and no reader of the repository ever sees.
+
+So for the THREE gaps that already existed (`api-backends-unavailable`,
+`permission-evaluation-semantics`, `channel-dependent-database-filename`) that
+sentence was already false, and no gate could fail over it. Invisible to a fully
+green suite, like every seam before it.
+
+This is structurally the same defect F1 and F4 each rejected — a claim correct in the
+executable gate and stale in prose nothing derives (`known_gaps()` saying 14/44, the
+README saying "thirteen"). Recording the turn-part gap only in `compat_suite.rs`
+would have satisfied todo 140's letter and reproduced the defect a fourth time.
+
+Fixed structurally: the list moved to
+`oc_testkit::compat_report::known_gaps(api_gap_count, upstream_api_operations)`, and
+`crates/oc-cli/tests/docs.rs::known_gaps_block` renders it into a
+`<!-- generated:BEGIN known-gaps -->` block on the matrix page using the API counts
+that test **probes off the running server**. A gap closing now rewrites the page
+without anyone editing it, and the docs gate fails until it is regenerated.
+
+Lesson generalised: "recorded in the compatibility artifact" was ambiguous between
+`compat-report.json` (uncommitted) and the committed docs. Whenever a promise names a
+committed page, something must GENERATE that page from the same source, or the
+promise is prose.
