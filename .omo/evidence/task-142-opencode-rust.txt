@@ -1,0 +1,226 @@
+todo 142 — pin the `diagnostics-name-their-cause` divergence to its documented texts
+====================================================================================
+
+Worktree `/config/workspace/ProdDir/AI/oc-wt/t142`, branch `task-142`, base `68bdfed`.
+Oracle: `/config/.local/share/mise/shims/opencode` reporting `1.18.15` (= `PINNED_RELEASE`).
+Subject: `target/debug/opencode-rust`, rebuilt before every measurement below (SEAM #15:
+`Subject::discover_or_build` never checks freshness, so a stale binary would make every
+mutation verdict meaningless).
+
+1. What F4 found, and what was actually wrong
+---------------------------------------------
+
+`.omo/evidence/F4-REPORT-wave5.md` judgment 1, verbatim:
+
+    its parity-row witness currently asserts only that both sides fail; unlike the other
+    three additions, it does not directly assert the documented stderr texts.
+
+Confirmed at base. `Witness::BothFail` (`cli_parity.rs:138` at `68bdfed`) evaluated exactly
+one predicate (`:728`):
+
+    verdict.oracle.exit != Some(0) && verdict.subject.exit != Some(0)
+
+Its two users were the two diagnostics probes (`:260`, `:286`). So the entry that exists to
+protect this port's *message content* was guarded by a check that never read a message.
+
+Two facts I measured that the todo description did not state:
+
+  a. The divergence declares **three** surfaces (`docs/divergences.toml:143`): `serve` on an
+     unavailable port, `run` with no message, `run` with an unresolvable model. The table had
+     probes for only **two** of them — `run --model <bogus>` had **no probe at all**. So the
+     weakness was worse than "witness too weak on two probes": one third of the declaration
+     was measured by nothing.
+  b. The entry's own closing prose was already stale for a second reason: it said the harness
+     "exempts those two stderr streams" and "still asserting both sides refuse", which after
+     this change describes neither the count nor the check. Corrected in the same commit and
+     `docs/divergences.md` regenerated through the existing `OC_DOCS_REGENERATE=1` path.
+
+2. The three surfaces, measured on this host
+--------------------------------------------
+
+Both binaries, same cleared environment `scripted_world` builds (`NO_COLOR=1`, `TERM=dumb`,
+`OPENCODE_DISABLE_{AUTOUPDATE,MODELS_FETCH,DEFAULT_PLUGINS,LSP_DOWNLOAD}=1`,
+`OPENCODE_DB=:memory:`, scripted `HOME`/XDG/`TMPDIR`, `git init`-ed project). Port 46157 was
+held bound by the measuring process.
+
+  serve --port 46157 --hostname 127.0.0.1
+    oracle  exit 1  stderr (SGR stripped): "Error: Unexpected error\n\nServeError"
+    subject exit 1  stderr: "could not bind HTTP server to 127.0.0.1:46157: Address already
+                             in use (os error 98)"
+
+  run
+    oracle  exit 1  stderr: "Error: You must provide a message or a command"
+    subject exit 1  stderr: "a message is required"
+
+  run --model bogus/model hi
+    oracle  exit 1  stderr: "Error: {\n \"name\": \"UnknownError\",\n \"data\": {\n
+                             \"message\": \"Unexpected server error. Check server logs for
+                             details.\",\n \"ref\": \"err_ce14d997\"\n }\n}"
+    subject exit 1  stderr: "model `bogus/model` is not available: no `provider` block in your
+                             configuration defines it, OPENCODE_DISABLE_MODELS_FETCH is set so
+                             no fetch from `https://models.opencode.ai` was attempted, and no
+                             cached catalog exists at `<CACHE>/opencode/models.json`. Define the
+                             provider and model under `provider` in your config, or unset
+                             OPENCODE_DISABLE_MODELS_FETCH to fetch the catalog, or set
+                             OPENCODE_MODELS_PATH to a catalog file on disk"
+
+Determinism of the third surface, three runs each (it is the one I did not trust on sight):
+
+  oracle  1.53s / 1.49s / 1.52s — text stable except `ref`, which is a fresh random id every
+          run (`err_e56cfd64`, `err_2b30c3e8`, `err_b3153a77`). The witness therefore pins
+          `UnknownError` and the `message` sentence, never the `ref`.
+  subject 0.022s / 0.023s / 0.022s — byte-identical apart from the scripted cache path, which
+          the witness does not pin. No network: the message is raised by
+          `oc-llm/src/catalog/error.rs:49` `CatalogError::FetchDisabled`, before any request.
+
+3. What changed
+---------------
+
+`crates/oc-cli/tests/cli_parity.rs` only, plus the two divergence-doc corrections.
+
+  * `Witness::BothFail` **removed**, replaced by
+    `Witness::DocumentedDiagnostics { oracle_form, subject_form }`. Removed rather than left
+    reachable-by-nothing: its only two users were the probes being upgraded, so keeping it
+    would have left a weaker tier available for the next probe to reach for.
+  * `Witness::OracleStderrContains` **untouched**; the `tui` probe that uses it is unchanged.
+  * A third probe added for `run --model bogus/model hi`, closing the surface that had none.
+    `PROBE_COUNT` 15 → 16, and the module doc's "Fifteen probes" updated with it.
+  * `documented_diagnostics_hold()` checks **four** facts per probe:
+      1. both sides still refuse (the old fact, kept — nothing was weakened);
+      2. every `oracle_form` fragment is in the oracle's raw stderr;
+      3. every `subject_form` fragment is in this port's raw stderr;
+      4. **and neither side carries the other's form.**
+    Fact 4 is why one direction alone is not enough: asserting only (2) passes if this port
+    degrades to the same opaque text; asserting only (3) passes if a future release starts
+    naming the cause, at which point the divergence is closed and the entry must go.
+  * `DIAGNOSTICS_SURFACES` freezes the three argvs **by name**, and the new test
+    `every_declared_diagnostics_surface_carries_a_two_sided_witness` compares it against the
+    table. It runs **no process**, so a downgrade fails even on a host with no oracle — where
+    the process-driven half of `every_exemption_states_a_reason_and_keeps_a_witness` skips.
+    It also asserts the declared reason quotes every fragment expected *of upstream*, because
+    that half is the one no code here controls.
+  * `witnesses_observed` 3 → 4, plus a new `diagnostics_witnesses_observed == 3`.
+
+Port number and OS error string (the todo's explicit "must not"):
+  * the address is asserted through `BUSY_PORT_TOKEN`, resolved to the port the run actually
+    holds — `SUBJECT_BIND_FAILURE = "could not bind HTTP server to 127.0.0.1:<BUSY_PORT>"`.
+    No literal port number anywhere.
+  * `Address already in use (os error 98)` is deliberately **not** pinned. `98` is Linux's
+    `EADDRINUSE` and the strerror text is the platform's, so pinning it would fail on a
+    healthy macOS or Windows host for a reason unrelated to the divergence. Recorded in the
+    rustdoc on `SUBJECT_BIND_FAILURE`. Everything the witness does pin — the `127.0.0.1:<port>`
+    prefix, the argv refusals, upstream's `Unexpected error`/`ServeError`/`UnknownError` — is
+    platform-independent.
+
+4. Mutation proof
+-----------------
+
+Every mutation was followed by `cargo build -p oc-cli --bin opencode-rust` before testing, and
+each was first shown to genuinely change observable behaviour (I have reported equivalent
+mutations as "uncaught" before).
+
+M1 — production: `oc-server/src/server.rs:330` `ServeError::Bind` display changed from
+     `"could not bind HTTP server to {address}: {source}"` to `"could not bind HTTP server:
+     {source}"` — the address, i.e. exactly what this divergence claims we add, removed.
+
+  behaviour actually changed:
+      stderr: 'could not bind HTTP server: Address already in use (os error 98)', exit 1
+
+  NEW harness — FAILS, by name:
+      test every_exemption_states_a_reason_and_keeps_a_witness ... FAILED
+      panicked at crates/oc-cli/tests/cli_parity.rs:663:
+      `diagnostics-name-their-cause` declares that this port answers ["serve", "--port",
+      "43199", "--hostname", "127.0.0.1"] by naming the cause, evidenced by "could not bind
+      HTTP server to 127.0.0.1:43199". `serve` emitted:
+      could not bind HTTP server: Address already in use (os error 98)
+      (9 passed; 1 failed)
+
+  PRE-TASK harness (`git stash` of my change, i.e. `68bdfed`'s `cli_parity.rs` with
+  `Witness::BothFail`), same mutation, same rebuilt binary — **FULLY GREEN**:
+      test result: ok. 9 passed; 0 failed; 0 ignored
+  This is the seam, demonstrated rather than argued: the declared diagnostic lost the address
+  and the entire parity target still passed, because both sides still exited 1.
+
+M2 — production: the same display string changed to upstream's own text,
+     `"Unexpected error\n\nServeError"` — the full degradation the entry exists to forbid.
+
+  behaviour actually changed: stderr became the two-line opaque form, exit 1.
+
+  NEW harness — FAILS on the *other* direction (fact 4):
+      panicked at crates/oc-cli/tests/cli_parity.rs:651:
+      this port answered ["serve", "--port", "34109", "--hostname", "127.0.0.1"] with
+      upstream's own "Unexpected error". The exemption exists *because* this port names what
+      that text omits, so carrying it means the declared improvement is gone and the stderr
+      comparison should be restored rather than forgiven.
+      (9 passed; 1 failed)
+
+M3 — harness: the `serve` probe's witness downgraded to the pre-existing weaker-but-nonzero
+     tier `Witness::OracleStderrContains("Unexpected error")` — the realistic regression, since
+     that tier still exists for `tui`. Two tests fail:
+      every_declared_diagnostics_surface_carries_a_two_sided_witness ... FAILED
+        left:  {"run", "run --model bogus/model hi"}
+        right: {"run", "run --model bogus/model hi", "serve --port <BUSY_PORT> --hostname 127.0.0.1"}
+      every_exemption_states_a_reason_and_keeps_a_witness ... FAILED
+        `diagnostics-name-their-cause` names 3 surfaces and each one's documented texts must
+        have been observed against both binaries — left: 2, right: 3
+
+M4 — the fourth intended mutation (swap a `subject_form` fragment for upstream's own text) did
+     not apply: my patch script's expected string no longer matched after `cargo fmt` reflowed
+     it. Reported rather than quietly dropped. It would have exercised the same assertion as
+     M2's direction, and M2 already proves that assertion bites against a real binary, which is
+     stronger evidence than editing the expectation would have been.
+
+`docs/divergences.toml` prose: the docs gate independently proved it is load-bearing. After I
+corrected the stale clause, `docs_every_declared_divergence_is_documented_with_its_reason`
+FAILED against the un-regenerated `docs/divergences.md`, then passed after
+`OC_DOCS_REGENERATE=1`.
+
+Production source restored byte-for-byte after every mutation:
+  `git diff -- crates/oc-server/src/server.rs` → empty; final diff touches only
+  `crates/oc-cli/tests/cli_parity.rs`, `docs/divergences.toml`, `docs/divergences.md`.
+
+5. Nothing was weakened
+-----------------------
+
+  * `Witness::OracleStderrContains` and the `tui` probe using it: unchanged.
+  * `the_declared_presentation_divergences_are_live`, `the_non_vcs_plan_glob_difference_is_live`,
+    `the_session_list_output_shape_difference_is_live` — the other three of todo 135's four
+    divergences: unchanged (`git diff` touches none of them) and all three pass.
+  * `the_comparison_cannot_shrink_into_exemptions` — unchanged and passing. The exempt-command
+    set is still exactly `{run, serve, tui}`: the added probe is a *second* `run` probe, so it
+    does not widen the frozen set. `fully_compared >= 9` and `exit_and_stdout >= 11` still hold.
+  * `every_exemption_states_a_reason_and_keeps_a_witness` gained assertions; it lost none.
+  * `surface.rs`'s production-dispatch mutation guard: untouched.
+
+6. Gates
+--------
+
+  cargo fmt --all --check                                  clean
+  cargo clippy --workspace --all-targets --offline         0 warnings, 0 errors
+  cargo metadata --locked --offline --format-version 1     clean
+  cargo test --workspace --offline (OC_MEMORY_GATE_MODE=skip)
+      3350 passed, 0 failed, 2 ignored (baseline 3349; +1 = the new
+      every_declared_diagnostics_surface_carries_a_two_sided_witness)
+
+  cargo test -p oc-cli --test cli_parity --offline: 10 passed, 0 failed.
+  All 16 probes ran against both binaries; the per-probe log records exit o=1 s=1 with
+  `stderr=exempt` on the three diagnostics surfaces and `stdout=same` on all sixteen.
+
+Frozen perf surfaces untouched; the ~100-minute memory gate and the 2-hour soak were not run
+(`OC_MEMORY_GATE_MODE=skip`). Nothing pushed, nothing merged, no broad `pkill`.
+
+7. Corrections to the task's own analysis
+-----------------------------------------
+
+  * "恰好 2 个 BothFail probe 就是 diagnostics 相关的" — accurate, but the framing "升级两个
+    probe" understates the fix: the divergence declares three surfaces and only two had probes.
+    Upgrading the two would have left `run --model <bogus>` declared and unmeasured, so a third
+    probe was required to satisfy the stated intent.
+  * The task said upgrade the existing `OracleStderrContains` tier. I did not reuse it: it holds
+    a single `&'static str` and observes only the oracle, so it cannot express "and ours says
+    something else". A sibling variant carrying both sides was the smaller change than
+    contorting that one, and `OracleStderrContains` stays exactly as `tui` needs it.
+  * The task did not mention `docs/divergences.toml`'s stale closing clause ("those two stderr
+    streams … still asserting both sides refuse"). Left alone it would have been a fresh
+    instance of the prose-versus-executable drift the same review blocked in two other places,
+    so I corrected it and regenerated the page.

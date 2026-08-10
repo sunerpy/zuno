@@ -6546,3 +6546,33 @@ is itself worth knowing, but it is undeclared in `docs/divergences.toml` (13 ent
   tested": the `tui` exemption, for instance, stands or falls on upstream really
   printing `Failed to change directory`, which is what proves the two binaries
   were asked different questions rather than behaving differently.
+
+## [2026-08-10] SEAM #17：见证只断言「都失败」时，声明的三个面里有一个连探针都没有
+
+todo 142 修 F4 指出的那条弱点，实测出来比它描述的更深一层。
+
+`Witness::BothFail` 只求值一个谓词——两边 exit 都非 0。它的两个使用者正是
+`diagnostics-name-their-cause` 的两个探针。但**这条 divergence 声明了三个面**
+（`serve` 绑不上端口、`run` 无消息、`run` 模型无法解析），表里只有前两个的探针，
+**第三个面一个探针都没有**。所以问题不只是「两个探针的见证太弱」，而是三分之一的声明
+根本没有任何测量。
+
+**决定性演示**：把 `ServeError::Bind` 的 Display 里 `{address}` 删掉（正是这条
+divergence 声称我们比上游多给的东西），重建 subject 二进制，跑**改造前**的 harness：
+
+    test result: ok. 9 passed; 0 failed; 0 ignored
+
+全绿。声明的诊断丢了地址，整个 parity target 一声不响，因为两边仍然都 exit 1。
+
+> **一个见证如果不读它声称保护的那个东西，它就不保护那个东西。**
+> 而「声明覆盖 N 个面」和「表里有 N 个探针」是两个独立的事实，必须各自有门去钉。
+
+修法：`Witness::DocumentedDiagnostics { oracle_form, subject_form }`，每个探针查四件事——
+两边仍拒绝、oracle 带上游的形态、subject 带点名的形态、**且任一方都不带对方的形态**。
+第四条是关键：只查前者，我们退化成同样不透明会通过；只查后者，上游哪天开始点名了不会
+被发现（而那正是该关掉这条 entry 的信号）。另加 `DIAGNOSTICS_SURFACES` 把三个 argv 按名
+冻结，并用一个**不跑任何进程**的测试比对——这样在没装 oracle 的机器上，降级见证也照样失败。
+
+顺带发现的第二处：entry 自己的收尾散文还写着「exempts those two stderr streams …
+still asserting both sides refuse」，两处都已不成立。docs 门在我改了 toml 之后立刻红了，
+证明那段散文是有门守的，不是死文字。
