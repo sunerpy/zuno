@@ -6512,3 +6512,29 @@ F1：SATISFIED 9 / NOT SATISFIED 8 / UNVERIFIABLE 1。F4 的三条 blocker 与�
 测试重新以 `Elapsed(())` 失败，证明测试守的是桥，不是数据库副作用。真实 `serve` 验收中四个读面
 都包含 `HTTP_ASSISTANT_OK`，而空会话仍精确返回空数组。**以后判断一条 HTTP 状态链是否完成，至少要
 证明 admission、执行、持久化、实时投影和事后读回是一条闭环；200/204 只能证明路由活着。**
+
+## [2026-08-09] 第四轮 F4：REJECT，两条都是我收窄时留下的尾巴
+
+报告：`.omo/evidence/F4-REPORT-wave4.md`。F4 确认第三轮三条 blocker 全部关闭，但找到**两条我自己造成的新问题**——都在我写的收窄文本里，不在代码里。
+
+### Blocker 1：准则 4 的收窄文本数字过期
+
+我在 wave 47 写收窄时是「44 个后端 / 14 个缺口」，但**同一波的 todo 132 又补了四个**（permission/question 的 reply/reject），实际已是 **48 / 10**。README 与 `docs/compatibility-matrix.md` 都已更新到 48/10（那两处有从代码派生的断言兜着），**只有计划里我手写的那段没跟上**。
+
+*这正是 todo 126 建立那个「从产物派生断言」机制要防的事——而我手写的收窄段落恰好在该机制覆盖范围之外。*
+
+### Blocker 2：准则 6 仍要求验证 `effort`，而测试明确声明不验
+
+我把准则 6 的 `client.middlewareStack.add` 换成「真实 Kiro 请求证明注入的 header 与 **effort** 字段」。但 `crates/oc-plugin/tests/js.rs:469` 写得很清楚：
+
+> The `effort` field is deliberately NOT asserted: it is chosen inside the plugin's AWS client on an outbound Kiro request, which needs live credentials and network this suite forbids. Stating that is the honest scope, not a waiver.
+
+**测试是诚实的，我的准则是贪心的。** 我在替换一条不可满足的断言时，顺手写进了另一条不可满足的断言。已改为明确把 `effort` 划出范围，并保留 header 的双向断言（hook 停止运行会失败，而不是静默注入空值）。
+
+### 教训
+
+**收窄准则时，我两次都把「当时的数字」和「想要的证明」写死进了文本。** 前者会随同波次的其他任务过期，后者会与测试的诚实范围冲突。规则：
+
+> 收窄文本里凡出现具体数字，必须指向一个从代码派生的断言，而不是自己复述；凡出现「必须证明 X」，先去读那个测试是否真的证明了 X。
+
+F4 的措辞值得记下：它把这两条列为 *"missing promised behavior or proof, not requests for additional scope"* ——即**契约承诺了产物没给的证明**，而不是它要求加范围。这个区分很准。
