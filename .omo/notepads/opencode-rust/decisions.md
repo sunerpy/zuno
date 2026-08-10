@@ -6627,3 +6627,42 @@ writes a placeholder credential into the user's `auth.json`).
 
 The kiro version-drift scan in `tests/js.rs` now also covers
 `tests/integration.rs`, so the new file cannot reintroduce a second version.
+## [2026-08-10] Task 136: how "one session, both binaries" was made structural
+
+**One `ScriptedEnv` with one absolute `OPENCODE_DB`, shared by both runners.** The
+alternative — an env per binary, agreeing on a path by convention — would let a later
+edit split them while every assertion still passed, which is the two-session fixture
+this todo explicitly forbids. `SharedWorld` hands the same env to both, so neither
+binary is *given* a way to reach a second database. Backed by three independent
+checks: exact vector equality on `session_ids()` (a fork fails by value, not merely by
+count), strict growth on storage, and the continuing binary replaying the other's turn.
+
+**Growth asserted on SQLite, in two units, strictly.** `TranscriptSize::grew_from`
+requires both `message` and `part` counts to increase. Reading it out of either
+binary's `export` would let a formatter change satisfy it; requiring only `message`
+would accept a turn that persisted a row with no content.
+
+**A local discriminating fake provider, NOT an addition to `MockProvider`.** The
+shared mock's contract is ordered replay of recorded bytes, routing by path
+(`mock_provider.rs:533-545`); teaching it to classify request *semantics* would change
+behaviour for every other consumer. What these tests need is narrow: classify on
+upstream's own title system prompt (`You are a title generator`, verbatim in 1.18.15's
+request bodies from BOTH binaries) and answer each kind correctly. The payoff is that
+the tests do not depend on how many preludes a run happens to make — an order-based
+fixture does, silently. Proven load-bearing: disabling the classification makes the
+alternating test see 4 chat requests instead of 3.
+
+**No HTTP client added.** The fake is an axum *server*, exactly like `MockProvider`, so
+`tests/no_http_client.rs`'s invariant is untouched and `Cargo.toml` is unchanged.
+
+**`docs/divergences.toml` deliberately NOT edited** for the `step-start`/`step-finish`
+part-shape difference found here. Two reasons: it is a production-behaviour question,
+not a test one, and that file is being changed by todo 135 in parallel — editing it
+would create a merge conflict for no gain. Instead the exemption is named in the test
+module's own doc comment with its measurement, so a green run cannot be misread as
+claiming part-shape parity. Visible exemption, which F4 accepts; invisible is what it
+rejected twice. Recommended as a follow-up todo.
+
+**Oracle resolved through `Oracle::discover_pinned`, never a hard-coded mise path.**
+Todo 130 removed exactly that hard-coding from `compat_suite.rs`, where the file named
+1.18.12 while recording 1.18.13 and nothing could fail over the difference.

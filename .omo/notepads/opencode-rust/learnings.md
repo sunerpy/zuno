@@ -6463,3 +6463,43 @@ test design:
 **The transferable lesson:** when a test uses a fixture *in a slot where the
 criterion names a real artifact*, the fixture is not a simplification — it is the
 gap. Grep the fixture's id, not the test's assertions.
+## [2026-08-10] Task 136: "readable" and "usable" fail separately, and only one assertion sees the difference
+
+The four mutations against the new `session_interop.rs` split cleanly into two
+groups, and the split is the lesson.
+
+M3 (`resolve_session` ignores `SessionChoice::Existing` and forks) was caught by the
+**session-identity** assertion. M4 (`retained_history` returns only the newest
+message) was caught by the **wire-replay** assertion — and by nothing else. Under M4
+the session still listed, still exported, and its transcript still **grew**: the port
+appended a fresh user+assistant pair to the right session row. Every storage-level
+assertion I would naturally write was satisfied while the port had silently stopped
+carrying the history it inherited. The only thing that noticed was reading the user
+turns out of the **outbound provider request**.
+
+So the strongest available form of "the opposite implementation can decode what the
+other wrote" is not "it parsed" and not even "the transcript grew" — it is *the bytes
+came back out of the decoder and onto the wire*. For any round-trip claim, find the
+place where the decoded value is used, not the place where it is stored.
+
+**A mutation test that does not rebuild the subject binary proves nothing.** My first
+M1 run looked uncaught for exactly one reason: `Subject::discover_or_build` reuses an
+existing `target/debug/opencode-rust`, so the suite re-ran against the *pre-mutation*
+binary. I nearly concluded `model_reference` was no longer the production writer and
+went looking for a second one. `cargo build -p oc-cli --bin opencode-rust` between
+mutation and run is mandatory; without it the green result is an artefact.
+
+**M1's asymmetry is the tests being precise, not a gap.** Re-injecting todo 115's
+`modelID` spelling failed the Rust→TS direction and the row-shape guard, and left the
+TS→Rust direction passing — correctly, because in that direction the *oracle* created
+the session, so this port's mis-spelling never reached upstream's decoder. A mutation
+that fails every test is weaker evidence than one that fails exactly the tests whose
+seam it crosses.
+
+**Measured while doing this — an undeclared part-shape divergence.** One assistant
+turn: release 1.18.15 persists `text, step-start, text, step-finish` (4 parts), this
+port persists `text, text` (2). Reproduced on the `run` path inside a git repository
+and outside one, so it is not the "step-start only carries a snapshot" case —
+production data has 218,899 `step-start` rows whose blob is literally
+`{"type":"step-start"}`. Interoperability holds across it in both directions, which
+is itself worth knowing, but it is undeclared in `docs/divergences.toml` (13 entries).
