@@ -16,6 +16,7 @@
 //! | `divergence-index`, `divergence-detail` | [`oc_testkit::DivergenceList`] over `docs/divergences.toml`, cross-checked against [`oc_testkit::divergence::DECLARED_COUNT`] |
 //! | `cli-disposition` | [`oc_cli::dispositions`] — the same table `oc-cli/tests/surface.rs` asserts against the registered `clap` tree |
 //! | `api-operations` | the served document from [`oc_server::api::openapi`] set-differenced against the committed 1.18.12 oracle capture, then **probed route by route** for an explicit `503 backend_unavailable` gap; any `501` fails the gate |
+//! | `known-gaps` | [`oc_testkit::compat_report::known_gaps`] — the same list the compatibility report writes, rendered with the API counts probed above |
 //! | `v1-routes` | [`oc_server::V1_SURFACE`] |
 //! | `rejected-inputs` | messages *rendered by* [`oc_config::legacy`]'s detectors, so a reworded message fails |
 //! | `plugin-hooks` | [`oc_plugin::HookName::ALL`] |
@@ -540,6 +541,32 @@ fn assert_api_counts(
     );
 }
 
+/// Renders the compatibility report's `known_gaps` section as documentation.
+///
+/// The counts come from the same live probe [`api_block`] uses, not from constants
+/// restated here, so an API gap closing rewrites this page's text without anyone
+/// editing it. Before plan todo 140 this block did not exist and the gap list was
+/// reachable only inside the uncommitted `target/compat/compat-report.json`, while
+/// `docs/divergences.md` promised twice that a gap is listed on this page.
+fn known_gaps_block(
+    upstream: &BTreeSet<(String, String)>,
+    gaps: &BTreeSet<(String, String)>,
+) -> String {
+    let mut out = String::new();
+    for (index, gap) in oc_testkit::compat_report::known_gaps(gaps.len(), upstream.len())
+        .iter()
+        .enumerate()
+    {
+        if index > 0 {
+            out.push('\n');
+        }
+        let _ = writeln!(out, "### {}\n", gap.id);
+        let _ = writeln!(out, "**Surface.** {}\n", gap.surface);
+        let _ = writeln!(out, "**What is missing.** {}", gap.detail);
+    }
+    out
+}
+
 fn v1_block() -> String {
     let mut out = String::from("| method | path | SDK method |\n|---|---|---|\n");
     for route in V1_SURFACE {
@@ -581,6 +608,7 @@ fn docs_compatibility_matrix_matches_every_code_table() {
         &api_block(&upstream, &served, &gaps),
     );
 
+    check_block(PAGE, "known-gaps", &known_gaps_block(&upstream, &gaps));
     check_block(PAGE, "v1-routes", &v1_block());
 
     assert_cli_disposition_counts();

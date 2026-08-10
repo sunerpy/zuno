@@ -43,6 +43,46 @@ OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs
 | 17 | [`non-vcs-plan-glob-is-absolute`](divergences.md#non-vcs-plan-glob-is-absolute) | `agent list` — the `plan` agent's `edit` allow-rule for the global plans directory, in a directory that is not a repository |
 <!-- generated:END divergence-index -->
 
+## Known gaps
+
+A surface that is merely **unimplemented** is not a decision, so it is never an
+entry on [divergences.md](divergences.md). It is recorded here and in the
+compatibility report's `known_gaps` section, which this table is generated from —
+`oc_testkit::compat_report::known_gaps`, the same list
+`crates/oc-testkit/tests/compat_suite.rs` writes into
+`target/compat/compat-report.json`.
+
+Until plan todo 140 this section did not exist, so every gap lived only in that
+uncommitted artifact while this page and `divergences.md` both told readers a gap
+is "listed in the compatibility matrix". Each entry below names what a consumer
+loses and, where one exists, the test that fails if the gap closes or goes stale.
+
+<!-- generated:BEGIN known-gaps -->
+### api-backends-unavailable
+
+**Surface.** 10 of the 58 upstream /api operations
+
+**What is missing.** Every upstream operation is invoked against both processes and its status, normalized body, and observable session/PTY state delta are captured. 48 operations have local backends. The remaining 10 return an operation-specific 503 backend_unavailable response and are never counted as parity. The matrix rejects any 501 before applying a differential exemption. This remains a compatibility gap, not a declared behavioral difference.
+
+### permission-evaluation-semantics
+
+**Surface.** permission resolution (`findLast` wildcard matching)
+
+**What is missing.** The merged permission CONFIG is compared against the real binary; the evaluation order that turns it into an allow/ask/deny decision is verified against the upstream source by unit tests, not differentially, because the binary exposes no command that prints a resolved decision.
+
+### channel-dependent-database-filename
+
+**Surface.** $XDG_DATA_HOME/opencode/opencode-<channel>.db
+
+**What is missing.** A source build of either implementation resolves opencode-local.db while an installed release resolves opencode.db, so a `cargo build` does not see the user's sessions. This port mirrors the oracle's rule (packages/core/src/database/database.ts:45-55) exactly, so it is FAITHFUL BEHAVIOUR and not a divergence — recorded here because it presents as a parity bug the first time anyone tries it. Plan todo 92 owns documenting it.
+
+### assistant-turn-step-parts
+
+**Surface.** the `part` rows one assistant turn persists — the step-boundary parts
+
+**What is missing.** For one plain single-step turn the release persists [step-start, text, step-finish] and this port persists [text], so [step-start, step-finish] is never written. Measured on the `run` path at 1.18.15 in .omo/evidence/task-136-opencode-rust.txt:191-215, inside a git repository and outside one; the user's production database holds 280,859 step-start rows, so the release's shape is the normal one rather than an artefact. This is a GAP and not a declared divergence because nothing chose it: `oc-db` already models both types as first-class wire tags (crates/oc-db/src/message.rs:139-142,181-182) and `oc-engine::stream::StreamProjector` already writes upstream's exact shape including the snapshot hashes (crates/oc-engine/src/stream.rs:211-265,869-977), but no production caller reaches it — the live turn path accumulates and then checkpoints only text, reasoning and tool parts (crates/oc-engine/src/loop.rs:1547-1588). An unwired implementation is work outstanding, so declaring it in docs/divergences.toml would dress an omission up as a decision. What a consumer loses: upstream reads `step-finish.cost`/`tokens` to aggregate session usage (packages/core/src/session/projector.ts:36-42,90-108) and takes the first `step-start.snapshot` and last `step-finish.snapshot` as the bounds of a turn's diff (packages/opencode/src/session/summary.ts:82-99), which `revert` then refreshes (packages/opencode/src/session/revert.ts:70-77). Interoperability is unaffected and was measured to be: every assertion in crates/oc-testkit/tests/session_interop.rs holds across this difference in both directions. Witnessed by crates/oc-testkit/tests/session_interop.rs::the_recorded_turn_part_gap_matches_what_a_turn_actually_persists.
+<!-- generated:END known-gaps -->
+
 ## Cross-session resident memory
 
 <!-- generated:BEGIN cross-session-memory -->

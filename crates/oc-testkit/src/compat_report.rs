@@ -302,9 +302,227 @@ impl CompatReport {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The known gaps, owned here so one source renders every artifact
+// ---------------------------------------------------------------------------
+
+/// The gap recording that a turn on this port persists no step-boundary parts.
+///
+/// Named so the witness in `crates/oc-testkit/tests/session_interop.rs` can look
+/// the gap up in [`known_gaps`] by id rather than by matching prose. Deleting the
+/// entry then fails that test instead of quietly un-recording the gap.
+pub const TURN_PART_GAP_ID: &str = "assistant-turn-step-parts";
+
+/// The assistant part types release 1.18.15 persists for one plain single-step turn.
+///
+/// Ordered as upstream writes them: `start-step` inserts `step-start`
+/// unconditionally — `snapshot.track()` may return nothing and the `updatePart` on
+/// the next line still runs (`packages/opencode/src/session/processor.ts:424-432`)
+/// — the text deltas accumulate into one `text` part (`:486-530`), and
+/// `finish-step` appends `step-finish` carrying `reason`, `cost` and `tokens`
+/// (`:435-455`).
+pub const UPSTREAM_TURN_PART_TYPES: &[&str] = &["step-start", "text", "step-finish"];
+
+/// The assistant part types this port persists for the same turn.
+///
+/// Measured on the `run` path at release 1.18.15 in
+/// `.omo/evidence/task-136-opencode-rust.txt:191-215`, inside a git repository and
+/// outside one, so this is not the "`step-start` only carries a snapshot" case.
+pub const PORTED_TURN_PART_TYPES: &[&str] = &["text"];
+
+/// The part types [`UPSTREAM_TURN_PART_TYPES`] has and [`PORTED_TURN_PART_TYPES`]
+/// does not.
+///
+/// Computed rather than typed a third time, so the gap's prose, the generated
+/// documentation table and the witness assertion cannot disagree about which types
+/// are missing.
+#[must_use]
+pub fn missing_turn_part_types() -> Vec<&'static str> {
+    UPSTREAM_TURN_PART_TYPES
+        .iter()
+        .filter(|kind| !PORTED_TURN_PART_TYPES.contains(*kind))
+        .copied()
+        .collect()
+}
+
+/// The gap [`TURN_PART_GAP_ID`] names, on its own.
+///
+/// Exposed separately from [`known_gaps`] so the witness can reach it without
+/// supplying API counts it has no business knowing. [`known_gaps`] returns this
+/// same value, and a unit test below asserts it does, so the entry cannot be
+/// dropped from the shipped list while the witness keeps passing.
+#[must_use]
+pub fn turn_part_gap() -> KnownGap {
+    KnownGap {
+        id: TURN_PART_GAP_ID.to_owned(),
+        surface: "the `part` rows one assistant turn persists — the step-boundary parts".to_owned(),
+        detail: format!(
+            "For one plain single-step turn the release persists [{upstream}] and this port \
+             persists [{ported}], so [{missing}] is never written. Measured on the `run` path at \
+             1.18.15 in .omo/evidence/task-136-opencode-rust.txt:191-215, inside a git repository \
+             and outside one; the user's production database holds 280,859 step-start rows, so the \
+             release's shape is the normal one rather than an artefact. This is a GAP and not a \
+             declared divergence because nothing chose it: `oc-db` already models both types as \
+             first-class wire tags (crates/oc-db/src/message.rs:139-142,181-182) and \
+             `oc-engine::stream::StreamProjector` already writes upstream's exact shape including \
+             the snapshot hashes (crates/oc-engine/src/stream.rs:211-265,869-977), but no \
+             production caller reaches it — the live turn path accumulates and then checkpoints \
+             only text, reasoning and tool parts (crates/oc-engine/src/loop.rs:1547-1588). An \
+             unwired implementation is work outstanding, so declaring it in docs/divergences.toml \
+             would dress an omission up as a decision. What a consumer loses: upstream reads \
+             `step-finish.cost`/`tokens` to aggregate session usage \
+             (packages/core/src/session/projector.ts:36-42,90-108) and takes the first \
+             `step-start.snapshot` and last `step-finish.snapshot` as the bounds of a turn's diff \
+             (packages/opencode/src/session/summary.ts:82-99), which `revert` then refreshes \
+             (packages/opencode/src/session/revert.ts:70-77). Interoperability is unaffected and \
+             was measured to be: every assertion in crates/oc-testkit/tests/session_interop.rs \
+             holds across this difference in both directions. Witnessed by \
+             crates/oc-testkit/tests/session_interop.rs::{witness}.",
+            upstream = UPSTREAM_TURN_PART_TYPES.join(", "),
+            ported = PORTED_TURN_PART_TYPES.join(", "),
+            missing = missing_turn_part_types().join(", "),
+            witness = TURN_PART_WITNESS,
+        ),
+    }
+}
+
+/// The test name [`turn_part_gap`]'s detail points a reader at.
+///
+/// A constant so the gap text and the `#[tokio::test]` cannot drift apart silently;
+/// the witness asserts its own name against it.
+pub const TURN_PART_WITNESS: &str =
+    "the_recorded_turn_part_gap_matches_what_a_turn_actually_persists";
+
+/// Every surface where this port is behind upstream with no decision behind it.
+///
+/// # Why this list moved out of the compatibility suite
+///
+/// It used to be a private `fn known_gaps()` inside
+/// `crates/oc-testkit/tests/compat_suite.rs`, reachable only by the test that
+/// writes `target/compat/compat-report.json` — a file nothing commits. Meanwhile
+/// `docs/divergences.md` told readers, twice, that a merely unimplemented surface
+/// "is reported as `known_gaps` by the compatibility report **and listed in the
+/// compatibility matrix**". No such listing existed, so for a reader consulting the
+/// committed documentation the gap section was empty and the promise was prose
+/// nothing derived — the same defect the first and fourth final-verification waves
+/// rejected twice over stale counts.
+///
+/// Living here, one list renders both the report and the matrix's generated
+/// `known-gaps` block, so a gap cannot be recorded in the artifact a reader never
+/// sees.
+///
+/// # Parameters
+///
+/// `api_gap_count` and `upstream_api_operations` come from the live gate rather
+/// than from constants restated here: the suite passes its frozen-by-name gap set
+/// and upstream operation count, and `crates/oc-cli/tests/docs.rs` passes what it
+/// probed off the running server and the committed oracle capture. A gap closing
+/// therefore changes this text without anyone editing it.
+#[must_use]
+pub fn known_gaps(api_gap_count: usize, upstream_api_operations: usize) -> Vec<KnownGap> {
+    vec![
+        KnownGap {
+            id: "api-backends-unavailable".to_owned(),
+            surface: format!(
+                "{api_gap_count} of the {upstream_api_operations} upstream /api operations"
+            ),
+            detail: format!(
+                "Every upstream operation is invoked against both processes and its status, \
+                 normalized body, and observable session/PTY state delta are captured. {} \
+                 operations have local backends. The remaining {api_gap_count} return an \
+                 operation-specific 503 backend_unavailable response and are never counted as \
+                 parity. The matrix rejects any 501 before applying a differential exemption. \
+                 This remains a compatibility gap, not a declared behavioral difference.",
+                upstream_api_operations - api_gap_count,
+            ),
+        },
+        KnownGap {
+            id: "permission-evaluation-semantics".to_owned(),
+            surface: "permission resolution (`findLast` wildcard matching)".to_owned(),
+            detail: "The merged permission CONFIG is compared against the real binary; the \
+                     evaluation order that turns it into an allow/ask/deny decision is verified \
+                     against the upstream source by unit tests, not differentially, because the \
+                     binary exposes no command that prints a resolved decision."
+                .to_owned(),
+        },
+        KnownGap {
+            id: "channel-dependent-database-filename".to_owned(),
+            surface: "$XDG_DATA_HOME/opencode/opencode-<channel>.db".to_owned(),
+            detail: "A source build of either implementation resolves opencode-local.db while an \
+                     installed release resolves opencode.db, so a `cargo build` does not see the \
+                     user's sessions. This port mirrors the oracle's rule \
+                     (packages/core/src/database/database.ts:45-55) exactly, so it is FAITHFUL \
+                     BEHAVIOUR and not a divergence — recorded here because it presents as a \
+                     parity bug the first time anyone tries it. Plan todo 92 owns documenting it."
+                .to_owned(),
+        },
+        turn_part_gap(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_known_gap_carries_an_id_a_surface_and_a_detail() {
+        let gaps = known_gaps(10, 58);
+        assert!(
+            !gaps.is_empty(),
+            "an empty gap list makes the report vacuous"
+        );
+        for gap in &gaps {
+            assert!(
+                !gap.id.trim().is_empty(),
+                "a gap without an id cannot be looked up"
+            );
+            assert!(
+                !gap.surface.trim().is_empty(),
+                "gap {} names no surface",
+                gap.id
+            );
+            assert!(
+                !gap.detail.trim().is_empty(),
+                "gap {} says nothing about what is missing, which is how a gap becomes invisible",
+                gap.id
+            );
+        }
+        let mut ids: Vec<&str> = gaps.iter().map(|gap| gap.id.as_str()).collect();
+        ids.sort_unstable();
+        let count = ids.len();
+        ids.dedup();
+        assert_eq!(count, ids.len(), "two gaps share an id: {ids:?}");
+    }
+
+    #[test]
+    fn the_turn_part_gap_names_exactly_the_types_the_port_does_not_write() {
+        assert_eq!(
+            missing_turn_part_types(),
+            vec!["step-start", "step-finish"],
+            "the missing set is derived from the two type lists; changing either without \
+             re-measuring the port's real behaviour is what the session_interop witness rejects"
+        );
+        let gap = known_gaps(10, 58)
+            .into_iter()
+            .find(|gap| gap.id == TURN_PART_GAP_ID)
+            .expect(
+                "the turn-part gap is reachable through turn_part_gap() but is NOT in the list \
+                 the compatibility report and the documentation actually render, so a reader \
+                 would never see it while its witness kept passing",
+            );
+        assert_eq!(
+            gap.detail,
+            turn_part_gap().detail,
+            "known_gaps ships a different text than turn_part_gap, so the witness and the \
+             artifact describe two different gaps"
+        );
+        for kind in missing_turn_part_types() {
+            assert!(
+                gap.detail.contains(kind),
+                "the gap's detail does not mention the missing {kind} part"
+            );
+        }
+    }
 
     fn surface(id: &str, verdict: Verdict) -> ComparedSurface {
         ComparedSurface {

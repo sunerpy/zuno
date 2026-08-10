@@ -56,14 +56,17 @@
 //! release writes four parts — `text`, `step-start`, `text`, `step-finish` — while
 //! this port writes two, `text` and `text`. Reproduced at release 1.18.15 on the
 //! `run` path, in a git repository and outside one, so it is not the "`step-start`
-//! only carries a snapshot" case; production data has 218,899 `step-start` rows
-//! whose blob is literally `{"type":"step-start"}`.
+//! only carries a snapshot" case.
 //!
 //! That difference does not break interoperability — every assertion below holds
-//! across it, in both directions — so it is out of scope for a test todo and is
-//! **not** silently normalised away here. It is named, with its measurement, so
-//! that a reader of a green run knows this file does not claim part-shape parity.
-//! An invisible exemption is the thing F4 rejected twice; a visible one is fine.
+//! across it, in both directions — and it is **not** silently normalised away here.
+//! Plan todo 140 classified it as the named compatibility gap
+//! [`oc_testkit::compat_report::TURN_PART_GAP_ID`], which the compatibility report
+//! and `docs/compatibility-matrix.md` both publish, and
+//! [`the_recorded_turn_part_gap_matches_what_a_turn_actually_persists`] below
+//! re-measures it so the record and the rows cannot disagree. Until then it lived
+//! only in this comment and in one task's evidence, which is what the fourth
+//! final-verification wave rejected: a classification nothing derives is prose.
 //!
 //! # The skip contract
 //!
@@ -1104,6 +1107,164 @@ async fn the_oracle_refuses_a_session_model_shape_only_this_port_could_decode() 
         fixed.contains(session_id),
         "the release accepted the corrected database but did not list the row, so the \
          failure above was not caused by the model spelling\nstdout:\n{fixed}"
+    );
+
+    provider.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// The witness for the recorded turn-part gap
+// ---------------------------------------------------------------------------
+
+/// Every part type one message persisted, in row order, paired with its role.
+fn persisted_parts(world: &SharedWorld, session_id: &str) -> Vec<(String, String)> {
+    let connection = oc_db::Connection::open(world.database()).expect("open the shared database");
+    let mut statement = connection
+        .prepare(
+            "SELECT m.data, p.data FROM part p JOIN message m ON m.id = p.message_id \
+             WHERE p.session_id = ?1 ORDER BY m.time_created, p.time_created, p.rowid",
+        )
+        .expect("prepare the part query");
+    statement
+        .query_map([session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .expect("query the parts")
+        .map(|row| {
+            let (message, part) = row.expect("read a part row");
+            let role = serde_json::from_str::<serde_json::Value>(&message)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("role")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| "<unreadable role>".to_owned());
+            let kind = serde_json::from_str::<serde_json::Value>(&part)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| "<unreadable type>".to_owned());
+            (role, kind)
+        })
+        .collect()
+}
+
+/// The recorded gap and the rows a real turn writes must not be able to disagree.
+///
+/// # Why this test exists at all
+///
+/// Todo 136 measured this difference and, correctly for a test-only todo, only
+/// wrote it into its own evidence file and this module's doc comment. Plan todo 140
+/// classifies it: it is a [`KnownGap`], not a declared divergence, because nothing
+/// chose it. `oc-db` already models `step-start` and `step-finish` as first-class
+/// wire tags (`crates/oc-db/src/message.rs:139-142,181-182`) and
+/// `oc_engine::stream::StreamProjector` already writes upstream's exact shape
+/// including snapshot hashes (`crates/oc-engine/src/stream.rs:211-265,869-977`) —
+/// there is simply no production caller, because the live turn path checkpoints only
+/// text, reasoning and tool parts (`crates/oc-engine/src/loop.rs:1547-1588`). An
+/// unwired implementation is work outstanding, and
+/// `docs/divergences.toml`'s own header forbids laundering an omission into the
+/// allow-list.
+///
+/// A classification recorded in prose is what F1 and F4 rejected twice, so this
+/// test binds the record to the behaviour in both directions:
+///
+/// * it looks the gap up **by id** in the live
+///   [`oc_testkit::compat_report::known_gaps`] list, so deleting or renaming the
+///   entry fails here rather than silently un-recording the gap;
+/// * it drives one real turn through the production binary and reads the `part`
+///   rows out of SQLite, so the gap going **stale** — the step parts starting to be
+///   written — fails too, and demands the entry be removed in the same commit.
+///
+/// Only the subject is needed, so unlike its siblings this test never skips.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_recorded_turn_part_gap_matches_what_a_turn_actually_persists() {
+    let gap = oc_testkit::compat_report::turn_part_gap();
+    assert_eq!(
+        gap.id,
+        oc_testkit::compat_report::TURN_PART_GAP_ID,
+        "the gap this test witnesses is not the one its id names"
+    );
+    assert!(
+        gap.detail
+            .contains(oc_testkit::compat_report::TURN_PART_WITNESS),
+        "the gap's detail must point a reader at the test that keeps it honest; it names \
+         something else: {}",
+        gap.detail
+    );
+    assert_eq!(
+        oc_testkit::compat_report::TURN_PART_WITNESS,
+        "the_recorded_turn_part_gap_matches_what_a_turn_actually_persists",
+        "this test was renamed without updating the name the gap's detail publishes"
+    );
+
+    let subject = Runner::subject();
+    let provider = TranscriptProvider::start().await;
+    let world = SharedWorld::new(provider.base_url(), "turn-parts");
+
+    subject
+        .expect_ok(
+            &world,
+            &["run", "--model", "test/test-model", "one plain turn"],
+            "persist one turn whose part shape can be measured",
+        )
+        .await;
+
+    let session = {
+        let sessions = world.session_ids();
+        assert_eq!(sessions.len(), 1, "one session was run: {sessions:?}");
+        sessions[0].clone()
+    };
+    let observed = persisted_parts(&world, &session);
+    let assistant: Vec<&str> = observed
+        .iter()
+        .filter(|(role, _)| role == "assistant")
+        .map(|(_, kind)| kind.as_str())
+        .collect();
+    eprintln!(
+        "turn-part gap witness: session {session} persisted {observed:?}; \
+         assistant parts {assistant:?}"
+    );
+
+    assert!(
+        !assistant.is_empty(),
+        "the turn persisted no assistant part at all, so this test measured nothing and could \
+         not detect the gap closing either way. Rows: {observed:?}"
+    );
+
+    for expected in oc_testkit::compat_report::PORTED_TURN_PART_TYPES {
+        assert!(
+            assistant.contains(expected),
+            "known gap {} records that this port still persists {:?} for one turn, but the turn \
+             wrote {assistant:?} and no {expected:?} part. The gap's description no longer \
+             matches the binary — re-measure and rewrite PORTED_TURN_PART_TYPES.",
+            gap.id,
+            oc_testkit::compat_report::PORTED_TURN_PART_TYPES,
+        );
+    }
+
+    let unexpectedly_present: Vec<&str> = oc_testkit::compat_report::missing_turn_part_types()
+        .into_iter()
+        .filter(|kind| assistant.contains(kind))
+        .collect();
+    assert!(
+        unexpectedly_present.is_empty(),
+        "this port now persists {unexpectedly_present:?} for one assistant turn, which known gap \
+         {} says it does not. That is progress and it must be recorded: wire the remaining part \
+         types too, then delete the gap from oc_testkit::compat_report::known_gaps and regenerate \
+         docs/compatibility-matrix.md in the same commit, so the gap closing is an explicit edit \
+         rather than a stale entry describing something the binary no longer does.\n  \
+         upstream persists: {:?}\n  gap says this port persists: {:?}\n  this turn persisted: \
+         {assistant:?}",
+        gap.id,
+        oc_testkit::compat_report::UPSTREAM_TURN_PART_TYPES,
+        oc_testkit::compat_report::PORTED_TURN_PART_TYPES,
     );
 
     provider.shutdown().await;
