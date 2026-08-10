@@ -6675,3 +6675,31 @@ divergence 声称我们比上游多给的东西），重建 subject 二进制，
 顺带发现的第二处：entry 自己的收尾散文还写着「exempts those two stderr streams …
 still asserting both sides refuse」，两处都已不成立。docs 门在我改了 toml 之后立刻红了，
 证明那段散文是有门守的，不是死文字。
+
+## [2026-08-10] todo 143：antigravity 在 `models` 上是**结构性**不可见，不只是断言写错了
+
+F2-B1 说「断言 provider `google` 分不清夹具和 antigravity」。我先量了再修，结论比
+报告更强：**antigravity 对 `models` 这个 surface 的贡献是 0 字节**。
+
+`models --verbose`，同一份 `env -i`，唯一差别是插件列表里有没有 antigravity：
+两次都是 2944 行，`diff` 空，stderr 也都空。
+
+读源码给出原因，不是猜的：
+- `crates/oc-cli/src/cmd/models.rs:92-127` 只 dispatch `Config` 和 `Provider` 两个 hook。
+- kiro-auth 两个都注册（`dist/plugin.js:68` config、`:424` provider），所以它的模型
+  真的会进 plain stdout —— 老测试的 kiro 那一半是**真守卫**。
+- antigravity 只注册 `event`/`tool`/`auth`（`dist/src/plugin.js:1138-1143`）。它在
+  `models` 上按构造就是惰性的。
+
+**所以计划给的路线 (a)「从初始 catalog 去掉 google」是做不到的**——去掉之后 google 行
+直接消失，不会因为 antigravity 跑了而回来（也实测了 oauth 型 auth entry，同样没有）。
+`models` 永远只显示 catalog 声明过的 provider。这是我对 todo 前提的一处修正。
+
+修法：证据放到 antigravity **真正动手**的地方——它为 provider `google` 注册的 auth
+resource，断言的是它自己的方法标签 `OAuth with Google (Antigravity)`，并在测试里同时
+断言这个字符串不在夹具 catalog 文本里。加负控（只装 kiro）时先断言 kiro 自己的 hook
+在，避免「因为什么都没加载所以证明了缺席」这种空洞负控。
+
+**可迁移的判据**：当「加/减一个成员什么都不会失败」时，先别急着改断言——先量这个成员
+到底在这个 surface 上有没有任何可观测效果。如果答案是「没有」，那问题不是断言写弱了，
+而是**断言选错了 surface**；此时改断言而不换 surface，只会造出第二个假见证。

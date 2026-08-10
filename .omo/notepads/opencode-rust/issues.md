@@ -6701,3 +6701,20 @@ Lesson generalised: "recorded in the compatibility artifact" was ambiguous betwe
 `compat-report.json` (uncommitted) and the committed docs. Whenever a promise names a
 committed page, something must GENERATE that page from the same source, or the
 promise is prose.
+
+## [2026-08-10] SEAM #17 候选：auth `loader` 与 `tool` hook 在生产路径上从未被 dispatch
+
+做 todo 143 时顺带发现，两个 hook 有实现、有测试，但**没有任何生产代码路径调用它们**：
+
+1. `HookInvocation::Auth`：全仓只在 `crates/oc-plugin/tests/{integration,hooks}.rs` 里
+   被 dispatch。生产侧 `providers login` 明确说「plugin auth 在 headless 下不可用」，
+   `models` 只 dispatch `Config`/`Provider`。后果：antigravity 的 auth `loader` 会把
+   google 每个模型的 cost 归零（`dist/src/plugin.js:1190-1197`
+   `model.cost = { input: 0, output: 0 }`）并返回 provider options —— 上游在列 provider
+   时会跑 auth loader，本移植不跑。所以 `models --verbose` 里 google 模型的 cost 与
+   上游不一致，且**没有任何测试会注意到**。
+2. `HookInvocation::Tool`：同样只在测试里 dispatch（`hooks.rs:198-206` 有实现）。
+   antigravity 注册的 `google_search` 工具因此对用户完全不可达。
+
+这不是「测试替身太友善」，是**生产路径缺一段接线**，测试替身反而比生产更完整——
+测试能看到的 hook，用户看不到。todo 143 是 test-only commit，未在其中修；记在这里。
