@@ -6718,3 +6718,25 @@ promise is prose.
 
 这不是「测试替身太友善」，是**生产路径缺一段接线**，测试替身反而比生产更完整——
 测试能看到的 hook，用户看不到。todo 143 是 test-only commit，未在其中修；记在这里。
+
+## [2026-08-10] SEAM #17：`Auth` 与 `Tool` hook 在生产路径从未被 dispatch —— 测试替身比生产更完整
+
+todo 143 在证明 antigravity 那一半时发现，**我独立核实**：`HookInvocation::Auth` 与 `HookInvocation::Tool` 在非测试代码里只出现于三处——hook 分发器自己的定义（`oc-plugin/src/hooks.rs:198,208`）与 JSON-RPC 传输枚举（`jsonrpc.rs:960-961,1098`）。**`oc-cli` 与 `oc-engine` 里零引用。**
+
+两个实测后果：
+- antigravity 的 auth `loader` 会把每个 google 模型的 cost 归零（`dist/src/plugin.js:1190-1197`）。上游列 provider 时会跑这个 loader，本移植不跑，所以 `models --verbose` 的 cost 与上游不一致，**且没有任何测试守着**。
+- 它的 `google_search` 工具对用户**完全不可达**。
+
+### 这是本项目第一次出现「反向」的测试替身问题
+
+前 13 次都是「测试替身比现实更友善」——夹具提供了产品没有的东西。**这次相反：`hooks.rs` 自己的测试确实 dispatch 了这两个 hook，所以套件全绿；生产路径却少接了一段。**
+
+> **测试替身比生产更完整，和测试替身比现实更友善，是同一枚硬币的两面。** 前者让缺失的功能看起来存在，后者让存在的缺陷看起来没有。判据仍然是那句：**测试证明的是它跑的那条路径，不是你以为的那条。**
+
+### 143 纠正了我的一处判断
+
+我在任务里给了两条路，其中 (a) 是「若生产行为允许，从初始 catalog 里去掉 `google`」。**它实测证明这条做不到**：去掉后 `google` 行直接消失、不会因 antigravity 执行而回来，因为 `models.rs:109-111` 要求 provider **已存在于 resolved catalog** 才应用 provider hook。
+
+更强的结论是它顺手证出来的：**antigravity 对 `models` 这个 surface 的贡献是 0 字节**——同一份 `env -i`、唯一差别是插件列表，`models --verbose` 两次都是 2944 行、`diff` 为空。原因是 antigravity 只注册 `event`/`tool`/`auth`（我核实了 `dist/src/plugin.js:1138-1143`，那里的 `provider:` 是 `auth` 对象**内部**的字段而非顶层 hook），而 `models.rs` 只 dispatch `Config` 与 `Provider`。
+
+**所以 F2-B1 的病根比「断言写弱了」更深：断言选错了 surface。** 143 把证据改到 antigravity 真正动手的地方——它注册的 auth resource 方法标签，并同时断言该字符串不在夹具 catalog 文本内。
