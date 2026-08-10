@@ -2225,3 +2225,37 @@ todo 132 加了进程内 broker，HTTP 轮次撞到 `ask` 规则时会**真的�
 | **137** | F1 #5 | 用**真实** kiro-auth 0.20.6 + antigravity 替换合成的 `integration-js` |
 
 F2 仍在审计中。
+
+## Wave 50 (2026-08-10)：F1/F3 的四条阻塞项全部关闭，140 个任务完成
+
+`main` = `a536c55`，**3349 测试通过**，clippy 0，fmt 干净，锁可离线复现。**140/144，只剩 F1-F4。**
+
+### 四个任务，四次变异验证
+
+| todo | 我的变异 | 被哪个测试抓住 |
+|---|---|---|
+| **134** | 观察者归零时不回收请求 | `disconnected_only_session_observer_rejects_permission_without_running_the_tool` |
+| **134** | deadline 不再拒绝 | `permission_without_an_observer_is_rejected_by_the_deadline` |
+| **135** | 悄悄扩大豁免集合 | `the_comparison_cannot_shrink_into_exemptions` |
+| **136** | 把 `session.model` 退回 `modelID`（重现 F3 第一轮那个缺陷） | `the_oracle_refuses_a_session_model_shape_only_this_port_could_decode` |
+| **137** | 交换真实插件的配置顺序 | `reversing_configuration_order_reverses_real_plugin_dispatch` |
+
+### 我在 134 上先做了一次等价变异，差点误报
+
+第一次我把 `take_session_requests` 的返回值 `clear()` 掉，测试仍全绿，我一度以为观察者路径没被守住。**但那是等价变异**：`take_session_requests` 已经把请求移出 map，`clear()` 只是提前 drop 掉 oneshot sender，而接收端把「通道关闭」按 fail-closed 解读为拒绝——**行为完全一致**。
+
+换成真正不回收（请求留在 map 里、sender 不 drop）之后，测试立刻失败。
+
+这是我第三次踩「等价变异」：前两次是 `.unwrap_or(0)` 配 `drain(..0)`，和这次。**判据始终是那句：报告变异为未捕获前，先证明变异真的改变了行为。**
+
+### 137 的一个坑：0.00s 的"通过"是响亮跳过
+
+三层测试初看 11 passed / 0.00s，我以为它们在空转。加 `--features wasm` 后真实执行 1.31s——**它们需要 wasm feature，缺失时会打印点名的 skip**（`skipping killing_the_rust_tier_...: requires the wasm feature and Unix PID controls`）。
+
+这正是我在任务里要求的「响亮跳过」，但也说明：**一个 0.00s 的绿色结果必须追问它是否真的执行了。** 默认 `cargo test` 不带 wasm feature，所以这三层覆盖在日常套件里其实是跳过的——值得 F2 复核这个取舍。
+
+### 135 的守卫直接引用了 F4 的拒绝理由
+
+`the_comparison_cannot_shrink_into_exemptions` 用**按名冻结的集合**加地板值（≥9 个命令全流比较），注释写着：*"a table that exempts its way to green is what two earlier reviews rejected"*。**它把评审历史编码进了断言。**
+
+divergence 从 13 涨到 **17**，`DECLARED_COUNT` 同步——新增的是 CLI 呈现层的真实差异，而不是给豁免找的说法。
