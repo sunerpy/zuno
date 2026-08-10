@@ -94,6 +94,18 @@ if [ -n "$marked" ]; then
 fi
 ok "no conflict markers"
 
+# Wave 54: I wrote `git add -A -f` to get past .omo's blanket ignore rule, and the
+# `-f` took `/target` with it -- 48,148 build-product files landed on main under a
+# fully green gate. The conflict-marker check above could not see it, because build
+# products are a different kind of dirty. Same root cause as that incident though:
+# an operation wider than the intent.
+note "no build products tracked"
+tracked_target=$(git ls-files target/ | wc -l | tr -d ' ')
+if [ "$tracked_target" != "0" ]; then
+  die "$tracked_target files under target/ are tracked -- something used a wide \`git add -f\`; unstage them before merging"
+fi
+ok "no build products tracked"
+
 # Order matters: metadata --locked first, because a broken lock makes every
 # later failure look like a code problem. `cargo build` would silently repair it.
 note "cargo metadata --locked --offline"
