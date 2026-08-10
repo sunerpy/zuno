@@ -6538,3 +6538,39 @@ F1：SATISFIED 9 / NOT SATISFIED 8 / UNVERIFIABLE 1。F4 的三条 blocker 与�
 > 收窄文本里凡出现具体数字，必须指向一个从代码派生的断言，而不是自己复述；凡出现「必须证明 X」，先去读那个测试是否真的证明了 X。
 
 F4 的措辞值得记下：它把这两条列为 *"missing promised behavior or proof, not requests for additional scope"* ——即**契约承诺了产物没给的证明**，而不是它要求加范围。这个区分很准。
+
+## [2026-08-10] SEAM #14：观察者断连不 fail-closed —— 我和 132 都只覆盖了"回复者断连"
+
+F3 第四轮实测（报告：`.omo/evidence/F3-REPORT-wave4.md` 第 6c 节）。**它确认了前四个 blocker 全部在真实使用中修好**，但发现一个新的：
+
+```
+唯一的 SSE 观察者断连（curl 超时退出 28）后：
+  permission 请求在 424 秒后仍然 pending
+  /wait 一直阻塞，直到第二个客户端手工 reply: "reject"
+```
+
+没有特权命令被执行（安全底线守住了），但**这一轮永久卡死**，除非另一个客户端发现并手工处理这条陈旧请求。
+
+### 为什么 132 的测试没抓到
+
+`crates/oc-cli/tests/session_mutation.rs:1010` 的
+`disconnected_permission_reply_fails_closed_without_running_the_tool` 断的是**回复者**断连：
+它写半个 body（`{"reply":`）然后 `shutdown()`。那条路径确实 fail-closed。
+
+**F3 断的是观察者**——那个打开 SSE 看 pending 请求的客户端。两种断连是不同场景，只有前者有覆盖。
+
+我核实了 `request_broker.rs`：**它既不感知订阅者数量，也没有任何超时/看门狗机制**（两个 grep 都为空）。所以没有任何东西能在最后一个观察者消失后回收这条请求。
+
+### 这是我的第二次"只验一半"
+
+上一轮 F3 发现 HTTP 轮次读不回结果时，我的教训是「我只验了写入侧，没验读回侧」。这次同构：**我验证了 132 声称的 fail-closed 测试确实存在且会失败（变异归属校验），但没问"它覆盖的是哪一种断连"。**
+
+一个名为 `disconnected_..._fails_closed` 的测试通过，不代表所有断连都 fail-closed。**测试名描述的是它测的那一种，不是那个类别。**
+
+### 修法方向（留给 todo）
+
+两条都需要，因为它们防的是不同故障：
+1. **最后一个观察者消失 → 自动拒绝**该会话的 pending 请求（F3 直接要求的）。
+2. **一个独立于订阅者的超时/看门狗**，因为可能从来没有观察者连上过——那种情况下第 1 条永不触发。
+
+安全上不能反过来：超时必须**拒绝**，绝不允许。
