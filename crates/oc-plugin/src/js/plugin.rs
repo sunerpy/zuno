@@ -96,25 +96,27 @@ impl Plugin for JsPlugin {
         let count = self.callbacks.get(name.as_str()).copied().unwrap_or(0);
         for index in 0..count {
             let call = crate::jsonrpc::encode_hook(hook).map_err(boxed)?;
-            let result = self
-                .host
-                .call_hook(name.as_str(), index, vec![call.input, call.output])
-                .await;
+            let (args, output_index) = if matches!(hook, HookInvocation::Config { .. }) {
+                (vec![call.output], 0)
+            } else {
+                (vec![call.input, call.output], 1)
+            };
+            let result = self.host.call_hook(name.as_str(), index, args).await;
             let Ok(result) = result else {
                 continue;
             };
-            let output = invocation_output(&result).map_err(boxed)?;
+            let output = invocation_output(&result, output_index).map_err(boxed)?;
             crate::jsonrpc::apply_hook_output(hook, output).map_err(boxed)?;
         }
         Ok(())
     }
 }
 
-fn invocation_output(result: &Value) -> Result<Value, JsPluginBuildError> {
+fn invocation_output(result: &Value, index: usize) -> Result<Value, JsPluginBuildError> {
     result
         .get("args")
         .and_then(Value::as_array)
-        .and_then(|args| args.get(1))
+        .and_then(|args| args.get(index))
         .cloned()
         .ok_or(JsPluginBuildError::MissingHookOutput)
 }

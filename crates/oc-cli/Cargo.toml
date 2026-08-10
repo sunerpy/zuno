@@ -30,6 +30,7 @@ oc-mcp = { workspace = true }
 oc-observability = { workspace = true }
 oc-paths = { workspace = true }
 oc-permission = { workspace = true }
+oc-plugin = { workspace = true }
 oc-process = { workspace = true }
 oc-provider-anthropic = { workspace = true }
 oc-provider-bedrock = { workspace = true }
@@ -49,13 +50,11 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
-# `tests/docs.rs` renders the plugin-authoring guide's hook table from
-# `oc_plugin::HookName::ALL` rather than transcribing 21 names into Markdown.
-oc-plugin = { workspace = true }
 oc-testkit = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

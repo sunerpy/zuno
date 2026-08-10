@@ -450,10 +450,10 @@ impl ProviderModelLoader for HandleModelLoader {
             .host
             .call(
                 &self.handle,
-                vec![json!({
-                    "provider": provider_value(provider),
-                    "auth": credential_value(context.auth),
-                })],
+                vec![
+                    provider_value(provider),
+                    json!({ "auth": credential_value(context.auth) }),
+                ],
             )
             .await?;
         // A plugin's model map is the SDK's `Model` shape, which is a superset of

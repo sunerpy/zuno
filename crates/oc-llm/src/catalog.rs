@@ -253,6 +253,22 @@ impl Catalog {
         self.providers.get(id)
     }
 
+    /// Replace the models of an already-resolved provider from a plugin hook.
+    pub fn replace_provider_models(
+        &mut self,
+        id: &str,
+        models: BTreeMap<String, ResolvedModel>,
+    ) -> bool {
+        let Some(provider) = self.providers.get_mut(id) else {
+            return false;
+        };
+        provider.models = models;
+        if provider.models.is_empty() {
+            self.providers.remove(id);
+        }
+        true
+    }
+
     /// One model by provider and model id.
     #[must_use]
     pub fn model(&self, provider_id: &str, model_id: &str) -> Option<&ResolvedModel> {
