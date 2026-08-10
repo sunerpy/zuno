@@ -6357,3 +6357,38 @@ does not assert.
   asked/replied events remain observable through the existing session/global SSE
   streams. Keeping these concerns separate avoids pretending a restored event can
   resume a missing turn.
+
+## [2026-08-10] 把 SEAM #14 的教训泛化去查全仓库——结果基本干净，且找到了正确模式的范本
+
+SEAM #14 的病根是：**测试名听起来像一个类别，实际只覆盖其中一种情形**
+（`disconnected_permission_reply_fails_closed` 覆盖回复者断连，不覆盖观察者断连）。
+
+我据此扫了整个仓库，重点看**名字声称普遍性**的测试（`every_*` / `all_*` / `any_*`）——这类名字
+一旦名不副实，危害最大。抽查结果：
+
+- `every_claimed_provider_id_constructs_with_only_a_base_url` → 迭代生产常量 `family::CLAIMED`。✅
+- `every_governed_tool_id_is_a_real_registry_builtin` → 迭代 `BUILTIN_ORDER` 与 `GOVERNED_TOOL_IDS`。✅
+- `all_authoritative_hooks_dispatch_with_their_typed_payloads` → **手写枚举**每个 hook 的 dispatch，
+  不迭代 `HookName::ALL`。我一度以为这就是同形缺陷。
+
+**但它是对的，而且用了最强的守法**：`crates/oc-plugin/tests/hooks.rs:22`
+
+```rust
+const EXPECTED: [HookName; 21] = HookName::ALL;
+```
+
+这是**编译期**长度断言——加第 22 个 hook 会直接编译失败，而不是静默逃过。配套
+`manifest.rs:41` 还断言 `HookName::ALL` 与 `ORACLE_HOOKS` 一致。所以三件事各司其职：
+名册与上游一致（manifest）、数量被钉死（编译期）、每个都被真的 dispatch（手写枚举）。
+
+### 值得记下的模式
+
+**手写枚举本身不是缺陷——缺少「集合完整性」的守卫才是。** 判据是：
+
+> 若给被测集合加一个成员，是否有东西会失败？编译期失败 > 测试失败 > 什么都不发生。
+
+`hooks.rs` 是「编译期失败」。todo 119 的 `FROZEN_API_GAPS` 与 todo 133 的收窄钩子是「测试失败」。
+SEAM #14 的断连测试是「什么都不发生」——它既没有断连方式的枚举，也没有集合完整性守卫。
+
+这条扫描没找到新缺陷，但**把判据写下来比结论更有用**：下次写「覆盖一个类别」的测试时，先问
+「加一个成员会不会有东西失败」。
