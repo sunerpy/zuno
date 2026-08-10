@@ -26,6 +26,7 @@ mod directory;
 mod discovery;
 mod event;
 mod events;
+mod request_broker;
 mod server;
 
 pub use auth::AuthConfig;
@@ -38,6 +39,10 @@ pub use discovery::local_server_urls;
 pub use event::{DEFAULT_EVENT_SUBSCRIBER_CAPACITY, Delivery, EventFanout, EventSubscription};
 pub use events::{
     EventCursor, EventService, EventStreamError, NewEvent, StreamEvent, events_router,
+};
+pub use request_broker::{
+    PermissionRequest, PermissionResolution, QuestionAnswers, QuestionDecision, QuestionRequest,
+    QuestionResolution, QuestionToolCall, RequestBroker, RequestSource,
 };
 pub use server::{
     BoundServer, ServerBuilder, ServerConfig, ServerError, ServerServices, SessionCompactExecution,

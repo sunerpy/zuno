@@ -6538,3 +6538,29 @@ onto 1dee81c, auto-merged `README.md` with no conflict markers, then validated:
   the `#![cfg(windows)]` gate on `windows_containment.rs`, the README disclosure,
   and at least one evidence artefact stating it are all asserted, so deleting the
   disclosure from either document fails a test.
+
+## Wave 48 — todo 132
+
+- **One `RequestBroker` is shared by server routes and HTTP turn collaborators.**
+  A broker per turn or per handler would make list/reply routes observe different
+  pending state. The instance is created beside `EventService` in `serve` and
+  injected through `ServerServices` and `TurnHost`.
+- **HTTP reply handlers validate schema before ownership, then fail closed through
+  RAII only for owned requests.** Branded path IDs and reply bodies are validated
+  in upstream middleware before its handler runs, so malformed input returns `400`
+  without leaking request ownership; valid cross-session input returns `404`.
+  Body-read failures claim only a matching `(session_id, request_id)` and drop its
+  `PermissionResolution` or `QuestionResolution`, whose `Drop` sends rejection.
+  Event-publication failures and future `?` returns remain fail-closed through the
+  same guards, while another session's request is never consumed.
+- **Question is registered only when a live `QuestionAsker` exists.** Ordinary
+  headless CLI behavior remains unchanged: it neither advertises an unusable
+  question tool nor waits for a user that is not attached. HTTP turns receive the
+  broker-backed collaborator and therefore advertise the tool.
+- **`Always` grants remain process-local and exact to action/resources.** This
+  matches the lifetime of pending requests and avoids introducing persistent
+  permission storage in a task scoped to live HTTP turns.
+- **The four closed gaps are represented as compared status/body dimensions, with
+  side effects covered by dedicated production-path tests.** `FROZEN_API_GAPS`
+  drops from 14 to 10, backed operations rise from 44 to 48, and generated docs
+  are updated through the sanctioned docs test.

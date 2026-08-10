@@ -19,6 +19,12 @@ pub enum ApiError {
     BackendUnavailable(String),
     #[error("{0}")]
     Conflict(String),
+    #[error("{kind} request `{id}` is not pending for session `{session_id}`")]
+    RequestNotFound {
+        kind: &'static str,
+        id: String,
+        session_id: String,
+    },
     #[error("{0}")]
     MutationFailed(String),
     /// A filesystem path left the session directory.
@@ -138,6 +144,15 @@ impl IntoResponse for ApiError {
                 format!("backend unavailable for {operation}"),
             ),
             Self::Conflict(message) => (StatusCode::CONFLICT, "conflict", message),
+            Self::RequestNotFound {
+                kind,
+                id,
+                session_id,
+            } => (
+                StatusCode::NOT_FOUND,
+                "not_found",
+                format!("{kind} request `{id}` is not pending for session `{session_id}`"),
+            ),
             Self::MutationFailed(message) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "mutation_failed",

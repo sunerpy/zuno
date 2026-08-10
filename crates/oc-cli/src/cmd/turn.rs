@@ -433,13 +433,14 @@ impl TurnHost {
         environment: &StartupEnvironment,
         approval: Arc<dyn PermissionAsker>,
     ) -> Result<Self, String> {
-        Self::open_with_interrupt(plan, environment, approval, InterruptSignal::new())
+        Self::open_with_interrupt(plan, environment, approval, None, InterruptSignal::new())
     }
 
     pub(crate) fn open_with_interrupt(
         mut plan: TurnPlan,
         environment: &StartupEnvironment,
         approval: Arc<dyn PermissionAsker>,
+        question: Option<Arc<dyn oc_tools::question::QuestionAsker>>,
         interrupt: InterruptSignal,
     ) -> Result<Self, String> {
         let env = environment.resolved();
@@ -476,8 +477,11 @@ impl TurnHost {
             env,
             &plan.config,
             &plan.agent,
-            &plan.provider_id,
-            &plan.model_id,
+            super::tool_runtime::ToolSelection {
+                provider_id: &plan.provider_id,
+                model_id: &plan.model_id,
+                question,
+            },
         )?;
         let dispatcher = ToolRegistryDispatcher::new(
             runtime_tools.tools,

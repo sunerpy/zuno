@@ -120,7 +120,7 @@ through the real router and recording which explicitly answer
 
 **58 of the 58 upstream operations are registered**, plus **2 operations added**
 for session retention (the declared `c8-maintenance-endpoints` divergence).
-Forty-four have local backends; **14 explicit 503 backend gaps** name the missing
+Forty-eight have local backends; **10 explicit 503 backend gaps** name the missing
 capability and remain reported as gaps rather than compatibility.
 
 The two SSE operations are implemented: `GET /api/event` immediately emits
@@ -184,14 +184,14 @@ scope-bound, and are never included in error responses.
 | GET | `/api/session/{sessionID}/message` | implemented |
 | GET | `/api/session/{sessionID}/message/{messageID}` | explicit gap (503 backend unavailable) |
 | POST | `/api/session/{sessionID}/model` | implemented |
-| GET | `/api/session/{sessionID}/permission` | explicit gap (503 backend unavailable) |
+| GET | `/api/session/{sessionID}/permission` | implemented |
 | POST | `/api/session/{sessionID}/permission` | explicit gap (503 backend unavailable) |
 | GET | `/api/session/{sessionID}/permission/{requestID}` | explicit gap (503 backend unavailable) |
-| POST | `/api/session/{sessionID}/permission/{requestID}/reply` | explicit gap (503 backend unavailable) |
+| POST | `/api/session/{sessionID}/permission/{requestID}/reply` | implemented |
 | POST | `/api/session/{sessionID}/prompt` | implemented |
 | GET | `/api/session/{sessionID}/question` | implemented |
-| POST | `/api/session/{sessionID}/question/{requestID}/reject` | explicit gap (503 backend unavailable) |
-| POST | `/api/session/{sessionID}/question/{requestID}/reply` | explicit gap (503 backend unavailable) |
+| POST | `/api/session/{sessionID}/question/{requestID}/reject` | implemented |
+| POST | `/api/session/{sessionID}/question/{requestID}/reply` | implemented |
 | POST | `/api/session/{sessionID}/revert/clear` | implemented |
 | POST | `/api/session/{sessionID}/revert/commit` | implemented |
 | POST | `/api/session/{sessionID}/revert/stage` | implemented |
