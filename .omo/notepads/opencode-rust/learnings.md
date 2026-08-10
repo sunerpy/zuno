@@ -6503,3 +6503,46 @@ and outside one, so it is not the "step-start only carries a snapshot" case —
 production data has 218,899 `step-start` rows whose blob is literally
 `{"type":"step-start"}`. Interoperability holds across it in both directions, which
 is itself worth knowing, but it is undeclared in `docs/divergences.toml` (13 entries).
+- **An empty `.git` directory does NOT make upstream treat a directory as a
+  worktree, and the difference silently changes what a comparison compares.**
+  `compat_suite.rs` marks fixture roots with an empty `.git` to stop config
+  discovery leaking to ancestors, which works. It does not work for VCS
+  detection: upstream resolves the worktree with `git rev-parse --show-toplevel`,
+  which rejects an empty directory, assigns a non-VCS project the worktree `/`
+  (`packages/opencode/src/project/project.ts:217`), and then reports a
+  *different* plan glob in `agent list` — measured as the relative
+  `tmp/.../plans/*.md` against this port's absolute path. A parity probe under an
+  empty `.git` therefore compares two answers to different questions while
+  looking perfectly reasonable. `crates/oc-cli/tests/cli_parity.rs` runs a real
+  `git init` and fails loudly when `git` is absent, because a silent fallback
+  would keep the probes running against the wrong project shape.
+- **The released binary emits SGR colour under `NO_COLOR=1` and `TERM=dumb`.**
+  `NO_COLOR` is honoured by the TUI theme, not by the CLI's error and prompt
+  writers: `import probe.json` writes `ESC[91m ESC[1m Error: ESC[0m`, and
+  `@clack/prompts` also writes its box's closing colour reset to **stderr** — so
+  after SGR stripping the oracle's stderr for `mcp list` is a lone `"\n"` where a
+  plain writer's is empty. Any CLI stream differential against this oracle needs
+  an SGR rule and a trailing-blank-line rule, and the second must be
+  unconditional: guarding it on "does this stream look decorated?" makes it fire
+  for stdout and not for stderr.
+- **`run` cannot be output-compared against the released binary at all, because
+  1.18.15 answers with no credential present.** Measured under a cleared
+  environment with an empty `auth.json`: `run --agent nosuch hi` printed a real
+  model reply from the bundled `opencode/big-pickle` gateway model and exited 0.
+  Any "compare a turn" probe against this oracle is a live provider call, which
+  `oc-testkit` has no capability to make. Only `run`'s argv-refusal paths are
+  comparable; the turn belongs to the cassette-driven tests.
+- **A count of exemptions cannot protect an exemption ledger; the members have to
+  be frozen by name.** `crates/oc-cli/tests/cli_parity.rs` keeps
+  `COMMANDS_WITH_EXEMPTIONS` as a name set compared against what the table
+  actually says, plus two floors (>= 9 commands with every stream compared, >= 11
+  with exit and stdout compared). With only a count, one command's exemption
+  closing while another's opens leaves the number unchanged — the same swap
+  `FROZEN_API_GAPS` was made a name list to catch.
+- **An exemption needs a witness that is OBSERVED, not asserted.** Each exempting
+  probe names a weaker fact — both sides refuse, or the oracle's stderr contains
+  a specific fragment — and the test runs both binaries to check it. That is what
+  keeps "this stream is not comparable" from degrading into "this command is not
+  tested": the `tui` exemption, for instance, stands or falls on upstream really
+  printing `Failed to change directory`, which is what proves the two binaries
+  were asked different questions rather than behaving differently.

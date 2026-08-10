@@ -13,7 +13,7 @@
 # `not_compared` / `known_gaps` sections and must never be laundered into an
 # entry here. See `.omo/notepads/opencode-rust/decisions.md`.
 #
-# Count discipline: this file has THIRTEEN entries. Eight were the count plan todo
+# Count discipline: this file has SEVENTEEN entries. Eight were the count plan todo
 # 86 asserted (the eighth being todo 103's cross-session memory subsystem); todo
 # 119 added four more by reconciling the "nominated divergences" that had been
 # kept in a SECOND reporting structure inside `compat_suite.rs`. That structure
@@ -38,6 +38,25 @@
 #     property. Both facts are stated in that entry's reason.
 #   * `memory-subsystem` folded into `cross-session-resident-memory`, which already
 #     declares the same three surfaces.
+#
+# Thirteen became SEVENTEEN in plan todo 135, which executed every one of the
+# twelve implemented CLI commands against release 1.18.15 and compared normalized
+# exit status, stdout and stderr. Four differences fell out of that comparison, all
+# four previously undeclared, and each is now the justification for exactly one
+# thing the parity target is allowed to forgive or exempt:
+#
+#   * `plain-cli-presentation` — the four presentational rules
+#     `crates/oc-testkit/src/cli_normalize.rs` applies.
+#   * `diagnostics-name-their-cause` — the two exempted stderr streams (`run`,
+#     `serve`), where this port's message names the cause upstream omits.
+#   * `session-list-output-shape` — the columns and JSON field names of a NON-empty
+#     `session list`. Nothing normalizes this; it is measured and declared.
+#   * `non-vcs-plan-glob-is-absolute` — why every parity probe runs inside a marked
+#     worktree, and what happens when it does not.
+#
+# Each is re-derived from the two running binaries by a named test in
+# `crates/oc-cli/tests/cli_parity.rs`, so a reverted decision fails the suite
+# instead of leaving an entry that describes something neither binary does.
 
 [[divergence]]
 id = "session-list-default-sort"
@@ -113,3 +132,23 @@ reason = "Upstream inspects the exit code and only logs: `if (result && result.e
 id = "non-pure-plugin-generated-trees"
 surface = "`debug config` without `OPENCODE_PURE` — the `agent` and `command` trees a third-party JS plugin synthesises"
 reason = "Success criterion 2 was NARROWED on 2026-08-09 to require byte-identical merged configuration in pure mode (`OPENCODE_PURE=1`), where neither binary loads external plugins. Without pure mode the released 1.18.15 binary's own plugin set writes generated entries into the merged config that this port does not reproduce: measured on the user's real `/config/.config/opencode/opencode.json`, a 221818-byte `agent` tree and a 17970-byte `command` tree, against empty `agent` and `command` objects here. Reproducing them means re-implementing third-party plugin output rather than the config contract, so it is a decision and not a gap — and declaring it with its measured sizes is what makes a *new* non-pure difference a failure instead of one absorbed into a vague inequality."
+
+[[divergence]]
+id = "plain-cli-presentation"
+surface = "every CLI command's stdout and stderr — colour, the `Error: ` prefix, the prompt gutter, and JSON object key order"
+reason = "The released binary decorates its output in four ways this port does not, all four measured on 1.18.15 under `NO_COLOR=1` and `TERM=dumb` in `.omo/evidence/task-135-opencode-rust.txt`. (1) It emits SGR colour regardless: `import probe.json` writes `ESC[91m ESC[1m Error: ESC[0m` — `NO_COLOR` is honoured for the TUI theme, not for these writers. (2) It prefixes a top-level failure with a line-leading `Error: `; this port prints the message alone, because the shell already reports the non-zero status and the prefix costs a line of terminal width in every failure. (3) It renders `mcp list` and `providers list` through `@clack/prompts`, drawing a box gutter of `┌ │ ▲ └` glyphs plus a trailing blank line; this port writes plain lines, which is what makes the output usable in a pipe. (4) It serializes embedded JSON with keys in insertion order, so `agent list`'s permission arrays spell `{action, pattern}` where this port spells `{pattern, action}`, and JavaScript's single number type writes an integral double as `1024` where `serde_json` writes `1024.0`. All four are presentational: the same values, the same order, the same lines. `crates/oc-testkit/src/cli_normalize.rs` neutralizes exactly these four and nothing else — each rule has a negative control asserting a renamed key, a changed value, a dropped line, a non-SGR escape and a `\\r\\n` all still diverge — and `crates/oc-cli/tests/cli_parity.rs::the_declared_presentation_divergences_are_live` re-derives all four from the two running binaries, so a reverted decision fails rather than widening what is forgiven."
+
+[[divergence]]
+id = "diagnostics-name-their-cause"
+surface = "CLI failure messages on paths where upstream reports an opaque error — `serve` on an unavailable port, `run` with no message, `run` with an unresolvable model"
+reason = "Upstream reports several failures without naming what failed. Measured on 1.18.15: binding an occupied port prints the two-line `Unexpected error` / `ServeError` with neither the address nor the reason, and `run --model bogus/model hi` prints a JSON `UnknownError` carrying `Unexpected server error. Check server logs for details.` and a `ref` — a message whose only actionable content is an instruction to read a log the user does not have. This port names the cause and the input at the point of failure: `could not bind HTTP server to 127.0.0.1:<port>: Address already in use (os error 98)`, and for an unresolvable model the provider, the catalogue state and the three ways to fix it. The consequence is that the two texts are not two renderings of one message and cannot be normalized into one without deleting the information that makes this port's version useful, so `crates/oc-cli/tests/cli_parity.rs` exempts those two stderr streams **by name, with this reason**, while still comparing their exit status and stdout and still asserting both sides refuse. The same decision covers the wording of `run`'s argv refusal (`a message is required` against `You must provide a message or a command`)."
+
+[[divergence]]
+id = "session-list-output-shape"
+surface = "CLI `session list` and `session list --format json` with at least one session"
+reason = "The empty listing is identical on both binaries. A non-empty one is not, and this is a difference in content rather than presentation, so nothing normalizes it. Upstream's table has three columns — `Session ID`, `Title`, `Updated` — and its JSON object has six flat fields: `id`, `title`, `updated`, `created`, `projectId`, `directory`. This port's table has seven columns, adding `Project`, `Agent`, `Msgs` and `Cost`, and its JSON nests `time.created` / `time.updated`, `tokens.*` and `project.{id,worktree}` while spelling the project reference `projectID` rather than `projectId`. The added columns exist because the listing this port serves is not project-scoped by construction — see the `session-list-default-sort` entry and `--all-projects` — so a row has to say which project it belongs to, and the nesting matches the shape `/api/session` returns so one decoder serves both. `crates/oc-cli/tests/cli_parity.rs::the_session_list_output_shape_difference_is_live` seeds one session into a database both binaries open and asserts the two field sets differ in exactly the `projectId` / `projectID` spelling this reason names, so the declaration carries a measurement rather than a memory."
+
+[[divergence]]
+id = "non-vcs-plan-glob-is-absolute"
+surface = "`agent list` — the `plan` agent's `edit` allow-rule for the global plans directory, in a directory that is not a repository"
+reason = "Upstream builds that rule as `path.relative(ctx.worktree, path.join(Global.Path.data, 'plans', '*.md'))` (`packages/opencode/src/agent/agent.ts:174`), and assigns a non-VCS project the worktree `/` (`packages/opencode/src/project/project.ts:217`). Relativising an absolute path against `/` strips the leading separator, so outside a repository the released binary emits a **relative** glob — measured on 1.18.15 as `tmp/.../data/opencode/plans/*.md` — which matches nothing from any working directory and is the shape a `worktree` sentinel produced rather than a path anyone intended. This port emits the absolute path there, and matches upstream exactly inside a repository, where the relative form is meaningful. `crates/oc-cli/tests/cli_parity.rs::the_non_vcs_plan_glob_difference_is_live` runs both binaries in an unmarked directory and asserts upstream's glob is relative while this port's is absolute; it is also why every parity probe marks its project with a `.git` directory, so that a probe never silently compares two answers to different questions."

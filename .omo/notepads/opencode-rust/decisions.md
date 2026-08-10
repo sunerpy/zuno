@@ -6666,3 +6666,36 @@ rejected twice. Recommended as a follow-up todo.
 **Oracle resolved through `Oracle::discover_pinned`, never a hard-coded mise path.**
 Todo 130 removed exactly that hard-coding from `compat_suite.rs`, where the file named
 1.18.12 while recording 1.18.13 and nothing could fail over the difference.
+- **CLI *presentation* normalization is a separate module from volatile-value
+  normalization, because the two have different lifetimes.**
+  `crates/oc-testkit/src/normalize.rs` masks values that *cannot* agree across
+  runs (a timestamp, an ephemeral port). `crates/oc-testkit/src/cli_normalize.rs`
+  neutralizes four differences this port makes *on purpose*, each declared in
+  `docs/divergences.toml`. A rule in the second module can be deleted the day its
+  decision is reverted, and the comparison then fails until the reversion is
+  complete; a rule folded into a general-purpose smoother has no such lifetime.
+  Rule names are pinned by a test, every rule has a negative control, and
+  `the_declared_presentation_divergences_are_live` re-derives all four from the
+  two running binaries so the allow-list cannot describe a decision neither
+  binary makes any more.
+- **`session list`'s output shape is DECLARED, never normalized.** The empty
+  listing is byte-identical and is what the parity row compares; a non-empty one
+  differs in columns and JSON field names (`projectId` against `projectID`,
+  flat against nested). Normalizing that would be exactly the laundering
+  `divergences.toml` exists to prevent, so it is an entry with a measurement —
+  seeded into one database both binaries open — rather than a rule.
+- **The universal CLI parity comparison lives in `crates/oc-cli/tests/`, not in
+  `crates/oc-testkit/tests/`.** It has to form a bijection with
+  `oc_cli::dispositions()` to prove no implemented command escapes comparison,
+  and `oc-testkit` cannot depend on `oc-cli` because `oc-cli` already
+  dev-depends on `oc-testkit`. The reusable half — the five presentation rules —
+  is in `oc-testkit`; the half that must read the disposition table sits beside
+  `tests/surface.rs`, which is also where todo 124's production-dispatch guard
+  lives, so a reader comparing the two guards finds them in one directory.
+- **The parity target does not absorb todo 124's dispatcher guard, and must not.**
+  They answer different questions: the guard asks whether an argv reached its real
+  handler, by looking for a fragment only that handler emits; parity asks whether
+  the handler's output matches the released binary's. A rerouted `match` arm could
+  in principle make both binaries fail in matching ways — parity would pass and
+  the guard would not. Both were re-verified against their own mutations in the
+  same session.
