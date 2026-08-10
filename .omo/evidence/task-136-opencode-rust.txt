@@ -1,0 +1,275 @@
+TASK 136 — prove bidirectional same-session interoperability across both binaries
+================================================================================
+Worktree: /config/workspace/ProdDir/AI/oc-wt/t136   branch: task-136
+Oracle:   /config/.local/share/mise/installs/opencode/1.18.15/opencode  (1.18.15,
+          resolved through `Oracle::discover_pinned`, not a hard-coded path)
+Subject:  target/debug/opencode-rust (this port's production binary)
+
+Commit: test(compat): prove one session survives a lifecycle in both directions
+
+New file: crates/oc-testkit/tests/session_interop.rs   (+1,110 lines, tests only)
+No production code was changed. `git diff --stat` for `crates/*/src/**` is empty.
+
+
+1. WHAT WAS MISSING, AND WHY THE OLD PROOF WAS HALF A PROOF
+--------------------------------------------------------------------------------
+Criterion 1's round trip was proved at two much weaker points:
+
+  a) compat_suite.rs::journal_round_trip_through_the_real_binary_does_not_replay_
+     migrations — opens an EMPTY Rust database and compares the `migration` table.
+     It passed throughout the entire life of this project's worst defect.
+
+  b) compat_suite.rs::a_session_written_by_this_port_is_decodable_by_the_real_binary
+     and oc-cli/tests/rollback.rs — ask the release to LIST a session this port
+     wrote. Real, and the correct fix for todo 115, but "can be listed" is one verb
+     out of five.
+
+Neither asks the question a user asks. A session can be listable and still lose its
+transcript; a transcript can be readable and still not grow; a binary can read the
+other's rows and still drop them when it continues. Every one of those failures is
+invisible to (a) and (b).
+
+The gap is now closed by four tests, all over ONE persisted session per test, with
+the two real programs alternating against ONE `OPENCODE_DB` file.
+
+
+2. THE TWO DIRECTIONS — STEPS AND ASSERTIONS
+--------------------------------------------------------------------------------
+Both run inside a single `ScriptedEnv` with `DbChoice::Absolute(<one path>)`. That
+is structural, not conventional: neither binary is given a way to reach a second
+database, so "the same session" cannot silently become "a session each" after a
+later edit. `SharedWorld` owns it (session_interop.rs:319-352).
+
+--- DIRECTION 1: a_session_the_oracle_created_survives_a_full_lifecycle_in_this_port
+
+  step  binary   command                                            assertion
+  ----  -------  -------------------------------------------------  -----------------
+   1    ORACLE   run --model test/test-model "<FIRST>"              exactly 1 session
+                                                                    row exists; >= 2
+                                                                    messages persisted
+   2    RUST     session list --format json                          stdout names the
+                                                                    oracle's session id
+   3    RUST     export <session>                                    stdout contains
+                                                                    <FIRST> — the
+                                                                    oracle's user turn,
+                                                                    not merely the row
+   4    RUST     run --session <session> --model … "<SECOND>"        exit 0
+   5    (SQL)    count messages / parts for that session id          session_ids() is
+                                                                    STILL exactly
+                                                                    [<session>]  AND
+                                                                    messages AND parts
+                                                                    both strictly grew
+   6    (wire)   the fake provider's last chat request               replays <FIRST>
+   7    ORACLE   session list, then export <session>                 both exit 0; the
+                                                                    export names BOTH
+                                                                    <FIRST> and <SECOND>
+
+  Measured: transcript 2 messages / 4 parts  →  4 messages / 6 parts.
+            2 chat requests reached the provider.
+
+--- DIRECTION 2: a_session_this_port_created_survives_a_full_lifecycle_in_the_oracle
+
+  The exact mirror, same seven steps, roles swapped. Step 2 here is todo 115's
+  `session.model` seam: a row spelled `modelID` takes the WHOLE listing down with
+  `Expected string, got undefined`, so exit 0 at step 2 is load-bearing rather than
+  incidental.
+
+  Measured: transcript 2 messages / 2 parts  →  4 messages / 6 parts.
+            2 chat requests reached the provider.
+
+--- THE SAME SESSION, NOT TWO: how that is proved rather than asserted
+
+  Three independent facts, any one of which fails if a fixture ever forks:
+    * `SharedWorld` exposes one absolute `OPENCODE_DB` to both runners;
+    * `session_ids()` is compared to `vec![session]` — an exact vector equality, so
+      a second row fails by value, not merely by count;
+    * the continuing binary's OUTBOUND provider request replays the other binary's
+      user turn. A forked session would replay nothing.
+
+--- TRANSCRIPT GROWTH is asserted on STORAGE, in TWO units
+
+  `TranscriptSize::grew_from` requires `messages > earlier.messages` AND
+  `parts > earlier.parts` (session_interop.rs:395-404), read straight out of SQLite.
+  Strictly, on both units, on purpose: a run that appended a message row but no part
+  rows persisted a turn with no content, and "readable" would still hold.
+
+
+3. THE DECODE PROOF — WHY IT IS THE WIRE AND NOT AN `export` SUBSTRING
+--------------------------------------------------------------------------------
+each_implementation_replays_every_turn_the_other_one_wrote drives THREE turns
+alternating ORACLE → RUST → ORACLE over one session, then asserts on the requests
+the binaries sent:
+
+  chat request 1 (oracle) : 1 replayed user turn
+  chat request 2 (rust)   : 2 replayed user turns, INCLUDING the oracle's turn 1
+  chat request 3 (oracle) : 3 replayed user turns, INCLUDING this port's turn 2
+
+  Measured user-turn counts: [1, 2, 3]
+  Measured sizes:            2msg/4parts → 4msg/6parts → 6msg/10parts
+
+This is the strongest available form of "the opposite implementation can decode what
+the other wrote": the bytes did not merely parse, they came back out of the decoder
+and onto the wire. Assertion 3 also requires request 3's replayed history to be
+strictly longer than request 2's, so a release that dropped only the FOREIGN turn
+would still fail — a test that checked only the newest turn would not notice.
+
+
+4. THE FAILURE TEST — a row shape only one implementation can decode
+--------------------------------------------------------------------------------
+the_oracle_refuses_a_session_model_shape_only_this_port_could_decode
+
+  The ORACLE creates the database first, so its own `project` row scopes the listing.
+  (A fabricated project id makes `session list` exit 0 with an EMPTY result, which
+  silently disarms the test. Recorded because a first draft of the sibling test in
+  compat_suite.rs did exactly that.)
+
+  Then one session is written through the production writer `oc_db::session::create`
+  with the MESSAGE spelling in the SESSION column:
+      {"providerID":"test","modelID":"test-model"}
+
+  Measured against 1.18.15:
+      release exited exit status: 1
+      stderr = Error: Unexpected error / Expected string, got undefined
+
+  The test then rewrites the same row through `oc_db::session::model_reference` and
+  requires the release to exit 0 AND name the row — so the failure above is
+  attributable to the SHAPE and not to the row's mere presence.
+
+  This is what stops every assertion in sections 2 and 3 from being vacuous.
+
+
+5. MUTATION TESTING — FOUR MUTATIONS, FOUR CAUGHT, EACH BY THE RIGHT ASSERTION
+--------------------------------------------------------------------------------
+Every mutation was applied to real code, the production binary REBUILT, and the
+suite re-run. (The first attempt at M1 appeared uncaught until I noticed
+`Subject::discover_or_build` had reused a stale binary — worth recording, because a
+mutation test that does not rebuild the subject silently proves nothing.)
+
+M1 — `oc_db::session::model_reference` emits `modelID` instead of `id`
+     (the exact todo 115 defect, re-injected)
+       a_session_this_port_created_survives_a_full_lifecycle_in_the_oracle ... FAILED
+         oracle could not list this port's session — exited exit status: 1
+       the_oracle_refuses_a_session_model_shape_only_this_port_could_decode ... FAILED
+       result: 2 passed; 2 failed
+     Direction 1 correctly still passed: the oracle created that session, so the
+     mis-spelling never reached it. The asymmetry is the tests being precise.
+
+M2 — the fake provider stops distinguishing title from chat requests
+     (`let is_title = false && …`)
+       each_implementation_replays_every_turn_the_other_one_wrote ... FAILED
+         three turns must produce three chat requests; got 4
+       result: 3 passed; 1 failed
+     This guards the FIXTURE, which is the trap named in the brief: a mock that
+     answers both kinds the same way makes a run die with `title model returned no
+     usable line`, a fixture defect that reads exactly like a product defect.
+
+M3 — `resolve_session` ignores `SessionChoice::Existing` and forks a new session
+       a_session_the_oracle_created_survives_a_full_lifecycle_in_this_port ... FAILED
+         continuing must extend the release's session, not fork a second one
+       each_implementation_replays_every_turn_the_other_one_wrote ... FAILED
+         alternating binaries must never fork the session
+       result: 2 passed; 2 failed
+     This is the mutation that proves the tests are not two-independent-sessions
+     dressed up as interoperability.
+
+M4 — `oc_engine::r#loop::retained_history` returns only the newest message
+       a_session_the_oracle_created_survives_a_full_lifecycle_in_this_port ... FAILED
+         this port continued the session without replaying the release's user turn,
+         so it did not decode the history it inherited.
+         replayed: ["second turn written by this port"]
+       each_implementation_replays_every_turn_the_other_one_wrote ... FAILED
+         this port did not replay the release's first turn: ["bravo turn from this port"]
+       result: 2 passed; 2 failed
+     Note what M4 shows: the session still listed, still exported, still GREW. Only
+     the wire-level replay assertion caught it. This is precisely the
+     "readable is not the same as usable" gap the todo names.
+
+All four mutations were reverted and the binary rebuilt; `git status` shows only the
+new test file.
+
+
+6. A GENUINE DIVERGENCE FOUND WHILE DOING THIS, NAMED RATHER THAN NORMALISED
+--------------------------------------------------------------------------------
+For one assistant turn the release persists FOUR parts and this port persists TWO:
+
+  release 1.18.15   user|text  assistant|step-start  assistant|text  assistant|step-finish
+  this port         user|text  assistant|text
+
+Reproduced on the `run` path both inside a git repository and outside one, so this is
+NOT the "step-start only carries a snapshot" case; production data holds 218,899
+`step-start` rows whose blob is literally `{"type":"step-start"}`
+(.omo/notepads/opencode-rust/learnings.md:2076).
+
+It does not break interoperability — every assertion in sections 2-4 holds across it,
+in both directions, which is itself a useful finding. It is a production-behaviour
+difference and therefore out of scope for a test todo, and `docs/divergences.toml`
+was deliberately NOT edited (that surface is being changed by todo 135 in parallel;
+touching it here would create a merge conflict for no gain).
+
+What was NOT done is to let the assertions quietly absorb it. The exemption is
+stated in the test module's own doc comment, with its measurement, so a reader of a
+green run knows this file does not claim part-shape parity. An invisible exemption is
+what F4 rejected twice; a visible one is acceptable.
+
+RECOMMENDATION: this belongs in a follow-up todo — either implement the two parts or
+declare the divergence and bump `DECLARED_COUNT` (currently 13 entries).
+
+
+7. GATES
+--------------------------------------------------------------------------------
+  $ cargo fmt --all --check                                    exit=0
+  $ cargo metadata --locked --offline --format-version 1        exit=0
+      (no dependency added; Cargo.lock unchanged; oc-testkit's dev-dependencies
+       already carried `oc-db`, and `axum`/`tokio`/`serde_json` are existing deps.
+       No HTTP *client* was added — `tests/no_http_client.rs`'s invariant holds,
+       because the fake provider is an axum SERVER, exactly like `MockProvider`.)
+  $ cargo clippy --workspace --all-targets --offline           0 warnings, 0 errors
+  $ cargo test --workspace --offline                           see section 8
+
+  Targeted run of the new file:
+    $ OC_MEMORY_GATE_MODE=skip cargo test -p oc-testkit --test session_interop \
+        -- --test-threads=1 --nocapture
+    test a_session_the_oracle_created_survives_a_full_lifecycle_in_this_port ... ok
+    test a_session_this_port_created_survives_a_full_lifecycle_in_the_oracle ... ok
+    test each_implementation_replays_every_turn_the_other_one_wrote ... ok
+    test the_oracle_refuses_a_session_model_shape_only_this_port_could_decode ... ok
+    test result: ok. 4 passed; 0 failed; 0 ignored   finished in 16.16s
+
+  No test ran as a skip: all four printed their measured lifecycle lines, and the
+  four `SKIPPED …` branches exist only for a host with no installed release, where
+  they name what was NOT tested on stderr.
+
+
+8. FULL SUITE
+--------------------------------------------------------------------------------
+  $ OC_MEMORY_GATE_MODE=skip cargo test --workspace --offline
+      TEST_EXIT=0
+      PASSED=3323  FAILED=0  IGNORED=2   across 207 test binaries
+
+  3,319 baseline + 4 new = 3,323. Every pre-existing test still passes.
+
+  No test skipped anywhere in the run:
+      $ grep -c SKIPPED <full log>        0
+
+  The two ignored tests are the pre-existing pair, unchanged by this task.
+
+
+9. CONSTRAINTS OBSERVED
+--------------------------------------------------------------------------------
+  * The user's real database was never opened, read or written. Every test builds
+    its own `ScriptedEnv` under TMPDIR and its own throwaway SQLite file.
+    `/config/.local/share/opencode/opencode.db` and `opencode.db.bak.20260408` were
+    not touched at all in this task.
+  * No existing test was weakened, skipped, `#[ignore]`d or deleted. The two older
+    round-trip tests in compat_suite.rs are unchanged and still pass.
+  * Frozen perf surface untouched: `crates/oc-testkit/src/perf/**`,
+    `docs/perf-methodology.md`, `benchmarks/ts-baseline.json`,
+    `crates/oc-testkit/tests/{memory,soak,backpressure}.rs`.
+  * `crates/oc-server/**` (todo 134) and `crates/oc-plugin/**` (todo 137) untouched.
+  * `crates/oc-testkit/**` is shared with todo 135: this task ADDS ONE NEW FILE and
+    changes nothing existing in that crate, including `Cargo.toml`. Merge-conflict
+    surface is zero.
+  * `OC_MEMORY_GATE_MODE=skip` was set for every oc-testkit invocation; the ~100
+    minute memory gate and 2 hour soak were not run.
+  * No `pkill`-style pattern was used; the fake provider shuts itself down and every
+    child process is spawned with `kill_on_drop(true)`.
