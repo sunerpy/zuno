@@ -832,6 +832,46 @@ async fn api_reply_routes_validate_bodies_before_rejecting_cross_session_request
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn permission_without_an_observer_is_rejected_by_the_deadline() {
+    let requests = RequestBroker::default();
+    let mut answer = tokio::spawn({
+        let requests = requests.clone();
+        async move {
+            requests
+                .ask_permission(PermissionRequest {
+                    id: "per_unobserved".to_owned(),
+                    session_id: "ses_unobserved".to_owned(),
+                    action: "bash".to_owned(),
+                    resources: vec!["touch must-not-run".to_owned()],
+                    save: Vec::new(),
+                    metadata: serde_json::Map::new(),
+                    source: None,
+                })
+                .await
+        }
+    });
+    while requests.permissions(None).is_empty() {
+        tokio::task::yield_now().await;
+    }
+
+    tokio::time::advance(Duration::from_secs(24 * 60 * 60)).await;
+    tokio::task::yield_now().await;
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), &mut answer)
+            .await
+            .expect("an unobserved permission request must have a finite deadline")
+            .expect("permission asker task does not panic"),
+        ReplyKind::Reject,
+        "the deadline must fail closed rather than authorize the request"
+    );
+    assert!(
+        requests.permissions(None).is_empty(),
+        "the deadline must remove the stale permission request"
+    );
+}
+
 #[tokio::test]
 async fn api_prompt_wait_and_interrupt_share_one_live_turn_signal() {
     let state = ApiState::memory("/repo").expect("in-memory API state initializes");

@@ -6357,3 +6357,23 @@ does not assert.
   asked/replied events remain observable through the existing session/global SSE
   streams. Keeping these concerns separate avoids pretending a restored event can
   resume a missing turn.
+
+## Wave 49 — todo 134 (observer loss and request deadline)
+
+- **A reply connection and an observation connection have independent lifetimes.**
+  Todo 132 proved that dropping a half-written reply body rejects the request; it
+  said nothing about dropping the session SSE stream that tells a human the request
+  exists. The latter needs an observer-lifetime guard attached to the SSE body.
+- **Last-observer cleanup and a deadline close different holes.** An observer guard
+  rejects immediately when a session's count falls from one to zero, while the
+  five-minute watchdog rejects a request that was never observed. Neither mechanism
+  can replace the other, and both send only `Reject`/`Rejected`.
+- **Observer accounting belongs to session SSE, not global SSE.** Only
+  `/event?sessionID=...` and `/api/session/{sessionID}/event` identify which
+  session's prompts that client can answer. A global stream cannot safely prove
+  ownership of any one session's pending request.
+- **Resource-pressure mitigation must not shrink thread stacks below toolchain
+  requirements.** A 1 MiB `ulimit -s` made the external TypeScript oracle segfault,
+  and `RUST_MIN_STACK=1 MiB` made `rustc` segfault. Restricting `CARGO_BUILD_JOBS`
+  and `RUST_TEST_THREADS` to one avoided the host's transient `EAGAIN` without
+  changing process semantics; the final workspace run passed 3,321 tests.

@@ -1081,3 +1081,71 @@ async fn disconnected_permission_reply_fails_closed_without_running_the_tool() {
     server.stop().await;
     provider.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disconnected_only_session_observer_rejects_permission_without_running_the_tool() {
+    const COMPLETION: &str = "DISCONNECTED_OBSERVER_DENIED";
+    let env = ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::Default);
+    let database = env
+        .xdg_data()
+        .join("http-permission-observer-disconnect.db");
+    let forbidden_side_effect = env.working_dir().join("observer-allowed-permission");
+    seed_session(&database, env.project());
+    let scenario = broker_scenario(
+        "http-permission-observer-disconnect",
+        "bash",
+        json!({
+            "command": format!("touch {}", forbidden_side_effect.display()),
+            "intent": "prove the last observer disconnecting denies permission"
+        }),
+        COMPLETION,
+    );
+    let provider = MockProvider::start(vec![scenario])
+        .await
+        .expect("mock provider binds loopback");
+    let mut server = RunningServer::start_with_config(
+        &env,
+        &database,
+        broker_provider_config(provider.base_url()),
+    )
+    .await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build loopback client");
+    let observer = SseClient::connect(
+        &client,
+        format!("{}/api/session/{SESSION_ID}/event?after=0", server.base_url),
+    )
+    .await;
+
+    submit_http_prompt(&client, &server, "msg_task134_observer_disconnect").await;
+    let _pending = wait_for_pending(
+        &client,
+        format!("{}/api/session/{SESSION_ID}/permission", server.base_url),
+    )
+    .await;
+
+    drop(observer);
+    let waited = tokio::time::timeout(
+        Duration::from_secs(15),
+        client
+            .post(format!("{}/api/session/{SESSION_ID}/wait", server.base_url))
+            .send(),
+    )
+    .await
+    .expect("dropping the only observer must release the HTTP turn")
+    .expect("wait for the observer-disconnected turn");
+    assert_eq!(waited.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_message_contains(&client, &server, COMPLETION).await;
+    assert!(
+        !forbidden_side_effect.exists(),
+        "the last observer disconnecting must reject; it allowed the shell tool to run"
+    );
+    assert_eq!(provider.captured_count().await, 2);
+
+    server.stop().await;
+    provider.shutdown().await;
+}
