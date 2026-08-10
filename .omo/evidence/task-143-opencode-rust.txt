@@ -1,0 +1,163 @@
+task 143 — plugin_models.rs: make the antigravity half distinguishable from the fixture catalog
+worktree /config/workspace/ProdDir/AI/oc-wt/t143, branch task-143, 2026-08-10
+
+===============================================================================
+0. THE MEASUREMENT THAT CHOSE THE ROUTE
+===============================================================================
+The plan offered two routes: (a) omit `google` from the initial catalog if
+production behaviour permits, or (b) assert a detail that exists only after
+antigravity executes. Both were measured first, because F2-B1's own lesson is
+that a mutation must be proven to change behaviour before it is trusted.
+
+Probe: the real production CLI (target/debug/opencode-rust, freshly built),
+`env -i` with exactly the test's environment, `models --verbose`, twice:
+  WITH    plugin = [antigravity@1.6.0, kiro-auth@0.20.6]
+  WITHOUT plugin = [kiro-auth@0.20.6]
+Both runs: 2944 lines of stdout. `diff with-ag.txt without-ag.txt` -> EMPTY.
+stderr identical (empty) in both runs.
+
+  $ wc -l with-ag.txt without-ag.txt
+    2944 with-ag.txt
+    2944 without-ag.txt
+  $ diff with-ag.txt without-ag.txt && echo IDENTICAL
+  IDENTICAL: antigravity contributes NOTHING to models --verbose
+
+Route (a) is therefore IMPOSSIBLE, and this is a correction to the todo's
+premise. Omitting `google` from the catalog does not make antigravity's
+contribution appear; it makes the `google` row disappear entirely. Measured:
+  plugin=[antigravity,kiro], auth={"kiro-auth":...}   -> no google row at all
+  plugin=[antigravity,kiro], auth={"google":{"type":"oauth",...},...} -> none
+`models` never shows a google row unless the catalog declares one.
+
+WHY (read from source, not guessed):
+  * `crates/oc-cli/src/cmd/models.rs:92-127` dispatches exactly two hooks:
+    `HookInvocation::Config` and `HookInvocation::Provider`.
+  * kiro-auth registers BOTH (`dist/plugin.js:68` config, `:424` provider), so
+    its models reach plain stdout — that is why the kiro half of the old test
+    was a real guard.
+  * antigravity registers `event`, `tool` and `auth` ONLY
+    (`dist/src/plugin.js:1138-1143`). It has no config hook and no provider
+    hook, so on the `models` surface it is inert by construction.
+  * `models.rs:109-111` additionally requires the provider to already exist in
+    the resolved catalog, so even a provider hook could not introduce one.
+
+Route (b) was taken, with the evidence placed where antigravity actually acts.
+
+===============================================================================
+1. WHAT CHANGED  (crates/oc-cli/tests/plugin_models.rs, test-only)
+===============================================================================
+* `production_plugin_specs()` — ONE definition of the plugin list, shared by
+  all three tests, so removing a plugin from the product is a single edit that
+  some assertion must notice.
+* `PINNED_CATALOG` — the fixture hoisted into a const so a test can assert the
+  evidence string is NOT in it.
+* `real_auth_plugin_providers_reach_the_plain_models_surface` — kept, kiro
+  assertion byte-identical. The `google` assertion is kept but its message now
+  states the truth: it is a FIXTURE CONTROL, not evidence about antigravity.
+  Nothing was weakened, skipped or deleted.
+* NEW `the_real_antigravity_plugin_registers_a_google_auth_method_no_fixture_supplies`
+  — loads `production_plugin_specs()` through the real production loader
+  (`load_js_plugins_ordered` + the same `JsHostConfig` models.rs builds), then
+  `HookBus::dispatch(HookInvocation::Auth)`, and asserts:
+    - an auth resource exists for provider `google`, AND
+    - its method labels contain "OAuth with Google (Antigravity)"
+      (antigravity's own string, `dist/src/plugin.js:1965`), AND
+    - that string is absent from `PINNED_CATALOG` (asserted in-test), so it
+      cannot be fixture-supplied.
+* NEW `without_antigravity_no_auth_resource_carries_its_evidence` — negative
+  control: same loader, kiro-auth only. Asserts kiro-auth's own hook IS present
+  first (so absence is not proven by loading nothing), then that no hook
+  advertises provider `google` and no label carries the Antigravity string.
+
+===============================================================================
+2. DELIVERABLE: REMOVING ANTIGRAVITY FAILS THE TEST
+===============================================================================
+Mutation: `production_plugin_specs()` -> `vec![supported_spec(KIRO_PACKAGE)]`
+(the exact shape of F2-B1's mutation: antigravity dropped from the plugin list).
+
+  running 3 tests
+  test the_real_antigravity_plugin_registers_a_google_auth_method_no_fixture_supplies ... FAILED
+  test real_auth_plugin_providers_reach_the_plain_models_surface ... ok
+  test without_antigravity_no_auth_resource_carries_its_evidence ... ok
+
+  ---- the_real_antigravity_plugin_registers_a_google_auth_method_no_fixture_supplies stdout ----
+  panicked at crates/oc-cli/tests/plugin_models.rs:267:13:
+  antigravity must register an auth resource for provider `google`; providers=["kiro-auth"]
+
+  test result: FAILED. 2 passed; 1 failed; 0 ignored
+
+Before this change the same mutation left the suite green ("1 passed"), which
+is F2-B1. Mutation reverted; full capture in the transcript above.
+
+===============================================================================
+3. DELIVERABLE: THE KIRO HALF STILL FAILS ON ITS OWN MUTATION
+===============================================================================
+Mutation: delete the user-tool-directory fallback from
+`crates/oc-plugin/src/js/runtime.rs::discover_runtime` (the `for kind in
+JsRuntimeKind::PREFERENCE { user_runtime_candidates(..) }` loop). The CLI test
+runs with `PATH=/usr/bin:/bin`, where neither `node` nor `bun` exists
+(verified: both absent), so this fallback via `MISE_DATA_DIR` is the only way
+its subprocess finds a JS runtime.
+
+  running 3 tests
+  test real_auth_plugin_providers_reach_the_plain_models_surface ... FAILED
+  test without_antigravity_no_auth_resource_carries_its_evidence ... ok
+  test the_real_antigravity_plugin_registers_a_google_auth_method_no_fixture_supplies ... ok
+
+  ---- real_auth_plugin_providers_reach_the_plain_models_surface stdout ----
+  panicked at crates/oc-cli/tests/plugin_models.rs:225:5:
+  loading kiro-auth is insufficient: its contributed models must reach plain
+  `models` output; providers={"google"}, stdout="google/gemini-test\n"
+
+  test result: FAILED. 2 passed; 1 failed; 0 ignored
+
+The stdout in the failure is the whole point: catalog-backed `google` survives
+while `kiro-auth` vanishes. The one guard that already worked still works, so
+the fix did not trade one half for the other. Mutation reverted (git checkout).
+
+(The two in-process tests pass under this mutation because they run with the
+cargo test process's own full PATH, where node is discoverable directly. They
+are not the runtime-discovery guard and do not claim to be.)
+
+===============================================================================
+4. UNMUTATED PASS
+===============================================================================
+  $ cargo test --offline -p oc-cli --test plugin_models -- --nocapture
+  running 3 tests
+  test without_antigravity_no_auth_resource_carries_its_evidence ... ok
+  test the_real_antigravity_plugin_registers_a_google_auth_method_no_fixture_supplies ... ok
+  test real_auth_plugin_providers_reach_the_plain_models_surface ... ok
+  test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+===============================================================================
+5. GATES
+===============================================================================
+$ OC_MEMORY_GATE_MODE=skip cargo test --workspace --offline
+  exit=0 ; passed=3362 failed=0 ignored=2
+  (3360 before + the 2 new tests; no pre-existing test lost, weakened or
+   #[ignore]d)
+$ cargo clippy --workspace --all-targets --offline
+  0 warnings, 0 errors (also confirmed with --message-format short: 0 lines)
+$ cargo fmt --all --check          -> clean
+$ cargo metadata --locked --offline --format-version 1 -> clean
+
+Untouched, as required: crates/oc-testkit/src/perf/**, docs/perf-methodology.md,
+benchmarks/ts-baseline.json, crates/oc-testkit/tests/{memory,soak,backpressure}.rs.
+No memory gate or soak run. No writes to /config/.config/opencode/ or to
+/config/.local/share/opencode/*.db. Verified separately that antigravity writes
+nothing under HOME/XDG at load time on this path (only the Rust log file
+appears), which is why in-process loading is safe here.
+
+Diff: 1 file changed, 251 insertions(+), 32 deletions(-) — test code only.
+
+===============================================================================
+6. NEW SEAM FOUND WHILE DOING THIS (#17 candidate)
+===============================================================================
+`models` never dispatches `HookInvocation::Auth`, so a plugin's auth `loader`
+never influences the user-visible catalog. Antigravity's loader zeroes the cost
+of every google model (`dist/src/plugin.js:1190-1197`:
+`model.cost = { input: 0, output: 0 }`) and returns provider options; upstream
+runs auth loaders while listing providers, this port does not. Nothing in the
+suite would notice. Likewise `HookInvocation::Tool` is dispatched by no
+production path, so antigravity's `google_search` tool is unreachable. Both are
+production gaps, out of scope for a test-only commit; recorded in the notepad.
