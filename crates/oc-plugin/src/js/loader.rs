@@ -178,7 +178,13 @@ async fn load_one(
             kind: map_diagnostic_kind(error.kind()),
             message: error.to_string(),
         })?;
-    let plugin = JsPlugin::build(host.clone(), &label).map_err(|error| JsDiagnostic {
+    let plugin = JsPlugin::build(
+        host.clone(),
+        &label,
+        config.directory.clone(),
+        config.worktree.clone(),
+    )
+    .map_err(|error| JsDiagnostic {
         plugin: label.clone(),
         kind: JsDiagnosticKind::Protocol,
         message: error.to_string(),

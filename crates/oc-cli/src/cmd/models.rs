@@ -1,18 +1,9 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
-use async_trait::async_trait;
-use oc_engine::terminal_lease::{
-    LeaseReason, TerminalLease, TerminalLeaseError, TerminalLeaseGuard,
-};
 use oc_llm::catalog::resolved::{
     JsonMap, ModelApi, ModelCapabilities, ModelCost, ModelLimit, ResolvedModel,
 };
 use oc_llm::catalog::{Catalog, CatalogSource, CatalogStatus, ResolveInput};
-use oc_plugin::{
-    HookBus, HookInvocation, JsHostConfig, JsPluginSpec, Plugin, ProviderHookContext,
-    load_js_plugins_ordered,
-};
 use serde::Serialize;
 
 use crate::command::ModelsArgs;
@@ -54,81 +45,27 @@ pub(super) fn execute(args: &ModelsArgs, environment: &StartupEnvironment) -> Re
             .map(oc_llm::catalog::LoadedCatalog::into_document)
             .map_err(|error| error.to_string())?;
 
-        let plugin_specs = if env.flag(crate::OPENCODE_PURE) {
-            Vec::new()
-        } else {
-            configured_plugins(&config)
-        };
-        if plugin_specs.is_empty() {
-            return Ok(resolve_catalog(&document, &config, &credentials, env));
-        }
-
-        let terminal: Arc<dyn TerminalLease> = Arc::new(HeadlessTerminalLease);
-        let host = JsHostConfig::new(
-            project.clone(),
-            reqwest::Url::parse("http://127.0.0.1:0").expect("static plugin server URL"),
-            terminal,
+        let Some(plugins) = super::plugin_runtime::PluginRuntime::load(
+            &config,
+            &project,
+            &directory,
+            worktree.unwrap_or(directory.as_path()),
+            &layout,
+            env.flag(crate::OPENCODE_PURE),
+            "models",
         )
-        .directory(&directory)
-        .worktree(worktree.unwrap_or(directory.as_path()))
-        .cache_dir(layout.cache());
-        let load = load_js_plugins_ordered(plugin_specs, host).await;
-        for diagnostic in load.diagnostics() {
-            tracing::warn!(
-                plugin = %diagnostic.plugin,
-                kind = ?diagnostic.kind,
-                message = %diagnostic.message,
-                "JavaScript plugin did not fully load for the models command"
-            );
-        }
-        let plugins = load
-            .plugins()
-            .iter()
-            .cloned()
-            .map(|plugin| plugin as Arc<dyn Plugin>)
-            .collect();
-        let bus = HookBus::new(plugins);
+        .await
+        else {
+            return Ok(resolve_catalog(&document, &config, &credentials, env));
+        };
         let result: Result<Catalog, String> = async {
-            bus.dispatch(HookInvocation::Config {
-                config: &mut config,
-            })
-            .await
-            .map_err(|error| error.to_string())?;
-
+            plugins.apply_config(&mut config).await?;
             let mut catalog = resolve_catalog(&document, &config, &credentials, env);
-            let mut provider_hooks = Vec::new();
-            bus.dispatch(HookInvocation::Provider {
-                output: &mut provider_hooks,
-            })
-            .await
-            .map_err(|error| error.to_string())?;
-            for hook in provider_hooks {
-                let Some(loader) = hook.models else {
-                    continue;
-                };
-                let Some(provider) = catalog.provider(&hook.id).cloned() else {
-                    continue;
-                };
-                let models = loader
-                    .models(
-                        &provider,
-                        ProviderHookContext {
-                            auth: credentials.get(&hook.id),
-                        },
-                    )
-                    .await
-                    .map_err(|error| {
-                        format!(
-                            "plugin provider `{}` failed to contribute models: {error}",
-                            hook.id
-                        )
-                    })?;
-                catalog.replace_provider_models(&hook.id, models);
-            }
+            plugins.apply_catalog(&mut catalog, &credentials).await?;
             Ok(catalog)
         }
         .await;
-        load.shutdown().await;
+        plugins.shutdown().await;
         result
     })?;
 
@@ -149,22 +86,6 @@ pub(super) fn execute(args: &ModelsArgs, environment: &StartupEnvironment) -> Re
     Ok(())
 }
 
-fn configured_plugins(config: &oc_config::Config) -> Vec<JsPluginSpec> {
-    config
-        .plugin
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .map(|plugin| {
-            let spec = JsPluginSpec::new(plugin.name());
-            match plugin.options() {
-                Some(options) => spec.options(serde_json::Value::Object(options.clone())),
-                None => spec,
-            }
-        })
-        .collect()
-}
-
 fn resolve_catalog(
     document: &oc_llm::catalog::CatalogDocument,
     config: &oc_config::Config,
@@ -181,19 +102,6 @@ fn resolve_catalog(
         )
         .with_experimental_models(env.flag(OPENCODE_ENABLE_EXPERIMENTAL_MODELS));
     Catalog::resolve(document, &input)
-}
-
-struct HeadlessTerminalLease;
-
-#[async_trait]
-impl TerminalLease for HeadlessTerminalLease {
-    async fn acquire(&self, reason: LeaseReason) -> Result<TerminalLeaseGuard, TerminalLeaseError> {
-        Err(TerminalLeaseError::Unavailable {
-            requested_by: reason.plugin,
-            detail: "the headless models command cannot host an interactive plugin prompt"
-                .to_owned(),
-        })
-    }
 }
 
 fn print_models(

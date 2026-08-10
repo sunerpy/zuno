@@ -59,7 +59,11 @@ const PINNED_CATALOG: &str = r#"{
         "name": "Google",
         "npm": "@ai-sdk/google",
         "models": {
-            "gemini-test": { "id": "gemini-test", "name": "Gemini Test" }
+            "gemini-test": {
+                "id": "gemini-test",
+                "name": "Gemini Test",
+                "cost": { "input": 1.25, "output": 5.0 }
+            }
         }
     }
 }"#;
@@ -232,6 +236,86 @@ async fn real_auth_plugin_providers_reach_the_plain_models_surface() {
         "the pinned catalog's own `{ANTIGRAVITY_PROVIDER}` row must survive plugin loading; this \
          is a fixture control and NOT evidence about antigravity, which registers no config or \
          provider hook; providers={providers:?}, stdout={stdout:?}"
+    );
+}
+
+/// Antigravity's auth loader mutates the provider seen by the real `models` command.
+///
+/// The non-zero fixture price is the control: only the loader can turn it into the
+/// free model the released binary reports. Merely loading or dispatching the auth
+/// resource is insufficient, so this guards the production loader call itself.
+#[tokio::test]
+async fn antigravity_auth_loader_zeroes_google_cost_on_the_verbose_models_surface() {
+    let absent = absent_packages();
+    if !absent.is_empty() {
+        skipped(
+            "antigravity_auth_loader_zeroes_google_cost_on_the_verbose_models_surface",
+            &absent,
+        );
+        return;
+    }
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let catalog = root.path().join("models.json");
+    std::fs::write(&catalog, PINNED_CATALOG).expect("write pinned models catalog");
+    let config = serde_json::json!({
+        "plugin": [supported_spec(ANTIGRAVITY_PACKAGE)],
+        "provider": { "google": {} }
+    });
+
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_opencode-rust"));
+    command
+        .args(["models", "google", "--verbose"])
+        .current_dir(root.path())
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .env_clear()
+        .env("HOME", root.path().join("home"))
+        .env("XDG_DATA_HOME", root.path().join("data"))
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("XDG_CACHE_HOME", "/config/.cache")
+        .env("XDG_STATE_HOME", root.path().join("state"))
+        .env("MISE_DATA_DIR", "/config/.local/share/mise")
+        .env("PATH", "/usr/bin:/bin")
+        .env("NO_COLOR", "1")
+        .env("TERM", "dumb")
+        .env("OPENCODE_DISABLE_AUTOUPDATE", "true")
+        .env("OPENCODE_DISABLE_MODELS_FETCH", "true")
+        .env("OPENCODE_DISABLE_DEFAULT_PLUGINS", "true")
+        .env("OPENCODE_DISABLE_LSP_DOWNLOAD", "true")
+        .env("OPENCODE_MODELS_PATH", &catalog)
+        .env("OPENCODE_CONFIG_CONTENT", config.to_string())
+        .env(
+            "OPENCODE_AUTH_CONTENT",
+            r#"{"google":{"type":"oauth","refresh":"fixture-refresh","access":"fixture-access","expires":4102444800000}}"#,
+        );
+
+    let output = tokio::time::timeout(Duration::from_secs(120), command.output())
+        .await
+        .expect("verbose models command timed out")
+        .expect("run verbose models command");
+    assert!(
+        output.status.success(),
+        "verbose models failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("models output is UTF-8");
+    let (_, json) = stdout
+        .split_once('\n')
+        .unwrap_or_else(|| panic!("verbose output omitted the model JSON: {stdout:?}"));
+    let model: serde_json::Value = serde_json::from_str(json)
+        .unwrap_or_else(|error| panic!("invalid verbose JSON: {error}\n{json}"));
+    assert_eq!(model["id"], "gemini-test");
+    assert_eq!(
+        model["cost"],
+        serde_json::json!({
+            "input": 0.0,
+            "output": 0.0,
+            "cache": { "read": 0.0, "write": 0.0 }
+        }),
+        "the fixture starts at input=1.25/output=5.0, so only antigravity's real auth loader can produce this cost; stdout={stdout:?}; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

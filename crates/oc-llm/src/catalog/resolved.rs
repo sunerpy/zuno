@@ -142,6 +142,7 @@ impl Default for ModalityFlags {
 /// crate's; preserving the distinction here would diverge from every cost
 /// calculation the rest of the program does.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ModelCost {
     /// Input price per million tokens.
     pub input: f64,
@@ -153,6 +154,7 @@ pub struct ModelCost {
 
 /// Cache pricing — `provider.ts:1492-1495`.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CacheCost {
     /// Cache-read price per million tokens.
     pub read: f64,

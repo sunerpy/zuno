@@ -298,25 +298,22 @@ impl AuthLoader for HandleAuthLoader {
     async fn load(
         &self,
         auth: &dyn AuthCredentialResolver,
-        provider: &ResolvedProvider,
+        provider: &mut ResolvedProvider,
     ) -> Result<JsonMap, BoxSource> {
-        // The oracle passes `getAuth` as a *callable* (`auth: () => Promise<Auth>`).
-        // Resolving it here and handing over the value is the one place this bridge
-        // narrows the contract, and it is safe because both real plugins call
-        // `getAuth()` exactly once and immediately: kiro discards the result
-        // (`dist/plugin.js:410-411`) and antigravity caches it
-        // (`dist/src/plugin.js:1144-1147`).
         let credential = auth.resolve().await?;
-        let value = self
+        let get_auth = self
             .host
-            .call(
+            .constant_function(credential_value(credential.as_ref()));
+        let (value, arguments) = self
+            .host
+            .call_mutating(
                 &self.handle,
-                vec![
-                    credential_value(credential.as_ref()),
-                    provider_value(provider),
-                ],
+                vec![get_auth.argument(), provider_value(provider)],
             )
             .await?;
+        if let Some(mutated) = arguments.get(1) {
+            *provider = serde_json::from_value(mutated.clone())?;
+        }
         Ok(value
             .as_object()
             .cloned()

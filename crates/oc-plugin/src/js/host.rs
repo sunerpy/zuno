@@ -391,6 +391,8 @@ struct HostInner {
     handle_peak: AtomicU64,
     tool_contexts: Mutex<HashMap<u64, (String, ToolContext)>>,
     next_tool_context: AtomicU64,
+    host_functions: Mutex<HashMap<u64, Value>>,
+    next_host_function: AtomicU64,
     _temp: Option<Arc<tempfile::TempDir>>,
 }
 
@@ -567,6 +569,8 @@ impl JsHostBuilder {
             handle_peak: AtomicU64::new(0),
             tool_contexts: Mutex::new(HashMap::new()),
             next_tool_context: AtomicU64::new(1),
+            host_functions: Mutex::new(HashMap::new()),
+            next_host_function: AtomicU64::new(1),
             _temp: temp,
         });
 
@@ -687,6 +691,44 @@ impl JsHost {
                 plugin: self.inner.plugin.clone(),
                 detail: format!("the host executor stopped during a callback: {error}"),
             })?
+    }
+
+    /// Invoke a retained function and return both its value and mutated arguments.
+    ///
+    /// JavaScript auth loaders mutate the provider object in place. Returning only
+    /// the callback value would silently discard that half of their contract.
+    pub async fn call_mutating(
+        &self,
+        handle: &JsHandle,
+        arguments: Vec<Value>,
+    ) -> Result<(Value, Vec<Value>), JsHostError> {
+        let inner = Arc::clone(&self.inner);
+        let executor = inner.executor.clone();
+        let id = handle.id;
+        let arity = handle.arity;
+        let frame = executor
+            .spawn(async move { inner.call_stable_frame(id, arity, arguments).await })
+            .await
+            .map_err(|error| JsHostError::Disabled {
+                plugin: self.inner.plugin.clone(),
+                detail: format!("the host executor stopped during a callback: {error}"),
+            })??;
+        let value = frame.get("value").cloned().unwrap_or(Value::Null);
+        let arguments = frame
+            .get("args")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok((value, arguments))
+    }
+
+    pub(crate) fn constant_function(&self, value: Value) -> JsHostFunction {
+        let id = self.inner.next_host_function.fetch_add(1, Ordering::SeqCst);
+        lock(&self.inner.host_functions).insert(id, value);
+        JsHostFunction {
+            host: self.clone(),
+            id,
+        }
     }
 
     /// Invoke a config-directory tool retained by this host.
@@ -897,6 +939,23 @@ impl JsHost {
     }
 }
 
+pub(crate) struct JsHostFunction {
+    host: JsHost,
+    id: u64,
+}
+
+impl JsHostFunction {
+    pub(crate) fn argument(&self) -> Value {
+        json!({ "$hostFn": self.id })
+    }
+}
+
+impl Drop for JsHostFunction {
+    fn drop(&mut self) {
+        lock(&self.host.inner.host_functions).remove(&self.id);
+    }
+}
+
 /// A bound the child exceeded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LimitBreach {
@@ -952,6 +1011,16 @@ impl HostInner {
         arity: u32,
         arguments: Vec<Value>,
     ) -> Result<Value, JsHostError> {
+        let frame = self.call_stable_frame(id, arity, arguments).await?;
+        Ok(frame.get("value").cloned().unwrap_or(Value::Null))
+    }
+
+    async fn call_stable_frame(
+        self: &Arc<Self>,
+        id: u64,
+        arity: u32,
+        arguments: Vec<Value>,
+    ) -> Result<Value, JsHostError> {
         if !self.enabled.load(Ordering::SeqCst) {
             self.restart().await?;
         }
@@ -960,7 +1029,7 @@ impl HostInner {
             arity,
             generation: self.generation.load(Ordering::SeqCst),
         };
-        self.call(&handle, arguments).await
+        self.call_frame(&handle, arguments).await
     }
 
     async fn boot(self: &Arc<Self>) -> Result<(), JsHostError> {
@@ -1118,11 +1187,6 @@ impl HostInner {
             workspace: value_list(value.get("workspace")),
             callbacks,
         })
-    }
-
-    async fn call(&self, handle: &JsHandle, arguments: Vec<Value>) -> Result<Value, JsHostError> {
-        let value = self.call_frame(handle, arguments).await?;
-        Ok(value.get("value").cloned().unwrap_or(Value::Null))
     }
 
     async fn call_frame(
@@ -1528,6 +1592,31 @@ fn route(host: &Arc<HostInner>, frame: Value, hello: &mut Option<oneshot::Sender
                             "jsonrpc": "2.0",
                             "id": id,
                             "error": { "code": -32000, "message": message },
+                        }),
+                    };
+                    let _written = host.write(&frame).await;
+                }
+            });
+        }
+        "host.call" => {
+            let target = frame
+                .get("params")
+                .and_then(|params| params.get("handle"))
+                .and_then(Value::as_u64);
+            let value = target.and_then(|target| lock(&host.host_functions).get(&target).cloned());
+            let host = Arc::clone(host);
+            host.executor.clone().spawn(async move {
+                if let Some(id) = id {
+                    let frame = match value {
+                        Some(value) => json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": { "value": value },
+                        }),
+                        None => json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": { "code": -32000, "message": "host callback is unavailable" },
                         }),
                     };
                     let _written = host.write(&frame).await;
