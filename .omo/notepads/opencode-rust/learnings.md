@@ -6291,3 +6291,42 @@ pair — `assert_api_counts` now covers `README.md` too.
 near-miss where a helper lost its only call site and clippy caught it. Clippy at
 `-D warnings` confirms; a helper with no caller is the same lie as a test that
 does not assert.
+
+## Wave 47 — todo 133 (pinning the narrowings)
+
+- **`prune_expired` in `oc-pty/src/ticket.rs:194-201` sweeps the FRONT only.** That
+  is correct in production, where `issue` always stamps `Instant::now()` and the
+  `VecDeque` is therefore ordered oldest-first, so a non-expired front implies no
+  expired entry — and `consume_at` performs no per-entry age check, which makes the
+  FIFO invariant load-bearing. A test that back-dates a ticket with `issue_at` while
+  a fresher ticket is still outstanding pushes the stale one BEHIND the front and it
+  escapes the sweep entirely, so the route accepts it. Any expiry test must drain
+  the store first (assert `tickets().is_empty()`) so the stale ticket is provably
+  the oldest.
+- **A scope-mismatch 403 is indistinguishable from an expiry 403 at the route.**
+  `pty::connect` redeems with `TicketScope { directory: Some(resolved), … }`; a
+  fixture using `TicketScope::for_session` (directory `None`) gets 403 for the wrong
+  reason. The fix that makes it honest is a *positive control*: redeem a FRESH ticket
+  carrying the identical hand-built scope first and require 400 (the WebSocket
+  upgrade boundary). Only then can the stale ticket's 403 be attributed to expiry.
+- **`chat_context_value` (`oc-plugin/src/jsonrpc.rs:1219-1236`) serializes
+  `ResolvedModel` with Rust field names, so a JS plugin sees `provider_id`, not the
+  `providerID` upstream's type declares.** `chat.message` in the SAME codec spells it
+  `providerID` (`:972`), so the two encodings disagree with each other. Measured
+  against the real kiro `0.20.6` plugin: with `model.provider_id` matching and
+  `provider.info.id` not, its `chat.headers` hook injects nothing — it survives only
+  on its `?? input?.provider?.info?.id` fallback. `chat.params` shares the input
+  shape. Pinned by an assertion in `oc-plugin/tests/js.rs` that fails when the seam
+  is closed.
+- **`/config/.cache/opencode/packages/@sunerpy/opencode-kiro-auth@0.20.2` exists as
+  an EMPTY DIRECTORY** — no `node_modules`, no `package.json`. A `ls -d` glob makes
+  it look installed; only `0.20.6` can actually load. Probe for
+  `node_modules/<package>/package.json`, not for the version directory.
+- **Deriving a version from `SUPPORTED_JS_PLUGINS` instead of typing it** is what
+  stops the three-way drift criterion 6 suffered. A test that names a version
+  literally can outlive the package.
+- **Freezing a gap set by COUNT cannot catch a swap.** Fourteen stays fourteen when
+  one gap closes and another opens. `FROZEN_API_GAPS` lists method+path and diffs
+  the list against what the live server actually answers, in both directions, plus a
+  third assertion for a member that leaves the set while its matrix row still exempts
+  status and body — an operation counted as neither gap nor parity is invisible.

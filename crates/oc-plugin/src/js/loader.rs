@@ -27,7 +27,7 @@ pub const SUPPORTED_JS_PLUGINS: [SupportedJsPlugin; 2] = [
     },
     SupportedJsPlugin {
         package: "@sunerpy/opencode-kiro-auth",
-        version: "0.20.1",
+        version: "0.20.6",
     },
 ];
 

@@ -7,7 +7,7 @@
 //! that starts an OAuth flow, and the `callback` that `authorize`'s result carries
 //! (`packages/plugin/src/index.ts:88-208`). Marshalling the hook object once would
 //! deliver its labels and drop everything that does work. Measured on the two real
-//! plugins: kiro@0.20.1's auth hook alone carries **11** closures — one `loader`,
+//! plugins: kiro@0.20.6's auth hook alone carries **11** closures — one `loader`,
 //! four `authorize`, and six prompt `validate` — and antigravity@1.6.0's carries
 //! two.
 //!

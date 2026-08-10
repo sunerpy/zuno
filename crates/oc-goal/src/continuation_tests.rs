@@ -311,3 +311,102 @@ fn failure_streak_survives_restart_and_resume_clears_it() {
         None
     );
 }
+
+/// Criterion 11's "survives two compactions", which had only ever been driven once.
+///
+/// One compaction cannot distinguish a goal that is genuinely re-derived from SQL
+/// from one that survived because a stale in-memory copy was still reachable: the
+/// second boundary is what proves the first regeneration did not consume the source.
+/// So the objective and every counter — tokens, wall clock, and the persistent
+/// failure streak — are checked after each of two consecutive boundaries, and both
+/// boundaries are asserted to have actually discarded the injected goal context
+/// rather than retaining it.
+#[test]
+fn goal_survives_two_consecutive_compactions_with_objective_and_counters_intact() {
+    const OBJECTIVE: &str = "port the whole surface, not the easy subset";
+    let fixture = Fixture::new();
+    fixture.create(OBJECTIVE);
+    fixture
+        .store
+        .record_usage("ses_goal", 1_500, 30)
+        .expect("record first usage");
+    fixture
+        .continuation
+        .record_turn_outcome("ses_goal", GoalTurnOutcome::Blocking("waiting on review"))
+        .expect("record a blocker so a counter has something to lose");
+
+    let mut compacted = Vec::new();
+    for round in 1..=2 {
+        let injection = fixture
+            .continuation
+            .injection("ses_goal")
+            .expect("render injection")
+            .expect("active goal injection");
+        assert!(
+            text(&injection).contains(OBJECTIVE),
+            "round {round}: the injection lost the objective before compaction even ran"
+        );
+        assert!(
+            !injection.preserve_initial,
+            "round {round}: goal context that is preserved across compaction would make this \
+             test prove nothing — the point is that it IS discarded and re-derived"
+        );
+
+        let entries = vec![
+            TranscriptEntry::new("system", Message::new(Role::System, "system"), 1),
+            injection,
+            TranscriptEntry::new("user", Message::new(Role::User, "keep going"), 1),
+            TranscriptEntry::new("assistant", Message::new(Role::Assistant, "working"), 1),
+        ];
+        let boundary = select_boundary(&entries, 1, 2)
+            .unwrap_or_else(|| panic!("round {round}: no compaction boundary was selectable"));
+        assert!(
+            boundary.retained_from > 1,
+            "round {round}: the goal injection at index 1 was retained, so this round compacted \
+             nothing the goal depended on"
+        );
+        compacted.push(boundary.retained_from);
+
+        fixture
+            .store
+            .record_usage("ses_goal", 350, 10)
+            .unwrap_or_else(|error| panic!("round {round}: record post-compaction usage: {error}"));
+    }
+    assert_eq!(compacted.len(), 2, "two boundaries must have been selected");
+
+    let goal = fixture
+        .store
+        .goal("ses_goal")
+        .expect("read goal")
+        .expect("the goal still exists after two compactions");
+    assert_eq!(goal.objective, OBJECTIVE, "the objective did not survive");
+    assert_eq!(
+        (goal.tokens_used, goal.time_used_seconds),
+        (2_200, 50),
+        "the usage counters must accumulate across both compactions: 1500+350+350 tokens and \
+         30+10+10 seconds"
+    );
+    assert_eq!(goal.status, GoalStatus::Active);
+    assert_eq!(
+        fixture
+            .store
+            .failure_streak("ses_goal")
+            .expect("read the persisted streak"),
+        Some(FailureStreak {
+            signal: "waiting on review".to_owned(),
+            consecutive_turns: 1,
+        }),
+        "the blocked-audit counter is persistent state, so two compactions must not reset it"
+    );
+
+    let after = fixture
+        .continuation
+        .injection("ses_goal")
+        .expect("render injection after two compactions")
+        .expect("active goal injection");
+    assert!(
+        text(&after).contains(OBJECTIVE),
+        "the third injection is regenerated from SQL after two compactions and must still carry \
+         the objective"
+    );
+}

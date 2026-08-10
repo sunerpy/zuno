@@ -1,0 +1,395 @@
+Task 133 — every narrowed criterion pinned by a test, and the PTY expiry
+assertion fixed
+Verified: 2026-08-10
+
+WHAT THIS TASK IS
+
+The plan owner narrowed success criteria 2, 4, 6 and 15. A narrowing that no
+test enforces is a waiver, so each is now pinned by a named test that FAILS when
+the narrowed scope grows. Two real defects are fixed alongside: the route-level
+PTY expiry assertion that passed for the wrong reason (F2 blocker 2), and the
+missing two-consecutive-compactions test for the goal tool (criterion 11).
+
+ONE TEST PER NARROWING
+
+  criterion 2  crates/oc-config/tests/differential.rs
+               ::criterion_2_is_narrowed_to_pure_mode_and_the_non_pure_plugin_trees_are_declared
+  criterion 4  crates/oc-testkit/tests/compat_suite.rs
+               ::criterion_4_freezes_the_backend_unavailable_operations_by_name
+  criterion 6  crates/oc-plugin/tests/js.rs
+               ::criterion_6_converges_the_plan_the_capture_and_this_test_on_one_kiro_auth_version
+               crates/oc-plugin/tests/js.rs
+               ::js_real_kiro_plugin_injects_its_request_kind_header_for_a_compaction_turn
+  criterion 15 crates/oc-cli/tests/docs.rs
+               ::criterion_15_states_the_windows_g6_half_is_not_executed_in_the_readme_and_the_evidence
+  criterion 11 crates/oc-goal/src/continuation_tests.rs
+               ::goal_survives_two_consecutive_compactions_with_objective_and_counters_intact
+  F2 blocker 2 crates/oc-server/tests/api.rs
+               ::api_pty_connect_requires_a_single_use_unexpired_ticket_without_echoing_it
+
+CRITERION 2 — narrowed to pure mode, with the excluded difference declared
+
+`docs/divergences.toml` gained a thirteenth entry, `non-pure-plugin-generated-trees`,
+carrying both measured sizes: a 221818-byte `agent` tree and a 17970-byte
+`command` tree that the released binary's own plugin set synthesises and this
+port leaves empty. `oc_testkit::divergence::DECLARED_COUNT` went 12 -> 13 in the
+same commit, which is what the allow-list gate requires.
+
+The count and the file agree:
+
+  $ python3 -c "import tomllib,pathlib; \
+      print(len(tomllib.loads(pathlib.Path('docs/divergences.toml').read_text())['divergence']))"
+  13
+  $ grep -n "pub const DECLARED_COUNT" crates/oc-testkit/src/divergence.rs
+  crates/oc-testkit/src/divergence.rs:57:pub const DECLARED_COUNT: usize = 13;
+
+The entry is also registered as a behavioural difference in
+`compat_suite.rs::behavioural_differences`, so
+`every_declared_behavioural_difference_names_a_test_that_exists_and_runs` now
+requires the criterion-2 test to exist and not be `#[ignore]`d. Documentation was
+regenerated through `OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs`, not
+edited by hand; the hand-written counts in `docs/divergences.md` and `README.md`
+were corrected from twelve to thirteen.
+
+The test asserts three things, one per clause of the narrowing:
+
+  1. the byte-exact matrix case named `real-user-global-config` forces
+     `OPENCODE_PURE=1` and still runs `debug config`;
+  2. the declared entry names `OPENCODE_PURE` in its surface and states BOTH
+     measured byte counts in its reason;
+  3. without pure mode this port really does still produce zero `agent` and zero
+     `command` entries — so the declaration describes reality, and plugin-tree
+     synthesis landing later trips this assertion rather than silently making the
+     declaration false.
+
+  MUTATION A. Widen the case out of pure mode (drop its `.env_var("OPENCODE_PURE", "1")`):
+
+    criterion 2 was narrowed to pure mode, so case real-user-global-config must
+    force OPENCODE_PURE=1. Without it this test would be asserting a scope the
+    criterion no longer claims, and the declared non-pure divergence below would
+    be covering a comparison that is once again required.
+      left: None
+     right: Some("1")
+    test result: FAILED. 0 passed; 1 failed
+
+  MUTATION B. Remove the measured size from the declared reason
+  ("a 221818-byte `agent` tree" -> "a large `agent` tree"):
+
+    the "non-pure-plugin-generated-trees" entry must state the measured
+    agent-tree size (221818 bytes). A declaration without the number cannot be
+    contradicted by a later measurement, which is the whole difference between a
+    declared divergence and a shrug.
+    test result: FAILED. 0 passed; 1 failed
+
+  Both mutations were reverted.
+
+CRITERION 4 — the fourteen gaps frozen BY NAME, not by count
+
+`FROZEN_API_GAPS` lists the fourteen operations by method+path:
+
+  DELETE /api/credential/{credentialID}
+  DELETE /api/integration/attempt/{attemptID}
+  GET    /api/integration/attempt/{attemptID}
+  GET    /api/session/{sessionID}/message/{messageID}
+  GET    /api/session/{sessionID}/permission
+  GET    /api/session/{sessionID}/permission/{requestID}
+  PATCH  /api/credential/{credentialID}
+  POST   /api/integration/attempt/{attemptID}/complete
+  POST   /api/integration/{integrationID}/connect/key
+  POST   /api/integration/{integrationID}/connect/oauth
+  POST   /api/session/{sessionID}/permission
+  POST   /api/session/{sessionID}/permission/{requestID}/reply
+  POST   /api/session/{sessionID}/question/{requestID}/reject
+  POST   /api/session/{sessionID}/question/{requestID}/reply
+
+The test invokes every upstream operation against a live subject server and
+compares the set that ACTUALLY answers 503 against that list. A count alone
+cannot catch a swap — one gap closing while another opens leaves the number at
+fourteen — which is why the members are named. Three failure modes are separate
+assertions: a gap appearing, a gap departing without being removed from the list,
+and a member leaving the set while its behaviour-matrix row still exempts both
+status and body (an operation that is counted as neither gap nor parity, i.e.
+invisible).
+
+  MUTATION C. Remove one member, simulating a gap the set does not admit:
+
+    1 operation(s) newly answer 503 backend_unavailable and are NOT in the frozen
+    criterion-4 gap set: [("POST", "/api/session/{sessionID}/question/{requestID}/reply")]
+    test result: FAILED. 0 passed; 1 failed
+
+  MUTATION D. Add an operation that has a real backend, simulating a member
+  leaving without the list being edited:
+
+    1 frozen gap(s) no longer answer 503: [("GET", "/api/session/{sessionID}/message")]
+    test result: FAILED. 0 passed; 1 failed
+
+  Both mutations were reverted.
+
+FOR TODO 132: this list, not a count, is the thing to edit. Implementing the
+permission/question reply and reject routes must remove those four entries from
+`FROZEN_API_GAPS` in the same commit, which drops the set to ten. Mutation D is
+exactly what a forgotten edit looks like. The existing count assertions in
+`api_behaviour_matrix_invokes_every_subject_operation_and_rejects_501` were left
+untouched, as instructed, because todo 131 may move them.
+
+CRITERION 6 — one kiro-auth version, in all three places
+
+The criterion named three mutually inconsistent versions. Measured on this host:
+
+  $ ls -d /config/.cache/opencode/packages/@sunerpy/opencode-kiro-auth@*
+  /config/.cache/opencode/packages/@sunerpy/opencode-kiro-auth@0.20.2
+  /config/.cache/opencode/packages/@sunerpy/opencode-kiro-auth@0.20.6
+
+CORRECTION TO THE BRIEF: `0.20.2` is present only as an EMPTY DIRECTORY. It has
+no `node_modules`, no `package.json` and no `dist`, so it cannot load either.
+`0.20.6` is the only kiro-auth actually installed, which strengthens rather than
+weakens the ruling.
+
+  $ ls /config/.cache/opencode/packages/@sunerpy/opencode-kiro-auth@0.20.2/
+  (empty)
+  $ grep '"version"' …@0.20.6/node_modules/@sunerpy/opencode-kiro-auth/package.json
+  "version": "0.20.6",
+
+Converged on `0.20.6`, the version `/config/.config/opencode/opencode.json:90`
+pins. Updated: `docs/v1-surface-capture.md:34,52`, `crates/oc-plugin/tests/js.rs`,
+`crates/oc-plugin/src/js/loader.rs` (`SUPPORTED_JS_PLUGINS`),
+`crates/oc-plugin/src/js/host.rs`, `crates/oc-plugin/src/js/spec.rs`,
+`crates/oc-server/src/compat_v1.rs` (`KIRO`). The test no longer types a version
+at all: it derives the spec from `SUPPORTED_JS_PLUGINS`, so this file cannot name
+a version the support table does not. A stale line-number citation in `spec.rs`
+was corrected (`plugin.js:67` -> `:68`) against the version now pinned.
+
+  $ grep -rn "0\.20\.1" docs crates README.md
+  (no matches)
+
+The pin asserts the version appears in the plan, in the capture, and in this
+test; that no source file or document names a second kiro-auth version; that the
+user's config still pins it; and that the installed manifest declares it.
+
+THE REMOVED `client.middlewareStack.add` CLAUSE AND ITS REPLACEMENT
+
+Dropped as unsatisfiable — todo 60 established `middlewareStack` is not a member
+of `PluginInput.client`; it belongs to the plugin's internal AWS client, built in
+`makeSdkClient(auth, region, effort)` after the auth loader returns its `fetch`.
+The behavioural replacement loads the REAL `0.20.6` plugin through the JS compat
+host and drives its real `chat.headers` hook:
+
+  compaction turn -> {"x-opencode-kiro-agent-hash": "…",
+                      "x-opencode-kiro-diagnostic-trace": "602d8e92-…",
+                      "x-opencode-kiro-request-kind": "compaction",
+                      "x-opencode-kiro-session-hash": "…"}
+  build turn      -> no request-kind header
+
+Asserted: the request-kind header is `compaction` for a compaction turn; every
+injected header carries the plugin's own `x-opencode-kiro-` namespace; the
+diagnostic trace, when present, has `crypto.randomUUID()` shape; and a
+non-compaction turn does NOT receive the request-kind header, so the positive
+assertion cannot pass for any input. The hook's registration is asserted first,
+so a plugin that stopped registering `chat.headers` fails instead of passing by
+injecting nothing.
+
+SCOPE STATED HONESTLY: the `effort` field is NOT asserted. It is resolved inside
+the plugin's AWS SDK client on an outbound Kiro request, which needs live
+credentials and network this suite forbids by construction. That is a stated
+limit, not a silent one.
+
+A NOTE ON THE BRIEF'S PREMISE: it says the default `diagnostic_log_level` is
+`off`. The schema default is indeed `off`
+(`dist/plugin/config/schema.js:187`), but this host's kiro configuration enables
+diagnostics, so the diagnostic headers DO appear here. My first draft asserted
+their absence and failed; the assertion was corrected to the invariant that holds
+either way rather than tuned to this host.
+
+SEAM 14 FOUND — the chat-context model encoding does not match the declared shape
+
+While proving the header injection I probed which field the hook matches on. The
+hook resolves `input?.model?.providerID ?? input?.provider?.info?.id`
+(`dist/plugin.js:390`). With `model.provider_id = "kiro-auth"` and
+`provider.info.id = "not-kiro"` the plugin injects NOTHING:
+
+  PROBE model-only-match -> {}
+
+So `input.model.providerID` never reaches the plugin. `chat_context_value`
+(`crates/oc-plugin/src/jsonrpc.rs:1219-1236`) serializes `ResolvedModel` with
+Rust field names, so the plugin sees `provider_id`, not the `providerID` upstream's
+type declares. `chat.message` in the SAME codec already spells it `providerID`
+(`jsonrpc.rs:972`), so the two encodings disagree with each other — this is an
+internal inconsistency, not a design choice. Kiro survives only on its
+`?? provider.info.id` fallback; a plugin reading only `model.providerID` would
+silently never fire, and `chat.params` has the same input shape.
+
+NOT FIXED HERE, deliberately: correcting `chat_context_value` changes the plugin
+wire contract for both `chat.params` and `chat.headers` and needs its own todo
+with upstream key-set verification. It is instead PINNED where a gate sees it —
+the test asserts the model-only match currently injects nothing, with a message
+saying that closing the seam is a fix and this assertion must then be updated. A
+recorded seam that fails on repair beats a comment nobody reads.
+
+CRITERION 15 — the Windows G6 half, disclosed in both places
+
+Asserted: `crates/oc-process/tests/windows_containment.rs` really opens with
+`#![cfg(windows)]` and `containment.rs` with `#![cfg(target_os = "linux")]`;
+`README.md` contains the test's file name, the words NOT EXECUTED, and the G6 row
+"PASS on Linux; Windows half unexecuted"; and at least one committed artefact in
+`.omo/evidence/` names both `windows_containment.rs` and NOT EXECUTED.
+
+  criterion 15: the Windows G6 half is disclosed as NOT EXECUTED in README.md and
+  in 2 evidence artefact(s): ["task-126-opencode-rust.txt",
+  "task-133-opencode-rust.txt"]
+
+`task-121-opencode-rust.txt:87` also says "NOT EXECUTED" but never names
+`windows_containment.rs`, so it does not satisfy the test's two-condition filter.
+That is the filter working as intended: a disclosure that does not name the file
+a reader would have to run is not a disclosure a reader can act on.
+
+THIS HOST IS LINUX. `crates/oc-process/tests/windows_containment.rs` was NOT
+EXECUTED here and is NOT reported as passing. The Windows Job-object containment
+half of G6 needs native Windows CI or a Windows machine before G6 can be called
+cross-platform. The Linux half — clean shutdown, parent SIGKILL, interactive PTY
+reads and terminal Ctrl-C — does pass here.
+
+  MUTATION E. Remove the disclosure from README ("NOT EXECUTED" -> "not run"):
+
+    panicked at crates/oc-cli/tests/docs.rs:162
+    test result: FAILED. 0 passed; 1 failed
+
+  MUTATION F. Change the source gate (`#![cfg(windows)]` ->
+  `#![cfg(all(windows, not(test)))]`):
+
+    crates/oc-process/tests/windows_containment.rs must open with
+    `#![cfg(windows)]`. The narrowing's honesty rests on which host each half can
+    run on; a changed gate makes the README's disclosure a false statement.
+    test result: FAILED. 0 passed; 1 failed
+
+  Both mutations were reverted.
+
+F2 BLOCKER 2 — the PTY expiry assertion passed for the WRONG REASON
+
+Two independent defects, both fixed.
+
+DEFECT 1, the one F2 reported. The fixture issued the stale ticket with
+`TicketScope::for_session`, whose `directory` is `None`, while `pty::connect`
+redeems with `Some("/repo")` (`crates/oc-server/src/api/pty.rs:144-163`). The
+route returned 403 on the SCOPE MISMATCH, so the assertion held with expiry
+enforcement removed entirely.
+
+DEFECT 2, found while fixing the first and not previously reported.
+`prune_expired` (`crates/oc-pty/src/ticket.rs:194-201`) sweeps from the FRONT
+only. That is CORRECT in production — `issue` always stamps `Instant::now()`, so
+the queue is ordered oldest-first and a non-expired front implies no expired
+entry — but a back-dated ticket pushed behind a fresher one escapes the sweep
+entirely. My first fixed draft did exactly that and returned 400: the ticket
+minted earlier in the test was still outstanding in front of it. This is NOT a
+production defect and is NOT reported as one; it is a constraint the test must
+respect to be meaningful, and `consume_at` performing no per-entry age check is
+what makes the FIFO invariant load-bearing.
+
+THE FIX. The expiry block now runs LAST, after the single-use and replay
+assertions have drained the queue, and it asserts `tickets().is_empty()` first so
+the stale ticket is provably the oldest — the ordering production guarantees. A
+`probe` ticket is then issued with the hand-built production scope and redeemed
+successfully (400 at the WebSocket upgrade, not 403), which PROVES the scope
+matches production before the stale ticket is trusted to fail for expiry. Only
+then is the back-dated ticket redeemed and required to be 403.
+
+  MUTATION G (THE REQUIRED DEMONSTRATION). `prune_expired` replaced with a no-op:
+
+    fn prune_expired(_entries: &mut VecDeque<Entry>, _ttl: Duration, _now: Instant) {}
+
+  The FIXED test fails:
+
+    thread 'api_pty_connect_requires_a_single_use_unexpired_ticket_without_echoing_it'
+    panicked at crates/oc-server/tests/api.rs:1073:5:
+    assertion `left == right` failed: a ticket older than the 60s TTL must be
+    refused. Its scope matches the route exactly — proven by the probe above — so
+    expiry is the only thing left that can reject it, and removing `prune_expired`
+    turns this into a 400.
+      left: 400
+     right: 403
+    test result: FAILED. 0 passed; 1 failed; 32 filtered out
+
+  The ORIGINAL test, under the SAME mutation, still passes — which is the proof
+  it never guarded expiry:
+
+    === ORIGINAL TEST + MUTATION (proving it passed for the wrong reason) ===
+    test api_pty_connect_requires_a_single_use_unexpired_ticket_without_echoing_it ... ok
+    test result: ok. 1 passed; 0 failed; 32 filtered out
+
+  `crates/oc-pty/src/ticket.rs` was restored byte-for-byte (`git diff` empty) and
+  the fixed test re-run green. The store-level unit guard
+  `ticket::tests::an_expired_ticket_is_rejected_and_pruned` was left untouched as
+  the independent library check.
+
+CRITERION 11 — two consecutive compactions
+
+`goal_survives_two_consecutive_compactions_with_objective_and_counters_intact`
+drives `select_boundary` TWICE. One compaction cannot distinguish a goal genuinely
+re-derived from SQL from one that survived because a stale in-memory copy was
+still reachable; the second boundary is what proves the first regeneration did not
+consume its source. Each round asserts the injection carries the objective before
+compaction, that the injection is NOT `preserve_initial` (otherwise the test would
+prove nothing, since preserved context is never summarized away), and that the
+selected boundary really discarded the injected goal entry at index 1. After both
+rounds: the objective is unchanged, `tokens_used` is exactly 2200 and
+`time_used_seconds` exactly 50 (1500+350+350 and 30+10+10), the status is still
+Active, the persistent failure streak is still
+`{signal: "waiting on review", consecutive_turns: 1}`, and a third injection
+rendered from SQL still carries the objective.
+
+EVERY NEW HELPER HAS A CALL SITE
+
+Checked deliberately, because a helper with no caller is the same lie as a test
+that does not assert. `supported_spec` is called by `installed_package`, by
+`js_real_supported_plugins_load_with_their_own_sdk_clients` (twice), by the
+criterion-6 convergence test and by the header test; `installed_package` by three
+tests; `kiro_headers` three times inside the header test; `kiro_model` and
+`kiro_provider` by the header test (`kiro_provider` twice, once through the
+`..kiro_provider()` foreign-provider struct update); `REAL_USER_CASE` by both the
+matrix builder and the criterion-2 pin; `FROZEN_API_GAPS` by the criterion-4 test;
+`divergence::NON_PURE_PLUGIN_TREES_ID` by the criterion-2 pin and by
+`behavioural_differences`; `NON_PURE_AGENT_TREE_BYTES` and
+`NON_PURE_COMMAND_TREE_BYTES` by both. Clippy at zero warnings confirms no
+`never used`.
+
+VERIFICATION
+
+  $ cargo fmt --all --check
+  FMT CLEAN
+
+  $ cargo metadata --locked --offline --format-version 1
+  METADATA CLEAN
+
+  $ cargo clippy --workspace --all-targets --offline
+  Finished `dev` profile — 0 warnings, 0 errors
+
+  $ OC_MEMORY_GATE_MODE=skip cargo test --workspace --offline
+  3312 passed; 0 failed; 2 ignored, across 206 test-result lines
+
+The count went 3306 -> 3312: the six tests listed above. The two ignored are the
+pre-existing `#[ignore]`d soak gate and one doctest; neither was added or changed
+here.
+
+ORDERING NOTE. The workspace suite was run TWICE and the figure above is from the
+SECOND run. Two documentation tests read `.omo/evidence/` as an input — the
+criterion-15 pin scans it for the disclosure, and
+`readme_publishes_the_newest_measured_memory_figures_not_a_remembered_one`
+discovers G1/G2 artefacts there by filename — so a run that predates this very
+file is not a run of the committed tree. The first run's figures happened to be
+identical, but reporting them would have been a claim about a tree that did not
+exist yet. Clippy, `fmt --check` and `cargo metadata` were likewise re-run after
+this file reached its final content.
+
+FROZEN SURFACES UNTOUCHED
+
+No change to `crates/oc-testkit/src/perf/**`, `docs/perf-methodology.md`,
+`benchmarks/ts-baseline.json`, or
+`crates/oc-testkit/tests/{memory,soak,backpressure}.rs`. No change to
+`crates/oc-server/src/api/**` or `crates/oc-cli/src/cmd/serve.rs`, which todo 131
+owns; the only `oc-server` production edit is the `KIRO` version constant in
+`compat_v1.rs`. The `compared`/`exempted` count assertions in `compat_suite.rs`
+were deliberately left alone. No permission/question broker was implemented —
+that is todo 132. Generated documentation blocks were regenerated with
+`OC_DOCS_REGENERATE=1`, never hand-edited. Neither the ~100-minute memory gate nor
+the two-hour soak was run; `OC_MEMORY_GATE_MODE=skip` was set as instructed. No
+test was weakened, skipped, `#[ignore]`d or deleted; every temporary mutation was
+reverted and re-verified. Nothing was pushed or merged.

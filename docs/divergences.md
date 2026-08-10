@@ -1,15 +1,17 @@
 # Divergences
 
-Twelve deliberate differences from upstream `opencode` 1.18.13. Each one is a
+Thirteen deliberate differences from upstream `opencode` 1.18.13. Each one is a
 **decision**, not an omission: a surface that is merely unimplemented is a gap,
 recorded in the compatibility report's `known_gaps` and listed in the
 [compatibility matrix](compatibility-matrix.md), never here.
 
 This page is the **single place** a behavioural difference is declared. Four of the
-twelve arrived late, in plan todo 119: they had been recorded in
+thirteen arrived late, in plan todo 119: they had been recorded in
 `compat_suite.rs::nominated_divergences`, a second structure that asserted they
 stayed *out* of the allow-list, so a reader consulting this page could not learn
-about them and no gate could fail while they went undeclared.
+about them and no gate could fail while they went undeclared. The thirteenth
+arrived in plan todo 133, which declared what success criterion 2's narrowing to
+pure mode leaves out — because a narrowing nothing declares is a waiver.
 
 ## How this page cannot drift
 
@@ -98,6 +100,12 @@ each entry's stated reason. Do not edit it by hand.
 **Surface.** post-edit formatter execution — the file's bytes after a formatter exits non-zero
 
 **Why.** Upstream inspects the exit code and only logs: `if (result && result.exitCode !== 0) yield* Effect.logError("failed", …)`, with a spawn failure mapped to `undefined` and the loop continuing (`packages/opencode/src/format/index.ts:73-114`). Nothing is snapshotted or written back, so whatever a failing formatter left on disk — including a truncated file — stands. This port keeps the bytes the edit wrote and restores them when a formatter exits non-zero, reports `editRestored` in the tool metadata and says so in the tool output. The cost is deliberate: useful partial work from a formatter that exits non-zero after reformatting is discarded.
+
+### non-pure-plugin-generated-trees
+
+**Surface.** `debug config` without `OPENCODE_PURE` — the `agent` and `command` trees a third-party JS plugin synthesises
+
+**Why.** Success criterion 2 was NARROWED on 2026-08-09 to require byte-identical merged configuration in pure mode (`OPENCODE_PURE=1`), where neither binary loads external plugins. Without pure mode the released 1.18.15 binary's own plugin set writes generated entries into the merged config that this port does not reproduce: measured on the user's real `/config/.config/opencode/opencode.json`, a 221818-byte `agent` tree and a 17970-byte `command` tree, against empty `agent` and `command` objects here. Reproducing them means re-implementing third-party plugin output rather than the config contract, so it is a decision and not a gap — and declaring it with its measured sizes is what makes a *new* non-pure difference a failure instead of one absorbed into a vague inequality.
 <!-- generated:END divergence-detail -->
 
 ## What is deliberately not on this page

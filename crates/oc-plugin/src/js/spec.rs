@@ -286,8 +286,8 @@ impl ResolvedJsPlugin {
     ///
     /// Advisory only. Kiro declares `auth, event, chat.headers` while its code
     /// registers `config, chat.headers, auth, provider`
-    /// (`@sunerpy/opencode-kiro-auth@0.20.1/package.json:56-63` vs
-    /// `dist/plugin.js:67,389,408,424`), so the manifest cannot be the dispatch
+    /// (`@sunerpy/opencode-kiro-auth@0.20.6/package.json:56-63` vs
+    /// `dist/plugin.js:68,389,408,424`), so the manifest cannot be the dispatch
     /// authority — the loaded object is.
     #[must_use]
     pub fn declared_hooks(&self) -> &[String] {

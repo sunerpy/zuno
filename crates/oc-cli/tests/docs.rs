@@ -1345,6 +1345,77 @@ fn readme_reports_every_non_functional_gate_with_its_opt_in_command() {
     );
 }
 
+/// Success criterion 15's narrowing: G6's Windows half, disclosed in both places.
+///
+/// The narrowing accepts a Linux-only G6 execution *provided* the Windows half is
+/// implemented in source behind a `cfg(windows)` test and the unexecuted state is
+/// stated in `README.md` **and** in the evidence. That makes it a disclosure
+/// requirement rather than a waiver, so all three halves are asserted here:
+/// the source gate really is `#![cfg(windows)]` (a test that silently started
+/// running everywhere would make the disclosure false), the README says so, and at
+/// least one committed evidence artefact says so too. Deleting the sentence from
+/// either document fails this test.
+#[test]
+fn criterion_15_states_the_windows_g6_half_is_not_executed_in_the_readme_and_the_evidence() {
+    const WINDOWS_TEST: &str = "crates/oc-process/tests/windows_containment.rs";
+    const LINUX_TEST: &str = "crates/oc-process/tests/containment.rs";
+    const DISCLOSURE: &str = "NOT EXECUTED";
+
+    let root = workspace_root();
+    for (relative, gate) in [
+        (WINDOWS_TEST, "#![cfg(windows)]"),
+        (LINUX_TEST, "#![cfg(target_os = \"linux\")]"),
+    ] {
+        let source = std::fs::read_to_string(root.join(relative))
+            .unwrap_or_else(|error| panic!("read {relative}: {error}"));
+        assert!(
+            source.starts_with(gate),
+            "{relative} must open with `{gate}`. The narrowing's honesty rests on which host each \
+             half can run on; a changed gate makes the README's disclosure a false statement."
+        );
+    }
+
+    contains_all(
+        "README.md",
+        &[
+            WINDOWS_TEST.rsplit('/').next().expect("the test file name"),
+            DISCLOSURE,
+            "PASS on Linux; Windows half unexecuted",
+        ],
+    );
+
+    let dir = root.join(EVIDENCE_DIR);
+    let mut disclosing = Vec::new();
+    for entry in
+        std::fs::read_dir(&dir).unwrap_or_else(|error| panic!("read {}: {error}", dir.display()))
+    {
+        let path = entry.expect("an evidence entry must be readable").path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(EVIDENCE_PREFIX) || !name.ends_with(EVIDENCE_SUFFIX) {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        if text.contains("windows_containment.rs") && text.contains(DISCLOSURE) {
+            disclosing.push(name.to_owned());
+        }
+    }
+    assert!(
+        !disclosing.is_empty(),
+        "no artefact in {} states that {WINDOWS_TEST} is {DISCLOSURE}. Criterion 15's narrowing \
+         requires the unexecuted state in the evidence as well as the README, so that nobody \
+         reads a Linux-only G6 result as a cross-platform one.",
+        dir.display()
+    );
+    eprintln!(
+        "criterion 15: the Windows G6 half is disclosed as {DISCLOSURE} in README.md and in {} \
+         evidence artefact(s): {disclosing:?}",
+        disclosing.len()
+    );
+}
+
 #[test]
 fn readme_links_every_page_this_target_checks() {
     contains_all(

@@ -31,7 +31,7 @@ whenever an unknown-route 404 tells you to (see "Unknown-route accounting").
 | plugin | evidence | runtime entry point |
 | --- | --- | --- |
 | `opencode-antigravity-auth@1.6.0` | `/config/.config/opencode/opencode.json:88` | `…/opencode-antigravity-auth@1.6.0/node_modules/opencode-antigravity-auth/dist/index.js` (`package.json:5`) |
-| `@sunerpy/opencode-kiro-auth@0.20.1` | `/config/.config/opencode/opencode.json:90` | `…/@sunerpy/opencode-kiro-auth@0.20.1/node_modules/@sunerpy/opencode-kiro-auth/dist/index.js` (`package.json:6`) |
+| `@sunerpy/opencode-kiro-auth@0.20.6` | `/config/.config/opencode/opencode.json:90` | `…/@sunerpy/opencode-kiro-auth@0.20.6/node_modules/@sunerpy/opencode-kiro-auth/dist/index.js` (`package.json:6`) |
 | `@sunerpy/oh-my-openagent@4.21.0` | `/config/.config/opencode/opencode.json:91` | `…/@sunerpy/oh-my-openagent@4.21.0/node_modules/@sunerpy/oh-my-openagent/dist/index.js` (`package.json:5`) |
 
 Cache paths are rooted at `/config/.cache/opencode/packages/`. Line 89 of the
@@ -49,7 +49,7 @@ and the generated SDK requests those bare paths directly
 (`packages/sdk/js/src/gen/sdk.gen.ts:437,553,607,617,725,743,759,1120`).
 
 Plugin short names: **AG** = `opencode-antigravity-auth@1.6.0`,
-**KIRO** = `@sunerpy/opencode-kiro-auth@0.20.1`,
+**KIRO** = `@sunerpy/opencode-kiro-auth@0.20.6`,
 **OMO** = `@sunerpy/oh-my-openagent@4.21.0`.
 
 | # | verb + path | SDK method | plugin | callsite |

@@ -47,7 +47,26 @@ use crate::error::{Result, TestkitError};
 /// (`compat_suite.rs::nominated_divergences`) that positively asserted they stayed
 /// *out* of the allow-list. Two of the six nominations were merged into entries
 /// that already covered them rather than declared twice.
-pub const DECLARED_COUNT: usize = 12;
+///
+/// Went from twelve to thirteen in plan todo 133, which declared the non-pure
+/// plugin-generated `agent` and `command` trees that success criterion 2's
+/// narrowing puts out of scope. A narrowing nothing declares is a waiver, so the
+/// entry carries the measured tree sizes and
+/// [`NON_PURE_PLUGIN_TREES_ID`] names it for the tests that pin the narrowing.
+pub const DECLARED_COUNT: usize = 13;
+
+/// The entry declaring criterion 2's narrowing to pure mode.
+pub const NON_PURE_PLUGIN_TREES_ID: &str = "non-pure-plugin-generated-trees";
+
+/// The `agent` tree size, in bytes, the released binary's plugins synthesise.
+///
+/// Measured on the user's real global config in Final-Wave report
+/// `.omo/evidence/F1-REPORT-wave2.md`. Restated here so the declared divergence
+/// carries a number a later measurement can contradict.
+pub const NON_PURE_AGENT_TREE_BYTES: usize = 221_818;
+
+/// The `command` tree size, in bytes, from the same measurement.
+pub const NON_PURE_COMMAND_TREE_BYTES: usize = 17_970;
 
 /// The allow-list's path, relative to the workspace root.
 pub const RELATIVE_PATH: &str = "docs/divergences.toml";

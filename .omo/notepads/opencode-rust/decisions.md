@@ -6511,3 +6511,30 @@ retyping, so it cannot invert again.
 127/128, so the API surface — and therefore the 35/23 split — differed. Rebased
 onto 1dee81c, auto-merged `README.md` with no conflict markers, then validated:
 3,294 workspace tests pass (main's 3,292 plus the two added here).
+
+## Wave 47 — todo 133
+
+- **Declared the thirteenth divergence, `non-pure-plugin-generated-trees`**, and
+  bumped `DECLARED_COUNT` 12 -> 13. Criterion 2's narrowing to `OPENCODE_PURE=1`
+  excludes the released binary's plugin-synthesised trees; the entry states both
+  measured sizes (221818-byte `agent`, 17970-byte `command`) so a later measurement
+  can contradict it. A narrowing nothing declares is a waiver, and an entry without
+  a number is a shrug.
+- **Did NOT fix the `chat_context_value` `providerID` seam here.** Correcting it
+  changes the plugin wire contract for both `chat.params` and `chat.headers` and
+  needs its own todo with upstream key-set verification. It is pinned by an
+  assertion whose failure message says closing the seam is a fix and the assertion
+  must then be updated — a recorded seam that fails on repair beats a comment.
+- **Did NOT assert the Kiro `effort` field.** It is resolved inside the plugin's own
+  AWS SDK client on an outbound request, which needs live credentials and network
+  this suite forbids by construction. The header half is asserted against the real
+  plugin; the effort half is stated as unverified rather than faked.
+- **Criterion 4's gap set is frozen by NAME in `FROZEN_API_GAPS`, and that list is
+  the thing todo 132 must edit.** Backing the four permission/question reply and
+  reject routes must remove those entries in the same commit, dropping the set to
+  ten. The existing `compared`/`exempted` count assertions were left untouched
+  because todo 131 may move them.
+- **The Windows G6 half remains NOT EXECUTED on this Linux host**, now enforced:
+  the `#![cfg(windows)]` gate on `windows_containment.rs`, the README disclosure,
+  and at least one evidence artefact stating it are all asserted, so deleting the
+  disclosure from either document fails a test.
