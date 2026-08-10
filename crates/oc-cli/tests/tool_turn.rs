@@ -77,6 +77,8 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What the executed `write` call must leave on disk.
 const WRITTEN_CONTENT: &str = "the tool ran\n";
+const ANTIGRAVITY_SPEC: &str = "opencode-antigravity-auth@1.6.0";
+const ANTIGRAVITY_TOOL: &str = "google_search";
 
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_opencode-rust"))
@@ -127,6 +129,16 @@ fn provider_config(base_url: &str) -> String {
     .to_string()
 }
 
+fn plugin_provider_config(base_url: &str, deny_plugin_tool: bool) -> String {
+    let mut config: serde_json::Value =
+        serde_json::from_str(&provider_config(base_url)).expect("provider config is JSON");
+    config["plugin"] = serde_json::json!([ANTIGRAVITY_SPEC]);
+    if deny_plugin_tool {
+        config["permission"] = serde_json::json!({ ANTIGRAVITY_TOOL: "deny" });
+    }
+    config.to_string()
+}
+
 fn variables(env: &ScriptedEnv, base_url: &str) -> BTreeMap<String, String> {
     let mut variables = env.env_vars();
     variables.extend([
@@ -165,6 +177,37 @@ async fn run_prompt(env: &ScriptedEnv, base_url: &str, prompt: &str) -> Output {
         .await
         .expect("the run must finish inside its budget")
         .expect("launch opencode-rust run")
+}
+
+async fn run_plugin_prompt(
+    env: &ScriptedEnv,
+    base_url: &str,
+    prompt: &str,
+    deny_plugin_tool: bool,
+) -> Output {
+    let mut plugin_variables = variables(env, base_url);
+    plugin_variables.remove("OPENCODE_PURE");
+    plugin_variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
+    plugin_variables.insert(
+        "MISE_DATA_DIR".to_owned(),
+        "/config/.local/share/mise".to_owned(),
+    );
+    plugin_variables.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+    plugin_variables.insert(
+        "OPENCODE_CONFIG_CONTENT".to_owned(),
+        plugin_provider_config(base_url, deny_plugin_tool),
+    );
+
+    let mut command = tokio::process::Command::new(binary());
+    command
+        .args(["run", "--model", "test/test-model", prompt])
+        .current_dir(env.working_dir())
+        .env_clear()
+        .envs(plugin_variables);
+    tokio::time::timeout(Duration::from_secs(90), command.output())
+        .await
+        .expect("the plugin-backed run must finish inside its budget")
+        .expect("launch plugin-backed opencode-rust run")
 }
 
 /// Every `tools[].function.name` the binary advertised in a captured request.
@@ -326,6 +369,56 @@ fn write_tool_call_response(recorded: &str, target: &Path) -> MockResponse {
     )
 }
 
+fn plugin_tool_call_response(recorded: &str) -> MockResponse {
+    rewrite_tool_call_response(
+        recorded,
+        ANTIGRAVITY_TOOL,
+        serde_json::json!({
+            "query": "production registry sentinel",
+            "intent": "prove the real plugin tool executes"
+        }),
+        "the real antigravity tool is the acceptance target; only the function name and its arguments differ from the recorded framing",
+    )
+}
+
+fn rewrite_tool_call_response(
+    recorded: &str,
+    tool: &str,
+    arguments: serde_json::Value,
+    reason: &str,
+) -> MockResponse {
+    let arguments = arguments.to_string();
+    let mut rewritten = String::new();
+    for frame in recorded.split("\n\n") {
+        let Some(payload) = frame.strip_prefix("data: ") else {
+            continue;
+        };
+        if payload.trim() == "[DONE]" {
+            rewritten.push_str("data: [DONE]\n\n");
+            continue;
+        }
+        let mut chunk: serde_json::Value =
+            serde_json::from_str(payload).expect("every recorded frame is JSON");
+        let fragment = has_tool_call_fragment(&chunk);
+        let named = chunk
+            .pointer("/choices/0/delta/tool_calls/0/function/name")
+            .is_some();
+        if named {
+            let call = chunk
+                .pointer_mut("/choices/0/delta/tool_calls/0")
+                .expect("the frame that names a function has the call");
+            call["function"]["name"] = serde_json::Value::String(tool.to_owned());
+            call["function"]["arguments"] = serde_json::Value::String(arguments.clone());
+        } else if fragment {
+            continue;
+        }
+        rewritten.push_str("data: ");
+        rewritten.push_str(&serde_json::to_string(&chunk).expect("the frame re-serializes"));
+        rewritten.push_str("\n\n");
+    }
+    MockResponse::authored(200, "text/event-stream; charset=utf-8", rewritten, reason)
+}
+
 /// Whether a frame carries an arguments-only `tool_calls` fragment.
 fn has_tool_call_fragment(chunk: &serde_json::Value) -> bool {
     chunk.pointer("/choices/0/delta/tool_calls").is_some()
@@ -392,6 +485,128 @@ async fn tool_turn_executes_a_real_tool_and_the_side_effect_lands_on_disk() {
             Some(ResponseOrigin::Authored { .. })
         ),
         "the rewritten first response must be reported as authored"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_real_plugin_tool_reaches_and_executes_through_the_production_registry() {
+    let installed = Path::new("/config/.cache/opencode/packages")
+        .join(ANTIGRAVITY_SPEC)
+        .join("node_modules/opencode-antigravity-auth");
+    if !installed.is_dir() {
+        eprintln!(
+            "SKIPPED a_real_plugin_tool_reaches_and_executes_through_the_production_registry: {} is absent",
+            installed.display()
+        );
+        return;
+    }
+    let env = ScriptedEnv::new().expect("isolated environment");
+    let player = CassettePlayer::from_oracle(CASSETTE).expect("the recorded tool loop loads");
+    let mut interactions = player.cassette().http_interactions();
+    let first = interactions.next().expect("the tool-call interaction");
+    let second = interactions.next().expect("the continuation interaction");
+    let recorded_first = String::from_utf8(
+        first
+            .response
+            .decoded_body(CASSETTE, 1)
+            .expect("the recorded body decodes"),
+    )
+    .expect("the recorded body is UTF-8");
+    let scenario = Scenario::new("real-plugin-tool-loop")
+        .on_path("/v1/chat/completions")
+        .from_oracle_cassette(TITLE_CASSETTE)
+        .expect("the recorded title completion loads")
+        .respond(plugin_tool_call_response(&recorded_first))
+        .respond(
+            MockResponse::from_recorded(CASSETTE, 2, second).expect("the continuation decodes"),
+        );
+    let provider = MockProvider::start(vec![scenario])
+        .await
+        .expect("mock provider binds loopback");
+
+    let output = run_plugin_prompt(
+        &env,
+        provider.base_url(),
+        "Use the plugin search tool.",
+        false,
+    )
+    .await;
+    let captured = provider.captured().await;
+    provider.shutdown().await;
+
+    assert!(
+        output.status.success(),
+        "plugin-backed run failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(captured.len(), REQUESTS_FOR_ONE_TOOL_TURN);
+    let offered = advertised_tools(&captured[1].json().expect("first turn request is JSON"));
+    assert!(
+        offered.iter().any(|name| name == ANTIGRAVITY_TOOL),
+        "the real plugin's tool hook never reached the production registry: {offered:?}"
+    );
+    let continuation = captured[2]
+        .json()
+        .expect("the continuation request is JSON");
+    let tool_result = continuation
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|messages| {
+            messages.iter().find(|message| {
+                message.get("role").and_then(serde_json::Value::as_str) == Some("tool")
+            })
+        })
+        .and_then(|message| message.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        tool_result.contains("Not authenticated with Antigravity"),
+        "the model call did not execute antigravity's own google_search implementation; result={tool_result:?}, body={continuation:#}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_plugin_tool_is_hidden_by_the_same_permission_layer_as_builtins() {
+    let installed = Path::new("/config/.cache/opencode/packages")
+        .join(ANTIGRAVITY_SPEC)
+        .join("node_modules/opencode-antigravity-auth");
+    if !installed.is_dir() {
+        eprintln!(
+            "SKIPPED a_plugin_tool_is_hidden_by_the_same_permission_layer_as_builtins: {} is absent",
+            installed.display()
+        );
+        return;
+    }
+    let env = ScriptedEnv::new().expect("isolated environment");
+    let scenario = Scenario::new("denied-plugin-tool")
+        .from_oracle_cassette(TITLE_CASSETTE)
+        .expect("the recorded title completion loads")
+        .from_oracle_cassette(TITLE_CASSETTE)
+        .expect("the recorded turn completion loads");
+    let provider = MockProvider::start(vec![scenario])
+        .await
+        .expect("mock provider binds loopback");
+
+    let output = run_plugin_prompt(&env, provider.base_url(), "Answer without tools.", true).await;
+    let captured = provider.captured().await;
+    provider.shutdown().await;
+
+    assert!(
+        output.status.success(),
+        "permission-gated run failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(captured.len(), 2, "title plus one ordinary turn");
+    let offered = advertised_tools(&captured[1].json().expect("turn request is JSON"));
+    assert!(
+        offered.iter().any(|name| name == "bash"),
+        "the control built-in must remain visible: {offered:?}"
+    );
+    assert!(
+        !offered.iter().any(|name| name == ANTIGRAVITY_TOOL),
+        "a user deny must hide a plugin tool exactly as it hides a built-in: {offered:?}"
     );
 }
 

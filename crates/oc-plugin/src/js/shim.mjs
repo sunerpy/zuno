@@ -644,7 +644,7 @@ function describeTool(id, definition) {
       typeof definition.description === "string" ? definition.description : null,
     args,
     execute:
-      typeof definition.execute === "function" ? retain(definition.execute) : null,
+      typeof definition.execute === "function" ? encode(definition.execute) : null,
   };
 }
 

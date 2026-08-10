@@ -58,6 +58,8 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
             max_output: 0,
         },
         notes: Vec::new(),
+        plugin_tools: Vec::new(),
+        plugins: None,
     }
 }
 

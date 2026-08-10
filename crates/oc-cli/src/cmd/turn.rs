@@ -121,6 +121,8 @@ pub(crate) struct TurnPlan {
     internals: Internals,
     window: TokenWindow,
     notes: Vec<String>,
+    plugin_tools: Vec<Arc<dyn oc_tool::Tool>>,
+    plugins: Option<super::plugin_runtime::PluginRuntime>,
 }
 
 impl TurnPlan {
@@ -143,7 +145,7 @@ impl TurnPlan {
         let project = oc_paths::project::resolve_project(&directory);
         let worktree = project.vcs.as_ref().map(|_| project.directory.clone());
         let layout = oc_paths::Layout::resolve(env);
-        let config =
+        let mut config =
             oc_config::discovery::discover_with(&oc_config::discovery::DiscoveryOptions::new(
                 &directory,
                 worktree.as_deref(),
@@ -158,6 +160,19 @@ impl TurnPlan {
             .load()
             .await
             .map_err(to_string)?;
+        let plugins = super::plugin_runtime::PluginRuntime::load(
+            &config,
+            &project,
+            &directory,
+            worktree.as_deref().unwrap_or(directory.as_path()),
+            &layout,
+            env.flag(crate::OPENCODE_PURE),
+            "turn",
+        )
+        .await;
+        if let Some(plugins) = &plugins {
+            plugins.apply_config(&mut config).await?;
+        }
         let input = ResolveInput::new()
             .with_config(&config)
             .with_credentials(credentials.clone())
@@ -167,7 +182,19 @@ impl TurnPlan {
                     .collect(),
             )
             .with_experimental_models(env.flag(OPENCODE_ENABLE_EXPERIMENTAL_MODELS));
-        let catalog = Catalog::resolve(loaded.document(), &input);
+        let mut catalog = Catalog::resolve(loaded.document(), &input);
+        if let Some(plugins) = &plugins {
+            plugins.apply_catalog(&mut catalog, &credentials).await?;
+        }
+        let plugin_tools = match &plugins {
+            Some(plugins) => plugins
+                .tools()
+                .await?
+                .into_iter()
+                .map(|(_, tool)| tool)
+                .collect(),
+            None => Vec::new(),
+        };
 
         let agents =
             oc_catalog::agent::load(&directory, worktree.as_deref(), env).map_err(to_string)?;
@@ -227,6 +254,8 @@ impl TurnPlan {
             internals,
             window,
             notes,
+            plugin_tools,
+            plugins,
         })
     }
 }
@@ -399,6 +428,7 @@ pub(crate) struct TurnHost {
     compaction_state: CompactionState,
     window: TokenWindow,
     notes: Vec<String>,
+    _plugins: Option<super::plugin_runtime::PluginRuntime>,
 }
 
 /// The registry answering for whichever spec an internal agent resolved to.
@@ -481,6 +511,7 @@ impl TurnHost {
                 provider_id: &plan.provider_id,
                 model_id: &plan.model_id,
                 question,
+                plugin_tools: &plan.plugin_tools,
             },
         )?;
         let dispatcher = ToolRegistryDispatcher::new(
@@ -506,6 +537,7 @@ impl TurnHost {
             compaction_state: CompactionState::default(),
             window: plan.window,
             notes: plan.notes,
+            _plugins: plan.plugins,
         })
     }
 

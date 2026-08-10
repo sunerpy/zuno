@@ -43,7 +43,9 @@ use oc_permission::visibility::permission_key;
 use oc_tool::{PermissionAsk, PermissionAsker, Tool, erase};
 use oc_tools::exposure::ExposureFlags;
 use oc_tools::question::{QuestionAsker, QuestionTool};
-use oc_tools::registry::{BuiltinSlot, RegistryFlags, ResolveInput, ToolRegistryBuilder};
+use oc_tools::registry::{
+    BuiltinSlot, CustomTool, CustomToolLoader, RegistryFlags, ResolveInput, ToolRegistryBuilder,
+};
 use oc_tools::search_common::{SearchScope, SearchTooling};
 use oc_tools::websearch::gating::SearchConfig;
 use oc_tools::{FileTools, MemoryTool, ScopePaths};
@@ -60,6 +62,7 @@ pub(crate) struct ToolSelection<'a> {
     pub(crate) provider_id: &'a str,
     pub(crate) model_id: &'a str,
     pub(crate) question: Option<Arc<dyn QuestionAsker>>,
+    pub(crate) plugin_tools: &'a [Arc<dyn Tool>],
 }
 
 /// Assemble the registry for `agent` and project it onto `provider_id`/`model_id`.
@@ -134,6 +137,9 @@ pub(crate) fn assemble(
             .register_builtin(slot, tool)
             .map_err(|error| error.to_string())?;
     }
+    builder = builder.with_custom_loader(Arc::new(ProductionCustomTools {
+        plugin_tools: selection.plugin_tools.to_vec(),
+    }));
 
     let registry = builder.build();
     let mut tools = registry.resolve(ResolveInput::new(
@@ -146,6 +152,20 @@ pub(crate) fn assemble(
         tools.push(memory);
     }
     Ok(ToolRuntime { tools, rules })
+}
+
+struct ProductionCustomTools {
+    plugin_tools: Vec<CustomTool>,
+}
+
+impl CustomToolLoader for ProductionCustomTools {
+    fn config_directory_tools(&self, _directories: &[std::path::PathBuf]) -> Vec<CustomTool> {
+        Vec::new()
+    }
+
+    fn plugin_tools(&self) -> Vec<CustomTool> {
+        self.plugin_tools.clone()
+    }
 }
 
 fn configured_memory_tool(root: &Path, config: &Config) -> Option<Arc<dyn Tool>> {

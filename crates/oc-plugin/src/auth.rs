@@ -70,7 +70,7 @@ pub trait AuthLoader: Send + Sync {
     async fn load(
         &self,
         auth: &dyn AuthCredentialResolver,
-        provider: &ResolvedProvider,
+        provider: &mut ResolvedProvider,
     ) -> Result<JsonMap, BoxSource>;
 }
 

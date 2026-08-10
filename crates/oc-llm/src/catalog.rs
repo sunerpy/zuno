@@ -253,6 +253,11 @@ impl Catalog {
         self.providers.get(id)
     }
 
+    /// One provider by id, for a production extension loader that mutates it.
+    pub fn provider_mut(&mut self, id: &str) -> Option<&mut ResolvedProvider> {
+        self.providers.get_mut(id)
+    }
+
     /// Replace the models of an already-resolved provider from a plugin hook.
     pub fn replace_provider_models(
         &mut self,

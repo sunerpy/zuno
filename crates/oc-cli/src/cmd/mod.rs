@@ -5,6 +5,7 @@ mod debug;
 mod export;
 mod mcp;
 mod models;
+mod plugin_runtime;
 mod providers;
 mod run;
 mod serve;
