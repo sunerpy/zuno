@@ -38,7 +38,10 @@
 //!   [`every_exemption_states_a_reason_and_keeps_a_witness`] requires the reason to
 //!   be substantive **and** requires a weaker fact — the [`Witness`] — to still be
 //!   observed against the two real processes, so an exemption is never total
-//!   blindness;
+//!   blindness. For the three failure-message surfaces that weaker fact is now the
+//!   two documented texts rather than a shared non-zero exit, and
+//!   [`every_declared_diagnostics_surface_carries_a_two_sided_witness`] keeps it
+//!   that way;
 //! * [`the_comparison_cannot_shrink_into_exemptions`] pins the floor and freezes
 //!   the exempt commands **by name**, so one exemption cannot be traded for another
 //!   while a count stays put;
@@ -84,6 +87,17 @@ const MODELS_CONFIG: &str = r#"{"provider":{"anyapi":{}}}"#;
 const MODELS_FIXTURE_TOKEN: &str = "<MODELS_FIXTURE>";
 /// Placeholder resolved to a port this test holds bound.
 const BUSY_PORT_TOKEN: &str = "<BUSY_PORT>";
+
+/// The part of this port's failed-bind message that names what upstream omits.
+///
+/// The address is asserted through [`BUSY_PORT_TOKEN`], so the witness pins *that
+/// the address the run actually occupied is in the message* rather than a literal
+/// port number. The trailing cause — `Address already in use (os error 98)` — is
+/// deliberately **not** pinned: `98` is Linux's `EADDRINUSE` and the strerror text
+/// is the platform's, so pinning it would make this witness fail on a healthy macOS
+/// or Windows host for a reason that has nothing to do with the divergence. What
+/// the entry promises and a user needs is the address, and that is portable.
+const SUBJECT_BIND_FAILURE: &str = "could not bind HTTP server to 127.0.0.1:<BUSY_PORT>";
 
 /// A session id no database contains, so a probe reaches the handler's not-found
 /// path without needing a fixture.
@@ -134,11 +148,46 @@ impl Stream {
 enum Witness {
     /// Nothing weaker is needed: every stream of this probe is compared.
     FullComparison,
-    /// Both sides refuse, so the command is reachable and fails on both.
-    BothFail,
     /// The oracle's raw stderr contains this fragment, which is what proves the
     /// argv means something else entirely upstream.
     OracleStderrContains(&'static str),
+    /// Both sides refuse, **and** each side's raw stderr carries the text the
+    /// [`DIAGNOSTICS_DIVERGENCE`] entry records for it.
+    ///
+    /// This replaces a weaker tier that asserted only *both sides refuse*. F4's
+    /// fifth-wave review named that gap: a witness which observes nothing but a
+    /// shared non-zero exit "does not directly assert the documented stderr
+    /// texts", so it cannot tell *failing for the reason we declared* apart from
+    /// *failing for some other reason*, and this project has already shipped one
+    /// test that passed for a reason other than the one it claimed. Its only two
+    /// users were exactly the probes of this divergence, so the weaker tier is
+    /// gone rather than left reachable by nothing.
+    ///
+    /// Four facts are observed per probe, because any three of them leave a hole:
+    ///
+    /// 1. both sides still refuse — the fact the weaker tier carried, kept;
+    /// 2. every [`Self::DocumentedDiagnostics::oracle_form`] fragment is in the
+    ///    oracle's stderr, so *upstream's* half of the declaration is measured
+    ///    rather than remembered;
+    /// 3. every [`Self::DocumentedDiagnostics::subject_form`] fragment is in this
+    ///    port's stderr, so the diagnostic this divergence exists to keep cannot
+    ///    quietly regress into upstream's opaque wording;
+    /// 4. **and neither side carries the other's form.** Asserting only (2) would
+    ///    pass if this port degraded to the same opaque text; asserting only (3)
+    ///    would pass if a future release started naming the cause too — at which
+    ///    point the divergence is closed and the entry has to go, which is a
+    ///    failure worth having.
+    DocumentedDiagnostics {
+        /// Fragments the released binary's stderr carries here — the opaque form
+        /// on the two surfaces where it names nothing, and its own wording on the
+        /// argv refusal.
+        oracle_form: &'static [&'static str],
+        /// Fragments this port's stderr carries here: the input, the address or
+        /// the cause upstream omits. [`BUSY_PORT_TOKEN`] is resolved to the port
+        /// the run actually holds, so the address is asserted without a literal
+        /// port number.
+        subject_form: &'static [&'static str],
+    },
 }
 
 /// One invocation, and what is compared about it.
@@ -240,25 +289,61 @@ static PARITY_ROWS: &[ParityRow] = &[
     },
     ParityRow {
         command: "run",
-        probes: &[Probe {
-            argv: &["run"],
-            env: NO_ENV,
-            exit: Stream::Compared,
-            stdout: Stream::Compared,
-            stderr: Stream::Exempt(
-                "the refusal is the same refusal in different words — upstream says `You must \
-                 provide a message or a command`, this port says `a message is required` — and it \
-                 falls under the declared `diagnostics-name-their-cause` divergence. The command's \
-                 real work is not comparable at all: measured on release 1.18.15 under this same \
-                 cleared environment, `run --agent nosuch hi` ANSWERED from the bundled \
-                 `opencode/big-pickle` gateway model with no credential present, so comparing a \
-                 turn means making a live provider call. `oc-testkit` has no HTTP client in its \
-                 dependency graph and `crates/oc-testkit/tests/no_http_client.rs` keeps it that \
-                 way; the turn is compared against recorded traffic in \
-                 `crates/oc-cli/tests/tool_turn.rs` instead.",
-            ),
-            witness: Witness::BothFail,
-        }],
+        probes: &[
+            Probe {
+                argv: &["run"],
+                env: NO_ENV,
+                exit: Stream::Compared,
+                stdout: Stream::Compared,
+                stderr: Stream::Exempt(
+                    "the refusal is the same refusal in different words — upstream says `You must \
+                     provide a message or a command`, this port says `a message is required` — and \
+                     it falls under the declared `diagnostics-name-their-cause` divergence. The \
+                     command's real work is not comparable at all: measured on release 1.18.15 \
+                     under this same cleared environment, `run --agent nosuch hi` ANSWERED from \
+                     the bundled `opencode/big-pickle` gateway model with no credential present, \
+                     so comparing a turn means making a live provider call. `oc-testkit` has no \
+                     HTTP client in its dependency graph and \
+                     `crates/oc-testkit/tests/no_http_client.rs` keeps it that way; the turn is \
+                     compared against recorded traffic in `crates/oc-cli/tests/tool_turn.rs` \
+                     instead.",
+                ),
+                witness: Witness::DocumentedDiagnostics {
+                    oracle_form: &["You must provide a message or a command"],
+                    subject_form: &["a message is required"],
+                },
+            },
+            Probe {
+                argv: &["run", "--model", "bogus/model", "hi"],
+                env: NO_ENV,
+                exit: Stream::Compared,
+                stdout: Stream::Compared,
+                stderr: Stream::Exempt(
+                    "the third surface the declared `diagnostics-name-their-cause` divergence \
+                     names, and the one where the difference is widest. Measured on 1.18.15 under \
+                     this cleared environment, upstream answers an unresolvable model with a JSON \
+                     `UnknownError` whose whole actionable content is `Unexpected server error. \
+                     Check server logs for details.` plus a `ref` that is a fresh random id on \
+                     every run — so the two texts are not two renderings of one message, and \
+                     upstream's is not even byte-stable against itself. This port names the model \
+                     that was asked for, the catalogue state that could not answer it, and the \
+                     three ways to fix it. The witness asserts both halves against both processes, \
+                     so neither a regression to upstream's opaque form nor upstream adopting ours \
+                     can pass as `both still fail`.",
+                ),
+                witness: Witness::DocumentedDiagnostics {
+                    oracle_form: &[
+                        "UnknownError",
+                        "Unexpected server error. Check server logs for details.",
+                    ],
+                    subject_form: &[
+                        "model `bogus/model` is not available",
+                        "Define the provider and model under `provider` in your config",
+                        "OPENCODE_MODELS_PATH to a catalog file on disk",
+                    ],
+                },
+            },
+        ],
     },
     ParityRow {
         command: "serve",
@@ -283,7 +368,10 @@ static PARITY_ROWS: &[ParityRow] = &[
                  because a bare `serve` listens forever: measured on 1.18.15, it never exits, so \
                  there is no output to compare.",
             ),
-            witness: Witness::BothFail,
+            witness: Witness::DocumentedDiagnostics {
+                oracle_form: &["Unexpected error", "ServeError"],
+                subject_form: &[SUBJECT_BIND_FAILURE],
+            },
         }],
     },
     ParityRow {
@@ -328,10 +416,27 @@ static PARITY_ROWS: &[ParityRow] = &[
 /// table actually says.
 const COMMANDS_WITH_EXEMPTIONS: &[&str] = &["run", "serve", "tui"];
 
+/// The three surfaces [`DIAGNOSTICS_DIVERGENCE`] declares, spelled as the argv that
+/// reaches each, frozen **by name**.
+///
+/// The entry names `serve` on an unavailable port, `run` with no message, and `run`
+/// with an unresolvable model. Two of the three had a probe that observed only a
+/// shared non-zero exit and the third had no probe at all, so the declaration
+/// outran what was measured.
+/// [`every_declared_diagnostics_surface_carries_a_two_sided_witness`] compares this
+/// list against the table, and it does so **without running either binary**, so
+/// downgrading a probe back to a weaker witness fails even on a host with no oracle
+/// installed.
+const DIAGNOSTICS_SURFACES: &[&str] = &[
+    "run",
+    "run --model bogus/model hi",
+    "serve --port <BUSY_PORT> --hostname 127.0.0.1",
+];
+
 /// How many probes the comparison runs. Pinned because each probe is one process
 /// per side, so a shrinking count is how a comparison quietly stops covering what
 /// it claims.
-const PROBE_COUNT: usize = 15;
+const PROBE_COUNT: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Running one probe against both binaries
@@ -525,6 +630,67 @@ fn compare(probe: &Probe, busy_port: u16) -> ProbeVerdict {
     }
 }
 
+/// One [`Witness::DocumentedDiagnostics`] row, checked against both processes.
+///
+/// Each fragment is checked in **both** directions — present on the side that
+/// declares it, absent on the other — because one direction alone is the hole F4
+/// found: "both sides fail" is compatible with the two messages having become the
+/// same opaque text, and with upstream having started naming the cause.
+fn documented_diagnostics_hold(
+    command: &str,
+    verdict: &ProbeVerdict,
+    oracle_form: &[&str],
+    subject_form: &[&str],
+    busy_port: u16,
+) {
+    for fragment in oracle_form {
+        let fragment = resolve_busy_port(fragment, busy_port);
+        assert!(
+            verdict.oracle.raw_stderr.contains(&fragment),
+            "`{command}`'s exemption rests on release {} answering {:?} with {fragment:?}, which \
+             `{DIAGNOSTICS_DIVERGENCE}` records. It emitted:\n{}",
+            oc_testkit::PINNED_RELEASE,
+            verdict.argv,
+            verdict.oracle.raw_stderr
+        );
+        assert!(
+            !verdict.subject.raw_stderr.contains(&fragment),
+            "this port answered {:?} with upstream's own {fragment:?}. The exemption exists \
+             *because* this port names what that text omits, so carrying it means the declared \
+             improvement is gone and the stderr comparison should be restored rather than \
+             forgiven. It emitted:\n{}",
+            verdict.argv,
+            verdict.subject.raw_stderr
+        );
+    }
+    for fragment in subject_form {
+        let fragment = resolve_busy_port(fragment, busy_port);
+        assert!(
+            verdict.subject.raw_stderr.contains(&fragment),
+            "`{DIAGNOSTICS_DIVERGENCE}` declares that this port answers {:?} by naming the cause, \
+             evidenced by {fragment:?}. `{command}` emitted:\n{}",
+            verdict.argv,
+            verdict.subject.raw_stderr
+        );
+        assert!(
+            !verdict.oracle.raw_stderr.contains(&fragment),
+            "release {} now says {fragment:?} for {:?} too. That closes \
+             `{DIAGNOSTICS_DIVERGENCE}` on this surface: delete the exemption, compare the stderr, \
+             and remove the entry's clause rather than keeping a declared difference neither \
+             binary has. It emitted:\n{}",
+            oc_testkit::PINNED_RELEASE,
+            verdict.argv,
+            verdict.oracle.raw_stderr
+        );
+    }
+}
+
+/// [`BUSY_PORT_TOKEN`] resolved to the port this run holds, so a witness names the
+/// address without a literal port number.
+fn resolve_busy_port(fragment: &str, busy_port: u16) -> String {
+    fragment.replace(BUSY_PORT_TOKEN, &busy_port.to_string())
+}
+
 /// A loopback port held bound for the caller's lifetime, so `serve` has something
 /// to fail against.
 fn hold_a_busy_port() -> (std::net::TcpListener, u16) {
@@ -553,7 +719,7 @@ fn oracle_is_available() -> bool {
 /// **Every implemented command, executed against both binaries and compared on
 /// normalized exit status, stdout and stderr.**
 ///
-/// F1's blocking finding 1. Fifteen probes over twelve commands, one process per
+/// F1's blocking finding 1. Sixteen probes over twelve commands, one process per
 /// side each, reporting *every* difference rather than the first so one failure
 /// names the whole gap.
 #[test]
@@ -684,6 +850,7 @@ fn every_exemption_states_a_reason_and_keeps_a_witness() {
     let (_listener, busy_port) = hold_a_busy_port();
     let mut exempt_streams = 0usize;
     let mut witnesses_observed = 0usize;
+    let mut diagnostics_witnesses_observed = 0usize;
 
     for row in PARITY_ROWS {
         for probe in row.probes {
@@ -725,15 +892,28 @@ fn every_exemption_states_a_reason_and_keeps_a_witness() {
             witnesses_observed += 1;
             match probe.witness {
                 Witness::FullComparison => unreachable!("handled above"),
-                Witness::BothFail => assert!(
-                    verdict.oracle.exit != Some(0) && verdict.subject.exit != Some(0),
-                    "`{}`'s witness claims both sides refuse {:?}, but they exited oracle {:?} / \
-                     subject {:?}",
-                    row.command,
-                    verdict.argv,
-                    verdict.oracle.exit,
-                    verdict.subject.exit
-                ),
+                Witness::DocumentedDiagnostics {
+                    oracle_form,
+                    subject_form,
+                } => {
+                    assert!(
+                        verdict.oracle.exit != Some(0) && verdict.subject.exit != Some(0),
+                        "`{}`'s witness claims both sides refuse {:?}, but they exited oracle \
+                         {:?} / subject {:?}",
+                        row.command,
+                        verdict.argv,
+                        verdict.oracle.exit,
+                        verdict.subject.exit
+                    );
+                    documented_diagnostics_hold(
+                        row.command,
+                        &verdict,
+                        oracle_form,
+                        subject_form,
+                        busy_port,
+                    );
+                    diagnostics_witnesses_observed += 1;
+                }
                 Witness::OracleStderrContains(fragment) => assert!(
                     verdict.oracle.raw_stderr.contains(fragment),
                     "`{}`'s exemption rests on the oracle reading {:?} differently, evidenced by \
@@ -753,8 +933,16 @@ fn every_exemption_states_a_reason_and_keeps_a_witness() {
     );
     if oracle_present {
         assert_eq!(
-            witnesses_observed, 3,
+            witnesses_observed, 4,
             "every exempting probe must have had its witness observed against both binaries"
+        );
+        assert_eq!(
+            diagnostics_witnesses_observed,
+            DIAGNOSTICS_SURFACES.len(),
+            "`{DIAGNOSTICS_DIVERGENCE}` names {} surfaces and each one's documented texts must \
+             have been observed against both binaries; a surface losing its two-sided witness is \
+             how this entry drifted back to `both still fail` once already",
+            DIAGNOSTICS_SURFACES.len()
         );
     } else {
         eprintln!(
@@ -860,6 +1048,94 @@ fn every_cited_divergence_is_declared() {
         5,
         "the CLI normalization rule set changed; a new rule widens what two binaries may disagree \
          about and needs an allow-list entry and a liveness assertion"
+    );
+}
+
+/// **Every surface `diagnostics-name-their-cause` declares carries a witness that
+/// names both texts, and the declaration quotes what that witness pins.**
+///
+/// The gap F4's fifth-wave review found: this entry's probes asserted only that
+/// both sides refuse, which "does not directly assert the documented stderr texts"
+/// the way the other three of todo 135's divergences do. A shared non-zero exit
+/// cannot tell *failing for the declared reason* apart from *failing for some other
+/// reason* — the same defect as a permission test that once passed because a scope
+/// did not match rather than because a ticket had expired.
+///
+/// Two things are checked here, and neither needs a process, so both hold on a host
+/// with no oracle:
+///
+/// * the table's two-sided witnesses cover exactly [`DIAGNOSTICS_SURFACES`], so a
+///   probe cannot be downgraded to a weaker tier or dropped;
+/// * the declared reason quotes every fragment the witnesses expect **of upstream**,
+///   because that half is the one no code here controls: a release can change its
+///   own wording, and when it does, the entry a reader trusts must be the thing that
+///   fails. This port's half is pinned against the running binary instead, which is
+///   stronger than prose, and the address form is checked here too since it is the
+///   example the entry leads with.
+#[test]
+fn every_declared_diagnostics_surface_carries_a_two_sided_witness() {
+    let mut witnessed: BTreeSet<String> = BTreeSet::new();
+    let mut oracle_fragments: BTreeSet<&str> = BTreeSet::new();
+    for row in PARITY_ROWS {
+        for probe in row.probes {
+            if let Witness::DocumentedDiagnostics {
+                oracle_form,
+                subject_form,
+            } = probe.witness
+            {
+                assert!(
+                    probe.stderr.is_exempt(),
+                    "`{}` claims the documented-diagnostics witness for {:?}, but its stderr is \
+                     compared; the two-sided witness exists to replace a comparison, not to sit \
+                     beside one",
+                    row.command,
+                    probe.argv
+                );
+                assert!(
+                    !oracle_form.is_empty() && !subject_form.is_empty(),
+                    "`{}`'s witness for {:?} must name a fragment for each side; an empty list \
+                     asserts nothing while looking like the stronger tier",
+                    row.command,
+                    probe.argv
+                );
+                witnessed.insert(probe.argv.join(" "));
+                oracle_fragments.extend(oracle_form.iter().copied());
+            }
+        }
+    }
+    let declared: BTreeSet<String> = DIAGNOSTICS_SURFACES
+        .iter()
+        .map(|surface| (*surface).to_owned())
+        .collect();
+    assert_eq!(
+        witnessed, declared,
+        "the set of argvs carrying a two-sided `{DIAGNOSTICS_DIVERGENCE}` witness changed. Every \
+         surface the entry declares must have one: a surface losing it reverts to the `both still \
+         fail` witness F4 rejected, and a surface gaining one that the entry does not declare is \
+         an exemption resting on nothing."
+    );
+
+    let list = DivergenceList::load().expect("docs/divergences.toml must load");
+    let entry = list
+        .find(DIAGNOSTICS_DIVERGENCE)
+        .unwrap_or_else(|| panic!("{DIAGNOSTICS_DIVERGENCE} must be declared"));
+    for fragment in &oracle_fragments {
+        assert!(
+            entry.reason.contains(fragment),
+            "the witnesses expect release {} to say {fragment:?}, but the declared reason never \
+             quotes it. A reader is then told one thing and the test enforces another, which is \
+             exactly the prose-versus-executable drift the fifth-wave review blocked elsewhere.",
+            oc_testkit::PINNED_RELEASE
+        );
+    }
+    let named_address = SUBJECT_BIND_FAILURE
+        .split(BUSY_PORT_TOKEN)
+        .next()
+        .expect("the bind fragment must have a literal prefix");
+    assert!(
+        entry.reason.contains(named_address),
+        "the entry must quote this port's {named_address:?} form, which is the improvement it \
+         exists to protect"
     );
 }
 
