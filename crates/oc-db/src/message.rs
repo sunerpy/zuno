@@ -754,6 +754,31 @@ impl<'conn> MessageStore<'conn> {
         Ok(messages)
     }
 
+    pub fn messages_by_id(&self, message_ids: &[String]) -> Result<Vec<MessageRecord>, DbError> {
+        if message_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (1..=message_ids.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT id, session_id, time_created, time_updated, data FROM message \
+             WHERE id IN ({placeholders})"
+        );
+        let mut statement = self.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(message_ids.iter()), |row| {
+                Ok(MessageRecord::from_row(row))
+            })
+            .map_err(map_error)?;
+        let mut messages = Vec::with_capacity(message_ids.len());
+        for row in rows {
+            messages.push(row.map_err(map_error)??);
+        }
+        Ok(messages)
+    }
+
     /// Every part belonging to any of `message_ids`, grouped by message id.
     ///
     /// One statement per [`HYDRATION_CHUNK`] ids, never one per message. Within

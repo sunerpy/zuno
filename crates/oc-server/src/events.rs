@@ -10,6 +10,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use oc_db::Pool;
+use oc_engine::r#loop::TurnEvent;
+use oc_llm::event::{ConnectionPhase, StreamEvent as ProviderEvent};
+use serde_json::{Map, Value, json};
+use tokio::sync::mpsc;
 
 use crate::{EventFanout, EventSubscription};
 use store::{Page, Snapshot, Store};
@@ -101,6 +105,24 @@ impl EventService {
         Ok(EventPage { events, has_more })
     }
 
+    /// Projects one engine channel onto both the legacy process-local fan-out and
+    /// the durable HTTP event stream. The durable write happens before live HTTP
+    /// delivery, so `/history` can always replay an event observed over SSE.
+    pub async fn forward_engine_events(
+        &self,
+        session_id: &str,
+        legacy: &EventFanout<TurnEvent>,
+        mut events: mpsc::Receiver<TurnEvent>,
+    ) {
+        while let Some(event) = events.recv().await {
+            legacy.publish(event.clone());
+            let projected = turn_event(&event);
+            if let Err(error) = self.publish(session_id, projected).await {
+                eprintln!("failed to publish HTTP turn event for `{session_id}`: {error}");
+            }
+        }
+    }
+
     async fn subscribe(
         &self,
         session_id: &str,
@@ -138,6 +160,280 @@ impl EventService {
     fn lock_fanouts(&self) -> MutexGuard<'_, HashMap<String, EventFanout<StreamEvent>>> {
         self.fanouts.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+fn turn_event(event: &TurnEvent) -> NewEvent {
+    let (event_type, properties) = match event {
+        TurnEvent::TurnStarted { session_id } => {
+            ("turn.started", object(json!({"sessionID": session_id})))
+        }
+        TurnEvent::HistoryRepaired {
+            repaired_tool_results,
+        } => (
+            "history.repaired",
+            object(json!({"repairedToolResults": repaired_tool_results})),
+        ),
+        TurnEvent::AgentResolved { step, agent } => (
+            "agent.resolved",
+            object(json!({"step": step, "agent": agent})),
+        ),
+        TurnEvent::ModelResolved {
+            step,
+            provider_id,
+            model_id,
+        } => (
+            "model.resolved",
+            object(json!({"step": step, "providerID": provider_id, "modelID": model_id})),
+        ),
+        TurnEvent::AssistantMessageCreated { step, message_id } => (
+            "assistant.message.created",
+            object(json!({"step": step, "messageID": message_id})),
+        ),
+        TurnEvent::ToolSnapshotLocked {
+            step,
+            tool_ids,
+            rebuilt_for_late_mcp,
+        } => (
+            "tool.snapshot.locked",
+            object(json!({
+                "step": step,
+                "toolIDs": tool_ids,
+                "rebuiltForLateMcp": rebuilt_for_late_mcp,
+            })),
+        ),
+        TurnEvent::ProviderRequestStarted {
+            step,
+            message_count,
+        } => (
+            "provider.request.started",
+            object(json!({"step": step, "messageCount": message_count})),
+        ),
+        TurnEvent::Provider { step, event } => (
+            "provider",
+            object(json!({"step": step, "event": provider_event(event)})),
+        ),
+        TurnEvent::AssistantCheckpointed {
+            step,
+            message_id,
+            interrupted,
+        } => (
+            "assistant.checkpointed",
+            object(json!({
+                "step": step,
+                "messageID": message_id,
+                "interrupted": interrupted,
+            })),
+        ),
+        TurnEvent::ToolDispatchStarted {
+            step,
+            call_id,
+            name,
+        } => (
+            "tool.dispatch.started",
+            object(json!({"step": step, "callID": call_id, "name": name})),
+        ),
+        TurnEvent::ToolDispatchCompleted {
+            step,
+            call_id,
+            name,
+            title,
+            output,
+            is_error,
+        } => (
+            "tool.dispatch.completed",
+            object(json!({
+                "step": step,
+                "callID": call_id,
+                "name": name,
+                "title": title,
+                "output": output,
+                "isError": is_error,
+            })),
+        ),
+        TurnEvent::ToolResultAppended {
+            step,
+            call_id,
+            is_error,
+        } => (
+            "tool.result.appended",
+            object(json!({"step": step, "callID": call_id, "isError": is_error})),
+        ),
+        TurnEvent::StepCompleted {
+            step,
+            finish_reason,
+        } => (
+            "step.completed",
+            object(json!({"step": step, "finishReason": finish_reason})),
+        ),
+        TurnEvent::TurnCompleted {
+            assistant_message_id,
+            steps,
+        } => (
+            "turn.completed",
+            object(json!({"assistantMessageID": assistant_message_id, "steps": steps})),
+        ),
+        TurnEvent::TurnInterrupted {
+            assistant_message_id,
+            steps,
+        } => (
+            "turn.interrupted",
+            object(json!({"assistantMessageID": assistant_message_id, "steps": steps})),
+        ),
+    };
+    NewEvent::new(event_type, properties).expect("fixed turn event types are valid")
+}
+
+fn provider_event(event: &ProviderEvent) -> Value {
+    match event {
+        ProviderEvent::TextDelta(text) => json!({"type": "text.delta", "text": text}),
+        ProviderEvent::ToolUseStart { id, name } => {
+            json!({"type": "tool.use.start", "id": id, "name": name})
+        }
+        ProviderEvent::ToolInputDelta(delta) => {
+            json!({"type": "tool.input.delta", "delta": delta})
+        }
+        ProviderEvent::ToolUseEnd => json!({"type": "tool.use.end"}),
+        ProviderEvent::ToolUseSignature(signature) => {
+            json!({"type": "tool.use.signature", "signature": signature})
+        }
+        ProviderEvent::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => json!({
+            "type": "tool.result",
+            "toolUseID": tool_use_id,
+            "content": content,
+            "isError": is_error,
+        }),
+        ProviderEvent::GeneratedImage {
+            id,
+            path,
+            metadata_path,
+            output_format,
+            revised_prompt,
+        } => json!({
+            "type": "generated.image",
+            "id": id,
+            "path": path,
+            "metadataPath": metadata_path,
+            "outputFormat": output_format,
+            "revisedPrompt": revised_prompt,
+        }),
+        ProviderEvent::ReasoningStart => json!({"type": "reasoning.start"}),
+        ProviderEvent::ReasoningDelta(text) => {
+            json!({"type": "reasoning.delta", "text": text})
+        }
+        ProviderEvent::ReasoningSignatureDelta(signature) => {
+            json!({"type": "reasoning.signature.delta", "signature": signature})
+        }
+        ProviderEvent::ProviderReasoningItem {
+            id,
+            summary,
+            encrypted_content,
+            status,
+        } => json!({
+            "type": "provider.reasoning.item",
+            "id": id,
+            "summary": summary,
+            "encryptedContent": encrypted_content,
+            "status": status,
+        }),
+        ProviderEvent::ReasoningEnd => json!({"type": "reasoning.end"}),
+        ProviderEvent::ReasoningDone { duration_secs } => {
+            json!({"type": "reasoning.done", "durationSecs": duration_secs})
+        }
+        ProviderEvent::MessageEnd { stop_reason } => {
+            json!({"type": "message.end", "stopReason": stop_reason})
+        }
+        ProviderEvent::RetryRollback { attempt, max } => {
+            json!({"type": "retry.rollback", "attempt": attempt, "max": max})
+        }
+        ProviderEvent::TokenUsage {
+            input_tokens,
+            output_tokens,
+            cache_read_input_tokens,
+            cache_write_input_tokens,
+        } => json!({
+            "type": "token.usage",
+            "inputTokens": input_tokens,
+            "outputTokens": output_tokens,
+            "cacheReadInputTokens": cache_read_input_tokens,
+            "cacheWriteInputTokens": cache_write_input_tokens,
+        }),
+        ProviderEvent::ConnectionType { connection } => {
+            json!({"type": "connection.type", "connection": connection})
+        }
+        ProviderEvent::ConnectionPhase { phase } => connection_phase(*phase),
+        ProviderEvent::StatusDetail { detail } => {
+            json!({"type": "status.detail", "detail": detail})
+        }
+        ProviderEvent::Error {
+            message,
+            retry_after,
+        } => json!({
+            "type": "error",
+            "message": message,
+            "retryAfterMs": retry_after.map(|value| value.as_millis()),
+        }),
+        ProviderEvent::SessionId(id) => json!({"type": "session.id", "id": id}),
+        ProviderEvent::Compaction {
+            trigger,
+            pre_tokens,
+            openai_encrypted_content,
+        } => json!({
+            "type": "compaction",
+            "trigger": trigger,
+            "preTokens": pre_tokens,
+            "openaiEncryptedContent": openai_encrypted_content,
+        }),
+        ProviderEvent::UpstreamProvider { provider } => {
+            json!({"type": "upstream.provider", "provider": provider})
+        }
+        ProviderEvent::NativeToolCall {
+            request_id,
+            tool_name,
+            input,
+        } => json!({
+            "type": "native.tool.call",
+            "requestID": request_id,
+            "toolName": tool_name,
+            "input": input,
+        }),
+    }
+}
+
+fn connection_phase(phase: ConnectionPhase) -> Value {
+    match phase {
+        ConnectionPhase::Authenticating => {
+            json!({"type": "connection.phase", "phase": "authenticating"})
+        }
+        ConnectionPhase::Connecting => {
+            json!({"type": "connection.phase", "phase": "connecting"})
+        }
+        ConnectionPhase::SendingRequest => {
+            json!({"type": "connection.phase", "phase": "sending-request"})
+        }
+        ConnectionPhase::WaitingForResponse => {
+            json!({"type": "connection.phase", "phase": "waiting-for-response"})
+        }
+        ConnectionPhase::Streaming => {
+            json!({"type": "connection.phase", "phase": "streaming"})
+        }
+        ConnectionPhase::Retrying { attempt, max } => json!({
+            "type": "connection.phase",
+            "phase": "retrying",
+            "attempt": attempt,
+            "max": max,
+        }),
+    }
+}
+
+fn object(value: Value) -> Map<String, Value> {
+    value
+        .as_object()
+        .expect("fixed turn event payloads are objects")
+        .clone()
 }
 
 impl fmt::Debug for EventService {

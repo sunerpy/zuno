@@ -6494,3 +6494,21 @@ F1：SATISFIED 9 / NOT SATISFIED 8 / UNVERIFIABLE 1。F4 的三条 blocker 与�
   仍未被证明——这是对的，我的注释只解释了为何不能比，没解释何时才能比。
 - prune 十表修正：F4 认定为 **「explicit owner-approved contract amendment」**，即「代码证伪契约」，
   不是「把契约改成代码的样子」。
+
+## [2026-08-10] Todo 131：SEAM #13 已关闭——一轮写入、一个事件投影、四个读面
+
+真实入口复现把根因拆成了两个彼此独立但同时存在的断点：生产 `run_turn` 把规范对话写进
+`message`/`part`，而 `/message` 只读 `session_message`；同一轮的 `TurnEvent` 只进入进程内
+`EventFanout`，HTTP 的 session/global SSE 与 `/history` 则消费另一套 `EventService`。因此
+「数据库里有答案」和「客户端看到答案」之间缺了消息加载与事件投影两座桥。
+
+修复没有新造读路径。事件侧由 `EventService::forward_engine_events` 将同一个 `TurnEvent` 先持久化、
+再广播到既有 HTTP SSE，同时保留原进程内 fanout；执行错误投影为 `session.error`。消息侧让
+`/message` 在同一时间边界内合并规范对话与 agent/model 控制消息，按 `(time_created,id)` 有界排序，
+重复 ID 以规范消息为准，并用 `messages_by_id` 批量水合，避免 N+1。
+
+这次守卫必须同时覆盖四个客户端读面：预先打开的 session SSE、全局 `/api/event`、`/message` 和
+`/history`。只测任意一个仍可能把另一半断线留到下一轮。可逆地断开 durable bridge 后，session SSE
+测试重新以 `Elapsed(())` 失败，证明测试守的是桥，不是数据库副作用。真实 `serve` 验收中四个读面
+都包含 `HTTP_ASSISTANT_OK`，而空会话仍精确返回空数组。**以后判断一条 HTTP 状态链是否完成，至少要
+证明 admission、执行、持久化、实时投影和事后读回是一条闭环；200/204 只能证明路由活着。**

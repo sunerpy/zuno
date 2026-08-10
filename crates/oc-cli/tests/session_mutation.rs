@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::time::Duration;
@@ -12,6 +12,7 @@ const CASSETTE: &str = "openai-chat/streams-text";
 const SESSION_ID: &str = "ses_task129entryparity0000000000";
 const PROMPT: &str = "answer from the recorded cassette";
 const RUN_TIMEOUT: Duration = Duration::from_secs(30);
+const SSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_opencode-rust"))
@@ -275,6 +276,97 @@ impl Drop for RunningServer {
     }
 }
 
+struct SseClient {
+    response: reqwest::Response,
+    buffered: Vec<u8>,
+    frames: VecDeque<Value>,
+}
+
+impl SseClient {
+    async fn connect(client: &reqwest::Client, url: String) -> Self {
+        let response = client.get(url).send().await.expect("open SSE stream");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        Self {
+            response,
+            buffered: Vec::new(),
+            frames: VecDeque::new(),
+        }
+    }
+
+    async fn next_json(&mut self) -> Value {
+        tokio::time::timeout(SSE_TIMEOUT, async {
+            loop {
+                self.decode_complete_frames();
+                if let Some(frame) = self.frames.pop_front() {
+                    return frame;
+                }
+                let chunk = self
+                    .response
+                    .chunk()
+                    .await
+                    .expect("read SSE chunk")
+                    .expect("SSE stream remains open");
+                self.buffered.extend_from_slice(&chunk);
+            }
+        })
+        .await
+        .expect("SSE stream must produce a data frame inside its budget")
+    }
+
+    async fn read_until_text(&mut self, expected: &str) -> Value {
+        tokio::time::timeout(RUN_TIMEOUT, async {
+            loop {
+                let frame = self.next_json().await;
+                if value_contains_text(&frame, expected) {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("the turn's assistant text must arrive over SSE")
+    }
+
+    fn decode_complete_frames(&mut self) {
+        while let Some(boundary) = self
+            .buffered
+            .windows(2)
+            .position(|window| window == b"\n\n")
+        {
+            let frame = self.buffered.drain(..boundary + 2).collect::<Vec<_>>();
+            let frame = String::from_utf8(frame).expect("SSE frames are UTF-8");
+            let data = frame
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !data.is_empty() {
+                self.frames
+                    .push_back(serde_json::from_str(&data).expect("SSE data is JSON"));
+            }
+        }
+    }
+}
+
+fn value_contains_text(value: &Value, expected: &str) -> bool {
+    match value {
+        Value::String(text) => text.contains(expected),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| value_contains_text(value, expected)),
+        Value::Object(values) => values
+            .values()
+            .any(|value| value_contains_text(value, expected)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
 fn scrub_dynamic(mut value: Value) -> Value {
     if let Some(object) = value.as_object_mut() {
         object.remove("time");
@@ -421,6 +513,146 @@ async fn http_prompt_matches_cli_output_and_persisted_rows_on_the_same_cassette(
         provider.captured_count().await,
         2,
         "each entry point must make exactly one real turn request"
+    );
+
+    server.stop().await;
+    provider.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_client_reads_one_prompt_answer_from_message_history_and_preopened_session_sse() {
+    let env = ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::Default);
+    let database = env.xdg_data().join("http-readback.db");
+    seed_session(&database, env.project());
+    let scenario = Scenario::new("http-client-readback")
+        .from_oracle_cassette(CASSETTE)
+        .expect("recorded completion loads");
+    let provider = MockProvider::start(vec![scenario])
+        .await
+        .expect("mock provider binds loopback");
+    let mut server = RunningServer::start(&env, provider.base_url(), &database).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build loopback client");
+    let mut session_events = SseClient::connect(
+        &client,
+        format!("{}/api/session/{SESSION_ID}/event?after=0", server.base_url),
+    )
+    .await;
+
+    let prompt = client
+        .post(format!(
+            "{}/api/session/{SESSION_ID}/prompt",
+            server.base_url
+        ))
+        .json(&json!({
+            "id": "msg_task131_http_user",
+            "prompt": { "text": PROMPT },
+            "delivery": "steer"
+        }))
+        .send()
+        .await
+        .expect("submit HTTP prompt");
+    assert_eq!(prompt.status(), reqwest::StatusCode::OK);
+    let wait = client
+        .post(format!("{}/api/session/{SESSION_ID}/wait", server.base_url))
+        .send()
+        .await
+        .expect("wait for HTTP turn");
+    assert_eq!(wait.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let session_event = session_events.read_until_text("Hello").await;
+    let messages = client
+        .get(format!(
+            "{}/api/session/{SESSION_ID}/message",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("read messages")
+        .json::<Value>()
+        .await
+        .expect("messages response is JSON");
+    let history = client
+        .get(format!(
+            "{}/api/session/{SESSION_ID}/history",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("read history")
+        .json::<Value>()
+        .await
+        .expect("history response is JSON");
+    assert!(
+        value_contains_text(&session_event, "Hello"),
+        "pre-opened session SSE omitted the assistant answer: {session_event}"
+    );
+    assert!(
+        value_contains_text(&messages["data"], "Hello"),
+        "message read omitted the assistant answer: {messages}"
+    );
+    assert!(
+        value_contains_text(&history["data"], "Hello"),
+        "history read omitted the assistant answer: {history}"
+    );
+
+    server.stop().await;
+    provider.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn global_http_event_stream_carries_the_http_driven_turn_after_server_connected() {
+    let env = ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::Default);
+    let database = env.xdg_data().join("http-global-events.db");
+    seed_session(&database, env.project());
+    let scenario = Scenario::new("http-global-event-readback")
+        .from_oracle_cassette(CASSETTE)
+        .expect("recorded completion loads");
+    let provider = MockProvider::start(vec![scenario])
+        .await
+        .expect("mock provider binds loopback");
+    let mut server = RunningServer::start(&env, provider.base_url(), &database).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build loopback client");
+    let mut global_events =
+        SseClient::connect(&client, format!("{}/api/event", server.base_url)).await;
+    let connected = global_events.next_json().await;
+    assert_eq!(connected["type"], "server.connected");
+
+    let prompt = client
+        .post(format!(
+            "{}/api/session/{SESSION_ID}/prompt",
+            server.base_url
+        ))
+        .json(&json!({
+            "id": "msg_task131_global_user",
+            "prompt": { "text": PROMPT },
+            "delivery": "steer"
+        }))
+        .send()
+        .await
+        .expect("submit HTTP prompt");
+    assert_eq!(prompt.status(), reqwest::StatusCode::OK);
+    let wait = client
+        .post(format!("{}/api/session/{SESSION_ID}/wait", server.base_url))
+        .send()
+        .await
+        .expect("wait for HTTP turn");
+    assert_eq!(wait.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let turn_event = global_events.read_until_text("Hello").await;
+    assert_ne!(turn_event["type"], "server.connected");
+    assert!(
+        value_contains_text(&turn_event, "Hello"),
+        "global SSE omitted the HTTP-driven turn: {turn_event}"
     );
 
     server.stop().await;

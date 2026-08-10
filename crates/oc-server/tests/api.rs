@@ -266,6 +266,42 @@ impl ReadApiFixture {
                     rusqlite::params![format!("msg_{seq:04}"), kind, seq, data.to_string()],
                 )
                 .expect("fixture projected message inserts");
+            let message = oc_db::message::MessageRecord::from_json(json!({
+                "id": format!("msg_{seq:04}"),
+                "sessionID": "ses_reads",
+                "role": "user",
+                "time": {"created": seq},
+                "agent": "test",
+                "model": {"providerID": "test", "modelID": "test"},
+            }))
+            .expect("canonical fixture message decodes");
+            let part_data = if seq == compaction_seq {
+                json!({
+                    "id": format!("prt_{seq:04}"),
+                    "sessionID": "ses_reads",
+                    "messageID": format!("msg_{seq:04}"),
+                    "type": "compaction",
+                    "reason": "auto",
+                    "summary": "summary",
+                })
+            } else {
+                json!({
+                    "id": format!("prt_{seq:04}"),
+                    "sessionID": "ses_reads",
+                    "messageID": format!("msg_{seq:04}"),
+                    "type": "text",
+                    "text": format!("message-{seq}"),
+                })
+            };
+            let part = oc_db::message::PartRecord::from_json(part_data, seq)
+                .expect("canonical fixture part decodes");
+            let store = oc_db::message::MessageStore::new(&connection);
+            store
+                .put_message_at(&message, seq)
+                .expect("canonical fixture message inserts");
+            store
+                .put_part_at(&part, seq)
+                .expect("canonical fixture part inserts");
         }
     }
 }
@@ -464,7 +500,8 @@ async fn api_session_message_and_context_are_projected_and_bounded_by_their_cont
     assert_eq!(messages.status(), StatusCode::OK);
     let messages = response_json(messages).await;
     assert_eq!(messages["data"].as_array().expect("message data").len(), 50);
-    assert_eq!(messages["data"][0]["id"], "msg_0119");
+    assert_eq!(messages["data"][0]["info"]["id"], "msg_0119");
+    assert_eq!(messages["data"][0]["parts"][0]["text"], "message-119");
     assert!(messages["cursor"]["previous"].is_string());
     assert!(messages["cursor"]["next"].is_string());
 
@@ -524,6 +561,39 @@ async fn api_session_history_is_a_finite_default_page_with_an_exclusive_cursor()
     assert_eq!(second["data"].as_array().expect("history data").len(), 25);
     assert_eq!(second["data"][0]["durable"]["seq"], 50);
     assert_eq!(second["hasMore"], false);
+}
+
+#[tokio::test]
+async fn api_empty_session_message_and_history_stay_empty() {
+    let state = ApiState::memory("/repo").expect("in-memory API state initializes");
+    state
+        .sessions()
+        .create(&SessionCreate::new(
+            "ses_empty",
+            "ses_empty",
+            "global",
+            "/repo",
+            "/repo",
+            "empty",
+            "test",
+        ))
+        .expect("fixture session inserts");
+    let app = api_app(state);
+
+    let messages = app
+        .clone()
+        .oneshot(request(Method::GET, "/api/session/ses_empty/message", None))
+        .await
+        .expect("empty message read responds");
+    assert_eq!(messages.status(), StatusCode::OK);
+    assert_eq!(response_json(messages).await["data"], json!([]));
+
+    let history = app
+        .oneshot(request(Method::GET, "/api/session/ses_empty/history", None))
+        .await
+        .expect("empty history read responds");
+    assert_eq!(history.status(), StatusCode::OK);
+    assert_eq!(response_json(history).await["data"], json!([]));
 }
 
 #[tokio::test]
@@ -785,6 +855,37 @@ async fn api_agent_model_compact_and_revert_mutations_are_guarded_and_persisted(
         switched[1]
     );
     assert!(switched[1]["time"]["created"].is_i64());
+
+    let messages = app
+        .clone()
+        .oneshot(request(Method::GET, "/api/session/ses_reads/message", None))
+        .await
+        .expect("messages respond after session switches");
+    assert_eq!(messages.status(), StatusCode::OK);
+    let messages = response_json(messages).await;
+    let message_data = messages["data"]
+        .as_array()
+        .expect("message data is an array");
+    assert!(
+        message_data.iter().any(|message| {
+            message["type"] == "agent-switched" && message["agent"] == "explore"
+        }),
+        "agent control message remains visible beside canonical messages: {messages}"
+    );
+    assert!(
+        message_data.iter().any(|message| {
+            message["type"] == "model-switched"
+                && message["model"]
+                    == json!({"providerID": "provider", "id": "model", "variant": "fast"})
+        }),
+        "model control message remains visible beside canonical messages: {messages}"
+    );
+    assert!(
+        message_data
+            .iter()
+            .any(|message| message["info"]["id"] == "msg_0002"),
+        "canonical messages remain visible beside control messages: {messages}"
+    );
 
     let history = app
         .clone()
