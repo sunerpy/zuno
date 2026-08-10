@@ -2842,9 +2842,21 @@ fn known_gaps() -> Vec<KnownGap> {
     vec![
         KnownGap {
             id: "api-backends-unavailable".to_owned(),
-            surface: "14 of the 58 upstream /api operations".to_owned(),
-            detail: "Every upstream operation is invoked against both processes and its status, normalized body, and observable session/PTY state delta are captured. Forty-four operations have local backends; 17 compare all dimensions and 19 more compare status and normalized body. The remaining 14 return an operation-specific 503 backend_unavailable response and are never counted as parity. The matrix rejects any 501 before applying a differential exemption. This remains a compatibility gap, not a declared behavioral difference."
-                .to_owned(),
+            surface: format!(
+                "{} of the {UPSTREAM_API_OPERATIONS} upstream /api operations",
+                FROZEN_API_GAPS.len()
+            ),
+            detail: format!(
+                "Every upstream operation is invoked against both processes and its status, \
+                 normalized body, and observable session/PTY state delta are captured. {} \
+                 operations have local backends. The remaining {} return an operation-specific \
+                 503 backend_unavailable response and are never counted as parity. The matrix \
+                 rejects any 501 before applying a differential exemption. This remains a \
+                 compatibility gap, not a declared behavioral difference.",
+                UPSTREAM_API_OPERATIONS - FROZEN_API_GAPS.len(),
+                FROZEN_API_GAPS.len()
+            )
+            .to_owned(),
         },
         KnownGap {
             id: "permission-evaluation-semantics".to_owned(),

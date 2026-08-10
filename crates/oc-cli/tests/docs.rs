@@ -176,6 +176,29 @@ fn cell(value: &str) -> String {
 // Divergences
 // ---------------------------------------------------------------------------
 
+/// Spells a small count the way the README's prose does.
+///
+/// The README writes "the seventeen deliberate differences", not "the 17", so a
+/// derived assertion has to match its register. Only the range the allow-list can
+/// plausibly reach is covered; anything outside it fails loudly rather than
+/// silently formatting a digit the prose would never contain.
+fn spell(count: usize) -> &'static str {
+    match count {
+        13 => "thirteen",
+        14 => "fourteen",
+        15 => "fifteen",
+        16 => "sixteen",
+        17 => "seventeen",
+        18 => "eighteen",
+        19 => "nineteen",
+        20 => "twenty",
+        other => panic!(
+            "the allow-list holds {other} entries, which this helper cannot spell; extend it and \
+             update the README's prose in the same commit"
+        ),
+    }
+}
+
 fn allow_list() -> DivergenceList {
     let list = DivergenceList::load().expect("docs/divergences.toml must load");
     assert_eq!(
@@ -264,6 +287,17 @@ Reflection must not learn any of these negative cases:\n",
 #[test]
 fn docs_every_declared_divergence_is_documented_with_its_reason() {
     let list = allow_list();
+
+    // The README names this count in prose, and nothing derived it until F1 and F4
+    // both found it still saying "thirteen" while the allow-list held seventeen.
+    // Spelling the number from the live list means the next entry cannot leave the
+    // README stale, which is the whole reason the other README figures are probed
+    // rather than retyped.
+    contains_all(
+        "README.md",
+        &[&format!("the {} deliberate differences", spell(list.len()))],
+    );
+
     check_block(
         "docs/divergences.md",
         "divergence-detail",
