@@ -6589,3 +6589,41 @@ onto 1dee81c, auto-merged `README.md` with no conflict markers, then validated:
   would preserve the same permanent `/wait` deadlock. Applying one invariant to
   both pending maps avoids a second asymmetric disconnect seam without changing
   either reply contract.
+## Task 137 — keep the synthetic three-tier test, add the real one beside it
+
+The brief said to replace the synthetic `integration-js` fixture in
+`three_tiers_follow_configuration_order`. I did not delete it. It is renamed
+`three_synthetic_tiers_follow_configuration_order` and still runs.
+
+**Why deleting it would have traded one gap for another.** The synthetic fixture
+is the only JS tier that implements a *mutating*
+`experimental.text.complete` hook, and it is what pins the JS host's own
+dispose-to-file marker and child-PID reaping. **Neither real auth plugin
+implements `experimental.text.complete`** (antigravity: `event`/`tool`/`auth`;
+kiro: `config`/`auth`/`provider`/`chat.headers`), so a real-only rewrite would
+have silently dropped the JS-host lifecycle coverage the synthetic test carries.
+Weakening an existing test is forbidden regardless, but here the removal would
+also have been a net coverage loss disguised as an upgrade.
+
+So: six tests where there was one. `three_tiers_follow_configuration_order` is
+now the real four-plugin test criterion 7 asks for; the synthetic one keeps its
+JS-host lifecycle assertions.
+
+**Order is asserted three independent ways** rather than one, because the real
+plugins share no mutating hook (see learnings): the bus's identity sequence, a
+recorded dispatch position (with a guard asserting no hook is shared by all four,
+so the recording cannot be redundant), and the two real `auth` hooks composing
+into an order-sensitive vector. A reverse-order test flips all three.
+
+**Mutation-verified rather than assumed green.** Reversing `HookBus::new` failed
+all five new tests; changing the provider id kiro matches on failed exactly the
+three that assert its real header; stubbing out the wrapper's `auth()`
+delegation failed all five. The loud-skip path was verified by repointing the
+plugin cache at a nonexistent directory.
+
+**Deliberately out of scope, both recorded in the test's docstring:** `effort`
+(needs live credentials and network) and the `config` hook (kiro's real one
+writes a placeholder credential into the user's `auth.json`).
+
+The kiro version-drift scan in `tests/js.rs` now also covers
+`tests/integration.rs`, so the new file cannot reintroduce a second version.
