@@ -6699,3 +6699,33 @@ Todo 130 removed exactly that hard-coding from `compat_suite.rs`, where the file
   in principle make both binaries fail in matching ways — parity would pass and
   the guard would not. Both were re-verified against their own mutations in the
   same session.
+
+## [2026-08-10] F4 第五轮对我五个判断的裁定：五条全部支持，但附一条我该修的弱点
+
+我在第五轮把自己做过的五个判断交给 F4 独立裁决。它逐条给了明确结论，**五条全部支持我的做法**——但其中一条附带了一个我没注意到的弱点，值得单独记下。
+
+| 我的判断 | F4 的裁定 |
+|---|---|
+| todo 135 新增的四条 divergence 是真差异吗 | **「都是真实差异且理由站得住，没有一条是把未实现的命令改个标签来让套件变绿」** |
+| todo 134 的 5 分钟 deadline 是履约还是范围膨胀 | **「忠实履约」**——它的推理与我给 134 的理由一致：若从未有观察者连上，就不存在「断连」这个状态转移，所以仅靠订阅者感知无法满足 fail-closed 目标 |
+| 「响亮跳过」对准则 7 够不够 | **「单靠跳过不算证明，但当前 HEAD 有独立的 feature-enabled 证明」**——已跟踪的 `--features wasm` 运行实测 11/11 与 9/9，所以准则 7 在本 HEAD 已被证明；**它把这条降级为"执行观察"而非阻塞项** |
+| 十个剩余缺口是否满足收窄后的准则 4 | **「在行为契约层面：是」**——并明确指出 blocker 1 针对的是与有效可执行契约并列的那份过期报告，**不是要求实现那十个后端** |
+| 把 `effort` 划出范围是诚实划界还是掩盖 | **「诚实且恰当的划界……移除一个不可能的证明义务不是洗白」** |
+
+### 它附带的那条弱点，我接受
+
+关于 `diagnostics-name-their-cause`：
+
+> *"its parity-row witness currently asserts only that both sides fail; unlike the other three additions, it does not directly assert the documented stderr texts."*
+
+**这是对的，而且是我该抓到的。** 我在验证 todo 135 时做的变异是「悄悄扩大豁免集合」，那验证的是**反收缩守卫**；我没有逐条检查四个新 divergence 各自的见证强度。四条里三条直接断言了记录在案的文本差异，这一条只断言了「两边都失败」——**一个只断言"都失败"的见证，无法区分"因我们记录的原因失败"和"因别的原因失败"**。
+
+这与本项目反复出现的那条规则同源：*PTY 过期票测试当初因 scope 不匹配而非过期才通过*。**见证必须钉住它声称钉住的那个原因。**
+
+### 一个值得记住的裁决模式
+
+F4 的第 3 条裁定给了我一个有用的区分：它把「默认套件跳过」从**阻塞项**降为**执行观察**，理由是当前 HEAD 已有独立的 feature-enabled 证明——但同时要求那条命令必须进必需门，**因为未来的回归可能在默认套件下通过而只打印跳过**。
+
+> 「当前已被证明」与「未来不会回归」是两个不同的问题。前者可以用一次已跟踪的运行满足，后者必须靠门。
+
+我给 todo 141 的 (c) 正是做后者，方向一致。
