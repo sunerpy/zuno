@@ -2327,3 +2327,44 @@ rust providers = 8    ts providers = 10
 | **139** | SEAM #16 | 让 kiro 的 provider 真的流到 `models`；**禁止硬编码**，禁止用不存在的 `--format` |
 | **140** | F4#3 | 把 turn-part 差异（`step-start`/`step-finish`，生产库里 280,859 行）归类进**当前**产物 |
 | **141** | F2 B1/B2/B4 | persist-before-live 路由测试、question 侧三道 fail-closed、wasm 进 CI |
+
+## Wave 52 (2026-08-10)：第五轮全部阻塞项关闭，145 个任务完成
+
+`main` = `40aa759`，**3360 测试通过**，clippy 0，fmt 干净，锁可离线复现。**145/149，只剩 F1-F4。**
+
+### 五个任务，五次变异验证
+
+| todo | 我的变异 | 被抓住的测试 |
+|---|---|---|
+| **138** | 变异引擎源码但**不重建**（原本 4 passed 假绿） | 3 个 interop 测试直接失败 |
+| **139** | `user_runtime_candidates` 返回空 | `real_auth_plugin_providers_reach_the_plain_models_surface` |
+| **140** | 把 `step-start` 谎称已实现 | `the_turn_part_gap_names_exactly_the_types_the_port_does_not_write` |
+| **141** | 让 SSE 的 seq 超前 history | `session_sse_never_outpaces_the_history_route` |
+| **142** | 把 serve 错误退化成上游的 `Unexpected error` | `every_exemption_states_a_reason_and_keeps_a_witness` |
+
+### SEAM #15 封堵，成本 0.27 秒
+
+138 的核心证明我亲手复跑：同一个 `hydrate_retained_history` 变异，**修复前 `4 passed`（假绿），修复后不重建就直接 3 个失败**。成本它测了五次，中位数 **0.27 秒/进程**（非每个测试用例）。
+
+**这条修好才让本波其余四次变异验证可信** —— 否则改了 subject 源码不重建，任何「变异被捕获」的结论都可能是空的。
+
+### SEAM #16 的根因不在我猜的地方
+
+我以为要在 catalog 里接线，还先变异了 `replace_provider_models`——**结果既不失败也不报错**，说明那个函数不在 kiro 的路径上。真正的根因在 **JS runtime 的发现**：插件因为找不到 runtime 而从未加载，这才解释了「日志里 0 次 kiro 提及」。
+
+实机结果：**provider 从 8 个变 9 个，`kiro-auth` 出现了**，唯一剩余差异是 `opencode`（上游自带托管 provider，139 的证据明确解释了这与插件无关）。生产代码零硬编码——两处 `"kiro-auth"` 字面量都在测试夹具与断言里。
+
+### 140 的分类判断很准
+
+它选了**具名 gap** 而非声明 divergence（17 条未变），理由是「仅未实现的表面是 gap 不是 divergence」。更强的是它证明了 `StreamProjector` **已经能写出上游形状**（含 snapshot 哈希），只是没有生产调用者到达——**所以这是"未接线"而非"有意选择"，声明成 divergence 会把遗漏打扮成决定。**
+
+### 我这一波犯的两个操作错误
+
+1. **构造不出编译通过的变异，浪费了三次尝试**：我先引用不存在的 `preview_stored`，又用 `durable` 字段（那是 JSON 键，结构体字段是 `cursor`）。**最后靠读结构体定义解决**——本该第一步就做。
+2. **冲突解决产生了重复的计划行**：141 合并后出现一个未勾 + 一个已勾的 141，我删掉了未勾那行。append-only 的自动解决对**同一行的两种状态**是不安全的。
+
+### F4 对我五个判断的裁定：五条全支持，附一条我该抓的弱点
+
+它认定 135 的四条 divergence「都是真实差异，没有一条是把未实现的命令改个标签来让套件变绿」，134 的 5 分钟 deadline 是「忠实履约」，`effort` 划界是「诚实且恰当」。
+
+但它指出 `diagnostics-name-their-cause` 的见证只断言「两边都失败」——**无法区分「因我们记录的原因失败」与「因别的原因失败」**。我核实后确认更强档位本就存在，已由 todo 142 升级：`BothFail` 现在归零。
