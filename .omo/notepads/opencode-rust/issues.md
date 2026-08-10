@@ -6594,3 +6594,45 @@ F3 第四轮实测（报告：`.omo/evidence/F3-REPORT-wave4.md` 第 6c 节）�
 ### 顺带记下的运维事实
 
 F2 是本项目第一个撞上 stale-timeout 的审计任务。它的前三轮分别用了 50m、1h15m、2h49m——**手法越来越深，耗时越来越长**。若下一轮它再次超时，需要调 `.omo/omo.jsonc` 的 `background_task.staleTimeoutMs`，而不是缩减它的审计范围。
+
+## [2026-08-10] SEAM #15：测试台会跑过期二进制，产出假绿 —— F2 找到，我独立复现
+
+第五轮 F2 首次完成审计（前一轮被 stale timeout 取消），四条阻塞项全是「守卫可被绕过」。**B3 最严重，而且我亲手复现了两个方向：**
+
+`crates/oc-testkit/src/subject.rs:68` 的 `discover_or_build()`：
+
+```rust
+match Self::discover() {
+    Ok(subject) => Ok(subject),          // 找到就用，不问新鲜度
+    Err(BinaryNotFound) => { build_subject()?; Self::discover() }
+```
+
+**复现（我做的）**：把 `hydrate_retained_history` 变异成返回空历史，**不重新构建**，跑 `session_interop`：
+
+```
+4 passed  ← 假绿：跑的是变异前的旧二进制
+```
+
+显式 `cargo build -p oc-cli --bin opencode-rust` 之后，同一个测试：
+
+```
+3 failed — session `ses_...` has no user message to answer
+```
+
+**所以对 subject 的源码改动可以完全不进入被测二进制，而互操作测试照样报成功。** 这是一条直通假绿的路，且它影响的正是 F3 第一轮那类跨实现兼容缺陷——最需要真实二进制的地方。
+
+### 为什么这比单个产品缺陷更重要
+
+我这一整轮做的每一次「变异验证」，只要目标是 subject 二进制而非库代码，**都可能是无效的**。我在 134/135/136/137 上的变异恰好都改的是库或测试内部（编译进测试二进制），所以那些结论仍然成立。但这个机制本身必须修，否则以后任何「变异被捕获」的结论都需要额外证明二进制是新的。
+
+### F2 另外三条
+
+- **B1**：persist-before-live 的 HTTP 事件顺序没有路由级回归测试——`events.rs` 的注释声称持久化先于实时投递，但没有测试会在顺序反转时失败。
+- **B2**：question 半边缺少 permission 已有的 fail-closed 覆盖（畸形 owned reply 清理、观察者归零、deadline 三种）。todo 134 只补了 permission。
+- **B4**：`oc-plugin` 的 `wasm` feature 不在必需 CI 门里，所以 todo 137 的真实三层测试**在默认套件里不执行**——我上轮已识别并主动交给 F2 表态，它的结论是「响亮跳过是有用的诊断，但不等于执行被门控的行为」。
+
+### 我这一轮又犯的一个错
+
+我把 stale timeout 加到了 `.omo/omo.jsonc`（项目级），**而生效位置是 `/config/.omo/omo.jsonc`**——后者的注释里明确写着 *"Project-level .omo/omo.jsonc files are NOT honored for this setting"*。所以提高从未生效，F3 这一轮又在同一个 90 分钟窗口被取消。已改到正确位置并删除放错的那份。
+
+**教训：改配置后要验证它真的被读取，而不是只确认文件写出去了。** 这与「测试跑了旧二进制」是同一种错误——**动作完成不等于效果生效。**
