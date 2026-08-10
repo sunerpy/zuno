@@ -2189,3 +2189,39 @@ todo 132 加了进程内 broker，HTTP 轮次撞到 `ask` 规则时会**真的�
 **3319 通过 / 0 失败 / 0 EAGAIN**。合并时又遇到一次 `ExecutableFileBusy`（并发构建争用二进制），
 单独重跑即通过。**如实记录：这两次都是宿主瞬时资源问题，不是缺陷，但也不能当成"测试通过"——
 必须由编排器自己复跑确认。**
+
+## Wave 49 (2026-08-10)：第四轮 Final Wave —— F1/F3/F4 已裁决，四个修复任务已派出
+
+`main` = `cad1c52`。136 个实现任务完成，**8 个开放**（134-137 + F1-F4）。
+
+### 三份第四轮报告的共同结论：前面所有 blocker 都真的关闭了
+
+- **F3**（最有价值的一份）：*"All four previously reported blockers are fixed in real use"* —— released TS 能读 Rust 写的会话、export/import 往返、`completion` 四种形式都诚实、**HTTP 轮次现在能通过 SSE + `/message` + `/history` 三条路径读回**。
+- **F1**：SATISFIED **12** / NOT SATISFIED 6 / UNVERIFIABLE 0（上一轮是 9/8/1）。
+- **F4**：确认第三轮三条 blocker 全部关闭。
+
+### F4 的两条 blocker 都是我收窄时留下的尾巴，已修（`b0243d4`）
+
+1. 准则 4 的收窄文本还写着「44 后端 / 14 缺口」，而**同一波的 todo 132 又补了四个**，实际是 **48 / 10**。README 与 matrix 都已更新——**只有我手写的那段没跟上**，因为它恰好在 todo 126 那个「从产物派生断言」机制的覆盖范围之外。
+2. 准则 6 我把 `middlewareStack.add` 换成「证明注入的 header 与 **effort** 字段」，但 `js.rs:469` 明确声明**不断言 effort**（需要活凭证与网络）。**测试是诚实的，我的准则是贪心的**——我在替换一条不可满足的断言时写进了另一条。
+
+### SEAM #14：观察者断连不 fail-closed（F3 实测）
+
+唯一的 SSE 观察者断连后，permission 请求 **424 秒仍 pending**，`/wait` 永久阻塞直到第二个客户端手工 reject。安全底线守住（没有特权命令执行），但轮次卡死。
+
+**为什么 132 的测试没抓到**：它断的是**回复者**断连（写半个 body 后 shutdown），F3 断的是**观察者**。我核实 `request_broker.rs` **既不感知订阅者也没有任何超时机制**——两个 grep 都为空。
+
+**这是我第二次"只验一半"。** 上一轮教训是「验了写入侧没验读回侧」；这次我验证了 132 的 fail-closed 测试存在且会失败，**但没问它覆盖的是哪一种断连**。
+
+> 一个名为 `disconnected_..._fails_closed` 的测试通过，不代表所有断连都 fail-closed。**测试名描述的是它测的那一种，不是那个类别。**
+
+### 派出的四个任务
+
+| todo | 来源 | 要点 |
+|---|---|---|
+| **134** | SEAM #14 | 两条都要：最后观察者消失即拒绝 **+** 独立超时（可能从未有人订阅）。超时必须**拒绝** |
+| **135** | F1 #1 | 12 个 implemented 命令逐个比 exit/stdout/stderr；**豁免必须可见** |
+| **136** | F1 #3 | **同一个**会话双向走完 list/open/continue/export，断言 transcript 真的增长 |
+| **137** | F1 #5 | 用**真实** kiro-auth 0.20.6 + antigravity 替换合成的 `integration-js` |
+
+F2 仍在审计中。
