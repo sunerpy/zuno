@@ -6699,3 +6699,22 @@ Todo 130 removed exactly that hard-coding from `compat_suite.rs`, where the file
   in principle make both binaries fail in matching ways — parity would pass and
   the guard would not. Both were re-verified against their own mutations in the
   same session.
+
+## [2026-08-10] Task 141: permanent guards stay at the externally promised seams
+
+**Persist ordering is guarded through HTTP, not by duplicating implementation order in
+a unit test.** `session_sse_never_outpaces_the_history_route` sends an engine event
+through the production projection, observes it on session SSE, and requires the same
+durable sequence from `/history`. This makes the documented replay promise the
+assertion and leaves implementation freedom behind it.
+
+**Question lifecycle coverage mirrors permissions but owns independent triggers.** The
+three tests deliberately use live broker requests and preserve the broker/asker while
+exercising malformed owned cleanup, observer-zero reclamation, and the finite deadline
+separately. One broad "eventually rejected" test was rejected because any fallback
+could satisfy it and conceal a missing trigger.
+
+**WASM integration is an explicit step in the required Unix test job.** A separate
+feature-enabled command is preferred over widening every workspace test to all features:
+it executes the exact three-tier suite Todo 137 established, is legible in CI, and
+does not change unrelated feature combinations.
