@@ -5,9 +5,10 @@
 //! that field cannot be honoured, so a plugin that shells out fails with an
 //! explanation instead of a `TypeError` from inside its own bundle.
 //!
-//! Nothing here bundles a runtime. Discovery is a `PATH` walk, and the absence of
-//! both is a *diagnostic naming the affected plugins*, not a panic and not a
-//! silent skip — a user whose auth plugins vanished needs to be told why.
+//! Nothing here bundles a runtime. Discovery checks `PATH`, then common user-tool
+//! installation roots, and the absence of both is a *diagnostic naming the affected
+//! plugins*, not a panic and not a silent skip — a user whose auth plugins vanished
+//! needs to be told why.
 
 use std::env;
 use std::ffi::OsString;
@@ -103,7 +104,7 @@ impl fmt::Display for JsRuntime {
 /// answers both "why is my provider missing" and "what do I install".
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
-    "no JavaScript runtime found on PATH (looked for {searched}); \
+    "no JavaScript runtime found on PATH or in user tool directories (looked for {searched}); \
      these plugins cannot load: {plugins}. Install `bun` (preferred) or `node`."
 )]
 pub struct MissingJsRuntime {
@@ -133,12 +134,52 @@ impl MissingJsRuntime {
     }
 }
 
-/// Find the best available runtime, naming `plugins` if none exists.
+/// Find the best available runtime on `PATH` or in user tool directories.
 ///
 /// # Errors
-/// Returns [`MissingJsRuntime`] when neither `bun` nor `node` is on `PATH`.
+/// Returns [`MissingJsRuntime`] when neither `bun` nor `node` is installed.
 pub fn discover_runtime(plugins: &[String]) -> Result<JsRuntime, MissingJsRuntime> {
-    discover_runtime_in(env::var_os("PATH").as_deref(), plugins)
+    if let Ok(runtime) = discover_runtime_in(env::var_os("PATH").as_deref(), plugins) {
+        return Ok(runtime);
+    }
+    for kind in JsRuntimeKind::PREFERENCE {
+        for candidate in user_runtime_candidates(kind) {
+            if is_executable_file(&candidate) {
+                return Ok(JsRuntime::new(kind, candidate));
+            }
+        }
+    }
+    Err(MissingJsRuntime::new(plugins))
+}
+
+fn user_runtime_candidates(kind: JsRuntimeKind) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if kind == JsRuntimeKind::Bun
+        && let Some(root) = env::var_os("BUN_INSTALL")
+    {
+        candidates.push(PathBuf::from(root).join("bin/bun"));
+    }
+    if let Some(root) = env::var_os("MISE_DATA_DIR") {
+        candidates.push(mise_runtime(Path::new(&root), kind));
+    }
+    if let Some(root) = env::var_os("XDG_DATA_HOME") {
+        candidates.push(mise_runtime(&PathBuf::from(root).join("mise"), kind));
+    }
+    if let Some(home) = env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        candidates.push(mise_runtime(&home.join(".local/share/mise"), kind));
+        if kind == JsRuntimeKind::Bun {
+            candidates.push(home.join(".bun/bin/bun"));
+        }
+    }
+    candidates
+}
+
+fn mise_runtime(root: &Path, kind: JsRuntimeKind) -> PathBuf {
+    root.join("installs")
+        .join(kind.program())
+        .join("latest/bin")
+        .join(kind.program())
 }
 
 /// `discover_runtime` against an explicit `PATH`, so a test can simulate absence.

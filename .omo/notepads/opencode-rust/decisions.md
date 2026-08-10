@@ -6746,3 +6746,28 @@ F4 的第 3 条裁定给了我一个有用的区分：它把「默认套件跳�
   content, and shared worktree targets make both especially misleading. Cargo's
   dependency graph is the identity authority; its measured warm cost is low
   enough that a weaker hand-rolled check has no defensible trade-off here.
+## [2026-08-10] Task 139 — route plugin providers through the real `models` composition root
+
+**The catalog does not name Kiro.** `models` loads configured JavaScript plugins in
+configuration order, dispatches their `config` hooks, resolves the ordinary catalog,
+then invokes each negotiated provider model loader only for an already-resolved
+provider. `Catalog::replace_provider_models` is deliberately narrow: a plugin can
+define the final models for its provider but cannot create a provider that failed
+normal availability and filtering.
+
+**`models` remains non-interactive.** Its plugin host uses a terminal lease that
+always refuses prompts with a named diagnostic. Listing models may execute ordinary
+plugin initialization/configuration, as upstream does, but cannot hang waiting for a
+device code. Tests redirect `HOME`/XDG data to a temporary root so Kiro's real
+bootstrap logic can never write the user's `auth.json`.
+
+**Pure mode remains the bypass.** With `OPENCODE_PURE=1`, or with no configured
+plugins, `models` follows the previous catalog-only path. The CLI surface remains
+plain `models`; no nonexistent `--format` flag was added.
+
+**The remaining provider-set difference is accepted, not hidden.** Current source
+lists nine providers under the exact isolated command, including both `google` and
+`kiro-auth`; release 1.18.15 lists ten. `comm -3` names only `opencode`, whose models
+come from upstream's compiled hosted-gateway snapshot. This port deliberately ships
+no such snapshot (`oc-llm::catalog::source`), so that difference is unrelated to
+plugin contribution and is not repaired by hard-coding a provider.

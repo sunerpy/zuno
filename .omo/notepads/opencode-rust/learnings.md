@@ -6564,3 +6564,26 @@ is itself worth knowing, but it is undeclared in `docs/divergences.toml` (13 ent
   workspace discovery or `OC_TESTKIT_SUBJECT`. Provenance now names automatic
   Cargo builds, explicit paths, pre-existing discovery, and the environment
   override separately.
+## [2026-08-10] Task 139 — a negotiated resource is inert until a production consumer calls it
+
+- `JsPlugin::build` already retained Kiro's `ProviderHook.models`, and
+  `HookBus::dispatch(Provider)` already returned it, but no production caller loaded
+  JavaScript plugins from the `models` command or invoked the retained loader. A
+  resource being negotiated and a hook being dispatched are therefore weaker facts
+  than its models appearing in the catalog.
+- Kiro's provider depends on its `config` hook creating `provider.kiro-auth.models`
+  before the provider loader normalizes those models. The bridge called every normal
+  hook as `(input, output)`; the SDK's `config` hook is the exception and accepts one
+  mutable `Config`. The JavaScript host returned an error, `JsPlugin::call` contained
+  it, and the catalog stayed unchanged. The correct production order is plugin
+  `config` -> catalog resolve -> provider resource collection -> provider model load.
+- `ProviderHook.models` also takes two SDK arguments, `(provider, context)`. Passing
+  one synthetic `{provider, auth}` object happened to be friendlier than reality and
+  made Kiro see no `provider.models`. The bridge now sends the two real arguments.
+- The acceptance probe's `env -i PATH=/usr/bin:/bin` removes mise shims. A test that
+  inherits the developer shell can pass while the documented probe cannot start any
+  JavaScript plugin. Runtime discovery must preserve explicit test-path injection but
+  may fall back from ambient `PATH` to standard per-user Bun/mise installation roots.
+- Rebuilding before measuring mattered again: the first `target/debug/opencode-rust`
+  run showed ten providers from a stale binary. After `cargo build -p oc-cli`, the
+  pre-fix source showed the real eight-provider baseline.

@@ -1,0 +1,137 @@
+TASK 139 — route a real auth plugin's providers onto the plain `models` surface
+================================================================================
+Worktree: /config/workspace/ProdDir/AI/oc-wt/t139   branch: task-139
+Oracle:   released opencode 1.18.15
+Subject:  target/debug/opencode-rust
+
+Commit: fix(plugin): route a real auth plugin's providers onto the models surface
+
+
+1. REPRODUCED GAP — THE PLUGIN LOADED, BUT ITS PROVIDER NEVER REACHED USERS
+--------------------------------------------------------------------------------
+Before this change, the two real binaries were run under the user's own plugin
+configuration and compared through the plain `models` command (not a synthetic
+catalog API and not the nonexistent `models --format json` flag):
+
+  released 1.18.15: 10 providers
+  this port:          8 providers
+  missing here:       kiro-auth, opencode
+
+`google`, contributed by `opencode-antigravity-auth`, was already present on both
+sides. `--print-logs` contained no kiro mention, showing that the user-facing
+models path never reached the kiro contribution rather than merely filtering an
+empty result.
+
+The new production-path regression test initially failed with exactly:
+
+  providers={"google"}
+  stdout="google/gemini-test\n"
+
+That failure pins the original seam: loading a real plugin alone cannot satisfy
+the test; its provider models must appear in the command's actual stdout.
+
+
+2. ROOT CAUSES AND PRODUCTION FIX
+--------------------------------------------------------------------------------
+The missing contribution crossed four independent seams:
+
+  * `models` parsed the static catalog without loading configured JS plugins or
+    consuming their `ProviderHook.models` loaders.
+  * the JS `config` hook was called as `(input, output)`, although the SDK mutates
+    one `Config` argument; the compatibility layer then swallowed that mismatch.
+  * `ProviderHook.models` received one `{provider, auth}` object instead of the
+    SDK's `(provider, context)` arguments.
+  * the acceptance environment's `PATH=/usr/bin:/bin` hid user-installed Bun and
+    mise shims, preventing a real plugin runtime from being discovered.
+
+The implementation now:
+
+  * loads configured JS plugins in configuration order on the `models` path;
+  * invokes their one-argument mutable `config` hooks before catalog parsing;
+  * gathers provider hooks and invokes each models loader as `(provider, context)`;
+  * replaces that provider's catalog models with the loader result through
+    `Catalog::replace_provider_models`;
+  * acquires a non-interactive terminal lease for the JS runtime lifecycle;
+  * preserves `PATH` precedence while falling back to standard BUN_INSTALL,
+    MISE_DATA_DIR, XDG_DATA_HOME and HOME installation locations.
+
+No provider name is hard-coded. In particular, neither `kiro-auth` nor `google`
+is inserted by Rust catalog code; both names and model sets come from the real
+plugins' hooks.
+
+
+3. USER-SURFACE REGRESSION — BOTH REAL AUTH PLUGINS
+--------------------------------------------------------------------------------
+`crates/oc-cli/tests/plugin_models.rs` installs a temporary user configuration
+that references the two real packages already present on this host:
+
+  opencode-antigravity-auth@1.6.0
+  @sunerpy/opencode-kiro-auth@0.20.6
+
+It runs the production CLI's plain `models` command and asserts stdout contains:
+
+  google/...
+  kiro-auth/...
+
+The test also runs with `PATH=/usr/bin:/bin`, proving runtime discovery does not
+accidentally depend on the interactive shell's mise shim. It fails if kiro merely
+loads but returns no user-visible provider models, while its independent `google`
+assertion prevents the antigravity path from regressing.
+
+Focused results:
+
+  cargo test -p oc-cli --test plugin_models --offline -- --nocapture   PASS
+  cargo test -p oc-plugin --test js --offline                          PASS
+  cargo build -p oc-cli --offline                                      PASS
+
+
+4. RELEASED-BINARY PROVIDER COMPARISON
+--------------------------------------------------------------------------------
+After rebuilding the subject, provider IDs were derived from each binary's plain
+`models` output and compared as sorted sets:
+
+  this port after fix: 9 providers, including google and kiro-auth
+  released 1.18.15:   10 providers
+  `comm -3` difference: opencode only
+
+The remaining `opencode` difference is expected and deliberately not conflated
+with this task. It is the upstream product's compiled-in hosted provider (for
+models such as `opencode/big-pickle`), not output from either configured auth
+plugin. This task routes real plugin contributions; it does not invent or clone
+an unrelated hosted service.
+
+
+5. FULL GATES
+--------------------------------------------------------------------------------
+The final combined validation ran from this worktree and every command exited 0:
+
+  OC_MEMORY_GATE_MODE=skip cargo test --workspace --offline
+    all reported test suites: ok; 0 failed
+  cargo clippy --workspace --all-targets --offline
+    Finished dev profile; no warnings or errors
+  cargo fmt --all --check
+    clean
+  cargo metadata --locked --offline --format-version 1
+    exit 0
+  git diff --check
+    clean
+
+The complete captured validation log ended with all workspace crates checked and:
+
+  Finished `dev` profile [unoptimized + debuginfo] target(s) in 19.10s
+
+`lsp_diagnostics` could not address this worktree because the tool session is
+rooted at `/config/workspace/ProdDir/AI/opencode-rust` and rejects every absolute
+path outside that request cwd, including the normalized `../oc-wt/t139` path.
+It was attempted twice and both calls failed before starting a language server.
+The compiler-backed workspace tests and all-target Clippy gate therefore provide
+the source diagnostics for the changed Rust files without touching the forbidden
+main worktree.
+
+
+6. SCOPE
+--------------------------------------------------------------------------------
+Changed production areas are limited to the CLI models route, JS hook ABI/runtime
+discovery, and catalog model replacement, plus one real-plugin CLI regression
+test and task records. `crates/oc-testkit/**` and `crates/oc-server/**` were not
+modified. No push or merge was performed.
