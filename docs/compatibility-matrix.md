@@ -37,6 +37,10 @@ OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs
 | 11 | [`malformed-auth-json-is-an-error`](divergences.md#malformed-auth-json-is-an-error) | `$XDG_DATA_HOME/opencode/auth.json` — reading the credential store |
 | 12 | [`failed-format-restores-pre-format-bytes`](divergences.md#failed-format-restores-pre-format-bytes) | post-edit formatter execution — the file's bytes after a formatter exits non-zero |
 | 13 | [`non-pure-plugin-generated-trees`](divergences.md#non-pure-plugin-generated-trees) | `debug config` without `OPENCODE_PURE` — the `agent` and `command` trees a third-party JS plugin synthesises |
+| 14 | [`plain-cli-presentation`](divergences.md#plain-cli-presentation) | every CLI command's stdout and stderr — colour, the `Error: ` prefix, the prompt gutter, and JSON object key order |
+| 15 | [`diagnostics-name-their-cause`](divergences.md#diagnostics-name-their-cause) | CLI failure messages on paths where upstream reports an opaque error — `serve` on an unavailable port, `run` with no message, `run` with an unresolvable model |
+| 16 | [`session-list-output-shape`](divergences.md#session-list-output-shape) | CLI `session list` and `session list --format json` with at least one session |
+| 17 | [`non-vcs-plan-glob-is-absolute`](divergences.md#non-vcs-plan-glob-is-absolute) | `agent list` — the `plan` agent's `edit` allow-rule for the global plans directory, in a directory that is not a repository |
 <!-- generated:END divergence-index -->
 
 ## Cross-session resident memory

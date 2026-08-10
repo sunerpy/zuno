@@ -50,6 +50,7 @@
 //! | [`ScriptedEnv`] | the closed world both sides run in: temp `XDG_*`, temp `HOME`, temp `TMPDIR`, explicit `OPENCODE_DB` |
 //! | [`ConfigFixture`] | layered config trees on disk, for a config differential matrix |
 //! | [`diff_normalized`] | the verdict, with provenance and masking in the report |
+//! | [`normalize_cli_stream`] | the four declared CLI *presentation* differences, so `crates/oc-cli/tests/cli_parity.rs` can compare every implemented command's streams |
 //! | [`CassettePlayer`] | cursor replay of the oracle's recorded provider traffic |
 //! | [`MockProvider`] | a loopback provider stand-in that captures every request |
 //! | [`FakeTerminalOwner`] | a terminal-lease owner that records transitions and owns no TTY |
@@ -83,6 +84,7 @@
 //! ```
 
 pub mod cassette;
+pub mod cli_normalize;
 pub mod compat_report;
 pub mod config_fixture;
 pub mod diff;
@@ -100,6 +102,10 @@ pub mod terminal_owner;
 pub use crate::cassette::{
     BodyEncoding, Cassette, CassettePlayer, HttpInteraction, Interaction, RequestSnapshot,
     ResponseSnapshot, SseFrame, canonical_snapshot, list_cassettes, recordings_root,
+};
+pub use crate::cli_normalize::{
+    CLI_RULE_NAMES, canonicalize_json, mask_program_name, normalize_cli_stream, strip_error_prefix,
+    strip_prompt_chrome, strip_sgr,
 };
 pub use crate::compat_report::{
     BehaviouralDifference, ComparedSurface, CompatReport, DivergenceSummary, KnownGap,

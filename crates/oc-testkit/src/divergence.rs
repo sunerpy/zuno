@@ -53,7 +53,16 @@ use crate::error::{Result, TestkitError};
 /// narrowing puts out of scope. A narrowing nothing declares is a waiver, so the
 /// entry carries the measured tree sizes and
 /// [`NON_PURE_PLUGIN_TREES_ID`] names it for the tests that pin the narrowing.
-pub const DECLARED_COUNT: usize = 13;
+///
+/// Went from thirteen to seventeen in plan todo 135, which executed all twelve
+/// implemented CLI commands against the pinned release and compared normalized exit
+/// status, stdout and stderr. Four previously undeclared differences fell out of
+/// that comparison — `plain-cli-presentation`, `diagnostics-name-their-cause`,
+/// `session-list-output-shape` and `non-vcs-plan-glob-is-absolute` — and each one
+/// is the justification for exactly one thing `crates/oc-cli/tests/cli_parity.rs`
+/// forgives or exempts. A parity comparison that had normalized any of them without
+/// declaring it would have been the laundering this file exists to prevent.
+pub const DECLARED_COUNT: usize = 17;
 
 /// The entry declaring criterion 2's narrowing to pure mode.
 pub const NON_PURE_PLUGIN_TREES_ID: &str = "non-pure-plugin-generated-trees";
