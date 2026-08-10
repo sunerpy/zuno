@@ -6740,3 +6740,23 @@ todo 143 在证明 antigravity 那一半时发现，**我独立核实**：`HookI
 更强的结论是它顺手证出来的：**antigravity 对 `models` 这个 surface 的贡献是 0 字节**——同一份 `env -i`、唯一差别是插件列表，`models --verbose` 两次都是 2944 行、`diff` 为空。原因是 antigravity 只注册 `event`/`tool`/`auth`（我核实了 `dist/src/plugin.js:1138-1143`，那里的 `provider:` 是 `auth` 对象**内部**的字段而非顶层 hook），而 `models.rs` 只 dispatch `Config` 与 `Provider`。
 
 **所以 F2-B1 的病根比「断言写弱了」更深：断言选错了 surface。** 143 把证据改到 antigravity 真正动手的地方——它注册的 auth resource 方法标签，并同时断言该字符串不在夹具 catalog 文本内。
+
+## [2026-08-10] 我用 `git add -A -f` 把 48,148 个 `target/` 文件提交进了 main
+
+补 todo 144 的证据与勾选时，我为了越过 `.omo` 的笼统忽略规则写了 `git add -A -f`。**`-f` 同时越过了 `/target`**，于是 `2576d754` 带进 **48,148** 个构建产物文件。
+
+抓到它的不是门（`premerge.sh` 全绿、3365 通过），是我合并后顺手看 `git status --porcelain` 发现 `target/.rustc_info.json` 被标成 `M`——被跟踪的文件才会这样显示。`git ls-files target/ | wc -l` 立刻确认了规模。
+
+处理：`git reset --hard` 回退 main → 在分支上 `reset --soft HEAD~1` 拆掉那次提交 → 改成 `git add crates/` 加上**逐个点名**的两个 `.omo` 文件 → 确认 `git diff --cached --name-only | grep -c "^target/"` 为 0 → 重新提交（18 个文件）→ 重新合并。
+
+### 这是同一种错误的第二次
+
+第一次是我把带 `<<<<<<<` 冲突标记的代码提交进 main（wave 45），根因是「自动解决脚本 + 无条件 `git add -A && git commit`」。这次根因是「为绕过一条忽略规则而使用 `-f`，却越过了全部忽略规则」。
+
+**两次的共同点：我用了一个比意图更宽的操作。** `-A` 比「我改的那些文件」更宽；`-f` 比「只越过 `.omo` 这一条规则」更宽。
+
+规则：
+> **需要越过忽略规则时，逐个点名文件，绝不用 `-f` 配 `-A`。** `.omo` 下的文件用 `git add -f <具体路径>`；代码用 `git add crates/`。提交前用
+> `git diff --cached --name-only | grep -c "^target/"` 确认为 0。
+
+`premerge.sh` 的冲突标记闸门是我上次加的，这次没帮上——因为构建产物不是冲突标记。**闸门只能挡它认识的那一种脏。** 值得考虑再加一条：暂存区里出现 `target/` 就拒绝。
