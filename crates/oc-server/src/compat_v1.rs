@@ -169,7 +169,7 @@ pub struct V1Route {
 }
 
 const AG: &str = "opencode-antigravity-auth@1.6.0";
-const KIRO: &str = "@sunerpy/opencode-kiro-auth@0.20.1";
+const KIRO: &str = "@sunerpy/opencode-kiro-auth@0.20.6";
 const OMO: &str = "@sunerpy/oh-my-openagent@4.21.0";
 
 /// The 20 routes the installed plugins actually call.

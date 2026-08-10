@@ -36,6 +36,7 @@ OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs
 | 10 | [`context-md-excluded`](divergences.md#context-md-excluded) | project instruction cascade — the filename list probed by `findUp` |
 | 11 | [`malformed-auth-json-is-an-error`](divergences.md#malformed-auth-json-is-an-error) | `$XDG_DATA_HOME/opencode/auth.json` — reading the credential store |
 | 12 | [`failed-format-restores-pre-format-bytes`](divergences.md#failed-format-restores-pre-format-bytes) | post-edit formatter execution — the file's bytes after a formatter exits non-zero |
+| 13 | [`non-pure-plugin-generated-trees`](divergences.md#non-pure-plugin-generated-trees) | `debug config` without `OPENCODE_PURE` — the `agent` and `command` trees a third-party JS plugin synthesises |
 <!-- generated:END divergence-index -->
 
 ## Cross-session resident memory

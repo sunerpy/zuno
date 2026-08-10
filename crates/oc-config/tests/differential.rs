@@ -2,7 +2,7 @@ use oc_config::Config;
 use oc_config::discovery::{DiscoveryOptions, discover_with};
 use oc_config::schema::permission::{PermissionConfig, PermissionRule};
 use oc_paths::Env;
-use oc_testkit::{ConfigFixture, Normalizer, Oracle, diff_normalized};
+use oc_testkit::{ConfigFixture, DivergenceList, Normalizer, Oracle, diff_normalized, divergence};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -10,6 +10,9 @@ use std::error::Error;
 use std::path::Path;
 
 const MINIMUM_TREE_COUNT: usize = 12;
+
+/// The matrix case criterion 2 names, shared by the matrix and its pure-mode pin.
+const REAL_USER_CASE: &str = "real-user-global-config";
 
 const REQUIRED_COVERAGE: &[&str] = &[
     "global-only",
@@ -296,7 +299,7 @@ fn matrix() -> Result<Vec<MatrixCase>, Box<dyn Error>> {
         // on it while the released binary exited 0; nothing in the synthetic trees
         // above carries that key, which is why every test passed anyway.
         MatrixCase::config(
-            "real-user-global-config",
+            REAL_USER_CASE,
             base_fixture()?
                 .global(&real_user_config())?
                 .env_var("OPENCODE_PURE", "1"),
@@ -389,6 +392,116 @@ fn merged_config_matches_real_opencode_across_the_full_matrix() -> Result<(), Bo
         )
         .into())
     }
+}
+
+/// Success criterion 2's narrowing, pinned so widening it fails here.
+///
+/// The plan owner narrowed criterion 2 on 2026-08-09 to require byte-identical
+/// merged configuration in **pure mode**. A narrowing no test enforces is a
+/// waiver, so all three halves of the narrowing are asserted:
+///
+/// 1. the real-user case the byte-exact matrix runs is *scoped* to pure mode, so
+///    silently reinterpreting the criterion as non-pure fails;
+/// 2. the excluded non-pure difference is declared in `docs/divergences.toml`
+///    with **both** measured tree sizes, so a reader learns what was excluded and
+///    a future difference outside those two trees is undeclared rather than
+///    absorbed;
+/// 3. this port really does still leave `agent` and `command` empty without pure
+///    mode — if plugin-tree synthesis ever lands, the declaration describes a
+///    difference that no longer exists and must be revisited.
+#[test]
+fn criterion_2_is_narrowed_to_pure_mode_and_the_non_pure_plugin_trees_are_declared()
+-> Result<(), Box<dyn Error>> {
+    let cases = matrix()?;
+    let real_user = cases
+        .iter()
+        .find(|case| case.name == REAL_USER_CASE)
+        .ok_or_else(|| {
+            format!(
+                "the byte-exact matrix no longer contains a case named {REAL_USER_CASE}; \
+                 criterion 2 names the user's own config specifically, so the case cannot be \
+                 renamed away"
+            )
+        })?;
+    assert_eq!(
+        real_user
+            .fixture
+            .env()
+            .env_vars()
+            .get("OPENCODE_PURE")
+            .map(String::as_str),
+        Some("1"),
+        "criterion 2 was narrowed to pure mode, so case {REAL_USER_CASE} must force \
+         OPENCODE_PURE=1. Without it this test would be asserting a scope the criterion no \
+         longer claims, and the declared non-pure divergence below would be covering a \
+         comparison that is once again required."
+    );
+    assert_eq!(
+        real_user.oracle_args,
+        &["debug", "config"],
+        "the narrowed comparison is still `debug config`; a different oracle command would not \
+         be the byte-identical merged configuration criterion 2 names"
+    );
+
+    let list = DivergenceList::load()?;
+    let entry = list
+        .find(divergence::NON_PURE_PLUGIN_TREES_ID)
+        .ok_or_else(|| {
+            format!(
+                "{} does not declare {:?}. Criterion 2's non-pure comparison is out of scope \
+                 ONLY because that exclusion is declared; without the entry the narrowing is a \
+                 waiver.",
+                list.path().display(),
+                divergence::NON_PURE_PLUGIN_TREES_ID
+            )
+        })?;
+    for (tree, measured) in [
+        ("agent", divergence::NON_PURE_AGENT_TREE_BYTES),
+        ("command", divergence::NON_PURE_COMMAND_TREE_BYTES),
+    ] {
+        assert!(
+            entry.reason.contains(&measured.to_string()),
+            "the {:?} entry must state the measured {tree}-tree size ({measured} bytes). A \
+             declaration without the number cannot be contradicted by a later measurement, \
+             which is the whole difference between a declared divergence and a shrug.",
+            divergence::NON_PURE_PLUGIN_TREES_ID
+        );
+    }
+    assert!(
+        entry.surface.contains("OPENCODE_PURE"),
+        "the {:?} entry must name the mode it is scoped to; an entry that does not say \
+         \"without OPENCODE_PURE\" would read as an unconditional difference",
+        divergence::NON_PURE_PLUGIN_TREES_ID
+    );
+
+    let non_pure = base_fixture()?.global(&real_user_config())?;
+    let merged = discover_with(&options(non_pure.env()))?;
+    let agent_entries = merged
+        .agent
+        .as_ref()
+        .map_or(0, |agent| agent.iter().count());
+    let command_entries = merged
+        .command
+        .as_ref()
+        .map_or(0, |command| command.iter().count());
+    assert_eq!(
+        (agent_entries, command_entries),
+        (0, 0),
+        "without pure mode this port still contributes no plugin-generated agent or command \
+         entries, which is exactly what {:?} declares. It now produces {agent_entries} agent and \
+         {command_entries} command entries, so the declared difference no longer describes \
+         reality — re-measure the oracle and update the entry rather than deleting this \
+         assertion.",
+        divergence::NON_PURE_PLUGIN_TREES_ID
+    );
+    eprintln!(
+        "criterion 2: case {REAL_USER_CASE} scoped to OPENCODE_PURE=1; non-pure exclusion \
+         declared as {} with {}-byte agent and {}-byte command trees measured on the oracle",
+        divergence::NON_PURE_PLUGIN_TREES_ID,
+        divergence::NON_PURE_AGENT_TREE_BYTES,
+        divergence::NON_PURE_COMMAND_TREE_BYTES
+    );
+    Ok(())
 }
 
 #[test]

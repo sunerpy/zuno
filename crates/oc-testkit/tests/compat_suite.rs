@@ -1864,6 +1864,133 @@ async fn api_behaviour_matrix_invokes_every_subject_operation_and_rejects_501() 
     );
 }
 
+/// Success criterion 4's narrowing, frozen by NAME rather than by count.
+///
+/// The narrowing permits exactly these operations to answer `503
+/// backend_unavailable`; everything else upstream declares must have a backend
+/// whose status and normalized body are compared. A count alone cannot catch a
+/// swap — one gap closing while another opens leaves the number at fourteen — so
+/// the members are listed and
+/// [`criterion_4_freezes_the_backend_unavailable_operations_by_name`] compares
+/// this list against what the server *actually answers*, not against a constant
+/// somewhere else.
+///
+/// Plan todo 132 implements the permission/question `reply`/`reject` routes and
+/// drops this list to ten. That is meant to be an explicit edit here, in the same
+/// commit, so the set shrinking is a decision a reviewer sees rather than drift.
+const FROZEN_API_GAPS: &[(&str, &str)] = &[
+    ("DELETE", "/api/credential/{credentialID}"),
+    ("DELETE", "/api/integration/attempt/{attemptID}"),
+    ("GET", "/api/integration/attempt/{attemptID}"),
+    ("GET", "/api/session/{sessionID}/message/{messageID}"),
+    ("GET", "/api/session/{sessionID}/permission"),
+    ("GET", "/api/session/{sessionID}/permission/{requestID}"),
+    ("PATCH", "/api/credential/{credentialID}"),
+    ("POST", "/api/integration/attempt/{attemptID}/complete"),
+    ("POST", "/api/integration/{integrationID}/connect/key"),
+    ("POST", "/api/integration/{integrationID}/connect/oauth"),
+    ("POST", "/api/session/{sessionID}/permission"),
+    (
+        "POST",
+        "/api/session/{sessionID}/permission/{requestID}/reply",
+    ),
+    (
+        "POST",
+        "/api/session/{sessionID}/question/{requestID}/reject",
+    ),
+    (
+        "POST",
+        "/api/session/{sessionID}/question/{requestID}/reply",
+    ),
+];
+
+#[tokio::test]
+async fn criterion_4_freezes_the_backend_unavailable_operations_by_name() {
+    let root = oc_testkit::subject::workspace_root().expect("workspace root");
+    let document: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join(ORACLE_OPENAPI_FIXTURE)).expect("read oracle OpenAPI"),
+    )
+    .expect("parse oracle OpenAPI");
+    let matrix = api_behaviour_matrix(&document);
+    let subject_root = tempfile::tempdir().expect("subject gap-freeze root");
+    let subject = start_subject_server(subject_root.path()).await;
+
+    let frozen: BTreeSet<(String, String)> = FROZEN_API_GAPS
+        .iter()
+        .map(|(method, path)| ((*method).to_owned(), (*path).to_owned()))
+        .collect();
+    assert_eq!(
+        frozen.len(),
+        FROZEN_API_GAPS.len(),
+        "the frozen gap list contains a duplicate, which would let a real gap hide behind it"
+    );
+
+    let mut observed = BTreeSet::new();
+    let mut closed_without_a_compared_backend = Vec::new();
+    for row in &matrix {
+        let operation = (row.method.to_ascii_uppercase(), row.path.clone());
+        let status = observe_api_operation(subject.addr, row, subject_root.path())
+            .await
+            .status;
+        if status == 503 {
+            observed.insert(operation);
+            continue;
+        }
+        // A member that leaves the frozen set has to arrive somewhere: an
+        // operation answering 200 while its matrix row still says "exempt" is
+        // reported as parity without ever being compared, which is the exact
+        // laundering the narrowing forbids.
+        if frozen.contains(&operation)
+            && !(matches!(row.status, ApiDimension::Compared(_))
+                && matches!(row.body, ApiDimension::Compared(_)))
+        {
+            closed_without_a_compared_backend.push(format!("{} {}", operation.0, operation.1));
+        }
+    }
+
+    let appeared: Vec<_> = observed.difference(&frozen).cloned().collect();
+    assert!(
+        appeared.is_empty(),
+        "{} operation(s) newly answer 503 backend_unavailable and are NOT in the frozen \
+         criterion-4 gap set: {appeared:?}\n\nThe narrowed criterion 4 allows exactly {} named \
+         gaps. A new one is a regression in coverage, not a member of the allow-list: give the \
+         operation a backend, or get the plan owner to widen the criterion and add it here \
+         deliberately.",
+        appeared.len(),
+        FROZEN_API_GAPS.len()
+    );
+
+    let departed: Vec<_> = frozen.difference(&observed).cloned().collect();
+    assert!(
+        departed.is_empty(),
+        "{} frozen gap(s) no longer answer 503: {departed:?}\n\nThat is progress, but it must be \
+         recorded: remove them from FROZEN_API_GAPS in the same commit that backs them, so the \
+         set shrinking is an explicit edit. Todo 132 is expected to do exactly this for the \
+         permission/question reply and reject routes.",
+        departed.len()
+    );
+
+    assert!(
+        closed_without_a_compared_backend.is_empty(),
+        "{} operation(s) left the frozen gap set without gaining a compared backend: {}\n\nAn \
+         operation that answers something other than 503 while its behaviour-matrix row exempts \
+         both status and body is counted as neither a gap nor parity — it is invisible. Compare \
+         it, or leave it as an explicit 503.",
+        closed_without_a_compared_backend.len(),
+        closed_without_a_compared_backend.join(", ")
+    );
+
+    eprintln!(
+        "criterion 4: {} backend-unavailable operations frozen by name and observed exactly:\n{}",
+        observed.len(),
+        observed
+            .iter()
+            .map(|(method, path)| format!("  {method} {path}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
 #[tokio::test]
 async fn api_behaviour_matrix_compares_live_status_body_and_side_effects() {
     let Some(binary) = oracle_binary() else {
@@ -2663,6 +2790,16 @@ fn behavioural_differences() -> Vec<BehaviouralDifference> {
             declared_as: "failed-format-restores-pre-format-bytes".to_owned(),
             upstream_evidence: "packages/opencode/src/format/index.ts:73-114 checks `result.exitCode !== 0` and only logs; a spawn failure is mapped to undefined; nothing is snapshotted or written back".to_owned(),
             asserted_by: "crates/oc-tools/tests/format.rs::a_formatter_that_truncates_the_file_before_failing_has_its_damage_undone".to_owned(),
+        },
+        BehaviouralDifference {
+            id: "non-pure-plugin-generated-trees".to_owned(),
+            surface: "`debug config` without OPENCODE_PURE — the plugin-generated `agent` and `command` trees".to_owned(),
+            declared_as: divergence::NON_PURE_PLUGIN_TREES_ID.to_owned(),
+            upstream_evidence: format!(
+                "measured on the user's real /config/.config/opencode/opencode.json in .omo/evidence/F1-REPORT-wave2.md: the released binary's own plugin set synthesises a {}-byte `agent` tree and a {}-byte `command` tree that this port leaves empty, so success criterion 2's byte-identical comparison was narrowed to pure mode",
+                divergence::NON_PURE_AGENT_TREE_BYTES, divergence::NON_PURE_COMMAND_TREE_BYTES
+            ),
+            asserted_by: "crates/oc-config/tests/differential.rs::criterion_2_is_narrowed_to_pure_mode_and_the_non_pure_plugin_trees_are_declared".to_owned(),
         },
         BehaviouralDifference {
             id: "memory-subsystem".to_owned(),

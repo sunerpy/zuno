@@ -1092,27 +1092,6 @@ async fn api_pty_connect_requires_a_single_use_unexpired_ticket_without_echoing_
         assert!(!body.to_string().contains("definitely-wrong"));
     }
 
-    let expired = state.pty().tickets().issue_at(
-        TicketScope::for_session(PtyId::from_raw(&pty_id)),
-        Instant::now() - Duration::from_secs(61),
-    );
-    let expired_response = app
-        .clone()
-        .oneshot(request(
-            Method::GET,
-            &format!("/api/pty/{pty_id}/connect?ticket={}", expired.ticket),
-            None,
-        ))
-        .await
-        .expect("expired connect rejection responds");
-    assert_eq!(expired_response.status(), StatusCode::FORBIDDEN);
-    assert!(
-        !response_json(expired_response)
-            .await
-            .to_string()
-            .contains(&expired.ticket)
-    );
-
     let first = app
         .clone()
         .oneshot(request(
@@ -1126,6 +1105,7 @@ async fn api_pty_connect_requires_a_single_use_unexpired_ticket_without_echoing_
     assert!(!response_json(first).await.to_string().contains(&ticket));
 
     let replay = app
+        .clone()
         .oneshot(request(
             Method::GET,
             &format!("/api/pty/{pty_id}/connect?ticket={ticket}"),
@@ -1135,6 +1115,75 @@ async fn api_pty_connect_requires_a_single_use_unexpired_ticket_without_echoing_
         .expect("ticket replay responds");
     assert_eq!(replay.status(), StatusCode::FORBIDDEN);
     assert!(!response_json(replay).await.to_string().contains(&ticket));
+
+    // Two things made the old expiry assertion pass for the wrong reason, and both
+    // are fixed here.
+    //
+    // 1. It issued the stale ticket with `TicketScope::for_session`, whose
+    //    `directory` is `None`, while `pty::connect` redeems with `Some("/repo")`.
+    //    The route answered 403 on the scope mismatch, so it stayed green with
+    //    expiry enforcement removed entirely. The probe below redeems a *fresh*
+    //    ticket carrying the hand-built scope first, so the scope is proven
+    //    redeemable before the stale one is trusted to fail for expiry.
+    // 2. `prune_expired` sweeps from the FRONT only, which is correct because
+    //    production always issues at `Instant::now()` and the queue is therefore
+    //    ordered oldest-first. A back-dated ticket pushed behind a fresher one
+    //    escapes that sweep. So this block runs last, when the earlier tickets have
+    //    all been consumed and the stale ticket is the queue's only — hence
+    //    oldest — entry, which is the ordering production guarantees.
+    let scope = || TicketScope {
+        pty_id: PtyId::from_raw(&pty_id),
+        directory: Some("/repo".to_owned()),
+        workspace_id: None,
+    };
+    assert!(
+        state.pty().tickets().is_empty(),
+        "the stale ticket must be the only entry, or the front-only prune will not reach it and \
+         this block stops testing expiry"
+    );
+    let probe = state.pty().tickets().issue(scope());
+    let accepted = app
+        .clone()
+        .oneshot(request(
+            Method::GET,
+            &format!("/api/pty/{pty_id}/connect?ticket={}", probe.ticket),
+            None,
+        ))
+        .await
+        .expect("scope probe responds");
+    assert_eq!(
+        accepted.status(),
+        StatusCode::BAD_REQUEST,
+        "an unexpired ticket carrying the route's own scope must be redeemed and fail later, at \
+         the WebSocket upgrade. A 403 here means the scope below does not match production and \
+         the expiry assertion would pass for the wrong reason."
+    );
+
+    let expired = state
+        .pty()
+        .tickets()
+        .issue_at(scope(), Instant::now() - Duration::from_secs(61));
+    let expired_response = app
+        .oneshot(request(
+            Method::GET,
+            &format!("/api/pty/{pty_id}/connect?ticket={}", expired.ticket),
+            None,
+        ))
+        .await
+        .expect("expired connect rejection responds");
+    assert_eq!(
+        expired_response.status(),
+        StatusCode::FORBIDDEN,
+        "a ticket older than the 60s TTL must be refused. Its scope matches the route exactly — \
+         proven by the probe above — so expiry is the only thing left that can reject it, and \
+         removing `prune_expired` turns this into a 400."
+    );
+    assert!(
+        !response_json(expired_response)
+            .await
+            .to_string()
+            .contains(&expired.ticket)
+    );
 }
 
 #[tokio::test]

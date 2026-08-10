@@ -13,7 +13,7 @@
 # `not_compared` / `known_gaps` sections and must never be laundered into an
 # entry here. See `.omo/notepads/opencode-rust/decisions.md`.
 #
-# Count discipline: this file has TWELVE entries. Eight were the count plan todo
+# Count discipline: this file has THIRTEEN entries. Eight were the count plan todo
 # 86 asserted (the eighth being todo 103's cross-session memory subsystem); todo
 # 119 added four more by reconciling the "nominated divergences" that had been
 # kept in a SECOND reporting structure inside `compat_suite.rs`. That structure
@@ -108,3 +108,8 @@ reason = "Upstream funnels every read and parse failure into an empty store: `re
 id = "failed-format-restores-pre-format-bytes"
 surface = "post-edit formatter execution — the file's bytes after a formatter exits non-zero"
 reason = "Upstream inspects the exit code and only logs: `if (result && result.exitCode !== 0) yield* Effect.logError(\"failed\", …)`, with a spawn failure mapped to `undefined` and the loop continuing (`packages/opencode/src/format/index.ts:73-114`). Nothing is snapshotted or written back, so whatever a failing formatter left on disk — including a truncated file — stands. This port keeps the bytes the edit wrote and restores them when a formatter exits non-zero, reports `editRestored` in the tool metadata and says so in the tool output. The cost is deliberate: useful partial work from a formatter that exits non-zero after reformatting is discarded."
+
+[[divergence]]
+id = "non-pure-plugin-generated-trees"
+surface = "`debug config` without `OPENCODE_PURE` — the `agent` and `command` trees a third-party JS plugin synthesises"
+reason = "Success criterion 2 was NARROWED on 2026-08-09 to require byte-identical merged configuration in pure mode (`OPENCODE_PURE=1`), where neither binary loads external plugins. Without pure mode the released 1.18.15 binary's own plugin set writes generated entries into the merged config that this port does not reproduce: measured on the user's real `/config/.config/opencode/opencode.json`, a 221818-byte `agent` tree and a 17970-byte `command` tree, against empty `agent` and `command` objects here. Reproducing them means re-implementing third-party plugin output rather than the config contract, so it is a decision and not a gap — and declaring it with its measured sizes is what makes a *new* non-pure difference a failure instead of one absorbed into a vague inequality."

@@ -24,7 +24,7 @@ or lie to an operator. It is a declared divergence
 | page | what it answers |
 |---|---|
 | [docs/compatibility-matrix.md](docs/compatibility-matrix.md) | every surface's state: implemented, explicit 503 gap, added, rejected, not-registered |
-| [docs/divergences.md](docs/divergences.md) | the twelve deliberate differences, each with its reason |
+| [docs/divergences.md](docs/divergences.md) | the thirteen deliberate differences, each with its reason |
 | [docs/rejected-inputs.md](docs/rejected-inputs.md) | every deprecated config form, its replacement, and the exact error message |
 | [docs/migration.md](docs/migration.md) | opening an existing database, the channel-database rule, the 38 migrations |
 | [docs/session-retention.md](docs/session-retention.md) | the C8 prune operator guide — `--archive` reversible, `--delete` not |
