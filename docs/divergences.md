@@ -1,17 +1,26 @@
 # Divergences
 
-Thirteen deliberate differences from upstream `opencode` 1.18.13. Each one is a
+Seventeen deliberate differences from upstream `opencode` 1.18.13. Each one is a
 **decision**, not an omission: a surface that is merely unimplemented is a gap,
 recorded in the compatibility report's `known_gaps` and listed in the
 [compatibility matrix](compatibility-matrix.md), never here.
 
-This page is the **single place** a behavioural difference is declared. Four of the
-thirteen arrived late, in plan todo 119: they had been recorded in
-`compat_suite.rs::nominated_divergences`, a second structure that asserted they
-stayed *out* of the allow-list, so a reader consulting this page could not learn
-about them and no gate could fail while they went undeclared. The thirteenth
-arrived in plan todo 133, which declared what success criterion 2's narrowing to
-pure mode leaves out — because a narrowing nothing declares is a waiver.
+This page is the **single place** a behavioural difference is declared. The count
+grew as late declarations landed, and the history is worth keeping because each
+addition closed a way the page could have lied. Four arrived in plan todo 119:
+they had been recorded in `compat_suite.rs::nominated_divergences`, a second
+structure that asserted they stayed *out* of the allow-list, so a reader
+consulting this page could not learn about them and no gate could fail while they
+went undeclared. A thirteenth arrived in plan todo 133, declaring what success
+criterion 2's narrowing to pure mode leaves out — because a narrowing nothing
+declares is a waiver. The final four arrived in plan todo 135, when comparing
+every implemented command's output against the released binary measured real CLI
+differences that had never been written down.
+
+The total above is asserted against `oc_testkit::divergence::DECLARED_COUNT` by
+`crates/oc-cli/tests/docs.rs`, because this sentence said "Thirteen" for two
+review waves after the allow-list held seventeen: a hand-written headline that
+nothing derives is exactly the drift the rest of this page is built to prevent.
 
 ## How this page cannot drift
 

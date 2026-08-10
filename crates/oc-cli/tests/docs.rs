@@ -299,6 +299,18 @@ fn docs_every_declared_divergence_is_documented_with_its_reason() {
         &[&format!("the {} deliberate differences", spell(list.len()))],
     );
 
+    // The divergence page's own headline. It said "Thirteen" for two review waves
+    // after the allow-list reached seventeen, on the one page that calls itself the
+    // single declaration point -- so the count a reader sees first is derived here
+    // too. Capitalised because it opens the sentence.
+    let headline = spell(list.len());
+    let capitalised = format!(
+        "{}{} deliberate differences",
+        headline[..1].to_uppercase(),
+        &headline[1..]
+    );
+    contains_all("docs/divergences.md", &[&capitalised]);
+
     check_block(
         "docs/divergences.md",
         "divergence-detail",

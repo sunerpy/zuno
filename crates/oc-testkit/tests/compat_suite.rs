@@ -140,7 +140,7 @@ const SURFACES: &[SurfaceRow] = &[
         verdict: Verdict::PartiallyCompared,
         oracle: OracleKind::LiveBinary,
         evidence: "crates/oc-testkit/tests/compat_suite.rs::api_behaviour_matrix_compares_live_status_body_and_side_effects",
-        detail: "58 of 58 upstream operations are invoked against both processes with status, normalized body, and side-effect delta captured; 17 operations are exact live differentials — todo 122's five including both SSE streams, plus todo 127's twelve read-only catalogue and filesystem operations — while todos 128 and 129 compare status and normalized body for nineteen more operations; 14 missing local backends remain explicit 503 gaps and 8 backed operations carry visible cross-process fixture exemptions; 2 C8 operations are added",
+        detail: "58 of 58 upstream operations are invoked against both processes with status, normalized body, and side-effect delta captured; 17 operations are exact live differentials — todo 122's five including both SSE streams, plus todo 127's twelve read-only catalogue and filesystem operations — while todos 128 and 129 compare status and normalized body for nineteen more operations; every operation without a local backend remains an explicit 503 gap — the exact set is frozen by FROZEN_API_GAPS and reported by known_gaps(), which derive the count so this prose cannot contradict them — and 8 backed operations carry visible cross-process fixture exemptions; 2 C8 operations are added",
     },
     SurfaceRow {
         id: "config-merge",
