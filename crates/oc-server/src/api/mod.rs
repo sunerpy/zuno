@@ -101,6 +101,22 @@ pub fn router(state: ApiState) -> Router {
             "/api/session/{sessionID}/question",
             get(request::session_questions),
         )
+        .route(
+            "/api/session/{sessionID}/permission",
+            get(request::session_permission_requests),
+        )
+        .route(
+            "/api/session/{sessionID}/permission/{requestID}/reply",
+            post(request::permission_reply),
+        )
+        .route(
+            "/api/session/{sessionID}/question/{requestID}/reply",
+            post(request::question_reply),
+        )
+        .route(
+            "/api/session/{sessionID}/question/{requestID}/reject",
+            post(request::question_reject),
+        )
         .route("/api/permission/request", get(request::permission_requests))
         .route("/api/permission/saved", get(request::saved_permissions))
         .route(
@@ -167,25 +183,10 @@ fn unsupported_routes() -> Router<ApiState> {
             "/api/credential/{credentialID}",
             patch(unsupported).delete(unsupported),
         )
-        .route(
-            "/api/session/{sessionID}/permission",
-            get(unsupported).post(unsupported),
-        )
+        .route("/api/session/{sessionID}/permission", post(unsupported))
         .route(
             "/api/session/{sessionID}/permission/{requestID}",
             get(unsupported),
-        )
-        .route(
-            "/api/session/{sessionID}/permission/{requestID}/reply",
-            post(unsupported),
-        )
-        .route(
-            "/api/session/{sessionID}/question/{requestID}/reply",
-            post(unsupported),
-        )
-        .route(
-            "/api/session/{sessionID}/question/{requestID}/reject",
-            post(unsupported),
         )
         .route(
             "/api/session/{sessionID}/message/{messageID}",

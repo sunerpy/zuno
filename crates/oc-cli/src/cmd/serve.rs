@@ -1,16 +1,22 @@
 use std::io::Write as _;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use oc_engine::interrupt::InterruptSignal;
 use oc_engine::r#loop::TurnEventSender;
+use oc_error::ToolError;
+use oc_permission::ReplyKind;
 use oc_server::api::{self, ApiState};
 use oc_server::{
-    AuthConfig, CompatV1State, DEFAULT_EVENT_SUBSCRIBER_CAPACITY, EventService, ServerBuilder,
+    AuthConfig, CompatV1State, DEFAULT_EVENT_SUBSCRIBER_CAPACITY, EventService, PermissionRequest,
+    QuestionDecision, QuestionRequest, QuestionToolCall, RequestBroker, ServerBuilder,
     ServerConfig, ServerServices, SessionCompactExecution, SessionMutationExecutor,
     SessionMutationFuture, SessionPromptExecution, compat_v1_router, events_router,
 };
+use oc_tool::{PermissionAsk, PermissionAsker};
+use oc_tools::question::{Answer, QuestionAsker};
+use uuid::Uuid;
 
-use super::tool_runtime::HeadlessApproval;
 use super::turn::{SessionChoice, TurnHost, TurnOptions, TurnPlan};
 use crate::command::ServeArgs;
 use crate::environment::StartupEnvironment;
@@ -18,15 +24,17 @@ use crate::environment::StartupEnvironment;
 #[derive(Clone, Debug)]
 struct ServerSessionMutationExecutor {
     environment: StartupEnvironment,
+    requests: RequestBroker,
 }
 
 impl ServerSessionMutationExecutor {
-    fn new() -> Self {
+    fn new(requests: RequestBroker) -> Self {
         Self {
             environment: StartupEnvironment::resolve(
                 &oc_paths::Env::from_process(),
                 &crate::command::GlobalOptions::default(),
             ),
+            requests,
         }
     }
 
@@ -36,17 +44,90 @@ impl ServerSessionMutationExecutor {
         directory: std::path::PathBuf,
         agent: Option<String>,
         model: Option<oc_server::SessionModelSelection>,
+        requests: RequestBroker,
         interrupt: InterruptSignal,
     ) -> Result<TurnHost, String> {
         let options = TurnOptions {
             directory: Some(directory),
             model: model.map(|model| format!("{}/{}", model.provider_id, model.model_id)),
             agent,
-            session: SessionChoice::Existing(session_id),
+            session: SessionChoice::Existing(session_id.clone()),
             title: None,
         };
         let plan = TurnPlan::resolve(&options, &environment).await?;
-        TurnHost::open_with_interrupt(plan, &environment, Arc::new(HeadlessApproval), interrupt)
+        let approval: Arc<dyn PermissionAsker> = Arc::new(ServerPermissionAsker {
+            requests: requests.clone(),
+            session_id,
+        });
+        let question: Arc<dyn QuestionAsker> = Arc::new(ServerQuestionAsker { requests });
+        TurnHost::open_with_interrupt(plan, &environment, approval, Some(question), interrupt)
+    }
+}
+
+#[derive(Debug)]
+struct ServerPermissionAsker {
+    requests: RequestBroker,
+    session_id: String,
+}
+
+#[async_trait]
+impl PermissionAsker for ServerPermissionAsker {
+    async fn ask(&self, tool: &str, ask: PermissionAsk) -> Result<(), ToolError> {
+        let request = PermissionRequest {
+            id: format!("per_{}", Uuid::new_v4().simple()),
+            session_id: self.session_id.clone(),
+            action: ask.permission,
+            resources: ask.patterns,
+            save: ask.always,
+            metadata: ask.metadata,
+            source: None,
+        };
+        match self.requests.ask_permission(request).await {
+            ReplyKind::Once | ReplyKind::Always => Ok(()),
+            ReplyKind::Reject => Err(ToolError::Denied {
+                tool: tool.to_owned(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ServerQuestionAsker {
+    requests: RequestBroker,
+}
+
+#[async_trait]
+impl QuestionAsker for ServerQuestionAsker {
+    async fn ask(
+        &self,
+        session_id: &str,
+        questions: &[oc_tools::question::QuestionRequest],
+        call: Option<(&str, &str)>,
+    ) -> Result<Vec<Answer>, ToolError> {
+        let questions = questions
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| ToolError::Failed {
+                tool: "question".to_owned(),
+                source: Box::new(source),
+            })?;
+        let tool = call.map(|(message_id, call_id)| QuestionToolCall {
+            message_id: message_id.to_owned(),
+            call_id: call_id.to_owned(),
+        });
+        let request = QuestionRequest {
+            id: format!("que_{}", Uuid::new_v4().simple()),
+            session_id: session_id.to_owned(),
+            questions,
+            tool,
+        };
+        match self.requests.ask_question(request).await {
+            QuestionDecision::Answered(answers) => Ok(answers),
+            QuestionDecision::Rejected => Err(ToolError::Denied {
+                tool: "question".to_owned(),
+            }),
+        }
     }
 }
 
@@ -58,6 +139,7 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
         events: TurnEventSender,
     ) -> SessionMutationFuture {
         let environment = self.environment.clone();
+        let requests = self.requests.clone();
         Box::pin(async move {
             let mut host = Self::open(
                 environment,
@@ -65,6 +147,7 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                 request.directory,
                 request.agent,
                 request.model,
+                requests,
                 interrupt,
             )
             .await?;
@@ -79,6 +162,7 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
         interrupt: InterruptSignal,
     ) -> SessionMutationFuture {
         let environment = self.environment.clone();
+        let requests = self.requests.clone();
         Box::pin(async move {
             let mut host = Self::open(
                 environment,
@@ -86,6 +170,7 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                 request.directory,
                 request.agent,
                 request.model,
+                requests,
                 interrupt,
             )
             .await?;
@@ -129,8 +214,10 @@ pub(super) fn execute(args: &ServeArgs) -> Result<(), String> {
         let state = ApiState::open_default(&directory)
             .map_err(|error| error.to_string())?
             .with_events(events.clone());
+        let requests = RequestBroker::with_events(events.clone());
         let services = ServerServices::new(DEFAULT_EVENT_SUBSCRIBER_CAPACITY)
-            .with_mutations(Arc::new(ServerSessionMutationExecutor::new()));
+            .with_requests(requests.clone())
+            .with_mutations(Arc::new(ServerSessionMutationExecutor::new(requests)));
         let server = ServerBuilder::new(config)
             .with_services(services)
             .with_routes(

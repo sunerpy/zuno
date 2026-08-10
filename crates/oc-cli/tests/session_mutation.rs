@@ -4,7 +4,7 @@ use std::process::{Output, Stdio};
 use std::time::Duration;
 
 use oc_testkit::env::DbChoice;
-use oc_testkit::{MockProvider, Scenario, ScriptedEnv};
+use oc_testkit::{MockProvider, MockResponse, Scenario, ScriptedEnv};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 
@@ -52,7 +52,25 @@ fn provider_config(base_url: &str) -> String {
     .to_string()
 }
 
+fn broker_provider_config(base_url: &str) -> String {
+    let mut config: Value =
+        serde_json::from_str(&provider_config(base_url)).expect("provider config is JSON");
+    config["permission"] = json!({
+        "bash": "ask",
+        "question": "allow"
+    });
+    config.to_string()
+}
+
 fn variables(env: &ScriptedEnv, base_url: &str, database: &Path) -> BTreeMap<String, String> {
+    variables_with_config(env, database, provider_config(base_url))
+}
+
+fn variables_with_config(
+    env: &ScriptedEnv,
+    database: &Path,
+    config: String,
+) -> BTreeMap<String, String> {
     let mut variables = env.env_vars();
     variables.extend([
         ("NO_COLOR".to_owned(), "1".to_owned()),
@@ -75,10 +93,7 @@ fn variables(env: &ScriptedEnv, base_url: &str, database: &Path) -> BTreeMap<Str
             "OPENCODE_DB".to_owned(),
             database.to_string_lossy().into_owned(),
         ),
-        (
-            "OPENCODE_CONFIG_CONTENT".to_owned(),
-            provider_config(base_url),
-        ),
+        ("OPENCODE_CONFIG_CONTENT".to_owned(), config),
     ]);
     variables
 }
@@ -228,12 +243,16 @@ impl Drop for HangingProvider {
 
 impl RunningServer {
     async fn start(env: &ScriptedEnv, provider_base_url: &str, database: &Path) -> Self {
+        Self::start_with_config(env, database, provider_config(provider_base_url)).await
+    }
+
+    async fn start_with_config(env: &ScriptedEnv, database: &Path, config: String) -> Self {
         let mut command = tokio::process::Command::new(binary());
         command
             .args(["serve", "--hostname", "127.0.0.1", "--port", "0"])
             .current_dir(env.working_dir())
             .env_clear()
-            .envs(variables(env, provider_base_url, database))
+            .envs(variables_with_config(env, database, config))
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
         let mut child = command
@@ -365,6 +384,113 @@ fn value_contains_text(value: &Value, expected: &str) -> bool {
             .any(|value| value_contains_text(value, expected)),
         Value::Null | Value::Bool(_) | Value::Number(_) => false,
     }
+}
+
+fn compatible_sse(events: impl IntoIterator<Item = Value>) -> Vec<u8> {
+    let mut body = String::new();
+    for event in events {
+        body.push_str("data: ");
+        body.push_str(&event.to_string());
+        body.push_str("\n\n");
+    }
+    body.push_str("data: [DONE]\n\n");
+    body.into_bytes()
+}
+
+fn broker_scenario(name: &str, tool: &str, arguments: Value, completion: &str) -> Scenario {
+    let arguments = arguments.to_string();
+    Scenario::new(name)
+        .on_path("/v1/chat/completions")
+        .respond(MockResponse::authored(
+            200,
+            "text/event-stream",
+            compatible_sse([
+                json!({"choices":[{"delta":{"tool_calls":[{
+                    "index": 0,
+                    "id": format!("call_{tool}"),
+                    "function": {"name": tool, "arguments": arguments}
+                }]}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+            ]),
+            "the broker test needs a deterministic tool call whose request id is discovered at runtime",
+        ))
+        .respond(MockResponse::authored(
+            200,
+            "text/event-stream",
+            compatible_sse([
+                json!({"choices":[{"delta":{"content": completion},"finish_reason":"stop"}]})
+            ]),
+            "the broker test needs a deterministic completion after the HTTP reply",
+        ))
+}
+
+async fn submit_http_prompt(client: &reqwest::Client, server: &RunningServer, message_id: &str) {
+    let response = client
+        .post(format!(
+            "{}/api/session/{SESSION_ID}/prompt",
+            server.base_url
+        ))
+        .json(&json!({
+            "id": message_id,
+            "prompt": { "text": PROMPT },
+            "delivery": "steer"
+        }))
+        .send()
+        .await
+        .expect("submit broker HTTP prompt");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+}
+
+async fn wait_for_pending(client: &reqwest::Client, url: String) -> Value {
+    tokio::time::timeout(RUN_TIMEOUT, async {
+        loop {
+            let body = client
+                .get(&url)
+                .send()
+                .await
+                .expect("read pending requests")
+                .json::<Value>()
+                .await
+                .expect("pending request response is JSON");
+            if let Some(request) = body["data"].as_array().and_then(|data| data.first()) {
+                return request.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the HTTP-driven turn must park on a pending request")
+}
+
+async fn wait_for_http_turn(client: &reqwest::Client, server: &RunningServer) {
+    let response = tokio::time::timeout(
+        RUN_TIMEOUT,
+        client
+            .post(format!("{}/api/session/{SESSION_ID}/wait", server.base_url))
+            .send(),
+    )
+    .await
+    .expect("HTTP turn must finish inside its budget")
+    .expect("wait for brokered HTTP turn");
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+}
+
+async fn assert_message_contains(client: &reqwest::Client, server: &RunningServer, expected: &str) {
+    let messages = client
+        .get(format!(
+            "{}/api/session/{SESSION_ID}/message",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("read completed brokered turn")
+        .json::<Value>()
+        .await
+        .expect("message response is JSON");
+    assert!(
+        value_contains_text(&messages["data"], expected),
+        "completed turn omitted `{expected}`: {messages}"
+    );
 }
 
 fn scrub_dynamic(mut value: Value) -> Value {
@@ -755,4 +881,203 @@ async fn http_interrupt_releases_wait_and_leaves_one_complete_abort_checkpoint()
     drop(connection);
     server.stop().await;
     provider.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_permission_request_parks_rejects_cross_session_reply_and_resumes() {
+    const COMPLETION: &str = "PERMISSION_HTTP_OK";
+    let env = ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::Default);
+    let database = env.xdg_data().join("http-permission-broker.db");
+    seed_session(&database, env.project());
+    let scenario = broker_scenario(
+        "http-permission-broker",
+        "bash",
+        json!({"command": "pwd", "intent": "prove the HTTP permission broker"}),
+        COMPLETION,
+    );
+    let provider = MockProvider::start(vec![scenario])
+        .await
+        .expect("mock provider binds loopback");
+    let mut server = RunningServer::start_with_config(
+        &env,
+        &database,
+        broker_provider_config(provider.base_url()),
+    )
+    .await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build loopback client");
+
+    submit_http_prompt(&client, &server, "msg_task132_permission").await;
+    let pending = wait_for_pending(
+        &client,
+        format!("{}/api/session/{SESSION_ID}/permission", server.base_url),
+    )
+    .await;
+    assert_eq!(pending["sessionID"], SESSION_ID);
+    assert_eq!(pending["action"], "bash");
+    let request_id = pending["id"]
+        .as_str()
+        .expect("permission request has an id");
+
+    let reply = client
+        .post(format!(
+            "{}/api/session/{SESSION_ID}/permission/{request_id}/reply",
+            server.base_url
+        ))
+        .json(&json!({"reply": "once"}))
+        .send()
+        .await
+        .expect("approve pending permission");
+    assert_eq!(reply.status(), reqwest::StatusCode::NO_CONTENT);
+
+    wait_for_http_turn(&client, &server).await;
+    assert_message_contains(&client, &server, COMPLETION).await;
+    assert_eq!(provider.captured_count().await, 2);
+
+    server.stop().await;
+    provider.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_question_request_parks_and_reply_resumes_the_same_turn() {
+    const COMPLETION: &str = "QUESTION_HTTP_OK";
+    let env = ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::Default);
+    let database = env.xdg_data().join("http-question-broker.db");
+    seed_session(&database, env.project());
+    let scenario = broker_scenario(
+        "http-question-broker",
+        "question",
+        json!({
+            "intent": "prove the HTTP question broker",
+            "questions": [{
+                "question": "Which database?",
+                "header": "Database",
+                "options": [
+                    {"label": "Postgres", "description": "Relational"},
+                    {"label": "SQLite", "description": "Embedded"}
+                ]
+            }]
+        }),
+        COMPLETION,
+    );
+    let provider = MockProvider::start(vec![scenario])
+        .await
+        .expect("mock provider binds loopback");
+    let mut server = RunningServer::start_with_config(
+        &env,
+        &database,
+        broker_provider_config(provider.base_url()),
+    )
+    .await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build loopback client");
+
+    submit_http_prompt(&client, &server, "msg_task132_question").await;
+    let pending =
+        wait_for_pending(&client, format!("{}/api/question/request", server.base_url)).await;
+    assert_eq!(pending["sessionID"], SESSION_ID);
+    assert_eq!(pending["questions"][0]["header"], "Database");
+    let request_id = pending["id"].as_str().expect("question request has an id");
+
+    let reply = client
+        .post(format!(
+            "{}/api/session/{SESSION_ID}/question/{request_id}/reply",
+            server.base_url
+        ))
+        .json(&json!({"answers": [["Postgres"]]}))
+        .send()
+        .await
+        .expect("answer pending question");
+    assert_eq!(reply.status(), reqwest::StatusCode::NO_CONTENT);
+
+    wait_for_http_turn(&client, &server).await;
+    assert_message_contains(&client, &server, COMPLETION).await;
+    assert_eq!(provider.captured_count().await, 2);
+
+    server.stop().await;
+    provider.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disconnected_permission_reply_fails_closed_without_running_the_tool() {
+    const COMPLETION: &str = "DISCONNECTED_PERMISSION_DENIED";
+    let env = ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::Default);
+    let database = env.xdg_data().join("http-permission-disconnect.db");
+    let forbidden_side_effect = env.working_dir().join("permission-was-allowed");
+    seed_session(&database, env.project());
+    let scenario = broker_scenario(
+        "http-permission-disconnect",
+        "bash",
+        json!({
+            "command": format!("touch {}", forbidden_side_effect.display()),
+            "intent": "prove disconnects deny permission"
+        }),
+        COMPLETION,
+    );
+    let provider = MockProvider::start(vec![scenario])
+        .await
+        .expect("mock provider binds loopback");
+    let mut server = RunningServer::start_with_config(
+        &env,
+        &database,
+        broker_provider_config(provider.base_url()),
+    )
+    .await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build loopback client");
+
+    submit_http_prompt(&client, &server, "msg_task132_disconnect").await;
+    let pending = wait_for_pending(
+        &client,
+        format!("{}/api/permission/request", server.base_url),
+    )
+    .await;
+    let request_id = pending["id"]
+        .as_str()
+        .expect("permission request has an id");
+
+    let address = server
+        .base_url
+        .strip_prefix("http://")
+        .expect("server URL uses HTTP");
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect raw HTTP client");
+    let path = format!("/api/session/{SESSION_ID}/permission/{request_id}/reply");
+    stream
+        .write_all(
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\n\
+                 Content-Length: 128\r\nConnection: close\r\n\r\n{{\"reply\":"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("send a deliberately incomplete reply body");
+    stream.flush().await.expect("flush incomplete reply");
+    stream.shutdown().await.expect("disconnect reply client");
+    drop(stream);
+
+    wait_for_http_turn(&client, &server).await;
+    assert_message_contains(&client, &server, COMPLETION).await;
+    assert!(
+        !forbidden_side_effect.exists(),
+        "a disconnected reply must reject; it allowed the shell tool to run"
+    );
+    assert_eq!(provider.captured_count().await, 2);
+
+    server.stop().await;
+    provider.shutdown().await;
 }

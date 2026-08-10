@@ -941,6 +941,21 @@ fn api_behaviour_matrix(document: &serde_json::Value) -> Vec<ApiBehaviourRow> {
         ("/api/session/{sessionID}/revert/clear", "post"),
         ("/api/session/{sessionID}/revert/commit", "post"),
     ]);
+    let task_132_compared = BTreeSet::from([
+        ("/api/session/{sessionID}/permission", "get"),
+        (
+            "/api/session/{sessionID}/permission/{requestID}/reply",
+            "post",
+        ),
+        (
+            "/api/session/{sessionID}/question/{requestID}/reply",
+            "post",
+        ),
+        (
+            "/api/session/{sessionID}/question/{requestID}/reject",
+            "post",
+        ),
+    ]);
     let mut rows = Vec::new();
     for (path, item) in document["paths"]
         .as_object()
@@ -1009,6 +1024,16 @@ fn api_behaviour_matrix(document: &serde_json::Value) -> Vec<ApiBehaviourRow> {
                     ),
                     ApiDimension::Exempt(
                         "turn execution, cancellation, waiting, and durable mutation are verified by dedicated server and CLI tests",
+                    ),
+                )
+            } else if task_132_compared.contains(&key) {
+                (
+                    ApiDimension::Compared("live status against the isolated upstream process"),
+                    ApiDimension::Compared(
+                        "live operation-scoped normalized body against the isolated upstream process",
+                    ),
+                    ApiDimension::Exempt(
+                        "pending request resolution is verified by dedicated server and production HTTP-turn tests",
                     ),
                 )
             } else {
@@ -1454,7 +1479,23 @@ fn normalize_scoped_api_body(
             | ("post", "/api/session/{sessionID}/revert/clear")
             | ("post", "/api/session/{sessionID}/revert/commit")
     );
-    if !task_128 && !task_129 {
+    let task_132 = matches!(
+        (row.method.as_str(), row.path.as_str()),
+        ("get", "/api/session/{sessionID}/permission")
+            | (
+                "post",
+                "/api/session/{sessionID}/permission/{requestID}/reply"
+            )
+            | (
+                "post",
+                "/api/session/{sessionID}/question/{requestID}/reply"
+            )
+            | (
+                "post",
+                "/api/session/{sessionID}/question/{requestID}/reject"
+            )
+    );
+    if !task_128 && !task_129 && !task_132 {
         return value;
     }
     if status >= 400 {
@@ -1799,11 +1840,11 @@ fn api_behaviour_matrix_accounts_for_status_body_and_side_effect_per_operation()
         }
     }
     assert_eq!(
-        compared, 85,
-        "thirty-four live operations are compared: todo 122's five and todo 127's twelve compare all three dimensions, while todo 128's ten and todo 129's seven compare status and normalized body -- /compact and /wait are exempt because the isolated oracle answers 503 for both"
+        compared, 93,
+        "thirty-eight live operations are compared: todo 122's five and todo 127's twelve compare all three dimensions, while todo 128's ten, todo 129's seven, and todo 132's four compare status and normalized body -- /compact and /wait are exempt because the isolated oracle answers 503 for both"
     );
     assert_eq!(
-        exempted, 89,
+        exempted, 81,
         "every other dimension must carry a visible reason, including all three compact dimensions"
     );
 }
@@ -1854,13 +1895,13 @@ async fn api_behaviour_matrix_invokes_every_subject_operation_and_rejects_501() 
         "none of todo 129's nine session-mutating operations may remain backend-unavailable"
     );
     assert_eq!(
-        unavailable, 14,
-        "the explicit API gap inventory drifted; todo 129 removes its nine backend-unavailable routes"
+        unavailable, 10,
+        "the explicit API gap inventory drifted; todo 132 removes its permission/question reply and reject routes"
     );
     assert_eq!(
         invoked.len() - unavailable,
-        44,
-        "backed operation count drifted; 58 upstream operations minus the 14 remaining 503 gaps"
+        48,
+        "backed operation count drifted; 58 upstream operations minus the 10 remaining 503 gaps"
     );
 }
 
@@ -1869,39 +1910,25 @@ async fn api_behaviour_matrix_invokes_every_subject_operation_and_rejects_501() 
 /// The narrowing permits exactly these operations to answer `503
 /// backend_unavailable`; everything else upstream declares must have a backend
 /// whose status and normalized body are compared. A count alone cannot catch a
-/// swap — one gap closing while another opens leaves the number at fourteen — so
+/// swap — one gap closing while another opens leaves the number at ten — so
 /// the members are listed and
 /// [`criterion_4_freezes_the_backend_unavailable_operations_by_name`] compares
 /// this list against what the server *actually answers*, not against a constant
 /// somewhere else.
 ///
-/// Plan todo 132 implements the permission/question `reply`/`reject` routes and
-/// drops this list to ten. That is meant to be an explicit edit here, in the same
-/// commit, so the set shrinking is a decision a reviewer sees rather than drift.
+/// Plan todo 132 implemented the permission/question `reply`/`reject` routes and
+/// dropped this list to ten in the same commit.
 const FROZEN_API_GAPS: &[(&str, &str)] = &[
     ("DELETE", "/api/credential/{credentialID}"),
     ("DELETE", "/api/integration/attempt/{attemptID}"),
     ("GET", "/api/integration/attempt/{attemptID}"),
     ("GET", "/api/session/{sessionID}/message/{messageID}"),
-    ("GET", "/api/session/{sessionID}/permission"),
     ("GET", "/api/session/{sessionID}/permission/{requestID}"),
     ("PATCH", "/api/credential/{credentialID}"),
     ("POST", "/api/integration/attempt/{attemptID}/complete"),
     ("POST", "/api/integration/{integrationID}/connect/key"),
     ("POST", "/api/integration/{integrationID}/connect/oauth"),
     ("POST", "/api/session/{sessionID}/permission"),
-    (
-        "POST",
-        "/api/session/{sessionID}/permission/{requestID}/reply",
-    ),
-    (
-        "POST",
-        "/api/session/{sessionID}/question/{requestID}/reject",
-    ),
-    (
-        "POST",
-        "/api/session/{sessionID}/question/{requestID}/reply",
-    ),
 ];
 
 #[tokio::test]

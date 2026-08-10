@@ -42,6 +42,7 @@ use oc_permission::Rule;
 use oc_permission::visibility::permission_key;
 use oc_tool::{PermissionAsk, PermissionAsker, Tool, erase};
 use oc_tools::exposure::ExposureFlags;
+use oc_tools::question::{QuestionAsker, QuestionTool};
 use oc_tools::registry::{BuiltinSlot, RegistryFlags, ResolveInput, ToolRegistryBuilder};
 use oc_tools::search_common::{SearchScope, SearchTooling};
 use oc_tools::websearch::gating::SearchConfig;
@@ -53,6 +54,12 @@ pub(crate) struct ToolRuntime {
     pub(crate) tools: Vec<Arc<dyn Tool>>,
     /// The merged ruleset the dispatcher re-evaluates before every call.
     pub(crate) rules: Vec<Rule>,
+}
+
+pub(crate) struct ToolSelection<'a> {
+    pub(crate) provider_id: &'a str,
+    pub(crate) model_id: &'a str,
+    pub(crate) question: Option<Arc<dyn QuestionAsker>>,
 }
 
 /// Assemble the registry for `agent` and project it onto `provider_id`/`model_id`.
@@ -67,8 +74,7 @@ pub(crate) fn assemble(
     env: &Env,
     config: &Config,
     selected_agent: &agent::Agent,
-    provider_id: &str,
-    model_id: &str,
+    selection: ToolSelection<'_>,
 ) -> Result<ToolRuntime, String> {
     let dynamic = super::agent::DynamicRules::resolve(directory, worktree, env, config);
     let rules = super::agent::resolved_rules(selected_agent, config, &dynamic);
@@ -94,6 +100,11 @@ pub(crate) fn assemble(
     let tooling = SearchTooling::with_backend(scope, oc_search::Backend::from_env());
     let shell = oc_tools::shell::ShellTool::new(directory).map_err(to_string)?;
     let todo_store = oc_db::pool::Pool::open_default().map_err(to_string)?;
+    if let Some(asker) = selection.question {
+        builder
+            .register_builtin(BuiltinSlot::Question, erase(QuestionTool::new(asker)))
+            .map_err(|error| error.to_string())?;
+    }
     for (slot, tool) in [
         (
             BuiltinSlot::Invalid,
@@ -125,7 +136,11 @@ pub(crate) fn assemble(
     }
 
     let registry = builder.build();
-    let mut tools = registry.resolve(ResolveInput::new(model_id, provider_id, &rules));
+    let mut tools = registry.resolve(ResolveInput::new(
+        selection.model_id,
+        selection.provider_id,
+        &rules,
+    ));
     let memory_root = worktree.unwrap_or(directory);
     if let Some(memory) = configured_memory_tool(memory_root, config) {
         tools.push(memory);

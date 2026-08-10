@@ -27,7 +27,7 @@ use tokio::net::{TcpListener, lookup_host};
 
 use crate::auth::WWW_AUTHENTICATE_VALUE;
 use crate::discovery::{self, LocalServerRegistration};
-use crate::{AuthConfig, EventFanout};
+use crate::{AuthConfig, EventFanout, RequestBroker};
 
 pub type SessionMutationFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'static>>;
 
@@ -154,6 +154,8 @@ pub struct ServerServices {
     pub events: EventFanout<TurnEvent>,
     /// Bounded destination for session-maintenance progress.
     pub maintenance_events: EventFanout<SessionPruneProgress>,
+    /// Pending permission and question requests raised by HTTP-driven turns.
+    pub requests: RequestBroker,
     pub mutations: Option<Arc<dyn SessionMutationExecutor>>,
 }
 
@@ -165,6 +167,7 @@ impl ServerServices {
             runs: SessionRunRegistry::new(),
             events: EventFanout::with_capacity(event_capacity),
             maintenance_events: EventFanout::with_capacity(event_capacity),
+            requests: RequestBroker::default(),
             mutations: None,
         }
     }
@@ -172,6 +175,12 @@ impl ServerServices {
     #[must_use]
     pub fn with_mutations(mut self, mutations: Arc<dyn SessionMutationExecutor>) -> Self {
         self.mutations = Some(mutations);
+        self
+    }
+
+    #[must_use]
+    pub fn with_requests(mut self, requests: RequestBroker) -> Self {
+        self.requests = requests;
         self
     }
 }

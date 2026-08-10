@@ -6330,3 +6330,30 @@ does not assert.
   the list against what the live server actually answers, in both directions, plus a
   third assertion for a member that leaves the set while its matrix row still exempts
   status and body — an operation counted as neither gap nor parity is invisible.
+
+## Wave 48 — todo 132 (HTTP permission/question broker)
+
+- **Upstream schema validation precedes request ownership checks.** Malformed
+  permission/question reply bodies return `400` even when the path names another
+  session's pending request; a valid cross-session body reaches the handler and
+  returns `404`. To preserve fail-closed behavior, the error path claims and drops
+  only a matching owned request. This rejects an owned disconnected reply without
+  consuming or revealing another session's pending request.
+- **Branded path IDs are part of the HTTP contract, not merely generated-name
+  conventions.** Upstream permission IDs start with `per` and question IDs with
+  `que`; schema middleware returns `400` for `request_matrix` before a handler runs.
+  A valid branded but absent ID reaches ownership lookup and returns `404`.
+- **A half-written HTTP body is the deterministic disconnect fixture.** Declaring
+  `Content-Length: 128`, writing only `{"reply":`, and closing the socket makes
+  Axum's body collection fail, after which the error path claims and drops the
+  matching owned request. This exercises the production cancellation path without
+  timing-dependent client abort APIs.
+- **Authored tool calls must satisfy the current schema before they can test a
+  broker.** The first fixture omitted required `intent`; dispatch stopped at
+  argument validation, so no request could park. Captured provider payloads and
+  persisted tool errors distinguished this from an SSE or broker-sharing defect.
+- **A process-local broker can reuse the durable event service without becoming
+  durable state.** Pending answer senders cannot survive process restart, while
+  asked/replied events remain observable through the existing session/global SSE
+  streams. Keeping these concerns separate avoids pretending a restored event can
+  resume a missing turn.

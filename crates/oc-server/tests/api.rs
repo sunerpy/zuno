@@ -14,12 +14,13 @@ use oc_engine::interrupt::InterruptSignal;
 use oc_engine::r#loop::TurnEventSender;
 use oc_engine::status::SessionStatus;
 use oc_paths::DbLocation;
+use oc_permission::ReplyKind;
 use oc_pty::{CreateInput, PtyId, TicketScope};
 use oc_server::api::{self, ApiState};
 use oc_server::{
-    Delivery, EventService, NewEvent, ServerBuilder, ServerConfig, ServerServices,
-    SessionCompactExecution, SessionMutationExecutor, SessionMutationFuture,
-    SessionPromptExecution,
+    Delivery, EventService, NewEvent, PermissionRequest, QuestionDecision, QuestionRequest,
+    RequestBroker, ServerBuilder, ServerConfig, ServerServices, SessionCompactExecution,
+    SessionMutationExecutor, SessionMutationFuture, SessionPromptExecution,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -657,6 +658,178 @@ async fn api_permission_and_question_read_routes_match_the_empty_process_state()
         .await
         .expect("saved permission delete responds");
     assert_eq!(removed.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn api_reply_routes_validate_bodies_before_rejecting_cross_session_requests() {
+    let state = ApiState::memory("/repo").expect("in-memory API state initializes");
+    let requests = RequestBroker::default();
+    let services = ServerServices::new(64).with_requests(requests.clone());
+    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
+        .with_services(services)
+        .with_routes(api::router(state))
+        .router();
+    let mut answer = tokio::spawn({
+        let requests = requests.clone();
+        async move {
+            requests
+                .ask_permission(PermissionRequest {
+                    id: "per_owner".to_owned(),
+                    session_id: "ses_owner".to_owned(),
+                    action: "bash".to_owned(),
+                    resources: vec!["pwd".to_owned()],
+                    save: Vec::new(),
+                    metadata: serde_json::Map::new(),
+                    source: None,
+                })
+                .await
+        }
+    });
+    while requests.permissions(None).is_empty() {
+        tokio::task::yield_now().await;
+    }
+
+    let malformed_permission = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_other/permission/per_owner/reply",
+            Some(json!("malformed for PermissionReplyBody")),
+        ))
+        .await
+        .expect("malformed cross-session permission reply responds");
+    assert_eq!(malformed_permission.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(requests.permissions(None).len(), 1);
+
+    let cross_session_permission = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_other/permission/per_owner/reply",
+            Some(json!({"reply": "once"})),
+        ))
+        .await
+        .expect("valid cross-session permission reply responds");
+    assert_eq!(cross_session_permission.status(), StatusCode::NOT_FOUND);
+    assert_eq!(requests.permissions(None).len(), 1);
+
+    let owner_permission = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_owner/permission/per_owner/reply",
+            Some(json!({"reply": "once"})),
+        ))
+        .await
+        .expect("owner reply responds");
+    assert_eq!(owner_permission.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), &mut answer)
+            .await
+            .expect("permission asker resumes")
+            .expect("permission asker task does not panic"),
+        ReplyKind::Once
+    );
+
+    let mut question_answer = tokio::spawn({
+        let requests = requests.clone();
+        async move {
+            requests
+                .ask_question(QuestionRequest {
+                    id: "que_owner".to_owned(),
+                    session_id: "ses_owner".to_owned(),
+                    questions: vec![json!({"question": "Continue?"})],
+                    tool: None,
+                })
+                .await
+        }
+    });
+    while requests.questions(None).is_empty() {
+        tokio::task::yield_now().await;
+    }
+
+    let malformed_question = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_other/question/que_owner/reply",
+            Some(json!("malformed for QuestionReplyBody")),
+        ))
+        .await
+        .expect("malformed cross-session question reply responds");
+    assert_eq!(malformed_question.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(requests.questions(None).len(), 1);
+
+    let cross_session_question = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_other/question/que_owner/reply",
+            Some(json!({"answers": [["yes"]]})),
+        ))
+        .await
+        .expect("valid cross-session question reply responds");
+    assert_eq!(cross_session_question.status(), StatusCode::NOT_FOUND);
+    assert_eq!(requests.questions(None).len(), 1);
+
+    let owner_question = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_owner/question/que_owner/reply",
+            Some(json!({"answers": [["yes"]]})),
+        ))
+        .await
+        .expect("owner question reply responds");
+    assert_eq!(owner_question.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), &mut question_answer)
+            .await
+            .expect("question asker resumes")
+            .expect("question asker task does not panic"),
+        QuestionDecision::Answered(vec![vec!["yes".to_owned()]])
+    );
+
+    for (path, body) in [
+        (
+            "/api/session/ses_owner/permission/request_matrix/reply",
+            Some(json!({"reply": "once"})),
+        ),
+        (
+            "/api/session/ses_owner/question/request_matrix/reply",
+            Some(json!({"answers": [["yes"]]})),
+        ),
+        (
+            "/api/session/ses_owner/question/request_matrix/reject",
+            None,
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request(Method::POST, path, body))
+            .await
+            .expect("invalid request ID responds");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+    }
+
+    for (path, body) in [
+        (
+            "/api/session/ses_owner/permission/per_missing/reply",
+            Some(json!({"reply": "once"})),
+        ),
+        (
+            "/api/session/ses_owner/question/que_missing/reply",
+            Some(json!({"answers": [["yes"]]})),
+        ),
+        ("/api/session/ses_owner/question/que_missing/reject", None),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request(Method::POST, path, body))
+            .await
+            .expect("missing request responds");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
 }
 
 #[tokio::test]
