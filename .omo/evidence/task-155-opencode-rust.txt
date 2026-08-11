@@ -1,0 +1,91 @@
+Task 155 evidence — refuse migration journals above the known ceiling
+Date: 2026-08-11
+Worktree: /config/workspace/ProdDir/AI/oc-wt/t155
+
+Scope
+-----
+- crates/oc-db/src/migration/mod.rs
+- crates/oc-error/src/db.rs
+- crates/oc-cli/tests/db_migration_ceiling.rs
+
+Implemented behavior
+--------------------
+1. `migration::apply_only` reads the journal and rejects its greatest id when that
+   id is lexicographically above the greatest id compiled into `MIGRATION_IDS`.
+2. The ceiling is derived with `MIGRATION_IDS.iter().max()`; no production literal
+   can drift from the migration set.
+3. `DbError::MigrationTooNew` names both the known ceiling and observed id and is
+   non-retryable.
+4. Unknown journal ids below the ceiling remain tolerated.
+5. The check runs before migration SQL and before the production `db` command can
+   serve the caller's query.
+
+Production-entry TDD
+--------------------
+Command:
+  cargo test -p oc-cli --test db_migration_ceiling --offline
+
+RED before implementation:
+  future_migration_in_the_journal_is_refused_before_the_db_command_serves_a_query
+  failed because the command exited 0 and served `[{"ok":1}]` after the journal
+  received `99999999999999_future_migration`.
+
+GREEN after implementation:
+  3 passed; 0 failed
+
+The three cases are:
+- future id `99999999999999_future_migration` is refused and stderr names it plus
+  ceiling `20260622202450_simplify_session_input`;
+- below-ceiling unknown id `20260622202449_unknown_gap` is accepted;
+- an ordinary compatible journal still opens and serves the query.
+
+Mutation proof
+--------------
+Mutation: removed the `refuse_future_migrations(&completed)?` call from
+`apply_only`.
+
+Observed result: the exact named future-id production-entry test failed and its
+query was served. The call was restored. The compatible-journal case remained
+green after restoration. This proves the regression test observes the guard rather
+than merely the error wording or a fixture-only path.
+
+Compatibility guard
+-------------------
+The existing named compatibility case
+`journal_round_trip_through_the_real_binary_does_not_replay_migrations` was invoked
+unchanged. No assertion was weakened, skipped, deleted, or rewritten for Task 155.
+
+Quality gates
+-------------
+PASS:
+  cargo clippy --workspace --all-targets --offline
+  Finished dev profile successfully; zero warnings.
+
+PASS:
+  cargo fmt --all --check
+  Exit 0, no output.
+
+LSP TOOL LIMITATION:
+  `lsp_diagnostics` was requested for all three changed Rust files. The tool
+  rejected each path before starting rust-analyzer because its request cwd is the
+  main checkout, while Task 155 is in sibling worktree `oc-wt/t155`:
+  `LSP file path must be inside request cwd`.
+  Full-workspace all-target Clippy supplied compiler-backed diagnostics for those
+  files and completed cleanly. This is a tool-root limitation, not a reported
+  source diagnostic.
+
+FULL WORKSPACE TEST LIMITATION:
+  `cargo test --workspace --offline` was attempted twice. Both runs were interrupted
+  by the host's known process-spawn failure:
+  `EAGAIN / Resource temporarily unavailable`.
+  The first interruption surfaced in `oc-tui`; the one permitted retry surfaced in
+  `oc-config`. Before each interruption, the new production-entry tests and many
+  existing targets passed. Per the two-status-check limit, the command was not run
+  a third time. A complete full-workspace PASS is therefore not claimed.
+
+Conclusion
+----------
+The task-specific production path, negative boundary, compatible boundary, and
+mutation sensitivity pass. Workspace Clippy and rustfmt pass. The only incomplete
+checks are the literal MCP LSP invocation and a complete full-workspace test run,
+both blocked by documented tooling/host constraints rather than a test failure.

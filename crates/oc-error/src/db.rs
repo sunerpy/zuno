@@ -30,6 +30,12 @@ pub enum DbError {
         source: BoxSource,
     },
 
+    /// The journal was written by a binary with a newer migration set.
+    #[error(
+        "database migration journal is newer than this binary (known ceiling {ceiling}, observed {observed})"
+    )]
+    MigrationTooNew { ceiling: String, observed: String },
+
     /// A statement failed to execute.
     #[error("database statement failed")]
     Query {
@@ -75,6 +81,7 @@ impl DbError {
             Self::Busy { retry_after } => *retry_after,
             Self::Open { .. }
             | Self::Migration { .. }
+            | Self::MigrationTooNew { .. }
             | Self::Query { .. }
             | Self::NotFound { .. }
             | Self::Decode { .. } => None,
@@ -90,6 +97,7 @@ impl Recoverable for DbError {
             },
             Self::Open { .. }
             | Self::Migration { .. }
+            | Self::MigrationTooNew { .. }
             | Self::Query { .. }
             | Self::NotFound { .. }
             | Self::Decode { .. } => Recovery::Fail,
@@ -158,6 +166,24 @@ mod tests {
             panic!("constructed a Migration, matched something else");
         };
         assert_eq!(*version, 7);
+    }
+
+    #[test]
+    fn migration_too_new_names_the_known_ceiling_and_observed_id() {
+        let e = DbError::MigrationTooNew {
+            ceiling: "20260622202450_simplify_session_input".to_owned(),
+            observed: "99999999999999_future_migration".to_owned(),
+        };
+        let message = e.to_string();
+        assert!(
+            message.contains("20260622202450_simplify_session_input"),
+            "{message}"
+        );
+        assert!(
+            message.contains("99999999999999_future_migration"),
+            "{message}"
+        );
+        assert!(!e.is_retryable());
     }
 
     #[test]

@@ -7089,3 +7089,24 @@ agent list   → 32 行,含全部嵌套 agent
 153 把夹具刷新到与实时文件一致,关闭了 seam #19(注释说谎),但**准则 2 要的是输出 parity,不是输入一致**。F1 说得准:*"That guard proves input identity, not output parity."* 我上一轮验收 153 时只验了漂移守卫真能拦,**没验它是否达成了准则 2 本身要的东西**——我验的是它做了什么,不是它该做什么。
 
 > **验收一条修复时,除了确认它声称的改动生效,还要回头对照它要满足的原始准则。** 守卫可以完美工作,同时完全没解决准则要求的问题。
+
+## [2026-08-11] Todo 155 — migration ceiling verification boundaries
+
+The production `db` entry point now refuses a journal id above the maximum of
+`MIGRATION_IDS` before serving the requested SQL. The ceiling is derived from the
+compiled migration set rather than duplicated as a literal; an unknown id below that
+ceiling remains tolerated. Removing the check made
+`future_migration_in_the_journal_is_refused_before_the_db_command_serves_a_query`
+fail while the query was served, so the production-path regression is sensitive to the
+guard.
+
+Two host limitations affected only the broad verification surface. The integrated
+`lsp_diagnostics` tool is rooted at the main checkout and rejected all three files under
+the sibling `oc-wt/t155` worktree before starting a language server. Full-workspace
+`cargo test --workspace --offline` was attempted twice and both runs were interrupted by
+the host's known `EAGAIN / Resource temporarily unavailable` process-spawn failure, first
+in `oc-tui` and then in `oc-config`; no third status retry was made. Compiler-backed
+coverage remained clean: the targeted production-entry suite passed 3/3, workspace
+all-target Clippy completed with zero warnings, and rustfmt check passed. Exact commands
+and the incomplete full-suite status are preserved in
+`.omo/evidence/task-155-opencode-rust.txt`.
