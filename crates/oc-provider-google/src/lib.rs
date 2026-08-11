@@ -22,7 +22,10 @@ use oc_llm::effort::{
 use oc_llm::event::{
     FinishReason, Message, RequestContentBlock, Role, StreamEvent, ThoughtSignature,
 };
-use oc_llm::registry::{Capabilities, CompletionRequest, Provider, ProviderStream};
+use oc_llm::registry::{
+    Capabilities, CompletionRequest, Declined, FactoryOutcome, Provider, ProviderStream, Spec,
+    Unavailable,
+};
 use oc_llm::sse::{SseEvent, SseParser};
 use reqwest::Client;
 use serde::Deserialize;
@@ -208,6 +211,26 @@ impl Default for GeminiOptions {
             generation: GeminiGenerationConfig::default(),
             tools: Vec::new(),
             tool_choice: None,
+        }
+    }
+}
+
+impl GeminiOptions {
+    fn from_spec(spec: &Spec) -> Self {
+        Self {
+            base_url: spec.base_url.clone(),
+            generation: GeminiGenerationConfig {
+                max_output_tokens: option_u64(spec, &["maxOutputTokens", "max_output_tokens"]),
+                temperature: option_f64(spec, &["temperature"]),
+                top_p: option_f64(spec, &["topP", "top_p"]),
+                top_k: option_u64(spec, &["topK", "top_k"]),
+                stop_sequences: option_array(spec, &["stopSequences", "stop_sequences"])
+                    .into_iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+            },
+            ..Self::default()
         }
     }
 }
@@ -1039,6 +1062,23 @@ impl Default for VertexAnthropicOptions {
     }
 }
 
+impl VertexAnthropicOptions {
+    fn from_spec(spec: &Spec) -> Self {
+        let mut options = Self {
+            base_url: spec.base_url.clone(),
+            ..Self::default()
+        };
+        if let Some(version) = &spec.api_version {
+            options.anthropic_version.clone_from(version);
+        }
+        if let Some(max_tokens) = option_u64(spec, &["maxTokens", "max_tokens"]) {
+            options.max_tokens = max_tokens;
+        }
+        options.temperature = option_f64(spec, &["temperature"]);
+        options
+    }
+}
+
 /// Anthropic Messages protocol transported through Vertex AI.
 #[derive(Clone)]
 pub struct VertexAnthropic {
@@ -1658,6 +1698,95 @@ impl VertexCredentials {
         let value = token.value.expose().to_owned();
         *cache = Some(token);
         Ok(value)
+    }
+}
+
+fn option<'a>(spec: &'a Spec, names: &[&str]) -> Option<&'a Value> {
+    names.iter().find_map(|name| spec.options.get(*name))
+}
+
+fn option_u64(spec: &Spec, names: &[&str]) -> Option<u64> {
+    option(spec, names).and_then(Value::as_u64)
+}
+
+fn option_f64(spec: &Spec, names: &[&str]) -> Option<f64> {
+    option(spec, names).and_then(Value::as_f64)
+}
+
+fn option_array<'a>(spec: &'a Spec, names: &[&str]) -> Vec<&'a Value> {
+    option(spec, names)
+        .and_then(Value::as_array)
+        .map_or_else(Vec::new, |values| values.iter().collect())
+}
+
+fn vertex_parts(spec: &Spec) -> Result<(String, String), Declined> {
+    let project = spec
+        .project
+        .clone()
+        .ok_or(Declined::Unavailable(Unavailable::IncompleteConfiguration))?;
+    let location = spec
+        .region
+        .clone()
+        .ok_or(Declined::Unavailable(Unavailable::IncompleteConfiguration))?;
+    Ok((project, location))
+}
+
+fn vertex_credentials(token: Option<String>) -> Result<VertexCredentials, Declined> {
+    token.map_or_else(
+        || {
+            VertexCredentials::application_default()
+                .map_err(|error| Declined::Failed(ProviderError::fatal(error)))
+        },
+        |token| Ok(VertexCredentials::access_token(token)),
+    )
+}
+
+/// Build the registry factory for Google AI Studio Gemini.
+pub fn google_factory<C>(credentials: C) -> impl Fn(Spec) -> FactoryOutcome + Send + Sync + 'static
+where
+    C: Fn(&str) -> Option<String> + Send + Sync + 'static,
+{
+    move |spec| {
+        let key = credentials(&spec.provider)
+            .ok_or(Declined::Unavailable(Unavailable::MissingCredential))?;
+        let options = GeminiOptions::from_spec(&spec);
+        let provider = GoogleGenerativeAi::new(key, options)
+            .map_err(|error| Declined::Failed(ProviderError::fatal(error)))?;
+        Ok(Arc::new(provider) as Arc<dyn Provider>)
+    }
+}
+
+/// Build the registry factory for Vertex-hosted Gemini.
+pub fn vertex_gemini_factory<C>(
+    credentials: C,
+) -> impl Fn(Spec) -> FactoryOutcome + Send + Sync + 'static
+where
+    C: Fn(&str) -> Option<String> + Send + Sync + 'static,
+{
+    move |spec| {
+        let (project, location) = vertex_parts(&spec)?;
+        let credentials = vertex_credentials(credentials(&spec.provider))?;
+        let options = GeminiOptions::from_spec(&spec);
+        let provider = VertexGemini::new(project, location, credentials, options)
+            .map_err(|error| Declined::Failed(ProviderError::fatal(error)))?;
+        Ok(Arc::new(provider) as Arc<dyn Provider>)
+    }
+}
+
+/// Build the registry factory for Vertex-hosted Anthropic Messages.
+pub fn vertex_anthropic_factory<C>(
+    credentials: C,
+) -> impl Fn(Spec) -> FactoryOutcome + Send + Sync + 'static
+where
+    C: Fn(&str) -> Option<String> + Send + Sync + 'static,
+{
+    move |spec| {
+        let (project, location) = vertex_parts(&spec)?;
+        let credentials = vertex_credentials(credentials(&spec.provider))?;
+        let options = VertexAnthropicOptions::from_spec(&spec);
+        let provider = VertexAnthropic::new(project, location, credentials, options)
+            .map_err(|error| Declined::Failed(ProviderError::fatal(error)))?;
+        Ok(Arc::new(provider) as Arc<dyn Provider>)
     }
 }
 

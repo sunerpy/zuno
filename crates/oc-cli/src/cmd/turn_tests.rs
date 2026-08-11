@@ -161,6 +161,299 @@ fn model_selection_splits_only_the_provider_prefix() {
     assert_eq!(model, "openai/gpt");
 }
 
+#[test]
+fn every_declared_wire_transport_selects_its_production_registry_key() {
+    let cases = [
+        ("@ai-sdk/anthropic", "anthropic"),
+        ("@ai-sdk/amazon-bedrock", "amazon-bedrock"),
+        ("@ai-sdk/amazon-bedrock/mantle", "amazon-bedrock/mantle"),
+        ("@ai-sdk/google", "google"),
+        ("@ai-sdk/google-vertex", "google-vertex"),
+        ("@ai-sdk/google-vertex/anthropic", "google-vertex/anthropic"),
+        ("@ai-sdk/openai", "openai"),
+        ("@ai-sdk/openai-compatible", COMPATIBLE_PROVIDER),
+        ("@openrouter/ai-sdk-provider", COMPATIBLE_PROVIDER),
+    ];
+
+    for (npm, expected) in cases {
+        assert_eq!(
+            provider_key_for_npm(npm),
+            Some(expected),
+            "resolved npm metadata `{npm}` selected the wrong production factory"
+        );
+    }
+    assert_eq!(provider_key_for_npm("@ai-sdk/not-implemented"), None);
+}
+
+fn production_wire_spec(
+    npm: &str,
+    model_id: &str,
+    endpoint: &str,
+    extra_options: serde_json::Value,
+) -> Spec {
+    let mut options = extra_options
+        .as_object()
+        .cloned()
+        .expect("provider options are an object");
+    options.insert("baseURL".to_owned(), serde_json::json!(endpoint));
+    let mut models = serde_json::Map::new();
+    models.insert(
+        model_id.to_owned(),
+        serde_json::json!({
+            "id": model_id,
+            "name": "Production wire replay",
+            "limit": {"context": 100000, "output": 8192}
+        }),
+    );
+    let config: oc_config::schema::Config = serde_json::from_value(serde_json::json!({
+        "provider": {
+            "wire-test": {
+                "id": "wire-test",
+                "name": "Production wire replay",
+                "env": [],
+                "npm": npm,
+                "options": serde_json::Value::Object(options),
+                "models": serde_json::Value::Object(models)
+            }
+        }
+    }))
+    .expect("production replay config");
+    let catalog = Catalog::resolve(
+        &oc_llm::catalog::models_dev::CatalogDocument::new(),
+        &ResolveInput::new().with_config(&config),
+    );
+    let model = catalog
+        .model("wire-test", model_id)
+        .expect("production replay model resolves");
+    model_spec(&catalog, model, &Env::empty()).expect("production replay spec resolves")
+}
+
+async fn replay_production_registration(
+    registry_key: &str,
+    npm: &str,
+    model_id: &str,
+    cassette: &str,
+    extra_options: serde_json::Value,
+    endpoint_suffix: &str,
+    expected_text: &str,
+) {
+    let scenario = oc_testkit::Scenario::new(registry_key)
+        .from_oracle_cassette(cassette)
+        .expect("recorded provider response loads");
+    let mock = oc_testkit::MockProvider::start(vec![scenario])
+        .await
+        .expect("loopback provider starts");
+    assert!(mock.authored_scenarios().is_empty());
+
+    let endpoint = if registry_key == COMPATIBLE_PROVIDER {
+        format!("{}/v1", mock.base_url())
+    } else {
+        mock.base_url().to_owned()
+    };
+    let spec = production_wire_spec(npm, model_id, &endpoint, extra_options);
+    assert_eq!(spec.provider, registry_key);
+    let credential = Credential::Api {
+        key: oc_auth::Secret::new("production-replay-credential"),
+        metadata: None,
+    };
+    let providers = provider_registry("wire-test", Some(credential));
+    assert!(
+        providers.is_registered(registry_key),
+        "production registry omitted `{registry_key}`"
+    );
+
+    let mut connection =
+        oc_db::open::open(&oc_paths::DbLocation::Memory).expect("open memory database");
+    oc_db::migration::apply(&mut connection).expect("apply schema");
+    let replay_plan = plan("/workspace", SessionChoice::New);
+    let now = 1_780_000_000_000;
+    ensure_project(&connection, &replay_plan.project, now).expect("persist project");
+    let session =
+        resolve_session(&mut connection, &replay_plan, now).expect("create replay session");
+    persist_user_message(
+        &connection,
+        UserMessageInput {
+            session_id: &session.id,
+            agent: "build",
+            provider_id: "wire-test",
+            model_id,
+            text: "Reply with a short greeting.",
+            message_id: None,
+            now,
+        },
+    )
+    .expect("persist replay prompt");
+
+    let internal = InternalAgent {
+        name: "summary".to_owned(),
+        prompt: "Summarize the conversation.".to_owned(),
+        model: EngineModel::new(spec.clone(), model_id, spec.surface),
+    };
+    let internals = Internals {
+        title: internal.clone(),
+        compaction: internal.clone(),
+        summary: internal,
+    };
+    let registry = RegistryProviders(&providers);
+    let compaction = oc_config::schema::CompactionConfig::default();
+    let mut state = CompactionState::default();
+    let mut context = PreludeContext {
+        connection: &mut connection,
+        providers: &registry,
+        internals: &internals,
+        compaction: &compaction,
+        window: TokenWindow {
+            context: 100_000,
+            max_output: 8_192,
+        },
+        state: &mut state,
+    };
+    let text = oc_engine::prelude::summarize(&session.id, &mut context)
+        .await
+        .expect("production provider stream decodes");
+    assert_eq!(text, expected_text);
+
+    let captured = mock.captured().await;
+    assert_eq!(captured.len(), 1, "one production stream request expected");
+    assert!(
+        captured[0].path.ends_with(endpoint_suffix),
+        "`{registry_key}` dispatched to {}, expected suffix {endpoint_suffix}",
+        captured[0].path
+    );
+    assert!(
+        captured[0]
+            .served_origin
+            .as_ref()
+            .is_some_and(oc_testkit::ResponseOrigin::is_recorded),
+        "`{registry_key}` did not decode recorded provider bytes"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn production_compatible_registration_dispatches_and_decodes_recorded_sse() {
+    replay_production_registration(
+        COMPATIBLE_PROVIDER,
+        "@ai-sdk/openai-compatible",
+        "deepseek-chat",
+        "openai-compatible-chat/deepseek-streams-text",
+        serde_json::json!({}),
+        "/v1/chat/completions",
+        "Hello!",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn production_anthropic_registration_dispatches_and_decodes_recorded_sse() {
+    replay_production_registration(
+        "anthropic",
+        "@ai-sdk/anthropic",
+        "claude-haiku-4-5-20251001",
+        "anthropic-messages/streams-text",
+        serde_json::json!({"maxTokens": 20, "promptCache": false}),
+        "/v1/messages",
+        "Hello!",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn production_openai_registration_dispatches_and_decodes_recorded_responses_sse() {
+    replay_production_registration(
+        "openai",
+        "@ai-sdk/openai",
+        "gpt-5.5",
+        "openai-responses/gpt-5-5-streams-text",
+        serde_json::json!({"maxTokens": 80}),
+        "/v1/responses",
+        "Hello!",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn production_bedrock_registration_dispatches_and_decodes_recorded_eventstream() {
+    replay_production_registration(
+        "amazon-bedrock",
+        "@ai-sdk/amazon-bedrock",
+        "us.amazon.nova-micro-v1:0",
+        "bedrock-converse/streams-text",
+        serde_json::json!({
+            "region": "us-east-1",
+            "accessKeyId": "AKIAREPLAY",
+            "secretAccessKey": "replay-secret"
+        }),
+        "/model/us.amazon.nova-micro-v1%3A0/converse-stream",
+        "Hello",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn production_bedrock_mantle_registration_dispatches_and_decodes_recorded_eventstream() {
+    replay_production_registration(
+        "amazon-bedrock/mantle",
+        "@ai-sdk/amazon-bedrock/mantle",
+        "openai.gpt-oss-120b",
+        "bedrock-converse/streams-text",
+        serde_json::json!({
+            "region": "us-east-1",
+            "accessKeyId": "AKIAREPLAY",
+            "secretAccessKey": "replay-secret"
+        }),
+        "/model/openai.gpt-oss-120b/converse-stream",
+        "Hello",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn production_google_registration_dispatches_and_decodes_recorded_gemini_sse() {
+    replay_production_registration(
+        "google",
+        "@ai-sdk/google",
+        "gemini-2.5-flash",
+        "gemini/streams-text",
+        serde_json::json!({}),
+        "/models/gemini-2.5-flash:streamGenerateContent",
+        "Hello!",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn production_vertex_gemini_registration_dispatches_and_decodes_recorded_gemini_sse() {
+    replay_production_registration(
+        "google-vertex",
+        "@ai-sdk/google-vertex",
+        "gemini-2.5-flash",
+        "gemini/streams-text",
+        serde_json::json!({"project": "project-a", "location": "us-central1"}),
+        "/models/gemini-2.5-flash:streamGenerateContent",
+        "Hello!",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn production_vertex_anthropic_registration_dispatches_and_decodes_recorded_anthropic_sse() {
+    replay_production_registration(
+        "google-vertex/anthropic",
+        "@ai-sdk/google-vertex/anthropic",
+        "claude-haiku-4-5-20251001",
+        "anthropic-messages/streams-text",
+        serde_json::json!({
+            "project": "project-a",
+            "location": "us",
+            "maxTokens": 20
+        }),
+        "/claude-haiku-4-5-20251001:streamRawPredict",
+        "Hello!",
+    )
+    .await;
+}
+
 /// The catalog a forbidden fetch leaves behind, as [`CatalogSource::load`] builds it.
 fn forbidden_fetch() -> CatalogProvenance {
     CatalogProvenance::FetchForbidden {
@@ -201,7 +494,7 @@ fn a_config_specified_model_selects_with_no_catalog_at_all() {
     assert_eq!(model, "house-model");
     assert_eq!(resolved.api.url, "https://gateway.internal/v1");
     assert!(
-        supports_compatible_transport(&resolved.api.npm),
+        provider_key_for_npm(&resolved.api.npm).is_some(),
         "the config's transport must survive resolution or the turn is refused later"
     );
 }
@@ -1012,7 +1305,11 @@ fn an_options_api_key_is_primary_and_the_stored_credential_is_the_fallback() {
 
         let resolved = resolved_credential(Some(provider), present.then_some(&stored));
 
-        assert_eq!(resolved.as_deref(), expected, "{why} (options={options})");
+        assert_eq!(
+            resolved.as_ref().map(credential_value).as_deref(),
+            expected,
+            "{why} (options={options})"
+        );
     }
 }
 

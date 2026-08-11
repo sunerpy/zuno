@@ -49,7 +49,7 @@ use oc_llm::catalog::{Catalog, CatalogProvenance, CatalogSource, ResolveInput};
 use oc_llm::event::StreamEvent;
 use oc_llm::registry::{ApiSurface, Provider, ProviderRegistry, Spec};
 use oc_memory::{ScopeLimits, SessionMemory, assemble_system_prompt};
-use oc_provider_compatible::{ReqwestTransport, Transport, factory};
+use oc_provider_compatible::{ReqwestTransport, Transport};
 use oc_tool::PermissionAsker;
 use serde_json::json;
 use uuid::Uuid;
@@ -114,7 +114,7 @@ pub(crate) struct TurnPlan {
     agent: oc_catalog::agent::Agent,
     provider_id: String,
     model_id: String,
-    credential: Option<String>,
+    credential: Option<Credential>,
     resolver: Resolver,
     session: SessionChoice,
     title: Option<String>,
@@ -206,9 +206,9 @@ impl TurnPlan {
         let requested_model = options.model.as_deref().or(agent.model.as_deref());
         let (provider_id, model_id, catalog_model) =
             select_model(&catalog, requested_model, loaded.provenance())?;
-        if !supports_compatible_transport(&catalog_model.api.npm) {
+        if provider_key_for_npm(&catalog_model.api.npm).is_none() {
             return Err(format!(
-                "model {provider_id}/{model_id} uses transport {}, but this runtime currently supports OpenAI-compatible transports",
+                "model {provider_id}/{model_id} uses unsupported transport {}",
                 catalog_model.api.npm
             ));
         }
@@ -332,7 +332,7 @@ fn resolve_internals(
                     return None;
                 }
                 let model = catalog.model(chosen_provider, chosen_model)?;
-                if !supports_compatible_transport(&model.api.npm) {
+                if provider_key_for_npm(&model.api.npm).is_none() {
                     notes.push(format!(
                         "{name}: `{}` uses transport {}, which this runtime has no \
                          provider for; using `{provider_id}/{model_id}` instead",
@@ -479,14 +479,8 @@ impl TurnHost {
             .vcs
             .as_ref()
             .map(|_| plan.project.directory.clone());
-        let mut providers = ProviderRegistry::new();
-        let transport: Arc<dyn Transport> = Arc::new(ReqwestTransport::new(&plan.provider_id));
-        let presented = plan.credential.clone();
-        let credential = plan.credential.clone();
-        providers.register_fallible(
-            COMPATIBLE_PROVIDER,
-            factory(transport, move |_| credential.clone()),
-        );
+        let presented = plan.credential.as_ref().map(credential_value);
+        let providers = provider_registry(&plan.provider_id, plan.credential.clone());
 
         let mut connection = oc_db::open_default().map_err(to_string)?;
         oc_db::migration::apply(&mut connection).map_err(to_string)?;
@@ -843,11 +837,70 @@ fn select_model<'a>(
     Err(message)
 }
 
-fn supports_compatible_transport(npm: &str) -> bool {
-    matches!(
-        npm,
-        "@ai-sdk/openai-compatible" | "@ai-sdk/openai" | "@openrouter/ai-sdk-provider"
-    )
+fn provider_key_for_npm(npm: &str) -> Option<&'static str> {
+    match npm {
+        "@ai-sdk/anthropic" => Some("anthropic"),
+        "@ai-sdk/amazon-bedrock" => Some("amazon-bedrock"),
+        "@ai-sdk/amazon-bedrock/mantle" => Some("amazon-bedrock/mantle"),
+        "@ai-sdk/google" => Some("google"),
+        "@ai-sdk/google-vertex" => Some("google-vertex"),
+        "@ai-sdk/google-vertex/anthropic" => Some("google-vertex/anthropic"),
+        "@ai-sdk/openai" => Some("openai"),
+        "@ai-sdk/openai-compatible" | "@openrouter/ai-sdk-provider" => Some(COMPATIBLE_PROVIDER),
+        _ => None,
+    }
+}
+
+fn provider_registry(provider_id: &str, credential: Option<Credential>) -> ProviderRegistry {
+    let mut providers = ProviderRegistry::new();
+
+    let transport: Arc<dyn Transport> = Arc::new(ReqwestTransport::new(provider_id));
+    let compatible_credential = credential.as_ref().map(credential_value);
+    providers.register_fallible(
+        COMPATIBLE_PROVIDER,
+        oc_provider_compatible::factory(transport, move |_| compatible_credential.clone()),
+    );
+
+    let anthropic_credential = credential.clone();
+    providers.register_fallible(
+        "anthropic",
+        oc_provider_anthropic::factory(move |_| anthropic_credential.clone()),
+    );
+
+    let openai_credential = credential.clone();
+    providers.register_fallible(
+        "openai",
+        oc_provider_openai::factory(move |_| openai_credential.clone()),
+    );
+
+    providers.register_fallible("amazon-bedrock", |spec| {
+        oc_provider_bedrock::factory(spec)
+            .map_err(|error| oc_llm::registry::Declined::Failed(ProviderError::fatal(error)))
+    });
+    providers.register_fallible("amazon-bedrock/mantle", |spec| {
+        oc_provider_bedrock::factory(spec)
+            .map_err(|error| oc_llm::registry::Declined::Failed(ProviderError::fatal(error)))
+    });
+
+    let google_credential = credential.as_ref().map(credential_value);
+    providers.register_fallible(
+        "google",
+        oc_provider_google::google_factory(move |_| google_credential.clone()),
+    );
+
+    let vertex_credential = credential.as_ref().map(credential_value);
+    providers.register_fallible(
+        "google-vertex",
+        oc_provider_google::vertex_gemini_factory(move |_| vertex_credential.clone()),
+    );
+
+    let vertex_anthropic_credential = credential.as_ref().map(credential_value);
+    providers.register_fallible(
+        "google-vertex/anthropic",
+        oc_provider_google::vertex_anthropic_factory(move |_| vertex_anthropic_credential.clone()),
+    );
+
+    providers
 }
 
 /// The provider-option keys that name an endpoint, in precedence order.
@@ -916,8 +969,13 @@ fn provider_api_key(provider: Option<&oc_llm::catalog::ResolvedProvider>) -> Opt
 fn resolved_credential(
     provider: Option<&oc_llm::catalog::ResolvedProvider>,
     stored: Option<&Credential>,
-) -> Option<String> {
-    provider_api_key(provider).or_else(|| stored.map(credential_value))
+) -> Option<Credential> {
+    provider_api_key(provider)
+        .map(|key| Credential::Api {
+            key: oc_auth::Secret::new(key),
+            metadata: None,
+        })
+        .or_else(|| stored.cloned())
 }
 
 /// The SDK option bag for one model: the provider's options, with the model's on top.
@@ -1125,16 +1183,46 @@ fn model_spec(
     env: &oc_paths::Env,
 ) -> Result<Spec, String> {
     let provider = catalog.provider(&model.provider_id);
-    let endpoint = provider_endpoint(provider, model).ok_or_else(|| {
-        format!(
+    let registry_key = provider_key_for_npm(&model.api.npm)
+        .ok_or_else(|| format!("unsupported provider transport `{}`", model.api.npm))?;
+    let surface = match model.api.npm.as_str() {
+        "@ai-sdk/anthropic" | "@ai-sdk/google-vertex/anthropic" => ApiSurface::Messages,
+        "@ai-sdk/openai-compatible" | "@openrouter/ai-sdk-provider" => ApiSurface::Chat,
+        _ => ApiSurface::Default,
+    };
+    let mut spec = Spec::new(registry_key).with_surface(surface);
+    if let Some(endpoint) = provider_endpoint(provider, model) {
+        spec = spec.with_base_url(expand_variables(&endpoint, env));
+    } else if registry_key == COMPATIBLE_PROVIDER {
+        return Err(format!(
             "provider `{}` has no endpoint: set \
              `provider.{}.options.baseURL` (or `options.endpoint`) to the API base URL",
             model.provider_id, model.provider_id
-        )
-    })?;
-    let mut spec = Spec::new(COMPATIBLE_PROVIDER)
-        .with_surface(ApiSurface::Chat)
-        .with_base_url(expand_variables(&endpoint, env));
+        ));
+    }
+    if (registry_key == "amazon-bedrock" || registry_key == "amazon-bedrock/mantle")
+        && let Some(region) = provider_string_option(provider, "region")
+            .or_else(|| env.value("AWS_REGION").map(str::to_owned))
+            .or_else(|| env.value("AWS_DEFAULT_REGION").map(str::to_owned))
+    {
+        spec = spec.with_region(region);
+    }
+    if registry_key == "google-vertex" || registry_key == "google-vertex/anthropic" {
+        if let Some(project) = provider_string_option(provider, "project")
+            .or_else(|| env.value("GOOGLE_VERTEX_PROJECT").map(str::to_owned))
+            .or_else(|| env.value("GOOGLE_CLOUD_PROJECT").map(str::to_owned))
+            .or_else(|| env.value("GCP_PROJECT").map(str::to_owned))
+            .or_else(|| env.value("GCLOUD_PROJECT").map(str::to_owned))
+        {
+            spec = spec.with_project(project);
+        }
+        let location = provider_string_option(provider, "location")
+            .or_else(|| env.value("GOOGLE_VERTEX_LOCATION").map(str::to_owned))
+            .or_else(|| env.value("GOOGLE_CLOUD_LOCATION").map(str::to_owned))
+            .or_else(|| env.value("VERTEX_LOCATION").map(str::to_owned))
+            .unwrap_or_else(|| "us-central1".to_owned());
+        spec = spec.with_region(location);
+    }
     for (name, value) in &model.headers {
         spec = spec.with_header(name, value);
     }
@@ -1142,6 +1230,16 @@ fn model_spec(
         spec = spec.with_option(name, value);
     }
     Ok(spec)
+}
+
+fn provider_string_option(
+    provider: Option<&oc_llm::catalog::ResolvedProvider>,
+    name: &str,
+) -> Option<String> {
+    provider
+        .and_then(|provider| provider.options.get(name))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
 }
 
 fn credential_value(credential: &Credential) -> String {
@@ -1174,8 +1272,13 @@ impl AgentModelResolver for Resolver {
     }
 
     fn resolve_model(&self, provider_id: &str, model_id: &str) -> Option<EngineModel> {
-        (provider_id == self.requested_provider && model_id == self.requested_model)
-            .then(|| EngineModel::new(self.spec.clone(), self.wire_model.clone(), ApiSurface::Chat))
+        (provider_id == self.requested_provider && model_id == self.requested_model).then(|| {
+            EngineModel::new(
+                self.spec.clone(),
+                self.wire_model.clone(),
+                self.spec.surface,
+            )
+        })
     }
 }
 
