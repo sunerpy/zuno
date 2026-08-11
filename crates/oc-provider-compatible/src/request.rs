@@ -1,4 +1,4 @@
-//! Assembling a chat-completions request body.
+//! Assembling Chat Completions and Responses request bodies.
 //!
 //! # The three ordering and gating rules that are not cosmetic
 //!
@@ -22,6 +22,7 @@
 //! transcript and the wire disagree silently.
 
 use oc_llm::event::{Message, RequestContentBlock, Role};
+use oc_llm::registry::ApiSurface;
 use serde_json::{Map, Value, json};
 
 use crate::quirks::Quirks;
@@ -30,11 +31,13 @@ use crate::quirks::Quirks;
 pub const PROTECTED_KEYS: &[&str] = &[
     "model",
     "messages",
+    "input",
     "stream",
     "tools",
     "tool_choice",
     "max_tokens",
     "max_completion_tokens",
+    "max_output_tokens",
 ];
 
 /// Sampling parameters, applied only when the model accepts them.
@@ -107,6 +110,14 @@ impl RequestBody {
     /// Serialize this body under the resolved quirks.
     #[must_use]
     pub fn build(&self, quirks: &Quirks) -> Value {
+        if quirks.surface == ApiSurface::Responses {
+            self.build_responses(quirks)
+        } else {
+            self.build_chat(quirks)
+        }
+    }
+
+    fn build_chat(&self, quirks: &Quirks) -> Value {
         let mut body = Map::new();
         body.insert("model".to_owned(), json!(self.model));
         body.insert(
@@ -159,6 +170,76 @@ impl RequestBody {
 
         Value::Object(body)
     }
+
+    fn build_responses(&self, quirks: &Quirks) -> Value {
+        let mut body = Map::new();
+        body.insert("model".to_owned(), json!(self.model));
+        body.insert(
+            "input".to_owned(),
+            Value::Array(
+                self.messages
+                    .iter()
+                    .flat_map(|message| translate_response_message(message, quirks))
+                    .collect(),
+            ),
+        );
+        body.insert("stream".to_owned(), json!(true));
+
+        if let Some(tools) = &self.tools
+            && quirks.accepts_tools()
+        {
+            body.insert("tools".to_owned(), response_tools(tools));
+        }
+
+        if quirks.accepts_sampling_params() {
+            insert_number(&mut body, "temperature", self.sampling.temperature);
+            insert_number(&mut body, "top_p", self.sampling.top_p);
+            insert_number(
+                &mut body,
+                "frequency_penalty",
+                self.sampling.frequency_penalty,
+            );
+            insert_number(
+                &mut body,
+                "presence_penalty",
+                self.sampling.presence_penalty,
+            );
+        }
+
+        if let Some(max_tokens) = self.max_tokens {
+            body.insert("max_output_tokens".to_owned(), json!(max_tokens));
+        }
+
+        for (key, value) in &self.extra_body {
+            if PROTECTED_KEYS.contains(&key.as_str()) {
+                continue;
+            }
+            body.insert(key.clone(), value.clone());
+        }
+
+        Value::Object(body)
+    }
+}
+
+fn response_tools(tools: &Value) -> Value {
+    let Some(tools) = tools.as_array() else {
+        return tools.clone();
+    };
+    Value::Array(
+        tools
+            .iter()
+            .map(|tool| {
+                tool.get("function").map_or_else(
+                    || tool.clone(),
+                    |function| {
+                        let mut response = function.as_object().cloned().unwrap_or_default();
+                        response.insert("type".to_owned(), json!("function"));
+                        Value::Object(response)
+                    },
+                )
+            })
+            .collect(),
+    )
 }
 
 fn insert_number(body: &mut Map<String, Value>, key: &str, value: Option<f64>) {
@@ -179,6 +260,145 @@ pub fn translate_message(message: &Message, quirks: &Quirks) -> Vec<Value> {
         Role::Tool => translate_tool_results(message),
         Role::System | Role::User => translate_plain(message, quirks),
     }
+}
+
+fn translate_response_message(message: &Message, quirks: &Quirks) -> Vec<Value> {
+    match message.role {
+        Role::System => vec![json!({
+            "role": "system",
+            "content": joined_text(message),
+        })],
+        Role::User => vec![json!({
+            "role": "user",
+            "content": response_content(message, quirks),
+        })],
+        Role::Assistant => translate_response_assistant(message),
+        Role::Tool => translate_response_tool_results(message, quirks),
+    }
+}
+
+fn translate_response_assistant(message: &Message) -> Vec<Value> {
+    let mut items = Vec::new();
+    let mut content = Vec::new();
+    for block in &message.content {
+        match block {
+            RequestContentBlock::Text { text } => {
+                content.push(json!({"type": "output_text", "text": text}));
+            }
+            RequestContentBlock::ProviderEncryptedReasoning {
+                summary,
+                encrypted_content,
+                status,
+                ..
+            } => {
+                let Some(encrypted_content) = encrypted_content else {
+                    continue;
+                };
+                let mut item = Map::new();
+                item.insert("type".to_owned(), json!("reasoning"));
+                item.insert(
+                    "summary".to_owned(),
+                    Value::Array(
+                        summary
+                            .iter()
+                            .map(|text| json!({"type": "summary_text", "text": text}))
+                            .collect(),
+                    ),
+                );
+                item.insert("encrypted_content".to_owned(), json!(encrypted_content));
+                if let Some(status) = status {
+                    item.insert("status".to_owned(), json!(status));
+                }
+                items.push(Value::Object(item));
+            }
+            RequestContentBlock::ToolUse {
+                id, name, input, ..
+            } => items.push(json!({
+                "type": "function_call",
+                "call_id": id,
+                "name": name,
+                "arguments": input.to_string(),
+            })),
+            RequestContentBlock::SignedThinking { .. }
+            | RequestContentBlock::ToolResult { .. }
+            | RequestContentBlock::Image { .. } => {}
+        }
+    }
+    if !content.is_empty() {
+        items.push(json!({"role": "assistant", "content": content}));
+    }
+    items
+}
+
+fn translate_response_tool_results(message: &Message, quirks: &Quirks) -> Vec<Value> {
+    let images = if quirks.accepts_attachments() {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                RequestContentBlock::Image { media_type, data } => Some(json!({
+                    "type": "input_image",
+                    "image_url": format!("data:{media_type};base64,{data}"),
+                })),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            RequestContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => {
+                let output = if images.is_empty() {
+                    Value::String(content.clone())
+                } else {
+                    let mut parts = vec![json!({"type": "input_text", "text": content})];
+                    parts.extend(images.clone());
+                    Value::Array(parts)
+                };
+                Some(json!({
+                    "type": "function_call_output",
+                    "call_id": tool_use_id,
+                    "output": output,
+                }))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn response_content(message: &Message, quirks: &Quirks) -> Vec<Value> {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            RequestContentBlock::Text { text } => Some(json!({"type": "input_text", "text": text})),
+            RequestContentBlock::Image { media_type, data } if quirks.accepts_attachments() => {
+                Some(json!({
+                    "type": "input_image",
+                    "image_url": format!("data:{media_type};base64,{data}"),
+                }))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn joined_text(message: &Message) -> String {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            RequestContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn translate_plain(message: &Message, quirks: &Quirks) -> Vec<Value> {
@@ -328,6 +548,13 @@ mod tests {
         }
     }
 
+    fn responses_quirks() -> Quirks {
+        Quirks {
+            surface: ApiSurface::Responses,
+            ..quirks(false, true)
+        }
+    }
+
     fn assistant_with_reasoning() -> Message {
         Message::from_content(
             Role::Assistant,
@@ -429,6 +656,25 @@ mod tests {
             .insert("reasoning_effort".to_owned(), json!("high"));
         let built = body.build(&quirks(false, true));
         assert_eq!(built["reasoning_effort"], json!("high"));
+    }
+
+    #[test]
+    fn responses_surface_uses_input_and_max_output_tokens_not_chat_fields() {
+        let mut body = RequestBody::new("gpt-5", vec![Message::new(Role::User, "hello")]);
+        body.max_tokens = Some(321);
+
+        let built = body.build(&responses_quirks());
+
+        assert!(
+            built["input"].is_array(),
+            "Responses requires an input array"
+        );
+        assert_eq!(built["input"][0]["role"], json!("user"));
+        assert_eq!(built["input"][0]["content"][0]["type"], json!("input_text"));
+        assert_eq!(built["input"][0]["content"][0]["text"], json!("hello"));
+        assert_eq!(built["max_output_tokens"], json!(321));
+        assert!(built.get("messages").is_none());
+        assert!(built.get("max_tokens").is_none());
     }
 
     #[test]

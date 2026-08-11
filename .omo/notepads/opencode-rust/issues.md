@@ -7089,3 +7089,22 @@ agent list   → 32 行,含全部嵌套 agent
 153 把夹具刷新到与实时文件一致,关闭了 seam #19(注释说谎),但**准则 2 要的是输出 parity,不是输入一致**。F1 说得准:*"That guard proves input identity, not output parity."* 我上一轮验收 153 时只验了漂移守卫真能拦,**没验它是否达成了准则 2 本身要的东西**——我验的是它做了什么,不是它该做什么。
 
 > **验收一条修复时,除了确认它声称的改动生效,还要回头对照它要满足的原始准则。** 守卫可以完美工作,同时完全没解决准则要求的问题。
+
+## [2026-08-11] Todo 156 — SEAM #20 在真实 wire protocol 边界关闭
+
+Todo 152 已正确选择 Azure/Copilot 的 `/responses` endpoint，却没有让该选择影响请求字节或
+SSE 解码：同一 `RequestBody` 始终发送 `messages`，同一 `ChunkTranslator` 始终读取
+`choices[].delta`。生产测试又把 Chat cassette 挂到 Responses 路径上，因此“路由正确”掩盖了
+“协议仍错误”。
+
+现在已有的 `ApiSurface` 是唯一协议选择器：Chat 保留原有 `messages` 与 Chat decoder；
+Responses 发送 `input`/`max_output_tokens` 并解码 typed `response.*` events。生产回放 helper
+同时断言 request discriminant，Azure/Copilot `gpt-5` 改用真实 Responses recording，不再允许
+Chat fixture 证明 Responses 路径。请求 builder 与 decoder 的反向 mutation 分别被两个命名测试
+捕获，完整证据见 `.omo/evidence/task-156-opencode-rust.txt`。
+
+最终 workspace 首次并发门禁遇到宿主 `EAGAIN (Resource temporarily unavailable)`；限制为
+`CARGO_BUILD_JOBS=2` 与单测试线程后，workspace tests、all-target Clippy、rustfmt 全部通过。
+五个改动 Rust 文件的 `lsp_diagnostics` 均无 findings。CodeGraph 未索引 sibling worktree，且
+集成 LSP 不能直接接受其路径；前者使用已授权的源码检查结果，后者通过主 workspace 下临时副本
+完成并在检查后删除。没有修改 `transport.rs`、依赖、provider identity、header 或 URL 规则。

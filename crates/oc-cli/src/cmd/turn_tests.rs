@@ -305,6 +305,7 @@ async fn replay_selected_production_spec<F>(
     model_id: &str,
     cassette: &str,
     endpoint_suffix: &str,
+    expected_body_key: &str,
     expected_text: &str,
     build_spec: F,
 ) where
@@ -399,6 +400,20 @@ async fn replay_selected_production_spec<F>(
         "`{registry_key}` dispatched to {}, expected suffix {endpoint_suffix}",
         captured[0].path
     );
+    let body = captured[0].json().expect("production request body is JSON");
+    let forbidden_body_key = if expected_body_key == "input" {
+        "messages"
+    } else {
+        "input"
+    };
+    assert!(
+        body.get(expected_body_key).is_some(),
+        "`{registry_key}` request body omitted `{expected_body_key}`: {body}"
+    );
+    assert!(
+        body.get(forbidden_body_key).is_none(),
+        "`{registry_key}` request body retained `{forbidden_body_key}`: {body}"
+    );
     assert!(
         captured[0]
             .served_origin
@@ -416,6 +431,7 @@ async fn replay_production_registration(
     cassette: &str,
     extra_options: serde_json::Value,
     endpoint_suffix: &str,
+    expected_body_key: &str,
     expected_text: &str,
 ) {
     let provider_id = if registry_key == COMPATIBLE_PROVIDER {
@@ -429,6 +445,7 @@ async fn replay_production_registration(
         model_id,
         cassette,
         endpoint_suffix,
+        expected_body_key,
         expected_text,
         |endpoint| production_wire_spec(provider_id, npm, model_id, endpoint, extra_options),
     )
@@ -444,6 +461,7 @@ async fn production_compatible_registration_dispatches_and_decodes_recorded_sse(
         "openai-compatible-chat/deepseek-streams-text",
         serde_json::json!({}),
         "/v1/chat/completions",
+        "messages",
         "Hello!",
     )
     .await;
@@ -499,6 +517,7 @@ async fn production_openrouter_keeps_router_identity_and_dispatches_recorded_sse
         "openai/gpt-4o-mini",
         "openai-compatible-chat/openrouter-streams-text",
         "/v1/chat/completions",
+        "messages",
         "Hello!",
         |endpoint| {
             production_wire_spec(
@@ -519,8 +538,9 @@ async fn production_azure_selector_dispatches_to_responses() {
         "azure",
         COMPATIBLE_PROVIDER,
         "deployment-a",
-        "openai-compatible-chat/deepseek-streams-text",
+        "openai-responses/gpt-5-5-streams-text",
         "/v1/responses",
+        "input",
         "Hello!",
         |endpoint| {
             production_wire_spec(
@@ -537,16 +557,27 @@ async fn production_azure_selector_dispatches_to_responses() {
 
 #[tokio::test]
 async fn production_copilot_rule_dispatches_by_model_id() {
-    for (model_id, endpoint_suffix) in [
-        ("gpt-5", "/v1/responses"),
-        ("gpt-5-mini", "/v1/chat/completions"),
+    for (model_id, cassette, endpoint_suffix, expected_body_key) in [
+        (
+            "gpt-5",
+            "openai-responses/gpt-5-5-streams-text",
+            "/v1/responses",
+            "input",
+        ),
+        (
+            "gpt-5-mini",
+            "openai-compatible-chat/deepseek-streams-text",
+            "/v1/chat/completions",
+            "messages",
+        ),
     ] {
         replay_selected_production_spec(
             "github-copilot",
             COMPATIBLE_PROVIDER,
             model_id,
-            "openai-compatible-chat/deepseek-streams-text",
+            cassette,
             endpoint_suffix,
+            expected_body_key,
             "Hello!",
             |endpoint| {
                 production_wire_spec(
@@ -570,6 +601,7 @@ async fn pinned_groq_transport_selects_compatible_factory_and_dispatches() {
         "allam-2-7b",
         "openai-compatible-chat/groq-streams-text",
         "/v1/chat/completions",
+        "messages",
         "Hello!",
         |endpoint| pinned_wire_spec("groq", "allam-2-7b", endpoint, "@ai-sdk/groq"),
     )
@@ -584,6 +616,7 @@ async fn pinned_mistral_transport_selects_compatible_factory_and_dispatches() {
         "codestral-latest",
         "openai-compatible-chat/togetherai-streams-text",
         "/v1/chat/completions",
+        "messages",
         "Hello!",
         |endpoint| pinned_wire_spec("mistral", "codestral-latest", endpoint, "@ai-sdk/mistral"),
     )
@@ -599,6 +632,7 @@ async fn production_anthropic_registration_dispatches_and_decodes_recorded_sse()
         "anthropic-messages/streams-text",
         serde_json::json!({"maxTokens": 20, "promptCache": false}),
         "/v1/messages",
+        "messages",
         "Hello!",
     )
     .await;
@@ -613,6 +647,7 @@ async fn production_openai_registration_dispatches_and_decodes_recorded_response
         "openai-responses/gpt-5-5-streams-text",
         serde_json::json!({"maxTokens": 80}),
         "/v1/responses",
+        "input",
         "Hello!",
     )
     .await;
@@ -631,6 +666,7 @@ async fn production_bedrock_registration_dispatches_and_decodes_recorded_eventst
             "secretAccessKey": "replay-secret"
         }),
         "/model/us.amazon.nova-micro-v1%3A0/converse-stream",
+        "messages",
         "Hello",
     )
     .await;
@@ -649,6 +685,7 @@ async fn production_bedrock_mantle_registration_dispatches_and_decodes_recorded_
             "secretAccessKey": "replay-secret"
         }),
         "/model/openai.gpt-oss-120b/converse-stream",
+        "messages",
         "Hello",
     )
     .await;
@@ -663,6 +700,7 @@ async fn production_google_registration_dispatches_and_decodes_recorded_gemini_s
         "gemini/streams-text",
         serde_json::json!({}),
         "/models/gemini-2.5-flash:streamGenerateContent",
+        "contents",
         "Hello!",
     )
     .await;
@@ -677,6 +715,7 @@ async fn production_vertex_gemini_registration_dispatches_and_decodes_recorded_g
         "gemini/streams-text",
         serde_json::json!({"project": "project-a", "location": "us-central1"}),
         "/models/gemini-2.5-flash:streamGenerateContent",
+        "contents",
         "Hello!",
     )
     .await;
@@ -695,6 +734,7 @@ async fn production_vertex_anthropic_registration_dispatches_and_decodes_recorde
             "maxTokens": 20
         }),
         "/claude-haiku-4-5-20251001:streamRawPredict",
+        "messages",
         "Hello!",
     )
     .await;
