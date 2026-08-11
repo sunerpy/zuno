@@ -194,11 +194,7 @@ impl PermissionBridge {
     fn pump(&mut self) -> EventResult {
         let mut result = EventResult::IGNORED;
         while let Some(request) = self.broker.next_request() {
-            let arguments = request
-                .metadata
-                .get("arguments")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
+            let arguments = request_arguments(&request);
             self.host.open(Box::new(PermissionPrompt::new(
                 self.context.clone(),
                 request,
@@ -214,6 +210,15 @@ impl PermissionBridge {
         }
         result
     }
+}
+
+fn request_arguments(request: &PermissionRequest) -> serde_json::Value {
+    request
+        .metadata
+        .get("arguments")
+        .filter(|arguments| arguments.is_object())
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()))
 }
 
 impl Component for PermissionBridge {

@@ -7089,3 +7089,22 @@ agent list   → 32 行,含全部嵌套 agent
 153 把夹具刷新到与实时文件一致,关闭了 seam #19(注释说谎),但**准则 2 要的是输出 parity,不是输入一致**。F1 说得准:*"That guard proves input identity, not output parity."* 我上一轮验收 153 时只验了漂移守卫真能拦,**没验它是否达成了准则 2 本身要的东西**——我验的是它做了什么,不是它该做什么。
 
 > **验收一条修复时,除了确认它声称的改动生效,还要回头对照它要满足的原始准则。** 守卫可以完美工作,同时完全没解决准则要求的问题。
+
+## [2026-08-11] Todo 157 — edit 权限不再要求用户盲批
+
+生产 dispatch 一直把 edit 参数放在 `metadata.arguments`，路径也保留在 `patterns`；旧视图却只读
+顶层 `metadata.filepath`，diff 也只等一个生产请求不会写入的顶层 `metadata.diff`。因此 todo 150
+修复通用参数桥接后，edit 仍只显示标题，普通与 `Ctrl+F` 全屏都看不到文件路径和变更内容。
+
+修复让 `PermissionBridge` 只向视图传递对象形状的 arguments，并让 edit 描述从
+`filePath`/`file_path`/`path`、旧 metadata、首个 pattern 依次解析路径；diff 优先接受已有 patch，
+否则从 `oldString`/`newString` 构造 replacement patch。普通与全屏共用同一个 subject/diff，footer
+改为真实可用的 `↑↓ select`。表驱动测试覆盖 `describe()` 的每个 permission 分支并证明主题非空，
+生产 dispatch 测试则从真实 dispatcher 穿过 broker/bridge，验证普通与全屏都显示路径和 diff。
+
+四个反向变异分别移除路径解析、diff 构造、fullscreen 状态切换和 producer arguments 写入，均由
+对应命名测试捕获。真实 tmux 验收显示 `/tmp/opencode-t157/project/edit-target.txt` 与
+`ORIGINAL` → `T157_EDITED`，全屏 footer 显示 `ctrl+f minimize`。最终 workspace tests、all-target
+Clippy 与 rustfmt 全部通过。集成 `lsp_diagnostics` 仍因固定 main-worktree cwd 拒绝 sibling worktree；
+同一 rust-analyzer 后端的原生 diagnostics 已完成，四个变更文件无错误或警告。完整记录见
+`.omo/evidence/task-157-opencode-rust.txt`。

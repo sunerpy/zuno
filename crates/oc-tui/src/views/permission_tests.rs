@@ -255,14 +255,16 @@ fn views_permission_always_stage_says_so_for_a_blanket_grant() {
 #[test]
 fn views_permission_edit_renders_the_diff_it_is_approving() {
     let mut inner = request("edit");
-    inner
-        .metadata
-        .insert(String::from("filepath"), json!("src/main.rs"));
-    inner.metadata.insert(
-        String::from("diff"),
-        json!("@@ -1,2 +1,2 @@\n-let a = 1;\n+let a = 2;\n ok\n"),
+    inner.patterns = vec![String::from("src/main.rs")];
+    let prompt = PermissionPrompt::new(
+        ViewContext::defaults(),
+        inner,
+        &json!({
+            "filePath": "src/main.rs",
+            "oldString": "let a = 1;",
+            "newString": "let a = 2;"
+        }),
     );
-    let prompt = PermissionPrompt::new(ViewContext::defaults(), inner, &json!({}));
     let joined = render(prompt, 70, 20).join("\n");
     assert!(joined.contains("Edit src/main.rs"), "{joined}");
     assert!(
@@ -288,6 +290,39 @@ fn views_permission_fullscreen_toggle_changes_the_requested_height() {
     assert_eq!(prompt.desired_height(30, 40), 40);
 }
 
+#[test]
+fn views_permission_fullscreen_renders_the_edit_subject_and_diff() {
+    let mut inner = request("edit");
+    inner.patterns = vec![String::from("src/fullscreen.rs")];
+    let mut prompt = PermissionPrompt::new(
+        ViewContext::defaults(),
+        inner,
+        &json!({
+            "filePath": "src/fullscreen.rs",
+            "oldString": "before_fullscreen",
+            "newString": "after_fullscreen"
+        }),
+    );
+    prompt.handle_action(
+        action("permission.prompt.fullscreen"),
+        &key(KeyCode::Char('f')),
+    );
+
+    let joined = render(prompt, 80, 30).join("\n");
+    assert!(
+        joined.contains("Edit src/fullscreen.rs"),
+        "fullscreen dropped the edit subject:\n{joined}"
+    );
+    assert!(
+        joined.contains("before_fullscreen") && joined.contains("after_fullscreen"),
+        "fullscreen dropped the diff:\n{joined}"
+    );
+    assert!(
+        joined.contains("ctrl+f minimize"),
+        "fullscreen did not render its active footer:\n{joined}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Per-permission descriptions
 // ---------------------------------------------------------------------------
@@ -295,6 +330,16 @@ fn views_permission_fullscreen_toggle_changes_the_requested_height() {
 #[test]
 fn views_permission_describe_covers_every_oracle_branch() {
     let cases: Vec<(&str, serde_json::Value, &str, &str)> = vec![
+        (
+            "edit",
+            json!({
+                "filePath": "src/edit.rs",
+                "oldString": "old",
+                "newString": "new"
+            }),
+            "→",
+            "Edit src/edit.rs",
+        ),
         ("read", json!({"filePath": "a.rs"}), "→", "Read a.rs"),
         (
             "glob",
@@ -332,10 +377,63 @@ fn views_permission_describe_covers_every_oracle_branch() {
         ("mystery_tool", json!({}), "⚙", "Call tool mystery_tool"),
     ];
     for (permission, input, icon, title) in cases {
-        let subject = describe(&request(permission), &input);
+        let inner = request(permission);
+        let subject = describe(&inner, &input);
         assert_eq!(subject.icon, icon, "wrong icon for {permission}");
         assert_eq!(subject.title, title, "wrong title for {permission}");
+        assert!(
+            !subject.title.trim().is_empty(),
+            "{permission} produced an empty subject"
+        );
+        let joined = render(
+            PermissionPrompt::new(ViewContext::defaults(), inner, &input),
+            90,
+            20,
+        )
+        .join("\n");
+        assert!(
+            joined.contains(title),
+            "{permission} did not render its non-empty subject:\n{joined}"
+        );
     }
+}
+
+#[test]
+fn views_permission_external_directory_renders_a_non_empty_subject() {
+    let mut inner = request("external_directory");
+    inner.patterns = vec![String::from("/tmp/work/**")];
+    let expected = "Access external directory /tmp/work";
+    let subject = describe(&inner, &json!({}));
+    assert_eq!(subject.title, expected);
+    let joined = render(
+        PermissionPrompt::new(ViewContext::defaults(), inner, &json!({})),
+        90,
+        20,
+    )
+    .join("\n");
+    assert!(
+        joined.contains(expected),
+        "external_directory did not render its subject:\n{joined}"
+    );
+}
+
+#[test]
+fn views_permission_footer_advertises_the_arrow_keys_that_select() {
+    let mut prompt = prompt("bash", json!({"command": "true"}));
+    assert!(
+        prompt.hints().contains(&("↑↓", "select")),
+        "the footer must advertise the Up/Down bindings that the prompt handles"
+    );
+    assert!(
+        !prompt.hints().iter().any(|(key, _)| *key == "⇆"),
+        "the footer still advertises an ambiguous key that does not select"
+    );
+
+    assert_eq!(prompt.highlighted(), ReplyKind::Once);
+    prompt.handle_action(action("dialog.select.next"), &key(KeyCode::Down));
+    assert_eq!(prompt.highlighted(), ReplyKind::Always);
+    prompt.handle_action(action("dialog.select.prev"), &key(KeyCode::Up));
+    assert_eq!(prompt.highlighted(), ReplyKind::Once);
 }
 
 #[test]
