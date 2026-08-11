@@ -150,34 +150,34 @@ session. `examples/rust_plugin.rs` uses it; copy that shape.
 
 ## The hooks
 
-Every tier dispatches the same 21 hooks, in upstream declaration order. Generated
-from `oc_plugin::HookName::ALL`, so a hook added to the host appears here or the
-documentation gate fails.
+Every tier dispatches the same 21 hooks, in upstream declaration order. The table
+is generated from `oc_plugin::hook_support()`, whose exhaustive mapping requires
+every advertised hook to name its production lifecycle trigger.
 
 <!-- generated:BEGIN plugin-hooks -->
-| hook | JavaScript / JSON-RPC name |
-|---:|---|
-| 1 | `dispose` |
-| 2 | `event` |
-| 3 | `config` |
-| 4 | `tool` |
-| 5 | `auth` |
-| 6 | `provider` |
-| 7 | `chat.message` |
-| 8 | `chat.params` |
-| 9 | `chat.headers` |
-| 10 | `permission.ask` |
-| 11 | `command.execute.before` |
-| 12 | `tool.execute.before` |
-| 13 | `shell.env` |
-| 14 | `tool.execute.after` |
-| 15 | `experimental.chat.messages.transform` |
-| 16 | `experimental.chat.system.transform` |
-| 17 | `experimental.provider.small_model` |
-| 18 | `experimental.session.compacting` |
-| 19 | `experimental.compaction.autocontinue` |
-| 20 | `experimental.text.complete` |
-| 21 | `tool.definition` |
+| hook | JavaScript / JSON-RPC name | production trigger |
+|---:|---|---|
+| 1 | `dispose` | runtime shutdown, before the plugin host is torn down |
+| 2 | `event` | each event published on the real turn event stream |
+| 3 | `config` | configuration finalization before turn composition |
+| 4 | `tool` | executable tool-registry assembly |
+| 5 | `auth` | provider-catalog credential enrichment |
+| 6 | `provider` | provider-catalog model enrichment |
+| 7 | `chat.message` | user-message construction before persistence |
+| 8 | `chat.params` | provider request preparation after model resolution |
+| 9 | `chat.headers` | provider request preparation after model resolution |
+| 10 | `permission.ask` | tool permission decision before interactive approval |
+| 11 | `command.execute.before` | command expansion before generated parts are persisted |
+| 12 | `tool.execute.before` | tool dispatch before validation, permission, and execution |
+| 13 | `shell.env` | shell child-process environment construction |
+| 14 | `tool.execute.after` | tool completion before result persistence |
+| 15 | `experimental.chat.messages.transform` | history projection before provider request preparation |
+| 16 | `experimental.chat.system.transform` | system-prompt assembly before provider request preparation |
+| 17 | `experimental.provider.small_model` | internal-agent model resolution |
+| 18 | `experimental.session.compacting` | compaction request assembly before summary generation |
+| 19 | `experimental.compaction.autocontinue` | overflow decision before automatic compaction |
+| 20 | `experimental.text.complete` | completed text part before its final checkpoint |
+| 21 | `tool.definition` | tool-definition snapshot before provider request preparation |
 <!-- generated:END plugin-hooks -->
 
 Regenerate with:

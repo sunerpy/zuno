@@ -9,6 +9,7 @@ mod jsonrpc;
 mod manifest;
 mod payload;
 mod provider;
+mod support;
 
 pub use crate::auth::*;
 pub use crate::config_tools::*;
@@ -19,6 +20,7 @@ pub use crate::jsonrpc::*;
 pub use crate::manifest::*;
 pub use crate::payload::*;
 pub use crate::provider::*;
+pub use crate::support::*;
 
 #[cfg(feature = "wasm")]
 pub mod wasm;

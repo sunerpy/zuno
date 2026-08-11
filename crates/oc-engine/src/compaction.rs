@@ -308,6 +308,7 @@ pub struct AutoContinueHookInput<'a> {
     pub agent: &'a str,
     pub provider_id: &'a str,
     pub model_id: &'a str,
+    pub message: &'a Message,
     pub overflow: bool,
 }
 
@@ -517,7 +518,7 @@ pub async fn run_compaction<T, H>(
 ) -> Result<CompactionOutcome, CompactionError>
 where
     T: Clone + PartialEq,
-    H: CompactionHooks,
+    H: CompactionHooks + ?Sized,
 {
     if let Some(message) = &state.failure {
         return Ok(CompactionOutcome::Stopped {
@@ -579,6 +580,13 @@ where
     let summary_prompt = prompt.prompt.unwrap_or_else(|| {
         build_summary_prompt(request.previous_summary, prompt.context.as_slice())
     });
+    let auto_continue_message = request
+        .entries
+        .iter()
+        .rev()
+        .find(|entry| entry.message.role == Role::User && !entry.synthetic)
+        .map(|entry| entry.message.clone())
+        .unwrap_or_else(|| Message::new(Role::User, ""));
     let mut entries = request.entries;
     let retained = entries.split_off(boundary.retained_from);
     let summarized = entries.split_off(boundary.initial_context_end);
@@ -645,6 +653,7 @@ where
                 agent: request.agent,
                 provider_id: request.provider_id,
                 model_id: request.small_model_id,
+                message: &auto_continue_message,
                 overflow: request.overflow,
             })
             .await

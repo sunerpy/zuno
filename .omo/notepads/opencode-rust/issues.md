@@ -6956,3 +6956,32 @@ Vertex), and Vertex Anthropic SSE. Removing each registration individually kille
 corresponding named test: 8/8 mutations observed. No new dependency or plugin-hook surface was
 touched. Full commands and final gate results are recorded in
 `.omo/evidence/task-148-opencode-rust.txt`.
+
+## [2026-08-11] Todo 149 — all 21 advertised plugin hooks now cross production boundaries
+
+The 17 formerly dispatcher-only hooks are now consumed through engine-native traits owned by
+`oc-engine`, with `oc-cli::PluginRuntime` as the adapter. This preserves the existing dependency
+direction (`oc-plugin -> oc-engine`) and avoids an `oc-engine -> oc-plugin` cycle. The four resource
+hooks (`config`, `tool`, `auth`, `provider`) remain at the CLI composition root. Runtime shutdown is
+idempotent and dispatches `dispose` before terminating the JavaScript host on run, TUI, and server
+surfaces.
+
+`HookName::ALL` is the sole advertised-hook list. `oc_plugin::hook_support()` maps it through an
+exhaustive `production_trigger(HookName)` match, so a newly added enum variant cannot compile until
+it has a declared production boundary. The generated `plugin-hooks` block in
+`docs/plugin-authoring.md` and its docs gate consume that same iterator rather than duplicating a
+handwritten support list.
+
+Four witnesses cover the real binary/turn/tool/compaction paths: one ordinary lifecycle run covers
+15 hooks, one real dispatcher tool turn covers `permission.ask` and tool before/after, one real bash
+turn proves `shell.env` reaches the child process, and one real compaction run proves prompt
+replacement plus auto-continuation suppression. Every production dispatch was independently
+removed while retaining payload type-checking: all 21 mutations compiled, entered their mapped
+test, and failed by name; the source was restored byte-for-byte after every attempt. Exact mapping,
+assertion locations, and restoration hash are in `.omo/evidence/task-149-opencode-rust.txt`.
+
+Two environment limitations remain disclosures rather than implementation gaps: this sibling
+worktree has no CodeGraph index, and `lsp_diagnostics` is rooted at the request cwd and rejects
+paths under `/config/workspace/ProdDir/AI/oc-wt/t149`. The pinned `.omo/refs` tree is also absent;
+upstream lifecycle locations were inspected in `/config/workspace/ProdDir/AI/opencode` at revision
+`aefaf140c1`, so exact source parity with released 1.18.15 is not claimed.

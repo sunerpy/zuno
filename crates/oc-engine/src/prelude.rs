@@ -44,9 +44,9 @@ use oc_tool::ToolDefinition;
 use serde_json::Value;
 
 use crate::compaction::{
-    CompactionCache, CompactionError, CompactionOutcome, CompactionPolicy, CompactionRequest,
-    CompactionState, CompactionTrigger, TokenWindow, TranscriptEntry, run_compaction,
-    summary_safe_message_owned,
+    CompactionCache, CompactionError, CompactionHooks, CompactionOutcome, CompactionPolicy,
+    CompactionRequest, CompactionState, CompactionTrigger, TokenWindow, TranscriptEntry,
+    run_compaction, summary_safe_message_owned,
 };
 use crate::r#loop::{
     ResolvedModel, hydrate_retained_history, map_project_history_owned_with_ids, project_history,
@@ -125,6 +125,7 @@ pub struct PreludeContext<'a> {
     pub window: TokenWindow,
     /// Latched compaction failure state, so a failing attempt is tried once.
     pub state: &'a mut CompactionState,
+    pub hooks: &'a dyn CompactionHooks,
 }
 
 /// How the prelude gets a provider for an internal agent's model.
@@ -150,6 +151,11 @@ pub struct PreludeOutcome {
     pub title: Option<String>,
     /// Whether the history was compacted before the turn.
     pub compacted: bool,
+    /// Whether the caller should enter the ordinary turn after the prelude.
+    ///
+    /// A plugin may suppress the synthetic continuation produced by automatic
+    /// compaction. This is `true` when no compaction ran and for the default hook.
+    pub continue_turn: bool,
     /// Why an internal was skipped, in the order the internals ran.
     pub skipped: Vec<String>,
 }
@@ -174,6 +180,7 @@ pub async fn run_prelude(
     let mut outcome = PreludeOutcome {
         title: None,
         compacted: false,
+        continue_turn: true,
         skipped: Vec::new(),
     };
     match generate_title(session_id, context).await {
@@ -182,7 +189,10 @@ pub async fn run_prelude(
         Err(TitleSkipped::Reason(reason)) => outcome.skipped.push(format!("title: {reason}")),
     }
     match compact_if_overflowing(session_id, context).await {
-        Ok(compacted) => outcome.compacted = compacted,
+        Ok(compaction) => {
+            outcome.compacted = compaction.compacted;
+            outcome.continue_turn = compaction.continue_turn;
+        }
         Err(CompactionSkipped::Database(error)) => return Err(error),
         Err(CompactionSkipped::Reason(reason)) => {
             outcome.skipped.push(format!("compaction: {reason}"));
@@ -269,7 +279,8 @@ pub async fn generate_title(
 
 /// Why compaction could not happen although the history needed it.
 ///
-/// A history that simply fits is **not** represented here — that is `Ok(false)`. The
+/// A history that simply fits is **not** represented here — that is an unchanged
+/// [`PreludeCompactionOutcome`]. The
 /// distinction is what keeps the report honest: "your context did not need compacting"
 /// is the ordinary case and belongs in no report, while "your context overflowed and I
 /// could not compact it" is a loss the user has to be told about. Collapsing the two
@@ -281,6 +292,22 @@ pub enum CompactionSkipped {
     Database(DbError),
     /// The history overflowed and the attempt could not be made or completed.
     Reason(String),
+}
+
+/// The prelude-facing result of checking and, when needed, compacting history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreludeCompactionOutcome {
+    /// Whether compaction replaced the old history with a summary.
+    pub compacted: bool,
+    /// Whether the caller should immediately continue into the ordinary turn.
+    pub continue_turn: bool,
+}
+
+impl PreludeCompactionOutcome {
+    const NOT_NEEDED: Self = Self {
+        compacted: false,
+        continue_turn: true,
+    };
 }
 
 /// Compact the session's history when it no longer fits the model's window.
@@ -306,16 +333,16 @@ pub enum CompactionSkipped {
 pub async fn compact_if_overflowing(
     session_id: &str,
     context: &mut PreludeContext<'_>,
-) -> Result<bool, CompactionSkipped> {
+) -> Result<PreludeCompactionOutcome, CompactionSkipped> {
     let store_history = hydrate_retained_history(context.connection, session_id)
         .map_err(CompactionSkipped::Database)?;
     let retained = retained_history(&store_history);
     let Some(used_tokens) = measured_tokens(retained) else {
-        return Ok(false);
+        return Ok(PreludeCompactionOutcome::NOT_NEEDED);
     };
     let trigger = CompactionTrigger::Threshold { used_tokens };
     if !CompactionPolicy::resolve(context.compaction, context.window).should_compact(trigger) {
-        return Ok(false);
+        return Ok(PreludeCompactionOutcome::NOT_NEEDED);
     }
 
     compact_history(session_id, context, store_history, trigger, true).await
@@ -335,6 +362,7 @@ pub async fn compact_manually(
         false,
     )
     .await
+    .map(|outcome| outcome.compacted)
 }
 
 async fn compact_history(
@@ -343,7 +371,7 @@ async fn compact_history(
     store_history: Vec<MessageWithParts>,
     trigger: CompactionTrigger,
     automatic: bool,
-) -> Result<bool, CompactionSkipped> {
+) -> Result<PreludeCompactionOutcome, CompactionSkipped> {
     let retained = retained_history(&store_history);
 
     let agent = &context.internals.compaction;
@@ -373,7 +401,7 @@ async fn compact_history(
     let outcome = run_compaction(
         context.connection,
         provider.as_ref(),
-        &crate::compaction::NoopCompactionHooks,
+        context.hooks,
         context.state,
         &mut cache,
         request,
@@ -382,8 +410,11 @@ async fn compact_history(
     .map_err(|CompactionError::Database(error)| CompactionSkipped::Database(error))?;
 
     match outcome {
-        CompactionOutcome::Compacted(_) => Ok(true),
-        CompactionOutcome::NotNeeded => Ok(false),
+        CompactionOutcome::Compacted(transcript) => Ok(PreludeCompactionOutcome {
+            compacted: true,
+            continue_turn: transcript.auto_continue,
+        }),
+        CompactionOutcome::NotNeeded => Ok(PreludeCompactionOutcome::NOT_NEEDED),
         CompactionOutcome::Stopped { reason, message } => {
             Err(CompactionSkipped::Reason(format!("{reason:?}: {message}")))
         }
@@ -587,6 +618,8 @@ async fn collect_text(
         surface: agent.model.surface,
         messages,
         tools: Vec::new(),
+        parameters: serde_json::Map::new(),
+        headers: std::collections::BTreeMap::new(),
     };
     let mut stream = provider.stream(request);
     let mut chunks = Vec::new();

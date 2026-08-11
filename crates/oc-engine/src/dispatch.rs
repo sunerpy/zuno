@@ -20,6 +20,7 @@ use oc_tool::{
 };
 use serde_json::{Map, Value};
 
+use crate::hooks::{NoopHooks, PermissionHookDecision, ToolHooks};
 use crate::interrupt::BackgroundToolSignal;
 use crate::r#loop::{AvailableTools, DispatchRequest, ToolDispatchResult, ToolDispatcher};
 
@@ -37,6 +38,7 @@ pub struct ToolRegistryDispatcher {
     approval: Arc<dyn PermissionAsker>,
     background_tool: BackgroundToolSignal,
     mcp_status: McpToolStatus,
+    hooks: Arc<dyn ToolHooks>,
 }
 
 impl ToolRegistryDispatcher {
@@ -59,7 +61,14 @@ impl ToolRegistryDispatcher {
             approval,
             background_tool,
             mcp_status,
+            hooks: Arc::new(NoopHooks),
         }
+    }
+
+    #[must_use]
+    pub fn with_hooks(mut self, hooks: Arc<dyn ToolHooks>) -> Self {
+        self.hooks = hooks;
+        self
     }
 
     fn visible_definitions(&self) -> Vec<ToolDefinition> {
@@ -84,7 +93,7 @@ impl ToolDispatcher for ToolRegistryDispatcher {
         AvailableTools::new(self.visible_definitions(), self.mcp_status)
     }
 
-    async fn dispatch(&self, request: DispatchRequest) -> ToolDispatchResult {
+    async fn dispatch(&self, mut request: DispatchRequest) -> ToolDispatchResult {
         let requested_name = request.call.name.clone();
         let resolved_name = resolve_tool_name(&requested_name);
         let available = available_names(&request.available_tools);
@@ -97,6 +106,19 @@ impl ToolDispatcher for ToolRegistryDispatcher {
         }) else {
             return unknown_tool_result(&requested_name, &available);
         };
+
+        if let Err(error) = self
+            .hooks
+            .before(
+                resolved_name,
+                &request.session_id,
+                &request.call.id,
+                &mut request.call.input,
+            )
+            .await
+        {
+            return error_result(resolved_name, error);
+        }
 
         if let Some(input_error) = &request.call.input_error {
             return error_result(
@@ -117,11 +139,31 @@ impl ToolDispatcher for ToolRegistryDispatcher {
         }
 
         let ask = permission_ask(resolved_name, &request.call.input);
+        let permission_request = ask.clone().into_request(
+            format!("per_{}", request.call.id),
+            &request.session_id,
+            Some(oc_permission::ToolCall {
+                message_id: request.message_id.clone(),
+                call_id: request.call.id.clone(),
+            }),
+        );
+        let plugin_permission = match self.hooks.permission(&permission_request).await {
+            Ok(decision) => decision,
+            Err(error) => return error_result(resolved_name, error),
+        };
+        if plugin_permission == PermissionHookDecision::Deny {
+            return error_result(
+                resolved_name,
+                format!("Tool `{resolved_name}` was denied by a plugin."),
+            );
+        }
         let permission = Arc::new(RulePermissionAsker::new(
             Arc::clone(&self.rules),
             Arc::clone(&self.approval),
         ));
-        if let Err(error) = permission.ask(resolved_name, ask).await {
+        if plugin_permission == PermissionHookDecision::Ask
+            && let Err(error) = permission.ask(resolved_name, ask).await
+        {
             return tool_error_result(resolved_name, &error);
         }
 
@@ -131,18 +173,18 @@ impl ToolDispatcher for ToolRegistryDispatcher {
         let interrupt = request.interrupt.clone();
         let permission: Arc<dyn PermissionAsker> = permission;
         let context = ToolContext::new(
-            request.session_id,
+            request.session_id.clone(),
             request.message_id,
-            request.call.id,
+            request.call.id.clone(),
             request.agent,
             permission,
             Arc::new(interrupt.clone()),
         );
-        let args = request.call.input;
+        let args = request.call.input.clone();
         let tool_name = resolved_name.to_owned();
         let mut execution = tokio::spawn(async move { tool.execute(args, context).await });
 
-        tokio::select! {
+        let mut result = tokio::select! {
             biased;
             joined = &mut execution => joined_result(&tool_name, joined),
             () = self.background_tool.notified() => {
@@ -164,7 +206,21 @@ impl ToolDispatcher for ToolRegistryDispatcher {
                     format!("Tool `{tool_name}` was interrupted before it completed."),
                 )
             }
+        };
+        if let Err(error) = self
+            .hooks
+            .after(
+                resolved_name,
+                &request.session_id,
+                &request.call.id,
+                &request.call.input,
+                &mut result.output,
+            )
+            .await
+        {
+            return error_result(resolved_name, error);
         }
+        result
     }
 }
 

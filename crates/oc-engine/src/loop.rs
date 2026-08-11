@@ -31,6 +31,7 @@ use oc_tool::{ToolDefinition, ToolOutput};
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 
+use crate::hooks::{HookMessageWithParts, NoopHooks, RequestHookInput, TurnHooks};
 use crate::interrupt::InterruptSignal;
 
 /// Maximum queued transitions before the turn applies lossless backpressure.
@@ -43,9 +44,10 @@ pub const INTERRUPTED_TOOL_RESULT: &str = "[Tool execution was interrupted]";
 ///
 /// Its field is private so callers cannot substitute an unbounded sender. Clone
 /// this handle when more than one engine component publishes into the same turn.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TurnEventSender {
     sender: mpsc::Sender<TurnEvent>,
+    hooks: Arc<dyn TurnHooks>,
 }
 
 impl TurnEventSender {
@@ -61,6 +63,7 @@ impl TurnEventSender {
     }
 
     async fn send(&self, event: TurnEvent) -> Result<(), TurnError> {
+        self.hooks.event(&event).await.map_err(TurnError::Hook)?;
         self.sender
             .send(event)
             .await
@@ -72,7 +75,22 @@ impl TurnEventSender {
 #[must_use]
 pub fn event_channel() -> (TurnEventSender, mpsc::Receiver<TurnEvent>) {
     let (sender, receiver) = mpsc::channel(TURN_EVENT_CHANNEL_CAPACITY);
-    (TurnEventSender { sender }, receiver)
+    (
+        TurnEventSender {
+            sender,
+            hooks: Arc::new(NoopHooks),
+        },
+        receiver,
+    )
+}
+
+impl TurnEventSender {
+    /// Route every event through `hooks` before the interface observes it.
+    #[must_use]
+    pub fn with_hooks(mut self, hooks: Arc<dyn TurnHooks>) -> Self {
+        self.hooks = hooks;
+        self
+    }
 }
 
 /// Every interface-observable transition of one turn.
@@ -187,6 +205,8 @@ pub enum TurnError {
     ToolUseEndWithoutStart { step: u32 },
     #[error("the turn event consumer closed")]
     EventConsumerClosed,
+    #[error("plugin hook failed: {0}")]
+    Hook(String),
     #[error(transparent)]
     Database(#[from] DbError),
     #[error(transparent)]
@@ -218,6 +238,11 @@ impl ResolvedAgent {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedModel {
     pub provider: Spec,
+    /// User-visible provider id from the resolved catalog.
+    pub catalog_provider_id: String,
+    /// User-visible model id from the resolved catalog.
+    pub catalog_model_id: String,
+    /// Model id sent on the provider wire.
     pub model_id: String,
     pub surface: ApiSurface,
 }
@@ -225,11 +250,26 @@ pub struct ResolvedModel {
 impl ResolvedModel {
     #[must_use]
     pub fn new(provider: Spec, model_id: impl Into<String>, surface: ApiSurface) -> Self {
+        let model_id = model_id.into();
         Self {
+            catalog_provider_id: provider.provider.clone(),
+            catalog_model_id: model_id.clone(),
             provider,
-            model_id: model_id.into(),
+            model_id,
             surface,
         }
+    }
+
+    /// Attach the catalog identity when it differs from the transport factory or wire id.
+    #[must_use]
+    pub fn with_catalog_identity(
+        mut self,
+        provider_id: impl Into<String>,
+        model_id: impl Into<String>,
+    ) -> Self {
+        self.catalog_provider_id = provider_id.into();
+        self.catalog_model_id = model_id.into();
+        self
     }
 }
 
@@ -342,6 +382,7 @@ pub struct TurnContext<'a> {
     resolver: &'a dyn AgentModelResolver,
     dispatcher: &'a dyn ToolDispatcher,
     interrupt: &'a InterruptSignal,
+    hooks: Arc<dyn TurnHooks>,
 }
 
 impl<'a> TurnContext<'a> {
@@ -359,7 +400,14 @@ impl<'a> TurnContext<'a> {
             resolver,
             dispatcher,
             interrupt,
+            hooks: Arc::new(NoopHooks),
         }
+    }
+
+    #[must_use]
+    pub fn with_hooks(mut self, hooks: Arc<dyn TurnHooks>) -> Self {
+        self.hooks = hooks;
+        self
     }
 }
 
@@ -548,6 +596,7 @@ pub async fn run_turn(
     context: TurnContext<'_>,
     events: TurnEventSender,
 ) -> Result<TurnOutcome, TurnError> {
+    let events = events.with_hooks(Arc::clone(&context.hooks));
     let session = session::get(context.connection, &request.session_id)?;
     touch_session(context.connection, &request.session_id)?;
     events
@@ -617,8 +666,8 @@ pub async fn run_turn(
         events
             .send(TurnEvent::ModelResolved {
                 step,
-                provider_id: model.provider.provider.clone(),
-                model_id: model.model_id.clone(),
+                provider_id: model.catalog_provider_id.clone(),
+                model_id: model.catalog_model_id.clone(),
             })
             .await?;
 
@@ -630,10 +679,26 @@ pub async fn run_turn(
         let mut assistant = assistant_message(
             &request, &session, &requested, &agent, &model, step, &history,
         )?;
-        // Project by consuming the decoded records. Large text, image and tool
-        // payloads move from SQLite JSON trees into provider blocks instead of
-        // existing in both representations at the same time.
-        let stable_history = project_history_owned(&agent.system_prompt, history);
+        let mut system = vec![agent.system_prompt.clone()];
+        context
+            .hooks
+            .transform_system(&request.session_id, &model, &mut system)
+            .await
+            .map_err(TurnError::Hook)?;
+        let system_prompt = system.join("\n");
+        let stable_history = if context.hooks.enabled() {
+            let mut transformed = hook_messages(&history);
+            context
+                .hooks
+                .transform_messages(&request.session_id, &mut transformed)
+                .await
+                .map_err(TurnError::Hook)?;
+            let mut messages = vec![Message::new(Role::System, system_prompt.clone())];
+            messages.extend(transformed.into_iter().map(|message| message.info));
+            messages
+        } else {
+            project_history_owned(&system_prompt, history)
+        };
         let assistant_id = assistant.id.clone();
         MessageStore::new(context.connection).put_message(&assistant)?;
         last_assistant_id = Some(assistant_id.clone());
@@ -645,13 +710,19 @@ pub async fn run_turn(
             .await?;
 
         let available = context.dispatcher.available_tools();
-        let definitions = if capabilities.tool_calls {
+        let mut definitions = if capabilities.tool_calls {
             available.definitions
         } else {
             Vec::new()
         };
-        let cache =
-            prompt_cache.get_or_insert_with(|| PromptCache::new(agent.system_prompt.clone()));
+        for definition in &mut definitions {
+            context
+                .hooks
+                .tool_definition(definition)
+                .await
+                .map_err(TurnError::Hook)?;
+        }
+        let cache = prompt_cache.get_or_insert_with(|| PromptCache::new(system_prompt));
         let prepared = cache.prepare_turn_owned(
             stable_history,
             request.dynamic_context.clone(),
@@ -673,7 +744,25 @@ pub async fn run_turn(
             })
             .await?;
 
-        let completion = completion_request(&model, prepared);
+        let mut completion = completion_request(&model, prepared);
+        let hook_message = completion
+            .messages
+            .last()
+            .cloned()
+            .unwrap_or_else(|| Message::new(Role::System, ""));
+        context
+            .hooks
+            .prepare_request(
+                RequestHookInput {
+                    session_id: &request.session_id,
+                    agent: &agent,
+                    model: &model,
+                    message: &hook_message,
+                },
+                &mut completion,
+            )
+            .await
+            .map_err(TurnError::Hook)?;
         let mut stream = provider.stream(completion);
         let mut accumulator = StepAccumulator::default();
         let mut interrupted = false;
@@ -697,6 +786,19 @@ pub async fn run_turn(
             if ended {
                 break;
             }
+        }
+
+        if !accumulator.text.is_empty() {
+            context
+                .hooks
+                .text_complete(
+                    &request.session_id,
+                    &assistant_id,
+                    &text_part_id(&request.turn_id, step),
+                    &mut accumulator.text,
+                )
+                .await
+                .map_err(TurnError::Hook)?;
         }
 
         if interrupted {
@@ -1476,8 +1578,8 @@ fn assistant_message(
         "role": "assistant",
         "time": { "created": created },
         "parentID": requested.user_message_id,
-        "modelID": model.model_id,
-        "providerID": model.provider.provider,
+        "modelID": model.catalog_model_id,
+        "providerID": model.catalog_provider_id,
         "mode": agent.name,
         "agent": agent.name,
         "path": { "cwd": session.directory, "root": session.directory },
@@ -1509,7 +1611,28 @@ fn completion_request(
                 parameters: tool.parameters.clone(),
             })
             .collect(),
+        parameters: Map::new(),
+        headers: std::collections::BTreeMap::new(),
     }
+}
+
+fn hook_messages(history: &[MessageWithParts]) -> Vec<HookMessageWithParts> {
+    let retained = retained_history(history);
+    project_history("", retained)
+        .into_iter()
+        .skip(1)
+        .map(|projected| {
+            let parts = projected
+                .message_id
+                .as_deref()
+                .and_then(|id| retained.iter().find(|message| message.info.id == id))
+                .map_or_else(Vec::new, |message| message.parts.clone());
+            HookMessageWithParts {
+                info: projected.message,
+                parts,
+            }
+        })
+        .collect()
 }
 
 fn checkpoint_assistant(

@@ -63,6 +63,7 @@ pub(crate) struct ToolSelection<'a> {
     pub(crate) model_id: &'a str,
     pub(crate) question: Option<Arc<dyn QuestionAsker>>,
     pub(crate) plugin_tools: &'a [Arc<dyn Tool>],
+    pub(crate) plugins: Option<Arc<super::plugin_runtime::PluginRuntime>>,
 }
 
 /// Assemble the registry for `agent` and project it onto `provider_id`/`model_id`.
@@ -101,7 +102,11 @@ pub(crate) fn assemble(
         worktree: worktree.map_or_else(|| directory.to_path_buf(), Path::to_path_buf),
     };
     let tooling = SearchTooling::with_backend(scope, oc_search::Backend::from_env());
-    let shell = oc_tools::shell::ShellTool::new(directory).map_err(to_string)?;
+    let mut shell = oc_tools::shell::ShellTool::new(directory).map_err(to_string)?;
+    if let Some(plugins) = selection.plugins.as_ref() {
+        let hook: Arc<dyn oc_tools::shell::ShellEnvHook> = plugins.clone();
+        shell = shell.with_env_hook(hook);
+    }
     let todo_store = oc_db::pool::Pool::open_default().map_err(to_string)?;
     if let Some(asker) = selection.question {
         builder

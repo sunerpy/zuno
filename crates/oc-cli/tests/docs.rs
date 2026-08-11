@@ -19,7 +19,7 @@
 //! | `known-gaps` | [`oc_testkit::compat_report::known_gaps`] — the same list the compatibility report writes, rendered with the API counts probed above |
 //! | `v1-routes` | [`oc_server::V1_SURFACE`] |
 //! | `rejected-inputs` | messages *rendered by* [`oc_config::legacy`]'s detectors, so a reworded message fails |
-//! | `plugin-hooks` | [`oc_plugin::HookName::ALL`] |
+//! | `plugin-hooks` | [`oc_plugin::hook_support`] |
 //! | `prune-tables` | [`oc_db::prune::PRUNE_TABLES`] and [`oc_db::prune::DELETE_ORDER`] |
 //! | `migration-journal` | [`oc_db::migration::MIGRATION_IDS`] and [`oc_db::migration::CURRENT_VERSION`] |
 //! | `cross-session-memory` | [`oc_config::schema::ResolvedMemoryConfig`], [`oc_memory::Scope`] and [`oc_agent::reflection::NEGATIVE_LEARNING_LIST`] |
@@ -771,9 +771,18 @@ fn docs_every_rejected_form_is_documented_with_the_message_the_code_renders() {
 // ---------------------------------------------------------------------------
 
 fn plugin_hook_block() -> String {
-    let mut out = String::from("| hook | JavaScript / JSON-RPC name |\n|---:|---|\n");
-    for (index, hook) in oc_plugin::HookName::ALL.iter().enumerate() {
-        let _ = writeln!(out, "| {} | `{}` |", index + 1, hook.as_str());
+    let support = oc_plugin::hook_support();
+    let mut out = String::from(
+        "| hook | JavaScript / JSON-RPC name | production trigger |\n|---:|---|---|\n",
+    );
+    for (index, entry) in support.enumerate() {
+        let _ = writeln!(
+            out,
+            "| {} | `{}` | {} |",
+            index + 1,
+            entry.hook.as_str(),
+            cell(entry.production_trigger)
+        );
     }
     out
 }
@@ -787,7 +796,7 @@ fn docs_plugin_guide_matches_the_hooks_and_the_example_the_host_ships() {
     );
     contains_all(
         "docs/plugin-authoring.md",
-        &[&format!("{} hooks", oc_plugin::HookName::ALL.len())],
+        &[&format!("{} hooks", oc_plugin::hook_support().len())],
     );
 
     let example = workspace_root().join("examples/rust_plugin.rs");

@@ -18,7 +18,10 @@ use super::{
     TITLE_INSTRUCTION, TitleSkipped, compact_if_overflowing, estimate_tokens, generate_title,
     run_prelude, summarize, transcript, transcript_owned,
 };
-use crate::compaction::{CompactionState, TOOL_OUTPUT_MAX_CHARS, TokenWindow, select_boundary};
+use crate::compaction::{
+    AutoContinueHookInput, CompactionHookInput, CompactionHooks, CompactionPrompt, CompactionState,
+    TOOL_OUTPUT_MAX_CHARS, TokenWindow, select_boundary,
+};
 use crate::r#loop::retained_history;
 
 const SESSION_ID: &str = "ses_prelude_test";
@@ -146,6 +149,23 @@ struct NoProvider;
 impl InternalProviders for NoProvider {
     fn provider_for(&self, agent: &InternalAgent) -> Result<Arc<dyn Provider>, String> {
         Err(format!("no credential answers for `{}`", agent.name))
+    }
+}
+
+struct SuppressContinueHooks;
+
+#[async_trait::async_trait]
+impl CompactionHooks for SuppressContinueHooks {
+    async fn compacting(
+        &self,
+        _input: &CompactionHookInput<'_>,
+        _output: &mut CompactionPrompt,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn auto_continue(&self, _input: &AutoContinueHookInput<'_>) -> Result<bool, String> {
+        Ok(false)
     }
 }
 
@@ -367,6 +387,7 @@ fn context<'a>(
         compaction: config,
         window,
         state,
+        hooks: &crate::compaction::NoopCompactionHooks,
     }
 }
 
@@ -702,7 +723,8 @@ async fn an_overflowing_session_is_compacted_before_the_turn() {
 
     // Then: the summary was requested tool-free, and the next request over this
     // session carries the summary instead of the summarised head.
-    assert!(compacted);
+    assert!(compacted.compacted);
+    assert!(compacted.continue_turn);
     let requests = provider.requests();
     assert_eq!(requests.len(), 1);
     assert!(requests[0].tools.is_empty());
@@ -756,12 +778,47 @@ async fn a_session_within_its_window_is_not_compacted() {
     .expect("a history that fits is not a failure");
 
     assert!(
-        !compacted,
+        !compacted.compacted,
         "a session inside its window must not be compacted"
     );
     assert!(
         provider.requests().is_empty(),
         "a session that fits must not pay for a summary"
+    );
+}
+
+#[tokio::test]
+async fn automatic_compaction_propagates_a_hook_decision_to_stop_the_turn() {
+    let mut connection = seeded("A named session", None);
+    put_user(&connection, "msg_001", 10, "First question");
+    put_assistant(&connection, "msg_002", 20, "First answer", 10);
+    put_user(&connection, "msg_003", 30, "Second question");
+    put_assistant(&connection, "msg_004", 40, "Second answer", 20);
+    put_user(&connection, "msg_005", 50, "Continue after compacting");
+    put_assistant(&connection, "msg_006", 60, "Third answer", 900);
+    let provider = RecordingProvider::answering(&["## Objective\n- Preserve state."]);
+    let providers = OneProvider(provider);
+    let internals = internals();
+    let config = CompactionConfig::default();
+    let mut state = CompactionState::default();
+    let mut prelude = context(
+        &mut connection,
+        &providers,
+        &internals,
+        &config,
+        TINY_WINDOW,
+        &mut state,
+    );
+    prelude.hooks = &SuppressContinueHooks;
+
+    let outcome = run_prelude(SESSION_ID, &mut prelude)
+        .await
+        .expect("automatic compaction succeeds");
+
+    assert!(outcome.compacted);
+    assert!(
+        !outcome.continue_turn,
+        "the auto-continue hook's false result must reach the turn owner"
     );
 }
 

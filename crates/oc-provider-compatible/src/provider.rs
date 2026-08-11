@@ -183,15 +183,19 @@ impl CompatibleProvider {
         body.tools = function_envelopes(&request.tools);
         body.sampling = self.sampling;
         body.extra_body = self.extra_body.clone();
-        body.build(&quirks)
+        let mut body = body.build(&quirks);
+        request.apply_parameters(&mut body);
+        body
     }
 
     /// The full request one completion will send.
     #[must_use]
     pub fn http_request(&self, request: &CompletionRequest) -> HttpRequest {
+        let mut headers = self.headers();
+        headers.extend(request.headers.clone());
         HttpRequest {
             url: self.endpoint(&request.model_id, request.surface),
-            headers: self.headers(),
+            headers,
             body: self.body_for(request),
         }
     }
