@@ -6985,3 +6985,30 @@ worktree has no CodeGraph index, and `lsp_diagnostics` is rooted at the request 
 paths under `/config/workspace/ProdDir/AI/oc-wt/t149`. The pinned `.omo/refs` tree is also absent;
 upstream lifecycle locations were inspected in `/config/workspace/ProdDir/AI/opencode` at revision
 `aefaf140c1`, so exact source parity with released 1.18.15 is not claimed.
+
+## [2026-08-11] Todo 150 — permission dialogs need both argument plumbing and focused key scopes
+
+The blank command/path/URL detail had a direct data-loss cause: `PermissionBridge::pump` received
+`PermissionAsk.metadata.arguments` but did not pass it to `PermissionRequest`. The dialog renderer
+already knew how to describe those arguments; restoring that field makes command text, external
+paths, and URLs visible without changing the HTTP permission path.
+
+The unresponsive keyboard actions were a separate routing defect. `KeyDispatcher` used only its
+static component scopes, so editor actions could consume `Enter`, arrows, and dialog shortcuts while
+`DialogHost` was focused. `ActionComponent::focused_scopes()` now lets `PermissionBridge` prepend
+`permission.prompt`, `dialog.select`, `dialog.prompt`, and `session` only while a dialog is open.
+Normal editor `Enter` behavior remains unchanged when no dialog is focused. `session_interrupt` is
+handled as rejection/cancellation, matching `app_exit`, so Escape also resolves rather than strands
+the pending permission request.
+
+Production-shaped tests cover command/URL detail rendering and once/always/reject/Escape/fullscreen
+actions; a session test protects ordinary non-dialog submission. Reverse mutations independently
+killed the argument-plumbing and focused-scope tests. Real tmux acceptance showed command, external
+path, and URL details; fullscreen toggle; allow-once execution; allow-always reuse; and rejection
+without hanging. A direct plain-PTY probe also showed the prompt, detail, answer, and sentinel.
+Complete commands and results are in `.omo/evidence/task-150-opencode-rust.txt`.
+
+The integrated `lsp_diagnostics` tool cannot inspect this sibling worktree because it is rooted at
+the main request cwd. Native `rust-analyzer diagnostics .` completed across 523 files with no
+diagnostics in the five changed Rust files; only unrelated cfg-disabled `inactive-code` weak
+warnings were emitted.

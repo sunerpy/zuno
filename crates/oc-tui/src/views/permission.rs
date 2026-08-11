@@ -561,7 +561,7 @@ impl Dialog for PermissionPrompt {
                 }
                 // Escape resolves to `reject`, never to the highlighted option: a
                 // prompt dismissed by accident must not have granted anything.
-                "app_exit" => self.decide(ReplyKind::Reject, None),
+                "app_exit" | "session_interrupt" => self.decide(ReplyKind::Reject, None),
                 _ => DialogStep::Ignored,
             },
             Stage::ConfirmAlways => match action.name {
@@ -577,7 +577,7 @@ impl Dialog for PermissionPrompt {
                         DialogStep::Redraw
                     }
                 }
-                "app_exit" => {
+                "app_exit" | "session_interrupt" => {
                     // Cancelling the escalation returns to the choice rather than
                     // resolving: the user has not decided yet.
                     self.stage = Stage::Choose;
@@ -595,7 +595,7 @@ impl Dialog for PermissionPrompt {
                     };
                     self.decide(ReplyKind::Reject, message)
                 }
-                "app_exit" => {
+                "app_exit" | "session_interrupt" => {
                     self.stage = Stage::Choose;
                     self.reject_message.clear();
                     DialogStep::Redraw
