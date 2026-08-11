@@ -64,6 +64,12 @@ export default {
       }
       output.text += "-resident";
     },
+    "tool.execute.before": async (_input, output) => {
+      if (options?.mutateBeforeTruncation) output.args.shallow = "mutated";
+    },
+    "tool.execute.after": async (_input, output) => {
+      if (options?.mutateAcrossArguments) output.title = "mutated";
+    },
   }),
 };
 "#;
@@ -301,6 +307,128 @@ async fn js_auth_loader_still_bounds_an_arbitrary_plugin_return_graph() {
     assert_eq!(
         value.get("$path").and_then(serde_json::Value::as_str),
         Some("/next/next/next/next/next/next/next/next")
+    );
+}
+
+#[tokio::test]
+async fn js_ordinary_hook_refuses_truncation_before_committing_any_output_field() {
+    // Given: a mutable ordinary-hook output with both a shallow mutation and an
+    // object graph that reaches the encoder's eighth level.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let owner = Arc::new(FakeTerminalOwner::new());
+    let terminal: Arc<dyn TerminalLease> = Arc::new(TerminalBroker::new(owner));
+    let spec = file_spec(&fixture(temp.path())).options(serde_json::json!({
+        "mutateBeforeTruncation": true,
+    }));
+    let load = load_js_plugins_ordered(
+        vec![spec],
+        host(temp.path(), terminal, JsHostPolicy::default()),
+    )
+    .await;
+    let plugin = load
+        .plugins()
+        .first()
+        .unwrap_or_else(|| panic!("fixture plugin loaded: {:?}", load.diagnostics()));
+    let mut deep = serde_json::json!({ "sentinel": "preserved" });
+    for _ in 0..7 {
+        deep = serde_json::json!({ "next": deep });
+    }
+    let mut output = oc_plugin::ToolExecuteBeforeOutput {
+        args: serde_json::json!({
+            "shallow": "original",
+            "deep": deep,
+        }),
+    };
+    let before = output.clone();
+
+    // When
+    let error = plugin
+        .call(&mut HookInvocation::ToolExecuteBefore {
+            input: &oc_plugin::ToolExecuteBeforeInput {
+                tool: "fixture",
+                session_id: "session",
+                call_id: "call",
+            },
+            output: &mut output,
+        })
+        .await
+        .expect_err("a lossy ordinary-hook output must be refused");
+    load.shutdown().await;
+
+    // Then
+    let message = error.to_string();
+    assert!(
+        message.contains("resident-fixture.mjs"),
+        "the refusal must name the plugin: {message}"
+    );
+    assert!(
+        message.contains("`tool.execute.before` hook argument 1"),
+        "the refusal must name the mutable hook argument: {message}"
+    );
+    assert!(
+        message.contains("/args/deep/next/next/next/next/next/next"),
+        "the refusal must name the argument-relative JSON Pointer: {message}"
+    );
+    assert_eq!(
+        output, before,
+        "detecting any truncated field must preserve every original output field"
+    );
+}
+
+#[tokio::test]
+async fn js_ordinary_hook_preserves_output_when_a_different_argument_is_truncated() {
+    // Given: argument 0 reaches the depth cap while the callback mutates argument 1.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let owner = Arc::new(FakeTerminalOwner::new());
+    let terminal: Arc<dyn TerminalLease> = Arc::new(TerminalBroker::new(owner));
+    let spec = file_spec(&fixture(temp.path())).options(serde_json::json!({
+        "mutateAcrossArguments": true,
+    }));
+    let load = load_js_plugins_ordered(
+        vec![spec],
+        host(temp.path(), terminal, JsHostPolicy::default()),
+    )
+    .await;
+    let plugin = load
+        .plugins()
+        .first()
+        .unwrap_or_else(|| panic!("fixture plugin loaded: {:?}", load.diagnostics()));
+    let mut deep = serde_json::json!({ "sentinel": "preserved" });
+    for _ in 0..7 {
+        deep = serde_json::json!({ "next": deep });
+    }
+    let args = serde_json::json!({ "deep": deep });
+    let mut output = oc_tool::ToolOutput::text("original", "output");
+    let before = output.clone();
+
+    // When
+    let error = plugin
+        .call(&mut HookInvocation::ToolExecuteAfter {
+            input: &oc_plugin::ToolExecuteAfterInput {
+                tool: "fixture",
+                session_id: "session",
+                call_id: "call",
+                args: &args,
+            },
+            output: &mut output,
+        })
+        .await
+        .expect_err("a truncated input argument must reject the whole write-back");
+    load.shutdown().await;
+
+    // Then
+    let message = error.to_string();
+    assert!(
+        message.contains("`tool.execute.after` hook argument 0"),
+        "the refusal must identify the independently truncated argument: {message}"
+    );
+    assert!(
+        message.contains("/args/deep/next/next/next/next/next/next"),
+        "the refusal must name the argument-relative JSON Pointer: {message}"
+    );
+    assert_eq!(
+        output, before,
+        "a mutation to argument 1 must not commit when argument 0 is truncated"
     );
 }
 

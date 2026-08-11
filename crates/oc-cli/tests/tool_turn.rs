@@ -159,11 +159,21 @@ export default {
       output.text += ":text-complete-hook";
     },
     "tool.definition": async (input, output) => {
+      output.parameters = { type: "object", properties: {} };
       if (input.toolID === "lifecycle_tool") {
         output.description = "definition-hook-description";
       }
     },
     dispose: async () => appendFileSync(options.disposeFile, "disposed\n"),
+  }),
+};
+"#;
+
+const NOOP_TOOL_DEFINITION_PLUGIN: &str = r#"
+export default {
+  id: "production-noop-tool-definition",
+  server: async () => ({
+    "tool.definition": async (_input, _output) => {},
   }),
 };
 "#;
@@ -483,6 +493,39 @@ fn advertised_tool_description<'a>(body: &'a serde_json::Value, id: &str) -> Opt
         })?
         .pointer("/function/description")
         .and_then(serde_json::Value::as_str)
+}
+
+fn bridge_truncation_paths(value: &serde_json::Value) -> Vec<String> {
+    fn visit(value: &serde_json::Value, paths: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    visit(value, paths);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                if map.get("$truncated").and_then(serde_json::Value::as_bool) == Some(true) {
+                    paths.push(
+                        map.get("$path")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("/")
+                            .to_owned(),
+                    );
+                }
+                for value in map.values() {
+                    visit(value, paths);
+                }
+            }
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_) => {}
+        }
+    }
+
+    let mut paths = Vec::new();
+    visit(value, &mut paths);
+    paths
 }
 
 /// The frozen harness's own arithmetic, reproduced so a failure names the number.
@@ -1011,6 +1054,59 @@ async fn shell_env_plugin_hook_reaches_the_real_shell_process() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn noop_tool_definition_hook_rejects_real_truncated_schema_before_provider_dispatch() {
+    let env = ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::TempFile);
+    let plugin = env.project().join("noop-tool-definition-plugin.mjs");
+    let event_file = env.project().join("noop-tool-definition.events");
+    let dispose_file = env.project().join("noop-tool-definition.dispose");
+    std::fs::write(&plugin, NOOP_TOOL_DEFINITION_PLUGIN)
+        .expect("write no-op tool.definition plugin");
+    let scenario = Scenario::new("noop-tool-definition-rejects-truncation")
+        .from_oracle_cassette(TITLE_CASSETTE)
+        .expect("the recorded title completion loads")
+        .from_oracle_cassette(TITLE_CASSETTE)
+        .expect("the turn response is available only to catch an unsafe dispatch");
+    let provider = MockProvider::start(vec![scenario])
+        .await
+        .expect("mock provider binds loopback");
+
+    let output = run_lifecycle_command(
+        &env,
+        provider.base_url(),
+        &plugin,
+        &event_file,
+        &dispose_file,
+    )
+    .await;
+    let captured = provider.captured().await;
+    provider.shutdown().await;
+
+    assert!(
+        !output.status.success(),
+        "the no-op hook must fail explicitly instead of silently replacing a real deep built-in schema"
+    );
+    assert_eq!(
+        captured.len(),
+        1,
+        "the lossy tool definition must be rejected after the title prelude and before turn dispatch"
+    );
+    for request in &captured {
+        let body = request.json().expect("captured request is JSON");
+        assert!(
+            bridge_truncation_paths(&body).is_empty(),
+            "$truncated must never reach a provider request: {body:#}"
+        );
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("plugin production-noop-tool-definition failed in hook tool.definition"),
+        "the production failure must identify the rejected plugin hook: {stderr}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ordinary_plugin_lifecycle_hooks_run_through_the_real_binary() {
     let env = ScriptedEnv::new()
         .expect("isolated environment")
@@ -1053,6 +1149,11 @@ async fn ordinary_plugin_lifecycle_hooks_run_through_the_real_binary() {
         "the internal title request did not consume experimental.provider.small_model: {title:#}"
     );
     let turn = captured[1].json().expect("turn request is JSON");
+    let truncation_paths = bridge_truncation_paths(&turn);
+    assert!(
+        truncation_paths.is_empty(),
+        "a no-op tool.definition hook silently committed bounded-encoder markers to the provider request: {truncation_paths:?}"
+    );
     assert_eq!(
         request_model(&turn),
         Some("provider-hook-model"),
