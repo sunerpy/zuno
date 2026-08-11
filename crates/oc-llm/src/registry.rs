@@ -184,10 +184,11 @@ impl ProviderRegistry {
         self.factories.insert(provider, Arc::new(factory));
     }
 
-    /// Construct the provider `spec` names.
+    /// Construct the provider identity `spec` names with its selected factory.
     ///
-    /// The key is [`Spec::provider`], so a caller cannot pass a key and a spec
-    /// that disagree.
+    /// [`Spec::factory`] is the registry key and [`Spec::provider`] remains the
+    /// identity passed to the factory. They default to the same value, while a
+    /// shared wire family can select one factory for several behavioral profiles.
     ///
     /// # Errors
     ///
@@ -196,9 +197,10 @@ impl ProviderRegistry {
     /// [`RegistryError::Unavailable`] when a factory declined, and
     /// [`RegistryError::Construction`] when one failed.
     pub fn resolve(&self, spec: Spec) -> Result<Arc<dyn Provider>, RegistryError> {
-        let Some(factory) = self.factories.get(spec.provider.as_str()).cloned() else {
+        let factory_key = spec.factory().to_owned();
+        let Some(factory) = self.factories.get(factory_key.as_str()).cloned() else {
             return Err(RegistryError::NotRegistered {
-                provider: spec.provider,
+                provider: factory_key,
             });
         };
         let provider = spec.provider.clone();

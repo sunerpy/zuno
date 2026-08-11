@@ -207,7 +207,7 @@ impl TurnPlan {
         let requested_model = options.model.as_deref().or(agent.model.as_deref());
         let (provider_id, model_id, catalog_model) =
             select_model(&catalog, requested_model, loaded.provenance())?;
-        if provider_key_for_npm(&catalog_model.api.npm).is_none() {
+        if provider_factory_key(&catalog_model.provider_id, &catalog_model.api.npm).is_none() {
             return Err(format!(
                 "model {provider_id}/{model_id} uses unsupported transport {}",
                 catalog_model.api.npm
@@ -347,7 +347,8 @@ fn resolve_internals(
             return None;
         }
         let model = catalog.model(small_provider, small_model)?;
-        if provider_key_for_npm(&model.api.npm).is_none() || model_spec(catalog, model, env).is_err()
+        if provider_factory_key(&model.provider_id, &model.api.npm).is_none()
+            || model_spec(catalog, model, env).is_err()
         {
             notes.push(format!(
                 "small_model: `{qualified}` cannot be reached by this runtime"
@@ -364,7 +365,8 @@ fn resolve_internals(
             ));
             return false;
         }
-        if provider_key_for_npm(&model.api.npm).is_none() || model_spec(catalog, model, env).is_err()
+        if provider_factory_key(&model.provider_id, &model.api.npm).is_none()
+            || model_spec(catalog, model, env).is_err()
         {
             notes.push(format!(
                 "plugin small model `{}/{}` cannot be reached; using `{provider_id}/{model_id}` instead",
@@ -395,7 +397,7 @@ fn resolve_internals(
                     return None;
                 }
                 let model = catalog.model(chosen_provider, chosen_model)?;
-                if provider_key_for_npm(&model.api.npm).is_none() {
+                if provider_factory_key(&model.provider_id, &model.api.npm).is_none() {
                     notes.push(format!(
                         "{name}: `{}` uses transport {}, which this runtime has no \
                          provider for; using `{provider_id}/{model_id}` instead",
@@ -994,7 +996,33 @@ fn select_model<'a>(
     Err(message)
 }
 
-fn provider_key_for_npm(npm: &str) -> Option<&'static str> {
+/// Provider identities whose dedicated upstream SDK still speaks the compatible
+/// wire family implemented by `oc-provider-compatible`.
+///
+/// This is intentionally a closed `(identity, transport)` table. Matching only
+/// the transport would admit an arbitrary provider id into a profile it did not
+/// claim; matching only the identity would turn a misspelled or future transport
+/// into an unsafe protocol guess. The generic compatible transport is the sole
+/// explicit opt-in for an unlisted identity.
+const COMPATIBLE_TRANSPORTS: &[(&str, &str)] = &[
+    ("alibaba", "@ai-sdk/alibaba"),
+    ("azure", "@ai-sdk/azure"),
+    ("cerebras", "@ai-sdk/cerebras"),
+    ("cohere", "@ai-sdk/cohere"),
+    ("deepinfra", "@ai-sdk/deepinfra"),
+    ("github-copilot", "@ai-sdk/github-copilot"),
+    ("gitlab", "gitlab-ai-provider"),
+    ("groq", "@ai-sdk/groq"),
+    ("mistral", "@ai-sdk/mistral"),
+    ("openrouter", "@openrouter/ai-sdk-provider"),
+    ("perplexity", "@ai-sdk/perplexity"),
+    ("togetherai", "@ai-sdk/togetherai"),
+    ("venice", "venice-ai-sdk-provider"),
+    ("vercel", "@ai-sdk/vercel"),
+    ("xai", "@ai-sdk/xai"),
+];
+
+fn provider_factory_key(provider_id: &str, npm: &str) -> Option<&'static str> {
     match npm {
         "@ai-sdk/anthropic" => Some("anthropic"),
         "@ai-sdk/amazon-bedrock" => Some("amazon-bedrock"),
@@ -1003,7 +1031,13 @@ fn provider_key_for_npm(npm: &str) -> Option<&'static str> {
         "@ai-sdk/google-vertex" => Some("google-vertex"),
         "@ai-sdk/google-vertex/anthropic" => Some("google-vertex/anthropic"),
         "@ai-sdk/openai" => Some("openai"),
-        "@ai-sdk/openai-compatible" | "@openrouter/ai-sdk-provider" => Some(COMPATIBLE_PROVIDER),
+        "@ai-sdk/openai-compatible" => Some(COMPATIBLE_PROVIDER),
+        _ if COMPATIBLE_TRANSPORTS
+            .iter()
+            .any(|&(identity, transport)| identity == provider_id && transport == npm) =>
+        {
+            Some(COMPATIBLE_PROVIDER)
+        }
         _ => None,
     }
 }
@@ -1340,31 +1374,33 @@ fn model_spec(
     env: &oc_paths::Env,
 ) -> Result<Spec, String> {
     let provider = catalog.provider(&model.provider_id);
-    let registry_key = provider_key_for_npm(&model.api.npm)
+    let factory_key = provider_factory_key(&model.provider_id, &model.api.npm)
         .ok_or_else(|| format!("unsupported provider transport `{}`", model.api.npm))?;
     let surface = match model.api.npm.as_str() {
         "@ai-sdk/anthropic" | "@ai-sdk/google-vertex/anthropic" => ApiSurface::Messages,
         "@ai-sdk/openai-compatible" | "@openrouter/ai-sdk-provider" => ApiSurface::Chat,
         _ => ApiSurface::Default,
     };
-    let mut spec = Spec::new(registry_key).with_surface(surface);
+    let mut spec = Spec::new(&model.provider_id)
+        .with_factory(factory_key)
+        .with_surface(surface);
     if let Some(endpoint) = provider_endpoint(provider, model) {
         spec = spec.with_base_url(expand_variables(&endpoint, env));
-    } else if registry_key == COMPATIBLE_PROVIDER {
+    } else if factory_key == COMPATIBLE_PROVIDER {
         return Err(format!(
             "provider `{}` has no endpoint: set \
              `provider.{}.options.baseURL` (or `options.endpoint`) to the API base URL",
             model.provider_id, model.provider_id
         ));
     }
-    if (registry_key == "amazon-bedrock" || registry_key == "amazon-bedrock/mantle")
+    if (factory_key == "amazon-bedrock" || factory_key == "amazon-bedrock/mantle")
         && let Some(region) = provider_string_option(provider, "region")
             .or_else(|| env.value("AWS_REGION").map(str::to_owned))
             .or_else(|| env.value("AWS_DEFAULT_REGION").map(str::to_owned))
     {
         spec = spec.with_region(region);
     }
-    if registry_key == "google-vertex" || registry_key == "google-vertex/anthropic" {
+    if factory_key == "google-vertex" || factory_key == "google-vertex/anthropic" {
         if let Some(project) = provider_string_option(provider, "project")
             .or_else(|| env.value("GOOGLE_VERTEX_PROJECT").map(str::to_owned))
             .or_else(|| env.value("GOOGLE_CLOUD_PROJECT").map(str::to_owned))
@@ -1385,6 +1421,16 @@ fn model_spec(
     }
     for (name, value) in forwarded_options(provider, model) {
         spec = spec.with_option(name, value);
+    }
+    if factory_key == COMPATIBLE_PROVIDER {
+        // `family::resolve` accepts an unlisted identity only when its resolved
+        // catalog metadata explicitly declares the generic compatible SDK. The
+        // transport belongs to the model API, not the provider option bag, so
+        // carry it across this boundary rather than making the family guess.
+        spec = spec.with_option(
+            oc_provider_compatible::family::NPM_OPTION,
+            json!(model.api.npm),
+        );
     }
     Ok(spec)
 }
