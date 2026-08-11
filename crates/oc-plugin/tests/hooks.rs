@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use oc_config::Config;
 use oc_config::schema::ordered::OrderedMap;
+use oc_db::message::{MessageRecord, MessageRole};
 use oc_engine::r#loop::TurnEvent;
 use oc_error::{BoxSource, ToolError};
 use oc_llm::catalog::availability::Availability;
@@ -107,7 +108,7 @@ impl Plugin for RecordingPlugin {
             | HookInvocation::Provider { .. } => panic!("resource hooks bypass call"),
             HookInvocation::ChatMessage { input, output } => {
                 assert_eq!(input.session_id, "ses");
-                output.message.role = Role::Assistant;
+                output.message.role = MessageRole::Assistant;
             }
             HookInvocation::ChatParams { input, output } => {
                 assert_eq!(input.model.id, "model");
@@ -281,7 +282,15 @@ async fn all_authoritative_hooks_dispatch_with_their_typed_payloads() {
     .await
     .expect("provider");
     let mut message = ChatMessageOutput {
-        message: Message::new(Role::User, "hello"),
+        message: MessageRecord::from_json(json!({
+            "id": "message",
+            "sessionID": "ses",
+            "role": "user",
+            "time": {"created": 1},
+            "agent": "build",
+            "model": {"providerID": "provider", "modelID": "model"}
+        }))
+        .expect("user message"),
         parts: Vec::new(),
     };
     bus.dispatch(HookInvocation::ChatMessage {

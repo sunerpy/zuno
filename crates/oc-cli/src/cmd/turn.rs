@@ -46,7 +46,7 @@ use oc_engine::prelude::{
 use oc_error::ProviderError;
 use oc_llm::cache::{DynamicContext, McpToolStatus};
 use oc_llm::catalog::{Catalog, CatalogProvenance, CatalogSource, ResolveInput};
-use oc_llm::event::{Message, RequestContentBlock, Role, StreamEvent};
+use oc_llm::event::StreamEvent;
 use oc_llm::registry::{ApiSurface, Provider, ProviderRegistry, Spec};
 use oc_memory::{ScopeLimits, SessionMemory, assemble_system_prompt};
 use oc_provider_compatible::{ReqwestTransport, Transport};
@@ -1658,10 +1658,8 @@ async fn prepare_user_message_with_hooks(
             .await?;
     }
     if let Some(plugins) = plugins {
-        let initial_message = message_from_parts(&parts);
-        let initial_parts = parts.clone();
         let mut output = oc_plugin::ChatMessageOutput {
-            message: initial_message.clone(),
+            message: message.clone(),
             parts,
         };
         let hook_input = oc_plugin::ChatMessageInput {
@@ -1675,14 +1673,17 @@ async fn prepare_user_message_with_hooks(
             variant: None,
         };
         plugins.apply_chat_message(&hook_input, &mut output).await?;
-        if output.message.role != Role::User {
+        if output.message.id != message.id {
+            return Err("chat.message cannot replace the user message id".to_owned());
+        }
+        if output.message.session_id != message.session_id {
+            return Err("chat.message cannot move a user message to another session".to_owned());
+        }
+        if output.message.role != oc_db::message::MessageRole::User {
             return Err("chat.message must return a user message".to_owned());
         }
-        parts = if output.message != initial_message && output.parts == initial_parts {
-            parts_from_message(&output.message, input.session_id, &message.id, input.now)?
-        } else {
-            output.parts
-        };
+        message = output.message;
+        parts = output.parts;
     }
     for part in &parts {
         if part.session_id != input.session_id || part.message_id != message.id {
@@ -1710,62 +1711,6 @@ fn persist_prepared_user_message(
             .map_err(to_string)?;
     }
     Ok(())
-}
-
-fn message_from_parts(parts: &[oc_db::message::PartRecord]) -> Message {
-    let content = parts
-        .iter()
-        .filter_map(|part| match part.kind {
-            oc_db::message::PartKind::Text => {
-                part.data.get("text").and_then(Value::as_str).map(|text| {
-                    RequestContentBlock::Text {
-                        text: text.to_owned(),
-                    }
-                })
-            }
-            oc_db::message::PartKind::File => {
-                let media_type = part.data.get("mime").and_then(Value::as_str)?;
-                let data = part.data.get("data").and_then(Value::as_str)?;
-                Some(RequestContentBlock::Image {
-                    media_type: media_type.to_owned(),
-                    data: data.to_owned(),
-                })
-            }
-            _ => None,
-        })
-        .collect();
-    Message::from_content(Role::User, content)
-}
-
-fn parts_from_message(
-    message: &Message,
-    session_id: &str,
-    message_id: &str,
-    now: i64,
-) -> Result<Vec<oc_db::message::PartRecord>, String> {
-    message
-        .content
-        .iter()
-        .map(|block| {
-            let value = match block {
-                RequestContentBlock::Text { text } => json!({
-                    "id": prefixed_id("prt"), "sessionID": session_id,
-                    "messageID": message_id, "type": "text", "text": text
-                }),
-                RequestContentBlock::Image { media_type, data } => json!({
-                    "id": prefixed_id("prt"), "sessionID": session_id,
-                    "messageID": message_id, "type": "file", "mime": media_type, "data": data
-                }),
-                _ => {
-                    return Err(
-                        "chat.message returned content that cannot be persisted as a user part"
-                            .to_owned(),
-                    );
-                }
-            };
-            oc_db::message::PartRecord::from_json(value, now).map_err(to_string)
-        })
-        .collect()
 }
 
 fn prefixed_id(prefix: &str) -> String {

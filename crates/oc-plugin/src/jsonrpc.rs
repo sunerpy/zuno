@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::future::join_all;
-use oc_db::message::PartRecord;
+use oc_db::message::{MessageRecord, PartRecord};
 use oc_error::{BoxSource, ToolError};
 use oc_llm::event::Message;
 use oc_plugin_sdk::{
@@ -976,7 +976,7 @@ pub(crate) fn encode_hook(hook: &HookInvocation<'_>) -> Result<HookCall, HookCod
                 "variant": input.variant,
             }),
             json!({
-                "message": output.message,
+                "message": output.message.to_json(),
                 "parts": encode_parts(&output.parts)?,
             }),
         ),
@@ -1101,7 +1101,8 @@ pub(crate) fn apply_hook_output(
         )),
         HookInvocation::ChatMessage { output, .. } => {
             let output_value: WireChatMessageOutput = decode(value)?;
-            output.message = output_value.message;
+            output.message = MessageRecord::from_json(output_value.message)
+                .map_err(|error| HookCodecError::Invalid(error.to_string()))?;
             output.parts = decode_parts(output_value.parts)?;
             Ok(())
         }
@@ -1498,7 +1499,7 @@ fn decode<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, HookCodecEr
 
 #[derive(Deserialize)]
 struct WireChatMessageOutput {
-    message: Message,
+    message: Value,
     parts: Vec<Value>,
 }
 
