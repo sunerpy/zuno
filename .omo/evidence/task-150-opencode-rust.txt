@@ -1,0 +1,118 @@
+Task 150 — TUI permission arguments and keyboard resolution evidence
+=====================================================================
+
+Baseline and root cause
+-----------------------
+- Worktree: `/config/workspace/ProdDir/AI/oc-wt/t150`, branch `task-150`.
+- The existing debug binary reproduced F3-W8-D2 in a real 170x44 tmux terminal:
+  the bash prompt rendered `# Shell command` followed by an empty row, and sending
+  `Right` then `Enter` left the dialog open and the sentinel absent.
+- The request already carried decoded input in `PermissionAsk.metadata.arguments`.
+  `PermissionBridge::pump` discarded it by constructing `PermissionPrompt` with
+  `Value::Null`.
+- `KeyDispatcher` resolved only the static session scopes (`input`, `prompt`,
+  `messages`, `app`). Therefore the editor's bindings consumed Enter, arrows and
+  Ctrl+F before the open dialog could receive `dialog.select.*` or
+  `permission.prompt.fullscreen` actions.
+
+Implementation
+--------------
+- `PermissionBridge::pump` clones `metadata.arguments` and passes it to
+  `PermissionPrompt::new`, retaining `Value::Null` only as the missing-metadata
+  fallback.
+- `ActionComponent::focused_scopes` lets the focused overlay prepend scopes at
+  dispatch time. `PermissionBridge` exposes permission/dialog/session scopes only
+  while its `DialogHost` is open, so normal input still owns Enter and arrows when
+  no dialog is present.
+- `PermissionPrompt` treats the Escape binding produced by the session scope
+  (`session_interrupt`) exactly like `app_exit`: reject at the choice stage and
+  cancel an intermediate confirmation/message stage.
+
+TDD and mutation evidence
+-------------------------
+- Before argument plumbing, named test
+  `an_ask_becomes_a_prompt_and_the_decision_answers_it` failed because the rendered
+  production-shaped request did not contain `$ git status`.
+- Before dynamic dialog scopes, named test
+  `production_keys_answer_every_permission_choice` timed out waiting for the
+  permission task to unblock.
+- After implementation:
+  - `cargo test -p oc-cli tui_permission --offline -- --nocapture`:
+    5 passed, 0 failed.
+  - `cargo test -p oc-tui views::permission --offline -- --nocapture`:
+    20 passed, 0 failed.
+  - `cargo test -p oc-tui views::session --offline -- --nocapture`:
+    11 passed, 0 failed.
+- Mutation 1 replaced the metadata lookup with `Value::Null`; the named rendering
+  test failed on the missing `$ git status` row (`MUTATION_KILLED_ARGUMENT_PLUMBING`).
+- Mutation 2 made `PermissionBridge::focused_scopes` empty; the named production-key
+  test failed immediately because Ctrl+F was consumed without redrawing the dialog
+  (`MUTATION_KILLED_DIALOG_SCOPES`). Both production edits were restored afterward.
+
+Real TUI acceptance
+-------------------
+- Rebuilt the real artifact with `cargo build --offline`.
+- tmux / `TERM=xterm-256color`:
+  - Bash displayed `$ touch /tmp/opencode/f3w8/T150_ONCE`.
+  - Ctrl+F expanded the prompt to the full terminal and changed the footer to
+    `ctrl+f minimize`.
+  - Enter selected Allow once. The following external-directory request displayed
+    `Access external directory /tmp/opencode/f3w8` and its concrete pattern; a
+    second Enter allowed it. The tool completed and the sentinel existed.
+  - Down, Enter, Enter selected and confirmed Allow always. The first command ran;
+    a second matching ask completed without another prompt.
+  - WebFetch displayed both `WebFetch https://example.com/t150` and
+    `URL: https://example.com/t150`. Down, Down, Enter selected Reject; the dialog
+    closed and the transcript reported denial rather than hanging.
+- Plain independent PTY, created directly with Python `pty.fork` (no tmux):
+  `plain_pty_prompt=True`, `plain_pty_detail=True`, `plain_pty_answer=True`, and
+  `plain_pty_sentinel=present`. This rules out the original terminal-capability
+  uncertainty: the fixed behavior works both inside tmux and on a direct PTY.
+
+Static validation
+-----------------
+- `cargo fmt --all` and `git diff --check` passed.
+- The MCP `lsp_diagnostics` tool is rooted at the main worktree and rejected the
+  sibling `t150` paths twice as outside its request cwd. The same Rust LSP backend
+  was run directly as `rust-analyzer diagnostics .`; it completed all 523 files
+  with no diagnostics for the five changed Rust files. Its output contained only
+  pre-existing `inactive-code` weak warnings for cfg-disabled code elsewhere.
+- No HTTP permission path, dependency, JS plugin runtime, turn implementation, or
+  config test was modified.
+
+Producer-side seam closure after review
+---------------------------------------
+- Review found that the first mutation covered only the consumer: removing the sole
+  production writer at `crates/oc-engine/src/dispatch.rs:332` still left the entire
+  workspace green (reviewer's observed baseline: 3390 passed, 0 failed). The same
+  fixture-friendlier-than-production defect therefore survived one layer upstream.
+- Added named test
+  `production_dispatch_arguments_reach_the_rendered_permission_dialog`. It enters
+  through the real `ToolRegistryDispatcher::dispatch` with a schema-valid bash call,
+  lets the production dispatcher publish the permission ask to `PermissionBroker`,
+  pumps it through `PermissionBridge`, and asserts the rendered dialog contains
+  `$ printf seam-20`. It then answers the dialog and waits for dispatch to finish.
+- Before mutation, the named test passed: 1 passed, 0 failed.
+- Producer mutation commented out only
+  `metadata.insert("arguments".to_owned(), args.clone());` and ran
+  `cargo test --workspace --offline`. The workspace now failed by the exact named
+  test: `cmd::tui_permission::tests::production_dispatch_arguments_reach_the_rendered_permission_dialog`.
+  Its rendered dialog retained `# Shell command` but the command row was blank, proving
+  the witness detects the producer regression that previously passed 3390/0.
+- Restored the producer line immediately. `git diff --exit-code --
+  crates/oc-engine/src/dispatch.rs` passed; the only remaining worktree change at that
+  point was the intended test file.
+
+Final gate after producer restoration
+-------------------------------------
+- `rust-analyzer diagnostics . --severity warning` completed successfully before the
+  cargo gate; no changed-file diagnostic was reported.
+- `cargo test --workspace --offline` was attempted twice as requested. Both attempts
+  were interrupted by the host's known `EAGAIN` condition while the Rust test harness
+  was listing tests, first in `oc-config --lib` and then in `oc-db --test fts`:
+  `Os { code: 11, kind: WouldBlock, message: "Resource temporarily unavailable" }`.
+  Before each interruption, the new producer-to-dialog test passed in the restored
+  tree. No assertion failure was reported on either restored run.
+- `cargo clippy --workspace --all-targets --offline -- -D warnings` passed with zero
+  warnings.
+- `cargo fmt --all --check` passed.

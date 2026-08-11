@@ -194,14 +194,15 @@ impl PermissionBridge {
     fn pump(&mut self) -> EventResult {
         let mut result = EventResult::IGNORED;
         while let Some(request) = self.broker.next_request() {
-            // The tool's decoded arguments are not carried by `PermissionAsk`, so the
-            // prompt describes the request from its own metadata and patterns. That
-            // is why `describe` treats a missing input as a fallback rather than an
-            // error.
+            let arguments = request
+                .metadata
+                .get("arguments")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             self.host.open(Box::new(PermissionPrompt::new(
                 self.context.clone(),
                 request,
-                &serde_json::Value::Null,
+                &arguments,
             )));
             result = EventResult::REDRAW;
         }
@@ -241,6 +242,19 @@ impl ActionComponent for PermissionBridge {
     ) -> EventResult {
         let result = self.host.handle_action(action, event);
         result.merge(self.pump())
+    }
+
+    fn focused_scopes(&self) -> Vec<&'static str> {
+        if self.host.is_open() {
+            vec![
+                "permission.prompt",
+                "dialog.select",
+                "dialog.prompt",
+                "session",
+            ]
+        } else {
+            Vec::new()
+        }
     }
 
     fn pending_changed(&mut self, pending: &[Chord]) -> EventResult {

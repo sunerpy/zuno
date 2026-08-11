@@ -850,6 +850,11 @@ pub trait ActionComponent: Component {
     /// Act on one resolved binding.
     fn handle_action(&mut self, action: &'static Definition, event: &KeyEvent) -> EventResult;
 
+    /// Scopes owned by the currently focused overlay, in resolution order.
+    fn focused_scopes(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
+
     /// Observe a change to the pending sequence, for a which-key surface.
     fn pending_changed(&mut self, _pending: &[Chord]) -> EventResult {
         EventResult::IGNORED
@@ -894,7 +899,8 @@ impl KeyDispatcher {
         let Some(chord) = Chord::from_key_event(event) else {
             return EventResult::IGNORED;
         };
-        let scopes = self.scopes.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut scopes = self.inner.focused_scopes();
+        scopes.extend(self.scopes.iter().map(String::as_str));
         match self.keymap.resolve(&scopes, chord, now) {
             Resolution::Action {
                 definition,

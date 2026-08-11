@@ -247,6 +247,21 @@ fn session_screen_is_dispatchable_through_the_keymap_without_naming_a_key() {
     );
 }
 
+#[test]
+fn session_screen_enter_still_submits_without_a_focused_dialog() {
+    let keymap = Keymap::defaults().expect("the shipped table builds");
+    let (mut screen, _shutdown) = screen();
+    screen.editor.set_text("send normally");
+    let mut dispatcher = KeyDispatcher::new(keymap, scopes(), Box::new(screen));
+    let result = dispatcher.handle_event(&AppEvent::Terminal(TerminalEvent::Input(
+        crossterm::event::Event::Key(crate::views::testkit::press(
+            crossterm::event::KeyCode::Enter,
+        )),
+    )));
+
+    assert!(result.redraw, "Enter no longer submitted the normal prompt");
+}
+
 /// A draw target that renders offscreen, for a loop test with no terminal.
 struct OffscreenTarget {
     terminal: ratatui::Terminal<ratatui::backend::TestBackend>,
