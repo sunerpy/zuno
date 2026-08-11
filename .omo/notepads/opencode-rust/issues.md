@@ -6985,3 +6985,32 @@ worktree has no CodeGraph index, and `lsp_diagnostics` is rooted at the request 
 paths under `/config/workspace/ProdDir/AI/oc-wt/t149`. The pinned `.omo/refs` tree is also absent;
 upstream lifecycle locations were inspected in `/config/workspace/ProdDir/AI/opencode` at revision
 `aefaf140c1`, so exact source parity with released 1.18.15 is not claimed.
+
+## [2026-08-11] Todo 153 — SEAM #19 closed honestly; criterion 2 remains unmet
+
+The matrix called `tests/fixtures/user-config.json` “the live file”, but it was a stale capture.
+Independent pre-change measurement reproduced 24,417 bytes / `502ca4db55e63d95…` for
+`/config/.config/opencode/opencode.json` and 25,361 bytes / `33c8e02fff454985…` for the fixture.
+The fixture is retained for reproducible `ConfigFixture` isolation, refreshed byte-for-byte, and
+guarded by `real_user_config_capture_matches_live_file_byte_for_byte`. The guard reads the absolute
+live path and fails visibly if it is absent or differs; no skip can report success without measuring
+the input criterion 2 names.
+
+That correction exposed a separate truth rather than making criterion 2 green. With both binaries
+run from this worktree under `OPENCODE_PURE=1`, released 1.18.15 emitted 266,233 bytes from
+`debug config`; Rust emitted 25,581. Sorted JSON still differed after removing only upstream's empty
+`mode`: upstream had nine adjacent Markdown `agent` entries, two adjacent Markdown `command`
+entries, and three `plugin_origins`; Rust had empty `agent`/`command` objects and no
+`plugin_origins`. The nine files exist under `/config/.config/opencode/agent/powerapps/` and the two
+under `/config/.config/opencode/command/`, so the missing trees are a genuine pure-mode config
+discovery/debug-output parity defect, not plugin execution. Criterion 2 is now declared UNMET in the
+plan rather than normalized away or allow-listed.
+
+Todo 13's neighboring prose defect is different. Released 1.18.15 rejects
+`agent list --format json` with exit 1, empty stdout, and the same 561-byte help text as
+`agent list --help`; the only options are help, version, print-logs, log-level, and pure. Plain
+non-pure output differed because upstream loaded `@sunerpy/oh-my-openagent@4.21.0`: 718,352 bytes /
+26,193 lines upstream versus 440,649 / 15,898 Rust. Under `OPENCODE_PURE=1`, both had 440,649 bytes,
+15,898 lines, and the same 16 `name (mode)` headers; remaining raw permission ordering is outside
+todo 13's deliberately header-scoped catalog test. The checked criterion now names the real plain
+surface and preserves the invalid former requirement in an explicit amendment.
