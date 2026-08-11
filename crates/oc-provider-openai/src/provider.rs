@@ -1,13 +1,15 @@
 //! OpenAI provider configuration, authentication, and HTTP transport.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 
 use futures::{TryStreamExt as _, stream};
 use oc_auth::{AuthStore, Credential, Secret};
 use oc_error::ProviderError;
 use oc_llm::event::StreamEvent;
 use oc_llm::registry::{
-    ApiSurface, Capabilities, CompletionRequest, Provider, ProviderStream, Spec,
+    ApiSurface, Capabilities, CompletionRequest, Declined, FactoryOutcome, Provider,
+    ProviderStream, Spec, Unavailable,
 };
 use oc_llm::sse::StreamIdleTimeout;
 use serde_json::Value;
@@ -318,6 +320,21 @@ impl Provider for OpenAiProvider {
             stream::once(async move { start_stream(client, credential, config, request).await })
                 .try_flatten(),
         )
+    }
+}
+
+/// Build the registry factory for OpenAI Chat Completions and Responses.
+pub fn factory<C>(credentials: C) -> impl Fn(Spec) -> FactoryOutcome + Send + Sync + 'static
+where
+    C: Fn(&str) -> Option<Credential> + Send + Sync + 'static,
+{
+    move |spec| {
+        let credential = credentials(&spec.provider)
+            .ok_or(Declined::Unavailable(Unavailable::MissingCredential))?;
+        let config = OpenAiConfig::from_spec(spec);
+        let provider =
+            OpenAiProvider::from_credential(credential, config).map_err(Declined::Failed)?;
+        Ok(Arc::new(provider) as Arc<dyn Provider>)
     }
 }
 

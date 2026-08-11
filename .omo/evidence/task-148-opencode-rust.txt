@@ -1,0 +1,173 @@
+Task 148 evidence — production provider wire-family composition
+Date: 2026-08-11
+Worktree: /config/workspace/ProdDir/AI/oc-wt/t148
+Branch: task-148
+Base: e871a9cb
+
+1. Production composition
+
+Selection is driven by ResolvedModel.api.npm, never by a model-id allow-list.
+The production composition root registers these keys:
+
+  @ai-sdk/openai-compatible       -> openai-compatible
+  @openrouter/ai-sdk-provider     -> openai-compatible
+  @ai-sdk/anthropic               -> anthropic
+  @ai-sdk/openai                  -> openai
+  @ai-sdk/amazon-bedrock          -> amazon-bedrock
+  @ai-sdk/amazon-bedrock/mantle   -> amazon-bedrock/mantle
+  @ai-sdk/google                  -> google
+  @ai-sdk/google-vertex           -> google-vertex
+  @ai-sdk/google-vertex/anthropic -> google-vertex/anthropic
+
+Unknown npm transports are rejected explicitly instead of being guessed to use
+the compatible protocol. The compatible transport alone requires a configured
+endpoint. Anthropic and Vertex Anthropic use the Messages surface; Bedrock
+receives region metadata; Vertex receives project and location metadata.
+
+TurnPlan keeps Option<Credential> until factory construction. This preserves the
+Anthropic/OpenAI OAuth-versus-API-key distinction; factories whose existing API
+accepts a token string receive only the projected secret value.
+
+No dependency was added. plugin_runtime.rs and hooks.rs were not touched.
+
+2. Production-path recorded replay
+
+The shared replay helper traverses:
+
+  model_spec -> provider_registry -> Provider::stream
+
+through oc_engine::prelude::summarize. The loopback server serves oracle cassette
+responses, and each assertion verifies the captured request path plus a recorded
+ResponseOrigin. No authored response is accepted.
+
+Named passing tests:
+
+  production_compatible_registration_dispatches_and_decodes_recorded_sse
+  production_anthropic_registration_dispatches_and_decodes_recorded_sse
+  production_openai_registration_dispatches_and_decodes_recorded_responses_sse
+  production_bedrock_registration_dispatches_and_decodes_recorded_eventstream
+  production_bedrock_mantle_registration_dispatches_and_decodes_recorded_eventstream
+  production_google_registration_dispatches_and_decodes_recorded_gemini_sse
+  production_vertex_gemini_registration_dispatches_and_decodes_recorded_gemini_sse
+  production_vertex_anthropic_registration_dispatches_and_decodes_recorded_anthropic_sse
+
+Targeted commands run before the final workspace gate:
+
+  cargo test -p oc-cli production_ --offline
+  result: 10 passed, 0 failed
+
+  cargo test -p oc-provider-anthropic -p oc-provider-openai \
+    -p oc-provider-google -p oc-provider-bedrock -p oc-cli --offline
+  result: all affected-crate tests passed
+
+3. Mutation evidence
+
+Each production registry registration was removed individually and the matching
+named replay test was run. Every mutation failed because the registry omitted the
+expected key. The implementation was restored after each run.
+
+  openai-compatible       killed
+  anthropic               killed
+  openai                  killed
+  amazon-bedrock          killed
+  amazon-bedrock/mantle   killed
+  google                  killed
+  google-vertex           killed
+  google-vertex/anthropic killed
+
+Result: 8/8 registration-removal mutations killed.
+
+4. Diagnostics and formatting
+
+The MCP lsp_diagnostics tool is rooted at the main worktree and rejects sibling
+worktree paths. Before the final gate, all seven changed Rust files were checked
+through a temporary detached worktree using the same language server; no
+diagnostics were reported, and the temporary worktree was removed.
+
+  cargo fmt --all
+  result: success
+
+  git diff --check
+  result before final documentation update: success
+
+5. Final workspace gate — NOT COMPLETED after the allowed two attempts
+
+Attempt 1:
+
+  CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=1 cargo test --workspace --offline &&
+  cargo clippy --workspace --all-targets --offline -- -D warnings &&
+  cargo fmt --all --check &&
+  cargo build --workspace --offline
+
+Result: product tests reached oc-cli docs tests. Two generated documentation
+blocks were stale after the intentional docs/divergences.toml wording update:
+docs/compatibility-matrix.md divergence-index and docs/divergences.md
+divergence-detail. This was a deterministic generated-output failure, not a
+provider behavior failure.
+
+The prescribed generator was then run once:
+
+  OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs --offline
+  result: 13 passed, 0 failed; generated blocks updated
+
+Attempt 2 (same full gate):
+
+Result: the workspace suite passed the regenerated docs tests and continued into
+oc-config, then the test harness failed while enumerating oc-config library tests:
+
+  error: io error when listing tests: Os { code: 11, kind: WouldBlock,
+         message: "Resource temporarily unavailable" }
+  error: test failed, to rerun pass `-p oc-config --lib`
+
+This is the repository's recorded shared-host EAGAIN failure class, not a test
+assertion failure. Per the task's maximum of two status checks, no third
+verification was run. Because the command chain stopped at cargo test, these
+required full-workspace outcomes remain unverified:
+
+  cargo test --workspace --offline                 NOT COMPLETED (EAGAIN)
+  cargo clippy --workspace --all-targets --offline NOT EXECUTED
+  cargo fmt --all --check                          NOT EXECUTED in final chain
+  cargo build --workspace --offline                NOT EXECUTED
+
+6. Closure status
+
+Todo 148 remains unchecked and no commit was created. The plan requires a green
+workspace test/build state before commit, so the implementation is ready but
+cannot honestly be declared complete from this run. A later run on a host able to
+spawn the full test suite must execute the remaining workspace gate once, then
+mark todo 148 complete and create the required single commit:
+
+  feat(turn): wire the declared provider wire-families into the production composition
+
+--------------------------------------------------------------------------------
+ORCHESTRATOR COMPLETION NOTE (2026-08-11)
+--------------------------------------------------------------------------------
+The subagent fixed the clippy lint but stopped at its two-attempt verification
+limit after the host produced `EAGAIN: Resource temporarily unavailable` during
+`oc-config` test enumeration (twice, the second also yielding a test-thread
+`SendError`). It therefore did not tick the box or commit. The orchestrator ran
+the full gate on the same tree and observed no EAGAIN:
+
+  cargo test --workspace --offline          3382 passed, 0 failed
+  cargo clippy --workspace --all-targets    0 warnings
+  cargo fmt --all --check                   clean
+
+Independently re-verified two of the eight claimed registration mutations:
+
+  google removed      -> production_google_registration_dispatches_and_decodes_recorded_gemini_sse FAILED
+  anthropic removed   -> production_anthropic_registration_dispatches_and_decodes_recorded_sse    FAILED
+
+Both restored; tree confirmed clean afterwards. The test names assert dispatch
+AND decode, not merely that a factory was registered, which is the distinction
+F4's finding required.
+
+Production registrations now present in `assemble_provider_registry`
+(`crates/oc-cli/src/cmd/turn.rs:855-902`): compatible, anthropic, openai,
+amazon-bedrock, amazon-bedrock/mantle, google, google-vertex,
+google-vertex/anthropic — eight families.
+
+`docs/divergences.toml` no longer claims coverage "by wire-protocol family".
+The entry was rewritten to describe the surface that genuinely still differs:
+selection for a model whose resolved `api.npm` transport is unknown to this
+build. That is a real post-implementation behavioral difference rather than the
+omission-laundering F4 rejected.

@@ -76,9 +76,9 @@ each entry's stated reason. Do not edit it by hand.
 
 ### provider-coverage-by-wire-family
 
-**Surface.** provider selection; `oc-provider-compatible` family routing and its diagnostics
+**Surface.** provider selection for a model whose resolved `api.npm` transport is unknown to this build
 
-**Why.** Upstream bundles 23 SDK factories behind one config surface; SigV4+EventStream, Gemini's wire format and Vertex auth cannot share an OpenAI-compatible request builder, so coverage is stated per wire-protocol family and an id no family claims is named in an error instead of being silently routed through the compatible profile.
+**Why.** Both sides implement the declared Anthropic, Bedrock, Gemini/Vertex, OpenAI and OpenAI-compatible wire families, but upstream bundles a broader SDK-factory table behind one config surface. This build selects only from explicit `api.npm` transport metadata and rejects an unknown transport by name instead of guessing that it speaks the OpenAI-compatible protocol. The narrower factory inventory and its explicit diagnostic are the remaining behavior difference; implemented families are not being recorded as gaps.
 
 ### cross-session-resident-memory
 

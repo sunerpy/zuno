@@ -17,6 +17,6 @@ pub mod request;
 pub mod stream;
 
 pub use crate::error::{AnthropicErrorBody, map_http_error, retry_after};
-pub use crate::provider::{AnthropicAuth, AnthropicConfig, AnthropicProvider};
+pub use crate::provider::{AnthropicAuth, AnthropicConfig, AnthropicProvider, factory};
 pub use crate::request::build_request_body;
 pub use crate::stream::AnthropicDecoder;

@@ -6929,3 +6929,30 @@ callsite 的 Interest 缓存打成 `never`、饿死随后 `with_default` 装上�
 路径。完整回退 `shim.mjs` 与 `bridge.rs` 后，字节保真、截断拒绝、任意返回图仍有界
 三个测试逐名失败；恢复后 3/3 通过。完整命令与结果在
 `.omo/evidence/task-147-opencode-rust.txt`。
+
+## [2026-08-11] Todo 148 — production provider selection must follow wire metadata, not model ids
+
+The production turn previously admitted three npm transports but registered only the
+OpenAI-compatible factory. That made even the native `@ai-sdk/openai` path accidentally use
+Chat Completions, while Anthropic, Bedrock, Gemini, and Vertex implementations were unreachable.
+The repair uses `ResolvedModel.api.npm` as the only selector and registers eight concrete keys in
+the composition root: `openai-compatible`, `anthropic`, `openai`, `amazon-bedrock`,
+`amazon-bedrock/mantle`, `google`, `google-vertex`, and `google-vertex/anthropic`.
+`@openrouter/ai-sdk-provider` remains an explicit alias of the compatible family. Unknown npm
+metadata is rejected; no model-id allow-list or compatible-protocol guess was introduced.
+
+`model_spec` now preserves the protocol distinctions the existing provider implementations need:
+Anthropic and Vertex Anthropic use the Messages surface, compatible transports use Chat, Bedrock
+receives region metadata, and Vertex receives project/location metadata. Only the compatible
+family requires an explicit endpoint; native SDK families retain their own defaults. The turn
+keeps the stored `Credential` typed until factory construction so Anthropic/OpenAI OAuth versus
+API-key behavior is not erased prematurely.
+
+Eight production-path replay tests run `model_spec -> provider_registry -> Provider::stream`
+through the engine prelude against loopback HTTP serving recorded oracle bytes. They prove both
+request dispatch and each family's own decoder for compatible SSE, Anthropic Messages SSE,
+OpenAI Responses SSE, Bedrock binary EventStream (native and Mantle), Gemini SSE (AI Studio and
+Vertex), and Vertex Anthropic SSE. Removing each registration individually killed its
+corresponding named test: 8/8 mutations observed. No new dependency or plugin-hook surface was
+touched. Full commands and final gate results are recorded in
+`.omo/evidence/task-148-opencode-rust.txt`.

@@ -30,7 +30,7 @@ OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs
 | 4 | [`split-version-identity`](divergences.md#split-version-identity) | CLI `--version` and `--version --long`; the npm plugin compatibility gate |
 | 5 | [`execute-parameter-contract`](divergences.md#execute-parameter-contract) | tool `execute` — the model-facing parameter schema |
 | 6 | [`c8-maintenance-endpoints`](divergences.md#c8-maintenance-endpoints) | HTTP `GET /api/session/prune`, `POST /api/session/prune` |
-| 7 | [`provider-coverage-by-wire-family`](divergences.md#provider-coverage-by-wire-family) | provider selection; `oc-provider-compatible` family routing and its diagnostics |
+| 7 | [`provider-coverage-by-wire-family`](divergences.md#provider-coverage-by-wire-family) | provider selection for a model whose resolved `api.npm` transport is unknown to this build |
 | 8 | [`cross-session-resident-memory`](divergences.md#cross-session-resident-memory) | system-prompt resident blocks; model-facing `memory` tool; post-response reflection |
 | 9 | [`session-subpath-is-applied`](divergences.md#session-subpath-is-applied) | HTTP `GET /api/session?project=…&subpath=…`; `oc-db` session listing in project scope |
 | 10 | [`context-md-excluded`](divergences.md#context-md-excluded) | project instruction cascade — the filename list probed by `findUp` |
