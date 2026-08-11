@@ -7059,3 +7059,33 @@ non-pure output differed because upstream loaded `@sunerpy/oh-my-openagent@4.21.
 15,898 lines, and the same 16 `name (mode)` headers; remaining raw permission ordering is outside
 todo 13's deliberately header-scoped catalog test. The checked criterion now names the real plain
 surface and preserves the invalid former requirement in an explicit amendment.
+
+## [2026-08-11] 准则 2：我定性了 F1/F2/F4 共同指出的 `debug config` 差异
+
+三位评审员本轮都判准则 2 未满足。我自己测,确认差异真实,但**根因与他们的推测不同**,值得记下。
+
+三位的测量一致:`OPENCODE_PURE=1 debug config` 上游 266,233 字节 / 本项目 25,581 字节,差异集中在 `agent`(9 vs 0)、`command`(2 vs 0)、`plugin_origins`(3 vs 缺失)。F1 指出那 9 个 agent 文件在 `/config/.config/opencode/agent/powerapps/`,2 个 command 在 `/config/.config/opencode/command/`,并称之为"adjacent real"。
+
+**但发现逻辑没有缺陷。** 我跑真二进制:
+
+```
+OPENCODE_PURE=1 ./target/debug/opencode-rust agent list | grep -ciE "canvas|webapi|powerapps"
+  → 856
+```
+
+嵌套目录下的 agent **全部被发现了**,包括 `agent/powerapps/` 这一层。`agent list` 输出 32 行、含 `ai-webapi-integration` 等。
+
+真正的差异在 `debug config` 这一个命令:它输出的 `agent`/`command` 取自**config 结构本身**,而 markdown agent 是**运行时发现**的,两者在本项目里是分开的。上游把运行时发现的结果合并进 `debug config` 的输出,本项目没有。
+
+```
+debug config → agent: dict len=0    command: dict len=0    plugin_origins: None
+agent list   → 32 行,含全部嵌套 agent
+```
+
+**所以这既不是"环境差异"(153 的诊断),也不是"agent 发现坏了"(F1 的推测),而是 `debug config` 少了一个合并步骤。** 是真缺陷,但范围比三位描述的小得多——发现能力在,只是没进这一个命令的输出。
+
+### 为什么值得单独记
+
+153 把夹具刷新到与实时文件一致,关闭了 seam #19(注释说谎),但**准则 2 要的是输出 parity,不是输入一致**。F1 说得准:*"That guard proves input identity, not output parity."* 我上一轮验收 153 时只验了漂移守卫真能拦,**没验它是否达成了准则 2 本身要的东西**——我验的是它做了什么,不是它该做什么。
+
+> **验收一条修复时,除了确认它声称的改动生效,还要回头对照它要满足的原始准则。** 守卫可以完美工作,同时完全没解决准则要求的问题。
