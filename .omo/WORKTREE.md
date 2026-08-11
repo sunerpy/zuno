@@ -2453,3 +2453,46 @@ todo 144 接进 `plugin_runtime.rs:82,137`，插件工具走与 config-directory
 ### 宿主 EAGAIN
 
 148 和 149 都两次撞 `EAGAIN: Resource temporarily unavailable`（`oc-config` 测试枚举阶段），按其两次验证上限停下未提交。我在同一棵树上跑同样命令**均无 EAGAIN**，3382 / 3390 全绿。这是宿主瞬时问题，不是缺陷——但它反复消耗子 agent 的验证配额，所以我改为在提示里明确授权「撞 EAGAIN 也要提交，我来跑门」。
+
+## Wave 56 (2026-08-11)：第八轮评审 → F3 首次交出 APPROVE，153/153 实现任务完成
+
+`main` = `2ee58d3e`，**3404 测试通过**（本轮 +14），clippy 0，fmt 干净。**153/157，只剩 F1-F4。**
+
+### 第八轮：F3 终于交出报告，且是 APPROVE
+
+| 评审员 | 裁决 | 内容 |
+|---|---|---|
+| **F3** | **APPROVE**（附一条待分类） | 41KB，最详尽的一份。16/21 hook 观察到真实触发；八个 provider family 全部对本地 mock 验过真实 wire 协议（含 SigV4 与 Amazon event-stream 分帧）|
+| **F1** | REJECT | **15/3**，从 17/1 **退回**——新代码带来新发现 |
+| **F2** | REJECT | 一条：147 修了实例没修类 |
+| **F4** | REJECT | 一条：148 接了 family 却丢了 provider 身份 |
+
+F3 这次能交报告，是因为我给了硬结构：**先写报告骨架、每个场景做完立即追加、SSE 读取必须限时**。它前三轮丢报告都是因为把发现攒在脑子里直到超时。
+
+### SEAM #20：TUI 权限对话框——本轮最严重
+
+`ask` 权限**卡死默认交互界面**。根因我自己追到：`tui_permission.rs:201` 传 `&Value::Null` 作为 tool input，而 `permission.rs:127` 的 `describe()` 正是从这个 input 取命令/路径/URL。测试文件里 `Value::Null` 出现 **0 次**，全传真 `json!({...})`——**夹具比现实友善，本项目的招牌形态**。
+
+150 修好了消费端，但我变异**生产者**侧（注释掉 `dispatch.rs:332` 唯一的 `metadata.insert("arguments", ...)`）时，**3390 个测试无一失败**。同一个 seam 只是上移了一层。我要求补端到端守卫；补完后同一变异按名失败于 `production_dispatch_arguments_reach_the_rendered_permission_dialog`。
+
+> **修 seam 时要问：我把它关闭了，还是把它往上游挪了一层？** 判据是对**产生方**做变异，不只是对消费方。
+
+### F2：147 修了实例没修类
+
+auth-loader 有 `truncated_path()` 拒绝，普通 hook 写回没有——而 **149 新接的 17 个 hook 全走那条未设防的路径**。151 把守卫放在 `invocation_output`（所有可变 hook 的单一出口），扫完全部参数才返回，满足「全有或全无」。变异被 `noop_tool_definition_hook_rejects_real_truncated_schema_before_provider_dispatch` 抓住。
+
+### F4：148 的身份坍塌（同一发现的第三层）
+
+`model_spec` 用 `Spec::new(registry_key)` 构造，OpenRouter 被压成 `openai-compatible`，`family::resolve` 选了通用行而非 `openrouter` 档案；Azure 选择器与 Copilot 规则同样不可达。`@ai-sdk/groq`、`@ai-sdk/mistral` 是固定 catalog 真实行、todo 94 冻结成员，却被 allow-list 直接拒掉。
+
+152 改为 `Spec::new(&model.provider_id).with_factory(factory_key)`——**身份与工厂分离**，并用**封闭的 `(identity, transport)` 表**覆盖全部 15 个冻结身份，而非只匹配 transport（代码注释自己写明：只匹配 transport 会让任意 provider id 混进它没声称的档案）。未知 transport 仍按名拒绝。变异身份坍塌，**五个测试同时失败**。
+
+这是 F4 同一条发现的第三层：先是只注册一个 factory → 接了八个 family → 身份被丢弃。**每层都通过了上一层的验收。**
+
+### SEAM #19：测试注释自称「the live file」
+
+`differential.rs:298` 注释写 *"The live file, byte-for-byte"*，实际读 committed 副本，而两者已漂移（24,417 vs 25,361 字节）。**过期的散文就在测试内部，断言着测试本身不检查的属性**——这是「散文过期而门全绿」的最锋利形态。153 刷新夹具并加 `real_user_config_capture_matches_live_file_byte_for_byte` 漂移断言；我改一个字节验证它真能拦。
+
+### 又一次任务丢失
+
+152 的任务在 2h9m 后消失，无提交无证据，但代码完整。我独立验证后补齐证据与提交。**这是本项目第五次因会话丢失而需要接管**（F3 三次、144、152）。代码通常是好的，丢的是收尾——所以我现在默认：任务消失先查 worktree，别急着重派。
