@@ -1,0 +1,88 @@
+Task 157 — show edit permission subject and diff in collapsed/fullscreen TUI
+================================================================================
+
+Defect and root cause
+--------------------------------------------------------------------------------
+- Worktree: `/config/workspace/ProdDir/AI/oc-wt/t157`, branch `task-157`.
+- F3-W9-D1 reproduced in the real TUI: an edit permission prompt displayed only
+  `Edit`; both the normal dialog and Ctrl+F fullscreen omitted the file path and
+  the change being approved. F3-W9-O1 also reproduced: the footer advertised
+  `⇆ select`, although only Up/Down changed the selection.
+- The production dispatcher already stores the complete decoded call input under
+  `PermissionAsk.metadata.arguments`, and the edit path is also present in
+  `patterns`. `PermissionBridge` passed those arguments after todo 150.
+- The remaining loss was in `permission.rs`: edit read only the legacy top-level
+  `metadata.filepath`, while `PermissionPrompt::new` waited only for a top-level
+  `metadata.diff` that production edit dispatch does not write. Fullscreen had no
+  independent data source, so it expanded an already-empty view.
+
+Implementation
+--------------------------------------------------------------------------------
+- `PermissionBridge::pump` uses `request_arguments`, accepting only an object and
+  falling back to an empty object. This preserves the production argument shape
+  while keeping every description helper safe on malformed or missing metadata.
+- `edit_path` resolves `filePath`, `file_path`, or `path`, then the legacy
+  `metadata.filepath`, then the request's first pattern. The subject and a `Path`
+  detail therefore identify the resource being approved.
+- `edit_patch` prefers an existing metadata diff or explicit patch argument. When
+  edit supplies the production `oldString`/`newString` pair, `replacement_patch`
+  emits a unified replacement hunk consumed by the existing `DiffView`.
+- The same `PermissionPrompt` subject and `DiffView` render in collapsed and
+  fullscreen layouts. The footer now advertises `↑↓ select`, matching the actions
+  the dialog actually handles.
+- A table-driven audit covers every permission branch handled by `describe()` and
+  renders each non-empty subject, including the pattern-derived external-directory
+  case. No HTTP permission path or dependency changed.
+
+TDD and mutation evidence
+--------------------------------------------------------------------------------
+- Before the view fix,
+  `views_permission_edit_renders_the_diff_it_is_approving` failed with an empty
+  edit path/diff.
+- Before the production-shape closure,
+  `production_edit_dispatch_renders_path_and_diff_in_collapsed_and_fullscreen`
+  failed because the real dispatch arguments did not become visible content.
+- Targeted restored-tree results:
+  - `cargo test -p oc-tui views::permission::tests --offline`: 23 passed.
+  - `cargo test -p oc-cli cmd::tui_permission::tests --offline`: 7 passed.
+- Four reversible mutations were each killed with exit 101 and then restored:
+  1. Removing `edit_path()` failed
+     `views_permission_edit_renders_the_diff_it_is_approving`; captured at
+     `/tmp/opencode-t157/mutation-path.log`.
+  2. Removing `replacement_patch()` failed the same named test on the absent diff;
+     captured at `/tmp/opencode-t157/mutation-diff.log`.
+  3. Disabling the fullscreen toggle failed
+     `views_permission_fullscreen_renders_the_edit_subject_and_diff`; captured at
+     `/tmp/opencode-t157/mutation-fullscreen.log`.
+  4. Removing the production dispatcher's arguments insertion failed
+     `production_edit_dispatch_renders_path_and_diff_in_collapsed_and_fullscreen`;
+     captured at `/tmp/opencode-t157/mutation-producer.log`.
+- `crates/oc-engine/src/dispatch.rs` was restored byte-for-byte after mutation and
+  has no final diff.
+
+Real TUI acceptance
+--------------------------------------------------------------------------------
+- A local mock drove the real TUI in tmux. Before the fix, normal and fullscreen
+  showed only `Edit` with no path or diff.
+- After the fix, both layouts displayed
+  `/tmp/opencode-t157/project/edit-target.txt`, the `ORIGINAL` removal and
+  `T157_EDITED` addition, and `↑↓ select`.
+- Ctrl+F expanded the dialog and changed the active footer to `ctrl+f minimize`.
+  The mock server was stopped after acceptance.
+
+Final validation
+--------------------------------------------------------------------------------
+- `CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 cargo test --workspace --offline --
+  --test-threads=1`: passed; no failed target or assertion.
+- `CARGO_BUILD_JOBS=1 cargo clippy --workspace --all-targets --offline`: passed
+  with zero warnings.
+- `cargo fmt --all --check`: passed.
+- `git diff --check`: passed before closeout bookkeeping.
+- The MCP `lsp_diagnostics` command rejected the sibling worktree with
+  `LSP file path must be inside request cwd`. Native `rust-analyzer diagnostics .`
+  had already completed in this exact worktree; no error or warning referenced any
+  of the four changed Rust files, with only pre-existing cfg-disabled weak notices
+  elsewhere. Clippy's full rustc analysis also completed cleanly.
+- The first two workspace attempts were interrupted by host process exhaustion
+  (`EAGAIN`) while another worktree was testing. No assertion failed. After waiting
+  and using one build job/test thread, the complete workspace gate passed.

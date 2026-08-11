@@ -90,6 +90,48 @@ impl Tool for DispatchBash {
     }
 }
 
+struct DispatchEdit;
+
+#[async_trait]
+impl Tool for DispatchEdit {
+    fn id(&self) -> &str {
+        "edit"
+    }
+
+    fn description(&self) -> &str {
+        "Exercise edit through the production permission dispatch path."
+    }
+
+    fn raw_parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "filePath": { "type": "string" },
+                "oldString": { "type": "string" },
+                "newString": { "type": "string" }
+            },
+            "required": ["filePath", "oldString", "newString"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text("edit", args["filePath"].to_string()))
+    }
+}
+
+fn rendered_text(component: &mut impl Component, width: u16, height: u16) -> String {
+    let rendered = render_offscreen(component, width, height).expect("infallible");
+    (0..rendered.area.height)
+        .map(|y| {
+            (0..rendered.area.width)
+                .map(|x| rendered[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 async fn answer_through_production_keys(
     keys: Vec<oc_tui::crossterm::event::KeyEvent>,
 ) -> (Arc<PermissionBroker>, Result<(), ToolError>) {
@@ -290,6 +332,95 @@ async fn production_dispatch_arguments_reach_the_rendered_permission_dialog() {
         .await
         .expect("the rendered permission must be answerable")
         .expect("the dispatch task");
+    assert!(!result.is_error, "{}", result.output.output);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_edit_dispatch_renders_path_and_diff_in_collapsed_and_fullscreen() {
+    let (broker, mut wake) = broker();
+    broker.bind_session("ses_edit_dispatch_bridge");
+    let dispatcher = Arc::new(ToolRegistryDispatcher::new(
+        vec![Arc::new(DispatchEdit)],
+        Vec::new(),
+        Arc::clone(&broker) as Arc<dyn PermissionAsker>,
+        InterruptSignal::new(),
+        McpToolStatus::Ready,
+    ));
+    let available_tools = dispatcher.available_tools().definitions.into();
+    let mut dispatching = {
+        let dispatcher = Arc::clone(&dispatcher);
+        tokio::spawn(async move {
+            dispatcher
+                .dispatch(DispatchRequest {
+                    call: ToolCall {
+                        id: "call_edit_dispatch_bridge".to_owned(),
+                        name: "edit".to_owned(),
+                        input: json!({
+                            "filePath": "src/production.rs",
+                            "oldString": "PRODUCTION_BEFORE",
+                            "newString": "PRODUCTION_AFTER",
+                            "intent": "prove edit permission rendering"
+                        }),
+                        raw_input: r#"{"filePath":"src/production.rs","oldString":"PRODUCTION_BEFORE","newString":"PRODUCTION_AFTER","intent":"prove edit permission rendering"}"#.to_owned(),
+                        input_error: None,
+                        thought_signature: None,
+                    },
+                    session_id: "ses_edit_dispatch_bridge".to_owned(),
+                    message_id: "msg_edit_dispatch_bridge".to_owned(),
+                    agent: "build".to_owned(),
+                    available_tools,
+                    interrupt: InterruptSignal::new(),
+                })
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            event = wake.recv() => assert!(matches!(event, Some(TerminalEvent::Wake))),
+            result = &mut dispatching => {
+                let result = result.expect("the edit dispatch task");
+                panic!("edit dispatch completed before asking permission: {}", result.output.output);
+            }
+        }
+    })
+    .await
+    .expect("production edit dispatch never reached the permission broker");
+
+    let mut bridge = bridge(&broker);
+    bridge.handle_event(&resize());
+    let collapsed = rendered_text(&mut bridge, 80, 20);
+    assert!(
+        collapsed.contains("Edit src/production.rs"),
+        "production edit arguments did not reach the subject:\n{collapsed}"
+    );
+    assert!(
+        collapsed.contains("PRODUCTION_BEFORE") && collapsed.contains("PRODUCTION_AFTER"),
+        "production edit arguments did not become a visible diff:\n{collapsed}"
+    );
+
+    bridge.handle_action(
+        oc_tui::keybind::definition("permission.prompt.fullscreen")
+            .expect("the fullscreen action exists"),
+        &key(
+            oc_tui::crossterm::event::KeyCode::Char('f'),
+            oc_tui::crossterm::event::KeyModifiers::CONTROL,
+        ),
+    );
+    let fullscreen = rendered_text(&mut bridge, 80, 30);
+    assert!(
+        fullscreen.contains("Edit src/production.rs"),
+        "fullscreen dropped the production edit subject:\n{fullscreen}"
+    );
+    assert!(
+        fullscreen.contains("PRODUCTION_BEFORE") && fullscreen.contains("PRODUCTION_AFTER"),
+        "fullscreen dropped the production edit diff:\n{fullscreen}"
+    );
+
+    bridge.handle_action(submit(), &press());
+    let result = tokio::time::timeout(Duration::from_secs(5), dispatching)
+        .await
+        .expect("the rendered edit permission must be answerable")
+        .expect("the edit dispatch task");
     assert!(!result.is_error, "{}", result.output.output);
 }
 

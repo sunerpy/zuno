@@ -132,11 +132,11 @@ pub fn describe(request: &PermissionRequest, input: &Value) -> Subject {
 
     match request.permission.as_str() {
         "edit" => {
-            let path = meta("filepath");
+            let path = edit_path(request, input);
             Subject {
                 icon: "→",
                 title: format!("Edit {path}"),
-                detail: Vec::new(),
+                detail: detail("Path", &path),
             }
         }
         "read" => {
@@ -261,6 +261,70 @@ pub fn describe(request: &PermissionRequest, input: &Value) -> Subject {
     }
 }
 
+fn edit_path(request: &PermissionRequest, input: &Value) -> String {
+    ["filePath", "file_path", "path"]
+        .into_iter()
+        .find_map(|key| input.get(key).and_then(Value::as_str))
+        .or_else(|| request.metadata.get("filepath").and_then(Value::as_str))
+        .or_else(|| request.patterns.first().map(String::as_str))
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn edit_patch(request: &PermissionRequest, input: &Value) -> Option<String> {
+    request
+        .metadata
+        .get("diff")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            ["patchText", "patch_text", "patch"]
+                .into_iter()
+                .find_map(|key| input.get(key).and_then(Value::as_str))
+        })
+        .filter(|patch| !patch.is_empty())
+        .map(str::to_owned)
+        .or_else(|| replacement_patch(input))
+}
+
+fn replacement_patch(input: &Value) -> Option<String> {
+    let old = input
+        .get("oldString")
+        .or_else(|| input.get("old_string"))
+        .and_then(Value::as_str)?;
+    let new = input
+        .get("newString")
+        .or_else(|| input.get("new_string"))
+        .and_then(Value::as_str)?;
+    if old == new {
+        return None;
+    }
+
+    let old_lines = old.lines().collect::<Vec<_>>();
+    let new_lines = new.lines().collect::<Vec<_>>();
+    let old_count = old_lines.len().max(1);
+    let new_count = new_lines.len().max(1);
+    let mut patch = format!("@@ -1,{old_count} +1,{new_count} @@\n");
+    if old_lines.is_empty() {
+        patch.push_str("-\n");
+    } else {
+        for line in old_lines {
+            patch.push('-');
+            patch.push_str(line);
+            patch.push('\n');
+        }
+    }
+    if new_lines.is_empty() {
+        patch.push_str("+\n");
+    } else {
+        for line in new_lines {
+            patch.push('+');
+            patch.push_str(line);
+            patch.push('\n');
+        }
+    }
+    Some(patch)
+}
+
 fn detail(label: &str, value: &str) -> Vec<String> {
     if value.is_empty() {
         Vec::new()
@@ -310,13 +374,10 @@ impl PermissionPrompt {
     #[must_use]
     pub fn new(context: ViewContext, request: PermissionRequest, input: &Value) -> Self {
         let subject = describe(&request, input);
-        // An `edit` ask carries the patch in its metadata, and a diff is the only
-        // way a user can judge one (`permission.tsx:24-88`).
-        let diff = request
-            .metadata
-            .get("diff")
-            .and_then(Value::as_str)
-            .map(|patch| DiffView::new(context.clone(), patch));
+        let diff = (request.permission == "edit")
+            .then(|| edit_patch(&request, input))
+            .flatten()
+            .map(|patch| DiffView::new(context.clone(), &patch));
         Self {
             context,
             request,
@@ -497,7 +558,7 @@ impl Dialog for PermissionPrompt {
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
         match self.stage {
             Stage::Choose => vec![
-                ("⇆", "select"),
+                ("↑↓", "select"),
                 ("enter", "confirm"),
                 (
                     "ctrl+f",

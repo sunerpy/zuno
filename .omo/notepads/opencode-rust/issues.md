@@ -7157,3 +7157,21 @@ Chat fixture 证明 Responses 路径。请求 builder 与 decoder 的反向 muta
 五个改动 Rust 文件的 `lsp_diagnostics` 均无 findings。CodeGraph 未索引 sibling worktree，且
 集成 LSP 不能直接接受其路径；前者使用已授权的源码检查结果，后者通过主 workspace 下临时副本
 完成并在检查后删除。没有修改 `transport.rs`、依赖、provider identity、header 或 URL 规则。
+## [2026-08-11] Todo 157 — edit 权限不再要求用户盲批
+
+生产 dispatch 一直把 edit 参数放在 `metadata.arguments`，路径也保留在 `patterns`；旧视图却只读
+顶层 `metadata.filepath`，diff 也只等一个生产请求不会写入的顶层 `metadata.diff`。因此 todo 150
+修复通用参数桥接后，edit 仍只显示标题，普通与 `Ctrl+F` 全屏都看不到文件路径和变更内容。
+
+修复让 `PermissionBridge` 只向视图传递对象形状的 arguments，并让 edit 描述从
+`filePath`/`file_path`/`path`、旧 metadata、首个 pattern 依次解析路径；diff 优先接受已有 patch，
+否则从 `oldString`/`newString` 构造 replacement patch。普通与全屏共用同一个 subject/diff，footer
+改为真实可用的 `↑↓ select`。表驱动测试覆盖 `describe()` 的每个 permission 分支并证明主题非空，
+生产 dispatch 测试则从真实 dispatcher 穿过 broker/bridge，验证普通与全屏都显示路径和 diff。
+
+四个反向变异分别移除路径解析、diff 构造、fullscreen 状态切换和 producer arguments 写入，均由
+对应命名测试捕获。真实 tmux 验收显示 `/tmp/opencode-t157/project/edit-target.txt` 与
+`ORIGINAL` → `T157_EDITED`，全屏 footer 显示 `ctrl+f minimize`。最终 workspace tests、all-target
+Clippy 与 rustfmt 全部通过。集成 `lsp_diagnostics` 仍因固定 main-worktree cwd 拒绝 sibling worktree；
+同一 rust-analyzer 后端的原生 diagnostics 已完成，四个变更文件无错误或警告。完整记录见
+`.omo/evidence/task-157-opencode-rust.txt`。
