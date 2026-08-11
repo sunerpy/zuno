@@ -344,7 +344,8 @@ async fn start_stream(
     config: OpenAiConfig,
     request: CompletionRequest,
 ) -> Result<ProviderStream<'static>, ProviderError> {
-    let body = build_request_body(&request, &config)?;
+    let mut body = build_request_body(&request, &config)?;
+    request.apply_parameters(&mut body);
     let surface = resolve_surface(request.surface);
     let endpoint = endpoint(&config.base_url, surface);
     let provider = config.provider.clone();
@@ -355,6 +356,9 @@ async fn start_stream(
         .header("content-type", "application/json")
         .header("accept", "text/event-stream");
     for (name, value) in &config.headers {
+        outgoing = outgoing.header(name, value);
+    }
+    for (name, value) in &request.headers {
         outgoing = outgoing.header(name, value);
     }
     let response = outgoing

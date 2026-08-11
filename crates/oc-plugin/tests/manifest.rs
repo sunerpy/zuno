@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use oc_plugin::{HookName, PluginManifest};
+use oc_plugin::{HookName, PluginManifest, hook_support};
 
 const ORACLE_HOOKS: [&str; 21] = [
     "dispose",
@@ -53,4 +53,19 @@ fn manifest_rejects_an_unknown_hook_with_the_valid_hook_list() {
     for hook in ORACLE_HOOKS {
         assert!(rendered.contains(hook), "missing valid hook {hook}");
     }
+}
+
+#[test]
+fn production_support_matrix_covers_every_advertised_hook_in_declaration_order() {
+    let support = hook_support().collect::<Vec<_>>();
+
+    assert_eq!(
+        support.iter().map(|row| row.hook).collect::<Vec<_>>(),
+        HookName::ALL
+    );
+    assert!(
+        support
+            .iter()
+            .all(|row| !row.production_trigger.trim().is_empty())
+    );
 }

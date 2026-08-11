@@ -310,8 +310,11 @@ impl GoogleGenerativeAi {
     ) -> Result<PreparedRequest, GoogleProviderError> {
         let base = self.options.base_url.as_deref().unwrap_or(GOOGLE_BASE_URL);
         let url = gemini_api_endpoint(base, &request.model_id)?;
-        let body = build_gemini_body(&request.messages, &self.options)?;
-        Ok(PreparedRequest::new(url, body))
+        let mut body = build_gemini_body(&request.messages, &self.options)?;
+        request.apply_parameters(&mut body);
+        let mut prepared = PreparedRequest::new(url, body);
+        prepared.headers.extend(request.headers.clone());
+        Ok(prepared)
     }
 }
 
@@ -402,8 +405,11 @@ impl VertexGemini {
         } else {
             vertex_gemini_endpoint(&self.project, &self.location, &request.model_id)?
         };
-        let body = build_gemini_body(&request.messages, &self.options)?;
-        Ok(PreparedRequest::new(url, body))
+        let mut body = build_gemini_body(&request.messages, &self.options)?;
+        request.apply_parameters(&mut body);
+        let mut prepared = PreparedRequest::new(url, body);
+        prepared.headers.extend(request.headers.clone());
+        Ok(prepared)
     }
 }
 
@@ -1132,8 +1138,11 @@ impl VertexAnthropic {
             Some(base) => vertex_anthropic_custom_endpoint(base, &request.model_id)?,
             None => vertex_anthropic_endpoint(&self.project, &self.location, &request.model_id)?,
         };
-        let body = build_vertex_anthropic_body(&request.messages, &self.options)?;
-        Ok(PreparedRequest::new(url, body))
+        let mut body = build_vertex_anthropic_body(&request.messages, &self.options)?;
+        request.apply_parameters(&mut body);
+        let mut prepared = PreparedRequest::new(url, body);
+        prepared.headers.extend(request.headers.clone());
+        Ok(prepared)
     }
 
     /// Construct the Anthropic SSE decoder used by this path.

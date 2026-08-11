@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use oc_engine::dispatch::ToolRegistryDispatcher;
+use oc_engine::hooks::{PermissionHookDecision, ToolHooks};
 use oc_engine::interrupt::InterruptSignal;
 use oc_engine::r#loop::{DispatchRequest, ToolCall, ToolDispatcher};
 use oc_error::ToolError;
@@ -200,6 +201,74 @@ fn dispatcher(
     background: InterruptSignal,
 ) -> ToolRegistryDispatcher {
     ToolRegistryDispatcher::new(tools, rules, approver, background, McpToolStatus::Ready)
+}
+
+#[derive(Default)]
+struct MutatingHooks;
+
+#[async_trait]
+impl ToolHooks for MutatingHooks {
+    async fn before(
+        &self,
+        _tool: &str,
+        _session_id: &str,
+        _call_id: &str,
+        args: &mut Value,
+    ) -> Result<(), String> {
+        args["command"] = json!("hooked");
+        Ok(())
+    }
+
+    async fn permission(
+        &self,
+        _request: &oc_permission::PermissionRequest,
+    ) -> Result<PermissionHookDecision, String> {
+        Ok(PermissionHookDecision::Allow)
+    }
+
+    async fn after(
+        &self,
+        _tool: &str,
+        _session_id: &str,
+        _call_id: &str,
+        _args: &Value,
+        output: &mut ToolOutput,
+    ) -> Result<(), String> {
+        output.title = "hooked title".to_owned();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn production_dispatch_applies_before_permission_and_after_hooks() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let approver = Arc::new(RecordingApprover::default());
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
+        vec![deny_rule("bash", "original")],
+        Arc::clone(&approver) as Arc<dyn PermissionAsker>,
+        InterruptSignal::new(),
+        McpToolStatus::Ready,
+    )
+    .with_hooks(Arc::new(MutatingHooks));
+
+    let result = dispatcher
+        .dispatch(request(
+            &dispatcher,
+            "call-hooked",
+            "bash",
+            json!({"command": "original", "intent": "verify plugin hooks"}),
+        ))
+        .await;
+
+    assert!(!result.is_error, "{}", result.output.output);
+    assert_eq!(result.output.output, "\"hooked\"");
+    assert_eq!(result.output.title, "hooked title");
+    assert!(
+        approver.asks().is_empty(),
+        "plugin allow must bypass approval"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

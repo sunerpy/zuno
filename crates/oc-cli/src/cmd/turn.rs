@@ -46,12 +46,12 @@ use oc_engine::prelude::{
 use oc_error::ProviderError;
 use oc_llm::cache::{DynamicContext, McpToolStatus};
 use oc_llm::catalog::{Catalog, CatalogProvenance, CatalogSource, ResolveInput};
-use oc_llm::event::StreamEvent;
+use oc_llm::event::{Message, RequestContentBlock, Role, StreamEvent};
 use oc_llm::registry::{ApiSurface, Provider, ProviderRegistry, Spec};
 use oc_memory::{ScopeLimits, SessionMemory, assemble_system_prompt};
 use oc_provider_compatible::{ReqwestTransport, Transport};
 use oc_tool::PermissionAsker;
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::environment::StartupEnvironment;
@@ -122,7 +122,7 @@ pub(crate) struct TurnPlan {
     window: TokenWindow,
     notes: Vec<String>,
     plugin_tools: Vec<Arc<dyn oc_tool::Tool>>,
-    plugins: Option<super::plugin_runtime::PluginRuntime>,
+    plugins: Option<Arc<super::plugin_runtime::PluginRuntime>>,
 }
 
 impl TurnPlan {
@@ -169,7 +169,8 @@ impl TurnPlan {
             env.flag(crate::OPENCODE_PURE),
             "turn",
         )
-        .await;
+        .await
+        .map(Arc::new);
         if let Some(plugins) = &plugins {
             plugins.apply_config(&mut config).await?;
         }
@@ -228,13 +229,24 @@ impl TurnPlan {
             max_output: token_count(catalog_model.limit.output),
         };
         let mut notes = Vec::new();
+        let plugin_small_model = if config.small_model.is_none() {
+            match (&plugins, catalog.provider(&provider_id)) {
+                (Some(plugins), Some(provider)) => plugins.small_model(provider).await?,
+                (Some(_), None) | (None, _) => None,
+            }
+        } else {
+            None
+        };
         let internals = resolve_internals(
-            &config,
-            &catalog,
-            &provider_id,
-            &model_id,
-            catalog_model,
-            env,
+            ResolveInternalsInput {
+                config: &config,
+                catalog: &catalog,
+                provider_id: &provider_id,
+                model_id: &model_id,
+                session_model: catalog_model,
+                env,
+                plugin_small_model: plugin_small_model.as_ref(),
+            },
             &mut notes,
         )?;
         Ok(Self {
@@ -297,30 +309,81 @@ fn token_count(limit: f64) -> u64 {
 /// The preset rung of the precedence chain is reachable but unfed: nothing in this
 /// workspace discovers a [`oc_agent::model_policy::PresetLibrary`] yet, so only the
 /// per-agent override and the session model can answer today.
+struct ResolveInternalsInput<'a> {
+    config: &'a oc_config::schema::Config,
+    catalog: &'a Catalog,
+    provider_id: &'a str,
+    model_id: &'a str,
+    session_model: &'a oc_llm::catalog::ResolvedModel,
+    env: &'a oc_paths::Env,
+    plugin_small_model: Option<&'a oc_llm::catalog::ResolvedModel>,
+}
+
 fn resolve_internals(
-    config: &oc_config::schema::Config,
-    catalog: &Catalog,
-    provider_id: &str,
-    model_id: &str,
-    session_model: &oc_llm::catalog::ResolvedModel,
-    env: &oc_paths::Env,
+    input: ResolveInternalsInput<'_>,
     notes: &mut Vec<String>,
 ) -> Result<Internals, String> {
+    let ResolveInternalsInput {
+        config,
+        catalog,
+        provider_id,
+        model_id,
+        session_model,
+        env,
+        plugin_small_model,
+    } = input;
     let session_choice = ModelChoice::new(format!("{provider_id}/{model_id}"));
     let mut policy = ModelPolicy::new().with_session_model(session_choice);
     if let Some(agents) = &config.agent {
         policy = policy.with_agent_overrides(agents);
     }
 
+    let configured_small_model = config.small_model.as_deref().and_then(|qualified| {
+        let (small_provider, small_model) = qualified.split_once('/')?;
+        if small_provider != provider_id {
+            notes.push(format!(
+                "small_model: `{qualified}` is served by `{small_provider}`, and only `{provider_id}`'s credential is wired for this turn"
+            ));
+            return None;
+        }
+        let model = catalog.model(small_provider, small_model)?;
+        if provider_key_for_npm(&model.api.npm).is_none() || model_spec(catalog, model, env).is_err()
+        {
+            notes.push(format!(
+                "small_model: `{qualified}` cannot be reached by this runtime"
+            ));
+            return None;
+        }
+        Some(model)
+    });
+    let inherited_small_model = configured_small_model.or(plugin_small_model).filter(|model| {
+        if model.provider_id != provider_id {
+            notes.push(format!(
+                "plugin small model `{}/{}` is served by another provider; using `{provider_id}/{model_id}` instead",
+                model.provider_id, model.id
+            ));
+            return false;
+        }
+        if provider_key_for_npm(&model.api.npm).is_none() || model_spec(catalog, model, env).is_err()
+        {
+            notes.push(format!(
+                "plugin small model `{}/{}` cannot be reached; using `{provider_id}/{model_id}` instead",
+                model.provider_id, model.id
+            ));
+            return false;
+        }
+        true
+    });
+
     let mut resolved = std::collections::BTreeMap::new();
     for name in oc_agent::builtin::INTERNAL_NAMES {
         let prompt = internal_prompt(name)?;
         let resolution = policy.resolve(name, &AnyModel);
         notes.extend(resolution.render_diagnostics());
-        let chosen = resolution
-            .model
-            .as_ref()
-            .and_then(|choice| {
+        let chosen = if resolution.inherits_session_model() {
+            inherited_small_model.map(|model| (model.id.clone(), model))
+        } else {
+            resolution.model.as_ref().and_then(|choice| {
                 let (chosen_provider, chosen_model) = (choice.provider()?, choice.model_id()?);
                 if chosen_provider != provider_id {
                     notes.push(format!(
@@ -354,7 +417,8 @@ fn resolve_internals(
                 }
                 Some((chosen_model.to_owned(), model))
             })
-            .unwrap_or_else(|| (model_id.to_owned(), session_model));
+        }
+        .unwrap_or_else(|| (model_id.to_owned(), session_model));
         let (chosen_model_id, catalog_model) = chosen;
         resolved.insert(
             name,
@@ -365,7 +429,8 @@ fn resolve_internals(
                     model_spec(catalog, catalog_model, env)?,
                     catalog_model.api.id.clone(),
                     ApiSurface::Chat,
-                ),
+                )
+                .with_catalog_identity(&catalog_model.provider_id, &catalog_model.id),
             },
         );
         debug_assert!(
@@ -428,7 +493,8 @@ pub(crate) struct TurnHost {
     compaction_state: CompactionState,
     window: TokenWindow,
     notes: Vec<String>,
-    _plugins: Option<super::plugin_runtime::PluginRuntime>,
+    plugins: Option<Arc<super::plugin_runtime::PluginRuntime>>,
+    commands: oc_catalog::command::Registry,
 }
 
 /// The registry answering for whichever spec an internal agent resolved to.
@@ -489,6 +555,11 @@ impl TurnHost {
         let session = resolve_session(&mut connection, &plan, now)?;
 
         let memory_root = worktree.as_deref().unwrap_or(&plan.directory);
+        let command_worktree = memory_root.to_string_lossy();
+        let commands = oc_catalog::command::Registry::build(
+            &oc_catalog::command::Sources::new(&command_worktree)
+                .with_config(plan.config.command.as_ref()),
+        );
         configure_resident_memory(
             &mut plan.resolver,
             &plan.config,
@@ -506,15 +577,20 @@ impl TurnHost {
                 model_id: &plan.model_id,
                 question,
                 plugin_tools: &plan.plugin_tools,
+                plugins: plan.plugins.clone(),
             },
         )?;
-        let dispatcher = ToolRegistryDispatcher::new(
+        let mut dispatcher = ToolRegistryDispatcher::new(
             runtime_tools.tools,
             runtime_tools.rules,
             approval,
             interrupt.clone(),
             McpToolStatus::Ready,
         );
+        if let Some(plugins) = plan.plugins.as_ref() {
+            let hooks: Arc<dyn oc_engine::hooks::ToolHooks> = plugins.clone();
+            dispatcher = dispatcher.with_hooks(hooks);
+        }
         Ok(Self {
             connection,
             providers,
@@ -531,13 +607,34 @@ impl TurnHost {
             compaction_state: CompactionState::default(),
             window: plan.window,
             notes: plan.notes,
-            _plugins: plan.plugins,
+            plugins: plan.plugins,
+            commands,
         })
     }
 
     /// The session every turn this host drives belongs to.
     pub(crate) fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    pub(crate) fn with_event_hooks(&self, events: TurnEventSender) -> TurnEventSender {
+        match &self.plugins {
+            Some(plugins) => {
+                let hooks: Arc<dyn oc_engine::hooks::TurnHooks> = plugins.clone();
+                events.with_hooks(hooks)
+            }
+            None => events,
+        }
+    }
+
+    pub(crate) fn plugin_runtime(&self) -> Option<Arc<super::plugin_runtime::PluginRuntime>> {
+        self.plugins.clone()
+    }
+
+    pub(crate) async fn shutdown(&mut self) {
+        if let Some(plugins) = &self.plugins {
+            plugins.shutdown().await;
+        }
     }
 
     /// Persist `prompt` as the user's message and run one turn over it.
@@ -577,17 +674,53 @@ impl TurnHost {
         self.drive_with_message_id(prompt, None, events).await
     }
 
+    pub(crate) async fn drive_command(
+        &mut self,
+        command: &str,
+        arguments: &str,
+        events: TurnEventSender,
+    ) -> Result<(), String> {
+        let resolved = match self
+            .commands
+            .resolve(command, arguments)
+            .map_err(to_string)?
+        {
+            oc_catalog::command::Resolution::Ready(resolved) => resolved,
+            oc_catalog::command::Resolution::PendingMcp(_) => {
+                return Err(format!(
+                    "command `{command}` requires a connected MCP prompt provider"
+                ));
+            }
+        };
+        if resolved.subtask == Some(true) {
+            return Err(format!(
+                "command `{command}` requires subtask execution, which this surface cannot host"
+            ));
+        }
+        self.drive_input(&resolved.prompt, None, Some((command, arguments)), events)
+            .await
+    }
+
     pub(crate) async fn drive_with_message_id(
         &mut self,
         prompt: &str,
         message_id: Option<&str>,
         events: TurnEventSender,
     ) -> Result<(), String> {
+        self.drive_input(prompt, message_id, None, events).await
+    }
+
+    async fn drive_input(
+        &mut self,
+        prompt: &str,
+        message_id: Option<&str>,
+        command: Option<(&str, &str)>,
+        events: TurnEventSender,
+    ) -> Result<(), String> {
         let latest = oc_db::message::MessageStore::new(&self.connection)
             .latest_time_created(&self.session_id)
             .map_err(to_string)?;
-        persist_user_message(
-            &self.connection,
+        let (message, parts) = prepare_user_message_with_hooks(
             UserMessageInput {
                 session_id: &self.session_id,
                 agent: &self.agent,
@@ -597,22 +730,34 @@ impl TurnHost {
                 message_id,
                 now: oc_db::message::created_after(oc_db::message::now_millis(), latest),
             },
-        )?;
+            self.plugins.as_deref(),
+            command,
+        )
+        .await?;
+        persist_prepared_user_message(&self.connection, &message, &parts)?;
         let outcome = self.run_prelude().await?;
         report_prelude(&events, &self.notes, &outcome).await?;
+        if !outcome.continue_turn {
+            return Ok(());
+        }
+        let mut context = TurnContext::new(
+            &mut self.connection,
+            &self.providers,
+            &self.resolver,
+            &self.dispatcher,
+            &self.interrupt,
+        );
+        if let Some(plugins) = self.plugins.as_ref() {
+            let hooks: Arc<dyn oc_engine::hooks::TurnHooks> = plugins.clone();
+            context = context.with_hooks(hooks);
+        }
         run_turn(
             RunTurnRequest::new(
                 self.session_id.clone(),
                 Uuid::new_v4().simple().to_string(),
                 DynamicContext::default(),
             ),
-            TurnContext::new(
-                &mut self.connection,
-                &self.providers,
-                &self.resolver,
-                &self.dispatcher,
-                &self.interrupt,
-            ),
+            context,
             events,
         )
         .await
@@ -622,6 +767,11 @@ impl TurnHost {
 
     pub(crate) async fn compact(&mut self) -> Result<(), String> {
         let providers = RegistryProviders(&self.providers);
+        let noop_hooks = oc_engine::compaction::NoopCompactionHooks;
+        let hooks: &dyn oc_engine::compaction::CompactionHooks = self
+            .plugins
+            .as_deref()
+            .map_or(&noop_hooks, |plugins| plugins);
         let mut context = PreludeContext {
             connection: &mut self.connection,
             providers: &providers,
@@ -629,6 +779,7 @@ impl TurnHost {
             compaction: &self.compaction_config,
             window: self.window,
             state: &mut self.compaction_state,
+            hooks,
         };
         compact_manually(&self.session_id, &mut context)
             .await
@@ -648,6 +799,11 @@ impl TurnHost {
     /// internals came to be declared and never invoked.
     async fn run_prelude(&mut self) -> Result<PreludeOutcome, String> {
         let providers = RegistryProviders(&self.providers);
+        let noop_hooks = oc_engine::compaction::NoopCompactionHooks;
+        let hooks: &dyn oc_engine::compaction::CompactionHooks = self
+            .plugins
+            .as_deref()
+            .map_or(&noop_hooks, |plugins| plugins);
         let mut context = PreludeContext {
             connection: &mut self.connection,
             providers: &providers,
@@ -655,6 +811,7 @@ impl TurnHost {
             compaction: &self.compaction_config,
             window: self.window,
             state: &mut self.compaction_state,
+            hooks,
         };
         run_prelude(&self.session_id, &mut context)
             .await
@@ -1278,6 +1435,7 @@ impl AgentModelResolver for Resolver {
                 self.wire_model.clone(),
                 self.spec.surface,
             )
+            .with_catalog_identity(&self.requested_provider, &self.requested_model)
         })
     }
 }
@@ -1367,6 +1525,7 @@ struct UserMessageInput<'a> {
     now: i64,
 }
 
+#[cfg(test)]
 fn persist_user_message(
     connection: &rusqlite::Connection,
     input: UserMessageInput<'_>,
@@ -1400,6 +1559,159 @@ fn persist_user_message(
         .map_err(to_string)?;
     store.put_part_at(&part, input.now).map_err(to_string)?;
     Ok(())
+}
+
+async fn prepare_user_message_with_hooks(
+    input: UserMessageInput<'_>,
+    plugins: Option<&super::plugin_runtime::PluginRuntime>,
+    command: Option<(&str, &str)>,
+) -> Result<
+    (
+        oc_db::message::MessageRecord,
+        Vec<oc_db::message::PartRecord>,
+    ),
+    String,
+> {
+    let message_id = input
+        .message_id
+        .map_or_else(|| prefixed_id("msg"), str::to_owned);
+    let mut message = oc_db::message::MessageRecord::from_json(json!({
+        "id": message_id,
+        "sessionID": input.session_id,
+        "role": "user",
+        "time": {"created": input.now},
+        "agent": input.agent,
+        "model": {"providerID": input.provider_id, "modelID": input.model_id}
+    }))
+    .map_err(to_string)?;
+    let mut parts = vec![
+        oc_db::message::PartRecord::from_json(
+            json!({
+                "id": prefixed_id("prt"),
+                "sessionID": input.session_id,
+                "messageID": message.id,
+                "type": "text",
+                "text": input.text
+            }),
+            input.now,
+        )
+        .map_err(to_string)?,
+    ];
+
+    if let (Some(plugins), Some((command, arguments))) = (plugins, command) {
+        plugins
+            .apply_command(command, input.session_id, arguments, &mut parts)
+            .await?;
+    }
+    if let Some(plugins) = plugins {
+        let initial_message = message_from_parts(&parts);
+        let initial_parts = parts.clone();
+        let mut output = oc_plugin::ChatMessageOutput {
+            message: initial_message.clone(),
+            parts,
+        };
+        let hook_input = oc_plugin::ChatMessageInput {
+            session_id: input.session_id,
+            agent: Some(input.agent),
+            model: Some(oc_plugin::ModelSelection {
+                provider_id: input.provider_id,
+                model_id: input.model_id,
+            }),
+            message_id: Some(&message.id),
+            variant: None,
+        };
+        plugins.apply_chat_message(&hook_input, &mut output).await?;
+        if output.message.role != Role::User {
+            return Err("chat.message must return a user message".to_owned());
+        }
+        parts = if output.message != initial_message && output.parts == initial_parts {
+            parts_from_message(&output.message, input.session_id, &message.id, input.now)?
+        } else {
+            output.parts
+        };
+    }
+    for part in &parts {
+        if part.session_id != input.session_id || part.message_id != message.id {
+            return Err("plugin returned a part for a different message or session".to_owned());
+        }
+    }
+    message
+        .data
+        .insert("role".to_owned(), Value::String("user".to_owned()));
+    Ok((message, parts))
+}
+
+fn persist_prepared_user_message(
+    connection: &rusqlite::Connection,
+    message: &oc_db::message::MessageRecord,
+    parts: &[oc_db::message::PartRecord],
+) -> Result<(), String> {
+    let store = oc_db::message::MessageStore::new(connection);
+    store
+        .put_message_at(message, message.time_created)
+        .map_err(to_string)?;
+    for part in parts {
+        store
+            .put_part_at(part, part.time_created)
+            .map_err(to_string)?;
+    }
+    Ok(())
+}
+
+fn message_from_parts(parts: &[oc_db::message::PartRecord]) -> Message {
+    let content = parts
+        .iter()
+        .filter_map(|part| match part.kind {
+            oc_db::message::PartKind::Text => {
+                part.data.get("text").and_then(Value::as_str).map(|text| {
+                    RequestContentBlock::Text {
+                        text: text.to_owned(),
+                    }
+                })
+            }
+            oc_db::message::PartKind::File => {
+                let media_type = part.data.get("mime").and_then(Value::as_str)?;
+                let data = part.data.get("data").and_then(Value::as_str)?;
+                Some(RequestContentBlock::Image {
+                    media_type: media_type.to_owned(),
+                    data: data.to_owned(),
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    Message::from_content(Role::User, content)
+}
+
+fn parts_from_message(
+    message: &Message,
+    session_id: &str,
+    message_id: &str,
+    now: i64,
+) -> Result<Vec<oc_db::message::PartRecord>, String> {
+    message
+        .content
+        .iter()
+        .map(|block| {
+            let value = match block {
+                RequestContentBlock::Text { text } => json!({
+                    "id": prefixed_id("prt"), "sessionID": session_id,
+                    "messageID": message_id, "type": "text", "text": text
+                }),
+                RequestContentBlock::Image { media_type, data } => json!({
+                    "id": prefixed_id("prt"), "sessionID": session_id,
+                    "messageID": message_id, "type": "file", "mime": media_type, "data": data
+                }),
+                _ => {
+                    return Err(
+                        "chat.message returned content that cannot be persisted as a user part"
+                            .to_owned(),
+                    );
+                }
+            };
+            oc_db::message::PartRecord::from_json(value, now).map_err(to_string)
+        })
+        .collect()
 }
 
 fn prefixed_id(prefix: &str) -> String {

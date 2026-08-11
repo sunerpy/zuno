@@ -184,6 +184,7 @@ impl BedrockProvider {
                 "application/json".to_owned(),
             );
         }
+        headers.extend(request.headers.clone());
         let signing = SigV4Signer::new(&self.config.region, "bedrock")
             .sign(
                 "POST",
@@ -324,10 +325,11 @@ fn request_body(
     request: &CompletionRequest,
     operation: BedrockOperation,
 ) -> Result<Vec<u8>, ProviderError> {
-    let value = match operation {
+    let mut value = match operation {
         BedrockOperation::ConverseStream => converse_body(request)?,
         BedrockOperation::InvokeModelWithResponseStream => native_body(request)?,
     };
+    request.apply_parameters(&mut value);
     serde_json::to_vec(&value).map_err(ProviderError::fatal)
 }
 

@@ -40,6 +40,7 @@ pub use crate::event::{FinishReason, Message, Role, StreamEvent};
 use crate::registry::spec::ApiSurface;
 use oc_error::ProviderError;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -161,6 +162,14 @@ pub struct CompletionRequest {
     /// checked against exactly what the model was shown. A provider that held its
     /// own tool list could answer with a call the loop would then refuse.
     pub tools: Vec<ToolSchema>,
+    /// Per-request provider parameters contributed after model resolution.
+    ///
+    /// Provider implementations consume these after building their normal body,
+    /// so a plugin mutation applies to this request only and cannot leak into the
+    /// provider instance shared by later turns.
+    pub parameters: serde_json::Map<String, serde_json::Value>,
+    /// Per-request HTTP headers contributed after model resolution.
+    pub headers: BTreeMap<String, String>,
 }
 
 /// One tool as the model is told about it, before any provider's wire shape.
@@ -189,6 +198,8 @@ impl CompletionRequest {
             surface: ApiSurface::Default,
             messages,
             tools: Vec::new(),
+            parameters: serde_json::Map::new(),
+            headers: BTreeMap::new(),
         }
     }
 
@@ -204,6 +215,16 @@ impl CompletionRequest {
     pub fn on_surface(mut self, surface: ApiSurface) -> Self {
         self.surface = surface;
         self
+    }
+
+    /// Overlay request-local parameters onto an object-shaped provider body.
+    pub fn apply_parameters(&self, body: &mut serde_json::Value) {
+        let Some(object) = body.as_object_mut() else {
+            return;
+        };
+        for (name, value) in &self.parameters {
+            object.insert(name.clone(), value.clone());
+        }
     }
 }
 

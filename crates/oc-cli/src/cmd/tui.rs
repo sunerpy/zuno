@@ -92,6 +92,8 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         Arc::clone(&broker) as Arc<dyn PermissionAsker>
     };
     let host = TurnHost::open(plan, environment, approval)?;
+    let engine_sender = host.with_event_hooks(engine_sender);
+    let plugins = host.plugin_runtime();
     broker.bind_session(host.session_id());
 
     let mut screen = SessionScreen::new(context.clone(), terminal_sender.clone())
@@ -125,6 +127,9 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         let outcome = app.run().await;
         input.abort();
         turns.abort();
+        if let Some(plugins) = plugins {
+            plugins.shutdown().await;
+        }
         outcome
     });
     drop(session);

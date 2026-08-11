@@ -21,7 +21,11 @@ use crate::environment::StartupEnvironment;
 
 pub(super) fn execute(args: &RunArgs, environment: &StartupEnvironment) -> Result<(), String> {
     validate_flags(args)?;
-    let message = prompt(args)?;
+    let message = if args.command.is_some() {
+        args.message.join(" ")
+    } else {
+        prompt(args)?
+    };
     let options = TurnOptions {
         directory: args.dir.as_deref().map(PathBuf::from),
         model: args.model.clone(),
@@ -38,23 +42,25 @@ pub(super) fn execute(args: &RunArgs, environment: &StartupEnvironment) -> Resul
     )?;
 
     let (sender, receiver) = event_channel();
+    let sender = host.with_event_hooks(sender);
     let (outcome, rendered) = runtime.block_on(async {
         tokio::join!(
-            host.drive(&message, sender),
+            async {
+                match args.command.as_deref() {
+                    Some(command) => host.drive_command(command, &message, sender).await,
+                    None => host.drive(&message, sender).await,
+                }
+            },
             render_events(receiver, args.format)
         )
     });
+    runtime.block_on(host.shutdown());
     outcome?;
     rendered?;
     Ok(())
 }
 
 fn validate_flags(args: &RunArgs) -> Result<(), String> {
-    if args.command.is_some() {
-        return Err(
-            "--command templates are not supported by the headless Rust run path yet".to_owned(),
-        );
-    }
     if args.fork {
         return Err(
             "--fork requires a session-history fork API that is not available yet".to_owned(),

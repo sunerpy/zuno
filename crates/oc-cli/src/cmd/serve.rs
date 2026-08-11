@@ -151,8 +151,12 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                 interrupt,
             )
             .await?;
-            host.drive_with_message_id(&request.prompt, Some(&request.message_id), events)
-                .await
+            let events = host.with_event_hooks(events);
+            let outcome = host
+                .drive_with_message_id(&request.prompt, Some(&request.message_id), events)
+                .await;
+            host.shutdown().await;
+            outcome
         })
     }
 
@@ -174,7 +178,9 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                 interrupt,
             )
             .await?;
-            host.compact().await
+            let outcome = host.compact().await;
+            host.shutdown().await;
+            outcome
         })
     }
 }

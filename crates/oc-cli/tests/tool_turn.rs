@@ -31,7 +31,7 @@ use std::process::Output;
 use std::time::Duration;
 
 use oc_testkit::mock_provider::{MockResponse, ResponseOrigin};
-use oc_testkit::{CassettePlayer, MockProvider, Scenario, ScriptedEnv};
+use oc_testkit::{CassettePlayer, DbChoice, MockProvider, Scenario, ScriptedEnv};
 
 /// The recorded conversation both tests build on.
 const CASSETTE: &str = "openai-chat/drives-a-tool-loop-end-to-end";
@@ -79,6 +79,94 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITTEN_CONTENT: &str = "the tool ran\n";
 const ANTIGRAVITY_SPEC: &str = "opencode-antigravity-auth@1.6.0";
 const ANTIGRAVITY_TOOL: &str = "google_search";
+
+const LIFECYCLE_PLUGIN: &str = r#"
+import { appendFileSync } from "node:fs";
+
+export default {
+  id: "production-lifecycle-fixture",
+  server: async (_input, options) => ({
+    config: async (config) => {
+      config.command.lifecycle.template = "config:$ARGUMENTS";
+    },
+    tool: {
+      lifecycle_tool: {
+        description: "resource-hook-description",
+        args: { value: {} },
+        execute: async (args) => args.value,
+      },
+    },
+    auth: {
+      provider: "test",
+      loader: async () => ({
+        extraBody: { auth_hook_sentinel: "auth-hook" },
+      }),
+      methods: [],
+    },
+    provider: {
+      id: "test",
+      models: async (provider) => {
+        provider.models["test-model"].api.id = "provider-hook-model";
+        return provider.models;
+      },
+    },
+    event: async (input) => {
+      appendFileSync(options.eventFile, `${input.event.type}\n`);
+    },
+    "command.execute.before": async (input, output) => {
+      output.parts[0].text += ":command";
+    },
+    "chat.message": async (_input, output) => {
+      output.parts[0].text += ":chat";
+    },
+    "chat.params": async (_input, output) => {
+      output.options.params_hook_sentinel = "chat-params-hook";
+    },
+    "chat.headers": async (_input, output) => {
+      output.headers["x-chat-headers-hook"] = "chat-headers-hook";
+    },
+    "permission.ask": async (_input, output) => {
+      output.status = "allow";
+    },
+    "tool.execute.before": async (input, output) => {
+      if (input.tool === "bash") {
+        output.args.command = "printf '%s' \"$PLUGIN_SHELL_ENV\"";
+      }
+      if (input.tool === "lifecycle_tool") {
+        output.args.value = "before-hook";
+      }
+    },
+    "shell.env": async (_input, output) => {
+      output.env.PLUGIN_SHELL_ENV = "shell-env-hook";
+    },
+    "tool.execute.after": async (input, output) => {
+      if (input.tool === "bash" || input.tool === "lifecycle_tool") {
+        output.title = "after-hook-title";
+        output.output += ":after-hook";
+      }
+    },
+    "experimental.chat.messages.transform": async (_input, output) => {
+      const user = output.messages.find((message) => message.info.role === "user");
+      user.info.content[0].text += ":messages";
+    },
+    "experimental.chat.system.transform": async (_input, output) => {
+      output.system.push("system-hook-sentinel");
+    },
+    "experimental.provider.small_model": async (input, output) => {
+      output.model = input.provider.models["small-model"];
+    },
+    "experimental.text.complete": async (_input, output) => {
+      output.text += ":text-complete-hook";
+    },
+    "tool.definition": async (input, output) => {
+      if (input.toolID === "lifecycle_tool") {
+        output.description = "definition-hook-description";
+      }
+    },
+    dispose: async () => appendFileSync(options.disposeFile, "disposed\n"),
+  }),
+};
+"#;
 
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_opencode-rust"))
@@ -136,6 +224,46 @@ fn plugin_provider_config(base_url: &str, deny_plugin_tool: bool) -> String {
     if deny_plugin_tool {
         config["permission"] = serde_json::json!({ ANTIGRAVITY_TOOL: "deny" });
     }
+    config.to_string()
+}
+
+fn lifecycle_provider_config(
+    base_url: &str,
+    plugin: &Path,
+    event_file: &Path,
+    dispose_file: &Path,
+) -> String {
+    let mut config: serde_json::Value =
+        serde_json::from_str(&provider_config(base_url)).expect("provider config is JSON");
+    let provider = config["provider"]["test"]
+        .as_object_mut()
+        .expect("test provider is an object");
+    provider
+        .get_mut("models")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("test models are an object")
+        .insert(
+            "small-model".to_owned(),
+            serde_json::json!({
+                "id": "small-model",
+                "name": "Small Model",
+                "attachment": false,
+                "reasoning": false,
+                "temperature": false,
+                "tool_call": false,
+                "release_date": "2025-01-01",
+                "limit": { "context": 100_000, "output": 10_000 },
+                "cost": { "input": 0, "output": 0 },
+                "options": {}
+            }),
+        );
+    config["command"] = serde_json::json!({
+        "lifecycle": { "template": "template:$ARGUMENTS" }
+    });
+    config["plugin"] = serde_json::json!([[
+        format!("file:{}", plugin.display()),
+        { "eventFile": event_file, "disposeFile": dispose_file }
+    ]]);
     config.to_string()
 }
 
@@ -210,6 +338,123 @@ async fn run_plugin_prompt(
         .expect("launch plugin-backed opencode-rust run")
 }
 
+async fn run_lifecycle_command(
+    env: &ScriptedEnv,
+    base_url: &str,
+    plugin: &Path,
+    event_file: &Path,
+    dispose_file: &Path,
+) -> Output {
+    run_lifecycle_command_with_args(
+        env,
+        base_url,
+        plugin,
+        event_file,
+        dispose_file,
+        &[
+            "run",
+            "--model",
+            "test/test-model",
+            "--command",
+            "lifecycle",
+            "raw arguments",
+        ],
+    )
+    .await
+}
+
+async fn run_lifecycle_command_with_args(
+    env: &ScriptedEnv,
+    base_url: &str,
+    plugin: &Path,
+    event_file: &Path,
+    dispose_file: &Path,
+    args: &[&str],
+) -> Output {
+    let mut plugin_variables = variables(env, base_url);
+    plugin_variables.remove("OPENCODE_PURE");
+    plugin_variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
+    plugin_variables.insert(
+        "MISE_DATA_DIR".to_owned(),
+        "/config/.local/share/mise".to_owned(),
+    );
+    plugin_variables.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+    plugin_variables.insert(
+        "OPENCODE_CONFIG_CONTENT".to_owned(),
+        lifecycle_provider_config(base_url, plugin, event_file, dispose_file),
+    );
+
+    let mut command = tokio::process::Command::new(binary());
+    command
+        .args(args)
+        .current_dir(env.working_dir())
+        .env_clear()
+        .envs(plugin_variables);
+    tokio::time::timeout(Duration::from_secs(90), command.output())
+        .await
+        .expect("the lifecycle-plugin run must finish inside its budget")
+        .expect("launch lifecycle-plugin run")
+}
+
+async fn run_lifecycle_tool_prompt(
+    env: &ScriptedEnv,
+    base_url: &str,
+    plugin: &Path,
+    event_file: &Path,
+    dispose_file: &Path,
+) -> Output {
+    let mut plugin_variables = variables(env, base_url);
+    plugin_variables.remove("OPENCODE_PURE");
+    plugin_variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
+    plugin_variables.insert(
+        "MISE_DATA_DIR".to_owned(),
+        "/config/.local/share/mise".to_owned(),
+    );
+    plugin_variables.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+    let mut config: serde_json::Value = serde_json::from_str(&lifecycle_provider_config(
+        base_url,
+        plugin,
+        event_file,
+        dispose_file,
+    ))
+    .expect("lifecycle provider config is JSON");
+    config["permission"] = serde_json::json!({ "lifecycle_tool": "ask" });
+    plugin_variables.insert("OPENCODE_CONFIG_CONTENT".to_owned(), config.to_string());
+
+    let mut command = tokio::process::Command::new(binary());
+    command
+        .args(["run", "--model", "test/test-model", "Use the shell once."])
+        .current_dir(env.working_dir())
+        .env_clear()
+        .envs(plugin_variables);
+    tokio::time::timeout(Duration::from_secs(90), command.output())
+        .await
+        .expect("the lifecycle tool run must finish inside its budget")
+        .expect("launch lifecycle tool run")
+}
+
+fn request_model(body: &serde_json::Value) -> Option<&str> {
+    body.get("model").and_then(serde_json::Value::as_str)
+}
+
+fn request_contains_text(body: &serde_json::Value, expected: &str) -> bool {
+    body.get("messages")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message.get("content").is_some_and(|content| match content {
+                    serde_json::Value::String(text) => text.contains(expected),
+                    serde_json::Value::Array(parts) => parts.iter().any(|part| {
+                        part.get("text")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|text| text.contains(expected))
+                    }),
+                    _ => false,
+                })
+            })
+        })
+}
+
 /// Every `tools[].function.name` the binary advertised in a captured request.
 fn advertised_tools(body: &serde_json::Value) -> Vec<String> {
     body.get("tools")
@@ -225,6 +470,19 @@ fn advertised_tools(body: &serde_json::Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn advertised_tool_description<'a>(body: &'a serde_json::Value, id: &str) -> Option<&'a str> {
+    body.get("tools")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .find(|tool| {
+            tool.pointer("/function/name")
+                .and_then(serde_json::Value::as_str)
+                == Some(id)
+        })?
+        .pointer("/function/description")
+        .and_then(serde_json::Value::as_str)
 }
 
 /// The frozen harness's own arithmetic, reproduced so a failure names the number.
@@ -607,6 +865,259 @@ async fn a_plugin_tool_is_hidden_by_the_same_permission_layer_as_builtins() {
     assert!(
         !offered.iter().any(|name| name == ANTIGRAVITY_TOOL),
         "a user deny must hide a plugin tool exactly as it hides a built-in: {offered:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_plugin_lifecycle_hooks_run_through_the_real_dispatcher() {
+    let env = ScriptedEnv::new().expect("isolated environment");
+    let plugin = env.project().join("lifecycle-tool-plugin.mjs");
+    let event_file = env.project().join("lifecycle-tool-plugin.events");
+    let dispose_file = env.project().join("lifecycle-tool-plugin.dispose");
+    std::fs::write(&plugin, LIFECYCLE_PLUGIN).expect("write lifecycle tool plugin");
+    let player = CassettePlayer::from_oracle(CASSETTE).expect("the recorded tool loop loads");
+    let mut interactions = player.cassette().http_interactions();
+    let first = interactions.next().expect("the tool-call interaction");
+    let second = interactions.next().expect("the continuation interaction");
+    let recorded_first = String::from_utf8(
+        first
+            .response
+            .decoded_body(CASSETTE, 1)
+            .expect("the recorded body decodes"),
+    )
+    .expect("the recorded body is UTF-8");
+    let scenario = Scenario::new("production-tool-lifecycle-hooks")
+        .on_path("/v1/chat/completions")
+        .from_oracle_cassette(TITLE_CASSETTE)
+        .expect("the recorded title completion loads")
+        .respond(rewrite_tool_call_response(
+            &recorded_first,
+            "lifecycle_tool",
+            serde_json::json!({
+                "value": "original",
+                "intent": "prove plugin tool lifecycle hooks"
+            }),
+            "the plugin tool call is authored so the real dispatcher consumes the before, permission, and after hooks",
+        ))
+        .respond(
+            MockResponse::from_recorded(CASSETTE, 2, second).expect("the continuation decodes"),
+        );
+    let provider = MockProvider::start(vec![scenario])
+        .await
+        .expect("mock provider binds loopback");
+
+    let output = run_lifecycle_tool_prompt(
+        &env,
+        provider.base_url(),
+        &plugin,
+        &event_file,
+        &dispose_file,
+    )
+    .await;
+    let captured = provider.captured().await;
+    provider.shutdown().await;
+
+    assert!(
+        output.status.success(),
+        "tool lifecycle run failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(captured.len(), REQUESTS_FOR_ONE_TOOL_TURN);
+    let continuation = captured[2]
+        .json()
+        .expect("the continuation request is JSON");
+    let tool_result = continuation
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|messages| {
+            messages.iter().find(|message| {
+                message.get("role").and_then(serde_json::Value::as_str) == Some("tool")
+            })
+        })
+        .and_then(|message| message.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    assert_eq!(
+        tool_result, "before-hook:after-hook",
+        "tool.execute.before, permission.ask, and tool.execute.after must all affect the production result: {continuation:#}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shell_env_plugin_hook_reaches_the_real_shell_process() {
+    let env = ScriptedEnv::new().expect("isolated environment");
+    let plugin = env.project().join("lifecycle-shell-plugin.mjs");
+    let event_file = env.project().join("lifecycle-shell-plugin.events");
+    let dispose_file = env.project().join("lifecycle-shell-plugin.dispose");
+    std::fs::write(&plugin, LIFECYCLE_PLUGIN).expect("write lifecycle shell plugin");
+    let player = CassettePlayer::from_oracle(CASSETTE).expect("the recorded tool loop loads");
+    let mut interactions = player.cassette().http_interactions();
+    let first = interactions.next().expect("the tool-call interaction");
+    let second = interactions.next().expect("the continuation interaction");
+    let recorded_first = String::from_utf8(
+        first
+            .response
+            .decoded_body(CASSETTE, 1)
+            .expect("the recorded body decodes"),
+    )
+    .expect("the recorded body is UTF-8");
+    let scenario = Scenario::new("production-shell-env-hook")
+        .on_path("/v1/chat/completions")
+        .from_oracle_cassette(TITLE_CASSETTE)
+        .expect("the recorded title completion loads")
+        .respond(rewrite_tool_call_response(
+            &recorded_first,
+            "bash",
+            serde_json::json!({
+                "command": "printf original",
+                "intent": "prove shell.env reaches the child process"
+            }),
+            "the bash call is authored so shell.env can be observed in the real child process",
+        ))
+        .respond(
+            MockResponse::from_recorded(CASSETTE, 2, second).expect("the continuation decodes"),
+        );
+    let provider = MockProvider::start(vec![scenario])
+        .await
+        .expect("mock provider binds loopback");
+
+    let output = run_lifecycle_command_with_args(
+        &env,
+        provider.base_url(),
+        &plugin,
+        &event_file,
+        &dispose_file,
+        &["run", "--model", "test/test-model", "Use the shell once."],
+    )
+    .await;
+    let captured = provider.captured().await;
+    provider.shutdown().await;
+
+    assert!(
+        output.status.success(),
+        "shell lifecycle run failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(captured.len(), REQUESTS_FOR_ONE_TOOL_TURN);
+    let continuation = captured[2]
+        .json()
+        .expect("the continuation request is JSON");
+    assert!(
+        request_contains_text(&continuation, "shell-env-hook:after-hook"),
+        "shell.env did not reach the spawned shell process: {continuation:#}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_plugin_lifecycle_hooks_run_through_the_real_binary() {
+    let env = ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::TempFile);
+    let plugin = env.project().join("lifecycle-plugin.mjs");
+    let event_file = env.project().join("lifecycle-plugin.events");
+    let dispose_file = env.project().join("lifecycle-plugin.dispose");
+    std::fs::write(&plugin, LIFECYCLE_PLUGIN).expect("write lifecycle plugin");
+    let scenario = Scenario::new("production-lifecycle-hooks")
+        .from_oracle_cassette(TITLE_CASSETTE)
+        .expect("the recorded title completion loads")
+        .from_oracle_cassette(TITLE_CASSETTE)
+        .expect("the recorded turn completion loads");
+    let provider = MockProvider::start(vec![scenario])
+        .await
+        .expect("mock provider binds loopback");
+
+    let output = run_lifecycle_command(
+        &env,
+        provider.base_url(),
+        &plugin,
+        &event_file,
+        &dispose_file,
+    )
+    .await;
+    let captured = provider.captured().await;
+    provider.shutdown().await;
+
+    assert!(
+        output.status.success(),
+        "lifecycle-plugin run failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(captured.len(), 2, "title plus one ordinary turn");
+    let title = captured[0].json().expect("title request is JSON");
+    assert_eq!(
+        request_model(&title),
+        Some("small-model"),
+        "the internal title request did not consume experimental.provider.small_model: {title:#}"
+    );
+    let turn = captured[1].json().expect("turn request is JSON");
+    assert_eq!(
+        request_model(&turn),
+        Some("provider-hook-model"),
+        "the provider resource hook did not replace the real catalog model: {turn:#}"
+    );
+    assert_eq!(
+        turn.get("auth_hook_sentinel")
+            .and_then(serde_json::Value::as_str),
+        Some("auth-hook"),
+        "the auth resource hook's provider options did not reach the real request: {turn:#}"
+    );
+    assert_eq!(
+        turn.get("params_hook_sentinel")
+            .and_then(serde_json::Value::as_str),
+        Some("chat-params-hook"),
+        "chat.params was not consumed by provider request preparation: {turn:#}"
+    );
+    assert_eq!(
+        captured[1].header("x-chat-headers-hook"),
+        Some("chat-headers-hook"),
+        "chat.headers was not consumed by the real HTTP request"
+    );
+    assert!(
+        request_contains_text(&turn, "config:raw arguments:command:chat:messages"),
+        "the provider request did not consume config, command.execute.before, chat.message, and the messages transform in order: {turn:#}"
+    );
+    assert!(
+        request_contains_text(&turn, "system-hook-sentinel"),
+        "the provider request did not consume the system transform: {turn:#}"
+    );
+    assert!(
+        advertised_tools(&turn)
+            .iter()
+            .any(|tool| tool == "lifecycle_tool"),
+        "the tool resource hook did not enter the production registry: {turn:#}"
+    );
+    assert_eq!(
+        advertised_tool_description(&turn, "lifecycle_tool"),
+        Some("definition-hook-description"),
+        "tool.definition did not mutate the provider-visible definition: {turn:#}"
+    );
+    let events = std::fs::read_to_string(&event_file).unwrap_or_default();
+    assert!(
+        events.lines().any(|event| event == "turn.completed"),
+        "the event hook did not observe the production turn stream: {events:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&dispose_file).ok().as_deref(),
+        Some("disposed\n"),
+        "the run surface stopped the JavaScript host without dispatching dispose"
+    );
+    let database = env.xdg_data().join("scripted.db");
+    let connection = oc_db::open_at(&database).expect("open lifecycle database");
+    let mut statement = connection
+        .prepare("SELECT data FROM part ORDER BY time_created, id")
+        .expect("prepare lifecycle part query");
+    let stored = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query lifecycle parts")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read lifecycle parts")
+        .join("\n");
+    assert!(
+        stored.contains(":text-complete-hook"),
+        "experimental.text.complete did not alter the durable assistant text: {stored}"
     );
 }
 

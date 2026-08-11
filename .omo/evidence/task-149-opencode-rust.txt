@@ -1,0 +1,119 @@
+Task 149 — advertised plugin-hook production trigger evidence
+=============================================================
+
+Baseline
+--------
+- Worktree: /config/workspace/ProdDir/AI/oc-wt/t149
+- Branch: task-149
+- Starting revision: 285012cb
+- CodeGraph lookup was attempted first but this worktree is not indexed:
+  `No indexed project found for projectPath "/config/workspace/ProdDir/AI/oc-wt/t149".`
+- The pinned `.omo/refs` tree is absent in this worktree. Upstream lifecycle locations below
+  were checked against `/config/workspace/ProdDir/AI/opencode` at revision aefaf140c1;
+  this divergence is explicit rather than claiming an unverified 1.18.15 byte match.
+
+Lifecycle inventory frozen before production edits
+--------------------------------------------------
+The table follows `HookName::ALL` declaration order. “Effect” is the production-visible
+value that must consume ordered plugin mutations; merely calling `HookBus::dispatch` is
+not a trigger.
+
+| Hook | Production lifecycle point | Payload and consumed effect | Upstream reference |
+| --- | --- | --- | --- |
+| `dispose` | CLI turn owner shuts down the loaded runtime, before the JavaScript host is torn down | no input; callbacks run in configuration order before `JsPluginLoad::shutdown` | `packages/opencode/src/plugin/index.ts` plugin disposal |
+| `event` | every `TurnEventSender::publish`/engine send on the real turn event stream | immutable `TurnEvent`; plugin observes the exact event before the interface consumer | `packages/opencode/src/plugin/index.ts` bus-to-plugin event subscription |
+| `config` | loaded CLI config is finalized before catalog/turn composition | mutable `Config`; later catalog, agent, permission, and turn setup read mutations | existing `PluginRuntime::apply_config` |
+| `tool` | CLI assembles the executable tool registry | mutable plugin tool map; contributed tools enter the real dispatcher | existing `PluginRuntime::tools` |
+| `auth` | CLI enriches the provider catalog from stored credentials | ordered `AuthHook`s; loader options mutate the real provider | existing `PluginRuntime::apply_catalog` |
+| `provider` | CLI enriches provider models before model resolution | ordered `ProviderHook`s; returned models replace the real provider model set | existing `PluginRuntime::apply_catalog` |
+| `chat.message` | after the user message/parts are built and before they are persisted | session/agent/model/message identity plus mutable message and parts; mutated record is what the turn reads | `packages/opencode/src/session/prompt.ts` message construction hook |
+| `chat.params` | after agent/model resolution and immediately before provider request creation | `ChatContext` plus mutable temperature/top-p/top-k/token/options; consumed by the real request extension metadata supported by the provider surface | `packages/opencode/src/session/llm/request.ts` request transform |
+| `chat.headers` | same request preparation boundary as `chat.params` | `ChatContext` plus mutable headers; headers are carried by the real provider request extension metadata | `packages/opencode/src/session/llm/request.ts` header transform |
+| `permission.ask` | dispatcher permission choke point, before interactive approval | immutable `PermissionRequest` plus mutable Ask/Deny/Allow; Deny fails, Allow bypasses prompting, Ask preserves policy/UI path | `packages/opencode/src/session/permission.ts` plugin permission decision |
+| `command.execute.before` | resolved CLI/session command path, before command-generated parts are persisted/executed | command/session/arguments plus mutable parts; resulting parts enter the real user message | `packages/opencode/src/session/prompt.ts` command expansion hook |
+| `tool.execute.before` | dispatcher choke point, before schema validation, permission, and tool execution | tool/session/call identity plus mutable JSON args; all later validation/policy/execution use mutated args | `packages/opencode/src/session/prompt.ts` tool before hook |
+| `shell.env` | shell tool child-process environment construction | cwd/session/call identity plus mutable env; entries are passed to the spawned shell process | upstream shell tool environment hook declared by `packages/plugin/src/index.ts` |
+| `tool.execute.after` | dispatcher choke point after tool completion and before transcript/event persistence | tool/session/call/args plus mutable `ToolOutput`; mutated output is emitted and appended to model history | `packages/opencode/src/session/prompt.ts` tool after hook |
+| `experimental.chat.messages.transform` | after stored history projection and before cache preparation/provider request | mutable message+parts history; transformed messages form the provider-visible request | `packages/opencode/src/session/llm/request.ts` messages transform |
+| `experimental.chat.system.transform` | after agent system prompt resolution and before cache preparation/provider request | session/model plus mutable system fragments; joined fragments are the provider-visible system context | `packages/opencode/src/session/llm/request.ts` system transform |
+| `experimental.provider.small_model` | internal-agent model resolution before title/compaction/summary requests | provider plus mutable optional model; selected model is used by the real internal request | upstream provider small-model selection hook declared by `packages/plugin/src/index.ts` |
+| `experimental.session.compacting` | after compaction request assembly and before summary provider call | session plus mutable context and replacement prompt; both alter the real compaction request | `packages/opencode/src/session/compaction.ts` compacting transform |
+| `experimental.compaction.autocontinue` | overflow decision before automatic compaction/continuation | request `ChatContext`, overflow flag, mutable enabled bit; false suppresses automatic continuation while manual compaction remains available | `packages/opencode/src/session/compaction.ts` auto-continue transform |
+| `experimental.text.complete` | a streamed text part is complete, before its final checkpoint/event becomes durable | session/message/part identity plus mutable text; persisted final text and downstream event use the mutation | `packages/opencode/src/session/processor.ts` text completion hook |
+| `tool.definition` | executable tool definitions are snapshotted for a model step | tool id plus mutable definition; transformed schema/description is what the provider sees and validates against | upstream tool-definition request transform declared by `packages/plugin/src/index.ts` |
+
+Structural contract
+-------------------
+- The production support matrix must be generated from `HookName::ALL` and map through an
+  exhaustive `match HookName`; adding a variant without a production mapping must fail to
+  compile or fail the matrix equality test.
+- Documentation rows must render from the same matrix, not maintain a second handwritten
+  list.
+- Hook dispatch remains sequential in configured plugin order. Every mutable output passed
+  to the next plugin is the previous plugin's output, and production consumes the final value.
+
+Mutation evidence
+-----------------
+Baseline production-path witnesses all passed before mutation:
+
+- `ordinary_plugin_lifecycle_hooks_run_through_the_real_binary` — 15 lifecycle hooks.
+- `tool_plugin_lifecycle_hooks_run_through_the_real_dispatcher` — 3 dispatcher hooks.
+- `shell_env_plugin_hook_reaches_the_real_shell_process` — child-process environment hook.
+- `compaction_plugin_hooks_mutate_the_real_summary_request_and_continuation` — 2 compaction hooks.
+
+Each row below is an independent mutation. The exact `self.bus.dispatch(...)` expression for
+that hook was replaced with a ready successful future that retains and type-checks the original
+invocation payload but does not call the bus. The named test had to compile, run, and report
+`FAILED`; compile failures did not count. The original file was restored in a `finally` block
+after each row and its SHA-256 was compared to the pre-mutation bytes.
+
+| Hook | Named real-path witness that failed when production dispatch was deleted | Assertion |
+| --- | --- | --- |
+| `dispose` | `ordinary_plugin_lifecycle_hooks_run_through_the_real_binary` | `tool_turn.rs:1112` |
+| `event` | `ordinary_plugin_lifecycle_hooks_run_through_the_real_binary` | `tool_turn.rs:1108` |
+| `config` | `ordinary_plugin_lifecycle_hooks_run_through_the_real_binary` | `tool_turn.rs:1085` |
+| `tool` | `ordinary_plugin_lifecycle_hooks_run_through_the_real_binary` | `tool_turn.rs:1096` |
+| `auth` | `ordinary_plugin_lifecycle_hooks_run_through_the_real_binary` | `tool_turn.rs:1068` |
+| `provider` | `ordinary_plugin_lifecycle_hooks_run_through_the_real_binary` | `tool_turn.rs:1063` |
+| `chat.message` | `ordinary_plugin_lifecycle_hooks_run_through_the_real_binary` | `tool_turn.rs:1085` |
+| `chat.params` | `ordinary_plugin_lifecycle_hooks_run_through_the_real_binary` | `tool_turn.rs:1074` |
+| `chat.headers` | `ordinary_plugin_lifecycle_hooks_run_through_the_real_binary` | `tool_turn.rs:1080` |
+| `permission.ask` | `tool_plugin_lifecycle_hooks_run_through_the_real_dispatcher` | `tool_turn.rs:948` |
+| `command.execute.before` | `ordinary_plugin_lifecycle_hooks_run_through_the_real_binary` | `tool_turn.rs:1085` |
+| `tool.execute.before` | `tool_plugin_lifecycle_hooks_run_through_the_real_dispatcher` | `tool_turn.rs:948` |
+| `shell.env` | `shell_env_plugin_hook_reaches_the_real_shell_process` | `tool_turn.rs:1014` |
+| `tool.execute.after` | `tool_plugin_lifecycle_hooks_run_through_the_real_dispatcher` | `tool_turn.rs:948` |
+| `experimental.chat.messages.transform` | `ordinary_plugin_lifecycle_hooks_run_through_the_real_binary` | `tool_turn.rs:1085` |
+| `experimental.chat.system.transform` | `ordinary_plugin_lifecycle_hooks_run_through_the_real_binary` | `tool_turn.rs:1092` |
+| `experimental.provider.small_model` | `ordinary_plugin_lifecycle_hooks_run_through_the_real_binary` | `tool_turn.rs:1057` |
+| `experimental.session.compacting` | `compaction_plugin_hooks_mutate_the_real_summary_request_and_continuation` | `plugin_runtime.rs:868` |
+| `experimental.compaction.autocontinue` | `compaction_plugin_hooks_mutate_the_real_summary_request_and_continuation` | `plugin_runtime.rs:862` |
+| `experimental.text.complete` | `ordinary_plugin_lifecycle_hooks_run_through_the_real_binary` | `tool_turn.rs:1128` |
+| `tool.definition` | `ordinary_plugin_lifecycle_hooks_run_through_the_real_binary` | `tool_turn.rs:1102` |
+
+Observed result: **21/21 dispatch deletions were caught by their mapped named witness**.
+Final restoration: `crates/oc-cli/src/cmd/plugin_runtime.rs`
+SHA-256 `9093bfb026e10ebc8e49db8b022fa3bf5278e4454ffc8d94cdf7de7bcc7688a4`, equal to
+the pre-mutation bytes.
+
+Validation evidence
+-------------------
+- `lsp_diagnostics` could not inspect this sibling worktree because the MCP is rooted at
+  `/config/workspace/ProdDir/AI/opencode-rust`; it rejected
+  `/config/workspace/ProdDir/AI/oc-wt/t149/crates` as outside the request cwd.
+- Fallback `rust-analyzer diagnostics . --severity warning` completed over 523 source files.
+  It emitted no source `error:`/`warning:` diagnostics, including none for the changed files.
+  Its progress stream did contain rust-analyzer-internal `Overloaded deref on type str is not a
+  projection` analysis logs without file diagnostics; these are not compiler findings and are
+  disclosed rather than silently omitted.
+- `cargo test --workspace --offline` was attempted twice. Both runs progressed through the
+  changed `oc-cli` hook witnesses successfully, then the host refused to create more test-runner
+  resources while listing `oc-config` tests with `EAGAIN: Resource temporarily unavailable`.
+  The single permitted retry used `CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2` and hit the same host
+  limit. No third status check was made. This is an interrupted gate, not a test assertion failure.
+- `CARGO_BUILD_JOBS=2 cargo clippy --workspace --all-targets --offline` passed with zero warnings
+  after grouping internal-model resolution inputs into `ResolveInternalsInput`.
+- `cargo fmt --all --check` passed after applying the formatter.
+- The post-format focused regression `CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2 cargo test -p oc-cli
+  --lib --offline` passed: 87 passed, 0 failed, including the production compaction witness and
+  plugin-hook user-surface error witness.

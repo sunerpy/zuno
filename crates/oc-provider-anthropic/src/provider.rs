@@ -337,7 +337,8 @@ async fn start_stream(
     config: AnthropicConfig,
     request: CompletionRequest,
 ) -> Result<ProviderStream<'static>, ProviderError> {
-    let body = build_request_body(&request, &config)?;
+    let mut body = build_request_body(&request, &config)?;
+    request.apply_parameters(&mut body);
     let model = request.model_id;
     let provider = config.provider.clone();
     let mut endpoint = messages_endpoint(&config.base_url);
@@ -355,6 +356,9 @@ async fn start_stream(
         .header("content-type", "application/json")
         .header("accept", "text/event-stream");
     for (name, value) in &config.headers {
+        outgoing = outgoing.header(name, value);
+    }
+    for (name, value) in &request.headers {
         outgoing = outgoing.header(name, value);
     }
     outgoing = match &auth {

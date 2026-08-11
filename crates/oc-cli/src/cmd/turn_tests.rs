@@ -307,6 +307,7 @@ async fn replay_production_registration(
             max_output: 8_192,
         },
         state: &mut state,
+        hooks: &oc_engine::compaction::NoopCompactionHooks,
     };
     let text = oc_engine::prelude::summarize(&session.id, &mut context)
         .await
@@ -735,13 +736,17 @@ fn all_three_internals_resolve_with_the_roster_prompt_and_a_reachable_model() {
     let mut notes = Vec::new();
 
     // When: the internals are resolved.
+    let env = Env::empty();
     let internals = resolve_internals(
-        &config,
-        &catalog,
-        "test",
-        "big",
-        session_model,
-        &Env::empty(),
+        ResolveInternalsInput {
+            config: &config,
+            catalog: &catalog,
+            provider_id: "test",
+            model_id: "big",
+            session_model,
+            env: &env,
+            plugin_small_model: None,
+        },
         &mut notes,
     )
     .expect("every internal resolves");
@@ -776,13 +781,17 @@ fn the_resolved_set_is_exactly_what_the_roster_calls_internal() {
     let (catalog, config) = catalog_with_two_models_and_a_title_override();
     let session_model = catalog.model("test", "big").expect("the session model");
     let mut notes = Vec::new();
+    let env = Env::empty();
     let internals = resolve_internals(
-        &config,
-        &catalog,
-        "test",
-        "big",
-        session_model,
-        &Env::empty(),
+        ResolveInternalsInput {
+            config: &config,
+            catalog: &catalog,
+            provider_id: "test",
+            model_id: "big",
+            session_model,
+            env: &env,
+            plugin_small_model: None,
+        },
         &mut notes,
     )
     .expect("every internal resolves");
@@ -813,13 +822,17 @@ fn an_internal_pointed_at_another_provider_falls_back_and_says_why() {
     let session_model = catalog.model("test", "big").expect("the session model");
     let mut notes = Vec::new();
 
+    let env = Env::empty();
     let internals = resolve_internals(
-        &config,
-        &catalog,
-        "test",
-        "big",
-        session_model,
-        &Env::empty(),
+        ResolveInternalsInput {
+            config: &config,
+            catalog: &catalog,
+            provider_id: "test",
+            model_id: "big",
+            session_model,
+            env: &env,
+            plugin_small_model: None,
+        },
         &mut notes,
     )
     .expect("a declined override is not a failure");
@@ -1429,13 +1442,17 @@ fn an_internal_whose_model_has_no_endpoint_falls_back_and_says_why() {
     let mut notes = Vec::new();
 
     // When: the internals resolve.
+    let env = Env::empty();
     let internals = resolve_internals(
-        &config,
-        &catalog,
-        "test",
-        "big",
-        session_model,
-        &Env::empty(),
+        ResolveInternalsInput {
+            config: &config,
+            catalog: &catalog,
+            provider_id: "test",
+            model_id: "big",
+            session_model,
+            env: &env,
+            plugin_small_model: None,
+        },
         &mut notes,
     )
     .expect("an unreachable override is a downgrade, not a failure");
@@ -1536,6 +1553,9 @@ fn every_turn_error() -> Vec<TurnError> {
         TurnError::NestedToolUse { step: 4 },
         TurnError::ToolUseEndWithoutStart { step: 5 },
         TurnError::EventConsumerClosed,
+        TurnError::Hook(
+            "plugin `fixture-plugin` failed hook `chat.params`: fixture failure".to_owned(),
+        ),
         TurnError::Database(oc_error::DbError::Busy { retry_after: None }),
         TurnError::Provider(ProviderError::ContextLimit {
             limit_tokens: Some(200_000),
@@ -1605,6 +1625,7 @@ fn the_variant_table_covers_the_whole_enum() {
             TurnError::NestedToolUse { .. } => "NestedToolUse",
             TurnError::ToolUseEndWithoutStart { .. } => "ToolUseEndWithoutStart",
             TurnError::EventConsumerClosed => "EventConsumerClosed",
+            TurnError::Hook(_) => "Hook",
             TurnError::Database(_) => "Database",
             TurnError::Provider(_) => "Provider",
             TurnError::Cache(_) => "Cache",
@@ -1614,10 +1635,23 @@ fn the_variant_table_covers_the_whole_enum() {
 
     assert_eq!(
         named.len(),
-        12,
+        13,
         "the table covers only {named:?}; every variant needs a value or the rendering \
          claims above are vacuous for the ones missing"
     );
+}
+
+#[test]
+fn a_plugin_hook_failure_names_the_plugin_and_hook_on_the_user_surface() {
+    let error = TurnError::Hook(
+        "plugin `fixture-plugin` failed hook `chat.params`: fixture failure".to_owned(),
+    );
+
+    let rendered = describe_turn_failure(&error, None);
+
+    assert!(rendered.contains("fixture-plugin"), "{rendered}");
+    assert!(rendered.contains("chat.params"), "{rendered}");
+    assert!(rendered.contains("fixture failure"), "{rendered}");
 }
 
 /// A wrapped failure names its cause instead of only its class.

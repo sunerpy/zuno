@@ -2,6 +2,7 @@
 
 pub mod compaction;
 pub mod dispatch;
+pub mod hooks;
 pub mod interrupt;
 pub mod r#loop;
 pub mod prelude;
