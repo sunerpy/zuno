@@ -7,12 +7,13 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::error::Error;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const MINIMUM_TREE_COUNT: usize = 12;
 
-/// The matrix case criterion 2 names, shared by the matrix and its pure-mode pin.
-const REAL_USER_CASE: &str = "real-user-global-config";
+/// The drift-checked capture case derived from the path criterion 2 names.
+const REAL_USER_CAPTURE_CASE: &str = "real-user-global-config-capture";
+const LIVE_USER_CONFIG: &str = "/config/.config/opencode/opencode.json";
 
 const REQUIRED_COVERAGE: &[&str] = &[
     "global-only",
@@ -28,7 +29,7 @@ const REQUIRED_COVERAGE: &[&str] = &[
     "--pure",
     "jsonc-comments",
     "deep-ancestor-walk",
-    "real-user-config",
+    "real-user-config-capture",
     "legacy-tui-keys",
 ];
 
@@ -295,22 +296,60 @@ fn matrix() -> Result<Vec<MatrixCase>, Box<dyn Error>> {
                 "OPENCODE_PURE",
             ],
         ),
-        // The live file, byte-for-byte, legacy `theme` included. Rust used to exit 1
-        // on it while the released binary exited 0; nothing in the synthetic trees
-        // above carries that key, which is why every test passed anyway.
+        // A committed capture of the live global file, byte-for-byte at test time,
+        // legacy `theme` included. The named drift test below makes a changed or
+        // absent live file an explicit failure rather than letting this reproducible
+        // fixture silently masquerade as the current machine state.
         MatrixCase::config(
-            REAL_USER_CASE,
+            REAL_USER_CAPTURE_CASE,
             base_fixture()?
                 .global(&real_user_config())?
                 .env_var("OPENCODE_PURE", "1"),
-            &["real-user-config", "legacy-tui-keys"],
+            &["real-user-config-capture", "legacy-tui-keys"],
         ),
     ])
 }
 
+fn real_user_config_capture_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/user-config.json")
+}
+
 fn real_user_config() -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/user-config.json");
+    let path = real_user_config_capture_path();
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+#[test]
+fn real_user_config_capture_matches_live_file_byte_for_byte() {
+    let capture_path = real_user_config_capture_path();
+    let live_path = Path::new(LIVE_USER_CONFIG);
+    let capture = std::fs::read(&capture_path)
+        .unwrap_or_else(|error| panic!("read capture {}: {error}", capture_path.display()));
+    let live = std::fs::read(live_path).unwrap_or_else(|error| {
+        panic!(
+            "read live config {}: {error}; this gate must fail visibly when the machine-specific \
+             criterion-2 input is unavailable",
+            live_path.display()
+        )
+    });
+
+    if capture != live {
+        let first_difference = capture
+            .iter()
+            .zip(&live)
+            .position(|(captured, current)| captured != current)
+            .unwrap_or_else(|| capture.len().min(live.len()));
+        panic!(
+            "committed real-config capture {} drifted from live config {}: capture={} bytes, \
+             live={} bytes, first difference at byte {}. Refresh the capture deliberately and \
+             re-run the differential; never call a stale copy the live file.",
+            capture_path.display(),
+            live_path.display(),
+            capture.len(),
+            live.len(),
+            first_difference
+        );
+    }
 }
 
 #[test]
@@ -400,8 +439,8 @@ fn merged_config_matches_real_opencode_across_the_full_matrix() -> Result<(), Bo
 /// merged configuration in **pure mode**. A narrowing no test enforces is a
 /// waiver, so all three halves of the narrowing are asserted:
 ///
-/// 1. the real-user case the byte-exact matrix runs is *scoped* to pure mode, so
-///    silently reinterpreting the criterion as non-pure fails;
+/// 1. the drift-checked real-user capture the byte-exact matrix runs is *scoped*
+///    to pure mode, so silently reinterpreting the criterion as non-pure fails;
 /// 2. the excluded non-pure difference is declared in `docs/divergences.toml`
 ///    with **both** measured tree sizes, so a reader learns what was excluded and
 ///    a future difference outside those two trees is undeclared rather than
@@ -415,12 +454,12 @@ fn criterion_2_is_narrowed_to_pure_mode_and_the_non_pure_plugin_trees_are_declar
     let cases = matrix()?;
     let real_user = cases
         .iter()
-        .find(|case| case.name == REAL_USER_CASE)
+        .find(|case| case.name == REAL_USER_CAPTURE_CASE)
         .ok_or_else(|| {
             format!(
-                "the byte-exact matrix no longer contains a case named {REAL_USER_CASE}; \
-                 criterion 2 names the user's own config specifically, so the case cannot be \
-                 renamed away"
+                "the byte-exact matrix no longer contains a case named {REAL_USER_CAPTURE_CASE}; \
+                 criterion 2 names the user's own config specifically, so its drift-checked \
+                 capture cannot be removed"
             )
         })?;
     assert_eq!(
@@ -431,7 +470,7 @@ fn criterion_2_is_narrowed_to_pure_mode_and_the_non_pure_plugin_trees_are_declar
             .get("OPENCODE_PURE")
             .map(String::as_str),
         Some("1"),
-        "criterion 2 was narrowed to pure mode, so case {REAL_USER_CASE} must force \
+        "criterion 2 was narrowed to pure mode, so case {REAL_USER_CAPTURE_CASE} must force \
          OPENCODE_PURE=1. Without it this test would be asserting a scope the criterion no \
          longer claims, and the declared non-pure divergence below would be covering a \
          comparison that is once again required."
@@ -495,7 +534,7 @@ fn criterion_2_is_narrowed_to_pure_mode_and_the_non_pure_plugin_trees_are_declar
         divergence::NON_PURE_PLUGIN_TREES_ID
     );
     eprintln!(
-        "criterion 2: case {REAL_USER_CASE} scoped to OPENCODE_PURE=1; non-pure exclusion \
+        "criterion 2: case {REAL_USER_CAPTURE_CASE} scoped to OPENCODE_PURE=1; non-pure exclusion \
          declared as {} with {}-byte agent and {}-byte command trees measured on the oracle",
         divergence::NON_PURE_PLUGIN_TREES_ID,
         divergence::NON_PURE_AGENT_TREE_BYTES,

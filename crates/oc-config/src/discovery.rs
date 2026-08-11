@@ -580,7 +580,7 @@ fn process_username() -> String {
 }
 
 /// Strip JSONC comments and trailing commas without changing byte offsets.
-fn strip_jsonc(text: &str) -> String {
+pub fn strip_jsonc(text: &str) -> String {
     #[derive(Clone, Copy)]
     enum State {
         Normal,

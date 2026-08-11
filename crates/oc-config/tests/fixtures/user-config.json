@@ -1,10 +1,10 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "theme": "system",
   "compaction": {
     "auto": true,
     "prune": true
   },
+  "theme": "system",
   "mcp": {
     "adk-docs-mcp": {
       "command": [
@@ -49,11 +49,7 @@
       "type": "local"
     },
     "codegraph-mcp-server": {
-      "command": [
-        "codegraph",
-        "serve",
-        "--mcp"
-      ],
+      "command": ["codegraph", "serve", "--mcp"],
       "enabled": true,
       "type": "local"
     },
@@ -90,7 +86,8 @@
   },
   "plugin": [
     "opencode-antigravity-auth@1.6.0",
-    "@sunerpy/opencode-kiro-auth@0.18.0",
+    //"file:///config/workspace/ProdDir/AI/oh-my-openagent/packages/omo-opencode/src/index.ts",
+    "@sunerpy/opencode-kiro-auth@0.20.6",
     "@sunerpy/oh-my-openagent@4.21.0"
   ],
   "provider": {
@@ -150,14 +147,8 @@
             "output": 64000
           },
           "modalities": {
-            "input": [
-              "text",
-              "image",
-              "pdf"
-            ],
-            "output": [
-              "text"
-            ]
+            "input": ["text", "image", "pdf"],
+            "output": ["text"]
           },
           "name": "Claude Opus 4.5 Thinking (Antigravity)",
           "variants": {
@@ -179,14 +170,8 @@
             "output": 64000
           },
           "modalities": {
-            "input": [
-              "text",
-              "image",
-              "pdf"
-            ],
-            "output": [
-              "text"
-            ]
+            "input": ["text", "image", "pdf"],
+            "output": ["text"]
           },
           "name": "Claude Opus 4.6 Thinking (Antigravity)",
           "variants": {
@@ -208,14 +193,8 @@
             "output": 64000
           },
           "modalities": {
-            "input": [
-              "text",
-              "image",
-              "pdf"
-            ],
-            "output": [
-              "text"
-            ]
+            "input": ["text", "image", "pdf"],
+            "output": ["text"]
           },
           "name": "Claude Sonnet 4.5 (Antigravity)"
         },
@@ -225,14 +204,8 @@
             "output": 64000
           },
           "modalities": {
-            "input": [
-              "text",
-              "image",
-              "pdf"
-            ],
-            "output": [
-              "text"
-            ]
+            "input": ["text", "image", "pdf"],
+            "output": ["text"]
           },
           "name": "Claude Sonnet 4.5 Thinking (Antigravity)",
           "variants": {
@@ -254,14 +227,8 @@
             "output": 65536
           },
           "modalities": {
-            "input": [
-              "text",
-              "image",
-              "pdf"
-            ],
-            "output": [
-              "text"
-            ]
+            "input": ["text", "image", "pdf"],
+            "output": ["text"]
           },
           "name": "Gemini 3 Flash (Antigravity)",
           "variants": {
@@ -285,14 +252,8 @@
             "output": 65535
           },
           "modalities": {
-            "input": [
-              "text",
-              "image",
-              "pdf"
-            ],
-            "output": [
-              "text"
-            ]
+            "input": ["text", "image", "pdf"],
+            "output": ["text"]
           },
           "name": "Gemini 3 Pro (Antigravity)",
           "variants": {
@@ -310,14 +271,8 @@
             "output": 65535
           },
           "modalities": {
-            "input": [
-              "text",
-              "image",
-              "pdf"
-            ],
-            "output": [
-              "text"
-            ]
+            "input": ["text", "image", "pdf"],
+            "output": ["text"]
           },
           "name": "Gemini 3.1 Pro (Antigravity)",
           "variants": {
@@ -335,14 +290,8 @@
             "output": 65536
           },
           "modalities": {
-            "input": [
-              "text",
-              "image",
-              "pdf"
-            ],
-            "output": [
-              "text"
-            ]
+            "input": ["text", "image", "pdf"],
+            "output": ["text"]
           },
           "name": "Gemini 2.5 Flash (Gemini CLI)"
         },
@@ -352,14 +301,8 @@
             "output": 65536
           },
           "modalities": {
-            "input": [
-              "text",
-              "image",
-              "pdf"
-            ],
-            "output": [
-              "text"
-            ]
+            "input": ["text", "image", "pdf"],
+            "output": ["text"]
           },
           "name": "Gemini 2.5 Pro (Gemini CLI)"
         },
@@ -369,14 +312,8 @@
             "output": 65536
           },
           "modalities": {
-            "input": [
-              "text",
-              "image",
-              "pdf"
-            ],
-            "output": [
-              "text"
-            ]
+            "input": ["text", "image", "pdf"],
+            "output": ["text"]
           },
           "name": "Gemini 3 Flash Preview (Gemini CLI)"
         },
@@ -386,14 +323,8 @@
             "output": 65535
           },
           "modalities": {
-            "input": [
-              "text",
-              "image",
-              "pdf"
-            ],
-            "output": [
-              "text"
-            ]
+            "input": ["text", "image", "pdf"],
+            "output": ["text"]
           },
           "name": "Gemini 3 Pro Preview (Gemini CLI)"
         },
@@ -403,14 +334,8 @@
             "output": 65535
           },
           "modalities": {
-            "input": [
-              "text",
-              "image",
-              "pdf"
-            ],
-            "output": [
-              "text"
-            ]
+            "input": ["text", "image", "pdf"],
+            "output": ["text"]
           },
           "name": "Gemini 3.1 Pro Preview (Gemini CLI)"
         }

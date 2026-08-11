@@ -853,8 +853,9 @@ fn the_documented_examples_all_deserialize() {
 #[test]
 fn the_real_user_config_deserializes() {
     let text = fixture("user-config.json");
-    let mut before: Value = serde_json::from_str(&text).expect("valid JSON");
-    let config = parse(&text).expect("the user's own config must load");
+    let strict = crate::discovery::strip_jsonc(&text);
+    let mut before: Value = serde_json::from_str(&strict).expect("valid JSONC");
+    let config = parse(&strict).expect("the user's own config must load");
     let after = serde_json::to_value(&config).expect("serializes");
 
     // `theme` stays in the fixture: a copy that omits it is friendlier than the

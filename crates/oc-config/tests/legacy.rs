@@ -23,7 +23,8 @@ fn real_user_config() -> PathBuf {
 fn legacy_rejection_finds_nothing_in_the_real_user_config() {
     let source = real_user_config();
     let text = fs::read_to_string(&source).expect("the checked-in user config");
-    let value: Value = serde_json::from_str(&text).expect("valid JSON");
+    let strict = oc_config::discovery::strip_jsonc(&text);
+    let value: Value = serde_json::from_str(&strict).expect("valid JSONC");
 
     // A copy, so the scenario cannot be accused of touching the original.
     let dir = TempDir::new().expect("tempdir");
