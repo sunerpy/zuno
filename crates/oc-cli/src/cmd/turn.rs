@@ -558,9 +558,17 @@ impl TurnHost {
 
         let memory_root = worktree.as_deref().unwrap_or(&plan.directory);
         let command_worktree = memory_root.to_string_lossy();
+        let discovered_commands =
+            oc_catalog::command::load_map(&plan.directory, worktree.as_deref(), env)
+                .map_err(to_string)?;
+        let configured_commands = match plan.config.command.as_ref() {
+            Some(config) => oc_catalog::command::merge_command_maps(&discovered_commands, config)
+                .map_err(to_string)?,
+            None => discovered_commands,
+        };
         let commands = oc_catalog::command::Registry::build(
             &oc_catalog::command::Sources::new(&command_worktree)
-                .with_config(plan.config.command.as_ref()),
+                .with_config(Some(&configured_commands)),
         );
         configure_resident_memory(
             &mut plan.resolver,

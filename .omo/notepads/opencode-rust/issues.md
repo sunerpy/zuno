@@ -7175,3 +7175,24 @@ Chat fixture 证明 Responses 路径。请求 builder 与 decoder 的反向 muta
 Clippy 与 rustfmt 全部通过。集成 `lsp_diagnostics` 仍因固定 main-worktree cwd 拒绝 sibling worktree；
 同一 rust-analyzer 后端的原生 diagnostics 已完成，四个变更文件无错误或警告。完整记录见
 `.omo/evidence/task-157-opencode-rust.txt`。
+## [2026-08-11] Todo 161 — criterion 2 reaches exact pure-mode parity
+
+`debug config` now overlays the same runtime Markdown agent and command maps used by execution and
+emits source-ordered, identity-deduplicated `plugin_origins`. The production differential captures
+stdout through files because released 1.18.15 truncates piped output at exactly 65,536 bytes. After
+removing only released's empty deprecated `mode` diagnostic object, both normalized documents are
+252,891 bytes and exactly equal: 9 agents, 2 commands, and 3 plugin origins. No divergence entry was
+needed, `agent list` was not changed, and todo 153's live-file drift guard still passes.
+
+One runtime consequence surfaced during the first workspace gate: execution had not previously loaded
+Markdown commands, and a naive shared loader let its result outrank plugin `config` hook mutations.
+`TurnHost` now loads Markdown commands but overlays the final plugin-mutated `plan.config.command` last;
+`ordinary_plugin_lifecycle_hooks_run_through_the_real_binary` proves that precedence.
+
+The host could not complete a single monolithic workspace-test process: three attempts stopped only
+when Rust's test harness received `EAGAIN` (`Resource temporarily unavailable`) while listing tests,
+including with Cargo and test thread counts limited to one. No assertion failed before those stops.
+Targeted criterion-2, runtime-discovery, live-drift, plugin-lifecycle, provenance, catalog, and mutation
+checks all passed; `rust-analyzer diagnostics .`, workspace build, and `cargo check -p oc-cli --offline`
+also passed. Per the two-status-check ceiling, the environment failure was recorded rather than retried
+indefinitely.

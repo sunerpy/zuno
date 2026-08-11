@@ -522,7 +522,7 @@ fn debug_config_emits_only_resolved_json() {
     isolated(&mut command, root.path());
     command.env(
         "OPENCODE_CONFIG_CONTENT",
-        r#"{"username":"debug-user","share":"disabled"}"#,
+        r#"{"username":"debug-user","share":"disabled","plugin":["probe-plugin@1.0.0"]}"#,
     );
     let output = command.output().expect("debug config");
     assert!(
@@ -534,6 +534,109 @@ fn debug_config_emits_only_resolved_json() {
         serde_json::from_slice(&output.stdout).expect("stdout contains only JSON");
     assert_eq!(config["username"], "debug-user");
     assert_eq!(config["share"], "disabled");
+    assert_eq!(config["plugin"], serde_json::json!(["probe-plugin@1.0.0"]));
+    assert_eq!(
+        config["plugin_origins"],
+        serde_json::json!([{
+            "spec": "probe-plugin@1.0.0",
+            "source": "OPENCODE_CONFIG_CONTENT",
+            "scope": "local"
+        }])
+    );
+}
+
+#[test]
+fn debug_config_includes_runtime_markdown_agents_and_commands() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let config_dir = root.path().join("config/opencode");
+    let agent_file = config_dir.join("agent/powerapps/runtime-agent.md");
+    let command_file = config_dir.join("command/runtime-command.md");
+    std::fs::create_dir_all(agent_file.parent().expect("agent parent")).expect("agent directory");
+    std::fs::create_dir_all(command_file.parent().expect("command parent"))
+        .expect("command directory");
+    std::fs::write(
+        agent_file,
+        "---\ndescription: runtime agent\nmode: subagent\n---\nRuntime agent prompt.\n",
+    )
+    .expect("agent markdown");
+    std::fs::write(
+        command_file,
+        "---\ndescription: runtime command\nagent: build\n---\nRun $ARGUMENTS.\n",
+    )
+    .expect("command markdown");
+
+    let mut command = rust_binary();
+    command.args(["debug", "config"]);
+    isolated(&mut command, root.path());
+    command.env("OPENCODE_PURE", "1");
+    let output = command.output().expect("debug config");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout contains only JSON");
+    assert_eq!(
+        config["agent"]["powerapps/runtime-agent"]["prompt"],
+        "Runtime agent prompt."
+    );
+    assert_eq!(
+        config["command"]["runtime-command"]["template"],
+        "Run $ARGUMENTS."
+    );
+}
+
+#[test]
+fn criterion_2_pure_debug_config_matches_the_released_binary() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("workspace root");
+    let run = |binary: &Path| {
+        let stdout = tempfile::NamedTempFile::new().expect("stdout capture");
+        let stderr = tempfile::NamedTempFile::new().expect("stderr capture");
+        let mut command = Command::new(binary);
+        command
+            .args(["debug", "config"])
+            .current_dir(&workspace)
+            .env("OPENCODE_PURE", "1")
+            .env("OPENCODE_DISABLE_AUTOUPDATE", "true")
+            .env("OPENCODE_DISABLE_MODELS_FETCH", "true")
+            .stdout(stdout.reopen().expect("reopen stdout"))
+            .stderr(stderr.reopen().expect("reopen stderr"));
+        let status = command.status().expect("debug config");
+        let stdout = std::fs::read(stdout.path()).expect("read stdout");
+        let stderr = std::fs::read(stderr.path()).expect("read stderr");
+        (status, stdout, stderr)
+    };
+    let released = run(oracle());
+    let rust = run(&rust_path());
+    assert!(
+        released.0.success(),
+        "released debug config failed: {}",
+        String::from_utf8_lossy(&released.2)
+    );
+    assert!(
+        rust.0.success(),
+        "Rust debug config failed: {}",
+        String::from_utf8_lossy(&rust.2)
+    );
+
+    let mut expected: serde_json::Value =
+        serde_json::from_slice(&released.1).expect("released debug config JSON");
+    let mode = expected
+        .as_object_mut()
+        .expect("released config object")
+        .remove("mode");
+    assert_eq!(
+        mode,
+        Some(serde_json::json!({})),
+        "only the released binary's empty deprecated mode object is excluded"
+    );
+    let actual: serde_json::Value =
+        serde_json::from_slice(&rust.1).expect("Rust debug config JSON");
+    assert_eq!(actual, expected);
 }
 
 // ---------------------------------------------------------------------------

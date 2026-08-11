@@ -68,8 +68,12 @@
 #[cfg(test)]
 mod tests;
 
+use oc_config::Config;
+use oc_config::discovery::{DiscoveryOptions, discover_with, merge_layers};
 use oc_config::schema::CommandConfig;
 use oc_config::schema::ordered::OrderedMap;
+use oc_error::ConfigError;
+use oc_paths::{Env, Layout};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -78,6 +82,9 @@ pub const BUILTIN_INIT: &str = "init";
 
 /// The built-in `review` command's name (`command/index.ts:48`).
 pub const BUILTIN_REVIEW: &str = "review";
+
+/// Path prefixes excluded from derived command names.
+pub const COMMAND_DIRECTORY_PREFIXES: [&str; 2] = ["command/", "commands/"];
 
 /// `command/template/initialize.txt`, byte-identical to the oracle's copy.
 const TEMPLATE_INITIALIZE: &str = include_str!("command/initialize.txt");
@@ -309,6 +316,106 @@ pub fn sanitize(value: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Discover configured and Markdown-defined commands for one working directory.
+///
+/// # Errors
+///
+/// Returns configuration, filesystem, or Markdown schema failures.
+pub fn load_map(
+    directory: &Path,
+    worktree: Option<&Path>,
+    env: &Env,
+) -> Result<OrderedMap<CommandConfig>, ConfigError> {
+    let options = DiscoveryOptions::new(directory, worktree, env.clone());
+    let config = discover_with(&options)?;
+    let mut commands = config.command.unwrap_or_default();
+
+    let layout = Layout::resolve(env);
+    for dir in layout.config_directories(directory, worktree) {
+        for root_name in ["command", "commands"] {
+            let root = dir.join(root_name);
+            if !root.is_dir() {
+                continue;
+            }
+            for file in crate::agent::markdown_files(&root)? {
+                let Some((name, command)) = read_markdown_command(&dir, &file)? else {
+                    continue;
+                };
+                let mut overlay = OrderedMap::new();
+                overlay.insert(name, command);
+                commands = merge_command_maps(&commands, &overlay)?;
+            }
+        }
+    }
+
+    if let Some(text) = env.truthy_value("OPENCODE_CONFIG_CONTENT")
+        && let Ok(layer) = serde_json::from_str::<Config>(text)
+        && let Some(from_env) = layer.command
+    {
+        commands = merge_command_maps(&commands, &from_env)?;
+    }
+
+    Ok(commands)
+}
+
+fn read_markdown_command(
+    dir: &Path,
+    file: &Path,
+) -> Result<Option<(String, CommandConfig)>, ConfigError> {
+    let text = std::fs::read_to_string(file).map_err(|source| ConfigError::Io {
+        path: file.to_path_buf(),
+        source,
+    })?;
+    let Ok(document) = crate::agent::frontmatter::parse(&text) else {
+        tracing::warn!(
+            path = %file.display(),
+            "skipping command: its frontmatter could not be parsed"
+        );
+        return Ok(None);
+    };
+
+    let relative = crate::agent::relative_path(dir, file);
+    let derived = crate::agent::entry_name_from_path(&relative, &COMMAND_DIRECTORY_PREFIXES);
+    let mut object = document.data;
+    let name = object
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map_or(derived, str::to_owned);
+    object.insert(
+        "template".to_owned(),
+        serde_json::Value::String(document.content.trim().to_owned()),
+    );
+    let command = serde_json::from_value(serde_json::Value::Object(object)).map_err(|source| {
+        ConfigError::Json {
+            path: file.to_path_buf(),
+            source,
+        }
+    })?;
+    Ok(Some((name, command)))
+}
+
+/// Deep-merge `overlay` over `base` using configuration merge semantics.
+///
+/// # Errors
+///
+/// Returns an error if either map cannot be represented as configuration JSON.
+pub fn merge_command_maps(
+    base: &OrderedMap<CommandConfig>,
+    overlay: &OrderedMap<CommandConfig>,
+) -> Result<OrderedMap<CommandConfig>, ConfigError> {
+    let merged = merge_layers([
+        Config {
+            command: Some(base.clone()),
+            ..Config::default()
+        },
+        Config {
+            command: Some(overlay.clone()),
+            ..Config::default()
+        },
+    ])?;
+    Ok(merged.command.unwrap_or_default())
 }
 
 /// The four sources of commands, gathered so precedence cannot be misapplied.
