@@ -299,18 +299,29 @@ fn pinned_wire_spec(provider_id: &str, model_id: &str, endpoint: &str, expected_
     model_spec(&catalog, model, &Env::empty()).expect("pinned provider spec resolves")
 }
 
-async fn replay_selected_production_spec<F>(
-    provider_id: &str,
-    registry_key: &str,
-    model_id: &str,
-    cassette: &str,
-    endpoint_suffix: &str,
-    expected_body_key: &str,
-    expected_text: &str,
-    build_spec: F,
-) where
+struct ReplayCase<'a> {
+    provider_id: &'a str,
+    registry_key: &'a str,
+    model_id: &'a str,
+    cassette: &'a str,
+    endpoint_suffix: &'a str,
+    expected_body_key: &'a str,
+    expected_text: &'a str,
+}
+
+async fn replay_selected_production_spec<F>(case: ReplayCase<'_>, build_spec: F)
+where
     F: FnOnce(&str) -> Spec,
 {
+    let ReplayCase {
+        provider_id,
+        registry_key,
+        model_id,
+        cassette,
+        endpoint_suffix,
+        expected_body_key,
+        expected_text,
+    } = case;
     let scenario = oc_testkit::Scenario::new(provider_id)
         .on_path(endpoint_suffix)
         .from_oracle_cassette(cassette)
@@ -424,29 +435,43 @@ async fn replay_selected_production_spec<F>(
     mock.shutdown().await;
 }
 
-async fn replay_production_registration(
-    registry_key: &str,
-    npm: &str,
-    model_id: &str,
-    cassette: &str,
+struct RegistrationCase<'a> {
+    registry_key: &'a str,
+    npm: &'a str,
+    model_id: &'a str,
+    cassette: &'a str,
     extra_options: serde_json::Value,
-    endpoint_suffix: &str,
-    expected_body_key: &str,
-    expected_text: &str,
-) {
+    endpoint_suffix: &'a str,
+    expected_body_key: &'a str,
+    expected_text: &'a str,
+}
+
+async fn replay_production_registration(case: RegistrationCase<'_>) {
+    let RegistrationCase {
+        registry_key,
+        npm,
+        model_id,
+        cassette,
+        extra_options,
+        endpoint_suffix,
+        expected_body_key,
+        expected_text,
+    } = case;
     let provider_id = if registry_key == COMPATIBLE_PROVIDER {
         "wire-test"
     } else {
         registry_key
     };
     replay_selected_production_spec(
-        provider_id,
-        registry_key,
-        model_id,
-        cassette,
-        endpoint_suffix,
-        expected_body_key,
-        expected_text,
+        ReplayCase {
+            provider_id,
+            registry_key,
+            model_id,
+            cassette,
+            endpoint_suffix,
+            expected_body_key,
+            expected_text,
+        },
         |endpoint| production_wire_spec(provider_id, npm, model_id, endpoint, extra_options),
     )
     .await;
@@ -454,16 +479,16 @@ async fn replay_production_registration(
 
 #[tokio::test]
 async fn production_compatible_registration_dispatches_and_decodes_recorded_sse() {
-    replay_production_registration(
-        COMPATIBLE_PROVIDER,
-        "@ai-sdk/openai-compatible",
-        "deepseek-chat",
-        "openai-compatible-chat/deepseek-streams-text",
-        serde_json::json!({}),
-        "/v1/chat/completions",
-        "messages",
-        "Hello!",
-    )
+    replay_production_registration(RegistrationCase {
+        registry_key: COMPATIBLE_PROVIDER,
+        npm: "@ai-sdk/openai-compatible",
+        model_id: "deepseek-chat",
+        cassette: "openai-compatible-chat/deepseek-streams-text",
+        extra_options: serde_json::json!({}),
+        endpoint_suffix: "/v1/chat/completions",
+        expected_body_key: "messages",
+        expected_text: "Hello!",
+    })
     .await;
 }
 
@@ -512,13 +537,15 @@ fn an_unknown_transport_is_refused_from_resolved_config() {
 #[tokio::test]
 async fn production_openrouter_keeps_router_identity_and_dispatches_recorded_sse() {
     replay_selected_production_spec(
-        "openrouter",
-        COMPATIBLE_PROVIDER,
-        "openai/gpt-4o-mini",
-        "openai-compatible-chat/openrouter-streams-text",
-        "/v1/chat/completions",
-        "messages",
-        "Hello!",
+        ReplayCase {
+            provider_id: "openrouter",
+            registry_key: COMPATIBLE_PROVIDER,
+            model_id: "openai/gpt-4o-mini",
+            cassette: "openai-compatible-chat/openrouter-streams-text",
+            endpoint_suffix: "/v1/chat/completions",
+            expected_body_key: "messages",
+            expected_text: "Hello!",
+        },
         |endpoint| {
             production_wire_spec(
                 "openrouter",
@@ -535,13 +562,15 @@ async fn production_openrouter_keeps_router_identity_and_dispatches_recorded_sse
 #[tokio::test]
 async fn production_azure_selector_dispatches_to_responses() {
     replay_selected_production_spec(
-        "azure",
-        COMPATIBLE_PROVIDER,
-        "deployment-a",
-        "openai-responses/gpt-5-5-streams-text",
-        "/v1/responses",
-        "input",
-        "Hello!",
+        ReplayCase {
+            provider_id: "azure",
+            registry_key: COMPATIBLE_PROVIDER,
+            model_id: "deployment-a",
+            cassette: "openai-responses/gpt-5-5-streams-text",
+            endpoint_suffix: "/v1/responses",
+            expected_body_key: "input",
+            expected_text: "Hello!",
+        },
         |endpoint| {
             production_wire_spec(
                 "azure",
@@ -572,13 +601,15 @@ async fn production_copilot_rule_dispatches_by_model_id() {
         ),
     ] {
         replay_selected_production_spec(
-            "github-copilot",
-            COMPATIBLE_PROVIDER,
-            model_id,
-            cassette,
-            endpoint_suffix,
-            expected_body_key,
-            "Hello!",
+            ReplayCase {
+                provider_id: "github-copilot",
+                registry_key: COMPATIBLE_PROVIDER,
+                model_id,
+                cassette,
+                endpoint_suffix,
+                expected_body_key,
+                expected_text: "Hello!",
+            },
             |endpoint| {
                 production_wire_spec(
                     "github-copilot",
@@ -596,13 +627,15 @@ async fn production_copilot_rule_dispatches_by_model_id() {
 #[tokio::test]
 async fn pinned_groq_transport_selects_compatible_factory_and_dispatches() {
     replay_selected_production_spec(
-        "groq",
-        COMPATIBLE_PROVIDER,
-        "allam-2-7b",
-        "openai-compatible-chat/groq-streams-text",
-        "/v1/chat/completions",
-        "messages",
-        "Hello!",
+        ReplayCase {
+            provider_id: "groq",
+            registry_key: COMPATIBLE_PROVIDER,
+            model_id: "allam-2-7b",
+            cassette: "openai-compatible-chat/groq-streams-text",
+            endpoint_suffix: "/v1/chat/completions",
+            expected_body_key: "messages",
+            expected_text: "Hello!",
+        },
         |endpoint| pinned_wire_spec("groq", "allam-2-7b", endpoint, "@ai-sdk/groq"),
     )
     .await;
@@ -611,13 +644,15 @@ async fn pinned_groq_transport_selects_compatible_factory_and_dispatches() {
 #[tokio::test]
 async fn pinned_mistral_transport_selects_compatible_factory_and_dispatches() {
     replay_selected_production_spec(
-        "mistral",
-        COMPATIBLE_PROVIDER,
-        "codestral-latest",
-        "openai-compatible-chat/togetherai-streams-text",
-        "/v1/chat/completions",
-        "messages",
-        "Hello!",
+        ReplayCase {
+            provider_id: "mistral",
+            registry_key: COMPATIBLE_PROVIDER,
+            model_id: "codestral-latest",
+            cassette: "openai-compatible-chat/togetherai-streams-text",
+            endpoint_suffix: "/v1/chat/completions",
+            expected_body_key: "messages",
+            expected_text: "Hello!",
+        },
         |endpoint| pinned_wire_spec("mistral", "codestral-latest", endpoint, "@ai-sdk/mistral"),
     )
     .await;
@@ -625,118 +660,118 @@ async fn pinned_mistral_transport_selects_compatible_factory_and_dispatches() {
 
 #[tokio::test]
 async fn production_anthropic_registration_dispatches_and_decodes_recorded_sse() {
-    replay_production_registration(
-        "anthropic",
-        "@ai-sdk/anthropic",
-        "claude-haiku-4-5-20251001",
-        "anthropic-messages/streams-text",
-        serde_json::json!({"maxTokens": 20, "promptCache": false}),
-        "/v1/messages",
-        "messages",
-        "Hello!",
-    )
+    replay_production_registration(RegistrationCase {
+        registry_key: "anthropic",
+        npm: "@ai-sdk/anthropic",
+        model_id: "claude-haiku-4-5-20251001",
+        cassette: "anthropic-messages/streams-text",
+        extra_options: serde_json::json!({"maxTokens": 20, "promptCache": false}),
+        endpoint_suffix: "/v1/messages",
+        expected_body_key: "messages",
+        expected_text: "Hello!",
+    })
     .await;
 }
 
 #[tokio::test]
 async fn production_openai_registration_dispatches_and_decodes_recorded_responses_sse() {
-    replay_production_registration(
-        "openai",
-        "@ai-sdk/openai",
-        "gpt-5.5",
-        "openai-responses/gpt-5-5-streams-text",
-        serde_json::json!({"maxTokens": 80}),
-        "/v1/responses",
-        "input",
-        "Hello!",
-    )
+    replay_production_registration(RegistrationCase {
+        registry_key: "openai",
+        npm: "@ai-sdk/openai",
+        model_id: "gpt-5.5",
+        cassette: "openai-responses/gpt-5-5-streams-text",
+        extra_options: serde_json::json!({"maxTokens": 80}),
+        endpoint_suffix: "/v1/responses",
+        expected_body_key: "input",
+        expected_text: "Hello!",
+    })
     .await;
 }
 
 #[tokio::test]
 async fn production_bedrock_registration_dispatches_and_decodes_recorded_eventstream() {
-    replay_production_registration(
-        "amazon-bedrock",
-        "@ai-sdk/amazon-bedrock",
-        "us.amazon.nova-micro-v1:0",
-        "bedrock-converse/streams-text",
-        serde_json::json!({
+    replay_production_registration(RegistrationCase {
+        registry_key: "amazon-bedrock",
+        npm: "@ai-sdk/amazon-bedrock",
+        model_id: "us.amazon.nova-micro-v1:0",
+        cassette: "bedrock-converse/streams-text",
+        extra_options: serde_json::json!({
             "region": "us-east-1",
             "accessKeyId": "AKIAREPLAY",
             "secretAccessKey": "replay-secret"
         }),
-        "/model/us.amazon.nova-micro-v1%3A0/converse-stream",
-        "messages",
-        "Hello",
-    )
+        endpoint_suffix: "/model/us.amazon.nova-micro-v1%3A0/converse-stream",
+        expected_body_key: "messages",
+        expected_text: "Hello",
+    })
     .await;
 }
 
 #[tokio::test]
 async fn production_bedrock_mantle_registration_dispatches_and_decodes_recorded_eventstream() {
-    replay_production_registration(
-        "amazon-bedrock/mantle",
-        "@ai-sdk/amazon-bedrock/mantle",
-        "openai.gpt-oss-120b",
-        "bedrock-converse/streams-text",
-        serde_json::json!({
+    replay_production_registration(RegistrationCase {
+        registry_key: "amazon-bedrock/mantle",
+        npm: "@ai-sdk/amazon-bedrock/mantle",
+        model_id: "openai.gpt-oss-120b",
+        cassette: "bedrock-converse/streams-text",
+        extra_options: serde_json::json!({
             "region": "us-east-1",
             "accessKeyId": "AKIAREPLAY",
             "secretAccessKey": "replay-secret"
         }),
-        "/model/openai.gpt-oss-120b/converse-stream",
-        "messages",
-        "Hello",
-    )
+        endpoint_suffix: "/model/openai.gpt-oss-120b/converse-stream",
+        expected_body_key: "messages",
+        expected_text: "Hello",
+    })
     .await;
 }
 
 #[tokio::test]
 async fn production_google_registration_dispatches_and_decodes_recorded_gemini_sse() {
-    replay_production_registration(
-        "google",
-        "@ai-sdk/google",
-        "gemini-2.5-flash",
-        "gemini/streams-text",
-        serde_json::json!({}),
-        "/models/gemini-2.5-flash:streamGenerateContent",
-        "contents",
-        "Hello!",
-    )
+    replay_production_registration(RegistrationCase {
+        registry_key: "google",
+        npm: "@ai-sdk/google",
+        model_id: "gemini-2.5-flash",
+        cassette: "gemini/streams-text",
+        extra_options: serde_json::json!({}),
+        endpoint_suffix: "/models/gemini-2.5-flash:streamGenerateContent",
+        expected_body_key: "contents",
+        expected_text: "Hello!",
+    })
     .await;
 }
 
 #[tokio::test]
 async fn production_vertex_gemini_registration_dispatches_and_decodes_recorded_gemini_sse() {
-    replay_production_registration(
-        "google-vertex",
-        "@ai-sdk/google-vertex",
-        "gemini-2.5-flash",
-        "gemini/streams-text",
-        serde_json::json!({"project": "project-a", "location": "us-central1"}),
-        "/models/gemini-2.5-flash:streamGenerateContent",
-        "contents",
-        "Hello!",
-    )
+    replay_production_registration(RegistrationCase {
+        registry_key: "google-vertex",
+        npm: "@ai-sdk/google-vertex",
+        model_id: "gemini-2.5-flash",
+        cassette: "gemini/streams-text",
+        extra_options: serde_json::json!({"project": "project-a", "location": "us-central1"}),
+        endpoint_suffix: "/models/gemini-2.5-flash:streamGenerateContent",
+        expected_body_key: "contents",
+        expected_text: "Hello!",
+    })
     .await;
 }
 
 #[tokio::test]
 async fn production_vertex_anthropic_registration_dispatches_and_decodes_recorded_anthropic_sse() {
-    replay_production_registration(
-        "google-vertex/anthropic",
-        "@ai-sdk/google-vertex/anthropic",
-        "claude-haiku-4-5-20251001",
-        "anthropic-messages/streams-text",
-        serde_json::json!({
+    replay_production_registration(RegistrationCase {
+        registry_key: "google-vertex/anthropic",
+        npm: "@ai-sdk/google-vertex/anthropic",
+        model_id: "claude-haiku-4-5-20251001",
+        cassette: "anthropic-messages/streams-text",
+        extra_options: serde_json::json!({
             "project": "project-a",
             "location": "us",
             "maxTokens": 20
         }),
-        "/claude-haiku-4-5-20251001:streamRawPredict",
-        "messages",
-        "Hello!",
-    )
+        endpoint_suffix: "/claude-haiku-4-5-20251001:streamRawPredict",
+        expected_body_key: "messages",
+        expected_text: "Hello!",
+    })
     .await;
 }
 
