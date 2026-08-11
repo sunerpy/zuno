@@ -147,7 +147,7 @@ export default {
     },
     "experimental.chat.messages.transform": async (_input, output) => {
       const user = output.messages.find((message) => message.info.role === "user");
-      user.info.content[0].text += ":messages";
+      user.parts[0].text += ":messages";
     },
     "experimental.chat.system.transform": async (_input, output) => {
       output.system.push("system-hook-sentinel");
