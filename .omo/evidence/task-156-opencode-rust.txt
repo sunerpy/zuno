@@ -1,0 +1,71 @@
+Task 156 — send and decode the real Responses shape on Responses surfaces
+Closes F4's wave-9 blocker 2.
+
+THE DEFECT
+--------------------------------------------------------------------------------
+`CompatibleProvider` selected `/responses` for Responses surfaces but still used
+the Chat Completions body and decoder on the wire. The request always contained
+`messages`, and the stream translator only understood `choices[].delta`. The
+production Azure/Copilot tests hid this by mounting a Chat cassette on a
+Responses endpoint.
+
+THE FIX
+--------------------------------------------------------------------------------
+`RequestBody::build` now dispatches on the already-resolved `ApiSurface`:
+
+- Chat surfaces retain `messages`, Chat-form tools, and the existing quirks.
+- Responses surfaces emit `input`, Responses-form tools, and
+  `max_output_tokens`.
+- Reasoning, tool calls/results, images, and protected reasoning content are
+  mapped into their Responses wire forms without changing provider identity,
+  endpoint, URL, or header selection.
+
+`CompatibleProvider::stream` resolves the same surface before decoding and
+uses `SurfaceTranslator`. Chat continues through `ChunkTranslator`; Responses
+uses `ResponsesTranslator`, which handles typed `response.*` text, reasoning,
+function-call, terminal, usage, `[DONE]`, and wire-error events.
+
+The production replay helpers now assert the request discriminant. Azure and
+Copilot `gpt-5` Responses routes replay
+`openai-responses/gpt-5-5-streams-text`; Chat routes continue to replay Chat
+recordings. No Chat cassette remains mounted as evidence for those Responses
+routes.
+
+MUTATION PROOF
+--------------------------------------------------------------------------------
+1. Forced a Responses surface through the Chat request builder.
+   `responses_surface_uses_input_and_max_output_tokens_not_chat_fields` failed.
+2. Forced a Responses surface through the Chat stream decoder.
+   `responses_events_decode_text_reasoning_tools_and_usage` failed.
+
+Both mutations were restored before the final gates.
+
+FINAL VERIFICATION
+--------------------------------------------------------------------------------
+Changed-file `lsp_diagnostics`: no findings in all five changed Rust files.
+The sibling-worktree path restriction was handled with a temporary validation
+copy under the request workspace; the copy was removed afterwards.
+
+  cargo test -p oc-provider-compatible --offline
+    PASS — 61 unit tests plus all integration targets
+
+  CARGO_BUILD_JOBS=2 cargo test --workspace --offline -- --test-threads=1
+    PASS
+
+  CARGO_BUILD_JOBS=2 cargo clippy --workspace --all-targets --offline
+    PASS (exit 0; only the pre-existing test-helper argument-count warning)
+
+  cargo fmt --all --check
+    PASS
+
+The first ordinary-concurrency workspace attempt hit the host process limit
+with `EAGAIN (Resource temporarily unavailable)`. The documented low-concurrency
+rerun above completed successfully; this was a host resource limit, not a test
+failure. Full captured output:
+`/config/.local/share/opencode/tool-output/tool_ff2a1e2f5001y0kv5OcrehuqgN`
+
+SCOPE
+--------------------------------------------------------------------------------
+No dependency or `transport.rs` change was made. Todo 152's provider identity,
+fifteen-identity transport table, provider-specific headers, URL rules, and
+quirks remain intact.

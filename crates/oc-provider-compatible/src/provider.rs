@@ -30,7 +30,7 @@ use serde_json::{Map, Value};
 use crate::family::{self, Profile, UnsupportedProvider};
 use crate::quirks::Quirks;
 use crate::request::{RequestBody, Sampling};
-use crate::stream::ChunkTranslator;
+use crate::stream::SurfaceTranslator;
 use crate::surface::endpoint_path;
 use crate::transport::{HttpRequest, Transport};
 
@@ -237,6 +237,7 @@ impl Provider for CompatibleProvider {
     }
 
     fn stream(&self, request: CompletionRequest) -> ProviderStream<'_> {
+        let surface = self.quirks_for(&request.model_id, request.surface).surface;
         let http = self.http_request(&request);
         let provider = self.spec.provider.clone();
         let model = request.model_id.clone();
@@ -246,7 +247,7 @@ impl Provider for CompatibleProvider {
         Box::pin(
             futures::stream::once(async move {
                 match transport.send(http).await {
-                    Ok(chunks) => translate(chunks, provider, model, idle).left_stream(),
+                    Ok(chunks) => translate(chunks, provider, model, surface, idle).left_stream(),
                     Err(error) => futures::stream::once(async move { Err(error) }).right_stream(),
                 }
             })
@@ -264,12 +265,13 @@ fn translate(
     chunks: crate::transport::ChunkStream,
     provider: String,
     model: String,
+    surface: ApiSurface,
     idle: StreamIdleTimeout,
 ) -> impl futures::Stream<Item = Result<StreamEvent, ProviderError>> + Send {
     struct State {
         chunks: crate::transport::ChunkStream,
         parser: SseParser,
-        translator: ChunkTranslator,
+        translator: SurfaceTranslator,
         pending: std::collections::VecDeque<StreamEvent>,
         provider: String,
         model: String,
@@ -280,7 +282,7 @@ fn translate(
     let state = State {
         chunks,
         parser: SseParser::new(),
-        translator: ChunkTranslator::new(provider.clone(), model.clone()),
+        translator: SurfaceTranslator::new(provider.clone(), model.clone(), surface),
         pending: std::collections::VecDeque::new(),
         provider,
         model,

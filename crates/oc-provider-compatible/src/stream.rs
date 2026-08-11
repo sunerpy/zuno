@@ -1,4 +1,4 @@
-//! Translating recorded chat-completions chunks into the shared event vocabulary.
+//! Translating Chat Completions and Responses frames into shared events.
 //!
 //! # What this module is not
 //!
@@ -23,12 +23,53 @@
 //! 3. **End of message.** Either a `finish_reason` or the `[DONE]` sentinel; both
 //!    appear, and some vendors send only one.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use oc_error::ProviderError;
-use oc_llm::registry::{FinishReason, StreamEvent};
+use oc_llm::registry::{ApiSurface, FinishReason, StreamEvent};
+use serde::Deserialize;
 
 use crate::wire::{ChatChunk, ChunkDelta, DONE_SENTINEL, WireError};
+
+/// Selects the decoder that matches the resolved request surface.
+#[derive(Debug)]
+pub enum SurfaceTranslator {
+    /// Chat Completions `choices[].delta` frames.
+    Chat(ChunkTranslator),
+    /// Responses typed `response.*` events.
+    Responses(ResponsesTranslator),
+}
+
+impl SurfaceTranslator {
+    /// A translator for one resolved request surface.
+    #[must_use]
+    pub fn new(provider: impl Into<String>, model: impl Into<String>, surface: ApiSurface) -> Self {
+        let provider = provider.into();
+        let model = model.into();
+        if surface == ApiSurface::Responses {
+            Self::Responses(ResponsesTranslator::new(provider, model))
+        } else {
+            Self::Chat(ChunkTranslator::new(provider, model))
+        }
+    }
+
+    /// Translate one complete SSE `data:` payload.
+    pub fn frame(&mut self, data: &str) -> Result<Vec<StreamEvent>, ProviderError> {
+        match self {
+            Self::Chat(translator) => translator.frame(data),
+            Self::Responses(translator) => translator.frame(data),
+        }
+    }
+
+    /// Close any protocol state left open at EOF.
+    pub fn finish(&mut self) -> Vec<StreamEvent> {
+        match self {
+            Self::Chat(translator) => translator.finish(),
+            Self::Responses(translator) => translator.finish(),
+        }
+    }
+}
 
 /// Turns chat-completions frames into [`StreamEvent`]s, holding the block state
 /// the wire format leaves implicit.
@@ -212,6 +253,310 @@ impl ChunkTranslator {
     }
 }
 
+/// Turns typed Responses events into [`StreamEvent`]s.
+#[derive(Debug)]
+pub struct ResponsesTranslator {
+    provider: String,
+    model: String,
+    reasoning: BTreeMap<String, ActiveReasoning>,
+    tools: BTreeMap<String, ActiveTool>,
+    saw_tool: bool,
+    ended: bool,
+    done: bool,
+}
+
+impl ResponsesTranslator {
+    /// A translator for one Responses request.
+    #[must_use]
+    pub fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+            reasoning: BTreeMap::new(),
+            tools: BTreeMap::new(),
+            saw_tool: false,
+            ended: false,
+            done: false,
+        }
+    }
+
+    /// Translate one complete SSE `data:` payload.
+    pub fn frame(&mut self, data: &str) -> Result<Vec<StreamEvent>, ProviderError> {
+        let trimmed = data.trim();
+        if trimmed.is_empty() {
+            return Ok(Vec::new());
+        }
+        if trimmed == DONE_SENTINEL {
+            self.done = true;
+            return Ok(self.finish());
+        }
+        let event: ResponsesEvent = serde_json::from_str(trimmed).map_err(|source| {
+            ProviderError::fatal(MalformedResponsesEvent {
+                provider: self.provider.clone(),
+                model: self.model.clone(),
+                source,
+            })
+        })?;
+        match event {
+            ResponsesEvent::OutputTextDelta { delta } => Ok(vec![StreamEvent::TextDelta(delta)]),
+            ResponsesEvent::ReasoningSummaryPartAdded { item_id } => {
+                let reasoning = self.reasoning.entry(item_id).or_default();
+                if reasoning.open {
+                    Ok(Vec::new())
+                } else {
+                    reasoning.open = true;
+                    Ok(vec![StreamEvent::ReasoningStart])
+                }
+            }
+            ResponsesEvent::ReasoningSummaryTextDelta { item_id, delta } => {
+                let reasoning = self.reasoning.entry(item_id).or_default();
+                let mut events = Vec::new();
+                if !reasoning.open {
+                    reasoning.open = true;
+                    events.push(StreamEvent::ReasoningStart);
+                }
+                reasoning.current_summary.push_str(&delta);
+                events.push(StreamEvent::ReasoningDelta(delta));
+                Ok(events)
+            }
+            ResponsesEvent::ReasoningSummaryTextDone { item_id, text } => {
+                let reasoning = self.reasoning.entry(item_id).or_default();
+                let summary = if text.is_empty() {
+                    std::mem::take(&mut reasoning.current_summary)
+                } else {
+                    reasoning.current_summary.clear();
+                    text
+                };
+                if !summary.is_empty() {
+                    reasoning.summary.push(summary);
+                }
+                Ok(Vec::new())
+            }
+            ResponsesEvent::OutputItemAdded { item } => self.item_added(item),
+            ResponsesEvent::FunctionCallArgumentsDelta { item_id, delta } => {
+                if let Some(tool) = self.tools.get_mut(&item_id) {
+                    tool.arguments.push_str(&delta);
+                }
+                Ok(vec![StreamEvent::ToolInputDelta(delta)])
+            }
+            ResponsesEvent::OutputItemDone { item } => self.item_done(item),
+            ResponsesEvent::Completed { response } => Ok(self.complete(response, false)),
+            ResponsesEvent::Incomplete { response } => {
+                Ok(self.terminal(response, FinishReason::Length))
+            }
+            ResponsesEvent::Failed { response } => Ok(self.terminal(response, FinishReason::Error)),
+            ResponsesEvent::Error { error } => Err(classify(&self.provider, &error)),
+            ResponsesEvent::Other => Ok(Vec::new()),
+        }
+    }
+
+    /// Close a Responses stream that ended without a terminal event.
+    pub fn finish(&mut self) -> Vec<StreamEvent> {
+        if self.ended {
+            Vec::new()
+        } else {
+            self.terminal(ResponseEnvelope::default(), FinishReason::Unknown)
+        }
+    }
+
+    fn item_added(&mut self, item: ResponseItem) -> Result<Vec<StreamEvent>, ProviderError> {
+        match item.kind.as_str() {
+            "reasoning" => {
+                self.reasoning.entry(item.id).or_default();
+                Ok(Vec::new())
+            }
+            "function_call" => {
+                self.saw_tool = true;
+                let item_id = item.id;
+                let call_id = item.call_id.unwrap_or_default();
+                let name = item.name.unwrap_or_default();
+                self.tools.insert(
+                    item_id,
+                    ActiveTool {
+                        arguments: item.arguments.unwrap_or_default(),
+                    },
+                );
+                Ok(vec![StreamEvent::ToolUseStart { id: call_id, name }])
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn item_done(&mut self, item: ResponseItem) -> Result<Vec<StreamEvent>, ProviderError> {
+        match item.kind.as_str() {
+            "reasoning" => {
+                let mut reasoning = self.reasoning.remove(&item.id).unwrap_or_default();
+                let mut events = Vec::new();
+                if reasoning.open {
+                    events.push(StreamEvent::ReasoningEnd);
+                }
+                if let Some(summary) = item.summary {
+                    reasoning.summary = summary.into_iter().filter_map(|part| part.text).collect();
+                } else if !reasoning.current_summary.is_empty() {
+                    reasoning.summary.push(reasoning.current_summary);
+                }
+                events.push(StreamEvent::ProviderReasoningItem {
+                    id: item.id,
+                    summary: reasoning.summary,
+                    encrypted_content: item.encrypted_content,
+                    status: item.status,
+                });
+                Ok(events)
+            }
+            "function_call" => {
+                self.tools.remove(&item.id);
+                Ok(vec![StreamEvent::ToolUseEnd])
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn complete(&mut self, response: ResponseEnvelope, force_stop: bool) -> Vec<StreamEvent> {
+        let reason = if self.saw_tool && !force_stop {
+            FinishReason::ToolCalls
+        } else {
+            FinishReason::Stop
+        };
+        self.terminal(response, reason)
+    }
+
+    fn terminal(&mut self, response: ResponseEnvelope, reason: FinishReason) -> Vec<StreamEvent> {
+        if self.ended {
+            return Vec::new();
+        }
+        self.ended = true;
+        self.done = true;
+        let mut events = vec![StreamEvent::MessageEnd {
+            stop_reason: Some(reason),
+        }];
+        if let Some(usage) = response.usage {
+            events.push(StreamEvent::TokenUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cache_read_input_tokens: usage
+                    .input_tokens_details
+                    .and_then(|details| details.cached_tokens),
+                cache_write_input_tokens: None,
+            });
+        }
+        events
+    }
+}
+
+#[derive(Debug, Default)]
+struct ActiveReasoning {
+    open: bool,
+    current_summary: String,
+    summary: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ActiveTool {
+    arguments: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum ResponsesEvent {
+    #[serde(rename = "response.output_text.delta")]
+    OutputTextDelta { delta: String },
+    #[serde(rename = "response.reasoning_summary_part.added")]
+    ReasoningSummaryPartAdded { item_id: String },
+    #[serde(rename = "response.reasoning_summary_text.delta")]
+    ReasoningSummaryTextDelta { item_id: String, delta: String },
+    #[serde(rename = "response.reasoning_summary_text.done")]
+    ReasoningSummaryTextDone { item_id: String, text: String },
+    #[serde(rename = "response.output_item.added")]
+    OutputItemAdded { item: ResponseItem },
+    #[serde(rename = "response.function_call_arguments.delta")]
+    FunctionCallArgumentsDelta { item_id: String, delta: String },
+    #[serde(rename = "response.output_item.done")]
+    OutputItemDone { item: ResponseItem },
+    #[serde(rename = "response.completed")]
+    Completed { response: ResponseEnvelope },
+    #[serde(rename = "response.incomplete")]
+    Incomplete { response: ResponseEnvelope },
+    #[serde(rename = "response.failed")]
+    Failed { response: ResponseEnvelope },
+    #[serde(rename = "error")]
+    Error {
+        #[serde(flatten)]
+        error: WireError,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponseItem {
+    id: String,
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    call_id: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+    #[serde(default)]
+    encrypted_content: Option<String>,
+    #[serde(default)]
+    summary: Option<Vec<SummaryPart>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SummaryPart {
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ResponseEnvelope {
+    #[serde(default)]
+    usage: Option<ResponseUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponseUsage {
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
+    #[serde(default)]
+    input_tokens_details: Option<ResponseTokenDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponseTokenDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+}
+
+#[derive(Debug)]
+struct MalformedResponsesEvent {
+    provider: String,
+    model: String,
+    source: serde_json::Error,
+}
+
+impl std::fmt::Display for MalformedResponsesEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "provider `{}` model `{}` sent a Responses event that is not valid JSON: {}",
+            self.provider, self.model, self.source
+        )
+    }
+}
+
+impl std::error::Error for MalformedResponsesEvent {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// Map a wire finish reason onto the shared vocabulary.
 ///
 /// This is a match on an enumerated protocol value, not text classification: the
@@ -315,6 +660,60 @@ mod tests {
         }
         events.extend(translator.finish());
         events
+    }
+
+    fn translate_responses(frames: &[&str]) -> Vec<StreamEvent> {
+        let mut translator = SurfaceTranslator::new("test", "model", ApiSurface::Responses);
+        let mut events = Vec::new();
+        for frame in frames {
+            events.extend(translator.frame(frame).expect("frame translates"));
+        }
+        events.extend(translator.finish());
+        events
+    }
+
+    #[test]
+    fn responses_events_decode_text_reasoning_tools_and_usage() {
+        let events = translate_responses(&[
+            r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_1","delta":"Think"}"#,
+            r#"{"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","summary":[{"type":"summary_text","text":"Think"}],"encrypted_content":"opaque","status":"completed"}}"#,
+            r#"{"type":"response.output_text.delta","delta":"Hello"}"#,
+            r#"{"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":""}}"#,
+            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"q\":1}"}"#,
+            r#"{"type":"response.output_item.done","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"q\":1}"}}"#,
+            r#"{"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":4,"input_tokens_details":{"cached_tokens":3}}}}"#,
+        ]);
+
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ReasoningStart,
+                StreamEvent::ReasoningDelta("Think".to_owned()),
+                StreamEvent::ReasoningEnd,
+                StreamEvent::ProviderReasoningItem {
+                    id: "rs_1".to_owned(),
+                    summary: vec!["Think".to_owned()],
+                    encrypted_content: Some("opaque".to_owned()),
+                    status: Some("completed".to_owned()),
+                },
+                StreamEvent::TextDelta("Hello".to_owned()),
+                StreamEvent::ToolUseStart {
+                    id: "call_1".to_owned(),
+                    name: "lookup".to_owned(),
+                },
+                StreamEvent::ToolInputDelta("{\"q\":1}".to_owned()),
+                StreamEvent::ToolUseEnd,
+                StreamEvent::MessageEnd {
+                    stop_reason: Some(FinishReason::ToolCalls),
+                },
+                StreamEvent::TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(4),
+                    cache_read_input_tokens: Some(3),
+                    cache_write_input_tokens: None,
+                },
+            ]
+        );
     }
 
     #[test]
