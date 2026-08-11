@@ -13,23 +13,13 @@
 
 use oc_db::message::{MessageRecord, MessageStore, PartKind, PartRecord};
 use oc_db::{migration, open};
+use oc_testkit::pinned_oracle_or_skip;
 use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output};
 
-const ORACLE_BINARY: &str = "/config/.local/share/mise/installs/opencode/1.18.12/opencode";
 const SESSION_ID: &str = "ses_5jXqK8mNpQrStUvWxYz0123456789ab";
 const MESSAGE_ID: &str = "msg_5jXqK8mNpQrStUvWxYz0123456789ab";
-
-fn oracle_binary() -> Option<PathBuf> {
-    std::env::var_os("OPENCODE_TEST_BINARY")
-        .map(PathBuf::from)
-        .or_else(|| {
-            Path::new(ORACLE_BINARY)
-                .is_file()
-                .then(|| ORACLE_BINARY.into())
-        })
-}
 
 /// Run the real binary against an isolated data home, so the user's own
 /// `opencode.db` is never opened, let alone written.
@@ -201,8 +191,10 @@ fn write_conversation(path: &Path) -> Vec<String> {
 
 #[test]
 fn message_a_rust_written_session_is_readable_by_the_real_binary() {
-    let Some(binary) = oracle_binary() else {
-        eprintln!("skipping real-binary export differential: opencode binary not found");
+    let Some(binary) = pinned_oracle_or_skip(
+        "message_a_rust_written_session_is_readable_by_the_real_binary",
+        "no conversation this crate wrote was decoded by a real release",
+    ) else {
         return;
     };
     let root = tempfile::tempdir().expect("create a temporary root");
@@ -213,11 +205,7 @@ fn message_a_rust_written_session_is_readable_by_the_real_binary() {
         .join("opencode.db");
     let part_ids = write_conversation(&path);
 
-    let output = run_oracle(
-        binary.as_path(),
-        root.path(),
-        &["export", SESSION_ID, "--pure"],
-    );
+    let output = run_oracle(binary, root.path(), &["export", SESSION_ID, "--pure"]);
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(

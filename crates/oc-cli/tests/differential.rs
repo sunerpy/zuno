@@ -4,7 +4,21 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-const ORACLE: &str = "/config/.local/share/mise/installs/opencode/1.18.12/opencode";
+use oc_testkit::{PinnedOracle, pinned_oracle, pinned_oracle_or_skip};
+
+/// The installed release every comparison in this file runs against.
+///
+/// Resolved and screened centrally rather than written down: a path naming one
+/// release can select a build other than the pinned one, and it exists on exactly
+/// one machine. Absence panics here because these comparisons have no meaning
+/// without the oracle and previously died in `Command::output` anyway; the tests
+/// that must survive a machine without it gate on [`pinned_oracle_or_skip`] instead.
+fn oracle() -> &'static Path {
+    match pinned_oracle() {
+        PinnedOracle::Found(program) => program.as_path(),
+        PinnedOracle::Absent(reason) | PinnedOracle::Disagrees(reason) => panic!("{reason}"),
+    }
+}
 
 fn rust_binary() -> Command {
     Command::new(env!("CARGO_BIN_EXE_opencode-rust"))
@@ -89,7 +103,7 @@ fn assert_help_flags(args: &[&str]) {
     let root = tempfile::tempdir().expect("tempdir");
     let mut oracle_args = args.to_vec();
     oracle_args.push("--help");
-    let oracle = run(Path::new(ORACLE), &oracle_args, root.path());
+    let oracle = run(oracle(), &oracle_args, root.path());
     let actual = run(&rust_path(), &oracle_args, root.path());
     let oracle_help = [oracle.stdout.as_slice(), oracle.stderr.as_slice()].concat();
     let actual_help = [actual.stdout.as_slice(), actual.stderr.as_slice()].concat();
@@ -137,7 +151,7 @@ fn every_declared_flag_addition_is_actually_present_and_upstream_keeps_its_own()
                 args.join(" ")
             );
         }
-        let oracle = run(Path::new(ORACLE), &with_help, root.path());
+        let oracle = run(oracle(), &with_help, root.path());
         let upstream = long_flags(&[oracle.stdout.as_slice(), oracle.stderr.as_slice()].concat());
         for flag in &upstream {
             assert!(
@@ -198,7 +212,7 @@ fn db_query_matches_oracle_in_json_and_tsv() {
     let query = "SELECT 1 AS answer, 'hello' AS greeting";
     for format in ["json", "tsv"] {
         let args = ["db", query, "--format", format];
-        let oracle = run(Path::new(ORACLE), &args, root.path());
+        let oracle = run(oracle(), &args, root.path());
         let actual = run(&rust_path(), &args, root.path());
         assert_eq!(
             actual.status.success(),
@@ -238,7 +252,7 @@ fn db_query_does_not_need_sqlite3_or_any_other_path_binary() {
 fn models_listing_and_provider_filter_match_oracle() {
     for args in [&["models"][..], &["models", "anyapi"][..]] {
         let root = tempfile::tempdir().expect("tempdir");
-        let mut oracle = Command::new(ORACLE);
+        let mut oracle = Command::new(oracle());
         oracle.args(args);
         isolated(&mut oracle, root.path());
         configure_models(&mut oracle);
@@ -485,7 +499,7 @@ fn mcp_add_list_and_logout_persist_headless_state() {
 #[test]
 fn debug_paths_matches_oracle_exactly() {
     let root = tempfile::tempdir().expect("tempdir");
-    let oracle = run(Path::new(ORACLE), &["debug", "paths"], root.path());
+    let oracle = run(oracle(), &["debug", "paths"], root.path());
     let actual = run(&rust_path(), &["debug", "paths"], root.path());
     assert!(
         oracle.status.success(),
@@ -647,7 +661,7 @@ fn seed_shared_database(path: &Path) {
 
 /// Start the oracle's HTTP server on `port`, waiting for it to say so.
 fn spawn_oracle_server(root: &Path, database: &Path, port: u16) -> Option<Child> {
-    let mut command = Command::new(ORACLE);
+    let mut command = Command::new(oracle());
     command
         .args([
             "serve",
@@ -802,12 +816,12 @@ fn rust_listing(root: &Path, database: &Path, args: &[&str]) -> serde_json::Valu
 
 #[test]
 fn session_list_all_projects_matches_the_experimental_endpoint_on_one_database() {
-    if !Path::new(ORACLE).is_file() {
-        eprintln!(
-            "SKIPPED session_list_all_projects_matches_the_experimental_endpoint_on_one_database: \
-             the real opencode binary is absent at {ORACLE}; the cross-project listing was NOT \
-             compared against /experimental/session"
-        );
+    if pinned_oracle_or_skip(
+        "session_list_all_projects_matches_the_experimental_endpoint_on_one_database",
+        "the cross-project listing was NOT compared against /experimental/session",
+    )
+    .is_none()
+    {
         return;
     }
 
@@ -1137,15 +1151,14 @@ fn export_matches_the_oracle_on_one_seeded_session() {
         "every seeded part variant must survive the export"
     );
 
-    if !Path::new(ORACLE).is_file() {
-        eprintln!(
-            "PARTIAL export_matches_the_oracle_on_one_seeded_session: the real opencode binary is \
-             absent at {ORACLE}; the payload was NOT compared against it"
-        );
+    let Some(oracle_program) = pinned_oracle_or_skip(
+        "export_matches_the_oracle_on_one_seeded_session",
+        "the export payload was NOT compared against a real release",
+    ) else {
         return;
-    }
+    };
     let oracle = export_document(
-        Path::new(ORACLE),
+        oracle_program,
         root.path(),
         &database,
         &["export", EXPORT_SESSION, "--pure"],
@@ -1161,13 +1174,12 @@ fn export_matches_the_oracle_on_one_seeded_session() {
 
 #[test]
 fn export_sanitize_matches_the_oracle_on_one_seeded_session() {
-    if !Path::new(ORACLE).is_file() {
-        eprintln!(
-            "SKIPPED export_sanitize_matches_the_oracle_on_one_seeded_session: the real opencode \
-             binary is absent at {ORACLE}; the redaction pass was NOT compared against it"
-        );
+    let Some(oracle_program) = pinned_oracle_or_skip(
+        "export_sanitize_matches_the_oracle_on_one_seeded_session",
+        "the redaction pass was NOT compared against a real release",
+    ) else {
         return;
-    }
+    };
     let root = tempfile::tempdir().expect("tempdir");
     let database = root.path().join("data").join("opencode").join("export.db");
     seed_export_database(&database);
@@ -1179,7 +1191,7 @@ fn export_sanitize_matches_the_oracle_on_one_seeded_session() {
         &["export", EXPORT_SESSION, "--sanitize"],
     );
     let oracle = export_document(
-        Path::new(ORACLE),
+        oracle_program,
         root.path(),
         &database,
         &["export", EXPORT_SESSION, "--sanitize", "--pure"],

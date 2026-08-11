@@ -45,7 +45,7 @@
 //! approaches 64 KiB, so a future fixture cannot re-enter the silent truncation.
 
 use oc_search::{EmbeddedEngine, GlobRequest, GrepRequest, NeverCancelled};
-use oc_testkit::{Normalizer, Oracle, ScriptedEnv, diff_normalized};
+use oc_testkit::{Normalizer, Oracle, ScriptedEnv, diff_normalized, pinned_oracle_or_skip};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -58,13 +58,6 @@ const DEBUG_RG_LIMIT: usize = 10_000;
 /// The glob `debug rg files` applies when `--glob` is absent
 /// (`cli/cmd/debug/ripgrep.ts:39`).
 const DEBUG_RG_DEFAULT_GLOB: &str = "**/*";
-
-/// The binary the harness prefers when nothing overrides it.
-///
-/// The `opencode` shim on `PATH` is a mise wrapper that fails under a cleared
-/// environment, so the real install is addressed directly. `OC_TESTKIT_ORACLE`
-/// overrides this.
-const INSTALLED_ORACLE: &str = "/config/.local/share/mise/installs/opencode/1.18.12/opencode";
 
 /// The point at which a captured oracle stdout is treated as suspect.
 ///
@@ -100,11 +93,19 @@ const FILE_PARTITION: &[(&str, usize)] = &[
     ("{build,build/**}", 1),
 ];
 
+/// The pinned release, screened by the central oracle.
+///
+/// A bare `opencode` on `PATH` can be a package-manager launcher that dies under a
+/// scripted environment, which is why this file used to address one install path
+/// directly. [`pinned_oracle_or_skip`] discovers the route and refuses any candidate
+/// that does not report [`oc_testkit::PINNED_RELEASE`], so the release is pinned
+/// without a path in this file selecting one.
 fn locate_oracle() -> Option<Oracle> {
-    if std::env::var("OC_TESTKIT_ORACLE").is_ok() {
-        return Oracle::discover().ok();
-    }
-    Oracle::at_binary(INSTALLED_ORACLE).ok()
+    let program = pinned_oracle_or_skip(
+        "the oc-search differentials",
+        "no ripgrep behaviour was compared against a real release",
+    )?;
+    Oracle::at_binary(program).ok()
 }
 
 /// Builds the tree.

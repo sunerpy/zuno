@@ -6760,3 +6760,86 @@ todo 143 在证明 antigravity 那一半时发现，**我独立核实**：`HookI
 > `git diff --cached --name-only | grep -c "^target/"` 确认为 0。
 
 `premerge.sh` 的冲突标记闸门是我上次加的，这次没帮上——因为构建产物不是冲突标记。**闸门只能挡它认识的那一种脏。** 值得考虑再加一条：暂存区里出现 `target/` 就拒绝。
+
+## [2026-08-11] Task 146: 九处硬编码 oracle 路径背后不是懒惰，是 shim 在仓库内 cwd 下会失败
+
+F4 的 wave-7 阻塞项 3 说：九个 differential 硬编码 `…/mise/installs/opencode/1.18.12/opencode`，
+一边测 1.18.12，一边由报告归因给 `PINNED_RELEASE = 1.18.15`。改法看着像重命名——把
+`Oracle::discover_pinned` 换上去就完了。**不是。** 先量一遍才知道为什么当初要写死路径：
+
+```
+cwd = 仓库内, env_clear + 重定向 HOME:
+  mise shim（PATH 第 1 位，symlink 到 mise 本体） -> stderr "Config files ... are not trusted", stdout 为空
+  1.18.15 真身                                     -> "1.18.15"
+cwd = 仓库外的临时目录, 同样的 env:
+  mise shim                                        -> "1.18.15"   ← 能用！
+```
+
+launcher 挂不挂**取决于工作目录**。而 `Oracle::run` 永远在 ScriptedEnv 的临时目录里跑，
+那里 shim 是好的；这九个 differential 自己拼 `std::process::Command`（要 `--format json`、
+要 `env_clear` + 剥掉 PATH、要自己选数据库路径），继承的是测试进程的 cwd，也就是仓库内，
+那里 shim 是坏的。**所以 `discover_pinned` 单独救不了这些调用点**：它会接受一个在每个调用点
+都会失败的 launcher。写死路径是对这件事的绕行，而绕行本身造成了版本归因的错。
+
+修法因此是**筛选**而不是改名：候选照旧发现（`OC_TESTKIT_ORACLE`，否则 `which_all` 按 PATH 顺序
+全取），但每个候选都要**在本进程的 cwd 下、带 ScriptedEnv 真跑一次 `--version`**，输出必须等于
+`PINNED_RELEASE`。printf 不出版本的 launcher 按「不可用」拒掉，报错版本的按「不是这个 release」
+拒掉，然后试下一个。钉的是 release，不是通往它的路。
+
+### F4 名单漏掉的那个更坏：`versions.sort(); versions.pop()`
+
+`oc-paths/tests/differential.rs` 不是常量，是一段走安装目录的代码，落到最后是**字典序**取最大：
+
+```
+versions.sort(); versions.pop()   // "1.18.9" > "1.18.15"，因为是字符串比较
+```
+
+在没有 `latest`/`1` 符号链接的机器上，它安静地跑**看起来最旧**的那个 release，而模块文档把
+dump 归因给 pin。同一种缝，另一条路走进来。附带一条：这个文件的
+`oracle_binary_is_locatable` 只断言 `--version` 输出**非空**——任何 release 都能过。已改成与
+`PINNED_RELEASE` 相等。
+
+### 一个等价变异体，差点让我以为筛选被守住了
+
+把筛选整段删掉、直接返回第一个候选，**十个单测全绿**。原因：`which::which_all("opencode")`
+在这台机器上先返回 1.18.15 真身、shim 排第二（不是 PATH 顺序）。于是「第一个候选」本来就等于
+「筛过的候选」，变异体不可观测。
+
+处理：把筛选抽成 `screen_candidates(Vec<PathBuf>)`，让它不依赖宿主 PATH 顺序可测，再喂给它两个
+**测试自己写出来、筛选真去执行**的 stand-in：一个 stdout 空 + exit 1（模拟 launcher），一个
+`echo 1.18.12` + exit 0（模拟那九条路径选中的 release）。再删筛选，测试立刻红：
+
+```
+the screen accepted /tmp/.tmpcuGFtr/launcher instead of walking past it to the pinned release
+```
+
+> **规则：变异体全绿不等于测试守住了行为，先证明变异体可观测。** 如果它的效果被宿主环境
+> （PATH 顺序、符号链接、已装版本）吞掉，那测的是这台机器，不是那段逻辑。把逻辑抽出来，用测试
+> 自己造的真实可执行文件喂它。
+
+### 最有价值的变异体：把 pin 改回 1.18.12
+
+改这一个常量，`oc-db --test schema` 2 挂、`oc-paths --test differential` 6 挂，报错点名
+「没有任何已安装的 opencode 在 …/crates/oc-db 下报告 1.18.12」。**改之前，同样的改动什么都不会发生**——
+路径写死跑的就是 1.18.12，没有任何东西能因为两者不一致而失败。这就是缝合上了的证据。
+
+### 「删掉覆盖」也要能被抓住
+
+新加的结构性 guard 有两个方向。负向那个（任何非注释行不得出现 `installs/opencode` 或
+`opencode/1.`）是把本次的 grep 约束变成可执行。正向那个是**十个文件的清单**，每个必须仍然存在、
+仍然提到 `pinned_oracle`。理由：我把 `schema.rs` 的 oracle 调用换成 `None` 之后，那个 differential
+报 **5 passed / 0 failed**——绿着，什么也没测。只有清单能看见这件事。
+
+### 顺手记一个别人家的潜伏 flake（未修）
+
+`cargo test --workspace` 第一轮挂了 `oc-auth store::tests::the_permission_warning_reaches_the_log_naming_the_file`，
+第二三轮全绿（3369 / 3370 passed）。不是本次改动引起：oc-auth 及其依赖图我没碰。
+
+现象是 store.rs:501 断言时 captured buffer **为空**，而 501 之前的 `is_permissive()`（498 行）
+已经过了——说明 `read_json` 确实发了 warning，事件没到 scoped writer。同一个测试二进制里有三个
+兄弟测试会在**没装 subscriber** 的情况下并发调 `read_json` 读权限过宽的文件，这正是把 tracing
+callsite 的 Interest 缓存打成 `never`、饿死随后 `with_default` 装上的 subscriber 的形状。
+
+复现尝试：单独跑 8 次（每次 66/66）；再用测试二进制自己 8 路和 24 路并发跑 48 + 72 次——**120 次 0 失败**。
+它需要整仓库级别的负载。归入本项目已记录的「load-correlated flake」家族，本次不修：oc-auth 不在
+任务范围内，对别人家的测试管线做猜测性修改比留一条点名的记录更糟。下一个碰 oc-auth 的人接手。

@@ -1,8 +1,7 @@
 use oc_db::{Connection, migration, open};
+use oc_testkit::pinned_oracle_or_skip;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-
-const ORACLE_BINARY: &str = "/config/.local/share/mise/installs/opencode/1.18.12/opencode";
 
 #[derive(Debug, PartialEq, Eq)]
 struct SchemaSnapshot {
@@ -37,16 +36,6 @@ struct ForeignKey {
 
 fn temp_dir() -> tempfile::TempDir {
     tempfile::tempdir().expect("create temporary directory")
-}
-
-fn oracle_binary() -> Option<PathBuf> {
-    std::env::var_os("OPENCODE_TEST_BINARY")
-        .map(PathBuf::from)
-        .or_else(|| {
-            Path::new(ORACLE_BINARY)
-                .is_file()
-                .then(|| ORACLE_BINARY.into())
-        })
 }
 
 fn run_oracle(binary: &Path, root: &Path, query: &str) -> Output {
@@ -223,8 +212,10 @@ fn row_count(connection: &Connection, table: &str) -> i64 {
 
 #[test]
 fn schema_matches_a_database_created_by_the_real_opencode_binary() {
-    let Some(binary) = oracle_binary() else {
-        eprintln!("skipping real-binary schema differential: opencode binary not found");
+    let Some(binary) = pinned_oracle_or_skip(
+        "schema_matches_a_database_created_by_the_real_opencode_binary",
+        "the schema was NOT compared against a real release",
+    ) else {
         return;
     };
     let dir = temp_dir();
@@ -232,7 +223,7 @@ fn schema_matches_a_database_created_by_the_real_opencode_binary() {
     create_rust_database(&rust_path);
 
     let oracle_root = dir.path().join("oracle");
-    let output = run_oracle(&binary, &oracle_root, "SELECT 1 AS opened");
+    let output = run_oracle(binary, &oracle_root, "SELECT 1 AS opened");
     assert_process_succeeded(&output);
     let oracle_path = oracle_database(&oracle_root);
 
@@ -303,8 +294,10 @@ fn schema_prefills_every_current_migration_id_in_generated_order() {
 
 #[test]
 fn schema_journal_round_trip_through_the_real_binary_does_not_replay_migrations() {
-    let Some(binary) = oracle_binary() else {
-        eprintln!("skipping real-binary journal round trip: opencode binary not found");
+    let Some(binary) = pinned_oracle_or_skip(
+        "schema_journal_round_trip_through_the_real_binary_does_not_replay_migrations",
+        "the migration journal was NOT round-tripped through a real release",
+    ) else {
         return;
     };
     let root = temp_dir();
@@ -316,7 +309,7 @@ fn schema_journal_round_trip_through_the_real_binary_does_not_replay_migrations(
     drop(before_connection);
 
     let output = run_oracle(
-        &binary,
+        binary,
         root.path(),
         "SELECT count(*) AS migration_count FROM migration",
     );

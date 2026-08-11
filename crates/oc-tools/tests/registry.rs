@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use oc_error::ToolError;
 use oc_permission::{PermissionAction, Rule};
+use oc_testkit::pinned_oracle_or_skip;
 use oc_tool::{Tool, ToolContext, ToolOutput};
 use oc_tools::FileTools;
 use oc_tools::SearchConfig;
@@ -15,8 +16,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
-
-const ORACLE_BINARY: &str = "/config/.local/share/mise/installs/opencode/1.18.12/opencode";
 
 struct StubTool(&'static str);
 
@@ -453,16 +452,6 @@ fn expected_set(case: DifferentialCase) -> BTreeSet<String> {
     case.expected.iter().map(|id| (*id).to_owned()).collect()
 }
 
-fn oracle_binary() -> Option<PathBuf> {
-    std::env::var_os("OPENCODE_TEST_BINARY")
-        .map(PathBuf::from)
-        .or_else(|| {
-            Path::new(ORACLE_BINARY)
-                .is_file()
-                .then(|| PathBuf::from(ORACLE_BINARY))
-        })
-}
-
 fn permission_json(case: PermissionCase) -> Option<Value> {
     match case {
         PermissionCase::Default => None,
@@ -539,7 +528,10 @@ fn registry_resolved_sets_match_five_real_binary_combinations() {
         5,
         "the differential matrix is load-bearing"
     );
-    let binary = oracle_binary();
+    let binary = pinned_oracle_or_skip(
+        "registry_resolved_sets_match_five_real_binary_combinations",
+        "the five captured tool sets were NOT compared against a real release",
+    );
 
     for (index, case) in DIFFERENTIAL_CASES.into_iter().enumerate() {
         let workspace = TempDir::new().expect("temporary Rust workspace");
@@ -556,8 +548,7 @@ fn registry_resolved_sets_match_five_real_binary_combinations() {
         let captured = expected_set(case);
         assert_eq!(subject_set, captured, "captured case: {}", case.label);
 
-        let Some(binary) = binary.as_deref() else {
-            eprintln!("skipping real opencode differential: {ORACLE_BINARY} is absent");
+        let Some(binary) = binary else {
             return;
         };
         let oracle_root = TempDir::new().expect("temporary oracle workspace");

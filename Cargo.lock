@@ -2531,6 +2531,7 @@ dependencies = [
  "oc-error",
  "oc-paths",
  "oc-snapshot",
+ "oc-testkit",
  "oc-tool",
  "proptest",
  "rusqlite",
@@ -2619,6 +2620,7 @@ dependencies = [
  "oc-config",
  "oc-error",
  "oc-process",
+ "oc-testkit",
  "oc-tool",
  "schemars",
  "serde",
@@ -2703,6 +2705,7 @@ dependencies = [
 name = "oc-paths"
 version = "0.1.0"
 dependencies = [
+ "oc-testkit",
  "tempfile",
  "thiserror 2.0.19",
  "url",

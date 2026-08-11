@@ -22,6 +22,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+# The three differentials here run the installed release directly. `oc-testkit`
+# resolves and screens it, so no test in this crate names a package-manager path.
+# This edge is a cycle only through dev-dependencies (`oc-testkit`'s own dev-deps
+# name `oc-db`), which cargo permits and which cannot affect either lib build.
+oc-testkit = { workspace = true }
 proptest = { workspace = true }
 tempfile = { workspace = true }
 

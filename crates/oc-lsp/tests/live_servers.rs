@@ -1,6 +1,7 @@
 use oc_catalog::lsp_config::ResolvedLsp;
 use oc_config::schema::lsp::{BUILTIN_SERVER_IDS, LspConfig};
 use oc_lsp::{Diagnostic, Manager, RestartPolicy, ServerRegistry};
+use oc_testkit::pinned_oracle_or_skip;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::error::Error;
@@ -52,14 +53,6 @@ impl From<&Diagnostic> for ComparableDiagnostic {
 
 fn command_path(name: &str) -> Option<PathBuf> {
     which::which(name).ok()
-}
-
-fn oracle_path() -> Option<PathBuf> {
-    let pinned = PathBuf::from("/config/.local/share/mise/installs/opencode/1.18.12/opencode");
-    pinned
-        .is_file()
-        .then_some(pinned)
-        .or_else(|| command_path("opencode"))
 }
 
 fn oracle_diagnostics(
@@ -123,8 +116,10 @@ async fn typescript_diagnostics_match_the_real_opencode_binary() -> Result<(), B
         );
         return Ok(());
     };
-    let Some(oracle) = oracle_path() else {
-        eprintln!("skipping live TypeScript LSP differential: opencode oracle binary not found");
+    let Some(oracle) = pinned_oracle_or_skip(
+        "the live TypeScript LSP differential",
+        "diagnostics were NOT compared against a real release",
+    ) else {
         return Ok(());
     };
     let workspace = tempfile::tempdir()?;
@@ -136,7 +131,7 @@ async fn typescript_diagnostics_match_the_real_opencode_binary() -> Result<(), B
     std::fs::write(&source, "const value: number = \"wrong\";\n")?;
     let command = vec![server.to_string_lossy().into_owned(), "--stdio".to_owned()];
 
-    let expected = oracle_diagnostics(&oracle, workspace.path(), &source, "typescript", &command)?;
+    let expected = oracle_diagnostics(oracle, workspace.path(), &source, "typescript", &command)?;
     let actual = rust_diagnostics(workspace.path(), &source, "typescript", &command).await?;
 
     assert!(

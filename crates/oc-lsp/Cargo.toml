@@ -26,6 +26,9 @@ which = { workspace = true }
 
 [dev-dependencies]
 oc-config = { workspace = true }
+# `tests/live_servers.rs` compares against the installed release; `oc-testkit`
+# resolves and screens it so no path in this crate selects one.
+oc-testkit = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

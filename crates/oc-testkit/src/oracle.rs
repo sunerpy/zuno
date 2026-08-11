@@ -41,6 +41,8 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::OnceLock;
 
 use crate::env::ScriptedEnv;
 use crate::error::{Result, TestkitError};
@@ -433,6 +435,200 @@ pub fn check_pin(reported: &str, program: &Path) -> Result<()> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Resolving an executable a differential can actually run
+// ---------------------------------------------------------------------------
+
+/// Declare that this machine has no installed `opencode` at all.
+///
+/// Read only by the workspace's oracle gate, which otherwise **fails** when nothing
+/// is installed. Individual differentials still skip on absence — see
+/// [`pinned_oracle_or_skip`] — so this variable is what turns "every differential
+/// quietly measured nothing" into a deliberate, recorded statement instead of an
+/// accident nobody notices.
+pub const ENV_ALLOW_MISSING_ORACLE: &str = "OC_TESTKIT_ALLOW_MISSING_ORACLE";
+
+/// The result of looking for an installed release a differential can run.
+///
+/// Absence and disagreement are separate variants because they are separate facts
+/// and deserve opposite treatment: a machine without `opencode` cannot verify
+/// anything and may skip, while a machine whose `opencode` is a *different release*
+/// would produce artifacts naming a build that never ran.
+#[derive(Debug)]
+pub enum PinnedOracle {
+    /// An executable that reported [`PINNED_RELEASE`] under a scripted world.
+    Found(PathBuf),
+    /// No `opencode` exists in any location consulted. Skippable.
+    Absent(String),
+    /// An `opencode` exists, but no candidate is [`PINNED_RELEASE`] — or none could
+    /// report a version at all. Not skippable: the message names every candidate.
+    Disagrees(String),
+}
+
+/// An installed `opencode` that reports [`PINNED_RELEASE`] **when run the way a
+/// differential runs it**, resolved once per test process.
+///
+/// # Why this exists next to [`Oracle::discover_pinned`]
+///
+/// [`Oracle::discover_pinned`] answers "is the oracle *the* oracle?" for callers
+/// that drive it through [`Oracle::run`], which always executes in the scripted
+/// world's own temporary working directory. Many differentials cannot use that:
+/// they build a `std::process::Command` themselves, because they need
+/// `--format json`, an `env_clear` with a stripped `PATH`, or a database at a path
+/// they chose. Those run the binary from **the test process's working directory**,
+/// which is inside this repository.
+///
+/// That difference is load-bearing, and it is why nine test files used to hard-code
+/// `…/mise/installs/opencode/1.18.12/opencode`. On a machine where `opencode` is
+/// reached through a package-manager shim, the first `PATH` hit is not the binary at
+/// all: it is the package manager, which re-execs. This host's shim is a symlink to
+/// `mise`, and `mise` resolves its own trust records under the **real** `HOME`, so
+/// under a differential's redirected `HOME` it exits with
+/// `Config files … are not trusted` and prints nothing on stdout. The hard-coded
+/// paths were a workaround for that, and the workaround is what let a differential
+/// silently measure 1.18.12 while every report attributed the result to
+/// [`PINNED_RELEASE`].
+///
+/// So candidates are **discovered** — [`ENV_ORACLE_BINARY`], else every `opencode` on
+/// `PATH` in `PATH` order — and each is **behaviourally screened**: run
+/// `--version` under a [`ScriptedEnv`] from this process's own working directory, and
+/// require the output to be [`PINNED_RELEASE`] via [`check_pin`]. A launcher that
+/// cannot survive that is rejected for the reason it failed, and the next candidate
+/// is tried. No version and no package manager is named in code; the release is
+/// pinned, the route to it is not.
+#[must_use]
+pub fn pinned_oracle() -> &'static PinnedOracle {
+    static RESOLVED: OnceLock<PinnedOracle> = OnceLock::new();
+    RESOLVED.get_or_init(resolve_pinned_oracle)
+}
+
+/// [`pinned_oracle`], reduced to the path a differential needs, with the skip
+/// contract applied.
+///
+/// * found — `Some(path)`, an executable already proven to report [`PINNED_RELEASE`]
+///   from this working directory;
+/// * absent — `None`, after printing `SKIPPED {test}: … {untested}` so the output
+///   says what was *not* measured rather than looking like a pass;
+/// * disagreement — **panics**, because continuing would measure one release and
+///   report another.
+///
+/// `untested` completes the sentence "…; {untested}", e.g.
+/// `"the rollback seam was NOT tested"`.
+///
+/// # Panics
+///
+/// When an `opencode` exists but no candidate is [`PINNED_RELEASE`].
+#[must_use]
+pub fn pinned_oracle_or_skip(test: &str, untested: &str) -> Option<&'static Path> {
+    match pinned_oracle() {
+        PinnedOracle::Found(program) => Some(program.as_path()),
+        PinnedOracle::Absent(reason) => {
+            eprintln!("SKIPPED {test}: {reason}; {untested}");
+            None
+        }
+        PinnedOracle::Disagrees(reason) => panic!("{reason}"),
+    }
+}
+
+/// Every path worth screening, in preference order.
+///
+/// An explicit [`ENV_ORACLE_BINARY`] is the only candidate when it is set: an
+/// operator naming a binary that turns out to be the wrong release must be told so,
+/// not quietly routed around.
+fn pinned_oracle_candidates() -> Vec<PathBuf> {
+    if let Ok(explicit) = std::env::var(ENV_ORACLE_BINARY) {
+        return vec![PathBuf::from(explicit)];
+    }
+    let mut candidates = Vec::new();
+    if let Ok(found) = which::which_all("opencode") {
+        for path in found {
+            if !candidates.contains(&path) {
+                candidates.push(path);
+            }
+        }
+    }
+    candidates
+}
+
+/// What `candidate --version` prints when run from **this** working directory under a
+/// scripted world.
+///
+/// The working directory is deliberately not overridden. That is the whole point:
+/// [`Oracle::probe_version`] runs in the scripted world's temporary directory, where
+/// a package-manager shim can still work, so a probe that did the same would accept a
+/// launcher that then fails in every caller.
+fn version_from_this_working_directory(candidate: &Path) -> Result<String> {
+    ensure_executable("oracle", candidate, || {
+        format!("install the real opencode CLI, or point {ENV_ORACLE_BINARY} somewhere it exists")
+    })?;
+    let env = ScriptedEnv::new()?;
+    let mut command = Command::new(candidate);
+    command.arg("--version").env_clear();
+    for (key, value) in &env.env_vars() {
+        command.env(key, value);
+    }
+    let output = command.output().map_err(|source| TestkitError::Spawn {
+        program: candidate.to_path_buf(),
+        args: vec!["--version".to_owned()],
+        source,
+    })?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let version = stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_owned();
+    if version.is_empty() {
+        return Err(TestkitError::VersionProbeFailed {
+            role: "oracle",
+            program: candidate.to_path_buf(),
+            stdout,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    Ok(version)
+}
+
+fn resolve_pinned_oracle() -> PinnedOracle {
+    screen_candidates(pinned_oracle_candidates())
+}
+
+/// Take the first candidate that executes and reports [`PINNED_RELEASE`].
+///
+/// Separated from discovery so the screen is observable on any host: whether
+/// `PATH` happens to put the release before a launcher shim decides nothing about
+/// whether the screen works, and a test that relied on that ordering would pass on
+/// this machine while proving nothing.
+fn screen_candidates(candidates: Vec<PathBuf>) -> PinnedOracle {
+    if candidates.is_empty() {
+        return PinnedOracle::Absent(format!(
+            "no opencode on PATH and no {ENV_ORACLE_BINARY}; install release {PINNED_RELEASE} or \
+             set {ENV_ORACLE_BINARY} to it"
+        ));
+    }
+    let mut refusals = Vec::new();
+    for candidate in candidates {
+        match version_from_this_working_directory(&candidate) {
+            Ok(reported) => match check_pin(&reported, &candidate) {
+                Ok(()) => return PinnedOracle::Found(candidate),
+                Err(mismatch) => refusals.push(mismatch.to_string()),
+            },
+            Err(unusable) => refusals.push(unusable.to_string()),
+        }
+    }
+    PinnedOracle::Disagrees(format!(
+        "no installed opencode reports {PINNED_RELEASE} when run from {}. Every artifact in this \
+         workspace attributes its measurements to {PINNED_RELEASE}, so continuing would name a \
+         build that did not run. Install {PINNED_RELEASE}, or set {ENV_ORACLE_BINARY} to it. \
+         Candidates refused:\n  - {}",
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("<unknown working directory>"))
+            .display(),
+        refusals.join("\n  - "),
+    ))
+}
+
 pub(crate) fn ensure_executable(
     role: &'static str,
     path: &Path,
@@ -635,6 +831,150 @@ mod tests {
         let pinned =
             Oracle::discover_pinned().expect("the agreeing oracle must also pass the gate");
         assert_eq!(pinned.reported_version(), PINNED_RELEASE);
+    }
+
+    /// The screen that replaced nine hard-coded package-manager paths.
+    ///
+    /// `--version` is re-run here through a raw [`Command`] with a cleared
+    /// environment, a scripted `HOME`, and **this test's own working directory** —
+    /// which is inside the repository, the condition under which this host's
+    /// package-manager shim exits with a trust error and prints nothing. So the
+    /// assertion fails if [`pinned_oracle`] ever hands back a launcher instead of the
+    /// release, which is the mutant that matters: dropping the behavioural screen
+    /// makes the first `PATH` hit win and this test go red.
+    #[test]
+    fn the_resolved_pinned_oracle_reports_the_pin_from_this_working_directory() {
+        let program = match pinned_oracle() {
+            PinnedOracle::Found(program) => program.clone(),
+            PinnedOracle::Absent(reason) => {
+                assert!(
+                    std::env::var(ENV_ALLOW_MISSING_ORACLE).is_ok(),
+                    "{reason}. Nothing in this workspace was measured against a real release. Set \
+                     {ENV_ALLOW_MISSING_ORACLE}=1 to state that on purpose."
+                );
+                eprintln!(
+                    "SKIPPED the_resolved_pinned_oracle_reports_the_pin_from_this_working_directory: \
+                     {reason}; declared via {ENV_ALLOW_MISSING_ORACLE}"
+                );
+                return;
+            }
+            PinnedOracle::Disagrees(reason) => panic!("{reason}"),
+        };
+
+        let env = ScriptedEnv::new().expect("a scripted world");
+        let mut command = Command::new(&program);
+        command.arg("--version").env_clear();
+        for (key, value) in &env.env_vars() {
+            command.env(key, value);
+        }
+        let output = command.output().expect("run the resolved oracle");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            stdout.lines().map(str::trim).find(|l| !l.is_empty()),
+            Some(PINNED_RELEASE),
+            "{} did not report {PINNED_RELEASE} from {}\nstdout:\n{stdout}\nstderr:\n{}",
+            program.display(),
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("<unknown>"))
+                .display(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// The route is discovered, not written down.
+    ///
+    /// The resolved executable may well sit in a version-named directory — on this
+    /// host the only one that survives the screen does. What must not happen is a
+    /// path reaching a caller that nothing on `PATH` or in [`ENV_ORACLE_BINARY`] put
+    /// there, because that is a path some source file chose. Reintroducing a
+    /// hard-coded fallback inside [`pinned_oracle_candidates`] makes this red.
+    #[test]
+    fn the_resolved_route_came_from_path_or_an_explicit_override() {
+        let PinnedOracle::Found(program) = pinned_oracle() else {
+            eprintln!(
+                "SKIPPED the_resolved_route_came_from_path_or_an_explicit_override: no pinned \
+                 oracle resolved"
+            );
+            return;
+        };
+        if let Ok(explicit) = std::env::var(ENV_ORACLE_BINARY) {
+            assert_eq!(Path::new(&explicit), program.as_path());
+            return;
+        }
+        let on_path: Vec<PathBuf> = which::which_all("opencode")
+            .map(Iterator::collect)
+            .unwrap_or_default();
+        assert!(
+            on_path.contains(program),
+            "{} is not one of the {} opencode executables on PATH, so some source file chose it \
+             rather than discovery: {on_path:?}",
+            program.display(),
+            on_path.len(),
+        );
+    }
+
+    /// Write an executable that prints `stdout` and exits `code`.
+    #[cfg(unix)]
+    fn stand_in(dir: &Path, name: &str, stdout: &str, code: u8) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{stdout}\nexit {code}\n"))
+            .expect("write the stand-in");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stand-in executable");
+        path
+    }
+
+    /// F4's finding, made executable: the screen must walk past a candidate that
+    /// cannot report the pin and reach the one that can.
+    ///
+    /// Both rejects are **real executables this test writes and the screen really
+    /// runs**. The first stands in for a package-manager launcher — it prints its
+    /// complaint on stderr and nothing on stdout, which is what this host's shim does
+    /// under a differential's redirected `HOME`. The second stands in for the release
+    /// the nine hard-coded paths used to select: it reports cleanly, and is refused
+    /// anyway because it is not the pin.
+    ///
+    /// This does not depend on where `PATH` happens to put the real binary, which is
+    /// what makes it a test of the screen rather than of this machine's ordering.
+    #[cfg(unix)]
+    #[test]
+    fn the_screen_walks_past_a_launcher_and_a_wrong_release_to_reach_the_pin() {
+        let PinnedOracle::Found(real) = pinned_oracle() else {
+            eprintln!(
+                "SKIPPED the_screen_walks_past_a_launcher_and_a_wrong_release_to_reach_the_pin: no \
+                 pinned oracle resolved; the screen was NOT exercised"
+            );
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let launcher = stand_in(dir.path(), "launcher", ">&2 echo 'not trusted'", 1);
+        let wrong = stand_in(dir.path(), "wrong-release", "echo 1.18.12", 0);
+
+        match screen_candidates(vec![launcher.clone(), wrong.clone(), real.clone()]) {
+            PinnedOracle::Found(found) => assert_eq!(
+                &found,
+                real,
+                "the screen accepted {} instead of walking past it to the pinned release",
+                found.display()
+            ),
+            other => panic!("the pinned release was in the list yet was not chosen: {other:?}"),
+        }
+
+        let refused = screen_candidates(vec![launcher.clone(), wrong.clone()]);
+        let PinnedOracle::Disagrees(reason) = refused else {
+            panic!("a list holding no pinned release must not resolve: {refused:?}");
+        };
+        assert!(
+            reason.contains(&launcher.display().to_string()),
+            "the refusal must name the launcher it could not use: {reason}"
+        );
+        assert!(
+            reason.contains(&wrong.display().to_string()) && reason.contains("1.18.12"),
+            "the refusal must name the wrong release and what it reported: {reason}"
+        );
+        assert!(reason.contains(PINNED_RELEASE), "{reason}");
     }
 
     /// The failure QA scenario for the pin: a binary that reports another release is

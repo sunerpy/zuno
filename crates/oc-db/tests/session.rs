@@ -16,10 +16,10 @@ use oc_db::session::{
 use oc_db::{Connection, Pool, migration, open, session};
 use oc_error::DbError;
 use oc_paths::DbLocation;
-use std::path::{Path, PathBuf};
+use oc_testkit::pinned_oracle_or_skip;
+use std::path::Path;
 use std::process::{Command, Output};
 
-const ORACLE_BINARY: &str = "/config/.local/share/mise/installs/opencode/1.18.12/opencode";
 const VERSION: &str = "1.18.13";
 const WORKTREE: &str = "/srv/app";
 
@@ -1490,16 +1490,6 @@ fn a_wide_and_deep_subtree_is_removed_completely() {
 // Differential against the real binary
 // ---------------------------------------------------------------------------
 
-fn oracle_binary() -> Option<PathBuf> {
-    std::env::var_os("OPENCODE_TEST_BINARY")
-        .map(PathBuf::from)
-        .or_else(|| {
-            Path::new(ORACLE_BINARY)
-                .is_file()
-                .then(|| ORACLE_BINARY.into())
-        })
-}
-
 fn run_oracle(binary: &Path, root: &Path, query: &str) -> Output {
     let home = root.join("home");
     std::fs::create_dir_all(&home).expect("create an isolated oracle home");
@@ -1569,8 +1559,10 @@ fn oracle_fixture(root: &Path) -> Pool {
 
 #[test]
 fn the_real_binary_reads_rust_written_sessions_in_the_same_order() {
-    let Some(binary) = oracle_binary() else {
-        eprintln!("skipping: no opencode binary at {ORACLE_BINARY}");
+    let Some(binary) = pinned_oracle_or_skip(
+        "the_real_binary_reads_rust_written_sessions_in_the_same_order",
+        "the listing order was NOT compared against a real release",
+    ) else {
         return;
     };
     let root = temp_dir();
@@ -1587,7 +1579,7 @@ fn the_real_binary_reads_rust_written_sessions_in_the_same_order() {
     // `listGlobal`'s own ORDER BY, run by the real binary against the rows this
     // crate wrote.
     let theirs = oracle_column(
-        &binary,
+        binary,
         root.path(),
         "SELECT id FROM session ORDER BY time_updated DESC, id DESC",
     );
@@ -1614,7 +1606,7 @@ fn the_real_binary_reads_rust_written_sessions_in_the_same_order() {
         .map(|session| session.id.clone())
         .collect::<Vec<_>>();
     let created_theirs = oracle_column(
-        &binary,
+        binary,
         root.path(),
         "SELECT id FROM session ORDER BY time_created DESC, id DESC",
     );
@@ -1623,8 +1615,10 @@ fn the_real_binary_reads_rust_written_sessions_in_the_same_order() {
 
 #[test]
 fn the_subpath_predicate_selects_the_same_rows_as_the_oracles_path_filter() {
-    let Some(binary) = oracle_binary() else {
-        eprintln!("skipping: no opencode binary at {ORACLE_BINARY}");
+    let Some(binary) = pinned_oracle_or_skip(
+        "the_subpath_predicate_selects_the_same_rows_as_the_oracles_path_filter",
+        "the subpath predicate was NOT compared against a real release",
+    ) else {
         return;
     };
     let root = temp_dir();
@@ -1642,7 +1636,7 @@ fn the_subpath_predicate_selects_the_same_rows_as_the_oracles_path_filter() {
     // real binary. This is the predicate the v2 API declares a `subpath` for and
     // then never applies.
     let theirs = oracle_column(
-        &binary,
+        binary,
         root.path(),
         "SELECT id FROM session WHERE project_id = 'prj_a' \
          AND (path = 'pkg' OR path LIKE 'pkg/%') \
@@ -1657,7 +1651,7 @@ fn the_subpath_predicate_selects_the_same_rows_as_the_oracles_path_filter() {
     // And the unfiltered project listing is strictly larger, which is what the
     // v2 no-op returns today.
     let unfiltered = oracle_column(
-        &binary,
+        binary,
         root.path(),
         "SELECT id FROM session WHERE project_id = 'prj_a' \
          ORDER BY time_updated DESC, id DESC",
@@ -1669,8 +1663,10 @@ fn the_subpath_predicate_selects_the_same_rows_as_the_oracles_path_filter() {
 
 #[test]
 fn the_real_binary_sees_nothing_left_after_a_subtree_delete() {
-    let Some(binary) = oracle_binary() else {
-        eprintln!("skipping: no opencode binary at {ORACLE_BINARY}");
+    let Some(binary) = pinned_oracle_or_skip(
+        "the_real_binary_sees_nothing_left_after_a_subtree_delete",
+        "the subtree delete was NOT observed by a real release",
+    ) else {
         return;
     };
     let root = temp_dir();
@@ -1715,7 +1711,7 @@ fn the_real_binary_sees_nothing_left_after_a_subtree_delete() {
         }
     }
     assert_eq!(
-        oracle_column(&binary, root.path(), "SELECT count(*) FROM session"),
+        oracle_column(binary, root.path(), "SELECT count(*) FROM session"),
         vec!["3"]
     );
 
@@ -1736,7 +1732,7 @@ fn the_real_binary_sees_nothing_left_after_a_subtree_delete() {
         ("SELECT count(*) FROM event_sequence", "0"),
     ] {
         assert_eq!(
-            oracle_column(&binary, root.path(), query),
+            oracle_column(binary, root.path(), query),
             vec![expected.to_owned()],
             "the real binary still sees rows for: {query}"
         );
