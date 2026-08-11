@@ -7089,3 +7089,33 @@ agent list   → 32 行,含全部嵌套 agent
 153 把夹具刷新到与实时文件一致,关闭了 seam #19(注释说谎),但**准则 2 要的是输出 parity,不是输入一致**。F1 说得准:*"That guard proves input identity, not output parity."* 我上一轮验收 153 时只验了漂移守卫真能拦,**没验它是否达成了准则 2 本身要的东西**——我验的是它做了什么,不是它该做什么。
 
 > **验收一条修复时,除了确认它声称的改动生效,还要回头对照它要满足的原始准则。** 守卫可以完美工作,同时完全没解决准则要求的问题。
+
+## [2026-08-11] Task 154: compatible transport idle reads are bounded; adjacent clients audited
+
+`ReqwestTransport` now applies a 120-second default to each individual response-body
+read, including clients supplied through `with_client`. It does not impose a total
+request deadline, and every successful chunk starts a fresh allowance. The existing
+`OPENCODE_STREAM_IDLE_TIMEOUT_SECS` override remains the configuration escape hatch;
+no new setting or dependency was needed. The value is deliberate: the SSE tests
+already require more than 90 seconds for reasoning gaps, while F3's 200-second
+liveness probe proved that the previous 300-second shared default was operationally
+indistinguishable from an unbounded read.
+
+Current upstream has the same per-read shape in `wrapSSE`: `chunkTimeout` starts a
+fresh timer around every `reader.read()`, and its live test uses 50 ms against a
+250 ms stall. Upstream leaves that option opt-in, so it supplies semantics but no
+safe default for F3-W9-D2. This task therefore keeps the port's existing environment
+override and adds the bounded default at the transport seam.
+
+The wave-56 adjacent-client audit found bare `reqwest::Client::new()` constructors in
+the dedicated OpenAI and Anthropic providers too, but both already wrap every
+`response.chunk()` call with `StreamIdleTimeout::default().wait(...)`. This change is
+intentionally confined to the compatible transport and does not move the seam to
+those two paths. Other non-provider clients use purpose-specific request deadlines;
+they do not return this `ChunkStream`.
+
+Tooling limitation: the MCP `lsp_diagnostics` command is rooted at the main worktree
+and rejects this sibling worktree path. Running `rust-analyzer diagnostics .
+--severity warning` from `oc-wt/t154` completed with exit 0 and no source diagnostics;
+rust-analyzer did emit pre-existing internal `Overloaded deref on type str is not a
+projection` log records while scanning unrelated files.
