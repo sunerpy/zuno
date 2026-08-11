@@ -6760,3 +6760,37 @@ todo 143 在证明 antigravity 那一半时发现，**我独立核实**：`HookI
 > `git diff --cached --name-only | grep -c "^target/"` 确认为 0。
 
 `premerge.sh` 的冲突标记闸门是我上次加的，这次没帮上——因为构建产物不是冲突标记。**闸门只能挡它认识的那一种脏。** 值得考虑再加一条：暂存区里出现 `target/` 就拒绝。
+
+## [2026-08-10] SEAM #18：有界深度编码器会静默腐化它写回的 provider
+
+F3 在第七轮真机 QA 中怀疑 `thinkingBudget` 丢失，并猜测是我刚合的 144 引入的回归。它在写出报告前停滞了。我接手把机制量清楚，结论与它的猜测**部分不同**，值得记下差别。
+
+### 机制（我复现的）
+
+1. `shim.mjs:96` `MAX_DEPTH = 8`，`:104` 对深度 ≥8 的**对象**返回 `{$truncated:true}`。这个界有真实理由（就写在上面的注释里）：对插件对象图的无界遍历会让「有界内存宿主」不再有界。
+2. `shim.mjs:755` `respond(id, {value: encode(value), args: encode(args)})`——**args 数组是编码根**，所以单个参数在深度 1。
+3. `bridge.rs:314` `*provider = serde_json::from_value(mutated.clone())?` —— 用 JS 返回值**整体覆盖真 provider**。
+4. `resolved.rs:75` `pub variants: BTreeMap<String, JsonMap>`。`JsonMap` 接受任意 JSON，所以 `{"$truncated":true}` **反序列化成功**。全文件无 `deny_unknown_fields`。
+
+**所以腐化是静默的：不报错、不告警，真实的 `thinkingConfig` 被一个标记替换，再被 `effort.rs` 在请求时消费。**
+
+### 但 F3 的具体断言今天不成立
+
+我用真 `user-config.json` 的 google provider 跑真 `encode`：**0 个截断标记，6 个 `thinkingBudget` 全部存活**。
+
+量出的余量：provider 自身最深对象在深度 6，包进 args 后深度 7，`MAX_DEPTH` 是 8 —— **余量 1 层**。
+
+F3 的隔离复现是**人为加深嵌套**来探测深度预算，那测的是「界在哪」，不是「真数据是否越界」。它自己的记录里也写着 *"Reproducer didn't truncate at that depth"*。**它的直觉对，具体结论错。**
+
+我按「今天不复现、但余量 1 层且越界即静默腐化」立项 147，而不是按「F3 发现了一个活 bug」。夸大一个未复现的缺陷和漏掉一个真缺陷同样是失真。
+
+### 因果链里我的责任
+
+截断逻辑是 `f66ab935` 就有的，**144 没写它**。但 144 之前 `Auth` hook 从不 dispatch，provider 根本不过 JS 边界——**144 把一个休眠缺陷变成了活的**。
+
+**我的验证没抓住它。** 我变异验证了 hook 确实 dispatch、auth loader 确实把 google cost 归零——我证明了**功能生效**，却没问**往返途中有没有损坏别的东西**。
+
+规则：
+> **接通一条此前从不执行的路径时，不仅要证明它生效，还要证明它经过的每个转换没有损坏数据。** 「新接的线让沿途某个既有的有损转换第一次被执行」是独立的一类缺陷，且不会被任何「功能是否生效」的测试发现。
+
+F3 是靠真的跑产品发现的，第五次。
