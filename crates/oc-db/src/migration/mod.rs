@@ -104,6 +104,7 @@ pub fn apply(connection: &mut Connection) -> Result<(), DbError> {
 ///    exists to serve.
 /// 2. **Seeds the journal from Drizzle's, once.** See [`seed_from_drizzle`].
 /// 3. **Skips anything already recorded**, so old SQL never replays over data.
+/// 4. **Refuses a journal newer than this migration set**, before running SQL.
 ///
 /// Each migration commits in its own transaction, as upstream does: a chain that
 /// fails halfway leaves the completed prefix recorded, and the next launch resumes
@@ -112,7 +113,9 @@ pub fn apply(connection: &mut Connection) -> Result<(), DbError> {
 /// # Errors
 ///
 /// [`DbError::Migration`] if the journal cannot be created or read, or if a
-/// migration's SQL fails. [`DbError::Busy`] if another writer holds the lock.
+/// migration's SQL fails. [`DbError::MigrationTooNew`] if the journal contains an
+/// id above this binary's known ceiling. [`DbError::Busy`] if another writer holds
+/// the lock.
 pub fn apply_only(connection: &mut Connection) -> Result<Applied, DbError> {
     connection
         .execute_batch(JOURNAL_IF_ABSENT_SQL)
@@ -125,6 +128,7 @@ pub fn apply_only(connection: &mut Connection) -> Result<Applied, DbError> {
         applied.seeded = drizzle_names(connection)?;
         completed = journal_ids(connection)?;
     }
+    refuse_future_migrations(&completed)?;
 
     for migration in &MIGRATIONS {
         if completed.contains(migration.id) {
@@ -139,6 +143,26 @@ pub fn apply_only(connection: &mut Connection) -> Result<Applied, DbError> {
         applied.executed.push(migration.id.to_owned());
     }
     Ok(applied)
+}
+
+fn refuse_future_migrations(completed: &HashSet<String>) -> Result<(), DbError> {
+    let ceiling = MIGRATION_IDS
+        .iter()
+        .copied()
+        .max()
+        .expect("the production migration set is not empty");
+    let observed = completed
+        .iter()
+        .map(String::as_str)
+        .filter(|id| *id > ceiling)
+        .max();
+    if let Some(observed) = observed {
+        return Err(DbError::MigrationTooNew {
+            ceiling: ceiling.to_owned(),
+            observed: observed.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Copy Drizzle's completed migration names into the `migration` journal.
