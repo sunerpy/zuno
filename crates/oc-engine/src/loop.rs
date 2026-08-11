@@ -694,7 +694,9 @@ pub async fn run_turn(
                 .await
                 .map_err(TurnError::Hook)?;
             let mut messages = vec![Message::new(Role::System, system_prompt.clone())];
-            messages.extend(transformed.into_iter().map(|message| message.info));
+            for message in transformed {
+                append_transformed_message_owned(&mut messages, message);
+            }
             messages
         } else {
             project_history_owned(&system_prompt, history)
@@ -1422,6 +1424,28 @@ fn append_assistant_message_owned(messages: &mut Vec<Message>, parts: Vec<PartRe
     }
     if !results.is_empty() {
         messages.push(Message::from_content(Role::Tool, results));
+    }
+}
+
+fn append_transformed_message_owned(messages: &mut Vec<Message>, message: HookMessageWithParts) {
+    let role = message.info.role;
+    match role {
+        Role::System | Role::User => {
+            let start = messages.len();
+            append_user_message_owned(messages, message.parts);
+            for projected in &mut messages[start..] {
+                projected.role = role;
+            }
+        }
+        Role::Assistant | Role::Tool => {
+            let mut projected = Vec::new();
+            append_assistant_message_owned(&mut projected, message.parts);
+            messages.extend(
+                projected
+                    .into_iter()
+                    .filter(|projected| projected.role == role),
+            );
+        }
     }
 }
 

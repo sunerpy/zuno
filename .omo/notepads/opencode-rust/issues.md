@@ -7196,3 +7196,29 @@ Targeted criterion-2, runtime-discovery, live-drift, plugin-lifecycle, provenanc
 checks all passed; `rust-analyzer diagnostics .`, workspace build, and `cargo check -p oc-cli --offline`
 also passed. Per the two-status-check ceiling, the environment failure was recorded rather than retried
 indefinitely.
+
+## [2026-08-11] Todo 158 — canonical `parts` now owns post-hook provider content
+
+`PluginRuntime::transform_messages` already transported and copied back both `info` and `parts`; the
+loss happened one layer later, where `run_turn` discarded `parts` and sent only `message.info`.
+Upstream invokes the transform before `MessageV2.toModelMessagesEffect`, whose provider projection is
+built from canonical parts. The Rust continuation now follows the same authority split: `info.role`
+selects the projected role, while provider content is rebuilt from `parts` through the existing
+user/assistant/tool projection helpers. Assistant/tool splitting is filtered by the transformed role so
+one stored part set cannot duplicate both halves.
+
+The real lifecycle plugin now mutates `user.parts[0].text`, and the existing production-binary test
+asserts that mutation in the captured outgoing provider request. Before the implementation it failed
+with only `config:raw arguments:command:chat`; after the implementation it passed with the expected
+`:messages` suffix. Reverting only the application made that exact test fail again. With the old
+application still reverted, changing the fixture back to `user.info.content[0].text` made the test pass,
+proving the old assertion could not detect discarded canonical parts. Both temporary mutations were
+restored.
+
+Changed-file `lsp_diagnostics` reported no findings through a temporary detached validation worktree;
+the direct sibling paths remain outside the MCP request root. Workspace Clippy completed with zero
+warnings and rustfmt passed. Full workspace tests were attempted twice, including one-job/one-thread
+settings; both stopped while `oc-config` was listing tests with the host's known `EAGAIN / Resource
+temporarily unavailable`, after the task's production regression had passed. No assertion failed before
+either interruption, and no third attempt was made under the two-status-check limit. Complete evidence:
+`.omo/evidence/task-158-opencode-rust.txt`.
