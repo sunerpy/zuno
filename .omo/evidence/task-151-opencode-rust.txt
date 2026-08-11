@@ -1,0 +1,138 @@
+Task 151 evidence — reject bounded-encoder truncation on every ordinary hook write-back
+Date: 2026-08-11
+Worktree: /config/workspace/ProdDir/AI/oc-wt/t151
+Branch/base: task-151 at fc98635a
+
+1. Required source inspection
+
+- CodeGraph was attempted first with projectPath set to this worktree and query
+  `truncated_path call_mutating encode plugin.rs bridge.rs write-back HookInvocation`.
+  It reported that the sibling worktree was not indexed, so inspection continued with
+  direct reads/searches as instructed.
+- `bridge.rs`: the auth-loader guard calls `truncated_path()` before deserialization
+  and assignment. Its marker semantics are `$truncated == true`, `$path` when present,
+  and `/` as fallback.
+- `plugin.rs`: every ordinary JavaScript callback previously flowed through
+  `host.call_hook -> invocation_output -> jsonrpc::apply_hook_output`; no truncation
+  check existed between extraction and production mutation.
+- `shim.mjs`: `MAX_DEPTH` remains 8, each returned argument is encoded independently
+  from depth 0, and markers carry argument-relative JSON Pointers.
+- `plugin_runtime.rs`: production `tool_definition()` passes the real `ToolDefinition`
+  through `HookInvocation::ToolDefinition` immediately before provider request assembly.
+- `tool_turn.rs`: the existing lifecycle witness asserted only tool presence and the
+  mutated description, so it permitted a damaged deep parameters schema.
+
+2. Pre-fix production reproduction
+
+Test assertion was first added to the existing real-binary lifecycle path, before the
+guard was implemented.
+
+Command:
+  cargo test -p oc-cli --test tool_turn ordinary_plugin_lifecycle_hooks_run_through_the_real_binary --offline -- --exact --nocapture
+
+Observed: FAILED. A no-op `tool.definition` round-trip committed ten markers to the real
+provider request. Reported argument-relative paths included:
+
+  /parameters/properties/todos/items/properties/priority/oneOf/0
+  /parameters/properties/todos/items/properties/priority/oneOf/1
+  /parameters/properties/todos/items/properties/priority/oneOf/2
+  /parameters/properties/todos/items/properties/status/oneOf/0
+  /parameters/properties/todos/items/properties/status/oneOf/1
+  /parameters/properties/todos/items/properties/status/oneOf/2
+  /parameters/properties/todos/items/properties/status/oneOf/3
+  /parameters/properties/operations/items/properties/action/oneOf/0
+  /parameters/properties/operations/items/properties/action/oneOf/1
+  /parameters/properties/operations/items/properties/action/oneOf/2
+
+These are real built-in schemas (`todowrite` and `apply_patch`), not synthesized deep
+fixtures. The corruption was therefore reproduced before the fix.
+
+3. Structural fix
+
+- `bridge::truncated_path` became `pub(super)` so ordinary hooks reuse exactly the
+  auth-loader marker and pointer semantics instead of inventing a second detector.
+- `plugin::invocation_output` is the single ordinary-hook write-back boundary. It now
+  obtains the complete returned `args` array, scans every argument recursively, and
+  only after every argument passes does it select the mutable output for
+  `jsonrpc::apply_hook_output`.
+- Rejection identifies plugin id/spec, hook name, argument index, and the
+  argument-relative JSON Pointer.
+- Because no `apply_hook_output` call occurs until all arguments pass, multi-argument
+  mutations are all-or-nothing. A future mutable hook automatically inherits the guard
+  because `JsPlugin::call` has no other write-back route.
+- No permissive JSON type was tightened. Open JSON schema/options are valid protocol
+  data; transport loss is rejected at the shared transport boundary.
+- `shim.mjs` is unchanged in the final diff and `MAX_DEPTH = 8` remains enforced.
+
+4. Regression tests
+
+Production shape:
+  noop_tool_definition_hook_rejects_real_truncated_schema_before_provider_dispatch
+
+This launches the real binary with a no-op JavaScript `tool.definition` callback and
+the real built-in tool registry. It asserts explicit failure after the one title prelude,
+before turn dispatch, and recursively asserts that every captured provider request is
+free of `$truncated` markers.
+
+Shared-boundary shapes:
+  js_ordinary_hook_refuses_truncation_before_committing_any_output_field
+  js_ordinary_hook_preserves_output_when_a_different_argument_is_truncated
+
+The first proves a deep field and a shallow mutation in the mutable output cannot
+partially commit. The second puts the truncated graph in argument 0 while the callback
+mutates argument 1; it proves the scan covers the entire argument set and preserves the
+original output. Both assert the argument index and relative JSON Pointer.
+
+Targeted fixed-state commands/results:
+  cargo test -p oc-plugin --test js js_ordinary_hook_refuses_truncation_before_committing_any_output_field --offline -- --exact --nocapture
+    PASS: 1 passed, 0 failed
+  cargo test -p oc-plugin --test js js_ordinary_hook_preserves_output_when_a_different_argument_is_truncated --offline -- --exact --nocapture
+    PASS: 1 passed, 0 failed
+  cargo test -p oc-cli --test tool_turn noop_tool_definition_hook_rejects_real_truncated_schema_before_provider_dispatch --offline -- --exact --nocapture
+    PASS: 1 passed, 0 failed
+  cargo test -p oc-cli --test tool_turn ordinary_plugin_lifecycle_hooks_run_through_the_real_binary --offline -- --exact --nocapture
+    PASS: 1 passed, 0 failed
+
+5. Observable mutation tests
+
+Guard mutant:
+- Mutation: removed the complete `for (argument, value) in arguments.iter().enumerate()`
+  truncation preflight from `plugin::invocation_output`, leaving the rest compiled.
+- Command: production-shape test above.
+- Observed: FAILED by name at `the no-op hook must fail explicitly instead of silently
+  replacing a real deep built-in schema`; without the guard the unsafe turn dispatched.
+- Conclusion: non-equivalent, observable mutant. Guard restored.
+
+Depth-cap mutant:
+- Mutation: changed `const MAX_DEPTH = 8` to `Number.POSITIVE_INFINITY`.
+- Command:
+  cargo test -p oc-plugin --test js js_auth_loader_still_bounds_an_arbitrary_plugin_return_graph --offline -- --exact --nocapture
+- Observed: FAILED by name because `$truncated` was `None` instead of `Some(true)`.
+- Conclusion: the bounded-memory assertion observes removal of the cap. `MAX_DEPTH = 8`
+  restored.
+
+6. Gates
+
+LSP:
+- The MCP `lsp_diagnostics` tool is rooted at the request's main checkout and rejected
+  all sibling-worktree paths as outside its cwd.
+- Equivalent worktree-local command `rust-analyzer diagnostics .` exited 0 before the
+  chained fmt/test command proceeded. No diagnostics were reported.
+
+Formatting:
+  cargo fmt --all --check
+  PASS (exited 0 before workspace tests started).
+
+Workspace tests:
+  cargo test --workspace --offline
+  Attempt 1: INTERRUPTED by known host transient while listing `oc-tui` tests:
+    EAGAIN / Resource temporarily unavailable.
+  Attempt 2 (the one permitted retry): INTERRUPTED by the same host transient while
+    listing `oc-error --test no_anyhow_in_libraries` tests.
+  No third retry was made, per the task's maximum. All task-specific production and
+  shared-boundary tests passed as listed above; the complete 3390+ count could not be
+  obtained on this host run.
+
+Clippy:
+  cargo clippy --workspace --all-targets --offline -- -D warnings
+  PASS, 0 warnings; finished dev profile successfully.

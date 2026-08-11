@@ -6985,3 +6985,23 @@ worktree has no CodeGraph index, and `lsp_diagnostics` is rooted at the request 
 paths under `/config/workspace/ProdDir/AI/oc-wt/t149`. The pinned `.omo/refs` tree is also absent;
 upstream lifecycle locations were inspected in `/config/workspace/ProdDir/AI/opencode` at revision
 `aefaf140c1`, so exact source parity with released 1.18.15 is not claimed.
+
+## [2026-08-11] Todo 151 — SEAM #18 的普通 hook 类缺陷在共享写回边界关闭
+
+修复前，真二进制的 no-op `tool.definition` 已把 10 个 `$truncated` marker 发给 provider：
+内建 `todowrite` 的 `priority/status.oneOf/*` 与 `apply_patch` 的
+`operations.action.oneOf/*` 都超过八层。原生命周期测试只检查工具名和描述，因此真实 schema
+损坏仍是绿色。
+
+唯一普通 hook 写回 choke point `plugin.rs::invocation_output` 现在先递归扫描 shim 返回的**全部**
+arguments，再选择 output 并调用 `apply_hook_output`。任一 argument 有 marker 时，错误点名插件、
+hook、argument index 和 argument-relative JSON Pointer，且没有任何 Rust production value 被写回。
+新 hook 仍只能通过这个边界写回，所以无需逐 hook 复制 guard。检测复用 auth loader 的
+`bridge::truncated_path` 语义；没有收紧开放 JSON 类型，因为开放 schema/options 是合法契约，
+传输损失应在传输边界识别。
+
+生产测试证明 no-op hook 在 title prelude 后、turn provider dispatch 前失败，provider 从未收到
+marker；另两项普通 hook 测试分别证明 output 内深层截断不提交同一对象的浅层 mutation，以及
+argument 0 截断时 argument 1 的 mutation 也不提交。删除共享 guard 后生产测试按名失败；把
+`MAX_DEPTH` 改为无限后既有 bounded-graph 测试按名失败，证明两个 mutant 均可观察。
+完整命令和宿主 `EAGAIN` 门禁披露见 `.omo/evidence/task-151-opencode-rust.txt`。

@@ -121,7 +121,9 @@ impl Plugin for JsPlugin {
             let Ok(result) = result else {
                 continue;
             };
-            let output = invocation_output(&result, output_index).map_err(boxed)?;
+            let output =
+                invocation_output(&result, output_index, self.host.plugin(), name.as_str())
+                    .map_err(boxed)?;
             crate::jsonrpc::apply_hook_output(hook, output).map_err(boxed)?;
         }
         Ok(())
@@ -244,11 +246,28 @@ impl JsPluginTool {
 #[error("JavaScript plugin tool failed: {0}")]
 struct JsPluginToolFailure(String);
 
-fn invocation_output(result: &Value, index: usize) -> Result<Value, JsPluginBuildError> {
-    result
+fn invocation_output(
+    result: &Value,
+    index: usize,
+    plugin: &str,
+    hook: &str,
+) -> Result<Value, JsPluginBuildError> {
+    let arguments = result
         .get("args")
         .and_then(Value::as_array)
-        .and_then(|args| args.get(index))
+        .ok_or(JsPluginBuildError::MissingHookOutput)?;
+    for (argument, value) in arguments.iter().enumerate() {
+        if let Some(path) = super::bridge::truncated_path(value) {
+            return Err(JsPluginBuildError::TruncatedHookArgument {
+                plugin: plugin.to_owned(),
+                hook: hook.to_owned(),
+                argument,
+                path,
+            });
+        }
+    }
+    arguments
+        .get(index)
         .cloned()
         .ok_or(JsPluginBuildError::MissingHookOutput)
 }
@@ -269,6 +288,16 @@ pub(crate) enum JsPluginBuildError {
     MissingReport,
     #[error("JavaScript hook invocation omitted its mutated output")]
     MissingHookOutput,
+    #[error(
+        "plugin `{plugin}` truncated `{hook}` hook argument {argument} at `{path}`; \
+         refusing to apply any hook mutation"
+    )]
+    TruncatedHookArgument {
+        plugin: String,
+        hook: String,
+        argument: usize,
+        path: String,
+    },
     #[error("JavaScript plugin tool descriptor {index} is incomplete")]
     InvalidToolDescriptor { index: usize },
 }

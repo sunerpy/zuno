@@ -551,7 +551,7 @@ fn provider_value(provider: &ResolvedProvider) -> Value {
     serde_json::to_value(provider).unwrap_or(Value::Null)
 }
 
-fn truncated_path(value: &Value) -> Option<String> {
+pub(super) fn truncated_path(value: &Value) -> Option<String> {
     match value {
         Value::Array(values) => values.iter().find_map(truncated_path),
         Value::Object(map) => {
