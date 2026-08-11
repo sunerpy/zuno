@@ -1,0 +1,145 @@
+task-145-opencode-rust — amend todos 26 and 60 off the nonexistent `models --format json` flag
+Date: 2026-08-11 | Branch: task-145 | Worktree: /config/workspace/ProdDir/AI/oc-wt/t145
+Origin: F4 wave-7 blocking finding 1.
+
+================================================================================
+1. THE DEFECT
+================================================================================
+Success criterion 6 had already been amended (third correction) to state that
+released 1.18.15 has no `--format` flag and that visibility must come through the
+plain `models` output. But the same authoritative plan still carried
+`models --format json` as a LIVE, CHECKED requirement in two places:
+
+  - todo 26 title      : "expect parity with `opencode models --format json`"
+  - todo 26 acceptance : "a differential test asserts the Rust model list equals
+                          `opencode models --format json` (normalized)"
+  - todo 60 QA (happy) : "after loading, `models --format json` includes a
+                          `kiro-auth/*` model"
+
+Both todos are `[x]`. A completed ledger cannot simultaneously assert that an
+upstream command does not exist and claim two completed items were accepted
+through it.
+
+================================================================================
+2. ORACLE PROOF — `--format` DOES NOT EXIST
+================================================================================
+Binary (newest installed release, per the standing "newest release is the oracle"
+constraint; no version pinned in the amendment text):
+  /config/.local/share/mise/installs/opencode/1.18.15/opencode
+
+$ /config/.local/share/mise/installs/opencode/1.18.15/opencode models --help
+opencode models [provider]
+
+list all available models
+
+Positionals:
+  provider  provider ID to filter models by                              [string]
+
+Options:
+  -h, --help        show help                                           [boolean]
+  -v, --version     show version number                                 [boolean]
+      --print-logs  print logs to stderr                                [boolean]
+      --log-level   log level    [string] [choices: "DEBUG","INFO","WARN","ERROR"]
+      --pure        run without external plugins                        [boolean]
+      --verbose     use more verbose model output (includes metadata like costs)
+                                                                        [boolean]
+      --refresh     refresh the models cache from models.dev            [boolean]
+
+exit code 0. There is NO `--format` flag. The real surfaces are the plain
+`models` listing and `models --verbose` (adds metadata such as cost).
+
+This port's flag set correctly matches upstream, so implementing `--format` to
+make the stale text true would itself break command parity — the outcome F1
+already ruled out: "implementing a subject-only JSON flag would itself violate
+command parity and is not the correct fix."
+
+================================================================================
+3. CHANGES MADE (.omo/plans/opencode-rust.md ONLY)
+================================================================================
+a) todo 26 title — now: "expect parity with `opencode models` /
+   `opencode models --verbose`".
+
+b) todo 26 acceptance criterion — the differential test now compares against the
+   `opencode models` listing (normalized; `--verbose` when metadata such as cost
+   is compared). Followed by an inline disclosure block:
+   "**AMENDED 2026-08-11 (todo 145) — the previous requirement was invalid, not
+   merely reworded**" — which quotes the full real flag set, cites F1's ruling,
+   and states explicitly that the SUBSTANCE is unchanged (catalog parity is still
+   required); only the command through which parity is observed is corrected.
+   Note this todo's own References line already cited
+   `models [provider] --verbose --refresh`, so the amendment removes an internal
+   contradiction rather than introducing one.
+
+c) todo 60 QA happy scenario — now "the plain `models` listing includes a
+   `kiro-auth/*` model", with a parallel inline disclosure block stating the
+   previous QA command was invalid, quoting the real flag set, and affirming the
+   QA INTENT (that a plugin-contributed provider actually reaches the
+   user-visible catalog) is unchanged and still required.
+
+d) todo 145's checkbox: `- [ ] 145.` -> `- [x] 145.`
+
+Amendment style matches the existing `**AMENDED 2026-08-10, third correction to
+this criterion**` block on success criterion 6, so the document reads
+consistently. Neither todo was weakened, deleted, or unchecked. No product
+source, test, or documentation file was touched.
+
+================================================================================
+4. VERIFICATION — grep closure
+================================================================================
+$ grep -n "models --format json" .omo/plans/opencode-rust.md
+ 378  <- inside todo 26's AMENDED disclosure note (quoting the invalid text)
+ 687  <- inside todo 60's AMENDED disclosure note (quoting the invalid text)
+1302  <- todo 139's "Must NOT use `models --format json` to prove it" note
+1350  <- todo 145's own title (this task)
+1352  <- todo 145's own acceptance criterion (this task)
+1393  <- success criterion 6's AMENDED history note
+
+6 occurrences, ALL inside explicit amendment/history/Must-NOT notes or todo 145's
+own self-description. ZERO occurrences inside a live requirement or acceptance
+criterion. Closure achieved and the correction is disclosed, not silent.
+
+================================================================================
+5. GATE
+================================================================================
+$ cargo test --workspace --offline
+TOTAL passed=3365 failed=0
+
+Unchanged from the pre-task baseline (3365 / 0), as expected: this change is
+plan text only and touches no code. No EAGAIN transient was observed; a single
+run sufficed.
+
+================================================================================
+6. ADJACENT DEFECT FOUND — NOT FIXED (out of scope, recorded for follow-up)
+================================================================================
+Per the inherited wisdom ("when you fix one, grep the whole document"), I swept
+every `--format json` occurrence, not just the three cited lines. The same
+defect class survives on a DIFFERENT todo:
+
+  line 270, todo 13 (CHECKED): "a differential test asserts the Rust agent list
+  equals `opencode agent list --format json` (normalized)"
+
+Measured with the same oracle:
+$ /config/.local/share/mise/installs/opencode/1.18.15/opencode agent list --help
+opencode agent list
+list all available agents
+Options:
+  -h, --help        show help                                           [boolean]
+  -v, --version     show version number                                 [boolean]
+      --print-logs  print logs to stderr                                [boolean]
+      --log-level   log level    [string] [choices: "DEBUG","INFO","WARN","ERROR"]
+      --pure        run without external plugins                        [boolean]
+
+`agent list` has NO `--format` flag either — and unlike `models` it does not even
+offer `--verbose`. So todo 13's checked acceptance criterion names a nonexistent
+command, exactly as todos 26 and 60 did. Todo 13's own title correctly says
+"expect parity with `opencode agent list`", so the contradiction is internal to
+that todo.
+
+NOT fixed here: this task's scope explicitly forbids touching other todos' text.
+Needs its own todo.
+
+Note that `--format json` IS genuine for OTHER commands and those references are
+correct: `db` really does offer `--format json|tsv` (cli/cmd/db.ts:8-36), which
+is why todos 43/44-area lines 647/649/650 and line 866 legitimately mention it.
+The flag is per-command, not global — that is precisely the trap that produced
+this defect family.

@@ -6794,3 +6794,35 @@ F3 的隔离复现是**人为加深嵌套**来探测深度预算，那测的是�
 > **接通一条此前从不执行的路径时，不仅要证明它生效，还要证明它经过的每个转换没有损坏数据。** 「新接的线让沿途某个既有的有损转换第一次被执行」是独立的一类缺陷，且不会被任何「功能是否生效」的测试发现。
 
 F3 是靠真的跑产品发现的，第五次。
+## 2026-08-11 — task 145: `models --format json` purged from live requirements (F4 wave-7 finding 1)
+
+**Oracle**: `opencode models --help` on 1.18.15 offers exactly `-h/--help`, `-v/--version`,
+`--print-logs`, `--log-level`, `--pure`, `--verbose`, `--refresh` + optional `[provider]`.
+**No `--format` flag.** Real surfaces: plain `models`, and `models --verbose` for metadata/cost.
+
+Fixed in `.omo/plans/opencode-rust.md` (plan text only, no code touched):
+- todo 26 title + acceptance criterion -> plain `models` / `models --verbose`
+- todo 60 QA happy scenario -> plain `models` listing
+- Each carries an inline `**AMENDED 2026-08-11 (todo 145) — the previous requirement was
+  invalid, not merely reworded**` block quoting the real flag set and F1's ruling, matching
+  the existing style of success criterion 6's amendment. Substance of both todos preserved:
+  catalog parity and the plugin-provider-reaches-catalog QA intent still stand; only the
+  observation command was corrected. Neither todo weakened or unchecked.
+
+Closure: all 6 surviving `models --format json` strings are inside amendment/history/Must-NOT
+notes or todo 145's own text. Zero in a live requirement. Gate unchanged: 3365 passed / 0 failed.
+
+### NEW FINDING — same defect class, NOT fixed (needs its own todo)
+
+`.omo/plans/opencode-rust.md:270`, **todo 13 (checked)**: acceptance criterion requires
+`a differential test asserts the Rust agent list equals `opencode agent list --format json``.
+Measured: `opencode agent list --help` offers only `-h/--help`, `-v/--version`, `--print-logs`,
+`--log-level`, `--pure` — **no `--format`, and not even `--verbose`**. Todo 13's own title
+already correctly says "expect parity with `opencode agent list`", so the contradiction is
+internal to the todo. Out of scope for task 145 (forbidden from editing other todos' text).
+
+**This is the 6th instance of the recurring project defect**: a contract correct in the
+executable gate and stale in the prose nothing derives from. Root lesson for future waves:
+`--format json` is **per-command, not global**. `db` genuinely has `--format json|tsv`
+(`cli/cmd/db.ts:8-36`), which is what makes the flag look universal and seeds this defect
+family. Before writing `--format json` into any criterion, run that subcommand's `--help`.
