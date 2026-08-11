@@ -2412,3 +2412,44 @@ todo 144 接进 `plugin_runtime.rs:82,137`，插件工具走与 config-directory
 已回退、拆提交、改为 `git add crates/` 加逐个点名的 `.omo` 文件、确认暂存区零 `target/` 后重做。
 
 **这是同一种错误的第二次**（第一次是带冲突标记的提交）：**我用了一个比意图更宽的操作**。`-A` 比「我改的文件」宽，`-f` 比「只越过 `.omo` 这一条」宽。已给 `premerge.sh` 加第二道闸门：暂存区或索引里出现 `target/` 就拒绝合并——因为**闸门只能挡它认识的那一种脏**。
+
+## Wave 55 (2026-08-11)：第七轮评审 → 149/149 实现任务全部完成
+
+`main` = `f7447387`，**3390 测试通过**（本轮 +25），clippy 0，fmt 干净。**149/153，只剩 F1-F4。**
+
+### 第七轮四位裁决
+
+| 评审员 | 裁决 | 内容 |
+|---|---|---|
+| **F1** | REJECT | **SATISFIED 17 / NOT SATISFIED 1**，唯一未满足项是自指的四审门。原话：*"No implementation, compatibility, performance-methodology, or documentation blocker remains in F1's criteria 1–17 audit."* 轨迹 9/8/1 → 12/6 → 14/4 → 15/3 → **17/1** |
+| **F2** | REJECT | 一条：十七个有文档的 plugin hook 在生产里没有触发点 |
+| **F3** | 未出报告 | 静默 68 分钟后任务消失，**第三次**因超时丢报告。但停滞前抓到了 seam #18 |
+| **F4** | REJECT | 三条：任务合约仍承诺 `models --format json`；`provider-coverage-by-wire-family` 把未接线面贴成 divergence；活跃差分测试绕过最新版 oracle |
+
+### 五条新任务（145-149），全部完成
+
+- **145**：我上轮改了权威准则却漏了两个**已勾选**的任务合约。F4 抓得准——修一半比不修更糟，因为账本自相矛盾。已改为真实面并标注修正理由，附实测 `models --help` 输出为证。
+- **146**：十个活跃差分测试硬编码 `installs/opencode/1.18.12`，而 oracle 固定 1.18.15——**可能测着旧版却把兼容性归给新版**。新增 `no_pinned_oracle_paths.rs` 结构性守卫，我植入一条硬编码路径验证它真能拦。
+- **147 / SEAM #18**：见下。
+- **148**：生产 turn 只注册 `compatible` 一个 factory，而 divergence 声称"按 wire-family 覆盖"。现注册 **8 个 family**（compatible、anthropic、openai、bedrock、bedrock/mantle、google、google-vertex、google-vertex/anthropic）。我抽验 google 与 anthropic 两个变异，各被 `production_*_registration_dispatches_and_decodes_*` 抓住——测试名断言的是**派发与解码**，不只是注册。divergence 条目改为"未知 npm transport 的选择行为"，即双方都实现后的真实差异。
+- **149 / seam #17 的规模版**：21 个 advertised hook 全部接入真实生产路径。核心是 `crates/oc-plugin/src/support.rs` 的**穷尽 `match`**——我植入一个新 `HookName` 变体，`cargo build` 直接编译失败。抽验 `PermissionAsk`、`ShellEnv` 两个 dispatch 变异，各被具名生产路径测试抓住。公开文档由同一矩阵生成，无法漂移。
+
+### SEAM #18：有界编码器静默腐化它写回的 provider
+
+`shim.mjs:96` 的 `MAX_DEPTH = 8` 把超深对象换成 `{$truncated:true}`；`bridge.rs:314` 用 JS 返回值**整体覆盖**真 provider；`resolved.rs:75` 的 `BTreeMap<String, JsonMap>` **接受任意 JSON**——所以腐化不报错。
+
+我量了真数据：**0 个截断、6 个 `thinkingBudget` 全存活，余量 1 层**。F3 的直觉对，具体结论错（它自己的记录写着 *"Reproducer didn't truncate"*，那是人为加深嵌套探测深度预算）。我按「今天不复现、但越界即静默腐化」立项——**夸大未复现的缺陷和漏掉真缺陷同样是失真**。
+
+147 选了**拒绝并报明 JSON Pointer 路径**，而非抬高上限（上限保持 8，界未削弱），并把 `args.map(encode)` 改成让每个参数各自成为编码根，余量从 1 层变回 2 层。
+
+**因果链里我的责任**：截断逻辑 `f66ab935` 就有，144 没写它。但 144 之前 `Auth` 从不 dispatch，provider 根本不过 JS 边界——**144 把休眠缺陷变成了活的**，而我的验证只证明了「功能生效」，没证明「往返途中没损坏别的东西」。
+
+> **接通一条此前从不执行的路径时，不仅要证明它生效，还要证明它经过的每个转换没有损坏数据。**
+
+### F3 第三次丢报告
+
+它真在干活（构建了二进制、起了 mock provider 和真服务器、两个 tmux 会话、`env -i` 全隔离），不是上游中断。但连续三轮因超时丢报告，而它是唯一靠真机使用找到最严重缺陷的评审员——**五个 seam 由它发现**。第八轮必须再压缩它的探索预算。
+
+### 宿主 EAGAIN
+
+148 和 149 都两次撞 `EAGAIN: Resource temporarily unavailable`（`oc-config` 测试枚举阶段），按其两次验证上限停下未提交。我在同一棵树上跑同样命令**均无 EAGAIN**，3382 / 3390 全绿。这是宿主瞬时问题，不是缺陷——但它反复消耗子 agent 的验证配额，所以我改为在提示里明确授权「撞 EAGAIN 也要提交，我来跑门」。
