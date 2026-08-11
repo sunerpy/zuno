@@ -7089,3 +7089,25 @@ agent list   → 32 行,含全部嵌套 agent
 153 把夹具刷新到与实时文件一致,关闭了 seam #19(注释说谎),但**准则 2 要的是输出 parity,不是输入一致**。F1 说得准:*"That guard proves input identity, not output parity."* 我上一轮验收 153 时只验了漂移守卫真能拦,**没验它是否达成了准则 2 本身要的东西**——我验的是它做了什么,不是它该做什么。
 
 > **验收一条修复时,除了确认它声称的改动生效,还要回头对照它要满足的原始准则。** 守卫可以完美工作,同时完全没解决准则要求的问题。
+
+## [2026-08-11] Todo 161 — criterion 2 reaches exact pure-mode parity
+
+`debug config` now overlays the same runtime Markdown agent and command maps used by execution and
+emits source-ordered, identity-deduplicated `plugin_origins`. The production differential captures
+stdout through files because released 1.18.15 truncates piped output at exactly 65,536 bytes. After
+removing only released's empty deprecated `mode` diagnostic object, both normalized documents are
+252,891 bytes and exactly equal: 9 agents, 2 commands, and 3 plugin origins. No divergence entry was
+needed, `agent list` was not changed, and todo 153's live-file drift guard still passes.
+
+One runtime consequence surfaced during the first workspace gate: execution had not previously loaded
+Markdown commands, and a naive shared loader let its result outrank plugin `config` hook mutations.
+`TurnHost` now loads Markdown commands but overlays the final plugin-mutated `plan.config.command` last;
+`ordinary_plugin_lifecycle_hooks_run_through_the_real_binary` proves that precedence.
+
+The host could not complete a single monolithic workspace-test process: three attempts stopped only
+when Rust's test harness received `EAGAIN` (`Resource temporarily unavailable`) while listing tests,
+including with Cargo and test thread counts limited to one. No assertion failed before those stops.
+Targeted criterion-2, runtime-discovery, live-drift, plugin-lifecycle, provenance, catalog, and mutation
+checks all passed; `rust-analyzer diagnostics .`, workspace build, and `cargo check -p oc-cli --offline`
+also passed. Per the two-status-check ceiling, the environment failure was recorded rather than retried
+indefinitely.

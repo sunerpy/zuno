@@ -284,7 +284,7 @@ pub fn discover_in_directory(dir: &Path) -> Result<Vec<MarkdownAgent>, ConfigErr
 }
 
 /// Every `*.md` under `root`, recursively, sorted, following symlinks.
-fn markdown_files(root: &Path) -> Result<Vec<PathBuf>, ConfigError> {
+pub(crate) fn markdown_files(root: &Path) -> Result<Vec<PathBuf>, ConfigError> {
     let mut files = Vec::new();
     let mut queue = vec![root.to_path_buf()];
     let mut visited = Vec::new();
@@ -356,6 +356,13 @@ pub fn read_markdown_agent(dir: &Path, file: &Path) -> Result<Option<MarkdownAge
         .get("name")
         .and_then(Value::as_str)
         .map_or(derived, str::to_owned);
+    object.insert("name".to_owned(), Value::String(name.clone()));
+    object
+        .entry("options".to_owned())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    object
+        .entry("permission".to_owned())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
     object.insert(
         "prompt".to_owned(),
         Value::String(document.content.trim().to_owned()),
@@ -378,7 +385,7 @@ pub fn read_markdown_agent(dir: &Path, file: &Path) -> Result<Option<MarkdownAge
 }
 
 /// `path.relative(dir, item)` with `/` separators, for the name rule.
-fn relative_path(dir: &Path, file: &Path) -> String {
+pub(crate) fn relative_path(dir: &Path, file: &Path) -> String {
     file.strip_prefix(dir)
         .unwrap_or(file)
         .to_string_lossy()
