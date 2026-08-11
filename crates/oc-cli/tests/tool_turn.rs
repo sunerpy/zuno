@@ -116,7 +116,25 @@ export default {
     "command.execute.before": async (input, output) => {
       output.parts[0].text += ":command";
     },
-    "chat.message": async (_input, output) => {
+    "chat.message": async (input, output) => {
+      appendFileSync(options.eventFile, `chat.message=${JSON.stringify({ input, message: output.message })}\n`);
+      const expected = {
+        id: input.messageID,
+        sessionID: input.sessionID,
+        agent: input.agent,
+        model: input.model,
+      };
+      const missing = Object.keys(expected).filter((field) => output.message[field] === undefined);
+      if (missing.length > 0) {
+        output.parts[0].text += `:missing-chat-message-${missing.join("-")}`;
+        return;
+      }
+      for (const [field, value] of Object.entries(expected)) {
+        if (JSON.stringify(output.message[field]) !== JSON.stringify(value)) {
+          output.parts[0].text += `:wrong-chat-message-${field}`;
+          return;
+        }
+      }
       output.parts[0].text += ":chat";
     },
     "chat.params": async (_input, output) => {
@@ -1135,6 +1153,30 @@ async fn ordinary_plugin_lifecycle_hooks_run_through_the_real_binary() {
     let captured = provider.captured().await;
     provider.shutdown().await;
 
+    let events = std::fs::read_to_string(&event_file).unwrap_or_default();
+    let chat_message = events
+        .lines()
+        .find_map(|line| line.strip_prefix("chat.message="))
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("chat.message capture"))
+        .expect("the production chat.message hook must record its payload");
+    let input = &chat_message["input"];
+    let message = &chat_message["message"];
+    assert_eq!(
+        message["id"], input["messageID"],
+        "chat.message output.message.id must carry the live message id"
+    );
+    assert_eq!(
+        message["sessionID"], input["sessionID"],
+        "chat.message output.message.sessionID must carry the live session id"
+    );
+    assert_eq!(
+        message["agent"], input["agent"],
+        "chat.message output.message.agent must carry the live agent"
+    );
+    assert_eq!(
+        message["model"], input["model"],
+        "chat.message output.message.model must carry the live model"
+    );
     assert!(
         output.status.success(),
         "lifecycle-plugin run failed\nstdout:\n{}\nstderr:\n{}",
@@ -1195,7 +1237,6 @@ async fn ordinary_plugin_lifecycle_hooks_run_through_the_real_binary() {
         Some("definition-hook-description"),
         "tool.definition did not mutate the provider-visible definition: {turn:#}"
     );
-    let events = std::fs::read_to_string(&event_file).unwrap_or_default();
     assert!(
         events.lines().any(|event| event == "turn.completed"),
         "the event hook did not observe the production turn stream: {events:?}"

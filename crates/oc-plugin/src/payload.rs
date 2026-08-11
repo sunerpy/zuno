@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use oc_db::message::PartRecord;
+use oc_db::message::{MessageRecord, PartRecord};
 use oc_llm::catalog::resolved::{JsonMap, ResolvedModel, ResolvedProvider};
 use oc_llm::event::Message;
 use oc_permission::PermissionRequest;
@@ -23,10 +23,10 @@ pub struct ChatMessageInput<'a> {
     pub variant: Option<&'a str>,
 }
 
-/// Mutable output of `chat.message`.
+/// Mutable output of `chat.message`, including the complete upstream user-message metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatMessageOutput {
-    pub message: Message,
+    pub message: MessageRecord,
     pub parts: Vec<PartRecord>,
 }
 
