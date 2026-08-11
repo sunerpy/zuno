@@ -60,12 +60,21 @@ pub enum ApiSurface {
 /// flow in this crate.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Spec {
-    /// The registry key being instantiated.
+    /// The provider identity being instantiated.
     ///
-    /// Present so a family serving several keys through one concrete type knows
-    /// which identity it is taking on, and so a factory's error can name it
-    /// without the registry having to stamp it.
+    /// Present so a family serving several identities through one concrete type
+    /// knows which profile it is taking on, and so a factory's error can name it
+    /// without the registry having to stamp it. This is deliberately separate
+    /// from [`factory`](Self::factory): OpenRouter, Groq and Azure all use the
+    /// `openai-compatible` factory while retaining distinct behavior.
     pub provider: String,
+
+    /// The registry factory that constructs this identity.
+    ///
+    /// Defaults to [`provider`](Self::provider), preserving the one-key case for
+    /// dedicated families. Production model selection overrides it only when
+    /// catalog transport metadata selects a shared wire-family factory.
+    factory: String,
 
     /// Which SDK surface to construct against, when the choice is fixed at
     /// construction time rather than per request.
@@ -118,10 +127,25 @@ impl Spec {
     /// nothing from the composition root.
     #[must_use]
     pub fn new(provider: impl Into<String>) -> Self {
+        let provider = provider.into();
         Self {
-            provider: provider.into(),
+            factory: provider.clone(),
+            provider,
             ..Self::default()
         }
+    }
+
+    /// Select a registry factory without changing the provider identity.
+    #[must_use]
+    pub fn with_factory(mut self, factory: impl Into<String>) -> Self {
+        self.factory = factory.into();
+        self
+    }
+
+    /// The registry key used to construct this provider identity.
+    #[must_use]
+    pub fn factory(&self) -> &str {
+        &self.factory
     }
 
     /// Fix the SDK surface to construct against.

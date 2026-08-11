@@ -164,33 +164,68 @@ fn model_selection_splits_only_the_provider_prefix() {
 #[test]
 fn every_declared_wire_transport_selects_its_production_registry_key() {
     let cases = [
-        ("@ai-sdk/anthropic", "anthropic"),
-        ("@ai-sdk/amazon-bedrock", "amazon-bedrock"),
-        ("@ai-sdk/amazon-bedrock/mantle", "amazon-bedrock/mantle"),
-        ("@ai-sdk/google", "google"),
-        ("@ai-sdk/google-vertex", "google-vertex"),
-        ("@ai-sdk/google-vertex/anthropic", "google-vertex/anthropic"),
-        ("@ai-sdk/openai", "openai"),
-        ("@ai-sdk/openai-compatible", COMPATIBLE_PROVIDER),
-        ("@openrouter/ai-sdk-provider", COMPATIBLE_PROVIDER),
+        ("anthropic", "@ai-sdk/anthropic", "anthropic"),
+        ("amazon-bedrock", "@ai-sdk/amazon-bedrock", "amazon-bedrock"),
+        (
+            "amazon-bedrock/mantle",
+            "@ai-sdk/amazon-bedrock/mantle",
+            "amazon-bedrock/mantle",
+        ),
+        ("google", "@ai-sdk/google", "google"),
+        ("google-vertex", "@ai-sdk/google-vertex", "google-vertex"),
+        (
+            "google-vertex/anthropic",
+            "@ai-sdk/google-vertex/anthropic",
+            "google-vertex/anthropic",
+        ),
+        ("openai", "@ai-sdk/openai", "openai"),
+        (
+            "private-gateway",
+            "@ai-sdk/openai-compatible",
+            COMPATIBLE_PROVIDER,
+        ),
     ];
 
-    for (npm, expected) in cases {
+    for (provider_id, npm, expected) in cases {
         assert_eq!(
-            provider_key_for_npm(npm),
+            provider_factory_key(provider_id, npm),
             Some(expected),
             "resolved npm metadata `{npm}` selected the wrong production factory"
         );
     }
-    assert_eq!(provider_key_for_npm("@ai-sdk/not-implemented"), None);
+    assert_eq!(
+        provider_factory_key("unknown", "@ai-sdk/not-implemented"),
+        None
+    );
 }
 
-fn production_wire_spec(
+fn named_compatible_cases() -> [(&'static str, &'static str); 15] {
+    [
+        ("openrouter", "@openrouter/ai-sdk-provider"),
+        ("xai", "@ai-sdk/xai"),
+        ("mistral", "@ai-sdk/mistral"),
+        ("groq", "@ai-sdk/groq"),
+        ("deepinfra", "@ai-sdk/deepinfra"),
+        ("cerebras", "@ai-sdk/cerebras"),
+        ("cohere", "@ai-sdk/cohere"),
+        ("togetherai", "@ai-sdk/togetherai"),
+        ("perplexity", "@ai-sdk/perplexity"),
+        ("vercel", "@ai-sdk/vercel"),
+        ("alibaba", "@ai-sdk/alibaba"),
+        ("gitlab", "gitlab-ai-provider"),
+        ("venice", "venice-ai-sdk-provider"),
+        ("azure", "@ai-sdk/azure"),
+        ("github-copilot", "@ai-sdk/github-copilot"),
+    ]
+}
+
+fn production_wire_spec_result(
+    provider_id: &str,
     npm: &str,
     model_id: &str,
     endpoint: &str,
     extra_options: serde_json::Value,
-) -> Spec {
+) -> Result<Spec, String> {
     let mut options = extra_options
         .as_object()
         .cloned()
@@ -205,17 +240,20 @@ fn production_wire_spec(
             "limit": {"context": 100000, "output": 8192}
         }),
     );
+    let mut providers = serde_json::Map::new();
+    providers.insert(
+        provider_id.to_owned(),
+        serde_json::json!({
+            "id": provider_id,
+            "name": "Production wire replay",
+            "env": [],
+            "npm": npm,
+            "options": serde_json::Value::Object(options),
+            "models": serde_json::Value::Object(models)
+        }),
+    );
     let config: oc_config::schema::Config = serde_json::from_value(serde_json::json!({
-        "provider": {
-            "wire-test": {
-                "id": "wire-test",
-                "name": "Production wire replay",
-                "env": [],
-                "npm": npm,
-                "options": serde_json::Value::Object(options),
-                "models": serde_json::Value::Object(models)
-            }
-        }
+        "provider": serde_json::Value::Object(providers)
     }))
     .expect("production replay config");
     let catalog = Catalog::resolve(
@@ -223,21 +261,57 @@ fn production_wire_spec(
         &ResolveInput::new().with_config(&config),
     );
     let model = catalog
-        .model("wire-test", model_id)
+        .model(provider_id, model_id)
         .expect("production replay model resolves");
-    model_spec(&catalog, model, &Env::empty()).expect("production replay spec resolves")
+    model_spec(&catalog, model, &Env::empty())
 }
 
-async fn replay_production_registration(
-    registry_key: &str,
+fn production_wire_spec(
+    provider_id: &str,
     npm: &str,
     model_id: &str,
-    cassette: &str,
+    endpoint: &str,
     extra_options: serde_json::Value,
+) -> Spec {
+    production_wire_spec_result(provider_id, npm, model_id, endpoint, extra_options)
+        .expect("production replay spec resolves")
+}
+
+fn pinned_wire_spec(provider_id: &str, model_id: &str, endpoint: &str, expected_npm: &str) -> Spec {
+    let document: oc_llm::catalog::models_dev::CatalogDocument = serde_json::from_str(
+        include_str!("../../../oc-llm/tests/fixtures/models-dev-pinned.json"),
+    )
+    .expect("pinned catalog fixture");
+    let mut providers = serde_json::Map::new();
+    providers.insert(
+        provider_id.to_owned(),
+        serde_json::json!({"options": {"baseURL": endpoint}}),
+    );
+    let config: oc_config::schema::Config = serde_json::from_value(serde_json::json!({
+        "provider": serde_json::Value::Object(providers)
+    }))
+    .expect("pinned provider endpoint override");
+    let catalog = Catalog::resolve(&document, &ResolveInput::new().with_config(&config));
+    let model = catalog
+        .model(provider_id, model_id)
+        .expect("pinned provider model resolves");
+    assert_eq!(model.api.npm, expected_npm);
+    model_spec(&catalog, model, &Env::empty()).expect("pinned provider spec resolves")
+}
+
+async fn replay_selected_production_spec<F>(
+    provider_id: &str,
+    registry_key: &str,
+    model_id: &str,
+    cassette: &str,
     endpoint_suffix: &str,
     expected_text: &str,
-) {
-    let scenario = oc_testkit::Scenario::new(registry_key)
+    build_spec: F,
+) where
+    F: FnOnce(&str) -> Spec,
+{
+    let scenario = oc_testkit::Scenario::new(provider_id)
+        .on_path(endpoint_suffix)
         .from_oracle_cassette(cassette)
         .expect("recorded provider response loads");
     let mock = oc_testkit::MockProvider::start(vec![scenario])
@@ -250,13 +324,17 @@ async fn replay_production_registration(
     } else {
         mock.base_url().to_owned()
     };
-    let spec = production_wire_spec(npm, model_id, &endpoint, extra_options);
-    assert_eq!(spec.provider, registry_key);
+    let spec = build_spec(&endpoint);
+    assert_eq!(
+        spec.provider, provider_id,
+        "production selection collapsed `{provider_id}` into its factory"
+    );
+    assert_eq!(spec.factory(), registry_key);
     let credential = Credential::Api {
         key: oc_auth::Secret::new("production-replay-credential"),
         metadata: None,
     };
-    let providers = provider_registry("wire-test", Some(credential));
+    let providers = provider_registry(provider_id, Some(credential));
     assert!(
         providers.is_registered(registry_key),
         "production registry omitted `{registry_key}`"
@@ -275,7 +353,7 @@ async fn replay_production_registration(
         UserMessageInput {
             session_id: &session.id,
             agent: "build",
-            provider_id: "wire-test",
+            provider_id,
             model_id,
             text: "Reply with a short greeting.",
             message_id: None,
@@ -331,6 +409,32 @@ async fn replay_production_registration(
     mock.shutdown().await;
 }
 
+async fn replay_production_registration(
+    registry_key: &str,
+    npm: &str,
+    model_id: &str,
+    cassette: &str,
+    extra_options: serde_json::Value,
+    endpoint_suffix: &str,
+    expected_text: &str,
+) {
+    let provider_id = if registry_key == COMPATIBLE_PROVIDER {
+        "wire-test"
+    } else {
+        registry_key
+    };
+    replay_selected_production_spec(
+        provider_id,
+        registry_key,
+        model_id,
+        cassette,
+        endpoint_suffix,
+        expected_text,
+        |endpoint| production_wire_spec(provider_id, npm, model_id, endpoint, extra_options),
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn production_compatible_registration_dispatches_and_decodes_recorded_sse() {
     replay_production_registration(
@@ -341,6 +445,147 @@ async fn production_compatible_registration_dispatches_and_decodes_recorded_sse(
         serde_json::json!({}),
         "/v1/chat/completions",
         "Hello!",
+    )
+    .await;
+}
+
+#[test]
+fn every_todo_94_identity_reaches_its_profile_from_resolved_config() {
+    for (provider_id, npm) in named_compatible_cases() {
+        let spec = production_wire_spec(
+            provider_id,
+            npm,
+            "selection-probe",
+            "https://selection.test/v1",
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            spec.provider, provider_id,
+            "identity collapsed for {provider_id}"
+        );
+        assert_eq!(spec.factory(), COMPATIBLE_PROVIDER, "{provider_id}");
+        let profile = oc_provider_compatible::family::resolve(&spec)
+            .unwrap_or_else(|error| panic!("{provider_id} was not reachable: {error}"));
+        assert_eq!(
+            profile.provider, provider_id,
+            "wrong profile for {provider_id}"
+        );
+        assert_eq!(
+            profile.routes_upstreams,
+            matches!(provider_id, "openrouter" | "vercel"),
+            "router behavior did not survive selection for {provider_id}"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_transport_is_refused_from_resolved_config() {
+    let error = production_wire_spec_result(
+        "unknown-provider",
+        "@ai-sdk/not-implemented",
+        "unknown-model",
+        "https://unknown.test/v1",
+        serde_json::json!({}),
+    )
+    .expect_err("unknown transports must not fall through to the compatible factory");
+    assert!(error.contains("@ai-sdk/not-implemented"), "{error}");
+}
+
+#[tokio::test]
+async fn production_openrouter_keeps_router_identity_and_dispatches_recorded_sse() {
+    replay_selected_production_spec(
+        "openrouter",
+        COMPATIBLE_PROVIDER,
+        "openai/gpt-4o-mini",
+        "openai-compatible-chat/openrouter-streams-text",
+        "/v1/chat/completions",
+        "Hello!",
+        |endpoint| {
+            production_wire_spec(
+                "openrouter",
+                "@openrouter/ai-sdk-provider",
+                "openai/gpt-4o-mini",
+                endpoint,
+                serde_json::json!({}),
+            )
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn production_azure_selector_dispatches_to_responses() {
+    replay_selected_production_spec(
+        "azure",
+        COMPATIBLE_PROVIDER,
+        "deployment-a",
+        "openai-compatible-chat/deepseek-streams-text",
+        "/v1/responses",
+        "Hello!",
+        |endpoint| {
+            production_wire_spec(
+                "azure",
+                "@ai-sdk/azure",
+                "deployment-a",
+                endpoint,
+                serde_json::json!({}),
+            )
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn production_copilot_rule_dispatches_by_model_id() {
+    for (model_id, endpoint_suffix) in [
+        ("gpt-5", "/v1/responses"),
+        ("gpt-5-mini", "/v1/chat/completions"),
+    ] {
+        replay_selected_production_spec(
+            "github-copilot",
+            COMPATIBLE_PROVIDER,
+            model_id,
+            "openai-compatible-chat/deepseek-streams-text",
+            endpoint_suffix,
+            "Hello!",
+            |endpoint| {
+                production_wire_spec(
+                    "github-copilot",
+                    "@ai-sdk/github-copilot",
+                    model_id,
+                    endpoint,
+                    serde_json::json!({}),
+                )
+            },
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn pinned_groq_transport_selects_compatible_factory_and_dispatches() {
+    replay_selected_production_spec(
+        "groq",
+        COMPATIBLE_PROVIDER,
+        "allam-2-7b",
+        "openai-compatible-chat/groq-streams-text",
+        "/v1/chat/completions",
+        "Hello!",
+        |endpoint| pinned_wire_spec("groq", "allam-2-7b", endpoint, "@ai-sdk/groq"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn pinned_mistral_transport_selects_compatible_factory_and_dispatches() {
+    replay_selected_production_spec(
+        "mistral",
+        COMPATIBLE_PROVIDER,
+        "codestral-latest",
+        "openai-compatible-chat/togetherai-streams-text",
+        "/v1/chat/completions",
+        "Hello!",
+        |endpoint| pinned_wire_spec("mistral", "codestral-latest", endpoint, "@ai-sdk/mistral"),
     )
     .await;
 }
@@ -495,7 +740,7 @@ fn a_config_specified_model_selects_with_no_catalog_at_all() {
     assert_eq!(model, "house-model");
     assert_eq!(resolved.api.url, "https://gateway.internal/v1");
     assert!(
-        provider_key_for_npm(&resolved.api.npm).is_some(),
+        provider_factory_key(&resolved.provider_id, &resolved.api.npm).is_some(),
         "the config's transport must survive resolution or the turn is refused later"
     );
 }

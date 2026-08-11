@@ -5,8 +5,9 @@
 //! Every id in [`crate::family::CLAIMED`] is served by this single type. The
 //! differences between them are data — a base URL, a surface rule, a capability
 //! set, a header — so there is no per-vendor struct and no per-vendor branch in
-//! the request path. `oc-cli` registers the same factory under each key, and
-//! [`Spec::provider`] tells the instance which identity it took on.
+//! the request path. `oc-cli` selects this crate's shared wire-family factory,
+//! while [`Spec::provider`] independently tells the instance which identity it
+//! took on.
 //!
 //! # Refusal is a construction-time decision
 //!
