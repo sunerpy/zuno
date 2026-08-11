@@ -1,0 +1,167 @@
+Task 147 evidence — bounded JS encoder/provider write-back
+Date: 2026-08-11
+Worktree: /config/workspace/ProdDir/AI/oc-wt/t147
+Base: 7421e249
+
+1. Production path and permissive sink
+
+The exercised path is:
+  oc-cli PluginRuntime::apply_catalog
+  -> AuthLoader::load
+  -> JsHost::call_mutating
+  -> shim.mjs "call"
+  -> encode callback value and mutated arguments
+  -> bridge.rs deserializes arguments[1] as ResolvedProvider
+  -> provider write-back
+
+ResolvedModel::variants is BTreeMap<String, JsonMap>. JsonMap is an open
+serde_json::Map, so {"$truncated":true} is valid data and deserialization does not
+detect that the encoder replaced a real object.
+
+2. Reproduction before editing production code
+
+The Node probe read crates/oc-config/tests/fixtures/user-config.json directly and
+ran the production encode algorithm with MAX_DEPTH=8 over [null, provider].
+
+Depth convention: the instrumented encoder is zero-based. Therefore provider
+depth 5 / args depth 6 below correspond to the plan's 1-based object levels 6 / 7.
+
+Real google provider:
+  deepest object depth within provider: 5 (level 6)
+  path: $.models.antigravity-claude-opus-4-5-thinking.variants.low.thinkingConfig
+  deepest object depth under args root: 6 (level 7)
+  source JSON bytes: 2820
+  old round-trip byte-identical: true
+  old truncation markers: none
+
+The real path extended to provider-relative depth 7:
+  path: ...variants.low.thinkingConfig.extra.nested
+  source JSON bytes: 2863
+  old encode(args) byte-identical: false
+  old marker:
+    $[1].models.antigravity-claude-opus-4-5-thinking.variants.low.thinkingConfig.extra.nested
+  per-argument encoding byte-identical: true
+
+One further provider level (depth 8):
+  path: ...thinkingConfig.extra.nested.deeper
+  source JSON bytes: 2896
+  per-argument encoding byte-identical: false
+  marker: ...thinkingConfig.extra.nested.deeper
+
+This establishes both sides of the cliff: today's fixture survives, while a real
+variant path extended to the args-consumed boundary is silently replaced by the
+old implementation. It also identifies the first depth that the fixed per-argument
+bound must continue to refuse.
+
+3. Design selected
+
+Selected: distinguish host-supplied mutating arguments from arbitrary plugin
+graphs, while refusing any still-lossy provider write-back.
+
+  * shim.mjs encodes every mutated argument separately from depth 0. The transport
+    args array no longer consumes one of the eight levels belonging to provider data.
+  * MAX_DEPTH remains 8. Callback return values and every individual mutated
+    argument still stop at that depth.
+  * A generated truncation marker now carries a JSON Pointer in $path.
+  * bridge.rs searches arguments[1] for a marker before deserialization. It returns
+    BridgeError::TruncatedProvider with plugin and path and never assigns provider.
+
+Rejected alternatives:
+
+  * Raising MAX_DEPTH merely relocates the cliff and was explicitly forbidden.
+  * Removing/exempting the bound for all mutated arguments permits a plugin to
+    attach an unbounded internal graph, violating the bounded-memory requirement.
+  * Refusal alone, while still charging the args transport wrapper, is safe but
+    rejects provider data one level earlier for a framing detail. The selected
+    hybrid preserves all provider objects below their own bound and refuses at it.
+  * Tightening ResolvedProvider/ResolvedModel was rejected. variants, options, and
+    related bags intentionally accept arbitrary upstream JSON; a closed schema
+    would reject valid providers and still would not generally identify encoder loss.
+
+4. Production-path tests
+
+All tests load the JavaScript module through load_js_plugins_ordered, obtain its
+real AuthLoader, and invoke AuthLoader::load. None calls encode directly.
+
+  js_auth_loader_round_trips_provider_data_below_its_depth_bound_byte_identically
+    Extends the real thinkingConfig path to provider depth 7 and compares serialized
+    ResolvedProvider bytes before and after a no-op JS loader.
+
+  js_auth_loader_refuses_a_truncated_provider_and_preserves_the_original
+    Places a real object at provider depth 8. Requires an error naming
+    resident-fixture.mjs and the exact JSON Pointer, then compares the provider bytes
+    with their pre-call copy.
+
+  js_auth_loader_still_bounds_an_arbitrary_plugin_return_graph
+    Makes the production JS auth loader return a ten-level plugin-originated graph.
+    Requires the eighth nested object to be a $truncated marker with its pointer.
+
+Before the fix:
+  cargo test -p oc-plugin --test js js_auth_loader_ --offline
+  result: 0 passed, 3 failed
+  failures: all three names above
+
+After the fix:
+  same command
+  result: 3 passed, 0 failed
+
+5. Mutation evidence
+
+Mutation: saved the production source diff, restored both shim.mjs and bridge.rs to
+7421e249, ran every new test exactly by name, then re-applied the source diff.
+
+  js_auth_loader_round_trips_provider_data_below_its_depth_bound_byte_identically
+    FAILED: the provider bytes contained $truncated in extra.nested.
+
+  js_auth_loader_refuses_a_truncated_provider_and_preserves_the_original
+    FAILED: load returned Ok({}); the lossy provider was accepted.
+
+  js_auth_loader_still_bounds_an_arbitrary_plugin_return_graph
+    FAILED: the old marker carried no $path, proving the path-bearing bounded marker
+    assertion observes the production shim rather than an equivalent mutant.
+
+All three failures were observed before restoration. The restored implementation's
+targeted run was 3/3 passing.
+
+6. Final gates
+
+MCP lsp_diagnostics:
+  Could not address the sibling worktree because the MCP is rooted at
+  /config/workspace/ProdDir/AI/opencode-rust. It rejected the absolute t147 path
+  before analyzing it.
+
+Fallback language diagnostics:
+  rust-analyzer diagnostics . --severity warning
+  result: success, no diagnostics (the command chain proceeded)
+
+JavaScript syntax:
+  node --check crates/oc-plugin/src/js/shim.mjs
+  result: success
+
+Formatting performed before the final gate:
+  cargo fmt -p oc-plugin
+  result: success
+
+Workspace gate attempt 1:
+  cargo test --workspace --offline
+  result: HOST TRANSIENT FAILURE, not a product assertion failure
+  detail: oc-config test enumeration returned EAGAIN / Resource temporarily
+          unavailable (WouldBlock); clippy/fmt/build after && did not execute
+
+Workspace gate attempt 2 (the single allowed retry):
+  CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=1 cargo test --workspace --offline
+  result: HOST TRANSIENT FAILURE, not a product assertion failure
+  detail: the run passed the first attempt's oc-config point and progressed to
+          oc-goal, where test enumeration again returned EAGAIN / Resource
+          temporarily unavailable; the remaining && gates did not execute
+
+Per the task's maximum of two status checks, no third verification was run.
+Therefore these required full-workspace outcomes remain unverified rather than
+being reported green:
+  cargo test --workspace --offline       NOT COMPLETED (EAGAIN twice)
+  cargo clippy --workspace --all-targets NOT EXECUTED after failed &&
+  cargo fmt --all --check                NOT EXECUTED after failed &&
+  cargo build --workspace --offline      NOT EXECUTED after failed &&
+
+The task-specific production-path test is green (3 passed, 0 failed), and its full
+source-revert mutation made all three tests fail exactly by name as recorded above.

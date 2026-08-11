@@ -64,6 +64,11 @@ pub enum BridgeError {
          expected `auto` or `code`"
     )]
     UnknownOAuthMethod { plugin: String, found: String },
+    #[error(
+        "plugin `{plugin}` truncated auth-loader provider data at `{path}`; \
+         refusing to overwrite the provider"
+    )]
+    TruncatedProvider { plugin: String, path: String },
 }
 
 /// Rebuild every auth hook the plugin registered.
@@ -312,6 +317,12 @@ impl AuthLoader for HandleAuthLoader {
             )
             .await?;
         if let Some(mutated) = arguments.get(1) {
+            if let Some(path) = truncated_path(mutated) {
+                return Err(Box::new(BridgeError::TruncatedProvider {
+                    plugin: self.host.plugin().to_owned(),
+                    path,
+                }));
+            }
             *provider = serde_json::from_value(mutated.clone())?;
         }
         Ok(value
@@ -538,6 +549,24 @@ fn inputs_value(inputs: Option<&AuthInputs>) -> Value {
 
 fn provider_value(provider: &ResolvedProvider) -> Value {
     serde_json::to_value(provider).unwrap_or(Value::Null)
+}
+
+fn truncated_path(value: &Value) -> Option<String> {
+    match value {
+        Value::Array(values) => values.iter().find_map(truncated_path),
+        Value::Object(map) => {
+            if map.get("$truncated").and_then(Value::as_bool) == Some(true) {
+                return Some(
+                    map.get("$path")
+                        .and_then(Value::as_str)
+                        .unwrap_or("/")
+                        .to_owned(),
+                );
+            }
+            map.values().find_map(truncated_path)
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => None,
+    }
 }
 
 /// A credential rendered for the plugin.
