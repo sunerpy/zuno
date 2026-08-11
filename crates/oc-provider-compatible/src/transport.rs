@@ -16,9 +16,11 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use oc_error::ProviderError;
+use oc_llm::sse::{STREAM_IDLE_TIMEOUT_ENV, StreamIdleTimeout};
 use serde_json::Value;
 
 use crate::stream::retry_after;
@@ -30,6 +32,23 @@ use crate::wire::ErrorEnvelope;
 /// holds the boundary state that makes a code point split across two chunks
 /// survive.
 pub type ChunkStream = Pin<Box<dyn Stream<Item = Result<Vec<u8>, ProviderError>> + Send>>;
+
+/// The default maximum silence between response-body chunks.
+///
+/// This leaves thirty seconds beyond the ninety-second reasoning gaps already
+/// accepted by the shared SSE policy, while still terminating before the
+/// two-hundred-second liveness probe that exposed the unbounded read.
+const DEFAULT_RESPONSE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The largest override that still satisfies the two-hundred-second liveness probe.
+///
+/// The twenty-second margin leaves time for scheduling and error propagation after
+/// the idle read itself expires.
+const MAX_RESPONSE_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+
+fn bounded_response_idle_timeout(idle: StreamIdleTimeout) -> StreamIdleTimeout {
+    StreamIdleTimeout::new(idle.duration().min(MAX_RESPONSE_IDLE_TIMEOUT))
+}
 
 /// One outbound request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +81,7 @@ pub trait Transport: fmt::Debug + Send + Sync + 'static {
 pub struct ReqwestTransport {
     client: reqwest::Client,
     provider: String,
+    idle: StreamIdleTimeout,
 }
 
 impl ReqwestTransport {
@@ -81,7 +101,21 @@ impl ReqwestTransport {
         Self {
             client,
             provider: provider.into(),
+            idle: bounded_response_idle_timeout(StreamIdleTimeout::from_config(
+                DEFAULT_RESPONSE_IDLE_TIMEOUT,
+            )),
         }
+    }
+
+    /// Override the maximum silence allowed between response chunks.
+    ///
+    /// This is an idle bound, not a total request deadline. Every received chunk
+    /// starts a fresh allowance. Overrides are capped by the production liveness
+    /// policy.
+    #[must_use]
+    pub fn with_idle_timeout(mut self, idle: StreamIdleTimeout) -> Self {
+        self.idle = bounded_response_idle_timeout(idle);
+        self
     }
 }
 
@@ -92,6 +126,7 @@ impl Transport for ReqwestTransport {
     ) -> Pin<Box<dyn Future<Output = Result<ChunkStream, ProviderError>> + Send + '_>> {
         let client = self.client.clone();
         let provider = self.provider.clone();
+        let idle = self.idle;
         Box::pin(async move {
             let mut builder = client.post(&request.url).json(&request.body);
             for (name, value) in &request.headers {
@@ -119,15 +154,47 @@ impl Transport for ReqwestTransport {
                 ));
             }
 
-            let chunks = futures::StreamExt::map(response.bytes_stream(), |result| {
-                result
-                    .map(|bytes| bytes.to_vec())
-                    .map_err(ProviderError::transient)
-            });
+            let body = Box::pin(response.bytes_stream());
+            let chunks =
+                futures::stream::unfold(Some((body, provider, idle)), |state| async move {
+                    let (mut body, provider, idle) = state?;
+                    match tokio::time::timeout(idle.duration(), body.next()).await {
+                        Ok(Some(Ok(bytes))) => {
+                            Some((Ok(bytes.to_vec()), Some((body, provider, idle))))
+                        }
+                        Ok(Some(Err(error))) => Some((Err(ProviderError::transient(error)), None)),
+                        Ok(None) => None,
+                        Err(_) => Some((
+                            Err(ProviderError::transient(ResponseIdleTimeout {
+                                provider,
+                                duration: idle.duration(),
+                            })),
+                            None,
+                        )),
+                    }
+                });
             Ok(Box::pin(chunks) as ChunkStream)
         })
     }
 }
+
+#[derive(Debug)]
+struct ResponseIdleTimeout {
+    provider: String,
+    duration: Duration,
+}
+
+impl fmt::Display for ResponseIdleTimeout {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "provider `{}` response stream idle timeout after {:?}; raise {} for slower providers",
+            self.provider, self.duration, STREAM_IDLE_TIMEOUT_ENV
+        )
+    }
+}
+
+impl std::error::Error for ResponseIdleTimeout {}
 
 /// Classify a non-2xx response into the typed taxonomy.
 ///
@@ -249,9 +316,62 @@ impl std::error::Error for ResponseBody {}
 mod tests {
     use super::*;
     use oc_error::Recovery;
+    use oc_llm::sse::StreamIdleTimeout;
     use std::error::Error as _;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    async fn spawn_chunked_server(
+        chunks: Vec<(Duration, &'static [u8])>,
+        finish: bool,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind chunked-response fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = vec![0_u8; 4096];
+            let bytes = socket.read(&mut request).await.expect("read request");
+            assert!(
+                request[..bytes].starts_with(b"POST "),
+                "fixture received an unexpected HTTP request"
+            );
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\n\
+                      Connection: close\r\n\
+                      \r\n",
+                )
+                .await
+                .expect("write response headers");
+
+            for (delay, chunk) in chunks {
+                tokio::time::sleep(delay).await;
+                socket
+                    .write_all(format!("{:X}\r\n", chunk.len()).as_bytes())
+                    .await
+                    .expect("write chunk size");
+                socket.write_all(chunk).await.expect("write response chunk");
+                socket
+                    .write_all(b"\r\n")
+                    .await
+                    .expect("terminate response chunk");
+            }
+
+            if finish {
+                socket
+                    .write_all(b"0\r\n\r\n")
+                    .await
+                    .expect("finish chunked response");
+            } else {
+                std::future::pending::<()>().await;
+            }
+        });
+        (address, server)
+    }
 
     #[test]
     fn a_429_carries_the_delay_the_vendor_named() {
@@ -370,6 +490,110 @@ mod tests {
         assert!(
             cause.contains("body") || cause.contains("connection"),
             "unexpected body read cause: {cause}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stalled_stream_times_out_after_preserving_received_chunks() {
+        let (address, server) =
+            spawn_chunked_server(vec![(Duration::ZERO, b"PARTIAL_")], false).await;
+        let transport = ReqwestTransport::new("stalled-fixture")
+            .with_idle_timeout(StreamIdleTimeout::new(Duration::from_millis(75)));
+        let mut chunks = transport
+            .send(HttpRequest {
+                url: format!("http://{address}/chat/completions"),
+                headers: BTreeMap::new(),
+                body: serde_json::json!({}),
+            })
+            .await
+            .expect("response headers should arrive");
+
+        let partial = tokio::time::timeout(Duration::from_secs(1), chunks.next())
+            .await
+            .expect("the first response chunk should arrive")
+            .expect("the stream should contain the partial chunk")
+            .expect("the partial chunk should be successful");
+        assert_eq!(partial, b"PARTIAL_");
+
+        let error = tokio::time::timeout(Duration::from_secs(1), chunks.next())
+            .await
+            .expect("the stalled read must be bounded")
+            .expect("the idle timeout must be a stream item")
+            .expect_err("a held-open socket must fail after its idle allowance");
+        assert!(matches!(error, ProviderError::Transient { .. }));
+        let cause = error.source().expect("idle timeout cause").to_string();
+        assert!(cause.contains("idle timeout"), "{cause}");
+        assert!(cause.contains("stalled-fixture"), "{cause}");
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[test]
+    fn production_transport_installs_a_sane_default_idle_timeout() {
+        assert!(
+            DEFAULT_RESPONSE_IDLE_TIMEOUT >= Duration::from_secs(90),
+            "the production default must accommodate established reasoning gaps"
+        );
+        assert!(
+            DEFAULT_RESPONSE_IDLE_TIMEOUT < Duration::from_secs(200),
+            "the production default must terminate before the liveness probe"
+        );
+
+        let transport = ReqwestTransport::new("default-fixture");
+        assert_eq!(
+            transport.idle,
+            bounded_response_idle_timeout(StreamIdleTimeout::from_config(
+                DEFAULT_RESPONSE_IDLE_TIMEOUT,
+            )),
+            "ReqwestTransport::new must install the bounded production configuration"
+        );
+    }
+
+    #[test]
+    fn an_excessive_idle_timeout_override_cannot_restore_the_hang() {
+        let excessive = StreamIdleTimeout::new(Duration::from_secs(86_400));
+        let transport = ReqwestTransport::new("override-fixture").with_idle_timeout(excessive);
+
+        assert_eq!(transport.idle.duration(), MAX_RESPONSE_IDLE_TIMEOUT);
+        assert!(MAX_RESPONSE_IDLE_TIMEOUT < Duration::from_secs(200));
+    }
+
+    #[tokio::test]
+    async fn a_slow_stream_that_keeps_progressing_outlives_one_idle_window() {
+        let interval = Duration::from_millis(200);
+        let idle = Duration::from_millis(500);
+        let (address, server) = spawn_chunked_server(
+            vec![
+                (Duration::ZERO, b"SLOW_"),
+                (interval, b"BUT_"),
+                (interval, b"STILL_"),
+                (interval, b"MOVING"),
+            ],
+            true,
+        )
+        .await;
+        let transport =
+            ReqwestTransport::new("slow-fixture").with_idle_timeout(StreamIdleTimeout::new(idle));
+        let mut chunks = transport
+            .send(HttpRequest {
+                url: format!("http://{address}/chat/completions"),
+                headers: BTreeMap::new(),
+                body: serde_json::json!({}),
+            })
+            .await
+            .expect("response headers should arrive");
+        let mut received = Vec::new();
+
+        while let Some(chunk) = chunks.next().await {
+            received.extend(chunk.expect("every progressing chunk should arrive"));
+        }
+
+        server.await.expect("fixture task");
+        assert_eq!(received, b"SLOW_BUT_STILL_MOVING");
+        assert!(
+            interval * 3 > idle,
+            "the fixture must outlive one idle window"
         );
     }
 }
