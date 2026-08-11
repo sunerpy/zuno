@@ -13,10 +13,10 @@ use oc_llm::catalog::resolved::{
 use oc_llm::event::{Message, Role};
 use oc_paths::ResolvedProject;
 use oc_plugin::{
-    AuthApiResult, AuthMethod, AuthPrompt, ChatContext, ChatHeadersOutput, HookInvocation,
-    JsDiagnosticKind, JsHostConfig, JsHostPolicy, JsPluginSpec, Plugin, ProviderContext,
-    ProviderSource, SUPPORTED_JS_PLUGINS, TextCompleteInput, TextCompleteOutput, VersionGate,
-    load_js_plugins_ordered,
+    AuthApiResult, AuthCredentialResolver, AuthLoader, AuthMethod, AuthPrompt, ChatContext,
+    ChatHeadersOutput, HookInvocation, JsDiagnosticKind, JsHostConfig, JsHostPolicy, JsPluginLoad,
+    JsPluginSpec, Plugin, ProviderContext, ProviderSource, SUPPORTED_JS_PLUGINS, TextCompleteInput,
+    TextCompleteOutput, VersionGate, load_js_plugins_ordered,
 };
 use oc_testkit::FakeTerminalOwner;
 use url::Url;
@@ -35,6 +35,16 @@ export default {
   server: async (_input, options) => ({
     auth: {
       provider: "resident-fixture",
+      loader: async (_getAuth, _provider) => {
+        if (!options?.returnDeep) return {};
+        const result = {};
+        let current = result;
+        for (let depth = 0; depth < 10; depth += 1) {
+          current.next = {};
+          current = current.next;
+        }
+        return result;
+      },
       methods: [{
         type: "api",
         label: "Fixture API key",
@@ -83,6 +93,64 @@ fn host(root: &Path, terminal: Arc<dyn TerminalLease>, policy: JsHostPolicy) -> 
 
 fn file_spec(path: &Path) -> JsPluginSpec {
     JsPluginSpec::new(format!("file:{}", path.display()))
+}
+
+async fn fixture_auth_loader(
+    root: &Path,
+    options: Option<serde_json::Value>,
+) -> (JsPluginLoad, Arc<dyn AuthLoader>) {
+    let owner = Arc::new(FakeTerminalOwner::new());
+    let terminal: Arc<dyn TerminalLease> = Arc::new(TerminalBroker::new(owner));
+    let mut spec = file_spec(&fixture(root));
+    if let Some(options) = options {
+        spec = spec.options(options);
+    }
+    let load =
+        load_js_plugins_ordered(vec![spec], host(root, terminal, JsHostPolicy::default())).await;
+    let plugin = load
+        .plugins()
+        .first()
+        .unwrap_or_else(|| panic!("fixture plugin loaded: {:?}", load.diagnostics()));
+    let loader = plugin
+        .auth()
+        .and_then(|auth| auth.loader)
+        .expect("fixture auth loader");
+    (load, loader)
+}
+
+struct MissingCredential;
+
+#[async_trait::async_trait]
+impl AuthCredentialResolver for MissingCredential {
+    async fn resolve(&self) -> Result<Option<oc_auth::Credential>, oc_error::BoxSource> {
+        Ok(None)
+    }
+}
+
+fn provider_with_variant_depth(include_cutoff_object: bool) -> ResolvedProvider {
+    let nested = if include_cutoff_object {
+        serde_json::json!({
+            "thinkingBudget": 4096,
+            "deeper": { "thinkingBudget": 2048 }
+        })
+    } else {
+        serde_json::json!({ "thinkingBudget": 4096 })
+    };
+    let variant = serde_json::from_value(serde_json::json!({
+        "thinkingConfig": {
+            "thinkingBudget": 8192,
+            "extra": { "nested": nested }
+        }
+    }))
+    .expect("variant is a JSON object");
+    let mut model = kiro_model();
+    model.id = "antigravity-claude-opus-4-5-thinking".to_owned();
+    model.provider_id = "resident-fixture".to_owned();
+    model.variants.insert("low".to_owned(), variant);
+    let mut provider = kiro_provider();
+    provider.id = "resident-fixture".to_owned();
+    provider.models.insert(model.id.clone(), model);
+    provider
 }
 
 #[tokio::test]
@@ -144,6 +212,96 @@ async fn js_prompt_validator_remains_callable_after_module_initialization() {
     assert_eq!(validate("wrong").as_deref(), Some("invalid key"));
     assert_eq!(validate("valid"), None);
     load.shutdown().await;
+}
+
+#[tokio::test]
+async fn js_auth_loader_round_trips_provider_data_below_its_depth_bound_byte_identically() {
+    // Given: the real google variant path, extended to provider-relative depth 7.
+    // The transport's args array must not consume one of the provider's 8 levels.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (load, loader) = fixture_auth_loader(temp.path(), None).await;
+    let mut provider = provider_with_variant_depth(false);
+    let before = serde_json::to_vec(&provider).expect("serialize provider before loader");
+
+    // When
+    let options = loader
+        .load(&MissingCredential, &mut provider)
+        .await
+        .expect("provider below the per-argument depth bound round-trips");
+    load.shutdown().await;
+
+    // Then
+    assert!(options.is_empty());
+    assert_eq!(
+        serde_json::to_vec(&provider).expect("serialize provider after loader"),
+        before,
+        "a no-op JavaScript auth loader must return every provider byte unchanged"
+    );
+}
+
+#[tokio::test]
+async fn js_auth_loader_refuses_a_truncated_provider_and_preserves_the_original() {
+    // Given: one object at provider-relative depth 8, where the defensive cap fires.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (load, loader) = fixture_auth_loader(temp.path(), None).await;
+    let mut provider = provider_with_variant_depth(true);
+    let before = serde_json::to_vec(&provider).expect("serialize provider before loader");
+
+    // When
+    let error = loader
+        .load(&MissingCredential, &mut provider)
+        .await
+        .expect_err("a lossy provider payload must be refused");
+    load.shutdown().await;
+
+    // Then
+    let message = error.to_string();
+    assert!(
+        message.contains("resident-fixture.mjs"),
+        "the refusal must name the plugin: {message}"
+    );
+    assert!(
+        message.contains(
+            "/models/antigravity-claude-opus-4-5-thinking/variants/low/\
+             thinkingConfig/extra/nested/deeper"
+        ),
+        "the refusal must name the truncated provider path: {message}"
+    );
+    assert_eq!(
+        serde_json::to_vec(&provider).expect("serialize provider after refusal"),
+        before,
+        "refusing a lossy payload must leave the caller's real provider untouched"
+    );
+}
+
+#[tokio::test]
+async fn js_auth_loader_still_bounds_an_arbitrary_plugin_return_graph() {
+    // Given
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (load, loader) =
+        fixture_auth_loader(temp.path(), Some(serde_json::json!({ "returnDeep": true }))).await;
+    let mut provider = kiro_provider();
+
+    // When
+    let options = loader
+        .load(&MissingCredential, &mut provider)
+        .await
+        .expect("the bounded return value remains a valid JSON object");
+    load.shutdown().await;
+
+    // Then: the eighth nested object is a marker, so the walk remains bounded.
+    let mut value = options.get("next").expect("first nested value");
+    for _ in 1..8 {
+        value = value.get("next").expect("nested value before the cap");
+    }
+    assert_eq!(
+        value.get("$truncated"),
+        Some(&serde_json::Value::Bool(true))
+    );
+    assert_eq!(
+        value.get("$path").and_then(serde_json::Value::as_str),
+        Some("/next/next/next/next/next/next/next/next")
+    );
 }
 
 #[tokio::test]

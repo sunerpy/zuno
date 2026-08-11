@@ -90,18 +90,22 @@ function retain(fn) {
   return id;
 }
 
-// Depth cap rather than full generality: auth descriptors are three levels deep
-// at most, and an unbounded walk over a plugin's internal object graph is how a
-// bounded-memory host stops being bounded.
+// Depth cap rather than full generality: an unbounded walk over a plugin's
+// internal object graph is how a bounded-memory host stops being bounded.
 const MAX_DEPTH = 8;
 
-function encode(value, depth = 0, seen = new Set()) {
+function childPointer(path, key) {
+  const segment = String(key).replaceAll("~", "~0").replaceAll("/", "~1");
+  return `${path}/${segment}`;
+}
+
+function encode(value, depth = 0, seen = new Set(), path = "") {
   if (value === null || value === undefined) return null;
   const kind = typeof value;
   if (kind === "function") return { $fn: retain(value), $arity: value.length };
   if (kind === "bigint") return { $bigint: value.toString() };
   if (kind !== "object") return value;
-  if (depth >= MAX_DEPTH) return { $truncated: true };
+  if (depth >= MAX_DEPTH) return { $truncated: true, $path: path || "/" };
   if (seen.has(value)) return { $cycle: true };
   if (value instanceof Error) {
     return { $error: value.message ?? String(value), $name: value.name };
@@ -111,7 +115,9 @@ function encode(value, depth = 0, seen = new Set()) {
   seen.add(value);
   try {
     if (Array.isArray(value)) {
-      return value.map((item) => encode(item, depth + 1, seen));
+      return value.map((item, index) =>
+        encode(item, depth + 1, seen, childPointer(path, index)),
+      );
     }
     const out = {};
     for (const key of Object.keys(value)) {
@@ -121,7 +127,7 @@ function encode(value, depth = 0, seen = new Set()) {
       } catch {
         continue; // A throwing getter is not worth failing the whole encode.
       }
-      out[key] = encode(member, depth + 1, seen);
+      out[key] = encode(member, depth + 1, seen, childPointer(path, key));
     }
     return out;
   } finally {
@@ -752,7 +758,7 @@ async function handleRequest(frame) {
       if (!fn) throw new Error(`handle ${params.handle} is no longer retained`);
       const args = (params.args ?? []).map(decodeArgument);
       const value = await fn(...args);
-      respond(id, { value: encode(value), args: encode(args) });
+      respond(id, { value: encode(value), args: args.map((argument) => encode(argument)) });
       return;
     }
     case "tool.call": {

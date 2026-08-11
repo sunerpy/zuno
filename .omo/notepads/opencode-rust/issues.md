@@ -6760,3 +6760,25 @@ todo 143 在证明 antigravity 那一半时发现，**我独立核实**：`HookI
 > `git diff --cached --name-only | grep -c "^target/"` 确认为 0。
 
 `premerge.sh` 的冲突标记闸门是我上次加的，这次没帮上——因为构建产物不是冲突标记。**闸门只能挡它认识的那一种脏。** 值得考虑再加一条：暂存区里出现 `target/` 就拒绝。
+
+## [2026-08-11] Todo 147 — SEAM #18：有损 JS 编码结果不能作为 provider 权威回写
+
+真实 `user-config.json` 的 google provider 最深对象是
+`models.*.variants.low.thinkingConfig`：以 provider 根为 0 时深度 5，以对象层数记为
+6；包进旧 `args` 根后编码深度为 6（层数 7）。当前 2,820 字节可原样返回，但沿
+该真实路径扩到 provider 深度 7 后，旧 `encode(args)` 会让传输数组额外占一层，
+在 `$[1].models.*.variants.low.thinkingConfig.extra.nested` 写入
+`{"$truncated":true}`。`ResolvedModel::variants` 的开放 `JsonMap` 会合法接收它，
+所以反序列化成功正是 silent corruption 的条件，而不是保护。
+
+修复同时保留两条边界：mutating arguments 逐个从深度 0 编码，传输 `args` 数组不再
+消耗 provider 的一层预算；任意插件图仍受 `MAX_DEPTH = 8` 限制。达到上限时 marker
+携带 JSON Pointer，`HandleAuthLoader` 在 `serde_json::from_value` 和赋值之前拒绝，错误
+同时命名插件和路径，原 provider 保持不变。没有收紧 `resolved.rs`：variants/options
+按上游契约就是开放 JSON，类型收紧既破坏合法配置，也无法识别其他开放字段里的
+编码损失。
+
+三个测试均穿过真实 `load_js_plugins_ordered -> AuthLoader::load -> call_mutating -> shim`
+路径。完整回退 `shim.mjs` 与 `bridge.rs` 后，字节保真、截断拒绝、任意返回图仍有界
+三个测试逐名失败；恢复后 3/3 通过。完整命令与结果在
+`.omo/evidence/task-147-opencode-rust.txt`。
