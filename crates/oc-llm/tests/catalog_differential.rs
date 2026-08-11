@@ -40,31 +40,25 @@ use std::collections::BTreeMap;
 use oc_config::schema::Config;
 use oc_llm::catalog::models_dev::CatalogDocument;
 use oc_llm::catalog::{Catalog, ResolveInput};
-use oc_testkit::{Normalizer, Oracle, ScriptedEnv, diff_normalized};
+use oc_testkit::{Normalizer, Oracle, ScriptedEnv, diff_normalized, pinned_oracle_or_skip};
 
 const PINNED: &str = include_str!("fixtures/models-dev-pinned.json");
 
-/// The absolute path of the installed 1.18.12 binary, when it is where mise put it.
-///
-/// `Oracle::discover()` is tried first; this is a fallback because the bare
-/// `opencode` shim on `PATH` fails under a cleared environment on this host.
-const MISE_ORACLE: &str = "/config/.local/share/mise/installs/opencode/1.18.12/opencode";
-
 /// An oracle, or `None` with a printed reason.
+///
+/// `Oracle::discover()` is deliberately not used: its first `PATH` hit on this host
+/// is a package-manager shim that fails under a cleared environment, which is why
+/// this file used to carry an absolute install path as a fallback.
+/// [`pinned_oracle_or_skip`] screens each candidate by running it the way a
+/// differential does and refuses any that does not report
+/// [`oc_testkit::PINNED_RELEASE`], so the release stays pinned while the route to it
+/// is discovered.
 fn oracle() -> Option<Oracle> {
-    match Oracle::discover() {
-        Ok(found) => Some(found),
-        Err(discover_error) => match Oracle::at_binary(MISE_ORACLE) {
-            Ok(found) => Some(found),
-            Err(fallback_error) => {
-                println!(
-                    "SKIP: no oracle binary available.\n  discover: {discover_error}\n  \
-                     fallback {MISE_ORACLE}: {fallback_error}"
-                );
-                None
-            }
-        },
-    }
+    let program = pinned_oracle_or_skip(
+        "the oc-llm catalog differentials",
+        "no model listing was compared against a real release",
+    )?;
+    Some(Oracle::at_binary(program).expect("the screened oracle must still be runnable"))
 }
 
 fn document() -> CatalogDocument {

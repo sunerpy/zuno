@@ -18,7 +18,7 @@
 //!
 //! So this test does the one thing the others do not: it runs a **real turn through
 //! the production binary**, then hands the resulting database to the **installed
-//! 1.18.12 release** and requires it to list the session. Both halves are the real
+//! pinned release** and requires it to list the session. Both halves are the real
 //! programs; neither side is a fixture.
 //!
 //! # The skip contract
@@ -33,13 +33,7 @@ use std::process::Output;
 use std::time::Duration;
 
 use oc_testkit::env::DbChoice;
-use oc_testkit::{MockProvider, Scenario, ScriptedEnv};
-
-/// The installed release this port must stay readable by.
-///
-/// Hard-coded for the same reason `compat_suite.rs:63` hard-codes it: a rollback
-/// test against "whatever `opencode` is on `PATH`" is a test against an unknown.
-const ORACLE_BINARY: &str = "/config/.local/share/mise/installs/opencode/1.18.12/opencode";
+use oc_testkit::{MockProvider, Scenario, ScriptedEnv, pinned_oracle_or_skip};
 
 /// A recorded tool-free text completion. A new session titles itself before its
 /// first turn, so one run replays this twice.
@@ -51,16 +45,6 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_opencode-rust"))
-}
-
-fn oracle_binary() -> Option<PathBuf> {
-    std::env::var_os("OPENCODE_TEST_BINARY")
-        .map(PathBuf::from)
-        .or_else(|| {
-            Path::new(ORACLE_BINARY)
-                .is_file()
-                .then(|| ORACLE_BINARY.into())
-        })
 }
 
 /// A config naming one OpenAI-compatible provider pointed at the mock.
@@ -160,11 +144,10 @@ fn oracle_session_list(oracle: &Path, database: &Path, home: &Path) -> Output {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_released_binary_lists_a_session_this_port_wrote() {
-    let Some(oracle) = oracle_binary() else {
-        eprintln!(
-            "SKIPPED the_released_binary_lists_a_session_this_port_wrote: no opencode binary at \
-             {ORACLE_BINARY}; the rollback seam was NOT tested"
-        );
+    let Some(oracle) = pinned_oracle_or_skip(
+        "the_released_binary_lists_a_session_this_port_wrote",
+        "the rollback seam was NOT tested",
+    ) else {
         return;
     };
 
@@ -223,7 +206,7 @@ async fn the_released_binary_lists_a_session_this_port_wrote() {
         .as_ref()
         .expect("a turn records the model it ran under");
 
-    let list = oracle_session_list(&oracle, &database, env.home());
+    let list = oracle_session_list(oracle, &database, env.home());
     let stdout = String::from_utf8_lossy(&list.stdout);
     let stderr = String::from_utf8_lossy(&list.stderr);
     eprintln!(

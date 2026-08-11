@@ -1,0 +1,258 @@
+task 146 — route every active installed-binary differential through the pinned-release oracle
+worktree /config/workspace/ProdDir/AI/oc-wt/t146, branch task-146, base 7421e249
+
+F4 wave-7 blocking finding 3. F4 named 10 files with "including"; the true count of
+executable references was 11 hits over 11 files, of which 9 were executable constants
+selecting a release by absolute path, 1 was an executable path *walk* that F4 did not
+name, and 1 was a comment.
+
+================================================================================
+1. ENUMERATION — every hit of `installs/opencode` under crates/, before the change
+================================================================================
+  grep -rn "installs/opencode" crates/ --include="*.rs"   ->  11 hits
+
+  #   file:line                                          classification    disposition
+  --- -------------------------------------------------- ----------------- --------------------------
+  1   oc-cli/tests/differential.rs:7                     ACTIVE            replaced by oracle()
+  2   oc-cli/tests/rollback.rs:42                        ACTIVE            replaced by helper
+  3   oc-db/tests/message_export.rs:20                   ACTIVE            replaced by helper
+  4   oc-db/tests/schema.rs:5                            ACTIVE            replaced by helper
+  5   oc-db/tests/session.rs:22                          ACTIVE            replaced by helper
+  6   oc-llm/tests/catalog_differential.rs:51            ACTIVE            replaced by helper
+  7   oc-lsp/tests/live_servers.rs:58                    ACTIVE            replaced by helper
+  8   oc-tools/tests/registry.rs:19                      ACTIVE            replaced by helper
+  9   oc-tools/tests/search_differential.rs:67           ACTIVE            replaced by helper
+  10  oc-paths/tests/differential.rs:73                  ACTIVE (unnamed)  replaced by helper
+  11  oc-testkit/tests/compat_suite.rs:68                HISTORICAL COMMENT retained verbatim
+
+  Hits 1-9 are the constants F4 named. Hit 10 is a *worse* variant F4's list missed and
+  is the single most load-bearing finding of this task:
+
+      let mise = home.join(".local/share/mise/installs/opencode");
+      for candidate in ["latest/opencode", "1/opencode"] { ... }
+      let mut versions: Vec<PathBuf> = read_dir(&mise)...collect();
+      versions.sort(); versions.pop()
+
+  The lexicographic sort selects "1.18.9" over "1.18.15" — string order, not version
+  order. On a host without the `latest`/`1` symlinks that walk silently runs the
+  *oldest-looking* installed release while the module docs attribute the dumps to the
+  pin. Same seam class, arrived at by a different route.
+
+  Hit 11 is a doc comment recording the pre-todo-130 defect. It cannot select a binary
+  and is retained; F4 explicitly allows this.
+
+AFTER the change:
+  grep -rn "installs/opencode" crates/ --include="*.rs"   ->  2 hits, both doc comments
+    oc-testkit/src/oracle.rs:482       (records why the workaround existed)
+    oc-testkit/tests/compat_suite.rs:68 (pre-existing history, untouched)
+  grep -rn "OPENCODE_TEST_BINARY|OPENCODE_BIN" crates/ --include="*.rs" -> 0 hits
+    (six files each had a private ad-hoc override variable; all now go through the one
+     documented override, OC_TESTKIT_ORACLE)
+
+Retained versioned FIXTURE, provenance already executable (unchanged by this task):
+  .omo/fixtures/oracle-openapi-1.18.12.json — the file NAME carries a release, and
+  compat_suite.rs::the_committed_openapi_capture_is_what_the_pinned_release_serves
+  refetches /doc from the running pinned release and compares bytes. Name is provenance,
+  not a claim; it stays.
+
+================================================================================
+2. WHY THE HARD-CODED PATHS EXISTED — the fact the fix had to accommodate
+================================================================================
+Not laziness: `Oracle::discover()` resolves `opencode` on PATH, and on this host PATH
+entry #1 is /config/.local/share/mise/shims/opencode, a symlink to `mise` itself.
+Measured directly:
+
+  cwd=<inside this repo>, env_clear + redirected HOME:
+    shim            -> "mise ERROR ... Config files in /config/.config/mise/config.toml
+                        are not trusted", stdout EMPTY
+    1.18.15 install -> "1.18.15"
+  cwd=<a temp dir outside the repo>, same env:
+    shim            -> "1.18.15"     (works!)
+
+So the launcher's failure depends on the *working directory*, and `Oracle::run` always
+executes in the ScriptedEnv's temp dir where the shim works — while the differentials
+below build their own `std::process::Command` and inherit the test process's cwd, which
+is inside the repo, where it does not. `Oracle::discover_pinned` alone therefore cannot
+serve these callers: it would accept a launcher that then fails in every one of them.
+That asymmetry is what the nine paths were working around, and why the fix is a screen
+rather than a rename.
+
+================================================================================
+3. THE FIX
+================================================================================
+crates/oc-testkit/src/oracle.rs — new capability beside Oracle::discover_pinned:
+
+  pub enum PinnedOracle { Found(PathBuf), Absent(String), Disagrees(String) }
+  pub fn pinned_oracle() -> &'static PinnedOracle            // OnceLock, once per process
+  pub fn pinned_oracle_or_skip(test, untested) -> Option<&'static Path>
+  pub const ENV_ALLOW_MISSING_ORACLE = "OC_TESTKIT_ALLOW_MISSING_ORACLE"
+
+  Discovery: OC_TESTKIT_ORACLE if set (then it is the ONLY candidate — an operator who
+  names the wrong release must be told, not routed around), else every `opencode` on
+  PATH via which::which_all, in PATH order. No path and no release is written down.
+
+  Screen: each candidate is EXECUTED with --version under a ScriptedEnv **from this
+  process's own working directory** — the condition a differential actually runs in —
+  and its stdout must equal PINNED_RELEASE via the existing check_pin. A launcher that
+  prints nothing is refused as unusable; a binary that reports another release is
+  refused as a mismatch; the next candidate is tried. Refusals accumulate into the
+  Disagrees message, so a failure names every candidate and why each lost.
+
+  Skip contract: Absent -> prints "SKIPPED {test}: {reason}; {untested}" and returns
+  None. Disagrees -> PANICS. Absence and disagreement get opposite treatment because
+  they are opposite facts: a machine without opencode can verify nothing, while a
+  machine with the wrong opencode produces artifacts naming a build that never ran.
+  No call site can silently pass: every skip prints what was not measured.
+
+Call sites converted (10 files, 6 crates). Each keeps its differential; none was
+deleted, ignored, or weakened:
+  oc-cli/tests/differential.rs        const ORACLE -> fn oracle() (panics on absence,
+                                       matching its previous behaviour of dying in
+                                       Command::output) + 3 skip-gated tests via helper
+  oc-cli/tests/rollback.rs            1 test
+  oc-db/tests/schema.rs               2 tests
+  oc-db/tests/session.rs              3 tests
+  oc-db/tests/message_export.rs       1 test
+  oc-llm/tests/catalog_differential.rs  14 tests via fn oracle()
+  oc-lsp/tests/live_servers.rs        1 test
+  oc-tools/tests/registry.rs          1 test
+  oc-tools/tests/search_differential.rs 5 tests via Harness::build
+  oc-paths/tests/differential.rs      6 tests; the broken version walk deleted; its
+                                       vacuous `assert!(!reported.is_empty())` replaced
+                                       by an equality against PINNED_RELEASE
+
+Cargo.toml: oc-testkit added as a dev-dependency of oc-db, oc-lsp, oc-paths (a legal
+cycle through dev-dependencies only; each edge is commented). oc-cli, oc-llm, oc-tools
+already had it.
+
+Module docs corrected where they asserted a stale fact: oc-paths/tests/differential.rs
+said "the installed binary reports 1.18.12" — false since the pin moved, and exactly the
+attribution error under review. The 1.18.12<->1.18.13 empty-diff provenance argument is
+retained, relabelled as history rather than as the current basis.
+
+New structural guard, crates/oc-testkit/tests/no_pinned_oracle_paths.rs, two tests:
+  no_test_file_selects_an_oracle_by_package_manager_path
+    walks every crates/*/tests/**/*.rs (asserts it found >20 files, so a broken walk
+    fails instead of vacuously passing) and rejects any NON-COMMENT line containing
+    "installs/opencode" or "opencode/1." — i.e. the task's grep constraint, executable.
+  every_installed_binary_differential_still_routes_through_the_oracle
+    an inventory of the 10 files above; each must still exist and still mention
+    pinned_oracle. This is the anti-deletion guard: it makes "remove the differential"
+    or "drop the oracle call" fail instead of reading as closure.
+
+================================================================================
+4. MUTATION TESTING — 6 mutants; 5 observable and killed, 1 proven EQUIVALENT
+================================================================================
+M1  check_pin's version comparison removed (`if reported == PINNED_RELEASE` -> `if true`)
+    KILLED: oracle::tests::a_binary_reporting_another_release_is_named_and_refused
+            (8 passed / 1 failed)
+    Note the resolution result is UNCHANGED by M1 on this host, because the launcher is
+    still rejected for printing nothing and the next candidate is the pinned release.
+    So M1 is observable only through that one direct test — recorded rather than assumed.
+
+M2a the behavioural screen removed, first candidate returned unverified
+    NOT KILLED — EQUIVALENT MUTANT. `which_all("opencode")` returns the 1.18.15 install
+    FIRST on this host (verified by a throwaway example: candidate[0] = the install,
+    candidate[1] = the shim), so "first candidate" already equals "screened candidate"
+    and every test stayed green. I did not conclude the screen was guarded.
+    -> Fix: extracted `screen_candidates(Vec<PathBuf>) -> PinnedOracle` so the screen is
+       testable independently of host PATH order, and added
+       the_screen_walks_past_a_launcher_and_a_wrong_release_to_reach_the_pin, which
+       feeds it two REAL stand-in executables it writes and runs: one printing nothing
+       on stdout and exiting 1 (a launcher), one printing "1.18.12" and exiting 0 (the
+       release the nine paths used to select), followed by the real pinned binary.
+
+M2b the screen removed again, against the new test
+    KILLED: the_screen_walks_past_a_launcher_and_a_wrong_release_to_reach_the_pin
+      assertion `left == right` failed: the screen accepted /tmp/.tmpcuGFtr/launcher
+      instead of walking past it to the pinned release
+        left:  "/tmp/.tmpcuGFtr/launcher"
+        right: "/config/.local/share/mise/installs/opencode/1.18.15/opencode"
+
+M3  PINNED_RELEASE moved back to "1.18.12" — the release F4's paths selected
+    KILLED, and this is the direct proof the seam is closed. BEFORE this task, the
+    suite was green while the pin said 1.18.15 and nine differentials ran 1.18.12;
+    nothing could fail over the difference. Now:
+      oc-db  --test schema      3 passed / 2 FAILED
+      oc-paths --test differential  0 passed / 6 FAILED
+      panic: "no installed opencode reports 1.18.12 when run from
+              .../crates/oc-db. Every artifact in this workspace attributes its
+              measurements to 1.18.12, so continuing would name a build that did not
+              run. Install 1.18.12, or set OC_TESTKIT_ORACLE to it. Candidates
+              refused: ..."
+    (1.18.12 IS installed on this host but is not on PATH, so it cannot be reached by
+    discovery — which is the point: the pin now follows the installed release.)
+
+M4  a hard-coded package-manager path smuggled back into oc-db/tests/schema.rs
+    KILLED: no_test_file_selects_an_oracle_by_package_manager_path
+      "crates/oc-db/tests/schema.rs:3: names installs/opencode in code: const SNEAKY..."
+
+M5  oc-db/tests/schema.rs quietly stops calling the oracle (binary hard-coded to None)
+    KILLED: every_installed_binary_differential_still_routes_through_the_oracle
+      "oc-db/tests/schema.rs: no reference to pinned_oracle"
+    The mutated differential itself reported **5 passed / 0 failed** — a green test
+    measuring nothing. This is the seam shape, and only the inventory guard sees it.
+
+M6  pinned_oracle_candidates prepends a /tmp stand-in that DOES report 1.18.15
+    (a route the code chose, which passes the version screen)
+    KILLED: the_resolved_route_came_from_path_or_an_explicit_override
+      "/tmp/t146_fake_oracle/opencode is not one of the 2 opencode executables on PATH,
+       so some source file chose it rather than discovery"
+
+All six mutants reverted; oracle.rs and schema.rs byte-compared identical to their
+pre-mutation state (`diff -q` clean) before the final gate.
+
+================================================================================
+5. GATE
+================================================================================
+cargo fmt --all --check                      clean
+cargo clippy --workspace --all-targets       0 warnings, 0 errors
+                                             (re-confirmed after `touch`ing the changed
+                                             files, so the count is not a cache artifact)
+cargo test --workspace --offline
+  run 1: 1 FAILED — oc-auth store::tests::the_permission_warning_reaches_the_log_naming_the_file
+  run 2: 3369 passed / 0 failed / 2 ignored
+  run 3: 3370 passed / 0 failed / 2 ignored   (final; +1 = the M2b test added after run 2)
+Baseline was 3365; +5 = the 5 tests this task adds (3 in oracle.rs, 2 in the guard).
+
+Run 1's failure is NOT caused by this change and is NOT the transient the brief names.
+Diagnosis: oc-auth was not touched, nor was anything in its dependency graph. The test
+captures a WARN through a thread-local `tracing::subscriber::with_default`; it panicked
+at store.rs:501 with an EMPTY captured buffer, while store.rs:498 (`is_permissive`) had
+already passed — so `read_json` did produce the warning and the event never reached the
+scoped writer. Three sibling tests in the same binary call `read_json` on permissive
+files concurrently with no subscriber installed, which is the shape that poisons a
+tracing callsite's cached Interest to `never` and starves a subscriber installed later.
+Reproduction attempts: 8x isolated (66/66 each), then 48 and 72 runs of the test binary
+at 8- and 24-way self-concurrency — 120 runs, 0 failures. It needs whole-workspace load.
+Recorded in issues.md as a latent load-correlated flake in the documented family; not
+fixed here, because oc-auth is outside this task's scope and a speculative fix to
+another crate's test plumbing is worse than a named finding.
+
+================================================================================
+6. FILES CHANGED
+================================================================================
+ crates/oc-testkit/src/oracle.rs                  (+ screen, + 3 tests)
+ crates/oc-testkit/src/lib.rs                     (re-exports)
+ crates/oc-testkit/tests/no_pinned_oracle_paths.rs (new, 2 guards)
+ crates/oc-cli/tests/differential.rs
+ crates/oc-cli/tests/rollback.rs
+ crates/oc-db/tests/schema.rs
+ crates/oc-db/tests/session.rs
+ crates/oc-db/tests/message_export.rs
+ crates/oc-db/Cargo.toml
+ crates/oc-llm/tests/catalog_differential.rs
+ crates/oc-lsp/tests/live_servers.rs
+ crates/oc-lsp/Cargo.toml
+ crates/oc-paths/tests/differential.rs
+ crates/oc-paths/Cargo.toml
+ crates/oc-tools/tests/registry.rs
+ crates/oc-tools/tests/search_differential.rs
+ Cargo.lock
+ .omo/plans/opencode-rust.md                      (146 checked)
+ .omo/notepads/opencode-rust/issues.md            (appended)
+ .omo/evidence/task-146-opencode-rust.txt         (this file)
+
+crates/oc-cli/src/cmd/turn.rs was NOT touched (owned by later tasks).
+No product source under crates/*/src/ changed except oc-testkit, which is the harness
+this task exists to centralize — the new capability is the fix, as section 2 explains.

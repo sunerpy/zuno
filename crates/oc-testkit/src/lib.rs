@@ -122,7 +122,10 @@ pub use crate::mock_provider::{
     CapturedRequest, MockProvider, MockResponse, ResponseOrigin, Scenario, StreamSignal,
 };
 pub use crate::normalize::{NormalizationRule, Normalizer};
-pub use crate::oracle::{Oracle, OracleFlavour, PINNED_RELEASE, check_pin, requested_flavour};
+pub use crate::oracle::{
+    ENV_ALLOW_MISSING_ORACLE, Oracle, OracleFlavour, PINNED_RELEASE, PinnedOracle, check_pin,
+    pinned_oracle, pinned_oracle_or_skip, requested_flavour,
+};
 pub use crate::run::{Provenance, RunOutcome, VersionGap};
 pub use crate::subject::{SUBJECT_BIN, SUBJECT_PACKAGE, Subject};
 pub use crate::terminal_owner::{FakeTerminalOwner, TerminalTranscript, TerminalTransition};
