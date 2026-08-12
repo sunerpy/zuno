@@ -80,6 +80,18 @@ const WRITTEN_CONTENT: &str = "the tool ran\n";
 const ANTIGRAVITY_SPEC: &str = "opencode-antigravity-auth@1.6.0";
 const ANTIGRAVITY_TOOL: &str = "google_search";
 
+const AUTO_DISCOVERY_PLUGIN: &str = r#"
+import { appendFileSync } from "node:fs";
+
+export default {
+  id: "production-auto-discovery-fixture",
+  server: async () => {
+    appendFileSync(process.env.AUTO_DISCOVERY_LOG, `${import.meta.url.split("/").pop()}\n`);
+    return {};
+  },
+};
+"#;
+
 const LIFECYCLE_PLUGIN: &str = r#"
 import { appendFileSync } from "node:fs";
 
@@ -364,6 +376,44 @@ async fn run_plugin_prompt(
         .await
         .expect("the plugin-backed run must finish inside its budget")
         .expect("launch plugin-backed opencode-rust run")
+}
+
+async fn run_auto_discovery_prompt(env: &ScriptedEnv, base_url: &str, load_log: &Path) -> Output {
+    let mut plugin_variables = variables(env, base_url);
+    plugin_variables.remove("OPENCODE_PURE");
+    plugin_variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
+    plugin_variables.insert(
+        "MISE_DATA_DIR".to_owned(),
+        "/config/.local/share/mise".to_owned(),
+    );
+    plugin_variables.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+    plugin_variables.insert(
+        "AUTO_DISCOVERY_LOG".to_owned(),
+        load_log.display().to_string(),
+    );
+    plugin_variables.insert(
+        "OPENCODE_CONFIG_DIR".to_owned(),
+        env.project().join("broken-config").display().to_string(),
+    );
+
+    let mut command = tokio::process::Command::new(binary());
+    command
+        .args([
+            "--print-logs",
+            "--log-level",
+            "DEBUG",
+            "run",
+            "--model",
+            "test/test-model",
+            "Load auto-discovered plugins.",
+        ])
+        .current_dir(env.working_dir())
+        .env_clear()
+        .envs(plugin_variables);
+    tokio::time::timeout(Duration::from_secs(90), command.output())
+        .await
+        .expect("the auto-discovery run must finish inside its budget")
+        .expect("launch auto-discovery run")
 }
 
 async fn run_lifecycle_command(
@@ -882,6 +932,79 @@ async fn a_real_plugin_tool_reaches_and_executes_through_the_production_registry
     assert!(
         tool_result.contains("Not authenticated with Antigravity"),
         "the model call did not execute antigravity's own google_search implementation; result={tool_result:?}, body={continuation:#}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_discovered_plugins_load_from_all_four_directories_through_the_real_binary() {
+    let env = ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::TempFile);
+    let local = env.project().join(".opencode");
+    let global = env.xdg_config().join("opencode");
+    let plugin_files = [
+        local.join("plugin/project-singular.js"),
+        local.join("plugins/project-plural.js"),
+        global.join("plugin/global-singular.js"),
+        global.join("plugins/global-plural.js"),
+    ];
+    for plugin in &plugin_files {
+        std::fs::create_dir_all(plugin.parent().expect("plugin parent"))
+            .expect("create auto-plugin directory");
+        std::fs::write(plugin, AUTO_DISCOVERY_PLUGIN).expect("write auto-discovered plugin");
+    }
+    let broken_config = env.project().join("broken-config");
+    std::fs::create_dir_all(&broken_config).expect("create broken config directory");
+    std::fs::write(broken_config.join("plugin"), "not a directory")
+        .expect("create unreadable plugin directory stand-in");
+    let load_log = env.project().join("auto-discovery.log");
+    let scenario = Scenario::new("production-auto-discovery")
+        .from_oracle_cassette(TITLE_CASSETTE)
+        .expect("the recorded title completion loads")
+        .from_oracle_cassette(TITLE_CASSETTE)
+        .expect("the recorded turn completion loads");
+    let provider = MockProvider::start(vec![scenario])
+        .await
+        .expect("mock provider binds loopback");
+
+    let output = run_auto_discovery_prompt(&env, provider.base_url(), &load_log).await;
+    let captured = provider.captured().await;
+    provider.shutdown().await;
+
+    assert!(
+        output.status.success(),
+        "auto-discovery run failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(captured.len(), 2, "title plus one ordinary turn");
+    let loaded: std::collections::BTreeSet<_> = std::fs::read_to_string(&load_log)
+        .expect("all four plugin factories must record their load")
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let expected: std::collections::BTreeSet<_> = plugin_files
+        .iter()
+        .map(|path| {
+            path.file_name()
+                .expect("plugin filename")
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(loaded, expected, "every advertised directory must load");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for plugin in &expected {
+        assert!(
+            stderr.contains(plugin),
+            "DEBUG logs must name auto-discovered plugin {plugin}; stderr:\n{stderr}"
+        );
+    }
+    assert!(
+        stderr.contains("failed to auto-discover JavaScript plugins")
+            && stderr.contains(&broken_config.join("plugin").display().to_string()),
+        "a scan failure must identify the affected directory; stderr:\n{stderr}"
     );
 }
 

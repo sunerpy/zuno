@@ -7242,3 +7242,34 @@ The production-binary regression configures separate server-only and TUI-only fi
 factory markers. Replacing the TUI production selection with `Server` made
 `interactive_tui_selects_tui_plugin_factory_from_production_config` fail specifically because the TUI
 marker was absent. The selection was restored after the mutation.
+
+## [2026-08-12] Todo 163 — complete discovery code was disconnected from every production runtime
+
+This was the seam-17 shape again: `oc_plugin::discover_plugins` already implemented the upstream
+`{plugin,plugins}/*.{ts,js}` scan and had focused tests, while the production `PluginRuntime::load`
+constructed specs only from the merged `config.plugin` array. A known-good file loaded when explicitly
+configured, but the same file in all four locations from F3's reproduction produced no side effect and
+no DEBUG mention.
+
+Released 1.18.15 settled both the implementation decision and an ambiguity in the old prose. Its real
+`debug config` discovers both singular and plural directories under `$XDG_CONFIG_HOME/opencode` and a
+project `.opencode`; its source performs the scan for every `ConfigPaths.directories` entry. It does
+not scan bare `./plugin` or `./plugins` at the project root. The implementation therefore wires the
+existing discovery function through the same `Layout::config_directories` chain, while the authoring
+guide now says “project `.opencode` directories” instead of the ambiguous “project trees.” This is
+upstream parity, so no divergence entry is appropriate.
+
+Discovery is no longer silent: each accepted file is named at DEBUG with source, scope, and surface;
+a directory scan error is a warning naming the directory; and the existing JS loader warning continues
+to name files rejected during loading. The production-binary regression loads all four upstream
+global/project × singular/plural locations, and injects a broken `OPENCODE_CONFIG_DIR/plugin` to prove
+the warning is observable. Removing only the production `specs.extend(auto_discovered_plugins(...))`
+call made that named test fail because no plugin load log existed; restoring it passed.
+
+Changed-file LSP was clean through a temporary detached validation worktree, workspace Clippy passed
+with zero warnings, and rustfmt passed. The full workspace test was attempted twice as required: attempt
+one stopped on the known `EAGAIN` while listing `oc-config` tests; the one-job/one-thread retry reached
+the unrelated G6 stress test but its heavily loaded fixture spawned only 31 of the expected 33 processes,
+then the broad command reached its 30-minute timeout. No task-163 assertion failed, and the production
+auto-discovery, existing configured-plugin lifecycle, and discovery unit tests all passed. Full details
+are in `.omo/evidence/task-163-opencode-rust.txt`.
