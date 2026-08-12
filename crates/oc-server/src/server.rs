@@ -53,6 +53,7 @@ pub struct SessionCompactExecution {
     pub directory: PathBuf,
     pub agent: Option<String>,
     pub model: Option<SessionModelSelection>,
+    pub automatic: bool,
 }
 
 pub trait SessionMutationExecutor: Send + Sync + std::fmt::Debug {

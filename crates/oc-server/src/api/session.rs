@@ -775,6 +775,16 @@ pub async fn compact(
     Extension(services): Extension<ServerServices>,
     Path(session_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    compact_session(state, services, session_id, None, false).await
+}
+
+pub(crate) async fn compact_session(
+    state: ApiState,
+    services: ServerServices,
+    session_id: String,
+    requested_model: Option<SessionModelSelection>,
+    automatic: bool,
+) -> Result<StatusCode, ApiError> {
     let session = state.sessions().get(&session_id)?;
     let executor = services.mutations.as_ref().ok_or_else(|| {
         ApiError::BackendUnavailable("POST /api/session/{sessionID}/compact".to_owned())
@@ -787,7 +797,11 @@ pub async fn compact(
         session_id,
         directory: session.directory.into(),
         agent: session.agent,
-        model: session_model(session.model.as_deref())?,
+        model: match requested_model {
+            Some(model) => Some(model),
+            None => session_model(session.model.as_deref())?,
+        },
+        automatic,
     };
     executor
         .compact(request, guard.interrupt_signal().clone())

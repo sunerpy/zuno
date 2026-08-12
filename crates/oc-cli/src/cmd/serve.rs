@@ -178,7 +178,7 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                 interrupt,
             )
             .await?;
-            let outcome = host.compact().await;
+            let outcome = host.compact(request.automatic).await;
             host.shutdown().await;
             outcome
         })
