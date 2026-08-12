@@ -7251,8 +7251,9 @@ honored `modelEndpoints`. `ModelApi` now carries a closed, optional `ModelEndpoi
 plugin serde boundary and merge path. `model_spec` publishes that declaration under the wire-level
 `api.id`; absence still preserves the existing heuristic.
 
-Two production replay tests begin with resolved catalog metadata, replace the provider models through
-the same resolved-plugin shape used by `HandleModelLoader`, and then traverse real surface selection.
+Two production replay tests begin with resolved catalog metadata, serialize and deserialize Rust's
+internal `ResolvedModel` shape, replace the provider models directly, and then traverse real surface
+selection. They do not invoke `HandleModelLoader` or decode the JavaScript SDK's `ModelV2` shape.
 `mai-code-1-flash-picker` explicitly advertises `responses` despite its heuristic-hostile id, while
 `gpt-5` explicitly advertises `chat` despite its Responses-friendly id. Before propagation both chose
 the heuristic surface. Mutating production propagation to always emit `chat` failed the first test;
@@ -7385,3 +7386,26 @@ transport error before `checkpoint_assistant` can persist the accumulator. Thus 
 user sees the partial answer, but a later session/export cannot recover it. Todo 166 records rather than
 silently disguises this broader durable-transcript gap; fixing it requires checkpoint-on-stream-error
 semantics in `oc-engine`, not a change to the already-correct timeout values.
+## [2026-08-12] Todo 167 — the JavaScript provider boundary required Rust's private model spelling
+
+F4's sixth provider wave exposed what todo 162's direct Rust serde replay could not: the released
+plugin contract declares `ProviderHook.models` as `Record<string, ModelV2>`, whose provider field is
+`providerID`, while `HandleModelLoader` decoded each value directly as `ResolvedModel` and required
+`provider_id`. A plugin constructing the SDK type from scratch therefore left its provider alive but
+silently lost every valid model. The full 1.18.15 SDK type comparison found one spelling mismatch and
+two optionality mismatches: `providerID` versus `provider_id`, optional `family`, and optional
+`variants`. Every other retained field has the same spelling and shape; SDK-only optional cost tiers
+are safely ignored by serde.
+
+The conversion is deliberately local to `HandleModelLoader`: the bridge normalizes `providerID` to
+the canonical internal `provider_id`, while `ResolvedModel` defaults the two SDK-optional containers.
+This keeps pinned-catalog and internal serialization on one snake_case shape instead of making a
+plugin wire spelling globally interchangeable. The original per-model skip branch is unchanged.
+
+Two real-binary tests import a JavaScript provider hook that constructs SDK models without spreading
+the host's Rust-shaped input, replaces the catalog model map, and drives ordinary turns to recorded
+HTTP dispatch. Advertised `responses` beats the hostile `mai-code-1-flash-picker` heuristic and
+advertised `chat` beats the Responses-friendly `gpt-5` heuristic. The same hook returns a genuinely
+malformed sibling without losing the provider. Bypassing only the boundary normalizer made both named
+tests fail with `Model not found`; restoring it returned both to green. Complete evidence:
+`.omo/evidence/task-167-opencode-rust.txt`.
