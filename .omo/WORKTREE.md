@@ -2496,3 +2496,49 @@ auth-loader 有 `truncated_path()` 拒绝，普通 hook 写回没有——而 **
 ### 又一次任务丢失
 
 152 的任务在 2h9m 后消失，无提交无证据，但代码完整。我独立验证后补齐证据与提交。**这是本项目第五次因会话丢失而需要接管**（F3 三次、144、152）。代码通常是好的，丢的是收尾——所以我现在默认：任务消失先查 worktree，别急着重派。
+
+## Wave 57 (2026-08-11)：第九轮评审 → 161/161 实现任务完成
+
+`main` = `4091b274`，**3421 测试通过**（本轮 +17），clippy 0，fmt 干净。**161/165，只剩 F1-F4。**
+
+### 第九轮：四位全 REJECT，包括上轮 APPROVE 的 F3
+
+| 评审员 | 裁决 | 阻塞项 |
+|---|---|---|
+| **F1** | REJECT | **15/3**（从 17/1 退回）：准则 1 的迁移上限**九轮以来从未实现**；准则 2 未达成 |
+| **F2** | REJECT | 四条，其中**三条是上轮非阻塞发现因未处理而升级** |
+| **F3** | CHANGES REQUESTED | 停流永久挂死 CLI；`edit` 对话框仍盲批 |
+| **F4** | REJECT | 152 的**第四层**：endpoint 变了，字节没变 |
+
+### 八条新任务（154-161），全部完成
+
+- **154 / F3-W9-D2**：`ReqwestTransport` 用裸 `reqwest::Client::new()`，**无任何超时**。F3 的对照实验很干净：socket 关闭（FIN）时 1 秒退出并显示已收到的 `PARTIAL_`；socket 挂着不关时**200 秒零字节**。修为 idle 界（非总时长），上限 120 秒。
+- **155 / F1 blocker 1**：准则 1 要求拒绝含未来迁移 id 的库，`apply_only` 却只跳过已知 id，**没有任何最大值比较**。F1 用真二进制证明注入 `99999999999999_future_migration` 后 `db "SELECT 1"` 仍**退出 0 并返回结果**。这条准则被声称九轮却从未实现——因为既有测试用的是**兼容的**固定 journal。
+- **156 / F4 第四层**：测试自证——`production_azure_selector_dispatches_to_responses` 把名为 `openai-compatible-chat` 的 cassette 挂在 `/v1/responses` 上。`body_for` 不分 surface，`ChunkTranslator` 只读 `choices[].delta`。Azure 被正确路由到 Responses 端点后**收到 Chat Completions 的字节**。
+- **157 / seam #20 未修完**：150 修了 bash/webfetch，`edit` 仍盲批，`ctrl+f` 全屏空白。根因是键名不匹配（`filePath` vs `filepath`）。这次加了覆盖**全部** permission kind 的表驱动测试。
+- **158 / F2-B2**：插件改 `user.parts[0].text` 在 hook 内可见但**不影响真实续写**，而生命周期测试观察的是 `user.info.content[0].text`——**测试观察的字段与生产使用的不是同一个**。
+- **159 / F2-B3**：`chat.message` 缺 `id`/`sessionID`/`agent`/`model`。修复**净删 77 行**——删掉了合成 id 的代码，因为真实 `MessageRecord` 本来就带这些。供给真形状比伪造简化形状代码更少，这是这类修复健康的标志。
+- **160 / F2-B4**：`PluginKind::Tui` **只有测试能构造**——与 seam #17 同一形态。它选了接通并**诚实声明能力边界**（不宣称返回对象已接入 Rust hooks）。
+- **161 / 准则 2**：见下。
+
+### 我自己的一处验收失误
+
+准则 2 被 F1/F2/F4 共同指出。我测下来根因比三位描述的都窄：**发现逻辑没坏**——`agent list` 找到全部 32 个 agent（含嵌套 `powerapps/` 树，856 处命中），只是 `debug config` 没把运行时发现的结果合并进输出。修复后 `agent`/`command`/`plugin_origins` 变成 9/2/3，与上游一致。
+
+但更值得记的是：我上轮验收 153 时只验了它的漂移守卫真能拦，**没回头对照准则 2 本身要什么**。F1 说得准：*"That guard proves input identity, not output parity."*
+
+> **验收一条修复时，除了确认它声称的改动生效，还要回头对照它要满足的原始准则。守卫可以完美工作，同时完全没解决准则要求的问题。**
+
+### 154 的默认值缺口——「往上游挪一层」的又一例
+
+154 报完成后，我把 `DEFAULT_RESPONSE_IDLE_TIMEOUT` 从 120 秒改成 **86400 秒**，`cargo test -p oc-provider-compatible` **全绿**。两个测试都注入自己的 75ms 超时，**没有任何测试守卫生产默认值**。补上后同一变异按名失败；它还顺带发现环境变量可重开挂死，加了 180 秒上限。
+
+这是 wave 56 那条规则的第二次应验：**判据是对产生方做变异，不只是对消费方。**
+
+### F2 的四条全是上轮就报过的
+
+F2 在第八轮把三条列为 non-blocking，本轮全部**升级为阻塞**，理由是没人处理。这是我的调度失误——非阻塞发现也该进计划账本，而不是只记在报告里。
+
+### 合并后才暴露的 clippy
+
+五条并行任务各自 clippy 干净，合并后出现两个 `too_many_arguments`——156 给两个测试辅助函数各加了一个参数，把 7 撞到 8。各分支单独跑门看不到。已用 case struct 重构，并验证 156 的守卫在重构后仍能抓住同一变异。
