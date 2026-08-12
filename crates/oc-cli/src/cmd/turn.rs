@@ -167,7 +167,7 @@ impl TurnPlan {
             worktree.as_deref().unwrap_or(directory.as_path()),
             &layout,
             env.flag(crate::OPENCODE_PURE),
-            "turn",
+            super::plugin_runtime::PluginRuntimeTarget::server("turn"),
         )
         .await
         .map(Arc::new);
@@ -269,6 +269,32 @@ impl TurnPlan {
             plugin_tools,
             plugins,
         })
+    }
+
+    pub(crate) async fn load_tui_plugins(
+        &self,
+        environment: &StartupEnvironment,
+    ) -> Option<Arc<super::plugin_runtime::PluginRuntime>> {
+        let env = environment.resolved();
+        let layout = oc_paths::Layout::resolve(env);
+        let worktree = self
+            .project
+            .vcs
+            .as_ref()
+            .map_or(self.directory.as_path(), |_| {
+                self.project.directory.as_path()
+            });
+        super::plugin_runtime::PluginRuntime::load(
+            &self.config,
+            &self.project,
+            &self.directory,
+            worktree,
+            &layout,
+            env.flag(crate::OPENCODE_PURE),
+            super::plugin_runtime::PluginRuntimeTarget::tui("tui"),
+        )
+        .await
+        .map(Arc::new)
     }
 }
 

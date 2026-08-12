@@ -52,7 +52,7 @@ pub(super) fn execute(args: &ModelsArgs, environment: &StartupEnvironment) -> Re
             worktree.unwrap_or(directory.as_path()),
             &layout,
             env.flag(crate::OPENCODE_PURE),
-            "models",
+            super::plugin_runtime::PluginRuntimeTarget::server("models"),
         )
         .await
         else {

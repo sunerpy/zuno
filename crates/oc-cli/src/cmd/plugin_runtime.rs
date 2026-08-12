@@ -23,7 +23,7 @@ use oc_plugin::{
     ChatMessagesTransformOutput, ChatParamsOutput, ChatSystemTransformInput,
     ChatSystemTransformOutput, CommandExecuteBeforeInput, CommandExecuteBeforeOutput,
     CompactionAutocontinueInput, CompactionAutocontinueOutput, HookBus, HookInvocation, HookName,
-    JsHostConfig, JsPluginLoad, JsPluginSpec, MessageWithParts, PermissionAskInput,
+    JsHostConfig, JsPluginKind, JsPluginLoad, JsPluginSpec, MessageWithParts, PermissionAskInput,
     PermissionAskOutput, PermissionStatus, Plugin, PluginTools, ProviderContext,
     ProviderHookContext, ProviderSmallModelInput, ProviderSmallModelOutput, ProviderSource,
     SessionCompactingInput, SessionCompactingOutput, ShellEnvInput as PluginShellEnvInput,
@@ -42,6 +42,27 @@ pub(crate) struct PluginRuntime {
     shutdown: AtomicBool,
 }
 
+pub(crate) struct PluginRuntimeTarget {
+    kind: JsPluginKind,
+    surface: &'static str,
+}
+
+impl PluginRuntimeTarget {
+    pub(crate) const fn server(surface: &'static str) -> Self {
+        Self {
+            kind: JsPluginKind::Server,
+            surface,
+        }
+    }
+
+    pub(crate) const fn tui(surface: &'static str) -> Self {
+        Self {
+            kind: JsPluginKind::Tui,
+            surface,
+        }
+    }
+}
+
 impl PluginRuntime {
     pub(crate) async fn load(
         config: &oc_config::Config,
@@ -50,12 +71,12 @@ impl PluginRuntime {
         worktree: &Path,
         layout: &oc_paths::Layout,
         pure: bool,
-        surface: &str,
+        target: PluginRuntimeTarget,
     ) -> Option<Self> {
         let specs = if pure {
             Vec::new()
         } else {
-            configured_plugins(config)
+            configured_plugins(config, target.kind)
         };
         if specs.is_empty() {
             return None;
@@ -75,7 +96,7 @@ impl PluginRuntime {
                 plugin = %diagnostic.plugin,
                 kind = ?diagnostic.kind,
                 message = %diagnostic.message,
-                %surface,
+                surface = target.surface,
                 "JavaScript plugin did not fully load"
             );
         }
@@ -640,14 +661,14 @@ fn integer_option(options: &Map<String, Value>, names: &[&str]) -> Option<u64> {
         .find_map(|name| options.get(*name).and_then(Value::as_u64))
 }
 
-fn configured_plugins(config: &oc_config::Config) -> Vec<JsPluginSpec> {
+fn configured_plugins(config: &oc_config::Config, kind: JsPluginKind) -> Vec<JsPluginSpec> {
     config
         .plugin
         .as_deref()
         .unwrap_or_default()
         .iter()
         .map(|plugin| {
-            let spec = JsPluginSpec::new(plugin.name());
+            let spec = JsPluginSpec::new(plugin.name()).with_kind(kind);
             match plugin.options() {
                 Some(options) => spec.options(serde_json::Value::Object(options.clone())),
                 None => spec,
@@ -803,7 +824,7 @@ export default {
             env.project(),
             &layout,
             false,
-            "compaction-test",
+            super::PluginRuntimeTarget::server("compaction-test"),
         )
         .await
         .expect("load compaction plugin");
