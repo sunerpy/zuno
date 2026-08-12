@@ -277,6 +277,64 @@ fn production_wire_spec(
         .expect("production replay spec resolves")
 }
 
+fn plugin_resolved_wire_spec(
+    catalog_model_id: &str,
+    api_model_id: &str,
+    advertised_endpoint: &str,
+    endpoint: &str,
+) -> Spec {
+    let document: oc_llm::catalog::models_dev::CatalogDocument =
+        serde_json::from_value(serde_json::json!({
+            "github-copilot": {
+                "id": "github-copilot",
+                "name": "GitHub Copilot",
+                "env": [],
+                "npm": "@ai-sdk/github-copilot",
+                "models": {
+                    catalog_model_id: {
+                        "id": api_model_id,
+                        "name": "Advertised endpoint replay",
+                        "limit": {"context": 100000, "output": 8192}
+                    }
+                }
+            }
+        }))
+        .expect("pinned Copilot catalog metadata");
+    let config: oc_config::schema::Config = serde_json::from_value(serde_json::json!({
+        "provider": {
+            "github-copilot": {"options": {"baseURL": endpoint}}
+        }
+    }))
+    .expect("Copilot endpoint override");
+    let mut catalog = Catalog::resolve(&document, &ResolveInput::new().with_config(&config));
+
+    // Provider model hooks return the SDK's resolved Model shape. Exercise the
+    // same serde boundary as `HandleModelLoader`, including a catalog id that is
+    // different from the wire id so the declaration must follow `api.id`.
+    let mut plugin_value = serde_json::to_value(
+        catalog
+            .model("github-copilot", catalog_model_id)
+            .expect("base Copilot model resolves"),
+    )
+    .expect("resolved model serializes");
+    plugin_value["api"]["endpoint"] = serde_json::json!(advertised_endpoint);
+    let plugin_model: oc_llm::catalog::ResolvedModel =
+        serde_json::from_value(plugin_value).expect("plugin model metadata resolves");
+    assert!(
+        catalog.replace_provider_models(
+            "github-copilot",
+            std::collections::BTreeMap::from([(catalog_model_id.to_owned(), plugin_model)]),
+        ),
+        "the plugin model replaces its pinned catalog provider"
+    );
+
+    let model = catalog
+        .model("github-copilot", catalog_model_id)
+        .expect("plugin-provided Copilot model resolves");
+    assert_eq!(model.api.id, api_model_id);
+    model_spec(&catalog, model, &Env::empty()).expect("plugin-provided Copilot spec resolves")
+}
+
 fn pinned_wire_spec(provider_id: &str, model_id: &str, endpoint: &str, expected_npm: &str) -> Spec {
     let document: oc_llm::catalog::models_dev::CatalogDocument = serde_json::from_str(
         include_str!("../../../oc-llm/tests/fixtures/models-dev-pinned.json"),
@@ -622,6 +680,47 @@ async fn production_copilot_rule_dispatches_by_model_id() {
         )
         .await;
     }
+}
+
+#[tokio::test]
+async fn production_copilot_advertised_responses_beats_a_heuristic_hostile_id() {
+    replay_selected_production_spec(
+        ReplayCase {
+            provider_id: "github-copilot",
+            registry_key: COMPATIBLE_PROVIDER,
+            model_id: "mai-code-1-flash-picker",
+            cassette: "openai-responses/gpt-5-5-streams-text",
+            endpoint_suffix: "/v1/responses",
+            expected_body_key: "input",
+            expected_text: "Hello!",
+        },
+        |endpoint| {
+            plugin_resolved_wire_spec(
+                "mai-code-alias",
+                "mai-code-1-flash-picker",
+                "responses",
+                endpoint,
+            )
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn production_copilot_advertised_chat_beats_a_responses_heuristic_id() {
+    replay_selected_production_spec(
+        ReplayCase {
+            provider_id: "github-copilot",
+            registry_key: COMPATIBLE_PROVIDER,
+            model_id: "gpt-5",
+            cassette: "openai-compatible-chat/deepseek-streams-text",
+            endpoint_suffix: "/v1/chat/completions",
+            expected_body_key: "messages",
+            expected_text: "Hello!",
+        },
+        |endpoint| plugin_resolved_wire_spec("gpt-5-alias", "gpt-5", "chat", endpoint),
+    )
+    .await;
 }
 
 #[tokio::test]

@@ -748,6 +748,7 @@ export default {
                 id: "small-model".to_owned(),
                 npm: "@ai-sdk/openai-compatible".to_owned(),
                 url: String::new(),
+                endpoint: None,
             },
             capabilities: ModelCapabilities::default(),
             cost: ModelCost::default(),

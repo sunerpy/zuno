@@ -1,0 +1,78 @@
+Task 162 — carry advertised model endpoints into production surface selection
+Closes F4's wave-10 provider blocker.
+
+ROOT CAUSE AND UPSTREAM SHAPE
+--------------------------------------------------------------------------------
+Upstream's GitHub Copilot model hook maps `supported_endpoints` into
+`api.endpoint`, and provider selection checks that explicit value before its
+model-id heuristic. The Rust compatible provider already read the
+`modelEndpoints` option, but production never supplied it: resolved `ModelApi`
+contained only id/npm/url, and plugin model deserialization silently dropped
+`api.endpoint`.
+
+PRE-FIX REPRODUCTION
+--------------------------------------------------------------------------------
+Command:
+  cargo test -p oc-cli --offline production_copilot_advertised -- --nocapture
+
+Both new production tests failed before the implementation:
+- `mai-code-1-flash-picker`, advertised `responses`, selected
+  `/v1/chat/completions` instead of `/v1/responses`.
+- `gpt-5`, advertised `chat`, selected `/v1/responses` instead of
+  `/v1/chat/completions`.
+
+IMPLEMENTATION
+--------------------------------------------------------------------------------
+- `ModelEndpoint::{Chat, Responses, Messages}` is a lowercase serde enum.
+- `ModelApi.endpoint` is optional and omitted from serialized output when absent.
+- Pinned catalog construction initializes it to `None`; model merge preserves an
+  endpoint already supplied by resolved/plugin metadata.
+- `model_spec` derives `modelEndpoints` using `model.api.id`, not the catalog key,
+  and only when the endpoint is present. The existing model-id heuristic remains
+  the fallback.
+- The sole direct `oc_llm::ModelApi` test literal was updated with `endpoint: None`.
+
+PRODUCTION REGRESSION AND MUTATION PROOF
+--------------------------------------------------------------------------------
+Named guards:
+  production_copilot_advertised_responses_beats_a_heuristic_hostile_id
+  production_copilot_advertised_chat_beats_a_responses_heuristic_id
+
+The tests do not hand-build a compatible `Spec`. They deserialize resolved
+catalog metadata, inject the endpoint through the plugin model serde boundary,
+replace the provider's model map, call production `model_spec`, and replay the
+selected provider request.
+
+Control:
+  cargo test -p oc-cli --offline production_copilot_advertised -- --nocapture
+  PASS: 2 passed, 0 failed.
+
+Mutation 1: production propagation always emitted `chat`.
+Result: the advertised-Responses test FAILED by name because the Responses
+cassette could not decode the Chat request. The mutation was restored.
+
+Mutation 2: production propagation always emitted `responses`.
+Result: the advertised-Chat test FAILED by name with an unrecoverable provider
+failure against the Chat cassette. The mutation was restored.
+
+FINAL VALIDATION
+--------------------------------------------------------------------------------
+Passed on the restored code:
+  changed-file lsp_diagnostics (5 Rust files): no diagnostics
+  cargo clippy --workspace --all-targets --offline -- -D warnings
+  cargo fmt --all --check
+  cargo build --workspace --offline
+  cargo test -p oc-cli --offline production_copilot_advertised -- --nocapture
+    2 passed, 0 failed
+
+The complete workspace test was attempted twice, including
+`CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1`. Both runs advanced through thousands
+of passing tests, including the 99-test `oc-cli` suite and both new production
+guards, before the host refused to let the Rust harness enumerate `oc-config`:
+
+  Os { code: 11, kind: WouldBlock, message: "Resource temporarily unavailable" }
+
+No assertion failed before either host interruption. Per the two-status-check
+ceiling, no third workspace-test attempt was made. The second gate continued
+after that interruption: zero-warning Clippy, rustfmt, and the workspace build
+all completed successfully.

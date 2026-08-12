@@ -7,11 +7,11 @@
 //! downstream of this crate — the picker, the agent model policy, each provider
 //! family — reads. Two things are worth naming about it:
 //!
-//! - **`api` is a resolved triple, not the catalog's optionals.** The catalog has
+//! - **`api` is resolved transport metadata, not the catalog's optionals.** The catalog has
 //!   an optional provider-level `api`/`npm` and an optional per-model override;
 //!   by the time a model reaches a provider crate the choice is already made and
-//!   `api.id`/`api.npm`/`api.url` are populated. Leaving them optional here would
-//!   push the same fallback ladder into all five provider crates.
+//!   `api.id`/`api.npm`/`api.url` are populated. A plugin-advertised endpoint stays
+//!   optional because the model-id rule remains the fallback when it is absent.
 //! - **`capabilities` is booleans, not the catalog's arrays.** `modalities.input`
 //!   is a list upstream and five flags here, because that is what the oracle
 //!   flattens it to (`provider.ts:1465-1481`) and what a caller actually asks.
@@ -59,7 +59,7 @@ pub struct ResolvedModel {
     pub release_date: String,
     /// Lifecycle status, defaulted to [`CatalogStatus::Active`].
     pub status: CatalogStatus,
-    /// The transport triple: wire id, npm package, base URL.
+    /// Resolved transport metadata: wire id, npm package, base URL and endpoint hint.
     pub api: ModelApi,
     /// Flattened capability flags.
     pub capabilities: ModelCapabilities,
@@ -84,6 +84,24 @@ pub struct ModelApi {
     pub npm: String,
     /// The base URL, possibly containing `${VAR}` placeholders.
     pub url: String,
+    /// A model-advertised SDK surface, when its provider reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<ModelEndpoint>,
+}
+
+/// A model-advertised SDK surface.
+///
+/// GitHub Copilot reports this independently of the model id. Keeping the three
+/// values closed prevents arbitrary endpoint paths from entering surface selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelEndpoint {
+    /// Chat completions.
+    Chat,
+    /// OpenAI Responses.
+    Responses,
+    /// Anthropic Messages.
+    Messages,
 }
 
 /// Flattened capabilities — `provider.ts:991-1000`.
