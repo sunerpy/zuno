@@ -1,0 +1,262 @@
+Task 170 — project the SDK model shape at every JavaScript boundary
+Branch: task-170
+Starting HEAD: 3f4dfa5329d74b8cbed756afe014ef0fa5eb6097
+
+PRE-IMPLEMENTATION CONTRACT AND BOUNDARY ENUMERATION
+--------------------------------------------------------------------------------
+CodeGraph was called first with projectPath
+`/config/workspace/ProdDir/AI/oc-wt/t170` and query
+`plugin_model_value chat_context_value HandleModelLoader Auth loader provider_value bridge`.
+It reported that this sibling worktree is not indexed, so the required full source read and
+systematic text audit were used.
+
+This worktree has no `.omo/refs/` directory. The main checkout's `.omo/refs/` contains the
+five claw-code/codex/hermes-agent/jcode/omo-slim reference trees and no opencode SDK source.
+The exact released declarations were therefore read from the locally installed 1.18.15
+packages used by the compatibility oracle:
+
+  /config/.bun/install/cache/@opencode-ai/plugin@1.18.15@@@1/dist/index.d.ts
+  /config/.bun/install/cache/@opencode-ai/sdk@1.18.15@@@1/dist/gen/types.gen.d.ts
+  /config/.bun/install/cache/@opencode-ai/sdk@1.18.15@@@1/dist/v2/gen/types.gen.d.ts
+
+The released contract has two model generations:
+
+* Legacy `Model` uses `providerID` and omits internal/v2-only `family`, `release_date`,
+  `variants`, `capabilities.interleaved`, `limit.input`, and `api.endpoint`.
+* `ModelV2` uses `providerID`; otherwise retained fields match the canonical Rust model,
+  with optional `family`/`variants`; `api.endpoint` remains a Rust extension.
+* Legacy `Provider` and `ProviderV2` both require `id`, `name`, `source`, `env`, `options`,
+  and `models`, with optional `key`. Their nested models use the corresponding generation.
+
+The released source at tag v1.18.15 was also checked for construction semantics.
+`fromModelsDevProvider` starts at source `custom`; config/env/API passes overwrite source,
+the single-env and stored-API paths can populate `key`; `toPublicInfo` removes functions and
+invalid models before plugin calls. Provider hooks and small-model hooks receive that public
+provider shape, while `Auth.loader` receives a public provider clone.
+
+The following table was completed before implementation. “Current projection” describes
+HEAD 3f4dfa53, not the intended fix.
+
+| JavaScript SDK boundary | Direction | Declared value | Current projection at start |
+|---|---|---|---|
+| `chat.message` | Rust -> JS | model selection `{providerID, modelID}` | COMPLETE: explicitly camel-cased; it is a selection, not SDK `Model` |
+| `chat.params` | Rust -> JS | legacy `Model` + `ProviderContext.info: Provider` | MISSING: `chat_context_value` serializes canonical model/provider directly |
+| `chat.headers` | Rust -> JS | legacy `Model` + `ProviderContext.info: Provider` | MISSING: same shared `chat_context_value` path |
+| `experimental.compaction.autocontinue` | Rust -> JS | legacy `Model` + `ProviderContext.info: Provider` | MISSING: extends the same unprojected `chat_context_value` |
+| `experimental.chat.system.transform` | Rust -> JS | legacy `Model` | MISSING: `json!` serializes `input.model` directly |
+| `experimental.provider.small_model` input | Rust -> JS | `ProviderV2` containing `ModelV2` | MISSING: `json!` serializes `input.provider` directly |
+| `experimental.provider.small_model` output | JS -> Rust | optional `ModelV2` | MISSING: `WireSmallModelOutput` deserializes `ResolvedModel` directly |
+| `ProviderHook.models` provider argument | Rust -> JS | `ProviderV2` containing `ModelV2` | MISSING: `provider_value` serializes `ResolvedProvider` directly |
+| `ProviderHook.models` returned map | JS -> Rust | `Record<string, ModelV2>` | COMPLETE from todo 167: `plugin_model_value` maps `providerID` before decode |
+| `Auth.loader` provider argument | Rust -> JS | legacy `Provider` containing legacy `Model` | MISSING: `provider_value` leaks `availability`/`provider_id` and lacks `source`/`key` |
+| `Auth.loader` mutated provider argument | JS -> Rust | legacy `Provider` containing legacy `Model` | MISSING: raw `ResolvedProvider` deserialization drops legal SDK model spelling/shape |
+
+COMPLETENESS METHOD
+--------------------------------------------------------------------------------
+The audit did not stop at F4's two named examples. It used all of these independent views:
+
+1. Read all 602 lines of `crates/oc-plugin/src/js/bridge.rs` and enumerated every
+   `JsHost::call`/`call_mutating` argument and every `ResolvedModel`/`ResolvedProvider` decode.
+2. Searched every Rust file under `crates/oc-plugin/src/js/` for `provider_value`,
+   `plugin_model_value`, `to_value`, `from_value`, `ResolvedModel`, and `ResolvedProvider`.
+   Only `bridge.rs` carries either canonical resolved type over the resident-JS callback path.
+3. Searched all of `crates/oc-plugin/src/` for `ResolvedModel`, `ResolvedProvider`,
+   `ChatContext`, `ProviderContext`, and `ProviderHookContext`. For JavaScript, the only other
+   codec is `jsonrpc.rs`; `payload.rs`/`hooks.rs` declare the typed internal union, and
+   `wasm.rs` is the separate WASM ABI, not a JavaScript boundary.
+4. Exhaustively matched every `HookInvocation` variant against released `Hooks` declarations.
+   The five model/provider-carrying ordinary hooks are chat params/headers, system transform,
+   provider small model, and compaction autocontinue; chat.message carries only the already-
+   projected selection. No other hook input/output contains `ResolvedModel` or
+   `ResolvedProvider`.
+5. Audited both directions: ordinary-hook input encoding and output decoding, plus both
+   resource callback families (`Auth.loader` and `ProviderHook.models`).
+
+This proves the table is the full current JavaScript model/provider boundary set. The planned
+structural guard will preserve that exhaustive `HookInvocation` classification at compile time
+and route every classified model/provider value through typed SDK projection wrappers; resource
+callbacks will use the same wrappers instead of a second conversion idiom.
+
+PRE-IMPLEMENTATION REAL-PLUGIN REPRODUCTION
+--------------------------------------------------------------------------------
+The tests use an imported `.mjs` plugin, invoke its resident JavaScript callbacks, and make each
+callback inspect or construct the released SDK shape. They do not call a Rust projection helper
+with hand-built JSON.
+
+Command:
+  cargo test -p oc-plugin --test js js_sdk_boundary --offline -- --nocapture
+
+Result before implementation: FAIL, 0 passed / 3 failed.
+
+* `js_sdk_boundary_auth_loader_reads_provider_and_supplies_model` failed inside the real
+  `Auth.loader`: `Auth.loader.provider leaked non-SDK keys: availability`.
+* `js_sdk_boundary_provider_loader_reads_v2_provider_and_supplies_model` failed inside the real
+  provider callback: `ProviderHook.models.provider leaked non-SDK keys: availability`.
+* `js_sdk_boundary_ordinary_hooks_read_declared_shapes_and_supply_small_model` failed because
+  the first SDK-shape check prevented the marker mutation (`sdkParams` remained absent).
+
+The existing installed Kiro plugin is a second, non-fixture proof. Its `chat.headers` hook reads
+`input.model.providerID ?? input.provider.info.id`; the test gives it a matching model and a
+deliberately foreign provider.info id, so only the first arm can succeed.
+
+Command:
+  cargo test -p oc-plugin --test js \
+    js_real_kiro_plugin_injects_its_request_kind_header_for_a_compaction_turn \
+    --offline -- --nocapture
+
+Result before implementation: FAIL. The real plugin injected `{}` and the expected
+`x-opencode-kiro-request-kind: compaction` header was absent. This proves the egress spelling
+mutant is observable rather than equivalent.
+
+IMPLEMENTATION AND STRUCTURAL CHECK
+--------------------------------------------------------------------------------
+`crates/oc-plugin/src/js/projection.rs` is now the one JavaScript model/provider codec.
+
+* `model_value` emits exact legacy or v2 SDK models. Both use `providerID`; legacy strips the
+  v2/internal-only fields, while v2 retains its declared fields. Both omit Rust's `api.endpoint`
+  extension on egress.
+* `provider_value` emits `id/name/source/env/key?/options/models` only and recursively projects
+  every model at the requested generation. Source comes from `ProviderContext` for request hooks
+  or canonical availability precedence for resource callbacks; an API/WellKnown credential
+  supplies the optional key.
+* `plugin_model` normalizes SDK `providerID` back to canonical `provider_id` before strict
+  `ResolvedModel` decoding. It serves ProviderHook.models and small-model output.
+* `plugin_provider` decodes Auth.loader's mutated legacy provider and recursively normalizes
+  models. For models that existed before the call, it restores fields the legacy SDK cannot
+  express (`family`, `release_date`, `variants`, `interleaved`, `limit.input`, `api.endpoint`),
+  so a no-op loader remains byte-identical; newly inserted SDK models receive canonical defaults.
+  Provider availability is likewise retained internally rather than trusting plugin input.
+
+The ordinary-hook structural check is `HookModelBoundary::classify`, an exhaustive match over
+the authoritative `HookInvocation` enum. Every current variant is classified as model selection,
+legacy context, legacy model, v2 provider+model, or none; encoding branches assert the expected
+classification and call only the typed `SdkValue` projectors. Adding a new hook variant cannot
+compile until the author makes a reviewer-visible boundary classification. Resource callbacks
+are not HookInvocation variants, so both call the same private `SdkValue`/plugin decoder API in
+`bridge.rs`; there is no duplicate ad-hoc provider/model codec left there.
+
+TARGETED RESTORED CONTROLS
+--------------------------------------------------------------------------------
+Command:
+  cargo test -p oc-plugin --test js js_sdk_boundary --offline -- --nocapture
+
+Result after implementation: PASS, 3 passed / 0 failed. An intermediate run exposed that the
+existing truncation fixture put its depth probe under legacy-SDK-inexpressible `variants`; the
+probe was moved to declared `model.options` rather than weakening projection. The complete JS
+suite then passed all shape, no-op byte-identity, truncation, restart, real-plugin, and resource
+tests:
+
+  cargo test -p oc-plugin --test js --offline -- --nocapture
+  Result: PASS, 17 passed / 0 failed.
+
+Todo 167's production provider-hook and endpoint-precedence controls remain green:
+
+  cargo test -p oc-cli --test tool_turn \
+    production_js_sdk_model_advertised --offline -- --nocapture
+  Result: PASS, 2 passed / 0 failed.
+
+MUTATION PROOF — EVERY PROJECTION IS OBSERVABLE
+--------------------------------------------------------------------------------
+Each mutant removed only the named projection, kept the real JavaScript plugin callback, and ran
+the named focused test. Every mutant failed before restoration; several also made an import/helper
+unused, independently proving the compatibility path was disconnected rather than equivalently
+rewritten.
+
+Ordinary hook command for mutations 1-8:
+  cargo test -p oc-plugin --test js \
+    js_sdk_boundary_ordinary_hooks_read_declared_shapes_and_supply_small_model \
+    --offline -- --exact --nocapture
+
+1. `chat.params` model egress: replaced the projected legacy model with raw `ResolvedModel`.
+   FAIL: the callback returned before setting `options.sdkParams`; assertion saw `None`.
+2. `chat.headers` model egress: same local raw-model replacement in the separate branch.
+   FAIL: `x-sdk-headers` was absent.
+3. `experimental.compaction.autocontinue` model egress: overwrote the shared projected model with
+   raw `ResolvedModel`. FAIL: callback did not set enabled false.
+4. Shared legacy ProviderContext.info egress used by those three hooks: replaced the nested SDK
+   provider with raw `ResolvedProvider`. FAIL: chat.params did not set `sdkParams`.
+5. `experimental.chat.system.transform` model egress: restored raw model serialization.
+   FAIL: `system` remained empty instead of containing `sdk-system`.
+6. `experimental.provider.small_model` ProviderV2 ingress-to-JS: restored raw provider
+   serialization. FAIL: no supplied small model survived; Rust still held the original model,
+   and the compiler warned that the v2 provider projectors were unused.
+7. The same hook's initial ModelV2 output egress-to-JS: restored raw output-model serialization.
+   The real callback now first validates the non-empty initial output before replacing it.
+   FAIL: replacement never ran; final id remained `claude-sonnet-4-5`, not `small-sdk-model`.
+8. The same hook's returned ModelV2 JS-to-Rust ingress: replaced `plugin_model` with direct
+   `ResolvedModel` deserialization. FAIL: `missing field provider_id`; compiler warned that
+   `plugin_model` was unused in this codec.
+
+ProviderHook resource command for mutations 9-10:
+  cargo test -p oc-plugin --test js \
+    js_sdk_boundary_provider_loader_reads_v2_provider_and_supplies_model \
+    --offline -- --exact --nocapture
+
+9. ProviderV2 egress argument: restored raw provider serialization. FAIL inside the real callback:
+   `ProviderHook.models.provider leaked non-SDK keys: availability`.
+10. ModelV2 return ingress: restored direct `ResolvedModel` decode. FAIL: the expected
+    `provider-sdk-model` was absent; compiler warned that bridge's `plugin_model` import was unused.
+
+Auth.loader resource command for mutations 11-12:
+  cargo test -p oc-plugin --test js \
+    js_sdk_boundary_auth_loader_reads_provider_and_supplies_model \
+    --offline -- --exact --nocapture
+
+11. Legacy Provider egress argument: restored raw provider serialization. FAIL inside the real
+    callback: `Auth.loader.provider leaked non-SDK keys: availability`.
+12. Mutated legacy Provider ingress: restored direct `ResolvedProvider` decode. FAIL:
+    `missing field interleaved`; compiler also reported `plugin_provider` dead/unused.
+
+The pre-fix real-Kiro run recorded above is an independent mutation-equivalent witness for legacy
+model egress: with raw model serialization, the installed plugin injected no header. After all
+mutants were restored, the focused SDK trio passed 3/0 and the Kiro test passed 1/0 again.
+
+FINAL VALIDATION
+--------------------------------------------------------------------------------
+Language-server diagnostics were clean for all five changed Rust files:
+
+  crates/oc-plugin/src/js/projection.rs
+  crates/oc-plugin/src/js/bridge.rs
+  crates/oc-plugin/src/js/mod.rs
+  crates/oc-plugin/src/jsonrpc.rs
+  crates/oc-plugin/tests/js.rs
+
+Targeted test gates:
+
+  cargo test -p oc-plugin --test js --offline -- --nocapture
+  Result: PASS, 17 passed / 0 failed.
+
+  cargo test -p oc-plugin --test js js_sdk_boundary --offline -- --nocapture
+  Result: PASS, 3 passed / 0 failed after the final mutation restoration.
+
+  cargo test -p oc-plugin --test js \
+    js_real_kiro_plugin_injects_its_request_kind_header_for_a_compaction_turn \
+    --offline -- --nocapture
+  Result: PASS, 1 passed / 0 failed.
+
+  cargo test -p oc-cli --test tool_turn \
+    production_js_sdk_model_advertised --offline -- --nocapture
+  Result: PASS, 2 passed / 0 failed.
+
+Static and formatting gates:
+
+  CARGO_BUILD_JOBS=1 cargo clippy --workspace --all-targets --offline
+  Result: PASS, 0 warnings.
+
+  cargo fmt --all
+  cargo fmt --all --check
+  Result: PASS; the check produced no diff.
+
+The first full-workspace test attempt did not reach a product-code failure. Multiple linker jobs
+terminated with rust-lld SIGBUS, followed by `No space left on device`; `cargo clean` then removed
+8.6 GiB. A resource-constrained retry was attempted with an invalid linker passthrough and stopped
+immediately because `cc` rejected `--threads=1`. Per the two-check ceiling, the full workspace gate
+was not retried again. The package-level suite, focused compatibility tests, workspace-wide clippy,
+format check, and changed-file diagnostics above all passed.
+
+FINAL SCOPE REVIEW
+--------------------------------------------------------------------------------
+`git diff --check` passed. The final diff contains only the shared JavaScript SDK projection,
+its bridge/jsonrpc routing, real-plugin regressions, todo completion, this evidence, and the issue
+notepad. No dependency was added, and neither `crates/oc-cli/src/cmd/plugin_runtime.rs` nor
+`crates/oc-server/src/compat_v1.rs` was modified.

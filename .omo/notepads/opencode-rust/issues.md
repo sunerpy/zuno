@@ -7453,3 +7453,26 @@ exact installed shapes, and three independent mutants—dropping create's model,
 extractor/application, and removing `tool_result`—all failed their corresponding named test. All three
 routes remain honestly served; none required demotion. Complete evidence:
 `.omo/evidence/task-169-opencode-rust.txt`.
+## [2026-08-12] Todo 170 — SDK projection was absent from nine additional model/provider crossings
+
+The exhaustive JavaScript audit found eleven boundary rows, not only F4's two examples. The already
+correct rows were `chat.message`'s model selection and todo 167's `ProviderHook.models` return;
+missing projection also affected chat params, chat headers, compaction autocontinue, system
+transform, both small-model directions, ProviderHook's provider argument, and both Auth.loader
+directions. Raw serde leaked `provider_id`/`availability`, omitted `source`/`key`, and accepted no
+SDK-spelled model on the return paths.
+
+One boundary-local codec now emits exact legacy or v2 SDK models/providers and converts both plugin
+return paths back to canonical resolved types. Auth.loader's legacy round trip restores internal/v2
+fields that the legacy SDK cannot express, preserving no-op provider bytes while allowing a real
+plugin to insert a legacy SDK model. `HookModelBoundary::classify` exhaustively classifies every
+ordinary `HookInvocation`; adding a hook variant cannot compile until its model/provider boundary
+status is explicit. Resource callbacks reuse the same private typed projectors.
+
+Three tests import a real `.mjs` plugin that reads every declared provider/model input, inspects a
+non-empty small-model output, and supplies SDK models on all three JS-to-Rust paths. The installed
+Kiro plugin additionally proves `model.providerID` works without its provider-info fallback. Twelve
+single-projection mutants each failed a named test, including the separate params/headers/
+autocontinue call sites and both directions of Auth.loader, ProviderHook.models, and small_model.
+Complete enumeration, source method, mutation outcomes, and gates are in
+`.omo/evidence/task-170-opencode-rust.txt`.
