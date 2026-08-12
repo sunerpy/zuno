@@ -85,6 +85,7 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         title: None,
     };
     let plan = runtime.block_on(TurnPlan::resolve(&options, environment))?;
+    let tui_plugins = runtime.block_on(plan.load_tui_plugins(environment));
     let broker = Arc::new(PermissionBroker::new(terminal_sender.clone()));
     let approval: Arc<dyn PermissionAsker> = if args.auto {
         Arc::new(AutoApproval)
@@ -128,6 +129,9 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         input.abort();
         turns.abort();
         if let Some(plugins) = plugins {
+            plugins.shutdown().await;
+        }
+        if let Some(plugins) = tui_plugins {
             plugins.shutdown().await;
         }
         outcome

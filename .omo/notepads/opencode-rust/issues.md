@@ -7222,3 +7222,23 @@ settings; both stopped while `oc-config` was listing tests with the host's known
 temporarily unavailable`, after the task's production regression had passed. No assertion failed before
 either interruption, and no third attempt was made under the two-status-check limit. Complete evidence:
 `.omo/evidence/task-158-opencode-rust.txt`.
+
+## [2026-08-12] Todo 160 — interactive startup selects the TUI plugin factory
+
+Before this task `PluginKind::Tui` had no non-test construction path: every configured plugin became
+the default `Server` spec. The public crate name is intentionally `JsPluginKind`, following the alias
+in `oc-plugin::js`; the internal enum remains `PluginKind`.
+
+The turn and models surfaces now select `Server` explicitly, while the real PTY-backed TUI startup
+loads the same resolved configuration a second time with `JsPluginKind::Tui` before entering raw mode.
+The two runtimes have separate lifetimes and both shut down on exit. This is behaviorally observable:
+the JavaScript shim validates the requested entry point and invokes `server()` or `tui()` accordingly.
+A configured package that exports only `tui()` was previously rejected by the sole server load; it now
+runs its initializer when an interactive user starts the TUI. This change does not claim that arbitrary
+objects returned by a TUI factory have become new Rust view hooks; the implemented compatibility is
+factory selection, initialization side effects, and runtime lifetime.
+
+The production-binary regression configures separate server-only and TUI-only fixtures and requires both
+factory markers. Replacing the TUI production selection with `Server` made
+`interactive_tui_selects_tui_plugin_factory_from_production_config` fail specifically because the TUI
+marker was absent. The selection was restored after the mutation.

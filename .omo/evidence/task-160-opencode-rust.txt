@@ -1,0 +1,137 @@
+Task 160 — make the TUI JavaScript plugin kind production-selectable
+Closes F2 wave-9 blocker F2-B4.
+
+REFERENCE CENSUS
+--------------------------------------------------------------------------------
+Before this task, `PluginKind::Tui` appeared only in the enum definition and its
+`as_str()` mapping. `JsPluginSpec::with_kind` had zero production callers and
+zero checked-in test callers. `configured_plugins()` always constructed the
+default `Server` spec, so the public TUI variant was constructible by an external
+test or consumer but unreachable from this binary.
+
+After this task, the existing crate-root public alias `JsPluginKind` is used
+(the established `oc-plugin::js` export style aliases internal `PluginKind` as
+`JsPluginKind`; no second export style was added):
+
+  crates/oc-cli/src/cmd/plugin_runtime.rs
+    PluginRuntimeTarget::server -> JsPluginKind::Server
+    PluginRuntimeTarget::tui    -> JsPluginKind::Tui
+    configured_plugins          -> JsPluginSpec::with_kind(target.kind)
+
+  crates/oc-cli/src/cmd/models.rs
+    production models load -> PluginRuntimeTarget::server("models")
+
+  crates/oc-cli/src/cmd/turn.rs
+    production turn load -> PluginRuntimeTarget::server("turn")
+    production TUI load  -> PluginRuntimeTarget::tui("tui")
+
+  crates/oc-cli/src/cmd/tui.rs
+    real interactive startup calls TurnPlan::load_tui_plugins before raw mode
+
+The test does not directly construct `JsPluginKind::Tui`; it configures plugins
+and launches the real binary under a PTY. The kind selection therefore remains a
+production responsibility rather than moving the old test-only seam.
+
+UPSTREAM CONCEPT AND DECISION
+--------------------------------------------------------------------------------
+Upstream has a real TUI-plugin runtime, not a dead type:
+
+  packages/opencode/src/plugin/tui/runtime.ts
+    PluginLoader.loadExternal({ kind: "tui" })
+
+  packages/opencode/src/plugin/index.ts
+    the server runtime loads with kind: "server"
+
+The checked upstream package surface also exports `./tui`, and the local
+upstream reference contains a `tui` factory. The Rust shim already implemented
+the same discriminator: `params.kind` selects `readV1Plugin(..., "server" |
+"tui")`, validates that exact export, and invokes the selected factory. The
+missing piece was only a production caller. Wiring it preserves an upstream
+capability; deleting it would create an unnecessary declared narrowing.
+
+OBSERVABLE DIFFERENCE FROM SERVER
+--------------------------------------------------------------------------------
+This is not a field that is set and ignored. On interactive startup, the Rust
+host sends kind `tui`; `shim.mjs` consumes it, requires `tui()`, and executes that
+factory. The ordinary turn runtime separately sends `server`, requires
+`server()`, and executes that factory. A configured package exporting only
+`tui()` was previously rejected by the sole server load; it now runs its
+initializer in the real interactive process and remains resident until TUI
+shutdown. Both runtimes dispatch dispose and shut down on exit.
+
+The production-path test makes the difference external and visible: a
+server-only fixture writes `server` from `server()`, while a TUI-only fixture
+writes `tui` from `tui()`. Both marker files must exist after launching the real
+binary under `script`/PTY.
+
+Scope honesty: this task wires factory selection, factory initialization side
+effects, and the TUI runtime lifetime. It does not claim that arbitrary objects
+returned by `tui()` have become new Rust view hooks. The observable compatibility
+implemented here is that the upstream TUI entrypoint is selected and executed,
+not merely serialized.
+
+MUTATION PROOF
+--------------------------------------------------------------------------------
+Named guard:
+
+  interactive_tui_selects_tui_plugin_factory_from_production_config
+
+Control after implementation:
+
+  cargo test -p oc-cli --test tui_turn \
+    interactive_tui_selects_tui_plugin_factory_from_production_config \
+    --offline -- --exact --nocapture
+  PASS: 1 passed, 0 failed; both server and TUI markers were written.
+
+Mutation: changed the production TUI target from `JsPluginKind::Tui` to
+`JsPluginKind::Server` while leaving the test untouched.
+
+Result: the named test FAILED. The server marker remained present, while the TUI
+marker assertion reported left `""`, right `"tui"`. This proves the test cannot
+pass when production TUI selection is removed. The mutation was restored; the
+final recovery-state run passed 1/1.
+
+REGRESSION OF TODOS 158 AND 159
+--------------------------------------------------------------------------------
+The shared production regression was run explicitly:
+
+  cargo test -p oc-cli --test tool_turn \
+    ordinary_plugin_lifecycle_hooks_run_through_the_real_binary \
+    --offline -- --exact
+  PASS: 1 passed, 0 failed.
+
+That test asserts both adjacent fixes in the captured real provider request:
+
+  todo 158: `experimental.chat.messages.transform` mutates canonical
+            `user.parts[0].text`, and the `:messages` suffix reaches the model.
+  todo 159: `chat.message` carries live `id`, `sessionID`, `agent`, and `model`
+            values matching the live hook input.
+
+DIAGNOSTICS AND GATES
+--------------------------------------------------------------------------------
+`lsp_diagnostics` cannot address sibling worktree paths from its fixed main-root
+request cwd. Following this repository's established validation workaround, the
+five Rust-file diffs were applied to a temporary detached validation worktree
+inside the accepted root. The same LSP backend returned `No diagnostics found`
+for all five files; the temporary worktree was then removed.
+
+  cargo clippy --workspace --all-targets --offline
+  PASS: 0 warnings on the final code.
+
+  cargo fmt --all --check
+  PASS: clean on the final code.
+
+  cargo test --workspace --offline
+  HOST-INTERRUPTED: the first final-code attempt reached `oc-config` test
+  enumeration with no prior assertion failure, then failed with `EAGAIN / Resource
+  temporarily unavailable`.
+
+  CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 cargo test --workspace --offline
+  HOST-INTERRUPTED: the one allowed retry reached the same `oc-config` enumeration
+  point with no prior assertion failure and the same EAGAIN. No third workspace
+  attempt was made, per the explicit retry limit.
+
+After those host interruptions, the zero-warning `PluginRuntimeTarget` argument
+wrapper refactor was compiled by all-target Clippy and both named production
+tests above passed on the final code. The aggregate workspace count cannot be
+claimed because the host did not let either workspace run finish.
