@@ -393,7 +393,7 @@ pub fn turn_part_gap() -> KnownGap {
 pub const TURN_PART_WITNESS: &str =
     "the_recorded_turn_part_gap_matches_what_a_turn_actually_persists";
 
-/// The gap recording that the measured pre-`/api` surface is almost entirely stubs.
+/// The gap recording the still-unbacked part of the measured pre-`/api` surface.
 pub const V1_SURFACE_GAP_ID: &str = "v1-surface-unbacked";
 
 /// The test name [`v1_surface_gap`]'s detail points a reader at.
@@ -435,9 +435,9 @@ impl V1SurfaceCoverage {
 /// # Why this is recorded as a gap
 ///
 /// The surface is presented as "plugin compatibility routes" measured from real
-/// plugin callsites, and those plugins get `501` from all but one of them. Nothing
-/// chose that: `docs/v1-surface-capture.md` describes the seams as awaiting
-/// backends, and no plan todo owns writing them. So it is a gap, and
+/// plugin callsites, but some calls still get `501`. Nothing chose that:
+/// `docs/v1-surface-capture.md` describes those seams as awaiting backends. So it
+/// is a gap, and
 /// `docs/divergences.toml:11-14` is explicit that a merely unimplemented surface
 /// "is a gap, not a divergence … and must never be laundered into an entry here".
 ///
@@ -458,26 +458,20 @@ pub fn v1_surface_gap(coverage: V1SurfaceCoverage) -> KnownGap {
         detail: format!(
             "The pre-/api surface exists because the published SDK sends unprefixed paths, so \
              every resident plugin talks to it. It registers {measured} routes, each with a \
-             recorded plugin callsite, but only {served} does real local work: POST \
-             /tui/show-toast, and even that is a recording sink rather than a display — no server \
-             entry point attaches a forwarder (crates/oc-server/src/main.rs, \
-             crates/oc-cli/src/cmd/serve.rs both build a bare CompatV1State::new). The other \
-             {unbacked} answer a structured 501 not_implemented. {redirected} of those name a \
-             served /api route that provides the same capability, taken from the oracle document \
-             which declares both surfaces, and their 501 bodies tell the caller to use it: \
-             app.agents to GET /api/agent, provider.list to GET /api/provider, session.list and \
-             session.create to GET and POST /api/session, session.get to GET \
-             /api/session/{{sessionID}}, session.abort to POST \
-             /api/session/{{sessionID}}/interrupt, session.summarize to POST \
-             /api/session/{{sessionID}}/compact, session.messages to GET \
-             /api/session/{{sessionID}}/message, and session.prompt and session.promptAsync to \
-             POST /api/session/{{sessionID}}/prompt. The remaining {stranded} have no served /api \
-             spelling at all — auth.set, app.log, config.get, the two provider.oauth calls, \
+             recorded plugin callsite, and {served} do real local work. Ten adapters reuse the \
+             corresponding /api implementations for app.agents, provider.list, session.list, \
+             session.create, session.get, session.abort, session.summarize, session.messages, \
+             session.prompt and session.promptAsync. POST /tui/show-toast remains a recording sink \
+             rather than a display — no server entry point attaches a forwarder \
+             (crates/oc-server/src/main.rs and crates/oc-cli/src/cmd/serve.rs both build a bare \
+             CompatV1State::new). {unbacked} of the {measured} answer `501 not_implemented`. \
+             {redirected} of those {unbacked} name a served /api alternative; the other {stranded} \
+             have no served /api spelling at all — auth.set, app.log, config.get, the two provider.oauth calls, \
              session.status, session.update, session.children and session.todo — so a plugin that \
              needs one has no working call today; concretely, the installed auth plugins reach a \
              registered route for every request they issue and can deliver toasts, but cannot \
              authenticate through this surface. This is a GAP and not a declared divergence \
-             because nothing chose it and no plan todo owns it, and docs/divergences.toml:11-14 \
+             because nothing chose it, and docs/divergences.toml:11-14 \
              forbids recording an unimplemented surface as a decision. Witnessed by \
              crates/oc-server/tests/compat_v1.rs::{witness}, which drives every route and fails \
              if a declared status disagrees with what the router answers.",

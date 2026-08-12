@@ -51,9 +51,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let state = ApiState::open_default(directory)?.with_events(events.clone());
             let server = ServerBuilder::new(config)
                 .with_routes(
-                    api::router(state)
+                    api::router(state.clone())
                         .merge(events_router(events))
-                        .merge(compat_v1_router(CompatV1State::new())),
+                        .merge(compat_v1_router(CompatV1State::new(), state)),
                 )
                 .bind()
                 .await?;

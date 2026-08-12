@@ -227,9 +227,9 @@ pub(super) fn execute(args: &ServeArgs) -> Result<(), String> {
         let server = ServerBuilder::new(config)
             .with_services(services)
             .with_routes(
-                api::router(state)
+                api::router(state.clone())
                     .merge(events_router(events))
-                    .merge(compat_v1_router(CompatV1State::new())),
+                    .merge(compat_v1_router(CompatV1State::new(), state)),
             )
             .bind()
             .await

@@ -1,0 +1,194 @@
+Task 165 evidence — measured pre-/api plugin routes
+Recorded before implementation on 2026-08-12 from:
+- crates/oc-server/src/compat_v1.rs::V1_SURFACE (measured callsites)
+- .omo/fixtures/oracle-openapi-1.18.12.json (frozen HTTP contracts)
+- installed @opencode-ai/sdk generated declarations under
+  /config/.cache/opencode/packages/@sunerpy/oh-my-openagent@4.21.0/
+- crates/oc-server/src/api/* and the existing oc-auth/oc-config/oc-db/oc-tools stores
+
+The table records the SDK wire shape, not an invented replacement. “API adapter” means
+the v1 handler calls the existing /api handler and only translates the request/response
+envelope or field spelling. “Local adapter” means it calls an existing lower-level store
+or resolver already used by the product; it does not duplicate that business logic.
+
+01 PUT /auth/{providerID} — client.auth.set
+   request: path provider id; body Auth union: oauth{refresh,access,expires,enterpriseUrl?},
+            api{key,metadata?}, or wellknown{key,token}; optional directory query.
+   response: 200 bare boolean.
+   backing: LOCAL ADAPTER over oc_auth::AuthStore::set; secrets remain Secret values.
+
+02 POST /log — client.app.log
+   request: {service,level:debug|info|warn|error,message,extra?}; optional directory query.
+   response: 200 bare boolean.
+   backing: LOCAL ADAPTER to the server diagnostic sink; body is validated and rendered
+            without credentials or arbitrary Debug output.
+
+03 GET /agent — client.app.agents
+   request: optional directory query.
+   response: 200 bare Agent[] (v1 name/mode/model/prompt/tools/options spelling).
+   backing: API ADAPTER over GET /api/agent; unwrap {location,data} and project the
+            resolved v2 Agent.Info values into the generated v1 Agent wire shape.
+
+04 GET /config — client.config.get
+   request: optional directory query.
+   response: 200 bare Config.
+   backing: LOCAL ADAPTER over oc_config::discovery::discover_with, the same resolver
+            used by the catalogue and CLI; no /api/config route exists.
+
+05 GET /provider — client.provider.list
+   request: optional directory query.
+   response: 200 {all:Provider[],default:Record<string,string>,connected:string[]}.
+   backing: API ADAPTER over GET /api/provider plus GET /api/model; unwrap both
+            location envelopes and assemble the v1 provider/model projection.
+
+06 POST /provider/{providerID}/oauth/authorize — client.provider.oauth.authorize
+   request: {method:number,inputs?:Record<string,string>}.
+   response: 200 ProviderAuthAuthorization {url,method:auto|code,instructions}.
+   backing: GENUINE GAP — the Rust server has no provider-auth method registry or OAuth
+            flow executor. The /api integration-connect routes are themselves frozen
+            backend_unavailable seams, so adapting them would only disguise a gap.
+
+07 POST /provider/{providerID}/oauth/callback — client.provider.oauth.callback
+   request: {method:number,code?:string}.
+   response: 200 bare boolean.
+   backing: GENUINE GAP — same missing provider-auth flow executor as route 06.
+
+08 GET /session — client.session.list
+   request: optional directory/workspace/scope/path/roots/start/search/limit query;
+            recorded plugin calls use the SDK default or directory.
+   response: 200 bare Session[].
+   backing: API ADAPTER over GET /api/session; translate directory/search/limit,
+            unwrap {data,cursor}, and project Session field spellings.
+
+09 POST /session — client.session.create
+   request: optional {parentID,title,agent,model,metadata,permission,workspaceID}; recorded
+            plugin calls use the SDK body directly.
+   response: 200 bare Session.
+   backing: API ADAPTER over POST /api/session. The shared create handler accepts the
+            meaningful parent/title/agent/model fields, then the adapter unwraps {data}.
+
+10 GET /session/status — client.session.status
+   request: optional directory query.
+   response: 200 Record<sessionID, SessionStatus>, with active entries {type:"busy"}.
+   backing: API ADAPTER over GET /api/session/active; unwrap {data} and translate the
+            v2 active marker {type:"running"} to the v1 marker {type:"busy"}.
+
+11 GET /session/{sessionID} — client.session.get
+   request: path session id; optional directory query.
+   response: 200 bare Session.
+   backing: API ADAPTER over GET /api/session/{sessionID}; unwrap {data} and project.
+
+12 PATCH /session/{sessionID} — client.session.update
+   request: optional {title,metadata,permission,time:{archived?}}; recorded call uses title.
+   response: 200 bare Session.
+   backing: LOCAL ADAPTER over oc_db::session::Store title/update primitives, followed by
+            the same Session projection. Unsupported non-recorded mutation fields are not
+            silently invented and remain explicit invalid requests.
+
+13 GET /session/{sessionID}/children — client.session.children
+   request: path session id; optional directory query.
+   response: 200 bare Session[].
+   backing: LOCAL ADAPTER over oc_db::session::Store::children and Session projection.
+
+14 GET /session/{sessionID}/todo — client.session.todo
+   request: path session id; optional directory query.
+   response: 200 bare Todo[] {content,status,priority,id}.
+   backing: LOCAL ADAPTER over oc_tools::SqliteTodoStore::list after proving the session
+            exists; this is the same persistent todo store used by todowrite.
+
+15 POST /session/{sessionID}/abort — client.session.abort
+   request: no body.
+   response: 200 bare true.
+   backing: API ADAPTER over POST /api/session/{sessionID}/interrupt; translate successful
+            204 to the SDK’s 200 true.
+
+16 POST /session/{sessionID}/summarize — client.session.summarize
+   request: {providerID,modelID,auto?}.
+   response: 200 bare true.
+   backing: API ADAPTER over POST /api/session/{sessionID}/compact; consume the v1-only
+            selection body and translate successful 204 to 200 true.
+
+17 GET /session/{sessionID}/message — client.session.messages
+   request: optional limit/before; recorded plugin calls use no before cursor.
+   response: 200 bare Array<{info,parts}>.
+   backing: API ADAPTER over GET /api/session/{sessionID}/message; translate limit,
+            unwrap {data,cursor}; reject unsupported before rather than guessing.
+
+18 POST /session/{sessionID}/message — client.session.prompt
+   request: {messageID?,model?,agent?,noReply?,system?,tools?,format?,variant?,parts[]}.
+   response: 200 {info:AssistantMessage,parts[]} after the turn finishes.
+   backing: API ADAPTER over POST /api/session/{sessionID}/prompt, then the existing wait
+            and messages handlers; translate text/file/agent parts into PromptBody and
+            return the resulting assistant message. This preserves synchronous v1 behavior.
+
+19 POST /session/{sessionID}/prompt_async — client.session.promptAsync
+   request: same generated prompt body as route 18.
+   response: 204 with no body.
+   backing: API ADAPTER over POST /api/session/{sessionID}/prompt; translate the body and
+            discard the admission envelope after successful admission.
+
+20 POST /tui/show-toast — client.tui.showToast
+   request: {title?,message,variant,duration?}.
+   response: 200 bare boolean.
+   backing: existing LOCAL TOAST SINK; retained unchanged.
+
+Pre-implementation expected coverage after genuine backing: measured=20, served=18,
+unbacked=2, unbacked-with-api-alternative=0. These numbers are expectations only; product
+diagnostics and the frozen-gap report must continue to obtain their counts from the actual
+router backing selected for each V1_SURFACE entry, never from these literals.
+
+Scope correction recorded before implementation
+-------------------------------------------------
+The 18/2 expectation above was too broad: it treated available lower-level stores as permission
+to invent new v1 semantics. Todo 165 permits shape adapters only where a genuine served `/api`
+equivalent already exists. The implemented scope is therefore the following 10 adapters:
+- GET /agent -> GET /api/agent
+- GET /provider -> GET /api/provider plus GET /api/model
+- GET|POST /session -> GET|POST /api/session
+- GET /session/{sessionID} -> GET /api/session/{sessionID}
+- POST /session/{sessionID}/abort -> POST /api/session/{sessionID}/interrupt
+- POST /session/{sessionID}/summarize -> POST /api/session/{sessionID}/compact
+- GET|POST /session/{sessionID}/message -> GET message and POST prompt `/api` handlers
+- POST /session/{sessionID}/prompt_async -> POST /api/session/{sessionID}/prompt
+
+The existing POST /tui/show-toast local sink remains served. The nine genuine gaps stay explicit:
+PUT /auth/{providerID}, POST /log, GET /config, both provider OAuth routes,
+GET /session/status, PATCH /session/{sessionID}, GET /session/{sessionID}/children, and
+GET /session/{sessionID}/todo. No new auth/config/log/status/update/children/todo/OAuth behavior
+was introduced.
+
+Actual coverage is measured=20, served=11, unbacked=9, redirected=0. These values are asserted
+against `v1_coverage()`, which derives served routes from `V1_BACKENDS`, the same registration
+source used to choose router handlers. `V1_SURFACE.backing` remains a frozen declaration and the
+named router witness fails if it disagrees with actual registration.
+
+Targeted behavior validation
+----------------------------
+`cargo test -p oc-server --test compat_v1 --offline` passed 22 tests. The named regressions drive
+the assembled server with generated-SDK request shapes and verify bare v1 response envelopes for
+agent/provider/session list/create/get/messages/abort/summarize plus synchronous and asynchronous
+prompt behavior.
+
+Mutation validation
+-------------------
+Changing the actual `GET /agent` registration in `V1_BACKENDS` to `NotImplemented` made
+`compat_v1_backed_sdk_routes_return_expected_catalog_and_session_shapes` fail by name with the
+observed 501 versus expected 200. Restored afterward.
+
+Changing only `V1_SURFACE`'s declared `GET /agent` backing to `NotImplemented` while leaving the
+actual router registration served made `compat_v1_declared_backing_matches_what_the_router_answers`
+fail by name, reporting that the declaration said `not-implemented` while the router answered 200.
+Restored afterward.
+
+Final validation
+----------------
+`cargo fmt --all --check` and
+`cargo clippy --workspace --all-targets --offline -- -D warnings` passed after regenerating the
+compatibility matrix. The workspace test run passed the updated 13-test `oc-cli --test docs` suite,
+then the host exhausted its process/thread allowance while listing the 147 `oc-config` unit tests
+(`Os { code: 11, kind: WouldBlock, message: "Resource temporarily unavailable" }`) because LSP
+servers had been launched concurrently with the workspace run. Re-running that affected package
+without concurrency as `RUST_TEST_THREADS=1 cargo test -p oc-config --lib --offline` passed all 147
+tests. A detached-worktree directory diagnostic then scanned 50 Rust files, including every changed
+Rust file, and reported 0 files with errors and 0 total diagnostics. The temporary diagnostic
+worktree was removed.

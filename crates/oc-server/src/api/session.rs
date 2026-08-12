@@ -26,27 +26,27 @@ use crate::{
 
 #[derive(Debug, Deserialize)]
 pub struct SessionListQuery {
-    workspace: Option<String>,
-    limit: Option<u32>,
-    order: Option<SessionOrder>,
-    search: Option<String>,
-    directory: Option<String>,
-    project: Option<String>,
-    subpath: Option<String>,
-    cursor: Option<i64>,
-    sort: Option<SessionOrderBy>,
+    pub(crate) workspace: Option<String>,
+    pub(crate) limit: Option<u32>,
+    pub(crate) order: Option<SessionOrder>,
+    pub(crate) search: Option<String>,
+    pub(crate) directory: Option<String>,
+    pub(crate) project: Option<String>,
+    pub(crate) subpath: Option<String>,
+    pub(crate) cursor: Option<i64>,
+    pub(crate) sort: Option<SessionOrderBy>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum SessionOrder {
+pub(crate) enum SessionOrder {
     Asc,
     Desc,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum SessionOrderBy {
+pub(crate) enum SessionOrderBy {
     Created,
     Updated,
 }
@@ -57,6 +57,18 @@ pub struct CreateSessionBody {
     id: Option<String>,
     agent: Option<String>,
     location: Option<LocationRef>,
+}
+
+pub(crate) struct SessionCreateInput {
+    pub id: Option<String>,
+    pub agent: Option<String>,
+    pub directory: Option<String>,
+    pub parent_id: Option<String>,
+    pub workspace_id: Option<String>,
+    pub title: Option<String>,
+    pub model: Option<Value>,
+    pub metadata: Option<Value>,
+    pub permission: Option<Value>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -93,8 +105,8 @@ pub struct SessionCursor {
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct SessionListResponse {
-    pub data: Vec<SessionInfo>,
-    pub cursor: SessionCursor,
+    pub(crate) data: Vec<SessionInfo>,
+    pub(crate) cursor: SessionCursor,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -113,7 +125,7 @@ pub type SessionActiveResponse = Data<BTreeMap<String, SessionActive>>;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
-enum MessageOrder {
+pub(crate) enum MessageOrder {
     Asc,
     Desc,
 }
@@ -127,9 +139,9 @@ enum CursorDirection {
 
 #[derive(Debug, Deserialize)]
 pub struct MessagesQuery {
-    limit: Option<usize>,
-    order: Option<MessageOrder>,
-    cursor: Option<String>,
+    pub(crate) limit: Option<usize>,
+    pub(crate) order: Option<MessageOrder>,
+    pub(crate) cursor: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -149,8 +161,8 @@ pub struct MessageCursor {
 
 #[derive(Debug, Serialize)]
 pub struct MessagesResponse {
-    data: Vec<Value>,
-    cursor: MessageCursor,
+    pub(crate) data: Vec<Value>,
+    pub(crate) cursor: MessageCursor,
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,11 +185,11 @@ pub struct AgentBody {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelRefBody {
-    id: String,
+    pub(crate) id: String,
     #[serde(rename = "providerID")]
-    provider_id: String,
+    pub(crate) provider_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    variant: Option<String>,
+    pub(crate) variant: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -187,11 +199,11 @@ pub struct ModelBody {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PromptInputBody {
-    text: String,
+    pub(crate) text: String,
     #[serde(default)]
-    files: Vec<Value>,
+    pub(crate) files: Vec<Value>,
     #[serde(default)]
-    agents: Vec<Value>,
+    pub(crate) agents: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -203,17 +215,19 @@ pub enum PromptDelivery {
 
 #[derive(Debug, Deserialize)]
 pub struct PromptBody {
-    id: Option<String>,
-    prompt: PromptInputBody,
-    delivery: Option<PromptDelivery>,
-    resume: Option<bool>,
+    pub(crate) id: Option<String>,
+    pub(crate) prompt: PromptInputBody,
+    pub(crate) delivery: Option<PromptDelivery>,
+    pub(crate) resume: Option<bool>,
+    pub(crate) agent: Option<String>,
+    pub(crate) model: Option<ModelRefBody>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PromptAdmitted {
     admitted_seq: u64,
-    id: String,
+    pub(crate) id: String,
     #[serde(rename = "sessionID")]
     session_id: String,
     prompt: PromptInputBody,
@@ -319,12 +333,32 @@ pub async fn create(
     State(state): State<ApiState>,
     Json(input): Json<CreateSessionBody>,
 ) -> Result<Json<Data<SessionInfo>>, ApiError> {
+    create_session(
+        &state,
+        SessionCreateInput {
+            id: input.id,
+            agent: input.agent,
+            directory: input.location.and_then(|location| location.directory),
+            parent_id: None,
+            workspace_id: None,
+            title: None,
+            model: None,
+            metadata: None,
+            permission: None,
+        },
+    )
+    .await
+}
+
+pub(crate) async fn create_session(
+    state: &ApiState,
+    input: SessionCreateInput,
+) -> Result<Json<Data<SessionInfo>>, ApiError> {
     let id = input
         .id
         .unwrap_or_else(|| format!("ses_{}", Uuid::new_v4().simple()));
     let directory = input
-        .location
-        .and_then(|location| location.directory)
+        .directory
         .unwrap_or_else(|| state.directory().to_owned());
     let mut create = SessionCreate::new(
         &id,
@@ -332,10 +366,27 @@ pub async fn create(
         GLOBAL_PROJECT_ID,
         state.directory(),
         directory,
-        format!("New session - {id}"),
+        input.title.unwrap_or_else(|| format!("New session - {id}")),
         env!("CARGO_PKG_VERSION"),
     );
     create.agent = input.agent;
+    create.parent_id = input.parent_id;
+    create.workspace_id = input.workspace_id;
+    create.model = input
+        .model
+        .map(|value| serde_json::to_string(&value))
+        .transpose()
+        .map_err(|error| ApiError::MutationFailed(error.to_string()))?;
+    create.metadata = input
+        .metadata
+        .map(|value| serde_json::to_string(&value))
+        .transpose()
+        .map_err(|error| ApiError::MutationFailed(error.to_string()))?;
+    create.permission = input
+        .permission
+        .map(|value| serde_json::to_string(&value))
+        .transpose()
+        .map_err(|error| ApiError::MutationFailed(error.to_string()))?;
     let session = state.sessions().create(&create)?.into_session();
     let info = SessionInfo::from(session);
     if let Some(events) = state.events() {
@@ -661,8 +712,14 @@ pub async fn prompt(
             directory: session.directory.into(),
             message_id,
             prompt: input.prompt.text,
-            agent: session.agent,
-            model: session_model(session.model.as_deref())?,
+            agent: input.agent.or(session.agent),
+            model: match input.model {
+                Some(model) => Some(SessionModelSelection {
+                    provider_id: model.provider_id,
+                    model_id: model.id,
+                }),
+                None => session_model(session.model.as_deref())?,
+            },
         };
         let signal = guard.interrupt_signal().clone();
         let executor = Arc::clone(executor);

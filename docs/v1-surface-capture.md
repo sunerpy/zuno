@@ -146,7 +146,19 @@ the *verb* is not, so it is accounted as an operation gap rather than a path gap
 
 ## Backends: what is real and what is a seam
 
-Only one of the 20 routes has a local backend in this build.
+Eleven of the 20 routes have local backends in this build. Ten are thin wire-format
+adapters over the corresponding `/api` implementation:
+
+- `GET /agent` and `GET /provider`;
+- `GET|POST /session` and `GET /session/{sessionID}`;
+- `POST /session/{sessionID}/abort` and
+  `POST /session/{sessionID}/summarize`;
+- `GET|POST /session/{sessionID}/message`; and
+- `POST /session/{sessionID}/prompt_async`.
+
+The adapters preserve the published SDK's unprefixed paths and response envelopes,
+while session persistence, event publication, prompt execution, compaction, and
+catalog resolution remain owned by the shared `/api` handlers.
 
 `POST /tui/show-toast` is fully served. No server entry point attaches a display
 — `crates/oc-server/src/main.rs` and `crates/oc-cli/src/cmd/serve.rs` both build a
@@ -165,19 +177,18 @@ required and forbids additional properties; this seam defaults a missing
 a cosmetic mismatch into the exact failure the plan warns about. A missing or
 non-string `message` is still a `400`, because there is then nothing to show.
 
-The other 19 routes are **registered, structured `501 not_implemented` seams**.
+The other nine routes are **registered, structured `501 not_implemented` seams**.
 This follows the precedent set by the `/api` surface: an operation with no local
 backend is registered explicitly and answers definitively rather than fabricating
 success data. Each `501` body names the SDK method, the plugins that call it, and
 the `/api` route to call instead when one is served here, so the operator learns
 which plugin needs which backend and the caller learns what works today.
 
-No plan todo owns backing them. This is a **gap, not a decision**: it is recorded
+This is a **gap, not a decision**: it is recorded
 as `v1-surface-unbacked` in `oc_testkit::compat_report::known_gaps`, rendered into
 `docs/compatibility-matrix.md`, and never declared in `docs/divergences.toml`,
 whose own rule is that a merely unimplemented surface must not be laundered into a
-divergence. Ten of the nineteen have a served `/api` equivalent and their `501`
-names it; the other nine — `auth.set`, `app.log`, `config.get`, the two
+divergence. The nine remaining seams — `auth.set`, `app.log`, `config.get`, the two
 `provider.oauth` calls, `session.status`, `session.update`, `session.children` and
 `session.todo` — have no served `/api` spelling in this build, so a plugin needing
 them has no working call today. `crates/oc-server/tests/compat_v1.rs` asserts both
