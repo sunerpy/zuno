@@ -626,6 +626,46 @@ impl JsHost {
         lock(&self.inner.diagnostics).clone()
     }
 
+    pub(crate) async fn disable(
+        &self,
+        plugin: impl Into<String>,
+        kind: PluginDiagnosticKind,
+        hook: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        let plugin = plugin.into();
+        let hook = hook.into();
+        let message = message.into();
+        {
+            let mut diagnostics = lock(&self.inner.diagnostics);
+            if let Some(existing) = diagnostics.iter_mut().rev().find(|diagnostic| {
+                diagnostic.hook.as_deref() == Some("call") && diagnostic.message == message
+            }) {
+                existing.plugin.clone_from(&plugin);
+                existing.hook = Some(hook.clone());
+                existing.kind = kind;
+            } else if !diagnostics.iter().any(|diagnostic| {
+                diagnostic.plugin == plugin
+                    && diagnostic.hook.as_deref() == Some(hook.as_str())
+                    && diagnostic.message == message
+            }) {
+                diagnostics.push(PluginDiagnostic {
+                    plugin: plugin.clone(),
+                    hook: Some(hook.clone()),
+                    kind,
+                    message: message.clone(),
+                });
+            }
+        }
+        tracing::warn!(
+            plugin = %plugin,
+            hook = %hook,
+            %message,
+            "disabled JavaScript plugin after hook failure"
+        );
+        self.inner.shutdown().await;
+    }
+
     /// How many restarts have happened inside the current window.
     #[must_use]
     pub fn restart_count(&self) -> usize {
@@ -753,6 +793,12 @@ impl JsHost {
         executor
             .spawn(async move {
                 if !inner.enabled.load(Ordering::SeqCst) {
+                    if inner.closing.load(Ordering::SeqCst) {
+                        return Err(JsHostError::Disabled {
+                            plugin: inner.plugin.clone(),
+                            detail: "the host is permanently disabled".to_owned(),
+                        });
+                    }
                     inner.restart().await?;
                 }
                 let handle_id = lock(&inner.report)
@@ -879,6 +925,12 @@ impl JsHost {
         executor
             .spawn(async move {
                 if !inner.enabled.load(Ordering::SeqCst) {
+                    if inner.closing.load(Ordering::SeqCst) {
+                        return Err(JsHostError::Disabled {
+                            plugin: inner.plugin.clone(),
+                            detail: "the host is permanently disabled".to_owned(),
+                        });
+                    }
                     inner.restart().await?;
                 }
                 let id = {
@@ -1022,6 +1074,12 @@ impl HostInner {
         arguments: Vec<Value>,
     ) -> Result<Value, JsHostError> {
         if !self.enabled.load(Ordering::SeqCst) {
+            if self.closing.load(Ordering::SeqCst) {
+                return Err(JsHostError::Disabled {
+                    plugin: self.plugin.clone(),
+                    detail: "the host is permanently disabled".to_owned(),
+                });
+            }
             self.restart().await?;
         }
         let handle = JsHandle {

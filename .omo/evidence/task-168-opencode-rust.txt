@@ -1,0 +1,124 @@
+Task 168 evidence log
+=====================
+
+2026-08-12 investigation start
+------------------------------
+- Worktree: /config/workspace/ProdDir/AI/oc-wt/t168
+- Branch: task-168
+- Required first codegraph query attempted:
+  `plugin_runtime dispatch PluginDiagnostic HookInvocation ToolDefinition disable turn`
+- Result: `Error: No indexed project found for projectPath "/config/workspace/ProdDir/AI/oc-wt/t168".`
+- Per task instructions, investigation continued with Read/Grep/Glob.
+
+Initial dispatch and load audit
+-------------------------------
+- `HookInvocation` has 21 variants and `PluginRuntime` wires all 21 production boundaries.
+- Four are not turn-fatal callback dispatches in the adapter:
+  - `tool`, `auth`, and `provider` are resource collectors; `HookBus` currently returns `Ok` without calling `Plugin::call`.
+  - `dispose` logs its error during shutdown and does not fail an active turn.
+- The remaining 17 callback dispatch sites all propagate `HookBus::dispatch` errors to their caller:
+  `config`, `event`, `chat.message`, `chat.params`, `chat.headers`, `permission.ask`,
+  `command.execute.before`, `tool.execute.before`, `shell.env`, `tool.execute.after`,
+  `experimental.chat.messages.transform`, `experimental.chat.system.transform`,
+  `experimental.provider.small_model`, `experimental.session.compacting`,
+  `experimental.compaction.autocontinue`, `experimental.text.complete`, and `tool.definition`.
+  Sixteen use `map_err(|error| error.to_string())`; `shell.env` wraps the same error in
+  `ToolError::Failed`. Thus a bridge/write-back failure from any of these 17 can abort the
+  surrounding lifecycle instead of being contained.
+- Existing out-of-process and WebAssembly plugins already implement the documented containment
+  contract internally: they disable themselves, retain a typed `PluginDiagnostic`, and return
+  success to `HookBus`.
+- JavaScript host transport failures are also retained by `JsHost`, but `JsPlugin::call` currently
+  discards every `call_hook` error with `let Ok(result) = result else { continue; }`. Bridge-side
+  failures after a successful callback (`invocation_output` / `apply_hook_output`) escape to
+  `HookBus`, which wraps them as `PluginError::Hook`; this is the todo 151 truncation path that
+  reaches the fatal adapter mappings.
+
+Load/dispatch contradiction
+---------------------------
+- The warning text `JavaScript plugin did not fully load` is misleading for compatibility
+  diagnostics. `load_one` fully starts and builds the plugin, then returns it in
+  `JsPluginLoad.plugins`; `VersionGate::Unsatisfied` is appended only as a warning.
+- `JsPluginSpec::VersionGate::Unsatisfied` explicitly says `Load anyway, but say so`, while
+  `docs/plugin-authoring.md:37-40` says an incompatible npm plugin is skipped. Therefore the
+  reported plugin genuinely loaded and was correctly present in `HookBus` under the current code;
+  the log did not describe a skip.
+- This explains how `@sunerpy/oh-my-openagent@4.21.0` could emit a later
+  `tool.definition` failure despite the startup warning. The root contradiction is a real
+  loader-policy/documentation mismatch, not dispatch of an absent plugin.
+
+Real binary two-direction reproduction
+--------------------------------------
+- Built `target/debug/opencode-rust` from task-168 HEAD with
+  `CARGO_BUILD_JOBS=2 cargo build -p oc-cli --offline`.
+- Used the real global plugin list through its highest-precedence
+  `OPENCODE_CONFIG_CONTENT` equivalent and added the same local fake OpenAI-compatible provider
+  to both runs. The command, model (`fakerepro/fake-model`), prompt
+  (`task 168 identical prompt`), database, binary, and environment were identical; only the
+  `@sunerpy/oh-my-openagent@4.21.0` plugin entry was removed for the control run.
+- With `[opencode-antigravity-auth, opencode-kiro-auth, oh-my-openagent]`:
+  - exit: `1`
+  - stdout: empty
+  - stderr: `plugin hook failed: plugin oh-my-openagent failed in hook tool.definition`
+- With `[opencode-antigravity-auth, opencode-kiro-auth]`:
+  - exit: `0`
+  - stdout: `tick0 tick1 tick2 tick3 tick4 tick5`
+  - stderr: empty
+- The local provider log shows completed streams, so provider availability was not the cause.
+- The real `/config/.config/opencode/opencode.json` was not modified; after the experiment its
+  SHA-256 was `502ca4db55e63d958be28bb7ed9b2d687a9a6f2eca84442df37dd8e7245336c6`.
+
+Regression tests before implementation
+--------------------------------------
+- `cargo test -p oc-cli --test tool_turn failing_tool_definition_hook_is_disabled_and_cli_turn_completes_with_a_diagnostic --offline -- --exact`
+  failed by name because the production CLI exited 1 with
+  `plugin hook failed: plugin production-noop-tool-definition failed in hook tool.definition`.
+- `cargo test -p oc-cli --test session_mutation failing_tool_definition_hook_is_disabled_and_http_turn_completes_with_a_diagnostic --offline -- --exact`
+  failed by name because the production HTTP server emitted `session.error` with
+  `plugin hook failed: plugin http-failing-tool-definition failed in hook tool.definition`.
+- Both tests use a real JavaScript `tool.definition` callback and the existing bounded-encoder
+  truncation refusal, so the red state proves the production failure mechanism rather than a
+  test-only substitute.
+
+Implementation and mutation evidence
+------------------------------------
+- The focused CLI and HTTP regressions both pass after the implementation. Each proves the turn
+  completes, the failed plugin is not invoked again, and a default-visible diagnostic names the
+  plugin id, `tool.definition`, and the truncation cause.
+- Hard-error mutation: temporarily removed the `plugin.is_disabled()` containment condition from
+  `HookBus`. Both named tests failed (`exit 101`): the CLI returned the hook error and the HTTP
+  path did not reach `turn.completed`. The containment condition was restored.
+- Diagnostic-removal mutation: temporarily replaced shared diagnostic publication with a no-op.
+  Both named tests failed (`exit 101`): CLI stderr was empty and HTTP SSE timed out waiting for the
+  diagnostic. Diagnostic publication was restored.
+- Todo 151 regression:
+  `cargo test -p oc-plugin --test js js_ordinary_hook_refuses_truncation_before_committing_any_output_field --offline -- --exact`
+  passed. The bridge still refuses the truncated write-back and preserves the original output;
+  only the host-level consequence changed from killing the turn to disabling the plugin.
+- `/config` filled while compiling that targeted test. `cargo clean` removed only the worktree's
+  reproducible `target/` artifacts (3.9 GiB), and subsequent validation uses
+  `CARGO_TARGET_DIR=/tmp/opencode/t168-target` on the filesystem with available capacity.
+
+Final contract reconciliation and validation
+--------------------------------------------
+- The first constrained workspace gate exposed one stale pre-todo-168 assertion:
+  `js_timed_out_hook_restarts_before_the_next_invocation` still expected a timed-out JavaScript
+  hook to restart and run again. That contradicted the documented and newly enforced permanent
+  disable contract. The test is now
+  `js_timed_out_hook_is_permanently_disabled_before_the_next_invocation` and proves the direct
+  failure is reported, the plugin is disabled, the next invocation is a no-op, no restart occurs,
+  and the retained diagnostic names `experimental.text.complete` with kind `TimedOut`.
+- `lsp_diagnostics` could not address the sibling worktree because the tool requires paths below
+  the session cwd. The equivalent `rust-analyzer diagnostics .` scan completed over the target
+  worktree; changed files had no errors or actionable warnings (only existing `#[cfg]`
+  inactive-code weak warnings were reported).
+- Final validation used `CARGO_TARGET_DIR=/tmp/opencode/t168-target` and
+  `CARGO_BUILD_JOBS=2`:
+  - `cargo test --workspace --offline -- --test-threads=2` passed, including all unit,
+    integration, and doc tests.
+  - `cargo clippy --workspace --all-targets --offline -- -D warnings` passed.
+  - `cargo fmt --all --check` passed.
+- The first Clippy pass identified one `collapsible_if` in the new `HookBus` containment branch;
+  the branch was rewritten equivalently and only the previously failed Clippy/format stages were
+  rerun, both successfully. Per the verification stop rule, tests were not redundantly rerun after
+  that non-semantic rewrite.

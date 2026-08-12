@@ -7409,3 +7409,28 @@ advertised `chat` beats the Responses-friendly `gpt-5` heuristic. The same hook 
 malformed sibling without losing the provider. Bypassing only the boundary normalizer made both named
 tests fail with `Model not found`; restoring it returned both to green. Complete evidence:
 `.omo/evidence/task-167-opencode-rust.txt`.
+
+## [2026-08-12] Todo 168 — a JavaScript hook failure now disables only its plugin
+
+The production failure was broader than the `tool.definition` adapter named by the finding.
+Seventeen callback-bearing hook boundaries propagated a JavaScript bridge or write-back error into
+their lifecycle caller. `JsPlugin` now owns one atomic permanent-disable transition: the first hook
+failure records the canonical typed diagnostic with the manifest plugin id, public hook name, kind,
+and underlying cause, then shuts down the resident host. `HookBus` suppresses an error only when the
+same plugin reports that it disabled itself; errors from plugins that remain enabled still propagate.
+Resource accessors and later callback calls are empty/no-op after disablement.
+
+Diagnostics are drained once through `PluginRuntime` after a turn and published as ordinary shared
+`StreamEvent::Error` events. This makes them visible on default CLI stderr and HTTP SSE without
+`--print-logs`, while avoiding duplicate publication on later turns. Real JavaScript regressions for
+both surfaces prove the turn completes, no later callback reaches the failed plugin, and the message
+names the plugin, `tool.definition`, and the bounded-encoder truncation cause. Removing containment or
+diagnostic publication fails both tests by name. The todo 151 regression remains green: truncated
+write-back is still rejected atomically; rejection now disables the plugin instead of terminating
+the turn.
+
+The existing timeout-restart test encoded the superseded host-recovery policy. It was converted to
+assert the documented permanent-disable behavior: direct callers receive the initial error, the
+diagnostic retains `experimental.text.complete`/`TimedOut`, and subsequent dispatch is a no-op with
+no runtime restart. Workspace tests, Clippy with `-D warnings`, formatting, and rust-analyzer
+diagnostics all pass. Full evidence is in `.omo/evidence/task-168-opencode-rust.txt`.

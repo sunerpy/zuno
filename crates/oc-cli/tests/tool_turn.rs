@@ -244,10 +244,14 @@ export default {
 "#;
 
 const NOOP_TOOL_DEFINITION_PLUGIN: &str = r#"
+import { appendFileSync } from "node:fs";
+
 export default {
   id: "production-noop-tool-definition",
-  server: async () => ({
-    "tool.definition": async (_input, _output) => {},
+  server: async (_input, options) => ({
+    "tool.definition": async (input, _output) => {
+      appendFileSync(options.eventFile, `${input.toolID}\n`);
+    },
   }),
 };
 "#;
@@ -1402,7 +1406,7 @@ async fn shell_env_plugin_hook_reaches_the_real_shell_process() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn noop_tool_definition_hook_rejects_real_truncated_schema_before_provider_dispatch() {
+async fn failing_tool_definition_hook_is_disabled_and_cli_turn_completes_with_a_diagnostic() {
     let env = ScriptedEnv::new()
         .expect("isolated environment")
         .with_db(DbChoice::TempFile);
@@ -1415,7 +1419,7 @@ async fn noop_tool_definition_hook_rejects_real_truncated_schema_before_provider
         .from_oracle_cassette(TITLE_CASSETTE)
         .expect("the recorded title completion loads")
         .from_oracle_cassette(TITLE_CASSETTE)
-        .expect("the turn response is available only to catch an unsafe dispatch");
+        .expect("the turn completes after the failing plugin is disabled");
     let provider = MockProvider::start(vec![scenario])
         .await
         .expect("mock provider binds loopback");
@@ -1432,13 +1436,15 @@ async fn noop_tool_definition_hook_rejects_real_truncated_schema_before_provider
     provider.shutdown().await;
 
     assert!(
-        !output.status.success(),
-        "the no-op hook must fail explicitly instead of silently replacing a real deep built-in schema"
+        output.status.success(),
+        "the hook failure must disable only the plugin, not the CLI turn\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
         captured.len(),
-        1,
-        "the lossy tool definition must be rejected after the title prelude and before turn dispatch"
+        2,
+        "the provider must receive the ordinary turn after the lossy plugin write-back is refused"
     );
     for request in &captured {
         let body = request.json().expect("captured request is JSON");
@@ -1449,8 +1455,21 @@ async fn noop_tool_definition_hook_rejects_real_truncated_schema_before_provider
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("plugin production-noop-tool-definition failed in hook tool.definition"),
-        "the production failure must identify the rejected plugin hook: {stderr}"
+        stderr.contains("production-noop-tool-definition")
+            && stderr.contains("tool.definition")
+            && stderr.contains("truncated"),
+        "the default CLI diagnostic must identify the disabled plugin, hook, and cause: {stderr}"
+    );
+    let calls = std::fs::read_to_string(&event_file).expect("read tool.definition calls");
+    assert_eq!(
+        calls.lines().filter(|tool| *tool == "todowrite").count(),
+        1,
+        "the truncation-producing tool must fail exactly once before the plugin is disabled: {calls:?}"
+    );
+    assert_eq!(
+        calls.lines().last(),
+        Some("todowrite"),
+        "the disabled plugin must not receive definitions after the failing tool: {calls:?}"
     );
 }
 

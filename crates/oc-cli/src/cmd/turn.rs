@@ -774,6 +774,7 @@ impl TurnHost {
         let outcome = self.run_prelude().await?;
         report_prelude(&events, &self.notes, &outcome).await?;
         if !outcome.continue_turn {
+            report_plugin_diagnostics(self.plugins.clone(), &events).await?;
             return Ok(());
         }
         let mut context = TurnContext::new(
@@ -787,17 +788,18 @@ impl TurnHost {
             let hooks: Arc<dyn oc_engine::hooks::TurnHooks> = plugins.clone();
             context = context.with_hooks(hooks);
         }
-        run_turn(
+        let outcome = run_turn(
             RunTurnRequest::new(
                 self.session_id.clone(),
                 Uuid::new_v4().simple().to_string(),
                 DynamicContext::default(),
             ),
             context,
-            events,
+            events.clone(),
         )
-        .await
-        .map_err(|error| describe_turn_failure(&error, self.credential.as_deref()))?;
+        .await;
+        report_plugin_diagnostics(self.plugins.clone(), &events).await?;
+        outcome.map_err(|error| describe_turn_failure(&error, self.credential.as_deref()))?;
         Ok(())
     }
 
@@ -852,6 +854,33 @@ impl TurnHost {
         run_prelude(&self.session_id, &mut context)
             .await
             .map_err(to_string)
+    }
+}
+
+async fn report_plugin_diagnostics(
+    plugins: Option<Arc<super::plugin_runtime::PluginRuntime>>,
+    events: &TurnEventSender,
+) -> Result<(), String> {
+    let Some(plugins) = plugins else {
+        return Ok(());
+    };
+    loop {
+        let diagnostics = plugins.take_diagnostics();
+        if diagnostics.is_empty() {
+            return Ok(());
+        }
+        for message in diagnostics {
+            events
+                .publish(TurnEvent::Provider {
+                    step: 0,
+                    event: StreamEvent::Error {
+                        message,
+                        retry_after: None,
+                    },
+                })
+                .await
+                .map_err(to_string)?;
+        }
     }
 }
 

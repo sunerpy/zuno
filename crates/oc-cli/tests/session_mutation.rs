@@ -14,6 +14,19 @@ const PROMPT: &str = "answer from the recorded cassette";
 const RUN_TIMEOUT: Duration = Duration::from_secs(30);
 const SSE_TIMEOUT: Duration = Duration::from_secs(5);
 
+const FAILING_TOOL_DEFINITION_PLUGIN: &str = r#"
+import { appendFileSync } from "node:fs";
+
+export default {
+  id: "http-failing-tool-definition",
+  server: async (_input, options) => ({
+    "tool.definition": async (input, _output) => {
+      appendFileSync(options.callLog, `${input.toolID}\n`);
+    },
+  }),
+};
+"#;
+
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_opencode-rust"))
 }
@@ -59,6 +72,16 @@ fn broker_provider_config(base_url: &str) -> String {
         "bash": "ask",
         "question": "allow"
     });
+    config.to_string()
+}
+
+fn failing_plugin_provider_config(base_url: &str, plugin: &Path, call_log: &Path) -> String {
+    let mut config: Value =
+        serde_json::from_str(&provider_config(base_url)).expect("provider config is JSON");
+    config["plugin"] = json!([[
+        format!("file:{}", plugin.display()),
+        { "callLog": call_log }
+    ]]);
     config.to_string()
 }
 
@@ -247,12 +270,28 @@ impl RunningServer {
     }
 
     async fn start_with_config(env: &ScriptedEnv, database: &Path, config: String) -> Self {
+        Self::start_with_variables(env, variables_with_config(env, database, config)).await
+    }
+
+    async fn start_with_plugin_config(env: &ScriptedEnv, database: &Path, config: String) -> Self {
+        let mut variables = variables_with_config(env, database, config);
+        variables.remove("OPENCODE_PURE");
+        variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
+        variables.insert(
+            "MISE_DATA_DIR".to_owned(),
+            "/config/.local/share/mise".to_owned(),
+        );
+        variables.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+        Self::start_with_variables(env, variables).await
+    }
+
+    async fn start_with_variables(env: &ScriptedEnv, variables: BTreeMap<String, String>) -> Self {
         let mut command = tokio::process::Command::new(binary());
         command
             .args(["serve", "--hostname", "127.0.0.1", "--port", "0"])
             .current_dir(env.working_dir())
             .env_clear()
-            .envs(variables_with_config(env, database, config))
+            .envs(variables)
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
         let mut child = command
@@ -779,6 +818,77 @@ async fn global_http_event_stream_carries_the_http_driven_turn_after_server_conn
     assert!(
         value_contains_text(&turn_event, "Hello"),
         "global SSE omitted the HTTP-driven turn: {turn_event}"
+    );
+
+    server.stop().await;
+    provider.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failing_tool_definition_hook_is_disabled_and_http_turn_completes_with_a_diagnostic() {
+    let env = ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::Default);
+    let database = env.xdg_data().join("http-plugin-diagnostic.db");
+    seed_session(&database, env.project());
+    let plugin = env.project().join("http-failing-tool-definition.mjs");
+    let call_log = env.project().join("http-failing-tool-definition.calls");
+    std::fs::write(&plugin, FAILING_TOOL_DEFINITION_PLUGIN).expect("write failing plugin");
+    let scenario = Scenario::new("http-plugin-failure-is-contained")
+        .from_oracle_cassette(CASSETTE)
+        .expect("recorded completion loads");
+    let provider = MockProvider::start(vec![scenario])
+        .await
+        .expect("mock provider binds loopback");
+    let config = failing_plugin_provider_config(provider.base_url(), &plugin, &call_log);
+    let mut server = RunningServer::start_with_plugin_config(&env, &database, config).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build loopback client");
+    let mut session_events = SseClient::connect(
+        &client,
+        format!("{}/api/session/{SESSION_ID}/event?after=0", server.base_url),
+    )
+    .await;
+
+    submit_http_prompt(&client, &server, "msg_task168_plugin_failure").await;
+    wait_for_http_turn(&client, &server).await;
+
+    let (diagnostic, completed) = tokio::time::timeout(RUN_TIMEOUT, async {
+        let mut completed = false;
+        loop {
+            let frame = session_events.next_json().await;
+            assert_ne!(
+                frame["type"], "session.error",
+                "hook failure killed HTTP turn: {frame}"
+            );
+            completed |= value_contains_text(&frame, "turn.completed");
+            if value_contains_text(&frame, "http-failing-tool-definition")
+                && value_contains_text(&frame, "tool.definition")
+                && value_contains_text(&frame, "truncated")
+            {
+                break (frame, completed);
+            }
+        }
+    })
+    .await
+    .expect("HTTP SSE must publish the plugin diagnostic inside the turn budget");
+    assert!(
+        completed,
+        "turn.completed must precede the contained diagnostic: {diagnostic}"
+    );
+    assert_message_contains(&client, &server, "Hello").await;
+    let calls = std::fs::read_to_string(&call_log).expect("read HTTP tool.definition calls");
+    assert_eq!(
+        calls.lines().filter(|tool| *tool == "question").count(),
+        1,
+        "the HTTP plugin must fail once on the truncation-producing tool: {calls:?}"
+    );
+    assert_eq!(
+        calls.lines().last(),
+        Some("question"),
+        "the disabled HTTP plugin must receive no later definitions: {calls:?}"
     );
 
     server.stop().await;

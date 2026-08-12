@@ -46,6 +46,7 @@ pub enum JsDiagnosticKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JsDiagnostic {
     pub plugin: String,
+    pub hook: Option<String>,
     pub kind: JsDiagnosticKind,
     pub message: String,
 }
@@ -71,6 +72,7 @@ impl JsPluginLoad {
                     .into_iter()
                     .map(|diagnostic| JsDiagnostic {
                         plugin: diagnostic.plugin,
+                        hook: diagnostic.hook,
                         kind: map_diagnostic_kind(diagnostic.kind),
                         message: diagnostic.message,
                     }),
@@ -108,6 +110,7 @@ pub async fn load_js_plugins_ordered(
                     .into_iter()
                     .map(|plugin| JsDiagnostic {
                         plugin,
+                        hook: None,
                         kind: JsDiagnosticKind::MissingRuntime,
                         message: error.to_string(),
                     })
@@ -175,6 +178,7 @@ async fn load_one(
         .await
         .map_err(|error| JsDiagnostic {
             plugin: label.clone(),
+            hook: None,
             kind: map_diagnostic_kind(error.kind()),
             message: error.to_string(),
         })?;
@@ -186,12 +190,14 @@ async fn load_one(
     )
     .map_err(|error| JsDiagnostic {
         plugin: label.clone(),
+        hook: None,
         kind: JsDiagnosticKind::Protocol,
         message: error.to_string(),
     })?;
     let warning = match resolved.gate() {
         VersionGate::Unsatisfied { range, reported } => vec![JsDiagnostic {
             plugin: label,
+            hook: None,
             kind: JsDiagnosticKind::Compatibility,
             message: format!(
                 "plugin declares @opencode-ai/plugin {range}; host reports {reported}"
@@ -266,6 +272,7 @@ fn spec_diagnostic(plugin: &str, error: SpecError) -> JsDiagnostic {
     };
     JsDiagnostic {
         plugin: plugin.to_owned(),
+        hook: None,
         kind,
         message: error.to_string(),
     }

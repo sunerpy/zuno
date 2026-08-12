@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 use oc_engine::compaction::{
@@ -39,6 +39,7 @@ pub(crate) struct PluginRuntime {
     load: JsPluginLoad,
     bus: HookBus,
     providers: RwLock<BTreeMap<String, ResolvedProvider>>,
+    reported_diagnostics: Mutex<usize>,
     shutdown: AtomicBool,
 }
 
@@ -100,9 +101,11 @@ impl PluginRuntime {
         .worktree(worktree)
         .cache_dir(layout.cache());
         let load = load_js_plugins_ordered(specs, host).await;
-        for diagnostic in load.diagnostics() {
+        let diagnostics = load.diagnostics();
+        for diagnostic in &diagnostics {
             tracing::warn!(
                 plugin = %diagnostic.plugin,
+                hook = ?diagnostic.hook,
                 kind = ?diagnostic.kind,
                 message = %diagnostic.message,
                 surface = target.surface,
@@ -119,8 +122,32 @@ impl PluginRuntime {
             load,
             bus: HookBus::new(plugins),
             providers: RwLock::new(BTreeMap::new()),
+            reported_diagnostics: Mutex::new(diagnostics.len()),
             shutdown: AtomicBool::new(false),
         })
+    }
+
+    pub(crate) fn take_diagnostics(&self) -> Vec<String> {
+        let diagnostics = self.load.diagnostics();
+        let Ok(mut reported) = self.reported_diagnostics.lock() else {
+            return vec!["plugin diagnostic cursor lock was poisoned".to_owned()];
+        };
+        let messages = diagnostics
+            .iter()
+            .skip(*reported)
+            .map(|diagnostic| {
+                let hook = diagnostic
+                    .hook
+                    .as_deref()
+                    .map_or_else(|| "startup".to_owned(), |hook| format!("hook `{hook}`"));
+                format!(
+                    "disabled plugin `{}` after {hook} failed: {}",
+                    diagnostic.plugin, diagnostic.message
+                )
+            })
+            .collect();
+        *reported = diagnostics.len();
+        messages
     }
 
     pub(crate) async fn apply_config(&self, config: &mut oc_config::Config) -> Result<(), String> {
