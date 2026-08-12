@@ -1,0 +1,100 @@
+Task 166 — turn-level idle-timeout evidence (incremental)
+========================================================
+
+Starting point
+--------------
+- Worktree: /config/workspace/ProdDir/AI/oc-wt/t166
+- Branch/base requested: task-166 at f7f3cac3
+- CodeGraph was attempted first with `ReqwestTransport StreamIdleTimeout with_idle_timeout turn TurnRuntime ProviderError retry`; it reported that this sibling worktree is not indexed, so source inspection used Read/Grep.
+- F2 wave-11 Todo 154 blocker confirmed: existing stalled-socket coverage stops at `ReqwestTransport::send`; no test drives `run_turn` or a CLI surface.
+
+Retry-path inspection (before reproduction)
+-------------------------------------------
+- `TurnHost::drive_input` calls `oc_engine::loop::run_turn` once and maps its error through `describe_turn_failure`.
+- `run_turn` reads `provider.stream(...)` directly and returns the first `ProviderError` (`let event = next?`); it does not call `retry_provider`.
+- `ProviderRetryPolicy` exists in `oc-engine::retry`, but repository search found no production call from `run_turn` or `oc-cli`; compatible-provider translation also returns a transport error once and terminates.
+- Therefore a stalled compatible-provider response is attempted exactly once. Worst-case production wall time attributable to this idle gap is one effective idle window (the compatible transport's bounded default is 120 s, capped at 180 s for explicit transport overrides) plus scheduler/error-rendering overhead, not N × timeout. The shared compatible-provider SSE wait is a second outer guard, but no retry follows either guard.
+- Mutation-design warning: setting `OPENCODE_STREAM_IDLE_TIMEOUT_SECS` shortens both the transport and the compatible provider's outer SSE guard. Removing only the transport timeout under that setup is an equivalent mutant. The durable test must inject a short timeout into `ReqwestTransport` while leaving the provider's outer timeout longer.
+
+Verbatim real-binary reproduction (before writing the regression)
+-----------------------------------------------------------------
+Command: `python /tmp/opencode/t166_repro.py` from the requested worktree. The harness started a raw loopback HTTP server, completed the new-session title request, then sent one complete SSE text frame for the actual turn and held the chunked socket open without FIN. The child alone received `OPENCODE_STREAM_IDLE_TIMEOUT_SECS=1`.
+
+```text
+ROOT=/tmp/opencode/t166-real-turn-5ych1zn1
+REQUEST_COUNT=2
+ELAPSED_SECONDS=1.117
+EXIT_CODE=1
+STDOUT_BEGIN
+PARTIAL_T166
+STDOUT_END
+STDERR_BEGIN
+transient provider failure (status=None): provider `test` response stream idle timeout after 1s; raise OPENCODE_STREAM_IDLE_TIMEOUT_SECS for slower providers
+STDERR_END
+DATABASES=["/tmp/opencode/t166-real-turn-5ych1zn1/data/opencode/opencode-local.db"]
+TRANSCRIPT_DATABASE=/tmp/opencode/t166-real-turn-5ych1zn1/data/opencode/opencode-local.db
+MESSAGE_ROWS=[{"data": "{\"agent\":\"build\",\"model\":{\"modelID\":\"test-model\",\"providerID\":\"test\"},\"role\":\"user\",\"time\":{\"created\":1786519527993}}", "id": "msg_5981584da60a45ab9b35b1eea4753e3a", "session_id": "ses_0e1e3121983e443f9c7405df55bc7fd7", "time_created": 1786519527993, "time_updated": 1786519527993}, {"data": "{\"agent\":\"build\",\"cost\":0.0,\"mode\":\"build\",\"modelID\":\"test-model\",\"parentID\":\"msg_5981584da60a45ab9b35b1eea4753e3a\",\"path\":{\"cwd\":\"/tmp/opencode/t166-real-turn-5ych1zn1/work\",\"root\":\"/tmp/opencode/t166-real-turn-5ych1zn1/work\"},\"providerID\":\"test\",\"role\":\"assistant\",\"time\":{\"created\":1786519527998},\"tokens\":{\"cache\":{\"read\":0,\"write\":0},\"input\":0,\"output\":0,\"reasoning\":0}}", "id": "msg_981c1b355aa24cfcafbc4a0cb121f79c_0001", "session_id": "ses_0e1e3121983e443f9c7405df55bc7fd7", "time_created": 1786519527998, "time_updated": 1786519527998}]
+PART_ROWS=[{"data": "{\"text\":\"Show the partial response.\",\"type\":\"text\"}", "id": "prt_71f92162b5884798a81c508e3800a232", "message_id": "msg_5981584da60a45ab9b35b1eea4753e3a", "session_id": "ses_0e1e3121983e443f9c7405df55bc7fd7", "time_created": 1786519527993, "time_updated": 1786519527993}]
+```
+
+Observed contract for assertions:
+- The user-visible headless surface terminates non-zero in approximately one injected idle window.
+- Already-emitted assistant text remains visible on stdout, followed by the renderer's newline.
+- The complete cause chain reaches stderr and names both `idle timeout` and `OPENCODE_STREAM_IDLE_TIMEOUT_SECS`.
+- Finding above this todo's requested proof: the durable transcript does **not** retain the partial text. `run_turn` inserts the assistant row before streaming, but `let event = next?` returns on the transport error before `checkpoint_assistant`; only the user prompt has a part. This todo will not silently claim durable preservation. It will assert the measured user-visible stdout behavior and record the transcript gap in `issues.md`.
+
+Implemented turn-level regressions
+----------------------------------
+- Added `cmd::turn::tests::a_stalled_provider_ends_a_real_turn_with_partial_text_and_a_visible_idle_error` in `crates/oc-cli/src/cmd/turn_tests.rs` alongside, not instead of, the existing direct transport tests.
+- Its raw loopback server follows `transport.rs`'s fixture pattern: it consumes the real POST, sends one complete chunked SSE text frame, and then awaits forever without sending the terminating HTTP chunk/FIN.
+- The test constructs the production `CompatibleProvider` over `ReqwestTransport`, injects a 75 ms timeout only into that transport, keeps the provider translator's outer idle allowance at 2 s, persists a real user message, and drives `run_turn` with the production resolver/dispatcher/event channel.
+- It asserts the turn returns inside a one-second outer test budget, the user-visible `TextDelta` surface still contains exactly `PARTIAL_T166`, `describe_turn_failure` contains `idle timeout` plus `OPENCODE_STREAM_IDLE_TIMEOUT_SECS`, and no `RetryRollback` hid/replayed the partial response.
+- Added `a_slow_but_progressing_real_turn_outlives_one_transport_idle_window`: five valid SSE chunks arrive at 60 ms intervals under a 150 ms per-chunk allowance. The total turn exceeds 150 ms, completes successfully, and yields `SLOW_BUT_STILL_MOVING`, proving the bound refreshes instead of acting as a total deadline.
+
+Initial targeted results after `cargo fmt --all`:
+```text
+test cmd::turn::tests::a_stalled_provider_ends_a_real_turn_with_partial_text_and_a_visible_idle_error ... ok
+test result: ok. 1 passed; 0 failed; ... 100 filtered out; finished in 0.10s
+
+test cmd::turn::tests::a_slow_but_progressing_real_turn_outlives_one_transport_idle_window ... ok
+test result: ok. 1 passed; 0 failed; ... 100 filtered out; finished in 0.21s
+```
+
+Mutation results (each restored immediately)
+--------------------------------------------
+1. Removed the actual `ReqwestTransport` per-chunk `tokio::time::timeout`, changing the unfold to await `body.next()` without a bound. The provider-level timeout in the test is deliberately 2 s, so this was proven non-equivalent before interpreting the result. Command:
+   `cargo test -p oc-cli a_stalled_provider_ends_a_real_turn_with_partial_text_and_a_visible_idle_error --offline`
+
+   Result: the named test failed after 1.03 s at its outer turn budget:
+   ```text
+   test cmd::turn::tests::a_stalled_provider_ends_a_real_turn_with_partial_text_and_a_visible_idle_error ... FAILED
+   the real turn must finish inside its one-second test budget: Elapsed(())
+   test result: FAILED. 0 passed; 1 failed; ... 100 filtered out
+   ```
+   This proves the new turn-level test guards the transport bound itself, not the compatible provider's second SSE guard.
+
+2. Made the bound fire too eagerly by changing the transport wait from `idle.duration()` to `idle.duration() / 3`. With the progressing fixture's configured 150 ms allowance this yields 50 ms, less than each intentional 60 ms gap. Command:
+   `cargo test -p oc-cli a_slow_but_progressing_real_turn_outlives_one_transport_idle_window --offline`
+
+   Result: the named test failed after the premature close (the fixture observed `Broken pipe` while sending the next valid progress chunk):
+   ```text
+   test cmd::turn::tests::a_slow_but_progressing_real_turn_outlives_one_transport_idle_window ... FAILED
+   write turn response chunk: Os { code: 32, kind: BrokenPipe, message: "Broken pipe" }
+   test result: FAILED. 0 passed; 1 failed; ... 100 filtered out
+   ```
+   This proves the progress test is sensitive to a timeout that does not preserve the full per-chunk allowance.
+
+Both mutations were restored in `crates/oc-provider-compatible/src/transport.rs`; no production timeout value or cap is part of the intended diff.
+
+Final gate — incremental results
+--------------------------------
+- Integrated `lsp_diagnostics` was attempted for the changed Rust file and rejected the sibling-worktree path because the MCP session is rooted at the main checkout. The same backend was run locally as `rust-analyzer diagnostics . --severity warning`; it exited successfully with `diagnostic scan complete` and no source diagnostic. It emitted the repository's pre-existing internal analyzer logs (`Overloaded deref on type str is not a projection` / `pattern has unexpected type`) while scanning unrelated code.
+- Workspace test attempt 1: `cargo test --workspace --offline` reached and passed both new `oc-cli` tests, then the test harness failed while enumerating `oc-config` tests with the documented host transient:
+  ```text
+  error: io error when listing tests: Os { code: 11, kind: WouldBlock, message: "Resource temporarily unavailable" }
+  error: test failed, to rerun pass `-p oc-config --lib`
+  ```
+  No product assertion failed before the host error. Per task instructions, one serialized retry follows; there will be no third workspace-test status check.
+- Workspace test attempt 2 (the one permitted retry): `CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 cargo test --workspace --offline -- --test-threads=1` ran for the 120-second command budget. Every reported test passed, including both new `oc-cli` turn tests; the outer command timeout then terminated the run while `tests/rollback.rs` was executing `the_released_binary_lists_a_session_this_port_wrote`. No assertion failure was reported. Per the two-status-check cap, the workspace suite is not run a third time; this gate remains bounded by the host timeout rather than claimed as a complete pass.
+- `cargo fmt --all --check`: passed with no output.
+- `CARGO_BUILD_JOBS=1 cargo clippy --workspace --all-targets --offline -- -D warnings`: passed (`Finished dev profile`) after one command-budget continuation reused the completed build cache; no warnings or errors.
