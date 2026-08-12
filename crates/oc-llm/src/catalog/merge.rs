@@ -185,6 +185,7 @@ fn model_from_catalog(
             id: model.id.clone(),
             npm,
             url,
+            endpoint: None,
         },
         capabilities: ModelCapabilities {
             temperature: model.temperature,
@@ -548,6 +549,7 @@ fn merge_model(
             id: api_id,
             npm: api_npm,
             url: api_url,
+            endpoint: existing.and_then(|model| model.api.endpoint),
         },
         capabilities,
         cost,

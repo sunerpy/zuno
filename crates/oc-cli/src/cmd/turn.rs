@@ -1465,6 +1465,12 @@ fn model_spec(
             oc_provider_compatible::family::NPM_OPTION,
             json!(model.api.npm),
         );
+        if let Some(endpoint) = model.api.endpoint {
+            spec = spec.with_option(
+                oc_provider_compatible::surface::MODEL_ENDPOINTS_OPTION,
+                json!({ model.api.id.clone(): endpoint }),
+            );
+        }
     }
     Ok(spec)
 }

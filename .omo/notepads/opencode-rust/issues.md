@@ -7242,3 +7242,19 @@ The production-binary regression configures separate server-only and TUI-only fi
 factory markers. Replacing the TUI production selection with `Server` made
 `interactive_tui_selects_tui_plugin_factory_from_production_config` fail specifically because the TUI
 marker was absent. The selection was restored after the mutation.
+
+## [2026-08-12] Todo 162 — advertised model endpoints reach production selection
+
+The catalog's resolved `ModelApi` previously discarded the endpoint supplied by a provider model hook,
+so Copilot always fell back to its model-id heuristic even though `oc-provider-compatible` already
+honored `modelEndpoints`. `ModelApi` now carries a closed, optional `ModelEndpoint` enum through the
+plugin serde boundary and merge path. `model_spec` publishes that declaration under the wire-level
+`api.id`; absence still preserves the existing heuristic.
+
+Two production replay tests begin with resolved catalog metadata, replace the provider models through
+the same resolved-plugin shape used by `HandleModelLoader`, and then traverse real surface selection.
+`mai-code-1-flash-picker` explicitly advertises `responses` despite its heuristic-hostile id, while
+`gpt-5` explicitly advertises `chat` despite its Responses-friendly id. Before propagation both chose
+the heuristic surface. Mutating production propagation to always emit `chat` failed the first test;
+mutating it to always emit `responses` failed the inverse test. Both mutations were restored, and the
+two-test control passed. Complete evidence: `.omo/evidence/task-162-opencode-rust.txt`.
