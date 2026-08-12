@@ -39,6 +39,9 @@ use oc_llm::catalog::resolved::{JsonMap, ResolvedModel, ResolvedProvider};
 use serde_json::{Value, json};
 
 use crate::js::host::{JsHandle, JsHost};
+use crate::js::projection::{
+    SdkGeneration, credential_key, plugin_model, plugin_provider, provider_source, provider_value,
+};
 use crate::{
     AuthApiAuthorizer, AuthApiResult, AuthAutoCallback, AuthCallbackResult, AuthCredentialResolver,
     AuthHook, AuthInputs, AuthLoader, AuthMethod, AuthOAuthAuthorizer, AuthOAuthCallback,
@@ -309,11 +312,17 @@ impl AuthLoader for HandleAuthLoader {
         let get_auth = self
             .host
             .constant_function(credential_value(credential.as_ref()));
+        let sdk_provider = provider_value(
+            provider,
+            SdkGeneration::Legacy,
+            provider_source(provider),
+            credential_key(credential.as_ref()),
+        );
         let (value, arguments) = self
             .host
             .call_mutating(
                 &self.handle,
-                vec![get_auth.argument(), provider_value(provider)],
+                vec![get_auth.argument(), sdk_provider.into_json()],
             )
             .await?;
         if let Some(mutated) = arguments.get(1) {
@@ -323,7 +332,7 @@ impl AuthLoader for HandleAuthLoader {
                     path,
                 }));
             }
-            *provider = serde_json::from_value(mutated.clone())?;
+            *provider = plugin_provider(mutated.clone(), SdkGeneration::Legacy, provider)?;
         }
         Ok(value
             .as_object()
@@ -459,7 +468,13 @@ impl ProviderModelLoader for HandleModelLoader {
             .call(
                 &self.handle,
                 vec![
-                    provider_value(provider),
+                    provider_value(
+                        provider,
+                        SdkGeneration::V2,
+                        provider_source(provider),
+                        credential_key(context.auth),
+                    )
+                    .into_json(),
                     json!({ "auth": credential_value(context.auth) }),
                 ],
             )
@@ -471,7 +486,7 @@ impl ProviderModelLoader for HandleModelLoader {
         let mut models = BTreeMap::new();
         if let Some(map) = value.as_object() {
             for (id, model) in map {
-                match serde_json::from_value::<ResolvedModel>(plugin_model_value(model)) {
+                match plugin_model(model.clone(), SdkGeneration::V2) {
                     Ok(model) => {
                         models.insert(id.clone(), model);
                     }
@@ -545,23 +560,6 @@ fn inputs_value(inputs: Option<&AuthInputs>) -> Value {
                 .collect(),
         )
     })
-}
-
-fn provider_value(provider: &ResolvedProvider) -> Value {
-    serde_json::to_value(provider).unwrap_or(Value::Null)
-}
-
-fn plugin_model_value(model: &Value) -> Value {
-    let mut model = model.clone();
-    let Some(fields) = model.as_object_mut() else {
-        return model;
-    };
-    if !fields.contains_key("provider_id")
-        && let Some(provider_id) = fields.remove("providerID")
-    {
-        fields.insert("provider_id".to_owned(), provider_id);
-    }
-    model
 }
 
 pub(super) fn truncated_path(value: &Value) -> Option<String> {

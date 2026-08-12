@@ -33,6 +33,10 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::js::projection::{
+    HookModelBoundary, SdkGeneration, chat_context_value, model_value, plugin_model,
+    provider_source, provider_value,
+};
 use crate::{
     ChatHeadersOutput, ChatParamsOutput, ChatSystemTransformOutput, CompactionAutocontinueOutput,
     HookInvocation, HookName, MessageWithParts, PermissionStatus, Plugin, PluginManifest,
@@ -953,6 +957,7 @@ impl RemoteTool {
 struct RemoteToolFailure(String);
 
 pub(crate) fn encode_hook(hook: &HookInvocation<'_>) -> Result<HookCall, HookCodecError> {
+    let model_boundary = HookModelBoundary::classify(hook);
     let (input, output) = match hook {
         HookInvocation::Dispose => (Value::Null, Value::Null),
         HookInvocation::Event { event } => (json!({ "event": event_value(event)? }), Value::Null),
@@ -965,7 +970,9 @@ pub(crate) fn encode_hook(hook: &HookInvocation<'_>) -> Result<HookCall, HookCod
             ));
         }
         HookInvocation::ChatMessage { input, output } => (
-            json!({
+            {
+                debug_assert_eq!(model_boundary, HookModelBoundary::ModelSelection);
+                json!({
                 "sessionID": input.session_id,
                 "agent": input.agent,
                 "model": input.model.map(|model| json!({
@@ -974,14 +981,18 @@ pub(crate) fn encode_hook(hook: &HookInvocation<'_>) -> Result<HookCall, HookCod
                 })),
                 "messageID": input.message_id,
                 "variant": input.variant,
-            }),
+                })
+            },
             json!({
                 "message": output.message.to_json(),
                 "parts": encode_parts(&output.parts)?,
             }),
         ),
         HookInvocation::ChatParams { input, output } => (
-            chat_context_value(input)?,
+            {
+                debug_assert_eq!(model_boundary, HookModelBoundary::LegacyContext);
+                chat_context_value(input).into_json()
+            },
             json!({
                 "temperature": output.temperature,
                 "topP": output.top_p,
@@ -991,7 +1002,10 @@ pub(crate) fn encode_hook(hook: &HookInvocation<'_>) -> Result<HookCall, HookCod
             }),
         ),
         HookInvocation::ChatHeaders { input, output } => (
-            chat_context_value(input)?,
+            {
+                debug_assert_eq!(model_boundary, HookModelBoundary::LegacyContext);
+                chat_context_value(input).into_json()
+            },
             json!({ "headers": output.headers }),
         ),
         HookInvocation::PermissionAsk { input, output } => (
@@ -1038,22 +1052,40 @@ pub(crate) fn encode_hook(hook: &HookInvocation<'_>) -> Result<HookCall, HookCod
             }),
         ),
         HookInvocation::ChatSystemTransform { input, output } => (
-            json!({
+            {
+                debug_assert_eq!(model_boundary, HookModelBoundary::LegacyModel);
+                json!({
                 "sessionID": input.session_id,
-                "model": input.model,
-            }),
+                "model": model_value(input.model, SdkGeneration::Legacy).into_json(),
+                })
+            },
             json!({ "system": output.system }),
         ),
         HookInvocation::ProviderSmallModel { input, output } => (
-            json!({ "provider": input.provider }),
-            json!({ "model": output.model }),
+            {
+                debug_assert_eq!(model_boundary, HookModelBoundary::V2ProviderAndModel);
+                json!({
+                    "provider": provider_value(
+                        input.provider,
+                        SdkGeneration::V2,
+                        provider_source(input.provider),
+                        None,
+                    ).into_json(),
+                })
+            },
+            json!({
+                "model": output.model.as_ref().map(|model| {
+                    model_value(model, SdkGeneration::V2).into_json()
+                }),
+            }),
         ),
         HookInvocation::SessionCompacting { input, output } => (
             json!({ "sessionID": input.session_id }),
             json!({ "context": output.context, "prompt": output.prompt }),
         ),
         HookInvocation::CompactionAutocontinue { input, output } => {
-            let mut value = chat_context_value(input.context)?;
+            debug_assert_eq!(model_boundary, HookModelBoundary::LegacyContext);
+            let mut value = chat_context_value(input.context).into_json();
             let object = value.as_object_mut().ok_or_else(|| {
                 HookCodecError::Invalid("chat context must encode as an object".to_owned())
             })?;
@@ -1181,7 +1213,10 @@ pub(crate) fn apply_hook_output(
         HookInvocation::ProviderSmallModel { output, .. } => {
             let remote: WireSmallModelOutput = decode(value)?;
             **output = ProviderSmallModelOutput {
-                model: remote.model,
+                model: remote
+                    .model
+                    .map(|model| plugin_model(model, SdkGeneration::V2))
+                    .transpose()?,
             };
             Ok(())
         }
@@ -1215,25 +1250,6 @@ pub(crate) fn apply_hook_output(
             Ok(())
         }
     }
-}
-
-fn chat_context_value(context: &crate::ChatContext<'_>) -> Result<Value, HookCodecError> {
-    Ok(json!({
-        "sessionID": context.session_id,
-        "agent": context.agent,
-        "model": context.model,
-        "provider": {
-            "source": match context.provider.source {
-                crate::ProviderSource::Env => "env",
-                crate::ProviderSource::Config => "config",
-                crate::ProviderSource::Custom => "custom",
-                crate::ProviderSource::Api => "api",
-            },
-            "info": context.provider.info,
-            "options": context.provider.options,
-        },
-        "message": context.message,
-    }))
 }
 
 fn event_value(event: &oc_engine::r#loop::TurnEvent) -> Result<Value, HookCodecError> {
@@ -1556,7 +1572,7 @@ struct WireSystemOutput {
 
 #[derive(Deserialize)]
 struct WireSmallModelOutput {
-    model: Option<oc_llm::catalog::resolved::ResolvedModel>,
+    model: Option<Value>,
 }
 
 #[derive(Deserialize)]

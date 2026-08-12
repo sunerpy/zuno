@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use oc_engine::terminal_lease::{TerminalBroker, TerminalLease};
-use oc_llm::catalog::availability::Availability;
+use oc_llm::catalog::availability::{Availability, AvailabilitySource};
 use oc_llm::catalog::models_dev::CatalogStatus;
 use oc_llm::catalog::resolved::{
     ModelApi, ModelCapabilities, ModelCost, ModelLimit, ResolvedModel, ResolvedProvider,
@@ -14,9 +14,12 @@ use oc_llm::event::{Message, Role};
 use oc_paths::ResolvedProject;
 use oc_plugin::{
     AuthApiResult, AuthCredentialResolver, AuthLoader, AuthMethod, AuthPrompt, ChatContext,
-    ChatHeadersOutput, HookInvocation, JsDiagnosticKind, JsHostConfig, JsHostPolicy, JsPluginLoad,
-    JsPluginSpec, Plugin, ProviderContext, ProviderSource, SUPPORTED_JS_PLUGINS, TextCompleteInput,
-    TextCompleteOutput, VersionGate, load_js_plugins_ordered,
+    ChatHeadersOutput, ChatParamsOutput, ChatSystemTransformInput, ChatSystemTransformOutput,
+    CompactionAutocontinueInput, CompactionAutocontinueOutput, HookInvocation, JsDiagnosticKind,
+    JsHostConfig, JsHostPolicy, JsPluginLoad, JsPluginSpec, Plugin, ProviderContext,
+    ProviderHookContext, ProviderSmallModelInput, ProviderSmallModelOutput, ProviderSource,
+    SUPPORTED_JS_PLUGINS, TextCompleteInput, TextCompleteOutput, VersionGate,
+    load_js_plugins_ordered,
 };
 use oc_testkit::FakeTerminalOwner;
 use url::Url;
@@ -30,12 +33,119 @@ const KIRO_REQUEST_KIND_HEADER: &str = "x-opencode-kiro-request-kind";
 const FIXTURE: &str = r#"
 import { existsSync, writeFileSync } from "node:fs";
 
+const providerKeys = ["id", "name", "source", "env", "key", "options", "models"];
+const legacyModelKeys = [
+  "id", "providerID", "api", "name", "capabilities", "cost", "limit", "status", "options", "headers",
+];
+const v2ModelKeys = [...legacyModelKeys, "family", "release_date", "variants"];
+
+function assertAllowedKeys(value, allowed, label) {
+  const extras = Object.keys(value).filter((key) => !allowed.includes(key));
+  if (extras.length > 0) throw new Error(`${label} leaked non-SDK keys: ${extras.join(",")}`);
+}
+
+function assertRequiredKeys(value, required, label) {
+  const missing = required.filter((key) => !(key in value));
+  if (missing.length > 0) throw new Error(`${label} omitted SDK keys: ${missing.join(",")}`);
+}
+
+function assertModel(model, generation, label) {
+  const allowed = generation === "legacy" ? legacyModelKeys : v2ModelKeys;
+  assertAllowedKeys(model, allowed, label);
+  assertRequiredKeys(model, legacyModelKeys, label);
+  if (model.providerID !== "resident-fixture") {
+    throw new Error(`${label}.providerID was ${JSON.stringify(model.providerID)}`);
+  }
+  if ("provider_id" in model) throw new Error(`${label} exposed provider_id`);
+  assertAllowedKeys(model.api, ["id", "url", "npm"], `${label}.api`);
+  if ("endpoint" in model.api) throw new Error(`${label}.api exposed endpoint`);
+  if (generation === "legacy") {
+    if ("family" in model || "release_date" in model || "variants" in model) {
+      throw new Error(`${label} exposed v2-only model fields`);
+    }
+    if ("interleaved" in model.capabilities) {
+      throw new Error(`${label}.capabilities exposed interleaved`);
+    }
+    if ("input" in model.limit) throw new Error(`${label}.limit exposed input`);
+  } else {
+    assertRequiredKeys(model, ["release_date"], label);
+    if (!("interleaved" in model.capabilities)) {
+      throw new Error(`${label}.capabilities omitted interleaved`);
+    }
+  }
+}
+
+function assertProvider(provider, generation, source, key, label) {
+  assertAllowedKeys(provider, providerKeys, label);
+  assertRequiredKeys(provider, ["id", "name", "source", "env", "options", "models"], label);
+  if (provider.source !== source) {
+    throw new Error(`${label}.source was ${JSON.stringify(provider.source)}, expected ${source}`);
+  }
+  if (key === undefined ? "key" in provider : provider.key !== key) {
+    throw new Error(`${label}.key was ${JSON.stringify(provider.key)}, expected ${JSON.stringify(key)}`);
+  }
+  if ("availability" in provider) throw new Error(`${label} exposed availability`);
+  for (const [id, model] of Object.entries(provider.models)) {
+    assertModel(model, generation, `${label}.models.${id}`);
+  }
+}
+
+function modelBase(id, providerID) {
+  return {
+    id,
+    providerID,
+    api: { id: `${id}-wire`, url: "https://example.invalid/v1", npm: "@ai-sdk/openai-compatible" },
+    name: `SDK ${id}`,
+    capabilities: {
+      temperature: true,
+      reasoning: false,
+      attachment: false,
+      toolcall: true,
+      input: { text: true, audio: false, image: false, video: false, pdf: false },
+      output: { text: true, audio: false, image: false, video: false, pdf: false },
+    },
+    cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+    limit: { context: 8192, output: 2048 },
+    status: "active",
+    options: {},
+    headers: {},
+  };
+}
+
+function legacyModel(id) {
+  return modelBase(id, "resident-fixture");
+}
+
+function v2Model(id) {
+  const model = modelBase(id, "resident-fixture");
+  model.family = "sdk-v2";
+  model.capabilities.interleaved = false;
+  model.limit.input = 4096;
+  model.release_date = "2026-08-12";
+  model.variants = {};
+  return model;
+}
+
+function assertLegacyContext(input, label) {
+  assertModel(input.model, "legacy", `${label}.model`);
+  if (input.provider.source !== "config") {
+    throw new Error(`${label}.provider.source was ${JSON.stringify(input.provider.source)}`);
+  }
+  assertProvider(input.provider.info, "legacy", "config", undefined, `${label}.provider.info`);
+}
+
 export default {
   id: "resident-fixture",
   server: async (_input, options) => ({
     auth: {
       provider: "resident-fixture",
-      loader: async (_getAuth, _provider) => {
+      loader: async (getAuth, provider) => {
+        if (options?.assertSdkAuthProvider) {
+          const auth = await getAuth();
+          assertProvider(provider, "legacy", "api", auth.key, "Auth.loader.provider");
+          provider.models["auth-sdk-model"] = legacyModel("auth-sdk-model");
+          return { sdkBoundary: `${provider.source}:${provider.key}` };
+        }
         if (!options?.returnDeep) return {};
         const result = {};
         let current = result;
@@ -56,6 +166,40 @@ export default {
         }],
         authorize: async () => ({ type: "failed" }),
       }],
+    },
+    provider: {
+      id: "resident-fixture",
+      models: async (provider, context) => {
+        if (!options?.assertSdkProviderHook) return {};
+        assertProvider(provider, "v2", "api", context.auth.key, "ProviderHook.models.provider");
+        return { "provider-sdk-model": v2Model("provider-sdk-model") };
+      },
+    },
+    "chat.params": async (input, output) => {
+      if (!options?.assertSdkOrdinaryHooks) return;
+      assertLegacyContext(input, "chat.params");
+      output.options.sdkParams = true;
+    },
+    "chat.headers": async (input, output) => {
+      if (!options?.assertSdkOrdinaryHooks) return;
+      assertLegacyContext(input, "chat.headers");
+      output.headers["x-sdk-headers"] = "projected";
+    },
+    "experimental.chat.system.transform": async (input, output) => {
+      if (!options?.assertSdkOrdinaryHooks) return;
+      assertModel(input.model, "legacy", "experimental.chat.system.transform.model");
+      output.system.push("sdk-system");
+    },
+    "experimental.provider.small_model": async (input, output) => {
+      if (!options?.assertSdkOrdinaryHooks) return;
+      assertProvider(input.provider, "v2", "config", undefined, "experimental.provider.small_model.provider");
+      assertModel(output.model, "v2", "experimental.provider.small_model.output.model");
+      output.model = v2Model("small-sdk-model");
+    },
+    "experimental.compaction.autocontinue": async (input, output) => {
+      if (!options?.assertSdkOrdinaryHooks) return;
+      assertLegacyContext(input, "experimental.compaction.autocontinue");
+      output.enabled = false;
     },
     "experimental.text.complete": async (_input, output) => {
       if (options?.hangOnce && !existsSync(options.hangOnce)) {
@@ -133,6 +277,29 @@ impl AuthCredentialResolver for MissingCredential {
     }
 }
 
+struct ApiCredential;
+
+#[async_trait::async_trait]
+impl AuthCredentialResolver for ApiCredential {
+    async fn resolve(&self) -> Result<Option<oc_auth::Credential>, oc_error::BoxSource> {
+        Ok(Some(oc_auth::Credential::Api {
+            key: oc_auth::Secret::new("sdk-secret"),
+            metadata: None,
+        }))
+    }
+}
+
+fn sdk_boundary_provider(source: AvailabilitySource) -> ResolvedProvider {
+    let mut model = kiro_model();
+    model.id = "sdk-input-model".to_owned();
+    model.provider_id = "resident-fixture".to_owned();
+    let mut provider = kiro_provider();
+    provider.id = "resident-fixture".to_owned();
+    provider.models.insert(model.id.clone(), model);
+    provider.availability.record(source);
+    provider
+}
+
 fn provider_with_variant_depth(include_cutoff_object: bool) -> ResolvedProvider {
     let nested = if include_cutoff_object {
         serde_json::json!({
@@ -142,17 +309,16 @@ fn provider_with_variant_depth(include_cutoff_object: bool) -> ResolvedProvider 
     } else {
         serde_json::json!({ "thinkingBudget": 4096 })
     };
-    let variant = serde_json::from_value(serde_json::json!({
+    let depth_probe = serde_json::json!({
         "thinkingConfig": {
             "thinkingBudget": 8192,
             "extra": { "nested": nested }
         }
-    }))
-    .expect("variant is a JSON object");
+    });
     let mut model = kiro_model();
     model.id = "antigravity-claude-opus-4-5-thinking".to_owned();
     model.provider_id = "resident-fixture".to_owned();
-    model.variants.insert("low".to_owned(), variant);
+    model.options.insert("depthProbe".to_owned(), depth_probe);
     let mut provider = kiro_provider();
     provider.id = "resident-fixture".to_owned();
     provider.models.insert(model.id.clone(), model);
@@ -268,7 +434,7 @@ async fn js_auth_loader_refuses_a_truncated_provider_and_preserves_the_original(
     );
     assert!(
         message.contains(
-            "/models/antigravity-claude-opus-4-5-thinking/variants/low/\
+            "/models/antigravity-claude-opus-4-5-thinking/options/depthProbe/\
              thinkingConfig/extra/nested/deeper"
         ),
         "the refusal must name the truncated provider path: {message}"
@@ -308,6 +474,198 @@ async fn js_auth_loader_still_bounds_an_arbitrary_plugin_return_graph() {
         value.get("$path").and_then(serde_json::Value::as_str),
         Some("/next/next/next/next/next/next/next/next")
     );
+}
+
+#[tokio::test]
+async fn js_sdk_boundary_auth_loader_reads_provider_and_supplies_model() {
+    // Given: a real JavaScript Auth.loader that reads the declared legacy Provider
+    // shape and inserts a legacy SDK Model constructed from scratch.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (load, loader) = fixture_auth_loader(
+        temp.path(),
+        Some(serde_json::json!({ "assertSdkAuthProvider": true })),
+    )
+    .await;
+    let mut provider = sdk_boundary_provider(AvailabilitySource::StoredApiKey);
+
+    // When
+    let options = loader
+        .load(&ApiCredential, &mut provider)
+        .await
+        .expect("SDK-shaped Auth.loader provider round-trips");
+    load.shutdown().await;
+
+    // Then
+    assert_eq!(
+        options
+            .get("sdkBoundary")
+            .and_then(serde_json::Value::as_str),
+        Some("api:sdk-secret")
+    );
+    let model = provider
+        .models
+        .get("auth-sdk-model")
+        .expect("legacy SDK model inserted by the JavaScript loader");
+    assert_eq!(model.provider_id, "resident-fixture");
+    assert_eq!(model.family, "");
+    assert_eq!(model.release_date, "");
+    assert!(model.variants.is_empty());
+}
+
+#[tokio::test]
+async fn js_sdk_boundary_provider_loader_reads_v2_provider_and_supplies_model() {
+    // Given: a real JavaScript ProviderHook.models callback that validates its
+    // ProviderV2 argument and returns a ModelV2 constructed from scratch.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let owner = Arc::new(FakeTerminalOwner::new());
+    let terminal: Arc<dyn TerminalLease> = Arc::new(TerminalBroker::new(owner));
+    let spec = file_spec(&fixture(temp.path()))
+        .options(serde_json::json!({ "assertSdkProviderHook": true }));
+    let load = load_js_plugins_ordered(
+        vec![spec],
+        host(temp.path(), terminal, JsHostPolicy::default()),
+    )
+    .await;
+    let plugin = load
+        .plugins()
+        .first()
+        .unwrap_or_else(|| panic!("fixture plugin loaded: {:?}", load.diagnostics()));
+    let loader = plugin
+        .provider()
+        .and_then(|provider| provider.models)
+        .expect("fixture provider model loader");
+    let provider = sdk_boundary_provider(AvailabilitySource::StoredApiKey);
+    let credential = oc_auth::Credential::Api {
+        key: oc_auth::Secret::new("sdk-secret"),
+        metadata: None,
+    };
+
+    // When
+    let models = loader
+        .models(
+            &provider,
+            ProviderHookContext {
+                auth: Some(&credential),
+            },
+        )
+        .await
+        .expect("SDK-shaped ProviderHook.models argument and return");
+    load.shutdown().await;
+
+    // Then
+    let model = models
+        .get("provider-sdk-model")
+        .expect("ModelV2 returned by the real JavaScript provider hook");
+    assert_eq!(model.provider_id, "resident-fixture");
+    assert_eq!(model.family, "sdk-v2");
+    assert_eq!(model.release_date, "2026-08-12");
+}
+
+#[tokio::test]
+async fn js_sdk_boundary_ordinary_hooks_read_declared_shapes_and_supply_small_model() {
+    // Given: one real JavaScript plugin implementing every ordinary hook whose
+    // contract carries a legacy Model/Provider or v2 Model/Provider.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let owner = Arc::new(FakeTerminalOwner::new());
+    let terminal: Arc<dyn TerminalLease> = Arc::new(TerminalBroker::new(owner));
+    let spec = file_spec(&fixture(temp.path()))
+        .options(serde_json::json!({ "assertSdkOrdinaryHooks": true }));
+    let load = load_js_plugins_ordered(
+        vec![spec],
+        host(temp.path(), terminal, JsHostPolicy::default()),
+    )
+    .await;
+    let plugin = load
+        .plugins()
+        .first()
+        .unwrap_or_else(|| panic!("fixture plugin loaded: {:?}", load.diagnostics()));
+    let model = {
+        let mut model = kiro_model();
+        model.provider_id = "resident-fixture".to_owned();
+        model
+    };
+    let provider = ProviderContext {
+        source: ProviderSource::Config,
+        info: sdk_boundary_provider(AvailabilitySource::ConfigBlock),
+        options: serde_json::Map::new(),
+    };
+    let context = ChatContext {
+        session_id: "ses_sdk_boundary",
+        agent: "build",
+        model: &model,
+        provider: &provider,
+        message: Message::new(Role::User, "project every model boundary"),
+    };
+
+    // When: exercise all three chat-context users plus the standalone legacy
+    // model hook and the bidirectional ProviderV2/ModelV2 hook.
+    let mut params = ChatParamsOutput::default();
+    plugin
+        .call(&mut HookInvocation::ChatParams {
+            input: &context,
+            output: &mut params,
+        })
+        .await
+        .expect("chat.params sees SDK shape");
+    let mut headers = ChatHeadersOutput::default();
+    plugin
+        .call(&mut HookInvocation::ChatHeaders {
+            input: &context,
+            output: &mut headers,
+        })
+        .await
+        .expect("chat.headers sees SDK shape");
+    let mut autocontinue = CompactionAutocontinueOutput { enabled: true };
+    plugin
+        .call(&mut HookInvocation::CompactionAutocontinue {
+            input: &CompactionAutocontinueInput {
+                context: &context,
+                overflow: true,
+            },
+            output: &mut autocontinue,
+        })
+        .await
+        .expect("compaction autocontinue sees SDK shape");
+    let mut system = ChatSystemTransformOutput::default();
+    plugin
+        .call(&mut HookInvocation::ChatSystemTransform {
+            input: &ChatSystemTransformInput {
+                session_id: Some("ses_sdk_boundary"),
+                model: &model,
+            },
+            output: &mut system,
+        })
+        .await
+        .expect("system transform sees legacy SDK model");
+    let mut small = ProviderSmallModelOutput {
+        model: Some(model.clone()),
+    };
+    plugin
+        .call(&mut HookInvocation::ProviderSmallModel {
+            input: &ProviderSmallModelInput {
+                provider: &provider.info,
+            },
+            output: &mut small,
+        })
+        .await
+        .expect("small-model hook projects both directions");
+    load.shutdown().await;
+
+    // Then: every callback made an observable mutation after its shape checks.
+    assert_eq!(
+        params.options.get("sdkParams"),
+        Some(&serde_json::Value::Bool(true))
+    );
+    assert_eq!(
+        headers.headers.get("x-sdk-headers").map(String::as_str),
+        Some("projected")
+    );
+    assert!(!autocontinue.enabled);
+    assert_eq!(system.system, ["sdk-system"]);
+    let small = small.model.expect("JavaScript supplied a ModelV2");
+    assert_eq!(small.id, "small-sdk-model");
+    assert_eq!(small.provider_id, "resident-fixture");
+    assert_eq!(small.family, "sdk-v2");
 }
 
 #[tokio::test]
@@ -869,20 +1227,14 @@ async fn js_real_kiro_plugin_injects_its_request_kind_header_for_a_compaction_tu
          compaction assertion above would pass for any input; injected: {:?}",
         ordinary.headers
     );
-    // Recorded seam, not a friendly double: the hook resolves the provider as
-    // `input?.model?.providerID ?? input?.provider?.info?.id` (`dist/plugin.js:390`),
-    // and only the second arm ever matches here — `chat_context_value` serializes
-    // `ResolvedModel` with Rust field names, so the plugin sees `provider_id`, not
-    // the `providerID` upstream's type declares. `chat.message` in the same codec
-    // already spells it `providerID` (`jsonrpc.rs:972`), so the two encodings
-    // disagree with each other. Kiro survives on its fallback; a plugin reading
-    // only `model.providerID` would silently never fire. Pinned here so closing
-    // that seam trips this assertion and is a deliberate edit rather than drift.
-    assert!(
-        model_only.headers.is_empty(),
-        "the kiro hook matched on `model.providerID` alone, which means the chat-context encoding \
-         now spells the model's provider id the way upstream's type declares. That is a fix, not \
-         a failure: update this assertion and remove the seam note above it. Injected: {:?}",
+    // The provider.info id is deliberately foreign, so this can only pass through
+    // Kiro's first arm: `input?.model?.providerID`. This is a real installed plugin,
+    // not a hand-built JSON assertion over the projection helper.
+    assert_eq!(
+        model_only.headers.get(KIRO_REQUEST_KIND_HEADER),
+        Some(&"compaction".to_owned()),
+        "the real kiro hook must match the SDK spelling `model.providerID` without falling back \
+         to provider.info.id; injected: {:?}",
         model_only.headers
     );
 }

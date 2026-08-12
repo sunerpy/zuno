@@ -3,6 +3,7 @@ mod config;
 pub mod host;
 mod loader;
 mod plugin;
+pub(crate) mod projection;
 pub mod runtime;
 pub mod spec;
 
