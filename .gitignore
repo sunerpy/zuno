@@ -28,3 +28,7 @@
 
 *.pdb
 .DS_Store
+
+# CodeGraph's local index: a derived artifact of this checkout, like /target.
+# Rebuilt by `codegraph init`; never a source of truth.
+/.codegraph
