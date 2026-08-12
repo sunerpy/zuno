@@ -40,6 +40,10 @@ pub struct PluginModule<Factory> {
 pub trait Plugin: Send + Sync {
     fn manifest(&self) -> &PluginManifest;
 
+    fn is_disabled(&self) -> bool {
+        false
+    }
+
     fn tools(&self) -> PluginTools {
         PluginTools::new()
     }
@@ -245,15 +249,15 @@ impl HookBus {
             | HookInvocation::ToolDefinition { .. } => {
                 let name = hook.name();
                 for plugin in &self.plugins {
-                    if plugin.manifest().supports(name) {
-                        plugin
-                            .call(&mut hook)
-                            .await
-                            .map_err(|source| PluginError::Hook {
-                                plugin: plugin.manifest().id().to_owned(),
-                                hook: name.to_string(),
-                                source,
-                            })?;
+                    if plugin.manifest().supports(name)
+                        && let Err(source) = plugin.call(&mut hook).await
+                        && !plugin.is_disabled()
+                    {
+                        return Err(PluginError::Hook {
+                            plugin: plugin.manifest().id().to_owned(),
+                            hook: name.to_string(),
+                            source,
+                        });
                     }
                 }
                 Ok(())

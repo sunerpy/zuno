@@ -433,7 +433,7 @@ async fn js_ordinary_hook_preserves_output_when_a_different_argument_is_truncate
 }
 
 #[tokio::test]
-async fn js_timed_out_hook_restarts_before_the_next_invocation() {
+async fn js_timed_out_hook_is_permanently_disabled_before_the_next_invocation() {
     // Given
     let temp = tempfile::tempdir().expect("tempdir");
     let owner = Arc::new(FakeTerminalOwner::new());
@@ -465,7 +465,7 @@ async fn js_timed_out_hook_restarts_before_the_next_invocation() {
             output: &mut first,
         })
         .await
-        .expect("timeout is contained by the host");
+        .expect_err("the direct call reports the failure after disabling the plugin");
     let mut second = TextCompleteOutput {
         text: "second".to_owned(),
     };
@@ -479,17 +479,19 @@ async fn js_timed_out_hook_restarts_before_the_next_invocation() {
             output: &mut second,
         })
         .await
-        .expect("next invocation restarts the runtime");
+        .expect("a disabled plugin makes later invocations a no-op");
 
     // Then
     assert_eq!(first.text, "first");
-    assert_eq!(second.text, "second-resident");
-    assert_eq!(plugin.restart_count(), 1);
+    assert_eq!(second.text, "second");
+    assert!(plugin.is_disabled());
+    assert_eq!(plugin.restart_count(), 0);
     assert!(
         plugin
             .diagnostics()
             .iter()
-            .any(|diagnostic| diagnostic.kind == JsDiagnosticKind::TimedOut)
+            .any(|diagnostic| diagnostic.kind == JsDiagnosticKind::TimedOut
+                && diagnostic.hook.as_deref() == Some("experimental.text.complete"))
     );
     load.shutdown().await;
 }

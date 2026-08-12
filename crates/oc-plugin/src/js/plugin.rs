@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use oc_error::{BoxSource, ToolError};
@@ -9,7 +10,8 @@ use oc_tool::{Tool, ToolContext, ToolOutput};
 use serde_json::{Map, Value, json};
 
 use crate::{
-    AuthHook, HookInvocation, HookName, Plugin, PluginManifest, PluginTools, ProviderHook,
+    AuthHook, HookInvocation, HookName, Plugin, PluginDiagnosticKind, PluginManifest, PluginTools,
+    ProviderHook,
 };
 
 use super::host::JsHost;
@@ -22,6 +24,7 @@ pub struct JsPlugin {
     tools: PluginTools,
     host: JsHost,
     callbacks: HashMap<String, usize>,
+    disabled: AtomicBool,
 }
 
 impl JsPlugin {
@@ -58,6 +61,7 @@ impl JsPlugin {
             tools,
             host,
             callbacks,
+            disabled: AtomicBool::new(false),
         }))
     }
 
@@ -68,6 +72,7 @@ impl JsPlugin {
             .into_iter()
             .map(|diagnostic| JsDiagnostic {
                 plugin: diagnostic.plugin,
+                hook: diagnostic.hook,
                 kind: map_diagnostic_kind(diagnostic.kind),
                 message: diagnostic.message,
             })
@@ -87,6 +92,20 @@ impl JsPlugin {
     pub async fn shutdown(&self) {
         self.host.shutdown().await;
     }
+
+    async fn disable(
+        &self,
+        hook: HookName,
+        kind: PluginDiagnosticKind,
+        error: impl std::fmt::Display,
+    ) {
+        if self.disabled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.host
+            .disable(self.manifest.id(), kind, hook.as_str(), error.to_string())
+            .await;
+    }
 }
 
 #[async_trait]
@@ -95,40 +114,88 @@ impl Plugin for JsPlugin {
         &self.manifest
     }
 
+    fn is_disabled(&self) -> bool {
+        self.disabled.load(Ordering::Acquire)
+    }
+
     fn auth(&self) -> Option<AuthHook> {
-        self.auth.clone()
+        (!self.disabled.load(Ordering::Acquire))
+            .then(|| self.auth.clone())
+            .flatten()
     }
 
     fn provider(&self) -> Option<ProviderHook> {
-        self.provider.clone()
+        (!self.disabled.load(Ordering::Acquire))
+            .then(|| self.provider.clone())
+            .flatten()
     }
 
     fn tools(&self) -> PluginTools {
-        self.tools.clone()
+        if self.disabled.load(Ordering::Acquire) {
+            PluginTools::new()
+        } else {
+            self.tools.clone()
+        }
     }
 
     async fn call(&self, hook: &mut HookInvocation<'_>) -> Result<(), BoxSource> {
+        if self.disabled.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let name = hook.name();
         let count = self.callbacks.get(name.as_str()).copied().unwrap_or(0);
         for index in 0..count {
-            let call = crate::jsonrpc::encode_hook(hook).map_err(boxed)?;
+            let call = match crate::jsonrpc::encode_hook(hook) {
+                Ok(call) => call,
+                Err(error) => {
+                    let message = error.to_string();
+                    self.disable(name, PluginDiagnosticKind::Protocol, error)
+                        .await;
+                    return Err(boxed(JsPluginHookFailure(message)));
+                }
+            };
             let (args, output_index) = if matches!(hook, HookInvocation::Config { .. }) {
                 (vec![call.output], 0)
             } else {
                 (vec![call.input, call.output], 1)
             };
-            let result = self.host.call_hook(name.as_str(), index, args).await;
-            let Ok(result) = result else {
-                continue;
+            let result = match self.host.call_hook(name.as_str(), index, args).await {
+                Ok(result) => result,
+                Err(error) => {
+                    let kind = error.kind();
+                    let message = error.to_string();
+                    self.disable(name, kind, error).await;
+                    return Err(boxed(JsPluginHookFailure(message)));
+                }
             };
             let output =
-                invocation_output(&result, output_index, self.host.plugin(), name.as_str())
-                    .map_err(boxed)?;
-            crate::jsonrpc::apply_hook_output(hook, output).map_err(boxed)?;
+                match invocation_output(&result, output_index, self.host.plugin(), name.as_str()) {
+                    Ok(output) => output,
+                    Err(error) => {
+                        let message = error.to_string();
+                        self.disable(name, PluginDiagnosticKind::Protocol, error)
+                            .await;
+                        return Err(boxed(JsPluginHookFailure(message)));
+                    }
+                };
+            if let Err(error) = crate::jsonrpc::apply_hook_output(hook, output) {
+                let message = error.to_string();
+                self.disable(name, PluginDiagnosticKind::Protocol, error)
+                    .await;
+                return Err(boxed(JsPluginHookFailure(message)));
+            }
         }
         Ok(())
     }
 }
+
+fn boxed(error: impl std::error::Error + Send + Sync + 'static) -> BoxSource {
+    Box::new(error)
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct JsPluginHookFailure(String);
 
 fn plugin_tools(
     host: &JsHost,
@@ -270,10 +337,6 @@ fn invocation_output(
         .get(index)
         .cloned()
         .ok_or(JsPluginBuildError::MissingHookOutput)
-}
-
-fn boxed(error: impl std::error::Error + Send + Sync + 'static) -> BoxSource {
-    Box::new(error)
 }
 
 #[derive(Debug, thiserror::Error)]
