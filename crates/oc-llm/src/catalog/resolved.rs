@@ -54,6 +54,7 @@ pub struct ResolvedModel {
     /// Human-readable name.
     pub name: String,
     /// Model family.
+    #[serde(default)]
     pub family: String,
     /// Release date, `YYYY-MM-DD`, or empty.
     pub release_date: String,
@@ -72,6 +73,7 @@ pub struct ResolvedModel {
     /// Per-model request headers.
     pub headers: BTreeMap<String, String>,
     /// Named alternate configurations, `disabled` ones already removed.
+    #[serde(default)]
     pub variants: BTreeMap<String, JsonMap>,
 }
 

@@ -1,0 +1,161 @@
+Task 167 — decode the plugin SDK model shape through the JavaScript provider path
+Closes F4 wave 11's sixth-layer provider finding.
+
+SOURCE AUDIT AND FULL FIELD MAPPING (RECORDED BEFORE IMPLEMENTATION)
+--------------------------------------------------------------------------------
+CodeGraph was attempted first with projectPath
+`/config/workspace/ProdDir/AI/oc-wt/t167` and query
+`HandleModelLoader ResolvedModel ModelApi provider_value models bridge`; it reported
+that this sibling worktree is not indexed, so the required source reads were used.
+
+The worktree has no `.omo/refs/` directory. The main checkout's `.omo/refs/` was
+read and searched, but its five reference repositories do not vendor the opencode
+plugin SDK Model declaration. The exact released contract was therefore read from
+the locally installed, version-pinned package used by this compatibility baseline:
+
+  /config/.bun/install/cache/@opencode-ai/plugin@1.18.15@@@1/dist/index.d.ts:1-2,167-170
+  /config/.bun/install/cache/@opencode-ai/sdk@1.18.15@@@1/dist/v2/gen/types.gen.d.ts:1650-1728
+
+The plugin contract imports `ModelV2` from `@opencode-ai/sdk/v2` and declares
+`ProviderHook.models` as `Promise<Record<string, ModelV2>>`. Comparing every field
+of that Model with `ResolvedModel`/nested Rust types gives:
+
+SDK ModelV2 path             Rust path                         mapping / difference
+id                           id                                same, required
+providerID                   provider_id                       NAMING DIFFERENCE
+api.id                       api.id                            same, required
+api.url                      api.url                           same, required
+api.npm                      api.npm                           same, required
+api.endpoint                 api.endpoint                      Rust extension; optional
+name                         name                              same, required
+family?                      family                            OPTIONALITY DIFFERENCE; default ""
+capabilities.temperature     capabilities.temperature         same
+capabilities.reasoning       capabilities.reasoning           same
+capabilities.attachment      capabilities.attachment          same
+capabilities.toolcall        capabilities.toolcall            same
+capabilities.input.*         capabilities.input.*              same five booleans
+capabilities.output.*        capabilities.output.*             same five booleans
+capabilities.interleaved     capabilities.interleaved          same bool-or-{field} union
+cost.input                   cost.input                        same
+cost.output                  cost.output                       same
+cost.cache.read/write        cost.cache.read/write             same
+cost.tiers?                  no retained Rust field            accepted/ignored SDK extra
+cost.experimentalOver200K?   no retained Rust field            accepted/ignored SDK extra
+limit.context/input?/output  limit.context/input/output        same; input already Option
+status                       status                            same lowercase enum
+options                      options                           same JSON object
+headers                      headers                           same string map
+release_date                 release_date                      same snake_case spelling
+variants?                    variants                          OPTIONALITY DIFFERENCE; default {}
+
+Thus `providerID` is the only spelling difference, but `family` and `variants`
+are also legal omissions in the SDK and must not become the seventh decode layer.
+`crates/oc-plugin/src/jsonrpc.rs:972` independently proves that this product already
+uses `providerID` on a plugin-facing codec.
+
+DECISION
+--------------------------------------------------------------------------------
+Convert at the JavaScript plugin boundary rather than adding a global serde alias.
+`ResolvedModel` remains one canonical snake_case internal/serialized shape, while
+`HandleModelLoader` normalizes the SDK's `providerID` before deserialization. The
+two SDK-optional fields receive serde defaults on the resolved type because their
+empty internal values are already the catalog's canonical meaning. This avoids
+letting SDK spellings drift into pinned-catalog/internal consumers while preserving
+the existing internal `provider_id` path.
+
+PRE-FIX PRODUCTION REPRODUCTION
+--------------------------------------------------------------------------------
+Added a real `.mjs` provider fixture that constructs `ModelV2` from scratch, uses
+`providerID`, deliberately omits optional `family` and `variants`, includes
+`api.endpoint`, and returns a genuinely malformed sibling model. It is loaded by
+the real `opencode-rust run` binary; production resource-hook application replaces
+the resolved catalog before `model_spec` and HTTP dispatch.
+
+Command:
+  cargo test -p oc-cli --test tool_turn --offline \
+    production_js_sdk_model_advertised -- --nocapture
+
+Observed before the fix: both named tests FAILED and the provider survived without
+a decode error, but each requested model was absent:
+
+  production_js_sdk_model_advertised_responses_beats_a_heuristic_hostile_id
+    stderr: Model not found: github-copilot/mai-code-alias
+  production_js_sdk_model_advertised_chat_beats_a_responses_heuristic_id
+    stderr: Model not found: github-copilot/gpt-5-alias
+
+Result: 0 passed, 2 failed. This reproduces the silent per-model drop through the
+production JavaScript provider hook rather than a hand-built Rust model value.
+
+IMPLEMENTATION AND RESTORED CONTROL
+--------------------------------------------------------------------------------
+The bridge now clones each JavaScript model at the boundary and renames
+`providerID` to canonical `provider_id` only when the canonical key is absent.
+`ResolvedModel.family` and `.variants` have serde defaults, matching the two
+optional SDK fields without changing serialized internal field names. All other
+fields continue through the existing strict `ResolvedModel` decoder. The original
+per-model error branch is unchanged.
+
+Command after the implementation:
+  cargo test -p oc-cli --test tool_turn --offline \
+    production_js_sdk_model_advertised -- --nocapture
+
+Result: PASS, 2 passed / 0 failed:
+  production_js_sdk_model_advertised_responses_beats_a_heuristic_hostile_id
+  production_js_sdk_model_advertised_chat_beats_a_responses_heuristic_id
+
+The tests launch the real binary, import and invoke the real `.mjs` provider hook,
+replace the catalog model map, resolve `model_spec`, and inspect the recorded HTTP
+path/body. The Responses case uses wire id `mai-code-1-flash-picker`, which the
+heuristic would send to Chat; it reaches `/v1/responses` with an `input` body. The
+Chat case uses wire id `gpt-5`, which the heuristic would send to Responses; it
+reaches `/v1/chat/completions` with a `messages` body. Assertions use the ordinary
+turn request because the title internal deliberately fixes its surface to Chat.
+
+The fixture returns a second entry `malformed: {providerID: "github-copilot"}`.
+Both runs complete with exactly the valid selected model, proving the unchanged
+skip-on-failure branch still protects the provider from a genuinely malformed
+sibling instead of rejecting the provider or accepting the malformed model.
+
+MUTATION PROOF
+--------------------------------------------------------------------------------
+Observable mutant: bypassed `plugin_model_value(model)` at `HandleModelLoader`
+and restored the old direct `model.clone()` decode. The normalization helper was
+still present, so this mutation changed only whether production consumed it.
+
+Command:
+  cargo test -p oc-cli --test tool_turn --offline \
+    production_js_sdk_model_advertised -- --nocapture
+
+Result: both guards FAILED by name with the original observable symptom:
+  production_js_sdk_model_advertised_responses_beats_a_heuristic_hostile_id
+    Model not found: github-copilot/mai-code-alias
+  production_js_sdk_model_advertised_chat_beats_a_responses_heuristic_id
+    Model not found: github-copilot/gpt-5-alias
+
+The mutant also emitted a dead-code warning for `plugin_model_value`, confirming
+the compatibility path was genuinely disconnected rather than equivalently
+rewritten. After restoring the call, the same command passed 2 / 0 again.
+
+FINAL VALIDATION
+--------------------------------------------------------------------------------
+The first unrestricted workspace run encountered the known host process-limit
+failure (`EAGAIN: Resource temporarily unavailable`) during test enumeration.
+The resource-bounded retry completed successfully:
+
+  CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 \
+    cargo test --workspace --offline --quiet
+
+Result: every workspace unit, integration, and doctest binary passed; two tests
+were explicitly ignored and there were zero failures.
+
+After resolving the sole `collapsible_if` clippy warning without changing the
+normalization semantics, the final static/build gate completed with no output and
+exit status 0:
+
+  cargo clippy --workspace --all-targets --offline --quiet && \
+    cargo fmt --all --check && \
+    cargo build --workspace --offline --quiet
+
+LSP diagnostics were then run against all three changed Rust files in a temporary
+detached mirror because the LSP tool rejects sibling-worktree paths. Result:
+`No diagnostics found` for `bridge.rs`, `resolved.rs`, and `tool_turn.rs`.

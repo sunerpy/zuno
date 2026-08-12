@@ -92,6 +92,50 @@ export default {
 };
 "#;
 
+/// A provider hook written against `@opencode-ai/plugin` 1.18.15's
+/// `Record<string, ModelV2>` contract. It constructs the SDK value from scratch:
+/// in particular, it emits `providerID` and omits the SDK-optional `family` and
+/// `variants` fields rather than spreading the Rust host's provider input back.
+const SDK_MODEL_PROVIDER_PLUGIN: &str = r#"
+export default {
+  id: "production-sdk-model-provider",
+  server: async (_input, options) => ({
+    provider: {
+      id: "github-copilot",
+      models: async () => ({
+        [options.catalogID]: {
+          id: options.catalogID,
+          providerID: "github-copilot",
+          api: {
+            id: options.apiID,
+            url: `${options.baseURL}/v1`,
+            npm: "@ai-sdk/github-copilot",
+            endpoint: options.endpoint,
+          },
+          name: "SDK model provider fixture",
+          capabilities: {
+            temperature: true,
+            reasoning: false,
+            attachment: false,
+            toolcall: true,
+            input: { text: true, audio: false, image: false, video: false, pdf: false },
+            output: { text: true, audio: false, image: false, video: false, pdf: false },
+            interleaved: false,
+          },
+          cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+          limit: { context: 100000, output: 8192 },
+          status: "active",
+          options: {},
+          headers: {},
+          release_date: "2026-08-12",
+        },
+        malformed: { providerID: "github-copilot" },
+      }),
+    },
+  }),
+};
+"#;
+
 const LIFECYCLE_PLUGIN: &str = r#"
 import { appendFileSync } from "node:fs";
 
@@ -307,6 +351,55 @@ fn lifecycle_provider_config(
     config.to_string()
 }
 
+fn sdk_model_provider_config(
+    base_url: &str,
+    plugin: &Path,
+    catalog_id: &str,
+    api_id: &str,
+    endpoint: &str,
+) -> String {
+    serde_json::json!({
+        "formatter": false,
+        "lsp": false,
+        "provider": {
+            "github-copilot": {
+                "name": "GitHub Copilot",
+                "id": "github-copilot",
+                "env": [],
+                "npm": "@ai-sdk/github-copilot",
+                "models": {
+                    catalog_id: {
+                        "id": "base-model-before-plugin-replacement",
+                        "name": "Base model before plugin replacement",
+                        "attachment": false,
+                        "reasoning": false,
+                        "temperature": false,
+                        "tool_call": true,
+                        "release_date": "2025-01-01",
+                        "limit": { "context": 100_000, "output": 10_000 },
+                        "cost": { "input": 0, "output": 0 },
+                        "options": {}
+                    }
+                },
+                "options": {
+                    "apiKey": "test-key",
+                    "baseURL": format!("{base_url}/v1")
+                }
+            }
+        },
+        "plugin": [[
+            format!("file:{}", plugin.display()),
+            {
+                "baseURL": base_url,
+                "catalogID": catalog_id,
+                "apiID": api_id,
+                "endpoint": endpoint,
+            }
+        ]]
+    })
+    .to_string()
+}
+
 fn variables(env: &ScriptedEnv, base_url: &str) -> BTreeMap<String, String> {
     let mut variables = env.env_vars();
     variables.extend([
@@ -376,6 +469,44 @@ async fn run_plugin_prompt(
         .await
         .expect("the plugin-backed run must finish inside its budget")
         .expect("launch plugin-backed opencode-rust run")
+}
+
+async fn run_sdk_model_provider_prompt(
+    env: &ScriptedEnv,
+    base_url: &str,
+    plugin: &Path,
+    catalog_id: &str,
+    api_id: &str,
+    endpoint: &str,
+) -> Output {
+    let mut plugin_variables = variables(env, base_url);
+    plugin_variables.remove("OPENCODE_PURE");
+    plugin_variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
+    plugin_variables.insert(
+        "MISE_DATA_DIR".to_owned(),
+        "/config/.local/share/mise".to_owned(),
+    );
+    plugin_variables.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+    plugin_variables.insert(
+        "OPENCODE_CONFIG_CONTENT".to_owned(),
+        sdk_model_provider_config(base_url, plugin, catalog_id, api_id, endpoint),
+    );
+
+    let mut command = tokio::process::Command::new(binary());
+    command
+        .args([
+            "run",
+            "--model",
+            &format!("github-copilot/{catalog_id}"),
+            "Exercise the SDK model provider hook.",
+        ])
+        .current_dir(env.working_dir())
+        .env_clear()
+        .envs(plugin_variables);
+    tokio::time::timeout(Duration::from_secs(90), command.output())
+        .await
+        .expect("the SDK-model plugin run must finish inside its budget")
+        .expect("launch SDK-model plugin run")
 }
 
 async fn run_auto_discovery_prompt(env: &ScriptedEnv, base_url: &str, load_log: &Path) -> Output {
@@ -609,6 +740,82 @@ fn has_tool_result(body: &serde_json::Value) -> bool {
                 message.get("role").and_then(serde_json::Value::as_str) == Some("tool")
             })
         })
+}
+
+async fn assert_sdk_model_provider_endpoint(
+    catalog_id: &str,
+    api_id: &str,
+    advertised_endpoint: &str,
+    expected_path: &str,
+    expected_body_key: &str,
+    cassette: &str,
+) {
+    let env = ScriptedEnv::new().expect("isolated environment");
+    let plugin = env.project().join("sdk-model-provider.mjs");
+    std::fs::write(&plugin, SDK_MODEL_PROVIDER_PLUGIN).expect("write SDK model provider plugin");
+    let scenario = Scenario::new(format!("sdk-model-{advertised_endpoint}"))
+        .on_path(expected_path)
+        .from_oracle_cassette(cassette)
+        .expect("the recorded title response loads")
+        .from_oracle_cassette(cassette)
+        .expect("the recorded turn response loads");
+    let provider = MockProvider::start(vec![scenario])
+        .await
+        .expect("mock provider binds loopback");
+
+    let output = run_sdk_model_provider_prompt(
+        &env,
+        provider.base_url(),
+        &plugin,
+        catalog_id,
+        api_id,
+        advertised_endpoint,
+    )
+    .await;
+    let captured = provider.captured().await;
+    provider.shutdown().await;
+
+    assert!(
+        output.status.success(),
+        "SDK-model plugin run failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(captured.len(), 2, "title plus one ordinary turn");
+    let request = captured.last().expect("ordinary turn request");
+    assert_eq!(request.path, expected_path);
+    let body = request.json().expect("provider request is JSON");
+    assert_eq!(request_model(&body), Some(api_id));
+    assert!(
+        body.get(expected_body_key).is_some(),
+        "the advertised `{advertised_endpoint}` surface did not shape the request: {body:#}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_js_sdk_model_advertised_responses_beats_a_heuristic_hostile_id() {
+    assert_sdk_model_provider_endpoint(
+        "mai-code-alias",
+        "mai-code-1-flash-picker",
+        "responses",
+        "/v1/responses",
+        "input",
+        "openai-responses/gpt-5-5-streams-text",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_js_sdk_model_advertised_chat_beats_a_responses_heuristic_id() {
+    assert_sdk_model_provider_endpoint(
+        "gpt-5-alias",
+        "gpt-5",
+        "chat",
+        "/v1/chat/completions",
+        "messages",
+        "openai-compatible-chat/deepseek-streams-text",
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

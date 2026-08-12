@@ -471,7 +471,7 @@ impl ProviderModelLoader for HandleModelLoader {
         let mut models = BTreeMap::new();
         if let Some(map) = value.as_object() {
             for (id, model) in map {
-                match serde_json::from_value::<ResolvedModel>(model.clone()) {
+                match serde_json::from_value::<ResolvedModel>(plugin_model_value(model)) {
                     Ok(model) => {
                         models.insert(id.clone(), model);
                     }
@@ -549,6 +549,19 @@ fn inputs_value(inputs: Option<&AuthInputs>) -> Value {
 
 fn provider_value(provider: &ResolvedProvider) -> Value {
     serde_json::to_value(provider).unwrap_or(Value::Null)
+}
+
+fn plugin_model_value(model: &Value) -> Value {
+    let mut model = model.clone();
+    let Some(fields) = model.as_object_mut() else {
+        return model;
+    };
+    if !fields.contains_key("provider_id")
+        && let Some(provider_id) = fields.remove("providerID")
+    {
+        fields.insert("provider_id".to_owned(), provider_id);
+    }
+    model
 }
 
 pub(super) fn truncated_path(value: &Value) -> Option<String> {
