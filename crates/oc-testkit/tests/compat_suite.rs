@@ -2846,5 +2846,10 @@ fn behavioural_differences() -> Vec<BehaviouralDifference> {
 /// nothing commits, while `docs/divergences.md` told readers twice that a gap is
 /// "listed in the compatibility matrix".
 fn known_gaps() -> Vec<KnownGap> {
-    compat_report::known_gaps(FROZEN_API_GAPS.len(), UPSTREAM_API_OPERATIONS)
+    let v1 = oc_server::compat_v1::v1_coverage();
+    compat_report::known_gaps(
+        FROZEN_API_GAPS.len(),
+        UPSTREAM_API_OPERATIONS,
+        compat_report::V1SurfaceCoverage::new(v1.measured, v1.served, v1.redirected),
+    )
 }

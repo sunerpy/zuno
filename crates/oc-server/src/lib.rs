@@ -31,8 +31,8 @@ mod server;
 
 pub use auth::AuthConfig;
 pub use compat_v1::{
-    CompatV1State, Toast, ToastForwarder, UnknownRoutes, V1_PREFIXES, V1_SURFACE, V1Route,
-    compat_v1_router,
+    CompatV1State, Toast, ToastForwarder, UnknownRoutes, V1_PREFIXES, V1_SURFACE, V1Backing,
+    V1Coverage, V1Route, compat_v1_router, v1_coverage,
 };
 pub use directory::RequestDirectory;
 pub use discovery::local_server_urls;

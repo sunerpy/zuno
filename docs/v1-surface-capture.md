@@ -148,8 +148,10 @@ the *verb* is not, so it is accounted as an operation gap rather than a path gap
 
 Only one of the 20 routes has a local backend in this build.
 
-`POST /tui/show-toast` is fully served. There is no TUI yet (todo 73), so the
-route is a **recording seam**: each accepted toast is appended to a bounded
+`POST /tui/show-toast` is fully served. No server entry point attaches a display
+— `crates/oc-server/src/main.rs` and `crates/oc-cli/src/cmd/serve.rs` both build a
+bare `CompatV1State::new()` — so in every shipped server the route is a
+**recording seam**: each accepted toast is appended to a bounded
 in-process ring, counted, and reported by the diagnostics endpoint, and the call
 returns `200 true`. A toast that no one sees is a degraded UX; a `500` would be a
 broken plugin, so the seam never fails on a well-formed toast. When a TUI
@@ -166,9 +168,21 @@ non-string `message` is still a `400`, because there is then nothing to show.
 The other 19 routes are **registered, structured `501 not_implemented` seams**.
 This follows the precedent set by the `/api` surface: an operation with no local
 backend is registered explicitly and answers definitively rather than fabricating
-success data. Each `501` body names the SDK method and the plugins that call it,
-so the operator learns which plugin needs which backend. Those backends land in
-todos 57-62.
+success data. Each `501` body names the SDK method, the plugins that call it, and
+the `/api` route to call instead when one is served here, so the operator learns
+which plugin needs which backend and the caller learns what works today.
+
+No plan todo owns backing them. This is a **gap, not a decision**: it is recorded
+as `v1-surface-unbacked` in `oc_testkit::compat_report::known_gaps`, rendered into
+`docs/compatibility-matrix.md`, and never declared in `docs/divergences.toml`,
+whose own rule is that a merely unimplemented surface must not be laundered into a
+divergence. Ten of the nineteen have a served `/api` equivalent and their `501`
+names it; the other nine — `auth.set`, `app.log`, `config.get`, the two
+`provider.oauth` calls, `session.status`, `session.update`, `session.children` and
+`session.todo` — have no served `/api` spelling in this build, so a plugin needing
+them has no working call today. `crates/oc-server/tests/compat_v1.rs` asserts both
+halves against the routes the server really answers, so this paragraph cannot go
+stale without a red test.
 
 The practical consequence, stated plainly: against this surface alone the
 installed auth plugins complete their **call lifecycle** — every request they

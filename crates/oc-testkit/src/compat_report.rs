@@ -393,6 +393,104 @@ pub fn turn_part_gap() -> KnownGap {
 pub const TURN_PART_WITNESS: &str =
     "the_recorded_turn_part_gap_matches_what_a_turn_actually_persists";
 
+/// The gap recording that the measured pre-`/api` surface is almost entirely stubs.
+pub const V1_SURFACE_GAP_ID: &str = "v1-surface-unbacked";
+
+/// The test name [`v1_surface_gap`]'s detail points a reader at.
+pub const V1_SURFACE_WITNESS: &str = "compat_v1_declared_backing_matches_what_the_router_answers";
+
+/// How much of the pre-`/api` surface is really backed.
+///
+/// Counted by `oc_server::v1_coverage` from the live route table and passed in,
+/// for the same reason [`known_gaps`] takes its API counts as parameters: this
+/// crate has `oc-server` as a *dev*-dependency only, so restating the numbers here
+/// would put a second copy of them one edit away from disagreeing with the router.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct V1SurfaceCoverage {
+    /// Routes the plugin capture measured, and the surface therefore registers.
+    pub measured: usize,
+    /// Routes answered by real local work.
+    pub served: usize,
+    /// Routes registered as structured `501` seams.
+    pub unbacked: usize,
+    /// Unbacked routes whose `501` names a served `/api` alternative.
+    pub redirected: usize,
+}
+
+impl V1SurfaceCoverage {
+    /// Builds the summary, deriving `unbacked` so it cannot contradict the rest.
+    #[must_use]
+    pub const fn new(measured: usize, served: usize, redirected: usize) -> Self {
+        Self {
+            measured,
+            served,
+            unbacked: measured - served,
+            redirected,
+        }
+    }
+}
+
+/// The gap [`V1_SURFACE_GAP_ID`] names, on its own.
+///
+/// # Why this is recorded as a gap
+///
+/// The surface is presented as "plugin compatibility routes" measured from real
+/// plugin callsites, and those plugins get `501` from all but one of them. Nothing
+/// chose that: `docs/v1-surface-capture.md` describes the seams as awaiting
+/// backends, and no plan todo owns writing them. So it is a gap, and
+/// `docs/divergences.toml:11-14` is explicit that a merely unimplemented surface
+/// "is a gap, not a divergence … and must never be laundered into an entry here".
+///
+/// Until the tenth review wave the only status this surface published was a `501`
+/// hint reading "its backend lands in todos 57-62", which had been true and then
+/// silently stopped being true when those todos closed — a plugin author was sent
+/// to finished work. The hint is now built from each route's recorded `/api`
+/// alternative and this entry carries the coverage, so both are derived rather than
+/// asserted in prose.
+#[must_use]
+pub fn v1_surface_gap(coverage: V1SurfaceCoverage) -> KnownGap {
+    KnownGap {
+        id: V1_SURFACE_GAP_ID.to_owned(),
+        surface: format!(
+            "{} of the {} measured pre-/api (v1) routes the installed plugins actually call",
+            coverage.unbacked, coverage.measured,
+        ),
+        detail: format!(
+            "The pre-/api surface exists because the published SDK sends unprefixed paths, so \
+             every resident plugin talks to it. It registers {measured} routes, each with a \
+             recorded plugin callsite, but only {served} does real local work: POST \
+             /tui/show-toast, and even that is a recording sink rather than a display — no server \
+             entry point attaches a forwarder (crates/oc-server/src/main.rs, \
+             crates/oc-cli/src/cmd/serve.rs both build a bare CompatV1State::new). The other \
+             {unbacked} answer a structured 501 not_implemented. {redirected} of those name a \
+             served /api route that provides the same capability, taken from the oracle document \
+             which declares both surfaces, and their 501 bodies tell the caller to use it: \
+             app.agents to GET /api/agent, provider.list to GET /api/provider, session.list and \
+             session.create to GET and POST /api/session, session.get to GET \
+             /api/session/{{sessionID}}, session.abort to POST \
+             /api/session/{{sessionID}}/interrupt, session.summarize to POST \
+             /api/session/{{sessionID}}/compact, session.messages to GET \
+             /api/session/{{sessionID}}/message, and session.prompt and session.promptAsync to \
+             POST /api/session/{{sessionID}}/prompt. The remaining {stranded} have no served /api \
+             spelling at all — auth.set, app.log, config.get, the two provider.oauth calls, \
+             session.status, session.update, session.children and session.todo — so a plugin that \
+             needs one has no working call today; concretely, the installed auth plugins reach a \
+             registered route for every request they issue and can deliver toasts, but cannot \
+             authenticate through this surface. This is a GAP and not a declared divergence \
+             because nothing chose it and no plan todo owns it, and docs/divergences.toml:11-14 \
+             forbids recording an unimplemented surface as a decision. Witnessed by \
+             crates/oc-server/tests/compat_v1.rs::{witness}, which drives every route and fails \
+             if a declared status disagrees with what the router answers.",
+            measured = coverage.measured,
+            served = coverage.served,
+            unbacked = coverage.unbacked,
+            redirected = coverage.redirected,
+            stranded = coverage.unbacked - coverage.redirected,
+            witness = V1_SURFACE_WITNESS,
+        ),
+    }
+}
+
 /// Every surface where this port is behind upstream with no decision behind it.
 ///
 /// # Why this list moved out of the compatibility suite
@@ -419,7 +517,11 @@ pub const TURN_PART_WITNESS: &str =
 /// probed off the running server and the committed oracle capture. A gap closing
 /// therefore changes this text without anyone editing it.
 #[must_use]
-pub fn known_gaps(api_gap_count: usize, upstream_api_operations: usize) -> Vec<KnownGap> {
+pub fn known_gaps(
+    api_gap_count: usize,
+    upstream_api_operations: usize,
+    v1: V1SurfaceCoverage,
+) -> Vec<KnownGap> {
     vec![
         KnownGap {
             id: "api-backends-unavailable".to_owned(),
@@ -457,6 +559,7 @@ pub fn known_gaps(api_gap_count: usize, upstream_api_operations: usize) -> Vec<K
                 .to_owned(),
         },
         turn_part_gap(),
+        v1_surface_gap(v1),
     ]
 }
 
@@ -466,7 +569,7 @@ mod tests {
 
     #[test]
     fn every_known_gap_carries_an_id_a_surface_and_a_detail() {
-        let gaps = known_gaps(10, 58);
+        let gaps = known_gaps(10, 58, V1SurfaceCoverage::new(20, 1, 10));
         assert!(
             !gaps.is_empty(),
             "an empty gap list makes the report vacuous"
@@ -502,7 +605,7 @@ mod tests {
             "the missing set is derived from the two type lists; changing either without \
              re-measuring the port's real behaviour is what the session_interop witness rejects"
         );
-        let gap = known_gaps(10, 58)
+        let gap = known_gaps(10, 58, V1SurfaceCoverage::new(20, 1, 10))
             .into_iter()
             .find(|gap| gap.id == TURN_PART_GAP_ID)
             .expect(
