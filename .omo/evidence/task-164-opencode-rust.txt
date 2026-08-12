@@ -1,0 +1,293 @@
+task 164 — make the v1 not_implemented diagnostic honest and freeze its coverage
+worktree /config/workspace/ProdDir/AI/oc-wt/t164, branch task-164, base 52175ba3
+F3 wave-10 finding F3-W10-D2, report section S8
+
+================================================================================
+1. THE DEFECT, CONFIRMED
+================================================================================
+
+crates/oc-server/src/compat_v1.rs:637 (pre-change):
+
+    "hint": "the route is measured and registered; its backend lands in todos 57-62",
+
+Every 501 this surface emits carried that line. Todos 57-62 are all checked:
+
+  $ grep -n '^- \[.\] \(5[7-9]\|6[0-2]\)\.' .omo/plans/opencode-rust.md
+  657:- [x] 57. ...  665:- [x] 58. ...  673:- [x] 59. ...
+  681:- [x] 60. ...  699:- [x] 61. ...  707:- [x] 62. ...
+
+  $ grep -c '^- \[x\] ' .omo/plans/opencode-rust.md   -> 161
+  $ grep -c '^- \[ \] ' .omo/plans/opencode-rust.md   ->   7  (162-164 + review items)
+
+So a plugin author receiving a 501 was pointed at work that had already shipped.
+Two further stale claims of the same class were found in the same surface while
+verifying, and are fixed here:
+
+  docs/v1-surface-capture.md:171  "Those backends land in todos 57-62."
+  compat_v1.rs ToastForwarder doc  "Todo 73 registers an implementation through
+                                    CompatV1State::with_toast_forwarder."
+
+The second is not merely stale but false. Verified: no production callsite
+registers a forwarder --
+
+  $ grep -rn 'with_toast_forwarder' crates --include='*.rs'
+  crates/oc-server/tests/compat_v1.rs:348   (test only)
+
+  crates/oc-server/src/main.rs:56        .merge(compat_v1_router(CompatV1State::new()))
+  crates/oc-cli/src/cmd/serve.rs:232     .merge(compat_v1_router(CompatV1State::new()))
+
+Both entry points build a bare state, so in every shipped server the one "served"
+v1 route records toasts and never displays them.
+
+================================================================================
+2. THE REAL NUMBERS (established here, not taken from the finding)
+================================================================================
+
+F3 reported "17/18 stubs". Both figures are wrong. Counted from the table:
+
+  $ python3 (count of `method: V1Method::` in V1_SURFACE)  ->  20 routes
+  crates/oc-server/tests/compat_v1.rs:69 already froze 20 by name.
+
+  measured/registered ......... 20
+  served locally ...............  1   POST /tui/show-toast (recording sink)
+  unbacked 501 seams ........... 19
+  of those, with a served
+    /api alternative ........... 10
+  of those, with none .......... 9
+
+So the shape is 19/20 stubs, not 17/18.
+
+--------------------------------------------------------------------------------
+2.1 PER-ROUTE STATUS AND /api MAPPING
+--------------------------------------------------------------------------------
+
+Each alternative was taken from .omo/fixtures/oracle-openapi-1.18.12.json, which
+declares BOTH surfaces and therefore states the equivalence itself (operationId +
+summary + description compared, not guessed), and then checked to be a route this
+server actually serves in crates/oc-server/src/api/mod.rs and NOT one of its
+unsupported_routes() 503 gaps.
+
+ #  verb+path (v1)                              sdk_method                       backing          /api alternative
+ 1  PUT   /auth/{providerID}                    client.auth.set                  not-implemented  none served here
+ 2  POST  /log                                  client.app.log                   not-implemented  none served here
+ 3  GET   /agent                                client.app.agents                not-implemented  GET  /api/agent
+ 4  GET   /config                               client.config.get                not-implemented  none served here
+ 5  GET   /provider                             client.provider.list             not-implemented  GET  /api/provider
+ 6  POST  /provider/{providerID}/oauth/authorize client.provider.oauth.authorize not-implemented  none served here
+ 7  POST  /provider/{providerID}/oauth/callback  client.provider.oauth.callback  not-implemented  none served here
+ 8  GET   /session                              client.session.list              not-implemented  GET  /api/session
+ 9  POST  /session                              client.session.create            not-implemented  POST /api/session
+10  GET   /session/status                       client.session.status            not-implemented  none served here
+11  GET   /session/{sessionID}                  client.session.get               not-implemented  GET  /api/session/{sessionID}
+12  PATCH /session/{sessionID}                  client.session.update            not-implemented  none served here
+13  GET   /session/{sessionID}/children         client.session.children          not-implemented  none served here
+14  GET   /session/{sessionID}/todo             client.session.todo              not-implemented  none served here
+15  POST  /session/{sessionID}/abort            client.session.abort             not-implemented  POST /api/session/{sessionID}/interrupt
+16  POST  /session/{sessionID}/summarize        client.session.summarize         not-implemented  POST /api/session/{sessionID}/compact
+17  GET   /session/{sessionID}/message          client.session.messages          not-implemented  GET  /api/session/{sessionID}/message
+18  POST  /session/{sessionID}/message          client.session.prompt            not-implemented  POST /api/session/{sessionID}/prompt
+19  POST  /session/{sessionID}/prompt_async     client.session.promptAsync       not-implemented  POST /api/session/{sessionID}/prompt
+20  POST  /tui/show-toast                       client.tui.showToast             local-toast-sink none (no /api/tui exists upstream)
+
+Equivalence evidence for the ten (oracle operationId, v1 -> /api):
+  #3  app.agents            -> v2.agent.list        both "List agents"
+  #5  provider.list         -> v2.provider.list     both "List providers"
+  #8  session.list          -> v2.session.list      both "List sessions"
+  #9  session.create        -> v2.session.create    "Create session"
+  #11 session.get           -> v2.session.get       "Get session"
+  #15 session.abort         -> v2.session.interrupt "Abort an active session and stop any ongoing
+                                                     AI processing" / "Interrupt active execution"
+  #16 session.summarize     -> v2.session.compact   "Generate a concise summary ... using AI
+                                                     compaction" / "Compact a session conversation"
+  #17 session.messages      -> v2.session.messages  "Get session messages"
+  #18 session.prompt        -> v2.session.prompt    both "Send message"
+  #19 session.prompt_async  -> v2.session.prompt    "returning immediately" / "Durably admit one
+                                                     session input and schedule ... execution"
+
+Rejected as unverified rather than guessed (kept as None):
+  * GET /session/status -> GET /api/session/active. NOT equivalent: session.status
+    returns "active, idle, and completed states" for all sessions; v2.session.active
+    returns only "foreground Session drains currently owned by this process".
+    Mapping it would have claimed parity that does not exist.
+  * provider.oauth.{authorize,callback} -> /api/integration/{id}/connect/oauth.
+    Different operation (v2 integration connect, not provider oauth), AND that route
+    is itself a 503 gap here (api/mod.rs:170-173, unsupported_routes). A redirect to
+    a second dead end is worse than none.
+  Confirmed absent from the oracle's /api surface entirely: /api/auth*, /api/config,
+  /api/tui*, /api/session/{id}/todo, /api/session/{id}/children, any /api session
+  PATCH (the only /api PATCH is /api/credential/{credentialID}).
+
+================================================================================
+3. OLD AND NEW HINT TEXT
+================================================================================
+
+OLD (one string, every route, stale):
+  "the route is measured and registered; its backend lands in todos 57-62"
+
+NEW (V1Route::hint(), derived per route from api_alternative):
+
+  with an alternative (10 routes), e.g. POST /session/{sessionID}/abort:
+    "this pre-/api route is registered but has no local backend; call
+     `POST /api/session/{sessionID}/interrupt` instead, which serves the same
+     capability in this build"
+
+  without one (9 routes), e.g. PUT /auth/{providerID}:
+    "this pre-/api route is registered but has no local backend, and
+     `client.auth.set` has no served /api equivalent here; there is no alternative
+     call that works today"
+
+The 501 body also gained structured fields, all derived:
+  "backing": "not-implemented"
+  "apiAlternative": "POST /api/session/{sessionID}/interrupt" | null
+  "surfaceCoverage": "19 of 20 measured pre-/api routes have no local backend
+                      (10 of those can name a served /api alternative); 1 served locally"
+
+surfaceCoverage is computed by v1_coverage() on each response rather than stored as
+a &'static str. That choice is deliberate: a `&'static str` restating a runtime
+count is one of the five prose-drift defects fixed in waves 53-57, and writing one
+here would have re-created the class of bug this todo removes.
+
+================================================================================
+4. WHERE THE GAP IS RECORDED, AND WHY IT CANNOT DRIFT
+================================================================================
+
+Classified as a GAP, not a divergence. docs/divergences.toml:11-14:
+
+  # An entry belongs here only when the difference is a DECISION. A surface that is
+  # merely unimplemented is a gap, not a divergence: it is reported by the suite's
+  # `not_compared` / `known_gaps` sections and must never be laundered into an
+  # entry here.
+
+docs/divergences.toml is therefore UNTOUCHED and DECLARED_COUNT stays 17.
+
+Recorded in the existing executable inventory, not in prose:
+
+  crates/oc-testkit/src/compat_report.rs
+    + V1_SURFACE_GAP_ID   = "v1-surface-unbacked"
+    + V1_SURFACE_WITNESS  = "compat_v1_declared_backing_matches_what_the_router_answers"
+    + V1SurfaceCoverage { measured, served, unbacked, redirected }  (unbacked derived)
+    + v1_surface_gap(coverage) -> KnownGap
+    + known_gaps(api_gap_count, upstream_api_operations, v1) now returns it
+
+This follows the turn_part_gap() precedent exactly (id constant + witness constant +
+standalone constructor + entry in the shipped list). The coverage arrives as a
+parameter for the same reason the API counts do: oc-testkit has oc-server as a
+DEV-dependency only, so restating the numbers inside oc-testkit would put a second
+copy one edit away from disagreeing with the router.
+
+Why it cannot go stale — four independent derivations:
+
+  a) crates/oc-server/tests/compat_v1.rs::
+     compat_v1_declared_backing_matches_what_the_router_answers
+     drives all 20 routes and asserts backing.is_served() == (status != 501), then
+     re-derives (served, unbacked, redirected) from the observed run and compares to
+     v1_coverage(). A route gaining or losing a backend fails here.
+
+  b) crates/oc-cli/tests/docs.rs::docs_compatibility_matrix_matches_every_code_table
+     regenerates the `known-gaps` and `v1-routes` blocks of
+     docs/compatibility-matrix.md from v1_coverage() and V1_SURFACE. Any count change
+     makes the committed page stale and the test red.
+
+  c) the same test's new assert_v1_alternatives_are_really_served() splits each
+     api_alternative into verb+path and asserts it is in the PROBED served set and
+     NOT in the probed 503 gap set — so a redirect target losing its backend fails,
+     and an alternative can never point at another dead end.
+
+  d) the matrix prose numbers are asserted via contains_all against v1_coverage()
+     ("19 of the 20 answer `501 not_implemented`", "10 of those 19 name a served",
+     "the other 9 have no served"), so the sentence a human reads cannot drift from
+     the table either.
+
+Also fixed, same defect class:
+  docs/v1-surface-capture.md   "Those backends land in todos 57-62." -> states that
+    no plan todo owns them, names the gap id, cites the divergence rule, and names
+    the nine stranded methods; asserted by (b) via the capture-document test.
+  compat_v1.rs ToastForwarder doc -> now records that no entry point attaches a
+    forwarder, with both callsites.
+  diagnostics JSON: "implementedRoutes": 20 was itself dishonest (only 1 is
+    implemented). Replaced with registeredRoutes / servedRoutes / unbackedRoutes /
+    unbackedWithApiAlternative / coverage, and "backend" now reads route.backing
+    rather than re-deriving from the path.
+
+================================================================================
+5. MUTATION TESTING
+================================================================================
+
+Both mutants were checked to be observable before being trusted.
+
+MUTATION 1 — reintroduce the stale todo reference in the hint
+  compat_v1.rs V1Route::hint(), None arm:
+    "... there is no alternative call that works today"
+  ->  "... its backend lands in todos 57-62"
+  Observable: changes the rendered `hint` string in every 501 body of that arm.
+
+  RESULT: FAILED as required, by name --
+    test compat_v1_seam_hint_names_a_live_alternative_and_never_a_plan_todo ... FAILED
+    "the 501 for PUT /auth/{providerID} cites plan work (`todos 57`), which is
+     exactly the reference that went stale when todos 57-62 closed. Tell the caller
+     what to call instead, not which todo owns the backend: {...}"
+    18 passed; 1 failed.  RESTORED -> 19 passed; 0 failed.
+
+  Note on the matcher: a plain substring test for "todo" is WRONG and was caught
+  during development — `client.session.todo` is a real SDK method this surface
+  serves, so the first version of this test failed on honest text. plan_todo_citation()
+  therefore matches "todo"/"todos" only when followed by a number.
+
+MUTATION 2 — change a route's backing status without updating the inventory
+  V1_SURFACE entry for GET /session/{sessionID}/todo:
+    backing: V1Backing::NotImplemented -> V1Backing::LocalToastSink
+  Observable: v1_coverage() changes from (20,1,19,10) to (20,2,18,9), and the route
+  claims a backend while the router still answers 501.
+
+  RESULT: FAILED in two independent places --
+    test compat_v1_declared_backing_matches_what_the_router_answers ... FAILED
+    "GET /session/{sessionID}/todo declares backing `local-toast-sink` but the router
+     answered 501 Not Implemented. Update the `backing` field in V1_SURFACE in the
+     same commit that changes the behaviour: the known gap `v1-surface-unbacked` and
+     the compatibility matrix both render their counts from it, so leaving it stale
+     publishes a coverage number the server contradicts."
+    18 passed; 1 failed.
+
+    test docs_compatibility_matrix_matches_every_code_table ... FAILED
+    "docs/compatibility-matrix.md block `known-gaps` is stale."
+    12 passed; 1 failed.
+
+    RESTORED -> compat_v1 19 passed; docs 13 passed.
+
+POST-RESTORE CLEANLINESS
+  $ git status --porcelain
+   M crates/oc-cli/tests/docs.rs
+   M crates/oc-server/src/compat_v1.rs
+   M crates/oc-server/src/lib.rs
+   M crates/oc-server/tests/compat_v1.rs
+   M crates/oc-testkit/src/compat_report.rs
+   M crates/oc-testkit/tests/compat_suite.rs
+   M docs/compatibility-matrix.md
+   M docs/v1-surface-capture.md
+  Exactly the eight intended files; no mutant residue, no stray artifacts.
+
+================================================================================
+6. GATE RESULTS
+================================================================================
+
+  cargo fmt --all --check                          -> FMT CLEAN (no output)
+  cargo clippy --workspace --all-targets --offline  -> 0 warnings, 0 errors
+  cargo test --workspace --offline                  -> 3423 passed; 0 failed; 2 ignored
+
+  Baseline was 3421 / 0. The delta of +2 is exactly the two tests added:
+    compat_v1_declared_backing_matches_what_the_router_answers
+    compat_v1_seam_hint_names_a_live_alternative_and_never_a_plan_todo
+
+  No EAGAIN, no interrupted commands; every gate ran to completion once.
+
+================================================================================
+7. SCOPE
+================================================================================
+
+  * No v1 route deleted. The count stayed 20 and every `plugins`/`callsites` record
+    is untouched, so the measured surface still reflects real plugin callsites.
+  * No v1 backend implemented — out of scope for this todo.
+  * docs/divergences.toml untouched; nothing laundered into a divergence.
+  * Files owned by parallel todos 162/163 (crates/oc-llm/src/catalog/,
+    crates/oc-cli/src/cmd/turn.rs, crates/oc-plugin/src/discovery.rs) untouched.
+  * No dependency added.

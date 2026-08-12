@@ -565,7 +565,10 @@ fn known_gaps_block(
     gaps: &BTreeSet<(String, String)>,
 ) -> String {
     let mut out = String::new();
-    for (index, gap) in oc_testkit::compat_report::known_gaps(gaps.len(), upstream.len())
+    let v1 = oc_server::compat_v1::v1_coverage();
+    let v1 =
+        oc_testkit::compat_report::V1SurfaceCoverage::new(v1.measured, v1.served, v1.redirected);
+    for (index, gap) in oc_testkit::compat_report::known_gaps(gaps.len(), upstream.len(), v1)
         .iter()
         .enumerate()
     {
@@ -579,15 +582,87 @@ fn known_gaps_block(
     out
 }
 
+/// Every `/api` route a v1 `501` sends a caller to must actually work.
+///
+/// The point of the redirect is that the caller has somewhere to go. An alternative
+/// that is unregistered, or that is itself an explicit `503` gap, would send a
+/// plugin author from one dead end to another — a more expensive version of the
+/// stale "lands in todos 57-62" hint this replaced. Checked against the probed
+/// router, so an `/api` route losing its backend fails here too.
+fn assert_v1_alternatives_are_really_served(
+    served: &BTreeSet<(String, String)>,
+    gaps: &BTreeSet<(String, String)>,
+) {
+    let coverage = oc_server::v1_coverage();
+    contains_all(
+        "docs/compatibility-matrix.md",
+        &[
+            &format!(
+                "{} of the {} answer `501 not_implemented`",
+                coverage.unbacked, coverage.measured
+            ),
+            &format!(
+                "{} of those {} name a served",
+                coverage.redirected, coverage.unbacked
+            ),
+            &format!(
+                "the other {} have no served",
+                coverage.unbacked - coverage.redirected
+            ),
+        ],
+    );
+    for route in V1_SURFACE {
+        let Some(alternative) = route.api_alternative else {
+            continue;
+        };
+        let (method, path) = alternative
+            .split_once(' ')
+            .unwrap_or_else(|| panic!("`{alternative}` is not a `VERB /path` pair"));
+        let key = (path.to_owned(), method.to_lowercase());
+        assert!(
+            served.contains(&key),
+            "{} {} points callers at `{alternative}`, which this server does not serve",
+            route.method,
+            route.path
+        );
+        assert!(
+            !gaps.contains(&key),
+            "{} {} points callers at `{alternative}`, which is itself an explicit 503 gap; a \
+             redirect to a second dead end is worse than none",
+            route.method,
+            route.path
+        );
+        assert!(
+            !route.backing.is_served(),
+            "{} {} has a local backend, so it should not be redirecting callers elsewhere",
+            route.method,
+            route.path
+        );
+    }
+}
+
+/// Renders the v1 route table with the status each route really has.
+///
+/// The `backing` and `/api alternative` columns come off [`V1_SURFACE`] itself,
+/// which `crates/oc-server/tests/compat_v1.rs` asserts against the routes the
+/// server answers. Before the tenth review wave this table listed 20 routes with no
+/// hint that 19 of them return `501`, so a reader consulting the matrix could not
+/// learn the surface was almost entirely stubs.
 fn v1_block() -> String {
-    let mut out = String::from("| method | path | SDK method |\n|---|---|---|\n");
+    let mut out = String::from(
+        "| method | path | SDK method | backing | `/api` alternative |\n|---|---|---|---|---|\n",
+    );
     for route in V1_SURFACE {
         let _ = writeln!(
             out,
-            "| {} | `{}` | `{}` |",
+            "| {} | `{}` | `{}` | {} | {} |",
             route.method.as_str(),
             route.path,
-            route.sdk_method
+            route.sdk_method,
+            route.backing.as_str(),
+            route
+                .api_alternative
+                .map_or_else(|| "none served here".to_owned(), |path| format!("`{path}`")),
         );
     }
     out
@@ -625,6 +700,7 @@ fn docs_compatibility_matrix_matches_every_code_table() {
 
     assert_cli_disposition_counts();
     assert_api_counts(&upstream, &served, &gaps);
+    assert_v1_alternatives_are_really_served(&served, &gaps);
     contains_all(PAGE, &[&format!("{} v1 route", V1_SURFACE.len())]);
     contains_all(PAGE, &oc_agent::reflection::NEGATIVE_LEARNING_LIST);
 }

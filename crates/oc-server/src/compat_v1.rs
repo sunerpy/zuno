@@ -150,6 +150,42 @@ impl fmt::Display for V1Method {
     }
 }
 
+/// What actually answers a measured v1 route in this build.
+///
+/// Declared per route rather than derived from the path, so the surface's real
+/// coverage is a value a test can read. The `Local` variant names the backend it
+/// means: there is no way to mark a route served without saying what serves it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V1Backing {
+    /// Served locally by [`show_toast`], which records into the toast sink.
+    LocalToastSink,
+    /// Registered and answering a structured `501`. No local backend.
+    NotImplemented,
+}
+
+impl V1Backing {
+    /// The spelling used by diagnostics and by the frozen coverage inventory.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalToastSink => "local-toast-sink",
+            Self::NotImplemented => "not-implemented",
+        }
+    }
+
+    /// Whether a request to this route is answered by real local work.
+    #[must_use]
+    pub const fn is_served(self) -> bool {
+        matches!(self, Self::LocalToastSink)
+    }
+}
+
+impl fmt::Display for V1Backing {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// One measured route, carrying the evidence that justifies serving it.
 ///
 /// `callsites` is not documentation. It is the acceptance criterion in data form:
@@ -166,6 +202,18 @@ pub struct V1Route {
     pub plugins: &'static [&'static str],
     /// `package → file:line` evidence for each callsite. Never empty.
     pub callsites: &'static [&'static str],
+    /// What answers this route here. Read by the `501` body and by diagnostics.
+    pub backing: V1Backing,
+    /// The `/api` route a caller should use instead, when one is served here.
+    ///
+    /// `None` is not "unmeasured": it means this capability has no served `/api`
+    /// spelling in this build, so a caller that needs it needs a v1 backend.
+    /// Each value was taken from the oracle document, which serves both
+    /// surfaces and so states the equivalence itself — `POST /session/{id}/abort`
+    /// (`session.abort`) against `POST /api/session/{id}/interrupt`
+    /// (`v2.session.interrupt`), and so on. The `501` body reads this field, so
+    /// the alternative a plugin author is sent to cannot drift from the route.
+    pub api_alternative: Option<&'static str>,
 }
 
 const AG: &str = "opencode-antigravity-auth@1.6.0";
@@ -185,6 +233,8 @@ pub const V1_SURFACE: &[V1Route] = &[
         sdk_method: "client.auth.set",
         plugins: &[AG],
         callsites: &["opencode-antigravity-auth: dist/src/plugin.js:1400,2319,2337,2366"],
+        backing: V1Backing::NotImplemented,
+        api_alternative: None,
     },
     V1Route {
         method: V1Method::Post,
@@ -192,6 +242,8 @@ pub const V1_SURFACE: &[V1Route] = &[
         sdk_method: "client.app.log",
         plugins: &[AG],
         callsites: &["opencode-antigravity-auth: dist/src/plugin/logger.js:45-50"],
+        backing: V1Backing::NotImplemented,
+        api_alternative: None,
     },
     V1Route {
         method: V1Method::Get,
@@ -199,6 +251,8 @@ pub const V1_SURFACE: &[V1Route] = &[
         sdk_method: "client.app.agents",
         plugins: &[OMO],
         callsites: &["oh-my-openagent: dist/index.js:135963"],
+        backing: V1Backing::NotImplemented,
+        api_alternative: Some("GET /api/agent"),
     },
     V1Route {
         method: V1Method::Get,
@@ -206,6 +260,8 @@ pub const V1_SURFACE: &[V1Route] = &[
         sdk_method: "client.config.get",
         plugins: &[OMO],
         callsites: &["oh-my-openagent: dist/index.js:136416,137080,171644"],
+        backing: V1Backing::NotImplemented,
+        api_alternative: None,
     },
     V1Route {
         method: V1Method::Get,
@@ -213,6 +269,8 @@ pub const V1_SURFACE: &[V1Route] = &[
         sdk_method: "client.provider.list",
         plugins: &[OMO],
         callsites: &["oh-my-openagent: dist/index.js:26958,84674"],
+        backing: V1Backing::NotImplemented,
+        api_alternative: Some("GET /api/provider"),
     },
     V1Route {
         method: V1Method::Post,
@@ -220,6 +278,8 @@ pub const V1_SURFACE: &[V1Route] = &[
         sdk_method: "client.provider.oauth.authorize",
         plugins: &[KIRO],
         callsites: &["opencode-kiro-auth: dist/core/request/request-handler.js:783-786"],
+        backing: V1Backing::NotImplemented,
+        api_alternative: None,
     },
     V1Route {
         method: V1Method::Post,
@@ -227,6 +287,8 @@ pub const V1_SURFACE: &[V1Route] = &[
         sdk_method: "client.provider.oauth.callback",
         plugins: &[KIRO],
         callsites: &["opencode-kiro-auth: dist/core/request/request-handler.js:787-790"],
+        backing: V1Backing::NotImplemented,
+        api_alternative: None,
     },
     V1Route {
         method: V1Method::Get,
@@ -234,6 +296,8 @@ pub const V1_SURFACE: &[V1Route] = &[
         sdk_method: "client.session.list",
         plugins: &[OMO],
         callsites: &["oh-my-openagent: dist/index.js:128645,128654"],
+        backing: V1Backing::NotImplemented,
+        api_alternative: Some("GET /api/session"),
     },
     V1Route {
         method: V1Method::Post,
@@ -241,6 +305,8 @@ pub const V1_SURFACE: &[V1Route] = &[
         sdk_method: "client.session.create",
         plugins: &[OMO],
         callsites: &["oh-my-openagent: dist/index.js:131233,132341,135030,143073"],
+        backing: V1Backing::NotImplemented,
+        api_alternative: Some("POST /api/session"),
     },
     V1Route {
         method: V1Method::Get,
@@ -248,6 +314,8 @@ pub const V1_SURFACE: &[V1Route] = &[
         sdk_method: "client.session.status",
         plugins: &[OMO],
         callsites: &["oh-my-openagent: dist/index.js:10581,123210,131119,132235,133654"],
+        backing: V1Backing::NotImplemented,
+        api_alternative: None,
     },
     V1Route {
         method: V1Method::Get,
@@ -255,6 +323,8 @@ pub const V1_SURFACE: &[V1Route] = &[
         sdk_method: "client.session.get",
         plugins: &[OMO],
         callsites: &["oh-my-openagent: dist/index.js:90497,96292,96646,116276,131215"],
+        backing: V1Backing::NotImplemented,
+        api_alternative: Some("GET /api/session/{sessionID}"),
     },
     V1Route {
         method: V1Method::Patch,
@@ -262,6 +332,8 @@ pub const V1_SURFACE: &[V1Route] = &[
         sdk_method: "client.session.update",
         plugins: &[OMO],
         callsites: &["oh-my-openagent: dist/index.js:138043"],
+        backing: V1Backing::NotImplemented,
+        api_alternative: None,
     },
     V1Route {
         method: V1Method::Get,
@@ -274,6 +346,8 @@ pub const V1_SURFACE: &[V1Route] = &[
         callsites: &[
             "oh-my-openagent: dist/cli/index.js:106371,106539 (plugin-entry line UNVERIFIED, gap G1)",
         ],
+        backing: V1Backing::NotImplemented,
+        api_alternative: None,
     },
     V1Route {
         method: V1Method::Get,
@@ -281,6 +355,8 @@ pub const V1_SURFACE: &[V1Route] = &[
         sdk_method: "client.session.todo",
         plugins: &[OMO],
         callsites: &["oh-my-openagent: dist/index.js:89318,89712,90912,119229,143674"],
+        backing: V1Backing::NotImplemented,
+        api_alternative: None,
     },
     V1Route {
         method: V1Method::Post,
@@ -291,6 +367,8 @@ pub const V1_SURFACE: &[V1Route] = &[
             "opencode-antigravity-auth: dist/src/plugin/recovery.js:293",
             "oh-my-openagent: dist/index.js:106808,120119,131421",
         ],
+        backing: V1Backing::NotImplemented,
+        api_alternative: Some("POST /api/session/{sessionID}/interrupt"),
     },
     V1Route {
         method: V1Method::Post,
@@ -298,6 +376,8 @@ pub const V1_SURFACE: &[V1Route] = &[
         sdk_method: "client.session.summarize",
         plugins: &[OMO],
         callsites: &["oh-my-openagent: dist/index.js:94259,119806,119913"],
+        backing: V1Backing::NotImplemented,
+        api_alternative: Some("POST /api/session/{sessionID}/compact"),
     },
     V1Route {
         method: V1Method::Get,
@@ -308,6 +388,8 @@ pub const V1_SURFACE: &[V1Route] = &[
             "opencode-antigravity-auth: dist/src/plugin/recovery.js:295",
             "oh-my-openagent: dist/index.js:28404,85143,87664",
         ],
+        backing: V1Backing::NotImplemented,
+        api_alternative: Some("GET /api/session/{sessionID}/message"),
     },
     V1Route {
         method: V1Method::Post,
@@ -318,6 +400,8 @@ pub const V1_SURFACE: &[V1Route] = &[
             "opencode-antigravity-auth: dist/src/plugin/recovery.js:126,198",
             "opencode-antigravity-auth: dist/src/plugin.js:1077",
         ],
+        backing: V1Backing::NotImplemented,
+        api_alternative: Some("POST /api/session/{sessionID}/prompt"),
     },
     V1Route {
         method: V1Method::Post,
@@ -325,6 +409,8 @@ pub const V1_SURFACE: &[V1Route] = &[
         sdk_method: "client.session.promptAsync",
         plugins: &[OMO],
         callsites: &["oh-my-openagent: dist/index.js:138443"],
+        backing: V1Backing::NotImplemented,
+        api_alternative: Some("POST /api/session/{sessionID}/prompt"),
     },
     V1Route {
         method: V1Method::Post,
@@ -336,11 +422,83 @@ pub const V1_SURFACE: &[V1Route] = &[
             "opencode-kiro-auth: dist/plugin.js:46-47",
             "oh-my-openagent: dist/index.js:89478,93846,94061",
         ],
+        backing: V1Backing::LocalToastSink,
+        api_alternative: None,
     },
 ];
 
 /// The one route in [`V1_SURFACE`] with a real local backend.
 pub const TOAST_PATH: &str = "/tui/show-toast";
+
+impl V1Route {
+    /// What to tell the plugin author who just received this route's `501`.
+    ///
+    /// Built from [`V1Route::api_alternative`] rather than written per route, so
+    /// the advice cannot survive the fact it describes. The previous text pointed
+    /// at "todos 57-62"; those closed, and a hint that cites finished work tells a
+    /// caller nothing about what to do next.
+    #[must_use]
+    pub fn hint(&self) -> String {
+        match self.api_alternative {
+            Some(alternative) => format!(
+                "this pre-/api route is registered but has no local backend; call `{alternative}` \
+                 instead, which serves the same capability in this build",
+            ),
+            None => format!(
+                "this pre-/api route is registered but has no local backend, and `{}` has no \
+                 served /api equivalent here; there is no alternative call that works today",
+                self.sdk_method,
+            ),
+        }
+    }
+}
+
+/// What the v1 surface actually covers, counted from [`V1_SURFACE`].
+///
+/// A [`Copy`] summary rather than a constant: every field is derived by
+/// [`v1_coverage`], so the numbers a `501` body and the compatibility matrix
+/// publish are recomputed from the route table instead of transcribed beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct V1Coverage {
+    /// Routes the plugin capture measured, and this surface therefore registers.
+    pub measured: usize,
+    /// Routes answered by real local work.
+    pub served: usize,
+    /// Routes registered as structured `501` seams.
+    pub unbacked: usize,
+    /// Unbacked routes whose `501` can name a served `/api` alternative.
+    pub redirected: usize,
+}
+
+impl V1Coverage {
+    /// One line, for an error body or a log, naming the shape of the gap.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        format!(
+            "{} of {} measured pre-/api routes have no local backend ({} of those can name a \
+             served /api alternative); {} served locally",
+            self.unbacked, self.measured, self.redirected, self.served,
+        )
+    }
+}
+
+/// Counts [`V1_SURFACE`]'s real coverage.
+#[must_use]
+pub fn v1_coverage() -> V1Coverage {
+    let unbacked = V1_SURFACE
+        .iter()
+        .filter(|route| !route.backing.is_served())
+        .collect::<Vec<_>>();
+    V1Coverage {
+        measured: V1_SURFACE.len(),
+        served: V1_SURFACE.len() - unbacked.len(),
+        unbacked: unbacked.len(),
+        redirected: unbacked
+            .iter()
+            .filter(|route| route.api_alternative.is_some())
+            .count(),
+    }
+}
 
 /// A toast a plugin asked to display.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,11 +513,13 @@ pub struct Toast {
     pub duration: Option<u64>,
 }
 
-/// A TUI that can display toasts once one exists.
+/// A TUI that can display toasts once one is attached.
 ///
-/// Todo 73 registers an implementation through
-/// [`CompatV1State::with_toast_forwarder`]. Keeping the route independent of the
-/// TUI's existence is the point: attaching a display must not change the HTTP
+/// No server entry point registers one: `crates/oc-server/src/main.rs` and
+/// `crates/oc-cli/src/cmd/serve.rs` both build a bare [`CompatV1State::new`], so
+/// in every shipped server this route records and never displays. That is why
+/// [`V1Backing::LocalToastSink`] names a sink rather than a TUI. Keeping the route
+/// independent of a display is the point: attaching one must not change the HTTP
 /// surface a plugin already talks to.
 pub trait ToastForwarder: Send + Sync + fmt::Debug {
     /// Displays one toast. Called while the request is in flight, so it must not
@@ -634,7 +794,12 @@ impl IntoResponse for CompatV1Error {
                     "sdkMethod": route.sdk_method,
                     "route": format!("{} {}", route.method, route.path),
                     "callers": route.plugins,
-                    "hint": "the route is measured and registered; its backend lands in todos 57-62",
+                    "backing": route.backing.as_str(),
+                    "apiAlternative": route.api_alternative,
+                    "hint": route.hint(),
+                    // Counted from V1_SURFACE on each response rather than
+                    // restated as a literal, so it cannot outlive the truth.
+                    "surfaceCoverage": v1_coverage().summary(),
                 }),
             ),
             Self::InvalidRequest(_) => (
@@ -773,14 +938,20 @@ async fn diagnostics(State(state): State<CompatV1State>) -> Json<Value> {
                 "sdkMethod": route.sdk_method,
                 "callers": route.plugins,
                 "callsites": route.callsites,
-                "backend": if route.path == TOAST_PATH { "recording-seam" } else { "not-implemented" },
+                "backend": route.backing.as_str(),
+                "apiAlternative": route.api_alternative,
             })
         })
         .collect::<Vec<_>>();
+    let coverage = v1_coverage();
     let ring = state.toasts.lock();
     Json(json!({
         "v1Surface": {
-            "implementedRoutes": implemented.len(),
+            "registeredRoutes": implemented.len(),
+            "servedRoutes": coverage.served,
+            "unbackedRoutes": coverage.unbacked,
+            "unbackedWithApiAlternative": coverage.redirected,
+            "coverage": coverage.summary(),
             "routes": implemented,
             "accountedPrefixes": V1_PREFIXES,
         },

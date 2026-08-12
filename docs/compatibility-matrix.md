@@ -81,6 +81,12 @@ loses and, where one exists, the test that fails if the gap closes or goes stale
 **Surface.** the `part` rows one assistant turn persists — the step-boundary parts
 
 **What is missing.** For one plain single-step turn the release persists [step-start, text, step-finish] and this port persists [text], so [step-start, step-finish] is never written. Measured on the `run` path at 1.18.15 in .omo/evidence/task-136-opencode-rust.txt:191-215, inside a git repository and outside one; the user's production database holds 280,859 step-start rows, so the release's shape is the normal one rather than an artefact. This is a GAP and not a declared divergence because nothing chose it: `oc-db` already models both types as first-class wire tags (crates/oc-db/src/message.rs:139-142,181-182) and `oc-engine::stream::StreamProjector` already writes upstream's exact shape including the snapshot hashes (crates/oc-engine/src/stream.rs:211-265,869-977), but no production caller reaches it — the live turn path accumulates and then checkpoints only text, reasoning and tool parts (crates/oc-engine/src/loop.rs:1547-1588). An unwired implementation is work outstanding, so declaring it in docs/divergences.toml would dress an omission up as a decision. What a consumer loses: upstream reads `step-finish.cost`/`tokens` to aggregate session usage (packages/core/src/session/projector.ts:36-42,90-108) and takes the first `step-start.snapshot` and last `step-finish.snapshot` as the bounds of a turn's diff (packages/opencode/src/session/summary.ts:82-99), which `revert` then refreshes (packages/opencode/src/session/revert.ts:70-77). Interoperability is unaffected and was measured to be: every assertion in crates/oc-testkit/tests/session_interop.rs holds across this difference in both directions. Witnessed by crates/oc-testkit/tests/session_interop.rs::the_recorded_turn_part_gap_matches_what_a_turn_actually_persists.
+
+### v1-surface-unbacked
+
+**Surface.** 19 of the 20 measured pre-/api (v1) routes the installed plugins actually call
+
+**What is missing.** The pre-/api surface exists because the published SDK sends unprefixed paths, so every resident plugin talks to it. It registers 20 routes, each with a recorded plugin callsite, but only 1 does real local work: POST /tui/show-toast, and even that is a recording sink rather than a display — no server entry point attaches a forwarder (crates/oc-server/src/main.rs, crates/oc-cli/src/cmd/serve.rs both build a bare CompatV1State::new). The other 19 answer a structured 501 not_implemented. 10 of those name a served /api route that provides the same capability, taken from the oracle document which declares both surfaces, and their 501 bodies tell the caller to use it: app.agents to GET /api/agent, provider.list to GET /api/provider, session.list and session.create to GET and POST /api/session, session.get to GET /api/session/{sessionID}, session.abort to POST /api/session/{sessionID}/interrupt, session.summarize to POST /api/session/{sessionID}/compact, session.messages to GET /api/session/{sessionID}/message, and session.prompt and session.promptAsync to POST /api/session/{sessionID}/prompt. The remaining 9 have no served /api spelling at all — auth.set, app.log, config.get, the two provider.oauth calls, session.status, session.update, session.children and session.todo — so a plugin that needs one has no working call today; concretely, the installed auth plugins reach a registered route for every request they issue and can deliver toasts, but cannot authenticate through this surface. This is a GAP and not a declared divergence because nothing chose it and no plan todo owns it, and docs/divergences.toml:11-14 forbids recording an unimplemented surface as a decision. Witnessed by crates/oc-server/tests/compat_v1.rs::compat_v1_declared_backing_matches_what_the_router_answers, which drives every route and fails if a declared status disagrees with what the router answers.
 <!-- generated:END known-gaps -->
 
 ## Cross-session resident memory
@@ -253,29 +259,40 @@ asserts every route has a recorded callsite and that none answers 404.
 **20 v1 routes**, measured against the plugins installed at capture time. A route
 with no recorded callsite is scope creep, and a test fails on it.
 
+Registering a route is not the same as backing it, and this surface is almost
+entirely unbacked: 19 of the 20 answer `501 not_implemented`. The one that does
+real local work, `POST /tui/show-toast`, records into a bounded in-process sink
+that no shipped entry point attaches a display to. 10 of those 19 name a served
+`/api` route with the same capability and their `501` tells the caller to use it;
+the other 9 have no served `/api` spelling here, so a plugin that needs one has no
+working call today. That is recorded as the `v1-surface-unbacked` known gap above —
+a gap, never a divergence. The counts in this paragraph are asserted by
+`crates/oc-cli/tests/docs.rs` against `oc_server::v1_coverage`, which counts the
+route table the server serves.
+
 <!-- generated:BEGIN v1-routes -->
-| method | path | SDK method |
-|---|---|---|
-| PUT | `/auth/{providerID}` | `client.auth.set` |
-| POST | `/log` | `client.app.log` |
-| GET | `/agent` | `client.app.agents` |
-| GET | `/config` | `client.config.get` |
-| GET | `/provider` | `client.provider.list` |
-| POST | `/provider/{providerID}/oauth/authorize` | `client.provider.oauth.authorize` |
-| POST | `/provider/{providerID}/oauth/callback` | `client.provider.oauth.callback` |
-| GET | `/session` | `client.session.list` |
-| POST | `/session` | `client.session.create` |
-| GET | `/session/status` | `client.session.status` |
-| GET | `/session/{sessionID}` | `client.session.get` |
-| PATCH | `/session/{sessionID}` | `client.session.update` |
-| GET | `/session/{sessionID}/children` | `client.session.children` |
-| GET | `/session/{sessionID}/todo` | `client.session.todo` |
-| POST | `/session/{sessionID}/abort` | `client.session.abort` |
-| POST | `/session/{sessionID}/summarize` | `client.session.summarize` |
-| GET | `/session/{sessionID}/message` | `client.session.messages` |
-| POST | `/session/{sessionID}/message` | `client.session.prompt` |
-| POST | `/session/{sessionID}/prompt_async` | `client.session.promptAsync` |
-| POST | `/tui/show-toast` | `client.tui.showToast` |
+| method | path | SDK method | backing | `/api` alternative |
+|---|---|---|---|---|
+| PUT | `/auth/{providerID}` | `client.auth.set` | not-implemented | none served here |
+| POST | `/log` | `client.app.log` | not-implemented | none served here |
+| GET | `/agent` | `client.app.agents` | not-implemented | `GET /api/agent` |
+| GET | `/config` | `client.config.get` | not-implemented | none served here |
+| GET | `/provider` | `client.provider.list` | not-implemented | `GET /api/provider` |
+| POST | `/provider/{providerID}/oauth/authorize` | `client.provider.oauth.authorize` | not-implemented | none served here |
+| POST | `/provider/{providerID}/oauth/callback` | `client.provider.oauth.callback` | not-implemented | none served here |
+| GET | `/session` | `client.session.list` | not-implemented | `GET /api/session` |
+| POST | `/session` | `client.session.create` | not-implemented | `POST /api/session` |
+| GET | `/session/status` | `client.session.status` | not-implemented | none served here |
+| GET | `/session/{sessionID}` | `client.session.get` | not-implemented | `GET /api/session/{sessionID}` |
+| PATCH | `/session/{sessionID}` | `client.session.update` | not-implemented | none served here |
+| GET | `/session/{sessionID}/children` | `client.session.children` | not-implemented | none served here |
+| GET | `/session/{sessionID}/todo` | `client.session.todo` | not-implemented | none served here |
+| POST | `/session/{sessionID}/abort` | `client.session.abort` | not-implemented | `POST /api/session/{sessionID}/interrupt` |
+| POST | `/session/{sessionID}/summarize` | `client.session.summarize` | not-implemented | `POST /api/session/{sessionID}/compact` |
+| GET | `/session/{sessionID}/message` | `client.session.messages` | not-implemented | `GET /api/session/{sessionID}/message` |
+| POST | `/session/{sessionID}/message` | `client.session.prompt` | not-implemented | `POST /api/session/{sessionID}/prompt` |
+| POST | `/session/{sessionID}/prompt_async` | `client.session.promptAsync` | not-implemented | `POST /api/session/{sessionID}/prompt` |
+| POST | `/tui/show-toast` | `client.tui.showToast` | local-toast-sink | none served here |
 <!-- generated:END v1-routes -->
 
 ## Surfaces compared differentially

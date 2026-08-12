@@ -6,7 +6,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use oc_paths::DbLocation;
 use oc_server::api::{self, ApiState};
-use oc_server::compat_v1::{V1_DIAGNOSTICS_PATH, V1Method};
+use oc_server::compat_v1::{TOAST_PATH, V1_DIAGNOSTICS_PATH, V1Method, v1_coverage};
 use oc_server::{
     CompatV1State, DEFAULT_EVENT_SUBSCRIBER_CAPACITY, EventService, ServerBuilder, ServerConfig,
     Toast, ToastForwarder, V1_PREFIXES, V1_SURFACE, compat_v1_router, events_router,
@@ -62,6 +62,35 @@ async fn response_json(response: axum::response::Response) -> Value {
 fn concrete_uri(path: &str) -> String {
     path.replace("{providerID}", "anthropic")
         .replace("{sessionID}", "ses_fixture")
+}
+
+/// Finds a citation of numbered plan work: `todo`/`todos` followed by a number.
+///
+/// A plain substring test for "todo" cannot be used, and finding that out is half
+/// the point: `client.session.todo` is a real SDK method this surface serves, so it
+/// appears in these bodies legitimately. What must never appear is a reference to
+/// numbered plan work — the form that was true when written and silently stopped
+/// being true once those todos closed.
+fn plan_todo_citation(text: &str) -> Option<String> {
+    let lowered = text.to_lowercase();
+    let mut search = 0;
+    while let Some(offset) = lowered[search..].find("todo") {
+        let word_start = search + offset;
+        let mut cursor = word_start + "todo".len();
+        if lowered[cursor..].starts_with('s') {
+            cursor += 1;
+        }
+        let digits: String = lowered[cursor..]
+            .trim_start_matches([' ', '\t'])
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        if !digits.is_empty() {
+            return Some(format!("{} {digits}", &lowered[word_start..cursor]));
+        }
+        search = cursor;
+    }
+    None
 }
 
 #[test]
@@ -213,6 +242,170 @@ async fn compat_v1_every_measured_route_is_reachable_and_never_answers_404() {
             "measured route {} {} is registered under a different verb",
             route.method,
             route.path
+        );
+    }
+}
+
+/// The declared status of every route, against what the router really answers.
+///
+/// This is the executable half of the `v1-surface-unbacked` known gap: the gap's
+/// text is rendered from [`v1_coverage`], which counts `backing` values, so a route
+/// whose declared `backing` drifts from its real behaviour would publish a false
+/// coverage number in both the `501` body and `docs/compatibility-matrix.md`.
+/// Driving each route closes that: gaining a backend without editing the table
+/// fails here, and so does claiming one that does not exist.
+#[tokio::test]
+async fn compat_v1_declared_backing_matches_what_the_router_answers() {
+    let app = compat_app(CompatV1State::new());
+    let coverage = v1_coverage();
+    assert_eq!(
+        coverage.measured,
+        V1_SURFACE.len(),
+        "the coverage summary counts a different table than the one that is served"
+    );
+    assert_eq!(
+        coverage.served + coverage.unbacked,
+        coverage.measured,
+        "every measured route is either served or unbacked"
+    );
+
+    let mut served = 0;
+    let mut unbacked = 0;
+    let mut redirected = 0;
+    for route in V1_SURFACE {
+        let method = match route.method {
+            V1Method::Get => Method::GET,
+            V1Method::Post => Method::POST,
+            V1Method::Put => Method::PUT,
+            V1Method::Patch => Method::PATCH,
+        };
+        let body = if route.path == TOAST_PATH {
+            Some(json!({"message": "backing probe", "variant": "info"}))
+        } else {
+            Some(json!({}))
+        };
+        let response = app
+            .clone()
+            .oneshot(request(method, &concrete_uri(route.path), body))
+            .await
+            .expect("a registered route responds");
+        let answered_501 = response.status() == StatusCode::NOT_IMPLEMENTED;
+        assert_eq!(
+            route.backing.is_served(),
+            !answered_501,
+            "{} {} declares backing `{}` but the router answered {}. Update the `backing` field \
+             in V1_SURFACE in the same commit that changes the behaviour: the known gap \
+             `v1-surface-unbacked` and the compatibility matrix both render their counts from it, \
+             so leaving it stale publishes a coverage number the server contradicts.",
+            route.method,
+            route.path,
+            route.backing,
+            response.status(),
+        );
+        if route.backing.is_served() {
+            served += 1;
+        } else {
+            unbacked += 1;
+            if route.api_alternative.is_some() {
+                redirected += 1;
+            }
+        }
+    }
+
+    assert_eq!(
+        (served, unbacked, redirected),
+        (coverage.served, coverage.unbacked, coverage.redirected),
+        "the coverage summary disagrees with what driving every route observed"
+    );
+}
+
+/// The `501` must tell a caller something that is true when they read it.
+///
+/// The wave-10 review found the hint reading "its backend lands in todos 57-62"
+/// after all 161 implementation todos had closed, so it pointed a plugin author at
+/// finished work. A todo number is a poor thing to publish in an error body at all:
+/// it goes stale silently and means nothing outside this repository. This asserts
+/// the body carries no such reference and names the served `/api` route instead.
+#[tokio::test]
+async fn compat_v1_seam_hint_names_a_live_alternative_and_never_a_plan_todo() {
+    let app = compat_app(CompatV1State::new());
+    for route in V1_SURFACE.iter().filter(|route| !route.backing.is_served()) {
+        let method = match route.method {
+            V1Method::Get => Method::GET,
+            V1Method::Post => Method::POST,
+            V1Method::Put => Method::PUT,
+            V1Method::Patch => Method::PATCH,
+        };
+        let response = app
+            .clone()
+            .oneshot(request(
+                method,
+                &concrete_uri(route.path),
+                Some(json!({"probe": "hint"})),
+            ))
+            .await
+            .expect("an unbacked route responds");
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = response_json(response).await;
+        let rendered = body.to_string();
+        let hint = body["error"]["hint"]
+            .as_str()
+            .expect("every 501 carries a hint")
+            .to_owned();
+
+        if let Some(citation) = plan_todo_citation(&rendered) {
+            panic!(
+                "the 501 for {} {} cites plan work (`{citation}`), which is exactly the reference \
+                 that went stale when todos 57-62 closed. Tell the caller what to call instead, \
+                 not which todo owns the backend: {rendered}",
+                route.method, route.path,
+            );
+        }
+        let lowered = rendered.to_lowercase();
+        assert!(
+            !lowered.contains("lands in"),
+            "the 501 for {} {} still promises future work: {rendered}",
+            route.method,
+            route.path,
+        );
+
+        match route.api_alternative {
+            Some(alternative) => {
+                assert!(
+                    hint.contains(alternative),
+                    "{} {} records `{alternative}` as its served /api equivalent, but its hint \
+                     does not name it, so the caller is not told what works: {hint}",
+                    route.method,
+                    route.path,
+                );
+                assert_eq!(
+                    body["error"]["apiAlternative"], alternative,
+                    "the structured field and the prose hint must name the same route"
+                );
+            }
+            None => {
+                assert!(
+                    body["error"]["apiAlternative"].is_null(),
+                    "{} {} declares no /api alternative but the body advertises one",
+                    route.method,
+                    route.path,
+                );
+                assert!(
+                    hint.contains("no served /api equivalent"),
+                    "{} {} has no alternative, so its hint must say so plainly rather than imply \
+                     one exists: {hint}",
+                    route.method,
+                    route.path,
+                );
+            }
+        }
+        assert_eq!(body["error"]["backing"], route.backing.as_str());
+        assert!(
+            body["error"]["surfaceCoverage"]
+                .as_str()
+                .is_some_and(|line| line.contains(&v1_coverage().unbacked.to_string())),
+            "the 501 should carry the surface's real coverage, counted at response time: \
+             {rendered}"
         );
     }
 }
@@ -524,7 +717,19 @@ async fn compat_v1_diagnostics_surface_the_counter_and_the_toast_sink() {
         .expect("diagnostics respond");
     assert_eq!(response.status(), StatusCode::OK);
     let body = response_json(response).await;
-    assert_eq!(body["v1Surface"]["implementedRoutes"], 20);
+    let coverage = v1_coverage();
+    assert_eq!(body["v1Surface"]["registeredRoutes"], 20);
+    assert_eq!(body["v1Surface"]["servedRoutes"], coverage.served);
+    assert_eq!(body["v1Surface"]["unbackedRoutes"], coverage.unbacked);
+    assert_eq!(
+        body["v1Surface"]["unbackedWithApiAlternative"],
+        coverage.redirected
+    );
+    assert_eq!(
+        body["v1Surface"]["coverage"],
+        coverage.summary(),
+        "diagnostics must publish the surface's real coverage, not just its route count"
+    );
     assert_eq!(body["unknownRoutes"]["total"], 1);
     assert_eq!(body["unknownRoutes"]["paths"]["/file/content"], 1);
     assert_eq!(body["unknownRoutes"]["overflowedSightings"], 0);

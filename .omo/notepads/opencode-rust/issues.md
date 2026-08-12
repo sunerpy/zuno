@@ -7288,3 +7288,48 @@ the unrelated G6 stress test but its heavily loaded fixture spawned only 31 of t
 then the broad command reached its 30-minute timeout. No task-163 assertion failed, and the production
 auto-discovery, existing configured-plugin lifecycle, and discovery unit tests all passed. Full details
 are in `.omo/evidence/task-163-opencode-rust.txt`.
+## [2026-08-12] Todo 164 — the v1 501 hint pointed at finished work, and the surface's real coverage was undeclared
+
+Every pre-`/api` 501 carried one fixed line: "the route is measured and registered; its backend lands in
+todos 57-62". Those six todos are checked, along with all 161 implementation todos, so the diagnostic sent
+a plugin author to completed work. `docs/v1-surface-capture.md:171` repeated the same claim.
+
+F3 reported the surface as "17/18 stubs". Counting `V1_SURFACE` gives **20 registered routes, 1 served,
+19 unbacked** — the shape is 19/20, and the existing test already froze the count at 20. Worth noting for
+future waves: a finding's numbers are a lead, not a measurement.
+
+The one "served" route is weaker than it read. `POST /tui/show-toast` records into an in-process ring and
+**no entry point attaches a display** — `main.rs:56` and `serve.rs:232` both build a bare
+`CompatV1State::new()`. The trait doc claiming "Todo 73 registers an implementation" was false, not merely
+stale: todo 73 shipped a TUI and wired no forwarder. Hence the backing variant is named `LocalToastSink`,
+which says what actually serves the route.
+
+Each route now records its own `/api` alternative, taken from the oracle document (which declares both
+surfaces, so it states the equivalence itself) and verified to be a route this server serves and not one of
+its own 503 gaps. Ten of the nineteen have one; nine do not. Two candidate mappings were **rejected rather
+than guessed**: `session.status` -> `/api/session/active` (status covers active/idle/completed, active
+covers only owned foreground drains — not the same capability), and the two `provider.oauth` calls ->
+`/api/integration/{id}/connect/oauth` (different operation, and itself a 503 gap here). A redirect to a
+second dead end would have been worse than admitting there is none.
+
+Recorded as the `v1-surface-unbacked` **known gap**, never a divergence — `docs/divergences.toml:11-14`
+forbids laundering an unimplemented surface into a decision, so that file and `DECLARED_COUNT` are
+untouched. It follows the `turn_part_gap()` precedent (id constant, witness constant, standalone
+constructor, entry in the shipped list). The coverage arrives as a parameter because oc-testkit has
+oc-server as a dev-dependency only; restating the numbers there would create the second copy that drifts.
+
+Four derivations keep it honest: the router witness drives all 20 routes and compares declared backing to
+real status; the docs gate regenerates both matrix blocks; a new assertion proves every alternative is in
+the probed served set and outside the probed gap set; and the matrix prose numbers are asserted against
+`v1_coverage()`. The 501's `surfaceCoverage` is computed per response rather than stored as a
+`&'static str` — writing that literal would have re-created the exact wave-53-to-57 defect this fixes.
+
+A trap worth recording: the first version of the no-stale-todo test used a plain `"todo"` substring check
+and failed on honest text, because `client.session.todo` is a real SDK method this surface serves. The
+matcher now requires a **number** after the word.
+
+Mutations: reintroducing "lands in todos 57-62" failed
+`compat_v1_seam_hint_names_a_live_alternative_and_never_a_plan_todo` by name, quoting the citation it
+found; flipping `GET /session/{sessionID}/todo` to claim a backend failed both
+`compat_v1_declared_backing_matches_what_the_router_answers` and the matrix gate. Both restored; gates
+3423 passed / 0 failed (baseline 3421 plus these two tests), clippy 0, fmt clean.
