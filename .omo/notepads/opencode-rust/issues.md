@@ -7476,3 +7476,39 @@ single-projection mutants each failed a named test, including the separate param
 autocontinue call sites and both directions of Auth.loader, ProviderHook.models, and small_model.
 Complete enumeration, source method, mutation outcomes, and gates are in
 `.omo/evidence/task-170-opencode-rust.txt`.
+
+## 171: the v1 `Session` projection served a body its own published schema rejects
+
+F3 wave-12 finding F3-W12-01. `crates/oc-server/src/compat_v1.rs`'s `v1_session` dropped `slug`
+while the OpenAPI the same process publishes at `/doc` and the committed oracle capture both mark
+it `required`. Reproduced against the real binary before touching anything: `POST /session`,
+`GET /session` and `GET /session/{id}` all served
+`['directory','id','parentID','projectID','time','title','version']`, and `/doc` listed
+`Session.required = ['id','projectId','slug','directory','title','version','time']`. The value was
+already one layer down — `/api/session/{id}` returned `slug` for the same session — so this was a
+lossy projection, not a missing capability, and `docs/divergences.toml:11-14` forbids declaring it.
+
+`slug` is now read off `SessionInfo` and never recomputed from `id`: it is a caller-supplied column
+of its own (`crates/oc-db/src/session.rs:248,257`), so the two are free to differ and deriving it
+would be a guess that merely holds today.
+
+The new test validates against the published schema rather than a hand-written key list. It fetches
+`/doc` through the router, reads `Session.required` off it, reads the same set off the oracle,
+asserts the two AGREE first — that agreement is the premise that makes an omission a defect, so the
+test proves it instead of assuming it — maps the camelCase ID keys through the one rename the
+projection is allowed to make, then requires every derived key present and non-null on all three v1
+bodies. A required field added to `SessionInfo` later is therefore covered on the day it is added.
+Dropping `slug` again fails exactly that test, by name, and no other: the seam was genuinely
+uncovered.
+
+F3's lower-severity `/agent` observation is a DIFFERENT class and is recorded, not fixed. Measured:
+every oracle-required Agent key (`name`, `mode`, `permission`, `options`) is served; the port
+publishes no `Agent` schema at all, so there is nothing for the body to contradict; and the only
+committed capture is 1.18.12 while the port targets later, so the optional-key drift
+(`builtIn`/`maxSteps`/`tools` extra, `hidden`/`native`/`steps`/`temperature`/`topP`/`variant`
+absent) is undecidable here. Picking an answer would be inventing the capture. It is now
+`v1-agent-projection-unverified` in `oc_testkit::compat_report::known_gaps`, rendered into
+`docs/compatibility-matrix.md`, with a witness that fails if either reason expires — a required key
+being dropped, or this build starting to publish an `Agent` schema — and that pins the measured key
+sets so the recording cannot rot while passing. Reproduction, disposition reasoning, mutation
+outcome and gates are in `.omo/evidence/task-171-opencode-rust.txt`.

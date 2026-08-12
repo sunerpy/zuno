@@ -1197,9 +1197,25 @@ fn prompt_body(body: V1PromptBody) -> Result<PromptBody, ApiError> {
     })
 }
 
+/// Projects an `/api` session onto the pre-`/api` (v1) SDK shape.
+///
+/// The two shapes differ only in how the ID-suffixed keys are spelled: the v1 SDK
+/// reads `projectID`/`parentID` where `/api` and the schema this build publishes at
+/// `/doc` serve `projectId`/`parentId`. A rename is all that is allowed here — every
+/// key the published `Session` schema marks `required` has to survive it.
+///
+/// `slug` did not, until the twelfth review wave measured the served body against
+/// that document and found the build contradicting its own schema. It is read off
+/// [`SessionInfo`] and never recomputed from `id`: it is a caller-supplied column of
+/// its own (`crates/oc-db/src/session.rs:248,257`), so the two are free to differ.
+/// `crates/oc-server/tests/compat_v1.rs::compat_v1_session_projection_satisfies_the_published_session_schema`
+/// reads the required set off `/doc` and off the committed oracle instead of
+/// restating it, so a required field added to [`SessionInfo`] and not carried
+/// through here fails that test rather than shipping a body no v1 client can trust.
 fn v1_session(session: SessionInfo) -> Value {
     json!({
         "id": session.id,
+        "slug": session.slug,
         "projectID": session.project_id,
         "directory": session.directory,
         "parentID": session.parent_id,

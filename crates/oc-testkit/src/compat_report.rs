@@ -485,6 +485,60 @@ pub fn v1_surface_gap(coverage: V1SurfaceCoverage) -> KnownGap {
     }
 }
 
+/// The gap recording that the v1 `/agent` body's shape is unclassified.
+pub const V1_AGENT_GAP_ID: &str = "v1-agent-projection-unverified";
+
+/// The test name [`v1_agent_projection_gap`]'s detail points a reader at.
+pub const V1_AGENT_WITNESS: &str =
+    "compat_v1_agent_projection_drift_is_recorded_and_drops_no_required_key";
+
+/// The gap [`V1_AGENT_GAP_ID`] names, on its own.
+///
+/// # Why this is a gap and not the `slug` defect next door
+///
+/// The twelfth review wave reported this beside the pre-`/api` `Session` projection
+/// dropping `slug`. That one was a defect and is fixed: `slug` was `required` in the
+/// oracle *and* in the schema this build publishes at `/doc`, so the build was
+/// rejecting its own response, and the value was already one layer down.
+///
+/// None of that holds here. Every oracle-**required** `Agent` key is served, this
+/// build publishes no `Agent` schema for the body to contradict, and the only
+/// committed capture is 1.18.12 while the port targets a later release — so the
+/// remaining difference is in optional keys measured against a stale contract.
+/// Choosing a shape from that would be inventing the missing capture, so the
+/// difference is recorded here unclassified rather than declared in
+/// `docs/divergences.toml`, which at lines 11-14 forbids recording something nobody
+/// decided as a decision.
+#[must_use]
+pub fn v1_agent_projection_gap() -> KnownGap {
+    KnownGap {
+        id: V1_AGENT_GAP_ID.to_owned(),
+        surface: "the `Agent` body shape `GET /agent` serves the pre-/api (v1) SDK".to_owned(),
+        detail: format!(
+            "The projection serves three keys the oracle `Agent` schema does not declare — \
+             builtIn, maxSteps and tools, against a schema with additionalProperties:false — and \
+             omits six it declares as optional: hidden, native, steps, temperature, topP and \
+             variant. maxSteps against the oracle's steps reads as a rename. What is NOT missing \
+             is any required key: all four of name, mode, permission and options are served, so \
+             no v1 caller reads a promised field and gets nothing. That is the line between this \
+             and the `Session` slug omission the same review wave found, which was a defect \
+             because the dropped key was required by the oracle AND by the OpenAPI this build \
+             publishes at /doc, making the build contradict itself. Here the build publishes no \
+             `Agent` schema at all, and the only committed oracle capture is 1.18.12 while this \
+             port targets a later release, so whether the difference is upstream drift already \
+             corrected at the targeted version or a real omission cannot be settled without a \
+             capture at that version. Picking an answer would be inventing the evidence, so the \
+             difference is recorded unclassified: a gap, not a decision, which \
+             docs/divergences.toml:11-14 requires. Witnessed by \
+             crates/oc-server/tests/compat_v1.rs::{witness}, which measures the served key set \
+             against the oracle schema and fails if a required key is ever dropped or if this \
+             build starts publishing an `Agent` schema of its own — either event ends the reason \
+             recorded here.",
+            witness = V1_AGENT_WITNESS,
+        ),
+    }
+}
+
 /// Every surface where this port is behind upstream with no decision behind it.
 ///
 /// # Why this list moved out of the compatibility suite
@@ -554,6 +608,7 @@ pub fn known_gaps(
         },
         turn_part_gap(),
         v1_surface_gap(v1),
+        v1_agent_projection_gap(),
     ]
 }
 
@@ -589,6 +644,24 @@ mod tests {
         let count = ids.len();
         ids.dedup();
         assert_eq!(count, ids.len(), "two gaps share an id: {ids:?}");
+    }
+
+    #[test]
+    fn the_v1_agent_gap_is_shipped_and_names_its_witness() {
+        let gap = known_gaps(10, 58, V1SurfaceCoverage::new(20, 1, 10))
+            .into_iter()
+            .find(|gap| gap.id == V1_AGENT_GAP_ID)
+            .expect(
+                "the /agent projection gap is reachable through v1_agent_projection_gap() but is \
+                 NOT in the list the compatibility report and the documentation render, so a \
+                 reader would never learn the difference was recorded",
+            );
+        assert_eq!(gap.detail, v1_agent_projection_gap().detail);
+        assert!(
+            gap.detail.contains(V1_AGENT_WITNESS),
+            "the gap does not name the test that measures it, so the recording could rot while \
+             the measurement passed"
+        );
     }
 
     #[test]
