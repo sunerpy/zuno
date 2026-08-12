@@ -3,7 +3,9 @@
 use super::*;
 
 use oc_catalog::agent::{Agent, AgentMode, AgentSource};
+use oc_llm::sse::StreamIdleTimeout;
 use oc_paths::Env;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 fn agent(name: &str) -> Agent {
     Agent {
@@ -2149,5 +2151,313 @@ fn an_empty_credential_scrubs_nothing() {
         describe_turn_failure(&error, Some("")),
         describe_turn_failure(&error, None),
         "an empty credential changed the message it appears in"
+    );
+}
+
+async fn spawn_turn_response_server(
+    chunks: Vec<(std::time::Duration, Vec<u8>)>,
+    finish: bool,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind turn-response fixture");
+    let address = listener.local_addr().expect("turn fixture address");
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept turn request");
+        read_http_request(&mut socket).await;
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\n\
+                  Content-Type: text/event-stream\r\n\
+                  Transfer-Encoding: chunked\r\n\
+                  Connection: close\r\n\
+                  \r\n",
+            )
+            .await
+            .expect("write turn response headers");
+
+        for (delay, chunk) in chunks {
+            tokio::time::sleep(delay).await;
+            socket
+                .write_all(format!("{:X}\r\n", chunk.len()).as_bytes())
+                .await
+                .expect("write turn chunk size");
+            socket
+                .write_all(&chunk)
+                .await
+                .expect("write turn response chunk");
+            socket
+                .write_all(b"\r\n")
+                .await
+                .expect("terminate turn response chunk");
+        }
+
+        if finish {
+            socket
+                .write_all(b"0\r\n\r\n")
+                .await
+                .expect("finish turn response");
+        } else {
+            std::future::pending::<()>().await;
+        }
+    });
+    (address, server)
+}
+
+async fn read_http_request(socket: &mut tokio::net::TcpStream) {
+    let mut request = Vec::new();
+    let header_end = loop {
+        let mut buffer = [0_u8; 4096];
+        let bytes = socket.read(&mut buffer).await.expect("read turn request");
+        assert!(bytes > 0, "turn request ended before its headers");
+        request.extend_from_slice(&buffer[..bytes]);
+        if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position + 4;
+        }
+    };
+    let content_length = std::str::from_utf8(&request[..header_end])
+        .expect("turn request headers are UTF-8")
+        .lines()
+        .find_map(|line| {
+            line.split_once(':').and_then(|(name, value)| {
+                name.eq_ignore_ascii_case("content-length").then(|| {
+                    value
+                        .trim()
+                        .parse::<usize>()
+                        .expect("numeric content length")
+                })
+            })
+        })
+        .unwrap_or_default();
+    while request.len() - header_end < content_length {
+        let mut buffer = [0_u8; 4096];
+        let bytes = socket
+            .read(&mut buffer)
+            .await
+            .expect("read turn request body");
+        assert!(bytes > 0, "turn request ended before its body");
+        request.extend_from_slice(&buffer[..bytes]);
+    }
+    assert!(
+        request.starts_with(b"POST /v1/chat/completions "),
+        "real turn used an unexpected endpoint"
+    );
+}
+
+fn chat_delta(text: &str) -> Vec<u8> {
+    format!(
+        "data: {}\n\n",
+        serde_json::json!({
+            "id": "chatcmpl-turn-idle",
+            "object": "chat.completion.chunk",
+            "created": 1_780_000_000,
+            "model": "model",
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": text},
+                "finish_reason": null
+            }]
+        })
+    )
+    .into_bytes()
+}
+
+fn chat_end() -> Vec<u8> {
+    format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        serde_json::json!({
+            "id": "chatcmpl-turn-idle",
+            "object": "chat.completion.chunk",
+            "created": 1_780_000_000,
+            "model": "model",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop"
+            }]
+        })
+    )
+    .into_bytes()
+}
+
+async fn collect_turn_events(
+    mut receiver: tokio::sync::mpsc::Receiver<TurnEvent>,
+) -> Vec<TurnEvent> {
+    let mut events = Vec::new();
+    while let Some(event) = receiver.recv().await {
+        events.push(event);
+    }
+    events
+}
+
+async fn run_compatible_turn(
+    chunks: Vec<(std::time::Duration, Vec<u8>)>,
+    finish: bool,
+    transport_idle: std::time::Duration,
+) -> (
+    Result<oc_engine::r#loop::TurnOutcome, TurnError>,
+    Vec<TurnEvent>,
+    std::time::Duration,
+) {
+    let (address, server) = spawn_turn_response_server(chunks, finish).await;
+    let transport: Arc<dyn Transport> = Arc::new(
+        ReqwestTransport::new(COMPATIBLE_PROVIDER)
+            .with_idle_timeout(StreamIdleTimeout::new(transport_idle)),
+    );
+    let provider_idle = StreamIdleTimeout::new(std::time::Duration::from_secs(2));
+    let mut providers = ProviderRegistry::new();
+    providers.register_fallible(COMPATIBLE_PROVIDER, move |spec| {
+        let provider =
+            oc_provider_compatible::CompatibleProvider::new(spec, Arc::clone(&transport), None)?
+                .with_idle_timeout(provider_idle);
+        Ok(Arc::new(provider) as Arc<dyn Provider>)
+    });
+
+    let spec = Spec::new(COMPATIBLE_PROVIDER)
+        .with_surface(ApiSurface::Chat)
+        .with_base_url(format!("http://{address}/v1"));
+    let resolver = Resolver {
+        requested_agent: "build".to_owned(),
+        system_prompt: String::new(),
+        max_steps: DEFAULT_MAX_STEPS,
+        requested_provider: "provider".to_owned(),
+        requested_model: "model".to_owned(),
+        wire_model: "model".to_owned(),
+        spec,
+    };
+    let mut connection =
+        oc_db::open::open(&oc_paths::DbLocation::Memory).expect("open turn fixture database");
+    oc_db::migration::apply(&mut connection).expect("apply turn fixture schema");
+    let fixture_plan = plan("/workspace", SessionChoice::New);
+    let now = 1_780_000_000_000;
+    ensure_project(&connection, &fixture_plan.project, now).expect("persist fixture project");
+    let session =
+        resolve_session(&mut connection, &fixture_plan, now).expect("create fixture session");
+    persist_user_message(
+        &connection,
+        UserMessageInput {
+            session_id: &session.id,
+            agent: "build",
+            provider_id: "provider",
+            model_id: "model",
+            text: "Show the streamed response.",
+            message_id: None,
+            now,
+        },
+    )
+    .expect("persist fixture prompt");
+    let interrupt = InterruptSignal::new();
+    let dispatcher = ToolRegistryDispatcher::new(
+        Vec::new(),
+        Vec::new(),
+        Arc::new(crate::cmd::tool_runtime::HeadlessApproval),
+        interrupt.clone(),
+        McpToolStatus::Ready,
+    );
+    let (sender, receiver) = oc_engine::r#loop::event_channel();
+
+    let started = std::time::Instant::now();
+    let (outcome, events) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        tokio::join!(
+            run_turn(
+                RunTurnRequest::new(session.id, "turn-idle-timeout", DynamicContext::default(),),
+                TurnContext::new(
+                    &mut connection,
+                    &providers,
+                    &resolver,
+                    &dispatcher,
+                    &interrupt,
+                ),
+                sender,
+            ),
+            collect_turn_events(receiver)
+        )
+    })
+    .await
+    .expect("the real turn must finish inside its one-second test budget");
+    let elapsed = started.elapsed();
+
+    if finish {
+        server.await.expect("progressing fixture completes");
+    } else {
+        server.abort();
+        let _ = server.await;
+    }
+    (outcome, events, elapsed)
+}
+
+fn visible_text(events: &[TurnEvent]) -> String {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            TurnEvent::Provider {
+                event: StreamEvent::TextDelta(text),
+                ..
+            } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_stalled_provider_ends_a_real_turn_with_partial_text_and_a_visible_idle_error() {
+    let idle = std::time::Duration::from_millis(75);
+    let (outcome, events, elapsed) = run_compatible_turn(
+        vec![(std::time::Duration::ZERO, chat_delta("PARTIAL_T166"))],
+        false,
+        idle,
+    )
+    .await;
+
+    assert_eq!(
+        visible_text(&events),
+        "PARTIAL_T166",
+        "text emitted before the stall must remain on the user-visible event surface"
+    );
+    let error = outcome.expect_err("a held-open provider socket must end the turn");
+    let rendered = describe_turn_failure(&error, None);
+    assert!(rendered.contains("idle timeout"), "{rendered}");
+    assert!(
+        rendered.contains(oc_llm::sse::STREAM_IDLE_TIMEOUT_ENV),
+        "{rendered}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "the stalled turn exceeded its user-visible bound: {elapsed:?}"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            TurnEvent::Provider {
+                event: StreamEvent::RetryRollback { .. },
+                ..
+            }
+        )),
+        "the turn retried a partial response instead of failing visibly"
+    );
+}
+
+#[tokio::test]
+async fn a_slow_but_progressing_real_turn_outlives_one_transport_idle_window() {
+    let interval = std::time::Duration::from_millis(60);
+    let idle = std::time::Duration::from_millis(150);
+    let (outcome, events, elapsed) = run_compatible_turn(
+        vec![
+            (std::time::Duration::ZERO, chat_delta("SLOW_")),
+            (interval, chat_delta("BUT_")),
+            (interval, chat_delta("STILL_")),
+            (interval, chat_delta("MOVING")),
+            (std::time::Duration::ZERO, chat_end()),
+        ],
+        true,
+        idle,
+    )
+    .await;
+
+    outcome.expect("progress inside each idle window must complete the real turn");
+    assert_eq!(visible_text(&events), "SLOW_BUT_STILL_MOVING");
+    assert!(
+        elapsed > idle,
+        "the fixture did not outlive one idle window: {elapsed:?} <= {idle:?}"
     );
 }

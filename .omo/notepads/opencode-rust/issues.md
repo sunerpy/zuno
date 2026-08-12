@@ -7361,3 +7361,27 @@ the 501 seam failed `compat_v1_backed_sdk_routes_return_expected_catalog_and_ses
 501 versus 200. Desynchronizing only the frozen `V1_SURFACE` declaration failed
 `compat_v1_declared_backing_matches_what_the_router_answers`, which named the declared
 `not-implemented`/actual 200 mismatch.
+## [2026-08-12] Todo 166 — the transport bound ends a real turn visibly, but durable partial text is still lost
+
+A raw loopback reproduction drove the real `opencode-rust run` binary through its title prelude and an
+actual turn. The turn's provider sent one complete SSE text frame (`PARTIAL_T166`) and then held the
+chunked socket open without FIN. With a one-second injected idle allowance, the process exited 1 in
+1.117 seconds, stdout contained `PARTIAL_T166`, and stderr named both the provider response-stream idle
+timeout and `OPENCODE_STREAM_IDLE_TIMEOUT_SECS`. Production `run_turn` does not invoke the available
+provider-retry helper: it returns the first stream error, so the worst-case idle delay is one timeout
+window plus propagation overhead, not N × timeout.
+
+The new `oc-cli` tests drive `run_turn` over the production `CompatibleProvider` and
+`ReqwestTransport`, with a 75 ms transport-only bound and a deliberately longer outer SSE allowance.
+Removing the transport bound makes the stalled-turn test fail at its one-second wall-clock guard, while
+shrinking the per-chunk allowance makes the slow-progressing real turn fail. The latter normally takes
+longer than one 150 ms idle window while receiving a valid chunk every 60 ms, proving this remains an
+idle deadline rather than a total turn deadline. Existing direct-transport tests remain unchanged.
+
+**New seam above the requested user-visible proof:** the same real-binary reproduction inspected the
+SQLite transcript after exit. The assistant row existed, but it had no text part; only the user prompt
+was in `part`. `run_turn` emits each `TextDelta` immediately, then `let event = next?` returns on the
+transport error before `checkpoint_assistant` can persist the accumulator. Thus the current terminal
+user sees the partial answer, but a later session/export cannot recover it. Todo 166 records rather than
+silently disguises this broader durable-transcript gap; fixing it requires checkpoint-on-stream-error
+semantics in `oc-engine`, not a change to the already-correct timeout values.
