@@ -96,7 +96,7 @@ impl SessionChoice {
 pub(crate) struct TurnOptions {
     /// The working directory, defaulting to the process's.
     pub(crate) directory: Option<PathBuf>,
-    /// `provider/model`, defaulting to the agent's and then to the catalog's first.
+    /// `provider/model`, defaulting through the agent, config, and catalog.
     pub(crate) model: Option<String>,
     /// The agent name, defaulting to [`DEFAULT_AGENT`].
     pub(crate) agent: Option<String>,
@@ -204,7 +204,11 @@ impl TurnPlan {
             .into_iter()
             .find(|entry| entry.name == agent_name)
             .ok_or_else(|| format!("Agent not found: {agent_name}"))?;
-        let requested_model = options.model.as_deref().or(agent.model.as_deref());
+        let requested_model = options
+            .model
+            .as_deref()
+            .or(agent.model.as_deref())
+            .or(config.model.as_deref());
         let (provider_id, model_id, catalog_model) =
             select_model(&catalog, requested_model, loaded.provenance())?;
         if provider_factory_key(&catalog_model.provider_id, &catalog_model.api.npm).is_none() {
