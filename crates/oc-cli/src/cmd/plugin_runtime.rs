@@ -22,14 +22,14 @@ use oc_plugin::{
     AuthCredentialResolver, ChatContext, ChatHeadersOutput, ChatMessageInput, ChatMessageOutput,
     ChatMessagesTransformOutput, ChatParamsOutput, ChatSystemTransformInput,
     ChatSystemTransformOutput, CommandExecuteBeforeInput, CommandExecuteBeforeOutput,
-    CompactionAutocontinueInput, CompactionAutocontinueOutput, HookBus, HookInvocation, HookName,
-    JsHostConfig, JsPluginKind, JsPluginLoad, JsPluginSpec, MessageWithParts, PermissionAskInput,
-    PermissionAskOutput, PermissionStatus, Plugin, PluginTools, ProviderContext,
-    ProviderHookContext, ProviderSmallModelInput, ProviderSmallModelOutput, ProviderSource,
-    SessionCompactingInput, SessionCompactingOutput, ShellEnvInput as PluginShellEnvInput,
-    ShellEnvOutput, TextCompleteInput, TextCompleteOutput, ToolDefinitionInput,
-    ToolExecuteAfterInput, ToolExecuteBeforeInput, ToolExecuteBeforeOutput,
-    load_js_plugins_ordered,
+    CompactionAutocontinueInput, CompactionAutocontinueOutput, ConfigDirectory, HookBus,
+    HookInvocation, HookName, JsHostConfig, JsPluginKind, JsPluginLoad, JsPluginSpec,
+    MessageWithParts, PermissionAskInput, PermissionAskOutput, PermissionStatus, Plugin,
+    PluginOrigin, PluginScope, PluginTools, ProviderContext, ProviderHookContext,
+    ProviderSmallModelInput, ProviderSmallModelOutput, ProviderSource, SessionCompactingInput,
+    SessionCompactingOutput, ShellEnvInput as PluginShellEnvInput, ShellEnvOutput,
+    TextCompleteInput, TextCompleteOutput, ToolDefinitionInput, ToolExecuteAfterInput,
+    ToolExecuteBeforeInput, ToolExecuteBeforeOutput, discover_plugins, load_js_plugins_ordered,
 };
 use oc_tool::{ToolDefinition, ToolOutput};
 use oc_tools::shell::{ShellEnvHook, ShellEnvInput};
@@ -73,11 +73,20 @@ impl PluginRuntime {
         pure: bool,
         target: PluginRuntimeTarget,
     ) -> Option<Self> {
-        let specs = if pure {
+        let mut specs = if pure {
             Vec::new()
         } else {
             configured_plugins(config, target.kind)
         };
+        if !pure {
+            specs.extend(auto_discovered_plugins(
+                directory,
+                worktree,
+                layout,
+                target.kind,
+                target.surface,
+            ));
+        }
         if specs.is_empty() {
             return None;
         }
@@ -667,14 +676,64 @@ fn configured_plugins(config: &oc_config::Config, kind: JsPluginKind) -> Vec<JsP
         .as_deref()
         .unwrap_or_default()
         .iter()
-        .map(|plugin| {
-            let spec = JsPluginSpec::new(plugin.name()).with_kind(kind);
-            match plugin.options() {
-                Some(options) => spec.options(serde_json::Value::Object(options.clone())),
-                None => spec,
-            }
-        })
+        .map(|plugin| js_plugin_spec(plugin, kind))
         .collect()
+}
+
+fn auto_discovered_plugins(
+    directory: &Path,
+    worktree: &Path,
+    layout: &oc_paths::Layout,
+    kind: JsPluginKind,
+    surface: &str,
+) -> Vec<JsPluginSpec> {
+    let directories = layout.config_directories(directory, Some(worktree));
+    let mut specs = Vec::new();
+    for directory in directories {
+        let scope = if directory.starts_with(worktree) {
+            PluginScope::Local
+        } else {
+            PluginScope::Global
+        };
+        let discovered =
+            match discover_plugins(&[], &[ConfigDirectory::new(directory.as_path(), scope)]) {
+                Ok(discovered) => discovered,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        directory = %directory.display(),
+                        surface,
+                        "failed to auto-discover JavaScript plugins"
+                    );
+                    continue;
+                }
+            };
+        for plugin in discovered {
+            let PluginOrigin::AutoDiscovered { source, scope } = &plugin.origin else {
+                continue;
+            };
+            tracing::debug!(
+                plugin = plugin.spec.name(),
+                source = %source.display(),
+                ?scope,
+                surface,
+                "auto-discovered JavaScript plugin"
+            );
+            specs.push(js_plugin_spec(&plugin.spec, kind));
+        }
+    }
+    specs
+}
+
+fn js_plugin_spec(
+    plugin: &oc_config::schema::plugin::PluginSpec,
+    kind: JsPluginKind,
+) -> JsPluginSpec {
+    let spec = JsPluginSpec::new(plugin.name()).with_kind(kind);
+    match plugin.options() {
+        Some(options) => spec.options(serde_json::Value::Object(options.clone())),
+        None => spec,
+    }
 }
 
 struct StoredCredential(Option<oc_auth::Credential>);

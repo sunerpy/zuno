@@ -25,11 +25,14 @@ Declared exactly as upstream declares it, so an existing plugin needs no change:
 
 A bare entry is an npm specifier, a `file://` URL, or a path
 (`oc_config::schema::plugin::PluginSpec`). The two-element form pairs a specifier
-with options handed to the plugin at load time. Beyond the config array, both
-`plugin/` and `plugins/` directories are scanned for `*.ts` and `*.js` in the
-global and project trees, and provenance is retained
-(`oc_plugin::PluginOrigin`) so a diagnostic can name the file that contributed a
-plugin.
+with options handed to the plugin at load time. Beyond the config array, every
+configuration directory is scanned for `plugin/*.{ts,js}` and
+`plugins/*.{ts,js}`. This includes `$XDG_CONFIG_HOME/opencode`, project
+`.opencode` directories, `$HOME/.opencode`, and `OPENCODE_CONFIG_DIR`, in that
+configuration-directory order; files are sorted within `plugin/` and then
+`plugins/`. Provenance is retained (`oc_plugin::PluginOrigin`), successful
+discovery is visible at `DEBUG`, and scan or load failures are warnings that name
+the affected directory or plugin.
 
 An npm plugin whose `engines.opencode` range excludes the running version is
 skipped, upstream's behaviour. That is why `--version` reports the pinned
