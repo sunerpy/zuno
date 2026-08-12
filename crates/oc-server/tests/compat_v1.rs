@@ -261,6 +261,37 @@ fn concrete_uri(path: &str) -> String {
         .replace("{sessionID}", "ses_fixture")
 }
 
+/// Rewrites an `/api` session key into the spelling the pre-`/api` SDK reads.
+///
+/// The only difference the v1 projection is allowed to introduce. `/api` and the
+/// schema this build publishes use camelCase; the v1 SDK reads the ID-suffixed keys
+/// in upstream's legacy capitalisation, so a required key arriving under its v1 name
+/// is still carried and must not be reported missing.
+fn v1_session_key(api_key: &str) -> String {
+    match api_key {
+        "projectId" => "projectID".to_owned(),
+        "parentId" => "parentID".to_owned(),
+        "workspaceId" => "workspaceID".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+/// The `required` set of a `Session` schema, in the v1 SDK's spelling.
+fn required_session_keys(schema: &Value, source: &str) -> BTreeSet<String> {
+    schema["components"]["schemas"]["Session"]["required"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{source} declares a required set for `Session`"))
+        .iter()
+        .map(|key| {
+            v1_session_key(
+                key.as_str().unwrap_or_else(|| {
+                    panic!("{source} lists `Session.required` entries as strings")
+                }),
+            )
+        })
+        .collect()
+}
+
 /// Finds a citation of numbered plan work: `todo`/`todos` followed by a number.
 ///
 /// A plain substring test for "todo" cannot be used, and finding that out is half
@@ -387,6 +418,240 @@ async fn compat_v1_backed_sdk_routes_return_expected_catalog_and_session_shapes(
         .expect("abort adapter responds");
     assert_eq!(aborted.status(), StatusCode::OK);
     assert_eq!(response_json(aborted).await, json!(true));
+}
+
+/// Every v1 session body carries every key the published `Session` schema requires.
+///
+/// The required set is read off two documents rather than typed here: the OpenAPI
+/// this same build serves at `/doc`, fetched through the router, and the committed
+/// oracle capture. Their agreement is asserted first, because that agreement is what
+/// makes a missing key a defect rather than something `docs/divergences.toml` could
+/// declare — a projection cannot be excused for dropping a field that both the
+/// upstream contract and this build's own schema promise. The twelfth review wave
+/// found `slug` missing from all three session-bearing routes while `/doc` listed it
+/// as required, so the build was rejecting its own responses.
+///
+/// Asserting presence key-by-key against a derived set rather than against a literal
+/// list is the point: a required field added to `SessionInfo` later is covered by
+/// this test on the day it is added, without anyone editing it.
+#[tokio::test]
+async fn compat_v1_session_projection_satisfies_the_published_session_schema() {
+    let fixture = adapter_fixture();
+    let app = fixture.app;
+
+    let doc = app
+        .clone()
+        .oneshot(request(Method::GET, "/doc", None))
+        .await
+        .expect("the build serves its own OpenAPI document");
+    assert_eq!(doc.status(), StatusCode::OK);
+    let doc = response_json(doc).await;
+    let published = required_session_keys(&doc, "the OpenAPI document served at /doc");
+
+    let oracle: Value = serde_json::from_str(ORACLE).expect("checked-in oracle OpenAPI parses");
+    let expected = required_session_keys(&oracle, "the checked-in oracle OpenAPI");
+
+    assert_eq!(
+        published, expected,
+        "the schema this build publishes at /doc and the oracle disagree about which \
+         `Session` keys are required; reconcile them before treating either as the contract"
+    );
+    assert!(
+        published.len() >= 5,
+        "only {} required `Session` key(s) were derived, so this assertion would be close to \
+         vacuous; the schemas are not the documents this test believes it read",
+        published.len()
+    );
+
+    let created = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/session?directory=%2Frepo",
+            Some(json!({"title": "schema-conformance probe"})),
+        ))
+        .await
+        .expect("session create adapter responds");
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = response_json(created).await;
+    let created_id = created["id"]
+        .as_str()
+        .expect("the SDK receives a bare created session")
+        .to_owned();
+
+    let listed = app
+        .clone()
+        .oneshot(request(Method::GET, "/session", None))
+        .await
+        .expect("session list adapter responds");
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed = response_json(listed).await;
+    let listed = listed
+        .as_array()
+        .expect("the SDK receives a bare session array")
+        .clone();
+    assert!(
+        !listed.is_empty(),
+        "the session list came back empty, so it would satisfy any schema"
+    );
+
+    let fetched = app
+        .oneshot(request(
+            Method::GET,
+            &format!("/session/{created_id}"),
+            None,
+        ))
+        .await
+        .expect("session get adapter responds");
+    assert_eq!(fetched.status(), StatusCode::OK);
+    let fetched = response_json(fetched).await;
+
+    let mut bodies = vec![
+        ("POST /session".to_owned(), created),
+        (format!("GET /session/{created_id}"), fetched),
+    ];
+    for (index, session) in listed.into_iter().enumerate() {
+        bodies.push((format!("GET /session[{index}]"), session));
+    }
+
+    for (route, session) in &bodies {
+        for key in &published {
+            let value = session.get(key).unwrap_or_else(|| {
+                panic!(
+                    "`{route}` omits `{key}`, which the schema this build publishes at /doc marks \
+                     required; the v1 projection in crates/oc-server/src/compat_v1.rs is dropping \
+                     it. Served keys: {:?}",
+                    session
+                        .as_object()
+                        .map(|body| body.keys().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default()
+                )
+            });
+            assert!(
+                !value.is_null(),
+                "`{route}` serves `{key}` as null, but the published schema requires it and \
+                 declares no nullable type for it"
+            );
+        }
+    }
+}
+
+/// The `/agent` projection's drift from the oracle, and why it is not the `slug` bug.
+///
+/// The twelfth review wave reported `GET /agent` alongside the `Session` `slug`
+/// omission. They are different classes, and this test is the reason that claim is
+/// falsifiable rather than an opinion:
+///
+/// * no oracle-**required** `Agent` key is dropped, so no caller reading a promised
+///   field gets nothing — that is what made `slug` a defect;
+/// * this build publishes no `Agent` schema at `/doc`, so unlike `Session` there is
+///   nothing of its own for the body to contradict. Publish one and this test fails,
+///   which is correct: the body would then have to be checked against it.
+///
+/// What is left is drift in optional keys against a 1.18.12 capture while the port
+/// targets a later release, so it cannot be classified without a capture at the
+/// targeted version. It is recorded as a gap in
+/// `oc_testkit::compat_report::known_gaps` and this test pins the measurement that
+/// recording describes, so the two cannot part company in silence.
+#[tokio::test]
+async fn compat_v1_agent_projection_drift_is_recorded_and_drops_no_required_key() {
+    let fixture = adapter_fixture();
+    let app = fixture.app;
+
+    let doc = app
+        .clone()
+        .oneshot(request(Method::GET, "/doc", None))
+        .await
+        .expect("the build serves its own OpenAPI document");
+    assert_eq!(doc.status(), StatusCode::OK);
+    let doc = response_json(doc).await;
+    assert!(
+        doc["components"]["schemas"]["Agent"].is_null(),
+        "this build now publishes its own `Agent` schema, so the recorded reason that there is \
+         nothing for the /agent body to contradict has expired; check the projection against it \
+         the way compat_v1_session_projection_satisfies_the_published_session_schema does"
+    );
+
+    let agents = app
+        .oneshot(request(Method::GET, "/agent", None))
+        .await
+        .expect("agent adapter responds");
+    assert_eq!(agents.status(), StatusCode::OK);
+    let agents = response_json(agents).await;
+    let served = agents
+        .as_array()
+        .expect("the SDK receives a bare agent array")
+        .first()
+        .and_then(Value::as_object)
+        .expect("at least one agent is projected")
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    let oracle: Value = serde_json::from_str(ORACLE).expect("checked-in oracle OpenAPI parses");
+    let schema = &oracle["components"]["schemas"]["Agent"];
+    let declared = schema["properties"]
+        .as_object()
+        .expect("the oracle declares `Agent` properties")
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let required = schema["required"]
+        .as_array()
+        .expect("the oracle declares a required set for `Agent`")
+        .iter()
+        .map(|key| {
+            key.as_str()
+                .expect("required entries are strings")
+                .to_owned()
+        })
+        .collect::<BTreeSet<_>>();
+    assert!(
+        declared.len() >= 10 && !required.is_empty(),
+        "the oracle `Agent` schema read back as {} propert(ies) and {} required key(s); this is \
+         not the schema this test believes it read",
+        declared.len(),
+        required.len()
+    );
+
+    let missing_required = required
+        .difference(&served)
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    assert!(
+        missing_required.is_empty(),
+        "`GET /agent` drops {missing_required:?}, which the oracle marks required. That is the \
+         same class as the `Session` slug omission and must be carried through in \
+         crates/oc-server/src/compat_v1.rs rather than recorded as a gap"
+    );
+
+    let undeclared = served
+        .difference(&declared)
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let absent = declared
+        .difference(&served)
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        undeclared,
+        vec!["builtIn", "maxSteps", "tools"],
+        "the keys /agent serves beyond the oracle `Agent` schema changed; re-measure before \
+         updating the gap recorded in oc_testkit::compat_report::known_gaps"
+    );
+    assert_eq!(
+        absent,
+        vec![
+            "hidden",
+            "native",
+            "steps",
+            "temperature",
+            "topP",
+            "variant"
+        ],
+        "the optional oracle `Agent` keys /agent omits changed; re-measure before updating the \
+         gap recorded in oc_testkit::compat_report::known_gaps"
+    );
 }
 
 #[tokio::test]
