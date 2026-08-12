@@ -583,7 +583,14 @@ fn every_workspace_member_inherits_the_workspace_lints() {
     assert!(
         offenders.is_empty(),
         "{} crate manifest(s) do not contain `[lints]` + `workspace = true`, so \
-         `unsafe_code = \"forbid\"` does not apply to them:\n  {}",
+         `unsafe_code = \"forbid\"` does not apply to them:\n  {}\n\n\
+         Owner policy: this workspace keeps first-party `unsafe` at zero. Downgrading \
+         the lint for a crate needs the owner's approval AND a comment in that crate's \
+         manifest stating why safe Rust cannot express the operation \u{2014} see the two \
+         existing precedents, `crates/oc-paths/src/lib.rs` (avoiding \
+         `std::env::set_var`) and the `portable-pty` rationale in the root \
+         `Cargo.toml`. Any `unsafe` block that does land must carry the same \
+         justification at its site.",
         offenders.len(),
         offenders.join("\n  ")
     );
