@@ -40,7 +40,7 @@ use oc_engine::r#loop::{
     TurnError, TurnEvent, TurnEventSender, run_turn,
 };
 use oc_engine::prelude::{
-    InternalAgent, InternalProviders, Internals, PreludeContext, PreludeOutcome, compact_manually,
+    InternalAgent, InternalProviders, Internals, PreludeContext, PreludeOutcome, compact_requested,
     run_prelude,
 };
 use oc_error::ProviderError;
@@ -801,7 +801,7 @@ impl TurnHost {
         Ok(())
     }
 
-    pub(crate) async fn compact(&mut self) -> Result<(), String> {
+    pub(crate) async fn compact(&mut self, automatic: bool) -> Result<(), String> {
         let providers = RegistryProviders(&self.providers);
         let noop_hooks = oc_engine::compaction::NoopCompactionHooks;
         let hooks: &dyn oc_engine::compaction::CompactionHooks = self
@@ -817,7 +817,7 @@ impl TurnHost {
             state: &mut self.compaction_state,
             hooks,
         };
-        compact_manually(&self.session_id, &mut context)
+        compact_requested(&self.session_id, &mut context, automatic)
             .await
             .map(|_| ())
             .map_err(|error| format!("manual compaction failed: {error:?}"))

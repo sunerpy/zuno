@@ -352,6 +352,16 @@ pub async fn compact_manually(
     session_id: &str,
     context: &mut PreludeContext<'_>,
 ) -> Result<bool, CompactionSkipped> {
+    compact_requested(session_id, context, false).await
+}
+
+/// Runs an explicitly requested compaction while preserving whether its caller
+/// classified the compaction as automatic.
+pub async fn compact_requested(
+    session_id: &str,
+    context: &mut PreludeContext<'_>,
+    automatic: bool,
+) -> Result<bool, CompactionSkipped> {
     let store_history = hydrate_retained_history(context.connection, session_id)
         .map_err(CompactionSkipped::Database)?;
     compact_history(
@@ -359,7 +369,7 @@ pub async fn compact_manually(
         context,
         store_history,
         CompactionTrigger::Manual,
-        false,
+        automatic,
     )
     .await
     .map(|outcome| outcome.compacted)

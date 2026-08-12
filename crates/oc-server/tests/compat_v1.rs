@@ -1,6 +1,5 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use axum::Router;
@@ -72,7 +71,7 @@ fn seed_session(state: &ApiState) {
 struct CompletingMutationExecutor {
     database: PathBuf,
     prompts: Mutex<Vec<SessionPromptExecution>>,
-    compact_calls: AtomicUsize,
+    compactions: Mutex<Vec<SessionCompactExecution>>,
 }
 
 impl CompletingMutationExecutor {
@@ -80,12 +79,19 @@ impl CompletingMutationExecutor {
         Self {
             database,
             prompts: Mutex::new(Vec::new()),
-            compact_calls: AtomicUsize::new(0),
+            compactions: Mutex::new(Vec::new()),
         }
     }
 
     fn prompts(&self) -> Vec<SessionPromptExecution> {
         self.prompts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn compactions(&self) -> Vec<SessionCompactExecution> {
+        self.compactions
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
@@ -160,10 +166,13 @@ impl SessionMutationExecutor for CompletingMutationExecutor {
 
     fn compact(
         &self,
-        _request: SessionCompactExecution,
+        request: SessionCompactExecution,
         _interrupt: InterruptSignal,
     ) -> SessionMutationFuture {
-        self.compact_calls.fetch_add(1, Ordering::SeqCst);
+        self.compactions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(request);
         Box::pin(async { Ok(()) })
     }
 }
@@ -171,6 +180,7 @@ impl SessionMutationExecutor for CompletingMutationExecutor {
 struct AdapterFixture {
     _temp: TempDir,
     app: Router,
+    state: ApiState,
     services: ServerServices,
     executor: Arc<CompletingMutationExecutor>,
 }
@@ -212,11 +222,14 @@ fn adapter_fixture() -> AdapterFixture {
         ServerConfig::default().with_default_directory(directory.to_string_lossy()),
     )
     .with_services(services.clone())
-    .with_routes(api::router(state.clone()).merge(compat_v1_router(CompatV1State::new(), state)))
+    .with_routes(
+        api::router(state.clone()).merge(compat_v1_router(CompatV1State::new(), state.clone())),
+    )
     .router();
     AdapterFixture {
         _temp: temp,
         app,
+        state,
         services,
         executor,
     }
@@ -345,38 +358,14 @@ async fn compat_v1_backed_sdk_routes_return_expected_catalog_and_session_shapes(
     );
     assert!(sessions.iter().all(|session| session.get("data").is_none()));
 
-    let created = app
-        .clone()
-        .oneshot(request(
-            Method::POST,
-            "/session",
-            Some(json!({
-                "parentID": "ses_fixture",
-                "title": "child from SDK",
-                "agent": "explore",
-                "model": {"providerID": "deepseek", "modelID": "deepseek-chat"}
-            })),
-        ))
-        .await
-        .expect("session create adapter responds");
-    assert_eq!(created.status(), StatusCode::OK);
-    let created = response_json(created).await;
-    let child_id = created["id"]
-        .as_str()
-        .expect("the SDK receives a bare created session")
-        .to_owned();
-    assert_eq!(created["parentID"], "ses_fixture");
-    assert_eq!(created["title"], "child from SDK");
-    assert!(created.get("data").is_none());
-
     let fetched = app
         .clone()
-        .oneshot(request(Method::GET, &format!("/session/{child_id}"), None))
+        .oneshot(request(Method::GET, "/session/ses_fixture", None))
         .await
         .expect("session get adapter responds");
     assert_eq!(fetched.status(), StatusCode::OK);
     let fetched = response_json(fetched).await;
-    assert_eq!(fetched["id"], child_id);
+    assert_eq!(fetched["id"], "ses_fixture");
     assert_eq!(fetched["projectID"], "global");
 
     let messages = app
@@ -398,18 +387,137 @@ async fn compat_v1_backed_sdk_routes_return_expected_catalog_and_session_shapes(
         .expect("abort adapter responds");
     assert_eq!(aborted.status(), StatusCode::OK);
     assert_eq!(response_json(aborted).await, json!(true));
+}
 
-    let summarized = app
+#[tokio::test]
+async fn compat_v1_omo_session_create_persists_and_consumes_the_recorded_model_shape() {
+    let fixture = adapter_fixture();
+    let app = fixture.app;
+
+    let created = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/session?directory=%2Frepo",
+            Some(json!({
+                "parentID": "ses_fixture",
+                "title": "recorded OMO child",
+                "permission": {"question": "deny"},
+                "model": {
+                    "id": "deepseek-chat",
+                    "providerID": "deepseek",
+                    "variant": "fast"
+                }
+            })),
+        ))
+        .await
+        .expect("session create adapter responds");
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = response_json(created).await;
+    let child_id = created["id"]
+        .as_str()
+        .expect("the SDK receives a bare created session")
+        .to_owned();
+    assert_eq!(created["parentID"], "ses_fixture");
+    assert_eq!(created["title"], "recorded OMO child");
+    assert!(created.get("data").is_none());
+
+    let persisted = fixture
+        .state
+        .sessions()
+        .get(&child_id)
+        .expect("the created session remains readable");
+    assert_eq!(
+        persisted.model.as_deref(),
+        Some(r#"{"id":"deepseek-chat","providerID":"deepseek","variant":"fast"}"#),
+        "session.model must retain the installed plugin's session spelling"
+    );
+
+    let prompted = app
+        .oneshot(request(
+            Method::POST,
+            &format!("/session/{child_id}/prompt_async"),
+            Some(json!({
+                "messageID": "msg_recorded_omo_child",
+                "parts": [{"type": "text", "text": "consume persisted model"}]
+            })),
+        ))
+        .await
+        .expect("the created session accepts a prompt");
+    assert_eq!(prompted.status(), StatusCode::NO_CONTENT);
+    fixture.services.runs.wait_until_idle(&child_id).await;
+    let prompts = fixture.executor.prompts();
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(
+        prompts[0].model.as_ref(),
+        Some(&oc_server::SessionModelSelection {
+            provider_id: "deepseek".to_owned(),
+            model_id: "deepseek-chat".to_owned(),
+        }),
+        "the production session-row decoder must consume the persisted model"
+    );
+}
+
+#[tokio::test]
+async fn compat_v1_omo_summarize_uses_the_recorded_body_model() {
+    let fixture = adapter_fixture();
+    let summarized = fixture
+        .app
         .oneshot(request(
             Method::POST,
             "/session/ses_fixture/summarize",
-            Some(json!({"providerID": "deepseek", "modelID": "deepseek-chat"})),
+            Some(json!({
+                "providerID": "deepseek",
+                "modelID": "deepseek-chat",
+                "auto": true
+            })),
         ))
         .await
         .expect("summarize adapter responds");
     assert_eq!(summarized.status(), StatusCode::OK);
     assert_eq!(response_json(summarized).await, json!(true));
-    assert_eq!(fixture.executor.compact_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture.executor.compactions(),
+        vec![SessionCompactExecution {
+            session_id: "ses_fixture".to_owned(),
+            directory: fixture.state.directory().into(),
+            agent: None,
+            model: Some(oc_server::SessionModelSelection {
+                provider_id: "deepseek".to_owned(),
+                model_id: "deepseek-chat".to_owned(),
+            }),
+            automatic: true,
+        }],
+        "summarize must use the body-selected model and preserve its auto flag"
+    );
+}
+
+#[tokio::test]
+async fn compat_v1_antigravity_recovery_tool_result_reaches_the_prompt_executor() {
+    let fixture = adapter_fixture();
+    let response = fixture
+        .app
+        .oneshot(request(
+            Method::POST,
+            "/session/ses_fixture/message",
+            Some(json!({
+                "parts": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call_recorded_antigravity",
+                    "content": "Operation cancelled by user (ESC pressed)"
+                }]
+            })),
+        ))
+        .await
+        .expect("the recorded recovery prompt reaches the v1 route");
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = response_json(response).await;
+    assert_eq!(response["info"]["role"], "assistant");
+    assert_eq!(
+        fixture.executor.prompts()[0].prompt,
+        "Operation cancelled by user (ESC pressed)",
+        "the recovery content must reach the real prompt executor"
+    );
 }
 
 #[tokio::test]

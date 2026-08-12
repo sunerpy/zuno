@@ -62,6 +62,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::ServerServices;
+use crate::SessionModelSelection;
 use crate::api::catalog::AgentInfo;
 use crate::api::error::ApiError;
 use crate::api::provider::{ModelInfo, ProviderInfo};
@@ -902,7 +903,7 @@ struct V1SessionCreateBody {
     parent_id: Option<String>,
     title: Option<String>,
     agent: Option<String>,
-    model: Option<Value>,
+    model: Option<ModelRefBody>,
     metadata: Option<Value>,
     permission: Option<Value>,
     #[serde(rename = "workspaceID")]
@@ -926,6 +927,16 @@ struct V1ModelRef {
     provider_id: String,
     #[serde(rename = "modelID")]
     model_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct V1SessionSummarizeBody {
+    #[serde(rename = "providerID")]
+    provider_id: String,
+    #[serde(rename = "modelID")]
+    model_id: String,
+    #[serde(default)]
+    auto: bool,
 }
 
 async fn v1_agents(
@@ -990,6 +1001,11 @@ async fn v1_session_create(
     Query(query): Query<V1DirectoryQuery>,
     Json(body): Json<V1SessionCreateBody>,
 ) -> Result<Json<Value>, ApiError> {
+    let model = body
+        .model
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|error| ApiError::MutationFailed(error.to_string()))?;
     let response = api::session::create_session(
         &api_state,
         SessionCreateInput {
@@ -999,7 +1015,7 @@ async fn v1_session_create(
             parent_id: body.parent_id,
             workspace_id: body.workspace_id,
             title: body.title,
-            model: body.model,
+            model,
             metadata: body.metadata,
             permission: body.permission,
         },
@@ -1029,9 +1045,19 @@ async fn v1_session_summarize(
     Extension(api_state): Extension<ApiState>,
     Extension(services): Extension<ServerServices>,
     Path(session_id): Path<String>,
-    Json(_body): Json<Value>,
+    Json(body): Json<V1SessionSummarizeBody>,
 ) -> Result<Json<bool>, ApiError> {
-    api::session::compact(State(api_state), Extension(services), Path(session_id)).await?;
+    api::session::compact_session(
+        api_state,
+        services,
+        session_id,
+        Some(SessionModelSelection {
+            provider_id: body.provider_id,
+            model_id: body.model_id,
+        }),
+        body.auto,
+    )
+    .await?;
     Ok(Json(true))
 }
 
@@ -1132,6 +1158,23 @@ fn prompt_body(body: V1PromptBody) -> Result<PromptBody, ApiError> {
                             "subtask parts require a string `prompt`",
                         ))?;
                 text.push(value.to_owned());
+            }
+            Some("tool_result") => {
+                part.get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .ok_or(ApiError::InvalidRequest(
+                        "tool_result parts require a string `tool_use_id`",
+                    ))?;
+                let content =
+                    part.get("content")
+                        .and_then(Value::as_str)
+                        .ok_or(ApiError::InvalidRequest(
+                            "tool_result parts require string `content`",
+                        ))?;
+                // The core turn loop repairs unmatched stored tool calls before
+                // hydrating history. Re-submit the plugin's cancellation text as
+                // the user prompt that starts that repaired turn.
+                text.push(content.to_owned());
             }
             _ => return Err(ApiError::InvalidRequest("unsupported v1 prompt part type")),
         }

@@ -7409,3 +7409,23 @@ advertised `chat` beats the Responses-friendly `gpt-5` heuristic. The same hook 
 malformed sibling without losing the provider. Bypassing only the boundary normalizer made both named
 tests fail with `Model not found`; restoring it returned both to green. Complete evidence:
 `.omo/evidence/task-167-opencode-rust.txt`.
+
+## [2026-08-12] Todo 169 — v1 served coverage now exercises recorded plugin bodies
+
+F2-B6 was three input-selection failures under green route tests. Antigravity's installed recovery
+code sends `{type:"tool_result",tool_use_id,content}` and catches every rejection as `false`; the v1
+adapter rejected it with 400 because its prompt-part match omitted that variant. OMO's installed
+summarize calls send `{providerID,modelID,auto?}`, but the adapter discarded the body and compacted
+with `session.model`. OMO session creation already sent the correct session-row shape
+`{id,providerID,variant?}` through the adapter, while the test used the incompatible message spelling
+`modelID` and never invoked the strict row decoder.
+
+The prompt adapter now validates and maps recorded recovery content into the recovery turn; the turn
+loop's existing missing-tool-output repair remains the authority for pairing stored tool calls. The
+summarize adapter now applies the body-selected model and carries `auto` through the real compact
+execution into the compaction marker. Session create now uses the existing typed `ModelRefBody` and a
+route test consumes the persisted row through the unchanged strict decoder. Three named tests use the
+exact installed shapes, and three independent mutants—dropping create's model, removing summarize's
+extractor/application, and removing `tool_result`—all failed their corresponding named test. All three
+routes remain honestly served; none required demotion. Complete evidence:
+`.omo/evidence/task-169-opencode-rust.txt`.
