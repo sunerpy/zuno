@@ -84,9 +84,9 @@ loses and, where one exists, the test that fails if the gap closes or goes stale
 
 ### v1-surface-unbacked
 
-**Surface.** 19 of the 20 measured pre-/api (v1) routes the installed plugins actually call
+**Surface.** 9 of the 20 measured pre-/api (v1) routes the installed plugins actually call
 
-**What is missing.** The pre-/api surface exists because the published SDK sends unprefixed paths, so every resident plugin talks to it. It registers 20 routes, each with a recorded plugin callsite, but only 1 does real local work: POST /tui/show-toast, and even that is a recording sink rather than a display — no server entry point attaches a forwarder (crates/oc-server/src/main.rs, crates/oc-cli/src/cmd/serve.rs both build a bare CompatV1State::new). The other 19 answer a structured 501 not_implemented. 10 of those name a served /api route that provides the same capability, taken from the oracle document which declares both surfaces, and their 501 bodies tell the caller to use it: app.agents to GET /api/agent, provider.list to GET /api/provider, session.list and session.create to GET and POST /api/session, session.get to GET /api/session/{sessionID}, session.abort to POST /api/session/{sessionID}/interrupt, session.summarize to POST /api/session/{sessionID}/compact, session.messages to GET /api/session/{sessionID}/message, and session.prompt and session.promptAsync to POST /api/session/{sessionID}/prompt. The remaining 9 have no served /api spelling at all — auth.set, app.log, config.get, the two provider.oauth calls, session.status, session.update, session.children and session.todo — so a plugin that needs one has no working call today; concretely, the installed auth plugins reach a registered route for every request they issue and can deliver toasts, but cannot authenticate through this surface. This is a GAP and not a declared divergence because nothing chose it and no plan todo owns it, and docs/divergences.toml:11-14 forbids recording an unimplemented surface as a decision. Witnessed by crates/oc-server/tests/compat_v1.rs::compat_v1_declared_backing_matches_what_the_router_answers, which drives every route and fails if a declared status disagrees with what the router answers.
+**What is missing.** The pre-/api surface exists because the published SDK sends unprefixed paths, so every resident plugin talks to it. It registers 20 routes, each with a recorded plugin callsite, and 11 do real local work. Ten adapters reuse the corresponding /api implementations for app.agents, provider.list, session.list, session.create, session.get, session.abort, session.summarize, session.messages, session.prompt and session.promptAsync. POST /tui/show-toast remains a recording sink rather than a display — no server entry point attaches a forwarder (crates/oc-server/src/main.rs and crates/oc-cli/src/cmd/serve.rs both build a bare CompatV1State::new). 9 of the 20 answer `501 not_implemented`. 0 of those 9 name a served /api alternative; the other 9 have no served /api spelling at all — auth.set, app.log, config.get, the two provider.oauth calls, session.status, session.update, session.children and session.todo — so a plugin that needs one has no working call today; concretely, the installed auth plugins reach a registered route for every request they issue and can deliver toasts, but cannot authenticate through this surface. This is a GAP and not a declared divergence because nothing chose it, and docs/divergences.toml:11-14 forbids recording an unimplemented surface as a decision. Witnessed by crates/oc-server/tests/compat_v1.rs::compat_v1_declared_backing_matches_what_the_router_answers, which drives every route and fails if a declared status disagrees with what the router answers.
 <!-- generated:END known-gaps -->
 
 ## Cross-session resident memory
@@ -275,23 +275,23 @@ route table the server serves.
 |---|---|---|---|---|
 | PUT | `/auth/{providerID}` | `client.auth.set` | not-implemented | none served here |
 | POST | `/log` | `client.app.log` | not-implemented | none served here |
-| GET | `/agent` | `client.app.agents` | not-implemented | `GET /api/agent` |
+| GET | `/agent` | `client.app.agents` | api-adapter:agent | `GET /api/agent` |
 | GET | `/config` | `client.config.get` | not-implemented | none served here |
-| GET | `/provider` | `client.provider.list` | not-implemented | `GET /api/provider` |
+| GET | `/provider` | `client.provider.list` | api-adapter:provider | `GET /api/provider` |
 | POST | `/provider/{providerID}/oauth/authorize` | `client.provider.oauth.authorize` | not-implemented | none served here |
 | POST | `/provider/{providerID}/oauth/callback` | `client.provider.oauth.callback` | not-implemented | none served here |
-| GET | `/session` | `client.session.list` | not-implemented | `GET /api/session` |
-| POST | `/session` | `client.session.create` | not-implemented | `POST /api/session` |
+| GET | `/session` | `client.session.list` | api-adapter:session-list | `GET /api/session` |
+| POST | `/session` | `client.session.create` | api-adapter:session-create | `POST /api/session` |
 | GET | `/session/status` | `client.session.status` | not-implemented | none served here |
-| GET | `/session/{sessionID}` | `client.session.get` | not-implemented | `GET /api/session/{sessionID}` |
+| GET | `/session/{sessionID}` | `client.session.get` | api-adapter:session-get | `GET /api/session/{sessionID}` |
 | PATCH | `/session/{sessionID}` | `client.session.update` | not-implemented | none served here |
 | GET | `/session/{sessionID}/children` | `client.session.children` | not-implemented | none served here |
 | GET | `/session/{sessionID}/todo` | `client.session.todo` | not-implemented | none served here |
-| POST | `/session/{sessionID}/abort` | `client.session.abort` | not-implemented | `POST /api/session/{sessionID}/interrupt` |
-| POST | `/session/{sessionID}/summarize` | `client.session.summarize` | not-implemented | `POST /api/session/{sessionID}/compact` |
-| GET | `/session/{sessionID}/message` | `client.session.messages` | not-implemented | `GET /api/session/{sessionID}/message` |
-| POST | `/session/{sessionID}/message` | `client.session.prompt` | not-implemented | `POST /api/session/{sessionID}/prompt` |
-| POST | `/session/{sessionID}/prompt_async` | `client.session.promptAsync` | not-implemented | `POST /api/session/{sessionID}/prompt` |
+| POST | `/session/{sessionID}/abort` | `client.session.abort` | api-adapter:session-abort | `POST /api/session/{sessionID}/interrupt` |
+| POST | `/session/{sessionID}/summarize` | `client.session.summarize` | api-adapter:session-summarize | `POST /api/session/{sessionID}/compact` |
+| GET | `/session/{sessionID}/message` | `client.session.messages` | api-adapter:session-messages | `GET /api/session/{sessionID}/message` |
+| POST | `/session/{sessionID}/message` | `client.session.prompt` | api-adapter:session-prompt | `POST /api/session/{sessionID}/prompt` |
+| POST | `/session/{sessionID}/prompt_async` | `client.session.promptAsync` | api-adapter:session-prompt-async | `POST /api/session/{sessionID}/prompt` |
 | POST | `/tui/show-toast` | `client.tui.showToast` | local-toast-sink | none served here |
 <!-- generated:END v1-routes -->
 

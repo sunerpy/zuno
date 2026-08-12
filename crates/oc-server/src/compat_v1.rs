@@ -53,13 +53,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use axum::Json;
-use axum::extract::{OriginalUri, State};
+use axum::extract::{Extension, OriginalUri, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, patch, post, put};
 use axum::{Router, routing::MethodRouter};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
+
+use crate::ServerServices;
+use crate::api::catalog::AgentInfo;
+use crate::api::error::ApiError;
+use crate::api::provider::{ModelInfo, ProviderInfo};
+use crate::api::session::{
+    MessagesQuery, ModelRefBody, PromptBody, PromptInputBody, SessionCreateInput, SessionInfo,
+    SessionListQuery,
+};
+use crate::api::{self, ApiState};
 
 /// Diagnostics for the v1 surface. Outside [`V1_PREFIXES`], so it shadows nothing.
 pub const V1_DIAGNOSTICS_PATH: &str = "/compat/v1/diagnostics";
@@ -157,6 +167,7 @@ impl fmt::Display for V1Method {
 /// means: there is no way to mark a route served without saying what serves it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum V1Backing {
+    ApiAdapter(V1Adapter),
     /// Served locally by [`show_toast`], which records into the toast sink.
     LocalToastSink,
     /// Registered and answering a structured `501`. No local backend.
@@ -168,6 +179,7 @@ impl V1Backing {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::ApiAdapter(adapter) => adapter.as_str(),
             Self::LocalToastSink => "local-toast-sink",
             Self::NotImplemented => "not-implemented",
         }
@@ -176,7 +188,39 @@ impl V1Backing {
     /// Whether a request to this route is answered by real local work.
     #[must_use]
     pub const fn is_served(self) -> bool {
-        matches!(self, Self::LocalToastSink)
+        !matches!(self, Self::NotImplemented)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V1Adapter {
+    Agents,
+    Providers,
+    SessionList,
+    SessionCreate,
+    SessionGet,
+    SessionAbort,
+    SessionSummarize,
+    SessionMessages,
+    SessionPrompt,
+    SessionPromptAsync,
+}
+
+impl V1Adapter {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Agents => "api-adapter:agent",
+            Self::Providers => "api-adapter:provider",
+            Self::SessionList => "api-adapter:session-list",
+            Self::SessionCreate => "api-adapter:session-create",
+            Self::SessionGet => "api-adapter:session-get",
+            Self::SessionAbort => "api-adapter:session-abort",
+            Self::SessionSummarize => "api-adapter:session-summarize",
+            Self::SessionMessages => "api-adapter:session-messages",
+            Self::SessionPrompt => "api-adapter:session-prompt",
+            Self::SessionPromptAsync => "api-adapter:session-prompt-async",
+        }
     }
 }
 
@@ -251,7 +295,7 @@ pub const V1_SURFACE: &[V1Route] = &[
         sdk_method: "client.app.agents",
         plugins: &[OMO],
         callsites: &["oh-my-openagent: dist/index.js:135963"],
-        backing: V1Backing::NotImplemented,
+        backing: V1Backing::ApiAdapter(V1Adapter::Agents),
         api_alternative: Some("GET /api/agent"),
     },
     V1Route {
@@ -269,7 +313,7 @@ pub const V1_SURFACE: &[V1Route] = &[
         sdk_method: "client.provider.list",
         plugins: &[OMO],
         callsites: &["oh-my-openagent: dist/index.js:26958,84674"],
-        backing: V1Backing::NotImplemented,
+        backing: V1Backing::ApiAdapter(V1Adapter::Providers),
         api_alternative: Some("GET /api/provider"),
     },
     V1Route {
@@ -296,7 +340,7 @@ pub const V1_SURFACE: &[V1Route] = &[
         sdk_method: "client.session.list",
         plugins: &[OMO],
         callsites: &["oh-my-openagent: dist/index.js:128645,128654"],
-        backing: V1Backing::NotImplemented,
+        backing: V1Backing::ApiAdapter(V1Adapter::SessionList),
         api_alternative: Some("GET /api/session"),
     },
     V1Route {
@@ -305,7 +349,7 @@ pub const V1_SURFACE: &[V1Route] = &[
         sdk_method: "client.session.create",
         plugins: &[OMO],
         callsites: &["oh-my-openagent: dist/index.js:131233,132341,135030,143073"],
-        backing: V1Backing::NotImplemented,
+        backing: V1Backing::ApiAdapter(V1Adapter::SessionCreate),
         api_alternative: Some("POST /api/session"),
     },
     V1Route {
@@ -323,7 +367,7 @@ pub const V1_SURFACE: &[V1Route] = &[
         sdk_method: "client.session.get",
         plugins: &[OMO],
         callsites: &["oh-my-openagent: dist/index.js:90497,96292,96646,116276,131215"],
-        backing: V1Backing::NotImplemented,
+        backing: V1Backing::ApiAdapter(V1Adapter::SessionGet),
         api_alternative: Some("GET /api/session/{sessionID}"),
     },
     V1Route {
@@ -367,7 +411,7 @@ pub const V1_SURFACE: &[V1Route] = &[
             "opencode-antigravity-auth: dist/src/plugin/recovery.js:293",
             "oh-my-openagent: dist/index.js:106808,120119,131421",
         ],
-        backing: V1Backing::NotImplemented,
+        backing: V1Backing::ApiAdapter(V1Adapter::SessionAbort),
         api_alternative: Some("POST /api/session/{sessionID}/interrupt"),
     },
     V1Route {
@@ -376,7 +420,7 @@ pub const V1_SURFACE: &[V1Route] = &[
         sdk_method: "client.session.summarize",
         plugins: &[OMO],
         callsites: &["oh-my-openagent: dist/index.js:94259,119806,119913"],
-        backing: V1Backing::NotImplemented,
+        backing: V1Backing::ApiAdapter(V1Adapter::SessionSummarize),
         api_alternative: Some("POST /api/session/{sessionID}/compact"),
     },
     V1Route {
@@ -388,7 +432,7 @@ pub const V1_SURFACE: &[V1Route] = &[
             "opencode-antigravity-auth: dist/src/plugin/recovery.js:295",
             "oh-my-openagent: dist/index.js:28404,85143,87664",
         ],
-        backing: V1Backing::NotImplemented,
+        backing: V1Backing::ApiAdapter(V1Adapter::SessionMessages),
         api_alternative: Some("GET /api/session/{sessionID}/message"),
     },
     V1Route {
@@ -400,7 +444,7 @@ pub const V1_SURFACE: &[V1Route] = &[
             "opencode-antigravity-auth: dist/src/plugin/recovery.js:126,198",
             "opencode-antigravity-auth: dist/src/plugin.js:1077",
         ],
-        backing: V1Backing::NotImplemented,
+        backing: V1Backing::ApiAdapter(V1Adapter::SessionPrompt),
         api_alternative: Some("POST /api/session/{sessionID}/prompt"),
     },
     V1Route {
@@ -409,7 +453,7 @@ pub const V1_SURFACE: &[V1Route] = &[
         sdk_method: "client.session.promptAsync",
         plugins: &[OMO],
         callsites: &["oh-my-openagent: dist/index.js:138443"],
-        backing: V1Backing::NotImplemented,
+        backing: V1Backing::ApiAdapter(V1Adapter::SessionPromptAsync),
         api_alternative: Some("POST /api/session/{sessionID}/prompt"),
     },
     V1Route {
@@ -425,6 +469,60 @@ pub const V1_SURFACE: &[V1Route] = &[
         backing: V1Backing::LocalToastSink,
         api_alternative: None,
     },
+];
+
+const V1_BACKENDS: &[(V1Method, &str, V1Backing)] = &[
+    (
+        V1Method::Get,
+        "/agent",
+        V1Backing::ApiAdapter(V1Adapter::Agents),
+    ),
+    (
+        V1Method::Get,
+        "/provider",
+        V1Backing::ApiAdapter(V1Adapter::Providers),
+    ),
+    (
+        V1Method::Get,
+        "/session",
+        V1Backing::ApiAdapter(V1Adapter::SessionList),
+    ),
+    (
+        V1Method::Post,
+        "/session",
+        V1Backing::ApiAdapter(V1Adapter::SessionCreate),
+    ),
+    (
+        V1Method::Get,
+        "/session/{sessionID}",
+        V1Backing::ApiAdapter(V1Adapter::SessionGet),
+    ),
+    (
+        V1Method::Post,
+        "/session/{sessionID}/abort",
+        V1Backing::ApiAdapter(V1Adapter::SessionAbort),
+    ),
+    (
+        V1Method::Post,
+        "/session/{sessionID}/summarize",
+        V1Backing::ApiAdapter(V1Adapter::SessionSummarize),
+    ),
+    (
+        V1Method::Get,
+        "/session/{sessionID}/message",
+        V1Backing::ApiAdapter(V1Adapter::SessionMessages),
+    ),
+    (
+        V1Method::Post,
+        "/session/{sessionID}/message",
+        V1Backing::ApiAdapter(V1Adapter::SessionPrompt),
+    ),
+    (
+        V1Method::Post,
+        "/session/{sessionID}/prompt_async",
+        V1Backing::ApiAdapter(V1Adapter::SessionPromptAsync),
+    ),
+    (V1Method::Post, TOAST_PATH, V1Backing::LocalToastSink),
 ];
 
 /// The one route in [`V1_SURFACE`] with a real local backend.
@@ -485,19 +583,26 @@ impl V1Coverage {
 /// Counts [`V1_SURFACE`]'s real coverage.
 #[must_use]
 pub fn v1_coverage() -> V1Coverage {
-    let unbacked = V1_SURFACE
-        .iter()
-        .filter(|route| !route.backing.is_served())
-        .collect::<Vec<_>>();
+    let served = V1_BACKENDS.len();
+    let unbacked = V1_SURFACE.len() - served;
     V1Coverage {
         measured: V1_SURFACE.len(),
-        served: V1_SURFACE.len() - unbacked.len(),
-        unbacked: unbacked.len(),
-        redirected: unbacked
+        served,
+        unbacked,
+        redirected: V1_SURFACE
             .iter()
-            .filter(|route| route.api_alternative.is_some())
+            .filter(|route| {
+                !registered_backing(route).is_served() && route.api_alternative.is_some()
+            })
             .count(),
     }
+}
+
+fn registered_backing(route: &V1Route) -> V1Backing {
+    V1_BACKENDS
+        .iter()
+        .find(|(method, path, _)| *method == route.method && *path == route.path)
+        .map_or(V1Backing::NotImplemented, |(_, _, backing)| *backing)
 }
 
 /// A toast a plugin asked to display.
@@ -702,15 +807,15 @@ impl Default for CompatV1State {
 /// One nest per prefix, each carrying its own fallback. Verbs sharing a path are
 /// merged into a single [`MethodRouter`] first, because registering the same path
 /// twice is a matcher conflict rather than an addition.
-pub fn compat_v1_router(state: CompatV1State) -> Router {
+pub fn compat_v1_router(state: CompatV1State, api_state: ApiState) -> Router {
     let mut grouped: BTreeMap<&str, BTreeMap<String, MethodRouter<CompatV1State>>> =
         BTreeMap::new();
     for route in V1_SURFACE {
         let (prefix, nested_path) = split_prefix(route.path);
-        let handler: MethodRouter<CompatV1State> = if route.path == TOAST_PATH {
-            post(show_toast)
-        } else {
-            seam_handler(route)
+        let handler: MethodRouter<CompatV1State> = match registered_backing(route) {
+            V1Backing::ApiAdapter(adapter) => adapter_handler(adapter),
+            V1Backing::LocalToastSink => post(show_toast),
+            V1Backing::NotImplemented => seam_handler(route),
         };
         let paths = grouped.entry(prefix).or_default();
         match paths.remove(&nested_path) {
@@ -746,6 +851,7 @@ pub fn compat_v1_router(state: CompatV1State) -> Router {
 
     router
         .route(V1_DIAGNOSTICS_PATH, get(diagnostics))
+        .layer(Extension(api_state))
         .with_state(state)
 }
 
@@ -767,6 +873,372 @@ fn seam_handler(route: &'static V1Route) -> MethodRouter<CompatV1State> {
         V1Method::Put => put(respond),
         V1Method::Patch => patch(respond),
     }
+}
+
+fn adapter_handler(adapter: V1Adapter) -> MethodRouter<CompatV1State> {
+    match adapter {
+        V1Adapter::Agents => get(v1_agents),
+        V1Adapter::Providers => get(v1_providers),
+        V1Adapter::SessionList => get(v1_session_list),
+        V1Adapter::SessionCreate => post(v1_session_create),
+        V1Adapter::SessionGet => get(v1_session_get),
+        V1Adapter::SessionAbort => post(v1_session_abort),
+        V1Adapter::SessionSummarize => post(v1_session_summarize),
+        V1Adapter::SessionMessages => get(v1_session_messages),
+        V1Adapter::SessionPrompt => post(v1_session_prompt),
+        V1Adapter::SessionPromptAsync => post(v1_session_prompt_async),
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct V1DirectoryQuery {
+    directory: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct V1SessionCreateBody {
+    #[serde(rename = "parentID")]
+    parent_id: Option<String>,
+    title: Option<String>,
+    agent: Option<String>,
+    model: Option<Value>,
+    metadata: Option<Value>,
+    permission: Option<Value>,
+    #[serde(rename = "workspaceID")]
+    workspace_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct V1PromptBody {
+    #[serde(rename = "messageID")]
+    message_id: Option<String>,
+    model: Option<V1ModelRef>,
+    agent: Option<String>,
+    #[serde(rename = "noReply")]
+    no_reply: Option<bool>,
+    parts: Vec<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct V1ModelRef {
+    #[serde(rename = "providerID")]
+    provider_id: String,
+    #[serde(rename = "modelID")]
+    model_id: String,
+}
+
+async fn v1_agents(
+    Extension(api_state): Extension<ApiState>,
+) -> Result<Json<Vec<Value>>, ApiError> {
+    let response = api::catalog::agents(State(api_state)).await?;
+    Ok(Json(response.data.into_iter().map(v1_agent).collect()))
+}
+
+async fn v1_providers(Extension(api_state): Extension<ApiState>) -> Result<Json<Value>, ApiError> {
+    let providers = api::provider::providers(State(api_state.clone())).await?;
+    let models = api::provider::models(State(api_state)).await?;
+    let connected = providers
+        .data
+        .iter()
+        .map(|provider| provider.id.clone())
+        .collect::<Vec<_>>();
+    let mut models_by_provider = BTreeMap::<String, Vec<ModelInfo>>::new();
+    for model in models.data {
+        models_by_provider
+            .entry(model.provider_id.clone())
+            .or_default()
+            .push(model);
+    }
+    let all = providers
+        .data
+        .into_iter()
+        .map(|provider| {
+            let models = models_by_provider.remove(&provider.id).unwrap_or_default();
+            v1_provider(provider, models)
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(
+        json!({"all": all, "default": {}, "connected": connected}),
+    ))
+}
+
+async fn v1_session_list(
+    Extension(api_state): Extension<ApiState>,
+    Query(query): Query<V1DirectoryQuery>,
+) -> Result<Json<Vec<Value>>, ApiError> {
+    let response = api::session::list(
+        State(api_state),
+        Query(SessionListQuery {
+            workspace: None,
+            limit: query.limit.map(|limit| limit.min(u32::MAX as usize) as u32),
+            order: None,
+            search: None,
+            directory: query.directory,
+            project: None,
+            subpath: None,
+            cursor: None,
+            sort: None,
+        }),
+    )
+    .await?;
+    Ok(Json(response.0.data.into_iter().map(v1_session).collect()))
+}
+
+async fn v1_session_create(
+    Extension(api_state): Extension<ApiState>,
+    Query(query): Query<V1DirectoryQuery>,
+    Json(body): Json<V1SessionCreateBody>,
+) -> Result<Json<Value>, ApiError> {
+    let response = api::session::create_session(
+        &api_state,
+        SessionCreateInput {
+            id: None,
+            agent: body.agent,
+            directory: query.directory,
+            parent_id: body.parent_id,
+            workspace_id: body.workspace_id,
+            title: body.title,
+            model: body.model,
+            metadata: body.metadata,
+            permission: body.permission,
+        },
+    )
+    .await?;
+    Ok(Json(v1_session(response.0.data)))
+}
+
+async fn v1_session_get(
+    Extension(api_state): Extension<ApiState>,
+    Path(session_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let response = api::session::get(State(api_state), Path(session_id)).await?;
+    Ok(Json(v1_session(response.0.data)))
+}
+
+async fn v1_session_abort(
+    Extension(api_state): Extension<ApiState>,
+    Extension(services): Extension<ServerServices>,
+    Path(session_id): Path<String>,
+) -> Result<Json<bool>, ApiError> {
+    api::session::interrupt(State(api_state), Extension(services), Path(session_id)).await?;
+    Ok(Json(true))
+}
+
+async fn v1_session_summarize(
+    Extension(api_state): Extension<ApiState>,
+    Extension(services): Extension<ServerServices>,
+    Path(session_id): Path<String>,
+    Json(_body): Json<Value>,
+) -> Result<Json<bool>, ApiError> {
+    api::session::compact(State(api_state), Extension(services), Path(session_id)).await?;
+    Ok(Json(true))
+}
+
+async fn v1_session_messages(
+    Extension(api_state): Extension<ApiState>,
+    Path(session_id): Path<String>,
+    Query(query): Query<V1DirectoryQuery>,
+) -> Result<Json<Vec<Value>>, ApiError> {
+    let response = api::session::messages(
+        State(api_state),
+        Path(session_id),
+        Query(MessagesQuery {
+            limit: query.limit,
+            order: None,
+            cursor: None,
+        }),
+    )
+    .await?;
+    Ok(Json(response.0.data))
+}
+
+async fn v1_session_prompt(
+    Extension(api_state): Extension<ApiState>,
+    Extension(services): Extension<ServerServices>,
+    Path(session_id): Path<String>,
+    Json(body): Json<V1PromptBody>,
+) -> Result<Json<Value>, ApiError> {
+    let admitted = api::session::prompt(
+        State(api_state.clone()),
+        Extension(services.clone()),
+        Path(session_id.clone()),
+        Json(prompt_body(body)?),
+    )
+    .await?;
+    services.runs.wait_until_idle(&session_id).await;
+    let messages = api::session::messages(
+        State(api_state),
+        Path(session_id),
+        Query(MessagesQuery {
+            limit: Some(200),
+            order: None,
+            cursor: None,
+        }),
+    )
+    .await?;
+    let message_id = admitted.0.data.id;
+    let message = messages
+        .0
+        .data
+        .into_iter()
+        .find(|message| {
+            message["info"]["role"] == "assistant" && message["info"]["parentID"] == message_id
+        })
+        .ok_or_else(|| {
+            ApiError::MutationFailed("prompt completed without an assistant message".to_owned())
+        })?;
+    Ok(Json(message))
+}
+
+async fn v1_session_prompt_async(
+    Extension(api_state): Extension<ApiState>,
+    Extension(services): Extension<ServerServices>,
+    Path(session_id): Path<String>,
+    Json(body): Json<V1PromptBody>,
+) -> Result<StatusCode, ApiError> {
+    let _ = api::session::prompt(
+        State(api_state),
+        Extension(services),
+        Path(session_id),
+        Json(prompt_body(body)?),
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn prompt_body(body: V1PromptBody) -> Result<PromptBody, ApiError> {
+    let mut text = Vec::new();
+    let mut files = Vec::new();
+    let mut agents = Vec::new();
+    for part in body.parts {
+        match part.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                let value =
+                    part.get("text")
+                        .and_then(Value::as_str)
+                        .ok_or(ApiError::InvalidRequest(
+                            "text parts require a string `text`",
+                        ))?;
+                text.push(value.to_owned());
+            }
+            Some("file") => files.push(part),
+            Some("agent") => agents.push(part),
+            Some("subtask") => {
+                let value =
+                    part.get("prompt")
+                        .and_then(Value::as_str)
+                        .ok_or(ApiError::InvalidRequest(
+                            "subtask parts require a string `prompt`",
+                        ))?;
+                text.push(value.to_owned());
+            }
+            _ => return Err(ApiError::InvalidRequest("unsupported v1 prompt part type")),
+        }
+    }
+    Ok(PromptBody {
+        id: body.message_id,
+        prompt: PromptInputBody {
+            text: text.join("\n"),
+            files,
+            agents,
+        },
+        delivery: None,
+        resume: body.no_reply.map(|no_reply| !no_reply),
+        agent: body.agent,
+        model: body.model.map(|model| ModelRefBody {
+            id: model.model_id,
+            provider_id: model.provider_id,
+            variant: None,
+        }),
+    })
+}
+
+fn v1_session(session: SessionInfo) -> Value {
+    json!({
+        "id": session.id,
+        "projectID": session.project_id,
+        "directory": session.directory,
+        "parentID": session.parent_id,
+        "title": session.title,
+        "version": session.version,
+        "time": session.time,
+    })
+}
+
+fn v1_agent(agent: AgentInfo) -> Value {
+    let mut permission = json!({"edit": "ask", "bash": {}});
+    for rule in &agent.permissions {
+        if rule.action == "edit" && rule.resource == "*" {
+            permission["edit"] = Value::String(rule.effect.to_owned());
+        }
+        if rule.action == "bash" {
+            permission["bash"][&rule.resource] = Value::String(rule.effect.to_owned());
+        }
+        if matches!(
+            rule.action.as_str(),
+            "webfetch" | "doom_loop" | "external_directory"
+        ) && rule.resource == "*"
+        {
+            permission[&rule.action] = Value::String(rule.effect.to_owned());
+        }
+    }
+    json!({
+        "name": agent.id,
+        "description": agent.description,
+        "mode": agent.mode,
+        "builtIn": matches!(agent.id.as_str(), "build" | "plan" | "general" | "explore" | "compaction" | "title" | "summary"),
+        "color": agent.color,
+        "permission": permission,
+        "model": agent.model.map(|model| json!({"modelID": model.id, "providerID": model.provider_id})),
+        "prompt": agent.system,
+        "tools": {},
+        "options": agent.request.body,
+        "maxSteps": agent.steps,
+    })
+}
+
+fn v1_provider(provider: ProviderInfo, models: Vec<ModelInfo>) -> Value {
+    let models = models
+        .into_iter()
+        .map(|model| (model.id.clone(), v1_model(model)))
+        .collect::<Map<String, Value>>();
+    json!({
+        "id": provider.id,
+        "name": provider.name,
+        "env": [],
+        "api": provider.api.url,
+        "npm": provider.api.package,
+        "models": models,
+    })
+}
+
+fn v1_model(model: ModelInfo) -> Value {
+    let cost = model.cost.first().map(|cost| {
+        json!({
+            "input": cost.input,
+            "output": cost.output,
+            "cache_read": cost.cache.read,
+            "cache_write": cost.cache.write,
+        })
+    });
+    let input = model.capabilities.input.clone();
+    let output = model.capabilities.output.clone();
+    json!({
+        "id": model.id,
+        "name": model.name,
+        "release_date": model.time.released.to_string(),
+        "attachment": input.iter().any(|modality| modality != "text"),
+        "reasoning": false,
+        "temperature": true,
+        "tool_call": model.capabilities.tools,
+        "cost": cost,
+        "limit": {"context": model.limit.context, "output": model.limit.output},
+        "modalities": {"input": input, "output": output},
+        "status": model.status,
+        "options": model.request.body,
+        "headers": model.request.headers,
+    })
 }
 
 /// Failures the v1 surface reports. No variant carries a credential.
@@ -938,7 +1410,7 @@ async fn diagnostics(State(state): State<CompatV1State>) -> Json<Value> {
                 "sdkMethod": route.sdk_method,
                 "callers": route.plugins,
                 "callsites": route.callsites,
-                "backend": route.backing.as_str(),
+                "backend": registered_backing(route).as_str(),
                 "apiAlternative": route.api_alternative,
             })
         })

@@ -1,24 +1,37 @@
 use std::collections::BTreeSet;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
+use oc_db::Pool;
+use oc_db::artifact_gc::ArtifactGcPaths;
+use oc_db::message::{MessageRecord, MessageStore, PartRecord, now_millis};
+use oc_db::session::SessionCreate;
+use oc_engine::interrupt::InterruptSignal;
+use oc_engine::r#loop::TurnEventSender;
 use oc_paths::DbLocation;
 use oc_server::api::{self, ApiState};
 use oc_server::compat_v1::{TOAST_PATH, V1_DIAGNOSTICS_PATH, V1Method, v1_coverage};
 use oc_server::{
     CompatV1State, DEFAULT_EVENT_SUBSCRIBER_CAPACITY, EventService, ServerBuilder, ServerConfig,
-    Toast, ToastForwarder, V1_PREFIXES, V1_SURFACE, compat_v1_router, events_router,
+    ServerServices, SessionCompactExecution, SessionMutationExecutor, SessionMutationFuture,
+    SessionPromptExecution, Toast, ToastForwarder, V1_PREFIXES, V1_SURFACE, compat_v1_router,
+    events_router,
 };
 use serde_json::{Value, json};
+use tempfile::TempDir;
 use tower::ServiceExt;
 
 const ORACLE: &str = include_str!("../../../.omo/fixtures/oracle-openapi-1.18.12.json");
 
 fn compat_app(state: CompatV1State) -> Router {
+    let api_state = ApiState::memory("/repo").expect("in-memory API state initializes");
+    seed_session(&api_state);
     ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
-        .with_routes(compat_v1_router(state))
+        .with_routes(compat_v1_router(state, api_state))
         .router()
 }
 
@@ -29,13 +42,184 @@ fn assembled_app(state: CompatV1State) -> Router {
         Arc::new(oc_db::Pool::open(&DbLocation::Memory).expect("in-memory event database opens"));
     let events = EventService::new(pool, DEFAULT_EVENT_SUBSCRIBER_CAPACITY);
     let api_state = ApiState::memory("/repo").expect("in-memory API state initializes");
+    seed_session(&api_state);
     ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
         .with_routes(
-            api::router(api_state)
+            api::router(api_state.clone())
                 .merge(events_router(events))
-                .merge(compat_v1_router(state)),
+                .merge(compat_v1_router(state, api_state)),
         )
         .router()
+}
+
+fn seed_session(state: &ApiState) {
+    let directory = state.directory().to_owned();
+    state
+        .sessions()
+        .create(&SessionCreate::new(
+            "ses_fixture",
+            "ses_fixture",
+            "global",
+            &directory,
+            &directory,
+            "fixture",
+            "test",
+        ))
+        .expect("fixture session inserts");
+}
+
+#[derive(Debug)]
+struct CompletingMutationExecutor {
+    database: PathBuf,
+    prompts: Mutex<Vec<SessionPromptExecution>>,
+    compact_calls: AtomicUsize,
+}
+
+impl CompletingMutationExecutor {
+    fn new(database: PathBuf) -> Self {
+        Self {
+            database,
+            prompts: Mutex::new(Vec::new()),
+            compact_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn prompts(&self) -> Vec<SessionPromptExecution> {
+        self.prompts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl SessionMutationExecutor for CompletingMutationExecutor {
+    fn prompt(
+        &self,
+        request: SessionPromptExecution,
+        _interrupt: InterruptSignal,
+        _events: TurnEventSender,
+    ) -> SessionMutationFuture {
+        self.prompts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(request.clone());
+        let database = self.database.clone();
+        Box::pin(async move {
+            let pool =
+                Pool::open(&DbLocation::File(database)).map_err(|error| error.to_string())?;
+            let connection = pool.get().map_err(|error| error.to_string())?;
+            let created = now_millis();
+            let assistant_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+            let part_id = format!("prt_{}", uuid::Uuid::new_v4().simple());
+            let model = request.model.unwrap_or(oc_server::SessionModelSelection {
+                provider_id: "test".to_owned(),
+                model_id: "test".to_owned(),
+            });
+            let directory = request.directory.to_string_lossy().into_owned();
+            let message = MessageRecord::from_json(json!({
+                "id": assistant_id,
+                "sessionID": request.session_id,
+                "role": "assistant",
+                "time": {"created": created, "completed": created},
+                "parentID": request.message_id,
+                "modelID": model.model_id,
+                "providerID": model.provider_id,
+                "mode": request.agent.unwrap_or_else(|| "build".to_owned()),
+                "path": {"cwd": directory, "root": directory},
+                "cost": 0,
+                "tokens": {
+                    "input": 1,
+                    "output": 1,
+                    "reasoning": 0,
+                    "cache": {"read": 0, "write": 0}
+                },
+                "finish": "stop"
+            }))
+            .map_err(|error| error.to_string())?;
+            let part = PartRecord::from_json(
+                json!({
+                    "id": part_id,
+                    "sessionID": message.session_id,
+                    "messageID": message.id,
+                    "type": "text",
+                    "text": format!("completed: {}", request.prompt)
+                }),
+                created,
+            )
+            .map_err(|error| error.to_string())?;
+            let store = MessageStore::new(&connection);
+            store
+                .put_message_at(&message, created)
+                .map_err(|error| error.to_string())?;
+            store
+                .put_part_at(&part, created)
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+    }
+
+    fn compact(
+        &self,
+        _request: SessionCompactExecution,
+        _interrupt: InterruptSignal,
+    ) -> SessionMutationFuture {
+        self.compact_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
+    }
+}
+
+struct AdapterFixture {
+    _temp: TempDir,
+    app: Router,
+    services: ServerServices,
+    executor: Arc<CompletingMutationExecutor>,
+}
+
+fn adapter_fixture() -> AdapterFixture {
+    let temp = tempfile::tempdir().expect("temporary adapter directory");
+    let directory = temp.path().join("repo");
+    std::fs::create_dir(&directory).expect("adapter repository directory creates");
+    let database = temp.path().join("opencode.db");
+    let location = DbLocation::File(database.clone());
+    let models = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../oc-llm/tests/fixtures/models-dev-pinned.json")
+        .canonicalize()
+        .expect("the pinned catalogue fixture exists");
+    let env = oc_paths::Env::empty()
+        .with("HOME", temp.path().to_string_lossy().into_owned())
+        .with(
+            "OPENCODE_TEST_HOME",
+            temp.path().to_string_lossy().into_owned(),
+        )
+        .with(
+            "OPENCODE_MODELS_PATH",
+            models.to_string_lossy().into_owned(),
+        )
+        .with("OPENCODE_DISABLE_MODELS_FETCH", "1")
+        .with("DEEPSEEK_API_KEY", "probe-key");
+    let state = ApiState::from_pool(
+        Pool::open(&location).expect("adapter database opens"),
+        directory.to_string_lossy().into_owned(),
+        ArtifactGcPaths::from_data_root(temp.path()),
+    )
+    .expect("adapter API state initializes")
+    .with_env(env);
+    seed_session(&state);
+    let executor = Arc::new(CompletingMutationExecutor::new(database));
+    let services = ServerServices::new(DEFAULT_EVENT_SUBSCRIBER_CAPACITY)
+        .with_mutations(Arc::clone(&executor) as Arc<_>);
+    let app = ServerBuilder::new(
+        ServerConfig::default().with_default_directory(directory.to_string_lossy()),
+    )
+    .with_services(services.clone())
+    .with_routes(api::router(state.clone()).merge(compat_v1_router(CompatV1State::new(), state)))
+    .router();
+    AdapterFixture {
+        _temp: temp,
+        app,
+        services,
+        executor,
+    }
 }
 
 fn request(method: Method, uri: &str, body: Option<Value>) -> Request<Body> {
@@ -91,6 +275,198 @@ fn plan_todo_citation(text: &str) -> Option<String> {
         search = cursor;
     }
     None
+}
+
+#[test]
+fn compat_v1_router_derived_coverage_counts_only_registered_backends() {
+    let coverage = v1_coverage();
+    assert_eq!(coverage.measured, 20);
+    assert_eq!(coverage.served, 11);
+    assert_eq!(coverage.unbacked, 9);
+    assert_eq!(coverage.redirected, 0);
+}
+
+#[tokio::test]
+async fn compat_v1_backed_sdk_routes_return_expected_catalog_and_session_shapes() {
+    let fixture = adapter_fixture();
+    let app = fixture.app;
+
+    let agents = app
+        .clone()
+        .oneshot(request(Method::GET, "/agent", None))
+        .await
+        .expect("agent adapter responds");
+    assert_eq!(agents.status(), StatusCode::OK);
+    let agents = response_json(agents).await;
+    let agents = agents
+        .as_array()
+        .expect("the SDK receives a bare agent array");
+    let build = agents
+        .iter()
+        .find(|agent| agent["name"] == "build")
+        .expect("the resolved build agent is projected");
+    assert_eq!(build["mode"], "primary");
+    assert_eq!(build["builtIn"], true);
+    assert!(build["permission"].is_object());
+    assert!(build["tools"].is_object());
+    assert!(build["options"].is_object());
+
+    let providers = app
+        .clone()
+        .oneshot(request(Method::GET, "/provider", None))
+        .await
+        .expect("provider adapter responds");
+    assert_eq!(providers.status(), StatusCode::OK);
+    let providers = response_json(providers).await;
+    assert!(providers["all"].is_array());
+    assert!(providers["default"].is_object());
+    assert!(providers["connected"].is_array());
+    let provider = providers["all"]
+        .as_array()
+        .and_then(|all| all.first())
+        .expect("the pinned catalogue exposes a provider");
+    assert!(provider["id"].is_string());
+    assert!(provider["models"].is_object());
+
+    let sessions = app
+        .clone()
+        .oneshot(request(Method::GET, "/session", None))
+        .await
+        .expect("session list adapter responds");
+    assert_eq!(sessions.status(), StatusCode::OK);
+    let sessions = response_json(sessions).await;
+    let sessions = sessions
+        .as_array()
+        .expect("the SDK receives a bare session array");
+    assert!(
+        sessions
+            .iter()
+            .any(|session| session["id"] == "ses_fixture")
+    );
+    assert!(sessions.iter().all(|session| session.get("data").is_none()));
+
+    let created = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/session",
+            Some(json!({
+                "parentID": "ses_fixture",
+                "title": "child from SDK",
+                "agent": "explore",
+                "model": {"providerID": "deepseek", "modelID": "deepseek-chat"}
+            })),
+        ))
+        .await
+        .expect("session create adapter responds");
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = response_json(created).await;
+    let child_id = created["id"]
+        .as_str()
+        .expect("the SDK receives a bare created session")
+        .to_owned();
+    assert_eq!(created["parentID"], "ses_fixture");
+    assert_eq!(created["title"], "child from SDK");
+    assert!(created.get("data").is_none());
+
+    let fetched = app
+        .clone()
+        .oneshot(request(Method::GET, &format!("/session/{child_id}"), None))
+        .await
+        .expect("session get adapter responds");
+    assert_eq!(fetched.status(), StatusCode::OK);
+    let fetched = response_json(fetched).await;
+    assert_eq!(fetched["id"], child_id);
+    assert_eq!(fetched["projectID"], "global");
+
+    let messages = app
+        .clone()
+        .oneshot(request(
+            Method::GET,
+            "/session/ses_fixture/message?limit=25",
+            None,
+        ))
+        .await
+        .expect("message list adapter responds");
+    assert_eq!(messages.status(), StatusCode::OK);
+    assert_eq!(response_json(messages).await, json!([]));
+
+    let aborted = app
+        .clone()
+        .oneshot(request(Method::POST, "/session/ses_fixture/abort", None))
+        .await
+        .expect("abort adapter responds");
+    assert_eq!(aborted.status(), StatusCode::OK);
+    assert_eq!(response_json(aborted).await, json!(true));
+
+    let summarized = app
+        .oneshot(request(
+            Method::POST,
+            "/session/ses_fixture/summarize",
+            Some(json!({"providerID": "deepseek", "modelID": "deepseek-chat"})),
+        ))
+        .await
+        .expect("summarize adapter responds");
+    assert_eq!(summarized.status(), StatusCode::OK);
+    assert_eq!(response_json(summarized).await, json!(true));
+    assert_eq!(fixture.executor.compact_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn compat_v1_backed_sdk_prompt_routes_preserve_sync_and_async_contracts() {
+    let fixture = adapter_fixture();
+    let app = fixture.app;
+
+    let asynchronous = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/session/ses_fixture/prompt_async",
+            Some(json!({
+                "messageID": "msg_async_sdk",
+                "agent": "explore",
+                "model": {"providerID": "deepseek", "modelID": "deepseek-chat"},
+                "parts": [{"type": "text", "text": "async request"}]
+            })),
+        ))
+        .await
+        .expect("async prompt adapter responds");
+    assert_eq!(asynchronous.status(), StatusCode::NO_CONTENT);
+    fixture.services.runs.wait_until_idle("ses_fixture").await;
+
+    let synchronous = app
+        .oneshot(request(
+            Method::POST,
+            "/session/ses_fixture/message",
+            Some(json!({
+                "messageID": "msg_sync_sdk",
+                "agent": "build",
+                "model": {"providerID": "deepseek", "modelID": "deepseek-chat"},
+                "parts": [
+                    {"type": "text", "text": "sync request"},
+                    {"type": "file", "mime": "text/plain", "url": "data:text/plain,fixture"},
+                    {"type": "agent", "name": "explore"}
+                ]
+            })),
+        ))
+        .await
+        .expect("sync prompt adapter responds");
+    assert_eq!(synchronous.status(), StatusCode::OK);
+    let synchronous = response_json(synchronous).await;
+    assert_eq!(synchronous["info"]["role"], "assistant");
+    assert_eq!(synchronous["info"]["parentID"], "msg_sync_sdk");
+    assert_eq!(synchronous["info"]["providerID"], "deepseek");
+    assert_eq!(synchronous["info"]["modelID"], "deepseek-chat");
+    assert_eq!(synchronous["parts"][0]["text"], "completed: sync request");
+
+    let prompts = fixture.executor.prompts();
+    assert_eq!(prompts.len(), 2);
+    assert_eq!(prompts[0].message_id, "msg_async_sdk");
+    assert_eq!(prompts[0].prompt, "async request");
+    assert_eq!(prompts[0].agent.as_deref(), Some("explore"));
+    assert_eq!(prompts[1].message_id, "msg_sync_sdk");
+    assert_eq!(prompts[1].prompt, "sync request");
+    assert_eq!(prompts[1].agent.as_deref(), Some("build"));
 }
 
 #[test]
@@ -249,8 +625,8 @@ async fn compat_v1_every_measured_route_is_reachable_and_never_answers_404() {
 /// The declared status of every route, against what the router really answers.
 ///
 /// This is the executable half of the `v1-surface-unbacked` known gap: the gap's
-/// text is rendered from [`v1_coverage`], which counts `backing` values, so a route
-/// whose declared `backing` drifts from its real behaviour would publish a false
+/// text is rendered from [`v1_coverage`], which counts registered backends, so a
+/// route whose declared `backing` drifts from its real behaviour would publish a false
 /// coverage number in both the `501` body and `docs/compatibility-matrix.md`.
 /// Driving each route closes that: gaining a backend without editing the table
 /// fails here, and so does claiming one that does not exist.
@@ -414,25 +790,21 @@ async fn compat_v1_seam_hint_names_a_live_alternative_and_never_a_plan_todo() {
 async fn compat_v1_seam_route_names_its_sdk_method_and_callers() {
     let app = compat_app(CompatV1State::new());
     let response = app
-        .oneshot(request(
-            Method::POST,
-            "/session/ses_fixture/abort",
-            Some(json!({})),
-        ))
+        .oneshot(request(Method::GET, "/session/status", None))
         .await
-        .expect("the abort seam responds");
+        .expect("the status seam responds");
     assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     let body = response_json(response).await;
     assert_eq!(body["error"]["code"], "not_implemented");
-    assert_eq!(body["error"]["sdkMethod"], "client.session.abort");
-    assert_eq!(body["error"]["route"], "POST /session/{sessionID}/abort");
+    assert_eq!(body["error"]["sdkMethod"], "client.session.status");
+    assert_eq!(body["error"]["route"], "GET /session/status");
     let callers = body["error"]["callers"]
         .as_array()
         .expect("the seam names its callers");
     assert!(
         callers
             .iter()
-            .any(|caller| caller.as_str() == Some("opencode-antigravity-auth@1.6.0")),
+            .any(|caller| caller.as_str() == Some("@sunerpy/oh-my-openagent@4.21.0")),
         "the seam must name the plugin that needs the backend: {callers:?}"
     );
 }

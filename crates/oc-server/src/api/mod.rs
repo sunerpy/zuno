@@ -1,12 +1,12 @@
-mod catalog;
-mod error;
+pub(crate) mod catalog;
+pub(crate) mod error;
 mod fs;
 mod maintenance;
 mod openapi;
-mod provider;
+pub(crate) mod provider;
 mod pty;
 mod request;
-mod session;
+pub(crate) mod session;
 mod state;
 
 use axum::Json;

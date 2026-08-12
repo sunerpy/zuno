@@ -7333,3 +7333,31 @@ Mutations: reintroducing "lands in todos 57-62" failed
 found; flipping `GET /session/{sessionID}/todo` to claim a backend failed both
 `compat_v1_declared_backing_matches_what_the_router_answers` and the matrix gate. Both restored; gates
 3423 passed / 0 failed (baseline 3421 plus these two tests), clippy 0, fmt clean.
+
+## [2026-08-12] Todo 165 — measured pre-`/api` routes reuse served `/api` handlers
+
+The route inventory exposed 20 plugin operations but production backed only the toast sink. Ten of the
+remaining operations have genuine served `/api` equivalents. They now use thin adapters over those
+same handlers: agent/provider catalogue reads; session list/create/get/messages; interrupt and compact;
+and synchronous/asynchronous prompt admission. Both production entry points pass the same `ApiState`
+clone to `/api` and v1 routing, so persistence, catalogue resolution, events, and session defaults do
+not fork. Session creation was split at the internal persistence input only; the public V2 wire contract
+remains unchanged.
+
+The original 18-served proposal was rejected before implementation because it would have invented
+auth, config, logging, status, update, children, todo, and OAuth semantics from lower-level stores.
+Those nine operations remain structured 501 gaps. Actual coverage is therefore 11/20 served (ten API
+adapters plus toast) and 9/20 unbacked.
+
+`V1_BACKENDS` is now the single actual registration source used both to select handlers and to derive
+`v1_coverage()`. `V1_SURFACE.backing` remains the frozen declared inventory; the route witness drives
+all operations and rejects any declaration/registration mismatch. The assembled-server regressions
+use recorded SDK bodies and assert the SDK's bare response envelopes, including synchronous prompt
+waiting for and returning the resulting assistant message, and asynchronous prompt returning 204.
+Detailed evidence is in `.omo/evidence/task-165-opencode-rust.txt`.
+
+Both required mutations were observed and restored. Replacing the actual `GET /agent` backend with
+the 501 seam failed `compat_v1_backed_sdk_routes_return_expected_catalog_and_session_shapes` on
+501 versus 200. Desynchronizing only the frozen `V1_SURFACE` declaration failed
+`compat_v1_declared_backing_matches_what_the_router_answers`, which named the declared
+`not-implemented`/actual 200 mismatch.
