@@ -7528,3 +7528,30 @@ passing by coincidence. Separate CLI and TUI tests preserve the genuinely-unset 
 fallback. Removing the config rung failed all four configured-direction tests; reversing fallback
 failed both unset tests. Complete reproduction and mutation evidence is in
 `.omo/evidence/task-177-opencode-rust.txt`.
+
+## [2026-08-12] 我在磁盘满时执行截断写入，毁掉了 t175 未提交的 compat_v1.rs
+
+验证 175 的「返回 200 但不落盘」变异时，我的命令是 `cp <file> /tmp/oc-v175.bak` 接一段 `python3` 截断重写。`/` 分区已 100% 满，于是：
+
+```
+cp: error writing '/tmp/oc-v175.bak': No space left on device
+zsh:3: write failed: no space left on device
+```
+
+**`cp` 失败了，python 的 `open(p,'w')` 却已经把源文件截成 0 字节。** 该文件是 175 未提交工作的核心（`ProviderOAuth*` 六个类型、`v1_auth_set`、两个 OAuth 处理器），`git checkout --` 只能退回 main 基线，175 在其中的实现全部丢失。
+
+其余 11 个文件完好（655 行改动存活），证据文件 6890 字节完整存活并详细记录了实现，所以可重建。
+
+### 三个错误，不是一个
+
+1. **我在同一条命令里把「备份」和「破坏」串成 `;` 序列**，没有让备份失败阻止后续写入。正确写法是 `cp x y && python3 ...`，或干脆用 `git stash` / `git diff > patch` 做备份——**对未提交的工作，git 本身就是比 `/tmp` 更可靠的备份介质**。
+2. **我看到了 `No space left on device` 却继续推进。** 那条错误就打印在我读到的输出里，我把它当成噪声掠过了。
+3. **我在磁盘 94%（`/config`）时就该先清理。** 之前一次 148 的验证也遇到过 `/config` 写满，我当时只在那个 worktree 里 `cargo clean` 应急，没有清理累积的历史构建目录——本次清出 90G，说明那些目录早就该删。
+
+### 规则
+
+> **变异未提交的工作前，用 `git stash` 或 `git diff > /tmp/x.patch` 做备份，且必须 `&&` 串接：备份失败就不许改文件。**
+> **命令输出里出现 `No space left on device`、`EAGAIN`、`error writing` 时立即停下处理，不得继续执行后续步骤。**
+> **对已提交的代码变异是安全的（`git checkout --` 可还原）；对未提交的工作变异必须先落盘或先提交。**
+
+更根本的一条：**我一直在对已提交的分支做变异，所以形成了「变异是安全的」这个习惯。175 是第一次在未提交状态下被变异，习惯没跟着调整。**
