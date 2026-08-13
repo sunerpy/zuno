@@ -1,0 +1,82 @@
+Task 173 evidence log
+=====================
+
+2026-08-13 investigation start
+------------------------------
+- Worktree: `/config/workspace/ProdDir/AI/oc-wt/t173`, branch `task-173`, base `11c1fc86`.
+- Required CodeGraph query `plugin_runtime auth_loader HookBus is_disabled PluginDiagnostic models turn getAuth` was attempted first and returned: `Error: No indexed project found for projectPath "/config/workspace/ProdDir/AI/oc-wt/t173".` Investigation therefore continued with Read/Grep as instructed.
+- Task 168's evidence establishes the shared containment condition: a callback error is non-fatal only after the plugin records a `PluginDiagnostic` and `Plugin::is_disabled()` becomes true; `HookBus` then returns `Ok(())`.
+- `PluginRuntime::apply_catalog` is outside that condition. It turns `auth.loader` and `provider.models` errors directly into `Err(String)`, and the shared call is reached by `run`, `models`, and HTTP turn resolution.
+- Upstream's SDK contract is `loader?: (auth: () => Promise<Auth>, provider: Provider) => Promise<Record<string, any>>` (`packages/plugin/src/index.ts:88-90`), so `null` is not a legitimate `Auth` value.
+- Upstream deliberately skips the loader before constructing `getAuth` when no stored credential exists (`packages/opencode/src/provider/provider.ts:1548-1563`: `if (!stored) continue`). The Rust host must likewise not invoke the loader in the configured-but-not-logged-in state; synthesizing an `Auth` is rejected.
+- `.omo/refs/` is absent from this worktree. The main checkout's `.omo/refs/` was inspected; its five reference projects do not contain the opencode plugin SDK `AuthHook` declaration. The pinned upstream source provides the authoritative signature above.
+
+Real-binary reproduction before implementation
+----------------------------------------------
+Built `target/debug/opencode-rust` from task-173 HEAD with `CARGO_BUILD_JOBS=2 cargo build -p oc-cli --offline`. The fixture is a real JavaScript plugin named `task173-auth-loader`; its auth resource targets configured provider `test`, calls `getAuth()`, and throws `task173 configured provider has no stored auth` when the result is `null`. The process has `OPENCODE_AUTH_CONTENT={}`, so this is exactly "provider configured but not logged in", not an invented malformed credential.
+
+### `run` (verbatim)
+```text
+=== RUN ===
+exit=1
+--- stdout ---
+--- stderr ---
+plugin auth loader `test` failed: plugin `file:/tmp/opencode/task-173-repro/plugin.mjs` failed `call`: task173 configured provider has no stored auth
+```
+
+### `models` (verbatim)
+```text
+=== MODELS ===
+exit=1
+--- stdout ---
+--- stderr ---
+plugin auth loader `test` failed: plugin `file:/tmp/opencode/task-173-repro/plugin.mjs` failed `call`: task173 configured provider has no stored auth
+```
+
+### HTTP turn (verbatim)
+```text
+=== HTTP ===
+server stdout:
+Warning: OPENCODE_SERVER_PASSWORD is not set; server is unsecured.
+opencode server listening on http://127.0.0.1:35943
+create: 200 {"data":{"id":"ses_task173httprepro00000000000","projectId":"global","workspaceId":null,"parentId":null,"slug":"ses_task173httprepro00000000000","directory":"/config/workspace/ProdDir/AI/oc-wt/t173","path":"","title":"New session - ses_task173httprepro00000000000","version":"0.1.0","time":{"created":1786590495064,"updated":1786590495064}}}
+prompt: 200 {"data":{"admittedSeq":0,"id":"msg_task173_http_user","sessionID":"ses_task173httprepro00000000000","prompt":{"text":"task 173 HTTP reproduction","files":[],"agents":[]},"delivery":"steer","timeCreated":1786590495280}}
+wait: 204
+session event frames:
+{"data":{"message":"plugin auth loader `test` failed: plugin `file:/tmp/opencode/task-173-repro/plugin.mjs` failed `call`: task173 configured provider has no stored auth","sessionID":"ses_task173httprepro00000000000"},"durable":{"aggregateID":"ses_task173httprepro00000000000","seq":1,"version":1},"id":"evt_019ff91782877e618f18e8341eb2a8b9","type":"session.error"}
+server exit: -15
+server stderr:
+session prompt execution failed: plugin auth loader `test` failed: plugin `file:/tmp/opencode/task-173-repro/plugin.mjs` failed `call`: task173 configured provider has no stored auth
+```
+
+Regression tests before implementation
+--------------------------------------
+- `configured_provider_without_stored_auth_does_not_invoke_auth_loader` failed by name: `apply_catalog` returned `plugin auth loader \`groq\` failed ... task173 configured provider has no stored auth` instead of skipping the loader.
+- `failing_auth_loader_is_disabled_and_catalog_resolution_continues_with_a_diagnostic` failed by name: `apply_catalog` returned `plugin auth loader \`groq\` failed ... task173 authenticated loader failure`.
+- `failing_provider_model_loader_is_disabled_and_catalog_resolution_continues` failed by name: `apply_catalog` returned `plugin provider \`groq\` failed to contribute models ... task173 provider model loader failure`.
+- These red tests distinguish the two required cases: absence is handled before the SDK callback is invoked; a callback that genuinely fails after receiving a real `Auth` is disabled with a diagnostic and does not abort catalog resolution.
+
+Implementation and three-surface regressions
+--------------------------------------------
+- `PluginRuntime::apply_catalog` now walks each owning JavaScript plugin directly so a failing retained resource callback can disable that plugin. Both `auth.loader` and `provider.models` call `JsPlugin::disable_after_callback_failure`, which records the same `PluginDiagnostic` and permanent disabled state used by ordinary `HookBus` callbacks.
+- A configured provider with no stored credential skips `auth.loader`, matching upstream and preserving the SDK's `getAuth(): Promise<Auth>` contract. `StoredCredential` therefore always contains a real credential; no fake or null `Auth` crosses the plugin boundary.
+- `models` prints newly recorded plugin diagnostics at default verbosity before shutdown, so successful model output does not hide the disabled plugin and its cause.
+- The following real-binary regressions passed after implementation:
+  - `failing_auth_loader_is_disabled_and_cli_run_completes_with_a_diagnostic`: `run` exits successfully, reaches the mock provider, and stderr names `cli-failing-auth-loader`, `auth.loader`, and `task173 CLI auth loader failure`.
+  - `failing_auth_loader_is_disabled_and_models_lists_models_with_a_diagnostic`: `models test` exits successfully, prints `test/test-model`, and stderr names the plugin, hook, and cause.
+  - `failing_auth_loader_is_disabled_and_http_turn_completes_with_a_diagnostic`: the HTTP turn emits no `session.error`, reaches `turn.completed`, persists the assistant response, and publishes the actionable diagnostic over SSE.
+- The named not-logged-in regression `configured_provider_without_stored_auth_does_not_invoke_auth_loader` passes and proves the callback is not invoked at all without stored auth.
+- `every_hook_surface_failure_boundary_is_non_fatal_by_name` covers all four requested surfaces (`run`, `models`, TUI, HTTP), all 21 authoritative hooks, and 67 applicable hook × surface entries. Ordinary callback and shutdown entries execute the real production `HookBus::dispatch` containment branch; retained `auth` and `provider` resource callbacks are covered by the production JavaScript loader tests above.
+
+Guarded mutation evidence
+-------------------------
+- Removed `&& !plugin.is_disabled()` from production `HookBus`. The named matrix failed with `dispose × Run propagated a disabled plugin failure`, proving the matrix observes the production containment condition. The file was restored byte-for-byte from its pre-mutation backup.
+- Changed production `auth.loader` handling back to `return Err(...)`. The real CLI regression failed because `run` exited with `plugin auth loader 'test' failed ... task173 CLI auth loader failure`. The file was restored byte-for-byte.
+- Kept the plugin disabled but suppressed `JsHost::disable` diagnostic publication. The real CLI regression completed the turn but failed because stderr contained no plugin/hook/cause diagnostic. The file was restored byte-for-byte.
+
+Final validation
+----------------
+- Direct `lsp_diagnostics` cannot address a sibling worktree outside the request cwd. The equivalent `rust-analyzer diagnostics .` completed over all 526 files; changed files had no errors or actionable warnings, only existing `#[cfg]` inactive-code weak warnings elsewhere in the workspace.
+- `CARGO_BUILD_JOBS=2 cargo test --workspace --offline -- --test-threads=2` ran the workspace. Every executed test passed except the five already registered under todo 178 in `crates/oc-cli/tests/cli_parity.rs`; each failed only with `OraclePinMismatch { pinned: "1.18.15", reported: "1.18.18" }`.
+- `CARGO_BUILD_JOBS=2 cargo clippy --workspace --all-targets --offline -- -D warnings` passed with zero warnings.
+- `cargo fmt --all --check` passed.

@@ -99,12 +99,34 @@ impl JsPlugin {
         kind: PluginDiagnosticKind,
         error: impl std::fmt::Display,
     ) {
+        self.disable_named(hook.as_str(), kind, error).await;
+    }
+
+    async fn disable_named(
+        &self,
+        hook: &str,
+        kind: PluginDiagnosticKind,
+        error: impl std::fmt::Display,
+    ) {
         if self.disabled.swap(true, Ordering::AcqRel) {
             return;
         }
         self.host
-            .disable(self.manifest.id(), kind, hook.as_str(), error.to_string())
+            .disable(self.manifest.id(), kind, hook, error.to_string())
             .await;
+    }
+
+    /// Permanently disable a resource callback that failed outside [`HookBus`].
+    ///
+    /// Auth and provider loaders are retained resource callbacks rather than
+    /// [`HookInvocation`] variants, so their caller must enter the same diagnostic
+    /// and disable path used by ordinary hooks instead of turning the error into a
+    /// surface failure.
+    pub async fn disable_after_callback_failure(&self, hook: &str, error: &BoxSource) {
+        let kind = error
+            .downcast_ref::<super::host::JsHostError>()
+            .map_or(PluginDiagnosticKind::Protocol, |error| error.kind());
+        self.disable_named(hook, kind, error).await;
     }
 }
 

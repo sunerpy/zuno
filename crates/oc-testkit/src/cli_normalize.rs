@@ -512,7 +512,7 @@ mod tests {
     }
 
     /// The negative control for the whole pipeline, on the real shapes measured
-    /// from release 1.18.15: the presentation differences collapse and every
+    /// from release 1.18.18: the presentation differences collapse and every
     /// difference in the *message* survives.
     #[test]
     fn the_pipeline_collapses_presentation_and_keeps_every_other_difference() {

@@ -7586,6 +7586,26 @@ changing only `V1_SURFACE.backing` makes the declared-backing regression fail. A
 effect mutations failed again after reconstruction; the detailed output is appended to the task
 evidence file.
 
+## Task 178 — the 1.18.18 recapture closed a stale-contract premise
+
+The live 1.18.18 `/doc` response is byte-identical to the committed
+`.omo/fixtures/oracle-openapi-1.18.12.json` capture (478,747 bytes, sha256
+`c3a9f94af0c3324d97b482b14c692e810ce7ccac3136319ba46334de972b4cf1`, 58 `/api`
+operations). This invalidated the `v1-agent-projection-unverified` gap's premise that the
+optional-key drift could not be classified without a target-version capture.
+
+The drift is now confirmed against the executable pin and recorded as
+`v1-agent-projection-drift`. It remains a known gap, not a `docs/divergences.toml`
+decision: every required Agent key is served, but three undeclared optional keys are added
+and six declared optional keys are omitted, with no implementation decision choosing that
+shape. The existing `compat_v1_agent_projection_drift_is_recorded_and_drops_no_required_key`
+witness still passes and the compatibility matrix is regenerated from the corrected source.
+
+No new 1.18.18 CLI behavior difference was found: all five oracle-blocked live
+differentials and all 16 parity probes passed under the existing declarations and narrow
+normalization rules. The full API matrix did find one non-CLI asset change: the built-in
+`compaction` agent's system prompt changed. Updating the V2 prompt asset from live
+`GET /api/agent` restored exact body parity; no normalization or divergence was added.
 ## [2026-08-13] Task 172 — bounded JavaScript values need authoritative provenance
 
 The old bridge treated every `$truncated` marker returned by the host's own encoder as
@@ -7608,3 +7628,22 @@ tests fail because the repository pins oracle 1.18.15 while the installed oracle
 Clippy, and the workspace build. The `lsp_diagnostics` MCP also cannot address sibling
 worktrees; worktree-local rust-analyzer reported no errors (only cfg-disabled
 `inactive-code` weak warnings).
+## [2026-08-13] Todo 173 — retained plugin callbacks now share disable-and-continue containment
+
+Todo 168 contained ordinary `HookBus` callbacks, but `auth.loader` and `provider.models` are retained
+resource callbacks invoked directly by `PluginRuntime::apply_catalog`. Their errors were still mapped
+to surface errors, so one plugin killed `run`, `models`, and HTTP turns. The catalog path now retains
+the owning plugin, permanently disables it through the shared diagnostic mechanism, and continues
+catalog resolution. A missing stored credential skips `auth.loader` entirely, matching upstream's
+`Promise<Auth>` contract rather than inventing null or fake auth.
+
+Real-binary regressions prove `run`, `models`, and HTTP turns remain useful and expose a default-visible
+plugin/hook/cause diagnostic. The exhaustive failure-boundary matrix now includes TUI as well as the
+three named surfaces: 21 hooks produce 67 applicable hook × surface entries, with ordinary callbacks
+executing the production `HookBus` containment branch. Removing that branch, restoring fatal auth
+mapping, or suppressing diagnostic publication each failed a named regression and was restored.
+
+Changed-file diagnostics, zero-warning workspace Clippy, and rustfmt passed. Workspace tests had no
+task-173 regression; only todo 178's five known `cli_parity.rs` failures remained, all caused by the
+pinned 1.18.15 oracle resolving to installed 1.18.18. Full commands and mutation output are recorded
+in `.omo/evidence/task-173-opencode-rust.txt`.

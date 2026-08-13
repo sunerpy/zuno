@@ -345,3 +345,45 @@ its server. Worktree-local `rust-analyzer diagnostics . --severity error` comple
 with exit 0 and no source diagnostic; it did emit analyzer-internal `Overloaded deref`
 error logs while scanning unrelated files. The changed test compiles cleanly under the
 targeted run, all-target Clippy, and the workspace runs above.
+
+10. Merge integration with todos 173 and 178
+
+`main` was merged normally after it acquired todo 173's retained-callback containment
+and todo 178's 1.18.18 oracle pin. The conflict resolution retained all three adjacent
+HTTP contracts and their helpers:
+
+- a genuinely failing `tool.definition` callback is disabled and diagnosed while the
+  HTTP turn completes;
+- a no-op `tool.definition` callback remains enabled and preserves every real schema;
+- a failing `auth.loader` is disabled and diagnosed while the HTTP turn completes.
+
+Each exact HTTP test passed independently, 1 passed / 0 failed. The merged
+`session_mutation` target also passed all 11 tests during both workspace attempts.
+
+The merge exposed a real fixture interaction outside the textual conflict. Todo 173
+correctly skips `auth.loader` when no stored provider credential exists, while the
+pre-existing ordinary lifecycle test still expected its successful auth loader to add
+`auth_hook_sentinel` under the globally empty auth fixture. The first workspace run
+therefore failed that named assertion, and an exact rerun reproduced it. The lifecycle
+command helper now supplies the same explicit `test` API credential as the failing-auth
+fixture. The exact lifecycle regression then passed, restoring a meaningful successful
+auth-loader witness without weakening todo 173's missing-credential contract.
+
+Post-fix full workspace attempts both advanced with no ordinary assertion failure and
+passed the merged `session_mutation` (11/11) and `tool_turn` (13/13) targets. Both were
+eventually interrupted by host process exhaustion rather than product failure:
+
+- attempt 1: `oc-config --lib`, `Os { code: 11, kind: WouldBlock, message:
+  "Resource temporarily unavailable" }`;
+- the single permitted retry: `oc-db --test fts`, the same `EAGAIN`/`WouldBlock` test
+  listing failure.
+
+No further workspace retry was made. `cargo clippy --workspace --all-targets --offline`
+passed with zero warnings, and `cargo fmt --all --check` passed cleanly.
+
+The integrated `lsp_diagnostics` entry point rejected both changed Rust files because
+this sibling worktree lies outside its fixed request cwd. Worktree-local
+`rust-analyzer diagnostics . --severity error` completed its 526-file scan and emitted
+no source diagnostic for either changed test file; it retained the analyzer's known
+internal `Overloaded deref on type str is not a projection` error logs in unrelated
+analysis. Compilation, exact tests, all-target Clippy, and rustfmt are clean.

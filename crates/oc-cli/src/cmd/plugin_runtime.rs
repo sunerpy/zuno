@@ -193,42 +193,44 @@ impl PluginRuntime {
         catalog: &mut oc_llm::catalog::Catalog,
         credentials: &BTreeMap<String, oc_auth::Credential>,
     ) -> Result<(), String> {
-        let mut auth_hooks = Vec::new();
-        self.bus
-            .dispatch(HookInvocation::Auth {
-                output: &mut auth_hooks,
-            })
-            .await
-            .map_err(|error| error.to_string())?;
-        for hook in auth_hooks {
+        for plugin in self.load.plugins() {
+            let Some(hook) = plugin.auth() else {
+                continue;
+            };
             let Some(loader) = hook.loader else {
+                continue;
+            };
+            // The SDK promises `getAuth(): Promise<Auth>`, not `Promise<Auth | null>`.
+            // Match upstream by skipping the loader when this provider has no stored
+            // credential rather than sending a value its compiled type cannot express.
+            let Some(credential) = credentials.get(&hook.provider).cloned() else {
                 continue;
             };
             let Some(provider) = catalog.provider_mut(&hook.provider) else {
                 continue;
             };
-            let auth = StoredCredential(credentials.get(&hook.provider).cloned());
-            let options = loader.load(&auth, provider).await.map_err(|error| {
-                format!("plugin auth loader `{}` failed: {error}", hook.provider)
-            })?;
-            provider.options.extend(options);
+            let auth = StoredCredential(credential);
+            match loader.load(&auth, provider).await {
+                Ok(options) => provider.options.extend(options),
+                Err(error) => {
+                    plugin
+                        .disable_after_callback_failure("auth.loader", &error)
+                        .await;
+                }
+            }
         }
 
-        let mut provider_hooks = Vec::new();
-        self.bus
-            .dispatch(HookInvocation::Provider {
-                output: &mut provider_hooks,
-            })
-            .await
-            .map_err(|error| error.to_string())?;
-        for hook in provider_hooks {
+        for plugin in self.load.plugins() {
+            let Some(hook) = plugin.provider() else {
+                continue;
+            };
             let Some(loader) = hook.models else {
                 continue;
             };
             let Some(provider) = catalog.provider(&hook.id).cloned() else {
                 continue;
             };
-            let models = loader
+            match loader
                 .models(
                     &provider,
                     ProviderHookContext {
@@ -236,13 +238,16 @@ impl PluginRuntime {
                     },
                 )
                 .await
-                .map_err(|error| {
-                    format!(
-                        "plugin provider `{}` failed to contribute models: {error}",
-                        hook.id
-                    )
-                })?;
-            catalog.replace_provider_models(&hook.id, models);
+            {
+                Ok(models) => {
+                    catalog.replace_provider_models(&hook.id, models);
+                }
+                Err(error) => {
+                    plugin
+                        .disable_after_callback_failure("provider.models", &error)
+                        .await;
+                }
+            }
         }
         *self
             .providers
@@ -919,12 +924,12 @@ fn js_plugin_spec(
     }
 }
 
-struct StoredCredential(Option<oc_auth::Credential>);
+struct StoredCredential(oc_auth::Credential);
 
 #[async_trait]
 impl AuthCredentialResolver for StoredCredential {
     async fn resolve(&self) -> Result<Option<oc_auth::Credential>, oc_error::BoxSource> {
-        Ok(self.0.clone())
+        Ok(Some(self.0.clone()))
     }
 }
 
@@ -955,7 +960,10 @@ impl TerminalOwner for StdioTerminal {
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
+    use async_trait::async_trait;
+    use oc_auth::{Credential, Secret};
     use oc_config::schema::CompactionConfig;
     use oc_engine::compaction::{
         CompactedTranscript, CompactionCache, CompactionOutcome, CompactionRequest,
@@ -967,8 +975,10 @@ mod tests {
     use oc_llm::catalog::resolved::{
         ModelApi, ModelCapabilities, ModelCost, ModelLimit, ResolvedModel, ResolvedProvider,
     };
+    use oc_llm::catalog::{Catalog, ResolveInput};
     use oc_llm::event::{Message, Role};
     use oc_llm::registry::Spec;
+    use oc_plugin::{HookBus, HookInvocation, HookName, Plugin, PluginManifest};
     use oc_provider_compatible::{CompatibleProvider, ReqwestTransport, Transport};
     use oc_server::{
         ProviderOAuthAuthorizeRequest, ProviderOAuthBackend, ProviderOAuthCallbackRequest,
@@ -976,7 +986,17 @@ mod tests {
     use oc_testkit::{MockProvider, Scenario, ScriptedEnv};
     use serde_json::json;
 
-    use super::PluginRuntime;
+    use super::{
+        ChatContext, ChatHeadersOutput, ChatMessageInput, ChatMessageOutput,
+        ChatMessagesTransformOutput, ChatParamsOutput, ChatSystemTransformInput,
+        ChatSystemTransformOutput, CommandExecuteBeforeInput, CommandExecuteBeforeOutput,
+        CompactionAutocontinueInput, CompactionAutocontinueOutput, MessageWithParts,
+        PermissionAskInput, PermissionAskOutput, PermissionRequest, PluginRuntime,
+        PluginShellEnvInput, PluginTools, ProviderContext, ProviderSmallModelInput,
+        ProviderSmallModelOutput, ProviderSource, SessionCompactingInput, SessionCompactingOutput,
+        ShellEnvOutput, TextCompleteInput, TextCompleteOutput, ToolDefinition, ToolDefinitionInput,
+        ToolExecuteAfterInput, ToolExecuteBeforeInput, ToolExecuteBeforeOutput, ToolOutput,
+    };
 
     const COMPACTION_PLUGIN: &str = r#"
 export default {
@@ -1019,6 +1039,431 @@ export default {
 };
 "#;
 
+    const AUTH_LOADER_PLUGIN: &str = r#"
+import { appendFileSync } from "node:fs";
+
+export default {
+  id: "production-auth-loader-fixture",
+  server: async (_input, options) => ({
+    auth: {
+      provider: "groq",
+      loader: async (getAuth) => {
+        const auth = await getAuth();
+        appendFileSync(options.callLog, `${JSON.stringify(auth)}\n`);
+        if (options.alwaysFail || auth === null) {
+          throw new Error(options.alwaysFail
+            ? "task173 authenticated loader failure"
+            : "task173 configured provider has no stored auth");
+        }
+        return {};
+      },
+      methods: [],
+    },
+  }),
+};
+"#;
+
+    const PROVIDER_MODELS_PLUGIN: &str = r#"
+export default {
+  id: "production-provider-models-fixture",
+  server: async () => ({
+    provider: {
+      id: "groq",
+      models: async () => {
+        throw new Error("task173 provider model loader failure");
+      },
+    },
+  }),
+};
+"#;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Surface {
+        Run,
+        Models,
+        Tui,
+        Http,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FailureBoundary {
+        HookBus,
+        ResourceCallback,
+        ToolResult,
+        Shutdown,
+        NotApplicable,
+        Fatal,
+    }
+
+    const SURFACES: [Surface; 4] = [Surface::Run, Surface::Models, Surface::Tui, Surface::Http];
+
+    const fn failure_boundary(surface: Surface, hook: oc_plugin::HookName) -> FailureBoundary {
+        match (surface, hook) {
+            (Surface::Models, oc_plugin::HookName::Dispose) => FailureBoundary::Shutdown,
+            (Surface::Models, oc_plugin::HookName::Config) => FailureBoundary::HookBus,
+            (Surface::Models, oc_plugin::HookName::Auth | oc_plugin::HookName::Provider) => {
+                FailureBoundary::ResourceCallback
+            }
+            (Surface::Models, _) => FailureBoundary::NotApplicable,
+            (Surface::Run | Surface::Tui | Surface::Http, oc_plugin::HookName::Dispose) => {
+                FailureBoundary::Shutdown
+            }
+            (Surface::Run | Surface::Tui | Surface::Http, oc_plugin::HookName::Tool) => {
+                FailureBoundary::ToolResult
+            }
+            (
+                Surface::Run | Surface::Tui | Surface::Http,
+                oc_plugin::HookName::Auth | oc_plugin::HookName::Provider,
+            ) => FailureBoundary::ResourceCallback,
+            (Surface::Run | Surface::Tui | Surface::Http, _) => FailureBoundary::HookBus,
+        }
+    }
+
+    struct DisablingFailurePlugin {
+        manifest: PluginManifest,
+        disabled: AtomicBool,
+    }
+
+    impl DisablingFailurePlugin {
+        fn new(hook: HookName) -> Self {
+            Self {
+                manifest: PluginManifest::new(format!("failing-{}", hook.as_str()), vec![hook])
+                    .expect("single-hook failure manifest"),
+                disabled: AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Plugin for DisablingFailurePlugin {
+        fn manifest(&self) -> &PluginManifest {
+            &self.manifest
+        }
+
+        fn is_disabled(&self) -> bool {
+            self.disabled.load(Ordering::Acquire)
+        }
+
+        async fn call(&self, hook: &mut HookInvocation<'_>) -> Result<(), oc_error::BoxSource> {
+            self.disabled.store(true, Ordering::Release);
+            Err(Box::new(std::io::Error::other(format!(
+                "{} fixture failure",
+                hook.name()
+            ))))
+        }
+    }
+
+    async fn dispatch_failure_fixture(
+        bus: &HookBus,
+        hook: HookName,
+    ) -> Result<(), oc_error::PluginError> {
+        let provider = catalog_provider();
+        let model = provider
+            .models
+            .get("small-model")
+            .expect("fixture model")
+            .clone();
+        let provider_context = ProviderContext {
+            source: ProviderSource::Config,
+            options: serde_json::Map::new(),
+            info: provider.clone(),
+        };
+        let chat_context = ChatContext {
+            session_id: "ses",
+            agent: "build",
+            model: &model,
+            provider: &provider_context,
+            message: Message::new(Role::User, "hello"),
+        };
+
+        match hook {
+            HookName::Dispose => bus.dispatch(HookInvocation::Dispose).await,
+            HookName::Event => {
+                let event = oc_engine::r#loop::TurnEvent::TurnStarted {
+                    session_id: "ses".to_owned(),
+                };
+                bus.dispatch(HookInvocation::Event { event: &event }).await
+            }
+            HookName::Config => {
+                let mut config = oc_config::Config::default();
+                bus.dispatch(HookInvocation::Config {
+                    config: &mut config,
+                })
+                .await
+            }
+            HookName::Tool => {
+                let mut output = PluginTools::new();
+                bus.dispatch(HookInvocation::Tool {
+                    output: &mut output,
+                })
+                .await
+            }
+            HookName::Auth => {
+                let mut output = Vec::new();
+                bus.dispatch(HookInvocation::Auth {
+                    output: &mut output,
+                })
+                .await
+            }
+            HookName::Provider => {
+                let mut output = Vec::new();
+                bus.dispatch(HookInvocation::Provider {
+                    output: &mut output,
+                })
+                .await
+            }
+            HookName::ChatMessage => {
+                let input = ChatMessageInput {
+                    session_id: "ses",
+                    agent: Some("build"),
+                    model: None,
+                    message_id: Some("message"),
+                    variant: None,
+                };
+                let mut output = ChatMessageOutput {
+                    message: oc_db::message::MessageRecord::from_json(json!({
+                        "id": "message",
+                        "sessionID": "ses",
+                        "role": "user",
+                        "time": {"created": 1},
+                        "agent": "build",
+                        "model": {"providerID": "groq", "modelID": "small-model"}
+                    }))
+                    .expect("fixture user message"),
+                    parts: Vec::new(),
+                };
+                bus.dispatch(HookInvocation::ChatMessage {
+                    input: &input,
+                    output: &mut output,
+                })
+                .await
+            }
+            HookName::ChatParams => {
+                let mut output = ChatParamsOutput::default();
+                bus.dispatch(HookInvocation::ChatParams {
+                    input: &chat_context,
+                    output: &mut output,
+                })
+                .await
+            }
+            HookName::ChatHeaders => {
+                let mut output = ChatHeadersOutput::default();
+                bus.dispatch(HookInvocation::ChatHeaders {
+                    input: &chat_context,
+                    output: &mut output,
+                })
+                .await
+            }
+            HookName::PermissionAsk => {
+                let request = PermissionRequest {
+                    id: "permission".to_owned(),
+                    session_id: "ses".to_owned(),
+                    permission: "read".to_owned(),
+                    patterns: vec!["*".to_owned()],
+                    metadata: serde_json::Map::new(),
+                    always: Vec::new(),
+                    tool: None,
+                };
+                let input = PermissionAskInput { request: &request };
+                let mut output = PermissionAskOutput::default();
+                bus.dispatch(HookInvocation::PermissionAsk {
+                    input: &input,
+                    output: &mut output,
+                })
+                .await
+            }
+            HookName::CommandExecuteBefore => {
+                let input = CommandExecuteBeforeInput {
+                    command: "build",
+                    session_id: "ses",
+                    arguments: "--release",
+                };
+                let mut output = CommandExecuteBeforeOutput::default();
+                bus.dispatch(HookInvocation::CommandExecuteBefore {
+                    input: &input,
+                    output: &mut output,
+                })
+                .await
+            }
+            HookName::ToolExecuteBefore => {
+                let input = ToolExecuteBeforeInput {
+                    tool: "echo",
+                    session_id: "ses",
+                    call_id: "call",
+                };
+                let mut output = ToolExecuteBeforeOutput {
+                    args: json!({"value": 1}),
+                };
+                bus.dispatch(HookInvocation::ToolExecuteBefore {
+                    input: &input,
+                    output: &mut output,
+                })
+                .await
+            }
+            HookName::ShellEnv => {
+                let input = PluginShellEnvInput {
+                    cwd: "/work",
+                    session_id: Some("ses"),
+                    call_id: Some("call"),
+                };
+                let mut output = ShellEnvOutput::default();
+                bus.dispatch(HookInvocation::ShellEnv {
+                    input: &input,
+                    output: &mut output,
+                })
+                .await
+            }
+            HookName::ToolExecuteAfter => {
+                let args = json!({"value": 1});
+                let input = ToolExecuteAfterInput {
+                    tool: "echo",
+                    session_id: "ses",
+                    call_id: "call",
+                    args: &args,
+                };
+                let mut output = ToolOutput::text("echo", "ok");
+                bus.dispatch(HookInvocation::ToolExecuteAfter {
+                    input: &input,
+                    output: &mut output,
+                })
+                .await
+            }
+            HookName::ChatMessagesTransform => {
+                let mut output = ChatMessagesTransformOutput {
+                    messages: vec![MessageWithParts {
+                        info: Message::new(Role::User, "hello"),
+                        parts: Vec::new(),
+                    }],
+                };
+                bus.dispatch(HookInvocation::ChatMessagesTransform {
+                    output: &mut output,
+                })
+                .await
+            }
+            HookName::ChatSystemTransform => {
+                let input = ChatSystemTransformInput {
+                    session_id: Some("ses"),
+                    model: &model,
+                };
+                let mut output = ChatSystemTransformOutput::default();
+                bus.dispatch(HookInvocation::ChatSystemTransform {
+                    input: &input,
+                    output: &mut output,
+                })
+                .await
+            }
+            HookName::ProviderSmallModel => {
+                let input = ProviderSmallModelInput {
+                    provider: &provider,
+                };
+                let mut output = ProviderSmallModelOutput::default();
+                bus.dispatch(HookInvocation::ProviderSmallModel {
+                    input: &input,
+                    output: &mut output,
+                })
+                .await
+            }
+            HookName::SessionCompacting => {
+                let input = SessionCompactingInput { session_id: "ses" };
+                let mut output = SessionCompactingOutput::default();
+                bus.dispatch(HookInvocation::SessionCompacting {
+                    input: &input,
+                    output: &mut output,
+                })
+                .await
+            }
+            HookName::CompactionAutocontinue => {
+                let input = CompactionAutocontinueInput {
+                    context: &chat_context,
+                    overflow: true,
+                };
+                let mut output = CompactionAutocontinueOutput { enabled: true };
+                bus.dispatch(HookInvocation::CompactionAutocontinue {
+                    input: &input,
+                    output: &mut output,
+                })
+                .await
+            }
+            HookName::TextComplete => {
+                let input = TextCompleteInput {
+                    session_id: "ses",
+                    message_id: "message",
+                    part_id: "part",
+                };
+                let mut output = TextCompleteOutput {
+                    text: "done".to_owned(),
+                };
+                bus.dispatch(HookInvocation::TextComplete {
+                    input: &input,
+                    output: &mut output,
+                })
+                .await
+            }
+            HookName::ToolDefinition => {
+                let input = ToolDefinitionInput { tool_id: "echo" };
+                let mut output = ToolDefinition {
+                    id: "echo".to_owned(),
+                    description: "echo".to_owned(),
+                    parameters: json!({"type": "object"}),
+                };
+                bus.dispatch(HookInvocation::ToolDefinition {
+                    input: &input,
+                    output: &mut output,
+                })
+                .await
+            }
+        }
+    }
+
+    fn plugin_catalog(config: &oc_config::Config) -> Catalog {
+        let document = serde_json::from_value(json!({
+            "groq": {
+                "id": "groq",
+                "name": "Groq",
+                "env": [],
+                "npm": "@ai-sdk/openai-compatible",
+                "models": {
+                    "small-model": {
+                        "id": "small-model",
+                        "name": "Small Model",
+                        "limit": { "context": 100_000, "output": 4_096 }
+                    }
+                }
+            }
+        }))
+        .expect("catalog document");
+        Catalog::resolve(&document, &ResolveInput::new().with_config(config))
+    }
+
+    async fn load_catalog_plugin(
+        env: &ScriptedEnv,
+        source: &str,
+        options: serde_json::Value,
+    ) -> (PluginRuntime, oc_config::Config) {
+        let plugin = env.project().join("catalog-plugin.mjs");
+        std::fs::write(&plugin, source).expect("write catalog plugin");
+        let config: oc_config::Config = serde_json::from_value(json!({
+            "plugin": [[format!("file:{}", plugin.display()), options]],
+            "provider": { "groq": {} }
+        }))
+        .expect("parse catalog plugin config");
+        let process_env = oc_paths::Env::from_pairs(env.env_vars());
+        let layout = oc_paths::Layout::resolve(&process_env);
+        let project = oc_paths::project::resolve_project(env.project());
+        let runtime = PluginRuntime::load(
+            &config,
+            &project,
+            env.project(),
+            env.project(),
+            &layout,
+            false,
+            super::PluginRuntimeTarget::server("catalog-test"),
+        )
+        .await
+        .expect("load catalog plugin");
+        (runtime, config)
+    }
+
     fn catalog_provider() -> ResolvedProvider {
         let model = ResolvedModel {
             id: "small-model".to_owned(),
@@ -1052,6 +1497,125 @@ export default {
             availability: Availability::none(),
             models: BTreeMap::from([("small-model".to_owned(), model)]),
         }
+    }
+
+    #[tokio::test]
+    async fn every_hook_surface_failure_boundary_is_non_fatal_by_name() {
+        let mut applicable = 0;
+        for surface in SURFACES {
+            for hook in HookName::ALL {
+                let boundary = failure_boundary(surface, hook);
+                assert_ne!(
+                    boundary,
+                    FailureBoundary::Fatal,
+                    "{} × {surface:?} maps a plugin failure to a fatal surface error",
+                    hook.as_str()
+                );
+                if boundary != FailureBoundary::NotApplicable {
+                    applicable += 1;
+                }
+                if matches!(
+                    boundary,
+                    FailureBoundary::HookBus | FailureBoundary::Shutdown
+                ) {
+                    let plugin = Arc::new(DisablingFailurePlugin::new(hook));
+                    let bus = HookBus::new(vec![plugin]);
+                    let result = dispatch_failure_fixture(&bus, hook).await;
+                    assert!(
+                        result.is_ok(),
+                        "{} × {surface:?} propagated a disabled plugin failure: {result:?}",
+                        hook.as_str()
+                    );
+                }
+            }
+        }
+        assert_eq!(applicable, 67, "the hook × surface matrix changed coverage");
+    }
+
+    #[tokio::test]
+    async fn configured_provider_without_stored_auth_does_not_invoke_auth_loader() {
+        let env = ScriptedEnv::new().expect("isolated auth-loader environment");
+        let call_log = env.project().join("auth-loader.calls");
+        let (runtime, config) = load_catalog_plugin(
+            &env,
+            AUTH_LOADER_PLUGIN,
+            json!({ "callLog": call_log, "alwaysFail": false }),
+        )
+        .await;
+        let mut catalog = plugin_catalog(&config);
+
+        runtime
+            .apply_catalog(&mut catalog, &BTreeMap::new())
+            .await
+            .expect("an absent credential must skip the SDK's Promise<Auth> loader");
+
+        assert!(
+            !call_log.exists(),
+            "getAuth cannot legitimately return null through Promise<Auth>; the loader must not run"
+        );
+        assert!(runtime.take_diagnostics().is_empty());
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failing_auth_loader_is_disabled_and_catalog_resolution_continues_with_a_diagnostic() {
+        let env = ScriptedEnv::new().expect("isolated auth-loader environment");
+        let call_log = env.project().join("auth-loader.calls");
+        let (runtime, config) = load_catalog_plugin(
+            &env,
+            AUTH_LOADER_PLUGIN,
+            json!({ "callLog": call_log, "alwaysFail": true }),
+        )
+        .await;
+        let mut catalog = plugin_catalog(&config);
+        let credentials = BTreeMap::from([(
+            "groq".to_owned(),
+            Credential::Api {
+                key: Secret::new("fixture-key"),
+                metadata: None,
+            },
+        )]);
+
+        runtime
+            .apply_catalog(&mut catalog, &credentials)
+            .await
+            .expect("a failing auth loader must not abort catalog resolution");
+
+        let diagnostics = runtime.take_diagnostics();
+        assert_eq!(diagnostics.len(), 1, "diagnostics={diagnostics:?}");
+        assert!(
+            diagnostics[0].contains("production-auth-loader-fixture")
+                && diagnostics[0].contains("auth.loader")
+                && diagnostics[0].contains("authenticated loader failure"),
+            "the diagnostic must name plugin, hook, and cause: {diagnostics:?}"
+        );
+        assert!(
+            runtime.load.plugins()[0].is_disabled(),
+            "the failing auth plugin must remain disabled"
+        );
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failing_provider_model_loader_is_disabled_and_catalog_resolution_continues() {
+        let env = ScriptedEnv::new().expect("isolated provider-loader environment");
+        let (runtime, config) = load_catalog_plugin(&env, PROVIDER_MODELS_PLUGIN, json!({})).await;
+        let mut catalog = plugin_catalog(&config);
+
+        runtime
+            .apply_catalog(&mut catalog, &BTreeMap::new())
+            .await
+            .expect("a failing provider model loader must not abort catalog resolution");
+
+        let diagnostics = runtime.take_diagnostics();
+        assert_eq!(diagnostics.len(), 1, "diagnostics={diagnostics:?}");
+        assert!(
+            diagnostics[0].contains("production-provider-models-fixture")
+                && diagnostics[0].contains("provider.models")
+                && diagnostics[0].contains("provider model loader failure"),
+            "the diagnostic must name plugin, hook, and cause: {diagnostics:?}"
+        );
+        runtime.shutdown().await;
     }
 
     fn seeded_connection() -> oc_db::Connection {

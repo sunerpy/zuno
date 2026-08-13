@@ -80,6 +80,22 @@ const WRITTEN_CONTENT: &str = "the tool ran\n";
 const ANTIGRAVITY_SPEC: &str = "opencode-antigravity-auth@1.6.0";
 const ANTIGRAVITY_TOOL: &str = "google_search";
 
+const FAILING_AUTH_LOADER_PLUGIN: &str = r#"
+export default {
+  id: "cli-failing-auth-loader",
+  server: async () => ({
+    auth: {
+      provider: "test",
+      loader: async (getAuth) => {
+        await getAuth();
+        throw new Error("task173 CLI auth loader failure");
+      },
+      methods: [],
+    },
+  }),
+};
+"#;
+
 const AUTO_DISCOVERY_PLUGIN: &str = r#"
 import { appendFileSync } from "node:fs";
 
@@ -315,6 +331,13 @@ fn plugin_provider_config(base_url: &str, deny_plugin_tool: bool) -> String {
     config.to_string()
 }
 
+fn failing_auth_loader_provider_config(base_url: &str, plugin: &Path) -> String {
+    let mut config: serde_json::Value =
+        serde_json::from_str(&provider_config(base_url)).expect("provider config is JSON");
+    config["plugin"] = serde_json::json!([[format!("file:{}", plugin.display()), {}]]);
+    config.to_string()
+}
+
 fn lifecycle_provider_config(
     base_url: &str,
     plugin: &Path,
@@ -489,6 +512,45 @@ async fn run_plugin_prompt(
         .expect("launch plugin-backed opencode-rust run")
 }
 
+async fn run_failing_auth_loader_prompt(
+    env: &ScriptedEnv,
+    base_url: &str,
+    plugin: &Path,
+) -> Output {
+    let mut plugin_variables = variables(env, base_url);
+    plugin_variables.remove("OPENCODE_PURE");
+    plugin_variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
+    plugin_variables.insert(
+        "MISE_DATA_DIR".to_owned(),
+        "/config/.local/share/mise".to_owned(),
+    );
+    plugin_variables.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+    plugin_variables.insert(
+        "OPENCODE_CONFIG_CONTENT".to_owned(),
+        failing_auth_loader_provider_config(base_url, plugin),
+    );
+    plugin_variables.insert(
+        "OPENCODE_AUTH_CONTENT".to_owned(),
+        r#"{"test":{"type":"api","key":"fixture-key"}}"#.to_owned(),
+    );
+
+    let mut command = tokio::process::Command::new(binary());
+    command
+        .args([
+            "run",
+            "--model",
+            "test/test-model",
+            "Continue after the auth loader fails.",
+        ])
+        .current_dir(env.working_dir())
+        .env_clear()
+        .envs(plugin_variables);
+    tokio::time::timeout(Duration::from_secs(90), command.output())
+        .await
+        .expect("the failing-auth-loader run must finish inside its budget")
+        .expect("launch failing-auth-loader opencode-rust run")
+}
+
 async fn run_sdk_model_provider_prompt(
     env: &ScriptedEnv,
     base_url: &str,
@@ -606,6 +668,10 @@ async fn run_lifecycle_command_with_args(
         "/config/.local/share/mise".to_owned(),
     );
     plugin_variables.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+    plugin_variables.insert(
+        "OPENCODE_AUTH_CONTENT".to_owned(),
+        r#"{"test":{"type":"api","key":"fixture-key"}}"#.to_owned(),
+    );
     plugin_variables.insert(
         "OPENCODE_CONFIG_CONTENT".to_owned(),
         lifecycle_provider_config(base_url, plugin, event_file, dispose_file),
@@ -1526,6 +1592,42 @@ async fn noop_tool_definition_hook_preserves_real_schemas_and_stays_enabled() {
         calls.lines().collect::<Vec<_>>(),
         advertised_tools(&plugin_turn),
         "the plugin must remain enabled through every real tool definition: {calls:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failing_auth_loader_is_disabled_and_cli_run_completes_with_a_diagnostic() {
+    let env = ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::TempFile);
+    let plugin = env.project().join("failing-auth-loader.mjs");
+    std::fs::write(&plugin, FAILING_AUTH_LOADER_PLUGIN).expect("write failing auth loader");
+    let scenario = Scenario::new("CLI auth loader failure is contained")
+        .from_oracle_cassette(TITLE_CASSETTE)
+        .expect("the recorded title completion loads")
+        .from_oracle_cassette(TITLE_CASSETTE)
+        .expect("the recorded turn completion loads");
+    let provider = MockProvider::start(vec![scenario])
+        .await
+        .expect("mock provider binds loopback");
+
+    let output = run_failing_auth_loader_prompt(&env, provider.base_url(), &plugin).await;
+    let captured = provider.captured().await;
+    provider.shutdown().await;
+
+    assert!(
+        output.status.success(),
+        "the auth loader failure must disable only the plugin, not `run`\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(captured.len(), 2, "the CLI turn must reach the provider");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cli-failing-auth-loader")
+            && stderr.contains("auth.loader")
+            && stderr.contains("task173 CLI auth loader failure"),
+        "the default CLI diagnostic must name plugin, hook, and cause: {stderr}"
     );
 }
 

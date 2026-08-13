@@ -1460,7 +1460,7 @@ Dependency direction is strictly downward from `oc-cli`; `oc-engine` never depen
   What to do / Must NOT do: **F3's wave-13 finding F3-W13-07, and the ROOT CAUSE of its wave-12 high-severity finding — `@sunerpy/oh-my-openagent@4.21.0` was never at fault.** `tool.definition` (hook 21 of 21) is unusable by **any** JavaScript plugin: a four-line no-op hook is disabled on every turn. F3's control experiment is decisive — the same plugin with the hook renamed to `chat.message` runs clean, so *registering `tool.definition` at all* is sufficient to be disabled. F3 dumped what the hook received and the data arrives **fully populated**; the loss is on the host's read-back. The plan owner measured why: the reported pointer `/parameters/properties/todos/items/properties/priority/oneOf/0` is **exactly 8 levels deep**, and `shim.mjs:95` sets `MAX_DEPTH = 8` — so a built-in tool's own JSON Schema trips the host's encoder, and todo 151's guard then reports the plugin as the truncator. **This is seam #18's third appearance.** Must NOT simply raise `MAX_DEPTH`: that relocates the cliff, and the plan already forbade it in todo 147. Must NOT weaken todo 151's refusal — a genuinely truncated plugin mutation must still be refused; the defect is misattribution plus a bound that real built-in data exceeds. The host must not accuse a plugin of damage the host inflicted.
   Acceptance criteria (agent-executable): a no-op JavaScript `tool.definition` hook completes a real turn with the plugin still enabled, proven through the production CLI; the real built-in tool schemas round-trip through the hook byte-identically; a genuinely plugin-truncated mutation is still refused and the diagnostic names the plugin only when the plugin is actually responsible; reverting the fix fails all three by name.
 
-- [ ] 173. `crates/oc-cli/src/cmd/plugin_runtime.rs` + the auth path: stop a plugin `auth.loader` failure from killing `run`, `models` and HTTP turns - expect the documented disable-and-continue contract on every hook path
+- [x] 173. `crates/oc-cli/src/cmd/plugin_runtime.rs` + the auth path: stop a plugin `auth.loader` failure from killing `run`, `models` and HTTP turns - expect the documented disable-and-continue contract on every hook path
   What to do / Must NOT do: **F3's wave-13 finding F3-W13-01 — the same defect class todo 168 fixed, on a path todo 168 did not cover.** A plugin `auth.loader` failure is fatal: it kills `run`, kills **`models`** (zero output, exit 1), and kills turns through the HTTP server. F3 found the trigger is the *ordinary* "provider configured but not logged in" state, because the host resolves `getAuth()` to `null` against the `Promise<Auth>` type the plugin compiles against — so this fires in normal use, not an edge case. Apply `docs/plugin-authoring.md:88`'s contract here as todo 168 did for `tool.definition`. **Audit every remaining hook and every surface** (`run`, `models`, TUI, HTTP) for the same fatal mapping rather than fixing `auth.loader` alone — todo 168 fixed one path and F3 immediately found another, and seam #20 resurfaced on `edit` after being fixed for `bash`. Must NOT paper over the `getAuth()` null by returning a fake `Auth`; the SDK type is `Promise<Auth>`, so either the host must not call the loader in that state or the SDK-facing shape must legitimately express absence.
   Acceptance criteria (agent-executable): a plugin whose `auth.loader` fails leaves `run`, `models` and the HTTP turn all working, with the plugin disabled and an actionable diagnostic; the not-logged-in state specifically is covered by a named test; a matrix over every hook × surface asserts no hook failure is fatal, and making any one fatal fails that matrix by name.
 
@@ -1480,9 +1480,87 @@ Dependency direction is strictly downward from `oc-cli`; `oc-engine` never depen
   What to do / Must NOT do: **F3's wave-13 finding F3-W13-05.** The top-level config `model` key is parsed, echoed back by `debug config`, and then **ignored**: the turn silently uses the **catalog's first** model. F3 proved it in both directions with two distinguishable fake providers, and it affects both `run` and the TUI. This is a silent wrong-answer defect — the user is billed for and receives output from a model they did not select, with no diagnostic. Must NOT fix this by making `debug config` stop echoing the key; the key is documented configuration and must take effect. Must NOT break the fallback for the genuinely-unset case.
   Acceptance criteria (agent-executable): with two distinguishable providers configured and `model` set to the second, a real turn dispatches to the second — proven through the production CLI and the TUI path, not by reading resolution code; the unset case still falls back deterministically; ignoring the key again fails those tests by name.
 
-- [ ] 178. `crates/oc-testkit/src/oracle.rs` + the 1.18.15 test assets: re-pin the compatibility oracle to the newest installed release - expect the differentials to run again
+- [x] 178. `crates/oc-testkit/src/oracle.rs` + the 1.18.15 test assets: re-pin the compatibility oracle to the newest installed release - expect the differentials to run again
   What to do / Must NOT do: **The host's installed upstream `opencode` was upgraded to 1.18.18 mid-session, and `PINNED_RELEASE = "1.18.15"` (`oracle.rs:81`) now refuses it.** Five differentials fail with `OraclePinMismatch { pinned: "1.18.15", reported: "1.18.18" }`: `every_implemented_command_produces_the_same_normalized_output_as_the_oracle`, `every_exemption_states_a_reason_and_keeps_a_witness`, `the_declared_presentation_divergences_are_live`, `the_session_list_output_shape_difference_is_live`, and one more in the same file. **The orchestrator proved this is environmental, not a regression**: the same test fails identically at `6ab8c0ae`, before this wave's merges. The user's standing constraint is *"opencode 版本使用最新即可"* — the same instruction that drove todo 130's original re-pin, so follow that todo's precedent. Thirteen files reference `1.18.15`; re-pin all of them coherently, and **re-capture rather than hand-edit** any recorded fixture whose bytes come from the oracle. Must NOT pin to 1.18.18 by editing only the constant and leaving stale captures — a differential that compares new-binary output against old recorded bytes would report false divergences. Must NOT silence the mismatch check; it exists to stop exactly the version-attribution seam todo 146 closed. Must NOT delete a failing differential.
   Acceptance criteria (agent-executable): `PINNED_RELEASE` matches the newest installed release, and the version-refusal check still rejects a mismatched binary (prove with a named test); all five previously-failing differentials pass; every re-captured asset's provenance is asserted rather than assumed; any genuine behavioral difference the newer release introduces is either matched or declared in `docs/divergences.toml` with its reason; `grep -rn "1\.18\.15" crates/ docs/` shows only historical notes, never a live pin.
+
+## Final Verification Wave — convergence protocol (governing, adopted 2026-08-12)
+
+Adopted at the user's instruction after **thirteen** review waves failed to terminate.
+Mechanism borrowed from the `/dual-review` command's convergence rules
+(`/config/.config/opencode/command/dual-review.md`), adapted from two review paths to
+four. **These rules override any instruction in an individual reviewer prompt.**
+
+### Why this was necessary — the orchestrator's own fault, not the reviewers'
+
+Every one of wave 13's six findings passes the Blocker admission threshold below
+(concrete falsifiable + in scope + not taste). The reviewers were not padding. The
+divergence came from the orchestrator running **Round-1-style full audits thirteen
+times**, and from prompts that explicitly requested expansion — wave 13 told F2 to
+"look for the twenty-third [seam]", told F4 to "say whether an eighth layer exists",
+and told F1 to rule "every success criterion... All of them". Asking for the next
+finding reliably produced one. Todos generated per wave: 2, 5, 4, 8, 3, 3, 4, 7 — no
+downward trend across eight waves.
+
+### Convergence iron rules
+
+1. **Hard cap = 7 effective rounds from adoption** (raised from 3 by explicit user
+   authorization, 2026-08-12: *"我授权你使用硬上线为7轮，如果7轮收敛评审还没通过再与我确认"*).
+   Wave 13 is retroactively **Round 1**; waves 14-19 are Rounds 2-7. If open Blockers
+   remain after Round 7, **stop reviewing** and escalate to the user. An eighth round is
+   forbidden.
+
+   The raised cap buys rounds, **not scope**. Every other iron rule still binds: Rounds
+   2-7 remain delta-only against the frozen ledger, and a round that produces no new
+   threshold-passing Blocker converges immediately — the cap is a ceiling, not a target.
+   With four open ledger entries, converging well before Round 7 is the expectation.
+2. **Only Round 1 is a full audit.** Its output — the ledger below — is the single
+   authoritative list of open Blockers for the remainder of the review.
+3. **Round 2+ is delta-only.** Each reviewer answers exactly one closed question per
+   ledger entry: *"has this Blocker been closed: yes / no; if no, which frozen
+   criterion does it still violate?"* Re-auditing unchanged areas is forbidden.
+4. **New Blockers are accepted in one case only**: a regression **directly introduced**
+   by a fix for a ledger entry, which also passes the admission threshold. Everything
+   else becomes a Follow-up and does not block.
+5. **Disputes default to pass.** If reviewers disagree on whether something is a Blocker
+   and the threshold does not settle it, it is **not** a Blocker; record it as a risk.
+6. **Converged when a round produces no new threshold-passing Blocker** — confirming old
+   ones closed is enough. Convergence does not require a zero-defect implementation.
+
+### Blocker admission threshold — all three, or automatic downgrade
+
+1. **Concrete and falsifiable**: a named file:line, command output, or reproducible
+   observation. Not "this might not handle X".
+2. **In scope**: corresponds to a requirement or acceptance criterion **already written**
+   in this plan or in a contract this plan declares (e.g. `docs/plugin-authoring.md`).
+   A reviewer may **not** introduce a new goal, feature, or quality bar.
+3. **Not taste, not a technology preference**: "I would have used another design" is
+   never a Blocker.
+
+Failing any one → downgraded to Follow-up in the backlog; it does **not** block release.
+
+### Round 1 ledger (frozen — the only tracked list)
+
+| # | Source | Blocker | Todo | Status |
+|---|---|---|---|---|
+| 1 | F1 w13 | criterion 4: measured v1 plugin SDK routes answer 501 | 175 | closed, merged |
+| 2 | F3-W13-07 | `tool.definition` unusable by any JS plugin; host blames the plugin for its own truncation | 172 | open |
+| 3 | F3-W13-01 | plugin `auth.loader` failure kills `run`, `models` and HTTP turns | 173 | open |
+| 4 | F2-B7 | version gate reads the wrong manifest field and loads incompatibles the docs say are skipped | 174 | open |
+| 5 | F3-W13-05 | top-level config `model` key parsed, echoed, then ignored | 177 | closed, merged |
+| 6 | F4 w13 | `PluginInput.client` is an unprojected model boundary a live installed plugin uses | 176 | open |
+
+Plus **todo 178**, not a review finding: the host's upstream `opencode` was upgraded to
+1.18.18 mid-session while the oracle pins 1.18.15. Environmental, must be fixed regardless.
+
+### Follow-up backlog (recorded, non-blocking)
+
+Carried from F2's wave-11/12/13 non-blocking observations and F3's lower-severity
+findings. These are real and recorded, and explicitly **do not** block acceptance:
+`ProviderRetryPolicy` has no production caller; the malformed-plugin-model diagnostic is
+unguarded; Antigravity recovery's `tool_use_id` is not covered end to end; the published
+OpenAPI binds no request/response bodies; `/agent` schema drift is unverifiable against
+the available capture.
 
 - [ ] F1. Plan compliance audit
 - [ ] F2. Code quality review
@@ -1500,7 +1578,7 @@ Rules: implementation and its tests land in the **same** commit (never a "tests 
 The project succeeds when all of the following hold. Each is a test or a command, not a judgment.
 
 **Drop-in compatibility**
-1. `cargo test --test compat_suite` is green, including the **journal round-trip**: a database created by the Rust binary is opened by the **latest released `opencode` binary available on the host** (**amended 2026-08-09 on the plan owner's instruction — "opencode 版本使用最新即可"**: the criterion named 1.18.13; the oracle is re-pinned to the newest installed release, currently **1.18.15**, and the pinned pair is whatever that resolves to at capture time) without dying and with its `migration` row count unchanged. This is the single test that makes side-by-side use and rollback real rather than claimed. **Scoped honestly:** it proves parity with the pinned pair only. A newer TypeScript binary can apply migrations this one does not know, so the binary carries a max-known-migration ceiling and **refuses** a database above it, naming the ceiling and the observed id; the documented rollback promise is stated for pinned version pairs, not indefinitely.
+1. `cargo test --test compat_suite` is green, including the **journal round-trip**: a database created by the Rust binary is opened by the **latest released `opencode` binary available on the host** (**amended 2026-08-09 on the plan owner's instruction — "opencode 版本使用最新即可"**: the criterion named 1.18.13; the oracle is re-pinned to the newest installed release, currently **1.18.18**, and the pinned pair is whatever that resolves to at capture time) without dying and with its `migration` row count unchanged. This is the single test that makes side-by-side use and rollback real rather than claimed. **Scoped honestly:** it proves parity with the pinned pair only. A newer TypeScript binary can apply migrations this one does not know, so the binary carries a max-known-migration ceiling and **refuses** a database above it, naming the ceiling and the observed id; the documented rollback promise is stated for pinned version pairs, not indefinitely.
 2. The Rust binary reads the user's actual config at `/config/.config/opencode/opencode.json` and its full skill and agent trees, producing a merged configuration byte-identical to `opencode debug config` after normalization. **NARROWED 2026-08-09 on the plan owner's instruction (「收窄准则」)**: the byte-identical comparison is required in **pure mode** (`OPENCODE_PURE=1`), where neither binary loads plugins. The non-pure comparison is explicitly **out of scope**: the released binary's plugins synthesise a 221,818-byte `agent` tree and a 17,970-byte `command` tree that this port does not reproduce, because doing so means re-implementing third-party plugin output rather than the config contract. The narrowing is falsifiable, not a waiver: a test must assert the pure-mode outputs stay byte-identical, and the non-pure divergence must be a declared entry in `docs/divergences.toml` with its measured sizes, so a *new* non-pure difference is a failure rather than an absorbed one. **RESOLVED 2026-08-11 by todo 161:** the production differential now compares the complete file-backed output of released 1.18.15 and this binary, removes only released's empty deprecated `mode` diagnostic object, and asserts exact JSON equality; both normalized documents are 252,891 bytes with 9 agents, 2 commands, and 3 plugin origins.
    **STATUS DISCLOSED 2026-08-11 (todo 153) — criterion 2 currently does not hold; the previous green evidence measured a stale isolated capture, not this live tree.** The committed `user-config.json` is now refreshed to the live file and guarded by `real_user_config_capture_matches_live_file_byte_for_byte`; a missing live path or one changed byte fails visibly. That makes the capture honest and reproducible, but does not pretend its isolated fixture directory contains the host's adjacent Markdown trees. Independent same-cwd measurements with `OPENCODE_PURE=1` and released 1.18.15 produced 266,233 bytes upstream versus 25,581 bytes from Rust. Recursively sorting JSON keys and removing only upstream's empty diagnostic `mode` object did not close the difference: upstream discovered the nine files under `/config/.config/opencode/agent/powerapps/` (`agent`: 9 entries / 222,219 canonical bytes) and two files under `/config/.config/opencode/command/` (`command`: 2 entries / 18,022 canonical bytes), while Rust emitted empty objects (3 bytes each); upstream also emitted three `plugin_origins` metadata entries while Rust omitted the field. Because these `agent` and `command` values come from real adjacent configuration files even in pure mode, this is a genuine unresolved config-tree/debug-output parity defect, not plugin execution and not an environmental excuse. It is declared **UNMET**, not normalized away or added to the intentional-divergence allow-list.
 3. Every implemented CLI command produces normalized output identical to the real binary's; every command upstream registers has exactly one recorded disposition (implemented / rejected-with-a-message / not-registered) asserted by a test.

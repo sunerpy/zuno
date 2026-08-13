@@ -43,6 +43,22 @@ export default {
 };
 "#;
 
+const FAILING_AUTH_LOADER_PLUGIN: &str = r#"
+export default {
+  id: "http-failing-auth-loader",
+  server: async () => ({
+    auth: {
+      provider: "test",
+      loader: async (getAuth) => {
+        await getAuth();
+        throw new Error("task173 HTTP auth loader failure");
+      },
+      methods: [],
+    },
+  }),
+};
+"#;
+
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_opencode-rust"))
 }
@@ -102,6 +118,13 @@ fn tool_definition_plugin_provider_config(
         format!("file:{}", plugin.display()),
         { "callLog": call_log }
     ]]);
+    config.to_string()
+}
+
+fn failing_auth_loader_provider_config(base_url: &str, plugin: &Path) -> String {
+    let mut config: Value =
+        serde_json::from_str(&provider_config(base_url)).expect("provider config is JSON");
+    config["plugin"] = json!([[format!("file:{}", plugin.display()), {}]]);
     config.to_string()
 }
 
@@ -302,6 +325,26 @@ impl RunningServer {
             "/config/.local/share/mise".to_owned(),
         );
         variables.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+        Self::start_with_variables(env, variables).await
+    }
+
+    async fn start_with_failing_auth_loader(
+        env: &ScriptedEnv,
+        database: &Path,
+        config: String,
+    ) -> Self {
+        let mut variables = variables_with_config(env, database, config);
+        variables.remove("OPENCODE_PURE");
+        variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
+        variables.insert(
+            "MISE_DATA_DIR".to_owned(),
+            "/config/.local/share/mise".to_owned(),
+        );
+        variables.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+        variables.insert(
+            "OPENCODE_AUTH_CONTENT".to_owned(),
+            r#"{"test":{"type":"api","key":"fixture-key"}}"#.to_owned(),
+        );
         Self::start_with_variables(env, variables).await
     }
 
@@ -1054,6 +1097,65 @@ async fn noop_tool_definition_hook_preserves_real_schemas_and_stays_enabled_over
         advertised_tools(&plugin_turn),
         "the no-op HTTP plugin must remain enabled through every definition: {calls:?}"
     );
+
+    server.stop().await;
+    provider.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failing_auth_loader_is_disabled_and_http_turn_completes_with_a_diagnostic() {
+    let env = ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::Default);
+    let database = env.xdg_data().join("http-auth-loader-diagnostic.db");
+    seed_session(&database, env.project());
+    let plugin = env.project().join("http-failing-auth-loader.mjs");
+    std::fs::write(&plugin, FAILING_AUTH_LOADER_PLUGIN).expect("write failing auth loader");
+    let scenario = Scenario::new("HTTP auth loader failure is contained")
+        .from_oracle_cassette(CASSETTE)
+        .expect("recorded completion loads");
+    let provider = MockProvider::start(vec![scenario])
+        .await
+        .expect("mock provider binds loopback");
+    let config = failing_auth_loader_provider_config(provider.base_url(), &plugin);
+    let mut server = RunningServer::start_with_failing_auth_loader(&env, &database, config).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build loopback client");
+    let mut session_events = SseClient::connect(
+        &client,
+        format!("{}/api/session/{SESSION_ID}/event?after=0", server.base_url),
+    )
+    .await;
+
+    submit_http_prompt(&client, &server, "msg_task173_auth_loader_failure").await;
+    wait_for_http_turn(&client, &server).await;
+
+    let (diagnostic, completed) = tokio::time::timeout(RUN_TIMEOUT, async {
+        let mut completed = false;
+        loop {
+            let frame = session_events.next_json().await;
+            assert_ne!(
+                frame["type"], "session.error",
+                "auth loader failure killed HTTP turn: {frame}"
+            );
+            completed |= value_contains_text(&frame, "turn.completed");
+            if value_contains_text(&frame, "http-failing-auth-loader")
+                && value_contains_text(&frame, "auth.loader")
+                && value_contains_text(&frame, "task173 HTTP auth loader failure")
+            {
+                break (frame, completed);
+            }
+        }
+    })
+    .await
+    .expect("HTTP SSE must publish the auth-loader diagnostic inside the turn budget");
+    assert!(
+        completed,
+        "turn.completed must precede the contained diagnostic: {diagnostic}"
+    );
+    assert_message_contains(&client, &server, "Hello").await;
 
     server.stop().await;
     provider.shutdown().await;
