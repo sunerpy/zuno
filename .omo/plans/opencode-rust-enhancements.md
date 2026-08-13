@@ -361,73 +361,133 @@ consolidation pass touch only new rows, asserted by row counts.
 
 ---
 
-## E-9. antigravity's "google_search" — investigated, and it is not what it looks like **[pure], small**
+## E-9. antigravity's `google_search` as a standalone optional plugin **[pure], self-contained**
 
-**Raised by the user 2026-08-13**: search `opencode-antigravity-auth` for how `google_search`
-is implemented, and consider shipping it as an optional plugin here.
+**Raised by the user 2026-08-13**, then corrected by the user twice. Both corrections were right
+and both are recorded here, because the second one changes the design.
 
-### Correction of the record first
+### Correction 1 — I investigated the wrong version
 
-**There is no `google_search` tool.** I grepped both installed versions
-(`opencode-antigravity-auth@1.2.8` and `@1.3.0` under `/config/.bun/install/cache/`):
-`google_search` appears **zero times** in either. The real name is **`web_search`**, and
-**`.omo/plans/opencode-rust.md:1346` calls it `google_search`** in a QA scenario — that is my
-own error from an earlier wave, carried forward unchecked. It should read `web_search`.
+My first pass grepped `opencode-antigravity-auth@1.2.8` and `@1.3.0`, found no `google_search`,
+and concluded it did not exist. **The user pushed back**: *"我让你执行联网搜索时你就会调用这个工具"*.
+They were right. `opencode.json`'s `plugin` array names **`opencode-antigravity-auth@1.6.0`**, and
+`google_search` is there in full.
 
-### What it actually is: server-side grounding, not a tool
+**Why I got it wrong is the part worth keeping.** I listed what the *cache* contained
+(`ls .../*antigravity*`) and never read which version the *config* enables. Cache contents are not
+runtime state. That is the same error shape as the twenty-three seams found in the main plan:
+**I measured something adjacent to the truth rather than the truth.** Rule: to learn what is
+loaded, read the config that loads it.
 
-It is not a search tool the model calls. It is a **request transform** that injects Gemini's
-grounding configuration into the outgoing payload:
-
-```js
-// dist/src/plugin.js:963
-googleSearch: config.web_search ? {
-    mode: config.web_search.default_mode,
-    threshold: config.web_search.grounding_threshold
-} : undefined,
-```
+### What it actually is — a real registered tool, and a clever one
 
 ```js
-// dist/src/plugin/transform/gemini.js:310
-if (googleSearch && googleSearch.mode === 'auto') {
-    ...
-    googleSearchRetrieval: {
-        ...
-        dynamicThreshold: googleSearch.threshold ?? 0.3,
+// dist/src/plugin.js:1140
+tool: { google_search: googleSearchTool }
 ```
 
-Resolution order is variant-then-global (`request.js:831`:
-`variantConfig?.googleSearch ?? options?.googleSearch`), and it is configured by environment
-variable (`config/loader.js:141-146`: `OPENCODE_ANTIGRAVITY_WEB_SEARCH=auto|off`,
-`OPENCODE_ANTIGRAVITY_WEB_SEARCH_THRESHOLD`).
+Args are `query`, `urls?`, `thinking?` (default true) — the signature is identical to the tool
+this session actually calls, which is what the user recognised.
 
-So **Google performs the search server-side during generation** and grounds the answer. There is
-no HTTP client, no result parsing, no tool registration — nothing that would become a "search
-plugin". The searching is done by the model provider.
+The implementation is a deliberate workaround, and the reason is in the source:
 
-### Why it therefore does not port as a plugin, and what does port
+```js
+// dist/src/plugin/search.js:4
+ * Due to Gemini API limitations, native search tools (googleSearch, urlContext)
+ * cannot be combined with function declarations. This module implements a
+ * wrapper that makes separate API calls with only the grounding tools enabled.
+```
 
-Making this "an optional plugin" would be a category error: the mechanism is a
-**Gemini-request-shaping concern**, and this project already has the right home for it —
-`oc-provider-google` and the surface-aware request building todo 156 added.
+So it makes a **separate Gemini call** whose `tools` array holds only `{googleSearch:{}}` (plus
+`{urlContext:{}}` when URLs are supplied) and **no function declarations**, then renders the
+grounding metadata into Markdown with source citations.
 
-What is worth adopting is small and real:
-- **A `googleSearchRetrieval` grounding option on the Google/Gemini request path**, off by
-  default, with `mode` and `dynamicThreshold`.
-- **Variant-then-global resolution**, matching antigravity's precedence.
-- Configuration through the project's existing config, **not** a bespoke env var.
+Concrete facts, all verified:
+- Endpoint `https://cloudcode-pa.googleapis.com` (`constants.js:30`), with daily/autopush
+  sandboxes and a fallback list (`:28-35`).
+- `SEARCH_MODEL = "gemini-2.5-flash"` (`:184`), `SEARCH_TIMEOUT_MS = 60000` (`:196`), and a
+  dedicated `SEARCH_SYSTEM_INSTRUCTION` (`:200`).
+- Auth is the plugin's cached OAuth token; on expiry it calls `refreshAccessToken`
+  (`plugin.js:1117-1126`). **No API key.**
+- Failure returns a plain string telling the user to run `opencode auth login`.
 
-**Dependency cost [pure]**: one optional field in a request body this project already builds.
+**The constraint that must be copied, not just noted**: grounding tools cannot coexist with
+function declarations. Injecting `googleSearch` into the main conversation request would collide
+with this project's tool declarations. **It has to be a separate request.** That is not an
+implementation detail; it is why the wrapper exists.
 
-**Do not** reimplement `web_search` as a tool that calls a Google API — that needs a key and an
-HTTP surface, and it is a different feature from what antigravity does.
+### Correction 2 — the user wants it as a standalone plugin, and that is the right call
 
-**Acceptance criteria (agent-executable)**: with grounding enabled, a Gemini request body carries
-`googleSearchRetrieval` with the configured threshold, asserted on the captured request; with it
-off (the default) the field is absent; a variant-level setting overrides the global one; removing
-the injection fails a named test. Also fix `.omo/plans/opencode-rust.md:1346` to say `web_search`.
+> *"如果实现可以作为一个独立的 plugin 进行实现不要影响主进程，后续也可以废弃"*
 
----
+My earlier draft proposed folding grounding into `oc-provider-google`'s request path. **That was
+wrong on two counts**: it would put a Gemini-only, OAuth-bound feature in the core request
+builder, and it would be hard to remove later. A standalone plugin is better because:
+
+- **The main process is unaffected.** No core code path changes; the binary works identically with
+  the plugin absent.
+- **It is discardable.** If Google changes the endpoint or the OAuth flow — plausible for a
+  `cloudcode-pa` sandbox surface — the plugin is deleted, not untangled.
+- **Gating already exists.** `websearch/mod.rs:3-8`: an unconfigured tool is **absent** from the
+  tool list rather than present-and-failing. Without a Google OAuth credential this tool simply
+  does not appear.
+
+### The auth question the user raised — mostly already answered
+
+> *"可能需要实现 gemini 或者反重力的认证登录方式，看看有没有相关 sdk 实现"*
+
+**No SDK is needed, and no new login flow is needed.** Verified:
+
+- `crates/oc-auth/src/provider.rs:63` already has `Credential::OAuth { refresh, access, expires }`
+  — the exact shape antigravity stores.
+- `/config/.local/share/opencode/auth.json` already holds a `google` entry of type `oauth` with
+  `access`, `refresh`, `expires` (124-char refresh token, `1//0e…` — a Google refresh token).
+  **This project already reads that store.**
+
+So the plugin **consumes an existing credential**; it does not mint one. What remains is narrow:
+- **Token refresh** when `expires` has passed — a standard Google OAuth refresh POST. Whether
+  `oc-auth` already refreshes or only reads must be checked before assuming.
+- **Project id extraction** from the refresh token's parts (antigravity's `parseRefreshParts`
+  yields `managedProjectId || projectId`); the Cloud Code endpoint needs it.
+
+**Only if a fresh login is ever wanted** would a device-code or loopback flow be needed — and that
+is a separate, larger item. Do not build it as part of this.
+
+### Dependency cost
+
+**[pure]** — one HTTPS POST and JSON parsing, both already in the workspace. No SDK. No new crate.
+The `oauth2` crate would only be justified if a full login flow is built later, and even then it
+should be weighed against the existing hand-rolled auth code.
+
+### Acceptance criteria (agent-executable)
+
+- With a `google` OAuth credential present, `google_search` appears in the tool list and a real
+  query returns cited results; with the credential absent the tool is **absent**, not failing.
+- The outgoing request carries `{googleSearch:{}}` and **no** function declarations, asserted on
+  the captured request body — the Gemini constraint is the thing most likely to be broken by a
+  later refactor.
+- `urls` supplied adds `{urlContext:{}}`; omitted, it does not.
+- An expired token is refreshed once and the search retried; a refresh failure returns an
+  actionable message naming the login command rather than a raw error.
+- Removing the plugin leaves the binary and its test suite unchanged — proving the main process is
+  genuinely unaffected.
+- The 60s timeout is enforced and bounded, consistent with `websearch`'s existing bounded fetch.
+
+### Open question to settle first, before writing code
+
+**Which plugin substrate?** This project's JS plugin host discovers an external `bun`/`node`
+(`oc-plugin/src/js/runtime.rs:141`), so a JS plugin would reintroduce exactly the runtime
+dependency the project refuses. Three options, in order of my preference:
+
+1. **A native Rust optional tool behind a cargo feature**, gated on the credential's presence —
+   mirrors the `wasmtime` precedent (feature-gated, absent from default builds, enforced by
+   `wasmtime_feature_gate.rs`). Self-contained and discardable by deleting one module.
+2. **A WASM plugin** through the existing gated `oc-plugin/wasm` surface.
+3. **A JS plugin** — most faithful to antigravity's own packaging, but only usable when an external
+   runtime happens to exist. Acceptable for an optional extra; unacceptable for anything core.
+
+I lean to (1): it satisfies "standalone, does not affect the main process, discardable later"
+without depending on Node.
 
 ## E-10. Keyless search backend — **already implemented; verify, do not build** **[pure]**
 
