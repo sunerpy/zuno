@@ -1544,8 +1544,8 @@ Failing any one → downgraded to Follow-up in the backlog; it does **not** bloc
 | # | Source | Blocker | Todo | Status |
 |---|---|---|---|---|
 | 1 | F1 w13 | criterion 4: measured v1 plugin SDK routes answer 501 | 175 | closed, merged |
-| 2 | F3-W13-07 | `tool.definition` unusable by any JS plugin; host blames the plugin for its own truncation | 172 | open |
-| 3 | F3-W13-01 | plugin `auth.loader` failure kills `run`, `models` and HTTP turns | 173 | open |
+| 2 | F3-W13-07 | `tool.definition` unusable by any JS plugin; host blames the plugin for its own truncation | 172 | closed, merged |
+| 3 | F3-W13-01 | plugin `auth.loader` failure kills `run`, `models` and HTTP turns | 173 | closed, merged |
 | 4 | F2-B7 | version gate reads the wrong manifest field and loads incompatibles the docs say are skipped | 174 | open |
 | 5 | F3-W13-05 | top-level config `model` key parsed, echoed, then ignored | 177 | closed, merged |
 | 6 | F4 w13 | `PluginInput.client` is an unprojected model boundary a live installed plugin uses | 176 | open |
