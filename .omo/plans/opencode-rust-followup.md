@@ -158,6 +158,8 @@ test for the gap is updated or retired accordingly.
 
 ## FU-6. Legacy reverse-projection `release_date` restoration is unguarded
 
+**Status: CLOSED (2026-08-13)** — Pinned, and the gap was four fields wide, not one: `release_date`, `variants`, `capabilities.interleaved` and `limit.input` were all unobservable because `kiro_model()` held their defaults; two new tests drive the real JS auth loader over a non-default canonical model so all five restorations fail by name.
+
 **Source**: the orchestrator found it while mutation-verifying todo 176; **F4 independently
 ruled it Follow-up** in Round 2 after `git blame` showed it predates todo 176
 (commit `35cda9514`), so it is not a regression that todo introduced.

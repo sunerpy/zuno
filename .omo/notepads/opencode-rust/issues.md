@@ -7708,3 +7708,39 @@ regressions, changed-file diagnostics, the complete workspace test suite, zero-w
 rustfmt, and diff checks passed. The first workspace run encountered the already-known host
 `WouldBlock` resource limit; the single-job, single-test-thread retry completed without skipping
 tests.
+
+## FU-6 — the legacy reverse projection's unguarded restorations were four fields wide
+
+FU-6 was filed against one line, `crates/oc-plugin/src/js/projection.rs:267`
+(`model.release_date`). Mutating each of the five restorations in that
+`SdkGeneration::Legacy` branch independently showed the gap is wider: deleting
+`release_date` (:267), `variants` (:268), `capabilities.interleaved` (:269) or
+`limit.input` (:270) each left the whole workspace suite green. Only `family`
+(:266) failed anything, and only incidentally — the two byte-identity tests
+catch it without naming it.
+
+The cause is a single mechanism, not five: `model_value` omits all five fields
+for Legacy (`:133-185`), so JS never receives them; `plugin_model_value` refills
+each with a default on the way back (`:303-321`); the restoration at `:265-271`
+is the only thing that recovers the canonical value. Every one of them is
+load-bearing, and the trigger is merely "a plugin declares an `auth.loader`" —
+`HandleAuthLoader::load` (`crates/oc-plugin/src/js/bridge.rs:361`) is the sole
+production caller of `plugin_provider` and always passes `Legacy`, so a no-op
+loader silently blanks `release_date` on every dated catalog model without it.
+
+Why the suite stayed green is the reusable lesson. The only canonical-model
+fixture, `kiro_model()` (`tests/js.rs:1538`), sets `release_date: String::new()`,
+`variants: BTreeMap::new()`, `ModelCapabilities::default()` (interleaved
+`Flag(false)`) and `ModelLimit::default()` (`input: None`) — every one byte-equal
+to what the reverse projection refills. Four textbook equivalent mutants. The
+one field with a non-default value, `family: "claude"`, was the only one covered.
+A guard is only as strong as the fixture's distance from the defaults it
+restores; asserting a field that already equals its default asserts nothing.
+The two new tests use a fixture deliberately non-default in all five, so each
+restoration now fails by name, and the fixture's doc comment records why the
+values must stay non-default.
+
+This also matches the FU-6 discovery story: the orchestrator mutated this line
+while verifying todo 176, saw nothing fail, and drew the wrong conclusion. The
+mutation was fine; the fixture made it unobservable. When a mutation produces no
+failure, check the fixture's values before concluding the line is dead.

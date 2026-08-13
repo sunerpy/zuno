@@ -1,0 +1,239 @@
+FU-6: Legacy reverse-projection `release_date` restoration is unguarded
+================================================================================
+Worktree: /config/workspace/ProdDir/AI/oc-wt/fu6   Branch: task-fu6
+Base commit: 9e8f0e673423c93197da989193277ecc96ccf2b9
+CARGO_TARGET_DIR=/tmp/opencode/fu6
+
+BASELINE (before any change)
+--------------------------------------------------------------------------------
+`CARGO_TARGET_DIR=/tmp/opencode/fu6 cargo test --workspace --offline`
+  -> 3473 passed, 0 failed (matches the required floor exactly).
+
+THE TWO `release_date` PATHS ARE UNRELATED
+--------------------------------------------------------------------------------
+The plan notes that "two separate code paths handle `release_date`; only one is
+guarded". Confirmed, and they are not variants of one mechanism:
+
+- `crates/oc-server/src/api/provider.rs:812` — `legacy_model_info()`, a forward
+  HTTP DTO serializer over `CatalogModel`. Pinned by
+  `compat_v1_provider_projection_preserves_catalog_model_semantics`.
+- `crates/oc-plugin/src/js/projection.rs:267` — `plugin_provider()`, the reverse
+  (JS -> Rust) projection over `ResolvedModel`. Unguarded.
+
+Different crates, different source types, different directions. Nothing about
+the forward guard constrains the reverse one.
+
+REACHABILITY: CAN A LEGACY MODEL REACH :267 WITH A DIFFERING `release_date`?
+--------------------------------------------------------------------------------
+ANSWER: YES. The line is load-bearing, and the dominant case is silent data
+loss on every real catalog model, not an exotic edge case.
+
+The path, with the single runtime entry:
+
+1. `HandleAuthLoader::load` (`crates/oc-plugin/src/js/bridge.rs:311-367`) is the
+   ONLY production caller of `plugin_provider`. A workspace-wide search for
+   `\bplugin_provider\s*\(` returns exactly one call site, `bridge.rs:361`, and
+   it passes `SdkGeneration::Legacy` as an inline literal. So *every* call to
+   this function takes the Legacy branch — the branch is not a rare arm, it is
+   the whole function's behaviour in production.
+
+2. `bridge.rs:325-331` projects the provider out to JS with
+   `provider_value(provider, SdkGeneration::Legacy, ...)`.
+
+3. `model_value(model, SdkGeneration::Legacy)` (`projection.rs:163-185`) builds
+   the per-model object and **omits `release_date` entirely** — that field is
+   inserted only under `if generation == SdkGeneration::V2` (`:175-185`). The JS
+   auth loader therefore never sees a `release_date` key.
+
+4. The JS loader mutates the provider in place; the host returns the mutated
+   argument (`bridge.rs:339`).
+
+5. `plugin_model_value` (`projection.rs:303-321`) refills the Legacy-omitted
+   fields before deserializing, using
+   `fields.entry("release_date").or_insert_with(|| Value::String(String::new()))`
+   (`:307-309`) — i.e. **the empty string**, because the real value was never
+   sent to JS and cannot be recovered from the returned object.
+
+6. `serde_json::from_value` yields `release_date == ""`.
+
+7. `:267` `model.release_date.clone_from(&original.release_date)` restores the
+   canonical value from `canonical.models[id]`.
+
+So for any canonical model whose `release_date` is non-empty — every dated
+models.dev entry, e.g. "2026-02-01" — the value arriving at step 6 differs from
+`original`, and deleting `:267` destroys it. The trigger is merely "a plugin
+declares an `auth.loader`"; the loader does not have to touch models at all. A
+no-op loader is enough, because the loss happens in the projection, not in the
+plugin.
+
+Second, narrower case (also real): a loader may *write* a field it was never
+shown — `provider.models["existing-id"].release_date = "1999-01-01"`. Serde's
+`Entry::or_insert_with` does not overwrite an occupied entry, so the forged
+value survives step 5. `:267` overwrites it with the canonical value, so the
+line additionally stops a legacy-generation plugin forging a field outside its
+declared SDK surface.
+
+Conclusion: Option A (pin it). Option B is refuted — the line is not redundant;
+"the forward projection is typed" is exactly *why* the reverse side loses the
+value, since the typed Legacy forward shape deliberately omits the field.
+
+WHY THE WHOLE SUITE STAYED GREEN — AN EQUIVALENT-MUTANT TRAP
+--------------------------------------------------------------------------------
+The restore loop is skipped entirely for model ids absent from `canonical`
+(`projection.rs:261-263` `continue`). The only test that inspects a model after
+a real Legacy auth-loader round trip,
+`js_sdk_boundary_auth_loader_reads_provider_and_supplies_model`
+(`crates/oc-plugin/tests/js.rs:656-689`), asserts on `auth-sdk-model` — a model
+the JS fixture *creates* (`js.rs:146`). It has no canonical counterpart, so it
+takes the `continue` and never reaches `:267`. Its assertions
+(`family == ""`, `release_date == ""`, `variants.is_empty()`, `js.rs:686-688`)
+are satisfied by `plugin_model_value`'s defaults, not by the restore.
+
+The tests that DO round-trip a canonical model are the byte-identity pair
+(`js.rs:542`, `js.rs:566`), whose model comes from `kiro_model()`
+(`js.rs:1538-1554`). That fixture sets:
+
+    release_date: String::new()          -> ""          == default fill
+    variants:     BTreeMap::new()        -> {}          == default fill
+    capabilities: ModelCapabilities::default() -> interleaved Flag(false) == default fill
+    limit:        ModelLimit::default()  -> input None  == absent-field default
+    family:       "claude".to_owned()    -> NON-default
+
+Four of the five restored fields hold values byte-identical to what
+`plugin_model_value` would refill, so removing those four restorations is
+unobservable — textbook equivalent mutants. `family` alone carries a
+non-default value and is therefore only *accidentally* covered.
+
+SIBLING-FIELD AUDIT (the same branch, `projection.rs:265-271`)
+--------------------------------------------------------------------------------
+All five restorations sit on one seam with one cause: the Legacy forward
+projection omits the field, so the reverse projection must re-supply it from
+`canonical`. They are not five independent decisions.
+
+    :266  model.family              omitted by model_value Legacy (:179 is V2-only)
+    :267  model.release_date        omitted by model_value Legacy (:180-183 V2-only)
+    :268  model.variants            omitted by model_value Legacy (:184 is V2-only)
+    :269  capabilities.interleaved  omitted by Legacy capabilities (:134-141)
+    :270  limit.input               omitted by Legacy limit (:152-156)
+
+Fixing `release_date` alone would leave four fields with the identical defect —
+the one-at-a-time pattern called out in the task. The test therefore pins all
+five. Empirical per-field mutation results follow below.
+
+MUTATION MATRIX — BEFORE THE FIX (empirical, not reasoned)
+--------------------------------------------------------------------------------
+Each restoration was commented out independently, `cargo test -p oc-plugin
+--test js --offline` run, then the file restored from a backup taken with
+`cp ... && ...` (disk checked first, 84% at the time, below the 90% stop).
+
+  :266  model.family              -> FAILED. 20 passed; 2 failed
+  :267  model.release_date        -> ok. 22 passed; 0 failed   <-- the FU-6 finding
+  :268  model.variants            -> ok. 22 passed; 0 failed
+  :269  capabilities.interleaved  -> ok. 22 passed; 0 failed
+  :270  limit.input               -> ok. 22 passed; 0 failed
+
+So the gap was FOUR fields wide, not one. `family`'s two failures are the
+byte-identity pair, which catch it only incidentally — `kiro_model` happens to
+set `family: "claude"`, and neither test names the field. Had `kiro_model` used
+`String::new()` for `family` as it does for `release_date`, all five would have
+been silent.
+
+THE FIX (Option A — pin it, all five)
+--------------------------------------------------------------------------------
+`crates/oc-plugin/tests/js.rs`:
+
+- `legacy_only_field_provider()` — a canonical provider whose single model
+  carries a non-default value for every legacy-omitted field:
+      family                   "canonical-family"
+      release_date             "2026-02-01"
+      variants                 {"thinking": {"thinkingBudget": 8192}}
+      capabilities.interleaved Interleaved::Name("reasoning_content")
+      limit.input              Some(200_000.0)
+  Its doc comment records why each must be non-default, so a later
+  "simplification" back to `kiro_model`'s defaults cannot silently reopen the
+  seam.
+
+- `js_auth_loader_restores_every_legacy_only_model_field_the_sdk_surface_omits`
+  — drives the real JS auth loader (no-op) over that provider and asserts all
+  five fields survive. This is the data-loss guard.
+
+- `js_auth_loader_refuses_legacy_only_model_fields_a_plugin_forges` — a new
+  fixture branch `forgeLegacyOnlyFields` first calls the fixture's existing
+  `assertModel(model, "legacy", ...)`, which THROWS if any of the five fields is
+  visible (`js.rs:62-69`) — that call is what proves the forward projection
+  hides them — then writes a value into each of the five anyway. The test
+  asserts all five remain canonical. This is the forgery guard.
+
+Both enter through the production boundary: `fixture_auth_loader` writes a real
+`.mjs`, `load_js_plugins_ordered` starts a real Bun/Node child, and
+`loader.load(...)` runs `HandleAuthLoader::load` — `provider_value(Legacy)` ->
+JS subprocess -> `plugin_provider(Legacy)` (`bridge.rs:325-362`). No test calls
+`plugin_provider` directly; it is `pub(crate)` and unreachable from an
+integration test, so a hand-built input was not possible even in principle.
+
+MUTATION MATRIX — AFTER THE FIX
+--------------------------------------------------------------------------------
+Same procedure, reporting only the two new tests:
+
+  :266  model.family              -> both named tests FAILED
+  :267  model.release_date        -> both named tests FAILED
+  :268  model.variants            -> both named tests FAILED
+  :269  capabilities.interleaved  -> both named tests FAILED
+  :270  limit.input               -> both named tests FAILED
+
+All five now fail by name. The `:267` failure text confirms the mutated line is
+on the path the test exercises rather than an equivalent mutant:
+
+    thread 'js_auth_loader_restores_every_legacy_only_model_field_the_sdk_surface_omits'
+    panicked at crates/oc-plugin/tests/js.rs:728:5:
+    assertion `left == right` failed: the legacy reverse projection must restore
+    `release_date` the SDK surface omits
+      left: ""
+     right: "2026-02-01"
+
+`left: ""` is `plugin_model_value`'s refill and `right` the canonical value —
+exactly the silent-data-loss mechanism described above, now observed rather than
+argued. After every mutation the file was restored and `git status --porcelain`
+showed only the intended `M crates/oc-plugin/tests/js.rs`.
+
+A/B DECISION
+--------------------------------------------------------------------------------
+Option A (pin it). Option B is refuted by the reachability path above: the line
+is reached with a differing value on every auth-loader call over a dated model,
+and "the forward projection is typed" is the *cause* of the divergence, not a
+reason it cannot happen. Removing any of the five would silently blank or admit
+a forged field.
+
+NO REGRESSION IN NEIGHBOURING GUARDS
+--------------------------------------------------------------------------------
+Run in the final workspace pass, all ok:
+  compat_v1_provider_projection_preserves_catalog_model_semantics   (todo 176)
+  every_generated_client_model_arrival_has_an_explicit_projection   (todo 179)
+  every_non_hook_resource_arrival_has_an_explicit_projection
+  js_sdk_boundary_auth_loader_reads_provider_and_supplies_model
+  js_auth_loader_round_trips_provider_data_below_its_depth_bound_byte_identically
+  js_auth_loader_restores_host_truncated_provider_byte_identically
+
+`crates/oc-plugin/src/js/projection.rs` is byte-identical to HEAD; the only
+production-source change in this task is none. The change is test-only:
+`crates/oc-plugin/tests/js.rs` (a JS fixture branch, a Rust fixture helper, two
+tests). `crates/oc-engine/src/retry.rs` (FU-1) and
+`crates/oc-server/src/compat_v1.rs` (FU-3) were not touched. No dependency added.
+
+FINAL GATES
+--------------------------------------------------------------------------------
+  CARGO_TARGET_DIR=/tmp/opencode/fu6 CARGO_BUILD_JOBS=2 cargo test --workspace --offline
+    -> 3475 passed, 0 failed (exit 0). Baseline was 3473; +2 are the new tests.
+  cargo clippy --workspace --all-targets --offline
+    -> exit 0, zero warning/error lines.
+  cargo fmt --all --check
+    -> exit 0, no output.
+  git diff --check -> clean.
+  Changed files: crates/oc-plugin/tests/js.rs,
+                 .omo/plans/opencode-rust-followup.md,
+                 .omo/notepads/opencode-rust/issues.md (appended).
+
+`lsp_diagnostics` refused the path because the MCP server is scoped to the main
+checkout, not this worktree. `cargo clippy --all-targets` covers integration
+tests and reported zero warnings, which is the equivalent check; no temporary
+clone was made.

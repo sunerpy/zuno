@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use oc_engine::terminal_lease::{TerminalBroker, TerminalLease};
 use oc_llm::catalog::availability::{Availability, AvailabilitySource};
-use oc_llm::catalog::models_dev::CatalogStatus;
+use oc_llm::catalog::models_dev::{CatalogStatus, Interleaved};
 use oc_llm::catalog::resolved::{
     ModelApi, ModelCapabilities, ModelCost, ModelLimit, ResolvedModel, ResolvedProvider,
 };
@@ -145,6 +145,19 @@ export default {
           assertProvider(provider, "legacy", "api", auth.key, "Auth.loader.provider");
           provider.models["auth-sdk-model"] = legacyModel("auth-sdk-model");
           return { sdkBoundary: `${provider.source}:${provider.key}` };
+        }
+        if (options?.forgeLegacyOnlyFields) {
+          for (const [id, model] of Object.entries(provider.models)) {
+            // Throws if any legacy-omitted field is visible here, so this call
+            // is what proves the forward projection hides all five.
+            assertModel(model, "legacy", `Auth.loader.provider.models.${id}`);
+            model.family = "forged-family";
+            model.release_date = "1999-12-31";
+            model.variants = { forged: { thinkingBudget: 1 } };
+            model.capabilities.interleaved = "forged-interleaved";
+            model.limit.input = 111;
+          }
+          return {};
         }
         if (options?.mutateProviderDeep) {
           const deep = {};
@@ -462,6 +475,34 @@ fn sdk_boundary_provider(source: AvailabilitySource) -> ResolvedProvider {
     provider
 }
 
+/// A canonical provider whose model carries a non-default value for every field
+/// the legacy SDK surface omits.
+///
+/// Each value must differ from what `plugin_model_value` refills a missing key
+/// with, or the restoration it guards becomes an equivalent mutant: the four
+/// fields other than `family` are defaulted in `kiro_model`, which is why
+/// deleting their restorations broke no test before this fixture existed.
+fn legacy_only_field_provider() -> ResolvedProvider {
+    let mut model = kiro_model();
+    model.id = "legacy-only-field-model".to_owned();
+    model.provider_id = "resident-fixture".to_owned();
+    model.family = "canonical-family".to_owned();
+    model.release_date = "2026-02-01".to_owned();
+    model.variants.insert(
+        "thinking".to_owned(),
+        serde_json::json!({ "thinkingBudget": 8192 })
+            .as_object()
+            .expect("a variant body is an object")
+            .clone(),
+    );
+    model.capabilities.interleaved = Interleaved::Name("reasoning_content".to_owned());
+    model.limit.input = Some(200_000.0);
+    let mut provider = kiro_provider();
+    provider.id = "resident-fixture".to_owned();
+    provider.models.insert(model.id.clone(), model);
+    provider
+}
+
 fn provider_with_variant_depth(nested_objects: usize) -> ResolvedProvider {
     let mut depth_probe = serde_json::json!({ "thinkingBudget": 8192 });
     for _ in 0..nested_objects {
@@ -649,6 +690,109 @@ async fn js_auth_loader_still_bounds_an_arbitrary_plugin_return_graph() {
     assert_eq!(
         value.get("$path").and_then(serde_json::Value::as_str),
         Some("/next/next/next/next/next/next/next/next/next/next/next/next/next/next/next/next")
+    );
+}
+
+#[tokio::test]
+async fn js_auth_loader_restores_every_legacy_only_model_field_the_sdk_surface_omits() {
+    // Given: a canonical model carrying a non-default value for each field the
+    // legacy `model_value` projection omits, and a no-op JavaScript auth loader.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (load, loader) = fixture_auth_loader(temp.path(), None).await;
+    let mut provider = legacy_only_field_provider();
+    let canonical = provider
+        .models
+        .get("legacy-only-field-model")
+        .expect("the canonical model exists before the loader runs")
+        .clone();
+
+    // When: the provider round-trips through the real JavaScript process.
+    loader
+        .load(&MissingCredential, &mut provider)
+        .await
+        .expect("a no-op auth loader round-trips the provider");
+    load.shutdown().await;
+
+    // Then: every legacy-omitted field survives. The legacy surface never sent
+    // these to JavaScript, so the returned object cannot carry them and
+    // `plugin_model_value` refills each with a default; only the reverse
+    // projection's restoration can recover the canonical value.
+    let model = provider
+        .models
+        .get("legacy-only-field-model")
+        .expect("the canonical model survives the loader");
+    assert_eq!(
+        model.family, canonical.family,
+        "the legacy reverse projection must restore `family` the SDK surface omits"
+    );
+    assert_eq!(
+        model.release_date, canonical.release_date,
+        "the legacy reverse projection must restore `release_date` the SDK surface omits"
+    );
+    assert_eq!(
+        model.variants, canonical.variants,
+        "the legacy reverse projection must restore `variants` the SDK surface omits"
+    );
+    assert_eq!(
+        model.capabilities.interleaved, canonical.capabilities.interleaved,
+        "the legacy reverse projection must restore `capabilities.interleaved` the SDK surface omits"
+    );
+    assert_eq!(
+        model.limit.input, canonical.limit.input,
+        "the legacy reverse projection must restore `limit.input` the SDK surface omits"
+    );
+}
+
+#[tokio::test]
+async fn js_auth_loader_refuses_legacy_only_model_fields_a_plugin_forges() {
+    // Given: a JavaScript auth loader that asserts all five legacy-omitted
+    // fields are hidden from it, then writes a value into each anyway.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (load, loader) = fixture_auth_loader(
+        temp.path(),
+        Some(serde_json::json!({ "forgeLegacyOnlyFields": true })),
+    )
+    .await;
+    let mut provider = legacy_only_field_provider();
+    let canonical = provider
+        .models
+        .get("legacy-only-field-model")
+        .expect("the canonical model exists before the loader runs")
+        .clone();
+
+    // When
+    loader
+        .load(&MissingCredential, &mut provider)
+        .await
+        .expect("a forging auth loader still round-trips the provider");
+    load.shutdown().await;
+
+    // Then: a legacy-generation plugin cannot introduce a field it was never
+    // shown. `plugin_model_value` leaves an occupied key alone, so without the
+    // restoration each forged value would reach the resolved catalog.
+    let model = provider
+        .models
+        .get("legacy-only-field-model")
+        .expect("the canonical model survives the loader");
+    assert_eq!(
+        model.family, canonical.family,
+        "a legacy plugin must not forge `family`"
+    );
+    assert_eq!(
+        model.release_date, canonical.release_date,
+        "a legacy plugin must not forge `release_date`"
+    );
+    assert_eq!(
+        model.variants, canonical.variants,
+        "a legacy plugin must not forge `variants`"
+    );
+    assert_eq!(
+        model.capabilities.interleaved, canonical.capabilities.interleaved,
+        "a legacy plugin must not forge `capabilities.interleaved`"
+    );
+    assert_eq!(
+        model.limit.input, canonical.limit.input,
+        "a legacy plugin must not forge `limit.input`"
     );
 }
 
