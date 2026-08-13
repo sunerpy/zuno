@@ -63,6 +63,8 @@ name; a permanent failure is not retried.
 
 ## FU-2. Malformed plugin-model diagnostic is unguarded
 
+**Status: CLOSED (2026-08-13)** — `production_js_malformed_model_diagnostic_names_the_plugin_model_and_decode_reason` pins plugin, model id and decode reason on one emitted line; deleting the emission or blanking any single field fails it by name.
+
 **Source**: F2, non-blocking observation F2-O2, Round 1 and Round 2.
 
 **What exists**: todo 167 correctly isolates a malformed model sibling — one bad model does

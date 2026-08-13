@@ -7769,3 +7769,46 @@ This also matches the FU-6 discovery story: the orchestrator mutated this line
 while verifying todo 176, saw nothing fail, and drew the wrong conclusion. The
 mutation was fine; the fixture made it unobservable. When a mutation produces no
 failure, check the fixture's values before concluding the line is dead.
+## FU-2 — the malformed plugin-model diagnostic was pinned by nothing
+
+Confirmed before fixing: replacing the `tracing::debug!` at
+`crates/oc-plugin/src/js/bridge.rs:523-528` with `Err(_) => {}` left both
+`production_js_sdk_model_advertised_*` tests green (2 passed / 0 failed). Those
+tests prove a malformed sibling is *isolated* — they select the valid model and
+assert the dispatched path and body — and isolation is unaffected by whether the
+drop is reported, so nothing they assert can see the diagnostic disappear.
+
+Closed by `production_js_malformed_model_diagnostic_names_the_plugin_model_and_decode_reason`
+(`crates/oc-cli/tests/tool_turn.rs`), which reuses the same real-binary fixture and
+adds `--print-logs --log-level DEBUG`, then asserts on `output.stderr`.
+
+The reusable part is the assertion's shape. It first locates the single line
+carrying the message, then asserts all three promised facts against *that line*:
+
+    let diagnostic = stderr.lines().find(|line| line.contains(MESSAGE))...
+    // then: plugin spec path, "malformed", "missing field `id`"
+
+Asserting `stderr.contains(...)` three times independently would have been
+satisfiable by three unrelated lines, and asserting only that the line exists
+would have passed with every field blank. Four mutations confirm the difference:
+deleting the emission fails at the line lookup; blanking `plugin`, `model`, or
+`%error` individually each leaves the event firing at DEBUG with the message
+intact and still fails, each on its own named leg. A presence assertion would
+have survived all three of those.
+
+Two mechanism notes worth keeping. The decode reason is exactly
+``missing field `id` `` because `plugin_model_value` renames the fixture sibling's
+only field `providerID` to `provider_id` (`projection.rs:294-302`), so serde then
+fails on `ResolvedModel`'s first missing required field, `id`
+(`oc-llm/src/catalog/resolved.rs:49-51`). And `JsHost::plugin()` reports the
+config *spec*, not the module's `id`: the line reads
+`plugin=file:/tmp/oc-testkit-XXXX/project/sdk-model-provider.mjs`, so the test
+builds the expected value from `format!("file:{}", plugin.display())` rather than
+matching a stem that could coincide with unrelated text.
+
+Neither `oc-plugin` nor `oc-cli` has a `tracing-subscriber` dependency, so the
+in-memory `MakeWriter` idiom (`oc-auth/src/store.rs:462-504`) is unavailable there.
+For a diagnostic emitted inside either crate, the real-binary
+`--print-logs --log-level DEBUG` idiom (`tool_turn.rs:592-628`) is the only
+existing option — and it is the better one anyway, since it crosses the same
+production boundary the behavior does.
