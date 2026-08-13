@@ -38,30 +38,43 @@ The pivot is right. It has to be made deliberately rather than by drift.
 
 Parity is an **asset on one surface and a cage on the other**. Treat them differently.
 
-### Keep parity: the HTTP API and the plugin ABI
+### Keep parity: the HTTP API. **Not** the plugin ABI — correcting myself
 
-Real third parties depend on this, today, on this machine. `opencode.json` loads
-`opencode-antigravity-auth@1.6.0`, `@sunerpy/opencode-kiro-auth@0.20.6`, and
-`@sunerpy/oh-my-openagent@4.21.0`. Those plugins call the pre-`/api` v1 routes — that is why todos
-165/169/175 existed at all, and why F1 rejected criterion 4 until the measured routes actually
-served.
+My first draft said "keep parity on the HTTP API *and the plugin ABI*". **The user corrected that,
+and they were right**: *"插件肯定不能复用 opencode 的 ts 插件啊，本项目不是有一套插件设计么"*.
 
-**On this surface the oracle and compat suite stay exactly as they are.** Breaking it does not
-"differentiate Zuno"; it breaks working installations for no gain. The 3479 tests keep their meaning
-here.
+I had drawn the wrong boundary because I reasoned from what is *installed on this machine* rather
+than from what the project *is*. Verified now:
 
-### Diverge freely: the agent orchestration layer
+**This project already has its own plugin architecture — four coexisting tiers on one hook bus:**
 
-Goal loop, task dispatch, subtask messaging, memory, skills. Here upstream becomes **one reference
-among several**, and the contract changes from *"matches 1.18.18"* to *"has declared behavior, and
-tests that pin it"*.
+| Tier | Where | Runtime cost |
+|---|---|---|
+| **Out-of-process JSON-RPC** | `crates/oc-plugin/src/jsonrpc.rs:1` — *"Out-of-process plugins over newline-delimited JSON-RPC"* | **none** — any language, any binary |
+| **WASM** | `crates/oc-plugin/src/wasm.rs` (`WasmPlugin`, `WasmResourceLimits`) | feature-gated wasmtime, absent from default builds |
+| **JS** | `crates/oc-plugin/src/js/` | discovers external `bun`/`node` |
+| **Native Rust** | exercised as `RealTier::Rust` | none |
 
-This is where `docs/divergences.toml` needs a decision I cannot make alone: its 17 entries currently
-mean "deviation from upstream". Under Zuno, deviation in the agent layer is **the point**, not an
-exception requiring justification. Either that registry is scoped to the compatibility surface only,
-or it needs a second category. Left ambiguous, every future agent-layer change will look like a
-divergence that needs declaring, and the rule will be quietly ignored — which is worse than either
-choice.
+`crates/oc-plugin/tests/integration.rs:328` `three_tiers_follow_configuration_order` drives
+`RealTier::{Antigravity, Rust, Kiro, Wasm}` together and proves they share one hook bus in
+configuration order. **The newline-delimited JSON-RPC protocol is the project's own contract**, and
+it is language-agnostic — nothing about it requires TypeScript.
+
+So the correct boundary is:
+
+- **Keep parity: the HTTP API.** Real clients speak it, and todos 165/169/175 exist because F1
+  rejected criterion 4 until the measured v1 routes actually served. Breaking it breaks working
+  installations for no gain.
+- **The plugin surface is Zuno's own.** The JS tier is *one* tier — kept because three real plugins
+  currently use it (`opencode-antigravity-auth@1.6.0`, `@sunerpy/opencode-kiro-auth@0.20.6`,
+  `@sunerpy/oh-my-openagent@4.21.0`), not because upstream's ABI is a contract worth preserving.
+  **The JSON-RPC tier should be the documented primary**: it costs no runtime, satisfies the
+  single-self-contained-binary rule, and a plugin author can write one in any language.
+
+A fact that supports demoting the JS tier rather than centring it: **`antigravity@1.6.0`'s
+`package.json` declares `engines: {"node": ">=20.0.0"}` and no `opencode` key at all.** So todo 174's
+`engines.opencode` version gate does not fire on any of the three real installed plugins. The npm
+compatibility story is thinner than it looks from the outside.
 
 ## The strongest evidence in the whole research corpus, found while writing this
 
@@ -158,12 +171,46 @@ I am **not** rewriting the plan into a Zuno roadmap in this pass. Two reasons:
 **Immediate next step**: a focused study of claw-code's goal/gate architecture, since it is on disk,
 free to read, and corroborates the two items already ranked first.
 
-## Open questions for the user
+## Decisions taken (user, 2026-08-13)
 
-1. **The surface split** — parity kept on HTTP API + plugin ABI, free divergence in the agent layer.
-   Agreed?
-2. **Config directory compatibility** on rename — keep, dual-read, or migrate?
-3. **Sequencing** — build E-1/E-4 (goal loop + gates) first under the current name and rename later,
-   or rename first? Renaming first touches 30 files and invalidates nothing; building first delivers
-   value sooner. I lean to **build first, rename at a natural boundary**, because the rename is
-   mechanical and the goal loop is not.
+1. **Sequencing: build first, rename at a natural boundary.** Confirmed. The rename touches 30
+   source files plus `user_agent()` and is mechanical; the goal loop is not.
+2. **Compatibility surface is essentially done** — 183/183 with four-reviewer approval, so parity
+   work is no longer the bottleneck and the agent layer is where effort belongs.
+3. **Plugin surface is Zuno's own**, per the correction above. The JSON-RPC tier is the primary;
+   JS stays as a compatibility tier for the three real installed plugins.
+4. **Config discovery becomes multi-source**: load Claude Code's `.agent`, Zuno's own `.zuno`, and
+   keep `.opencode`.
+
+### On (4), what the code already supports and what it does not
+
+`crates/oc-paths/src/lib.rs:202` already exposes `config_directories(directory, worktree) ->
+Vec<PathBuf>` — a **chain**, not a single path. The tool registry consumes it as a chain too
+(`oc-tools/src/registry.rs:129` `config_directory_tools(&[PathBuf])`).
+
+What is single is the constant: `PROJECT_CONFIG_DIRECTORY = ".opencode"`
+(asserted at `oc-paths/src/lib.rs:285`). So adding sources is **extending a chain that exists**,
+not building discovery from scratch. That is the cheap half.
+
+The parts that need deciding rather than coding:
+
+- **Precedence.** With `.zuno`, `.opencode` and `.agent` all present, which wins? Nearest-wins by
+  directory depth is already the chain's behaviour; source priority within one directory is new.
+- **`.agent` is Claude Code's shape, not this project's.** Reading the directory is easy; agreeing on
+  what a Claude Code agent file *means* here — its frontmatter fields, its permission model — is the
+  real work. Prior research established Claude Code's agent frontmatter is the richest of any CLI
+  surveyed, so this is worth doing properly rather than partially.
+- **Data directory on rename.** `~/.local/share/opencode/auth.json` holds this machine's live
+  `google` OAuth credential, which E-9's `google_search` plugin depends on. Moving it breaks that.
+  Dual-read is the safe default; a migration-on-first-run with a notice is the tidier one. Still
+  needs a call.
+
+## Open question remaining
+
+**The divergence registry's meaning.** `docs/divergences.toml`'s 17 entries currently mean
+"deviation from upstream", governed by a rule (`:11-14`) that an unimplemented surface is a **gap**,
+never a divergence. Under Zuno, deviation in the agent layer is the *point*. Either that registry is
+scoped to the HTTP compatibility surface only, or it needs a second category for "Zuno-original
+behaviour". Left ambiguous, every future agent-layer change looks like a divergence needing
+justification, the rule gets quietly ignored, and we are back to a claim nothing derives from —
+the defect class this project fixed seven times.
