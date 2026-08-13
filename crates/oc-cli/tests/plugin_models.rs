@@ -68,6 +68,37 @@ const PINNED_CATALOG: &str = r#"{
     }
 }"#;
 
+const AUTH_FAILURE_CATALOG: &str = r#"{
+    "test": {
+        "id": "test",
+        "name": "Test",
+        "npm": "@ai-sdk/openai-compatible",
+        "models": {
+            "test-model": {
+                "id": "test-model",
+                "name": "Test Model",
+                "limit": { "context": 100000, "output": 4096 }
+            }
+        }
+    }
+}"#;
+
+const FAILING_AUTH_LOADER_PLUGIN: &str = r#"
+export default {
+  id: "models-failing-auth-loader",
+  server: async () => ({
+    auth: {
+      provider: "test",
+      loader: async (getAuth) => {
+        await getAuth();
+        throw new Error("task173 models auth loader failure");
+      },
+      methods: [],
+    },
+  }),
+};
+"#;
+
 fn supported_spec(package: &str) -> String {
     let entry = SUPPORTED_JS_PLUGINS
         .iter()
@@ -316,6 +347,68 @@ async fn antigravity_auth_loader_zeroes_google_cost_on_the_verbose_models_surfac
         }),
         "the fixture starts at input=1.25/output=5.0, so only antigravity's real auth loader can produce this cost; stdout={stdout:?}; stderr={}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn failing_auth_loader_is_disabled_and_models_lists_models_with_a_diagnostic() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let catalog = root.path().join("models.json");
+    let plugin = root.path().join("failing-auth-loader.mjs");
+    std::fs::write(&catalog, AUTH_FAILURE_CATALOG).expect("write pinned models catalog");
+    std::fs::write(&plugin, FAILING_AUTH_LOADER_PLUGIN).expect("write failing auth loader");
+    let config = serde_json::json!({
+        "plugin": [[format!("file:{}", plugin.display()), {}]],
+        "provider": { "test": {} }
+    });
+
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_opencode-rust"));
+    command
+        .args(["models", "test"])
+        .current_dir(root.path())
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .env_clear()
+        .env("HOME", root.path().join("home"))
+        .env("XDG_DATA_HOME", root.path().join("data"))
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("XDG_CACHE_HOME", "/config/.cache")
+        .env("XDG_STATE_HOME", root.path().join("state"))
+        .env("MISE_DATA_DIR", "/config/.local/share/mise")
+        .env("PATH", "/usr/bin:/bin")
+        .env("NO_COLOR", "1")
+        .env("TERM", "dumb")
+        .env("OPENCODE_DISABLE_AUTOUPDATE", "true")
+        .env("OPENCODE_DISABLE_MODELS_FETCH", "true")
+        .env("OPENCODE_DISABLE_DEFAULT_PLUGINS", "true")
+        .env("OPENCODE_DISABLE_LSP_DOWNLOAD", "true")
+        .env("OPENCODE_MODELS_PATH", &catalog)
+        .env("OPENCODE_CONFIG_CONTENT", config.to_string())
+        .env(
+            "OPENCODE_AUTH_CONTENT",
+            r#"{"test":{"type":"api","key":"fixture-key"}}"#,
+        );
+
+    let output = tokio::time::timeout(Duration::from_secs(90), command.output())
+        .await
+        .expect("models command timed out")
+        .expect("run models command");
+    assert!(
+        output.status.success(),
+        "the auth loader failure must disable only the plugin, not `models`: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "test/test-model\n",
+        "models must remain useful after auth failure"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("models-failing-auth-loader")
+            && stderr.contains("auth.loader")
+            && stderr.contains("task173 models auth loader failure"),
+        "the default models diagnostic must name plugin, hook, and cause: {stderr}"
     );
 }
 

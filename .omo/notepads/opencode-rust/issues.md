@@ -7585,3 +7585,23 @@ must move together: changing only the handler can still leave diagnostics claimi
 changing only `V1_SURFACE.backing` makes the declared-backing regression fail. All three guarded
 effect mutations failed again after reconstruction; the detailed output is appended to the task
 evidence file.
+
+## [2026-08-13] Todo 173 — retained plugin callbacks now share disable-and-continue containment
+
+Todo 168 contained ordinary `HookBus` callbacks, but `auth.loader` and `provider.models` are retained
+resource callbacks invoked directly by `PluginRuntime::apply_catalog`. Their errors were still mapped
+to surface errors, so one plugin killed `run`, `models`, and HTTP turns. The catalog path now retains
+the owning plugin, permanently disables it through the shared diagnostic mechanism, and continues
+catalog resolution. A missing stored credential skips `auth.loader` entirely, matching upstream's
+`Promise<Auth>` contract rather than inventing null or fake auth.
+
+Real-binary regressions prove `run`, `models`, and HTTP turns remain useful and expose a default-visible
+plugin/hook/cause diagnostic. The exhaustive failure-boundary matrix now includes TUI as well as the
+three named surfaces: 21 hooks produce 67 applicable hook × surface entries, with ordinary callbacks
+executing the production `HookBus` containment branch. Removing that branch, restoring fatal auth
+mapping, or suppressing diagnostic publication each failed a named regression and was restored.
+
+Changed-file diagnostics, zero-warning workspace Clippy, and rustfmt passed. Workspace tests had no
+task-173 regression; only todo 178's five known `cli_parity.rs` failures remained, all caused by the
+pinned 1.18.15 oracle resolving to installed 1.18.18. Full commands and mutation output are recorded
+in `.omo/evidence/task-173-opencode-rust.txt`.

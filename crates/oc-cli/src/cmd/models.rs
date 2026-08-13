@@ -65,6 +65,9 @@ pub(super) fn execute(args: &ModelsArgs, environment: &StartupEnvironment) -> Re
             Ok(catalog)
         }
         .await;
+        for diagnostic in plugins.take_diagnostics() {
+            eprintln!("{diagnostic}");
+        }
         plugins.shutdown().await;
         result
     })?;
