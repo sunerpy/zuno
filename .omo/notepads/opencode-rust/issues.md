@@ -7647,3 +7647,19 @@ Changed-file diagnostics, zero-warning workspace Clippy, and rustfmt passed. Wor
 task-173 regression; only todo 178's five known `cli_parity.rs` failures remained, all caused by the
 pinned 1.18.15 oracle resolving to installed 1.18.18. Full commands and mutation output are recorded
 in `.omo/evidence/task-173-opencode-rust.txt`.
+
+## [2026-08-13] Todo 174 — npm compatibility is a host contract, not an SDK dependency
+
+The old gate inferred host compatibility from `dependencies` or `peerDependencies` on
+`@opencode-ai/plugin`. That field describes an SDK package relationship, not which opencode host
+versions may load the plugin. Upstream 1.18.18 instead reads `package.json.engines.opencode`, applies
+npm semver range semantics, and rejects mismatches before dynamic import. Treating an unknown range
+as compatible was also unsafe: npm semver rejects invalid ranges, so permissive parsing could execute
+code whose host contract was not understood.
+
+The production loader now gates only npm packages on `engines.opencode`, emits the upstream-actionable
+range/running-version diagnostic, and returns before starting the JavaScript host. Local `file:`
+plugins remain exempt for development parity. A production-path regression proves an excluding range
+activates neither the plugin nor its factory marker; its satisfying-range control proves the gate does
+not reject compatible packages. Full upstream, TDD, mutation, and verification evidence is recorded in
+`.omo/evidence/task-174-opencode-rust.txt`.

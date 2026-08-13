@@ -9,10 +9,12 @@ use super::config::JsHostConfig;
 use super::host::{JsHost, JsHostBuilder, JsHostLimits, JsPluginInput};
 use super::plugin::JsPlugin;
 use super::runtime::{JsRuntime, JsRuntimeKind, discover_runtime, discover_runtime_in};
-use super::spec::{JsPluginSpec, PluginSource, SpecError, VersionGate};
+use super::spec::{
+    JsPluginSpec, PluginSource, REPORTED_PLUGIN_API_VERSION, SpecError, VersionGate,
+};
 use crate::PluginDiagnosticKind;
 
-pub const JS_COMPAT_OPENCODE_VERSION: &str = "1.18.13";
+pub const JS_COMPAT_OPENCODE_VERSION: &str = REPORTED_PLUGIN_API_VERSION;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SupportedJsPlugin {
@@ -129,10 +131,9 @@ pub async fn load_js_plugins_ordered(
     let mut startup_diagnostics = Vec::new();
     for attempt in attempts {
         match attempt {
-            Ok((plugin, host, warning)) => {
+            Ok((plugin, host)) => {
                 plugins.push(plugin);
                 hosts.push(host);
-                startup_diagnostics.extend(warning);
             }
             Err(diagnostic) => startup_diagnostics.push(diagnostic),
         }
@@ -148,10 +149,18 @@ async fn load_one(
     spec: JsPluginSpec,
     config: JsHostConfig,
     runtime: JsRuntime,
-) -> Result<(Arc<JsPlugin>, JsHost, Vec<JsDiagnostic>), JsDiagnostic> {
+) -> Result<(Arc<JsPlugin>, JsHost), JsDiagnostic> {
     let label = spec.spec().to_owned();
     let resolved = resolve_or_install(&spec, &config.cache_dir, &runtime)
         .map_err(|error| spec_diagnostic(&label, error))?;
+    if let VersionGate::Unsatisfied { range, reported } = resolved.gate() {
+        return Err(JsDiagnostic {
+            plugin: label,
+            hook: None,
+            kind: JsDiagnosticKind::Compatibility,
+            message: format!("Plugin requires opencode {range} but running {reported}"),
+        });
+    }
     let input = JsPluginInput {
         project: serde_json::json!({
             "id": config.project.id,
@@ -194,18 +203,7 @@ async fn load_one(
         kind: JsDiagnosticKind::Protocol,
         message: error.to_string(),
     })?;
-    let warning = match resolved.gate() {
-        VersionGate::Unsatisfied { range, reported } => vec![JsDiagnostic {
-            plugin: label,
-            hook: None,
-            kind: JsDiagnosticKind::Compatibility,
-            message: format!(
-                "plugin declares @opencode-ai/plugin {range}; host reports {reported}"
-            ),
-        }],
-        _ => Vec::new(),
-    };
-    Ok((plugin, host, warning))
+    Ok((plugin, host))
 }
 
 fn resolve_or_install(

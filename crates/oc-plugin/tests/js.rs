@@ -18,8 +18,8 @@ use oc_plugin::{
     CompactionAutocontinueInput, CompactionAutocontinueOutput, HookInvocation, JsDiagnosticKind,
     JsHostBuilder, JsHostConfig, JsHostPolicy, JsPluginInput, JsPluginLoad, JsPluginSpec, Plugin,
     ProviderContext, ProviderHookContext, ProviderSmallModelInput, ProviderSmallModelOutput,
-    ProviderSource, SUPPORTED_JS_PLUGINS, TextCompleteInput, TextCompleteOutput, VersionGate,
-    discover_runtime, load_js_plugins_ordered,
+    ProviderSource, SUPPORTED_JS_PLUGINS, TextCompleteInput, TextCompleteOutput, discover_runtime,
+    load_js_plugins_ordered,
 };
 use oc_testkit::FakeTerminalOwner;
 use url::Url;
@@ -267,6 +267,54 @@ fn host(root: &Path, terminal: Arc<dyn TerminalLease>, policy: JsHostPolicy) -> 
 
 fn file_spec(path: &Path) -> JsPluginSpec {
     JsPluginSpec::new(format!("file:{}", path.display()))
+}
+
+fn npm_compatibility_fixture(root: &Path, range: &str, marker: &Path) -> JsPluginSpec {
+    let package =
+        root.join("cache/packages/compatibility-fixture@1.0.0/node_modules/compatibility-fixture");
+    std::fs::create_dir_all(&package).expect("create compatibility fixture package");
+    std::fs::write(
+        package.join("package.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "name": "compatibility-fixture",
+            "version": "1.0.0",
+            "type": "module",
+            "main": "index.js",
+            "engines": { "opencode": range },
+        }))
+        .expect("encode compatibility fixture manifest"),
+    )
+    .expect("write compatibility fixture manifest");
+    let marker =
+        serde_json::to_string(&marker.to_string_lossy()).expect("encode compatibility marker path");
+    std::fs::write(
+        package.join("index.js"),
+        format!(
+            r#"import {{ writeFileSync }} from "node:fs";
+export default {{
+  id: "compatibility-fixture",
+  server: async () => {{
+    writeFileSync({marker}, "activated");
+    return {{ "experimental.text.complete": async (_input, output) => {{ output.text += "-compat"; }} }};
+  }},
+}};
+"#,
+        ),
+    )
+    .expect("write compatibility fixture entrypoint");
+    let sdk = package.join("node_modules/@opencode-ai/sdk");
+    std::fs::create_dir_all(sdk.join("dist")).expect("create compatibility fixture SDK");
+    std::fs::write(
+        sdk.join("package.json"),
+        r#"{"name":"@opencode-ai/sdk","type":"module","main":"dist/index.js"}"#,
+    )
+    .expect("write compatibility fixture SDK manifest");
+    std::fs::write(
+        sdk.join("dist/index.js"),
+        "export function createOpencodeClient() { return {}; }",
+    )
+    .expect("write compatibility fixture SDK entrypoint");
+    JsPluginSpec::new("compatibility-fixture@1.0.0")
 }
 
 async fn record_sdk_client_config(case: &str) -> serde_json::Value {
@@ -1087,28 +1135,75 @@ async fn js_memory_ceiling_is_enforced_without_a_hook_call() {
     load.shutdown().await;
 }
 
-#[test]
-fn js_version_gate_records_an_incompatible_peer_range() {
-    // Given
+#[tokio::test]
+async fn js_version_gate_skips_an_excluding_engines_opencode_package_before_activation() {
+    // Given: an installed npm plugin whose package contract excludes this host.
     let temp = tempfile::tempdir().expect("tempdir");
-    let package = temp
-        .path()
-        .join("packages/example@1.0.0/node_modules/example");
-    std::fs::create_dir_all(&package).expect("package directory");
-    std::fs::write(package.join("index.js"), "export default {};").expect("entrypoint");
-    std::fs::write(
-        package.join("package.json"),
-        r#"{"name":"example","version":"1.0.0","peerDependencies":{"@opencode-ai/plugin":"^0.1.0"}}"#,
+    let marker = temp.path().join("activated");
+    let spec = npm_compatibility_fixture(temp.path(), ">=2.0.0", &marker);
+    let owner = Arc::new(FakeTerminalOwner::new());
+    let terminal: Arc<dyn TerminalLease> = Arc::new(TerminalBroker::new(owner));
+
+    // When: the production loader resolves the npm package.
+    let load = load_js_plugins_ordered(
+        vec![spec],
+        host(temp.path(), terminal, JsHostPolicy::default()),
     )
-    .expect("package manifest");
+    .await;
+
+    // Then: compatibility fails before import/factory activation and names both versions.
+    assert!(load.plugins().is_empty(), "{:?}", load.diagnostics());
+    assert!(!marker.exists(), "the incompatible plugin factory ran");
+    assert_eq!(load.diagnostics().len(), 1);
+    let diagnostic = &load.diagnostics()[0];
+    assert_eq!(diagnostic.kind, JsDiagnosticKind::Compatibility);
+    assert_eq!(diagnostic.plugin, "compatibility-fixture@1.0.0");
+    assert!(diagnostic.message.contains("requires opencode >=2.0.0"));
+    assert!(diagnostic.message.contains("running 1.18.13"));
+}
+
+#[tokio::test]
+async fn js_version_gate_loads_a_satisfying_engines_opencode_package() {
+    // Given: an installed npm plugin whose package contract admits this host.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let marker = temp.path().join("activated");
+    let spec = npm_compatibility_fixture(temp.path(), ">=1.18.0 <2.0.0", &marker);
+    let owner = Arc::new(FakeTerminalOwner::new());
+    let terminal: Arc<dyn TerminalLease> = Arc::new(TerminalBroker::new(owner));
 
     // When
-    let resolved = JsPluginSpec::new("example@1.0.0")
-        .resolve(temp.path())
-        .expect("installed package resolves");
+    let load = load_js_plugins_ordered(
+        vec![spec],
+        host(temp.path(), terminal, JsHostPolicy::default()),
+    )
+    .await;
 
     // Then
-    assert!(matches!(resolved.gate(), VersionGate::Unsatisfied { .. }));
+    assert_eq!(load.plugins().len(), 1, "{:?}", load.diagnostics());
+    assert!(load.diagnostics().is_empty());
+    assert!(marker.exists(), "the compatible plugin factory did not run");
+    load.shutdown().await;
+}
+
+#[tokio::test]
+async fn js_version_gate_rejects_a_non_semver_engines_opencode_range() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let marker = temp.path().join("activated");
+    let spec = npm_compatibility_fixture(temp.path(), "latest", &marker);
+    let owner = Arc::new(FakeTerminalOwner::new());
+    let terminal: Arc<dyn TerminalLease> = Arc::new(TerminalBroker::new(owner));
+
+    let load = load_js_plugins_ordered(
+        vec![spec],
+        host(temp.path(), terminal, JsHostPolicy::default()),
+    )
+    .await;
+
+    assert!(load.plugins().is_empty(), "{:?}", load.diagnostics());
+    assert!(!marker.exists(), "the invalid-range plugin factory ran");
+    assert_eq!(load.diagnostics().len(), 1);
+    assert_eq!(load.diagnostics()[0].kind, JsDiagnosticKind::Compatibility);
+    assert!(load.diagnostics()[0].message.contains("opencode latest"));
 }
 
 const PLUGIN_CACHE: &str = "/config/.cache/opencode";

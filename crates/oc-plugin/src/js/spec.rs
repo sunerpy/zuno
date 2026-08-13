@@ -12,10 +12,9 @@
 //!    contribute a theme (`loader.ts:163-172`) — so the failure is reported and
 //!    the rest of the plugins still load.
 //! 3. **Whether its declared compatibility admits this host.** The version gate
-//!    compares the package's `@opencode-ai/plugin` requirement against the version
-//!    this binary reports, `1.18.13`. `file:` specs skip the gate: the user is
-//!    editing that source right now and a range they never wrote must not stop
-//!    them.
+//!    compares `package.json.engines.opencode` against the version this binary
+//!    reports, `1.18.13`. `file:` specs skip the gate: the user is editing that
+//!    source right now and a package range must not stop local development.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -29,9 +28,6 @@ use serde_json::Value;
 /// the number is a *compatibility claim about the JavaScript API*, matching todo
 /// 55's `--version`, not this crate's own release number.
 pub const REPORTED_PLUGIN_API_VERSION: &str = "1.18.13";
-
-/// The package whose version range gates a plugin.
-pub const PLUGIN_PEER_PACKAGE: &str = "@opencode-ai/plugin";
 
 /// Which entry point of a dual-entrypoint package to load.
 ///
@@ -303,19 +299,14 @@ impl ResolvedJsPlugin {
 pub enum VersionGate {
     /// A `file:` spec. The user owns that source; no range is enforced.
     Skipped,
-    /// The package names no `@opencode-ai/plugin` dependency.
+    /// The package names no `engines.opencode` range.
     Undeclared,
     /// The declared range admits this host.
     Satisfied {
         /// The range as written in the package's manifest.
         range: String,
     },
-    /// The declared range excludes this host. Load anyway, but say so.
-    ///
-    /// A refusal was rejected: every installed plugin here declares a range that
-    /// predates `1.18.13` (`^0.15.30` and `^1.15.11`), so a hard gate would reject
-    /// the two plugins this host exists to run. The verdict is therefore carried
-    /// as a warning a caller can surface.
+    /// The declared range excludes this host and the loader must skip it.
     Unsatisfied {
         /// The range as written.
         range: String,
@@ -364,9 +355,7 @@ pub struct PackageManifest {
     #[serde(default)]
     exports: Option<serde_json::Value>,
     #[serde(default)]
-    dependencies: Option<std::collections::BTreeMap<String, String>>,
-    #[serde(default, rename = "peerDependencies")]
-    peer_dependencies: Option<std::collections::BTreeMap<String, String>>,
+    engines: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default)]
     opencode: Option<OpencodeSection>,
 }
@@ -474,111 +463,308 @@ fn split_package_version(spec: &str) -> (Option<String>, Option<String>) {
 
 fn gate_for(manifest: &PackageManifest, reported: &str) -> VersionGate {
     let range = manifest
-        .dependencies
+        .engines
         .as_ref()
-        .and_then(|deps| deps.get(PLUGIN_PEER_PACKAGE))
-        .or_else(|| {
-            manifest
-                .peer_dependencies
-                .as_ref()
-                .and_then(|deps| deps.get(PLUGIN_PEER_PACKAGE))
-        });
+        .and_then(|engines| engines.get("opencode"))
+        .and_then(serde_json::Value::as_str);
     let Some(range) = range else {
         return VersionGate::Undeclared;
     };
     if range_admits(range, reported) {
         VersionGate::Satisfied {
-            range: range.clone(),
+            range: range.to_owned(),
         }
     } else {
         VersionGate::Unsatisfied {
-            range: range.clone(),
+            range: range.to_owned(),
             reported: reported.to_owned(),
         }
     }
 }
 
-/// A deliberately small npm-range check: `*`, `x`, exact, `^`, `~`, `>=`.
-///
-/// Full semver-range parsing is a dependency this crate does not have and does not
-/// need: the gate's only job is to decide whether to attach a warning, and every
-/// range observed in a real plugin manifest is one of these five shapes. An
-/// unrecognised range is treated as admitting the host, because refusing to load
-/// over an unparsed string would be the worse failure.
 fn range_admits(range: &str, version: &str) -> bool {
-    let range = range.trim();
-    if range.is_empty() || range == "*" || range == "x" || range == "latest" {
-        return true;
-    }
     let Some(target) = Semver::parse(version) else {
         return true;
     };
-    for clause in range.split("||") {
-        if clause_admits(clause.trim(), target) {
-            return true;
-        }
-    }
-    false
+    range
+        .split("||")
+        .any(|clause| clause_admits(clause.trim(), &target))
 }
 
-fn clause_admits(clause: &str, target: Semver) -> bool {
-    let (operator, rest) = match clause.as_bytes().first() {
-        Some(b'^') => ("^", &clause[1..]),
-        Some(b'~') => ("~", &clause[1..]),
-        Some(b'>') if clause.starts_with(">=") => (">=", &clause[2..]),
-        Some(b'>') => (">", &clause[1..]),
-        Some(b'<') if clause.starts_with("<=") => ("<=", &clause[2..]),
-        Some(b'<') => ("<", &clause[1..]),
-        Some(b'=') => ("=", &clause[1..]),
-        _ => ("=", clause),
-    };
-    let Some(bound) = Semver::parse(rest.trim()) else {
+fn clause_admits(clause: &str, target: &Semver) -> bool {
+    if clause.is_empty() || matches!(clause, "*" | "x" | "X") {
         return true;
-    };
-    match operator {
-        "^" => {
-            target >= bound
-                && if bound.major == 0 {
-                    target.major == 0 && target.minor == bound.minor
-                } else {
-                    target.major == bound.major
-                }
-        }
-        "~" => target >= bound && target.major == bound.major && target.minor == bound.minor,
-        ">=" => target >= bound,
-        ">" => target > bound,
-        "<=" => target <= bound,
-        "<" => target < bound,
-        _ => target == bound,
     }
+    if let Some((lower, upper)) = hyphen_bounds(clause) {
+        return lower.is_some_and(|bound| target >= &bound)
+            && upper.is_some_and(|bound| match bound {
+                RangeBound::Inclusive(version) => target <= &version,
+                RangeBound::Exclusive(version) => target < &version,
+            });
+    }
+    let tokens = clause.split_whitespace().collect::<Vec<_>>();
+    !tokens.is_empty()
+        && tokens
+            .into_iter()
+            .all(|token| comparator_admits(token, target).unwrap_or(false))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+fn comparator_admits(token: &str, target: &Semver) -> Option<bool> {
+    let (operator, rest) = if let Some(rest) = token.strip_prefix(">=") {
+        (">=", rest)
+    } else if let Some(rest) = token.strip_prefix("<=") {
+        ("<=", rest)
+    } else if let Some(rest) = token.strip_prefix('>') {
+        (">", rest)
+    } else if let Some(rest) = token.strip_prefix('<') {
+        ("<", rest)
+    } else if let Some(rest) = token.strip_prefix('=') {
+        ("=", rest)
+    } else if let Some(rest) = token.strip_prefix('^') {
+        ("^", rest)
+    } else if let Some(rest) = token.strip_prefix('~') {
+        ("~", rest.strip_prefix('>').unwrap_or(rest))
+    } else {
+        ("=", token)
+    };
+    let partial = PartialVersion::parse(rest)?;
+    if partial.major.is_none() {
+        return matches!(operator, "=" | ">=" | "<=" | "^" | "~").then_some(true);
+    }
+    let lower = partial.lower();
+    let next_major = lower.next_major();
+    let next_minor = lower.next_minor();
+    let upper = match (partial.minor, partial.patch) {
+        (None, _) => next_major.clone(),
+        (Some(_), None) => next_minor.clone(),
+        (Some(_), Some(_)) => lower.clone(),
+    };
+    Some(match operator {
+        "^" => {
+            let ceiling = if lower.major > 0 {
+                next_major
+            } else if partial.minor.is_none() {
+                Semver::new(1, 0, 0)
+            } else if lower.minor > 0 {
+                next_minor
+            } else if partial.patch.is_none() {
+                Semver::new(0, 1, 0)
+            } else {
+                lower.next_patch()
+            };
+            target >= &lower && target < &ceiling
+        }
+        "~" => {
+            let ceiling = if partial.minor.is_none() {
+                next_major
+            } else {
+                next_minor
+            };
+            target >= &lower && target < &ceiling
+        }
+        ">=" => target >= &lower,
+        ">" if partial.patch.is_none() => target >= &upper,
+        ">" => target > &lower,
+        "<=" if partial.patch.is_none() => target < &upper,
+        "<=" => target <= &lower,
+        "<" => target < &lower,
+        "=" if partial.patch.is_none() => target >= &lower && target < &upper,
+        "=" => target == &lower,
+        _ => false,
+    })
+}
+
+fn hyphen_bounds(clause: &str) -> Option<(Option<Semver>, Option<RangeBound>)> {
+    let (left, right) = clause.split_once(" - ")?;
+    let left = PartialVersion::parse(left.trim())?;
+    let right = PartialVersion::parse(right.trim())?;
+    let lower = left.major.map(|_| left.lower());
+    let upper = right.major.map(|_| {
+        let version = right.lower();
+        if right.minor.is_none() {
+            RangeBound::Exclusive(version.next_major())
+        } else if right.patch.is_none() {
+            RangeBound::Exclusive(version.next_minor())
+        } else {
+            RangeBound::Inclusive(version)
+        }
+    });
+    Some((lower, upper))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RangeBound {
+    Inclusive(Semver),
+    Exclusive(Semver),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Semver {
     major: u64,
     minor: u64,
     patch: u64,
+    prerelease: Vec<PrereleaseIdentifier>,
 }
 
 impl Semver {
+    const fn new(major: u64, minor: u64, patch: u64) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+            prerelease: Vec::new(),
+        }
+    }
+
     fn parse(text: &str) -> Option<Self> {
         let text = text.trim().trim_start_matches('v');
-        let core = text
+        let without_build = text.split_once('+').map_or(text, |(core, _)| core);
+        let (core, prerelease) = without_build
             .split_once('-')
-            .map_or(text, |(core, _)| core)
-            .split_once('+')
-            .map_or_else(
-                || text.split_once('-').map_or(text, |(core, _)| core),
-                |(core, _)| core,
-            );
+            .map_or((without_build, ""), |parts| parts);
         let mut parts = core.split('.');
         let major = parts.next()?.parse().ok()?;
-        let minor = parts.next().unwrap_or("0").parse().unwrap_or(0);
-        let patch = parts.next().unwrap_or("0").parse().unwrap_or(0);
+        let minor = parts.next()?.parse().ok()?;
+        let patch = parts.next()?.parse().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        let prerelease = if prerelease.is_empty() {
+            Vec::new()
+        } else {
+            prerelease
+                .split('.')
+                .map(PrereleaseIdentifier::parse)
+                .collect::<Option<Vec<_>>>()?
+        };
         Some(Self {
             major,
             minor,
             patch,
+            prerelease,
         })
+    }
+
+    const fn next_major(&self) -> Self {
+        Self::new(self.major + 1, 0, 0)
+    }
+
+    const fn next_minor(&self) -> Self {
+        Self::new(self.major, self.minor + 1, 0)
+    }
+
+    const fn next_patch(&self) -> Self {
+        Self::new(self.major, self.minor, self.patch + 1)
+    }
+}
+
+impl PartialOrd for Semver {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Semver {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.major, self.minor, self.patch)
+            .cmp(&(other.major, other.minor, other.patch))
+            .then_with(
+                || match (self.prerelease.is_empty(), other.prerelease.is_empty()) {
+                    (true, true) | (false, false) => self.prerelease.cmp(&other.prerelease),
+                    (true, false) => std::cmp::Ordering::Greater,
+                    (false, true) => std::cmp::Ordering::Less,
+                },
+            )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum PrereleaseIdentifier {
+    Numeric(u64),
+    Text(String),
+}
+
+impl PrereleaseIdentifier {
+    fn parse(text: &str) -> Option<Self> {
+        if text.is_empty() {
+            None
+        } else if text.bytes().all(|byte| byte.is_ascii_digit()) {
+            Some(Self::Numeric(text.parse().ok()?))
+        } else if text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            Some(Self::Text(text.to_owned()))
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PartialVersion {
+    major: Option<u64>,
+    minor: Option<u64>,
+    patch: Option<u64>,
+    prerelease: Vec<PrereleaseIdentifier>,
+}
+
+impl PartialVersion {
+    fn parse(text: &str) -> Option<Self> {
+        let text = text.trim().trim_start_matches('v');
+        if text.is_empty() {
+            return None;
+        }
+        let without_build = text.split_once('+').map_or(text, |(core, _)| core);
+        let (core, prerelease) = without_build
+            .split_once('-')
+            .map_or((without_build, ""), |parts| parts);
+        let mut parts = core.split('.');
+        let major = parse_partial_number(parts.next()?)?;
+        let minor = match parts.next() {
+            Some(value) => parse_partial_number(value)?,
+            None => None,
+        };
+        let patch = match parts.next() {
+            Some(value) => parse_partial_number(value)?,
+            None => None,
+        };
+        if parts.next().is_some() || major.is_none() && (minor.is_some() || patch.is_some()) {
+            return None;
+        }
+        let prerelease = if prerelease.is_empty() {
+            Vec::new()
+        } else {
+            prerelease
+                .split('.')
+                .map(PrereleaseIdentifier::parse)
+                .collect::<Option<Vec<_>>>()?
+        };
+        if !prerelease.is_empty() && patch.is_none() {
+            return None;
+        }
+        Some(Self {
+            major,
+            minor,
+            patch,
+            prerelease,
+        })
+    }
+
+    fn lower(&self) -> Semver {
+        Semver {
+            major: self.major.unwrap_or(0),
+            minor: self.minor.unwrap_or(0),
+            patch: self.patch.unwrap_or(0),
+            prerelease: self.prerelease.clone(),
+        }
+    }
+}
+
+fn parse_partial_number(text: &str) -> Option<Option<u64>> {
+    if matches!(text, "*" | "x" | "X") {
+        Some(None)
+    } else {
+        text.parse().ok().map(Some)
     }
 }
