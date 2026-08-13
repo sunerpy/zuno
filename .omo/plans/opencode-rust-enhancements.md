@@ -361,6 +361,130 @@ consolidation pass touch only new rows, asserted by row counts.
 
 ---
 
+## E-9. antigravity's "google_search" — investigated, and it is not what it looks like **[pure], small**
+
+**Raised by the user 2026-08-13**: search `opencode-antigravity-auth` for how `google_search`
+is implemented, and consider shipping it as an optional plugin here.
+
+### Correction of the record first
+
+**There is no `google_search` tool.** I grepped both installed versions
+(`opencode-antigravity-auth@1.2.8` and `@1.3.0` under `/config/.bun/install/cache/`):
+`google_search` appears **zero times** in either. The real name is **`web_search`**, and
+**`.omo/plans/opencode-rust.md:1346` calls it `google_search`** in a QA scenario — that is my
+own error from an earlier wave, carried forward unchecked. It should read `web_search`.
+
+### What it actually is: server-side grounding, not a tool
+
+It is not a search tool the model calls. It is a **request transform** that injects Gemini's
+grounding configuration into the outgoing payload:
+
+```js
+// dist/src/plugin.js:963
+googleSearch: config.web_search ? {
+    mode: config.web_search.default_mode,
+    threshold: config.web_search.grounding_threshold
+} : undefined,
+```
+
+```js
+// dist/src/plugin/transform/gemini.js:310
+if (googleSearch && googleSearch.mode === 'auto') {
+    ...
+    googleSearchRetrieval: {
+        ...
+        dynamicThreshold: googleSearch.threshold ?? 0.3,
+```
+
+Resolution order is variant-then-global (`request.js:831`:
+`variantConfig?.googleSearch ?? options?.googleSearch`), and it is configured by environment
+variable (`config/loader.js:141-146`: `OPENCODE_ANTIGRAVITY_WEB_SEARCH=auto|off`,
+`OPENCODE_ANTIGRAVITY_WEB_SEARCH_THRESHOLD`).
+
+So **Google performs the search server-side during generation** and grounds the answer. There is
+no HTTP client, no result parsing, no tool registration — nothing that would become a "search
+plugin". The searching is done by the model provider.
+
+### Why it therefore does not port as a plugin, and what does port
+
+Making this "an optional plugin" would be a category error: the mechanism is a
+**Gemini-request-shaping concern**, and this project already has the right home for it —
+`oc-provider-google` and the surface-aware request building todo 156 added.
+
+What is worth adopting is small and real:
+- **A `googleSearchRetrieval` grounding option on the Google/Gemini request path**, off by
+  default, with `mode` and `dynamicThreshold`.
+- **Variant-then-global resolution**, matching antigravity's precedence.
+- Configuration through the project's existing config, **not** a bespoke env var.
+
+**Dependency cost [pure]**: one optional field in a request body this project already builds.
+
+**Do not** reimplement `web_search` as a tool that calls a Google API — that needs a key and an
+HTTP surface, and it is a different feature from what antigravity does.
+
+**Acceptance criteria (agent-executable)**: with grounding enabled, a Gemini request body carries
+`googleSearchRetrieval` with the configured threshold, asserted on the captured request; with it
+off (the default) the field is absent; a variant-level setting overrides the global one; removing
+the injection fails a named test. Also fix `.omo/plans/opencode-rust.md:1346` to say `web_search`.
+
+---
+
+## E-10. Keyless search backend — **already implemented; verify, do not build** **[pure]**
+
+**Raised by the user 2026-08-13**: how does opencode's context7 work when the user has never
+entered an API key, and can this project do the same?
+
+### The answer: this project already does it
+
+`crates/oc-tools/src/websearch/mcp.rs:55` takes the key as an **`Option`** and returns the bare
+endpoint when it is absent:
+
+```rust
+pub fn exa_url(api_key: Option<&str>) -> String {
+    let Some(key) = api_key else {
+        return EXA_URL.to_owned();          // no key → plain https://mcp.exa.ai/mcp
+    };
+    ...append_pair("exaApiKey", key)
+}
+```
+
+The mechanism generalises: both backends are **MCP servers reached over HTTP**
+(`mcp.rs:3-4`: *"Both providers expose their search as an MCP `tools/call`, so one bounded POST
+serves both"*), at `https://mcp.exa.ai/mcp` and `https://search.parallel.ai/mcp`. A public MCP
+endpoint that accepts unauthenticated calls is exactly how context7 works too — the same shape,
+a different host. **So there is nothing to design here.**
+
+Two details already right, worth not breaking:
+- **Gating, not failing** (`websearch/mod.rs:3-8`): an unconfigured backend makes the tool
+  **absent** from the tool list rather than present-and-erroring. `web_search_enabled`
+  (`gating.rs:199`) returns true for the hosted provider id even with no keys configured, so a
+  hosted-provider session gets search without any user setup.
+- **Deterministic per-session backend choice** (`gating.rs:209`) so a session does not alternate
+  backends mid-conversation.
+
+### What is actually left to do — verification, and it is small
+
+The keyless path exists in code; what I did **not** verify is that it *works against the live
+endpoint today*, and that is the only open question. Concretely:
+
+1. **Does a keyless POST to `https://mcp.exa.ai/mcp` still succeed?** A public endpoint can start
+   requiring a key at any time, and the failure would be a silent capability loss.
+2. **If a keyless call is rejected, does the tool degrade honestly** — absent, or a clear error —
+   rather than appearing available and failing mid-turn? That is the seam shape this project has
+   found twenty-three times.
+3. **Adding context7 itself** would then be config plus one endpoint constant, if its MCP server
+   is public. Worth doing only if a keyless Exa call is confirmed working, since it is the same
+   mechanism.
+
+**Dependency cost [pure]** — no new code paths, no new dependencies.
+
+**Acceptance criteria (agent-executable)**: a live keyless call is exercised and its outcome
+recorded with the date (a network test must be opt-in, not part of the offline gate); if keyless
+access is rejected, the tool is absent rather than failing, asserted by a test; any added backend
+reuses `mcp.rs`'s single bounded POST rather than a second client.
+
+---
+
 ## E-8. Deferred, with reasons
 
 - **Agent teams (peer topology, shared task list)** — the only shipped peer-to-peer design is
