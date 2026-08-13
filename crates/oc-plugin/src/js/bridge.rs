@@ -72,6 +72,11 @@ pub enum BridgeError {
          refusing to overwrite the provider"
     )]
     TruncatedProvider { plugin: String, path: String },
+    #[error(
+        "JavaScript host truncated auth-loader provider data at `{path}` and could not restore it; \
+         refusing to overwrite the provider"
+    )]
+    HostTruncatedProvider { path: String },
 }
 
 /// Rebuild every auth hook the plugin registered.
@@ -312,27 +317,43 @@ impl AuthLoader for HandleAuthLoader {
         let get_auth = self
             .host
             .constant_function(credential_value(credential.as_ref()));
-        let sdk_provider = provider_value(
+        let provider_argument = provider_value(
             provider,
             SdkGeneration::Legacy,
             provider_source(provider),
             credential_key(credential.as_ref()),
-        );
-        let (value, arguments) = self
+        )
+        .into_json();
+        let (value, arguments, truncation_metadata) = self
             .host
             .call_mutating(
                 &self.handle,
-                vec![get_auth.argument(), sdk_provider.into_json()],
+                vec![get_auth.argument(), provider_argument.clone()],
             )
             .await?;
         if let Some(mutated) = arguments.get(1) {
-            if let Some(path) = truncated_path(mutated) {
+            let mut mutated = mutated.clone();
+            let encoded = encoded_truncations(&truncation_metadata, 1);
+            if let Some(truncation) = encoded
+                .iter()
+                .find(|truncation| truncation.source == TruncationSource::Plugin)
+            {
+                return Err(Box::new(BridgeError::TruncatedProvider {
+                    plugin: self.host.plugin().to_owned(),
+                    path: truncation.path.clone(),
+                }));
+            }
+            if let Some(path) = restore_host_truncations(&mut mutated, &provider_argument, &encoded)
+            {
+                return Err(Box::new(BridgeError::HostTruncatedProvider { path }));
+            }
+            if let Some(path) = truncated_path(&mutated) {
                 return Err(Box::new(BridgeError::TruncatedProvider {
                     plugin: self.host.plugin().to_owned(),
                     path,
                 }));
             }
-            *provider = plugin_provider(mutated.clone(), SdkGeneration::Legacy, provider)?;
+            *provider = plugin_provider(mutated, SdkGeneration::Legacy, provider)?;
         }
         Ok(value
             .as_object()
@@ -560,6 +581,69 @@ fn inputs_value(inputs: Option<&AuthInputs>) -> Value {
                 .collect(),
         )
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TruncationSource {
+    Host,
+    Plugin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct EncoderTruncation {
+    pub(super) path: String,
+    pub(super) source: TruncationSource,
+}
+
+pub(super) fn encoded_truncations(value: &Value, argument: usize) -> Vec<EncoderTruncation> {
+    value
+        .get(argument)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| {
+            let path = value.get("path")?.as_str()?.to_owned();
+            let source = if value.get("source").and_then(Value::as_str) == Some("host") {
+                TruncationSource::Host
+            } else {
+                TruncationSource::Plugin
+            };
+            Some(EncoderTruncation { path, source })
+        })
+        .collect()
+}
+
+pub(super) fn restore_host_truncations(
+    value: &mut Value,
+    original: &Value,
+    truncations: &[EncoderTruncation],
+) -> Option<String> {
+    for truncation in truncations
+        .iter()
+        .filter(|truncation| truncation.source == TruncationSource::Host)
+    {
+        let replacement = if truncation.path == "/" {
+            Some(original.clone())
+        } else {
+            original.pointer(&truncation.path).cloned()
+        };
+        let Some(replacement) = replacement else {
+            return Some(truncation.path.clone());
+        };
+        let target = if truncation.path == "/" {
+            Some(&mut *value)
+        } else {
+            value.pointer_mut(&truncation.path)
+        };
+        let Some(target) = target else {
+            return Some(truncation.path.clone());
+        };
+        if target.get("$truncated").and_then(Value::as_bool) != Some(true) {
+            return Some(truncation.path.clone());
+        }
+        *target = replacement;
+    }
+    None
 }
 
 pub(super) fn truncated_path(value: &Value) -> Option<String> {

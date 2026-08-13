@@ -159,6 +159,7 @@ impl Plugin for JsPlugin {
             } else {
                 (vec![call.input, call.output], 1)
             };
+            let original_args = args.clone();
             let result = match self.host.call_hook(name.as_str(), index, args).await {
                 Ok(result) => result,
                 Err(error) => {
@@ -168,16 +169,25 @@ impl Plugin for JsPlugin {
                     return Err(boxed(JsPluginHookFailure(message)));
                 }
             };
-            let output =
-                match invocation_output(&result, output_index, self.host.plugin(), name.as_str()) {
-                    Ok(output) => output,
-                    Err(error) => {
-                        let message = error.to_string();
-                        self.disable(name, PluginDiagnosticKind::Protocol, error)
-                            .await;
-                        return Err(boxed(JsPluginHookFailure(message)));
-                    }
-                };
+            let output = match invocation_output(
+                &result,
+                output_index,
+                self.host.plugin(),
+                name.as_str(),
+                &original_args,
+            ) {
+                Ok(output) => output,
+                Err(error @ JsPluginBuildError::HostTruncatedHookArgument { .. }) => {
+                    tracing::warn!(hook = %name, %error, "refused a hook mutation after host-side encoder loss");
+                    continue;
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    self.disable(name, PluginDiagnosticKind::Protocol, error)
+                        .await;
+                    return Err(boxed(JsPluginHookFailure(message)));
+                }
+            };
             if let Err(error) = crate::jsonrpc::apply_hook_output(hook, output) {
                 let message = error.to_string();
                 self.disable(name, PluginDiagnosticKind::Protocol, error)
@@ -318,12 +328,39 @@ fn invocation_output(
     index: usize,
     plugin: &str,
     hook: &str,
+    original_arguments: &[Value],
 ) -> Result<Value, JsPluginBuildError> {
-    let arguments = result
+    let mut arguments = result
         .get("args")
         .and_then(Value::as_array)
+        .cloned()
         .ok_or(JsPluginBuildError::MissingHookOutput)?;
-    for (argument, value) in arguments.iter().enumerate() {
+    let truncation_metadata = result.get("truncations").unwrap_or(&Value::Null);
+    for argument in 0..arguments.len() {
+        if let Some(truncation) = super::bridge::encoded_truncations(truncation_metadata, argument)
+            .into_iter()
+            .find(|truncation| truncation.source == super::bridge::TruncationSource::Plugin)
+        {
+            return Err(JsPluginBuildError::TruncatedHookArgument {
+                plugin: plugin.to_owned(),
+                hook: hook.to_owned(),
+                argument,
+                path: truncation.path,
+            });
+        }
+    }
+    for (argument, value) in arguments.iter_mut().enumerate() {
+        let encoded = super::bridge::encoded_truncations(truncation_metadata, argument);
+        if let Some(path) = original_arguments
+            .get(argument)
+            .and_then(|original| super::bridge::restore_host_truncations(value, original, &encoded))
+        {
+            return Err(JsPluginBuildError::HostTruncatedHookArgument {
+                hook: hook.to_owned(),
+                argument,
+                path,
+            });
+        }
         if let Some(path) = super::bridge::truncated_path(value) {
             return Err(JsPluginBuildError::TruncatedHookArgument {
                 plugin: plugin.to_owned(),
@@ -357,6 +394,15 @@ pub(crate) enum JsPluginBuildError {
     )]
     TruncatedHookArgument {
         plugin: String,
+        hook: String,
+        argument: usize,
+        path: String,
+    },
+    #[error(
+        "JavaScript host truncated `{hook}` hook argument {argument} at `{path}` and could not \
+         restore it; refusing to apply any hook mutation"
+    )]
+    HostTruncatedHookArgument {
         hook: String,
         argument: usize,
         path: String,
