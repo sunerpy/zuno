@@ -1,0 +1,107 @@
+FU-3 — Antigravity recovery tool_use_id end-to-end evidence
+================================================================
+
+Recorded client semantics (established before coding)
+-----------------------------------------------------
+
+Authoritative installed client source:
+`/config/.cache/opencode/packages/opencode-antigravity-auth@1.6.0/node_modules/opencode-antigravity-auth/dist/src/plugin/recovery.js:93-134,285-364`.
+
+- `extractToolUseIds` collects every `tool_use` part's concrete `id` from the failed
+  assistant message.
+- `recoverToolResultMissing` maps each collected id to its own
+  `{type:"tool_result", tool_use_id:id, content:"Operation cancelled by user (ESC pressed)"}`
+  and submits the whole array to `client.session.prompt`.
+- Prompt success is reported as successful recovery; any prompt rejection is caught and
+  reported as `false` by the recovery handler.
+
+Therefore `tool_use_id` is a selector among potentially multiple unfinished calls, not
+an ornamental assertion that some session-wide unfinished call exists. Each submitted
+result must resolve the call it names. A genuinely unknown/stale id must reject the
+request: the recorded client explicitly handles rejection as recovery failure, whereas
+silently accepting it would return `true` while leaving the named call unresolved.
+
+The prompt-provided `dist/src/plugin.js:1400,2319,2337,2366` locations were checked in
+the installed 1.6.0 bundle; they are `client.auth.set` calls in this installed layout,
+not recovery calls. The split installed recovery module above is the payload source also
+recorded by task 169 and is used as the contract rather than guessing from stale offsets.
+
+Existing Rust behavior and chosen seam
+--------------------------------------
+
+- `compat_v1.rs:1353-1368` validates `tool_use_id`, drops it, and converts only
+  `content` into prompt text.
+- `oc-engine/src/loop.rs:995-1017` repairs every unfinished tool part in the session
+  with the generic `[Tool execution was interrupted]` result. The engine regression
+  `loop_repairs_a_missing_tool_result_before_the_provider_sees_history`
+  (`oc-engine/tests/loop.rs:817-910`) proves that session-wide fallback behavior, but
+  has no submitted id to connect to one part.
+- `MessageStore::unfinished_tool_parts_for_session` returns each pending/running tool
+  part with its persisted `callID`, which is the selector the installed client submits.
+
+The route-level fix will first validate all submitted ids against that unfinished set,
+then mark each named part `error` using its submitted content before admitting the
+prompt. Any remaining unfinished part is untouched by the adapter and remains available
+to the engine's existing session-wide fallback. Validation precedes all writes so a
+multi-result request containing an unknown id cannot partially mutate the session.
+
+Regression design: seed two pending calls (`call-selected` and `call-other`), submit a
+result only for `call-selected`, then assert its persisted state carries the submitted
+error while `call-other` is still pending. A second request with `call-unknown` must
+return a non-success status and leave both calls pending. Thus replacing the submitted
+id with a wrong one, or dropping id consumption entirely, is observable.
+
+TDD red run
+-----------
+
+`CARGO_TARGET_DIR=/tmp/opencode/fu3 cargo test -p oc-server --test compat_v1
+compat_v1_antigravity_recovery_ --offline` compiled and ran both new route tests.
+Both failed for the intended pre-fix reasons: the selected call remained `pending`
+instead of becoming `error`, and the unknown id returned HTTP 200 instead of 404.
+No fixture or compile failure masked the behavioral gap.
+
+Targeted green run
+------------------
+
+After implementation, the two FU-3 tests passed. The complete `oc-server` v1
+compatibility integration target then passed 32/32. This includes task 169's OMO
+session-create and summarize adapters, FU-3's Antigravity adapter, task 171's
+published-schema/`slug` projection regression, and task 175's Antigravity/Kiro auth
+route regressions. No neighboring adapter in `compat_v1.rs` regressed.
+
+Mutation test
+-------------
+
+Before mutation, `df -h /` reported 80% use (below the 90% stop threshold).
+`compat_v1.rs` was copied to `/tmp/opencode/fu3/compat_v1.rs.fu3-backup` with
+`cp ... && cmp ...` before either route was changed.
+
+The non-equivalent mutant replaced both calls to `resolve_tool_results` with an
+ornamental read of `body.tool_results`, reproducing validate-and-drop while retaining
+the same accepted payload. The exact named test
+`compat_v1_antigravity_recovery_resolves_the_submitted_tool_use_id` failed: the named
+part's state was `pending` instead of `error`. This proves the assertion observes id
+consumption rather than merely validation or prompt execution.
+
+The backup was restored with `cp ... && cmp ...`. `git status --porcelain` then listed
+only the three intended Rust paths (`api/state.rs`, `compat_v1.rs`, and its integration
+test); no mutant or backup artifact remained in the worktree.
+
+Final gates
+-----------
+
+All commands used `CARGO_TARGET_DIR=/tmp/opencode/fu3` where Cargo was involved.
+
+- `cargo test --workspace --offline`: 217 test summaries, 3474 passed / 0 failed.
+- `cargo clippy --workspace --all-targets --offline`: completed with 0 warnings and
+  0 errors.
+- `cargo fmt --all --check`: clean (0 output lines).
+- The literal `lsp_diagnostics` MCP was attempted for all three changed Rust files,
+  but its server is rooted at the main checkout and rejected sibling-worktree paths
+  before invoking rust-analyzer. The same engine was run directly from this worktree
+  as `rust-analyzer diagnostics . --severity warning`; it completed with 0 findings.
+
+The first two aggregate gate attempts exceeded the tool's 600-second limit while the
+fresh private target was still executing, without a failed test. The completed Cargo
+test log was then parsed rather than rerunning it; the remaining diagnostics, Clippy,
+and fmt gates completed once. No gate failure was hidden or retried after success.

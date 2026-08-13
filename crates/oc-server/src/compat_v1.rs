@@ -60,6 +60,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, patch, post, put};
 use axum::{Router, routing::MethodRouter};
+use oc_db::message::{MessageStore, PartRecord};
 use oc_plugin_sdk::GeneratedClientArrival;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1276,11 +1277,13 @@ async fn v1_session_prompt(
     Path(session_id): Path<String>,
     Json(body): Json<V1PromptBody>,
 ) -> Result<Json<Value>, ApiError> {
+    let body = prompt_body(body)?;
+    resolve_tool_results(&api_state, &session_id, &body.tool_results)?;
     let admitted = api::session::prompt(
         State(api_state.clone()),
         Extension(services.clone()),
         Path(session_id.clone()),
-        Json(prompt_body(body)?),
+        Json(body.prompt),
     )
     .await?;
     services.runs.wait_until_idle(&session_id).await;
@@ -1314,20 +1317,33 @@ async fn v1_session_prompt_async(
     Path(session_id): Path<String>,
     Json(body): Json<V1PromptBody>,
 ) -> Result<StatusCode, ApiError> {
+    let body = prompt_body(body)?;
+    resolve_tool_results(&api_state, &session_id, &body.tool_results)?;
     let _ = api::session::prompt(
         State(api_state),
         Extension(services),
         Path(session_id),
-        Json(prompt_body(body)?),
+        Json(body.prompt),
     )
     .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn prompt_body(body: V1PromptBody) -> Result<PromptBody, ApiError> {
+struct V1ToolResult {
+    tool_use_id: String,
+    content: String,
+}
+
+struct V1Prompt {
+    prompt: PromptBody,
+    tool_results: Vec<V1ToolResult>,
+}
+
+fn prompt_body(body: V1PromptBody) -> Result<V1Prompt, ApiError> {
     let mut text = Vec::new();
     let mut files = Vec::new();
     let mut agents = Vec::new();
+    let mut tool_results = Vec::new();
     for part in body.parts {
         match part.get("type").and_then(Value::as_str) {
             Some("text") => {
@@ -1351,41 +1367,94 @@ fn prompt_body(body: V1PromptBody) -> Result<PromptBody, ApiError> {
                 text.push(value.to_owned());
             }
             Some("tool_result") => {
-                part.get("tool_use_id")
-                    .and_then(Value::as_str)
-                    .ok_or(ApiError::InvalidRequest(
-                        "tool_result parts require a string `tool_use_id`",
-                    ))?;
+                let tool_use_id = part.get("tool_use_id").and_then(Value::as_str).ok_or(
+                    ApiError::InvalidRequest("tool_result parts require a string `tool_use_id`"),
+                )?;
                 let content =
                     part.get("content")
                         .and_then(Value::as_str)
                         .ok_or(ApiError::InvalidRequest(
                             "tool_result parts require string `content`",
                         ))?;
-                // The core turn loop repairs unmatched stored tool calls before
-                // hydrating history. Re-submit the plugin's cancellation text as
-                // the user prompt that starts that repaired turn.
                 text.push(content.to_owned());
+                tool_results.push(V1ToolResult {
+                    tool_use_id: tool_use_id.to_owned(),
+                    content: content.to_owned(),
+                });
             }
             _ => return Err(ApiError::InvalidRequest("unsupported v1 prompt part type")),
         }
     }
-    Ok(PromptBody {
-        id: body.message_id,
-        prompt: PromptInputBody {
-            text: text.join("\n"),
-            files,
-            agents,
+    Ok(V1Prompt {
+        prompt: PromptBody {
+            id: body.message_id,
+            prompt: PromptInputBody {
+                text: text.join("\n"),
+                files,
+                agents,
+            },
+            delivery: None,
+            resume: body.no_reply.map(|no_reply| !no_reply),
+            agent: body.agent,
+            model: body.model.map(|model| ModelRefBody {
+                id: model.model_id,
+                provider_id: model.provider_id,
+                variant: None,
+            }),
         },
-        delivery: None,
-        resume: body.no_reply.map(|no_reply| !no_reply),
-        agent: body.agent,
-        model: body.model.map(|model| ModelRefBody {
-            id: model.model_id,
-            provider_id: model.provider_id,
-            variant: None,
-        }),
+        tool_results,
     })
+}
+
+fn resolve_tool_results(
+    state: &ApiState,
+    session_id: &str,
+    results: &[V1ToolResult],
+) -> Result<(), ApiError> {
+    if results.is_empty() {
+        return Ok(());
+    }
+
+    let connection = state.pool().get()?;
+    let store = MessageStore::new(&connection);
+    let mut unfinished = store.unfinished_tool_parts_for_session(session_id)?;
+    let mut selected = Vec::with_capacity(results.len());
+    for result in results {
+        let Some(index) = unfinished.iter().position(|part| {
+            part.data.get("callID").and_then(Value::as_str) == Some(&result.tool_use_id)
+        }) else {
+            return Err(ApiError::RequestNotFound {
+                kind: "tool result",
+                id: result.tool_use_id.clone(),
+                session_id: session_id.to_owned(),
+            });
+        };
+        selected.push(index);
+    }
+
+    for (result, index) in results.iter().zip(selected) {
+        resolve_tool_result(&store, &mut unfinished[index], result)?;
+    }
+    Ok(())
+}
+
+fn resolve_tool_result(
+    store: &MessageStore<'_>,
+    part: &mut PartRecord,
+    result: &V1ToolResult,
+) -> Result<(), ApiError> {
+    let Some(state) = part.data.get_mut("state").and_then(Value::as_object_mut) else {
+        return Err(ApiError::RequestNotFound {
+            kind: "tool result",
+            id: result.tool_use_id.clone(),
+            session_id: part.session_id.clone(),
+        });
+    };
+    state.insert("status".to_owned(), Value::String("error".to_owned()));
+    state.insert("error".to_owned(), Value::String(result.content.clone()));
+    state.insert("metadata".to_owned(), json!({"interrupted": true}));
+    store.put_part(part)?;
+    Ok(())
 }
 
 /// Projects an `/api` session onto the pre-`/api` (v1) SDK shape.
