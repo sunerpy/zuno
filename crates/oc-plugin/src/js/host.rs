@@ -70,6 +70,7 @@ use tokio::runtime::{Builder, Handle, Runtime};
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::js::projection::{GeneratedClientArrival, JsModelArrival, JsModelProjection};
 use crate::js::runtime::JsRuntime;
 use crate::js::spec::JsPluginSpec;
 use crate::{PluginDiagnostic, PluginDiagnosticKind};
@@ -1205,6 +1206,21 @@ impl HostInner {
     }
 
     async fn initialize(self: &Arc<Self>) -> Result<JsInitReport, JsHostError> {
+        debug_assert!(GeneratedClientArrival::ALL.into_iter().all(|arrival| {
+            JsModelArrival::GeneratedClient(arrival).projection() != JsModelProjection::None
+        }));
+        debug_assert_eq!(
+            JsModelArrival::PluginTools.projection(),
+            JsModelProjection::None
+        );
+        debug_assert_eq!(
+            JsModelArrival::AuthMethods.projection(),
+            JsModelProjection::None
+        );
+        debug_assert_eq!(
+            JsModelArrival::WorkspaceRegistration.projection(),
+            JsModelProjection::None
+        );
         let input = &self.boot.input;
         let params = json!({
             "entry": self.boot.entry,

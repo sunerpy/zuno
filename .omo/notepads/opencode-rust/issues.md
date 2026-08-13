@@ -7663,3 +7663,26 @@ plugins remain exempt for development parity. A production-path regression prove
 activates neither the plugin nor its factory marker; its satisfying-range control proves the gate does
 not reject compatible packages. Full upstream, TDD, mutation, and verification evidence is recorded in
 `.omo/evidence/task-174-opencode-rust.txt`.
+## [2026-08-13] Todo 176 — generated SDK arrivals must be classified independently of hooks
+
+Todo 170's exhaustive `HookModelBoundary` guard was correct but structurally incapable of seeing
+`PluginInput.client`: the real SDK object talks to the Rust HTTP server directly and never enters
+hook dispatch. The durable boundary is therefore an arrival taxonomy, not a larger hook enum.
+`GeneratedClientArrival` and `JsModelArrival` now classify generated catalogue responses,
+lightweight selections, ordinary hooks, and retained resource callbacks with exhaustive matches
+and no wildcard fallback. `/config/providers` remains explicitly `Unbacked`; that is safer than
+pretending an absent endpoint has a projection.
+
+The legacy `/provider` defect could not be repaired faithfully from v2 `ModelInfo`. By that point
+the canonical catalogue had already lost exact release-date representation, provider metadata,
+and long-context pricing detail. The specialized legacy DTO must remain a direct projection from
+models.dev data while sharing `CatalogView` availability. Future work must not collapse the two
+wire contracts and then attempt to reconstruct one from the other.
+
+Two environmental facts remain for future verification work. The exact installed
+`@opencode-ai/sdk@1.18.18` declaration tree was unavailable, so the declaration audit used the
+complete local 1.18.16 package plus installed 1.4.7/1.17.4 and the live 1.15.13 package; all
+relevant provider/model roles agreed, and the runtime regression uses the actual 1.15.13 client
+loaded by the installed plugin. Also, unconstrained workspace gates can exhaust host process
+resources; `CARGO_BUILD_JOBS=2` plus `--test-threads=1` completed the full test, Clippy, and fmt
+gates without changing behavior or skipping tests.

@@ -61,13 +61,13 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, patch, post, put};
 use axum::{Router, routing::MethodRouter};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 use crate::ServerServices;
 use crate::SessionModelSelection;
 use crate::api::catalog::AgentInfo;
 use crate::api::error::ApiError;
-use crate::api::provider::{ModelInfo, ProviderInfo};
+use crate::api::provider::LegacyProviderList;
 use crate::api::session::{
     MessagesQuery, ModelRefBody, PromptBody, PromptInputBody, SessionCreateInput, SessionInfo,
     SessionListQuery,
@@ -1158,32 +1158,10 @@ async fn v1_agents(
     Ok(Json(response.data.into_iter().map(v1_agent).collect()))
 }
 
-async fn v1_providers(Extension(api_state): Extension<ApiState>) -> Result<Json<Value>, ApiError> {
-    let providers = api::provider::providers(State(api_state.clone())).await?;
-    let models = api::provider::models(State(api_state)).await?;
-    let connected = providers
-        .data
-        .iter()
-        .map(|provider| provider.id.clone())
-        .collect::<Vec<_>>();
-    let mut models_by_provider = BTreeMap::<String, Vec<ModelInfo>>::new();
-    for model in models.data {
-        models_by_provider
-            .entry(model.provider_id.clone())
-            .or_default()
-            .push(model);
-    }
-    let all = providers
-        .data
-        .into_iter()
-        .map(|provider| {
-            let models = models_by_provider.remove(&provider.id).unwrap_or_default();
-            v1_provider(provider, models)
-        })
-        .collect::<Vec<_>>();
-    Ok(Json(
-        json!({"all": all, "default": {}, "connected": connected}),
-    ))
+async fn v1_providers(
+    Extension(api_state): Extension<ApiState>,
+) -> Result<Json<LegacyProviderList>, ApiError> {
+    api::provider::legacy_provider_list(&api_state).map(Json)
 }
 
 async fn v1_session_list(
@@ -1466,49 +1444,6 @@ fn v1_agent(agent: AgentInfo) -> Value {
         "tools": {},
         "options": agent.request.body,
         "maxSteps": agent.steps,
-    })
-}
-
-fn v1_provider(provider: ProviderInfo, models: Vec<ModelInfo>) -> Value {
-    let models = models
-        .into_iter()
-        .map(|model| (model.id.clone(), v1_model(model)))
-        .collect::<Map<String, Value>>();
-    json!({
-        "id": provider.id,
-        "name": provider.name,
-        "env": [],
-        "api": provider.api.url,
-        "npm": provider.api.package,
-        "models": models,
-    })
-}
-
-fn v1_model(model: ModelInfo) -> Value {
-    let cost = model.cost.first().map(|cost| {
-        json!({
-            "input": cost.input,
-            "output": cost.output,
-            "cache_read": cost.cache.read,
-            "cache_write": cost.cache.write,
-        })
-    });
-    let input = model.capabilities.input.clone();
-    let output = model.capabilities.output.clone();
-    json!({
-        "id": model.id,
-        "name": model.name,
-        "release_date": model.time.released.to_string(),
-        "attachment": input.iter().any(|modality| modality != "text"),
-        "reasoning": false,
-        "temperature": true,
-        "tool_call": model.capabilities.tools,
-        "cost": cost,
-        "limit": {"context": model.limit.context, "output": model.limit.output},
-        "modalities": {"input": input, "output": output},
-        "status": model.status,
-        "options": model.request.body,
-        "headers": model.request.headers,
     })
 }
 

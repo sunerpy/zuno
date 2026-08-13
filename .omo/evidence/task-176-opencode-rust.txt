@@ -1,0 +1,129 @@
+Task 176 — project SDK shape across the generated JavaScript client boundary
+Branch: task-176
+Starting HEAD: 573a424f
+
+DISCOVERY PROVENANCE
+--------------------------------------------------------------------------------
+The required first call was CodeGraph `explore` with projectPath
+`/config/workspace/ProdDir/AI/oc-wt/t176` and query
+`PluginInput client projection HookModelBoundary classify v1_model JsHost call`.
+CodeGraph reported that the sibling worktree is not indexed, so this task proceeds with
+full source reads and a generated-declaration audit as permitted by the task instructions.
+
+Todo 170's evidence and all of `projection.rs`, `bridge.rs`, `host.rs`, `plugin.rs`, and
+`shim.mjs` were read before implementation. The key open seam is confirmed: `buildInput`
+loads the plugin's own real `@opencode-ai/sdk`, calls `createOpencodeClient` directly with
+the Rust server URL, and hands that unwrapped object to every plugin factory as
+`PluginInput.client`. Therefore generated HTTP responses bypass `HookModelBoundary` and
+the resident callback codec entirely.
+
+PRE-IMPLEMENTATION BOUNDARY INVENTORY
+--------------------------------------------------------------------------------
+The generated declarations were audited from both SDK generations. The locally cached
+1.18.16 declarations are the closest complete generated package to the 1.18.18 oracle pin;
+the live `@sunerpy/oh-my-openagent@4.21.0` manifest itself pins SDK 1.15.13. The relevant
+contracts are unchanged across the additional locally installed 1.4.7 and 1.17.4 copies:
+legacy `ConfigProvidersResponses`, specialized `ProviderListResponses`, and the v2
+`V2ModelListResponses`/`V2ProviderListResponses`/`V2ProviderGetResponses` have the same
+model/provider roles. No conclusion below depends on a field seen in only one copy.
+
+| JavaScript surface | Direction | Declared value | Projection status at start |
+|---|---|---|---|
+| `chat.message` | Rust -> JS | `{providerID, modelID}` selection | COMPLETE: todo 170 classified and projected it |
+| `chat.params`, `chat.headers`, `experimental.compaction.autocontinue` | Rust -> JS | legacy `Model` and `ProviderContext.info: Provider` | COMPLETE: shared `chat_context_value` |
+| `experimental.chat.system.transform` | Rust -> JS | legacy `Model` | COMPLETE: `model_value(Legacy)` |
+| `experimental.provider.small_model` input/output | Rust <-> JS | v2 hook `Provider`/`Model` | COMPLETE: v2 projectors and decoder |
+| `ProviderHook.models` argument/result | Rust <-> JS | v2 hook `Provider`/model map | COMPLETE: resource callback projectors |
+| `Auth.loader` argument/mutation | Rust <-> JS | legacy hook `Provider` with models | COMPLETE: resource callback projectors |
+| JavaScript plugin tools | Rust <-> JS | JSON args, `ToolContext`, `ToolOutput` | N/A: no model/provider field |
+| OAuth/API auth method callbacks | Rust <-> JS | auth inputs/results/credentials | N/A: no model/provider field; `Auth.loader` is listed separately |
+| `experimental_workspace.register` | JS -> Rust | opaque workspace adapter descriptor | N/A: no declared model/provider field |
+| `PluginInput.client.config.providers()` (legacy and v2 SDK roots) | Rust HTTP -> JS | full public `Provider[]`, each with SDK `Model` map | GENERATED BUT CURRENTLY UNBACKED; any future backing must select a projection class |
+| `PluginInput.client.provider.list()` (legacy and v2 SDK roots) | Rust HTTP -> JS | specialized provider catalog and model metadata | INCOMPLETE: backed by `v1_provider`/`v1_model`, outside `projection.rs`; live OMO callsites consume it |
+| `PluginInput.client.v2.model.list()` | Rust HTTP -> JS | `ModelV2Info[]` | COMPLETE: `/api/model` has a typed `ModelInfo` projection and full shape test |
+| `PluginInput.client.v2.provider.list/get()` | Rust HTTP -> JS | `ProviderV2Info[]` / `ProviderV2Info` | COMPLETE: `/api/provider` typed projection and shape tests |
+| Generated session/config/message/event methods carrying `ModelRef` | Rust HTTP <-> JS | `{providerID, modelID}` selection only | COMPLETE BY TYPE: API request/response structs use explicit SDK spelling; this is selection metadata, not full model/provider projection |
+
+`client.provider.list()` is the live missing path. Its generated model contract requires the
+meaningful source values `release_date`, `reasoning`, `temperature`, `tool_call`, `cost`,
+`limit`, and `modalities`. At start, `v1_model` receives a v2 `ModelInfo` after the source
+catalogue has already been reduced: it stringifies epoch milliseconds as `release_date`,
+hard-codes reasoning/temperature, and cannot faithfully reproduce long-context cost metadata.
+The repair therefore must project the specialized legacy response directly from the canonical
+models.dev document rather than reverse-project the lossy `/api/model` wire value.
+
+COMPLETENESS METHOD
+--------------------------------------------------------------------------------
+1. Extended todo 170's exhaustive hook/resource audit with every `PluginInput` field and every
+   non-hook callback family (`tools`, auth methods, provider methods, workspace registration).
+2. Searched both legacy and v2 generated `sdk.gen.d.ts` return types for Model/Provider-bearing
+   responses, then traced those named responses in `types.gen.d.ts`. This found exactly the two
+   legacy public-provider operations, the specialized `/provider` operation, and the three v2
+   catalogue operations above. Lightweight `ModelRef` occurrences were audited separately.
+3. Matched every generated HTTP route to the Rust routers. `/api/model` and `/api/provider*`
+   already use typed v2 wire structs; `/provider` alone uses an ad-hoc lossy adapter; and
+   `/config/providers` is honestly unbacked rather than silently projected.
+4. Checked the real installed OMO distribution rather than relying only on declarations:
+   `dist/index.js:26958,84674` calls `client.provider.list()` and reads the model map.
+
+This inventory extends the authoritative arrival classes beyond `HookInvocation`: callback
+arrivals, retained resource callbacks, generated full-provider responses, the specialized
+legacy catalogue response, v2 wire catalogue responses, and lightweight model selections must
+all be explicitly classified. A compile-time exhaustive Rust enum will encode those classes so
+adding a new arrival kind cannot default silently to an unprojected path.
+
+IMPLEMENTATION
+--------------------------------------------------------------------------------
+`crates/oc-plugin/src/js/projection.rs` now defines the complete arrival vocabulary through
+`GeneratedClientArrival` and `JsModelArrival`. Its exhaustive `projection()` match has no
+wildcard arm. It classifies `/config/providers` honestly as `Unbacked`, `/provider` as the
+specialized `LegacyCatalogHttp` projection, all three v2 model/provider catalogue operations,
+lightweight selections, ordinary hook callbacks, and retained resource callbacks. Production
+entry points in `jsonrpc.rs`, `js/bridge.rs`, and `js/host.rs` consume that classification, so a
+new arrival class cannot silently inherit an unprojected default.
+
+`crates/oc-server/src/api/provider.rs` now projects a typed legacy provider/model document
+directly from canonical models.dev data while reusing `CatalogView` for availability. The
+projection preserves provider API/env/npm metadata and model identity, exact release date,
+reasoning/temperature/tool-call flags, modalities, limits, status, headers/options, npm override,
+and complete costs including zero-valued cache prices and `context_over_200k`. The legacy
+`/provider` handler in `compat_v1.rs` delegates to this canonical projection rather than trying
+to reverse-project the already-reduced v2 `ModelInfo`; epoch milliseconds can therefore no
+longer become a decimal `release_date` string.
+
+`crates/oc-cli/tests/generated_sdk_provider.rs` starts the production `ServerBuilder` plus
+`compat_v1_router`, loads the real installed `@opencode-ai/sdk@1.15.13`, and invokes
+`PluginInput.client.provider.list()`. It proves JavaScript observes the generated SDK spelling
+and meaningful model values rather than a hand-authored HTTP fixture.
+
+REGRESSIONS AND MUTATION PROOFS
+--------------------------------------------------------------------------------
+- `compat_v1_provider_projection_preserves_catalog_model_semantics` passed and checks the full
+  canonical legacy response, including the exact date and long-context cost metadata.
+- `plugin_input_client_provider_list_observes_the_production_sdk_projection` passed through the
+  production router and real generated client.
+- `every_generated_client_model_arrival_has_an_explicit_projection` and
+  `every_non_hook_resource_arrival_has_an_explicit_projection` passed and pin the exhaustive
+  arrival inventory.
+- Mutating `release_date` back to epoch-millisecond text produced `"1764547200000"` and the
+  compat-v1 regression failed.
+- Mutating projected `reasoning` to `false` made the real generated-client regression fail.
+- Reclassifying `/provider` as `Unbacked` made the classifier regression fail.
+All three mutations were restored before final verification.
+
+FINAL VERIFICATION
+--------------------------------------------------------------------------------
+- Changed-file `lsp_diagnostics`: all eight changed Rust files reported `No diagnostics found`.
+  The MCP workspace restriction was handled with a temporary shared clone under the primary
+  repository; that clone was removed afterward.
+- `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/tmp/opencode/t176 cargo test --workspace --offline -- --test-threads=1`
+  passed, including all named task regressions and doc tests.
+- `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/tmp/opencode/t176 cargo clippy --workspace --all-targets --offline`
+  passed with no warnings.
+- `cargo fmt --all --check` passed with no output.
+- `git diff --check` passed.
+
+The first unconstrained workspace-gate attempt hit host `WouldBlock: Resource temporarily
+unavailable`; this was environmental rather than an assertion failure. The single constrained
+retry above completed all required gates successfully. No dependency was added, and todo 174's
+version gate and `docs/plugin-authoring.md` compatibility contract were not changed.
