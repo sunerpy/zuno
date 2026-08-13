@@ -1,0 +1,265 @@
+TASK FU-2 — Malformed plugin-model diagnostic is unguarded
+Worktree: /config/workspace/ProdDir/AI/oc-wt/fu2   Branch: task-fu2
+Started:  2026-08-13
+STATUS: COMPLETE — FU-2 closed. Created as the first action and appended
+incrementally; this line was the only edit to an existing line.
+
+Base HEAD at start: 41827c84 docs(plan): register FU-7 — cap retry at 180s and make retrying visible
+df -h / at start: 290G total, 29G avail (91% used)
+
+--- LOG ---
+
+SOURCES READ (authoritative statement first)
+--------------------------------------------------------------------------------
+- .omo/plans/opencode-rust-followup.md, section `## FU-2` — the authoritative
+  statement and its acceptance clause.
+- .omo/plans/opencode-rust-followup.md, `## Working rules` — mutate-to-verify,
+  `&&`-guarded backups, never `git add -A`.
+- crates/oc-plugin/src/js/bridge.rs:480-534 — `HandleModelLoader::models`: the
+  per-entry `plugin_model(...)` decode, the `Err(error) =>` skip branch, and the
+  `tracing::debug!` diagnostic at :523-528 naming plugin, model, and error.
+- crates/oc-plugin/src/js/projection.rs:236-241, :294-302 — `plugin_model` returns
+  `serde_json::Error`; `plugin_model_value` renames SDK `providerID` to
+  `provider_id`. So the fixture's `{providerID: "github-copilot"}` sibling decodes
+  as `{provider_id: ...}` and fails on the first missing required field.
+- crates/oc-llm/src/catalog/resolved.rs:49-53 — `ResolvedModel`'s first field is
+  `id`, so that malformed sibling's decode reason is `missing field \`id\``.
+- crates/oc-plugin/src/js/host.rs:599-604 — `JsHost::plugin()`, "the plugin name
+  used in every diagnostic".
+- .omo/evidence/task-167-opencode-rust.txt — built this isolation; its fixture
+  already returns `malformed: {providerID: "github-copilot"}` alongside one valid
+  model, and its mutation proof covers decoding, not the diagnostic.
+- .omo/evidence/F2-REPORT-wave12.md:99-101 and F2-REPORT-wave13.md:75,103-105 —
+  F2-O2's exact wording. Round 2's `## Follow-ups` section carries only the
+  projection.rs observation; F2-O2's text lives in the wave reports, which the
+  followup plan's `**Source**: F2 ... Round 1 and Round 2` line points at.
+  Wave 13: "independently removed only the malformed-model `tracing::debug!` event
+  from `HandleModelLoader`, preserving sibling isolation. Both
+  `production_js_sdk_model_advertised_*` real-binary tests still passed 2/2 ...
+  no test consumes the promised plugin id, malformed model id, or decode error."
+
+ESTABLISHED IDIOM CHOSEN (reused, not invented)
+--------------------------------------------------------------------------------
+Two idioms exist in this repository for asserting an emitted tracing event:
+  (a) crates/oc-auth/src/store.rs:462-504 and crates/oc-config/tests/instructions.rs:529-582
+      — a scoped in-memory `MakeWriter` + `tracing::subscriber::with_default`.
+      NOT USABLE HERE: neither `oc-plugin` nor `oc-cli` has a `tracing-subscriber`
+      dependency or dev-dependency, and adding one is forbidden by this task.
+  (b) crates/oc-cli/tests/tool_turn.rs:592-628 (runner) and :1292-1330 (assertions)
+      — launch the real `opencode-rust` binary with `--print-logs --log-level DEBUG`
+      and assert on `output.stderr`.
+Idiom (b) is used, and it is also the idiom the task prefers on independent
+grounds: it crosses the production JavaScript boundary exactly as todo 167's two
+tests do, rather than unit-testing an emission helper.
+`crates/oc-observability/src/config.rs:319-336` confirms `--log-level DEBUG`
+installs a global default directive, so `oc_plugin::js::bridge` DEBUG events pass
+the filter; `--print-logs` adds the stderr layer additively.
+
+DISK NOTE (working-rules check, non-destructive resolution)
+--------------------------------------------------------------------------------
+`df -h /` read 93-94% used with ~19-22G free, above the working rules' 90% stop
+line, because five sibling target directories hold 14-18G each. Nothing was
+deleted. Reading FU-7's live command line showed the cause and the fix: it builds
+with `CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_DEBUG=0`,
+which strips debuginfo. Adopting the same three variables kept this task's
+`/tmp/opencode/fu2` at 1021M instead of ~17G, so no reclamation was needed and no
+other task's build cache was touched. Every backup below uses `cp ... && test -s`.
+
+STEP 1 — REPRODUCED THE GAP (before writing anything)
+--------------------------------------------------------------------------------
+Backed up: cp crates/oc-plugin/src/js/bridge.rs /tmp/opencode/fu2-backup/bridge.rs.orig
+           && test -s ...   (md5 0a23d5e24261109624d553e789d60b16)
+
+Mutation: deleted ONLY the diagnostic at bridge.rs:523-528, replacing the arm with
+`Err(_) => {}`. The `plugin_model` decode and the skip-on-failure isolation were
+left exactly as they are, so this removes reporting without touching policy.
+
+Command:
+  CARGO_TARGET_DIR=/tmp/opencode/fu2 CARGO_INCREMENTAL=0 \
+  CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_BUILD_JOBS=4 \
+  cargo test -p oc-cli --test tool_turn --offline production_js_sdk_model_advertised
+
+Result — the gap, confirmed:
+  test production_js_sdk_model_advertised_chat_beats_a_responses_heuristic_id ... ok
+  test production_js_sdk_model_advertised_responses_beats_a_heuristic_hostile_id ... ok
+  test result: ok. 2 passed; 0 failed; 0 ignored; 11 filtered out
+
+Both production JavaScript boundary tests stay green with the diagnostic deleted.
+The diagnostic is behavior nothing pins. Restored immediately from the backup;
+md5 matched the original and `git status --porcelain` was empty.
+
+STEP 2 — THE TEST, AND WHY IT PINS CONTENT RATHER THAN PRESENCE
+--------------------------------------------------------------------------------
+Added to crates/oc-cli/tests/tool_turn.rs:
+
+  production_js_malformed_model_diagnostic_names_the_plugin_model_and_decode_reason
+
+Shape (production boundary, matching todo 167's two tests rather than unit-testing
+an emission helper):
+  1. Writes the SAME `SDK_MODEL_PROVIDER_PLUGIN` .mjs fixture todo 167 built, whose
+     model map is one decodable `ModelV2` plus `malformed: {providerID: "github-copilot"}`.
+  2. Launches the real `opencode-rust` binary through
+     `run_sdk_model_provider_prompt(..., print_debug_logs = true)`, which now prefixes
+     `--print-logs --log-level DEBUG`. That is the existing idiom at
+     tool_turn.rs:592-628, and it is required: `oc-observability` writes the rolling
+     file always but attaches the stderr layer only under `--print-logs`, and the
+     DEBUG default directive only under `--log-level DEBUG`.
+  3. Asserts the run SUCCEEDED, then that the valid sibling still dispatched:
+     2 captured requests, last on `/v1/chat/completions`, `model == "gpt-5"`.
+     This is the isolation restatement — it fails if a future change "reports" the
+     malformed model by discarding the provider or the run.
+  4. Finds the ONE stderr line containing the message, then asserts three facts
+     against THAT LINE:
+        the plugin      -> format!("file:{}", plugin.display())
+        the model id    -> "malformed"
+        the decode reason -> "missing field `id`"
+
+Why this pins content, not presence. Three independent `stderr.contains(..)` calls
+would be satisfiable by three unrelated lines, and merely finding the line would
+pass with every field empty. Locating the line first and then asserting its fields
+means a diagnostic that fires with a blank plugin, blank model, or blank error
+fails here. Mutations 2-4 below demonstrate exactly that, each on its own leg.
+
+The two expected literals are derived, not guessed:
+  - `missing field \`id\`` — `plugin_model_value` (projection.rs:294-302) renames the
+    fixture sibling's only field `providerID` to `provider_id`, so serde then fails
+    on `ResolvedModel`'s first missing required field, `id` (resolved.rs:49-51).
+  - the plugin — `JsHost::plugin()` reports the config SPEC, so the emitted line is
+    `plugin=file:/tmp/oc-testkit-XXXX/project/sdk-model-provider.mjs`. The test builds
+    that from the fixture path (the same idiom as tool_turn.rs:1327's
+    `broken_config.join("plugin").display()`), rather than matching a stem that could
+    coincide with unrelated text. An earlier draft asserted the stem
+    `"sdk-model-provider"`; it was strengthened to the exact spec after mutation 2
+    printed the real line.
+
+The one production-source change is NONE: bridge.rs is byte-identical to `main`
+(md5 0a23d5e24261109624d553e789d60b16 verified after every mutation). Only
+crates/oc-cli/tests/tool_turn.rs changed: the runner gained a `print_debug_logs`
+parameter (existing call site passes `false`, so the two todo-167 tests keep their
+exact previous command line) and the new test was added.
+
+First run, unmutated:
+  cargo test -p oc-cli --test tool_turn --offline production_js
+  test production_js_sdk_model_advertised_responses_beats_a_heuristic_hostile_id ... ok
+  test production_js_sdk_model_advertised_chat_beats_a_responses_heuristic_id ... ok
+  test production_js_malformed_model_diagnostic_names_the_plugin_model_and_decode_reason ... ok
+  test result: ok. 3 passed; 0 failed; 0 ignored; 11 filtered out
+
+STEP 3 — MUTATIONS (four; each restored from an `&&`-guarded backup)
+--------------------------------------------------------------------------------
+Every mutation touched ONLY the diagnostic. The `plugin_model` decode and the
+skip-on-failure isolation were untouched throughout, and all three tests were run
+each time so the two todo-167 tests act as a control.
+
+MUTATION 1 — remove the emission (`Err(error) => tracing::debug!(...)` -> `Err(_) => {}`)
+  production_js_malformed_model_diagnostic_names_the_plugin_model_and_decode_reason ... FAILED
+    panicked at crates/oc-cli/tests/tool_turn.rs:1008:13:
+    the skipped model must be reported at DEBUG; stderr: <no matching line>
+  production_js_sdk_model_advertised_responses_beats_a_heuristic_hostile_id ... ok
+  production_js_sdk_model_advertised_chat_beats_a_responses_heuristic_id ... ok
+  test result: FAILED. 2 passed; 1 failed
+  => The new test fails BY NAME. The two old tests still pass, which is FU-2's exact
+     shape, now closed rather than merely described.
+
+MUTATION 2 — blank ONLY the model id (`model = %id` -> `model = ""`)
+  ... FAILED, and the event still fired, proving the mutant is observable rather
+  than equivalent:
+    the diagnostic must name the rejected model's id ("malformed")
+    line: 2026-08-13T18:59:16Z DEBUG oc_plugin::js::bridge: skipped a plugin model
+      this host could not decode
+      plugin=file:/tmp/oc-testkit-XbkSvl/project/sdk-model-provider.mjs
+      model="" error=missing field `id`
+  test result: FAILED. 2 passed; 1 failed
+  => Presence is intact — same level, same message, plugin and error still named —
+     and the test STILL fails. Content is pinned, not presence.
+
+MUTATION 3 — blank ONLY the plugin (`plugin = %self.host.plugin()` -> `plugin = ""`)
+    the diagnostic must name the plugin it came from
+      ("file:/tmp/oc-testkit-WtqrVw/project/sdk-model-provider.mjs")
+    line: ... plugin="" model=malformed error=missing field `id`
+  test result: FAILED. 2 passed; 1 failed
+
+MUTATION 4 — blank ONLY the decode reason (`%error` -> `error = ""`)
+    the diagnostic must name the decode reason ("missing field `id`")
+    line: ... plugin=file:/tmp/oc-testkit-23pewF/... model=malformed error=""
+  test result: FAILED. 2 passed; 1 failed
+  (This mutant also produced `warning: unused variable: error`, independent proof
+   the field was genuinely disconnected rather than equivalently rewritten.)
+
+Mutations 3 and 4 are beyond the two required. They were run because the acceptance
+clause names three facts, and only mutating each leg proves all three are pinned.
+
+After each mutation: `cp /tmp/opencode/fu2-backup/bridge.rs.orig ...` then
+`test -s`, `md5sum` (0a23d5e24261109624d553e789d60b16 every time), and
+`git status --porcelain` showing only ` M crates/oc-cli/tests/tool_turn.rs`.
+
+STEP 4 — NO REGRESSION IN THE NEIGHBOURING TODOS
+--------------------------------------------------------------------------------
+  cargo test -p oc-plugin --offline
+    every binary ok; totals include 24 passed / 0 failed on tests/js.rs and
+    11 + 5 + 4 + 2 + 2 passed / 0 failed across the unit binaries.
+    Named guards confirmed present and passing via `--list`:
+      js::projection::tests::every_generated_client_model_arrival_has_an_explicit_projection   (todo 179)
+      js::projection::tests::every_non_hook_resource_arrival_has_an_explicit_projection        (todo 179)
+      js_auth_loader_refuses_legacy_only_model_fields_a_plugin_forges                          (todo 176)
+      js_auth_loader_restores_every_legacy_only_model_field_the_sdk_surface_omits               (todo 176)
+      js_sdk_boundary_provider_loader_reads_v2_provider_and_supplies_model                     (todo 167)
+      js_sdk_boundary_auth_loader_reads_provider_and_supplies_model
+      js_sdk_boundary_ordinary_hooks_read_declared_shapes_and_supply_small_model
+  cargo test -p oc-cli --test tool_turn --offline
+    test result: ok. 14 passed; 0 failed  (13 before, plus the new test)
+
+STEP 5 — GATES (final state, nothing mutated)
+--------------------------------------------------------------------------------
+  cargo fmt --all --check
+    exit 0, no output. CLEAN.
+
+  cargo clippy --workspace --all-targets --offline
+    `Finished dev profile`; zero lines matching ^warning or ^error. 0 WARNINGS.
+
+  cargo test --workspace --offline -- --test-threads=1
+    (log: /tmp/opencode/fu2-backup/workspace-test2.log, 217 result lines =
+     182 test binaries + 35 doctest sections)
+    TOTALS: passed=3480  failed=0  ignored=2
+    Zero lines matching `^test result: FAILED` or `^error`.
+    3480 = the 3479 baseline plus this task's one new test, so the required
+    "at or above 3479 passing / 0 failed" is met and the delta is fully accounted for.
+
+    Note on an earlier truncated run: a first attempt was cut off by my own
+    `timeout 7000` mid-suite at `oc-pty` with no error text, which summed to a
+    misleading 2099. It was detected by checking `grep -c Doc-tests` (0) against the
+    completed run's 35, and re-run to completion rather than reported. Recorded here
+    because a truncated cargo run under `timeout` leaves a clean-looking log.
+
+CONSTRAINTS OBSERVED
+--------------------------------------------------------------------------------
+- Isolation policy unchanged: the `Err` arm still skips one entry and keeps the
+  provider. The new test asserts the run succeeds and the valid sibling still
+  dispatches, so converting the drop into a hard error would fail it.
+- The diagnostic is still `tracing::debug!`; nothing was promoted to an error.
+- No production source changed. bridge.rs md5 equals `main`'s.
+- No dependency added. `tracing-subscriber` is absent from oc-plugin and oc-cli, so
+  the in-memory writer idiom was deliberately NOT used; the real-binary idiom was.
+- Untouched: crates/oc-engine/src/retry.rs, crates/oc-cli/src/cmd/run.rs,
+  crates/oc-tui/ (FU-7), crates/oc-testkit/ and .omo/fixtures/ (FU-5).
+  Verified by the final `git status` / staged-path list below.
+
+RESULT
+--------------------------------------------------------------------------------
+Every FU-2 acceptance clause met:
+  [x] A test asserts the diagnostic names plugin, model id and decode reason.
+  [x] Deleting the emission fails that test by name (mutation 1).
+  [x] Isolation unchanged — malformed sibling still dropped, valid model and provider
+      both survive, asserted inside the same test.
+  [x] cargo test --workspace --offline: 3480 passed / 0 failed (>= 3479).
+      cargo clippy --workspace --all-targets --offline: 0 warnings.
+      cargo fmt --all --check: clean.
+Beyond the requirement: mutations 3 and 4 prove the plugin and decode-reason legs
+are pinned too, not just the model id.
+
+Commit: test(plugin): pin the malformed plugin-model diagnostic
+Files: crates/oc-cli/tests/tool_turn.rs (the guard + the runner's debug-log flag)
+       .omo/plans/opencode-rust-followup.md (FU-2 marked CLOSED)
+       .omo/notepads/opencode-rust/issues.md (appended)
+       .omo/evidence/task-fu2-opencode-rust.txt (this file, staged with -f)
+No production source file is in the commit.

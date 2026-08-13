@@ -558,6 +558,7 @@ async fn run_sdk_model_provider_prompt(
     catalog_id: &str,
     api_id: &str,
     endpoint: &str,
+    print_debug_logs: bool,
 ) -> Output {
     let mut plugin_variables = variables(env, base_url);
     plugin_variables.remove("OPENCODE_PURE");
@@ -572,14 +573,21 @@ async fn run_sdk_model_provider_prompt(
         sdk_model_provider_config(base_url, plugin, catalog_id, api_id, endpoint),
     );
 
+    let model = format!("github-copilot/{catalog_id}");
+    let mut arguments = Vec::new();
+    if print_debug_logs {
+        arguments.extend(["--print-logs", "--log-level", "DEBUG"]);
+    }
+    arguments.extend([
+        "run",
+        "--model",
+        &model,
+        "Exercise the SDK model provider hook.",
+    ]);
+
     let mut command = tokio::process::Command::new(binary());
     command
-        .args([
-            "run",
-            "--model",
-            &format!("github-copilot/{catalog_id}"),
-            "Exercise the SDK model provider hook.",
-        ])
+        .args(&arguments)
         .current_dir(env.working_dir())
         .env_clear()
         .envs(plugin_variables);
@@ -885,6 +893,7 @@ async fn assert_sdk_model_provider_endpoint(
         catalog_id,
         api_id,
         advertised_endpoint,
+        false,
     )
     .await;
     let captured = provider.captured().await;
@@ -931,6 +940,86 @@ async fn production_js_sdk_model_advertised_chat_beats_a_responses_heuristic_id(
         "openai-compatible-chat/deepseek-streams-text",
     )
     .await;
+}
+
+/// The two tests above prove a malformed sibling is isolated, and both stay green when
+/// the diagnostic that reports it is deleted. Since the drop is silent by design, that
+/// event is the only way a plugin author learns their model was rejected, so this pins
+/// the three facts it promises — plugin, rejected model id, decode reason — on one line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_js_malformed_model_diagnostic_names_the_plugin_model_and_decode_reason() {
+    const MESSAGE: &str = "skipped a plugin model this host could not decode";
+
+    let env = ScriptedEnv::new().expect("isolated environment");
+    let plugin = env.project().join("sdk-model-provider.mjs");
+    std::fs::write(&plugin, SDK_MODEL_PROVIDER_PLUGIN).expect("write SDK model provider plugin");
+    let scenario = Scenario::new("sdk-model-malformed-sibling")
+        .on_path("/v1/chat/completions")
+        .from_oracle_cassette("openai-compatible-chat/deepseek-streams-text")
+        .expect("the recorded title response loads")
+        .from_oracle_cassette("openai-compatible-chat/deepseek-streams-text")
+        .expect("the recorded turn response loads");
+    let provider = MockProvider::start(vec![scenario])
+        .await
+        .expect("mock provider binds loopback");
+
+    // The fixture returns one decodable model beside `malformed`, whose only field is
+    // `providerID`. `plugin_model` renames that to `provider_id`, so `ResolvedModel`'s
+    // first required field is what the decode reports missing.
+    let output = run_sdk_model_provider_prompt(
+        &env,
+        provider.base_url(),
+        &plugin,
+        "gpt-5-alias",
+        "gpt-5",
+        "chat",
+        true,
+    )
+    .await;
+    let captured = provider.captured().await;
+    provider.shutdown().await;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "a malformed sibling must not fail the run\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    // Isolation, restated here so a future change cannot satisfy the diagnostic by
+    // discarding the provider: the valid sibling still resolved and still dispatched.
+    assert_eq!(
+        captured.len(),
+        2,
+        "title plus one ordinary turn; stderr:\n{stderr}"
+    );
+    let request = captured.last().expect("ordinary turn request");
+    assert_eq!(request.path, "/v1/chat/completions");
+    let body = request.json().expect("provider request is JSON");
+    assert_eq!(request_model(&body), Some("gpt-5"));
+
+    // One line must carry all three facts. Matching the line first, then its fields,
+    // is what makes this a content assertion: a diagnostic that fires with an empty
+    // plugin, model, or error fails below instead of passing on presence alone.
+    let diagnostic = stderr
+        .lines()
+        .find(|line| line.contains(MESSAGE))
+        .unwrap_or_else(|| {
+            panic!("the skipped model must be reported at DEBUG; stderr:\n{stderr}")
+        });
+    for (fact, expected) in [
+        (
+            "the plugin it came from",
+            format!("file:{}", plugin.display()),
+        ),
+        ("the rejected model's id", "malformed".to_owned()),
+        ("the decode reason", "missing field `id`".to_owned()),
+    ] {
+        assert!(
+            diagnostic.contains(&expected),
+            "the diagnostic must name {fact} ({expected:?})\nline: {diagnostic}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
