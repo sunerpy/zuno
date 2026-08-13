@@ -146,10 +146,20 @@ export default {
           provider.models["auth-sdk-model"] = legacyModel("auth-sdk-model");
           return { sdkBoundary: `${provider.source}:${provider.key}` };
         }
+        if (options?.mutateProviderDeep) {
+          const deep = {};
+          let current = deep;
+          for (let depth = 0; depth < 18; depth += 1) {
+            current.next = {};
+            current = current.next;
+          }
+          provider.options.pluginDeep = deep;
+          return {};
+        }
         if (!options?.returnDeep) return {};
         const result = {};
         let current = result;
-        for (let depth = 0; depth < 10; depth += 1) {
+        for (let depth = 0; depth < 18; depth += 1) {
           current.next = {};
           current = current.next;
         }
@@ -209,7 +219,21 @@ export default {
       output.text += "-resident";
     },
     "tool.execute.before": async (_input, output) => {
-      if (options?.mutateBeforeTruncation) output.args.shallow = "mutated";
+      if (options?.mutateExistingDeep) {
+        let current = output.args.deep;
+        while (current.next) current = current.next;
+        current.sentinel = "mutated";
+      }
+      if (options?.mutateBeforeTruncation) {
+        output.args.shallow = "mutated";
+        const deep = {};
+        let current = deep;
+        for (let depth = 0; depth < 18; depth += 1) {
+          current.next = {};
+          current = current.next;
+        }
+        output.args.deep = deep;
+      }
     },
     "tool.execute.after": async (_input, output) => {
       if (options?.mutateAcrossArguments) output.title = "mutated";
@@ -390,21 +414,11 @@ fn sdk_boundary_provider(source: AvailabilitySource) -> ResolvedProvider {
     provider
 }
 
-fn provider_with_variant_depth(include_cutoff_object: bool) -> ResolvedProvider {
-    let nested = if include_cutoff_object {
-        serde_json::json!({
-            "thinkingBudget": 4096,
-            "deeper": { "thinkingBudget": 2048 }
-        })
-    } else {
-        serde_json::json!({ "thinkingBudget": 4096 })
-    };
-    let depth_probe = serde_json::json!({
-        "thinkingConfig": {
-            "thinkingBudget": 8192,
-            "extra": { "nested": nested }
-        }
-    });
+fn provider_with_variant_depth(nested_objects: usize) -> ResolvedProvider {
+    let mut depth_probe = serde_json::json!({ "thinkingBudget": 8192 });
+    for _ in 0..nested_objects {
+        depth_probe = serde_json::json!({ "next": depth_probe });
+    }
     let mut model = kiro_model();
     model.id = "antigravity-claude-opus-4-5-thinking".to_owned();
     model.provider_id = "resident-fixture".to_owned();
@@ -478,11 +492,10 @@ async fn js_prompt_validator_remains_callable_after_module_initialization() {
 
 #[tokio::test]
 async fn js_auth_loader_round_trips_provider_data_below_its_depth_bound_byte_identically() {
-    // Given: the real google variant path, extended to provider-relative depth 7.
-    // The transport's args array must not consume one of the provider's 8 levels.
+    // Given: provider data reaching one object below the measured production cap.
     let temp = tempfile::tempdir().expect("tempdir");
     let (load, loader) = fixture_auth_loader(temp.path(), None).await;
-    let mut provider = provider_with_variant_depth(false);
+    let mut provider = provider_with_variant_depth(11);
     let before = serde_json::to_vec(&provider).expect("serialize provider before loader");
 
     // When
@@ -502,37 +515,62 @@ async fn js_auth_loader_round_trips_provider_data_below_its_depth_bound_byte_ide
 }
 
 #[tokio::test]
-async fn js_auth_loader_refuses_a_truncated_provider_and_preserves_the_original() {
-    // Given: one object at provider-relative depth 8, where the defensive cap fires.
+async fn js_auth_loader_restores_host_truncated_provider_byte_identically() {
+    // Given: host-supplied provider data reaching the defensive cap.
     let temp = tempfile::tempdir().expect("tempdir");
     let (load, loader) = fixture_auth_loader(temp.path(), None).await;
-    let mut provider = provider_with_variant_depth(true);
+    let mut provider = provider_with_variant_depth(12);
+    let before = serde_json::to_vec(&provider).expect("serialize provider before loader");
+
+    // When
+    let options = loader
+        .load(&MissingCredential, &mut provider)
+        .await
+        .expect("host-owned provider branches are restored after bounded encoding");
+    load.shutdown().await;
+
+    // Then
+    assert!(options.is_empty());
+    assert_eq!(
+        serde_json::to_vec(&provider).expect("serialize provider after restoration"),
+        before,
+        "a no-op loader must restore every host-owned byte beyond the transport cap"
+    );
+}
+
+#[tokio::test]
+async fn js_auth_loader_refuses_plugin_truncated_provider_and_preserves_the_original() {
+    // Given: the plugin itself adds provider data beyond the defensive cap.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (load, loader) = fixture_auth_loader(
+        temp.path(),
+        Some(serde_json::json!({ "mutateProviderDeep": true })),
+    )
+    .await;
+    let mut provider = kiro_provider();
     let before = serde_json::to_vec(&provider).expect("serialize provider before loader");
 
     // When
     let error = loader
         .load(&MissingCredential, &mut provider)
         .await
-        .expect_err("a lossy provider payload must be refused");
+        .expect_err("plugin-origin provider loss must be refused");
     load.shutdown().await;
 
     // Then
     let message = error.to_string();
     assert!(
         message.contains("resident-fixture.mjs"),
-        "the refusal must name the plugin: {message}"
+        "plugin-origin loss must name the responsible plugin: {message}"
     );
     assert!(
-        message.contains(
-            "/models/antigravity-claude-opus-4-5-thinking/options/depthProbe/\
-             thinkingConfig/extra/nested/deeper"
-        ),
-        "the refusal must name the truncated provider path: {message}"
+        message.contains(&format!("/options/pluginDeep{}", "/next".repeat(14))),
+        "the refusal must name the plugin-origin provider path: {message}"
     );
     assert_eq!(
         serde_json::to_vec(&provider).expect("serialize provider after refusal"),
         before,
-        "refusing a lossy payload must leave the caller's real provider untouched"
+        "refusing plugin-origin loss must leave the real provider untouched"
     );
 }
 
@@ -551,9 +589,9 @@ async fn js_auth_loader_still_bounds_an_arbitrary_plugin_return_graph() {
         .expect("the bounded return value remains a valid JSON object");
     load.shutdown().await;
 
-    // Then: the eighth nested object is a marker, so the walk remains bounded.
+    // Then: the sixteenth nested object is a marker, so the walk remains bounded.
     let mut value = options.get("next").expect("first nested value");
-    for _ in 1..8 {
+    for _ in 1..16 {
         value = value.get("next").expect("nested value before the cap");
     }
     assert_eq!(
@@ -562,7 +600,7 @@ async fn js_auth_loader_still_bounds_an_arbitrary_plugin_return_graph() {
     );
     assert_eq!(
         value.get("$path").and_then(serde_json::Value::as_str),
-        Some("/next/next/next/next/next/next/next/next")
+        Some("/next/next/next/next/next/next/next/next/next/next/next/next/next/next/next/next")
     );
 }
 
@@ -760,8 +798,8 @@ async fn js_sdk_boundary_ordinary_hooks_read_declared_shapes_and_supply_small_mo
 
 #[tokio::test]
 async fn js_ordinary_hook_refuses_truncation_before_committing_any_output_field() {
-    // Given: a mutable ordinary-hook output with both a shallow mutation and an
-    // object graph that reaches the encoder's eighth level.
+    // Given: the plugin itself adds both a shallow mutation and an object graph
+    // that reaches the encoder's cap.
     let temp = tempfile::tempdir().expect("tempdir");
     let owner = Arc::new(FakeTerminalOwner::new());
     let terminal: Arc<dyn TerminalLease> = Arc::new(TerminalBroker::new(owner));
@@ -777,14 +815,9 @@ async fn js_ordinary_hook_refuses_truncation_before_committing_any_output_field(
         .plugins()
         .first()
         .unwrap_or_else(|| panic!("fixture plugin loaded: {:?}", load.diagnostics()));
-    let mut deep = serde_json::json!({ "sentinel": "preserved" });
-    for _ in 0..7 {
-        deep = serde_json::json!({ "next": deep });
-    }
     let mut output = oc_plugin::ToolExecuteBeforeOutput {
         args: serde_json::json!({
             "shallow": "original",
-            "deep": deep,
         }),
     };
     let before = output.clone();
@@ -814,7 +847,7 @@ async fn js_ordinary_hook_refuses_truncation_before_committing_any_output_field(
         "the refusal must name the mutable hook argument: {message}"
     );
     assert!(
-        message.contains("/args/deep/next/next/next/next/next/next"),
+        message.contains(&format!("/args/deep{}", "/next".repeat(14))),
         "the refusal must name the argument-relative JSON Pointer: {message}"
     );
     assert_eq!(
@@ -824,13 +857,68 @@ async fn js_ordinary_hook_refuses_truncation_before_committing_any_output_field(
 }
 
 #[tokio::test]
-async fn js_ordinary_hook_preserves_output_when_a_different_argument_is_truncated() {
-    // Given: argument 0 reaches the depth cap while the callback mutates argument 1.
+async fn js_noop_hook_restores_host_truncated_input_without_blaming_the_plugin() {
+    // Given: host-owned argument 0 reaches the depth cap and the callback is a no-op.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let owner = Arc::new(FakeTerminalOwner::new());
+    let terminal: Arc<dyn TerminalLease> = Arc::new(TerminalBroker::new(owner));
+    let spec = file_spec(&fixture(temp.path()));
+    let load = load_js_plugins_ordered(
+        vec![spec],
+        host(temp.path(), terminal, JsHostPolicy::default()),
+    )
+    .await;
+    let plugin = load
+        .plugins()
+        .first()
+        .unwrap_or_else(|| panic!("fixture plugin loaded: {:?}", load.diagnostics()));
+    let mut deep = serde_json::json!({ "sentinel": "preserved" });
+    for _ in 0..16 {
+        deep = serde_json::json!({ "next": deep });
+    }
+    let args = serde_json::json!({ "deep": deep });
+    let mut output = oc_tool::ToolOutput::text("original", "output");
+    let before = output.clone();
+
+    // When
+    plugin
+        .call(&mut HookInvocation::ToolExecuteAfter {
+            input: &oc_plugin::ToolExecuteAfterInput {
+                tool: "fixture",
+                session_id: "session",
+                call_id: "call",
+                args: &args,
+            },
+            output: &mut output,
+        })
+        .await
+        .expect("host-side encoder loss must not fail or disable a no-op plugin");
+
+    // Then
+    assert_eq!(
+        output, before,
+        "the no-op hook must preserve the mutable output byte-for-byte"
+    );
+    assert!(
+        !plugin.is_disabled(),
+        "host loss must not disable the plugin"
+    );
+    assert!(
+        plugin.diagnostics().is_empty(),
+        "host loss must not publish a plugin-fault diagnostic: {:?}",
+        plugin.diagnostics()
+    );
+    load.shutdown().await;
+}
+
+#[tokio::test]
+async fn js_plugin_mutation_below_a_host_cutoff_is_still_refused() {
+    // Given: the plugin mutates inside an existing host object below the cutoff.
     let temp = tempfile::tempdir().expect("tempdir");
     let owner = Arc::new(FakeTerminalOwner::new());
     let terminal: Arc<dyn TerminalLease> = Arc::new(TerminalBroker::new(owner));
     let spec = file_spec(&fixture(temp.path())).options(serde_json::json!({
-        "mutateAcrossArguments": true,
+        "mutateExistingDeep": true,
     }));
     let load = load_js_plugins_ordered(
         vec![spec],
@@ -842,41 +930,38 @@ async fn js_ordinary_hook_preserves_output_when_a_different_argument_is_truncate
         .first()
         .unwrap_or_else(|| panic!("fixture plugin loaded: {:?}", load.diagnostics()));
     let mut deep = serde_json::json!({ "sentinel": "preserved" });
-    for _ in 0..7 {
+    for _ in 0..16 {
         deep = serde_json::json!({ "next": deep });
     }
-    let args = serde_json::json!({ "deep": deep });
-    let mut output = oc_tool::ToolOutput::text("original", "output");
+    let mut output = oc_plugin::ToolExecuteBeforeOutput {
+        args: serde_json::json!({ "deep": deep }),
+    };
     let before = output.clone();
 
     // When
     let error = plugin
-        .call(&mut HookInvocation::ToolExecuteAfter {
-            input: &oc_plugin::ToolExecuteAfterInput {
+        .call(&mut HookInvocation::ToolExecuteBefore {
+            input: &oc_plugin::ToolExecuteBeforeInput {
                 tool: "fixture",
                 session_id: "session",
                 call_id: "call",
-                args: &args,
             },
             output: &mut output,
         })
         .await
-        .expect_err("a truncated input argument must reject the whole write-back");
+        .expect_err("a plugin mutation below a host cutoff must not be restored away");
     load.shutdown().await;
 
     // Then
     let message = error.to_string();
     assert!(
-        message.contains("`tool.execute.after` hook argument 0"),
-        "the refusal must identify the independently truncated argument: {message}"
-    );
-    assert!(
-        message.contains("/args/deep/next/next/next/next/next/next"),
-        "the refusal must name the argument-relative JSON Pointer: {message}"
+        message.contains("resident-fixture.mjs")
+            && message.contains(&format!("/args/deep{}", "/next".repeat(14))),
+        "the refusal must name the plugin and affected cutoff: {message}"
     );
     assert_eq!(
         output, before,
-        "a mutation to argument 1 must not commit when argument 0 is truncated"
+        "a refused deep plugin mutation must not commit any output"
     );
 }
 

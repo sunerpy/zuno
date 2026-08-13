@@ -22,6 +22,22 @@ export default {
   server: async (_input, options) => ({
     "tool.definition": async (input, _output) => {
       appendFileSync(options.callLog, `${input.toolID}\n`);
+      if (input.toolID === "question") {
+        throw new Error("intentional HTTP tool.definition failure");
+      }
+    },
+  }),
+};
+"#;
+
+const NOOP_TOOL_DEFINITION_PLUGIN: &str = r#"
+import { appendFileSync } from "node:fs";
+
+export default {
+  id: "http-noop-tool-definition",
+  server: async (_input, options) => ({
+    "tool.definition": async (input, _output) => {
+      appendFileSync(options.callLog, `${input.toolID}\n`);
     },
   }),
 };
@@ -75,7 +91,11 @@ fn broker_provider_config(base_url: &str) -> String {
     config.to_string()
 }
 
-fn failing_plugin_provider_config(base_url: &str, plugin: &Path, call_log: &Path) -> String {
+fn tool_definition_plugin_provider_config(
+    base_url: &str,
+    plugin: &Path,
+    call_log: &Path,
+) -> String {
     let mut config: Value =
         serde_json::from_str(&provider_config(base_url)).expect("provider config is JSON");
     config["plugin"] = json!([[
@@ -359,7 +379,13 @@ impl SseClient {
     }
 
     async fn next_json(&mut self) -> Value {
-        tokio::time::timeout(SSE_TIMEOUT, async {
+        self.next_json_within(SSE_TIMEOUT)
+            .await
+            .expect("SSE stream must produce a data frame inside its budget")
+    }
+
+    async fn next_json_within(&mut self, budget: Duration) -> Option<Value> {
+        tokio::time::timeout(budget, async {
             loop {
                 self.decode_complete_frames();
                 if let Some(frame) = self.frames.pop_front() {
@@ -375,7 +401,15 @@ impl SseClient {
             }
         })
         .await
-        .expect("SSE stream must produce a data frame inside its budget")
+        .ok()
+    }
+
+    async fn drain_until_idle(&mut self) -> Vec<Value> {
+        let mut frames = Vec::new();
+        while let Some(frame) = self.next_json_within(Duration::from_millis(250)).await {
+            frames.push(frame);
+        }
+        frames
     }
 
     async fn read_until_text(&mut self, expected: &str) -> Value {
@@ -423,6 +457,22 @@ fn value_contains_text(value: &Value, expected: &str) -> bool {
             .any(|value| value_contains_text(value, expected)),
         Value::Null | Value::Bool(_) | Value::Number(_) => false,
     }
+}
+
+fn advertised_tools(body: &Value) -> Vec<String> {
+    body.get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| {
+                    tool.pointer("/function/name")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn compatible_sse(events: impl IntoIterator<Item = Value>) -> Vec<u8> {
@@ -840,7 +890,7 @@ async fn failing_tool_definition_hook_is_disabled_and_http_turn_completes_with_a
     let provider = MockProvider::start(vec![scenario])
         .await
         .expect("mock provider binds loopback");
-    let config = failing_plugin_provider_config(provider.base_url(), &plugin, &call_log);
+    let config = tool_definition_plugin_provider_config(provider.base_url(), &plugin, &call_log);
     let mut server = RunningServer::start_with_plugin_config(&env, &database, config).await;
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -866,7 +916,7 @@ async fn failing_tool_definition_hook_is_disabled_and_http_turn_completes_with_a
             completed |= value_contains_text(&frame, "turn.completed");
             if value_contains_text(&frame, "http-failing-tool-definition")
                 && value_contains_text(&frame, "tool.definition")
-                && value_contains_text(&frame, "truncated")
+                && value_contains_text(&frame, "intentional HTTP tool.definition failure")
             {
                 break (frame, completed);
             }
@@ -883,12 +933,126 @@ async fn failing_tool_definition_hook_is_disabled_and_http_turn_completes_with_a
     assert_eq!(
         calls.lines().filter(|tool| *tool == "question").count(),
         1,
-        "the HTTP plugin must fail once on the truncation-producing tool: {calls:?}"
+        "the HTTP plugin must fail once on the deliberately failing tool: {calls:?}"
     );
     assert_eq!(
         calls.lines().last(),
         Some("question"),
         "the disabled HTTP plugin must receive no later definitions: {calls:?}"
+    );
+
+    server.stop().await;
+    provider.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn noop_tool_definition_hook_preserves_real_schemas_and_stays_enabled_over_http() {
+    let baseline_env = ScriptedEnv::new()
+        .expect("isolated baseline environment")
+        .with_db(DbChoice::Default);
+    let baseline_database = baseline_env
+        .xdg_data()
+        .join("http-tool-definition-baseline.db");
+    seed_session(&baseline_database, baseline_env.project());
+    let baseline_scenario = Scenario::new("http-tool-definition-baseline")
+        .from_oracle_cassette(CASSETTE)
+        .expect("recorded baseline completion loads");
+    let baseline_provider = MockProvider::start(vec![baseline_scenario])
+        .await
+        .expect("baseline mock provider binds loopback");
+    let mut baseline_server = RunningServer::start(
+        &baseline_env,
+        baseline_provider.base_url(),
+        &baseline_database,
+    )
+    .await;
+    let baseline_client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build baseline loopback client");
+
+    submit_http_prompt(
+        &baseline_client,
+        &baseline_server,
+        "msg_task172_http_baseline",
+    )
+    .await;
+    wait_for_http_turn(&baseline_client, &baseline_server).await;
+    assert_message_contains(&baseline_client, &baseline_server, "Hello").await;
+    let baseline_captured = baseline_provider.captured().await;
+    baseline_server.stop().await;
+    baseline_provider.shutdown().await;
+
+    let env = ScriptedEnv::new()
+        .expect("isolated plugin environment")
+        .with_db(DbChoice::Default);
+    let database = env.xdg_data().join("http-noop-tool-definition.db");
+    seed_session(&database, env.project());
+    let plugin = env.project().join("http-noop-tool-definition.mjs");
+    let call_log = env.project().join("http-noop-tool-definition.calls");
+    std::fs::write(&plugin, NOOP_TOOL_DEFINITION_PLUGIN)
+        .expect("write no-op HTTP tool.definition plugin");
+    let scenario = Scenario::new("http-noop-tool-definition-round-trip")
+        .from_oracle_cassette(CASSETTE)
+        .expect("recorded plugin completion loads");
+    let provider = MockProvider::start(vec![scenario])
+        .await
+        .expect("plugin mock provider binds loopback");
+    let config = tool_definition_plugin_provider_config(provider.base_url(), &plugin, &call_log);
+    let mut server = RunningServer::start_with_plugin_config(&env, &database, config).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build plugin loopback client");
+    let mut session_events = SseClient::connect(
+        &client,
+        format!("{}/api/session/{SESSION_ID}/event?after=0", server.base_url),
+    )
+    .await;
+
+    submit_http_prompt(&client, &server, "msg_task172_http_noop").await;
+    wait_for_http_turn(&client, &server).await;
+    assert_message_contains(&client, &server, "Hello").await;
+    let frames = session_events.drain_until_idle().await;
+    let captured = provider.captured().await;
+
+    assert_eq!(
+        baseline_captured.len(),
+        1,
+        "baseline makes one turn request"
+    );
+    assert_eq!(captured.len(), 1, "plugin makes one turn request");
+    let baseline_turn = baseline_captured[0]
+        .json()
+        .expect("baseline provider request is JSON");
+    let plugin_turn = captured[0].json().expect("plugin provider request is JSON");
+    assert_eq!(
+        serde_json::to_vec(&plugin_turn["tools"]).expect("serialize plugin tools"),
+        serde_json::to_vec(&baseline_turn["tools"]).expect("serialize baseline tools"),
+        "every real built-in schema must round-trip byte-identically over HTTP"
+    );
+    assert!(
+        frames
+            .iter()
+            .any(|frame| value_contains_text(frame, "turn.completed")),
+        "HTTP session stream omitted turn completion: {frames:#?}"
+    );
+    assert!(
+        frames.iter().all(|frame| frame["type"] != "session.error"),
+        "the no-op hook must not fail the HTTP turn: {frames:#?}"
+    );
+    assert!(
+        frames.iter().all(|frame| {
+            !value_contains_text(frame, "disabled plugin")
+                && !value_contains_text(frame, "http-noop-tool-definition")
+        }),
+        "host data must not produce a plugin diagnostic over HTTP: {frames:#?}"
+    );
+    let calls = std::fs::read_to_string(&call_log).expect("read no-op HTTP hook calls");
+    assert_eq!(
+        calls.lines().collect::<Vec<_>>(),
+        advertised_tools(&plugin_turn),
+        "the no-op HTTP plugin must remain enabled through every definition: {calls:?}"
     );
 
     server.stop().await;

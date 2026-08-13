@@ -7585,3 +7585,26 @@ must move together: changing only the handler can still leave diagnostics claimi
 changing only `V1_SURFACE.backing` makes the declared-backing regression fail. All three guarded
 effect mutations failed again after reconstruction; the detailed output is appended to the task
 evidence file.
+
+## [2026-08-13] Task 172 — bounded JavaScript values need authoritative provenance
+
+The old bridge treated every `$truncated` marker returned by the host's own encoder as
+proof that the plugin truncated the value. A no-op `tool.definition` hook therefore
+disabled itself on the real `todowrite` schema at definition-root depth 8. Raising the
+limit alone only moves this failure to the next sufficiently deep host value.
+
+The durable rule is that a lossy bridge must report provenance outside the value being
+bridged. The shim now returns unforgeable sideband classifications: an unchanged host
+cutoff can be restored byte-identically from the original Rust argument, while a
+plugin-created, replaced, or internally mutated cutoff remains plugin-origin and is
+refused atomically. Identity alone was insufficient because a plugin can mutate below
+the same boundary object, so decoded host containers are mutation-tracked with proxies.
+The finite cap remains, now at 16 against a measured production maximum of 8.
+
+Workspace verification has one environmental limitation unrelated to this task:
+`cargo test --workspace --offline` reaches `oc-cli/tests/cli_parity.rs` and then five
+tests fail because the repository pins oracle 1.18.15 while the installed oracle is
+1.18.18. Targeted plugin and production-CLI regressions pass, as do rustfmt, all-target
+Clippy, and the workspace build. The `lsp_diagnostics` MCP also cannot address sibling
+worktrees; worktree-local rust-analyzer reported no errors (only cfg-disabled
+`inactive-code` weak warnings).

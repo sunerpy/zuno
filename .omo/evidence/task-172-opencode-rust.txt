@@ -1,0 +1,347 @@
+Task 172 evidence — distinguish host-side encoder loss from plugin truncation
+Date: 2026-08-13
+Worktree: /config/workspace/ProdDir/AI/oc-wt/t172
+Branch/base: task-172 at 11c1fc86
+
+0. Preflight and inherited design constraints
+
+- `df -h /`: 290G total, 218G used, 72G available, 76%; safely below the
+  task's 90% mutation-test stop threshold.
+- `git status --short --branch`: clean `task-172`; HEAD `11c1fc86`.
+- CodeGraph was attempted first with projectPath set to this worktree and query
+  `MAX_DEPTH encode truncated_path invocation_output tool_definition`. It reported
+  that the sibling worktree is not indexed, so exact direct reads were used.
+- The prompt said a 2,424-byte evidence file from an earlier attempt was already
+  present. An exact read and a workspace-wide glob both found no such file. This
+  file was therefore created rather than overwriting any surviving evidence; the
+  required reproduction is repeated below from this HEAD.
+- Todo 147's invariant remains binding: arbitrary plugin object graphs stay bounded;
+  `MAX_DEPTH` must not merely be raised, and any lossy provider write-back is refused.
+- Todo 151's invariant remains binding: `invocation_output` preflights all returned
+  arguments before applying any mutation, so genuine truncation is atomic and refused.
+- Current failure mechanism: `shim.mjs` independently encodes each returned argument
+  with `MAX_DEPTH = 8`; `bridge::truncated_path` recognizes any `$truncated: true`;
+  `plugin::invocation_output` assumes every recognized marker was plugin-caused and
+  constructs `TruncatedHookArgument`, even when the marker was introduced while the
+  host encoded its own unchanged argument on the return trip.
+
+1. Pre-change real-binary reproduction and one-variable control
+
+Defect command (the integration test launches the real `opencode-rust run` binary):
+
+  cargo test -p oc-cli --test tool_turn \
+    failing_tool_definition_hook_is_disabled_and_cli_turn_completes_with_a_diagnostic \
+    --offline -- --exact --nocapture
+
+Result: PASS, 1 passed / 0 failed. This test's production assertions establish that
+the no-op `tool.definition` callback reaches `todowrite` once, the plugin is then
+disabled, the ordinary CLI turn still completes, and stderr names
+`production-noop-tool-definition`, `tool.definition`, and `truncated`.
+
+Control: after backing up `tool_turn.rs`, changed only the same four-line fixture's
+hook key from `tool.definition` to `chat.message` and reran the exact command. The
+test reached only its now-inapplicable expectation for a disable diagnostic and failed:
+
+  the default CLI diagnostic must identify the disabled plugin, hook, and cause:
+
+The diagnostic text after the colon was empty. All earlier assertions passed first:
+the real binary exited successfully, the provider received both expected requests,
+and neither contained `$truncated`. Thus the same callback under `chat.message` runs
+cleanly; registration as `tool.definition` is the single changed variable that causes
+disablement. The backed-up test file was restored and `git diff -- tool_turn.rs` was
+empty. (The first restore chain used zsh's read-only variable name `status`; it aborted
+after the expected failing test, so restoration was immediately performed in a
+separate `cp backup original && git diff` command and verified empty.)
+
+2. Measured production schema depth
+
+The schema sources under `crates/oc-tools/src` were read before selecting a bound:
+`registry.rs` supplies the real built-in order and visibility projection; `todo.rs`,
+`memory.rs`, `question.rs`, `batch.rs`, and `apply_patch.rs` define the deepest nested
+`JsonSchema` inputs. In particular, `TodoWriteParams -> Vec<TodoItem> -> enum` and
+`MemoryParams -> Vec<MemoryOperation> -> enum` produce the nested `oneOf` objects.
+
+For an exact production measurement, the no-op hook dumped the `ToolDefinition` value
+it received from the real binary before read-back. A temporary measurement-only copy
+of the embedded shim used depth 64 so every currently visible definition could finish;
+both `shim.mjs` and `tool_turn.rs` were backed up first and restored byte-clean after
+the probe. Container depth is zero-based and counts each JSON object/array edge, exactly
+as `encode` does. Results for the real turn's ten visible tools:
+
+  invalid:   definition 3, schema 2
+  bash:      definition 4, schema 3
+  read:      definition 4, schema 3
+  glob:      definition 4, schema 3
+  grep:      definition 4, schema 3
+  edit:      definition 3, schema 2
+  write:     definition 3, schema 2
+  webfetch:  definition 5, schema 4
+  todowrite: definition 8, schema 7
+  memory:    definition 8, schema 7
+
+The measured maximum is definition-root depth 8. The first deepest path is exactly:
+
+  /parameters/properties/todos/items/properties/priority/oneOf/0
+
+`memory` independently reaches the same depth at:
+
+  /parameters/properties/operations/items/properties/action/oneOf/0
+
+Thus `MAX_DEPTH = 8` replaces a real object because the check fires at `depth >= 8`.
+The selected production cap will be 16: twice the measured requirement, leaving eight
+full object/array levels of margin while retaining a finite walk. Raising the cap is
+not the structural fix: markers will also carry whether the capped object is the same
+host-supplied boundary object or a boundary introduced/replaced by the plugin, and the
+Rust guard will refuse both without accusing/disabling the plugin for host-origin loss.
+
+3. Red regression tests before production changes
+
+The production test was rewritten to run two real CLI turns against identical recorded
+providers: a baseline without a plugin and one with the four-line no-op
+`tool.definition` hook. It compares the serialized provider-visible `tools` arrays,
+requires every hook call to run, and forbids a disable diagnostic.
+
+  cargo test -p oc-cli --test tool_turn \
+    noop_tool_definition_hook_preserves_real_schemas_and_stays_enabled \
+    --offline -- --exact --nocapture
+
+Pre-fix result: FAILED by name at the no-disable assertion. Stderr was the live defect:
+
+  disabled plugin `production-noop-tool-definition` after hook `tool.definition`
+  failed: plugin `file:/tmp/.../noop-tool-definition-plugin.mjs` truncated
+  `tool.definition` hook argument 1 at
+  `/parameters/properties/todos/items/properties/priority/oneOf/0`
+
+The source-attribution regression uses a synthetic host-owned graph beyond the new cap
+and an actual no-op callback:
+
+  cargo test -p oc-plugin --test js \
+    js_noop_hook_restores_host_truncated_input_without_blaming_the_plugin \
+    --offline -- --exact --nocapture
+
+Pre-fix result: FAILED by name because the host marker was attributed to and disabled
+`resident-fixture.mjs` at argument 0. The genuine plugin-loss regression has the plugin
+itself attach a new deep graph plus a shallow mutation:
+
+  cargo test -p oc-plugin --test js \
+    js_ordinary_hook_refuses_truncation_before_committing_any_output_field \
+    --offline -- --exact --nocapture
+
+Pre-fix result: FAILED at its new depth-16 pointer assertion (the old cap fired at
+depth 8), proving it traversed the production shim and did not pass vacuously.
+
+The three auth-loader invariants were moved to the same depth-16 contract and run as a
+group. Pre-fix result: 0 passed / 3 failed. Below-bound host data was refused at the old
+depth; cutoff host data still accused the plugin; and the arbitrary plugin return graph
+was truncated too early for the depth-16 assertion. These failures establish the cap,
+source attribution, and bounded plugin-return behavior independently before the fix.
+
+4. Implementation and fixed-state targeted results
+
+The two defects are addressed separately rather than hiding one with the other:
+
+- Production depth: `MAX_DEPTH` is 16, double the measured maximum of 8. The cap is
+  still finite and applies to callback values and every returned argument, so arbitrary
+  plugin graphs remain bounded.
+- Attribution and future cliffs: before invoking the callback, shim records object
+  identities that are already at the host argument's cutoff boundary. On read-back it
+  classifies a cutoff as `host` only when the exact same object remains at the exact
+  JSON Pointer; replaced/new objects are `plugin`. The authoritative classifications
+  are returned in response sideband outside the plugin callback's values, so a plugin
+  cannot forge `$source: "host"` to bypass refusal.
+- `bridge.rs` restores only sideband-proven host cutoff markers from the original Rust
+  argument before deserialization/write-back. That preserves bytes instead of merely
+  suppressing an accusation. A sideband-proven plugin cutoff is still refused; a
+  marker literal without matching sideband is conservatively plugin-origin and refused.
+- `plugin::invocation_output` applies the same algorithm to every ordinary hook argument
+  before selecting the mutable output, preserving todo 151's all-or-nothing choke point.
+  The auth loader applies it before `plugin_provider` and provider assignment, preserving
+  todo 147's no-loss write-back rule.
+
+Syntax/format before tests:
+
+  node --check crates/oc-plugin/src/js/shim.mjs                    PASS
+  cargo fmt -p oc-plugin -p oc-cli                                PASS
+
+Targeted fixed-state tests:
+
+  cargo test -p oc-plugin --test js js_auth_loader_ --offline
+    PASS: 4 passed, 0 failed
+  cargo test -p oc-plugin --test js \
+    js_noop_hook_restores_host_truncated_input_without_blaming_the_plugin \
+    --offline -- --exact
+    PASS: 1 passed, 0 failed
+  cargo test -p oc-plugin --test js \
+    js_ordinary_hook_refuses_truncation_before_committing_any_output_field \
+    --offline -- --exact
+    PASS: 1 passed, 0 failed
+  cargo test -p oc-cli --test tool_turn \
+    noop_tool_definition_hook_preserves_real_schemas_and_stays_enabled \
+    --offline -- --exact
+    PASS: 1 passed, 0 failed
+
+The production test's baseline and plugin turns serialize identical complete real
+`tools` arrays, every advertised tool reaches the hook, and stderr contains no plugin
+disable diagnostic.
+
+5. Mutation tests
+
+Pre-mutation disk check: `/` was 84% used, below the mandatory 90% stop point.
+
+Mutation 1 — misattribution/source proof:
+
+- Backed up `shim.mjs` with `cp ... &&` before editing.
+- Replaced only the identity comparison with unconditional `source = "plugin"`.
+- Ran `js_noop_hook_restores_host_truncated_input_without_blaming_the_plugin`.
+- Observable result: FAILED by name. The no-op plugin was accused at the depth-16
+  pointer and the call returned `JsPluginHookFailure`.
+- Restored from backup and verified byte identity with `cmp -s`.
+
+7. Final workspace gates
+
+  cargo fmt --all --check
+    PASS: exit 0
+  cargo clippy --workspace --all-targets --offline
+    PASS: exit 0, no warnings
+  cargo build --workspace --offline
+    PASS: exit 0
+  cargo test --workspace --offline
+    ENVIRONMENT BLOCKED after all preceding targets passed: `oc-cli`'s
+    `cli_parity` target reported exactly five `OraclePinMismatch` failures because
+    the repository pins 1.18.15 while `OC_TESTKIT_ORACLE` resolves to the installed
+    `/config/.local/share/mise/installs/opencode/1.18.18/opencode`. The five failing
+    tests are `every_exemption_states_a_reason_and_keeps_a_witness`,
+    `every_implemented_command_produces_the_same_normalized_output_as_the_oracle`,
+    `the_declared_presentation_divergences_are_live`,
+    `the_non_vcs_plan_glob_difference_is_live`, and
+    `the_session_list_output_shape_difference_is_live`. None executes or names the
+    Task 172 plugin paths; this is the known external oracle-version precondition.
+
+The integrated `lsp_diagnostics` MCP rejected the sibling worktree path before
+starting a server (`LSP file path must be inside request cwd`). The equivalent
+worktree-local `rust-analyzer diagnostics .` completed without error diagnostics;
+its only output was cfg-disabled `inactive-code` weak warnings. `node --check` passed
+for the changed shim, while all changed Rust targets additionally passed all-target
+Clippy and the workspace build above.
+
+Mutation 3 — genuine plugin truncation refusal:
+
+- Backed up `plugin.rs`, bypassed `invocation_output`'s entire truncation preflight,
+  and ran `js_ordinary_hook_refuses_truncation_before_committing_any_output_field`.
+- Observable result: FAILED by name because the call returned `Ok(())`; the plugin's
+  deep graph was no longer refused.
+- Restored from backup and verified byte identity with `cmp -s`.
+
+Every counted mutant was observable before being accepted as evidence; all production
+sources were restored from successful `cp` backups.
+
+6. Final targeted acceptance after all mutations and provenance hardening
+
+  cargo test -p oc-plugin --test js --offline
+    PASS: 20 passed, 0 failed
+  cargo test -p oc-cli --test tool_turn \
+    noop_tool_definition_hook_preserves_real_schemas_and_stays_enabled \
+    --offline -- --exact --nocapture
+    PASS: 1 passed, 0 failed
+
+This final production run launches the real binary twice, proves the plugin-backed
+turn succeeds, compares every provider-visible built-in tool schema byte-for-byte with
+the no-plugin baseline, observes the callback for every advertised tool, and sees no
+disable diagnostic. The full JS suite simultaneously proves plugin-created and
+plugin-mutated deep graphs are still refused while host-owned deep data is restored.
+
+
+
+Mutation 2 — round-trip fidelity:
+
+- First candidate changed host restoration to `null` and ran the real-schema test.
+  It stayed green because the measured maximum is 8 and the production cap is 16;
+  current built-ins correctly never enter the restoration branch. This mutant was
+  classified equivalent for that fixture and was not counted.
+- That analysis exposed a fourth seam face: object identity alone cannot distinguish a
+  no-op from a plugin mutating *inside* the same cutoff object. A new red test proved
+  the identity-only implementation silently restored such a mutation away. The shim
+  now wraps decoded host arrays/objects in mutation-tracking proxies; any write/delete/
+  define at or below a cutoff makes that cutoff plugin-origin. The new test passes.
+- Backed up `bridge.rs`, replaced the restored host value with `null`, and ran
+  `js_auth_loader_restores_host_truncated_provider_byte_identically`.
+- Observable result: FAILED by name at the byte-vector equality assertion; the nested
+  host value ended in `null` instead of the original `thinkingBudget` object.
+- Restored from backup and verified byte identity with `cmp -s`.
+
+8. HTTP regression missed by the original change
+
+Post-merge review found todo 168's HTTP twin in
+`crates/oc-cli/tests/session_mutation.rs`. Its fixture was the same innocent no-op
+`tool.definition` callback as the original CLI reproducer, but the test still expected
+host-side depth truncation to disable it and emit a diagnostic. After Task 172 fixed the
+misattribution, no diagnostic existed and its SSE loop timed out. This was a stale test
+premise, not a production regression.
+
+The HTTP contract is now split symmetrically:
+
+- `failing_tool_definition_hook_is_disabled_and_http_turn_completes_with_a_diagnostic`
+  uses a genuinely failing hook. It logs each definition and deliberately throws
+  `intentional HTTP tool.definition failure` on `question`; the test requires that the
+  plugin is disabled exactly there, the diagnostic names the plugin and hook, no later
+  definitions reach it, and the HTTP turn still completes with `Hello`.
+- `noop_tool_definition_hook_preserves_real_schemas_and_stays_enabled_over_http`
+  runs a no-plugin baseline and a no-op-plugin HTTP turn. It compares their complete
+  provider-visible `tools` arrays byte-for-byte, requires every advertised definition
+  to reach the callback, drains the completed turn's already-published session events,
+  and forbids both a `session.error` and any plugin-disable diagnostic.
+
+Red/green proof:
+
+  cargo test -p oc-cli --test session_mutation tool_definition_hook --offline -- --nocapture
+    BEFORE genuine throw: 1 passed / 1 failed; the positive no-op test passed, while
+    the negative test timed out waiting for a diagnostic the innocent callback could
+    no longer produce.
+    AFTER genuine throw: PASS, 2 passed / 0 failed.
+
+Repository audit: CodeGraph was attempted first but this sibling worktree has no index.
+A fallback grep over all Rust crates searched `tool.definition`, disabled-plugin text,
+truncation errors, no-op/empty callbacks, and the stale failing-test name. It found 35
+raw references in 13 files. The only other test whose expected disablement depended on
+an innocent `tool.definition` callback was this HTTP test. `tool_turn.rs` already has
+Task 172's positive CLI regression; `oc-plugin/tests/js.rs` exercises actual
+plugin-created or plugin-mutated truncation; the remaining hits are hook manifests,
+payloads, diagnostics implementation, or ordinary definition consumers. No second
+stale misattribution expectation was found.
+
+9. Follow-up gates
+
+  cargo fmt --all --check
+    PASS: exit 0
+  cargo clippy --workspace --all-targets --offline
+    PASS: exit 0, 0 warnings
+  cargo test -p oc-cli --test session_mutation tool_definition_hook \
+    --offline -- --nocapture
+    PASS: 2 passed, 0 failed
+
+The exact unqualified `cargo test --workspace --offline` still resolves the machine's
+default 1.18.18 oracle and therefore stops at the same five `OraclePinMismatch` cases:
+this branch intentionally predates todo 178 and was not rebased or merged as directed.
+The matching 1.18.15 binary is installed locally, so the workspace gate was rerun as:
+
+  OC_TESTKIT_ORACLE=/config/.local/share/mise/installs/opencode/1.18.15/opencode \
+    cargo test --workspace --offline
+
+Both the first run and the single permitted retry advanced beyond all parity tests and
+passed the complete updated `session_mutation` target (10/10), including both HTTP
+`tool.definition` cases. Both were then interrupted in `oc-config --lib` by the same
+host-transient harness failure:
+
+  error: io error when listing tests: Os { code: 11, kind: WouldBlock,
+    message: "Resource temporarily unavailable" }
+
+The retry was performed exactly once as instructed; no product test reported a normal
+assertion failure before the harness channel collapsed. The amend proceeds with the
+targeted regressions, rustfmt, and all-target Clippy green, while recording that the
+full total was interrupted twice by persistent EAGAIN.
+
+Integrated `lsp_diagnostics` again rejected the sibling worktree path before launching
+its server. Worktree-local `rust-analyzer diagnostics . --severity error` completed
+with exit 0 and no source diagnostic; it did emit analyzer-internal `Overloaded deref`
+error logs while scanning unrelated files. The changed test compiles cleanly under the
+targeted run, all-target Clippy, and the workspace runs above.

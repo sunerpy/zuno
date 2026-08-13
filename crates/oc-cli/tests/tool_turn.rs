@@ -355,6 +355,20 @@ fn lifecycle_provider_config(
     config.to_string()
 }
 
+fn noop_tool_definition_provider_config(
+    base_url: &str,
+    plugin: &Path,
+    event_file: &Path,
+) -> String {
+    let mut config: serde_json::Value =
+        serde_json::from_str(&provider_config(base_url)).expect("provider config is JSON");
+    config["plugin"] = serde_json::json!([[
+        format!("file:{}", plugin.display()),
+        { "eventFile": event_file }
+    ]]);
+    config.to_string()
+}
+
 fn sdk_model_provider_config(
     base_url: &str,
     plugin: &Path,
@@ -607,6 +621,37 @@ async fn run_lifecycle_command_with_args(
         .await
         .expect("the lifecycle-plugin run must finish inside its budget")
         .expect("launch lifecycle-plugin run")
+}
+
+async fn run_noop_tool_definition_prompt(
+    env: &ScriptedEnv,
+    base_url: &str,
+    plugin: &Path,
+    event_file: &Path,
+) -> Output {
+    let mut plugin_variables = variables(env, base_url);
+    plugin_variables.remove("OPENCODE_PURE");
+    plugin_variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
+    plugin_variables.insert(
+        "MISE_DATA_DIR".to_owned(),
+        "/config/.local/share/mise".to_owned(),
+    );
+    plugin_variables.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+    plugin_variables.insert(
+        "OPENCODE_CONFIG_CONTENT".to_owned(),
+        noop_tool_definition_provider_config(base_url, plugin, event_file),
+    );
+
+    let mut command = tokio::process::Command::new(binary());
+    command
+        .args(["run", "--model", "test/test-model", "hello"])
+        .current_dir(env.working_dir())
+        .env_clear()
+        .envs(plugin_variables);
+    tokio::time::timeout(Duration::from_secs(90), command.output())
+        .await
+        .expect("the no-op tool.definition run must finish inside its budget")
+        .expect("launch no-op tool.definition run")
 }
 
 async fn run_lifecycle_tool_prompt(
@@ -1406,70 +1451,81 @@ async fn shell_env_plugin_hook_reaches_the_real_shell_process() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn failing_tool_definition_hook_is_disabled_and_cli_turn_completes_with_a_diagnostic() {
-    let env = ScriptedEnv::new()
+async fn noop_tool_definition_hook_preserves_real_schemas_and_stays_enabled() {
+    let baseline_env = ScriptedEnv::new()
         .expect("isolated environment")
         .with_db(DbChoice::TempFile);
-    let plugin = env.project().join("noop-tool-definition-plugin.mjs");
-    let event_file = env.project().join("noop-tool-definition.events");
-    let dispose_file = env.project().join("noop-tool-definition.dispose");
-    std::fs::write(&plugin, NOOP_TOOL_DEFINITION_PLUGIN)
-        .expect("write no-op tool.definition plugin");
-    let scenario = Scenario::new("noop-tool-definition-rejects-truncation")
+    let baseline_scenario = Scenario::new("tool-definition-baseline")
         .from_oracle_cassette(TITLE_CASSETTE)
         .expect("the recorded title completion loads")
         .from_oracle_cassette(TITLE_CASSETTE)
-        .expect("the turn completes after the failing plugin is disabled");
+        .expect("the baseline turn completes");
+    let baseline_provider = MockProvider::start(vec![baseline_scenario])
+        .await
+        .expect("baseline mock provider binds loopback");
+    let baseline_output = run_prompt(&baseline_env, baseline_provider.base_url(), "hello").await;
+    let baseline_captured = baseline_provider.captured().await;
+    baseline_provider.shutdown().await;
+
+    let env = ScriptedEnv::new()
+        .expect("isolated plugin environment")
+        .with_db(DbChoice::TempFile);
+    let plugin = env.project().join("noop-tool-definition-plugin.mjs");
+    let event_file = env.project().join("noop-tool-definition.events");
+    std::fs::write(&plugin, NOOP_TOOL_DEFINITION_PLUGIN)
+        .expect("write no-op tool.definition plugin");
+    let scenario = Scenario::new("noop-tool-definition-round-trip")
+        .from_oracle_cassette(TITLE_CASSETTE)
+        .expect("the recorded title completion loads")
+        .from_oracle_cassette(TITLE_CASSETTE)
+        .expect("the turn completes with the plugin enabled");
     let provider = MockProvider::start(vec![scenario])
         .await
         .expect("mock provider binds loopback");
 
-    let output = run_lifecycle_command(
-        &env,
-        provider.base_url(),
-        &plugin,
-        &event_file,
-        &dispose_file,
-    )
-    .await;
+    let output =
+        run_noop_tool_definition_prompt(&env, provider.base_url(), &plugin, &event_file).await;
     let captured = provider.captured().await;
     provider.shutdown().await;
 
     assert!(
+        baseline_output.status.success(),
+        "baseline run failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&baseline_output.stdout),
+        String::from_utf8_lossy(&baseline_output.stderr)
+    );
+    assert!(
         output.status.success(),
-        "the hook failure must disable only the plugin, not the CLI turn\nstdout:\n{}\nstderr:\n{}",
+        "the no-op hook must complete the CLI turn\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert_eq!(baseline_captured.len(), 2, "baseline title plus turn");
+    assert_eq!(captured.len(), 2, "plugin title plus turn");
+    let baseline_turn = baseline_captured[1].json().expect("baseline turn is JSON");
+    let plugin_turn = captured[1].json().expect("plugin turn is JSON");
+    let baseline_tools =
+        serde_json::to_vec(&baseline_turn["tools"]).expect("serialize baseline tool definitions");
+    let plugin_tools =
+        serde_json::to_vec(&plugin_turn["tools"]).expect("serialize plugin tool definitions");
     assert_eq!(
-        captured.len(),
-        2,
-        "the provider must receive the ordinary turn after the lossy plugin write-back is refused"
+        plugin_tools, baseline_tools,
+        "every real built-in schema must round-trip through the no-op hook byte-identically"
     );
-    for request in &captured {
-        let body = request.json().expect("captured request is JSON");
-        assert!(
-            bridge_truncation_paths(&body).is_empty(),
-            "$truncated must never reach a provider request: {body:#}"
-        );
-    }
+    assert!(
+        bridge_truncation_paths(&plugin_turn).is_empty(),
+        "$truncated must never reach the provider request: {plugin_turn:#}"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("production-noop-tool-definition")
-            && stderr.contains("tool.definition")
-            && stderr.contains("truncated"),
-        "the default CLI diagnostic must identify the disabled plugin, hook, and cause: {stderr}"
+        !stderr.contains("disabled plugin"),
+        "host data must not disable or blame the no-op plugin: {stderr}"
     );
     let calls = std::fs::read_to_string(&event_file).expect("read tool.definition calls");
     assert_eq!(
-        calls.lines().filter(|tool| *tool == "todowrite").count(),
-        1,
-        "the truncation-producing tool must fail exactly once before the plugin is disabled: {calls:?}"
-    );
-    assert_eq!(
-        calls.lines().last(),
-        Some("todowrite"),
-        "the disabled plugin must not receive definitions after the failing tool: {calls:?}"
+        calls.lines().collect::<Vec<_>>(),
+        advertised_tools(&plugin_turn),
+        "the plugin must remain enabled through every real tool definition: {calls:?}"
     );
 }
 
