@@ -14,6 +14,7 @@
 
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -34,15 +35,15 @@ use tokio::sync::mpsc;
 
 use crate::hooks::{HookMessageWithParts, NoopHooks, RequestHookInput, TurnHooks};
 use crate::interrupt::InterruptSignal;
-use crate::retry::{ProviderRetryError, ProviderRetryPolicy, retry_provider};
+use crate::retry::{
+    PROVIDER_RETRY_MAX_ATTEMPTS, ProviderRetryError, ProviderRetryPolicy, retry_provider,
+};
 
 /// Maximum queued transitions before the turn applies lossless backpressure.
 pub const TURN_EVENT_CHANNEL_CAPACITY: usize = 64;
 
 /// Text used to close an unanswered tool call before its transcript is replayed.
 pub const INTERRUPTED_TOOL_RESULT: &str = "[Tool execution was interrupted]";
-
-const PROVIDER_RETRY_MAX_ATTEMPTS: u32 = 3;
 
 /// Producer half of the engine's bounded event channel.
 ///
@@ -215,6 +216,8 @@ pub enum TurnError {
     Database(#[from] DbError),
     #[error(transparent)]
     Provider(#[from] ProviderError),
+    #[error("provider retry deadline exceeded on attempt {attempt} after {elapsed:?}")]
+    ProviderRetryDeadlineExceeded { attempt: u32, elapsed: Duration },
     #[error(transparent)]
     Cache(#[from] CacheViolation),
 }
@@ -848,6 +851,9 @@ pub async fn run_turn(
             Err(ProviderRetryError::Provider(error))
             | Err(ProviderRetryError::AttemptsExhausted { source: error, .. }) => {
                 return Err(TurnError::Provider(error));
+            }
+            Err(ProviderRetryError::DeadlineExceeded { attempt, elapsed }) => {
+                return Err(TurnError::ProviderRetryDeadlineExceeded { attempt, elapsed });
             }
             Err(ProviderRetryError::RollbackEmission { source }) => return Err(*source),
         };

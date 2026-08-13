@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use futures::{Stream, StreamExt};
 use oc_error::ProviderError;
-use oc_llm::sse::{STREAM_IDLE_TIMEOUT_ENV, StreamIdleTimeout};
+use oc_llm::sse::{MAX_PROVIDER_WAIT, STREAM_IDLE_TIMEOUT_ENV, StreamIdleTimeout};
 use serde_json::Value;
 
 use crate::stream::retry_after;
@@ -44,7 +44,7 @@ const DEFAULT_RESPONSE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 ///
 /// The twenty-second margin leaves time for scheduling and error propagation after
 /// the idle read itself expires.
-const MAX_RESPONSE_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+const MAX_RESPONSE_IDLE_TIMEOUT: Duration = MAX_PROVIDER_WAIT;
 
 fn bounded_response_idle_timeout(idle: StreamIdleTimeout) -> StreamIdleTimeout {
     StreamIdleTimeout::new(idle.duration().min(MAX_RESPONSE_IDLE_TIMEOUT))

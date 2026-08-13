@@ -178,6 +178,8 @@ pub enum MessagePart {
         /// The MIME type, when known.
         mime: Option<String>,
     },
+    /// A provider replay that is waiting or starting now.
+    Retry { attempt: u32, max: u32 },
 }
 
 impl MessagePart {
@@ -412,12 +414,16 @@ impl Transcript {
                 });
                 true
             }
-            StreamEvent::RetryRollback { .. } => {
+            StreamEvent::RetryRollback { attempt, max } => {
                 // The provider will replay from the beginning. Discarding is not an
                 // optimisation: keeping the parts would render the answer twice.
                 if let Some(index) = self.streaming {
                     self.messages[index].parts.clear();
                 }
+                self.append(MessagePart::Retry {
+                    attempt: *attempt,
+                    max: *max,
+                });
                 true
             }
             _ => false,
@@ -653,6 +659,13 @@ impl TranscriptView {
                     None => format!("  ⎘ {filename}"),
                 };
                 out.push(padded(&label, width, self.context.accent()));
+            }
+            MessagePart::Retry { attempt, max } => {
+                out.push(padded(
+                    &format!("  Retrying provider request (attempt {attempt}/{max})"),
+                    width,
+                    self.context.error(),
+                ));
             }
         }
     }
