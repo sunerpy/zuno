@@ -7769,3 +7769,27 @@ This also matches the FU-6 discovery story: the orchestrator mutated this line
 while verifying todo 176, saw nothing fail, and drew the wrong conclusion. The
 mutation was fine; the fixture made it unobservable. When a mutation produces no
 failure, check the fixture's values before concluding the line is dead.
+
+## [2026-08-13] FU-5 — a current-version fixture name needs executable provenance
+
+Pinned release 1.18.18 serves a 478,747-byte `/doc` that is byte-identical to the
+capture formerly named `oracle-openapi-1.18.12.json`. Keeping both names would create
+two identical authorities and let consumers drift between them, so FU-5 renamed the
+sole fixture to `oracle-openapi-1.18.18.json` and moved every consumer together. The
+live provenance test still starts the centrally screened binary and compares exact
+bytes; it caught both a deliberately missing new fixture and an accidental trailing
+newline introduced by a patch-based rename. The final rename therefore uses the
+original Git object unchanged.
+
+The `/agent` result is now measurable against the current pin but not fully equal.
+All required keys (`name`, `mode`, `permission`, `options`) remain present. The exact
+residual difference remains three served-but-undeclared keys (`builtIn`, `maxSteps`,
+`tools`) and six declared-but-absent optional keys (`hidden`, `native`, `steps`,
+`temperature`, `topP`, `variant`). It remains the witnessed
+`v1-agent-projection-drift` gap: inventing values would fabricate behavior, while
+publishing a local `Agent` body schema belongs to FU-4 rather than this fixture task.
+
+The `lsp_diagnostics` MCP again rejected the sibling worktree because it is rooted at
+the main request cwd. Direct `rust-analyzer diagnostics .` completed in the FU-5
+worktree with no errors; output contained only the repository's existing `#[cfg]`
+inactive-code weak warnings.

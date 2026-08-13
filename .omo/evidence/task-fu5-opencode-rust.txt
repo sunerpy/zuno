@@ -1,0 +1,67 @@
+FU-5 — pinned OpenAPI recapture and /agent projection drift
+Date: 2026-08-13
+Branch/worktree: task-fu5 / /config/workspace/ProdDir/AI/oc-wt/fu5
+Base: 41827c84
+
+Pre-mutation safety
+- `df -h /`: 290G total, 239G used, 51G available, 83%; below the 90% stop threshold.
+- Backups were created with `cp ... && test -s ...` before fixture/test mutations.
+
+Baseline provenance measurement
+Command:
+  CARGO_TARGET_DIR=/tmp/opencode/fu5 cargo test -p oc-testkit --test compat_suite the_committed_openapi_capture_is_what_the_pinned_release_serves --offline -- --nocapture
+Result:
+  PASS (1 passed, 0 failed).
+  The centrally resolved binary reported pin 1.18.18 and served 478,747 bytes at `/doc`.
+  Those bytes were byte-identical to `.omo/fixtures/oracle-openapi-1.18.12.json` and declared 58 `/api` operations.
+
+Baseline /agent measurement
+Command:
+  CARGO_TARGET_DIR=/tmp/opencode/fu5 cargo test -p oc-server --test compat_v1 compat_v1_agent_projection_drift_is_recorded_and_drops_no_required_key --offline -- --nocapture
+Result:
+  PASS (1 passed, 0 failed).
+  Required oracle keys remain present: name, mode, permission, options.
+  Residual served-but-undeclared keys: builtIn, maxSteps, tools.
+  Residual declared-but-absent optional keys: hidden, native, steps, temperature, topP, variant.
+  The local `/doc` still publishes no `components.schemas.Agent`, so FU-4 remains separate.
+
+Fixture decision: REPLACE, do not add
+- The live 1.18.18 document is byte-identical to the old 1.18.12-named file. Keeping both would create two identical authorities and permit consumers to drift between them.
+- Rename the single capture to `.omo/fixtures/oracle-openapi-1.18.18.json` and keep the live refetch/byte-equality test as executable provenance.
+- Mandated consumer effects:
+  1. `crates/oc-testkit/tests/compat_suite.rs`: point the provenance and operation-set tests at the 1.18.18-named capture and state that the name follows the executable pin.
+  2. `crates/oc-testkit/tests/no_pinned_oracle_paths.rs`: update the allowed-fixture rationale to the 1.18.18-named capture; the central resolver rule remains unchanged.
+  3. `crates/oc-server/tests/compat_v1.rs`: derive the Agent schema comparison from the 1.18.18-named capture and update the witness name to describe residual drift against the pinned capture.
+  4. `crates/oc-server/tests/api.rs`: derive owned upstream operations from the same renamed capture.
+- Additional consumers found and updated in the same atomic rename: `crates/oc-cli/tests/docs.rs`, `crates/oc-plugin-sdk/build.rs`, `crates/oc-server/src/compat_v1.rs`, `docs/v1-surface-capture.md`, `docs/compatibility-matrix.md`, and the follow-up plan.
+
+Disposition of `/agent` drift
+- Keep `v1-agent-projection-drift` as a known gap. The new pinned capture makes its exact residual key sets measurable; it does not supply trustworthy runtime values for optional keys that the projection does not carry.
+- Do not invent values or silently normalize the projection to satisfy the schema.
+- Do not publish a local `Agent` schema as part of FU-5; body publication is FU-4's explicitly larger scope.
+
+TDD and mutation evidence
+- Before the rename, the provenance test was changed to require `.omo/fixtures/oracle-openapi-1.18.18.json`; it failed because that file did not exist. This proves the new provenance name is enforced rather than documentary.
+- The capture was then renamed from the original Git object with `git mv`, preserving the exact 478,747 bytes. An earlier patch-based rename was rejected by the provenance test because it introduced one trailing newline (478,748 bytes); the exact-byte gate caught and prevented that mutation.
+- Removing `v1_agent_projection_gap()` from `known_gaps()` made `compat_report::tests::the_v1_agent_gap_is_shipped_and_names_its_witness` fail by name.
+- Adding `hidden` to the served `/agent` projection made `compat_v1_agent_projection_residual_drift_matches_pinned_capture_and_drops_no_required_key` fail by name because the measured absent-key set changed.
+- Both mutations were restored immediately from guarded non-empty backups.
+
+Targeted verification
+- Provenance: PASS; 1.18.18 served 478,747 bytes, byte-identical to `.omo/fixtures/oracle-openapi-1.18.18.json`, with 58 `/api` operations.
+- Central resolver structural guard: PASS, 2 passed / 0 failed.
+- Known-gap registration/witness linkage: PASS, 1 passed / 0 failed.
+- `/agent` pinned-capture residual drift witness: PASS, 1 passed / 0 failed.
+- Owned OpenAPI operation fixture consumer: PASS, 1 passed / 0 failed.
+- Generated documentation suite: PASS, 13 passed / 0 failed.
+
+Diagnostics
+- The `lsp_diagnostics` MCP rejected the sibling worktree path twice because the tool is fixed to the main request cwd; this is the known worktree-root limitation recorded by earlier tasks.
+- Direct `rust-analyzer diagnostics .` completed for all 529 indexed files with no errors. Its only output was pre-existing `#[cfg]` inactive-code WeakWarnings.
+
+Final validation
+- `CARGO_TARGET_DIR=/tmp/opencode/fu5 CARGO_BUILD_JOBS=1 cargo fmt --all -- --check`: PASS, clean.
+- `CARGO_TARGET_DIR=/tmp/opencode/fu5 CARGO_BUILD_JOBS=1 cargo clippy --workspace --all-targets --offline -- -D warnings`: PASS, 0 warnings.
+- `CARGO_TARGET_DIR=/tmp/opencode/fu5 CARGO_BUILD_JOBS=1 cargo build --workspace --offline`: PASS.
+- `CARGO_TARGET_DIR=/tmp/opencode/fu5 CARGO_BUILD_JOBS=1 cargo test --workspace --offline -- --test-threads=1`: PASS, 3,479 passed / 0 failed across 217 result groups.
+- The first final-chain attempt stopped at rustfmt before Clippy/build/tests because the renamed witness's opening brace needed standard formatting. After that one-line correction, the second and final full chain passed.

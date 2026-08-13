@@ -92,7 +92,7 @@ loses and, where one exists, the test that fails if the gap closes or goes stale
 
 **Surface.** the `Agent` body shape `GET /agent` serves the pre-/api (v1) SDK
 
-**What is missing.** The projection serves three keys the oracle `Agent` schema does not declare — builtIn, maxSteps and tools, against a schema with additionalProperties:false — and omits six it declares as optional: hidden, native, steps, temperature, topP and variant. maxSteps against the oracle's steps reads as a rename. What is NOT missing is any required key: all four of name, mode, permission and options are served, so no v1 caller reads a promised field and gets nothing. That is the line between this and the `Session` slug omission the same review wave found, which was a defect because the dropped key was required by the oracle AND by the OpenAPI this build publishes at /doc, making the build contradict itself. Here the build publishes no `Agent` schema at all. The 1.18.18 live `/doc` recapture is byte-identical to the committed oracle capture, so this optional-key drift is confirmed against the current executable pin rather than inferred from the fixture's 1.18.12 filename. It remains a gap, not a declared divergence, because no implementation decision chose the difference; docs/divergences.toml:11-14 forbids recording an omission as a decision. Witnessed by crates/oc-server/tests/compat_v1.rs::compat_v1_agent_projection_drift_is_recorded_and_drops_no_required_key, which measures the served key set against the oracle schema and fails if a required key is ever dropped or if this build starts publishing an `Agent` schema of its own — either event ends the reason recorded here.
+**What is missing.** The projection serves three keys the oracle `Agent` schema does not declare — builtIn, maxSteps and tools, against a schema with additionalProperties:false — and omits six it declares as optional: hidden, native, steps, temperature, topP and variant. maxSteps against the oracle's steps reads as a rename. What is NOT missing is any required key: all four of name, mode, permission and options are served, so no v1 caller reads a promised field and gets nothing. That is the line between this and the `Session` slug omission the same review wave found, which was a defect because the dropped key was required by the oracle AND by the OpenAPI this build publishes at /doc, making the build contradict itself. Here the build publishes no `Agent` schema at all. The committed 1.18.18 oracle capture is byte-identical to the live `/doc` recapture, so this optional-key drift is confirmed against the current executable pin. It remains a gap, not a declared divergence, because no implementation decision chose the difference; docs/divergences.toml:11-14 forbids recording an omission as a decision. Witnessed by crates/oc-server/tests/compat_v1.rs::compat_v1_agent_projection_residual_drift_matches_pinned_capture_and_drops_no_required_key, which measures the served key set against the oracle schema and fails if a required key is ever dropped or if this build starts publishing an `Agent` schema of its own — either event ends the reason recorded here.
 <!-- generated:END known-gaps -->
 
 ## Cross-session resident memory
@@ -169,8 +169,8 @@ as identifiers for the work that owns a surface, not as anything a user needs.
 ## HTTP `/api` operations
 
 Derived by set-differencing the document `oc_server::api::openapi()` serves
-against the committed capture of the 1.18.12 release's document
-(`.omo/fixtures/oracle-openapi-1.18.12.json`), then probing each served route
+against the committed capture of the pinned 1.18.18 release's document
+(`.omo/fixtures/oracle-openapi-1.18.18.json`), then probing each served route
 through the real router and recording which explicitly answer
 `503 backend_unavailable`. Any `501` fails the gate.
 

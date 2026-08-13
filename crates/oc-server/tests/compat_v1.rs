@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-const ORACLE: &str = include_str!("../../../.omo/fixtures/oracle-openapi-1.18.12.json");
+const ORACLE: &str = include_str!("../../../.omo/fixtures/oracle-openapi-1.18.18.json");
 
 fn compat_app(state: CompatV1State) -> Router {
     let api_state = ApiState::memory("/repo").expect("in-memory API state initializes");
@@ -662,13 +662,14 @@ async fn compat_v1_session_projection_satisfies_the_published_session_schema() {
 ///   nothing of its own for the body to contradict. Publish one and this test fails,
 ///   which is correct: the body would then have to be checked against it.
 ///
-/// What is left is drift in optional keys. The 1.18.18 live `/doc` recapture is
-/// byte-identical to the committed 1.18.12-named fixture, so the drift is confirmed
-/// against the executable pin. It remains a gap in
+/// What is left is drift in optional keys. The committed 1.18.18 capture is
+/// byte-identical to the live `/doc` response by an executable provenance gate, so
+/// the drift is confirmed against the executable pin. It remains a gap in
 /// `oc_testkit::compat_report::known_gaps`, not a declared decision, and this test
 /// pins the measurement so the two cannot part company in silence.
 #[tokio::test]
-async fn compat_v1_agent_projection_drift_is_recorded_and_drops_no_required_key() {
+async fn compat_v1_agent_projection_residual_drift_matches_pinned_capture_and_drops_no_required_key()
+ {
     let fixture = adapter_fixture();
     let app = fixture.app;
 

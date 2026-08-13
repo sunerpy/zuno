@@ -135,16 +135,19 @@ schema; unbound operations are enumerated in the frozen gap inventory with reaso
 
 ## FU-5. `/agent` schema drift is unverifiable against the available capture
 
+**Status: CLOSED (2026-08-13)** — The sole OpenAPI fixture now names pinned release 1.18.18 and is byte-verified against its live `/doc`; the exact residual optional-key drift remains a witnessed known gap.
+
 **Source**: F3, lower-severity observation, Round 1; recorded by todo 171 as the frozen gap
 `v1-agent-projection-drift` (`crates/oc-testkit/src/compat_report.rs:491`) with a witness
 test.
 
-**Why it is honestly blocked, not neglected.** Todo 171 established three facts: all four
+**Why it was honestly blocked, not neglected.** Todo 171 established three facts: all four
 oracle-required keys (`name`, `mode`, `permission`, `options`) are returned; this build
 publishes **no** `Agent` schema at `/doc`, so there is no self-contradiction to detect; and
-the tree holds only a **1.18.12** capture while the oracle now pins **1.18.18**. Optional-key
-drift (extra `builtIn`/`maxSteps`/`tools`, missing `hidden`/`native`/`steps`/`temperature`/
-`topP`/`variant`) therefore **cannot be characterised** without fabricating a capture.
+the tree held only a **1.18.12**-named capture while the oracle pinned **1.18.18**. FU-5
+replaced that name with the executable pin after proving the live bytes identical, so the
+optional-key drift (extra `builtIn`/`maxSteps`/`tools`, missing `hidden`/`native`/`steps`/
+`temperature`/`topP`/`variant`) is now characterised without fabricating a capture.
 
 **What would unblock it**: a `/doc` capture from the currently pinned release, taken the way
 `compat_suite.rs` takes its others — refetched from the running binary so provenance is an

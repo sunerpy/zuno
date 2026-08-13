@@ -20,7 +20,7 @@ are reportable, and the executable form of that rule is
    `const app = _client?.app; app.log(...)`.
 4. Each captured SDK method was mapped to an HTTP verb and path from the oracle's
    route groups, then cross-checked against the committed OpenAPI document
-   `.omo/fixtures/oracle-openapi-1.18.12.json`. All 20 verb/path pairs are
+   `.omo/fixtures/oracle-openapi-1.18.18.json`. All 20 verb/path pairs are
    present there; none was invented.
 
 Re-run this capture when the plugin set changes, when a plugin is upgraded, or
@@ -132,7 +132,7 @@ this is the one route in the table whose justification rests on a CLI-bundle
 citation.
 
 **No captured SDK method lacks a route.** All 20 map to a verb/path present in
-`.omo/fixtures/oracle-openapi-1.18.12.json`.
+`.omo/fixtures/oracle-openapi-1.18.18.json`.
 
 **No route in `V1_SURFACE` lacks a callsite.** Asserted by
 `compat_v1_every_route_has_a_recorded_callsite`.
