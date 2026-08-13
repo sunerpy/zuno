@@ -2932,6 +2932,7 @@ dependencies = [
  "oc-llm",
  "oc-paths",
  "oc-permission",
+ "oc-plugin-sdk",
  "oc-pty",
  "reqwest",
  "rusqlite",

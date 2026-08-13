@@ -60,6 +60,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, patch, post, put};
 use axum::{Router, routing::MethodRouter};
+use oc_plugin_sdk::GeneratedClientArrival;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -318,7 +319,7 @@ pub const V1_SURFACE: &[V1Route] = &[
     },
     V1Route {
         method: V1Method::Get,
-        path: "/provider",
+        path: GeneratedClientArrival::ProviderList.path(),
         sdk_method: "client.provider.list",
         plugins: &[OMO],
         callsites: &["oh-my-openagent: dist/index.js:26958,84674"],
@@ -493,7 +494,7 @@ const V1_BACKENDS: &[(V1Method, &str, V1Backing)] = &[
     ),
     (
         V1Method::Get,
-        "/provider",
+        GeneratedClientArrival::ProviderList.path(),
         V1Backing::ApiAdapter(V1Adapter::Providers),
     ),
     (

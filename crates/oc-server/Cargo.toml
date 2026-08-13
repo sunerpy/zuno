@@ -26,6 +26,7 @@ oc-error = { workspace = true }
 oc-llm = { workspace = true }
 oc-paths = { workspace = true }
 oc-permission = { workspace = true }
+oc-plugin-sdk = { workspace = true }
 oc-pty = { workspace = true }
 rusqlite = { workspace = true }
 schemars = { workspace = true }

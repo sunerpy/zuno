@@ -5,10 +5,12 @@
 //! standard error so one stray log line cannot corrupt the host connection.
 
 mod conformance;
+mod generated_client;
 mod protocol;
 mod server;
 
 pub use crate::conformance::*;
+pub use crate::generated_client::*;
 pub use crate::protocol::*;
 pub use crate::server::{serve, serve_io};
 
