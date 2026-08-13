@@ -550,11 +550,11 @@ async fn compat_v1_session_projection_satisfies_the_published_session_schema() {
 ///   nothing of its own for the body to contradict. Publish one and this test fails,
 ///   which is correct: the body would then have to be checked against it.
 ///
-/// What is left is drift in optional keys against a 1.18.12 capture while the port
-/// targets a later release, so it cannot be classified without a capture at the
-/// targeted version. It is recorded as a gap in
-/// `oc_testkit::compat_report::known_gaps` and this test pins the measurement that
-/// recording describes, so the two cannot part company in silence.
+/// What is left is drift in optional keys. The 1.18.18 live `/doc` recapture is
+/// byte-identical to the committed 1.18.12-named fixture, so the drift is confirmed
+/// against the executable pin. It remains a gap in
+/// `oc_testkit::compat_report::known_gaps`, not a declared decision, and this test
+/// pins the measurement so the two cannot part company in silence.
 #[tokio::test]
 async fn compat_v1_agent_projection_drift_is_recorded_and_drops_no_required_key() {
     let fixture = adapter_fixture();

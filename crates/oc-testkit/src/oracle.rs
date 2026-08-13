@@ -34,7 +34,7 @@
 //! | [`PINNED_RELEASE`] | the installed binary every differential runs against | this module, verified by [`Oracle::discover_pinned`] |
 //! | the source baseline | the TypeScript tree this port was read from, and the version it reports to the npm plugin gate | `packages/opencode/package.json` in the located tree, and `oc_plugin::js::spec::REPORTED_PLUGIN_API_VERSION` |
 //!
-//! They are currently `1.18.15` and `1.18.13`. Conflating them is what produced
+//! They are currently `1.18.18` and `1.18.13`. Conflating them is what produced
 //! the artifact F1 rejected — a report recording the source baseline as though it
 //! were the binary that ran. [`Oracle::version_gap`] exists to keep the difference
 //! visible rather than to excuse it.
@@ -78,7 +78,7 @@ pub enum OracleFlavour {
 /// Moving this constant means recapturing every artifact measured against it. See
 /// `.omo/evidence/task-130-opencode-rust.txt` for what 1.18.15 was measured to
 /// produce.
-pub const PINNED_RELEASE: &str = "1.18.15";
+pub const PINNED_RELEASE: &str = "1.18.18";
 
 /// Override the discovered oracle binary with an explicit path.
 pub const ENV_ORACLE_BINARY: &str = "OC_TESTKIT_ORACLE";
@@ -950,7 +950,7 @@ mod tests {
         };
         let dir = tempfile::tempdir().expect("tempdir");
         let launcher = stand_in(dir.path(), "launcher", ">&2 echo 'not trusted'", 1);
-        let wrong = stand_in(dir.path(), "wrong-release", "echo 1.18.12", 0);
+        let wrong = stand_in(dir.path(), "wrong-release", "echo 1.18.14", 0);
 
         match screen_candidates(vec![launcher.clone(), wrong.clone(), real.clone()]) {
             PinnedOracle::Found(found) => assert_eq!(
@@ -971,7 +971,7 @@ mod tests {
             "the refusal must name the launcher it could not use: {reason}"
         );
         assert!(
-            reason.contains(&wrong.display().to_string()) && reason.contains("1.18.12"),
+            reason.contains(&wrong.display().to_string()) && reason.contains("1.18.14"),
             "the refusal must name the wrong release and what it reported: {reason}"
         );
         assert!(reason.contains(PINNED_RELEASE), "{reason}");
@@ -980,34 +980,39 @@ mod tests {
     /// The failure QA scenario for the pin: a binary that reports another release is
     /// refused and named, not accepted with a warning.
     ///
-    /// The wrong-release binary is a real executable this test writes and
-    /// [`Oracle::at_binary`] really runs, so the refused version string comes out of
-    /// [`Oracle::probe_version`]'s stdout rather than being handed to [`check_pin`]
-    /// as a literal. That is what makes this a test of the gate and not of
-    /// [`TestkitError`]'s `Display`.
+    /// Set `OC_TESTKIT_MISMATCH_ORACLE` to a real older install during a re-pin. The
+    /// hermetic fallback is a real executable this test writes, so either way
+    /// [`Oracle::at_binary`] really runs a process and the refused version string
+    /// comes out of [`Oracle::probe_version`]'s stdout rather than being handed to
+    /// [`check_pin`] as a literal. That is what makes this a test of the gate and not
+    /// of [`TestkitError`]'s `Display`.
     #[cfg(unix)]
     #[test]
     fn a_binary_reporting_another_release_is_named_and_refused() {
         use std::os::unix::fs::PermissionsExt as _;
 
+        const MISMATCH_ORACLE: &str = "OC_TESTKIT_MISMATCH_ORACLE";
         let dir = tempfile::tempdir().expect("tempdir");
         let fake = dir.path().join("opencode");
-        std::fs::write(&fake, "#!/bin/sh\necho 1.18.12\n").expect("write the stand-in release");
+        std::fs::write(&fake, "#!/bin/sh\necho 1.18.14\n").expect("write the stand-in release");
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
             .expect("make the stand-in executable");
+        let candidate = std::env::var_os(MISMATCH_ORACLE)
+            .map(PathBuf::from)
+            .unwrap_or(fake);
 
-        let oracle = Oracle::at_binary(&fake).expect("a runnable file is an oracle");
+        let oracle = Oracle::at_binary(&candidate).expect("a runnable file is an oracle");
         assert_eq!(
             oracle.reported_version(),
-            "1.18.12",
-            "the probe must read the stand-in's own output"
+            "1.18.14",
+            "the mismatch probe must execute a 1.18.14 binary; check {MISMATCH_ORACLE}"
         );
 
         let err = check_pin(oracle.reported_version(), oracle.program())
             .expect_err("a release other than the pin must be refused");
         let rendered = err.to_string();
         assert!(rendered.contains(PINNED_RELEASE), "{rendered}");
-        assert!(rendered.contains("1.18.12"), "{rendered}");
+        assert!(rendered.contains("1.18.14"), "{rendered}");
         assert!(rendered.contains("opencode"), "{rendered}");
         assert!(rendered.contains(ENV_ORACLE_BINARY), "{rendered}");
         assert!(

@@ -10,7 +10,7 @@
 //! That `1.18.13` is the **source baseline** — the tree this port was read from and
 //! the version it reports to the npm plugin gate. The binary the differentials
 //! actually execute is [`PINNED_RELEASE`], the newest installed release, currently
-//! `1.18.15`. The two numbers are separate pins and [`oracle`] documents why;
+//! `1.18.18`. The two numbers are separate pins and [`oracle`] documents why;
 //! recording one as though it were the other is the defect plan todo 130 closed.
 //!
 //! # The failure this crate exists to prevent
