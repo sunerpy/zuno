@@ -268,3 +268,122 @@ Mutation 2 — round-trip fidelity:
 - Observable result: FAILED by name at the byte-vector equality assertion; the nested
   host value ended in `null` instead of the original `thinkingBudget` object.
 - Restored from backup and verified byte identity with `cmp -s`.
+
+8. HTTP regression missed by the original change
+
+Post-merge review found todo 168's HTTP twin in
+`crates/oc-cli/tests/session_mutation.rs`. Its fixture was the same innocent no-op
+`tool.definition` callback as the original CLI reproducer, but the test still expected
+host-side depth truncation to disable it and emit a diagnostic. After Task 172 fixed the
+misattribution, no diagnostic existed and its SSE loop timed out. This was a stale test
+premise, not a production regression.
+
+The HTTP contract is now split symmetrically:
+
+- `failing_tool_definition_hook_is_disabled_and_http_turn_completes_with_a_diagnostic`
+  uses a genuinely failing hook. It logs each definition and deliberately throws
+  `intentional HTTP tool.definition failure` on `question`; the test requires that the
+  plugin is disabled exactly there, the diagnostic names the plugin and hook, no later
+  definitions reach it, and the HTTP turn still completes with `Hello`.
+- `noop_tool_definition_hook_preserves_real_schemas_and_stays_enabled_over_http`
+  runs a no-plugin baseline and a no-op-plugin HTTP turn. It compares their complete
+  provider-visible `tools` arrays byte-for-byte, requires every advertised definition
+  to reach the callback, drains the completed turn's already-published session events,
+  and forbids both a `session.error` and any plugin-disable diagnostic.
+
+Red/green proof:
+
+  cargo test -p oc-cli --test session_mutation tool_definition_hook --offline -- --nocapture
+    BEFORE genuine throw: 1 passed / 1 failed; the positive no-op test passed, while
+    the negative test timed out waiting for a diagnostic the innocent callback could
+    no longer produce.
+    AFTER genuine throw: PASS, 2 passed / 0 failed.
+
+Repository audit: CodeGraph was attempted first but this sibling worktree has no index.
+A fallback grep over all Rust crates searched `tool.definition`, disabled-plugin text,
+truncation errors, no-op/empty callbacks, and the stale failing-test name. It found 35
+raw references in 13 files. The only other test whose expected disablement depended on
+an innocent `tool.definition` callback was this HTTP test. `tool_turn.rs` already has
+Task 172's positive CLI regression; `oc-plugin/tests/js.rs` exercises actual
+plugin-created or plugin-mutated truncation; the remaining hits are hook manifests,
+payloads, diagnostics implementation, or ordinary definition consumers. No second
+stale misattribution expectation was found.
+
+9. Follow-up gates
+
+  cargo fmt --all --check
+    PASS: exit 0
+  cargo clippy --workspace --all-targets --offline
+    PASS: exit 0, 0 warnings
+  cargo test -p oc-cli --test session_mutation tool_definition_hook \
+    --offline -- --nocapture
+    PASS: 2 passed, 0 failed
+
+The exact unqualified `cargo test --workspace --offline` still resolves the machine's
+default 1.18.18 oracle and therefore stops at the same five `OraclePinMismatch` cases:
+this branch intentionally predates todo 178 and was not rebased or merged as directed.
+The matching 1.18.15 binary is installed locally, so the workspace gate was rerun as:
+
+  OC_TESTKIT_ORACLE=/config/.local/share/mise/installs/opencode/1.18.15/opencode \
+    cargo test --workspace --offline
+
+Both the first run and the single permitted retry advanced beyond all parity tests and
+passed the complete updated `session_mutation` target (10/10), including both HTTP
+`tool.definition` cases. Both were then interrupted in `oc-config --lib` by the same
+host-transient harness failure:
+
+  error: io error when listing tests: Os { code: 11, kind: WouldBlock,
+    message: "Resource temporarily unavailable" }
+
+The retry was performed exactly once as instructed; no product test reported a normal
+assertion failure before the harness channel collapsed. The amend proceeds with the
+targeted regressions, rustfmt, and all-target Clippy green, while recording that the
+full total was interrupted twice by persistent EAGAIN.
+
+Integrated `lsp_diagnostics` again rejected the sibling worktree path before launching
+its server. Worktree-local `rust-analyzer diagnostics . --severity error` completed
+with exit 0 and no source diagnostic; it did emit analyzer-internal `Overloaded deref`
+error logs while scanning unrelated files. The changed test compiles cleanly under the
+targeted run, all-target Clippy, and the workspace runs above.
+
+10. Merge integration with todos 173 and 178
+
+`main` was merged normally after it acquired todo 173's retained-callback containment
+and todo 178's 1.18.18 oracle pin. The conflict resolution retained all three adjacent
+HTTP contracts and their helpers:
+
+- a genuinely failing `tool.definition` callback is disabled and diagnosed while the
+  HTTP turn completes;
+- a no-op `tool.definition` callback remains enabled and preserves every real schema;
+- a failing `auth.loader` is disabled and diagnosed while the HTTP turn completes.
+
+Each exact HTTP test passed independently, 1 passed / 0 failed. The merged
+`session_mutation` target also passed all 11 tests during both workspace attempts.
+
+The merge exposed a real fixture interaction outside the textual conflict. Todo 173
+correctly skips `auth.loader` when no stored provider credential exists, while the
+pre-existing ordinary lifecycle test still expected its successful auth loader to add
+`auth_hook_sentinel` under the globally empty auth fixture. The first workspace run
+therefore failed that named assertion, and an exact rerun reproduced it. The lifecycle
+command helper now supplies the same explicit `test` API credential as the failing-auth
+fixture. The exact lifecycle regression then passed, restoring a meaningful successful
+auth-loader witness without weakening todo 173's missing-credential contract.
+
+Post-fix full workspace attempts both advanced with no ordinary assertion failure and
+passed the merged `session_mutation` (11/11) and `tool_turn` (13/13) targets. Both were
+eventually interrupted by host process exhaustion rather than product failure:
+
+- attempt 1: `oc-config --lib`, `Os { code: 11, kind: WouldBlock, message:
+  "Resource temporarily unavailable" }`;
+- the single permitted retry: `oc-db --test fts`, the same `EAGAIN`/`WouldBlock` test
+  listing failure.
+
+No further workspace retry was made. `cargo clippy --workspace --all-targets --offline`
+passed with zero warnings, and `cargo fmt --all --check` passed cleanly.
+
+The integrated `lsp_diagnostics` entry point rejected both changed Rust files because
+this sibling worktree lies outside its fixed request cwd. Worktree-local
+`rust-analyzer diagnostics . --severity error` completed its 526-file scan and emitted
+no source diagnostic for either changed test file; it retained the analyzer's known
+internal `Overloaded deref on type str is not a projection` error logs in unrelated
+analysis. Compilation, exact tests, all-target Clippy, and rustfmt are clean.

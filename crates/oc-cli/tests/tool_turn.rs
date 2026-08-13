@@ -669,6 +669,10 @@ async fn run_lifecycle_command_with_args(
     );
     plugin_variables.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
     plugin_variables.insert(
+        "OPENCODE_AUTH_CONTENT".to_owned(),
+        r#"{"test":{"type":"api","key":"fixture-key"}}"#.to_owned(),
+    );
+    plugin_variables.insert(
         "OPENCODE_CONFIG_CONTENT".to_owned(),
         lifecycle_provider_config(base_url, plugin, event_file, dispose_file),
     );
