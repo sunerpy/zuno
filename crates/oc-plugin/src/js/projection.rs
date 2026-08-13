@@ -1,6 +1,7 @@
 use oc_auth::Credential;
 use oc_llm::catalog::availability::AvailabilitySource;
 use oc_llm::catalog::resolved::{ResolvedModel, ResolvedProvider};
+pub(crate) use oc_plugin_sdk::GeneratedClientArrival;
 use serde_json::{Map, Value, json};
 
 use crate::{ChatContext, HookInvocation, ProviderSource};
@@ -33,27 +34,6 @@ pub(crate) enum JsModelProjection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GeneratedClientArrival {
-    ConfigProviders,
-    ProviderList,
-    V2ModelList,
-    V2ProviderList,
-    V2ProviderGet,
-    ModelSelection,
-}
-
-impl GeneratedClientArrival {
-    pub(crate) const ALL: [Self; 6] = [
-        Self::ConfigProviders,
-        Self::ProviderList,
-        Self::V2ModelList,
-        Self::V2ProviderList,
-        Self::V2ProviderGet,
-        Self::ModelSelection,
-    ];
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JsModelArrival {
     Hook(HookModelBoundary),
     AuthLoader,
@@ -72,9 +52,21 @@ impl JsModelArrival {
             | Self::AuthMethods
             | Self::WorkspaceRegistration => JsModelProjection::None,
             Self::Hook(HookModelBoundary::ModelSelection)
-            | Self::GeneratedClient(GeneratedClientArrival::ModelSelection) => {
-                JsModelProjection::ModelSelection
-            }
+            | Self::GeneratedClient(
+                GeneratedClientArrival::EventSubscribe
+                | GeneratedClientArrival::GlobalEvent
+                | GeneratedClientArrival::V2AgentList
+                | GeneratedClientArrival::V2CommandList
+                | GeneratedClientArrival::V2EventSubscribe
+                | GeneratedClientArrival::V2SessionContext
+                | GeneratedClientArrival::V2SessionCreate
+                | GeneratedClientArrival::V2SessionEvents
+                | GeneratedClientArrival::V2SessionGet
+                | GeneratedClientArrival::V2SessionHistory
+                | GeneratedClientArrival::V2SessionList
+                | GeneratedClientArrival::V2SessionMessage
+                | GeneratedClientArrival::V2SessionMessages,
+            ) => JsModelProjection::ModelSelection,
             Self::Hook(HookModelBoundary::LegacyContext | HookModelBoundary::LegacyModel)
             | Self::AuthLoader => JsModelProjection::LegacySdk,
             Self::Hook(HookModelBoundary::V2ProviderAndModel) | Self::ProviderModels => {
@@ -351,10 +343,22 @@ mod tests {
             projections,
             [
                 JsModelProjection::Unbacked,
+                JsModelProjection::ModelSelection,
+                JsModelProjection::ModelSelection,
                 JsModelProjection::LegacyCatalogHttp,
+                JsModelProjection::ModelSelection,
+                JsModelProjection::ModelSelection,
+                JsModelProjection::ModelSelection,
                 JsModelProjection::V2ModelHttp,
                 JsModelProjection::V2ProviderHttp,
                 JsModelProjection::V2ProviderHttp,
+                JsModelProjection::ModelSelection,
+                JsModelProjection::ModelSelection,
+                JsModelProjection::ModelSelection,
+                JsModelProjection::ModelSelection,
+                JsModelProjection::ModelSelection,
+                JsModelProjection::ModelSelection,
+                JsModelProjection::ModelSelection,
                 JsModelProjection::ModelSelection,
             ]
         );

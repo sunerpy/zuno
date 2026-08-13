@@ -7686,3 +7686,25 @@ relevant provider/model roles agreed, and the runtime regression uses the actual
 loaded by the installed plugin. Also, unconstrained workspace gates can exhaust host process
 resources; `CARGO_BUILD_JOBS=2` plus `--test-threads=1` completed the full test, Clippy, and fmt
 gates without changing behavior or skipping tests.
+
+## [2026-08-13] Todo 179 — generated-client arrival completeness is now a build contract
+
+F4 Round 2 was correct that todo 176's handwritten `GeneratedClientArrival` only made a
+remembered enum edit exhaustive. It was disconnected from both generated SDK response schemas
+and production route declarations, so a new Model/Provider-bearing operation could bypass it.
+
+`oc-plugin-sdk/build.rs` now derives the complete arrival enum from every 200 response in the
+pinned OpenAPI capture that transitively reaches `Model`, `ModelRef`, `ModelV2Info`, `Provider`,
+or `ProviderV2Info`. `JsModelArrival::projection` exhaustively matches that generated enum with
+no wildcard, and the four concrete legacy/V2 model/provider route registrations consume paths
+from the same generated variants. A temporary `Model` response generated `Todo179Probe` and
+failed `cargo build` with E0004; adding a temporary wildcard made the same probe compile, proving
+the exhaustive binding was causal. Both mutations were restored.
+
+The exact 1.18.18 SDK declaration package remains unavailable locally, but todo 178 proved the
+committed OpenAPI document byte-identical to the screened 1.18.18 `/doc` response. That capture
+is therefore the authoritative generated-client contract used by this build step. All four F4
+regressions, changed-file diagnostics, the complete workspace test suite, zero-warning Clippy,
+rustfmt, and diff checks passed. The first workspace run encountered the already-known host
+`WouldBlock` resource limit; the single-job, single-test-thread retry completed without skipping
+tests.

@@ -1,0 +1,92 @@
+TODO 179 — COMPILE-TIME GENERATED-CLIENT ARRIVAL BINDING
+========================================================
+
+SOURCE FINDINGS AND BINDING DECISION
+------------------------------------
+- F4 Round 2 correctly rejected the handwritten `GeneratedClientArrival`: its variants were
+  not derived from generated SDK responses, and the server route registrations used unrelated
+  string literals. Exhaustiveness therefore applied only after a human remembered to edit the
+  enum.
+- The requested `@opencode-ai/sdk@1.18.18` declaration package is not present in the Bun cache.
+  Todo 176 already recorded that environmental fact and audited the closest complete 1.18.16
+  declarations. Todo 178 supplies the stronger build input: it launched the screened 1.18.18
+  release and proved its 478,747-byte `/doc` response byte-identical (sha256
+  c3a9f94af0c3324d97b482b14c692e810ce7ccac3136319ba46334de972b4cf1) to the committed
+  `.omo/fixtures/oracle-openapi-1.18.12.json`. The JavaScript declarations are generated from
+  that OpenAPI contract.
+- Chosen mechanism: `oc-plugin-sdk/build.rs` traverses every 200-response schema transitively
+  from that pinned OpenAPI document and generates `GeneratedClientArrival` for every operation
+  reaching `Model`, `ModelRef`, `ModelV2Info`, `Provider`, or `ProviderV2Info`.
+  `JsModelArrival::projection` exhaustively matches that generated enum without a wildcard.
+  The concrete `/provider`, `/api/model`, `/api/provider`, and
+  `/api/provider/{providerID}` registrations now take their paths from those same generated
+  variants instead of disconnected literals.
+- Why regeneration cannot bypass it: adding a Model/Provider-bearing 200 response to the
+  generated-client OpenAPI input makes the build script emit a new Rust variant before
+  `projection.rs` is compiled. Rust then rejects the non-exhaustive projection match. A route
+  serving an existing generated operation is bound to that operation's generated path; a new
+  generated route first has to exist in the same OpenAPI input and therefore creates the same
+  compile-time obligation. There is no handwritten `ALL` list to forget and no runtime assertion
+  in the enforcement path.
+
+IMPLEMENTATION STATUS
+---------------------
+- `oc-plugin-sdk` now generates the arrival enum from the pinned OpenAPI capture at build time.
+- `projection.rs` consumes the generated enum in a wildcard-free exhaustive match.
+- The legacy and V2 model/provider router registrations consume generated path constants.
+
+COMPILE-FAIL PROBE AND CAUSAL MUTATION
+--------------------------------------
+Before each temporary mutation, `df -h /` reported 80% utilization (below the 90% stop
+threshold), and the changed file was copied under `/tmp/opencode/t179`.
+
+The positive probe added `GET /__todo179/probe` with operationId `todo179.probe` and a
+200 response schema referencing `#/components/schemas/Model` to the pinned OpenAPI capture.
+The production build script generated `GeneratedClientArrival::Todo179Probe`, and:
+
+  CARGO_TARGET_DIR=/tmp/opencode/t179 cargo build -p oc-plugin --offline
+
+failed with rustc E0004:
+
+  non-exhaustive patterns:
+  `JsModelArrival::GeneratedClient(GeneratedClientArrival::Todo179Probe)` not covered
+  --> crates/oc-plugin/src/js/projection.rs:49:15
+
+For the causal mutation, the same probe remained present while a temporary
+`Self::GeneratedClient(_) => JsModelProjection::None` fallback removed the exhaustive
+binding. The identical package build then succeeded. Both temporary changes were restored
+from their backups before final verification. `git status --short` and `git diff --check`
+confirmed that neither the probe operation nor the wildcard fallback remained.
+
+TARGETED REGRESSIONS
+--------------------
+All four tests cited by F4 Round 2 passed independently (4 passed, 0 failed):
+
+- `compat_v1_provider_projection_preserves_catalog_model_semantics`
+- `plugin_input_client_provider_list_observes_the_production_sdk_projection`
+- `every_generated_client_model_arrival_has_an_explicit_projection`
+- `every_non_hook_resource_arrival_has_an_explicit_projection`
+
+The last two each executed one test (the initial `--exact` spelling omitted the module path
+and selected zero tests, so they were immediately rerun with their unique name filters).
+
+FINAL VERIFICATION
+------------------
+- Changed-file `lsp_diagnostics`: all six changed Rust files reported `No diagnostics found`.
+  Because the MCP is rooted at the primary checkout, a temporary shared clone inside that
+  root received the exact worktree diff, was diagnosed, and was then removed.
+- `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/tmp/opencode/t179 cargo build --workspace --offline`
+  passed.
+- The first workspace-test attempt reached `oc-config` before the host refused test listing
+  with `WouldBlock: Resource temporarily unavailable`; this was an OS resource failure, not
+  a compile error or failed assertion.
+- The constrained retry,
+  `CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR=/tmp/opencode/t179 cargo test --workspace --offline
+  --quiet -- --test-threads=1`, ran the complete unchanged-at-or-above-3473 baseline and
+  passed with 0 failures (including all doctests).
+- `CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR=/tmp/opencode/t179 cargo clippy --workspace
+  --all-targets --offline -- -D warnings` passed with zero warnings.
+- `cargo fmt --all --check` and `git diff --check` passed with no output.
+
+Todo 179 therefore closes F4 Round 2 ledger entry 6: a newly generated
+Model/Provider-bearing arrival is now a compiler obligation, not a runtime inventory check.

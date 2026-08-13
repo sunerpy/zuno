@@ -14,6 +14,7 @@ use axum::Router;
 use axum::extract::MatchedPath;
 use axum::http::Method;
 use axum::routing::{delete, get, patch, post};
+use oc_plugin_sdk::GeneratedClientArrival;
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -56,9 +57,18 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/command", get(catalog::commands))
         .route("/api/skill", get(catalog::skills))
         .route("/api/reference", get(catalog::references))
-        .route("/api/model", get(provider::models))
-        .route("/api/provider", get(provider::providers))
-        .route("/api/provider/{providerID}", get(provider::provider))
+        .route(
+            GeneratedClientArrival::V2ModelList.path(),
+            get(provider::models),
+        )
+        .route(
+            GeneratedClientArrival::V2ProviderList.path(),
+            get(provider::providers),
+        )
+        .route(
+            GeneratedClientArrival::V2ProviderGet.path(),
+            get(provider::provider),
+        )
         .route("/api/integration", get(provider::integrations))
         .route(
             "/api/integration/{integrationID}",
