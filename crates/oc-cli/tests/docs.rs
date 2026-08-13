@@ -49,12 +49,12 @@ use oc_server::{ServerBuilder, ServerConfig, V1_SURFACE};
 use oc_testkit::{DivergenceList, divergence};
 use tower::ServiceExt as _;
 
-/// The committed capture of the 1.18.12 release's OpenAPI document.
+/// The committed capture of the pinned 1.18.18 release's OpenAPI document.
 ///
 /// The same fixture `crates/oc-testkit/tests/compat_suite.rs` compares against,
 /// so the documentation and the compatibility gate cannot disagree about what
 /// upstream declares.
-const ORACLE_OPENAPI_FIXTURE: &str = ".omo/fixtures/oracle-openapi-1.18.12.json";
+const ORACLE_OPENAPI_FIXTURE: &str = ".omo/fixtures/oracle-openapi-1.18.18.json";
 
 /// How many `/api` operations that capture declares. Restated so a replaced
 /// fixture fails loudly here as well as in the compatibility suite.

@@ -492,7 +492,7 @@ pub const V1_AGENT_GAP_ID: &str = "v1-agent-projection-drift";
 
 /// The test name [`v1_agent_projection_gap`]'s detail points a reader at.
 pub const V1_AGENT_WITNESS: &str =
-    "compat_v1_agent_projection_drift_is_recorded_and_drops_no_required_key";
+    "compat_v1_agent_projection_residual_drift_matches_pinned_capture_and_drops_no_required_key";
 
 /// The gap [`V1_AGENT_GAP_ID`] names, on its own.
 ///
@@ -506,9 +506,9 @@ pub const V1_AGENT_WITNESS: &str =
 /// None of that holds here. Every oracle-**required** `Agent` key is served and this
 /// build publishes no `Agent` schema for the body to contradict. The 1.18.18 live
 /// `/doc` recapture is byte-identical to the committed capture, so the remaining
-/// optional-key difference is confirmed against the current executable pin rather
-/// than inferred from the fixture's 1.18.12 filename. It remains a gap rather than a
-/// declaration because no implementation decision chose the difference;
+/// optional-key difference is confirmed against the current executable pin. It
+/// remains a gap rather than a declaration because no implementation decision chose
+/// the difference;
 /// `docs/divergences.toml` lines 11-14 forbid recording an omission as a decision.
 #[must_use]
 pub fn v1_agent_projection_gap() -> KnownGap {
@@ -525,9 +525,9 @@ pub fn v1_agent_projection_gap() -> KnownGap {
              and the `Session` slug omission the same review wave found, which was a defect \
              because the dropped key was required by the oracle AND by the OpenAPI this build \
              publishes at /doc, making the build contradict itself. Here the build publishes no \
-             `Agent` schema at all. The 1.18.18 live `/doc` recapture is byte-identical to the \
-             committed oracle capture, so this optional-key drift is confirmed against the \
-             current executable pin rather than inferred from the fixture's 1.18.12 filename. \
+             `Agent` schema at all. The committed 1.18.18 oracle capture is byte-identical to the \
+             live `/doc` recapture, so this optional-key drift is confirmed against the current \
+             executable pin. \
              It remains a gap, not a declared divergence, because no implementation decision \
              chose the difference; docs/divergences.toml:11-14 forbids recording an omission as \
              a decision. Witnessed by \

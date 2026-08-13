@@ -71,16 +71,16 @@ const PINNED_RELEASE: &str = oc_testkit::PINNED_RELEASE;
 
 /// The committed capture of the real binary's OpenAPI document.
 ///
-/// Recaptured from [`PINNED_RELEASE`] for todo 130 by serving `/doc` under an
-/// isolated XDG world. The bytes are **identical** to the 1.18.12 capture the name
-/// records — 1.18.12, 1.18.13, 1.18.14, 1.18.15 and 1.18.18 all emit the same
-/// 478,747-byte
+/// Recaptured from [`PINNED_RELEASE`] by serving `/doc` under an isolated XDG
+/// world. The bytes are **identical** across 1.18.12, 1.18.13, 1.18.14, 1.18.15
+/// and 1.18.18: all five emit the same 478,747-byte
 /// document, sha256 `c3a9f94af0c3324d97b482b14c692e810ce7ccac3136319ba46334de972b4cf1`
-/// — so the filename is the capture's provenance, not a claim that the document is
-/// version-specific. That equality is not taken on trust:
+/// — so the filename records the executable pin that supplied this committed
+/// capture, not a claim that the document is version-specific. That equality is
+/// not taken on trust:
 /// [`the_committed_openapi_capture_is_what_the_pinned_release_serves`] refetches
 /// `/doc` from the running release and compares.
-const ORACLE_OPENAPI_FIXTURE: &str = ".omo/fixtures/oracle-openapi-1.18.12.json";
+const ORACLE_OPENAPI_FIXTURE: &str = ".omo/fixtures/oracle-openapi-1.18.18.json";
 
 /// Upstream `/api` operations the capture declares. Unchanged from the 1.18.12
 /// capture, because the document is byte-identical across all five installed
@@ -2207,8 +2207,8 @@ async fn api_behaviour_matrix_compares_live_status_body_and_side_effects() {
 /// from one release and then compared against a differently-versioned binary is a
 /// stale oracle that no other test in this file can detect — it would simply keep
 /// agreeing with itself. This is the test that makes the recapture a fact rather
-/// than a claim in a commit message, and it is why the `1.18.12` in the filename is
-/// harmless: the bytes are re-derived from [`PINNED_RELEASE`] on every run.
+/// than a claim in a commit message. The filename follows [`PINNED_RELEASE`], and
+/// the bytes are re-derived from that release on every run.
 #[tokio::test]
 async fn the_committed_openapi_capture_is_what_the_pinned_release_serves() {
     let Some(binary) = oracle_binary() else {

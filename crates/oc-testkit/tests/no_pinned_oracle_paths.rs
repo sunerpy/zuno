@@ -20,7 +20,7 @@
 //! A *comment* may name an old path: that is how the history of a defect stays
 //! readable, and a comment cannot select a binary. A fixture may still carry a
 //! release in its **file name** when its provenance is an executable assertion —
-//! `.omo/fixtures/oracle-openapi-1.18.12.json` is retained on exactly those terms,
+//! `.omo/fixtures/oracle-openapi-1.18.18.json` is retained on exactly those terms,
 //! because `compat_suite.rs` refetches `/doc` from the running pinned release and
 //! compares the bytes. A name that no test re-derives would be a claim, not a
 //! fixture.

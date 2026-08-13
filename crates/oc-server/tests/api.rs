@@ -327,7 +327,7 @@ fn fixture_operations(document: &Value) -> BTreeSet<(String, String)> {
 #[test]
 fn api_openapi_contains_every_owned_oracle_operation() {
     let oracle: Value = serde_json::from_str(include_str!(
-        "../../../.omo/fixtures/oracle-openapi-1.18.12.json"
+        "../../../.omo/fixtures/oracle-openapi-1.18.18.json"
     ))
     .expect("checked-in oracle OpenAPI parses");
     let generated = api::openapi();

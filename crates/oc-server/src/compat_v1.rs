@@ -84,7 +84,7 @@ pub const V1_DIAGNOSTICS_PATH: &str = "/compat/v1/diagnostics";
 /// The oracle's pre-`/api` surface has 25 distinct top-level segments;
 /// `event` is excluded because the SSE stream owns `/event` exactly, and mounting
 /// a second route on that path would panic at assembly. A test derives this set
-/// from `.omo/fixtures/oracle-openapi-1.18.12.json` and asserts equality, so the
+/// from `.omo/fixtures/oracle-openapi-1.18.18.json` and asserts equality, so the
 /// list cannot silently drift from the document it claims to mirror.
 pub const V1_PREFIXES: &[&str] = &[
     "agent",

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-const OPENAPI_CAPTURE: &str = "../../.omo/fixtures/oracle-openapi-1.18.12.json";
+const OPENAPI_CAPTURE: &str = "../../.omo/fixtures/oracle-openapi-1.18.18.json";
 const HTTP_METHODS: &[&str] = &[
     "delete", "get", "head", "options", "patch", "post", "put", "trace",
 ];
