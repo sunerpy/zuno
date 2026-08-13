@@ -54,7 +54,9 @@ impl CommandDispatcher for HeadlessCommandDispatcher {
             DispatchArguments::Debug(args) => {
                 debug::execute(args, &request.environment).map_err(to_error)
             }
-            DispatchArguments::Serve(args) => serve::execute(args).map_err(to_error),
+            DispatchArguments::Serve(args) => {
+                serve::execute(args, &request.environment).map_err(to_error)
+            }
             DispatchArguments::Run(args) => {
                 run::execute(args, &request.environment).map_err(to_error)
             }

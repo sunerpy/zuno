@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -15,8 +15,10 @@ use oc_paths::DbLocation;
 use oc_server::api::{self, ApiState};
 use oc_server::compat_v1::{TOAST_PATH, V1_DIAGNOSTICS_PATH, V1Method, v1_coverage};
 use oc_server::{
-    CompatV1State, DEFAULT_EVENT_SUBSCRIBER_CAPACITY, EventService, ServerBuilder, ServerConfig,
-    ServerServices, SessionCompactExecution, SessionMutationExecutor, SessionMutationFuture,
+    CompatV1State, DEFAULT_EVENT_SUBSCRIBER_CAPACITY, EventService, ProviderOAuthAuthorization,
+    ProviderOAuthAuthorizeRequest, ProviderOAuthBackend, ProviderOAuthCallbackRequest,
+    ProviderOAuthCompletion, ProviderOAuthFuture, ServerBuilder, ServerConfig, ServerServices,
+    SessionCompactExecution, SessionMutationExecutor, SessionMutationFuture,
     SessionPromptExecution, Toast, ToastForwarder, V1_PREFIXES, V1_SURFACE, compat_v1_router,
     events_router,
 };
@@ -325,8 +327,8 @@ fn plan_todo_citation(text: &str) -> Option<String> {
 fn compat_v1_router_derived_coverage_counts_only_registered_backends() {
     let coverage = v1_coverage();
     assert_eq!(coverage.measured, 20);
-    assert_eq!(coverage.served, 11);
-    assert_eq!(coverage.unbacked, 9);
+    assert_eq!(coverage.served, 14);
+    assert_eq!(coverage.unbacked, 6);
     assert_eq!(coverage.redirected, 0);
 }
 
@@ -1184,7 +1186,8 @@ async fn compat_v1_seam_route_names_its_sdk_method_and_callers() {
 
 #[tokio::test]
 async fn compat_v1_auth_set_seam_never_echoes_the_credential_it_was_sent() {
-    let app = compat_app(CompatV1State::new());
+    let temp = tempfile::tempdir().expect("temporary auth data root");
+    let (app, _) = auth_app(&temp, CompatV1State::new());
     let response = app
         .oneshot(request(
             Method::PUT,
@@ -1193,11 +1196,188 @@ async fn compat_v1_auth_set_seam_never_echoes_the_credential_it_was_sent() {
         ))
         .await
         .expect("the auth seam responds");
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(response.status(), StatusCode::OK);
     let body = serde_json::to_string(&response_json(response).await).expect("body re-serializes");
     assert!(
         !body.contains("sk-do-not-echo-me"),
         "the credential leaked into the response body: {body}"
+    );
+}
+
+fn auth_app(temp: &TempDir, compat: CompatV1State) -> (Router, oc_paths::Env) {
+    let env = oc_paths::Env::empty()
+        .with("HOME", temp.path().to_string_lossy().into_owned())
+        .with(
+            "XDG_DATA_HOME",
+            temp.path().join("data").to_string_lossy().into_owned(),
+        );
+    let api_state = ApiState::memory("/repo")
+        .expect("in-memory auth API state initializes")
+        .with_env(env.clone());
+    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
+        .with_routes(compat_v1_router(compat, api_state))
+        .router();
+    (app, env)
+}
+
+#[derive(Debug, Default)]
+struct RecordingProviderOAuth {
+    authorizations: Mutex<Vec<ProviderOAuthAuthorizeRequest>>,
+    callbacks: Mutex<Vec<ProviderOAuthCallbackRequest>>,
+}
+
+impl ProviderOAuthBackend for RecordingProviderOAuth {
+    fn authorize(
+        &self,
+        request: ProviderOAuthAuthorizeRequest,
+    ) -> ProviderOAuthFuture<ProviderOAuthAuthorization> {
+        self.authorizations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(request);
+        Box::pin(async {
+            Ok(ProviderOAuthAuthorization {
+                url: "https://device.example.test/authorize".to_owned(),
+                method: "auto".to_owned(),
+                instructions: "complete device authorization".to_owned(),
+            })
+        })
+    }
+
+    fn callback(
+        &self,
+        request: ProviderOAuthCallbackRequest,
+    ) -> ProviderOAuthFuture<Option<ProviderOAuthCompletion>> {
+        self.callbacks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(request);
+        Box::pin(async {
+            Ok(Some(ProviderOAuthCompletion {
+                provider_id: None,
+                credential: oc_auth::Credential::Api {
+                    key: oc_auth::Secret::new("kiro-recorded-access"),
+                    metadata: None,
+                },
+            }))
+        })
+    }
+}
+
+#[tokio::test]
+async fn compat_v1_auth_set_persists_the_recorded_antigravity_oauth_payload() {
+    let temp = tempfile::tempdir().expect("temporary auth data root");
+    let (app, env) = auth_app(&temp, CompatV1State::new());
+    let response = app
+        .oneshot(request(
+            Method::PUT,
+            "/auth/google",
+            Some(json!({
+                "type": "oauth",
+                "refresh": "antigravity-recorded-refresh",
+                "access": "",
+                "expires": 0
+            })),
+        ))
+        .await
+        .expect("the auth set route responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_json(response).await, json!(true));
+
+    let layout = oc_paths::Layout::resolve(&env);
+    let stored = oc_auth::AuthStore::resolve(&layout, &env)
+        .get("google")
+        .expect("the shared auth file remains readable");
+    assert_eq!(
+        stored,
+        Some(oc_auth::Credential::Oauth {
+            refresh: oc_auth::Secret::new("antigravity-recorded-refresh"),
+            access: oc_auth::Secret::new(""),
+            expires: 0,
+            account_id: None,
+            enterprise_url: None,
+        }),
+        "a 200 without this shared-auth.json mutation is a shaped no-op"
+    );
+}
+
+#[tokio::test]
+async fn compat_v1_kiro_oauth_authorize_invokes_method_zero_with_the_recorded_payload() {
+    let temp = tempfile::tempdir().expect("temporary auth data root");
+    let backend = Arc::new(RecordingProviderOAuth::default());
+    let state = CompatV1State::new()
+        .with_provider_oauth_backend(Arc::clone(&backend) as Arc<dyn ProviderOAuthBackend>);
+    let (app, _) = auth_app(&temp, state);
+    let response = app
+        .oneshot(request(
+            Method::POST,
+            "/provider/kiro-auth/oauth/authorize",
+            Some(json!({"method": 0})),
+        ))
+        .await
+        .expect("the OAuth authorize route responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await,
+        json!({
+            "url": "https://device.example.test/authorize",
+            "method": "auto",
+            "instructions": "complete device authorization"
+        })
+    );
+    assert_eq!(
+        *backend
+            .authorizations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner),
+        vec![ProviderOAuthAuthorizeRequest {
+            provider_id: "kiro-auth".to_owned(),
+            method: 0,
+            inputs: BTreeMap::new(),
+        }],
+        "a 200 without invoking Kiro method zero is a shaped no-op"
+    );
+}
+
+#[tokio::test]
+async fn compat_v1_kiro_oauth_callback_invokes_method_zero_and_persists_its_credential() {
+    let temp = tempfile::tempdir().expect("temporary auth data root");
+    let backend = Arc::new(RecordingProviderOAuth::default());
+    let state = CompatV1State::new()
+        .with_provider_oauth_backend(Arc::clone(&backend) as Arc<dyn ProviderOAuthBackend>);
+    let (app, env) = auth_app(&temp, state);
+    let response = app
+        .oneshot(request(
+            Method::POST,
+            "/provider/kiro-auth/oauth/callback",
+            Some(json!({"method": 0})),
+        ))
+        .await
+        .expect("the OAuth callback route responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_json(response).await, json!(true));
+    assert_eq!(
+        *backend
+            .callbacks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner),
+        vec![ProviderOAuthCallbackRequest {
+            provider_id: "kiro-auth".to_owned(),
+            method: 0,
+            code: None,
+        }],
+        "a 200 without invoking Kiro's retained callback is a shaped no-op"
+    );
+    let layout = oc_paths::Layout::resolve(&env);
+    assert_eq!(
+        oc_auth::AuthStore::resolve(&layout, &env)
+            .get("kiro-auth")
+            .expect("the shared auth file remains readable"),
+        Some(oc_auth::Credential::Api {
+            key: oc_auth::Secret::new("kiro-recorded-access"),
+            metadata: None,
+        }),
+        "the callback's successful credential must reach shared auth.json"
     );
 }
 

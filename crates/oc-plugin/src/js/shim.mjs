@@ -27,6 +27,7 @@
 
 import net from "node:net";
 import path from "node:path";
+import { Buffer } from "node:buffer";
 import { pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
 
@@ -310,7 +311,7 @@ async function loadSdk(entry, explicit) {
   throw err;
 }
 
-async function makeShell(entry) {
+async function makeShell(_entry) {
   // Bun's real `$` when available. Under node there is no Bun shell, and a
   // fabricated one would silently change what a plugin's shell calls do, so the
   // stub refuses loudly instead.
@@ -345,9 +346,19 @@ async function buildInput(params) {
   try {
     const sdk = await loadSdk(params.entry, params.sdkModule);
     from = sdk.from;
+    const password = process.env.OPENCODE_SERVER_PASSWORD;
+    const headers = password
+      ? {
+          Authorization: `Basic ${Buffer.from(
+            `${process.env.OPENCODE_SERVER_USERNAME ?? "opencode"}:${password}`,
+            "utf8",
+          ).toString("base64")}`,
+        }
+      : undefined;
     client = sdk.createOpencodeClient({
       baseUrl: params.serverUrl,
       directory: params.directory,
+      headers,
     });
   } catch (error) {
     if (!String(params.spec).startsWith("file:")) throw error;

@@ -185,7 +185,7 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
     }
 }
 
-pub(super) fn execute(args: &ServeArgs) -> Result<(), String> {
+pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Result<(), String> {
     if args.mdns {
         return Err("--mdns is not supported by the Rust server runtime yet".to_owned());
     }
@@ -196,10 +196,8 @@ pub(super) fn execute(args: &ServeArgs) -> Result<(), String> {
         return Err("--cors is not supported by the Rust server runtime yet".to_owned());
     }
 
-    let directory = std::env::current_dir()
-        .map_err(|error| error.to_string())?
-        .to_string_lossy()
-        .into_owned();
+    let directory_path = std::env::current_dir().map_err(|error| error.to_string())?;
+    let directory = directory_path.to_string_lossy().into_owned();
     let auth = AuthConfig::from_env();
     if !auth.required() {
         println!("Warning: OPENCODE_SERVER_PASSWORD is not set; server is unsecured.");
@@ -210,6 +208,21 @@ pub(super) fn execute(args: &ServeArgs) -> Result<(), String> {
         .build()
         .map_err(|error| error.to_string())?;
     runtime.block_on(async {
+        let env = environment.resolved();
+        let project = oc_paths::project::resolve_project(&directory_path);
+        let worktree = project
+            .vcs
+            .as_ref()
+            .map_or(directory_path.as_path(), |_| project.directory.as_path());
+        let layout = oc_paths::Layout::resolve(env);
+        let plugin_config =
+            oc_config::discovery::discover_with(&oc_config::discovery::DiscoveryOptions::new(
+                &directory_path,
+                Some(worktree),
+                env.clone(),
+            ))
+            .map_err(|error| error.report())?;
+        let compat = CompatV1State::new();
         let pool = Arc::new(oc_db::Pool::open_default().map_err(|error| error.to_string())?);
         let events = EventService::new(Arc::clone(&pool), DEFAULT_EVENT_SUBSCRIBER_CAPACITY);
         let config = ServerConfig::default()
@@ -229,11 +242,32 @@ pub(super) fn execute(args: &ServeArgs) -> Result<(), String> {
             .with_routes(
                 api::router(state.clone())
                     .merge(events_router(events))
-                    .merge(compat_v1_router(CompatV1State::new(), state)),
+                    .merge(compat_v1_router(compat.clone(), state)),
             )
             .bind()
             .await
             .map_err(|error| error.to_string())?;
+        let plugin_server_url = reqwest::Url::parse(&format!("http://{}", server.local_addr()))
+            .map_err(|error| error.to_string())?;
+        let plugins = super::plugin_runtime::PluginRuntime::load(
+            &plugin_config,
+            &project,
+            &directory_path,
+            worktree,
+            &layout,
+            env.flag(crate::OPENCODE_PURE),
+            super::plugin_runtime::PluginRuntimeTarget::server_with_stdio(
+                "serve",
+                plugin_server_url,
+            ),
+        )
+        .await
+        .map(Arc::new);
+        if let Some(plugins) = &plugins {
+            compat.set_provider_oauth_backend(
+                Arc::clone(plugins) as Arc<dyn oc_server::ProviderOAuthBackend>
+            );
+        }
         println!(
             "opencode server listening on http://{}",
             server.local_addr()
@@ -241,6 +275,10 @@ pub(super) fn execute(args: &ServeArgs) -> Result<(), String> {
         std::io::stdout()
             .flush()
             .map_err(|error| error.to_string())?;
-        server.serve().await.map_err(|error| error.to_string())
+        let result = server.serve().await.map_err(|error| error.to_string());
+        if let Some(plugins) = plugins {
+            plugins.shutdown().await;
+        }
+        result
     })
 }
