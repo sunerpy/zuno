@@ -313,7 +313,7 @@ impl CompatReport {
 /// entry then fails that test instead of quietly un-recording the gap.
 pub const TURN_PART_GAP_ID: &str = "assistant-turn-step-parts";
 
-/// The assistant part types release 1.18.15 persists for one plain single-step turn.
+/// The assistant part types release 1.18.18 persists for one plain single-step turn.
 ///
 /// Ordered as upstream writes them: `start-step` inserts `step-start`
 /// unconditionally — `snapshot.track()` may return nothing and the `updatePart` on
@@ -325,9 +325,9 @@ pub const UPSTREAM_TURN_PART_TYPES: &[&str] = &["step-start", "text", "step-fini
 
 /// The assistant part types this port persists for the same turn.
 ///
-/// Measured on the `run` path at release 1.18.15 in
-/// `.omo/evidence/task-136-opencode-rust.txt:191-215`, inside a git repository and
-/// outside one, so this is not the "`step-start` only carries a snapshot" case.
+/// Measured on the `run` path at release 1.18.18 in
+/// `.omo/evidence/task-178-opencode-rust.txt`, inside a git repository and outside
+/// one, so this is not the "`step-start` only carries a snapshot" case.
 pub const PORTED_TURN_PART_TYPES: &[&str] = &["text"];
 
 /// The part types [`UPSTREAM_TURN_PART_TYPES`] has and [`PORTED_TURN_PART_TYPES`]
@@ -359,7 +359,7 @@ pub fn turn_part_gap() -> KnownGap {
         detail: format!(
             "For one plain single-step turn the release persists [{upstream}] and this port \
              persists [{ported}], so [{missing}] is never written. Measured on the `run` path at \
-             1.18.15 in .omo/evidence/task-136-opencode-rust.txt:191-215, inside a git repository \
+             1.18.18 in .omo/evidence/task-178-opencode-rust.txt, inside a git repository \
              and outside one; the user's production database holds 280,859 step-start rows, so the \
              release's shape is the normal one rather than an artefact. This is a GAP and not a \
              declared divergence because nothing chose it: `oc-db` already models both types as \
@@ -487,8 +487,8 @@ pub fn v1_surface_gap(coverage: V1SurfaceCoverage) -> KnownGap {
     }
 }
 
-/// The gap recording that the v1 `/agent` body's shape is unclassified.
-pub const V1_AGENT_GAP_ID: &str = "v1-agent-projection-unverified";
+/// The gap recording the confirmed drift in the v1 `/agent` body's shape.
+pub const V1_AGENT_GAP_ID: &str = "v1-agent-projection-drift";
 
 /// The test name [`v1_agent_projection_gap`]'s detail points a reader at.
 pub const V1_AGENT_WITNESS: &str =
@@ -503,14 +503,13 @@ pub const V1_AGENT_WITNESS: &str =
 /// oracle *and* in the schema this build publishes at `/doc`, so the build was
 /// rejecting its own response, and the value was already one layer down.
 ///
-/// None of that holds here. Every oracle-**required** `Agent` key is served, this
-/// build publishes no `Agent` schema for the body to contradict, and the only
-/// committed capture is 1.18.12 while the port targets a later release — so the
-/// remaining difference is in optional keys measured against a stale contract.
-/// Choosing a shape from that would be inventing the missing capture, so the
-/// difference is recorded here unclassified rather than declared in
-/// `docs/divergences.toml`, which at lines 11-14 forbids recording something nobody
-/// decided as a decision.
+/// None of that holds here. Every oracle-**required** `Agent` key is served and this
+/// build publishes no `Agent` schema for the body to contradict. The 1.18.18 live
+/// `/doc` recapture is byte-identical to the committed capture, so the remaining
+/// optional-key difference is confirmed against the current executable pin rather
+/// than inferred from the fixture's 1.18.12 filename. It remains a gap rather than a
+/// declaration because no implementation decision chose the difference;
+/// `docs/divergences.toml` lines 11-14 forbid recording an omission as a decision.
 #[must_use]
 pub fn v1_agent_projection_gap() -> KnownGap {
     KnownGap {
@@ -526,12 +525,12 @@ pub fn v1_agent_projection_gap() -> KnownGap {
              and the `Session` slug omission the same review wave found, which was a defect \
              because the dropped key was required by the oracle AND by the OpenAPI this build \
              publishes at /doc, making the build contradict itself. Here the build publishes no \
-             `Agent` schema at all, and the only committed oracle capture is 1.18.12 while this \
-             port targets a later release, so whether the difference is upstream drift already \
-             corrected at the targeted version or a real omission cannot be settled without a \
-             capture at that version. Picking an answer would be inventing the evidence, so the \
-             difference is recorded unclassified: a gap, not a decision, which \
-             docs/divergences.toml:11-14 requires. Witnessed by \
+             `Agent` schema at all. The 1.18.18 live `/doc` recapture is byte-identical to the \
+             committed oracle capture, so this optional-key drift is confirmed against the \
+             current executable pin rather than inferred from the fixture's 1.18.12 filename. \
+             It remains a gap, not a declared divergence, because no implementation decision \
+             chose the difference; docs/divergences.toml:11-14 forbids recording an omission as \
+             a decision. Witnessed by \
              crates/oc-server/tests/compat_v1.rs::{witness}, which measures the served key set \
              against the oracle schema and fails if a required key is ever dropped or if this \
              build starts publishing an `Agent` schema of its own — either event ends the reason \

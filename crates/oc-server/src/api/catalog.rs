@@ -59,7 +59,8 @@ use super::state::ApiState;
 /// because `packages/core/src/plugin/{agent,command}.ts` carries its own revision of
 /// each. Measured against 1.18.12: the V2 `title` prompt writes `->` and `<=50`
 /// where v1 writes `→` and `≤50`, and V2's `review` template drops a sentence v1
-/// has. Both are correct for their own surface.
+/// has. Both are correct for their own surface. The compaction prompt was refreshed
+/// from the live 1.18.18 `/api/agent` response when that release changed its bytes.
 ///
 /// So `oc-catalog` keeps the v1 bytes untouched — other differentials pin them — and
 /// these assets carry the V2 bytes. The four prompts were captured from a live
@@ -88,7 +89,11 @@ mod v2 {
 fn v2_system(name: &str) -> Option<&'static str> {
     match name {
         "explore" => Some(v2::PROMPT_EXPLORE),
-        "compaction" => Some(v2::PROMPT_COMPACTION),
+        "compaction" => Some(
+            v2::PROMPT_COMPACTION
+                .strip_suffix('\n')
+                .unwrap_or(v2::PROMPT_COMPACTION),
+        ),
         "title" => Some(v2::PROMPT_TITLE),
         "summary" => Some(v2::PROMPT_SUMMARY),
         _ => None,

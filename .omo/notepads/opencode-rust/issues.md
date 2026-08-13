@@ -7585,3 +7585,24 @@ must move together: changing only the handler can still leave diagnostics claimi
 changing only `V1_SURFACE.backing` makes the declared-backing regression fail. All three guarded
 effect mutations failed again after reconstruction; the detailed output is appended to the task
 evidence file.
+
+## Task 178 — the 1.18.18 recapture closed a stale-contract premise
+
+The live 1.18.18 `/doc` response is byte-identical to the committed
+`.omo/fixtures/oracle-openapi-1.18.12.json` capture (478,747 bytes, sha256
+`c3a9f94af0c3324d97b482b14c692e810ce7ccac3136319ba46334de972b4cf1`, 58 `/api`
+operations). This invalidated the `v1-agent-projection-unverified` gap's premise that the
+optional-key drift could not be classified without a target-version capture.
+
+The drift is now confirmed against the executable pin and recorded as
+`v1-agent-projection-drift`. It remains a known gap, not a `docs/divergences.toml`
+decision: every required Agent key is served, but three undeclared optional keys are added
+and six declared optional keys are omitted, with no implementation decision choosing that
+shape. The existing `compat_v1_agent_projection_drift_is_recorded_and_drops_no_required_key`
+witness still passes and the compatibility matrix is regenerated from the corrected source.
+
+No new 1.18.18 CLI behavior difference was found: all five oracle-blocked live
+differentials and all 16 parity probes passed under the existing declarations and narrow
+normalization rules. The full API matrix did find one non-CLI asset change: the built-in
+`compaction` agent's system prompt changed. Updating the V2 prompt asset from live
+`GET /api/agent` restored exact body parity; no normalization or divergence was added.

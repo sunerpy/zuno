@@ -54,7 +54,7 @@
 //! They compare transcript **growth**, not transcript **shape**. That exemption is
 //! load-bearing and was measured rather than assumed: for one assistant turn the
 //! release writes four parts — `text`, `step-start`, `text`, `step-finish` — while
-//! this port writes two, `text` and `text`. Reproduced at release 1.18.15 on the
+//! this port writes two, `text` and `text`. Reproduced at release 1.18.18 on the
 //! `run` path, in a git repository and outside one, so it is not the "`step-start`
 //! only carries a snapshot" case.
 //!
@@ -97,7 +97,7 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(120);
 /// The marker upstream's own title prompt opens with.
 ///
 /// From `packages/opencode/src/session/prompt/title.txt`, observed verbatim in the
-/// captured request bodies of both binaries at release 1.18.15. Classifying on the
+/// captured request bodies of both binaries at release 1.18.18. Classifying on the
 /// prompt the *client* sends — rather than on a request counter — is what makes
 /// these tests independent of how many preludes a run makes.
 const TITLE_PROMPT_MARKER: &str = "You are a title generator";

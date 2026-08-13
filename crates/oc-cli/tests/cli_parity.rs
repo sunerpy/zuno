@@ -299,7 +299,7 @@ static PARITY_ROWS: &[ParityRow] = &[
                     "the refusal is the same refusal in different words — upstream says `You must \
                      provide a message or a command`, this port says `a message is required` — and \
                      it falls under the declared `diagnostics-name-their-cause` divergence. The \
-                     command's real work is not comparable at all: measured on release 1.18.15 \
+                     command's real work is not comparable at all: measured on release 1.18.18 \
                      under this same cleared environment, `run --agent nosuch hi` ANSWERED from \
                      the bundled `opencode/big-pickle` gateway model with no credential present, \
                      so comparing a turn means making a live provider call. `oc-testkit` has no \
@@ -320,7 +320,7 @@ static PARITY_ROWS: &[ParityRow] = &[
                 stdout: Stream::Compared,
                 stderr: Stream::Exempt(
                     "the third surface the declared `diagnostics-name-their-cause` divergence \
-                     names, and the one where the difference is widest. Measured on 1.18.15 under \
+                     names, and the one where the difference is widest. Measured on 1.18.18 under \
                      this cleared environment, upstream answers an unresolvable model with a JSON \
                      `UnknownError` whose whole actionable content is `Unexpected server error. \
                      Check server logs for details.` plus a `ref` that is a fresh random id on \
@@ -365,7 +365,7 @@ static PARITY_ROWS: &[ParityRow] = &[
                  98)`. That is the declared `diagnostics-name-their-cause` divergence, and this \
                  port's message embeds the address it tried, so the two texts cannot be made equal \
                  without deleting information a user needs. The probe binds an occupied port \
-                 because a bare `serve` listens forever: measured on 1.18.15, it never exits, so \
+                 because a bare `serve` listens forever: measured on 1.18.18, it never exits, so \
                  there is no output to compare.",
             ),
             witness: Witness::DocumentedDiagnostics {

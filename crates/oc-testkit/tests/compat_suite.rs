@@ -73,7 +73,8 @@ const PINNED_RELEASE: &str = oc_testkit::PINNED_RELEASE;
 ///
 /// Recaptured from [`PINNED_RELEASE`] for todo 130 by serving `/doc` under an
 /// isolated XDG world. The bytes are **identical** to the 1.18.12 capture the name
-/// records — 1.18.12, 1.18.13, 1.18.14 and 1.18.15 all emit the same 478,747-byte
+/// records — 1.18.12, 1.18.13, 1.18.14, 1.18.15 and 1.18.18 all emit the same
+/// 478,747-byte
 /// document, sha256 `c3a9f94af0c3324d97b482b14c692e810ce7ccac3136319ba46334de972b4cf1`
 /// — so the filename is the capture's provenance, not a claim that the document is
 /// version-specific. That equality is not taken on trust:
@@ -82,7 +83,7 @@ const PINNED_RELEASE: &str = oc_testkit::PINNED_RELEASE;
 const ORACLE_OPENAPI_FIXTURE: &str = ".omo/fixtures/oracle-openapi-1.18.12.json";
 
 /// Upstream `/api` operations the capture declares. Unchanged from the 1.18.12
-/// capture, because the document is byte-identical across all four installed
+/// capture, because the document is byte-identical across all five installed
 /// releases.
 const UPSTREAM_API_OPERATIONS: usize = 58;
 
