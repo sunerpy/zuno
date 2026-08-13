@@ -7,14 +7,52 @@ use std::time::Duration;
 
 use oc_engine::retry::{
     MAX_CONTEXT_LIMIT_RETRIES, MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS,
-    MAX_INCOMPLETE_CONTINUATION_ATTEMPTS, ProviderRetryError, ProviderRetryPolicy, RecoveryAttempt,
-    RecoveryBudget, RecoveryBudgets, RetryError, retry_provider_with_sleep,
+    MAX_INCOMPLETE_CONTINUATION_ATTEMPTS, PROVIDER_RETRY_MAX_ATTEMPTS, ProviderRetryError,
+    ProviderRetryPolicy, RecoveryAttempt, RecoveryBudget, RecoveryBudgets, RetryError,
+    retry_provider, retry_provider_with_sleep,
 };
 use oc_error::ProviderError;
 use oc_llm::event::StreamEvent;
 
 fn policy(max_attempts: u32) -> ProviderRetryPolicy {
     ProviderRetryPolicy::new(NonZeroU32::new(max_attempts).expect("non-zero test policy"))
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_total_elapsed_never_exceeds_three_minutes() {
+    for (max_attempts, idle_window) in [
+        (PROVIDER_RETRY_MAX_ATTEMPTS, Duration::from_secs(120)),
+        (
+            PROVIDER_RETRY_MAX_ATTEMPTS.saturating_mul(10),
+            Duration::from_secs(120),
+        ),
+        (PROVIDER_RETRY_MAX_ATTEMPTS, Duration::from_secs(240)),
+    ] {
+        let started = tokio::time::Instant::now();
+        let result = retry_provider(
+            policy(max_attempts),
+            |_| async {
+                tokio::time::sleep(idle_window).await;
+                Err::<(), _>(ProviderError::Transient {
+                    status: None,
+                    source: None,
+                })
+            },
+            |_| ready(Ok::<(), std::io::Error>(())),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ProviderRetryError::DeadlineExceeded { .. })),
+            "repeated status-less stalls must end with a typed retry error: {result:?}"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed <= Duration::from_secs(180),
+            "provider retry wall time reached {elapsed:?} with max_attempts={max_attempts} and \
+             idle_window={idle_window:?}, above the three-minute ceiling"
+        );
+    }
 }
 
 fn assert_budget<F>(budget: RecoveryBudget, limit: u32, mut record: F)

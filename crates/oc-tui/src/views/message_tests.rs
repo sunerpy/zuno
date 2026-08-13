@@ -217,15 +217,44 @@ fn views_retry_rollback_discards_the_interrupted_attempt() {
     transcript.observe(&provider(StreamEvent::TextDelta(String::from("whole"))));
 
     let parts = &transcript.messages()[0].parts;
+    let text_parts = parts
+        .iter()
+        .filter_map(MessagePart::text)
+        .collect::<Vec<_>>();
     assert_eq!(
-        parts.len(),
-        1,
+        text_parts,
+        ["whole"],
         "the discarded attempt was kept alongside the replay: {parts:?}"
     );
+}
+
+#[test]
+fn views_retry_rollback_notice_is_visible_in_the_error_colour() {
+    let context = ViewContext::defaults();
+    let mut view = TranscriptView::new(context.clone());
+    view.handle_event(&AppEvent::Engine(started()));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::TextDelta(
+        String::from("discard me"),
+    ))));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::RetryRollback {
+        attempt: 2,
+        max: 3,
+    })));
+
+    let buffer = render_offscreen(&mut view, 56, 5).expect("infallible");
+    let rendered_rows = rows(&buffer);
+    let retry_row = rendered_rows
+        .iter()
+        .position(|row| row.contains("Retrying provider request (attempt 2/3)"))
+        .expect("retry notice is rendered");
+    assert!(
+        !rendered_rows.join("\n").contains("discard me"),
+        "rollback kept the failed attempt: {rendered_rows:?}"
+    );
     assert_eq!(
-        parts[0].text(),
-        Some("whole"),
-        "rollback did not discard the interrupted text"
+        buffer[(0, u16::try_from(retry_row).expect("test row fits u16"))].fg,
+        ratatui::style::Color::from(context.palette.error),
+        "retry notice did not use the theme's red/error colour"
     );
 }
 

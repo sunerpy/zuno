@@ -2001,6 +2001,10 @@ fn every_turn_error() -> Vec<TurnError> {
             status: Some(400),
             source: None,
         }),
+        TurnError::ProviderRetryDeadlineExceeded {
+            attempt: 2,
+            elapsed: std::time::Duration::from_secs(180),
+        },
         TurnError::Cache(oc_llm::cache::CacheViolation::StaticPrefixChanged { turn: 2 }),
     ]
 }
@@ -2049,6 +2053,7 @@ fn the_variant_table_covers_the_whole_enum() {
             TurnError::Hook(_) => "Hook",
             TurnError::Database(_) => "Database",
             TurnError::Provider(_) => "Provider",
+            TurnError::ProviderRetryDeadlineExceeded { .. } => "ProviderRetryDeadlineExceeded",
             TurnError::Cache(_) => "Cache",
         };
         named.insert(name);
@@ -2056,7 +2061,7 @@ fn the_variant_table_covers_the_whole_enum() {
 
     assert_eq!(
         named.len(),
-        13,
+        14,
         "the table covers only {named:?}; every variant needs a value or the rendering \
          claims above are vacuous for the ones missing"
     );

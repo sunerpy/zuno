@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use oc_error::ProviderError;
 use oc_llm::event::StreamEvent;
+use oc_llm::sse::MAX_PROVIDER_WAIT;
 
 /// Bounds repeated compaction when a conversation still exceeds the context
 /// window after the compactor has already tried to make it fit.
@@ -28,6 +29,16 @@ pub const MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS: u32 = 5;
 pub const RETRY_INITIAL_DELAY: Duration = Duration::from_secs(2);
 
 pub const RETRY_MAX_DELAY_WITHOUT_PROVIDER: Duration = Duration::from_secs(30);
+
+/// Maximum provider calls in one recovery sequence.
+pub const PROVIDER_RETRY_MAX_ATTEMPTS: u32 = 3;
+
+/// Hard wall-clock budget for one provider recovery sequence.
+///
+/// This derives from the shared provider wait policy rather than multiplying an
+/// attempt count by an idle timeout. Either factor may change without enlarging
+/// this deadline.
+pub const PROVIDER_RETRY_MAX_ELAPSED: Duration = MAX_PROVIDER_WAIT;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryBudget {
@@ -139,17 +150,26 @@ impl RecoveryBudgets {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderRetryPolicy {
     max_attempts: NonZeroU32,
+    max_elapsed: Duration,
 }
 
 impl ProviderRetryPolicy {
     #[must_use]
     pub const fn new(max_attempts: NonZeroU32) -> Self {
-        Self { max_attempts }
+        Self {
+            max_attempts,
+            max_elapsed: PROVIDER_RETRY_MAX_ELAPSED,
+        }
     }
 
     #[must_use]
     pub const fn max_attempts(self) -> NonZeroU32 {
         self.max_attempts
+    }
+
+    #[must_use]
+    pub const fn max_elapsed(self) -> Duration {
+        self.max_elapsed
     }
 
     #[must_use]
@@ -173,6 +193,8 @@ where
         #[source]
         source: ProviderError,
     },
+    #[error("provider retry deadline exceeded on attempt {attempt} after {elapsed:?}")]
+    DeadlineExceeded { attempt: u32, elapsed: Duration },
     #[error("failed to emit RetryRollback before provider retry")]
     RollbackEmission {
         #[source]
@@ -228,10 +250,18 @@ where
     SleepFuture: Future<Output = ()>,
 {
     let max = policy.max_attempts().get();
+    let started = tokio::time::Instant::now();
+    let deadline = started + policy.max_elapsed();
     let mut attempt = 1_u32;
 
     loop {
-        match operation(attempt).await {
+        let result = tokio::time::timeout_at(deadline, operation(attempt))
+            .await
+            .map_err(|_| ProviderRetryError::DeadlineExceeded {
+                attempt,
+                elapsed: started.elapsed(),
+            })?;
+        match result {
             Ok(output) => return Ok(output),
             Err(error) if !error.is_retryable() => {
                 return Err(ProviderRetryError::Provider(error));
@@ -245,15 +275,33 @@ where
             Err(error) => {
                 let delay = policy.delay_after(attempt, &error);
                 let next_attempt = attempt + 1;
-                emit(StreamEvent::RetryRollback {
-                    attempt: next_attempt,
-                    max,
-                })
+                if delay >= deadline.saturating_duration_since(tokio::time::Instant::now()) {
+                    return Err(ProviderRetryError::DeadlineExceeded {
+                        attempt,
+                        elapsed: started.elapsed(),
+                    });
+                }
+                tokio::time::timeout_at(
+                    deadline,
+                    emit(StreamEvent::RetryRollback {
+                        attempt: next_attempt,
+                        max,
+                    }),
+                )
                 .await
+                .map_err(|_| ProviderRetryError::DeadlineExceeded {
+                    attempt,
+                    elapsed: started.elapsed(),
+                })?
                 .map_err(|source| ProviderRetryError::RollbackEmission {
                     source: Box::new(source),
                 })?;
-                sleep(delay).await;
+                tokio::time::timeout_at(deadline, sleep(delay))
+                    .await
+                    .map_err(|_| ProviderRetryError::DeadlineExceeded {
+                        attempt,
+                        elapsed: started.elapsed(),
+                    })?;
                 attempt = next_attempt;
             }
         }

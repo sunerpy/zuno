@@ -194,6 +194,13 @@ projection is typed, remove it and prove the removal changes nothing observable.
 
 ## FU-7. Cap the retry worst case at 3 minutes and make retrying visible
 
+**Status: CLOSED (2026-08-13)** — the engine now enforces a shared 180-second absolute
+provider deadline independent of attempt and idle-timeout factors. Plain `run` and the TUI render
+`RetryRollback` as a red human-readable attempt notice, while non-TTY output remains escape-free
+and the JSON shape remains unchanged. Paused-time regressions, partial-output checks, changed-file
+diagnostics, and controlled ceiling/visibility/factor mutations all passed; the final workspace
+gates are recorded in `.omo/evidence/task-fu7-opencode-rust.txt`.
+
 **Source**: the user, 2026-08-13, on reviewing FU-1's measured timing bound:
 *"需要优化 6 分钟的重试，可以选择性增加一些必要输出（比如红色的重试中），最长 3 分钟的时间是极限了"*.
 

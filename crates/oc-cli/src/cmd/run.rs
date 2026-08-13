@@ -7,7 +7,7 @@
 //! that a tool, a permission rule, or a session-resolution fix cannot land on one
 //! surface and miss the other.
 
-use std::io::{IsTerminal as _, Read as _, Write as _};
+use std::io::{IsTerminal as _, Read as _, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -119,9 +119,33 @@ fn prompt(args: &RunArgs) -> Result<String, String> {
 }
 
 async fn render_events(
-    mut receiver: tokio::sync::mpsc::Receiver<TurnEvent>,
+    receiver: tokio::sync::mpsc::Receiver<TurnEvent>,
     format: RunFormat,
 ) -> Result<(), String> {
+    let stderr_is_terminal = std::io::stderr().is_terminal();
+    let mut stdout = std::io::stdout().lock();
+    let mut stderr = std::io::stderr().lock();
+    render_events_to(
+        receiver,
+        format,
+        &mut stdout,
+        &mut stderr,
+        stderr_is_terminal,
+    )
+    .await
+}
+
+async fn render_events_to<Stdout, Stderr>(
+    mut receiver: tokio::sync::mpsc::Receiver<TurnEvent>,
+    format: RunFormat,
+    stdout: &mut Stdout,
+    stderr: &mut Stderr,
+    stderr_is_terminal: bool,
+) -> Result<(), String>
+where
+    Stdout: Write,
+    Stderr: Write,
+{
     let mut wrote_text = false;
     while let Some(event) = receiver.recv().await {
         match format {
@@ -130,33 +154,56 @@ async fn render_events(
                     event: StreamEvent::TextDelta(text),
                     ..
                 } => {
-                    print!("{text}");
-                    std::io::stdout().flush().map_err(to_string)?;
+                    write!(stdout, "{text}").map_err(to_string)?;
+                    stdout.flush().map_err(to_string)?;
                     wrote_text = true;
                 }
                 TurnEvent::Provider {
                     event: StreamEvent::Error { message, .. },
                     ..
-                } => eprintln!("{message}"),
-                TurnEvent::ToolDispatchStarted { name, .. } => eprintln!("[{name}] started"),
+                } => writeln!(stderr, "{message}").map_err(to_string)?,
+                TurnEvent::Provider {
+                    event: StreamEvent::RetryRollback { attempt, max },
+                    ..
+                } => write_retry_notice(stderr, attempt, max, stderr_is_terminal)
+                    .map_err(to_string)?,
+                TurnEvent::ToolDispatchStarted { name, .. } => {
+                    writeln!(stderr, "[{name}] started").map_err(to_string)?;
+                }
                 TurnEvent::ToolDispatchCompleted {
                     name,
                     title,
                     is_error,
                     ..
-                } => eprintln!(
+                } => writeln!(
+                    stderr,
                     "[{name}] {}: {title}",
                     if is_error { "failed" } else { "completed" }
-                ),
+                )
+                .map_err(to_string)?,
                 _ => {}
             },
-            RunFormat::Json => println!("{}", event_json(event)),
+            RunFormat::Json => writeln!(stdout, "{}", event_json(event)).map_err(to_string)?,
         }
     }
     if format == RunFormat::Default && wrote_text {
-        println!();
+        writeln!(stdout).map_err(to_string)?;
     }
     Ok(())
+}
+
+fn write_retry_notice(
+    writer: &mut impl Write,
+    attempt: u32,
+    max: u32,
+    use_color: bool,
+) -> std::io::Result<()> {
+    let notice = format!("Retrying provider request (attempt {attempt}/{max})");
+    if use_color {
+        writeln!(writer, "\x1b[31m{notice}\x1b[0m")
+    } else {
+        writeln!(writer, "{notice}")
+    }
 }
 
 fn event_json(event: TurnEvent) -> Value {
@@ -417,5 +464,55 @@ mod tests {
         })
         .await
         .expect("bounded channel must be consumed concurrently");
+    }
+
+    async fn rendered_retry_notice(stderr_is_terminal: bool) -> (Vec<u8>, Vec<u8>) {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .send(TurnEvent::Provider {
+                step: 1,
+                event: StreamEvent::RetryRollback { attempt: 2, max: 3 },
+            })
+            .await
+            .expect("renderer remains connected");
+        drop(sender);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        render_events_to(
+            receiver,
+            RunFormat::Default,
+            &mut stdout,
+            &mut stderr,
+            stderr_is_terminal,
+        )
+        .await
+        .expect("retry notice renders");
+        (stdout, stderr)
+    }
+
+    #[tokio::test]
+    async fn run_retry_rollback_notice_is_red_on_tty_and_plain_off_tty() {
+        let (tty_stdout, tty_stderr) = rendered_retry_notice(true).await;
+        assert!(tty_stdout.is_empty());
+        assert_eq!(
+            tty_stderr,
+            b"\x1b[31mRetrying provider request (attempt 2/3)\x1b[0m\n"
+        );
+
+        let (pipe_stdout, pipe_stderr) = rendered_retry_notice(false).await;
+        assert!(pipe_stdout.is_empty());
+        assert_eq!(pipe_stderr, b"Retrying provider request (attempt 2/3)\n");
+        assert!(
+            !pipe_stderr.contains(&0x1b),
+            "non-TTY retry output contains an escape sequence: {pipe_stderr:?}"
+        );
+    }
+
+    #[test]
+    fn run_retry_rollback_json_contract_is_unchanged() {
+        assert_eq!(
+            stream_event_json(7, StreamEvent::RetryRollback { attempt: 2, max: 3 }),
+            json!({"type":"retry_rollback","step":7,"attempt":2,"max":3})
+        );
     }
 }

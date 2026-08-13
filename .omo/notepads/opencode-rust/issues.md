@@ -7835,3 +7835,27 @@ The `lsp_diagnostics` MCP again rejected the sibling worktree because it is root
 the main request cwd. Direct `rust-analyzer diagnostics .` completed in the FU-5
 worktree with no errors; output contained only the repository's existing `#[cfg]`
 inactive-code weak warnings.
+## [2026-08-13] FU-7 — provider retry has one absolute 180-second budget
+
+FU-1's three attempts composed with the compatible transport's 120-second idle
+window into a roughly 366-second pre-output worst case. FU-7 replaces that
+factor-derived bound with an absolute engine deadline derived from
+`oc_llm::sse::MAX_PROVIDER_WAIT`; the compatible transport cap derives from the
+same constant. Increasing attempts from 3 to 30 or the default idle timeout from
+120 to 240 seconds leaves the paused-time total-bound test at or below 180
+seconds. Removing the deadline makes that named test fail.
+
+`RetryRollback` still clears failed-attempt parts before replay, but is no longer
+silent: plain `run` writes an attempt/max notice to stderr and the TUI adds an
+error-themed retry part. The plain renderer uses `std::io::IsTerminal`: TTY output
+is red, while pipes and logs receive the same text without ANSI. JSON continues to
+emit the existing `retry_rollback` object unchanged. Removing the plain notice
+makes the named visibility regression fail. A status-less idle failure after any
+generated text still preserves that text, surfaces immediately, and is never
+replayed.
+
+The sibling worktree could not be addressed directly by the MCP LSP root, so the
+exact diff was applied to a temporary detached worktree inside the accepted root;
+all ten changed Rust files reported no diagnostics, and that temporary worktree
+was removed. Detailed reproduction, targeted tests, mutations, disk guards, and
+workspace gates are in `.omo/evidence/task-fu7-opencode-rust.txt`.

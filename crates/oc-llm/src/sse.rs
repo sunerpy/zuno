@@ -16,6 +16,14 @@ use serde::de::DeserializeOwned;
 /// Environment override for the maximum gap between streamed chunks.
 pub const STREAM_IDLE_TIMEOUT_ENV: &str = "OPENCODE_STREAM_IDLE_TIMEOUT_SECS";
 
+/// Longest user-visible wait budget for one provider recovery sequence.
+///
+/// Compatible transports also cap one silent response window at this value. The
+/// retry executor derives its total deadline from the same constant, so changing
+/// an attempt count or an idle default cannot accidentally restore a multi-window
+/// hang.
+pub const MAX_PROVIDER_WAIT: Duration = Duration::from_secs(180);
+
 /// Default idle allowance for reasoning models that may pause before emitting.
 pub const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 300;
 
