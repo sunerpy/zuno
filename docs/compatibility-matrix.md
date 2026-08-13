@@ -84,9 +84,9 @@ loses and, where one exists, the test that fails if the gap closes or goes stale
 
 ### v1-surface-unbacked
 
-**Surface.** 9 of the 20 measured pre-/api (v1) routes the installed plugins actually call
+**Surface.** 6 of the 20 measured pre-/api (v1) routes the installed plugins actually call
 
-**What is missing.** The pre-/api surface exists because the published SDK sends unprefixed paths, so every resident plugin talks to it. It registers 20 routes, each with a recorded plugin callsite, and 11 do real local work. Ten adapters reuse the corresponding /api implementations for app.agents, provider.list, session.list, session.create, session.get, session.abort, session.summarize, session.messages, session.prompt and session.promptAsync. POST /tui/show-toast remains a recording sink rather than a display — no server entry point attaches a forwarder (crates/oc-server/src/main.rs and crates/oc-cli/src/cmd/serve.rs both build a bare CompatV1State::new). 9 of the 20 answer `501 not_implemented`. 0 of those 9 name a served /api alternative; the other 9 have no served /api spelling at all — auth.set, app.log, config.get, the two provider.oauth calls, session.status, session.update, session.children and session.todo — so a plugin that needs one has no working call today; concretely, the installed auth plugins reach a registered route for every request they issue and can deliver toasts, but cannot authenticate through this surface. This is a GAP and not a declared divergence because nothing chose it, and docs/divergences.toml:11-14 forbids recording an unimplemented surface as a decision. Witnessed by crates/oc-server/tests/compat_v1.rs::compat_v1_declared_backing_matches_what_the_router_answers, which drives every route and fails if a declared status disagrees with what the router answers.
+**What is missing.** The pre-/api surface exists because the published SDK sends unprefixed paths, so every resident plugin talks to it. It registers 20 routes, each with a recorded plugin callsite, and 14 do real local work. Ten adapters reuse the corresponding /api implementations for app.agents, provider.list, session.list, session.create, session.get, session.abort, session.summarize, session.messages, session.prompt and session.promptAsync. Three local authentication backends persist auth.set credentials and invoke the installed provider OAuth authorize/callback closures. POST /tui/show-toast remains a recording sink rather than a display — no server entry point attaches a forwarder (crates/oc-server/src/main.rs and crates/oc-cli/src/cmd/serve.rs both build a bare CompatV1State::new). 6 of the 20 answer `501 not_implemented`. 0 of those 6 name a served /api alternative; the other 6 have no served /api spelling at all — app.log, config.get, session.status, session.update, session.children and session.todo — so a plugin that needs one has no working call today. The installed auth plugins' measured authentication routes are served; the remaining gaps are non-authentication operations. This is a GAP and not a declared divergence because nothing chose it, and docs/divergences.toml:11-14 forbids recording an unimplemented surface as a decision. Witnessed by crates/oc-server/tests/compat_v1.rs::compat_v1_declared_backing_matches_what_the_router_answers, which drives every route and fails if a declared status disagrees with what the router answers.
 
 ### v1-agent-projection-unverified
 
@@ -279,13 +279,13 @@ route table the server serves.
 <!-- generated:BEGIN v1-routes -->
 | method | path | SDK method | backing | `/api` alternative |
 |---|---|---|---|---|
-| PUT | `/auth/{providerID}` | `client.auth.set` | not-implemented | none served here |
+| PUT | `/auth/{providerID}` | `client.auth.set` | local-auth-store | none served here |
 | POST | `/log` | `client.app.log` | not-implemented | none served here |
 | GET | `/agent` | `client.app.agents` | api-adapter:agent | `GET /api/agent` |
 | GET | `/config` | `client.config.get` | not-implemented | none served here |
 | GET | `/provider` | `client.provider.list` | api-adapter:provider | `GET /api/provider` |
-| POST | `/provider/{providerID}/oauth/authorize` | `client.provider.oauth.authorize` | not-implemented | none served here |
-| POST | `/provider/{providerID}/oauth/callback` | `client.provider.oauth.callback` | not-implemented | none served here |
+| POST | `/provider/{providerID}/oauth/authorize` | `client.provider.oauth.authorize` | local-provider-oauth | none served here |
+| POST | `/provider/{providerID}/oauth/callback` | `client.provider.oauth.callback` | local-provider-oauth | none served here |
 | GET | `/session` | `client.session.list` | api-adapter:session-list | `GET /api/session` |
 | POST | `/session` | `client.session.create` | api-adapter:session-create | `POST /api/session` |
 | GET | `/session/status` | `client.session.status` | not-implemented | none served here |

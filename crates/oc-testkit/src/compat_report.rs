@@ -461,16 +461,18 @@ pub fn v1_surface_gap(coverage: V1SurfaceCoverage) -> KnownGap {
              recorded plugin callsite, and {served} do real local work. Ten adapters reuse the \
              corresponding /api implementations for app.agents, provider.list, session.list, \
              session.create, session.get, session.abort, session.summarize, session.messages, \
-             session.prompt and session.promptAsync. POST /tui/show-toast remains a recording sink \
+             session.prompt and session.promptAsync. Three local authentication backends persist \
+             auth.set credentials and invoke the installed provider OAuth authorize/callback \
+             closures. POST /tui/show-toast remains a recording sink \
              rather than a display — no server entry point attaches a forwarder \
              (crates/oc-server/src/main.rs and crates/oc-cli/src/cmd/serve.rs both build a bare \
              CompatV1State::new). {unbacked} of the {measured} answer `501 not_implemented`. \
              {redirected} of those {unbacked} name a served /api alternative; the other {stranded} \
-             have no served /api spelling at all — auth.set, app.log, config.get, the two provider.oauth calls, \
-             session.status, session.update, session.children and session.todo — so a plugin that \
-             needs one has no working call today; concretely, the installed auth plugins reach a \
-             registered route for every request they issue and can deliver toasts, but cannot \
-             authenticate through this surface. This is a GAP and not a declared divergence \
+             have no served /api spelling at all — app.log, config.get, session.status, \
+             session.update, session.children and session.todo — so a plugin that needs one has no \
+             working call today. The installed auth plugins' measured authentication routes are \
+             served; the remaining gaps are non-authentication operations. This is a GAP and not a \
+             declared divergence \
              because nothing chose it, and docs/divergences.toml:11-14 \
              forbids recording an unimplemented surface as a decision. Witnessed by \
              crates/oc-server/tests/compat_v1.rs::{witness}, which drives every route and fails \

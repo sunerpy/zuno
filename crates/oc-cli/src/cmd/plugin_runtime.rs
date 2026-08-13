@@ -12,14 +12,16 @@ use oc_engine::hooks::{
     HookMessageWithParts, PermissionHookDecision, RequestHookInput, ToolHooks, TurnHooks,
 };
 use oc_engine::terminal_lease::{
-    LeaseReason, TerminalLease, TerminalLeaseError, TerminalLeaseGuard,
+    LeaseReason, ReclaimCause, TerminalBroker, TerminalLease, TerminalLeaseError,
+    TerminalLeaseGuard, TerminalOwner,
 };
 use oc_llm::catalog::availability::AvailabilitySource;
 use oc_llm::catalog::resolved::{ResolvedModel as CatalogModel, ResolvedProvider};
 use oc_llm::registry::CompletionRequest;
 use oc_permission::PermissionRequest;
 use oc_plugin::{
-    AuthCredentialResolver, ChatContext, ChatHeadersOutput, ChatMessageInput, ChatMessageOutput,
+    AuthCallbackResult, AuthCredentialResolver, AuthMethod, AuthOAuthCallback, AuthSuccess,
+    ChatContext, ChatHeadersOutput, ChatMessageInput, ChatMessageOutput,
     ChatMessagesTransformOutput, ChatParamsOutput, ChatSystemTransformInput,
     ChatSystemTransformOutput, CommandExecuteBeforeInput, CommandExecuteBeforeOutput,
     CompactionAutocontinueInput, CompactionAutocontinueOutput, ConfigDirectory, HookBus,
@@ -31,6 +33,10 @@ use oc_plugin::{
     TextCompleteInput, TextCompleteOutput, ToolDefinitionInput, ToolExecuteAfterInput,
     ToolExecuteBeforeInput, ToolExecuteBeforeOutput, discover_plugins, load_js_plugins_ordered,
 };
+use oc_server::{
+    ProviderOAuthAuthorization, ProviderOAuthAuthorizeRequest, ProviderOAuthBackend,
+    ProviderOAuthCallbackRequest, ProviderOAuthCompletion, ProviderOAuthFuture,
+};
 use oc_tool::{ToolDefinition, ToolOutput};
 use oc_tools::shell::{ShellEnvHook, ShellEnvInput};
 use serde_json::{Map, Value};
@@ -39,6 +45,7 @@ pub(crate) struct PluginRuntime {
     load: JsPluginLoad,
     bus: HookBus,
     providers: RwLock<BTreeMap<String, ResolvedProvider>>,
+    oauth_callbacks: Arc<Mutex<BTreeMap<(String, usize), AuthOAuthCallback>>>,
     reported_diagnostics: Mutex<usize>,
     shutdown: AtomicBool,
 }
@@ -46,6 +53,14 @@ pub(crate) struct PluginRuntime {
 pub(crate) struct PluginRuntimeTarget {
     kind: JsPluginKind,
     surface: &'static str,
+    terminal: PluginRuntimeTerminal,
+    server_url: Option<reqwest::Url>,
+}
+
+#[derive(Clone, Copy)]
+enum PluginRuntimeTerminal {
+    Reject,
+    Stdio,
 }
 
 impl PluginRuntimeTarget {
@@ -53,6 +68,17 @@ impl PluginRuntimeTarget {
         Self {
             kind: JsPluginKind::Server,
             surface,
+            terminal: PluginRuntimeTerminal::Reject,
+            server_url: None,
+        }
+    }
+
+    pub(crate) fn server_with_stdio(surface: &'static str, server_url: reqwest::Url) -> Self {
+        Self {
+            kind: JsPluginKind::Server,
+            surface,
+            terminal: PluginRuntimeTerminal::Stdio,
+            server_url: Some(server_url),
         }
     }
 
@@ -60,6 +86,8 @@ impl PluginRuntimeTarget {
         Self {
             kind: JsPluginKind::Tui,
             surface,
+            terminal: PluginRuntimeTerminal::Reject,
+            server_url: None,
         }
     }
 }
@@ -91,15 +119,17 @@ impl PluginRuntime {
         if specs.is_empty() {
             return None;
         }
-        let terminal: Arc<dyn TerminalLease> = Arc::new(HeadlessTerminalLease);
-        let host = JsHostConfig::new(
-            project.clone(),
-            reqwest::Url::parse("http://127.0.0.1:0").expect("static plugin server URL"),
-            terminal,
-        )
-        .directory(directory)
-        .worktree(worktree)
-        .cache_dir(layout.cache());
+        let terminal: Arc<dyn TerminalLease> = match target.terminal {
+            PluginRuntimeTerminal::Reject => Arc::new(HeadlessTerminalLease),
+            PluginRuntimeTerminal::Stdio => Arc::new(TerminalBroker::new(Arc::new(StdioTerminal))),
+        };
+        let server_url = target.server_url.unwrap_or_else(|| {
+            reqwest::Url::parse("http://127.0.0.1:0").expect("static plugin server URL")
+        });
+        let host = JsHostConfig::new(project.clone(), server_url, terminal)
+            .directory(directory)
+            .worktree(worktree)
+            .cache_dir(layout.cache());
         let load = load_js_plugins_ordered(specs, host).await;
         let diagnostics = load.diagnostics();
         for diagnostic in &diagnostics {
@@ -122,6 +152,7 @@ impl PluginRuntime {
             load,
             bus: HookBus::new(plugins),
             providers: RwLock::new(BTreeMap::new()),
+            oauth_callbacks: Arc::new(Mutex::new(BTreeMap::new())),
             reported_diagnostics: Mutex::new(diagnostics.len()),
             shutdown: AtomicBool::new(false),
         })
@@ -326,6 +357,131 @@ impl PluginRuntime {
                 format!("plugin hook model context `{provider_id}/{model_id}` is unavailable")
             })?;
         Ok((provider, model))
+    }
+}
+
+impl std::fmt::Debug for PluginRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PluginRuntime")
+            .field("plugins", &self.bus.plugins().len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProviderOAuthBackend for PluginRuntime {
+    fn authorize(
+        &self,
+        request: ProviderOAuthAuthorizeRequest,
+    ) -> ProviderOAuthFuture<ProviderOAuthAuthorization> {
+        let authorization = self
+            .bus
+            .plugins()
+            .iter()
+            .filter_map(|plugin| plugin.auth())
+            .find(|hook| hook.provider == request.provider_id)
+            .and_then(|hook| hook.methods.get(request.method).cloned());
+        let callbacks = Arc::clone(&self.oauth_callbacks);
+        Box::pin(async move {
+            let AuthMethod::OAuth { authorize, .. } = authorization.ok_or_else(|| {
+                format!(
+                    "plugin provider `{}` has no OAuth method {}",
+                    request.provider_id, request.method
+                )
+            })?
+            else {
+                return Err(format!(
+                    "plugin provider `{}` method {} is not OAuth",
+                    request.provider_id, request.method
+                ));
+            };
+            let result = authorize
+                .authorize((!request.inputs.is_empty()).then_some(&request.inputs))
+                .await
+                .map_err(|error| error.to_string())?;
+            let method = match &result.callback {
+                AuthOAuthCallback::Auto(_) => "auto",
+                AuthOAuthCallback::Code(_) => "code",
+            };
+            callbacks
+                .lock()
+                .map_err(|_| "plugin OAuth callback lock was poisoned".to_owned())?
+                .insert((request.provider_id, request.method), result.callback);
+            Ok(ProviderOAuthAuthorization {
+                url: result.url,
+                method: method.to_owned(),
+                instructions: result.instructions,
+            })
+        })
+    }
+
+    fn callback(
+        &self,
+        request: ProviderOAuthCallbackRequest,
+    ) -> ProviderOAuthFuture<Option<ProviderOAuthCompletion>> {
+        let callback = self
+            .oauth_callbacks
+            .lock()
+            .map_err(|_| "plugin OAuth callback lock was poisoned".to_owned())
+            .and_then(|mut callbacks| {
+                callbacks
+                    .remove(&(request.provider_id.clone(), request.method))
+                    .ok_or_else(|| {
+                        format!(
+                            "plugin provider `{}` method {} has no active OAuth callback",
+                            request.provider_id, request.method
+                        )
+                    })
+            });
+        Box::pin(async move {
+            let result = match callback? {
+                AuthOAuthCallback::Auto(callback) => callback.callback().await,
+                AuthOAuthCallback::Code(callback) => {
+                    let code = request.code.as_deref().ok_or_else(|| {
+                        format!(
+                            "plugin provider `{}` method {} requires an OAuth code",
+                            request.provider_id, request.method
+                        )
+                    })?;
+                    callback.callback(code).await
+                }
+            }
+            .map_err(|error| error.to_string())?;
+            Ok(match result {
+                AuthCallbackResult::Failed => None,
+                AuthCallbackResult::Success(success) => Some(oauth_completion(success)),
+            })
+        })
+    }
+}
+
+fn oauth_completion(success: AuthSuccess) -> ProviderOAuthCompletion {
+    match success {
+        AuthSuccess::OAuth {
+            provider,
+            refresh,
+            access,
+            expires,
+            account_id,
+            enterprise_url,
+        } => ProviderOAuthCompletion {
+            provider_id: provider,
+            credential: oc_auth::Credential::Oauth {
+                refresh,
+                access,
+                expires,
+                account_id,
+                enterprise_url,
+            },
+        },
+        AuthSuccess::ApiKey {
+            provider,
+            key,
+            metadata,
+        } => ProviderOAuthCompletion {
+            provider_id: provider,
+            credential: oc_auth::Credential::Api { key, metadata },
+        },
     }
 }
 
@@ -784,6 +940,17 @@ impl TerminalLease for HeadlessTerminalLease {
     }
 }
 
+struct StdioTerminal;
+
+#[async_trait]
+impl TerminalOwner for StdioTerminal {
+    async fn yield_terminal(&self, _reason: &LeaseReason) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn reclaim_terminal(&self, _reason: &LeaseReason, _cause: ReclaimCause) {}
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -803,6 +970,9 @@ mod tests {
     use oc_llm::event::{Message, Role};
     use oc_llm::registry::Spec;
     use oc_provider_compatible::{CompatibleProvider, ReqwestTransport, Transport};
+    use oc_server::{
+        ProviderOAuthAuthorizeRequest, ProviderOAuthBackend, ProviderOAuthCallbackRequest,
+    };
     use oc_testkit::{MockProvider, Scenario, ScriptedEnv};
     use serde_json::json;
 
@@ -819,6 +989,33 @@ export default {
       output.enabled = false;
     },
   }),
+};
+"#;
+
+    const OAUTH_PLUGIN: &str = r#"
+export default {
+  id: "production-oauth-fixture",
+  server: async () => ({
+    auth: {
+      provider: "kiro-auth",
+      methods: [{
+        type: "oauth",
+        label: "Fixture OAuth",
+        authorize: async () => ({
+          url: "https://device.example.test/authorize",
+          instructions: "complete fixture authorization",
+          method: "auto",
+          callback: async () => ({
+            type: "success",
+            provider: "kiro-auth",
+            refresh: "fixture-refresh",
+            access: "fixture-access",
+            expires: 1234
+          })
+        })
+      }]
+    }
+  })
 };
 "#;
 
@@ -991,5 +1188,73 @@ export default {
 
         runtime.shutdown().await;
         mock.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn provider_oauth_backend_retains_and_consumes_the_live_plugin_callback() {
+        let env = ScriptedEnv::new().expect("isolated OAuth environment");
+        let plugin = env.project().join("oauth-plugin.mjs");
+        std::fs::write(&plugin, OAUTH_PLUGIN).expect("write OAuth plugin");
+        let config: oc_config::Config = serde_json::from_value(json!({
+            "plugin": [[format!("file:{}", plugin.display()), {}]]
+        }))
+        .expect("parse OAuth plugin config");
+        let process_env = oc_paths::Env::from_pairs(env.env_vars());
+        let layout = oc_paths::Layout::resolve(&process_env);
+        let project = oc_paths::project::resolve_project(env.project());
+        let runtime = PluginRuntime::load(
+            &config,
+            &project,
+            env.project(),
+            env.project(),
+            &layout,
+            false,
+            super::PluginRuntimeTarget::server_with_stdio(
+                "oauth-test",
+                reqwest::Url::parse("http://127.0.0.1:1").expect("fixture server URL"),
+            ),
+        )
+        .await
+        .expect("load OAuth plugin");
+
+        let authorization = runtime
+            .authorize(ProviderOAuthAuthorizeRequest {
+                provider_id: "kiro-auth".to_owned(),
+                method: 0,
+                inputs: BTreeMap::new(),
+            })
+            .await
+            .expect("start OAuth authorization");
+        assert_eq!(authorization.url, "https://device.example.test/authorize");
+        assert_eq!(authorization.method, "auto");
+        assert_eq!(authorization.instructions, "complete fixture authorization");
+
+        let request = ProviderOAuthCallbackRequest {
+            provider_id: "kiro-auth".to_owned(),
+            method: 0,
+            code: None,
+        };
+        let completion = runtime
+            .callback(request.clone())
+            .await
+            .expect("invoke retained OAuth callback")
+            .expect("OAuth callback succeeds");
+        assert_eq!(completion.provider_id.as_deref(), Some("kiro-auth"));
+        assert_eq!(
+            completion.credential,
+            oc_auth::Credential::Oauth {
+                refresh: oc_auth::Secret::new("fixture-refresh"),
+                access: oc_auth::Secret::new("fixture-access"),
+                expires: 1234,
+                account_id: None,
+                enterprise_url: None,
+            }
+        );
+        assert!(
+            runtime.callback(request).await.is_err(),
+            "a live plugin callback must be consumed exactly once"
+        );
+
+        runtime.shutdown().await;
     }
 }

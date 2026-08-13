@@ -7512,3 +7512,34 @@ absent) is undecidable here. Picking an answer would be inventing the capture. I
 being dropped, or this build starting to publish an `Agent` schema — and that pins the measured key
 sets so the recording cannot rot while passing. Reproduction, disposition reasoning, mutation
 outcome and gates are in `.omo/evidence/task-171-opencode-rust.txt`.
+
+## [2026-08-12] Todo 175 — installed auth plugins now have an effectful v1 authentication path
+
+The three promised authentication operations were registered but returned structured 501. They now
+share the production auth store and a bind-late OAuth backend supplied by the resident
+`PluginRuntime`. Antigravity's exact OAuth body replaces the provider credential; Kiro method zero
+invokes the installed authorize closure, retains its live callback, consumes it once on callback,
+and persists the resulting credential. Effect tests fail if any handler becomes a shaped 200 no-op.
+
+Binding order mattered: plugins need the actual listener address, not `127.0.0.1:0`, because their
+generated SDK client calls these routes. `serve` therefore binds the router before loading plugins,
+then installs the runtime backend and keeps its lifetime aligned with the server. A second production
+seam appeared when Basic Auth is enabled: `@opencode-ai/sdk` does not infer credentials from the
+environment. The embedded shim now supplies Basic Authorization from the same server environment;
+an isolated real-shim regression covers the default username, a custom username, and the empty
+password disabled case without mutating process-global environment inside the parallel test process.
+
+The derived v1 matrix rises from 11/20 to 14/20 served. The six remaining 501s are all outside todo
+175: app.log, config.get, session.status, session.update, session.children and session.todo. Full
+payload, mutation, test and gate evidence is in `.omo/evidence/task-175-opencode-rust.txt`.
+
+### 2026-08-13 recovery note
+
+`crates/oc-server/src/compat_v1.rs` was later reset to its pre-todo-175 version while all eleven
+other modified files survived. The file was reconstructed from the surviving tests and public
+callers instead of replaying or rewriting unrelated work. A useful recovery invariant is that the
+route table, registered backend table, handler dispatch, public re-exports, and generated matrix
+must move together: changing only the handler can still leave diagnostics claiming `501`, while
+changing only `V1_SURFACE.backing` makes the declared-backing regression fail. All three guarded
+effect mutations failed again after reconstruction; the detailed output is appended to the task
+evidence file.

@@ -16,10 +16,10 @@ use oc_plugin::{
     AuthApiResult, AuthCredentialResolver, AuthLoader, AuthMethod, AuthPrompt, ChatContext,
     ChatHeadersOutput, ChatParamsOutput, ChatSystemTransformInput, ChatSystemTransformOutput,
     CompactionAutocontinueInput, CompactionAutocontinueOutput, HookInvocation, JsDiagnosticKind,
-    JsHostConfig, JsHostPolicy, JsPluginLoad, JsPluginSpec, Plugin, ProviderContext,
-    ProviderHookContext, ProviderSmallModelInput, ProviderSmallModelOutput, ProviderSource,
-    SUPPORTED_JS_PLUGINS, TextCompleteInput, TextCompleteOutput, VersionGate,
-    load_js_plugins_ordered,
+    JsHostBuilder, JsHostConfig, JsHostPolicy, JsPluginInput, JsPluginLoad, JsPluginSpec, Plugin,
+    ProviderContext, ProviderHookContext, ProviderSmallModelInput, ProviderSmallModelOutput,
+    ProviderSource, SUPPORTED_JS_PLUGINS, TextCompleteInput, TextCompleteOutput, VersionGate,
+    discover_runtime, load_js_plugins_ordered,
 };
 use oc_testkit::FakeTerminalOwner;
 use url::Url;
@@ -243,6 +243,96 @@ fn host(root: &Path, terminal: Arc<dyn TerminalLease>, policy: JsHostPolicy) -> 
 
 fn file_spec(path: &Path) -> JsPluginSpec {
     JsPluginSpec::new(format!("file:{}", path.display()))
+}
+
+async fn record_sdk_client_config(case: &str) -> serde_json::Value {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let entry = temp.path().join("plugin.mjs");
+    std::fs::write(
+        &entry,
+        r#"export default { id: "sdk-auth-fixture", server: async () => ({}) };"#,
+    )
+    .expect("write plugin fixture");
+
+    let recorded = temp.path().join(format!("sdk-client-{case}.json"));
+    let sdk = temp.path().join("sdk");
+    std::fs::create_dir_all(sdk.join("dist")).expect("create fake SDK");
+    std::fs::write(sdk.join("package.json"), r#"{"type":"module"}"#)
+        .expect("write fake SDK manifest");
+    let recorded_literal =
+        serde_json::to_string(&recorded.to_string_lossy()).expect("encode recording path");
+    std::fs::write(
+        sdk.join("dist/index.js"),
+        format!(
+            r#"import {{ writeFileSync }} from "node:fs";
+export function createOpencodeClient(config) {{
+  writeFileSync({recorded_literal}, JSON.stringify(config));
+  return {{}};
+}}"#,
+        ),
+    )
+    .expect("write fake SDK");
+
+    let runtime = discover_runtime(&["sdk-auth-fixture".to_owned()]).expect("JavaScript runtime");
+    let input =
+        JsPluginInput::new(temp.path(), temp.path(), "http://127.0.0.1:4096").with_sdk_module(&sdk);
+    let host = JsHostBuilder::new(
+        "sdk-auth-fixture",
+        runtime,
+        &file_spec(&entry),
+        &entry,
+        input,
+    )
+    .start()
+    .await
+    .expect("start SDK auth fixture");
+    host.shutdown().await;
+
+    serde_json::from_slice(&std::fs::read(recorded).expect("read SDK client config"))
+        .expect("decode SDK client config")
+}
+
+#[tokio::test]
+async fn js_sdk_client_authenticates_to_the_password_gated_server() {
+    const CHILD_CASE: &str = "OC_JS_SDK_AUTH_TEST_CASE";
+    if let Ok(case) = std::env::var(CHILD_CASE) {
+        let config = record_sdk_client_config(&case).await;
+        let authorization = config
+            .pointer("/headers/Authorization")
+            .and_then(serde_json::Value::as_str);
+        match case.as_str() {
+            "default-user" => {
+                assert_eq!(authorization, Some("Basic b3BlbmNvZGU6c2VjcmV0"));
+            }
+            "custom-user" => {
+                assert_eq!(authorization, Some("Basic YWxpY2U6c2VjcmV0"));
+            }
+            "empty-password" => assert_eq!(authorization, None),
+            _ => panic!("unknown child case {case}"),
+        }
+        return;
+    }
+
+    for (case, username, password) in [
+        ("default-user", None, "secret"),
+        ("custom-user", Some("alice"), "secret"),
+        ("empty-password", Some("alice"), ""),
+    ] {
+        let mut command = std::process::Command::new(std::env::current_exe().expect("test binary"));
+        command
+            .arg("--exact")
+            .arg("js_sdk_client_authenticates_to_the_password_gated_server")
+            .arg("--nocapture")
+            .env(CHILD_CASE, case)
+            .env("OPENCODE_SERVER_PASSWORD", password);
+        if let Some(username) = username {
+            command.env("OPENCODE_SERVER_USERNAME", username);
+        } else {
+            command.env_remove("OPENCODE_SERVER_USERNAME");
+        }
+        let status = command.status().expect("run isolated SDK auth test");
+        assert!(status.success(), "SDK auth child case {case} failed");
+    }
 }
 
 async fn fixture_auth_loader(

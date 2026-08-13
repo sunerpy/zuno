@@ -49,8 +49,10 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 
 use axum::Json;
 use axum::extract::{Extension, OriginalUri, Path, Query, State};
@@ -58,7 +60,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, patch, post, put};
 use axum::{Router, routing::MethodRouter};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::ServerServices;
@@ -169,6 +171,10 @@ impl fmt::Display for V1Method {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum V1Backing {
     ApiAdapter(V1Adapter),
+    /// Served locally by the shared provider credential store.
+    LocalAuthStore,
+    /// Served by the resident plugin runtime's provider OAuth hooks.
+    LocalProviderOAuth,
     /// Served locally by [`show_toast`], which records into the toast sink.
     LocalToastSink,
     /// Registered and answering a structured `501`. No local backend.
@@ -181,6 +187,8 @@ impl V1Backing {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ApiAdapter(adapter) => adapter.as_str(),
+            Self::LocalAuthStore => "local-auth-store",
+            Self::LocalProviderOAuth => "local-provider-oauth",
             Self::LocalToastSink => "local-toast-sink",
             Self::NotImplemented => "not-implemented",
         }
@@ -278,7 +286,7 @@ pub const V1_SURFACE: &[V1Route] = &[
         sdk_method: "client.auth.set",
         plugins: &[AG],
         callsites: &["opencode-antigravity-auth: dist/src/plugin.js:1400,2319,2337,2366"],
-        backing: V1Backing::NotImplemented,
+        backing: V1Backing::LocalAuthStore,
         api_alternative: None,
     },
     V1Route {
@@ -323,7 +331,7 @@ pub const V1_SURFACE: &[V1Route] = &[
         sdk_method: "client.provider.oauth.authorize",
         plugins: &[KIRO],
         callsites: &["opencode-kiro-auth: dist/core/request/request-handler.js:783-786"],
-        backing: V1Backing::NotImplemented,
+        backing: V1Backing::LocalProviderOAuth,
         api_alternative: None,
     },
     V1Route {
@@ -332,7 +340,7 @@ pub const V1_SURFACE: &[V1Route] = &[
         sdk_method: "client.provider.oauth.callback",
         plugins: &[KIRO],
         callsites: &["opencode-kiro-auth: dist/core/request/request-handler.js:787-790"],
-        backing: V1Backing::NotImplemented,
+        backing: V1Backing::LocalProviderOAuth,
         api_alternative: None,
     },
     V1Route {
@@ -474,6 +482,11 @@ pub const V1_SURFACE: &[V1Route] = &[
 
 const V1_BACKENDS: &[(V1Method, &str, V1Backing)] = &[
     (
+        V1Method::Put,
+        "/auth/{providerID}",
+        V1Backing::LocalAuthStore,
+    ),
+    (
         V1Method::Get,
         "/agent",
         V1Backing::ApiAdapter(V1Adapter::Agents),
@@ -482,6 +495,16 @@ const V1_BACKENDS: &[(V1Method, &str, V1Backing)] = &[
         V1Method::Get,
         "/provider",
         V1Backing::ApiAdapter(V1Adapter::Providers),
+    ),
+    (
+        V1Method::Post,
+        "/provider/{providerID}/oauth/authorize",
+        V1Backing::LocalProviderOAuth,
+    ),
+    (
+        V1Method::Post,
+        "/provider/{providerID}/oauth/callback",
+        V1Backing::LocalProviderOAuth,
     ),
     (
         V1Method::Get,
@@ -633,6 +656,53 @@ pub trait ToastForwarder: Send + Sync + fmt::Debug {
     fn show(&self, toast: &Toast);
 }
 
+/// Boxed result returned by a resident provider OAuth backend.
+pub type ProviderOAuthFuture<T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'static>>;
+
+/// The provider method and prompt values used to start an OAuth flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderOAuthAuthorizeRequest {
+    pub provider_id: String,
+    pub method: usize,
+    pub inputs: BTreeMap<String, String>,
+}
+
+/// The public authorization details returned to the SDK caller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderOAuthAuthorization {
+    pub url: String,
+    pub method: String,
+    pub instructions: String,
+}
+
+/// The provider method and optional code used to complete an OAuth flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderOAuthCallbackRequest {
+    pub provider_id: String,
+    pub method: usize,
+    pub code: Option<String>,
+}
+
+/// A successful provider callback and the credential it produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderOAuthCompletion {
+    pub provider_id: Option<String>,
+    pub credential: oc_auth::Credential,
+}
+
+/// Resident plugin runtime seam used by the measured provider OAuth routes.
+pub trait ProviderOAuthBackend: Send + Sync + fmt::Debug {
+    fn authorize(
+        &self,
+        request: ProviderOAuthAuthorizeRequest,
+    ) -> ProviderOAuthFuture<ProviderOAuthAuthorization>;
+
+    fn callback(
+        &self,
+        request: ProviderOAuthCallbackRequest,
+    ) -> ProviderOAuthFuture<Option<ProviderOAuthCompletion>>;
+}
+
 /// Bounded record of toasts, plus the forward seam.
 #[derive(Debug)]
 struct ToastSink {
@@ -746,6 +816,8 @@ fn truncate(value: &str, limit: usize) -> String {
 pub struct CompatV1State {
     toasts: Arc<ToastSink>,
     unknown: Arc<UnknownRoutes>,
+    auth_store: Arc<RwLock<Option<oc_auth::AuthStore>>>,
+    oauth_backend: Arc<RwLock<Option<Arc<dyn ProviderOAuthBackend>>>>,
 }
 
 impl CompatV1State {
@@ -758,6 +830,8 @@ impl CompatV1State {
                 forwarder: None,
             }),
             unknown: Arc::new(UnknownRoutes::default()),
+            auth_store: Arc::new(RwLock::new(None)),
+            oauth_backend: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -770,6 +844,48 @@ impl CompatV1State {
             forwarder: Some(forwarder),
         });
         self
+    }
+
+    /// Installs the resident provider OAuth runtime before the router is served.
+    #[must_use]
+    pub fn with_provider_oauth_backend(self, backend: Arc<dyn ProviderOAuthBackend>) -> Self {
+        self.set_provider_oauth_backend(backend);
+        self
+    }
+
+    /// Installs the resident provider OAuth runtime after listener binding.
+    ///
+    /// The state is shared by every router clone, so a server can bind first,
+    /// construct plugins with the listener's real URL, and then publish them here.
+    pub fn set_provider_oauth_backend(&self, backend: Arc<dyn ProviderOAuthBackend>) {
+        *self
+            .oauth_backend
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(backend);
+    }
+
+    /// Returns the currently installed provider OAuth runtime, if one is ready.
+    #[must_use]
+    pub fn oauth_backend(&self) -> Option<Arc<dyn ProviderOAuthBackend>> {
+        self.oauth_backend
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn bind_auth_store(&self, store: oc_auth::AuthStore) {
+        *self
+            .auth_store
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(store);
+    }
+
+    fn auth_store(&self) -> Result<oc_auth::AuthStore, CompatV1Error> {
+        self.auth_store
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .ok_or(CompatV1Error::AuthStoreUnavailable)
     }
 
     /// The unknown-route counters, for callers assembling their own diagnostics.
@@ -809,12 +925,16 @@ impl Default for CompatV1State {
 /// merged into a single [`MethodRouter`] first, because registering the same path
 /// twice is a matcher conflict rather than an addition.
 pub fn compat_v1_router(state: CompatV1State, api_state: ApiState) -> Router {
+    let layout = oc_paths::Layout::resolve(api_state.env());
+    state.bind_auth_store(oc_auth::AuthStore::resolve(&layout, api_state.env()));
     let mut grouped: BTreeMap<&str, BTreeMap<String, MethodRouter<CompatV1State>>> =
         BTreeMap::new();
     for route in V1_SURFACE {
         let (prefix, nested_path) = split_prefix(route.path);
         let handler: MethodRouter<CompatV1State> = match registered_backing(route) {
             V1Backing::ApiAdapter(adapter) => adapter_handler(adapter),
+            V1Backing::LocalAuthStore => put(set_auth),
+            V1Backing::LocalProviderOAuth => provider_oauth_handler(route),
             V1Backing::LocalToastSink => post(show_toast),
             V1Backing::NotImplemented => seam_handler(route),
         };
@@ -873,6 +993,14 @@ fn seam_handler(route: &'static V1Route) -> MethodRouter<CompatV1State> {
         V1Method::Post => post(respond),
         V1Method::Put => put(respond),
         V1Method::Patch => patch(respond),
+    }
+}
+
+fn provider_oauth_handler(route: &'static V1Route) -> MethodRouter<CompatV1State> {
+    match route.path {
+        "/provider/{providerID}/oauth/authorize" => post(provider_oauth_authorize),
+        "/provider/{providerID}/oauth/callback" => post(provider_oauth_callback),
+        _ => unreachable!("unknown provider OAuth route: {}", route.path),
     }
 }
 
@@ -937,6 +1065,90 @@ struct V1SessionSummarizeBody {
     model_id: String,
     #[serde(default)]
     auto: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ProviderOAuthAuthorizeBody {
+    method: usize,
+    #[serde(default)]
+    inputs: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ProviderOAuthCallbackBody {
+    method: usize,
+    code: Option<String>,
+}
+
+async fn set_auth(
+    State(state): State<CompatV1State>,
+    Path(provider_id): Path<String>,
+    body: Result<Json<oc_auth::Credential>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<bool>, CompatV1Error> {
+    let Json(credential) = body.map_err(|_| {
+        CompatV1Error::InvalidRequest("auth.set requires a recognized JSON credential body")
+    })?;
+    state
+        .auth_store()?
+        .set(&provider_id, credential)
+        .map_err(|error| CompatV1Error::AuthStore(error.to_string()))?;
+    Ok(Json(true))
+}
+
+async fn provider_oauth_authorize(
+    State(state): State<CompatV1State>,
+    Path(provider_id): Path<String>,
+    body: Result<Json<ProviderOAuthAuthorizeBody>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<ProviderOAuthAuthorization>, CompatV1Error> {
+    let Json(body) = body.map_err(|_| {
+        CompatV1Error::InvalidRequest(
+            "provider OAuth authorize requires a JSON body with an integer `method`",
+        )
+    })?;
+    let backend = state
+        .oauth_backend()
+        .ok_or(CompatV1Error::ProviderOAuthUnavailable)?;
+    let authorization = backend
+        .authorize(ProviderOAuthAuthorizeRequest {
+            provider_id,
+            method: body.method,
+            inputs: body.inputs,
+        })
+        .await
+        .map_err(CompatV1Error::ProviderOAuth)?;
+    Ok(Json(authorization))
+}
+
+async fn provider_oauth_callback(
+    State(state): State<CompatV1State>,
+    Path(provider_id): Path<String>,
+    body: Result<Json<ProviderOAuthCallbackBody>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<bool>, CompatV1Error> {
+    let Json(body) = body.map_err(|_| {
+        CompatV1Error::InvalidRequest(
+            "provider OAuth callback requires a JSON body with an integer `method`",
+        )
+    })?;
+    let backend = state
+        .oauth_backend()
+        .ok_or(CompatV1Error::ProviderOAuthUnavailable)?;
+    let completion = backend
+        .callback(ProviderOAuthCallbackRequest {
+            provider_id: provider_id.clone(),
+            method: body.method,
+            code: body.code,
+        })
+        .await
+        .map_err(CompatV1Error::ProviderOAuth)?;
+    let Some(completion) = completion else {
+        return Ok(Json(false));
+    };
+    let target_provider = completion.provider_id.as_deref().unwrap_or(&provider_id);
+    state
+        .auth_store()?
+        .set(target_provider, completion.credential)
+        .map_err(|error| CompatV1Error::AuthStore(error.to_string()))?;
+    Ok(Json(true))
 }
 
 async fn v1_agents(
@@ -1312,6 +1524,18 @@ pub enum CompatV1Error {
     /// A request that cannot be served as written.
     #[error("{0}")]
     InvalidRequest(&'static str),
+    /// The router was assembled without a credential store.
+    #[error("the shared provider credential store is unavailable")]
+    AuthStoreUnavailable,
+    /// The shared credential store rejected a mutation.
+    #[error("failed to update the shared provider credential store: {0}")]
+    AuthStore(String),
+    /// No resident plugin runtime has been installed yet.
+    #[error("the provider OAuth runtime is unavailable")]
+    ProviderOAuthUnavailable,
+    /// The resident plugin's OAuth hook failed.
+    #[error("provider OAuth failed: {0}")]
+    ProviderOAuth(String),
 }
 
 impl IntoResponse for CompatV1Error {
@@ -1336,6 +1560,24 @@ impl IntoResponse for CompatV1Error {
             Self::InvalidRequest(_) => (
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
+                self.to_string(),
+                Value::Null,
+            ),
+            Self::AuthStoreUnavailable | Self::AuthStore(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "auth_store_error",
+                self.to_string(),
+                Value::Null,
+            ),
+            Self::ProviderOAuthUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "provider_oauth_unavailable",
+                self.to_string(),
+                Value::Null,
+            ),
+            Self::ProviderOAuth(_) => (
+                StatusCode::BAD_GATEWAY,
+                "provider_oauth_failed",
                 self.to_string(),
                 Value::Null,
             ),
