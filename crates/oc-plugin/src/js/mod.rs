@@ -21,6 +21,6 @@ pub use runtime::{
     JsRuntime, JsRuntimeKind, MissingJsRuntime, discover_runtime, discover_runtime_in,
 };
 pub use spec::{
-    JsPluginSpec, PLUGIN_PEER_PACKAGE, PackageManifest, PluginKind as JsPluginKind, PluginSource,
+    JsPluginSpec, PackageManifest, PluginKind as JsPluginKind, PluginSource,
     REPORTED_PLUGIN_API_VERSION, ResolvedJsPlugin, SpecError, VersionGate,
 };

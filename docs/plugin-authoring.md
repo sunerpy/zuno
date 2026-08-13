@@ -34,10 +34,16 @@ configuration-directory order; files are sorted within `plugin/` and then
 discovery is visible at `DEBUG`, and scan or load failures are warnings that name
 the affected directory or plugin.
 
-An npm plugin whose `engines.opencode` range excludes the running version is
-skipped, upstream's behaviour. That is why `--version` reports the pinned
-compatibility baseline and the real build identity is exposed separately — see
-the `split-version-identity` entry in [divergences.md](divergences.md).
+An npm plugin may declare its supported host range in
+`package.json.engines.opencode`. The production loader checks that range against
+the pinned compatibility baseline before importing the module: an excluding or
+invalid range skips the plugin and reports `Plugin requires opencode <range> but
+running <version>`, while a satisfying or absent range loads normally. Local
+`file:` plugins bypass this package gate, matching upstream's development-code
+exception. This is why `--version` reports the compatibility baseline and the
+real build identity is exposed separately — see the `split-version-identity`
+entry in [divergences.md](divergences.md). The excluding and satisfying cases
+are executable production-loader regressions in `crates/oc-plugin/tests/js.rs`.
 
 A JavaScript plugin also gets the v1 SDK routes it calls. Only the routes with a
 measured callsite are served; see the v1 table in
