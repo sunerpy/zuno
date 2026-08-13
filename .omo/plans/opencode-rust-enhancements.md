@@ -159,6 +159,110 @@ three verbs into one fails a named test.
 
 ---
 
+## E-3b. Code-form delegation — the user's question, investigated properly **[crate], optional**
+
+**Raised by the user 2026-08-13**: *"prime-agent 的任务委派、多 agent 协作是否可以参考？它应该是
+使用代码的形式而不是工具 tool 调用"*. The user is **right about the mechanism**, and the summary
+above understated it. This section records what investigation found, including the part that
+reverses half the conclusion.
+
+### The user is correct: prime-agent delegates in code, not tool calls
+
+```python
+# prime-agent-runtime/src/rlm/__init__.py:143
+async def run(prompt: str, **kwargs: Any) -> RLMSpawnHandle:
+    """Spawn a recursive Prime Agent child and return once its task is admitted."""
+```
+
+The model writes Python in a persistent IPython kernel; `rlm.run`, messaging, skills and
+compaction are all Python-callable functions bridged over a Jupyter comm channel. Delegation is a
+**function call in a language**, not a structured tool invocation. Calling it "the model's tool
+surface" earlier was accurate but obscured that distinction.
+
+### But prime-agent's code form does not deliver the main benefit of a code form
+
+`rlm.run` **resolves when the child accepts the task, not when it finishes**, and returns only a
+handle (`rlm_child_id`, `name`, `session_dir`, `model` — `rlm-runtime.ts:14`). So results
+**cannot** flow back as return values; they arrive as agent-to-agent messages.
+
+That matters because the theoretical prize of code delegation is result-side composition:
+
+```python
+results = [spawn(p) for p in prompts]
+summary  = reduce(r.output for r in results)   # raw child output NEVER enters parent context
+```
+
+The second line is the real win — child output stays in the interpreter and only the reduction
+costs context. **prime-agent cannot write it.** The research reached the same verdict
+independently: the async-only result path is *"a design regression that should not be copied —
+the absence of join, typed results, result timeouts, and error envelopes is a real defect,
+visible in the prompt-level nagging that compensates for it."*
+
+So the code form buys prime-agent **spawn-side** composition only: `[await rlm.run(p) for p in
+prompts]` is fan-out with no scheduler, and loops or conditionals can decide *whether* to spawn.
+
+### Where that leaves this project
+
+Two facts reframe the question:
+
+1. **`oc-tools/src/task.rs` is already closer to results-as-values than prime-agent is.** It is
+   synchronous by default and returns the result (`task.rs:31`: *"foreground is a blocking wait
+   the caller must opt out of"*). The thing prime-agent gave up to get code form, this project
+   already has.
+2. **The real gap is spawn-side composition**: fanning out N subtasks, or deciding what to spawn
+   from a prior result, currently costs N model round-trips.
+
+**Convergence evidence runs 4:1 against the code form.** All four other surveyed agents dispatch
+through **one tool** — opencode `task`, codex `spawn_agent`, Claude Code `Agent`, ZCode `Agent`
+(`research-cli-agents.md:518`). `openai/codex` is the most relevant comparison: Rust, ~140
+crates, Apache-2.0, and it shipped **typed tools with an envelope**, not a code substrate. It had
+the engineering budget to choose either.
+
+### Substrate reality here
+
+- **No embedded script engine exists.** Verified.
+- **JS plugins discover an external `bun`/`node` on PATH** (`oc-plugin/src/js/runtime.rs:141`,
+  `:35-36`). Unusable for a *core* control-flow feature, which must work without an external
+  runtime.
+- **wasmtime is a dependency but feature-gated**, deliberately kept out of every default build
+  and enforced by `wasmtime_feature_gate.rs::wasm_runtime_is_absent_from_the_default_dependency_graph`.
+  So an embedded execution substrate is **precedented but gated** — which is the shape any code
+  substrate here would have to take.
+
+### Two ways to close the real gap, with the honest tradeoff
+
+**Cheap — batch fan-out tool [pure].** One tool call carrying N task specs, returning N typed
+results. Closes parallel fan-out, which is the dominant composition case, with no interpreter, no
+sandbox, no new failure modes. Composes with E-2's envelope. This gets most of the value.
+
+**Expensive — embedded pure-Rust script engine [crate], feature-gated.** `rhai`, `rune`, or
+`starlark-rust` (starlark is deterministic and I/O-free by design, which is the right safety
+posture for model-authored code). Mirrors the wasmtime precedent: optional, off by default,
+guarded. This buys what batching cannot — **data-dependent orchestration**: spawn based on a
+prior child's result, loop until a condition holds, filter before returning.
+
+**If the expensive path is taken, do the part prime-agent did not.** Make spawn return results
+as values so reduce-in-code works, keeping raw child output out of the parent's context. That is
+the actual prize, and it is available precisely because this project's `task()` is already
+synchronous. Adopting the code form while copying prime-agent's fire-and-forget handle would take
+on the cost and leave the benefit behind.
+
+**Recommendation**: build the batch fan-out tool first and see whether data-dependent
+orchestration is genuinely wanted before embedding an interpreter. The 4:1 convergence is not
+proof that code delegation is wrong — CodeAct-style results are real — but it is evidence that
+four teams solving this problem did not need it, and one team that did needed a Python runtime to
+get there.
+
+**Acceptance criteria (agent-executable), cheap path**: one tool call spawning N subtasks returns
+N typed results with per-child status and errors; a partial failure does not discard successful
+siblings; the parent's context grows by the reductions, not by the raw child outputs, asserted by
+byte comparison; collapsing the batch into sequential single dispatches fails a named test.
+
+**Acceptance criteria, expensive path (only if pursued)**: the engine is absent from the default
+dependency graph, enforced the way `wasmtime_feature_gate.rs` enforces wasmtime; a script can
+spawn, await results as values, reduce them, and return only the reduction, proven by asserting
+parent context size; script execution cannot perform I/O outside the declared tool surface.
+
 ## E-4. Autonomous completion gates, with the livelock breaker **[pure]**
 
 **The best single idea in prime-agent**, and independently the thing this project has been
