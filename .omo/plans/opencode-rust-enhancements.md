@@ -473,21 +473,58 @@ should be weighed against the existing hand-rolled auth code.
   genuinely unaffected.
 - The 60s timeout is enforced and bounded, consistent with `websearch`'s existing bounded fetch.
 
-### Open question to settle first, before writing code
+### Substrate: DECIDED — native Rust behind a cargo feature
 
-**Which plugin substrate?** This project's JS plugin host discovers an external `bun`/`node`
-(`oc-plugin/src/js/runtime.rs:141`), so a JS plugin would reintroduce exactly the runtime
-dependency the project refuses. Three options, in order of my preference:
+**User decision 2026-08-13**: *"我倾向于原生 rust 方式"*. Settled. The JS and WASM options are
+dropped. A JS plugin would have reintroduced the external `bun`/`node` discovery
+(`oc-plugin/src/js/runtime.rs:141`) that this project exists to avoid.
 
-1. **A native Rust optional tool behind a cargo feature**, gated on the credential's presence —
-   mirrors the `wasmtime` precedent (feature-gated, absent from default builds, enforced by
-   `wasmtime_feature_gate.rs`). Self-contained and discardable by deleting one module.
-2. **A WASM plugin** through the existing gated `oc-plugin/wasm` surface.
-3. **A JS plugin** — most faithful to antigravity's own packaging, but only usable when an external
-   runtime happens to exist. Acceptable for an optional extra; unacceptable for anything core.
+**Shape, copied from the `wasmtime` precedent** — which is the project's own proven pattern for an
+optional heavyweight capability:
 
-I lean to (1): it satisfies "standalone, does not affect the main process, discardable later"
-without depending on Node.
+```toml
+# crates/oc-plugin/Cargo.toml:12-14 — the pattern to follow
+[features]
+default = []
+wasm = ["dep:wasmtime"]
+```
+
+So: a new module (or small crate) with `default = []` and a `google-search` feature, **absent from
+every default build**, enforced by a structural test written the way
+`crates/oc-plugin/tests/wasmtime_feature_gate.rs::wasm_runtime_is_absent_from_the_default_dependency_graph`
+enforces wasmtime's absence. That test is the thing that makes "does not affect the main process"
+checkable rather than asserted.
+
+**No new dependencies.** `reqwest` (`Cargo.toml:90`) and `serde_json` (`:103`) are already
+workspace dependencies. One HTTPS POST, one JSON parse. No SDK, no `oauth2` crate.
+
+### One thing I verified that changes the work estimate
+
+**`oc-auth` stores provider OAuth credentials but does not refresh them.** `Credential::OAuth
+{ refresh, access, expires }` exists (`provider.rs:63-74`) and `expires` is stored, but the only
+refresh machinery in the crate is on the **MCP** path (`mcp.rs:69` `refresh_token`), not the
+provider path. So the plugin must perform its own refresh:
+
+- POST to Google's token endpoint with the stored `refresh` token when `expires` has passed.
+- Persist the new `access`/`expires` back through `AuthStore` so the next process does not re-refresh.
+- Antigravity's own flow is the reference (`plugin.js:1117-1126` → `refreshAccessToken`), including
+  extracting the project id from the refresh token's parts (`parseRefreshParts` →
+  `managedProjectId || projectId`), which the Cloud Code endpoint requires.
+
+This is the largest single piece of the item and it was invisible in the first pass. **Do not
+assume `oc-auth` will hand back a fresh token.**
+
+### Build order
+
+1. **Read the credential and refresh it.** Prove a refresh round-trip persists through `AuthStore`
+   before any search code exists — if this does not work, nothing else matters.
+2. **The bounded POST and the grounding request shape**, with the no-function-declarations
+   assertion, since that constraint is the one a later refactor will silently break.
+3. **Response rendering** — sources and `urlsRetrieved`, matching antigravity's Markdown so output
+   is recognisable to anyone who has used it.
+4. **Registration and gating** — appear only when the credential exists, absent otherwise, using
+   the existing `websearch` gating rather than a parallel mechanism.
+5. **The feature-absence structural test**, last, so it pins a real surface.
 
 ## E-10. Keyless search backend — **already implemented; verify, do not build** **[pure]**
 
