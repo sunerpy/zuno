@@ -7512,3 +7512,19 @@ absent) is undecidable here. Picking an answer would be inventing the capture. I
 being dropped, or this build starting to publish an `Agent` schema — and that pins the measured key
 sets so the recording cannot rot while passing. Reproduction, disposition reasoning, mutation
 outcome and gates are in `.omo/evidence/task-171-opencode-rust.txt`.
+
+## [2026-08-12] Todo 177 — top-level `model` now participates in shared turn selection
+
+`run` and the TUI already shared `TurnPlan::resolve`; the defect was one omitted rung there:
+selection used explicit `--model`, then the agent model, then deterministic catalog fallback, while
+`Config::model` was never consulted. Released 1.18.15 source establishes explicit model, agent model,
+continued-session model, config model, recent model, then fallback. This todo adds the locally
+applicable config rung without duplicating resolution or changing the existing fallback.
+
+Production regressions launch the real CLI and a real PTY/TUI against two independently captured
+loopback providers. They physically swap ALPHA/BETA endpoints while configuration always selects the
+lexicographically second provider, so catalog-first behavior fails in both directions rather than
+passing by coincidence. Separate CLI and TUI tests preserve the genuinely-unset deterministic
+fallback. Removing the config rung failed all four configured-direction tests; reversing fallback
+failed both unset tests. Complete reproduction and mutation evidence is in
+`.omo/evidence/task-177-opencode-rust.txt`.

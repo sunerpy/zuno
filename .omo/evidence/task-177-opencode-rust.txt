@@ -1,0 +1,135 @@
+Task 177 — honor the configured model key
+Worktree: /config/workspace/ProdDir/AI/oc-wt/t177
+Starting HEAD: 2dcedbfed3c4322c9a7df99cbbf2436887e40b88
+
+== Initial investigation ==
+
+CodeGraph query:
+  model_spec resolve_model default_model Config model turn tui
+Result:
+  Error: No indexed project found for projectPath "/config/workspace/ProdDir/AI/oc-wt/t177".
+Per the task instruction, investigation continued with direct source reads.
+
+Shared/duplicated resolution:
+  crates/oc-cli/src/cmd/run.rs:29-37 builds TurnOptions and calls TurnPlan::resolve.
+  crates/oc-cli/src/cmd/tui.rs:80-87 builds TurnOptions and calls the same TurnPlan::resolve.
+  crates/oc-cli/src/cmd/turn.rs:207 currently computes:
+    options.model.as_deref().or(agent.model.as_deref())
+  The top-level Config::model is therefore parsed but absent from selection.
+  run and the TUI SHARE the faulty resolution; there is no duplicated TUI resolver.
+
+Config/debug confirmation:
+  crates/oc-config/src/schema.rs:201-203 declares Config::model as the default
+  provider/model string. crates/oc-cli/src/cmd/debug.rs:91 serializes the complete
+  resolved Config, so debug config correctly echoes that field.
+
+Upstream source baseline available on the host (pinned source 1.18.13):
+  packages/opencode/src/session/prompt.ts:469 and :614-632:
+    input model -> agent model -> current session model -> Provider.defaultModel
+  packages/opencode/src/provider/provider.ts:1947-1979:
+    config model -> recent model -> deterministic catalog fallback
+  packages/opencode/src/cli/cmd/run.ts:858-865 passes --model as input.model.
+Thus the source precedence is:
+  --model/input override > agent-level model > continued session model >
+  top-level config.model > recent model > deterministic catalog fallback.
+Released 1.18.15 behavior will be measured below before implementation; the
+checked-out source is 1.18.13 and is not being presented as 1.18.15 evidence.
+
+== Released 1.18.15 precedence baseline ==
+
+Authoritative release source:
+  remote tag v1.18.15 -> d7b115f623760e68a4749d16508a9eca350f246f
+  packages/opencode/src/cli/cmd/run.ts:842-844 forwards args.model as input.model.
+  packages/opencode/src/session/prompt.ts:646 resolves:
+    input.model ?? ag.model ?? currentModel(input.sessionID)
+  packages/opencode/src/session/prompt.ts:628-632 makes currentModel resolve:
+    current session model -> most recent user-message model -> Provider.defaultModel
+  packages/opencode/src/provider/provider.ts:1947-1979 makes defaultModel resolve:
+    cfg.model -> first valid recent model -> configured-provider/catalog fallback
+
+Released ordering therefore is:
+  explicit --model > selected agent model > continued-session model >
+  top-level config.model > valid recent model > deterministic catalog fallback.
+
+Installed release oracle:
+  /config/.local/share/mise/installs/opencode/1.18.15/opencode --version
+  => 1.18.15
+With two distinguishable providers alpha/alpha-model and beta/beta-model,
+OPENCODE_CONFIG_CONTENT set model=beta/beta-model. The release DEBUG stream logged:
+  providerID=beta modelID=beta-model ... agent=build
+This independently confirms the config-model branch of the release source.
+
+== Pre-fix reproduction on Rust HEAD ==
+
+Artifact:
+  target/debug/opencode-rust built from 2dcedbfed3c4322c9a7df99cbbf2436887e40b88
+Probe:
+  /tmp/opencode/t177_model_probe.py
+Topology:
+  two live loopback OpenAI-compatible SSE providers, ids aaa/aaa-model and
+  zzz/zzz-model; config.model always zzz/zzz-model; provider endpoints are
+  physically swapped between ALPHA and BETA. CLI uses `run probe` with no
+  --model. TUI uses the real default surface under `script` PTY with
+  `--prompt probe --auto`, also with no --model.
+
+Observed JSON rows:
+  {"surface":"cli","aaa_endpoint":"ALPHA","zzz_endpoint":"BETA","aaa_hits":2,"zzz_hits":0,"saw_alpha":true,"saw_beta":false}
+  {"surface":"cli","aaa_endpoint":"BETA","zzz_endpoint":"ALPHA","aaa_hits":2,"zzz_hits":0,"saw_alpha":false,"saw_beta":true}
+  {"surface":"tui","aaa_endpoint":"ALPHA","zzz_endpoint":"BETA","aaa_hits":2,"zzz_hits":0,"saw_alpha":true,"saw_beta":false}
+  {"surface":"tui","aaa_endpoint":"BETA","zzz_endpoint":"ALPHA","aaa_hits":2,"zzz_hits":0,"saw_alpha":false,"saw_beta":true}
+
+Each selected endpoint receives two requests (title prelude + user turn), and
+the configured zzz endpoint receives zero. Swapping the physical response
+identity swaps the visible answer while selection remains aaa. This reproduces
+the silent catalog-first defect through both production surfaces in both
+directions; no error-message inference or single-provider coincidence is used.
+
+== Regression red phase and mutation evidence ==
+
+Initial production-path regression run before implementation:
+  cargo test -p oc-cli --test configured_model --offline
+After correcting the PTY fixture to wait for the user-turn marker rather than
+the title marker, the configured-model test failed with:
+  Cli ignored config.model and dialled catalog-first aaa (ALPHA)
+and the genuinely-unset deterministic fallback test passed.
+
+Mutation A — remove `.or(config.model.as_deref())` from TurnPlan::resolve:
+  cargo test -p oc-cli --test configured_model honors_configured_model --offline -- --nocapture
+Result: 0 passed, 4 failed. Every named direction detected the mutation:
+  cli_honors_configured_model_when_zzz_is_alpha
+  cli_honors_configured_model_when_zzz_is_beta
+  tui_honors_configured_model_when_zzz_is_alpha
+  tui_honors_configured_model_when_zzz_is_beta
+The mutation was then restored.
+
+Mutation B — reverse catalog.provider_ids() only for the unset fallback:
+  cargo test -p oc-cli --test configured_model deterministic_catalog_fallback --offline -- --nocapture
+Result: 0 passed, 2 failed. Both named surfaces detected the mutation:
+  cli_keeps_deterministic_catalog_fallback_when_model_is_unset
+  tui_keeps_deterministic_catalog_fallback_when_model_is_unset
+The reversal was then removed. Final production ordering in the shared resolver:
+  explicit --model > agent.model > config.model > deterministic catalog fallback.
+
+== Final verification ==
+
+Passed:
+  cargo test -p oc-cli --test configured_model --offline
+  => 6 passed, 0 failed
+  cargo clippy --workspace --all-targets --offline
+  cargo fmt --all --check
+  rust-analyzer diagnostics .
+  => no errors; only pre-existing inactive-code weak warnings
+
+Workspace test environmental blocker:
+  cargo test --workspace --offline
+  RUST_TEST_THREADS=2 cargo test --workspace --offline
+Both attempts stopped while spawning around oc-config with OS error 11:
+  Resource temporarily unavailable (EAGAIN)
+This was process creation failure, not a test assertion. Per the two-check limit,
+the workspace suite was not retried again. A full process-table inspection found
+no task-177, configured_model, cargo-test, PTY script, or t177_model_probe process
+left running by this task, so no unrelated host process was terminated.
+
+The direct lsp_diagnostics tool could not address the sibling worktree because
+its path is outside the tool request cwd; rust-analyzer diagnostics was run from
+the task worktree as the equivalent changed-workspace diagnostic check.
