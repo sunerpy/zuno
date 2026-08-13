@@ -1484,6 +1484,77 @@ Dependency direction is strictly downward from `oc-cli`; `oc-engine` never depen
   What to do / Must NOT do: **The host's installed upstream `opencode` was upgraded to 1.18.18 mid-session, and `PINNED_RELEASE = "1.18.15"` (`oracle.rs:81`) now refuses it.** Five differentials fail with `OraclePinMismatch { pinned: "1.18.15", reported: "1.18.18" }`: `every_implemented_command_produces_the_same_normalized_output_as_the_oracle`, `every_exemption_states_a_reason_and_keeps_a_witness`, `the_declared_presentation_divergences_are_live`, `the_session_list_output_shape_difference_is_live`, and one more in the same file. **The orchestrator proved this is environmental, not a regression**: the same test fails identically at `6ab8c0ae`, before this wave's merges. The user's standing constraint is *"opencode 版本使用最新即可"* — the same instruction that drove todo 130's original re-pin, so follow that todo's precedent. Thirteen files reference `1.18.15`; re-pin all of them coherently, and **re-capture rather than hand-edit** any recorded fixture whose bytes come from the oracle. Must NOT pin to 1.18.18 by editing only the constant and leaving stale captures — a differential that compares new-binary output against old recorded bytes would report false divergences. Must NOT silence the mismatch check; it exists to stop exactly the version-attribution seam todo 146 closed. Must NOT delete a failing differential.
   Acceptance criteria (agent-executable): `PINNED_RELEASE` matches the newest installed release, and the version-refusal check still rejects a mismatched binary (prove with a named test); all five previously-failing differentials pass; every re-captured asset's provenance is asserted rather than assumed; any genuine behavioral difference the newer release introduces is either matched or declared in `docs/divergences.toml` with its reason; `grep -rn "1\.18\.15" crates/ docs/` shows only historical notes, never a live pin.
 
+## Final Verification Wave — convergence protocol (governing, adopted 2026-08-12)
+
+Adopted at the user's instruction after **thirteen** review waves failed to terminate.
+Mechanism borrowed from the `/dual-review` command's convergence rules
+(`/config/.config/opencode/command/dual-review.md`), adapted from two review paths to
+four. **These rules override any instruction in an individual reviewer prompt.**
+
+### Why this was necessary — the orchestrator's own fault, not the reviewers'
+
+Every one of wave 13's six findings passes the Blocker admission threshold below
+(concrete falsifiable + in scope + not taste). The reviewers were not padding. The
+divergence came from the orchestrator running **Round-1-style full audits thirteen
+times**, and from prompts that explicitly requested expansion — wave 13 told F2 to
+"look for the twenty-third [seam]", told F4 to "say whether an eighth layer exists",
+and told F1 to rule "every success criterion... All of them". Asking for the next
+finding reliably produced one. Todos generated per wave: 2, 5, 4, 8, 3, 3, 4, 7 — no
+downward trend across eight waves.
+
+### Convergence iron rules
+
+1. **Hard cap = 3 effective rounds from adoption.** Wave 13 is retroactively **Round 1**.
+   Wave 14 is Round 2, wave 15 is Round 3. If open Blockers remain after Round 3,
+   **stop reviewing** and escalate to the user. A fourth round is forbidden.
+2. **Only Round 1 is a full audit.** Its output — the ledger below — is the single
+   authoritative list of open Blockers for the remainder of the review.
+3. **Round 2+ is delta-only.** Each reviewer answers exactly one closed question per
+   ledger entry: *"has this Blocker been closed: yes / no; if no, which frozen
+   criterion does it still violate?"* Re-auditing unchanged areas is forbidden.
+4. **New Blockers are accepted in one case only**: a regression **directly introduced**
+   by a fix for a ledger entry, which also passes the admission threshold. Everything
+   else becomes a Follow-up and does not block.
+5. **Disputes default to pass.** If reviewers disagree on whether something is a Blocker
+   and the threshold does not settle it, it is **not** a Blocker; record it as a risk.
+6. **Converged when a round produces no new threshold-passing Blocker** — confirming old
+   ones closed is enough. Convergence does not require a zero-defect implementation.
+
+### Blocker admission threshold — all three, or automatic downgrade
+
+1. **Concrete and falsifiable**: a named file:line, command output, or reproducible
+   observation. Not "this might not handle X".
+2. **In scope**: corresponds to a requirement or acceptance criterion **already written**
+   in this plan or in a contract this plan declares (e.g. `docs/plugin-authoring.md`).
+   A reviewer may **not** introduce a new goal, feature, or quality bar.
+3. **Not taste, not a technology preference**: "I would have used another design" is
+   never a Blocker.
+
+Failing any one → downgraded to Follow-up in the backlog; it does **not** block release.
+
+### Round 1 ledger (frozen — the only tracked list)
+
+| # | Source | Blocker | Todo | Status |
+|---|---|---|---|---|
+| 1 | F1 w13 | criterion 4: measured v1 plugin SDK routes answer 501 | 175 | closed, merged |
+| 2 | F3-W13-07 | `tool.definition` unusable by any JS plugin; host blames the plugin for its own truncation | 172 | open |
+| 3 | F3-W13-01 | plugin `auth.loader` failure kills `run`, `models` and HTTP turns | 173 | open |
+| 4 | F2-B7 | version gate reads the wrong manifest field and loads incompatibles the docs say are skipped | 174 | open |
+| 5 | F3-W13-05 | top-level config `model` key parsed, echoed, then ignored | 177 | closed, merged |
+| 6 | F4 w13 | `PluginInput.client` is an unprojected model boundary a live installed plugin uses | 176 | open |
+
+Plus **todo 178**, not a review finding: the host's upstream `opencode` was upgraded to
+1.18.18 mid-session while the oracle pins 1.18.15. Environmental, must be fixed regardless.
+
+### Follow-up backlog (recorded, non-blocking)
+
+Carried from F2's wave-11/12/13 non-blocking observations and F3's lower-severity
+findings. These are real and recorded, and explicitly **do not** block acceptance:
+`ProviderRetryPolicy` has no production caller; the malformed-plugin-model diagnostic is
+unguarded; Antigravity recovery's `tool_use_id` is not covered end to end; the published
+OpenAPI binds no request/response bodies; `/agent` schema drift is unverifiable against
+the available capture.
+
 - [ ] F1. Plan compliance audit
 - [ ] F2. Code quality review
 - [ ] F3. Real manual QA
