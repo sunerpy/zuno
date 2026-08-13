@@ -214,7 +214,7 @@ impl ApiState {
         self.events.as_ref()
     }
 
-    pub(super) fn pool(&self) -> &Pool {
+    pub(crate) fn pool(&self) -> &Pool {
         &self.pool
     }
 

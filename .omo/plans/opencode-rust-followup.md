@@ -82,6 +82,8 @@ deleting the emission fails it by name.
 
 ## FU-3. Antigravity recovery's `tool_use_id` is not covered end to end
 
+**Status: CLOSED (2026-08-13)** — The v1 adapter now resolves only the pending calls named by submitted ids and rejects unknown ids without writes.
+
 **Source**: F2, non-blocking observation F2-O3, Round 2.
 
 **Verified location**: `crates/oc-server/src/compat_v1.rs:1354-1357` — the route reads and

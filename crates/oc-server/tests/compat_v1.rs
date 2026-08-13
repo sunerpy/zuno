@@ -69,6 +69,65 @@ fn seed_session(state: &ApiState) {
         .expect("fixture session inserts");
 }
 
+fn put_pending_tool(
+    database: &std::path::Path,
+    message_id: &str,
+    part_id: &str,
+    created: i64,
+    call_id: &str,
+) {
+    let pool = Pool::open(&DbLocation::File(database.to_owned()))
+        .expect("adapter database opens for pending tool setup");
+    let connection = pool
+        .get()
+        .expect("adapter database connection opens for pending tool setup");
+    let message = MessageRecord::from_json(json!({
+        "id": message_id,
+        "sessionID": "ses_fixture",
+        "role": "assistant",
+        "time": {"created": created, "completed": created + 1},
+        "parentID": "msg_before_recovery",
+        "modelID": "test",
+        "providerID": "test",
+        "mode": "build",
+        "agent": "build",
+        "path": {"cwd": "/repo", "root": "/repo"},
+        "cost": 0,
+        "tokens": {
+            "input": 0,
+            "output": 0,
+            "reasoning": 0,
+            "cache": {"read": 0, "write": 0}
+        },
+        "finish": "tool-calls"
+    }))
+    .expect("pending tool assistant message is valid");
+    let part = PartRecord::from_json(
+        json!({
+            "id": part_id,
+            "sessionID": "ses_fixture",
+            "messageID": message_id,
+            "type": "tool",
+            "callID": call_id,
+            "tool": "echo",
+            "state": {
+                "status": "pending",
+                "input": {"text": call_id},
+                "raw": format!(r#"{{"text":"{call_id}"}}"#)
+            }
+        }),
+        created,
+    )
+    .expect("pending tool part is valid");
+    let store = MessageStore::new(&connection);
+    store
+        .put_message_at(&message, created)
+        .expect("pending tool assistant message persists");
+    store
+        .put_part_at(&part, created)
+        .expect("pending tool part persists");
+}
+
 #[derive(Debug)]
 struct CompletingMutationExecutor {
     database: PathBuf,
@@ -813,8 +872,22 @@ async fn compat_v1_omo_summarize_uses_the_recorded_body_model() {
 }
 
 #[tokio::test]
-async fn compat_v1_antigravity_recovery_tool_result_reaches_the_prompt_executor() {
+async fn compat_v1_antigravity_recovery_resolves_the_submitted_tool_use_id() {
     let fixture = adapter_fixture();
+    put_pending_tool(
+        &fixture.executor.database,
+        "msg_other_pending_tool",
+        "prt_other_pending_tool",
+        10,
+        "call-other",
+    );
+    put_pending_tool(
+        &fixture.executor.database,
+        "msg_selected_pending_tool",
+        "prt_selected_pending_tool",
+        20,
+        "call-selected",
+    );
     let response = fixture
         .app
         .oneshot(request(
@@ -823,7 +896,7 @@ async fn compat_v1_antigravity_recovery_tool_result_reaches_the_prompt_executor(
             Some(json!({
                 "parts": [{
                     "type": "tool_result",
-                    "tool_use_id": "call_recorded_antigravity",
+                    "tool_use_id": "call-selected",
                     "content": "Operation cancelled by user (ESC pressed)"
                 }]
             })),
@@ -838,6 +911,81 @@ async fn compat_v1_antigravity_recovery_tool_result_reaches_the_prompt_executor(
         "Operation cancelled by user (ESC pressed)",
         "the recovery content must reach the real prompt executor"
     );
+
+    let pool = Pool::open(&DbLocation::File(fixture.executor.database.clone()))
+        .expect("adapter database reopens after recovery");
+    let connection = pool
+        .get()
+        .expect("adapter database connection opens after recovery");
+    let store = MessageStore::new(&connection);
+    let selected = store
+        .part("prt_selected_pending_tool")
+        .expect("selected pending call remains readable");
+    let other = store
+        .part("prt_other_pending_tool")
+        .expect("other pending call remains readable");
+    assert_eq!(selected.data["state"]["status"], "error");
+    assert_eq!(
+        selected.data["state"]["error"], "Operation cancelled by user (ESC pressed)",
+        "the submitted id must receive its submitted result"
+    );
+    assert_eq!(selected.data["state"]["metadata"]["interrupted"], true);
+    assert_eq!(
+        other.data["state"]["status"], "pending",
+        "the adapter must not resolve whichever pending call happens to come first"
+    );
+}
+
+#[tokio::test]
+async fn compat_v1_antigravity_recovery_rejects_an_unknown_tool_use_id_without_writes() {
+    let fixture = adapter_fixture();
+    put_pending_tool(
+        &fixture.executor.database,
+        "msg_first_pending_tool",
+        "prt_first_pending_tool",
+        10,
+        "call-first",
+    );
+    put_pending_tool(
+        &fixture.executor.database,
+        "msg_second_pending_tool",
+        "prt_second_pending_tool",
+        20,
+        "call-second",
+    );
+
+    let response = fixture
+        .app
+        .oneshot(request(
+            Method::POST,
+            "/session/ses_fixture/message",
+            Some(json!({
+                "parts": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call-unknown",
+                    "content": "Operation cancelled by user (ESC pressed)"
+                }]
+            })),
+        ))
+        .await
+        .expect("an unknown recovery id receives an HTTP response");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let pool = Pool::open(&DbLocation::File(fixture.executor.database.clone()))
+        .expect("adapter database reopens after rejected recovery");
+    let connection = pool
+        .get()
+        .expect("adapter database connection opens after rejected recovery");
+    let store = MessageStore::new(&connection);
+    for part_id in ["prt_first_pending_tool", "prt_second_pending_tool"] {
+        let part = store
+            .part(part_id)
+            .expect("pending call remains readable after rejection");
+        assert_eq!(
+            part.data["state"]["status"], "pending",
+            "unknown ids must not partially resolve another pending call"
+        );
+    }
 }
 
 #[tokio::test]

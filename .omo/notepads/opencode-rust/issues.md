@@ -7708,3 +7708,19 @@ regressions, changed-file diagnostics, the complete workspace test suite, zero-w
 rustfmt, and diff checks passed. The first workspace run encountered the already-known host
 `WouldBlock` resource limit; the single-job, single-test-thread retry completed without skipping
 tests.
+
+## [2026-08-13] FU-3 — Antigravity recovery now consumes `tool_use_id`
+
+The installed `opencode-antigravity-auth@1.6.0` recovery code extracts every concrete
+`tool_use.id` from the failed assistant message and submits one `tool_result` per id.
+Therefore the field selects a pending call; it is not merely evidence that the session
+has some unfinished call. The v1 adapter now validates the complete submitted id set
+before writing, resolves only the named pending parts with their submitted cancellation
+content, and returns 404 for an unknown/stale id so the plugin's existing catch path can
+report recovery failure.
+
+The route regression seeds two pending calls and proves only the submitted id changes.
+Its unknown-id companion proves neither pending call changes on rejection. Temporarily
+restoring validate-and-drop made the named-call test fail with `pending` versus `error`,
+then the exact backup was restored. Full transcripts are in
+`.omo/evidence/task-fu3-opencode-rust.txt`.
