@@ -187,6 +187,72 @@ projection is typed, remove it and prove the removal changes nothing observable.
 
 ---
 
+## FU-7. Cap the retry worst case at 3 minutes and make retrying visible
+
+**Source**: the user, 2026-08-13, on reviewing FU-1's measured timing bound:
+*"需要优化 6 分钟的重试，可以选择性增加一些必要输出（比如红色的重试中），最长 3 分钟的时间是极限了"*.
+
+**The measurement that prompted it.** FU-1 wired `ProviderRetryPolicy` into `run_turn` with
+`PROVIDER_RETRY_MAX_ATTEMPTS = 3` (`crates/oc-engine/src/loop.rs:45`). That composes with todo
+154/166's 120-second idle timeout, so a provider that stalls **without a status code and before
+emitting any output** can consume 3 × 120s = **360 seconds**. FU-1 recorded this honestly rather
+than hiding it. After any generated output the cost is one idle window, because generated text is
+not rolled back and the error surfaces immediately.
+
+**Two requirements, and they are independent.**
+
+### (a) Hard ceiling: 180 seconds
+
+The user's limit is explicit. **Do not simply set attempts to 2** and call it done — 2 × 120s is
+still 240s. The ceiling must hold as a property, not as an arithmetic coincidence of two constants
+that a later change to either one can break.
+
+Prefer a **deadline** the retry loop honours: record the first attempt's start, and refuse a further
+replay once elapsed + the next idle window would exceed the ceiling. That survives someone later
+changing `PROVIDER_RETRY_MAX_ATTEMPTS` or the idle timeout. Whatever mechanism is chosen, a test
+must pin the **total**, not the factors.
+
+Note there is already a precedent for capping a bound rather than trusting its inputs: todo 154
+capped user overrides of the idle timeout at 180s. Reuse that thinking, and check whether the same
+constant should be shared rather than duplicated.
+
+### (b) Make retrying visible in the human-facing surfaces
+
+**Verified current state**: `StreamEvent::RetryRollback { attempt, max }` is already emitted before
+every sleep and replay (`crates/oc-engine/src/retry.rs:248`), and the JSON surface already renders
+it as `{"type":"retry_rollback","attempt":…,"max":…}` (`crates/oc-cli/src/cmd/run.rs:288`).
+
+**But no human-readable surface shows anything.** The TUI consumes the event only to *discard*
+partial parts (`crates/oc-tui/src/views/message.rs:415`) — correct behaviour, since keeping them
+would render the answer twice — and prints nothing. So a user watching a stalled turn sees silence
+for up to the full ceiling.
+
+Show it, in red, on the surfaces a person reads: the plain `run` output and the TUI. The event
+already carries `attempt` and `max`, so the message can say which attempt is in flight.
+
+**Check for an existing colour idiom before adding one.** A grep for `Color::Red` found nothing in
+`oc-cli`, so establish how this workspace already styles warnings — and if it does not, whether
+adding a styling dependency is justified for one message, or whether the TUI's own renderer already
+provides colour. Do not introduce a new dependency casually; this project's dependency discipline
+is the reason it has zero first-party `unsafe`.
+
+**Respect non-TTY output.** A red escape sequence written into a pipe or a log is noise. Follow
+whatever the workspace already does for TTY detection; if nothing exists, plain text on non-TTY.
+
+**Acceptance criteria (agent-executable)**:
+- A test drives repeated status-less transient stalls and asserts the **total** elapsed bound is at
+  or under 180s — not that attempts equal some number. Changing either `PROVIDER_RETRY_MAX_ATTEMPTS`
+  or the idle timeout alone must not be able to breach it; prove that by mutating each and observing
+  the bound test still holds or fails loudly.
+- A retry emits a visible, red, human-readable notice naming the attempt and the max on the plain
+  `run` surface and in the TUI; a test asserts the rendered bytes contain the notice.
+- On a non-TTY sink the notice carries no escape sequences.
+- The JSON surface's `retry_rollback` shape is unchanged — it is a public output contract.
+- Todo 154/166's behaviour still holds: a stall after generated output preserves the partial text
+  and surfaces the idle error immediately, with no replay.
+- Removing the notice fails the visibility test by name; removing the ceiling fails the bound test
+  by name.
+
 ## Working rules for whoever picks these up
 
 Carried from the main plan, because each was learned the hard way:
