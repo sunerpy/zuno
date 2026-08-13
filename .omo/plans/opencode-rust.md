@@ -1551,7 +1551,7 @@ Failing any one → downgraded to Follow-up in the backlog; it does **not** bloc
 | 3 | F3-W13-01 | plugin `auth.loader` failure kills `run`, `models` and HTTP turns | 173 | open |
 | 4 | F2-B7 | version gate reads the wrong manifest field and loads incompatibles the docs say are skipped | 174 | closed |
 | 5 | F3-W13-05 | top-level config `model` key parsed, echoed, then ignored | 177 | closed, merged |
-| 6 | F4 w13 | `PluginInput.client` is an unprojected model boundary a live installed plugin uses | 176 | open (R2: 179) |
+| 6 | F4 w13 | `PluginInput.client` is an unprojected model boundary a live installed plugin uses | 176 | closed, merged (179) |
 
 Plus **todo 178**, not a review finding: the host's upstream `opencode` was upgraded to
 1.18.18 mid-session while the oracle pins 1.18.15. Environmental, must be fixed regardless.
@@ -1567,6 +1567,27 @@ question per entry — "is this Blocker closed: yes / no" — and may raise a ne
 **only** for a regression directly introduced by one of these six fixes. Anything else
 is a Follow-up. Per iron rule 6, a round that produces no new threshold-passing Blocker
 converges immediately.
+
+### Round 2 result (2026-08-13)
+
+**F1 APPROVE, F2 APPROVE, F3 APPROVE, F4 REJECT** — F4 alone, and only on entry 6: the
+`/provider` wrong-answer path was genuinely repaired, but todo 176's own acceptance
+wording ("a new unprojected **arrival path** [must be] a compile error") was unmet
+because the arrival taxonomy was handwritten and disconnected from the generated SDK
+types. **Todo 179 closed it**: `oc-plugin-sdk/build.rs` generates the arrival enum from
+the pinned OpenAPI capture and `JsModelArrival::projection()` matches it exhaustively.
+
+Orchestrator-verified causally, not just by test name: injecting a `Model`-bearing route
+into the capture makes `cargo build -p oc-plugin` fail with
+`E0004: non-exhaustive patterns: JsModelArrival::GeneratedClient(GeneratedClientArrival::Probe179Check) not covered`;
+adding a wildcard arm to the match makes the identical probe compile again. Both restored.
+
+**All six ledger entries are now closed. Round 3 is a delta-only re-verification of
+entry 6 for F4 alone; F1, F2 and F3 already approved this ledger.**
+
+Two items F4 explicitly ruled **Follow-up, non-blocking**: the unguarded
+`release_date` restoration at `projection.rs:275` (predates todo 176 per `git blame`),
+and the previously recorded backlog below.
 
 ### Follow-up backlog (recorded, non-blocking)
 
