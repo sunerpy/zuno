@@ -741,7 +741,7 @@ impl JsHost {
         &self,
         handle: &JsHandle,
         arguments: Vec<Value>,
-    ) -> Result<(Value, Vec<Value>), JsHostError> {
+    ) -> Result<(Value, Vec<Value>, Value), JsHostError> {
         let inner = Arc::clone(&self.inner);
         let executor = inner.executor.clone();
         let id = handle.id;
@@ -759,7 +759,8 @@ impl JsHost {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        Ok((value, arguments))
+        let truncations = frame.get("truncations").cloned().unwrap_or(Value::Null);
+        Ok((value, arguments, truncations))
     }
 
     pub(crate) fn constant_function(&self, value: Value) -> JsHostFunction {

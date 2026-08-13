@@ -93,20 +93,98 @@ function retain(fn) {
 
 // Depth cap rather than full generality: an unbounded walk over a plugin's
 // internal object graph is how a bounded-memory host stops being bounded.
-const MAX_DEPTH = 8;
+const MAX_DEPTH = 16;
 
 function childPointer(path, key) {
   const segment = String(key).replaceAll("~", "~0").replaceAll("/", "~1");
   return `${path}/${segment}`;
 }
 
-function encode(value, depth = 0, seen = new Set(), path = "") {
+function hostBoundaries(
+  value,
+  depth = 0,
+  seen = new Set(),
+  path = "",
+  boundaries = new Map(),
+) {
+  if (value === null || typeof value !== "object") return boundaries;
+  if (depth >= MAX_DEPTH) {
+    boundaries.set(path || "/", value);
+    return boundaries;
+  }
+  if (seen.has(value)) return boundaries;
+  if (value instanceof Error || value instanceof URL || value instanceof Date) {
+    return boundaries;
+  }
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      value.forEach((item, index) =>
+        hostBoundaries(
+          item,
+          depth + 1,
+          seen,
+          childPointer(path, index),
+          boundaries,
+        ),
+      );
+      return boundaries;
+    }
+    for (const key of Object.keys(value)) {
+      let member;
+      try {
+        member = value[key];
+      } catch {
+        continue;
+      }
+      hostBoundaries(
+        member,
+        depth + 1,
+        seen,
+        childPointer(path, key),
+        boundaries,
+      );
+    }
+    return boundaries;
+  } finally {
+    seen.delete(value);
+  }
+}
+
+function mutationTouchesBoundary(mutations, pointer) {
+  if (!mutations) return false;
+  if (pointer === "/") return mutations.size > 0;
+  const prefix = `${pointer}/`;
+  for (const path of mutations) {
+    if (path === pointer || path.startsWith(prefix)) return true;
+  }
+  return false;
+}
+
+function encode(
+  value,
+  depth = 0,
+  seen = new Set(),
+  path = "",
+  boundaries,
+  mutations,
+  truncations,
+) {
   if (value === null || value === undefined) return null;
   const kind = typeof value;
   if (kind === "function") return { $fn: retain(value), $arity: value.length };
   if (kind === "bigint") return { $bigint: value.toString() };
   if (kind !== "object") return value;
-  if (depth >= MAX_DEPTH) return { $truncated: true, $path: path || "/" };
+  if (depth >= MAX_DEPTH) {
+    const pointer = path || "/";
+    const source =
+      boundaries?.get(pointer) === value &&
+      !mutationTouchesBoundary(mutations, pointer)
+        ? "host"
+        : "plugin";
+    truncations?.push({ path: pointer, source });
+    return { $truncated: true, $path: pointer, $source: source };
+  }
   if (seen.has(value)) return { $cycle: true };
   if (value instanceof Error) {
     return { $error: value.message ?? String(value), $name: value.name };
@@ -117,7 +195,15 @@ function encode(value, depth = 0, seen = new Set(), path = "") {
   try {
     if (Array.isArray(value)) {
       return value.map((item, index) =>
-        encode(item, depth + 1, seen, childPointer(path, index)),
+        encode(
+          item,
+          depth + 1,
+          seen,
+          childPointer(path, index),
+          boundaries,
+          mutations,
+          truncations,
+        ),
       );
     }
     const out = {};
@@ -128,7 +214,15 @@ function encode(value, depth = 0, seen = new Set(), path = "") {
       } catch {
         continue; // A throwing getter is not worth failing the whole encode.
       }
-      out[key] = encode(member, depth + 1, seen, childPointer(path, key));
+      out[key] = encode(
+        member,
+        depth + 1,
+        seen,
+        childPointer(path, key),
+        boundaries,
+        mutations,
+        truncations,
+      );
     }
     return out;
   } finally {
@@ -767,9 +861,32 @@ async function handleRequest(frame) {
     case "call": {
       const fn = handles.get(params.handle);
       if (!fn) throw new Error(`handle ${params.handle} is no longer retained`);
-      const args = (params.args ?? []).map(decodeArgument);
+      const mutations = (params.args ?? []).map(() => new Set());
+      const args = (params.args ?? []).map((argument, index) =>
+        decodeArgument(argument, mutations[index]),
+      );
+      const boundaries = args.map((argument) => hostBoundaries(argument));
       const value = await fn(...args);
-      respond(id, { value: encode(value), args: args.map((argument) => encode(argument)) });
+      const encoded = args.map((argument, index) => {
+        const truncations = [];
+        return {
+          value: encode(
+            argument,
+            0,
+            new Set(),
+            "",
+            boundaries[index],
+            mutations[index],
+            truncations,
+          ),
+          truncations,
+        };
+      });
+      respond(id, {
+        value: encode(value),
+        args: encoded.map((argument) => argument.value),
+        truncations: encoded.map((argument) => argument.truncations),
+      });
       return;
     }
     case "tool.call": {
@@ -865,7 +982,25 @@ async function handleRequest(frame) {
 // A host-supplied argument may itself name a handle the plugin gave us earlier
 // (an auth `loader` receives a `getAuth` callable). Rebuilding it as a real
 // function keeps the plugin's own call shape intact.
-function decodeArgument(value) {
+function mutationProxy(value, mutations, path) {
+  if (!mutations) return value;
+  return new Proxy(value, {
+    set(target, key, member, receiver) {
+      mutations.add(childPointer(path, key));
+      return Reflect.set(target, key, member, receiver);
+    },
+    deleteProperty(target, key) {
+      mutations.add(childPointer(path, key));
+      return Reflect.deleteProperty(target, key);
+    },
+    defineProperty(target, key, descriptor) {
+      mutations.add(childPointer(path, key));
+      return Reflect.defineProperty(target, key, descriptor);
+    },
+  });
+}
+
+function decodeArgument(value, mutations, path = "") {
   if (isRecord(value) && typeof value.$hostFn === "number") {
     const target = value.$hostFn;
     return async (...args) => {
@@ -873,11 +1008,22 @@ function decodeArgument(value) {
       return result?.value ?? null;
     };
   }
-  if (Array.isArray(value)) return value.map(decodeArgument);
+  if (Array.isArray(value)) {
+    const decoded = value.map((member, index) =>
+      decodeArgument(member, mutations, childPointer(path, index)),
+    );
+    return mutationProxy(decoded, mutations, path);
+  }
   if (isRecord(value)) {
     const out = {};
-    for (const [key, member] of Object.entries(value)) out[key] = decodeArgument(member);
-    return out;
+    for (const [key, member] of Object.entries(value)) {
+      out[key] = decodeArgument(
+        member,
+        mutations,
+        childPointer(path, key),
+      );
+    }
+    return mutationProxy(out, mutations, path);
   }
   return value;
 }
