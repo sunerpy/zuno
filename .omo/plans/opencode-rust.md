@@ -1551,7 +1551,7 @@ Failing any one → downgraded to Follow-up in the backlog; it does **not** bloc
 | 3 | F3-W13-01 | plugin `auth.loader` failure kills `run`, `models` and HTTP turns | 173 | open |
 | 4 | F2-B7 | version gate reads the wrong manifest field and loads incompatibles the docs say are skipped | 174 | closed |
 | 5 | F3-W13-05 | top-level config `model` key parsed, echoed, then ignored | 177 | closed, merged |
-| 6 | F4 w13 | `PluginInput.client` is an unprojected model boundary a live installed plugin uses | 176 | closed, merged |
+| 6 | F4 w13 | `PluginInput.client` is an unprojected model boundary a live installed plugin uses | 176 | open (R2: 179) |
 
 Plus **todo 178**, not a review finding: the host's upstream `opencode` was upgraded to
 1.18.18 mid-session while the oracle pins 1.18.15. Environmental, must be fixed regardless.
@@ -1576,6 +1576,10 @@ findings. These are real and recorded, and explicitly **do not** block acceptanc
 unguarded; Antigravity recovery's `tool_use_id` is not covered end to end; the published
 OpenAPI binds no request/response bodies; `/agent` schema drift is unverifiable against
 the available capture.
+
+- [ ] 179. `crates/oc-plugin/src/js/projection.rs` + the arrival classifier: make a new unprojected arrival path fail at COMPILE time, not at runtime - expect todo 176's stated acceptance criterion to actually hold
+  What to do / Must NOT do: **F4's Round 2 finding — ledger entry 6 is the only one still open, and the gap is narrow and specific.** The wrong-answer path is genuinely repaired: `/provider` now projects a typed legacy document straight from the canonical catalogue (`crates/oc-server/src/api/provider.rs:282-327,808-837`), the lossy ad-hoc adapter is gone, and four exact tests pass. What is **not** satisfied is todo 176's own acceptance wording at `.omo/plans/opencode-rust.md:1477`: *"the structural guard makes a new unprojected **arrival path** a compile error, not merely a new hook variant."* F4's judgment: the arrival taxonomy is **handwritten and disconnected** from the generated SDK response types and the server route registrations, so it is a defensible one-time audit of the currently pinned SDK rather than a durable guard — a newly generated Model/Provider-bearing response, or a newly registered route, can be added without any compile error. Bind the taxonomy to something the compiler checks: derive the arrival set from the generated types or the route registrations so adding one without a projection fails to build. Must NOT settle for a runtime assertion or a test that enumerates today's arrivals — that is exactly what F4 rejected. Must NOT re-do the projection work itself; entries 1-5 and the `/provider` repair are closed and must stay closed.
+  Acceptance criteria (agent-executable): adding a Model/Provider-bearing arrival without a projection **fails `cargo build`**, demonstrated by a recorded probe that introduces one and shows the compiler error; the existing four projection tests and the generated-arrival/non-hook-resource classifiers still pass; `cargo test --workspace --offline` stays at or above 3473 passing / 0 failed with 0 clippy warnings.
 
 - [ ] F1. Plan compliance audit
 - [ ] F2. Code quality review
