@@ -34,8 +34,8 @@ use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::js::projection::{
-    HookModelBoundary, SdkGeneration, chat_context_value, model_value, plugin_model,
-    provider_source, provider_value,
+    HookModelBoundary, JsModelArrival, JsModelProjection, SdkGeneration, chat_context_value,
+    model_value, plugin_model, provider_source, provider_value,
 };
 use crate::{
     ChatHeadersOutput, ChatParamsOutput, ChatSystemTransformOutput, CompactionAutocontinueOutput,
@@ -958,6 +958,7 @@ struct RemoteToolFailure(String);
 
 pub(crate) fn encode_hook(hook: &HookInvocation<'_>) -> Result<HookCall, HookCodecError> {
     let model_boundary = HookModelBoundary::classify(hook);
+    let model_projection = JsModelArrival::Hook(model_boundary).projection();
     let (input, output) = match hook {
         HookInvocation::Dispose => (Value::Null, Value::Null),
         HookInvocation::Event { event } => (json!({ "event": event_value(event)? }), Value::Null),
@@ -971,7 +972,7 @@ pub(crate) fn encode_hook(hook: &HookInvocation<'_>) -> Result<HookCall, HookCod
         }
         HookInvocation::ChatMessage { input, output } => (
             {
-                debug_assert_eq!(model_boundary, HookModelBoundary::ModelSelection);
+                debug_assert_eq!(model_projection, JsModelProjection::ModelSelection);
                 json!({
                 "sessionID": input.session_id,
                 "agent": input.agent,
@@ -990,7 +991,7 @@ pub(crate) fn encode_hook(hook: &HookInvocation<'_>) -> Result<HookCall, HookCod
         ),
         HookInvocation::ChatParams { input, output } => (
             {
-                debug_assert_eq!(model_boundary, HookModelBoundary::LegacyContext);
+                debug_assert_eq!(model_projection, JsModelProjection::LegacySdk);
                 chat_context_value(input).into_json()
             },
             json!({
@@ -1003,7 +1004,7 @@ pub(crate) fn encode_hook(hook: &HookInvocation<'_>) -> Result<HookCall, HookCod
         ),
         HookInvocation::ChatHeaders { input, output } => (
             {
-                debug_assert_eq!(model_boundary, HookModelBoundary::LegacyContext);
+                debug_assert_eq!(model_projection, JsModelProjection::LegacySdk);
                 chat_context_value(input).into_json()
             },
             json!({ "headers": output.headers }),
@@ -1053,7 +1054,7 @@ pub(crate) fn encode_hook(hook: &HookInvocation<'_>) -> Result<HookCall, HookCod
         ),
         HookInvocation::ChatSystemTransform { input, output } => (
             {
-                debug_assert_eq!(model_boundary, HookModelBoundary::LegacyModel);
+                debug_assert_eq!(model_projection, JsModelProjection::LegacySdk);
                 json!({
                 "sessionID": input.session_id,
                 "model": model_value(input.model, SdkGeneration::Legacy).into_json(),
@@ -1063,7 +1064,7 @@ pub(crate) fn encode_hook(hook: &HookInvocation<'_>) -> Result<HookCall, HookCod
         ),
         HookInvocation::ProviderSmallModel { input, output } => (
             {
-                debug_assert_eq!(model_boundary, HookModelBoundary::V2ProviderAndModel);
+                debug_assert_eq!(model_projection, JsModelProjection::V2Sdk);
                 json!({
                     "provider": provider_value(
                         input.provider,
@@ -1084,7 +1085,7 @@ pub(crate) fn encode_hook(hook: &HookInvocation<'_>) -> Result<HookCall, HookCod
             json!({ "context": output.context, "prompt": output.prompt }),
         ),
         HookInvocation::CompactionAutocontinue { input, output } => {
-            debug_assert_eq!(model_boundary, HookModelBoundary::LegacyContext);
+            debug_assert_eq!(model_projection, JsModelProjection::LegacySdk);
             let mut value = chat_context_value(input.context).into_json();
             let object = value.as_object_mut().ok_or_else(|| {
                 HookCodecError::Invalid("chat context must encode as an object".to_owned())

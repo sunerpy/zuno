@@ -422,6 +422,59 @@ async fn compat_v1_backed_sdk_routes_return_expected_catalog_and_session_shapes(
     assert_eq!(response_json(aborted).await, json!(true));
 }
 
+#[tokio::test]
+async fn compat_v1_provider_projection_preserves_catalog_model_semantics() {
+    // Given: the pinned catalogue carries both an ordinary chat model and a
+    // reasoning model with a YYYY-MM-DD release date. `/api/model` converts that
+    // date to epoch milliseconds, but the generated legacy SDK requires the
+    // original date string on `/provider`.
+    let app = adapter_fixture().app;
+
+    // When
+    let response = app
+        .oneshot(request(Method::GET, "/provider", None))
+        .await
+        .expect("provider adapter responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    let deepseek = body["all"]
+        .as_array()
+        .and_then(|providers| {
+            providers
+                .iter()
+                .find(|provider| provider["id"] == "deepseek")
+        })
+        .expect("deepseek provider is available");
+    let chat = &deepseek["models"]["deepseek-chat"];
+    let reasoner = &deepseek["models"]["deepseek-reasoner"];
+
+    // Then: source catalogue semantics survive exactly once. In particular,
+    // `release_date` must not contain the already-converted epoch milliseconds.
+    assert_eq!(deepseek["env"], json!(["DEEPSEEK_API_KEY"]));
+    assert_eq!(deepseek["api"], "https://api.deepseek.com");
+    assert_eq!(deepseek["npm"], "@ai-sdk/openai-compatible");
+    assert_eq!(chat["release_date"], "2025-12-01");
+    assert_eq!(chat["reasoning"], false);
+    assert_eq!(chat["temperature"], true);
+    assert_eq!(chat["tool_call"], true);
+    assert_eq!(chat["modalities"]["input"], json!(["text"]));
+    assert_eq!(chat["modalities"]["output"], json!(["text"]));
+    assert_eq!(
+        chat["limit"],
+        json!({"context": 1_000_000, "output": 384_000})
+    );
+    assert_eq!(
+        chat["cost"],
+        json!({
+            "input": 0.14,
+            "output": 0.28,
+            "cache_read": 0.0028,
+            "cache_write": 0
+        })
+    );
+    assert_eq!(reasoner["reasoning"], true);
+}
+
 /// Every v1 session body carries every key the published `Session` schema requires.
 ///
 /// The required set is read off two documents rather than typed here: the OpenAPI

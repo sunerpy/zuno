@@ -40,7 +40,8 @@ use serde_json::{Value, json};
 
 use crate::js::host::{JsHandle, JsHost};
 use crate::js::projection::{
-    SdkGeneration, credential_key, plugin_model, plugin_provider, provider_source, provider_value,
+    JsModelArrival, JsModelProjection, SdkGeneration, credential_key, plugin_model,
+    plugin_provider, provider_source, provider_value,
 };
 use crate::{
     AuthApiAuthorizer, AuthApiResult, AuthAutoCallback, AuthCallbackResult, AuthCredentialResolver,
@@ -313,6 +314,10 @@ impl AuthLoader for HandleAuthLoader {
         auth: &dyn AuthCredentialResolver,
         provider: &mut ResolvedProvider,
     ) -> Result<JsonMap, BoxSource> {
+        debug_assert_eq!(
+            JsModelArrival::AuthLoader.projection(),
+            JsModelProjection::LegacySdk
+        );
         let credential = auth.resolve().await?;
         let get_auth = self
             .host
@@ -484,6 +489,10 @@ impl ProviderModelLoader for HandleModelLoader {
         provider: &ResolvedProvider,
         context: ProviderHookContext<'_>,
     ) -> Result<BTreeMap<String, ResolvedModel>, BoxSource> {
+        debug_assert_eq!(
+            JsModelArrival::ProviderModels.projection(),
+            JsModelProjection::V2Sdk
+        );
         let value = self
             .host
             .call(

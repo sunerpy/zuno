@@ -20,6 +20,82 @@ pub(crate) enum HookModelBoundary {
     V2ProviderAndModel,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JsModelProjection {
+    None,
+    ModelSelection,
+    LegacySdk,
+    V2Sdk,
+    LegacyCatalogHttp,
+    V2ModelHttp,
+    V2ProviderHttp,
+    Unbacked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GeneratedClientArrival {
+    ConfigProviders,
+    ProviderList,
+    V2ModelList,
+    V2ProviderList,
+    V2ProviderGet,
+    ModelSelection,
+}
+
+impl GeneratedClientArrival {
+    pub(crate) const ALL: [Self; 6] = [
+        Self::ConfigProviders,
+        Self::ProviderList,
+        Self::V2ModelList,
+        Self::V2ProviderList,
+        Self::V2ProviderGet,
+        Self::ModelSelection,
+    ];
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JsModelArrival {
+    Hook(HookModelBoundary),
+    AuthLoader,
+    ProviderModels,
+    PluginTools,
+    AuthMethods,
+    WorkspaceRegistration,
+    GeneratedClient(GeneratedClientArrival),
+}
+
+impl JsModelArrival {
+    pub(crate) const fn projection(self) -> JsModelProjection {
+        match self {
+            Self::Hook(HookModelBoundary::None)
+            | Self::PluginTools
+            | Self::AuthMethods
+            | Self::WorkspaceRegistration => JsModelProjection::None,
+            Self::Hook(HookModelBoundary::ModelSelection)
+            | Self::GeneratedClient(GeneratedClientArrival::ModelSelection) => {
+                JsModelProjection::ModelSelection
+            }
+            Self::Hook(HookModelBoundary::LegacyContext | HookModelBoundary::LegacyModel)
+            | Self::AuthLoader => JsModelProjection::LegacySdk,
+            Self::Hook(HookModelBoundary::V2ProviderAndModel) | Self::ProviderModels => {
+                JsModelProjection::V2Sdk
+            }
+            Self::GeneratedClient(GeneratedClientArrival::ConfigProviders) => {
+                JsModelProjection::Unbacked
+            }
+            Self::GeneratedClient(GeneratedClientArrival::ProviderList) => {
+                JsModelProjection::LegacyCatalogHttp
+            }
+            Self::GeneratedClient(GeneratedClientArrival::V2ModelList) => {
+                JsModelProjection::V2ModelHttp
+            }
+            Self::GeneratedClient(
+                GeneratedClientArrival::V2ProviderList | GeneratedClientArrival::V2ProviderGet,
+            ) => JsModelProjection::V2ProviderHttp,
+        }
+    }
+}
+
 impl HookModelBoundary {
     pub(crate) const fn classify(hook: &HookInvocation<'_>) -> Self {
         match hook {
@@ -260,5 +336,47 @@ const fn source_name(source: ProviderSource) -> &'static str {
         ProviderSource::Config => "config",
         ProviderSource::Custom => "custom",
         ProviderSource::Api => "api",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_generated_client_model_arrival_has_an_explicit_projection() {
+        let projections = GeneratedClientArrival::ALL
+            .map(|arrival| JsModelArrival::GeneratedClient(arrival).projection());
+        assert_eq!(
+            projections,
+            [
+                JsModelProjection::Unbacked,
+                JsModelProjection::LegacyCatalogHttp,
+                JsModelProjection::V2ModelHttp,
+                JsModelProjection::V2ProviderHttp,
+                JsModelProjection::V2ProviderHttp,
+                JsModelProjection::ModelSelection,
+            ]
+        );
+    }
+
+    #[test]
+    fn every_non_hook_resource_arrival_has_an_explicit_projection() {
+        assert_eq!(
+            [
+                JsModelArrival::AuthLoader.projection(),
+                JsModelArrival::ProviderModels.projection(),
+                JsModelArrival::PluginTools.projection(),
+                JsModelArrival::AuthMethods.projection(),
+                JsModelArrival::WorkspaceRegistration.projection(),
+            ],
+            [
+                JsModelProjection::LegacySdk,
+                JsModelProjection::V2Sdk,
+                JsModelProjection::None,
+                JsModelProjection::None,
+                JsModelProjection::None,
+            ]
+        );
     }
 }
