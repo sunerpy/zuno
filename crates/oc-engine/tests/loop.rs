@@ -9,8 +9,8 @@ use oc_db::{Connection, migration, open};
 use oc_engine::interrupt::InterruptSignal;
 use oc_engine::r#loop::{
     AgentModelResolver, AvailableTools, DispatchRequest, ResolvedAgent, ResolvedModel,
-    RunTurnRequest, ToolDispatchResult, ToolDispatcher, TurnContext, TurnEvent, TurnOutcome,
-    event_channel, hydrate_retained_history, project_history, project_history_owned,
+    RunTurnRequest, ToolDispatchResult, ToolDispatcher, TurnContext, TurnError, TurnEvent,
+    TurnOutcome, event_channel, hydrate_retained_history, project_history, project_history_owned,
     retained_history, run_turn,
 };
 use oc_error::ProviderError;
@@ -25,14 +25,23 @@ use tokio::sync::mpsc;
 
 const SESSION_ID: &str = "ses_loop_test";
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct ScriptedResponse {
-    events: Vec<StreamEvent>,
+    events: Vec<Result<StreamEvent, ProviderError>>,
     hang_after: bool,
 }
 
 impl ScriptedResponse {
     fn complete(events: Vec<StreamEvent>) -> Self {
+        Self {
+            events: events.into_iter().map(Ok).collect(),
+            hang_after: false,
+        }
+    }
+
+    fn failed(events: Vec<StreamEvent>, error: ProviderError) -> Self {
+        let mut events = events.into_iter().map(Ok).collect::<Vec<_>>();
+        events.push(Err(error));
         Self {
             events,
             hang_after: false,
@@ -41,7 +50,7 @@ impl ScriptedResponse {
 
     fn hanging(events: Vec<StreamEvent>) -> Self {
         Self {
-            events,
+            events: events.into_iter().map(Ok).collect(),
             hang_after: true,
         }
     }
@@ -86,7 +95,7 @@ impl Provider for FakeProvider {
             .expect("response lock")
             .pop_front()
             .expect("one scripted response per provider request");
-        let events = stream::iter(response.events.into_iter().map(Ok::<_, ProviderError>));
+        let events = stream::iter(response.events);
         if response.hang_after {
             Box::pin(events.chain(stream::pending()))
         } else {
@@ -812,6 +821,182 @@ async fn loop_full_turn_emits_the_exact_sequence_deterministically() {
         rendered_runs.windows(2).all(|pair| pair[0] == pair[1]),
         "the three event transcripts must be byte-identical"
     );
+}
+
+#[tokio::test]
+async fn loop_provider_retry_replays_transient_503_and_rolls_back_partial_output() {
+    let mut connection = seeded();
+    put_user(&connection, "msg_retry_user", 10, "retry once");
+    let provider = Arc::new(FakeProvider::new(vec![
+        ScriptedResponse::failed(
+            vec![StreamEvent::TextDelta("discarded attempt".to_owned())],
+            ProviderError::Transient {
+                status: Some(503),
+                source: None,
+            },
+        ),
+        ScriptedResponse::complete(vec![
+            StreamEvent::TextDelta("completed replay".to_owned()),
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::Stop),
+            },
+        ]),
+    ]));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        request("turn-retry-503"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, events) = tokio::join!(turn, collect_events(receiver));
+
+    assert!(matches!(
+        outcome,
+        Ok(TurnOutcome::Completed { steps: 1, .. })
+    ));
+    assert_eq!(provider.requests().len(), 2);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        TurnEvent::Provider {
+            step: 1,
+            event: StreamEvent::RetryRollback { attempt: 2, max: 3 },
+        }
+    )));
+
+    let hydrated = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .expect("hydrate retried turn");
+    let assistant = hydrated
+        .iter()
+        .find(|message| message.info.id == "msg_turn-retry-503_0001")
+        .expect("retried assistant was persisted");
+    let text = assistant
+        .parts
+        .iter()
+        .find(|part| part.kind == PartKind::Text)
+        .expect("successful replay text was persisted");
+    assert_eq!(text.data["text"], "completed replay");
+}
+
+#[tokio::test]
+async fn loop_provider_retry_is_bounded_and_surfaces_the_final_transient_failure() {
+    let mut connection = seeded();
+    put_user(&connection, "msg_retry_limit_user", 10, "keep failing");
+    let failures = (0..3)
+        .map(|_| {
+            ScriptedResponse::failed(
+                Vec::new(),
+                ProviderError::Transient {
+                    status: Some(503),
+                    source: None,
+                },
+            )
+        })
+        .collect();
+    let provider = Arc::new(FakeProvider::new(failures));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        request("turn-retry-limit"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, events) = tokio::join!(turn, collect_events(receiver));
+
+    assert!(matches!(
+        outcome,
+        Err(TurnError::Provider(ProviderError::Transient {
+            status: Some(503),
+            ..
+        }))
+    ));
+    assert_eq!(provider.requests().len(), 3);
+    let rollbacks = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                TurnEvent::Provider {
+                    event: StreamEvent::RetryRollback { .. },
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(rollbacks, 2);
+}
+
+#[tokio::test]
+async fn loop_provider_retry_never_replays_a_permanent_failure() {
+    let mut connection = seeded();
+    put_user(&connection, "msg_permanent_user", 10, "do not retry");
+    let provider = Arc::new(FakeProvider::new(vec![
+        ScriptedResponse::failed(
+            Vec::new(),
+            ProviderError::Fatal {
+                status: Some(400),
+                source: None,
+            },
+        ),
+        ScriptedResponse::complete(vec![StreamEvent::MessageEnd {
+            stop_reason: Some(FinishReason::Stop),
+        }]),
+    ]));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        request("turn-permanent"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, events) = tokio::join!(turn, collect_events(receiver));
+
+    assert!(matches!(
+        outcome,
+        Err(TurnError::Provider(ProviderError::Fatal {
+            status: Some(400),
+            ..
+        }))
+    ));
+    assert_eq!(provider.requests().len(), 1);
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        TurnEvent::Provider {
+            event: StreamEvent::RetryRollback { .. },
+            ..
+        }
+    )));
 }
 
 #[tokio::test]

@@ -1,0 +1,66 @@
+Task FU-1 — wire the provider retry policy (incremental evidence)
+================================================================
+
+Starting point
+--------------
+- Worktree: `/config/workspace/ProdDir/AI/oc-wt/fu1`, branch `task-fu1`, base `9e8f0e67`.
+- `codegraph_explore` was called first with `ProviderRetryPolicy retry_provider run_turn ProviderError RetryRollback stream`; this sibling worktree has no CodeGraph index, so the allowed Read/Grep fallback was used.
+- `crates/oc-engine/src/retry.rs` defines the finite policy and retry helpers; repository search found callers only in `crates/oc-engine/tests/retry.rs` and `crates/oc-testkit/src/cassettes.rs`, never in production.
+- `run_turn` in `crates/oc-engine/src/loop.rs` constructs `provider.stream(completion)` directly and propagates the first stream `ProviderError` at `let event = next?`. `StepAccumulator::apply` already handles `StreamEvent::RetryRollback` by calling `reset_generated()`.
+- `.omo/evidence/task-166-opencode-rust.txt` confirms this direct path means no retry amplification today and that already-streamed text remains user-visible on an idle timeout, although the failed attempt is not durably checkpointed.
+
+Upstream decision evidence
+--------------------------
+- The installed oracle `/config/.local/share/mise/installs/opencode/1.18.18/opencode --version` reports `1.18.18`.
+- Upstream source `packages/opencode/src/session/retry.ts:68-75` explicitly classifies every HTTP 5xx as retryable, even when the provider SDK does not. Its retry schedule records retry status and applies provider-header or exponential delay (`:176-198`).
+- The production caller is `packages/opencode/src/session/processor.ts:627-675`: the LLM stream is drained and wrapped in `Effect.retry(SessionRetry.policy(...))`, so a transient provider failure replays the production stream instead of ending the turn immediately.
+- The checked-out source labels itself 1.18.13, so an exact installed-1.18.18 black-box probe is recorded separately below before implementation is considered verified.
+- `.omo/refs/jcode/crates/jcode-provider-anthropic-runtime/src/lib.rs:1489-1685` independently shows the intended Rust shape: finite `MAX_RETRIES`, retry only for classified transient failures, emit `RetryRollback` after partial output, and surface the final error. `jcode-message-types/src/lib.rs:713-719` defines rollback as discarding attempt-local text/tool/reasoning before replay.
+
+Choice
+------
+- **Option A — wire it.** Upstream production retries transient provider failures, so removing the policy would create a known parity gap. This port will keep a finite budget, route replay through the existing `RetryRollback`/`StepAccumulator::reset_generated` seam, avoid retrying permanent failures, preserve already-emitted provider events for interfaces, and surface the final provider failure.
+
+Installed 1.18.18 black-box confirmation
+---------------------------------------
+- Probe: `/tmp/opencode/fu1-upstream-probe.py` launched the exact installed 1.18.18 binary with an isolated home and `OPENCODE_CONFIG_CONTENT` registering an OpenAI-compatible loopback provider. The server returned HTTP 503 plus `retry-after-ms: 1` on request 1, then a complete SSE response on request 2.
+- Result (verbatim):
+  ```text
+  REQUEST_COUNT=2
+  REQUEST_PATHS=['/v1/chat/completions', '/v1/chat/completions']
+  EXIT_CODE=0
+  STDOUT='FU1_RETRIED_OK\n'
+  ```
+- This directly proves the installed 1.18.18 production command retries a transient provider 503 and completes from the replay. Option A is therefore decided by both source and the exact release binary, not convenience.
+
+Implementation and focused regressions
+--------------------------------------
+- `run_turn` now invokes `retry_provider` around each provider stream with a finite three-attempt `ProviderRetryPolicy`. The identical prepared request is replayed, ordinary stream events remain incremental, and every retry emits `RetryRollback` through the same bounded `TurnEvent` channel before sleeping and replaying.
+- The existing `StepAccumulator::reset_generated` consumes that rollback and clears text, reasoning, provider reasoning, tool calls, active tool state, finish state, and token accounting from the failed attempt. The successful replay is the only attempt checkpointed.
+- Final transient exhaustion is unwrapped back to the final typed `ProviderError`, and permanent failures return after one request. No error-string classification or dependency was added.
+- A typed compatibility edge preserves todo 154/166: a status-less transient after generated text/reasoning/tool output is surfaced immediately without rollback or replay. HTTP failures such as 503 carry `status=Some(503)` and remain retryable even if the failed attempt emitted partial output.
+- Focused command: `CARGO_TARGET_DIR=/tmp/opencode/fu1 cargo test -p oc-engine --test loop loop_provider_retry --offline` -> 3 passed, 0 failed. The tests prove partial 503 rollback and replay, three-attempt exhaustion with the final 503 surfaced, and no replay for a permanent 400.
+- Idle-timeout regression: `CARGO_TARGET_DIR=/tmp/opencode/fu1 cargo test -p oc-cli a_stalled_provider_ends_a_real_turn_with_partial_text_and_a_visible_idle_error --offline` -> 1 passed, 0 failed. `PARTIAL_T166` remained the only visible text and no `RetryRollback` appeared.
+- Timing bound: a compatible-provider stall after partial output still costs one idle window. Before any generated output, three status-less transient stalls can consume three windows plus 2s + 4s backoff: about 366s at the 120s default, or about 546s at the compatible transport's 180s override cap. The budget is finite; it cannot wait indefinitely.
+
+Mutation proof
+--------------
+- Backed up `crates/oc-engine/src/loop.rs` with `cp ... && test -s ...`, then disabled production replay by changing the finite policy from three attempts to one (the observable equivalent of removing the retry call).
+- Named test `loop_provider_retry_replays_transient_503_and_rolls_back_partial_output` failed at its completed-turn assertion because the first transient 503 escaped instead of replaying.
+- The first restore script used zsh's read-only variable `status` and stopped before its restore command. This was detected immediately; the file was restored from the verified backup and `cmp -s` proved byte identity. The focused retry suite and idle-timeout regression then both passed on the restored tree.
+
+Strict production-call removal mutation
+---------------------------------------
+- To remove ambiguity from the earlier one-attempt mutation, `crates/oc-engine/src/loop.rs` was backed up again and the production `retry_provider(...)` invocation was replaced temporarily by a compiling one-shot stream execution path. This bypassed the retry executor entirely rather than changing its policy.
+- Exact command: `CARGO_TARGET_DIR=/tmp/opencode/fu1 cargo test -p oc-engine --test loop loop_provider_retry_replays_transient_503_and_rolls_back_partial_output --offline -- --exact`.
+- Result: FAILED as expected (`rc=101`, 0 passed, 1 failed). The assertion at `crates/oc-engine/tests/loop.rs:864` observed that the first transient 503 escaped instead of producing `TurnOutcome::Completed` from a replay.
+- The shell restored the backup regardless of the expected test failure, and `cmp -s /tmp/opencode/fu1-loop.rs.strict-mutation-backup crates/oc-engine/src/loop.rs` succeeded: `STRICT_MUTATION_RESTORED_BYTE_IDENTICAL`.
+- This stricter mutation proves the production `retry_provider` call itself, not merely the chosen attempt count, is required by the named regression.
+
+Final diagnostics and gates
+---------------------------
+- The MCP `lsp_diagnostics` path guard rejected the sibling worktree path before opening either file. The two changed Rust files were therefore copied byte-for-byte into a temporary clone of the same `task-fu1` branch under the request workspace; native `lsp_diagnostics` then reported `No diagnostics found` for both `crates/oc-engine/src/loop.rs` and `crates/oc-engine/tests/loop.rs`. The temporary clone was removed after diagnostics.
+- `CARGO_TARGET_DIR=/tmp/opencode/fu1 cargo test --workspace --offline` advanced through the workspace but the host exhausted process resources in `oc-config`: `Os { code: 11, kind: WouldBlock, message: "Resource temporarily unavailable" }`. This is a host limit, not a FU-1 assertion failure.
+- Per the one-retry rule, `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/tmp/opencode/fu1 cargo test --workspace --offline -- --test-threads=1` was attempted once. Every completed test binary reported zero failures, including both todo 166 real-turn regressions and all FU-1 focused tests reached earlier, but the captured run ended during `tui_turn` without a workspace completion marker. No third workspace run was attempted; therefore a complete 3473+ aggregate cannot be claimed from this host run.
+- `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/tmp/opencode/fu1 cargo clippy --workspace --all-targets --offline -- -D warnings` passed with zero warnings.
+- `cargo fmt --all --check` passed after applying rustfmt's import wrapping, and `git diff --check` passed.
