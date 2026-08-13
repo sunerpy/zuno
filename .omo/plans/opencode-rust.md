@@ -1546,15 +1546,27 @@ Failing any one → downgraded to Follow-up in the backlog; it does **not** bloc
 | 1 | F1 w13 | criterion 4: measured v1 plugin SDK routes answer 501 | 175 | closed, merged |
 | 2 | F3-W13-07 | `tool.definition` unusable by any JS plugin; host blames the plugin for its own truncation | 172 | closed, merged |
 | 3 | F3-W13-01 | plugin `auth.loader` failure kills `run`, `models` and HTTP turns | 173 | closed, merged |
-| 4 | F2-B7 | version gate reads the wrong manifest field and loads incompatibles the docs say are skipped | 174 | open |
+| 4 | F2-B7 | version gate reads the wrong manifest field and loads incompatibles the docs say are skipped | 174 | closed, merged |
 | 2 | F3-W13-07 | `tool.definition` unusable by any JS plugin; host blames the plugin for its own truncation | 172 | open |
 | 3 | F3-W13-01 | plugin `auth.loader` failure kills `run`, `models` and HTTP turns | 173 | open |
 | 4 | F2-B7 | version gate reads the wrong manifest field and loads incompatibles the docs say are skipped | 174 | closed |
 | 5 | F3-W13-05 | top-level config `model` key parsed, echoed, then ignored | 177 | closed, merged |
-| 6 | F4 w13 | `PluginInput.client` is an unprojected model boundary a live installed plugin uses | 176 | open |
+| 6 | F4 w13 | `PluginInput.client` is an unprojected model boundary a live installed plugin uses | 176 | closed, merged |
 
 Plus **todo 178**, not a review finding: the host's upstream `opencode` was upgraded to
 1.18.18 mid-session while the oracle pins 1.18.15. Environmental, must be fixed regardless.
+
+### Round 1 ledger status — all six closed (2026-08-13)
+
+All six frozen Blockers are closed and merged at `92e4fe48`, plus todo 178's
+environmental oracle re-pin. `main` is at **3473 passing / 0 failed**, 0 clippy
+warnings, fmt clean, 178 implementation todos checked.
+
+**Round 2 is therefore delta-only against this ledger.** Reviewers answer one closed
+question per entry — "is this Blocker closed: yes / no" — and may raise a new Blocker
+**only** for a regression directly introduced by one of these six fixes. Anything else
+is a Follow-up. Per iron rule 6, a round that produces no new threshold-passing Blocker
+converges immediately.
 
 ### Follow-up backlog (recorded, non-blocking)
 
