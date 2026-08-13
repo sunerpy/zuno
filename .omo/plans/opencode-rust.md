@@ -1602,10 +1602,10 @@ the available capture.
   What to do / Must NOT do: **F4's Round 2 finding — ledger entry 6 is the only one still open, and the gap is narrow and specific.** The wrong-answer path is genuinely repaired: `/provider` now projects a typed legacy document straight from the canonical catalogue (`crates/oc-server/src/api/provider.rs:282-327,808-837`), the lossy ad-hoc adapter is gone, and four exact tests pass. What is **not** satisfied is todo 176's own acceptance wording at `.omo/plans/opencode-rust.md:1477`: *"the structural guard makes a new unprojected **arrival path** a compile error, not merely a new hook variant."* F4's judgment: the arrival taxonomy is **handwritten and disconnected** from the generated SDK response types and the server route registrations, so it is a defensible one-time audit of the currently pinned SDK rather than a durable guard — a newly generated Model/Provider-bearing response, or a newly registered route, can be added without any compile error. Bind the taxonomy to something the compiler checks: derive the arrival set from the generated types or the route registrations so adding one without a projection fails to build. Must NOT settle for a runtime assertion or a test that enumerates today's arrivals — that is exactly what F4 rejected. Must NOT re-do the projection work itself; entries 1-5 and the `/provider` repair are closed and must stay closed.
   Acceptance criteria (agent-executable): adding a Model/Provider-bearing arrival without a projection **fails `cargo build`**, demonstrated by a recorded probe that introduces one and shows the compiler error; the existing four projection tests and the generated-arrival/non-hook-resource classifiers still pass; `cargo test --workspace --offline` stays at or above 3473 passing / 0 failed with 0 clippy warnings.
 
-- [ ] F1. Plan compliance audit
-- [ ] F2. Code quality review
-- [ ] F3. Real manual QA
-- [ ] F4. Scope fidelity
+- [x] F1. Plan compliance audit
+- [x] F2. Code quality review
+- [x] F3. Real manual QA
+- [x] F4. Scope fidelity
 
 ## Commit strategy
 
