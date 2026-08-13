@@ -32,3 +32,7 @@
 # CodeGraph's local index: a derived artifact of this checkout, like /target.
 # Rebuilt by `codegraph init`; never a source of truth.
 /.codegraph
+
+# Scratch directories reviewers and subagents create while probing this checkout
+# (LSP sandboxes, worktree-scoped temp dirs). Derived, never source.
+/.tmp-*
