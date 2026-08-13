@@ -12,7 +12,8 @@
 //! Retry, compaction, and the one-live-loop-per-session registry wrap the same
 //! [`run_turn`] entry point rather than copying its state machine.
 
-use std::sync::Arc;
+use std::num::NonZeroU32;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -33,12 +34,15 @@ use tokio::sync::mpsc;
 
 use crate::hooks::{HookMessageWithParts, NoopHooks, RequestHookInput, TurnHooks};
 use crate::interrupt::InterruptSignal;
+use crate::retry::{ProviderRetryError, ProviderRetryPolicy, retry_provider};
 
 /// Maximum queued transitions before the turn applies lossless backpressure.
 pub const TURN_EVENT_CHANNEL_CAPACITY: usize = 64;
 
 /// Text used to close an unanswered tool call before its transcript is replayed.
 pub const INTERRUPTED_TOOL_RESULT: &str = "[Tool execution was interrupted]";
+
+const PROVIDER_RETRY_MAX_ATTEMPTS: u32 = 3;
 
 /// Producer half of the engine's bounded event channel.
 ///
@@ -587,6 +591,14 @@ impl StepAccumulator {
         self.cache_read_input_tokens = None;
         self.cache_write_input_tokens = None;
     }
+
+    fn has_generated_output(&self) -> bool {
+        !self.text.is_empty()
+            || !self.reasoning.is_empty()
+            || !self.provider_reasoning.is_empty()
+            || !self.calls.is_empty()
+            || self.active_tool.is_some()
+    }
 }
 
 /// Run one complete user turn. Every continuation after a tool result re-enters
@@ -765,30 +777,84 @@ pub async fn run_turn(
             )
             .await
             .map_err(TurnError::Hook)?;
-        let mut stream = provider.stream(completion);
-        let mut accumulator = StepAccumulator::default();
-        let mut interrupted = false;
-
-        loop {
-            let next = tokio::select! {
-                biased;
-                _ = context.interrupt.notified() => {
-                    interrupted = true;
-                    None
+        let accumulator = Arc::new(Mutex::new(StepAccumulator::default()));
+        let policy = ProviderRetryPolicy::new(
+            NonZeroU32::new(PROVIDER_RETRY_MAX_ATTEMPTS)
+                .expect("provider retry maximum is non-zero"),
+        );
+        let attempt = retry_provider(
+            policy,
+            |_| {
+                let provider = Arc::clone(&provider);
+                let completion = completion.clone();
+                let interrupt = context.interrupt.clone();
+                let events = events.clone();
+                let accumulator = Arc::clone(&accumulator);
+                async move {
+                    let mut stream = provider.stream(completion);
+                    loop {
+                        let next = tokio::select! {
+                            biased;
+                            _ = interrupt.notified() => return Ok(Ok(true)),
+                            event = stream.next() => event,
+                        };
+                        let Some(next) = next else {
+                            return Ok(Ok(false));
+                        };
+                        let event = match next {
+                            Ok(event) => event,
+                            Err(error @ ProviderError::Transient { status: None, .. })
+                                if accumulator
+                                    .lock()
+                                    .expect("step accumulator lock")
+                                    .has_generated_output() =>
+                            {
+                                return Ok(Err(TurnError::Provider(error)));
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        let ended = matches!(event, StreamEvent::MessageEnd { .. });
+                        let apply = accumulator
+                            .lock()
+                            .expect("step accumulator lock")
+                            .apply(step, &event);
+                        if let Err(error) = apply {
+                            return Ok(Err(error));
+                        }
+                        if let Err(error) = events.send(TurnEvent::Provider { step, event }).await {
+                            return Ok(Err(error));
+                        }
+                        if ended {
+                            return Ok(Ok(false));
+                        }
+                    }
                 }
-                event = stream.next() => event,
-            };
-            let Some(next) = next else {
-                break;
-            };
-            let event = next?;
-            accumulator.apply(step, &event)?;
-            let ended = matches!(event, StreamEvent::MessageEnd { .. });
-            events.send(TurnEvent::Provider { step, event }).await?;
-            if ended {
-                break;
+            },
+            |event| {
+                let events = events.clone();
+                let accumulator = Arc::clone(&accumulator);
+                async move {
+                    accumulator
+                        .lock()
+                        .expect("step accumulator lock")
+                        .apply(step, &event)?;
+                    events.send(TurnEvent::Provider { step, event }).await
+                }
+            },
+        )
+        .await;
+        let interrupted = match attempt {
+            Ok(result) => result?,
+            Err(ProviderRetryError::Provider(error))
+            | Err(ProviderRetryError::AttemptsExhausted { source: error, .. }) => {
+                return Err(TurnError::Provider(error));
             }
-        }
+            Err(ProviderRetryError::RollbackEmission { source }) => return Err(*source),
+        };
+        let mut accumulator = {
+            let mut accumulator = accumulator.lock().expect("step accumulator lock");
+            std::mem::take(&mut *accumulator)
+        };
 
         if !accumulator.text.is_empty() {
             context

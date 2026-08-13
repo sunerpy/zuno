@@ -7708,3 +7708,14 @@ regressions, changed-file diagnostics, the complete workspace test suite, zero-w
 rustfmt, and diff checks passed. The first workspace run encountered the already-known host
 `WouldBlock` resource limit; the single-job, single-test-thread retry completed without skipping
 tests.
+
+## [2026-08-13] FU-1 — provider retry is finite and partial idle failures stay single-window
+
+`run_turn` now uses the existing `ProviderRetryPolicy` with three attempts. Retryable HTTP failures
+emit `RetryRollback`, clear failed-attempt text/reasoning/tools, and replay the identical request;
+permanent failures and the final transient error remain user-visible. A status-less transport
+failure after generated output is deliberately not replayed, preserving todo 154/166's partial-text
+contract and one-window latency. Before any output, a compatible-provider stall can consume three
+idle windows plus 6 seconds of backoff: about 366 seconds at the 120-second default or 546 seconds
+at the 180-second override cap. This is longer than the prior single attempt but remains explicitly
+bounded.

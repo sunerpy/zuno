@@ -27,6 +27,8 @@ None started. No item has an owner. Nothing here is in progress.
 
 ## FU-1. `ProviderRetryPolicy` has no production caller
 
+**Status: CLOSED (2026-08-13)** — `run_turn` now performs bounded typed provider retries with rollback, terminal-error propagation, and permanent/idle-partial guards.
+
 **Source**: F2, non-blocking observation F2-O1, raised in Round 1 (wave 13) and confirmed
 still true in Round 2.
 
