@@ -1504,9 +1504,16 @@ downward trend across eight waves.
 
 ### Convergence iron rules
 
-1. **Hard cap = 3 effective rounds from adoption.** Wave 13 is retroactively **Round 1**.
-   Wave 14 is Round 2, wave 15 is Round 3. If open Blockers remain after Round 3,
-   **stop reviewing** and escalate to the user. A fourth round is forbidden.
+1. **Hard cap = 7 effective rounds from adoption** (raised from 3 by explicit user
+   authorization, 2026-08-12: *"我授权你使用硬上线为7轮，如果7轮收敛评审还没通过再与我确认"*).
+   Wave 13 is retroactively **Round 1**; waves 14-19 are Rounds 2-7. If open Blockers
+   remain after Round 7, **stop reviewing** and escalate to the user. An eighth round is
+   forbidden.
+
+   The raised cap buys rounds, **not scope**. Every other iron rule still binds: Rounds
+   2-7 remain delta-only against the frozen ledger, and a round that produces no new
+   threshold-passing Blocker converges immediately — the cap is a ceiling, not a target.
+   With four open ledger entries, converging well before Round 7 is the expectation.
 2. **Only Round 1 is a full audit.** Its output — the ledger below — is the single
    authoritative list of open Blockers for the remainder of the review.
 3. **Round 2+ is delta-only.** Each reviewer answers exactly one closed question per
