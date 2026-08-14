@@ -7880,3 +7880,24 @@ component with `jsonschema`, calls the real GET session route, and validates its
 the binding fails at the missing `$ref`; suppressing serialization of required `slug` compiles but
 fails with `"slug" is a required property`. This closes the specific blind spot that allowed a
 served projection to contradict a published schema without any operation-level validation.
+
+## [2026-08-14] FU-8B — a completed protocol frame is not necessarily an assistant answer
+
+The live `kiro-auth` turn was neither an authentication failure nor a renderer loss. An auth or
+provider failure already returns non-zero, and a stream without `MessageEnd` already returns
+`StreamEndedWithoutMessageEnd`; meanwhile the persisted assistant message had zero parts. The
+remaining path was a syntactically complete stream whose `MessageEnd` advanced `run_turn` to its
+unconditional `TurnCompleted` return despite checkpointing no text, reasoning, or tool part.
+
+The invariant now lives at that engine-wide completion chokepoint: after preserving the checkpoint
+for inspection but before any success event, a zero-part accumulator returns
+`EmptyAssistantMessage` with the catalog provider id and step. The check is deliberately part-based,
+not text-based, so tool-only turns and reasoning-only turns remain valid. A real-process compatible
+SSE fixture proves `run` exits non-zero and names both `provider `test`` and `empty`; a separate
+engine regression proves a tool-only first step still completes normally.
+
+Deleting only the guard restores the old `Completed` outcome and fails the named zero-part test.
+All five changed Rust files have clean LSP diagnostics; rustfmt and Clippy are clean; the final
+single-thread offline workspace gate reports 3491 passed, 0 failed, 2 ignored. FU-8 defect A remains
+open and its routing/surface files were not touched. Full evidence is in
+`.omo/evidence/task-fu8b-opencode-rust.txt`.

@@ -1971,8 +1971,12 @@ fn every_turn_error() -> Vec<TurnError> {
             max_steps: 100,
         },
         TurnError::StreamEndedWithoutMessageEnd { step: 3 },
-        TurnError::NestedToolUse { step: 4 },
-        TurnError::ToolUseEndWithoutStart { step: 5 },
+        TurnError::EmptyAssistantMessage {
+            provider_id: "empty-provider-in-the-message".to_owned(),
+            step: 4,
+        },
+        TurnError::NestedToolUse { step: 5 },
+        TurnError::ToolUseEndWithoutStart { step: 6 },
         TurnError::EventConsumerClosed,
         TurnError::Hook(
             "plugin `fixture-plugin` failed hook `chat.params`: fixture failure".to_owned(),
@@ -2047,6 +2051,7 @@ fn the_variant_table_covers_the_whole_enum() {
             TurnError::ModelNotFound { .. } => "ModelNotFound",
             TurnError::StepLimit { .. } => "StepLimit",
             TurnError::StreamEndedWithoutMessageEnd { .. } => "StreamEndedWithoutMessageEnd",
+            TurnError::EmptyAssistantMessage { .. } => "EmptyAssistantMessage",
             TurnError::NestedToolUse { .. } => "NestedToolUse",
             TurnError::ToolUseEndWithoutStart { .. } => "ToolUseEndWithoutStart",
             TurnError::EventConsumerClosed => "EventConsumerClosed",
@@ -2061,7 +2066,7 @@ fn the_variant_table_covers_the_whole_enum() {
 
     assert_eq!(
         named.len(),
-        14,
+        15,
         "the table covers only {named:?}; every variant needs a value or the rendering \
          claims above are vacuous for the ones missing"
     );

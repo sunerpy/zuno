@@ -269,6 +269,8 @@ whatever the workspace already does for TTY detection; if nothing exists, plain 
 
 ## FU-8. `run` cannot complete a turn against a real provider — two distinct defects
 
+**Status:** Defect B fixed and verified on 2026-08-14; defect A remains open and was not changed.
+
 **Source**: the orchestrator's first genuine end-to-end verification with real credentials,
 2026-08-14, prompted by the user asking how to configure and validate the project. **Nothing in the
 3488-test suite covers this path**, because every test supplies its own mock provider. This is the
