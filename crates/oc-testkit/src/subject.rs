@@ -15,7 +15,7 @@ use crate::oracle::ensure_executable;
 use crate::run::{Provenance, RunOutcome, SubjectSource, run_process};
 
 /// The binary `oc-cli` produces, and the name a drop-in replacement is invoked by.
-pub const SUBJECT_BIN: &str = "opencode-rust";
+pub const SUBJECT_BIN: &str = "zuno";
 /// The cargo package that builds it.
 pub const SUBJECT_PACKAGE: &str = "oc-cli";
 /// Override the discovered subject binary with an explicit path.
@@ -267,15 +267,15 @@ mod tests {
 
     #[test]
     fn a_missing_subject_binary_names_the_build_command() {
-        let missing = PathBuf::from("/nonexistent/oc-testkit/subject/opencode-rust");
+        let missing = PathBuf::from("/nonexistent/oc-testkit/subject/zuno");
         let err = Subject::at(&missing).expect_err("a missing path cannot be a subject");
         let rendered = err.to_string();
         assert!(
-            rendered.contains("/nonexistent/oc-testkit/subject/opencode-rust"),
+            rendered.contains("/nonexistent/oc-testkit/subject/zuno"),
             "{rendered}"
         );
         assert!(
-            rendered.contains("cargo build -p oc-cli --bin opencode-rust"),
+            rendered.contains("cargo build -p oc-cli --bin zuno"),
             "{rendered}"
         );
     }

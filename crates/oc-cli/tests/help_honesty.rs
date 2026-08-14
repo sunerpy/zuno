@@ -17,7 +17,7 @@ use clap::CommandFactory as _;
 use oc_cli::{Cli, Disposition, PENDING_COMMANDS, disposition_for, pending_reason};
 
 fn binary() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_opencode-rust"))
+    Command::new(env!("CARGO_BIN_EXE_zuno"))
 }
 
 /// Phrases that tell a reader the command does not work.

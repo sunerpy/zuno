@@ -1,0 +1,54 @@
+CLOSED — Z-2 verified 2026-08-14; command alias remains an explicit user decision
+
+## Start and scope
+- CodeGraph explore attempted first with query: user_agent COMPATIBILITY_VERSION BUILD_ID version long_version help; sibling worktree is not indexed, so Read/Grep fallback was used as instructed.
+- Initial disk check: 21 GB free (93% used), above the 90%% stop threshold. Killed stale PID 4075393 (`/tmp/opencode/v9/debug/opencode-rust --pure --prompt route probe`) by PID and removed the completed Z-1 build-only target `/tmp/opencode/z1` (34 GB). Result: 54 GB free (82% used).
+- Authoritative Z-2 section and follow-up Working rules read in full. Kept oc-* crate names; no dependency, path-semantics, or plugin-ABI env changes are in scope.
+- Baseline source inventory saved at /tmp/opencode/z2/opencode-inventory.before.txt.
+
+## TDD rename guards (red)
+- `command::tests::zuno_binary_name_is_pinned_in_manifest`: exit 101, assertion failure under old `opencode-rust` manifest name.
+- `surface_zuno_user_agent_is_pinned`: assertion failure under old `opencode-rust/…` user agent.
+- `surface_zuno_long_display_version_is_pinned`: assertion failure under old `opencode-rust …` long display.
+- `surface_zuno_help_identity_is_pinned`: assertion failure under old clap name/help.
+- Logs: /tmp/opencode/z2/red-binary.log and /tmp/opencode/z2/red-identity.log. Red result: 0 passed / 4 failed as intended.
+
+## Rename implementation and focused verification
+- Shipped executable, Makefile, CI/release artifact variable, crate generator, testkit subject, Clap identity, long display version, user agent, plugin host name, diagnostics, examples, and user-facing docs now use `zuno` / `Zuno`.
+- `oc-*` crate names remain unchanged. Repository/remote examples under `oc-paths` were reviewed and deliberately restored because repository identity belongs to Z-3, not this executable rename.
+- `COMPATIBILITY_VERSION` remains `1.18.13`; its source comment and `surface_compatibility_version_and_rust_identity_are_separate` explain that npm `engines.opencode` checks consume this upstream compatibility value.
+- Focused green result: `command::tests::zuno_binary_name_is_pinned_in_manifest` plus the three `surface_zuno_*` guards passed; full `surface` target passed 16/16.
+- Documentation regeneration: `OC_DOCS_REGENERATE=1 CARGO_TARGET_DIR=/tmp/opencode/z2 cargo test -p oc-cli --test docs` passed 13/13 after updating the Z-1 environment-name assertions to `ZUNO_DB` and `ZUNO_DISABLE_CHANNEL_DB`.
+
+## ALIAS DECISION — AWAITING USER
+- Investigation: the manifest declares exactly one executable, `zuno`; Clap's root command is `zuno`; Makefile, release/CI workflows and `oc-testkit::SUBJECT_BIN` all name `zuno`. No `opencode` executable, Clap alias, wrapper, symlink, or packaging alias exists. Therefore this change preserves the current no-alias behavior rather than silently deciding the open question.
+- Recommendation: do **not** add an `opencode` alias. The project is unreleased and Z-1 deliberately made a hard cut; an alias would also shadow the installed TypeScript oracle used for differential testing and side-by-side operation. If the user values drop-in command replacement more than unambiguous coexistence, implement that later as an explicit packaging decision with a dedicated test.
+- Reasoning: aliasing cannot be expressed as a Clap subcommand alias because it is the executable name; it requires shipping a second binary, symlink, or installer wrapper. That changes packaging and collision behavior, so it must not be inferred during a user-facing rename.
+
+## Final lowercase `opencode` source inventory
+- Command: `grep -rn "opencode" crates/*/src/`; raw output: `/tmp/opencode/z2/opencode-inventory.after.txt`; classified file inventory: `/tmp/opencode/z2/opencode-inventory.classified.txt`.
+- Total: 868 matching lines across 173 source files, containing 962 lowercase occurrences in line bodies. Every line was assigned to exactly one permitted class; there is no fourth/unclassified class.
+- Upstream/oracle compatibility: 759 lines, 166 files, 840 occurrences. Inventory covers captured upstream names and wire literals (`opencode.json`, schema URLs, database filenames, model endpoints, API/TUI compatibility names), oracle commands/fixtures, and comments that identify the upstream behavior being ported. These remain because Zuno's compatibility contract is still measured against OpenCode.
+- Plugin compatibility: 62 lines, 26 files, 75 occurrences. Inventory covers the six documented `OPENCODE_*` plugin ABI variables, npm/plugin metadata including `engines.opencode`, the embedded `customize-opencode` compatibility skill, JavaScript host/shim/spec surfaces, and `compatible-opencode/1.18.13` in the non-masquerading Zuno user agent. These remain because installed JavaScript plugins consume them.
+- Historical references: 47 lines, 20 files, 47 occurrences. Inventory covers immutable `.omo/plans/opencode-rust.md`, `.omo/drafts/opencode-rust.md`, `.omo/notepads/opencode-rust/*`, `.omo/evidence/task-*-opencode-rust.txt`, repository/remote normalization examples, and historical oracle measurements. Renaming these would break links, evidence provenance, or move repository identity into Z-2.
+
+## Release build and real turn
+- `CARGO_TARGET_DIR=/tmp/opencode/z2 cargo build -p oc-cli --bin zuno --release` passed and produced `/tmp/opencode/z2/release/zuno`.
+- Exactly one non-`--pure` request was sent with the required model and prompt. Stdout was exactly `Z2-VERIFIED`; stderr contained only the two expected `grep`/`glob` plugin-suppression warnings. Logs: `/tmp/opencode/z2/real-turn.stdout` and `/tmp/opencode/z2/real-turn.stderr`.
+- The outer collection shell then rejected the variable name `status` as read-only. This happened after the request and after both output files were written; the request was not repeated, preserving the one-attempt constraint.
+
+## Mutation and regression verification
+- Binary assertion mutation: after a non-empty backup, changing only `crates/oc-cli/Cargo.toml` from `name = "zuno"` back to `name = "opencode-rust"` compiled the library test and failed `command::tests::zuno_binary_name_is_pinned_in_manifest` on the assertion `the shipped executable must be named 'zuno'`. It was not a compile error. The manifest was immediately restored byte-for-byte; log: `/tmp/opencode/z2/mutation-binary.log`.
+- `crates/oc-cli/tests/differential.rs`: 21 passed / 0 failed.
+- FU-9 `registry_de_duplicates_cross_source_names_with_upstreams_last_source_winning`: passed.
+- Todo 144 `a_plugin_tool_is_hidden_by_the_same_permission_layer_as_builtins`: passed.
+- FU-8B `an_empty_assistant_response_exits_non_zero_and_names_the_provider`: passed.
+- FU-8A production routing group: all 18 `cmd::turn_tests::production_*` tests passed; the filtered command also included four adjacent production guards, for 22 passed / 0 failed total.
+
+## Final gates
+- Detached command was the required `setsid nohup zsh -c '... cargo test --workspace --offline --no-fail-fast ...'` form. `/tmp/opencode/z2gate.done` reports `EXIT=0`; 217 test summaries aggregate to 3509 passed / 0 failed / 2 ignored, with 0 `FAILED` or `error:` markers. Full log: `/tmp/opencode/z2gate.log`.
+- `CARGO_TARGET_DIR=/tmp/opencode/z2 cargo clippy --workspace --all-targets --offline -- -D warnings`: passed with 0 warnings.
+- `cargo fmt --all --check`: initially identified formatting introduced by the rename; `cargo fmt --all` applied it and the immediate check passed clean.
+- The `lsp_diagnostics` MCP rejects sibling-worktree paths. Both checkouts were confirmed at the same baseline and the main checkout was clean, so the exact Rust/Cargo diff was temporarily mirrored there. `lsp_diagnostics` then scanned all 43 `oc-cli` Rust files, all 37 `oc-testkit` Rust files, and the individual changed `oc-plugin`, `oc-process`, and `oc-server` files: 0 diagnostics in every call. The mirror was reversed immediately and the main checkout was confirmed clean.
+- A direct `rust-analyzer diagnostics . --severity warning` in the sibling worktree completed but printed rust-analyzer internal overloaded-deref errors; it was not treated as clean evidence. The successful MCP LSP scans above are the diagnostic gate.
+- No dependency was added, no `oc-*` crate was renamed, no oracle fixture or kept plugin-ABI variable was changed, and no credential value was recorded.

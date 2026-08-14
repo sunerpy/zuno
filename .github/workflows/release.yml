@@ -41,8 +41,8 @@
 # ---------------------------------------------------------------------------
 # WHAT SHIPS
 #
-# `opencode-rust` (from `oc-cli`) only. The workspace also builds `oc-server`,
-# but `opencode-rust serve` wraps `oc_server::ServerBuilder` as a library rather
+# `zuno` (from `oc-cli`) only. The workspace also builds `oc-server`,
+# but `zuno serve` wraps `oc_server::ServerBuilder` as a library rather
 # than spawning that binary (see `oc-cli/src/command.rs`), so `oc-server` is a
 # development and QA surface, not a user entry point. Shipping both would invite
 # users to run the wrong one. `oc-example-plugin`, `oc-acp-conformance`,
@@ -85,7 +85,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  BINARY_NAME: opencode-rust
+  BINARY_NAME: zuno
   CLI_CRATE: oc-cli
 
 jobs:

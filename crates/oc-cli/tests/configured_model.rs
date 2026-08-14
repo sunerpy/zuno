@@ -22,7 +22,7 @@ const VIEWPORT_ROWS: u16 = 30;
 const VIEWPORT_COLUMNS: u16 = 100;
 
 fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_opencode-rust"))
+    PathBuf::from(env!("CARGO_BIN_EXE_zuno"))
 }
 
 #[derive(Clone, Copy, Debug)]

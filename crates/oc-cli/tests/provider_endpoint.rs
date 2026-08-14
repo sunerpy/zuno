@@ -67,7 +67,7 @@ const DEAD_ENDPOINT: &str = "http://127.0.0.1:1/v1";
 const PROBE_HOST: &str = "PROBE_HOST";
 
 fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_opencode-rust"))
+    PathBuf::from(env!("CARGO_BIN_EXE_zuno"))
 }
 
 /// One OpenAI-compatible provider, with the endpoint placed wherever the caller says.
@@ -169,7 +169,7 @@ async fn run_prompt_with(env: &ScriptedEnv, config: String, extra: &[(&str, &str
     tokio::time::timeout(RUN_TIMEOUT, command.output())
         .await
         .expect("the run must finish inside its budget")
-        .expect("launch opencode-rust run")
+        .expect("launch zuno run")
 }
 
 /// A mock provider replaying two tool-free completions: the title prelude and the turn.

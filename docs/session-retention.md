@@ -33,8 +33,8 @@ asserts inertness across every table, and
 the preview's counts are the counts the delete then produces.
 
 ```sh
-opencode-rust session prune --older-than 90
-opencode-rust session prune --older-than 90 --format json
+zuno session prune --older-than 90
+zuno session prune --older-than 90 --format json
 ```
 
 ## Flags

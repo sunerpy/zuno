@@ -75,7 +75,7 @@ authors.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "opencode-rust"
+name = "zuno"
 path = "src/main.rs"
 
 [dependencies]

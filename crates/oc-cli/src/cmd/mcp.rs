@@ -64,12 +64,12 @@ fn list(context: &Context) -> Result<(), String> {
     println!("MCP Servers");
     let Some(servers) = context.config.mcp.as_ref() else {
         println!("No MCP servers configured");
-        println!("Add servers with: opencode-rust mcp add");
+        println!("Add servers with: zuno mcp add");
         return Ok(());
     };
     if servers.is_empty() {
         println!("No MCP servers configured");
-        println!("Add servers with: opencode-rust mcp add");
+        println!("Add servers with: zuno mcp add");
         return Ok(());
     }
 

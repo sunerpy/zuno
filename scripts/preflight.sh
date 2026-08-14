@@ -30,7 +30,7 @@ version_key() {
   printf '%s' "$1" | awk -F'[^0-9]+' '{printf "%05d%05d%05d", $1, $2, $3}'
 }
 
-echo "preflight: opencode-rust"
+echo "preflight: zuno"
 echo
 echo "required tools"
 

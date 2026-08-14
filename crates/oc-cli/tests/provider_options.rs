@@ -79,7 +79,7 @@ fn echoed_key_body() -> Vec<u8> {
 }
 
 fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_opencode-rust"))
+    PathBuf::from(env!("CARGO_BIN_EXE_zuno"))
 }
 
 /// Where a key may be planted, so a test names its case instead of two bare `Option`s.
@@ -169,7 +169,7 @@ async fn run_prompt(env: &ScriptedEnv, config: String, stored: Option<&str>) -> 
     tokio::time::timeout(RUN_TIMEOUT, command.output())
         .await
         .expect("the run must finish inside its budget")
-        .expect("launch opencode-rust run")
+        .expect("launch zuno run")
 }
 
 /// A mock replaying two tool-free completions: the title prelude and the turn.

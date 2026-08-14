@@ -19,7 +19,7 @@ static GUARD_EXECUTABLE: OnceLock<PathBuf> = OnceLock::new();
 ///
 /// The executable must call [`run_guard_from_args`] before parsing its ordinary
 /// command line. Tests may supply a dedicated guard binary; production supplies
-/// the current `opencode-rust` executable.
+/// the current `zuno` executable.
 pub fn activate_guard_executable(executable: impl Into<PathBuf>) -> io::Result<()> {
     let executable = executable.into();
     match GUARD_EXECUTABLE.set(executable.clone()) {

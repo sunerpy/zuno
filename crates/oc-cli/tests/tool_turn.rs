@@ -4,7 +4,7 @@
 //! that `run_turn` drives a tool loop, and both stayed green while `run` passed the
 //! dispatcher an empty tool vector. Neither test could see that, because neither
 //! went through a production entry point. These do: they launch the real
-//! `opencode-rust run` binary against a cassette-backed provider and assert on what
+//! `zuno run` binary against a cassette-backed provider and assert on what
 //! the binary put on the wire and what it did to the filesystem.
 //!
 //! # Why two tests and not one
@@ -279,7 +279,7 @@ export default {
 "#;
 
 fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_opencode-rust"))
+    PathBuf::from(env!("CARGO_BIN_EXE_zuno"))
 }
 
 /// A config naming one OpenAI-compatible provider pointed at the mock.
@@ -485,7 +485,7 @@ async fn run_prompt(env: &ScriptedEnv, base_url: &str, prompt: &str) -> Output {
     tokio::time::timeout(RUN_TIMEOUT, command.output())
         .await
         .expect("the run must finish inside its budget")
-        .expect("launch opencode-rust run")
+        .expect("launch zuno run")
 }
 
 async fn run_plugin_prompt(
@@ -516,7 +516,7 @@ async fn run_plugin_prompt(
     tokio::time::timeout(Duration::from_secs(90), command.output())
         .await
         .expect("the plugin-backed run must finish inside its budget")
-        .expect("launch plugin-backed opencode-rust run")
+        .expect("launch plugin-backed zuno run")
 }
 
 async fn run_failing_auth_loader_prompt(
@@ -555,7 +555,7 @@ async fn run_failing_auth_loader_prompt(
     tokio::time::timeout(Duration::from_secs(90), command.output())
         .await
         .expect("the failing-auth-loader run must finish inside its budget")
-        .expect("launch failing-auth-loader opencode-rust run")
+        .expect("launch failing-auth-loader zuno run")
 }
 
 async fn run_sdk_model_provider_prompt(
@@ -1874,7 +1874,7 @@ fn tui_refuses_a_non_terminal_invocation_and_names_the_headless_surface() {
         .env_clear()
         .envs(env.env_vars())
         .output()
-        .expect("launch opencode-rust tui");
+        .expect("launch zuno tui");
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);

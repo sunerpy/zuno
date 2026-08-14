@@ -155,19 +155,19 @@ as identifiers for the work that owns a surface, not as anything a user needs.
 | `DebugCommand` | `debug` | implemented | registered through the headless-command seam for todo 56 |
 | `ExportCommand` | `export` | implemented | prints one session's whole transcript as JSON, byte-compared against the released binary's own export, with `--sanitize` redacting the same fields |
 | `GenerateCommand` | `generate` | rejected | the command is a TypeScript source-tree SDK/OpenAPI generator that depends on Prettier and is excluded from the runtime binary; use the server's `/openapi.json` document instead |
-| `GithubCommand` | `github` | rejected | the hosted GitHub agent is outside the local-agent scope; run `opencode-rust run` from the CI workflow instead |
+| `GithubCommand` | `github` | rejected | the hosted GitHub agent is outside the local-agent scope; run `zuno run` from the CI workflow instead |
 | `ImportCommand` | `import` | implemented | reads a document `export` produced back into this checkout's database; share-URL imports are not accepted because the hosted share service is outside this port's scope |
 | `McpCommand` | `mcp` | implemented | registered through the headless-command seam for todo 56 |
 | `ModelsCommand` | `models` | implemented | registered through the headless-command seam for todo 56 |
 | `PluginCommand` | `plugin` | not-registered | plugin installation must wait for todo 60's resident JavaScript host and compatibility gate; accepting installs before plugins can load would corrupt configuration |
-| `PrCommand` | `pr` | rejected | the GitHub checkout helper is excluded from the local-agent runtime; use `gh pr checkout <number>` and then `opencode-rust run` instead |
+| `PrCommand` | `pr` | rejected | the GitHub checkout helper is excluded from the local-agent runtime; use `gh pr checkout <number>` and then `zuno run` instead |
 | `ProvidersCommand` | `providers` | implemented | registered with the upstream `auth` alias through the headless-command seam for todo 56 |
 | `RunCommand` | `run` | implemented | registered through the headless-command seam for todo 56 |
 | `ServeCommand` | `serve` | implemented | registered through the headless-command seam; todo 56 wraps oc-server's public builder rather than duplicating its server logic |
 | `SessionCommand` | `session` | implemented | registered through the headless-command seam for todo 56 and session maintenance todos 80-85 |
 | `StatsCommand` | `stats` | rejected | upstream stats reads the excluded stats package's session SQL directly; use `db stats` from todo 84 instead |
 | `TuiThreadCommand` | `tui` | implemented | registered as `tui` and as the bare invocation upstream spells `$0`; it boots oc-tui's application over the terminal lease from todo 73 and the views from todo 76 |
-| `UninstallCommand` | `uninstall` | rejected | self-uninstallation is excluded from the runtime; remove `opencode-rust` with the package manager or installer that placed it |
+| `UninstallCommand` | `uninstall` | rejected | self-uninstallation is excluded from the runtime; remove `zuno` with the package manager or installer that placed it |
 | `UpgradeCommand` | `upgrade` | rejected | the TypeScript self-updater cannot safely replace this Rust artifact and is excluded; install the desired release through the Rust release installer instead |
 | `WebCommand` | `web` | rejected | the bundled hosted web application is excluded from this headless Rust scope; use `serve` and connect a supported client instead |
 <!-- generated:END cli-disposition -->

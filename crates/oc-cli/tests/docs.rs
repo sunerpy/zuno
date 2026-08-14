@@ -954,8 +954,8 @@ fn docs_migration_guide_lists_every_migration_in_execution_order() {
         &[
             oc_db::migration::DRIZZLE_JOURNAL_TABLE,
             &format!("{} migrations", oc_db::migration::MIGRATION_IDS.len()),
-            "OPENCODE_DB",
-            "OPENCODE_DISABLE_CHANNEL_DB",
+            "ZUNO_DB",
+            "ZUNO_DISABLE_CHANNEL_DB",
             "opencode-local.db",
         ],
     );
@@ -1471,7 +1471,7 @@ fn readme_documents_the_four_gaps_a_side_by_side_user_hits() {
         &[
             // 1. the channel database filename
             "opencode-local.db",
-            "OPENCODE_DISABLE_CHANNEL_DB",
+            "ZUNO_DISABLE_CHANNEL_DB",
             // 2. the absent event stream
             "/api/event",
             // 3. legacy databases

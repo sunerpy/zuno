@@ -374,7 +374,7 @@ fn agent(args: &DebugAgentArgs, context: &Context) -> Result<(), String> {
         .find(|entry| entry.name == args.name)
         .ok_or_else(|| {
             format!(
-                "Agent {} not found, run 'opencode-rust agent list' to get an agent list",
+                "Agent {} not found, run 'zuno agent list' to get an agent list",
                 args.name
             )
         })?;

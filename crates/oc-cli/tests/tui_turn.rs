@@ -96,7 +96,7 @@ const VIEWPORT_ROWS: u16 = 40;
 const VIEWPORT_COLUMNS: u16 = 120;
 
 fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_opencode-rust"))
+    PathBuf::from(env!("CARGO_BIN_EXE_zuno"))
 }
 
 /// A config naming one OpenAI-compatible provider pointed at the mock.

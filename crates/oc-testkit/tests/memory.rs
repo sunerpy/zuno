@@ -368,7 +368,7 @@ fn dispatcher_routes_every_launch_without_a_waiting_window() {
 #[test]
 fn a_completed_pass_survives_preparing_the_same_measurement_root_again() {
     let target = tempfile::tempdir().expect("temporary measurement target");
-    let rust = target.path().join("opencode-rust");
+    let rust = target.path().join("zuno");
     let typescript = target.path().join("opencode");
     let database = target.path().join("opencode.db");
     std::fs::write(&rust, b"rust-v1").expect("write Rust fixture");
@@ -390,7 +390,7 @@ fn a_completed_pass_survives_preparing_the_same_measurement_root_again() {
 #[test]
 fn changing_a_measured_binary_invalidates_completed_passes() {
     let target = tempfile::tempdir().expect("temporary measurement target");
-    let rust = target.path().join("opencode-rust");
+    let rust = target.path().join("zuno");
     let typescript = target.path().join("opencode");
     let database = target.path().join("opencode.db");
     std::fs::write(&rust, b"rust-v1").expect("write Rust fixture");
@@ -520,14 +520,14 @@ fn build_release_subject(workspace: &Path, target: &Path) -> PathBuf {
             OsStr::new("-p"),
             OsStr::new("oc-cli"),
             OsStr::new("--bin"),
-            OsStr::new("opencode-rust"),
+            OsStr::new("zuno"),
             OsStr::new("--offline"),
         ])
         .current_dir(workspace)
         .status()
         .expect("spawn release build for the Rust subject");
     assert!(status.success(), "Rust release build failed with {status}");
-    let binary = target.join("release/opencode-rust");
+    let binary = target.join("release/zuno");
     assert!(
         binary.is_file(),
         "release binary missing at {}",

@@ -8,6 +8,10 @@
 //! binary.
 
 /// The version supplied to npm plugin compatibility checks.
+///
+/// This remains the pinned upstream baseline because existing npm plugins may
+/// declare `engines.opencode`; changing it to Zuno's package or build version
+/// would make compatible plugins skip themselves before their hooks can load.
 pub const COMPATIBILITY_VERSION: &str = "1.18.13";
 
 /// Cargo's package version for this Rust implementation.
@@ -32,17 +36,17 @@ pub const fn compatibility_version() -> &'static str {
 #[must_use]
 pub fn long_version() -> String {
     format!(
-        "opencode-rust {BUILD_ID} (Rust package {RUST_PACKAGE_VERSION}; plugin compatibility {COMPATIBILITY_VERSION})"
+        "Zuno {BUILD_ID} (Rust package {RUST_PACKAGE_VERSION}; plugin compatibility {COMPATIBILITY_VERSION})"
     )
 }
 
 /// The HTTP identity for this implementation.
 ///
-/// Starting with `opencode-rust/` is load-bearing: telemetry and server logs can
+/// Starting with `zuno/` is load-bearing: telemetry and server logs can
 /// distinguish this implementation even though plugin semver checks see 1.18.13.
 #[must_use]
 pub fn user_agent() -> String {
     format!(
-        "opencode-rust/{RUST_PACKAGE_VERSION} (build {BUILD_ID}; compatible-opencode/{COMPATIBILITY_VERSION})"
+        "zuno/{RUST_PACKAGE_VERSION} (build {BUILD_ID}; compatible-opencode/{COMPATIBILITY_VERSION})"
     )
 }

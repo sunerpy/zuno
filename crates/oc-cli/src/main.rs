@@ -7,7 +7,7 @@ fn main() -> std::process::ExitCode {
     let executable = match std::env::current_exe() {
         Ok(executable) => executable,
         Err(error) => {
-            eprintln!("failed to locate opencode-rust for child-process containment: {error}");
+            eprintln!("failed to locate zuno for child-process containment: {error}");
             return std::process::ExitCode::FAILURE;
         }
     };

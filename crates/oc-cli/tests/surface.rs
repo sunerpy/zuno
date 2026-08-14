@@ -9,7 +9,7 @@ use oc_cli::{
 const UPSTREAM_COMMANDS: &str = include_str!("fixtures/upstream-commands-1.18.13.txt");
 
 fn binary() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_opencode-rust"))
+    Command::new(env!("CARGO_BIN_EXE_zuno"))
 }
 
 #[test]
@@ -73,11 +73,13 @@ fn surface_registered_commands_match_their_dispositions() {
 
 #[test]
 fn surface_compatibility_version_and_rust_identity_are_separate() {
+    // npm plugins compare this value with `engines.opencode`. It is the pinned
+    // upstream compatibility baseline, not Zuno's package or build version.
     assert_eq!(COMPATIBILITY_VERSION, "1.18.13");
     assert_ne!(BUILD_ID, COMPATIBILITY_VERSION);
     assert!(long_version().contains(BUILD_ID));
     assert!(long_version().contains(COMPATIBILITY_VERSION));
-    assert!(user_agent().starts_with("opencode-rust/"));
+    assert!(user_agent().starts_with("zuno/"));
     assert!(!user_agent().starts_with("opencode/"));
 
     let short = binary().arg("--version").output().expect("run --version");
@@ -95,6 +97,28 @@ fn surface_compatibility_version_and_rust_identity_are_separate() {
     let stdout = String::from_utf8_lossy(&long.stdout);
     assert!(stdout.contains(BUILD_ID));
     assert!(stdout.contains(COMPATIBILITY_VERSION));
+}
+
+#[test]
+fn surface_zuno_user_agent_is_pinned() {
+    assert!(user_agent().starts_with("zuno/"), "{}", user_agent());
+    assert!(!user_agent().starts_with("opencode/"), "{}", user_agent());
+}
+
+#[test]
+fn surface_zuno_long_display_version_is_pinned() {
+    let display = long_version();
+    assert!(display.starts_with("Zuno "), "{display}");
+    assert!(display.contains(BUILD_ID), "{display}");
+    assert!(display.contains(COMPATIBILITY_VERSION), "{display}");
+}
+
+#[test]
+fn surface_zuno_help_identity_is_pinned() {
+    let command = Cli::command();
+    assert_eq!(command.get_name(), "zuno");
+    let about = command.get_about().expect("root command has help text");
+    assert!(about.to_string().contains("Zuno"), "{about}");
 }
 
 #[test]
@@ -214,7 +238,7 @@ const IMPLEMENTED_PROBES: &[Probe] = &[
 
 /// Resolve one argv to the dispatch request the CLI would hand a handler.
 fn dispatch_request(argv: &[&str]) -> Box<oc_cli::DispatchRequest> {
-    let cli = Cli::try_parse_from(std::iter::once("opencode-rust").chain(argv.iter().copied()))
+    let cli = Cli::try_parse_from(std::iter::once("zuno").chain(argv.iter().copied()))
         .unwrap_or_else(|error| panic!("{argv:?} must parse: {error}"));
     match cli.action(&oc_paths::Env::empty()) {
         Action::Dispatch(request) => request,
