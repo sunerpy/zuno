@@ -7959,3 +7959,19 @@ clean, and mirrored `lsp_diagnostics` reported zero diagnostics for every change
 before or was added here. Recommendation is to keep no alias because this unreleased hard cut should
 coexist unambiguously with the TypeScript oracle. Adding one requires an explicit packaging choice
 (second binary, symlink, or installer wrapper), not a Clap parser tweak.
+
+## [2026-08-14] Z-3 — repository scaffold completed on the file side
+
+The repository now declares MIT licensing, points Cargo metadata at `sunerpy/zuno`, uses a Chinese
+root README with a linked English landing page, and provides a POSIX installer whose target and asset
+naming match the six-target release matrix. The generated memory block remains owned only by the
+root README's docs test; the English page links to it instead of copying measured values.
+
+Local hooks share Makefile entry points: pre-commit runs Rust plus scoped oxfmt formatting, while
+pre-push runs only the docs/release-surface tests and installer syntax check rather than the complete
+workspace suite. The existing release workflow was retained: every one of six archives is built,
+unpacked, executed on its native architecture, checksummed, and gated before publishing. It does not
+yet use release-please or git-cliff; replacing a working 418-line workflow without a remote release
+to validate was rejected for this task. GHCR was also rejected because Zuno is a standalone static
+CLI with no container runtime contract. Creating the private remote, setting GitHub description and
+topics, and making the first push remain explicit follow-up work.

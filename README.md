@@ -1,12 +1,26 @@
 # Zuno
 
-A Rust port of [`opencode`](https://github.com/sst/opencode), pinned to
-compatibility baseline **1.18.13**.
+> [`opencode`](https://github.com/sst/opencode) 的 Rust 实现，兼容基线固定为 **1.18.13**。
 
-`zuno --version` reports `1.18.13`. That is deliberate and it is not the
-build's identity: npm plugins read the running version as a semver range and skip
-themselves when it does not match, so the short version has to be the pinned
-baseline. Ask for the real identity explicitly:
+简体中文 · [English](docs/readme/README.en.md)
+
+## 目录
+
+- [项目定位](#项目定位)
+- [安装](#安装)
+- [快速开始](#快速开始)
+- [文档](#文档)
+- [与 TypeScript 版本并行运行](#与-typescript-版本并行运行)
+- [并行使用时最先遇到的四件事](#并行使用时最先遇到的四件事)
+- [构建与开发](#构建与开发)
+- [非功能门禁](#非功能门禁)
+- [许可证](#许可证)
+
+## 项目定位
+
+`zuno --version` 输出 `1.18.13`。这不是构建版本，而是有意固定的插件兼容版本：npm
+插件会把运行版本作为 semver 范围判断条件，版本不匹配时会跳过加载。因此短版本必须保持为兼容
+基线；如需真实构建身份，请显式使用长版本：
 
 ```console
 $ zuno --version
@@ -15,120 +29,137 @@ $ zuno --version --long
 Zuno 0.1.0 (Rust package 0.1.0; plugin compatibility 1.18.13)
 ```
 
-Both identities appear because conflating them would either break plugin loading
-or lie to an operator. It is a declared divergence
-(`split-version-identity`).
+同时保留两种身份，是因为混用会导致插件无法加载，或向运维人员报告错误的构建身份。这项差异以
+`split-version-identity` 明确登记。
 
-## Documentation
+## 安装
 
-| page | what it answers |
-|---|---|
-| [docs/compatibility-matrix.md](docs/compatibility-matrix.md) | every surface's state: implemented, explicit 503 gap, added, rejected, not-registered |
-| [docs/divergences.md](docs/divergences.md) | the seventeen deliberate differences, each with its reason |
-| [docs/rejected-inputs.md](docs/rejected-inputs.md) | every deprecated config form, its replacement, and the exact error message |
-| [docs/migration.md](docs/migration.md) | opening an existing database, the channel-database rule, the 38 migrations |
-| [docs/session-retention.md](docs/session-retention.md) | the C8 prune operator guide — `--archive` reversible, `--delete` not |
-| [docs/plugin-authoring.md](docs/plugin-authoring.md) | all three plugin tiers, with a Rust example |
-| [docs/perf-methodology.md](docs/perf-methodology.md) | how the memory and liveness gates are measured |
+Linux 与 macOS 可使用一行安装脚本。仓库为私有仓库，因此先运行 `gh auth login`；下列命令
+通过已认证的 GitHub CLI 读取脚本，并将 token 传给 release 下载。脚本默认安装到
+`$HOME/.local/bin`：
 
-Every table in those pages is generated from the code it describes, and
-`cargo test -p oc-cli --test docs` fails when the code moves and the prose does
-not. Regenerate with `OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs`.
+```sh
+GH_TOKEN="$(gh auth token)" sh -c "$(gh api -H 'Accept: application/vnd.github.raw+json' repos/sunerpy/zuno/contents/scripts/install.sh)"
+```
 
-## Running Zuno side by side with the TypeScript binary
+可通过 `ZUNO_VERSION` 固定版本，通过 `ZUNO_INSTALL_DIR` 修改安装目录：
 
-Zuno uses its own config and data roots. It does not fall back to the TypeScript
-binary's directories because the project made a pre-release hard cut. To opt in
-to a one-time local copy for testing, run:
+```sh
+ZUNO_VERSION=0.1.0 ZUNO_INSTALL_DIR=/usr/local/bin \
+  GH_TOKEN="$(gh auth token)" sh -c "$(gh api -H 'Accept: application/vnd.github.raw+json' repos/sunerpy/zuno/contents/scripts/install.sh)"
+```
+
+也可以从 [GitHub Releases](https://github.com/sunerpy/zuno/releases) 下载对应平台的预编译归档，
+或在克隆仓库后运行 `cargo install --path crates/oc-cli --locked` 从源码安装。
+
+## 快速开始
+
+```console
+$ zuno --version
+1.18.13
+$ zuno --help
+```
+
+现有 opencode 数据不会被自动读取或修改；需要并行验证旧数据时，请先按下文复制并备份数据。
+
+## 文档
+
+| 页面 | 内容 |
+| --- | --- |
+| [docs/compatibility-matrix.md](docs/compatibility-matrix.md) | 每个接口面的状态：implemented、显式 503 gap、added、rejected、not-registered |
+| [docs/divergences.md](docs/divergences.md) | 17 项有意差异及各自原因 |
+| [docs/rejected-inputs.md](docs/rejected-inputs.md) | 已弃用配置、替代形式与准确错误信息 |
+| [docs/migration.md](docs/migration.md) | 打开现有数据库、channel 数据库规则及 38 个迁移 |
+| [docs/session-retention.md](docs/session-retention.md) | C8 清理操作指南：`--archive` 可逆，`--delete` 不可逆 |
+| [docs/plugin-authoring.md](docs/plugin-authoring.md) | 三类插件层级与 Rust 示例 |
+| [docs/perf-methodology.md](docs/perf-methodology.md) | 内存和活性门禁的测量方法 |
+
+这些页面中的表格均从其描述的代码生成；代码与文档不一致时，
+`cargo test -p oc-cli --test docs` 会失败。使用
+`OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs` 重新生成。
+
+## 与 TypeScript 版本并行运行
+
+Zuno 使用独立的配置和数据根目录，不会回退读取 TypeScript 版本的目录。若要一次性复制本地数据
+进行并行测试，请运行：
 
 ```sh
 mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/zuno" "${XDG_DATA_HOME:-$HOME/.local/share}/zuno" && cp -a "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/." "${XDG_CONFIG_HOME:-$HOME/.config}/zuno/" && cp -a "${XDG_DATA_HOME:-$HOME/.local/share}/opencode/." "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/"
 
-# Back up the copied database before a forward-only migration.
+# 单向迁移前先备份复制出的数据库。
 cp "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/opencode.db" "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/opencode.db.backup"
 
-# Read-only sanity check: does Zuno see the copied data?
+# 只读检查：Zuno 是否能看到复制的数据？
 zuno debug paths
 ZUNO_DISABLE_CHANNEL_DB=1 zuno session list
 
-# The TypeScript binary remains on its original paths.
+# TypeScript 版本仍使用原目录。
 opencode session list
 ```
 
-If step 2 shows an empty list, you have hit the channel-database rule, not a
-compatibility bug — see the first gap below.
+若第二步显示空列表，原因是 channel 数据库规则，而不是兼容性缺陷；请查看下文第一项。
 
-### Rolling back
+### 回滚
 
-There is no uninstall command and no self-updater; both are deliberately
-[rejected](docs/compatibility-matrix.md). Rolling back is therefore just:
+项目没有卸载命令或自更新器，两者均被明确
+[拒绝](docs/compatibility-matrix.md)。回滚只需：
 
 ```sh
-# Stop using this binary. The TypeScript one is untouched.
+# 停止使用 Zuno；TypeScript 版本未被改动。
 opencode
 
-# If you migrated the copied database and want its exact prior bytes back:
+# 若已迁移复制出的数据库并希望恢复原始字节：
 cp "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/opencode.db.backup" "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/opencode.db"
 ```
 
-The released binary can keep using a database this port has migrated: a
-Rust-created database is opened by the real 1.18.12 binary without replaying
-migrations, and the resulting schema is compared object by object against a
-database that binary created itself
-(`crates/oc-db/tests/schema.rs`, `crates/oc-testkit/tests/compat_suite.rs`). That
-is tested at the schema and journal level only, which is why the backup in step 1
-is not optional.
+TypeScript 1.18.12 正式版可以继续打开由本实现迁移的数据库：测试会让真实 1.18.12 二进制打开
+Rust 创建的数据库且不重放迁移，并逐对象对比其 schema 与该二进制自行创建的数据库
+（`crates/oc-db/tests/schema.rs`、`crates/oc-testkit/tests/compat_suite.rs`）。该验证仅覆盖 schema
+与 journal，因此备份不是可选步骤。
 
-## Four things a side-by-side user hits first
+## 并行使用时最先遇到的四件事
 
-**1. The database filename differs, and it looks like data loss.** A build from
-source resolves `opencode-local.db`; an installed release resolves `opencode.db`.
-Same rule in both implementations — a channel define, not a divergence — but the
-symptom is an empty session list. Use `ZUNO_DISABLE_CHANNEL_DB=1` or point
-`ZUNO_DB` at the file you mean. Details and the full precedence order:
-[docs/migration.md](docs/migration.md#the-channel-database).
+**1. 数据库文件名不同，看起来像数据丢失。** 源码构建解析为 `opencode-local.db`，安装的 release
+解析为 `opencode.db`。两种实现遵循同一 channel define 规则，这不是差异，但表现会是空会话列表。
+使用 `ZUNO_DISABLE_CHANNEL_DB=1`，或通过 `ZUNO_DB` 指向目标文件。完整优先级见
+[docs/migration.md](docs/migration.md#the-channel-database)。
 
-**2. Event subscriptions use SSE.** `/api/event` immediately emits
-`server.connected` and then live events; `/api/session/{sessionID}/event` replays
-durable events after `?after=<sequence>` and continues live. The older `/event`
-cursor stream remains available for compatibility. Slow subscribers stay bounded
-and receive an explicit lag diagnostic rather than growing memory.
+**2. 事件订阅使用 SSE。** `/api/event` 会立即发送 `server.connected`，随后发送实时事件；
+`/api/session/{sessionID}/event` 会从 `?after=<sequence>` 之后重放持久事件并继续实时发送。旧的
+`/event` 游标流保留用于兼容。慢订阅者有容量上限并会收到明确的 lag 诊断，不会无限增长内存。
 
-The API differential invokes all 58 upstream operations against both binaries.
-48 of the 58 upstream operations have local backends; the remaining 10 return an
-operation-specific `503 backend_unavailable` and remain reported as compatibility
-gaps. A registered `501` can never satisfy the matrix.
+API differential 会针对两个二进制调用全部 58 个上游操作。58 个上游操作中，48 个具有本地
+后端；其余 10 个返回针对具体操作的 `503 backend_unavailable`，并继续报告为兼容性缺口。
+已注册的 `501` 永远不能满足兼容矩阵。
 
-**3. An old install needs a migration you should know about.** A database
-predating the `migration` table carries a `__drizzle_migrations` journal instead.
-That case is handled — the journal is created, seeded from the names Drizzle
-recorded, and the remaining migrations run — but it is a one-way upgrade of your
-real data. See [docs/migration.md](docs/migration.md#opening-an-existing-database).
+**3. 旧安装需要一次明确的迁移。** 早于 `migration` 表的数据库使用
+`__drizzle_migrations` journal。实现会创建该 journal、填入 Drizzle 记录的名称并执行剩余迁移，
+但这是对真实数据的单向升级。详见
+[docs/migration.md](docs/migration.md#opening-an-existing-database)。
 
-**4. Provider coverage is stated per wire family, not per vendor.** If your
-provider id is not claimed by a family, you get an error naming it rather than a
-request quietly built in the wrong shape. Declared as
-`provider-coverage-by-wire-family` in [docs/divergences.md](docs/divergences.md).
+**4. Provider 覆盖按 wire family 而非厂商声明。** 如果 provider id 不属于任何已声明 family，
+系统会返回点名该 id 的错误，而不会静默构造错误形状的请求。这项差异以
+`provider-coverage-by-wire-family` 登记于 [docs/divergences.md](docs/divergences.md)。
 
-## Building and testing
+## 构建与开发
 
 ```sh
 cargo build --release
 cargo test --workspace
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
+make hooks
 ```
 
-`unsafe_code` is forbidden workspace-wide.
+`unsafe_code` 在整个 workspace 中被禁止。`make hooks` 安装两个共享本地门禁：提交前运行格式化，
+推送前运行快速测试；完整 workspace 测试仍由 CI 和显式 `make test` 执行。
 
-## Non-functional gates
+## 非功能门禁
 
-Six gates back the port's resource claims. Every figure below was measured on
-Linux; none is a projection. Two of the six are opt-in rather than part of the
-ordinary suite, and one has a half that has never run here — both stated in the
-caveats.
+六项门禁支撑本实现的资源声明。下列数据均在 Linux 上实测，不是推算值。其中两项需要显式启用，
+不属于普通测试套件；另有一项的一半从未在当前环境运行，限制见后文。
 
-### G1 and G2 — peak resident memory
+### G1 与 G2 — 峰值常驻内存
 
 <!-- generated:BEGIN memory-gate-measurement -->
 Derived from the newest committed measurement artefact,
@@ -154,57 +185,54 @@ is the shape being avoided: a 164,552 KiB spread around a median that finished
 13,692 KiB over the same ceiling — FAIL.
 <!-- generated:END memory-gate-measurement -->
 
-### G3 to G6
+### G3 至 G6
 
-| gate | what it bounds | measured | bound | verdict |
-|---|---|---|---|---|
-| G3 | memory growth per turn over a 500-turn soak | 0.0001775568 MiB/turn | 1.0 MiB/turn | PASS |
-| G3 | final/middle peak ratio | 0.9938255268 | 1.5 | PASS |
-| G4 | liveness during the soak | neither bound tripped | 120 s without state progress; 1800 s hard deadline per turn | PASS |
-| G5 | unbounded channels on producer/consumer boundaries | 17 bounded + 2 declared exclusions, 0 undeclared | — | PASS |
-| G6 | orphaned processes after the parent dies | 0 orphans on Linux, clean shutdown **and** `SIGKILL` | — | PASS on Linux; Windows half unexecuted |
+| 门禁 | 约束对象 | 实测值 | 上限 | 结论 |
+| --- | --- | --- | --- | --- |
+| G3 | 500 轮 soak 中每轮内存增长 | 0.0001775568 MiB/turn | 1.0 MiB/turn | PASS |
+| G3 | 最终/中段峰值比 | 0.9938255268 | 1.5 | PASS |
+| G4 | soak 期间的活性 | 两个上限均未触发 | 120 秒无状态进展；每轮 1800 秒硬截止 | PASS |
+| G5 | 生产者/消费者边界的无界 channel | 17 个有界 + 2 个已声明例外，0 个未声明 | — | PASS |
+| G6 | 父进程退出后的孤儿进程 | Linux 上 0 个孤儿，正常关闭和 `SIGKILL` 均验证 | — | Linux 上 PASS；Windows 部分未执行 |
 
-### Four caveats, stated rather than buried
+### 四项明确限制
 
-**The G2 ceiling does not scale with the subject.** It is a fixed number — half
-one TypeScript median, measured once, on one session — so the gate can flip to
-FAIL on a materially larger session with no change in this code. The margin and
-the five-run spread above are what decide how much room there actually is, and
-the ordering between the two matters more than either on its own.
+**G2 上限不会随测试对象缩放。** 它是固定值：同一 session 的一次 TypeScript 中位数的一半。
+因此，即使代码不变，换成明显更大的 session 也可能使门禁转为 FAIL。上方 margin 与五次运行
+spread 决定真实余量，两者的大小关系比任何单个数字更重要。
 
-**G6's Windows half has never been executed.** The measured result above comes
-from `crates/oc-process/tests/containment.rs`, which is
-`#![cfg(target_os = "linux")]`. The Windows Job-object path lives in
-`crates/oc-process/tests/windows_containment.rs` behind `#![cfg(windows)]`, and
-on a Linux host it is **NOT EXECUTED** — not skipped-but-fine, not inferred from
-the Linux result. It needs native Windows CI or a Windows machine before G6 can
-be claimed cross-platform.
+**G6 的 Windows 部分从未执行。** 上方实测结果来自
+`crates/oc-process/tests/containment.rs`，该文件受 `#![cfg(target_os = "linux")]` 限制。
+Windows Job Object 路径位于 `crates/oc-process/tests/windows_containment.rs`，受
+`#![cfg(windows)]` 限制；它在 Linux 主机上是 **NOT EXECUTED**，不是“跳过但视为通过”，也不能
+由 Linux 结果推断。只有在原生 Windows CI 或 Windows 主机上执行后，才能声明 G6 跨平台通过。
 
-**A green `cargo test --workspace` does not mean G1-G6 pass.** The expensive gates
-are opt-in, and the ordinary suite skips or ignores them:
+**`cargo test --workspace` 通过不代表 G1-G6 通过。** 高成本门禁需要显式启用，普通套件会跳过
+或忽略它们：
 
 ```sh
-# G1 + G2. Skipped entirely unless the mode is `run`.
+# G1 + G2：仅当 mode 为 `run` 时执行。
 OC_MEMORY_GATE_MODE=run cargo test -p oc-testkit --test memory -- --nocapture --test-threads=1
 
-# G3 + G4, real-driver soak. #[ignore]d: it occupies two real language servers,
-# a 50,000-file watcher, a PTY, and two hours of wall clock.
+# G3 + G4：真实 driver soak。该测试被 #[ignore]，会占用两个真实 language server、
+# 一个 50,000 文件 watcher、一个 PTY，以及两小时 wall clock。
 OC_MEMORY_GATE_MODE=skip cargo test -p oc-testkit --test soak \
   g3_and_g4_real_driver_soak_stays_bounded_and_live -- \
   --ignored --exact --nocapture --test-threads=1
 
-# G5 and G6 do run in the ordinary suite.
+# G5 与 G6 会在普通套件中运行。
 cargo test -p oc-testkit --test backpressure
 cargo test -p oc-process --test containment
 ```
 
-**G2's subject is pinned, and reproducing it elsewhere requires a recapture.**
-The measured session is `ses_2bcaee257ffeFZNJrmtpi3ZglR` (931 messages, 3,620
-parts, 105,118,812 part bytes) inside a 2.6 GB database snapshot identified by
-sha256. `crates/oc-testkit/src/perf/subject.rs` holds the pin and prints a
-four-step recapture procedure on any mismatch; step four is re-measuring the
-TypeScript baseline, because the subject and the ceiling have to come from one
-measurement. On a machine without that snapshot, G2 fails the pin rather than
-measuring something else and calling it G2.
+**G2 测试对象已固定，在其他环境复现需要重新捕获。** 实测 session 为
+`ses_2bcaee257ffeFZNJrmtpi3ZglR`（931 条消息、3,620 个 part、105,118,812 part bytes），位于
+一个以 sha256 标识的 2.6 GB 数据库快照中。`crates/oc-testkit/src/perf/subject.rs` 保存该 pin；
+发生不匹配时会打印四步重新捕获流程，第四步要求重测 TypeScript 基线，因为测试对象与上限必须
+来自同一次测量。没有该快照的机器会在 pin 校验处失败，而不会测量其他对象并称其为 G2。
 
-Method, formulas, and the frozen revision: [docs/perf-methodology.md](docs/perf-methodology.md).
+测量方法、公式与冻结版本见 [docs/perf-methodology.md](docs/perf-methodology.md)。
+
+## 许可证
+
+本项目采用 [MIT License](LICENSE)。

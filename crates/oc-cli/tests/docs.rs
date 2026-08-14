@@ -289,15 +289,10 @@ Reflection must not learn any of these negative cases:\n",
 fn docs_every_declared_divergence_is_documented_with_its_reason() {
     let list = allow_list();
 
-    // The README names this count in prose, and nothing derived it until F1 and F4
-    // both found it still saying "thirteen" while the allow-list held seventeen.
-    // Spelling the number from the live list means the next entry cannot leave the
-    // README stale, which is the whole reason the other README figures are probed
-    // rather than retyped.
-    contains_all(
-        "README.md",
-        &[&format!("the {} deliberate differences", spell(list.len()))],
-    );
+    // The Chinese root README names this count in prose. Deriving the number from
+    // the live list means the next entry cannot leave the README stale, which is
+    // the whole reason the other README figures are probed rather than retyped.
+    contains_all("README.md", &[&format!("{} 项有意差异", list.len())]);
 
     // The divergence page's own headline. It said "Thirteen" for two review waves
     // after the allow-list reached seventeen, on the one page that calls itself the
@@ -525,8 +520,8 @@ fn assert_api_counts(
         ],
     );
 
-    // The README restates this split, and once shipped it inverted: 23 backed
-    // against the table's 35. Both halves now come from the same probe.
+    // The Chinese root README restates this split, and once shipped it inverted:
+    // 23 backed against the table's 35. Both halves now come from the same probe.
     let backed = upstream
         .iter()
         .filter(|operation| served.contains(*operation) && !gaps.contains(*operation))
@@ -543,12 +538,9 @@ fn assert_api_counts(
     contains_all(
         "README.md",
         &[
-            &format!("all {} upstream operations", upstream.len()),
-            &format!(
-                "{backed} of the {} upstream operations have local backends",
-                upstream.len()
-            ),
-            &format!("the remaining {gapped} return an"),
+            &format!("全部 {} 个上游操作", upstream.len()),
+            &format!("{} 个上游操作中，{backed} 个具有本地", upstream.len(),),
+            &format!("其余 {gapped} 个返回针对"),
         ],
     );
 }
@@ -1459,7 +1451,7 @@ fn readme_states_the_pinned_baseline_the_binary_actually_reports() {
         "README.md",
         &[
             oc_cli::COMPATIBILITY_VERSION,
-            &format!("--version` reports `{}`", oc_cli::COMPATIBILITY_VERSION),
+            &format!("--version` 输出 `{}`", oc_cli::COMPATIBILITY_VERSION),
         ],
     );
 }
@@ -1479,7 +1471,7 @@ fn readme_documents_the_four_gaps_a_side_by_side_user_hits() {
             // 4. provider coverage by wire family
             "provider-coverage-by-wire-family",
             // and the rollback the QA scenario requires
-            "Rolling back",
+            "回滚",
         ],
     );
 }
@@ -1497,7 +1489,7 @@ fn readme_reports_every_non_functional_gate_with_its_opt_in_command() {
             // measured values, so they are checked by
             // `readme_publishes_the_newest_measured_memory_figures_not_a_remembered_one`
             // against the artefact instead of pinned to a literal here.
-            "does not mean G1-G6 pass",
+            "通过不代表 G1-G6 通过",
             "ses_2bcaee257ffeFZNJrmtpi3ZglR",
             // G6's unexecuted Windows half, named by the file that would run it.
             "windows_containment.rs",
@@ -1541,7 +1533,7 @@ fn criterion_15_states_the_windows_g6_half_is_not_executed_in_the_readme_and_the
         &[
             WINDOWS_TEST.rsplit('/').next().expect("the test file name"),
             DISCLOSURE,
-            "PASS on Linux; Windows half unexecuted",
+            "Linux 上 PASS；Windows 部分未执行",
         ],
     );
 

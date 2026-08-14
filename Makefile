@@ -15,12 +15,14 @@
 # cannot be reproduced makes CI fail in a way that looks like a code problem.
 
 .PHONY: all help \
-        fmt fmt-check lint check test ci \
-        deny metadata \
+		fmt fmt-check fmt-rust fmt-rust-check fmt-oxfmt fmt-oxfmt-check \
+		lint check test test-fast hook-fmt hook-test hooks ci \
+		deny metadata \
         build release release-target package smoke smoke-artifact \
         clean
 
 CARGO       := cargo
+OXFMT      ?= oxfmt
 CLI_CRATE   := oc-cli
 BINARY_NAME := zuno
 TARGET_DIR  := target
@@ -28,6 +30,11 @@ DIST_DIR    := dist
 
 # Set `OFFLINE=` on the command line to permit network access.
 OFFLINE ?= --offline
+
+OXFMT_FILES := \
+  .oxfmtrc.json \
+  .pre-commit-config.yaml \
+  docs/readme/README.en.md
 
 # Cross-compilation target for `release-target` / `package`, e.g.
 #   make package TARGET=x86_64-unknown-linux-musl
@@ -49,11 +56,25 @@ all: build
 
 # ─── Gates ──────────────────────────────────────────────────────────────────
 
-fmt:
+fmt: fmt-rust fmt-oxfmt
+
+fmt-rust:
 	$(CARGO) fmt --all
 
-fmt-check:
+fmt-check: fmt-rust-check fmt-oxfmt-check
+
+fmt-rust-check:
 	$(CARGO) fmt --all --check
+
+fmt-oxfmt:
+	@command -v $(OXFMT) > /dev/null 2>&1 \
+	  || { echo "oxfmt is required; install it from https://oxc.rs/docs/guide/usage/formatter.html"; exit 1; }
+	$(OXFMT) --ignore-path .oxfmtignore $(OXFMT_FILES)
+
+fmt-oxfmt-check:
+	@command -v $(OXFMT) > /dev/null 2>&1 \
+	  || { echo "oxfmt is required; install it from https://oxc.rs/docs/guide/usage/formatter.html"; exit 1; }
+	$(OXFMT) --check --ignore-path .oxfmtignore $(OXFMT_FILES)
 
 # `--all-targets` so tests and examples are linted too; `-D warnings` because the
 # workspace lint table sets `clippy::all = "warn"` and a warning nobody fails on
@@ -66,6 +87,19 @@ check:
 
 test:
 	$(CARGO) test --workspace $(OFFLINE)
+
+test-fast:
+	$(CARGO) test -p $(CLI_CRATE) --test docs --test release_surface $(OFFLINE)
+	sh -n scripts/install.sh
+
+hook-fmt: fmt
+
+hook-test: test-fast
+
+hooks:
+	@command -v pre-commit > /dev/null 2>&1 \
+	  || { echo "pre-commit is required; install it from https://pre-commit.com"; exit 1; }
+	pre-commit install --hook-type pre-commit --hook-type pre-push
 
 # Run FIRST in `ci`: a lock file that cannot be reproduced makes every later
 # failure look like a code problem, and a plain `cargo build` silently repairs it
@@ -166,10 +200,15 @@ help:
 	@echo "Gates:"
 	@echo "  ci              metadata + fmt-check + lint + test + deny"
 	@echo "  fmt             cargo fmt --all"
-	@echo "  fmt-check       cargo fmt --all --check"
+	@echo "                  + oxfmt YAML/JSON/Markdown"
+	@echo "  fmt-check       verify Rust and oxfmt formatting"
 	@echo "  lint            cargo clippy --workspace --all-targets -D warnings"
 	@echo "  check           cargo check --workspace --all-targets"
 	@echo "  test            cargo test --workspace"
+	@echo "  test-fast       focused docs/release tests + installer syntax"
+	@echo "  hook-fmt        commit-time formatting gate"
+	@echo "  hook-test       push-time fast test gate"
+	@echo "  hooks           install pre-commit and pre-push hooks"
 	@echo "  metadata        cargo metadata --locked (lock reproducibility)"
 	@echo "  deny            cargo deny check (skipped with a notice if absent)"
 	@echo ""
