@@ -1,0 +1,105 @@
+COMPLETE — FU-8 defect A implemented and verified; final quality-gate results are recorded below.
+
+SCOPE FROZEN
+--------------------------------------------------------------------------------
+Authoritative plan: `.omo/plans/opencode-rust-followup.md:270-395`.
+Only FU-8 defect A is in scope. Defect B is already closed; its engine guard is
+untouched. Acceptance requires a custom-baseURL `@ai-sdk/openai` provider that
+serves Chat only to complete, while explicit Responses/Chat model declarations
+continue to win. Working rules require a sensitive mutation, disk-space check,
+an aborting backup, exact staging, and no credentials in artifacts.
+
+Prior layers preserved:
+- Task 156 evidence: `ApiSurface` already governs both request bytes and stream
+  decoder; Chat and Responses protocol shapes must remain distinct.
+- Task 162 evidence: `ModelApi.endpoint` reaches `modelEndpoints`, and explicit
+  advertised endpoint precedence is guarded by two production tests.
+
+UPSTREAM 1.18.18 SURFACE PROBE (2026-08-14)
+--------------------------------------------------------------------------------
+Oracle executable: `/config/.local/share/mise/installs/opencode/1.18.18/opencode`.
+An isolated config gave two otherwise-identical providers the same loopback
+`baseURL` and model id, changing only `npm`. A local recorder logged only the
+request path and sorted top-level JSON keys; the synthetic API key was the
+literal `probe-not-a-secret` and no real credential was loaded.
+
+- `npm: "@ai-sdk/openai"` posted `/v1/responses` with Responses keys including
+  `input`, `max_output_tokens`, and `store`.
+- `npm: "@ai-sdk/openai-compatible"` posted `/v1/chat/completions` with Chat keys
+  including `messages`, `max_tokens`, and `stream_options`.
+
+The executable bundle corroborates the wire observation at byte offset
+96327664: its native adapter maps `@ai-sdk/openai` to
+`configure(...).responses(model.api.id)` and `@ai-sdk/openai-compatible` to
+`configure(...).model(model.api.id)`. The available 1.18.13 TypeScript source
+also calls `sdk.languageModel(model.api.id)` at `provider.ts:1835-1855`, while
+AI SDK 3.0.84 implements OpenAI `languageModel` as `createResponsesModel` at
+`openai-provider.ts:219-247`.
+
+This directly disproves the plan's tentative premise that released 1.18.18
+automatically makes this exact `@ai-sdk/openai` custom-baseURL shape work.
+Upstream's package distinction is nevertheless the useful oracle: Responses is
+the genuine OpenAI default; generic compatible is Chat. FU-8A therefore must
+make the custom-gateway policy explicit at Rust's composition boundary, while
+retaining explicit model endpoint declarations and genuine Responses routing.
+
+IMPLEMENTATION
+--------------------------------------------------------------------------------
+`crates/oc-cli/src/cmd/turn.rs` now treats a non-empty provider-level
+`options.endpoint` or `options.baseURL` on an `@ai-sdk/openai` model as the
+custom-gateway signal. It does not inspect the hostname. Such a model is built by
+the compatible factory, with the generic compatible npm declaration required by
+that family's closed claim table. Its default surface is Chat. An explicit
+`model.api.endpoint` still wins and can select Chat, Responses, or Messages.
+
+An `@ai-sdk/openai` model whose URL comes only from catalog `api.url` retains the
+native OpenAI factory and Responses default. The existing `modelEndpoints`
+forwarding for compatible models is unchanged. No HTTP 400/404 retry fallback was
+added, so a genuine malformed Responses request is never silently replayed as
+Chat. No hostname literal or dependency was added.
+
+REGRESSION AND MUTATION
+--------------------------------------------------------------------------------
+The production-path regressions in `turn_tests.rs` build resolved catalogs, run
+through `model_spec`, the real provider registry, request-body construction and
+recorded SSE decoding. They prove:
+
+- custom `@ai-sdk/openai` URL with no advertised endpoint uses
+  `/v1/chat/completions`, emits `messages`, and decodes a complete reply;
+- custom URL with advertised Responses uses `/v1/responses` and `input`;
+- catalog-native OpenAI with no override retains Responses;
+- catalog-native OpenAI with advertised Chat uses Chat;
+- the pre-existing native OpenAI Responses replay remains green.
+
+Before the fix, the custom-gateway regression failed with an unrecoverable
+provider error. The final sensitive mutation disabled only the custom OpenAI to
+compatible-factory branch. The same named regression failed immediately because
+the selected factory was `openai` instead of `openai-compatible`. Restoring the
+branch restored the test. The complete `oc-cli` suite then passed.
+
+LIVE SMOKE
+--------------------------------------------------------------------------------
+After rebuilding the changed binary, one real minimal `hi` was sent through the
+configured custom provider with `--pure` so third-party plugins could not alter
+the tool list. Result: exit 0, 376 stdout bytes, 0 stderr bytes, and non-empty
+assistant output. No response body, URL, request header, token, or credential is
+stored in this artifact.
+
+A non-pure attempt reached the Chat provider but was rejected because an external
+plugin registered the `grep` tool twice. That is an independent plugin-composition
+issue, recorded in the notepad; it is not a surface-routing failure and was not
+changed in FU-8A.
+
+FINAL QUALITY GATES
+--------------------------------------------------------------------------------
+- Changed-file `lsp_diagnostics`: 0 diagnostics for `turn.rs` and
+  `turn_tests.rs` (same bytes diagnosed in a temporary in-root worktree because
+  the LSP tool rejects sibling-worktree paths).
+- `cargo fmt --all --check`: clean.
+- `cargo clippy --workspace --all-targets --offline -- -D warnings`: clean.
+- `cargo test --workspace --offline -- --test-threads=1`: 3495 passed,
+  0 failed, 2 ignored across 217 test-result summaries.
+- `cargo build -p oc-cli --bin opencode-rust --offline`: passed.
+
+The final source contains no host-specific routing literal, no new dependency,
+and no credential or provider response bytes in committed artifacts.

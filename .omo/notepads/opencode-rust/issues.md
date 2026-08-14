@@ -7901,3 +7901,12 @@ All five changed Rust files have clean LSP diagnostics; rustfmt and Clippy are c
 single-thread offline workspace gate reports 3491 passed, 0 failed, 2 ignored. FU-8 defect A remains
 open and its routing/surface files were not touched. Full evidence is in
 `.omo/evidence/task-fu8b-opencode-rust.txt`.
+
+## [2026-08-14] FU-8A — non-pure live turns can duplicate plugin tools
+
+The FU-8A live smoke reached the corrected Chat surface but a non-pure invocation
+was rejected by the configured gateway because `grep` appeared twice in the tool
+list. Re-running the same model and prompt with `--pure` completed successfully
+with exit 0 and non-empty output. This is independent of provider surface routing:
+the request reached and was parsed by the Chat endpoint. FU-8A therefore records
+the plugin-composition issue but does not widen scope to tool deduplication.

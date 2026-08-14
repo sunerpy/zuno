@@ -279,6 +279,66 @@ fn production_wire_spec(
         .expect("production replay spec resolves")
 }
 
+fn openai_wire_spec(
+    provider_id: &str,
+    model_id: &str,
+    endpoint: &str,
+    custom_base_url: bool,
+    advertised_endpoint: Option<&str>,
+) -> Spec {
+    let provider_location = if custom_base_url {
+        serde_json::json!({"options": {"baseURL": endpoint}})
+    } else {
+        serde_json::json!({"api": endpoint})
+    };
+    let mut provider = provider_location
+        .as_object()
+        .cloned()
+        .expect("provider location is an object");
+    provider.insert("id".to_owned(), serde_json::json!(provider_id));
+    provider.insert("name".to_owned(), serde_json::json!("OpenAI wire replay"));
+    provider.insert("env".to_owned(), serde_json::json!([]));
+    provider.insert("npm".to_owned(), serde_json::json!("@ai-sdk/openai"));
+    provider.insert(
+        "models".to_owned(),
+        serde_json::json!({
+            model_id: {
+                "id": model_id,
+                "name": "OpenAI wire replay",
+                "limit": {"context": 100000, "output": 8192}
+            }
+        }),
+    );
+    let providers =
+        serde_json::Map::from_iter([(provider_id.to_owned(), serde_json::Value::Object(provider))]);
+    let config: oc_config::schema::Config = serde_json::from_value(serde_json::json!({
+        "provider": serde_json::Value::Object(providers)
+    }))
+    .expect("OpenAI replay config");
+    let mut catalog = Catalog::resolve(
+        &oc_llm::catalog::models_dev::CatalogDocument::new(),
+        &ResolveInput::new().with_config(&config),
+    );
+    if let Some(advertised_endpoint) = advertised_endpoint {
+        let mut value = serde_json::to_value(
+            catalog
+                .model(provider_id, model_id)
+                .expect("OpenAI replay model resolves"),
+        )
+        .expect("OpenAI replay model serializes");
+        value["api"]["endpoint"] = serde_json::json!(advertised_endpoint);
+        let resolved = serde_json::from_value(value).expect("advertised endpoint resolves");
+        assert!(catalog.replace_provider_models(
+            provider_id,
+            std::collections::BTreeMap::from([(model_id.to_owned(), resolved)]),
+        ));
+    }
+    let model = catalog
+        .model(provider_id, model_id)
+        .expect("OpenAI replay model resolves");
+    model_spec(&catalog, model, &Env::empty()).expect("OpenAI replay spec resolves")
+}
+
 fn plugin_resolved_wire_spec(
     catalog_model_id: &str,
     api_model_id: &str,
@@ -776,16 +836,110 @@ async fn production_anthropic_registration_dispatches_and_decodes_recorded_sse()
 
 #[tokio::test]
 async fn production_openai_registration_dispatches_and_decodes_recorded_responses_sse() {
-    replay_production_registration(RegistrationCase {
-        registry_key: "openai",
-        npm: "@ai-sdk/openai",
-        model_id: "gpt-5.5",
-        cassette: "openai-responses/gpt-5-5-streams-text",
-        extra_options: serde_json::json!({"maxTokens": 80}),
-        endpoint_suffix: "/v1/responses",
-        expected_body_key: "input",
-        expected_text: "Hello!",
-    })
+    replay_selected_production_spec(
+        ReplayCase {
+            provider_id: "openai",
+            registry_key: "openai",
+            model_id: "gpt-5.5",
+            cassette: "openai-responses/gpt-5-5-streams-text",
+            endpoint_suffix: "/v1/responses",
+            expected_body_key: "input",
+            expected_text: "Hello!",
+        },
+        |endpoint| openai_wire_spec("openai", "gpt-5.5", endpoint, false, None),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn production_custom_openai_base_url_without_advertised_endpoint_dispatches_to_chat() {
+    replay_selected_production_spec(
+        ReplayCase {
+            provider_id: "private-openai-gateway",
+            registry_key: COMPATIBLE_PROVIDER,
+            model_id: "gateway-model",
+            cassette: "openai-compatible-chat/deepseek-streams-text",
+            endpoint_suffix: "/v1/chat/completions",
+            expected_body_key: "messages",
+            expected_text: "Hello!",
+        },
+        |endpoint| {
+            openai_wire_spec(
+                "private-openai-gateway",
+                "gateway-model",
+                endpoint,
+                true,
+                None,
+            )
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn production_custom_openai_base_url_honors_advertised_responses() {
+    replay_selected_production_spec(
+        ReplayCase {
+            provider_id: "openai-wire",
+            registry_key: COMPATIBLE_PROVIDER,
+            model_id: "gateway-model",
+            cassette: "openai-responses/gpt-5-5-streams-text",
+            endpoint_suffix: "/v1/responses",
+            expected_body_key: "input",
+            expected_text: "Hello!",
+        },
+        |endpoint| {
+            openai_wire_spec(
+                "openai-wire",
+                "gateway-model",
+                endpoint,
+                true,
+                Some("responses"),
+            )
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn production_catalog_native_openai_without_override_keeps_responses() {
+    replay_selected_production_spec(
+        ReplayCase {
+            provider_id: "openai-wire",
+            registry_key: "openai",
+            model_id: "gpt-native",
+            cassette: "openai-responses/gpt-5-5-streams-text",
+            endpoint_suffix: "/v1/responses",
+            expected_body_key: "input",
+            expected_text: "Hello!",
+        },
+        |endpoint| openai_wire_spec("openai-wire", "gpt-native", endpoint, false, None),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn production_catalog_native_openai_honors_advertised_chat() {
+    replay_selected_production_spec(
+        ReplayCase {
+            provider_id: "openai-wire",
+            registry_key: "openai",
+            model_id: "gpt-native-chat",
+            cassette: "openai-compatible-chat/deepseek-streams-text",
+            endpoint_suffix: "/v1/chat/completions",
+            expected_body_key: "messages",
+            expected_text: "Hello!",
+        },
+        |endpoint| {
+            openai_wire_spec(
+                "openai-wire",
+                "gpt-native-chat",
+                endpoint,
+                false,
+                Some("chat"),
+            )
+        },
+    )
     .await;
 }
 
