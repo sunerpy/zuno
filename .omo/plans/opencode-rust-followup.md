@@ -267,6 +267,113 @@ whatever the workspace already does for TTY detection; if nothing exists, plain 
 - Removing the notice fails the visibility test by name; removing the ceiling fails the bound test
   by name.
 
+## FU-8. `run` cannot complete a turn against a real provider — two distinct defects
+
+**Source**: the orchestrator's first genuine end-to-end verification with real credentials,
+2026-08-14, prompted by the user asking how to configure and validate the project. **Nothing in the
+3488-test suite covers this path**, because every test supplies its own mock provider. This is the
+project's twenty-fourth seam and the first one found by simply trying to use the product as shipped.
+
+### Defect A — `@ai-sdk/openai` is routed to a Responses endpoint that many gateways do not serve
+
+**Measured directly against the user's configured gateway** (`myopenai`, an OpenAI-compatible relay
+at `https://openai-us.onethinker.top/api/v1`, `npm: "@ai-sdk/openai"`):
+
+```
+POST /api/v1/chat/completions  -> HTTP 200
+POST /api/v1/responses         -> HTTP 400
+```
+
+And the product's own behaviour on the same model:
+
+```
+$ opencode-rust run --model myopenai/global.anthropic.claude-haiku-4-5-20251001-v1:0 "hi"
+EXIT=1
+unrecoverable provider failure (status=Some(404))
+```
+
+The chain: `turn.rs:1100` maps `"@ai-sdk/openai"` to the `openai` identity; `family.rs:250` binds
+that identity to `Family::OpenAi`; the surface walk in `surface.rs:160-212` prefers
+`ApiSurface::Responses` whenever `support.responses` holds — and the comment at `:162` is explicit:
+*"without it the walk always prefers `responses`"*.
+
+So **a provider that declares `@ai-sdk/openai` but serves only Chat Completions is unusable**. That
+describes most self-hosted relays and proxies, and it describes the user's working configuration.
+
+**Why the existing tests missed it.** Todo 156 made request bodies and decoders surface-aware and
+todo 162 carried the advertised endpoint into selection — both correct, both verified. But their
+tests assert that *a declared surface is honoured*, never that *an undeclared surface degrades to
+one the server actually serves*. The `SurfaceSupport` for a custom gateway is assumed, not probed.
+
+**Do NOT fix this by hard-coding a host pattern.** Options, to be weighed with evidence:
+- honour an explicit per-provider surface override in config (does one already exist? check before
+  adding);
+- treat a `404`/`400` on `/responses` as a signal to fall back to `/chat/completions` **once** per
+  provider, cached for the session — note this must not mask a genuine `400` from a well-formed
+  Responses request;
+- default a *custom* `baseURL` to Chat unless Responses is explicitly declared, on the reasoning that
+  `@ai-sdk/openai` against a non-OpenAI host cannot imply OpenAI's newest surface.
+
+Whichever is chosen, **check what released 1.18.18 does with this exact configuration** — the user's
+gateway works under upstream, so upstream's behaviour is the oracle.
+
+### Defect B — `kiro-auth` turns exit 0 with no output, no error, and no log line
+
+Separate from A and worse, because it is **silent**:
+
+```
+$ opencode-rust run --model kiro-auth/claude-haiku-4-5 "say ok"
+EXIT=0   stdout 0 bytes   stderr 0 bytes   --print-logs 0 lines
+```
+
+The turn is not a no-op. Verified through the database, bypassing every rendering layer:
+
+```
+session ses_8abf8f57…  (created 03:00:06, four minutes before the query)
+  role=user       parts=1     <- the prompt was persisted
+  role=assistant  parts=0     <- the assistant message exists and is empty
+```
+
+So a session is created, both messages are written, the assistant message has **zero parts**, and the
+CLI exits **0** having printed nothing at all. A user cannot distinguish this from success.
+
+This must be characterised before it is fixed. Candidate causes, none confirmed:
+- the provider returned an empty stream and the turn treated it as a completed turn;
+- authentication failed in a way that produced no error path;
+- content was produced but dropped between the stream and the renderer.
+
+**The most important requirement here is not the fix but the observability**: exiting 0 with no
+output is the failure mode this project has hunted twenty-three times. Whatever the cause, an empty
+assistant turn must be reported, not silently accepted.
+
+### Both defects share one root cause in the test strategy
+
+**No test exercises a real provider with real credentials.** Every one of the 3488 supplies a mock.
+That is defensible for an offline gate — determinism and no cost — but it means the suite can be
+entirely green while the product cannot hold a conversation. That gap is the actual finding.
+
+The fix is not "add a live test to the default gate". It is an **opt-in** live smoke test, excluded
+from the offline gate, that a maintainer can run before a release:
+
+- one turn, one cheap model, a minimal prompt (cost was a stated user concern; `hi` against a Haiku
+  is the right size);
+- asserts a non-empty assistant part reaches stdout **and** the process exits 0;
+- asserts the inverse honestly: if the provider is unreachable or unauthenticated, the command exits
+  non-zero with a message naming the cause.
+
+### Acceptance criteria (agent-executable)
+
+- Defect A: a provider declaring `@ai-sdk/openai` with a custom `baseURL` that serves only
+  `/chat/completions` completes a turn. A test pins the chosen mechanism; reverting it fails that
+  test by name. Upstream 1.18.18's behaviour on the same configuration is recorded in the evidence.
+- Defect B: an empty assistant turn is **never** reported as success — the command exits non-zero
+  with a diagnostic naming the provider and the emptiness. A test drives a provider that returns an
+  empty stream and asserts the non-zero exit and the message.
+- A live smoke test exists, is **excluded from `cargo test --workspace --offline`** by an explicit
+  mechanism (feature or ignore attribute), is documented with its cost, and passes against the
+  configured provider.
+- No credential, key, or token appears in any test fixture, log, or evidence file.
+
 ## Working rules for whoever picks these up
 
 Carried from the main plan, because each was learned the hard way:
