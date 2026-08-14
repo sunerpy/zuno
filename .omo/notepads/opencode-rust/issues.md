@@ -7910,3 +7910,27 @@ list. Re-running the same model and prompt with `--pure` completed successfully
 with exit 0 and non-empty output. This is independent of provider surface routing:
 the request reached and was parsed by the Chat endpoint. FU-8A therefore records
 the plugin-composition issue but does not widen scope to tool deduplication.
+
+## [2026-08-14] FU-9 — cross-source tool collisions now follow upstream precedence
+
+The failure was at the registry assembly boundary, not the provider: builtins, config-directory
+exports, plugin exports, and MCP tools were appended to one `Vec`, so two provider-facing tools could
+share an id. The configured `@sunerpy/oh-my-openagent@4.21.0` exposed `grep` alongside the builtin;
+the gateway correctly rejected that invalid request with HTTP 400. The identical `--pure` control
+completed, isolating the defect to extension composition.
+
+Upstream 1.18.18 establishes a keyed, last-source-wins projection. Its registry returns builtin
+before config/plugin tools (`tool/registry.ts:178-199,224-253`), `SessionTools.resolve` assigns each
+to `tools[item.id]` (`session/tools.ts:92-99`), and MCP tools assign to that object afterward
+(`session/tools.ts:390-489`). The resulting precedence is `MCP > plugin > config-directory >
+builtin`, while JavaScript retains the first key's insertion position.
+
+Rust now applies that rule at the single `ToolRegistryBuilder::build` chokepoint: a later same-named
+tool replaces the earlier implementation in place. Every replacement emits a default-visible stderr
+diagnostic and is retained as structured registry data, naming the tool, suppressed source, and
+winning source. The regression first failed with four `grep` entries, then passed with one MCP winner
+and all three suppression transitions asserted. Todo 144 permission filtering and FU-8A/FU-8B guards
+remain green. A single post-fix non-`--pure` turn with all three configured plugins printed visible
+`grep`/`glob` suppression diagnostics and returned `FU-9 OK` with exit 0. Full evidence is in
+`.omo/evidence/task-fu9-opencode-rust.txt`.
+- FU-9 evidence cited upstream sources as `v1.18.18`, but the tree read at `/tmp/opencode-src` was `1.18.16` (commit `d470434`) — mislabelled by two patch versions. Caught by re-running `grep -m1 '"version"' package.json` against the cited tree instead of trusting the section heading; the `file:line` citations themselves were verbatim-true, only the version label was wrong. Lesson: verify the version of a vendored source tree at citation time, not from memory of which release was fetched.
