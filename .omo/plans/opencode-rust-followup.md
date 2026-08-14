@@ -436,6 +436,8 @@ matches upstream, and *silently* is what must be avoided in both cases.
   completes a turn.
 - Reverting the de-duplication fails the registry test by name.
 
+**Status: CLOSED (2026-08-14)** — Cross-source tool names are de-duplicated with upstream last-source-wins precedence, visible suppression diagnostics, and a successful three-plugin live turn.
+
 ## Working rules for whoever picks these up
 
 Carried from the main plan, because each was learned the hard way:

@@ -1,10 +1,11 @@
 //! Ordered tool assembly and the final model-visible registry projection.
 //!
 //! The registry keeps loading order separate from visibility. Built-ins are first,
-//! followed by config-directory exports, plugin exports, and MCP tools. Model and
-//! provider gates run over that assembled sequence, and permission hiding runs last.
-//! That order matters: an extension can use a built-in wire id, while a blanket deny
-//! must also hide tools that arrived from an extension host.
+//! followed by config-directory exports, plugin exports, and MCP tools. A later
+//! source replaces an earlier same-named tool in place, matching upstream's keyed
+//! projection without sending duplicate names to a provider. Model and provider gates
+//! run over that assembled sequence, and permission hiding runs last, so a blanket
+//! deny also hides tools that arrived from an extension host.
 
 use crate::FileTools;
 use crate::batch::ExecuteTool;
@@ -19,6 +20,44 @@ use std::sync::{Arc, Weak};
 
 /// The wire-level tool object stored by extension seams.
 pub type CustomTool = Arc<dyn Tool>;
+
+/// A tool's assembly source, in increasing upstream precedence order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolSource {
+    Builtin,
+    ConfigDirectory,
+    Plugin,
+    Mcp,
+}
+
+impl std::fmt::Display for ToolSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Builtin => "built-in",
+            Self::ConfigDirectory => "config-directory",
+            Self::Plugin => "plugin",
+            Self::Mcp => "MCP",
+        })
+    }
+}
+
+/// One observable same-name replacement made during registry assembly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolSuppressionDiagnostic {
+    pub tool: String,
+    pub suppressed_source: ToolSource,
+    pub winning_source: ToolSource,
+}
+
+impl std::fmt::Display for ToolSuppressionDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "tool `{}` from {} suppressed by same-named tool from {}",
+            self.tool, self.suppressed_source, self.winning_source
+        )
+    }
+}
 
 /// Built-in positions from `packages/opencode/src/tool/registry.ts:224-247`.
 ///
@@ -263,27 +302,55 @@ impl ToolRegistryBuilder {
         let config_directories =
             oc_paths::config_directories(&self.directory, self.worktree.as_deref());
         let output_store = ToolOutputStore::new(self.directory.join(".opencode/tool-output"));
+        let mut diagnostics = Vec::new();
         let core = Arc::new_cyclic(|weak| {
-            let mut tools = Vec::new();
+            let mut sourced_tools = Vec::new();
             for slot in BUILTIN_ORDER {
                 if !slot.exposed_by_flags(&self.flags) {
                     continue;
                 }
                 if let Some(tool) = self.builtins.get(&slot) {
-                    tools.push(Arc::clone(tool));
+                    insert_tool(
+                        &mut sourced_tools,
+                        &mut diagnostics,
+                        Arc::clone(tool),
+                        ToolSource::Builtin,
+                    );
                 } else if slot == BuiltinSlot::Execute {
-                    tools.push(erase(ExecuteTool::new(
-                        RegistryHandle::new(weak.clone()),
-                        output_store.clone(),
-                    )));
+                    insert_tool(
+                        &mut sourced_tools,
+                        &mut diagnostics,
+                        erase(ExecuteTool::new(
+                            RegistryHandle::new(weak.clone()),
+                            output_store.clone(),
+                        )),
+                        ToolSource::Builtin,
+                    );
                 }
             }
-            tools.extend(
+            insert_tools(
+                &mut sourced_tools,
+                &mut diagnostics,
                 self.custom_loader
                     .config_directory_tools(&config_directories),
+                ToolSource::ConfigDirectory,
             );
-            tools.extend(self.custom_loader.plugin_tools());
-            tools.extend(self.mcp_loader.tools());
+            insert_tools(
+                &mut sourced_tools,
+                &mut diagnostics,
+                self.custom_loader.plugin_tools(),
+                ToolSource::Plugin,
+            );
+            insert_tools(
+                &mut sourced_tools,
+                &mut diagnostics,
+                self.mcp_loader.tools(),
+                ToolSource::Mcp,
+            );
+            let tools = sourced_tools
+                .into_iter()
+                .map(|(tool, _source)| tool)
+                .collect();
             RegistryCore { tools }
         });
 
@@ -292,7 +359,43 @@ impl ToolRegistryBuilder {
             file_tools: self.file_tools,
             flags: self.flags,
             config_directories,
+            diagnostics,
         }
+    }
+}
+
+fn insert_tools(
+    tools: &mut Vec<(Arc<dyn Tool>, ToolSource)>,
+    diagnostics: &mut Vec<ToolSuppressionDiagnostic>,
+    incoming: impl IntoIterator<Item = Arc<dyn Tool>>,
+    source: ToolSource,
+) {
+    for tool in incoming {
+        insert_tool(tools, diagnostics, tool, source);
+    }
+}
+
+fn insert_tool(
+    tools: &mut Vec<(Arc<dyn Tool>, ToolSource)>,
+    diagnostics: &mut Vec<ToolSuppressionDiagnostic>,
+    tool: Arc<dyn Tool>,
+    source: ToolSource,
+) {
+    if let Some((existing, existing_source)) = tools
+        .iter_mut()
+        .find(|(existing, _source)| existing.id() == tool.id())
+    {
+        let diagnostic = ToolSuppressionDiagnostic {
+            tool: tool.id().to_owned(),
+            suppressed_source: *existing_source,
+            winning_source: source,
+        };
+        eprintln!("warning: {diagnostic}");
+        diagnostics.push(diagnostic);
+        *existing = tool;
+        *existing_source = source;
+    } else {
+        tools.push((tool, source));
     }
 }
 
@@ -335,6 +438,7 @@ pub struct ToolRegistry {
     file_tools: FileTools,
     flags: RegistryFlags,
     config_directories: Vec<PathBuf>,
+    diagnostics: Vec<ToolSuppressionDiagnostic>,
 }
 
 impl ToolRegistry {
@@ -348,6 +452,12 @@ impl ToolRegistry {
     #[must_use]
     pub fn config_directories(&self) -> &[PathBuf] {
         &self.config_directories
+    }
+
+    /// Same-name replacements performed while all registry sources were assembled.
+    #[must_use]
+    pub fn diagnostics(&self) -> &[ToolSuppressionDiagnostic] {
+        &self.diagnostics
     }
 
     /// Resolve the model/provider projection, then hide fully denied tools last.

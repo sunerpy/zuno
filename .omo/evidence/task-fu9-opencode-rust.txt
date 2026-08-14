@@ -1,0 +1,132 @@
+COMPLETE — FU-9 implemented, verified, documented, and ready to commit.
+
+## Baseline reproduction (2026-08-14)
+
+Built the current `task-fu9` baseline without network dependency resolution:
+
+```console
+$ CARGO_TARGET_DIR=/tmp/opencode/fu9 cargo build -p oc-cli --offline
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 41.92s
+```
+
+One non-`--pure` attempt with the required model reproduced FU-9:
+
+```console
+$ /tmp/opencode/fu9/debug/opencode-rust run --model 'myopenai/global.anthropic.claude-haiku-4-5-20251001-v1:0' 'hi'
+unrecoverable provider failure (status=Some(400)): provider `myopenai` returned HTTP 400: {"error":{"message":"The tool grep is already defined at toolConfig.tools.10.","type":"invalid_request_error","code":"bad_request"}}
+EXIT_CODE=1
+```
+
+The identical one-turn control with `--pure` succeeded and returned a real answer:
+
+```console
+$ /tmp/opencode/fu9/debug/opencode-rust run --pure --model 'myopenai/global.anthropic.claude-haiku-4-5-20251001-v1:0' 'hi'
+Hey there! 👋 I'm here to help you with your coding projects. I can:
+
+- **Read and explore** your codebase
+- **Find files and search** for specific code patterns
+- **Edit files** to make changes
+- **Run commands** to build, test, or debug
+- **Fetch web content** if you need to reference documentation
+- **Track tasks** for multi-step work
+
+What would you like to work on today?
+EXIT_CODE=0
+```
+
+No credentials or request headers are present in this evidence.
+
+## Upstream precedence (2026-08-14)
+
+Two independent legs establish the last-source-wins policy.
+
+**Leg 1 — mechanism, read from source.** The sources read were the upstream `1.18.16` tree at
+`/tmp/opencode-src`, commit `d470434` (dated 2026-08-11), verified in place:
+
+```console
+$ grep -m1 '"version"' /tmp/opencode-src/packages/opencode/package.json
+  "version": "1.18.16",
+$ git -C /tmp/opencode-src log --oneline -1
+d470434 refactor(console): simplify go usage response
+```
+
+All `file:line` citations below are verbatim-true for that `1.18.16` tree and are attributed to it:
+
+- `packages/opencode/src/tool/registry.ts:178-190` appends config-directory tools to `custom`.
+- `packages/opencode/src/tool/registry.ts:194-198` appends plugin tools after config-directory tools.
+- `packages/opencode/src/tool/registry.ts:224-253` returns `builtin` before `custom` from `all()`.
+- `packages/opencode/src/session/tools.ts:92-99` iterates those registry tools in order and assigns
+  `tools[item.id] = ...`; a later config/plugin implementation therefore replaces an earlier
+  builtin implementation with the same id.
+- `packages/opencode/src/session/tools.ts:390-489` assigns MCP tools to the same keyed object after
+  registry tools, so an MCP implementation replaces any same-named builtin/config/plugin tool.
+
+The resulting precedence is therefore **MCP > plugin > config-directory > builtin**. JavaScript
+property reassignment retains the key's original insertion position, so the compatible Rust
+projection must keep one entry at the first occurrence's position while replacing its implementation
+with the last source's tool. The Rust assembly chokepoint before this fix is
+`crates/oc-tools/src/registry.rs:267-287`: it appends all four sources to a `Vec` without keyed
+replacement, allowing duplicate provider-facing ids through.
+
+**Leg 2 — behaviour at 1.18.18, confirmed empirically rather than from source.** The installed
+`1.18.18` binary runs the identical plugin configuration successfully:
+
+```console
+$ /config/.local/share/mise/installs/opencode/1.18.18/opencode run \
+    --model myopenai/global.anthropic.claude-haiku-4-5-20251001-v1:0 "hi"
+你好！我是 Sisyphus…      (a real answer, same plugins active)
+```
+
+**Stated limitation.** The `1.18.18` install ships only a compiled binary with no TypeScript
+sources, so its sources could not be read. `git fetch --tags` to compare `v1.18.16..v1.18.18`
+timed out on the network and was not completed, so the two patch versions were not diffed. The
+mechanism above is therefore verified at `1.18.16` and only behaviourally confirmed at `1.18.18`.
+
+## Post-fix real turn (2026-08-14)
+
+Rebuilt the current branch and ran one non-`--pure` turn with the machine's three configured plugins
+active. The turn completed, while the default-visible diagnostics named each suppressed tool and
+both sources:
+
+```console
+$ /tmp/opencode/fu9/debug/opencode-rust run --model 'myopenai/global.anthropic.claude-haiku-4-5-20251001-v1:0' 'Reply with exactly: FU-9 OK'
+warning: tool `grep` from built-in suppressed by same-named tool from plugin
+warning: tool `glob` from built-in suppressed by same-named tool from plugin
+FU-9 OK
+EXIT_CODE=0
+```
+
+This was the sole post-fix paid-provider attempt. No credentials or request headers are present.
+
+## Regression and mutation evidence
+
+The named registry regression
+`registry_de_duplicates_cross_source_names_with_upstreams_last_source_winning` assembles four
+same-named `grep` implementations: builtin, config-directory, plugin, and MCP. Before the
+implementation it failed by name with `left: 4, right: 1`, proving the provider-facing list still
+contained every duplicate. With the fix it asserts one `grep`, the MCP implementation as winner,
+and the complete diagnostic chain:
+
+1. built-in suppressed by config-directory;
+2. config-directory suppressed by plugin;
+3. plugin suppressed by MCP.
+
+The test therefore fails when the de-duplication is absent and pins both upstream precedence and
+observable suppression. Existing guards remained green, including
+`a_plugin_tool_is_hidden_by_the_same_permission_layer_as_builtins`, all four FU-8A surface-routing
+regressions, both FU-8B engine guards, and the FU-8B process-level empty-response regression.
+
+## Final quality gates
+
+- Changed-file `lsp_diagnostics`: 0 diagnostics for `registry.rs` and its registry integration test;
+  the exact bytes were temporarily mirrored under the accepted repository root because the LSP MCP
+  rejects sibling-worktree paths, then the clean main worktree was restored byte-for-byte.
+- `cargo test -p oc-tools --test registry --offline`: 9 passed, 0 failed.
+- Targeted todo 144 and FU-8A/FU-8B regressions: all passed.
+- `RUST_TEST_THREADS=1 cargo test --workspace --offline --quiet`: 3496 passed, 0 failed, 2 ignored
+  (the prior 3495-test baseline plus the new FU-9 regression).
+- `cargo clippy --workspace --all-targets --offline -- -D warnings`: clean, zero warnings.
+- `cargo fmt --all -- --check`: clean.
+- `cargo build -p oc-cli --bin opencode-rust --offline`: passed.
+- No dependency, credential, key, token, request header, provider response body, `oc-paths` change,
+  or `OPENCODE_*` behavior change was introduced.

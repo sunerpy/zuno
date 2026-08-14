@@ -8,7 +8,7 @@ use oc_tools::SearchConfig;
 use oc_tools::exposure::ExposureFlags;
 use oc_tools::registry::{
     BuiltinSlot, CustomTool, CustomToolLoader, McpToolLoader, RegistryError, RegistryFlags,
-    ResolveInput, ToolRegistry, ToolRegistryBuilder, config_tool_id,
+    ResolveInput, ToolRegistry, ToolRegistryBuilder, ToolSource, config_tool_id,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -40,6 +40,34 @@ impl Tool for StubTool {
 
 fn stub(id: &'static str) -> Arc<dyn Tool> {
     Arc::new(StubTool(id))
+}
+
+struct TaggedTool {
+    id: &'static str,
+    description: &'static str,
+}
+
+#[async_trait]
+impl Tool for TaggedTool {
+    fn id(&self) -> &str {
+        self.id
+    }
+
+    fn description(&self) -> &str {
+        self.description
+    }
+
+    fn raw_parameters_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+
+    async fn execute(&self, _args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text(self.description, "ok"))
+    }
+}
+
+fn tagged(id: &'static str, description: &'static str) -> Arc<dyn Tool> {
+    Arc::new(TaggedTool { id, description })
 }
 
 fn register_non_file_builtins(builder: &mut ToolRegistryBuilder) {
@@ -207,6 +235,71 @@ impl McpToolLoader for FixedMcpLoader {
     fn tools(&self) -> Vec<CustomTool> {
         vec![stub("mcp_tool")]
     }
+}
+
+struct CollidingCustomLoader;
+
+impl CustomToolLoader for CollidingCustomLoader {
+    fn config_directory_tools(&self, _directories: &[PathBuf]) -> Vec<CustomTool> {
+        vec![tagged("grep", "config-directory grep")]
+    }
+
+    fn plugin_tools(&self) -> Vec<CustomTool> {
+        vec![tagged("grep", "plugin grep")]
+    }
+}
+
+struct CollidingMcpLoader;
+
+impl McpToolLoader for CollidingMcpLoader {
+    fn tools(&self) -> Vec<CustomTool> {
+        vec![tagged("grep", "MCP grep")]
+    }
+}
+
+#[test]
+fn registry_de_duplicates_cross_source_names_with_upstreams_last_source_winning() {
+    let root = TempDir::new().expect("temporary workspace");
+    let files = FileTools::new(root.path()).expect("create file tools");
+    let mut builder = ToolRegistryBuilder::new(
+        root.path(),
+        Some(root.path().to_path_buf()),
+        files,
+        RegistryFlags::default(),
+    );
+    register_non_file_builtins(&mut builder);
+    let registry = builder
+        .with_custom_loader(Arc::new(CollidingCustomLoader))
+        .with_mcp_loader(Arc::new(CollidingMcpLoader))
+        .build();
+
+    let grep = registry
+        .all()
+        .iter()
+        .filter(|tool| tool.id() == "grep")
+        .collect::<Vec<_>>();
+    assert_eq!(grep.len(), 1, "provider-facing tool ids must be unique");
+    assert_eq!(grep[0].description(), "MCP grep");
+    assert_eq!(
+        registry
+            .diagnostics()
+            .iter()
+            .map(|diagnostic| (
+                diagnostic.tool.as_str(),
+                diagnostic.suppressed_source,
+                diagnostic.winning_source,
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("grep", ToolSource::Builtin, ToolSource::ConfigDirectory),
+            ("grep", ToolSource::ConfigDirectory, ToolSource::Plugin),
+            ("grep", ToolSource::Plugin, ToolSource::Mcp),
+        ]
+    );
+    assert_eq!(
+        registry.diagnostics()[2].to_string(),
+        "tool `grep` from plugin suppressed by same-named tool from MCP"
+    );
 }
 
 #[test]
