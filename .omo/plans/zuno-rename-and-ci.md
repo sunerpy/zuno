@@ -74,30 +74,67 @@ Concretely, on this machine, today:
 
 A user who upgrades and finds an empty model list and no history has been broken by us, silently.
 
-### Three options — the user must pick
+### DECIDED: hard cut (user, 2026-08-14)
 
-1. **Dual-read, single-write.** Read `.zuno` then `.opencode`, write only `.zuno`. Nothing breaks;
-   the old directory lingers indefinitely. **Lowest risk, least clean.**
-2. **Migrate on first run, with a visible notice.** Copy config, auth and database to the Zuno
-   locations, print what moved and from where, leave the originals untouched. **Tidiest; the risk is
-   a partial migration**, so it must be atomic per file and idempotent, and it must never move
-   `auth.json` without confirming the copy is readable.
-3. **Hard cut.** Read only Zuno paths. **Breaks every existing install**, including the three plugins
-   and the live credentials above.
+> *"Z-1 的话硬切就行  因为还没有发布投产"*
 
-**My recommendation is (2) with (1) as the fallback for one release**: migrate, but keep reading the
-old path if the new one is absent, so a rollback is survivable. Announce the removal, then remove it
-in a later release rather than in the same one.
+**The project has never been released, so there is no installed base to protect.** That removes the
+entire compatibility question: read Zuno paths only, write Zuno paths only, no dual-read, no
+migration, no deprecation window. The three options previously listed are moot.
 
-### Also in scope, and larger than it looks
+**What this simplifies, concretely**: no migration atomicity to get right, no "both present"
+precedence rule, no fallback path to test, and no announcement cycle. The work becomes a rename of
+literals plus the tests that pin them.
 
-**68 distinct `OPENCODE_*` environment variables.** These are a public contract — scripts, CI, and
-the three plugins set them. `OPENCODE_CONFIG_CONTENT` and `OPENCODE_AUTH_CONTENT` are used by this
-project's own tests. Options: accept both prefixes with `ZUNO_*` winning; accept `ZUNO_*` only and
-break callers; or keep `OPENCODE_*` for plugin-facing variables and rename only internal ones.
+**What it still costs, and must be handled rather than discovered:**
 
-**This needs the same decision as the directories, and the answer may differ per variable.** Note
-one hard constraint: variables the **plugins** read are not ours to rename unilaterally.
+- **This machine's own setup stops being read.** `~/.config/opencode/opencode.json` (7 providers, 404
+  models, 3 plugins) and `~/.local/share/opencode/auth.json` (the live `google` OAuth plus the
+  `myopenai` / `kiro-auth` API keys) will no longer be found. That is correct behaviour under a hard
+  cut, but it means **the orchestrator's own end-to-end verification breaks until a Zuno-located
+  config exists**. Provide a documented one-liner that copies the existing config into the Zuno
+  location so hands-on QA — including FU-8A's verification — remains possible.
+- **`.omo/fixtures/` and the compat suite** may reference `opencode` config paths. The oracle is the
+  released `opencode` binary and **its** paths must not be renamed; only *this* project's paths move.
+  Confirm that distinction test by test rather than by global replace.
+- **The 68 environment variables** are a separate decision from the directories — see below. A hard
+  cut on directories does not automatically imply a hard cut on variable names.
+
+### Environment variables: hard cut too, with one exception to verify
+
+The same reasoning applies — nothing is deployed, so `ZUNO_*` can be the only accepted spelling.
+
+**The exception to check before assuming**: variables that the **plugins** set or read are not ours
+to rename. `OPENCODE_CONFIG_CONTENT` and `OPENCODE_AUTH_CONTENT` are used by this project's own
+tests, which is fine to rename. But if any of the three installed plugins reads an `OPENCODE_*`
+variable from the host environment, renaming it breaks that plugin regardless of release status.
+
+**Established empirically, so this is settled rather than open.** Grepping the three installed
+plugin bundles under `/config/.bun/install/cache/` and intersecting with the 68 variables this
+project uses:
+
+- Plugins read **35** host-contract `OPENCODE_*` variables (excluding their own
+  `OPENCODE_ANTIGRAVITY_*` / `KIRO` / `OMO` namespaces, which are theirs, not ours).
+- This project uses **68**.
+- **The intersection is exactly 8**, and these are the ones a rename would break:
+
+```
+OPENCODE_CLIENT              OPENCODE_CONFIG_CONTENT      OPENCODE_SERVER_PASSWORD
+OPENCODE_CONFIG              OPENCODE_CONFIG_DIR          OPENCODE_SERVER_USERNAME
+OPENCODE_DISABLE_CLAUDE_CODE OPENCODE_VERSION
+```
+
+`oh-my-openagent@4.21.0` alone reads 28 host variables; `opencode-antigravity-auth@1.6.0` reads 9;
+`kiro-provider@0.3.0` reads none outside its own namespace.
+
+**So the rule is precise: those 8 keep their `OPENCODE_*` spelling as a documented plugin-facing
+contract. The other 60 become `ZUNO_*` with no fallback.** Do not treat the 8 as an oversight to be
+cleaned up later — they are the ABI the JS plugin tier speaks, and this project deliberately keeps
+that tier for the three real installed plugins.
+
+Note `OPENCODE_CONFIG_DIR` is in the intersection. A plugin can therefore point the host at a config
+directory. Under a hard cut the *default* directory becomes Zuno's, but this override must keep
+working, and a test should pin that.
 
 ### Acceptance criteria (agent-executable)
 
@@ -220,17 +257,17 @@ record why, rather than accepting `BUILD_GENERAL1_MEDIUM` because it is the exam
 
 ---
 
-## What I am not doing without your answers
+## Execution order (confirmed by the user)
 
-**Z-1's directory strategy and the environment-variable strategy are decisions, not implementation
-details.** Picking wrong breaks working installations — the three plugins, the live credentials, and
-every existing session — and does so quietly, which is this project's most-punished failure mode.
+1. **FU-8A** — the `@ai-sdk/openai` → Responses routing defect. Small, and it makes the first CI run
+   on the new repo meaningful rather than red for a known cause.
+2. **Z-1 hard cut** — Zuno-only config and data directories; `ZUNO_*` variables only, except any
+   variable an installed plugin provably reads.
+3. **Z-2 rename** — binary, user agent, display version, help text and docs. **Keep the `oc-` crate
+   prefix**: renaming 36 crates is churn with no user-visible benefit.
+4. **Z-3 audit-then-fill** — `release.yml` is 418 working lines; audit it against the skill rather
+   than replacing it. Add LICENSE and the remote, which Z-4 depends on.
+5. **Z-4 last** — CodeBuild runners, once a remote exists to authorise against.
 
-**Recommendation, restated compactly:**
-
-1. **FU-8A first** — small, and it makes the first CI run on the new repo meaningful.
-2. **Z-1 with migrate-plus-fallback**, `ZUNO_*` accepted with `OPENCODE_*` still honoured for the
-   variables plugins read.
-3. **Z-2 renaming the binary and identity but keeping the `oc-` crate prefix.**
-4. **Z-3 audit-then-fill**, not scaffold-over-the-top.
-5. **Z-4 last**, once there is a remote to authorise against.
+Each step's acceptance criteria are above. FU-8A's are in
+`.omo/plans/opencode-rust-followup.md` under `## FU-8`.
