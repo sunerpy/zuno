@@ -2852,5 +2852,6 @@ fn known_gaps() -> Vec<KnownGap> {
         FROZEN_API_GAPS.len(),
         UPSTREAM_API_OPERATIONS,
         compat_report::V1SurfaceCoverage::new(v1.measured, v1.served, v1.redirected),
+        oc_server::api::openapi_body_schema_gaps(),
     )
 }

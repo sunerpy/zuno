@@ -7859,3 +7859,24 @@ exact diff was applied to a temporary detached worktree inside the accepted root
 all ten changed Rust files reported no diagnostics, and that temporary worktree
 was removed. Detailed reproduction, targeted tests, mutations, disk guards, and
 workspace gates are in `.omo/evidence/task-fu7-opencode-rust.txt`.
+
+## [2026-08-13] FU-4 — OpenAPI body coverage is now bound or explicitly frozen
+
+The published `/doc` had components but no operation referenced them. FU-4 found six mechanical
+bindings across five operations: two requests (`SessionCreate`, `SessionPruneMutation`) and four
+responses (`SessionListResponse`, two uses of `SessionResponse`, and `SessionActiveResponse`).
+`SessionResponse` required no authored contract; it is derived from the existing
+`Data<SessionInfo>` schema.
+
+The useful accounting is not simply “bound versus unbound.” Eight operations genuinely have no
+request or successful response body, while 48 still have at least one body side that cannot be
+described from an existing Rust `JsonSchema` type. POST `/api/session/prune` demonstrates why the
+inventory is per operation with a reason: its request is now bound, but its `SessionPruneReport`
+response remains untyped. One source list now feeds the test guard, compatibility report, and
+generated matrix, so closing type work cannot leave stale prose behind.
+
+The load-bearing test fetches the real `/doc`, resolves the operation's `$ref`, compiles that exact
+component with `jsonschema`, calls the real GET session route, and validates its response. Removing
+the binding fails at the missing `$ref`; suppressing serialization of required `slug` compiles but
+fails with `"slug" is a required property`. This closes the specific blind spot that allowed a
+served projection to contradict a published schema without any operation-level validation.

@@ -1,5 +1,7 @@
 use serde_json::{Map, Value, json};
 
+type BodySchemaGap = (&'static str, &'static str, &'static str);
+
 pub const OPERATIONS: &[(&str, &str)] = &[
     ("/api/health", "get"),
     ("/api/location", "get"),
@@ -72,6 +74,268 @@ pub const OPERATIONS: &[(&str, &str)] = &[
     ("/api/session/{sessionID}/message", "get"),
 ];
 
+const BODY_SCHEMA_GAPS: &[BodySchemaGap] = &[
+    (
+        "/api/health",
+        "get",
+        "the successful response is an untyped Json<Value>",
+    ),
+    (
+        "/api/location",
+        "get",
+        "LocationInfo does not derive JsonSchema",
+    ),
+    (
+        "/api/event",
+        "get",
+        "the successful response is an SSE stream, not a modeled JSON body",
+    ),
+    (
+        "/api/agent",
+        "get",
+        "LocationEnvelope<Vec<AgentInfo>> and its nested catalog types do not derive JsonSchema",
+    ),
+    (
+        "/api/model",
+        "get",
+        "LocationEnvelope<Vec<ModelInfo>> and its nested provider types do not derive JsonSchema",
+    ),
+    (
+        "/api/command",
+        "get",
+        "LocationEnvelope<Vec<CommandInfo>> does not derive JsonSchema",
+    ),
+    (
+        "/api/skill",
+        "get",
+        "LocationEnvelope<Vec<SkillInfo>> does not derive JsonSchema",
+    ),
+    (
+        "/api/reference",
+        "get",
+        "LocationEnvelope<Vec<ReferenceInfo>> does not derive JsonSchema",
+    ),
+    (
+        "/api/provider",
+        "get",
+        "LocationEnvelope<Vec<ProviderInfo>> and its nested types do not derive JsonSchema",
+    ),
+    (
+        "/api/provider/{providerID}",
+        "get",
+        "LocationEnvelope<ProviderInfo> and its nested types do not derive JsonSchema",
+    ),
+    (
+        "/api/integration",
+        "get",
+        "LocationEnvelope<Vec<IntegrationInfo>> and its nested types do not derive JsonSchema",
+    ),
+    (
+        "/api/integration/{integrationID}",
+        "get",
+        "OptionalEnvelope<IntegrationInfo> and its nested types do not derive JsonSchema",
+    ),
+    (
+        "/api/integration/{integrationID}/connect/key",
+        "post",
+        "the unsupported handler has neither a typed request extractor nor a modeled success response",
+    ),
+    (
+        "/api/integration/{integrationID}/connect/oauth",
+        "post",
+        "the unsupported handler has neither a typed request extractor nor a modeled success response",
+    ),
+    (
+        "/api/integration/attempt/{attemptID}",
+        "get",
+        "the unsupported handler has no modeled success response",
+    ),
+    (
+        "/api/integration/attempt/{attemptID}/complete",
+        "post",
+        "the unsupported handler has neither a typed request extractor nor a modeled success response",
+    ),
+    (
+        "/api/integration/attempt/{attemptID}",
+        "delete",
+        "the unsupported handler has no modeled response contract",
+    ),
+    (
+        "/api/credential/{credentialID}",
+        "patch",
+        "the unsupported handler has neither a typed request extractor nor a modeled success response",
+    ),
+    (
+        "/api/credential/{credentialID}",
+        "delete",
+        "the unsupported handler has no modeled response contract",
+    ),
+    (
+        "/api/fs/read/*",
+        "get",
+        "the response is content-type-dependent raw bytes with no schema type",
+    ),
+    (
+        "/api/fs/list",
+        "get",
+        "LocationEnvelope<Vec<Entry>> does not derive JsonSchema",
+    ),
+    (
+        "/api/fs/find",
+        "get",
+        "LocationEnvelope<Vec<Entry>> does not derive JsonSchema",
+    ),
+    (
+        "/api/pty",
+        "get",
+        "PtyInfo is imported without a JsonSchema implementation",
+    ),
+    (
+        "/api/pty",
+        "post",
+        "CreateInput and PtyInfo are imported without JsonSchema implementations",
+    ),
+    (
+        "/api/pty/{ptyID}",
+        "get",
+        "PtyInfo is imported without a JsonSchema implementation",
+    ),
+    (
+        "/api/pty/{ptyID}",
+        "put",
+        "UpdateInput and PtyInfo are imported without JsonSchema implementations",
+    ),
+    (
+        "/api/pty/{ptyID}/connect-token",
+        "post",
+        "ConnectTokenResponse and its nested types do not derive JsonSchema",
+    ),
+    (
+        "/api/pty/{ptyID}/connect",
+        "get",
+        "the response upgrades to WebSocket frames and has no JSON body model",
+    ),
+    (
+        "/api/permission/request",
+        "get",
+        "the opaque Json<impl Serialize> envelope has no nameable JsonSchema type",
+    ),
+    (
+        "/api/permission/saved",
+        "get",
+        "Data<Vec<Value>> leaves each saved permission payload untyped",
+    ),
+    (
+        "/api/session/{sessionID}/permission",
+        "post",
+        "the unsupported handler has neither a typed request extractor nor a modeled success response",
+    ),
+    (
+        "/api/session/{sessionID}/permission",
+        "get",
+        "PermissionRequest does not derive JsonSchema",
+    ),
+    (
+        "/api/session/{sessionID}/permission/{requestID}",
+        "get",
+        "the unsupported handler has no modeled success response",
+    ),
+    (
+        "/api/session/{sessionID}/permission/{requestID}/reply",
+        "post",
+        "PermissionReplyBody does not derive JsonSchema",
+    ),
+    (
+        "/api/question/request",
+        "get",
+        "the opaque Json<impl Serialize> envelope has no nameable JsonSchema type",
+    ),
+    (
+        "/api/session/{sessionID}/question",
+        "get",
+        "QuestionRequest does not derive JsonSchema",
+    ),
+    (
+        "/api/session/{sessionID}/question/{requestID}/reply",
+        "post",
+        "QuestionReplyBody does not derive JsonSchema",
+    ),
+    (
+        "/api/session/prune",
+        "get",
+        "SessionPruneReport does not derive JsonSchema",
+    ),
+    (
+        "/api/session/prune",
+        "post",
+        "the request is bound, but SessionPruneReport does not derive JsonSchema for the response",
+    ),
+    (
+        "/api/session/{sessionID}/event",
+        "get",
+        "the successful response is an SSE stream, not a modeled JSON body",
+    ),
+    (
+        "/api/session/{sessionID}/agent",
+        "post",
+        "AgentBody does not derive JsonSchema",
+    ),
+    (
+        "/api/session/{sessionID}/model",
+        "post",
+        "ModelBody and ModelRefBody do not derive JsonSchema",
+    ),
+    (
+        "/api/session/{sessionID}/prompt",
+        "post",
+        "PromptBody, PromptAdmitted, and their nested types do not derive JsonSchema",
+    ),
+    (
+        "/api/session/{sessionID}/revert/stage",
+        "post",
+        "RevertStageBody does not derive JsonSchema and Data<Value> leaves the response untyped",
+    ),
+    (
+        "/api/session/{sessionID}/context",
+        "get",
+        "Data<Vec<Value>> leaves context items untyped",
+    ),
+    (
+        "/api/session/{sessionID}/history",
+        "get",
+        "HistoryResponse does not derive JsonSchema",
+    ),
+    (
+        "/api/session/{sessionID}/message/{messageID}",
+        "get",
+        "the unsupported handler has no modeled success response",
+    ),
+    (
+        "/api/session/{sessionID}/message",
+        "get",
+        "MessagesResponse and MessageCursor do not derive JsonSchema",
+    ),
+];
+
+pub(crate) const fn body_schema_gaps() -> &'static [BodySchemaGap] {
+    BODY_SCHEMA_GAPS
+}
+
+#[cfg(test)]
+const BODYLESS_OPERATIONS: &[(&str, &str)] = &[
+    ("/api/pty/{ptyID}", "delete"),
+    ("/api/permission/saved/{id}", "delete"),
+    (
+        "/api/session/{sessionID}/question/{requestID}/reject",
+        "post",
+    ),
+    ("/api/session/{sessionID}/compact", "post"),
+    ("/api/session/{sessionID}/wait", "post"),
+    ("/api/session/{sessionID}/revert/clear", "post"),
+    ("/api/session/{sessionID}/revert/commit", "post"),
+    ("/api/session/{sessionID}/interrupt", "post"),
+];
+
 #[must_use]
 pub fn document() -> Value {
     let mut paths = Map::new();
@@ -80,16 +344,15 @@ pub fn document() -> Value {
             .entry((*path).to_owned())
             .or_insert_with(|| Value::Object(Map::new()));
         if let Value::Object(methods) = item {
-            methods.insert(
-                (*method).to_owned(),
-                json!({
-                    "operationId": operation_id(method, path),
-                    "responses": {
-                        "200": {"description": "Success"},
-                        "503": {"description": "Operation is known but its local backend is explicitly unavailable"}
-                    }
-                }),
-            );
+            let mut operation = json!({
+                "operationId": operation_id(method, path),
+                "responses": {
+                    "200": {"description": "Success"},
+                    "503": {"description": "Operation is known but its local backend is explicitly unavailable"}
+                }
+            });
+            bind_existing_body_schemas(&mut operation, method, path);
+            methods.insert((*method).to_owned(), operation);
         }
     }
     json!({
@@ -100,6 +363,7 @@ pub fn document() -> Value {
             "schemas": {
                 "Session": schemars::schema_for!(super::session::SessionInfo),
                 "SessionCreate": schemars::schema_for!(super::session::CreateSessionBody),
+                "SessionResponse": schemars::schema_for!(super::Data<super::session::SessionInfo>),
                 "SessionListResponse": schemars::schema_for!(super::session::SessionListResponse),
                 "SessionActive": schemars::schema_for!(super::session::SessionActive),
                 "SessionActiveResponse": schemars::schema_for!(super::session::SessionActiveResponse),
@@ -107,6 +371,41 @@ pub fn document() -> Value {
             }
         }
     })
+}
+
+fn bind_existing_body_schemas(operation: &mut Value, method: &str, path: &str) {
+    match (method, path) {
+        ("get", "/api/session") => bind_response(operation, "SessionListResponse"),
+        ("post", "/api/session") => {
+            bind_request(operation, "SessionCreate");
+            bind_response(operation, "SessionResponse");
+        }
+        ("post", "/api/session/prune") => {
+            bind_request(operation, "SessionPruneMutation");
+        }
+        ("get", "/api/session/active") => bind_response(operation, "SessionActiveResponse"),
+        ("get", "/api/session/{sessionID}") => bind_response(operation, "SessionResponse"),
+        _ => {}
+    }
+}
+
+fn bind_request(operation: &mut Value, schema: &str) {
+    operation["requestBody"] = json!({
+        "required": true,
+        "content": {
+            "application/json": {
+                "schema": {"$ref": format!("#/components/schemas/{schema}")}
+            }
+        }
+    });
+}
+
+fn bind_response(operation: &mut Value, schema: &str) {
+    operation["responses"]["200"]["content"] = json!({
+        "application/json": {
+            "schema": {"$ref": format!("#/components/schemas/{schema}")}
+        }
+    });
 }
 
 fn operation_id(method: &str, path: &str) -> String {
@@ -117,4 +416,76 @@ fn operation_id(method: &str, path: &str) -> String {
             .replace(['/', '{', '}', '*'], "_")
             .trim_matches('_')
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    #[test]
+    fn every_operation_is_bound_bodyless_or_a_reasoned_frozen_gap() {
+        assert_eq!(
+            BODY_SCHEMA_GAPS.len(),
+            48,
+            "review and re-freeze every gap change"
+        );
+        assert_eq!(
+            BODYLESS_OPERATIONS.len(),
+            8,
+            "review and re-freeze every bodyless change"
+        );
+
+        let operations = OPERATIONS.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(
+            operations.len(),
+            OPERATIONS.len(),
+            "duplicate OpenAPI operation"
+        );
+        let gaps = BODY_SCHEMA_GAPS
+            .iter()
+            .map(|(path, method, reason)| {
+                assert!(
+                    !reason.trim().is_empty(),
+                    "{method} {path} has no gap reason"
+                );
+                (*path, *method)
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            gaps.len(),
+            BODY_SCHEMA_GAPS.len(),
+            "duplicate body schema gap"
+        );
+        let bodyless = BODYLESS_OPERATIONS.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(
+            bodyless.len(),
+            BODYLESS_OPERATIONS.len(),
+            "duplicate bodyless operation"
+        );
+        assert!(
+            gaps.is_disjoint(&bodyless),
+            "an operation cannot be both bodyless and a body-schema gap"
+        );
+
+        let document = document();
+        for (path, method) in OPERATIONS {
+            let operation = &document["paths"][path][method];
+            let bound = operation.get("requestBody").is_some()
+                || operation["responses"]["200"].get("content").is_some();
+            assert!(
+                bound || gaps.contains(&(*path, *method)) || bodyless.contains(&(*path, *method)),
+                "{method} {path} is neither bound, intentionally bodyless, nor frozen as a gap"
+            );
+        }
+        for key in gaps.union(&bodyless) {
+            assert!(
+                operations.contains(key),
+                "inventory names unregistered operation {} {}",
+                key.1,
+                key.0
+            );
+        }
+    }
 }

@@ -570,6 +570,7 @@ pub fn known_gaps(
     api_gap_count: usize,
     upstream_api_operations: usize,
     v1: V1SurfaceCoverage,
+    openapi_body_schema_gaps: &[(&str, &str, &str)],
 ) -> Vec<KnownGap> {
     vec![
         KnownGap {
@@ -610,6 +611,24 @@ pub fn known_gaps(
         turn_part_gap(),
         v1_surface_gap(v1),
         v1_agent_projection_gap(),
+        KnownGap {
+            id: "openapi-body-schema-bindings".to_owned(),
+            surface: format!(
+                "{} published /api operations whose request or success-response body schema is not fully bound",
+                openapi_body_schema_gaps.len()
+            ),
+            detail: format!(
+                "The remaining type work is frozen by operation and reason: {}. These are gaps, not declared divergences: each entry must be removed when its Rust body types gain JsonSchema and the operation is bound.",
+                openapi_body_schema_gaps
+                    .iter()
+                    .map(|(path, method, reason)| format!(
+                        "{} `{path}` — {reason}",
+                        method.to_ascii_uppercase()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        },
     ]
 }
 
@@ -617,9 +636,15 @@ pub fn known_gaps(
 mod tests {
     use super::*;
 
+    const OPENAPI_BODY_GAPS: &[(&str, &str, &str)] = &[(
+        "/api/example",
+        "post",
+        "ExampleBody does not derive JsonSchema",
+    )];
+
     #[test]
     fn every_known_gap_carries_an_id_a_surface_and_a_detail() {
-        let gaps = known_gaps(10, 58, V1SurfaceCoverage::new(20, 1, 10));
+        let gaps = known_gaps(10, 58, V1SurfaceCoverage::new(20, 1, 10), OPENAPI_BODY_GAPS);
         assert!(
             !gaps.is_empty(),
             "an empty gap list makes the report vacuous"
@@ -649,7 +674,7 @@ mod tests {
 
     #[test]
     fn the_v1_agent_gap_is_shipped_and_names_its_witness() {
-        let gap = known_gaps(10, 58, V1SurfaceCoverage::new(20, 1, 10))
+        let gap = known_gaps(10, 58, V1SurfaceCoverage::new(20, 1, 10), OPENAPI_BODY_GAPS)
             .into_iter()
             .find(|gap| gap.id == V1_AGENT_GAP_ID)
             .expect(
@@ -673,7 +698,7 @@ mod tests {
             "the missing set is derived from the two type lists; changing either without \
              re-measuring the port's real behaviour is what the session_interop witness rejects"
         );
-        let gap = known_gaps(10, 58, V1SurfaceCoverage::new(20, 1, 10))
+        let gap = known_gaps(10, 58, V1SurfaceCoverage::new(20, 1, 10), OPENAPI_BODY_GAPS)
             .into_iter()
             .find(|gap| gap.id == TURN_PART_GAP_ID)
             .expect(
@@ -693,6 +718,20 @@ mod tests {
                 "the gap's detail does not mention the missing {kind} part"
             );
         }
+    }
+
+    #[test]
+    fn the_openapi_body_gap_inventory_is_shipped_with_each_reason() {
+        let gap = known_gaps(10, 58, V1SurfaceCoverage::new(20, 1, 10), OPENAPI_BODY_GAPS)
+            .into_iter()
+            .find(|gap| gap.id == "openapi-body-schema-bindings")
+            .expect("the OpenAPI body inventory is shipped in known_gaps");
+        assert!(gap.surface.contains("1 published /api operations"));
+        assert!(gap.detail.contains("POST `/api/example`"));
+        assert!(
+            gap.detail
+                .contains("ExampleBody does not derive JsonSchema")
+        );
     }
 
     fn surface(id: &str, verdict: Verdict) -> ComparedSurface {

@@ -2923,6 +2923,7 @@ dependencies = [
  "futures",
  "hyper",
  "hyper-util",
+ "jsonschema",
  "oc-auth",
  "oc-catalog",
  "oc-config",

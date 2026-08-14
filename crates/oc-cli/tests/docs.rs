@@ -568,9 +568,14 @@ fn known_gaps_block(
     let v1 = oc_server::compat_v1::v1_coverage();
     let v1 =
         oc_testkit::compat_report::V1SurfaceCoverage::new(v1.measured, v1.served, v1.redirected);
-    for (index, gap) in oc_testkit::compat_report::known_gaps(gaps.len(), upstream.len(), v1)
-        .iter()
-        .enumerate()
+    for (index, gap) in oc_testkit::compat_report::known_gaps(
+        gaps.len(),
+        upstream.len(),
+        v1,
+        oc_server::api::openapi_body_schema_gaps(),
+    )
+    .iter()
+    .enumerate()
     {
         if index > 0 {
             out.push('\n');
