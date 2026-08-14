@@ -687,6 +687,145 @@ persists a user-owned objective, and the *gating* designs diverge.
 - `plan-mode` as prompt text — its own source concedes the enforcement gap this project already
   closed with permission rulesets.
 
+## E-12. "Everything is a plugin" — agent-authored plugins instead of skill guidance **[crate], feature-gated**
+
+**Raised by the user 2026-08-13**: *"其设计理念类似『一切皆插件』是否可以参考，比如可以让 agent
+自行创建插件加载执行相关工作流、loop 等而不是 skill 引导"*.
+
+The distinction the user is drawing is real and sharper than E-5's skill catalogue: **a skill is
+text that guides the model; a plugin is code that executes.** Asking the agent to author executable
+capability is a different proposition from giving it better instructions.
+
+### What the field actually does — six implementations, one paper, all Python
+
+Web search surfaced a coherent cluster, and every one of them converges on the same pipeline:
+
+| Project | Substrate | Validation before registration |
+|---|---|---|
+| `CorvinLabs/CorvinOS` (forge / skill-forge) | Python + bwrap sandbox, MCP | linter, policy, scope ladder, hash-chain audit |
+| `tomasmihalyi/claude-forge` | FastMCP servers, Python | **11-check AST validator**, 3 retries, atomic registry |
+| `kai-linux/hydra` | PydanticAI + MCP | validate, hot-load, self-healing retry on traceback |
+| `OneManCrew/self-extending-agent` | Python | AST + banned patterns + subprocess import test |
+| `ms1963/Codegen` | MCP, in-process | generate → register → invoke → inspect → remove |
+| **SelfEvolve** (arXiv:2604.16314, SEAMS 2026) | Python, `importlib.reload()` | **TDD tests → intermediate adjudicator → unit tests → final adjudicator** |
+
+**The convergent pipeline is: detect gap → generate → validate in a sandbox → register → use.**
+Six independent teams built the same shape. That is a real signal about the *architecture*.
+
+**The paper's evidence is thinner than its abstract implies.** 92.7% Pass@1 sounds strong, but it is
+**11 tasks / 55 attempts**, in a **6-page** SEAMS short paper, on function-scale generation
+("compute eigenvalues of this matrix"). It is preliminary feasibility evidence, not a validated
+production design. Its genuinely transferable contribution is the **two-adjudicator TDD loop**:
+generate tests first, run them, adjudicate; then generate *implementation-specific* unit tests, run
+those, adjudicate again. Tests come before code and both gates execute.
+
+### Two facts about this codebase decide the design
+
+**1. The plugin substrate is already there and needs no runtime.** `PluginProcessSpec::new(name,
+program)` (`crates/oc-plugin/src/jsonrpc.rs:72`) takes a name and an **executable path** — that is
+the whole contract. Newline-delimited JSON-RPC over stdio, process-tree containment via
+`oc_process::guarded_argv` (`jsonrpc.rs:203`). **An agent that writes an executable script has
+written a plugin.** No Node, no Python, no MCP server needed. This is the one place where Zuno is
+structurally *better positioned* than all six references, every one of which needs a Python realm.
+
+**2. The tool registry is built once and cannot be extended mid-turn.** `RegistryCore` is assembled
+in a single pass (`crates/oc-tools/src/registry.rs:270-288`): builtins, then
+`config_directory_tools`, then `plugin_tools`, then `mcp_loader.tools()`. There is **no
+`tools/list_changed`, no reload, no refresh** — I grepped for all three and found nothing.
+
+That second fact is the load-bearing constraint. Claude-forge works around the same problem with a
+`--call` CLI wrapper so a freshly forged tool is usable "in the same turn without waiting for MCP
+registration". **Zuno has a cheaper answer available**: a forged plugin is an executable, and
+`execute` already runs executables under permission governance. **Same-turn use needs no registry
+mutation at all** — it is a governed process launch. Registration for *subsequent* turns is then a
+config write, which the existing loader already picks up.
+
+### Why this must not be built as an unguarded capability
+
+This project's entire review history is the argument. Across 183 todos, the most common failure was
+a subagent claiming success against evidence — and **E-11 just established that DeepSeek's
+production runtime deliberately forbids a model from creating or re-arming its own goal**, enforcing
+it structurally through authority tiers (`authority.ts:90-93`). Letting a model author *executable
+code that then runs* is strictly more dangerous than letting it set its own objective.
+
+So the design constraints are not negotiable:
+
+- **Feature-gated and off by default**, following the `wasmtime` precedent — absent from the default
+  dependency graph and enforced by a structural test, the way
+  `wasmtime_feature_gate.rs::wasm_runtime_is_absent_from_the_default_dependency_graph` does it.
+- **Validation before registration, and the validation must execute**, not merely lint. SelfEvolve's
+  two-adjudicator loop and claude-forge's 11-check AST validator are the two references worth
+  copying. A generated plugin that has not run its own tests is not a plugin, it is a guess.
+- **Governed like any other tool.** A forged plugin's tools must pass the same permission layer as
+  builtins — the property todo 144 established and a named test already guards
+  (`a_plugin_tool_is_hidden_by_the_same_permission_layer_as_builtins`).
+- **Human authority on promotion.** Session-scoped by default; persisting a plugin beyond the
+  session requires explicit user action. This is E-11's authority-tier lesson applied to capability
+  rather than to goals. CorvinOS's scope ladder and claude-forge's `/tool save` are both this idea.
+- **Auditable.** CorvinOS feeds every forge event into a hash chain. Zuno has SQLite; an append-only
+  record of what was forged, from what prompt, and what it was allowed to do is cheap here.
+
+### Where the substrate choice lands
+
+**The generated artifact should be a JSON-RPC plugin executable, not a script for an embedded
+interpreter.** Reasons, in order:
+
+1. It requires **no new runtime** — the strongest fit with the single-binary rule.
+2. Process-tree containment already exists (`oc-process`).
+3. It is language-agnostic: the agent can emit whatever the host can execute, and on a host with no
+   interpreter it can emit a shell script.
+
+The alternative — an embedded pure-Rust script engine (`rhai`, `rune`, `starlark-rust`) — was already
+weighed in **E-3b** for code-form delegation and deferred there. The same reasoning applies, with one
+addition: `starlark-rust` is deterministic and I/O-free by design, which is the right safety posture
+for model-authored code, and would let a forged *workflow* (the user's "loop") run without spawning
+a process. **That is the stronger option specifically for loops and workflows**, where spawning a
+process per iteration is wasteful. Worth revisiting if forged workflows become the dominant use.
+
+### Relationship to E-5 (skills) — the user's actual question
+
+The user asked whether plugin authoring should replace skill guidance. **Answer: they solve different
+problems and both are worth having, but plugin authoring is the more valuable of the two here.**
+
+- A **skill** is text in the context window. It costs context on every turn it is active, cannot be
+  tested, and its effect is advisory. CorvinOS's own comparison table is honest about this: skills are
+  "markdown knowledge" that "runs in LLM context", guarded only by a "linter".
+- A **plugin** is code. It costs nothing until invoked, **can be tested before it is trusted**, and
+  its effect is deterministic.
+
+For a coding agent whose failures are overwhelmingly "claimed something without checking", the
+capability that can be *verified before use* is worth more than the one that can only be *read*.
+E-5 stays, at lower priority; this item supersedes the ambition behind it.
+
+### Sequencing — not now, and here is the honest reason
+
+This is a **large** item with a real blast radius: code generation, sandboxed execution, a validation
+pipeline, a promotion ladder, and an audit trail. It depends on machinery that does not exist yet:
+
+- **E-1's goal loop** — a forge that cannot be bounded by a goal and budget is an unbounded process.
+- **E-11's structural completion contract** — the cheap gate that would reject a forge claiming
+  success with no evidence.
+- **E-4's evidence-execution gate** — the thing that actually runs the generated tests.
+
+**Build E-1, E-11's structure gate, and E-4 first.** They are individually valuable, each `[pure]`,
+and together they are the substrate that makes agent-authored plugins safe rather than exciting.
+Attempting this before them would produce the most dangerous shape available: a model writing and
+running code with no bounded objective and no evidence requirement.
+
+### Acceptance criteria, when it is built (agent-executable)
+
+- The forge capability is **absent from the default dependency graph and default builds**, enforced
+  by a structural test in the `wasmtime_feature_gate.rs` style.
+- A forged plugin **cannot be registered until its generated tests execute and pass**; a plugin whose
+  tests fail is rejected with the failure surfaced, and a test proves the rejection.
+- A forged plugin's tools pass the **same permission layer** as builtins, proven by extending the
+  existing `a_plugin_tool_is_hidden_by_the_same_permission_layer_as_builtins` guard to a forged tool.
+- Promotion beyond session scope **requires direct user action**; a test proves a model cannot promote
+  its own forge.
+- Every forge event is recorded append-only with prompt provenance, and a test proves the record
+  cannot be silently skipped.
+- Removing any one of these guards fails a named test.
+
 ## E-8. Deferred, with reasons
 
 - **Agent teams (peer topology, shared task list)** — the only shipped peer-to-peer design is
