@@ -30,7 +30,7 @@ fn fixture_options(
     }
     let mut pairs = vec![
         ("HOME".to_owned(), home.display().to_string()),
-        ("OPENCODE_TEST_HOME".to_owned(), home.display().to_string()),
+        ("ZUNO_TEST_HOME".to_owned(), home.display().to_string()),
         (
             "XDG_CONFIG_HOME".to_owned(),
             xdg_config.display().to_string(),
@@ -113,7 +113,7 @@ fn discovery_walks_every_layer_in_oracle_precedence_order() {
     let cwd = project.join("nested");
     fs::create_dir_all(project.join(".git")).expect("worktree marker");
 
-    let global = root.join("xdg-config/opencode");
+    let global = root.join("xdg-config/zuno");
     write(
         &global.join("config.json"),
         r#"{"model":"global-config","instructions":["global-config"]}"#,
@@ -141,15 +141,15 @@ fn discovery_walks_every_layer_in_oracle_precedence_order() {
         r#"{"model":"project-nearest","instructions":["project-nearest"]}"#,
     );
     write(
-        &cwd.join(".opencode/opencode.json"),
+        &cwd.join(".zuno/opencode.json"),
         r#"{"model":"dot-nearest","instructions":["dot-nearest"]}"#,
     );
     write(
-        &project.join(".opencode/opencode.json"),
+        &project.join(".zuno/opencode.json"),
         r#"{"model":"dot-root","instructions":["dot-root"]}"#,
     );
     write(
-        &root.join("home/.opencode/opencode.json"),
+        &root.join("home/.zuno/opencode.json"),
         r#"{"model":"home-dot","instructions":["home-dot"]}"#,
     );
     let override_dir = root.join("override");
@@ -171,7 +171,7 @@ fn discovery_walks_every_layer_in_oracle_precedence_order() {
         root,
         &cwd,
         [
-            ("OPENCODE_CONFIG".to_owned(), env_file.display().to_string()),
+            ("ZUNO_CONFIG".to_owned(), env_file.display().to_string()),
             (
                 "OPENCODE_CONFIG_DIR".to_owned(),
                 override_dir.display().to_string(),
@@ -181,7 +181,7 @@ fn discovery_walks_every_layer_in_oracle_precedence_order() {
                 r#"{"model":"content","instructions":["content","global-json"]}"#.to_owned(),
             ),
             (
-                "OPENCODE_TEST_MANAGED_CONFIG_DIR".to_owned(),
+                "ZUNO_TEST_MANAGED_CONFIG_DIR".to_owned(),
                 managed_dir.display().to_string(),
             ),
         ],
@@ -220,7 +220,7 @@ fn discovery_jsonc_accepts_comments_and_trailing_commas_and_reports_bad_offset()
     let valid = tempfile::tempdir().expect("valid tempdir");
     let valid_project = valid.path().join("project");
     fs::create_dir_all(valid_project.join(".git")).expect("worktree marker");
-    let valid_path = valid_project.join(".opencode/opencode.jsonc");
+    let valid_path = valid_project.join(".zuno/opencode.jsonc");
     write(
         &valid_path,
         "{\n  // accepted comment\n  \"model\": \"provider/valid\",\n  \"instructions\": [\"one\",],\n}\n",
@@ -237,7 +237,7 @@ fn discovery_jsonc_accepts_comments_and_trailing_commas_and_reports_bad_offset()
     let invalid = tempfile::tempdir().expect("invalid tempdir");
     let invalid_project = invalid.path().join("project");
     fs::create_dir_all(invalid_project.join(".git")).expect("worktree marker");
-    let invalid_path = invalid_project.join(".opencode/opencode.jsonc");
+    let invalid_path = invalid_project.join(".zuno/opencode.jsonc");
     let malformed = "{\n  \"model\": ,\n}\n";
     write(&invalid_path, malformed);
 
@@ -289,7 +289,7 @@ fn discovery_applies_permission_after_managed_preferences_and_tools_defaults_fir
                 r#"{"tools":{"bash":false,"write":true},"permission":{"read":"ask"}}"#.to_owned(),
             ),
             (
-                "OPENCODE_PERMISSION".to_owned(),
+                "ZUNO_PERMISSION".to_owned(),
                 r#"{"bash":"allow","edit":"deny"}"#.to_owned(),
             ),
         ],

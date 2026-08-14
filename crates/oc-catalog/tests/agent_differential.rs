@@ -47,11 +47,13 @@ fn global_asset(
     relative: &str,
     contents: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let path = fixture.env().xdg_config().join("opencode").join(relative);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+    for directory in ["opencode", "zuno"] {
+        let path = fixture.env().xdg_config().join(directory).join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, contents)?;
     }
-    fs::write(path, contents)?;
     Ok(())
 }
 
@@ -62,11 +64,13 @@ fn project_asset(
     relative: &str,
     contents: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let path = fixture.env().project().join(".opencode").join(relative);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+    for directory in [".opencode", ".zuno"] {
+        let path = fixture.env().project().join(directory).join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, contents)?;
     }
-    fs::write(path, contents)?;
     Ok(())
 }
 
@@ -506,5 +510,6 @@ fn the_working_directory_of_the_fixture_is_inside_the_project() -> Result<(), Bo
         project.display()
     );
     assert!(Path::new(&project).join(".opencode").exists());
+    assert!(Path::new(&project).join(".zuno").exists());
     Ok(())
 }

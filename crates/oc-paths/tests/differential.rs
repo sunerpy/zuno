@@ -4,8 +4,9 @@
 //!
 //! `opencode debug paths` prints nine `key value` lines
 //! (`packages/opencode/src/cli/cmd/debug/index.ts:79-87`). This test runs the
-//! real binary and [`Layout::resolve_with`] under an **identical, fully
-//! explicit** environment and requires the two dumps to be byte-identical.
+//! real binary under a fully explicit environment, then derives the Zuno
+//! subject's expected dump by replacing only the application path component
+//! `opencode` with `zuno`. Everything else remains byte-identical.
 //!
 //! Only the keys the oracle emits are compared, because those are the only ones
 //! it emits. The getters `debug paths` does *not* cover — `snapshot_root`,
@@ -55,15 +56,17 @@
 //! non-skip path asserts.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use oc_testkit::{PINNED_RELEASE, pinned_oracle_or_skip};
 
 use oc_paths::env::{
-    HOME, OPENCODE_DB, XDG_CACHE_HOME, XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_STATE_HOME,
+    HOME, XDG_CACHE_HOME, XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_STATE_HOME, ZUNO_DB,
 };
 use oc_paths::{DbLocation, Env, Layout};
+
+const ORACLE_OPENCODE_DB: &str = "OPENCODE_DB";
 
 /// The installed release these dumps are compared against.
 ///
@@ -111,6 +114,61 @@ fn subject_dump(env: &BTreeMap<&str, String>) -> String {
     layout.debug_paths_dump()
 }
 
+fn dump_entries(dump: &str) -> Vec<(&str, PathBuf)> {
+    dump.lines()
+        .map(|line| {
+            let (key, value) = line
+                .split_once(' ')
+                .unwrap_or_else(|| panic!("debug path line has no separator: {line:?}"));
+            (key, PathBuf::from(value.trim_start()))
+        })
+        .collect()
+}
+
+fn zuno_path_from_oracle(path: &Path, suffix: &[&str]) -> PathBuf {
+    let mut app = path;
+    for expected in suffix.iter().rev() {
+        assert_eq!(
+            app.file_name().and_then(|part| part.to_str()),
+            Some(*expected),
+            "oracle path {} did not end with {suffix:?}",
+            path.display()
+        );
+        app = app.parent().expect("oracle suffix has a parent");
+    }
+    assert_eq!(
+        app.file_name().and_then(|part| part.to_str()),
+        Some("opencode"),
+        "oracle application leaf changed unexpectedly: {}",
+        path.display()
+    );
+
+    let mut result = app
+        .parent()
+        .expect("oracle app leaf has a parent")
+        .join("zuno");
+    for part in suffix {
+        result.push(part);
+    }
+    result
+}
+
+fn expected_zuno_dump(oracle: &str) -> String {
+    let mut expected = String::new();
+    for (key, path) in dump_entries(oracle) {
+        let path = match key {
+            "home" => path,
+            "data" | "cache" | "config" | "state" | "tmp" => zuno_path_from_oracle(&path, &[]),
+            "bin" => zuno_path_from_oracle(&path, &["bin"]),
+            "log" => zuno_path_from_oracle(&path, &["log"]),
+            "repos" => zuno_path_from_oracle(&path, &["repos"]),
+            other => panic!("unexpected debug paths key: {other}"),
+        };
+        expected.push_str(&format!("{key:<10} {}\n", path.display()));
+    }
+    expected
+}
+
 /// `PATH` and `HOME` only; without `PATH` the child cannot find `git`, and
 /// without `HOME` neither side has an XDG fallback base.
 fn base_env(home: &str) -> BTreeMap<&'static str, String> {
@@ -126,9 +184,10 @@ fn base_env(home: &str) -> BTreeMap<&'static str, String> {
 fn compare(binary: &Path, label: &str, env: &BTreeMap<&str, String>) {
     let oracle = oracle_dump(binary, env);
     let subject = subject_dump(env);
+    let expected = expected_zuno_dump(&oracle);
     assert_eq!(
-        oracle, subject,
-        "[{label}] differential dump mismatch\nenv: {env:?}\n--- oracle ---\n{oracle}--- subject ---\n{subject}"
+        expected, subject,
+        "[{label}] hard-cut dump mismatch\nenv: {env:?}\n--- oracle ---\n{oracle}--- expected Zuno ---\n{expected}--- subject ---\n{subject}"
     );
     assert_eq!(
         oracle.lines().count(),
@@ -136,7 +195,7 @@ fn compare(binary: &Path, label: &str, env: &BTreeMap<&str, String>) {
         "[{label}] oracle emitted an unexpected number of keys:\n{oracle}"
     );
     println!(
-        "[{label}] {} keys byte-identical\n{subject}",
+        "[{label}] {} keys differ only by the zuno application leaf\n{subject}",
         oracle.lines().count()
     );
 }
@@ -179,10 +238,11 @@ fn differential_custom_xdg_home() {
     assert!(dump.contains(&base("data")), "{dump}");
 }
 
-/// Permutation 3: `OPENCODE_DB=:memory:` on top of a temp XDG root.
+/// Permutation 3: the oracle's `OPENCODE_DB=:memory:` and the subject's
+/// `ZUNO_DB=:memory:` on top of a temp XDG root.
 ///
 /// `debug paths` does not print the database path, so this permutation checks
-/// two things: that the nine printed paths are unaffected by `OPENCODE_DB`, and
+/// two things: that the nine printed paths are unaffected by the DB override, and
 /// that this crate resolves the sentinel to [`DbLocation::Memory`] rather than to
 /// a file called `:memory:`.
 #[test]
@@ -198,11 +258,14 @@ fn differential_memory_db() {
     env.insert(XDG_CACHE_HOME, base("cache"));
     env.insert(XDG_CONFIG_HOME, base("config"));
     env.insert(XDG_STATE_HOME, base("state"));
-    env.insert(OPENCODE_DB, ":memory:".to_owned());
+    env.insert(ORACLE_OPENCODE_DB, ":memory:".to_owned());
     compare(binary, "memory-db", &env);
 
+    let mut subject_env = env.clone();
+    subject_env.remove(ORACLE_OPENCODE_DB);
+    subject_env.insert(ZUNO_DB, ":memory:".to_owned());
     let layout = Layout::resolve_with(
-        &Env::from_pairs(env.iter().map(|(k, v)| (*k, v.clone()))),
+        &Env::from_pairs(subject_env.iter().map(|(k, v)| (*k, v.clone()))),
         None,
     );
     assert_eq!(layout.db_path_for_channel("latest"), DbLocation::Memory);
@@ -213,11 +276,9 @@ fn differential_memory_db() {
 /// The failure scenario, checked against the real binary's behaviour rather than
 /// against a reading of its source.
 ///
-/// A **relative** `OPENCODE_DB` must resolve under `data()`, never under the
-/// working directory. `debug paths` cannot show this, so the oracle side is
-/// established by running a command that opens the database from a working
-/// directory that is *not* the data directory, and then looking at where the file
-/// landed.
+/// A relative DB override must resolve under each application's `data()`, never
+/// under the working directory. The oracle keeps `OPENCODE_DB` and writes below
+/// `opencode`; the subject accepts only `ZUNO_DB` and resolves below `zuno`.
 #[test]
 fn db_override_relative_resolves_where_the_oracle_writes() {
     let root = tempfile::tempdir().expect("tempdir");
@@ -227,18 +288,22 @@ fn db_override_relative_resolves_where_the_oracle_writes() {
     std::fs::create_dir_all(&xdg_data).expect("create xdg data");
     std::fs::create_dir_all(&cwd).expect("create cwd");
 
-    let mut env = base_env(&home);
-    env.insert(XDG_DATA_HOME, xdg_data.to_string_lossy().into_owned());
-    env.insert(OPENCODE_DB, "relprobe.db".to_owned());
+    let mut oracle_env = base_env(&home);
+    oracle_env.insert(XDG_DATA_HOME, xdg_data.to_string_lossy().into_owned());
+    oracle_env.insert(ORACLE_OPENCODE_DB, "relprobe.db".to_owned());
+
+    let mut subject_env = base_env(&home);
+    subject_env.insert(XDG_DATA_HOME, xdg_data.to_string_lossy().into_owned());
+    subject_env.insert(ZUNO_DB, "relprobe.db".to_owned());
 
     // This crate's answer.
     let layout = Layout::resolve_with(
-        &Env::from_pairs(env.iter().map(|(k, v)| (*k, v.clone()))),
+        &Env::from_pairs(subject_env.iter().map(|(k, v)| (*k, v.clone()))),
         None,
     );
     let resolved = layout.db_path_for_channel("latest");
-    let expected = xdg_data.join("opencode/relprobe.db");
-    assert_eq!(resolved, DbLocation::File(expected.clone()));
+    let subject_expected = xdg_data.join("zuno/relprobe.db");
+    assert_eq!(resolved, DbLocation::File(subject_expected.clone()));
     assert!(
         resolved.as_path().expect("file").starts_with(layout.data()),
         "{:?} is not under data() {}",
@@ -247,8 +312,8 @@ fn db_override_relative_resolves_where_the_oracle_writes() {
     );
     assert_ne!(resolved.as_path(), Some(cwd.join("relprobe.db").as_path()));
     println!(
-        "subject resolved OPENCODE_DB=relprobe.db to {}",
-        expected.display()
+        "subject resolved ZUNO_DB=relprobe.db to {}",
+        subject_expected.display()
     );
 
     let Some(binary) = oracle_binary("db_override_relative_resolves_where_the_oracle_writes")
@@ -267,15 +332,16 @@ fn db_override_relative_resolves_where_the_oracle_writes() {
         .arg("probe")
         .current_dir(&cwd)
         .env_clear();
-    for (key, value) in &env {
+    for (key, value) in &oracle_env {
         command.env(key, value);
     }
     let _ = command.output().expect("spawn oracle run");
 
+    let oracle_expected = xdg_data.join("opencode/relprobe.db");
     assert!(
-        expected.is_file(),
+        oracle_expected.is_file(),
         "oracle did not create {} — data-relative resolution not reproduced",
-        expected.display()
+        oracle_expected.display()
     );
     assert!(
         !cwd.join("relprobe.db").exists(),
@@ -284,7 +350,7 @@ fn db_override_relative_resolves_where_the_oracle_writes() {
     );
     println!(
         "oracle created {} and left {} empty",
-        expected.display(),
+        oracle_expected.display(),
         cwd.display()
     );
 }
@@ -304,7 +370,11 @@ fn the_comparison_detects_a_single_character_divergence() {
     let env = base_env(&home);
     let oracle = oracle_dump(binary, &env);
     let subject = subject_dump(&env);
-    assert_eq!(oracle, subject, "baseline must match before perturbing");
+    let expected = expected_zuno_dump(&oracle);
+    assert_eq!(
+        expected, subject,
+        "baseline hard cut must match before perturbing"
+    );
 
     for (index, line) in subject.lines().enumerate() {
         let perturbed: String = subject
@@ -319,7 +389,7 @@ fn the_comparison_detects_a_single_character_divergence() {
             })
             .collect();
         assert_ne!(
-            oracle, perturbed,
+            expected, perturbed,
             "perturbing line {index} ({line:?}) did not change the dump"
         );
     }

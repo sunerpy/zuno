@@ -22,8 +22,8 @@ pub use disposition::{
     validate_upstream_surface,
 };
 pub use environment::{
-    AGENT, OPENCODE, OPENCODE_FLAG_NAMES, OPENCODE_LOG_LEVEL, OPENCODE_PID, OPENCODE_PRINT_LOGS,
-    OPENCODE_PURE, OpenCodeFlags, StartupEnvironment,
+    AGENT, OpenCodeFlags, StartupEnvironment, ZUNO, ZUNO_FLAG_NAMES, ZUNO_LOG_LEVEL, ZUNO_PID,
+    ZUNO_PRINT_LOGS, ZUNO_PURE,
 };
 pub use version::{
     BUILD_ID, COMPATIBILITY_VERSION, RUST_PACKAGE_VERSION, compatibility_version, long_version,
@@ -135,12 +135,12 @@ fn init_logging(
         }
     };
     let mut config = LogConfig::from_env(oc_paths::log());
-    if let Some(raw) = environment.flags.value(OPENCODE_LOG_LEVEL)
+    if let Some(raw) = environment.flags.value(ZUNO_LOG_LEVEL)
         && let Some(level) = oc_observability::LogLevel::parse(raw)
     {
         config = config.with_level(level);
     }
-    if environment.flags.value(OPENCODE_PRINT_LOGS) == Some("1") {
+    if environment.flags.value(ZUNO_PRINT_LOGS) == Some("1") {
         config = config.with_print_logs(true);
     }
     oc_observability::init(config)

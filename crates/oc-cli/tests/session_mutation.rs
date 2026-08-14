@@ -137,26 +137,21 @@ fn variables_with_config(
     database: &Path,
     config: String,
 ) -> BTreeMap<String, String> {
-    let mut variables = env.env_vars();
+    let mut variables = env
+        .env_vars()
+        .into_iter()
+        .map(|(key, value)| (oc_paths::env::accepted_env_name(&key).to_owned(), value))
+        .collect::<BTreeMap<_, _>>();
     variables.extend([
         ("NO_COLOR".to_owned(), "1".to_owned()),
         ("TERM".to_owned(), "dumb".to_owned()),
-        ("OPENCODE_PURE".to_owned(), "1".to_owned()),
-        ("OPENCODE_AUTH_CONTENT".to_owned(), "{}".to_owned()),
+        ("ZUNO_PURE".to_owned(), "1".to_owned()),
+        ("ZUNO_AUTH_CONTENT".to_owned(), "{}".to_owned()),
+        ("ZUNO_DISABLE_MODELS_FETCH".to_owned(), "true".to_owned()),
+        ("ZUNO_DISABLE_DEFAULT_PLUGINS".to_owned(), "true".to_owned()),
+        ("ZUNO_DISABLE_LSP_DOWNLOAD".to_owned(), "true".to_owned()),
         (
-            "OPENCODE_DISABLE_MODELS_FETCH".to_owned(),
-            "true".to_owned(),
-        ),
-        (
-            "OPENCODE_DISABLE_DEFAULT_PLUGINS".to_owned(),
-            "true".to_owned(),
-        ),
-        (
-            "OPENCODE_DISABLE_LSP_DOWNLOAD".to_owned(),
-            "true".to_owned(),
-        ),
-        (
-            "OPENCODE_DB".to_owned(),
+            "ZUNO_DB".to_owned(),
             database.to_string_lossy().into_owned(),
         ),
         ("OPENCODE_CONFIG_CONTENT".to_owned(), config),
@@ -318,7 +313,7 @@ impl RunningServer {
 
     async fn start_with_plugin_config(env: &ScriptedEnv, database: &Path, config: String) -> Self {
         let mut variables = variables_with_config(env, database, config);
-        variables.remove("OPENCODE_PURE");
+        variables.remove("ZUNO_PURE");
         variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
         variables.insert(
             "MISE_DATA_DIR".to_owned(),
@@ -334,7 +329,7 @@ impl RunningServer {
         config: String,
     ) -> Self {
         let mut variables = variables_with_config(env, database, config);
-        variables.remove("OPENCODE_PURE");
+        variables.remove("ZUNO_PURE");
         variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
         variables.insert(
             "MISE_DATA_DIR".to_owned(),
@@ -342,7 +337,7 @@ impl RunningServer {
         );
         variables.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
         variables.insert(
-            "OPENCODE_AUTH_CONTENT".to_owned(),
+            "ZUNO_AUTH_CONTENT".to_owned(),
             r#"{"test":{"type":"api","key":"fixture-key"}}"#.to_owned(),
         );
         Self::start_with_variables(env, variables).await

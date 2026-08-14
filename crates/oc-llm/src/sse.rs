@@ -14,7 +14,7 @@ use oc_error::ProviderError;
 use serde::de::DeserializeOwned;
 
 /// Environment override for the maximum gap between streamed chunks.
-pub const STREAM_IDLE_TIMEOUT_ENV: &str = "OPENCODE_STREAM_IDLE_TIMEOUT_SECS";
+pub const STREAM_IDLE_TIMEOUT_ENV: &str = "ZUNO_STREAM_IDLE_TIMEOUT_SECS";
 
 /// Longest user-visible wait budget for one provider recovery sequence.
 ///

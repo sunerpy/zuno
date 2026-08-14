@@ -118,6 +118,17 @@ fn production_plugin_specs() -> Vec<String> {
     ]
 }
 
+fn installed_production_plugin_specs() -> Vec<String> {
+    [ANTIGRAVITY_PACKAGE, KIRO_PACKAGE]
+        .into_iter()
+        .map(|package| format!("file:{}", installed_package(package).display()))
+        .collect()
+}
+
+fn installed_spec(package: &str) -> String {
+    format!("file:{}", installed_package(package).display())
+}
+
 fn installed_package(package: &str) -> PathBuf {
     Path::new(PLUGIN_CACHE).join(format!(
         "packages/{}/node_modules/{package}",
@@ -214,7 +225,7 @@ async fn real_auth_plugin_providers_reach_the_plain_models_surface() {
     let root = tempfile::tempdir().expect("tempdir");
     let catalog = root.path().join("models.json");
     std::fs::write(&catalog, PINNED_CATALOG).expect("write pinned models catalog");
-    let config = serde_json::json!({ "plugin": production_plugin_specs() });
+    let config = serde_json::json!({ "plugin": installed_production_plugin_specs() });
 
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_opencode-rust"));
     command
@@ -222,23 +233,24 @@ async fn real_auth_plugin_providers_reach_the_plain_models_surface() {
         .current_dir(root.path())
         .stdin(Stdio::null())
         .kill_on_drop(true)
+        .env_clear()
         .env("HOME", root.path().join("home"))
         .env("XDG_DATA_HOME", root.path().join("data"))
         .env("XDG_CONFIG_HOME", root.path().join("config"))
-        .env("XDG_CACHE_HOME", "/config/.cache")
+        .env("XDG_CACHE_HOME", root.path().join("cache"))
         .env("XDG_STATE_HOME", root.path().join("state"))
         .env("MISE_DATA_DIR", "/config/.local/share/mise")
         .env("PATH", "/usr/bin:/bin")
         .env("NO_COLOR", "1")
         .env("TERM", "dumb")
-        .env("OPENCODE_DISABLE_AUTOUPDATE", "true")
-        .env("OPENCODE_DISABLE_MODELS_FETCH", "true")
-        .env("OPENCODE_DISABLE_DEFAULT_PLUGINS", "true")
-        .env("OPENCODE_DISABLE_LSP_DOWNLOAD", "true")
-        .env("OPENCODE_MODELS_PATH", &catalog)
+        .env("ZUNO_DISABLE_AUTOUPDATE", "true")
+        .env("ZUNO_DISABLE_MODELS_FETCH", "true")
+        .env("ZUNO_DISABLE_DEFAULT_PLUGINS", "true")
+        .env("ZUNO_DISABLE_LSP_DOWNLOAD", "true")
+        .env("ZUNO_MODELS_PATH", &catalog)
         .env("OPENCODE_CONFIG_CONTENT", config.to_string())
         .env(
-            "OPENCODE_AUTH_CONTENT",
+            "ZUNO_AUTH_CONTENT",
             r#"{"google":{"type":"api","key":"test"},"kiro-auth":{"type":"api","key":"test"}}"#,
         );
 
@@ -290,7 +302,7 @@ async fn antigravity_auth_loader_zeroes_google_cost_on_the_verbose_models_surfac
     let catalog = root.path().join("models.json");
     std::fs::write(&catalog, PINNED_CATALOG).expect("write pinned models catalog");
     let config = serde_json::json!({
-        "plugin": [supported_spec(ANTIGRAVITY_PACKAGE)],
+        "plugin": [installed_spec(ANTIGRAVITY_PACKAGE)],
         "provider": { "google": {} }
     });
 
@@ -304,20 +316,20 @@ async fn antigravity_auth_loader_zeroes_google_cost_on_the_verbose_models_surfac
         .env("HOME", root.path().join("home"))
         .env("XDG_DATA_HOME", root.path().join("data"))
         .env("XDG_CONFIG_HOME", root.path().join("config"))
-        .env("XDG_CACHE_HOME", "/config/.cache")
+        .env("XDG_CACHE_HOME", root.path().join("cache"))
         .env("XDG_STATE_HOME", root.path().join("state"))
         .env("MISE_DATA_DIR", "/config/.local/share/mise")
         .env("PATH", "/usr/bin:/bin")
         .env("NO_COLOR", "1")
         .env("TERM", "dumb")
-        .env("OPENCODE_DISABLE_AUTOUPDATE", "true")
-        .env("OPENCODE_DISABLE_MODELS_FETCH", "true")
-        .env("OPENCODE_DISABLE_DEFAULT_PLUGINS", "true")
-        .env("OPENCODE_DISABLE_LSP_DOWNLOAD", "true")
-        .env("OPENCODE_MODELS_PATH", &catalog)
+        .env("ZUNO_DISABLE_AUTOUPDATE", "true")
+        .env("ZUNO_DISABLE_MODELS_FETCH", "true")
+        .env("ZUNO_DISABLE_DEFAULT_PLUGINS", "true")
+        .env("ZUNO_DISABLE_LSP_DOWNLOAD", "true")
+        .env("ZUNO_MODELS_PATH", &catalog)
         .env("OPENCODE_CONFIG_CONTENT", config.to_string())
         .env(
-            "OPENCODE_AUTH_CONTENT",
+            "ZUNO_AUTH_CONTENT",
             r#"{"google":{"type":"oauth","refresh":"fixture-refresh","access":"fixture-access","expires":4102444800000}}"#,
         );
 
@@ -372,20 +384,20 @@ async fn failing_auth_loader_is_disabled_and_models_lists_models_with_a_diagnost
         .env("HOME", root.path().join("home"))
         .env("XDG_DATA_HOME", root.path().join("data"))
         .env("XDG_CONFIG_HOME", root.path().join("config"))
-        .env("XDG_CACHE_HOME", "/config/.cache")
+        .env("XDG_CACHE_HOME", root.path().join("cache"))
         .env("XDG_STATE_HOME", root.path().join("state"))
         .env("MISE_DATA_DIR", "/config/.local/share/mise")
         .env("PATH", "/usr/bin:/bin")
         .env("NO_COLOR", "1")
         .env("TERM", "dumb")
-        .env("OPENCODE_DISABLE_AUTOUPDATE", "true")
-        .env("OPENCODE_DISABLE_MODELS_FETCH", "true")
-        .env("OPENCODE_DISABLE_DEFAULT_PLUGINS", "true")
-        .env("OPENCODE_DISABLE_LSP_DOWNLOAD", "true")
-        .env("OPENCODE_MODELS_PATH", &catalog)
+        .env("ZUNO_DISABLE_AUTOUPDATE", "true")
+        .env("ZUNO_DISABLE_MODELS_FETCH", "true")
+        .env("ZUNO_DISABLE_DEFAULT_PLUGINS", "true")
+        .env("ZUNO_DISABLE_LSP_DOWNLOAD", "true")
+        .env("ZUNO_MODELS_PATH", &catalog)
         .env("OPENCODE_CONFIG_CONTENT", config.to_string())
         .env(
-            "OPENCODE_AUTH_CONTENT",
+            "ZUNO_AUTH_CONTENT",
             r#"{"test":{"type":"api","key":"fixture-key"}}"#,
         );
 

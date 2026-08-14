@@ -64,6 +64,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use oc_cli::{Disposition, dispositions};
+use oc_paths::env::accepted_env_name;
 use oc_testkit::{
     DivergenceList, Oracle, RunOutcome, ScriptedEnv, Subject, TestkitError, normalize_cli_stream,
 };
@@ -339,7 +340,7 @@ static PARITY_ROWS: &[ParityRow] = &[
                     subject_form: &[
                         "model `bogus/model` is not available",
                         "Define the provider and model under `provider` in your config",
-                        "OPENCODE_MODELS_PATH to a catalog file on disk",
+                        "ZUNO_MODELS_PATH to a catalog file on disk",
                     ],
                 },
             },
@@ -473,6 +474,18 @@ fn scripted_world(extra: &[(&str, &str)]) -> ScriptedEnv {
     env
 }
 
+fn subject_world(extra: &[(&str, &str)]) -> ScriptedEnv {
+    let env = scripted_world(extra);
+    env.env_vars().into_iter().fold(env, |env, (key, value)| {
+        let accepted = accepted_env_name(&key).to_owned();
+        if accepted == key {
+            env
+        } else {
+            env.set(accepted, value)
+        }
+    })
+}
+
 /// Make `directory` a real repository, failing loudly when `git` is absent.
 ///
 /// A silent fallback would be the worst outcome: the probes would keep running and
@@ -584,7 +597,7 @@ fn run_oracle(probe: &Probe, busy_port: u16) -> SideOutcome {
 fn run_subject(probe: &Probe, busy_port: u16) -> SideOutcome {
     let subject = Subject::at(env!("CARGO_BIN_EXE_opencode-rust"))
         .expect("the shipped binary must exist")
-        .with_env(scripted_world(probe.env));
+        .with_env(subject_world(probe.env));
     let outcome = subject
         .run(resolved_argv(probe, busy_port))
         .expect("the subject must run");
@@ -600,8 +613,10 @@ struct ProbeVerdict {
 }
 
 fn compare(probe: &Probe, busy_port: u16) -> ProbeVerdict {
-    let oracle = run_oracle(probe, busy_port);
+    let mut oracle = run_oracle(probe, busy_port);
     let subject = run_subject(probe, busy_port);
+    oracle.stdout = expected_zuno_paths(&oracle.stdout);
+    oracle.stderr = expected_zuno_paths(&oracle.stderr);
     let mut differences = Vec::new();
 
     if probe.exit == Stream::Compared && oracle.exit != subject.exit {
@@ -628,6 +643,19 @@ fn compare(probe: &Probe, busy_port: u16) -> ProbeVerdict {
         oracle,
         subject,
     }
+}
+
+fn expected_zuno_paths(text: &str) -> String {
+    [
+        ("<DATA>/opencode", "<DATA>/zuno"),
+        ("<CACHE>/opencode", "<CACHE>/zuno"),
+        ("<CONFIG>/opencode", "<CONFIG>/zuno"),
+        ("<STATE>/opencode", "<STATE>/zuno"),
+        ("<TMP>/opencode", "<TMP>/zuno"),
+        ("/opencode/", "/zuno/"),
+    ]
+    .into_iter()
+    .fold(text.to_owned(), |text, (old, new)| text.replace(old, new))
 }
 
 /// One [`Witness::DocumentedDiagnostics`] row, checked against both processes.
@@ -1320,6 +1348,7 @@ fn the_session_list_output_shape_difference_is_live() {
         &["session", "list"],
         root.path(),
         &database,
+        false,
     );
     assert!(
         empty.status.success(),
@@ -1331,6 +1360,7 @@ fn the_session_list_output_shape_difference_is_live() {
         &["db", "--format", "tsv", "select id from project"],
         root.path(),
         &database,
+        false,
     );
     let project_id = String::from_utf8_lossy(&projects.stdout)
         .lines()
@@ -1352,7 +1382,13 @@ fn the_session_list_output_shape_difference_is_live() {
         project.display(),
         oc_testkit::PINNED_RELEASE
     );
-    let seeded = shared_run(&oracle_program, &["db", &insert], root.path(), &database);
+    let seeded = shared_run(
+        &oracle_program,
+        &["db", &insert],
+        root.path(),
+        &database,
+        false,
+    );
     assert!(
         seeded.status.success(),
         "seeding one session must succeed: {}",
@@ -1364,12 +1400,14 @@ fn the_session_list_output_shape_difference_is_live() {
         &["session", "list", "--format", "json"],
         root.path(),
         &database,
+        false,
     );
     let subject_json = shared_run(
         Path::new(env!("CARGO_BIN_EXE_opencode-rust")),
         &["session", "list", "--format", "json"],
         root.path(),
         &database,
+        true,
     );
     let oracle_keys = json_field_names(&String::from_utf8_lossy(&oracle_json.stdout));
     let subject_keys = json_field_names(&String::from_utf8_lossy(&subject_json.stdout));
@@ -1407,8 +1445,15 @@ fn the_session_list_output_shape_difference_is_live() {
 ///
 /// Only [`the_session_list_output_shape_difference_is_live`] uses this, because it
 /// is the one comparison that needs both binaries to resolve the *same* project.
-fn shared_run(binary: &Path, argv: &[&str], root: &Path, database: &Path) -> Output {
-    Command::new(binary)
+fn shared_run(
+    binary: &Path,
+    argv: &[&str],
+    root: &Path,
+    database: &Path,
+    zuno_env: bool,
+) -> Output {
+    let mut command = Command::new(binary);
+    command
         .args(argv)
         .current_dir(root.join("project"))
         .env_clear()
@@ -1420,12 +1465,23 @@ fn shared_run(binary: &Path, argv: &[&str], root: &Path, database: &Path) -> Out
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_CACHE_HOME", root.join("cache"))
         .env("XDG_STATE_HOME", root.join("state"))
-        .env("TMPDIR", root.join("tmp"))
-        .env("OPENCODE_DB", database)
-        .env("OPENCODE_DISABLE_AUTOUPDATE", "1")
-        .env("OPENCODE_DISABLE_MODELS_FETCH", "1")
-        .env("OPENCODE_DISABLE_DEFAULT_PLUGINS", "1")
-        .env("OPENCODE_DISABLE_LSP_DOWNLOAD", "1")
+        .env("TMPDIR", root.join("tmp"));
+    if zuno_env {
+        command
+            .env("ZUNO_DB", database)
+            .env("ZUNO_DISABLE_AUTOUPDATE", "1")
+            .env("ZUNO_DISABLE_MODELS_FETCH", "1")
+            .env("ZUNO_DISABLE_DEFAULT_PLUGINS", "1")
+            .env("ZUNO_DISABLE_LSP_DOWNLOAD", "1");
+    } else {
+        command
+            .env("OPENCODE_DB", database)
+            .env("OPENCODE_DISABLE_AUTOUPDATE", "1")
+            .env("OPENCODE_DISABLE_MODELS_FETCH", "1")
+            .env("OPENCODE_DISABLE_DEFAULT_PLUGINS", "1")
+            .env("OPENCODE_DISABLE_LSP_DOWNLOAD", "1");
+    }
+    command
         .output()
         .unwrap_or_else(|error| panic!("{argv:?} must run: {error}"))
 }

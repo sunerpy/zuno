@@ -172,7 +172,7 @@ mod tests {
         // fail with NotADirectory / AlreadyExists.
         let data_base = root.path().join("data");
         std::fs::create_dir_all(&data_base).expect("create data base");
-        std::fs::write(data_base.join("opencode"), "not a directory").expect("write blocker");
+        std::fs::write(data_base.join("zuno"), "not a directory").expect("write blocker");
 
         let layout = isolated(root.path());
         let error = layout.ensure().expect_err("ensure must fail");

@@ -139,7 +139,7 @@ const ETC_SHELLS: &str = "/etc/shells";
 const POSIX_FALLBACK: &[&str] = &["/bin/bash", "/bin/zsh", "/bin/sh"];
 
 /// Overrides Git Bash detection on Windows (`shell.ts:125`).
-pub const GIT_BASH_PATH_ENV: &str = "OPENCODE_GIT_BASH_PATH";
+pub const GIT_BASH_PATH_ENV: &str = "ZUNO_GIT_BASH_PATH";
 
 /// The lowercased base name, as `shell.ts:139-142` computes it.
 #[must_use]

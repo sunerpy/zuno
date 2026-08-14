@@ -93,10 +93,10 @@ pub const CLAUDE_GLOBAL_RELATIVE: [&str; 2] = [".claude", "CLAUDE.md"];
 /// (`packages/opencode/src/effect/runtime-flags.ts:24`).
 pub const OPENCODE_DISABLE_CLAUDE_CODE: &str = "OPENCODE_DISABLE_CLAUDE_CODE";
 
-/// `OPENCODE_DISABLE_CLAUDE_CODE_PROMPT` — the targeted switch
+/// `ZUNO_DISABLE_CLAUDE_CODE_PROMPT` — the targeted switch
 /// (`runtime-flags.ts:25`). Either variable disables the Claude instruction
 /// files.
-pub const OPENCODE_DISABLE_CLAUDE_CODE_PROMPT: &str = "OPENCODE_DISABLE_CLAUDE_CODE_PROMPT";
+pub const ZUNO_DISABLE_CLAUDE_CODE_PROMPT: &str = "ZUNO_DISABLE_CLAUDE_CODE_PROMPT";
 
 /// The header the oracle puts above every instruction body (`instruction.ts:162`).
 const HEADER: &str = "Instructions from: ";
@@ -217,7 +217,7 @@ impl InstructionOptions {
             layout: Layout::resolve(env),
             instructions,
             claude_prompt_disabled: env.flag(OPENCODE_DISABLE_CLAUDE_CODE)
-                || env.flag(OPENCODE_DISABLE_CLAUDE_CODE_PROMPT),
+                || env.flag(ZUNO_DISABLE_CLAUDE_CODE_PROMPT),
         }
     }
 
@@ -834,7 +834,7 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         for flag in [
             OPENCODE_DISABLE_CLAUDE_CODE,
-            OPENCODE_DISABLE_CLAUDE_CODE_PROMPT,
+            ZUNO_DISABLE_CLAUDE_CODE_PROMPT,
         ] {
             let env = env_for(root.path()).with(flag, "true");
             let options = InstructionOptions::new(root.path(), None::<PathBuf>, &env, Vec::new());
@@ -859,7 +859,7 @@ mod tests {
     #[test]
     fn the_global_probe_stops_at_the_first_hit() {
         let root = tempfile::tempdir().expect("tempdir");
-        let config_agents = root.path().join("home/.config/opencode/AGENTS.md");
+        let config_agents = root.path().join("home/.config/zuno/AGENTS.md");
         write(&config_agents, "global agents");
         write(&root.path().join("home/.claude/CLAUDE.md"), "global claude");
         fs::create_dir_all(root.path().join("repo")).expect("mkdir repo");
@@ -961,7 +961,7 @@ mod tests {
         let repo = root.path().join("repo");
         write(&repo.join("AGENTS.md"), "root agents");
 
-        let env = env_for(root.path()).with("OPENCODE_DISABLE_PROJECT_CONFIG", "true");
+        let env = env_for(root.path()).with("ZUNO_DISABLE_PROJECT_CONFIG", "true");
         let options = InstructionOptions::new(&repo, Some(repo.clone()), &env, Vec::new());
         assert!(options.project_config_disabled());
         assert!(Instructions::discover(&options).paths().is_empty());
@@ -1276,7 +1276,7 @@ mod tests {
     fn with_layout_overrides_the_resolved_layout() {
         let root = tempfile::tempdir().expect("tempdir");
         let elsewhere = root.path().join("elsewhere");
-        write(&elsewhere.join("opencode/AGENTS.md"), "override global");
+        write(&elsewhere.join("zuno/AGENTS.md"), "override global");
         fs::create_dir_all(root.path().join("repo")).expect("mkdir");
 
         let layout = Layout::resolve(
@@ -1292,7 +1292,7 @@ mod tests {
         let found = Instructions::discover(&options);
         assert_eq!(
             found.paths()[0].path(),
-            resolve(&elsewhere.join("opencode/AGENTS.md"))
+            resolve(&elsewhere.join("zuno/AGENTS.md"))
         );
     }
 

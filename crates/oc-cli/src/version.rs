@@ -17,7 +17,7 @@ pub const RUST_PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 ///
 /// Release builds may inject a commit, tag, or reproducible-build identifier.
 /// Local builds remain honest by falling back to the Rust package version.
-pub const BUILD_ID: &str = match option_env!("OPENCODE_RUST_BUILD_ID") {
+pub const BUILD_ID: &str = match option_env!("ZUNO_RUST_BUILD_ID") {
     Some(identity) => identity,
     None => RUST_PACKAGE_VERSION,
 };

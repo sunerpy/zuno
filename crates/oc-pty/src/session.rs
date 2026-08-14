@@ -89,7 +89,7 @@ pub const DRAIN_GRACE: Duration = Duration::from_millis(500);
 const TERM_VALUE: &str = "xterm-256color";
 
 /// Marks a shell as running inside opencode (`packages/core/src/pty.ts:178`).
-const TERMINAL_MARKER_ENV: &str = "OPENCODE_TERMINAL";
+const TERMINAL_MARKER_ENV: &str = "ZUNO_TERMINAL";
 
 /// A PTY session identifier, `pty_`-prefixed as `packages/schema/src/pty.ts:9`.
 #[derive(

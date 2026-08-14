@@ -1223,7 +1223,9 @@ fn matrix_env(root: &Path) -> Vec<(String, String)> {
             path_string(&root.join("state")),
         ),
         ("OPENCODE_MODELS_PATH".to_owned(), path_string(&catalogue)),
+        ("ZUNO_MODELS_PATH".to_owned(), path_string(&catalogue)),
         ("OPENCODE_DISABLE_MODELS_FETCH".to_owned(), "1".to_owned()),
+        ("ZUNO_DISABLE_MODELS_FETCH".to_owned(), "1".to_owned()),
         (
             MATRIX_CREDENTIAL_ENV.0.to_owned(),
             MATRIX_CREDENTIAL_ENV.1.to_owned(),
@@ -1603,9 +1605,9 @@ async fn observable_api_state(addr: SocketAddr) -> serde_json::Value {
 /// Both servers report absolute paths that name their own tempdir — the agent
 /// ruleset names the tool-output and plans directories, and `location.directory`
 /// names the served worktree. Those differ *by construction*, so the root and its
-/// final component are tokenized. Nothing else is normalized: this is a substitution
-/// of the harness's own two variables, not a smoother that would make unequal
-/// bodies compare equal.
+/// final component are tokenized. The application-owned data, temp and plan path
+/// leaves are tokenized too because Z-1 deliberately renames those leaves while
+/// preserving the surrounding permission semantics.
 fn normalize_state_paths(value: serde_json::Value, root: &Path) -> serde_json::Value {
     let root = root.to_string_lossy().into_owned();
     let leaf = Path::new(&root)
@@ -1623,6 +1625,16 @@ fn normalize_state_paths(value: serde_json::Value, root: &Path) -> serde_json::V
                 } else {
                     text.replace(&format!("../{leaf}/"), "../<MATRIX_ROOT>/")
                 };
+                let text = [
+                    ("/data/opencode/", "/data/<APP>/"),
+                    ("/data/zuno/", "/data/<APP>/"),
+                    ("/tmp/opencode/", "/tmp/<APP>/"),
+                    ("/tmp/zuno/", "/tmp/<APP>/"),
+                    (".opencode/plans/", ".<APP>/plans/"),
+                    (".zuno/plans/", ".<APP>/plans/"),
+                ]
+                .into_iter()
+                .fold(text, |text, (from, to)| text.replace(from, to));
                 serde_json::Value::String(text)
             }
             serde_json::Value::Array(items) => serde_json::Value::Array(

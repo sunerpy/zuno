@@ -153,10 +153,7 @@ impl Fixture {
         let root = dir.path().canonicalize().expect("canonical root");
         let options = configure(
             WatchOptions::new(&root)
-                .env(
-                    oc_paths::Env::empty()
-                        .with(oc_watch::flags::OPENCODE_EXPERIMENTAL_FILEWATCHER, "true"),
-                )
+                .env(oc_paths::Env::empty().with("ZUNO_EXPERIMENTAL_FILEWATCHER", "true"))
                 .debounce(TEST_DEBOUNCE)
                 .max_wait(Duration::from_secs(30)),
         );
@@ -561,9 +558,7 @@ fn gitignored_paths_are_suppressed_when_gitignore_is_enabled() {
     fs::create_dir(root.join("keep")).expect("mkdir");
 
     let options = WatchOptions::new(&root)
-        .env(
-            oc_paths::Env::empty().with(oc_watch::flags::OPENCODE_EXPERIMENTAL_FILEWATCHER, "true"),
-        )
+        .env(oc_paths::Env::empty().with("ZUNO_EXPERIMENTAL_FILEWATCHER", "true"))
         .debounce(TEST_DEBOUNCE)
         .max_wait(Duration::from_secs(30))
         .gitignore(true);
@@ -603,11 +598,8 @@ fn the_disable_flag_yields_a_watcher_that_reports_nothing() {
     let root = dir.path().canonicalize().expect("canonical root");
     let options = WatchOptions::new(&root).env(
         oc_paths::Env::empty()
-            .with(oc_watch::flags::OPENCODE_EXPERIMENTAL_FILEWATCHER, "true")
-            .with(
-                oc_watch::flags::OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER,
-                "true",
-            ),
+            .with("ZUNO_EXPERIMENTAL_FILEWATCHER", "true")
+            .with("ZUNO_EXPERIMENTAL_DISABLE_FILEWATCHER", "true"),
     );
     let (watcher, mut stream) = Watcher::start(options).expect("a disabled watch is not an error");
     assert_eq!(

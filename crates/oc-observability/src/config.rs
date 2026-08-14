@@ -41,11 +41,11 @@ use tracing::level_filters::LevelFilter;
 
 /// The environment variable naming the minimum level, set by the CLI's
 /// `--log-level` (`packages/opencode/src/index.ts:68`).
-pub const ENV_LOG_LEVEL: &str = "OPENCODE_LOG_LEVEL";
+pub const ENV_LOG_LEVEL: &str = "ZUNO_LOG_LEVEL";
 
 /// The environment variable enabling the additional terminal sink, set to exactly
 /// `"1"` by the CLI's `--print-logs` (`packages/opencode/src/index.ts:67`).
-pub const ENV_PRINT_LOGS: &str = "OPENCODE_PRINT_LOGS";
+pub const ENV_PRINT_LOGS: &str = "ZUNO_PRINT_LOGS";
 
 /// The only value of [`ENV_PRINT_LOGS`] the oracle treats as enabled.
 pub const PRINT_LOGS_ENABLED: &str = "1";

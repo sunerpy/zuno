@@ -208,8 +208,8 @@ impl Transport {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
-            .env("OPENCODE_PLUGIN_NAME", &spec.name)
-            .env("OPENCODE_PLUGIN_PROTOCOL_VERSION", PROTOCOL_VERSION)
+            .env("ZUNO_PLUGIN_NAME", &spec.name)
+            .env("ZUNO_PLUGIN_PROTOCOL_VERSION", PROTOCOL_VERSION)
             .envs(&spec.environment);
         if let Some(cwd) = &spec.cwd {
             command.current_dir(cwd);

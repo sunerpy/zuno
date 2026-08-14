@@ -116,16 +116,17 @@ fn config(configured: Option<&str>, aaa_base_url: &str, zzz_base_url: &str) -> S
 }
 
 fn variables(env: &ScriptedEnv, config: String) -> BTreeMap<String, String> {
-    let mut variables = env.env_vars();
+    let mut variables = env
+        .env_vars()
+        .into_iter()
+        .map(|(key, value)| (oc_paths::env::accepted_env_name(&key).to_owned(), value))
+        .collect::<BTreeMap<_, _>>();
     variables.extend([
         ("NO_COLOR".to_owned(), "1".to_owned()),
         ("TERM".to_owned(), "xterm-256color".to_owned()),
-        ("OPENCODE_PURE".to_owned(), "1".to_owned()),
-        ("OPENCODE_AUTH_CONTENT".to_owned(), "{}".to_owned()),
-        (
-            "OPENCODE_DISABLE_MODELS_FETCH".to_owned(),
-            "true".to_owned(),
-        ),
+        ("ZUNO_PURE".to_owned(), "1".to_owned()),
+        ("ZUNO_AUTH_CONTENT".to_owned(), "{}".to_owned()),
+        ("ZUNO_DISABLE_MODELS_FETCH".to_owned(), "true".to_owned()),
         ("OPENCODE_CONFIG_CONTENT".to_owned(), config),
     ]);
     variables

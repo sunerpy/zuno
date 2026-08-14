@@ -22,7 +22,7 @@ Created 2026-08-14, at the user's direction:
 | Fact | Count | Where |
 |---|---:|---|
 | Source files mentioning `opencode` | **181** | `crates/*/src/` |
-| Distinct `OPENCODE_*` environment variables | **68** | `crates/*/src/` |
+| Distinct `OPENCODE_*` environment variables | **72** | `crates/*/src/` |
 | Crates in the workspace | **36** | `crates/` |
 | `runs-on: ubuntu-latest` jobs in CI | **4** | `.github/workflows/ci.yml` (210 lines) |
 | `runs-on` entries in release | **5** | `.github/workflows/release.yml` (418 lines) |
@@ -50,7 +50,9 @@ FU-8A  provider surface  ─────────┘
 
 ---
 
-## Z-1. Own the configuration and data directories **[decision required first]**
+## Z-1. Own the configuration and data directories
+
+**Status: CLOSED (2026-08-14)** — Zuno-only config/data/project directories are implemented with no migration, dual-read, or fallback; 66 project-owned environment names moved to `ZUNO_*`, the six measured plugin ABI names remain `OPENCODE_*`, matrix and mutation tests pin the hard cut, and a single real non-`--pure` run discovered the copied Zuno configuration and plugins before the selected Bedrock endpoint returned HTTP 404.
 
 **This is the one genuinely breaking change in the set**, and I will not guess at it.
 
@@ -97,7 +99,7 @@ literals plus the tests that pin them.
 - **`.omo/fixtures/` and the compat suite** may reference `opencode` config paths. The oracle is the
   released `opencode` binary and **its** paths must not be renamed; only *this* project's paths move.
   Confirm that distinction test by test rather than by global replace.
-- **The 68 environment variables** are a separate decision from the directories — see below. A hard
+- **The 72 environment variables** are a separate decision from the directories — see below. A hard
   cut on directories does not automatically imply a hard cut on variable names.
 
 ### Environment variables: hard cut too, with one exception to verify
@@ -109,26 +111,28 @@ to rename. `OPENCODE_CONFIG_CONTENT` and `OPENCODE_AUTH_CONTENT` are used by thi
 tests, which is fine to rename. But if any of the three installed plugins reads an `OPENCODE_*`
 variable from the host environment, renaming it breaks that plugin regardless of release status.
 
-**Established empirically, so this is settled rather than open.** Grepping the three installed
-plugin bundles under `/config/.bun/install/cache/` and intersecting with the 68 variables this
-project uses:
+**Established empirically, so this is settled rather than open.** The original
+`/config/.bun/install/cache/` measurement used stale manifests
+(`oh-my-openagent@4.10.0`, `opencode-antigravity-auth@1.2.8`) and is retained only as historical
+context. The decision was re-measured against the exact loaded bundles under
+`/config/.cache/opencode/packages/`: `@sunerpy/oh-my-openagent@4.21.0`,
+`opencode-antigravity-auth@1.6.0`, and `@sunerpy/opencode-kiro-auth@0.20.6`.
 
-- Plugins read **35** host-contract `OPENCODE_*` variables (excluding their own
-  `OPENCODE_ANTIGRAVITY_*` / `KIRO` / `OMO` namespaces, which are theirs, not ours).
-- This project uses **68**.
-- **The intersection is exactly 8**, and these are the ones a rename would break:
+- The loaded bundle union contains **30** `OPENCODE_*` names; the bundle-local counts are 25 for
+  OMO, 7 for Antigravity, and 0 for Kiro. Antigravity's own namespace is not a host ABI.
+- This project uses **72**.
+- **The intersection is exactly 6**, and these are the ones a rename would break:
 
 ```
-OPENCODE_CLIENT              OPENCODE_CONFIG_CONTENT      OPENCODE_SERVER_PASSWORD
-OPENCODE_CONFIG              OPENCODE_CONFIG_DIR          OPENCODE_SERVER_USERNAME
-OPENCODE_DISABLE_CLAUDE_CODE OPENCODE_VERSION
+OPENCODE_CLIENT              OPENCODE_CONFIG_CONTENT      OPENCODE_CONFIG_DIR
+OPENCODE_DISABLE_CLAUDE_CODE OPENCODE_SERVER_PASSWORD     OPENCODE_SERVER_USERNAME
 ```
 
-`oh-my-openagent@4.21.0` alone reads 28 host variables; `opencode-antigravity-auth@1.6.0` reads 9;
-`kiro-provider@0.3.0` reads none outside its own namespace.
+`OPENCODE_CONFIG` and `OPENCODE_VERSION` were artifacts of the stale measurement and are not in the
+loaded-bundle intersection.
 
-**So the rule is precise: those 8 keep their `OPENCODE_*` spelling as a documented plugin-facing
-contract. The other 60 become `ZUNO_*` with no fallback.** Do not treat the 8 as an oversight to be
+**So the rule is precise: those 6 keep their `OPENCODE_*` spelling as a documented plugin-facing
+contract. The other 66 become `ZUNO_*` with no fallback.** Do not treat the 6 as an oversight to be
 cleaned up later — they are the ABI the JS plugin tier speaks, and this project deliberately keeps
 that tier for the three real installed plugins.
 

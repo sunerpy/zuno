@@ -112,7 +112,8 @@ impl ConfigFixture {
             .xdg_config()
             .join(CONFIG_BASENAME)
             .join("opencode.json");
-        self.place(ConfigLayer::Global, path, contents)
+        let zuno = self.env.xdg_config().join("zuno").join("opencode.json");
+        self.place_with_zuno_mirror(ConfigLayer::Global, path, zuno, contents)
     }
 
     /// Write `$XDG_CONFIG_HOME/opencode/opencode.jsonc`.
@@ -126,7 +127,8 @@ impl ConfigFixture {
             .xdg_config()
             .join(CONFIG_BASENAME)
             .join("opencode.jsonc");
-        self.place(ConfigLayer::Global, path, contents)
+        let zuno = self.env.xdg_config().join("zuno").join("opencode.jsonc");
+        self.place_with_zuno_mirror(ConfigLayer::Global, path, zuno, contents)
     }
 
     /// Write `$HOME/.opencode/opencode.json`.
@@ -136,7 +138,8 @@ impl ConfigFixture {
     /// [`TestkitError::Io`] when the file cannot be written.
     pub fn home_dot_opencode(self, contents: &str) -> Result<Self> {
         let path = self.env.home().join(".opencode").join("opencode.json");
-        self.place(ConfigLayer::HomeDotOpencode, path, contents)
+        let zuno = self.env.home().join(".zuno").join("opencode.json");
+        self.place_with_zuno_mirror(ConfigLayer::HomeDotOpencode, path, zuno, contents)
     }
 
     /// Write `<project>/<relative>/opencode.json`.
@@ -173,7 +176,13 @@ impl ConfigFixture {
             .join(relative)
             .join(".opencode")
             .join("opencode.json");
-        self.place(ConfigLayer::ProjectDotOpencode, path, contents)
+        let zuno = self
+            .env
+            .project()
+            .join(relative)
+            .join(".zuno")
+            .join("opencode.json");
+        self.place_with_zuno_mirror(ConfigLayer::ProjectDotOpencode, path, zuno, contents)
     }
 
     /// Write an arbitrary file under `<project>/<relative>`.
@@ -326,6 +335,23 @@ impl ConfigFixture {
         self.layers.push(PlacedLayer {
             layer,
             path: Some(path),
+            contents: contents.to_owned(),
+        });
+        Ok(self)
+    }
+
+    fn place_with_zuno_mirror(
+        mut self,
+        layer: ConfigLayer,
+        oracle_path: PathBuf,
+        zuno_path: PathBuf,
+        contents: &str,
+    ) -> Result<Self> {
+        write_file(&oracle_path, contents)?;
+        write_file(&zuno_path, contents)?;
+        self.layers.push(PlacedLayer {
+            layer,
+            path: Some(oracle_path),
             contents: contents.to_owned(),
         });
         Ok(self)

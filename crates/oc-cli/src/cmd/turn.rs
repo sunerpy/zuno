@@ -167,7 +167,7 @@ impl TurnPlan {
             &directory,
             worktree.as_deref().unwrap_or(directory.as_path()),
             &layout,
-            env.flag(crate::OPENCODE_PURE),
+            env.flag(crate::ZUNO_PURE),
             super::plugin_runtime::PluginRuntimeTarget::server("turn"),
         )
         .await
@@ -295,7 +295,7 @@ impl TurnPlan {
             &self.directory,
             worktree,
             &layout,
-            env.flag(crate::OPENCODE_PURE),
+            env.flag(crate::ZUNO_PURE),
             super::plugin_runtime::PluginRuntimeTarget::tui("tui"),
         )
         .await
@@ -1056,7 +1056,7 @@ fn select_model<'a>(
         // Nothing was requested, so there is no model to name — but "no available
         // model" alone would let a forbidden fetch read as "you configured nothing".
         message.push_str(&format!(
-            ", or allow the catalog to load: OPENCODE_DISABLE_MODELS_FETCH is set, so \
+            ", or allow the catalog to load: ZUNO_DISABLE_MODELS_FETCH is set, so \
              `{origin}` was not contacted and no cached catalog exists at `{}`",
             cache.display()
         ));

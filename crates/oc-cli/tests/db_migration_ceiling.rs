@@ -24,10 +24,10 @@ fn run_db(root: &Path, database: &Path, query: &str) -> Output {
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_CACHE_HOME", root.join("cache"))
         .env("XDG_STATE_HOME", root.join("state"))
-        .env("OPENCODE_DB", database)
-        .env("OPENCODE_DISABLE_AUTOUPDATE", "true")
-        .env("OPENCODE_DISABLE_MODELS_FETCH", "true")
-        .env("OPENCODE_DISABLE_DEFAULT_PLUGINS", "true");
+        .env("ZUNO_DB", database)
+        .env("ZUNO_DISABLE_AUTOUPDATE", "true")
+        .env("ZUNO_DISABLE_MODELS_FETCH", "true")
+        .env("ZUNO_DISABLE_DEFAULT_PLUGINS", "true");
     command.output().expect("run the production db command")
 }
 

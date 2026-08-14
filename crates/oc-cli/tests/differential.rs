@@ -24,7 +24,7 @@ fn rust_binary() -> Command {
     Command::new(env!("CARGO_BIN_EXE_opencode-rust"))
 }
 
-fn isolated(command: &mut Command, root: &Path) {
+fn isolated_base(command: &mut Command, root: &Path) {
     command
         .env("NO_COLOR", "1")
         .env("TERM", "dumb")
@@ -32,17 +32,39 @@ fn isolated(command: &mut Command, root: &Path) {
         .env("XDG_DATA_HOME", root.join("data"))
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_CACHE_HOME", root.join("cache"))
-        .env("XDG_STATE_HOME", root.join("state"))
+        .env("XDG_STATE_HOME", root.join("state"));
+}
+
+fn isolated_oracle(command: &mut Command, root: &Path) {
+    isolated_base(command, root);
+    command
         .env("OPENCODE_DISABLE_AUTOUPDATE", "true")
         .env("OPENCODE_DISABLE_MODELS_FETCH", "true")
         .env("OPENCODE_DISABLE_DEFAULT_PLUGINS", "true")
         .env("OPENCODE_DISABLE_LSP_DOWNLOAD", "true");
 }
 
+fn isolated_subject(command: &mut Command, root: &Path) {
+    isolated_base(command, root);
+    command
+        .env("ZUNO_DISABLE_AUTOUPDATE", "true")
+        .env("ZUNO_DISABLE_MODELS_FETCH", "true")
+        .env("ZUNO_DISABLE_DEFAULT_PLUGINS", "true")
+        .env("ZUNO_DISABLE_LSP_DOWNLOAD", "true");
+}
+
+fn isolated_for_binary(command: &mut Command, binary: &Path, root: &Path) {
+    if binary == rust_path() {
+        isolated_subject(command, root);
+    } else {
+        isolated_oracle(command, root);
+    }
+}
+
 fn run(binary: &Path, args: &[&str], root: &Path) -> Output {
     let mut command = Command::new(binary);
     command.args(args);
-    isolated(&mut command, root);
+    isolated_for_binary(&mut command, binary, root);
     command.output().expect("run CLI")
 }
 
@@ -54,9 +76,15 @@ fn models_fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../oc-llm/tests/fixtures/models-dev-pinned.json")
 }
 
-fn configure_models(command: &mut Command) {
+fn configure_oracle_models(command: &mut Command) {
     command
         .env("OPENCODE_MODELS_PATH", models_fixture())
+        .env("OPENCODE_CONFIG_CONTENT", r#"{"provider":{"anyapi":{}}}"#);
+}
+
+fn configure_subject_models(command: &mut Command) {
+    command
+        .env("ZUNO_MODELS_PATH", models_fixture())
         .env("OPENCODE_CONFIG_CONTENT", r#"{"provider":{"anyapi":{}}}"#);
 }
 
@@ -235,7 +263,7 @@ fn db_query_does_not_need_sqlite3_or_any_other_path_binary() {
     command
         .args(["db", "SELECT 1 AS answer", "--format", "json"])
         .env("PATH", "");
-    isolated(&mut command, root.path());
+    isolated_subject(&mut command, root.path());
     let output = command.output().expect("run db with stripped PATH");
     assert!(
         output.status.success(),
@@ -254,13 +282,13 @@ fn models_listing_and_provider_filter_match_oracle() {
         let root = tempfile::tempdir().expect("tempdir");
         let mut oracle = Command::new(oracle());
         oracle.args(args);
-        isolated(&mut oracle, root.path());
-        configure_models(&mut oracle);
+        isolated_oracle(&mut oracle, root.path());
+        configure_oracle_models(&mut oracle);
 
         let mut actual = rust_binary();
         actual.args(args);
-        isolated(&mut actual, root.path());
-        configure_models(&mut actual);
+        isolated_subject(&mut actual, root.path());
+        configure_subject_models(&mut actual);
 
         let oracle = oracle.output().expect("run oracle models");
         let actual = actual.output().expect("run Rust models");
@@ -283,8 +311,8 @@ fn models_verbose_uses_the_upstream_field_names_and_order() {
     let root = tempfile::tempdir().expect("tempdir");
     let mut command = rust_binary();
     command.args(["models", "anyapi", "--verbose"]);
-    isolated(&mut command, root.path());
-    configure_models(&mut command);
+    isolated_subject(&mut command, root.path());
+    configure_subject_models(&mut command);
     let output = command.output().expect("run verbose models");
     assert!(
         output.status.success(),
@@ -327,8 +355,8 @@ fn models_reports_an_unknown_provider_like_the_oracle() {
     let root = tempfile::tempdir().expect("tempdir");
     let mut command = rust_binary();
     command.args(["models", "missing"]);
-    isolated(&mut command, root.path());
-    configure_models(&mut command);
+    isolated_subject(&mut command, root.path());
+    configure_subject_models(&mut command);
     let output = command.output().expect("run missing provider");
     assert!(!output.status.success());
     assert_eq!(
@@ -340,7 +368,7 @@ fn models_reports_an_unknown_provider_like_the_oracle() {
 #[test]
 fn providers_list_and_logout_use_the_shared_auth_store() {
     let root = tempfile::tempdir().expect("tempdir");
-    let auth_path = root.path().join("data/opencode/auth.json");
+    let auth_path = root.path().join("data/zuno/auth.json");
     std::fs::create_dir_all(auth_path.parent().expect("auth parent")).expect("create auth parent");
     std::fs::write(
         &auth_path,
@@ -350,8 +378,8 @@ fn providers_list_and_logout_use_the_shared_auth_store() {
 
     let mut list = rust_binary();
     list.args(["providers", "list"]);
-    isolated(&mut list, root.path());
-    configure_models(&mut list);
+    isolated_subject(&mut list, root.path());
+    configure_subject_models(&mut list);
     let listed = list.output().expect("list providers");
     assert!(
         listed.status.success(),
@@ -369,8 +397,8 @@ fn providers_list_and_logout_use_the_shared_auth_store() {
 
     let mut logout = rust_binary();
     logout.args(["providers", "logout", "AnyAPI"]);
-    isolated(&mut logout, root.path());
-    configure_models(&mut logout);
+    isolated_subject(&mut logout, root.path());
+    configure_subject_models(&mut logout);
     let removed = logout.output().expect("logout provider");
     assert!(
         removed.status.success(),
@@ -388,8 +416,8 @@ fn providers_headless_login_reads_the_key_from_stdin() {
     let root = tempfile::tempdir().expect("tempdir");
     let mut command = rust_binary();
     command.args(["providers", "login", "--provider", "AnyAPI"]);
-    isolated(&mut command, root.path());
-    configure_models(&mut command);
+    isolated_subject(&mut command, root.path());
+    configure_subject_models(&mut command);
     command.stdin(Stdio::piped());
     let mut child = command.spawn().expect("spawn provider login");
     use std::io::Write as _;
@@ -406,7 +434,7 @@ fn providers_headless_login_reads_the_key_from_stdin() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let auth_path = root.path().join("data/opencode/auth.json");
+    let auth_path = root.path().join("data/zuno/auth.json");
     let auth: serde_json::Value =
         serde_json::from_slice(&std::fs::read(auth_path).expect("read auth")).expect("auth JSON");
     assert_eq!(auth["anyapi"]["type"], "api");
@@ -426,7 +454,7 @@ fn mcp_add_list_and_logout_persist_headless_state() {
         "--header",
         "Authorization=Bearer test",
     ]);
-    isolated(&mut add, root.path());
+    isolated_subject(&mut add, root.path());
     let added = add.output().expect("add MCP server");
     assert!(
         added.status.success(),
@@ -434,7 +462,7 @@ fn mcp_add_list_and_logout_persist_headless_state() {
         String::from_utf8_lossy(&added.stderr)
     );
 
-    let config_path = root.path().join("config/opencode/opencode.json");
+    let config_path = root.path().join("config/zuno/opencode.json");
     let config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&config_path).expect("read generated config"))
             .expect("config JSON");
@@ -447,7 +475,7 @@ fn mcp_add_list_and_logout_persist_headless_state() {
 
     let mut list = rust_binary();
     list.args(["mcp", "list"]);
-    isolated(&mut list, root.path());
+    isolated_subject(&mut list, root.path());
     let listed = list.output().expect("list MCP servers");
     assert!(
         listed.status.success(),
@@ -458,7 +486,7 @@ fn mcp_add_list_and_logout_persist_headless_state() {
     assert!(stdout.contains("docs not initialized"), "{stdout}");
     assert!(stdout.contains("https://example.com/mcp"), "{stdout}");
 
-    let auth_path = root.path().join("data/opencode/mcp-auth.json");
+    let auth_path = root.path().join("data/zuno/mcp-auth.json");
     std::fs::create_dir_all(auth_path.parent().expect("MCP auth parent"))
         .expect("create MCP auth parent");
     std::fs::write(
@@ -469,7 +497,7 @@ fn mcp_add_list_and_logout_persist_headless_state() {
 
     let mut auth_list = rust_binary();
     auth_list.args(["mcp", "auth", "list"]);
-    isolated(&mut auth_list, root.path());
+    isolated_subject(&mut auth_list, root.path());
     let auth_listed = auth_list.output().expect("list MCP auth");
     assert!(
         auth_listed.status.success(),
@@ -483,7 +511,7 @@ fn mcp_add_list_and_logout_persist_headless_state() {
 
     let mut logout = rust_binary();
     logout.args(["mcp", "logout", "docs"]);
-    isolated(&mut logout, root.path());
+    isolated_subject(&mut logout, root.path());
     let logged_out = logout.output().expect("logout MCP");
     assert!(
         logged_out.status.success(),
@@ -511,7 +539,11 @@ fn debug_paths_matches_oracle_exactly() {
         "{}",
         String::from_utf8_lossy(&actual.stderr)
     );
-    assert_eq!(actual.stdout, oracle.stdout);
+    let expected = String::from_utf8(oracle.stdout)
+        .expect("oracle paths are UTF-8")
+        .replace("/opencode", "/zuno")
+        .into_bytes();
+    assert_eq!(actual.stdout, expected);
 }
 
 #[test]
@@ -519,7 +551,7 @@ fn debug_config_emits_only_resolved_json() {
     let root = tempfile::tempdir().expect("tempdir");
     let mut command = rust_binary();
     command.args(["debug", "config"]);
-    isolated(&mut command, root.path());
+    isolated_subject(&mut command, root.path());
     command.env(
         "OPENCODE_CONFIG_CONTENT",
         r#"{"username":"debug-user","share":"disabled","plugin":["probe-plugin@1.0.0"]}"#,
@@ -548,7 +580,7 @@ fn debug_config_emits_only_resolved_json() {
 #[test]
 fn debug_config_includes_runtime_markdown_agents_and_commands() {
     let root = tempfile::tempdir().expect("tempdir");
-    let config_dir = root.path().join("config/opencode");
+    let config_dir = root.path().join("config/zuno");
     let agent_file = config_dir.join("agent/powerapps/runtime-agent.md");
     let command_file = config_dir.join("command/runtime-command.md");
     std::fs::create_dir_all(agent_file.parent().expect("agent parent")).expect("agent directory");
@@ -567,8 +599,8 @@ fn debug_config_includes_runtime_markdown_agents_and_commands() {
 
     let mut command = rust_binary();
     command.args(["debug", "config"]);
-    isolated(&mut command, root.path());
-    command.env("OPENCODE_PURE", "1");
+    isolated_subject(&mut command, root.path());
+    command.env("ZUNO_PURE", "1");
     let output = command.output().expect("debug config");
     assert!(
         output.status.success(),
@@ -593,6 +625,7 @@ fn criterion_2_pure_debug_config_matches_the_released_binary() {
         .join("../..")
         .canonicalize()
         .expect("workspace root");
+    let root = tempfile::tempdir().expect("isolated root");
     let run = |binary: &Path| {
         let stdout = tempfile::NamedTempFile::new().expect("stdout capture");
         let stderr = tempfile::NamedTempFile::new().expect("stderr capture");
@@ -600,11 +633,17 @@ fn criterion_2_pure_debug_config_matches_the_released_binary() {
         command
             .args(["debug", "config"])
             .current_dir(&workspace)
-            .env("OPENCODE_PURE", "1")
-            .env("OPENCODE_DISABLE_AUTOUPDATE", "true")
-            .env("OPENCODE_DISABLE_MODELS_FETCH", "true")
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("USER", "user")
             .stdout(stdout.reopen().expect("reopen stdout"))
             .stderr(stderr.reopen().expect("reopen stderr"));
+        isolated_for_binary(&mut command, binary, root.path());
+        if binary == rust_path() {
+            command.env("ZUNO_PURE", "1");
+        } else {
+            command.env("OPENCODE_PURE", "1");
+        }
         let status = command.status().expect("debug config");
         let stdout = std::fs::read(stdout.path()).expect("read stdout");
         let stderr = std::fs::read(stderr.path()).expect("read stderr");
@@ -775,7 +814,7 @@ fn spawn_oracle_server(root: &Path, database: &Path, port: u16) -> Option<Child>
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    isolated(&mut command, root);
+    isolated_oracle(&mut command, root);
     command.env("OPENCODE_DB", database);
     let mut child = command.spawn().expect("spawn the oracle server");
 
@@ -906,8 +945,8 @@ fn dechunk(reader: &mut BufReader<&mut std::net::TcpStream>, target: &str) -> St
 fn rust_listing(root: &Path, database: &Path, args: &[&str]) -> serde_json::Value {
     let mut command = rust_binary();
     command.args(args);
-    isolated(&mut command, root);
-    command.env("OPENCODE_DB", database);
+    isolated_subject(&mut command, root);
+    command.env("ZUNO_DB", database);
     let output = command.output().expect("run the Rust session listing");
     assert!(
         output.status.success(),
@@ -1198,8 +1237,12 @@ fn export_document(
 ) -> serde_json::Value {
     let mut command = Command::new(binary);
     command.args(args);
-    isolated(&mut command, root);
-    command.env("OPENCODE_DB", database);
+    isolated_for_binary(&mut command, binary, root);
+    if binary == rust_path() {
+        command.env("ZUNO_DB", database);
+    } else {
+        command.env("OPENCODE_DB", database);
+    }
     let output = command.output().expect("run export");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -1224,7 +1267,7 @@ fn export_document(
 #[test]
 fn export_matches_the_oracle_on_one_seeded_session() {
     let root = tempfile::tempdir().expect("tempdir");
-    let database = root.path().join("data").join("opencode").join("export.db");
+    let database = root.path().join("data").join("zuno").join("export.db");
     seed_export_database(&database);
 
     let actual = export_document(
@@ -1284,7 +1327,7 @@ fn export_sanitize_matches_the_oracle_on_one_seeded_session() {
         return;
     };
     let root = tempfile::tempdir().expect("tempdir");
-    let database = root.path().join("data").join("opencode").join("export.db");
+    let database = root.path().join("data").join("zuno").join("export.db");
     seed_export_database(&database);
 
     let actual = export_document(
@@ -1315,7 +1358,7 @@ fn export_sanitize_matches_the_oracle_on_one_seeded_session() {
 #[test]
 fn export_then_import_restores_the_session_into_another_database() {
     let root = tempfile::tempdir().expect("tempdir");
-    let source = root.path().join("data").join("opencode").join("source.db");
+    let source = root.path().join("data").join("zuno").join("source.db");
     seed_export_database(&source);
     let exported = export_document(
         &rust_path(),
@@ -1331,11 +1374,11 @@ fn export_then_import_restores_the_session_into_another_database() {
     )
     .expect("write the export");
 
-    let target = root.path().join("data").join("opencode").join("target.db");
+    let target = root.path().join("data").join("zuno").join("target.db");
     let mut command = rust_binary();
     command.args(["import", &file.to_string_lossy()]);
-    isolated(&mut command, root.path());
-    command.env("OPENCODE_DB", &target).current_dir(root.path());
+    isolated_subject(&mut command, root.path());
+    command.env("ZUNO_DB", &target).current_dir(root.path());
     let output = command.output().expect("run import");
     assert!(
         output.status.success(),
@@ -1407,14 +1450,14 @@ fn export_without_a_session_id_explains_the_interactive_selection() {
 #[test]
 fn export_reports_an_unknown_session_the_way_the_oracle_does() {
     let root = tempfile::tempdir().expect("tempdir");
-    let database = root.path().join("data").join("opencode").join("export.db");
+    let database = root.path().join("data").join("zuno").join("export.db");
     seed_export_database(&database);
     let missing = "ses_diffexport0000000000000000zz";
 
     let mut command = rust_binary();
     command.args(["export", missing]);
-    isolated(&mut command, root.path());
-    command.env("OPENCODE_DB", &database);
+    isolated_subject(&mut command, root.path());
+    command.env("ZUNO_DB", &database);
     let output = command.output().expect("run export");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1429,7 +1472,7 @@ fn import_reports_a_missing_file_the_way_the_oracle_does() {
     let root = tempfile::tempdir().expect("tempdir");
     let mut command = rust_binary();
     command.args(["import", "/definitely/absent/export.json"]);
-    isolated(&mut command, root.path());
+    isolated_subject(&mut command, root.path());
     command.current_dir(root.path());
     let output = command.output().expect("run import");
     assert!(!output.status.success());

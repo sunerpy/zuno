@@ -4,10 +4,10 @@
 //! ```text
 //! directories(directory, worktree) = unique([
 //!   Global.Path.config,
-//!   ...(!OPENCODE_DISABLE_PROJECT_CONFIG
-//!         ? up({ targets: [".opencode"], start: directory, stop: worktree })
+//!   ...(!ZUNO_DISABLE_PROJECT_CONFIG
+//!         ? up({ targets: [".zuno"], start: directory, stop: worktree })
 //!         : []),
-//!   ...up({ targets: [".opencode"], start: home, stop: home }),
+//!   ...up({ targets: [".zuno"], start: home, stop: home }),
 //!   ...(OPENCODE_CONFIG_DIR ? [OPENCODE_CONFIG_DIR] : []),
 //! ])
 //!
@@ -21,14 +21,14 @@
 //! config merging. Two properties in particular:
 //!
 //! - `directories` runs **global first, then project directories nearest-first,
-//!   then `$HOME/.opencode`, then `OPENCODE_CONFIG_DIR`** — the walk is *not*
+//!   then `$HOME/.zuno`, then `OPENCODE_CONFIG_DIR`** — the walk is *not*
 //!   reversed here.
 //! - `files` **is** reversed, so the outermost file comes first and the deepest
 //!   last. Because [`crate::walk::up`] probes `.jsonc` before `.json` per
 //!   directory, reversing makes `.json` precede `.jsonc` within one directory.
 //!
 //! `unique` is first-occurrence-wins, which matters when the global config
-//! directory is itself on the walk (`$HOME/.config/opencode` inside a repository
+//! directory is itself on the walk (`$HOME/.config/zuno` inside a repository
 //! checked out under `$HOME/.config`, for instance): it keeps its leading
 //! position rather than being pulled deeper.
 
@@ -40,7 +40,7 @@ use crate::node_path;
 use crate::walk;
 
 /// The per-project configuration directory name.
-pub const PROJECT_CONFIG_DIRECTORY: &str = ".opencode";
+pub const PROJECT_CONFIG_DIRECTORY: &str = ".zuno";
 
 impl Layout {
     /// Port of `ConfigPaths.directories`.
@@ -113,7 +113,7 @@ fn unique(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use crate::env::{
-        Env, HOME, OPENCODE_CONFIG_DIR, OPENCODE_DISABLE_PROJECT_CONFIG, XDG_CONFIG_HOME,
+        Env, HOME, OPENCODE_CONFIG_DIR, XDG_CONFIG_HOME, ZUNO_DISABLE_PROJECT_CONFIG,
     };
     use std::fs;
 
@@ -122,18 +122,18 @@ mod tests {
     }
 
     impl Fixture {
-        /// A worktree at `<root>/repo` with `.opencode` at the worktree root, at
-        /// `repo/a`, and at `repo/a/b/c`, plus a `$HOME/.opencode` and config
+        /// A worktree at `<root>/repo` with `.zuno` at the worktree root, at
+        /// `repo/a`, and at `repo/a/b/c`, plus a `$HOME/.zuno` and config
         /// files at two depths.
         fn new() -> Self {
             let root = tempfile::tempdir().expect("tempdir");
             let path = root.path();
             for directory in [
-                "repo/.opencode",
-                "repo/a/.opencode",
-                "repo/a/b/c/.opencode",
-                "home/.opencode",
-                "xdgconfig/opencode",
+                "repo/.zuno",
+                "repo/a/.zuno",
+                "repo/a/b/c/.zuno",
+                "home/.zuno",
+                "xdgconfig/zuno",
             ] {
                 fs::create_dir_all(path.join(directory)).expect("create directory");
             }
@@ -161,6 +161,52 @@ mod tests {
         }
     }
 
+    fn project_marker_membership(old_present: bool, new_present: bool) -> (bool, bool) {
+        let root = tempfile::tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        let current = repo.join("nested");
+        let home = root.path().join("home");
+        let xdg_config = root.path().join("xdg-config");
+        for directory in [&current, &home, &xdg_config] {
+            fs::create_dir_all(directory).expect("create fixture directory");
+        }
+        if old_present {
+            fs::create_dir_all(repo.join(".opencode")).expect("create old project config");
+        }
+        if new_present {
+            fs::create_dir_all(repo.join(".zuno")).expect("create Zuno project config");
+        }
+
+        let env = Env::empty()
+            .with(HOME, home.to_string_lossy().into_owned())
+            .with(XDG_CONFIG_HOME, xdg_config.to_string_lossy().into_owned());
+        let found = Layout::resolve_with(&env, None).config_directories(&current, Some(&repo));
+        (
+            found.contains(&repo.join(".opencode")),
+            found.contains(&repo.join(".zuno")),
+        )
+    }
+
+    #[test]
+    fn zuno_path_matrix_ignores_an_old_only_project_directory() {
+        assert_eq!(project_marker_membership(true, false), (false, false));
+    }
+
+    #[test]
+    fn zuno_path_matrix_discovers_a_new_only_project_directory() {
+        assert_eq!(project_marker_membership(false, true), (false, true));
+    }
+
+    #[test]
+    fn zuno_path_matrix_uses_only_new_when_both_project_directories_exist() {
+        assert_eq!(project_marker_membership(true, true), (false, true));
+    }
+
+    #[test]
+    fn zuno_path_matrix_adds_no_project_directory_when_neither_exists() {
+        assert_eq!(project_marker_membership(false, false), (false, false));
+    }
+
     #[test]
     fn directories_run_global_then_nearest_project_then_home_then_override() {
         let fixture = Fixture::new();
@@ -170,11 +216,11 @@ mod tests {
         assert_eq!(
             found,
             vec![
-                fixture.path("xdgconfig/opencode"),
-                fixture.path("repo/a/b/c/.opencode"),
-                fixture.path("repo/a/.opencode"),
-                fixture.path("repo/.opencode"),
-                fixture.path("home/.opencode"),
+                fixture.path("xdgconfig/zuno"),
+                fixture.path("repo/a/b/c/.zuno"),
+                fixture.path("repo/a/.zuno"),
+                fixture.path("repo/.zuno"),
+                fixture.path("home/.zuno"),
             ]
         );
     }
@@ -188,27 +234,24 @@ mod tests {
         assert_eq!(
             bounded,
             vec![
-                fixture.path("xdgconfig/opencode"),
-                fixture.path("repo/a/b/c/.opencode"),
-                fixture.path("repo/a/.opencode"),
-                fixture.path("home/.opencode"),
+                fixture.path("xdgconfig/zuno"),
+                fixture.path("repo/a/b/c/.zuno"),
+                fixture.path("repo/a/.zuno"),
+                fixture.path("home/.zuno"),
             ]
         );
-        assert!(!bounded.contains(&fixture.path("repo/.opencode")));
+        assert!(!bounded.contains(&fixture.path("repo/.zuno")));
     }
 
     #[test]
     fn disabling_project_config_drops_only_the_project_walk() {
         let fixture = Fixture::new();
-        let layout = fixture.layout(&[(OPENCODE_DISABLE_PROJECT_CONFIG, "1")]);
+        let layout = fixture.layout(&[(ZUNO_DISABLE_PROJECT_CONFIG, "1")]);
         let found =
             layout.config_directories(&fixture.path("repo/a/b/c"), Some(&fixture.path("repo")));
         assert_eq!(
             found,
-            vec![
-                fixture.path("xdgconfig/opencode"),
-                fixture.path("home/.opencode")
-            ]
+            vec![fixture.path("xdgconfig/zuno"), fixture.path("home/.zuno")]
         );
     }
 
@@ -231,7 +274,7 @@ mod tests {
     #[test]
     fn a_duplicate_override_keeps_its_first_position() {
         let fixture = Fixture::new();
-        let global = fixture.path("xdgconfig/opencode");
+        let global = fixture.path("xdgconfig/zuno");
         let layout = fixture.layout(&[(OPENCODE_CONFIG_DIR, global.to_str().expect("utf8"))]);
         let found = layout.config_directories(&fixture.path("repo"), Some(&fixture.path("repo")));
         assert_eq!(found.first(), Some(&global));
@@ -239,15 +282,15 @@ mod tests {
     }
 
     /// The home probe is a single directory, never a walk to the root — so a
-    /// `.opencode` in a parent of `$HOME` is not picked up.
+    /// `.zuno` in a parent of `$HOME` is not picked up.
     #[test]
     fn the_home_probe_does_not_walk_above_home() {
         let fixture = Fixture::new();
-        fs::create_dir_all(fixture.path(".opencode")).expect("create sibling-of-home marker");
+        fs::create_dir_all(fixture.path(".zuno")).expect("create sibling-of-home marker");
         let layout = fixture.layout(&[]);
         let found = layout.config_directories(&fixture.path("repo"), Some(&fixture.path("repo")));
-        assert!(found.contains(&fixture.path("home/.opencode")));
-        assert!(!found.contains(&fixture.path(".opencode")));
+        assert!(found.contains(&fixture.path("home/.zuno")));
+        assert!(!found.contains(&fixture.path(".zuno")));
     }
 
     #[test]

@@ -654,10 +654,10 @@ mod tests {
         );
     }
 
-    // -- OPENCODE_AUTH_CONTENT ---------------------------------------------
+    // -- ZUNO_AUTH_CONTENT -------------------------------------------------
 
     fn env(value: &str) -> Env {
-        Env::empty().with(OPENCODE_AUTH_CONTENT, value)
+        Env::empty().with("ZUNO_AUTH_CONTENT", value)
     }
 
     #[test]

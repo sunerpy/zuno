@@ -209,7 +209,7 @@ mod tests {
     #[test]
     fn project_path_is_worktree_relative() {
         let path = Scope::Project.path(Path::new("/srv/repo"));
-        assert_eq!(path, Path::new("/srv/repo/.opencode/RULES.md"));
+        assert_eq!(path, Path::new("/srv/repo/.zuno/RULES.md"));
     }
 
     #[test]

@@ -184,7 +184,8 @@ impl ExposureFlags {
     /// Reads the flags from the process environment.
     #[must_use]
     pub fn from_env() -> Self {
-        Self::from_lookup(|key| std::env::var(key).ok())
+        let env = oc_paths::Env::from_process();
+        Self::from_lookup(|key| env.value(key).map(str::to_owned))
     }
 
     /// Reads the flags through a caller-supplied lookup, for tests and for a host

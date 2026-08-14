@@ -3,16 +3,12 @@
 //!
 //! # What this crate promises
 //!
-//! A user must be able to switch between the TypeScript `opencode` binary and
-//! this one and back, keeping the same config files, the same session database,
-//! the same credentials and the same snapshots. That promise is decided entirely
-//! by the paths below, so every one of them is a port of a specific oracle line
-//! rather than a reasonable-looking layout. Pinned to `opencode` **1.18.13**
-//! (`aefaf140c1`), differentially verified against the installed **1.18.12**
-//! binary.
+//! Zuno owns its configuration and data directories. The layout deliberately
+//! does not read or write OpenCode directories; oracle compatibility remains in
+//! dedicated fixtures rather than in production path resolution.
 //!
 //! ```text
-//! $XDG_DATA_HOME/opencode          data()
+//! $XDG_DATA_HOME/zuno              data()
 //!   ├── auth.json                  auth_file()
 //!   ├── mcp-auth.json              mcp_auth_file()
 //!   ├── opencode.db                db_path()          (release channels)
@@ -22,12 +18,12 @@
 //!   ├── snapshot/                  snapshot_root()
 //!   │   └── <projectID>/<sha1(worktree)>/   snapshot_store()
 //!   └── tool-output/               tool_output()
-//! $XDG_CACHE_HOME/opencode         cache()
+//! $XDG_CACHE_HOME/zuno             cache()
 //!   ├── bin/                       bin()
 //!   └── models.json                models_cache()
-//! $XDG_CONFIG_HOME/opencode        config()
-//! $XDG_STATE_HOME/opencode         state()
-//! <os.tmpdir()>/opencode           temp()
+//! $XDG_CONFIG_HOME/zuno            config()
+//! $XDG_STATE_HOME/zuno             state()
+//! <os.tmpdir()>/zuno               temp()
 //! ```
 //!
 //! # Two rules, and why they are not negotiable
@@ -41,7 +37,7 @@
 //!
 //! **Joining is Node's, not Rust's.** `path.join` normalizes; `PathBuf::push`
 //! concatenates. With `XDG_DATA_HOME=/tmp/x/../y` the oracle reports
-//! `/tmp/y/opencode` and a `PathBuf::join` would report `/tmp/x/../y/opencode`
+//! `/tmp/y/zuno` and a `PathBuf::join` would report `/tmp/x/../y/zuno`
 //! — a different directory as far as a string-keyed database row is concerned.
 //! See [`node_path`].
 //!
@@ -65,8 +61,8 @@
 //!
 //! let env = Env::empty().with(HOME, "/home/u").with(XDG_DATA_HOME, "/srv/data");
 //! let layout = Layout::resolve_with(&env, None);
-//! assert_eq!(layout.data(), Path::new("/srv/data/opencode"));
-//! assert_eq!(layout.log(), Path::new("/srv/data/opencode/log"));
+//! assert_eq!(layout.data(), Path::new("/srv/data/zuno"));
+//! assert_eq!(layout.log(), Path::new("/srv/data/zuno/log"));
 //! ```
 
 pub mod config_chain;
@@ -108,28 +104,28 @@ pub fn home() -> &'static Path {
     global().home()
 }
 
-/// `Global.Path.data` — `$XDG_DATA_HOME/opencode`.
+/// `Global.Path.data` — `$XDG_DATA_HOME/zuno`.
 pub fn data() -> &'static Path {
     global().data()
 }
 
-/// `Global.Path.cache` — `$XDG_CACHE_HOME/opencode`.
+/// `Global.Path.cache` — `$XDG_CACHE_HOME/zuno`.
 pub fn cache() -> &'static Path {
     global().cache()
 }
 
-/// `Global.Path.config` — `$XDG_CONFIG_HOME/opencode`, before any
+/// `Global.Path.config` — `$XDG_CONFIG_HOME/zuno`, before any
 /// `OPENCODE_CONFIG_DIR` override.
 pub fn config() -> &'static Path {
     global().config()
 }
 
-/// `Global.Path.state` — `$XDG_STATE_HOME/opencode`.
+/// `Global.Path.state` — `$XDG_STATE_HOME/zuno`.
 pub fn state() -> &'static Path {
     global().state()
 }
 
-/// `Global.Path.tmp` — `<os.tmpdir()>/opencode`.
+/// `Global.Path.tmp` — `<os.tmpdir()>/zuno`.
 pub fn temp() -> &'static Path {
     global().temp()
 }
@@ -191,7 +187,7 @@ pub fn models_cache() -> PathBuf {
     global().models_cache()
 }
 
-/// Where the session database lives, honouring `OPENCODE_DB`.
+/// Where the session database lives, honouring `ZUNO_DB`.
 #[must_use]
 pub fn db_path() -> DbLocation {
     global().db_path()
@@ -281,8 +277,8 @@ mod tests {
 
     #[test]
     fn re_exports_are_reachable() {
-        assert_eq!(APP, "opencode");
-        assert_eq!(PROJECT_CONFIG_DIRECTORY, ".opencode");
+        assert_eq!(APP, "zuno");
+        assert_eq!(PROJECT_CONFIG_DIRECTORY, ".zuno");
         assert_eq!(GLOBAL_PROJECT_ID, "global");
         assert_eq!(AUTH_FILE, "auth.json");
         assert_eq!(MCP_AUTH_FILE, "mcp-auth.json");
