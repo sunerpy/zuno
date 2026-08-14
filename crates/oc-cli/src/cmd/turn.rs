@@ -45,6 +45,7 @@ use oc_engine::prelude::{
 };
 use oc_error::ProviderError;
 use oc_llm::cache::{DynamicContext, McpToolStatus};
+use oc_llm::catalog::resolved::ModelEndpoint;
 use oc_llm::catalog::{Catalog, CatalogProvenance, CatalogSource, ResolveInput};
 use oc_llm::event::StreamEvent;
 use oc_llm::registry::{ApiSurface, Provider, ProviderRegistry, Spec};
@@ -1339,17 +1340,37 @@ fn provider_endpoint(
     provider: Option<&oc_llm::catalog::ResolvedProvider>,
     model: &oc_llm::catalog::ResolvedModel,
 ) -> Option<String> {
-    provider
+    provider_option_endpoint(provider)
         .into_iter()
-        .flat_map(|provider| {
-            ENDPOINT_OPTIONS
-                .into_iter()
-                .filter_map(|key| provider.options.get(key))
-        })
         .filter_map(serde_json::Value::as_str)
         .map(str::to_owned)
         .chain(std::iter::once(model.api.url.clone()))
         .find(|url| !url.is_empty())
+}
+
+fn provider_option_endpoint(
+    provider: Option<&oc_llm::catalog::ResolvedProvider>,
+) -> Option<&serde_json::Value> {
+    let provider = provider?;
+    ENDPOINT_OPTIONS.iter().find_map(|key| {
+        provider
+            .options
+            .get(*key)
+            .filter(|value| value.as_str().is_some_and(|url| !url.is_empty()))
+    })
+}
+
+fn openai_surface(
+    provider: Option<&oc_llm::catalog::ResolvedProvider>,
+    model: &oc_llm::catalog::ResolvedModel,
+) -> ApiSurface {
+    match model.api.endpoint {
+        Some(ModelEndpoint::Chat) => ApiSurface::Chat,
+        Some(ModelEndpoint::Responses) => ApiSurface::Responses,
+        Some(ModelEndpoint::Messages) => ApiSurface::Messages,
+        None if provider_option_endpoint(provider).is_some() => ApiSurface::Chat,
+        None => ApiSurface::Default,
+    }
 }
 
 /// Substitute every `${VAR}` in a chosen base URL from the resolved environment.
@@ -1441,10 +1462,17 @@ fn model_spec(
     env: &oc_paths::Env,
 ) -> Result<Spec, String> {
     let provider = catalog.provider(&model.provider_id);
-    let factory_key = provider_factory_key(&model.provider_id, &model.api.npm)
-        .ok_or_else(|| format!("unsupported provider transport `{}`", model.api.npm))?;
+    let custom_openai =
+        model.api.npm == "@ai-sdk/openai" && provider_option_endpoint(provider).is_some();
+    let factory_key = if custom_openai {
+        COMPATIBLE_PROVIDER
+    } else {
+        provider_factory_key(&model.provider_id, &model.api.npm)
+            .ok_or_else(|| format!("unsupported provider transport `{}`", model.api.npm))?
+    };
     let surface = match model.api.npm.as_str() {
         "@ai-sdk/anthropic" | "@ai-sdk/google-vertex/anthropic" => ApiSurface::Messages,
+        "@ai-sdk/openai" => openai_surface(provider, model),
         "@ai-sdk/openai-compatible" | "@openrouter/ai-sdk-provider" => ApiSurface::Chat,
         _ => ApiSurface::Default,
     };
@@ -1496,7 +1524,11 @@ fn model_spec(
         // carry it across this boundary rather than making the family guess.
         spec = spec.with_option(
             oc_provider_compatible::family::NPM_OPTION,
-            json!(model.api.npm),
+            json!(if custom_openai {
+                oc_provider_compatible::family::OPENAI_COMPATIBLE_NPM
+            } else {
+                model.api.npm.as_str()
+            }),
         );
         if let Some(endpoint) = model.api.endpoint {
             spec = spec.with_option(
