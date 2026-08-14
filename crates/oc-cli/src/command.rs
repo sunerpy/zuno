@@ -68,8 +68,8 @@ pub struct GlobalOptions {
 /// The root command parser.
 #[derive(Debug, Clone, Parser)]
 #[command(
-    name = "opencode-rust",
-    about = "A Rust reimplementation of the OpenCode agent",
+    name = "zuno",
+    about = "Zuno, a Rust port of the OpenCode agent",
     disable_version_flag = true,
     subcommand_precedence_over_arg = true
 )]
@@ -948,6 +948,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn zuno_binary_name_is_pinned_in_manifest() {
+        let manifest = include_str!("../Cargo.toml");
+        let binary = manifest
+            .split_once("[[bin]]")
+            .map(|(_, binary)| binary)
+            .expect("oc-cli must declare its executable explicitly");
+        let binary = binary
+            .split_once("[dependencies]")
+            .map_or(binary, |(binary, _)| binary);
+
+        assert!(
+            binary.lines().any(|line| line.trim() == "name = \"zuno\""),
+            "the shipped executable must be named `zuno`; reverting the binary rename is a user-facing regression"
+        );
+    }
+
+    #[test]
     fn all_registered_headless_commands_reach_the_dispatch_seam() {
         for args in [
             &["run"][..],
@@ -969,9 +986,8 @@ mod tests {
             // than relaxing the requirement.
             &["import", "exported.json"],
         ] {
-            let cli =
-                Cli::try_parse_from(std::iter::once("opencode-rust").chain(args.iter().copied()))
-                    .expect("registered command");
+            let cli = Cli::try_parse_from(std::iter::once("zuno").chain(args.iter().copied()))
+                .expect("registered command");
             let action = cli.action(&Env::empty());
             assert!(matches!(action, Action::Dispatch(_)), "{}", args[0]);
         }
@@ -981,7 +997,7 @@ mod tests {
     fn a_bare_invocation_dispatches_the_tui_like_upstreams_default_command() {
         // Upstream registers the TUI as `$0`, so a bare invocation must reach the
         // same handler as `tui` rather than explain that no command was given.
-        let cli = Cli::try_parse_from(["opencode-rust"]).expect("a bare invocation parses");
+        let cli = Cli::try_parse_from(["zuno"]).expect("a bare invocation parses");
         let Action::Dispatch(request) = cli.action(&Env::empty()) else {
             panic!("a bare invocation must dispatch");
         };
@@ -1001,7 +1017,7 @@ mod tests {
             "uninstall",
             "generate",
         ] {
-            let cli = Cli::try_parse_from(["opencode-rust", name]).expect("rejected command");
+            let cli = Cli::try_parse_from(["zuno", name]).expect("rejected command");
             let action = cli.action(&Env::empty());
             assert!(
                 matches!(action, Action::Rejected { command, .. } if command == name),
@@ -1013,8 +1029,8 @@ mod tests {
     #[test]
     fn global_options_parse_before_and_after_a_command() {
         for args in [
-            vec!["opencode-rust", "--print-logs", "--pure", "run"],
-            vec!["opencode-rust", "run", "--print-logs", "--pure"],
+            vec!["zuno", "--print-logs", "--pure", "run"],
+            vec!["zuno", "run", "--print-logs", "--pure"],
         ] {
             let cli = Cli::try_parse_from(args).expect("global flags");
             assert!(cli.print_logs);
@@ -1025,16 +1041,16 @@ mod tests {
     #[test]
     fn log_level_accepts_only_the_four_upstream_spellings() {
         for level in ["DEBUG", "INFO", "WARN", "ERROR"] {
-            let cli = Cli::try_parse_from(["opencode-rust", "--log-level", level, "run"])
+            let cli = Cli::try_parse_from(["zuno", "--log-level", level, "run"])
                 .expect("upstream log level");
             assert!(cli.log_level.is_some());
         }
-        assert!(Cli::try_parse_from(["opencode-rust", "--log-level", "TRACE", "run"]).is_err());
+        assert!(Cli::try_parse_from(["zuno", "--log-level", "TRACE", "run"]).is_err());
     }
 
     #[test]
     fn session_prune_defaults_to_preview_for_the_current_project() {
-        let cli = Cli::try_parse_from(["opencode-rust", "session", "prune", "--older-than", "90"])
+        let cli = Cli::try_parse_from(["zuno", "session", "prune", "--older-than", "90"])
             .expect("session prune parses");
         let Some(Command::Session(SessionArgs {
             command: Some(SessionCommand::Prune(args)),
@@ -1055,7 +1071,7 @@ mod tests {
     #[test]
     fn session_prune_accepts_the_complete_destructive_shape() {
         let cli = Cli::try_parse_from([
-            "opencode-rust",
+            "zuno",
             "session",
             "prune",
             "--older-than",
@@ -1092,7 +1108,7 @@ mod tests {
     fn session_prune_rejects_conflicting_scopes_and_actions() {
         assert!(
             Cli::try_parse_from([
-                "opencode-rust",
+                "zuno",
                 "session",
                 "prune",
                 "--older-than",
@@ -1105,7 +1121,7 @@ mod tests {
         );
         assert!(
             Cli::try_parse_from([
-                "opencode-rust",
+                "zuno",
                 "session",
                 "prune",
                 "--older-than",
@@ -1116,15 +1132,8 @@ mod tests {
             .is_err()
         );
         assert!(
-            Cli::try_parse_from([
-                "opencode-rust",
-                "session",
-                "prune",
-                "--older-than",
-                "90",
-                "--yes",
-            ])
-            .is_err()
+            Cli::try_parse_from(["zuno", "session", "prune", "--older-than", "90", "--yes",])
+                .is_err()
         );
     }
 }

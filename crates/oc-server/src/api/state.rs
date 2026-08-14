@@ -42,10 +42,8 @@ impl ApiState {
     /// Returns the classified database failure when opening or seeding fails.
     pub fn memory(directory: impl Into<String>) -> Result<Self, DbError> {
         let directory = directory.into();
-        let artifact_root = std::env::temp_dir().join(format!(
-            "opencode-rust-api-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let artifact_root =
+            std::env::temp_dir().join(format!("zuno-api-{}", uuid::Uuid::new_v4().simple()));
         Self::initialize(
             Pool::open(&DbLocation::Memory)?,
             directory,

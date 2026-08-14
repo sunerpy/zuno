@@ -442,7 +442,7 @@ mod tests {
             "Add servers with: <BIN> mcp add"
         );
         assert_eq!(
-            mask_program_name("Add servers with: opencode-rust mcp add", "opencode-rust").as_ref(),
+            mask_program_name("Add servers with: zuno mcp add", "zuno").as_ref(),
             "Add servers with: <BIN> mcp add"
         );
         // The data directory is not the program name.
@@ -520,7 +520,7 @@ mod tests {
         let subject = "Exporting session: ses_x\nSession not found: ses_x\n";
         assert_eq!(
             normalize_cli_stream(oracle, "opencode"),
-            normalize_cli_stream(subject, "opencode-rust")
+            normalize_cli_stream(subject, "zuno")
         );
 
         for wrong in [
@@ -532,7 +532,7 @@ mod tests {
         ] {
             assert_ne!(
                 normalize_cli_stream(oracle, "opencode"),
-                normalize_cli_stream(wrong, "opencode-rust"),
+                normalize_cli_stream(wrong, "zuno"),
                 "the pipeline erased a real difference in {wrong:?}"
             );
         }
@@ -544,7 +544,7 @@ mod tests {
     fn carriage_returns_are_not_forgiven() {
         assert_ne!(
             normalize_cli_stream("done\n", "opencode"),
-            normalize_cli_stream("done\r\n", "opencode-rust")
+            normalize_cli_stream("done\r\n", "zuno")
         );
     }
 }

@@ -27,7 +27,7 @@ pub struct Divergence {
 pub struct DiffReport {
     /// What the left side is, e.g. `oracle(installed-binary, reports 1.18.12)`.
     pub left_label: String,
-    /// What the right side is, e.g. `subject(opencode-rust 0.1.0)`.
+    /// What the right side is, e.g. `subject(zuno 0.1.0)`.
     pub right_label: String,
     /// Every difference that survived normalization.
     pub divergences: Vec<Divergence>,
@@ -375,13 +375,13 @@ mod tests {
         let r = diff_normalized(
             "oracle(installed-binary, reports 1.18.12)",
             "x",
-            "subject(opencode-rust 0.1.0)",
+            "subject(zuno 0.1.0)",
             "y",
             &Normalizer::none(),
         );
         let rendered = r.render();
         assert!(rendered.contains("reports 1.18.12"), "{rendered}");
-        assert!(rendered.contains("opencode-rust 0.1.0"), "{rendered}");
+        assert!(rendered.contains("zuno 0.1.0"), "{rendered}");
     }
 
     #[test]

@@ -1,18 +1,18 @@
-# opencode-rust
+# Zuno
 
 A Rust port of [`opencode`](https://github.com/sst/opencode), pinned to
 compatibility baseline **1.18.13**.
 
-`opencode-rust --version` reports `1.18.13`. That is deliberate and it is not the
+`zuno --version` reports `1.18.13`. That is deliberate and it is not the
 build's identity: npm plugins read the running version as a semver range and skip
 themselves when it does not match, so the short version has to be the pinned
 baseline. Ask for the real identity explicitly:
 
 ```console
-$ opencode-rust --version
+$ zuno --version
 1.18.13
-$ opencode-rust --version --long
-opencode-rust 0.1.0 (Rust package 0.1.0; plugin compatibility 1.18.13)
+$ zuno --version --long
+Zuno 0.1.0 (Rust package 0.1.0; plugin compatibility 1.18.13)
 ```
 
 Both identities appear because conflating them would either break plugin loading
@@ -35,20 +35,23 @@ Every table in those pages is generated from the code it describes, and
 `cargo test -p oc-cli --test docs` fails when the code moves and the prose does
 not. Regenerate with `OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs`.
 
-## Running it side by side with the TypeScript binary
+## Running Zuno side by side with the TypeScript binary
 
-Both binaries read the same data directory, so the only thing to get right is
-*which database file* each one opens.
+Zuno uses its own config and data roots. It does not fall back to the TypeScript
+binary's directories because the project made a pre-release hard cut. To opt in
+to a one-time local copy for testing, run:
 
 ```sh
-# 1. Back up first. Migration is forward-only.
-cp "$XDG_DATA_HOME/opencode/opencode.db" "$XDG_DATA_HOME/opencode/opencode.db.backup"
+mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/zuno" "${XDG_DATA_HOME:-$HOME/.local/share}/zuno" && cp -a "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/." "${XDG_CONFIG_HOME:-$HOME/.config}/zuno/" && cp -a "${XDG_DATA_HOME:-$HOME/.local/share}/opencode/." "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/"
 
-# 2. Read-only sanity check: does this binary see your data?
-opencode-rust debug paths
-OPENCODE_DISABLE_CHANNEL_DB=1 opencode-rust session list
+# Back up the copied database before a forward-only migration.
+cp "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/opencode.db" "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/opencode.db.backup"
 
-# 3. Same question, other binary, same environment.
+# Read-only sanity check: does Zuno see the copied data?
+zuno debug paths
+ZUNO_DISABLE_CHANNEL_DB=1 zuno session list
+
+# The TypeScript binary remains on its original paths.
 opencode session list
 ```
 
@@ -64,8 +67,8 @@ There is no uninstall command and no self-updater; both are deliberately
 # Stop using this binary. The TypeScript one is untouched.
 opencode
 
-# If you migrated a legacy database and want the exact prior bytes back:
-cp "$XDG_DATA_HOME/opencode/opencode.db.backup" "$XDG_DATA_HOME/opencode/opencode.db"
+# If you migrated the copied database and want its exact prior bytes back:
+cp "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/opencode.db.backup" "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/opencode.db"
 ```
 
 The released binary can keep using a database this port has migrated: a
@@ -81,8 +84,8 @@ is not optional.
 **1. The database filename differs, and it looks like data loss.** A build from
 source resolves `opencode-local.db`; an installed release resolves `opencode.db`.
 Same rule in both implementations — a channel define, not a divergence — but the
-symptom is an empty session list. Use `OPENCODE_DISABLE_CHANNEL_DB=1` or point
-`OPENCODE_DB` at the file you mean. Details and the full precedence order:
+symptom is an empty session list. Use `ZUNO_DISABLE_CHANNEL_DB=1` or point
+`ZUNO_DB` at the file you mean. Details and the full precedence order:
 [docs/migration.md](docs/migration.md#the-channel-database).
 
 **2. Event subscriptions use SSE.** `/api/event` immediately emits

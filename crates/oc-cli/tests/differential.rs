@@ -21,7 +21,7 @@ fn oracle() -> &'static Path {
 }
 
 fn rust_binary() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_opencode-rust"))
+    Command::new(env!("CARGO_BIN_EXE_zuno"))
 }
 
 fn isolated_base(command: &mut Command, root: &Path) {
@@ -69,7 +69,7 @@ fn run(binary: &Path, args: &[&str], root: &Path) -> Output {
 }
 
 fn rust_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_opencode-rust"))
+    PathBuf::from(env!("CARGO_BIN_EXE_zuno"))
 }
 
 fn models_fixture() -> PathBuf {

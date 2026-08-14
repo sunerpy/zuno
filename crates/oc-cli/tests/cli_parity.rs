@@ -76,7 +76,7 @@ const NO_ORACLE: &str = "no opencode on PATH and no OC_TESTKIT_ORACLE override";
 /// The name each side is invoked by, for `oc_testkit::mask_program_name`.
 const ORACLE_PROGRAM: &str = "opencode";
 /// The name this port is invoked by.
-const SUBJECT_PROGRAM: &str = "opencode-rust";
+const SUBJECT_PROGRAM: &str = "zuno";
 
 /// The pinned catalogue two `models` probes need, so the roster is a fixture
 /// rather than whatever this machine cached — and so the oracle answers without a
@@ -595,7 +595,7 @@ fn run_oracle(probe: &Probe, busy_port: u16) -> SideOutcome {
 }
 
 fn run_subject(probe: &Probe, busy_port: u16) -> SideOutcome {
-    let subject = Subject::at(env!("CARGO_BIN_EXE_opencode-rust"))
+    let subject = Subject::at(env!("CARGO_BIN_EXE_zuno"))
         .expect("the shipped binary must exist")
         .with_env(subject_world(probe.env));
     let outcome = subject
@@ -1271,7 +1271,7 @@ fn the_non_vcs_plan_glob_difference_is_live() {
     let oracle_out = oracle.run(["agent", "list"]).expect("oracle agent list");
 
     let subject_env = ScriptedEnv::new().expect("scripted env");
-    let subject = Subject::at(env!("CARGO_BIN_EXE_opencode-rust"))
+    let subject = Subject::at(env!("CARGO_BIN_EXE_zuno"))
         .expect("shipped binary")
         .with_env(subject_env.set("NO_COLOR", "1").set("TERM", "dumb"));
     let subject_out = subject.run(["agent", "list"]).expect("subject agent list");
@@ -1403,7 +1403,7 @@ fn the_session_list_output_shape_difference_is_live() {
         false,
     );
     let subject_json = shared_run(
-        Path::new(env!("CARGO_BIN_EXE_opencode-rust")),
+        Path::new(env!("CARGO_BIN_EXE_zuno")),
         &["session", "list", "--format", "json"],
         root.path(),
         &database,

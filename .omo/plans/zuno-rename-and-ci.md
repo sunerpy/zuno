@@ -154,6 +154,8 @@ working, and a test should pin that.
 
 ## Z-2. Rename to Zuno
 
+**Status: CLOSED (2026-08-14)** — Zuno identity is implemented and verified; the `opencode` executable alias remains open for an explicit user decision, with current no-alias behavior preserved.
+
 **Mechanical, but 181 files and 36 crates deep.** Do it after Z-1 so the directory semantics are
 already settled.
 

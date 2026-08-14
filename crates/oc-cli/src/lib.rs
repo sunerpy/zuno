@@ -92,7 +92,7 @@ fn restart_with_environment(args: &[OsString], environment: &StartupEnvironment)
     let executable = match std::env::current_exe() {
         Ok(path) => path,
         Err(error) => {
-            eprintln!("failed to locate opencode-rust for environment bootstrap: {error}");
+            eprintln!("failed to locate zuno for environment bootstrap: {error}");
             return ExitCode::FAILURE;
         }
     };
@@ -110,7 +110,7 @@ fn restart_with_environment(args: &[OsString], environment: &StartupEnvironment)
         use std::os::unix::process::CommandExt as _;
 
         let error = command.exec();
-        eprintln!("failed to replace opencode-rust with its command process: {error}");
+        eprintln!("failed to replace zuno with its command process: {error}");
         ExitCode::FAILURE
     }
 
@@ -118,7 +118,7 @@ fn restart_with_environment(args: &[OsString], environment: &StartupEnvironment)
     match command.status() {
         Ok(status) => exit_code(status.code().unwrap_or(1)),
         Err(error) => {
-            eprintln!("failed to start opencode-rust command process: {error}");
+            eprintln!("failed to start zuno command process: {error}");
             ExitCode::FAILURE
         }
     }

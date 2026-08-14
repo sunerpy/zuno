@@ -6,7 +6,7 @@
 //!
 //! # Why these live next to `oc-cli` and not in a shell script
 //!
-//! `opencode-rust` is built from this crate, so "what is in the artifact" is a
+//! `zuno` is built from this crate, so "what is in the artifact" is a
 //! question about this crate's dependency graph. Putting the answer in a
 //! `#[test]` means `cargo test` alone enforces it, with no separate gate to
 //! remember and no second CI step that can be dropped.

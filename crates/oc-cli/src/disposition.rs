@@ -87,7 +87,7 @@ const COMMAND_DISPOSITIONS: [CommandDisposition; 23] = [
         upstream_symbol: "GithubCommand",
         command: "github",
         disposition: Disposition::Rejected,
-        reason: "the hosted GitHub agent is outside the local-agent scope; run `opencode-rust run` from the CI workflow instead",
+        reason: "the hosted GitHub agent is outside the local-agent scope; run `zuno run` from the CI workflow instead",
     },
     CommandDisposition {
         upstream_symbol: "ImportCommand",
@@ -117,7 +117,7 @@ const COMMAND_DISPOSITIONS: [CommandDisposition; 23] = [
         upstream_symbol: "PrCommand",
         command: "pr",
         disposition: Disposition::Rejected,
-        reason: "the GitHub checkout helper is excluded from the local-agent runtime; use `gh pr checkout <number>` and then `opencode-rust run` instead",
+        reason: "the GitHub checkout helper is excluded from the local-agent runtime; use `gh pr checkout <number>` and then `zuno run` instead",
     },
     CommandDisposition {
         upstream_symbol: "ProvidersCommand",
@@ -159,7 +159,7 @@ const COMMAND_DISPOSITIONS: [CommandDisposition; 23] = [
         upstream_symbol: "UninstallCommand",
         command: "uninstall",
         disposition: Disposition::Rejected,
-        reason: "self-uninstallation is excluded from the runtime; remove `opencode-rust` with the package manager or installer that placed it",
+        reason: "self-uninstallation is excluded from the runtime; remove `zuno` with the package manager or installer that placed it",
     },
     CommandDisposition {
         upstream_symbol: "UpgradeCommand",

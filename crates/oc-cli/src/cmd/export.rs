@@ -9,7 +9,7 @@
 //!
 //! `export` prints the JSON to stdout and its progress line to stderr, matching
 //! `cli/cmd/export.ts:243` and `:289`. That separation is the whole point of the
-//! command: `opencode-rust export ses_… > backup.json` has to produce a file that
+//! command: `zuno export ses_… > backup.json` has to produce a file that
 //! parses, so a status line on stdout would corrupt every backup.
 
 use std::path::Path;

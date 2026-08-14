@@ -7937,3 +7937,25 @@ remain green. A single post-fix non-`--pure` turn with all three configured plug
 - FU-9 merged into main as merge commit 04f64427 (`git merge --no-ff task-fu9`, no conflicts); post-merge gates on main: 3496 passed / 0 failed / 2 ignored, clippy 0 warnings, fmt clean. Worktree oc-wt/fu9 removed and branch task-fu9 deleted. Not pushed.
 - Z-1 (2026-08-14): hard-cut path/env semantics and both mutation guards passed; the one permitted real non-`--pure` run loaded Zuno config plus plugins but its model returned HTTP 404.
 - Z-1 404 resolved by the orchestrator: the attempt omitted `--model`, so it defaulted to `amazon-bedrock/amazon.nova-2-lite-v1:0`, unreachable from this host — NOT a hard-cut defect, since plugins/agent/model had all resolved by then. Re-running with an explicit reachable model against the Zuno-located config, three plugins active and no `--pure`, returned `Z1-VERIFIED`. Lesson: when a real-turn check fails, separate the layer under test (path discovery) from the layer that happened to fail (model reachability) before recording it as an open issue — the default model is not part of Z-1's contract.
+
+## [2026-08-14] Z-2 — executable and user-facing identity renamed to Zuno
+
+The shipped binary, Clap identity/help, long display version, user agent, plugin host identity,
+diagnostics, release/CI artifact name, testkit subject, and binary-name documentation now use
+`zuno` / `Zuno`. The `oc-*` crate names remain unchanged. `COMPATIBILITY_VERSION` intentionally
+remains `1.18.13` because npm plugins may evaluate `engines.opencode`; the Zuno user agent remains
+distinct from the TypeScript oracle.
+
+The lowercase source inventory has 868 matching lines across 173 files: 759 upstream/oracle, 62
+plugin compatibility, and 47 historical. No unclassified user-facing old binary name remains. The
+21 CLI differential tests stay green. Reverting the manifest binary to `opencode-rust` compiles and
+fails the named `zuno_binary_name_is_pinned_in_manifest` assertion, then restores byte-for-byte.
+
+One required non-pure real turn loaded the configured plugins and returned exactly `Z2-VERIFIED`.
+The detached workspace gate passed 3509/0, all-target Clippy passed with warnings denied, rustfmt is
+clean, and mirrored `lsp_diagnostics` reported zero diagnostics for every changed Rust file.
+
+**Alias remains open.** Current behavior ships only `zuno`; no `opencode` executable alias existed
+before or was added here. Recommendation is to keep no alias because this unreleased hard cut should
+coexist unambiguously with the TypeScript oracle. Adding one requires an explicit packaging choice
+(second binary, symlink, or installer wrapper), not a Clap parser tweak.

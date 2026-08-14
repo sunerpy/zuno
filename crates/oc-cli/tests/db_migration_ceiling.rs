@@ -13,7 +13,7 @@ fn migration_ceiling() -> &'static str {
 }
 
 fn run_db(root: &Path, database: &Path, query: &str) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_opencode-rust"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_zuno"));
     command
         .args(["db", "--format", "json", query])
         .current_dir(root)

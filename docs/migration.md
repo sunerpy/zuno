@@ -1,7 +1,15 @@
-# Migration and side-by-side operation
+# Zuno migration and side-by-side operation
 
-How to point this binary at an existing `opencode` installation's data, what it
-does to that data, and how to get back.
+Zuno reads only its own config and data roots. The project made a pre-release
+hard cut, so it never falls back to an existing `opencode` installation. To make
+a one-time local copy for testing without exposing credentials, run:
+
+```sh
+mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/zuno" "${XDG_DATA_HOME:-$HOME/.local/share}/zuno" && cp -a "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/." "${XDG_CONFIG_HOME:-$HOME/.config}/zuno/" && cp -a "${XDG_DATA_HOME:-$HOME/.local/share}/opencode/." "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/"
+```
+
+This copy is explicit and local. Zuno itself performs no path migration and
+continues to ignore the old roots.
 
 ## The channel database
 
@@ -14,10 +22,10 @@ The filename is chosen by build channel, faithfully reproducing upstream's rule:
 
 | condition | file |
 |---|---|
-| `OPENCODE_DB` is `:memory:` | in memory |
-| `OPENCODE_DB` is an absolute path | that path, verbatim |
-| `OPENCODE_DB` is relative | joined onto the data directory, **not** the working directory |
-| channel is `latest`, `beta`, or `prod`, or `OPENCODE_DISABLE_CHANNEL_DB` is exactly `1` or `true` | `opencode.db` |
+| `ZUNO_DB` is `:memory:` | in memory |
+| `ZUNO_DB` is an absolute path | that path, verbatim |
+| `ZUNO_DB` is relative | joined onto the data directory, **not** the working directory |
+| channel is `latest`, `beta`, or `prod`, or `ZUNO_DISABLE_CHANNEL_DB` is exactly `1` or `true` | `opencode.db` |
 | otherwise | `opencode-<channel>.db` |
 
 A build from source has no channel define, so its channel is `local` and it
@@ -27,14 +35,14 @@ true of the TypeScript source tree as well — it is the same rule, not a diverg
 (`channel-dependent-database-filename`) rather than in
 [divergences.md](divergences.md).
 
-To read the installed release's data from a source build, pick one:
+To read the copied release database from a source build, pick one:
 
 ```sh
-OPENCODE_DISABLE_CHANNEL_DB=1 opencode-rust session list
-OPENCODE_DB="$XDG_DATA_HOME/opencode/opencode.db" opencode-rust session list
+ZUNO_DISABLE_CHANNEL_DB=1 zuno session list
+ZUNO_DB="${XDG_DATA_HOME:-$HOME/.local/share}/zuno/opencode.db" zuno session list
 ```
 
-`OPENCODE_DISABLE_CHANNEL_DB` is matched **case-sensitively** against exactly `1`
+`ZUNO_DISABLE_CHANNEL_DB` is matched **case-sensitively** against exactly `1`
 or `true`. `TRUE`, `yes`, and `on` do nothing —
 `crates/oc-paths/src/files.rs::disable_channel_db_forces_the_unsuffixed_name_case_sensitively`
 pins that.
@@ -42,7 +50,7 @@ pins that.
 Confirm which file you are on before concluding anything:
 
 ```sh
-opencode-rust debug paths
+zuno debug paths
 ```
 
 The session-prune report also warns when it cannot attribute artifacts to the
@@ -82,7 +90,7 @@ database is not empty and has no session table
 Migration is forward-only. There is no downgrade. Copy the file first:
 
 ```sh
-cp "$XDG_DATA_HOME/opencode/opencode.db" "$XDG_DATA_HOME/opencode/opencode.db.backup"
+cp "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/opencode.db" "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/opencode.db.backup"
 ```
 
 The schema this binary reaches is byte-compared against a database the real 1.18.12

@@ -1,6 +1,6 @@
 //! The instrument that proves or disproves this project's compatibility claim.
 //!
-//! `opencode-rust` promises to be a drop-in replacement for `opencode` v1.18.13:
+//! Zuno promises to be a drop-in replacement for `opencode` v1.18.13:
 //! same config, same CLI, same HTTP API, same on-disk state. Ninety-one later
 //! tasks each verify some part of that promise through this crate. If this crate
 //! can be satisfied by wrong code, the promise is unfounded — so every design
@@ -46,7 +46,7 @@
 //! | type | role |
 //! |---|---|
 //! | [`Oracle`] | the real `opencode`, as an installed binary or from the pinned source tree |
-//! | [`Subject`] | this project's `opencode-rust` |
+//! | [`Subject`] | this project's `zuno` binary |
 //! | [`ScriptedEnv`] | the closed world both sides run in: temp `XDG_*`, temp `HOME`, temp `TMPDIR`, explicit `OPENCODE_DB` |
 //! | [`ConfigFixture`] | layered config trees on disk, for a config differential matrix |
 //! | [`diff_normalized`] | the verdict, with provenance and masking in the report |
@@ -185,7 +185,7 @@ mod tests {
         );
         let right = outcome(
             Provenance::Subject {
-                program: PathBuf::from("/t/opencode-rust"),
+                program: PathBuf::from("/t/zuno"),
                 source: crate::run::SubjectSource::ExplicitPath,
                 reported_version: Some("0.1.0".to_owned()),
             },
@@ -196,7 +196,7 @@ mod tests {
         assert!(!report.is_identical(), "the versions differ");
         assert!(rendered.contains("installed-binary"), "{rendered}");
         assert!(rendered.contains("pinned source 1.18.13"), "{rendered}");
-        assert!(rendered.contains("opencode-rust"), "{rendered}");
+        assert!(rendered.contains("zuno"), "{rendered}");
     }
 }
 

@@ -227,7 +227,7 @@ async fn real_auth_plugin_providers_reach_the_plain_models_surface() {
     std::fs::write(&catalog, PINNED_CATALOG).expect("write pinned models catalog");
     let config = serde_json::json!({ "plugin": installed_production_plugin_specs() });
 
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_opencode-rust"));
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_zuno"));
     command
         .arg("models")
         .current_dir(root.path())
@@ -306,7 +306,7 @@ async fn antigravity_auth_loader_zeroes_google_cost_on_the_verbose_models_surfac
         "provider": { "google": {} }
     });
 
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_opencode-rust"));
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_zuno"));
     command
         .args(["models", "google", "--verbose"])
         .current_dir(root.path())
@@ -374,7 +374,7 @@ async fn failing_auth_loader_is_disabled_and_models_lists_models_with_a_diagnost
         "provider": { "test": {} }
     });
 
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_opencode-rust"));
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_zuno"));
     command
         .args(["models", "test"])
         .current_dir(root.path())

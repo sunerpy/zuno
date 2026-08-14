@@ -60,7 +60,7 @@ export default {
 "#;
 
 fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_opencode-rust"))
+    PathBuf::from(env!("CARGO_BIN_EXE_zuno"))
 }
 
 fn provider_config(base_url: &str) -> String {

@@ -687,7 +687,7 @@ impl JsonRpcPlugin {
         let params = serde_json::to_value(InitializeParams {
             protocol_versions: vec![PROTOCOL_VERSION.to_owned()],
             host: HostInfo {
-                name: "opencode-rust".to_owned(),
+                name: "zuno".to_owned(),
                 version: env!("CARGO_PKG_VERSION").to_owned(),
             },
         })

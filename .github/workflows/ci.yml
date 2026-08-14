@@ -33,7 +33,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  BINARY_NAME: opencode-rust
+  BINARY_NAME: zuno
 
 jobs:
   test:

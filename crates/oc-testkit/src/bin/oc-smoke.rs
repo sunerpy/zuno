@@ -2,9 +2,9 @@
 //!
 //! # Why this exists as a binary rather than a `#[test]`
 //!
-//! `crates/oc-cli/tests/tool_turn.rs` already drives the real `opencode-rust`
+//! `crates/oc-cli/tests/tool_turn.rs` already drives the real `zuno` binary
 //! against a cassette-backed provider, and it is the pattern this file follows.
-//! But it finds its subject through `env!("CARGO_BIN_EXE_opencode-rust")`, which
+//! But it finds its subject through `env!("CARGO_BIN_EXE_zuno")`, which
 //! resolves at compile time to the binary cargo just built for the host. That is
 //! exactly the wrong subject for a release gate: the thing we must prove works is
 //! the binary **inside the archive we are about to publish**, after packaging,
@@ -124,7 +124,7 @@ fn parse_arguments() -> Result<Options, String> {
         return Err(format!("{} is not a file", binary.display()));
     }
     // Absolute, because every subprocess runs with `current_dir` set to a scratch
-    // project: a relative `--binary ./target/release/opencode-rust` would resolve
+    // project: a relative `--binary ./target/release/zuno` would resolve
     // against that scratch directory and report a bare "No such file".
     let binary = binary
         .canonicalize()

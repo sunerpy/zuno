@@ -22,7 +22,7 @@
 
 CARGO       := cargo
 CLI_CRATE   := oc-cli
-BINARY_NAME := opencode-rust
+BINARY_NAME := zuno
 TARGET_DIR  := target
 DIST_DIR    := dist
 

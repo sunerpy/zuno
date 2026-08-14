@@ -44,7 +44,7 @@ const CASSETTE: &str = "openai-chat/streams-text";
 const RUN_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_opencode-rust"))
+    PathBuf::from(env!("CARGO_BIN_EXE_zuno"))
 }
 
 /// A config naming one OpenAI-compatible provider pointed at the mock.
@@ -121,7 +121,7 @@ async fn run_prompt(env: &ScriptedEnv, base_url: &str, prompt: &str) -> Output {
     tokio::time::timeout(RUN_TIMEOUT, command.output())
         .await
         .expect("the run must finish inside its budget")
-        .expect("launch opencode-rust run")
+        .expect("launch zuno run")
 }
 
 /// Ask the released binary to list the sessions in `database`.
