@@ -378,6 +378,64 @@ from the offline gate, that a maintainer can run before a release:
   configured provider.
 - No credential, key, or token appears in any test fixture, log, or evidence file.
 
+## FU-9. A plugin tool that collides with a builtin name breaks every turn
+
+**Source**: the orchestrator's hands-on verification of FU-8A, 2026-08-14. FU-8A fixed the surface
+routing correctly — and the very next real turn failed for an entirely different reason, which the
+old 404 had been masking.
+
+### The defect
+
+With this machine's real configuration:
+
+```
+$ opencode-rust run --model myopenai/global.anthropic.claude-haiku-4-5-... "hi"
+unrecoverable provider failure (status=Some(400)): provider `myopenai` returned HTTP 400:
+{"error":{"message":"The tool grep is already defined at toolConfig.tools.10.",
+ "type":"invalid_request_error","code":"bad_request"}}
+```
+
+**The decisive control**: the identical command with `--pure` **succeeds and returns a real answer.**
+So the collision comes from user configuration or plugins, not from the builtin set.
+
+**Located**: `@sunerpy/oh-my-openagent@4.21.0` registers a tool named `grep`, and the builtin registry
+also has `grep`. Both reach the provider request.
+
+### Why the registry does not catch it
+
+`crates/oc-tools/src/registry.rs` **does** guard collisions *among builtins* — `RegistryError::
+DuplicateBuiltin` at `:170`, enforced by a `contains_key` check at `:239`. But the assembly path at
+`:281-286` is a sequence of `tools.extend(...)` calls — config-directory tools, then plugin tools,
+then MCP tools — **with no cross-source name check at all.** A plugin may therefore shadow or
+duplicate a builtin name, and the duplicate is sent to the provider verbatim.
+
+### Why no test caught it
+
+Same root cause as all of FU-8: **no test in the 3495 loads a real plugin set alongside the builtins
+and inspects the outgoing tool list for duplicates.** The plugin tests use fixture plugins with
+distinctive names; the builtin tests do not load plugins.
+
+### The question that must be answered before fixing
+
+**What does upstream 1.18.18 do when a plugin registers a builtin name?** It runs this exact
+configuration successfully, so it either de-duplicates, gives one source precedence, or namespaces
+plugin tools. Establish which, with a file:line citation, and match it. Do not invent a policy —
+precedence here is user-visible: if the plugin's `grep` wins, behaviour changes silently; if the
+builtin wins, the plugin author's tool is silently ignored. Either is defensible, but only one
+matches upstream, and *silently* is what must be avoided in both cases.
+
+### Acceptance criteria (agent-executable)
+
+- A registry-level test assembles builtins plus a plugin declaring a colliding name and asserts the
+  outgoing tool list contains **no duplicate names**.
+- The precedence rule matches upstream, is cited in the evidence, and is pinned by a test.
+- The losing tool's suppression is **observable** — a diagnostic naming the tool and both sources —
+  rather than silent. This project has fixed twenty-four silent defects; this must not become the
+  twenty-fifth.
+- A hands-on run against the real configuration (all three installed plugins active, no `--pure`)
+  completes a turn.
+- Reverting the de-duplication fails the registry test by name.
+
 ## Working rules for whoever picks these up
 
 Carried from the main plan, because each was learned the hard way:
