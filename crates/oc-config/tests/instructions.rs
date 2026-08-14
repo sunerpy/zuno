@@ -127,7 +127,7 @@ mod instructions {
     #[test]
     fn the_global_file_precedes_the_project_chain() {
         let fixture = Fixture::new();
-        let global = fixture.write("home/.config/opencode/AGENTS.md", "global");
+        let global = fixture.write("home/.config/zuno/AGENTS.md", "global");
         let project = fixture.write("repo/AGENTS.md", "project");
 
         let found = Instructions::discover(&fixture.options("repo", Vec::new()));
@@ -154,7 +154,7 @@ mod instructions {
 
         let env = fixture
             .env()
-            .with("OPENCODE_DISABLE_CLAUDE_CODE_PROMPT", "true");
+            .with("ZUNO_DISABLE_CLAUDE_CODE_PROMPT", "true");
         let options = InstructionOptions::new(
             fixture.path("repo"),
             Some(fixture.path("repo")),

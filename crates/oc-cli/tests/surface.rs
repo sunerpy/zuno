@@ -379,11 +379,11 @@ fn probe_binary(argv: &[&str], root: &std::path::Path) -> std::process::Output {
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_CACHE_HOME", root.join("cache"))
         .env("XDG_STATE_HOME", root.join("state"))
-        .env("OPENCODE_DB", root.join("opencode.db"))
-        .env("OPENCODE_DISABLE_AUTOUPDATE", "true")
-        .env("OPENCODE_DISABLE_MODELS_FETCH", "true")
-        .env("OPENCODE_DISABLE_DEFAULT_PLUGINS", "true")
-        .env("OPENCODE_DISABLE_LSP_DOWNLOAD", "true")
+        .env("ZUNO_DB", root.join("opencode.db"))
+        .env("ZUNO_DISABLE_AUTOUPDATE", "true")
+        .env("ZUNO_DISABLE_MODELS_FETCH", "true")
+        .env("ZUNO_DISABLE_DEFAULT_PLUGINS", "true")
+        .env("ZUNO_DISABLE_LSP_DOWNLOAD", "true")
         .output()
         .unwrap_or_else(|error| panic!("{argv:?} must run: {error}"))
 }
@@ -494,10 +494,7 @@ fn surface_failure_scenario_the_binary_prints_a_pending_marker_for_a_stub() {
 fn surface_export_no_longer_reports_a_pending_handler() {
     let output = binary()
         .args(["export", "ses_738026eec17c4c33ba2fe3bfc90d8b01"])
-        .env(
-            "OPENCODE_DB",
-            std::env::temp_dir().join("oc-surface-export.db"),
-        )
+        .env("ZUNO_DB", std::env::temp_dir().join("oc-surface-export.db"))
         .output()
         .expect("run export");
     let stderr = String::from_utf8_lossy(&output.stderr);

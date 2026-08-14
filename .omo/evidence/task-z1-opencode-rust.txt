@@ -1,0 +1,52 @@
+PENDING — Z-1 implementation started 2026-08-14
+
+SCOPE LOCK
+- Authoritative Z-1 lines 53-148 read in full: hard cut, Zuno-only paths, no migration/dual-read/fallback.
+- zuno-strategy.md establishes project directory spelling `.zuno`; global XDG leaf is therefore lower-case `zuno`.
+- zuno-rename-and-ci.md currently ends at line 273 and contains no `## Working rules` heading; this requested section could not be read because it is absent at commit 04f64427.
+- Oracle fixture/compat `opencode` paths remain out of scope and must not be renamed.
+
+CODEGRAPH / PATH BLAST RADIUS
+- codegraph_explore against the sibling worktree reported: no indexed project (expected fallback condition).
+- codegraph_callers against indexed main at the same base found 13 direct callers across oc-paths tests plus oc-catalog agent/command/skill discovery, oc-cli debug/plugin runtime, oc-config discovery, and the free-function wrapper.
+- No codegraph_impact tool is exposed in this session; direct callers were captured before edits and source reads continued from the sibling worktree.
+
+ENVIRONMENT ABI RE-MEASUREMENT (2026-08-14)
+- Project inventory command: `grep -rhoE '\bOPENCODE_[A-Z0-9_]+' crates/ | sort -u`; result: 72 unique `OPENCODE_*` tokens.
+- Configured plugin declarations were read from `/config/.config/opencode/opencode.json` (the file contains comments, so `jq` was not applicable). No configuration values or credentials were copied into this evidence.
+- Exact resolved bundles inspected under `/config/.cache/opencode/packages/`: `opencode-antigravity-auth@1.6.0`, `@sunerpy/opencode-kiro-auth@0.20.6`, and `@sunerpy/oh-my-openagent@4.21.0`.
+- Bundle inventory command shape: `grep -rhoE '\bOPENCODE_[A-Z0-9_]+' <exact-bundle>/dist | sort -u`; antigravity contained 7 names, Kiro 0, and OMO 25; bundle union: 30 unique names.
+- The unversioned `/config/.cache/opencode/node_modules/oh-my-openagent` tree is stale version 4.9.2 and was excluded from the ABI decision.
+- Project/plugin intersection: 6 names — `OPENCODE_CLIENT`, `OPENCODE_CONFIG_CONTENT`, `OPENCODE_CONFIG_DIR`, `OPENCODE_DISABLE_CLAUDE_CODE`, `OPENCODE_SERVER_PASSWORD`, `OPENCODE_SERVER_USERNAME`.
+- Decision: preserve those six plugin-read names exactly; rename every other project-owned `OPENCODE_*` input/output to `ZUNO_*` without fallback, using one auditable mapping. `OPENCODE_CONFIG_DIR` remains accepted and overrides the new Zuno default directory.
+
+DRIFT RECHECK AND ABI PROOF (2026-08-14)
+- Drift 1 command: `grep -rhoE '\bOPENCODE_[A-Z0-9_]+' crates/ | sort -u | wc -l`; result: 72, correcting the plan's 68.
+- Drift 2 version command: `node -e 'for (const p of process.argv.slice(1)) { const j=require(p); console.log(`${j.name}@${j.version}`) }' <manifest...>` over the two trees used by the plan's `/config/.bun/install/cache/` measurement reported `oh-my-openagent@4.10.0` and `opencode-antigravity-auth@1.2.8`; those trees are stale relative to the configured plugins. Running the same command over the actually loaded package manifests under `/config/.cache/opencode/packages/` reported `@sunerpy/oh-my-openagent@4.21.0`, `opencode-antigravity-auth@1.6.0`, and `@sunerpy/opencode-kiro-auth@0.20.6`.
+- Loaded-bundle host-contract command: `{ grep -rhoE '\bOPENCODE_[A-Z0-9_]+' <the three exact loaded package dist directories> || true; } | grep -vE '^OPENCODE_ANTIGRAVITY_' | sort -u | wc -l`; result: 30. The namespace filter removes the Antigravity plugin's own variables rather than host ABI names.
+- Drift 3 intersection command: `comm -12 <(grep -rhoE '\bOPENCODE_[A-Z0-9_]+' crates/ | sort -u) <({ grep -rhoE '\bOPENCODE_[A-Z0-9_]+' <the three exact loaded package dist directories> || true; } | sort -u)`; result: exactly 6 names: `OPENCODE_CLIENT`, `OPENCODE_CONFIG_CONTENT`, `OPENCODE_CONFIG_DIR`, `OPENCODE_DISABLE_CLAUDE_CODE`, `OPENCODE_SERVER_PASSWORD`, `OPENCODE_SERVER_USERNAME`. This corrects the plan's 8; `OPENCODE_CONFIG` and `OPENCODE_VERSION` are not in the measured intersection.
+- Code guard: `crates/oc-paths/src/env.rs` defines `PLUGIN_ABI_ENV_NAMES: [&str; 6]` with exactly the same six names and tests that only their `OPENCODE_*` spellings remain accepted.
+
+DIRECTORY MATRIX AND OVERRIDE PROOF (2026-08-14)
+- Command: `CARGO_TARGET_DIR=/tmp/opencode/z1 cargo test -p oc-paths zuno_path_matrix_ --offline -- --nocapture`; result: 4 passed / 0 failed. Named states: `zuno_path_matrix_ignores_an_old_only_project_directory` (only-old -> not found), `zuno_path_matrix_discovers_a_new_only_project_directory` (only-new -> found), `zuno_path_matrix_uses_only_new_when_both_project_directories_exist` (both -> new wins), and `zuno_path_matrix_adds_no_project_directory_when_neither_exists` (neither -> not found). The only-old assertion explicitly expects neither old nor new marker in the discovered chain.
+- Command: `CARGO_TARGET_DIR=/tmp/opencode/z1 cargo test -p oc-paths layout::tests::config_override_is_nullish_and_does_not_move_config --offline -- --exact --nocapture`; result: 1 passed / 0 failed. It proves `OPENCODE_CONFIG_DIR=/tmp/mycfg` keeps the default at `/config/.config/zuno` while `effective_config()` resolves to `/tmp/mycfg`; unset falls back to the Zuno default.
+
+HANDS-ON QA CONFIG COPY (2026-08-14)
+- Documented and executed one-liner: `install -d -m 700 "$HOME/.config/zuno" "$HOME/.local/share/zuno" && install -m 600 "$HOME/.config/opencode/opencode.json" "$HOME/.config/zuno/opencode.json" && install -m 600 "$HOME/.local/share/opencode/auth.json" "$HOME/.local/share/zuno/auth.json"`.
+- Non-secret verification: `test -s` succeeded for both destination files; `stat -c '%a %n'` reported mode `600` for `/config/.config/zuno/opencode.json` and `/config/.local/share/zuno/auth.json`. No credential content was printed, logged, or copied into this evidence.
+
+MUTATION PROOF (2026-08-14)
+- Directory mutant: after a verified backup, temporarily changed `PROJECT_CONFIG_DIRECTORY` from `.zuno` to `.opencode` and ran `CARGO_TARGET_DIR=/tmp/opencode/z1 cargo test -p oc-paths zuno_path_matrix_ignores_an_old_only_project_directory --offline -- --nocapture`. The named test failed at `config_chain.rs:192` by assertion (`left: (true, false)`, `right: (false, false)`), proving an old-only project directory is rejected by the green implementation. The source was restored byte-identically to the backup.
+- Environment mutant: after a verified backup, temporarily changed the `OPENCODE_DB` mapping target from `ZUNO_DB` to `OPENCODE_DB` and ran `CARGO_TARGET_DIR=/tmp/opencode/z1 cargo test -p oc-paths zuno_names_replace_non_plugin_opencode_names_without_fallback --offline -- --nocapture`. The named test failed at `env.rs:371` by assertion (`left: None`, `right: Some("new")`), proving the Zuno spelling is required. The source was restored byte-identically to the backup.
+
+SINGLE REAL-TURN ATTEMPT (2026-08-14)
+- Command: `CARGO_TARGET_DIR=/tmp/opencode/z1 cargo run -p oc-cli --offline -- run --format json "Reply with exactly ZUNO_PATH_OK"`. It intentionally omitted `--pure` and was executed exactly once.
+- The runtime loaded the real plugin tier, emitted observable last-source-wins suppression warnings for plugin-provided `grep` and `glob`, resolved agent `build`, and resolved configured model `amazon-bedrock/amazon.nova-2-lite-v1:0`. This proves the Zuno-located configuration and plugin setup were discovered.
+- The provider request then ended with an unrecoverable Bedrock HTTP 404 before assistant text was produced. Per the one-attempt constraint, it was not retried. No credential or `auth.json` content was printed or recorded.
+
+FINAL STATIC AND WORKSPACE GATES (2026-08-14)
+- `lsp_diagnostics` cannot address a sibling worktree directly, so a temporary hard-link snapshot was created under the request root, diagnosed, and removed. Result: 50 Rust files scanned (tool cap), 0 files with errors, 0 diagnostics. The workspace-wide Clippy gate below covers every Rust target beyond that tool cap.
+- The first full test attempt used `RUST_TEST_THREADS=2` and stopped in `oc-config` because the host returned `EAGAIN` / `Resource temporarily unavailable` while the Rust test harness listed tests; no product assertion failed.
+- The permitted reduced-concurrency retry ran `CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR=/tmp/opencode/z1 RUST_TEST_THREADS=1 cargo test --workspace --offline`; result: PASS.
+- Command: `CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR=/tmp/opencode/z1 cargo clippy --workspace --all-targets --offline -- -D warnings`; result: PASS, zero warnings.
+- Command: `cargo fmt --all --check`; result: PASS.

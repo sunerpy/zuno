@@ -87,16 +87,17 @@ fn provider_config(base_url: &str) -> String {
 }
 
 fn variables(env: &ScriptedEnv, base_url: &str) -> BTreeMap<String, String> {
-    let mut variables = env.env_vars();
+    let mut variables = env
+        .env_vars()
+        .into_iter()
+        .map(|(key, value)| (oc_paths::env::accepted_env_name(&key).to_owned(), value))
+        .collect::<BTreeMap<_, _>>();
     variables.extend([
         ("NO_COLOR".to_owned(), "1".to_owned()),
         ("TERM".to_owned(), "dumb".to_owned()),
-        ("OPENCODE_PURE".to_owned(), "1".to_owned()),
-        ("OPENCODE_AUTH_CONTENT".to_owned(), "{}".to_owned()),
-        (
-            "OPENCODE_DISABLE_MODELS_FETCH".to_owned(),
-            "true".to_owned(),
-        ),
+        ("ZUNO_PURE".to_owned(), "1".to_owned()),
+        ("ZUNO_AUTH_CONTENT".to_owned(), "{}".to_owned()),
+        ("ZUNO_DISABLE_MODELS_FETCH".to_owned(), "true".to_owned()),
         (
             "OPENCODE_CONFIG_CONTENT".to_owned(),
             provider_config(base_url),
@@ -152,7 +153,7 @@ async fn the_released_binary_lists_a_session_this_port_wrote() {
     };
 
     let env = ScriptedEnv::new().expect("isolated environment");
-    let database = env.xdg_data().join("opencode").join("rollback.db");
+    let database = env.xdg_data().join("zuno").join("rollback.db");
     let env = env.with_db(DbChoice::Absolute(database.clone()));
 
     let scenario = Scenario::new("rollback-text-turn")

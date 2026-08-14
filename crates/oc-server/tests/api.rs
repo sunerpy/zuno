@@ -2179,11 +2179,8 @@ async fn api_catalogue_projects_a_pinned_models_document_onto_the_v2_shape() {
         .canonicalize()
         .expect("the pinned catalogue fixture exists");
     let env = isolated_env(root.path())
-        .with(
-            "OPENCODE_MODELS_PATH",
-            fixture.to_string_lossy().into_owned(),
-        )
-        .with("OPENCODE_DISABLE_MODELS_FETCH", "1")
+        .with("ZUNO_MODELS_PATH", fixture.to_string_lossy().into_owned())
+        .with("ZUNO_DISABLE_MODELS_FETCH", "1")
         .with("DEEPSEEK_API_KEY", "probe-key");
     let state = ApiState::memory(directory)
         .expect("API state")

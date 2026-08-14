@@ -2,17 +2,17 @@
 //! and the failure the disable flag is supposed to produce.
 //!
 //! These tests write real files into a `tempfile::TempDir` and point `XDG_CACHE_HOME`
-//! at it through an explicit [`Env`], so the user's real `~/.cache/opencode/models.json`
+//! at it through an explicit [`Env`], so the user's real `~/.cache/zuno/models.json`
 //! is never read, written, or deleted. Nothing here touches the network: the one
 //! test that reaches the fetch branch asserts it is *not* reached.
 
 use std::path::Path;
 
 use oc_config::schema::Config;
-use oc_llm::catalog::source::{CatalogSource, OPENCODE_DISABLE_MODELS_FETCH, OPENCODE_MODELS_PATH};
+use oc_llm::catalog::source::{CatalogSource, ZUNO_DISABLE_MODELS_FETCH, ZUNO_MODELS_PATH};
 use oc_llm::catalog::{Catalog, CatalogError, CatalogProvenance, ResolveInput};
 use oc_paths::Layout;
-use oc_paths::env::{Env, HOME, OPENCODE_MODELS_URL, XDG_CACHE_HOME};
+use oc_paths::env::{Env, HOME, XDG_CACHE_HOME, ZUNO_MODELS_URL};
 
 const PINNED: &str = include_str!("fixtures/models-dev-pinned.json");
 
@@ -39,7 +39,7 @@ fn source_in(root: &Path, extra: &[(&str, &str)]) -> CatalogSource {
 #[tokio::test]
 async fn fetch_disabled_with_no_cache_yields_an_empty_catalog_rather_than_an_error() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let source = source_in(temp.path(), &[(OPENCODE_DISABLE_MODELS_FETCH, "1")]);
+    let source = source_in(temp.path(), &[(ZUNO_DISABLE_MODELS_FETCH, "1")]);
     assert!(source.fetch_disabled());
     assert!(
         !source.cache().exists(),
@@ -71,14 +71,14 @@ async fn fetch_disabled_with_no_cache_yields_an_empty_catalog_rather_than_an_err
 
 /// The air-gapped user's whole scenario, from the source to a selectable model.
 ///
-/// No cache, no network, no `OPENCODE_MODELS_PATH` — only a config that names its
+/// No cache, no network, no `ZUNO_MODELS_PATH` — only a config that names its
 /// own provider, model, limits and base URL. Upstream runs this
 /// (`provider.ts:1425-1520` merges config over the loaded document); measured on
 /// 1.18.12, `opencode models` prints `test/test-model` and exits 0.
 #[tokio::test]
 async fn a_config_only_provider_resolves_with_no_cache_and_no_network() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let source = source_in(temp.path(), &[(OPENCODE_DISABLE_MODELS_FETCH, "1")]);
+    let source = source_in(temp.path(), &[(ZUNO_DISABLE_MODELS_FETCH, "1")]);
     let config: Config = serde_json::from_str(
         r#"{"provider":{"test":{"name":"Test","id":"test","env":[],
              "npm":"@ai-sdk/openai-compatible","api":"https://gateway.internal/v1",
@@ -110,7 +110,7 @@ async fn a_config_only_provider_resolves_with_no_cache_and_no_network() {
 #[tokio::test]
 async fn a_model_nothing_defines_still_fails_immediately_and_actionably() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let source = source_in(temp.path(), &[(OPENCODE_DISABLE_MODELS_FETCH, "1")]);
+    let source = source_in(temp.path(), &[(ZUNO_DISABLE_MODELS_FETCH, "1")]);
     let loaded = source
         .load()
         .await
@@ -132,7 +132,7 @@ async fn a_model_nothing_defines_still_fails_immediately_and_actionably() {
         "must name the config block that would define it: {rendered}"
     );
     assert!(
-        rendered.contains("OPENCODE_DISABLE_MODELS_FETCH"),
+        rendered.contains("ZUNO_DISABLE_MODELS_FETCH"),
         "must name the flag that caused it: {rendered}"
     );
     assert!(
@@ -144,7 +144,7 @@ async fn a_model_nothing_defines_still_fails_immediately_and_actionably() {
         "must name the cache path it looked for: {rendered}"
     );
     assert!(
-        rendered.contains("OPENCODE_MODELS_PATH"),
+        rendered.contains("ZUNO_MODELS_PATH"),
         "must name the alternative: {rendered}"
     );
     assert!(
@@ -160,7 +160,7 @@ async fn a_model_nothing_defines_still_fails_immediately_and_actionably() {
 #[tokio::test]
 async fn a_loaded_catalog_does_not_blame_the_flag_for_an_absent_model() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let source = source_in(temp.path(), &[(OPENCODE_DISABLE_MODELS_FETCH, "1")]);
+    let source = source_in(temp.path(), &[(ZUNO_DISABLE_MODELS_FETCH, "1")]);
     std::fs::create_dir_all(source.cache().parent().expect("a parent")).expect("mkdir");
     std::fs::write(source.cache(), PINNED).expect("seed the cache");
 
@@ -171,7 +171,7 @@ async fn a_loaded_catalog_does_not_blame_the_flag_for_an_absent_model() {
 #[tokio::test]
 async fn fetch_disabled_with_a_cache_present_loads_from_it() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let source = source_in(temp.path(), &[(OPENCODE_DISABLE_MODELS_FETCH, "1")]);
+    let source = source_in(temp.path(), &[(ZUNO_DISABLE_MODELS_FETCH, "1")]);
     std::fs::create_dir_all(source.cache().parent().expect("a parent")).expect("mkdir");
     std::fs::write(source.cache(), PINNED).expect("seed the cache");
 
@@ -188,7 +188,7 @@ async fn refresh_with_the_fetch_disabled_says_so_rather_than_doing_nothing() {
     // `models --refresh` is a direct question. Silently succeeding without
     // refreshing would be the worst possible answer.
     let temp = tempfile::tempdir().expect("temp dir");
-    let source = source_in(temp.path(), &[(OPENCODE_DISABLE_MODELS_FETCH, "1")]);
+    let source = source_in(temp.path(), &[(ZUNO_DISABLE_MODELS_FETCH, "1")]);
     let error = tokio::time::timeout(std::time::Duration::from_secs(5), source.refresh(true))
         .await
         .expect("refresh must return promptly")
@@ -209,8 +209,8 @@ async fn an_explicit_path_is_read_instead_of_the_cache() {
     let source = source_in(
         temp.path(),
         &[
-            (OPENCODE_MODELS_PATH, &pinned.to_string_lossy()),
-            (OPENCODE_DISABLE_MODELS_FETCH, "1"),
+            (ZUNO_MODELS_PATH, &pinned.to_string_lossy()),
+            (ZUNO_DISABLE_MODELS_FETCH, "1"),
         ],
     );
     // The cache does not exist; the explicit path still satisfies the load.
@@ -229,7 +229,7 @@ async fn a_missing_explicit_path_is_an_error_not_a_fallback() {
     let temp = tempfile::tempdir().expect("temp dir");
     let source = source_in(
         temp.path(),
-        &[(OPENCODE_MODELS_PATH, "/nonexistent/t26/catalog.json")],
+        &[(ZUNO_MODELS_PATH, "/nonexistent/t26/catalog.json")],
     );
     let error = source
         .load()
@@ -237,7 +237,7 @@ async fn a_missing_explicit_path_is_an_error_not_a_fallback() {
         .expect_err("a named-but-absent file is a mistake worth reporting");
     assert!(matches!(error, CatalogError::ExplicitPathUnreadable { .. }));
     assert!(
-        error.to_string().contains("OPENCODE_MODELS_PATH"),
+        error.to_string().contains("ZUNO_MODELS_PATH"),
         "the message names the variable: {error}"
     );
 }
@@ -249,7 +249,7 @@ async fn a_malformed_explicit_path_is_reported_and_never_deleted() {
     std::fs::write(&pinned, "{ not json").expect("write");
     let source = source_in(
         temp.path(),
-        &[(OPENCODE_MODELS_PATH, &pinned.to_string_lossy())],
+        &[(ZUNO_MODELS_PATH, &pinned.to_string_lossy())],
     );
     let error = source.load().await.expect_err("malformed JSON is an error");
     assert!(matches!(error, CatalogError::Malformed { .. }));
@@ -307,7 +307,7 @@ fn a_custom_source_writes_to_its_own_cache_file() {
     let default = source_in(temp.path(), &[]);
     let mirror = source_in(
         temp.path(),
-        &[(OPENCODE_MODELS_URL, "https://mirror.example.com")],
+        &[(ZUNO_MODELS_URL, "https://mirror.example.com")],
     );
     assert_ne!(default.cache(), mirror.cache());
     assert_eq!(default.cache().file_name().expect("a name"), "models.json");

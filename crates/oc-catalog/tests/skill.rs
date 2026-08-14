@@ -109,12 +109,12 @@ async fn every_root_contributes_and_the_builtin_comes_first() {
         Some("p"),
     );
     tree.skill(
-        "home/.config/opencode/skill/from-config",
+        "home/.config/zuno/skill/from-config",
         "from-config",
         Some("g"),
     );
     tree.skill(
-        "home/.config/opencode/skills/from-config-plural",
+        "home/.config/zuno/skills/from-config-plural",
         "from-config-plural",
         Some("gp"),
     );
@@ -146,10 +146,10 @@ async fn every_root_contributes_and_the_builtin_comes_first() {
 async fn a_skill_file_with_no_name_is_rejected_and_the_warning_names_the_file() {
     let tree = Tree::new();
     let broken = tree.write(
-        "home/.config/opencode/skill/broken/SKILL.md",
+        "home/.config/zuno/skill/broken/SKILL.md",
         "---\ndescription: I forgot my name.\n---\n\nBody.\n",
     );
-    tree.skill("home/.config/opencode/skill/fine", "fine", Some("d"));
+    tree.skill("home/.config/zuno/skill/fine", "fine", Some("d"));
 
     let skills = load(&tree.options("proj")).await;
 
@@ -221,17 +221,13 @@ async fn a_config_directory_beats_both_external_roots() {
     let tree = Tree::new();
     tree.skill("home/.claude/skills/dupe", "dupe", Some("from claude"));
     tree.skill("home/.agents/skills/dupe", "dupe", Some("from agents"));
-    tree.skill(
-        "home/.config/opencode/skill/dupe",
-        "dupe",
-        Some("from config"),
-    );
+    tree.skill("home/.config/zuno/skill/dupe", "dupe", Some("from config"));
 
     let skills = load(&tree.options("proj")).await;
 
     assert_eq!(
         located(&skills, "dupe"),
-        tree.at("home/.config/opencode/skill/dupe/SKILL.md")
+        tree.at("home/.config/zuno/skill/dupe/SKILL.md")
             .to_string_lossy()
     );
     assert_eq!(
@@ -317,7 +313,7 @@ async fn a_symlink_alias_is_a_duplicate_name_not_a_duplicate_path() {
 async fn a_disk_skill_overrides_the_builtin_with_one_warning() {
     let tree = Tree::new();
     tree.skill(
-        &format!("home/.config/opencode/skill/{}", builtin::NAME),
+        &format!("home/.config/zuno/skill/{}", builtin::NAME),
         builtin::NAME,
         Some("mine"),
     );
@@ -375,7 +371,7 @@ async fn a_broken_frontmatter_block_is_warned_about_and_skipped() {
 async fn dirs_are_reported_for_every_match() {
     let tree = Tree::new();
     let one = tree.skill("home/.agents/skills/one", "one", Some("d"));
-    let two = tree.skill("home/.config/opencode/skill/two", "two", Some("d"));
+    let two = tree.skill("home/.config/zuno/skill/two", "two", Some("d"));
 
     let skills = load(&tree.options("proj")).await;
 

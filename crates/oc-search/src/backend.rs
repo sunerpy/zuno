@@ -19,7 +19,7 @@ use std::path::PathBuf;
 /// Accepts `ripgrep` or `rg`. Any other value, including absent, selects the
 /// embedded engine. Naming it explicitly means a divergence investigation can switch
 /// backends without a rebuild.
-pub const BACKEND_ENV: &str = "OPENCODE_SEARCH_BACKEND";
+pub const BACKEND_ENV: &str = "ZUNO_SEARCH_BACKEND";
 
 /// Which engine answers a request.
 #[derive(Debug, Clone)]

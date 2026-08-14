@@ -51,7 +51,7 @@ pub(super) fn execute(args: &ModelsArgs, environment: &StartupEnvironment) -> Re
             &directory,
             worktree.unwrap_or(directory.as_path()),
             &layout,
-            env.flag(crate::OPENCODE_PURE),
+            env.flag(crate::ZUNO_PURE),
             super::plugin_runtime::PluginRuntimeTarget::server("models"),
         )
         .await

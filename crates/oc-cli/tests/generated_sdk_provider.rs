@@ -26,15 +26,9 @@ async fn plugin_input_client_provider_list_observes_the_production_sdk_projectio
         .expect("pinned models.dev fixture");
     let env = oc_paths::Env::empty()
         .with("HOME", temp.path().to_string_lossy().into_owned())
-        .with(
-            "OPENCODE_TEST_HOME",
-            temp.path().to_string_lossy().into_owned(),
-        )
-        .with(
-            "OPENCODE_MODELS_PATH",
-            models.to_string_lossy().into_owned(),
-        )
-        .with("OPENCODE_DISABLE_MODELS_FETCH", "1")
+        .with("ZUNO_TEST_HOME", temp.path().to_string_lossy().into_owned())
+        .with("ZUNO_MODELS_PATH", models.to_string_lossy().into_owned())
+        .with("ZUNO_DISABLE_MODELS_FETCH", "1")
         .with("DEEPSEEK_API_KEY", "probe-key");
     let state = ApiState::memory(directory.to_string_lossy())
         .expect("in-memory API state")

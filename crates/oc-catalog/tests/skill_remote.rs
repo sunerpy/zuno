@@ -63,13 +63,13 @@ impl Tree {
     }
 
     fn cache_root(&self) -> PathBuf {
-        self.home().join(".cache/opencode/skills")
+        self.home().join(".cache/zuno/skills")
     }
 
     fn local_skill(&self, name: &str) {
         let path = self
             .home()
-            .join(".config/opencode/skill")
+            .join(".config/zuno/skill")
             .join(name)
             .join("SKILL.md");
         fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");

@@ -91,7 +91,7 @@ struct Keys {
     stored: Option<&'static str>,
 }
 
-/// The auth-store document `OPENCODE_AUTH_CONTENT` carries.
+/// The auth-store document `ZUNO_AUTH_CONTENT` carries.
 fn auth_content(stored: Option<&str>) -> String {
     match stored {
         Some(key) => serde_json::json!({"test": {"type": "api", "key": key}}).to_string(),
@@ -148,14 +148,11 @@ fn variables(env: &ScriptedEnv, config: String, stored: Option<&str>) -> BTreeMa
     variables.extend([
         ("NO_COLOR".to_owned(), "1".to_owned()),
         ("TERM".to_owned(), "dumb".to_owned()),
-        ("OPENCODE_PURE".to_owned(), "1".to_owned()),
-        ("OPENCODE_AUTH_CONTENT".to_owned(), auth_content(stored)),
+        ("ZUNO_PURE".to_owned(), "1".to_owned()),
+        ("ZUNO_AUTH_CONTENT".to_owned(), auth_content(stored)),
         // The config fully specifies `test/test-model`, so nothing but the config may
         // supply the endpoint or the key.
-        (
-            "OPENCODE_DISABLE_MODELS_FETCH".to_owned(),
-            "true".to_owned(),
-        ),
+        ("ZUNO_DISABLE_MODELS_FETCH".to_owned(), "true".to_owned()),
         ("OPENCODE_CONFIG_CONTENT".to_owned(), config),
     ]);
     variables

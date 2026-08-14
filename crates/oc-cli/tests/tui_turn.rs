@@ -170,15 +170,12 @@ fn variables(env: &ScriptedEnv, base_url: &str) -> BTreeMap<String, String> {
     variables.extend([
         ("TERM".to_owned(), "xterm-256color".to_owned()),
         ("COLORTERM".to_owned(), "truecolor".to_owned()),
-        ("OPENCODE_PURE".to_owned(), "1".to_owned()),
-        ("OPENCODE_AUTH_CONTENT".to_owned(), "{}".to_owned()),
+        ("ZUNO_PURE".to_owned(), "1".to_owned()),
+        ("ZUNO_AUTH_CONTENT".to_owned(), "{}".to_owned()),
         // No `OPENCODE_MODELS_PATH`: the config below fully specifies `test/test-model`,
         // so a catalog is not needed to resolve it. Injecting a fixture here is what hid
         // todo 108 — the binary could not start without one — through five waves.
-        (
-            "OPENCODE_DISABLE_MODELS_FETCH".to_owned(),
-            "true".to_owned(),
-        ),
+        ("ZUNO_DISABLE_MODELS_FETCH".to_owned(), "true".to_owned()),
         (
             "OPENCODE_CONFIG_CONTENT".to_owned(),
             provider_config(base_url),
@@ -253,7 +250,7 @@ fn run_plugin_kind_startup(
         std::io::Error::other("`script` is required to give the TUI a real PTY; install util-linux")
     })?;
     let mut variables = variables(env, base_url);
-    variables.remove("OPENCODE_PURE");
+    variables.remove("ZUNO_PURE");
     variables.insert(
         "OPENCODE_CONFIG_CONTENT".to_owned(),
         plugin_kind_config(

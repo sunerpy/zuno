@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn enable_flag_adds_the_project_directory() {
-        let env = Env::empty().with(OPENCODE_EXPERIMENTAL_FILEWATCHER, "true");
+        let env = Env::empty().with("ZUNO_EXPERIMENTAL_FILEWATCHER", "true");
         assert_eq!(decide(&env), Decision::Full);
         assert!(decide(&env).watches_project());
         assert!(decide(&env).watches_vcs());
@@ -172,8 +172,8 @@ mod tests {
     #[test]
     fn disable_wins_when_both_flags_are_set() {
         let env = Env::empty()
-            .with(OPENCODE_EXPERIMENTAL_FILEWATCHER, "true")
-            .with(OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER, "true");
+            .with("ZUNO_EXPERIMENTAL_FILEWATCHER", "true")
+            .with("ZUNO_EXPERIMENTAL_DISABLE_FILEWATCHER", "true");
         assert_eq!(
             decide(&env),
             Decision::Disabled(DisabledReason::ExplicitlyDisabled)
@@ -183,18 +183,18 @@ mod tests {
     #[test]
     fn effect_boolean_accepts_more_than_flag_truthy() {
         for value in ["true", "TRUE", "1", "yes", "YES", "on", "On"] {
-            let env = Env::empty().with(OPENCODE_EXPERIMENTAL_FILEWATCHER, value);
+            let env = Env::empty().with("ZUNO_EXPERIMENTAL_FILEWATCHER", value);
             assert_eq!(decide(&env), Decision::Full, "{value} should enable");
         }
         for value in ["false", "FALSE", "0", "no", "off"] {
-            let env = Env::empty().with(OPENCODE_EXPERIMENTAL_FILEWATCHER, value);
+            let env = Env::empty().with("ZUNO_EXPERIMENTAL_FILEWATCHER", value);
             assert_eq!(decide(&env), Decision::VcsOnly, "{value} should not enable");
         }
     }
 
     #[test]
     fn an_unparseable_value_disables_everything() {
-        let env = Env::empty().with(OPENCODE_EXPERIMENTAL_FILEWATCHER, "bogus");
+        let env = Env::empty().with("ZUNO_EXPERIMENTAL_FILEWATCHER", "bogus");
         assert_eq!(
             decide(&env),
             Decision::Disabled(DisabledReason::UnparseableFlag {
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn an_unparseable_disable_value_also_disables_everything() {
-        let env = Env::empty().with(OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER, "maybe");
+        let env = Env::empty().with("ZUNO_EXPERIMENTAL_DISABLE_FILEWATCHER", "maybe");
         assert_eq!(
             decide(&env),
             Decision::Disabled(DisabledReason::UnparseableFlag {
@@ -223,7 +223,7 @@ mod tests {
         // `Config.boolean` reads the variable as present with the empty string,
         // which is in neither value set. This is where it diverges from
         // `Env::truthy_value`'s JavaScript `||` rule.
-        let env = Env::empty().with(OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER, "");
+        let env = Env::empty().with("ZUNO_EXPERIMENTAL_DISABLE_FILEWATCHER", "");
         assert!(decide(&env).is_disabled());
     }
 }

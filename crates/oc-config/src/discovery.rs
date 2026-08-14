@@ -198,7 +198,7 @@ pub fn discover_with(options: &DiscoveryOptions) -> Result<Config, ConfigError> 
             .config_dir_override()
             .filter(|value| !value.is_empty())
             .is_some_and(|value| directory == Path::new(value));
-        if directory.to_string_lossy().ends_with(".opencode") || is_override {
+        if directory.to_string_lossy().ends_with(".zuno") || is_override {
             for path in Layout::file_in_directory(&directory, "opencode") {
                 merge_file(&mut result, &path)?;
             }

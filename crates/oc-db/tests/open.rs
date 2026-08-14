@@ -1,9 +1,9 @@
-//! Opening `opencode.db`: the pragmas, the `OPENCODE_DB` forms, WAL behaviour
+//! Opening `opencode.db`: the pragmas, the `ZUNO_DB` forms, WAL behaviour
 //! under concurrent writers, and proof that `foreign_keys = ON` is in force.
 
 use oc_db::open;
 use oc_db::{Pool, TransactionBehavior};
-use oc_paths::env::{HOME, OPENCODE_DB, XDG_DATA_HOME};
+use oc_paths::env::{HOME, XDG_DATA_HOME, ZUNO_DB};
 use oc_paths::{DbLocation, Env, Layout};
 use std::path::Path;
 use std::sync::{Arc, Barrier};
@@ -444,16 +444,16 @@ fn a_transaction_that_succeeds_commits() {
 }
 
 // ---------------------------------------------------------------------------
-// The three `OPENCODE_DB` forms, resolved by `oc-paths` and opened here.
+// The three `ZUNO_DB` forms, resolved by `oc-paths` and opened here.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn opencode_db_memory_yields_an_in_memory_database_and_writes_no_file() {
+fn zuno_db_memory_yields_an_in_memory_database_and_writes_no_file() {
     let dir = temp_dir();
     let resolved = layout(&[
         (HOME, &dir.path().to_string_lossy()),
         (XDG_DATA_HOME, &dir.path().to_string_lossy()),
-        (OPENCODE_DB, ":memory:"),
+        (ZUNO_DB, ":memory:"),
     ]);
     let location = resolved.db_path();
     assert_eq!(location, DbLocation::Memory);
@@ -476,7 +476,7 @@ fn opencode_db_memory_yields_an_in_memory_database_and_writes_no_file() {
 }
 
 #[test]
-fn opencode_db_memory_is_transient_between_pools() {
+fn zuno_db_memory_is_transient_between_pools() {
     let first = Pool::open(&DbLocation::Memory).expect("first pool");
     first
         .transaction(|tx| {
@@ -498,16 +498,16 @@ fn opencode_db_memory_is_transient_between_pools() {
 }
 
 #[test]
-fn opencode_db_relative_resolves_under_data_and_the_file_lands_there() {
+fn zuno_db_relative_resolves_under_data_and_the_file_lands_there() {
     let dir = temp_dir();
     let data_home = dir.path().join("xdg");
     let resolved = layout(&[
         (HOME, &dir.path().to_string_lossy()),
         (XDG_DATA_HOME, &data_home.to_string_lossy()),
-        (OPENCODE_DB, "relprobe.db"),
+        (ZUNO_DB, "relprobe.db"),
     ]);
     let location = resolved.db_path();
-    let expected = data_home.join("opencode").join("relprobe.db");
+    let expected = data_home.join("zuno").join("relprobe.db");
     assert_eq!(location, DbLocation::File(expected.clone()));
     assert!(
         location
@@ -529,13 +529,13 @@ fn opencode_db_relative_resolves_under_data_and_the_file_lands_there() {
 }
 
 #[test]
-fn opencode_db_absolute_is_used_verbatim() {
+fn zuno_db_absolute_is_used_verbatim() {
     let dir = temp_dir();
     let absolute = dir.path().join("nested").join("custom.db");
     let resolved = layout(&[
         (HOME, &dir.path().to_string_lossy()),
         (XDG_DATA_HOME, &dir.path().join("xdg").to_string_lossy()),
-        (OPENCODE_DB, &absolute.to_string_lossy()),
+        (ZUNO_DB, &absolute.to_string_lossy()),
     ]);
     let location = resolved.db_path();
     assert_eq!(location, DbLocation::File(absolute.clone()));

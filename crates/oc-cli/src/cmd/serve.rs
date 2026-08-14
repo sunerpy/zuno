@@ -255,7 +255,7 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
             &directory_path,
             worktree,
             &layout,
-            env.flag(crate::OPENCODE_PURE),
+            env.flag(crate::ZUNO_PURE),
             super::plugin_runtime::PluginRuntimeTarget::server_with_stdio(
                 "serve",
                 plugin_server_url,

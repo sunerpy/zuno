@@ -15,6 +15,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use oc_paths::env::ZUNO_ENV_NAME_MAP;
+
 use tempfile::TempDir;
 
 use crate::error::{Result, TestkitError};
@@ -235,6 +237,11 @@ impl ScriptedEnv {
             DbChoice::Default => {}
         }
         env.extend(self.extra.iter().map(|(k, v)| (k.clone(), v.clone())));
+        for (legacy, zuno) in ZUNO_ENV_NAME_MAP {
+            if let Some(value) = env.get(legacy).cloned() {
+                env.entry(zuno.to_owned()).or_insert(value);
+            }
+        }
         env
     }
 
@@ -284,6 +291,7 @@ mod tests {
             "XDG_STATE_HOME",
             "TMPDIR",
             "OPENCODE_TEST_HOME",
+            "ZUNO_TEST_HOME",
         ] {
             let value = vars.get(key).unwrap_or_else(|| panic!("{key} must be set"));
             assert!(
@@ -297,6 +305,7 @@ mod tests {
             .filter(|k| {
                 !k.starts_with("XDG_")
                     && !k.starts_with("OPENCODE_")
+                    && !k.starts_with("ZUNO_")
                     && !matches!(k.as_str(), "HOME" | "TMPDIR" | "PATH")
             })
             .collect();
@@ -319,6 +328,14 @@ mod tests {
                 .map(String::as_str),
             Some("1")
         );
+        assert_eq!(
+            vars.get("ZUNO_DISABLE_AUTOUPDATE").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            vars.get("ZUNO_DISABLE_MODELS_FETCH").map(String::as_str),
+            Some("1")
+        );
     }
 
     #[test]
@@ -326,6 +343,10 @@ mod tests {
         let base = ScriptedEnv::new().expect("scripted env");
         assert_eq!(
             base.env_vars().get("OPENCODE_DB").map(String::as_str),
+            Some(":memory:")
+        );
+        assert_eq!(
+            base.env_vars().get("ZUNO_DB").map(String::as_str),
             Some(":memory:")
         );
 
@@ -362,6 +383,10 @@ mod tests {
         let vars = env.env_vars();
         assert_eq!(
             vars.get("OPENCODE_DB").map(String::as_str),
+            Some("/explicit/path.db")
+        );
+        assert_eq!(
+            vars.get("ZUNO_DB").map(String::as_str),
             Some("/explicit/path.db")
         );
         assert_eq!(

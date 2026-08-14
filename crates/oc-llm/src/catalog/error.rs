@@ -2,7 +2,7 @@
 //!
 //! # The case [`CatalogError::FetchDisabled`] actually covers
 //!
-//! This file used to argue that `OPENCODE_DISABLE_MODELS_FETCH` with no cache on
+//! This file used to argue that `ZUNO_DISABLE_MODELS_FETCH` with no cache on
 //! disk must fail immediately, because the two alternatives — hanging on a fetch
 //! policy forbids, or returning an empty catalog the user meets as "no models
 //! found" three screens later — are both worse. That argument is sound, and it was
@@ -48,11 +48,11 @@ pub enum CatalogError {
     /// to start.
     #[error(
         "model `{requested}` is not available: no `provider` block in your \
-         configuration defines it, OPENCODE_DISABLE_MODELS_FETCH is set so no fetch \
+         configuration defines it, ZUNO_DISABLE_MODELS_FETCH is set so no fetch \
          from `{origin}` was attempted, and no cached catalog exists at `{cache}`. \
          Define the provider and model under `provider` in your config, or unset \
-         OPENCODE_DISABLE_MODELS_FETCH to fetch the catalog, or set \
-         OPENCODE_MODELS_PATH to a catalog file on disk"
+         ZUNO_DISABLE_MODELS_FETCH to fetch the catalog, or set \
+         ZUNO_MODELS_PATH to a catalog file on disk"
     )]
     FetchDisabled {
         /// The `provider/model` the user asked for.
@@ -72,20 +72,20 @@ pub enum CatalogError {
     /// request, so there is no config that could satisfy it and nothing to fall
     /// back on.
     #[error(
-        "the model catalog cannot be refreshed: OPENCODE_DISABLE_MODELS_FETCH is \
+        "the model catalog cannot be refreshed: ZUNO_DISABLE_MODELS_FETCH is \
          set, so no fetch from `{origin}` was attempted. Unset \
-         OPENCODE_DISABLE_MODELS_FETCH to allow it"
+         ZUNO_DISABLE_MODELS_FETCH to allow it"
     )]
     RefreshDisabled {
         /// The source a fetch would have gone to.
         origin: String,
     },
 
-    /// `OPENCODE_MODELS_PATH` points at something that cannot be read.
+    /// `ZUNO_MODELS_PATH` points at something that cannot be read.
     ///
     /// Distinct from a missing cache: an explicit path is an instruction, so
     /// failing to honour it is an error rather than a reason to look elsewhere.
-    #[error("the model catalog at `{path}` (OPENCODE_MODELS_PATH) could not be read")]
+    #[error("the model catalog at `{path}` (ZUNO_MODELS_PATH) could not be read")]
     ExplicitPathUnreadable {
         /// The path the variable named.
         path: PathBuf,

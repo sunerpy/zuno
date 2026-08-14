@@ -1034,7 +1034,7 @@ async fn production_vertex_anthropic_registration_dispatches_and_decodes_recorde
 fn forbidden_fetch() -> CatalogProvenance {
     CatalogProvenance::FetchForbidden {
         origin: "https://models.opencode.ai".to_owned(),
-        cache: PathBuf::from("/nowhere/cache/opencode/models.json"),
+        cache: PathBuf::from("/nowhere/cache/zuno/models.json"),
     }
 }
 
@@ -1090,10 +1090,10 @@ fn a_model_no_config_defines_fails_immediately_and_names_the_fix() {
     for needle in [
         "private/absent-model",
         "provider",
-        "OPENCODE_DISABLE_MODELS_FETCH",
+        "ZUNO_DISABLE_MODELS_FETCH",
         "https://models.opencode.ai",
-        "/nowhere/cache/opencode/models.json",
-        "OPENCODE_MODELS_PATH",
+        "/nowhere/cache/zuno/models.json",
+        "ZUNO_MODELS_PATH",
     ] {
         assert!(
             message.contains(needle),
@@ -1115,12 +1115,9 @@ fn an_empty_catalog_with_no_request_still_explains_the_policy() {
     );
     let message = select_model(&catalog, None, &forbidden_fetch())
         .expect_err("an empty catalog offers no default");
+    assert!(message.contains("ZUNO_DISABLE_MODELS_FETCH"), "{message}");
     assert!(
-        message.contains("OPENCODE_DISABLE_MODELS_FETCH"),
-        "{message}"
-    );
-    assert!(
-        message.contains("/nowhere/cache/opencode/models.json"),
+        message.contains("/nowhere/cache/zuno/models.json"),
         "{message}"
     );
 
@@ -1128,7 +1125,7 @@ fn an_empty_catalog_with_no_request_still_explains_the_policy() {
     let loaded = select_model(&catalog, None, &CatalogProvenance::Fetched)
         .expect_err("an empty catalog offers no default");
     assert!(
-        !loaded.contains("OPENCODE_DISABLE_MODELS_FETCH"),
+        !loaded.contains("ZUNO_DISABLE_MODELS_FETCH"),
         "a loaded catalog that lists nothing is a configuration problem, not a \
          policy one: {loaded}"
     );

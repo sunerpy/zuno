@@ -80,6 +80,12 @@ const WRITTEN_CONTENT: &str = "the tool ran\n";
 const ANTIGRAVITY_SPEC: &str = "opencode-antigravity-auth@1.6.0";
 const ANTIGRAVITY_TOOL: &str = "google_search";
 
+fn installed_antigravity() -> PathBuf {
+    Path::new("/config/.cache/opencode/packages")
+        .join(ANTIGRAVITY_SPEC)
+        .join("node_modules/opencode-antigravity-auth")
+}
+
 const FAILING_AUTH_LOADER_PLUGIN: &str = r#"
 export default {
   id: "cli-failing-auth-loader",
@@ -324,7 +330,7 @@ fn provider_config(base_url: &str) -> String {
 fn plugin_provider_config(base_url: &str, deny_plugin_tool: bool) -> String {
     let mut config: serde_json::Value =
         serde_json::from_str(&provider_config(base_url)).expect("provider config is JSON");
-    config["plugin"] = serde_json::json!([ANTIGRAVITY_SPEC]);
+    config["plugin"] = serde_json::json!([format!("file:{}", installed_antigravity().display())]);
     if deny_plugin_tool {
         config["permission"] = serde_json::json!({ ANTIGRAVITY_TOOL: "deny" });
     }
@@ -442,19 +448,20 @@ fn sdk_model_provider_config(
 }
 
 fn variables(env: &ScriptedEnv, base_url: &str) -> BTreeMap<String, String> {
-    let mut variables = env.env_vars();
+    let mut variables = env
+        .env_vars()
+        .into_iter()
+        .map(|(key, value)| (oc_paths::env::accepted_env_name(&key).to_owned(), value))
+        .collect::<BTreeMap<_, _>>();
     variables.extend([
         ("NO_COLOR".to_owned(), "1".to_owned()),
         ("TERM".to_owned(), "dumb".to_owned()),
-        ("OPENCODE_PURE".to_owned(), "1".to_owned()),
-        ("OPENCODE_AUTH_CONTENT".to_owned(), "{}".to_owned()),
-        // No `OPENCODE_MODELS_PATH`: the config below fully specifies `test/test-model`,
+        ("ZUNO_PURE".to_owned(), "1".to_owned()),
+        ("ZUNO_AUTH_CONTENT".to_owned(), "{}".to_owned()),
+        // No `ZUNO_MODELS_PATH`: the config below fully specifies `test/test-model`,
         // so a catalog is not needed to resolve it. Injecting a fixture here is what hid
         // todo 108 — the binary could not start without one — through five waves.
-        (
-            "OPENCODE_DISABLE_MODELS_FETCH".to_owned(),
-            "true".to_owned(),
-        ),
+        ("ZUNO_DISABLE_MODELS_FETCH".to_owned(), "true".to_owned()),
         (
             "OPENCODE_CONFIG_CONTENT".to_owned(),
             provider_config(base_url),
@@ -488,7 +495,7 @@ async fn run_plugin_prompt(
     deny_plugin_tool: bool,
 ) -> Output {
     let mut plugin_variables = variables(env, base_url);
-    plugin_variables.remove("OPENCODE_PURE");
+    plugin_variables.remove("ZUNO_PURE");
     plugin_variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
     plugin_variables.insert(
         "MISE_DATA_DIR".to_owned(),
@@ -518,7 +525,7 @@ async fn run_failing_auth_loader_prompt(
     plugin: &Path,
 ) -> Output {
     let mut plugin_variables = variables(env, base_url);
-    plugin_variables.remove("OPENCODE_PURE");
+    plugin_variables.remove("ZUNO_PURE");
     plugin_variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
     plugin_variables.insert(
         "MISE_DATA_DIR".to_owned(),
@@ -530,7 +537,7 @@ async fn run_failing_auth_loader_prompt(
         failing_auth_loader_provider_config(base_url, plugin),
     );
     plugin_variables.insert(
-        "OPENCODE_AUTH_CONTENT".to_owned(),
+        "ZUNO_AUTH_CONTENT".to_owned(),
         r#"{"test":{"type":"api","key":"fixture-key"}}"#.to_owned(),
     );
 
@@ -561,7 +568,7 @@ async fn run_sdk_model_provider_prompt(
     print_debug_logs: bool,
 ) -> Output {
     let mut plugin_variables = variables(env, base_url);
-    plugin_variables.remove("OPENCODE_PURE");
+    plugin_variables.remove("ZUNO_PURE");
     plugin_variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
     plugin_variables.insert(
         "MISE_DATA_DIR".to_owned(),
@@ -599,7 +606,7 @@ async fn run_sdk_model_provider_prompt(
 
 async fn run_auto_discovery_prompt(env: &ScriptedEnv, base_url: &str, load_log: &Path) -> Output {
     let mut plugin_variables = variables(env, base_url);
-    plugin_variables.remove("OPENCODE_PURE");
+    plugin_variables.remove("ZUNO_PURE");
     plugin_variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
     plugin_variables.insert(
         "MISE_DATA_DIR".to_owned(),
@@ -669,7 +676,7 @@ async fn run_lifecycle_command_with_args(
     args: &[&str],
 ) -> Output {
     let mut plugin_variables = variables(env, base_url);
-    plugin_variables.remove("OPENCODE_PURE");
+    plugin_variables.remove("ZUNO_PURE");
     plugin_variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
     plugin_variables.insert(
         "MISE_DATA_DIR".to_owned(),
@@ -677,7 +684,7 @@ async fn run_lifecycle_command_with_args(
     );
     plugin_variables.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
     plugin_variables.insert(
-        "OPENCODE_AUTH_CONTENT".to_owned(),
+        "ZUNO_AUTH_CONTENT".to_owned(),
         r#"{"test":{"type":"api","key":"fixture-key"}}"#.to_owned(),
     );
     plugin_variables.insert(
@@ -704,7 +711,7 @@ async fn run_noop_tool_definition_prompt(
     event_file: &Path,
 ) -> Output {
     let mut plugin_variables = variables(env, base_url);
-    plugin_variables.remove("OPENCODE_PURE");
+    plugin_variables.remove("ZUNO_PURE");
     plugin_variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
     plugin_variables.insert(
         "MISE_DATA_DIR".to_owned(),
@@ -736,7 +743,7 @@ async fn run_lifecycle_tool_prompt(
     dispose_file: &Path,
 ) -> Output {
     let mut plugin_variables = variables(env, base_url);
-    plugin_variables.remove("OPENCODE_PURE");
+    plugin_variables.remove("ZUNO_PURE");
     plugin_variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
     plugin_variables.insert(
         "MISE_DATA_DIR".to_owned(),
@@ -1270,9 +1277,7 @@ async fn tool_turn_executes_a_real_tool_and_the_side_effect_lands_on_disk() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_real_plugin_tool_reaches_and_executes_through_the_production_registry() {
-    let installed = Path::new("/config/.cache/opencode/packages")
-        .join(ANTIGRAVITY_SPEC)
-        .join("node_modules/opencode-antigravity-auth");
+    let installed = installed_antigravity();
     if !installed.is_dir() {
         eprintln!(
             "SKIPPED a_real_plugin_tool_reaches_and_executes_through_the_production_registry: {} is absent",
@@ -1351,8 +1356,8 @@ async fn auto_discovered_plugins_load_from_all_four_directories_through_the_real
     let env = ScriptedEnv::new()
         .expect("isolated environment")
         .with_db(DbChoice::TempFile);
-    let local = env.project().join(".opencode");
-    let global = env.xdg_config().join("opencode");
+    let local = env.project().join(".zuno");
+    let global = env.xdg_config().join("zuno");
     let plugin_files = [
         local.join("plugin/project-singular.js"),
         local.join("plugins/project-plural.js"),
@@ -1421,9 +1426,7 @@ async fn auto_discovered_plugins_load_from_all_four_directories_through_the_real
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_plugin_tool_is_hidden_by_the_same_permission_layer_as_builtins() {
-    let installed = Path::new("/config/.cache/opencode/packages")
-        .join(ANTIGRAVITY_SPEC)
-        .join("node_modules/opencode-antigravity-auth");
+    let installed = installed_antigravity();
     if !installed.is_dir() {
         eprintln!(
             "SKIPPED a_plugin_tool_is_hidden_by_the_same_permission_layer_as_builtins: {} is absent",

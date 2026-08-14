@@ -143,7 +143,8 @@ impl SearchConfig {
     /// A caller that wants a key from elsewhere constructs this struct itself.
     #[must_use]
     pub fn from_env() -> Self {
-        Self::from_lookup(|key| std::env::var(key).ok())
+        let env = oc_paths::Env::from_process();
+        Self::from_lookup(|key| env.value(key).map(str::to_owned))
     }
 
     /// Reads the configuration through a caller-supplied lookup, for tests.

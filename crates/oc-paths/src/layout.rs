@@ -3,7 +3,7 @@
 //! # What is being reproduced
 //!
 //! ```text
-//! const app    = "opencode"
+//! const app    = "zuno"
 //! const data   = path.join(xdgData!,   app)
 //! const cache  = path.join(xdgCache!,  app)
 //! const config = path.join(xdgConfig!, app)
@@ -32,22 +32,20 @@
 //! is recorded in `.omo/notepads/opencode-rust/decisions.md` — a differential
 //! test cannot see it, because both binaries report the same *paths*.
 //!
-//! The eager `mkdir` is observable, though: `TMPDIR=/ opencode debug paths`
-//! prints no paths at all and exits 1 with
-//! `EACCES: permission denied, mkdir '/opencode'`, because import-time creation
-//! runs before the command does.
+//! The eager `mkdir` is observable in the oracle, though: `TMPDIR=/ opencode
+//! debug paths` exits before printing because import-time creation runs first.
 
 use std::path::{Path, PathBuf};
 
 use crate::env::{
-    Env, HOME, OPENCODE_CONFIG_DIR, OPENCODE_DB, OPENCODE_DISABLE_CHANNEL_DB,
-    OPENCODE_DISABLE_PROJECT_CONFIG, OPENCODE_MODELS_URL, OPENCODE_TEST_HOME, TEMP, TMP, TMPDIR,
-    XDG_CACHE_HOME, XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_STATE_HOME,
+    Env, HOME, OPENCODE_CONFIG_DIR, TEMP, TMP, TMPDIR, XDG_CACHE_HOME, XDG_CONFIG_HOME,
+    XDG_DATA_HOME, XDG_STATE_HOME, ZUNO_DB, ZUNO_DISABLE_CHANNEL_DB, ZUNO_DISABLE_PROJECT_CONFIG,
+    ZUNO_MODELS_URL, ZUNO_TEST_HOME,
 };
 use crate::node_path;
 
-/// The application directory name appended to every XDG base — `global.ts:10`.
-pub const APP: &str = "opencode";
+/// The application directory name appended to every XDG base.
+pub const APP: &str = "zuno";
 
 /// Node's `os.tmpdir()` POSIX fallback when none of the temp variables is set.
 pub const DEFAULT_TMPDIR: &str = "/tmp";
@@ -142,11 +140,9 @@ impl Layout {
         let state = node_path::join(&state_base, APP);
         let tmp = node_path::join(&tmpdir(env), APP);
 
-        // `Path.home` uses `??`, so an empty OPENCODE_TEST_HOME wins over the
+        // `Path.home` uses nullish semantics, so an empty ZUNO_TEST_HOME wins over the
         // system home. See the module docs on env.rs for the measured proof.
-        let home = env
-            .value(OPENCODE_TEST_HOME)
-            .map_or(system_home, str::to_owned);
+        let home = env.value(ZUNO_TEST_HOME).map_or(system_home, str::to_owned);
 
         Self {
             bin: PathBuf::from(node_path::join(&cache, "bin")),
@@ -159,11 +155,11 @@ impl Layout {
             state: PathBuf::from(state),
             tmp: PathBuf::from(tmp),
             config_dir_override: env.value(OPENCODE_CONFIG_DIR).map(str::to_owned),
-            disable_project_config: env.flag(OPENCODE_DISABLE_PROJECT_CONFIG),
-            db_override: env.truthy_value(OPENCODE_DB).map(str::to_owned),
-            disable_channel_db: env.exact_flag(OPENCODE_DISABLE_CHANNEL_DB),
+            disable_project_config: env.flag(ZUNO_DISABLE_PROJECT_CONFIG),
+            db_override: env.truthy_value(ZUNO_DB).map(str::to_owned),
+            disable_channel_db: env.exact_flag(ZUNO_DISABLE_CHANNEL_DB),
             models_source: env
-                .truthy_value(OPENCODE_MODELS_URL)
+                .truthy_value(ZUNO_MODELS_URL)
                 .unwrap_or(crate::files::DEFAULT_MODELS_SOURCE)
                 .to_owned(),
         }
@@ -175,7 +171,7 @@ impl Layout {
         &self.home
     }
 
-    /// `Global.Path.data` — `$XDG_DATA_HOME/opencode`.
+    /// `Global.Path.data` — `$XDG_DATA_HOME/zuno`.
     #[must_use]
     pub fn data(&self) -> &Path {
         &self.data
@@ -199,13 +195,13 @@ impl Layout {
         &self.repos
     }
 
-    /// `Global.Path.cache` — `$XDG_CACHE_HOME/opencode`.
+    /// `Global.Path.cache` — `$XDG_CACHE_HOME/zuno`.
     #[must_use]
     pub fn cache(&self) -> &Path {
         &self.cache
     }
 
-    /// `Global.Path.config` — `$XDG_CONFIG_HOME/opencode`.
+    /// `Global.Path.config` — `$XDG_CONFIG_HOME/zuno`.
     ///
     /// This is the raw XDG directory, which is what `debug paths` prints and
     /// what `global.ts:37` creates. `OPENCODE_CONFIG_DIR` does **not** change
@@ -215,13 +211,13 @@ impl Layout {
         &self.config
     }
 
-    /// `Global.Path.state` — `$XDG_STATE_HOME/opencode`.
+    /// `Global.Path.state` — `$XDG_STATE_HOME/zuno`.
     #[must_use]
     pub fn state(&self) -> &Path {
         &self.state
     }
 
-    /// `Global.Path.tmp` — `<os.tmpdir()>/opencode`.
+    /// `Global.Path.tmp` — `<os.tmpdir()>/zuno`.
     #[must_use]
     pub fn temp(&self) -> &Path {
         &self.tmp
@@ -247,25 +243,25 @@ impl Layout {
         self.config_dir_override.as_deref()
     }
 
-    /// Whether `OPENCODE_DISABLE_PROJECT_CONFIG` was truthy.
+    /// Whether `ZUNO_DISABLE_PROJECT_CONFIG` was truthy.
     #[must_use]
     pub fn project_config_disabled(&self) -> bool {
         self.disable_project_config
     }
 
-    /// The non-empty `OPENCODE_DB` value, if any.
+    /// The non-empty `ZUNO_DB` value, if any.
     #[must_use]
     pub fn db_override(&self) -> Option<&str> {
         self.db_override.as_deref()
     }
 
-    /// Whether `OPENCODE_DISABLE_CHANNEL_DB` was exactly `"1"` or `"true"`.
+    /// Whether `ZUNO_DISABLE_CHANNEL_DB` was exactly `"1"` or `"true"`.
     #[must_use]
     pub fn channel_db_disabled(&self) -> bool {
         self.disable_channel_db
     }
 
-    /// The resolved model catalog source: `OPENCODE_MODELS_URL` or the default.
+    /// The resolved model catalog source: `ZUNO_MODELS_URL` or the default.
     #[must_use]
     pub fn models_source(&self) -> &str {
         &self.models_source
@@ -312,7 +308,7 @@ impl Layout {
 ///
 /// The `||` is why an empty variable falls back, and the absence of any
 /// absoluteness check is why a relative one is honoured verbatim — measured:
-/// `XDG_DATA_HOME=relx` makes the oracle report `data relx/opencode`. That is
+/// `XDG_DATA_HOME=relx` resolves to `data relx/zuno`. This is
 /// the single reason the `dirs` crate is not used here; `dirs` discards a
 /// relative XDG value and substitutes the home-relative default, which would
 /// send the Rust binary to a different data directory than the real one.
@@ -336,7 +332,7 @@ fn xdg_base(env: &Env, key: &str, home: &str, defaults: &[&str]) -> String {
 ///
 /// `TMPDIR || TMP || TEMP || "/tmp"`, then one trailing slash removed unless
 /// that would empty the path. The `length > 1` guard is why `TMPDIR=/` yields
-/// `/opencode` rather than `opencode`.
+/// `/zuno` rather than `zuno`.
 fn tmpdir(env: &Env) -> String {
     let raw = env
         .truthy_value(TMPDIR)
@@ -358,30 +354,27 @@ mod tests {
         Layout::resolve_with(&env, None)
     }
 
-    /// The exact output of `opencode debug paths` on this machine with no XDG
-    /// variables set and `HOME=/config`, captured from the 1.18.12 binary.
     #[test]
-    fn reproduces_the_measured_default_layout() {
+    fn resolves_the_default_zuno_layout() {
         let resolved = layout(&[(HOME, "/config")]);
         assert_eq!(
             resolved.debug_paths_dump(),
             concat!(
                 "home       /config\n",
-                "data       /config/.local/share/opencode\n",
-                "bin        /config/.cache/opencode/bin\n",
-                "log        /config/.local/share/opencode/log\n",
-                "repos      /config/.local/share/opencode/repos\n",
-                "cache      /config/.cache/opencode\n",
-                "config     /config/.config/opencode\n",
-                "state      /config/.local/state/opencode\n",
-                "tmp        /tmp/opencode\n",
+                "data       /config/.local/share/zuno\n",
+                "bin        /config/.cache/zuno/bin\n",
+                "log        /config/.local/share/zuno/log\n",
+                "repos      /config/.local/share/zuno/repos\n",
+                "cache      /config/.cache/zuno\n",
+                "config     /config/.config/zuno\n",
+                "state      /config/.local/state/zuno\n",
+                "tmp        /tmp/zuno\n",
             )
         );
     }
 
-    /// Captured from the binary with all four XDG variables pointed at /tmp/x.
     #[test]
-    fn reproduces_the_measured_custom_xdg_layout() {
+    fn resolves_the_custom_xdg_zuno_layout() {
         let resolved = layout(&[
             (HOME, "/config"),
             (XDG_DATA_HOME, "/tmp/x/data"),
@@ -393,58 +386,54 @@ mod tests {
             resolved.debug_paths_dump(),
             concat!(
                 "home       /config\n",
-                "data       /tmp/x/data/opencode\n",
-                "bin        /tmp/x/cache/opencode/bin\n",
-                "log        /tmp/x/data/opencode/log\n",
-                "repos      /tmp/x/data/opencode/repos\n",
-                "cache      /tmp/x/cache/opencode\n",
-                "config     /tmp/x/config/opencode\n",
-                "state      /tmp/x/state/opencode\n",
-                "tmp        /tmp/opencode\n",
+                "data       /tmp/x/data/zuno\n",
+                "bin        /tmp/x/cache/zuno/bin\n",
+                "log        /tmp/x/data/zuno/log\n",
+                "repos      /tmp/x/data/zuno/repos\n",
+                "cache      /tmp/x/cache/zuno\n",
+                "config     /tmp/x/config/zuno\n",
+                "state      /tmp/x/state/zuno\n",
+                "tmp        /tmp/zuno\n",
             )
         );
     }
 
     #[test]
     fn empty_xdg_falls_back_but_empty_test_home_does_not() {
-        let resolved = layout(&[
-            (HOME, "/config"),
-            (XDG_DATA_HOME, ""),
-            (OPENCODE_TEST_HOME, ""),
-        ]);
-        assert_eq!(resolved.data(), Path::new("/config/.local/share/opencode"));
+        let resolved = layout(&[(HOME, "/config"), (XDG_DATA_HOME, ""), (ZUNO_TEST_HOME, "")]);
+        assert_eq!(resolved.data(), Path::new("/config/.local/share/zuno"));
         assert_eq!(resolved.home(), Path::new(""));
     }
 
     #[test]
     fn test_home_overrides_home_but_not_data() {
-        let resolved = layout(&[(HOME, "/config"), (OPENCODE_TEST_HOME, "/tmp/fakehome")]);
+        let resolved = layout(&[(HOME, "/config"), (ZUNO_TEST_HOME, "/tmp/fakehome")]);
         assert_eq!(resolved.home(), Path::new("/tmp/fakehome"));
-        assert_eq!(resolved.data(), Path::new("/config/.local/share/opencode"));
+        assert_eq!(resolved.data(), Path::new("/config/.local/share/zuno"));
     }
 
     #[test]
     fn relative_xdg_is_honoured_verbatim() {
         let resolved = layout(&[(HOME, "/config"), (XDG_DATA_HOME, "relx")]);
-        assert_eq!(resolved.data(), Path::new("relx/opencode"));
-        assert_eq!(resolved.log(), Path::new("relx/opencode/log"));
-        assert_eq!(resolved.repos(), Path::new("relx/opencode/repos"));
+        assert_eq!(resolved.data(), Path::new("relx/zuno"));
+        assert_eq!(resolved.log(), Path::new("relx/zuno/log"));
+        assert_eq!(resolved.repos(), Path::new("relx/zuno/repos"));
     }
 
     #[test]
     fn tmpdir_follows_the_node_ladder() {
-        assert_eq!(layout(&[(TMPDIR, "/a")]).temp(), Path::new("/a/opencode"));
-        assert_eq!(layout(&[(TMP, "/b")]).temp(), Path::new("/b/opencode"));
-        assert_eq!(layout(&[(TEMP, "/c")]).temp(), Path::new("/c/opencode"));
-        assert_eq!(layout(&[]).temp(), Path::new("/tmp/opencode"));
+        assert_eq!(layout(&[(TMPDIR, "/a")]).temp(), Path::new("/a/zuno"));
+        assert_eq!(layout(&[(TMP, "/b")]).temp(), Path::new("/b/zuno"));
+        assert_eq!(layout(&[(TEMP, "/c")]).temp(), Path::new("/c/zuno"));
+        assert_eq!(layout(&[]).temp(), Path::new("/tmp/zuno"));
         // TMPDIR wins over TMP wins over TEMP.
         assert_eq!(
             layout(&[(TMPDIR, "/a"), (TMP, "/b"), (TEMP, "/c")]).temp(),
-            Path::new("/a/opencode")
+            Path::new("/a/zuno")
         );
         assert_eq!(
             layout(&[(TMP, "/b"), (TEMP, "/c")]).temp(),
-            Path::new("/b/opencode")
+            Path::new("/b/zuno")
         );
     }
 
@@ -452,18 +441,16 @@ mod tests {
     fn tmpdir_strips_one_trailing_slash_unless_it_is_root() {
         assert_eq!(
             layout(&[(TMPDIR, "/probe/")]).temp(),
-            Path::new("/probe/opencode")
+            Path::new("/probe/zuno")
         );
-        // The `length > 1` guard: root keeps its slash, so the join yields
-        // `/opencode` — measured against the binary, which then dies trying to
-        // mkdir it.
-        assert_eq!(layout(&[(TMPDIR, "/")]).temp(), Path::new("/opencode"));
+        // The `length > 1` guard keeps the root slash.
+        assert_eq!(layout(&[(TMPDIR, "/")]).temp(), Path::new("/zuno"));
     }
 
     #[test]
     fn config_override_is_nullish_and_does_not_move_config() {
         let resolved = layout(&[(HOME, "/config"), (OPENCODE_CONFIG_DIR, "/tmp/mycfg")]);
-        assert_eq!(resolved.config(), Path::new("/config/.config/opencode"));
+        assert_eq!(resolved.config(), Path::new("/config/.config/zuno"));
         assert_eq!(resolved.effective_config(), Path::new("/tmp/mycfg"));
         assert_eq!(resolved.config_dir_override(), Some("/tmp/mycfg"));
 
@@ -481,24 +468,24 @@ mod tests {
         let fallback = Path::new("/from/passwd");
         assert_eq!(
             Layout::resolve_with(&env, Some(fallback)).data(),
-            Path::new("/from/passwd/.local/share/opencode")
+            Path::new("/from/passwd/.local/share/zuno")
         );
         let with_empty_home = Env::empty().with(HOME, "");
         assert_eq!(
             Layout::resolve_with(&with_empty_home, Some(fallback)).data(),
-            Path::new("/from/passwd/.local/share/opencode")
+            Path::new("/from/passwd/.local/share/zuno")
         );
         let with_home = Env::empty().with(HOME, "/real");
         assert_eq!(
             Layout::resolve_with(&with_home, Some(fallback)).data(),
-            Path::new("/real/.local/share/opencode")
+            Path::new("/real/.local/share/zuno")
         );
     }
 
     #[test]
     fn no_home_at_all_yields_a_relative_base_instead_of_panicking() {
         let resolved = Layout::resolve_with(&Env::empty(), None);
-        assert_eq!(resolved.data(), Path::new(".local/share/opencode"));
+        assert_eq!(resolved.data(), Path::new(".local/share/zuno"));
         assert_eq!(resolved.home(), Path::new(""));
     }
 
@@ -513,17 +500,17 @@ mod tests {
     fn flag_inputs_are_captured_at_resolve_time() {
         let resolved = layout(&[
             (HOME, "/config"),
-            (OPENCODE_DISABLE_PROJECT_CONFIG, "1"),
-            (OPENCODE_DISABLE_CHANNEL_DB, "true"),
-            (OPENCODE_DB, "custom.db"),
-            (OPENCODE_MODELS_URL, "https://example.test"),
+            (ZUNO_DISABLE_PROJECT_CONFIG, "1"),
+            (ZUNO_DISABLE_CHANNEL_DB, "true"),
+            (ZUNO_DB, "custom.db"),
+            (ZUNO_MODELS_URL, "https://example.test"),
         ]);
         assert!(resolved.project_config_disabled());
         assert!(resolved.channel_db_disabled());
         assert_eq!(resolved.db_override(), Some("custom.db"));
         assert_eq!(resolved.models_source(), "https://example.test");
 
-        let bare = layout(&[(HOME, "/config"), (OPENCODE_DB, "")]);
+        let bare = layout(&[(HOME, "/config"), (ZUNO_DB, "")]);
         assert!(!bare.project_config_disabled());
         assert!(!bare.channel_db_disabled());
         assert_eq!(bare.db_override(), None);

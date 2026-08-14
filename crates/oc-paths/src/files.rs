@@ -110,7 +110,7 @@ impl DbLocation {
 /// `.omo/notepads/opencode-rust/issues.md`.
 #[must_use]
 pub fn installation_channel() -> &'static str {
-    match option_env!("OPENCODE_CHANNEL") {
+    match option_env!("ZUNO_CHANNEL") {
         Some(channel) => channel,
         None => LOCAL_CHANNEL,
     }
@@ -256,7 +256,7 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::env::{Env, HOME, OPENCODE_DB, OPENCODE_DISABLE_CHANNEL_DB, OPENCODE_MODELS_URL};
+    use crate::env::{Env, HOME, ZUNO_DB, ZUNO_DISABLE_CHANNEL_DB, ZUNO_MODELS_URL};
 
     fn layout(pairs: &[(&str, &str)]) -> Layout {
         Layout::resolve_with(&Env::from_pairs(pairs.iter().copied()), None)
@@ -269,7 +269,7 @@ mod tests {
     #[test]
     fn artifact_paths_hang_off_the_data_directory() {
         let resolved = base();
-        let data = Path::new("/config/.local/share/opencode");
+        let data = Path::new("/config/.local/share/zuno");
         assert_eq!(resolved.snapshot_root(), data.join("snapshot"));
         assert_eq!(resolved.tool_output(), data.join("tool-output"));
         assert_eq!(resolved.auth_file(), data.join("auth.json"));
@@ -287,7 +287,7 @@ mod tests {
         assert_eq!(
             resolved.snapshot_store("global", worktree),
             Path::new(
-                "/config/.local/share/opencode/snapshot/global/0714ccfc127950dd77bb82077e308e9400a11189"
+                "/config/.local/share/zuno/snapshot/global/0714ccfc127950dd77bb82077e308e9400a11189"
             )
         );
         assert_eq!(
@@ -317,7 +317,7 @@ mod tests {
     #[test]
     fn models_cache_suffixes_only_non_default_sources() {
         let resolved = base();
-        let cache = Path::new("/config/.cache/opencode");
+        let cache = Path::new("/config/.cache/zuno");
         assert_eq!(resolved.models_cache(), cache.join("models.json"));
         assert_eq!(
             resolved.models_cache_for_source(DEFAULT_MODELS_SOURCE),
@@ -331,13 +331,13 @@ mod tests {
             cache.join(&expected)
         );
 
-        let overridden = layout(&[(HOME, "/config"), (OPENCODE_MODELS_URL, mirror)]);
+        let overridden = layout(&[(HOME, "/config"), (ZUNO_MODELS_URL, mirror)]);
         assert_eq!(overridden.models_cache(), cache.join(&expected));
     }
 
     #[test]
     fn db_override_memory_sentinel() {
-        let resolved = layout(&[(HOME, "/config"), (OPENCODE_DB, MEMORY_SENTINEL)]);
+        let resolved = layout(&[(HOME, "/config"), (ZUNO_DB, MEMORY_SENTINEL)]);
         let location = resolved.db_path_for_channel("latest");
         assert_eq!(location, DbLocation::Memory);
         assert!(location.is_memory());
@@ -347,7 +347,7 @@ mod tests {
 
     #[test]
     fn db_override_absolute_is_used_verbatim() {
-        let resolved = layout(&[(HOME, "/config"), (OPENCODE_DB, "/var/lib/oc/custom.db")]);
+        let resolved = layout(&[(HOME, "/config"), (ZUNO_DB, "/var/lib/oc/custom.db")]);
         assert_eq!(
             resolved.db_path_for_channel("latest"),
             DbLocation::File(PathBuf::from("/var/lib/oc/custom.db"))
@@ -358,11 +358,11 @@ mod tests {
     /// the working directory.
     #[test]
     fn db_override_relative_resolves_under_data_not_cwd() {
-        let resolved = layout(&[(HOME, "/config"), (OPENCODE_DB, "relprobe.db")]);
+        let resolved = layout(&[(HOME, "/config"), (ZUNO_DB, "relprobe.db")]);
         let location = resolved.db_path_for_channel("latest");
         assert_eq!(
             location,
-            DbLocation::File(PathBuf::from("/config/.local/share/opencode/relprobe.db"))
+            DbLocation::File(PathBuf::from("/config/.local/share/zuno/relprobe.db"))
         );
         let path = location.as_path().expect("file location");
         assert!(
@@ -373,17 +373,17 @@ mod tests {
         assert_ne!(path, Path::new("relprobe.db"));
 
         // Nested and dot-segmented relative values normalize the Node way.
-        let nested = layout(&[(HOME, "/config"), (OPENCODE_DB, "sub/../db/oc.db")]);
+        let nested = layout(&[(HOME, "/config"), (ZUNO_DB, "sub/../db/oc.db")]);
         assert_eq!(
             nested.db_path_for_channel("latest"),
-            DbLocation::File(PathBuf::from("/config/.local/share/opencode/db/oc.db"))
+            DbLocation::File(PathBuf::from("/config/.local/share/zuno/db/oc.db"))
         );
     }
 
     #[test]
     fn release_channels_use_the_unsuffixed_name() {
         let resolved = base();
-        let data = Path::new("/config/.local/share/opencode");
+        let data = Path::new("/config/.local/share/zuno");
         for channel in UNSUFFIXED_DB_CHANNELS {
             assert_eq!(
                 resolved.db_path_for_channel(channel),
@@ -396,7 +396,7 @@ mod tests {
     #[test]
     fn other_channels_are_suffixed_and_sanitized() {
         let resolved = base();
-        let data = Path::new("/config/.local/share/opencode");
+        let data = Path::new("/config/.local/share/zuno");
         assert_eq!(
             resolved.db_path_for_channel("local"),
             DbLocation::File(data.join("opencode-local.db"))
@@ -414,19 +414,19 @@ mod tests {
     #[test]
     fn disable_channel_db_forces_the_unsuffixed_name_case_sensitively() {
         for value in ["1", "true"] {
-            let resolved = layout(&[(HOME, "/config"), (OPENCODE_DISABLE_CHANNEL_DB, value)]);
+            let resolved = layout(&[(HOME, "/config"), (ZUNO_DISABLE_CHANNEL_DB, value)]);
             assert_eq!(
                 resolved.db_path_for_channel("mybranch"),
-                DbLocation::File(PathBuf::from("/config/.local/share/opencode/opencode.db")),
+                DbLocation::File(PathBuf::from("/config/.local/share/zuno/opencode.db")),
                 "value {value}"
             );
         }
         // `database.ts` compares the raw string, so `TRUE` does not qualify.
-        let uppercase = layout(&[(HOME, "/config"), (OPENCODE_DISABLE_CHANNEL_DB, "TRUE")]);
+        let uppercase = layout(&[(HOME, "/config"), (ZUNO_DISABLE_CHANNEL_DB, "TRUE")]);
         assert_eq!(
             uppercase.db_path_for_channel("mybranch"),
             DbLocation::File(PathBuf::from(
-                "/config/.local/share/opencode/opencode-mybranch.db"
+                "/config/.local/share/zuno/opencode-mybranch.db"
             ))
         );
     }
@@ -435,8 +435,8 @@ mod tests {
     fn db_override_wins_over_the_channel_rules() {
         let resolved = layout(&[
             (HOME, "/config"),
-            (OPENCODE_DB, MEMORY_SENTINEL),
-            (OPENCODE_DISABLE_CHANNEL_DB, "1"),
+            (ZUNO_DB, MEMORY_SENTINEL),
+            (ZUNO_DISABLE_CHANNEL_DB, "1"),
         ]);
         assert_eq!(resolved.db_path_for_channel("mybranch"), DbLocation::Memory);
     }

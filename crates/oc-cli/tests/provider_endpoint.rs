@@ -125,7 +125,11 @@ fn variables(
     config: String,
     extra: &[(&str, &str)],
 ) -> BTreeMap<String, String> {
-    let mut variables = env.env_vars();
+    let mut variables = env
+        .env_vars()
+        .into_iter()
+        .map(|(key, value)| (oc_paths::env::accepted_env_name(&key).to_owned(), value))
+        .collect::<BTreeMap<_, _>>();
     variables.extend(
         extra
             .iter()
@@ -134,14 +138,11 @@ fn variables(
     variables.extend([
         ("NO_COLOR".to_owned(), "1".to_owned()),
         ("TERM".to_owned(), "dumb".to_owned()),
-        ("OPENCODE_PURE".to_owned(), "1".to_owned()),
-        ("OPENCODE_AUTH_CONTENT".to_owned(), "{}".to_owned()),
-        // No `OPENCODE_MODELS_PATH` and no fetch: the config fully specifies
+        ("ZUNO_PURE".to_owned(), "1".to_owned()),
+        ("ZUNO_AUTH_CONTENT".to_owned(), "{}".to_owned()),
+        // No `ZUNO_MODELS_PATH` and no fetch: the config fully specifies
         // `test/test-model`, so nothing but the config may supply the endpoint.
-        (
-            "OPENCODE_DISABLE_MODELS_FETCH".to_owned(),
-            "true".to_owned(),
-        ),
+        ("ZUNO_DISABLE_MODELS_FETCH".to_owned(), "true".to_owned()),
         ("OPENCODE_CONFIG_CONTENT".to_owned(), config),
     ]);
     variables

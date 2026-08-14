@@ -104,8 +104,8 @@ fn run_probe(env: &[(&str, &str)]) -> ProbeRun {
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_oc-log-probe"));
     command
-        .env_remove("OPENCODE_LOG_LEVEL")
-        .env_remove("OPENCODE_PRINT_LOGS")
+        .env_remove("ZUNO_LOG_LEVEL")
+        .env_remove("ZUNO_PRINT_LOGS")
         .env_remove("OC_PROBE_ROTATION")
         .env_remove("OC_PROBE_DIRECTIVES")
         .env("OC_PROBE_LOG_DIR", &log_dir);
@@ -194,7 +194,7 @@ fn an_info_record_in_a_stdout_framing_mode_lands_only_in_the_file() {
 /// terminal at all.
 #[test]
 fn stdout_stays_pure_even_with_the_terminal_sink_enabled() {
-    let run = run_probe(&[("OPENCODE_PRINT_LOGS", "1")]);
+    let run = run_probe(&[("ZUNO_PRINT_LOGS", "1")]);
     assert!(run.success, "probe failed.\nstderr:\n{}", run.stderr);
 
     assert_stdout_is_pure(&run);
@@ -217,7 +217,7 @@ fn stdout_stays_pure_even_with_the_terminal_sink_enabled() {
 /// is the test that would catch it.
 #[test]
 fn print_logs_accepts_only_the_literal_one() {
-    let enabled = run_probe(&[("OPENCODE_PRINT_LOGS", "1")]);
+    let enabled = run_probe(&[("ZUNO_PRINT_LOGS", "1")]);
     assert!(
         enabled.success,
         "probe failed.\nstderr:\n{}",
@@ -226,7 +226,7 @@ fn print_logs_accepts_only_the_literal_one() {
     assert!(enabled.stderr.contains("probe-info"));
 
     for rejected in ["true", "TRUE", "yes", "0", "on", ""] {
-        let run = run_probe(&[("OPENCODE_PRINT_LOGS", rejected)]);
+        let run = run_probe(&[("ZUNO_PRINT_LOGS", rejected)]);
         assert!(run.success, "probe failed.\nstderr:\n{}", run.stderr);
         assert!(
             !run.stderr.contains("probe-info"),
@@ -272,7 +272,7 @@ fn the_log_level_environment_variable_follows_the_oracle() {
     ]);
 
     for (value, (resolved, present, absent)) in cases {
-        let run = run_probe(&[("OPENCODE_LOG_LEVEL", value)]);
+        let run = run_probe(&[("ZUNO_LOG_LEVEL", value)]);
         assert!(
             run.success,
             "probe failed for {value:?}.\nstderr:\n{}",
@@ -309,7 +309,7 @@ fn the_log_level_environment_variable_follows_the_oracle() {
 /// `TRACE` is the programmatic directive string.
 #[test]
 fn trace_is_reachable_only_through_programmatic_directives() {
-    let via_env = run_probe(&[("OPENCODE_LOG_LEVEL", "TRACE")]);
+    let via_env = run_probe(&[("ZUNO_LOG_LEVEL", "TRACE")]);
     assert!(
         via_env.success,
         "probe failed.\nstderr:\n{}",
@@ -362,7 +362,7 @@ fn a_second_init_installs_nothing_and_does_not_panic() {
 /// turn, with nobody passing an id down by hand.
 #[test]
 fn records_carry_their_enclosing_span_stack() {
-    let run = run_probe(&[("OPENCODE_LOG_LEVEL", "DEBUG")]);
+    let run = run_probe(&[("ZUNO_LOG_LEVEL", "DEBUG")]);
     assert!(run.success, "probe failed.\nstderr:\n{}", run.stderr);
 
     let provider_line = run
@@ -390,7 +390,7 @@ fn records_carry_their_enclosing_span_stack() {
 /// that makes a call which stops being tracked visible instead of an absence.
 #[test]
 fn the_tool_lifecycle_records_every_phase_with_its_call_id() {
-    let run = run_probe(&[("OPENCODE_LOG_LEVEL", "DEBUG")]);
+    let run = run_probe(&[("ZUNO_LOG_LEVEL", "DEBUG")]);
     assert!(run.success, "probe failed.\nstderr:\n{}", run.stderr);
 
     for phase in ["pending", "running", "completed", "error", "abandoned"] {
@@ -427,8 +427,8 @@ fn the_rotating_policy_writes_a_dated_file_in_the_configured_directory() {
     let log_dir = dir.path().join("nested").join("log");
 
     let output = Command::new(env!("CARGO_BIN_EXE_oc-log-probe"))
-        .env_remove("OPENCODE_LOG_LEVEL")
-        .env_remove("OPENCODE_PRINT_LOGS")
+        .env_remove("ZUNO_LOG_LEVEL")
+        .env_remove("ZUNO_PRINT_LOGS")
         .env("OC_PROBE_LOG_DIR", &log_dir)
         .env("OC_PROBE_ROTATION", "daily")
         .output()
@@ -475,8 +475,8 @@ fn an_unusable_log_directory_fails_with_the_path_in_the_message() {
     std::fs::write(&blocker, b"not a directory").expect("write the blocking file");
 
     let output = Command::new(env!("CARGO_BIN_EXE_oc-log-probe"))
-        .env_remove("OPENCODE_LOG_LEVEL")
-        .env_remove("OPENCODE_PRINT_LOGS")
+        .env_remove("ZUNO_LOG_LEVEL")
+        .env_remove("ZUNO_PRINT_LOGS")
         .env("OC_PROBE_LOG_DIR", &blocker)
         .output()
         .expect("the probe binary runs");

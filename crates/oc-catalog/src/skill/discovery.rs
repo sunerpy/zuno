@@ -477,7 +477,7 @@ mod tests {
         let claude = fixture.skill("home/.claude/skills/a", "a");
         let agents = fixture.skill("home/.agents/skills/b", "b");
         let project = fixture.skill("proj/.agents/skills/c", "c");
-        let config = fixture.skill("home/.config/opencode/skill/d", "d");
+        let config = fixture.skill("home/.config/zuno/skill/d", "d");
         let configured = fixture.skill("extra/e", "e");
         fs::create_dir_all(fixture.dir.path().join("proj/sub")).expect("mkdir");
 
@@ -515,7 +515,7 @@ mod tests {
         let agents = fixture.skill("home/.agents/skills/b", "b");
         let project = fixture.skill("proj/.agents/skills/d", "d");
 
-        let env = fixture.env().with(OPENCODE_DISABLE_CLAUDE_CODE_SKILLS, "1");
+        let env = fixture.env().with("ZUNO_DISABLE_CLAUDE_CODE_SKILLS", "1");
         let options = SkillOptions::new(
             fixture.dir.path().join("proj"),
             None::<PathBuf>,
@@ -558,9 +558,9 @@ mod tests {
         fixture.skill("home/.claude/skills/a", "a");
         fixture.skill("home/.agents/skills/b", "b");
         fixture.skill("proj/.agents/skills/c", "c");
-        let config = fixture.skill("home/.config/opencode/skills/d", "d");
+        let config = fixture.skill("home/.config/zuno/skills/d", "d");
 
-        let env = fixture.env().with(OPENCODE_DISABLE_EXTERNAL_SKILLS, "1");
+        let env = fixture.env().with("ZUNO_DISABLE_EXTERNAL_SKILLS", "1");
         let options = SkillOptions::new(
             fixture.dir.path().join("proj"),
             None::<PathBuf>,
@@ -729,7 +729,7 @@ mod tests {
         let options = fixture.options("proj", Vec::new());
         assert_eq!(
             options.remote_cache_root(),
-            fixture.home().join(".cache/opencode/skills")
+            fixture.home().join(".cache/zuno/skills")
         );
     }
 }

@@ -111,9 +111,18 @@ impl<'a> Sandbox<'a> {
         self.env.xdg_config().join("opencode")
     }
 
+    fn zuno_config_dir(&self) -> PathBuf {
+        self.env.xdg_config().join("zuno")
+    }
+
     fn raw(&self, path: &Path, body: &str) {
         fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         fs::write(path, body).expect("write");
+        if let Ok(relative) = path.strip_prefix(self.config_dir()) {
+            let zuno = self.zuno_config_dir().join(relative);
+            fs::create_dir_all(zuno.parent().expect("parent")).expect("mkdir");
+            fs::write(zuno, body).expect("write");
+        }
     }
 
     fn skill(&self, dir: &Path, name: &str, description: Option<&str>) {
@@ -483,6 +492,17 @@ async fn debug_skill_matches_the_oracle_across_every_root() -> Result<(), Box<dy
         // Snapshot what the Rust side needs before `with_env` takes ownership.
         let vars = case.env.env_vars();
         let cwd = case.env.working_dir().to_path_buf();
+        let normalizer = Normalizer::none()
+            .mask_literal(
+                "oracle-config-directory",
+                case.env.xdg_config().join("opencode").to_string_lossy(),
+                "<CONFIG-DIRECTORY>",
+            )
+            .mask_literal(
+                "zuno-config-directory",
+                case.env.xdg_config().join("zuno").to_string_lossy(),
+                "<CONFIG-DIRECTORY>",
+            );
 
         // `with_env` owns the scripted directories for the rest of this
         // iteration, which is what keeps the temporary tree alive.
@@ -512,7 +532,7 @@ async fn debug_skill_matches_the_oracle_across_every_root() -> Result<(), Box<dy
             &oracle_json,
             format!("oc-catalog skill case {}", case.name),
             &rust_json,
-            &Normalizer::none(),
+            &normalizer,
         );
         if report.is_identical() {
             eprintln!(
@@ -554,11 +574,21 @@ async fn the_real_skill_tree_yields_the_same_names_as_the_oracle() -> Result<(),
 
     let scratch = TempDir::new()?;
     let cwd = scratch.path().to_path_buf();
+    let legacy_config = host_legacy_config_dir();
+    let host_env = Env::from_process().with(
+        "OPENCODE_CONFIG_DIR",
+        legacy_config.to_string_lossy().into_owned(),
+    );
+    let vars = host_env
+        .iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect::<BTreeMap<_, _>>();
 
-    let config = real_config(&cwd);
-    let skills = load(&SkillOptions::from_process(
+    let config = real_config(&cwd, &host_env, &legacy_config);
+    let skills = load(&SkillOptions::from_config(
         cwd.clone(),
         None::<PathBuf>,
+        &host_env,
         &config,
     ))
     .await;
@@ -566,7 +596,7 @@ async fn the_real_skill_tree_yields_the_same_names_as_the_oracle() -> Result<(),
 
     let pure = parse_skills(&run_debug_skill_with(
         oracle.program(),
-        None,
+        Some(&vars),
         &cwd,
         &["--pure", "debug", "skill"],
     )?)?;
@@ -592,7 +622,7 @@ async fn the_real_skill_tree_yields_the_same_names_as_the_oracle() -> Result<(),
 
     // Not a weaker second check: this is what pins the `--pure` choice to the
     // plugin layer instead of leaving it as an unexplained convenience.
-    let plain = parse_skills(&run_debug_skill(oracle.program(), None, &cwd)?)?;
+    let plain = parse_skills(&run_debug_skill(oracle.program(), Some(&vars), &cwd)?)?;
     let plain_names: BTreeSet<String> = plain.keys().cloned().collect();
     let plugin_only: Vec<&String> = plain_names.difference(&rust_names).collect();
     for name in &plugin_only {
@@ -626,15 +656,16 @@ async fn the_real_skill_tree_yields_the_same_names_as_the_oracle() -> Result<(),
 /// unrecognized `theme` key. That is a schema gap in another crate; it must not
 /// silently change what this test compares, so the fallback asserts the file
 /// configures no skills at all.
-fn real_config(cwd: &Path) -> Config {
-    match discover_with(&DiscoveryOptions::from_process(
+fn real_config(cwd: &Path, env: &Env, legacy_config: &Path) -> Config {
+    match discover_with(&DiscoveryOptions::new(
         cwd.to_path_buf(),
         None::<PathBuf>,
+        env.clone(),
     )) {
         Ok(config) => config,
         Err(error) => {
             eprintln!("real config did not load ({error}); continuing with defaults");
-            let global = oc_paths::config().join("opencode.json");
+            let global = legacy_config.join("opencode.json");
             if let Ok(text) = fs::read_to_string(&global) {
                 assert!(
                     !text.contains("\"skills\""),
@@ -647,10 +678,26 @@ fn real_config(cwd: &Path) -> Config {
     }
 }
 
+fn host_legacy_config_dir() -> PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .unwrap_or_else(|| PathBuf::from(".config"));
+    base.join("opencode")
+}
+
 /// Whether a location sits in the `skills.urls[]` download cache, which only the
 /// remote root can populate (`skill/discovery.ts:35`).
 fn is_remote_cache(location: &str) -> bool {
-    Path::new(location).starts_with(oc_paths::cache().join("skills"))
+    let path = Path::new(location);
+    path.starts_with(oc_paths::cache().join("skills"))
+        || path.starts_with(
+            oc_paths::cache()
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .join("opencode/skills"),
+        )
 }
 
 /// A divergence list that outlives its cause is worse than no list: it makes a

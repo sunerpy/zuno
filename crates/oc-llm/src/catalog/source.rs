@@ -7,9 +7,9 @@
 //!
 //! | variable | question it answers | effect |
 //! |---|---|---|
-//! | `OPENCODE_MODELS_URL` | *where* would a fetch go | changes the source **and** the cache filename |
-//! | `OPENCODE_MODELS_PATH` | read this file **instead** | bypasses the cache path entirely; never written to |
-//! | `OPENCODE_DISABLE_MODELS_FETCH` | may we go to the network | no fetch, ever — including at startup |
+//! | `ZUNO_MODELS_URL` | *where* would a fetch go | changes the source **and** the cache filename |
+//! | `ZUNO_MODELS_PATH` | read this file **instead** | bypasses the cache path entirely; never written to |
+//! | `ZUNO_DISABLE_MODELS_FETCH` | may we go to the network | no fetch, ever — including at startup |
 //!
 //! Three details that a reimplementation gets wrong by default:
 //!
@@ -18,11 +18,11 @@
 //!    (`models-dev.ts:161-164`), so pointing at a mirror cannot poison the
 //!    default cache. `oc-paths` already implements this; this module does not
 //!    re-derive it.
-//! 2. **`OPENCODE_MODELS_URL` is read with JavaScript `||` semantics**, so
-//!    `OPENCODE_MODELS_URL=""` means *unset*, not "empty source"
-//!    (`models-dev.ts:160`). `OPENCODE_DISABLE_MODELS_FETCH` goes through
+//! 2. **`ZUNO_MODELS_URL` is read with JavaScript `||` semantics**, so
+//!    `ZUNO_MODELS_URL=""` means *unset*, not "empty source"
+//!    (`models-dev.ts:160`). `ZUNO_DISABLE_MODELS_FETCH` goes through
 //!    `Flag.truthy` instead, where only `"1"` and a case-insensitive `"true"`
-//!    count (`flag.ts:3-6`) — so `OPENCODE_DISABLE_MODELS_FETCH=0`, `=no` and
+//!    count (`flag.ts:3-6`) — so `ZUNO_DISABLE_MODELS_FETCH=0`, `=no` and
 //!    `=yes` all leave fetching **enabled**. Both are `oc-paths::Env` methods
 //!    already; this module uses them rather than parsing strings again.
 //! 3. **An unreadable cache file is deleted; an unreadable explicit path is not**
@@ -45,7 +45,7 @@
 //! providers *over* whatever the load returned, so an empty document plus a config
 //! that names its own provider, model, cost and limits still resolves that model.
 //! Measured on 1.18.12 under `env -i`, an empty `XDG_CACHE_HOME`,
-//! `OPENCODE_DISABLE_MODELS_FETCH=1` and no `OPENCODE_MODELS_PATH`: `opencode
+//! `ZUNO_DISABLE_MODELS_FETCH=1` and no `ZUNO_MODELS_PATH`: `opencode
 //! models` exits 0 and prints `test/test-model` from config alone.
 //!
 //! So [`CatalogSource::load`] returns `Ok` with an empty [`CatalogDocument`] here,
@@ -73,7 +73,7 @@
 //! workspace forbids, or a committed blob to keep current forever.
 //!
 //! The cost is a listing difference, not a functional one: under
-//! `OPENCODE_DISABLE_MODELS_FETCH` with no cache, upstream lists its seven gateway
+//! `ZUNO_DISABLE_MODELS_FETCH` with no cache, upstream lists its seven gateway
 //! models and this crate lists none. Anything the user's own config declares
 //! resolves identically on both sides, which is what
 //! `tests/catalog_differential.rs` asserts byte for byte.
@@ -87,10 +87,10 @@ use oc_paths::env::Env;
 use crate::catalog::error::CatalogError;
 use crate::catalog::models_dev::CatalogDocument;
 
-/// `OPENCODE_MODELS_PATH` — read this catalog file instead of the cache.
-pub const OPENCODE_MODELS_PATH: &str = "OPENCODE_MODELS_PATH";
-/// `OPENCODE_DISABLE_MODELS_FETCH` — never go to the network for the catalog.
-pub const OPENCODE_DISABLE_MODELS_FETCH: &str = "OPENCODE_DISABLE_MODELS_FETCH";
+/// `ZUNO_MODELS_PATH` — read this catalog file instead of the cache.
+pub const ZUNO_MODELS_PATH: &str = "ZUNO_MODELS_PATH";
+/// `ZUNO_DISABLE_MODELS_FETCH` — never go to the network for the catalog.
+pub const ZUNO_DISABLE_MODELS_FETCH: &str = "ZUNO_DISABLE_MODELS_FETCH";
 
 /// How long a cache file counts as fresh — `models-dev.ts:165`.
 pub const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -125,12 +125,12 @@ impl CatalogSource {
     #[must_use]
     pub fn resolve(env: &Env, layout: &Layout) -> Self {
         Self {
-            // `models_source()` is `OPENCODE_MODELS_URL` with `||` semantics and
+            // `models_source()` is `ZUNO_MODELS_URL` with `||` semantics and
             // the models.dev default; the cache filename hangs off it.
             source: layout.models_source().to_owned(),
             cache: layout.models_cache(),
-            explicit_path: env.truthy_value(OPENCODE_MODELS_PATH).map(PathBuf::from),
-            fetch_disabled: env.flag(OPENCODE_DISABLE_MODELS_FETCH),
+            explicit_path: env.truthy_value(ZUNO_MODELS_PATH).map(PathBuf::from),
+            fetch_disabled: env.flag(ZUNO_DISABLE_MODELS_FETCH),
         }
     }
 
@@ -146,7 +146,7 @@ impl CatalogSource {
         &self.cache
     }
 
-    /// The file `OPENCODE_MODELS_PATH` named, if it named one.
+    /// The file `ZUNO_MODELS_PATH` named, if it named one.
     #[must_use]
     pub fn explicit_path(&self) -> Option<&Path> {
         self.explicit_path.as_deref()
@@ -379,14 +379,14 @@ impl CatalogSource {
 ///
 /// Travels with the document because the *same* empty document means two opposite
 /// things. Loaded from a cache that genuinely lists nothing, an absent model is a
-/// wrong id. Left empty because `OPENCODE_DISABLE_MODELS_FETCH` forbade the only
+/// wrong id. Left empty because `ZUNO_DISABLE_MODELS_FETCH` forbade the only
 /// remaining way to fill it, an absent model is a policy problem with a named fix —
 /// and a caller with no way to tell those apart must either fail on both, which
 /// breaks the air-gapped user todo 108 exists for, or fail on neither, which is how
 /// an unknown model degrades into a mysteriously empty model picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogProvenance {
-    /// Read from the file `OPENCODE_MODELS_PATH` named.
+    /// Read from the file `ZUNO_MODELS_PATH` named.
     ExplicitPath(PathBuf),
     /// Read from this source's cache file.
     Cache(PathBuf),
@@ -482,7 +482,7 @@ fn user_agent() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oc_paths::env::{HOME, OPENCODE_MODELS_URL, XDG_CACHE_HOME};
+    use oc_paths::env::{HOME, XDG_CACHE_HOME, ZUNO_MODELS_URL};
 
     fn source_for(pairs: &[(&str, &str)]) -> CatalogSource {
         let env = Env::from_pairs(pairs.iter().copied());
@@ -494,7 +494,7 @@ mod tests {
     fn the_default_source_caches_at_models_json() {
         let source = source_for(&[(HOME, "/h"), (XDG_CACHE_HOME, "/c")]);
         assert_eq!(source.source(), "https://models.opencode.ai");
-        assert_eq!(source.cache(), Path::new("/c/opencode/models.json"));
+        assert_eq!(source.cache(), Path::new("/c/zuno/models.json"));
         assert_eq!(source.api_url(), "https://models.opencode.ai/api.json");
     }
 
@@ -503,7 +503,7 @@ mod tests {
         let source = source_for(&[
             (HOME, "/h"),
             (XDG_CACHE_HOME, "/c"),
-            (OPENCODE_MODELS_URL, "https://mirror.example.com"),
+            (ZUNO_MODELS_URL, "https://mirror.example.com"),
         ]);
         assert_eq!(source.source(), "https://mirror.example.com");
         // sha1("https://mirror.example.com"); the suffix keeps a mirror from
@@ -514,20 +514,16 @@ mod tests {
             file.starts_with("models-") && file.ends_with(".json") && file.len() == 7 + 40 + 5,
             "expected models-<40 hex>.json, got {file}"
         );
-        assert_ne!(source.cache(), Path::new("/c/opencode/models.json"));
+        assert_ne!(source.cache(), Path::new("/c/zuno/models.json"));
         assert_eq!(source.api_url(), "https://mirror.example.com/api.json");
     }
 
     #[test]
     fn an_empty_models_url_means_unset() {
         // JavaScript `||`: `models-dev.ts:160` treats "" as absent.
-        let source = source_for(&[
-            (HOME, "/h"),
-            (XDG_CACHE_HOME, "/c"),
-            (OPENCODE_MODELS_URL, ""),
-        ]);
+        let source = source_for(&[(HOME, "/h"), (XDG_CACHE_HOME, "/c"), (ZUNO_MODELS_URL, "")]);
         assert_eq!(source.source(), "https://models.opencode.ai");
-        assert_eq!(source.cache(), Path::new("/c/opencode/models.json"));
+        assert_eq!(source.cache(), Path::new("/c/zuno/models.json"));
     }
 
     #[test]
@@ -535,11 +531,11 @@ mod tests {
         // `Flag.truthy` — flag.ts:3-6. Everything else leaves fetching on, so
         // `=0` and `=no` must not silently disable the network.
         for value in ["1", "true", "TRUE", "True"] {
-            let source = source_for(&[(HOME, "/h"), (OPENCODE_DISABLE_MODELS_FETCH, value)]);
+            let source = source_for(&[(HOME, "/h"), (ZUNO_DISABLE_MODELS_FETCH, value)]);
             assert!(source.fetch_disabled(), "{value} should disable the fetch");
         }
         for value in ["0", "false", "no", "yes", "", "2"] {
-            let source = source_for(&[(HOME, "/h"), (OPENCODE_DISABLE_MODELS_FETCH, value)]);
+            let source = source_for(&[(HOME, "/h"), (ZUNO_DISABLE_MODELS_FETCH, value)]);
             assert!(
                 !source.fetch_disabled(),
                 "{value} must not disable the fetch"
@@ -552,7 +548,7 @@ mod tests {
         let source = source_for(&[
             (HOME, "/h"),
             (XDG_CACHE_HOME, "/c"),
-            (OPENCODE_MODELS_PATH, "/pinned/fixture.json"),
+            (ZUNO_MODELS_PATH, "/pinned/fixture.json"),
         ]);
         assert_eq!(
             source.explicit_path(),
@@ -561,6 +557,6 @@ mod tests {
         assert_eq!(source.read_path(), Path::new("/pinned/fixture.json"));
         // The cache path is still computed: refresh() writes there even when a
         // read comes from the explicit path.
-        assert_eq!(source.cache(), Path::new("/c/opencode/models.json"));
+        assert_eq!(source.cache(), Path::new("/c/zuno/models.json"));
     }
 }
