@@ -582,6 +582,111 @@ reuses `mcp.rs`'s single bounded POST rather than a second client.
 
 ---
 
+## E-11. deepseek-harness findings — one principled contradiction, and a cheaper gate **[pure]**
+
+**Requested by the user 2026-08-13**: analyse `deepseek-ai/deepseek-harness` (`dsh`) and its paper.
+Full report: `.omo/research/deepseek-harness.md` (51 KB, source-grounded with file:line).
+
+### First correction: it is not what the name suggests
+
+**`dsh` is a production agent runtime, not an evaluation harness.** "Harness" here means *the thing
+that wraps a model to make it act*. Not a SWE-bench rig, not an RL environment. I had assumed
+otherwise when dispatching, and that assumption would have made the whole report unusable had the
+researcher not established it first.
+
+### The headline: a principled contradiction of "machine-checked completion gates"
+
+E-4 and the Zuno strategy both rank machine-checked completion gates highly, on the strength of two
+independent implementations (prime-agent, claw-code). **`dsh` is a fifth independent goal-loop
+implementation that deliberately does NOT machine-check completion**, and what it builds instead is
+better than nothing and cheaper than a test runner.
+
+`packages/goal/tool-goal/src/index.ts:298-305` — the terminal transition runs no test, evaluates no
+acceptance criteria, and calls no judge model. Completion is model self-report. **What is machine-
+enforced is *who may make the claim*, not *whether it is true*:**
+
+- **Compare-and-set on the goal revision** (`tool-goal/src/index.ts:145-154`): the model must pass
+  the exact `revision` it read from `get_goal`; a stale revision is rejected. This defeats completing
+  a goal the model has not re-read.
+- **Authority tiers** (`authority.ts:19-22, 90-93, 101-108`): `create_goal`, `edit`, `pause`,
+  `resume` require **direct human input** — a `user/message` whose `source.kind === 'user'` inside the
+  current *root-agent* turn. **A model may never create, re-scope, or re-arm its own goal.**
+  Subagents are structurally excluded (`authority.ts:71`).
+- The doc comment names the attack it defends: *"An omitted `Agent.followup()` / `steer()` source
+  resolves to `user`, so non-human producers must supply their own source rather than inheriting this
+  authority."* That is a real hole, found and closed.
+
+**This is the same philosophy as this project's "modes as permission rulesets a model cannot argue
+with", applied to goal lifecycle** — and it extends it somewhere E-1 did not cover. E-1 already says
+the agent must not set its own goal; `dsh` shows *how to enforce that structurally* rather than by
+convention.
+
+### The cheaper gate worth adopting first
+
+**A structural completion contract**: require a terminal status to be *self-consistent with its own
+fields*. `complete` demands ≥1 evidence item and zero remaining steps; `continue` demands ≥1 next
+step and an empty blocker; `blocked` demands a non-empty concrete blocker. Reject the call otherwise.
+
+Why this goes **before** E-4's evidence-execution gate rather than instead of it:
+- It needs **no test runner, no acceptance criteria, no per-project config**, so it works on day one
+  and on tasks that have no runnable test.
+- It deterministically kills bare "Done!" and self-contradicting completions.
+- The two compose. The researcher's own note: *"this is not a substitute for running tests. Adopt
+  both: structure gate first (always applicable), evidence-execution gate second (applicable when a
+  verify command exists)."*
+
+**This is directly relevant to this project's own history.** Across 183 todos the single most common
+failure was a subagent reporting success while `cargo test` disagreed — and several reported success
+having produced *nothing at all* (FU-2's first dispatch: 5m46s, zero commits, zero evidence). A
+structural contract would have caught the empty-handed ones without running anything.
+
+### Corroboration ledger — what changes and what does not
+
+| Prior finding | `dsh` verdict |
+|---|---|
+| Persisted user-owned goal with status and budget | **CORROBORATES — 5th independent implementation** (`GoalSnapshot { objective, phase, blockedReason?, maxGoalRounds }`) |
+| Machine-checked completion gates | **PARTIALLY CONTRADICTS**, and supplies a cheaper gate that composes with it |
+| Livelock breaker | **CORROBORATES — 3rd implementation, best design seen**: `repeat-tool-reminder`, thresholds `[3,5,8]`, canonicalised-arg keying, advisory, counts denials |
+| Typed subtask envelopes | **CORROBORATES**: `RalphRoundReport { status, summary, evidence[], nextSteps[], blocker }`, schema-enforced, double-validated across the boundary |
+| `wait` returns no content | **CORROBORATES from the other direction**: the parent never sees the child transcript; only ≤16 KB of validated JSON crosses |
+| Collaboration modes as prompt text — REFUSED | **CONFIRMS THE REFUSAL**: `dsh`'s `plan-mode` is prompt text only, and its own source admits sandbox and approval are unenforced there |
+| Python/Node substrate — REFUSED | No new evidence; `dsh` *is* Node, and its Code Mode needs a JS realm |
+| Vector-DB memory — REFUSED | No new evidence; `dsh` ships no vector memory at all — the workspace filesystem is its long-term memory |
+
+**Five independent implementations of goal-with-status.** E-1 stays first. But its justification
+changes: the strongest reason is no longer "everyone gates completion" — it is that everyone
+persists a user-owned objective, and the *gating* designs diverge.
+
+### Ideas with no prior counterpart, ranked
+
+1. **Structural completion contract** — above. **[pure]**. Adopt before E-4.
+2. **Monotonic tool guards**: deny is absorbing and "allow" is **not representable**
+   (`packages/core/tools/README.md:25,51`). A guard that cannot be widened by construction is
+   stronger than one that must be checked. **[pure]**, and it matches this project's taste for
+   compile-time impossibility — see todo 179's `E0004` arrival guard.
+3. **`armed | disarmed` activation split** on the goal loop. **[pure]**. A persisted goal that is not
+   currently driving is a distinct state from paused; E-1's status enum should account for it.
+4. **Escalating repeat-call reminder** as livelock breaker: thresholds `[3,5,8]`, keyed on
+   canonicalised arguments, advisory rather than blocking, and it **counts denials** so a model
+   cannot spin against a permission wall. Better than claw-code's or prime-agent's. **[pure]**.
+5. **Block-threshold floor**: a machine-enforced minimum round count before a model may declare
+   itself `blocked` (default 3, `tool-goal/src/index.ts:290-297`). **Premature surrender treated as a
+   first-class failure mode distinct from livelock** — nothing else surveyed had this, and this
+   project has seen it (subagents stopping at their verification limit with work incomplete).
+   **[pure]**.
+6. **`SandboxEnforcement: full | partial`** — the sandbox **reports the limits of its own
+   guarantee** (`docs/subsystems/sandbox.md`). Honest capability reporting rather than an implied
+   promise. **[crate]**, and philosophically close to this project's gating-not-failing rule.
+
+### Not worth adopting
+
+- `dsh`'s completion model **as a replacement** for evidence execution. Its authority tiers are
+  worth taking; its willingness to trust a self-reported `complete` is not, in a project whose
+  review history is a catalogue of exactly that failure.
+- Anything requiring the Node realm: Code Mode, workflow worker-threads.
+- `plan-mode` as prompt text — its own source concedes the enforcement gap this project already
+  closed with permission rulesets.
+
 ## E-8. Deferred, with reasons
 
 - **Agent teams (peer topology, shared task list)** — the only shipped peer-to-peer design is
