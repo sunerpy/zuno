@@ -796,6 +796,32 @@ fn matrix_targets(text: &str, job: &str) -> BTreeSet<String> {
         .collect()
 }
 
+fn codebuild_label_sets(text: &str) -> Vec<Vec<String>> {
+    const PROJECT_LABEL: &str =
+        "codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}";
+
+    let lines: Vec<&str> = text.lines().collect();
+    let mut sets = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.strip_prefix("- ") != Some(PROJECT_LABEL) {
+            continue;
+        }
+
+        let indentation = line.len() - trimmed.len();
+        let labels = lines[index..]
+            .iter()
+            .take_while(|candidate| {
+                candidate.len() - candidate.trim_start().len() == indentation
+                    && candidate.trim_start().starts_with("- ")
+            })
+            .map(|candidate| candidate.trim_start()[2..].to_owned())
+            .collect();
+        sets.push(labels);
+    }
+    sets
+}
+
 #[test]
 fn the_release_matrix_builds_every_target_the_project_ships() {
     let text = workflow("release.yml");
@@ -837,6 +863,65 @@ fn every_built_target_is_also_smoke_tested() {
         unbuilt.is_empty(),
         "release.yml smoke-tests {unbuilt:?}, which nothing builds; that job would \
          fail on a missing artifact"
+    );
+}
+
+#[test]
+fn every_codebuild_job_has_a_unique_label_set() {
+    const EXPECTED_MIGRATED_JOBS: usize = 11;
+    const PROJECT_LABEL: &str =
+        "codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}";
+
+    let workflows = [
+        ("ci.yml", workflow("ci.yml")),
+        ("release.yml", workflow("release.yml")),
+    ];
+    let mut named_sets = Vec::new();
+    for (name, text) in &workflows {
+        for labels in codebuild_label_sets(text) {
+            println!("{name}: {}", labels.join(" + "));
+            named_sets.push((name, labels));
+        }
+    }
+
+    assert_eq!(
+        named_sets.len(),
+        EXPECTED_MIGRATED_JOBS,
+        "expected one CodeBuild label set for each migrated Linux job or matrix leg"
+    );
+
+    let mut routing_labels = BTreeSet::new();
+    let mut complete_sets = BTreeSet::new();
+    for (workflow_name, labels) in &named_sets {
+        assert_eq!(
+            labels.first().map(String::as_str),
+            Some(PROJECT_LABEL),
+            "{workflow_name} does not name the CodeBuild project verbatim"
+        );
+        let routing_label = labels
+            .get(1)
+            .unwrap_or_else(|| panic!("{workflow_name} has no unique second label in {labels:?}"));
+        assert!(
+            routing_label.starts_with("zuno-ci-") || routing_label.starts_with("zuno-release-"),
+            "{workflow_name}'s second label is not a Zuno job identity: {labels:?}"
+        );
+        assert!(
+            routing_labels.insert(routing_label.clone()),
+            "duplicate CodeBuild routing label {routing_label:?}"
+        );
+        assert!(
+            complete_sets.insert(labels.clone()),
+            "duplicate CodeBuild label set {labels:?}"
+        );
+    }
+
+    assert_eq!(
+        workflows[1]
+            .1
+            .matches("runs-on: ${{ matrix.runs_on }}")
+            .count(),
+        2,
+        "both release matrices must select their per-entry label arrays"
     );
 }
 

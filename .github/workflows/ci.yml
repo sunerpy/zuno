@@ -12,6 +12,10 @@
 #     whose smoke step is first exercised during the real release is untested.
 #   * `windows` catches the platform-specific failures a Linux developer cannot
 #     see: path separators, and the two Windows targets the release ships.
+#
+# Linux jobs run on the `zuno-runner` CodeBuild-hosted runner. The Windows job
+# deliberately remains GitHub-hosted: CodeBuild's Linux container cannot execute
+# the native Windows checks, and dropping that job would hide a shipped platform.
 
 name: CI
 
@@ -38,7 +42,9 @@ env:
 jobs:
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
+      - zuno-ci-test
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
@@ -75,7 +81,9 @@ jobs:
   # legible at a glance instead of buried in a 3000-test log.
   supply-chain:
     name: Supply chain
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
+      - zuno-ci-supply-chain
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
@@ -106,7 +114,9 @@ jobs:
   # -------------------------------------------------------------------------
   artifact:
     name: Artifact smoke (host)
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
+      - zuno-ci-artifact
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
@@ -164,7 +174,9 @@ jobs:
   # -------------------------------------------------------------------------
   ci-success:
     name: CI Success
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
+      - zuno-ci-success
     if: always()
     needs: [test, supply-chain, artifact, windows]
     steps:
