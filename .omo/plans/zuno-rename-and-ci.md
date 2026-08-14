@@ -190,6 +190,9 @@ already settled.
 
 ## Z-3. Repository scaffold, per the `github-project-scaffold` skill
 
+**Status: CLOSED (2026-08-14)** — File-side scaffold complete; remote creation, repository metadata,
+and the first push remain explicit follow-up work because this task must not create or push a remote.
+
 **Blocked on: there is no git remote, and no LICENSE.** Both must exist before Z-4 is even possible.
 
 Scope from the skill: a bilingual README (Chinese root + English under `docs/readme/`, slim with a
