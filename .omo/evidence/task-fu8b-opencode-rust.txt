@@ -1,0 +1,43 @@
+PASS
+
+Scope established (2026-08-14)
+- Authoritative source: .omo/plans/opencode-rust-followup.md:320-375 and working rules at :377-393.
+- This task closes FU-8 defect B only: any assistant message ending with zero parts must fail non-zero and name the provider plus the empty response.
+- Defect A is explicitly excluded; turn.rs:1100, family.rs, and surface.rs must remain untouched.
+- Existing contracts to preserve: FU-1 typed retry/rollback and partial-output behavior; FU-7 shared absolute 180-second deadline, visible RetryRollback notice, and escape-free non-TTY/unchanged JSON rendering.
+- Relevant inherited findings: plugin-provided providers flow through runtime plugin config/provider hooks before catalog/registry assembly; canonical provider content is parts-based; run_turn is the production completion chokepoint.
+
+Baseline reproduction (release build, CARGO_TARGET_DIR=/tmp/opencode/fu8b)
+- Command: /tmp/opencode/fu8b/release/opencode-rust run --print-logs --model kiro-auth/claude-haiku-4-5 "say ok"
+- Result: EXIT=0; stdout=0 bytes; stderr=0 bytes; stderr=0 lines.
+- This independently reproduces FU-8B exactly before any source modification.
+
+Root cause and success conversion point
+- The live command could exit zero only after observing `StreamEvent::MessageEnd`: a stream ending without it already returns `TurnError::StreamEndedWithoutMessageEnd`, and any provider/authentication error already returns non-zero.
+- The database independently showed the assistant message had zero parts, excluding a renderer-only loss.
+- `crates/oc-engine/src/loop.rs` checkpointed that zero-part assistant and then unconditionally emitted `TurnCompleted` / returned `TurnOutcome::Completed`. A syntactically complete provider stream was therefore mistaken for a semantically non-empty answer.
+
+Implementation
+- Added `TurnError::EmptyAssistantMessage { provider_id, step }`, whose diagnostic names both the provider and the empty response.
+- Added the universal guard at the engine completion chokepoint after checkpointing and before `AssistantCheckpointed`, tool dispatch, `StepCompleted`, or `TurnCompleted` can report success.
+- The guard checks whether checkpointing can create any assistant part: text, reasoning, or tool call. It does not reduce the contract to visible text, so tool-only turns remain valid.
+- Updated the exhaustive CLI `TurnError` rendering table. No provider routing, retry/deadline, rollback, or renderer behavior changed; FU-8 defect A files remain untouched.
+
+Regression and process-level acceptance
+- `loop_rejects_a_completed_assistant_message_with_zero_parts`: a provider sending only `MessageEnd` returns `EmptyAssistantMessage`, names provider `fake`, contains `empty`, emits no `TurnCompleted`, and leaves the empty checkpoint inspectable.
+- `loop_accepts_a_tool_only_assistant_step_as_non_empty`: a tool-only first step remains valid and the two-step turn completes.
+- `an_empty_assistant_response_exits_non_zero_and_names_the_provider`: the real `opencode-rust run` process receives a complete SSE response with no content, exits non-zero, and prints a diagnostic containing `provider `test`` and `empty`.
+- Existing `dispatch_loop` fixtures were corrected to provide a real text final answer rather than relying on a zero-part `MessageEnd` as a successful second step.
+
+Mutation evidence
+- Before implementation, the named zero-part regression failed to compile because `TurnError::EmptyAssistantMessage` did not exist.
+- After implementation, temporarily deleting only the completion guard made `loop_rejects_a_completed_assistant_message_with_zero_parts` fail with the previous wrong outcome: `Completed { assistant_message_id: "msg_turn-empty-assistant_0001", steps: 1 }`.
+- `crates/oc-engine/src/loop.rs` was restored from a verified non-empty backup after the mutation.
+
+Validation
+- `lsp_diagnostics`: no diagnostics on all five changed Rust files. The MCP root rejected the sibling worktree directly, so an exact temporary copy under the accepted repository root was diagnosed and then removed.
+- `cargo fmt --all -- --check`: clean.
+- `cargo clippy --workspace --all-targets --offline -- -D warnings`: passed with zero warnings.
+- `RUST_TEST_THREADS=1 cargo test --workspace --offline`: 3491 passed, 0 failed, 2 ignored across 217 summaries.
+- A prior parallel workspace run hit host process/thread exhaustion and one transient TypeScript live-server timeout; the isolated live-server test then passed, and the final single-thread workspace gate passed completely.
+- No credential, key, or token was written to source, fixtures, logs, or this evidence.

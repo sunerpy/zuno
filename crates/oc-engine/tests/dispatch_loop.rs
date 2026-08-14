@@ -175,9 +175,12 @@ fn provider_events(calls: &[(&str, &str)]) -> Vec<Vec<StreamEvent>> {
     });
     vec![
         first,
-        vec![StreamEvent::MessageEnd {
-            stop_reason: Some(FinishReason::Stop),
-        }],
+        vec![
+            StreamEvent::TextDelta("tools completed".to_owned()),
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::Stop),
+            },
+        ],
     ]
 }
 

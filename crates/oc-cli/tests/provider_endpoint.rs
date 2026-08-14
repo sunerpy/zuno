@@ -45,7 +45,7 @@ use std::path::PathBuf;
 use std::process::Output;
 use std::time::Duration;
 
-use oc_testkit::{MockProvider, Scenario, ScriptedEnv};
+use oc_testkit::{MockProvider, MockResponse, Scenario, ScriptedEnv};
 
 /// A recorded tool-free text completion — the smallest thing a turn can complete on.
 const CASSETTE: &str = "openai-chat/streams-text";
@@ -183,6 +183,28 @@ async fn mock() -> MockProvider {
         .expect("mock provider binds loopback")
 }
 
+async fn empty_turn_mock() -> MockProvider {
+    let finish = serde_json::json!({
+        "id": "chatcmpl-empty-turn",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "test-model",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+    });
+    let scenario = Scenario::new("empty-turn")
+        .from_oracle_cassette(CASSETTE)
+        .expect("the recorded title completion loads")
+        .respond(MockResponse::authored(
+            200,
+            "text/event-stream",
+            format!("data: {finish}\n\ndata: [DONE]\n\n"),
+            "FU-8B requires a complete provider stream that contains no assistant part",
+        ));
+    MockProvider::start(vec![scenario])
+        .await
+        .expect("empty-turn provider binds loopback")
+}
+
 fn describe(output: &Output) -> String {
     format!("status: {:?}\n{}", output.status, combined(output))
 }
@@ -194,6 +216,27 @@ fn combined(output: &Output) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_assistant_response_exits_non_zero_and_names_the_provider() {
+    let env = ScriptedEnv::new().expect("isolated environment");
+    let provider = empty_turn_mock().await;
+    let base_url = format!("{}/v1", provider.base_url());
+
+    let output = run_prompt(&env, provider_config(None, None, Some(&base_url))).await;
+    let captured = provider.captured().await;
+    provider.shutdown().await;
+
+    assert_eq!(captured.len(), 2, "{}", describe(&output));
+    assert!(
+        !output.status.success(),
+        "a zero-part assistant response must not exit zero\n{}",
+        describe(&output)
+    );
+    let diagnostic = combined(&output);
+    assert!(diagnostic.contains("provider `test`"), "{diagnostic}");
+    assert!(diagnostic.contains("empty"), "{diagnostic}");
 }
 
 /// The product, with no crutch: an endpoint in `options.baseURL` and nowhere else.

@@ -204,6 +204,8 @@ pub enum TurnError {
     StepLimit { agent: String, max_steps: u32 },
     #[error("provider stream ended during step {step} without MessageEnd")]
     StreamEndedWithoutMessageEnd { step: u32 },
+    #[error("provider `{provider_id}` returned an empty assistant response during step {step}")]
+    EmptyAssistantMessage { provider_id: String, step: u32 },
     #[error("provider emitted ToolUseStart before ending the active tool in step {step}")]
     NestedToolUse { step: u32 },
     #[error("provider emitted ToolUseEnd without ToolUseStart in step {step}")]
@@ -602,6 +604,10 @@ impl StepAccumulator {
             || !self.calls.is_empty()
             || self.active_tool.is_some()
     }
+
+    fn has_assistant_parts(&self) -> bool {
+        !self.text.is_empty() || !self.reasoning.is_empty() || !self.calls.is_empty()
+    }
 }
 
 /// Run one complete user turn. Every continuation after a tool result re-enters
@@ -923,6 +929,12 @@ pub async fn run_turn(
             &accumulator,
             false,
         )?;
+        if !accumulator.has_assistant_parts() {
+            return Err(TurnError::EmptyAssistantMessage {
+                provider_id: model.catalog_provider_id,
+                step,
+            });
+        }
         events
             .send(TurnEvent::AssistantCheckpointed {
                 step,

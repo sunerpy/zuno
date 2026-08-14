@@ -824,6 +824,122 @@ async fn loop_full_turn_emits_the_exact_sequence_deterministically() {
 }
 
 #[tokio::test]
+async fn loop_rejects_a_completed_assistant_message_with_zero_parts() {
+    let mut connection = seeded();
+    put_user(
+        &connection,
+        "msg_empty_user",
+        10,
+        "do not accept an empty answer",
+    );
+    let provider = Arc::new(FakeProvider::new(vec![ScriptedResponse::complete(vec![
+        StreamEvent::MessageEnd {
+            stop_reason: Some(FinishReason::Stop),
+        },
+    ])]));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        request("turn-empty-assistant"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, events) = tokio::join!(turn, collect_events(receiver));
+
+    let error = outcome.expect_err("a zero-part assistant message must not complete the turn");
+    let diagnostic = error.to_string();
+    assert!(diagnostic.contains("fake"), "{diagnostic}");
+    assert!(diagnostic.contains("empty"), "{diagnostic}");
+    assert!(matches!(
+        error,
+        TurnError::EmptyAssistantMessage {
+            provider_id,
+            step: 1,
+        } if provider_id == "fake"
+    ));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::TurnCompleted { .. }))
+    );
+
+    let assistant = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .expect("hydrate rejected empty turn")
+        .into_iter()
+        .find(|message| message.info.id == "msg_turn-empty-assistant_0001")
+        .expect("empty assistant checkpoint remains inspectable");
+    assert!(assistant.parts.is_empty());
+}
+
+#[tokio::test]
+async fn loop_accepts_a_tool_only_assistant_step_as_non_empty() {
+    let mut connection = seeded();
+    put_user(&connection, "msg_tool_only_user", 10, "use the echo tool");
+    let provider = Arc::new(FakeProvider::new(vec![
+        ScriptedResponse::complete(vec![
+            StreamEvent::ToolUseStart {
+                id: "call-tool-only".to_owned(),
+                name: "echo".to_owned(),
+            },
+            StreamEvent::ToolInputDelta(r#"{"text":"hello"}"#.to_owned()),
+            StreamEvent::ToolUseEnd,
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::ToolCalls),
+            },
+        ]),
+        ScriptedResponse::complete(vec![
+            StreamEvent::TextDelta("done".to_owned()),
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::Stop),
+            },
+        ]),
+    ]));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        request("turn-tool-only"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, _events) = tokio::join!(turn, collect_events(receiver));
+
+    assert!(matches!(
+        outcome,
+        Ok(TurnOutcome::Completed { steps: 2, .. })
+    ));
+    let assistants = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .expect("hydrate tool-only turn")
+        .into_iter()
+        .filter(|message| message.info.role.as_str() == "assistant")
+        .collect::<Vec<_>>();
+    assert_eq!(assistants.len(), 2);
+    assert_eq!(assistants[0].parts.len(), 1, "tool part counts as output");
+    assert_eq!(assistants[0].parts[0].kind, PartKind::Tool);
+}
+
+#[tokio::test]
 async fn loop_provider_retry_replays_transient_503_and_rolls_back_partial_output() {
     let mut connection = seeded();
     put_user(&connection, "msg_retry_user", 10, "retry once");
