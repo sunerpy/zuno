@@ -223,6 +223,10 @@ rather than replace), and release automation with release-please + git-cliff.
 
 ## Z-4. AWS-hosted GitHub Actions runners, per the `github-actions-on-codebuild` skill
 
+**Status:** PREPARED — Linux workflow edits, least-privilege IAM, project-scoped secret auth, and
+the CodeBuild project are complete; activation and remote CI proof are blocked only on a real GitHub
+PAT with `repo` + `admin:repo_hook`, after which the webhook must be created and deliveries verified.
+
 **Blocked on Z-3.** Runner-mode CodeBuild needs a repository, and the CodeConnections GitHub App
 handshake is **console-only** — no CLI path exists (skill §1).
 

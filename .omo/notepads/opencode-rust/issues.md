@@ -7978,3 +7978,24 @@ topics, and making the first push remain explicit follow-up work.
 - Z-3b (2026-08-14): before the first push, `git count-objects -vH` showed size-pack 3.84 GiB with 48,854 in-pack objects but only 6,954 reachable — unreachable residue from the 48,148 build-product files once committed. `git reflog expire --expire=now --all` + `git gc --prune=now --aggressive` reclaimed it to 5.42 MiB (.git 6.1G -> 5.9M) with `main` unchanged and `git fsck` clean. Lesson: check size-pack vs reachable-object count BEFORE the first push of a repo with a history of mis-commits, or the garbage ships to the remote.
 - Z-4 reachability established (2026-08-14): CodeConnections has NO endpoint in aws-cn (both `codeconnections.` and `codestar-connections.cn-northwest-1.amazonaws.com.cn` fail to connect), and this host's only working credentials are aws-cn (us/jp/dig profiles all return InvalidClientTokenId). But cn CodeBuild does support runner mode: `create-webhook` with a WORKFLOW_JOB_QUEUED filter fails with "Project does not exist" rather than an invalid-filter error, and `import-source-credentials --auth-type PERSONAL_ACCESS_TOKEN` succeeds (probe credential deleted immediately). A buildspec-override probe on the existing `workkit-linux` project measured api.github.com=200, github.com=200, codeload.github.com=301, so cn-northwest-1 CodeBuild can reach GitHub to collect jobs. PAT therefore substitutes for the console-only CodeConnections handshake.
 - Z-4 scope limit measured (2026-08-14): release.yml carries two 6-platform matrices (x86_64/aarch64 linux-musl, x86_64/aarch64 apple-darwin, x86_64/aarch64 pc-windows-msvc). CodeBuild-hosted runners are Linux containers only, so the 4 non-Linux targets CANNOT move — that is a capability boundary, not a preference. ci.yml also has one windows-latest job at :128.
+
+## [2026-08-14] Z-4 — Linux CodeBuild runner prepared; activation awaits PAT
+
+The Linux-only workflow migration is implemented without changing CI topology or dropping any release
+target. Native macOS and Windows legs remain GitHub-hosted by capability necessity. An automated
+release-surface test parses all 11 migrated job/leg label sets and rejects a missing project label,
+missing/duplicate second routing label, duplicate complete set, or matrix that ignores its per-entry
+`runs_on` value.
+
+AWS now has a Zuno-specific role and `zuno-runner` project in `cn-northwest-1`. The role trusts only
+CodeBuild, has exactly two inline policies (project-log writes and one dedicated source-secret read),
+no attached policies, and no ECR/ECS permissions. The project has an empty buildspec, no CodeBuild
+artifacts, status reporting disabled, privileged mode enabled, and `BUILD_GENERAL1_LARGE` chosen for
+the 3,509-test Rust/C workload. Its `source.auth` points directly at a dedicated Secrets Manager ARN,
+so it neither uses nor overwrites the account-level GitHub credential slot that other projects share.
+
+The secret intentionally has no value/version and the webhook intentionally does not exist yet.
+Activation requires a real GitHub classic PAT with `repo` (private repository read/clone and workflow
+job data) plus `admin:repo_hook` (create/manage the `workflow_job` webhook). After the PAT is supplied,
+store it only in that secret, create the `WORKFLOW_JOB_QUEUED`-filtered webhook, push only `task-z4`,
+then record queued/in_progress HTTP 200 deliveries and the full CodeBuild-vs-ubuntu CI comparison.
