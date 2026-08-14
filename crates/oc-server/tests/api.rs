@@ -346,6 +346,46 @@ fn api_openapi_contains_every_owned_oracle_operation() {
     );
 }
 
+#[test]
+fn api_openapi_binds_every_body_with_an_existing_rust_schema() {
+    let document = api::openapi();
+    let request_ref = |path: &str, method: &str| {
+        document["paths"][path][method]["requestBody"]["content"]["application/json"]["schema"]
+            ["$ref"]
+            .as_str()
+    };
+    let response_ref = |path: &str, method: &str| {
+        document["paths"][path][method]["responses"]["200"]["content"]["application/json"]["schema"]
+            ["$ref"]
+            .as_str()
+    };
+
+    assert_eq!(
+        request_ref("/api/session", "post"),
+        Some("#/components/schemas/SessionCreate")
+    );
+    assert_eq!(
+        request_ref("/api/session/prune", "post"),
+        Some("#/components/schemas/SessionPruneMutation")
+    );
+    assert_eq!(
+        response_ref("/api/session", "get"),
+        Some("#/components/schemas/SessionListResponse")
+    );
+    assert_eq!(
+        response_ref("/api/session", "post"),
+        Some("#/components/schemas/SessionResponse")
+    );
+    assert_eq!(
+        response_ref("/api/session/active", "get"),
+        Some("#/components/schemas/SessionActiveResponse")
+    );
+    assert_eq!(
+        response_ref("/api/session/{sessionID}", "get"),
+        Some("#/components/schemas/SessionResponse")
+    );
+}
+
 #[tokio::test]
 async fn api_doc_aliases_serve_the_generated_document() {
     let state = ApiState::memory("/repo").expect("in-memory API state initializes");
@@ -360,6 +400,61 @@ async fn api_doc_aliases_serve_the_generated_document() {
         let document = response_json(response).await;
         assert_eq!(document["openapi"], "3.1.0");
     }
+}
+
+#[tokio::test]
+async fn api_session_response_validates_against_its_published_openapi_binding() {
+    let state = ApiState::memory("/repo").expect("in-memory API state initializes");
+    state
+        .sessions()
+        .create(&SessionCreate::new(
+            "ses_schema",
+            "schema-slug",
+            "global",
+            "/repo",
+            "/repo",
+            "schema validation probe",
+            "test",
+        ))
+        .expect("schema fixture session inserts");
+    let app = api_app(state);
+
+    let document = app
+        .clone()
+        .oneshot(request(Method::GET, "/doc", None))
+        .await
+        .expect("the build serves its own OpenAPI document");
+    assert_eq!(document.status(), StatusCode::OK);
+    let document = response_json(document).await;
+    let schema_ref = document["paths"]["/api/session/{sessionID}"]["get"]["responses"]["200"]
+        ["content"]["application/json"]["schema"]["$ref"]
+        .as_str()
+        .expect("GET /api/session/{sessionID} publishes a JSON response schema reference");
+    let schema_name = schema_ref
+        .strip_prefix("#/components/schemas/")
+        .expect("the response schema reference resolves inside the published document");
+    let schema = &document["components"]["schemas"][schema_name];
+    assert!(
+        schema.is_object(),
+        "the bound response component `{schema_name}` exists"
+    );
+    let validator = jsonschema::validator_for(schema)
+        .unwrap_or_else(|error| panic!("published `{schema_name}` schema compiles: {error}"));
+
+    let response = app
+        .oneshot(request(Method::GET, "/api/session/ses_schema", None))
+        .await
+        .expect("bound session route responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    let errors = validator
+        .iter_errors(&body)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        errors.is_empty(),
+        "GET /api/session/ses_schema returned a body rejected by its own published schema: {errors:?}; body={body}"
+    );
 }
 
 #[tokio::test]

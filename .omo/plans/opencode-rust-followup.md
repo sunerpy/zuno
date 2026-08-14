@@ -109,6 +109,8 @@ observable difference.
 
 ## FU-4. The published OpenAPI binds no request or response bodies
 
+**Status: CLOSED (2026-08-13)** — Every body already described by a Rust `JsonSchema` type is now bound in `/doc`; the remaining 48 operations are frozen by operation and reason in the generated compatibility inventory.
+
 **Source**: F3, finding F3-W13-03, Round 1.
 
 **What F3 measured**: the document served at `/doc` binds **0 of 60** operations to any

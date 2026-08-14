@@ -150,6 +150,11 @@ pub fn openapi() -> Value {
     openapi::document()
 }
 
+#[must_use]
+pub const fn openapi_body_schema_gaps() -> &'static [(&'static str, &'static str, &'static str)] {
+    openapi::body_schema_gaps()
+}
+
 async fn document() -> Json<Value> {
     Json(openapi())
 }
