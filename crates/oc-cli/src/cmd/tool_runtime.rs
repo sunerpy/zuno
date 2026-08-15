@@ -146,16 +146,17 @@ pub(crate) fn assemble(
         plugin_tools: selection.plugin_tools.to_vec(),
     }));
 
+    let memory_root = worktree.unwrap_or(directory);
+    if let Some(memory) = configured_memory_tool(memory_root, config) {
+        builder.register_configured_builtin(memory);
+    }
+
     let registry = builder.build();
-    let mut tools = registry.resolve(ResolveInput::new(
+    let tools = registry.resolve(ResolveInput::new(
         selection.model_id,
         selection.provider_id,
         &rules,
     ));
-    let memory_root = worktree.unwrap_or(directory);
-    if let Some(memory) = configured_memory_tool(memory_root, config) {
-        tools.push(memory);
-    }
     Ok(ToolRuntime { tools, rules })
 }
 

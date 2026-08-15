@@ -223,6 +223,7 @@ pub struct ToolRegistryBuilder {
     flags: RegistryFlags,
     file_tools: FileTools,
     builtins: BTreeMap<BuiltinSlot, Arc<dyn Tool>>,
+    configured_builtins: Vec<Arc<dyn Tool>>,
     custom_loader: Arc<dyn CustomToolLoader>,
     mcp_loader: Arc<dyn McpToolLoader>,
 }
@@ -251,6 +252,7 @@ impl ToolRegistryBuilder {
             flags,
             file_tools,
             builtins,
+            configured_builtins: Vec::new(),
             custom_loader: Arc::new(NoopCustomToolLoader),
             mcp_loader: Arc::new(NoopMcpToolLoader),
         }
@@ -280,6 +282,16 @@ impl ToolRegistryBuilder {
         }
         self.builtins.insert(slot, tool);
         Ok(self)
+    }
+
+    /// Register a configured built-in that has no fixed upstream slot.
+    ///
+    /// These tools are assembled after the slotted built-ins and before every
+    /// extension source, so the registry's normal last-source-wins precedence and
+    /// suppression diagnostic apply to any same-named config, plugin, or MCP tool.
+    pub fn register_configured_builtin(&mut self, tool: Arc<dyn Tool>) -> &mut Self {
+        self.configured_builtins.push(tool);
+        self
     }
 
     /// Install the wave-9 custom-tool seam.
@@ -328,6 +340,12 @@ impl ToolRegistryBuilder {
                     );
                 }
             }
+            insert_tools(
+                &mut sourced_tools,
+                &mut diagnostics,
+                self.configured_builtins.iter().cloned(),
+                ToolSource::Builtin,
+            );
             insert_tools(
                 &mut sourced_tools,
                 &mut diagnostics,
