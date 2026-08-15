@@ -30,8 +30,11 @@ on:
 permissions:
   contents: read
 
+# `g2` is a generation counter, not decoration: run 31832366629 wedged in `queued`,
+# could not be cancelled via the API, and held the old group so every later run on
+# the ref sat `pending` with zero jobs. Bump the generation to release a wedged ref.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-g2-${{ github.ref }}
   cancel-in-progress: true
 
 env:
