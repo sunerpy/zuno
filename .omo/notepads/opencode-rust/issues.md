@@ -8812,3 +8812,38 @@ F3 用真机四态矩阵独立验证了这一点：把 plan 放在旧路径 `.op
 **测试直接调用被测函数，从而绕过「该函数是否被生产代码调用」这一层**。13 个四态
 测试全绿、诊断文案正确、错误类型齐备，唯独没人证明生产路径会走到那里。要证伪
 这类缺陷，必须像 F3 那样从**真实入口**驱动，而不是从函数入口。
+
+## [2026-08-15] Atlas 复核：F4 两条 Blocker 均为真，且第一条又被守卫测试冻结
+
+**Blocker 1：文档写的导入命令不存在。** 实测：
+
+    $ zuno session --help
+    Commands:  list  prune  delete  help        ← 没有 export/import
+
+    $ zuno --help
+      export      Export session data as JSON   ← 真实入口在顶层
+      import      Import session data from a JSON file
+
+而 `README.md:63,88` 与 `docs/readme/README.en.md:56,81` 都写 `zuno session export`
+/ `zuno session import`。F3 的真机 QA 独立测到同一件事，并证明顶层命令的往返可用
+（导出 2609 字节 → 新库导入 → `session list` 列出 → `run -s` 可续跑）。
+
+**这条 Blocker 又一次被守卫测试冻结**——`crates/oc-cli/tests/docs.rs:1650,1655`
+把 `"zuno session import"` 和 `` "`zuno session import` reads Zuno's own" `` 当作
+必须出现的 needle 钉住。所以：
+
+- 测试当前是**绿的**，因为文档里确实有那个字符串；
+- 一旦把文档改成正确的顶层命令，这个测试**立刻变红**；
+- 于是修复者会以为自己改错了，而真相是守卫本身钉住了缺陷。
+
+这是本会话第三次遇到同一形态。前两次：`docs.rs:1640` 钉住过时的 README 独立性
+句子（改正文档后失败）、`no_pinned_oracle_paths.rs` 的 ROUTED_DIFFERENTIALS 钉住
+已删除的差分文件清单。**规律**：守卫测试用字面量钉住文档内容时，它同时锁住了
+「文档说了什么」和「文档说得对不对」——前者可测，后者不可测，于是错误内容被
+守卫保护起来。修法始终是同一个 commit 内一起改，并把 needle 换成更强的断言
+（要求正确命令 + 保留边界声明），而不是删掉 needle。
+
+**Blocker 2：计划三处仍要求已废弃的路径。** `.omo/plans/opencode-rust.md:770`
+（`.opencode/goal/`）、`:854`（`.opencode/plans/`）、`:1654`（`.opencode/goal/`，
+属成功准则 11）——而实现已切到 `.zuno/`，`crates/oc-goal/src/projection_tests.rs:645`
+断言的是 `.zuno/goal/`。按各自措辞验收，这三条现在无法通过。
