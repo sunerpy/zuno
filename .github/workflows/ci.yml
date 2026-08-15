@@ -11,11 +11,13 @@
 #     slow for a per-commit gate, but its host leg is not — and a release pipeline
 #     whose smoke step is first exercised during the real release is untested.
 #   * `windows` catches the platform-specific failures a Linux developer cannot
-#     see: path separators, and the two Windows targets the release ships.
+#     see: path separators, and the two Windows targets the release ships. It is
+#     the one job here that cannot run on CodeBuild, so it is opt-in — see the
+#     comment above the job for why, and what turns it back on.
 #
-# Linux jobs run on the `zuno-runner` CodeBuild-hosted runner. The Windows job
-# deliberately remains GitHub-hosted: CodeBuild's Linux container cannot execute
-# the native Windows checks, and dropping that job would hide a shipped platform.
+# Every gating job runs on the `zuno-runner` CodeBuild-hosted runner, which
+# consumes no GitHub Actions minutes. That is the required path, and it is
+# complete on its own: nothing GitHub-hosted can hold the merge gate red.
 
 name: CI
 
@@ -52,12 +54,16 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      # No `toolchain:` input: rust-toolchain.toml pins 1.96.0 and the components,
-      # and naming a channel here would silently override it.
+      # rust-toolchain.toml stays authoritative: a toolchain file outranks
+      # `rustup default`, which is all this action sets. The input is named anyway
+      # because the action hard-requires it (an empty value exits 1 — it does not
+      # read the toml), and naming the SAME version the toml pins is what puts
+      # rustfmt and clippy on the toolchain cargo actually uses instead of on a
+      # second one rustup would then have to auto-install. Bump both together.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
-          toolchain: stable
+          toolchain: "1.96.0"
           components: rustfmt,clippy
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -67,6 +73,33 @@ jobs:
       # `cargo build` silently repairs it. Learned the hard way merging wave 7.
       - name: Verify the lock file is reproducible
         run: cargo metadata --locked --format-version 1 > /dev/null
+
+      # Every make gate below passes `--offline`, because `OFFLINE ?= --offline` is
+      # the Makefile default and the right one for local work. On a cold runner the
+      # registry is empty and `--offline` then fails resolution outright
+      # (`no matching package named 'async-trait' found`), which is nothing to do
+      # with the code under test. One online fetch makes the shared make targets
+      # behave here exactly as they do locally. No `--target`: without one
+      # `cargo fetch` takes every target's dependencies, including the
+      # Windows-only transitive deps an offline resolve otherwise trips over.
+      - name: Populate the cargo registry for the offline gates
+        run: cargo fetch --locked
+
+      # oxfmt is an npm package with per-platform native bindings and
+      # `engines: ^20.19.0 || >=22.12.0`. The CodeBuild image defaults to Node 18,
+      # where `npm install` only WARNS EBADENGINE, exits 0, and leaves an oxfmt that
+      # dies two steps later on a missing `@oxfmt/binding-linux-x64-gnu`. So pin the
+      # Node line, pin oxfmt to the version the pre-commit hook formats with (a
+      # different one can disagree about already-committed files), and run
+      # `--version` as the gate so a broken install fails in this step.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      - name: Install oxfmt
+        run: |
+          npm install --global oxfmt@0.59.0
+          oxfmt --version
 
       - name: Format check
         run: make fmt-check
@@ -91,10 +124,11 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
+      # Same version rust-toolchain.toml pins, for the reason spelled out in `test`.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
-          toolchain: stable
+          toolchain: "1.96.0"
 
       - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
@@ -124,29 +158,57 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
+      # Same version rust-toolchain.toml pins, for the reason spelled out in `test`.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
-          toolchain: stable
+          toolchain: "1.96.0"
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: artifact
 
+      # `make smoke-artifact` reaches `release`, which is `--offline` by default; see
+      # the same step in `test` for why a cold runner needs this first.
+      - name: Populate the cargo registry for the offline gates
+        run: cargo fetch --locked
+
       - name: Package and smoke
         run: make smoke-artifact
 
+  # -------------------------------------------------------------------------
+  # windows: opt-in, because the capacity to run it is not there.
+  #
+  # This account's GitHub-hosted minutes are exhausted, so a `windows-latest` job
+  # is never assigned a runner: measured on run 31868933369, the job concluded
+  # `failure` with an empty `runner_name` and zero steps — it never started, and
+  # nothing about the code caused it. It cannot move to CodeBuild either: Windows
+  # CodeBuild runners require a reserved-capacity fleet, and `list-fleets` in
+  # cn-northwest-1 answers `Unknown operation ListFleets` — the aws-cn partition
+  # has no fleet API at all, only `LINUX_CONTAINER`.
+  #
+  # So the job stays defined and stays in `ci-success`'s `needs:`, gated on a
+  # repository variable instead of deleted. Unset, it skips, and `ci-success`
+  # tolerates a skip from this job by name. Set `GITHUB_HOSTED_RUNNERS=true` once
+  # minutes exist and it is a hard gate again with no other edit.
+  #
+  # Deliberately not `continue-on-error: true`: that would also swallow a real
+  # Windows failure. The distinction this keeps is "did not run" vs "ran and
+  # failed" — only the first is acceptable.
+  # -------------------------------------------------------------------------
   windows:
     name: Windows
+    if: vars.GITHUB_HOSTED_RUNNERS == 'true'
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
+      # Same version rust-toolchain.toml pins, for the reason spelled out in `test`.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
-          toolchain: stable
+          toolchain: "1.96.0"
           components: clippy
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -166,6 +228,13 @@ jobs:
   # `cancel-in-progress: true` above, that would let a green tick sit on a run
   # whose tests never finished. Anything other than `success` fails here,
   # including any result value GitHub adds in future.
+  #
+  # One narrow exception, enumerated by job name in the script: a job that is
+  # opt-in may be `skipped`. Today that is `windows` alone, because this account
+  # has no GitHub-hosted minutes to run it on. The exception is per-job and per-
+  # result: `skipped` from a named job passes, every other result from it — and
+  # every result but `success` from anything else — still fails. A blanket
+  # "ignore skipped" would re-open the hole this job exists to close.
   #
   # The results are read from `toJSON(needs)` rather than named one by one, so
   # adding a job to `needs:` below makes it required with no change to the script.
@@ -206,12 +275,24 @@ jobs:
             echo "::error title=CI gate::no required jobs in the needs context; failing closed."
             exit 1
           fi
+          # The enumerated exception. Adding a name here weakens the gate for that
+          # job only, and only for `skipped`.
+          may_be_skipped() {
+            case "$1" in
+              windows) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
           offenders=0
+          skips=0
           for row in "${rows[@]}"; do
             job="${row%%$'\t'*}"
             result="${row#*$'\t'}"
             if [ "$result" = "success" ]; then
               printf '  ok   %-14s %s\n' "$job" "$result"
+            elif [ "$result" = "skipped" ] && may_be_skipped "$job"; then
+              printf '  skip %-14s %s (opt-in; see the job comment)\n' "$job" "$result"
+              skips=$((skips + 1))
             else
               printf '  FAIL %-14s %s\n' "$job" "$result"
               echo "::error title=CI gate::required job '${job}' concluded '${result}', not 'success'."
@@ -222,4 +303,4 @@ jobs:
             echo "CI failed: ${offenders} of ${#rows[@]} required job(s) did not conclude 'success'."
             exit 1
           fi
-          echo "CI passed: all ${#rows[@]} required job(s) concluded 'success'."
+          echo "CI passed: $(( ${#rows[@]} - skips )) of ${#rows[@]} required job(s) succeeded, ${skips} opt-in job(s) skipped."

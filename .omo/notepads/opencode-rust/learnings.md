@@ -6703,3 +6703,75 @@ resource，断言的是它自己的方法标签 `OAuth with Google (Antigravity)
 **可迁移的判据**：当「加/减一个成员什么都不会失败」时，先别急着改断言——先量这个成员
 到底在这个 surface 上有没有任何可观测效果。如果答案是「没有」，那问题不是断言写弱了，
 而是**断言选错了 surface**；此时改断言而不换 surface，只会造出第二个假见证。
+
+## [2026-08-15] C-2：共享 make target 是 CI 与本地一致性的资产，也是它唯一的负债
+
+`ci.yml` 的设计原则是「CI 调用开发者本地跑的同一个 make target」，所以"本地绿"和"CI 绿"
+不会漂成两个意思。C-2 暴露的是这个原则的**成本**：make target 的默认值也一起被继承了，
+包括那些只对本地成立的默认值。
+
+`OFFLINE ?= --offline`（`Makefile:32`）在本地是对的选择，在冷 CI runner 上是错的。
+症状极具误导性 —— `cargo build … --offline` 报的是 `no matching package named 'async-trait'
+found`，读起来像依赖声明坏了，而 `async-trait` 明明在 `Cargo.lock` 里。真正的原因是
+registry 是空的，离线 resolve 无从下手。
+
+**可迁移的判据**：当 CI 复用本地 make/just/npm target 时，把每个 target 的默认变量单独
+过一遍，问「这个默认值假设了机器上已经有什么」。`--offline` 假设 registry 已填充，
+`command -v <tool>` 假设工具已装 —— 这两条正好就是 C-2 的两个缺陷。
+CI 侧的修法不是改默认值（那会伤害本地体验），而是**在调用 target 之前把它假设的前置条件
+准备好**：一步 `cargo fetch --locked`，一步装工具。
+
+### 一个掩盖机制值得单独记：在线的那一步会让离线的问题晚两步才炸
+
+`ci.yml:69` 的 `cargo metadata --locked --format-version 1` 是**故意在线**的（这样锁文件
+的可复现性独立于代码问题被验证）。它成功了，于是日志开头是绿的，让人以为依赖解析没问题；
+真正的离线失败发生在两步之后的 `make lint` / `make release`。
+learnings.md:3526 记过同源的另一面：`cargo metadata --locked --offline` 会因 Windows-only
+传递依赖失败。两条合起来给出一条规则：**`cargo fetch` 不要带 `--target`** —— 不带时它取
+所有 target 的依赖，一次把这两个坑都填掉。
+
+## [2026-08-15] C-2：注释与代码矛盾时，先去读第三方 action 的源码再决定改哪一边
+
+`ci.yml:55-61` 的注释说「不要给 `toolchain:` 输入，rust-toolchain.toml 已经钉了 1.96.0，
+在这里写 channel 会静默覆盖它」，而第 61 行写着 `toolchain: stable`。看起来该按注释删掉
+那个 input —— **实测不行**。
+
+读 `dtolnay/rust-toolchain@6c977a6` 的 `action.yml`：
+- `:35-39` 空值时 `echo "'toolchain' is a required input" >&2; exit 1`。它自己不读
+  `rust-toolchain.toml`（GitHub 不强制 `required: true`，所以 action 自己校验）。
+- `:96-98` 它做的全部事情是 `rustup toolchain install <ver> --profile minimal` 加
+  `rustup default <ver>`（后者还带 `continue-on-error: true`）。
+
+所以注释里"会静默覆盖 toml"这句本身是错的：**toolchain 文件的优先级高于 `rustup default`**，
+写 `stable` 不会让构建用 stable 编译，只会让 rustup 多装一条 toolchain，并且把
+rustfmt/clippy 这两个 component 装到那条**用不上**的 toolchain 上。真正的失败模式不是
+"版本被覆盖"，而是"component 装错了 toolchain"。
+
+结论：改代码为 `toolchain: "1.96.0"`（与 toml 同值，4 处），注释改成陈述实测机制。
+代价是多了一处重复字面量，用一行交叉引用注释标出来，因为**没有任何测试绑定这两处**。
+
+**可迁移的判据**：注释与代码矛盾时，两边都可能是错的。判断哪边错的唯一办法是读被调用方
+的实现（第三方 action 就是 `git clone` 它的 tag 然后读 `action.yml`），而不是相信注释里
+对第三方行为的转述 —— 那种转述写下来时可能就是错的，也可能只是过期了。
+
+## [2026-08-15] C-2：`needs` 门禁要放行"没跑"，就必须按 job 名 + 按结果值双重枚举
+
+`ci-success` 的设计是严格门：任何非 `success` 都红，因为 `skipped` / `cancelled` 也能让
+一次没跑完测试的 run 挂上绿勾。现在需要一个例外（`windows` 因为账户没有 GitHub-hosted
+额度而永远拿不到 runner），但**"忽略 skipped"这个宽泛写法会把门重新打开**：`cancel-in-progress`
+下一个被新 push 取消的 job、或一个因为 `if:` 写错而整体跳过的 test job，都会变成绿。
+
+写法是 shell 函数枚举白名单，判定同时约束 job 名和结果值：
+
+    may_be_skipped() { case "$1" in windows) return 0 ;; *) return 1 ;; esac; }
+    …
+    elif [ "$result" = "skipped" ] && may_be_skipped "$job"; then
+
+三种情形实测（把 `run:` 脚本抽出来喂 `NEEDS_JSON` 直接跑）：
+`windows=skipped` → exit 0；`windows=failure` → exit 1；`test=skipped` → exit 1。
+**这个抽出来单跑的手法值得复用**：`ci-success` 的逻辑只能在真实 run 里被观察到，而真实 run
+每次要几十分钟；用 `python3 -c "yaml.safe_load(...)['jobs']['ci-success']['steps'][0]['run']"`
+导出脚本再 `bash -n` + 喂几组 `NEEDS_JSON`，把一个只能在 CI 里验证的门变成本地秒级可测。
+
+顺带：`continue-on-error: true` 在这里是错的工具。它让 job 失败也不影响 run 结论，于是
+"没跑"和"跑了但失败"被压成同一个结果 —— 而这个区分正是这次要保住的东西。
