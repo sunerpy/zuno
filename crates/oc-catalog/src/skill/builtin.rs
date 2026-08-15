@@ -24,7 +24,7 @@ pub const NAME: &str = "customize-opencode";
 pub const LOCATION: &str = "<built-in>";
 
 /// `CUSTOMIZE_OPENCODE_SKILL_DESCRIPTION` (`skill/index.ts:33-34`), verbatim.
-pub const DESCRIPTION: &str = "Use ONLY when the user is editing or creating opencode's own configuration: opencode.json, opencode.jsonc, files under .opencode/, or files under ~/.config/opencode/. Also use when creating or fixing opencode agents, subagents, skills, plugins, MCP servers, or permission rules. Do not use for the user's own application code, or for any project that is not configuring opencode itself.";
+pub const DESCRIPTION: &str = "Use ONLY when the user is editing or creating Zuno's own configuration: opencode.json, opencode.jsonc, files under .zuno/, or files under ~/.config/zuno/. Also use when creating or fixing Zuno agents, subagents, skills, plugins, MCP servers, or permission rules. Do not use for the user's own application code, or for any project that is not configuring Zuno itself.";
 
 /// The body, byte-identical to
 /// `packages/core/src/plugin/skill/customize-opencode.md` at 1.18.13.

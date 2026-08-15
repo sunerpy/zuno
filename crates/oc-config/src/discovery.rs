@@ -332,11 +332,12 @@ fn legacy_copy_command(options: &DiscoveryOptions, old_config: &Path, new_config
     let old_data = sibling_product_root(options.layout.data(), "opencode").join("auth.json");
     let new_data = options.layout.data().join("auth.json");
     format!(
-        "install -d -m 700 {} {} && install -m 600 {} {} && install -m 600 {} {}",
+        "install -d -m 700 {} {} && install -m 600 {} {} && if [ ! -f {} ] || install -m 600 {} {}; then :; else exit 1; fi",
         shell_quote(options.layout.config()),
         shell_quote(options.layout.data()),
         shell_quote(old_config),
         shell_quote(new_config),
+        shell_quote(&old_data),
         shell_quote(&old_data),
         shell_quote(&new_data),
     )
@@ -543,16 +544,16 @@ fn system_managed_config_dir(env: &Env) -> PathBuf {
     #[cfg(target_os = "macos")]
     {
         let _ = env;
-        PathBuf::from("/Library/Application Support/opencode")
+        PathBuf::from("/Library/Application Support/zuno")
     }
     #[cfg(target_os = "windows")]
     {
-        PathBuf::from(env.truthy_value("ProgramData").unwrap_or("C:\\ProgramData")).join("opencode")
+        PathBuf::from(env.truthy_value("ProgramData").unwrap_or("C:\\ProgramData")).join("zuno")
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = env;
-        PathBuf::from("/etc/opencode")
+        PathBuf::from("/etc/zuno")
     }
 }
 
@@ -574,7 +575,7 @@ fn read_native_managed_preferences(_username: &str) -> Option<ManagedPreferences
 fn read_native_managed_preferences(username: &str) -> Option<ManagedPreferences> {
     use std::process::Command;
 
-    const DOMAIN: &str = "ai.opencode.managed";
+    const DOMAIN: &str = "ai.zuno.managed";
     const METADATA: &[&str] = &[
         "PayloadDisplayName",
         "PayloadIdentifier",

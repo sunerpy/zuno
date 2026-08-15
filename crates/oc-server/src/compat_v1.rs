@@ -813,7 +813,7 @@ fn truncate(value: &str, limit: usize) -> String {
     format!("{}…", &value[..end])
 }
 
-/// Shared state for the v1 compatibility surface.
+/// Shared state for the retained v1 plugin ABI surface.
 #[derive(Clone, Debug)]
 pub struct CompatV1State {
     toasts: Arc<ToastSink>,

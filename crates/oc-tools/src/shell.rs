@@ -149,9 +149,9 @@ impl ShellTool {
     pub fn with_configured_shell(workspace: &Path, configured: Option<&Path>) -> io::Result<Self> {
         let workspace = workspace.canonicalize()?;
         let shell = discover_shell(configured)?;
-        let output_store = ToolOutputStore::new(workspace.join(".opencode").join("tool-output"));
+        let output_store = ToolOutputStore::new(workspace.join(".zuno").join("tool-output"));
         let background_manager = Arc::new(LocalBackgroundManager::new(
-            workspace.join(".opencode").join("background"),
+            workspace.join(".zuno").join("background"),
         ));
         Ok(Self {
             workspace,

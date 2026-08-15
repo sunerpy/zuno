@@ -188,7 +188,7 @@ fn plugin_origins(context: &Context) -> Result<Vec<PluginOriginOutput>, String> 
             .config_dir_override()
             .filter(|value| !value.is_empty())
             .is_some_and(|value| directory == Path::new(value));
-        if directory.to_string_lossy().ends_with(".opencode") || is_override {
+        if directory.to_string_lossy().ends_with(".zuno") || is_override {
             for path in oc_paths::Layout::file_in_directory(directory, "opencode") {
                 let scope = plugin_scope(context, &path);
                 add_plugin_file(&mut origins, &path, path.display().to_string(), scope)?;
@@ -271,15 +271,15 @@ fn managed_config_dir(env: &oc_paths::Env) -> PathBuf {
     }
     #[cfg(target_os = "macos")]
     {
-        PathBuf::from("/Library/Application Support/opencode")
+        PathBuf::from("/Library/Application Support/zuno")
     }
     #[cfg(target_os = "windows")]
     {
-        PathBuf::from(env.truthy_value("ProgramData").unwrap_or("C:\\ProgramData")).join("opencode")
+        PathBuf::from(env.truthy_value("ProgramData").unwrap_or("C:\\ProgramData")).join("zuno")
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        PathBuf::from("/etc/opencode")
+        PathBuf::from("/etc/zuno")
     }
 }
 

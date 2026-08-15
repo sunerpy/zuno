@@ -46,13 +46,13 @@ pub(super) fn export(args: &ExportArgs) -> Result<(), String> {
 
 /// Read an exported document back into this checkout's database.
 pub(super) fn import(args: &ImportArgs) -> Result<(), String> {
-    // Upstream also accepts a share URL (`cli/cmd/import.ts:117-160`). The hosted
-    // share service is outside this port's scope, and letting the URL fall through
+    // Upstream also accepts a share URL (`cli/cmd/import.ts:117-160`). Zuno does
+    // not integrate with that hosted service, and letting the URL fall through
     // to the file reader would report `File not found` for a URL that is perfectly
     // well formed.
     if args.file.starts_with("http://") || args.file.starts_with("https://") {
         return Err(format!(
-            "cannot import from {}: the hosted share service is outside this port's scope; \
+            "cannot import from {}: Zuno does not integrate with the hosted share service; \
              export the session with the hosted client and import the resulting file instead",
             args.file
         ));

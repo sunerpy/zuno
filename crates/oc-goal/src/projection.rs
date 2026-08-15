@@ -7,10 +7,10 @@
 //! it is why this module is an *addition* to the port rather than a port of
 //! anything — the resolution recorded under "Q3" in `.omo/drafts/opencode-rust.md`
 //! ("Round 1 — RESOLVED", option A) asks for a rendered Markdown projection at
-//! `.opencode/goal/<sessionID>.md` that a human can read and edit.
+//! `.zuno/goal/<sessionID>.md` that a human can read and edit.
 //!
 //! The path parallels the sibling convention for plans, which the oracle writes
-//! to `<worktree>/.opencode/plans` when the project is under version control and
+//! to `<worktree>/.zuno/plans` when the project is under version control and
 //! to the global data directory when it is not
 //! (`packages/opencode/src/session/session.ts:331-335`). [`document_path`] makes
 //! the same two-way choice for the same reason: a project-local file is the one a
@@ -115,7 +115,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The project-local directory the oracle keeps its own project state in.
-pub const PROJECT_DIRECTORY: &str = ".opencode";
+pub const PROJECT_DIRECTORY: &str = ".zuno";
 
 /// The subdirectory of [`PROJECT_DIRECTORY`] holding goal documents.
 pub const GOAL_DIRECTORY: &str = "goal";
@@ -125,10 +125,10 @@ pub const GOAL_DIRECTORY: &str = "goal";
 /// See the module docs for why this is a constant rather than an entry in an
 /// existing snippet file.
 pub const GITIGNORE_SNIPPET: &str = "\
-# opencode renders the authoritative goal to a human-editable Markdown document,
+# Zuno renders the authoritative goal to a human-editable Markdown document,
 # one per session. It is derived from the goal database and rewritten on every
 # material change, so it is local working state rather than source.
-.opencode/goal/
+.zuno/goal/
 ";
 
 /// Opens the region of the document whose contents the human owns.
@@ -831,7 +831,7 @@ const HEADER: &str = "\
 # Goal
 
 <!--
-This document is a projection of opencode's goal database.
+This document is a projection of Zuno's goal database.
 
 The objective between the two `goal:objective` markers is yours to edit: the next
 turn adopts whatever you leave there, spilling it to a file if it is longer than

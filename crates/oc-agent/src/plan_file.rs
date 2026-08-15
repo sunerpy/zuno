@@ -5,7 +5,7 @@
 //! ```ts
 //! export function plan(input: { slug: string; time: { created: number } }, instance: InstanceContext) {
 //!   const base = instance.project.vcs
-//!     ? path.join(instance.worktree, ".opencode", "plans")
+//!     ? path.join(instance.worktree, ".zuno", "plans")
 //!     : path.join(Global.Path.data, "plans")
 //!   return path.join(base, [input.time.created, input.slug].join("-") + ".md")
 //! }
@@ -20,15 +20,15 @@
 //!
 //! # Why the fallback exists
 //!
-//! `.opencode/plans/` is the location a human will actually find, and in a
+//! `.zuno/plans/` is the location a human will actually find, and in a
 //! repository it is a path they can gitignore or commit as they choose. Outside a
-//! repository there is no such place: writing `.opencode/` into whatever directory
+//! repository there is no such place: writing `.zuno/` into whatever directory
 //! the user happened to start in litters unrelated trees with files nothing will
 //! ever clean up, and there is no `.gitignore` to keep them out of anyone's commit.
 //! So the global data directory takes over — the plan is still durable, just not
 //! sitting in a directory that does not belong to the project.
 //!
-//! `oc-goal`'s `.opencode/goal/<sessionID>.md` (todo 69) makes the same two-way
+//! `oc-goal`'s `.zuno/goal/<sessionID>.md` (todo 69) makes the same two-way
 //! choice for the same reason, and says so in its own module docs. That is not a
 //! coincidence: it copied this convention.
 //!
@@ -60,7 +60,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The project-local directory the oracle keeps its own project state in.
-pub const PROJECT_DIRECTORY: &str = ".opencode";
+pub const PROJECT_DIRECTORY: &str = ".zuno";
 
 /// The subdirectory holding plan documents, in both locations
 /// (`session/session.ts:332-334`).
@@ -74,7 +74,7 @@ pub const PLANS_DIRECTORY: &str = "plans";
 /// called something like `worktree: Option<&Path>` invites exactly that mistake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanLocation<'a> {
-    /// `project.vcs` is set: `<worktree>/.opencode/plans`.
+    /// `project.vcs` is set: `<worktree>/.zuno/plans`.
     Worktree(&'a Path),
     /// `project.vcs` is unset: `<data>/plans`.
     Global,

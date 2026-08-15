@@ -31,7 +31,7 @@ fn both_locations_are_reachable_and_distinct() {
     assert_eq!(
         local,
         worktree
-            .join(".opencode")
+            .join(".zuno")
             .join("plans")
             .join("1764000000000-swift-otter.md")
     );
@@ -64,15 +64,15 @@ fn the_two_locations_agree_on_the_directory_name_but_not_the_root() {
             .parent()
             .and_then(Path::file_name)
             .and_then(|name| name.to_str()),
-        Some(".opencode"),
-        "the project-local location nests plans under .opencode"
+        Some(".zuno"),
+        "the project-local location nests plans under .zuno"
     );
     assert_ne!(
         global
             .parent()
             .and_then(Path::file_name)
             .and_then(|name| name.to_str()),
-        Some(".opencode"),
+        Some(".zuno"),
         "the global location is not a project directory"
     );
 }
@@ -126,7 +126,7 @@ fn writing_creates_the_directory_and_leaves_no_temporary_behind() {
     assert_eq!(
         path,
         root.path()
-            .join(".opencode")
+            .join(".zuno")
             .join("plans")
             .join("1764000000000-swift-otter.md")
     );

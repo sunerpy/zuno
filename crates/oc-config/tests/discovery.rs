@@ -9,7 +9,10 @@ use oc_paths::Env;
 use proptest::prelude::*;
 use std::collections::HashSet;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
+use std::process::Command;
 
 fn write(path: &Path, contents: &str) {
     if let Some(parent) = path.parent() {
@@ -51,38 +54,77 @@ fn instructions(config: &Config) -> Vec<&str> {
         .collect()
 }
 
+#[cfg(unix)]
 #[test]
-fn legacy_config_with_an_empty_zuno_root_returns_an_actionable_typed_error() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let project = temp.path().join("project");
-    let old_path = temp.path().join("xdg-config/opencode/opencode.json");
-    let new_path = temp.path().join("xdg-config/zuno/opencode.json");
-    write(&old_path, r#"{"model":"provider/legacy"}"#);
+fn legacy_copy_command_executes_with_or_without_an_auth_file() {
+    for auth_exists in [false, true] {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().join("project");
+        let old_path = temp.path().join("xdg-config/opencode/opencode.json");
+        let new_path = temp.path().join("xdg-config/zuno/opencode.json");
+        let old_auth = temp.path().join("home/.local/share/opencode/auth.json");
+        let new_auth = temp.path().join("home/.local/share/zuno/auth.json");
+        let old_body = r#"{"model":"provider/legacy"}"#;
+        write(&old_path, old_body);
+        if auth_exists {
+            write(&old_auth, r#"{"provider":{"type":"api","key":"secret"}}"#);
+        }
 
-    let result = discover_with(&fixture_options(temp.path(), &project, std::iter::empty()));
+        let result = discover_with(&fixture_options(temp.path(), &project, std::iter::empty()));
+        let error = result.expect_err("the old location requires an explicit copy");
+        let ConfigError::LegacyConfig {
+            old_path: actual_old,
+            new_path: actual_new,
+            copy_command,
+        } = &error
+        else {
+            panic!("expected ConfigError::LegacyConfig, got {error:?}");
+        };
+        assert_eq!(actual_old, &old_path);
+        assert_eq!(actual_new, &new_path);
+        assert!(copy_command.contains("install -d -m 700"), "{copy_command}");
+        assert!(copy_command.contains(&old_path.display().to_string()));
+        assert!(copy_command.contains(&new_path.display().to_string()));
+        assert!(copy_command.contains(&old_auth.display().to_string()));
+        assert!(copy_command.contains(&new_auth.display().to_string()));
+        let report = error.report();
+        assert!(report.contains(&old_path.display().to_string()), "{report}");
+        assert!(report.contains(&new_path.display().to_string()), "{report}");
+        assert!(report.contains(copy_command), "{report}");
 
-    assert!(
-        result.is_err(),
-        "an old config must not be hidden by generating a fresh Zuno config"
-    );
-    let error = result.expect_err("the old location requires an explicit copy");
-    let ConfigError::LegacyConfig {
-        old_path: actual_old,
-        new_path: actual_new,
-        copy_command,
-    } = &error
-    else {
-        panic!("expected ConfigError::LegacyConfig, got {error:?}");
-    };
-    assert_eq!(actual_old, &old_path);
-    assert_eq!(actual_new, &new_path);
-    assert!(copy_command.contains("install -d -m 700"), "{copy_command}");
-    assert!(copy_command.contains(&old_path.display().to_string()));
-    assert!(copy_command.contains(&new_path.display().to_string()));
-    let report = error.report();
-    assert!(report.contains(&old_path.display().to_string()), "{report}");
-    assert!(report.contains(&new_path.display().to_string()), "{report}");
-    assert!(report.contains(copy_command), "{report}");
+        let status = Command::new("sh")
+            .args(["-c", copy_command])
+            .status()
+            .expect("execute migration command");
+        assert!(status.success(), "migration command failed: {copy_command}");
+        assert_eq!(
+            fs::read_to_string(&new_path).expect("copied config"),
+            old_body
+        );
+        assert_eq!(
+            fs::metadata(&new_path)
+                .expect("config metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(new_auth.exists(), auth_exists);
+        if auth_exists {
+            assert_eq!(
+                fs::read_to_string(&new_auth).expect("copied auth"),
+                fs::read_to_string(&old_auth).expect("old auth")
+            );
+            assert_eq!(
+                fs::metadata(&new_auth)
+                    .expect("auth metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
 }
 
 #[test]
@@ -300,7 +342,7 @@ fn discovery_walks_every_layer_in_oracle_precedence_order() {
         ],
     )
     .with_managed_preferences(ManagedPreferences::new(
-        "mobileconfig:/Library/Managed Preferences/ai.opencode.managed.plist",
+        "mobileconfig:/Library/Managed Preferences/ai.zuno.managed.plist",
         r#"{"model":"mac-managed","instructions":["mac-managed","content"]}"#,
     ));
 

@@ -3,7 +3,7 @@
 //! # The plan document
 //!
 //! [`plan_file`] owns where a session's plan lives: `<created>-<slug>.md`, under
-//! `<worktree>/.opencode/plans` when the project is a repository and under the
+//! `<worktree>/.zuno/plans` when the project is a repository and under the
 //! global data directory when it is not (`session/session.ts:331-335`). The naming
 //! is the contract — the `plan` agent is told the path and writes the file with the
 //! ordinary file tools — so it is stated once, here, and asserted rather than

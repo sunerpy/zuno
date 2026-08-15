@@ -154,7 +154,7 @@ mod tests {
     #[test]
     fn io_failure_keeps_the_error_kind_recoverable() {
         let e = ConfigError::Io {
-            path: PathBuf::from("/etc/opencode/config.json"),
+            path: PathBuf::from("/etc/zuno/config.json"),
             source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
         };
         let ConfigError::Io { source, .. } = &e else {
@@ -163,7 +163,7 @@ mod tests {
         assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
         assert_eq!(
             e.to_string(),
-            "config file /etc/opencode/config.json could not be read"
+            "config file /etc/zuno/config.json could not be read"
         );
     }
 

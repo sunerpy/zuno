@@ -69,7 +69,7 @@ pub struct GlobalOptions {
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "zuno",
-    about = "Zuno, a Rust port of the OpenCode agent",
+    about = "Zuno — Zero code. Any task.",
     disable_version_flag = true,
     subcommand_precedence_over_arg = true
 )]

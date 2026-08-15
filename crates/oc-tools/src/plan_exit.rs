@@ -137,7 +137,7 @@ impl RecordingHost {
 
 impl Default for RecordingHost {
     fn default() -> Self {
-        Self::new(".opencode/plans/plan.md")
+        Self::new(".zuno/plans/plan.md")
     }
 }
 
@@ -352,10 +352,10 @@ mod tests {
 
     #[test]
     fn the_approval_question_names_the_plan_file_and_closes_the_answer_set() {
-        let question = PlanExitTool::approval_question(".opencode/plans/auth.md");
+        let question = PlanExitTool::approval_question(".zuno/plans/auth.md");
         assert_eq!(
             question.question,
-            "Plan at .opencode/plans/auth.md is complete. \
+            "Plan at .zuno/plans/auth.md is complete. \
              Would you like to switch to the build agent and start implementing?"
         );
         assert_eq!(question.header, "Build Agent");

@@ -293,7 +293,7 @@ async fn risk_gate_runs_before_explicit_background_dispatch() {
     let source = std::error::Error::source(&error).expect("reflection reason");
     assert!(source.to_string().contains("This command was not run"));
     assert!(target.join("sentinel").is_file());
-    assert!(!directory.path().join(".opencode/background").exists());
+    assert!(!directory.path().join(".zuno/background").exists());
 }
 
 fn tool_context(_workspace: &Path) -> ToolContext {

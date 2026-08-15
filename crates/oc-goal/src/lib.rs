@@ -33,7 +33,7 @@
 //! point. See [`store`] for the full argument.
 //!
 //! **The Markdown document is a projection, and the conflict rule is fixed.** The
-//! goal is also rendered to `.opencode/goal/<sessionID>.md` for a human to read
+//! goal is also rendered to `.zuno/goal/<sessionID>.md` for a human to read
 //! and edit. SQL stays authoritative for the status, the budget and the counters;
 //! the document is authoritative for the objective text, and nothing else. An
 //! edit outside that one region is refused *and reported inside the document*,

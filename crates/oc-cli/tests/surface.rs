@@ -101,8 +101,13 @@ fn surface_compatibility_version_and_rust_identity_are_separate() {
 
 #[test]
 fn surface_zuno_user_agent_is_pinned() {
-    assert!(user_agent().starts_with("zuno/"), "{}", user_agent());
-    assert!(!user_agent().starts_with("opencode/"), "{}", user_agent());
+    assert_eq!(
+        user_agent(),
+        format!(
+            "zuno/{} (build {BUILD_ID}; compatible-opencode/{COMPATIBILITY_VERSION})",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
 }
 
 #[test]

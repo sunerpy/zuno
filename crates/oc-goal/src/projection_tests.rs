@@ -642,7 +642,7 @@ fn the_document_path_parallels_the_oracles_plans_convention() {
     let worktree = Path::new("/tmp/repo");
     assert_eq!(
         document_path(Some(worktree), "ses_abc").expect("resolve"),
-        worktree.join(".opencode").join("goal").join("ses_abc.md")
+        worktree.join(".zuno").join("goal").join("ses_abc.md")
     );
     let global = document_path(None, "ses_abc").expect("resolve");
     assert!(global.ends_with("goal/ses_abc.md"));
@@ -671,11 +671,9 @@ fn a_session_id_that_would_escape_the_directory_is_refused() {
 
 #[test]
 fn the_gitignore_snippet_names_the_projection_directory() {
-    assert!(GITIGNORE_SNIPPET.contains(".opencode/goal/"));
+    assert!(GITIGNORE_SNIPPET.contains(".zuno/goal/"));
     assert!(
-        GITIGNORE_SNIPPET
-            .lines()
-            .any(|line| line == ".opencode/goal/"),
+        GITIGNORE_SNIPPET.lines().any(|line| line == ".zuno/goal/"),
         "the pattern must be a line on its own so the snippet can be pasted verbatim"
     );
     assert!(

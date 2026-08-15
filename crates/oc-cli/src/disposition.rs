@@ -57,7 +57,7 @@ const COMMAND_DISPOSITIONS: [CommandDisposition; 23] = [
         upstream_symbol: "ConsoleCommand",
         command: "console",
         disposition: Disposition::Rejected,
-        reason: "the hosted OpenCode Console is excluded from this Rust port's local-agent scope; use `providers` (alias `auth`) for local credentials instead",
+        reason: "the hosted OpenCode Console is excluded from Zuno's local-agent scope; use `providers` (alias `auth`) for local credentials instead",
     },
     CommandDisposition {
         upstream_symbol: "DbCommand",
@@ -93,7 +93,7 @@ const COMMAND_DISPOSITIONS: [CommandDisposition; 23] = [
         upstream_symbol: "ImportCommand",
         command: "import",
         disposition: Disposition::Implemented,
-        reason: "reads a document `export` produced back into this checkout's database; share-URL imports are not accepted because the hosted share service is outside this port's scope",
+        reason: "reads a local `export` document into Zuno's database; share-URL imports are not accepted because Zuno does not integrate with the hosted share service",
     },
     CommandDisposition {
         upstream_symbol: "McpCommand",
@@ -111,7 +111,7 @@ const COMMAND_DISPOSITIONS: [CommandDisposition; 23] = [
         upstream_symbol: "PluginCommand",
         command: "plugin",
         disposition: Disposition::NotRegistered,
-        reason: "plugin installation must wait for todo 60's resident JavaScript host and compatibility gate; accepting installs before plugins can load would corrupt configuration",
+        reason: "the resident host loads configured plugins, but Zuno does not own an npm installer; declare plugins in opencode.json so compatibility is checked before import",
     },
     CommandDisposition {
         upstream_symbol: "PrCommand",

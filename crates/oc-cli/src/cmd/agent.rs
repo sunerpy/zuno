@@ -128,7 +128,7 @@ pub(crate) fn resolved_rules(
                 ));
                 rules.extend([
                     rule("edit", "*", PermissionAction::Deny),
-                    rule("edit", ".opencode/plans/*.md", PermissionAction::Allow),
+                    rule("edit", ".zuno/plans/*.md", PermissionAction::Allow),
                     rule("edit", &dynamic.relative_plan_glob, PermissionAction::Allow),
                 ]);
             }

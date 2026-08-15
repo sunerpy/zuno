@@ -1300,7 +1300,7 @@ fn plan_edit_glob(stdout: &str) -> String {
     stdout
         .lines()
         .map(str::trim)
-        .find(|line| line.contains("plans/*.md") && !line.contains(".opencode/plans"))
+        .find(|line| line.contains("plans/*.md") && !line.contains(".zuno/plans"))
         .and_then(|line| line.split('"').nth(3).map(str::to_owned))
         .unwrap_or_else(|| panic!("no plan glob in agent list output:\n{stdout}"))
 }

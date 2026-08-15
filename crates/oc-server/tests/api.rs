@@ -2112,6 +2112,18 @@ async fn api_agent_roster_is_the_resolved_native_set() {
     assert_eq!(build["mode"], "primary");
     assert_eq!(build["hidden"], false);
     assert!(build["request"]["headers"].is_object());
+    let plan = agents
+        .iter()
+        .find(|entry| entry["id"] == "plan")
+        .expect("plan is present");
+    let resources = plan["permissions"]
+        .as_array()
+        .expect("permissions are an array")
+        .iter()
+        .filter_map(|rule| rule["resource"].as_str())
+        .collect::<Vec<_>>();
+    assert!(resources.contains(&".zuno/plans/*.md"));
+    assert!(!resources.contains(&".opencode/plans/*.md"));
 }
 
 #[tokio::test]
@@ -2140,6 +2152,10 @@ async fn api_skill_reports_the_v2_builtin_location_and_description() {
             .contains("commands, skills, plugins"),
         "the V2 description lists `commands`, which the v1 copy does not"
     );
+    let description = builtin["description"].as_str().expect("description");
+    assert!(description.contains("Zuno's own configuration"));
+    assert!(description.contains("files under .zuno/"));
+    assert!(!description.contains("opencode's own configuration"));
 }
 
 #[tokio::test]

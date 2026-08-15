@@ -141,7 +141,7 @@ const V2_NATIVE_ORDER: &[&str] = &[
 /// `packages/core/src/plugin/skill.ts:23`, which unlike the v1 copy at
 /// `skill/index.ts:33-34` also lists `commands`. `oc-catalog`'s own doc comment
 /// already records that the two strings differ; this is the V2 one.
-const V2_BUILTIN_SKILL_DESCRIPTION: &str = "Use ONLY when the user is editing or creating opencode's own configuration: opencode.json, opencode.jsonc, files under .opencode/, or files under ~/.config/opencode/. Also use when creating or fixing opencode agents, subagents, commands, skills, plugins, MCP servers, or permission rules. Do not use for the user's own application code, or for any project that is not configuring opencode itself.";
+const V2_BUILTIN_SKILL_DESCRIPTION: &str = "Use ONLY when the user is editing or creating Zuno's own configuration: opencode.json, opencode.jsonc, files under .zuno/, or files under ~/.config/zuno/. Also use when creating or fixing Zuno agents, subagents, commands, skills, plugins, MCP servers, or permission rules. Do not use for the user's own application code, or for any project that is not configuring Zuno itself.";
 
 /// Upstream's `{location, data}` success envelope.
 ///
@@ -490,7 +490,7 @@ fn v2_permissions(name: &str, layout: &oc_paths::Layout, worktree: &Path) -> Vec
             v2_rule("plan_exit", "*", "allow"),
             v2_rule("external_directory", &glob_of(&plans), "allow"),
             v2_rule("edit", "*", "deny"),
-            v2_rule("edit", ".opencode/plans/*.md", "allow"),
+            v2_rule("edit", ".zuno/plans/*.md", "allow"),
             v2_rule(
                 "edit",
                 &relative_path(worktree, &plans.join("*.md")),

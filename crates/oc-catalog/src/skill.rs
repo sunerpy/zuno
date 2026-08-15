@@ -602,13 +602,18 @@ mod tests {
     }
 
     #[test]
-    fn the_builtin_is_registered_with_the_oracles_location_and_description() {
+    fn the_builtin_uses_zuno_identity_and_keeps_the_compatibility_config_filename() {
         let mut skills = Skills::default();
         skills.insert(builtin::skill());
         let built_in = skills.get(builtin::NAME).expect("present");
         assert_eq!(built_in.location, "<built-in>");
         assert_eq!(built_in.description.as_deref(), Some(builtin::DESCRIPTION));
-        assert!(!built_in.content.is_empty());
+        assert!(builtin::DESCRIPTION.contains("Zuno's own configuration"));
+        assert!(builtin::DESCRIPTION.contains("files under .zuno/"));
+        assert!(!builtin::DESCRIPTION.contains("opencode's own configuration"));
+        assert!(built_in.content.contains("# Customizing Zuno"));
+        assert!(built_in.content.contains(".zuno/agent/"));
+        assert!(built_in.content.contains("opencode.json"));
     }
 
     #[test]
