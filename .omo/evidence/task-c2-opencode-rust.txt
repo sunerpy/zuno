@@ -172,4 +172,99 @@ GitHub 此前根本不创建 job，所以这些步骤第一次被执行就是 31
 
 真实 CI 验证
 --------------------------------------------------------------------------------
-（下面这一节在推送后由真实 run 填入）
+推送 182652e（main，SSH，pre-commit「format repository files」与 pre-push
+「run fast repository tests」均 Passed）。
+
+run 31873702463（commit 182652e）
+    Supply chain           completed/success  runner=62ae1905-a5e1-4165-87e9-ad56423ba712
+    Artifact smoke (host)  completed/failure  runner=5f103cdc-4429-4b29-b7af-0404bfd49069
+    Test                   queued（永不派发，见下「webhook 丢投递」）
+    Windows                completed/skipped  runner=-      ← 缺陷 D 的设计行为
+    CI Success             completed/failure  runner=…       ← 正确地因 artifact 红
+
+    CI Success 的真实输出，证明缺陷 D 的门禁逻辑在生产上如设计工作：
+        FAIL artifact       failure
+        ok   supply-chain   success
+        FAIL test           cancelled          ← cancelled 仍然被拒，未被放宽
+        skip windows        skipped (opt-in; see the job comment)
+        CI failed: 2 of 4 required job(s) did not conclude 'success'.
+
+run 31874504920（attempt 2，单 job 重跑 Test）
+    Test  runner=f2dec2af-f89f-4dd0-b197-04a2a57a4747  steps=14（原 12，新增 2 步）
+        1  Set up job                                      success
+        2  actions/checkout                                success
+        3  Install Rust toolchain                          success
+        4  Swatinem/rust-cache                             success
+        5  Verify the lock file is reproducible            success
+        6  Populate the cargo registry for the offline gates  success   ← 缺陷 B 的修复
+        7  actions/setup-node@…v7.0.0                      success   ← 缺陷 A 的修复
+        8  Install oxfmt                                   success   ← 缺陷 A 的修复
+        9  Format check                                    success   ← **原失败点，已绿**
+       10  Clippy                                          success   ← 离线 clippy 已能解析
+       11  Test suite                                      failure   ← 缺陷 F（既存，见下）
+       12  WASM plugin integration suite                   skipped
+
+逐缺陷的验证结论
+    A oxfmt        已证明。步骤 7、8 success，步骤 9 `Format check` 由 failure 转 success。
+    B 离线 registry 已证明两处。Test 步骤 6 success 且步骤 10 `Clippy`（--offline）success；
+                   Artifact job 的 `cargo fetch` success 且 `make release` 编译完成
+                   （日志 `Finished release profile … in 52.30s`），
+                   原先的 `no matching package named 'async-trait'` 不再出现。
+    C toolchain    已证明。4 处 `Install Rust toolchain` 全 success，代码与注释一致。
+    D Windows      已证明。job `skipped`，且 CI Success 打印
+                   `skip windows skipped (opt-in; …)` 同时仍拒绝 failure 与 cancelled。
+
+一次基础设施故障（非本改动引入，已定位）
+    GitHub 的 workflow_job 投递**不重试**（错误文本自带 "giving up after 1 attempt(s)"），
+    而 aws-cn 的 CodeBuild webhook 端点不稳：
+        08:07:38.008 workflow_job/queued code=502 failed to connect to host   ← Test 的事件
+        08:07:38.799 workflow_job/queued code=200
+        08:07:45.789 workflow_job/queued code=200
+        08:09:18.873 workflow_job/in_progress code=500 context deadline exceeded
+    那条 502 丢失后 CodeBuild 从不知道该 job 存在，于是永久卡 queued（runner_name 空、steps=0）。
+    同 run 内另两个 job 拿到真实 runner UUID，排除了「接线坏了」。
+    失败与突发相关：6 秒内 3 个事件 → 2 失败；单独一个事件（gh run rerun --job）→ 200 且立即派发。
+    恢复用的是 cancel + 单 job 重跑；投递重发 API 在本机 token 上返回 404。
+    附注：CodeBuild 的 webhook.lastTriggeredAt 在 aws-cn 上恒为 null，即使派发成功 ——
+    继承 skill 把它当「唯一干净判据」，在此分区不成立。
+
+未达成项：CI Success 尚未绿，被两个既存缺陷阻塞（均在允许改动范围之外）
+--------------------------------------------------------------------------------
+A/B/C/D 修完后，CodeBuild 第一次真正执行到 `make test` 与 `make smoke-artifact`，
+露出两个更深一层的既存缺陷。两个都不是本改动引入，都属「CI 从未执行到这一步」同一族，
+且**都要改 crates/ 下的文件**，超出本任务允许的 .github/workflows/ + Makefile + .omo/ 范围。
+
+缺陷 E — oc-smoke 的请求形状比运行时晚了 8 天（读到了 prelude）
+    `8cd05f6` 写 smoke driver 时一次 tool turn = 2 个请求；`3e6730c`（更晚，
+    git merge-base --is-ancestor 判定）引入 title prelude，使每次运行先发一个
+    **不带工具**的请求。`tool_turn.rs:57-61` 已同步为 1+2=3，`:1122` 明确断言
+    prelude 不提供工具，`:1133` 从 captured[1] 读工具 —— 该测试在本机 3519/0 里通过。
+    `oc-smoke.rs:305,315` 从未同步，仍断言 2 并把 captured[0] 当 turn 请求，
+    于是读到那个按设计就空的 prelude，报出误导性的
+    「the assembled tool registry did not reach the provider」。
+    本机 100% 复现（与 CodeBuild 逐字一致），故与 CI 环境无关。
+    正确修法要同时动 oc-smoke 的下标、把只有 2 个 interaction 的 cassette 扩到 3
+    （`release_surface.rs:1217` 正钉死 2），而 cassette 由
+    `committed_smoke_cassette_matches_the_oracle_recording` 守着必须**重新录制** oracle。
+    手写 cassette 会造出假 fixture —— 那正是这套门禁要防的，故不在本任务内做。
+
+缺陷 F — oc-acp::live_sdk 依赖仓库之外的宿主本地目录，干净机器上必败
+    `live_sdk.rs:4-14` 的 sdk_entry() 对 CARGO_MANIFEST_DIR 走 ancestors()，
+    逐级找 opencode/packages/opencode/node_modules/@agentclientprotocol/sdk/dist/acp.js。
+    仓库内没有该路径，**也没有 submodule**（.gitmodules 不存在、git submodule status 为空）。
+    逐级实测命中的是仓库**之外**、worktree 上两级的
+        /config/workspace/ProdDir/AI/opencode/packages/opencode/node_modules/…/acp.js
+    即一个上游 TypeScript opencode 的平行 checkout。所以本机能过是宿主布局巧合，
+    CI 上 ancestors() 找不到 → `.expect()` 直接 panic（不是 skip）。
+    两条修法都需要设计决定而非接线：优雅 skip 会把真门禁变成可跳过的门禁；
+    在 CI 里 provision 则要回答「按哪个钉住的上游 commit 提供 oracle tree」——
+    随手 npm install 一个任意版本会造出假 oracle，与该测试的意义相反。
+
+按任务的「不得为了让 CI 变绿而弱化或删除测试」，这两项均按原样保留为红，
+并附完整根因，而不是靠放宽断言换一个绿勾。
+
+当前 CodeBuild 侧状态
+    Supply chain  success  （本任务前后均绿）
+    Test          failure  步骤 9/10 已绿（A、B 的直接证明），步骤 11 撞缺陷 F
+    Artifact      failure  cargo fetch 与 make release 已绿（B 的直接证明），撞缺陷 E
+    Windows       skipped  缺陷 D 的设计行为

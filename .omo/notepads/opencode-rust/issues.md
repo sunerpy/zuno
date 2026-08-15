@@ -8092,3 +8092,82 @@ ListFleets` —— **aws-cn 分区没有 fleet API**，只有 `LINUX_CONTAINER`�
 windows=skipped → exit 0；windows=failure → exit 1；test=skipped → exit 1（枚举是按 job 且按结果的，
 不是「一律忽略 skipped」）。仓库变量当前为空（`gh api repos/sunerpy/zuno/actions/variables` →
 `total_count=0`），所以默认就是 skip；额度回来后设一个变量即可恢复硬门禁，无需再改文件。
+
+## [2026-08-15] C-2 后续：修完 A/B/C/D 之后又露出两个「本地绿、CI 永远红」的既存缺陷
+
+A/B/C/D 修完并在真实 run 上逐项验证通过（见 evidence 文件）。但 CodeBuild 一旦真的执行到
+`make test` 和 `make smoke-artifact`，又露出两个**更深一层**的既存缺陷。两个都不是本次改动
+引入的，都是「CI 从未执行到那一步」的同一族问题，且**两个都在本任务允许改动的文件范围之外**。
+
+### 缺陷 E — `oc-smoke` 的请求形状比运行时晚了 8 天（off-by-one 到 prelude 上）
+
+症状（CodeBuild run 31873702463 与本机 100% 一致复现）：
+    oc-smoke: ok    --version -> 1.18.13
+    oc-smoke: ok    --help lists run + serve
+    oc-smoke: FAIL  dist/unpacked/zuno
+      the request advertised [], which does not include `bash`;
+      the assembled tool registry did not reach the provider
+    make: *** [Makefile:193: smoke-artifact] Error 2
+
+根因（由**已通过**的测试反证，不需要新探针）：
+- `8cd05f6`（2026-08-07）写下 smoke driver，假定一次 tool turn = 2 个请求，
+  于是 `oc-smoke.rs:305` 断言 `captured.len() == 2`、`:315` 把 `captured[0]` 当作首个 turn 请求。
+- `3e6730c`（**同日但更晚**，`git merge-base --is-ancestor` 判定 smoke driver 先于它）
+  引入了 title prelude：每次新会话在第一个真实 turn 之前先发一个**不带任何工具**的请求。
+- `crates/oc-cli/tests/tool_turn.rs` 同步更新了：`:57-61`
+  `FROZEN_PRELUDE_REQUESTS=1 + FROZEN_RESPONSES_PER_TURN=2 = 3`，
+  `:1122` 明确断言 **prelude 请求不提供任何工具**，`:1133` 从 `captured[1]` 读工具。
+  该测试在本机 3519/0 那轮里是**通过**的 —— 所以运行时的形状是权威已知的。
+- `oc-smoke.rs` 从未同步。它读的正是那个「按设计就不带工具」的 prelude。
+
+因此 `advertised []` 不是「工具注册表没送到 provider」，而是**断言读错了那个请求**。
+错误信息本身也因此是误导性的。
+
+为什么不在本任务修：正确修法要同时动
+  (1) `crates/oc-testkit/src/bin/oc-smoke.rs` 的计数与下标；
+  (2) smoke cassette —— 它只有 2 个 HTTP interaction，而 prelude 之后一次完整 tool loop
+      需要 3 个（`release_surface.rs:1217` 的 `the_committed_smoke_cassette_is_a_two_turn_recording`
+      正是钉死 2 的那个断言）；
+  (3) 而 cassette 有 `committed_smoke_cassette_matches_the_oracle_recording` 守着，
+      必须**重新录制** oracle，不能手写 —— 手写会造出一份假 fixture，那正是这套门禁存在
+      要防的东西。
+这已经是另一个子系统的实质工作，且需要 oracle 录制条件。**不能靠放宽断言换 CI 绿。**
+
+### 缺陷 F — `oc-acp::live_sdk` 依赖仓库之外的宿主本地目录，任何干净机器上都必败
+
+症状（Test job 步骤 11 `Test suite`，步骤 9 `Format check` 与 10 `Clippy` 均已 success）：
+    thread 'real_sdk_drives_streaming_permission_and_cancellation_with_pure_stdout'
+      panicked at crates/oc-acp/tests/live_sdk.rs:13:10:
+      the pinned oracle tree contains @agentclientprotocol/sdk
+    test result: FAILED. 0 passed; 1 failed
+    error: test failed, to rerun pass `-p oc-acp --test live_sdk`
+
+根因  `live_sdk.rs:4-14` 的 `sdk_entry()` 对 `CARGO_MANIFEST_DIR` 走 **`ancestors()`**，
+      在每一级祖先下找
+      `opencode/packages/opencode/node_modules/@agentclientprotocol/sdk/dist/acp.js`。
+      仓库里没有这个路径，**也没有 submodule**（`.gitmodules` 不存在，
+      `git submodule status` 为空）。逐级实测，它命中的是
+        /config/workspace/ProdDir/AI/opencode/packages/opencode/node_modules/…/acp.js
+      —— 仓库**之外**、worktree 上两级的一个上游 TypeScript opencode 平行 checkout。
+      所以本机能过纯属宿主布局巧合；任何干净机器上 `ancestors()` 找不到，
+      `.expect()` 直接 panic（**不是 skip**）。
+
+这是「本地绿 / CI 红」这一差异最纯粹的形态：测试依赖一个未提交、宿主本地、位于仓库之外的
+产物。此前继承经验里记的是「依赖 submodule 的门禁会静默 skip 并通过」——
+**这一条更糟：它硬失败**，而且因为 `make test` 从未在 CI 跑到过，一直没人看见。
+
+为什么不在本任务修：两条路都需要设计决定，不是接线。
+  (a) 缺失时优雅 skip → 要改 `crates/oc-acp/tests/live_sdk.rs`（超出允许范围），
+      而且会把一个真门禁变成可跳过的门禁，需要显式决定。
+  (b) 在 CI 里 provision oracle tree → 路径形状 `opencode/packages/opencode/node_modules/…`
+      表明它要的是**上游仓库在某个钉住的 commit 上的 checkout**，不是随便一个 npm 版本。
+      随手 `npm install @agentclientprotocol/sdk` 会造出一份版本任意的假 oracle，
+      与该测试的全部意义相反。
+`make test` 在 CI 上能否变绿，取决于先回答「oracle tree 如何 provision」。
+
+### 结论：CodeBuild 侧还剩两个 job 红，原因均已定位且均为既存缺陷
+
+  Supply chain  success  （真实 runner，本任务前后都绿）
+  Test          failure  → 步骤 9/10 已绿（A、B 的直接证明），步骤 11 撞缺陷 F
+  Artifact      failure  → `cargo fetch` 与 `make release` 已绿（B 的直接证明），撞缺陷 E
+  Windows       skipped  → 缺陷 D 的设计行为，`ci-success` 打印 `skip windows skipped (opt-in…)`

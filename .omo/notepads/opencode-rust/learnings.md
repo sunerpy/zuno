@@ -6775,3 +6775,70 @@ rustfmt/clippy 这两个 component 装到那条**用不上**的 toolchain 上。
 
 顺带：`continue-on-error: true` 在这里是错的工具。它让 job 失败也不影响 run 结论，于是
 "没跑"和"跑了但失败"被压成同一个结果 —— 而这个区分正是这次要保住的东西。
+
+## [2026-08-15] C-2：GitHub 的 `workflow_job` 投递**不重试**，aws-cn 的 CodeBuild 端点又不稳 —— 组合成「job 永久卡 queued」
+
+这是本次最有复用价值的运维发现，症状与继承经验里那个「wedged queued run」几乎一样，
+但**根因完全不同**，按老经验去查会走错方向。
+
+实测（hook id=666011311 的投递记录）：
+    08:07:38.008 workflow_job/queued code=502 failed to connect to host
+    08:07:38.799 workflow_job/queued code=200
+    08:07:45.789 workflow_job/queued code=200
+    08:09:18.873 workflow_job/in_progress code=500 … context deadline exceeded
+    错误文本里 GitHub 自己写着：**giving up after 1 attempt(s)**
+
+那条 502 就是 `Test` job 的 queued 事件。CodeBuild 因此从未得知这个 job，
+**永远不会为它派发 runner**，job 就无限停在 `queued`、`runner_name` 为空、`steps=0`。
+同一个 run 里另外两个 job 拿到了真实 runner UUID 并正常跑完 —— 所以
+「CodeBuild 接线坏了」这个假设当场被排除。
+
+**判据（与配额耗尽、与标签路由都要区分开）**
+- 同 run 内有别的 CodeBuild job 拿到了真实 runner → 接线是好的，不要去查 IAM / 连接 / 标签。
+- 去读投递记录的 `status_code`，而不是只看 job 状态：非 200 的 `queued` 事件就是答案。
+- 标签 superset 路由问题会让**标签少的**那个 job 挨饿，但本仓库每个 job 都是 2 个标签且
+  第二个唯一（`release_surface.rs` 的 `every_codebuild_job_has_a_unique_label_set` 钉死 11 组），
+  所以那条也排除。
+- CodeBuild 的 `webhook.lastTriggeredAt` 在 aws-cn 上**恒为 null**，即使派发明明成功。
+  继承的 skill 把这个字段当作「唯一干净的判据」，**在 aws-cn 上不成立**，不要用它下结论。
+
+**失败是突发相关的，不是随机的**。两轮实测：
+    第 1 轮  6 秒内 3 个 queued 事件 → 1 成功 2 失败（502、500）
+    第 2 轮  单独一个 queued 事件（`gh run rerun --job <id>`）→ 200，runner 立刻派发
+所以恢复手法是**逐个、错开地重发 queued 事件**，而不是重跑整个 run（重跑整个 run 会再造一次
+突发，大概率再失败）。
+
+**可用的恢复路径（按优先级）**
+1. `gh run cancel <run>` → 等 run 变 `completed` → `gh run rerun <run> --job <job-id>`，
+   一次只重跑一个 job。这会为该 job 单独发一个 queued 事件，命中率最高。
+   （注意 `rerun` 要求 run 已 completed，而卡住的 run 不会自己 completed，所以必须先 cancel。）
+2. 空提交重新触发。代价是一次性再发 N 个突发事件，且污染历史。
+3. **重发投递（`POST /repos/{o}/{r}/hooks/{id}/deliveries/{d}/attempts`）在本机 token 上是 404**，
+   走不通 —— 别浪费时间。
+
+顺带一个反直觉的好消息：这次 `gh run cancel` **干净地**把 run 收成了 `cancelled`
+（继承经验里那次是怎么都取消不掉、只能 bump concurrency generation）。所以先试 cancel，
+不要一上来就 bump `g2` → `g3`。
+
+## [2026-08-15] C-2：「CI 从未执行过这一步」会把缺陷**按层叠**藏起来，一层修完才看见下一层
+
+本任务的形状值得记下来，因为它会重复出现在任何「CI 第一次真正跑起来」的场景里。
+
+同一个 job 里的步骤是串行短路的，所以**第一步的缺陷会把它后面所有步骤的缺陷一起藏住**。
+实测的层数：
+
+    Test job     步骤 6 Format check   ← 缺陷 A（oxfmt 没装）挡住了下面全部
+                 步骤 10 Clippy        ← 缺陷 B（--offline 无 registry），A 修完才暴露
+                 步骤 11 Test suite    ← 缺陷 F（oracle tree 在仓库之外），B 修完才暴露
+    Artifact job 步骤 5 Package        ← 缺陷 B，修完后才暴露缺陷 E（smoke 请求形状过期）
+
+**所以「修完 N 个缺陷」不等于「CI 会绿」**，估工时不能按已知缺陷数线性算。
+更该做的是：修完一层就**立刻把那一层的成功当作独立证据固定下来**（本次是逐步骤记录
+`Format check: success`、`Clippy: success`），这样即便下游还红，上游的修复也是已证明的，
+不会因为 job 整体 failure 而被误判为没做成。
+
+**另一个可迁移的判据**：缺陷 E 和 F 有共同结构 ——
+「一份验证资产（断言 / fixture / oracle 路径）与它验证的对象各自演进，而唯一会发现分歧的
+执行路径从未运行」。E 里是 driver 落后运行时 8 天；F 里是测试依赖一个只存在于某台机器上的
+目录。**凡是一条门禁长期没有真正执行过，就不要假定它此刻还是正确的**；它更可能已经腐坏，
+而且腐坏方向通常是「本地能过」，因为本地是它唯一被运行过的地方。
