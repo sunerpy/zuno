@@ -8541,3 +8541,59 @@ hosted minutes → E/F smoke 断言 + 非密闭 SDK 路径 → I）。
 `Supply chain`(95040917585) 与 `Artifact smoke (host)`(95040917615) 都停在
 step 2 `actions/checkout`，后续 step 全 skipped——第 2 类跨境故障
 （CodeBuild → github.com）。同一轮 `Test` 的 checkout 反而成功，佐证其间歇性。
+## 2026-08-15 — R5：R3 清单曾把 12 个 Zuno 自有旧身份误标为 upstream（未修源码）
+
+不可失败的默认分类掩盖了 4 个文件中的 12 次真实残留，现已在 TSV 中单列为
+`zuno-owned-stale-identity`，没有按 upstream 合法化：
+
+- `crates/oc-agent/src/plan_file.rs`：5 次 Zuno 自有 `.opencode` 计划路径/说明；
+- `crates/oc-goal/src/projection.rs`：5 次 Zuno 自有 `.opencode/goal` 路径及生成文案；
+- `crates/oc-tools/src/registry.rs`：1 次运行时 `.opencode/tool-output` 路径；
+- `crates/oc-testkit/src/lib.rs`：1 次已过时的「Zuno 是 opencode drop-in replacement」声明。
+
+这些是代码/文档所有权问题，不是分类器规则缺口。R5 的约束禁止修改 `crates/`，故只
+修复证据的诚实性并保留 12 条可查询问题；后续应由独立源码任务决定前三处路径迁移的
+兼容策略，并删除或收窄 testkit 的旧产品承诺。
+
+扫描边界仍是 R3 明确声明的 `crates/*/src/**/*`，不是全仓库存量。全 `crates/` 搜索还
+包含 `tests/`、`examples/`、Cargo.toml、assets 和大小写 `OpenCode` / `OPENCODE`，不能与
+944 直接比较。若目标升级为全仓身份审计，应新建清单和分类契约，而不是静默扩大本 TSV
+的口径；否则历史总数变化无法解释。
+
+## 2026-08-15 — R5 续：12 个 `zuno-owned-stale-identity` 已全部消解（源码侧由他人修复）
+
+R5 上一轮记录的 4 文件 12 处 Zuno 自有旧身份，在 `origin/main` = `a5dca38` 上逐一复核后
+**全部消失**。这是分类器被造出来想要的结果：它暴露了真实残留，另一个任务修掉了。
+逐文件裁定（当前源码实测）：
+
+| 文件 | 原计数 | 现存 `.opencode` | 裁定 |
+|---|---|---|---|
+| `crates/oc-agent/src/plan_file.rs` | 5 | 1（第 172 行） | 已修；残留是**旧路径拒绝逻辑的文档注释**，含 `pre-rename` |
+| `crates/oc-goal/src/projection.rs` | 5 | 1（第 892 行） | 已修；残留是**指示搬到 `.zuno/goal/` 的报错文案** |
+| `crates/oc-tools/src/registry.rs` | 1 | 0 | 已修，完全迁移 |
+| `crates/oc-testkit/src/lib.rs` | 1 | 1（第 7 行） | 已修；残留描述 `engines.opencode` 与六个 `OPENCODE_*`，属 plugin ABI |
+
+三处存活的提及都**不是**残留缺陷：两处是 `821ebc6 refactor(paths)` 刻意迁移的机制
+（把三份重复的 `PROJECT_DIRECTORY` 收敛为 `oc-paths` 唯一定义，并为旧路径加硬切诊断，
+使旧路径上的文档产生带指引的报错而不是被静默覆盖），一处是保留的插件 ABI。
+现已分别归为 `historical-citation` 与 `plugin-abi`，不再计入自有旧身份。
+
+**由此暴露的方法论缺陷（已修）**：旧规则用 `{文件名: 手抄子串}` 判定，既无法发现第 13 处，
+又会在被命名的行仅仅改写措辞时静默归零——「缺陷已修」和「子串没匹配上」无法区分。
+实测更糟：旧规则在 `a5dca38` 上仍命中 `projection.rs:892`，即把**迁移诊断本身**报成
+旧身份残留。照此清单去「清理」，就会恢复 `821ebc6` 刚消灭的静默数据丢失。
+
+### 仍然开放：建议把此门迁移为一等仓库测试（R5 不实施）
+
+理由较上一轮更强，且现在有量化依据：基线到 `a5dca38` 之间源码漂移了 −92 次出现、
+横跨 13 个提交，而静态 TSV 全程没有任何机制提示自己已过期。参照
+`crates/oc-testkit/tests/no_pinned_oracle_paths.rs`，迁移后 `cargo test` / CI 会在规则或
+源码清单漂移时直接失败，不依赖有人想起来手跑 `.omo` 脚本。
+
+迁移时必须一并带走的两条契约，否则会重演本轮修掉的缺陷：
+1. **零值必须显式断言**，且必须有注入用例证明规则确实能触发；一条永不触发的规则与
+   一条不存在的规则在输出上无法区分。
+2. **判据只能基于行为**（常量绑定、未撤回的承诺、迁移词汇），不能基于文件名或行号；
+   并且 `plugin-abi` 优先于迁移词汇，因为 `engines.opencode` 子串含 `.opencode`。
+
+成本仍是要把规则与例外迁入受维护的测试代码，并在每个合法上游标识新增时显式更新规则。
