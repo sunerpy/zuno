@@ -182,3 +182,74 @@ Post-Defect-G local gate note:
   isolated CodeBuild Test job is the full-suite acceptance gate.
 
 The final main run id and per-job table remain pending the updated PR and merge.
+
+Second PR run — attempt 2
+=========================
+Run 31879788919 was rerun once after attempt 1 encountered transient checkout and
+setup network failures. Attempt 2 reached the real gates on CodeBuild-hosted
+runners:
+  Test                  failure    runner=d0e24546-fbda-4c3d-b283-5afa3253afd1
+  Artifact smoke (host) success    runner=9d17fc2e-e627-4c2c-b0fe-50ed5591875e
+  Supply chain          cancelled  runner=53099b9d-ef0b-461e-bd26-51463bb322c8
+  Windows               skipped    runner=(none; opt-in job)
+  CI Success            failure    runner=0b97cee4-0364-482a-9be2-0a45be6f4c08
+
+The Test job passed checkout, Rust setup, lockfile reproducibility, registry
+population, Node/oxfmt setup, format, and Clippy. Its `Test suite` step then
+exposed two remaining direct `Oracle::discover` calls in
+`oc-catalog/tests/skill_differential.rs`. Artifact smoke passed end to end,
+directly confirming Defects E/F on the clean runner. Supply chain reached
+`cargo deny` before the workflow cancelled it after the required Test failure;
+it did not expose a source failure.
+
+Defect H — remaining skill differential routing
+================================================
+Red structural proof:
+  cargo test -p oc-testkit --test no_pinned_oracle_paths \
+    every_installed_binary_differential_still_routes_through_the_oracle \
+    -- --exact --nocapture
+Result before adding the route:
+  oc-catalog/tests/skill_differential.rs was absent from ROUTED_DIFFERENTIALS;
+  the structural gate failed as intended.
+
+Implementation:
+- both real-oracle skill tests call `pinned_oracle_or_skip` before constructing
+  `Oracle::at_binary`;
+- a wholly absent pinned oracle produces a visible skip naming the comparison
+  that was not performed;
+- an explicit bad override or a discovered wrong version remains a hard failure;
+- `oc-catalog/tests/skill_differential.rs` is now in the structural route inventory.
+
+Positive proof with installed pinned oracle 1.18.18:
+  CARGO_TARGET_DIR=/tmp/opencode/c3 cargo test -p oc-catalog \
+    --test skill_differential -- --nocapture
+Result:
+  3 passed; 0 failed; both real comparisons ran against the pinned release.
+
+Clean-host proof using the already-built test binary:
+  env -u OC_TESTKIT_ORACLE -u OC_TESTKIT_ORACLE_SOURCE \
+    -u OC_TESTKIT_ORACLE_FLAVOUR PATH=/usr/bin:/bin \
+    /tmp/opencode/c3/debug/deps/skill_differential-* --nocapture
+Result:
+  3 passed; 0 failed; both real comparisons emitted explicit `SKIPPED`
+  diagnostics and the hermetic fixture guard still ran.
+
+Bad-override proof:
+  OC_TESTKIT_ORACLE=/nonexistent-opencode-c3 ...skill_differential... --nocapture
+Result:
+  both real differential tests failed hard; the captured transcript is
+  `/tmp/opencode/c3-skill-bad-override.log`.
+
+Post-Defect-H gates:
+  central resolver structural test     PASS
+  skill differential, oracle present   3 passed
+  skill differential, clean PATH       3 passed with two visible skips
+  explicit bad oracle override         hard failure as required
+  make fmt-check                       PASS
+  make lint                            PASS
+  cargo build --workspace --locked     PASS
+  lsp_diagnostics on both changed Rust files: no diagnostics
+  git diff --check                     PASS
+
+The next updated PR run is the complete isolated-suite acceptance gate. The final
+main run id and per-job table remain pending that green PR run and merge.

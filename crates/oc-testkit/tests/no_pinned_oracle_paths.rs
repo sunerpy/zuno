@@ -40,6 +40,7 @@ const INSTALL_MARKERS: &[&str] = &["installs/opencode", "opencode/1."];
 /// see. Renaming or removing one of these fails here, loudly, with the reason.
 const ROUTED_DIFFERENTIALS: &[&str] = &[
     "oc-catalog/tests/agent_differential.rs",
+    "oc-catalog/tests/skill_differential.rs",
     "oc-cli/tests/differential.rs",
     "oc-cli/tests/rollback.rs",
     "oc-db/tests/message_export.rs",

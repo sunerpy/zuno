@@ -6890,3 +6890,18 @@ PR run `31878406895` 的 `Test` job 已实际拿到 CodeBuild runner，但
 resolver 获取钉住版本。候选完全缺失时逐项打印 `SKIPPED` 和未覆盖内容后返回；用户显式指定错误
 路径或发现了版本不一致时仍 hard fail，不能把配置错误降级成 skip。结构测试清单也必须纳入该
 文件，防止以后退回直接 discovery。
+
+## [2026-08-15] C-3 追加：中央 oracle 路由清单必须覆盖每一种 differential，不只是首个失败文件
+
+PR run `31879788919` attempt 2 的 `Test` job 已通过 checkout、toolchain、lockfile、format 和
+Clippy，随后在完整测试套件中暴露 `skill_differential.rs` 仍有两个直接 `Oracle::discover`。
+这说明修复 `agent_differential.rs` 的 6 个用例只能消掉当时可见的第一层，不能证明同类调用已穷尽。
+
+可持续的修复不是再加一处分散 skip，而是把每个真实二进制 differential 都登记进
+`ROUTED_DIFFERENTIALS`，由结构测试强制其引用 `pinned_oracle`。运行时合同统一为三态：找到且版本
+正确就真实比较；完全找不到就明确列出未覆盖内容后 skip；显式错误 override 或版本不一致就 hard
+fail。Defect H 同时验证了这三条路径，因此缺少 oracle 的干净 CI 不再误红，错误配置也不会被误绿。
+
+另一个 CI 取证经验：不要只记录 job 的总 conclusion。该 attempt 的 `Artifact smoke (host)` 已完整
+成功，直接证明 Defect E/F；`Test` 也在失败前证明 format 与 Clippy 成功；`Supply chain` 则进入
+`cargo deny` 后因必需 Test 失败而被取消。逐步骤结论能区分产品缺陷、后续取消和网络噪声。

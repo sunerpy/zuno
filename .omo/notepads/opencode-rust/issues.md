@@ -8216,3 +8216,18 @@ PR run `31878406895` 中 `Supply chain` 与 `Artifact smoke (host)` 通过，`Wi
 修复后本机 1.18.18 oracle 的 8 项测试全部真实通过。清除 oracle override、把 `PATH` 限制到
 `/usr/bin:/bin` 后，6 个 differential 各自输出明确 `SKIPPED`，2 个 hermetic fixture 测试仍执行，
 总计 `8 passed`。显式设置一个不存在的 `OC_TESTKIT_ORACLE` 仍按设计 hard fail。
+
+## [2026-08-15] C-3：PR attempt 2 暴露 Defect H，已在本地修复
+
+Run `31879788919` 只按 runbook 重跑失败 jobs 一次。Attempt 2 的 checkout/setup 网络阶段恢复；
+`Artifact smoke (host)` 完整成功，`Test` 通过 format 与 Clippy 后，在真实 `Test suite` 中因
+`oc-catalog/tests/skill_differential.rs` 的两个直接 `Oracle::discover` 失败。因此这是 Defect G 的
+同类遗漏（Defect H），不是可再次用网络故障解释并重跑的噪声。
+
+本地修复已完成：两个真实 skill differential 改走 `pinned_oracle_or_skip`，文件加入中央结构门禁。
+已证明 installed 1.18.18 oracle 路径 `3 passed`；清空 override 并限制 `PATH=/usr/bin:/bin` 时仍
+`3 passed` 且输出两条明确 skip；显式无效 `OC_TESTKIT_ORACLE` 时两个真实比较都 hard fail。
+`make fmt-check`、`make lint`、`cargo build --workspace --locked`、两份 Rust 文件的 LSP 诊断均通过。
+
+仍待关闭：将 Defect H 推入 PR #1，取得更新后的完整 CodeBuild PR run 全绿，合并后再取得 main
+run 的逐 job `runner_name`/`conclusion`。在 main 证据落盘前，C-3 仍不标记为 CI RESOLVED。
