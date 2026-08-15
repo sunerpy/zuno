@@ -6905,3 +6905,31 @@ fail。Defect H 同时验证了这三条路径，因此缺少 oracle 的干净 C
 另一个 CI 取证经验：不要只记录 job 的总 conclusion。该 attempt 的 `Artifact smoke (host)` 已完整
 成功，直接证明 Defect E/F；`Test` 也在失败前证明 format 与 Clippy 成功；`Supply chain` 则进入
 `cargo deny` 后因必需 Test 失败而被取消。逐步骤结论能区分产品缺陷、后续取消和网络噪声。
+## [2026-08-15] Atlas 复核：webhook 投递失败率的总量测量
+
+C-2 记录了突发相关性（第 1 轮 3 事件 → 2 失败），我补一次总量测量，因为
+「偶发」和「28% 恒定失败」对是否能依赖这条 CI 是两个不同的结论。
+
+    gh api "repos/sunerpy/zuno/hooks/666011311/deliveries?per_page=100" \
+      --jq '[.[]|select(.event=="workflow_job")] | group_by(.status_code)[]
+            | "code=\(.[0].status_code): \(length)"'
+
+    workflow_job 投递总数 61
+      code=200  44 次
+      code=500  11 次
+      code=502   6 次        → 失败 17/61 ≈ 28%
+
+只看决定「job 能否拿到 runner」的 `queued`：**5/21 ≈ 24% 永久丢失**。
+每个丢失的 `queued` 等于一个永远停在 0 步骤的 job，因为 GitHub 不重试
+（投递错误文本里它自己写着 `giving up after 1 attempt(s)`）。
+
+**这不是配置错误，无平台级修法。** 两处查证：
+- 继承的 `github-actions-on-codebuild` skill 记了 4 个坑，**没有这一条**；
+  它的「唯一干净判据 `lastTriggeredAt`」在 aws-cn 上也不成立（C-2 已记）。
+- AWS 官方 `action-runner-troubleshoot-webhook.html` 对 hanging job 只给两个
+  方向：读 Response 日志、标签路由。本项目 11 组标签集各自唯一
+  （`release_surface.rs:870` 钉死），**已排除**路由成因。
+
+结论：aws-cn 分区的 GitHub→CodeBuild 投递不可靠是**固有属性**，只能靠 C-2 记的
+逐个错开重发来运维。任何「CI 绿了就等于稳定」的判断在此分区都不成立；判断
+CI 是否健康要看 job 是否**拿到 runner**，不能只看 run 的 conclusion。
