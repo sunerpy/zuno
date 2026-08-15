@@ -22,6 +22,7 @@
 //! label only its own code can supply.
 
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -32,11 +33,19 @@ use oc_engine::terminal_lease::{
     LeaseReason, TerminalLease, TerminalLeaseError, TerminalLeaseGuard,
 };
 use oc_plugin::{
-    AuthHook, AuthMethod, HookBus, HookInvocation, JsHostConfig, JsPluginSpec, Plugin,
-    SUPPORTED_JS_PLUGINS, load_js_plugins_ordered,
+    AuthHook, AuthMethod, HookBus, HookInvocation, JsHostConfig, JsPluginSpec, JsRuntime, Plugin,
+    SUPPORTED_JS_PLUGINS, discover_runtime, load_js_plugins_ordered,
 };
 
 const PLUGIN_CACHE: &str = "/config/.cache/opencode";
+
+/// The `PATH` entries a hermetic child keeps besides its JavaScript runtime.
+///
+/// Not load-bearing and not machine-specific: whether these exist decides nothing,
+/// because the runtime directory is prepended by [`hermetic_runtime_path`]. They
+/// are retained only so that clearing the environment does not also take away the
+/// ordinary system utilities these runs had before.
+const SYSTEM_PATH_BASE: [&str; 2] = ["/usr/bin", "/bin"];
 const ANTIGRAVITY_PACKAGE: &str = "opencode-antigravity-auth";
 const KIRO_PACKAGE: &str = "@sunerpy/opencode-kiro-auth";
 
@@ -153,6 +162,57 @@ fn skipped(test: &str, absent: &[String]) {
     );
 }
 
+/// The JavaScript runtime this host offers, or a visible skip naming its absence.
+///
+/// Every test in this file loads a JavaScript plugin, so a host with neither `bun`
+/// nor `node` can prove nothing here. Reporting that as a skip which names the
+/// missing runtime is the point: the alternative is an assertion failing against an
+/// empty stream, which reads as a product defect rather than a missing tool.
+fn js_runtime_or_skip(test: &str) -> Option<JsRuntime> {
+    let plugins = [format!("the JavaScript plugin {test} loads")];
+    match discover_runtime(&plugins) {
+        Ok(runtime) => Some(runtime),
+        Err(error) => {
+            eprintln!("SKIPPED {test}: {error}");
+            None
+        }
+    }
+}
+
+/// The `PATH` a hermetic child needs in order to still spawn a JavaScript runtime.
+///
+/// `env_clear` here is deliberate and stays: the subject must not inherit the
+/// developer's shell. But every plugin these tests load is JavaScript, and a plugin
+/// only loads if the child can spawn `bun` or `node` — so the runtime has to be
+/// handed over explicitly, and it has to be **found on this host** rather than
+/// assumed.
+///
+/// What this replaced was `PATH=/usr/bin:/bin` plus a hardcoded
+/// `MISE_DATA_DIR=/config/.local/share/mise`. The machine those were written on has
+/// neither `/usr/bin/node` nor `/bin/node`, so that second value was the only thing
+/// that ever produced a runtime, and anywhere else the plugin simply never ran:
+/// `models` printed its models, emitted no diagnostic at all, and the assertion in
+/// [`failing_auth_loader_is_disabled_and_models_lists_models_with_a_diagnostic`]
+/// failed against an empty stderr.
+///
+/// [`discover_runtime`] is the same production discovery the child itself performs,
+/// so consulting it keeps both sides in agreement about what counts as a runtime,
+/// and handing over only the directory it selected keeps the child hermetic: one
+/// directory, not the ambient `PATH`.
+fn hermetic_runtime_path(test: &str) -> Option<OsString> {
+    let runtime = js_runtime_or_skip(test)?;
+    let directory = runtime.program().parent().unwrap_or_else(|| {
+        panic!(
+            "discovery must return a runtime inside a directory, got {}",
+            runtime.program().display()
+        )
+    });
+    let entries = std::iter::once(directory.to_path_buf())
+        .chain(SYSTEM_PATH_BASE.iter().map(PathBuf::from))
+        .collect::<Vec<_>>();
+    Some(std::env::join_paths(entries).expect("no runtime directory may contain a path separator"))
+}
+
 /// Collects the auth resources the named plugins register, through the real loader.
 ///
 /// This is the production path — [`load_js_plugins_ordered`] with the same host
@@ -221,6 +281,11 @@ async fn real_auth_plugin_providers_reach_the_plain_models_surface() {
         );
         return;
     }
+    let Some(runtime_path) =
+        hermetic_runtime_path("real_auth_plugin_providers_reach_the_plain_models_surface")
+    else {
+        return;
+    };
 
     let root = tempfile::tempdir().expect("tempdir");
     let catalog = root.path().join("models.json");
@@ -239,8 +304,7 @@ async fn real_auth_plugin_providers_reach_the_plain_models_surface() {
         .env("XDG_CONFIG_HOME", root.path().join("config"))
         .env("XDG_CACHE_HOME", root.path().join("cache"))
         .env("XDG_STATE_HOME", root.path().join("state"))
-        .env("MISE_DATA_DIR", "/config/.local/share/mise")
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", &runtime_path)
         .env("NO_COLOR", "1")
         .env("TERM", "dumb")
         .env("ZUNO_DISABLE_AUTOUPDATE", "true")
@@ -297,6 +361,11 @@ async fn antigravity_auth_loader_zeroes_google_cost_on_the_verbose_models_surfac
         );
         return;
     }
+    let Some(runtime_path) = hermetic_runtime_path(
+        "antigravity_auth_loader_zeroes_google_cost_on_the_verbose_models_surface",
+    ) else {
+        return;
+    };
 
     let root = tempfile::tempdir().expect("tempdir");
     let catalog = root.path().join("models.json");
@@ -318,8 +387,7 @@ async fn antigravity_auth_loader_zeroes_google_cost_on_the_verbose_models_surfac
         .env("XDG_CONFIG_HOME", root.path().join("config"))
         .env("XDG_CACHE_HOME", root.path().join("cache"))
         .env("XDG_STATE_HOME", root.path().join("state"))
-        .env("MISE_DATA_DIR", "/config/.local/share/mise")
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", &runtime_path)
         .env("NO_COLOR", "1")
         .env("TERM", "dumb")
         .env("ZUNO_DISABLE_AUTOUPDATE", "true")
@@ -364,6 +432,12 @@ async fn antigravity_auth_loader_zeroes_google_cost_on_the_verbose_models_surfac
 
 #[tokio::test]
 async fn failing_auth_loader_is_disabled_and_models_lists_models_with_a_diagnostic() {
+    let Some(runtime_path) = hermetic_runtime_path(
+        "failing_auth_loader_is_disabled_and_models_lists_models_with_a_diagnostic",
+    ) else {
+        return;
+    };
+
     let root = tempfile::tempdir().expect("tempdir");
     let catalog = root.path().join("models.json");
     let plugin = root.path().join("failing-auth-loader.mjs");
@@ -386,8 +460,7 @@ async fn failing_auth_loader_is_disabled_and_models_lists_models_with_a_diagnost
         .env("XDG_CONFIG_HOME", root.path().join("config"))
         .env("XDG_CACHE_HOME", root.path().join("cache"))
         .env("XDG_STATE_HOME", root.path().join("state"))
-        .env("MISE_DATA_DIR", "/config/.local/share/mise")
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", &runtime_path)
         .env("NO_COLOR", "1")
         .env("TERM", "dumb")
         .env("ZUNO_DISABLE_AUTOUPDATE", "true")
@@ -433,6 +506,13 @@ async fn the_real_antigravity_plugin_registers_a_google_auth_method_no_fixture_s
             "the_real_antigravity_plugin_registers_a_google_auth_method_no_fixture_supplies",
             &absent,
         );
+        return;
+    }
+    if js_runtime_or_skip(
+        "the_real_antigravity_plugin_registers_a_google_auth_method_no_fixture_supplies",
+    )
+    .is_none()
+    {
         return;
     }
     assert!(
@@ -482,6 +562,9 @@ async fn without_antigravity_no_auth_resource_carries_its_evidence() {
             "without_antigravity_no_auth_resource_carries_its_evidence",
             &absent,
         );
+        return;
+    }
+    if js_runtime_or_skip("without_antigravity_no_auth_resource_carries_its_evidence").is_none() {
         return;
     }
 

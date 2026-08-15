@@ -1,0 +1,146 @@
+task-c4 / opencode-rust (zuno)
+=========================================================================
+缺陷：crates/oc-cli/tests/plugin_models.rs 的
+failing_auth_loader_is_disabled_and_models_lists_models_with_a_diagnostic
+只因本机工具布局才通过；CodeBuild runner 上 stderr 为空、断言失败。
+
+分支 task-c4，worktree /config/workspace/ProdDir/AI/oc-wt/c4，
+基线 origin/main = ea3096f，CARGO_TARGET_DIR=/tmp/opencode/c4。
+
+-------------------------------------------------------------------------
+1. 根因（实测，非推断）
+-------------------------------------------------------------------------
+测试用 .env_clear() 构造密闭环境后写死两个只在本机成立的值：
+    .env("PATH", "/usr/bin:/bin")
+    .env("MISE_DATA_DIR", "/config/.local/share/mise")
+
+被测插件是 .mjs，必须有 node/bun 才能跑。实测本机：
+    $ command -v node  -> /config/.local/share/mise/shims/node
+    $ ls /usr/bin/node /bin/node /usr/bin/bun
+      ls: cannot access '/usr/bin/node': No such file or directory
+      ls: cannot access '/bin/node':     No such file or directory
+      ls: cannot access '/usr/bin/bun':  No such file or directory
+
+生产发现顺序（crates/oc-plugin/src/js/runtime.rs:141-176 discover_runtime）：
+    PATH  ->  BUN_INSTALL/bin/bun  ->  $MISE_DATA_DIR/installs/<rt>/latest/bin/<rt>
+          ->  $XDG_DATA_HOME/mise/...  ->  $HOME/.local/share/mise/...
+所以 PATH=/usr/bin:/bin 一定找不到 runtime，本机唯一命中的是写死的
+MISE_DATA_DIR。别的机器上该目录不存在 -> 插件从未启动 -> 无 diagnostic ->
+断言对着空 stderr 失败。测试此前的“通过”完全是本机布局的偶然。
+
+-------------------------------------------------------------------------
+2. 修法
+-------------------------------------------------------------------------
+保留 .env_clear() 的密闭意图，改为向子进程显式交出**本机实际存在**的
+runtime 目录：调用生产的 oc_plugin::discover_runtime（与子进程自己用的是同
+一函数，两侧对“什么算 runtime”不会分歧），取其所在目录，前置到
+SYSTEM_PATH_BASE = ["/usr/bin", "/bin"] 之前。仍是单一目录 + 系统基座，
+不是环境里的 ambient PATH，密闭性未放松。MISE_DATA_DIR 全部删除。
+
+runtime 缺失时的行为（关键验收点，绝不静默通过）：
+  * plugin_models.rs 三个子进程测试：js_runtime_or_skip() 打印
+    "SKIPPED <test>: no JavaScript runtime found ..." 并 return。
+  * plugin_models.rs 两个 in-process 测试：同一 guard，同样可见 skip。
+  * tool_turn.rs / session_mutation.rs：js_runtime_path() 以 expect 明确
+    panic，消息含 MissingJsRuntime{searched:"bun, node"} 与所属套件名。
+顺带证据：同时删掉的 XDG_CACHE_HOME=/config/.cache 并非承重项——真实
+antigravity/kiro 测试在删除后仍全部通过（插件路径由 config 里的
+installed_antigravity() 提供，不经 XDG_CACHE_HOME）。
+
+-------------------------------------------------------------------------
+3. 同类缺陷全量排查（要求的逐条判定）
+-------------------------------------------------------------------------
+grep MISE_DATA_DIR + /config/ + env("PATH" + env_clear 覆盖 crates/**/tests/。
+
+A. 命中同一缺陷、已修复（共 11 处写死 PATH+MISE_DATA_DIR）
+  crates/oc-cli/tests/plugin_models.rs        3 处（:242 :321 :389）
+  crates/oc-cli/tests/tool_turn.rs            8 处（8 个 run_* 辅助函数，
+      逐处三行块完全相同，已收敛为 js_plugin_variables() 单一入口）
+  crates/oc-cli/tests/session_mutation.rs     2 处（start_with_plugin_config /
+      start_with_failing_auth_loader，收敛为 js_plugin_variables()）
+  注：tool_turn/session_mutation 的这些测试在本 worktree 里**确实执行**
+  （祖先目录存在 /config/workspace/ProdDir/AI/opencode，oracle 录音可达），
+  修复后 15+11 项全部真实通过，不是靠 skip 掩盖。
+
+B. plugin_models.rs 中另外 4 个“已通过”的测试为何未受影响
+  real_auth_plugin_providers_reach_the_plain_models_surface        -> 曾同样带病
+      （子进程 + 写死 PATH），只是它断言的 provider 行由 PINNED_CATALOG 供给，
+      插件不启动时 kiro-auth 行会缺失 -> 本机同样只因 MISE_DATA_DIR 才绿。已修。
+  antigravity_auth_loader_zeroes_google_cost_on_the_verbose_...     -> 同上，已修。
+  the_real_antigravity_plugin_registers_a_google_auth_method_...    -> in-process
+      加载，不经 PATH env，继承真实环境；原本就诚实。已补 runtime guard。
+  without_antigravity_no_auth_resource_carries_its_evidence         -> 同上。已补。
+
+C. 其余 /config/ 命中，逐条判定为“非本缺陷”
+  oc-catalog/tests/skill.rs:455-456        只读语料，!is_dir() 跳过 + 打印 skipped   OK
+  oc-catalog/tests/skill_render.rs:31-47   纯字符串字面量，不触碰文件系统            OK
+  oc-catalog/tests/snapshots/*.snap        上述字面量的快照                          OK
+  oc-catalog/tests/fixtures/*.cjs:3        注释里的来源标注                          OK
+  oc-cli/tests/plugin_models.rs:40         PLUGIN_CACHE，absent_packages() 命名缺失
+                                          后 skipped()                              OK
+  oc-cli/tests/tool_turn.rs:90             installed_antigravity()，各测试 is_dir()
+                                          检查后打印 SKIPPED                        OK
+  oc-cli/tests/generated_sdk_provider.rs:7 SDK，!is_file() 打印 SKIPPED 后 return    OK
+  oc-config/tests/differential.rs:16       LIVE_USER_CONFIG，**故意**硬失败（criterion 2
+                                          要求机器特定输入不可用时可见失败）        OK 设计如此
+  oc-config/tests/fixtures/user-config.json:89  被注释掉的 JSON 行                   OK
+  oc-db/tests/legacy_migration.rs:59       REAL_LEGACY_BACKUP，须显式设
+                                          OPENCODE_LEGACY_DB 才启用，否则跳过       OK
+  oc-mcp/tests/remote_live.rs:7            读不到即 SKIP，逐 server 再 SKIP          OK
+  oc-plugin/tests/js.rs:1353/1494          PLUGIN_CACHE 走 is_file() 分支；
+                                          user_config 不可读时打印“NOT verified”     OK
+  oc-plugin/tests/integration.rs:843       PLUGIN_CACHE，!is_dir() -> SKIPPED        OK
+  oc-plugin/tests/config_tools.rs:56       zod fixture 候选之一，另有相对路径候选与
+                                          OPENCODE_ZOD_FIXTURE，找不到即 SKIP；
+                                          且已用 discover_runtime 判缺失             OK
+  oc-tools/tests/registry.rs:202           纯路径字符串解析，不访问磁盘              OK
+  oc-testkit/tests/compat_suite.rs:2839    说明文字（且属禁改文件）                  OK
+  oc-testkit/tests/no_pinned_oracle_paths.rs:4  文档注释                             OK
+  oc-tui/tests/fixtures/*.tsv:2            上游来源注释                              OK
+
+结论：crates/**/tests/ 中已无任何测试**依赖** /config/ 或本机布局才能通过；
+剩余 /config/ 文本均为字面量、注释，或带可见 skip / 故意硬失败的守卫路径。
+修改后 MISE_DATA_DIR 在 crates/ 下只剩生产发现代码
+（oc-plugin/src/js/runtime.rs:162）与三处解释性文档注释。
+
+-------------------------------------------------------------------------
+4. 本地验证
+-------------------------------------------------------------------------
+[a] cargo test -p oc-cli --test plugin_models
+    5 passed; 0 failed; 0 ignored
+
+[b] 无 runtime 行为证明（隐藏所有 runtime 后直接跑测试二进制）
+    env -i PATH=/usr/bin:/bin HOME=/tmp/opencode/c4-nohome \
+        plugin_models-d833b4688c6c297e --nocapture --test-threads 1
+    -> 3 个子进程测试各打印：
+       "SKIPPED <name>: no JavaScript runtime found on PATH or in user tool
+        directories (looked for bun, node); ... Install `bun` (preferred) or `node`."
+    -> 2 个 in-process 测试 FAILED，panic 文本含
+       kind: MissingRuntime + 完整 MissingJsRuntime 说明
+    （guard 补齐后这两项也改为同样可见的 SKIPPED）
+    tool_turn / session_mutation 同法验证，各自 panic 于
+    "a JavaScript runtime: MissingJsRuntime { searched: \"bun, node\",
+     plugins: \"the JavaScript plugins crates/oc-cli/tests/<file> loads\" }"
+    => 无 runtime 时只有「可见 skip」或「点名 panic」两种结果，绝无静默通过。
+
+[c] cargo test -p oc-cli --test plugin_models --test tool_turn --test session_mutation
+    plugin_models 5 passed / session_mutation 11 passed / tool_turn 15 passed
+    共 31 passed; 0 failed
+
+[d] cargo test --workspace
+    suites=217 passed=3526 failed=0 ignored=2
+    与交接基线（3526 / 0 / 2，217 套）完全一致，计数无变化。
+
+[e] make fmt-check  -> "All matched files use the correct format."
+    make lint       -> clippy --workspace --all-targets -D warnings，0 warning
+    （--all-targets 覆盖本次改动的三个 tests/ 文件）
+
+[f] make smoke-artifact（CARGO_TARGET_DIR 已 unset，因 Makefile:28
+    TARGET_DIR := target 用 := 固定为 ./target/release/）
+    结果见下方 CI 章节前的补记。
+
+-------------------------------------------------------------------------
+5. CI 验证（main）
+-------------------------------------------------------------------------
+待填：run id 与逐 job 表格（Test / Artifact smoke (host) / Supply chain /
+CI Success 均 conclusion=success 且 runner_name 非空；Windows = skipped）。

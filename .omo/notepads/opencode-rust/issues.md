@@ -8231,3 +8231,32 @@ Run `31879788919` 只按 runbook 重跑失败 jobs 一次。Attempt 2 的 checko
 
 仍待关闭：将 Defect H 推入 PR #1，取得更新后的完整 CodeBuild PR run 全绿，合并后再取得 main
 run 的逐 job `runner_name`/`conclusion`。在 main 证据落盘前，C-3 仍不标记为 CI RESOLVED。
+
+## [2026-08-15] C-4：Defect I —— 插件测试写死本机 PATH/MISE_DATA_DIR
+
+`crates/oc-cli/tests/plugin_models.rs` 的
+`failing_auth_loader_is_disabled_and_models_lists_models_with_a_diagnostic`
+在 CodeBuild runner 上失败（run `31890921981`，stderr **为空**），本机通过。
+根因不是 diagnostic 内容错，而是插件从未启动：测试 `.env_clear()` 后写死
+`PATH=/usr/bin:/bin` 与 `MISE_DATA_DIR=/config/.local/share/mise`。被测插件是
+`.mjs`，需 node/bun；本机实测 `/usr/bin/node`、`/bin/node`、`/usr/bin/bun`
+**都不存在**，`command -v node` 指向 mise shim，所以唯一命中的是那个写死的
+mise 根。别的机器上它不存在 → 插件不启动 → 无 diagnostic → 断言对空 stderr 失败。
+与 C-3 的 `live_sdk.rs` 用 `ancestors()` 跳出仓库同一类：绿色但依赖本机布局。
+
+同一模式共 11 处，全部修掉：`plugin_models.rs` 3 处、`tool_turn.rs` 8 处
+（8 个 `run_*` 辅助函数逐处复制同一三行块）、`session_mutation.rs` 2 处。
+另外 4 个“已通过”的 plugin_models 测试里，2 个子进程测试其实同样带病（只是断言
+对象换成 provider 行），2 个 in-process 测试不经 PATH env，本就诚实。
+
+修法：调用生产的 `oc_plugin::discover_runtime`（子进程用的是同一函数，两侧不会
+对“什么算 runtime”产生分歧），取其所在目录前置到 `["/usr/bin","/bin"]`，
+`MISE_DATA_DIR` 全删。缺 runtime 时只有两种结果——可见 `SKIPPED ... no JavaScript
+runtime found ...`，或点名 `MissingJsRuntime{searched:"bun, node"}` 的 panic；
+绝无静默通过。附带实测：一起删掉的 `XDG_CACHE_HOME=/config/.cache` 并非承重项，
+真实 antigravity/kiro 测试删后仍全绿（插件路径由 config 里的
+`installed_antigravity()` 提供）。
+
+`crates/**/tests/` 全量排查后，其余 `/config/` 命中均为字面量、注释，或带可见
+skip 的守卫；唯一故意硬失败的是 `oc-config/tests/differential.rs:16`
+（criterion 2 要求机器特定输入缺失时可见失败），按设计保留。

@@ -77,6 +77,12 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What the executed `write` call must leave on disk.
 const WRITTEN_CONTENT: &str = "the tool ran\n";
+
+/// The `PATH` entries a plugin-backed child keeps besides its JavaScript runtime.
+///
+/// Not load-bearing and not machine-specific: whether these exist decides nothing,
+/// because [`js_runtime_path`] prepends the directory that actually holds a runtime.
+const SYSTEM_PATH_BASE: [&str; 2] = ["/usr/bin", "/bin"];
 const ANTIGRAVITY_SPEC: &str = "opencode-antigravity-auth@1.6.0";
 const ANTIGRAVITY_TOOL: &str = "google_search";
 
@@ -492,6 +498,47 @@ fn variables(env: &ScriptedEnv, base_url: &str) -> BTreeMap<String, String> {
     variables
 }
 
+/// [`variables`], adjusted for a child that has to load a JavaScript plugin.
+///
+/// Every plugin-backed run below shares this, and what it centralises is the part
+/// that used to be copied eight times: `PATH=/usr/bin:/bin` plus a hardcoded
+/// `MISE_DATA_DIR=/config/.local/share/mise`. This host has neither `/usr/bin/node`
+/// nor `/bin/node`, so that mise root was the only thing that ever produced a
+/// runtime, and on any machine without it every plugin here failed to start — which
+/// a plugin assertion then reports as an empty stream rather than as a missing tool.
+///
+/// `PATH` is now the directory production discovery selects on this host, prepended
+/// to the same system base as before, so the child stays hermetic without encoding
+/// anyone's tool layout.
+///
+/// # Panics
+///
+/// When the host has neither `bun` nor `node`. These runs cannot mean anything
+/// without one, and naming the absence outright is what keeps it from being read as
+/// a product defect.
+fn js_plugin_variables(env: &ScriptedEnv, base_url: &str) -> BTreeMap<String, String> {
+    let mut variables = variables(env, base_url);
+    variables.remove("ZUNO_PURE");
+    variables.insert("PATH".to_owned(), js_runtime_path());
+    variables
+}
+
+fn js_runtime_path() -> String {
+    let plugins = ["the JavaScript plugins crates/oc-cli/tests/tool_turn.rs loads".to_owned()];
+    let runtime = oc_plugin::discover_runtime(&plugins).expect("a JavaScript runtime");
+    let directory = runtime
+        .program()
+        .parent()
+        .expect("discovery returns a runtime inside a directory");
+    let entries = std::iter::once(directory.to_path_buf())
+        .chain(SYSTEM_PATH_BASE.iter().map(PathBuf::from))
+        .collect::<Vec<_>>();
+    std::env::join_paths(entries)
+        .expect("no runtime directory may contain a path separator")
+        .into_string()
+        .expect("the runtime directory is UTF-8")
+}
+
 /// Launch the real binary and wait for it, bounded.
 ///
 /// `tokio::process` rather than `std::process` because the mock provider's server
@@ -516,14 +563,7 @@ async fn run_plugin_prompt(
     prompt: &str,
     deny_plugin_tool: bool,
 ) -> Output {
-    let mut plugin_variables = variables(env, base_url);
-    plugin_variables.remove("ZUNO_PURE");
-    plugin_variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
-    plugin_variables.insert(
-        "MISE_DATA_DIR".to_owned(),
-        "/config/.local/share/mise".to_owned(),
-    );
-    plugin_variables.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+    let mut plugin_variables = js_plugin_variables(env, base_url);
     plugin_variables.insert(
         "OPENCODE_CONFIG_CONTENT".to_owned(),
         plugin_provider_config(base_url, deny_plugin_tool),
@@ -546,14 +586,7 @@ async fn run_failing_auth_loader_prompt(
     base_url: &str,
     plugin: &Path,
 ) -> Output {
-    let mut plugin_variables = variables(env, base_url);
-    plugin_variables.remove("ZUNO_PURE");
-    plugin_variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
-    plugin_variables.insert(
-        "MISE_DATA_DIR".to_owned(),
-        "/config/.local/share/mise".to_owned(),
-    );
-    plugin_variables.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+    let mut plugin_variables = js_plugin_variables(env, base_url);
     plugin_variables.insert(
         "OPENCODE_CONFIG_CONTENT".to_owned(),
         failing_auth_loader_provider_config(base_url, plugin),
@@ -589,14 +622,7 @@ async fn run_sdk_model_provider_prompt(
     endpoint: &str,
     print_debug_logs: bool,
 ) -> Output {
-    let mut plugin_variables = variables(env, base_url);
-    plugin_variables.remove("ZUNO_PURE");
-    plugin_variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
-    plugin_variables.insert(
-        "MISE_DATA_DIR".to_owned(),
-        "/config/.local/share/mise".to_owned(),
-    );
-    plugin_variables.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+    let mut plugin_variables = js_plugin_variables(env, base_url);
     plugin_variables.insert(
         "OPENCODE_CONFIG_CONTENT".to_owned(),
         sdk_model_provider_config(base_url, plugin, catalog_id, api_id, endpoint),
@@ -627,14 +653,7 @@ async fn run_sdk_model_provider_prompt(
 }
 
 async fn run_auto_discovery_prompt(env: &ScriptedEnv, base_url: &str, load_log: &Path) -> Output {
-    let mut plugin_variables = variables(env, base_url);
-    plugin_variables.remove("ZUNO_PURE");
-    plugin_variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
-    plugin_variables.insert(
-        "MISE_DATA_DIR".to_owned(),
-        "/config/.local/share/mise".to_owned(),
-    );
-    plugin_variables.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+    let mut plugin_variables = js_plugin_variables(env, base_url);
     plugin_variables.insert(
         "AUTO_DISCOVERY_LOG".to_owned(),
         load_log.display().to_string(),
@@ -697,14 +716,7 @@ async fn run_lifecycle_command_with_args(
     dispose_file: &Path,
     args: &[&str],
 ) -> Output {
-    let mut plugin_variables = variables(env, base_url);
-    plugin_variables.remove("ZUNO_PURE");
-    plugin_variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
-    plugin_variables.insert(
-        "MISE_DATA_DIR".to_owned(),
-        "/config/.local/share/mise".to_owned(),
-    );
-    plugin_variables.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+    let mut plugin_variables = js_plugin_variables(env, base_url);
     plugin_variables.insert(
         "ZUNO_AUTH_CONTENT".to_owned(),
         r#"{"test":{"type":"api","key":"fixture-key"}}"#.to_owned(),
@@ -732,14 +744,7 @@ async fn run_noop_tool_definition_prompt(
     plugin: &Path,
     event_file: &Path,
 ) -> Output {
-    let mut plugin_variables = variables(env, base_url);
-    plugin_variables.remove("ZUNO_PURE");
-    plugin_variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
-    plugin_variables.insert(
-        "MISE_DATA_DIR".to_owned(),
-        "/config/.local/share/mise".to_owned(),
-    );
-    plugin_variables.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+    let mut plugin_variables = js_plugin_variables(env, base_url);
     plugin_variables.insert(
         "OPENCODE_CONFIG_CONTENT".to_owned(),
         noop_tool_definition_provider_config(base_url, plugin, event_file),
@@ -758,14 +763,7 @@ async fn run_noop_tool_definition_prompt(
 }
 
 async fn run_memory_collision_prompt(env: &ScriptedEnv, base_url: &str, plugin: &Path) -> Output {
-    let mut plugin_variables = variables(env, base_url);
-    plugin_variables.remove("ZUNO_PURE");
-    plugin_variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
-    plugin_variables.insert(
-        "MISE_DATA_DIR".to_owned(),
-        "/config/.local/share/mise".to_owned(),
-    );
-    plugin_variables.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+    let mut plugin_variables = js_plugin_variables(env, base_url);
     plugin_variables.insert(
         "OPENCODE_CONFIG_CONTENT".to_owned(),
         memory_collision_provider_config(base_url, plugin),
@@ -790,14 +788,7 @@ async fn run_lifecycle_tool_prompt(
     event_file: &Path,
     dispose_file: &Path,
 ) -> Output {
-    let mut plugin_variables = variables(env, base_url);
-    plugin_variables.remove("ZUNO_PURE");
-    plugin_variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
-    plugin_variables.insert(
-        "MISE_DATA_DIR".to_owned(),
-        "/config/.local/share/mise".to_owned(),
-    );
-    plugin_variables.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+    let mut plugin_variables = js_plugin_variables(env, base_url);
     let mut config: serde_json::Value = serde_json::from_str(&lifecycle_provider_config(
         base_url,
         plugin,

@@ -6933,3 +6933,26 @@ C-2 记录了突发相关性（第 1 轮 3 事件 → 2 失败），我补一次
 结论：aws-cn 分区的 GitHub→CodeBuild 投递不可靠是**固有属性**，只能靠 C-2 记的
 逐个错开重发来运维。任何「CI 绿了就等于稳定」的判断在此分区都不成立；判断
 CI 是否健康要看 job 是否**拿到 runner**，不能只看 run 的 conclusion。
+
+## [2026-08-15] C-4：密闭子进程要 JS runtime 时，唯一诚实的来源是生产发现函数
+
+`.env_clear()` + 显式 `PATH` 是对的（不让开发机环境漏进被测进程），错的是把
+`PATH` 写成常量。凡子进程要加载 JS 插件，`PATH` 必须由
+`oc_plugin::discover_runtime`（`crates/oc-plugin/src/js/runtime.rs:141`）在**当前
+主机**上解析出来，再把它所在的**单个目录**前置到系统基座。这样既保持密闭
+（交出一个目录，不是 ambient PATH），又与子进程自己的发现逻辑同源。
+
+发现顺序值得记住，写测试时别绕过它：
+`PATH` → `BUN_INSTALL/bin/bun` → `$MISE_DATA_DIR/installs/<rt>/latest/bin/<rt>`
+→ `$XDG_DATA_HOME/mise/...` → `$HOME/.local/share/mise/...`；`bun` 优先于 `node`。
+本机 `node`/`bun` 只存在于 mise，且 mise shim 在 `env -i` 下也能正常输出版本号
+（配置不受信的告警只影响 stderr，不影响 exec）。
+
+判据：一个「插件测试」在没有 runtime 的机器上必须可见 skip 或点名 panic。
+若它只是断言失败在空 stdout/stderr 上，那条测试等于没测插件——本仓库已连续
+出现三次同类（C-3 的 `ancestors()` 越界、C-3 的 oracle 直连、C-4 的写死 PATH）。
+
+顺带：本仓库 worktree 放在 `/config/workspace/ProdDir/AI/oc-wt/<n>` 时，
+`oc_testkit::oracle::locate_source_tree()` 沿祖先找 `<ancestor>/opencode` 仍能命中
+`/config/workspace/ProdDir/AI/opencode`，所以 cassette 类测试在 worktree 里是**真跑**
+而非 skip；换到别处（如 /tmp）就会整片转成 skip，读测试数量时要注意这点差异。

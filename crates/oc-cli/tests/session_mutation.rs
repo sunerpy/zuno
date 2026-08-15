@@ -14,6 +14,12 @@ const PROMPT: &str = "answer from the recorded cassette";
 const RUN_TIMEOUT: Duration = Duration::from_secs(30);
 const SSE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The `PATH` entries a plugin-backed server keeps besides its JavaScript runtime.
+///
+/// Not load-bearing and not machine-specific: whether these exist decides nothing,
+/// because [`js_runtime_path`] prepends the directory that actually holds a runtime.
+const SYSTEM_PATH_BASE: [&str; 2] = ["/usr/bin", "/bin"];
+
 const FAILING_TOOL_DEFINITION_PLUGIN: &str = r#"
 import { appendFileSync } from "node:fs";
 
@@ -157,6 +163,48 @@ fn variables_with_config(
         ("OPENCODE_CONFIG_CONTENT".to_owned(), config),
     ]);
     variables
+}
+
+/// [`variables_with_config`], adjusted for a server that has to load a JS plugin.
+///
+/// The `PATH` is the point. This used to be `PATH=/usr/bin:/bin` plus a hardcoded
+/// `MISE_DATA_DIR=/config/.local/share/mise`; the machine that was written on has
+/// neither `/usr/bin/node` nor `/bin/node`, so the mise root was the only thing that
+/// ever produced a runtime, and elsewhere the plugin never started — which a plugin
+/// assertion then reports as an empty stream rather than as a missing tool. It is
+/// now the directory production discovery selects on this host, prepended to the
+/// same system base as before.
+///
+/// # Panics
+///
+/// When the host has neither `bun` nor `node`, which these servers cannot do
+/// without.
+fn js_plugin_variables(
+    env: &ScriptedEnv,
+    database: &Path,
+    config: String,
+) -> BTreeMap<String, String> {
+    let mut variables = variables_with_config(env, database, config);
+    variables.remove("ZUNO_PURE");
+    variables.insert("PATH".to_owned(), js_runtime_path());
+    variables
+}
+
+fn js_runtime_path() -> String {
+    let plugins =
+        ["the JavaScript plugins crates/oc-cli/tests/session_mutation.rs loads".to_owned()];
+    let runtime = oc_plugin::discover_runtime(&plugins).expect("a JavaScript runtime");
+    let directory = runtime
+        .program()
+        .parent()
+        .expect("discovery returns a runtime inside a directory");
+    let entries = std::iter::once(directory.to_path_buf())
+        .chain(SYSTEM_PATH_BASE.iter().map(PathBuf::from))
+        .collect::<Vec<_>>();
+    std::env::join_paths(entries)
+        .expect("no runtime directory may contain a path separator")
+        .into_string()
+        .expect("the runtime directory is UTF-8")
 }
 
 fn seed_session(database: &Path, project: &Path) {
@@ -312,15 +360,7 @@ impl RunningServer {
     }
 
     async fn start_with_plugin_config(env: &ScriptedEnv, database: &Path, config: String) -> Self {
-        let mut variables = variables_with_config(env, database, config);
-        variables.remove("ZUNO_PURE");
-        variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
-        variables.insert(
-            "MISE_DATA_DIR".to_owned(),
-            "/config/.local/share/mise".to_owned(),
-        );
-        variables.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
-        Self::start_with_variables(env, variables).await
+        Self::start_with_variables(env, js_plugin_variables(env, database, config)).await
     }
 
     async fn start_with_failing_auth_loader(
@@ -328,14 +368,7 @@ impl RunningServer {
         database: &Path,
         config: String,
     ) -> Self {
-        let mut variables = variables_with_config(env, database, config);
-        variables.remove("ZUNO_PURE");
-        variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
-        variables.insert(
-            "MISE_DATA_DIR".to_owned(),
-            "/config/.local/share/mise".to_owned(),
-        );
-        variables.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+        let mut variables = js_plugin_variables(env, database, config);
         variables.insert(
             "ZUNO_AUTH_CONTENT".to_owned(),
             r#"{"test":{"type":"api","key":"fixture-key"}}"#.to_owned(),
