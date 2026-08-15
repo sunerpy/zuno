@@ -8778,3 +8778,37 @@ eof）。会话被正确解析并追加了消息，这是本次要证的部分�
 - `make smoke-artifact`：需 **unset** `CARGO_TARGET_DIR`（`Makefile:28` 的 `TARGET_DIR := target`
   不读该变量）。
 - 全程 `df -h /` 52-56G 可用，未触发磁盘假失败。
+## [2026-08-15] Atlas 复核：两个 legacy 硬切诊断在生产路径上不可达
+
+F2 与 F3 在本轮**各自独立**发现同一件事，我逐项复核确认为真：`821ebc6` 为
+plan 与 goal 文档加的旧路径硬切诊断，在任何用户命令下都不会触发，因为两个
+读取咽喉点都没有生产调用者。
+
+    Grep read_plan|write_plan  → 仅 3 个文件：
+      crates/oc-agent/src/plan_file.rs         定义
+      crates/oc-agent/src/plan_file/tests.rs   测试
+      crates/oc-agent/src/lib.rs:43-44         pub use 导出（不是调用）
+
+    Grep '\.ingest\(|ingest_event' → 仅 3 个文件：
+      crates/oc-goal/src/projection.rs         定义
+      crates/oc-goal/src/projection_tests.rs   测试
+      crates/oc-pty/src/session.rs             **同名不同物**，不是 goal 的 ingest
+
+F3 用真机四态矩阵独立验证了这一点：把 plan 放在旧路径 `.opencode/plans/` 下跑
+`zuno run`，四种状态（neither / only-old / only-new / both）**全部 exit 0 且无诊断**。
+测试全绿是因为 13 个新测试直接调函数，绕过了「没人调它」这一层。
+
+**判为 pre-existing，不是本轮回归**，依据是 git 史而非推断：
+
+    git log -S"write_plan(" -- crates
+      821ebc6  本轮加诊断
+      ba2702d  当初引入
+
+只有引入与加诊断两个提交，**没有任何提交移除过调用者**。所以 `821ebc6` 是在一个
+本就未接线的函数里加了正确的分支，并未造成不可达。按收敛协议第 4 条（新 Blocker
+只接受修复直接引入的回归），两位评审都正确地判为 Follow-up。
+
+**可推广的教训**：本会话反复出现的「不会失败的门禁」还有一种更隐蔽的形态——
+**测试直接调用被测函数，从而绕过「该函数是否被生产代码调用」这一层**。13 个四态
+测试全绿、诊断文案正确、错误类型齐备，唯独没人证明生产路径会走到那里。要证伪
+这类缺陷，必须像 F3 那样从**真实入口**驱动，而不是从函数入口。
