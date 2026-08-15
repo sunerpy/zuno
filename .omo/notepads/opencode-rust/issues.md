@@ -8702,3 +8702,79 @@ opt-in 通道做成又一个只在一种宿主上正确的东西。
 `docs/compatibility-matrix.md` 的 `known-gaps` 生成块，而 `check_block` 逐字节断言。改常量后
 必须跑 `OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs` 再 review diff，否则 docs 门禁
 红在一个看起来与本次改动无关的地方。
+
+## 任务 r8：F4 两个 Blocker（文档命令名不存在、三处验收文本要求改名前路径）
+
+### Blocker 1：六处文档写 `zuno session export/import`，二进制里没有这两个子命令
+
+实测（`/tmp/opencode/r8/release/zuno`，未管道，退出码可信）：
+
+```
+$ zuno session --help   → Commands: list  prune  delete  help
+$ zuno --help           → export / import 都在顶层
+$ zuno session import <file>   → error: unrecognized subcommand 'import'   exit=2
+$ zuno session export <id>     → exit=2
+```
+
+能力本身是对的，只有名字写错了。已按顶层名修正六处：`README.md:63,88`、
+`docs/readme/README.en.md:56,81`、`.omo/plans/opencode-rust.md:1632,1645`，并在两个 README 补一句
+明确「两者是顶层命令，不是 `session` 的子命令」。
+
+### 用修正后的命令名实测往返（源库 → 空库 → 列出 → 续跑）
+
+```
+$ zuno export ses_19836663bc2a4b4682421493325608dc > session.json
+Exporting session: ses_19836663bc2a4b4682421493325608dc      exit=0   2114 bytes
+$ XDG_DATA_HOME=<空库> zuno session list                      → 无输出（确认空库）
+$ XDG_DATA_HOME=<空库> zuno import session.json
+Imported session: ses_19836663bc2a4b4682421493325608dc        exit=0
+$ XDG_DATA_HOME=<空库> zuno session list                      → 列出该会话，Msgs=2
+$ XDG_DATA_HOME=<空库> zuno run -s <id> "continue after import"
+  → 「session not found」类字样匹配 0 次；Msgs 2 → 4
+```
+
+`run -s` 退出 1 仅因沙箱内 provider 不可达（`bedrock-runtime.cn-northwest-1` TLS handshake
+eof）。会话被正确解析并追加了消息，这是本次要证的部分；模型回复不在本任务范围内。另注：
+`zuno run` 的 prompt 是位置参数，`--prompt` 会以 exit 2 报错并提示 `--port`。
+
+### Blocker 2：plan 里 14 处 `.opencode`，逐条 verdict
+
+改成 `.zuno/`（都是「判据按自身措辞已无法被满足」的活要求）：
+
+| 行 | 原文 | 依据 |
+| --- | --- | --- |
+| 770 | `.opencode/goal/<sessionID>.md` | `crates/oc-goal/src/projection_tests.rs` 断言 `.zuno/goal/` |
+| 854 | `<worktree>/.opencode/plans/…` | `crates/oc-agent/src/plan_file.rs` 写 `.zuno/plans` |
+| 1065 | `<worktree>/.opencode/RULES.md` | `crates/oc-memory/src/scope.rs` 解析 `.zuno/RULES.md` |
+| 1655 | 准则 11，`.opencode/goal/` | 仍在生效的成功准则，风险最高 |
+| 185 | bare `.opencode` 目录链 | `Layout::config_directories` 走 `.zuno` 及 `$HOME/.zuno` |
+| 227 | 「each level's `.opencode`, `~/.opencode`」 | 同上 |
+| 259 | fixture matrix 的「`.opencode` dir chain」 | 同上 |
+
+标注为历史/上游引用（保留原路径，明确不是要求）：
+
+| 行 | 性质 |
+| --- | --- |
+| 49 | 上游 `session.ts:331-335` 自己写 `.opencode/plans/`，此处是被移植的上游面 |
+| 187 | 上游源码引用 `config/paths.ts:10-40` 的 `.opencode` chain |
+| 231 | todo 8 当时的 QA 记录，`.opencode/opencode.jsonc` 是改名前目录 |
+| 772 | 两处：`.omo/drafts` 里 Q3 决议原文（历史引文）+ 上游 `.opencode/plans` 约定 |
+| 1470/1471 | `engines.opencode` —— 插件 ABI，本就该保留上游名，未触碰 |
+
+**未纳入本次范围但已发现**：`185`/`227`/`259` 里的 `opencode.json` / `opencode.jsonc` 文件名与
+`OPENCODE_CONFIG*` 变量名经实测**仍然准确**（`config_chain.rs:191-193,425-457` 找的就是这两个
+文件名），已在行内写明「不是过期项」，免得下一轮有人连带改错。但 `259` 提到的
+`OPENCODE_DISABLE_PROJECT_CONFIG` 与代码里的 `ZUNO_DISABLE_PROJECT_CONFIG`
+（`config_chain.rs:167`）不一致——这既不属于本任务两个 Blocker，也不在 `.opencode` 占位符内，
+故仅登记不改，留给后续轮次判定。
+
+### 本轮完整门禁结果
+
+- `cargo test --workspace`：**3489 passed / 0 failed / 2 ignored / 213 suites**，与 `bb023f4`
+  基线逐项一致。新增的 `contains_none_in` / `unwrapped` / `rejected_round_trip_spellings` 都在
+  已存在的 `readmes_define_zuno_as_independent_while_retaining_the_plugin_abi` 内被调用，没有
+  新增测试函数，所以计数不变**是预期的**，无需解释增减。
+- `make lint` 0 warning；`make fmt-check` exit=0。
+- `make smoke-artifact`：需 **unset** `CARGO_TARGET_DIR`（`Makefile:28` 的 `TARGET_DIR := target`
+  不读该变量）。
+- 全程 `df -h /` 52-56G 可用，未触发磁盘假失败。

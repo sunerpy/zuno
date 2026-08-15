@@ -44,7 +44,8 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use oc_cli::{Disposition, dispositions};
+use clap::CommandFactory as _;
+use oc_cli::{Cli, Disposition, dispositions};
 use oc_server::api::{self, ApiState};
 use oc_server::{ServerBuilder, ServerConfig, V1_SURFACE};
 use oc_testkit::{DivergenceList, divergence};
@@ -167,6 +168,82 @@ fn contains_all(relative: &str, needles: &[&str]) {
             path.display()
         );
     }
+}
+
+/// Asserts no needle appears in the document, with the reason in the message.
+///
+/// The counterpart to [`contains_all`], and the only form that can catch a
+/// *wrong* claim rather than a missing one. A positive needle alone cannot: it
+/// still passes when the correct sentence is added next to the incorrect one it
+/// was meant to replace, which is how an invocation the binary rejects survived
+/// in both READMEs while the gate stayed green.
+fn contains_none_in(text: &str, label: &str, forbidden: &[(String, String)]) {
+    for (needle, reason) in forbidden {
+        assert!(
+            !text.contains(needle.as_str()),
+            "{label} must not mention {needle:?}: {reason}"
+        );
+    }
+}
+
+/// The `zuno session <name>` spellings the documentation must never use, derived
+/// from the registered `clap` tree rather than typed.
+///
+/// Both halves of the session round trip are top-level commands. Deriving that
+/// here, instead of hard-coding the forbidden strings, means a future move of
+/// `export`/`import` under `session` fails *this* function loudly rather than
+/// silently inverting the documentation gate into forbidding the only invocation
+/// that works.
+fn rejected_round_trip_spellings() -> Vec<(String, String)> {
+    let root = Cli::command();
+    let session = root
+        .get_subcommands()
+        .find(|subcommand| subcommand.get_name() == "session")
+        .expect("`session` is a registered command");
+    let session_children: Vec<&str> = session
+        .get_subcommands()
+        .map(clap::Command::get_name)
+        .collect();
+
+    ["export", "import"]
+        .into_iter()
+        .map(|name| {
+            assert!(
+                root.get_subcommands()
+                    .any(|subcommand| subcommand.get_name() == name),
+                "`zuno {name}` must be a top-level command, because both READMEs document it as \
+                 one"
+            );
+            assert!(
+                !session_children.contains(&name),
+                "`zuno session {name}` is now registered, so forbidding it in the READMEs would \
+                 forbid a working invocation; update the documentation first. Registered `session` \
+                 subcommands: {session_children:?}"
+            );
+            (
+                format!("zuno session {name}"),
+                format!(
+                    "`zuno session` carries only {session_children:?}, so this invocation exits \
+                     with `unrecognized subcommand '{name}'`; the working command is the \
+                     top-level `zuno {name}`"
+                ),
+            )
+        })
+        .collect()
+}
+
+/// Collapses every run of whitespace to one space.
+///
+/// These documents are hard-wrapped, so a prose needle longer than a few words
+/// straddles a line break and would otherwise be pinned to one wrap position — a
+/// reflow that changed no claim would fail the gate, and the failure would read
+/// as a broken edit. Matching the collapsed form pins the sentence, not its
+/// layout.
+fn unwrapped(relative: &str) -> String {
+    let path = workspace_root().join(relative);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn section(relative: &str, heading: &str) -> String {
@@ -1641,26 +1718,42 @@ fn readmes_define_zuno_as_independent_while_retaining_the_plugin_abi() {
     let config_root = format!("$XDG_CONFIG_HOME/{}", oc_paths::APP);
     let data_root = format!("$XDG_DATA_HOME/{}", oc_paths::APP);
     let plugin_abi = oc_paths::env::PLUGIN_ABI_ENV_NAMES.to_vec();
-    // Both needles are required, because either one alone reads as the opposite
-    // claim. "no opencode session" without naming `session import` is the stale
-    // wording that let a reader conclude Zuno cannot import anything at all, and
-    // naming `session import` without the bound would advertise adopting an
-    // opencode session.
+    let rejected = rejected_round_trip_spellings();
+    // Each document must carry all four claims, because any subset reads as a
+    // different one. A bound without the command names is the stale wording that
+    // let a reader conclude Zuno cannot import anything at all; the command names
+    // without both bounds would advertise adopting an opencode session or a share
+    // URL. And a positive needle alone cannot catch a *wrong* invocation, only a
+    // missing one — `zuno session import` sat in both files, naming a subcommand
+    // `zuno session` has never carried, while this gate stayed green. So the
+    // spellings come from the registered `clap` tree and the rejected ones are
+    // forbidden outright.
     for (relative, independence) in [
-        ("README.md", ["不接受 opencode 会话", "zuno session import"]),
+        (
+            "README.md",
+            [
+                "不接受 opencode 会话",
+                "也不接受 share URL",
+                "`zuno export` 与 `zuno import` 构成",
+                "`zuno import` 只读取 Zuno 自己 `zuno export` 出的文档",
+            ],
+        ),
         (
             "docs/readme/README.en.md",
             [
                 "never an opencode session",
-                "`zuno session import` reads Zuno's own",
+                "never a share URL",
+                "`zuno export` and `zuno import` close Zuno's own round trip",
+                "`zuno import` reads Zuno's own `zuno export` documents only",
             ],
         ),
     ] {
+        let prose = unwrapped(relative);
+        contains_all_in(&prose, relative, &independence);
+        contains_none_in(&prose, relative, &rejected);
         contains_all(
             relative,
             &[
-                independence[0],
-                independence[1],
                 &config_root,
                 &data_root,
                 oc_paths::PROJECT_CONFIG_DIRECTORY,

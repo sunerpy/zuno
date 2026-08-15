@@ -53,9 +53,10 @@ $ zuno --version
 $ zuno --help
 ```
 
-Zuno reads only its own configuration and data roots. `zuno session export` and `zuno session
-import` close Zuno's own round trip: `import` accepts only a local document that `export` produced,
-never an opencode session and never a share URL.
+Zuno reads only its own configuration and data roots. `zuno export` and `zuno import` close Zuno's
+own round trip: `import` accepts only a local document that `export` produced, never an opencode
+session and never a share URL. Both are **top-level** commands, not subcommands of `session` — `zuno
+session` carries only `list`, `prune`, and `delete`.
 
 ## Documentation
 
@@ -78,7 +79,7 @@ review. Use `OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs` to regenerat
 
 Zuno uses `$XDG_CONFIG_HOME/zuno`, project `.zuno` directories, and `$XDG_DATA_HOME/zuno`. It never
 falls back to the corresponding opencode roots, and it provides no way to adopt an opencode session:
-`zuno session import` reads Zuno's own `export` documents only. Old roots appear only in
+`zuno import` reads Zuno's own `zuno export` documents only. Old roots appear only in
 upstream-only fixtures, source notes, or historical evidence.
 
 The plugin tier is the sole retained compatibility layer. `COMPATIBILITY_VERSION = "1.18.13"`

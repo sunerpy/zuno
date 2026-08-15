@@ -7457,3 +7457,43 @@ F1 指出准则 4 措辞「overstating the surviving verification」，隐含准
 从不声称宿主独立**——缺失时每个测试打印点名「未比对了什么」的 `SKIPPED`，且错版本二进制会
 panic 而非被接受。把这句写进准则，才能防止下一个读者以为 `cargo test -p oc-cli --test
 cli_parity` 在任何机器上都在真的比对。
+
+## 任务 r8：正向 needle 抓不到「写错的说法」，只能抓「缺失的说法」
+
+F4 的 Blocker 1 是本会话第三次「守卫测试冻结了它本该守卫的缺陷」，但它的机制与前两次不同，
+值得单独记一条。前两次（`docs.rs:1640` 冻结过期 README 句子、`no_pinned_oracle_paths.rs` 冻结
+已删除的 differential 清单）都是 needle 内容本身过期；这一次 needle 内容**在当时是准确的**，
+过期的是它描述的命令拼写，而 `contains_all` 这种断言形态**在原理上无法发现这件事**。
+
+实测三态（`README.md`，`readmes_define_zuno_as_independent_while_retaining_the_plugin_abi`）：
+
+| 文档状态 | 旧 needle（两条正向） | 新门禁 |
+| --- | --- | --- |
+| 只有错拼写 `zuno session import` | **PASS** —— 缺陷被冻结 | FAILED：`must mention "`zuno export` 与 `zuno import` 构成"` |
+| 正确句子 + 旁边保留错拼写 | **PASS** —— 更隐蔽 | FAILED：`must not mention "zuno session export": `zuno session` carries only ["list","prune","delete"]…` |
+| 只有正确拼写 | PASS（但当时不成立） | PASS |
+
+第二行是关键：给文档补上正确句子、同时把错句子留在别处，**旧门禁两条正向 needle 全部满足**。
+所以「把 needle 改准确」并不足以修掉这一类缺陷——正向 needle 的语义是「文档里有这句话」，
+永远不等于「文档里没有相反的话」。要让门禁能对**错误主张**失败，必须补一条否定断言
+（`contains_none_in`）。这是 `contains_all` / `check_block` 之外的第三种形态，本次新增。
+
+### 否定断言必须从代码派生，否则它会从「过期」升级成「主动错误」
+
+正向 needle 过期只是失去效力；否定 needle 过期会**禁止唯一可用的写法**。若将来 `export` /
+`import` 真的挪到 `session` 之下，硬编码的 `"zuno session import"` 黑名单会把正确文档判红，
+而修红的最省力做法恰好是删掉这条 needle——回到 F4 明令禁止的动作。
+
+所以 `rejected_round_trip_spellings()` 从注册的 `clap` 树派生，并带两条反向断言：
+`export`/`import` 必须是顶层命令；`session` 之下必须**没有**同名子命令。命令一旦搬家，**这个
+函数**先带着可操作信息炸掉（"…is now registered, so forbidding it in the READMEs would forbid a
+working invocation; update the documentation first"），而不是让门禁静默反转。失败信息里
+`["list", "prune", "delete"]` 是运行时从 clap 读出来的，不是写死的字符串——这就是派生的证据。
+
+### 长 prose needle 必须先折叠空白，否则钉住的是排版而非主张
+
+两个 README 都是硬换行的。`"`zuno import` reads Zuno's own `zuno export` documents only"` 跨行，
+直接 `contains` 会把 needle 钉在某个换行位置：一次不改变任何主张的 reflow 就会让门禁变红，
+而红的样子看起来像有人改坏了文档。`unwrapped()` 把连续空白折叠成单空格后再匹配，钉住句子
+本身。同理，`docs/readme/README.en.md` 在 `Makefile` 的 `OXFMT_FILES` 里，oxfmt 会重排它的
+换行——不折叠空白的话，`make fmt-check` 与 docs 门禁会互相拆台。

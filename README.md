@@ -60,9 +60,10 @@ $ zuno --version
 $ zuno --help
 ```
 
-Zuno 只读取自己的配置与数据根目录。`zuno session export` 与 `zuno session import` 构成 Zuno
+Zuno 只读取自己的配置与数据根目录。`zuno export` 与 `zuno import` 构成 Zuno
 自身的导出/导入闭环：`import` 只接受 `export` 生成的本地文档，不接受 opencode 会话，也不接受
-share URL。
+share URL。两者都是**顶层命令**，不是 `session` 的子命令 —— `zuno session` 只有 `list`、
+`prune`、`delete`。
 
 ## 文档
 
@@ -85,8 +86,8 @@ share URL。
 
 Zuno 的默认配置根是 `$XDG_CONFIG_HOME/zuno`，项目配置目录是 `.zuno`，数据根是
 `$XDG_DATA_HOME/zuno`。它不会回退读取 `$XDG_CONFIG_HOME/opencode`、项目 `.opencode` 或
-`$XDG_DATA_HOME/opencode`，也没有任何接管 opencode 会话的途径：`zuno session import` 只读取
-Zuno 自己 `export` 出的文档。旧路径只会在 oracle fixture、上游源码说明或历史证据中以
+`$XDG_DATA_HOME/opencode`，也没有任何接管 opencode 会话的途径：`zuno import` 只读取
+Zuno 自己 `zuno export` 出的文档。旧路径只会在 oracle fixture、上游源码说明或历史证据中以
 **upstream-only** 身份出现。
 
 插件层是唯一保留的 opencode 兼容层。`COMPATIBILITY_VERSION = "1.18.13"` 继续供 npm
