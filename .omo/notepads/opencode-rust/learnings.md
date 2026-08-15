@@ -7030,3 +7030,59 @@ suite 的结果全部隐藏，看起来像「改坏了很多东西」。**
 
 **shell 工具 120s 超时会杀掉 `sleep 180`**，但不会杀掉 `setsid nohup` 的子进程。
 轮询长任务用 `sleep 110` + `ps -p <pid>` 判活，单次不要超过 115s。
+
+## 2026-08-15 补 — 用「复现 CI 环境」代替「一次 CI 往返修一个文件」
+
+**教训的由来。** 首轮删掉 6 个 oracle 差分后推送，CI 仍失败，暴露第 7 个文件
+`oc-config/tests/discovery_differential.rs`。它在本机不可见——因为本机装了
+`opencode`；文件名不含 `compat`；且它所在的 crate（oc-config）看起来「已处理过」。
+若继续「推一次、CI 报一个、修一个」，每轮约 15 分钟，还会漏。
+
+**正确做法：本地复现 runner 的 PATH，一次跑出全部同类失败。**
+```
+PATH="/config/.local/share/mise/installs/node/26.5.0/bin:/config/.cargo/bin:\
+/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  CARGO_TARGET_DIR=<独立目录> cargo test --workspace --no-fail-fast
+```
+关键是 PATH 要**精确**模拟 runner，不能过度裁剪。第一次我用了极简 PATH，
+把 `sqlite3` / `bun` / `node` 也剥掉了，得到 14 个失败，其中 13 个是
+**沙箱假象**（`sqlite3: CannotFindBinaryPath`、`bun (via PATH)` 找不到），
+只有 1 个是真的。**教训：沙箱比目标环境更贫瘠时，产出的失败清单不可信；
+要先确认 runner 上有什么（本例 CI 日志里的 PATH 就列了 node，
+且后来 perf::database 在 CI 上通过反证了 runner 自带 sqlite3）。**
+
+本机这些工具全在 mise 下（`/config/.local/share/mise/installs/<tool>/<ver>/bin`），
+`which` 只看到 shim（`/config/.local/share/mise/shims/x` → `/config/.local/bin/mise`）。
+用 `mise which <tool>` 拿真实路径来拼装沙箱 PATH。
+
+**「缺失即必须显式声明」的门在前提消失后就是纯负担。**
+`oracle.rs` 的 `ENV_ALLOW_MISSING_ORACLE`（`OC_TESTKIT_ALLOW_MISSING_ORACLE`）
+让「机器上没有 opencode」在单元测试里成为**失败**，除非显式设置环境变量声明
+「我故意没测」。这在「本项目全部前提是与 opencode 对等」时是合理的郑重声明；
+前提废止后，它只意味着**任何没装过 opencode 的机器都跑不过这个单元测试**。
+改成普通跳过，与同文件 `pinned_oracle_or_skip` 既有契约一致——后者正是
+存活的 8 个比对套件在 CI 上干净跳过、没有失败的原因。
+
+**判断「某测试是否受我改动影响」要用 git 而不是直觉。**
+`git diff --name-only <base>..HEAD | grep <crate>` 为空即证明未触碰。
+本例用它证明 layer J（oc-lsp rust-analyzer）与本任务无关。
+
+**skip guard 只覆盖「不存在」，不覆盖「存在但不可用」。**
+`live_servers.rs` 用 `command_path("rust-analyzer")` 判断存在即跳过，
+但 runner 上 rust-analyzer **存在**、启动后却索引不了，于是
+`Unavailable { server_id: "rust" }` 变成硬失败。
+**教训：外部依赖的 guard 要区分三态——缺失（跳过）、就绪（断言）、
+启动但未就绪（也应跳过并打印未测内容）。只做二态判断会在 CI 上炸。**
+
+**`pkill -f` 会匹配到自己的命令串（本次踩中）。**
+`pkill -TERM -f 'CARGO_TARGET_DIR=/tmp/opencode/...'` 把发起它的 shell 一起杀了，
+命令挂死到超时。同理 `pgrep -f <pat>` 也会把自己列出来，导致误判「还在跑」。
+**只能按显式 PID kill**；判活用 `ps -C cargo --no-headers` 或 `ps -o pid -p <PID>`。
+本次共清理 3 个残留 zuno 进程：2716、2724（本次中断产生），
+以及并行任务 r4 遗留的 3500740（`--pure --prompt route probe --auto`，
+已 99.6% CPU 跑满 1h26m）。
+
+**双 CARGO_TARGET_DIR 会吃光磁盘。** 为复现 CI 又开了
+`/tmp/opencode/c1b-nooracle`，单独占 14G，磁盘从 28G 掉到 14G（96%）。
+用完立刻 `rm -rf` 回收。**验证前后都要 `df -h /`**，
+本机磁盘耗尽已两次伪装成 rustc/clippy 报错。

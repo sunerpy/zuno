@@ -354,6 +354,169 @@ Corrected invocation and its ACTUAL output, verbatim:
 Real Bedrock-backed model call, real plugin loading, exit 0.
 
 --------------------------------------------------------------------------------
-10. CI VERIFICATION
+10. SECOND ROUND — CI FOUND TWO MORE ORACLE SUITES MY INVENTORY MISSED
 --------------------------------------------------------------------------------
-(appended below after push)
+First push (545ffc6) -> CI run 31902521642. Test job STILL failed, on a file that
+was in neither the task's 6-file inventory nor my own measurement:
+
+  crates/oc-config/tests/discovery_differential.rs
+    Error: BinaryNotFound { role: "oracle", expected: "opencode (via PATH)",
+    searched: [<the CodeBuild runner's PATH>],
+    remedy: "install the real opencode CLI, or set OC_TESTKIT_ORACLE to its path" }
+
+Why neither I nor the task inventory saw it: it is invisible on this host because
+`opencode` IS installed here (/config/.local/share/mise/shims/opencode), and the
+file name does not contain "compat" while its crate (oc-config) had already been
+"handled". It has 1 test, 7 oracle refs, and calls Oracle::installed_binary()? —
+the `?` making absence a hard failure rather than a skip.
+
+RATHER THAN FIX ONE FILE PER CI ROUND-TRIP, I REPRODUCED THE CI CONDITION LOCALLY.
+Built a PATH mirroring the runner (node present, cargo/rustc/cc/git present,
+`opencode` absent) and ran the whole workspace under it:
+
+  PATH="/config/.local/share/mise/installs/node/26.5.0/bin:/config/.cargo/bin:\
+        /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+  (First attempt used a PATH so bare it also stripped sqlite3/bun/node, which
+  produced 13 failures that were sandbox artifacts, not CI failures. Corrected.)
+
+That surfaced the second missed suite in the same pass:
+
+  crates/oc-testkit/tests/differential_self_test.rs — DELETED, 2 tests extracted.
+    Its own module doc states the retired premise verbatim: "This project's entire
+    premise is differential compatibility against `opencode` v1.18.13, so a machine
+    without the oracle cannot verify anything, and a harness that quietly skips
+    would report success for a verification it never performed." 7 tests; 5 require
+    a real `opencode` or `bun` and fail hard without them.
+    KEPT as crates/oc-testkit/tests/diff_engine.rs (2 tests, no binary needed):
+      * a_volatile_looking_value_outside_a_masked_position_still_diverges — the
+        anti-widening guard on Normalizer/diff_normalized. Worth keeping because the
+        diff engine is STILL used by the 8 surviving comparison suites, and a
+        normalizer wide enough to force a pass is worse than no comparison.
+      * a_missing_comparison_binary_is_actionable (renamed from
+        oracle_absence_is_actionable) — error reporting names the path and a remedy.
+
+  crates/oc-testkit/src/oracle.rs — the unit test
+  oracle::tests::the_resolved_pinned_oracle_reports_the_pin_from_this_working_directory
+    hard-failed unless OC_TESTKIT_ALLOW_MISSING_ORACLE=1 was set:
+      "Nothing in this workspace was measured against a real release. Set
+       OC_TESTKIT_ALLOW_MISSING_ORACLE=1 to state that on purpose."
+    That ceremony existed because measuring nothing against a real release was a
+    fact a project CLAIMING PARITY had to declare deliberately. Zuno claims no
+    parity, so absence is now the normal case. Changed to an ordinary skip, matching
+    the contract pinned_oracle_or_skip already applied (which is exactly why the 8
+    surviving suites skipped cleanly and did NOT fail). Removed the now-dead
+    ENV_ALLOW_MISSING_ORACLE const and its re-export from lib.rs; verified no
+    remaining references and a clean build.
+    I did NOT touch .github/workflows to inject the env var, per instruction.
+
+FINAL LOCAL TOTALS (second round):
+  cargo test --workspace --no-fail-fast: 3475 passed / 0 failed / 2 ignored, 213 suites
+  Baseline: 3526 passed / 0 failed / 2 ignored, 217 suites
+
+  Full accounting, exact:
+    suites 217 - 8 deleted + 4 added = 213                      MATCHES
+    tests  3526 - 67 deleted + 16 added = 3475                  MATCHES
+      8 files deleted, 67 tests:
+        compat_suite.rs 16, oc-cli/differential.rs 21,
+        agent_differential.rs 8, oc-paths/differential.rs 6,
+        skill_differential.rs 3, oc-config/differential.rs 5,
+        discovery_differential.rs 1, differential_self_test.rs 7
+      4 files added, 16 tests:
+        agent_discovery.rs 1, behavior.rs 12, execute_contract.rs 1, diff_engine.rs 2
+  ZERO tests broke across both rounds.
+
+  make fmt-check     clean
+  make lint          0 warnings, 0 errors
+  make smoke-artifact oc-smoke: PASS (3 requests, 10 tools offered)
+
+--------------------------------------------------------------------------------
+11. CI VERIFICATION — run 31904577140 on main @ cfa07d1
+--------------------------------------------------------------------------------
+gh api repos/sunerpy/zuno/actions/runs/31904577140/jobs
+
+  JOB                    STATUS     CONCLUSION  RUNNER_NAME
+  Supply chain           completed  success     266af373-9f2e-4a60-b3c0-7e516f854923
+  Artifact smoke (host)  completed  success     ff86bc1c-c7ac-47e6-a368-ede454f5676b
+  Test                   completed  FAILURE     d042b474-62c8-4635-a69f-1f9dedb75615
+  Windows                completed  skipped     NONE
+  CI Success             completed  failure     d8e1aa49-70fa-4e0d-a44b-a1a725ab8b73
+
+  run status=completed conclusion=failure
+
+Runner provenance cross-checked against CodeBuild (with the AWS env vars unset
+first and --profile us --region us-east-2 passed explicitly):
+  $ aws codebuild list-builds-for-project --project-name zuno-runner \
+      --profile us --region us-east-2
+    zuno-runner:d8e1aa49-70fa-4e0d-a44b-a1a725ab8b73   <- CI Success
+    zuno-runner:266af373-9f2e-4a60-b3c0-7e516f854923   <- Supply chain
+    zuno-runner:d042b474-62c8-4635-a69f-1f9dedb75615   <- Test
+    zuno-runner:ff86bc1c-c7ac-47e6-a368-ede454f5676b   <- Artifact smoke (host)
+All four UUIDs match, so every job ran on the intended self-hosted runner.
+
+WHAT THIS TASK ACHIEVED, MEASURED ON CI:
+  * Windows                 skipped   (as required)
+  * Supply chain            success   (required)
+  * Artifact smoke (host)   success   (required)
+  * Test                    every ORACLE-CLASS failure is GONE.
+      - the oc-config differential that blocked f9b8f92: gone
+      - the oc-config discovery_differential that blocked 545ffc6: gone
+      - perf::database's 6 sqlite3 tests: PASSED, so the runner image does ship
+        sqlite3 (an uncertainty I had flagged; now resolved by measurement)
+      - oc-lsp's typescript_diagnostics_match_the_real_opencode_binary: PASSED by
+        skipping cleanly, which is direct CI-side proof that keeping the oracle
+        infrastructure and its skip contract was the correct call
+  * CI Success             fails only because Test does.
+
+--------------------------------------------------------------------------------
+12. FULL GREEN NOT REACHED — BLOCKED BY A NEW, OUT-OF-SCOPE DEFECT (LAYER J)
+--------------------------------------------------------------------------------
+Test now fails at a strictly later point, on a different defect class:
+
+  Running tests/live_servers.rs
+  running 2 tests
+  test typescript_diagnostics_match_the_real_opencode_binary ... ok
+  test rust_analyzer_reports_a_live_compiler_error ... FAILED
+  ---- rust_analyzer_reports_a_live_compiler_error stdout ----
+  Error: Unavailable { server_id: "rust" }
+  error: test failed, to rerun pass `-p oc-lsp --test live_servers`
+
+DIAGNOSIS. crates/oc-lsp/tests/live_servers.rs:147 guards with
+`command_path("rust-analyzer")` and skips when it is missing. The guard does not
+fire, so rust-analyzer IS on the runner's PATH. It is then spawned and never
+reaches an available state, so `rust_diagnostics(...).await?` returns
+`Unavailable { server_id: "rust" }`. Present-but-nonfunctional is a failure mode
+the test does not model: it distinguishes "absent" (skip) from "working" (assert),
+with no third branch for "starts but cannot index". A plausible cause is that
+rust-analyzer on a cold CodeBuild container has no usable rustup/sysroot metadata
+for the throwaway Cargo project the test writes to a tempdir, or exceeds the
+readiness timeout; confirming which needs runner-side investigation.
+
+WHY I AM NOT FIXING IT. Out of scope on every axis: it is not an opencode-oracle
+differential, it reads no path under /config/, and oc-lsp is untouched by both my
+commits (verified: `git diff --name-only f9b8f92..HEAD | grep oc-lsp` is empty).
+Fixing it means changing oc-lsp's tolerance for an LSP server that starts without
+becoming ready — a behavioural decision about Zuno's LSP layer, not test removal.
+Per instruction I report it rather than force green.
+
+RECOMMENDED FIX for whoever owns it: treat `Unavailable` for a live LSP server the
+same way absence is treated — an explicit, printed skip naming what went untested —
+or gate the test behind an opt-in env var like the memory gate. Silently asserting
+against a server that never indexed cannot distinguish a broken Zuno client from a
+runner without a Rust sysroot.
+
+THE LAYERED-DEFECT SEQUENCE, updated. A oxfmt missing -> B --offline cold registry
+-> C/D toolchain + hosted minutes -> E/F stale smoke assertion + non-hermetic SDK
+path -> G plugin_models hardcoded mise path -> H oc-config oracle differential
+(mine) -> I oc-config discovery_differential + differential_self_test +
+ENV_ALLOW_MISSING_ORACLE ceremony (mine) -> J oc-lsp rust-analyzer Unavailable
+(open, out of scope). Steps short-circuit within a job, so each fix reveals the
+next; J is strictly further into the suite than H or I, which is the progress this
+task delivered.
+
+REMAINING KNOWN PORTABILITY DEFECT (not CI-blocking, reported in issues.md):
+crates/oc-testkit/src/perf/subject.rs:68 defaults OC_MEMORY_GATE_DATABASE to
+/config/.local/share/opencode/opencode.db.bak.20260408 and panics if absent. Never
+reached by `cargo test --workspace` (memory.rs skips at should_run_expensive_gate()
+first — confirmed by the passing full run and by perf::database passing on CI). Only
+bites an explicit `cargo test -p oc-testkit --test memory` with no env override.

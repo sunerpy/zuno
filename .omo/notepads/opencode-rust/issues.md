@@ -8306,3 +8306,56 @@ H 本例 oracle differentials。每修一层暴露下一层（job 内步骤短�
 而并行任务（worktree oc-wt/r4）正在改这个生成器。在生成器被他人修改期间
 编辑生成产物会冲突。该 .md 工作树副本本身是干净的，属**生成器归属权**推迟，
 不是脏文件推迟。落地 docs.rs 改动的人应顺手修这两处。
+
+## 2026-08-15 — CI 阻塞层 I：另两个 oracle 套件（已修）与层 J：rust-analyzer 不可用（未修）
+
+**层 I（已修）。** 首轮删除 6 个 oracle 差分（545ffc6）后 CI 仍红，
+run 31902521642 的 Test job 报
+`BinaryNotFound { role: "oracle", expected: "opencode (via PATH)" }`，
+来自 `crates/oc-config/tests/discovery_differential.rs`——任务清单和我自己的
+测量都漏了它（本机装了 opencode 所以不可见，文件名不含 compat）。
+用复现 runner PATH 的沙箱一次跑出全部同类项，另找到
+`crates/oc-testkit/tests/differential_self_test.rs`（模块 doc 自述
+「本项目全部前提是与 opencode v1.18.13 的差分兼容」）和
+`oracle::tests::the_resolved_pinned_oracle_reports_the_pin_from_this_working_directory`
+（缺失时要求 `OC_TESTKIT_ALLOW_MISSING_ORACLE=1` 才不算失败）。
+均已处理（cfa07d1），提取 2 个纯逻辑测试到 `tests/diff_engine.rs`。
+
+**层 J（未修，超出范围，需要接手）。** run 31904577140 的 Test job 失败点已推进到：
+```
+Running tests/live_servers.rs
+test typescript_diagnostics_match_the_real_opencode_binary ... ok
+test rust_analyzer_reports_a_live_compiler_error ... FAILED
+---- rust_analyzer_reports_a_live_compiler_error stdout ----
+Error: Unavailable { server_id: "rust" }
+```
+**根因。** `crates/oc-lsp/tests/live_servers.rs:147` 用
+`command_path("rust-analyzer")` 判断——不存在则跳过。guard 没触发，
+说明 runner 上 rust-analyzer **存在**；但启动后始终不可用，
+`rust_diagnostics(...).await?` 返回 `Unavailable`。
+测试只建模了「缺失（跳过）/ 可用（断言）」两态，缺少
+「启动但索引不起来」第三态。推测是冷 CodeBuild 容器里
+rust-analyzer 对测试临时写出的 Cargo 工程拿不到可用的 rustup/sysroot 元数据，
+或超过就绪超时；确认需要 runner 侧排查。
+
+**与本任务无关（已用 git 证明）。**
+`git diff --name-only f9b8f92..HEAD | grep oc-lsp` 为空，两次提交都没碰 oc-lsp。
+且同文件的 `typescript_diagnostics_match_the_real_opencode_binary` 在 CI 上
+**通过**（走 `pinned_oracle_or_skip` 干净跳过），反证保留 oracle 基础设施
+及其跳过契约是对的。
+
+**建议修法。** 把 live LSP 的 `Unavailable` 与「不存在」同等对待——
+显式打印跳过并说明未测内容；或像 memory gate 那样改成 opt-in 环境变量。
+对一个从未完成索引的 server 硬断言，无法区分「Zuno 客户端有 bug」
+和「runner 没有 Rust sysroot」。
+
+**层序更新。** A oxfmt → B --offline 冷 registry → C/D 工具链+hosted minutes →
+E/F 陈旧 smoke 断言+非 hermetic SDK 路径 → G plugin_models 硬编码 mise 路径 →
+H oc-config oracle differential → I discovery_differential +
+differential_self_test + ENV_ALLOW_MISSING_ORACLE 仪式 → **J oc-lsp
+rust-analyzer Unavailable（开放）**。job 内步骤短路，每修一层暴露下一层；
+J 的位置比 H/I 都更靠后，即本任务确有推进。
+
+**已解决的一处不确定性。** 我曾担心 `oc-testkit` 的 perf::database 6 个测试
+shell 调用 `sqlite3` 会成为下一个阻塞点。本次 CI 上它们**全部通过**，
+证明 runner 镜像自带 sqlite3。无需处理。
