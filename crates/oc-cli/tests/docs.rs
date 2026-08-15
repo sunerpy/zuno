@@ -1607,10 +1607,7 @@ fn readme_states_the_pinned_baseline_the_binary_actually_reports() {
 fn readmes_define_zuno_as_independent_while_retaining_the_plugin_abi() {
     let config_root = format!("$XDG_CONFIG_HOME/{}", oc_paths::APP);
     let data_root = format!("$XDG_DATA_HOME/{}", oc_paths::APP);
-    let plugin_abi = oc_paths::env::PLUGIN_ABI_ENV_NAMES
-        .iter()
-        .copied()
-        .collect::<Vec<_>>();
+    let plugin_abi = oc_paths::env::PLUGIN_ABI_ENV_NAMES.to_vec();
     for (relative, independence) in [
         ("README.md", "不会导入或恢复 opencode 会话"),
         (
