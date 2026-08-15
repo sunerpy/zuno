@@ -1,0 +1,255 @@
+Task C-3 — CodeBuild smoke/live-SDK defect evidence
+Date: 2026-08-15
+Base: origin/main 4a198098df35560b1437a4bbfdec90bd552c641d
+Worktree: /config/workspace/ProdDir/AI/oc-wt/c3
+Branch: task-c3
+Cargo target: /tmp/opencode/c3 (fresh)
+
+Scope
+=====
+- Defect E: oc-smoke still expected two provider requests after the runtime added
+  one tool-free title prelude.
+- Defect F: oc-acp's live SDK test searched above the repository and panicked when
+  a sibling upstream checkout was absent.
+
+Defect E — red proof
+====================
+Command:
+  CARGO_TARGET_DIR=/tmp/opencode/c3 cargo test -p oc-testkit --bin oc-smoke
+
+Before the validator fix, the three new regression tests all failed with:
+  the provider saw 3 request(s), not 2; the turn did not send the tool result back
+  test result: FAILED. 0 passed; 3 failed
+
+The final validator requires:
+  request 0: title prelude; no advertised tools and no role:tool message
+  request 1: first real turn; bash/read/glob/grep all advertised
+  request 2: second real turn; bash/read/glob/grep all advertised and role:tool present
+
+The prelude response remains recorded evidence. The release-smoke cassette root
+does not contain the full oracle tree's independent title cassette, so the smoke
+reuses interaction 2 of the committed tool-loop cassette as the recorded text
+response for the prelude, then replays both cassette interactions normally.
+All three MockResponse values retain ResponseOrigin::Recorded. No cassette was
+added, edited, hand-authored, or re-recorded.
+
+Defect E — green proof
+======================
+Command:
+  CARGO_TARGET_DIR=/tmp/opencode/c3 cargo test -p oc-testkit --bin oc-smoke
+Result:
+  3 passed; 0 failed
+
+Commands (TARGET_DIR is the relative spelling of the same fresh absolute target;
+Makefile executes ./$(TARGET_DIR), so an absolute TARGET_DIR is not valid):
+  export CARGO_TARGET_DIR=/tmp/opencode/c3
+  target_dir=$(realpath --relative-to="$PWD" "$CARGO_TARGET_DIR")
+  make smoke TARGET_DIR="$target_dir"
+  make smoke-artifact TARGET_DIR="$target_dir"
+
+Results:
+  oc-smoke: ok    headless run replayed openai-chat/drives-a-tool-loop-end-to-end: 3 requests, 10 tools offered
+  oc-smoke: PASS  /tmp/opencode/c3/release/zuno
+  oc-smoke: ok    headless run replayed openai-chat/drives-a-tool-loop-end-to-end: 3 requests, 10 tools offered
+  oc-smoke: PASS  /config/workspace/ProdDir/AI/oc-wt/c3/dist/unpacked/zuno
+
+Defect F — design decision
+==========================
+The live test now skips cleanly and visibly when a repository-local pinned SDK is
+absent. A test-time SDK download was rejected because this Rust repository has no
+Node package manifest, lockfile, or install gate; adding network acquisition would
+make the test non-hermetic and its version source unauditable. Repository-local
+discovery leaves a defensible future seam: vendoring pinned SDK 0.21.0 re-enables
+the live test, and the JS report still asserts sdkVersion == 0.21.0.
+
+Defect F — red proof
+====================
+Command:
+  CARGO_TARGET_DIR=/tmp/opencode/c3 cargo test -p oc-acp --test live_sdk \
+    sdk_discovery_does_not_escape_the_repository_root -- --exact --nocapture
+
+Before bounding discovery, the synthetic external fixture was accepted:
+  assertion failed: SDK discovery escaped the repository and accepted
+  /tmp/.tmpnLxGAG/opencode/packages/opencode/node_modules/@agentclientprotocol/sdk/dist/acp.js
+  left: Some(...acp.js)
+  right: None
+
+Defect F — clean-machine proof
+==============================
+This host still has the sibling external SDK at:
+  /config/workspace/ProdDir/AI/opencode/packages/opencode/node_modules/@agentclientprotocol/sdk/dist/acp.js
+
+The task-c3 repository has no SDK at its bounded path. Command:
+  CARGO_TARGET_DIR=/tmp/opencode/c3 cargo test -p oc-acp -- --nocapture
+
+Observed output proves the external tree is unreachable after the fix:
+  SKIP: pinned @agentclientprotocol/sdk 0.21.0 is absent at
+  /config/workspace/ProdDir/AI/oc-wt/c3/opencode/packages/opencode/node_modules/@agentclientprotocol/sdk/dist/acp.js;
+  the live SDK test requires a repository-local fixture and will not search parent directories
+
+Package result:
+  8 passed; 0 failed (across non-empty test binaries); live_sdk: 3 passed
+
+The live_sdk test file has two discovery regression tests:
+- an SDK outside repository_root is rejected;
+- an SDK at repository_root/SDK_ENTRY is accepted (positive control, preventing a
+  hollow implementation that always returns None).
+
+Full local gate
+===============
+Disk before full run:
+  /dev/root 290G total, 194G used, 96G available (67%)
+
+Final full test command:
+  setsid nohup env CARGO_TARGET_DIR=/tmp/opencode/c3 cargo test --workspace \
+    > /tmp/opencode/c3-test.log 2>&1 &
+
+Final result from all 217 `test result` summaries:
+  3524 passed / 0 failed / 2 ignored
+
+Baseline explanation:
+  The prior baseline was 3519 passed. The +5 is exactly this task's five new
+  regression tests: 3 oc-smoke request-shape tests + 2 ACP SDK discovery tests.
+
+Additional gates:
+  make lint         PASS (cargo clippy --workspace --all-targets --offline -- -D warnings)
+  make fmt-check    PASS (cargo fmt --all --check + oxfmt)
+  make smoke        PASS
+  make smoke-artifact PASS
+
+CI evidence
+===========
+PR: https://github.com/sunerpy/zuno/pull/1
+First PR run: 31878406895
+
+The first run proved Defects E/F and exposed one additional pre-existing clean-host
+failure:
+  Supply chain          success  runner=d67ac5b7-f2f5-4c6f-9092-db5ede902614
+  Artifact smoke (host) success  runner=2f6a14b9-e29f-406f-aad5-9ff209ff9a7f
+  Test                  failure  runner=9197ca6e-6076-4173-a970-9d130f3c4333
+  Windows               skipped  runner=(none; opt-in job)
+  CI Success            failure  runner=f02442af-ba38-494d-a57b-5a6fe89ba030
+
+The Test job completed checkout, toolchain, formatting, and Clippy, then failed six
+tests in `oc-catalog/tests/agent_differential.rs`. Every failure was the same:
+  BinaryNotFound { role: "oracle", expected: "opencode (via PATH)", ... }
+
+Defect G — central oracle routing
+=================================
+Red structural proof:
+  cargo test -p oc-testkit --test no_pinned_oracle_paths \
+    every_installed_binary_differential_still_routes_through_the_oracle \
+    -- --exact --nocapture
+Result before the implementation change:
+  oc-catalog/tests/agent_differential.rs: no reference to pinned_oracle
+  test result: FAILED. 0 passed; 1 failed
+
+Implementation:
+- the six real-oracle tests obtain their program through
+  `pinned_oracle_or_skip` and preserve its version-mismatch hard failure;
+- the two fixture-only tests still run unconditionally;
+- the structural route inventory now includes this differential file.
+
+Positive proof with installed pinned oracle 1.18.18:
+  cargo test -p oc-catalog --test agent_differential -- --nocapture
+Result:
+  8 passed; 0 failed; all six differential comparisons actually ran and reported
+  byte-identical output against opencode 1.18.18.
+
+Clean-host proof using the already-built test binary:
+  env -u OC_TESTKIT_ORACLE -u OC_TESTKIT_ORACLE_SOURCE \
+    -u OC_TESTKIT_ORACLE_FLAVOUR PATH=/usr/bin:/bin \
+    /tmp/opencode/c3/debug/deps/agent_differential-da37f3bfea64a160 \
+    --nocapture
+Result:
+  8 passed; 0 failed; six explicit `SKIPPED ... no opencode on PATH` diagnostics,
+  while both hermetic fixture tests still executed.
+
+An explicit invalid `OC_TESTKIT_ORACLE=/nonexistent-opencode-c3` was also checked
+and correctly remained a hard failure rather than being silently skipped.
+
+Post-Defect-G local gate note:
+- `make fmt-check`: PASS
+- `make lint`: PASS
+- central resolver structural test: PASS
+- agent differential with installed 1.18.18 oracle: 8 passed
+- agent differential with clean PATH: 8 passed, including six visible skips
+- two attempts to rerun the complete workspace reached `oc-config` and then the
+  shared development host refused additional test threads with OS EAGAIN
+  (`Resource temporarily unavailable`). The second attempt used
+  `--test-threads=4` and hit the same host-wide limit. No test assertion failed.
+  Per the two-attempt cap, no further local retry was made; the updated PR's
+  isolated CodeBuild Test job is the full-suite acceptance gate.
+
+The final main run id and per-job table remain pending the updated PR and merge.
+
+Second PR run — attempt 2
+=========================
+Run 31879788919 was rerun once after attempt 1 encountered transient checkout and
+setup network failures. Attempt 2 reached the real gates on CodeBuild-hosted
+runners:
+  Test                  failure    runner=d0e24546-fbda-4c3d-b283-5afa3253afd1
+  Artifact smoke (host) success    runner=9d17fc2e-e627-4c2c-b0fe-50ed5591875e
+  Supply chain          cancelled  runner=53099b9d-ef0b-461e-bd26-51463bb322c8
+  Windows               skipped    runner=(none; opt-in job)
+  CI Success            failure    runner=0b97cee4-0364-482a-9be2-0a45be6f4c08
+
+The Test job passed checkout, Rust setup, lockfile reproducibility, registry
+population, Node/oxfmt setup, format, and Clippy. Its `Test suite` step then
+exposed two remaining direct `Oracle::discover` calls in
+`oc-catalog/tests/skill_differential.rs`. Artifact smoke passed end to end,
+directly confirming Defects E/F on the clean runner. Supply chain reached
+`cargo deny` before the workflow cancelled it after the required Test failure;
+it did not expose a source failure.
+
+Defect H — remaining skill differential routing
+================================================
+Red structural proof:
+  cargo test -p oc-testkit --test no_pinned_oracle_paths \
+    every_installed_binary_differential_still_routes_through_the_oracle \
+    -- --exact --nocapture
+Result before adding the route:
+  oc-catalog/tests/skill_differential.rs was absent from ROUTED_DIFFERENTIALS;
+  the structural gate failed as intended.
+
+Implementation:
+- both real-oracle skill tests call `pinned_oracle_or_skip` before constructing
+  `Oracle::at_binary`;
+- a wholly absent pinned oracle produces a visible skip naming the comparison
+  that was not performed;
+- an explicit bad override or a discovered wrong version remains a hard failure;
+- `oc-catalog/tests/skill_differential.rs` is now in the structural route inventory.
+
+Positive proof with installed pinned oracle 1.18.18:
+  CARGO_TARGET_DIR=/tmp/opencode/c3 cargo test -p oc-catalog \
+    --test skill_differential -- --nocapture
+Result:
+  3 passed; 0 failed; both real comparisons ran against the pinned release.
+
+Clean-host proof using the already-built test binary:
+  env -u OC_TESTKIT_ORACLE -u OC_TESTKIT_ORACLE_SOURCE \
+    -u OC_TESTKIT_ORACLE_FLAVOUR PATH=/usr/bin:/bin \
+    /tmp/opencode/c3/debug/deps/skill_differential-* --nocapture
+Result:
+  3 passed; 0 failed; both real comparisons emitted explicit `SKIPPED`
+  diagnostics and the hermetic fixture guard still ran.
+
+Bad-override proof:
+  OC_TESTKIT_ORACLE=/nonexistent-opencode-c3 ...skill_differential... --nocapture
+Result:
+  both real differential tests failed hard; the captured transcript is
+  `/tmp/opencode/c3-skill-bad-override.log`.
+
+Post-Defect-H gates:
+  central resolver structural test     PASS
+  skill differential, oracle present   3 passed
+  skill differential, clean PATH       3 passed with two visible skips
+  explicit bad oracle override         hard failure as required
+  make fmt-check                       PASS
+  make lint                            PASS
+  cargo build --workspace --locked     PASS
+  lsp_diagnostics on both changed Rust files: no diagnostics
+  git diff --check                     PASS
+
+The next updated PR run is the complete isolated-suite acceptance gate. The final
+main run id and per-job table remain pending that green PR run and merge.

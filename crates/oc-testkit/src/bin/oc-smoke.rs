@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::Duration;
 
-use oc_testkit::{MockProvider, Scenario, ScriptedEnv};
+use oc_testkit::{MockProvider, MockResponse, Scenario, ScriptedEnv};
 
 /// The committed recording the turn check replays.
 const CASSETTE: &str = "openai-chat/drives-a-tool-loop-end-to-end";
@@ -267,7 +267,18 @@ async fn check_help(options: &Options) -> Result<(), String> {
 async fn check_tool_turn(options: &Options) -> Result<(), String> {
     let env = scripted_env()?;
     let cassette = load_cassette(&options.cassette_root)?;
+    let title_response = cassette
+        .http_interactions()
+        .nth(1)
+        .ok_or_else(|| {
+            format!("{CASSETTE} has no recorded text continuation for the title prelude")
+        })
+        .and_then(|interaction| {
+            MockResponse::from_recorded(CASSETTE, 2, interaction)
+                .map_err(|source| format!("cannot replay {CASSETTE} interaction 2: {source}"))
+        })?;
     let scenario = Scenario::new("artifact-smoke")
+        .respond(title_response)
         .from_cassette(CASSETTE, &cassette)
         .map_err(|source| format!("cannot build a scenario from {CASSETTE}: {source}"))?;
     let provider = MockProvider::start(vec![scenario])
@@ -304,34 +315,21 @@ async fn check_tool_turn(options: &Options) -> Result<(), String> {
             describe(&output)
         ));
     }
-    if captured.len() != 2 {
-        return Err(format!(
-            "the provider saw {} request(s), not 2; the turn did not send the tool \
-             result back\n{}",
-            captured.len(),
-            describe(&output)
-        ));
-    }
-    let first = captured[0]
-        .json()
-        .ok_or_else(|| format!("the first request was not JSON: {}", captured[0].body))?;
-    let offered = advertised_tools(&first);
-    for required in REQUIRED_TOOLS {
-        if !offered.iter().any(|name| name == required) {
-            return Err(format!(
-                "the request advertised {offered:?}, which does not include `{required}`; \
-                 the assembled tool registry did not reach the provider"
-            ));
-        }
-    }
-    let second = captured[1]
-        .json()
-        .ok_or_else(|| format!("the second request was not JSON: {}", captured[1].body))?;
-    if !has_tool_result(&second) {
-        return Err(format!(
-            "the second request carries no `role: tool` message:\n{second:#}"
-        ));
-    }
+    let requests = captured
+        .iter()
+        .enumerate()
+        .map(|(index, request)| {
+            request.json().ok_or_else(|| {
+                format!(
+                    "provider request {} was not JSON: {}",
+                    index + 1,
+                    request.body
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let offered = validate_tool_turn_requests(&requests)
+        .map_err(|failure| format!("{failure}\n{}", describe(&output)))?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !stderr.contains(RECORDED_TOOL) {
         return Err(format!(
@@ -345,6 +343,59 @@ async fn check_tool_turn(options: &Options) -> Result<(), String> {
         offered.len()
     );
     Ok(())
+}
+
+fn validate_tool_turn_requests(requests: &[serde_json::Value]) -> Result<Vec<String>, String> {
+    if requests.len() != 3 {
+        return Err(format!(
+            "the provider saw {} request(s), not 3; one tool turn must be one tool-free title \
+             prelude plus two turn requests, and the tool result must return on the second turn \
+             request",
+            requests.len()
+        ));
+    }
+
+    let prelude = &requests[0];
+    let prelude_tools = advertised_tools(prelude);
+    if !prelude_tools.is_empty() {
+        return Err(format!(
+            "the title prelude advertised {prelude_tools:?}, but the title agent denies every \
+             tool and its request must stay tool-free:\n{prelude:#}"
+        ));
+    }
+    if has_tool_result(prelude) {
+        return Err(format!(
+            "the title prelude carried a `role: tool` message even though it is the first \
+             request on the wire:\n{prelude:#}"
+        ));
+    }
+
+    let mut first_offered = Vec::new();
+    for (turn_index, request) in requests[1..].iter().enumerate() {
+        let offered = advertised_tools(request);
+        for required in REQUIRED_TOOLS {
+            if !offered.iter().any(|name| name == required) {
+                let ordinal = if turn_index == 0 { "first" } else { "second" };
+                return Err(format!(
+                    "the {ordinal} turn request advertised {offered:?}, which does not include \
+                     `{required}`; the assembled tool registry did not reach every real turn \
+                     request:\n{request:#}"
+                ));
+            }
+        }
+        if turn_index == 0 {
+            first_offered = offered;
+        }
+    }
+
+    let second = &requests[2];
+    if !has_tool_result(second) {
+        return Err(format!(
+            "the second turn request carries no `role: tool` message, so the tool loop did not \
+             send its result back:\n{second:#}"
+        ));
+    }
+    Ok(first_offered)
 }
 
 fn load_cassette(root: &Path) -> Result<oc_testkit::Cassette, String> {
@@ -443,4 +494,53 @@ fn has_tool_result(body: &serde_json::Value) -> bool {
                 message.get("role").and_then(serde_json::Value::as_str) == Some("tool")
             })
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn turn_request(messages: serde_json::Value) -> serde_json::Value {
+        let tools = REQUIRED_TOOLS.map(|name| {
+            serde_json::json!({
+                "type": "function",
+                "function": { "name": name }
+            })
+        });
+        serde_json::json!({ "messages": messages, "tools": tools })
+    }
+
+    fn one_tool_turn() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({ "messages": [] }),
+            turn_request(serde_json::json!([{ "role": "user" }])),
+            turn_request(serde_json::json!([{ "role": "tool" }])),
+        ]
+    }
+
+    #[test]
+    fn tool_turn_shape_includes_a_tool_free_title_prelude_and_two_registry_requests() {
+        let requests = one_tool_turn();
+        let offered = validate_tool_turn_requests(&requests)
+            .expect("one tool turn is a tool-free title prelude plus two turn requests");
+        assert_eq!(offered, REQUIRED_TOOLS);
+    }
+
+    #[test]
+    fn title_prelude_must_not_advertise_the_tool_registry() {
+        let mut requests = one_tool_turn();
+        requests[0]["tools"] = requests[1]["tools"].clone();
+        let failure = validate_tool_turn_requests(&requests)
+            .expect_err("the title agent denies every tool, so its request must stay tool-free");
+        assert!(failure.contains("title prelude"), "{failure}");
+    }
+
+    #[test]
+    fn both_real_turn_requests_must_advertise_the_registry() {
+        let mut requests = one_tool_turn();
+        requests[2]["tools"] = serde_json::json!([]);
+        let failure = validate_tool_turn_requests(&requests)
+            .expect_err("the follow-up turn request must keep the assembled registry");
+        assert!(failure.contains("second turn request"), "{failure}");
+    }
 }

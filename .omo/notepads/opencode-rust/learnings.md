@@ -6842,3 +6842,66 @@ rustfmt/clippy 这两个 component 装到那条**用不上**的 toolchain 上。
 执行路径从未运行」。E 里是 driver 落后运行时 8 天；F 里是测试依赖一个只存在于某台机器上的
 目录。**凡是一条门禁长期没有真正执行过，就不要假定它此刻还是正确的**；它更可能已经腐坏，
 而且腐坏方向通常是「本地能过」，因为本地是它唯一被运行过的地方。
+
+## [2026-08-15] C-3：smoke 的 wire-shape 回归要同时钉住「哪些请求不能有工具」和「哪些请求必须有工具」
+
+Defect E 的修复不是把 `captured[0]` 改成 `captured[1]` 就结束。权威形状是：
+
+    request 0  title prelude       tools=[]，不能有 role:tool
+    request 1  首次真实 turn       必须包含 bash/read/glob/grep
+    request 2  tool-result followup 必须包含同一注册表，且必须有 role:tool
+
+只检查 request 1 会留下两个空洞：title agent 若错误拿到工具不会失败；第二次 turn 若丢失注册表
+也不会失败。`oc-smoke` 现在对三个位置分别断言，并用已有的 `openai-chat/streams-text`
+recording 服务 prelude，再接原来的 tool-loop recording；不需要也不允许手写或重录 cassette。
+以后 runtime wire shape 再变化，先同步这个三位置回归测试，CI smoke 才不会在数天后成为第一个
+发现者。
+
+## [2026-08-15] C-3：可选外部 fixture 的 discovery 必须有仓库边界、正向控制和可见 skip
+
+Defect F 的安全形状是三件事缺一不可：
+
+1. discovery 只拼 `<repository-root>/<pinned-relative-path>`，绝不对 `ancestors()` 搜索；
+2. 单元测试同时证明仓库外 fixture 被拒绝、仓库内 fixture 会被接受，避免把「永远返回 None」
+   误当成边界修复；
+3. fixture 缺失时打印 `SKIP:`、钉住的 SDK 版本和精确期望路径，然后 return，不能 panic，
+   也不能无输出地绿。
+
+本仓库没有 Node package manifest、lockfile 或 install gate，因此测试时联网安装 SDK 不是 hermetic
+acquisition，而是引入一个新的网络与版本漂移来源。保留 repository-local fixture seam：将来若真正
+vendor 钉住的 0.21.0 SDK，live test 会自动恢复执行，且 harness 仍会断言 package version。
+
+### C-3 追加更正：精简 smoke 根没有独立 title cassette
+
+上段提到 `openai-chat/streams-text` 是 `tool_turn.rs` 在完整 oracle tree 中使用的权威 recording，
+但它没有提交到 `packaging/smoke/cassettes`。release smoke 的 hermetic 解法是复用同一个已提交
+tool-loop cassette 的第 2 个 interaction：它是真实 provider 的文本 continuation，先作为 title
+prelude 响应，再完整重放 cassette 的 tool-call + continuation。三份响应的 provenance 都是
+`Recorded`，`authored_scenarios()` 仍为空；没有新增、手写或重录 fixture。
+
+## [2026-08-15] C-3 追加：differential 缺 oracle 必须走中央 resolver，不能直接 `Oracle::discover`
+
+PR run `31878406895` 的 `Test` job 已实际拿到 CodeBuild runner，但
+`oc-catalog/tests/agent_differential.rs` 的 6 个真实 oracle 用例在干净 runner 上因
+`BinaryNotFound` 失败。根因不是产品逻辑，而是该文件绕过了仓库已有的
+`pinned_oracle_or_skip` 合同。
+
+正确形状是：纯 fixture 守卫继续无条件执行；真正依赖 `opencode` 的 differential 通过中央
+resolver 获取钉住版本。候选完全缺失时逐项打印 `SKIPPED` 和未覆盖内容后返回；用户显式指定错误
+路径或发现了版本不一致时仍 hard fail，不能把配置错误降级成 skip。结构测试清单也必须纳入该
+文件，防止以后退回直接 discovery。
+
+## [2026-08-15] C-3 追加：中央 oracle 路由清单必须覆盖每一种 differential，不只是首个失败文件
+
+PR run `31879788919` attempt 2 的 `Test` job 已通过 checkout、toolchain、lockfile、format 和
+Clippy，随后在完整测试套件中暴露 `skill_differential.rs` 仍有两个直接 `Oracle::discover`。
+这说明修复 `agent_differential.rs` 的 6 个用例只能消掉当时可见的第一层，不能证明同类调用已穷尽。
+
+可持续的修复不是再加一处分散 skip，而是把每个真实二进制 differential 都登记进
+`ROUTED_DIFFERENTIALS`，由结构测试强制其引用 `pinned_oracle`。运行时合同统一为三态：找到且版本
+正确就真实比较；完全找不到就明确列出未覆盖内容后 skip；显式错误 override 或版本不一致就 hard
+fail。Defect H 同时验证了这三条路径，因此缺少 oracle 的干净 CI 不再误红，错误配置也不会被误绿。
+
+另一个 CI 取证经验：不要只记录 job 的总 conclusion。该 attempt 的 `Artifact smoke (host)` 已完整
+成功，直接证明 Defect E/F；`Test` 也在失败前证明 format 与 Clippy 成功；`Supply chain` 则进入
+`cargo deny` 后因必需 Test 失败而被取消。逐步骤结论能区分产品缺陷、后续取消和网络噪声。

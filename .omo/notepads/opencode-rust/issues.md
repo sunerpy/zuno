@@ -8171,3 +8171,63 @@ A/B/C/D 修完并在真实 run 上逐项验证通过（见 evidence 文件）。
   Test          failure  → 步骤 9/10 已绿（A、B 的直接证明），步骤 11 撞缺陷 F
   Artifact      failure  → `cargo fetch` 与 `make release` 已绿（B 的直接证明），撞缺陷 E
   Windows       skipped  → 缺陷 D 的设计行为，`ci-success` 打印 `skip windows skipped (opt-in…)`
+
+## [2026-08-15] C-3：缺陷 E/F 已在本地修复，等待 main CI 证明
+
+### 缺陷 E — RESOLVED LOCALLY
+
+上文 `:8126-8134` 关于「必须重录 smoke cassette」的判断已由更完整的 fixture 读取推翻：仓库已有
+权威 title recording `openai-chat/streams-text`，与原 tool-loop recording 按顺序组合后就是运行时
+真实的 1+2 请求，不需要改动任何 cassette bytes。
+
+`oc-smoke` 现在要求恰好 3 个请求：prelude 必须无工具且无 tool result；两个真实 turn request
+都必须携带四个无条件工具；最后一个 request 必须携带 `role: tool`。三个单元回归测试分别钉住
+正确形状、prelude 禁止工具、第二个 turn 不能丢注册表。
+
+### 缺陷 F — RESOLVED LOCALLY
+
+选择「无法 hermetic acquisition 时显式 skip」，原因是仓库没有 Node lock/install surface，测试运行时
+下载会引入网络依赖并让版本来源失去可审计性。discovery 已限制在 repository root；缺失时打印
+`SKIP:`、`@agentclientprotocol/sdk 0.21.0` 与精确期望路径，不再 panic，也不会命中平行 checkout。
+
+干净机器路径证明不是模拟：本机平行 checkout 的外部 SDK 仍然存在，但在 `task-c3` worktree 运行
+`cargo test -p oc-acp -- --nocapture` 明确打印 repository-local absent 的 skip reason，随后包内
+8 个测试全部通过。另有负向测试构造仓库外 SDK 并证明拒绝，正向测试证明仓库内 fixture 会启用。
+
+仍待关闭：完整 workspace/make gates 与 main 上真实 CodeBuild CI run；在这些证据落盘前不把本条
+标为 CI RESOLVED。
+
+### C-3 追加更正：Defect E 的最终 fixture 组合
+
+完整 oracle tree 有 `openai-chat/streams-text`，但精简 release smoke 根没有提交该文件。最终实现
+不依赖它：从已提交的 tool-loop cassette 取 interaction 2 的真实文本 response 作为 prelude，随后
+完整重放同一 cassette。`make smoke` 与 `make smoke-artifact` 均实测输出
+`3 requests, 10 tools offered` 并 PASS；全程未修改 cassette bytes。
+
+## [2026-08-15] C-3：PR 首轮暴露 Defect G，已在本地修复
+
+PR run `31878406895` 中 `Supply chain` 与 `Artifact smoke (host)` 通过，`Windows`
+按设计 skipped；`Test` 确实运行在 CodeBuild runner
+`9197ca6e-6076-4173-a970-9d130f3c4333`，随后 6 个 agent differential 因缺少真实
+`opencode` 报 `BinaryNotFound`。这排除了 webhook/runner 路由问题，也与 Defect E/F 实现无关。
+
+`crates/oc-catalog/tests/agent_differential.rs` 现通过 `pinned_oracle_or_skip` 获取 oracle，
+并已加入 `no_pinned_oracle_paths.rs` 的中央路由清单。红测先证明旧文件没有引用中央 resolver；
+修复后本机 1.18.18 oracle 的 8 项测试全部真实通过。清除 oracle override、把 `PATH` 限制到
+`/usr/bin:/bin` 后，6 个 differential 各自输出明确 `SKIPPED`，2 个 hermetic fixture 测试仍执行，
+总计 `8 passed`。显式设置一个不存在的 `OC_TESTKIT_ORACLE` 仍按设计 hard fail。
+
+## [2026-08-15] C-3：PR attempt 2 暴露 Defect H，已在本地修复
+
+Run `31879788919` 只按 runbook 重跑失败 jobs 一次。Attempt 2 的 checkout/setup 网络阶段恢复；
+`Artifact smoke (host)` 完整成功，`Test` 通过 format 与 Clippy 后，在真实 `Test suite` 中因
+`oc-catalog/tests/skill_differential.rs` 的两个直接 `Oracle::discover` 失败。因此这是 Defect G 的
+同类遗漏（Defect H），不是可再次用网络故障解释并重跑的噪声。
+
+本地修复已完成：两个真实 skill differential 改走 `pinned_oracle_or_skip`，文件加入中央结构门禁。
+已证明 installed 1.18.18 oracle 路径 `3 passed`；清空 override 并限制 `PATH=/usr/bin:/bin` 时仍
+`3 passed` 且输出两条明确 skip；显式无效 `OC_TESTKIT_ORACLE` 时两个真实比较都 hard fail。
+`make fmt-check`、`make lint`、`cargo build --workspace --locked`、两份 Rust 文件的 LSP 诊断均通过。
+
+仍待关闭：将 Defect H 推入 PR #1，取得更新后的完整 CodeBuild PR run 全绿，合并后再取得 main
+run 的逐 job `runner_name`/`conclusion`。在 main 证据落盘前，C-3 仍不标记为 CI RESOLVED。

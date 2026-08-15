@@ -49,7 +49,7 @@ use oc_catalog::skill::{SkillOptions, Skills, load};
 use oc_config::Config;
 use oc_config::discovery::{DiscoveryOptions, discover_with};
 use oc_paths::Env;
-use oc_testkit::{Normalizer, Oracle, ScriptedEnv, diff_normalized};
+use oc_testkit::{Normalizer, Oracle, ScriptedEnv, diff_normalized, pinned_oracle_or_skip};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -482,6 +482,12 @@ fn parse_skills(document: &str) -> Result<BTreeMap<String, String>, Box<dyn Erro
 
 #[tokio::test]
 async fn debug_skill_matches_the_oracle_across_every_root() -> Result<(), Box<dyn Error>> {
+    let Some(program) = pinned_oracle_or_skip(
+        "the oc-catalog skill fixture differential",
+        "no skill fixture was compared against the pinned opencode release",
+    ) else {
+        return Ok(());
+    };
     let mut failures = Vec::new();
     let mut covered = BTreeSet::new();
     let mut ran = 0usize;
@@ -506,7 +512,9 @@ async fn debug_skill_matches_the_oracle_across_every_root() -> Result<(), Box<dy
 
         // `with_env` owns the scripted directories for the rest of this
         // iteration, which is what keeps the temporary tree alive.
-        let oracle = Oracle::discover()?.with_env(case.env);
+        let oracle = Oracle::at_binary(program)
+            .expect("the centrally screened oracle must still be runnable")
+            .with_env(case.env);
         if ran == 0 {
             eprintln!(
                 "oracle: {} ({:?}), reported version {}",
@@ -564,7 +572,14 @@ async fn debug_skill_matches_the_oracle_across_every_root() -> Result<(), Box<dy
 /// picks up a project `.claude`, `.agents`, or `.opencode` from this repository.
 #[tokio::test]
 async fn the_real_skill_tree_yields_the_same_names_as_the_oracle() -> Result<(), Box<dyn Error>> {
-    let oracle = Oracle::discover()?;
+    let Some(program) = pinned_oracle_or_skip(
+        "the oc-catalog real skill tree differential",
+        "the host skill tree was not compared against the pinned opencode release",
+    ) else {
+        return Ok(());
+    };
+    let oracle =
+        Oracle::at_binary(program).expect("the centrally screened oracle must still be runnable");
     eprintln!(
         "oracle: {} ({:?}), reported version {}",
         oracle.program().display(),
