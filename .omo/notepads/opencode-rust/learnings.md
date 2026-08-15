@@ -7220,3 +7220,39 @@ needle silently restores the defect, so the next person cannot quietly halve the
 
 还有一个容易漏的副作用：`=======` 那一行往往正占着两段之间的空行位置，删掉它两段就会贴在一起，
 Markdown 不再解析为两节。删完要检查接缝，必要时补回空行。
+## [2026-08-15] C-4：CI 的 Test job 有 node，所以 runtime guard 不会把门禁变成空跑
+
+`.github/workflows/ci.yml` 的 `Test` job 在 `make test` 之前就跑
+`actions/setup-node@v7 node-version: "22"`（本是为 oxfmt 装的）。副作用很重要：
+`discover_runtime` 在 CI 上一定能在 PATH 找到 node，所以 plugin_models /
+tool_turn / session_mutation 里「找不到 runtime 就可见 skip」的守卫在 CI 上
+**不会触发**，这些测试在 CI 是真跑真断言。判断一个 runtime guard 会不会把门禁
+悄悄变成空跑，要去看该 job 装了什么工具，而不是只看守卫代码本身。
+
+## [2026-08-15] C-4：cargo test 的 fail-fast 会把后面所有套件藏起来
+
+`cargo test --workspace`（`make test`）默认在第一个失败的 test binary 处停止，
+不带 `--no-fail-fast`。所以一次 CI 红只能证明「第一个失败」，不能证明「只有这个
+失败」。判断某套件在上一轮是否真的跑过，直接对旧 job 日志 grep
+`Running tests/<name>` 的计数：计数 0 就是根本没跑到，而不是跑过且通过。
+本轮据此证明 oc-config differential 是被 plugin_models 遮住的第 5 层，不是回归。
+
+## [2026-08-15] C-4：磁盘写满的假故障有可识别特征
+
+/ 到 100%（剩 1.2G）时 `cargo test --workspace` 被中途杀死，日志**在测试名中间
+截断**且没有任何 `test result:` 汇总行——没有 rustc 报错，也没有 FAILED。
+这与真实测试失败的形状不同（真失败必有 `test result: FAILED` 与 panic 文案）。
+凡遇日志无汇总行地突然结束，先 `df -h /`。清掉数小时未被触碰的陈旧
+`/tmp/opencode/<name>` 构建缓存即可恢复（构建缓存可重建，删除是可逆的）；
+删之前用 `stat -c %y` 看 mtime，避开并行任务正在写的目录。
+
+## [2026-08-15] C-4：pinned oracle 缺失与 live-config 缺失是两种不同性质的红
+
+`BinaryNotFound { role: "oracle" }` 是**可移植性缺陷**：干净机器上没有真实
+`opencode`，仓库已有既定修法 `pinned_oracle_or_skip` + 登记
+`no_pinned_oracle_paths.rs` 中央清单（见 Defect G/H）。
+而 `oc-config/tests/differential.rs:329` 读 `/config/.config/opencode/opencode.json`
+的硬失败是**刻意设计**，源码与 panic 文案都写明「criterion-2 的机器特定输入
+不可用时必须可见失败」。前者该修成 skip，后者改动等于变更 criterion 2 的取证
+口径，属策略决定。看到 `/config/` 硬编码不要一律当 bug——先读它的 panic 文案和
+所属验收准则。

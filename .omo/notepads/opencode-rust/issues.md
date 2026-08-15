@@ -8497,3 +8497,47 @@ Oracle，归一化仍然承重。Zuno 内置技能身份仍由上述 location �
 （28%，GitHub 不重试）变成 12/12 全 200，`actions/checkout` 不再超时。**所以 checkout 或投递失败
 不再是已知环境噪声，必须调查。** 判断作业健康仍看是否拿到非空 `runner_name`；
 `webhook.lastTriggeredAt` 对 runner 项目即使成功也是 null，证明不了任何事。
+## [2026-08-15] C-4 复验：本任务缺陷已在真实 runner 闭环，并暴露 Defect I
+
+run `31896667730`（head_sha=681b92d）三个 gating job 都拿到非空 runner_name，
+确认真跑在 CodeBuild 上。job `Test`(95040917606) 第 2533 行
+`failing_auth_loader_is_disabled_and_models_lists_models_with_a_diagnostic ... ok`；
+上一轮 run `31890921981` 同一 job 同一行是 `panicked at plugin_models.rs:419`
+`FAILED. 4 passed; 1 failed`。同测试同行号，修复前红修复后绿，本任务闭环。
+
+关键点：CI 上该测试是 `ok` 而非 `SKIPPED`。Test job 在 `make test` 之前用
+`setup-node@v7` 装 Node 22（step 7），`discover_runtime` 在 PATH 上找得到 node，
+所以插件真的启动、diagnostic 真的被断言到，不是被 skip 掩盖。
+
+### Defect I（新暴露，属 C-3 的 G/H 缺陷族，C-4 未修）
+
+`Test` 现在停在 step 11 `Test suite`，失败点是
+`crates/oc-config/tests/differential.rs`，`1 passed; 4 failed`：
+三项 `Error: BinaryNotFound { role: "oracle", expected: "opencode (via PATH)" }`
+（`pure_env_and_cli_flag_disable_external_plugins_without_suppressing_config`、
+`permission_env_object_key_order_matches_raw_oracle`、
+`merged_config_matches_real_opencode_across_the_full_matrix`），
+加一项 `real_user_config_capture_matches_live_file_byte_for_byte`
+panic 于 `differential.rs:329`：读不到 `/config/.config/opencode/opencode.json`。
+
+前三项与 Defect G(agent_differential)/H(skill_differential) 形状完全相同，
+修法应一致：改走 `pinned_oracle_or_skip` 并登记进
+`oc-testkit/tests/no_pinned_oracle_paths.rs` 中央清单。但这需要触碰
+`oc-testkit/src/oracle.rs`（C-4 禁改清单内）与 C-3 的中央门禁，会与 C-3 冲突。
+第四项是**刻意**硬失败（源码与 panic 文案均写明 criterion-2 机器特定输入不可用
+时必须可见失败），改成 skip 属于 criterion 2 取证口径的策略决定而非可移植性
+修复。故 C-4 按越界报告处理，未动这些文件，也未声称 Test 全绿。
+
+### 层级遮蔽已实测（不是推断）
+
+`cargo test` 默认在第一个失败的 test binary 处停止：对上一轮 Test 日志 grep
+`oc-config.*differential|Running tests/differential` 计数为 **0** —— plugin_models
+失败时根本没跑到 oc-config。本轮 plugin_models 变绿后才暴露 Defect I。这是
+CI 真实执行以来的第 5 层（A oxfmt → B `--offline` 冷注册表 → C/D toolchain +
+hosted minutes → E/F smoke 断言 + 非密闭 SDK 路径 → I）。
+
+### 同轮网络噪声（与代码无关，单独隔离）
+
+`Supply chain`(95040917585) 与 `Artifact smoke (host)`(95040917615) 都停在
+step 2 `actions/checkout`，后续 step 全 skipped——第 2 类跨境故障
+（CodeBuild → github.com）。同一轮 `Test` 的 checkout 反而成功，佐证其间歇性。

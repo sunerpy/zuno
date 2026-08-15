@@ -137,10 +137,104 @@ C. 其余 /config/ 命中，逐条判定为“非本缺陷”
 
 [f] make smoke-artifact（CARGO_TARGET_DIR 已 unset，因 Makefile:28
     TARGET_DIR := target 用 := 固定为 ./target/release/）
-    结果见下方 CI 章节前的补记。
+    oc-smoke: ok    --version -> 1.18.13
+    oc-smoke: ok    --help lists run + serve
+    oc-smoke: ok    headless run replayed openai-chat/drives-a-tool-loop-end-to-end:
+                    3 requests, 10 tools offered
+    oc-smoke: PASS  .../oc-wt/c4/dist/unpacked/zuno
+
+[g] 复验补记（本轮独立重跑，非沿用上轮记录）
+    上面 [a]-[f] 全部在 worktree /config/workspace/ProdDir/AI/oc-wt/c4
+    （HEAD=681b92d，即已合入 main 的本任务提交）重新实测一次，结论一致：
+      targeted  plugin_models 5 + session_mutation 11 + tool_turn 15 = 31 passed / 0 failed
+                且日志中无一条 SKIPPED —— 本机三个套件是真跑，不是靠 skip 掩盖
+      workspace suites=217 passed=3526 failed=0 ignored=2（与基线逐项相等）
+      fmt-check "All matched files use the correct format."
+      lint      clippy --workspace --all-targets -D warnings，0 warning
+      smoke     oc-smoke: PASS
+    过程注记：首次 workspace 跑被磁盘写满（/ 到 100%，剩 1.2G）中途杀死，
+    日志在测试名中间截断、无 test result 汇总——正是交接提醒的假故障特征。
+    删除 8 小时未被触碰的陈旧构建缓存 /tmp/opencode/gm-target（18G）后重跑，
+    才得到上面的计数。任何一次大批编译错误都应先看 df -h /。
 
 -------------------------------------------------------------------------
 5. CI 验证（main）
 -------------------------------------------------------------------------
-待填：run id 与逐 job 表格（Test / Artifact smoke (host) / Supply chain /
-CI Success 均 conclusion=success 且 runner_name 非空；Windows = skipped）。
+run id = 31896667730（push，head_sha=681b92d，即本任务的修复提交）
+命令：gh api repos/sunerpy/zuno/actions/runs/31896667730/jobs
+
+  job                    status     conclusion  runner_name                            steps
+  ---------------------- ---------- ----------- -------------------------------------- -----
+  Supply chain           completed  failure     88d04ab2-06ae-4c52-80ff-298dc74f3e8c   7
+  Test                   completed  failure     00d344d2-2a48-4afa-839a-2124bf02222d   16
+  Artifact smoke (host)  completed  failure     9147891d-4ea0-49d8-988e-61c9490f3007   8
+  Windows                completed  skipped     (empty)                                0
+  CI Success             completed  failure     967bd536-612a-4ad1-ae3b-9ce285c2f017   3
+
+三个 gating job 都拿到了非空 runner_name —— 都真正跑在 CodeBuild runner 上，
+不是「从未启动」。Windows 按设计 skipped。
+
+【本任务的缺陷已在真实 runner 上证明修复】
+job Test（95040917606）日志第 2533 行：
+    test failing_auth_loader_is_disabled_and_models_lists_models_with_a_diagnostic ... ok
+注意是 ok 而不是 SKIPPED：Test job 在 make test 之前用 setup-node@v7 装了
+Node 22（step 7），所以 discover_runtime 在 PATH 上找到 node，该测试**真的
+启动了插件并断言到 diagnostic**，不是被 skip 掩盖过去。对照上一轮
+run 31890921981 的同一 job（95032117342）第 2533 行：
+    thread 'failing_auth_loader_is_disabled_and_models_lists_models_with_a_diagnostic'
+    panicked at crates/oc-cli/tests/plugin_models.rs:419:5
+    test result: FAILED. 4 passed; 1 failed
+同一行号、同一测试，修复前 FAILED、修复后 ok。这是本任务的完整闭环证据。
+
+【Test job 仍 failure 的原因是新暴露的第 5 层缺陷，不是本任务的缺陷】
+Test 的 step 逐项：checkout ✓ toolchain ✓ lock ✓ fetch ✓ setup-node ✓ oxfmt ✓
+Format check ✓ Clippy ✓ → Test suite ✗（step 11）。失败点：
+    crates/oc-config/tests/differential.rs
+    test result: FAILED. 1 passed; 4 failed
+    - pure_env_and_cli_flag_disable_external_plugins_without_suppressing_config
+    - permission_env_object_key_order_matches_raw_oracle
+    - merged_config_matches_real_opencode_across_the_full_matrix
+        以上三项：Error: BinaryNotFound { role: "oracle",
+        expected: "opencode (via PATH)", searched: ["opencode (via PATH)",
+        "<ancestor>/opencode/packages/opencode/package.json"] }
+    - real_user_config_capture_matches_live_file_byte_for_byte
+        panicked at crates/oc-config/tests/differential.rs:329:9:
+        read live config /config/.config/opencode/opencode.json:
+        No such file or directory (os error 2); this gate must fail visibly
+        when the machine-specific criterion-2 input is unavailable
+
+层级关系已实测证明，不是推断：`cargo test` 默认在第一个失败的 test binary 处
+停止，所以上一轮 plugin_models 失败时根本没跑到 oc-config。对上一轮日志
+grep "oc-config.*differential|Running tests/differential" 的计数是 **0**；
+本轮 plugin_models 变 ok 后才跑到并暴露它。即交接文件预告的「一个 job 内
+前一个缺陷会遮住后面全部缺陷」，这是第 5 层（A oxfmt → B --offline 冷注册表
+→ C/D toolchain+hosted minutes → E/F smoke 断言+非密闭 SDK 路径 → 本层）。
+
+【为什么不由本任务修，明确越界报告】
+这一层属于 C-3 已在处理的同一缺陷族，而非本任务的 node/PATH 缺陷：
+  * issues.md 记录 C-3 的 Defect G = agent_differential.rs 的 BinaryNotFound，
+    Defect H = skill_differential.rs 的两处直接 Oracle::discover；两者都改走
+    oc_testkit 的 pinned_oracle_or_skip 并登记进
+    oc-testkit/tests/no_pinned_oracle_paths.rs 的中央路由清单。
+  * 本层 3 项 BinaryNotFound 是同一形状的第三例（Defect I）。
+  * 修它需要 (a) 调用/可能调整 crates/oc-testkit/src/oracle.rs，
+    (b) 把文件登记进 no_pinned_oracle_paths.rs 的中央清单——前者在本任务的
+    禁改清单内，后者是 C-3 的中央门禁，两者都会与 C-3 正在合并的改动冲突。
+  * 第 4 项 real_user_config_capture 更是**刻意**硬失败：源码与 panic 文案都写明
+    「criterion-2 的机器特定输入不可用时必须可见失败」，compat_suite.rs（同在
+    禁改清单内）承载 criterion 2 的判定。把它从 hard-fail 改成 skip 是对
+    criterion 2 取证口径的策略决定，不是可移植性 bugfix，超出本任务授权。
+因此按交接指示「新失败出现即是进展；诊断清楚，超范围就报告而不是强行转绿」，
+本任务不动这些文件，不把这 4 项失败算作自己的结果，也不声称拿到了 Test 全绿。
+
+建议的修法（留给 C-3 或后续任务，保持与 G/H 一致）：
+  三项 Oracle::discover 改走 pinned_oracle_or_skip，并把
+  crates/oc-config/tests/differential.rs 加入 no_pinned_oracle_paths.rs 清单；
+  real_user_config_capture 的 hard-fail 语义需先与 criterion 2 的取证要求对齐，
+  由用户裁定是保留硬失败（则 CI 上该 job 永远红）还是降级为可见 skip。
+
+【与本任务无关的网络噪声，单独隔离】
+Supply chain(95040917585) 与 Artifact smoke(95040917615) 都停在 step 2
+actions/checkout，后续 step 全部 skipped——即交接说明的第 2 类跨境故障
+（CodeBuild → github.com 的 checkout 超时/EOF），与代码无关，不作为代码缺陷追查。
+Test job 反而顺利通过了 checkout，进一步说明这是间歇性网络问题。
