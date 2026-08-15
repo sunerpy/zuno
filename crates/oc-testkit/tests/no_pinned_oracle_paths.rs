@@ -49,13 +49,20 @@ const INSTALL_MARKERS: &[&str] = &["installs/opencode", "opencode/1."];
 /// catch, and it did: those four files no longer exist, so the removal was
 /// deliberate and is recorded here rather than worked around. The rule itself is
 /// unchanged for every file that still runs an installed binary.
+///
+/// A fifth entry, `oc-lsp/tests/live_servers.rs`, was removed for the same reason
+/// one release later: it held `typescript_diagnostics_match_the_real_opencode_binary`,
+/// the last differential that shelled out to `opencode debug lsp diagnostics`, and
+/// that suite is gone. The file's remaining test drives a live `rust-analyzer` and
+/// never touches an installed `opencode`, so it survived under the new name
+/// `oc-lsp/tests/live_rust_analyzer.rs` and is deliberately *not* listed here —
+/// listing it would demand an oracle call it must not make.
 const ROUTED_DIFFERENTIALS: &[&str] = &[
     "oc-cli/tests/rollback.rs",
     "oc-db/tests/message_export.rs",
     "oc-db/tests/schema.rs",
     "oc-db/tests/session.rs",
     "oc-llm/tests/catalog_differential.rs",
-    "oc-lsp/tests/live_servers.rs",
     "oc-tools/tests/registry.rs",
     "oc-tools/tests/search_differential.rs",
 ];

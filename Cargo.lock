@@ -2620,7 +2620,6 @@ dependencies = [
  "oc-config",
  "oc-error",
  "oc-process",
- "oc-testkit",
  "oc-tool",
  "schemars",
  "serde",
