@@ -1,0 +1,65 @@
+COMPLETE — task-r3 documentation, identity, and evidence-integrity remediation verified 2026-08-15.
+
+BASELINE
+- Worktree: task-r3 at 48236f9, clean before edits except this evidence file (gitignored).
+- Disk: /dev/root 76G free, 74% used; below the 90% stop threshold.
+- CodeGraph workflow and follow-up Working rules read; this worktree has no `.codegraph/` index, so the documented source-read fallback was used.
+- Safety: fresh CARGO_TARGET_DIR=/tmp/opencode/r3; no sibling-owned files; precise staging only.
+
+EXPLORATION
+- No .codegraph/ exists in the task-r3 worktree; MCP and local status both confirmed no index, so source reads used the documented fallback.
+- Identity owners: oc-server api/openapi.rs::document and oc-cli cmd/serve.rs readiness output; api.rs and serve-local unit tests are the matching guard locations, while session_mutation.rs consumes the readiness prefix.
+- Docs owner: crates/oc-cli/tests/docs.rs::check_block. oc-paths exports APP="zuno" and PROJECT_CONFIG_DIRECTORY=".zuno"; v1_coverage() derives measured/served/unbacked/redirected from V1_SURFACE/V1_BACKENDS.
+- Finding D decision: narrow README claims to generated:BEGIN/END regions. Reason: plugin-tier and retention-flags tables are explanatory prose, not stable runtime inventories; pretending every table is generated would overstate the gate. Path and v1 behavior claims will nevertheless receive derived generated blocks and scoped assertions.
+
+FINDING A — ZUNO DISPLAY IDENTITY
+- Changed OpenAPI info.title from `opencode Rust API` to `Zuno API`; pinned by api_openapi_presents_zunos_identity (1 passed).
+- Changed serve readiness line to `Zuno server listening on http://…`; production output and its session_mutation consumer share the new identity, while readiness_message_presents_zunos_identity pins the exact line (1 passed).
+
+FINDING B — ZUNO PATH DOCUMENTATION
+- Plugin discovery prose is now a generated `plugin-config-paths` block derived from oc_paths::APP and PROJECT_CONFIG_DIRECTORY; it says `$XDG_CONFIG_HOME/zuno`, project `.zuno`, `$HOME/.zuno`, then retained plugin-ABI `OPENCODE_CONFIG_DIR`.
+- Divergence surfaces now describe `$XDG_DATA_HOME/zuno/{tool-output,auth.json}` and docs.rs asserts those source records against oc_paths::APP before rendering.
+- Resident-memory project prose derives `.zuno` from PROJECT_CONFIG_DIRECTORY. The channel-database known-gap uses Zuno’s data root and docs.rs checks it against APP.
+- Rustdoc that described Zuno runtime paths was corrected; remaining old roots are explicitly labelled upstream-only observations. Generated Markdown regeneration and mutation proof are recorded in later sections.
+
+FINDING C — V1 COVERAGE CONSISTENCY
+- Added generated `v1-summary` and `v1-capture-coverage` regions. Both call oc_server::v1_coverage(); the capture additionally derives adapter/auth/toast and unbacked-method detail from V1_SURFACE.
+- Replaced the weak page-wide number lookup with a section extractor and assertions scoped to `## v1 plugin compatibility routes`, so a matching number in Known gaps cannot mask contradictory prose.
+- Compatibility matrix known-gap detail already derives from the same v1_coverage() value. Regeneration will align all three statements at 14 served / 6 unbacked / 0 redirected.
+
+FINDING D + PROJECT DIRECTION
+- Chose the narrow, truthful anti-drift contract: only generated:BEGIN/END regions are code-generated and byte-checked; selected load-bearing prose has separate derived assertions. Reason: plugin-tier and retention-flag tables are explanatory prose, so calling every table generated would remain false.
+- Rewrote Chinese and English README positioning: Zuno is independent; it does not import/restore opencode sessions or read old roots. Only npm plugin ABI compatibility remains.
+- Added a derived README test that checks oc_paths::APP, PROJECT_CONFIG_DIRECTORY, COMPATIBILITY_VERSION, and every name in PLUGIN_ABI_ENV_NAMES in both languages.
+- Removed duplicated upstream API counts from README rather than maintaining a second drift-prone copy. The compatibility matrix remains their canonical generated owner.
+- Updated the plan and compatibility-matrix preface: differential suites/documents remain pending a separate decision and are verification assets, not a cross-binary product goal.
+
+RE-DERIVED LOWERCASE INVENTORY
+- Scope: case-sensitive lowercase `opencode` occurrences in `crates/*/src/**/*` after all Zuno identity corrections.
+- Result: 943 occurrences on 863 matching lines across 169 files.
+- Classification: 824 upstream-artifact-reference, 67 plugin-abi, 52 historical-citation; 943 classified, 0 unclassified.
+- Reproducibility: `.omo/evidence/task-r3-opencode-inventory-generator.py` writes the committed one-row-per-occurrence mapping `.omo/evidence/task-r3-opencode-inventory.tsv`, including path, line, column, class, reason, source text, and a source-snapshot SHA-256. The generator fails if either stale identity string from Finding A returns.
+- The additional six-occurrence reduction beyond Finding A covers ACP presentation/auth method and the provider-auth CLI instruction, all Zuno-owned identity rather than plugin ABI.
+
+FINDING B/C MUTATION PROOFS
+- Finding B: changed only `docs/plugin-authoring.md` generated `plugin-config-paths` from `$XDG_CONFIG_HOME/zuno` to `$XDG_CONFIG_HOME/opencode`; `docs_plugin_guide_matches_the_hooks_and_the_example_the_host_ships` failed as expected. Restored SHA-256: `8f1c78476fd9b0db9b8ce95b59ce892d945820294c2f6f43be241e9d3f6dcde3`.
+- Finding C: changed only `docs/v1-surface-capture.md` generated coverage from 14/6 to 13/7; `docs_compatibility_matrix_matches_every_code_table` failed as expected. Restored SHA-256: `b585b7c0799750bc81d959f6d9254dcb1cff9838ba8ce10b94bb72a77cb6abbe`; untouched matrix SHA-256 remained `efbb740da19ee8a84a455df35817d73642f1dfc8c73cf95932a183d125ecbd6f`.
+- Mutation logs: `/tmp/opencode/r3-finding-b-mutation.log` and `/tmp/opencode/r3-finding-c-mutation.log`.
+
+TARGETED REGRESSION RESULTS
+- Docs: 13 passed / 0 failed.
+- Identity: OpenAPI, serve readiness, and ACP initialize identity tests passed.
+- Guards: registry precedence, permission filtering, empty-provider response, production memory collision chokepoint, and legacy-config actionable diagnostic passed.
+- Production routing: exactly 18 `cmd::turn_tests::production_*` tests passed.
+
+FINAL GATES
+- First detached fresh-target workspace run exposed one stale ACP live-SDK client method: 3517 passed / 1 failed / 2 ignored. The harness still submitted `opencode-login`; it now asserts the initialized method is `zuno-login` and authenticates with the method returned by the server. Its focused live-SDK test passed after the fix.
+- Second and final detached fresh-target workspace run completed with `EXIT=0`: 217 summaries, 3518 passed / 0 failed / 2 ignored, zero failure sections, and zero `error:` markers. Per the two-status-check limit, no third workspace run was made.
+- `crates/oc-cli/tests/differential.rs`: 21 passed / 0 failed.
+- `cargo clippy --workspace --all-targets --all-features --offline -- -D warnings`: passed with zero warnings after replacing an `iter().copied().collect()` in the docs assertion with `to_vec()`.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+- The integrated `lsp_diagnostics` tool is rooted at the parent request checkout and rejected this sibling worktree path before starting a server. Equivalent worktree-local `RA_LOG=off rust-analyzer diagnostics . --severity warning` exited 0; after removing progress control characters its only non-progress line was `diagnostic scan complete`, with no source warning/error diagnostics. `node --check crates/oc-acp/tests/live_sdk_client.mjs` also passed.
+- Concern-separated commits before this evidence closeout: `2d5ae5d` identity/docs, `4eb3531` evidence corrections and inventory, `05e186d` ACP live-SDK contract, and `3c800a1` Clippy cleanup. No push was performed.
+
+CLEANUP
+- Removed the worktree-local ignored `target/` created by rust-analyzer and the required fresh target directory `/tmp/opencode/r3` after all validation completed.
