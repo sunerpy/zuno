@@ -7138,3 +7138,55 @@ diagnostics 超时不报错，改为回落到缓存快照——即“等不到�
 LSP 的被 `Err(error @ ManagerError::Unavailable{..})` 分支抓住（55s，= 50s ready
 预算 + shutdown）。两条路都不能省：只有探针会漏掉后者，只有 `Unavailable` 分支会
 让前者也等 50s 且不打印 stderr。
+
+## [2026-08-15] R4 — a rename that lands in some copies of a constant and not others
+
+`PROJECT_DIRECTORY` existed three times: `oc-agent/src/plan_file.rs`, `oc-goal/src/projection.rs`,
+and `oc-paths/src/config_chain.rs` (as `PROJECT_CONFIG_DIRECTORY`). The `.zuno` rename was applied to
+all three by hand, and the R3 inventory then reported two of them as "upstream-artifact-reference"
+because a classifier catch-all filed them by filename rather than by role. Both halves of that are
+the same defect shape: **a value duplicated across crates has no single place to be right**, so
+neither a human edit nor an automated audit can be complete by construction. Collapsed to one
+definition in `oc-paths`, with the other two as `pub use` re-exports so no caller changed.
+
+The generalisable rule: when a constant names something that appears on disk, the number of
+definitions is part of the risk. Three copies of a path name is not a style problem, it is a
+guarantee that some future rename will be partial and green.
+
+## [2026-08-15] R4 — `Ok(None)` is the dangerous return type for a renamed on-disk path
+
+Renaming a config *directory* is cheap: discovery either finds it or does not. Renaming a directory
+that holds **durable documents a human edits** is not, and the danger is concentrated in functions
+whose "absent" case is a success value rather than an error:
+
+- `oc-agent::read_plan` returned `Ok(None)` for a missing plan, which upstream's `reminders.ts:55,73`
+  interprets as "no plan yet, tell the model to write one". With the plan sitting in the pre-rename
+  `.opencode/plans/`, that writes a fresh plan over a document the user cannot see is being ignored.
+- `oc-goal`'s `ingest` took `Ingest::Restored` and regenerated the projection from the database,
+  discarding whatever the human had typed into the objective region of the legacy file — and the
+  module's own docs promise that region is the user's to edit.
+
+Both were silent, both destroyed user intent, and both were invisible to every existing test because
+the tests only ever exercised trees where the legacy path did not exist. The fix is the same shape as
+the existing `legacy_db_path` hard cut: **detection only**, no read, no copy, no merge, no fallback —
+`oc_paths::unmigrated_project_path` returns `Some(old)` in exactly one of four states and the caller
+turns that into a typed error naming both paths and the `mv` that resolves it.
+
+Test the matrix, not the happy path: neither exists / only old / only new / both. The
+"only new" and "both" cases are the ones that catch an over-eager detector that would start
+erroring on healthy projects, and they are the cases a fix-shaped-like-a-guard usually forgets.
+
+## [2026-08-15] R4 — a guard test that pins prose can pin the defect
+
+`crates/oc-cli/tests/docs.rs` asserted the README contains the literal
+「不会导入或恢复 opencode 会话」. That sentence was the thing being corrected, so the test failed the
+moment the documentation became accurate — the guard had frozen a misleading claim in place and would
+have made the correct wording look like a regression.
+
+Two lessons. First, the failure was *useful*: the test forced the correction to be deliberate instead
+of drive-by. Second, re-pinning must move in the direction of more falsifiability, never less. The
+replacement requires **two** needles per readme — the independence claim AND the bounded-import fact
+(`zuno session import` reads only Zuno's own export) — because either one alone reads as the opposite
+claim: the independence sentence alone is what let readers conclude no import exists, and naming the
+command alone would advertise adopting an opencode session. A comment records that deleting either
+needle silently restores the defect, so the next person cannot quietly halve the assertion.

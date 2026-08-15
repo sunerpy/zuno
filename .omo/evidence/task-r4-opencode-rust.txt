@@ -55,3 +55,172 @@ Real three-plugin turn
 Result
 - R4 local verification is complete: Zuno-owned identity differences have narrow differential boundaries, the retained external compatibility comparisons remain active, all local gates pass, changed Rust files are diagnostic-clean, and the real three-plugin turn returned `R4-VERIFIED`.
 - Z-4 remote proof remains separately blocked at GitHub Actions scheduling capacity as recorded in `task-z4-opencode-rust.txt`; no AWS resource was mutated during R4.
+
+================================================================================
+2026-08-15 (resumed session) — rebase onto current main, plus findings 7-9
+================================================================================
+
+Why this section exists
+- The four original R4 commits were built on 7d36eee and their background session was lost before
+  anything merged. Nothing in the section above was redone; it was replayed by rebase and verified.
+
+Rebase
+- Before rebasing, the worktree held four staged-but-uncommitted files from the lost session
+  (skill_differential.rs, cli_parity.rs, compat_suite.rs, docs/compatibility-matrix.md). They were
+  committed first, as `fix(test): 让差分测试容纳产品自有内置技能`, so the rebase would carry them.
+  `git diff --cached --name-only | grep -c '^target/'` was 0 before that commit.
+- `git rebase origin/main` replayed all five commits with ZERO conflicts. origin/main had advanced
+  past ea3096f to 681b92d (the parallel plugin_models task merged while this task was running).
+- The two predicted collisions did not materialise as conflicts because the two sides touched
+  disjoint regions: main's 8130c78 changed skill_differential.rs's oracle routing
+  (pinned_oracle_or_skip / Oracle::at_binary) while R4 changed its canonical() filter; both are
+  present afterwards, verified by reading the file and `git show 8130c78`. The issues.md notepad
+  append likewise merged cleanly; the file is 8266 lines and both sides' text is present.
+- `grep -rnE '^(<{7} |={7}$|>{7} )'` over the tree excluding .git and target: no matches. No
+  conflict-marker line was ever written, so none had to be deleted.
+
+Finding 7 — `.opencode` in production code, with a verdict for every occurrence
+- The three paths named in the task brief were ALREADY `.zuno` on this branch: commit 4a16625
+  ("完成 Zuno 独立项目身份收敛") had migrated plan_file.rs:63, projection.rs:118 and
+  registry.rs:316 (plus shell.rs) before the session was lost. Re-verifying rather than trusting the
+  brief is what surfaced that; no change was needed to the literals themselves.
+- What was still a real defect is the part the brief predicted: PROJECT_DIRECTORY had three
+  independent definitions (oc-agent, oc-goal, oc-paths as PROJECT_CONFIG_DIRECTORY). That is exactly
+  how the rename could land in some copies and not others.
+- Resolved by making `oc_paths::config_chain::PROJECT_DIRECTORY` the single definition.
+  PROJECT_CONFIG_DIRECTORY is now an alias of it; oc-agent and oc-goal `pub use oc_paths::
+  PROJECT_DIRECTORY`, preserving their public re-exports. oc-tools' two remaining literals now
+  compose oc_paths::PROJECT_DIRECTORY with TOOL_OUTPUT_DIRECTORY / BACKGROUND_DIRECTORY.
+- Verdicts for every production `.opencode` occurrence outside tests/fixtures:
+  * `.zuno` (Zuno's own state, already migrated, now single-sourced): plan documents
+    (oc-agent/plan_file.rs), goal projection + gitignore snippet (oc-goal/projection.rs),
+    tool-output store (oc-tools/registry.rs), tool-output + background stores (oc-tools/shell.rs),
+    project config directory (oc-paths/config_chain.rs).
+  * PLUGIN ABI — stays `opencode`, deliberately: `engines.opencode` semver field
+    (oc-plugin/js/spec.rs, oc-cli/version.rs COMPATIBILITY_VERSION=1.18.13), the six OPENCODE_*
+    handshake names, `v1_coverage()`.
+  * PROTOCOL/SERVICE, not an on-disk Zuno path: `.opencode-version` remote-skill cache stamp
+    (oc-catalog/skill/remote.rs:67) is a protocol artifact written by the upstream skill registry;
+    `https://models.opencode.ai` (oc-paths/files.rs:35) is a service endpoint.
+  * PROTECTIVE RECOGNITION — must keep matching the old name: oc-memory/threat.rs's
+    self-modification detector, which must still recognise plugin-authored `.opencode/` writes as an
+    attack target; oc-error/config.rs's `.opencode-agents` typo suggestion.
+  * COMMENTS/UPSTREAM REFERENCES: oc-catalog/agent.rs, oc-paths/walk.rs module docs — descriptions
+    of upstream behaviour, not code paths.
+- On-disk rename safety, as required: because plan and goal documents are durable files a user may
+  have left at the old path, `oc_paths::unmigrated_project_path` was added as a detection-only hard
+  cut (no read, copy, merge, or fallback — same posture as the existing legacy_db_path). Wired into
+  the two read chokepoints that would otherwise lose data in silence:
+  * oc-agent read_plan: previously returned Ok(None) for a missing plan, which tells the model
+    "no plan yet" and makes it write a fresh one OVER a document the user cannot see is ignored.
+    Now errors, naming both paths and the exact `mv` that fixes it.
+  * oc-goal read_optional/ingest: previously took the Ingest::Restored branch and rewrote the
+    projection from the DB, silently discarding the human-edited objective region in the legacy file.
+    Now returns GoalError::Document naming the legacy path.
+- Four-state matrix tested at every level (neither / only old / only new / both): 6 tests on the
+  detector in oc-paths (including two refusing an ambiguous path with zero or two `.zuno`
+  components), 4 in oc-agent plan_file, 3 in oc-goal projection. 13 new tests, all green.
+
+Finding 8 — stale drop-in-replacement claims
+- oc-testkit/src/lib.rs:1-8 rewritten: Zuno is independent, does NOT promise drop-in replacement,
+  and the differentials are a retained verification asset rather than a product promise. The
+  1.18.13-vs-PINNED_RELEASE distinction was kept, since it is still true and load-bearing.
+- oc-testkit/src/subject.rs:17 "the name a drop-in replacement is invoked by" -> "the name Zuno is
+  invoked by".
+- oc-testkit/src/compat_report.rs:5-9 "for a drop-in-replacement claim" -> "for an inventory of
+  retained verification". (4a16625 had already updated other parts of this file.)
+- Remaining `drop-in` matches in the tree are only NEGATIONS of the claim (lib.rs:3 and
+  docs/compatibility-matrix.md:4), plus compat_suite.rs which a later task deletes and which this
+  task did not touch.
+
+Finding 8b — the session-import contradiction, resolved rather than escalated
+- I agree the command should be KEPT and the docs corrected, with one refinement to the assessment:
+  the README statements were not strictly false, they were misleading by omission.
+  「它不会导入或恢复 opencode 会话」 is literally true — export.rs:48-92 rejects http/https share
+  URLs outright and only reads a local document that Zuno's own `export` produced. But a reader
+  concludes no import exists at all, which contradicts docs/compatibility-matrix.md:163
+  `ImportCommand | implemented`. The genuinely false sentence was in the English mirror:
+  README.en.md:79-80 "deliberately provides no session import or restore workflow".
+- This also matches the user's stated direction rather than contradicting it: what was rejected was
+  importing OPENCODE sessions, which this command refuses. Zuno's own export/import round trip is a
+  different thing.
+- Fixed in four places to state both halves — import exists, and it is bounded to Zuno's own export
+  documents: README.md:63 and :88, README.en.md:56-58 and :79-81, plus the "retained suites" caveat
+  in both readmes ("新增会话导入" -> "新增接管 opencode 会话的能力").
+- crates/oc-cli/tests/docs.rs:1640 pinned the exact stale literal, so the guard itself encoded the
+  defect. It was re-pinned STRONGER, not weakened: from one needle to two per readme, now requiring
+  both the independence claim AND the bounded-import fact, with a comment recording that deleting
+  either needle silently restores the defect. `cargo test -p oc-cli --test docs`: 13 passed.
+
+Finding 9 — plan/evidence corrected against values I measured myself
+- Measured live, not copied from the brief:
+  `aws codebuild batch-get-projects --names zuno-runner --region cn-northwest-1` returns
+  arn:aws-cn:codebuild:cn-northwest-1:107255705363:project/zuno-runner, computeType
+  BUILD_GENERAL1_LARGE, image aws/codebuild/standard:7.0, type LINUX_CONTAINER,
+  privilegedMode False, source.auth.type SECRETS_MANAGER, buildspec '', reportBuildStatus False.
+  `aws codebuild list-fleets --region cn-northwest-1` -> InvalidInputException: Unknown operation
+  ListFleets. Secret resource: codebuild/zuno/github-source
+  (arn:aws-cn:secretsmanager:cn-northwest-1:107255705363:secret:codebuild/zuno/github-source-vzWMnL).
+- plan:268 "9 jobs across two workflows" -> "11 distinct CodeBuild label sets", noting the figure is
+  pinned by crates/oc-cli/tests/release_surface.rs and that the old number was never measured.
+  Independently counted 11 `codebuild-` label occurrences in .github/workflows/.
+- plan: added a measured-configuration table (partition/region/account, ARN, all five environment
+  fields, source auth, buildspec, report status) marked as superseding any earlier figure, plus the
+  consequence the plan never stated: because aws-cn has NO fleet API, and reserved-capacity fleets
+  are the only way CodeBuild hosts Windows or macOS runners, this partition is LINUX_CONTAINER-only.
+  Windows/macOS jobs must stay GitHub-hosted — a partition limitation, not a tuning choice.
+- privilegedMode: the plan already said false (corrected earlier by cef7798); the measured table now
+  makes it verifiable and records WHY it is correct (both workflows use zero docker).
+- Credential shape: the `repo + admin:repo_hook` classic-PAT demand had already been removed from the
+  plan and both evidence files by cef7798. What was still missing is what is actually in use, so the
+  plan now records the Secrets Manager secret name and ARN, the in-use `gh` token's scopes
+  (admin:public_key, gist, read:org, repo), the reason webhook creation worked (GitHub's `repo`
+  scope includes webhook administration), an explicit note that the classic-PAT requirement is
+  obsolete and was never tested against the credential the host already had, and the recommended
+  rotation shape: fine-grained, scoped to sunerpy/zuno only, Contents Read, Commit statuses R/W,
+  Webhooks R/W, Administration R/W. No credential value is recorded.
+- .omo/evidence/task-r1-opencode-rust.txt:1 PENDING -> MERGED, naming merge commit 48236f9 and
+  recording that `git merge-base --is-ancestor 48236f9 origin/main` confirms it.
+
+Gates (this session, on the rebased tree)
+- `cargo test --workspace`: 3541 passed / 0 failed / 2 ignored across 217 suites, 0 FAILED lines,
+  no `error: test failed`. Run detached via setsid nohup and polled, per the shell-timeout trap.
+  Delta vs the 3526 baseline is +15 and fully accounted: +6 oc-paths detector matrix, +4 oc-agent
+  legacy-plan states, +3 oc-goal goal-document states, +2 carried in by the WIP commit that the
+  rebase replayed. No test was weakened, ignored, or deleted.
+- `make fmt-check`: initially FAILED on my docs.rs edit; `cargo fmt --all` applied, then PASS
+  ("All matched files use the correct format").
+- `make lint`: rc=0, zero warning/error lines.
+- `make smoke-artifact` with CARGO_TARGET_DIR unset (Makefile:28 hardcodes TARGET_DIR := target):
+  `oc-smoke: PASS`, --version 1.18.13, headless run 3 requests / 10 tools offered.
+- Disk discipline: the FIRST post-rebase test run reported 7 FAILED, all of them
+  `StorageFull`/errno 28 "No space left on device" from tempdir creation, with `df -h /` at 100%.
+  Those were NOT real failures and were not recorded as such; the clean 3541/0 run above is the
+  measurement, taken after space was reclaimed.
+
+Real-machine verification (this session)
+- First attempt used `--prompt`, which this CLI does not accept: `error: unexpected argument
+  '--prompt' found`, exit 2. The prompt is positional. Corrected invocation:
+    ZUNO_DB=/tmp/opencode/r4/r4-live-verify.db ./dist/unpacked/zuno run \
+      --model myopenai/global.anthropic.claude-haiku-4-5-20251001-v1:0 \
+      "reply with exactly R4-VERIFIED"
+- stdout, verbatim and complete:
+    R4-VERIFIED
+- exit 0. stderr contained only the two expected plugin-suppression diagnostics:
+    warning: tool `grep` from built-in suppressed by same-named tool from plugin
+    warning: tool `glob` from built-in suppressed by same-named tool from plugin
+- The binary under test is the one `make smoke-artifact` unpacked from the release archive
+  (dist/unpacked/zuno), not a debug build. An explicit disposable ZUNO_DB was used so the run could
+  not touch the host's real database, same as the earlier session. No credential, key, token, or
+  request body is recorded here.
+
+Result
+- R4 is complete and merge-ready on the current main: rebased with all original commits intact and
+  no conflict markers, every production `.opencode` occurrence carries an explicit verdict, the
+  three duplicate PROJECT_DIRECTORY definitions are collapsed to one behind a tested four-state
+  hard cut, the drop-in-replacement posture is gone from oc-testkit source, the import
+  contradiction is resolved consistently across README/README.en/matrix/code with a stronger guard,
+  and every Finding 9 item is corrected against values measured on the live AWS project.
+- Not touched, per the task's exclusions: task-r3 inventory generator/TSV, plugin_models.rs,
+  compat_suite.rs beyond the WIP commit the rebase replayed, differential.rs, agent_differential.rs,
+  oc-paths/tests/differential.rs, oracle.rs, and .github/workflows/.

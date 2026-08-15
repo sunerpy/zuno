@@ -272,9 +272,26 @@ Traps, all of which the skill reports having hit in practice:
    empty secret cannot authenticate webhook creation or repository access. The host's existing
    GitHub CLI credential was sufficient; a new PAT and CodeConnections/App authorization were not
    required. CodeConnections instructions do not apply in `aws-cn`.
+
+   **What is actually in use.** The credential lives in Secrets Manager secret
+   `codebuild/zuno/github-source`
+   (`arn:aws-cn:secretsmanager:cn-northwest-1:107255705363:secret:codebuild/zuno/github-source-vzWMnL`),
+   referenced by the project's `source.auth.resource`. It is the host's existing `gh` token, whose
+   scopes are `admin:public_key, gist, read:org, repo`; GitHub's `repo` scope already includes
+   webhook administration, which is why webhook creation succeeded. Any earlier text in this plan or
+   its evidence demanding a **classic PAT with `repo + admin:repo_hook`** is obsolete — that
+   requirement was never tested against the credential the host already had, and minting a token was
+   avoidable. No credential value is recorded here or in evidence.
+
+   **Recommended shape when this is next rotated:** a fine-grained token scoped to `sunerpy/zuno`
+   only, with Contents `Read`, Commit statuses `Read/Write`, Webhooks `Read/Write`, Administration
+   `Read/Write`. That is narrower than the classic `repo` scope in use today, which grants access to
+   every repository the account can reach.
 2. **Give every job a unique label.** GitHub routes by label **superset**, so a job with fewer labels
    can have its runner stolen by one with more — and the symptom is a job hanging forever with no
-   error. This project has **9 jobs across two workflows**; that is exactly the condition.
+   error. This project has **11 distinct CodeBuild label sets across two workflows**, pinned by
+   `crates/oc-cli/tests/release_surface.rs`; that is exactly the condition. The earlier "9 jobs"
+   figure in this plan was never measured and was wrong by two.
 3. **Pin tool versions.** `aws/codebuild/standard:7.0` defaults to Node 18 while GitHub-hosted images
    are newer, and `npm install` only *warns* on `EBADENGINE` — so a failure surfaces two steps later
    with no mention of versions. Less acute for a Rust project, but `release.yml` may use Node tooling.
@@ -282,6 +299,29 @@ Traps, all of which the skill reports having hit in practice:
 **One project-specific check the skill cannot know**: `cargo test --workspace` here is heavy, and this
 session repeatedly hit host `EAGAIN` under parallel load. Establish the compute size deliberately and
 record why, rather than accepting `BUILD_GENERAL1_MEDIUM` because it is the example.
+
+### Measured configuration of the live project (2026-08-15)
+
+Read back from `aws codebuild batch-get-projects --names zuno-runner --region cn-northwest-1`, so
+these supersede any earlier figure in this plan:
+
+| field | measured value |
+|---|---|
+| partition / region / account | `aws-cn` / `cn-northwest-1` / `107255705363` |
+| ARN | `arn:aws-cn:codebuild:cn-northwest-1:107255705363:project/zuno-runner` |
+| `environment.type` | `LINUX_CONTAINER` |
+| `environment.computeType` | `BUILD_GENERAL1_LARGE` |
+| `environment.image` | `aws/codebuild/standard:7.0` |
+| `environment.privilegedMode` | `false` — correct, because both workflows use zero docker |
+| `source.auth.type` | `SECRETS_MANAGER`, because `aws-cn` has no CodeConnections |
+| `source.buildspec` | empty, as runner mode requires |
+| `source.reportBuildStatus` | `false` |
+
+**`aws-cn` has no fleet API at all.** `aws codebuild list-fleets --region cn-northwest-1` answers
+`InvalidInputException: Unknown operation ListFleets`. Reserved-capacity fleets are the only way
+CodeBuild hosts Windows or macOS runners, so in this partition the runner path is
+`LINUX_CONTAINER`-only. Any Windows or macOS job must stay GitHub-hosted; that is a partition
+limitation, not a configuration choice, and no amount of project tuning changes it.
 
 ### Acceptance criteria (agent-executable)
 

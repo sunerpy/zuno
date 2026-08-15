@@ -1,4 +1,4 @@
-PENDING — task-r1 silent-failure fixes started
+MERGED — task-r1 silent-failure fixes landed on main as merge commit 48236f9 ("Merge branch 'task-r1'"), verified an ancestor of origin/main. The leading PENDING was left behind after the merge; corrected by task-r4.
 AUDIT A — confirmed crates/oc-cli/src/cmd/tool_runtime.rs:149-157 builds/resolves the registry, then pushes configured memory afterward; crates/oc-tools/src/registry.rs:378-399 is the universal insert_tool diagnostic/de-dup chokepoint.
 PRECEDENCE A — memory is a configured built-in, so it belongs in the Builtin source phase. Existing last-source-wins remains MCP > plugin > config-directory > builtin; therefore a plugin-provided memory wins visibly over built-in memory.
 FIFTH-SOURCE AUDIT — searched every Rust registry.resolve/ResolveInput and tools.push/extend site. No fifth post-resolve provider-facing source exists; the only such mutation is memory at tool_runtime.rs:157. MCP catalog/transport pushes occur upstream of registry assembly.

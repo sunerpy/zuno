@@ -8393,3 +8393,70 @@ config/registry 层（`oc-lsp/src/registry.rs` 单测断言 typescript 内建 sp
 command / extensions / env / initialization 覆盖）与协议层（Python stub server 单测，
 server 无关）。没有补写新的 oracle-free TypeScript live 测试：它依赖 PATH 上有
 typescript-language-server，CI 上没有，等于再造一个 hollow gate。
+
+## [2026-08-15] R4 — rebase onto current main, plus findings 7-9
+
+**Rebase.** The four R4 commits were built on 7d36eee and their session was lost before any merge.
+`git rebase origin/main` replayed all five (a WIP commit was made first so the four staged files from
+the lost session would travel with it) with **zero conflicts**, and origin/main had meanwhile advanced
+past ea3096f to 681b92d. The two predicted collisions did not conflict because the sides touched
+disjoint regions of the same files: main's 8130c78 rewrote `skill_differential.rs`'s oracle routing
+(`pinned_oracle_or_skip` / `Oracle::at_binary`) while R4 changed its `canonical()` filter. Both are
+present afterwards — verified by reading the file, not by trusting a clean exit. No conflict-marker
+line was ever written, so the notepad marker-deletion procedure was not needed.
+
+**Finding 7 was already half-fixed, and re-verifying is what showed it.** The three paths named in
+the task (plan_file.rs:63, projection.rs:118, registry.rs:316) were ALREADY `.zuno`: commit 4a16625
+migrated them before the session was lost. Treating the brief as ground truth would have produced a
+no-op change plus a false report. The real remaining defect was the one the brief predicted
+structurally: `PROJECT_DIRECTORY` had three independent definitions, which is precisely how a rename
+lands in some copies and not others. Collapsed to a single definition in `oc-paths`.
+
+**Two silent data-destroying paths found while doing it.** `oc-agent::read_plan` returned `Ok(None)`
+for a plan left at the pre-rename path, which makes the model write a fresh plan over it; `oc-goal`'s
+`ingest` regenerated the projection from the database, discarding the human-edited objective region of
+a legacy document. Both invisible to every existing test, because no test built a tree containing the
+legacy path. Closed with a detection-only hard cut (`oc_paths::unmigrated_project_path`, same posture
+as `legacy_db_path`: no read/copy/merge/fallback) plus the four-state matrix at three levels — 13 new
+tests.
+
+**The import "contradiction" was misleading-by-omission, not a falsehood.** `export.rs:48-92` rejects
+http/https share URLs outright and only reads a document Zuno's own `export` produced, so
+「它不会导入或恢复 opencode 会话」 is literally true — but a reader concludes no import exists at all,
+contradicting `ImportCommand | implemented`. The genuinely false sentence was in the English mirror
+(`README.en.md:79-80`, "deliberately provides no session import or restore workflow"). Kept the
+command, fixed four doc sites to state both halves. This does not contradict the user's direction: what
+they rejected was importing OPENCODE sessions, which this command refuses.
+
+**A guard test had frozen the defect.** `docs.rs:1640` pinned the exact stale literal, so it failed the
+moment the docs became accurate. Re-pinned stronger — two needles per readme instead of one — never
+weaker. See learnings.md for the general rule.
+
+**Finding 9 measured, not copied.** `aws codebuild batch-get-projects --names zuno-runner --region
+cn-northwest-1` confirms `arn:aws-cn:...:107255705363:project/zuno-runner`, `BUILD_GENERAL1_LARGE`,
+`aws/codebuild/standard:7.0`, `LINUX_CONTAINER`, `privilegedMode False`, `SECRETS_MANAGER`, empty
+buildspec, `reportBuildStatus False`. `aws codebuild list-fleets --region cn-northwest-1` ->
+`InvalidInputException: Unknown operation ListFleets`. The consequence the plan never stated:
+**reserved-capacity fleets are the only way CodeBuild hosts Windows or macOS runners, so aws-cn is
+LINUX_CONTAINER-only and Windows/macOS jobs must stay GitHub-hosted** — a partition limitation, not a
+tuning choice. Also corrected "9 jobs" to 11 label sets (pinned by `release_surface.rs`), and recorded
+what credential is actually in use: the host's `gh` token (scopes `admin:public_key, gist, read:org,
+repo`) in Secrets Manager secret `codebuild/zuno/github-source`. The `repo + admin:repo_hook`
+classic-PAT demand is obsolete and was never tested against the credential the host already had;
+recommended rotation shape is fine-grained, scoped to `sunerpy/zuno`, Contents R + Commit statuses R/W
++ Webhooks R/W + Administration R/W. `task-r1` evidence's leading `PENDING` corrected to `MERGED`
+(48236f9, confirmed an ancestor of origin/main).
+
+**The disk trap fired again, and it reads exactly like a real failure.** The first post-rebase
+`cargo test --workspace` reported 7 FAILED. All seven were
+`Custom { kind: StorageFull, ... Os { code: 28, ... "No space left on device" } }` raised while
+creating a scripted temp root, with `df -h /` at 100%. They are indistinguishable from genuine test
+failures in the log unless you read the panic payload. **Check `df -h /` before believing any burst of
+failures**, and never record such a run as a result. The real measurement afterwards: 3541 passed /
+0 failed / 2 ignored across 217 suites (+15 vs the 3526 baseline: +13 new tests here, +2 carried by
+the replayed WIP commit).
+
+**`zuno run` takes the prompt positionally.** `--prompt` fails with `error: unexpected argument
+'--prompt' found ... tip: a similar argument exists: '--port'`, exit 2. Correct form is
+`zuno run --model <MODEL> "<prompt>"`. Real-machine check then returned stdout exactly `R4-VERIFIED`,
+exit 0, stderr only the two expected plugin suppressions for `grep` and `glob`.
