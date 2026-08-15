@@ -108,7 +108,7 @@ jobs:
       version: ${{ steps.resolve.outputs.version }}
       publish: ${{ steps.resolve.outputs.publish }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Resolve and cross-check the version
         id: resolve
@@ -151,52 +151,46 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
             use_zigbuild: true
             archive: tar.gz
             runs_on:
               - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
               - zuno-release-build-x86_64-linux
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
             use_zigbuild: true
             archive: tar.gz
             runs_on:
               - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
               - zuno-release-build-aarch64-linux
           - target: x86_64-apple-darwin
-            os: macos-15-intel
             use_zigbuild: false
             archive: tar.gz
             runs_on:
               - macos-15-intel
           - target: aarch64-apple-darwin
-            os: macos-latest
             use_zigbuild: false
             archive: tar.gz
             runs_on:
               - macos-latest
           - target: x86_64-pc-windows-msvc
-            os: windows-latest
             use_zigbuild: false
             archive: zip
             runs_on:
               - windows-latest
           - target: aarch64-pc-windows-msvc
-            os: windows-11-arm
             use_zigbuild: false
             archive: zip
             runs_on:
               - windows-11-arm
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: release-${{ matrix.target }}
 
@@ -206,13 +200,13 @@ jobs:
       # cargo-zigbuild tracks Zig's CLI, which is not yet stable.
       - name: Install Zig
         if: matrix.use_zigbuild
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.13.0
 
       - name: Install cargo-zigbuild
         if: matrix.use_zigbuild
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
           tool: cargo-zigbuild
 
@@ -257,7 +251,7 @@ jobs:
             -Path "target/${{ matrix.target }}/release/${env:BINARY_NAME}.exe" `
             -DestinationPath "dist/${env:BINARY_NAME}-${{ needs.version.outputs.version }}-${{ matrix.target }}.zip"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dist-${{ matrix.target }}
           path: dist/*
@@ -267,15 +261,14 @@ jobs:
   # -------------------------------------------------------------------------
   # smoke: run every archive's binary on a runner of its own architecture.
   #
-  # `runner` is chosen per target so the artifact is EXECUTED rather than merely
-  # inspected. The two cases worth knowing:
+  # `runs_on` is chosen per target so the artifact is EXECUTED rather than merely
+  # inspected. The two Linux cases worth knowing:
   #
-  #   * x86_64-unknown-linux-musl smokes on ubuntu-latest even though it was
-  #     cross-linked there: a static musl binary runs on any Linux of the same
-  #     architecture, glibc host included.
+  #   * x86_64-unknown-linux-musl smokes on the x86_64 CodeBuild route: a static
+  #     musl binary runs on any Linux of the same architecture, glibc host included.
   #   * aarch64-unknown-linux-musl is BUILT on x86_64 (zigbuild) and cannot run
-  #     there, so it is handed to ubuntu-24.04-arm. That runner-crossing handoff
-  #     is the reason smoke is a separate job from build.
+  #     there, so the ARM CodeBuild image label routes it to native aarch64. That
+  #     architecture-crossing handoff is why smoke is separate from build.
   #
   # `oc-smoke` is compiled from this checkout on the smoke runner, then pointed at
   # the unpacked artifact. It runs `--version`, `--help`, and a headless `run`
@@ -293,13 +286,11 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            runner: ubuntu-latest
             archive: tar.gz
             runs_on:
               - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
               - zuno-release-smoke-x86_64-linux
           - target: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
             archive: tar.gz
             runs_on:
               - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
@@ -307,36 +298,32 @@ jobs:
               - image:arm-3.0
               - instance-size:large
           - target: x86_64-apple-darwin
-            runner: macos-15-intel
             archive: tar.gz
             runs_on:
               - macos-15-intel
           - target: aarch64-apple-darwin
-            runner: macos-latest
             archive: tar.gz
             runs_on:
               - macos-latest
           - target: x86_64-pc-windows-msvc
-            runner: windows-latest
             archive: zip
             runs_on:
               - windows-latest
           - target: aarch64-pc-windows-msvc
-            runner: windows-11-arm
             archive: zip
             runs_on:
               - windows-11-arm
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: smoke-${{ matrix.runner }}
+          key: smoke-${{ matrix.target }}
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: dist-${{ matrix.target }}
           path: dist
@@ -384,7 +371,7 @@ jobs:
       - zuno-release-checksums
     timeout-minutes: 10
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: dist-*
           path: dist
@@ -408,7 +395,7 @@ jobs:
           done
           cat SHA256SUMS
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: checksums
           path: dist/SHA256SUMS
@@ -434,19 +421,19 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: dist-*
           path: dist
           merge-multiple: true
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: checksums
           path: dist
 
       - name: Attach assets to the GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: ${{ github.ref_name }}
           fail_on_unmatched_files: true

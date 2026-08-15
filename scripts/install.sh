@@ -3,7 +3,6 @@ set -eu
 
 repo="sunerpy/zuno"
 binary="zuno"
-token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
 
 fail() {
   printf 'error: %s\n' "$1" >&2
@@ -14,40 +13,7 @@ say() {
   printf '%s\n' "$1" >&2
 }
 
-if command -v curl >/dev/null 2>&1; then
-  download() {
-    if [ -n "$token" ]; then
-      curl -fsSL -H "Authorization: Bearer $token" "$1" -o "$2"
-    else
-      curl -fsSL "$1" -o "$2"
-    fi
-  }
-  fetch() {
-    if [ -n "$token" ]; then
-      curl -fsSL -H "Authorization: Bearer $token" "$1"
-    else
-      curl -fsSL "$1"
-    fi
-  }
-elif command -v wget >/dev/null 2>&1; then
-  download() {
-    if [ -n "$token" ]; then
-      wget -q --header="Authorization: Bearer $token" -O "$2" "$1"
-    else
-      wget -qO "$2" "$1"
-    fi
-  }
-  fetch() {
-    if [ -n "$token" ]; then
-      wget -q --header="Authorization: Bearer $token" -O - "$1"
-    else
-      wget -qO - "$1"
-    fi
-  }
-else
-  fail "curl or wget is required"
-fi
-
+command -v gh >/dev/null 2>&1 || fail "GitHub CLI (gh) is required"
 command -v tar >/dev/null 2>&1 || fail "tar is required"
 
 case "$(uname -s)" in
@@ -65,22 +31,22 @@ esac
 if [ -n "${ZUNO_VERSION:-}" ]; then
   version=$(printf '%s' "$ZUNO_VERSION" | sed 's/^v//')
 else
-  api="https://api.github.com/repos/${repo}/releases/latest"
   say "Resolving the latest Zuno release..."
-  tag=$(fetch "$api" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n '1p')
-  [ -n "$tag" ] || fail "could not resolve the latest release from $api"
+  tag=$(gh release view --repo "$repo" --json tagName --jq .tagName) \
+    || fail "could not resolve the latest release for $repo"
+  [ -n "$tag" ] || fail "the latest release for $repo has no tag"
   version=$(printf '%s' "$tag" | sed 's/^v//')
 fi
 
 target="${arch}-${os}"
 asset="${binary}-${version}-${target}.tar.gz"
-url="https://github.com/${repo}/releases/download/v${version}/${asset}"
 install_dir="${ZUNO_INSTALL_DIR:-$HOME/.local/bin}"
 tmp=$(mktemp -d 2>/dev/null || mktemp -d -t zuno)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
 say "Installing Zuno v${version} for ${target}..."
-download "$url" "$tmp/$asset" || fail "download failed: $url"
+gh release download "v${version}" --repo "$repo" --pattern "$asset" --dir "$tmp" \
+  || fail "download failed: ${repo} v${version} asset ${asset}"
 tar -xzf "$tmp/$asset" -C "$tmp" || fail "could not extract $asset"
 [ -f "$tmp/$binary" ] || fail "$asset does not contain $binary"
 
