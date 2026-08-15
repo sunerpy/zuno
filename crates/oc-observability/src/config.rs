@@ -167,10 +167,10 @@ impl Rotation {
 pub struct LogConfig {
     /// The directory rolling log files are written to.
     ///
-    /// This is a parameter rather than a call to `oc_paths::log()` because
-    /// `oc-paths` does not expose `log()` yet. Once it does, the CLI passes
-    /// `oc_paths::log()` here; the oracle's value is
-    /// `$XDG_DATA_HOME/opencode/log` (`packages/core/src/global.ts:11,23`).
+    /// This is a parameter rather than an implicit path lookup. The CLI passes
+    /// `oc_paths::log()` here, which resolves `$XDG_DATA_HOME/zuno/log`; the
+    /// upstream-only value is `$XDG_DATA_HOME/opencode/log`
+    /// (`packages/core/src/global.ts:11,23`).
     pub dir: PathBuf,
 
     /// The minimum level, or `None` to read [`ENV_LOG_LEVEL`].

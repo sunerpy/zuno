@@ -59,7 +59,7 @@ pub enum Scope {
     /// Cross-project agent notes at `$CONFIG/memory/MEMORY.md`, capped at 2200
     /// characters.
     Global,
-    /// This repository's rules at `<worktree>/.opencode/RULES.md`, capped at 3000
+    /// This repository's rules at `<worktree>/.zuno/RULES.md`, capped at 3000
     /// characters.
     Project,
 }

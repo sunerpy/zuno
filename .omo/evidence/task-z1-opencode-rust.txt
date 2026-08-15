@@ -1,4 +1,4 @@
-PENDING — Z-1 implementation started 2026-08-14
+COMPLETE — Z-1 implemented and verified 2026-08-14
 
 SCOPE LOCK
 - Authoritative Z-1 lines 53-148 read in full: hard cut, Zuno-only paths, no migration/dual-read/fallback.
@@ -15,7 +15,7 @@ ENVIRONMENT ABI RE-MEASUREMENT (2026-08-14)
 - Project inventory command: `grep -rhoE '\bOPENCODE_[A-Z0-9_]+' crates/ | sort -u`; result: 72 unique `OPENCODE_*` tokens.
 - Configured plugin declarations were read from `/config/.config/opencode/opencode.json` (the file contains comments, so `jq` was not applicable). No configuration values or credentials were copied into this evidence.
 - Exact resolved bundles inspected under `/config/.cache/opencode/packages/`: `opencode-antigravity-auth@1.6.0`, `@sunerpy/opencode-kiro-auth@0.20.6`, and `@sunerpy/oh-my-openagent@4.21.0`.
-- Bundle inventory command shape: `grep -rhoE '\bOPENCODE_[A-Z0-9_]+' <exact-bundle>/dist | sort -u`; antigravity contained 7 names, Kiro 0, and OMO 25; bundle union: 30 unique names.
+- Unfiltered bundle inventory command shape: `grep -rhoE '\bOPENCODE_[A-Z0-9_]+' <exact-bundle>/dist | sort -u`; Antigravity contained 18 names, Kiro 0, and OMO 25; the unfiltered union contained 41 unique names. The later 7/30 figures are the filtered host-contract view after excluding 11 plugin-owned `OPENCODE_ANTIGRAVITY_*` names.
 - The unversioned `/config/.cache/opencode/node_modules/oh-my-openagent` tree is stale version 4.9.2 and was excluded from the ABI decision.
 - Project/plugin intersection: 6 names — `OPENCODE_CLIENT`, `OPENCODE_CONFIG_CONTENT`, `OPENCODE_CONFIG_DIR`, `OPENCODE_DISABLE_CLAUDE_CODE`, `OPENCODE_SERVER_PASSWORD`, `OPENCODE_SERVER_USERNAME`.
 - Decision: preserve those six plugin-read names exactly; rename every other project-owned `OPENCODE_*` input/output to `ZUNO_*` without fallback, using one auditable mapping. `OPENCODE_CONFIG_DIR` remains accepted and overrides the new Zuno default directory.

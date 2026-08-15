@@ -357,7 +357,7 @@ pub fn document() -> Value {
     }
     json!({
         "openapi": "3.1.0",
-        "info": {"title": "opencode Rust API", "version": env!("CARGO_PKG_VERSION")},
+        "info": {"title": "Zuno API", "version": env!("CARGO_PKG_VERSION")},
         "paths": paths,
         "components": {
             "schemas": {

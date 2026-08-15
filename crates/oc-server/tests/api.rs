@@ -347,6 +347,11 @@ fn api_openapi_contains_every_owned_oracle_operation() {
 }
 
 #[test]
+fn api_openapi_presents_zunos_identity() {
+    assert_eq!(api::openapi()["info"]["title"], "Zuno API");
+}
+
+#[test]
 fn api_openapi_binds_every_body_with_an_existing_rust_schema() {
     let document = api::openapi();
     let request_ref = |path: &str, method: &str| {

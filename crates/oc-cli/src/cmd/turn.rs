@@ -949,7 +949,7 @@ fn describe_turn_failure(error: &TurnError, credential: Option<&str>) -> String 
     if let TurnError::Provider(ProviderError::Auth { provider, .. }) = error {
         message.push_str(&format!(
             "; set `provider.{provider}.options.apiKey`, or run \
-             `opencode auth login {provider}`"
+             `zuno auth login {provider}`"
         ));
     }
     without_credential(message, credential)

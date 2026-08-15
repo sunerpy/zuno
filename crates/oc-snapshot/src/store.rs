@@ -5,7 +5,7 @@
 //! it are addressed by tree hash. That is why [`crate::refcount`] exists at all —
 //! a store may only be deleted once no surviving session references it.
 //!
-//! # Observed path contract
+//! # Upstream-only observed path contract
 //!
 //! Verified by running the real binary (`opencode 1.18.12`,
 //! `debug snapshot track`) under a temporary `XDG_DATA_HOME`:
@@ -14,7 +14,9 @@
 //! $XDG_DATA_HOME/opencode/snapshot/<projectID>/<sha1(worktree path string)>
 //! ```
 //!
-//! with `projectID` resolved by `oc_paths::project::resolve_project` and the
+//! Zuno keeps the structure but places it under its independent
+//! `$XDG_DATA_HOME/zuno/snapshot` root. In both cases `projectID` is resolved by
+//! `oc_paths::project::resolve_project` and the
 //! second component `sha1::hex` of the worktree's absolute path *string* — not
 //! normalized, not canonicalized, no trailing-slash handling. `oc-paths` already
 //! implements both halves as [`oc_paths::Layout::snapshot_store`], so this crate

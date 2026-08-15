@@ -65,8 +65,9 @@ The resulting precedence is therefore **MCP > plugin > config-directory > builti
 property reassignment retains the key's original insertion position, so the compatible Rust
 projection must keep one entry at the first occurrence's position while replacing its implementation
 with the last source's tool. The Rust assembly chokepoint before this fix is
-`crates/oc-tools/src/registry.rs:267-287`: it appends all four sources to a `Vec` without keyed
-replacement, allowing duplicate provider-facing ids through.
+`crates/oc-tools/src/registry.rs:267-287` at pre-fix commit `24b64510`: it appends all four sources
+to a `Vec` without keyed replacement, allowing duplicate provider-facing ids through. Those line
+numbers do not describe HEAD after the fix and therefore always carry that revision.
 
 **Leg 2 — behaviour at 1.18.18, confirmed empirically rather than from source.** The installed
 `1.18.18` binary runs the identical plugin configuration successfully:

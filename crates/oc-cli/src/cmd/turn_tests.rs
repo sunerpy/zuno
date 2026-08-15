@@ -2288,7 +2288,7 @@ fn a_rejected_credential_is_scrubbed_from_the_body_that_echoed_it() {
         "the key was dropped without a trace, so the message reads as if the gateway \
          said nothing: {rendered}"
     );
-    for needle in ["provider.test.options.apiKey", "auth login test"] {
+    for needle in ["provider.test.options.apiKey", "zuno auth login test"] {
         assert!(
             rendered.contains(needle),
             "scrubbing cost the advice `{needle}`: {rendered}"

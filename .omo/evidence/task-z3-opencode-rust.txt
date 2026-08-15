@@ -1,4 +1,4 @@
-PENDING — Z-3 file-side implementation started 2026-08-14.
+COMPLETE — Z-3 file-side implementation and verification completed 2026-08-14.
 
 BASELINE
 - Worktree: task-z3 at 0f63d931718a7412baa72ca0ba6844a6e18cce40; clean except this evidence file.

@@ -56,11 +56,12 @@
 //!
 //! # The log directory
 //!
-//! [`LogConfig::dir`] is a parameter rather than a call to `oc_paths::log()`,
-//! because `oc-paths` does not expose `log()` yet. The value the CLI must pass is
-//! the oracle's, `$XDG_DATA_HOME/opencode/log`
-//! (`packages/core/src/global.ts:11,23`). Resolving XDG here instead would create a
-//! second, drifting copy of a layout that has exactly one owner.
+//! [`LogConfig::dir`] is a parameter rather than a call to `oc_paths::log()` so
+//! this crate does not resolve process-global paths itself. The CLI passes Zuno's
+//! `$XDG_DATA_HOME/zuno/log`; the corresponding upstream-only artefact is
+//! `$XDG_DATA_HOME/opencode/log` (`packages/core/src/global.ts:11,23`). Resolving
+//! XDG here instead would create a second, drifting copy of a layout that has
+//! exactly one owner.
 //!
 //! # Anti-patterns this crate exists to avoid
 //!

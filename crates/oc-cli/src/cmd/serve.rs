@@ -268,10 +268,7 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
                 Arc::clone(plugins) as Arc<dyn oc_server::ProviderOAuthBackend>
             );
         }
-        println!(
-            "opencode server listening on http://{}",
-            server.local_addr()
-        );
+        println!("{}", server_readiness_message(server.local_addr()));
         std::io::stdout()
             .flush()
             .map_err(|error| error.to_string())?;
@@ -281,4 +278,22 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
         }
         result
     })
+}
+
+fn server_readiness_message(address: std::net::SocketAddr) -> String {
+    format!("Zuno server listening on http://{address}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::server_readiness_message;
+
+    #[test]
+    fn readiness_message_presents_zunos_identity() {
+        let address = "127.0.0.1:4096".parse().expect("valid fixture address");
+        assert_eq!(
+            server_readiness_message(address),
+            "Zuno server listening on http://127.0.0.1:4096"
+        );
+    }
 }

@@ -54,8 +54,9 @@ const initialized = await connection.initialize({
 assert.equal(initialized.protocolVersion, 1)
 assert.equal(initialized.agentCapabilities.loadSession, true)
 assert.deepEqual(initialized.agentCapabilities.sessionCapabilities.close, {})
+assert.equal(initialized.authMethods[0].id, "zuno-login")
 
-await connection.authenticate({ methodId: "opencode-login" })
+await connection.authenticate({ methodId: initialized.authMethods[0].id })
 const created = await connection.newSession({ cwd: process.cwd(), mcpServers: [] })
 assert.equal(typeof created.sessionId, "string")
 await connection.listSessions({ cwd: process.cwd() })

@@ -25,12 +25,20 @@ CLOSED — Z-2 verified 2026-08-14; command alias remains an explicit user decis
 - Recommendation: do **not** add an `opencode` alias. The project is unreleased and Z-1 deliberately made a hard cut; an alias would also shadow the installed TypeScript oracle used for differential testing and side-by-side operation. If the user values drop-in command replacement more than unambiguous coexistence, implement that later as an explicit packaging decision with a dedicated test.
 - Reasoning: aliasing cannot be expressed as a Clap subcommand alias because it is the executable name; it requires shipping a second binary, symlink, or installer wrapper. That changes packaging and collision behavior, so it must not be inferred during a user-facing rename.
 
-## Final lowercase `opencode` source inventory
-- Command: `grep -rn "opencode" crates/*/src/`; raw output: `/tmp/opencode/z2/opencode-inventory.after.txt`; classified file inventory: `/tmp/opencode/z2/opencode-inventory.classified.txt`.
-- Total: 868 matching lines across 173 source files, containing 962 lowercase occurrences in line bodies. Every line was assigned to exactly one permitted class; there is no fourth/unclassified class.
-- Upstream/oracle compatibility: 759 lines, 166 files, 840 occurrences. Inventory covers captured upstream names and wire literals (`opencode.json`, schema URLs, database filenames, model endpoints, API/TUI compatibility names), oracle commands/fixtures, and comments that identify the upstream behavior being ported. These remain because Zuno's compatibility contract is still measured against OpenCode.
-- Plugin compatibility: 62 lines, 26 files, 75 occurrences. Inventory covers the six documented `OPENCODE_*` plugin ABI variables, npm/plugin metadata including `engines.opencode`, the embedded `customize-opencode` compatibility skill, JavaScript host/shim/spec surfaces, and `compatible-opencode/1.18.13` in the non-masquerading Zuno user agent. These remain because installed JavaScript plugins consume them.
-- Historical references: 47 lines, 20 files, 47 occurrences. Inventory covers immutable `.omo/plans/opencode-rust.md`, `.omo/drafts/opencode-rust.md`, `.omo/notepads/opencode-rust/*`, `.omo/evidence/task-*-opencode-rust.txt`, repository/remote normalization examples, and historical oracle measurements. Renaming these would break links, evidence provenance, or move repository identity into Z-2.
+## Final lowercase `opencode` source inventory (corrected and superseded by task R3)
+- The original independent count at the Z-2 tree was 949 lowercase occurrences, not 962. The
+  `/tmp/opencode/z2/opencode-inventory.classified.txt` cited here was temporary and is gone, so its
+  exact per-class split was not reproducible and is withdrawn.
+- After R3 removed six Zuno-owned identity occurrences, the re-derived tree has 943 occurrences on
+  863 matching lines across 169 source files.
+- The committed generator `.omo/evidence/task-r3-opencode-inventory-generator.py` writes the
+  one-row-per-occurrence mapping `.omo/evidence/task-r3-opencode-inventory.tsv`. Its final split is
+  824 upstream artefact/reference, 67 plugin ABI, and 52 historical citation occurrences; 943 are
+  classified and 0 are unclassified. The mapping records path, line, column, class, reason, source
+  text, and a SHA-256 of the classified source snapshot.
+- The plugin class remains because installed JavaScript plugins consume that ABI. The upstream and
+  historical classes describe artefacts or evidence; they are not Zuno presentation identity and
+  do not restore cross-binary compatibility as a product goal.
 
 ## Release build and real turn
 - `CARGO_TARGET_DIR=/tmp/opencode/z2 cargo build -p oc-cli --bin zuno --release` passed and produced `/tmp/opencode/z2/release/zuno`.
