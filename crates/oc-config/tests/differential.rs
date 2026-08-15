@@ -384,6 +384,7 @@ fn merged_config_matches_real_opencode_across_the_full_matrix() -> Result<(), Bo
     let mut failures = Vec::new();
     for case in cases {
         let rust_options = options(case.fixture.env());
+        let rust = discover_with(&rust_options)?;
         let oracle = Oracle::discover()?.with_env(case.fixture.into_env());
         let outcome = oracle.run(case.oracle_args.iter().copied())?;
         if !outcome.is_success() {
@@ -395,7 +396,6 @@ fn merged_config_matches_real_opencode_across_the_full_matrix() -> Result<(), Bo
             continue;
         }
 
-        let rust = discover_with(&rust_options)?;
         let oracle_json = canonical_debug_config(&outcome.stdout, Path::new("oracle-debug.json"))?;
         let rust_json = format!("{}\n", serde_json::to_string_pretty(&rust)?);
         let report = diff_normalized(
@@ -578,11 +578,11 @@ fn permission_env_object_key_order_matches_raw_oracle() -> Result<(), Box<dyn Er
 
     for (name, fixture, expected_outer, expected_nested) in cases {
         let rust_options = options(fixture.env());
+        let rust = discover_with(&rust_options)?;
         let oracle = Oracle::discover()?.with_env(fixture.into_env());
         let outcome = oracle.run(["debug", "config"])?;
         assert!(outcome.is_success(), "{name}: {}", outcome.render());
 
-        let rust = discover_with(&rust_options)?;
         let oracle_json = canonical_debug_config(&outcome.stdout, Path::new("oracle-debug.json"))?;
         let rust_json = format!("{}\n", serde_json::to_string_pretty(&rust)?);
         let report = diff_normalized(

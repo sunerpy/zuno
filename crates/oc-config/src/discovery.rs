@@ -29,6 +29,7 @@ const OPENCODE_DISABLE_AUTOCOMPACT: &str = "OPENCODE_DISABLE_AUTOCOMPACT";
 const OPENCODE_DISABLE_PRUNE: &str = "OPENCODE_DISABLE_PRUNE";
 const OPENCODE_TEST_MANAGED_CONFIG_DIR: &str = "OPENCODE_TEST_MANAGED_CONFIG_DIR";
 const MERGED_CONFIG_SOURCE: &str = "<merged config>";
+const GLOBAL_CONFIG_NAMES: [&str; 3] = ["opencode.jsonc", "opencode.json", "config.json"];
 
 /// A decoded macOS managed-preferences document and the plist it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,7 +164,7 @@ pub fn discover(directory: &Path, worktree: Option<&Path>) -> Result<Config, Con
 /// Returns [`ConfigError`] for the first existing layer that cannot be read,
 /// parsed, or validated.
 pub fn discover_with(options: &DiscoveryOptions) -> Result<Config, ConfigError> {
-    ensure_default_global_config(options);
+    ensure_default_global_config(options)?;
     let mut result = RawJson::empty_object();
 
     // config.ts:258-260. The compatibility contract treats each file as a layer,
@@ -279,7 +280,7 @@ pub fn json_error_byte_offset(text: &str, error: &serde_json::Error) -> usize {
         .min(text.len())
 }
 
-fn ensure_default_global_config(options: &DiscoveryOptions) {
+fn ensure_default_global_config(options: &DiscoveryOptions) -> Result<(), ConfigError> {
     if [
         OPENCODE_CONFIG,
         oc_paths::env::OPENCODE_CONFIG_DIR,
@@ -288,19 +289,61 @@ fn ensure_default_global_config(options: &DiscoveryOptions) {
     .iter()
     .any(|key| options.env.truthy_value(key).is_some())
     {
-        return;
+        return Ok(());
     }
 
-    let candidates = ["opencode.jsonc", "opencode.json", "config.json"]
-        .map(|name| options.layout.config().join(name));
+    let candidates = GLOBAL_CONFIG_NAMES.map(|name| options.layout.config().join(name));
     if candidates.iter().any(|path| path.exists()) {
-        return;
+        return Ok(());
     }
+
+    let legacy_config_root = sibling_product_root(options.layout.config(), "opencode");
+    if let Some(old_path) = GLOBAL_CONFIG_NAMES
+        .iter()
+        .map(|name| legacy_config_root.join(name))
+        .find(|path| path.exists())
+    {
+        let new_path = options.layout.config().join(
+            old_path
+                .file_name()
+                .expect("a config candidate always has a filename"),
+        );
+        return Err(ConfigError::LegacyConfig {
+            copy_command: legacy_copy_command(options, &old_path, &new_path),
+            old_path,
+            new_path,
+        });
+    }
+
     let path = &candidates[0];
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
     let _ = fs::write(path, format!("{{\n  \"$schema\": \"{DEFAULT_SCHEMA}\"\n}}"));
+    Ok(())
+}
+
+fn sibling_product_root(root: &Path, product: &str) -> PathBuf {
+    root.parent()
+        .map_or_else(|| PathBuf::from(product), |parent| parent.join(product))
+}
+
+fn legacy_copy_command(options: &DiscoveryOptions, old_config: &Path, new_config: &Path) -> String {
+    let old_data = sibling_product_root(options.layout.data(), "opencode").join("auth.json");
+    let new_data = options.layout.data().join("auth.json");
+    format!(
+        "install -d -m 700 {} {} && install -m 600 {} {} && install -m 600 {} {}",
+        shell_quote(options.layout.config()),
+        shell_quote(options.layout.data()),
+        shell_quote(old_config),
+        shell_quote(new_config),
+        shell_quote(&old_data),
+        shell_quote(&new_data),
+    )
+}
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
 }
 
 fn merge_file(result: &mut RawJson, path: &Path) -> Result<(), ConfigError> {

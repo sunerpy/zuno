@@ -89,6 +89,16 @@ pub enum ConfigError {
     /// A remote config source needs credentials that are not available.
     #[error("remote config {url} on {remote} requires authentication")]
     RemoteAuth { url: String, remote: String },
+
+    /// A config remains at the pre-Zuno path while the new config root is empty.
+    #[error(
+        "legacy config {old_path} was not loaded because Zuno uses {new_path}; copy it with: {copy_command}"
+    )]
+    LegacyConfig {
+        old_path: PathBuf,
+        new_path: PathBuf,
+        copy_command: String,
+    },
 }
 
 impl ConfigError {
@@ -131,7 +141,8 @@ impl Recoverable for ConfigError {
             | Self::Invalid { .. }
             | Self::Frontmatter { .. }
             | Self::DirectoryTypo { .. }
-            | Self::RemoteAuth { .. } => Recovery::Fail,
+            | Self::RemoteAuth { .. }
+            | Self::LegacyConfig { .. } => Recovery::Fail,
         }
     }
 }
@@ -261,6 +272,11 @@ mod tests {
             ConfigError::RemoteAuth {
                 url: "https://example.invalid/c.json".to_owned(),
                 remote: "origin".to_owned(),
+            },
+            ConfigError::LegacyConfig {
+                old_path: PathBuf::from("old/opencode.json"),
+                new_path: PathBuf::from("new/opencode.json"),
+                copy_command: "install old new".to_owned(),
             },
         ];
         for e in &errors {
