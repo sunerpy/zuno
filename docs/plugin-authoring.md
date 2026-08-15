@@ -31,6 +31,21 @@ with options handed to the plugin at load time.
 Beyond the config array, Zuno scans every configuration directory for `plugin/*.{ts,js}` and `plugins/*.{ts,js}`. The directory chain is `$XDG_CONFIG_HOME/zuno`, project `.zuno` directories, `$HOME/.zuno`, then `OPENCODE_CONFIG_DIR`; files are sorted within `plugin/` and then `plugins/`. `OPENCODE_CONFIG_DIR` deliberately keeps its upstream spelling because installed npm plugins consume it as one of the six retained plugin-ABI environment names. Provenance is retained (`oc_plugin::PluginOrigin`), successful discovery is visible at `DEBUG`, and scan or load failures are warnings that name the affected directory or plugin.
 <!-- generated:END plugin-config-paths -->
 
+### Tool name collisions
+
+<!-- generated:BEGIN tool-source-precedence -->
+The registry assembles sources in increasing precedence order. If tool ids collide, the later source replaces the earlier implementation in its existing provider-visible position and emits a suppression diagnostic naming both sources.
+
+| order | source |
+|---:|---|
+| 1 | `built-in` |
+| 2 | `config-directory` |
+| 3 | `plugin` |
+| 4 | `MCP` |
+
+Highest-to-lowest winner precedence: `MCP > plugin > config-directory > built-in`.
+<!-- generated:END tool-source-precedence -->
+
 An npm plugin may declare its supported host range in
 `package.json.engines.opencode`. The production loader checks that range against
 the pinned compatibility baseline before importing the module: an excluding or

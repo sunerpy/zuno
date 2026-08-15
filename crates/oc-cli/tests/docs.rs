@@ -610,7 +610,10 @@ fn known_gaps_block(
         .expect("the channel-dependent database gap must remain documented");
     assert_eq!(
         channel_gap.surface,
-        format!("$XDG_DATA_HOME/{}/opencode-<channel>.db", oc_paths::APP),
+        format!(
+            "$XDG_DATA_HOME/{app}/{app}-<channel>.db",
+            app = oc_paths::APP
+        ),
         "the channel database documentation must derive Zuno's data root from oc_paths::APP"
     );
     for (index, gap) in known_gaps.iter().enumerate() {
@@ -999,6 +1002,28 @@ failures are warnings that name the affected directory or plugin.",
     )
 }
 
+fn tool_source_precedence_block() -> String {
+    use oc_tools::registry::TOOL_SOURCE_PRECEDENCE;
+
+    let mut out = String::from(
+        "The registry assembles sources in increasing precedence order. If tool ids collide, the \
+later source replaces the earlier implementation in its existing provider-visible position and \
+emits a suppression diagnostic naming both sources.\n\n\
+| order | source |\n|---:|---|\n",
+    );
+    for (index, source) in TOOL_SOURCE_PRECEDENCE.iter().enumerate() {
+        let _ = writeln!(out, "| {} | `{source}` |", index + 1);
+    }
+    let winners = TOOL_SOURCE_PRECEDENCE
+        .iter()
+        .rev()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" > ");
+    let _ = write!(out, "\nHighest-to-lowest winner precedence: `{winners}`.");
+    out
+}
+
 #[test]
 fn docs_plugin_guide_matches_the_hooks_and_the_example_the_host_ships() {
     check_block(
@@ -1010,6 +1035,11 @@ fn docs_plugin_guide_matches_the_hooks_and_the_example_the_host_ships() {
         "docs/plugin-authoring.md",
         "plugin-hooks",
         &plugin_hook_block(),
+    );
+    check_block(
+        "docs/plugin-authoring.md",
+        "tool-source-precedence",
+        &tool_source_precedence_block(),
     );
     contains_all(
         "docs/plugin-authoring.md",
@@ -1095,7 +1125,10 @@ fn docs_migration_guide_lists_every_migration_in_execution_order() {
             &format!("{} migrations", oc_db::migration::MIGRATION_IDS.len()),
             "ZUNO_DB",
             "ZUNO_DISABLE_CHANNEL_DB",
-            "opencode-local.db",
+            oc_paths::DEFAULT_DB_FILE,
+            &format!("{}-local.db", oc_paths::APP),
+            oc_paths::LEGACY_DB_FILE,
+            "does not import an opencode database",
         ],
     );
 }

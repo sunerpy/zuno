@@ -8,7 +8,8 @@ use oc_tools::SearchConfig;
 use oc_tools::exposure::ExposureFlags;
 use oc_tools::registry::{
     BuiltinSlot, CustomTool, CustomToolLoader, McpToolLoader, RegistryError, RegistryFlags,
-    ResolveInput, ToolRegistry, ToolRegistryBuilder, ToolSource, config_tool_id,
+    ResolveInput, TOOL_SOURCE_PRECEDENCE, ToolRegistry, ToolRegistryBuilder, ToolSource,
+    config_tool_id,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -259,6 +260,16 @@ impl McpToolLoader for CollidingMcpLoader {
 
 #[test]
 fn registry_de_duplicates_cross_source_names_with_upstreams_last_source_winning() {
+    assert_eq!(
+        TOOL_SOURCE_PRECEDENCE,
+        [
+            ToolSource::Builtin,
+            ToolSource::ConfigDirectory,
+            ToolSource::Plugin,
+            ToolSource::Mcp,
+        ],
+        "the exported low-to-high precedence contract must stay pinned"
+    );
     let root = TempDir::new().expect("temporary workspace");
     let files = FileTools::new(root.path()).expect("create file tools");
     let mut builder = ToolRegistryBuilder::new(

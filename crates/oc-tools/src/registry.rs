@@ -30,6 +30,17 @@ pub enum ToolSource {
     Mcp,
 }
 
+/// Tool sources in assembly order, from lowest to highest precedence.
+///
+/// Registry assembly and generated plugin-authoring documentation both consume
+/// this constant. A later source replaces an earlier same-named tool in place.
+pub const TOOL_SOURCE_PRECEDENCE: [ToolSource; 4] = [
+    ToolSource::Builtin,
+    ToolSource::ConfigDirectory,
+    ToolSource::Plugin,
+    ToolSource::Mcp,
+];
+
 impl std::fmt::Display for ToolSource {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
@@ -313,58 +324,64 @@ impl ToolRegistryBuilder {
     pub fn build(self) -> ToolRegistry {
         let config_directories =
             oc_paths::config_directories(&self.directory, self.worktree.as_deref());
-        let output_store = ToolOutputStore::new(self.directory.join(".opencode/tool-output"));
+        let output_store = ToolOutputStore::new(self.directory.join(".zuno/tool-output"));
         let mut diagnostics = Vec::new();
         let core = Arc::new_cyclic(|weak| {
             let mut sourced_tools = Vec::new();
-            for slot in BUILTIN_ORDER {
-                if !slot.exposed_by_flags(&self.flags) {
-                    continue;
-                }
-                if let Some(tool) = self.builtins.get(&slot) {
-                    insert_tool(
+            for source in TOOL_SOURCE_PRECEDENCE {
+                match source {
+                    ToolSource::Builtin => {
+                        for slot in BUILTIN_ORDER {
+                            if !slot.exposed_by_flags(&self.flags) {
+                                continue;
+                            }
+                            if let Some(tool) = self.builtins.get(&slot) {
+                                insert_tool(
+                                    &mut sourced_tools,
+                                    &mut diagnostics,
+                                    Arc::clone(tool),
+                                    source,
+                                );
+                            } else if slot == BuiltinSlot::Execute {
+                                insert_tool(
+                                    &mut sourced_tools,
+                                    &mut diagnostics,
+                                    erase(ExecuteTool::new(
+                                        RegistryHandle::new(weak.clone()),
+                                        output_store.clone(),
+                                    )),
+                                    source,
+                                );
+                            }
+                        }
+                        insert_tools(
+                            &mut sourced_tools,
+                            &mut diagnostics,
+                            self.configured_builtins.iter().cloned(),
+                            source,
+                        );
+                    }
+                    ToolSource::ConfigDirectory => insert_tools(
                         &mut sourced_tools,
                         &mut diagnostics,
-                        Arc::clone(tool),
-                        ToolSource::Builtin,
-                    );
-                } else if slot == BuiltinSlot::Execute {
-                    insert_tool(
+                        self.custom_loader
+                            .config_directory_tools(&config_directories),
+                        source,
+                    ),
+                    ToolSource::Plugin => insert_tools(
                         &mut sourced_tools,
                         &mut diagnostics,
-                        erase(ExecuteTool::new(
-                            RegistryHandle::new(weak.clone()),
-                            output_store.clone(),
-                        )),
-                        ToolSource::Builtin,
-                    );
+                        self.custom_loader.plugin_tools(),
+                        source,
+                    ),
+                    ToolSource::Mcp => insert_tools(
+                        &mut sourced_tools,
+                        &mut diagnostics,
+                        self.mcp_loader.tools(),
+                        source,
+                    ),
                 }
             }
-            insert_tools(
-                &mut sourced_tools,
-                &mut diagnostics,
-                self.configured_builtins.iter().cloned(),
-                ToolSource::Builtin,
-            );
-            insert_tools(
-                &mut sourced_tools,
-                &mut diagnostics,
-                self.custom_loader
-                    .config_directory_tools(&config_directories),
-                ToolSource::ConfigDirectory,
-            );
-            insert_tools(
-                &mut sourced_tools,
-                &mut diagnostics,
-                self.custom_loader.plugin_tools(),
-                ToolSource::Plugin,
-            );
-            insert_tools(
-                &mut sourced_tools,
-                &mut diagnostics,
-                self.mcp_loader.tools(),
-                ToolSource::Mcp,
-            );
             let tools = sourced_tools
                 .into_iter()
                 .map(|(tool, _source)| tool)
