@@ -1179,34 +1179,28 @@ fn committed_smoke_cassette_matches_the_oracle_recording() {
         ours.len()
     );
 
-    match oc_testkit::recordings_root() {
-        Ok(root) => {
-            let theirs_path = root.join(format!("{SMOKE_CASSETTE}.json"));
-            let theirs = std::fs::read(&theirs_path)
-                .unwrap_or_else(|e| panic!("read {}: {e}", theirs_path.display()));
-            assert_eq!(
-                ours,
-                theirs,
-                "the committed smoke cassette has drifted from the oracle recording.\n\
-                 committed: {} ({} bytes)\n\
-                 oracle:    {} ({} bytes)\n\
-                 Re-copy it verbatim and update the SHA-256 in \
-                 packaging/smoke/cassettes/PROVENANCE.md.",
-                committed.display(),
-                ours.len(),
-                theirs_path.display(),
-                theirs.len()
-            );
-        }
-        Err(reason) => {
-            println!(
-                "SKIP committed_smoke_cassette_matches_the_oracle_recording: no oracle \
-                 recordings tree is reachable ({reason}). The committed copy at {} was \
-                 checked for shape only.",
-                committed.display()
-            );
-        }
-    }
+    let Some(root) = oc_testkit::recordings_root_or_skip(
+        "committed_smoke_cassette_matches_the_oracle_recording",
+        "the committed copy was checked for shape only, not byte parity",
+    ) else {
+        return;
+    };
+    let theirs_path = root.join(format!("{SMOKE_CASSETTE}.json"));
+    let theirs = std::fs::read(&theirs_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", theirs_path.display()));
+    assert_eq!(
+        ours,
+        theirs,
+        "the committed smoke cassette has drifted from the oracle recording.\n\
+         committed: {} ({} bytes)\n\
+         oracle:    {} ({} bytes)\n\
+         Re-copy it verbatim and update the SHA-256 in \
+         packaging/smoke/cassettes/PROVENANCE.md.",
+        committed.display(),
+        ours.len(),
+        theirs_path.display(),
+        theirs.len()
+    );
 }
 
 /// The committed cassette must be a real recording end to end: version 1, two HTTP

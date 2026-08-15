@@ -151,6 +151,14 @@ async fn the_released_binary_lists_a_session_this_port_wrote() {
     ) else {
         return;
     };
+    if oc_testkit::recordings_root_or_skip(
+        "the_released_binary_lists_a_session_this_port_wrote",
+        "the recorded turn needed by the rollback seam was NOT tested",
+    )
+    .is_none()
+    {
+        return;
+    }
 
     let env = ScriptedEnv::new().expect("isolated environment");
     let database = env.xdg_data().join("zuno").join("rollback.db");

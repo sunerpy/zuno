@@ -12,6 +12,11 @@ use oc_provider_google::{
 use oc_testkit::{CassettePlayer, RequestSnapshot};
 use serde_json::{Value, json};
 
+fn recordings_available(test: &str) -> bool {
+    oc_testkit::recordings_root_or_skip(test, "Google provider cassette replay was NOT tested")
+        .is_some()
+}
+
 fn text(role: Role, value: &str) -> Message {
     Message::new(role, value)
 }
@@ -84,6 +89,9 @@ fn token_budget_capability_uses_the_resolver_budget_shape() {
 
 #[test]
 fn gemini_request_and_stream_replay_the_real_tool_call_cassette() {
+    if !recordings_available("gemini_request_and_stream_replay_the_real_tool_call_cassette") {
+        return;
+    }
     let provider = GoogleGenerativeAi::new("test-api-key", gemini_tool_options())
         .expect("provider configuration");
     let request = CompletionRequest::new(
@@ -125,6 +133,11 @@ fn gemini_request_and_stream_replay_the_real_tool_call_cassette() {
 
 #[test]
 fn captured_tool_thought_signature_is_replayed_byte_identically_next_turn() {
+    if !recordings_available(
+        "captured_tool_thought_signature_is_replayed_byte_identically_next_turn",
+    ) {
+        return;
+    }
     let mut cassette = CassettePlayer::from_oracle("gemini/streams-tool-call")
         .expect("real Gemini cassette exists");
     let response = cassette
@@ -295,6 +308,11 @@ fn service_account_json_is_supported_without_leaking_private_material() {
 
 #[test]
 fn vertex_anthropic_uses_anthropic_shape_and_replays_real_anthropic_wire_events() {
+    if !recordings_available(
+        "vertex_anthropic_uses_anthropic_shape_and_replays_real_anthropic_wire_events",
+    ) {
+        return;
+    }
     let provider = VertexAnthropic::new(
         "project-a",
         "us",

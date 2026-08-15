@@ -692,6 +692,14 @@ fn assistant_text(database: &Path) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_prompt_matches_cli_output_and_persisted_rows_on_the_same_cassette() {
+    if oc_testkit::recordings_root_or_skip(
+        "http_prompt_matches_cli_output_and_persisted_rows_on_the_same_cassette",
+        "CLI/HTTP cassette parity was NOT tested",
+    )
+    .is_none()
+    {
+        return;
+    }
     let env = ScriptedEnv::new()
         .expect("isolated environment")
         .with_db(DbChoice::Default);
@@ -774,6 +782,14 @@ async fn http_prompt_matches_cli_output_and_persisted_rows_on_the_same_cassette(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_client_reads_one_prompt_answer_from_message_history_and_preopened_session_sse() {
+    if oc_testkit::recordings_root_or_skip(
+        "http_client_reads_one_prompt_answer_from_message_history_and_preopened_session_sse",
+        "recorded HTTP readback was NOT tested",
+    )
+    .is_none()
+    {
+        return;
+    }
     let env = ScriptedEnv::new()
         .expect("isolated environment")
         .with_db(DbChoice::Default);
@@ -859,6 +875,14 @@ async fn http_client_reads_one_prompt_answer_from_message_history_and_preopened_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn global_http_event_stream_carries_the_http_driven_turn_after_server_connected() {
+    if oc_testkit::recordings_root_or_skip(
+        "global_http_event_stream_carries_the_http_driven_turn_after_server_connected",
+        "recorded global event delivery was NOT tested",
+    )
+    .is_none()
+    {
+        return;
+    }
     let env = ScriptedEnv::new()
         .expect("isolated environment")
         .with_db(DbChoice::Default);
@@ -914,6 +938,14 @@ async fn global_http_event_stream_carries_the_http_driven_turn_after_server_conn
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failing_tool_definition_hook_is_disabled_and_http_turn_completes_with_a_diagnostic() {
+    if oc_testkit::recordings_root_or_skip(
+        "failing_tool_definition_hook_is_disabled_and_http_turn_completes_with_a_diagnostic",
+        "recorded HTTP plugin recovery was NOT tested",
+    )
+    .is_none()
+    {
+        return;
+    }
     let env = ScriptedEnv::new()
         .expect("isolated environment")
         .with_db(DbChoice::Default);
@@ -985,6 +1017,14 @@ async fn failing_tool_definition_hook_is_disabled_and_http_turn_completes_with_a
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn noop_tool_definition_hook_preserves_real_schemas_and_stays_enabled_over_http() {
+    if oc_testkit::recordings_root_or_skip(
+        "noop_tool_definition_hook_preserves_real_schemas_and_stays_enabled_over_http",
+        "recorded HTTP tool-schema parity was NOT tested",
+    )
+    .is_none()
+    {
+        return;
+    }
     let baseline_env = ScriptedEnv::new()
         .expect("isolated baseline environment")
         .with_db(DbChoice::Default);
@@ -1099,6 +1139,14 @@ async fn noop_tool_definition_hook_preserves_real_schemas_and_stays_enabled_over
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failing_auth_loader_is_disabled_and_http_turn_completes_with_a_diagnostic() {
+    if oc_testkit::recordings_root_or_skip(
+        "failing_auth_loader_is_disabled_and_http_turn_completes_with_a_diagnostic",
+        "recorded HTTP auth-loader recovery was NOT tested",
+    )
+    .is_none()
+    {
+        return;
+    }
     let env = ScriptedEnv::new()
         .expect("isolated environment")
         .with_db(DbChoice::Default);

@@ -442,6 +442,14 @@ where
         expected_body_key,
         expected_text,
     } = case;
+    if oc_testkit::recordings_root_or_skip(
+        &format!("replay_selected_production_spec[{provider_id}/{model_id}]"),
+        "the selected production provider spec was NOT replayed",
+    )
+    .is_none()
+    {
+        return;
+    }
     let scenario = oc_testkit::Scenario::new(provider_id)
         .on_path(endpoint_suffix)
         .from_oracle_cassette(cassette)

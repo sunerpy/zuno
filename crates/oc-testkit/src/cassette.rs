@@ -505,6 +505,45 @@ pub fn recordings_root() -> Result<PathBuf> {
     }
 }
 
+/// The oracle's recordings root, with the test-suite skip contract applied.
+///
+/// Automatic discovery may legitimately find no sibling source checkout on a
+/// clean build host. In that case this prints a visible `SKIPPED` line naming
+/// both the discovery failure and the behaviour that was not exercised, then
+/// returns `None`. Once [`crate::oracle::ENV_ORACLE_SOURCE`] is set, however,
+/// the operator has explicitly selected a source tree: an invalid path or a tree
+/// without [`RECORDINGS_SUBPATH`] remains a hard error.
+///
+/// # Panics
+///
+/// When an explicitly configured oracle source cannot provide the recordings root.
+#[must_use]
+pub fn recordings_root_or_skip(test: &str, untested: &str) -> Option<PathBuf> {
+    classify_recordings_root(
+        recordings_root(),
+        std::env::var_os(crate::oracle::ENV_ORACLE_SOURCE).is_some(),
+        test,
+        untested,
+    )
+    .unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn classify_recordings_root(
+    root: Result<PathBuf>,
+    explicitly_configured: bool,
+    test: &str,
+    untested: &str,
+) -> Result<Option<PathBuf>> {
+    match root {
+        Ok(root) => Ok(Some(root)),
+        Err(error) if !explicitly_configured => {
+            eprintln!("SKIPPED {test}: {error}; {untested}");
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Every cassette name under `root`, in sorted order.
 ///
 /// Names are returned in the `<route>/<file>` form [`CassettePlayer::load`] takes.
@@ -613,6 +652,43 @@ fn canonicalize(value: &serde_json::Value) -> serde_json::Value {
 mod tests {
     use super::*;
 
+    fn recordings_available(test: &str) -> bool {
+        recordings_root_or_skip(test, "cassette-backed behavior was NOT tested").is_some()
+    }
+
+    fn missing_recordings_error() -> TestkitError {
+        TestkitError::RecordingsRootNotFound {
+            searched: vec![PathBuf::from("/missing/opencode/recordings")],
+            remedy: "provide the pinned source checkout".to_owned(),
+        }
+    }
+
+    #[test]
+    fn automatically_missing_recordings_are_a_visible_skip() {
+        let root = classify_recordings_root(
+            Err(missing_recordings_error()),
+            false,
+            "automatic_missing",
+            "provider replay was NOT tested",
+        )
+        .expect("automatic discovery absence is skippable");
+
+        assert_eq!(root, None);
+    }
+
+    #[test]
+    fn explicitly_configured_missing_recordings_are_a_hard_error() {
+        let error = classify_recordings_root(
+            Err(missing_recordings_error()),
+            true,
+            "explicit_missing",
+            "provider replay was NOT tested",
+        )
+        .expect_err("an invalid explicit source must not be reported as a skip");
+
+        assert!(matches!(error, TestkitError::RecordingsRootNotFound { .. }));
+    }
+
     fn snapshot(body: &str) -> RequestSnapshot {
         RequestSnapshot {
             method: "POST".to_owned(),
@@ -632,7 +708,12 @@ mod tests {
 
     #[test]
     fn every_recorded_cassette_in_the_oracle_tree_parses() {
-        let root = recordings_root().expect("the oracle recordings root");
+        let Some(root) = recordings_root_or_skip(
+            "every_recorded_cassette_in_the_oracle_tree_parses",
+            "the complete cassette corpus was NOT parsed",
+        ) else {
+            return;
+        };
         let names = list_cassettes(&root).expect("list recordings");
         assert!(
             names.len() >= 40,
@@ -683,6 +764,9 @@ mod tests {
 
     #[test]
     fn a_real_anthropic_cassette_decodes_to_its_recorded_sse_frames() {
+        if !recordings_available("a_real_anthropic_cassette_decodes_to_its_recorded_sse_frames") {
+            return;
+        }
         let mut player = CassettePlayer::from_oracle("anthropic-messages/streams-text")
             .expect("the pinned corpus contains this recording");
         assert_eq!(player.remaining(), 1);
@@ -718,6 +802,9 @@ mod tests {
 
     #[test]
     fn a_real_bedrock_cassette_decodes_its_base64_eventstream() {
+        if !recordings_available("a_real_bedrock_cassette_decodes_its_base64_eventstream") {
+            return;
+        }
         let mut player = CassettePlayer::from_oracle("bedrock-converse/streams-text")
             .expect("the pinned corpus contains this recording");
         let interaction = player.next_unchecked().expect("one interaction");
@@ -746,6 +833,9 @@ mod tests {
 
     #[test]
     fn a_multi_interaction_cassette_replays_in_order() {
+        if !recordings_available("a_multi_interaction_cassette_replays_in_order") {
+            return;
+        }
         let mut player =
             CassettePlayer::from_oracle("anthropic-messages/claude-opus-4-7-drives-a-tool-loop")
                 .expect("the pinned corpus contains this recording");
@@ -768,6 +858,9 @@ mod tests {
 
     #[test]
     fn the_cursor_matches_a_request_and_advances() {
+        if !recordings_available("the_cursor_matches_a_request_and_advances") {
+            return;
+        }
         let mut player =
             CassettePlayer::from_oracle("anthropic-messages/streams-text").expect("recording");
         let recorded = player.peek().expect("one interaction").request.clone();
@@ -779,6 +872,9 @@ mod tests {
 
     #[test]
     fn a_differing_request_is_a_mismatch_and_the_cursor_holds() {
+        if !recordings_available("a_differing_request_is_a_mismatch_and_the_cursor_holds") {
+            return;
+        }
         let mut player =
             CassettePlayer::from_oracle("anthropic-messages/streams-text").expect("recording");
         let mut wrong = player.peek().expect("one interaction").request.clone();
@@ -799,6 +895,9 @@ mod tests {
 
     #[test]
     fn running_past_the_end_is_an_error_not_a_wrap_around() {
+        if !recordings_available("running_past_the_end_is_an_error_not_a_wrap_around") {
+            return;
+        }
         let mut player =
             CassettePlayer::from_oracle("anthropic-messages/streams-text").expect("recording");
         player.next_unchecked().expect("first");
@@ -818,6 +917,9 @@ mod tests {
 
     #[test]
     fn finishing_early_is_reported() {
+        if !recordings_available("finishing_early_is_reported") {
+            return;
+        }
         let player =
             CassettePlayer::from_oracle("anthropic-messages/claude-opus-4-7-drives-a-tool-loop")
                 .expect("recording");

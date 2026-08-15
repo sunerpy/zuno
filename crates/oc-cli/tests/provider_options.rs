@@ -237,7 +237,11 @@ async fn observed_authorization(
     keys: Keys,
     provider_options: serde_json::Map<String, serde_json::Value>,
     model_options: serde_json::Map<String, serde_json::Value>,
-) -> (Vec<Option<String>>, Vec<serde_json::Value>, Output) {
+) -> Option<(Vec<Option<String>>, Vec<serde_json::Value>, Output)> {
+    oc_testkit::recordings_root_or_skip(
+        "provider_options::observed_authorization",
+        "recorded provider option propagation was NOT tested",
+    )?;
     let env = ScriptedEnv::new().expect("isolated environment");
     let provider = mock().await;
     let base_url = format!("{}/v1", provider.base_url());
@@ -255,7 +259,7 @@ async fn observed_authorization(
         .iter()
         .map(|request| request.json().unwrap_or(serde_json::Value::Null))
         .collect();
-    (authorizations, bodies, output)
+    Some((authorizations, bodies, output))
 }
 
 fn no_options() -> serde_json::Map<String, serde_json::Value> {
@@ -273,8 +277,11 @@ async fn an_options_api_key_alone_reaches_the_authorization_header() {
         options: Some(OPTIONS_KEY),
         stored: None,
     };
-    let (authorizations, _, output) =
-        observed_authorization(keys, no_options(), no_options()).await;
+    let Some((authorizations, _, output)) =
+        observed_authorization(keys, no_options(), no_options()).await
+    else {
+        return;
+    };
 
     assert!(
         !authorizations.is_empty(),
@@ -305,8 +312,11 @@ async fn a_stored_credential_still_authenticates_when_no_option_names_a_key() {
         options: None,
         stored: Some(STORED_KEY),
     };
-    let (authorizations, _, output) =
-        observed_authorization(keys, no_options(), no_options()).await;
+    let Some((authorizations, _, output)) =
+        observed_authorization(keys, no_options(), no_options()).await
+    else {
+        return;
+    };
 
     assert!(
         !authorizations.is_empty(),
@@ -335,8 +345,11 @@ async fn an_options_api_key_wins_over_the_stored_credential() {
         options: Some(OPTIONS_KEY),
         stored: Some(STORED_KEY),
     };
-    let (authorizations, _, output) =
-        observed_authorization(keys, no_options(), no_options()).await;
+    let Some((authorizations, _, output)) =
+        observed_authorization(keys, no_options(), no_options()).await
+    else {
+        return;
+    };
 
     assert!(
         !authorizations.is_empty(),
@@ -370,7 +383,11 @@ async fn a_provider_level_option_reaches_the_request_body() {
         options: Some(OPTIONS_KEY),
         stored: None,
     };
-    let (_, bodies, output) = observed_authorization(keys, provider_options, no_options()).await;
+    let Some((_, bodies, output)) =
+        observed_authorization(keys, provider_options, no_options()).await
+    else {
+        return;
+    };
 
     assert!(
         !bodies.is_empty(),
@@ -411,7 +428,11 @@ async fn a_model_level_option_overrides_the_provider_level_one_of_the_same_name(
         options: Some(OPTIONS_KEY),
         stored: None,
     };
-    let (_, bodies, output) = observed_authorization(keys, provider_options, model_options).await;
+    let Some((_, bodies, output)) =
+        observed_authorization(keys, provider_options, model_options).await
+    else {
+        return;
+    };
 
     assert!(
         !bodies.is_empty(),

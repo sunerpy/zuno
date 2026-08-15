@@ -127,11 +127,11 @@ const ADDED_LONG_FLAGS: &[(&[&str], &[&str])] = &[(
     ],
 )];
 
-fn assert_help_flags(args: &[&str]) {
+fn assert_help_flags(oracle_program: &Path, args: &[&str]) {
     let root = tempfile::tempdir().expect("tempdir");
     let mut oracle_args = args.to_vec();
     oracle_args.push("--help");
-    let oracle = run(oracle(), &oracle_args, root.path());
+    let oracle = run(oracle_program, &oracle_args, root.path());
     let actual = run(&rust_path(), &oracle_args, root.path());
     let oracle_help = [oracle.stdout.as_slice(), oracle.stderr.as_slice()].concat();
     let actual_help = [actual.stdout.as_slice(), actual.stderr.as_slice()].concat();
@@ -179,7 +179,13 @@ fn every_declared_flag_addition_is_actually_present_and_upstream_keeps_its_own()
                 args.join(" ")
             );
         }
-        let oracle = run(oracle(), &with_help, root.path());
+        let Some(oracle_program) = pinned_oracle_or_skip(
+            "every_declared_flag_addition_is_actually_present_and_upstream_keeps_its_own",
+            "the upstream half of the declared flag comparison was NOT tested",
+        ) else {
+            return;
+        };
+        let oracle = run(oracle_program, &with_help, root.path());
         let upstream = long_flags(&[oracle.stdout.as_slice(), oracle.stderr.as_slice()].concat());
         for flag in &upstream {
             assert!(
@@ -197,6 +203,12 @@ fn every_declared_flag_addition_is_actually_present_and_upstream_keeps_its_own()
 
 #[test]
 fn every_headless_command_keeps_the_oracle_long_option_surface() {
+    let Some(oracle_program) = pinned_oracle_or_skip(
+        "every_headless_command_keeps_the_oracle_long_option_surface",
+        "the upstream long-option surface was NOT compared",
+    ) else {
+        return;
+    };
     for args in [
         &["run"][..],
         &["serve"][..],
@@ -230,17 +242,23 @@ fn every_headless_command_keeps_the_oracle_long_option_surface() {
         &["export"][..],
         &["import"][..],
     ] {
-        assert_help_flags(args);
+        assert_help_flags(oracle_program, args);
     }
 }
 
 #[test]
 fn db_query_matches_oracle_in_json_and_tsv() {
+    let Some(oracle_program) = pinned_oracle_or_skip(
+        "db_query_matches_oracle_in_json_and_tsv",
+        "the upstream db output was NOT compared",
+    ) else {
+        return;
+    };
     let root = tempfile::tempdir().expect("tempdir");
     let query = "SELECT 1 AS answer, 'hello' AS greeting";
     for format in ["json", "tsv"] {
         let args = ["db", query, "--format", format];
-        let oracle = run(oracle(), &args, root.path());
+        let oracle = run(oracle_program, &args, root.path());
         let actual = run(&rust_path(), &args, root.path());
         assert_eq!(
             actual.status.success(),
@@ -278,9 +296,15 @@ fn db_query_does_not_need_sqlite3_or_any_other_path_binary() {
 
 #[test]
 fn models_listing_and_provider_filter_match_oracle() {
+    let Some(oracle_program) = pinned_oracle_or_skip(
+        "models_listing_and_provider_filter_match_oracle",
+        "the upstream model listing was NOT compared",
+    ) else {
+        return;
+    };
     for args in [&["models"][..], &["models", "anyapi"][..]] {
         let root = tempfile::tempdir().expect("tempdir");
-        let mut oracle = Command::new(oracle());
+        let mut oracle = Command::new(oracle_program);
         oracle.args(args);
         isolated_oracle(&mut oracle, root.path());
         configure_oracle_models(&mut oracle);
@@ -526,8 +550,14 @@ fn mcp_add_list_and_logout_persist_headless_state() {
 
 #[test]
 fn debug_paths_matches_oracle_exactly() {
+    let Some(oracle_program) = pinned_oracle_or_skip(
+        "debug_paths_matches_oracle_exactly",
+        "the upstream debug paths were NOT compared",
+    ) else {
+        return;
+    };
     let root = tempfile::tempdir().expect("tempdir");
-    let oracle = run(oracle(), &["debug", "paths"], root.path());
+    let oracle = run(oracle_program, &["debug", "paths"], root.path());
     let actual = run(&rust_path(), &["debug", "paths"], root.path());
     assert!(
         oracle.status.success(),
@@ -650,10 +680,16 @@ fn criterion_2_pure_debug_config_matches_the_released_binary() {
         (status, stdout, stderr)
     };
     let rust = run(&rust_path());
+    let Some(oracle_program) = pinned_oracle_or_skip(
+        "criterion_2_pure_debug_config_matches_the_released_binary",
+        "the released binary's pure debug config was NOT compared",
+    ) else {
+        return;
+    };
     // Run the hard-cut subject first. On an empty tree the released oracle creates
     // its legacy default config, which the subject must correctly diagnose as an
     // unmigrated install rather than silently treating as its own input.
-    let released = run(oracle());
+    let released = run(oracle_program);
     assert!(
         released.0.success(),
         "released debug config failed: {}",

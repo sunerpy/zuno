@@ -629,6 +629,14 @@ mod tests {
     /// can assert on.
     #[tokio::test]
     async fn a_request_round_trips_into_a_captured_record() {
+        if crate::recordings_root_or_skip(
+            "a_request_round_trips_into_a_captured_record",
+            "recorded mock-provider round trip was NOT tested",
+        )
+        .is_none()
+        {
+            return;
+        }
         let scenario = Scenario::new("anthropic-text")
             .from_oracle_cassette("anthropic-messages/streams-text")
             .expect("the pinned corpus contains this recording");
@@ -735,6 +743,14 @@ mod tests {
 
     #[tokio::test]
     async fn multiple_responses_are_served_in_recorded_order() {
+        if crate::recordings_root_or_skip(
+            "multiple_responses_are_served_in_recorded_order",
+            "recorded multi-response ordering was NOT tested",
+        )
+        .is_none()
+        {
+            return;
+        }
         let scenario = Scenario::new("tool-loop")
             .from_oracle_cassette("anthropic-messages/claude-opus-4-7-drives-a-tool-loop")
             .expect("recording");
@@ -832,6 +848,14 @@ mod tests {
 
     #[tokio::test]
     async fn authored_responses_are_declared_and_recorded_ones_are_not() {
+        if crate::recordings_root_or_skip(
+            "authored_responses_are_declared_and_recorded_ones_are_not",
+            "recorded-versus-authored provenance was NOT tested",
+        )
+        .is_none()
+        {
+            return;
+        }
         let recorded = Scenario::new("recorded")
             .from_oracle_cassette("anthropic-messages/streams-text")
             .expect("recording");

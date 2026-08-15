@@ -2,6 +2,10 @@ use oc_llm::event::{FinishReason, StreamEvent};
 use oc_provider_bedrock::{BedrockDecodeError, BedrockEventDecoder, CrcKind, EventStreamError};
 use oc_testkit::CassettePlayer;
 
+fn recordings_available(test: &str) -> bool {
+    oc_testkit::recordings_root_or_skip(test, "Bedrock cassette replay was NOT tested").is_some()
+}
+
 fn recorded_body(name: &str, interaction_index: usize) -> Vec<u8> {
     let mut player = CassettePlayer::from_oracle(name).expect("recorded Bedrock cassette");
     let mut body = Vec::new();
@@ -28,6 +32,10 @@ fn decode(chunks: &[&[u8]]) -> Result<Vec<StreamEvent>, BedrockDecodeError> {
 
 #[test]
 fn recorded_stream_decodes_identically_when_split_at_every_byte_offset() {
+    if !recordings_available("recorded_stream_decodes_identically_when_split_at_every_byte_offset")
+    {
+        return;
+    }
     let bytes = recorded_body("bedrock-converse/streams-text", 0);
     let expected = decode(&[&bytes]).expect("whole recording decodes");
 
@@ -57,6 +65,9 @@ fn recorded_stream_decodes_identically_when_split_at_every_byte_offset() {
 
 #[test]
 fn recorded_text_and_tool_conversations_replay_to_shared_events() {
+    if !recordings_available("recorded_text_and_tool_conversations_replay_to_shared_events") {
+        return;
+    }
     let text =
         decode(&[&recorded_body("bedrock-converse/streams-text", 0)]).expect("text conversation");
     assert!(matches!(text.first(), Some(StreamEvent::TextDelta(value)) if value == "Hello"));
@@ -96,6 +107,9 @@ fn recorded_text_and_tool_conversations_replay_to_shared_events() {
 
 #[test]
 fn corrupted_message_crc_is_typed_and_names_its_absolute_offset() {
+    if !recordings_available("corrupted_message_crc_is_typed_and_names_its_absolute_offset") {
+        return;
+    }
     let mut bytes = recorded_body("bedrock-converse/streams-text", 0);
     let first_frame_len = u32::from_be_bytes(bytes[0..4].try_into().expect("four bytes")) as usize;
     let crc_offset = first_frame_len - 4;

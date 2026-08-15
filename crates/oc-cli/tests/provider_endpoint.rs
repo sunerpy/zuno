@@ -221,6 +221,14 @@ fn combined(output: &Output) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_empty_assistant_response_exits_non_zero_and_names_the_provider() {
+    if oc_testkit::recordings_root_or_skip(
+        "an_empty_assistant_response_exits_non_zero_and_names_the_provider",
+        "the recorded title request before an empty response was NOT tested",
+    )
+    .is_none()
+    {
+        return;
+    }
     let env = ScriptedEnv::new().expect("isolated environment");
     let provider = empty_turn_mock().await;
     let base_url = format!("{}/v1", provider.base_url());
@@ -247,6 +255,14 @@ async fn an_empty_assistant_response_exits_non_zero_and_names_the_provider() {
 /// binary declined the provider without opening a socket, so `captured` was empty.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn options_base_url_alone_reaches_the_endpoint() {
+    if oc_testkit::recordings_root_or_skip(
+        "options_base_url_alone_reaches_the_endpoint",
+        "recorded endpoint dispatch was NOT tested",
+    )
+    .is_none()
+    {
+        return;
+    }
     let env = ScriptedEnv::new().expect("isolated environment");
     let provider = mock().await;
     let base_url = format!("{}/v1", provider.base_url());
@@ -271,6 +287,14 @@ async fn options_base_url_alone_reaches_the_endpoint() {
 /// slower, which is the point: both keys naming a live server would prove nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn endpoint_wins_over_base_url_when_both_are_set() {
+    if oc_testkit::recordings_root_or_skip(
+        "endpoint_wins_over_base_url_when_both_are_set",
+        "recorded endpoint precedence was NOT tested",
+    )
+    .is_none()
+    {
+        return;
+    }
     let env = ScriptedEnv::new().expect("isolated environment");
     let provider = mock().await;
     let endpoint = format!("{}/v1", provider.base_url());
@@ -299,6 +323,14 @@ async fn endpoint_wins_over_base_url_when_both_are_set() {
 /// replacement.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_catalog_supplied_api_url_still_reaches_the_endpoint() {
+    if oc_testkit::recordings_root_or_skip(
+        "a_catalog_supplied_api_url_still_reaches_the_endpoint",
+        "recorded catalog endpoint dispatch was NOT tested",
+    )
+    .is_none()
+    {
+        return;
+    }
     let env = ScriptedEnv::new().expect("isolated environment");
     let provider = mock().await;
     let api = format!("{}/v1", provider.base_url());
@@ -324,6 +356,14 @@ async fn a_catalog_supplied_api_url_still_reaches_the_endpoint() {
 /// unexpanded `http://${PROBE_HOST}/v1` has no host a socket can be opened to.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_placeholder_in_the_catalog_api_url_reaches_the_substituted_host() {
+    if oc_testkit::recordings_root_or_skip(
+        "a_placeholder_in_the_catalog_api_url_reaches_the_substituted_host",
+        "recorded catalog placeholder dispatch was NOT tested",
+    )
+    .is_none()
+    {
+        return;
+    }
     let env = ScriptedEnv::new().expect("isolated environment");
     let provider = mock().await;
     let authority = provider.addr().to_string();
@@ -354,6 +394,14 @@ async fn a_placeholder_in_the_catalog_api_url_reaches_the_substituted_host() {
 /// braces.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_placeholder_arriving_via_options_base_url_reaches_the_substituted_host() {
+    if oc_testkit::recordings_root_or_skip(
+        "a_placeholder_arriving_via_options_base_url_reaches_the_substituted_host",
+        "recorded options placeholder dispatch was NOT tested",
+    )
+    .is_none()
+    {
+        return;
+    }
     let env = ScriptedEnv::new().expect("isolated environment");
     let provider = mock().await;
     let authority = provider.addr().to_string();
@@ -402,6 +450,14 @@ async fn a_placeholder_arriving_via_options_base_url_reaches_the_substituted_hos
 /// the test honest if a later change carries the config's verbatim spelling instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unset_variable_reaches_no_endpoint_rather_than_a_collapsed_one() {
+    if oc_testkit::recordings_root_or_skip(
+        "an_unset_variable_reaches_no_endpoint_rather_than_a_collapsed_one",
+        "recorded unresolved-placeholder behavior was NOT tested",
+    )
+    .is_none()
+    {
+        return;
+    }
     let env = ScriptedEnv::new().expect("isolated environment");
     let provider = mock().await;
     let authority = provider.addr().to_string();

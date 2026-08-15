@@ -682,6 +682,14 @@ fn frozen_thresholds() -> FrozenThresholds {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "500-turn real-driver soak takes at least two hours"]
 async fn g3_and_g4_real_driver_soak_stays_bounded_and_live() {
+    if oc_testkit::recordings_root_or_skip(
+        "g3_and_g4_real_driver_soak_stays_bounded_and_live",
+        "the 500-turn real-driver soak was NOT measured",
+    )
+    .is_none()
+    {
+        return;
+    }
     let thresholds = frozen_thresholds();
     let limits = WatchdogLimits {
         progress_timeout: Duration::from_secs_f64(thresholds.g4_progress_timeout_seconds),

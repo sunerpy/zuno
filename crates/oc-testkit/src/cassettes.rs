@@ -1345,6 +1345,14 @@ fn cassettes_new_registered_provider_without_a_family_fails_coverage() {
 
 #[tokio::test]
 async fn cassettes_replay_every_non_gap_cell_to_an_exact_event_sequence() {
+    if crate::recordings_root_or_skip(
+        "cassettes_replay_every_non_gap_cell_to_an_exact_event_sequence",
+        "recorded provider matrix cells were NOT replayed",
+    )
+    .is_none()
+    {
+        return;
+    }
     for cell in coverage_matrix() {
         replay_cell(&cell).await;
     }
@@ -1366,6 +1374,14 @@ fn cassettes_gap_cells_name_protocol_absence_instead_of_claiming_authored_bytes_
 
 #[test]
 fn cassettes_gemini_tool_signature_keeps_opaque_recorded_bytes() {
+    if crate::recordings_root_or_skip(
+        "cassettes_gemini_tool_signature_keeps_opaque_recorded_bytes",
+        "the recorded Gemini signature was NOT checked",
+    )
+    .is_none()
+    {
+        return;
+    }
     let interaction = recorded_interaction("gemini/streams-tool-call");
     let actual = decode_gemini(&interaction);
     let expected_signature = "CiQBDDnWx5RcSsS1UMbykQ5HWlrMu6wrxXGUhmZ0uRKLaMhDZaEKXwEMOdbHVoJAlfbOQyKB378pDZ/gkjWr3HP+dWw1us1kMG22g4G3oJvuTq/SrWS+7KYtSlvOxCKhW2l/2/TczpyGyGmANmsusDcxF1SKOYA5/8Hg0nI24MAlT3+91V/MCoUBAQw51seClFLy3E71v2H44F1kpmjgz8FeTRZofrjbaazfrT+w8Yxgdr3UgGagLMY4OadZemQTWckq9IAqRum78hrBg6NGtQvn15SbtfTNqI4PcxX/+qPo4/g4/ZT5kVORDhVqO8BVP/RA5GQ3ce3sRK8hSkvQlXSoXIPpHh6x7hBezIGXzw==";

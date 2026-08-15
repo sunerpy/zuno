@@ -12,6 +12,10 @@ use serde_json::json;
 const HAIKU: &str = "claude-haiku-4-5-20251001";
 const OPUS: &str = "claude-opus-4-7";
 
+fn recordings_available(test: &str) -> bool {
+    oc_testkit::recordings_root_or_skip(test, "Anthropic cassette replay was NOT tested").is_some()
+}
+
 fn decode(interaction: &HttpInteraction, model: &str) -> Vec<StreamEvent> {
     assert_eq!(interaction.response.status, 200);
     assert!(interaction.response.is_sse());
@@ -68,6 +72,9 @@ fn request_snapshot(body: serde_json::Value) -> RequestSnapshot {
 
 #[test]
 fn recorded_streams_text_matches_request_and_exact_events() {
+    if !recordings_available("recorded_streams_text_matches_request_and_exact_events") {
+        return;
+    }
     let mut player = CassettePlayer::from_oracle("anthropic-messages/streams-text")
         .expect("recorded conversation");
     let request = CompletionRequest::new(
@@ -94,6 +101,9 @@ fn recorded_streams_text_matches_request_and_exact_events() {
 
 #[test]
 fn recorded_streams_tool_call_matches_request_and_exact_events() {
+    if !recordings_available("recorded_streams_tool_call_matches_request_and_exact_events") {
+        return;
+    }
     let mut player = CassettePlayer::from_oracle("anthropic-messages/streams-tool-call")
         .expect("recorded conversation");
     let request = CompletionRequest::new(
@@ -152,6 +162,9 @@ fn recorded_streams_tool_call_matches_request_and_exact_events() {
 
 #[test]
 fn recorded_two_turn_tool_loop_matches_both_exact_event_sequences() {
+    if !recordings_available("recorded_two_turn_tool_loop_matches_both_exact_event_sequences") {
+        return;
+    }
     let mut player =
         CassettePlayer::from_oracle("anthropic-messages/claude-opus-4-7-drives-a-tool-loop")
             .expect("recorded conversation");
@@ -194,6 +207,9 @@ fn recorded_two_turn_tool_loop_matches_both_exact_event_sequences() {
 
 #[test]
 fn recorded_malformed_order_patch_matches_exact_events() {
+    if !recordings_available("recorded_malformed_order_patch_matches_exact_events") {
+        return;
+    }
     let mut player = CassettePlayer::from_oracle(
         "anthropic-messages/accepts-malformed-assistant-tool-order-with-default-patch",
     )
@@ -214,6 +230,9 @@ fn recorded_malformed_order_patch_matches_exact_events() {
 
 #[test]
 fn recorded_image_tool_result_matches_exact_events() {
+    if !recordings_available("recorded_image_tool_result_matches_exact_events") {
+        return;
+    }
     let mut player =
         CassettePlayer::from_oracle("anthropic-messages/anthropic-opus-4-7-image-tool-result")
             .expect("recorded conversation");
@@ -227,6 +246,9 @@ fn recorded_image_tool_result_matches_exact_events() {
 
 #[test]
 fn recorded_cache_write_then_read_matches_exact_usage() {
+    if !recordings_available("recorded_cache_write_then_read_matches_exact_usage") {
+        return;
+    }
     let mut player = CassettePlayer::from_oracle(
         "anthropic-messages-cache/writes-then-reads-cache-control-on-identical-second-call",
     )
@@ -241,6 +263,11 @@ fn recorded_cache_write_then_read_matches_exact_usage() {
 
 #[test]
 fn recorded_structured_invalid_request_is_fatal_without_message_matching() {
+    if !recordings_available(
+        "recorded_structured_invalid_request_is_fatal_without_message_matching",
+    ) {
+        return;
+    }
     let mut player = CassettePlayer::from_oracle(
         "anthropic-messages/rejects-malformed-assistant-tool-order-without-patch",
     )

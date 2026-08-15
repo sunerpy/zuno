@@ -39,6 +39,11 @@ use oc_llm::registry::{ApiSurface, CompletionRequest, FinishReason, Provider, Sp
 use oc_provider_compatible::{ChunkStream, CompatibleProvider, HttpRequest, Transport};
 use oc_testkit::cassette::CassettePlayer;
 
+fn recordings_available(test: &str) -> bool {
+    oc_testkit::recordings_root_or_skip(test, "compatible-provider cassette replay was NOT tested")
+        .is_some()
+}
+
 /// A transport that answers from a cassette instead of a socket.
 ///
 /// It captures the request it was handed so a test can assert on the URL, and it
@@ -159,6 +164,9 @@ fn tool_input(value: &str) -> StreamEvent {
 /// Vendor 1 of 6 — DeepSeek, `api.deepseek.com`.
 #[tokio::test]
 async fn deepseek_text_replays_to_the_recorded_event_sequence() {
+    if !recordings_available("deepseek_text_replays_to_the_recorded_event_sequence") {
+        return;
+    }
     let (events, recorded_url, sent_url) = replay(
         "deepseek",
         "https://api.deepseek.com/v1",
@@ -191,6 +199,9 @@ async fn deepseek_text_replays_to_the_recorded_event_sequence() {
 /// Vendor 2 of 6 — Groq, `api.groq.com`. Includes a tool call.
 #[tokio::test]
 async fn groq_tool_call_replays_to_the_recorded_event_sequence() {
+    if !recordings_available("groq_tool_call_replays_to_the_recorded_event_sequence") {
+        return;
+    }
     let (events, recorded_url, sent_url) = replay(
         "groq",
         "https://api.groq.com/openai/v1",
@@ -228,6 +239,9 @@ async fn groq_tool_call_replays_to_the_recorded_event_sequence() {
 /// an event.
 #[tokio::test]
 async fn openrouter_text_reports_its_upstream_and_ignores_the_comment_frame() {
+    if !recordings_available("openrouter_text_reports_its_upstream_and_ignores_the_comment_frame") {
+        return;
+    }
     let (events, recorded_url, sent_url) = replay(
         "openrouter",
         "https://openrouter.ai/api/v1",
@@ -261,6 +275,9 @@ async fn openrouter_text_reports_its_upstream_and_ignores_the_comment_frame() {
 /// arguments across two chunks, with no id on the second.
 #[tokio::test]
 async fn togetherai_tool_call_survives_a_split_tool_fragment() {
+    if !recordings_available("togetherai_tool_call_survives_a_split_tool_fragment") {
+        return;
+    }
     let (events, recorded_url, sent_url) = replay(
         "togetherai",
         "https://api.together.xyz/v1",
@@ -296,6 +313,9 @@ async fn togetherai_tool_call_survives_a_split_tool_fragment() {
 /// events are asserted.
 #[tokio::test]
 async fn cloudflare_workers_ai_reasoning_content_becomes_reasoning_events() {
+    if !recordings_available("cloudflare_workers_ai_reasoning_content_becomes_reasoning_events") {
+        return;
+    }
     let (events, recorded_url, _sent) = replay(
         "cloudflare-workers-ai",
         "https://api.cloudflare.com/client/v4/accounts/acct/ai/v1",
@@ -318,6 +338,9 @@ async fn cloudflare_workers_ai_reasoning_content_becomes_reasoning_events() {
 /// path, emitting the same `reasoning_content` shape.
 #[tokio::test]
 async fn cloudflare_ai_gateway_reasoning_content_becomes_reasoning_events() {
+    if !recordings_available("cloudflare_ai_gateway_reasoning_content_becomes_reasoning_events") {
+        return;
+    }
     let (events, _recorded, _sent) = replay(
         "cloudflare-ai-gateway",
         "https://gateway.ai.cloudflare.com/v1/acct/gw/compat",
@@ -391,6 +414,11 @@ fn assert_reasoning_then_tool_call(events: &[StreamEvent]) {
 /// this profile, so this cassette is not one of the six vendors claimed above.
 #[tokio::test]
 async fn the_canonical_openai_chat_shape_parses_under_a_declared_compatible_id() {
+    if !recordings_available(
+        "the_canonical_openai_chat_shape_parses_under_a_declared_compatible_id",
+    ) {
+        return;
+    }
     let (transport, recorded_url) = CassetteTransport::load("openai-chat/streams-text", 7);
     // Configured as a user's own declared-compatible endpoint, which is the only
     // honest way to route this shape through this profile.
@@ -440,6 +468,9 @@ async fn the_canonical_openai_chat_shape_parses_under_a_declared_compatible_id()
 /// re-testing the parser.
 #[tokio::test]
 async fn a_one_byte_at_a_time_stream_produces_the_identical_sequence() {
+    if !recordings_available("a_one_byte_at_a_time_stream_produces_the_identical_sequence") {
+        return;
+    }
     let (whole, _, _) = replay(
         "deepseek",
         "https://api.deepseek.com/v1",
