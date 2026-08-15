@@ -39,6 +39,7 @@ const INSTALL_MARKERS: &[&str] = &["installs/opencode", "opencode/1."];
 /// quietly dropping its oracle call — which no pattern over the *remaining* text can
 /// see. Renaming or removing one of these fails here, loudly, with the reason.
 const ROUTED_DIFFERENTIALS: &[&str] = &[
+    "oc-catalog/tests/agent_differential.rs",
     "oc-cli/tests/differential.rs",
     "oc-cli/tests/rollback.rs",
     "oc-db/tests/message_export.rs",

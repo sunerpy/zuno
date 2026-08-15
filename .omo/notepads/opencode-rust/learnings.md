@@ -6878,3 +6878,15 @@ vendor 钉住的 0.21.0 SDK，live test 会自动恢复执行，且 harness 仍�
 tool-loop cassette 的第 2 个 interaction：它是真实 provider 的文本 continuation，先作为 title
 prelude 响应，再完整重放 cassette 的 tool-call + continuation。三份响应的 provenance 都是
 `Recorded`，`authored_scenarios()` 仍为空；没有新增、手写或重录 fixture。
+
+## [2026-08-15] C-3 追加：differential 缺 oracle 必须走中央 resolver，不能直接 `Oracle::discover`
+
+PR run `31878406895` 的 `Test` job 已实际拿到 CodeBuild runner，但
+`oc-catalog/tests/agent_differential.rs` 的 6 个真实 oracle 用例在干净 runner 上因
+`BinaryNotFound` 失败。根因不是产品逻辑，而是该文件绕过了仓库已有的
+`pinned_oracle_or_skip` 合同。
+
+正确形状是：纯 fixture 守卫继续无条件执行；真正依赖 `opencode` 的 differential 通过中央
+resolver 获取钉住版本。候选完全缺失时逐项打印 `SKIPPED` 和未覆盖内容后返回；用户显式指定错误
+路径或发现了版本不一致时仍 hard fail，不能把配置错误降级成 skip。结构测试清单也必须纳入该
+文件，防止以后退回直接 discovery。

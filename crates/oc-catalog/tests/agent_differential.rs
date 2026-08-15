@@ -29,7 +29,7 @@
 
 use oc_catalog::agent;
 use oc_paths::Env;
-use oc_testkit::{ConfigFixture, Normalizer, Oracle, diff_normalized};
+use oc_testkit::{ConfigFixture, Normalizer, Oracle, diff_normalized, pinned_oracle_or_skip};
 use std::error::Error;
 use std::fs;
 use std::path::Path;
@@ -39,6 +39,18 @@ use std::path::Path;
 /// Empty. Todo 12's config differential carries exactly one entry; this one needs
 /// none, because the header line has no key-order or formatting freedom.
 const INTENTIONAL_DIVERGENCES: &[(&str, &str)] = &[];
+
+fn oracle_or_skip(test: &str, fixture: ConfigFixture) -> Option<Oracle> {
+    let program = pinned_oracle_or_skip(
+        test,
+        "no agent listing was compared against the pinned opencode release",
+    )?;
+    Some(
+        Oracle::at_binary(program)
+            .expect("the centrally screened oracle must still be runnable")
+            .with_env(fixture.into_env()),
+    )
+}
 
 /// Write a file under `$XDG_CONFIG_HOME/opencode/`, which is the global config
 /// directory both this crate and the oracle scan for `{agent,agents}/**/*.md`.
@@ -249,7 +261,9 @@ fn the_agent_list_matches_real_opencode() -> Result<(), Box<dyn Error>> {
     let project = fixture.env().project().to_path_buf();
     let env = Env::from_pairs(fixture.env().env_vars());
 
-    let oracle = Oracle::discover()?.with_env(fixture.into_env());
+    let Some(oracle) = oracle_or_skip("the full oc-catalog agent differential", fixture) else {
+        return Ok(());
+    };
     let oracle_headers = oracle_agent_headers(&oracle)?;
     assert!(
         oracle_headers.len() >= 10,
@@ -340,7 +354,10 @@ fn the_agent_list_matches_real_opencode_with_no_user_agents_at_all() -> Result<(
     let project = fixture.env().project().to_path_buf();
     let env = Env::from_pairs(fixture.env().env_vars());
 
-    let oracle = Oracle::discover()?.with_env(fixture.into_env());
+    let Some(oracle) = oracle_or_skip("the built-in-only oc-catalog agent differential", fixture)
+    else {
+        return Ok(());
+    };
     let oracle_lines = oracle_agent_headers(&oracle)?;
 
     let rust = agent::load(&directory, Some(project.as_path()), &env)?;
@@ -374,7 +391,10 @@ fn a_markdown_agent_beats_a_config_file_entry_of_the_same_name() -> Result<(), B
     let project = fixture.env().project().to_path_buf();
     let env = Env::from_pairs(fixture.env().env_vars());
 
-    let oracle = Oracle::discover()?.with_env(fixture.into_env());
+    let Some(oracle) = oracle_or_skip("the Markdown-over-config agent differential", fixture)
+    else {
+        return Ok(());
+    };
     let oracle_lines = oracle_agent_headers(&oracle)?;
     assert!(
         oracle_lines.contains(&"collide (subagent)".to_owned()),
@@ -414,7 +434,10 @@ fn opencode_config_content_beats_a_markdown_agent() -> Result<(), Box<dyn Error>
     let project = fixture.env().project().to_path_buf();
     let env = Env::from_pairs(fixture.env().env_vars());
 
-    let oracle = Oracle::discover()?.with_env(fixture.into_env());
+    let Some(oracle) = oracle_or_skip("the config-content-over-Markdown differential", fixture)
+    else {
+        return Ok(());
+    };
     let oracle_lines = oracle_agent_headers(&oracle)?;
     assert!(
         oracle_lines.contains(&"contentwin (all)".to_owned()),
@@ -443,7 +466,9 @@ fn the_oracle_has_no_format_json_flag() -> Result<(), Box<dyn Error>> {
     let fixture = ConfigFixture::new()?
         .mark_worktree_root("")?
         .global(r#"{"model":"differential/model"}"#)?;
-    let oracle = Oracle::discover()?.with_env(fixture.into_env());
+    let Some(oracle) = oracle_or_skip("the agent-list format-flag differential", fixture) else {
+        return Ok(());
+    };
     let outcome = oracle.run(["agent", "list", "--format", "json"])?;
     assert!(
         !outcome.is_success(),
@@ -473,7 +498,10 @@ fn every_config_directory_is_scanned_for_markdown_agents() -> Result<(), Box<dyn
     let project = fixture.env().project().to_path_buf();
     let env = Env::from_pairs(fixture.env().env_vars());
 
-    let oracle = Oracle::discover()?.with_env(fixture.into_env());
+    let Some(oracle) = oracle_or_skip("the all-config-directories agent differential", fixture)
+    else {
+        return Ok(());
+    };
     let oracle_lines = oracle_agent_headers(&oracle)?;
     for expected in ["from-global (all)", "from-project (all)"] {
         assert!(

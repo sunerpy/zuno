@@ -8203,3 +8203,16 @@ A/B/C/D 修完并在真实 run 上逐项验证通过（见 evidence 文件）。
 不依赖它：从已提交的 tool-loop cassette 取 interaction 2 的真实文本 response 作为 prelude，随后
 完整重放同一 cassette。`make smoke` 与 `make smoke-artifact` 均实测输出
 `3 requests, 10 tools offered` 并 PASS；全程未修改 cassette bytes。
+
+## [2026-08-15] C-3：PR 首轮暴露 Defect G，已在本地修复
+
+PR run `31878406895` 中 `Supply chain` 与 `Artifact smoke (host)` 通过，`Windows`
+按设计 skipped；`Test` 确实运行在 CodeBuild runner
+`9197ca6e-6076-4173-a970-9d130f3c4333`，随后 6 个 agent differential 因缺少真实
+`opencode` 报 `BinaryNotFound`。这排除了 webhook/runner 路由问题，也与 Defect E/F 实现无关。
+
+`crates/oc-catalog/tests/agent_differential.rs` 现通过 `pinned_oracle_or_skip` 获取 oracle，
+并已加入 `no_pinned_oracle_paths.rs` 的中央路由清单。红测先证明旧文件没有引用中央 resolver；
+修复后本机 1.18.18 oracle 的 8 项测试全部真实通过。清除 oracle override、把 `PATH` 限制到
+`/usr/bin:/bin` 后，6 个 differential 各自输出明确 `SKIPPED`，2 个 hermetic fixture 测试仍执行，
+总计 `8 passed`。显式设置一个不存在的 `OC_TESTKIT_ORACLE` 仍按设计 hard fail。

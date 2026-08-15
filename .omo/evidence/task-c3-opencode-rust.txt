@@ -119,5 +119,66 @@ Additional gates:
 
 CI evidence
 ===========
-Pending commit/push/merge and the required real run on main. This section will be
-appended with the run id and per-job table after GitHub reports final conclusions.
+PR: https://github.com/sunerpy/zuno/pull/1
+First PR run: 31878406895
+
+The first run proved Defects E/F and exposed one additional pre-existing clean-host
+failure:
+  Supply chain          success  runner=d67ac5b7-f2f5-4c6f-9092-db5ede902614
+  Artifact smoke (host) success  runner=2f6a14b9-e29f-406f-aad5-9ff209ff9a7f
+  Test                  failure  runner=9197ca6e-6076-4173-a970-9d130f3c4333
+  Windows               skipped  runner=(none; opt-in job)
+  CI Success            failure  runner=f02442af-ba38-494d-a57b-5a6fe89ba030
+
+The Test job completed checkout, toolchain, formatting, and Clippy, then failed six
+tests in `oc-catalog/tests/agent_differential.rs`. Every failure was the same:
+  BinaryNotFound { role: "oracle", expected: "opencode (via PATH)", ... }
+
+Defect G — central oracle routing
+=================================
+Red structural proof:
+  cargo test -p oc-testkit --test no_pinned_oracle_paths \
+    every_installed_binary_differential_still_routes_through_the_oracle \
+    -- --exact --nocapture
+Result before the implementation change:
+  oc-catalog/tests/agent_differential.rs: no reference to pinned_oracle
+  test result: FAILED. 0 passed; 1 failed
+
+Implementation:
+- the six real-oracle tests obtain their program through
+  `pinned_oracle_or_skip` and preserve its version-mismatch hard failure;
+- the two fixture-only tests still run unconditionally;
+- the structural route inventory now includes this differential file.
+
+Positive proof with installed pinned oracle 1.18.18:
+  cargo test -p oc-catalog --test agent_differential -- --nocapture
+Result:
+  8 passed; 0 failed; all six differential comparisons actually ran and reported
+  byte-identical output against opencode 1.18.18.
+
+Clean-host proof using the already-built test binary:
+  env -u OC_TESTKIT_ORACLE -u OC_TESTKIT_ORACLE_SOURCE \
+    -u OC_TESTKIT_ORACLE_FLAVOUR PATH=/usr/bin:/bin \
+    /tmp/opencode/c3/debug/deps/agent_differential-da37f3bfea64a160 \
+    --nocapture
+Result:
+  8 passed; 0 failed; six explicit `SKIPPED ... no opencode on PATH` diagnostics,
+  while both hermetic fixture tests still executed.
+
+An explicit invalid `OC_TESTKIT_ORACLE=/nonexistent-opencode-c3` was also checked
+and correctly remained a hard failure rather than being silently skipped.
+
+Post-Defect-G local gate note:
+- `make fmt-check`: PASS
+- `make lint`: PASS
+- central resolver structural test: PASS
+- agent differential with installed 1.18.18 oracle: 8 passed
+- agent differential with clean PATH: 8 passed, including six visible skips
+- two attempts to rerun the complete workspace reached `oc-config` and then the
+  shared development host refused additional test threads with OS EAGAIN
+  (`Resource temporarily unavailable`). The second attempt used
+  `--test-threads=4` and hit the same host-wide limit. No test assertion failed.
+  Per the two-attempt cap, no further local retry was made; the updated PR's
+  isolated CodeBuild Test job is the full-suite acceptance gate.
+
+The final main run id and per-job table remain pending the updated PR and merge.
