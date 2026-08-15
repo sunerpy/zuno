@@ -32,11 +32,13 @@ on:
 permissions:
   contents: read
 
-# `g2` is a generation counter, not decoration: run 31832366629 wedged in `queued`,
-# could not be cancelled via the API, and held the old group so every later run on
-# the ref sat `pending` with zero jobs. Bump the generation to release a wedged ref.
+# `g3` is a generation counter, not decoration. Twice now a run has wedged in
+# `queued` — 31832366629, then 31875272553, which ignored two separate cancel
+# requests — and a wedged run holds its group forever, leaving every later run on
+# the ref at `pending` with zero jobs. Bumping the generation is the only remedy
+# that does not need GitHub Support. Try `gh run cancel` first; bump when it fails.
 concurrency:
-  group: ${{ github.workflow }}-g2-${{ github.ref }}
+  group: ${{ github.workflow }}-g3-${{ github.ref }}
   cancel-in-progress: true
 
 env:
