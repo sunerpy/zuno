@@ -331,3 +331,37 @@ Note on reading future CI failures
   `rust_analyzer_reports_a_live_compiler_error` fails on the runner with
   `Error: Unavailable { server_id: "rust" }` because rust-analyzer is present but never becomes
   ready — a third state its absent-only skip does not model. Another task owns it.
+
+--------------------------------------------------------------------------------
+2026-08-15 (rebase 3) — main moved again to 504c379 during the push attempt
+--------------------------------------------------------------------------------
+
+- The pre-push freshness check (`git merge-base --is-ancestor origin/main HEAD`) reported main had
+  advanced 1121bf3 -> 504c379: "移除最后一个 oracle 差分并为 live rust-analyzer 建立三态守卫",
+  which deletes `crates/oc-lsp/tests/live_servers.rs` and adds
+  `crates/oc-lsp/tests/live_rust_analyzer.rs`, touches `oc-lsp/Cargo.toml`, `Cargo.lock`, and
+  `oc-testkit/tests/no_pinned_oracle_paths.rs`.
+- Rebased again rather than forcing, as instructed. `comm -12` over the two change sets showed ZERO
+  overlapping files, and the rebase replayed all 9 commits with zero conflicts.
+- That commit is the parallel task that owned `live_servers.rs` — the file this task was told not to
+  touch, and which held both the last oracle differential and the rust-analyzer CI blocker. Taking
+  main's version was therefore automatic; nothing of mine competed with it.
+- Baseline re-derived for the third base, before running:
+  * attribute counts: 1121bf3 = 3361, 504c379 = 3360 (main net -1), HEAD = 3375 (my +15 unchanged).
+  * integration test files: 131 at all three revisions, so suites stay 213 (one file swapped).
+  * predicted 3474 + 15 = 3489 / 0 / 2 / 213.
+- MEASURED on the final tree: 3489 passed / 0 failed / 2 ignored / 213 suites. Exact match again.
+  No `error: test failed`, no `StorageFull`, no `No space left`; `df -h /` held at 92%.
+- `make fmt-check` rc=0; `make lint` rc=0 with zero warning/error lines; `make smoke-artifact`
+  `oc-smoke: PASS` (--version 1.18.13, 3 requests / 10 tools offered).
+- Incidental confirmation: main's new `rust_analyzer_reports_a_live_compiler_error` three-state guard
+  PASSES on this host (rust-analyzer present and becoming ready), so the guard does not regress the
+  local run. Whether it resolves the runner-side `Unavailable { server_id: "rust" }` is that task's
+  to prove on CI, not mine.
+- One pre-existing rustdoc warning was observed and is NOT mine: "public documentation for
+  `deferred_reason` links to private item `BaselineReport::validate`" in `oc-testkit/src/perf/`,
+  reproduced on clean `main` @1121bf3 in the untouched main checkout. `make lint` (clippy) reports 0,
+  and `cargo doc` is not part of the gate, so it is left for whoever owns that module.
+
+Final state
+- `task-r4` = 9 commits on top of 504c379, pushed to `origin main`.
