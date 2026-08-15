@@ -52,6 +52,119 @@ fn instructions(config: &Config) -> Vec<&str> {
 }
 
 #[test]
+fn legacy_config_with_an_empty_zuno_root_returns_an_actionable_typed_error() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let project = temp.path().join("project");
+    let old_path = temp.path().join("xdg-config/opencode/opencode.json");
+    let new_path = temp.path().join("xdg-config/zuno/opencode.json");
+    write(&old_path, r#"{"model":"provider/legacy"}"#);
+
+    let result = discover_with(&fixture_options(temp.path(), &project, std::iter::empty()));
+
+    assert!(
+        result.is_err(),
+        "an old config must not be hidden by generating a fresh Zuno config"
+    );
+    let error = result.expect_err("the old location requires an explicit copy");
+    let ConfigError::LegacyConfig {
+        old_path: actual_old,
+        new_path: actual_new,
+        copy_command,
+    } = &error
+    else {
+        panic!("expected ConfigError::LegacyConfig, got {error:?}");
+    };
+    assert_eq!(actual_old, &old_path);
+    assert_eq!(actual_new, &new_path);
+    assert!(copy_command.contains("install -d -m 700"), "{copy_command}");
+    assert!(copy_command.contains(&old_path.display().to_string()));
+    assert!(copy_command.contains(&new_path.display().to_string()));
+    let report = error.report();
+    assert!(report.contains(&old_path.display().to_string()), "{report}");
+    assert!(report.contains(&new_path.display().to_string()), "{report}");
+    assert!(report.contains(copy_command), "{report}");
+}
+
+#[test]
+fn an_empty_zuno_root_without_legacy_config_still_gets_the_default() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let project = temp.path().join("project");
+
+    let config = discover_with(&fixture_options(temp.path(), &project, std::iter::empty()))
+        .expect("a genuinely fresh install gets a default config");
+
+    let generated = temp.path().join("xdg-config/zuno/opencode.jsonc");
+    assert_eq!(config.schema.as_deref(), Some(DEFAULT_SCHEMA));
+    assert!(generated.is_file());
+    assert!(
+        fs::read_to_string(generated)
+            .expect("read generated config")
+            .contains(DEFAULT_SCHEMA)
+    );
+}
+
+#[test]
+fn populated_zuno_config_wins_even_when_legacy_config_exists() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let project = temp.path().join("project");
+    write(
+        &temp.path().join("xdg-config/opencode/opencode.json"),
+        r#"{"model":"provider/legacy"}"#,
+    );
+    write(
+        &temp.path().join("xdg-config/zuno/opencode.json"),
+        r#"{"model":"provider/zuno"}"#,
+    );
+
+    let config = discover_with(&fixture_options(temp.path(), &project, std::iter::empty()))
+        .expect("the populated Zuno root is authoritative");
+
+    assert_eq!(config.model.as_deref(), Some("provider/zuno"));
+}
+
+#[test]
+fn explicit_config_overrides_bypass_the_legacy_location_diagnostic() {
+    for key in [
+        "OPENCODE_CONFIG",
+        "OPENCODE_CONFIG_DIR",
+        "OPENCODE_CONFIG_CONTENT",
+    ] {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().join("project");
+        write(
+            &temp.path().join("xdg-config/opencode/opencode.json"),
+            r#"{"model":"provider/legacy"}"#,
+        );
+        let override_file = temp.path().join("override/opencode.json");
+        let override_dir = temp.path().join("override-dir");
+        let value = match key {
+            "OPENCODE_CONFIG" => {
+                write(&override_file, r#"{"model":"provider/override"}"#);
+                override_file.display().to_string()
+            }
+            "OPENCODE_CONFIG_DIR" => {
+                write(
+                    &override_dir.join("opencode.json"),
+                    r#"{"model":"provider/override"}"#,
+                );
+                override_dir.display().to_string()
+            }
+            "OPENCODE_CONFIG_CONTENT" => r#"{"model":"provider/override"}"#.to_owned(),
+            _ => unreachable!("the override list is closed"),
+        };
+
+        let config = discover_with(&fixture_options(
+            temp.path(),
+            &project,
+            [(oc_paths::env::accepted_env_name(key).to_owned(), value)],
+        ))
+        .unwrap_or_else(|error| panic!("{key} must bypass the diagnostic: {error:?}"));
+
+        assert_eq!(config.model.as_deref(), Some("provider/override"), "{key}");
+    }
+}
+
+#[test]
 fn discovery_instructions_keep_earlier_entries_first_and_deduplicate() {
     let first = Config {
         model: Some("provider/first".to_owned()),

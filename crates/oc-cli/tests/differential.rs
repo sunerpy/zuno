@@ -649,8 +649,11 @@ fn criterion_2_pure_debug_config_matches_the_released_binary() {
         let stderr = std::fs::read(stderr.path()).expect("read stderr");
         (status, stdout, stderr)
     };
-    let released = run(oracle());
     let rust = run(&rust_path());
+    // Run the hard-cut subject first. On an empty tree the released oracle creates
+    // its legacy default config, which the subject must correctly diagnose as an
+    // unmigrated install rather than silently treating as its own input.
+    let released = run(oracle());
     assert!(
         released.0.success(),
         "released debug config failed: {}",

@@ -278,6 +278,21 @@ export default {
 };
 "#;
 
+const COLLIDING_MEMORY_PLUGIN: &str = r#"
+export default {
+  id: "production-memory-collision",
+  server: async () => ({
+    tool: {
+      memory: {
+        description: "plugin-provided memory",
+        args: {},
+        execute: async () => "plugin memory ran",
+      },
+    },
+  }),
+};
+"#;
+
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_zuno"))
 }
@@ -395,6 +410,13 @@ fn noop_tool_definition_provider_config(
         format!("file:{}", plugin.display()),
         { "eventFile": event_file }
     ]]);
+    config.to_string()
+}
+
+fn memory_collision_provider_config(base_url: &str, plugin: &Path) -> String {
+    let mut config: serde_json::Value =
+        serde_json::from_str(&provider_config(base_url)).expect("provider config is JSON");
+    config["plugin"] = serde_json::json!([format!("file:{}", plugin.display())]);
     config.to_string()
 }
 
@@ -733,6 +755,32 @@ async fn run_noop_tool_definition_prompt(
         .await
         .expect("the no-op tool.definition run must finish inside its budget")
         .expect("launch no-op tool.definition run")
+}
+
+async fn run_memory_collision_prompt(env: &ScriptedEnv, base_url: &str, plugin: &Path) -> Output {
+    let mut plugin_variables = variables(env, base_url);
+    plugin_variables.remove("ZUNO_PURE");
+    plugin_variables.insert("XDG_CACHE_HOME".to_owned(), "/config/.cache".to_owned());
+    plugin_variables.insert(
+        "MISE_DATA_DIR".to_owned(),
+        "/config/.local/share/mise".to_owned(),
+    );
+    plugin_variables.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+    plugin_variables.insert(
+        "OPENCODE_CONFIG_CONTENT".to_owned(),
+        memory_collision_provider_config(base_url, plugin),
+    );
+
+    let mut command = tokio::process::Command::new(binary());
+    command
+        .args(["run", "--model", "test/test-model", "hello"])
+        .current_dir(env.working_dir())
+        .env_clear()
+        .envs(plugin_variables);
+    tokio::time::timeout(Duration::from_secs(90), command.output())
+        .await
+        .expect("the memory-collision run must finish inside its budget")
+        .expect("launch memory-collision run")
 }
 
 async fn run_lifecycle_tool_prompt(
@@ -1684,6 +1732,54 @@ async fn noop_tool_definition_hook_preserves_real_schemas_and_stays_enabled() {
         calls.lines().collect::<Vec<_>>(),
         advertised_tools(&plugin_turn),
         "the plugin must remain enabled through every real tool definition: {calls:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plugin_memory_collision_is_deduplicated_on_the_production_assembly_path() {
+    let env = ScriptedEnv::new()
+        .expect("isolated plugin environment")
+        .with_db(DbChoice::TempFile);
+    let plugin = env.project().join("memory-collision-plugin.mjs");
+    std::fs::write(&plugin, COLLIDING_MEMORY_PLUGIN).expect("write colliding memory plugin");
+    let scenario = Scenario::new("memory collision is resolved before provider assembly")
+        .from_oracle_cassette(TITLE_CASSETTE)
+        .expect("the recorded title completion loads")
+        .from_oracle_cassette(TITLE_CASSETTE)
+        .expect("the turn completion loads");
+    let provider = MockProvider::start(vec![scenario])
+        .await
+        .expect("mock provider binds loopback");
+
+    let output = run_memory_collision_prompt(&env, provider.base_url(), &plugin).await;
+    let captured = provider.captured().await;
+    provider.shutdown().await;
+
+    assert!(
+        output.status.success(),
+        "the colliding plugin must not prevent the CLI turn\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(captured.len(), 2, "title plus one ordinary turn");
+    let turn = captured[1].json().expect("turn request is JSON");
+    let memory_count = advertised_tools(&turn)
+        .into_iter()
+        .filter(|name| name == "memory")
+        .count();
+    assert_eq!(
+        memory_count, 1,
+        "the provider must receive exactly one memory definition: {turn:#}"
+    );
+    assert_eq!(
+        advertised_tool_description(&turn, "memory"),
+        Some("plugin-provided memory"),
+        "plugin must win because configured memory is a built-in source"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("tool `memory` from built-in suppressed by same-named tool from plugin"),
+        "suppression must name the tool and both sources at default verbosity: {stderr}"
     );
 }
 

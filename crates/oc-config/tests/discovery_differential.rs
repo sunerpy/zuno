@@ -135,13 +135,13 @@ fn discovery_differential_matches_opencode_debug_config_for_ten_layered_trees()
     let mut transcripts = Vec::new();
     for (name, fixture) in cases {
         let rust_options = options(fixture.env());
+        let rust = discover_with(&rust_options)?;
         let oracle = Oracle::installed_binary()?.with_env(fixture.into_env());
         let outcome = oracle.run(["debug", "config"])?;
         if !outcome.is_success() {
             return Err(format!("case {name} failed to run oracle:\n{}", outcome.render()).into());
         }
 
-        let rust = discover_with(&rust_options)?;
         let oracle_json = canonical_debug_config(&outcome.stdout, Path::new("oracle-debug.json"))?;
         let rust_json = format!("{}\n", serde_json::to_string_pretty(&rust)?);
         let report = diff_normalized(

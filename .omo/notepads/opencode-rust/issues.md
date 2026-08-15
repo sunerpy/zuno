@@ -7999,3 +7999,27 @@ Activation requires a real GitHub classic PAT with `repo` (private repository re
 job data) plus `admin:repo_hook` (create/manage the `workflow_job` webhook). After the PAT is supplied,
 store it only in that secret, create the `WORKFLOW_JOB_QUEUED`-filtered webhook, push only `task-z4`,
 then record queued/in_progress HTTP 200 deliveries and the full CodeBuild-vs-ubuntu CI comparison.
+
+## [2026-08-15] R1 — close two silent bypasses at existing chokepoints
+
+Configured `memory` used to be appended after `ToolRegistryBuilder::build`, bypassing the registry's
+universal same-id replacement and diagnostic path. It now enters as a configured builtin before the
+config-directory, plugin, and MCP phases. Existing precedence remains `MCP > plugin >
+config-directory > builtin`; a plugin-provided `memory` therefore wins once and the suppression is
+visible. The fifth-source audit found no other provider-facing mutation after `registry.resolve`.
+
+An unmigrated legacy config under the old root used to look like a fresh installation: discovery
+silently generated a new Zuno config. Discovery now checks candidate-file existence only and returns
+typed `ConfigError::LegacyConfig` with old path, new path, and a shell-safe copy command. It never
+reads, parses, merges, copies, or falls back to the legacy file. A populated new root wins, an absent
+legacy root still gets the normal default, and all three explicit config overrides bypass the check.
+
+Differential fixtures that share one synthetic HOME must execute the Rust subject before the released
+oracle. The oracle can create its own legacy default config, contaminating the filesystem before the
+subject runs and invalidating a discovery comparison. The three affected differential suites now use
+subject-before-oracle ordering where required.
+
+Both regression mutations compiled and failed their intended behavioral assertions before restoration.
+Final gates: 3515 workspace tests passed with zero failures; the CLI differential is 21/21; rustfmt,
+`git diff --check`, all-target Clippy, and worktree-local rust-analyzer diagnostics are clean. Full
+incremental evidence is in `.omo/evidence/task-r1-opencode-rust.txt`.
