@@ -146,60 +146,13 @@ the *verb* is not, so it is accounted as an operation gap rather than a path gap
 
 ## Backends: what is real and what is a seam
 
-Eleven of the 20 routes have local backends in this build. Ten are thin wire-format
-adapters over the corresponding `/api` implementation:
+<!-- generated:BEGIN v1-capture-coverage -->
+Current backend coverage is **14 of 20 measured routes served locally** and **6 of 20 registered as structured `501 not_implemented` seams**. The served set contains 10 `/api` adapters, 3 credential/OAuth routes, and 1 toast recording sink.
 
-- `GET /agent` and `GET /provider`;
-- `GET|POST /session` and `GET /session/{sessionID}`;
-- `POST /session/{sessionID}/abort` and
-  `POST /session/{sessionID}/summarize`;
-- `GET|POST /session/{sessionID}/message`; and
-- `POST /session/{sessionID}/prompt_async`.
+Of the 6 unbacked routes, 0 name a served `/api` alternative and 6 do not. The unbacked SDK methods are `client.app.log`, `client.config.get`, `client.session.status`, `client.session.update`, `client.session.children`, `client.session.todo`. These counts are generated from `oc_server::v1_coverage()` and the same `V1_SURFACE` backing declarations the server mounts.
 
-The adapters preserve the published SDK's unprefixed paths and response envelopes,
-while session persistence, event publication, prompt execution, compaction, and
-catalog resolution remain owned by the shared `/api` handlers.
-
-`POST /tui/show-toast` is fully served. No server entry point attaches a display
-— `crates/oc-server/src/main.rs` and `crates/oc-cli/src/cmd/serve.rs` both build a
-bare `CompatV1State::new()` — so in every shipped server the route is a
-**recording seam**: each accepted toast is appended to a bounded
-in-process ring, counted, and reported by the diagnostics endpoint, and the call
-returns `200 true`. A toast that no one sees is a degraded UX; a `500` would be a
-broken plugin, so the seam never fails on a well-formed toast. When a TUI
-attaches it registers a forwarder through
-`CompatV1State::with_toast_forwarder`, and the same route forwards instead of
-only recording — no route change.
-
-Two deliberate leniencies protect the toast mandate. The oracle marks `variant`
-required and forbids additional properties; this seam defaults a missing
-`variant` to `info` and ignores unknown fields. Rejecting either case would turn
-a cosmetic mismatch into the exact failure the plan warns about. A missing or
-non-string `message` is still a `400`, because there is then nothing to show.
-
-The other nine routes are **registered, structured `501 not_implemented` seams**.
-This follows the precedent set by the `/api` surface: an operation with no local
-backend is registered explicitly and answers definitively rather than fabricating
-success data. Each `501` body names the SDK method, the plugins that call it, and
-the `/api` route to call instead when one is served here, so the operator learns
-which plugin needs which backend and the caller learns what works today.
-
-This is a **gap, not a decision**: it is recorded
-as `v1-surface-unbacked` in `oc_testkit::compat_report::known_gaps`, rendered into
-`docs/compatibility-matrix.md`, and never declared in `docs/divergences.toml`,
-whose own rule is that a merely unimplemented surface must not be laundered into a
-divergence. The nine remaining seams — `auth.set`, `app.log`, `config.get`, the two
-`provider.oauth` calls, `session.status`, `session.update`, `session.children` and
-`session.todo` — have no served `/api` spelling in this build, so a plugin needing
-them has no working call today. `crates/oc-server/tests/compat_v1.rs` asserts both
-halves against the routes the server really answers, so this paragraph cannot go
-stale without a red test.
-
-The practical consequence, stated plainly: against this surface alone the
-installed auth plugins complete their **call lifecycle** — every request they
-issue reaches a registered route and receives a definitive answer, and their
-toasts are delivered to the sink — but they cannot yet authenticate, because
-`auth.set` and the OAuth pair have no credential backend here.
+The practical consequence: the installed auth plugins can authenticate because `auth.set` and both provider OAuth routes have credential backends. Toasts reach the bounded recording sink. A plugin that needs one of the unbacked methods receives a definitive `501` rather than fabricated success data.
+<!-- generated:END v1-capture-coverage -->
 
 ## Unknown-route accounting
 

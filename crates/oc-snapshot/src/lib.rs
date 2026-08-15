@@ -5,7 +5,7 @@
 //! their history, their index, or their reflog:
 //!
 //! ```text
-//! $XDG_DATA_HOME/opencode/snapshot/<projectID>/<sha1(worktree path)>/
+//! $XDG_DATA_HOME/zuno/snapshot/<projectID>/<sha1(worktree path)>/
 //! ```
 //!
 //! Ports `packages/opencode/src/snapshot/index.ts`.

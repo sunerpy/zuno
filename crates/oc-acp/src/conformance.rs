@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::{Agent, ClientConnection, RpcError};
 
-const AUTH_METHOD: &str = "opencode-login";
+const AUTH_METHOD: &str = "zuno-login";
 
 #[derive(Debug, Clone)]
 struct Session {
@@ -285,10 +285,10 @@ fn initialize(params: &Value) -> Result<Value, RpcError> {
         },
         "authMethods": [{
             "id": AUTH_METHOD,
-            "name": "Login with opencode",
-            "description": "Run `opencode auth login` in the terminal",
+            "name": "Login with Zuno",
+            "description": "Run `zuno auth login` in the terminal",
         }],
-        "agentInfo": { "name": "OpenCode Rust", "version": env!("CARGO_PKG_VERSION") },
+        "agentInfo": { "name": "Zuno", "version": env!("CARGO_PKG_VERSION") },
     }))
 }
 
@@ -434,4 +434,21 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initialize_presents_zunos_identity() {
+        let response = initialize(&json!({ "protocolVersion": 1 })).expect("initialize response");
+        assert_eq!(response["agentInfo"]["name"], "Zuno");
+        assert_eq!(response["authMethods"][0]["id"], "zuno-login");
+        assert_eq!(response["authMethods"][0]["name"], "Login with Zuno");
+        assert_eq!(
+            response["authMethods"][0]["description"],
+            "Run `zuno auth login` in the terminal"
+        );
+    }
 }

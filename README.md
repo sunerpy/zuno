@@ -1,6 +1,7 @@
 # Zuno
 
-> [`opencode`](https://github.com/sst/opencode) 的 Rust 实现，兼容基线固定为 **1.18.13**。
+> 独立的 AI 编程代理。保留 [`opencode`](https://github.com/sst/opencode) 插件 ABI 接入，
+> 但不以其二进制、配置或会话兼容为产品目标。
 
 简体中文 · [English](docs/readme/README.en.md)
 
@@ -10,8 +11,7 @@
 - [安装](#安装)
 - [快速开始](#快速开始)
 - [文档](#文档)
-- [与 TypeScript 版本并行运行](#与-typescript-版本并行运行)
-- [并行使用时最先遇到的四件事](#并行使用时最先遇到的四件事)
+- [独立运行与插件接入](#独立运行与插件接入)
 - [构建与开发](#构建与开发)
 - [非功能门禁](#非功能门禁)
 - [许可证](#许可证)
@@ -60,7 +60,7 @@ $ zuno --version
 $ zuno --help
 ```
 
-现有 opencode 数据不会被自动读取或修改；需要并行验证旧数据时，请先按下文复制并备份数据。
+Zuno 只读取自己的配置与数据根目录；它不会导入或恢复 opencode 会话。
 
 ## 文档
 
@@ -74,72 +74,27 @@ $ zuno --help
 | [docs/plugin-authoring.md](docs/plugin-authoring.md) | 三类插件层级与 Rust 示例 |
 | [docs/perf-methodology.md](docs/perf-methodology.md) | 内存和活性门禁的测量方法 |
 
-这些页面中的表格均从其描述的代码生成；代码与文档不一致时，
-`cargo test -p oc-cli --test docs` 会失败。使用
-`OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs` 重新生成。
+只有 `<!-- generated:BEGIN … -->` 与 `<!-- generated:END … -->` 标记之间的区域从代码生成并由
+`cargo test -p oc-cli --test docs` 做字节级防漂移检查；该测试还针对少量关键章节做派生断言。
+标记外的说明性表格与 prose 仍需评审，不能因测试通过就视为已从代码生成。使用
+`OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs` 重新生成受管区域。
 
-## 与 TypeScript 版本并行运行
+## 独立运行与插件接入
 
-Zuno 使用独立的配置和数据根目录，不会回退读取 TypeScript 版本的目录。若要一次性复制本地数据
-进行并行测试，请运行：
+Zuno 的默认配置根是 `$XDG_CONFIG_HOME/zuno`，项目配置目录是 `.zuno`，数据根是
+`$XDG_DATA_HOME/zuno`。它不会回退读取 `$XDG_CONFIG_HOME/opencode`、项目 `.opencode` 或
+`$XDG_DATA_HOME/opencode`，也不提供导入或恢复 opencode 会话的功能。旧路径只会在 oracle fixture、
+上游源码说明或历史证据中以 **upstream-only** 身份出现。
 
-```sh
-mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/zuno" "${XDG_DATA_HOME:-$HOME/.local/share}/zuno" && cp -a "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/." "${XDG_CONFIG_HOME:-$HOME/.config}/zuno/" && cp -a "${XDG_DATA_HOME:-$HOME/.local/share}/opencode/." "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/"
+插件层是唯一保留的 opencode 兼容层。`COMPATIBILITY_VERSION = "1.18.13"` 继续供 npm
+`engines.opencode` semver 判断使用；以下六个名称继续作为插件 ABI，不是 Zuno 自身份遗留：
+`OPENCODE_CLIENT`、`OPENCODE_CONFIG_CONTENT`、`OPENCODE_CONFIG_DIR`、
+`OPENCODE_DISABLE_CLAUDE_CODE`、`OPENCODE_SERVER_PASSWORD`、`OPENCODE_SERVER_USERNAME`。
+除此之外，Zuno 的用户界面、默认路径和自有环境变量均使用 Zuno 身份。
 
-# 单向迁移前先备份复制出的数据库。
-cp "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/opencode.db" "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/opencode.db.backup"
-
-# 只读检查：Zuno 是否能看到复制的数据？
-zuno debug paths
-ZUNO_DISABLE_CHANNEL_DB=1 zuno session list
-
-# TypeScript 版本仍使用原目录。
-opencode session list
-```
-
-若第二步显示空列表，原因是 channel 数据库规则，而不是兼容性缺陷；请查看下文第一项。
-
-### 回滚
-
-项目没有卸载命令或自更新器，两者均被明确
-[拒绝](docs/compatibility-matrix.md)。回滚只需：
-
-```sh
-# 停止使用 Zuno；TypeScript 版本未被改动。
-opencode
-
-# 若已迁移复制出的数据库并希望恢复原始字节：
-cp "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/opencode.db.backup" "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/opencode.db"
-```
-
-TypeScript 1.18.12 正式版可以继续打开由本实现迁移的数据库：测试会让真实 1.18.12 二进制打开
-Rust 创建的数据库且不重放迁移，并逐对象对比其 schema 与该二进制自行创建的数据库
-（`crates/oc-db/tests/schema.rs`、`crates/oc-testkit/tests/compat_suite.rs`）。该验证仅覆盖 schema
-与 journal，因此备份不是可选步骤。
-
-## 并行使用时最先遇到的四件事
-
-**1. 数据库文件名不同，看起来像数据丢失。** 源码构建解析为 `opencode-local.db`，安装的 release
-解析为 `opencode.db`。两种实现遵循同一 channel define 规则，这不是差异，但表现会是空会话列表。
-使用 `ZUNO_DISABLE_CHANNEL_DB=1`，或通过 `ZUNO_DB` 指向目标文件。完整优先级见
-[docs/migration.md](docs/migration.md#the-channel-database)。
-
-**2. 事件订阅使用 SSE。** `/api/event` 会立即发送 `server.connected`，随后发送实时事件；
-`/api/session/{sessionID}/event` 会从 `?after=<sequence>` 之后重放持久事件并继续实时发送。旧的
-`/event` 游标流保留用于兼容。慢订阅者有容量上限并会收到明确的 lag 诊断，不会无限增长内存。
-
-API differential 会针对两个二进制调用全部 58 个上游操作。58 个上游操作中，48 个具有本地
-后端；其余 10 个返回针对具体操作的 `503 backend_unavailable`，并继续报告为兼容性缺口。
-已注册的 `501` 永远不能满足兼容矩阵。
-
-**3. 旧安装需要一次明确的迁移。** 早于 `migration` 表的数据库使用
-`__drizzle_migrations` journal。实现会创建该 journal、填入 Drizzle 记录的名称并执行剩余迁移，
-但这是对真实数据的单向升级。详见
-[docs/migration.md](docs/migration.md#opening-an-existing-database)。
-
-**4. Provider 覆盖按 wire family 而非厂商声明。** 如果 provider id 不属于任何已声明 family，
-系统会返回点名该 id 的错误，而不会静默构造错误形状的请求。这项差异以
-`provider-coverage-by-wire-family` 登记于 [docs/divergences.md](docs/divergences.md)。
+仓库暂时保留 differential suites 与 compatibility 文档作为已有验证资产；是否删除或重构它们尚待
+单独决定。保留这些测试不等于把跨二进制兼容重新定义为产品目标，也不应据此新增会话导入、恢复或
+旧目录 fallback。
 
 ## 构建与开发
 

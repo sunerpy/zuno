@@ -2819,7 +2819,7 @@ fn behavioural_differences() -> Vec<BehaviouralDifference> {
         },
         BehaviouralDifference {
             id: "malformed-auth-json-is-an-error".to_owned(),
-            surface: "$XDG_DATA_HOME/opencode/auth.json".to_owned(),
+            surface: "$XDG_DATA_HOME/zuno/auth.json".to_owned(),
             declared_as: "malformed-auth-json-is-an-error".to_owned(),
             upstream_evidence: "packages/opencode/src/auth/index.ts:58-67 maps any read or parse failure to `{}` via orElseSucceed; :73-80 then writes `{ ...data, [norm]: info }` over the file".to_owned(),
             asserted_by: "crates/oc-auth/src/store.rs::malformed_json_is_a_typed_error_naming_the_file".to_owned(),

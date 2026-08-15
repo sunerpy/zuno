@@ -25,14 +25,11 @@ Declared exactly as upstream declares it, so an existing plugin needs no change:
 
 A bare entry is an npm specifier, a `file://` URL, or a path
 (`oc_config::schema::plugin::PluginSpec`). The two-element form pairs a specifier
-with options handed to the plugin at load time. Beyond the config array, every
-configuration directory is scanned for `plugin/*.{ts,js}` and
-`plugins/*.{ts,js}`. This includes `$XDG_CONFIG_HOME/opencode`, project
-`.opencode` directories, `$HOME/.opencode`, and `OPENCODE_CONFIG_DIR`, in that
-configuration-directory order; files are sorted within `plugin/` and then
-`plugins/`. Provenance is retained (`oc_plugin::PluginOrigin`), successful
-discovery is visible at `DEBUG`, and scan or load failures are warnings that name
-the affected directory or plugin.
+with options handed to the plugin at load time.
+
+<!-- generated:BEGIN plugin-config-paths -->
+Beyond the config array, Zuno scans every configuration directory for `plugin/*.{ts,js}` and `plugins/*.{ts,js}`. The directory chain is `$XDG_CONFIG_HOME/zuno`, project `.zuno` directories, `$HOME/.zuno`, then `OPENCODE_CONFIG_DIR`; files are sorted within `plugin/` and then `plugins/`. `OPENCODE_CONFIG_DIR` deliberately keeps its upstream spelling because installed npm plugins consume it as one of the six retained plugin-ABI environment names. Provenance is retained (`oc_plugin::PluginOrigin`), successful discovery is visible at `DEBUG`, and scan or load failures are warnings that name the affected directory or plugin.
+<!-- generated:END plugin-config-paths -->
 
 An npm plugin may declare its supported host range in
 `package.json.engines.opencode`. The production loader checks that range against

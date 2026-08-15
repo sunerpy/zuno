@@ -366,7 +366,7 @@ impl RunningServer {
                     .await
                     .expect("read server readiness line");
                 assert!(read > 0, "server exited before reporting readiness");
-                if let Some(url) = line.trim().strip_prefix("opencode server listening on ") {
+                if let Some(url) = line.trim().strip_prefix("Zuno server listening on ") {
                     break url.to_owned();
                 }
             }

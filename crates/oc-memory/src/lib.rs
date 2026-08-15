@@ -14,7 +14,7 @@
 //! | Scope | Location | Cap |
 //! |---|---|---|
 //! | [`Scope::Global`] | `$CONFIG/memory/MEMORY.md` | 2200 chars |
-//! | [`Scope::Project`] | `<worktree>/.opencode/RULES.md` | 3000 chars |
+//! | [`Scope::Project`] | `<worktree>/.zuno/RULES.md` | 3000 chars |
 //!
 //! Habits that travel with the user go global; rules that belong to one repository
 //! stay in it. See [`scope`] for why that is the split, and why the unit is

@@ -1,7 +1,11 @@
 # Compatibility matrix
 
-Every surface this port claims, and its state against upstream `opencode`
-1.18.13. Five states are used throughout:
+This is the retained verification inventory against upstream `opencode` 1.18.13,
+not a promise that Zuno is a drop-in binary or session-store replacement. Zuno is
+independent; only the plugin ABI remains a supported compatibility layer. A
+separate decision is pending on whether to keep or reshape the differential
+suites and these historical compatibility documents. Five states are used
+throughout:
 
 - **implemented** — registered and backed by a handler that does the work.
 - **explicit gap (503 backend unavailable)** — the path and method exist, but
@@ -25,7 +29,7 @@ OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs
 | # | id | surface |
 |---:|---|---|
 | 1 | [`session-list-default-sort`](divergences.md#session-list-default-sort) | CLI `session list`; HTTP `GET /api/session`; `oc-db` session listing |
-| 2 | [`tool-output-filename-carries-session`](divergences.md#tool-output-filename-carries-session) | on-disk `$XDG_DATA_HOME/opencode/tool-output/tool_<session>_<uuidv7>` |
+| 2 | [`tool-output-filename-carries-session`](divergences.md#tool-output-filename-carries-session) | on-disk `$XDG_DATA_HOME/zuno/tool-output/tool_<session>_<uuidv7>` |
 | 3 | [`no-eager-directory-creation`](divergences.md#no-eager-directory-creation) | process startup; `oc-paths` layout getters |
 | 4 | [`split-version-identity`](divergences.md#split-version-identity) | CLI `--version` and `--version --long`; the npm plugin compatibility gate |
 | 5 | [`execute-parameter-contract`](divergences.md#execute-parameter-contract) | tool `execute` — the model-facing parameter schema |
@@ -34,7 +38,7 @@ OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs
 | 8 | [`cross-session-resident-memory`](divergences.md#cross-session-resident-memory) | system-prompt resident blocks; model-facing `memory` tool; post-response reflection |
 | 9 | [`session-subpath-is-applied`](divergences.md#session-subpath-is-applied) | HTTP `GET /api/session?project=…&subpath=…`; `oc-db` session listing in project scope |
 | 10 | [`context-md-excluded`](divergences.md#context-md-excluded) | project instruction cascade — the filename list probed by `findUp` |
-| 11 | [`malformed-auth-json-is-an-error`](divergences.md#malformed-auth-json-is-an-error) | `$XDG_DATA_HOME/opencode/auth.json` — reading the credential store |
+| 11 | [`malformed-auth-json-is-an-error`](divergences.md#malformed-auth-json-is-an-error) | `$XDG_DATA_HOME/zuno/auth.json` — reading the credential store |
 | 12 | [`failed-format-restores-pre-format-bytes`](divergences.md#failed-format-restores-pre-format-bytes) | post-edit formatter execution — the file's bytes after a formatter exits non-zero |
 | 13 | [`non-pure-plugin-generated-trees`](divergences.md#non-pure-plugin-generated-trees) | `debug config` without `OPENCODE_PURE` — the `agent` and `command` trees a third-party JS plugin synthesises |
 | 14 | [`plain-cli-presentation`](divergences.md#plain-cli-presentation) | every CLI command's stdout and stderr — colour, the `Error: ` prefix, the prompt gutter, and JSON object key order |
@@ -72,9 +76,9 @@ loses and, where one exists, the test that fails if the gap closes or goes stale
 
 ### channel-dependent-database-filename
 
-**Surface.** $XDG_DATA_HOME/opencode/opencode-<channel>.db
+**Surface.** $XDG_DATA_HOME/zuno/opencode-<channel>.db
 
-**What is missing.** A source build of either implementation resolves opencode-local.db while an installed release resolves opencode.db, so a `cargo build` does not see the user's sessions. This port mirrors the oracle's rule (packages/core/src/database/database.ts:45-55) exactly, so it is FAITHFUL BEHAVIOUR and not a divergence — recorded here because it presents as a parity bug the first time anyone tries it. Plan todo 92 owns documenting it.
+**What is missing.** A Zuno source build resolves opencode-local.db while an installed release resolves opencode.db, so a `cargo build` does not see the release database. Zuno retains the oracle's channel filename rule (packages/core/src/database/database.ts:45-55) exactly, so it is FAITHFUL BEHAVIOUR inside Zuno's own data root and not a divergence — recorded here because it presents as a missing-data bug the first time anyone tries it. Plan todo 92 owns documenting it.
 
 ### assistant-turn-step-parts
 
@@ -115,7 +119,7 @@ Persistent memory is **enabled by default**. With both non-empty scopes, the def
 | `memory.tool` | `true` | advertise the model-facing `memory` tool |
 | `memory.reflection` | `true` | permit post-response reflection tasks |
 | `memory.global_char_limit` | `2200` | cap `$CONFIG/memory/MEMORY.md` in Unicode scalar values |
-| `memory.project_char_limit` | `3000` | cap `<worktree>/.opencode/RULES.md` in Unicode scalar values |
+| `memory.project_char_limit` | `3000` | cap `<worktree>/.zuno/RULES.md` in Unicode scalar values |
 | `memory.nudge_interval` | `10` | periodic reflection cadence in delivered turns; `0` disables only that trigger |
 
 Reflection must not learn any of these negative cases:
@@ -268,19 +272,11 @@ it is the set of routes the installed JavaScript plugins were measured calling,
 each carrying its callsite evidence. `crates/oc-server/tests/compat_v1.rs`
 asserts every route has a recorded callsite and that none answers 404.
 
-**20 v1 routes**, measured against the plugins installed at capture time. A route
-with no recorded callsite is scope creep, and a test fails on it.
+<!-- generated:BEGIN v1-summary -->
+**20 v1 routes** are registered from measured installed-plugin callsites. A route with no recorded callsite is scope creep, and a test fails on it.
 
-Registering a route is not the same as backing it, and this surface is almost
-entirely unbacked: 19 of the 20 answer `501 not_implemented`. The one that does
-real local work, `POST /tui/show-toast`, records into a bounded in-process sink
-that no shipped entry point attaches a display to. 10 of those 19 name a served
-`/api` route with the same capability and their `501` tells the caller to use it;
-the other 9 have no served `/api` spelling here, so a plugin that needs one has no
-working call today. That is recorded as the `v1-surface-unbacked` known gap above —
-a gap, never a divergence. The counts in this paragraph are asserted by
-`crates/oc-cli/tests/docs.rs` against `oc_server::v1_coverage`, which counts the
-route table the server serves.
+Registering a route is not the same as backing it: **14 of the 20 do real local work**, while **6 of the 20 answer `501 not_implemented`**. 0 of those 6 name a served `/api` alternative; the other 6 have no served `/api` spelling here. The generated route table below names every backing. The installed auth plugins' `auth.set` and provider OAuth routes are served; the remaining gaps are non-authentication operations. These figures come from `oc_server::v1_coverage()`, which counts the same route and backend tables the server mounts.
+<!-- generated:END v1-summary -->
 
 <!-- generated:BEGIN v1-routes -->
 | method | path | SDK method | backing | `/api` alternative |

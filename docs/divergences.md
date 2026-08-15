@@ -46,7 +46,7 @@ each entry's stated reason. Do not edit it by hand.
 
 ### tool-output-filename-carries-session
 
-**Surface.** on-disk `$XDG_DATA_HOME/opencode/tool-output/tool_<session>_<uuidv7>`
+**Surface.** on-disk `$XDG_DATA_HOME/zuno/tool-output/tool_<session>_<uuidv7>`
 
 **Why.** Upstream's `bound()` takes a `sessionID` that `write()` never uses, so a filename cannot be attributed to a session; the prune in plan todo 83 needs that attribution, so the session id is encoded in the name and the mtime sweep is kept as the backstop for foreign files.
 
@@ -100,7 +100,7 @@ each entry's stated reason. Do not edit it by hand.
 
 ### malformed-auth-json-is-an-error
 
-**Surface.** `$XDG_DATA_HOME/opencode/auth.json` — reading the credential store
+**Surface.** `$XDG_DATA_HOME/zuno/auth.json` — reading the credential store
 
 **Why.** Upstream funnels every read and parse failure into an empty store: `readJson(file).pipe(Effect.orElseSucceed(() => ({})))` (`packages/opencode/src/auth/index.ts:58-67`), and the next `set` writes `{ ...data, [norm]: info }` over the file (`:73-80`) — so one truncated `auth.json` silently destroys every other credential in it. This port returns a typed `Malformed` error naming the file instead, which fails the read a user can retry rather than losing data they cannot recover. An empty or whitespace-only file still reads as an empty store, because that is a crash mid-create rather than corruption.
 

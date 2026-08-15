@@ -1,5 +1,6 @@
-//! The documentation gate: every table in `docs/` is generated from the code it
-//! describes, and this target proves the committed prose still matches.
+//! The documentation gate: regions delimited by `generated:BEGIN` and
+//! `generated:END` are rendered from the code they describe. This target also
+//! derives focused assertions for a small set of load-bearing prose claims.
 //!
 //! # Why a test that reads Markdown is not the vacuous test it looks like
 //!
@@ -8,8 +9,8 @@
 //! both sides are the same artifact, so it passes for any content, including
 //! content that contradicts the code.
 //!
-//! Every assertion here therefore derives its *expected* side from a live code
-//! artifact and its *actual* side from the committed Markdown:
+//! Every generated-region assertion therefore derives its *expected* side from a
+//! live code artifact and its *actual* side from the committed Markdown:
 //!
 //! | doc block | derived from |
 //! |---|---|
@@ -168,6 +169,26 @@ fn contains_all(relative: &str, needles: &[&str]) {
     }
 }
 
+fn section(relative: &str, heading: &str) -> String {
+    let path = workspace_root().join(relative);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    let start = text
+        .find(heading)
+        .unwrap_or_else(|| panic!("{} must contain section {heading:?}", path.display()));
+    let body_start = start + heading.len();
+    let end = text[body_start..]
+        .find("\n## ")
+        .map_or(text.len(), |offset| body_start + offset);
+    text[start..end].to_owned()
+}
+
+fn contains_all_in(text: &str, label: &str, needles: &[&str]) {
+    for needle in needles {
+        assert!(text.contains(needle), "{label} must mention {needle:?}");
+    }
+}
+
 /// Escapes a table cell so a value containing `|` cannot forge a column.
 fn cell(value: &str) -> String {
     value.replace('|', "\\|")
@@ -214,6 +235,32 @@ fn allow_list() -> DivergenceList {
         !list.is_empty(),
         "an empty allow-list would make every documentation assertion below vacuous"
     );
+    for (id, expected) in [
+        (
+            "tool-output-filename-carries-session",
+            format!(
+                "on-disk `$XDG_DATA_HOME/{}/tool-output/tool_<session>_<uuidv7>`",
+                oc_paths::APP
+            ),
+        ),
+        (
+            "malformed-auth-json-is-an-error",
+            format!(
+                "`$XDG_DATA_HOME/{}/auth.json` — reading the credential store",
+                oc_paths::APP
+            ),
+        ),
+    ] {
+        let surface = list
+            .entries()
+            .iter()
+            .find(|entry| entry.id == id)
+            .unwrap_or_else(|| panic!("the path-bearing divergence {id} must exist"));
+        assert_eq!(
+            surface.surface, expected,
+            "the {id} documentation must derive Zuno's data root from oc_paths::APP"
+        );
+    }
     list
 }
 
@@ -269,7 +316,7 @@ are returned unchanged.\n\n\
 | `memory.tool` | `{tool}` | advertise the model-facing `memory` tool |\n\
 | `memory.reflection` | `{reflection}` | permit post-response reflection tasks |\n\
 | `memory.global_char_limit` | `{global}` | cap `$CONFIG/memory/MEMORY.md` in Unicode scalar values |\n\
-| `memory.project_char_limit` | `{project}` | cap `<worktree>/.opencode/RULES.md` in Unicode scalar values |\n\
+| `memory.project_char_limit` | `{project}` | cap `<worktree>/{project_directory}/RULES.md` in Unicode scalar values |\n\
 | `memory.nudge_interval` | `{interval}` | periodic reflection cadence in delivered turns; `0` disables only that trigger |\n\n\
 Reflection must not learn any of these negative cases:\n",
         global = defaults.global_char_limit,
@@ -278,6 +325,7 @@ Reflection must not learn any of these negative cases:\n",
         tool = defaults.tool,
         reflection = defaults.reflection,
         interval = defaults.nudge_interval,
+        project_directory = oc_paths::PROJECT_CONFIG_DIRECTORY,
     );
     for exclusion in NEGATIVE_LEARNING_LIST {
         let _ = writeln!(out, "- {exclusion}");
@@ -520,8 +568,6 @@ fn assert_api_counts(
         ],
     );
 
-    // The Chinese root README restates this split, and once shipped it inverted:
-    // 23 backed against the table's 35. Both halves now come from the same probe.
     let backed = upstream
         .iter()
         .filter(|operation| served.contains(*operation) && !gaps.contains(*operation))
@@ -534,14 +580,6 @@ fn assert_api_counts(
         backed + gapped + missing,
         upstream.len(),
         "every upstream operation is backed, gapped, or unregistered"
-    );
-    contains_all(
-        "README.md",
-        &[
-            &format!("全部 {} 个上游操作", upstream.len()),
-            &format!("{} 个上游操作中，{backed} 个具有本地", upstream.len(),),
-            &format!("其余 {gapped} 个返回针对"),
-        ],
     );
 }
 
@@ -560,15 +598,22 @@ fn known_gaps_block(
     let v1 = oc_server::compat_v1::v1_coverage();
     let v1 =
         oc_testkit::compat_report::V1SurfaceCoverage::new(v1.measured, v1.served, v1.redirected);
-    for (index, gap) in oc_testkit::compat_report::known_gaps(
+    let known_gaps = oc_testkit::compat_report::known_gaps(
         gaps.len(),
         upstream.len(),
         v1,
         oc_server::api::openapi_body_schema_gaps(),
-    )
-    .iter()
-    .enumerate()
-    {
+    );
+    let channel_gap = known_gaps
+        .iter()
+        .find(|gap| gap.id == "channel-dependent-database-filename")
+        .expect("the channel-dependent database gap must remain documented");
+    assert_eq!(
+        channel_gap.surface,
+        format!("$XDG_DATA_HOME/{}/opencode-<channel>.db", oc_paths::APP),
+        "the channel database documentation must derive Zuno's data root from oc_paths::APP"
+    );
+    for (index, gap) in known_gaps.iter().enumerate() {
         if index > 0 {
             out.push('\n');
         }
@@ -591,8 +636,13 @@ fn assert_v1_alternatives_are_really_served(
     gaps: &BTreeSet<(String, String)>,
 ) {
     let coverage = oc_server::v1_coverage();
-    contains_all(
+    let v1_section = section(
         "docs/compatibility-matrix.md",
+        "## v1 plugin compatibility routes",
+    );
+    contains_all_in(
+        &v1_section,
+        "docs/compatibility-matrix.md v1 plugin compatibility routes section",
         &[
             &format!(
                 "{} of the {} answer `501 not_implemented`",
@@ -633,6 +683,77 @@ fn assert_v1_alternatives_are_really_served(
             route.path
         );
     }
+}
+
+fn v1_summary_block() -> String {
+    let coverage = oc_server::v1_coverage();
+    format!(
+        "**{measured} v1 routes** are registered from measured installed-plugin callsites. \
+A route with no recorded callsite is scope creep, and a test fails on it.\n\n\
+Registering a route is not the same as backing it: **{served} of the {measured} do real local \
+work**, while **{unbacked} of the {measured} answer `501 not_implemented`**. {redirected} of \
+those {unbacked} name a served `/api` alternative; the other {without_alternative} have no served \
+`/api` spelling here. The generated route table below names every backing. The installed auth \
+plugins' `auth.set` and provider OAuth routes are served; the remaining gaps are non-authentication \
+operations. These figures come from `oc_server::v1_coverage()`, which counts the same route and \
+backend tables the server mounts.",
+        measured = coverage.measured,
+        served = coverage.served,
+        unbacked = coverage.unbacked,
+        redirected = coverage.redirected,
+        without_alternative = coverage.unbacked - coverage.redirected,
+    )
+}
+
+fn v1_capture_coverage_block() -> String {
+    let coverage = oc_server::v1_coverage();
+    let adapters = V1_SURFACE
+        .iter()
+        .filter(|route| matches!(route.backing, oc_server::V1Backing::ApiAdapter(_)))
+        .count();
+    let auth = V1_SURFACE
+        .iter()
+        .filter(|route| {
+            matches!(
+                route.backing,
+                oc_server::V1Backing::LocalAuthStore | oc_server::V1Backing::LocalProviderOAuth
+            )
+        })
+        .count();
+    let toast = V1_SURFACE
+        .iter()
+        .filter(|route| matches!(route.backing, oc_server::V1Backing::LocalToastSink))
+        .count();
+    let unbacked_methods = V1_SURFACE
+        .iter()
+        .filter(|route| !route.backing.is_served())
+        .map(|route| format!("`{}`", route.sdk_method))
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert_eq!(adapters + auth + toast, coverage.served);
+
+    format!(
+        "Current backend coverage is **{served} of {measured} measured routes served locally** and \
+**{unbacked} of {measured} registered as structured `501 not_implemented` seams**. The served set \
+contains {adapters} `/api` adapters, {auth} credential/OAuth routes, and {toast} toast recording \
+sink.\n\n\
+Of the {unbacked} unbacked routes, {redirected} name a served `/api` alternative and \
+{without_alternative} do not. The unbacked SDK methods are {unbacked_methods}. These counts are \
+generated from `oc_server::v1_coverage()` and the same `V1_SURFACE` backing declarations the \
+server mounts.\n\n\
+The practical consequence: the installed auth plugins can authenticate because `auth.set` and \
+both provider OAuth routes have credential backends. Toasts reach the bounded recording sink. A \
+plugin that needs one of the unbacked methods receives a definitive `501` rather than fabricated \
+success data.",
+        measured = coverage.measured,
+        served = coverage.served,
+        unbacked = coverage.unbacked,
+        adapters = adapters,
+        auth = auth,
+        toast = toast,
+        redirected = coverage.redirected,
+        without_alternative = coverage.unbacked - coverage.redirected,
+    )
 }
 
 /// Renders the v1 route table with the status each route really has.
@@ -690,7 +811,13 @@ fn docs_compatibility_matrix_matches_every_code_table() {
     );
 
     check_block(PAGE, "known-gaps", &known_gaps_block(&upstream, &gaps));
+    check_block(PAGE, "v1-summary", &v1_summary_block());
     check_block(PAGE, "v1-routes", &v1_block());
+    check_block(
+        "docs/v1-surface-capture.md",
+        "v1-capture-coverage",
+        &v1_capture_coverage_block(),
+    );
 
     assert_cli_disposition_counts();
     assert_api_counts(&upstream, &served, &gaps);
@@ -857,8 +984,28 @@ fn plugin_hook_block() -> String {
     out
 }
 
+fn plugin_config_paths_block() -> String {
+    format!(
+        "Beyond the config array, Zuno scans every configuration directory for \
+`plugin/*.{{ts,js}}` and `plugins/*.{{ts,js}}`. The directory chain is \
+`$XDG_CONFIG_HOME/{app}`, project `{project}` directories, `$HOME/{project}`, then \
+`OPENCODE_CONFIG_DIR`; files are sorted within `plugin/` and then `plugins/`. \
+`OPENCODE_CONFIG_DIR` deliberately keeps its upstream spelling because installed npm plugins \
+consume it as one of the six retained plugin-ABI environment names. Provenance is retained \
+(`oc_plugin::PluginOrigin`), successful discovery is visible at `DEBUG`, and scan or load \
+failures are warnings that name the affected directory or plugin.",
+        app = oc_paths::APP,
+        project = oc_paths::PROJECT_CONFIG_DIRECTORY,
+    )
+}
+
 #[test]
 fn docs_plugin_guide_matches_the_hooks_and_the_example_the_host_ships() {
+    check_block(
+        "docs/plugin-authoring.md",
+        "plugin-config-paths",
+        &plugin_config_paths_block(),
+    );
     check_block(
         "docs/plugin-authoring.md",
         "plugin-hooks",
@@ -1457,23 +1604,32 @@ fn readme_states_the_pinned_baseline_the_binary_actually_reports() {
 }
 
 #[test]
-fn readme_documents_the_four_gaps_a_side_by_side_user_hits() {
-    contains_all(
-        "README.md",
-        &[
-            // 1. the channel database filename
-            "opencode-local.db",
-            "ZUNO_DISABLE_CHANNEL_DB",
-            // 2. the absent event stream
-            "/api/event",
-            // 3. legacy databases
-            oc_db::migration::DRIZZLE_JOURNAL_TABLE,
-            // 4. provider coverage by wire family
-            "provider-coverage-by-wire-family",
-            // and the rollback the QA scenario requires
-            "回滚",
-        ],
-    );
+fn readmes_define_zuno_as_independent_while_retaining_the_plugin_abi() {
+    let config_root = format!("$XDG_CONFIG_HOME/{}", oc_paths::APP);
+    let data_root = format!("$XDG_DATA_HOME/{}", oc_paths::APP);
+    let plugin_abi = oc_paths::env::PLUGIN_ABI_ENV_NAMES
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    for (relative, independence) in [
+        ("README.md", "不会导入或恢复 opencode 会话"),
+        (
+            "docs/readme/README.en.md",
+            "does not import or restore opencode",
+        ),
+    ] {
+        contains_all(
+            relative,
+            &[
+                independence,
+                &config_root,
+                &data_root,
+                oc_paths::PROJECT_CONFIG_DIRECTORY,
+                oc_cli::COMPATIBILITY_VERSION,
+            ],
+        );
+        contains_all(relative, &plugin_abi);
+    }
 }
 
 #[test]

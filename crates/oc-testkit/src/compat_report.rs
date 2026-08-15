@@ -599,13 +599,14 @@ pub fn known_gaps(
         },
         KnownGap {
             id: "channel-dependent-database-filename".to_owned(),
-            surface: "$XDG_DATA_HOME/opencode/opencode-<channel>.db".to_owned(),
-            detail: "A source build of either implementation resolves opencode-local.db while an \
-                     installed release resolves opencode.db, so a `cargo build` does not see the \
-                     user's sessions. This port mirrors the oracle's rule \
+            surface: "$XDG_DATA_HOME/zuno/opencode-<channel>.db".to_owned(),
+            detail: "A Zuno source build resolves opencode-local.db while an installed release \
+                     resolves opencode.db, so a `cargo build` does not see the release database. \
+                     Zuno retains the oracle's channel filename rule \
                      (packages/core/src/database/database.ts:45-55) exactly, so it is FAITHFUL \
-                     BEHAVIOUR and not a divergence — recorded here because it presents as a \
-                     parity bug the first time anyone tries it. Plan todo 92 owns documenting it."
+                     BEHAVIOUR inside Zuno's own data root and not a divergence — recorded here \
+                     because it presents as a missing-data bug the first time anyone tries it. \
+                     Plan todo 92 owns documenting it."
                 .to_owned(),
         },
         turn_part_gap(),

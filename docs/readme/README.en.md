@@ -1,7 +1,7 @@
 # Zuno
 
-> A Rust implementation of [`opencode`](https://github.com/sst/opencode), pinned to compatibility
-> baseline **1.18.13**.
+> An independent AI coding agent. Zuno keeps [`opencode`](https://github.com/sst/opencode) plugin
+> ABI integration, but binary, configuration, and session compatibility are not product goals.
 
 [简体中文](../../README.md) · English
 
@@ -11,7 +11,7 @@
 - [Install](#install)
 - [Quick start](#quick-start)
 - [Documentation](#documentation)
-- [Run beside the TypeScript binary](#run-beside-the-typescript-binary)
+- [Independent runtime and plugin ABI](#independent-runtime-and-plugin-abi)
 - [Development](#development)
 - [Resource gates](#resource-gates)
 - [License](#license)
@@ -53,8 +53,8 @@ $ zuno --version
 $ zuno --help
 ```
 
-Zuno does not automatically read or change your existing opencode data. Follow the migration guide
-before testing against copied data.
+Zuno reads only its own configuration and data roots. It does not import or restore opencode
+sessions.
 
 ## Documentation
 
@@ -68,20 +68,28 @@ before testing against copied data.
 | [Plugin authoring](../plugin-authoring.md)         | The three plugin tiers and a Rust example                               |
 | [Performance methodology](../perf-methodology.md)  | How memory and liveness gates are measured                              |
 
-Documentation tables are derived from code. Run `cargo test -p oc-cli --test docs` to detect drift,
-or `OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs` to regenerate them.
+Only regions delimited by `generated:BEGIN` and `generated:END` comments are generated from code and
+checked byte-for-byte by `cargo test -p oc-cli --test docs`; the test also derives assertions for a
+small set of critical sections. Explanatory tables and prose outside those markers still require
+review. Use `OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs` to regenerate managed regions.
 
-## Run beside the TypeScript binary
+## Independent runtime and plugin ABI
 
-Zuno uses separate configuration and data roots. It never falls back to the TypeScript binary's
-directories. To test copied data safely:
+Zuno uses `$XDG_CONFIG_HOME/zuno`, project `.zuno` directories, and `$XDG_DATA_HOME/zuno`. It never
+falls back to the corresponding opencode roots and deliberately provides no session import or
+restore workflow. Old roots appear only in upstream-only fixtures, source notes, or historical
+evidence.
 
-1. Copy the original config and data into the Zuno roots.
-2. Back up the copied `opencode.db` before any forward-only migration.
-3. Run `zuno debug paths` and `ZUNO_DISABLE_CHANNEL_DB=1 zuno session list`.
-4. Keep using `opencode` against its untouched original directories.
+The plugin tier is the sole retained compatibility layer. `COMPATIBILITY_VERSION = "1.18.13"`
+continues to satisfy npm `engines.opencode` checks. The six plugin-ABI names also remain unchanged:
+`OPENCODE_CLIENT`, `OPENCODE_CONFIG_CONTENT`, `OPENCODE_CONFIG_DIR`,
+`OPENCODE_DISABLE_CLAUDE_CODE`, `OPENCODE_SERVER_PASSWORD`, and `OPENCODE_SERVER_USERNAME`.
+They identify the plugin contract, not Zuno itself.
 
-See the [migration guide](../migration.md) for exact commands, database precedence, and rollback.
+The repository currently retains its differential suites and compatibility documents as existing
+verification assets. Whether to remove or reshape them is a separate pending decision; their
+presence does not make cross-binary compatibility a product goal or justify adding legacy-path
+fallback, session import, or session restoration.
 
 ## Development
 

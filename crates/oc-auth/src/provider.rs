@@ -10,15 +10,16 @@
 //! | `wellknown` | `auth/index.ts:29-33` | `key`, `token` |
 //!
 //! Discriminated by `type` (`auth/index.ts:35`). Both optional-field shapes and
-//! the `accountId` spelling were confirmed against the live
+//! the `accountId` spelling were confirmed against the live, upstream-only
 //! `$XDG_DATA_HOME/opencode/auth.json` this machine's 1.18.12 binary maintains,
-//! read structurally without its values.
+//! read structurally without its values. Zuno stores this shape under its own
+//! `$XDG_DATA_HOME/zuno/auth.json` root instead.
 //!
-//! # This file is shared with the TypeScript binary
+//! # The shape is compatible; the file is not shared
 //!
-//! Same path, same bytes, either program may have written it. Every behaviour
-//! below that is not obvious from the source was pinned by running the 1.18.12
-//! binary against a scratch `XDG_DATA_HOME`:
+//! Zuno never reads or writes the upstream path. Every wire-shape behaviour below
+//! that is not obvious from the source was pinned by running the 1.18.12 binary
+//! against a scratch `XDG_DATA_HOME`:
 //!
 //! - `opencode auth list` on a file written by [`AuthStore::set`] lists all three
 //!   shapes with the right `type` for each.
