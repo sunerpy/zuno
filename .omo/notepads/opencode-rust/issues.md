@@ -8597,3 +8597,50 @@ R5 上一轮记录的 4 文件 12 处 Zuno 自有旧身份，在 `origin/main` =
    并且 `plugin-abi` 优先于迁移词汇，因为 `engines.opencode` 子串含 `.opencode`。
 
 成本仍是要把规则与例外迁入受维护的测试代码，并在每个合法上游标识新增时显式更新规则。
+
+## 2026-08-15 — R6：`crates/oc-plugin/tests/js.rs:1494` 的静默降级门已关闭（附四步注入证明）
+
+### 缺陷形状
+
+```rust
+let user_config = Path::new("/config/.config/opencode/opencode.json");
+if let Ok(text) = std::fs::read_to_string(user_config) {
+    assert!(text.contains(&spec), "…criterion 6 converged on the version the USER'S CONFIG pins…");
+} else {
+    eprintln!("criterion 6: … was NOT verified");
+}
+```
+
+两个问题叠在一起：真相源在**仓库之外**（无人能复核），且 `if let Ok` 让断言在没有该文件的机器上
+**整条消失**。它今天不使 CI 失败，正因如此才活了下来——与本轮之前已修的三例同族
+（`live_sdk.rs` 用 `ancestors()` 跑出仓库、`plugin_models.rs` 硬编码 `MISE_DATA_DIR`、
+`oc-config/tests/differential.rs` 逐字节读同一个个人配置）。
+
+### 修法：把真相搬回仓库内，并让显式请求 fail-closed
+
+1. 契约 pin 仍是 `oc_plugin::SUPPORTED_JS_PLUGINS`（本文件此前的断言已经这么做）。
+2. 新增**无条件**断言：`docs/v1-surface-capture.md` 的 `Installed plugins` 表里必须有该 spec 的行，
+   且其证据单元格必须是 `<config file>:<line>` 形式（`recorded_plugin_provenance()` 解析表格取第二列）。
+   即：版本可以变，但**版本必须始终带着它被观测到的出处**。
+3. 现场重测改为显式 opt-in：`OC_PLUGIN_CONFIG=<path>`。默认不设。一旦设了就**只能成功或失败**——
+   文件读不到 panic，pin 不上 panic。绝不 skip。
+4. on-disk 半边（`/config/.cache/opencode` 下的已装包 manifest）改用仓库统一的
+   `SKIPPED <test>: <reason>` stderr 约定，并明确写出「仓库内的两半确实跑了」。
+
+### 注入证明（四例，全部实测，源码已复原）
+
+| 实验 | 手法 | 结果 |
+|---|---|---|
+| 旧形状是否真的静默降级 | 临时把旧 `if let Ok` 块指向 `/definitely/not/here/opencode.json` | **PASS**（1 passed）——证实无该文件的机器上它什么也不检查 |
+| 新 opt-in 遇到不存在路径 | `OC_PLUGIN_CONFIG=/definitely/not/here/opencode.json` | **FAILED**，`js.rs:1524`：`could not be read … A live check that was asked for must fail, not skip.` |
+| 新 opt-in 遇到 pin 错版本 | 临时配置写 `@sunerpy/opencode-kiro-auth@0.19.0` | **FAILED**，`js.rs:1530`：`does not pin @sunerpy/opencode-kiro-auth@0.20.6` |
+| 仓库内溯源断言是否可失败 | 把 capture 里 kiro 行的证据单元格改成 `recorded elsewhere` | **FAILED**，`js.rs:1512`：`cites "recorded elsewhere" instead of a <config file>:<line> location` |
+
+两次临时改动均以备份文件复原，`git diff --stat` 复核后只剩本轮预期改动（js.rs 69 插入 / 11 删除，
+capture 零差异）。
+
+### 计数不变的解释
+
+`cargo test --workspace` = 3489 passed / 0 failed / 2 ignored / 213 suites，与 `67037a7` 基线完全一致。
+本轮没有新增或删除测试函数：`criterion_6_converges_the_plan_the_capture_and_this_test_on_one_kiro_auth_version`
+仍是同一个测试，只是其中一半从「条件执行」变成了「无条件执行 + 可选 fail-closed 重测」。

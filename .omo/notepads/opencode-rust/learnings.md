@@ -7362,3 +7362,41 @@ Zuno 自有旧身份；按当前源码先净增 1，再重分类 12 个，得到
 消失了。「缺这一行」和「这一类从未被考虑」在读者眼里一样。现在按固定的 `CATEGORIES`
 清单输出，归零也显式写 `0`。这与「不可失败的门」是同一族缺陷：一条永不触发的规则和
 一条不存在的规则，从输出上看不出区别——所以零值必须与注入证明配对才算证据。
+
+## 2026-08-15 — R6：成功准则退役的判据，与「不可失败的门」在文档层的同型缺陷
+
+### 判据：准则退役只有两个合法理由，「难」不在其中
+
+本轮退役了 `## Success criteria` 的准则 1、2、5，逐条给出的理由都是可核验的事实，不是判断：
+
+| 准则 | 退役理由（实测） | 存活意图落到哪 |
+|---|---|---|
+| 1 | 它点名的 `cargo test --test compat_suite` 所在文件已删除，命令无法运行 | 新增 1a：`cargo test -p oc-cli --test db_migration_ceiling`（迁移天花板拒绝，单二进制即可验证） |
+| 2 | 自身已带 `STATUS DISCLOSED … does not hold`，且量测它的 `oc-config/tests/differential.rs` 已删除（该文件硬编码开发者个人绝对路径做逐字节比对） | 新增 2a：`oc-config` 的 discovery/instructions/variable_substitution/legacy + `oc-catalog` 的 skill/agent 发现 |
+| 3、4 | **未退役**，只改了「身份」：其验证测试仍存在（`cli_parity.rs` / `docs.rs` / `compat_v1.rs`），因此保持在册并点名 | — |
+| 5 | 用户明确撤回（跨二进制会话接管），**没有存活意图可写** | 无。但显式写明两件事：量测文件不删、`zuno session import` 不是本准则描述的东西 |
+
+关键区别，写进了准则里以免下一轮再混：**插件 ABI 是硬要求，与 opencode 二进制的行为等价不是**。
+准则 6/7 明确标注被排除在本次退役之外。
+
+### 文档层的同型缺陷：一条无法运行的命令 = 一个不可失败的门
+
+`docs/compatibility-matrix.md` 曾让读者运行 `cargo test -p oc-testkit --test compat_suite` 并
+`cat target/compat/compat-report.json`。测试文件已删、该产物已无人写入。这与代码里的
+`if let Ok(...)` 空转是同一族：读者按页面照做，得到的不是失败而是「什么也没发生」。
+改法是陈述现状——`known_gaps` 已迁到 `oc_testkit::compat_report::known_gaps` 并渲染成页面上的
+生成块，由 `cargo test -p oc-cli --test docs` 断言。
+
+### 「决定尚待」句是没有闹钟的定时器（第二次实测到）
+
+README.md:98 与 README.en.md:90 都写着「是否删除或重构 differential suites 尚待单独决定」。
+该决定其实已被执行（整面差分套件已删），句子却还在等待。本轮改成陈述已发生的事实，并点名
+仍然存活的三个验证资产（`cli_parity.rs`、`rollback.rs`、`session_interop.rs`），避免下一个读者
+把「保留了测试」误读成「跨二进制兼容仍是产品目标」。
+
+### 退役不等于删除量测：`docs/divergences.toml` 的处理
+
+`non-pure-plugin-generated-trees` 的 reason 以「成功准则 2 被收窄」开头。准则退役后，正确做法
+不是删条目——那会连同「这个差异当初是怎么被知道的」一起抹掉——而是追加一句 `RETAINED 2026-08-15`
+说明准则已退役、条目作为实测记录保留。改 reason 必须跑 `OC_DOCS_REGENERATE=1 cargo test -p oc-cli
+--test docs` 重生 `divergences.md`，否则 `page.contains(entry.reason)` 会失败。

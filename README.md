@@ -95,9 +95,12 @@ Zuno 自己 `export` 出的文档。旧路径只会在 oracle fixture、上游�
 `OPENCODE_DISABLE_CLAUDE_CODE`、`OPENCODE_SERVER_PASSWORD`、`OPENCODE_SERVER_USERNAME`。
 除此之外，Zuno 的用户界面、默认路径和自有环境变量均使用 Zuno 身份。
 
-仓库暂时保留 differential suites 与 compatibility 文档作为已有验证资产；是否删除或重构它们尚待
-单独决定。保留这些测试不等于把跨二进制兼容重新定义为产品目标，也不应据此新增接管 opencode
-会话的能力或旧目录 fallback。
+该决定已经作出：按整个接口面逐字节比对 Zuno 与已发布 `opencode` 二进制输出的 differential
+suites 已被删除，要求它们的成功准则也一并退役。剩下的比对是逐项具名的验证资产，而不是产品承诺：
+`cargo test -p oc-cli --test cli_parity` 仍会拿每条已实现命令的规范化输出与本机固定版本发布二进制
+对比，`crates/oc-cli/tests/rollback.rs` 与 `crates/oc-testkit/tests/session_interop.rs` 仍会跨两个
+真实程序驱动同一个会话，找不到发布二进制时打印可见的 `SKIPPED`。保留这些测试不等于把跨二进制
+兼容重新定义为产品目标，也不构成新增接管 opencode 会话的能力或旧目录 fallback 的理由。
 
 ## 构建与开发
 

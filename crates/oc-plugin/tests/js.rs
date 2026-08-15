@@ -1491,18 +1491,47 @@ fn criterion_6_converges_the_plan_the_capture_and_this_test_on_one_kiro_auth_ver
         );
     }
 
-    let user_config = Path::new("/config/.config/opencode/opencode.json");
-    if let Ok(text) = std::fs::read_to_string(user_config) {
+    // The provenance half, and it runs on every host.
+    //
+    // This used to read `/config/.config/opencode/opencode.json` under an
+    // `if let Ok(...)`, because the criterion's anchor was worded as "the version
+    // the USER'S CONFIG pins". Two things were wrong with that. The anchor pointed
+    // outside the repository, so no reviewer could check it; and the `if let Ok`
+    // made the assertion evaporate on any machine without that developer's file,
+    // which is the unfalsifiable-gate shape three other defects in this project
+    // had. The pin now lives in `SUPPORTED_JS_PLUGINS`, and what the capture is
+    // held to is that it still records *where* that pin was observed — so a
+    // refreshed capture cannot leave a bare version string with no source.
+    let provenance = recorded_plugin_provenance(&capture, &spec).unwrap_or_else(|| {
+        panic!(
+            "docs/v1-surface-capture.md has no `Installed plugins` row for `{spec}`. The capture \
+             is the committed record of where this pin was measured; without the row the version \
+             is unsourced and criterion 6 has nothing a reviewer can check."
+        )
+    });
+    assert!(
+        provenance.contains(".json:"),
+        "the capture's row for `{spec}` cites {provenance:?} instead of a `<config file>:<line>` \
+         location. One version in one place is the narrowing, and a version whose recorded source \
+         has been dropped is how three places came to name three different ones."
+    );
+
+    // Optional live re-measurement of that provenance, and it is fail-closed: an
+    // explicit request must never degrade into a pass the way the old read did.
+    if let Some(live) = std::env::var_os(LIVE_PLUGIN_CONFIG_ENV) {
+        let live = PathBuf::from(live);
+        let text = std::fs::read_to_string(&live).unwrap_or_else(|error| {
+            panic!(
+                "{LIVE_PLUGIN_CONFIG_ENV}={} could not be read ({error}). A live check that was \
+                 asked for must fail, not skip.",
+                live.display()
+            )
+        });
         assert!(
             text.contains(&spec),
-            "{} does not pin {spec}; criterion 6 converged on the version the USER'S CONFIG \
-             pins, so a config change makes this contract stale rather than merely different",
-            user_config.display()
-        );
-    } else {
-        eprintln!(
-            "criterion 6: {} is unreadable here, so the user-config half was NOT verified",
-            user_config.display()
+            "{} does not pin {spec}, so this host's live configuration and the committed capture \
+             disagree about which kiro-auth release criterion 6 is about",
+            live.display()
         );
     }
 
@@ -1521,10 +1550,39 @@ fn criterion_6_converges_the_plan_the_capture_and_this_test_on_one_kiro_auth_ver
         );
     } else {
         eprintln!(
-            "criterion 6: {} is absent here, so the on-disk half was NOT verified",
+            "SKIPPED criterion_6_converges_the_plan_the_capture_and_this_test_on_one_kiro_auth_\
+             version (on-disk half): {} is absent, so the installed package's own manifest was \
+             NOT compared against {spec} on this host. The in-repository halves above did run.",
             installed.display()
         );
     }
+}
+
+/// Point this at a real configuration file to re-measure criterion 6's provenance.
+///
+/// Unset by default, because the contract is anchored in the repository. When it
+/// *is* set the check is fail-closed: an unreadable path or a config pinning a
+/// different release fails the test. A skip would put back the defect this
+/// variable replaced.
+const LIVE_PLUGIN_CONFIG_ENV: &str = "OC_PLUGIN_CONFIG";
+
+/// The evidence cell of the capture's `Installed plugins` row for `spec`.
+///
+/// Returns `None` when no row names `spec`, which is itself a failure at the
+/// callsite — the point is that the recorded version keeps a recorded source.
+fn recorded_plugin_provenance(capture: &str, spec: &str) -> Option<String> {
+    let plugin_cell = format!("`{spec}`");
+    capture
+        .lines()
+        .filter(|line| line.starts_with('|'))
+        .map(|line| {
+            line.trim_matches('|')
+                .split('|')
+                .map(str::trim)
+                .collect::<Vec<_>>()
+        })
+        .find(|cells| cells.len() >= 2 && cells[0] == plugin_cell)
+        .map(|cells| cells[1].to_owned())
 }
 
 /// The behavioural replacement for the removed `client.middlewareStack.add` clause.

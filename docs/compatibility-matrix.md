@@ -2,10 +2,14 @@
 
 This is the retained verification inventory against upstream `opencode` 1.18.13,
 not a promise that Zuno is a drop-in binary or session-store replacement. Zuno is
-independent; only the plugin ABI remains a supported compatibility layer. A
-separate decision is pending on whether to keep or reshape the differential
-suites and these historical compatibility documents. Five states are used
-throughout:
+independent; only the plugin ABI remains a supported compatibility layer.
+
+That decision has since been taken. The whole-surface differential suites that
+byte-compared Zuno's output against a released `opencode` binary are **gone**, and
+the success criteria that required them are retired. What this page still
+describes is live and asserted from code: the `/api` surface the plugin ABI is
+served over, the declared divergences, the CLI disposition table, and the known
+gaps. Five states are used throughout:
 
 - **implemented** — registered and backed by a handler that does the work.
 - **explicit gap (503 backend unavailable)** — the path and method exist, but
@@ -305,18 +309,27 @@ Registering a route is not the same as backing it: **14 of the 20 do real local 
 
 ## Surfaces compared differentially
 
-The compatibility suite records, per surface, whether it was compared against the
-real binary, compared with a declared exception, or never compared — and writes
-that as `target/compat/compat-report.json`. Read the artifact rather than trusting
-a summary here:
+`crates/oc-testkit/tests/compat_suite.rs` used to write a per-surface verdict to
+`target/compat/compat-report.json`. That suite is **deleted** and nothing writes
+that file any more, so this section no longer points at it — a page telling a
+reader to run a test that does not exist is worse than a page that says what is
+actually asserted.
+
+The `known_gaps` half of that report was moved into
+`oc_testkit::compat_report::known_gaps`, which renders the generated
+[Known gaps](#known-gaps) table above. So a gap is now published in a committed
+document rather than in an artifact nobody commits, and it is checked by:
 
 ```sh
-cargo test -p oc-testkit --test compat_suite
-cat target/compat/compat-report.json
+cargo test -p oc-cli --test docs
 ```
 
-Three surfaces are deliberately **never** compared and say so in the report:
-live provider wire bytes (the harness has no HTTP client by construction), TUI
-rendering byte-for-byte (an equivalent interface was the goal, not a pixel-exact
-reproduction of OpenTUI), and the ACP transport (validated against the real SDK
-instead of against the binary).
+What remains of the comparison is per-surface and named. Every implemented CLI
+command's normalized exit status, stdout and stderr are compared against the
+installed pinned release by `cargo test -p oc-cli --test cli_parity`, whose
+exemption floor is frozen by name and whose every exemption must keep a two-sided
+witness. Three surfaces are deliberately **never** compared, and each says so
+where it lives: live provider wire bytes (the harness has no HTTP client by
+construction), TUI rendering byte-for-byte (an equivalent interface was the goal,
+not a pixel-exact reproduction of OpenTUI), and the ACP transport (validated
+against the real SDK instead of against the binary).

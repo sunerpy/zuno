@@ -87,10 +87,15 @@ continues to satisfy npm `engines.opencode` checks. The six plugin-ABI names als
 `OPENCODE_DISABLE_CLAUDE_CODE`, `OPENCODE_SERVER_PASSWORD`, and `OPENCODE_SERVER_USERNAME`.
 They identify the plugin contract, not Zuno itself.
 
-The repository currently retains its differential suites and compatibility documents as existing
-verification assets. Whether to remove or reshape them is a separate pending decision; their
-presence does not make cross-binary compatibility a product goal or justify adding legacy-path
-fallback or adoption of opencode sessions.
+That decision has since been taken. The whole-surface differential suites that byte-compared
+Zuno's output against a released `opencode` binary are gone, and the success criteria that
+required them are retired. What remains is named, per surface, and is a verification asset rather
+than a product promise: `cargo test -p oc-cli --test cli_parity` still compares every implemented
+command's normalized output against the pinned release, and `crates/oc-cli/tests/rollback.rs` plus
+`crates/oc-testkit/tests/session_interop.rs` still drive one session through both real programs,
+printing a visible `SKIPPED` when that release is absent. Their presence does not make cross-binary
+compatibility a product goal or justify adding legacy-path fallback or adoption of opencode
+sessions.
 
 ## Development
 

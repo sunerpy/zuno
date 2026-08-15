@@ -153,9 +153,11 @@ replaced that name with the executable pin after proving the live bytes identica
 optional-key drift (extra `builtIn`/`maxSteps`/`tools`, missing `hidden`/`native`/`steps`/
 `temperature`/`topP`/`variant`) is now characterised without fabricating a capture.
 
-**What would unblock it**: a `/doc` capture from the currently pinned release, taken the way
-`compat_suite.rs` takes its others — refetched from the running binary so provenance is an
-executable assertion rather than a claim. Then the drift becomes measurable and is either
+**What would unblock it**: a `/doc` capture from the currently pinned release, refetched from
+the running binary so provenance is an executable assertion rather than a claim. (This
+sentence named `compat_suite.rs` as the method to copy; that file was deleted with the
+whole-surface differentials on 2026-08-15, so the method is stated directly instead of by
+reference to a file a reader cannot open.) Then the drift becomes measurable and is either
 matched or declared.
 
 **Do NOT** hand-author a capture to make the comparison possible. A capture no test

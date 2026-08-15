@@ -13,7 +13,10 @@ structure that asserted they stayed *out* of the allow-list, so a reader
 consulting this page could not learn about them and no gate could fail while they
 went undeclared. A thirteenth arrived in plan todo 133, declaring what success
 criterion 2's narrowing to pure mode leaves out — because a narrowing nothing
-declares is a waiver. The final four arrived in plan todo 135, when comparing
+declares is a waiver. That criterion was retired on 2026-08-15 when identical
+merged configuration stopped being a promise, and the entry was deliberately kept
+rather than dropped: a retirement that deletes the measurement erases the reason
+the difference was ever known. The final four arrived in plan todo 135, when comparing
 every implemented command's output against the released binary measured real CLI
 differences that had never been written down.
 
@@ -116,7 +119,7 @@ each entry's stated reason. Do not edit it by hand.
 
 **Surface.** `debug config` without `OPENCODE_PURE` — the `agent` and `command` trees a third-party JS plugin synthesises
 
-**Why.** Success criterion 2 was NARROWED on 2026-08-09 to require byte-identical merged configuration in pure mode (`OPENCODE_PURE=1`), where neither binary loads external plugins. Without pure mode the released 1.18.15 binary's own plugin set writes generated entries into the merged config that this port does not reproduce: measured on the user's real `/config/.config/opencode/opencode.json`, a 221818-byte `agent` tree and a 17970-byte `command` tree, against empty `agent` and `command` objects here. Reproducing them means re-implementing third-party plugin output rather than the config contract, so it is a decision and not a gap — and declaring it with its measured sizes is what makes a *new* non-pure difference a failure instead of one absorbed into a vague inequality.
+**Why.** Success criterion 2 was NARROWED on 2026-08-09 to require byte-identical merged configuration in pure mode (`OPENCODE_PURE=1`), where neither binary loads external plugins. Without pure mode the released 1.18.15 binary's own plugin set writes generated entries into the merged config that this port does not reproduce: measured on the user's real `/config/.config/opencode/opencode.json`, a 221818-byte `agent` tree and a 17970-byte `command` tree, against empty `agent` and `command` objects here. Reproducing them means re-implementing third-party plugin output rather than the config contract, so it is a decision and not a gap — and declaring it with its measured sizes is what makes a *new* non-pure difference a failure instead of one absorbed into a vague inequality. RETAINED 2026-08-15: success criterion 2 has itself been retired — Zuno no longer promises a merged configuration identical to another product's, and the differential that measured it is deleted — but this entry stays as the committed record of the measured difference, so the history is not erased by the retirement.
 
 ### plain-cli-presentation
 
