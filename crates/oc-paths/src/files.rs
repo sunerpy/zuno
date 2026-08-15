@@ -9,7 +9,7 @@
 //! | `auth.json` | `packages/opencode/src/auth/index.ts:10` |
 //! | `mcp-auth.json` | `packages/opencode/src/mcp/auth.ts:37` |
 //! | `models.json` / `models-<sha1(source)>.json` | `packages/core/src/models-dev.ts:161-164` |
-//! | `opencode.db` / `opencode-<channel>.db` | `packages/core/src/database/database.ts:43-55` |
+//! | `zuno.db` / `zuno-<channel>.db` | Zuno session database |
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -38,17 +38,18 @@ pub const DEFAULT_MODELS_SOURCE: &str = "https://models.opencode.ai";
 pub const DEFAULT_MODELS_FILE: &str = "models.json";
 
 /// The database file name used on release channels.
-pub const DEFAULT_DB_FILE: &str = "opencode.db";
+pub const DEFAULT_DB_FILE: &str = "zuno.db";
 
-/// The channels that get [`DEFAULT_DB_FILE`] rather than a suffixed name —
-/// `database.ts:49`.
+/// The filename used by Zuno before its independent-project rename completed.
+pub const LEGACY_DB_FILE: &str = "opencode.db";
+
+/// The channels that get [`DEFAULT_DB_FILE`] rather than a suffixed name.
 pub const UNSUFFIXED_DB_CHANNELS: [&str; 3] = ["latest", "beta", "prod"];
 
-/// The channel a build without an `OPENCODE_CHANNEL` define reports —
-/// `installation/version.ts:7`.
+/// The channel a build without a `ZUNO_CHANNEL` define reports.
 pub const LOCAL_CHANNEL: &str = "local";
 
-/// The literal `OPENCODE_DB` value that selects an in-memory database.
+/// The literal `ZUNO_DB` value that selects an in-memory database.
 pub const MEMORY_SENTINEL: &str = ":memory:";
 
 /// Where the session database lives.
@@ -60,7 +61,7 @@ pub const MEMORY_SENTINEL: &str = ":memory:";
 /// string form invites.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DbLocation {
-    /// `OPENCODE_DB=:memory:` — a transient, per-process database.
+    /// `ZUNO_DB=:memory:` — a transient, per-process database.
     Memory,
     /// A file on disk.
     File(PathBuf),
@@ -97,16 +98,11 @@ impl DbLocation {
 
 /// The channel this binary was built for.
 ///
-/// Mirrors `InstallationChannel`: the bundler-injected `OPENCODE_CHANNEL`
-/// define if present, otherwise `"local"`. Here the injection point is a
-/// build-time environment variable read by [`option_env!`], which is the
-/// closest Rust analogue — a release build sets `OPENCODE_CHANNEL=latest` and
-/// therefore reads the same `opencode.db` the TypeScript release binary writes.
+/// Uses the build-time `ZUNO_CHANNEL` value when present, otherwise `"local"`.
 ///
 /// A build that does **not** set it reports `"local"` and consequently uses
-/// `opencode-local.db`. That is exactly what the oracle does when run from
-/// source, so it is parity rather than a bug — but it does mean a
-/// `cargo run` build reads a different database than the installed binary. See
+/// `zuno-local.db`. This means a `cargo run` build reads a different database
+/// than the installed binary. See
 /// `.omo/notepads/opencode-rust/issues.md`.
 #[must_use]
 pub fn installation_channel() -> &'static str {
@@ -221,18 +217,18 @@ impl Layout {
 
     /// Where the session database lives for an explicit channel.
     ///
-    /// The resolution order is `database.ts:43-55` exactly:
+    /// The resolution order is:
     ///
-    /// 1. `OPENCODE_DB` set and equal to `":memory:"` → in memory.
-    /// 2. `OPENCODE_DB` set and absolute → that path, verbatim.
-    /// 3. `OPENCODE_DB` set and relative → **joined onto `data()`**, not onto
+    /// 1. `ZUNO_DB` set and equal to `":memory:"` → in memory.
+    /// 2. `ZUNO_DB` set and absolute → that path, verbatim.
+    /// 3. `ZUNO_DB` set and relative → **joined onto `data()`**, not onto
     ///    the working directory. Verified against the 1.18.12 binary: with
-    ///    `XDG_DATA_HOME=/tmp/dbprobe/xdg` and `OPENCODE_DB=relprobe.db`, the
-    ///    file appeared at `/tmp/dbprobe/xdg/opencode/relprobe.db` while the
+    ///    `XDG_DATA_HOME=/tmp/dbprobe/xdg` and `ZUNO_DB=relprobe.db`, the
+    ///    file appears at `/tmp/dbprobe/xdg/zuno/relprobe.db` while the
     ///    working directory stayed empty.
-    /// 4. Release channel, or `OPENCODE_DISABLE_CHANNEL_DB` exactly `1`/`true`
-    ///    → `data()/opencode.db`.
-    /// 5. Otherwise → `data()/opencode-<sanitized channel>.db`.
+    /// 4. Release channel, or `ZUNO_DISABLE_CHANNEL_DB` exactly `1`/`true`
+    ///    → `data()/zuno.db`.
+    /// 5. Otherwise → `data()/zuno-<sanitized channel>.db`.
     #[must_use]
     pub fn db_path_for_channel(&self, channel: &str) -> DbLocation {
         let data = self.data().to_string_lossy();
@@ -248,9 +244,24 @@ impl Layout {
         if UNSUFFIXED_DB_CHANNELS.contains(&channel) || self.channel_db_disabled() {
             return DbLocation::File(PathBuf::from(node_path::join(&data, DEFAULT_DB_FILE)));
         }
-        let file = format!("opencode-{}.db", sanitize_channel(channel));
+        let file = format!("zuno-{}.db", sanitize_channel(channel));
         DbLocation::File(PathBuf::from(node_path::join(&data, &file)))
     }
+}
+
+/// The pre-rename Zuno database filename corresponding to `path`.
+///
+/// Arbitrary `ZUNO_DB` names return `None`; only the two default filename forms
+/// participate in the hard-cut diagnostic.
+#[must_use]
+pub fn legacy_db_path(path: &Path) -> Option<PathBuf> {
+    let file = path.file_name()?.to_str()?;
+    let legacy = if file == DEFAULT_DB_FILE {
+        LEGACY_DB_FILE.to_owned()
+    } else {
+        format!("opencode-{}", file.strip_prefix("zuno-")?)
+    };
+    Some(path.with_file_name(legacy))
 }
 
 #[cfg(test)]
@@ -387,7 +398,7 @@ mod tests {
         for channel in UNSUFFIXED_DB_CHANNELS {
             assert_eq!(
                 resolved.db_path_for_channel(channel),
-                DbLocation::File(data.join("opencode.db")),
+                DbLocation::File(data.join("zuno.db")),
                 "channel {channel}"
             );
         }
@@ -399,15 +410,15 @@ mod tests {
         let data = Path::new("/config/.local/share/zuno");
         assert_eq!(
             resolved.db_path_for_channel("local"),
-            DbLocation::File(data.join("opencode-local.db"))
+            DbLocation::File(data.join("zuno-local.db"))
         );
         assert_eq!(
             resolved.db_path_for_channel("feature/new-thing"),
-            DbLocation::File(data.join("opencode-feature-new-thing.db"))
+            DbLocation::File(data.join("zuno-feature-new-thing.db"))
         );
         assert_eq!(
             resolved.db_path_for_channel("dev@2.0 rc"),
-            DbLocation::File(data.join("opencode-dev-2.0-rc.db"))
+            DbLocation::File(data.join("zuno-dev-2.0-rc.db"))
         );
     }
 
@@ -417,17 +428,15 @@ mod tests {
             let resolved = layout(&[(HOME, "/config"), (ZUNO_DISABLE_CHANNEL_DB, value)]);
             assert_eq!(
                 resolved.db_path_for_channel("mybranch"),
-                DbLocation::File(PathBuf::from("/config/.local/share/zuno/opencode.db")),
+                DbLocation::File(PathBuf::from("/config/.local/share/zuno/zuno.db")),
                 "value {value}"
             );
         }
-        // `database.ts` compares the raw string, so `TRUE` does not qualify.
+        // The flag compares the raw string, so `TRUE` does not qualify.
         let uppercase = layout(&[(HOME, "/config"), (ZUNO_DISABLE_CHANNEL_DB, "TRUE")]);
         assert_eq!(
             uppercase.db_path_for_channel("mybranch"),
-            DbLocation::File(PathBuf::from(
-                "/config/.local/share/zuno/opencode-mybranch.db"
-            ))
+            DbLocation::File(PathBuf::from("/config/.local/share/zuno/zuno-mybranch.db"))
         );
     }
 
@@ -439,6 +448,19 @@ mod tests {
             (ZUNO_DISABLE_CHANNEL_DB, "1"),
         ]);
         assert_eq!(resolved.db_path_for_channel("mybranch"), DbLocation::Memory);
+    }
+
+    #[test]
+    fn legacy_database_path_maps_only_zuno_default_filename_forms() {
+        assert_eq!(
+            legacy_db_path(Path::new("/data/zuno.db")),
+            Some(PathBuf::from("/data/opencode.db"))
+        );
+        assert_eq!(
+            legacy_db_path(Path::new("/data/zuno-local.db")),
+            Some(PathBuf::from("/data/opencode-local.db"))
+        );
+        assert_eq!(legacy_db_path(Path::new("/data/custom.db")), None);
     }
 
     #[test]

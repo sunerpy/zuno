@@ -11,8 +11,8 @@
 //! $XDG_DATA_HOME/zuno              data()
 //!   ├── auth.json                  auth_file()
 //!   ├── mcp-auth.json              mcp_auth_file()
-//!   ├── opencode.db                db_path()          (release channels)
-//!   ├── opencode-<channel>.db      db_path()          (preview / local)
+//!   ├── zuno.db                    db_path()          (release channels)
+//!   ├── zuno-<channel>.db          db_path()          (preview / local)
 //!   ├── log/                       log()
 //!   ├── repos/                     repos()
 //!   ├── snapshot/                  snapshot_root()
@@ -83,8 +83,8 @@ pub use crate::ensure::PathsError;
 pub use crate::env::Env;
 pub use crate::files::{
     AUTH_FILE, DEFAULT_DB_FILE, DEFAULT_MODELS_FILE, DEFAULT_MODELS_SOURCE, DbLocation,
-    MCP_AUTH_FILE, MEMORY_SENTINEL, SNAPSHOT_DIRECTORY, TOOL_OUTPUT_DIRECTORY,
-    installation_channel,
+    LEGACY_DB_FILE, MCP_AUTH_FILE, MEMORY_SENTINEL, SNAPSHOT_DIRECTORY, TOOL_OUTPUT_DIRECTORY,
+    installation_channel, legacy_db_path,
 };
 pub use crate::layout::{APP, DEBUG_PATHS_KEYS, Layout};
 pub use crate::project::{GLOBAL_PROJECT_ID, Repository, ResolvedProject, Vcs};
@@ -284,7 +284,8 @@ mod tests {
         assert_eq!(MCP_AUTH_FILE, "mcp-auth.json");
         assert_eq!(SNAPSHOT_DIRECTORY, "snapshot");
         assert_eq!(TOOL_OUTPUT_DIRECTORY, "tool-output");
-        assert_eq!(DEFAULT_DB_FILE, "opencode.db");
+        assert_eq!(DEFAULT_DB_FILE, "zuno.db");
+        assert_eq!(LEGACY_DB_FILE, "opencode.db");
         assert_eq!(DEFAULT_MODELS_FILE, "models.json");
         assert_eq!(DEFAULT_MODELS_SOURCE, "https://models.opencode.ai");
         assert_eq!(MEMORY_SENTINEL, ":memory:");

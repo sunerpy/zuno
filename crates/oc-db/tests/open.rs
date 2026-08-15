@@ -1,4 +1,4 @@
-//! Opening `opencode.db`: the pragmas, the `ZUNO_DB` forms, WAL behaviour
+//! Opening `zuno.db`: the pragmas, the `ZUNO_DB` forms, WAL behaviour
 //! under concurrent writers, and proof that `foreign_keys = ON` is in force.
 
 use oc_db::open;
@@ -15,6 +15,57 @@ fn layout(pairs: &[(&str, &str)]) -> Layout {
 
 fn temp_dir() -> tempfile::TempDir {
     tempfile::tempdir().expect("create a temporary directory")
+}
+
+#[test]
+fn default_database_filename_hard_cut_covers_old_new_both_and_neither() {
+    for (old_exists, new_exists) in [(true, false), (false, true), (true, true), (false, false)] {
+        let dir = temp_dir();
+        let old_path = dir.path().join("opencode.db");
+        let new_path = dir.path().join("zuno.db");
+        if old_exists {
+            std::fs::write(&old_path, []).expect("create legacy filename");
+        }
+        if new_exists {
+            std::fs::write(&new_path, []).expect("create current filename");
+        }
+
+        let location = DbLocation::File(new_path.clone());
+        let result = open::open_default_location(&location);
+        if old_exists && !new_exists {
+            let error = result.expect_err("old-only must require an explicit filename migration");
+            let message = error.to_string();
+            assert!(
+                message.contains(&old_path.display().to_string()),
+                "{message}"
+            );
+            assert!(
+                message.contains(&new_path.display().to_string()),
+                "{message}"
+            );
+            assert!(
+                old_path.is_file(),
+                "the diagnostic must not move the old file"
+            );
+            assert!(
+                !new_path.exists(),
+                "the diagnostic must not create the new file"
+            );
+        } else {
+            drop(result.expect("new-only, both, and neither open the Zuno filename"));
+            assert!(
+                new_path.is_file(),
+                "the Zuno filename must be authoritative"
+            );
+        }
+    }
+
+    let dir = temp_dir();
+    let explicit_path = dir.path().join("zuno.db");
+    let legacy_path = dir.path().join("opencode.db");
+    std::fs::write(&legacy_path, []).expect("create unrelated legacy basename");
+    drop(open::open_at(&explicit_path).expect("an explicit path remains authoritative"));
+    assert!(explicit_path.is_file());
 }
 
 // ---------------------------------------------------------------------------

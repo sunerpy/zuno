@@ -69,7 +69,7 @@ Zuno 只读取自己的配置与数据根目录；它不会导入或恢复 openc
 | [docs/compatibility-matrix.md](docs/compatibility-matrix.md) | 每个接口面的状态：implemented、显式 503 gap、added、rejected、not-registered |
 | [docs/divergences.md](docs/divergences.md) | 17 项有意差异及各自原因 |
 | [docs/rejected-inputs.md](docs/rejected-inputs.md) | 已弃用配置、替代形式与准确错误信息 |
-| [docs/migration.md](docs/migration.md) | 打开现有数据库、channel 数据库规则及 38 个迁移 |
+| [docs/migration.md](docs/migration.md) | Zuno 数据库文件选择、旧默认文件名诊断及 schema 演进 |
 | [docs/session-retention.md](docs/session-retention.md) | C8 清理操作指南：`--archive` 可逆，`--delete` 不可逆 |
 | [docs/plugin-authoring.md](docs/plugin-authoring.md) | 三类插件层级与 Rust 示例 |
 | [docs/perf-methodology.md](docs/perf-methodology.md) | 内存和活性门禁的测量方法 |

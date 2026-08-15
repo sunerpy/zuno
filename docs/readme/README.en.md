@@ -58,15 +58,15 @@ sessions.
 
 ## Documentation
 
-| Page                                               | Purpose                                                                 |
-| -------------------------------------------------- | ----------------------------------------------------------------------- |
-| [Compatibility matrix](../compatibility-matrix.md) | Implemented, added, rejected, not-registered, and explicit 503 surfaces |
-| [Declared divergences](../divergences.md)          | Every intentional difference and its reason                             |
-| [Rejected inputs](../rejected-inputs.md)           | Deprecated configuration forms, replacements, and exact errors          |
-| [Migration](../migration.md)                       | Existing databases, channel database selection, and rollback            |
-| [Session retention](../session-retention.md)       | Reversible archive and irreversible delete operations                   |
-| [Plugin authoring](../plugin-authoring.md)         | The three plugin tiers and a Rust example                               |
-| [Performance methodology](../perf-methodology.md)  | How memory and liveness gates are measured                              |
+| Page                                               | Purpose                                                                  |
+| -------------------------------------------------- | ------------------------------------------------------------------------ |
+| [Compatibility matrix](../compatibility-matrix.md) | Implemented, added, rejected, not-registered, and explicit 503 surfaces  |
+| [Declared divergences](../divergences.md)          | Every intentional difference and its reason                              |
+| [Rejected inputs](../rejected-inputs.md)           | Deprecated configuration forms, replacements, and exact errors           |
+| [Database lifecycle](../migration.md)              | Zuno database selection, legacy-filename diagnostics, and schema changes |
+| [Session retention](../session-retention.md)       | Reversible archive and irreversible delete operations                    |
+| [Plugin authoring](../plugin-authoring.md)         | The three plugin tiers and a Rust example                                |
+| [Performance methodology](../perf-methodology.md)  | How memory and liveness gates are measured                               |
 
 Only regions delimited by `generated:BEGIN` and `generated:END` comments are generated from code and
 checked byte-for-byte by `cargo test -p oc-cli --test docs`; the test also derives assertions for a

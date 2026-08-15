@@ -1,8 +1,8 @@
-//! Opening a SQLite connection the way the TypeScript `opencode` binary does.
+//! Opening a Zuno SQLite connection with the proven pragma sequence.
 //!
 //! The pragma sequence is a verbatim port of `database.ts:27-32`, in order, and
 //! the connection target comes from [`oc_paths::db_path`] — this module never
-//! re-derives a path or re-parses `OPENCODE_DB`.
+//! re-parses `ZUNO_DB`.
 
 use oc_error::DbError;
 use oc_paths::DbLocation;
@@ -49,8 +49,8 @@ pub const FOREIGN_KEYS_ON: i64 = 1;
 /// The suffixes SQLite adds beside a WAL database file.
 ///
 /// Recorded as a constant because pruning (todo 82) and vacuuming (todo 84)
-/// both have to move or delete the whole set: deleting `opencode.db` while
-/// leaving `opencode.db-wal` behind loses committed transactions.
+/// both have to move or delete the whole set: deleting `zuno.db` while leaving
+/// `zuno.db-wal` behind loses committed transactions.
 pub const WAL_SIDECAR_SUFFIXES: [&str; 2] = ["-wal", "-shm"];
 
 /// Open the database the running binary would use.
@@ -60,7 +60,21 @@ pub const WAL_SIDECAR_SUFFIXES: [&str; 2] = ["-wal", "-shm"];
 /// [`DbError::Open`] when the file cannot be created or opened, or when a
 /// pragma did not take effect.
 pub fn open_default() -> Result<Connection, DbError> {
-    open(&oc_paths::db_path())
+    open_default_location(&oc_paths::db_path())
+}
+
+/// Open a computed default location and reject a pre-rename database filename.
+///
+/// Explicit `ZUNO_DB` paths must use [`open`] and are never interpreted as a
+/// legacy default, even when their basename happens to be `zuno.db`.
+///
+/// # Errors
+///
+/// [`DbError::LegacyDatabase`] when only the corresponding pre-rename filename
+/// exists, or [`DbError::Open`] when opening the selected location fails.
+pub fn open_default_location(location: &DbLocation) -> Result<Connection, DbError> {
+    reject_legacy_default(location)?;
+    open(location)
 }
 
 /// Open `location`, applying the oracle's pragmas.
@@ -91,6 +105,25 @@ pub fn open_at(path: &Path) -> Result<Connection, DbError> {
     ensure_parent(path)?;
     let location = DbLocation::File(path.to_path_buf());
     open_target(&path.to_string_lossy(), &location)
+}
+
+pub(crate) fn reject_legacy_default(location: &DbLocation) -> Result<(), DbError> {
+    let DbLocation::File(new_path) = location else {
+        return Ok(());
+    };
+    if new_path.exists() {
+        return Ok(());
+    }
+    let Some(old_path) = oc_paths::legacy_db_path(new_path) else {
+        return Ok(());
+    };
+    if old_path.exists() {
+        return Err(DbError::LegacyDatabase {
+            old_path,
+            new_path: new_path.clone(),
+        });
+    }
+    Ok(())
 }
 
 /// Create the directory a database file will live in.

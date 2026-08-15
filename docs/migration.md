@@ -1,15 +1,9 @@
-# Zuno migration and side-by-side operation
+# Zuno database lifecycle
 
-Zuno reads only its own config and data roots. The project made a pre-release
-hard cut, so it never falls back to an existing `opencode` installation. To make
-a one-time local copy for testing without exposing credentials, run:
-
-```sh
-mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/zuno" "${XDG_DATA_HOME:-$HOME/.local/share}/zuno" && cp -a "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/." "${XDG_CONFIG_HOME:-$HOME/.config}/zuno/" && cp -a "${XDG_DATA_HOME:-$HOME/.local/share}/opencode/." "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/"
-```
-
-This copy is explicit and local. Zuno itself performs no path migration and
-continues to ignore the old roots.
+Zuno reads only its own config and data roots. Zuno does not import an opencode database,
+restore opencode sessions, or fall back to an opencode directory. The
+migrations on this page evolve a database already selected by Zuno; they are not
+a cross-product import mechanism.
 
 ## The channel database
 
@@ -18,28 +12,27 @@ compatibility failure: **you run the binary, and the session list is empty.**
 
 Nothing is lost. The two builds selected different database files.
 
-The filename is chosen by build channel, faithfully reproducing upstream's rule:
+The filename is chosen by build channel:
 
 | condition | file |
 |---|---|
 | `ZUNO_DB` is `:memory:` | in memory |
 | `ZUNO_DB` is an absolute path | that path, verbatim |
 | `ZUNO_DB` is relative | joined onto the data directory, **not** the working directory |
-| channel is `latest`, `beta`, or `prod`, or `ZUNO_DISABLE_CHANNEL_DB` is exactly `1` or `true` | `opencode.db` |
-| otherwise | `opencode-<channel>.db` |
+| channel is `latest`, `beta`, or `prod`, or `ZUNO_DISABLE_CHANNEL_DB` is exactly `1` or `true` | `zuno.db` |
+| otherwise | `zuno-<channel>.db` |
 
 A build from source has no channel define, so its channel is `local` and it
-resolves `opencode-local.db`. An installed release resolves `opencode.db`. This is
-true of the TypeScript source tree as well — it is the same rule, not a divergence
-— which is why it is recorded as a known gap in the compatibility report
-(`channel-dependent-database-filename`) rather than in
-[divergences.md](divergences.md).
+resolves `zuno-local.db`. An installed release resolves `zuno.db`. The channel
+selection rule is retained as implementation heritage, but both filenames and
+their data root belong to Zuno. The resulting source-vs-release surprise is
+recorded as `channel-dependent-database-filename` in the compatibility report.
 
-To read the copied release database from a source build, pick one:
+To read the Zuno release database from a source build, pick one:
 
 ```sh
 ZUNO_DISABLE_CHANNEL_DB=1 zuno session list
-ZUNO_DB="${XDG_DATA_HOME:-$HOME/.local/share}/zuno/opencode.db" zuno session list
+ZUNO_DB="${XDG_DATA_HOME:-$HOME/.local/share}/zuno/zuno.db" zuno session list
 ```
 
 `ZUNO_DISABLE_CHANNEL_DB` is matched **case-sensitively** against exactly `1`
@@ -54,26 +47,41 @@ zuno debug paths
 ```
 
 The session-prune report also warns when it cannot attribute artifacts to the
-database it opened, which is the same situation seen from the other side. See
+database it opened. See
 [session-retention.md](session-retention.md#reading-the-artifact-warning).
 
-## Opening an existing database
+## Pre-rename Zuno database filename
+
+An earlier unreleased Zuno build used `opencode.db` or
+`opencode-<channel>.db` inside the **Zuno** data root. When the computed default
+`zuno*.db` is absent but its corresponding old filename exists, Zuno refuses to
+open or move either file and reports both paths. Move the file explicitly after
+checking it:
+
+```sh
+mv "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/opencode.db" \
+  "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/zuno.db"
+```
+
+If both names exist, the `zuno*.db` file is authoritative. Explicit file APIs
+such as `open_at` do not reinterpret a basename; this diagnostic is confined to
+the computed default database path.
+
+## Opening an existing Zuno database
 
 Three states, and this binary handles all three:
 
 1. **Empty file.** The current schema is created and the journal is pre-filled
-   with every migration id, so a later TypeScript run does not replay old SQL.
+   with every migration id.
 2. **A database with a `session` table and a `migration` journal.** Only
    migrations whose id is not recorded are run, each in its own transaction.
 3. **A database older than the `migration` table** — it has a `session` table and
    a Drizzle journal, `__drizzle_migrations`. The `migration` table is created,
    seeded from the names Drizzle recorded, and the remaining migrations run.
 
-State 3 is the one that matters for an older install: before it was implemented,
-**the binary could not open such a database at all.** If you are coming from a
-long-lived installation, this is the path you are on, and
-`crates/oc-db/tests/legacy_migration.rs::legacy_the_users_real_pre_migration_backup_opens_and_keeps_its_sessions`
-runs it against a real pre-migration backup.
+State 3 preserves the schema lineage represented by a Zuno database created
+before the current journal existed. Its regression fixture is historical
+verification data; it does not make an opencode database a supported import.
 
 A database with a `session` table and *neither* journal is refused without being
 modified. That shape cannot be migrated safely by either implementation, and the
@@ -85,21 +93,19 @@ A non-empty database with no `session` table is refused outright:
 database is not empty and has no session table
 ```
 
-### Before you migrate
+### Before schema migration
 
 Migration is forward-only. There is no downgrade. Copy the file first:
 
 ```sh
-cp "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/opencode.db" "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/opencode.db.backup"
+cp "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/zuno.db" "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/zuno.db.backup"
 ```
 
-The schema this binary reaches is byte-compared against a database the real 1.18.12
-binary created (`crates/oc-db/tests/schema.rs`), and a Rust-created database is
-opened by the real binary without replaying migrations
-(`journal_round_trip_through_the_real_binary_does_not_replay_migrations`). So the
-release can keep using a database this binary has migrated. That is what makes
-rolling back to the TypeScript binary work — but it is only tested at the schema
-and journal level, so keep the backup.
+The migration journal is forward-only. If it contains an id above this binary's
+known ceiling, Zuno refuses to open the database and names both the ceiling and
+the observed id. Compatibility tests against historical fixtures remain useful
+verification assets, but they do not establish a supported cross-binary rollback
+contract. Keep the backup before allowing any version to migrate the file.
 
 ## The 38 migrations
 

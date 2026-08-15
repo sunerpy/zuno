@@ -1,4 +1,4 @@
-//! A connection pool over one `opencode.db`, and the transaction helper the
+//! A connection pool over one `zuno.db`, and the transaction helper the
 //! session store runs every write through.
 
 use crate::open;
@@ -52,10 +52,12 @@ impl Pool {
     ///
     /// # Errors
     ///
-    /// [`DbError::Open`] when the database cannot be opened or a pragma did not
-    /// take effect.
+    /// [`DbError::LegacyDatabase`] when the old default filename must be moved,
+    /// or [`DbError::Open`] when the database cannot be opened or configured.
     pub fn open_default() -> Result<Self, DbError> {
-        Self::open(&oc_paths::db_path())
+        let location = oc_paths::db_path();
+        open::reject_legacy_default(&location)?;
+        Self::open(&location)
     }
 
     /// Open a pool on `location`.

@@ -599,9 +599,9 @@ pub fn known_gaps(
         },
         KnownGap {
             id: "channel-dependent-database-filename".to_owned(),
-            surface: "$XDG_DATA_HOME/zuno/opencode-<channel>.db".to_owned(),
-            detail: "A Zuno source build resolves opencode-local.db while an installed release \
-                     resolves opencode.db, so a `cargo build` does not see the release database. \
+            surface: "$XDG_DATA_HOME/zuno/zuno-<channel>.db".to_owned(),
+            detail: "A Zuno source build resolves zuno-local.db while an installed release \
+                     resolves zuno.db, so a `cargo build` does not see the release database. \
                      Zuno retains the oracle's channel filename rule \
                      (packages/core/src/database/database.ts:45-55) exactly, so it is FAITHFUL \
                      BEHAVIOUR inside Zuno's own data root and not a divergence — recorded here \
