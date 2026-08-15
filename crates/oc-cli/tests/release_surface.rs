@@ -822,6 +822,23 @@ fn codebuild_label_sets(text: &str) -> Vec<Vec<String>> {
     sets
 }
 
+fn matrix_entry<'a>(text: &'a str, job: &str, target: &str) -> Vec<&'a str> {
+    let body = job_body(text, job);
+    let target_header = format!("- target: {target}");
+    let mut entry = Vec::new();
+    let mut inside = false;
+    for line in body {
+        let trimmed = line.trim();
+        if trimmed.starts_with("- target: ") {
+            inside = trimmed == target_header;
+        }
+        if inside {
+            entry.push(line);
+        }
+    }
+    entry
+}
+
 #[test]
 fn the_release_matrix_builds_every_target_the_project_ships() {
     let text = workflow("release.yml");
@@ -925,6 +942,49 @@ fn every_codebuild_job_has_a_unique_label_set() {
     );
 }
 
+#[test]
+fn release_matrices_use_the_effective_runner_fields() {
+    const PROJECT_LABEL: &str =
+        "codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}";
+
+    let text = workflow("release.yml");
+    for job in ["build", "smoke"] {
+        let legacy_fields: Vec<_> = job_body(&text, job)
+            .into_iter()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with("os:") || trimmed.starts_with("runner:")
+            })
+            .collect();
+        assert!(
+            legacy_fields.is_empty(),
+            "release.yml's `{job}` matrix retains fields that do not select the runner: \
+             {legacy_fields:?}; `runs_on` is the effective field"
+        );
+    }
+
+    let x86_smoke = matrix_entry(&text, "smoke", "x86_64-unknown-linux-musl").join("\n");
+    for required in [PROJECT_LABEL, "zuno-release-smoke-x86_64-linux"] {
+        assert!(
+            x86_smoke.contains(required),
+            "the x86_64 Linux smoke leg is missing CodeBuild label {required:?}"
+        );
+    }
+
+    let arm_smoke = matrix_entry(&text, "smoke", "aarch64-unknown-linux-musl").join("\n");
+    for required in [
+        PROJECT_LABEL,
+        "zuno-release-smoke-aarch64-linux",
+        "image:arm-3.0",
+        "instance-size:large",
+    ] {
+        assert!(
+            arm_smoke.contains(required),
+            "the aarch64 Linux smoke leg is missing CodeBuild label {required:?}"
+        );
+    }
+}
+
 /// Also from "must not ship an artifact that was never executed": publication has
 /// to depend on the smoke job, not merely coexist with it.
 #[test]
@@ -992,15 +1052,24 @@ fn the_musl_legs_use_zig_and_no_cross_toolchain() {
              cross-compile this workspace's C dependencies without Zig"
         );
     }
-    for musl in ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"] {
-        assert!(
-            text.contains(&format!(
-                "- target: {musl}\n            os: ubuntu-latest\n            use_zigbuild: true"
-            )),
-            "release.yml's `{musl}` entry is not marked `use_zigbuild: true` on \
-             ubuntu-latest; it would fall through to a native build that cannot \
-             link this workspace's C dependencies for that target"
-        );
+    for (musl, routing_label) in [
+        (
+            "x86_64-unknown-linux-musl",
+            "zuno-release-build-x86_64-linux",
+        ),
+        (
+            "aarch64-unknown-linux-musl",
+            "zuno-release-build-aarch64-linux",
+        ),
+    ] {
+        let entry = matrix_entry(&text, "build", musl).join("\n");
+        for required in ["use_zigbuild: true", routing_label] {
+            assert!(
+                entry.contains(required),
+                "release.yml's `{musl}` build entry is missing {required:?}; it \
+                 would not use Zig on its dedicated CodeBuild route"
+            );
+        }
     }
 }
 
