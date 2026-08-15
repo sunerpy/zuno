@@ -579,12 +579,12 @@ pub fn known_gaps(
                 "{api_gap_count} of the {upstream_api_operations} upstream /api operations"
             ),
             detail: format!(
-                "Every upstream operation is invoked against both processes and its status, \
-                 normalized body, and observable session/PTY state delta are captured. {} \
-                 operations have local backends. The remaining {api_gap_count} return an \
-                 operation-specific 503 backend_unavailable response and are never counted as \
-                 parity. The matrix rejects any 501 before applying a differential exemption. \
-                 This remains a compatibility gap, not a declared behavioral difference.",
+                "Every upstream operation is registered here and probed through the real router \
+                 in-process; no second process is executed. {} operations have local backends. \
+                 The remaining {api_gap_count} return an operation-specific 503 \
+                 backend_unavailable response and are never counted as coverage. Any 501 fails \
+                 the gate outright. This remains a gap in this server's own capability, not a \
+                 declared behavioral difference.",
                 upstream_api_operations - api_gap_count,
             ),
         },

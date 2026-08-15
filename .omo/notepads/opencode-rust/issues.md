@@ -8644,3 +8644,61 @@ capture 零差异）。
 `cargo test --workspace` = 3489 passed / 0 failed / 2 ignored / 213 suites，与 `67037a7` 基线完全一致。
 本轮没有新增或删除测试函数：`criterion_6_converges_the_plan_the_capture_and_this_test_on_one_kiro_auth_version`
 仍是同一个测试，只是其中一半从「条件执行」变成了「无条件执行 + 可选 fail-closed 重测」。
+
+## 任务 r7：opt-in + fail-closed 是本仓库处理「仓库外真实语料」的既定先例
+
+### 为什么选「改测试」而不是「只改准则措辞」
+
+F1 给了两个选项：给准则 2a 加限定，说明哪个测试是例外；或把语料检查改成显式 opt-in 且
+fail-closed。选了后者，理由是可证伪性而非洁癖：
+
+只加限定的话，`skill.rs` 里那个空转检查会**留在原地**，而准则 2a 会变成「除某一项外都不读
+宿主路径」。下一个读者看到 `cargo test -p oc-catalog` 里有一个名叫
+`parse_file_accepts_the_users_real_skill_files` 的绿色测试，会合理地认为真实语料被覆盖了——
+在没有那两棵树的机器上（也就是 CI 和除一台以外的所有机器），它覆盖 0 个文件。这正是本 session
+清了一整轮的缺陷：`live_sdk.rs` 的 `ancestors()`、`plugin_models.rs` 的硬编码 `MISE_DATA_DIR`、
+`oc-config/tests/differential.rs` 的开发者个人配置、`live_servers.rs` 只在 rust-analyzer
+**缺失**时跳过。留一个已知的空门禁，等于主动埋下第八个。
+
+改成 opt-in 后，准则 2a 的宿主独立性声明**无条件成立**，不需要例外条款；语料本身的价值也保住
+了——真实作者写的 SKILL.md 会用到 fixture 想不到的 frontmatter 形状。
+
+### 先例：`OC_PLUGIN_CONFIG`（`crates/oc-plugin/tests/js.rs:1567`）
+
+同一形状：变量未设 → 不跑；已设 → 路径读不出来就 **panic**，而不是跳过。注释原话
+「A live check that was asked for must fail, not skip.」新增的
+`OC_SKILL_CORPUS`（`crates/oc-catalog/tests/skill.rs`）沿用同一措辞，便于 grep 出这一族。
+
+用 `std::env::split_paths` 而不是手写 `split(':')`——它在 Windows 上按 `;` 切分，避免把这个
+opt-in 通道做成又一个只在一种宿主上正确的东西。
+
+### 三态 + 两个退化态，全部实测（`CARGO_TARGET_DIR=/tmp/opencode/r7`）
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test -p oc-catalog --test skill parse_file_accepts_every_skill_in_an_opt_in_real_corpus -- --nocapture` | ok，stderr 打印 `SKIPPED ... OC_SKILL_CORPUS is unset, so NO real skill tree was parsed on this host.` |
+| `OC_SKILL_CORPUS=/config/.config/opencode/skill:/config/.agents/skills <同上>` | ok，stderr 打印 `parsed 146 real SKILL.md file(s) from OC_SKILL_CORPUS` |
+| `OC_SKILL_CORPUS=/config/.config/opencode/skill:/nonexistent/skills <同上>` | **FAILED**：`/nonexistent/skills, which is not a directory. A live check that was asked for must fail, not skip.` |
+| `OC_SKILL_CORPUS=<一个空目录> <同上>` | **FAILED**：`contains no SKILL.md. Walking an empty tree would report success without parsing anything.` |
+| `OC_SKILL_CORPUS= <同上>` | **FAILED**：`is set to "", which names no directory.` |
+
+后两态是刻意加的：只挡「路径不存在」还不够——指向一个空目录，或把变量设成空串，都会让
+「显式请求」退化成 0 次断言的 PASS，也就是换了个入口的同一个空门禁。
+
+### 本轮完整门禁结果
+
+- `cargo test --workspace`：**3489 passed / 0 failed / 2 ignored / 213 suites**，与 `452ee2f`
+  基线完全一致。测试重命名（`parse_file_accepts_the_users_real_skill_files` →
+  `parse_file_accepts_every_skill_in_an_opt_in_real_corpus`）是 1:1，计数无需解释。
+- `make lint` 0 warning；`make fmt-check` clean。
+- `make smoke-artifact`：PASS（必须 **unset** `CARGO_TARGET_DIR`，`Makefile:28` 的
+  `TARGET_DIR := target` 不读该变量；`make smoke` 不建二进制，会以
+  `target/release/zuno is not a file` 失败）。
+- 期间 `df -h /` 从 81% 升到 87%，未触发磁盘假失败。
+
+### 改 `known_gaps` 常量必须连带重生文档
+
+`crates/oc-testkit/src/compat_report.rs` 的 `known_gaps` detail 会渲染进
+`docs/compatibility-matrix.md` 的 `known-gaps` 生成块，而 `check_block` 逐字节断言。改常量后
+必须跑 `OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs` 再 review diff，否则 docs 门禁
+红在一个看起来与本次改动无关的地方。

@@ -70,7 +70,7 @@ loses and, where one exists, the test that fails if the gap closes or goes stale
 
 **Surface.** 10 of the 58 upstream /api operations
 
-**What is missing.** Every upstream operation is invoked against both processes and its status, normalized body, and observable session/PTY state delta are captured. 48 operations have local backends. The remaining 10 return an operation-specific 503 backend_unavailable response and are never counted as parity. The matrix rejects any 501 before applying a differential exemption. This remains a compatibility gap, not a declared behavioral difference.
+**What is missing.** Every upstream operation is registered here and probed through the real router in-process; no second process is executed. 48 operations have local backends. The remaining 10 return an operation-specific 503 backend_unavailable response and are never counted as coverage. Any 501 fails the gate outright. This remains a gap in this server's own capability, not a declared behavioral difference.
 
 ### permission-evaluation-semantics
 
@@ -195,14 +195,17 @@ capability and remain reported as gaps rather than compatibility.
 
 The two SSE operations are implemented: `GET /api/event` immediately emits
 `server.connected`, while `GET /api/session/{sessionID}/event` replays durable
-events after `?after=<sequence>` and continues live. The differential matrix
-invokes all 58 operations against both binaries, captures status, normalized
-body, and observable side-effect delta, and rejects a `501` before any exemption.
-The ten session-read, request-state, and PTY-attach operations added in task 128
-compare status and operation-scoped normalized bodies. Session message pages
-default to 50 entries and cap at 200; durable history defaults to 50 and caps at
-100. PTY attach credentials expire after 60 seconds, are single-use and
-scope-bound, and are never included in error responses.
+events after `?after=<sequence>` and continues live. All 58 operations are probed
+through the real router in-process, as described above; **no second binary is
+executed**, and any `501` fails the gate outright rather than being exempted. The
+whole-surface differential that once compared both processes was deleted when
+behavioural equivalence with `opencode` stopped being a promise. The ten
+session-read, request-state, and PTY-attach operations added in task 128 have
+their status and operation-scoped normalized bodies asserted against recorded
+expectations. Session message pages default to 50 entries and cap at 200; durable
+history defaults to 50 and caps at 100. PTY attach credentials expire after 60
+seconds, are single-use and scope-bound, and are never included in error
+responses.
 
 <!-- generated:BEGIN api-operations -->
 | method | path | state |

@@ -7400,3 +7400,60 @@ README.md:98 与 README.en.md:90 都写着「是否删除或重构 differential 
 不是删条目——那会连同「这个差异当初是怎么被知道的」一起抹掉——而是追加一句 `RETAINED 2026-08-15`
 说明准则已退役、条目作为实测记录保留。改 reason 必须跑 `OC_DOCS_REGENERATE=1 cargo test -p oc-cli
 --test docs` 重生 `divergences.md`，否则 `page.contains(entry.reason)` 会失败。
+
+## 任务 r7：F1 两个 Blocker（准则 4 自相矛盾、准则 2a 宿主独立性声明为假）
+
+### 「不可能失败的门禁」有文档层形态，且比代码层更难发现
+
+本轮两个 Blocker 是同一缺陷族的两半：
+
+- **代码层（Blocker 2）**：`crates/oc-catalog/tests/skill.rs` 的语料检查硬编码
+  `/config/.config/opencode/skill` 与 `/config/.agents/skills`，对缺失的根 `continue`，
+  打印 `skipped` 却仍然 PASS。除一台机器外，它遍历 0 个文件、断言 0 次，且通过与否取决于
+  仓库外的可变内容。
+- **文档层（Blocker 1）**：准则 4 在同一段里既要求「comparing ... **against the real
+  binary**」，又断言「Its verification is in the repository and **needs no second
+  binary**」。前半句是整面差分套件被删之前的遗留，后半句是删除之后补写的。两句都在，读者
+  按前半句去找那个矩阵会找不到，按后半句去信任则会漏掉「501 直接失败」这一真正的强约束。
+
+文档层更难发现，因为它不会红。代码层的空转至少能用 `checked == 0` 观察到；一段过期的准则
+描述只会在有人真的去执行它时才暴露。**结论：删除一个门禁时，必须同时 grep 所有描述它的
+句子**——本轮除准则 4 外，同一句谎言还活在两处：`docs/compatibility-matrix.md:199`
+（「The differential matrix invokes all 58 operations against both binaries」）和
+`crates/oc-testkit/src/compat_report.rs:582` 的 `known_gaps` detail 常量
+（「invoked against both processes ... rejects any 501 before applying a differential
+exemption」）。后者是代码常量，会渲染进生成块，改文档而不改常量会让 `check_block` 失败。
+
+### 修正描述可以顺带加强门禁，不必权衡
+
+把准则 4 改成描述实际存在的验证时，有两处顺带变严，且都不是新目标：
+
+1. 十个 `503` 缺口的旧措辞只点了三组（integration connect / credential / single-message
+   read），漏掉了 `POST /api/session/{id}/permission` 与
+   `GET /api/session/{id}/permission/{requestID}`。按生成表逐行核对后补全为四组，枚举与
+   实际 10 行完全对应。
+2. 旧措辞给 `/compact` 与 `/wait` 留了豁免，理由是「隔离的 oracle 无 provider 时也答
+   503，比对两条不可用路径是假 parity」。该理由完全依赖跨进程比对；比对不存在了，豁免也就
+   不再描述任何东西。生成表里这两条现在读作 `implemented`——把它们从豁免移回 48 条之内，
+   是收紧而不是放松。
+
+### 「冻结」要说清是靠什么冻结的
+
+旧措辞只说缺口集合「enumerated and **frozen**: a test must fail if that set grows」。实际
+机制是 `docs.rs::check_block` 对生成块**逐字节**比较（仅 `OC_DOCS_REGENERATE=1` 时才改写），
+所以集合**增或减**都会让 `docs_compatibility_matrix_matches_every_code_table` 失败，直到有人
+重生并 review diff。写清机制之后，读者不需要相信「有个测试会失败」，可以自己去看是哪个。
+
+反过来，旧措辞里「or if an operation leaves it **without gaining a compared backend**」是
+过度承诺：探针只能把离开缺口集的操作重新分类为 `implemented`，没有任何测试强制为它新增一条
+逐操作比对。已按实际机制改写。
+
+### 准则 3 与准则 4 形状不同，不应被拉平
+
+F1 指出准则 4 措辞「overstating the surviving verification」，隐含准则 3、4 应一致。逐字核对
+后结论是**两者形状本就不同，且都成立**：`cli_parity.rs` 确实执行安装的 pinned release
+（`oracle_is_available()` 在 `cli_parity.rs:734`，门控 4 个比对测试加第 5 个的 witness 半边），
+所以准则 3 的跨二进制说法描述的是存在的比对。真正需要补的不是把它改成本地化，而是**明确它
+从不声称宿主独立**——缺失时每个测试打印点名「未比对了什么」的 `SKIPPED`，且错版本二进制会
+panic 而非被接受。把这句写进准则，才能防止下一个读者以为 `cargo test -p oc-cli --test
+cli_parity` 在任何机器上都在真的比对。

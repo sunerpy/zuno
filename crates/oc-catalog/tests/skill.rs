@@ -447,29 +447,86 @@ fn parse_file_round_trips_a_good_skill() {
     );
 }
 
+/// Names the roots of an opt-in real-world corpus, `PATH`-separated.
+const SKILL_CORPUS_ENV: &str = "OC_SKILL_CORPUS";
+
+/// An opt-in corpus check: every `SKILL.md` under the requested roots must parse.
+///
+/// This used to hardcode two absolute host paths
+/// (`/config/.config/opencode/skill` and `/config/.agents/skills`) and `continue`
+/// past each one that was absent, so on every machine but one it walked nothing,
+/// counted nothing, and passed. That is the unfalsifiable-gate shape this project
+/// removed from `oc-config/tests/differential.rs`, `plugin_models.rs` and
+/// `live_sdk.rs`: a check whose subject lives outside the repository and whose
+/// absence is indistinguishable from success.
+///
+/// The corpus itself is worth keeping — real authored skill files exercise
+/// frontmatter shapes the fixtures do not invent — so it follows the precedent
+/// `crates/oc-plugin/tests/js.rs` set for its live config re-measurement: the
+/// check runs **only when asked for**, and once asked for it is **fail-closed**.
+/// Three states, all distinguishable from the outside:
+///
+/// * `OC_SKILL_CORPUS` unset — announces a visible `SKIPPED` and asserts nothing.
+/// * set to a root that is missing, is not a directory, or holds no `SKILL.md` —
+///   **fails**, because a request that silently degrades into a pass is the
+///   defect, not the fix.
+/// * set to a real tree — every `SKILL.md` under it must parse and yield a name.
 #[test]
-fn parse_file_accepts_the_users_real_skill_files() {
-    // A cheap corpus check: every SKILL.md the surveyed machine ships must parse.
-    // Read-only; skipped when the tree is not present.
-    let roots = [
-        Path::new("/config/.config/opencode/skill"),
-        Path::new("/config/.agents/skills"),
-    ];
+fn parse_file_accepts_every_skill_in_an_opt_in_real_corpus() {
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    let Some(raw) = std::env::var_os(SKILL_CORPUS_ENV) else {
+        eprintln!(
+            "SKIPPED parse_file_accepts_every_skill_in_an_opt_in_real_corpus: \
+             {SKILL_CORPUS_ENV} is unset, so NO real skill tree was parsed on this host. Set it to \
+             one or more `{separator}`-separated directories to run the corpus check; once \
+             requested it fails rather than skips."
+        );
+        return;
+    };
+
+    let roots = std::env::split_paths(&raw)
+        .filter(|root| !root.as_os_str().is_empty())
+        .collect::<Vec<_>>();
+    assert!(
+        !roots.is_empty(),
+        "{SKILL_CORPUS_ENV} is set to {raw:?}, which names no directory. An explicit request must \
+         name a corpus; an empty request is how the old hardcoded-path version passed without \
+         reading anything."
+    );
+
     let mut checked = 0usize;
-    for root in roots {
-        if !root.is_dir() {
-            continue;
-        }
-        for entry in walk(root) {
+    for root in &roots {
+        assert!(
+            root.is_dir(),
+            "{SKILL_CORPUS_ENV} names {}, which is not a directory. A live check that was asked \
+             for must fail, not skip.",
+            root.display()
+        );
+        let found = walk(root);
+        assert!(
+            !found.is_empty(),
+            "{SKILL_CORPUS_ENV} names {}, which contains no SKILL.md. Walking an empty tree would \
+             report success without parsing anything.",
+            root.display()
+        );
+        for entry in found {
             let skill = parse_file(&entry)
                 .unwrap_or_else(|error| panic!("{} must parse: {error}", entry.display()));
-            assert!(!skill.name.is_empty());
+            assert!(
+                !skill.name.is_empty(),
+                "{} parsed to an empty name",
+                entry.display()
+            );
             checked += 1;
         }
     }
-    if checked == 0 {
-        eprintln!("skipped: no real skill tree on this host");
-    }
+
+    assert!(
+        checked > 0,
+        "{SKILL_CORPUS_ENV} named {} root(s) but nothing was parsed",
+        roots.len()
+    );
+    eprintln!("parsed {checked} real SKILL.md file(s) from {SKILL_CORPUS_ENV}");
 }
 
 fn walk(root: &Path) -> Vec<PathBuf> {
