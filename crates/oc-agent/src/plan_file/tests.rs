@@ -169,6 +169,59 @@ fn reading_a_missing_plan_is_not_an_error() {
     );
 }
 
+fn legacy_plan_states(old_present: bool, new_present: bool) -> io::Result<Option<String>> {
+    let root = tempfile::tempdir().expect("temporary worktree");
+    if old_present {
+        let legacy = root
+            .path()
+            .join(oc_paths::LEGACY_PROJECT_DIRECTORY)
+            .join(PLANS_DIRECTORY);
+        std::fs::create_dir_all(&legacy).expect("create legacy plans directory");
+        std::fs::write(
+            legacy.join(key().file_name().expect("a plain slug resolves")),
+            "legacy body\n",
+        )
+        .expect("write legacy plan");
+    }
+    if new_present {
+        write_plan(PlanLocation::Worktree(root.path()), key(), "new body\n").expect("write");
+    }
+    read_plan(PlanLocation::Worktree(root.path()), key())
+}
+
+#[test]
+fn a_plan_read_with_neither_document_is_still_not_an_error() {
+    assert_eq!(legacy_plan_states(false, false).expect("read"), None);
+}
+
+#[test]
+fn a_plan_left_at_the_pre_rename_path_is_reported_rather_than_ignored() {
+    let error = legacy_plan_states(true, false).expect_err("the legacy document must be reported");
+    let message = error.to_string();
+    for expected in [oc_paths::LEGACY_PROJECT_DIRECTORY, PROJECT_DIRECTORY, "mv "] {
+        assert!(
+            message.contains(expected),
+            "the diagnostic must name {expected}, got: {message}"
+        );
+    }
+}
+
+#[test]
+fn a_migrated_plan_reads_without_a_diagnostic() {
+    assert_eq!(
+        legacy_plan_states(false, true).expect("read"),
+        Some("new body\n".to_owned())
+    );
+}
+
+#[test]
+fn a_plan_present_in_both_locations_reads_the_new_one() {
+    assert_eq!(
+        legacy_plan_states(true, true).expect("read"),
+        Some("new body\n".to_owned())
+    );
+}
+
 #[test]
 fn two_sessions_in_the_same_millisecond_get_different_documents() {
     let root = tempfile::tempdir().expect("temporary worktree");

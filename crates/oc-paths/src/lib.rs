@@ -78,7 +78,9 @@ pub mod walk;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-pub use crate::config_chain::PROJECT_CONFIG_DIRECTORY;
+pub use crate::config_chain::{
+    LEGACY_PROJECT_DIRECTORY, PROJECT_CONFIG_DIRECTORY, PROJECT_DIRECTORY, unmigrated_project_path,
+};
 pub use crate::ensure::PathsError;
 pub use crate::env::Env;
 pub use crate::files::{

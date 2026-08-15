@@ -114,8 +114,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// The project-local directory the oracle keeps its own project state in.
-pub const PROJECT_DIRECTORY: &str = ".zuno";
+pub use oc_paths::PROJECT_DIRECTORY;
 
 /// The subdirectory of [`PROJECT_DIRECTORY`] holding goal documents.
 pub const GOAL_DIRECTORY: &str = "goal";
@@ -883,7 +882,20 @@ fn box_of(state: bool) -> &'static str {
 fn read_optional(path: &Path) -> Result<Option<String>, GoalError> {
     match std::fs::read_to_string(path) {
         Ok(raw) => Ok(Some(raw)),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            match oc_paths::unmigrated_project_path(path) {
+                Some(old) => Err(GoalError::Document {
+                    operation: "read",
+                    path: old,
+                    source: std::io::Error::other(
+                        "this goal document predates the .zuno rename; Zuno does not read \
+                         .opencode/goal/, so move the file to the .zuno/goal/ path reported \
+                         above (or delete it) and run the command again",
+                    ),
+                }),
+                None => Ok(None),
+            }
+        }
         Err(source) => Err(GoalError::Document {
             operation: "read",
             path: path.to_path_buf(),

@@ -324,7 +324,11 @@ impl ToolRegistryBuilder {
     pub fn build(self) -> ToolRegistry {
         let config_directories =
             oc_paths::config_directories(&self.directory, self.worktree.as_deref());
-        let output_store = ToolOutputStore::new(self.directory.join(".zuno/tool-output"));
+        let output_store = ToolOutputStore::new(
+            self.directory
+                .join(oc_paths::PROJECT_DIRECTORY)
+                .join(oc_paths::TOOL_OUTPUT_DIRECTORY),
+        );
         let mut diagnostics = Vec::new();
         let core = Arc::new_cyclic(|weak| {
             let mut sourced_tools = Vec::new();

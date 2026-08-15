@@ -59,8 +59,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// The project-local directory the oracle keeps its own project state in.
-pub const PROJECT_DIRECTORY: &str = ".zuno";
+pub use oc_paths::PROJECT_DIRECTORY;
 
 /// The subdirectory holding plan documents, in both locations
 /// (`session/session.ts:332-334`).
@@ -168,6 +167,11 @@ pub fn write_plan(location: PlanLocation<'_>, key: PlanKey<'_>, body: &str) -> i
 ///
 /// [`io::ErrorKind::InvalidInput`] when the slug is refused; otherwise whatever the
 /// filesystem reported while reading.
+///
+/// Also an error, rather than `Ok(None)`, when the plan is absent here but present
+/// at the pre-rename `.opencode/plans/` path. Reporting "no plan" there would make
+/// the model write a fresh plan over a document the user cannot see is being
+/// ignored, so the read refuses and names both paths.
 pub fn read_plan(location: PlanLocation<'_>, key: PlanKey<'_>) -> io::Result<Option<String>> {
     let path = plan_path(location, key).ok_or_else(|| {
         io::Error::new(
@@ -177,7 +181,20 @@ pub fn read_plan(location: PlanLocation<'_>, key: PlanKey<'_>) -> io::Result<Opt
     })?;
     match std::fs::read_to_string(&path) {
         Ok(body) => Ok(Some(body)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match oc_paths::unmigrated_project_path(&path) {
+                Some(old) => Err(io::Error::other(format!(
+                    "a plan document exists at the pre-rename path {} but not at {}. \
+                 Zuno does not read the old directory: move it with \
+                 `mv {} {}` (or delete it) and run the command again",
+                    old.display(),
+                    path.display(),
+                    old.display(),
+                    path.display()
+                ))),
+                None => Ok(None),
+            }
+        }
         Err(error) => Err(error),
     }
 }

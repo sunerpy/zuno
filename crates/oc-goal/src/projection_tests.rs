@@ -846,3 +846,59 @@ fn the_render_is_atomic_under_a_concurrent_reader() {
         "every temporary file must have been renamed away, found {stragglers:?}"
     );
 }
+
+fn write_legacy_document(fixture: &Fixture, body: &str) {
+    let legacy = fixture
+        .projection
+        .path()
+        .parent()
+        .expect("the document has a directory")
+        .parent()
+        .expect("the goal directory sits inside the project directory")
+        .parent()
+        .expect("the project directory sits inside the worktree")
+        .join(oc_paths::LEGACY_PROJECT_DIRECTORY)
+        .join(GOAL_DIRECTORY);
+    std::fs::create_dir_all(&legacy).expect("create the legacy goal directory");
+    let name = fixture
+        .projection
+        .path()
+        .file_name()
+        .expect("the document has a file name")
+        .to_owned();
+    std::fs::write(legacy.join(name), body).expect("write the legacy document");
+}
+
+#[test]
+fn a_goal_document_left_at_the_pre_rename_path_is_reported_rather_than_silently_restored() {
+    let fixture = Fixture::new();
+    fixture.create("ship the thing", None);
+    std::fs::remove_file(fixture.projection.path()).expect("remove the migrated document");
+    write_legacy_document(&fixture, "a human edit nobody would see\n");
+
+    let error = fixture
+        .projection
+        .ingest(&fixture.store)
+        .expect_err("the legacy document must be reported");
+    let message = error.to_string();
+    assert!(
+        message.contains(oc_paths::LEGACY_PROJECT_DIRECTORY),
+        "the diagnostic must name the legacy directory, got: {message}"
+    );
+}
+
+#[test]
+fn a_goal_document_with_no_legacy_counterpart_is_still_restored() {
+    let fixture = Fixture::new();
+    fixture.create("ship the thing", None);
+    std::fs::remove_file(fixture.projection.path()).expect("remove the migrated document");
+    assert!(matches!(fixture.ingest(), Ingest::Restored));
+}
+
+#[test]
+fn a_goal_document_present_in_both_locations_ingests_the_new_one() {
+    let fixture = Fixture::new();
+    fixture.create("ship the thing", None);
+    write_legacy_document(&fixture, "a stale pre-rename projection\n");
+    assert!(matches!(fixture.ingest(), Ingest::OwnRender));
+}

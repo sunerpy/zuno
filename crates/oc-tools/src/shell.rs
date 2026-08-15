@@ -21,6 +21,7 @@ use tokio::process::{Child, Command};
 use tree_sitter::{Node, Parser};
 
 const TOOL_ID: &str = "bash";
+const BACKGROUND_DIRECTORY: &str = "background";
 const TERMINATE_GRACE: Duration = Duration::from_millis(200);
 const DESCRIPTION: &str = "Executes a command with the configured shell. Commands are parsed with tree-sitter before execution so each constituent command is permission-checked independently. A deterministic destructive-command gate runs before every foreground or background spawn. This is not a sandbox: commands retain the user's full filesystem, network, and credentials; confinement is a future decision, not an implied guarantee. Use workdir instead of changing directories inside the command.";
 
@@ -149,9 +150,15 @@ impl ShellTool {
     pub fn with_configured_shell(workspace: &Path, configured: Option<&Path>) -> io::Result<Self> {
         let workspace = workspace.canonicalize()?;
         let shell = discover_shell(configured)?;
-        let output_store = ToolOutputStore::new(workspace.join(".zuno").join("tool-output"));
+        let output_store = ToolOutputStore::new(
+            workspace
+                .join(oc_paths::PROJECT_DIRECTORY)
+                .join(oc_paths::TOOL_OUTPUT_DIRECTORY),
+        );
         let background_manager = Arc::new(LocalBackgroundManager::new(
-            workspace.join(".zuno").join("background"),
+            workspace
+                .join(oc_paths::PROJECT_DIRECTORY)
+                .join(BACKGROUND_DIRECTORY),
         ));
         Ok(Self {
             workspace,

@@ -39,8 +39,59 @@ use crate::Layout;
 use crate::node_path;
 use crate::walk;
 
-/// The per-project configuration directory name.
-pub const PROJECT_CONFIG_DIRECTORY: &str = ".zuno";
+/// The per-project directory Zuno keeps its own project-local state in.
+///
+/// This is the single definition. Configuration reads it, and so do plan
+/// documents (`oc-agent`), the goal projection (`oc-goal`), and the tool-output
+/// and background stores (`oc-tools`). Three independent copies existed before,
+/// which is how the rename to `.zuno` landed in some of them and not others.
+///
+/// The plugin ABI is deliberately out of scope: `engines.opencode` and the six
+/// `OPENCODE_*` handshake variables are a contract with someone else's code and
+/// keep the upstream name.
+pub const PROJECT_DIRECTORY: &str = ".zuno";
+
+/// The per-project configuration directory name, which is [`PROJECT_DIRECTORY`].
+pub const PROJECT_CONFIG_DIRECTORY: &str = PROJECT_DIRECTORY;
+
+/// The pre-rename project directory name, used only to detect unmigrated state.
+pub const LEGACY_PROJECT_DIRECTORY: &str = ".opencode";
+
+/// The pre-rename path of a project-local state file that was never migrated.
+///
+/// | `.zuno` file | `.opencode` file | result |
+/// |---|---|---|
+/// | absent | absent | `None` — an ordinary new project |
+/// | absent | present | `Some(old)` — the state a diagnostic must name |
+/// | present | absent | `None` — migrated |
+/// | present | present | `None` — the new file wins, as everywhere else |
+///
+/// A path with no `.zuno` component, or more than one, returns `None` rather
+/// than guessing which component was meant.
+///
+/// Detection only: it does not read, copy, merge, or fall back to the legacy
+/// file — the same hard cut [`crate::legacy_db_path`] makes for the database
+/// filename.
+#[must_use]
+pub fn unmigrated_project_path(new_path: &Path) -> Option<PathBuf> {
+    if new_path.exists() {
+        return None;
+    }
+    let mut rebuilt = PathBuf::new();
+    let mut swapped = 0_usize;
+    for component in new_path.components() {
+        if component.as_os_str() == std::ffi::OsStr::new(PROJECT_DIRECTORY) {
+            swapped += 1;
+            rebuilt.push(LEGACY_PROJECT_DIRECTORY);
+        } else {
+            rebuilt.push(component);
+        }
+    }
+    if swapped != 1 {
+        return None;
+    }
+    rebuilt.exists().then_some(rebuilt)
+}
 
 impl Layout {
     /// Port of `ConfigPaths.directories`.
@@ -205,6 +256,73 @@ mod tests {
     #[test]
     fn zuno_path_matrix_adds_no_project_directory_when_neither_exists() {
         assert_eq!(project_marker_membership(false, false), (false, false));
+    }
+
+    fn unmigrated_state(old_present: bool, new_present: bool) -> (Option<PathBuf>, PathBuf) {
+        let root = tempfile::tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        let new_path = repo.join(PROJECT_DIRECTORY).join("plans").join("plan.md");
+        let old_path = repo
+            .join(LEGACY_PROJECT_DIRECTORY)
+            .join("plans")
+            .join("plan.md");
+        for (present, path) in [(old_present, &old_path), (new_present, &new_path)] {
+            if present {
+                fs::create_dir_all(path.parent().expect("parent")).expect("create fixture parent");
+                fs::write(path, "body").expect("write fixture document");
+            }
+        }
+        (unmigrated_project_path(&new_path), old_path)
+    }
+
+    #[test]
+    fn unmigrated_project_path_reports_nothing_when_neither_document_exists() {
+        assert_eq!(unmigrated_state(false, false).0, None);
+    }
+
+    #[test]
+    fn unmigrated_project_path_reports_the_legacy_document_when_only_it_exists() {
+        let (found, old_path) = unmigrated_state(true, false);
+        assert_eq!(found, Some(old_path));
+    }
+
+    #[test]
+    fn unmigrated_project_path_reports_nothing_when_only_the_new_document_exists() {
+        assert_eq!(unmigrated_state(false, true).0, None);
+    }
+
+    #[test]
+    fn unmigrated_project_path_reports_nothing_when_both_documents_exist() {
+        assert_eq!(unmigrated_state(true, true).0, None);
+    }
+
+    #[test]
+    fn unmigrated_project_path_refuses_a_path_with_no_project_directory_component() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let legacy = root.path().join("plans");
+        fs::create_dir_all(&legacy).expect("create fixture parent");
+        fs::write(legacy.join("plan.md"), "body").expect("write fixture document");
+        assert_eq!(
+            unmigrated_project_path(&root.path().join("plans").join("absent.md")),
+            None
+        );
+    }
+
+    #[test]
+    fn unmigrated_project_path_refuses_a_path_with_two_project_directory_components() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let ambiguous = root
+            .path()
+            .join(PROJECT_DIRECTORY)
+            .join(PROJECT_DIRECTORY)
+            .join("plan.md");
+        let one_swap = root
+            .path()
+            .join(LEGACY_PROJECT_DIRECTORY)
+            .join(PROJECT_DIRECTORY);
+        fs::create_dir_all(&one_swap).expect("create fixture parent");
+        fs::write(one_swap.join("plan.md"), "body").expect("write fixture document");
+        assert_eq!(unmigrated_project_path(&ambiguous), None);
     }
 
     #[test]
