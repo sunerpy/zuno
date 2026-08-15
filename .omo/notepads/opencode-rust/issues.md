@@ -7999,3 +7999,12 @@ Activation requires a real GitHub classic PAT with `repo` (private repository re
 job data) plus `admin:repo_hook` (create/manage the `workflow_job` webhook). After the PAT is supplied,
 store it only in that secret, create the `WORKFLOW_JOB_QUEUED`-filtered webhook, push only `task-z4`,
 then record queued/in_progress HTTP 200 deliveries and the full CodeBuild-vs-ubuntu CI comparison.
+
+## [2026-08-15] R2 — security and release-surface findings resolved
+
+- The installer no longer expands `GITHUB_TOKEN`/`GH_TOKEN` into curl/wget `Authorization` arguments. It now requires GitHub CLI and uses `gh release view` plus `gh release download`, keeping authentication inside `gh` rather than process argv.
+- The Z-4 AWS snapshot above is superseded for two fields: `zuno-codebuild-runner-role` now requires the exact `aws:SourceAccount` and `aws:SourceArn`, and `zuno-runner` now has `privilegedMode=false`. Project image, compute type, image-pull credential type, and empty environment-variable set were preserved.
+- All 28 workflow `uses:` references are pinned to GitHub-API-resolved full commit SHAs with readable version/channel comments. The repository-wide Actions policy still reports `allowed_actions=all` and `sha_pinning_required=false`; changing organization/repository policy was outside this task, so pinning is enforced in the two committed workflows rather than by a remote policy mutation.
+- The release matrices no longer carry stale `os`/`runner` fields. `runs_on` is the single effective routing field, the smoke cache keys by target, all six platforms remain, and the Linux aarch64 smoke route retains `image:arm-3.0` plus `instance-size:large`.
+- Verification passed: installer shell checks, actionlint, 25 release-surface tests, fmt, workspace build, Clippy with zero warnings, and detached workspace tests totaling 3511 passed / 0 failed.
+- Tooling limitation: `lsp_diagnostics` is rooted at the main worktree and rejected `oc-wt/r2`; compiler, Clippy, targeted, and full-test diagnostics were clean. No functional item remains unresolved from R2.
