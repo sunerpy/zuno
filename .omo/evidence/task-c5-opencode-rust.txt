@@ -1,0 +1,279 @@
+task-c5 / opencode-rust — CI 最后一道阻塞项：oc-lsp live 测试的三态守卫 + 第九个 oracle 差分
+
+基线
+====
+origin/main = 1121bf3
+cargo test --workspace: 3475 passed / 0 failed / 2 ignored / 213 suites（上游实测）
+CI run 31905115532: Supply chain success, Artifact smoke (host) success, Windows skipped,
+                    Test FAILED（本任务目标测试）, CI Success failed（仅因 Test）
+Test 失败原文：
+    Running tests/live_servers.rs (target/debug/deps/live_servers-2e25cf4572ab2830)
+    Error: Unavailable { server_id: "rust" }
+    error: test failed, to rerun pass `-p oc-lsp --test live_servers`
+    test result: FAILED. 1 passed; 1 failed
+
+
+缺陷 A 根因（已复现，非 Zuno 缺陷）
+=================================
+`~/.cargo/bin/rust-analyzer` 是 rustup 的 proxy 符号链接，只要装了 rustup 就存在，
+与 `rust-analyzer` component 是否安装无关。CI 的 dtolnay/rust-toolchain 只装了
+`rustfmt,clippy`（.github/workflows/ci.yml:66-69），所以 proxy 存在但 component 没有。
+
+本机复现（剥掉 mise fallback 后与 CI 完全一致）：
+    $ env -i HOME=/config PATH=/config/.cargo/bin:/usr/bin:/bin RUSTUP_TOOLCHAIN=1.90.0 \
+        /config/.cargo/bin/rust-analyzer --version
+    error: Unknown binary 'rust-analyzer' in official toolchain '1.90.0-x86_64-unknown-linux-gnu'.
+    exit=1
+
+本机默认 PATH 下反而看不出问题（这就是「本机绿 / CI 红」的来源）：
+    info: `rust-analyzer` is unavailable for the active toolchain
+    info: falling back to "/config/.local/share/mise/shims/rust-analyzer"
+    rust-analyzer 1.96.0 (ac68faa 2026-05-25)   exit=0
+
+链路：proxy 秒退 → ManagerError::Initialize{ClientError::Closed}
+     → supervisor 用尽 RestartPolicy::default() 的 6 次 launch
+       （退避 100+200+400+800+1600ms ≈ 3.1s）→ publish_stopped
+     → wait_for_client 观察到 Stopped → ManagerError::Unavailable
+CI 时间戳佐证：19:55:05.5 套件开始 → 19:55:09.26 报错 = 3.76s，
+与退避总和吻合，**不是** CLIENT_READY_TIMEOUT(50s) 触发。
+
+因此这不是 Zuno LSP 客户端可修的 readiness/timeout 问题：进程根本不是语言服务器。
+修 readiness 的唯一替代方案是给 CI 装 rust-analyzer component，那要改
+.github/workflows/**（本任务禁止）。故按要求把第三态实现为「带原因的跳过」。
+
+oc-lsp readiness 语义（探测所得，支撑上述判断）
+- Unavailable{server_id} 仅 3 个构造点，全在 manager.rs:696-721 wait_for_client：
+  supervisor 已 Stopped / watch channel 关闭 / CLIENT_READY_TIMEOUT(50s) 耗尽。
+- 真实根因（Registry::NotInstalled、Spawn、MissingPipe、
+  Initialize{Framing|Protocol|Closed|Timeout}）被 supervisor tracing::warn! 后折叠，
+  公开 API 只剩 Unavailable。
+- 超时常量：INITIALIZE_TIMEOUT=45s、REQUEST_TIMEOUT=10s、DIAGNOSTICS_TIMEOUT=20s、
+  CLIENT_READY_TIMEOUT=50s。
+- $/progress（含 rustAnalyzer/Indexing）被 dispatch_message 静默忽略，不参与 readiness。
+- Manager::diagnostics 对 diagnostics 超时不报错，回落缓存快照 → 表现为「成功但空」。
+
+
+缺陷 A 修复：三态守卫（crates/oc-lsp/tests/live_rust_analyzer.rs）
+================================================================
+1. 缺失      → which 失败 → Unusable::Missing → 跳过
+2. 存在但起不来 → 两条路都堵上：
+   2a `--version` 探针（usable_server）抓非零退出/无法执行，打印路径 + exit status + stderr 原文
+   2b Err(error @ ManagerError::Unavailable{..}) 抓「能答 --version 但不说 LSP」
+3. 起来了    → 断言 severity==1 且 (code==E0425 或 message 含 does_not_exist)，答错即红
+
+四条路径逐一实测（沙箱只在一个维度变穷：仅在 PATH 前置一个桩目录，其余 PATH 不动）
+--------------------------------------------------------------------------------
+状态 3（真 rust-analyzer，本机 mise 版 1.96.0）：
+    cargo test -p oc-lsp --test live_rust_analyzer -- --nocapture
+    test rust_analyzer_reports_a_live_compiler_error ... ok
+    test result: ok. 1 passed; 0 failed; ... finished in 2.33s
+    （输出无 SKIPPED，证明真的走了断言分支）
+
+状态 1（PATH=/usr/bin:/bin，rust-analyzer 不存在）：
+    SKIPPED rust_analyzer_reports_a_live_compiler_error: rust-analyzer not found on PATH;
+      live Rust diagnostics were NOT exercised
+    test result: ok. 1 passed; 0 failed; ... finished in 0.00s
+
+状态 2a（桩：任何调用都 exit 1 并输出 rustup 原文，模拟缺 component 的 proxy）：
+    /tmp/opencode/c5-proof/exit1/rust-analyzer
+    SKIPPED rust_analyzer_reports_a_live_compiler_error: rust-analyzer
+      /tmp/opencode/c5-proof/exit1/rust-analyzer exited with exit status: 1 for `--version`:
+      error: Unknown binary 'rust-analyzer' in official toolchain
+      '1.96.0-x86_64-unknown-linux-gnu'.; live Rust diagnostics were NOT exercised
+    test result: ok. 1 passed; 0 failed; ... finished in 0.00s
+    → 这正是 CI 上那条红线的等价场景，现在是「带原因的跳过」而不是 FAILED
+
+状态 2b（桩：`--version` 正常 exit 0，其余 exec sleep 600，永不说 LSP）：
+    /tmp/opencode/c5-proof/silent/rust-analyzer
+    SKIPPED rust_analyzer_reports_a_live_compiler_error: language server rust is unavailable
+      — /tmp/opencode/c5-proof/silent/rust-analyzer never completed initialization;
+      live Rust diagnostics were NOT exercised
+    test result: ok. 1 passed; 0 failed; ... finished in 55.01s
+    → 55s = 50s CLIENT_READY_TIMEOUT + shutdown；证明 Unavailable 分支确实生效，
+      且探针单独不足以覆盖此态（故两条路都保留）
+
+反向证明「没有被改成静默通过」——桩服务器完成 initialize 并 publish 空诊断：
+    /tmp/opencode/c5-proof/wrong/rust-analyzer（Python LSP 桩，答 initialize + 空 publishDiagnostics）
+    panicked at crates/oc-lsp/tests/live_rust_analyzer.rs:148:5:
+    rust-analyzer diagnostics did not include the deliberate E0425 error: []
+    test result: FAILED. 0 passed; 1 failed; ... finished in 0.06s
+    → 「起来了但答错」依然红。环境失败与真实缺陷没有被折叠。
+
+
+缺陷 B：第九个 oracle 差分已删除
+==============================
+删除 typescript_diagnostics_match_the_real_opencode_binary（原 live_servers.rs:112-143）
+及仅其使用的辅助：oracle_diagnostics()、pinned_oracle_or_skip 调用、command_path()、
+ComparableDiagnostic/ComparableRange/ComparablePosition 三个类型与 From<&Diagnostic> impl、
+serde::Deserialize 与 oc_testkit 导入。
+连带清理 crates/oc-lsp/Cargo.toml 的 oc-testkit dev-dependency（oc-lsp 内已无任何
+oc_testkit 引用），Cargo.lock 随之少一行 "oc-testkit"。
+Comparable* 之所以能整体删掉：它们存在的唯一目的是把 oracle 的 JSON 反序列化成可比较
+形状；存活测试直接断言 oc_lsp::Diagnostic 即可。
+
+文件重命名：live_servers.rs → live_rust_analyzer.rs
+（sweep 约定：differential.rs→behavior.rs、agent_differential.rs→agent_discovery.rs、
+compat_suite.rs→execute_contract.rs。文件只剩一个 rust-analyzer 用例，
+"live_servers" 复数已不描述内容。）
+
+连带必须同批修改的关卡：
+crates/oc-testkit/tests/no_pinned_oracle_paths.rs 的 ROUTED_DIFFERENTIALS 是一份**清单**，
+文件不存在即报 missing。删除后该守卫立刻红：
+    test result: FAILED. 1 passed; 1 failed
+    every_installed_binary_differential_still_routes_through_the_oracle
+其断言文案本身规定了处置方式（"If a differential was deliberately retired, remove it from
+ROUTED_DIFFERENTIALS in the same change and say why"），已按 C1 sweep 删 4 个文件时的
+既有先例，在同一 commit 内移除条目并写明理由。这是设计成的关卡，不是误报。
+
+
+全仓库 oracle 残留排查（逐条判定）
+=================================
+`pinned_oracle`（42 处 / 11 文件 → 改后 10 文件）
+  crates/oc-testkit/src/oracle.rs                     基础设施本体，C1 sweep 明确保留 —— 保留
+  crates/oc-testkit/src/lib.rs                        re-export —— 保留
+  crates/oc-testkit/tests/no_pinned_oracle_paths.rs   结构守卫本身 —— 保留（本次同批更新清单）
+  crates/oc-cli/tests/rollback.rs                     驱动真实 opencode 的 rollback 缝 —— 保留（非 diagnostics 差分，且清单在列）
+  crates/oc-db/tests/schema.rs / session.rs / message_export.rs  DB schema/session 兼容读取 —— 保留
+  crates/oc-llm/tests/catalog_differential.rs         保留
+  crates/oc-tools/tests/registry.rs                   保留
+  crates/oc-tools/tests/search_differential.rs        保留
+  crates/oc-lsp/tests/live_servers.rs                 **已删除**（本任务目标）
+  判定依据：任务书与 C1 sweep 都只清除「Zuno 是否与 opencode 一致」的 diagnostics/behaviour
+  差分；oracle 基础设施与 22 个跨 9 crate 的消费者（含 docs 生成器与 plugin-ABI 关卡）
+  按 MUST NOT DO 保留。
+
+`debug lsp diagnostics`（.args(["debug","lsp","diagnostics"])）
+  改前唯一命中：crates/oc-lsp/tests/live_servers.rs:70 —— **已删除**
+  改后全仓库 0 命中。
+
+`_matches_the_real_opencode` / `match_the_real_opencode`
+  改前唯一命中：live_servers.rs:112 typescript_diagnostics_match_the_real_opencode_binary
+  —— **已删除**。改后 0 命中。
+
+`OPENCODE_CONFIG_CONTENT`（57 处 / 27 文件 → 改后 26 文件）
+  逐条判据：调用方是否拿它去喂一个真实 opencode 二进制做对比。
+  生产代码（plugin/config ABI，必须保留）：
+    oc-config/src/discovery.rs:26,211,212,287     配置层发现逻辑本体
+    oc-cli/src/cmd/debug.rs:208-216               debug 输出该层来源
+    oc-cli/src/environment.rs:39                  6 个 OPENCODE_* plugin env 之一
+    oc-paths/src/env.rs:33                        同上
+    oc-catalog/src/command.rs:353, agent.rs:32-43,656,704  agent/command 层叠加顺序
+    oc-catalog/src/skill/customize-opencode.md:433         文档
+  测试/基础设施（用它构造被测进程自身的配置，不做 oracle 对比 —— 保留）：
+    oc-cli/tests: session_mutation.rs cli_parity.rs provider_options.rs rollback.rs
+                  tool_turn.rs configured_model.rs plugin_models.rs tui_turn.rs
+                  provider_endpoint.rs behavior.rs
+    oc-config/tests/discovery.rs
+    oc-testkit/src: env.rs config_fixture.rs bin/oc-smoke.rs perf/workload.rs
+    oc-testkit/tests/session_interop.rs
+    oc-tools/tests/registry.rs:584（该文件的 oracle 用法本身在清单内保留）
+  README.md / docs/readme/README.en.md：仅列举 env 名称 —— 保留（且属他人任务禁改区）
+  唯一以 oracle 对比为目的的调用：live_servers.rs:72 —— **已删除**
+  结论：仓库内已无 oracle 差分。
+
+
+TypeScript 侧覆盖评估（如实说明，未补写）
+=======================================
+删除的用例除 oracle 对比外，唯一独立断言是 `!actual.is_empty()`
+（Zuno 能从真实 typescript-language-server 拿到诊断）。
+改后仍存在的 TypeScript 覆盖：
+  - config/registry 层：oc-lsp/src/registry.rs 单测断言 typescript 内建 spec 的
+    command(["typescript-language-server","--stdio"])、extensions、env、initialization
+    与用户覆盖（registry.rs:878-901）。
+  - 协议层：oc-lsp/src/{manager,client}.rs 的 Python stub server 单测（hermetic，
+    server 无关）覆盖 initialize/publishDiagnostics/重启/降级。
+真正失去的：真实 typescript-language-server 的端到端 live 覆盖，现在只剩
+  oc-testkit/tests/soak.rs 的 G3/G4，而它是 #[ignore]（两小时），CI 不跑。
+选择：**不补写**新的 oracle-free TypeScript live 测试。理由是它不 hermetic ——
+必须 PATH 上有 typescript-language-server，CI 上没有，落地即又一个「看着通过其实
+什么都没测」的 hollow gate，正是本仓库反复出现的缺陷类。这一点如实记入 issues.md，
+未静默降低覆盖。
+
+
+本地门禁
+=======
+cargo test --workspace（CARGO_TARGET_DIR=/tmp/opencode/c5，setsid nohup + 轮询日志）
+    suites=213  passed=3474  failed=0  ignored=2
+    grep -c FAILED /tmp/opencode/c5-test.log = 0
+差值核对：基线 3475 → 3474，恰好 -1，即删除的
+typescript_diagnostics_match_the_real_opencode_binary。
+suites 仍为 213：文件是重命名而非移除，集成测试目标数不变。
+
+make fmt-check && make lint      → Finished，grep -c '^warning' = 0
+make smoke-artifact（env -u CARGO_TARGET_DIR，因 Makefile:28 TARGET_DIR := target）
+    oc-smoke: ok    --version -> 1.18.13
+    oc-smoke: ok    --help lists run + serve
+    oc-smoke: ok    headless run replayed openai-chat/drives-a-tool-loop-end-to-end:
+                    3 requests, 10 tools offered
+    oc-smoke: PASS  .../dist/unpacked/zuno
+
+磁盘全程监控（历史上磁盘耗尽伪造过 rustc/clippy 报错）：
+    起 42G → 31G → 28G → 25G 可用，无 StorageFull / errno 28。
+
+
+改动文件
+=======
+D  crates/oc-lsp/tests/live_servers.rs        （重命名 + 删除 oracle 用例）
+A  crates/oc-lsp/tests/live_rust_analyzer.rs  （三态守卫）
+M  crates/oc-lsp/Cargo.toml                   （移除 oc-testkit dev-dep）
+M  crates/oc-testkit/tests/no_pinned_oracle_paths.rs（ROUTED_DIFFERENTIALS 移除条目 + 理由）
+M  Cargo.lock                                 （少一行 "oc-testkit"）
+未触碰 .github/workflows/**，未触碰他人任务禁改区，未改 plugin ABI。
+
+
+CI 验证
+=======
+（见下方 CI 段，推送后追加）
+
+CI 验证（决定性证据）
+====================
+commit 504c379 直推 origin/main（SSH，token 无 workflow scope 但本次未改 workflow）
+push 输出：
+    run fast repository tests................................................Passed
+    To github.com:sunerpy/zuno.git
+       1121bf3..504c379  HEAD -> main
+（pre-commit「format repository files」与 pre-push「run fast repository tests」均 Passed，
+ 未使用 --no-verify。）
+
+run id 31907363690（head_sha 504c379）status=completed conclusion=success
+
+job                     conclusion   runner_name (UUID)                     runner_group
+----------------------- ------------ -------------------------------------- ------------
+Artifact smoke (host)   success      1341fa50-725c-4f57-a155-f3f9126f377c   Default
+Supply chain            success      c08f215b-84b5-4238-956a-99739c81ba24   Default
+Test                    success      baad089b-4f41-4e7d-b85b-d1705ac60ad2   Default
+Windows                 skipped      null                                   null
+CI Success              success      7e9b923e-cb2f-4862-876d-28290563fd95   Default
+
+注：`gh run view --json jobs` 返回的 runner_name 为 null（该字段在此路径上不填充），
+必须用 `gh api repos/sunerpy/zuno/actions/runs/<id>/jobs` 才拿到真实 UUID。
+
+runner 归属交叉核对（先 unset 全部 AWS_* 环境变量，再显式 --profile/--region）：
+    aws codebuild list-builds-for-project --project-name zuno-runner \
+      --profile us --region us-east-2
+    zuno-runner:7e9b923e-cb2f-4862-876d-28290563fd95   ← CI Success
+    zuno-runner:1341fa50-725c-4f57-a155-f3f9126f377c   ← Artifact smoke (host)
+    zuno-runner:c08f215b-84b5-4238-956a-99739c81ba24   ← Supply chain
+    zuno-runner:baad089b-4f41-4e7d-b85b-d1705ac60ad2   ← Test
+4/4 UUID 与 us-east-2 的 zuno-runner build id 完全一致 —— 四个 job 都真的在预期 runner 上跑过。
+
+目标测试在 CI 上的表现（Test job 日志 12649-12654 行）：
+    Running tests/live_rust_analyzer.rs (target/debug/deps/live_rust_analyzer-fed51c20b83b3d7c)
+    running 1 test
+    test rust_analyzer_reports_a_live_compiler_error ... ok
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+0.09s 是关键读数：旧代码在同一环境下耗时约 3.76s（6 次 launch + 退避）后报
+Unavailable 并失败；0.09s 说明 `--version` 探针在启动任何 supervisor 之前就短路了，
+即 CI 走的是状态 2a，与本机桩复现（0.00s）一致。
+
+诚实说明一处局限：SKIPPED 文案走 stderr，cargo test 不带 --nocapture 时会捕获通过用例的
+输出，因此该原因在 CI 日志里不可见。这不是本次引入的偏差 —— Makefile:89 的
+`cargo test --workspace` 与 ci.yml:113/222 都不带 --nocapture，整份 CI 日志里
+`SKIPPED` 命中数为 0，而 oracle 相关跳过在 CI 上必然全部触发（那里没有 opencode
+二进制）。也就是说本实现与 pinned_oracle_or_skip 建立的既有契约完全一致；要让原因
+默认可见需要改 Makefile/workflow 的测试调用方式，超出本任务范围且 workflow 禁改。
+本地以 --nocapture 已逐条验证四种路径的文案（见上文）。
+
+结论：Test / Artifact smoke (host) / Supply chain / CI Success 全部 success，
+Windows skipped，第九层阻塞清除，未引出新的失败层。

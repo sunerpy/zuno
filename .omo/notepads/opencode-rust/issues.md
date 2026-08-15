@@ -8359,3 +8359,33 @@ J 的位置比 H/I 都更靠后，即本任务确有推进。
 **已解决的一处不确定性。** 我曾担心 `oc-testkit` 的 perf::database 6 个测试
 shell 调用 `sqlite3` 会成为下一个阻塞点。本次 CI 上它们**全部通过**，
 证明 runner 镜像自带 sqlite3。无需处理。
+
+## task-c5：`no_pinned_oracle_paths` 是删除 oracle 差分时的必经关卡
+
+删掉 `oc-lsp/tests/live_servers.rs` 后 `cargo test --workspace` 在
+`oc-testkit/tests/no_pinned_oracle_paths.rs::every_installed_binary_differential_still_routes_through_the_oracle`
+直接红：该文件用 `ROUTED_DIFFERENTIALS` 常量维护一份**清单**（不是 pattern），文件
+不存在即 `missing`。断言文案本身给出了处置方式：「If a differential was deliberately
+retired, remove it from ROUTED_DIFFERENTIALS in the same change and say why」。
+所以任何后续再删 oracle 差分文件的改动，都必须同批改这个清单并写明理由——C1 sweep
+删 4 个文件时已经这么做过，注释里留有先例。这不是缺陷，是设计成的关卡；记在这里是
+为了下一个人不要把它当成误报绕过去。
+
+## task-c5：仍存在的 hollow gate（本次范围外，未修）
+
+以下测试用 `exists()`/`is_file()` 守卫指向开发者本机路径，在干净机器上退化为跳过：
+`oc-mcp/tests/remote_live.rs`、`oc-cli/tests/generated_sdk_provider.rs`、
+`oc-cli/tests/tool_turn.rs`、`oc-tools/tests/registry.rs`。它们不是 CI 阻塞项。
+另有 `oc-testkit/tests/soak.rs` 的 G3/G4 用 `which::which(...).expect("G3 requires ...")`
+硬要求 rust-analyzer + typescript-language-server，但整个用例 `#[ignore]`（两小时），
+所以不会在 CI 触发；注意它对 rust-analyzer 用的是 `which` + `expect`，一旦有人去掉
+`#[ignore]`，就会踩到与 task-c5 完全相同的 rustup proxy 陷阱。
+
+## task-c5：live TypeScript LSP 覆盖被削减（如实记录，未补）
+
+删除 `typescript_diagnostics_match_the_real_opencode_binary` 后，真实
+typescript-language-server 的端到端覆盖只剩 `#[ignore]` 的 G3 soak。保留下来的是
+config/registry 层（`oc-lsp/src/registry.rs` 单测断言 typescript 内建 spec 的
+command / extensions / env / initialization 覆盖）与协议层（Python stub server 单测，
+server 无关）。没有补写新的 oracle-free TypeScript live 测试：它依赖 PATH 上有
+typescript-language-server，CI 上没有，等于再造一个 hollow gate。

@@ -7086,3 +7086,55 @@ PATH="/config/.local/share/mise/installs/node/26.5.0/bin:/config/.cargo/bin:\
 `/tmp/opencode/c1b-nooracle`，单独占 14G，磁盘从 28G 掉到 14G（96%）。
 用完立刻 `rm -rf` 回收。**验证前后都要 `df -h /`**，
 本机磁盘耗尽已两次伪装成 rustc/clippy 报错。
+
+## rustup 代理会让 `which(binary)` 撒谎（task-c5, oc-lsp live 测试）
+
+`~/.cargo/bin/rust-analyzer` 是 rustup 的 **proxy 符号链接**，只要装了 rustup 它就存在，
+与 `rust-analyzer` component 是否安装无关。component 缺失时执行该 proxy 会立刻退出：
+
+```
+$ env -i PATH=/config/.cargo/bin:/usr/bin:/bin RUSTUP_TOOLCHAIN=1.90.0 rust-analyzer --version
+error: Unknown binary 'rust-analyzer' in official toolchain '1.90.0-x86_64-unknown-linux-gnu'.
+exit=1
+```
+
+所以 `which::which("rust-analyzer").ok()` 形式的守卫在 CI 上会**通过**，随后进程秒退。
+本机之所以看不出来，是因为 mise 装了真 rust-analyzer 并在 rustup fallback 链里兜底
+（`info: falling back to "/config/.local/share/mise/shims/rust-analyzer"`，exit 0）——
+即“本机与 CI 表现相反”的又一例。判断一个 CLI 是否真的可用，必须**执行**它
+（`--version` + 断言 exit status），不能只做 PATH 查找。
+
+CI（`dtolnay/rust-toolchain` toolchain 1.96.0、components 仅 `rustfmt,clippy`）上
+的完整链路：proxy 秒退 → `ManagerError::Initialize{ClientError::Closed}` →
+supervisor 用尽 `RestartPolicy::default()` 的 6 次 launch（退避 100/200/400/800/1600ms
+≈3.1s）→ `publish_stopped` → `ManagerError::Unavailable`。CI 日志时间戳
+19:55:05.5 起、19:55:09.26 报错，3.76s，与该退避总和吻合，证明**不是** 50s 超时。
+
+## oc-lsp 的 readiness 语义与 `Unavailable` 的信息损失
+
+`crates/oc-lsp/src/manager.rs` 里 `Unavailable{server_id}` 只有三个构造点，全在
+`wait_for_client`：supervisor 已 `Stopped`、watch channel 关闭、或 caller 的
+`CLIENT_READY_TIMEOUT`（50s）耗尽。真正的根因（`Registry::NotInstalled`、`Spawn`、
+`MissingPipe`、`Initialize{Framing|Protocol|Closed|Timeout}`）都被 supervisor 用
+`tracing::warn!` 记录后**折叠**掉，公开 API 只剩 `Unavailable`。超时常量：
+`INITIALIZE_TIMEOUT=45s`、`REQUEST_TIMEOUT=10s`、`DIAGNOSTICS_TIMEOUT=20s`、
+`CLIENT_READY_TIMEOUT=50s`；`$/progress`（含 rust-analyzer 的 `rustAnalyzer/Indexing`）
+被 `dispatch_message` 静默忽略，不参与 readiness。`Manager::diagnostics` 对
+diagnostics 超时不报错，改为回落到缓存快照——即“等不到诊断”会表现为**成功但空**。
+
+结论：`Unavailable` 无法在 API 层区分“环境起不来”与“Zuno 握手有 bug”。live 测试
+选择把 `Unavailable` 当跳过，是因为握手本身另有 hermetic 覆盖
+（`manager.rs`/`client.rs` 里的 Python stub server 单测），逃生口有界。
+
+## live 外部工具测试的三态守卫写法
+
+`crates/oc-lsp/tests/live_rust_analyzer.rs` 现在建模三态而非两态：
+1. PATH 上没有 → 普通跳过；
+2. 解析到了但跑不起来 → 跳过，但必须喊出 server id + 底层错误（`--version` 的
+   exit status 与 stderr 原文）；
+3. 起来了 → 断言，答错就红。
+
+第 2 态又分两条路：秒退型被 `--version` 探针抓住（0.00s），能答 `--version` 但不说
+LSP 的被 `Err(error @ ManagerError::Unavailable{..})` 分支抓住（55s，= 50s ready
+预算 + shutdown）。两条路都不能省：只有探针会漏掉后者，只有 `Unavailable` 分支会
+让前者也等 50s 且不打印 stderr。
