@@ -19,11 +19,15 @@
 //!
 //! A *comment* may name an old path: that is how the history of a defect stays
 //! readable, and a comment cannot select a binary. A fixture may still carry a
-//! release in its **file name** when its provenance is an executable assertion —
-//! `.omo/fixtures/oracle-openapi-1.18.18.json` is retained on exactly those terms,
-//! because `compat_suite.rs` refetches `/doc` from the running pinned release and
-//! compares the bytes. A name that no test re-derives would be a claim, not a
-//! fixture.
+//! release in its **file name** when something in the tree still consumes it:
+//! `.omo/fixtures/oracle-openapi-1.18.18.json` is retained because it is the
+//! recorded OpenAPI capture the plugin ABI is generated and checked against —
+//! `oc-plugin-sdk/build.rs` reads it at build time and `oc-server/tests/compat_v1.rs`
+//! asserts the served surface against it. The test that used to re-fetch `/doc`
+//! from a running release and compare the bytes was `compat_suite.rs`, deleted with
+//! the rest of the opencode differentials; the capture is now a frozen input to the
+//! plugin contract rather than a re-derived one, and the version in its name is
+//! provenance for where those bytes came from.
 
 use std::path::{Path, PathBuf};
 
@@ -38,17 +42,20 @@ const INSTALL_MARKERS: &[&str] = &["installs/opencode", "opencode/1."];
 /// An inventory rather than a pattern, because the failure this prevents is a file
 /// quietly dropping its oracle call — which no pattern over the *remaining* text can
 /// see. Renaming or removing one of these fails here, loudly, with the reason.
+/// Four further entries were removed when the opencode differential suites were
+/// deleted — `oc-catalog/tests/agent_differential.rs`,
+/// `oc-catalog/tests/skill_differential.rs`, `oc-cli/tests/differential.rs` and
+/// `oc-paths/tests/differential.rs`. That deletion is what this list is designed to
+/// catch, and it did: those four files no longer exist, so the removal was
+/// deliberate and is recorded here rather than worked around. The rule itself is
+/// unchanged for every file that still runs an installed binary.
 const ROUTED_DIFFERENTIALS: &[&str] = &[
-    "oc-catalog/tests/agent_differential.rs",
-    "oc-catalog/tests/skill_differential.rs",
-    "oc-cli/tests/differential.rs",
     "oc-cli/tests/rollback.rs",
     "oc-db/tests/message_export.rs",
     "oc-db/tests/schema.rs",
     "oc-db/tests/session.rs",
     "oc-llm/tests/catalog_differential.rs",
     "oc-lsp/tests/live_servers.rs",
-    "oc-paths/tests/differential.rs",
     "oc-tools/tests/registry.rs",
     "oc-tools/tests/search_differential.rs",
 ];

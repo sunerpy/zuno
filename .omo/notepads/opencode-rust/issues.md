@@ -8260,3 +8260,49 @@ runtime found ...`，或点名 `MissingJsRuntime{searched:"bun, node"}` 的 pani
 `crates/**/tests/` 全量排查后，其余 `/config/` 命中均为字面量、注释，或带可见
 skip 的守卫；唯一故意硬失败的是 `oc-config/tests/differential.rs:16`
 （criterion 2 要求机器特定输入缺失时可见失败），按设计保留。
+
+## 2026-08-15 — CI 阻塞层 H：oc-config differential 读开发者本机配置（已修）
+
+**症状。** CI runner 上 `Test` job 失败，`crates/oc-config/tests/differential.rs`
+5 个测试中 4 个失败，`real_user_config_capture_matches_live_file_byte_for_byte`
+在 :329 panic。本机跑却全绿。
+
+**根因。** `differential.rs:16` 硬编码
+`const LIVE_USER_CONFIG: &str = "/config/.config/opencode/opencode.json"`
+——开发者本人的 opencode 配置文件——并在 :328 `fs::read` 后做逐字节比对，
+缺失即无条件 `panic!`。**这是刻意设计的**：panic 消息自称
+"this gate must fail visibly when the machine-specific criterion-2 input is
+unavailable"。本机通过只是因为那个文件恰好存在。
+
+**与前序缺陷同类。** 这是同一缺陷类的第三例：
+- `plugin_models.rs` 硬编码 `MISE_DATA_DIR`（681b92d 已修）
+- `live_sdk.rs` 用 `ancestors()` 逃出仓库（已修）
+- 本例 `LIVE_USER_CONFIG` 硬编码 `/config/`
+
+**修复。** 整个文件删除——5/5 测试的前提都是「与真实 opencode 的合并配置一致」，
+而该前提已随 Zuno 独立而消失。保留 `tests/fixtures/user-config.json`
+（`legacy.rs` 与 `schema/tests.rs` 仍用作真实 config 解析语料）。
+
+**这是 CI 首次可达全绿前的第 8 层（H）缺陷。** 序列：
+A oxfmt 缺失 → B `--offline` 冷 registry → C/D 工具链 + hosted minutes →
+E/F 陈旧 smoke 断言 + 非 hermetic SDK 路径 → G `plugin_models` 硬编码 mise 路径 →
+H 本例 oracle differentials。每修一层暴露下一层（job 内步骤短路）。
+
+**遗留同类缺陷（未修，超出本任务范围）。**
+`crates/oc-testkit/src/perf/subject.rs:68` 把
+`/config/.local/share/opencode/opencode.db.bak.20260408` 作为
+`OC_MEMORY_GATE_DATABASE` 的默认值，`fs::metadata` 校验后 panic。
+`cargo test --workspace` **不会**触发它：`oc-testkit/tests/memory.rs` 在
+`should_run_expensive_gate()` 处先跳过（全量跑通过已证实）。
+只有显式 `cargo test -p oc-testkit --test memory` 且未设环境变量时才失败。
+非 CI 阻塞，属 perf gate 默认值而非 oracle 差分，故未动。
+**建议下一个处理该类缺陷的任务把它改成「必须显式提供，否则明确跳过」。**
+
+**遗留文档陈旧引用（已报告，故意未修）。**
+`docs/compatibility-matrix.md` 第 56 行与第 314 行仍引用已删除的
+`compat_suite.rs`（分别是「谁写 target/compat/compat-report.json」和
+`cargo test -p oc-testkit --test compat_suite` 命令）。未修原因：该文档的
+"Known gaps" 与 "Divergence index" 两节由 `crates/oc-cli/tests/docs.rs` 生成，
+而并行任务（worktree oc-wt/r4）正在改这个生成器。在生成器被他人修改期间
+编辑生成产物会冲突。该 .md 工作树副本本身是干净的，属**生成器归属权**推迟，
+不是脏文件推迟。落地 docs.rs 改动的人应顺手修这两处。

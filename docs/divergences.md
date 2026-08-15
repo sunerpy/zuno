@@ -25,10 +25,12 @@ nothing derives is exactly the drift the rest of this page is built to prevent.
 ## How this page cannot drift
 
 The entries below are generated from [`docs/divergences.toml`](divergences.toml),
-which is the same file `crates/oc-testkit/tests/compat_suite.rs` loads and counts
-against `oc_testkit::divergence::DECLARED_COUNT`. Adding an entry without a count
-bump fails the compatibility suite; adding an entry without documenting it fails
-`crates/oc-cli/tests/docs.rs`. Regenerate this page with:
+which is the same file `crates/oc-cli/tests/docs.rs` loads and counts against
+`oc_testkit::divergence::DECLARED_COUNT`, and which
+`crates/oc-testkit/tests/execute_contract.rs` reads to verify the one entry whose
+contract is asserted against live code rather than merely declared. Adding an entry
+without a count bump fails the documentation gate; adding an entry without
+documenting it fails the same gate. Regenerate this page with:
 
 ```sh
 OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs

@@ -6956,3 +6956,77 @@ CI 是否健康要看 job 是否**拿到 runner**，不能只看 run 的 conclus
 `oc_testkit::oracle::locate_source_tree()` 沿祖先找 `<ancestor>/opencode` 仍能命中
 `/config/workspace/ProdDir/AI/opencode`，所以 cassette 类测试在 worktree 里是**真跑**
 而非 skip；换到别处（如 /tmp）就会整片转成 skip，读测试数量时要注意这点差异。
+
+## 2026-08-15 — 移除 opencode oracle 差分测试套件（task C1）
+
+**背景。** Zuno 已是独立项目，用户明确「跟 opencode 没什么关系了，无需考虑兼容」「兼容测试可以移除」。
+只保留插件 ABI。6 个 differential/compat 文件共 59 个测试被逐个判定。
+
+**判定标准可操作化。** 关键不是文件名，而是测试的**主语**：
+- 主语是「Zuno 是否与 opencode 一致」→ 删
+- 主语是「Zuno 是否正确工作」→ 留（即使文件名叫 `differential.rs`）
+
+用脚本按 `#[test]` 块切分、逐块统计 oracle 符号引用数，比整文件 grep 精确得多。
+结果：59 个测试里 56 个是 oracle 比对，3 个不是。但 `oc-cli/tests/differential.rs`
+是例外——它 21 个测试里有 12 个只是**断言目标**指向 oracle（"...matches oracle"），
+实际驱动的是真实 Zuno CLI 行为，这 12 个被改写成以 Zuno 为主语后全部保留。
+**教训：逐块 grep 计数只能定位嫌疑，不能替代读测试体判断主语。**
+
+**grep "oracle" 在本仓库几乎无信号。** 全仓库约 300 处 `oracle` 出现在
+doc comment 里引用上游 TypeScript 路径（`//! Oracle: packages/core/src/v1/config/...`）。
+同理 grep `/config/` 有 127 个命中，其中 ~90 个是 `packages/opencode/src/config/config.ts`
+这类散文。**要定位真实代码消费者，必须 grep 具体符号**
+（`Oracle::` / `pinned_oracle` / `Subject::` / `CompatReport` / `DivergenceList`），
+再用 `grep -v '^\S*: *//'` 排除注释行。
+
+**oracle 基础设施不能删——数量级远超任务清单。** 删掉 6 个文件后仍有 22 个测试文件
+跨 9 个 crate 在代码层消费 `oc-testkit/src/{oracle,subject,compat_report,divergence}.rs`，
+包括 `oc-cli/tests/docs.rs`（文档生成器）和 `oc-server/tests/compat_v1.rs`（插件 ABI 门）。
+删基础设施等于连带删这 22 个文件，远超范围。
+**教训：判断「基础设施是否孤立」要按符号数完整枚举消费者，不能凭直觉。**
+
+**审计清单型 guard 会正确报警，不要绕过。**
+`oc-testkit/tests/no_pinned_oracle_paths.rs` 的 `ROUTED_DIFFERENTIALS` 是手工维护的
+文件清单，其 doc 明写 "Renaming or removing one of these fails here, loudly, with
+the reason"。它列了我删的 4 个文件，于是失败——这是 guard 按设计工作。
+正确做法：删掉那 4 项，并在 const 的 doc 里**记录删了哪四个、为什么**。
+静默缩小审计清单恰恰是这个 guard 存在的目的所要防止的事。
+
+**删除会让别处的"事实声明"变成谎言，必须一并修。**
+同一文件模块 doc 声称保留 `.omo/fixtures/oracle-openapi-1.18.18.json` 是
+"because compat_suite.rs refetches /doc ... and compares the bytes"。我删了那个
+re-deriver。但 fixture 本身有 5 个存活消费者，含 `oc-plugin-sdk/build.rs`
+（**构建期**读取以生成插件 SDK）和 `oc-server/tests/compat_v1.rs`（`include_str!`）。
+所以 fixture 必须留，而它的**理由**必须改写为「插件 ABI 契约的冻结输入，而非再推导物」。
+**教训：删一个文件后，grep 全仓库对该文件的散文引用，逐条判断哪些从「历史」变成了「假声明」。
+历史可以留（"曾经由 X 记录"），当下的机制声明必须改。**
+
+**fixture 的消费者要独立确认再决定去留。**
+`oc-config/tests/fixtures/user-config.json` 看起来是 oracle 差分的专属输入，实际还有
+`oc-config/tests/legacy.rs:18` 和 `oc-config/src/schema/tests.rs:855` 当作真实世界
+config 解析语料。删测试文件时保留了 fixture。
+
+**测试数变化要能精确对账。** 3526 → 3481（-45），217 → 214 suites（-3）。
+删 59（5+6+8+3+21+16）+ 加 14（1+12+1）= -45，**逐个吻合**，证明零测试被意外破坏。
+**教训：预先统计每个待删文件的测试数，事后做减法对账——这是唯一能区分
+「删掉的测试」和「被我改坏的测试」的方法。**
+
+**`cargo test` 默认 fail-fast 会截断证据。** 第一次全量跑在 144/217 suites 处中止，
+因为 `oc-testkit oracle::tests::a_binary_reporting_another_release_is_named_and_refused`
+以 `ExecutableFileBusy`（errno 26, "Text file busy"）失败——写完临时可执行文件后
+立即 exec 的并发竞态，与本次改动无关（该文件我没碰）。单独跑通过。
+**教训：验证删除类改动必须用 `--no-fail-fast`，否则一个偶发 flake 会把后面 70 个
+suite 的结果全部隐藏，看起来像「改坏了很多东西」。**
+
+**`zuno run` 没有 `--prompt` 参数**，message 是位置参数：
+`zuno run --model <M> "消息"`。用 `--prompt` 会报
+`error: unexpected argument '--prompt' found / tip: a similar argument exists: '--port'`。
+任务书里给的命令需要改写才能执行。
+
+**`make smoke-artifact` 必须 unset `CARGO_TARGET_DIR`**（Makefile:28 硬编码
+`TARGET_DIR := target`）。另外用 `setsid nohup make ... > log 2>&1 &` 时，
+若把 `unset VAR &&` 放在同一个后台链的开头，日志文件可能不生成——
+改成 `setsid nohup make ... >log 2>&1 </dev/null &` 并 `sleep 5` 确认文件存在再轮询。
+
+**shell 工具 120s 超时会杀掉 `sleep 180`**，但不会杀掉 `setsid nohup` 的子进程。
+轮询长任务用 `sleep 110` + `ps -p <pid>` 判活，单次不要超过 115s。
