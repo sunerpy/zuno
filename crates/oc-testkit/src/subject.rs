@@ -14,7 +14,7 @@ use crate::error::{Result, TestkitError};
 use crate::oracle::ensure_executable;
 use crate::run::{Provenance, RunOutcome, SubjectSource, run_process};
 
-/// The binary `oc-cli` produces, and the name a drop-in replacement is invoked by.
+/// The binary `oc-cli` produces, and the name Zuno is invoked by.
 pub const SUBJECT_BIN: &str = "zuno";
 /// The cargo package that builds it.
 pub const SUBJECT_PACKAGE: &str = "oc-cli";

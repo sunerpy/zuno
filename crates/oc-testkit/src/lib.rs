@@ -1,14 +1,23 @@
-//! The instrument that proves or disproves this project's compatibility claim.
+//! The instrument behind this project's retained verification inventory.
 //!
-//! Zuno promises to be a drop-in replacement for `opencode` v1.18.13:
-//! same config, same CLI, same HTTP API, same on-disk state. Ninety-one later
-//! tasks each verify some part of that promise through this crate. If this crate
-//! can be satisfied by wrong code, the promise is unfounded — so every design
-//! decision here is made in favour of *detecting* a difference rather than
+//! Zuno is an independent product. It does **not** promise to be a drop-in
+//! replacement for `opencode`: its config root, data root, project directory, CLI
+//! identity and on-disk state are its own, and it neither reads the old paths nor
+//! imports opencode sessions. The one supported compatibility layer is the plugin
+//! ABI — `engines.opencode`, the six `OPENCODE_*` handshake variables, and the
+//! `COMPATIBILITY_VERSION` an npm plugin range-matches against.
+//!
+//! The differentials in this crate are therefore a *verification asset* rather
+//! than a product promise: they were built while the behaviour was being ported
+//! and they still catch real regressions, so they are kept until a separate
+//! decision retires or reshapes them. Keeping them does not re-declare
+//! cross-binary compatibility as a goal. Where a surface has deliberately
+//! diverged, the difference is declared rather than normalised away — every design
+//! decision here is still made in favour of *detecting* a difference rather than
 //! producing a green run.
 //!
-//! That `1.18.13` is the **source baseline** — the tree this port was read from and
-//! the version it reports to the npm plugin gate. The binary the differentials
+//! `1.18.13` is the **source baseline** — the tree this port was read from and the
+//! version it reports to the npm plugin gate. The binary the differentials
 //! actually execute is [`PINNED_RELEASE`], the newest installed release, currently
 //! `1.18.18`. The two numbers are separate pins and [`oracle`] documents why;
 //! recording one as though it were the other is the defect plan todo 130 closed.

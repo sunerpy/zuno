@@ -3,10 +3,10 @@
 //! # Why the report is part of the gate rather than a log
 //!
 //! A green suite answers "did anything I checked disagree?". It does not answer
-//! "what did you check?" — and for a drop-in-replacement claim that second
-//! question is the load-bearing one. A suite that silently stopped comparing a
-//! surface, or that never compared it at all, is green in exactly the same way as
-//! one that compared everything.
+//! "what did you check?" — and for an inventory of retained verification that
+//! second question is the load-bearing one. A suite that silently stopped
+//! comparing a surface, or that never compared it at all, is green in exactly the
+//! same way as one that compared everything.
 //!
 //! So the suite emits this artifact and each surface carries a [`Verdict`]. A
 //! reader (or plan todos F1-F4) can then see the difference between *compared and

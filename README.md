@@ -60,7 +60,9 @@ $ zuno --version
 $ zuno --help
 ```
 
-Zuno 只读取自己的配置与数据根目录；它不会导入或恢复 opencode 会话。
+Zuno 只读取自己的配置与数据根目录。`zuno session export` 与 `zuno session import` 构成 Zuno
+自身的导出/导入闭环：`import` 只接受 `export` 生成的本地文档，不接受 opencode 会话，也不接受
+share URL。
 
 ## 文档
 
@@ -83,8 +85,9 @@ Zuno 只读取自己的配置与数据根目录；它不会导入或恢复 openc
 
 Zuno 的默认配置根是 `$XDG_CONFIG_HOME/zuno`，项目配置目录是 `.zuno`，数据根是
 `$XDG_DATA_HOME/zuno`。它不会回退读取 `$XDG_CONFIG_HOME/opencode`、项目 `.opencode` 或
-`$XDG_DATA_HOME/opencode`，也不提供导入或恢复 opencode 会话的功能。旧路径只会在 oracle fixture、
-上游源码说明或历史证据中以 **upstream-only** 身份出现。
+`$XDG_DATA_HOME/opencode`，也没有任何接管 opencode 会话的途径：`zuno session import` 只读取
+Zuno 自己 `export` 出的文档。旧路径只会在 oracle fixture、上游源码说明或历史证据中以
+**upstream-only** 身份出现。
 
 插件层是唯一保留的 opencode 兼容层。`COMPATIBILITY_VERSION = "1.18.13"` 继续供 npm
 `engines.opencode` semver 判断使用；以下六个名称继续作为插件 ABI，不是 Zuno 自身份遗留：
@@ -93,8 +96,8 @@ Zuno 的默认配置根是 `$XDG_CONFIG_HOME/zuno`，项目配置目录是 `.zun
 除此之外，Zuno 的用户界面、默认路径和自有环境变量均使用 Zuno 身份。
 
 仓库暂时保留 differential suites 与 compatibility 文档作为已有验证资产；是否删除或重构它们尚待
-单独决定。保留这些测试不等于把跨二进制兼容重新定义为产品目标，也不应据此新增会话导入、恢复或
-旧目录 fallback。
+单独决定。保留这些测试不等于把跨二进制兼容重新定义为产品目标，也不应据此新增接管 opencode
+会话的能力或旧目录 fallback。
 
 ## 构建与开发
 

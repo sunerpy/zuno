@@ -53,8 +53,9 @@ $ zuno --version
 $ zuno --help
 ```
 
-Zuno reads only its own configuration and data roots. It does not import or restore opencode
-sessions.
+Zuno reads only its own configuration and data roots. `zuno session export` and `zuno session
+import` close Zuno's own round trip: `import` accepts only a local document that `export` produced,
+never an opencode session and never a share URL.
 
 ## Documentation
 
@@ -76,9 +77,9 @@ review. Use `OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs` to regenerat
 ## Independent runtime and plugin ABI
 
 Zuno uses `$XDG_CONFIG_HOME/zuno`, project `.zuno` directories, and `$XDG_DATA_HOME/zuno`. It never
-falls back to the corresponding opencode roots and deliberately provides no session import or
-restore workflow. Old roots appear only in upstream-only fixtures, source notes, or historical
-evidence.
+falls back to the corresponding opencode roots, and it provides no way to adopt an opencode session:
+`zuno session import` reads Zuno's own `export` documents only. Old roots appear only in
+upstream-only fixtures, source notes, or historical evidence.
 
 The plugin tier is the sole retained compatibility layer. `COMPATIBILITY_VERSION = "1.18.13"`
 continues to satisfy npm `engines.opencode` checks. The six plugin-ABI names also remain unchanged:
@@ -89,7 +90,7 @@ They identify the plugin contract, not Zuno itself.
 The repository currently retains its differential suites and compatibility documents as existing
 verification assets. Whether to remove or reshape them is a separate pending decision; their
 presence does not make cross-binary compatibility a product goal or justify adding legacy-path
-fallback, session import, or session restoration.
+fallback or adoption of opencode sessions.
 
 ## Development
 

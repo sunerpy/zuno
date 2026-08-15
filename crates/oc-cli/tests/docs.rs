@@ -1641,17 +1641,26 @@ fn readmes_define_zuno_as_independent_while_retaining_the_plugin_abi() {
     let config_root = format!("$XDG_CONFIG_HOME/{}", oc_paths::APP);
     let data_root = format!("$XDG_DATA_HOME/{}", oc_paths::APP);
     let plugin_abi = oc_paths::env::PLUGIN_ABI_ENV_NAMES.to_vec();
+    // Both needles are required, because either one alone reads as the opposite
+    // claim. "no opencode session" without naming `session import` is the stale
+    // wording that let a reader conclude Zuno cannot import anything at all, and
+    // naming `session import` without the bound would advertise adopting an
+    // opencode session.
     for (relative, independence) in [
-        ("README.md", "不会导入或恢复 opencode 会话"),
+        ("README.md", ["不接受 opencode 会话", "zuno session import"]),
         (
             "docs/readme/README.en.md",
-            "does not import or restore opencode",
+            [
+                "never an opencode session",
+                "`zuno session import` reads Zuno's own",
+            ],
         ),
     ] {
         contains_all(
             relative,
             &[
-                independence,
+                independence[0],
+                independence[1],
                 &config_root,
                 &data_root,
                 oc_paths::PROJECT_CONFIG_DIRECTORY,
