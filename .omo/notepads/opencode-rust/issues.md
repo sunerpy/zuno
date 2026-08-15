@@ -8171,3 +8171,35 @@ A/B/C/D 修完并在真实 run 上逐项验证通过（见 evidence 文件）。
   Test          failure  → 步骤 9/10 已绿（A、B 的直接证明），步骤 11 撞缺陷 F
   Artifact      failure  → `cargo fetch` 与 `make release` 已绿（B 的直接证明），撞缺陷 E
   Windows       skipped  → 缺陷 D 的设计行为，`ci-success` 打印 `skip windows skipped (opt-in…)`
+
+## [2026-08-15] C-3：缺陷 E/F 已在本地修复，等待 main CI 证明
+
+### 缺陷 E — RESOLVED LOCALLY
+
+上文 `:8126-8134` 关于「必须重录 smoke cassette」的判断已由更完整的 fixture 读取推翻：仓库已有
+权威 title recording `openai-chat/streams-text`，与原 tool-loop recording 按顺序组合后就是运行时
+真实的 1+2 请求，不需要改动任何 cassette bytes。
+
+`oc-smoke` 现在要求恰好 3 个请求：prelude 必须无工具且无 tool result；两个真实 turn request
+都必须携带四个无条件工具；最后一个 request 必须携带 `role: tool`。三个单元回归测试分别钉住
+正确形状、prelude 禁止工具、第二个 turn 不能丢注册表。
+
+### 缺陷 F — RESOLVED LOCALLY
+
+选择「无法 hermetic acquisition 时显式 skip」，原因是仓库没有 Node lock/install surface，测试运行时
+下载会引入网络依赖并让版本来源失去可审计性。discovery 已限制在 repository root；缺失时打印
+`SKIP:`、`@agentclientprotocol/sdk 0.21.0` 与精确期望路径，不再 panic，也不会命中平行 checkout。
+
+干净机器路径证明不是模拟：本机平行 checkout 的外部 SDK 仍然存在，但在 `task-c3` worktree 运行
+`cargo test -p oc-acp -- --nocapture` 明确打印 repository-local absent 的 skip reason，随后包内
+8 个测试全部通过。另有负向测试构造仓库外 SDK 并证明拒绝，正向测试证明仓库内 fixture 会启用。
+
+仍待关闭：完整 workspace/make gates 与 main 上真实 CodeBuild CI run；在这些证据落盘前不把本条
+标为 CI RESOLVED。
+
+### C-3 追加更正：Defect E 的最终 fixture 组合
+
+完整 oracle tree 有 `openai-chat/streams-text`，但精简 release smoke 根没有提交该文件。最终实现
+不依赖它：从已提交的 tool-loop cassette 取 interaction 2 的真实文本 response 作为 prelude，随后
+完整重放同一 cassette。`make smoke` 与 `make smoke-artifact` 均实测输出
+`3 requests, 10 tools offered` 并 PASS；全程未修改 cassette bytes。

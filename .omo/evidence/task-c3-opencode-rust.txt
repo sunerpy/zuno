@@ -1,0 +1,123 @@
+Task C-3 — CodeBuild smoke/live-SDK defect evidence
+Date: 2026-08-15
+Base: origin/main 4a198098df35560b1437a4bbfdec90bd552c641d
+Worktree: /config/workspace/ProdDir/AI/oc-wt/c3
+Branch: task-c3
+Cargo target: /tmp/opencode/c3 (fresh)
+
+Scope
+=====
+- Defect E: oc-smoke still expected two provider requests after the runtime added
+  one tool-free title prelude.
+- Defect F: oc-acp's live SDK test searched above the repository and panicked when
+  a sibling upstream checkout was absent.
+
+Defect E — red proof
+====================
+Command:
+  CARGO_TARGET_DIR=/tmp/opencode/c3 cargo test -p oc-testkit --bin oc-smoke
+
+Before the validator fix, the three new regression tests all failed with:
+  the provider saw 3 request(s), not 2; the turn did not send the tool result back
+  test result: FAILED. 0 passed; 3 failed
+
+The final validator requires:
+  request 0: title prelude; no advertised tools and no role:tool message
+  request 1: first real turn; bash/read/glob/grep all advertised
+  request 2: second real turn; bash/read/glob/grep all advertised and role:tool present
+
+The prelude response remains recorded evidence. The release-smoke cassette root
+does not contain the full oracle tree's independent title cassette, so the smoke
+reuses interaction 2 of the committed tool-loop cassette as the recorded text
+response for the prelude, then replays both cassette interactions normally.
+All three MockResponse values retain ResponseOrigin::Recorded. No cassette was
+added, edited, hand-authored, or re-recorded.
+
+Defect E — green proof
+======================
+Command:
+  CARGO_TARGET_DIR=/tmp/opencode/c3 cargo test -p oc-testkit --bin oc-smoke
+Result:
+  3 passed; 0 failed
+
+Commands (TARGET_DIR is the relative spelling of the same fresh absolute target;
+Makefile executes ./$(TARGET_DIR), so an absolute TARGET_DIR is not valid):
+  export CARGO_TARGET_DIR=/tmp/opencode/c3
+  target_dir=$(realpath --relative-to="$PWD" "$CARGO_TARGET_DIR")
+  make smoke TARGET_DIR="$target_dir"
+  make smoke-artifact TARGET_DIR="$target_dir"
+
+Results:
+  oc-smoke: ok    headless run replayed openai-chat/drives-a-tool-loop-end-to-end: 3 requests, 10 tools offered
+  oc-smoke: PASS  /tmp/opencode/c3/release/zuno
+  oc-smoke: ok    headless run replayed openai-chat/drives-a-tool-loop-end-to-end: 3 requests, 10 tools offered
+  oc-smoke: PASS  /config/workspace/ProdDir/AI/oc-wt/c3/dist/unpacked/zuno
+
+Defect F — design decision
+==========================
+The live test now skips cleanly and visibly when a repository-local pinned SDK is
+absent. A test-time SDK download was rejected because this Rust repository has no
+Node package manifest, lockfile, or install gate; adding network acquisition would
+make the test non-hermetic and its version source unauditable. Repository-local
+discovery leaves a defensible future seam: vendoring pinned SDK 0.21.0 re-enables
+the live test, and the JS report still asserts sdkVersion == 0.21.0.
+
+Defect F — red proof
+====================
+Command:
+  CARGO_TARGET_DIR=/tmp/opencode/c3 cargo test -p oc-acp --test live_sdk \
+    sdk_discovery_does_not_escape_the_repository_root -- --exact --nocapture
+
+Before bounding discovery, the synthetic external fixture was accepted:
+  assertion failed: SDK discovery escaped the repository and accepted
+  /tmp/.tmpnLxGAG/opencode/packages/opencode/node_modules/@agentclientprotocol/sdk/dist/acp.js
+  left: Some(...acp.js)
+  right: None
+
+Defect F — clean-machine proof
+==============================
+This host still has the sibling external SDK at:
+  /config/workspace/ProdDir/AI/opencode/packages/opencode/node_modules/@agentclientprotocol/sdk/dist/acp.js
+
+The task-c3 repository has no SDK at its bounded path. Command:
+  CARGO_TARGET_DIR=/tmp/opencode/c3 cargo test -p oc-acp -- --nocapture
+
+Observed output proves the external tree is unreachable after the fix:
+  SKIP: pinned @agentclientprotocol/sdk 0.21.0 is absent at
+  /config/workspace/ProdDir/AI/oc-wt/c3/opencode/packages/opencode/node_modules/@agentclientprotocol/sdk/dist/acp.js;
+  the live SDK test requires a repository-local fixture and will not search parent directories
+
+Package result:
+  8 passed; 0 failed (across non-empty test binaries); live_sdk: 3 passed
+
+The live_sdk test file has two discovery regression tests:
+- an SDK outside repository_root is rejected;
+- an SDK at repository_root/SDK_ENTRY is accepted (positive control, preventing a
+  hollow implementation that always returns None).
+
+Full local gate
+===============
+Disk before full run:
+  /dev/root 290G total, 194G used, 96G available (67%)
+
+Final full test command:
+  setsid nohup env CARGO_TARGET_DIR=/tmp/opencode/c3 cargo test --workspace \
+    > /tmp/opencode/c3-test.log 2>&1 &
+
+Final result from all 217 `test result` summaries:
+  3524 passed / 0 failed / 2 ignored
+
+Baseline explanation:
+  The prior baseline was 3519 passed. The +5 is exactly this task's five new
+  regression tests: 3 oc-smoke request-shape tests + 2 ACP SDK discovery tests.
+
+Additional gates:
+  make lint         PASS (cargo clippy --workspace --all-targets --offline -- -D warnings)
+  make fmt-check    PASS (cargo fmt --all --check + oxfmt)
+  make smoke        PASS
+  make smoke-artifact PASS
+
+CI evidence
+===========
+Pending commit/push/merge and the required real run on main. This section will be
+appended with the run id and per-job table after GitHub reports final conclusions.
