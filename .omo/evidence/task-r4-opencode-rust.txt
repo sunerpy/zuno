@@ -224,3 +224,110 @@ Result
 - Not touched, per the task's exclusions: task-r3 inventory generator/TSV, plugin_models.rs,
   compat_suite.rs beyond the WIP commit the rebase replayed, differential.rs, agent_differential.rs,
   oc-paths/tests/differential.rs, oracle.rs, and .github/workflows/.
+
+================================================================================
+2026-08-15 (rebase 2) — onto 1121bf3, after main removed the oracle differentials
+================================================================================
+
+Why a second rebase
+- main advanced 681b92d -> 1121bf3 with the oracle-differential removal (545ffc6, cfa07d1, 1121bf3)
+  plus the runner migration to us-east-2 (f9b8f92). Two files my WIP commit edited were deleted.
+
+Carry-vs-drop decision, made after reading main's version of each deleted file
+- DROPPED, both from the WIP commit `fix(test): 让差分测试容纳产品自有内置技能`:
+  * `crates/oc-catalog/tests/skill_differential.rs` — my change was a `parsed.retain(...)` filter
+    excluding `customize-opencode` from the byte-comparison, plus deletion of the module-doc
+    paragraph describing that comparison.
+  * `crates/oc-testkit/tests/compat_suite.rs` — my change was `normalize_product_owned_builtin_skill`,
+    replacing the builtin's `description`/`content` with `<PRODUCT-OWNED>` for `GET /api/skill`.
+  Both are pure oracle-comparison normalisation and contain ZERO test functions
+  (`git show 1367679 -- <both files>` confirms: one retain call, one if-block, one helper fn). Their
+  only purpose was to let a byte-comparison against the released opencode binary pass. With the
+  comparison deleted the normalisation is unreachable, so carrying it would add dead code.
+- Checked for a surviving carry target before dropping, as instructed. None exists:
+  * `git grep -n 'customize-opencode' origin/main -- 'crates/**'` returns 17 hits; every one is
+    either production source (`oc-catalog/src/skill/builtin.rs`, `render.rs`, `command.rs`,
+    `oc-server/src/api/catalog.rs`) or an IN-PROCESS/snapshot assertion
+    (`oc-catalog/tests/skill_render.rs` + two insta snapshots, `command/tests.rs`,
+    `oc-server/tests/api.rs:2130`). Not one compares skill output against the oracle.
+  * The salvaged files were read directly: `execute_contract.rs`, `behavior.rs`,
+    `agent_discovery.rs`, `diff_engine.rs` contain no reference to `customize-opencode`,
+    `/api/skill`, `debug skill`, or the word `skill` at all.
+- CARRIED (and still load-bearing):
+  * `crates/oc-cli/tests/cli_parity.rs` — the `(".opencode/", ".zuno/")` entry in
+    `expected_zuno_paths`. This file SURVIVED and still uses the Oracle, so the plan-path
+    normalisation is still required. Verified present in the rebased tree.
+  * `docs/compatibility-matrix.md` — survived, unchanged by main, carried intact.
+- Coverage lost by dropping: none. Zuno's builtin-skill identity is still pinned by
+  `oc-server/tests/api.rs`'s `/builtin/customize-opencode.md` location assertion (added by my own
+  commit 2b40dbb), the `skill_render` insta snapshots, and
+  `the_builtin_uses_zuno_identity_and_keeps_the_compatibility_config_filename`.
+- The WIP commit's message was rewritten to record this, so the drop is auditable from the log
+  rather than only from evidence.
+
+Notepad conflicts
+- `issues.md` and `learnings.md` each had exactly ONE conflict hunk = 3 real marker lines, verified
+  by `grep -nE '^(<{7} HEAD$|={7}$|>{7} .*$)'` before editing: issues.md at 8268/8367/8434,
+  learnings.md at 6960/7090/7142. A Python pass asserted the count was exactly 3, asserted marker
+  ORDER (open, separator, close), then removed those exact line indices — both sides kept in full.
+- The quoted-marker trap is real and nearly fired: a loose `grep -rnE '^(<{7}|={7}|>{7})'` reports
+  matches in `.omo/evidence/task-106/163/118-*.txt`, because those files use `======...` banner
+  rules far longer than 7 characters. The strict anchored pattern (`^={7}$`) returns nothing. Only
+  the strict pattern is safe; the loose one would have corrupted three evidence files.
+- Deleting the `=======` line closed the gap where a blank line belonged, leaving main's last
+  paragraph flush against my `## [2026-08-15] R4` heading. One blank line was reinserted at each
+  seam so the Markdown still parses as two sections.
+
+One correction to my own earlier work, found while rebasing
+- My Finding-8 rewrite of `crates/oc-testkit/src/lib.rs` said the differential suites "are kept
+  until a separate decision retires or reshapes them". main has now TAKEN that decision, so my own
+  sentence became stale in the same way as the text it replaced. Rewritten to state what is now
+  true: the whole-surface differentials are gone; what remains is the shared harness (scripted env,
+  cassette mock provider, diff engine, pinned-release helpers) that 22 test files across 9 crates
+  still consume; the oracle in these APIs is now a tool, not a contract.
+- main's own edit to the same file (removing `ENV_ALLOW_MISSING_ORACLE` from the `pub use` block at
+  ~line 124) auto-merged cleanly because it is ~120 lines away from my module docs. Both changes
+  verified present afterwards.
+
+Baseline reconciliation — derived BEFORE running, not fitted afterwards
+- main @1121bf3 measured by the requester: 3475 passed / 0 failed / 2 ignored / 213 suites.
+- My 8 commits add exactly +15 test functions, by two independent counts that agree:
+  (a) per-file diff scan of `#[test]`/`#[tokio::test]` immediately preceding `fn`:
+      oc-paths/src/config_chain.rs +6, oc-agent/src/plan_file/tests.rs +4,
+      oc-goal/src/projection_tests.rs +3, oc-db/tests/open.rs +1, oc-paths/src/files.rs +1;
+      removed: 0.
+  (b) whole-tree attribute count: 1121bf3 = 3361, HEAD = 3376, delta +15.
+- All 15 live in files that survive on main, and no new test FILE is added, so suites stay 213.
+- Predicted 3475 + 15 = 3490 / 0 / 2 / 213. MEASURED: 3490 passed / 0 failed / 2 ignored /
+  213 suites. Exact match, no unexplained delta.
+- This also reconciles the earlier 3541 figure: 3541 - 15 = 3526 = the old base @681b92d, and
+  3526 - 3475 = 51, which is main's 67 deleted tests minus the 16 salvaged (1 into
+  execute_contract.rs, 12 into behavior.rs, 1 in agent_discovery.rs, 2 into diff_engine.rs). So the
+  requester's hypothesis that some of my +15 lived in a deleted file is disproved: none did,
+  because the two doomed edits contained no test functions.
+
+Gates on the rebased tree (all clean, no fake failures this time)
+- `cargo test --workspace`: 3490 passed / 0 failed / 2 ignored / 213 suites; zero FAILED lines; no
+  `error: test failed`, no `StorageFull`, no `No space left`. Run detached via setsid nohup and
+  polled. `df -h /` stayed at 90-91% throughout, never near the 100% that produced the earlier
+  phantom failures.
+- `make fmt-check`: rc=0, "All matched files use the correct format".
+- `make lint`: rc=0, zero warning/error lines.
+- `make smoke-artifact` (CARGO_TARGET_DIR unset per Makefile:28): `oc-smoke: PASS`,
+  --version 1.18.13, headless run 3 requests / 10 tools offered.
+- Deleted-file audit: all eight removed differential files confirmed still absent in the rebased
+  tree — the rebase resurrected none of them.
+- Parallel-task files confirmed untouched by all 8 commits: `crates/oc-lsp/tests/live_servers.rs`,
+  `.omo/evidence/task-r3-opencode-inventory-generator.py` and its `.tsv`,
+  `crates/oc-cli/tests/plugin_models.rs`. `.github/workflows/` also untouched.
+
+Note on reading future CI failures
+- The runner moved from `aws-cn` to `us-east-2` (f9b8f92): webhook delivery went from 17/61 failing
+  (28%, no GitHub retry) to 12/12 at HTTP 200, and `actions/checkout` no longer times out. So a
+  checkout or delivery failure is NO LONGER known environmental noise and must be investigated.
+  Judge a job by whether it received a non-empty `runner_name`; `webhook.lastTriggeredAt` is null
+  for runner projects even on success and proves nothing.
+- The known open CI blocker is not mine and was not touched: `oc-lsp/tests/live_servers.rs`'s
+  `rust_analyzer_reports_a_live_compiler_error` fails on the runner with
+  `Error: Unavailable { server_id: "rust" }` because rust-analyzer is present but never becomes
+  ready — a third state its absent-only skip does not model. Another task owns it.

@@ -7190,3 +7190,33 @@ replacement requires **two** needles per readme — the independence claim AND t
 claim: the independence sentence alone is what let readers conclude no import exists, and naming the
 command alone would advertise adopting an opencode session. A comment records that deleting either
 needle silently restores the defect, so the next person cannot quietly halve the assertion.
+
+## [2026-08-15] R4 — 「待另行决定」是文档里的定时炸弹
+
+上一轮我修 Finding 8 时，把 `oc-testkit/src/lib.rs` 那句失效的 drop-in 承诺改成了「差分套件是保留
+的验证资产，保留至另行决定退役或重塑它们」。一天之内 main 就执行了那个决定，把整面 oracle 差分
+删了——**我的句子以与它替换掉的那句完全相同的方式变成了错的**。
+
+这不是运气差，是句式本身的问题。「X 保留至某决定作出」把一个尚未发生的外部事件编码进了断言，
+而没有任何机制在事件发生时提醒你回来改。它读起来很谨慎、很诚实，实际上是自带过期时间且不会
+报警的陈述。
+
+可行的替代：只陈述当前可验证的状态（「差分已移除，留下的是 N 个文件仍在消费的共享脚手架」），
+把待决事项放进计划或 issue 而不是放进源码文档；或者如果非要在代码里提，就让它可被测试钉住——
+本仓库 `docs.rs` 的 `contains_all` 就是这个作用，它逼着文档与代码一起改。
+
+判据很简单：**如果一句文档的真假取决于一件还没发生的事，它就不该出现在源码里。**
+
+## [2026-08-15] R4 — 删除冲突标记时，宽松正则会吃掉正文
+
+`.omo/notepads/*` 两侧都是追加，冲突必须两侧全留、只删标记行。直觉写法
+`grep -rE '^(<{7}|={7}|>{7})'` 是错的：`^={7}` 匹配任何以 7 个等号开头的行，而本仓库的证据文件
+大量使用 `======================...` 作为分隔横线，长度远超 7。宽松模式在三个证据文件里报出命中，
+照它清理就会把横线删成空行。
+
+安全做法三步：**严格锚定**（`^(<{7} HEAD$|={7}$|>{7} .*$)`，注意 `$` 让 `=======` 必须恰好 7 个）；
+**先断言数量再动手**（本次断言恰为 3，且顺序为 open/separator/close，不符就停）；**按行号删除而非
+按模式替换**，这样即使模式有漏也不会误伤正文。
+
+还有一个容易漏的副作用：`=======` 那一行往往正占着两段之间的空行位置，删掉它两段就会贴在一起，
+Markdown 不再解析为两节。删完要检查接缝，必要时补回空行。

@@ -7,14 +7,19 @@
 //! ABI — `engines.opencode`, the six `OPENCODE_*` handshake variables, and the
 //! `COMPATIBILITY_VERSION` an npm plugin range-matches against.
 //!
-//! The differentials in this crate are therefore a *verification asset* rather
-//! than a product promise: they were built while the behaviour was being ported
-//! and they still catch real regressions, so they are kept until a separate
-//! decision retires or reshapes them. Keeping them does not re-declare
-//! cross-binary compatibility as a goal. Where a surface has deliberately
-//! diverged, the difference is declared rather than normalised away — every design
-//! decision here is still made in favour of *detecting* a difference rather than
-//! producing a green run.
+//! That decision has since been taken: the whole-surface differential suites that
+//! byte-compared Zuno against the released `opencode` binary are **gone**. What
+//! remains of this crate is the harness those suites happened to share — the
+//! scripted environment, the cassette-backed mock provider, the diff engine, and
+//! the pinned-release helpers — which 22 test files across 9 crates still use for
+//! their own assertions, including the docs generator and the plugin-ABI gate.
+//!
+//! So the oracle in these APIs is now a *tool*, not a contract. A test may still
+//! run the pinned release to source a fixture or to check the plugin handshake;
+//! nothing here asserts that Zuno's own output must match it. Where a surface has
+//! deliberately diverged, the difference is declared rather than normalised away —
+//! every design decision in this crate is still made in favour of *detecting* a
+//! difference rather than producing a green run.
 //!
 //! `1.18.13` is the **source baseline** — the tree this port was read from and the
 //! version it reports to the npm plugin gate. The binary the differentials

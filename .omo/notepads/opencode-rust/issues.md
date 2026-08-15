@@ -8460,3 +8460,40 @@ the replayed WIP commit).
 '--prompt' found ... tip: a similar argument exists: '--port'`, exit 2. Correct form is
 `zuno run --model <MODEL> "<prompt>"`. Real-machine check then returned stdout exactly `R4-VERIFIED`,
 exit 0, stderr only the two expected plugin suppressions for `grep` and `glob`.
+
+## [2026-08-15] R4 — 第二次 rebase：main 删掉了我的 WIP 改过的两个文件
+
+**处置：丢弃，且确认没有丢覆盖率。** WIP 提交对 `skill_differential.rs` 与 `compat_suite.rs` 的改动
+分别是一个 `parsed.retain(...)` 过滤器和一个 `normalize_product_owned_builtin_skill` 归一化函数，
+**两处都不含任何测试函数**——它们唯一的作用是让与上游二进制的逐字比对通过。比对被删除后这些代码
+不可达，搬过去只会变成死代码。搬运前按要求先找存活的接收方：`git grep customize-opencode
+origin/main` 的 17 处命中全是生产源码或进程内/快照断言（`skill_render.rs` 及其两个 insta 快照、
+`oc-server/tests/api.rs:2130` 的 location 断言），没有一处与 oracle 比对；抢救出来的
+`execute_contract.rs` / `behavior.rs` / `agent_discovery.rs` / `diff_engine.rs` 连 `skill` 这个词
+都不出现。**真正搬过来的是 `cli_parity.rs` 的 `.opencode/` → `.zuno/` 映射**：该文件存活且仍在用
+Oracle，归一化仍然承重。Zuno 内置技能身份仍由上述 location 断言与快照守住。
+
+**引号里的冲突标记差点被误删。** 宽松的 `grep -rnE '^(<{7}|={7}|>{7})'` 会命中
+`.omo/evidence/task-106/163/118-*.txt` 里的 `======...` 分隔横线（长度远超 7 个字符）；严格的
+`^={7}$` 则一个都不命中。**只有严格锚定的模式是安全的**，宽松版会破坏三个证据文件。本次用 Python
+先断言标记数恰为 3、再断言顺序（open/separator/close），然后按行号精确删除，两侧内容全部保留。
+
+**删掉 `=======` 会顺带吃掉一个空行。** 该行原本占着 main 末段与我的 `## [2026-08-15] R4` 标题之间
+的空行位置，删除后两段贴在一起，Markdown 不再解析为两节。两个文件的接缝各补回一个空行。
+
+**我自己上一轮写的文字也过期了。** Finding 8 里我把 `oc-testkit/src/lib.rs` 改成「差分套件保留至
+另行决定」，而 main 恰好执行了那个决定——我的句子以与它替换掉的那句完全相同的方式变成了错的。
+教训：**凡是写「待某决定」的文档，都是一颗定时炸弹**，决定一落地它就成了陈述性谎言。已改为陈述
+现状：整面差分已移除，留下的是 22 个测试文件仍在消费的共享脚手架，oracle 在这些 API 里现在是
+工具而非契约。
+
+**基线推导先于测量。** main @1121bf3 = 3475/213；我的 8 个提交净增 15 个测试函数（两种独立计数
+一致：逐文件 diff 扫描 = 6+4+3+1+1，全树属性计数 3361→3376），全部位于存活文件、且不新增测试
+文件，故 213 套不变。预测 3490，实测 3490/0/2/213，无未解释差异。反推也自洽：3541−15=3526 即旧
+基线，3526−3475=51 = main 删的 67 个减去抢救回来的 16 个。请求方担心「我的 +15 里有些住在被删文件
+里」——不成立，因为那两处改动本就没有测试函数。
+
+**CI 失败的读法变了。** runner 从 `aws-cn` 迁到 `us-east-2`（f9b8f92）后，webhook 投递从 17/61 失败
+（28%，GitHub 不重试）变成 12/12 全 200，`actions/checkout` 不再超时。**所以 checkout 或投递失败
+不再是已知环境噪声，必须调查。** 判断作业健康仍看是否拿到非空 `runner_name`；
+`webhook.lastTriggeredAt` 对 runner 项目即使成功也是 null，证明不了任何事。
