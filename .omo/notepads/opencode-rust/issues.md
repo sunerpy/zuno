@@ -7981,7 +7981,7 @@ topics, and making the first push remain explicit follow-up work.
 - Z-4 reachability established (2026-08-14): CodeConnections has NO endpoint in aws-cn (both `codeconnections.` and `codestar-connections.cn-northwest-1.amazonaws.com.cn` fail to connect), and this host's only working credentials are aws-cn (us/jp/dig profiles all return InvalidClientTokenId). But cn CodeBuild does support runner mode: `create-webhook` with a WORKFLOW_JOB_QUEUED filter fails with "Project does not exist" rather than an invalid-filter error, and `import-source-credentials --auth-type PERSONAL_ACCESS_TOKEN` succeeds (probe credential deleted immediately). A buildspec-override probe on the existing `workkit-linux` project measured api.github.com=200, github.com=200, codeload.github.com=301, so cn-northwest-1 CodeBuild can reach GitHub to collect jobs. PAT therefore substitutes for the console-only CodeConnections handshake.
 - Z-4 scope limit measured (2026-08-14): release.yml carries two 6-platform matrices (x86_64/aarch64 linux-musl, x86_64/aarch64 apple-darwin, x86_64/aarch64 pc-windows-msvc). CodeBuild-hosted runners are Linux containers only, so the 4 non-Linux targets CANNOT move — that is a capability boundary, not a preference. ci.yml also has one windows-latest job at :128.
 
-## [2026-08-14] Z-4 — Linux CodeBuild runner prepared; activation awaits PAT
+## [2026-08-14, superseded 2026-08-15] Z-4 — Linux CodeBuild runner active; remote proof awaits GitHub Actions capacity
 
 The Linux-only workflow migration is implemented without changing CI topology or dropping any release
 target. Native macOS and Windows legs remain GitHub-hosted by capability necessity. An automated
@@ -7990,17 +7990,21 @@ missing/duplicate second routing label, duplicate complete set, or matrix that i
 `runs_on` value.
 
 AWS now has a Zuno-specific role and `zuno-runner` project in `cn-northwest-1`. The role trusts only
-CodeBuild, has exactly two inline policies (project-log writes and one dedicated source-secret read),
-no attached policies, and no ECR/ECS permissions. The project has an empty buildspec, no CodeBuild
-artifacts, status reporting disabled, privileged mode enabled, and `BUILD_GENERAL1_LARGE` chosen for
-the 3,509-test Rust/C workload. Its `source.auth` points directly at a dedicated Secrets Manager ARN,
-so it neither uses nor overwrites the account-level GitHub credential slot that other projects share.
+CodeBuild with exact source-account/project conditions, has exactly two inline policies (project-log
+writes and one dedicated source-secret read), no attached policies, and no ECR/ECS permissions. The
+project has an empty buildspec, no CodeBuild artifacts, status reporting disabled, privileged mode
+disabled, and `BUILD_GENERAL1_LARGE` chosen for the 3,509-test Rust/C workload. Its `source.auth`
+points directly at a dedicated Secrets Manager ARN, so it neither uses nor overwrites the
+account-level GitHub credential slot that other projects share.
 
-The secret intentionally has no value/version and the webhook intentionally does not exist yet.
-Activation requires a real GitHub classic PAT with `repo` (private repository read/clone and workflow
-job data) plus `admin:repo_hook` (create/manage the `workflow_job` webhook). After the PAT is supplied,
-store it only in that secret, create the `WORKFLOW_JOB_QUEUED`-filtered webhook, push only `task-z4`,
-then record queued/in_progress HTTP 200 deliveries and the full CodeBuild-vs-ubuntu CI comparison.
+The host's existing GitHub CLI credential was sufficient and was installed without recording its
+value; the secret has one `AWSCURRENT` version. GitHub hook `666011311` and the CodeBuild
+`WORKFLOW_JOB_QUEUED` filter are active, and the hook's `ping` returned 200. Remote proof is instead
+blocked below CodeBuild: affected runs show GitHub-hosted jobs failing in two seconds with zero steps
+and empty `runner_name`, while a later run remains pending with no jobs at all. That is the Actions
+quota signature. The exact quota value remains unverified because the current token lacks the `user`
+billing scope. After scheduling capacity is restored, record queued/in-progress delivery 200s and a
+complete CodeBuild-vs-GitHub-hosted CI comparison.
 
 ## [2026-08-15] R1 — close two silent bypasses at existing chokepoints
 

@@ -233,15 +233,22 @@ rather than replace), and release automation with release-please + git-cliff.
 
 ## Z-4. AWS-hosted GitHub Actions runners, per the `github-actions-on-codebuild` skill
 
-**Status:** PREPARED — Linux workflow edits, least-privilege IAM, project-scoped secret auth, and
-the CodeBuild project are complete; activation and remote CI proof are blocked only on a real GitHub
-PAT with `repo` + `admin:repo_hook`, after which the webhook must be created and deliveries verified.
+**Status:** ACTIVE, REMOTE PROOF BLOCKED BELOW CODEBUILD (2026-08-15) — Linux workflow edits,
+least-privilege IAM, project-scoped secret auth, the CodeBuild project, and the
+`WORKFLOW_JOB_QUEUED` webhook are complete. The existing GitHub CLI credential supplied the source
+credential without minting a new PAT; no credential value was recorded. A full remote runner proof is
+currently blocked because GitHub is not starting workflow jobs. A GitHub-hosted Windows job in the
+same affected run also failed in two seconds with zero steps and an empty `runner_name`, which is the
+account-level Actions quota signature rather than a CodeBuild routing failure. The exact billing/quota
+figure could not be read because the current GitHub token lacks the required `user` scope.
 
 **Not blocked on Z-3.** The repository and first push exist. CodeConnections is not the path in
 `aws-cn` because that partition has no CodeConnections endpoint. The CodeBuild project source uses
-`SECRETS_MANAGER` PAT authentication instead. The only remaining activation blocker is writing a
-real PAT with `repo` + `admin:repo_hook` into the existing empty secret, then creating and verifying
-the webhook. No credential value belongs in this plan or its evidence.
+`SECRETS_MANAGER` PAT authentication instead. The dedicated secret now has one `AWSCURRENT` version,
+and webhook `666011311` is active for `workflow_job`/`issue_comment` events with a
+`WORKFLOW_JOB_QUEUED` CodeBuild filter. The remaining blocker is restoring GitHub Actions job
+scheduling capacity, not supplying credentials or activating CodeBuild. No credential value belongs
+in this plan or its evidence.
 
 ### Why this shape rather than migrating to CodePipeline
 
@@ -254,15 +261,17 @@ files, that duplication is the larger risk.
 
 Actual path: private repository → least-privilege service role (**two policies, no ECR/ECS**) →
 runner-mode project with source auth type `SECRETS_MANAGER` (`buildspec: ""`,
-`privilegedMode: true`, `reportBuildStatus: false`) → populate the existing empty PAT secret →
-create the webhook filtered to `WORKFLOW_JOB_QUEUED` → verify webhook deliveries and jobs, not just
-job status.
+`privilegedMode: false`, `reportBuildStatus: false`) → populate the dedicated source secret from the
+existing GitHub CLI credential without exposing its value → create the webhook filtered to
+`WORKFLOW_JOB_QUEUED` → after GitHub Actions scheduling capacity is restored, verify workflow-job
+deliveries and jobs rather than only webhook activation.
 
 Traps, all of which the skill reports having hit in practice:
 
-1. **Create the webhook only after the real PAT is present in the existing secret.** A placeholder
-   or empty secret cannot authenticate webhook creation or repository access. CodeConnections/App
-   authorization instructions do not apply in `aws-cn`.
+1. **Create the webhook only after a valid source credential is present in the existing secret.** An
+   empty secret cannot authenticate webhook creation or repository access. The host's existing
+   GitHub CLI credential was sufficient; a new PAT and CodeConnections/App authorization were not
+   required. CodeConnections instructions do not apply in `aws-cn`.
 2. **Give every job a unique label.** GitHub routes by label **superset**, so a job with fewer labels
    can have its runner stolen by one with more — and the symptom is a job hanging forever with no
    error. This project has **9 jobs across two workflows**; that is exactly the condition.
@@ -278,7 +287,8 @@ record why, rather than accepting `BUILD_GENERAL1_MEDIUM` because it is the exam
 
 - Every job's `runs-on` names the CodeBuild project **verbatim** and carries a **unique** second
   label; a check proves no two jobs share a label set.
-- Webhook deliveries for `queued` and `in_progress` both return 200, recorded in the evidence.
+- Webhook activation and its 200 `ping` delivery are recorded. Once GitHub resumes creating jobs,
+  `queued` and `in_progress` workflow-job deliveries must both return 200 before remote proof closes.
 - The service role has exactly the two documented policies and **no** ECR/ECS permissions.
 - A full CI run passes on the CodeBuild runners with the same result as on `ubuntu-latest`, and both
   results are recorded.
