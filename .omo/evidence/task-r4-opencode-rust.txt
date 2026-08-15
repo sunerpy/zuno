@@ -1,0 +1,57 @@
+PENDING — task-r4 started; incremental evidence follows.
+
+2026-08-15 preflight
+- Worktree/branch: /config/workspace/ProdDir/AI/oc-wt/r4, task-r4, clean before the evidence file.
+- `df -h /`: 70 GiB available, 76% used; safe to proceed.
+- Read the closing `## Working rules` in `.omo/plans/opencode-rust-followup.md` and the latest notepad entries through issues.md:8051.
+- The worktree has no `.codegraph/`; code intelligence was read from the indexed main tree at the same clean `main` revision, then the requested worktree itself was used for the exact textual inventory. No exploration agent was delegated, so no delegated search was duplicated.
+
+Fresh `.opencode` inventory before edits
+- Exact broad grep over `crates/**/*.rs`: 118 matching lines in 44 files (includes comments, tests, fixtures and upstream references, so it is not used as the production count).
+- Re-measured executable/non-comment implementation scope as `crates/*/src/**/*.rs`, excluding `tests.rs`, `*/tests/*`, `*_tests.rs`, `oc-testkit`, and code after an inline `#[cfg(test)]`: 17 occurrences. The previous 39-occurrence estimate therefore had drifted or used a broader scope.
+- Move as Zuno-owned state/identity (12): `oc-agent` plan project directory; `oc-goal` goal project directory and gitignore line; `oc-cli` plan permission; `oc-tools` shell tool-output/background, registry tool-output and plan-exit default; `oc-catalog` and `oc-server` built-in skill descriptions; `oc-server` v2 plan permission.
+- Keep as plugin/protocol ABI or protective recognition (4): `.opencode-version` is the remote-skill protocol cache stamp; an explicitly supplied `OPENCODE_CONFIG_DIR` may itself end in `.opencode`; the memory threat detector must continue recognizing plugin-authored `.opencode/` self-modification; `engines.opencode` remains the npm plugin semver field. These are not default Zuno state writes.
+- Rename as stale managed identity (1): macOS managed preference domain `ai.opencode.managed` becomes `ai.zuno.managed`. The corresponding system managed roots (`/etc/opencode`, macOS Application Support and Windows ProgramData) were found during context reading and will also use `zuno`; they are configuration discovery, not plugin ABI.
+- `DEFAULT_MODELS_SOURCE=https://models.opencode.ai` is a service endpoint, not an on-disk path or product identity, and remains unchanged.
+
+Database decision
+- Rename Zuno's own default files inside `$XDG_DATA_HOME/zuno` from `opencode.db` / `opencode-<channel>.db` to `zuno.db` / `zuno-<channel>.db`.
+- This is not an import of `$XDG_DATA_HOME/opencode`: the diagnostic concerns only the prior Zuno-owned filename in the already-hard-cut Zuno data root.
+- `oc-db::open_at` will refuse old-only with a typed `DbError` naming both old and new files; new-only and both open the new file; neither creates the new file. These four states will be tested explicitly. Arbitrary `ZUNO_DB` filenames remain untouched.
+
+2026-08-15 mutation evidence
+- Default database hard cut: temporarily changed the old-file guard from `old_path.exists()` to `false && old_path.exists()`. `default_database_filename_hard_cut_covers_old_new_both_and_neither` failed in the old-only case because the expected typed rejection became a connection/open error. The mutation was restored before proceeding.
+- Tool source precedence: temporarily swapped `Plugin` and `Mcp` in `TOOL_SOURCE_PRECEDENCE`. `registry_de_duplicates_cross_source_names_with_upstreams_last_source_winning` failed with `left: [Builtin, ConfigDirectory, Mcp, Plugin]`; exit code 101. The mutation was restored before proceeding.
+
+2026-08-15 full-suite finding and minimal repair
+- The first detached workspace run completed with exit 101: 3516 passed, 5 failed, 2 ignored. All five failures were retained differential tests comparing intentional Zuno identity changes against the upstream product, not runtime regressions.
+- `skill_differential.rs` now removes only the product-owned `customize-opencode` builtin before comparing discovered external skills. The independent Zuno builtin identity remains pinned by `the_builtin_uses_zuno_identity_and_keeps_the_compatibility_config_filename` and the server API assertions.
+- `cli_parity.rs` normalizes the project-owned `.opencode/` plan prefix to `.zuno/`; all other output remains differentially compared.
+- `compat_suite.rs` normalizes only `description` and `content` for the `customize-opencode` item returned by `GET /api/skill`. External skill bodies and every other API field remain compared.
+- `docs/compatibility-matrix.md` changed only stale generated values: the three `ConsoleCommand`, `ImportCommand`, and `PluginCommand` disposition rows plus the Zuno database filenames in `channel-dependent-database-filename`. This overlaps task-c1's file ownership only inside code-derived generated blocks; no task-c1 prose was replaced.
+
+Focused regression results
+- `debug_skill_matches_the_oracle_across_every_root`: PASS.
+- `the_declared_presentation_divergences_are_live`: PASS.
+- `every_implemented_command_produces_the_same_normalized_output_as_the_oracle`: PASS.
+- `api_behaviour_matrix_compares_live_status_body_and_side_effects`: PASS.
+- `docs_compatibility_matrix_matches_every_code_table`: PASS. Its first run exposed the three stale command rows; its second run exposed the two stale database filenames; after those exact generated values were updated, the test passed.
+
+Final local gates
+- One chained gate used `CARGO_TARGET_DIR=/tmp/opencode/r4`, `CARGO_BUILD_JOBS=2`, offline Cargo resolution, and `RUST_TEST_THREADS=2` for the workspace suite.
+- `cargo metadata --locked --offline --format-version 1`: PASS.
+- `cargo fmt --all --check`: PASS.
+- `cargo build --workspace --offline`: PASS.
+- `cargo test --workspace --offline`: PASS, no failed test-result summary.
+- `cargo clippy --workspace --all-targets --offline -- -D warnings`: PASS.
+- `git diff --check`: PASS.
+- Changed-file diagnostics: the LSP tool rejects the R4 worktree because its request root is fixed to the main checkout. A temporary physical source copy under that request root was made solely for diagnostics; `skill_differential.rs`, `cli_parity.rs`, and `compat_suite.rs` each returned `No diagnostics found`. The copy was deleted immediately. The actual worktree independently passed build, tests, and all-target Clippy above.
+
+Real three-plugin turn
+- A preliminary process launch without `ZUNO_DB` exited before plugin loading or provider dispatch because the new hard-cut guard detected `/config/.local/share/zuno/opencode-local.db`. It produced no assistant output and therefore was not a live turn. The old database was neither read nor moved.
+- The one actual non-`--pure` provider request used the already-proven reachable model and an explicit disposable `ZUNO_DB=/tmp/opencode/r4/r4-live.db`, preserving the normal Zuno config and all three installed plugins.
+- Stdout was exactly `R4-VERIFIED` with exit 0. Stderr contained only the expected visible suppressions: builtin `grep` and `glob` were replaced by same-named plugin tools. No credential, key, token, request body, or secret value was written to this evidence.
+
+Result
+- R4 local verification is complete: Zuno-owned identity differences have narrow differential boundaries, the retained external compatibility comparisons remain active, all local gates pass, changed Rust files are diagnostic-clean, and the real three-plugin turn returned `R4-VERIFIED`.
+- Z-4 remote proof remains separately blocked at GitHub Actions scheduling capacity as recorded in `task-z4-opencode-rust.txt`; no AWS resource was mutated during R4.

@@ -76,9 +76,9 @@ loses and, where one exists, the test that fails if the gap closes or goes stale
 
 ### channel-dependent-database-filename
 
-**Surface.** $XDG_DATA_HOME/zuno/opencode-<channel>.db
+**Surface.** $XDG_DATA_HOME/zuno/zuno-<channel>.db
 
-**What is missing.** A Zuno source build resolves opencode-local.db while an installed release resolves opencode.db, so a `cargo build` does not see the release database. Zuno retains the oracle's channel filename rule (packages/core/src/database/database.ts:45-55) exactly, so it is FAITHFUL BEHAVIOUR inside Zuno's own data root and not a divergence — recorded here because it presents as a missing-data bug the first time anyone tries it. Plan todo 92 owns documenting it.
+**What is missing.** A Zuno source build resolves zuno-local.db while an installed release resolves zuno.db, so a `cargo build` does not see the release database. Zuno retains the oracle's channel filename rule (packages/core/src/database/database.ts:45-55) exactly, so it is FAITHFUL BEHAVIOUR inside Zuno's own data root and not a divergence — recorded here because it presents as a missing-data bug the first time anyone tries it. Plan todo 92 owns documenting it.
 
 ### assistant-turn-step-parts
 
@@ -154,16 +154,16 @@ as identifiers for the work that owns a surface, not as anything a user needs.
 | `AcpCommand` | `acp` | not-registered | todo 78 owns the oc-acp protocol adapter; registering it before that handler exists would advertise a server that cannot speak ACP |
 | `AgentCommand` | `agent` | implemented | registered through the headless-command seam for todo 56 |
 | `AttachCommand` | `attach` | not-registered | attach requires the TUI client and terminal lifecycle owned by the TUI wave; no headless substitute is equivalent |
-| `ConsoleCommand` | `console` | rejected | the hosted OpenCode Console is excluded from this Rust port's local-agent scope; use `providers` (alias `auth`) for local credentials instead |
+| `ConsoleCommand` | `console` | rejected | the hosted OpenCode Console is excluded from Zuno's local-agent scope; use `providers` (alias `auth`) for local credentials instead |
 | `DbCommand` | `db` | implemented | registered through the headless-command seam for todo 56 and the maintenance extensions in todo 84 |
 | `DebugCommand` | `debug` | implemented | registered through the headless-command seam for todo 56 |
 | `ExportCommand` | `export` | implemented | prints one session's whole transcript as JSON, byte-compared against the released binary's own export, with `--sanitize` redacting the same fields |
 | `GenerateCommand` | `generate` | rejected | the command is a TypeScript source-tree SDK/OpenAPI generator that depends on Prettier and is excluded from the runtime binary; use the server's `/openapi.json` document instead |
 | `GithubCommand` | `github` | rejected | the hosted GitHub agent is outside the local-agent scope; run `zuno run` from the CI workflow instead |
-| `ImportCommand` | `import` | implemented | reads a document `export` produced back into this checkout's database; share-URL imports are not accepted because the hosted share service is outside this port's scope |
+| `ImportCommand` | `import` | implemented | reads a local `export` document into Zuno's database; share-URL imports are not accepted because Zuno does not integrate with the hosted share service |
 | `McpCommand` | `mcp` | implemented | registered through the headless-command seam for todo 56 |
 | `ModelsCommand` | `models` | implemented | registered through the headless-command seam for todo 56 |
-| `PluginCommand` | `plugin` | not-registered | plugin installation must wait for todo 60's resident JavaScript host and compatibility gate; accepting installs before plugins can load would corrupt configuration |
+| `PluginCommand` | `plugin` | not-registered | the resident host loads configured plugins, but Zuno does not own an npm installer; declare plugins in opencode.json so compatibility is checked before import |
 | `PrCommand` | `pr` | rejected | the GitHub checkout helper is excluded from the local-agent runtime; use `gh pr checkout <number>` and then `zuno run` instead |
 | `ProvidersCommand` | `providers` | implemented | registered with the upstream `auth` alias through the headless-command seam for todo 56 |
 | `RunCommand` | `run` | implemented | registered through the headless-command seam for todo 56 |

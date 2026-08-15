@@ -652,6 +652,7 @@ fn expected_zuno_paths(text: &str) -> String {
         ("<CONFIG>/opencode", "<CONFIG>/zuno"),
         ("<STATE>/opencode", "<STATE>/zuno"),
         ("<TMP>/opencode", "<TMP>/zuno"),
+        (".opencode/", ".zuno/"),
         ("/opencode/", "/zuno/"),
     ]
     .into_iter()
