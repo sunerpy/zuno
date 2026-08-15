@@ -8,6 +8,15 @@ Created 2026-08-14, at the user's direction:
 > 使用自己的配置文件目录。然后根据 github-project skill 优化本项目设计，并根据
 > github-codebuild skill 实现 aws 托管的 actions 构建测试验证等"*
 
+Direction updated 2026-08-15: **Zuno is an independent project.** Compatibility
+with the released `opencode` binary, and importing or restoring its sessions, are
+not product goals. The npm plugin tier remains supported, so
+`COMPATIBILITY_VERSION`, `engines.opencode`, and the six measured `OPENCODE_*`
+plugin-ABI names stay load-bearing. Existing differential suites and compatibility
+documents remain in place pending a separate explicit decision; their presence is
+verification history, not a mandate to add old-directory fallback or session
+interchange features.
+
 ## Status of the work that precedes this
 
 - Main plan **183/183**, four reviewers approved on one product tree.
@@ -21,17 +30,17 @@ Created 2026-08-14, at the user's direction:
 
 | Fact | Count | Where |
 |---|---:|---|
-| Source files mentioning `opencode` | **181** | `crates/*/src/` |
+| Lowercase `opencode` source inventory | **943 occurrences / 169 files** | committed R3 inventory |
 | Distinct `OPENCODE_*` environment variables | **72** | `crates/*/src/` |
 | Crates in the workspace | **36** | `crates/` |
 | `runs-on: ubuntu-latest` jobs in CI | **4** | `.github/workflows/ci.yml` (210 lines) |
 | `runs-on` entries in release | **5** | `.github/workflows/release.yml` (418 lines) |
-| **git remote** | **none** | — |
-| **LICENSE** | **absent** | — |
+| **git remote** | **origin configured** | `git@github.com:sunerpy/zuno.git` |
+| **LICENSE** | **present** | `LICENSE` |
 
-Two of those decide the ordering. There is **no git remote**, and CodeBuild-hosted runners require
-a GitHub repository with a CodeConnections App authorisation against it. And `LICENSE` is missing,
-which the project-scaffold skill treats as table stakes for a public repo.
+The remote and license were absent when the plan was drafted; Z-3 subsequently created both. In
+AWS China, Z-4 cannot use CodeConnections because that partition has no endpoint, so the prepared
+CodeBuild project uses project-scoped `SECRETS_MANAGER` PAT authentication instead.
 
 ## The dependency order, and why it is not negotiable
 
@@ -43,9 +52,9 @@ FU-8A  provider surface  ─────────┘
 
 - **Z-1 before Z-2**: renaming while still reading `~/.config/opencode/` would ship a binary called
   Zuno that silently depends on its predecessor's directories. Decide the directory story first.
-- **Z-3 before Z-4**: the CodeBuild path needs a remote, a CodeConnections authorisation bound to
-  that remote, and a workflow to attach runners to. Skill §1 makes the connection **region-scoped**
-  and its GitHub App handshake **console-only** — it cannot be done from the CLI.
+- **Z-3 before Z-4**: the CodeBuild path needs a remote and a workflow to attach runners to. The
+  completed AWS China implementation uses `SECRETS_MANAGER` PAT authentication because
+  CodeConnections is unavailable in `aws-cn`.
 - **FU-8A should land before Z-3** so the first CI run on the new repo is not red for a known cause.
 
 ---
@@ -90,12 +99,9 @@ literals plus the tests that pin them.
 
 **What it still costs, and must be handled rather than discovered:**
 
-- **This machine's own setup stops being read.** `~/.config/opencode/opencode.json` (7 providers, 404
-  models, 3 plugins) and `~/.local/share/opencode/auth.json` (the live `google` OAuth plus the
-  `myopenai` / `kiro-auth` API keys) will no longer be found. That is correct behaviour under a hard
-  cut, but it means **the orchestrator's own end-to-end verification breaks until a Zuno-located
-  config exists**. Provide a documented one-liner that copies the existing config into the Zuno
-  location so hands-on QA — including FU-8A's verification — remains possible.
+- **This machine's old setup stopped being read.** The one-time config copy used during Z-1 was a
+  private QA fixture that proved the new root worked; it is not a supported import path and must not
+  be presented as a session/config migration feature. Production behavior remains Zuno-only.
 - **`.omo/fixtures/` and the compat suite** may reference `opencode` config paths. The oracle is the
   released `opencode` binary and **its** paths must not be renamed; only *this* project's paths move.
   Confirm that distinction test by test rather than by global replace.
@@ -118,8 +124,10 @@ context. The decision was re-measured against the exact loaded bundles under
 `/config/.cache/opencode/packages/`: `@sunerpy/oh-my-openagent@4.21.0`,
 `opencode-antigravity-auth@1.6.0`, and `@sunerpy/opencode-kiro-auth@0.20.6`.
 
-- The loaded bundle union contains **30** `OPENCODE_*` names; the bundle-local counts are 25 for
-  OMO, 7 for Antigravity, and 0 for Kiro. Antigravity's own namespace is not a host ABI.
+- The unfiltered loaded-bundle union contains **41** `OPENCODE_*` names; the bundle-local counts are
+  25 for OMO, 18 for Antigravity, and 0 for Kiro. Excluding Antigravity's 11 plugin-owned
+  `OPENCODE_ANTIGRAVITY_*` names leaves 7 for that bundle and a **30-name filtered host-contract
+  union**. Antigravity's own namespace is not a host ABI.
 - This project uses **72**.
 - **The intersection is exactly 6**, and these are the ones a rename would break:
 
@@ -173,9 +181,10 @@ already settled.
 - **Crate names** (`oc-*`): renaming 36 crates is churn with no user-visible benefit. **I would keep
   the `oc-` prefix** and rename only the binary, the user agent, the display name, and the docs. Say
   so explicitly rather than leaving it ambiguous.
-- **`docs/divergences.toml`'s meaning.** Its 17 entries mean "deviation from upstream". That framing
-  survives Z-1 and Z-2 only if the compatibility surface is still defined against upstream. This is
-  the open question already recorded in `zuno-strategy.md`; renaming does not settle it.
+- **Compatibility records are retained evidence, not identity.** `docs/divergences.toml`, the
+  differential suites, and oracle fixtures still describe upstream artefacts. Whether those suites
+  should remain is awaiting an explicit user decision; Zuno's own behavior must not be bent to
+  preserve cross-binary session or configuration compatibility in the meantime.
 
 ### Acceptance criteria (agent-executable)
 
@@ -183,17 +192,18 @@ already settled.
 - `COMPATIBILITY_VERSION`'s meaning is documented and its test updated to state *why* the value is
   what it is.
 - The alias decision is implemented and tested either way.
-- `grep -rn "opencode" crates/*/src/` returns only: upstream oracle references, historical comments,
-  and the plugin-compatibility surface — each of which a test or a comment justifies.
+- A reproducible classification inventory accounts for every lowercase `opencode` source occurrence
+  as an upstream artefact/reference, plugin ABI, or historical citation; Zuno presentation identity
+  has no remainder.
 
 ---
 
 ## Z-3. Repository scaffold, per the `github-project-scaffold` skill
 
-**Status: CLOSED (2026-08-14)** — File-side scaffold complete; remote creation, repository metadata,
-and the first push remain explicit follow-up work because this task must not create or push a remote.
-
-**Blocked on: there is no git remote, and no LICENSE.** Both must exist before Z-4 is even possible.
+**Status: CLOSED (2026-08-14)** — File-side scaffold, remote creation, repository metadata, and the
+first push are complete. `origin` is `git@github.com:sunerpy/zuno.git`; `origin/main` matched HEAD at
+verification time. The repository is private and has a description plus five topics. `LICENSE` is
+present.
 
 Scope from the skill: a bilingual README (Chinese root + English under `docs/readme/`, slim with a
 TOC and detail pushed into `docs/`), LICENSE, repository description and topics via `gh`, commit-time
@@ -227,8 +237,11 @@ rather than replace), and release automation with release-please + git-cliff.
 the CodeBuild project are complete; activation and remote CI proof are blocked only on a real GitHub
 PAT with `repo` + `admin:repo_hook`, after which the webhook must be created and deliveries verified.
 
-**Blocked on Z-3.** Runner-mode CodeBuild needs a repository, and the CodeConnections GitHub App
-handshake is **console-only** — no CLI path exists (skill §1).
+**Not blocked on Z-3.** The repository and first push exist. CodeConnections is not the path in
+`aws-cn` because that partition has no CodeConnections endpoint. The CodeBuild project source uses
+`SECRETS_MANAGER` PAT authentication instead. The only remaining activation blocker is writing a
+real PAT with `repo` + `admin:repo_hook` into the existing empty secret, then creating and verifying
+the webhook. No credential value belongs in this plan or its evidence.
 
 ### Why this shape rather than migrating to CodePipeline
 
@@ -239,14 +252,17 @@ files, that duplication is the larger risk.
 
 ### The six steps, and the three traps that matter most here
 
-Steps: CodeConnections → service role (**two policies, no ECR/ECS**) → runner-mode project
-(`buildspec: ""`, `privilegedMode: true`, `reportBuildStatus: false`) → webhook filtered to
-`WORKFLOW_JOB_QUEUED` → change `runs-on` → verify via webhook deliveries, not just job status.
+Actual path: private repository → least-privilege service role (**two policies, no ECR/ECS**) →
+runner-mode project with source auth type `SECRETS_MANAGER` (`buildspec: ""`,
+`privilegedMode: true`, `reportBuildStatus: false`) → populate the existing empty PAT secret →
+create the webhook filtered to `WORKFLOW_JOB_QUEUED` → verify webhook deliveries and jobs, not just
+job status.
 
 Traps, all of which the skill reports having hit in practice:
 
-1. **Create the webhook *after* the App authorisation.** Otherwise `workflow_job` arrives null and
-   CodeBuild returns 400 with a message that points nowhere near the cause.
+1. **Create the webhook only after the real PAT is present in the existing secret.** A placeholder
+   or empty secret cannot authenticate webhook creation or repository access. CodeConnections/App
+   authorization instructions do not apply in `aws-cn`.
 2. **Give every job a unique label.** GitHub routes by label **superset**, so a job with fewer labels
    can have its runner stolen by one with more — and the symptom is a job hanging forever with no
    error. This project has **9 jobs across two workflows**; that is exactly the condition.
