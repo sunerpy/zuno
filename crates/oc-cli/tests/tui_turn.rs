@@ -415,6 +415,14 @@ fn run_under_pty(
 /// Two copies of these assertions would be free to drift into testing two different
 /// things while still both passing.
 async fn one_turn_through(submission: Submission) {
+    if oc_testkit::recordings_root_or_skip(
+        "tui_turn::one_turn_through",
+        "the recorded TUI turn was NOT tested",
+    )
+    .is_none()
+    {
+        return;
+    }
     let env = ScriptedEnv::new().expect("isolated environment");
     let scenario = Scenario::new("recorded-tool-loop")
         .from_oracle_cassette(TITLE_CASSETTE)

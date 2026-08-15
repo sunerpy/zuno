@@ -1655,6 +1655,14 @@ export default {
 
     #[tokio::test]
     async fn compaction_plugin_hooks_mutate_the_real_summary_request_and_continuation() {
+        if oc_testkit::recordings_root_or_skip(
+            "compaction_plugin_hooks_mutate_the_real_summary_request_and_continuation",
+            "the real summary request and continuation were NOT replayed",
+        )
+        .is_none()
+        {
+            return;
+        }
         let env = ScriptedEnv::new().expect("isolated compaction environment");
         let plugin = env.project().join("compaction-plugin.mjs");
         std::fs::write(&plugin, COMPACTION_PLUGIN).expect("write compaction plugin");

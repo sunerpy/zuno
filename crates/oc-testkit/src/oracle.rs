@@ -768,13 +768,19 @@ mod tests {
         }
     }
 
-    /// The oracle tree is a hard requirement of this project: it is the source
-    /// baseline this port was read from and ninety later tasks read fixtures out of
-    /// it. A machine without it cannot verify anything, so this fails loudly rather
-    /// than skipping. Note this is the *source* pin, not [`PINNED_RELEASE`] — see
-    /// the module docs' "two pins" table.
+    /// Verify the source version whenever the complete recordings checkout is
+    /// available. Automatic absence is a visible skip on clean build hosts, while
+    /// an invalid explicit source remains fatal through [`crate::recordings_root_or_skip`].
     #[test]
     fn the_pinned_source_tree_is_locatable_and_states_its_version() {
+        if crate::recordings_root_or_skip(
+            "the_pinned_source_tree_is_locatable_and_states_its_version",
+            "the pinned source version was NOT verified",
+        )
+        .is_none()
+        {
+            return;
+        }
         let tree = locate_source_tree()
             .expect("no opencode source tree found; set OC_TESTKIT_ORACLE_SOURCE to a checkout");
         let version = read_pinned_version(&tree).expect("the tree must declare a version");

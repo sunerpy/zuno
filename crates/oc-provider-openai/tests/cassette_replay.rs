@@ -9,6 +9,10 @@ use serde_json::{Value, json};
 const CHAT_MODEL: &str = "gpt-4o-mini";
 const RESPONSES_MODEL: &str = "gpt-5.5";
 
+fn recordings_available(test: &str) -> bool {
+    oc_testkit::recordings_root_or_skip(test, "OpenAI cassette replay was NOT tested").is_some()
+}
+
 fn decode(
     interaction: &HttpInteraction,
     model: &str,
@@ -80,6 +84,9 @@ fn weather_tool_responses() -> Value {
 
 #[test]
 fn recorded_chat_text_matches_request_and_exact_events() {
+    if !recordings_available("recorded_chat_text_matches_request_and_exact_events") {
+        return;
+    }
     let mut player =
         CassettePlayer::from_oracle("openai-chat/streams-text").expect("recorded conversation");
     let request = CompletionRequest::new(
@@ -125,6 +132,9 @@ fn recorded_chat_text_matches_request_and_exact_events() {
 
 #[test]
 fn recorded_chat_tool_call_matches_request_and_exact_events() {
+    if !recordings_available("recorded_chat_tool_call_matches_request_and_exact_events") {
+        return;
+    }
     let mut player = CassettePlayer::from_oracle("openai-chat/streams-tool-call")
         .expect("recorded conversation");
     let request = CompletionRequest::new(
@@ -187,6 +197,9 @@ fn recorded_chat_tool_call_matches_request_and_exact_events() {
 
 #[test]
 fn recorded_chat_two_turn_tool_loop_matches_both_requests() {
+    if !recordings_available("recorded_chat_two_turn_tool_loop_matches_both_requests") {
+        return;
+    }
     let mut player = CassettePlayer::from_oracle("openai-chat/drives-a-tool-loop-end-to-end")
         .expect("recorded conversation");
     let system = Message::new(
@@ -250,6 +263,9 @@ fn recorded_chat_two_turn_tool_loop_matches_both_requests() {
 
 #[test]
 fn recorded_responses_text_uses_default_surface_and_exact_events() {
+    if !recordings_available("recorded_responses_text_uses_default_surface_and_exact_events") {
+        return;
+    }
     let mut player = CassettePlayer::from_oracle("openai-responses/gpt-5-5-streams-text")
         .expect("recorded conversation");
     let request = CompletionRequest::new(
@@ -295,6 +311,9 @@ fn recorded_responses_text_uses_default_surface_and_exact_events() {
 
 #[test]
 fn recorded_responses_tool_call_matches_request_and_exact_events() {
+    if !recordings_available("recorded_responses_tool_call_matches_request_and_exact_events") {
+        return;
+    }
     let mut player = CassettePlayer::from_oracle("openai-responses/gpt-5-5-streams-tool-call")
         .expect("recorded conversation");
     let request = CompletionRequest::new(
@@ -351,6 +370,9 @@ fn recorded_responses_tool_call_matches_request_and_exact_events() {
 
 #[test]
 fn recorded_encrypted_reasoning_survives_store_false_continuation() {
+    if !recordings_available("recorded_encrypted_reasoning_survives_store_false_continuation") {
+        return;
+    }
     let mut player = CassettePlayer::from_oracle(
         "openai-responses/openai-responses-gpt-5-5-reasoning-continuation",
     )

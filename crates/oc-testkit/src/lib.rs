@@ -102,6 +102,7 @@ pub mod terminal_owner;
 pub use crate::cassette::{
     BodyEncoding, Cassette, CassettePlayer, HttpInteraction, Interaction, RequestSnapshot,
     ResponseSnapshot, SseFrame, canonical_snapshot, list_cassettes, recordings_root,
+    recordings_root_or_skip,
 };
 pub use crate::cli_normalize::{
     CLI_RULE_NAMES, canonicalize_json, mask_program_name, normalize_cli_stream, strip_error_prefix,

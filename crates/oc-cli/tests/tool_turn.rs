@@ -928,6 +928,14 @@ async fn assert_sdk_model_provider_endpoint(
     expected_body_key: &str,
     cassette: &str,
 ) {
+    if oc_testkit::recordings_root_or_skip(
+        "tool_turn::assert_sdk_model_provider_endpoint",
+        "the SDK model provider endpoint was NOT replayed",
+    )
+    .is_none()
+    {
+        return;
+    }
     let env = ScriptedEnv::new().expect("isolated environment");
     let plugin = env.project().join("sdk-model-provider.mjs");
     std::fs::write(&plugin, SDK_MODEL_PROVIDER_PLUGIN).expect("write SDK model provider plugin");
@@ -1005,6 +1013,14 @@ async fn production_js_sdk_model_advertised_chat_beats_a_responses_heuristic_id(
 async fn production_js_malformed_model_diagnostic_names_the_plugin_model_and_decode_reason() {
     const MESSAGE: &str = "skipped a plugin model this host could not decode";
 
+    if oc_testkit::recordings_root_or_skip(
+        "production_js_malformed_model_diagnostic_names_the_plugin_model_and_decode_reason",
+        "the recorded plugin-model diagnostic path was NOT tested",
+    )
+    .is_none()
+    {
+        return;
+    }
     let env = ScriptedEnv::new().expect("isolated environment");
     let plugin = env.project().join("sdk-model-provider.mjs");
     std::fs::write(&plugin, SDK_MODEL_PROVIDER_PLUGIN).expect("write SDK model provider plugin");
@@ -1079,6 +1095,14 @@ async fn production_js_malformed_model_diagnostic_names_the_plugin_model_and_dec
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_turn_offers_the_assembled_registry_and_continues_after_a_tool_result() {
+    if oc_testkit::recordings_root_or_skip(
+        "tool_turn_offers_the_assembled_registry_and_continues_after_a_tool_result",
+        "the recorded tool loop was NOT tested",
+    )
+    .is_none()
+    {
+        return;
+    }
     let env = ScriptedEnv::new().expect("isolated environment");
     let scenario = Scenario::new("recorded-tool-loop")
         .from_oracle_cassette(TITLE_CASSETTE)
@@ -1261,6 +1285,14 @@ fn has_tool_call_fragment(chunk: &serde_json::Value) -> bool {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_turn_executes_a_real_tool_and_the_side_effect_lands_on_disk() {
+    if oc_testkit::recordings_root_or_skip(
+        "tool_turn_executes_a_real_tool_and_the_side_effect_lands_on_disk",
+        "the recorded tool execution loop was NOT tested",
+    )
+    .is_none()
+    {
+        return;
+    }
     let env = ScriptedEnv::new().expect("isolated environment");
     let target = env.project().join("written-by-the-tool.txt");
     let player = CassettePlayer::from_oracle(CASSETTE).expect("the recorded tool loop loads");
@@ -1325,6 +1357,14 @@ async fn tool_turn_executes_a_real_tool_and_the_side_effect_lands_on_disk() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_real_plugin_tool_reaches_and_executes_through_the_production_registry() {
+    if oc_testkit::recordings_root_or_skip(
+        "a_real_plugin_tool_reaches_and_executes_through_the_production_registry",
+        "the recorded plugin tool loop was NOT tested",
+    )
+    .is_none()
+    {
+        return;
+    }
     let installed = installed_antigravity();
     if !installed.is_dir() {
         eprintln!(
@@ -1401,6 +1441,14 @@ async fn a_real_plugin_tool_reaches_and_executes_through_the_production_registry
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_discovered_plugins_load_from_all_four_directories_through_the_real_binary() {
+    if oc_testkit::recordings_root_or_skip(
+        "auto_discovered_plugins_load_from_all_four_directories_through_the_real_binary",
+        "recorded plugin auto-discovery dispatch was NOT tested",
+    )
+    .is_none()
+    {
+        return;
+    }
     let env = ScriptedEnv::new()
         .expect("isolated environment")
         .with_db(DbChoice::TempFile);
@@ -1474,6 +1522,14 @@ async fn auto_discovered_plugins_load_from_all_four_directories_through_the_real
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_plugin_tool_is_hidden_by_the_same_permission_layer_as_builtins() {
+    if oc_testkit::recordings_root_or_skip(
+        "a_plugin_tool_is_hidden_by_the_same_permission_layer_as_builtins",
+        "recorded plugin permission filtering was NOT tested",
+    )
+    .is_none()
+    {
+        return;
+    }
     let installed = installed_antigravity();
     if !installed.is_dir() {
         eprintln!(
@@ -1516,6 +1572,14 @@ async fn a_plugin_tool_is_hidden_by_the_same_permission_layer_as_builtins() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_plugin_lifecycle_hooks_run_through_the_real_dispatcher() {
+    if oc_testkit::recordings_root_or_skip(
+        "tool_plugin_lifecycle_hooks_run_through_the_real_dispatcher",
+        "the recorded tool lifecycle loop was NOT tested",
+    )
+    .is_none()
+    {
+        return;
+    }
     let env = ScriptedEnv::new().expect("isolated environment");
     let plugin = env.project().join("lifecycle-tool-plugin.mjs");
     let event_file = env.project().join("lifecycle-tool-plugin.events");
@@ -1592,6 +1656,14 @@ async fn tool_plugin_lifecycle_hooks_run_through_the_real_dispatcher() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shell_env_plugin_hook_reaches_the_real_shell_process() {
+    if oc_testkit::recordings_root_or_skip(
+        "shell_env_plugin_hook_reaches_the_real_shell_process",
+        "the recorded shell lifecycle loop was NOT tested",
+    )
+    .is_none()
+    {
+        return;
+    }
     let env = ScriptedEnv::new().expect("isolated environment");
     let plugin = env.project().join("lifecycle-shell-plugin.mjs");
     let event_file = env.project().join("lifecycle-shell-plugin.events");
@@ -1658,6 +1730,14 @@ async fn shell_env_plugin_hook_reaches_the_real_shell_process() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn noop_tool_definition_hook_preserves_real_schemas_and_stays_enabled() {
+    if oc_testkit::recordings_root_or_skip(
+        "noop_tool_definition_hook_preserves_real_schemas_and_stays_enabled",
+        "recorded tool-definition schema parity was NOT tested",
+    )
+    .is_none()
+    {
+        return;
+    }
     let baseline_env = ScriptedEnv::new()
         .expect("isolated environment")
         .with_db(DbChoice::TempFile);
@@ -1737,6 +1817,14 @@ async fn noop_tool_definition_hook_preserves_real_schemas_and_stays_enabled() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plugin_memory_collision_is_deduplicated_on_the_production_assembly_path() {
+    if oc_testkit::recordings_root_or_skip(
+        "plugin_memory_collision_is_deduplicated_on_the_production_assembly_path",
+        "recorded plugin memory-collision assembly was NOT tested",
+    )
+    .is_none()
+    {
+        return;
+    }
     let env = ScriptedEnv::new()
         .expect("isolated plugin environment")
         .with_db(DbChoice::TempFile);
@@ -1785,6 +1873,14 @@ async fn plugin_memory_collision_is_deduplicated_on_the_production_assembly_path
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failing_auth_loader_is_disabled_and_cli_run_completes_with_a_diagnostic() {
+    if oc_testkit::recordings_root_or_skip(
+        "failing_auth_loader_is_disabled_and_cli_run_completes_with_a_diagnostic",
+        "recorded CLI auth-loader recovery was NOT tested",
+    )
+    .is_none()
+    {
+        return;
+    }
     let env = ScriptedEnv::new()
         .expect("isolated environment")
         .with_db(DbChoice::TempFile);
@@ -1821,6 +1917,14 @@ async fn failing_auth_loader_is_disabled_and_cli_run_completes_with_a_diagnostic
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ordinary_plugin_lifecycle_hooks_run_through_the_real_binary() {
+    if oc_testkit::recordings_root_or_skip(
+        "ordinary_plugin_lifecycle_hooks_run_through_the_real_binary",
+        "recorded ordinary plugin lifecycle dispatch was NOT tested",
+    )
+    .is_none()
+    {
+        return;
+    }
     let env = ScriptedEnv::new()
         .expect("isolated environment")
         .with_db(DbChoice::TempFile);

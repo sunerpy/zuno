@@ -6,7 +6,7 @@ use oc_error::ProviderError;
 use oc_llm::sse::{
     DEFAULT_STREAM_IDLE_TIMEOUT_SECS, SseEvent, SseParser, StreamIdleTimeout, Utf8StreamDecoder,
 };
-use oc_testkit::{CassettePlayer, list_cassettes, recordings_root};
+use oc_testkit::{CassettePlayer, list_cassettes};
 
 fn mixed_script_frame() -> (String, String) {
     let unit = "中文流式响应 preserves English, Ελληνικά, العربية, and emoji 🧠🚀。";
@@ -150,7 +150,12 @@ fn sse_default_idle_timeout_allows_ninety_second_reasoning_gaps() {
 
 #[test]
 fn sse_real_provider_recordings_parse_with_the_shared_parser() {
-    let root = recordings_root().expect("oracle recordings root");
+    let Some(root) = oc_testkit::recordings_root_or_skip(
+        "sse_real_provider_recordings_parse_with_the_shared_parser",
+        "the real provider SSE corpus was NOT parsed",
+    ) else {
+        return;
+    };
     let cassette_names = list_cassettes(&root).expect("list real provider recordings");
     let mut sse_responses = 0usize;
     let mut lf_separators = 0usize;
