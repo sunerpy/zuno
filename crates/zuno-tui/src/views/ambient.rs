@@ -1,0 +1,539 @@
+//! Ambient state: token spend, language servers, MCP servers, and skills.
+//!
+//! # These are facts, not actions, so they get a panel rather than a view
+//!
+//! An LSP server's health and an MCP server's connection are things a user checks,
+//! not things a user does. Giving each its own full-screen surface would mean a
+//! keystroke to answer "is my MCP up", and a user who has to ask cannot notice the
+//! answer changed. So they are drawn continuously beside the transcript, and the
+//! only interaction is collapsing a section that has grown long.
+//!
+//! # Nothing here knows where a fact came from
+//!
+//! [`Ambient`] is plain data: strings, counts, and a three-way state. `zuno-tui`
+//! deliberately does not depend on `zuno-lsp`, `zuno-mcp` or `zuno-catalog`, so the
+//! host converts its own types into these and this module cannot reach back into
+//! execution. That is the same discipline the transcript follows with
+//! [`zuno_engine::r#loop::TurnEvent`], and it is why a sidebar can be asserted
+//! off-screen with no servers running.
+//!
+//! # The sidebar is dropped, never squeezed
+//!
+//! Below [`crate::views::SIDEBAR_MIN_WIDTH`] the panel is not drawn at all. A
+//! sidebar narrowed until its server names truncate tells the user less than no
+//! sidebar while costing the reply the columns it needed —
+//! [`crate::views::session::SessionScreen`] makes that call, and
+//! [`SIDEBAR_WIDTH`] is why the threshold is where it is.
+
+use crate::app::{AppEvent, Component, EventResult};
+use crate::views::{ViewContext, fill, padded};
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Widget};
+
+#[cfg(test)]
+#[path = "ambient_tests.rs"]
+mod tests;
+
+/// Columns the sidebar occupies when it is drawn.
+///
+/// Wide enough for `typescript-language-server` plus its state glyph without
+/// truncating, which is the longest name the shipped LSP registry can produce.
+pub const SIDEBAR_WIDTH: u16 = 34;
+
+/// The glyph marking a collapsible section that is open.
+pub const OPEN_GLYPH: &str = "▾";
+
+/// The glyph marking a collapsible section that is closed.
+pub const CLOSED_GLYPH: &str = "▸";
+
+/// How healthy a background service is, reduced to what a colour can carry.
+///
+/// Three states rather than each subsystem's own enum, because the panel's job is to
+/// let a user scan for trouble: an LSP that is `Degraded` and an MCP that
+/// `NeedsAuth` are the same colour of problem, and the specific word goes in the
+/// detail column beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Health {
+    /// Answering.
+    Ready,
+    /// Working on it, or not yet started.
+    Pending,
+    /// Needs attention.
+    Faulted,
+    /// Deliberately switched off, which is not a fault.
+    Disabled,
+}
+
+impl Health {
+    /// The glyph drawn in the row's gutter.
+    #[must_use]
+    pub const fn glyph(self) -> &'static str {
+        match self {
+            Self::Ready => "●",
+            Self::Pending => "◐",
+            Self::Faulted => "✗",
+            Self::Disabled => "○",
+        }
+    }
+}
+
+/// One background service, as the panel shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Service {
+    /// Its name.
+    pub name: String,
+    /// Its health.
+    pub health: Health,
+    /// A short human-readable detail, such as a root path or a failure reason.
+    pub detail: String,
+}
+
+impl Service {
+    /// A service with no detail.
+    #[must_use]
+    pub fn new(name: impl Into<String>, health: Health) -> Self {
+        Self {
+            name: name.into(),
+            health,
+            detail: String::new(),
+        }
+    }
+
+    /// Attach a detail.
+    #[must_use]
+    pub fn detailed(mut self, detail: impl Into<String>) -> Self {
+        self.detail = detail.into();
+        self
+    }
+}
+
+/// One skill, as the panel shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillSummary {
+    /// The skill's name, which is also the command it claims.
+    pub name: String,
+    /// Its one-line description.
+    pub description: String,
+}
+
+/// Every ambient fact the sidebar states.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ambient {
+    /// The working directory, already abbreviated.
+    pub directory: Option<String>,
+    /// The checkout's branch.
+    pub branch: Option<String>,
+    /// The agent answering.
+    pub agent: Option<String>,
+    /// `provider/model`.
+    pub model: Option<String>,
+    /// Token accounting, folded by the transcript and handed over each frame.
+    pub tokens: crate::views::message::TokenUsage,
+    /// How full the context window is, when the model declares one.
+    pub context_used: Option<u64>,
+    /// Language servers.
+    pub lsp: Vec<Service>,
+    /// MCP servers.
+    pub mcp: Vec<Service>,
+    /// Discovered skills.
+    pub skills: Vec<SkillSummary>,
+    /// The build's version.
+    pub version: Option<String>,
+}
+
+/// The fewest columns a detail needs before it says more than the glyph beside it.
+///
+/// Below this the text is dropped rather than elided: a two-character stub of
+/// `configured` is a fragment a reader has to decode, and the health glyph already
+/// carries the state.
+pub const DETAIL_MIN_COLUMNS: usize = 6;
+
+/// Keep the last `width` columns of `text`, marking the cut with an ellipsis.
+///
+/// The tail is kept because that is what identifies a path or a failure message; a cut
+/// at the other end preserves the prefix every sibling shares.
+#[must_use]
+pub fn elide_left(text: &str, width: usize) -> String {
+    let length = text.chars().count();
+    if length <= width {
+        return text.to_owned();
+    }
+    if width <= 1 {
+        return text.chars().take(width).collect();
+    }
+    let tail = text.chars().skip(length - (width - 1)).collect::<String>();
+    format!("…{tail}")
+}
+
+/// Abbreviate a token count for a row that has no space for the grouped form.
+///
+/// The status strip has one row shared with the turn state, so `12.3k` is worth more
+/// there than `12,345`; the sidebar shows the exact figure.
+#[must_use]
+pub fn compact(value: u64) -> String {
+    match value {
+        0..=999 => value.to_string(),
+        1_000..=999_999 => format!("{:.1}k", value as f64 / 1_000.0),
+        _ => format!("{:.1}m", value as f64 / 1_000_000.0),
+    }
+}
+
+/// Which sidebar sections are expanded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Expanded {
+    /// Whether the LSP list is open.
+    pub lsp: bool,
+    /// Whether the MCP list is open.
+    pub mcp: bool,
+    /// Whether the skill list is open.
+    pub skills: bool,
+}
+
+impl Default for Expanded {
+    /// LSP and MCP open, skills closed.
+    ///
+    /// Skills are numerous and static — a shipped install has dozens and they do not
+    /// change while the session runs — so their count is the interesting part and
+    /// their names are not. Servers are few and can break, so their names are.
+    fn default() -> Self {
+        Self {
+            lsp: true,
+            mcp: true,
+            skills: false,
+        }
+    }
+}
+
+/// The ambient panel.
+pub struct SidebarView {
+    context: ViewContext,
+    ambient: Ambient,
+    expanded: Expanded,
+}
+
+impl SidebarView {
+    /// A panel over `context` with nothing resolved yet.
+    #[must_use]
+    pub fn new(context: ViewContext) -> Self {
+        Self {
+            context,
+            ambient: Ambient::default(),
+            expanded: Expanded::default(),
+        }
+    }
+
+    /// The facts, mutably, for the host that resolves them.
+    pub const fn ambient_mut(&mut self) -> &mut Ambient {
+        &mut self.ambient
+    }
+
+    /// The facts.
+    #[must_use]
+    pub const fn ambient(&self) -> &Ambient {
+        &self.ambient
+    }
+
+    /// Which sections are open.
+    #[must_use]
+    pub const fn expanded(&self) -> Expanded {
+        self.expanded
+    }
+
+    /// Open or close the LSP section.
+    pub const fn toggle_lsp(&mut self) {
+        self.expanded.lsp = !self.expanded.lsp;
+    }
+
+    /// Open or close the MCP section.
+    pub const fn toggle_mcp(&mut self) {
+        self.expanded.mcp = !self.expanded.mcp;
+    }
+
+    /// Open or close the skill section.
+    pub const fn toggle_skills(&mut self) {
+        self.expanded.skills = !self.expanded.skills;
+    }
+
+    fn health_style(&self, health: Health) -> Style {
+        match health {
+            Health::Ready => self.context.success(),
+            Health::Pending => self.context.warning(),
+            Health::Faulted => self.context.error(),
+            Health::Disabled => self.context.muted(),
+        }
+    }
+
+    fn heading(&self, label: &str, summary: &str, open: Option<bool>, width: u16) -> Line<'static> {
+        let glyph = match open {
+            Some(true) => OPEN_GLYPH,
+            Some(false) => CLOSED_GLYPH,
+            None => " ",
+        };
+        let head = format!("{glyph} {label}");
+        let columns = usize::from(width);
+        let used = head.chars().count() + summary.chars().count();
+        let gap = columns.saturating_sub(used).max(1);
+        Line::from(vec![
+            Span::styled(head, self.context.title()),
+            Span::styled(" ".repeat(gap), self.context.surface()),
+            Span::styled(summary.to_owned(), self.context.muted()),
+        ])
+    }
+
+    fn service_row(&self, service: &Service, width: u16) -> Line<'static> {
+        let columns = usize::from(width);
+        let head = format!("  {} {}", service.health.glyph(), service.name);
+        let head_len = head.chars().count();
+        let mut spans = vec![Span::styled(head, self.health_style(service.health))];
+        // The detail is dropped, never abbreviated to a stub. A long server name leaves
+        // two or three columns, and `…d` is not a shorter way of saying `configured` —
+        // it is a fragment a reader has to decode, while the health glyph already
+        // carries the state the detail was repeating.
+        let room = columns.saturating_sub(head_len + 1);
+        if !service.detail.is_empty() && room >= DETAIL_MIN_COLUMNS {
+            let detail = elide_left(&service.detail, room);
+            let pad = columns.saturating_sub(head_len + detail.chars().count());
+            spans.push(Span::styled(" ".repeat(pad), self.context.surface()));
+            spans.push(Span::styled(detail, self.context.muted()));
+        }
+        Line::from(spans)
+    }
+
+    fn summarise(services: &[Service]) -> String {
+        if services.is_empty() {
+            return String::from("none");
+        }
+        let faulted = services
+            .iter()
+            .filter(|service| service.health == Health::Faulted)
+            .count();
+        let ready = services
+            .iter()
+            .filter(|service| service.health == Health::Ready)
+            .count();
+        if faulted > 0 {
+            return format!("{ready} up, {faulted} failed");
+        }
+        format!("{ready}/{}", services.len())
+    }
+
+    /// The rows this panel draws at `width`.
+    ///
+    /// Public for the same reason the transcript's is: a row list is the readable
+    /// surface to assert against, and the buffer test then proves the rows land.
+    #[must_use]
+    pub fn lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        let blank = || padded("", width, self.context.surface());
+
+        let tokens = &self.ambient.tokens;
+        lines.push(self.heading("Context", "", None, width));
+        if tokens.is_empty() {
+            lines.push(padded(
+                "  no usage reported yet",
+                width,
+                self.context.muted(),
+            ));
+        } else {
+            lines.push(padded(
+                &format!(
+                    "  {} tokens",
+                    crate::views::message::thousands(tokens.total())
+                ),
+                width,
+                self.context.text(),
+            ));
+            lines.push(padded(
+                &format!(
+                    "  {} in · {} out",
+                    compact(tokens.input),
+                    compact(tokens.output)
+                ),
+                width,
+                self.context.muted(),
+            ));
+            if tokens.cache_read > 0 || tokens.cache_write > 0 {
+                lines.push(padded(
+                    &format!(
+                        "  {} cached · {} written",
+                        compact(tokens.cache_read),
+                        compact(tokens.cache_write)
+                    ),
+                    width,
+                    self.context.muted(),
+                ));
+            }
+            if let Some(percent) = self.ambient.context_used {
+                lines.push(padded(
+                    &format!("  {percent}% of the window"),
+                    width,
+                    if percent >= 80 {
+                        self.context.warning()
+                    } else {
+                        self.context.muted()
+                    },
+                ));
+            }
+        }
+
+        lines.push(blank());
+        lines.push(self.heading(
+            "LSP",
+            &Self::summarise(&self.ambient.lsp),
+            Some(self.expanded.lsp),
+            width,
+        ));
+        if self.expanded.lsp {
+            if self.ambient.lsp.is_empty() {
+                lines.push(padded(
+                    "  starts as files are read",
+                    width,
+                    self.context.muted(),
+                ));
+            } else {
+                for service in &self.ambient.lsp {
+                    lines.push(self.service_row(service, width));
+                }
+            }
+        }
+
+        lines.push(blank());
+        lines.push(self.heading(
+            "MCP",
+            &Self::summarise(&self.ambient.mcp),
+            Some(self.expanded.mcp),
+            width,
+        ));
+        if self.expanded.mcp {
+            if self.ambient.mcp.is_empty() {
+                lines.push(padded("  none configured", width, self.context.muted()));
+            } else {
+                for service in &self.ambient.mcp {
+                    lines.push(self.service_row(service, width));
+                }
+            }
+        }
+
+        lines.push(blank());
+        lines.push(self.heading(
+            "Skills",
+            &format!("{}", self.ambient.skills.len()),
+            Some(self.expanded.skills),
+            width,
+        ));
+        if self.expanded.skills {
+            if self.ambient.skills.is_empty() {
+                lines.push(padded("  none discovered", width, self.context.muted()));
+            } else {
+                for skill in &self.ambient.skills {
+                    lines.push(padded(
+                        &format!("  · {}", skill.name),
+                        width,
+                        self.context.text(),
+                    ));
+                }
+            }
+        }
+
+        lines
+    }
+
+    /// The rows drawn at the very bottom of the panel, whatever the content above.
+    ///
+    /// Location and version are pinned there rather than at the top because they are
+    /// the two facts a user reads once and then stops looking at, and the top of the
+    /// panel is where the numbers that change belong.
+    #[must_use]
+    pub fn footer_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        if let Some(directory) = &self.ambient.directory {
+            // The tail of a path is what identifies it, so an over-long one is cut at
+            // the front and marked. A path cut at the end keeps the part every sibling
+            // directory shares and discards the part that tells them apart.
+            lines.push(padded(
+                &elide_left(directory, usize::from(width)),
+                width,
+                self.context.muted(),
+            ));
+            if let Some(branch) = &self.ambient.branch {
+                lines.push(padded(&format!("⑂ {branch}"), width, self.context.muted()));
+            }
+        }
+        if let Some(version) = &self.ambient.version {
+            lines.push(padded(
+                &format!("● zuno {version}"),
+                width,
+                self.context.success(),
+            ));
+        }
+        lines
+    }
+}
+
+impl Component for SidebarView {
+    fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        fill(frame.buffer_mut(), area, self.context.surface());
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        // The left rule is the same split border the dialog host draws, so a panel and
+        // a prompt read as the same family of surface.
+        for y in area.top()..area.bottom() {
+            let cell = &mut frame.buffer_mut()[(area.left(), y)];
+            cell.set_style(
+                Style::new()
+                    .fg(self.context.palette.border_subtle.into())
+                    .bg(self.context.palette.background_panel.into()),
+            );
+            cell.set_symbol(ratatui::symbols::line::VERTICAL);
+        }
+        let inner = Rect {
+            x: area.left() + 2,
+            y: area.top(),
+            width: area.width.saturating_sub(3),
+            height: area.height,
+        };
+        if inner.width == 0 {
+            return;
+        }
+
+        let footer = self.footer_lines(inner.width);
+        let body_rows = usize::from(inner.height).saturating_sub(footer.len());
+        let body = self
+            .lines(inner.width)
+            .into_iter()
+            .take(body_rows)
+            .collect::<Vec<_>>();
+        Paragraph::new(body)
+            .style(self.context.surface())
+            .render(inner, frame.buffer_mut());
+
+        if footer.is_empty() {
+            return;
+        }
+        let Ok(height) = u16::try_from(footer.len()) else {
+            return;
+        };
+        if height > inner.height {
+            return;
+        }
+        let region = Rect {
+            y: inner.bottom() - height,
+            height,
+            ..inner
+        };
+        Paragraph::new(footer)
+            .style(self.context.surface())
+            .render(region, frame.buffer_mut());
+    }
+
+    fn handle_event(&mut self, _event: &AppEvent) -> EventResult {
+        // Token usage reaches the panel through its owner, which already folds the
+        // provider stream for the transcript; folding it twice would be two copies of
+        // the same running total drifting apart.
+        EventResult::IGNORED
+    }
+}
