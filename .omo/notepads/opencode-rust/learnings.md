@@ -8089,3 +8089,122 @@ keymap.leader())` 展开，直接 `Chord::parse("<leader>m")` 会把 token 当�
 ### 可复用的判据
 凡是"UI 宣传了某个键"的改动，必须问三个问题：动作有处理分支吗？它的 scope 在链里吗？
 按真实和弦走 dispatcher 会被消费吗？只答前一个就提交，是本仓库第十二次同形缺陷。
+
+## keys 是三个独立必要条件，不是两个（task r18）
+
+上一轮记的是「路由与 scope 是两个独立必要条件」。实际做完六个 `keys: "none"` 动作
+之后，条件是**三个**，缺任何一个都得到一个「按下去没反应」的键：
+
+1. **有键**（`Keymap` 能把和弦解析成这个 action）；
+2. **scope 在链条里**（`views::session::scopes()` 列出了该 action 的 scope）；
+3. **有路由**（`handle_action` / `handle_view_action` 有一条 arm 真的做事）。
+
+六个动作在这三项上的分布是**不均匀**的，这就是为什么必须逐个查而不能整批处理：
+`mcp_list` / `help_show` / `display_thinking` / `tool_details` 早就有路由、scope 也在，
+只缺键；`prompt_skills` 缺键和路由；`diff_open` 三项全缺——连整个 `diff` scope 都不在
+`scopes()` 里。
+
+### 加键有两个不显而易见的落点陷阱
+
+**不能改 `DEFINITIONS`。** `keybind_tests::table_matches_the_upstream_fixture_row_for_row`
+逐行断言 `found.keys == row.keys`，对着
+`tests/fixtures/upstream-keybinds-1.18.13.tsv`。给一个 `"none"` 行填键，等于让这份表
+宣称上游发布了它并不存在的键，兼容性守卫会（正确地）失败。正确做法是新增
+`SHIPPED_DEFAULTS`，走与用户自定义绑定同一条覆盖路径。
+
+**不能放在 `TuiConfig::resolve`。** 那里已经有 `terminal_suspend` 重写的先例，看起来
+就是「放默认值的地方」。但宿主 `cmd/tui.rs:81` 用的是 `ResolvedTuiConfig::default()`，
+**从不调用 `resolve`**。默认值放那里 = 表里声明了、运行的二进制没有 = 正是要消灭的
+那种死键。唯一安全的漏斗是 `Keymap::from_config`，所有 keymap 都必经它。
+判断方法：`grep -rn "ResolvedTuiConfig::default\|ResolveOptions" crates/*/src`，
+看宿主走哪条。
+
+### 选键位时被 shift 咬过一次
+
+`?` 看起来是 help 的自然键（`diff_help` 就用它）。但 `?` 要按 shift，事件到达时带
+`SHIFT` 修饰符，而拼写 `?` 声明的是无修饰符，两者**永不匹配**。功能键或 leader
+序列没有这个问题。裸字母也不能用——见下条。
+
+## 暴露一个 scope 会把它全部的裸字母一起放出来（task r18）
+
+给 `scopes()` 加 `"diff"` 只是为了 `diff_open` 一个动作，但 `diff` scope 还带着查看器
+自己的裸键：`q n p d v s b [ ]`。加进链条后，这些字母在**会话屏上**也会解析成 diff
+动作，无论查看器是否打开。
+
+输入框仍然能打字，只因为两件事**同时**成立：
+- 本屏对除 `diff_open` 以外的所有 diff 动作返回 `EventResult::IGNORED`；
+- `KeyDispatcher::handle_event` 在 `!result.handled` 时把事件继续交给 `inner`，
+  编辑器于是把字符插进去。
+
+**给本屏加一个 `"n"` 或 `"p"` 的 arm，这个字母立刻打不出来了。** 已加
+`exposing_the_diff_scope_did_not_stop_its_bare_letters_being_typed` 守这条。
+
+## 「未解析的和弦也会报告 handled」让可达性断言不会失败（task r18）
+
+第一版可达性测试是：过 `KeyDispatcher::handle_event`，断言 `result.handled`。
+实测变异（把 `"diff"` 从 `scopes()` 删掉）**照样通过**——因为和弦没解析成 action 时会
+落到编辑器，编辑器把字符插进去并报告 `handled`。这个断言在 scope 列表为空时也成立，
+即又一个「不会失败的断言」。
+
+改成两半，各自钉一个必要条件：
+- **scope 那半**：直接调 `Keymap::resolve(&chain, chord, now)`，断言拿到
+  `Resolution::Action{definition}` 且 `definition.name` 就是它自己。这是
+  `KeyDispatcher` 内部调的同一个函数，绕开了编辑器兜底。
+- **路由那半**：调 `handle_action`，断言 `handled`。只有在上一半已经证明键能到达
+  这一层之后，这一半才是有意义的。
+
+实测两个变异各让对应的一半失败：
+
+| 变异 | scope 半 | 路由半 | 端到端 |
+|---|---|---|---|
+| 删 `scopes()` 里的 `"diff"` | **FAIL** | pass | **FAIL** |
+| 删 `diff_open` 的 arm | pass | **FAIL** | **FAIL** |
+
+**教训**：断言「事件被消费」在有兜底链的系统里几乎没有鉴别力。要断言的是
+**解析结果本身**。
+
+## token usage 缺口是两个必要条件，两次修复各只做了一半（task r18）
+
+notepad 里此前记的是「兼容层网关不回 usage（provider 侧，未修）」，而 task-r17s 的
+`38a94cf` 说根因是「MessageEnd 之后的帧被丢掉」。**两个说法都只对一半。**
+
+curl 直连该网关（`openai-us.onethinker.top/api/v1`，同一个 claude-haiku-4-5）实测：
+
+- 不带 `stream_options`：内容帧 → 带 `finish_reason` 的帧 → `[DONE]`，
+  **没有任何 usage 帧**。
+- 带 `stream_options.include_usage=true`：`finish_reason` 之后多出一帧
+  `choices: [], usage: {prompt_tokens, completion_tokens, total_tokens}`，再之后
+  才是 `[DONE]`。
+
+所以：只加 `include_usage` → 引擎在 `MessageEnd` 处 return，多出来的帧被丢掉 →
+看起来「网关不回 usage」（第一次的结论）。只修引擎尾部读取 → 根本没有帧可读 →
+仍然全零（第二次的结论）。**两半都必要。**
+
+判断这类问题的最短路径是**打线**，不是从 UI 往回猜，也不是信任任一方的提交信息：
+一条 curl 就把「provider 不发」和「client 不收」区分开了。
+
+实测结果（真实回合）：状态条 `↑33,382 ↓481 ⚡25,604`，侧栏
+`59,467 tokens / 33.4k in · 481 out / 25.6k cached`，数据库里 assistant 记录从
+每条 `input:0 output:0` 变成 `{"cache":{"read":6401},"input":7006,"output":23}`。
+
+## `ToolDispatchCompleted` 单独到达会被静默丢弃（task r18，未修，已登记）
+
+`Transcript::observe` 对 `ToolDispatchStarted` 会在找不到对应 part 时 `append` 一个
+（注释写明「a dispatch with no ToolUseStart seen — materialise it rather than
+dropping」），但 `ToolDispatchCompleted` 只走 `update_tool`，找不到就返回 `false`
+**什么都不做**。
+
+后果：重连后只收到 completion 的那一路，工具输出连同它可能携带的补丁一起消失。
+写测试 fixture 时也会踩到——只发 completion 的 transcript 是空的，`latest_diff()`
+返回 `None`，于是 `diff_open` 报「nothing to choose from」，看起来像 diff 功能坏了。
+
+本次没改渲染行为（超出范围），fixture 改为按真实顺序先发 Started 再发 Completed。
+
+## `0 lsp` 是对的，但要能证明非零（task r18）
+
+欢迎页的 `0 lsp` 不是缺陷：`ResolvedLsp::resolve(config.lsp.as_ref())` 在配置里没有
+`lsp` 段时返回空列表，而本机 cwd 确实没配。造一个带 `lsp.rust.command=["rust-analyzer"]`
+的项目后，欢迎页变 `1 lsp`、侧栏出现 `▾ LSP 0/1 · ◐ rust`，真实 rust-analyzer 的诊断
+进入 transcript：`⌁ src/lib.rs: 1 error, 2 others (rust)` 并带 1-based 位置。
+
+**「计数为 0」和「计数坏了」必须用配置一个真实服务器来区分**，光看 UI 分不出来。

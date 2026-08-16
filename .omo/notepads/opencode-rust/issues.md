@@ -9197,3 +9197,59 @@ worktree 建在 `3b46b5f` 上。`cargo test --workspace` 实测
 - TUI 侧的折叠、累加、百分比都有测试（`views_transcript_folds_provider_token_usage_for_the_ambient_panel`
   等），逻辑正确；空白是数据没来，不是渲染没接。UI 显示"no usage reported yet"而不是 0，
   正是为了区分"未测量"和"测得为零"。
+
+## 43 个 `keys: "none"` 的处置结论（task r18）
+
+六个已绑（见 learnings.md）。**其余 37 个全部维持未绑定**，理由不是「niche」，而是
+一个可验证的事实：**它们一个都没有路由。**
+
+核对方法：`grep -q "\"<action>\"" crates/zuno-tui/src/views/session.rs` 对 37 个逐个
+执行，全部无命中；`views/` 下也不存在 console / debug / plugin / docs / variant /
+workspace 任何一个视图。给它们加键 = 造 37 个死键 = 正是本轮在消灭的缺陷，所以
+「43 个全绑上」是错的方向。
+
+按缺什么分组：
+
+**A. 界面在这个移植里不存在（28 个）** — 加键必然是死键：
+`app_console` `console_org_switch`（无 console 面板）、`app_debug` `debug_view`
+（无 debug 面板）、`app_heap_snapshot`（无 heap profiler）、`docs_open`（无文档浏览）、
+`plugin_install` `plugin_manager`（无插件 UI）、`provider_connect`（无 provider 接入
+流程）、`variant_list`（无 variant 面）、`workspace_set`（无工作区切换）、
+`session_copy` `session_fork` `session_move` `session_share` `session_unshare`
+（`session_share` 只有一张 DB 表，没有任何 share 实现）、
+`prompt_stash` `prompt_stash_list` `prompt_stash_pop`（editor 里的 `stashed` 是历史
+导航用的暂存，与 prompt stash 是两回事）、`prompt_editor_context_clear`、
+`app_toggle_animations` `app_toggle_diffwrap` `app_toggle_file_context`
+`app_toggle_paste_summary` `app_toggle_session_directory_filter`
+`session_toggle_generic_tool_output` `session_toggle_timestamps`
+`terminal_title_toggle`（这些开关背后没有对应的渲染模式或配置项）、
+`scrollbar_toggle`、`model_cycle_favorite` `model_cycle_favorite_reverse`
+（没有 favorites 存储）。
+
+**B. 已被一个能用的键覆盖（4 个）**：
+`prompt_submit`（`return` 已经由 `input_submit` 提交）、
+`theme_switch_mode` `theme_mode_lock`（`<leader>t` 的主题选择器已覆盖选主题；
+`theme::Mode` 有 Dark/Light 但没有切换入口）。
+
+**C. 需要按消息定位、而 transcript 只按行滚动（3 个）**：
+`messages_next` `messages_previous` `messages_last_user`。要实现得先有「消息锚点」
+概念；现在 `messages_first/last` 和逐行/翻页都已绑定，滚动本身不缺键。
+
+**这 37 个正确的下一步是先实现界面，再在同一个提交里加键**，而不是先加键。
+`f1` 的 Keybindings 视图会把它们显示成 `(unbound)`，所以「存在但没绑」对用户是
+可见的，不是隐藏状态。
+
+## 该网关不发 reasoning content，可折叠思考无法由 provider 驱动演示（task r18）
+
+curl 直连实测：`global.anthropic.claude-sonnet-4-6` 带 `reasoning_effort: medium`，
+整条流里 `reasoning_content` / `reasoning` / `thinking` 三个 key **一个都没出现**；
+`myopenai/gpt-5.4`（配置里带 reasoningEffort）在 TUI 里也只给散文，不产生
+Reasoning part。
+
+所以本机无法用真实回合截出思考块。折叠本身是好的，用 offscreen 渲染实测：
+collapsed 为 `▸ Thinking… · 3 lines` 且只显示第一行，`display_thinking` 之后变
+`▾ Thinking…` 且三行全出。`views_thinking_affordance_toggles_between_summary_and_full_text`
+已经守着这条。
+
+**登记而非修复**：要真实驱动它，需要一个会回 reasoning 的 provider（bedrock 直连
+或 anthropic 原生 surface），本机对 nova/claude 的 bedrock 权限仍是 404。
