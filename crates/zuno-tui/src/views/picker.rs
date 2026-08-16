@@ -43,6 +43,8 @@ pub const AGENT_DIALOG_ID: &str = "agent_list";
 pub const THEME_DIALOG_ID: &str = "theme_list";
 /// The dialog id for the MCP server list.
 pub const MCP_DIALOG_ID: &str = "mcp_list";
+/// The dialog id for the skill list.
+pub const SKILL_DIALOG_ID: &str = "prompt_skills";
 
 /// The MCP servers, as a filterable list.
 ///
@@ -441,6 +443,24 @@ pub fn agent_picker(context: ViewContext, agents: Vec<AgentEntry>) -> SelectDial
         .map(|agent| Item::new(agent.name).described(agent.description))
         .collect();
     SelectDialog::new(AGENT_DIALOG_ID, "Agents", context, items)
+}
+
+/// The discovered skills, as a filterable list.
+///
+/// A list rather than a launcher: a skill is invoked by naming it in a prompt, so what
+/// this surface is for is finding out what the name is. Choosing a row therefore reports
+/// the name for the transcript to state, and does not start anything — a picker that
+/// silently did nothing on enter would read as broken.
+#[must_use]
+pub fn skill_list(
+    context: ViewContext,
+    skills: Vec<crate::views::ambient::SkillSummary>,
+) -> SelectDialog {
+    let items = skills
+        .into_iter()
+        .map(|skill| Item::new(skill.name).described(skill.description))
+        .collect();
+    SelectDialog::new(SKILL_DIALOG_ID, "Skills", context, items)
 }
 
 /// The theme picker, previewing each theme's resolved palette.

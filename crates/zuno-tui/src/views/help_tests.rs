@@ -84,12 +84,23 @@ fn views_help_reports_the_keys_the_keymap_actually_resolved() {
 
 #[test]
 fn views_help_shows_an_action_the_shipped_table_leaves_unbound() {
-    // `help_show` ships with the spelling `none`. A user has to be able to see that
-    // it exists and needs binding.
+    // `session_share` ships with the spelling `none` and this build does not bind it, so
+    // a user has to be able to see that it exists and needs binding. The action is looked
+    // up rather than hard-coded to `help_show`, which this build *does* bind now: an
+    // action from `SHIPPED_DEFAULTS` would assert the opposite of what this guards.
+    let unbound_action = crate::keybind::DEFINITIONS
+        .iter()
+        .find(|definition| {
+            definition.keys == crate::keybind::NO_KEY
+                && !crate::keybind::SHIPPED_DEFAULTS
+                    .iter()
+                    .any(|(name, _)| *name == definition.name)
+        })
+        .expect("some action is still unbound, or this test has nothing to guard");
     let entry = entries(&keymap())
         .values()
         .flatten()
-        .find(|entry| entry.action == "help_show")
+        .find(|entry| entry.action == unbound_action.name)
         .cloned()
         .expect("listed even though it is unbound");
     assert_eq!(entry.keys, UNBOUND);

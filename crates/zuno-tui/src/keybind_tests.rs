@@ -182,12 +182,42 @@ fn every_binding_resolves_to_its_documented_action() {
                 row.name
             );
             let keymap = keymap_with(&[]);
-            assert!(
-                keymap.sequences(&row.name).is_empty(),
-                "`{}` is `none` upstream and must be unbound",
-                row.name
-            );
-            unbound += 1;
+            // An action upstream ships with no key must stay unbound here *unless* this
+            // build gives it one. Upstream reaches these through its command palette, so
+            // `none` costs it nothing; here it means the surface behind the action cannot
+            // be opened at all. `SHIPPED_DEFAULTS` is that list, and every row of it is
+            // asserted to resolve — in the shipped scope, to the action that asked for it
+            // — rather than merely being non-empty.
+            match crate::keybind::SHIPPED_DEFAULTS
+                .iter()
+                .find(|(name, _)| *name == row.name)
+            {
+                None => {
+                    assert!(
+                        keymap.sequences(&row.name).is_empty(),
+                        "`{}` is `none` upstream, is not in SHIPPED_DEFAULTS, and must \
+                         therefore be unbound",
+                        row.name
+                    );
+                    unbound += 1;
+                }
+                Some((_, shipped)) => {
+                    let sequence = parse_sequence(shipped, leader)
+                        .expect("every shipped default spelling must parse");
+                    let mut keymap = keymap_with(&[]);
+                    assert!(
+                        matches!(
+                            replay(&mut keymap, entry.scope, &sequence, start),
+                            Resolution::Action { definition, .. } if definition.name == row.name
+                        ),
+                        "`{}` is bound to `{shipped}` by SHIPPED_DEFAULTS but does not \
+                         resolve to itself in scope `{}`",
+                        row.name,
+                        entry.scope
+                    );
+                    sequences_checked += 1;
+                }
+            }
             asserted += 1;
             continue;
         }
@@ -225,9 +255,18 @@ fn every_binding_resolves_to_its_documented_action() {
         asserted, EXPECTED_ROWS,
         "only {asserted} of {EXPECTED_ROWS} bindings were asserted"
     );
+    // Upstream ships 43 `none` rows. The ones this build binds are still counted as
+    // upstream-unbound — the parity claim is about upstream's table, not this keymap — so
+    // the two numbers are asserted separately: the total must stay 43, and the remainder
+    // must be exactly the rows `SHIPPED_DEFAULTS` does not claim. Asserting only the
+    // remainder would let a silent shrinkage of the upstream table pass.
+    const UPSTREAM_UNBOUND: usize = 43;
     assert_eq!(
-        unbound, 43,
-        "upstream ships 43 `none` bindings; found {unbound}"
+        unbound + crate::keybind::SHIPPED_DEFAULTS.len(),
+        UPSTREAM_UNBOUND,
+        "upstream ships {UPSTREAM_UNBOUND} `none` bindings; found {unbound} still unbound \
+         plus {} bound by this build",
+        crate::keybind::SHIPPED_DEFAULTS.len()
     );
     assert!(
         sequences_checked >= 170,

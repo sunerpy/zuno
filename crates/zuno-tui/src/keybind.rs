@@ -95,6 +95,67 @@ impl Definition {
     }
 }
 
+/// The keys this build gives to actions upstream ships with no key at all.
+///
+/// # Why these are not spelled in [`DEFINITIONS`]
+///
+/// [`DEFINITIONS`] is the compatibility surface and is asserted row-for-row against
+/// `tests/fixtures/upstream-keybinds-1.18.13.tsv`, `keys` column included. Editing a
+/// `"none"` row there to give it a chord would make this build claim upstream ships a
+/// key it does not, and the parity guard would fail — correctly. So a binding this
+/// build chooses is applied the same way a user's own binding is: as an override, in
+/// [`crate::config::TuiConfig::resolve`], with the user's entry winning.
+///
+/// # Why bind them at all
+///
+/// Upstream reaches these through its command palette, so `"none"` costs it nothing.
+/// Here an action with no key and no palette entry is unreachable, which means the
+/// surface behind it is unreachable — the failure this project has removed repeatedly:
+/// machinery built, tested, documented, and impossible to open. Each row below is an
+/// action whose surface exists and works, and whose only missing piece was a key.
+///
+/// Every spelling is leader-prefixed or a function key. Neither can shadow text typed
+/// into the prompt, which a bare letter would: an unmatched chord falls through to the
+/// editor, but a *matched* one does not, so a bare `d` here would stop `d` reaching the
+/// prompt. See [`crate::views::session::scopes`] for the other half of that hazard.
+pub const SHIPPED_DEFAULTS: &[(&str, &str)] = &[
+    // `f1` rather than `?`: `?` is typed with shift, so the event arrives carrying
+    // `SHIFT` while the spelling `?` declares no modifier, and the two never match.
+    // `f1` needs no modifier and is what every terminal user tries first for help.
+    ("help_show", "f1"),
+    // `d` for diff. Its scope carries the diff viewer's own bare keys, which is why it
+    // has to be a leader sequence — see `views::session::scopes`.
+    ("diff_open", "<leader>d"),
+    // `i` for the model's inner reasoning. `t` would read better but belongs to
+    // `theme_list`.
+    ("display_thinking", "<leader>i"),
+    // `o` for a tool's output, which is what the toggle actually hides and shows.
+    ("tool_details", "<leader>o"),
+    // `k` for skills: `s` is `status_view` and `x` is `session_export`.
+    ("prompt_skills", "<leader>k"),
+    // `p` for the protocol servers. `m` is `model_list` and `c` is `session_compact`.
+    ("mcp_list", "<leader>p"),
+];
+
+/// The spelling this build resolves `definition` to before user config is consulted.
+///
+/// Applied here, in the one funnel every keymap is built through, rather than in
+/// [`crate::config::TuiConfig::resolve`]: the host builds its config with
+/// `ResolvedTuiConfig::default()` and never calls `resolve`, so a default applied there
+/// would be a key the table claimed and the running binary did not have.
+fn shipped_spelling(definition: &Definition) -> &'static str {
+    if definition.keys != NO_KEY {
+        return definition.keys;
+    }
+    SHIPPED_DEFAULTS
+        .iter()
+        .find(|(action, _)| *action == definition.name)
+        .map_or(definition.keys, |(_, spelling)| *spelling)
+}
+
+/// The sentinel [`DEFINITIONS`] uses for an action upstream ships with no key.
+pub const NO_KEY: &str = "none";
+
 /// The default spelling recorded for `name`, if the table has that action.
 #[must_use]
 pub fn default_spelling(name: &str) -> Option<&'static str> {
@@ -670,7 +731,7 @@ impl Keymap {
             let value = overrides
                 .get(definition.name)
                 .cloned()
-                .unwrap_or_else(|| BindingValue::parse(definition.keys));
+                .unwrap_or_else(|| BindingValue::parse(shipped_spelling(definition)));
             let prevent_default = match &value {
                 BindingValue::Keys(items) => items
                     .iter()

@@ -964,3 +964,254 @@ fn session_diagnostics_survive_the_end_of_the_turn_that_produced_them() {
         "the verdict was cleared when the turn ended: [{strip}]"
     );
 }
+
+/// Turn one chord spelling into the key event a terminal would send.
+///
+/// Function keys go through `Chord::parse`'s own spelling so `f1` cannot silently be
+/// read as the character `f`, which is the shape of mistake that makes a binding test
+/// pass while the key does nothing.
+fn key_event_for(spelling: &str) -> KeyEvent {
+    let chord = crate::keybind::Chord::parse(spelling).expect("a valid spelling");
+    let tail = spelling.rsplit('+').next().unwrap_or(spelling);
+    let code = match tail {
+        "return" => crossterm::event::KeyCode::Enter,
+        "escape" => crossterm::event::KeyCode::Esc,
+        "space" => crossterm::event::KeyCode::Char(' '),
+        other => match other
+            .strip_prefix('f')
+            .filter(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+            .and_then(|rest| rest.parse::<u8>().ok())
+        {
+            Some(index) => crossterm::event::KeyCode::F(index),
+            None => crossterm::event::KeyCode::Char(
+                other.chars().next().expect("a non-empty chord tail"),
+            ),
+        },
+    };
+    let mut modifiers = crossterm::event::KeyModifiers::NONE;
+    let rendered = chord.to_string();
+    if rendered.contains("ctrl+") {
+        modifiers |= crossterm::event::KeyModifiers::CONTROL;
+    }
+    if rendered.contains("alt+") {
+        modifiers |= crossterm::event::KeyModifiers::ALT;
+    }
+    if rendered.contains("shift+") {
+        modifiers |= crossterm::event::KeyModifiers::SHIFT;
+    }
+    KeyEvent {
+        code,
+        modifiers,
+        kind: crossterm::event::KeyEventKind::Press,
+        state: crossterm::event::KeyEventState::NONE,
+    }
+}
+
+/// Send every chord of `spelling` through `dispatcher`, returning the last result.
+fn dispatch_sequence(
+    dispatcher: &mut KeyDispatcher,
+    spelling: &str,
+    leader: crate::keybind::Chord,
+) -> crate::app::EventResult {
+    let sequence = crate::keybind::parse_sequence(spelling, leader).expect("a valid spelling");
+    let mut last = crate::app::EventResult::IGNORED;
+    for chord in sequence {
+        last = dispatcher.handle_event(&AppEvent::Terminal(TerminalEvent::Input(
+            crossterm::event::Event::Key(key_event_for(&chord.to_string())),
+        )));
+    }
+    last
+}
+
+/// A screen with every catalog and ambient list the six bound surfaces read from.
+fn furnished_screen() -> SessionScreen {
+    let (sender, _receiver) = terminal_event_channel();
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_keymap(Keymap::defaults().expect("the shipped table builds"));
+    *screen.catalog_mut() = catalog();
+    let ambient = screen.sidebar_mut().ambient_mut();
+    ambient.mcp = vec![crate::views::ambient::Service::new(
+        "context7",
+        crate::views::ambient::Health::Ready,
+    )];
+    ambient.skills = vec![crate::views::ambient::SkillSummary {
+        name: String::from("codegraph"),
+        description: String::from("navigate an indexed codebase"),
+    }];
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .push(Message::user("edit something"));
+    // Started before Completed, which is the order a turn produces: the transcript
+    // materialises the part on `ToolDispatchStarted` and only *updates* it on
+    // `ToolDispatchCompleted`, so a fixture that sent the completion alone would be
+    // silently dropped and the diff viewer would have nothing to open.
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .observe(&TurnEvent::ToolDispatchStarted {
+            step: 1,
+            call_id: String::from("call_1"),
+            name: String::from("edit"),
+        });
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .observe(&TurnEvent::ToolDispatchCompleted {
+            step: 1,
+            call_id: String::from("call_1"),
+            name: String::from("edit"),
+            title: String::from("src/lib.rs"),
+            output: String::from(
+                "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n-old line\n+new line\n",
+            ),
+            is_error: false,
+        });
+    screen
+}
+
+#[test]
+fn every_shipped_default_binding_resolves_in_the_screens_own_scope_chain() {
+    // Half one of two: SCOPE. A binding is dead if its scope is missing from `scopes()`,
+    // and this is the half that says so. It asserts through `Keymap::resolve` with the
+    // real chain, because that is the function `KeyDispatcher` calls.
+    //
+    // Deliberately *not* asserted through the dispatcher's `EventResult`: an unresolved
+    // chord falls through to the editor, which inserts the character and reports
+    // `handled`, so a `handled` assertion here would pass with the scope list empty. That
+    // is the shape of un-failable assertion this project keeps finding.
+    let leader = Keymap::defaults()
+        .expect("the shipped table builds")
+        .leader();
+    let owned = scopes();
+    let chain = owned.iter().map(String::as_str).collect::<Vec<_>>();
+
+    for (action_name, spelling) in crate::keybind::SHIPPED_DEFAULTS {
+        let mut keymap = Keymap::defaults().expect("the shipped table builds");
+        let sequence = crate::keybind::parse_sequence(spelling, leader).expect("a valid spelling");
+        let now = std::time::Instant::now();
+        let mut resolution = crate::keybind::Resolution::Unmatched;
+        for chord in sequence {
+            resolution = keymap.resolve(&chain, chord, now);
+        }
+        match resolution {
+            crate::keybind::Resolution::Action { definition, .. } => assert_eq!(
+                definition.name, *action_name,
+                "`{spelling}` resolved to `{}` instead of `{action_name}`",
+                definition.name
+            ),
+            other => panic!(
+                "`{action_name}` is bound to `{spelling}` but the screen's scope chain does \
+                 not resolve it ({other:?}); its scope is missing from `scopes()`"
+            ),
+        }
+    }
+}
+
+#[test]
+fn every_shipped_default_binding_is_routed_by_the_screen() {
+    // Half two of two: ROUTING. A binding is equally dead if the scope is listed and
+    // nothing acts on the action, so each one is asserted to be *consumed* by the screen.
+    // `handle_action` is the right layer for this half only because the previous test
+    // already proved the key reaches it.
+    for (action_name, _) in crate::keybind::SHIPPED_DEFAULTS {
+        let mut screen = furnished_screen();
+        let result = screen.handle_action(action(action_name), &press_none());
+        assert!(
+            result.handled,
+            "`{action_name}` resolves from a real chord but no arm in \
+             `SessionScreen::handle_view_action` acts on it"
+        );
+    }
+}
+
+#[test]
+fn every_shipped_default_binding_puts_something_on_the_screen() {
+    // `handled` alone would be satisfied by an arm that consumed the key and did nothing,
+    // so each surface is also asserted to render its own text. The four that open a modal
+    // are proven by the dialog's title; the two toggles are proven by the transcript
+    // still rendering, since a toggle has no title of its own.
+    let leader = Keymap::defaults()
+        .expect("the shipped table builds")
+        .leader();
+    let expected = [
+        ("help_show", "Keybindings"),
+        ("diff_open", "Diff"),
+        ("prompt_skills", "Skills"),
+        ("mcp_list", "MCP servers"),
+    ];
+
+    for (action_name, needle) in expected {
+        let spelling = crate::keybind::SHIPPED_DEFAULTS
+            .iter()
+            .find(|(name, _)| *name == action_name)
+            .map(|(_, spelling)| *spelling)
+            .expect("the action has a shipped default");
+        let keymap = Keymap::defaults().expect("the shipped table builds");
+        let screen = furnished_screen();
+        let host = crate::views::dialog::DialogHost::new(ViewContext::defaults(), Box::new(screen));
+        let mut dispatcher = KeyDispatcher::new(keymap, scopes(), Box::new(host));
+
+        dispatch_sequence(&mut dispatcher, spelling, leader);
+        let joined =
+            rows(&render_offscreen(&mut dispatcher, 100, 24).expect("infallible")).join("\n");
+        assert!(
+            joined.contains(needle),
+            "`{action_name}` on `{spelling}` did not put `{needle}` on the screen:\n{joined}"
+        );
+    }
+}
+
+#[test]
+fn the_two_display_toggles_change_what_the_transcript_renders() {
+    // The toggles have no modal to name them, so they are proven by their effect: tool
+    // output visible, then hidden. Without this a toggle bound to a key that resolved and
+    // flipped nothing would satisfy the reachability test above.
+    let leader = Keymap::defaults()
+        .expect("the shipped table builds")
+        .leader();
+    let spelling = crate::keybind::SHIPPED_DEFAULTS
+        .iter()
+        .find(|(name, _)| *name == "tool_details")
+        .map(|(_, spelling)| *spelling)
+        .expect("tool_details has a shipped default");
+    let keymap = Keymap::defaults().expect("the shipped table builds");
+    let mut dispatcher = KeyDispatcher::new(keymap, scopes(), Box::new(furnished_screen()));
+
+    let before = rows(&render_offscreen(&mut dispatcher, 100, 24).expect("infallible")).join("\n");
+    dispatch_sequence(&mut dispatcher, spelling, leader);
+    let after = rows(&render_offscreen(&mut dispatcher, 100, 24).expect("infallible")).join("\n");
+    assert_ne!(
+        before, after,
+        "`tool_details` on `{spelling}` resolved but changed nothing on screen"
+    );
+}
+
+#[test]
+fn exposing_the_diff_scope_did_not_stop_its_bare_letters_being_typed() {
+    // `scopes()` now lists `diff`, whose viewer owns bare `q`, `n`, `p`, `d`, `v`, `s`
+    // and `b`. Those resolve on the session screen whether or not the viewer is open, so
+    // typing survives only because this screen returns `IGNORED` for them and an
+    // unhandled action falls through to the editor. Give the screen an arm for one of
+    // those letters and this test is what says the prompt stopped accepting it.
+    let keymap = Keymap::defaults().expect("the shipped table builds");
+    let (sender, _receiver) = terminal_event_channel();
+    let screen = SessionScreen::new(ViewContext::defaults(), sender);
+    let mut dispatcher = KeyDispatcher::new(keymap, scopes(), Box::new(screen));
+
+    let typed = "qnpdvsb";
+    for character in typed.chars() {
+        dispatcher.handle_event(&AppEvent::Terminal(TerminalEvent::Input(
+            crossterm::event::Event::Key(crate::views::testkit::press(
+                crossterm::event::KeyCode::Char(character),
+            )),
+        )));
+    }
+
+    let joined = rows(&render_offscreen(&mut dispatcher, 100, 12).expect("infallible")).join("\n");
+    assert!(
+        joined.contains(typed),
+        "the diff scope's bare letters stopped reaching the prompt; `{typed}` is not on \
+         screen:\n{joined}"
+    );
+}

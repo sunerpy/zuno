@@ -32,7 +32,9 @@
 //! recoverable, hiding a line of a patch they are about to approve is not.
 
 use crate::app::{AppEvent, Component, EventResult};
+use crate::keybind::Definition;
 use crate::views::{DiffColumns, ViewContext, fill, padded};
+use crossterm::event::KeyEvent;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -204,6 +206,11 @@ impl DiffView {
     /// Scroll to `offset`.
     pub const fn set_offset(&mut self, offset: usize) {
         self.offset = offset;
+    }
+
+    /// Force a layout after construction, for a caller that toggles it.
+    pub const fn set_columns(&mut self, columns: DiffColumns) {
+        self.forced = Some(columns);
     }
 
     fn style(&self, kind: LineKind) -> Style {
@@ -386,6 +393,104 @@ impl Component for DiffView {
 
     fn handle_event(&mut self, _event: &AppEvent) -> EventResult {
         EventResult::IGNORED
+    }
+}
+
+/// How many rows a diff dialog scrolls for a page key.
+///
+/// A fixed step rather than the frame's height: [`crate::views::dialog::Dialog::lines`]
+/// is handed a width but not a height, so the dialog cannot know its own viewport.
+const PAGE_ROWS: isize = 20;
+
+/// The diff viewer as a modal, which is how `diff_open` reaches it.
+///
+/// A wrapper rather than a `Dialog` impl on [`DiffView`] itself, because the view is also
+/// mounted as a plain [`Component`] and the two want different scroll ownership: the
+/// component form offsets inside its own `render`, while a dialog is asked for rows by
+/// its host and must therefore apply the offset before returning them.
+pub struct DiffDialog {
+    view: DiffView,
+    offset: usize,
+    rows: usize,
+}
+
+impl DiffDialog {
+    /// Open `patch` in a modal diff viewer.
+    #[must_use]
+    pub fn new(context: ViewContext, patch: &str) -> Self {
+        let view = DiffView::new(context, patch);
+        let rows = view.parsed().len();
+        Self {
+            view,
+            offset: 0,
+            rows,
+        }
+    }
+
+    fn scroll(&mut self, delta: isize) -> crate::views::dialog::DialogStep {
+        let target = isize::try_from(self.offset)
+            .unwrap_or(isize::MAX)
+            .saturating_add(delta);
+        let next = usize::try_from(target.max(0))
+            .unwrap_or(0)
+            .min(self.rows.saturating_sub(1));
+        if next == self.offset {
+            return crate::views::dialog::DialogStep::Redraw;
+        }
+        self.offset = next;
+        crate::views::dialog::DialogStep::Redraw
+    }
+}
+
+impl crate::views::dialog::Dialog for DiffDialog {
+    fn id(&self) -> &'static str {
+        "diff_open"
+    }
+
+    fn title(&self) -> String {
+        format!("Diff — {} lines", self.rows)
+    }
+
+    fn lines(&mut self, width: u16) -> Vec<Line<'static>> {
+        let all = self.view.lines(width);
+        all.into_iter().skip(self.offset).collect()
+    }
+
+    fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        vec![("↑↓", "scroll"), ("v", "split/unified"), ("esc", "close")]
+    }
+
+    fn handle_action(
+        &mut self,
+        action: &'static Definition,
+        _event: &KeyEvent,
+    ) -> crate::views::dialog::DialogStep {
+        match action.name {
+            // `session_interrupt` as well as `diff_close`, because `escape` resolves to
+            // the former in the scope chain a session screen carries — the same reason
+            // the pickers accept it.
+            "diff_close" | "session_interrupt" => crate::views::dialog::DialogStep::Resolved(
+                crate::views::dialog::DialogOutcome::Cancelled,
+            ),
+            // Both vocabularies: `dialog.select.*` is what the arrow keys resolve to
+            // while a modal is focused, and `messages_*` is what the same keys resolve to
+            // from the session screen's own chain. Accepting one only would leave the
+            // viewer scrollable by half the keys that reach it.
+            "dialog.select.prev" | "messages_line_up" => self.scroll(-1),
+            "dialog.select.next" | "messages_line_down" => self.scroll(1),
+            "dialog.select.page_up" | "messages_page_up" => self.scroll(-PAGE_ROWS),
+            "dialog.select.page_down" | "messages_page_down" => self.scroll(PAGE_ROWS),
+            "dialog.select.home" | "messages_first" => self.scroll(isize::MIN),
+            "dialog.select.end" | "messages_last" => self.scroll(isize::MAX),
+            "diff_toggle_view" => {
+                self.view.set_columns(match self.view.columns() {
+                    DiffColumns::Unified => DiffColumns::Split,
+                    DiffColumns::Split => DiffColumns::Unified,
+                });
+                crate::views::dialog::DialogStep::Redraw
+            }
+            _ => crate::views::dialog::DialogStep::Ignored,
+        }
     }
 }
 

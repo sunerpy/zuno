@@ -447,6 +447,26 @@ impl Transcript {
         SPINNER[self.ticks % SPINNER.len()]
     }
 
+    /// The most recent tool output that is a unified diff.
+    ///
+    /// Searched newest-first because the interesting patch is the one just produced, and
+    /// recognised with the same [`looks_like_diff`] the transcript colours by, so the
+    /// diff viewer opens on exactly what the transcript already treats as a patch.
+    #[must_use]
+    pub fn latest_diff(&self) -> Option<String> {
+        self.messages
+            .iter()
+            .rev()
+            .flat_map(|message| message.parts.iter().rev())
+            .find_map(|part| match part {
+                MessagePart::Tool {
+                    output: Some(output),
+                    ..
+                } if looks_like_diff(output) => Some(output.clone()),
+                _ => None,
+            })
+    }
+
     /// Append a message written locally, such as the user's own prompt.
     pub fn push(&mut self, message: Message) {
         self.messages.push(message);

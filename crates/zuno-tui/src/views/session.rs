@@ -554,6 +554,8 @@ impl SessionScreen {
             "session_list" => self.request(self.session_picker()),
             "theme_list" => self.request(self.theme_picker()),
             "mcp_list" => self.request(self.mcp_list()),
+            "prompt_skills" => self.request(self.skill_list()),
+            "diff_open" => self.request(self.diff_view()),
             "help_show" => self.request(self.help_view()),
             _ => EventResult::IGNORED,
         }
@@ -621,6 +623,32 @@ impl SessionScreen {
         Some(Box::new(crate::views::picker::mcp_list(
             self.context.clone(),
             servers,
+        )))
+    }
+
+    fn skill_list(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
+        let skills = self.sidebar.ambient().skills.clone();
+        if skills.is_empty() {
+            return None;
+        }
+        Some(Box::new(crate::views::picker::skill_list(
+            self.context.clone(),
+            skills,
+        )))
+    }
+
+    /// The most recent patch a tool reported, as a scrollable diff.
+    ///
+    /// Read back out of the transcript rather than accumulated separately: the transcript
+    /// already recognises a unified diff in tool output — see
+    /// [`crate::views::message::looks_like_diff`] — so a second collector could disagree
+    /// with what is on screen. Absent when no tool has produced one, which the caller
+    /// reports rather than opening an empty viewer.
+    fn diff_view(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
+        let patch = self.transcript.transcript().latest_diff()?;
+        Some(Box::new(crate::views::diff::DiffDialog::new(
+            self.context.clone(),
+            &patch,
         )))
     }
 
@@ -788,7 +816,14 @@ pub fn scopes() -> Vec<String> {
         // application-wide one on the same keys.
         "input", "prompt", "messages", "model", "agent", "session", "theme", "sidebar", "mcp",
         "tool", "display", "tips", "command", "help",
-        // `app` last, so `app_exit` still resolves while the prompt has focus.
+        // `diff` after `input` and `messages`, and only for `diff_open`'s sake. The scope
+        // also carries the viewer's own bare letters — `q`, `n`, `p`, `d`, `v`, `s`, `b`,
+        // `[`, `]` — which resolve here whether or not the viewer is open. That is
+        // survivable, and only because of two facts together: this screen returns
+        // `IGNORED` for every diff action except `diff_open`, and an unhandled action
+        // falls through to the editor, which inserts the character. Give this screen an
+        // arm for one of those letters and the letter stops being typeable.
+        "diff", // `app` last, so `app_exit` still resolves while the prompt has focus.
         "app",
     ]
     .into_iter()
