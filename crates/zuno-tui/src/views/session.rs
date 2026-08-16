@@ -76,6 +76,12 @@ pub struct SessionScreen {
     sidebar_visible: bool,
     /// The resolved palette and configuration, for the pickers this screen builds.
     context: ViewContext,
+    /// The user's resolved keymap, for the keybinding reference.
+    ///
+    /// Optional because every view test builds a screen without one, and a help view
+    /// built from the shipped table instead would list the default spellings rather
+    /// than the ones the user actually has.
+    keymap: Option<crate::keybind::Keymap>,
     /// What the pickers offer, stated by the host.
     catalog: SessionCatalog,
     /// Dialogs asked for but not yet opened by the host.
@@ -134,6 +140,7 @@ impl SessionScreen {
             cancel_requested: false,
             sidebar_visible: true,
             context,
+            keymap: None,
             catalog: SessionCatalog::default(),
             requested: Vec::new(),
             selections: None,
@@ -183,6 +190,13 @@ impl SessionScreen {
     /// The welcome screen, for the host that resolves the facts it states.
     pub const fn welcome_mut(&mut self) -> &mut crate::views::welcome::WelcomeView {
         &mut self.welcome
+    }
+
+    /// Supply the resolved keymap the keybinding reference is built from.
+    #[must_use]
+    pub fn with_keymap(mut self, keymap: crate::keybind::Keymap) -> Self {
+        self.keymap = Some(keymap);
+        self
     }
 
     /// State what the pickers offer.
@@ -424,6 +438,8 @@ impl SessionScreen {
             "agent_list" => self.request(self.agent_picker()),
             "session_list" => self.request(self.session_picker()),
             "theme_list" => self.request(self.theme_picker()),
+            "mcp_list" => self.request(self.mcp_list()),
+            "help_show" => self.request(self.help_view()),
             _ => EventResult::IGNORED,
         }
     }
@@ -479,6 +495,31 @@ impl SessionScreen {
         Some(Box::new(crate::views::picker::session_picker(
             self.context.clone(),
             self.catalog.sessions.clone(),
+        )))
+    }
+
+    fn mcp_list(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
+        let servers = self.sidebar.ambient().mcp.clone();
+        if servers.is_empty() {
+            return None;
+        }
+        Some(Box::new(crate::views::picker::mcp_list(
+            self.context.clone(),
+            servers,
+        )))
+    }
+
+    /// The keybinding reference, when the host supplied the keymap to build it from.
+    ///
+    /// A help view lists what the *user's* keymap resolved, so it cannot be built from
+    /// the shipped table alone; without the keymap it would advertise defaults the user
+    /// may have rebound. Absent rather than wrong: the key then reports "nothing to show"
+    /// instead of printing a table of keys that do not work.
+    fn help_view(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
+        let keymap = self.keymap.as_ref()?;
+        Some(Box::new(crate::views::help::HelpView::new(
+            self.context.clone(),
+            keymap,
         )))
     }
 
@@ -630,8 +671,8 @@ pub fn scopes() -> Vec<String> {
     [
         // `input` and `prompt` first, so a chord the editor claims wins over an
         // application-wide one on the same keys.
-        "input", "prompt", "messages", "model", "agent", "session", "theme", "sidebar", "tool",
-        "display", "tips", "command", "help",
+        "input", "prompt", "messages", "model", "agent", "session", "theme", "sidebar", "mcp",
+        "tool", "display", "tips", "command", "help",
         // `app` last, so `app_exit` still resolves while the prompt has focus.
         "app",
     ]

@@ -125,7 +125,11 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         .with_prompt_sink(prompt_sender)
         .with_cancel_sink(cancel_sender)
         .with_selection_sink(selection_sender)
-        .with_catalog(catalog);
+        .with_catalog(catalog)
+        // A clone rather than a borrow: `KeyDispatcher` takes the keymap by value below,
+        // and the keybinding reference has to list what the *user's* keymap resolved
+        // rather than the shipped defaults.
+        .with_keymap(keymap.clone());
     facts.describe(&mut screen, host.tool_count());
     if let Some(prompt) = args
         .prompt

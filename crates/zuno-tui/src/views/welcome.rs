@@ -116,14 +116,20 @@ pub type Hint = (&'static str, &'static str);
 ///
 /// Chosen for the capabilities a user has to be able to reach on a first launch, with
 /// the exit chord last because it is the one needed when nothing else has worked.
-pub const HINTS: [Hint; 12] = [
+///
+/// **Every entry must be an action [`crate::views::session::SessionScreen`] routes.** An
+/// advertised key that nothing handles is worse than an absent one: the user presses it,
+/// nothing happens, and they cannot tell a missing feature from a broken program. That is
+/// the defect class this whole surface exists to remove, so re-introducing it *here* would
+/// be the worst possible place. `welcome_tests` asserts the property rather than trusting
+/// this note — `command_list` was on this list, bound to `ctrl+p`, and reached nothing.
+pub const HINTS: [Hint; 11] = [
     ("input_submit", "send"),
     ("model_list", "models"),
     ("agent_list", "agents"),
     ("input_newline", "newline"),
     ("session_list", "sessions"),
     ("theme_list", "themes"),
-    ("command_list", "commands"),
     ("display_thinking", "thinking"),
     ("tool_details", "tool output"),
     ("help_show", "help"),

@@ -258,11 +258,19 @@ pub const SIDEBAR_MIN_WIDTH: u16 = 120;
 
 /// The spelling a user would actually press for `action`, or `None` when unbound.
 ///
-/// The user's own overrides win over the shipped table, and that is the whole point:
-/// a hint reading `enter` after the user rebound `input_submit` is a lie, and a
-/// surface that told one would be worse than one that stayed quiet. The first
-/// spelling is taken because a hint has room for one and the table lists its
-/// preferred spelling first.
+/// Overrides carried by the resolved configuration win over the shipped table, and that
+/// is the whole point: a hint reading `enter` after the user rebound `input_submit` is a
+/// lie, and a surface that told one would be worse than one that stayed quiet. The first
+/// spelling is taken because a hint has room for one and the table lists its preferred
+/// spelling first.
+///
+/// Note what this does **not** yet buy in production: nothing populates
+/// [`crate::config::ResolvedTuiConfig::keybinds`] on the `tui` path — `cmd/tui.rs` builds
+/// a `ResolvedTuiConfig::default()`, and `tui.json` discovery is explicitly out of scope
+/// for [`crate::config`] (see that module's `# Scope`). So every hint today renders the
+/// shipped default. The override branch is reachable and tested, and it is what makes
+/// this function correct the day discovery lands; it is not a claim that a user's
+/// `tui.json` is being read now.
 #[must_use]
 pub fn key_label(action: &str, context: &ViewContext) -> Option<String> {
     if let Some(value) = context.config.keybinds.get(action) {

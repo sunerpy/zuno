@@ -41,6 +41,35 @@ pub const MODEL_DIALOG_ID: &str = "model_list";
 pub const AGENT_DIALOG_ID: &str = "agent_list";
 /// The dialog id for the theme picker.
 pub const THEME_DIALOG_ID: &str = "theme_list";
+/// The dialog id for the MCP server list.
+pub const MCP_DIALOG_ID: &str = "mcp_list";
+
+/// The MCP servers, as a filterable list.
+///
+/// A list and not a picker, strictly speaking: selecting a row does nothing, because an
+/// MCP server is an ambient fact rather than a choice. It exists because the sidebar
+/// shows a *summary* — `2 up, 1 failed` — and a failure's reason is what a user acts on,
+/// which does not fit in the panel's remaining columns. The same [`SelectDialog`] is
+/// reused rather than a bespoke view so that filtering by name behaves the way it does
+/// everywhere else.
+#[must_use]
+pub fn mcp_list(
+    context: ViewContext,
+    servers: Vec<crate::views::ambient::Service>,
+) -> SelectDialog {
+    let items = servers
+        .into_iter()
+        .map(|service| {
+            let detail = if service.detail.is_empty() {
+                String::new()
+            } else {
+                format!("{} · {}", service.health.glyph(), service.detail)
+            };
+            Item::new(service.name).described(detail)
+        })
+        .collect();
+    SelectDialog::new(MCP_DIALOG_ID, "MCP servers", context, items)
+}
 
 /// One row of a picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
