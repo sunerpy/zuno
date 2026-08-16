@@ -7569,3 +7569,56 @@ compact executor 返回前 session 始终 `Busy`，返回后才变为 `Idle`。
 `make fmt-check`、`make smoke-artifact` 全部通过；隔离数据目录并只读复用现有 auth 的真实
 `zuno run --model myopenai/global.anthropic.claude-haiku-4-5-20251001-v1:0` 返回
 `GOAL_INTEGRATION_OK`。
+
+## r11 — 36 个 crate 从 oc- 改名为 zuno- 的可迁移经验
+
+**并非所有改名 sweep 都有上游引文风险，判据是"这个 token 上游是否可能出现"。**
+此前 `.opencode` → `.zuno` 那次改坏了八处上游引文，因为 `.opencode` 是上游和本项目
+共用的词汇。`oc-`/`oc_` 不是：上游是 TypeScript，从未有过 `oc-*` 或 `oc_*` 标识符。
+先花一次 grep 证明这一点，而不是靠"上次出过事所以这次逐条人工审 588 处"——
+判据是：树中同时提到 `packages/opencode` 且匹配 `\boc[-_][a-z]` 的每一行，都在上游
+路径旁引用我们自己的 crate 路径。证明成立后，机械 sed 就是正确工具；证明不成立时
+才需要逐条判定。把"要不要机械替换"变成一个可证伪的问题，而不是一种态度。
+
+**`\b` 在下划线后不成立，所以 `\boc_` 匹配不到 `CARGO_BIN_EXE_oc-process-fixture`。**
+`_` 是 word 字符，`_oc` 内部没有 word 边界。11 处 `env!("CARGO_BIN_EXE_oc-*")` 因此
+被 sweep 漏掉。这类漏改是编译期错误（`environment variable ... not defined at
+compile time`），所以会被抓到；但同样的边界盲区若落在字符串字面量里就是静默的。
+改名后除了 `\boc`，还要单独扫 `[A-Za-z0-9]_oc[-_]`。
+
+**insta 快照的文件名由模块路径推导，改 crate 名必须同时 git mv 快照文件。**
+`crates/oc-tui/src/snapshots/oc_tui__theme__tests__*.snap` 共 33 个，文件名前缀就是
+crate 的下划线名。只改 crate 不改文件名，insta 会去找 `zuno_tui__*`，33 个主题测试
+全部报快照缺失——这是改名会静默丢掉测试的一条真实路径，而且 `cargo check` 完全干净。
+凡是"把身份写进文件名"的机制（insta 快照、`src/bin/<name>.rs` 推导 bin 名）都要在
+改名清单里单列，不能只想着 manifest 和 import。
+
+**捕获对（capture pair）比单个 fixture 更脆：改输入等于作废输出的溯源。**
+`crates/zuno-tools/tests/fixtures/webfetch_page.{html,md,turndown.md,txt}` 是一组：
+`.txt` 是 `htmlparser2` 的输出、`.turndown.md` 是 `turndown` 的输出，都由运行上游
+函数处理 `.html` 捕获而来并逐字节断言。要改的 `oc-tools` 字符串在**输入** `.html`
+里，改了它，两份上游捕获就不再是那个输入的输出。判断一个 fixture 能不能改，要先问
+"它是不是某个捕获的输入"，而不只是"它自己是不是捕获"。
+
+**`git checkout -- <未 staged 的文件>` 会回退该文件的全部工作区改动，不只是你刚加的那几行。**
+我为验证 `make lint` 真的会失败，往 `crates/zuno-error/src/lib.rs` 追加了一处
+`ptr_arg` canary，然后用 `git checkout --` 撤销。当时 index 里还是 sweep 前的内容，
+于是整个文件的 sweep 被一并抹掉，`use oc_error::` 复活，被 doctest 抓到（3485/1）。
+在大规模未提交改动的树里做临时探针，撤销要用与写入对称的方式（记录行号后删行、或先
+`cp` 备份再还原），不要用 `git checkout --`。反过来说，这次是 gate 抓住了我，
+canary 验证本身是对的——只是撤销方式错了。
+
+**逐 suite 比对，而不是只比总数。** 改名可能让某个 suite 不再被发现，而总数恰好被
+另一处补上的可能性虽小，但"总数一致"根本不覆盖"suite 集合一致"。把
+`Running <path> (<target>)` 与紧随的 `test result:` 配对导出成一张表，改名前后各一
+份，把旧表的 crate 名前缀归一化后 `diff`。本次 213 个 suite 逐行完全一致。
+
+**`cargo fmt` 会因为改名而重排 use 分组，这是预期的、无害的。**
+`zuno_` 排在 `std`/`serde_json` 之后，而 `oc_` 排在其之前，所以 524 个文件的 use
+顺序要变。看到 `fmt-check` 退出码 2 时先确认 diff 只是顺序，不要以为 sweep 出错。
+
+**这个仓库的 crate 改名无法拆成能构建的中间提交。** 根 `Cargo.toml` 的
+`[workspace.dependencies]` 用 `path = "crates/oc-*"` 指向各 crate，
+`crates/zuno-cli/tests/docs.rs` 又按字面断言 README 与 docs 内容——"仅目录"和
+"仅代码不含文档"的提交都过不了 gate。想拆分要先确认拆出来的每一半各自能过 gate，
+否则单个原子提交才是诚实的选择。

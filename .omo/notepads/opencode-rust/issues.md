@@ -8939,3 +8939,44 @@ guard 后续跑，原「crate 粒度不可达」问题不再存在。
    移动或修改用户数据库。改用临时 `XDG_DATA_HOME` 后，凭据也随之隔离而得到预期 HTTP 401；
    最终通过 `ZUNO_AUTH_CONTENT` 只读复用现有 `auth.json`，真实请求成功返回
    `GOAL_INTEGRATION_OK`。
+
+## r11 — crate 改名：修正的旧决策、实测口径差异、以及一处环境遗留
+
+**修正 `.omo/plans/zuno-rename-and-ci.md` 的"保留 oc- 前缀"结论。** 原文的理由是
+"没有用户可见收益"，漏掉了 `oc-plugin-sdk` 本身就是用户可见接口：第三方 Rust 插件
+作者按名 `use zuno_plugin_sdk::{...}`（`docs/plugin-authoring.md:126`），
+`examples/rust_plugin.rs` 会真实编译它。既然 36 个里有一个必须改，35 个 oc- 加
+1 个 zuno- 的分裂名册比两个极端都糟，因此整个名册一起改。计划中那一条已就地更正并
+写明理由，不再与已发布状态矛盾。
+
+**实测口径与计划给出的数字有系统性差异，原因是正则边界，不是仓库变了。**
+在同一个 `origin/main` @ 5229896 上实测：Cargo.toml 中 `oc-` 引用 332 处（计划说
+290）；`.rs` 中 `\boc_[a-z]` 2384 处、395 个文件（计划说 2361 / 394）；`.rs` 中
+`oc-[a-z0-9]` 字面量 588 处、174 个文件（计划说 139 处）。588 与 139 差得最多，因为
+计划只统计了 `"oc-…"` 和 `"…crates/oc-…"` 两种引号形态，而实际的 `oc-` 字面量还大量
+出现在线程名（`oc-log-writer`、`oc-pty-read-{id}`）、临时目录前缀
+（`oc-testkit-real-db-`）、共享内存 URI（`oc-db-<pid>-<n>`）、HTTP 头
+（`x-oc-testkit-scenario`）和 doc 注释里的 crate 路径中。**结论不是计划算错了，而是
+"非编译期捕获的字面量"这个集合比按引号形态数出来的更大**；下次估算这类范围，要按
+token 形态（`oc-[a-z0-9]`）而不是按引号模式来数。
+
+**`crates.expected` 与 `MINIMUM_CRATES` 的关系再次确认。** 本次只改名不增删，
+`crates.expected` 仍 36 行、`MINIMUM_CRATES` 仍 36，
+`the_workspace_roster_matches_the_declared_crate_list` 直接绿。用
+`printf '%s\n' crates/zuno-* | sed 's|crates/||' | sort` 重新生成该 fixture 是安全的：
+它要求裸名、排序、无 header，正与 `decisions.md` 记录的字节级 `cmp` 口径一致。
+
+**`make lint` 的 canary 验证方式与代价。** 往 `crates/zuno-error/src/lib.rs` 追加
+`fn f(v: &Vec<u8>) -> usize { v.len() }` 会触发 `clippy::ptr_arg`，`make lint` 退出码
+2，证明该 gate 确实会失败（否则 34 个 crate 11 秒跑完 clippy 看起来很像没真跑）。
+代价见 learnings：撤销时误用 `git checkout --` 抹掉了该文件的 sweep。要做这类反证，
+先 `cp` 备份目标文件。
+
+**一处与本次改动无关的环境遗留：`/config/.local/share/zuno/opencode-local.db`。**
+真机验证时 `zuno run` 直接退出 1，报 "legacy Zuno database ... was not opened; move
+it to .../zuno-local.db before continuing"。这是 `zuno-paths` 的 legacy DB 迁移守卫
+在起作用（`LEGACY_DB_FILE`），文件 mtime 是 Aug 15 18:51，属于此前会话留下的状态，
+与 crate 改名无关。绕过方式：`XDG_DATA_HOME` 指向临时目录，**并把
+`auth.json` 复制进去**——凭据也存在 data root 下，只换 data home 会变成 401
+`Incorrect API key provided`，那不是配置坏了。这个遗留文件仍在用户家目录里，下一个
+在真机上跑 `zuno` 的人会再撞一次，建议由所有者决定是改名还是删除。
