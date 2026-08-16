@@ -60,16 +60,22 @@ pub enum Role {
 }
 
 impl Role {
-    /// The marker drawn in the gutter.
+    /// The rule drawn down the left edge of every row this role owns.
+    ///
+    /// Upstream distinguishes the two sides by drawing the user's turn as a panel
+    /// with a coloured left rule and leaving the assistant's prose unmarked
+    /// (`routes/session/index.tsx:1395-1420`). A rule on all three sides is better
+    /// here for a reason upstream does not have to care about: an off-screen buffer
+    /// assertion can then tell the roles apart *positionally*, at column zero,
+    /// instead of searching for a label that any wrapped body line might also
+    /// contain. Three distinct glyphs rather than one in three colours, because a
+    /// colour is invisible to the row-text assertions every view test is built on.
     #[must_use]
     pub const fn marker(self) -> &'static str {
         match self {
-            // Upstream marks the user's turn with a caret and leaves the
-            // assistant's unmarked (`index.tsx`); a glyph on both sides makes an
-            // off-screen assertion able to tell them apart positionally.
-            Self::User => ">",
-            Self::Assistant => "*",
-            Self::System => "!",
+            Self::User => "▌",
+            Self::Assistant => "│",
+            Self::System => "▲",
         }
     }
 }
@@ -143,6 +149,82 @@ pub enum ThinkingDisplay {
     /// The full reasoning text.
     Expanded,
 }
+
+impl ThinkingDisplay {
+    /// The glyph that says whether there is more text behind this block.
+    ///
+    /// Upstream uses `+ `/`- ` (`routes/session/index.tsx:1671-1675`). Those are the
+    /// wrong two characters *here*, because this transcript renders unified diffs
+    /// inline: a row beginning `+ ` already means "an added line", and reusing it for
+    /// "expandable" would make the two indistinguishable at a glance. The triangles
+    /// carry the same meaning, are already the sidebar's collapse vocabulary, and
+    /// collide with nothing.
+    #[must_use]
+    pub const fn glyph(self) -> &'static str {
+        match self {
+            Self::Collapsed => "▸",
+            Self::Expanded => "▾",
+        }
+    }
+}
+
+/// Whether a tool call shows all of its output or only the first few rows.
+///
+/// Tool output is the most variable content in a transcript — a `read` of a large
+/// file is thousands of rows — so it is capped by default and the cap states how much
+/// it hid. The `tool_details` action lifts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolDisplay {
+    /// The first [`TOOL_OUTPUT_PREVIEW_ROWS`] rows, and a count of the rest.
+    Collapsed,
+    /// Up to [`TOOL_OUTPUT_MAX_ROWS`] rows.
+    Expanded,
+}
+
+impl ToolDisplay {
+    /// How many rows of output this display shows.
+    #[must_use]
+    pub const fn rows(self) -> usize {
+        match self {
+            Self::Collapsed => TOOL_OUTPUT_PREVIEW_ROWS,
+            Self::Expanded => TOOL_OUTPUT_MAX_ROWS,
+        }
+    }
+}
+
+/// Rows of tool output shown before the collapse notice.
+///
+/// Three is enough to see that a command produced the shape of output expected and
+/// short enough that four tool calls still fit on one screen.
+pub const TOOL_OUTPUT_PREVIEW_ROWS: usize = 3;
+
+/// Rows of tool output shown when expanded.
+///
+/// A ceiling rather than everything, because the transcript wraps and counts every
+/// row it produces in order to scroll, and a single unbounded `read` result would
+/// make that arithmetic dominate the frame.
+pub const TOOL_OUTPUT_MAX_ROWS: usize = 60;
+
+/// Whether `text` is a unified diff this transcript should render as one.
+///
+/// A hunk header is required rather than merely leading `+`/`-` runs, because a
+/// tool that printed a bulleted list would otherwise be recoloured as a patch — and
+/// a false diff is worse than a plain one, since its colours assert a meaning the
+/// content does not have.
+#[must_use]
+pub fn looks_like_diff(text: &str) -> bool {
+    text.lines().any(|line| line.starts_with("@@"))
+        && text
+            .lines()
+            .any(|line| line.starts_with('+') || line.starts_with('-'))
+}
+
+/// The braille spinner frames, in order.
+///
+/// A moving glyph is the cheapest honest signal that a turn is alive: a static word
+/// `working` is indistinguishable from a hung process, which is the single most
+/// expensive ambiguity an interactive surface can have.
+pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// One renderable piece of a message.
 #[derive(Debug, Clone, PartialEq)]
@@ -264,6 +346,17 @@ pub struct Transcript {
     streaming: Option<usize>,
     /// Whether the turn is still running, for the status affordance.
     running: bool,
+    /// Session-cumulative provider token accounting.
+    ///
+    /// The same [`TokenUsage`] the status strip carries, folded from the same event.
+    /// One type rather than two: a sidebar with its own accumulator is a second
+    /// running total free to disagree with the strip's, and two token figures on one
+    /// screen that differ is worse than either alone.
+    tokens: TokenUsage,
+    /// The model's context ceiling, when the catalog states one.
+    context_limit: u64,
+    /// How many events have been folded, which is what advances the spinner.
+    ticks: usize,
 }
 
 impl Transcript {
@@ -285,6 +378,46 @@ impl Transcript {
         self.running
     }
 
+    /// The session's cumulative token accounting.
+    #[must_use]
+    pub const fn tokens(&self) -> TokenUsage {
+        self.tokens
+    }
+
+    /// State the model's context ceiling, so a percentage can be computed.
+    pub const fn set_context_limit(&mut self, limit: u64) {
+        self.context_limit = limit;
+    }
+
+    /// The model's context ceiling, or zero when the catalog states none.
+    #[must_use]
+    pub const fn context_limit(&self) -> u64 {
+        self.context_limit
+    }
+
+    /// How full the context window is, as a percentage, when a ceiling is known.
+    ///
+    /// Computed from the last prompt's billed input plus its cache reads, never from
+    /// the cumulative total: the total exceeds any window as soon as a second turn
+    /// happens, so a percentage derived from it climbs past 100 and means nothing.
+    /// A zero ceiling is "no window declared" — see `token_count` in the CLI's turn
+    /// plan, which maps a non-finite catalog limit to zero — so it yields `None`
+    /// rather than dividing.
+    #[must_use]
+    pub const fn context_used(&self) -> Option<u64> {
+        if self.context_limit == 0 {
+            return None;
+        }
+        let used = self.tokens.input.saturating_add(self.tokens.cache_read);
+        Some(used.saturating_mul(100) / self.context_limit)
+    }
+
+    /// The spinner frame this transcript is on.
+    #[must_use]
+    pub const fn spinner(&self) -> &'static str {
+        SPINNER[self.ticks % SPINNER.len()]
+    }
+
     /// Append a message written locally, such as the user's own prompt.
     pub fn push(&mut self, message: Message) {
         self.messages.push(message);
@@ -295,6 +428,7 @@ impl Transcript {
     /// Returns whether anything visible changed, which is what the component turns
     /// into a redraw request.
     pub fn observe(&mut self, event: &TurnEvent) -> bool {
+        self.ticks = self.ticks.wrapping_add(1);
         match event {
             TurnEvent::TurnStarted { .. } => {
                 self.running = true;
@@ -436,6 +570,20 @@ impl Transcript {
                 });
                 true
             }
+            StreamEvent::TokenUsage {
+                input_tokens,
+                output_tokens,
+                cache_read_input_tokens,
+                cache_write_input_tokens,
+            } => {
+                self.tokens.add(
+                    input_tokens.unwrap_or_default(),
+                    output_tokens.unwrap_or_default(),
+                    cache_read_input_tokens.unwrap_or_default(),
+                    cache_write_input_tokens.unwrap_or_default(),
+                );
+                true
+            }
             StreamEvent::RetryRollback { attempt, max } => {
                 // The provider will replay from the beginning. Discarding is not an
                 // optimisation: keeping the parts would render the answer twice.
@@ -512,12 +660,19 @@ pub struct TranscriptView {
     context: ViewContext,
     transcript: Transcript,
     thinking: ThinkingDisplay,
+    tool_output: ToolDisplay,
     /// First rendered row, from the top of the produced line list.
     offset: usize,
     /// Rows the last render produced, so a scroller can clamp against content.
     content_height: usize,
     /// Rows the last render had room for.
     viewport_height: usize,
+    /// Whether the viewport follows the newest row as content arrives.
+    ///
+    /// True until the user scrolls away, which is the only reading of "follow" that
+    /// does not fight them: a transcript that always jumped to the bottom would make
+    /// scrolling back through a long tool result impossible while a turn ran.
+    following: bool,
 }
 
 impl TranscriptView {
@@ -528,10 +683,37 @@ impl TranscriptView {
             context,
             transcript: Transcript::new(),
             thinking: ThinkingDisplay::Collapsed,
+            tool_output: ToolDisplay::Collapsed,
             offset: 0,
             content_height: 0,
             viewport_height: 0,
+            following: true,
         }
+    }
+
+    /// Flip the tool-output affordance, the `tool_details` action.
+    pub const fn toggle_tool_output(&mut self) {
+        self.tool_output = match self.tool_output {
+            ToolDisplay::Collapsed => ToolDisplay::Expanded,
+            ToolDisplay::Expanded => ToolDisplay::Collapsed,
+        };
+    }
+
+    /// The current tool-output affordance.
+    #[must_use]
+    pub const fn tool_output(&self) -> ToolDisplay {
+        self.tool_output
+    }
+
+    /// Whether the viewport is pinned to the newest row.
+    #[must_use]
+    pub const fn is_following(&self) -> bool {
+        self.following
+    }
+
+    /// Pin the viewport back to the newest row.
+    pub const fn follow(&mut self) {
+        self.following = true;
     }
 
     /// The folded transcript.
@@ -578,9 +760,13 @@ impl TranscriptView {
     }
 
     /// Move the viewport, clamped to the content produced by the last render.
+    ///
+    /// Landing on the last row re-arms following, so a user who scrolls back and then
+    /// returns to the bottom does not have to keep scrolling to watch a live turn.
     pub const fn set_offset(&mut self, offset: usize) {
         let max = self.content_height.saturating_sub(self.viewport_height);
         self.offset = if offset > max { max } else { offset };
+        self.following = self.offset >= max;
     }
 
     /// The rendered rows, before the viewport is applied.
@@ -591,37 +777,101 @@ impl TranscriptView {
     #[must_use]
     pub fn lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
+        let mut previous: Option<Role> = None;
         for message in &self.transcript.messages {
-            lines.push(self.message_header(message, width));
+            let rule = self.rule_style(message.role);
+            // A multi-step turn opens one assistant message per step, so a header per
+            // message printed `Assistant` five times for what the user experienced as
+            // one reply. The header marks a change of speaker, which is what it was
+            // always for; the left rule already runs down every row of the turn.
+            if previous != Some(message.role) {
+                lines.push(self.ruled(
+                    message.role,
+                    rule,
+                    self.role_label(message.role),
+                    self.context.title(),
+                    width,
+                ));
+            }
+            previous = Some(message.role);
             for part in &message.parts {
-                self.part_lines(part, width, &mut lines);
+                self.part_lines(message.role, rule, part, width, &mut lines);
             }
             lines.push(padded("", width, self.context.surface()));
         }
         if self.transcript.running {
-            lines.push(padded("… working", width, self.context.muted()));
+            lines.push(padded(
+                &format!("{} working", self.transcript.spinner()),
+                width,
+                self.context.accent(),
+            ));
         }
         lines
     }
 
-    fn message_header(&self, message: &Message, width: u16) -> Line<'static> {
-        let label = match message.role {
+    const fn role_label(&self, role: Role) -> &'static str {
+        match role {
             Role::User => "You",
             Role::Assistant => "Assistant",
             Role::System => "Session",
-        };
-        padded(
-            &format!("{} {label}", message.role.marker()),
-            width,
-            self.context.title(),
-        )
+        }
     }
 
-    fn part_lines(&self, part: &MessagePart, width: u16, out: &mut Vec<Line<'static>>) {
+    fn rule_style(&self, role: Role) -> Style {
+        match role {
+            Role::User => self.context.accent(),
+            Role::Assistant => Style::new()
+                .fg(self.context.palette.border_subtle.into())
+                .bg(self.context.palette.background_panel.into()),
+            Role::System => self.context.warning(),
+        }
+    }
+
+    /// One row carrying the role's left rule, then `body` in `style`.
+    ///
+    /// Two spans rather than one padded string because the rule and the body are
+    /// different colours; a single span could only be one, which is precisely how the
+    /// old renderer ended up with a transcript that had no visible structure.
+    fn ruled(
+        &self,
+        role: Role,
+        rule: Style,
+        body: &str,
+        style: Style,
+        width: u16,
+    ) -> Line<'static> {
+        let marker = role.marker();
+        let gutter = marker.chars().count() + 1;
+        let columns = usize::from(width);
+        let room = columns.saturating_sub(gutter);
+        let mut text = body.chars().take(room).collect::<String>();
+        let used = text.chars().count();
+        if used < room {
+            text.extend(std::iter::repeat_n(' ', room - used));
+        }
+        Line::from(vec![
+            Span::styled(format!("{marker} "), rule),
+            Span::styled(text, style),
+        ])
+    }
+
+    fn part_lines(
+        &self,
+        role: Role,
+        rule: Style,
+        part: &MessagePart,
+        width: u16,
+        out: &mut Vec<Line<'static>>,
+    ) {
+        let gutter = u16::try_from(role.marker().chars().count() + 1).unwrap_or(2);
+        let body_width = width.saturating_sub(gutter);
+        let push = |body: &str, style: Style, out: &mut Vec<Line<'static>>| {
+            out.push(self.ruled(role, rule, body, style, width));
+        };
         match part {
             MessagePart::Text { text } => {
-                for row in wrap(text, width.saturating_sub(2)) {
-                    out.push(padded(&format!("  {row}"), width, self.context.text()));
+                for row in wrap(text, body_width) {
+                    push(&row, self.context.text(), out);
                 }
             }
             MessagePart::Reasoning {
@@ -629,29 +879,32 @@ impl TranscriptView {
                 duration_secs,
                 streaming,
             } => {
-                let header = match (duration_secs, streaming) {
-                    (Some(secs), _) => format!("  ⋮ Thinking ({secs:.1}s)"),
-                    (None, true) => String::from("  ⋮ Thinking…"),
-                    (None, false) => String::from("  ⋮ Thinking"),
+                let hidden = text.lines().filter(|line| !line.trim().is_empty()).count();
+                let elapsed = match (duration_secs, streaming) {
+                    (Some(secs), _) => format!(" ({secs:.1}s)"),
+                    (None, true) => String::from("…"),
+                    (None, false) => String::new(),
                 };
-                out.push(padded(&header, width, self.context.thinking()));
+                let header = match self.thinking {
+                    // The row states the size of what it hides, so the affordance says
+                    // "there is more here" without the reader having to open it to find
+                    // out whether opening it was worth doing.
+                    ThinkingDisplay::Collapsed if hidden > 1 => format!(
+                        "{} Thinking{elapsed} · {hidden} lines",
+                        self.thinking.glyph()
+                    ),
+                    _ => format!("{} Thinking{elapsed}", self.thinking.glyph()),
+                };
+                push(&header, self.context.thinking(), out);
                 match self.thinking {
                     ThinkingDisplay::Collapsed => {
                         if let Some(summary) = summary(text) {
-                            out.push(padded(
-                                &format!("    {summary}"),
-                                width,
-                                self.context.thinking(),
-                            ));
+                            push(&format!("  {summary}"), self.context.thinking(), out);
                         }
                     }
                     ThinkingDisplay::Expanded => {
-                        for row in wrap(text, width.saturating_sub(4)) {
-                            out.push(padded(
-                                &format!("    {row}"),
-                                width,
-                                self.context.thinking(),
-                            ));
+                        for row in wrap(text, body_width.saturating_sub(2)) {
+                            push(&format!("  {row}"), self.context.thinking(), out);
                         }
                     }
                 }
@@ -669,42 +922,108 @@ impl TranscriptView {
                     (None, ToolStatus::Pending) => placeholder.to_owned(),
                     (None, _) => name.clone(),
                 };
+                // Only a *dispatched* call spins. `Pending` keeps the oracle's `~`
+                // because the two states differ in a way a user acts on: pending means
+                // the model is still writing the arguments, running means the tool is
+                // executing, and collapsing both into one animation would hide which.
+                let glyph = if *status == ToolStatus::Running {
+                    self.transcript.spinner()
+                } else {
+                    status.glyph()
+                };
                 let style = match status {
                     ToolStatus::Error => self.context.error(),
                     ToolStatus::Completed => self.context.success(),
                     ToolStatus::Pending | ToolStatus::Running => self.context.muted(),
                 };
-                out.push(padded(
-                    &format!("  {} {icon} {label}", status.glyph()),
-                    width,
-                    style,
-                ));
+                push(&format!("{glyph} {icon} {label}"), style, out);
                 if let Some(output) = output {
-                    for row in wrap(output, width.saturating_sub(6)).into_iter().take(8) {
-                        out.push(padded(&format!("      {row}"), width, self.context.muted()));
-                    }
+                    self.tool_output_lines(role, rule, output, width, out);
                 }
             }
             MessagePart::Attachment { filename, mime } => {
                 let label = match mime {
-                    Some(mime) => format!("  ⎘ {filename} ({mime})"),
-                    None => format!("  ⎘ {filename}"),
+                    Some(mime) => format!("⎘ {filename} ({mime})"),
+                    None => format!("⎘ {filename}"),
                 };
-                out.push(padded(&label, width, self.context.accent()));
+                push(&label, self.context.accent(), out);
             }
             MessagePart::Retry { attempt, max } => {
-                out.push(padded(
-                    &format!("  Retrying provider request (attempt {attempt}/{max})"),
-                    width,
+                push(
+                    &format!("↻ Retrying provider request (attempt {attempt}/{max})"),
                     self.context.error(),
-                ));
+                    out,
+                );
             }
             MessagePart::Notice { text } => {
-                for row in wrap(text, width.saturating_sub(4)) {
-                    out.push(padded(&format!("  ! {row}"), width, self.context.warning()));
+                for row in wrap(text, body_width.saturating_sub(2)) {
+                    push(&format!("! {row}"), self.context.warning(), out);
                 }
             }
         }
+    }
+
+    /// A tool's output, as a diff when it is one and as capped prose otherwise.
+    ///
+    /// The diff branch is why an `edit` is worth reading in the transcript at all: an
+    /// unstyled patch is a wall of text whose `+` and `-` a reader has to scan for,
+    /// and the same patch with line numbers and the theme's eleven diff colours is a
+    /// review surface.
+    fn tool_output_lines(
+        &self,
+        role: Role,
+        rule: Style,
+        output: &str,
+        width: u16,
+        out: &mut Vec<Line<'static>>,
+    ) {
+        let gutter = u16::try_from(role.marker().chars().count() + 3).unwrap_or(4);
+        let body_width = width.saturating_sub(gutter);
+        let marker = role.marker();
+        if looks_like_diff(output) {
+            let mut view = crate::views::diff::DiffView::new(self.context.clone(), output);
+            let rows = view.lines(body_width);
+            let total = rows.len();
+            for row in rows.into_iter().take(self.tool_output.rows()) {
+                let mut spans = vec![Span::styled(format!("{marker}   "), rule)];
+                spans.extend(row.spans);
+                out.push(Line::from(spans));
+            }
+            self.push_overflow(role, rule, total, width, out);
+            return;
+        }
+        let rows = wrap(output, body_width);
+        let total = rows.len();
+        for row in rows.into_iter().take(self.tool_output.rows()) {
+            out.push(self.ruled(role, rule, &format!("  {row}"), self.context.muted(), width));
+        }
+        self.push_overflow(role, rule, total, width, out);
+    }
+
+    fn push_overflow(
+        &self,
+        role: Role,
+        rule: Style,
+        total: usize,
+        width: u16,
+        out: &mut Vec<Line<'static>>,
+    ) {
+        let shown = self.tool_output.rows();
+        if total <= shown {
+            return;
+        }
+        let hidden = total - shown;
+        let notice = match crate::views::key_label("tool_details", &self.context) {
+            Some(key) => format!(
+                "  {} {hidden} more lines · {key}",
+                ThinkingDisplay::Collapsed.glyph()
+            ),
+            None => format!(
+                "  {} {hidden} more lines",
+                ThinkingDisplay::Collapsed.glyph()
+            ),
+        };
+        out.push(self.ruled(role, rule, &notice, self.context.accent(), width));
     }
 }
 
@@ -755,6 +1074,92 @@ pub struct StatusView {
     model: Option<String>,
     step: u32,
     detail: Option<String>,
+    /// What the session was configured with, shown before the first turn resolves.
+    ///
+    /// Separate from `agent`/`model`, which are what the *engine* resolved: carrying
+    /// the configured pair in the same fields would make the strip claim a turn had
+    /// resolved a model before one had run, and clearing them at the end of a turn
+    /// would then blank a row that is still true.
+    configured_agent: Option<String>,
+    configured_model: Option<String>,
+    usage: TokenUsage,
+}
+
+/// Token counts for the session, accumulated across every step of every turn.
+///
+/// Cumulative rather than per-step because the number a user is watching for is what
+/// the session has cost so far; a per-step count resets to a small number at every
+/// step boundary and reads as if usage went down.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    /// Prompt tokens sent.
+    pub input: u64,
+    /// Completion tokens received.
+    pub output: u64,
+    /// Prompt tokens served from the provider's cache.
+    pub cache_read: u64,
+    /// Prompt tokens written into the provider's cache.
+    pub cache_write: u64,
+}
+
+impl TokenUsage {
+    /// Whether anything has been counted yet.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.input == 0 && self.output == 0 && self.cache_read == 0 && self.cache_write == 0
+    }
+
+    /// Every token the session has been billed for, cache included.
+    #[must_use]
+    pub const fn total(&self) -> u64 {
+        self.input + self.output + self.cache_read + self.cache_write
+    }
+
+    /// Add one step's report.
+    ///
+    /// A provider that reports the same step twice — a retry replaying its usage
+    /// event — would double-count, so the accumulator is fed from
+    /// [`StreamEvent::TokenUsage`] only, which the engine emits once per completed
+    /// step (`zuno-engine/src/loop.rs:530`).
+    pub const fn add(&mut self, input: u64, output: u64, cache_read: u64, cache_write: u64) {
+        self.input += input;
+        self.output += output;
+        self.cache_read += cache_read;
+        self.cache_write += cache_write;
+    }
+
+    /// The compact form the status strip carries.
+    ///
+    /// Cache is named only when the provider reported some: a permanent `cache 0` on
+    /// a provider that does not support caching is a column of noise.
+    #[must_use]
+    pub fn compact(&self) -> String {
+        let cached = self.cache_read + self.cache_write;
+        if cached == 0 {
+            format!("↑{} ↓{}", thousands(self.input), thousands(self.output))
+        } else {
+            format!(
+                "↑{} ↓{} ⚡{}",
+                thousands(self.input),
+                thousands(self.output),
+                thousands(cached)
+            )
+        }
+    }
+}
+
+/// Group `value` in thousands so a six-figure token count stays readable.
+#[must_use]
+pub fn thousands(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, character) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(character);
+    }
+    out
 }
 
 impl StatusView {
@@ -781,13 +1186,53 @@ impl StatusView {
             model: None,
             step: 0,
             detail: None,
+            configured_agent: None,
+            configured_model: None,
+            usage: TokenUsage::default(),
         }
+    }
+
+    /// Adopt the configured agent and model, so the idle strip is not just `idle`.
+    ///
+    /// Before this the strip's only pre-turn state was the literal word `idle`, which
+    /// answers none of the questions a user has before pressing enter: which agent
+    /// will run, and against which model. Both are known at launch.
+    /// An empty string is treated as "not resolved" rather than adopted, because a
+    /// blank agent on the strip is indistinguishable from one that failed to resolve.
+    pub fn describe(&mut self, agent: &str, model: &str) {
+        if !agent.is_empty() {
+            self.configured_agent = Some(agent.to_owned());
+        }
+        if !model.is_empty() {
+            self.configured_model = Some(model.to_owned());
+        }
+    }
+
+    /// Replace the configured model, after the user picked a different one.
+    pub fn set_configured_model(&mut self, model: impl Into<String>) {
+        self.configured_model = Some(model.into());
+    }
+
+    /// Replace the configured agent, after the user picked a different one.
+    pub fn set_configured_agent(&mut self, agent: impl Into<String>) {
+        self.configured_agent = Some(agent.into());
     }
 
     /// Whether a turn is in flight, as the strip is reporting it.
     #[must_use]
     pub const fn is_running(&self) -> bool {
         self.running
+    }
+
+    /// The tokens counted so far.
+    #[must_use]
+    pub const fn usage(&self) -> TokenUsage {
+        self.usage
+    }
+
+    /// Replace the palette and settings, for a live theme change.
+    pub fn set_context(&mut self, context: ViewContext) {
+        self.context = context;
     }
 
     /// Report a turn as running before the engine's first event arrives.
@@ -816,6 +1261,14 @@ impl StatusView {
         self.detail = None;
     }
 
+    /// The right-hand group: token usage, then the exit hint.
+    fn trailer(&self) -> String {
+        if self.usage.is_empty() {
+            return Self::EXIT_HINT.to_owned();
+        }
+        format!("{}  {}", self.usage.compact(), Self::EXIT_HINT)
+    }
+
     /// The rendered row, with [`Self::EXIT_HINT`] right-aligned when it fits.
     ///
     /// The hint is dropped rather than truncated on a narrow terminal: half a key
@@ -825,28 +1278,34 @@ impl StatusView {
     pub fn line(&self, width: u16) -> Line<'static> {
         let state = format!(" {}", self.state());
         let columns = usize::from(width);
-        let used = state.chars().count() + Self::EXIT_HINT.chars().count();
-        if used < columns {
-            return Line::from(vec![
-                Span::styled(state, self.context.element()),
-                Span::styled(" ".repeat(columns - used), self.context.element()),
-                Span::styled(
-                    Self::EXIT_HINT.to_owned(),
-                    Style::new()
-                        .fg(self.context.palette.text_muted.into())
-                        .bg(self.context.palette.background_element.into()),
-                ),
-            ]);
+        // The trailer is tried whole first, then the exit hint alone, then nothing.
+        // Dropping the token counts before the exit key is the deliberate order: the
+        // counts are informational and the key is the only way out.
+        for trailer in [self.trailer(), Self::EXIT_HINT.to_owned()] {
+            let used = state.chars().count() + trailer.chars().count() + 1;
+            if used < columns {
+                return Line::from(vec![
+                    Span::styled(state, self.context.element()),
+                    Span::styled(" ".repeat(columns - used), self.context.element()),
+                    Span::styled(
+                        trailer,
+                        Style::new()
+                            .fg(self.context.palette.text_muted.into())
+                            .bg(self.context.palette.background_element.into()),
+                    ),
+                    Span::styled(String::from(" "), self.context.element()),
+                ]);
+            }
         }
         padded(&state, width, self.context.element())
     }
 
     fn state(&self) -> String {
         let mut text = String::new();
-        if let Some(agent) = &self.agent {
+        if let Some(agent) = self.agent.as_ref().or(self.configured_agent.as_ref()) {
             text.push_str(agent);
         }
-        if let Some(model) = &self.model {
+        if let Some(model) = self.model.as_ref().or(self.configured_model.as_ref()) {
             if !text.is_empty() {
                 text.push_str(" · ");
             }
@@ -913,6 +1372,24 @@ impl Component for StatusView {
                 ..
             } => {
                 self.detail = Some(detail.clone());
+                EventResult::REDRAW
+            }
+            TurnEvent::Provider {
+                event:
+                    StreamEvent::TokenUsage {
+                        input_tokens,
+                        output_tokens,
+                        cache_read_input_tokens,
+                        cache_write_input_tokens,
+                    },
+                ..
+            } => {
+                self.usage.add(
+                    input_tokens.unwrap_or(0),
+                    output_tokens.unwrap_or(0),
+                    cache_read_input_tokens.unwrap_or(0),
+                    cache_write_input_tokens.unwrap_or(0),
+                );
                 EventResult::REDRAW
             }
             TurnEvent::Provider {

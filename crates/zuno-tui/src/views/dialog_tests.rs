@@ -202,19 +202,23 @@ fn views_dialog_base_still_receives_engine_events_while_a_dialog_is_open() {
             step: index,
             message_id: format!("msg_{index}"),
         }));
+        host.handle_event(&AppEvent::Engine(TurnEvent::Provider {
+            step: index,
+            event: zuno_llm::event::StreamEvent::TextDelta(format!("folded {index}")),
+        }));
     }
     // The host has no accessor for its base, so the observation is made through the
-    // rendered frame: five assistant headers means five events were folded while the
-    // dialog was up.
+    // rendered frame. Each event carries its own text rather than being counted by
+    // message headers: consecutive assistant steps now share one header, so a header
+    // count would measure the grouping rule instead of the property under test.
     let buffer = render_offscreen(&mut host, 40, 30).expect("infallible");
-    let headers = rows(&buffer)
-        .iter()
-        .filter(|row| row.contains("Assistant"))
-        .count();
-    assert_eq!(
-        headers, 5,
-        "engine events were dropped while a dialog was open"
-    );
+    let joined = rows(&buffer).join("\n");
+    for index in 0..5 {
+        assert!(
+            joined.contains(&format!("folded {index}")),
+            "engine event {index} was dropped while a dialog was open:\n{joined}"
+        );
+    }
 }
 
 #[test]

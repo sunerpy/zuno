@@ -78,7 +78,7 @@ fn views_chat_transcript_renders_every_part_kind_offscreen() {
     let rows = draw(&mut view, 48, 16);
     let joined = rows.join("\n");
     assert!(
-        joined.contains("> You"),
+        joined.contains("▌ You"),
         "the user's turn is missing its header:\n{joined}"
     );
     assert!(
@@ -86,7 +86,7 @@ fn views_chat_transcript_renders_every_part_kind_offscreen() {
         "the user's text is missing:\n{joined}"
     );
     assert!(
-        joined.contains("* Assistant"),
+        joined.contains("│ Assistant"),
         "the assistant's turn is missing its header:\n{joined}"
     );
     assert!(
@@ -121,16 +121,29 @@ fn views_chat_transcript_paints_from_the_palette_not_from_a_literal() {
     let mut view = TranscriptView::new(context.clone());
     view.transcript_mut().push(Message::user("hello"));
     let buffer = render_offscreen(&mut view, 20, 4).expect("infallible");
-    let cell = &buffer[(0, 0)];
+    // Column zero is the role's left rule and column two is the body, so the two are
+    // sampled separately: asserting one cell could not tell a themed transcript from
+    // one whose rule and body had collapsed into a single colour.
+    let rule = &buffer[(0, 0)];
+    let body = &buffer[(2, 0)];
     assert_eq!(
-        cell.bg,
+        body.bg,
         ratatui::style::Color::from(context.palette.background_panel),
         "the transcript background did not come from the resolved palette"
     );
     assert_eq!(
-        cell.fg,
+        body.fg,
         ratatui::style::Color::from(context.palette.text),
         "the transcript foreground did not come from the resolved palette"
+    );
+    assert_eq!(
+        rule.fg,
+        ratatui::style::Color::from(context.palette.border_active),
+        "the user's left rule did not come from the resolved palette"
+    );
+    assert_ne!(
+        rule.fg, body.fg,
+        "the rule and the body are the same colour, so the transcript has no structure"
     );
 }
 
@@ -251,8 +264,10 @@ fn views_retry_rollback_notice_is_visible_in_the_error_colour() {
         !rendered_rows.join("\n").contains("discard me"),
         "rollback kept the failed attempt: {rendered_rows:?}"
     );
+    // Column two, not zero: column zero carries the role's left rule, so sampling it
+    // would read the rule's colour and never see the notice's.
     assert_eq!(
-        buffer[(0, u16::try_from(retry_row).expect("test row fits u16"))].fg,
+        buffer[(2, u16::try_from(retry_row).expect("test row fits u16"))].fg,
         ratatui::style::Color::from(context.palette.error),
         "retry notice did not use the theme's red/error colour"
     );
@@ -480,7 +495,7 @@ fn views_transcript_keeps_a_warning_detail_that_the_status_strip_would_overwrite
         "the shadowing warning is not visible in the transcript:\n{joined}"
     );
     assert!(
-        joined.contains("! Session"),
+        joined.contains("▲ Session"),
         "the warning must be attributed to the session, not to the user or the model:\n{joined}"
     );
     assert!(
@@ -666,5 +681,178 @@ fn views_attachment_renders_its_mime_when_known() {
     assert!(
         joined.contains("⎘ diagram.svg (image/svg+xml)"),
         "the attachment did not render its name and type:\n{joined}"
+    );
+}
+
+#[test]
+fn views_transcript_groups_consecutive_assistant_steps_under_one_header() {
+    // Measured on a real terminal: a five-step turn printed `Assistant` five times for
+    // what the user experienced as a single reply.
+    let mut view = view();
+    view.transcript_mut().push(Message::user("go"));
+    for step in 1..=3 {
+        view.handle_event(&AppEvent::Engine(TurnEvent::AssistantMessageCreated {
+            step,
+            message_id: format!("m{step}"),
+        }));
+        view.handle_event(&AppEvent::Engine(provider(StreamEvent::TextDelta(
+            format!("step {step}"),
+        ))));
+    }
+    let rendered = draw(&mut view, 60, 30);
+    let headers = rendered
+        .iter()
+        .filter(|row| row.contains("Assistant"))
+        .count();
+    assert_eq!(
+        headers,
+        1,
+        "three assistant steps produced {headers} headers:\n{}",
+        rendered.join("\n")
+    );
+    let joined = rendered.join("\n");
+    for step in 1..=3 {
+        assert!(
+            joined.contains(&format!("step {step}")),
+            "grouping dropped step {step}'s text:\n{joined}"
+        );
+    }
+    assert!(
+        joined.contains("▌ You"),
+        "grouping also swallowed the user's header:\n{joined}"
+    );
+}
+
+#[test]
+fn views_transcript_folds_provider_token_usage_for_the_ambient_panel() {
+    // The sidebar and the strip read this one accumulator; a fold that never ran is why
+    // a completed turn can still report `no usage reported yet`.
+    let mut view = view();
+    view.handle_event(&AppEvent::Engine(started()));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::TokenUsage {
+        input_tokens: Some(1_200),
+        output_tokens: Some(340),
+        cache_read_input_tokens: Some(80),
+        cache_write_input_tokens: None,
+    })));
+    let tokens = view.transcript().tokens();
+    assert_eq!(tokens.input, 1_200);
+    assert_eq!(tokens.output, 340);
+    assert_eq!(tokens.cache_read, 80);
+    assert_eq!(tokens.total(), 1_620);
+    assert!(!tokens.is_empty());
+
+    // Two reports accumulate rather than replace, because a turn bills per step.
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::TokenUsage {
+        input_tokens: Some(100),
+        output_tokens: Some(10),
+        cache_read_input_tokens: None,
+        cache_write_input_tokens: None,
+    })));
+    assert_eq!(view.transcript().tokens().input, 1_300);
+}
+
+#[test]
+fn views_transcript_context_percentage_needs_a_declared_window() {
+    let mut view = view();
+    view.handle_event(&AppEvent::Engine(started()));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::TokenUsage {
+        input_tokens: Some(5_000),
+        output_tokens: Some(1_000),
+        cache_read_input_tokens: None,
+        cache_write_input_tokens: None,
+    })));
+    assert_eq!(
+        view.transcript().context_used(),
+        None,
+        "a model that declares no window must not produce a percentage"
+    );
+    view.transcript_mut().set_context_limit(20_000);
+    assert_eq!(view.transcript().context_used(), Some(25));
+    // Output is excluded: the window bounds the prompt, and including completions would
+    // climb past 100 on a long session.
+    assert!(view.transcript().context_used().unwrap() <= 100);
+}
+
+#[test]
+fn views_transcript_renders_a_tool_patch_as_a_diff() {
+    let mut view = view();
+    view.handle_event(&AppEvent::Engine(started()));
+    view.handle_event(&AppEvent::Engine(TurnEvent::AssistantMessageCreated {
+        step: 1,
+        message_id: String::from("m"),
+    }));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseStart {
+        id: String::from("c1"),
+        name: String::from("edit"),
+    })));
+    view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
+        step: 1,
+        call_id: String::from("c1"),
+        name: String::from("edit"),
+        title: String::from("Edit src/main.rs"),
+        output: String::from("@@ -1,3 +1,3 @@\n fn main() {\n-    old();\n+    new();\n }\n"),
+        is_error: false,
+    }));
+    view.toggle_tool_output();
+    let joined = draw(&mut view, 90, 24).join("\n");
+    assert!(
+        joined.contains("@@ -1,3 +1,3 @@"),
+        "the hunk header is missing:\n{joined}"
+    );
+    assert!(
+        joined.contains('+') && joined.contains('-'),
+        "the patch lost its signs:\n{joined}"
+    );
+    assert!(
+        joined.contains('2') && joined.contains('3'),
+        "the diff was rendered without line numbers:\n{joined}"
+    );
+}
+
+#[test]
+fn views_transcript_collapses_long_tool_output_and_says_how_much_it_hid() {
+    let mut view = view();
+    view.handle_event(&AppEvent::Engine(started()));
+    view.handle_event(&AppEvent::Engine(TurnEvent::AssistantMessageCreated {
+        step: 1,
+        message_id: String::from("m"),
+    }));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseStart {
+        id: String::from("c1"),
+        name: String::from("bash"),
+    })));
+    let body = (1..=12)
+        .map(|n| format!("line {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
+        step: 1,
+        call_id: String::from("c1"),
+        name: String::from("bash"),
+        title: String::from("ls"),
+        output: body,
+        is_error: false,
+    }));
+    let collapsed = draw(&mut view, 60, 30).join("\n");
+    assert!(
+        collapsed.contains("9 more lines"),
+        "the collapse notice does not state how much it hid:\n{collapsed}"
+    );
+    assert!(collapsed.contains("line 1"), "{collapsed}");
+    assert!(
+        !collapsed.contains("line 12"),
+        "collapsed output rendered its whole body:\n{collapsed}"
+    );
+
+    view.toggle_tool_output();
+    let expanded = draw(&mut view, 60, 30).join("\n");
+    assert!(
+        expanded.contains("line 12"),
+        "expanding did not reveal the rest:\n{expanded}"
+    );
+    assert!(
+        !expanded.contains("more lines"),
+        "an expanded block still claims to be hiding rows:\n{expanded}"
     );
 }
