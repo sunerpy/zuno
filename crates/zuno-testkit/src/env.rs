@@ -200,6 +200,42 @@ impl ScriptedEnv {
         self
     }
 
+    /// Variables the operating system itself requires, as opposed to configuration.
+    ///
+    /// A no-op on Unix, where the variables this fixture already sets are enough.
+    ///
+    /// On Windows they are not: a child started from a cleared environment has no
+    /// `SystemRoot`, and WinSock cannot initialize without it. The symptom is narrow
+    /// enough to be misleading — the artifact smoke test's `--version` and `--help`
+    /// checks passed on Windows while only the networked check failed, with
+    /// `os error 10106` (`WSAEPROVIDERFAILEDINIT`) on a loopback connect. Isolation
+    /// is not weakened: these locate the OS, and the paths a run reads or writes
+    /// (`USERPROFILE`, `TEMP`, `TMP`) are pointed back into this fixture's own
+    /// directories rather than inherited.
+    #[cfg(not(windows))]
+    fn insert_os_mandatory_variables(&self, _env: &mut BTreeMap<String, String>) {}
+
+    #[cfg(windows)]
+    fn insert_os_mandatory_variables(&self, env: &mut BTreeMap<String, String>) {
+        const OS_VARIABLES: &[&str] = &[
+            "SystemRoot",
+            "SystemDrive",
+            "windir",
+            "ComSpec",
+            "PATHEXT",
+            "NUMBER_OF_PROCESSORS",
+            "PROCESSOR_ARCHITECTURE",
+        ];
+        for key in OS_VARIABLES {
+            if let Ok(value) = std::env::var(key) {
+                env.insert((*key).to_owned(), value);
+            }
+        }
+        env.insert("USERPROFILE".to_owned(), display(&self.home));
+        env.insert("TEMP".to_owned(), display(&self.tmp));
+        env.insert("TMP".to_owned(), display(&self.tmp));
+    }
+
     /// The complete environment a child process receives.
     #[must_use]
     pub fn env_vars(&self) -> BTreeMap<String, String> {
@@ -209,6 +245,7 @@ impl ScriptedEnv {
                 env.insert(key.clone(), value);
             }
         }
+        self.insert_os_mandatory_variables(&mut env);
         env.insert("HOME".to_owned(), display(&self.home));
         env.insert("XDG_DATA_HOME".to_owned(), display(&self.data));
         env.insert("XDG_CONFIG_HOME".to_owned(), display(&self.config));
