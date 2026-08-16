@@ -9253,3 +9253,48 @@ collapsed 为 `▸ Thinking… · 3 lines` 且只显示第一行，`display_thin
 
 **登记而非修复**：要真实驱动它，需要一个会回 reasoning 的 provider（bedrock 直连
 或 anthropic 原生 surface），本机对 nova/claude 的 bedrock 权限仍是 404。
+## TUI 能力补齐（续 main 的 8 个提交）— 已修 6 项
+
+基线：main 317e8ca（另一 agent 已完成欢迎屏、四个选择器、对话渲染、思考折叠、环境面板）。
+本轮只做 main 缺的部分，逐项验证 main 的行为后才动手。
+
+### 1. engine：token 统计永远为 0（已修 cf01840）
+`loop.rs` 在 `MessageEnd` 处 return，而 OpenAI 兼容端点把 usage 放在 finish_reason 之后
+的一帧。改成 8 帧有上限尾部读取。实测同一 mock 端点、只差这一个提交：
+修前 `input=0 output=0`，修后 `input=5902 output=41 cache.read=4096`。
+
+### 2. 行宽按字符数而非终端列数（已修 1898462）
+CJK 名称撑破边框。新增 `display_width` / `truncate`，并把用错单位的既有断言改成断言列数。
+
+### 3. 命令面板缺失，43 个无键动作无入口（已修 ad233c4）
+新增 `views/palette.rs`，选中后解析为动作名重走 `handle_action`。`command_list` 因此可以
+放回欢迎屏 HINTS（上一轮是因为按下去没反应才移除的）。实测 ctrl+p → Commands (183)，
+搜 "thinking blocks" → 唯一一行 "no key · run from here" → 回车后折叠状态翻转。
+
+### 4. picker 不按 value 搜索（已修 86419c4）
+模型 label 是显示名、value 是引擎 id，而 `--model` 和配置文件写的是 id。实测搜
+`haiku-4-5` 得到 `Models (0)`。
+
+### 5. LSP 诊断完全没有 TUI 入口（已修 d4ff930）
+新增 `views/lsp.rs` + `cmd/tui_lsp.rs`。三种状态互不塌缩（无人认领 / 已查无问题 /
+有问题），位置转 1-based。顺带修 `PermissionBridge` 吞掉 `Wake`，以及 ambient 面板对
+未安装的语言服务器谎称 "starts on first matching file"。实测真实 rust-analyzer：
+`⑁ src/lib.rs: 1 error, 2 others (rust)` + `✗ 2:25 error [rustc] mismatched types`。
+
+### 6. 全屏权限提示在边框里刷 38 行空白（已修 6a5f3b2）
+`desired_height` 在 expanded 时返回整帧高度。三行 diff 展开占满 50 行，盖掉正在询问的
+对话。改成"整帧是上限而不是高度"。
+
+### 门禁
+- `cargo test --workspace`：213 suites / 3595 passed / 0 failed / 2 ignored / EXIT=0
+  （main 基线实测 213 / 3554 / 0 / 2，差值 +41 全部来自本轮新增测试）
+- `make lint` 0 warning；`cargo fmt --all --check` clean
+- `make smoke-artifact` PASS，`13 tools offered`
+- 2 个 ignored 均为既有：`soak.rs` 的 500-turn（注释说至少两小时）与
+  `zuno-tool/src/context.rs` 的 doctest
+
+### 未做（明确记录，非遗漏）
+- **会话切换**：`session_list` 能开、能选、Selection::Session 会发出，但宿主侧未实现真正
+  换会话。main 的 `adopt` 也只是发出选择。属于 main 既有状态，本轮未扩大范围。
+- **MCP 开关**：`mcp_list` 只读。切换意味着重启服务器，属于 turn host 的职责，一个
+  静默什么都不做的开关比没有开关更糟。

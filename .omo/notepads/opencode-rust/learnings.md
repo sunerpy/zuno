@@ -8208,3 +8208,90 @@ dropping」），但 `ToolDispatchCompleted` 只走 `update_tool`，找不到就
 进入 transcript：`⌁ src/lib.rs: 1 error, 2 others (rust)` 并带 1-based 位置。
 
 **「计数为 0」和「计数坏了」必须用配置一个真实服务器来区分**，光看 UI 分不出来。
+## TUI 重建续篇：通道接不上消费者，是"建好但打不到"的第二种形态
+
+前一轮把"路由 + scope 两个独立必要条件"记了下来。这一轮遇到的四个缺陷里有三个是同一
+类的第三种形态：**通道有生产者、有容量、有 try_send，消费者却永远不跑**。它比缺 scope
+更难发现，因为编译器、clippy、单元测试全都通过——每一端单独看都是对的。
+
+### 形态一：事件在最后一个事件之后到达
+
+`SessionScreen::drain_reports` 在 `handle_event` 里 try_recv。看起来没问题，直到发现
+**已完成的回合是渲染循环能看到的最后一个事件**：LSP 报告在回合结束后 20 秒才产生，此时
+没有任何事件会再来触发 drain。"下一个事件会顺手取走"不是兜底，是永远。
+
+修法是已有的 `TerminalEvent::Wake`——但这暴露了形态二。
+
+### 形态二：中间层吞掉了唤醒，理由在写下时是对的
+
+`PermissionBridge::handle_event` 有一行注释："a wake carries no state of its own, so
+there is nothing below to hand it to"，然后 return，不转发给 base。在 broker 是唯一
+nudge 生产者时这句话完全正确。出现第二个生产者的那一刻它变成错的，而注释仍然读起来像
+对的——这是最难删掉的一类注释。
+
+实测症状：rust-analyzer 已经拉起（pgrep 看得到进程）、报告已经入队、屏幕上什么都没有。
+三个组件各自都"正确"。
+
+### 形态三：两个消费者排空同一个队列
+
+`DialogHost::drain_outcomes` 取走整个队列。router 消费 picker 的选择，permission bridge
+消费权限决定。谁先跑，谁就把另一个的答案丢掉——表现为 5 个测试在等一个**已经作出的**决定
+上超时。修法是 `requeue_outcomes` 把不认领的按原顺序放回，并用 `OWNED_DIALOGS` 显式声明
+所有权，而不是靠"我打开的我消费"（权限提示是通过 `host_mut()` 打开的，栈是真共享的）。
+
+### 可复用的判据（扩展前一轮的三问）
+
+对任何 `mpsc` / 队列接线，除了容量与背压策略（backpressure.rs 已强制），还要问：
+1. 消费者的**触发条件**是什么？如果是"另一个事件到达"，那个事件一定会到吗？
+2. 生产者入队之后有没有主动唤醒消费者？唤醒会被中间层吞掉吗？
+3. 这个队列有几个消费者？第一个排空它时，会不会丢掉第二个要的东西？
+
+第 1 条和第 3 条都不会被"每一端单独测一遍"发现，只能靠端到端：真实终端 + 真实
+rust-analyzer，或 bridge → host → screen → drain → transcript 走完整条路的断言。
+
+## 断言用错单位，等于没有断言
+
+`padded` 用 `chars().count()` 补齐，CJK 字形占两格，于是每个宽字形让行多出一列——实测
+skill 描述冲出右边界、折行、把整帧下推。
+
+真正的教训在测试上：既有断言是 `padded("日本", 4)` 有 4 个**字符**。它的名字叫
+`views_padded_counts_characters_not_bytes`，抓得住"按字节数"，恰好放过"按字符数"。
+一个用错单位的断言比没有断言更危险，因为它占着位置、看起来在防这件事。改成断言**终端
+列数**后，两种错都能抓到，原意（不要按字节）完整保留。
+
+## usage 在 finish_reason 之后到达，整条记账链路因此为空
+
+OpenAI 兼容端点把 `usage` 放在带 finish_reason 的 chunk **之后**的一帧里
+（`stream_options.include_usage` 的约定：choices 为空、usage 有值），再之后才是 `[DONE]`。
+`loop.rs` 在 `MessageEnd` 处 return，这一帧连同 `StreamEvent::TokenUsage` 一起被丢掉。
+
+被丢掉的不只是状态条显示：`StepAccumulator` 的四个 token 字段、`update_usage` 写
+`message.tokens` 的实现，全都测过而永远收不到数据。实测本机 9 个会话的数据库，每一条
+assistant 记录都是 `input: 0, output: 0`；下游还有成本统计与压缩阈值。
+
+**为什么测试没抓到**：既有 projector 测试在 `MessageEnd` **之前** apply `TokenUsage`。
+这个顺序没有任何真实 provider 会产生，所以它证明了 projector 正确，同时盖住了上游正在
+丢事件。写 stream 层测试时，事件顺序本身就是被测契约的一部分，不能选一个方便的顺序。
+
+修法：`MessageEnd` 不结束这一步，而是开启 8 帧的有上限尾部读取。有上限是因为"说完了却
+继续发"的 provider 不能把回合拖住；尾部阶段的错误不再让回合失败——答案已经完整落库，
+此时只剩记账。
+
+## 并发写者：同一个 worktree 被两个 agent 同时改
+
+本轮开局在 r17 里写了 5 个文件，随后发现 `ambient.rs`、`key_label`、`SIDEBAR_MIN_WIDTH`
+不是我写的——另一个 agent 正在同一个 worktree 做同一个任务。更糟的是我们都创建了
+`views/welcome.rs`，我的 `cp` 覆盖了对方的文件。
+
+**自保手法**（本轮验证有效）：
+1. 发现异常文件后立刻新建自己的 worktree，`cp` 走自己的新文件；
+2. 用 python 精确字符串替换把自己的改动从共享文件里**逐块回退**，而不是 `git checkout`
+   ——后者会连对方的改动一起丢；
+3. 对每一块 assert `count(old)==1`，找不到就报错而不是静默跳过。
+
+另一个教训：对方的成果最后进了 main（8 个提交），而我的分支基线落后。此时正确动作是
+**rebase 到 main 并只移植 main 没有的部分**，而不是强推自己的版本。实际只有 6 项是
+additive 的：engine 的 usage 修复、列宽度量、命令面板、picker 按 value 搜索、LSP 诊断、
+全屏权限提示取高。其余（欢迎屏、四个选择器、思考折叠）main 的实现更好，直接用它的。
+
+判断"谁的更好"要看运行结果而不是代码：main 的欢迎屏 49/50 行且带侧栏，我的 23/50 行。
