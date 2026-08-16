@@ -359,3 +359,64 @@ fn views_picker_escape_cancels_because_its_footer_says_it_does() {
         "escape did not cancel the picker"
     );
 }
+
+#[test]
+fn picker_finds_a_model_by_the_id_the_engine_takes_not_only_by_its_display_name() {
+    // Measured: filtering the live model picker for `haiku-4-5` — the form `--model` and
+    // the config file use — reported `Models (0) — haiku-4-5` while the model was present
+    // under the label `Claude Haiku 4.5`.
+    let mut dialog = model_picker(
+        ViewContext::defaults(),
+        vec![
+            ModelEntry {
+                id: String::from("myopenai/global.anthropic.claude-haiku-4-5-20251001-v1:0"),
+                name: String::from("Claude Haiku 4.5"),
+                provider: String::from("myopenai"),
+            },
+            ModelEntry {
+                id: String::from("amazon-bedrock/amazon.nova-2-lite-v1:0"),
+                name: String::from("Nova 2 Lite"),
+                provider: String::from("amazon-bedrock"),
+            },
+        ],
+    );
+    dialog.set_filter("haiku-4-5");
+    let found = dialog.selected().expect("the id form matched nothing");
+    assert_eq!(
+        found.value,
+        "myopenai/global.anthropic.claude-haiku-4-5-20251001-v1:0"
+    );
+    // The display name still works, and still wins when both could match.
+    dialog.set_filter("Nova 2");
+    assert_eq!(
+        dialog.selected().expect("the label matched nothing").value,
+        "amazon-bedrock/amazon.nova-2-lite-v1:0"
+    );
+}
+
+#[test]
+fn picker_ranks_a_label_match_above_a_value_match() {
+    // Otherwise a query that appears in one model's id and another's name would surface
+    // the id match first, which is the less likely intent.
+    let mut dialog = model_picker(
+        ViewContext::defaults(),
+        vec![
+            ModelEntry {
+                id: String::from("p/contains-sonnet-inside-the-id"),
+                name: String::from("Something Else"),
+                provider: String::from("p"),
+            },
+            ModelEntry {
+                id: String::from("p/anthropic.x"),
+                name: String::from("Sonnet"),
+                provider: String::from("p"),
+            },
+        ],
+    );
+    dialog.set_filter("sonnet");
+    assert_eq!(
+        dialog.selected().expect("nothing matched").label,
+        "Sonnet",
+        "a value match outranked a label match"
+    );
+}

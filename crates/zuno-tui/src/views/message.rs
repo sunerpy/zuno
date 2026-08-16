@@ -1351,8 +1351,13 @@ impl Component for StatusView {
                 self.reset(true);
                 EventResult::REDRAW
             }
+            // Both the live field and the configured one. The live field is what the strip
+            // shows during a turn and is cleared when the turn ends; the configured one
+            // survives that reset, so a mid-session switch is still reported once the
+            // turn it applies to has finished.
             TurnEvent::AgentResolved { agent, .. } => {
                 self.agent = Some(agent.clone());
+                self.configured_agent = Some(agent.clone());
                 EventResult::REDRAW
             }
             TurnEvent::ModelResolved {
@@ -1360,7 +1365,9 @@ impl Component for StatusView {
                 model_id,
                 ..
             } => {
-                self.model = Some(format!("{provider_id}/{model_id}"));
+                let label = format!("{provider_id}/{model_id}");
+                self.model = Some(label.clone());
+                self.configured_model = Some(label);
                 EventResult::REDRAW
             }
             TurnEvent::StepCompleted { step, .. } => {

@@ -619,11 +619,25 @@ fn views_status_strip_never_reads_idle_while_a_turn_is_under_way() {
             .redraw
     );
     assert!(!status.is_running());
-    assert_eq!(
-        rendered(&mut status).trim(),
-        StatusView::IDLE,
-        "the finished turn's agent stayed on the strip, so it still describes a turn \
-         that is over"
+    // The intent here is unchanged: the strip must never describe a turn that is over.
+    // What changed is that the agent a *later* turn will run as now survives the reset,
+    // because the alternative — a strip whose only pre-turn state is the bare word
+    // `idle` — answers neither of the questions a user has before pressing enter. So the
+    // assertion is now that `idle` is stated explicitly and that the finished turn's
+    // *step* is gone, which is the part that would genuinely have been a lie.
+    let after = rendered(&mut status);
+    assert!(
+        after.contains(StatusView::IDLE),
+        "the strip does not say that nothing is running: [{after}]"
+    );
+    assert!(
+        !after.contains("step"),
+        "the finished turn's step stayed on the strip, so it still describes a turn \
+         that is over: [{after}]"
+    );
+    assert!(
+        after.contains("build"),
+        "the agent the next turn will run as is not shown: [{after}]"
     );
 }
 
@@ -854,5 +868,113 @@ fn views_transcript_collapses_long_tool_output_and_says_how_much_it_hid() {
     assert!(
         !expanded.contains("more lines"),
         "an expanded block still claims to be hiding rows:\n{expanded}"
+    );
+}
+
+#[test]
+fn views_status_strip_keeps_a_resolved_model_after_the_turn_that_resolved_it_ends() {
+    // Measured live: choosing a model in the picker printed
+    // `session: model is now myopenai/…` on the strip while the strip's own model field
+    // still read `amazon-bedrock/amazon.nova-2-lite-v1:0`. A strip that contradicts the
+    // line beside it is worse than one that says nothing.
+    let mut view = StatusView::new(ViewContext::defaults());
+    view.handle_event(&AppEvent::Engine(TurnEvent::ModelResolved {
+        step: 0,
+        provider_id: String::from("myopenai"),
+        model_id: String::from("global.anthropic.claude-haiku-4-5-20251001-v1:0"),
+    }));
+    view.handle_event(&AppEvent::Engine(TurnEvent::AgentResolved {
+        step: 0,
+        agent: String::from("explore"),
+    }));
+    view.handle_event(&AppEvent::Engine(TurnEvent::TurnCompleted {
+        assistant_message_id: String::from("msg_1"),
+        steps: 1,
+    }));
+    let line = view.line(160);
+    let text = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    assert!(
+        text.contains("myopenai/global.anthropic.claude-haiku-4-5-20251001-v1:0"),
+        "the resolved model did not survive the turn's end: [{text}]"
+    );
+    assert!(
+        text.contains("explore"),
+        "the resolved agent did not survive the turn's end: [{text}]"
+    );
+    assert!(
+        text.contains(StatusView::IDLE),
+        "the strip does not report that nothing is running: [{text}]"
+    );
+}
+
+#[test]
+fn views_status_strip_reports_cumulative_token_usage_and_never_loses_the_exit_hint() {
+    let mut view = StatusView::new(ViewContext::defaults());
+    for _ in 0..3 {
+        view.handle_event(&AppEvent::Engine(provider(StreamEvent::TokenUsage {
+            input_tokens: Some(1_000),
+            output_tokens: Some(250),
+            cache_read_input_tokens: Some(10),
+            cache_write_input_tokens: Some(5),
+        })));
+    }
+    assert_eq!(
+        view.usage(),
+        crate::views::message::TokenUsage {
+            input: 3_000,
+            output: 750,
+            cache_read: 30,
+            cache_write: 15,
+        },
+        "usage is per-step rather than cumulative"
+    );
+    let text = view
+        .line(160)
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    assert!(text.contains("in 3,000"), "[{text}]");
+    assert!(text.contains("out 750"), "[{text}]");
+    assert!(text.contains("cache 45"), "[{text}]");
+    assert!(text.contains(StatusView::EXIT_HINT), "[{text}]");
+
+    // Under width pressure the counts go before the exit key, never the other way round.
+    let narrow = view
+        .line(40)
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    assert!(
+        narrow.contains(StatusView::EXIT_HINT),
+        "the exit hint was dropped before the token counts: [{narrow}]"
+    );
+    assert!(!narrow.contains("in 3,000"), "[{narrow}]");
+}
+
+#[test]
+fn views_status_strip_omits_a_cache_column_a_provider_never_reported() {
+    let mut view = StatusView::new(ViewContext::defaults());
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::TokenUsage {
+        input_tokens: Some(12),
+        output_tokens: Some(3),
+        cache_read_input_tokens: None,
+        cache_write_input_tokens: None,
+    })));
+    let text = view
+        .line(160)
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    assert!(text.contains("in 12 out 3"), "[{text}]");
+    assert!(
+        !text.contains("cache"),
+        "a permanent `cache 0` is a column of noise: [{text}]"
     );
 }

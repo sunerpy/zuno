@@ -223,9 +223,17 @@ impl SelectDialog {
                 // The description is searched too, matching upstream's behaviour for
                 // slash commands (`autocomplete.tsx:506-507`): a user looking for
                 // "the one that forks" does not know it is called `session_fork`.
+                //
+                // And the value, at the same weight as the description. A model's label is
+                // its display name (`Claude Haiku 4.5`) while its value is the id the
+                // engine takes (`…claude-haiku-4-5-20251001-v1:0`), and a user who knows
+                // the id — because that is what `--model` and the config file spell —
+                // otherwise types it and is told there are no matches. "No results" and
+                // "searching the wrong field" look identical from the outside.
                 let best = score(&item.label, filter)
                     .into_iter()
                     .chain(score(&item.description, filter).map(|value| value / 2))
+                    .chain(score(&item.value, filter).map(|value| value / 2))
                     .max()?;
                 Some((best, index))
             })

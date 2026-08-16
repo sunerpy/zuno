@@ -1690,3 +1690,181 @@ fn loop_test_fixture_uses_no_live_network_provider() {
     assert_eq!(Value::Null, Value::Null);
     assert_eq!(Role::User, Role::User);
 }
+
+/// Usage arriving *after* the finish reason, which is where every OpenAI-compatible
+/// endpoint puts it (`stream_options.include_usage` sends a final chunk whose `choices`
+/// is empty and whose `usage` is populated).
+///
+/// The existing projector test applies `TokenUsage` *before* `MessageEnd` — an ordering
+/// no real provider produces — so it proved the projector worked while the loop was
+/// discarding the event upstream of it. Measured consequence: every assistant row in a
+/// nine-session database carried `input: 0, output: 0`.
+fn trailing_usage_responses() -> Vec<ScriptedResponse> {
+    vec![ScriptedResponse::complete(vec![
+        StreamEvent::TextDelta("The answer is 3.".to_owned()),
+        StreamEvent::MessageEnd {
+            stop_reason: Some(FinishReason::Stop),
+        },
+        StreamEvent::TokenUsage {
+            input_tokens: Some(4210),
+            output_tokens: Some(186),
+            cache_read_input_tokens: Some(1024),
+            cache_write_input_tokens: Some(64),
+        },
+    ])]
+}
+
+#[tokio::test]
+async fn loop_records_token_usage_that_arrives_after_the_finish_reason() {
+    let mut connection = seeded();
+    put_user(&connection, "msg_user", 10, "what resolver version?");
+    let provider = Arc::new(FakeProvider::new(trailing_usage_responses()));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        request("turn-usage"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, events) = tokio::join!(turn, collect_events(receiver));
+    assert_eq!(
+        outcome.expect("the turn succeeds"),
+        TurnOutcome::Completed {
+            assistant_message_id: "msg_turn-usage_0001".to_owned(),
+            steps: 1,
+        },
+        "reading past the finish reason must not change how the turn ends"
+    );
+
+    // The event must reach whoever is watching — the TUI's status strip reads it there.
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            TurnEvent::Provider {
+                event: StreamEvent::TokenUsage {
+                    input_tokens: Some(4210),
+                    output_tokens: Some(186),
+                    ..
+                },
+                ..
+            }
+        )),
+        "the trailing usage event was never published:\n{events:#?}"
+    );
+
+    // And it must reach the row `update_usage` writes, which is what every later
+    // consumer — cost reporting, compaction thresholds — reads.
+    let hydrated = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .expect("hydrate the finished turn");
+    let assistant = hydrated
+        .iter()
+        .find(|message| message.info.role.as_str() == "assistant")
+        .expect("one assistant message");
+    let tokens = assistant
+        .info
+        .data
+        .get("tokens")
+        .and_then(serde_json::Value::as_object)
+        .expect("the assistant row carries a tokens object");
+    assert_eq!(
+        tokens.get("input").and_then(serde_json::Value::as_u64),
+        Some(4210),
+        "input tokens were dropped: {tokens:?}"
+    );
+    assert_eq!(
+        tokens.get("output").and_then(serde_json::Value::as_u64),
+        Some(186),
+        "output tokens were dropped: {tokens:?}"
+    );
+    let cache = tokens
+        .get("cache")
+        .and_then(serde_json::Value::as_object)
+        .expect("a cache object");
+    assert_eq!(
+        cache.get("read").and_then(serde_json::Value::as_u64),
+        Some(1024)
+    );
+    assert_eq!(
+        cache.get("write").and_then(serde_json::Value::as_u64),
+        Some(64)
+    );
+}
+
+#[tokio::test]
+async fn loop_does_not_wait_forever_for_a_provider_that_streams_past_its_own_finish() {
+    // The bound on the trailing drain. A provider that keeps sending after saying it
+    // finished must not be able to hold the turn open, so the step ends once the budget
+    // is spent rather than following the stream.
+    let mut connection = seeded();
+    put_user(&connection, "msg_user", 10, "hello");
+    let mut events = vec![
+        StreamEvent::TextDelta("done".to_owned()),
+        StreamEvent::MessageEnd {
+            stop_reason: Some(FinishReason::Stop),
+        },
+    ];
+    events.extend((0..64).map(|_| StreamEvent::StatusDetail {
+        detail: "keep-alive".to_owned(),
+    }));
+    let provider = Arc::new(FakeProvider::new(vec![ScriptedResponse {
+        events: events.into_iter().map(Ok).collect(),
+        hang_after: true,
+    }]));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        request("turn-chatty"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let finished = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(turn, collect_events(receiver))
+    })
+    .await;
+    let (outcome, published) = finished.expect("the turn must not hang on a chatty provider");
+    assert_eq!(
+        outcome.expect("the turn succeeds"),
+        TurnOutcome::Completed {
+            assistant_message_id: "msg_turn-chatty_0001".to_owned(),
+            steps: 1,
+        }
+    );
+    let trailing = published
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                TurnEvent::Provider {
+                    event: StreamEvent::StatusDetail { .. },
+                    ..
+                }
+            )
+        })
+        .count();
+    assert!(
+        trailing <= usize::from(zuno_engine::r#loop::TRAILING_FRAME_BUDGET),
+        "the drain read {trailing} trailing frames, past its budget of {}",
+        zuno_engine::r#loop::TRAILING_FRAME_BUDGET
+    );
+}

@@ -170,6 +170,15 @@ pub enum TurnEvent {
     },
 }
 
+/// Frames read after a message finishes, for the bookkeeping that follows it.
+///
+/// An OpenAI-compatible endpoint sends `usage` in a chunk after the finish reason and
+/// `[DONE]` after that, so two is the real requirement; the budget is larger to absorb
+/// a keep-alive or an upstream-provider frame without losing the usage behind it. It is
+/// bounded at all because a provider that keeps streaming after saying it finished must
+/// not be able to hold a turn open.
+pub const TRAILING_FRAME_BUDGET: u8 = 8;
+
 /// A normal terminal state of [`run_turn`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnOutcome {
@@ -801,6 +810,9 @@ pub async fn run_turn(
                 let accumulator = Arc::clone(&accumulator);
                 async move {
                     let mut stream = provider.stream(completion);
+                    // `Some(n)` once the message has finished: how many more frames may be
+                    // read for their bookkeeping before the step ends regardless.
+                    let mut trailing: Option<u8> = None;
                     loop {
                         let next = tokio::select! {
                             biased;
@@ -810,6 +822,14 @@ pub async fn run_turn(
                         let Some(next) = next else {
                             return Ok(Ok(false));
                         };
+                        // An error *after* the message has finished is not the turn's
+                        // failure: the answer is already complete and persisted, and the
+                        // only thing still outstanding is bookkeeping. Failing the turn
+                        // over a truncated trailing frame would throw away a reply the
+                        // user has already read.
+                        if trailing.is_some() && next.is_err() {
+                            return Ok(Ok(false));
+                        }
                         let event = match next {
                             Ok(event) => event,
                             Err(error @ ProviderError::Transient { status: None, .. })
@@ -833,8 +853,30 @@ pub async fn run_turn(
                         if let Err(error) = events.send(TurnEvent::Provider { step, event }).await {
                             return Ok(Err(error));
                         }
+                        // `MessageEnd` is not the last frame an OpenAI-compatible endpoint
+                        // sends: `usage` arrives in a chunk *after* the one carrying the
+                        // finish reason, and `[DONE]` after that. Returning here read the
+                        // finish reason and discarded everything behind it, so
+                        // `StreamEvent::TokenUsage` — and therefore
+                        // `StepAccumulator`'s token fields, and therefore the `tokens`
+                        // column `update_usage` writes — could never be reached on those
+                        // providers. Measured: every assistant row in a nine-session
+                        // database had `input: 0, output: 0`.
+                        //
+                        // So a finished message starts a bounded trailing drain rather
+                        // than ending the step. Bounded because a provider that keeps
+                        // streaming after saying it finished must not hold the turn open:
+                        // the count is generous next to the one-or-two frames a real
+                        // endpoint sends, and the provider's own idle timeout still
+                        // governs how long any single frame may take to arrive.
                         if ended {
-                            return Ok(Ok(false));
+                            trailing = Some(TRAILING_FRAME_BUDGET);
+                        }
+                        if let Some(remaining) = trailing.as_mut() {
+                            if *remaining == 0 {
+                                return Ok(Ok(false));
+                            }
+                            *remaining -= 1;
                         }
                     }
                 }
