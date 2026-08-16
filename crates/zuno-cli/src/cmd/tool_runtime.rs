@@ -56,6 +56,12 @@ pub(crate) struct ToolRuntime {
     pub(crate) tools: Vec<Arc<dyn Tool>>,
     /// The merged ruleset the dispatcher re-evaluates before every call.
     pub(crate) rules: Vec<Rule>,
+    /// Same-name replacements made while assembling, for the host to surface.
+    ///
+    /// Carried out of assembly rather than printed inside it: a shadowed built-in is
+    /// a defect a user must see, but which surface can say so — stderr, a transcript
+    /// line — is the host's decision, not the registry's.
+    pub(crate) suppressions: Vec<String>,
 }
 
 pub(crate) struct ToolSelection<'a> {
@@ -156,12 +162,21 @@ pub(crate) fn assemble(
     }
 
     let registry = builder.build();
+    let suppressions = registry
+        .diagnostics()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
     let tools = registry.resolve(ResolveInput::new(
         selection.model_id,
         selection.provider_id,
         &rules,
     ));
-    Ok(ToolRuntime { tools, rules })
+    Ok(ToolRuntime {
+        tools,
+        rules,
+        suppressions,
+    })
 }
 
 struct ProductionCustomTools {

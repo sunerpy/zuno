@@ -454,6 +454,41 @@ fn views_scrollbar_hides_its_thumb_when_everything_fits() {
     );
 }
 
+/// A warning has to survive in the transcript, not flash past on the status strip.
+///
+/// The registry's shadowing diagnostic used to be an `eprintln!`, which under the
+/// alternate screen meant the user inherited it on exit with no context. It now
+/// travels as a status detail — and the strip holds exactly one, so a warning left
+/// only there is overwritten by the next detail and effectively lost. This asserts it
+/// lands in the transcript, is attributed to neither party, and is not overwritten.
+#[test]
+fn views_transcript_keeps_a_warning_detail_that_the_status_strip_would_overwrite() {
+    let mut transcript = TranscriptView::new(ViewContext::defaults());
+    let warning = "warning: tool `grep` from built-in suppressed by same-named tool from plugin";
+    for detail in [warning, "session titled: something else"] {
+        transcript.handle_event(&AppEvent::Engine(TurnEvent::Provider {
+            step: 0,
+            event: StreamEvent::StatusDetail {
+                detail: detail.to_owned(),
+            },
+        }));
+    }
+
+    let joined = rows(&render_offscreen(&mut transcript, 90, 8).expect("infallible")).join("\n");
+    assert!(
+        joined.contains("suppressed by same-named tool from plugin"),
+        "the shadowing warning is not visible in the transcript:\n{joined}"
+    );
+    assert!(
+        joined.contains("! Session"),
+        "the warning must be attributed to the session, not to the user or the model:\n{joined}"
+    );
+    assert!(
+        !joined.contains("session titled"),
+        "an ordinary status detail must stay on the strip, not fill the transcript:\n{joined}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The status strip
 // ---------------------------------------------------------------------------

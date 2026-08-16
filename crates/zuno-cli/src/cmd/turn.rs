@@ -638,6 +638,16 @@ impl TurnHost {
                 goal_store: Arc::clone(&goal_store),
             },
         )?;
+        // Joins the notes so shadowing reaches whatever surface is watching: the
+        // headless runs print them, and the TUI draws them in the transcript. This is
+        // what replaces the registry's own `eprintln!` without going quiet.
+        let mut notes = plan.notes;
+        notes.extend(
+            runtime_tools
+                .suppressions
+                .iter()
+                .map(|suppression| format!("warning: {suppression}")),
+        );
         let mut dispatcher = ToolRegistryDispatcher::new(
             runtime_tools.tools,
             runtime_tools.rules,
@@ -663,7 +673,7 @@ impl TurnHost {
             compaction_config: plan.config.compaction.clone().unwrap_or_default(),
             compaction_state: CompactionState::default(),
             window: plan.window,
-            notes: plan.notes,
+            notes,
             plugins: plan.plugins,
             commands,
             goal_store,

@@ -429,7 +429,18 @@ fn insert_tool(
             suppressed_source: *existing_source,
             winning_source: source,
         };
-        eprintln!("warning: {diagnostic}");
+        // A shadowed built-in was a real defect that a quiet log hid, so this stays
+        // observable two ways: durably in the log, and as structured data the host is
+        // expected to surface. What it must not do is write to the terminal itself —
+        // a library that owns stdout cannot be hosted by a TUI, and this printed onto
+        // the primary screen, where the lines lay hidden behind the alternate screen
+        // until the user exited and inherited them without context.
+        tracing::warn!(
+            tool = %diagnostic.tool,
+            suppressed_source = %diagnostic.suppressed_source,
+            winning_source = %diagnostic.winning_source,
+            "tool suppressed by a same-named tool from a later source"
+        );
         diagnostics.push(diagnostic);
         *existing = tool;
         *existing_source = source;

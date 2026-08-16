@@ -176,6 +176,14 @@ where
                     ..
                 } => write_retry_notice(stderr, attempt, max, stderr_is_terminal)
                     .map_err(to_string)?,
+                // Status details were only ever rendered by `--json`, so anything the
+                // prelude reported — a suppressed tool, a skipped internal — was
+                // invisible to a plain run. stderr, because stdout is the model's
+                // answer and a caller pipes it.
+                TurnEvent::Provider {
+                    event: StreamEvent::StatusDetail { detail },
+                    ..
+                } => writeln!(stderr, "{detail}").map_err(to_string)?,
                 TurnEvent::ToolDispatchStarted { name, .. } => {
                     writeln!(stderr, "[{name}] started").map_err(to_string)?;
                 }

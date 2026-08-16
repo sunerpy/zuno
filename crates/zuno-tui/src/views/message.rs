@@ -55,6 +55,8 @@ pub enum Role {
     User,
     /// The model.
     Assistant,
+    /// The session itself, for something neither party said.
+    System,
 }
 
 impl Role {
@@ -67,6 +69,7 @@ impl Role {
             // off-screen assertion able to tell them apart positionally.
             Self::User => ">",
             Self::Assistant => "*",
+            Self::System => "!",
         }
     }
 }
@@ -180,6 +183,15 @@ pub enum MessagePart {
     },
     /// A provider replay that is waiting or starting now.
     Retry { attempt: u32, max: u32 },
+    /// Something the session needs the user to know, from neither party.
+    ///
+    /// A part of its own rather than text on an assistant or user message, because a
+    /// warning attributed to either is a lie about who said it — and a warning the
+    /// host writes to stderr instead is one the alternate screen hides.
+    Notice {
+        /// The message, already human-readable.
+        text: String,
+    },
 }
 
 impl MessagePart {
@@ -222,6 +234,16 @@ impl Message {
             role: Role::User,
             id: None,
             parts: vec![MessagePart::Text { text: text.into() }],
+        }
+    }
+
+    /// A session notice carrying one line the user has to see.
+    #[must_use]
+    pub fn notice(text: impl Into<String>) -> Self {
+        Self {
+            role: Role::System,
+            id: None,
+            parts: vec![MessagePart::Notice { text: text.into() }],
         }
     }
 
@@ -426,6 +448,15 @@ impl Transcript {
                 });
                 true
             }
+            // Warnings go in the transcript, not only on the status strip: the strip
+            // holds one detail and the next one overwrites it, so a suppressed tool
+            // would appear for a moment and then be gone. The rest of the details are
+            // transient by nature and stay on the strip alone.
+            StreamEvent::StatusDetail { detail } if detail.starts_with("warning: ") => {
+                self.messages.push(Message::notice(detail.clone()));
+                self.streaming = None;
+                true
+            }
             _ => false,
         }
     }
@@ -577,6 +608,7 @@ impl TranscriptView {
         let label = match message.role {
             Role::User => "You",
             Role::Assistant => "Assistant",
+            Role::System => "Session",
         };
         padded(
             &format!("{} {label}", message.role.marker()),
@@ -666,6 +698,11 @@ impl TranscriptView {
                     width,
                     self.context.error(),
                 ));
+            }
+            MessagePart::Notice { text } => {
+                for row in wrap(text, width.saturating_sub(4)) {
+                    out.push(padded(&format!("  ! {row}"), width, self.context.warning()));
+                }
             }
         }
     }
