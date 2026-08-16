@@ -8049,3 +8049,43 @@ opencode 插件，新插件推荐用 Rust（`zuno-plugin-sdk`），并链到 `do
   之一，`keybind_tests.rs:229` 钉住这个数字），所以只能通过用户自定义绑定或命令面板触发。
   路由已打通并有测试，但实机截图只能证明路由存在，不能证明有默认键。
 - 会话切换给的是空列表：无法在不丢弃可能正在运行的 turn 的前提下切会话。
+
+## 同一个缺陷在一次修复里犯了两遍：路由与 scope 是两个独立必要条件
+
+r17-solo 收尾自查时发现，我自己上一批提交复刻了本任务正要消除的缺陷形态：
+欢迎页快捷键网格宣传 `ctrl+p commands` / `help` / `mcp`，而 `command_list`、
+`help_show`、`mcp_list` 在 SessionScreen 里都没有处理分支。实机按 ctrl+p 毫无反应。
+
+**更值得记的是修复过程本身又犯了一次**：给 `mcp_list` 加了 handle_action 分支后，
+实机按 `<leader>k` 仍然把 `k` 打进了 prompt —— 因为 `scopes()` 里漏了 `"mcp"`。
+`mcp_list` 的 scope 是 `mcp`，不在链里，KeyDispatcher 永远解析不到。
+**"加了 handle_action 分支" ≠ "键通了"**，这两件事必须分别验证。
+
+### 第一版 guard 为什么没抓到（比缺陷本身更重要）
+我写的第一个 guard 直接调 `screen.handle_action(definition, ...)`，
+**绕过了整条 scope 解析链**，所以 `mcp_list` 在 guard 里"已路由"而在实机里按不动。
+一个从错误的层进入的断言，会精确地放过这一层之下的缺陷。
+
+最终补了三层，缺一层都不够：
+1. 动作被 `handle_action` 路由（能抓：忘记写分支）；
+2. 动作的 scope 被 `scopes()` 覆盖（能抓：忘记加 scope）；
+3. **用 `KeyDispatcher` 按真实和弦走一遍并要求被消费**（能抓前两者，是唯一
+   与用户实际按键路径同构的断言）。
+第 3 层写的时候踩了两个坑：`<leader>m` 必须用 `keybind::parse_sequence(spelling,
+keymap.leader())` 展开，直接 `Chord::parse("<leader>m")` 会把 token 当字面量，
+让一个实机验证过的键"失败"；`input_submit` 在空 prompt 上合法地什么都不做，
+断言前必须先经 dispatcher 打一个字符，否则会因非缺陷原因失败。
+三个 guard 都做过反向验证（移除 mcp 路由 / 移除 mcp scope 分别失败）。
+
+### 顺带查清的一件事：TUI 不读 tui.json
+`cmd/tui.rs:81` 用的是 `ResolvedTuiConfig::default()`，而 `tui.json` 的发现与多文件
+合并按 `config.rs` 模块文档的 `# Scope` 明确"不在该模块范围内"，且**没有任何一层实现它**
+（`grep keybinds crates/zuno-cli/src/` 为空）。所以 `ResolvedTuiConfig::keybinds`
+在生产路径上永远是空的，`key_label` 的覆盖分支可达且有测试，但当前每个提示渲染的
+都是内置默认拼写。已在 `key_label` 文档里写明这一点——它原来的措辞是过度承诺。
+后续要做 tui.json 发现的人：`Keymap::from_config(&config)` 已经存在且可用，
+缺的只是"走目录、合并文件"那一层。
+
+### 可复用的判据
+凡是"UI 宣传了某个键"的改动，必须问三个问题：动作有处理分支吗？它的 scope 在链里吗？
+按真实和弦走 dispatcher 会被消费吗？只答前一个就提交，是本仓库第十二次同形缺陷。
