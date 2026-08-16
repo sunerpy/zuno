@@ -1206,9 +1206,9 @@ export default {
             .arg("zuno-integration-rust-wrapper")
             .arg(pid_file.as_os_str())
             .arg(env!("CARGO_BIN_EXE_zuno-example-plugin"))
-            .env("OC_EXAMPLE_PLUGIN_ID", "integration-rust")
+            .env("ZUNO_EXAMPLE_PLUGIN_ID", "integration-rust")
             .env(
-                "OC_EXAMPLE_SLEEP_HOOK_MS",
+                "ZUNO_EXAMPLE_SLEEP_HOOK_MS",
                 hook_sleep.as_millis().to_string(),
             )
             .timeout(Duration::from_secs(4))

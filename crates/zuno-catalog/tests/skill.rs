@@ -448,7 +448,7 @@ fn parse_file_round_trips_a_good_skill() {
 }
 
 /// Names the roots of an opt-in real-world corpus, `PATH`-separated.
-const SKILL_CORPUS_ENV: &str = "OC_SKILL_CORPUS";
+const SKILL_CORPUS_ENV: &str = "ZUNO_SKILL_CORPUS";
 
 /// An opt-in corpus check: every `SKILL.md` under the requested roots must parse.
 ///
@@ -466,7 +466,7 @@ const SKILL_CORPUS_ENV: &str = "OC_SKILL_CORPUS";
 /// check runs **only when asked for**, and once asked for it is **fail-closed**.
 /// Three states, all distinguishable from the outside:
 ///
-/// * `OC_SKILL_CORPUS` unset — announces a visible `SKIPPED` and asserts nothing.
+/// * `ZUNO_SKILL_CORPUS` unset — announces a visible `SKIPPED` and asserts nothing.
 /// * set to a root that is missing, is not a directory, or holds no `SKILL.md` —
 ///   **fails**, because a request that silently degrades into a pass is the
 ///   defect, not the fix.

@@ -106,7 +106,7 @@ const fn window(workload: WorkloadName) -> Duration {
 
 /// Locate the **released** TypeScript binary this baseline measures.
 ///
-/// `OC_TESTKIT_ORACLE` is honoured because the not-found error's own remedy tells
+/// `ZUNO_TESTKIT_ORACLE` is honoured because the not-found error's own remedy tells
 /// the operator to set it, and because a `PATH` entry can resolve to a launcher
 /// shim rather than the binary. The from-source flavour is deliberately not
 /// honoured: running the TypeScript entry point under Bun would measure a

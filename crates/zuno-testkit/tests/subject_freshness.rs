@@ -9,9 +9,9 @@ use std::process::{Command, Output};
 
 use zuno_testkit::{Subject, subject::ENV_SUBJECT_BINARY};
 
-const CHILD_SCENARIO: &str = "OC_TESTKIT_SUBJECT_FRESHNESS_CHILD";
-const SUBJECT_PATH: &str = "OC_TESTKIT_SUBJECT_FRESHNESS_PATH";
-const BUILD_COUNT: &str = "OC_TESTKIT_SUBJECT_FRESHNESS_BUILD_COUNT";
+const CHILD_SCENARIO: &str = "ZUNO_TESTKIT_SUBJECT_FRESHNESS_CHILD";
+const SUBJECT_PATH: &str = "ZUNO_TESTKIT_SUBJECT_FRESHNESS_PATH";
+const BUILD_COUNT: &str = "ZUNO_TESTKIT_SUBJECT_FRESHNESS_BUILD_COUNT";
 const FRESH_BYTES: &[u8] = b"fresh subject built from the current sources";
 
 #[test]

@@ -80,7 +80,7 @@ share URL。两者都是**顶层命令**，不是 `session` 的子命令 —— 
 只有 `<!-- generated:BEGIN … -->` 与 `<!-- generated:END … -->` 标记之间的区域从代码生成并由
 `cargo test -p zuno-cli --test docs` 做字节级防漂移检查；该测试还针对少量关键章节做派生断言。
 标记外的说明性表格与 prose 仍需评审，不能因测试通过就视为已从代码生成。使用
-`OC_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs` 重新生成受管区域。
+`ZUNO_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs` 重新生成受管区域。
 
 ## 独立运行与插件接入
 
@@ -174,11 +174,11 @@ Windows Job Object 路径位于 `crates/zuno-process/tests/windows_containment.r
 
 ```sh
 # G1 + G2：仅当 mode 为 `run` 时执行。
-OC_MEMORY_GATE_MODE=run cargo test -p zuno-testkit --test memory -- --nocapture --test-threads=1
+ZUNO_MEMORY_GATE_MODE=run cargo test -p zuno-testkit --test memory -- --nocapture --test-threads=1
 
 # G3 + G4：真实 driver soak。该测试被 #[ignore]，会占用两个真实 language server、
 # 一个 50,000 文件 watcher、一个 PTY，以及两小时 wall clock。
-OC_MEMORY_GATE_MODE=skip cargo test -p zuno-testkit --test soak \
+ZUNO_MEMORY_GATE_MODE=skip cargo test -p zuno-testkit --test soak \
   g3_and_g4_real_driver_soak_stays_bounded_and_live -- \
   --ignored --exact --nocapture --test-threads=1
 

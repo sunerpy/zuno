@@ -28,15 +28,16 @@
 //!
 //! | Variable | Meaning |
 //! | :------- | :------ |
-//! | `OC_PROBE_LOG_DIR` | required; the log directory to write to |
-//! | `OC_PROBE_ROTATION` | optional; `daily`, `hourly` or `never` (default `never`, so the test knows the file name) |
-//! | `OC_PROBE_DIRECTIVES` | optional; raw filter directives, the only way to reach `TRACE` |
+//! | `ZUNO_PROBE_LOG_DIR` | required; the log directory to write to |
+//! | `ZUNO_PROBE_ROTATION` | optional; `daily`, `hourly` or `never` (default `never`, so the test knows the file name) |
+//! | `ZUNO_PROBE_DIRECTIVES` | optional; raw filter directives, the only way to reach `TRACE` |
 //! | `OPENCODE_LOG_LEVEL` | read by the library under test |
 //! | `OPENCODE_PRINT_LOGS` | read by the library under test |
 //!
-//! The `OC_PROBE_*` names are deliberately not in the `OPENCODE_*` namespace: they
-//! configure this test fixture, not the product, so they can never be mistaken for
-//! part of the oracle's flag surface.
+//! The `ZUNO_PROBE_*` names configure this fixture, never the product: no crate
+//! outside this file reads one. They are also outside the `OPENCODE_*` namespace the
+//! oracle's flag surface occupies, so neither half of the table can be mistaken for
+//! the other.
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -72,7 +73,7 @@ fn frame(body: &str) {
 }
 
 fn rotation_from_env() -> Rotation {
-    match std::env::var("OC_PROBE_ROTATION")
+    match std::env::var("ZUNO_PROBE_ROTATION")
         .unwrap_or_default()
         .to_ascii_lowercase()
         .as_str()
@@ -86,15 +87,15 @@ fn rotation_from_env() -> Rotation {
 }
 
 fn main() -> ExitCode {
-    let Ok(dir) = std::env::var("OC_PROBE_LOG_DIR") else {
-        eprintln!("OC_PROBE_LOG_DIR is required");
+    let Ok(dir) = std::env::var("ZUNO_PROBE_LOG_DIR") else {
+        eprintln!("ZUNO_PROBE_LOG_DIR is required");
         return ExitCode::FAILURE;
     };
 
     frame(r#"{"jsonrpc":"2.0","method":"probe/start","params":{"stage":"pre-init"}}"#);
 
     let mut config = LogConfig::from_env(&dir).with_rotation(rotation_from_env());
-    if let Ok(directives) = std::env::var("OC_PROBE_DIRECTIVES") {
+    if let Ok(directives) = std::env::var("ZUNO_PROBE_DIRECTIVES") {
         config = config.with_directives(directives);
     }
     let handle = match zuno_observability::init(config) {

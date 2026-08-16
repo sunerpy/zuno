@@ -106,9 +106,9 @@ fn run_probe(env: &[(&str, &str)]) -> ProbeRun {
     command
         .env_remove("ZUNO_LOG_LEVEL")
         .env_remove("ZUNO_PRINT_LOGS")
-        .env_remove("OC_PROBE_ROTATION")
-        .env_remove("OC_PROBE_DIRECTIVES")
-        .env("OC_PROBE_LOG_DIR", &log_dir);
+        .env_remove("ZUNO_PROBE_ROTATION")
+        .env_remove("ZUNO_PROBE_DIRECTIVES")
+        .env("ZUNO_PROBE_LOG_DIR", &log_dir);
     for (key, value) in env {
         command.env(key, value);
     }
@@ -150,7 +150,7 @@ fn assert_stdout_is_pure(run: &ProbeRun) {
 /// framing JSON, stdout carries no log bytes, and the log file carries all of them.
 #[test]
 fn logs_at_every_level_reach_the_file_and_never_stdout() {
-    let run = run_probe(&[("OC_PROBE_DIRECTIVES", "trace")]);
+    let run = run_probe(&[("ZUNO_PROBE_DIRECTIVES", "trace")]);
     assert!(
         run.success,
         "probe failed.\nstdout:\n{}\nstderr:\n{}",
@@ -324,7 +324,7 @@ fn trace_is_reachable_only_through_programmatic_directives() {
         "OPENCODE_LOG_LEVEL=TRACE must not enable trace; the oracle maps it to INFO"
     );
 
-    let via_directives = run_probe(&[("OC_PROBE_DIRECTIVES", "trace")]);
+    let via_directives = run_probe(&[("ZUNO_PROBE_DIRECTIVES", "trace")]);
     assert!(
         via_directives.success,
         "probe failed.\nstderr:\n{}",
@@ -429,8 +429,8 @@ fn the_rotating_policy_writes_a_dated_file_in_the_configured_directory() {
     let output = Command::new(env!("CARGO_BIN_EXE_zuno-log-probe"))
         .env_remove("ZUNO_LOG_LEVEL")
         .env_remove("ZUNO_PRINT_LOGS")
-        .env("OC_PROBE_LOG_DIR", &log_dir)
-        .env("OC_PROBE_ROTATION", "daily")
+        .env("ZUNO_PROBE_LOG_DIR", &log_dir)
+        .env("ZUNO_PROBE_ROTATION", "daily")
         .output()
         .expect("the probe binary runs");
     assert!(
@@ -477,7 +477,7 @@ fn an_unusable_log_directory_fails_with_the_path_in_the_message() {
     let output = Command::new(env!("CARGO_BIN_EXE_zuno-log-probe"))
         .env_remove("ZUNO_LOG_LEVEL")
         .env_remove("ZUNO_PRINT_LOGS")
-        .env("OC_PROBE_LOG_DIR", &blocker)
+        .env("ZUNO_PROBE_LOG_DIR", &blocker)
         .output()
         .expect("the probe binary runs");
 
@@ -505,13 +505,13 @@ fn an_unusable_log_directory_fails_with_the_path_in_the_message() {
 #[test]
 fn the_probe_refuses_to_run_without_a_log_directory() {
     let output = Command::new(env!("CARGO_BIN_EXE_zuno-log-probe"))
-        .env_remove("OC_PROBE_LOG_DIR")
+        .env_remove("ZUNO_PROBE_LOG_DIR")
         .output()
         .expect("the probe binary runs");
 
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("OC_PROBE_LOG_DIR"),
+        String::from_utf8_lossy(&output.stderr).contains("ZUNO_PROBE_LOG_DIR"),
         "the probe should name the variable it needs"
     );
 }

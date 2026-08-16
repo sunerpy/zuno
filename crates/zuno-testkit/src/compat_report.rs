@@ -35,11 +35,11 @@ use serde::Serialize;
 
 use crate::error::{Result, TestkitError};
 
-/// Where the report is written when `OC_COMPAT_REPORT` is unset.
+/// Where the report is written when `ZUNO_COMPAT_REPORT` is unset.
 pub const DEFAULT_RELATIVE_PATH: &str = "target/compat/compat-report.json";
 
 /// Environment variable overriding the report's destination.
-pub const PATH_ENV: &str = "OC_COMPAT_REPORT";
+pub const PATH_ENV: &str = "ZUNO_COMPAT_REPORT";
 
 /// The artifact's format version, so a consumer can refuse a shape it predates.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -222,7 +222,7 @@ impl CompatReport {
             .collect()
     }
 
-    /// The report's destination: `OC_COMPAT_REPORT`, else under the workspace root.
+    /// The report's destination: `ZUNO_COMPAT_REPORT`, else under the workspace root.
     ///
     /// # Errors
     ///

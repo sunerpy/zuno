@@ -71,7 +71,7 @@ use zuno_testkit::{
 
 /// Restated wherever a test skips, so a reader of the output knows what was
 /// wanted. Absence is skippable; disagreement is not.
-const NO_ORACLE: &str = "no opencode on PATH and no OC_TESTKIT_ORACLE override";
+const NO_ORACLE: &str = "no opencode on PATH and no ZUNO_TESTKIT_ORACLE override";
 
 /// The name each side is invoked by, for `zuno_testkit::mask_program_name`.
 const ORACLE_PROGRAM: &str = "opencode";

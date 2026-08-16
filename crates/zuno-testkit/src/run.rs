@@ -355,7 +355,7 @@ mod tests {
 
     #[test]
     fn running_a_process_captures_streams_and_the_exact_environment() {
-        let env: BTreeMap<String, String> = [("OC_TESTKIT_PROBE".to_owned(), "yes".to_owned())]
+        let env: BTreeMap<String, String> = [("ZUNO_TESTKIT_PROBE".to_owned(), "yes".to_owned())]
             .into_iter()
             .collect();
         let outcome = run_process(
@@ -372,7 +372,7 @@ mod tests {
         .expect("env(1) should run");
         assert!(outcome.is_success());
         assert!(
-            outcome.stdout.contains("OC_TESTKIT_PROBE=yes"),
+            outcome.stdout.contains("ZUNO_TESTKIT_PROBE=yes"),
             "{}",
             outcome.render()
         );

@@ -10,7 +10,7 @@ use zuno_tool::{AllowAll, NeverInterrupted, ToolContext};
 
 fn example_spec(id: &str) -> PluginProcessSpec {
     PluginProcessSpec::new(id, env!("CARGO_BIN_EXE_zuno-example-plugin"))
-        .env("OC_EXAMPLE_PLUGIN_ID", id)
+        .env("ZUNO_EXAMPLE_PLUGIN_ID", id)
 }
 
 #[tokio::test]
@@ -64,7 +64,7 @@ async fn jsonrpc_hung_hook_is_disabled_and_the_turn_completes() {
     let timeout = Duration::from_millis(60);
     let load = load_plugins_ordered(vec![
         example_spec("slow")
-            .env("OC_EXAMPLE_SLEEP_HOOK_MS", "500")
+            .env("ZUNO_EXAMPLE_SLEEP_HOOK_MS", "500")
             .timeout(timeout),
     ])
     .await;
@@ -104,7 +104,7 @@ async fn jsonrpc_hung_hook_is_disabled_and_the_turn_completes() {
 #[tokio::test]
 async fn jsonrpc_startup_panic_is_reported_and_other_plugins_still_load() {
     let load = load_plugins_ordered(vec![
-        example_spec("panic").env("OC_EXAMPLE_PANIC_STARTUP", "1"),
+        example_spec("panic").env("ZUNO_EXAMPLE_PANIC_STARTUP", "1"),
         example_spec("healthy"),
     ])
     .await;
@@ -124,9 +124,9 @@ async fn jsonrpc_parallel_resolve_still_dispatches_in_configuration_order() {
     let gate_path = gate.path().to_string_lossy().into_owned();
     let gated = |id: &str, operation: &str| {
         example_spec(id)
-            .env("OC_EXAMPLE_OPERATION", operation)
-            .env("OC_EXAMPLE_STARTUP_GATE", &gate_path)
-            .env("OC_EXAMPLE_GATE_COUNT", "2")
+            .env("ZUNO_EXAMPLE_OPERATION", operation)
+            .env("ZUNO_EXAMPLE_STARTUP_GATE", &gate_path)
+            .env("ZUNO_EXAMPLE_GATE_COUNT", "2")
             .timeout(Duration::from_secs(3))
     };
     let load = load_plugins_ordered(vec![gated("first", "add"), gated("second", "multiply")]).await;

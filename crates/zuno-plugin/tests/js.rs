@@ -379,7 +379,7 @@ export function createOpencodeClient(config) {{
 
 #[tokio::test]
 async fn js_sdk_client_authenticates_to_the_password_gated_server() {
-    const CHILD_CASE: &str = "OC_JS_SDK_AUTH_TEST_CASE";
+    const CHILD_CASE: &str = "ZUNO_JS_SDK_AUTH_TEST_CASE";
     if let Ok(case) = std::env::var(CHILD_CASE) {
         let config = record_sdk_client_config(&case).await;
         let authorization = config
@@ -1564,7 +1564,7 @@ fn criterion_6_converges_the_plan_the_capture_and_this_test_on_one_kiro_auth_ver
 /// *is* set the check is fail-closed: an unreadable path or a config pinning a
 /// different release fails the test. A skip would put back the defect this
 /// variable replaced.
-const LIVE_PLUGIN_CONFIG_ENV: &str = "OC_PLUGIN_CONFIG";
+const LIVE_PLUGIN_CONFIG_ENV: &str = "ZUNO_PLUGIN_CONFIG";
 
 /// The evidence cell of the capture's `Installed plugins` row for `spec`.
 ///

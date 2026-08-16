@@ -1,7 +1,7 @@
 //! G1/G2 compare released TUI process trees through the frozen performance runner.
 //!
 //! The runner's name is TypeScript-specific, but its public binary override is
-//! not: `OC_TESTKIT_ORACLE` is resolved before any workload starts. Two
+//! not: `ZUNO_TESTKIT_ORACLE` is resolved before any workload starts. Two
 //! sequential passes route each frozen launch through one immediate dispatcher;
 //! their public reports are split by [`interleaved_pair_order`] into five AB/BA
 //! pairs. The private workload, database snapshot, windows, process-tree walk and
@@ -20,9 +20,9 @@ use zuno_testkit::perf::{
     load_committed_baseline, measure_typescript_baseline, verify_pinned_database,
 };
 
-const MEMORY_GATE_MODE: &str = "OC_MEMORY_GATE_MODE";
-const MEMORY_GATE_WORKER_OUTPUT: &str = "OC_MEMORY_GATE_WORKER_OUTPUT";
-const MEMORY_GATE_DATABASE: &str = "OC_MEMORY_GATE_DATABASE";
+const MEMORY_GATE_MODE: &str = "ZUNO_MEMORY_GATE_MODE";
+const MEMORY_GATE_WORKER_OUTPUT: &str = "ZUNO_MEMORY_GATE_WORKER_OUTPUT";
+const MEMORY_GATE_DATABASE: &str = "ZUNO_MEMORY_GATE_DATABASE";
 const WORKER_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 
 #[derive(Debug, Clone, Copy)]
@@ -684,7 +684,7 @@ fn spawn_worker(
             "--test-threads=1",
         ])
         .env(MEMORY_GATE_WORKER_OUTPUT, report)
-        .env("OC_TESTKIT_ORACLE", wrapper)
+        .env("ZUNO_TESTKIT_ORACLE", wrapper)
         .env("OPENCODE_DB", database)
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(stderr))

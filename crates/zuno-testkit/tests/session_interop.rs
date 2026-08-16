@@ -88,7 +88,7 @@ use zuno_testkit::env::DbChoice;
 use zuno_testkit::{Oracle, ScriptedEnv, Subject, TestkitError};
 
 /// Restated wherever a test skips, so a reader of the output knows what was wanted.
-const NO_ORACLE: &str = "no opencode on PATH and no OC_TESTKIT_ORACLE override";
+const NO_ORACLE: &str = "no opencode on PATH and no ZUNO_TESTKIT_ORACLE override";
 
 /// Wall-clock budget for one cassette-free run. Everything it talks to is loopback,
 /// so exceeding this is a hang rather than slowness.

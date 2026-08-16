@@ -31,7 +31,7 @@
 //!
 //! # Regeneration
 //!
-//! `OC_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs` rewrites each block
+//! `ZUNO_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs` rewrites each block
 //! **from the code** and then re-asserts. That is the intended way to satisfy a
 //! failure: the mechanical edit is applied by the tool that read the source of
 //! truth, not typed from memory. Prose outside the markers is never touched.
@@ -93,7 +93,7 @@ fn end_marker(name: &str) -> String {
 
 fn regenerating() -> bool {
     matches!(
-        std::env::var("OC_DOCS_REGENERATE").as_deref(),
+        std::env::var("ZUNO_DOCS_REGENERATE").as_deref(),
         Ok("1" | "true")
     )
 }
@@ -144,7 +144,7 @@ fn check_block(relative: &str, name: &str, expected: &str) {
     panic!(
         "{} block `{name}` is stale.\n\
          The code changed and the documentation did not. Run\n\
-         \n    OC_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs\n\
+         \n    ZUNO_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs\n\
          \nto take the generated version, then review the diff. Expected:\n\
          ----- BEGIN GENERATED -----\n{expected}\n----- END GENERATED -----\n\
          Found:\n----- BEGIN COMMITTED -----\n{actual}\n----- END COMMITTED -----",
@@ -866,7 +866,7 @@ fn v1_block() -> String {
 /// Every table on the matrix page, checked by one test.
 ///
 /// One test per file is not a stylistic choice: [`check_block`] rewrites the
-/// whole file under `OC_DOCS_REGENERATE`, so two tests regenerating two blocks of
+/// whole file under `ZUNO_DOCS_REGENERATE`, so two tests regenerating two blocks of
 /// the same page race and each silently discards the other's write.
 #[test]
 fn docs_compatibility_matrix_matches_every_code_table() {
@@ -1769,7 +1769,7 @@ fn readme_reports_every_non_functional_gate_with_its_opt_in_command() {
     contains_all(
         "README.md",
         &[
-            "OC_MEMORY_GATE_MODE=run",
+            "ZUNO_MEMORY_GATE_MODE=run",
             "--ignored",
             "cargo test --workspace",
             // the four caveats, each as a claim a reader can check. The G1/G2

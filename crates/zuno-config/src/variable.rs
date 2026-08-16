@@ -123,8 +123,8 @@ impl<'a> Source<'a> {
 /// use zuno_paths::env::Env;
 /// use std::path::Path;
 ///
-/// let env = Env::empty().with("OC_MODEL", "anthropic/claude-sonnet-4-5");
-/// let text = r#"{"model": "{env:OC_MODEL}"}"#;
+/// let env = Env::empty().with("ZUNO_SAMPLE_MODEL", "anthropic/claude-sonnet-4-5");
+/// let text = r#"{"model": "{env:ZUNO_SAMPLE_MODEL}"}"#;
 /// let out = Substitution::for_file(Path::new("/repo/opencode.json"))
 ///     .with_env(&env)
 ///     .apply(text)
@@ -529,11 +529,11 @@ mod tests {
     fn env_token_is_replaced_from_the_injected_map() {
         let fixture = Fixture::new();
         let process = Env::empty();
-        let env = Env::empty().with("OC_MODEL", "anthropic/claude-sonnet-4-5");
+        let env = Env::empty().with("ZUNO_SAMPLE_MODEL", "anthropic/claude-sonnet-4-5");
         assert_eq!(
             at(&fixture, &process)
                 .with_env(&env)
-                .apply(r#"{"model":"{env:OC_MODEL}"}"#)
+                .apply(r#"{"model":"{env:ZUNO_SAMPLE_MODEL}"}"#)
                 .expect("no file tokens"),
             r#"{"model":"anthropic/claude-sonnet-4-5"}"#
         );
@@ -542,12 +542,12 @@ mod tests {
     #[test]
     fn env_falls_back_to_the_process_environment() {
         let fixture = Fixture::new();
-        let process = Env::empty().with("OC_MODEL", "from-process");
+        let process = Env::empty().with("ZUNO_SAMPLE_MODEL", "from-process");
         let env = Env::empty().with("OTHER", "x");
         assert_eq!(
             at(&fixture, &process)
                 .with_env(&env)
-                .apply("{env:OC_MODEL}")
+                .apply("{env:ZUNO_SAMPLE_MODEL}")
                 .expect("no file tokens"),
             "from-process"
         );
@@ -558,12 +558,12 @@ mod tests {
         // `??` does not fall through on an empty string, so the injected "" wins
         // and `|| ""` then makes it empty. Measured: `env-empty-injected-shadows-proc`.
         let fixture = Fixture::new();
-        let process = Env::empty().with("OC_MODEL", "from-process");
-        let env = Env::empty().with("OC_MODEL", "");
+        let process = Env::empty().with("ZUNO_SAMPLE_MODEL", "from-process");
+        let env = Env::empty().with("ZUNO_SAMPLE_MODEL", "");
         assert_eq!(
             at(&fixture, &process)
                 .with_env(&env)
-                .apply("[{env:OC_MODEL}]")
+                .apply("[{env:ZUNO_SAMPLE_MODEL}]")
                 .expect("no file tokens"),
             "[]"
         );
@@ -575,7 +575,7 @@ mod tests {
         let process = Env::empty();
         assert_eq!(
             at(&fixture, &process)
-                .apply(r#"{"model":"{env:OC_ABSENT}"}"#)
+                .apply(r#"{"model":"{env:ZUNO_ABSENT}"}"#)
                 .expect("a missing variable is not an error"),
             r#"{"model":""}"#
         );
@@ -1069,11 +1069,11 @@ mod tests {
         // Measured: `env-value-makes-file-token`.
         let fixture = Fixture::new();
         let process = Env::empty();
-        let env = Env::empty().with("OC_REF", "{file:./rel.md}");
+        let env = Env::empty().with("ZUNO_REF", "{file:./rel.md}");
         assert_eq!(
             at(&fixture, &process)
                 .with_env(&env)
-                .apply(r#"{"a":"{env:OC_REF}"}"#)
+                .apply(r#"{"a":"{env:ZUNO_REF}"}"#)
                 .expect("fixture exists"),
             r#"{"a":"relative-content"}"#
         );
@@ -1083,11 +1083,11 @@ mod tests {
     fn the_env_pass_runs_first_so_a_file_path_can_be_built_from_a_variable() {
         let fixture = Fixture::new();
         let process = Env::empty();
-        let env = Env::empty().with("OC_DIR", fixture.path("cfg").to_string_lossy());
+        let env = Env::empty().with("ZUNO_DIR", fixture.path("cfg").to_string_lossy());
         assert_eq!(
             at(&fixture, &process)
                 .with_env(&env)
-                .apply("{file:{env:OC_DIR}/rel.md}")
+                .apply("{file:{env:ZUNO_DIR}/rel.md}")
                 .expect("fixture exists"),
             "relative-content"
         );
@@ -1097,14 +1097,14 @@ mod tests {
     fn a_file_body_is_not_rescanned_for_tokens() {
         let fixture = Fixture::new();
         let process = Env::empty();
-        let env = Env::empty().with("OC_INNER", "expanded");
-        fixture.write("cfg/tokens.md", "{env:OC_INNER} {file:./rel.md}");
+        let env = Env::empty().with("ZUNO_INNER", "expanded");
+        fixture.write("cfg/tokens.md", "{env:ZUNO_INNER} {file:./rel.md}");
         assert_eq!(
             at(&fixture, &process)
                 .with_env(&env)
                 .apply("{file:./tokens.md}")
                 .expect("fixture exists"),
-            "{env:OC_INNER} {file:./rel.md}"
+            "{env:ZUNO_INNER} {file:./rel.md}"
         );
     }
 
@@ -1112,9 +1112,9 @@ mod tests {
     fn several_tokens_on_one_line_are_all_substituted() {
         let fixture = Fixture::new();
         let process = Env::empty();
-        let env = Env::empty().with("OC_MODEL", "m");
+        let env = Env::empty().with("ZUNO_SAMPLE_MODEL", "m");
         let text = format!(
-            r#"{{"model":"{{env:OC_MODEL}}","a":"{{file:./rel.md}}","b":"{{file:{}}}"}}"#,
+            r#"{{"model":"{{env:ZUNO_SAMPLE_MODEL}}","a":"{{file:./rel.md}}","b":"{{file:{}}}"}}"#,
             fixture.path("outside.md").display()
         );
         assert_eq!(

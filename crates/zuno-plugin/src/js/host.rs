@@ -1120,8 +1120,8 @@ impl HostInner {
             .stdout(Stdio::inherit())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
-            .env("OC_JS_HOST_PORT", port.to_string())
-            .env("OC_JS_HOST_TOKEN", &self.token)
+            .env("ZUNO_JS_HOST_PORT", port.to_string())
+            .env("ZUNO_JS_HOST_TOKEN", &self.token)
             .env("ZUNO_PLUGIN_NAME", &self.plugin)
             .env("ZUNO_PLUGIN_PROTOCOL_VERSION", JS_PROTOCOL_VERSION);
         if let Some(reserved) = self.boot.input.loopback_port {

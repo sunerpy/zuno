@@ -38,7 +38,7 @@ use clap::{CommandFactory as _, Parser as _, error::ErrorKind};
 use zuno_observability::LogConfig;
 use zuno_paths::Env;
 
-const BOOTSTRAP_MARKER: &str = "OC_RUST_CLI_BOOTSTRAPPED";
+const BOOTSTRAP_MARKER: &str = "ZUNO_RUST_CLI_BOOTSTRAPPED";
 
 /// Runs the process boundary with the default command dispatcher.
 ///

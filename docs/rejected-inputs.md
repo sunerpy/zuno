@@ -19,7 +19,7 @@ replacement in `crates/zuno-config/src/legacy.rs` fails the documentation gate.
 part of a message that is not a constant. Regenerate with:
 
 ```sh
-OC_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
+ZUNO_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
 ```
 
 <!-- generated:BEGIN rejected-inputs -->

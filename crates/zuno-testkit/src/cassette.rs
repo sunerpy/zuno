@@ -492,14 +492,14 @@ pub fn recordings_root() -> Result<PathBuf> {
                     searched: vec![root],
                     remedy: format!(
                         "the located opencode tree has no {RECORDINGS_SUBPATH}; point \
-                         OC_TESTKIT_ORACLE_SOURCE at a full checkout"
+                         ZUNO_TESTKIT_ORACLE_SOURCE at a full checkout"
                     ),
                 })
             }
         }
         None => Err(TestkitError::RecordingsRootNotFound {
             searched: vec![PathBuf::from(env!("CARGO_MANIFEST_DIR"))],
-            remedy: "set OC_TESTKIT_ORACLE_SOURCE to a checkout of the opencode source tree"
+            remedy: "set ZUNO_TESTKIT_ORACLE_SOURCE to a checkout of the opencode source tree"
                 .to_owned(),
         }),
     }

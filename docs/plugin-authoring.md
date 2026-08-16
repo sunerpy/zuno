@@ -204,7 +204,7 @@ every advertised hook to name its production lifecycle trigger.
 Regenerate with:
 
 ```sh
-OC_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
+ZUNO_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
 ```
 
 ## What is not available

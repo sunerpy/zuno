@@ -889,14 +889,14 @@ fn message_hydrating_nothing_costs_one_statement_and_no_part_lookup() {
 
 /// Hydrate rows written by the real TypeScript binary.
 ///
-/// Skipped unless `OC_T22_REAL_ROWS` points at a JSON array of rows extracted
+/// Skipped unless `ZUNO_T22_REAL_ROWS` points at a JSON array of rows extracted
 /// from a real `opencode.db` - one entry per distinct `part.type`, each carrying
 /// the part's columns and blob plus its parent message's. The fixture is not
 /// committed because it contains a user's conversation content; the extraction
 /// query lives in the task evidence file.
 #[test]
 fn message_real_typescript_rows_hydrate_when_a_fixture_is_supplied() {
-    let Some(path) = std::env::var_os("OC_T22_REAL_ROWS") else {
+    let Some(path) = std::env::var_os("ZUNO_T22_REAL_ROWS") else {
         return;
     };
     let raw = std::fs::read_to_string(&path).expect("read the real-row fixture");

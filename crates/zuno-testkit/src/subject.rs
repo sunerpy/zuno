@@ -19,7 +19,7 @@ pub const SUBJECT_BIN: &str = "zuno";
 /// The cargo package that builds it.
 pub const SUBJECT_PACKAGE: &str = "zuno-cli";
 /// Override the discovered subject binary with an explicit path.
-pub const ENV_SUBJECT_BINARY: &str = "OC_TESTKIT_SUBJECT";
+pub const ENV_SUBJECT_BINARY: &str = "ZUNO_TESTKIT_SUBJECT";
 
 static BUILT_SUBJECT: OnceLock<PathBuf> = OnceLock::new();
 static SUBJECT_BUILD_LOCK: Mutex<()> = Mutex::new(());

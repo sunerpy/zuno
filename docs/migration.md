@@ -159,7 +159,7 @@ so adding a migration without documenting it fails.
 Regenerate with:
 
 ```sh
-OC_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
+ZUNO_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
 ```
 
 ## Configuration that is rejected rather than reinterpreted

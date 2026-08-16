@@ -24,7 +24,7 @@ gaps. Five states are used throughout:
 Every table on this page is generated from the code it describes. Regenerate with:
 
 ```sh
-OC_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
+ZUNO_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
 ```
 
 ## Declared divergences

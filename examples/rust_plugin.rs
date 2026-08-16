@@ -8,9 +8,9 @@ use zuno_plugin_sdk::{
 };
 
 fn plugin() -> Result<Plugin, Box<dyn Error>> {
-    let id = std::env::var("OC_EXAMPLE_PLUGIN_ID").unwrap_or_else(|_| "rust-example".to_owned());
-    let operation = std::env::var("OC_EXAMPLE_OPERATION").unwrap_or_else(|_| "add".to_owned());
-    let sleep_ms = std::env::var("OC_EXAMPLE_SLEEP_HOOK_MS")
+    let id = std::env::var("ZUNO_EXAMPLE_PLUGIN_ID").unwrap_or_else(|_| "rust-example".to_owned());
+    let operation = std::env::var("ZUNO_EXAMPLE_OPERATION").unwrap_or_else(|_| "add".to_owned());
+    let sleep_ms = std::env::var("ZUNO_EXAMPLE_SLEEP_HOOK_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
@@ -76,11 +76,11 @@ fn plugin() -> Result<Plugin, Box<dyn Error>> {
 }
 
 async fn wait_for_startup_gate() -> Result<(), Box<dyn Error>> {
-    let Ok(directory) = std::env::var("OC_EXAMPLE_STARTUP_GATE") else {
+    let Ok(directory) = std::env::var("ZUNO_EXAMPLE_STARTUP_GATE") else {
         return Ok(());
     };
-    let id = std::env::var("OC_EXAMPLE_PLUGIN_ID")?;
-    let count = std::env::var("OC_EXAMPLE_GATE_COUNT")?.parse::<usize>()?;
+    let id = std::env::var("ZUNO_EXAMPLE_PLUGIN_ID")?;
+    let count = std::env::var("ZUNO_EXAMPLE_GATE_COUNT")?.parse::<usize>()?;
     std::fs::create_dir_all(&directory)?;
     std::fs::write(Path::new(&directory).join(format!("{id}.ready")), b"ready")?;
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -133,7 +133,7 @@ fn conformance() -> ConformanceSuite {
 
 #[tokio::main]
 async fn main() {
-    if std::env::var_os("OC_EXAMPLE_PANIC_STARTUP").is_some() {
+    if std::env::var_os("ZUNO_EXAMPLE_PANIC_STARTUP").is_some() {
         panic!("requested startup panic");
     }
     if let Err(error) = run().await {

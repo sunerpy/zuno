@@ -225,7 +225,7 @@ pub enum TestkitError {
         binary_env: &'static str,
     },
 
-    /// `OC_TESTKIT_ORACLE_FLAVOUR` named something the harness does not implement.
+    /// `ZUNO_TESTKIT_ORACLE_FLAVOUR` named something the harness does not implement.
     #[error("unknown oracle flavour {requested:?}; accepted values are {}", accepted.join(", "))]
     UnknownOracleFlavour {
         /// What the environment asked for.

@@ -110,7 +110,7 @@ because the order is what keeps foreign keys satisfied mid-transaction.
 Regenerate with:
 
 ```sh
-OC_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
+ZUNO_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
 ```
 
 After the table deletes, parts with no surviving session are swept, and artifact

@@ -81,11 +81,11 @@ pub enum OracleFlavour {
 pub const PINNED_RELEASE: &str = "1.18.18";
 
 /// Override the discovered oracle binary with an explicit path.
-pub const ENV_ORACLE_BINARY: &str = "OC_TESTKIT_ORACLE";
+pub const ENV_ORACLE_BINARY: &str = "ZUNO_TESTKIT_ORACLE";
 /// Point the harness at a specific `opencode` source tree.
-pub const ENV_ORACLE_SOURCE: &str = "OC_TESTKIT_ORACLE_SOURCE";
+pub const ENV_ORACLE_SOURCE: &str = "ZUNO_TESTKIT_ORACLE_SOURCE";
 /// Force a flavour: `binary` or `source`.
-pub const ENV_ORACLE_FLAVOUR: &str = "OC_TESTKIT_ORACLE_FLAVOUR";
+pub const ENV_ORACLE_FLAVOUR: &str = "ZUNO_TESTKIT_ORACLE_FLAVOUR";
 
 /// The real `opencode`, ready to run under a scripted environment.
 #[derive(Debug)]
@@ -773,7 +773,7 @@ mod tests {
             return;
         }
         let tree = locate_source_tree()
-            .expect("no opencode source tree found; set OC_TESTKIT_ORACLE_SOURCE to a checkout");
+            .expect("no opencode source tree found; set ZUNO_TESTKIT_ORACLE_SOURCE to a checkout");
         let version = read_pinned_version(&tree).expect("the tree must declare a version");
         assert!(
             version.starts_with("1."),
@@ -841,8 +841,10 @@ mod tests {
     /// makes the first `PATH` hit win and this test go red.
     ///
     /// Absence is an ordinary skip, the same contract [`pinned_oracle_or_skip`]
-    /// applies. It used to be a failure unless `OC_TESTKIT_ALLOW_MISSING_ORACLE` was
-    /// set, because measuring nothing against a real release was a fact a project
+    /// applies. It used to be a failure unless the since-removed
+    /// `OC_TESTKIT_ALLOW_MISSING_ORACLE` was set — that spelling is recorded as it
+    /// was and no longer names anything this crate reads — because measuring nothing
+    /// against a real release was a fact a project
     /// claiming parity had to declare deliberately. Zuno makes no such claim, so a
     /// machine without `opencode` is now the normal case rather than an omission
     /// worth confessing — and demanding the variable only meant this unit test failed
@@ -980,7 +982,7 @@ mod tests {
     /// The failure QA scenario for the pin: a binary that reports another release is
     /// refused and named, not accepted with a warning.
     ///
-    /// Set `OC_TESTKIT_MISMATCH_ORACLE` to a real older install during a re-pin. The
+    /// Set `ZUNO_TESTKIT_MISMATCH_ORACLE` to a real older install during a re-pin. The
     /// hermetic fallback is a real executable this test writes, so either way
     /// [`Oracle::at_binary`] really runs a process and the refused version string
     /// comes out of [`Oracle::probe_version`]'s stdout rather than being handed to
@@ -991,7 +993,7 @@ mod tests {
     fn a_binary_reporting_another_release_is_named_and_refused() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        const MISMATCH_ORACLE: &str = "OC_TESTKIT_MISMATCH_ORACLE";
+        const MISMATCH_ORACLE: &str = "ZUNO_TESTKIT_MISMATCH_ORACLE";
         let dir = tempfile::tempdir().expect("tempdir");
         let fake = dir.path().join("opencode");
         std::fs::write(&fake, "#!/bin/sh\necho 1.18.14\n").expect("write the stand-in release");

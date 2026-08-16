@@ -185,7 +185,7 @@ impl ShellEnvHook for InjectEnv {
         assert_eq!(input.session_id, "ses_shell");
         assert_eq!(input.call_id, "call_shell");
         Ok(BTreeMap::from([(
-            "OC_T40_ENV".to_owned(),
+            "ZUNO_T40_ENV".to_owned(),
             "injected".to_owned(),
         )]))
     }
@@ -201,7 +201,7 @@ async fn shell_env_hook_injects_call_scoped_environment() {
 
     let output = tool
         .run(
-            params("printf '%s' \"$OC_T40_ENV\""),
+            params("printf '%s' \"$ZUNO_T40_ENV\""),
             context(Arc::new(zuno_tool::NeverInterrupted)),
         )
         .await

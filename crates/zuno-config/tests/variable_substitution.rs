@@ -63,12 +63,12 @@ fn variable_expands_env_and_tilde_file_into_a_parsable_config() {
     let config = site.write(
         "opencode.json",
         r#"{
-  "model": "{env:OC_MODEL}",
+  "model": "{env:ZUNO_SAMPLE_MODEL}",
   "instructions": ["{file:~/notes.md}"]
 }"#,
     );
 
-    let env = Env::empty().with("OC_MODEL", "anthropic/claude-sonnet-4-5");
+    let env = Env::empty().with("ZUNO_SAMPLE_MODEL", "anthropic/claude-sonnet-4-5");
     let process = site.home_env();
     let expanded = Substitution::for_file(&config)
         .with_env(&env)
@@ -197,14 +197,14 @@ fn variable_comment_lines_hold_back_file_tokens_only() {
     let site = Site::new();
     site.write("prompt.md", "real");
     let config = site.write("opencode.json", "{}");
-    let env = Env::empty().with("OC_MODEL", "expanded");
+    let env = Env::empty().with("ZUNO_SAMPLE_MODEL", "expanded");
     let process = Env::empty();
 
     let expanded = Substitution::for_file(&config)
         .with_env(&env)
         .with_process_env(&process)
         .apply(
-            "{\n  // disabled: {file:./prompt.md} {env:OC_MODEL}\n  \"instructions\": [\"{file:./prompt.md}\"]\n}",
+            "{\n  // disabled: {file:./prompt.md} {env:ZUNO_SAMPLE_MODEL}\n  \"instructions\": [\"{file:./prompt.md}\"]\n}",
         )
         .expect("the live reference resolves and the commented one is never read");
 

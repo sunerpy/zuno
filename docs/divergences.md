@@ -36,7 +36,7 @@ without a count bump fails the documentation gate; adding an entry without
 documenting it fails the same gate. Regenerate this page with:
 
 ```sh
-OC_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
+ZUNO_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
 ```
 
 Everything between the generated markers comes from the allow-list, including

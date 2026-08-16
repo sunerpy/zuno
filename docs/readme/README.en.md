@@ -73,7 +73,7 @@ session` carries only `list`, `prune`, and `delete`.
 Only regions delimited by `generated:BEGIN` and `generated:END` comments are generated from code and
 checked byte-for-byte by `cargo test -p zuno-cli --test docs`; the test also derives assertions for a
 small set of critical sections. Explanatory tables and prose outside those markers still require
-review. Use `OC_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs` to regenerate managed regions.
+review. Use `ZUNO_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs` to regenerate managed regions.
 
 ## Independent runtime and plugin ABI
 

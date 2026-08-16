@@ -65,10 +65,10 @@ console.warn = toStderr;
 console.error = toStderr;
 console.trace = toStderr;
 
-const port = Number(process.env.OC_JS_HOST_PORT);
-const token = process.env.OC_JS_HOST_TOKEN ?? "";
+const port = Number(process.env.ZUNO_JS_HOST_PORT);
+const token = process.env.ZUNO_JS_HOST_TOKEN ?? "";
 if (!Number.isInteger(port) || port <= 0 || token === "") {
-  toStderr("zuno-js-shim: OC_JS_HOST_PORT and OC_JS_HOST_TOKEN are required");
+  toStderr("zuno-js-shim: ZUNO_JS_HOST_PORT and ZUNO_JS_HOST_TOKEN are required");
   process.exit(64);
 }
 
