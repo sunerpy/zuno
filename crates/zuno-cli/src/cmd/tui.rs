@@ -56,6 +56,13 @@ use crate::environment::StartupEnvironment;
 /// How many prompts may be in flight. One, so a second is refused and not queued.
 const PROMPT_CHANNEL_CAPACITY: usize = 1;
 
+/// How many cancellation requests may be queued.
+///
+/// One, because aborting a turn is idempotent: a second request for the same turn
+/// would abort nothing new, and a full channel is what makes the screen fall through
+/// to shutdown rather than swallow the key.
+const CANCEL_CHANNEL_CAPACITY: usize = 1;
+
 pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Result<(), String> {
     if !std::io::stdout().is_terminal() {
         return Err(
@@ -97,8 +104,12 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
     let plugins = host.plugin_runtime();
     broker.bind_session(host.session_id());
 
+    let (cancel_sender, cancel_receiver) = mpsc::channel(CANCEL_CHANNEL_CAPACITY);
+    let control = host.control();
+
     let mut screen = SessionScreen::new(context.clone(), terminal_sender.clone())
-        .with_prompt_sink(prompt_sender);
+        .with_prompt_sink(prompt_sender)
+        .with_cancel_sink(cancel_sender);
     if let Some(prompt) = args
         .prompt
         .as_deref()
@@ -125,9 +136,11 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
     let outcome = runtime.block_on(async move {
         let input = tokio::spawn(zuno_tui::app::forward_terminal_input(terminal_sender));
         let turns = tokio::spawn(drive_turns(host, prompt_receiver, engine_sender));
+        let cancels = tokio::spawn(forward_cancellations(control, cancel_receiver));
         let outcome = app.run().await;
         input.abort();
         turns.abort();
+        cancels.abort();
         if let Some(plugins) = plugins {
             plugins.shutdown().await;
         }
@@ -138,6 +151,22 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
     });
     drop(session);
     outcome.map_err(to_string)
+}
+
+/// Abort the live turn each time the screen asks, until the screen stops asking.
+///
+/// A task rather than a call inside the component handler for the reason the turn
+/// driver is one: the render loop is the only consumer of the events an aborted turn
+/// produces, so it must not be the thing waiting on the abort. `abort` returning
+/// `false` means the turn had already finished, which is not a failure — the screen's
+/// next press leaves instead.
+async fn forward_cancellations(
+    control: zuno_engine::status::SessionControl,
+    mut cancels: mpsc::Receiver<()>,
+) {
+    while cancels.recv().await.is_some() {
+        let _aborted = control.abort();
+    }
 }
 
 /// Drive one turn per submitted prompt until the screen stops sending.

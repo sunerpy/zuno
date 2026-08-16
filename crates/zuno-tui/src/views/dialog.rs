@@ -1,5 +1,20 @@
 //! Dialogs, and why none of them blocks.
 //!
+//! # A modal owns the keyboard, but never the exit
+//!
+//! Swallowing every action a dialog does not understand is what stops `session_new`
+//! from firing behind a permission prompt, and it must stay. Applied to the exit
+//! chord it was a trap: the scope chain a permission prompt installs resolves
+//! `ctrl+d` to `session_delete` and `ctrl+c` to `input_clear`, neither of which the
+//! prompt understands, so both were absorbed and never reached the one component
+//! that sends [`crate::app::TerminalEvent::Shutdown`]. Raw mode having already taken
+//! `SIGINT` away, the application could not be left at all while a prompt was up.
+//!
+//! So exactly one class of ignored action is forwarded: one whose chord the table
+//! binds to [`crate::keybind::APP_EXIT`]. A dialog that wants the chord for itself
+//! still gets it first — the permission prompt resolves it to a rejection — and this
+//! only runs once the dialog has said it has no use for it.
+//!
 //! # A dialog is state in the tree, not a call that waits
 //!
 //! The tempting shape for a modal is a function that renders, reads input, and
@@ -36,7 +51,7 @@
 //! top of the stack has the keys; everything below it renders nothing.
 
 use crate::app::{AppEvent, Component, EventResult};
-use crate::keybind::{ActionComponent, Chord, Definition};
+use crate::keybind::{ActionComponent, Chord, Definition, is_exit_request};
 use crate::views::{ViewContext, fill, hint, padded};
 use crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -318,6 +333,11 @@ impl ActionComponent for DialogHost {
         if let Some(dialog) = self.stack.last_mut() {
             let id = dialog.id();
             return match dialog.handle_action(action, event) {
+                DialogStep::Ignored if is_exit_request(event) => {
+                    // The one forwarded class. See the module docs: absorbing this
+                    // leaves a user with no way out of a raw-mode terminal.
+                    self.base.handle_action(action, event)
+                }
                 DialogStep::Ignored => {
                     // An action a dialog does not understand is *not* forwarded to
                     // the base. A modal owns the keyboard; forwarding would let

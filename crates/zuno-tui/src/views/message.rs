@@ -38,7 +38,7 @@ use crate::app::{AppEvent, Component, EventResult};
 use crate::views::{ViewContext, fill, padded};
 use ratatui::layout::Rect;
 use ratatui::style::Style;
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Frame, symbols};
 use zuno_engine::r#loop::TurnEvent;
@@ -727,6 +727,13 @@ impl StatusView {
     /// The word the strip shows the instant a turn starts, before anything resolves.
     pub const WORKING: &'static str = "working";
 
+    /// The key shown as the way out, and what it does while a turn is running.
+    ///
+    /// The strip is the one row always on screen, so it is where a binding a user
+    /// cannot otherwise guess belongs. An application whose exit key is undiscoverable
+    /// is only marginally better than one that has none.
+    pub const EXIT_HINT: &'static str = "ctrl+c cancel/exit";
+
     /// A status strip over `context`.
     #[must_use]
     pub fn new(context: ViewContext) -> Self {
@@ -772,9 +779,32 @@ impl StatusView {
         self.detail = None;
     }
 
-    /// The rendered row.
+    /// The rendered row, with [`Self::EXIT_HINT`] right-aligned when it fits.
+    ///
+    /// The hint is dropped rather than truncated on a narrow terminal: half a key
+    /// name is worse than none, and the turn state it shares the row with is what a
+    /// user needs more.
     #[must_use]
     pub fn line(&self, width: u16) -> Line<'static> {
+        let state = format!(" {}", self.state());
+        let columns = usize::from(width);
+        let used = state.chars().count() + Self::EXIT_HINT.chars().count();
+        if used < columns {
+            return Line::from(vec![
+                Span::styled(state, self.context.element()),
+                Span::styled(" ".repeat(columns - used), self.context.element()),
+                Span::styled(
+                    Self::EXIT_HINT.to_owned(),
+                    Style::new()
+                        .fg(self.context.palette.text_muted.into())
+                        .bg(self.context.palette.background_element.into()),
+                ),
+            ]);
+        }
+        padded(&state, width, self.context.element())
+    }
+
+    fn state(&self) -> String {
         let mut text = String::new();
         if let Some(agent) = &self.agent {
             text.push_str(agent);
@@ -804,7 +834,7 @@ impl StatusView {
                 Self::IDLE
             });
         }
-        padded(&format!(" {text}"), width, self.context.element())
+        text
     }
 }
 

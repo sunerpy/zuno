@@ -26,9 +26,27 @@
 //! therefore a collaborator of the screen, and `try_send` is deliberate: a full
 //! terminal channel already has 64 events queued, and blocking here would stall the
 //! render loop that has to drain them.
+//!
+//! # An exit chord during a running turn cancels the turn, but only once
+//!
+//! Tearing the application down mid-turn discards work the user is waiting for, so
+//! the first exit chord asks the driver to cancel rather than leaving.
+//!
+//! The second one leaves unconditionally, and that is the load-bearing part. Reading
+//! "has a turn been cancelled already" off the status strip's running state looks
+//! equivalent and is not: a turn parked on a permission ask never reaches the
+//! engine's interrupt check, so it stays running after an abort and the strip never
+//! clears. A screen that re-derived its answer from the strip would cancel forever
+//! and never leave — the same trap in a politer form. One press is therefore
+//! remembered explicitly, and cleared when a new turn starts.
+//!
+//! For the same reason cancellation never gets to swallow the key: with no sink
+//! attached, or a sink that refuses, the chord falls straight through to shutdown. A
+//! user must always have a way out, so a broken collaborator costs a cancelled turn,
+//! never the ability to leave.
 
 use crate::app::{AppEvent, Component, EventResult, TerminalEvent};
-use crate::keybind::{ActionComponent, Definition};
+use crate::keybind::{APP_EXIT, ActionComponent, Definition, is_exit_request};
 use crate::views::ViewContext;
 use crate::views::editor::{EditorSignal, InputEditor};
 use crate::views::message::{Message, StatusView, TranscriptView};
@@ -49,7 +67,10 @@ pub struct SessionScreen {
     editor: InputEditor,
     shutdown: mpsc::Sender<TerminalEvent>,
     prompts: Option<mpsc::Sender<String>>,
+    cancels: Option<mpsc::Sender<()>>,
     submissions: Vec<String>,
+    cancellations: usize,
+    cancel_requested: bool,
 }
 
 impl SessionScreen {
@@ -62,7 +83,10 @@ impl SessionScreen {
             editor: InputEditor::new(context),
             shutdown,
             prompts: None,
+            cancels: None,
             submissions: Vec::new(),
+            cancellations: 0,
+            cancel_requested: false,
         }
     }
 
@@ -79,6 +103,26 @@ impl SessionScreen {
     pub fn with_prompt_sink(mut self, prompts: mpsc::Sender<String>) -> Self {
         self.prompts = Some(prompts);
         self
+    }
+
+    /// Let an exit chord cancel a running turn instead of leaving the application.
+    ///
+    /// Optional for the same reason [`Self::with_prompt_sink`] is: a screen with no
+    /// driver has no turn to cancel. Without it, an exit chord leaves immediately.
+    #[must_use]
+    pub fn with_cancel_sink(mut self, cancels: mpsc::Sender<()>) -> Self {
+        self.cancels = Some(cancels);
+        self
+    }
+
+    /// How many times an exit chord has cancelled a running turn.
+    ///
+    /// Retained for the same reason [`Self::submissions`] is: a test should be able
+    /// to tell "cancelled the turn" from "left the application" without owning the
+    /// far side of either channel.
+    #[must_use]
+    pub const fn cancellations(&self) -> usize {
+        self.cancellations
     }
 
     /// The transcript, for a host that appends locally composed messages.
@@ -117,7 +161,7 @@ impl SessionScreen {
             .push(Message::user(text.clone()));
         if let Some(prompts) = self.prompts.as_ref() {
             match prompts.try_send(text.clone()) {
-                Ok(()) => self.status.mark_running(),
+                Ok(()) => self.mark_turn_accepted(),
                 Err(error) => {
                     let reason = match error {
                         mpsc::error::TrySendError::Full(_) => "a turn is already running",
@@ -164,19 +208,48 @@ impl Component for SessionScreen {
     }
 }
 
-impl ActionComponent for SessionScreen {
-    fn handle_action(&mut self, action: &'static Definition, _event: &KeyEvent) -> EventResult {
-        // `ctrl+c` and `ctrl+d` are each bound twice in the shipped table: once in
-        // the `input` scope and once as `app_exit`. The input scope wins, so a
-        // screen that only watched for `app_exit` could never be left — the two
-        // editor actions have to fall through when there is nothing to act on,
-        // which is also the behaviour the keys have in the reference TUI.
-        let empty = self.editor.text().is_empty();
-        if action.name == "app_exit"
-            || (empty && matches!(action.name, "input_clear" | "input_delete"))
+impl SessionScreen {
+    fn mark_turn_accepted(&mut self) {
+        self.cancel_requested = false;
+        self.status.mark_running();
+    }
+
+    /// Cancel a running turn, or leave the application when none is running.
+    ///
+    /// Falling through to shutdown when the sink is missing or refuses is what keeps
+    /// this from becoming the trap described in the module docs.
+    fn request_exit(&mut self) -> EventResult {
+        if self.status.is_running()
+            && !self.cancel_requested
+            && let Some(cancels) = self.cancels.as_ref()
+            && cancels.try_send(()).is_ok()
         {
-            let _requested = self.shutdown.try_send(TerminalEvent::Shutdown);
+            self.cancel_requested = true;
+            self.cancellations += 1;
+            self.transcript
+                .transcript_mut()
+                .push(Message::user(String::from(
+                    "cancelling the turn; press the same key again to exit",
+                )));
             return EventResult::REDRAW;
+        }
+        let _requested = self.shutdown.try_send(TerminalEvent::Shutdown);
+        EventResult::REDRAW
+    }
+}
+
+impl ActionComponent for SessionScreen {
+    fn handle_action(&mut self, action: &'static Definition, event: &KeyEvent) -> EventResult {
+        // `ctrl+c` and `ctrl+d` are each claimed by the `input` scope before `app`,
+        // so a screen that only watched for `app_exit` could never be left. Asking
+        // the keymap whether the *chord* is an exit chord — rather than matching the
+        // action names the resolution happened to produce — is what makes this
+        // independent of which scope won, and it is why `delete`, the other spelling
+        // of `input_delete`, no longer quits an application it was never bound to.
+        let editor_owns_chord =
+            !self.editor.text().is_empty() && matches!(action.name, "input_clear" | "input_delete");
+        if action.name == APP_EXIT || (is_exit_request(event) && !editor_owns_chord) {
+            return self.request_exit();
         }
         match self.editor.handle_action(action) {
             EditorSignal::None => EventResult::IGNORED,

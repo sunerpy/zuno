@@ -493,6 +493,32 @@ fn views_status_strip_is_idle_before_anything_resolves() {
     assert_eq!(rows(&buffer).remove(0), " idle");
 }
 
+/// The way out of a raw-mode terminal has to be readable on screen.
+///
+/// Wiring the exit chord is only half the fix: a binding nothing displays is one a
+/// user has to already know. This asserts the strip carries it, and that a terminal
+/// too narrow to hold it drops the hint rather than truncating either half — a
+/// half-printed key name would be worse than none.
+#[test]
+fn views_status_strip_shows_the_exit_binding_and_drops_it_when_too_narrow() {
+    let mut status = StatusView::new(ViewContext::defaults());
+    let row = rows(&render_offscreen(&mut status, 48, 1).expect("infallible")).remove(0);
+    assert!(
+        row.ends_with(StatusView::EXIT_HINT),
+        "the strip must show how to leave: {row:?}"
+    );
+    assert!(
+        row.starts_with(&format!(" {}", StatusView::IDLE)),
+        "the hint must not displace the turn state: {row:?}"
+    );
+
+    let narrow = rows(&render_offscreen(&mut status, 20, 1).expect("infallible")).remove(0);
+    assert_eq!(
+        narrow, " idle",
+        "a row too narrow for the hint must drop it whole, not truncate it"
+    );
+}
+
 /// The strip must never read `idle` while a turn is under way.
 ///
 /// Three moments, because the strip can lie at any of them and only the middle one
@@ -502,8 +528,14 @@ fn views_status_strip_is_idle_before_anything_resolves() {
 #[test]
 fn views_status_strip_never_reads_idle_while_a_turn_is_under_way() {
     let mut status = StatusView::new(ViewContext::defaults());
+    // Reads the turn-state half of a row the exit hint shares. Asserting on the whole
+    // row would make any wording of the hint read as the strip lying about the turn.
     let rendered = |status: &mut StatusView| {
-        rows(&render_offscreen(status, 48, 1).expect("infallible")).remove(0)
+        let row = rows(&render_offscreen(status, 48, 1).expect("infallible")).remove(0);
+        row.strip_suffix(StatusView::EXIT_HINT)
+            .unwrap_or(&row)
+            .trim_end()
+            .to_owned()
     };
 
     status.mark_running();

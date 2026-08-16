@@ -64,6 +64,9 @@ mod tests;
 /// The name of the entry that configures the leader chord rather than an action.
 pub const LEADER: &str = "leader";
 
+/// The action that leaves the application.
+pub const APP_EXIT: &str = "app_exit";
+
 /// The token a spelling uses to mean "the configured leader chord".
 pub const LEADER_TOKEN: &str = "<leader>";
 
@@ -107,6 +110,40 @@ pub fn definition(name: &str) -> Option<&'static Definition> {
     DEFINITIONS
         .iter()
         .find(|definition| definition.name == name)
+}
+
+/// Whether `chord` is a single-chord spelling the table gives to [`APP_EXIT`].
+///
+/// Exit intent is a property of the **chord**, not of the action a scope chain
+/// happened to resolve it to. `ctrl+c` and `ctrl+d` are each claimed by several
+/// scopes — `input_clear`, `input_delete`, `session_delete`, `stash_delete` — so an
+/// action name cannot tell a component whether the user asked to leave. Asking
+/// about the chord can, and it is also what stops `delete`, the other spelling of
+/// `input_delete`, from quitting an application it was never bound to exit.
+///
+/// Derived from the table rather than hard-coded so that regenerating [`DEFINITIONS`]
+/// from a newer upstream keeps this in step. Leader sequences are excluded because a
+/// multi-chord spelling cannot be recognised from one press; `<leader>q` still
+/// reaches [`APP_EXIT`] through ordinary resolution.
+#[must_use]
+pub fn is_exit_chord(chord: Chord) -> bool {
+    definition(APP_EXIT).is_some_and(|exit| {
+        exit.keys
+            .split(',')
+            .map(str::trim)
+            .filter(|spelling| !spelling.contains(LEADER_TOKEN))
+            .filter_map(|spelling| Chord::parse(spelling).ok())
+            .any(|bound| bound == chord)
+    })
+}
+
+/// Whether `event` asked to leave the application.
+///
+/// The seam a component uses when it holds a [`Definition`] and a [`KeyEvent`] but
+/// must not depend on which scope won: see [`is_exit_chord`].
+#[must_use]
+pub fn is_exit_request(event: &KeyEvent) -> bool {
+    Chord::from_key_event(event).is_some_and(is_exit_chord)
 }
 
 /// The chord modifiers a terminal can report.

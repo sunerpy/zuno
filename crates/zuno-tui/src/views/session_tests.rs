@@ -211,6 +211,224 @@ fn session_screen_scopes_shadow_the_exit_action_with_the_editor_bindings() {
     );
 }
 
+/// The scope chain a focused permission prompt installs, as the CLI bridge builds it.
+///
+/// Reproduced here rather than imported because the bridge lives in `zuno-cli`, above
+/// this crate. `session` is in it so `escape` can reject — and that is precisely what
+/// drags `session_delete` in front of `app_exit` on `ctrl+d`.
+fn focused_permission_scopes() -> Vec<String> {
+    let mut chain = vec![
+        String::from("permission.prompt"),
+        String::from("dialog.select"),
+        String::from("dialog.prompt"),
+        String::from("session"),
+    ];
+    chain.extend(scopes());
+    chain
+}
+
+fn permission_prompt() -> Box<dyn crate::views::dialog::Dialog> {
+    Box::new(crate::views::permission::PermissionPrompt::new(
+        ViewContext::defaults(),
+        zuno_permission::PermissionRequest {
+            id: String::from("req_exit"),
+            session_id: String::from("ses_exit"),
+            permission: String::from("bash"),
+            patterns: vec![String::from("*")],
+            metadata: serde_json::Map::new(),
+            always: vec![String::from("*")],
+            tool: None,
+        },
+        &serde_json::json!({}),
+    ))
+}
+
+/// An open modal must not be able to trap a user in a raw-mode terminal.
+///
+/// The regression this pins was reachable and reported: with a permission prompt up,
+/// `ctrl+d` resolves to `session_delete` and `ctrl+c` to `input_clear`, the prompt
+/// understands neither, and `DialogHost` used to absorb both — so the one component
+/// that sends `Shutdown` never heard either key. Raw mode having taken `SIGINT` away,
+/// nothing could end the process.
+///
+/// Asserted through the real tree at the real focused scope chain, because every
+/// layer in it may decline to forward and the defect lived in exactly one of them.
+#[test]
+fn session_screen_the_exit_chord_leaves_even_while_a_modal_owns_the_keyboard() {
+    for spelling in exit_chord_spellings() {
+        let (screen, mut shutdown) = screen();
+        let mut host =
+            crate::views::dialog::DialogHost::new(ViewContext::defaults(), Box::new(screen));
+        host.open(permission_prompt());
+        assert!(host.is_open(), "the prompt is not focused");
+        let mut dispatcher = KeyDispatcher::new(
+            Keymap::defaults().expect("the shipped table builds"),
+            focused_permission_scopes(),
+            Box::new(host),
+        );
+
+        dispatcher.handle_event(&AppEvent::Terminal(TerminalEvent::Input(
+            crossterm::event::Event::Key(key_event(&spelling)),
+        )));
+
+        assert!(
+            matches!(shutdown.try_recv(), Ok(TerminalEvent::Shutdown)),
+            "`{spelling}` was absorbed by the modal, leaving no way out of the TUI"
+        );
+    }
+}
+
+/// Every single-chord spelling the table gives to `app_exit`.
+fn exit_chord_spellings() -> Vec<String> {
+    action("app_exit")
+        .keys
+        .split(',')
+        .map(str::trim)
+        .filter(|spelling| !spelling.contains(crate::keybind::LEADER_TOKEN))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn key_event(spelling: &str) -> KeyEvent {
+    let chord = crate::keybind::Chord::parse(spelling).expect("a valid spelling");
+    let rendered = chord.to_string();
+    KeyEvent {
+        code: crossterm::event::KeyCode::Char(rendered.chars().last().expect("a key character")),
+        modifiers: if rendered.contains("ctrl+") {
+            crossterm::event::KeyModifiers::CONTROL
+        } else {
+            crossterm::event::KeyModifiers::NONE
+        },
+        kind: crossterm::event::KeyEventKind::Press,
+        state: crossterm::event::KeyEventState::NONE,
+    }
+}
+
+/// A modal still owns every key that is not the way out.
+///
+/// The other half of the exception: forwarding *all* ignored actions would let
+/// `session_new` fire behind a permission prompt, which is the property the modal
+/// discipline exists for.
+#[test]
+fn session_screen_a_modal_still_absorbs_actions_that_are_not_the_exit() {
+    let (screen, mut shutdown) = screen();
+    let mut host = crate::views::dialog::DialogHost::new(ViewContext::defaults(), Box::new(screen));
+    host.open(permission_prompt());
+
+    let absorbed = host.handle_action(action("session_new"), &press_none());
+
+    assert!(
+        absorbed.handled && !absorbed.redraw,
+        "an unrelated action was not absorbed by the modal: {absorbed:?}"
+    );
+    assert!(
+        shutdown.try_recv().is_err(),
+        "an unrelated action reached the base and requested shutdown"
+    );
+}
+
+/// `delete` on an empty prompt must not quit the application.
+///
+/// `input_delete`'s shipped spelling is `ctrl+d,delete,shift+delete`, so a screen
+/// that read exit intent from the *action name* quit on all three. Intent belongs to
+/// the chord: only the ones `app_exit` binds may leave.
+#[test]
+fn session_screen_a_non_exit_spelling_of_the_same_action_does_not_leave() {
+    let (mut screen, mut shutdown) = screen();
+    screen.handle_action(
+        action("input_delete"),
+        &crate::views::testkit::press(crossterm::event::KeyCode::Delete),
+    );
+
+    assert!(
+        shutdown.try_recv().is_err(),
+        "`delete` left the application, which the table never bound it to do"
+    );
+}
+
+/// An exit chord during a running turn cancels the turn; the next one always leaves.
+///
+/// The second press is asserted **without** delivering `TurnInterrupted`, because
+/// that is the case a real terminal exposed: a turn parked on a permission ask never
+/// reaches the engine's interrupt check, so it stays "running" after an abort. A
+/// screen that decided by re-reading the strip cancelled forever and never left. The
+/// only safe rule is that one press is remembered and the next one leaves regardless.
+#[test]
+fn session_screen_the_second_exit_chord_leaves_even_if_the_cancelled_turn_never_ends() {
+    let (sender, mut shutdown) = terminal_event_channel();
+    let (cancels, mut cancelled) = mpsc::channel(1);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender).with_cancel_sink(cancels);
+    screen.status.mark_running();
+
+    screen.handle_action(action("app_exit"), &press_none());
+    assert_eq!(cancelled.try_recv(), Ok(()), "the turn was not cancelled");
+    assert_eq!(screen.cancellations(), 1);
+    assert!(
+        shutdown.try_recv().is_err(),
+        "the first press tore the application down instead of cancelling the turn"
+    );
+
+    assert!(
+        screen.status.is_running(),
+        "this test is only meaningful while the strip still reports a running turn"
+    );
+    screen.handle_action(action("app_exit"), &press_none());
+    assert!(
+        matches!(shutdown.try_recv(), Ok(TerminalEvent::Shutdown)),
+        "a turn that ignored its abort left the user with no way out"
+    );
+    assert_eq!(
+        screen.cancellations(),
+        1,
+        "the second press must leave, not cancel again"
+    );
+}
+
+/// A later turn is cancellable again; only the turn already asked about is remembered.
+#[test]
+fn session_screen_a_new_turn_can_be_cancelled_after_an_earlier_one_was() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (prompts, mut submitted) = mpsc::channel(1);
+    let (cancels, mut cancelled) = mpsc::channel(1);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_prompt_sink(prompts)
+        .with_cancel_sink(cancels);
+
+    screen.submit_prompt("first");
+    assert_eq!(submitted.try_recv().as_deref(), Ok("first"));
+    screen.handle_action(action("app_exit"), &press_none());
+    assert_eq!(cancelled.try_recv(), Ok(()));
+
+    screen.submit_prompt("second");
+    assert_eq!(submitted.try_recv().as_deref(), Ok("second"));
+    screen.handle_action(action("app_exit"), &press_none());
+
+    assert_eq!(
+        cancelled.try_recv(),
+        Ok(()),
+        "a fresh turn inherited the previous turn's spent cancellation"
+    );
+    assert_eq!(screen.cancellations(), 2);
+}
+
+/// A refusing cancel sink must cost a cancellation, never the way out.
+#[test]
+fn session_screen_a_full_cancel_sink_falls_through_to_shutdown() {
+    let (sender, mut shutdown) = terminal_event_channel();
+    let (cancels, _held) = mpsc::channel(1);
+    let mut screen =
+        SessionScreen::new(ViewContext::defaults(), sender).with_cancel_sink(cancels.clone());
+    screen.status.mark_running();
+    cancels.try_send(()).expect("the sink starts empty");
+
+    screen.handle_action(action("app_exit"), &press_none());
+
+    assert!(
+        matches!(shutdown.try_recv(), Ok(TerminalEvent::Shutdown)),
+        "a sink that could not take the request must not swallow the exit"
+    );
+}
+
 #[test]
 fn session_screen_is_dispatchable_through_the_keymap_without_naming_a_key() {
     let keymap = Keymap::defaults().expect("the shipped table builds");

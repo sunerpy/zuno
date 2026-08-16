@@ -679,6 +679,15 @@ impl TurnHost {
         &self.session_id
     }
 
+    /// A handle that aborts whichever turn this host has live.
+    ///
+    /// Resolving the live turn by session id rather than capturing a signal is what
+    /// lets the TUI hold one handle across every turn it drives — see
+    /// [`SessionRunRegistry::control`].
+    pub(crate) fn control(&self) -> zuno_engine::status::SessionControl {
+        self.runs.control(self.session_id.clone())
+    }
+
     pub(crate) fn with_event_hooks(&self, events: TurnEventSender) -> TurnEventSender {
         match &self.plugins {
             Some(plugins) => {
