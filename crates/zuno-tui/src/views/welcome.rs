@@ -123,8 +123,14 @@ pub type Hint = (&'static str, &'static str);
 /// the defect class this whole surface exists to remove, so re-introducing it *here* would
 /// be the worst possible place. `welcome_tests` asserts the property rather than trusting
 /// this note — `command_list` was on this list, bound to `ctrl+p`, and reached nothing.
-pub const HINTS: [Hint; 11] = [
+///
+/// It is back, because it now routes: [`crate::views::palette`] is what the forty-three
+/// rows the binding table ships with `keys: "none"` are reached through, so the palette is
+/// the entry point for a third of the application's capabilities rather than a convenience.
+/// It is listed second, right after `send`, for that reason.
+pub const HINTS: [Hint; 12] = [
     ("input_submit", "send"),
+    ("command_list", "commands"),
     ("model_list", "models"),
     ("agent_list", "agents"),
     ("input_newline", "newline"),

@@ -51,6 +51,7 @@ pub mod external;
 pub mod help;
 pub mod lsp;
 pub mod message;
+pub mod palette;
 pub mod permission;
 pub mod picker;
 pub mod question;

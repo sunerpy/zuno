@@ -56,6 +56,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use tokio::sync::mpsc;
 
+/// The dialog id the skill browser reports under.
+pub const SKILL_DIALOG_ID: &str = "prompt_skills";
+
 /// Rows reserved for the status strip and the prompt.
 const STATUS_ROWS: u16 = 1;
 const PROMPT_ROWS: u16 = 2;
@@ -557,8 +560,49 @@ impl SessionScreen {
             "prompt_skills" => self.request(self.skill_list()),
             "diff_open" => self.request(self.diff_view()),
             "help_show" => self.request(self.help_view()),
+            "command_list" => self.request(self.command_palette()),
             _ => EventResult::IGNORED,
         }
+    }
+
+    /// The command palette.
+    ///
+    /// Always available, and that is the point: forty-three rows of the binding table ship
+    /// with `keys: "none"`, faithfully to upstream, and upstream's answer for reaching one
+    /// is the palette. Without it a third of the table is unreachable by any means —
+    /// `command_list` was itself on the welcome screen's hint list, bound to `ctrl+p`, and
+    /// reached nothing, which is why it was removed from that list rather than wired.
+    fn command_palette(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
+        // The keymap rather than the shipped table, so the spelling each row shows is the
+        // one the user would actually press. Without a keymap there is nothing honest to
+        // print, and `request` says so instead of guessing.
+        let keymap = self.keymap.as_ref()?;
+        Some(Box::new(crate::views::palette::palette(
+            self.context.clone(),
+            keymap,
+        )))
+    }
+
+    /// Run the action a palette row named.
+    ///
+    /// Guarded against the palette naming itself, which would push a second palette over
+    /// the first and leave one behind on every later choice.
+    fn dispatch_action(&mut self, action: &str) -> EventResult {
+        if action == "command_list" {
+            return EventResult::IGNORED;
+        }
+        let Some(definition) = crate::keybind::definition(action) else {
+            return EventResult::IGNORED;
+        };
+        // A synthetic event with no key: the two readers both fall back to the action name.
+        // `handle_action` checks `APP_EXIT` before asking whether the chord is an exit
+        // chord, and `typed_character` yields nothing for a null key — correct here,
+        // because a palette choice is not a typed character.
+        let event = KeyEvent::new(
+            crossterm::event::KeyCode::Null,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        self.handle_action(definition, &event)
     }
 
     /// Ask the host to open `dialog`, or say why it cannot be opened.
@@ -724,6 +768,19 @@ impl SessionScreen {
             }
             crate::views::picker::SESSION_DIALOG_ID => Selection::Session(value.to_owned()),
             crate::views::picker::THEME_DIALOG_ID => Selection::Theme(value.to_owned()),
+            // The palette resolves to *another action's name*, so it re-enters the same
+            // routing a key press takes. That is what makes an unbound action reachable
+            // without a second copy of the routing table. Re-entry is bounded because the
+            // palette is excluded from what it can dispatch.
+            crate::views::palette::DIALOG_ID => return self.dispatch_action(value),
+            SKILL_DIALOG_ID => {
+                self.transcript
+                    .transcript_mut()
+                    .push(Message::notice(format!(
+                        "skill `{value}` — name it in a prompt to invoke it"
+                    )));
+                return EventResult::REDRAW;
+            }
             _ => return EventResult::IGNORED,
         };
         let notice = match &selection {

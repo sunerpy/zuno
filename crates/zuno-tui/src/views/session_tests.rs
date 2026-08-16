@@ -1215,3 +1215,153 @@ fn exposing_the_diff_scope_did_not_stop_its_bare_letters_being_typed() {
          screen:\n{joined}"
     );
 }
+
+#[test]
+fn session_command_palette_opens_and_dispatches_an_unbound_action() {
+    // The palette's reason to exist: forty-three rows of the binding table ship with
+    // `keys: "none"`, and upstream's answer for reaching one is the palette. This asserts
+    // the whole path — open it, choose a keyless action, and require that the action ran.
+    let (screen, _shutdown) = screen();
+    let mut screen = screen.with_keymap(Keymap::defaults().expect("the shipped table builds"));
+    assert_eq!(
+        screen.handle_action(action("command_list"), &press_none()),
+        EventResult::REDRAW
+    );
+    let mut opened = screen.drain_dialogs();
+    assert_eq!(opened.len(), 1, "the palette did not open");
+    let palette = opened.pop().expect("one dialog");
+    assert_eq!(palette.id(), crate::views::palette::DIALOG_ID);
+
+    // `display_thinking` is what the palette dispatches here; whether the table also binds it
+    // to a key is beside the point — applying the outcome must actually flip the affordance.
+    let before = screen.transcript.thinking();
+    let result = screen.apply_dialog_outcome(
+        crate::views::palette::DIALOG_ID,
+        &crate::views::dialog::DialogOutcome::Selected {
+            dialog: crate::views::palette::DIALOG_ID,
+            value: String::from("display_thinking"),
+        },
+    );
+    assert!(result.redraw);
+    assert_ne!(
+        screen.transcript.thinking(),
+        before,
+        "a palette choice did not run the action it named"
+    );
+}
+
+#[test]
+fn session_command_palette_refuses_to_open_itself() {
+    // Otherwise choosing "list available commands" inside the palette pushes a second one,
+    // and every later choice leaves one behind.
+    let (screen, _shutdown) = screen();
+    let mut screen = screen.with_keymap(Keymap::defaults().expect("the shipped table builds"));
+    screen.handle_action(action("command_list"), &press_none());
+    let _opened = screen.drain_dialogs();
+    let result = screen.apply_dialog_outcome(
+        crate::views::palette::DIALOG_ID,
+        &crate::views::dialog::DialogOutcome::Selected {
+            dialog: crate::views::palette::DIALOG_ID,
+            value: String::from("command_list"),
+        },
+    );
+    assert!(!result.handled, "the palette re-opened itself");
+    assert!(screen.drain_dialogs().is_empty());
+}
+
+#[test]
+fn session_command_palette_dispatches_a_dialog_opener_into_a_dialog() {
+    let (screen, _shutdown) = screen();
+    let mut screen = screen.with_keymap(Keymap::defaults().expect("the shipped table builds"));
+    screen.handle_action(action("command_list"), &press_none());
+    let _opened = screen.drain_dialogs();
+    screen.apply_dialog_outcome(
+        crate::views::palette::DIALOG_ID,
+        &crate::views::dialog::DialogOutcome::Selected {
+            dialog: crate::views::palette::DIALOG_ID,
+            value: String::from("help_show"),
+        },
+    );
+    let opened = screen.drain_dialogs();
+    assert_eq!(opened.len(), 1, "the palette's choice opened no dialog");
+    assert_eq!(opened[0].id(), crate::views::help::DIALOG_ID);
+}
+
+#[test]
+fn session_palette_needs_a_keymap_and_says_so_rather_than_guessing() {
+    // Without a keymap there is no honest spelling to print, so the screen reports it in
+    // the transcript instead of inventing one.
+    let (mut screen, _shutdown) = screen();
+    let result = screen.handle_action(action("command_list"), &press_none());
+    assert!(result.redraw);
+    assert!(
+        screen.drain_dialogs().is_empty(),
+        "a palette was built with no keymap to read spellings from"
+    );
+}
+
+#[test]
+fn session_every_action_the_palette_can_name_is_routed_or_harmlessly_ignored() {
+    // The palette offers every non-leader action, so dispatching any of them must not
+    // panic and must not be able to leave a dialog half-open. This is the blast-radius
+    // assertion for making a third of the binding table reachable at once.
+    for definition in crate::keybind::DEFINITIONS
+        .iter()
+        .filter(|row| !row.is_leader())
+    {
+        let (screen, _shutdown) = screen();
+        let mut screen = screen.with_keymap(Keymap::defaults().expect("the shipped table builds"));
+        let _ = screen.apply_dialog_outcome(
+            crate::views::palette::DIALOG_ID,
+            &crate::views::dialog::DialogOutcome::Selected {
+                dialog: crate::views::palette::DIALOG_ID,
+                value: definition.name.to_owned(),
+            },
+        );
+        assert!(
+            screen.drain_dialogs().len() <= 1,
+            "`{}` opened more than one dialog",
+            definition.name
+        );
+    }
+}
+
+#[test]
+fn session_skill_picker_reports_an_empty_skill_set_rather_than_an_empty_list() {
+    let (mut screen, _shutdown) = screen();
+    screen.handle_action(action("prompt_skills"), &press_none());
+    assert!(
+        screen.drain_dialogs().is_empty(),
+        "an empty skill set opened a picker saying `no matches`"
+    );
+}
+
+#[test]
+fn session_skill_picker_lists_discovered_skills_on_one_row_each() {
+    let (mut screen, _shutdown) = screen();
+    screen.sidebar_mut().ambient_mut().skills = vec![crate::views::ambient::SkillSummary {
+        name: String::from("codegraph"),
+        description: String::from("navigate\n  a  codebase"),
+    }];
+    screen.handle_action(action("prompt_skills"), &press_none());
+    let mut opened = screen.drain_dialogs();
+    assert_eq!(opened.len(), 1, "the skill picker did not open");
+    let mut picker = opened.pop().expect("one dialog");
+    assert_eq!(picker.id(), crate::views::picker::SKILL_DIALOG_ID);
+    let rendered = picker
+        .lines(80)
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("codegraph"), "{rendered}");
+    assert!(
+        rendered.contains("navigate a codebase"),
+        "the description kept its newlines: {rendered}"
+    );
+}

@@ -458,9 +458,17 @@ pub fn skill_list(
 ) -> SelectDialog {
     let items = skills
         .into_iter()
-        .map(|skill| Item::new(skill.name).described(skill.description))
+        // Whitespace collapsed: a skill's description is a paragraph in `SKILL.md`, and a
+        // list row is one line. Left as-is, an embedded newline ends the row early and the
+        // rest of the sentence renders as a second, unlabelled row.
+        .map(|skill| Item::new(skill.name).described(flatten(&skill.description)))
         .collect();
     SelectDialog::new(SKILL_DIALOG_ID, "Skills", context, items)
+}
+
+/// Collapse whitespace so a paragraph fits one list row.
+fn flatten(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The theme picker, previewing each theme's resolved palette.
