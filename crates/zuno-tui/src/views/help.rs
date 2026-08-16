@@ -220,7 +220,7 @@ impl Dialog for HelpView {
                 self.offset = 0;
                 DialogStep::Redraw
             }
-            "app_exit" | "help_show" | "dialog.select.submit" => {
+            "app_exit" | "session_interrupt" | "help_show" | "dialog.select.submit" => {
                 DialogStep::Resolved(DialogOutcome::Cancelled)
             }
             "input_backspace" => {
@@ -229,14 +229,16 @@ impl Dialog for HelpView {
                 self.set_filter(&filter);
                 DialogStep::Redraw
             }
-            _ => {
-                if let Some(character) = crate::views::permission::typed_character(event) {
-                    let filter = format!("{}{character}", self.filter);
-                    self.set_filter(&filter);
-                    return DialogStep::Redraw;
-                }
-                DialogStep::Ignored
-            }
+            _ => self.handle_typed(event),
         }
+    }
+
+    fn handle_typed(&mut self, key: &KeyEvent) -> DialogStep {
+        if let Some(character) = crate::views::permission::typed_character(key) {
+            let filter = format!("{}{character}", self.filter);
+            self.set_filter(&filter);
+            return DialogStep::Redraw;
+        }
+        DialogStep::Ignored
     }
 }

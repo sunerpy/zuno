@@ -665,19 +665,24 @@ impl Dialog for PermissionPrompt {
                     self.reject_message.pop();
                     DialogStep::Redraw
                 }
-                _ => {
-                    if let KeyCode::Char(character) = event.code
-                        && !event
-                            .modifiers
-                            .intersects(crossterm::event::KeyModifiers::CONTROL)
-                    {
-                        self.reject_message.push(character);
-                        return DialogStep::Redraw;
-                    }
-                    DialogStep::Ignored
-                }
+                _ => self.handle_typed(event),
             },
         }
+    }
+
+    fn handle_typed(&mut self, key: &KeyEvent) -> DialogStep {
+        if self.stage != Stage::RejectMessage {
+            return DialogStep::Ignored;
+        }
+        if let KeyCode::Char(character) = key.code
+            && !key
+                .modifiers
+                .intersects(crossterm::event::KeyModifiers::CONTROL)
+        {
+            self.reject_message.push(character);
+            return DialogStep::Redraw;
+        }
+        DialogStep::Ignored
     }
 }
 

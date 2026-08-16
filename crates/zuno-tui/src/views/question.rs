@@ -322,6 +322,17 @@ impl Dialog for QuestionPrompt {
         }
     }
 
+    fn handle_typed(&mut self, key: &KeyEvent) -> DialogStep {
+        if !self.editing {
+            return DialogStep::Ignored;
+        }
+        if let Some(character) = crate::views::permission::typed_character(key) {
+            self.typed.push(character);
+            return DialogStep::Redraw;
+        }
+        DialogStep::Ignored
+    }
+
     fn handle_action(&mut self, action: &'static Definition, event: &KeyEvent) -> DialogStep {
         if self.editing {
             match action.name {
@@ -335,13 +346,7 @@ impl Dialog for QuestionPrompt {
                     self.typed.clear();
                     return DialogStep::Redraw;
                 }
-                _ => {
-                    if let Some(character) = crate::views::permission::typed_character(event) {
-                        self.typed.push(character);
-                        return DialogStep::Redraw;
-                    }
-                    return DialogStep::Ignored;
-                }
+                _ => return self.handle_typed(event),
             }
         }
         match action.name {

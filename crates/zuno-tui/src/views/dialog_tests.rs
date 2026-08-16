@@ -483,3 +483,106 @@ fn views_observed_base_counts_both_event_families() {
     assert_eq!(base.terminal_events(), 1);
     assert!(base.inner().transcript().is_running());
 }
+
+#[test]
+fn views_dialog_typed_keys_filter_the_dialog_and_never_reach_the_base() {
+    // Observed on a real terminal: with the model picker open, typing a filter appended
+    // to the *prompt behind it* and never filtered anything, so the visible selection
+    // was whatever the unfiltered cursor happened to be on. Every keystroke did two
+    // wrong things at once, and the suite could not see either.
+    let context = ViewContext::defaults();
+    let (shutdown, _receiver) = crate::app::terminal_event_channel();
+    let mut screen = crate::views::session::SessionScreen::new(context.clone(), shutdown);
+    *screen.catalog_mut() = crate::views::session::SessionCatalog {
+        models: vec![
+            crate::views::picker::ModelEntry {
+                id: String::from("prov/alpha"),
+                name: String::from("alpha"),
+                provider: String::from("prov"),
+            },
+            crate::views::picker::ModelEntry {
+                id: String::from("prov/beta"),
+                name: String::from("beta"),
+                provider: String::from("prov"),
+            },
+        ],
+        ..crate::views::session::SessionCatalog::default()
+    };
+    let mut host = DialogHost::new(context, Box::new(screen));
+    host.handle_action(
+        crate::views::testkit::action("model_list"),
+        &press(KeyCode::Null),
+    );
+    assert!(host.is_open(), "the picker did not open");
+
+    for character in "beta".chars() {
+        host.handle_event(&AppEvent::Terminal(crate::app::TerminalEvent::Input(
+            crossterm::event::Event::Key(press(KeyCode::Char(character))),
+        )));
+    }
+    let joined = rows(&render_offscreen(&mut host, 70, 20).expect("infallible")).join("\n");
+    assert!(
+        joined.contains("beta"),
+        "the filter did not reach the dialog:\n{joined}"
+    );
+    assert!(
+        !joined.contains("alpha"),
+        "the filter did not narrow the list:\n{joined}"
+    );
+    // The base must not have been typed into. The dialog is drawn over the bottom of the
+    // frame, so the prompt is only observable once the dialog is gone.
+    assert!(host.dismiss());
+    let after = rows(&render_offscreen(&mut host, 70, 20).expect("infallible")).join("\n");
+    assert!(
+        !after.contains("beta"),
+        "typed text leaked into the prompt behind the dialog:\n{after}"
+    );
+}
+
+#[test]
+fn views_dialog_a_reject_box_can_still_be_typed_into() {
+    // The complement: routing unclaimed keys to the dialog must not stop the one dialog
+    // that legitimately collects free text from collecting it.
+    let context = ViewContext::defaults();
+    let mut host = DialogHost::new(
+        context.clone(),
+        Box::new(ObservedBase::new(
+            crate::views::message::TranscriptView::new(context.clone()),
+        )),
+    );
+    host.open(Box::new(
+        crate::views::permission::PermissionPrompt::new(
+            context,
+            zuno_permission::PermissionRequest {
+                id: String::from("r"),
+                session_id: String::from("s"),
+                permission: String::from("bash"),
+                patterns: Vec::new(),
+                metadata: serde_json::Map::new(),
+                always: Vec::new(),
+                tool: None,
+            },
+            &serde_json::json!({"command": "make"}),
+        )
+        .with_reject_message(true),
+    ));
+    // Reach the reject stage, then type a reason.
+    host.handle_action(
+        crate::views::testkit::action("dialog.select.end"),
+        &press(KeyCode::End),
+    );
+    host.handle_action(
+        crate::views::testkit::action("dialog.select.submit"),
+        &press(KeyCode::Enter),
+    );
+    for character in "nope".chars() {
+        host.handle_event(&AppEvent::Terminal(crate::app::TerminalEvent::Input(
+            crossterm::event::Event::Key(press(KeyCode::Char(character))),
+        )));
+    }
+    let joined = rows(&render_offscreen(&mut host, 70, 20).expect("infallible")).join("\n");
+    assert!(
+        joined.contains("nope"),
+        "the reject box no longer receives typed text:\n{joined}"
+    );
+}

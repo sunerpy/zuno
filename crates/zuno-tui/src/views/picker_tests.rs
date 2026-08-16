@@ -332,3 +332,30 @@ fn views_picker_ids_are_distinct() {
         "two pickers share a dialog id, so an outcome cannot be routed"
     );
 }
+
+#[test]
+fn views_picker_escape_cancels_because_its_footer_says_it_does() {
+    // Observed on a real terminal: the footer read `esc cancel` and escape did nothing,
+    // so the only way out of a picker was to choose something. `escape` resolves to
+    // `session_interrupt`, which the dialog previously ignored and the host absorbed.
+    let mut picker = model_picker(
+        ViewContext::defaults(),
+        vec![ModelEntry {
+            id: String::from("prov/one"),
+            name: String::from("one"),
+            provider: String::from("prov"),
+        }],
+    );
+    assert!(
+        picker.hints().iter().any(|(key, _)| *key == "esc"),
+        "the footer no longer advertises escape, so this test guards nothing"
+    );
+    assert_eq!(
+        picker.handle_action(
+            crate::views::testkit::action("session_interrupt"),
+            &crate::views::testkit::press(crossterm::event::KeyCode::Esc),
+        ),
+        DialogStep::Resolved(DialogOutcome::Cancelled),
+        "escape did not cancel the picker"
+    );
+}

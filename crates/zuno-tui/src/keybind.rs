@@ -896,6 +896,30 @@ pub trait ActionComponent: Component {
     fn pending_changed(&mut self, _pending: &[Chord]) -> EventResult {
         EventResult::IGNORED
     }
+
+    /// Dialogs this component asked for while handling the last action.
+    ///
+    /// A component below [`crate::views::dialog::DialogHost`] cannot open a dialog
+    /// itself: the host owns the stack, and the host owns *it*. Before this seam
+    /// existed, every picker in [`crate::views::picker`] was therefore constructible
+    /// only from its own tests — model, agent, session and theme switching were four
+    /// finished surfaces that no key press could reach.
+    ///
+    /// The request is the built dialog rather than a description of one, because the
+    /// component is what holds the list to put in it. The host only opens what it is
+    /// handed, so no inventory has to travel up.
+    fn drain_dialogs(&mut self) -> Vec<Box<dyn crate::views::dialog::Dialog>> {
+        Vec::new()
+    }
+
+    /// Observe the answer to a dialog this component asked for.
+    fn apply_dialog_outcome(
+        &mut self,
+        _dialog: &'static str,
+        _outcome: &crate::views::dialog::DialogOutcome,
+    ) -> EventResult {
+        EventResult::IGNORED
+    }
 }
 
 /// Turns key presses into actions before the component tree sees them.

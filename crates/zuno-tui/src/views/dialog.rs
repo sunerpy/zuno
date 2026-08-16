@@ -128,6 +128,16 @@ pub trait Dialog: Send {
     /// Act on one resolved binding.
     fn handle_action(&mut self, action: &'static Definition, event: &KeyEvent) -> DialogStep;
 
+    /// Act on a key no binding claimed, which is how a filter box is typed into.
+    ///
+    /// Separate from [`Dialog::handle_action`] because the two arrive by different routes:
+    /// an action comes from [`crate::keybind::KeyDispatcher`], while an unclaimed key
+    /// reaches the host as an ordinary event. A dialog that only implemented the former
+    /// could be navigated but not typed into.
+    fn handle_typed(&mut self, _key: &KeyEvent) -> DialogStep {
+        DialogStep::Ignored
+    }
+
     /// Rows the dialog wants, given the rows its body produced and the rows the
     /// frame has.
     ///
@@ -200,6 +210,16 @@ impl DialogHost {
     /// Close the top dialog without an outcome.
     pub fn dismiss(&mut self) -> bool {
         self.stack.pop().is_some()
+    }
+
+    /// Open whatever the base asked for, reporting whether anything opened.
+    fn open_requested(&mut self) -> bool {
+        let requested = self.base.drain_dialogs();
+        let opened = !requested.is_empty();
+        for dialog in requested {
+            self.stack.push(dialog);
+        }
+        opened
     }
 
     /// The pending leader chords, for a which-key surface.
@@ -304,11 +324,33 @@ impl Component for DialogHost {
         // single line is what keeps an open dialog from stalling the loop.
         match event {
             AppEvent::Terminal(crate::app::TerminalEvent::Input(crossterm::event::Event::Key(
-                _,
+                key,
             ))) => {
-                // Key routing belongs to `KeyDispatcher`, which calls
-                // `handle_action` below. Reaching here means no binding matched, so
-                // the base gets its chance.
+                // Key routing belongs to `KeyDispatcher`, which calls `handle_action`
+                // below. Reaching here means no binding matched — an ordinary printable
+                // character, in practice — so it belongs to whoever has the keyboard.
+                //
+                // While a dialog is open, that is the dialog and never the base. Sending
+                // it to the base instead is what put a picker's filter text into the
+                // prompt behind it: every keystroke both failed to filter and appended
+                // to a message the user was not writing. A modal owns the keyboard; only
+                // the exit chord is forwarded, and that is handled in `handle_action`.
+                if let Some(dialog) = self.stack.last_mut() {
+                    let id = dialog.id();
+                    return match dialog.handle_typed(key) {
+                        DialogStep::Resolved(outcome) => {
+                            self.stack.pop();
+                            self.base.apply_dialog_outcome(id, &outcome);
+                            self.outcomes.push((id, outcome));
+                            EventResult::REDRAW
+                        }
+                        DialogStep::Redraw => EventResult::REDRAW,
+                        DialogStep::Ignored => EventResult {
+                            handled: true,
+                            redraw: false,
+                        },
+                    };
+                }
                 self.base.handle_event(event)
             }
             _ => {
@@ -350,12 +392,22 @@ impl ActionComponent for DialogHost {
                 DialogStep::Redraw => EventResult::REDRAW,
                 DialogStep::Resolved(outcome) => {
                     self.stack.pop();
+                    // The base is told before the outcome is queued, so a component that
+                    // asked for the dialog can act on the answer without owning the
+                    // queue a host also drains.
+                    self.base.apply_dialog_outcome(id, &outcome);
                     self.outcomes.push((id, outcome));
+                    self.open_requested();
                     EventResult::REDRAW
                 }
             };
         }
-        self.base.handle_action(action, event)
+        let result = self.base.handle_action(action, event);
+        // Drained after the action, never before: the action is what asks.
+        if self.open_requested() {
+            return EventResult::REDRAW;
+        }
+        result
     }
 
     fn pending_changed(&mut self, pending: &[Chord]) -> EventResult {

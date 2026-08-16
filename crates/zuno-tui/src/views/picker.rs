@@ -307,22 +307,29 @@ impl Dialog for SelectDialog {
                 }),
                 None => DialogStep::Ignored,
             },
-            "app_exit" => DialogStep::Resolved(DialogOutcome::Cancelled),
+            // `session_interrupt` is the action the table binds to escape, and every
+            // dialog footer here advertises `esc cancel`. Without this arm the dialog
+            // ignored it, `DialogHost` absorbed it as an unrecognised action, and a
+            // picker could only be left by choosing something — a hint that lies, and
+            // the worse kind, because it names a way out that does not exist.
+            "app_exit" | "session_interrupt" => DialogStep::Resolved(DialogOutcome::Cancelled),
             "input_backspace" => {
                 let mut filter = self.filter.clone();
                 filter.pop();
                 self.set_filter(&filter);
                 DialogStep::Redraw
             }
-            _ => {
-                if let Some(character) = crate::views::permission::typed_character(event) {
-                    let filter = format!("{}{character}", self.filter);
-                    self.set_filter(&filter);
-                    return DialogStep::Redraw;
-                }
-                DialogStep::Ignored
-            }
+            _ => self.handle_typed(event),
         }
+    }
+
+    fn handle_typed(&mut self, key: &KeyEvent) -> DialogStep {
+        if let Some(character) = crate::views::permission::typed_character(key) {
+            let filter = format!("{}{character}", self.filter);
+            self.set_filter(&filter);
+            return DialogStep::Redraw;
+        }
+        DialogStep::Ignored
     }
 }
 
