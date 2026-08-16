@@ -938,9 +938,9 @@ fn views_status_strip_reports_cumulative_token_usage_and_never_loses_the_exit_hi
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>();
-    assert!(text.contains("in 3,000"), "[{text}]");
-    assert!(text.contains("out 750"), "[{text}]");
-    assert!(text.contains("cache 45"), "[{text}]");
+    assert!(text.contains("↑3,000"), "[{text}]");
+    assert!(text.contains("↓750"), "[{text}]");
+    assert!(text.contains("⚡45"), "[{text}]");
     assert!(text.contains(StatusView::EXIT_HINT), "[{text}]");
 
     // Under width pressure the counts go before the exit key, never the other way round.
@@ -954,7 +954,7 @@ fn views_status_strip_reports_cumulative_token_usage_and_never_loses_the_exit_hi
         narrow.contains(StatusView::EXIT_HINT),
         "the exit hint was dropped before the token counts: [{narrow}]"
     );
-    assert!(!narrow.contains("in 3,000"), "[{narrow}]");
+    assert!(!narrow.contains("↑3,000"), "[{narrow}]");
 }
 
 #[test]
@@ -972,9 +972,9 @@ fn views_status_strip_omits_a_cache_column_a_provider_never_reported() {
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>();
-    assert!(text.contains("in 12 out 3"), "[{text}]");
+    assert!(text.contains("↑12 ↓3"), "[{text}]");
     assert!(
-        !text.contains("cache"),
+        !text.contains('⚡'),
         "a permanent `cache 0` is a column of noise: [{text}]"
     );
 }

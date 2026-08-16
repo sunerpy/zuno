@@ -211,6 +211,24 @@ const CHANNELS: &[ChannelGate] = &[
         "zuno-tui/src/views/session.rs",
         "cancels.try_send(()).is_ok()",
     ),
+    gate(
+        "tui-edited-files",
+        "zuno-cli/src/cmd/tui.rs",
+        "let (edit_sender, edit_receiver) = mpsc::channel(LSP_CHANNEL_CAPACITY);",
+        "LSP_CHANNEL_CAPACITY=16",
+        Policy::RefuseNewest,
+        "zuno-tui/src/views/session.rs",
+        "let _sent = edits.try_send(batch);",
+    ),
+    gate(
+        "tui-diagnostic-reports",
+        "zuno-cli/src/cmd/tui.rs",
+        "let (report_sender, report_receiver) = mpsc::channel(LSP_CHANNEL_CAPACITY);",
+        "LSP_CHANNEL_CAPACITY=16",
+        Policy::RefuseNewest,
+        "zuno-cli/src/cmd/tui_lsp.rs",
+        "let _sent = reports.try_send(Report::unchecked(display));",
+    ),
     excluded(
         "plugin-wasm-completion",
         "zuno-plugin/src/wasm.rs",
@@ -277,7 +295,7 @@ fn source_channel_inventory_matches_the_declared_registry() {
             .iter()
             .filter(|entry| entry.exclusion.is_none())
             .count(),
-        19
+        21
     );
     assert_eq!(
         CHANNELS

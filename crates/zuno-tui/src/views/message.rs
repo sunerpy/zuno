@@ -192,6 +192,16 @@ impl ToolDisplay {
     }
 }
 
+/// Diagnostics a collapsed report lists.
+///
+/// Fewer than a tool result's rows because a diagnostic row is dense and the summary
+/// above it already carries the counts; the `tool_details` action expands both together,
+/// since a user asking for detail wants it everywhere rather than per part.
+pub const DIAGNOSTICS_PREVIEW_ROWS: usize = 4;
+
+/// Diagnostics an expanded report lists.
+pub const DIAGNOSTICS_MAX_ROWS: usize = 200;
+
 /// Rows of tool output shown before the collapse notice.
 ///
 /// Three is enough to see that a command produced the shape of output expected and
@@ -274,6 +284,15 @@ pub enum MessagePart {
         /// The message, already human-readable.
         text: String,
     },
+    /// What a language server said about a file the turn touched.
+    ///
+    /// Its own part rather than a notice because it has structure a notice does not —
+    /// severity, position, and the distinction between "checked and clean" and "nobody
+    /// checked" — and because it is styled by severity rather than as one warning.
+    Diagnostics {
+        /// The report, already sorted worst-first.
+        report: crate::views::lsp::Report,
+    },
 }
 
 impl MessagePart {
@@ -316,6 +335,16 @@ impl Message {
             role: Role::User,
             id: None,
             parts: vec![MessagePart::Text { text: text.into() }],
+        }
+    }
+
+    /// A session message carrying one language-server report.
+    #[must_use]
+    pub fn diagnostics(report: crate::views::lsp::Report) -> Self {
+        Self {
+            role: Role::System,
+            id: None,
+            parts: vec![MessagePart::Diagnostics { report }],
         }
     }
 
@@ -960,6 +989,13 @@ impl TranscriptView {
                     push(&format!("! {row}"), self.context.warning(), out);
                 }
             }
+            MessagePart::Diagnostics { report } => {
+                let limit = match self.tool_output {
+                    ToolDisplay::Collapsed => DIAGNOSTICS_PREVIEW_ROWS,
+                    ToolDisplay::Expanded => DIAGNOSTICS_MAX_ROWS,
+                };
+                out.extend(report.lines(width, limit, &self.context));
+            }
         }
     }
 
@@ -1083,6 +1119,13 @@ pub struct StatusView {
     configured_agent: Option<String>,
     configured_model: Option<String>,
     usage: TokenUsage,
+    /// The most recent language-server verdict.
+    ///
+    /// Kept separately from `detail` because `detail` is overwritten by the next
+    /// transport message, and "your edit does not compile" must not be displaced by
+    /// "connected". It is the same reasoning that put the shadowing warning in the
+    /// transcript.
+    diagnostics: Option<String>,
 }
 
 /// Token counts for the session, accumulated across every step of every turn.
@@ -1189,7 +1232,13 @@ impl StatusView {
             configured_agent: None,
             configured_model: None,
             usage: TokenUsage::default(),
+            diagnostics: None,
         }
+    }
+
+    /// Record the latest language-server verdict.
+    pub fn set_diagnostics(&mut self, summary: impl Into<String>) {
+        self.diagnostics = Some(summary.into());
     }
 
     /// Adopt the configured agent and model, so the idle strip is not just `idle`.
@@ -1259,6 +1308,9 @@ impl StatusView {
         self.model = None;
         self.step = 0;
         self.detail = None;
+        // `diagnostics` deliberately survives: it describes the working tree, not the
+        // turn, so clearing it at a turn boundary would hide a verdict that is still
+        // true. The next report replaces it.
     }
 
     /// The right-hand group: token usage, then the exit hint.
@@ -1323,12 +1375,24 @@ impl StatusView {
             }
             text.push_str(detail);
         }
+        if let Some(diagnostics) = &self.diagnostics {
+            if !text.is_empty() {
+                text.push_str(" · ");
+            }
+            text.push_str(diagnostics);
+        }
         if text.is_empty() {
             text.push_str(if self.running {
                 Self::WORKING
             } else {
                 Self::IDLE
             });
+        } else if !self.running && self.agent.is_none() && self.model.is_none() && self.step == 0 {
+            // Only when every field came from configuration. Saying `idle` beside a
+            // resolved agent, model and step would contradict the state it sits next
+            // to, which is the same defect as a strip that stays `idle` mid-turn.
+            text.push_str(" · ");
+            text.push_str(Self::IDLE);
         }
         text
     }

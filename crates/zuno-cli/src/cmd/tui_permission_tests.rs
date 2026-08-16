@@ -555,3 +555,58 @@ async fn auto_approval_never_parks_anything() {
             .is_ok()
     );
 }
+
+#[tokio::test]
+async fn a_wake_reaches_the_component_below_the_bridge() {
+    // The regression this guards: the bridge used to absorb `Wake` on the grounds that it
+    // "carries no state of its own". That was true while the permission broker was the
+    // only producer of one. The language-server probe is a second producer — it queues a
+    // report and then nudges — and a wake stopped here meant the report was never drained.
+    // Since a completed turn is the last event the loop sees, "the next event will pick it
+    // up" is not a fallback but never.
+    //
+    // The assertion is the real path: bridge -> dialog host -> screen -> drain ->
+    // transcript. The host is in the chain rather than skipped because it is the other
+    // component that has absorbed an event it did not recognise.
+    let (broker, _wake) = broker();
+    let context = ViewContext::defaults();
+    let (shutdown, _held) = tokio::sync::mpsc::channel(4);
+    let (reports, report_receiver) = tokio::sync::mpsc::channel(4);
+    let screen = zuno_tui::views::session::SessionScreen::new(context.clone(), shutdown)
+        .with_diagnostics_source(report_receiver);
+    let host = zuno_tui::views::dialog::DialogHost::new(context.clone(), Box::new(screen));
+    let mut bridge = PermissionBridge::new(context, Arc::clone(&broker), host);
+
+    reports
+        .try_send(zuno_tui::views::lsp::Report::checked(
+            "src/lib.rs",
+            "rust",
+            vec![zuno_tui::views::lsp::Diagnostic {
+                severity: zuno_tui::views::lsp::Severity::Error,
+                line: 2,
+                column: 9,
+                source: Some(String::from("rustc")),
+                message: String::from("mismatched types"),
+            }],
+        ))
+        .expect("the inlet accepts a report");
+
+    let result = bridge.handle_event(&AppEvent::Terminal(TerminalEvent::Wake));
+    assert!(
+        result.redraw,
+        "a wake carrying a queued report produced no frame"
+    );
+    let buffer = zuno_tui::app::render_offscreen(&mut bridge, 120, 24).expect("a frame");
+    let joined = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("mismatched types"),
+        "the report never reached the transcript, so the wake was absorbed:\n{joined}"
+    );
+}

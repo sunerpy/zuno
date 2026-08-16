@@ -70,6 +70,20 @@ pub struct SessionScreen {
     shutdown: mpsc::Sender<TerminalEvent>,
     prompts: Option<mpsc::Sender<String>>,
     cancels: Option<mpsc::Sender<()>>,
+    /// Language-server reports produced beside the loop.
+    ///
+    /// Drained with `try_recv` inside `handle_event`, which is the same non-blocking
+    /// shape the permission bridge uses: a receiver awaited here would stop the one loop
+    /// that consumes terminal input, engine events and the lease wake.
+    reports: Option<mpsc::Receiver<crate::views::lsp::Report>>,
+    /// Where the set of files a finished turn wrote is sent for checking.
+    edits: Option<mpsc::Sender<Vec<String>>>,
+    /// The files the running turn has written so far.
+    ///
+    /// Accumulated from the same `ToolDispatchCompleted` events the transcript renders,
+    /// so what is checked is exactly what the user was shown. A second listener wired
+    /// separately could disagree with the screen about what happened.
+    touched: Vec<String>,
     submissions: Vec<String>,
     cancellations: usize,
     cancel_requested: bool,
@@ -135,6 +149,9 @@ impl SessionScreen {
             shutdown,
             prompts: None,
             cancels: None,
+            reports: None,
+            edits: None,
+            touched: Vec::new(),
             submissions: Vec::new(),
             cancellations: 0,
             cancel_requested: false,
@@ -180,6 +197,100 @@ impl SessionScreen {
     #[must_use]
     pub const fn cancellations(&self) -> usize {
         self.cancellations
+    }
+
+    /// Report the files each finished turn wrote, for checking.
+    #[must_use]
+    pub fn with_edit_sink(mut self, edits: mpsc::Sender<Vec<String>>) -> Self {
+        self.edits = Some(edits);
+        self
+    }
+
+    /// The tools whose completion means a file on disk changed.
+    ///
+    /// `read` is deliberately absent: reporting the pre-existing diagnostics of a file
+    /// the model only read would attribute somebody else's problem to this turn.
+    pub const WRITING_TOOLS: [&'static str; 3] = ["edit", "write", "patch"];
+
+    /// Note a written file, and hand the batch over when the turn ends.
+    fn observe_edits(&mut self, event: &AppEvent) {
+        let AppEvent::Engine(turn) = event else {
+            return;
+        };
+        match turn {
+            zuno_engine::r#loop::TurnEvent::ToolDispatchCompleted {
+                name,
+                title,
+                is_error,
+                ..
+            } => {
+                // A failed write changed nothing, so its diagnostics would describe the
+                // file as it already was.
+                if !*is_error
+                    && Self::WRITING_TOOLS.contains(&name.as_str())
+                    && !title.trim().is_empty()
+                    && !self.touched.iter().any(|seen| seen == title.trim())
+                {
+                    self.touched.push(title.trim().to_owned());
+                }
+            }
+            zuno_engine::r#loop::TurnEvent::TurnCompleted { .. }
+            | zuno_engine::r#loop::TurnEvent::TurnInterrupted { .. } => {
+                if self.touched.is_empty() {
+                    return;
+                }
+                let batch = std::mem::take(&mut self.touched);
+                if let Some(edits) = self.edits.as_ref() {
+                    // `try_send` for the reason every sink here uses it: a full channel
+                    // costs a check, never a stalled render loop.
+                    let _sent = edits.try_send(batch);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Take language-server reports from `reports` as they arrive.
+    ///
+    /// Optional for the same reason the other two sinks are: a screen with no host has
+    /// nothing querying language servers, and a receiver it could never be fed would be
+    /// worse than none.
+    #[must_use]
+    pub fn with_diagnostics_source(
+        mut self,
+        reports: mpsc::Receiver<crate::views::lsp::Report>,
+    ) -> Self {
+        self.reports = Some(reports);
+        self
+    }
+
+    /// Drain every report that has arrived.
+    fn drain_reports(&mut self) -> EventResult {
+        let mut drained = Vec::new();
+        if let Some(reports) = self.reports.as_mut() {
+            while let Ok(report) = reports.try_recv() {
+                drained.push(report);
+            }
+        }
+        if drained.is_empty() {
+            return EventResult::IGNORED;
+        }
+        for report in drained {
+            self.report_diagnostics(report);
+        }
+        EventResult::REDRAW
+    }
+
+    /// Append a language-server report to the transcript.
+    ///
+    /// A method rather than letting the host reach through `transcript_mut` because the
+    /// report should also reach the status strip, and a host that pushed the message
+    /// itself would have to remember to do both.
+    pub fn report_diagnostics(&mut self, report: crate::views::lsp::Report) {
+        self.status.set_diagnostics(report.summary());
+        self.transcript
+            .transcript_mut()
+            .push(Message::diagnostics(report));
     }
 
     /// The transcript, for a host that appends locally composed messages.
@@ -344,8 +455,12 @@ impl Component for SessionScreen {
             self.editor.insert_char(character);
             return EventResult::REDRAW;
         }
-        self.transcript
-            .handle_event(event)
+        // Drained on every event rather than only on a wake, for the reason the
+        // permission bridge pumps on every event: a dropped nudge must not leave a
+        // verdict the user is waiting for sitting in a channel forever.
+        self.observe_edits(event);
+        self.drain_reports()
+            .merge(self.transcript.handle_event(event))
             .merge(self.status.handle_event(event))
     }
 }

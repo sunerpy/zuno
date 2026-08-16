@@ -809,3 +809,158 @@ fn session_screen_shows_the_welcome_surface_only_while_the_transcript_is_empty()
     );
     assert!(used.contains("first prompt"), "{used}");
 }
+
+#[test]
+fn session_reports_the_files_a_finished_turn_wrote_and_no_others() {
+    use zuno_engine::r#loop::TurnEvent;
+    let (shutdown, _keep) = mpsc::channel(4);
+    let (edits, mut written) = mpsc::channel(4);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), shutdown).with_edit_sink(edits);
+
+    let dispatched = |name: &str, title: &str, is_error: bool| {
+        AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
+            step: 1,
+            call_id: String::from("c"),
+            name: name.to_owned(),
+            title: title.to_owned(),
+            output: String::new(),
+            is_error,
+        })
+    };
+
+    screen.handle_event(&dispatched("edit", "src/lib.rs", false));
+    // A read changed nothing; reporting its pre-existing diagnostics would attribute
+    // somebody else's problem to this turn.
+    screen.handle_event(&dispatched("read", "src/other.rs", false));
+    // A failed write changed nothing either.
+    screen.handle_event(&dispatched("write", "src/failed.rs", true));
+    screen.handle_event(&dispatched("write", "src/new.rs", false));
+    // The same file twice is one entry.
+    screen.handle_event(&dispatched("edit", "src/lib.rs", false));
+    assert!(
+        written.try_recv().is_err(),
+        "the batch was sent before the turn finished"
+    );
+
+    screen.handle_event(&AppEvent::Engine(TurnEvent::TurnCompleted {
+        assistant_message_id: String::from("msg_1"),
+        steps: 1,
+    }));
+    assert_eq!(
+        written.try_recv(),
+        Ok(vec![String::from("src/lib.rs"), String::from("src/new.rs")])
+    );
+}
+
+#[test]
+fn session_sends_nothing_for_a_turn_that_wrote_nothing() {
+    use zuno_engine::r#loop::TurnEvent;
+    let (shutdown, _keep) = mpsc::channel(4);
+    let (edits, mut written) = mpsc::channel(4);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), shutdown).with_edit_sink(edits);
+    screen.handle_event(&AppEvent::Engine(TurnEvent::TurnCompleted {
+        assistant_message_id: String::from("msg_1"),
+        steps: 1,
+    }));
+    assert!(written.try_recv().is_err());
+}
+
+#[test]
+fn session_reports_an_interrupted_turns_writes_too() {
+    // An aborted turn may already have written; the user still needs to know whether what
+    // landed compiles.
+    use zuno_engine::r#loop::TurnEvent;
+    let (shutdown, _keep) = mpsc::channel(4);
+    let (edits, mut written) = mpsc::channel(4);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), shutdown).with_edit_sink(edits);
+    screen.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
+        step: 1,
+        call_id: String::from("c"),
+        name: String::from("edit"),
+        title: String::from("src/lib.rs"),
+        output: String::new(),
+        is_error: false,
+    }));
+    screen.handle_event(&AppEvent::Engine(TurnEvent::TurnInterrupted {
+        assistant_message_id: None,
+        steps: 1,
+    }));
+    assert_eq!(written.try_recv(), Ok(vec![String::from("src/lib.rs")]));
+}
+
+#[test]
+fn session_puts_an_arriving_report_in_the_transcript_and_on_the_strip() {
+    let (shutdown, _keep) = mpsc::channel(4);
+    let (reports, receiver) = mpsc::channel(4);
+    let mut screen =
+        SessionScreen::new(ViewContext::defaults(), shutdown).with_diagnostics_source(receiver);
+    reports
+        .try_send(crate::views::lsp::Report::checked(
+            "src/lib.rs",
+            "rust",
+            vec![crate::views::lsp::Diagnostic {
+                severity: crate::views::lsp::Severity::Error,
+                line: 7,
+                column: 2,
+                source: Some(String::from("rustc")),
+                message: String::from("mismatched types"),
+            }],
+        ))
+        .expect("the inlet accepts a report");
+    // Any event drains the inlet, for the reason the permission bridge pumps on every
+    // event: a dropped nudge must not leave a verdict sitting in a channel.
+    let result = screen.handle_event(&AppEvent::Terminal(TerminalEvent::Resize {
+        width: 120,
+        height: 40,
+    }));
+    assert!(result.redraw);
+
+    let rendered = crate::app::render_offscreen(&mut screen, 120, 24).expect("an offscreen frame");
+    let joined = crate::views::testkit::rows(&rendered).join("\n");
+    assert!(joined.contains("src/lib.rs"), "{joined}");
+    assert!(joined.contains("1 error"), "{joined}");
+    assert!(joined.contains("mismatched types"), "{joined}");
+    assert!(
+        joined.contains("7:2"),
+        "the position is missing, so the row cannot be acted on: {joined}"
+    );
+}
+
+#[test]
+fn session_diagnostics_survive_the_end_of_the_turn_that_produced_them() {
+    // The verdict describes the working tree, not the turn. Clearing it at a turn boundary
+    // would hide something that is still true.
+    use zuno_engine::r#loop::TurnEvent;
+    let (shutdown, _keep) = mpsc::channel(4);
+    let (reports, receiver) = mpsc::channel(4);
+    let mut screen =
+        SessionScreen::new(ViewContext::defaults(), shutdown).with_diagnostics_source(receiver);
+    reports
+        .try_send(crate::views::lsp::Report::checked(
+            "src/lib.rs",
+            "rust",
+            vec![crate::views::lsp::Diagnostic {
+                severity: crate::views::lsp::Severity::Error,
+                line: 1,
+                column: 1,
+                source: None,
+                message: String::from("boom"),
+            }],
+        ))
+        .expect("the inlet accepts a report");
+    screen.handle_event(&AppEvent::Terminal(TerminalEvent::Wake));
+    screen.handle_event(&AppEvent::Engine(TurnEvent::TurnCompleted {
+        assistant_message_id: String::from("msg_1"),
+        steps: 1,
+    }));
+    let rendered = crate::app::render_offscreen(&mut screen, 160, 24).expect("an offscreen frame");
+    let strip = crate::views::testkit::rows(&rendered)
+        .into_iter()
+        .rev()
+        .find(|row| row.contains("idle"))
+        .expect("the status strip");
+    assert!(
+        strip.contains("src/lib.rs"),
+        "the verdict was cleared when the turn ended: [{strip}]"
+    );
+}

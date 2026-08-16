@@ -49,6 +49,7 @@ pub mod diff;
 pub mod editor;
 pub mod external;
 pub mod help;
+pub mod lsp;
 pub mod message;
 pub mod permission;
 pub mod picker;
@@ -246,6 +247,24 @@ pub fn padded(text: &str, width: u16, style: Style) -> Line<'static> {
         owned.extend(std::iter::repeat_n(' ', width - len));
     }
     Line::from(Span::styled(owned, style))
+}
+
+/// How many columns `text` is assumed to occupy.
+///
+/// Counted in characters, matching [`padded`] and [`ambient::elide_left`], rather than
+/// in East-Asian display cells. That undercounts a wide glyph, but every width decision
+/// in this module already counts the same way, and one helper measuring differently from
+/// the padding applied beside it produces rows that disagree about where they end — a
+/// worse artefact than a uniformly narrow estimate.
+#[must_use]
+pub fn display_width(text: &str) -> usize {
+    text.chars().count()
+}
+
+/// The longest prefix of `text` that fits in `width` columns.
+#[must_use]
+pub fn truncate(text: &str, width: usize) -> String {
+    text.chars().take(width).collect()
 }
 
 /// The terminal width at or above which the ambient sidebar is drawn.

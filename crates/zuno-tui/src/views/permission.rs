@@ -50,6 +50,9 @@ mod tests;
 /// The dialog id [`DialogOutcome`] carries for this prompt.
 pub const DIALOG_ID: &str = "permission";
 
+/// Rows a collapsed prompt is capped at (`permission.tsx:626`).
+pub const COLLAPSED_MAX_ROWS: u16 = 15;
+
 /// What the user decided about one permission request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionDecision {
@@ -575,12 +578,17 @@ impl Dialog for PermissionPrompt {
     }
 
     fn desired_height(&self, content_rows: u16, available: u16) -> u16 {
+        let fitted = content_rows.saturating_add(2).min(available);
         if self.expanded {
-            return available;
+            // The whole frame is the *ceiling*, not the height. A three-line diff
+            // expanded to fifty rows paints thirty-eight empty ones and looks like the
+            // prompt broke; the point of expanding is to stop capping a diff that is
+            // genuinely long, not to inflate a short one.
+            return fitted;
         }
         // `permission.tsx:626` caps a collapsed prompt at 15 rows so the transcript
         // behind it stays readable — which is what makes the prompt decidable.
-        content_rows.saturating_add(2).min(available).min(15)
+        fitted.min(COLLAPSED_MAX_ROWS)
     }
 
     fn handle_action(&mut self, action: &'static Definition, event: &KeyEvent) -> DialogStep {

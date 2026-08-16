@@ -14,6 +14,7 @@ mod session_list;
 mod session_prune;
 mod tool_runtime;
 mod tui;
+mod tui_lsp;
 mod tui_permission;
 mod turn;
 

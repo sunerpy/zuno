@@ -227,15 +227,15 @@ impl Component for PermissionBridge {
     }
 
     fn handle_event(&mut self, event: &AppEvent) -> EventResult {
-        let pumped = self.pump();
-        // A wake carries no state of its own, so there is nothing below to hand it to.
-        if matches!(event, AppEvent::Terminal(TerminalEvent::Wake)) {
-            return EventResult {
-                handled: true,
-                redraw: pumped.redraw,
-            };
-        }
-        pumped.merge(self.host.handle_event(event))
+        // A wake is forwarded like every other non-key event. It used to be swallowed
+        // here on the grounds that "a wake carries no state of its own, so there is
+        // nothing below to hand it to" — which was true while this broker was the only
+        // thing that nudged the loop. It stopped being true the moment a second producer
+        // existed: the language-server probe queues a report and then nudges, and a wake
+        // absorbed here meant the report was never drained. A completed turn is the last
+        // event the loop will see, so "it will be picked up on the next event" is not a
+        // fallback — it is never.
+        self.pump().merge(self.host.handle_event(event))
     }
 }
 

@@ -56,6 +56,9 @@ use crate::environment::StartupEnvironment;
 /// How many prompts may be in flight. One, so a second is refused and not queued.
 const PROMPT_CHANNEL_CAPACITY: usize = 1;
 
+/// How many language-server reports may be queued.
+const LSP_CHANNEL_CAPACITY: usize = super::tui_lsp::REPORT_CHANNEL_CAPACITY;
+
 /// How many cancellation requests may be queued.
 ///
 /// One, because aborting a turn is idempotent: a second request for the same turn
@@ -98,6 +101,14 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         title: None,
     };
     let plan = runtime.block_on(TurnPlan::resolve(&options, environment))?;
+    // Cloned before `TurnHost::open` consumes the plan, because the language-server
+    // probe is built after the host is open and would otherwise have nothing to read
+    // its server list and workspace root from.
+    let lsp_config = plan.config().clone();
+    let lsp_workspace = plan
+        .worktree()
+        .unwrap_or_else(|| plan.directory())
+        .to_path_buf();
     let tui_plugins = runtime.block_on(plan.load_tui_plugins(environment));
     // Read before `TurnHost::open` consumes the plan, and before raw mode, so a slow
     // skill scan cannot delay the first frame of an already-entered alternate screen.
@@ -121,11 +132,20 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
     let (selection_sender, selection_receiver) = mpsc::channel(SELECTION_CHANNEL_CAPACITY);
     let control = host.control();
 
+    let (report_sender, report_receiver) = mpsc::channel(LSP_CHANNEL_CAPACITY);
+    let (edit_sender, edit_receiver) = mpsc::channel(LSP_CHANNEL_CAPACITY);
+    let probe = super::tui_lsp::Probe::resolve(
+        &lsp_config,
+        lsp_workspace.as_path(),
+        terminal_sender.clone(),
+    );
     let mut screen = SessionScreen::new(context.clone(), terminal_sender.clone())
         .with_prompt_sink(prompt_sender)
         .with_cancel_sink(cancel_sender)
         .with_selection_sink(selection_sender)
         .with_catalog(catalog)
+        .with_diagnostics_source(report_receiver)
+        .with_edit_sink(edit_sender)
         // A clone rather than a borrow: `KeyDispatcher` takes the keymap by value below,
         // and the keybinding reference has to list what the *user's* keymap resolved
         // rather than the shipped defaults.
@@ -167,10 +187,16 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
             driver_environment,
             engine_sender,
         ));
+        let checks = tokio::spawn(super::tui_lsp::check_edits(
+            probe,
+            edit_receiver,
+            report_sender,
+        ));
         let cancels = tokio::spawn(forward_cancellations(control, cancel_receiver));
         let outcome = app.run().await;
         input.abort();
         turns.abort();
+        checks.abort();
         cancels.abort();
         if let Some(plugins) = plugins {
             plugins.shutdown().await;

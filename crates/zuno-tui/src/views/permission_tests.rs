@@ -287,7 +287,20 @@ fn views_permission_fullscreen_toggle_changes_the_requested_height() {
         &key(KeyCode::Char('f')),
     );
     assert!(prompt.is_expanded());
-    assert_eq!(prompt.desired_height(30, 40), 40);
+    // Expanding lifts the cap; the frame is the ceiling rather than the height. This
+    // assertion used to demand the whole 40 rows for 30 rows of content, and that is
+    // exactly the behaviour that painted thirty-eight blank rows around a three-line
+    // diff on a 200×50 terminal.
+    assert_eq!(
+        prompt.desired_height(30, 40),
+        32,
+        "an expanded prompt should fit its content, not stretch to the frame"
+    );
+    assert_eq!(
+        prompt.desired_height(80, 40),
+        40,
+        "content longer than the frame must still be allowed all of it"
+    );
 }
 
 #[test]
@@ -486,5 +499,76 @@ fn views_permission_typed_character_rejects_a_control_chord() {
         typed_character(&control),
         None,
         "ctrl+a was treated as typed text, so a chord would insert a letter"
+    );
+}
+
+#[test]
+fn permission_expanded_prompt_does_not_inflate_a_short_body_to_the_whole_frame() {
+    // Measured at 200×50: pressing the fullscreen key on a three-line diff produced
+    // thirty-eight blank rows inside the prompt's border, which reads as a broken frame.
+    // Expanding must lift the cap, not stretch the content.
+    let mut prompt = PermissionPrompt::new(
+        ViewContext::defaults(),
+        request("edit"),
+        &serde_json::json!({
+            "filePath": "/work/demo.txt",
+            "oldString": "second line\n",
+            "newString": "second line, amended\nan inserted line\n"
+        }),
+    );
+    let rows = u16::try_from(prompt.lines(200).len()).expect("a row count");
+    let collapsed = prompt.desired_height(rows, 50);
+    assert!(
+        collapsed <= COLLAPSED_MAX_ROWS,
+        "a collapsed prompt must stay capped: {collapsed}"
+    );
+
+    prompt.handle_action(
+        crate::views::testkit::action("permission.prompt.fullscreen"),
+        &crate::views::testkit::press(crossterm::event::KeyCode::Char('f')),
+    );
+    assert!(prompt.is_expanded());
+    let expanded = prompt.desired_height(rows, 50);
+    assert!(
+        expanded < 50,
+        "an expanded short prompt claimed the whole frame: {expanded}"
+    );
+    assert!(
+        expanded >= collapsed,
+        "expanding made the prompt smaller: {expanded} < {collapsed}"
+    );
+}
+
+#[test]
+fn permission_expanded_prompt_uses_the_frame_when_the_diff_is_genuinely_long() {
+    // The other half: expanding exists so a long diff stops being truncated at fifteen
+    // rows. A version that always fitted the content would cap nothing.
+    let mut prompt = PermissionPrompt::new(
+        ViewContext::defaults(),
+        request("edit"),
+        &serde_json::json!({
+            "filePath": "/work/demo.txt",
+            "oldString": "old\n".repeat(60),
+            "newString": "new\n".repeat(60)
+        }),
+    );
+    let rows = u16::try_from(prompt.lines(200).len()).expect("a row count");
+    assert!(
+        rows > COLLAPSED_MAX_ROWS,
+        "the fixture is not long enough: {rows}"
+    );
+    assert_eq!(
+        prompt.desired_height(rows, 50),
+        COLLAPSED_MAX_ROWS,
+        "a long collapsed diff must be capped"
+    );
+    prompt.handle_action(
+        crate::views::testkit::action("permission.prompt.fullscreen"),
+        &crate::views::testkit::press(crossterm::event::KeyCode::Char('f')),
+    );
+    assert_eq!(
+        prompt.desired_height(rows, 50),
+        50,
+        "an expanded long diff must be allowed the whole frame"
     );
 }
