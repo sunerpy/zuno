@@ -388,7 +388,7 @@ fn clean_shutdown_reaps_every_host_process_tree() {
     let directory = tempfile::tempdir().expect("G6 fixture directory");
     let (mut parent, ready, stop) = spawn_reaping_parent(directory.path());
     wait_for_reaping_ready(&mut parent, &ready);
-    let pids = snapshot_fixture_tree(parent.id());
+    let pids = snapshot_fixture_tree(&mut parent);
 
     std::fs::write(&stop, b"stop").expect("request clean host shutdown");
     let status = parent.wait().expect("wait for clean fixture parent");
@@ -402,7 +402,7 @@ fn parent_sigkill_reaps_every_host_process_tree() {
     let directory = tempfile::tempdir().expect("G6 fixture directory");
     let (mut parent, ready, _stop) = spawn_reaping_parent(directory.path());
     wait_for_reaping_ready(&mut parent, &ready);
-    let pids = snapshot_fixture_tree(parent.id());
+    let pids = snapshot_fixture_tree(&mut parent);
 
     let pid = rustix::process::Pid::from_raw(parent.id() as i32).expect("non-zero parent PID");
     rustix::process::kill_process(pid, rustix::process::Signal::KILL)
@@ -586,17 +586,43 @@ fn wait_for_reaping_ready(parent: &mut Child, ready: &Path) {
     }
 }
 
+/// Wait until every process the fixture will fork exists, then snapshot the tree.
+///
+/// `ready` proves each host answered its handshake, which is weaker than "the
+/// fork storm finished": a guarded host is a four-process chain (`supervise`
+/// guard, `monitor` guard, host, grandchild) and `PtyService::create` returns
+/// once only the outermost guard is spawned, so a PTY chain can still owe three
+/// PIDs. A loaded CI runner observed 27 of 33 and failed a reaping test on a
+/// forking symptom.
+///
+/// The threshold must stay at the full topology. Lowering it to whatever a slow
+/// machine reaches would run the reaping assertion against a tree that was never
+/// fully built, which is exactly what this gate exists to catch.
 #[cfg(target_os = "linux")]
-fn snapshot_fixture_tree(root: u32) -> Vec<u32> {
-    let sample = zuno_testkit::perf::sample_process_tree(root, Instant::now())
-        .expect("sample complete G6 fixture process tree");
+fn snapshot_fixture_tree(parent: &mut Child) -> Vec<u32> {
+    let root = parent.id();
     let minimum = 1 + HOST_SESSION_COUNT * HOST_KIND_COUNT * CONTAINED_PROCESSES_PER_HOST;
-    assert!(
-        sample.pids.len() >= minimum,
-        "G6 fixture tree is incomplete: expected at least {minimum}, got {:?}",
-        sample.pids
-    );
-    sample.pids
+    let started = Instant::now();
+    loop {
+        let sample = zuno_testkit::perf::sample_process_tree(root, Instant::now())
+            .expect("sample G6 fixture process tree");
+        if sample.pids.len() >= minimum {
+            return sample.pids;
+        }
+        if let Some(status) = parent.try_wait().expect("poll G6 fixture parent") {
+            panic!("G6 fixture parent exited while its tree was still forking: {status}");
+        }
+        assert!(
+            started.elapsed() < REAP_TIMEOUT,
+            "G6 fixture tree never finished forking within {REAP_TIMEOUT:?}: \
+             expected at least {minimum} PIDs, observed {} — {:?}. \
+             This is an incomplete fork, not an incomplete reap: \
+             no fixture process has been signalled yet.",
+            sample.pids.len(),
+            sample.pids
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -609,7 +635,11 @@ fn assert_all_fixture_pids_exit(pids: &[u32]) {
         }
         assert!(
             started.elapsed() < REAP_TIMEOUT,
-            "owned G6 fixture PIDs were not reaped: {remaining:?}"
+            "G6 fixture tree finished forking with {} PIDs but {} survived {REAP_TIMEOUT:?} \
+             after shutdown: {remaining:?}. \
+             This is an incomplete reap, not an incomplete fork.",
+            pids.len(),
+            remaining.len()
         );
         std::thread::sleep(Duration::from_millis(10));
     }
