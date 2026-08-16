@@ -163,6 +163,13 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
+      # `cargo metadata` below needs a toolchain, and the CodeBuild Linux image
+      # does not ship one — unlike the GitHub-hosted `ubuntu-*` images, where cargo
+      # is preinstalled and this step looked unnecessary. The job failed with
+      # `cargo: command not found` on the pipeline's first ever run.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
       - name: Resolve and cross-check the version
         id: resolve
         shell: bash
