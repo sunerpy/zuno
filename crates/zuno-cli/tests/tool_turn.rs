@@ -519,6 +519,9 @@ fn variables(env: &ScriptedEnv, base_url: &str) -> BTreeMap<String, String> {
 fn js_plugin_variables(env: &ScriptedEnv, base_url: &str) -> BTreeMap<String, String> {
     let mut variables = variables(env, base_url);
     variables.remove("ZUNO_PURE");
+    // Removing `ZUNO_PURE` no longer loads anything: the JavaScript host is opt-in, so
+    // a test that asserts on plugin behaviour has to ask for it the way a user does.
+    variables.insert("ZUNO_ENABLE_JS_PLUGINS".to_owned(), "1".to_owned());
     variables.insert("PATH".to_owned(), js_runtime_path());
     variables
 }
@@ -1427,6 +1430,71 @@ async fn a_real_plugin_tool_reaches_and_executes_through_the_production_registry
     assert!(
         tool_result.contains("Not authenticated with Antigravity"),
         "the model call did not execute antigravity's own google_search implementation; result={tool_result:?}, body={continuation:#}"
+    );
+}
+
+/// The JavaScript host stays off unless somebody asks for it.
+///
+/// The inverse of `auto_discovered_plugins_load_from_all_four_directories_through_the_real_binary`,
+/// and deliberately so: that test's premise — plugins load because nothing stopped
+/// them — is no longer the product's behaviour. Each JavaScript plugin spawns a Node
+/// process, which measured as 98% of `models` startup, so loading is now opt-in and
+/// this pins the new default.
+///
+/// `ZUNO_PURE` is explicitly *absent*, which is the whole point: it proves the gate is
+/// the missing opt-in rather than the pre-existing kill switch. The four plugins are
+/// planted in the same four discovered directories, so the only reason a factory does
+/// not run is the policy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_discovered_plugins_do_not_load_without_the_explicit_opt_in() {
+    let env = ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::TempFile);
+    let local = env.project().join(".zuno");
+    let global = env.xdg_config().join("zuno");
+    for plugin in [
+        local.join("plugin/project-singular.js"),
+        local.join("plugins/project-plural.js"),
+        global.join("plugin/global-singular.js"),
+        global.join("plugins/global-plural.js"),
+    ] {
+        std::fs::create_dir_all(plugin.parent().expect("plugin parent"))
+            .expect("create auto-plugin directory");
+        std::fs::write(&plugin, AUTO_DISCOVERY_PLUGIN).expect("write auto-discovered plugin");
+    }
+    let load_log = env.project().join("must-stay-absent.log");
+
+    let mut plugin_variables = js_plugin_variables(&env, "http://127.0.0.1:1");
+    plugin_variables.remove("ZUNO_ENABLE_JS_PLUGINS");
+    assert!(
+        !plugin_variables.contains_key("ZUNO_PURE"),
+        "this test must prove the opt-in gates loading, not `--pure`"
+    );
+    plugin_variables.insert(
+        "AUTO_DISCOVERY_LOG".to_owned(),
+        load_log.display().to_string(),
+    );
+
+    let mut command = tokio::process::Command::new(binary());
+    command
+        .args(["models"])
+        .current_dir(env.working_dir())
+        .env_clear()
+        .envs(plugin_variables);
+    let output = tokio::time::timeout(Duration::from_secs(90), command.output())
+        .await
+        .expect("the run must finish inside its budget")
+        .expect("launch models run");
+
+    assert!(
+        output.status.success(),
+        "listing models must not depend on the plugin host\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !load_log.exists(),
+        "a plugin factory ran without the opt-in; the log it wrote is {}",
+        std::fs::read_to_string(&load_log).unwrap_or_default()
     );
 }
 

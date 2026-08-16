@@ -25,13 +25,15 @@ pub const ZUNO_PRINT_LOGS: &str = "ZUNO_PRINT_LOGS";
 pub const ZUNO_LOG_LEVEL: &str = "ZUNO_LOG_LEVEL";
 /// Disables external plugins while preserving built-ins.
 pub const ZUNO_PURE: &str = "ZUNO_PURE";
+/// Starts the JavaScript plugin host, which is otherwise off.
+pub const ZUNO_ENABLE_JS_PLUGINS: &str = "ZUNO_ENABLE_JS_PLUGINS";
 
 /// Every `OPENCODE_*` input read by `flag.ts:3-78`, plus the four values produced
 /// or consumed by the CLI middleware itself.
 ///
 /// There are 33 unique names in the source extraction and four CLI/runtime names:
 /// `OPENCODE`, `OPENCODE_PID`, `OPENCODE_PRINT_LOGS`, and `OPENCODE_LOG_LEVEL`.
-pub const ZUNO_FLAG_NAMES: [&str; 38] = [
+pub const ZUNO_FLAG_NAMES: [&str; 39] = [
     "ZUNO_ALWAYS_NOTIFY_UPDATE",
     "ZUNO_AUTO_HEAP_SNAPSHOT",
     "OPENCODE_CLIENT",
@@ -48,6 +50,7 @@ pub const ZUNO_FLAG_NAMES: [&str; 38] = [
     "ZUNO_DISABLE_PROJECT_CONFIG",
     "ZUNO_DISABLE_PRUNE",
     "ZUNO_DISABLE_TERMINAL_TITLE",
+    ZUNO_ENABLE_JS_PLUGINS,
     "ZUNO_EXPERIMENTAL",
     "ZUNO_EXPERIMENTAL_DISABLE_COPY_ON_SELECT",
     "ZUNO_EXPERIMENTAL_DISABLE_FILEWATCHER",

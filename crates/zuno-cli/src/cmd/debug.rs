@@ -116,6 +116,17 @@ fn config(context: &Context) -> Result<(), String> {
             serde_json::to_value(origins).map_err(to_string)?,
         );
     }
+    // Reported unconditionally, and alongside the discovered plugins rather than
+    // instead of them: "these were found but the host is off" is the state a user
+    // whose plugins stopped running actually needs to see.
+    let policy = super::plugin_runtime::JsPluginPolicy::resolve(&context.config, &context.env);
+    object.insert(
+        "plugin_runtime_resolved".to_owned(),
+        serde_json::json!({
+            "javascript": policy.enabled,
+            "source": policy.source,
+        }),
+    );
     normalize_json_numbers(&mut output);
     print_json(&output)
 }

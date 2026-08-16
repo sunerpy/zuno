@@ -45,13 +45,29 @@ pub(super) fn execute(args: &ModelsArgs, environment: &StartupEnvironment) -> Re
             .map(zuno_llm::catalog::LoadedCatalog::into_document)
             .map_err(|error| error.to_string())?;
 
+        let policy = super::plugin_runtime::JsPluginPolicy::resolve(&config, env);
+        // Named only when a plugin was configured and the host is off. Announcing it
+        // unprompted would be noise on every run; staying silent for someone whose
+        // configured plugin stopped contributing models is the "no results" and
+        // "cannot see the data" confusion. stderr, so piped stdout stays a clean
+        // `provider/model` list.
+        if !policy.enabled && config.plugin.as_ref().is_some_and(|list| !list.is_empty()) {
+            eprintln!(
+                "note: {} configured plugin(s) are not loaded because the JavaScript \
+                 plugin host is off ({}); enable it with `{}=1` or \
+                 `\"plugin_runtime\": {{\"javascript\": true}}`",
+                config.plugin.as_ref().map_or(0, Vec::len),
+                policy.source,
+                crate::ZUNO_ENABLE_JS_PLUGINS,
+            );
+        }
         let Some(plugins) = super::plugin_runtime::PluginRuntime::load(
             &config,
             &project,
             &directory,
             worktree.unwrap_or(directory.as_path()),
             &layout,
-            env.flag(crate::ZUNO_PURE),
+            policy,
             super::plugin_runtime::PluginRuntimeTarget::server("models"),
         )
         .await

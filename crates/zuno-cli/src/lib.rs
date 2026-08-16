@@ -22,8 +22,8 @@ pub use disposition::{
     validate_upstream_surface,
 };
 pub use environment::{
-    AGENT, OpenCodeFlags, StartupEnvironment, ZUNO, ZUNO_FLAG_NAMES, ZUNO_LOG_LEVEL, ZUNO_PID,
-    ZUNO_PRINT_LOGS, ZUNO_PURE,
+    AGENT, OpenCodeFlags, StartupEnvironment, ZUNO, ZUNO_ENABLE_JS_PLUGINS, ZUNO_FLAG_NAMES,
+    ZUNO_LOG_LEVEL, ZUNO_PID, ZUNO_PRINT_LOGS, ZUNO_PURE,
 };
 pub use version::{
     BUILD_ID, COMPATIBILITY_VERSION, RUST_PACKAGE_VERSION, compatibility_version, long_version,

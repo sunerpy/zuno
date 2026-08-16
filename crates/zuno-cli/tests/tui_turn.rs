@@ -251,6 +251,9 @@ fn run_plugin_kind_startup(
     })?;
     let mut variables = variables(env, base_url);
     variables.remove("ZUNO_PURE");
+    // Removing `ZUNO_PURE` no longer loads anything: the JavaScript host is opt-in, so
+    // a test that asserts on plugin behaviour has to ask for it the way a user does.
+    variables.insert("ZUNO_ENABLE_JS_PLUGINS".to_owned(), "1".to_owned());
     variables.insert(
         "OPENCODE_CONFIG_CONTENT".to_owned(),
         plugin_kind_config(

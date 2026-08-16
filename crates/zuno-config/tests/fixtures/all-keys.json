@@ -48,6 +48,7 @@
     "opencode-antigravity-auth@1.6.0",
     ["@sunerpy/oh-my-openagent", { "level": "verbose", "retries": 3 }]
   ],
+  "plugin_runtime": { "javascript": true },
   "share": "manual",
   "autoupdate": "notify",
   "disabled_providers": ["openai"],

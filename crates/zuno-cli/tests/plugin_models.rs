@@ -311,6 +311,9 @@ async fn real_auth_plugin_providers_reach_the_plain_models_surface() {
         .env("ZUNO_DISABLE_MODELS_FETCH", "true")
         .env("ZUNO_DISABLE_DEFAULT_PLUGINS", "true")
         .env("ZUNO_DISABLE_LSP_DOWNLOAD", "true")
+        // Opt in the way a user must: the JavaScript host no longer starts by default,
+        // and these tests are about what a real plugin contributes.
+        .env("ZUNO_ENABLE_JS_PLUGINS", "1")
         .env("ZUNO_MODELS_PATH", &catalog)
         .env("OPENCODE_CONFIG_CONTENT", config.to_string())
         .env(
@@ -394,6 +397,9 @@ async fn antigravity_auth_loader_zeroes_google_cost_on_the_verbose_models_surfac
         .env("ZUNO_DISABLE_MODELS_FETCH", "true")
         .env("ZUNO_DISABLE_DEFAULT_PLUGINS", "true")
         .env("ZUNO_DISABLE_LSP_DOWNLOAD", "true")
+        // Opt in the way a user must: the JavaScript host no longer starts by default,
+        // and these tests are about what a real plugin contributes.
+        .env("ZUNO_ENABLE_JS_PLUGINS", "1")
         .env("ZUNO_MODELS_PATH", &catalog)
         .env("OPENCODE_CONFIG_CONTENT", config.to_string())
         .env(
@@ -467,6 +473,9 @@ async fn failing_auth_loader_is_disabled_and_models_lists_models_with_a_diagnost
         .env("ZUNO_DISABLE_MODELS_FETCH", "true")
         .env("ZUNO_DISABLE_DEFAULT_PLUGINS", "true")
         .env("ZUNO_DISABLE_LSP_DOWNLOAD", "true")
+        // Opt in the way a user must: the JavaScript host no longer starts by default,
+        // and these tests are about what a real plugin contributes.
+        .env("ZUNO_ENABLE_JS_PLUGINS", "1")
         .env("ZUNO_MODELS_PATH", &catalog)
         .env("OPENCODE_CONFIG_CONTENT", config.to_string())
         .env(

@@ -173,7 +173,7 @@ impl TurnPlan {
             &directory,
             worktree.as_deref().unwrap_or(directory.as_path()),
             &layout,
-            env.flag(crate::ZUNO_PURE),
+            super::plugin_runtime::JsPluginPolicy::resolve(&config, env),
             super::plugin_runtime::PluginRuntimeTarget::server("turn"),
         )
         .await
@@ -301,7 +301,7 @@ impl TurnPlan {
             &self.directory,
             worktree,
             &layout,
-            env.flag(crate::ZUNO_PURE),
+            super::plugin_runtime::JsPluginPolicy::resolve(&self.config, env),
             super::plugin_runtime::PluginRuntimeTarget::tui("tui"),
         )
         .await

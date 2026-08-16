@@ -186,6 +186,9 @@ fn js_plugin_variables(
 ) -> BTreeMap<String, String> {
     let mut variables = variables_with_config(env, database, config);
     variables.remove("ZUNO_PURE");
+    // Removing `ZUNO_PURE` no longer loads anything: the JavaScript host is opt-in, so
+    // a test that asserts on plugin behaviour has to ask for it the way a user does.
+    variables.insert("ZUNO_ENABLE_JS_PLUGINS".to_owned(), "1".to_owned());
     variables.insert("PATH".to_owned(), js_runtime_path());
     variables
 }

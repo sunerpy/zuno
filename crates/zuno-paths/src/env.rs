@@ -38,7 +38,7 @@ pub const PLUGIN_ABI_ENV_NAMES: [&str; 6] = [
 ];
 
 /// Project-owned environment names and their only accepted external spellings.
-pub const ZUNO_ENV_NAME_MAP: [(&str, &str); 66] = [
+pub const ZUNO_ENV_NAME_MAP: [(&str, &str); 67] = [
     ("OPENCODE_ALWAYS_NOTIFY_UPDATE", "ZUNO_ALWAYS_NOTIFY_UPDATE"),
     ("OPENCODE_API_KEY", "ZUNO_API_KEY"),
     ("OPENCODE_AUTH_CONTENT", "ZUNO_AUTH_CONTENT"),
@@ -83,6 +83,7 @@ pub const ZUNO_ENV_NAME_MAP: [(&str, &str); 66] = [
         "OPENCODE_ENABLE_EXPERIMENTAL_MODELS",
         "ZUNO_ENABLE_EXPERIMENTAL_MODELS",
     ),
+    ("OPENCODE_ENABLE_JS_PLUGINS", "ZUNO_ENABLE_JS_PLUGINS"),
     ("OPENCODE_ENABLE_PARALLEL", "ZUNO_ENABLE_PARALLEL"),
     ("OPENCODE_ENABLE_QUESTION_TOOL", "ZUNO_ENABLE_QUESTION_TOOL"),
     ("OPENCODE_EXPERIMENTAL", "ZUNO_EXPERIMENTAL"),
@@ -411,7 +412,11 @@ mod tests {
             assert_eq!(rejected.value(internal), None, "{internal}");
         }
 
-        assert_eq!(internal_names.len(), 66);
-        assert_eq!(external_names.len(), 66);
+        assert_eq!(internal_names.len(), ZUNO_ENV_NAME_MAP.len());
+        assert_eq!(external_names.len(), ZUNO_ENV_NAME_MAP.len());
+        // A floor, not an equality: the guarded failure is a name *losing* its entry,
+        // which would silently accept its `OPENCODE_` spelling again. Adding a name is
+        // not a failure, so an equality here would only demand its own maintenance.
+        assert!(ZUNO_ENV_NAME_MAP.len() >= 66, "the map only ever grows");
     }
 }

@@ -92,6 +92,51 @@ impl PluginRuntimeTarget {
     }
 }
 
+/// Whether the JavaScript plugin host may start, and what decided it.
+///
+/// Reported rather than returned as a bare `bool` so `debug config` can say *why* a
+/// user's plugins are not running. "Disabled" and "you never asked" look identical
+/// from the outside, and telling them apart is the difference between a one-line fix
+/// and a bug report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct JsPluginPolicy {
+    pub(crate) enabled: bool,
+    pub(crate) source: &'static str,
+}
+
+impl JsPluginPolicy {
+    /// Resolve the opt-in from `--pure`, the environment, then the configuration.
+    ///
+    /// `--pure` wins because it is the existing kill switch and a caller that asked
+    /// for no external plugins must not get them from a config file it did not write.
+    /// The environment beats the configuration so a one-off run needs no edit, which
+    /// is the same precedence the CLI's other flags already have.
+    pub(crate) fn resolve(config: &zuno_config::Config, env: &zuno_paths::Env) -> Self {
+        if env.flag(crate::ZUNO_PURE) {
+            return Self {
+                enabled: false,
+                source: "pure",
+            };
+        }
+        if env.flag(crate::ZUNO_ENABLE_JS_PLUGINS) {
+            return Self {
+                enabled: true,
+                source: "environment",
+            };
+        }
+        match config.plugin_runtime.as_ref().and_then(|it| it.javascript) {
+            Some(enabled) => Self {
+                enabled,
+                source: "config",
+            },
+            None => Self {
+                enabled: false,
+                source: "default",
+            },
+        }
+    }
+}
+
 impl PluginRuntime {
     pub(crate) async fn load(
         config: &zuno_config::Config,
@@ -99,23 +144,22 @@ impl PluginRuntime {
         directory: &Path,
         worktree: &Path,
         layout: &zuno_paths::Layout,
-        pure: bool,
+        policy: JsPluginPolicy,
         target: PluginRuntimeTarget,
     ) -> Option<Self> {
-        let mut specs = if pure {
-            Vec::new()
-        } else {
-            configured_plugins(config, target.kind)
-        };
-        if !pure {
-            specs.extend(auto_discovered_plugins(
-                directory,
-                worktree,
-                layout,
-                target.kind,
-                target.surface,
-            ));
+        // Before discovery, not after: scanning four directories and reading package
+        // manifests is work a disabled runtime must not do either.
+        if !policy.enabled {
+            return None;
         }
+        let mut specs = configured_plugins(config, target.kind);
+        specs.extend(auto_discovered_plugins(
+            directory,
+            worktree,
+            layout,
+            target.kind,
+            target.surface,
+        ));
         if specs.is_empty() {
             return None;
         }
@@ -1459,7 +1503,12 @@ export default {
             env.project(),
             env.project(),
             &layout,
-            false,
+            // Explicit, not `pure: false`: this test exercises plugin behaviour, so it
+            // has to ask for the host the product no longer starts by default.
+            super::JsPluginPolicy {
+                enabled: true,
+                source: "test",
+            },
             super::PluginRuntimeTarget::server("catalog-test"),
         )
         .await
@@ -1682,7 +1731,12 @@ export default {
             env.project(),
             env.project(),
             &layout,
-            false,
+            // Explicit, not `pure: false`: this test exercises plugin behaviour, so it
+            // has to ask for the host the product no longer starts by default.
+            super::JsPluginPolicy {
+                enabled: true,
+                source: "test",
+            },
             super::PluginRuntimeTarget::server("compaction-test"),
         )
         .await
@@ -1783,7 +1837,12 @@ export default {
             env.project(),
             env.project(),
             &layout,
-            false,
+            // Explicit, not `pure: false`: this test exercises plugin behaviour, so it
+            // has to ask for the host the product no longer starts by default.
+            super::JsPluginPolicy {
+                enabled: true,
+                source: "test",
+            },
             super::PluginRuntimeTarget::server_with_stdio(
                 "oauth-test",
                 reqwest::Url::parse("http://127.0.0.1:1").expect("fixture server URL"),

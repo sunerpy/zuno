@@ -93,6 +93,7 @@ pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "watcher",
     "snapshot",
     "plugin",
+    "plugin_runtime",
     "share",
     "autoupdate",
     "disabled_providers",
@@ -186,6 +187,9 @@ pub struct Config {
     /// Plugins to load.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plugin: Option<Vec<PluginSpec>>,
+    /// Which plugin runtimes may start. Absent leaves JavaScript off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_runtime: Option<PluginRuntimeConfig>,
     /// Session sharing behaviour.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub share: Option<ShareMode>,
@@ -278,6 +282,19 @@ impl Config {
         self.memory
             .as_ref()
             .map_or_else(ResolvedMemoryConfig::default, MemoryConfig::resolved)
+    }
+
+    /// Whether the configuration asks for the JavaScript plugin host.
+    ///
+    /// `false` for an absent key, which is what makes JavaScript plugins opt-in: each
+    /// one starts a Node process, and paying for that on every invocation is a cost a
+    /// user should choose rather than inherit.
+    #[must_use]
+    pub fn javascript_plugins_enabled(&self) -> bool {
+        self.plugin_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.javascript)
+            .unwrap_or(false)
     }
 }
 
@@ -458,6 +475,20 @@ pub const DEFAULT_PROJECT_MEMORY_CHAR_LIMIT: u32 = 3_000;
 
 /// Default delivered-turn interval for background reflection.
 pub const DEFAULT_MEMORY_NUDGE_INTERVAL: u32 = 10;
+
+/// Which plugin runtimes a session may start.
+///
+/// A table of its own rather than a field on any existing key because the decision
+/// is per-runtime: JavaScript costs a Node process per plugin and is therefore
+/// opt-in, while in-process runtimes are not gated here at all. Named
+/// `plugin_runtime` and not `plugins` deliberately — a near-homograph of the
+/// existing `plugin` list would let a typo silently mean the other key.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct PluginRuntimeConfig {
+    /// Start the JavaScript plugin host. Absent means no.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub javascript: Option<bool>,
+}
 
 /// Persistent memory: a master boolean, or component settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
