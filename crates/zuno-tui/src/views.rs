@@ -42,6 +42,7 @@ use crate::theme::{Mode, Palette, Resolved, ThemeRegistry};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+pub mod ambient;
 pub mod autocomplete;
 pub mod dialog;
 pub mod diff;
@@ -54,6 +55,7 @@ pub mod picker;
 pub mod question;
 pub mod scroll;
 pub mod session;
+pub mod welcome;
 
 #[cfg(test)]
 #[path = "views/views_tests.rs"]
@@ -244,6 +246,39 @@ pub fn padded(text: &str, width: u16, style: Style) -> Line<'static> {
         owned.extend(std::iter::repeat_n(' ', width - len));
     }
     Line::from(Span::styled(owned, style))
+}
+
+/// The terminal width at or above which the ambient sidebar is drawn.
+///
+/// A sidebar earns its columns only when the transcript keeps a usable measure
+/// beside it. [`ambient::SIDEBAR_WIDTH`] out of 120 leaves 86 for the reply, which is
+/// about where prose stops being comfortable; the same panel taken out of 100 would
+/// leave the answer narrower than the column describing it.
+pub const SIDEBAR_MIN_WIDTH: u16 = 120;
+
+/// The spelling a user would actually press for `action`, or `None` when unbound.
+///
+/// The user's own overrides win over the shipped table, and that is the whole point:
+/// a hint reading `enter` after the user rebound `input_submit` is a lie, and a
+/// surface that told one would be worse than one that stayed quiet. The first
+/// spelling is taken because a hint has room for one and the table lists its
+/// preferred spelling first.
+#[must_use]
+pub fn key_label(action: &str, context: &ViewContext) -> Option<String> {
+    if let Some(value) = context.config.keybinds.get(action) {
+        // A binding the user explicitly disabled yields nothing rather than falling
+        // back to the default, which would advertise a key they switched off.
+        return value
+            .spellings()
+            .first()
+            .map(|spelling| (*spelling).to_owned());
+    }
+    crate::keybind::definition(action)?
+        .keys
+        .split(',')
+        .map(str::trim)
+        .find(|spelling| !spelling.is_empty() && *spelling != "none")
+        .map(str::to_owned)
 }
 
 /// A `key label` hint pair, the footer vocabulary every prompt shares.
