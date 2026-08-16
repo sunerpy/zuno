@@ -7933,3 +7933,41 @@ tmux capture-pane -t S -p
 （raw mode 与 SIGINT 都已归还）、capture-pane 里没有继承的 `warning:` 行。
 注意首次 `send-keys` 常被 zsh 的 fancy prompt 初始化吃掉（本次只剩一个 `c`），
 所以要先发一条无害命令确认 shell 已就绪，再发真正的验证命令。
+
+### 把默认值反转时，「原本安静的路径」是最容易被忽略的回归面（task r15 补记）
+
+JS 插件改成 opt-in 之后，`models` 会在「配了插件但 host 关着」时打一行提示。
+这条提示本身是对的（否则用户看不到模型会以为是数据问题），但它的守卫写成
+`!policy.enabled`，于是 **`--pure` 也命中了**——把用户刚刚显式拒绝的开关再推荐一遍。
+`--pure models` 原本一个字都不打，改完多出一行 note，这是行为回归。
+
+判据：**反转一个默认值时，要枚举所有「原本走 disabled 分支」的入口**，
+其中显式 kill switch（`--pure`）与「你没开」是两种语义完全不同的 disabled，
+不能共用一个 `!enabled` 判断。修法是让 `source` 带类型（`JsPluginSource`）而不是
+字符串，把「该不该解释」变成一个可被类型检查的谓词 `should_explain_absence()`。
+字符串比较能表达同样的规则，但没有任何检查。
+
+顺带确认 `make smoke-artifact` 的 `13 tools offered` 未变，原因是
+`zuno-smoke.rs:458` 本来就设了 `OPENCODE_PURE=1`——它从来没加载过 JS 插件，
+所以这个数字钉的是**内置工具面**，与插件门控无关，断言依然有意义。
+不查这一行就无法回答「数字为什么没变」，只能猜。
+
+### 共享 worktree 上有并发写者：`git status` 干净不等于「你的改动在里面」
+
+本次在 `oc-wt/r15` 上工作时，另一个进程在同一个 worktree 里持续提交（00:54、
+00:55、01:00、01:22 四次），其中一次把我未提交的 `JsPluginSource` 重构连同 4 个
+测试一起丢弃，另一次把我的 notepad 追加与两处编辑**替我提交了**。
+最迷惑的一步是：`git status` 变成干净，看上去像「工作已保存」，实际是被别人
+选择性提交后我的一部分改动消失了。
+
+可复现的检测手法：
+
+* `ls -la /proc/*/cwd | grep <worktree>` 找出把 cwd 设在该目录的进程；
+* `git log --format="%h %ad %s" --date=format:"%H:%M:%S"` 把提交时间和自己的动作
+  时间轴对齐——提交时间落在自己两次工具调用之间，就是并发写者；
+* 采样 `git rev-parse HEAD` + `git status --porcelain | md5sum`，间隔 60–90s
+  比较，判断对方是否仍在活动。
+
+教训：**在共享 worktree 上，任何「我改完了」的结论都必须用 `git show HEAD:<file>`
+或重新构建的二进制复核，不能依赖自己的编辑记忆**。本次正是靠重新读 HEAD 才发现
+`--pure` 的回归还留在树上——如果按记忆汇报，就会汇报一个并不存在的修复。

@@ -9134,3 +9134,18 @@ Windows leg 现在会跑发布 smoke，但 `crates/zuno-process/tests/windows_co
 起初未登记，该测试如实报红。已按 `Policy::CoalesceFull` 登记
 （容量 1，满即丢弃冗余取消请求，`try_send` 失败落到 shutdown），
 并把 gated 计数 17 → 18。这是一个**设计良好、真的会失败**的门。
+
+### r15 补记：两个在收尾复核时才发现的问题
+
+1. **`--pure` 提示回归**（已修，commit `ffd173f`）：opt-in 的提示守卫写成
+   `!policy.enabled`，把显式 kill switch 也算成「你忘了开」。实测
+   `--pure models` 多出一行 note。修法见 learnings.md。
+   同时补了 4 个优先级守卫——此前 `--pure` > env > config > 默认关这条链条
+   **一个测试都没有**，只有一条集成守卫证明「不 opt-in 就不加载」。
+2. **worktree 有并发写者**：`oc-wt/r15` 同时被另一个进程提交，导致一次未提交的
+   重构被丢弃。检测与自保手法见 learnings.md。汇报前务必 `git show HEAD:<file>` 复核。
+
+最终门禁（本人实测）：213 suites / 3500 passed / 0 failed / 2 ignored；
+`cargo fmt --check` 0；`clippy -D warnings` 0；`make smoke-artifact` PASS
+（`13 tools offered` 未变，因 smoke 自身设了 `OPENCODE_PURE=1`）。
+基线 3487 + 13 个新增测试 = 3500，逐条对得上：缺陷 A 7 个、缺陷 B 5 个、缺陷 C 1 个。
