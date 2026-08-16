@@ -156,6 +156,21 @@ impl RequestBody {
             body.insert("max_tokens".to_owned(), json!(max_tokens));
         }
 
+        // Asked for explicitly, because a streaming chat completion does not report usage
+        // otherwise: measured against a live gateway, the stream without this field ends
+        // `finish_reason` then `[DONE]` with no usage anywhere, and with it a further
+        // frame carries `usage` after the finish. Both halves are required — the engine
+        // reading past `MessageEnd` has nothing to read unless this is sent, and sending
+        // this achieves nothing if the engine stops at `MessageEnd`.
+        //
+        // Inserted before `extra_body` and deliberately absent from [`PROTECTED_KEYS`],
+        // so a provider that rejects the field can be told to omit it from configuration
+        // rather than needing a code change.
+        body.insert(
+            "stream_options".to_owned(),
+            json!({ "include_usage": true }),
+        );
+
         for (key, value) in &self.extra_body {
             if PROTECTED_KEYS.contains(&key.as_str()) {
                 continue;
@@ -568,6 +583,57 @@ mod tests {
                 },
             ],
         )
+    }
+
+    #[test]
+    fn a_streaming_chat_request_asks_for_usage_because_the_wire_omits_it_otherwise() {
+        // Measured against a live OpenAI-compatible gateway: without `stream_options`
+        // the stream is content chunks, a `finish_reason` chunk, then `[DONE]` — no usage
+        // frame exists at all, so every token counter downstream reads zero no matter how
+        // far past `MessageEnd` the engine reads. Two earlier attempts each fixed one half
+        // and concluded the other half was the provider's fault.
+        let body = RequestBody::new(
+            "a-model",
+            vec![Message::from_content(
+                Role::User,
+                vec![RequestContentBlock::Text {
+                    text: "hi".to_owned(),
+                }],
+            )],
+        );
+        let built = body.build(&quirks(false, true));
+        assert_eq!(
+            built["stream_options"]["include_usage"],
+            json!(true),
+            "a streaming request that does not ask for usage will never be told any"
+        );
+    }
+
+    #[test]
+    fn a_provider_that_rejects_stream_options_can_override_it_from_configuration() {
+        // `stream_options` is deliberately not in `PROTECTED_KEYS`, so a gateway that
+        // 400s on the field is a configuration change rather than a code change. If this
+        // fails because the key became protected, the escape hatch is gone.
+        assert!(
+            !PROTECTED_KEYS.contains(&"stream_options"),
+            "protecting `stream_options` removes the only way to disable it per provider"
+        );
+        let mut body = RequestBody::new(
+            "a-model",
+            vec![Message::from_content(
+                Role::User,
+                vec![RequestContentBlock::Text {
+                    text: "hi".to_owned(),
+                }],
+            )],
+        );
+        body.extra_body
+            .insert("stream_options".to_owned(), Value::Null);
+        assert_eq!(
+            body.build(&quirks(false, true))["stream_options"],
+            Value::Null,
+            "configuration could not override the shipped default"
+        );
     }
 
     #[test]
