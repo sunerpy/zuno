@@ -243,6 +243,20 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
+      # rustup cannot install into the Windows container's default profile:
+      # `rustup toolchain install stable` died with `could not create component
+      # directory: 'C:\Users\ContainerAdministrator\.rustup\toolchains\...'` /
+      # `The specified path is invalid. (os error 161)`. The same write failure is
+      # why `rustup target add` appeared to succeed and then left rustc reporting
+      # `can't find crate for std`. Short roots on the system drive are writable.
+      - name: Relocate the Rust toolchain root (Windows container)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          "RUSTUP_HOME=C:\rustup" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CARGO_HOME=C:\cargo" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "C:\cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
@@ -375,6 +389,15 @@ jobs:
               - zuno-release-smoke-x86_64-windows
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # Same Windows container path problem as the build job; see the comment there.
+      - name: Relocate the Rust toolchain root (Windows container)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          "RUSTUP_HOME=C:\rustup" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CARGO_HOME=C:\cargo" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "C:\cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
