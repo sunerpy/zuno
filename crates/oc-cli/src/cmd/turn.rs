@@ -29,6 +29,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use oc_agent::model_policy::{AnyModel, ModelChoice, ModelPolicy};
 use oc_auth::Credential;
@@ -37,17 +38,22 @@ use oc_engine::dispatch::ToolRegistryDispatcher;
 use oc_engine::interrupt::InterruptSignal;
 use oc_engine::r#loop::{
     AgentModelResolver, ResolvedAgent, ResolvedModel as EngineModel, RunTurnRequest, TurnContext,
-    TurnError, TurnEvent, TurnEventSender, run_turn,
+    TurnError, TurnEvent, TurnEventSender, TurnOutcome, run_turn,
 };
 use oc_engine::prelude::{
     InternalAgent, InternalProviders, Internals, PreludeContext, PreludeOutcome, compact_requested,
     run_prelude,
 };
+use oc_engine::status::{SessionRunGuard, SessionRunRegistry};
 use oc_error::ProviderError;
+use oc_goal::{
+    ContinuationAttempt, GoalContinuation, GoalProjection, GoalStore, GoalTurnMode,
+    GoalTurnOutcome, QueuedUserInput,
+};
 use oc_llm::cache::{DynamicContext, McpToolStatus};
 use oc_llm::catalog::resolved::ModelEndpoint;
 use oc_llm::catalog::{Catalog, CatalogProvenance, CatalogSource, ResolveInput};
-use oc_llm::event::StreamEvent;
+use oc_llm::event::{RequestContentBlock, StreamEvent};
 use oc_llm::registry::{ApiSurface, Provider, ProviderRegistry, Spec};
 use oc_memory::{ScopeLimits, SessionMemory, assemble_system_prompt};
 use oc_provider_compatible::{ReqwestTransport, Transport};
@@ -516,7 +522,6 @@ pub(crate) struct TurnHost {
     credential: Option<String>,
     resolver: Resolver,
     dispatcher: ToolRegistryDispatcher,
-    interrupt: InterruptSignal,
     session_id: String,
     agent: String,
     provider_id: String,
@@ -528,6 +533,11 @@ pub(crate) struct TurnHost {
     notes: Vec<String>,
     plugins: Option<Arc<super::plugin_runtime::PluginRuntime>>,
     commands: oc_catalog::command::Registry,
+    goal_store: Arc<GoalStore>,
+    goal_projection: GoalProjection,
+    goal_continuation: GoalContinuation,
+    runs: SessionRunRegistry,
+    last_turn_completed: bool,
 }
 
 /// The registry answering for whichever spec an internal agent resolved to.
@@ -562,15 +572,15 @@ impl TurnHost {
         environment: &StartupEnvironment,
         approval: Arc<dyn PermissionAsker>,
     ) -> Result<Self, String> {
-        Self::open_with_interrupt(plan, environment, approval, None, InterruptSignal::new())
+        Self::open_with_runtime(plan, environment, approval, None, SessionRunRegistry::new())
     }
 
-    pub(crate) fn open_with_interrupt(
+    pub(crate) fn open_with_runtime(
         mut plan: TurnPlan,
         environment: &StartupEnvironment,
         approval: Arc<dyn PermissionAsker>,
         question: Option<Arc<dyn oc_tools::question::QuestionAsker>>,
-        interrupt: InterruptSignal,
+        runs: SessionRunRegistry,
     ) -> Result<Self, String> {
         let env = environment.resolved();
         let worktree = plan
@@ -586,6 +596,11 @@ impl TurnHost {
         let now = oc_db::message::now_millis();
         ensure_project(&connection, &plan.project, now)?;
         let session = resolve_session(&mut connection, &plan, now)?;
+        let todo_store = Arc::new(oc_db::pool::Pool::open_default().map_err(to_string)?);
+        let goal_store = Arc::new(GoalStore::open_default().map_err(to_string)?);
+        let goal_projection = GoalProjection::new(worktree.as_deref(), &session.id)
+            .ok_or_else(|| format!("session id `{}` cannot name a goal projection", session.id))?;
+        let goal_continuation = GoalContinuation::new(Arc::clone(&goal_store), runs.clone());
 
         let memory_root = worktree.as_deref().unwrap_or(&plan.directory);
         let command_worktree = memory_root.to_string_lossy();
@@ -619,13 +634,15 @@ impl TurnHost {
                 question,
                 plugin_tools: &plan.plugin_tools,
                 plugins: plan.plugins.clone(),
+                todo_store,
+                goal_store: Arc::clone(&goal_store),
             },
         )?;
         let mut dispatcher = ToolRegistryDispatcher::new(
             runtime_tools.tools,
             runtime_tools.rules,
             approval,
-            interrupt.clone(),
+            InterruptSignal::new(),
             McpToolStatus::Ready,
         );
         if let Some(plugins) = plan.plugins.as_ref() {
@@ -638,7 +655,6 @@ impl TurnHost {
             credential: presented,
             resolver: plan.resolver,
             dispatcher,
-            interrupt,
             session_id: session.id,
             agent: plan.agent.name,
             provider_id: plan.provider_id,
@@ -650,6 +666,11 @@ impl TurnHost {
             notes: plan.notes,
             plugins: plan.plugins,
             commands,
+            goal_store,
+            goal_projection,
+            goal_continuation,
+            runs,
+            last_turn_completed: false,
         })
     }
 
@@ -738,8 +759,18 @@ impl TurnHost {
                 "command `{command}` requires subtask execution, which this surface cannot host"
             ));
         }
-        self.drive_input(&resolved.prompt, None, Some((command, arguments)), events)
-            .await
+        let guard = self
+            .runs
+            .begin_turn(self.session_id.clone())
+            .map_err(to_string)?;
+        self.drive_input(
+            &resolved.prompt,
+            None,
+            Some((command, arguments)),
+            guard.interrupt_signal(),
+            events,
+        )
+        .await
     }
 
     pub(crate) async fn drive_with_message_id(
@@ -748,7 +779,23 @@ impl TurnHost {
         message_id: Option<&str>,
         events: TurnEventSender,
     ) -> Result<(), String> {
-        self.drive_input(prompt, message_id, None, events).await
+        let guard = self
+            .runs
+            .begin_turn(self.session_id.clone())
+            .map_err(to_string)?;
+        self.drive_input(prompt, message_id, None, guard.interrupt_signal(), events)
+            .await
+    }
+
+    pub(crate) async fn drive_with_message_id_and_guard(
+        &mut self,
+        prompt: &str,
+        message_id: Option<&str>,
+        guard: SessionRunGuard,
+        events: TurnEventSender,
+    ) -> Result<(), String> {
+        self.drive_input(prompt, message_id, None, guard.interrupt_signal(), events)
+            .await
     }
 
     async fn drive_input(
@@ -756,8 +803,45 @@ impl TurnHost {
         prompt: &str,
         message_id: Option<&str>,
         command: Option<(&str, &str)>,
+        interrupt: &InterruptSignal,
         events: TurnEventSender,
     ) -> Result<(), String> {
+        self.goal_projection
+            .ingest(&self.goal_store)
+            .map_err(to_string)?;
+        let usage_before = goal_usage(&self.connection, &self.session_id)?;
+        let started = Instant::now();
+        let result = self
+            .drive_input_unaccounted(prompt, message_id, command, interrupt, events)
+            .await;
+        match result {
+            Ok(outcome) => {
+                self.last_turn_completed = outcome
+                    .as_ref()
+                    .is_some_and(|outcome| matches!(outcome, TurnOutcome::Completed { .. }));
+                self.finish_goal_turn(usage_before, started, outcome.as_ref())?;
+                Ok(())
+            }
+            Err(error) => {
+                self.last_turn_completed = false;
+                match self.finish_goal_error(usage_before, started) {
+                    Ok(()) => Err(error),
+                    Err(goal_error) => Err(format!(
+                        "{error}; additionally failed to record terminal goal state: {goal_error}"
+                    )),
+                }
+            }
+        }
+    }
+
+    async fn drive_input_unaccounted(
+        &mut self,
+        prompt: &str,
+        message_id: Option<&str>,
+        command: Option<(&str, &str)>,
+        interrupt: &InterruptSignal,
+        events: TurnEventSender,
+    ) -> Result<Option<TurnOutcome>, String> {
         let latest = oc_db::message::MessageStore::new(&self.connection)
             .latest_time_created(&self.session_id)
             .map_err(to_string)?;
@@ -780,14 +864,93 @@ impl TurnHost {
         report_prelude(&events, &self.notes, &outcome).await?;
         if !outcome.continue_turn {
             report_plugin_diagnostics(self.plugins.clone(), &events).await?;
-            return Ok(());
+            return Ok(None);
         }
+        let dynamic_context = self.goal_dynamic_context()?;
+        self.execute_turn_unaccounted(dynamic_context, interrupt, events)
+            .await
+    }
+
+    pub(crate) async fn continue_goal_if_idle(
+        &mut self,
+        queued_input: QueuedUserInput,
+        events: TurnEventSender,
+    ) -> Result<bool, String> {
+        if !self.last_turn_completed {
+            return Ok(false);
+        }
+        self.goal_projection
+            .ingest(&self.goal_store)
+            .map_err(to_string)?;
+        let mode = if self.agent == "plan" {
+            GoalTurnMode::Plan
+        } else {
+            GoalTurnMode::Work
+        };
+        let prepared = match self
+            .goal_continuation
+            .prepare_if_idle(&self.session_id, mode, queued_input)
+            .map_err(to_string)?
+        {
+            ContinuationAttempt::Prepared(prepared) => prepared,
+            ContinuationAttempt::Suppressed(_) => return Ok(false),
+        };
+        let usage_before = goal_usage(&self.connection, &self.session_id)?;
+        let started = Instant::now();
+        let result = self.continue_goal_unaccounted(&prepared, events).await;
+        match result {
+            Ok(outcome) => {
+                self.last_turn_completed = outcome
+                    .as_ref()
+                    .is_some_and(|outcome| matches!(outcome, TurnOutcome::Completed { .. }));
+                self.finish_goal_turn(usage_before, started, outcome.as_ref())?;
+                Ok(self.last_turn_completed)
+            }
+            Err(error) => {
+                self.last_turn_completed = false;
+                match self.finish_goal_error(usage_before, started) {
+                    Ok(()) => Err(error),
+                    Err(goal_error) => Err(format!(
+                        "{error}; additionally failed to record terminal goal state: {goal_error}"
+                    )),
+                }
+            }
+        }
+    }
+
+    async fn continue_goal_unaccounted(
+        &mut self,
+        prepared: &oc_goal::PreparedContinuation,
+        events: TurnEventSender,
+    ) -> Result<Option<TurnOutcome>, String> {
+        let dynamic_context = dynamic_context_from_goal_entry(prepared.entry());
+        let prelude = self.run_prelude().await;
+        let prelude = match prelude {
+            Ok(prelude) if prelude.continue_turn => prelude,
+            Ok(_) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        report_prelude(&events, &self.notes, &prelude).await?;
+        self.execute_turn_unaccounted(
+            dynamic_context,
+            prepared.run_guard().interrupt_signal(),
+            events,
+        )
+        .await
+    }
+
+    async fn execute_turn_unaccounted(
+        &mut self,
+        dynamic_context: DynamicContext,
+        interrupt: &InterruptSignal,
+        events: TurnEventSender,
+    ) -> Result<Option<TurnOutcome>, String> {
         let mut context = TurnContext::new(
             &mut self.connection,
             &self.providers,
             &self.resolver,
             &self.dispatcher,
-            &self.interrupt,
+            interrupt,
         );
         if let Some(plugins) = self.plugins.as_ref() {
             let hooks: Arc<dyn oc_engine::hooks::TurnHooks> = plugins.clone();
@@ -797,18 +960,98 @@ impl TurnHost {
             RunTurnRequest::new(
                 self.session_id.clone(),
                 Uuid::new_v4().simple().to_string(),
-                DynamicContext::default(),
+                dynamic_context,
             ),
             context,
             events.clone(),
         )
         .await;
         report_plugin_diagnostics(self.plugins.clone(), &events).await?;
-        outcome.map_err(|error| describe_turn_failure(&error, self.credential.as_deref()))?;
+        outcome
+            .map(Some)
+            .map_err(|error| describe_turn_failure(&error, self.credential.as_deref()))
+    }
+
+    fn goal_dynamic_context(&self) -> Result<DynamicContext, String> {
+        self.goal_continuation
+            .injection(&self.session_id)
+            .map_err(to_string)
+            .map(|entry| {
+                entry.map_or_else(DynamicContext::default, |entry| {
+                    dynamic_context_from_goal_entry(&entry)
+                })
+            })
+    }
+
+    fn finish_goal_turn(
+        &self,
+        usage_before: GoalUsage,
+        started: Instant,
+        outcome: Option<&TurnOutcome>,
+    ) -> Result<(), String> {
+        self.record_goal_usage(usage_before, started)?;
+        if let Some(outcome) = outcome {
+            let audit = match outcome {
+                TurnOutcome::Completed { .. } => GoalTurnOutcome::Progress,
+                TurnOutcome::Interrupted { .. } => GoalTurnOutcome::Blocking("turn interrupted"),
+            };
+            self.goal_continuation
+                .record_turn_outcome(&self.session_id, audit)
+                .map_err(to_string)?;
+        }
+        self.write_goal_projection()
+    }
+
+    fn finish_goal_error(&self, usage_before: GoalUsage, started: Instant) -> Result<(), String> {
+        self.record_goal_usage(usage_before, started)?;
+        self.goal_continuation
+            .on_terminal_turn_error(&self.session_id)
+            .map_err(to_string)?;
+        self.write_goal_projection()
+    }
+
+    fn record_goal_usage(&self, before: GoalUsage, started: Instant) -> Result<(), String> {
+        let after = goal_usage(&self.connection, &self.session_id)?;
+        let token_delta = after.tokens.saturating_sub(before.tokens);
+        let elapsed = i64::try_from(started.elapsed().as_secs()).unwrap_or(i64::MAX);
+        self.goal_store
+            .record_usage(&self.session_id, token_delta, elapsed)
+            .map_err(to_string)?;
+        Ok(())
+    }
+
+    fn write_goal_projection(&self) -> Result<(), String> {
+        if let Some(goal) = self.goal_store.goal(&self.session_id).map_err(to_string)? {
+            self.goal_projection.write(&goal).map_err(to_string)?;
+        }
         Ok(())
     }
 
     pub(crate) async fn compact(&mut self, automatic: bool) -> Result<(), String> {
+        self.goal_projection
+            .ingest(&self.goal_store)
+            .map_err(to_string)?;
+        let usage_before = goal_usage(&self.connection, &self.session_id)?;
+        let started = Instant::now();
+        let result = self.compact_unaccounted(automatic).await;
+        match result {
+            Ok(()) => {
+                self.last_turn_completed = true;
+                self.finish_goal_turn(usage_before, started, None)
+            }
+            Err(error) => {
+                self.last_turn_completed = false;
+                match self.finish_goal_error(usage_before, started) {
+                    Ok(()) => Err(error),
+                    Err(goal_error) => Err(format!(
+                        "{error}; additionally failed to record terminal goal state: {goal_error}"
+                    )),
+                }
+            }
+        }
+    }
+
+    async fn compact_unaccounted(&mut self, automatic: bool) -> Result<(), String> {
         let providers = RegistryProviders(&self.providers);
         let noop_hooks = oc_engine::compaction::NoopCompactionHooks;
         let hooks: &dyn oc_engine::compaction::CompactionHooks = self
@@ -860,6 +1103,46 @@ impl TurnHost {
             .await
             .map_err(to_string)
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct GoalUsage {
+    tokens: i64,
+}
+
+fn goal_usage(connection: &rusqlite::Connection, session_id: &str) -> Result<GoalUsage, String> {
+    connection
+        .query_row(
+            "SELECT COALESCE(SUM(\
+               COALESCE(json_extract(data, '$.tokens.input'), 0) + \
+               COALESCE(json_extract(data, '$.tokens.output'), 0) + \
+               COALESCE(json_extract(data, '$.tokens.reasoning'), 0) + \
+               COALESCE(json_extract(data, '$.tokens.cache.read'), 0) + \
+               COALESCE(json_extract(data, '$.tokens.cache.write'), 0)\
+             ), 0) \
+             FROM message \
+             WHERE session_id = ?1 AND json_extract(data, '$.role') = 'assistant'",
+            [session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|tokens| GoalUsage { tokens })
+        .map_err(to_string)
+}
+
+fn dynamic_context_from_goal_entry(
+    entry: &oc_engine::compaction::TranscriptEntry,
+) -> DynamicContext {
+    let text = entry
+        .message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            RequestContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    DynamicContext::new(text)
 }
 
 async fn report_plugin_diagnostics(

@@ -121,6 +121,10 @@ pub const AUXILIARY_SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS goal_continuation_deferral (
     session_id TEXT PRIMARY KEY NOT NULL
 );
+CREATE TABLE IF NOT EXISTS goal_pending_failure_signal (
+    session_id TEXT PRIMARY KEY NOT NULL,
+    signal TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS goal_failure_streak (
     session_id TEXT PRIMARY KEY NOT NULL,
     signal TEXT NOT NULL,
@@ -479,6 +483,48 @@ impl GoalStore {
         Ok(consumed)
     }
 
+    /// Stage the blocking condition reported during the current real turn.
+    ///
+    /// Repeated tool calls in one turn overwrite this row instead of incrementing
+    /// the persisted streak. The turn boundary consumes the row exactly once, so
+    /// three tool retries cannot impersonate three consecutive turns.
+    pub fn stage_failure_signal(&self, session_id: &str, signal: &str) -> Result<bool, GoalError> {
+        let signal = signal.trim();
+        if signal.is_empty() {
+            return Ok(false);
+        }
+        let changed = self.pool.transaction(|tx| {
+            tx.execute(
+                "INSERT INTO goal_pending_failure_signal (session_id, signal) \
+                 SELECT session_id, ?2 FROM goal \
+                 WHERE session_id = ?1 AND status = 'active' \
+                 ON CONFLICT(session_id) DO UPDATE SET signal = excluded.signal",
+                params![session_id, signal],
+            )
+            .map_err(oc_db::map_error)
+        })?;
+        Ok(changed > 0)
+    }
+
+    /// Consume the blocking condition staged by this turn, if any.
+    pub fn consume_staged_failure_signal(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, GoalError> {
+        self.pool
+            .transaction(|tx| {
+                tx.query_row(
+                    "DELETE FROM goal_pending_failure_signal WHERE session_id = ?1 \
+                     RETURNING signal",
+                    params![session_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(oc_db::map_error)
+            })
+            .map_err(GoalError::from)
+    }
+
     /// Record one turn's blocking signal, or clear the streak after progress.
     ///
     /// Repeating the same non-empty signal increments the count; a different
@@ -652,6 +698,13 @@ impl GoalStore {
                 )
                 .map_err(oc_db::map_error)?;
             }
+            if goal.is_some() {
+                tx.execute(
+                    "DELETE FROM goal_pending_failure_signal WHERE session_id = ?1",
+                    params![session_id],
+                )
+                .map_err(oc_db::map_error)?;
+            }
             Ok(goal)
         })?;
         Ok(goal)
@@ -805,6 +858,11 @@ fn blocking_status(tx: &Transaction<'_>, session_id: &str) -> Result<GoalStatus,
 fn clear_auxiliary_state(tx: &Transaction<'_>, session_id: &str) -> Result<(), DbError> {
     tx.execute(
         "DELETE FROM goal_continuation_deferral WHERE session_id = ?1",
+        params![session_id],
+    )
+    .map_err(oc_db::map_error)?;
+    tx.execute(
+        "DELETE FROM goal_pending_failure_signal WHERE session_id = ?1",
         params![session_id],
     )
     .map_err(oc_db::map_error)?;

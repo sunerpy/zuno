@@ -2,8 +2,8 @@ use std::io::Write as _;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use oc_engine::interrupt::InterruptSignal;
 use oc_engine::r#loop::TurnEventSender;
+use oc_engine::status::{SessionRunGuard, SessionRunRegistry};
 use oc_error::ToolError;
 use oc_permission::ReplyKind;
 use oc_server::api::{self, ApiState};
@@ -25,16 +25,18 @@ use crate::environment::StartupEnvironment;
 struct ServerSessionMutationExecutor {
     environment: StartupEnvironment,
     requests: RequestBroker,
+    runs: SessionRunRegistry,
 }
 
 impl ServerSessionMutationExecutor {
-    fn new(requests: RequestBroker) -> Self {
+    fn new(requests: RequestBroker, runs: SessionRunRegistry) -> Self {
         Self {
             environment: StartupEnvironment::resolve(
                 &oc_paths::Env::from_process(),
                 &crate::command::GlobalOptions::default(),
             ),
             requests,
+            runs,
         }
     }
 
@@ -45,7 +47,7 @@ impl ServerSessionMutationExecutor {
         agent: Option<String>,
         model: Option<oc_server::SessionModelSelection>,
         requests: RequestBroker,
-        interrupt: InterruptSignal,
+        runs: SessionRunRegistry,
     ) -> Result<TurnHost, String> {
         let options = TurnOptions {
             directory: Some(directory),
@@ -60,7 +62,7 @@ impl ServerSessionMutationExecutor {
             session_id,
         });
         let question: Arc<dyn QuestionAsker> = Arc::new(ServerQuestionAsker { requests });
-        TurnHost::open_with_interrupt(plan, &environment, approval, Some(question), interrupt)
+        TurnHost::open_with_runtime(plan, &environment, approval, Some(question), runs)
     }
 }
 
@@ -135,11 +137,12 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
     fn prompt(
         &self,
         request: SessionPromptExecution,
-        interrupt: InterruptSignal,
+        guard: SessionRunGuard,
         events: TurnEventSender,
     ) -> SessionMutationFuture {
         let environment = self.environment.clone();
         let requests = self.requests.clone();
+        let runs = self.runs.clone();
         Box::pin(async move {
             let mut host = Self::open(
                 environment,
@@ -148,13 +151,25 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                 request.agent,
                 request.model,
                 requests,
-                interrupt,
+                runs,
             )
             .await?;
             let events = host.with_event_hooks(events);
-            let outcome = host
-                .drive_with_message_id(&request.prompt, Some(&request.message_id), events)
-                .await;
+            let outcome = async {
+                host.drive_with_message_id_and_guard(
+                    &request.prompt,
+                    Some(&request.message_id),
+                    guard,
+                    events.clone(),
+                )
+                .await?;
+                while host
+                    .continue_goal_if_idle(oc_goal::QueuedUserInput::Absent, events.clone())
+                    .await?
+                {}
+                Ok(())
+            }
+            .await;
             host.shutdown().await;
             outcome
         })
@@ -163,10 +178,12 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
     fn compact(
         &self,
         request: SessionCompactExecution,
-        interrupt: InterruptSignal,
+        guard: SessionRunGuard,
+        events: TurnEventSender,
     ) -> SessionMutationFuture {
         let environment = self.environment.clone();
         let requests = self.requests.clone();
+        let runs = self.runs.clone();
         Box::pin(async move {
             let mut host = Self::open(
                 environment,
@@ -175,10 +192,22 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                 request.agent,
                 request.model,
                 requests,
-                interrupt,
+                runs,
             )
             .await?;
+            let events = host.with_event_hooks(events);
             let outcome = host.compact(request.automatic).await;
+            drop(guard);
+            let outcome = match outcome {
+                Ok(()) => {
+                    while host
+                        .continue_goal_if_idle(oc_goal::QueuedUserInput::Absent, events.clone())
+                        .await?
+                    {}
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            };
             host.shutdown().await;
             outcome
         })
@@ -234,9 +263,13 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
             .map_err(|error| error.to_string())?
             .with_events(events.clone());
         let requests = RequestBroker::with_events(events.clone());
-        let services = ServerServices::new(DEFAULT_EVENT_SUBSCRIBER_CAPACITY)
-            .with_requests(requests.clone())
-            .with_mutations(Arc::new(ServerSessionMutationExecutor::new(requests)));
+        let services =
+            ServerServices::new(DEFAULT_EVENT_SUBSCRIBER_CAPACITY).with_requests(requests.clone());
+        let mutations = Arc::new(ServerSessionMutationExecutor::new(
+            requests,
+            services.runs.clone(),
+        ));
+        let services = services.with_mutations(mutations);
         let server = ServerBuilder::new(config)
             .with_services(services)
             .with_routes(

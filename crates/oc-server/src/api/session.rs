@@ -721,7 +721,6 @@ pub async fn prompt(
                 None => session_model(session.model.as_deref())?,
             },
         };
-        let signal = guard.interrupt_signal().clone();
         let executor = Arc::clone(executor);
         let fanout = services.events.clone();
         let durable_events = state.events().cloned();
@@ -730,13 +729,13 @@ pub async fn prompt(
         tokio::spawn(async move {
             let outcome = if let Some(events) = durable_events.as_ref() {
                 let (outcome, ()) = tokio::join!(
-                    executor.prompt(request, signal, sender),
+                    executor.prompt(request, guard, sender),
                     events.forward_engine_events(&event_session_id, &fanout, receiver)
                 );
                 outcome
             } else {
                 let (outcome, ()) = tokio::join!(
-                    executor.prompt(request, signal, sender),
+                    executor.prompt(request, guard, sender),
                     fanout.forward_engine_events(receiver)
                 );
                 outcome
@@ -762,7 +761,6 @@ pub async fn prompt(
                     }
                 }
             }
-            drop(guard);
         });
     } else {
         drop(guard);
@@ -794,7 +792,7 @@ pub(crate) async fn compact_session(
         .begin_turn(&session_id)
         .map_err(|error| ApiError::Conflict(error.to_string()))?;
     let request = SessionCompactExecution {
-        session_id,
+        session_id: session_id.clone(),
         directory: session.directory.into(),
         agent: session.agent,
         model: match requested_model {
@@ -803,11 +801,23 @@ pub(crate) async fn compact_session(
         },
         automatic,
     };
-    executor
-        .compact(request, guard.interrupt_signal().clone())
-        .await
-        .map_err(ApiError::MutationFailed)?;
-    drop(guard);
+    let fanout = services.events.clone();
+    let durable_events = state.events().cloned();
+    let (sender, receiver) = event_channel();
+    let outcome = if let Some(events) = durable_events.as_ref() {
+        let (outcome, ()) = tokio::join!(
+            executor.compact(request, guard, sender),
+            events.forward_engine_events(&session_id, &fanout, receiver)
+        );
+        outcome
+    } else {
+        let (outcome, ()) = tokio::join!(
+            executor.compact(request, guard, sender),
+            fanout.forward_engine_events(receiver)
+        );
+        outcome
+    };
+    outcome.map_err(ApiError::MutationFailed)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

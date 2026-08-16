@@ -960,7 +960,7 @@ fn the_table_declares_the_check_constraint_and_deliberately_no_foreign_key() {
         )
         .expect("count the tables");
     assert_eq!(
-        tables, 3,
+        tables, 4,
         "the goal database holds its goal and runtime tables"
     );
 }

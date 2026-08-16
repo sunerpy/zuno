@@ -9,7 +9,6 @@ use oc_db::Pool;
 use oc_db::artifact_gc::ArtifactGcPaths;
 use oc_db::message::{MessageRecord, MessageStore, PartRecord, now_millis};
 use oc_db::session::SessionCreate;
-use oc_engine::interrupt::InterruptSignal;
 use oc_engine::r#loop::TurnEventSender;
 use oc_paths::DbLocation;
 use oc_server::api::{self, ApiState};
@@ -163,7 +162,7 @@ impl SessionMutationExecutor for CompletingMutationExecutor {
     fn prompt(
         &self,
         request: SessionPromptExecution,
-        _interrupt: InterruptSignal,
+        _guard: oc_engine::status::SessionRunGuard,
         _events: TurnEventSender,
     ) -> SessionMutationFuture {
         self.prompts
@@ -228,7 +227,8 @@ impl SessionMutationExecutor for CompletingMutationExecutor {
     fn compact(
         &self,
         request: SessionCompactExecution,
-        _interrupt: InterruptSignal,
+        _guard: oc_engine::status::SessionRunGuard,
+        _events: TurnEventSender,
     ) -> SessionMutationFuture {
         self.compactions
             .lock()

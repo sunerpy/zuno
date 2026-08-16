@@ -2,6 +2,7 @@
 
 use super::*;
 
+use crate::cmd::tool_runtime;
 use oc_catalog::agent::{Agent, AgentMode, AgentSource};
 use oc_llm::sse::StreamIdleTimeout;
 use oc_paths::Env;
@@ -2054,6 +2055,133 @@ fn a_catalog_limit_that_is_absent_or_negative_reads_as_no_window() {
     assert_eq!(token_count(-1.0), 0);
     assert_eq!(token_count(f64::NAN), 0);
     assert_eq!(token_count(f64::INFINITY), 0);
+}
+
+#[test]
+fn production_registry_exposes_all_three_goal_tools() {
+    let directory = tempfile::TempDir::new().expect("temporary tool workspace");
+    let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
+    let selected_agent = agent("build");
+    let runtime = tool_runtime::assemble(
+        directory.path(),
+        None,
+        &Env::empty(),
+        &oc_config::schema::Config::default(),
+        &selected_agent,
+        tool_runtime::ToolSelection {
+            provider_id: "provider",
+            model_id: "model",
+            question: None,
+            plugin_tools: &[],
+            plugins: None,
+            todo_store: Arc::new(
+                oc_db::Pool::open(&oc_paths::DbLocation::Memory).expect("in-memory todo store"),
+            ),
+            goal_store: Arc::new(
+                GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
+            ),
+        },
+    )
+    .expect("production registry assembles");
+    let ids = runtime
+        .tools
+        .iter()
+        .map(|tool| tool.id())
+        .collect::<Vec<_>>();
+
+    for goal_tool in ["get_goal", "create_goal", "update_goal"] {
+        assert!(
+            ids.contains(&goal_tool),
+            "production registry is missing `{goal_tool}`; visible tools: {ids:?}"
+        );
+    }
+}
+
+#[test]
+fn goal_dynamic_context_is_rebuilt_from_authoritative_sql_for_each_request() {
+    let spill = tempfile::tempdir().expect("temporary goal spill directory");
+    let store =
+        Arc::new(GoalStore::open_memory(spill.path().to_owned()).expect("in-memory goal store"));
+    let continuation = GoalContinuation::new(Arc::clone(&store), SessionRunRegistry::new());
+    let first_goal = store
+        .create_goal("ses_goal_context", "first objective", None)
+        .expect("create goal");
+    let first = continuation
+        .injection("ses_goal_context")
+        .expect("read first injection")
+        .map(|entry| dynamic_context_from_goal_entry(&entry))
+        .expect("goal context exists");
+    assert_eq!(
+        first,
+        DynamicContext::new(oc_goal::render_goal_context(&first_goal))
+    );
+
+    let second_goal = store
+        .update_objective("ses_goal_context", "second objective from SQL")
+        .expect("update objective")
+        .expect("goal exists");
+    let second = continuation
+        .injection("ses_goal_context")
+        .expect("read second injection")
+        .map(|entry| dynamic_context_from_goal_entry(&entry))
+        .expect("goal context exists");
+    assert_eq!(
+        second,
+        DynamicContext::new(oc_goal::render_goal_context(&second_goal))
+    );
+    assert_ne!(
+        first, second,
+        "the second request reused stale goal context"
+    );
+}
+
+#[test]
+fn goal_usage_delta_includes_every_assistant_step_and_token_bucket() {
+    let mut connection =
+        oc_db::open::open(&oc_paths::DbLocation::Memory).expect("open memory database");
+    oc_db::migration::apply(&mut connection).expect("apply schema");
+    let fixture_plan = plan("/workspace", SessionChoice::New);
+    let now = 1_780_000_000_000;
+    ensure_project(&connection, &fixture_plan.project, now).expect("persist project");
+    let session =
+        resolve_session(&mut connection, &fixture_plan, now).expect("create fixture session");
+    let store = oc_db::message::MessageStore::new(&connection);
+    let assistant = |id: &str, created: i64, values: [i64; 5]| {
+        oc_db::message::MessageRecord::from_json(serde_json::json!({
+            "id": id,
+            "sessionID": session.id,
+            "role": "assistant",
+            "time": { "created": created, "completed": created + 1 },
+            "parentID": "msg_parent",
+            "modelID": "model",
+            "providerID": "provider",
+            "mode": "build",
+            "agent": "build",
+            "path": { "cwd": "/workspace", "root": "/workspace" },
+            "cost": 0,
+            "tokens": {
+                "input": values[0],
+                "output": values[1],
+                "reasoning": values[2],
+                "cache": { "read": values[3], "write": values[4] }
+            },
+            "finish": "stop"
+        }))
+        .expect("valid assistant message")
+    };
+    store
+        .put_message(&assistant("msg_baseline", now, [1, 1, 1, 1, 1]))
+        .expect("persist baseline assistant");
+    let before = goal_usage(&connection, &session.id).expect("read usage before turn");
+    store
+        .put_message(&assistant("msg_step_1", now + 2, [1, 2, 3, 4, 5]))
+        .expect("persist first assistant step");
+    store
+        .put_message(&assistant("msg_step_2", now + 4, [10, 20, 30, 40, 50]))
+        .expect("persist second assistant step");
+    let after = goal_usage(&connection, &session.id).expect("read usage after turn");
+
+    assert_eq!(after.tokens - before.tokens, 165);
 }
 
 /// Neither surface may compose a turn of its own.

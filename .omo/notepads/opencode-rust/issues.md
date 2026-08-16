@@ -8919,3 +8919,23 @@ F3 用真机四态矩阵独立验证了这一点：把 plan 放在旧路径 `.op
 `ingest`，并从真实入口证明冲突规则生效）；(b) 整体退役该 crate，同 commit 内修改
 `crates.expected`、`MINIMUM_CRATES`、计划枚举与计数，并把 todo 69 与成功准则 11 显式标记退役。
 在此之前**不要**只删 `ingest`：那既没修好可达性，又毁掉了唯一记录该行为的测试。
+
+## 已解决：`oc-goal` 整个 crate 未接线（task-r10，2026-08-16）
+
+采用上节建议的方案 (a)：`oc-cli` 现在依赖 `oc-goal`，三个 goal 工具、SQL 动态注入、projection、
+usage accounting、真实 turn blocker 结算和 guarded idle continuation 均通过共享 `TurnHost` 到达
+`run`、TUI、server。server compact 的 admission guard/event sender 也已移交 executor，并在释放
+guard 后续跑，原「crate 粒度不可达」问题不再存在。
+
+验证期间有两个环境注意点：
+
+1. `lsp_diagnostics` 工具把路径强制限制在会话 cwd
+   `/config/workspace/ProdDir/AI/opencode-rust`，因此拒绝唯一可修改的 sibling worktree
+   `/config/workspace/ProdDir/AI/oc-wt/r10`；Rust LSP 已安装，但无法由该工具对目标路径启动。
+   等价诊断使用目标 worktree 内的
+   `cargo clippy -p oc-goal -p oc-cli -p oc-server --all-targets -- -D warnings`，随后全 workspace
+   `make lint` 也通过，均为零 warning。
+2. 首次真实模型 smoke 被 `/config/.local/share/zuno/opencode-local.db` 的旧库迁移保护阻断；没有
+   移动或修改用户数据库。改用临时 `XDG_DATA_HOME` 后，凭据也随之隔离而得到预期 HTTP 401；
+   最终通过 `ZUNO_AUTH_CONTENT` 只读复用现有 `auth.json`，真实请求成功返回
+   `GOAL_INTEGRATION_OK`。

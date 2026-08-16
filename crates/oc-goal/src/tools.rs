@@ -19,7 +19,7 @@ pub const UPDATE_GOAL_TOOL_ID: &str = "update_goal";
 const GET_DESCRIPTION: &str =
     "Get the current goal for this session, including status, budget, usage, and remaining tokens.";
 const CREATE_DESCRIPTION: &str = "Create a goal only when explicitly requested. An unfinished goal cannot be replaced. Set token_budget only when the user explicitly requested one.";
-const UPDATE_DESCRIPTION: &str = "Mark the current goal complete or blocked. Complete requires evidence for every requirement. Blocked requires the same impasse on three consecutive goal turns.";
+const UPDATE_DESCRIPTION: &str = "Mark the current goal complete, or report a blocking condition for the current turn. Complete requires evidence for every requirement. Blocked requires blocking_condition and becomes terminal only after the same condition persists for three consecutive goal turns.";
 
 /// No-argument payload for [`GetGoalTool`].
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -62,6 +62,9 @@ impl From<UpdateGoalStatus> for ModelStatus {
 pub struct UpdateGoalParams {
     /// Terminal status justified by the completion or blocked audit.
     pub status: UpdateGoalStatus,
+    /// Stable description of the impasse. Required only with `status: blocked`.
+    #[serde(default)]
+    pub blocking_condition: Option<String>,
 }
 
 /// Reads the current session goal.
@@ -187,23 +190,43 @@ impl TypedTool for UpdateGoalTool {
         let session_id = ctx.session_id;
         let status = ModelStatus::from(params.status);
         if matches!(status, ModelStatus::Blocked) {
-            let audit_store = Arc::clone(&store);
-            let audit_session_id = session_id.clone();
-            let streak =
-                tokio::task::spawn_blocking(move || audit_store.failure_streak(&audit_session_id))
-                    .await
-                    .map_err(|error| failed(UPDATE_GOAL_TOOL_ID, error))?
-                    .map_err(|error| map_goal_error(UPDATE_GOAL_TOOL_ID, error))?;
-            let turns = streak.map_or(0, |streak| streak.consecutive_turns);
-            if turns < crate::BLOCKED_TURN_THRESHOLD {
+            let condition = params
+                .blocking_condition
+                .as_deref()
+                .map(str::trim)
+                .filter(|condition| !condition.is_empty())
+                .ok_or_else(|| {
+                    invalid(
+                        UPDATE_GOAL_TOOL_ID,
+                        "blocking_condition is required when status is blocked",
+                    )
+                })?;
+            let staged_store = Arc::clone(&store);
+            let staged_session_id = session_id.clone();
+            let condition = condition.to_owned();
+            let staged = tokio::task::spawn_blocking(move || {
+                staged_store.stage_failure_signal(&staged_session_id, &condition)
+            })
+            .await
+            .map_err(|error| failed(UPDATE_GOAL_TOOL_ID, error))?
+            .map_err(|error| map_goal_error(UPDATE_GOAL_TOOL_ID, error))?;
+            if !staged {
                 return Err(invalid(
                     UPDATE_GOAL_TOOL_ID,
-                    &format!(
-                        "blocked requires the same blocking condition for {} consecutive goal turns; recorded {turns}",
-                        crate::BLOCKED_TURN_THRESHOLD
-                    ),
+                    "cannot report a blocker because this session has no active goal",
                 ));
             }
+            let goal = tokio::task::spawn_blocking(move || store.goal(&session_id))
+                .await
+                .map_err(|error| failed(UPDATE_GOAL_TOOL_ID, error))?
+                .map_err(|error| map_goal_error(UPDATE_GOAL_TOOL_ID, error))?;
+            return goal_output(UPDATE_GOAL_TOOL_ID, goal);
+        }
+        if params.blocking_condition.is_some() {
+            return Err(invalid(
+                UPDATE_GOAL_TOOL_ID,
+                "blocking_condition is only valid when status is blocked",
+            ));
         }
         let goal =
             tokio::task::spawn_blocking(move || store.update_status_as_model(&session_id, status))

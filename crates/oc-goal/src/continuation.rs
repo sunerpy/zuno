@@ -229,6 +229,11 @@ impl GoalContinuation {
         session_id: &str,
         outcome: GoalTurnOutcome<'_>,
     ) -> Result<BlockedAudit, GoalError> {
+        let staged = self.store.consume_staged_failure_signal(session_id)?;
+        let outcome = match (outcome, staged.as_deref()) {
+            (GoalTurnOutcome::Progress, Some(signal)) => GoalTurnOutcome::Blocking(signal),
+            (outcome, _) => outcome,
+        };
         if self
             .store
             .goal(session_id)?

@@ -64,6 +64,8 @@ pub(crate) struct ToolSelection<'a> {
     pub(crate) question: Option<Arc<dyn QuestionAsker>>,
     pub(crate) plugin_tools: &'a [Arc<dyn Tool>],
     pub(crate) plugins: Option<Arc<super::plugin_runtime::PluginRuntime>>,
+    pub(crate) todo_store: Arc<oc_db::pool::Pool>,
+    pub(crate) goal_store: Arc<oc_goal::GoalStore>,
 }
 
 /// Assemble the registry for `agent` and project it onto `provider_id`/`model_id`.
@@ -107,7 +109,6 @@ pub(crate) fn assemble(
         let hook: Arc<dyn oc_tools::shell::ShellEnvHook> = plugins.clone();
         shell = shell.with_env_hook(hook);
     }
-    let todo_store = oc_db::pool::Pool::open_default().map_err(to_string)?;
     if let Some(asker) = selection.question {
         builder
             .register_builtin(BuiltinSlot::Question, erase(QuestionTool::new(asker)))
@@ -128,7 +129,7 @@ pub(crate) fn assemble(
         (
             BuiltinSlot::Todo,
             erase(oc_tools::todo::TodoWriteTool::new(Arc::new(
-                oc_tools::todo::SqliteTodoStore::new(Arc::new(todo_store)),
+                oc_tools::todo::SqliteTodoStore::new(Arc::clone(&selection.todo_store)),
             ))),
         ),
         (
@@ -149,6 +150,9 @@ pub(crate) fn assemble(
     let memory_root = worktree.unwrap_or(directory);
     if let Some(memory) = configured_memory_tool(memory_root, config) {
         builder.register_configured_builtin(memory);
+    }
+    for tool in oc_goal::goal_tools(Arc::clone(&selection.goal_store)) {
+        builder.register_configured_builtin(tool);
     }
 
     let registry = builder.build();

@@ -2467,6 +2467,7 @@ dependencies = [
  "oc-db",
  "oc-engine",
  "oc-error",
+ "oc-goal",
  "oc-llm",
  "oc-lsp",
  "oc-mcp",

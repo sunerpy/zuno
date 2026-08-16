@@ -158,33 +158,90 @@ async fn blocked_update_requires_three_persisted_matching_failure_signals() {
         .expect("create goal");
     let tool = erase(UpdateGoalTool::new(Arc::clone(&fixture.store)));
 
-    let early = tool
-        .execute(
-            json!({"status": "blocked"}),
-            fixture.context("call_early_blocked"),
+    let continuation = crate::GoalContinuation::new(
+        Arc::clone(&fixture.store),
+        oc_engine::status::SessionRunRegistry::new(),
+    );
+    for turn in 1..=3 {
+        let pending = tool
+            .execute(
+                json!({
+                    "status": "blocked",
+                    "blocking_condition": "credential unavailable"
+                }),
+                fixture.context(&format!("call_blocked_{turn}")),
+            )
+            .await
+            .expect("stage blocker for this turn");
+        assert_eq!(
+            goal_from_metadata(&pending)
+                .expect("decode pending metadata")
+                .expect("goal exists")
+                .status,
+            GoalStatus::Active
+        );
+        continuation
+            .record_turn_outcome("ses_tools", crate::GoalTurnOutcome::Progress)
+            .expect("settle one real turn");
+    }
+    let blocked = fixture.store.goal("ses_tools").expect("read blocked goal");
+    assert_eq!(blocked.expect("goal exists").status, GoalStatus::Blocked);
+}
+
+#[tokio::test]
+async fn repeated_blocked_calls_in_one_turn_count_once() {
+    let fixture = Fixture::new();
+    fixture
+        .store
+        .create_goal("ses_tools", "do not forge turns", None)
+        .expect("create goal");
+    let tool = erase(UpdateGoalTool::new(Arc::clone(&fixture.store)));
+    for call in 1..=3 {
+        tool.execute(
+            json!({"status": "blocked", "blocking_condition": "same blocker"}),
+            fixture.context(&format!("call_retry_{call}")),
         )
         .await
-        .expect_err("blocked before three turns must be refused");
-    assert!(matches!(early, ToolError::InvalidArgs { .. }));
+        .expect("restage blocker within one turn");
+    }
+    let continuation = crate::GoalContinuation::new(
+        Arc::clone(&fixture.store),
+        oc_engine::status::SessionRunRegistry::new(),
+    );
+    let audit = continuation
+        .record_turn_outcome("ses_tools", crate::GoalTurnOutcome::Progress)
+        .expect("settle one real turn");
+    assert!(matches!(
+        audit,
+        crate::BlockedAudit::Pending(crate::FailureStreak {
+            consecutive_turns: 1,
+            ..
+        })
+    ));
+}
 
-    for _ in 0..3 {
+#[test]
+fn a_terminal_status_discards_an_unsettled_blocker() {
+    let fixture = Fixture::new();
+    fixture
+        .store
+        .create_goal("ses_tools", "discard stale blocker", None)
+        .expect("create goal");
+    assert!(
         fixture
             .store
-            .record_failure_signal("ses_tools", Some("credential unavailable"))
-            .expect("record matching blocker");
-    }
-    let blocked = tool
-        .execute(
-            json!({"status": "blocked"}),
-            fixture.context("call_blocked"),
-        )
-        .await
-        .expect("blocked after three matching turns");
+            .stage_failure_signal("ses_tools", "old blocker")
+            .expect("stage blocker")
+    );
+    fixture
+        .store
+        .update_status_as_model("ses_tools", crate::ModelStatus::Blocked)
+        .expect("block goal");
     assert_eq!(
-        goal_from_metadata(&blocked)
-            .expect("decode metadata")
-            .expect("goal exists")
-            .status,
-        GoalStatus::Blocked
+        fixture
+            .store
+            .consume_staged_failure_signal("ses_tools")
+            .expect("read pending blocker"),
+        None
     );
 }

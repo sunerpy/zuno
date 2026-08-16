@@ -153,7 +153,22 @@ async fn drive_turns(
     events: TurnEventSender,
 ) {
     while let Some(prompt) = prompts.recv().await {
-        if let Err(message) = host.drive(&prompt, events.clone()).await {
+        let outcome = async {
+            host.drive(&prompt, events.clone()).await?;
+            loop {
+                let queued = if prompts.is_empty() {
+                    oc_goal::QueuedUserInput::Absent
+                } else {
+                    oc_goal::QueuedUserInput::Present
+                };
+                if !host.continue_goal_if_idle(queued, events.clone()).await? {
+                    break;
+                }
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+        if let Err(message) = outcome {
             let reported = events
                 .publish(TurnEvent::TurnInterrupted {
                     assistant_message_id: None,

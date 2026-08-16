@@ -10,7 +10,6 @@ use axum::http::{Method, Request, StatusCode};
 use oc_db::Pool;
 use oc_db::artifact_gc::ArtifactGcPaths;
 use oc_db::session::SessionCreate;
-use oc_engine::interrupt::InterruptSignal;
 use oc_engine::r#loop::TurnEventSender;
 use oc_engine::status::SessionStatus;
 use oc_paths::DbLocation;
@@ -76,7 +75,7 @@ impl SessionMutationExecutor for BlockingMutationExecutor {
     fn prompt(
         &self,
         request: SessionPromptExecution,
-        interrupt: InterruptSignal,
+        guard: oc_engine::status::SessionRunGuard,
         _events: TurnEventSender,
     ) -> SessionMutationFuture {
         self.prompts
@@ -88,7 +87,7 @@ impl SessionMutationExecutor for BlockingMutationExecutor {
         Box::pin(async move {
             started.store(true, Ordering::SeqCst);
             started_notify.notify_waiters();
-            interrupt.notified().await;
+            guard.interrupt_signal().notified().await;
             Ok(())
         })
     }
@@ -96,10 +95,62 @@ impl SessionMutationExecutor for BlockingMutationExecutor {
     fn compact(
         &self,
         _request: SessionCompactExecution,
-        _interrupt: InterruptSignal,
+        _guard: oc_engine::status::SessionRunGuard,
+        _events: TurnEventSender,
     ) -> SessionMutationFuture {
         self.compact_calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Ok(()) })
+    }
+}
+
+#[derive(Debug, Default)]
+struct BlockingCompactMutationExecutor {
+    compact_started: AtomicBool,
+    compact_started_notify: Notify,
+    compact_release: Arc<Notify>,
+}
+
+impl BlockingCompactMutationExecutor {
+    async fn wait_until_compact_started(&self) {
+        loop {
+            let mut notified = std::pin::pin!(self.compact_started_notify.notified());
+            notified.as_mut().enable();
+            if self.compact_started.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn release_compact(&self) {
+        self.compact_release.notify_one();
+    }
+}
+
+impl SessionMutationExecutor for BlockingCompactMutationExecutor {
+    fn prompt(
+        &self,
+        _request: SessionPromptExecution,
+        _guard: oc_engine::status::SessionRunGuard,
+        _events: TurnEventSender,
+    ) -> SessionMutationFuture {
+        Box::pin(async { Err("prompt is not expected in this test".to_owned()) })
+    }
+
+    fn compact(
+        &self,
+        _request: SessionCompactExecution,
+        guard: oc_engine::status::SessionRunGuard,
+        _events: TurnEventSender,
+    ) -> SessionMutationFuture {
+        self.compact_started.store(true, Ordering::SeqCst);
+        self.compact_started_notify.notify_waiters();
+        let compact_release = self.compact_release.clone();
+        Box::pin(async move {
+            compact_release.notified().await;
+            drop(guard);
+            Ok(())
+        })
     }
 }
 
@@ -1157,6 +1208,66 @@ async fn api_prompt_wait_and_interrupt_share_one_live_turn_signal() {
             agent: None,
             model: None,
         }]
+    );
+}
+
+#[tokio::test]
+async fn api_compact_holds_the_admission_guard_until_the_executor_returns() {
+    let state = ApiState::memory("/repo").expect("in-memory API state initializes");
+    state
+        .sessions()
+        .create(&SessionCreate::new(
+            "ses_compact_guard",
+            "ses_compact_guard",
+            "global",
+            "/repo",
+            "/repo",
+            "compact guard",
+            "test",
+        ))
+        .expect("fixture session inserts");
+    let executor = Arc::new(BlockingCompactMutationExecutor::default());
+    let services = ServerServices::new(64).with_mutations(executor.clone());
+    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
+        .with_services(services.clone())
+        .with_routes(api::router(state))
+        .router();
+
+    let mut compact_task = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.oneshot(request(
+                Method::POST,
+                "/api/session/ses_compact_guard/compact",
+                None,
+            ))
+            .await
+            .expect("compact responds")
+        }
+    });
+    executor.wait_until_compact_started().await;
+    assert_eq!(
+        services.runs.status("ses_compact_guard"),
+        SessionStatus::Busy,
+        "the HTTP admission guard must remain live inside the compact executor"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut compact_task)
+            .await
+            .is_err(),
+        "the HTTP request must wait for compact and its post-compact handoff"
+    );
+
+    executor.release_compact();
+    let response = tokio::time::timeout(Duration::from_secs(1), &mut compact_task)
+        .await
+        .expect("compact finishes after release")
+        .expect("compact task does not panic");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        services.runs.status("ses_compact_guard"),
+        SessionStatus::Idle,
+        "the guard must be released when the executor and idle handoff finish"
     );
 }
 

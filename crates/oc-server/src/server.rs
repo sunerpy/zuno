@@ -20,9 +20,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
 use oc_db::session_prune::SessionPruneProgress;
-use oc_engine::interrupt::InterruptSignal;
 use oc_engine::r#loop::{TurnEvent, TurnEventSender};
-use oc_engine::status::SessionRunRegistry;
+use oc_engine::status::{SessionRunGuard, SessionRunRegistry};
 use tokio::net::{TcpListener, lookup_host};
 
 use crate::auth::WWW_AUTHENTICATE_VALUE;
@@ -60,14 +59,15 @@ pub trait SessionMutationExecutor: Send + Sync + std::fmt::Debug {
     fn prompt(
         &self,
         request: SessionPromptExecution,
-        interrupt: InterruptSignal,
+        guard: SessionRunGuard,
         events: TurnEventSender,
     ) -> SessionMutationFuture;
 
     fn compact(
         &self,
         request: SessionCompactExecution,
-        interrupt: InterruptSignal,
+        guard: SessionRunGuard,
+        events: TurnEventSender,
     ) -> SessionMutationFuture;
 }
 

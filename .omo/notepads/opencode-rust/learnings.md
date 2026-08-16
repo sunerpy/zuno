@@ -7541,3 +7541,31 @@ sweep 无法再无声篡改。三种写法都用上了：引文块前加一句�
 
 **先用 `cargo metadata` 查 crate 级依赖者，再判函数级死代码**——否则会把「一整个功能没接线」
 误诊成「一个函数忘了删」，然后做出一个既没修好也不可评审的改动。
+
+## 准则 11：goal 必须在共享 composition root 结算（task-r10，2026-08-16）
+
+`oc-goal` 已从孤立 crate 接入 `crates/oc-cli/src/cmd/turn.rs::TurnHost`，而不是分别在
+`run`、TUI、server 复制组装逻辑。三个 goal 工具进入共享 configured built-ins；每个请求都从
+SQL 权威状态重建动态上下文；projection ingest、usage delta、turn outcome 与 terminal error 都在
+同一 host 收口。composition-root 守卫继续断言全仓只有 `turn.rs` 的单一 `run_turn(` 调用点。
+
+blocker 的关键边界不是 tool call，而是真实 turn：`update_goal(status="blocked")` 只把
+`blocking_condition` 暂存到 `goal_pending_failure_signal`；`record_turn_outcome` 在 turn 结束时最多
+消费一次。同一 turn 内反复调用不会伪造连续失败，第三个条件相同的真实 turn 才进入 `blocked`；
+条件改变、取得进展或 terminal status 都会清理暂存信号。
+
+server compact 现在把 HTTP admission `SessionRunGuard` 和 `TurnEventSender` 直接移交
+`SessionMutationExecutor::compact`。production executor 由 `TurnHost::compact` 统一做 goal usage
+与失败阻断，随后先释放 admission guard，再调用 guarded idle continuation；新增 API 回归证明
+compact executor 返回前 session 始终 `Busy`，返回后才变为 `Idle`。
+
+另一个容易遗漏的生命周期边界是 headless renderer：producer 完成后若外层仍持有最后一个
+`TurnEventSender`，`render_events` 会永久等 channel 关闭。goal continuation 接入后暴露了这个旧
+所有权缺口；在 producer 尾部显式 `drop(sender)` 后，`configured_model` 的三个 CLI route probe
+从稳定 30 秒超时恢复为 6/6 通过。
+
+最终证据：`oc-goal` 90 tests + 1 doctest、`oc-server --test api` 42/42、`oc-cli --lib`
+119/119、`release_surface` 25/25、后台 `cargo test --workspace` exit 0、`make lint`、
+`make fmt-check`、`make smoke-artifact` 全部通过；隔离数据目录并只读复用现有 auth 的真实
+`zuno run --model myopenai/global.anthropic.claude-haiku-4-5-20251001-v1:0` 返回
+`GOAL_INTEGRATION_OK`。

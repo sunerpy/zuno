@@ -47,9 +47,18 @@ pub(super) fn execute(args: &RunArgs, environment: &StartupEnvironment) -> Resul
         tokio::join!(
             async {
                 match args.command.as_deref() {
-                    Some(command) => host.drive_command(command, &message, sender).await,
-                    None => host.drive(&message, sender).await,
+                    Some(command) => {
+                        host.drive_command(command, &message, sender.clone())
+                            .await?
+                    }
+                    None => host.drive(&message, sender.clone()).await?,
                 }
+                while host
+                    .continue_goal_if_idle(oc_goal::QueuedUserInput::Absent, sender.clone())
+                    .await?
+                {}
+                drop(sender);
+                Ok::<(), String>(())
             },
             render_events(receiver, args.format)
         )
