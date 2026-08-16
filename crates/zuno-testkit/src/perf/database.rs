@@ -1,6 +1,5 @@
 //! Read-only isolation and pinned-session selection for W-real.
 
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -11,9 +10,45 @@ use crate::error::{Result, TestkitError};
 use super::subject::{PinnedSubject, W_REAL_RECAPTURE, W_REAL_SUBJECT};
 
 /// `rw-------`: one run's private, writable copy of the snapshot.
+#[cfg(unix)]
 const OWNER_READ_WRITE: u32 = 0o600;
 /// `r--r--r--`: the shared snapshot no run may write back to.
+#[cfg(unix)]
 const READ_ONLY: u32 = 0o444;
+
+/// Make `path` writable by its owner.
+///
+/// Split by platform because the Unix modes above are not expressible on Windows,
+/// where the only file-permission bit `std` exposes is read-only. The Windows arm
+/// clears that bit rather than doing nothing: this function's caller relies on the
+/// clone being writable, and a silent no-op would turn a permission problem into a
+/// confusing SQLite error later.
+#[cfg(unix)]
+fn set_owner_read_write(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(OWNER_READ_WRITE))
+}
+
+#[cfg(not(unix))]
+fn set_owner_read_write(path: &Path) -> std::io::Result<()> {
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    permissions.set_readonly(false);
+    std::fs::set_permissions(path, permissions)
+}
+
+/// Make `path` read-only, so no run can write back to the shared snapshot.
+#[cfg(unix)]
+fn set_read_only(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(READ_ONLY))
+}
+
+#[cfg(not(unix))]
+fn set_read_only(path: &Path) -> std::io::Result<()> {
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(path, permissions)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RealSession {
@@ -65,7 +100,7 @@ impl RealDatabaseSnapshot {
         std::fs::copy(&self.path, target).map_err(|source| {
             TestkitError::io("clone W-real snapshot for one run", target, source)
         })?;
-        std::fs::set_permissions(target, std::fs::Permissions::from_mode(OWNER_READ_WRITE))
+        set_owner_read_write(target)
             .map_err(|source| TestkitError::io("make W-real run clone writable", target, source))?;
         Ok(target.to_path_buf())
     }
@@ -219,9 +254,9 @@ fn make_sqlite_family_read_only(path: &Path) -> Result<()> {
         if !candidate.exists() {
             continue;
         }
-        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(READ_ONLY)).map_err(
-            |source| TestkitError::io("make W-real snapshot read-only", candidate, source),
-        )?;
+        set_read_only(&candidate).map_err(|source| {
+            TestkitError::io("make W-real snapshot read-only", candidate, source)
+        })?;
     }
     Ok(())
 }
