@@ -7497,3 +7497,47 @@ working invocation; update the documentation first"），而不是让门禁静�
 而红的样子看起来像有人改坏了文档。`unwrapped()` 把连续空白折叠成单空格后再匹配，钉住句子
 本身。同理，`docs/readme/README.en.md` 在 `Makefile` 的 `OXFMT_FILES` 里，oxfmt 会重排它的
 换行——不折叠空白的话，`make fmt-check` 与 docs 门禁会互相拆台。
+
+## 机械重命名会篡改引文：把「引用」与「本项目行为」在文本层面分离（task-r9，2026-08-16）
+
+`.opencode` → `.zuno` 那次 sweep 改的不只是活需求，还改掉了**逐字引用上游源码的引文**。
+被篡改的引文比 stale 标识更坏：它看起来是维护过的，却让文档断言上游做了它没做的事。
+本轮实测到 4 个站点（全部对照 `/tmp/opencode-src/` 真源逐行核验后修复）：
+
+- `crates/oc-agent/src/plan_file.rs:8`——```ts 块里 `path.join(instance.worktree, ".zuno", "plans")`，
+  上游 `session/session.ts:333` 实为 `".opencode"`。
+- `crates/oc-paths/src/config_chain.rs:7-10`——标为 ported-from 的伪代码把
+  `OPENCODE_DISABLE_PROJECT_CONFIG` 与两处 `targets: [".opencode"]` 改成了 `ZUNO_*` / `.zuno`；
+  上游 `config/paths.ts:27-39` 三处都是 `.opencode`。
+- `crates/oc-llm/src/catalog/source.rs:48`——「Measured on 1.18.12 ... `ZUNO_DISABLE_MODELS_FETCH=1`
+  and no `ZUNO_MODELS_PATH`」。这条最隐蔽：1.18.12 只读 `OPENCODE_*`，所以按字面复现的话
+  fetch 根本没被关掉，**记录下来的实测无法复现**。
+- `crates/oc-llm/src/catalog/source.rs:76`——"under `ZUNO_DISABLE_MODELS_FETCH`, upstream …"。
+
+**可复用的做法**：修复不是把名字换回去就完事，而是在文本里把两种身份显式分开，让下一次
+sweep 无法再无声篡改。三种写法都用上了：引文块前加一句「The transcription below is the
+**oracle's**, so it keeps upstream's own spellings verbatim」；叙述句里两个名字并列
+（`OPENCODE_DISABLE_MODELS_FETCH` upstream, `ZUNO_DISABLE_MODELS_FETCH` here）；路径引用就地
+标注「upstream's own directory name, quoted here as a citation rather than as a requirement」。
+
+**判定规则**（审计 40 个站点时用的，含 36 个判 CORRECT 的）：`.zuno` / `ZUNO_*` 描述 Zuno
+自己的行为 → 正确；出现在 ```ts / ported-from / Oracle: / 「measured against the real binary」
+的语境里 → 篡改。fixture（`crates/**/tests/fixtures/`）本轮全部干净。
+
+即将到来的 36 个 `oc-*` → `zuno-*` crate 重命名属于同一类风险：引文、fixture、历史记录都会被
+波及，且 394 个文件的 diff 里没人看得见。
+
+## 「没有生产调用者」有两种，处理方式完全不同（task-r9，2026-08-16）
+
+同样是 grep 只在自身模块 + 自身测试 + `pub use` 里命中，粒度不同，结论就不同：
+
+- **活 crate 里的死函数**（`oc-agent` 的 `read_plan` / `write_plan`）：`oc-agent` 被
+  `oc-cli` / `oc-tools` / `oc-memory` 依赖，所以这是两个函数的问题，删除是小而语义化的改动。
+- **整个 crate 没有依赖者**（`oc-goal`）：`cargo metadata` 实测 `oc-goal` 的依赖者是 **NONE**。
+  它自带 `store.rs`（`CREATE TABLE goal`）、`tools.rs`、`status.rs`、`spill.rs`、`continuation.rs`、
+  `projection.rs`，共 88 个测试——是一整个未接线的子系统（todo 67/68/69/50），不是一个孤立函数。
+  删 `ingest` 只会让剩下的同样不可达；删整 crate 会撞上冻结的 36 crate roster
+  （`crates.expected` + `MINIMUM_CRATES` + 计划枚举与计数，`release_surface.rs` 要求同一个 commit 内一起改）。
+
+**先用 `cargo metadata` 查 crate 级依赖者，再判函数级死代码**——否则会把「一整个功能没接线」
+误诊成「一个函数忘了删」，然后做出一个既没修好也不可评审的改动。

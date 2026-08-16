@@ -7,7 +7,9 @@
 //! global data directory when it is not (`session/session.ts:331-335`). The naming
 //! is the contract — the `plan` agent is told the path and writes the file with the
 //! ordinary file tools — so it is stated once, here, and asserted rather than
-//! reconstructed at each call site.
+//! reconstructed at each call site. The module therefore offers a path and nothing
+//! else: it grew a reader and a writer that no production path ever called, and
+//! they were removed in 2026-08 rather than left looking like a feature.
 //!
 //! # Models
 //!
@@ -40,6 +42,4 @@ pub mod model_policy;
 pub mod plan_file;
 pub mod reflection;
 
-pub use plan_file::{
-    PLANS_DIRECTORY, PROJECT_DIRECTORY, PlanKey, PlanLocation, plan_path, read_plan, write_plan,
-};
+pub use plan_file::{PLANS_DIRECTORY, PROJECT_DIRECTORY, PlanKey, PlanLocation, plan_path};

@@ -1,11 +1,11 @@
-//! Where a session's plan document lives, and how it is written.
+//! Where a session's plan document lives.
 //!
 //! Oracle: `packages/opencode/src/session/session.ts:331-335`.
 //!
 //! ```ts
 //! export function plan(input: { slug: string; time: { created: number } }, instance: InstanceContext) {
 //!   const base = instance.project.vcs
-//!     ? path.join(instance.worktree, ".zuno", "plans")
+//!     ? path.join(instance.worktree, ".opencode", "plans")
 //!     : path.join(Global.Path.data, "plans")
 //!   return path.join(base, [input.time.created, input.slug].join("-") + ".md")
 //! }
@@ -32,32 +32,24 @@
 //! choice for the same reason, and says so in its own module docs. That is not a
 //! coincidence: it copied this convention.
 //!
-//! # Why the write is atomic, and why it does not `fsync`
+//! # This module names the document; it does not read or write it
 //!
-//! A temporary file in the destination's own directory, then a rename. Same
-//! filesystem, so the rename is atomic, so a reader — the model on the next turn,
-//! or a human with the file open — always sees one complete document rather than a
-//! half-written one. `oc-memory` (todo 98) settled on this and `oc-goal` (todo 69)
-//! repeated it; both helpers are private to their crates, so this is the same
-//! technique rather than the same function, and the temp-name details that were
-//! learned the hard way are carried over rather than rediscovered:
+//! Deliberately, and the oracle draws the same line: `Session.plan` is a *path*
+//! function, and the only code that touches the file is
+//! `session/reminders.ts:54-88`, which checks existence, ensures the directory, and
+//! then tells the model where to write — *"You should create your plan at ${plan}
+//! using the write tool"*. The file is produced by the ordinary `write` and `edit`
+//! tools, under the same permission and formatting rules as any other file the
+//! model touches, which is what [`crate`]'s own module docs state.
 //!
-//! - `with_file_name`, **not** `with_extension`. `with_extension` would replace the
-//!   `.md` — and worse, a slug containing a dot would make the temp name collide
-//!   with a *different* plan's document.
-//! - nanos in the temp name, so two concurrent writes cannot land on one temp file
-//!   and interleave.
-//! - the rename's error arm removes the temp file, so a failure leaves no litter
-//!   beside a document a human is about to open.
-//!
-//! No `sync_all`. A plan is a document a user is iterating on with the editing
-//! tools, not a ledger: a rename that reaches the directory entry is what the next
-//! reader needs, and paying an fsync per keystroke-sized edit buys nothing the
-//! rename does not already give.
+//! So a `write_plan`/`read_plan` pair lived here until 2026-08-16 with no caller in
+//! any production path — the reader also carried a legacy-path diagnostic that
+//! nothing could ever reach, which is worse than no diagnostic because it reads as
+//! protection. Both are gone. What a caller needs is [`plan_path`]: the seam that
+//! wants it is `oc_tools::plan_exit::PlanExitHost::plan_path`, whose own docs
+//! describe exactly this computation (`tool/plan.ts:29`).
 
-use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use oc_paths::PROJECT_DIRECTORY;
 
@@ -134,89 +126,6 @@ impl PlanKey<'_> {
 #[must_use]
 pub fn plan_path(location: PlanLocation<'_>, key: PlanKey<'_>) -> Option<PathBuf> {
     Some(location.directory().join(key.file_name()?))
-}
-
-/// Write `body` to the session's plan document, creating the directory.
-///
-/// Returns the path written. The write is atomic, for the reasons in the module
-/// docs.
-///
-/// # Errors
-///
-/// [`io::ErrorKind::InvalidInput`] when the slug is refused; otherwise whatever the
-/// filesystem reported while creating the directory, writing the temporary file, or
-/// renaming it into place.
-pub fn write_plan(location: PlanLocation<'_>, key: PlanKey<'_>, body: &str) -> io::Result<PathBuf> {
-    let path = plan_path(location, key).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{:?} is not a usable plan slug", key.slug),
-        )
-    })?;
-    write_atomic(&path, body)?;
-    Ok(path)
-}
-
-/// Read a session's plan document, if it has one.
-///
-/// `Ok(None)` for a plan that does not exist yet, because "no plan" is the ordinary
-/// state of a new session rather than an error — `reminders.ts:55,73` branches on
-/// exactly this and tells the model to create the plan instead of failing.
-///
-/// # Errors
-///
-/// [`io::ErrorKind::InvalidInput`] when the slug is refused; otherwise whatever the
-/// filesystem reported while reading.
-///
-/// Also an error, rather than `Ok(None)`, when the plan is absent here but present
-/// at the pre-rename `.opencode/plans/` path. Reporting "no plan" there would make
-/// the model write a fresh plan over a document the user cannot see is being
-/// ignored, so the read refuses and names both paths.
-pub fn read_plan(location: PlanLocation<'_>, key: PlanKey<'_>) -> io::Result<Option<String>> {
-    let path = plan_path(location, key).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{:?} is not a usable plan slug", key.slug),
-        )
-    })?;
-    match std::fs::read_to_string(&path) {
-        Ok(body) => Ok(Some(body)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            match oc_paths::unmigrated_project_path(&path) {
-                Some(old) => Err(io::Error::other(format!(
-                    "a plan document exists at the pre-rename path {} but not at {}. \
-                 Zuno does not read the old directory: move it with \
-                 `mv {} {}` (or delete it) and run the command again",
-                    old.display(),
-                    path.display(),
-                    old.display(),
-                    path.display()
-                ))),
-                None => Ok(None),
-            }
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn write_atomic(path: &Path, body: &str) -> io::Result<()> {
-    let parent = path.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    let name = path.file_name().map_or_else(
-        || "plan.md".to_owned(),
-        |name| name.to_string_lossy().into(),
-    );
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_nanos());
-    let temporary = path.with_file_name(format!("{name}.tmp.{nanos}"));
-
-    std::fs::write(&temporary, body)?;
-    if let Err(error) = std::fs::rename(&temporary, path) {
-        drop(std::fs::remove_file(&temporary));
-        return Err(error);
-    }
-    Ok(())
 }
 
 #[cfg(test)]

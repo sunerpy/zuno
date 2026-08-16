@@ -8847,3 +8847,75 @@ F3 用真机四态矩阵独立验证了这一点：把 plan 放在旧路径 `.op
 （`.opencode/goal/`）、`:854`（`.opencode/plans/`）、`:1654`（`.opencode/goal/`，
 属成功准则 11）——而实现已切到 `.zuno/`，`crates/oc-goal/src/projection_tests.rs:645`
 断言的是 `.zuno/goal/`。按各自措辞验收，这三条现在无法通过。
+
+## task-r9（2026-08-16）：引文篡改 3 处、计划 env 名 2 处、plan_file 死代码 1 处
+
+**已修：被 sweep 篡改的上游引文（除 plan_file.rs:8 外新发现 3 个文件、8 个站点）**
+`config_chain.rs:7-10`、`catalog/source.rs:21,23,48,76`、`projection.rs:13`。全部对照
+`/tmp/opencode-src/` 真源核验：`config/paths.ts:27-39`、`core/src/models-dev.ts:160,184,222`、
+`session/session.ts:331-335`。审计共 40 个站点，36 个判 CORRECT（`.zuno` 合法描述 Zuno 自身），
+0 个 AMBIGUOUS。fixture 目录全部干净。
+
+**注意 inventory 脚本的计数会动**：`.omo/evidence/task-r3-opencode-inventory-generator.py` 扫
+`crates/*/src/**/*` 找小写 `opencode`，恢复引文后 `upstream-artifact-reference` 计数 +N。
+**这是正确行为，不是漂移**——下次重跑不要读成回退。
+
+**已修：计划里两处 env 名与代码不符**
+1. `:259` 的 `OPENCODE_DISABLE_PROJECT_CONFIG`。代码定义的是 `ZUNO_DISABLE_PROJECT_CONFIG`
+   （`oc-paths/src/env.rs:197`，`oc-cli/src/environment.rs:48`），且 `DISABLE_PROJECT_CONFIG`
+   **不在**六个冻结 ABI 名里（那六个是 `OPENCODE_CLIENT` / `CONFIG_CONTENT` / `CONFIG_DIR` /
+   `DISABLE_CLAUDE_CODE` / `SERVER_PASSWORD` / `SERVER_USERNAME`）。改法是加注说明：那行是已删除的
+   differential 喂给 `opencode` 二进制的历史记录，同时点明四个被改名的和两个属 ABI 的。
+2. `:185` 有一句更危险的话：「`opencode.json`/`opencode.jsonc` 文件名和**本 todo 里的
+   `OPENCODE_*` 变量名**都不是 stale——2026-08-15 实测仍是代码读的名字」。文件名部分对，
+   变量名部分**错**：该 todo 里唯一的变量是 `OPENCODE_DB`，它在 `ZUNO_ENV_NAME_MAP` 里，
+   `accepted_env_name` 会让 `OPENCODE_DB` 解析不到任何值。`oc-paths` 的
+   `every_project_owned_name_accepts_only_its_zuno_spelling` 正是断言这个拒绝——
+   **一句计划文本与一个通过的测试直接矛盾，却没有任何门禁会发现**。已收窄该句。
+   计划里其余 30 个 `OPENCODE_*` 出现位置逐一核对：全部位于 `References:`
+   （引上游 `flag.ts` / `models-dev.ts`）或历史实测记录里，属正确引用，未改。
+
+**已删：`oc-agent` 的 `write_plan` / `read_plan` / `write_atomic`**
+判定依据不是「grep 不到调用者」，而是**上游根本没有写入者**：`Session.plan` 是纯路径函数，
+唯一碰这个文件的是 `session/reminders.ts:54-88`——只做 `existsSafe` + `ensureDir`，然后注入一条
+合成消息告诉模型 *"You should create your plan at ${plan} using the write tool"*。文件是模型用
+普通 `write`/`edit` 工具写的。`oc-agent/src/lib.rs:8-9` 早就把这个设计写明了
+（"the `plan` agent is told the path and writes the file with the ordinary file tools"），
+所以给 `write_plan` 加一个生产调用者会**违反 crate 自己的契约**。
+
+保留 `plan_path` / `PlanLocation` / `PlanKey` / `PLANS_DIRECTORY`：这正是 todo 79 验收标准点名的
+东西（"asserts the file name and both locations"），也正是
+`oc_tools::plan_exit::PlanExitHost::plan_path` 文档里描述的消费者（`tool/plan.ts:29`）。
+
+**覆盖损失（精确）**：删掉 9 个测试，3489 → 3480，213 个 suite 与 2 个 ignored 不变。
+被删的是 `writing_creates_the_directory_and_leaves_no_temporary_behind`、
+`a_rewrite_replaces_the_document_rather_than_appending`、`reading_a_missing_plan_is_not_an_error`、
+四态 legacy 组（`a_plan_read_with_neither_document_is_still_not_an_error`、
+`a_plan_left_at_the_pre_rename_path_is_reported_rather_than_ignored`、
+`a_migrated_plan_reads_without_a_diagnostic`、`a_plan_present_in_both_locations_reads_the_new_one`）、
+`two_sessions_in_the_same_millisecond_get_different_documents`、
+`a_rewrite_is_atomic_under_a_concurrent_reader`。
+**诊断机制本身的四态覆盖没有损失**：`unmigrated_project_path` 在
+`oc-paths/src/config_chain.rs:285-331` 有自己的四态 + 两个拒绝用例。丢的只是 plan 这一侧的接线，
+而那条接线从来不可达——人工 QA 已证实四种状态全部 `exit 0`、零诊断。`oc-agent` 的
+`tempfile` dev-dependency 随之无人使用，一并移除（Cargo.lock -1 行）。
+
+## 未决（需计划所有者裁决）：`oc-goal` 整个 crate 未接线
+
+不是「`ingest` 少一个调用者」。`cargo metadata` 实测：**`oc-goal` 的依赖者是 NONE**
+（对比 `oc-agent` ← `oc-cli` / `oc-memory` / `oc-tools`）。`ingest` 有 crate 内调用者
+`ingest_event`（模块公开的 watch 路由入口），所以死的是 crate 粒度，不是函数粒度。
+
+三条路都超出「小而语义化」的范围：
+- **删 `ingest`**：必须连 `ingest_event` 一起删，那就是整个冲突规则引擎——todo 69 已勾选的
+  核心交付物及其验收标准（"a test asserting an edited status is **rejected**"）。会留下一个
+  `[x]` 却无法验证的 todo，正是本项目末轮在消灭的不可falsify门禁的镜像。
+- **删整个 crate**：撞冻结 roster（`crates.expected`、`MINIMUM_CRATES = 36`、计划枚举与计数
+  必须同 commit 修改），且与紧随其后的 36 crate 重命名冲突。
+- **接线**：需要 goal 创建路径、把 `tools.rs` 的 goal 工具注册进 tool runtime、一个 watcher、
+  一个 turn 边界钩子。全都不存在——这是功能，不是接线。
+
+**建议**：作为一个独立 todo 处理，二选一——(a) 接线 `oc-goal`（注册 goal 工具 + turn 边界
+`ingest`，并从真实入口证明冲突规则生效）；(b) 整体退役该 crate，同 commit 内修改
+`crates.expected`、`MINIMUM_CRATES`、计划枚举与计数，并把 todo 69 与成功准则 11 显式标记退役。
+在此之前**不要**只删 `ingest`：那既没修好可达性，又毁掉了唯一记录该行为的测试。

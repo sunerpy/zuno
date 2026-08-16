@@ -1,13 +1,19 @@
 //! The configuration directory and file chain, ported from
 //! `packages/opencode/src/config/paths.ts:10-45`.
 //!
+//! The transcription below is the **oracle's**, so it keeps upstream's own
+//! `.opencode` and `OPENCODE_DISABLE_PROJECT_CONFIG` spellings verbatim. Zuno
+//! walks [`PROJECT_CONFIG_DIRECTORY`] (`.zuno`) and reads
+//! `ZUNO_DISABLE_PROJECT_CONFIG`; the shape of the list is what is ported, not
+//! the names.
+//!
 //! ```text
 //! directories(directory, worktree) = unique([
 //!   Global.Path.config,
-//!   ...(!ZUNO_DISABLE_PROJECT_CONFIG
-//!         ? up({ targets: [".zuno"], start: directory, stop: worktree })
+//!   ...(!OPENCODE_DISABLE_PROJECT_CONFIG
+//!         ? up({ targets: [".opencode"], start: directory, stop: worktree })
 //!         : []),
-//!   ...up({ targets: [".zuno"], start: home, stop: home }),
+//!   ...up({ targets: [".opencode"], start: home, stop: home }),
 //!   ...(OPENCODE_CONFIG_DIR ? [OPENCODE_CONFIG_DIR] : []),
 //! ])
 //!

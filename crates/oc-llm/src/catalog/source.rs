@@ -5,6 +5,11 @@
 //! the part worth stating precisely, because each rung answers a different
 //! question and they are routinely conflated:
 //!
+//! The `ZUNO_*` names below are the spellings **this crate** accepts. Upstream
+//! reads the same three switches under `OPENCODE_MODELS_URL`,
+//! `OPENCODE_MODELS_PATH` and `OPENCODE_DISABLE_MODELS_FETCH`, so any sentence
+//! reporting what the oracle did names those instead.
+//!
 //! | variable | question it answers | effect |
 //! |---|---|---|
 //! | `ZUNO_MODELS_URL` | *where* would a fetch go | changes the source **and** the cache filename |
@@ -45,7 +50,8 @@
 //! providers *over* whatever the load returned, so an empty document plus a config
 //! that names its own provider, model, cost and limits still resolves that model.
 //! Measured on 1.18.12 under `env -i`, an empty `XDG_CACHE_HOME`,
-//! `ZUNO_DISABLE_MODELS_FETCH=1` and no `ZUNO_MODELS_PATH`: `opencode
+//! `OPENCODE_DISABLE_MODELS_FETCH=1` and no `OPENCODE_MODELS_PATH` — the names
+//! that binary reads: `opencode
 //! models` exits 0 and prints `test/test-model` from config alone.
 //!
 //! So [`CatalogSource::load`] returns `Ok` with an empty [`CatalogDocument`] here,
@@ -72,9 +78,10 @@
 //! stale one. It would also need either a network fetch at build time, which this
 //! workspace forbids, or a committed blob to keep current forever.
 //!
-//! The cost is a listing difference, not a functional one: under
-//! `ZUNO_DISABLE_MODELS_FETCH` with no cache, upstream lists its seven gateway
-//! models and this crate lists none. Anything the user's own config declares
+//! The cost is a listing difference, not a functional one: with fetching disabled
+//! and no cache — `OPENCODE_DISABLE_MODELS_FETCH` upstream,
+//! `ZUNO_DISABLE_MODELS_FETCH` here — upstream lists its seven gateway models and
+//! this crate lists none. Anything the user's own config declares
 //! resolves identically on both sides, which is what
 //! `tests/catalog_differential.rs` asserts byte for byte.
 

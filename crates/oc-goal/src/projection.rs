@@ -10,7 +10,9 @@
 //! `.zuno/goal/<sessionID>.md` that a human can read and edit.
 //!
 //! The path parallels the sibling convention for plans, which the oracle writes
-//! to `<worktree>/.zuno/plans` when the project is under version control and
+//! to `<worktree>/.opencode/plans` — upstream's own directory name, quoted here
+//! as a citation rather than as a requirement; Zuno's equivalent is
+//! `.zuno/plans` — when the project is under version control and
 //! to the global data directory when it is not
 //! (`packages/opencode/src/session/session.ts:331-335`). [`document_path`] makes
 //! the same two-way choice for the same reason: a project-local file is the one a
