@@ -241,30 +241,50 @@ pub enum DiffColumns {
 #[must_use]
 pub fn padded(text: &str, width: u16, style: Style) -> Line<'static> {
     let width = usize::from(width);
-    let mut owned = text.chars().take(width).collect::<String>();
-    let len = owned.chars().count();
-    if len < width {
-        owned.extend(std::iter::repeat_n(' ', width - len));
+    let mut owned = truncate(text, width);
+    let used = display_width(&owned);
+    if used < width {
+        owned.extend(std::iter::repeat_n(' ', width - used));
     }
     Line::from(Span::styled(owned, style))
 }
 
-/// How many columns `text` is assumed to occupy.
+/// The terminal columns `text` occupies.
 ///
-/// Counted in characters, matching [`padded`] and [`ambient::elide_left`], rather than
-/// in East-Asian display cells. That undercounts a wide glyph, but every width decision
-/// in this module already counts the same way, and one helper measuring differently from
-/// the padding applied beside it produces rows that disagree about where they end — a
-/// worse artefact than a uniformly narrow estimate.
+/// Not `chars().count()`. A CJK glyph occupies two cells, so a row padded by character
+/// count overflows its frame by one column per wide glyph — measured as a skill
+/// description running past the right edge, wrapping onto the next line, and pushing
+/// every row below it down. Both mistakes are invisible to a test that counts characters,
+/// which is why [`views_tests`] asserts columns.
+///
+/// The alternative — counting characters so that this helper agrees with every other width
+/// decision in the module — was tried and is the wrong trade. Agreement is worth having, but
+/// it is achieved by routing the other decisions through [`padded`] and [`truncate`], not by
+/// making all of them undercount together: rows that agree with each other and disagree with
+/// the terminal still wrap.
 #[must_use]
 pub fn display_width(text: &str) -> usize {
-    text.chars().count()
+    unicode_width::UnicodeWidthStr::width(text)
 }
 
 /// The longest prefix of `text` that fits in `width` columns.
+///
+/// Stops before a wide glyph that would straddle the boundary rather than splitting it:
+/// half of a double-width cell is not something a terminal can draw, and writing one
+/// leaves the rest of the row shifted by a column.
 #[must_use]
 pub fn truncate(text: &str, width: usize) -> String {
-    text.chars().take(width).collect()
+    let mut out = String::new();
+    let mut used = 0;
+    for character in text.chars() {
+        let cost = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + cost > width {
+            break;
+        }
+        out.push(character);
+        used += cost;
+    }
+    out
 }
 
 /// The terminal width at or above which the ambient sidebar is drawn.

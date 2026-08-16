@@ -511,14 +511,72 @@ fn views_padded_fills_and_truncates_to_the_width() {
 }
 
 #[test]
-fn views_padded_counts_characters_not_bytes() {
+fn views_padded_counts_terminal_columns_not_bytes_and_not_characters() {
+    // This assertion used to demand four *characters* for `日本`, which caught
+    // byte-counting and let character-counting through. A CJK glyph occupies two cells, so
+    // a row measured in characters overflows its frame by one column per wide glyph —
+    // measured as a skill description running past the right edge and wrapping the frame.
+    // Asserting columns catches both mistakes, and keeps the original intent.
     let style = ViewContext::defaults().text();
     let line = padded("日本", 4, style);
     assert_eq!(
-        line.spans[0].content.chars().count(),
+        display_width(line.spans[0].content.as_ref()),
         4,
-        "padding measured bytes, so a multi-byte row would be short"
+        "padding did not measure terminal columns"
     );
+    assert_eq!(
+        line.spans[0].content.as_ref(),
+        "日本",
+        "a row that already fills its width was padded further"
+    );
+
+    // And the truncating direction: three columns cannot hold two wide glyphs, and half a
+    // cell is not something a terminal can draw.
+    let narrow = padded("日本", 3, style);
+    assert_eq!(display_width(narrow.spans[0].content.as_ref()), 3);
+    assert_eq!(narrow.spans[0].content.as_ref(), "日 ");
+}
+
+#[test]
+fn views_display_width_and_truncate_agree_about_wide_glyphs() {
+    assert_eq!(display_width("abc"), 3);
+    assert_eq!(display_width("日本語"), 6);
+    assert_eq!(display_width(""), 0);
+    assert_eq!(truncate("日本語", 4), "日本");
+    assert_eq!(truncate("日本語", 5), "日本");
+    assert_eq!(truncate("日本語", 6), "日本語");
+    assert_eq!(truncate("abc", 2), "ab");
+    assert_eq!(truncate("abc", 0), "");
+    for width in 0..10 {
+        assert!(
+            display_width(&truncate("a日b本c", width)) <= width,
+            "truncating to {width} produced a wider string"
+        );
+    }
+}
+
+#[test]
+fn views_every_padded_surface_stays_inside_its_frame_with_wide_glyphs() {
+    // The property the two helpers exist for, asserted through the surfaces that render
+    // user-supplied names: a project whose skills and agents are named in Chinese must not
+    // push the frame apart.
+    let context = ViewContext::defaults();
+    let long = "飞书多维表格操作：建表、字段、记录、视图、统计、公式".repeat(4);
+    for width in [40_u16, 80, 200] {
+        for text in [long.as_str(), "ascii only", "", "日"] {
+            let line = padded(text, width, context.text());
+            let used: usize = line
+                .spans
+                .iter()
+                .map(|span| display_width(&span.content))
+                .sum();
+            assert_eq!(
+                used,
+                usize::from(width),
+                "padded({text:?}, {width}) measured {used} columns"
+            );
+        }
+    }
 }
 
 #[test]

@@ -6070,6 +6070,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
+ "unicode-width",
  "zuno-engine",
  "zuno-llm",
  "zuno-permission",

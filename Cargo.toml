@@ -208,6 +208,11 @@ time = { version = "0.3.55", features = [
   "local-offset",
 ] }
 uuid = { version = "1.24.0", features = ["v4", "v7", "serde"] }
+# Terminal cell width. A CJK glyph occupies two columns, so a row padded by
+# character count overflows its frame by one column per wide glyph — measured as
+# a skill description running past the right edge and wrapping the frame. Already
+# in the lock file through ratatui, so naming it here adds no download.
+unicode-width = "0.2.2"
 
 # -- optional plugin runtimes ------------------------------------------------
 # Kept out of every default build: only `zuno-plugin/wasm` activates this exact
