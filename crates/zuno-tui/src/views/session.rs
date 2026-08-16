@@ -65,12 +65,15 @@ pub struct SessionScreen {
     transcript: TranscriptView,
     status: StatusView,
     editor: InputEditor,
+    welcome: crate::views::welcome::WelcomeView,
+    sidebar: crate::views::ambient::SidebarView,
     shutdown: mpsc::Sender<TerminalEvent>,
     prompts: Option<mpsc::Sender<String>>,
     cancels: Option<mpsc::Sender<()>>,
     submissions: Vec<String>,
     cancellations: usize,
     cancel_requested: bool,
+    sidebar_visible: bool,
 }
 
 impl SessionScreen {
@@ -80,6 +83,8 @@ impl SessionScreen {
         Self {
             transcript: TranscriptView::new(context.clone()),
             status: StatusView::new(context.clone()),
+            welcome: crate::views::welcome::WelcomeView::new(context.clone()),
+            sidebar: crate::views::ambient::SidebarView::new(context.clone()),
             editor: InputEditor::new(context),
             shutdown,
             prompts: None,
@@ -87,6 +92,7 @@ impl SessionScreen {
             submissions: Vec::new(),
             cancellations: 0,
             cancel_requested: false,
+            sidebar_visible: true,
         }
     }
 
@@ -128,6 +134,27 @@ impl SessionScreen {
     /// The transcript, for a host that appends locally composed messages.
     pub const fn transcript_mut(&mut self) -> &mut TranscriptView {
         &mut self.transcript
+    }
+
+    /// The welcome screen, for the host that resolves the facts it states.
+    pub const fn welcome_mut(&mut self) -> &mut crate::views::welcome::WelcomeView {
+        &mut self.welcome
+    }
+
+    /// The status strip, for the host that states the configured agent and model.
+    pub const fn status_mut(&mut self) -> &mut StatusView {
+        &mut self.status
+    }
+
+    /// The ambient panel, for the host that resolves its services.
+    pub const fn sidebar_mut(&mut self) -> &mut crate::views::ambient::SidebarView {
+        &mut self.sidebar
+    }
+
+    /// Whether the ambient panel is drawn when the terminal is wide enough.
+    #[must_use]
+    pub const fn sidebar_visible(&self) -> bool {
+        self.sidebar_visible
     }
 
     /// Every text the user has submitted, oldest first.
@@ -179,13 +206,47 @@ impl SessionScreen {
 
 impl Component for SessionScreen {
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let [transcript, status, prompt] = Layout::vertical([
+        let [body, status, prompt] = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(STATUS_ROWS),
             Constraint::Length(PROMPT_ROWS),
         ])
         .areas(area);
-        self.transcript.render(frame, transcript);
+
+        // The sidebar is dropped rather than narrowed below the threshold: a panel
+        // squeezed until its server names truncate says less than no panel while still
+        // costing the reply the columns it needed.
+        let (main, aside) = if self.sidebar_visible && area.width >= crate::views::SIDEBAR_MIN_WIDTH
+        {
+            let [main, aside] = Layout::horizontal([
+                Constraint::Min(1),
+                Constraint::Length(crate::views::ambient::SIDEBAR_WIDTH),
+            ])
+            .areas(body);
+            (main, Some(aside))
+        } else {
+            (body, None)
+        };
+
+        // The transcript owns this region as soon as there is anything to show, so the
+        // welcome screen can never hide content — it only fills rows that would
+        // otherwise be blank.
+        if self.transcript.transcript().messages().is_empty() {
+            self.welcome.render(frame, main);
+        } else {
+            self.transcript.render(frame, main);
+        }
+
+        if let Some(aside) = aside {
+            // Both the panel and the strip read the transcript's single accumulator
+            // rather than folding the provider stream again, which is what keeps the
+            // two token figures on screen from ever disagreeing.
+            let ambient = self.sidebar.ambient_mut();
+            ambient.tokens = self.transcript.transcript().tokens();
+            ambient.context_used = self.transcript.transcript().context_used();
+            self.sidebar.render(frame, aside);
+        }
+
         self.status.render(frame, status);
         self.editor.render(frame, prompt);
     }
@@ -212,6 +273,88 @@ impl SessionScreen {
     fn mark_turn_accepted(&mut self) {
         self.cancel_requested = false;
         self.status.mark_running();
+    }
+
+    /// Route the actions that change what is *shown* rather than what is typed.
+    ///
+    /// These were the largest class of built-but-unreachable behaviour in this crate.
+    /// [`TranscriptView`] has had `toggle_thinking` and a clamped `set_offset` since the
+    /// view layer was written, and no key press could reach either, because the composed
+    /// screen forwarded keys only to the editor — and the editor answers
+    /// [`EditorSignal::None`] for all of them, which the screen then reported as
+    /// unhandled. A collapsible reasoning block nothing can collapse is
+    /// indistinguishable from one that does not exist.
+    fn handle_view_action(&mut self, action: &'static Definition) -> EventResult {
+        let viewport = self.transcript.viewport_height().max(1);
+        let max = self
+            .transcript
+            .content_height()
+            .saturating_sub(self.transcript.viewport_height());
+        let offset = self.transcript.offset();
+        let moved = |delta: isize| -> usize {
+            let target = isize::try_from(offset)
+                .unwrap_or(isize::MAX)
+                .saturating_add(delta);
+            usize::try_from(target.max(0)).unwrap_or(0).min(max)
+        };
+        let half = isize::try_from(viewport / 2).unwrap_or(1).max(1);
+        let page = isize::try_from(viewport).unwrap_or(1);
+        match action.name {
+            "display_thinking" => {
+                self.transcript.toggle_thinking();
+                EventResult::REDRAW
+            }
+            "tool_details" => {
+                self.transcript.toggle_tool_output();
+                EventResult::REDRAW
+            }
+            "sidebar_toggle" => {
+                self.sidebar_visible = !self.sidebar_visible;
+                EventResult::REDRAW
+            }
+            "tips_toggle" => {
+                if self.welcome.tips_visible() {
+                    self.welcome.hide_tips();
+                } else {
+                    self.welcome.next_tip();
+                }
+                EventResult::REDRAW
+            }
+            "messages_line_up" => {
+                self.transcript.set_offset(moved(-1));
+                EventResult::REDRAW
+            }
+            "messages_line_down" => {
+                self.transcript.set_offset(moved(1));
+                EventResult::REDRAW
+            }
+            "messages_page_up" => {
+                self.transcript.set_offset(moved(-page));
+                EventResult::REDRAW
+            }
+            "messages_page_down" => {
+                self.transcript.set_offset(moved(page));
+                EventResult::REDRAW
+            }
+            "messages_half_page_up" => {
+                self.transcript.set_offset(moved(-half));
+                EventResult::REDRAW
+            }
+            "messages_half_page_down" => {
+                self.transcript.set_offset(moved(half));
+                EventResult::REDRAW
+            }
+            "messages_first" => {
+                self.transcript.set_offset(0);
+                EventResult::REDRAW
+            }
+            "messages_last" => {
+                self.transcript.set_offset(max);
+                self.transcript.follow();
+                EventResult::REDRAW
+            }
+            _ => EventResult::IGNORED,
+        }
     }
 
     /// Cancel a running turn, or leave the application when none is running.
@@ -248,6 +391,9 @@ impl ActionComponent for SessionScreen {
             !self.editor.text().is_empty() && matches!(action.name, "input_clear" | "input_delete");
         if action.name == APP_EXIT || (is_exit_request(event) && !editor_owns_chord) {
             return self.request_exit();
+        }
+        if self.handle_view_action(action).handled {
+            return EventResult::REDRAW;
         }
         match self.editor.handle_action(action) {
             EditorSignal::None => EventResult::IGNORED,

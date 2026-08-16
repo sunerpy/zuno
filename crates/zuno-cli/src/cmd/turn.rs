@@ -282,6 +282,43 @@ impl TurnPlan {
         })
     }
 
+    /// The directory this turn runs in.
+    pub(crate) fn directory(&self) -> &std::path::Path {
+        &self.directory
+    }
+
+    /// The worktree root, when the directory is under version control.
+    pub(crate) fn worktree(&self) -> Option<&std::path::Path> {
+        self.project
+            .vcs
+            .as_ref()
+            .map(|_| self.project.directory.as_path())
+    }
+
+    /// The merged configuration this turn resolved against.
+    ///
+    /// Handed out rather than re-discovered by callers: discovery walks the filesystem
+    /// and merges layers, so a second call is both slow and free to disagree with the
+    /// configuration the turn is actually using.
+    pub(crate) const fn config(&self) -> &zuno_config::schema::Config {
+        &self.config
+    }
+
+    /// The agent that will answer.
+    pub(crate) fn agent_name(&self) -> &str {
+        &self.agent.name
+    }
+
+    /// `provider/model`, as resolved.
+    pub(crate) fn qualified_model(&self) -> String {
+        format!("{}/{}", self.provider_id, self.model_id)
+    }
+
+    /// The model's context ceiling, or zero when the catalog declares none.
+    pub(crate) const fn context_window(&self) -> u64 {
+        self.window.context
+    }
+
     pub(crate) async fn load_tui_plugins(
         &self,
         environment: &StartupEnvironment,
@@ -687,6 +724,16 @@ impl TurnHost {
     /// The session every turn this host drives belongs to.
     pub(crate) fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// How many tools this session offers the model.
+    ///
+    /// Read off the assembled dispatcher rather than recomputed, so the figure a
+    /// surface shows is the one the model is actually given — the two diverging is how
+    /// a tool count becomes a claim nobody can act on.
+    pub(crate) fn tool_count(&self) -> usize {
+        use zuno_engine::r#loop::ToolDispatcher as _;
+        self.dispatcher.available_tools().definitions.len()
     }
 
     /// A handle that aborts whichever turn this host has live.

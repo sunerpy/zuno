@@ -93,6 +93,9 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
     };
     let plan = runtime.block_on(TurnPlan::resolve(&options, environment))?;
     let tui_plugins = runtime.block_on(plan.load_tui_plugins(environment));
+    // Read before `TurnHost::open` consumes the plan, and before raw mode, so a slow
+    // skill scan cannot delay the first frame of an already-entered alternate screen.
+    let facts = runtime.block_on(SessionFacts::resolve(&plan, environment));
     let broker = Arc::new(PermissionBroker::new(terminal_sender.clone()));
     let approval: Arc<dyn PermissionAsker> = if args.auto {
         Arc::new(AutoApproval)
@@ -110,6 +113,7 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
     let mut screen = SessionScreen::new(context.clone(), terminal_sender.clone())
         .with_prompt_sink(prompt_sender)
         .with_cancel_sink(cancel_sender);
+    facts.describe(&mut screen, host.tool_count());
     if let Some(prompt) = args
         .prompt
         .as_deref()
@@ -151,6 +155,175 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
     });
     drop(session);
     outcome.map_err(to_string)
+}
+
+/// What the welcome screen and the ambient panel state about this session.
+///
+/// Resolved once, before raw mode, from the plan's already-merged configuration. Every
+/// field is a string or a count: `zuno-tui` depends on none of `zuno-lsp`, `zuno-mcp`
+/// or `zuno-catalog`, and translating here is what keeps rendering above execution.
+struct SessionFacts {
+    directory: String,
+    branch: Option<String>,
+    agent: String,
+    model: String,
+    version: String,
+    context_window: u64,
+    lsp: Vec<zuno_tui::views::ambient::Service>,
+    mcp: Vec<zuno_tui::views::ambient::Service>,
+    skills: Vec<zuno_tui::views::ambient::SkillSummary>,
+}
+
+impl SessionFacts {
+    /// Read every fact off `plan`, whose configuration is already merged.
+    ///
+    /// Nothing here can fail into an error: a fact that cannot be resolved is omitted,
+    /// because a placeholder would be indistinguishable from a fact that failed to
+    /// load — the one ambiguity a surface like this must not have.
+    async fn resolve(plan: &TurnPlan, environment: &StartupEnvironment) -> Self {
+        let env = environment.resolved();
+        let directory = plan.directory();
+        let worktree = plan.worktree();
+        let config = plan.config();
+
+        let resolved_lsp = zuno_catalog::lsp_config::ResolvedLsp::resolve(config.lsp.as_ref());
+        let lsp = resolved_lsp
+            .servers()
+            .map(|server| {
+                // `Pending`, never `Ready`: a server is spawned lazily when a file it
+                // handles is first read, so claiming it is up would name a process that
+                // does not exist yet.
+                zuno_tui::views::ambient::Service::new(
+                    server.id.clone(),
+                    zuno_tui::views::ambient::Health::Pending,
+                )
+                .detailed("starts on first matching file")
+            })
+            .collect();
+
+        let mut mcp = config
+            .mcp
+            .as_ref()
+            .map(|servers| {
+                servers
+                    .iter()
+                    .map(|(name, server)| {
+                        let enabled = mcp_enabled(server);
+                        let health = if enabled {
+                            zuno_tui::views::ambient::Health::Pending
+                        } else {
+                            zuno_tui::views::ambient::Health::Disabled
+                        };
+                        zuno_tui::views::ambient::Service::new(name.to_owned(), health)
+                            .detailed(if enabled { "configured" } else { "disabled" })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        mcp.sort_by(|left, right| left.name.cmp(&right.name));
+
+        let options = zuno_catalog::skill::discovery::SkillOptions::from_config(
+            directory, worktree, env, config,
+        );
+        let skills = zuno_catalog::skill::load(&options)
+            .await
+            .sorted()
+            .into_iter()
+            .map(|skill| zuno_tui::views::ambient::SkillSummary {
+                name: skill.name,
+                description: skill.description.unwrap_or_default(),
+            })
+            .collect();
+
+        Self {
+            directory: abbreviate_home(directory, environment),
+            branch: worktree.and_then(current_branch),
+            agent: plan.agent_name().to_owned(),
+            model: plan.qualified_model(),
+            version: crate::version::RUST_PACKAGE_VERSION.to_owned(),
+            context_window: plan.context_window(),
+            lsp,
+            mcp,
+            skills,
+        }
+    }
+
+    /// State them on the screen's welcome surface, status strip and ambient panel.
+    fn describe(self, screen: &mut SessionScreen, tools: usize) {
+        screen
+            .transcript_mut()
+            .transcript_mut()
+            .set_context_limit(self.context_window);
+        screen.status_mut().describe(&self.agent, &self.model);
+
+        let directory = (!self.directory.is_empty()).then(|| self.directory.clone());
+        *screen.welcome_mut().facts_mut() = zuno_tui::views::welcome::WelcomeFacts {
+            directory: directory.clone(),
+            branch: self.branch.clone(),
+            model: Some(self.model.clone()),
+            agent: Some(self.agent.clone()),
+            version: Some(self.version.clone()),
+            tools: Some(tools),
+            mcp: Some(self.mcp.len()),
+            lsp: Some(self.lsp.len()),
+            skills: Some(self.skills.len()),
+        };
+
+        let ambient = screen.sidebar_mut().ambient_mut();
+        ambient.directory = directory;
+        ambient.branch = self.branch;
+        ambient.agent = Some(self.agent);
+        ambient.model = Some(self.model);
+        ambient.version = Some(self.version);
+        ambient.lsp = self.lsp;
+        ambient.mcp = self.mcp;
+        ambient.skills = self.skills;
+    }
+}
+
+/// `~/rest` rather than the absolute path, which is the form a user recognises.
+fn abbreviate_home(path: &std::path::Path, environment: &StartupEnvironment) -> String {
+    let display = path.display().to_string();
+    let Some(home) = environment
+        .resolved()
+        .value("HOME")
+        .filter(|home| !home.is_empty())
+    else {
+        return display;
+    };
+    match display.strip_prefix(home) {
+        Some(rest) => format!("~{rest}"),
+        None => display,
+    }
+}
+
+/// The checked-out branch, read from `git` itself.
+///
+/// Asking `git` rather than parsing `.git/HEAD` because a worktree, a detached head and
+/// a packed ref are three different files and `git` already knows which. A failure is
+/// `None`: the branch is an ornament here, and guessing one would be worse than
+/// omitting it.
+fn current_branch(worktree: &std::path::Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(worktree)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (!branch.is_empty() && branch != "HEAD").then_some(branch)
+}
+
+/// Whether a configured MCP server is switched on, defaulting to on.
+fn mcp_enabled(server: &zuno_config::schema::mcp::McpServerConfig) -> bool {
+    use zuno_config::schema::mcp::McpServerConfig;
+    match server {
+        McpServerConfig::Local(local) => local.enabled.unwrap_or(true),
+        McpServerConfig::Remote(remote) => remote.enabled.unwrap_or(true),
+        McpServerConfig::Toggle(toggle) => toggle.enabled,
+    }
 }
 
 /// Abort the live turn each time the screen asks, until the screen stops asking.
