@@ -56,14 +56,10 @@ ZUNO_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
 A surface that is merely **unimplemented** is not a decision, so it is never an
 entry on [divergences.md](divergences.md). It is recorded here and in the
 compatibility report's `known_gaps` section, which this table is generated from —
-`zuno_testkit::compat_report::known_gaps`, the same list
-`crates/zuno-testkit/tests/compat_suite.rs` writes into
-`target/compat/compat-report.json`.
+`zuno_testkit::compat_report::known_gaps`.
 
-Until plan todo 140 this section did not exist, so every gap lived only in that
-uncommitted artifact while this page and `divergences.md` both told readers a gap
-is "listed in the compatibility matrix". Each entry below names what a consumer
-loses and, where one exists, the test that fails if the gap closes or goes stale.
+Each entry below names what a consumer loses and, where one exists, the test that
+fails if the gap closes or goes stale.
 
 <!-- generated:BEGIN known-gaps -->
 ### api-backends-unavailable
@@ -149,8 +145,8 @@ the replacement instead of reporting an unknown command. A not-registered one
 names the owner of the work it waits on.
 
 The `why` column is the reason recorded in the code, reproduced verbatim rather
-than paraphrased. `todo N` references are this port's own build plan; treat them
-as identifiers for the work that owns a surface, not as anything a user needs.
+than paraphrased. `todo N` references are Zuno's own build plan; treat them as
+identifiers for the work that owns a surface, not as anything a user needs.
 
 <!-- generated:BEGIN cli-disposition -->
 | upstream symbol | command | disposition | why |

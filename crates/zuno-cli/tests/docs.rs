@@ -16,7 +16,7 @@
 //! |---|---|
 //! | `divergence-index`, `divergence-detail` | [`zuno_testkit::DivergenceList`] over `docs/divergences.toml`, cross-checked against [`zuno_testkit::divergence::DECLARED_COUNT`] |
 //! | `cli-disposition` | [`zuno_cli::dispositions`] — the same table `zuno-cli/tests/surface.rs` asserts against the registered `clap` tree |
-//! | `api-operations` | the served document from [`zuno_server::api::openapi`] set-differenced against the committed 1.18.12 oracle capture, then **probed route by route** for an explicit `503 backend_unavailable` gap; any `501` fails the gate |
+//! | `api-operations` | the served document from [`zuno_server::api::openapi`] set-differenced against the committed 1.18.18 oracle capture, then **probed route by route** for an explicit `503 backend_unavailable` gap; any `501` fails the gate |
 //! | `known-gaps` | [`zuno_testkit::compat_report::known_gaps`] — the same list the compatibility report writes, rendered with the API counts probed above |
 //! | `v1-routes` | [`zuno_server::V1_SURFACE`] |
 //! | `rejected-inputs` | messages *rendered by* [`zuno_config::legacy`]'s detectors, so a reworded message fails |
@@ -53,9 +53,8 @@ use zuno_testkit::{DivergenceList, divergence};
 
 /// The committed capture of the pinned 1.18.18 release's OpenAPI document.
 ///
-/// The same fixture `crates/zuno-testkit/tests/compat_suite.rs` compares against,
-/// so the documentation and the compatibility gate cannot disagree about what
-/// upstream declares.
+/// Also read by `crates/zuno-server/tests/compat_v1.rs`, so the documentation and
+/// the compatibility assertions cannot disagree about what upstream declares.
 const ORACLE_OPENAPI_FIXTURE: &str = ".omo/fixtures/oracle-openapi-1.18.18.json";
 
 /// How many `/api` operations that capture declares. Restated so a replaced

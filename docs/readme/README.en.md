@@ -88,15 +88,10 @@ continues to satisfy npm `engines.opencode` checks. The six plugin-ABI names als
 `OPENCODE_DISABLE_CLAUDE_CODE`, `OPENCODE_SERVER_PASSWORD`, and `OPENCODE_SERVER_USERNAME`.
 They identify the plugin contract, not Zuno itself.
 
-That decision has since been taken. The whole-surface differential suites that byte-compared
-Zuno's output against a released `opencode` binary are gone, and the success criteria that
-required them are retired. What remains is named, per surface, and is a verification asset rather
-than a product promise: `cargo test -p zuno-cli --test cli_parity` still compares every implemented
-command's normalized output against the pinned release, and `crates/zuno-cli/tests/rollback.rs` plus
-`crates/zuno-testkit/tests/session_interop.rs` still drive one session through both real programs,
-printing a visible `SKIPPED` when that release is absent. Their presence does not make cross-binary
-compatibility a product goal or justify adding legacy-path fallback or adoption of opencode
-sessions.
+A few tests still compare against a released `opencode` binary (`cli_parity`, `rollback`,
+`session_interop`, each printing `SKIPPED` when that binary is absent). They are verification
+assets, not product promises: cross-binary compatibility is not a goal, and their presence does
+not add adoption of opencode sessions or legacy-path fallback.
 
 ## Development
 

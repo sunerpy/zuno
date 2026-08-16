@@ -1,9 +1,8 @@
 # Session retention (C8)
 
-Retention is scope this port adds; upstream `opencode` has no equivalent. That is
-why the two `/api/session/prune` operations are a declared divergence
-(`c8-maintenance-endpoints` in [divergences.md](divergences.md)) rather than a
-parity claim.
+Retention is Zuno's own scope; upstream `opencode` has no equivalent. That is why
+the two `/api/session/prune` operations are a declared divergence
+(`c8-maintenance-endpoints` in [divergences.md](divergences.md)).
 
 ## The one thing to get right
 
