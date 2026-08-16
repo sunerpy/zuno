@@ -20,23 +20,23 @@ the difference was ever known. The final four arrived in plan todo 135, when com
 every implemented command's output against the released binary measured real CLI
 differences that had never been written down.
 
-The total above is asserted against `oc_testkit::divergence::DECLARED_COUNT` by
-`crates/oc-cli/tests/docs.rs`, because this sentence said "Thirteen" for two
+The total above is asserted against `zuno_testkit::divergence::DECLARED_COUNT` by
+`crates/zuno-cli/tests/docs.rs`, because this sentence said "Thirteen" for two
 review waves after the allow-list held seventeen: a hand-written headline that
 nothing derives is exactly the drift the rest of this page is built to prevent.
 
 ## How this page cannot drift
 
 The entries below are generated from [`docs/divergences.toml`](divergences.toml),
-which is the same file `crates/oc-cli/tests/docs.rs` loads and counts against
-`oc_testkit::divergence::DECLARED_COUNT`, and which
-`crates/oc-testkit/tests/execute_contract.rs` reads to verify the one entry whose
+which is the same file `crates/zuno-cli/tests/docs.rs` loads and counts against
+`zuno_testkit::divergence::DECLARED_COUNT`, and which
+`crates/zuno-testkit/tests/execute_contract.rs` reads to verify the one entry whose
 contract is asserted against live code rather than merely declared. Adding an entry
 without a count bump fails the documentation gate; adding an entry without
 documenting it fails the same gate. Regenerate this page with:
 
 ```sh
-OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs
+OC_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
 ```
 
 Everything between the generated markers comes from the allow-list, including
@@ -45,7 +45,7 @@ each entry's stated reason. Do not edit it by hand.
 <!-- generated:BEGIN divergence-detail -->
 ### session-list-default-sort
 
-**Surface.** CLI `session list`; HTTP `GET /api/session`; `oc-db` session listing
+**Surface.** CLI `session list`; HTTP `GET /api/session`; `zuno-db` session listing
 
 **Why.** Upstream is self-inconsistent — `/api/session` sorts `time_created` while the legacy and experimental global listings sort `time_updated` — so one default was chosen: `time_updated DESC, id DESC`, with `--sort created` / `?sort=created` to opt out.
 
@@ -57,7 +57,7 @@ each entry's stated reason. Do not edit it by hand.
 
 ### no-eager-directory-creation
 
-**Surface.** process startup; `oc-paths` layout getters
+**Surface.** process startup; `zuno-paths` layout getters
 
 **Why.** Upstream's `global.ts:35-43` creates seven directories at module import, before any command has decided it needs them — observable as `TMPDIR=/ opencode debug paths` exiting 1 with `EACCES … mkdir '/opencode'`; here every getter is a pure computation and creation happens only in `Layout::ensure`.
 
@@ -93,7 +93,7 @@ each entry's stated reason. Do not edit it by hand.
 
 ### session-subpath-is-applied
 
-**Surface.** HTTP `GET /api/session?project=…&subpath=…`; `oc-db` session listing in project scope
+**Surface.** HTTP `GET /api/session?project=…&subpath=…`; `zuno-db` session listing in project scope
 
 **Why.** Upstream declares `subpath` in the v2 list union (`packages/core/src/session.ts:68-76`), the HTTP query schema (`packages/protocol/src/groups/session.ts:98-110`), the generated client and the SDK, and the handler even forwards it (`packages/server/src/handlers/session.ts:23-37`) — but `session.list` builds its conditions from `directory`, `workspaceID`, `project` and `search` only (`packages/core/src/session.ts:268-277`), so the parameter changes nothing upstream. This port applies it, which narrows the result set for a request upstream answers unfiltered. It is matched as a literal tree prefix (`path = s OR path LIKE s || '/%'` with the pattern bound, not interpolated), so a subpath containing `_` or `%` selects that directory and not a wildcard family; upstream's un-escaped `LIKE '${path}/%'` lives on the LEGACY `/session?path=` handler (`packages/opencode/src/session/session.ts:969-980`), a route this port does not serve, so literal matching is a property of the applied filter rather than a second divergence. Absorbs the former `subpath-matches-literally` nomination.
 
@@ -125,25 +125,25 @@ each entry's stated reason. Do not edit it by hand.
 
 **Surface.** every CLI command's stdout and stderr — colour, the `Error: ` prefix, the prompt gutter, and JSON object key order
 
-**Why.** The released binary decorates its output in four ways this port does not, all four measured on 1.18.15 under `NO_COLOR=1` and `TERM=dumb` in `.omo/evidence/task-135-opencode-rust.txt`. (1) It emits SGR colour regardless: `import probe.json` writes `ESC[91m ESC[1m Error: ESC[0m` — `NO_COLOR` is honoured for the TUI theme, not for these writers. (2) It prefixes a top-level failure with a line-leading `Error: `; this port prints the message alone, because the shell already reports the non-zero status and the prefix costs a line of terminal width in every failure. (3) It renders `mcp list` and `providers list` through `@clack/prompts`, drawing a box gutter of `┌ │ ▲ └` glyphs plus a trailing blank line; this port writes plain lines, which is what makes the output usable in a pipe. (4) It serializes embedded JSON with keys in insertion order, so `agent list`'s permission arrays spell `{action, pattern}` where this port spells `{pattern, action}`, and JavaScript's single number type writes an integral double as `1024` where `serde_json` writes `1024.0`. All four are presentational: the same values, the same order, the same lines. `crates/oc-testkit/src/cli_normalize.rs` neutralizes exactly these four and nothing else — each rule has a negative control asserting a renamed key, a changed value, a dropped line, a non-SGR escape and a `\r\n` all still diverge — and `crates/oc-cli/tests/cli_parity.rs::the_declared_presentation_divergences_are_live` re-derives all four from the two running binaries, so a reverted decision fails rather than widening what is forgiven.
+**Why.** The released binary decorates its output in four ways this port does not, all four measured on 1.18.15 under `NO_COLOR=1` and `TERM=dumb` in `.omo/evidence/task-135-opencode-rust.txt`. (1) It emits SGR colour regardless: `import probe.json` writes `ESC[91m ESC[1m Error: ESC[0m` — `NO_COLOR` is honoured for the TUI theme, not for these writers. (2) It prefixes a top-level failure with a line-leading `Error: `; this port prints the message alone, because the shell already reports the non-zero status and the prefix costs a line of terminal width in every failure. (3) It renders `mcp list` and `providers list` through `@clack/prompts`, drawing a box gutter of `┌ │ ▲ └` glyphs plus a trailing blank line; this port writes plain lines, which is what makes the output usable in a pipe. (4) It serializes embedded JSON with keys in insertion order, so `agent list`'s permission arrays spell `{action, pattern}` where this port spells `{pattern, action}`, and JavaScript's single number type writes an integral double as `1024` where `serde_json` writes `1024.0`. All four are presentational: the same values, the same order, the same lines. `crates/zuno-testkit/src/cli_normalize.rs` neutralizes exactly these four and nothing else — each rule has a negative control asserting a renamed key, a changed value, a dropped line, a non-SGR escape and a `\r\n` all still diverge — and `crates/zuno-cli/tests/cli_parity.rs::the_declared_presentation_divergences_are_live` re-derives all four from the two running binaries, so a reverted decision fails rather than widening what is forgiven.
 
 ### diagnostics-name-their-cause
 
 **Surface.** CLI failure messages on paths where upstream reports an opaque error — `serve` on an unavailable port, `run` with no message, `run` with an unresolvable model
 
-**Why.** Upstream reports several failures without naming what failed. Measured on 1.18.15: binding an occupied port prints the two-line `Unexpected error` / `ServeError` with neither the address nor the reason, and `run --model bogus/model hi` prints a JSON `UnknownError` carrying `Unexpected server error. Check server logs for details.` and a `ref` — a message whose only actionable content is an instruction to read a log the user does not have. This port names the cause and the input at the point of failure: `could not bind HTTP server to 127.0.0.1:<port>: Address already in use (os error 98)`, and for an unresolvable model the provider, the catalogue state and the three ways to fix it. The consequence is that the two texts are not two renderings of one message and cannot be normalized into one without deleting the information that makes this port's version useful, so `crates/oc-cli/tests/cli_parity.rs` exempts all three stderr streams **by name, with this reason**, while still comparing their exit status and stdout. The same decision covers the wording of `run`'s argv refusal (`a message is required` against `You must provide a message or a command`). Each exemption's witness asserts both halves of this entry against the two running processes — the fragments above in upstream's stderr and this port's naming form in its own, neither carrying the other's — so a regression to upstream's opaque wording fails instead of passing as `both sides still refuse`, and a release that starts naming the cause fails too, which is the signal to close this entry.
+**Why.** Upstream reports several failures without naming what failed. Measured on 1.18.15: binding an occupied port prints the two-line `Unexpected error` / `ServeError` with neither the address nor the reason, and `run --model bogus/model hi` prints a JSON `UnknownError` carrying `Unexpected server error. Check server logs for details.` and a `ref` — a message whose only actionable content is an instruction to read a log the user does not have. This port names the cause and the input at the point of failure: `could not bind HTTP server to 127.0.0.1:<port>: Address already in use (os error 98)`, and for an unresolvable model the provider, the catalogue state and the three ways to fix it. The consequence is that the two texts are not two renderings of one message and cannot be normalized into one without deleting the information that makes this port's version useful, so `crates/zuno-cli/tests/cli_parity.rs` exempts all three stderr streams **by name, with this reason**, while still comparing their exit status and stdout. The same decision covers the wording of `run`'s argv refusal (`a message is required` against `You must provide a message or a command`). Each exemption's witness asserts both halves of this entry against the two running processes — the fragments above in upstream's stderr and this port's naming form in its own, neither carrying the other's — so a regression to upstream's opaque wording fails instead of passing as `both sides still refuse`, and a release that starts naming the cause fails too, which is the signal to close this entry.
 
 ### session-list-output-shape
 
 **Surface.** CLI `session list` and `session list --format json` with at least one session
 
-**Why.** The empty listing is identical on both binaries. A non-empty one is not, and this is a difference in content rather than presentation, so nothing normalizes it. Upstream's table has three columns — `Session ID`, `Title`, `Updated` — and its JSON object has six flat fields: `id`, `title`, `updated`, `created`, `projectId`, `directory`. This port's table has seven columns, adding `Project`, `Agent`, `Msgs` and `Cost`, and its JSON nests `time.created` / `time.updated`, `tokens.*` and `project.{id,worktree}` while spelling the project reference `projectID` rather than `projectId`. The added columns exist because the listing this port serves is not project-scoped by construction — see the `session-list-default-sort` entry and `--all-projects` — so a row has to say which project it belongs to, and the nesting matches the shape `/api/session` returns so one decoder serves both. `crates/oc-cli/tests/cli_parity.rs::the_session_list_output_shape_difference_is_live` seeds one session into a database both binaries open and asserts the two field sets differ in exactly the `projectId` / `projectID` spelling this reason names, so the declaration carries a measurement rather than a memory.
+**Why.** The empty listing is identical on both binaries. A non-empty one is not, and this is a difference in content rather than presentation, so nothing normalizes it. Upstream's table has three columns — `Session ID`, `Title`, `Updated` — and its JSON object has six flat fields: `id`, `title`, `updated`, `created`, `projectId`, `directory`. This port's table has seven columns, adding `Project`, `Agent`, `Msgs` and `Cost`, and its JSON nests `time.created` / `time.updated`, `tokens.*` and `project.{id,worktree}` while spelling the project reference `projectID` rather than `projectId`. The added columns exist because the listing this port serves is not project-scoped by construction — see the `session-list-default-sort` entry and `--all-projects` — so a row has to say which project it belongs to, and the nesting matches the shape `/api/session` returns so one decoder serves both. `crates/zuno-cli/tests/cli_parity.rs::the_session_list_output_shape_difference_is_live` seeds one session into a database both binaries open and asserts the two field sets differ in exactly the `projectId` / `projectID` spelling this reason names, so the declaration carries a measurement rather than a memory.
 
 ### non-vcs-plan-glob-is-absolute
 
 **Surface.** `agent list` — the `plan` agent's `edit` allow-rule for the global plans directory, in a directory that is not a repository
 
-**Why.** Upstream builds that rule as `path.relative(ctx.worktree, path.join(Global.Path.data, 'plans', '*.md'))` (`packages/opencode/src/agent/agent.ts:174`), and assigns a non-VCS project the worktree `/` (`packages/opencode/src/project/project.ts:217`). Relativising an absolute path against `/` strips the leading separator, so outside a repository the released binary emits a **relative** glob — measured on 1.18.15 as `tmp/.../data/opencode/plans/*.md` — which matches nothing from any working directory and is the shape a `worktree` sentinel produced rather than a path anyone intended. This port emits the absolute path there, and matches upstream exactly inside a repository, where the relative form is meaningful. `crates/oc-cli/tests/cli_parity.rs::the_non_vcs_plan_glob_difference_is_live` runs both binaries in an unmarked directory and asserts upstream's glob is relative while this port's is absolute; it is also why every parity probe marks its project with a `.git` directory, so that a probe never silently compares two answers to different questions.
+**Why.** Upstream builds that rule as `path.relative(ctx.worktree, path.join(Global.Path.data, 'plans', '*.md'))` (`packages/opencode/src/agent/agent.ts:174`), and assigns a non-VCS project the worktree `/` (`packages/opencode/src/project/project.ts:217`). Relativising an absolute path against `/` strips the leading separator, so outside a repository the released binary emits a **relative** glob — measured on 1.18.15 as `tmp/.../data/opencode/plans/*.md` — which matches nothing from any working directory and is the shape a `worktree` sentinel produced rather than a path anyone intended. This port emits the absolute path there, and matches upstream exactly inside a repository, where the relative form is meaningful. `crates/zuno-cli/tests/cli_parity.rs::the_non_vcs_plan_glob_difference_is_live` runs both binaries in an unmarked directory and asserts upstream's glob is relative while this port's is absolute; it is also why every parity probe marks its project with a `.git` directory, so that a probe never silently compares two answers to different questions.
 <!-- generated:END divergence-detail -->
 
 ## What is deliberately not on this page

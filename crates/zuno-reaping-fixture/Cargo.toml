@@ -1,0 +1,24 @@
+[package]
+name = "zuno-reaping-fixture"
+description = "Process-tree fixture for host containment tests."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+zuno-catalog = { workspace = true }
+zuno-config = { workspace = true }
+zuno-lsp = { workspace = true }
+zuno-mcp = { workspace = true }
+zuno-plugin = { workspace = true }
+zuno-process = { workspace = true }
+zuno-pty = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

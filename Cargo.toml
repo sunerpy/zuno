@@ -36,41 +36,41 @@ all = "warn"
 [workspace.dependencies]
 
 # -- first-party crates (path-only; the workspace is not published) ----------
-oc-acp = { path = "crates/oc-acp" }
-oc-agent = { path = "crates/oc-agent" }
-oc-auth = { path = "crates/oc-auth" }
-oc-catalog = { path = "crates/oc-catalog" }
-oc-cli = { path = "crates/oc-cli" }
-oc-config = { path = "crates/oc-config" }
-oc-db = { path = "crates/oc-db" }
-oc-engine = { path = "crates/oc-engine" }
-oc-error = { path = "crates/oc-error" }
-oc-goal = { path = "crates/oc-goal" }
-oc-llm = { path = "crates/oc-llm" }
-oc-lsp = { path = "crates/oc-lsp" }
-oc-mcp = { path = "crates/oc-mcp" }
-oc-memory = { path = "crates/oc-memory" }
-oc-observability = { path = "crates/oc-observability" }
-oc-paths = { path = "crates/oc-paths" }
-oc-permission = { path = "crates/oc-permission" }
-oc-plugin = { path = "crates/oc-plugin" }
-oc-plugin-sdk = { path = "crates/oc-plugin-sdk" }
-oc-process = { path = "crates/oc-process" }
-oc-provider-anthropic = { path = "crates/oc-provider-anthropic" }
-oc-provider-bedrock = { path = "crates/oc-provider-bedrock" }
-oc-provider-compatible = { path = "crates/oc-provider-compatible" }
-oc-provider-google = { path = "crates/oc-provider-google" }
-oc-provider-openai = { path = "crates/oc-provider-openai" }
-oc-pty = { path = "crates/oc-pty" }
-oc-search = { path = "crates/oc-search" }
-oc-server = { path = "crates/oc-server" }
-oc-snapshot = { path = "crates/oc-snapshot" }
-oc-testkit = { path = "crates/oc-testkit" }
-oc-tool = { path = "crates/oc-tool" }
-oc-tools = { path = "crates/oc-tools" }
-oc-tui = { path = "crates/oc-tui" }
-oc-types = { path = "crates/oc-types" }
-oc-watch = { path = "crates/oc-watch" }
+zuno-acp = { path = "crates/zuno-acp" }
+zuno-agent = { path = "crates/zuno-agent" }
+zuno-auth = { path = "crates/zuno-auth" }
+zuno-catalog = { path = "crates/zuno-catalog" }
+zuno-cli = { path = "crates/zuno-cli" }
+zuno-config = { path = "crates/zuno-config" }
+zuno-db = { path = "crates/zuno-db" }
+zuno-engine = { path = "crates/zuno-engine" }
+zuno-error = { path = "crates/zuno-error" }
+zuno-goal = { path = "crates/zuno-goal" }
+zuno-llm = { path = "crates/zuno-llm" }
+zuno-lsp = { path = "crates/zuno-lsp" }
+zuno-mcp = { path = "crates/zuno-mcp" }
+zuno-memory = { path = "crates/zuno-memory" }
+zuno-observability = { path = "crates/zuno-observability" }
+zuno-paths = { path = "crates/zuno-paths" }
+zuno-permission = { path = "crates/zuno-permission" }
+zuno-plugin = { path = "crates/zuno-plugin" }
+zuno-plugin-sdk = { path = "crates/zuno-plugin-sdk" }
+zuno-process = { path = "crates/zuno-process" }
+zuno-provider-anthropic = { path = "crates/zuno-provider-anthropic" }
+zuno-provider-bedrock = { path = "crates/zuno-provider-bedrock" }
+zuno-provider-compatible = { path = "crates/zuno-provider-compatible" }
+zuno-provider-google = { path = "crates/zuno-provider-google" }
+zuno-provider-openai = { path = "crates/zuno-provider-openai" }
+zuno-pty = { path = "crates/zuno-pty" }
+zuno-search = { path = "crates/zuno-search" }
+zuno-server = { path = "crates/zuno-server" }
+zuno-snapshot = { path = "crates/zuno-snapshot" }
+zuno-testkit = { path = "crates/zuno-testkit" }
+zuno-tool = { path = "crates/zuno-tool" }
+zuno-tools = { path = "crates/zuno-tools" }
+zuno-tui = { path = "crates/zuno-tui" }
+zuno-types = { path = "crates/zuno-types" }
+zuno-watch = { path = "crates/zuno-watch" }
 
 # -- async runtime ----------------------------------------------------------
 async-trait = "0.1.91"
@@ -129,7 +129,7 @@ ratatui = { version = "0.30.2", features = ["serde"] }
 # (`core/src/pty/pty.bun.ts`) or `@lydell/node-pty` (`pty.node.ts`) — so there is
 # no `.node` file to ship here and no `hasNativeBinding()` case to degrade into.
 #
-# It is the *only* dependency that lets `oc-pty` honour this workspace's
+# It is the *only* dependency that lets `zuno-pty` honour this workspace's
 # `unsafe_code = "forbid"`: creating a pty is `posix_openpt`/`grantpt` on unix and
 # `CreatePseudoConsole` on Windows, both of which are `unsafe` FFI. Verified by
 # building a probe crate that itself set `unsafe_code = "forbid"` against
@@ -139,7 +139,7 @@ ratatui = { version = "0.30.2", features = ["serde"] }
 #
 # Pinned exactly: the pty is the one subsystem where a patch-level behaviour
 # change (EOF timing, signal-to-exit-code mapping) would silently alter what a
-# session reports, and those are precisely the properties `oc-pty`'s tests assert.
+# session reports, and those are precisely the properties `zuno-pty`'s tests assert.
 portable-pty = "=0.9.0"
 
 process-wrap = { version = "=9.0.1", default-features = false, features = [
@@ -193,7 +193,7 @@ aws-lc-rs = { version = "1.17.3", default-features = false, features = [
 base64 = "0.23.1"
 # Already in the lock as a transitive dependency of `grep-regex` at this exact
 # version, so naming it here adds a manifest line and **zero** packages. It is a
-# direct dependency because `oc-memory`'s prompt-injection scanner runs on every
+# direct dependency because `zuno-memory`'s prompt-injection scanner runs on every
 # memory write and needs a matcher with a *guaranteed* linear-time bound: this
 # crate compiles to a finite automaton and cannot backtrack, so an adversarial
 # near-miss entry cannot turn the scan into a DoS. A hand-rolled matcher would
@@ -210,7 +210,7 @@ time = { version = "0.3.55", features = [
 uuid = { version = "1.24.0", features = ["v4", "v7", "serde"] }
 
 # -- optional plugin runtimes ------------------------------------------------
-# Kept out of every default build: only `oc-plugin/wasm` activates this exact
+# Kept out of every default build: only `zuno-plugin/wasm` activates this exact
 # runtime. WASI is intentionally absent; the component host starts with no
 # filesystem, network, clock, or environment authority.
 wasmtime = { version = "=47.0.3", default-features = false, features = [

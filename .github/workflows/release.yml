@@ -11,7 +11,7 @@
 # all six archives. There is no path from a compiled binary to a release asset
 # that does not pass through a process that ran it.
 #
-# `crates/oc-cli/tests/release_surface.rs` asserts from outside this file that the
+# `crates/zuno-cli/tests/release_surface.rs` asserts from outside this file that the
 # two matrices name the same six targets, because a target added to `build` and
 # forgotten in `smoke` would otherwise ship unexecuted and CI would stay green.
 # ---------------------------------------------------------------------------
@@ -41,12 +41,12 @@
 # ---------------------------------------------------------------------------
 # WHAT SHIPS
 #
-# `zuno` (from `oc-cli`) only. The workspace also builds `oc-server`,
-# but `zuno serve` wraps `oc_server::ServerBuilder` as a library rather
-# than spawning that binary (see `oc-cli/src/command.rs`), so `oc-server` is a
+# `zuno` (from `zuno-cli`) only. The workspace also builds `zuno-server`,
+# but `zuno serve` wraps `zuno_server::ServerBuilder` as a library rather
+# than spawning that binary (see `zuno-cli/src/command.rs`), so `zuno-server` is a
 # development and QA surface, not a user entry point. Shipping both would invite
-# users to run the wrong one. `oc-example-plugin`, `oc-acp-conformance`,
-# `oc-log-probe` and `ts-baseline` are likewise test harnesses.
+# users to run the wrong one. `zuno-example-plugin`, `zuno-acp-conformance`,
+# `zuno-log-probe` and `ts-baseline` are likewise test harnesses.
 # ---------------------------------------------------------------------------
 #
 # ---------------------------------------------------------------------------
@@ -90,7 +90,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   BINARY_NAME: zuno
-  CLI_CRATE: oc-cli
+  CLI_CRATE: zuno-cli
 
 jobs:
   # -------------------------------------------------------------------------
@@ -270,11 +270,11 @@ jobs:
   #     there, so the ARM CodeBuild image label routes it to native aarch64. That
   #     architecture-crossing handoff is why smoke is separate from build.
   #
-  # `oc-smoke` is compiled from this checkout on the smoke runner, then pointed at
+  # `zuno-smoke` is compiled from this checkout on the smoke runner, then pointed at
   # the unpacked artifact. It runs `--version`, `--help`, and a headless `run`
   # against a committed cassette, asserting the tool registry reached the wire and
   # that the turn continued after the tool result. See
-  # `crates/oc-testkit/src/bin/oc-smoke.rs`.
+  # `crates/zuno-testkit/src/bin/zuno-smoke.rs`.
   # -------------------------------------------------------------------------
   smoke:
     name: Smoke ${{ matrix.target }}
@@ -347,15 +347,15 @@ jobs:
             -DestinationPath unpacked -Force
 
       - name: Build the smoke driver
-        run: cargo build --locked --release -p oc-testkit --bin oc-smoke
+        run: cargo build --locked --release -p zuno-testkit --bin zuno-smoke
 
       - name: Smoke the unpacked artifact (unix)
         if: matrix.archive == 'tar.gz'
-        run: ./target/release/oc-smoke --binary "unpacked/${BINARY_NAME}"
+        run: ./target/release/zuno-smoke --binary "unpacked/${BINARY_NAME}"
 
       - name: Smoke the unpacked artifact (windows)
         if: matrix.archive == 'zip'
-        run: ./target/release/oc-smoke.exe --binary "unpacked/${env:BINARY_NAME}.exe"
+        run: ./target/release/zuno-smoke.exe --binary "unpacked/${env:BINARY_NAME}.exe"
 
   # -------------------------------------------------------------------------
   # checksums: computed from the same merged `dist/` the release attaches, so the

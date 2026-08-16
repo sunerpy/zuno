@@ -1,0 +1,36 @@
+[package]
+name = "zuno-search"
+description = "Content and path search over a project, honouring ignore semantics."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+globset = { workspace = true }
+grep-regex = { workspace = true }
+grep-searcher = { workspace = true }
+ignore = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# NOT inheritable: `grep-matcher` is absent from the workspace dependency table,
+# and this crate cannot add it there (the root manifest is off limits in this
+# worktree). It is required, not optional: `submatches` parity with
+# `opencode debug rg search` needs `Matcher::find_iter` to locate each occurrence
+# inside a matched line, that method lives on `grep_matcher::Matcher`, and neither
+# `grep-regex` nor `grep-searcher` re-exports the trait. See the task-41 note in
+# `.omo/notepads/opencode-rust/issues.md`: this line should be hoisted into
+# `[workspace.dependencies]` alongside the other four search crates.
+grep-matcher = "0.1.9"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

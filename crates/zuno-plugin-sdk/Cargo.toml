@@ -1,0 +1,23 @@
+[package]
+name = "zuno-plugin-sdk"
+description = "The surface a plugin is written against, shared by hosts and plugin authors."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[build-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

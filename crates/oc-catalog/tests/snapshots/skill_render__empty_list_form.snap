@@ -1,5 +1,0 @@
----
-source: crates/oc-catalog/tests/skill_render.rs
-expression: "render(&[], Form::List)"
----
-No skills are currently available.

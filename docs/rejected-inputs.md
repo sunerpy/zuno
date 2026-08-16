@@ -12,14 +12,14 @@ offending file. The message therefore names its own path.
 ## How this page cannot drift
 
 Every message below is **rendered by the detector**, not transcribed:
-`crates/oc-cli/tests/docs.rs` calls `oc_config::legacy`'s `inspect_*` functions
+`crates/zuno-cli/tests/docs.rs` calls `zuno_config::legacy`'s `inspect_*` functions
 and compares `Deprecation::message()` against this page byte for byte. Rewording a
-replacement in `crates/oc-config/src/legacy.rs` fails the documentation gate.
+replacement in `crates/zuno-config/src/legacy.rs` fails the documentation gate.
 `<file>` stands in for the absolute path of the offending file, which is the only
 part of a message that is not a constant. Regenerate with:
 
 ```sh
-OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs
+OC_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
 ```
 
 <!-- generated:BEGIN rejected-inputs -->
@@ -142,6 +142,6 @@ because the surrounding document already shows the shape.
 ## What is not rejected
 
 The legacy global TOML `config` file is reported and **never rewritten or
-removed** — `crates/oc-config/src/legacy/tests.rs::the_toml_config_file_is_never_rewritten_or_removed`
+removed** — `crates/zuno-config/src/legacy/tests.rs::the_toml_config_file_is_never_rewritten_or_removed`
 asserts that. Rejecting an input is a refusal to interpret it, not a licence to
 modify the user's files.

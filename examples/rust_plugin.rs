@@ -2,10 +2,10 @@ use std::error::Error;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use oc_plugin_sdk::{
+use serde_json::json;
+use zuno_plugin_sdk::{
     ConformanceSuite, HandlerError, HookCase, Plugin, ToolCase, ToolDefinition, ToolOutput,
 };
-use serde_json::json;
 
 fn plugin() -> Result<Plugin, Box<dyn Error>> {
     let id = std::env::var("OC_EXAMPLE_PLUGIN_ID").unwrap_or_else(|_| "rust-example".to_owned());
@@ -153,6 +153,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     wait_for_startup_gate().await?;
-    oc_plugin_sdk::serve(plugin).await?;
+    zuno_plugin_sdk::serve(plugin).await?;
     Ok(())
 }

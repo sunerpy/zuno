@@ -20,7 +20,7 @@
 # nothing — the full graph passes.
 #
 # `wasm` stays off (plan todo 59 made it a cargo feature and
-# `crates/oc-plugin/tests/wasmtime_feature_gate.rs` holds it off by default).
+# `crates/zuno-plugin/tests/wasmtime_feature_gate.rs` holds it off by default).
 # Enabling all features would pull `wasmtime` into the audited graph and make
 # this file assert something about a dependency no default artifact contains.
 all-features = false
@@ -101,13 +101,13 @@ multiple-versions = "warn"
 # A `*` version requirement on a registry crate is not a reproducible release
 # input. The first-party crates are exempt because a workspace path dependency
 # legitimately carries no version requirement
-# (`oc-cli = { path = "crates/oc-cli" }`), and all 34 are `publish = false`.
+# (`zuno-cli = { path = "crates/zuno-cli" }`), and all 34 are `publish = false`.
 wildcards = "deny"
 allow-wildcard-paths = true
 highlight = "all"
 
 # The no-OpenSSL constraint (plan todo 1), stated declaratively as well as in
-# `crates/oc-cli/tests/release_surface.rs`. Two mechanisms because they fail
+# `crates/zuno-cli/tests/release_surface.rs`. Two mechanisms because they fail
 # differently: the test names the offending dependency path and runs offline
 # inside `make ci`; this list also covers target/feature combinations the test's
 # `cargo tree` invocation does not resolve.

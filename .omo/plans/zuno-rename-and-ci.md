@@ -178,9 +178,22 @@ already settled.
 - **Whether `opencode` remains an accepted command alias.**
 - **`user_agent()`** (`version.rs:44`) — it must not masquerade as the TypeScript binary, which the
   module doc already states as a requirement.
-- **Crate names** (`oc-*`): renaming 36 crates is churn with no user-visible benefit. **I would keep
-  the `oc-` prefix** and rename only the binary, the user agent, the display name, and the docs. Say
-  so explicitly rather than leaving it ambiguous.
+- **Crate names** (`oc-*`): ~~renaming 36 crates is churn with no user-visible benefit. **I would keep
+  the `oc-` prefix** and rename only the binary, the user agent, the display name, and the docs.~~
+  **CORRECTED, and done: all 36 crates are now `zuno-*`.** The reasoning above had a hole — one of
+  the 36 *is* user-visible. `oc-plugin-sdk` is the crate a third-party Rust plugin author depends on
+  and imports by name: `docs/plugin-authoring.md` teaches `use zuno_plugin_sdk::{...}` and
+  `examples/rust_plugin.rs` compiles it. A plugin author types that name, so it is public surface,
+  not internal churn, and leaving it as `oc_plugin_sdk` would have taught a name the product no
+  longer carries. Once one crate must move, a split roster (35 `oc-*` + 1 `zuno-*`) is worse than
+  either extreme, so the whole roster moved. Cost was bounded: the compiler catches the ~2384
+  `oc_*` path references and the 11 `env!("CARGO_BIN_EXE_oc-*")` sites, and — unlike the
+  `.opencode` → `.zuno` sweep, which damaged eight upstream citations — the `oc-` prefix is not
+  shared vocabulary with upstream, because upstream is TypeScript and has never had an `oc-*`
+  identifier. What is NOT renamed: the `zuno` binary (already correct), the plugin ABI
+  (`COMPATIBILITY_VERSION`, the six `OPENCODE_*` names, `engines.opencode`), and the
+  `webfetch_page.*` capture set, whose `oc-tools` string is the input to two byte-asserted upstream
+  captures.
 - **Compatibility records are retained evidence, not identity.** `docs/divergences.toml`, the
   differential suites, and oracle fixtures still describe upstream artefacts. Whether those suites
   should remain is awaiting an explicit user decision; Zuno's own behavior must not be bent to

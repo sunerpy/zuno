@@ -1,0 +1,64 @@
+[package]
+name = "zuno-tools"
+description = "Built-in tool implementations: file, shell, search, web, and task tools."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+base64 = { workspace = true }
+# `task` resolves its delegation target and its model through `zuno-agent` rather than
+# re-listing either. The edge runs this way deliberately: `zuno-agent/src/builtin.rs:78`
+# states its `GOVERNED_TOOL_IDS` inline "because the dependency edge runs the other
+# way … the cross-crate assertion belongs in `zuno-tools`, where todo 65's `task` tool
+# already sees both crates". `tests/task.rs` is that assertion.
+zuno-agent = { workspace = true }
+# For `formatter::ResolvedFormatters` only: todo 18 parsed the `formatter` config
+# and `zuno-catalog` resolved its two-arm union, so `format` consumes that answer
+# rather than re-reading the config shape. The edge is one-way; `zuno-catalog` does
+# not depend on this crate.
+zuno-catalog = { workspace = true }
+zuno-db = { workspace = true }
+zuno-error = { workspace = true }
+# `task` names todo 31's canonical effort levels and todo 25's provider capability
+# facts so it can refuse an effort the resolved provider cannot honour, instead of
+# inventing a second effort vocabulary here.
+zuno-llm = { workspace = true }
+zuno-memory = { workspace = true }
+zuno-paths = { workspace = true }
+zuno-permission = { workspace = true }
+zuno-search = { workspace = true }
+zuno-tool = { workspace = true }
+reqwest = { workspace = true }
+# Only for `rusqlite::params!` in `todo::SqliteTodoStore`; the connection, pragmas
+# and schema all come from `zuno-db`, which re-exports the types this crate names.
+rusqlite = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-bash = { workspace = true }
+tree-sitter-powershell = { workspace = true }
+url = { workspace = true }
+which = { workspace = true }
+
+[dev-dependencies]
+# `tests/format.rs` parses the real `formatter` union from JSON rather than
+# hand-building the resolved enum, so a typo in the config shape fails the test
+# instead of being papered over.
+zuno-config = { workspace = true }
+zuno-testkit = { workspace = true }
+tempfile = { workspace = true }
+wiremock = { workspace = true }
+
+[lints]
+workspace = true

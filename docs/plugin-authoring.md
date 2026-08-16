@@ -24,11 +24,11 @@ Declared exactly as upstream declares it, so an existing plugin needs no change:
 ```
 
 A bare entry is an npm specifier, a `file://` URL, or a path
-(`oc_config::schema::plugin::PluginSpec`). The two-element form pairs a specifier
+(`zuno_config::schema::plugin::PluginSpec`). The two-element form pairs a specifier
 with options handed to the plugin at load time.
 
 <!-- generated:BEGIN plugin-config-paths -->
-Beyond the config array, Zuno scans every configuration directory for `plugin/*.{ts,js}` and `plugins/*.{ts,js}`. The directory chain is `$XDG_CONFIG_HOME/zuno`, project `.zuno` directories, `$HOME/.zuno`, then `OPENCODE_CONFIG_DIR`; files are sorted within `plugin/` and then `plugins/`. `OPENCODE_CONFIG_DIR` deliberately keeps its upstream spelling because installed npm plugins consume it as one of the six retained plugin-ABI environment names. Provenance is retained (`oc_plugin::PluginOrigin`), successful discovery is visible at `DEBUG`, and scan or load failures are warnings that name the affected directory or plugin.
+Beyond the config array, Zuno scans every configuration directory for `plugin/*.{ts,js}` and `plugins/*.{ts,js}`. The directory chain is `$XDG_CONFIG_HOME/zuno`, project `.zuno` directories, `$HOME/.zuno`, then `OPENCODE_CONFIG_DIR`; files are sorted within `plugin/` and then `plugins/`. `OPENCODE_CONFIG_DIR` deliberately keeps its upstream spelling because installed npm plugins consume it as one of the six retained plugin-ABI environment names. Provenance is retained (`zuno_plugin::PluginOrigin`), successful discovery is visible at `DEBUG`, and scan or load failures are warnings that name the affected directory or plugin.
 <!-- generated:END plugin-config-paths -->
 
 ### Tool name collisions
@@ -55,7 +55,7 @@ running <version>`, while a satisfying or absent range loads normally. Local
 exception. This is why `--version` reports the compatibility baseline and the
 real build identity is exposed separately — see the `split-version-identity`
 entry in [divergences.md](divergences.md). The excluding and satisfying cases
-are executable production-loader regressions in `crates/oc-plugin/tests/js.rs`.
+are executable production-loader regressions in `crates/zuno-plugin/tests/js.rs`.
 
 A JavaScript plugin also gets the v1 SDK routes it calls. Only the routes with a
 measured callsite are served; see the v1 table in
@@ -69,13 +69,13 @@ that imports anything fails to load rather than loading with a surprise
 capability. Granting one has to be an explicit, per-interface change to
 `WasmPluginSpec`.
 
-The guest world is `oc_plugin::wasm::WASM_HOOK_WIT`. Every export corresponds
+The guest world is `zuno_plugin::wasm::WASM_HOOK_WIT`. Every export corresponds
 one-for-one with a hook below and takes `(input-json, output-json) -> string`: the
 guest returns the complete replacement output JSON, or `null` for hooks that have
 no mutable output.
 
 ```rust
-use oc_plugin::wasm::{WasmPluginSpec, load_wasm_plugins_ordered};
+use zuno_plugin::wasm::{WasmPluginSpec, load_wasm_plugins_ordered};
 
 let load = load_wasm_plugins_ordered(vec![
     WasmPluginSpec::new("my-plugin", std::fs::read("my_plugin.wasm")?),
@@ -91,7 +91,7 @@ A child process speaking **newline-delimited JSON-RPC 2.0 on stdin and stdout**.
 Standard output is reserved for frames; anything a plugin wants to log goes to
 standard error, or one stray line corrupts the connection.
 
-Protocol version `1.0` (`oc_plugin_sdk::PROTOCOL_VERSION`). Three methods:
+Protocol version `1.0` (`zuno_plugin_sdk::PROTOCOL_VERSION`). Three methods:
 
 | method | when |
 |---|---|
@@ -102,13 +102,13 @@ Protocol version `1.0` (`oc_plugin_sdk::PROTOCOL_VERSION`). Three methods:
 `hook.call` or `tool.call` before initialize is `-32002 plugin is not
 initialized`; a second initialize is `-32003`; an unknown method is `-32601`.
 Initialization, each hook, and each tool are governed by independent deadlines
-(`oc_plugin::DEFAULT_HOOK_TIMEOUT`, five seconds), and a plugin that crashes or
+(`zuno_plugin::DEFAULT_HOOK_TIMEOUT`, five seconds), and a plugin that crashes or
 times out is disabled with a `PluginDiagnostic` rather than taking the turn down.
 
-The host declares one with `oc_plugin::PluginProcessSpec`:
+The host declares one with `zuno_plugin::PluginProcessSpec`:
 
 ```rust
-use oc_plugin::PluginProcessSpec;
+use zuno_plugin::PluginProcessSpec;
 
 let spec = PluginProcessSpec::new("my-plugin", "/usr/local/bin/my-plugin")
     .arg("--serve")
@@ -123,7 +123,7 @@ this tier. It builds one `Plugin`, registers a tool and three hooks, and hands
 the result to `serve`:
 
 ```rust
-use oc_plugin_sdk::{HandlerError, Plugin, ToolDefinition, ToolOutput, serve};
+use zuno_plugin_sdk::{HandlerError, Plugin, ToolDefinition, ToolOutput, serve};
 use serde_json::json;
 
 fn plugin() -> Result<Plugin, Box<dyn std::error::Error>> {
@@ -164,7 +164,7 @@ the manifest.
 
 ### Prove it conforms before shipping it
 
-`oc_plugin_sdk::ConformanceSuite` drives a plugin the way the host does —
+`zuno_plugin_sdk::ConformanceSuite` drives a plugin the way the host does —
 initialize, then the hook and tool cases you declare — so a protocol mistake
 surfaces in your own test run rather than as a disabled plugin in someone's
 session. `examples/rust_plugin.rs` uses it; copy that shape.
@@ -172,7 +172,7 @@ session. `examples/rust_plugin.rs` uses it; copy that shape.
 ## The hooks
 
 Every tier dispatches the same 21 hooks, in upstream declaration order. The table
-is generated from `oc_plugin::hook_support()`, whose exhaustive mapping requires
+is generated from `zuno_plugin::hook_support()`, whose exhaustive mapping requires
 every advertised hook to name its production lifecycle trigger.
 
 <!-- generated:BEGIN plugin-hooks -->
@@ -204,7 +204,7 @@ every advertised hook to name its production lifecycle trigger.
 Regenerate with:
 
 ```sh
-OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs
+OC_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
 ```
 
 ## What is not available

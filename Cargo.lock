@@ -2381,713 +2381,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "oc-acp"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "oc-engine",
- "oc-error",
- "oc-llm",
- "oc-tool",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "oc-agent"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "oc-catalog",
- "oc-config",
- "oc-error",
- "oc-llm",
- "oc-paths",
- "oc-permission",
- "oc-tool",
- "serde",
- "serde_json",
- "thiserror 2.0.19",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "oc-auth"
-version = "0.1.0"
-dependencies = [
- "oc-error",
- "oc-paths",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.19",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "oc-catalog"
-version = "0.1.0"
-dependencies = [
- "futures",
- "insta",
- "oc-config",
- "oc-error",
- "oc-paths",
- "oc-testkit",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "url",
- "uuid",
- "walkdir",
- "wiremock",
- "yaml-rust2",
-]
-
-[[package]]
-name = "oc-cli"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "clap",
- "oc-agent",
- "oc-auth",
- "oc-catalog",
- "oc-config",
- "oc-db",
- "oc-engine",
- "oc-error",
- "oc-goal",
- "oc-llm",
- "oc-lsp",
- "oc-mcp",
- "oc-memory",
- "oc-observability",
- "oc-paths",
- "oc-permission",
- "oc-plugin",
- "oc-process",
- "oc-provider-anthropic",
- "oc-provider-bedrock",
- "oc-provider-compatible",
- "oc-provider-google",
- "oc-provider-openai",
- "oc-search",
- "oc-server",
- "oc-snapshot",
- "oc-testkit",
- "oc-tool",
- "oc-tools",
- "oc-tui",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.19",
- "time",
- "tokio",
- "tower",
- "tracing",
- "uuid",
- "which",
-]
-
-[[package]]
-name = "oc-config"
-version = "0.1.0"
-dependencies = [
- "futures",
- "globset",
- "oc-error",
- "oc-paths",
- "oc-testkit",
- "proptest",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "walkdir",
- "wiremock",
-]
-
-[[package]]
-name = "oc-db"
-version = "0.1.0"
-dependencies = [
- "oc-error",
- "oc-paths",
- "oc-snapshot",
- "oc-testkit",
- "oc-tool",
- "proptest",
- "rusqlite",
- "rustix 1.1.4",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "oc-engine"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "jsonschema",
- "oc-config",
- "oc-db",
- "oc-error",
- "oc-llm",
- "oc-paths",
- "oc-permission",
- "oc-tool",
- "proptest",
- "serde_json",
- "thiserror 2.0.19",
- "tokio",
-]
-
-[[package]]
-name = "oc-error"
-version = "0.1.0"
-dependencies = [
- "serde_json",
- "thiserror 2.0.19",
- "walkdir",
-]
-
-[[package]]
-name = "oc-goal"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "oc-db",
- "oc-engine",
- "oc-error",
- "oc-llm",
- "oc-paths",
- "oc-tool",
- "oc-watch",
- "rusqlite",
- "schemars",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "oc-llm"
-version = "0.1.0"
-dependencies = [
- "futures",
- "oc-auth",
- "oc-config",
- "oc-error",
- "oc-paths",
- "oc-testkit",
- "reqwest",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
-]
-
-[[package]]
-name = "oc-lsp"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "oc-catalog",
- "oc-config",
- "oc-error",
- "oc-process",
- "oc-tool",
- "schemars",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "tracing",
- "url",
- "which",
-]
-
-[[package]]
-name = "oc-mcp"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64 0.23.1",
- "futures",
- "oc-auth",
- "oc-catalog",
- "oc-config",
- "oc-error",
- "oc-llm",
- "oc-paths",
- "oc-permission",
- "oc-process",
- "oc-tool",
- "oc-tools",
- "reqwest",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "tracing",
- "url",
- "uuid",
- "wiremock",
-]
-
-[[package]]
-name = "oc-memory"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "oc-agent",
- "oc-config",
- "oc-db",
- "oc-engine",
- "oc-error",
- "oc-llm",
- "oc-paths",
- "oc-tool",
- "oc-tools",
- "regex",
- "serde_json",
- "sha2 0.11.0",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "oc-observability"
-version = "0.1.0"
-dependencies = [
- "oc-error",
- "serde_json",
- "tempfile",
- "thiserror 2.0.19",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "walkdir",
-]
-
-[[package]]
-name = "oc-paths"
-version = "0.1.0"
-dependencies = [
- "oc-testkit",
- "tempfile",
- "thiserror 2.0.19",
- "url",
-]
-
-[[package]]
-name = "oc-permission"
-version = "0.1.0"
-dependencies = [
- "dirs",
- "oc-config",
- "oc-error",
- "proptest",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "oc-plugin"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "oc-auth",
- "oc-config",
- "oc-db",
- "oc-engine",
- "oc-error",
- "oc-llm",
- "oc-paths",
- "oc-permission",
- "oc-plugin-sdk",
- "oc-process",
- "oc-testkit",
- "oc-tool",
- "oc-tools",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "toml",
- "tracing",
- "url",
- "wasmtime",
-]
-
-[[package]]
-name = "oc-plugin-sdk"
-version = "0.1.0"
-dependencies = [
- "futures",
- "serde",
- "serde_json",
- "thiserror 2.0.19",
- "tokio",
-]
-
-[[package]]
-name = "oc-process"
-version = "0.1.0"
-dependencies = [
- "portable-pty",
- "process-wrap",
- "rustix 1.1.4",
- "signal-hook 0.4.1",
- "tempfile",
-]
-
-[[package]]
-name = "oc-provider-anthropic"
-version = "0.1.0"
-dependencies = [
- "futures",
- "oc-auth",
- "oc-error",
- "oc-llm",
- "oc-testkit",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.19",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "oc-provider-bedrock"
-version = "0.1.0"
-dependencies = [
- "base64 0.23.1",
- "dirs",
- "futures",
- "oc-error",
- "oc-llm",
- "oc-testkit",
- "reqwest",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tempfile",
- "thiserror 2.0.19",
- "time",
- "tokio",
- "url",
- "wiremock",
-]
-
-[[package]]
-name = "oc-provider-compatible"
-version = "0.1.0"
-dependencies = [
- "futures",
- "oc-error",
- "oc-llm",
- "oc-testkit",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.19",
- "tokio",
- "toml",
-]
-
-[[package]]
-name = "oc-provider-google"
-version = "0.1.0"
-dependencies = [
- "aws-lc-rs",
- "base64 0.23.1",
- "futures",
- "oc-error",
- "oc-llm",
- "oc-testkit",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.19",
- "tokio",
- "url",
-]
-
-[[package]]
-name = "oc-provider-openai"
-version = "0.1.0"
-dependencies = [
- "futures",
- "oc-auth",
- "oc-error",
- "oc-llm",
- "oc-testkit",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.19",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "oc-pty"
-version = "0.1.0"
-dependencies = [
- "oc-process",
- "portable-pty",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "tracing",
- "uuid",
- "which",
-]
-
-[[package]]
-name = "oc-reaping-fixture"
-version = "0.1.0"
-dependencies = [
- "oc-catalog",
- "oc-config",
- "oc-lsp",
- "oc-mcp",
- "oc-plugin",
- "oc-process",
- "oc-pty",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "oc-search"
-version = "0.1.0"
-dependencies = [
- "globset",
- "grep-matcher",
- "grep-regex",
- "grep-searcher",
- "ignore",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.19",
- "tracing",
-]
-
-[[package]]
-name = "oc-server"
-version = "0.1.0"
-dependencies = [
- "aws-lc-rs",
- "axum",
- "base64 0.23.1",
- "clap",
- "futures",
- "hyper",
- "hyper-util",
- "jsonschema",
- "oc-auth",
- "oc-catalog",
- "oc-config",
- "oc-db",
- "oc-engine",
- "oc-error",
- "oc-llm",
- "oc-paths",
- "oc-permission",
- "oc-plugin-sdk",
- "oc-pty",
- "reqwest",
- "rusqlite",
- "schemars",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "tower",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "oc-snapshot"
-version = "0.1.0"
-dependencies = [
- "oc-paths",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "oc-testkit"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "base64 0.23.1",
- "futures",
- "oc-catalog",
- "oc-config",
- "oc-db",
- "oc-engine",
- "oc-error",
- "oc-llm",
- "oc-lsp",
- "oc-paths",
- "oc-provider-anthropic",
- "oc-provider-bedrock",
- "oc-provider-compatible",
- "oc-provider-google",
- "oc-provider-openai",
- "oc-pty",
- "oc-server",
- "oc-tool",
- "oc-tools",
- "oc-watch",
- "rustix 1.1.4",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "toml",
- "walkdir",
- "which",
-]
-
-[[package]]
-name = "oc-tool"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "oc-config",
- "oc-error",
- "oc-paths",
- "oc-permission",
- "schemars",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "oc-tools"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64 0.23.1",
- "oc-agent",
- "oc-catalog",
- "oc-config",
- "oc-db",
- "oc-error",
- "oc-llm",
- "oc-memory",
- "oc-paths",
- "oc-permission",
- "oc-search",
- "oc-testkit",
- "oc-tool",
- "reqwest",
- "rusqlite",
- "schemars",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.19",
- "time",
- "tokio",
- "tracing",
- "tree-sitter",
- "tree-sitter-bash",
- "tree-sitter-powershell",
- "url",
- "which",
- "wiremock",
-]
-
-[[package]]
-name = "oc-tui"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "crossterm 0.29.0",
- "insta",
- "oc-engine",
- "oc-llm",
- "oc-permission",
- "ratatui",
- "serde",
- "serde_json",
- "thiserror 2.0.19",
- "tokio",
-]
-
-[[package]]
-name = "oc-types"
-version = "0.1.0"
-
-[[package]]
-name = "oc-watch"
-version = "0.1.0"
-dependencies = [
- "globset",
- "ignore",
- "notify",
- "oc-config",
- "oc-paths",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6093,3 +5386,710 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[package]]
+name = "zuno-acp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "uuid",
+ "zuno-engine",
+ "zuno-error",
+ "zuno-llm",
+ "zuno-tool",
+]
+
+[[package]]
+name = "zuno-agent"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "zuno-catalog",
+ "zuno-config",
+ "zuno-error",
+ "zuno-llm",
+ "zuno-paths",
+ "zuno-permission",
+ "zuno-tool",
+]
+
+[[package]]
+name = "zuno-auth"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tracing",
+ "tracing-subscriber",
+ "zuno-error",
+ "zuno-paths",
+]
+
+[[package]]
+name = "zuno-catalog"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "insta",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+ "walkdir",
+ "wiremock",
+ "yaml-rust2",
+ "zuno-config",
+ "zuno-error",
+ "zuno-paths",
+ "zuno-testkit",
+]
+
+[[package]]
+name = "zuno-cli"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "clap",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "time",
+ "tokio",
+ "tower",
+ "tracing",
+ "uuid",
+ "which",
+ "zuno-agent",
+ "zuno-auth",
+ "zuno-catalog",
+ "zuno-config",
+ "zuno-db",
+ "zuno-engine",
+ "zuno-error",
+ "zuno-goal",
+ "zuno-llm",
+ "zuno-lsp",
+ "zuno-mcp",
+ "zuno-memory",
+ "zuno-observability",
+ "zuno-paths",
+ "zuno-permission",
+ "zuno-plugin",
+ "zuno-process",
+ "zuno-provider-anthropic",
+ "zuno-provider-bedrock",
+ "zuno-provider-compatible",
+ "zuno-provider-google",
+ "zuno-provider-openai",
+ "zuno-search",
+ "zuno-server",
+ "zuno-snapshot",
+ "zuno-testkit",
+ "zuno-tool",
+ "zuno-tools",
+ "zuno-tui",
+]
+
+[[package]]
+name = "zuno-config"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "globset",
+ "proptest",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "walkdir",
+ "wiremock",
+ "zuno-error",
+ "zuno-paths",
+ "zuno-testkit",
+]
+
+[[package]]
+name = "zuno-db"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "rusqlite",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "zuno-error",
+ "zuno-paths",
+ "zuno-snapshot",
+ "zuno-testkit",
+ "zuno-tool",
+]
+
+[[package]]
+name = "zuno-engine"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "jsonschema",
+ "proptest",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "zuno-config",
+ "zuno-db",
+ "zuno-error",
+ "zuno-llm",
+ "zuno-paths",
+ "zuno-permission",
+ "zuno-tool",
+]
+
+[[package]]
+name = "zuno-error"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror 2.0.19",
+ "walkdir",
+]
+
+[[package]]
+name = "zuno-goal"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "rusqlite",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "uuid",
+ "zuno-db",
+ "zuno-engine",
+ "zuno-error",
+ "zuno-llm",
+ "zuno-paths",
+ "zuno-tool",
+ "zuno-watch",
+]
+
+[[package]]
+name = "zuno-llm"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "zuno-auth",
+ "zuno-config",
+ "zuno-error",
+ "zuno-paths",
+ "zuno-testkit",
+]
+
+[[package]]
+name = "zuno-lsp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "url",
+ "which",
+ "zuno-catalog",
+ "zuno-config",
+ "zuno-error",
+ "zuno-process",
+ "zuno-tool",
+]
+
+[[package]]
+name = "zuno-mcp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+ "wiremock",
+ "zuno-auth",
+ "zuno-catalog",
+ "zuno-config",
+ "zuno-error",
+ "zuno-llm",
+ "zuno-paths",
+ "zuno-permission",
+ "zuno-process",
+ "zuno-tool",
+ "zuno-tools",
+]
+
+[[package]]
+name = "zuno-memory"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "regex",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "zuno-agent",
+ "zuno-config",
+ "zuno-db",
+ "zuno-engine",
+ "zuno-error",
+ "zuno-llm",
+ "zuno-paths",
+ "zuno-tool",
+ "zuno-tools",
+]
+
+[[package]]
+name = "zuno-observability"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "walkdir",
+ "zuno-error",
+]
+
+[[package]]
+name = "zuno-paths"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.19",
+ "url",
+ "zuno-testkit",
+]
+
+[[package]]
+name = "zuno-permission"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "proptest",
+ "serde",
+ "serde_json",
+ "zuno-config",
+ "zuno-error",
+]
+
+[[package]]
+name = "zuno-plugin"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "toml",
+ "tracing",
+ "url",
+ "wasmtime",
+ "zuno-auth",
+ "zuno-config",
+ "zuno-db",
+ "zuno-engine",
+ "zuno-error",
+ "zuno-llm",
+ "zuno-paths",
+ "zuno-permission",
+ "zuno-plugin-sdk",
+ "zuno-process",
+ "zuno-testkit",
+ "zuno-tool",
+ "zuno-tools",
+]
+
+[[package]]
+name = "zuno-plugin-sdk"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
+name = "zuno-process"
+version = "0.1.0"
+dependencies = [
+ "portable-pty",
+ "process-wrap",
+ "rustix 1.1.4",
+ "signal-hook 0.4.1",
+ "tempfile",
+]
+
+[[package]]
+name = "zuno-provider-anthropic"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "zuno-auth",
+ "zuno-error",
+ "zuno-llm",
+ "zuno-testkit",
+]
+
+[[package]]
+name = "zuno-provider-bedrock"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "dirs",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.19",
+ "time",
+ "tokio",
+ "url",
+ "wiremock",
+ "zuno-error",
+ "zuno-llm",
+ "zuno-testkit",
+]
+
+[[package]]
+name = "zuno-provider-compatible"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "toml",
+ "zuno-error",
+ "zuno-llm",
+ "zuno-testkit",
+]
+
+[[package]]
+name = "zuno-provider-google"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "base64 0.23.1",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "url",
+ "zuno-error",
+ "zuno-llm",
+ "zuno-testkit",
+]
+
+[[package]]
+name = "zuno-provider-openai"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "zuno-auth",
+ "zuno-error",
+ "zuno-llm",
+ "zuno-testkit",
+]
+
+[[package]]
+name = "zuno-pty"
+version = "0.1.0"
+dependencies = [
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "uuid",
+ "which",
+ "zuno-process",
+]
+
+[[package]]
+name = "zuno-reaping-fixture"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tokio",
+ "zuno-catalog",
+ "zuno-config",
+ "zuno-lsp",
+ "zuno-mcp",
+ "zuno-plugin",
+ "zuno-process",
+ "zuno-pty",
+]
+
+[[package]]
+name = "zuno-search"
+version = "0.1.0"
+dependencies = [
+ "globset",
+ "grep-matcher",
+ "grep-regex",
+ "grep-searcher",
+ "ignore",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tracing",
+]
+
+[[package]]
+name = "zuno-server"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "axum",
+ "base64 0.23.1",
+ "clap",
+ "futures",
+ "hyper",
+ "hyper-util",
+ "jsonschema",
+ "reqwest",
+ "rusqlite",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tower",
+ "url",
+ "uuid",
+ "zuno-auth",
+ "zuno-catalog",
+ "zuno-config",
+ "zuno-db",
+ "zuno-engine",
+ "zuno-error",
+ "zuno-llm",
+ "zuno-paths",
+ "zuno-permission",
+ "zuno-plugin-sdk",
+ "zuno-pty",
+]
+
+[[package]]
+name = "zuno-snapshot"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "zuno-paths",
+]
+
+[[package]]
+name = "zuno-testkit"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "futures",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "toml",
+ "walkdir",
+ "which",
+ "zuno-catalog",
+ "zuno-config",
+ "zuno-db",
+ "zuno-engine",
+ "zuno-error",
+ "zuno-llm",
+ "zuno-lsp",
+ "zuno-paths",
+ "zuno-provider-anthropic",
+ "zuno-provider-bedrock",
+ "zuno-provider-compatible",
+ "zuno-provider-google",
+ "zuno-provider-openai",
+ "zuno-pty",
+ "zuno-server",
+ "zuno-tool",
+ "zuno-tools",
+ "zuno-watch",
+]
+
+[[package]]
+name = "zuno-tool"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+ "zuno-config",
+ "zuno-error",
+ "zuno-paths",
+ "zuno-permission",
+]
+
+[[package]]
+name = "zuno-tools"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "reqwest",
+ "rusqlite",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "time",
+ "tokio",
+ "tracing",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "tree-sitter-powershell",
+ "url",
+ "which",
+ "wiremock",
+ "zuno-agent",
+ "zuno-catalog",
+ "zuno-config",
+ "zuno-db",
+ "zuno-error",
+ "zuno-llm",
+ "zuno-memory",
+ "zuno-paths",
+ "zuno-permission",
+ "zuno-search",
+ "zuno-testkit",
+ "zuno-tool",
+]
+
+[[package]]
+name = "zuno-tui"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "crossterm 0.29.0",
+ "insta",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "zuno-engine",
+ "zuno-llm",
+ "zuno-permission",
+]
+
+[[package]]
+name = "zuno-types"
+version = "0.1.0"
+
+[[package]]
+name = "zuno-watch"
+version = "0.1.0"
+dependencies = [
+ "globset",
+ "ignore",
+ "notify",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "zuno-config",
+ "zuno-paths",
+]

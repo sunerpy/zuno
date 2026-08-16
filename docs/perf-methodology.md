@@ -82,7 +82,7 @@ instead of asserting a tolerance the machine does not meet.
 ## W-real subject pin
 
 `W-real` measures one specific session in one specific database snapshot. Both
-are recorded as `W_REAL_SUBJECT` in `crates/oc-testkit/src/perf/subject.rs`:
+are recorded as `W_REAL_SUBJECT` in `crates/zuno-testkit/src/perf/subject.rs`:
 
 | field | value |
 | --- | --- |
@@ -136,7 +136,7 @@ completes a turn do not count as progress.
 
 ## Frozen threshold formulas
 
-The text between the markers is hashed by `oc-testkit`. Changing it requires an
+The text between the markers is hashed by `zuno-testkit`. Changing it requires an
 explicit `PERF_METHODOLOGY_REVISION` bump and a newly registered digest.
 
 <!-- PERF_FORMULAS_START -->

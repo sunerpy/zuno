@@ -11,9 +11,9 @@ parity claim.
 
 - `--archive` writes a single column: `session.time_archived`. Nothing is
   removed. The reverse operation exists in the library
-  (`oc_db::prune::PruneRequest::restore_archive`, which sets `time_archived` back
+  (`zuno_db::prune::PruneRequest::restore_archive`, which sets `time_archived` back
   to `NULL`) and is covered by
-  `crates/oc-db/tests/prune.rs::prune_archive_is_reversible_without_deleting_session_data`.
+  `crates/zuno-db/tests/prune.rs::prune_archive_is_reversible_without_deleting_session_data`.
 - `--delete` removes rows from the tables below, sweeps orphaned parts, and
   switches artifact collection into delete mode. There is no undo. Restore from a
   backup or from the source of the data; nothing in this binary can bring it back.
@@ -27,7 +27,7 @@ The reversibility is real, but it is not yet a flag.
 
 With neither `--archive` nor `--delete`, the command is a preview and mutates
 nothing —
-`crates/oc-db/tests/prune.rs::prune_default_preview_is_inert_across_every_real_table`
+`crates/zuno-db/tests/prune.rs::prune_default_preview_is_inert_across_every_real_table`
 asserts inertness across every table, and
 `prune_preview_counts_exactly_match_the_subsequent_transactional_delete` asserts
 the preview's counts are the counts the delete then produces.
@@ -68,7 +68,7 @@ Answering anything but yes at the prompt is the same refusal:
 session deletion cancelled; nothing was changed
 ```
 
-Both are asserted in `crates/oc-cli/src/cmd/session_prune.rs`. Note that the
+Both are asserted in `crates/zuno-cli/src/cmd/session_prune.rs`. Note that the
 refusal happens **before** stdin is read at all, so a delete in a pipeline cannot
 be confirmed by whatever bytes happen to arrive.
 
@@ -86,8 +86,8 @@ be.
 
 ## What a delete touches
 
-Generated from `oc_db::prune::DELETE_ORDER`. The order is pinned by
-`crates/oc-db/tests/prune.rs::prune_delete_order_and_true_related_table_count_are_pinned`,
+Generated from `zuno_db::prune::DELETE_ORDER`. The order is pinned by
+`crates/zuno-db/tests/prune.rs::prune_delete_order_and_true_related_table_count_are_pinned`,
 because the order is what keeps foreign keys satisfied mid-transaction.
 
 **10 tables**, in this order:
@@ -110,7 +110,7 @@ because the order is what keeps foreign keys satisfied mid-transaction.
 Regenerate with:
 
 ```sh
-OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs
+OC_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
 ```
 
 After the table deletes, parts with no surviving session are swept, and artifact
@@ -154,5 +154,5 @@ session prune mutation requires `apply: true`; nothing was changed
 ```
 
 The CLI and HTTP previews emit byte-identical JSON —
-`crates/oc-cli/src/cmd/session_prune.rs::session_prune_cli_and_http_preview_json_are_byte_identical`
+`crates/zuno-cli/src/cmd/session_prune.rs::session_prune_cli_and_http_preview_json_are_byte_identical`
 — so an operator can build a policy against one and audit with the other.

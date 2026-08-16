@@ -23,7 +23,7 @@
 
 CARGO       := cargo
 OXFMT      ?= oxfmt
-CLI_CRATE   := oc-cli
+CLI_CRATE   := zuno-cli
 BINARY_NAME := zuno
 TARGET_DIR  := target
 DIST_DIR    := dist
@@ -43,7 +43,7 @@ TARGET ?=
 # The six targets the release pipeline ships. Listed here so `make help` can show
 # them next to the command that builds one; the authoritative matrix lives in
 # `.github/workflows/release.yml` and
-# `crates/oc-cli/tests/release_surface.rs` asserts the two agree.
+# `crates/zuno-cli/tests/release_surface.rs` asserts the two agree.
 RELEASE_TARGETS := \
   x86_64-unknown-linux-musl \
   aarch64-unknown-linux-musl \
@@ -177,20 +177,20 @@ package: release-target
 BINARY ?= $(TARGET_DIR)/release/$(BINARY_NAME)
 
 smoke:
-	$(CARGO) build --release -p oc-testkit --bin oc-smoke $(OFFLINE)
-	./$(TARGET_DIR)/release/oc-smoke --binary "$(BINARY)"
+	$(CARGO) build --release -p zuno-testkit --bin zuno-smoke $(OFFLINE)
+	./$(TARGET_DIR)/release/zuno-smoke --binary "$(BINARY)"
 
 # The release pipeline's packaging + smoke path for the host, end to end: build a
 # real release binary, archive it, unpack the archive, and smoke what came out.
 # Unpacking is the point — it proves the archive contains a runnable binary, not
 # just that the compiler produced one. This is what CI's `artifact` job runs.
 smoke-artifact: release
-	$(CARGO) build --release -p oc-testkit --bin oc-smoke $(OFFLINE)
+	$(CARGO) build --release -p zuno-testkit --bin zuno-smoke $(OFFLINE)
 	@rm -rf $(DIST_DIR)/host $(DIST_DIR)/unpacked
 	@mkdir -p $(DIST_DIR)/host $(DIST_DIR)/unpacked
 	tar -czf $(DIST_DIR)/host/$(BINARY_NAME).tar.gz -C $(TARGET_DIR)/release $(BINARY_NAME)
 	tar -xzf $(DIST_DIR)/host/$(BINARY_NAME).tar.gz -C $(DIST_DIR)/unpacked
-	./$(TARGET_DIR)/release/oc-smoke --binary $(DIST_DIR)/unpacked/$(BINARY_NAME)
+	./$(TARGET_DIR)/release/zuno-smoke --binary $(DIST_DIR)/unpacked/$(BINARY_NAME)
 
 clean:
 	$(CARGO) clean
@@ -219,7 +219,7 @@ help:
 	@echo "  package         release-target + the release archive into $(DIST_DIR)/"
 	@echo ""
 	@echo "Smoke:"
-	@echo "  smoke           run oc-smoke against BINARY (default: the release build)"
+	@echo "  smoke           run zuno-smoke against BINARY (default: the release build)"
 	@echo "  smoke-artifact  release + archive + unpack + smoke (what CI runs)"
 	@echo ""
 	@echo "Release targets:"

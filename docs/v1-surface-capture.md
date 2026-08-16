@@ -1,10 +1,10 @@
 # The measured pre-`/api` (v1) surface
 
-This document is the evidence behind `crates/oc-server/src/compat_v1.rs`. Every
+This document is the evidence behind `crates/zuno-server/src/compat_v1.rs`. Every
 route that file serves appears here with at least one recorded plugin callsite.
 A route with no callsite is scope creep; a callsite with no route is a gap. Both
 are reportable, and the executable form of that rule is
-`crates/oc-server/tests/compat_v1.rs`, which asserts the same properties against
+`crates/zuno-server/tests/compat_v1.rs`, which asserts the same properties against
 `V1_SURFACE`.
 
 ## How this was measured
@@ -149,7 +149,7 @@ the *verb* is not, so it is accounted as an operation gap rather than a path gap
 <!-- generated:BEGIN v1-capture-coverage -->
 Current backend coverage is **14 of 20 measured routes served locally** and **6 of 20 registered as structured `501 not_implemented` seams**. The served set contains 10 `/api` adapters, 3 credential/OAuth routes, and 1 toast recording sink.
 
-Of the 6 unbacked routes, 0 name a served `/api` alternative and 6 do not. The unbacked SDK methods are `client.app.log`, `client.config.get`, `client.session.status`, `client.session.update`, `client.session.children`, `client.session.todo`. These counts are generated from `oc_server::v1_coverage()` and the same `V1_SURFACE` backing declarations the server mounts.
+Of the 6 unbacked routes, 0 name a served `/api` alternative and 6 do not. The unbacked SDK methods are `client.app.log`, `client.config.get`, `client.session.status`, `client.session.update`, `client.session.children`, `client.session.todo`. These counts are generated from `zuno_server::v1_coverage()` and the same `V1_SURFACE` backing declarations the server mounts.
 
 The practical consequence: the installed auth plugins can authenticate because `auth.set` and both provider OAuth routes have credential backends. Toasts reach the bounded recording sink. A plugin that needs one of the unbacked methods receives a definitive `501` rather than fabricated success data.
 <!-- generated:END v1-capture-coverage -->

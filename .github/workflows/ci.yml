@@ -113,7 +113,7 @@ jobs:
         run: make test
 
       - name: WASM plugin integration suite
-        run: cargo test -p oc-plugin --features wasm --test integration
+        run: cargo test -p zuno-plugin --features wasm --test integration
 
   # The supply-chain gate is its own job so a licence or advisory failure is
   # legible at a glance instead of buried in a 3000-test log.
@@ -242,7 +242,7 @@ jobs:
   # adding a job to `needs:` below makes it required with no change to the script.
   # GitHub cannot close the remaining gap — the `needs` context contains only the
   # jobs listed in `needs:`, so a job never added there is invisible to this gate
-  # however the expression is written. `crates/oc-cli/tests/release_surface.rs`
+  # however the expression is written. `crates/zuno-cli/tests/release_surface.rs`
   # closes it from outside by asserting `ci-success.needs` lists every job in this
   # file.
   # -------------------------------------------------------------------------

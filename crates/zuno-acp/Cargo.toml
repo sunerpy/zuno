@@ -1,0 +1,28 @@
+[package]
+name = "zuno-acp"
+description = "Agent Client Protocol adapter for external editor clients."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+zuno-engine = { workspace = true }
+zuno-error = { workspace = true }
+zuno-llm = { workspace = true }
+zuno-tool = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

@@ -52,18 +52,18 @@ sh_run 'cmp /tmp/t1-roster.txt crates.expected && echo "cmp: byte-for-byte ident
 section "ACCEPTANCE 2 / QA HAPPY — cold cargo build --workspace, zero warnings"
 printf '\n(target/ is removed first so this is a real full build, not a cache hit.\n Registry "Adding"/"Locking" lines are dropped from the transcript only;\n the warning count below is taken from the unfiltered log.)\n' >>"$OUT"
 sh_run 'rm -rf target && cargo build --workspace 2>&1 | tee /tmp/t1-build.log | grep -vE "^ +(Adding|Locking|Updating) "; exit ${PIPESTATUS[0]}'
-sh_run 'grep -c "^   Compiling oc-" /tmp/t1-build.log; echo "first-party crates compiled (expect $(wc -l < crates.expected))"'
+sh_run 'grep -c "^   Compiling zuno-" /tmp/t1-build.log; echo "first-party crates compiled (expect $(wc -l < crates.expected))"'
 sh_run 'grep -in "warning" /tmp/t1-build.log; echo "grep -i warning over the UNFILTERED log exited $? (1 == no match == zero warnings)"'
 sh_run 'tail -1 /tmp/t1-build.log'
 
 section "ACCEPTANCE 3 — every crate opts into the workspace lints"
 sh_run 'for f in crates/*/Cargo.toml; do grep -q "^workspace = true" "$f" || echo "MISSING [lints] workspace = true: $f"; done; echo "crates checked: $(ls -d crates/*/ | wc -l)"'
-sh_run 'grep -A1 -h "^\[lints\]" crates/oc-error/Cargo.toml crates/oc-cli/Cargo.toml'
+sh_run 'grep -A1 -h "^\[lints\]" crates/zuno-error/Cargo.toml crates/zuno-cli/Cargo.toml'
 sh_run 'grep -n "unsafe_code\|resolver\|edition\|members" Cargo.toml | head'
 
 section "ACCEPTANCE 4 — no per-crate dependency versions"
 sh_run 'grep -nE "^[a-z0-9_-]+ *= *\"[0-9]" crates/*/Cargo.toml; echo "grep exited $? (1 == no literal version in any member manifest)"'
-sh_run 'grep -rn "workspace = true" crates/oc-tui/Cargo.toml'
+sh_run 'grep -rn "workspace = true" crates/zuno-tui/Cargo.toml'
 
 section "ACCEPTANCE 5 — no OpenSSL-backed TLS"
 printf '\n(Honest scope: no member crate depends on reqwest yet, so the WORKSPACE\n lockfile is silent on TLS and a grep over it would prove nothing. The pin is\n verified two ways instead: the root manifest, and an isolated build of exactly\n that dependency line in /tmp/t1-tls.)\n' >>"$OUT"
@@ -89,7 +89,7 @@ sh_run 'env -i PATH=/tmp/t1-nojq/bin HOME="$HOME" RUSTUP_HOME="${RUSTUP_HOME:-$H
 sh_run 'MIN_DISK_GB=999999 bash scripts/preflight.sh'
 
 section "QA FAILURE — an unsafe block is rejected by the workspace lint"
-sh_run 'cat > crates/oc-types/src/bad.rs <<RS
+sh_run 'cat > crates/zuno-types/src/bad.rs <<RS
 //! Temporary QA fixture for task 1: proves \`unsafe_code = "forbid"\` is live.
 
 pub fn read_through_raw_pointer() -> i32 {
@@ -98,17 +98,17 @@ pub fn read_through_raw_pointer() -> i32 {
     unsafe { *ptr }
 }
 RS
-printf "mod bad;\n" >> crates/oc-types/src/lib.rs
-echo "--- crates/oc-types/src/bad.rs ---"; cat crates/oc-types/src/bad.rs
-echo "--- crates/oc-types/src/lib.rs ---"; cat crates/oc-types/src/lib.rs'
-sh_run 'cargo build -p oc-types 2>&1 | tee /tmp/t1-unsafe.log; exit ${PIPESTATUS[0]}'
+printf "mod bad;\n" >> crates/zuno-types/src/lib.rs
+echo "--- crates/zuno-types/src/bad.rs ---"; cat crates/zuno-types/src/bad.rs
+echo "--- crates/zuno-types/src/lib.rs ---"; cat crates/zuno-types/src/lib.rs'
+sh_run 'cargo build -p zuno-types 2>&1 | tee /tmp/t1-unsafe.log; exit ${PIPESTATUS[0]}'
 sh_run 'grep -c "usage of an .unsafe. block" /tmp/t1-unsafe.log; echo "occurrences of the expected error (expect 1)"'
 
 section "QA FAILURE — revert, and the workspace builds clean again"
-sh_run 'rm -f crates/oc-types/src/bad.rs
-printf "%s\n" "//! Wire and domain types shared across the workspace (sessions, messages, parts, tool payloads)." > crates/oc-types/src/lib.rs
-echo "--- crates/oc-types/src/ ---"; ls crates/oc-types/src/
-echo "--- crates/oc-types/src/lib.rs ---"; cat crates/oc-types/src/lib.rs'
+sh_run 'rm -f crates/zuno-types/src/bad.rs
+printf "%s\n" "//! Wire and domain types shared across the workspace (sessions, messages, parts, tool payloads)." > crates/zuno-types/src/lib.rs
+echo "--- crates/zuno-types/src/ ---"; ls crates/zuno-types/src/
+echo "--- crates/zuno-types/src/lib.rs ---"; cat crates/zuno-types/src/lib.rs'
 sh_run 'cargo build --workspace 2>&1 | tee /tmp/t1-rebuild.log; exit ${PIPESTATUS[0]}'
 sh_run 'grep -icE "^(warning|error)" /tmp/t1-rebuild.log; echo "warning/error lines after revert (expect 0)"'
 

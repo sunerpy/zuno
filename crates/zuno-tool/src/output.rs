@@ -1,0 +1,455 @@
+//! What a tool returns, and how oversized output is detected and preserved.
+//!
+//! # Scope
+//!
+//! This module **detects** that output exceeds the configured thresholds and
+//! reports the verdict alongside the limits that produced it. It does not decide
+//! what the model is shown as a result. That decision — refuse and offer the
+//! `accept_large_output` opt-in, rather than hand back a silently truncated prefix
+//! — belongs to the output-policy layer (todo 72), and nothing here may presume it.
+//! Two layers asserting the same policy is how the two behaviours end up
+//! contradicting each other; measurement and policy are split so exactly one place
+//! owns the answer.
+//!
+//! # Matching the oracle's arithmetic
+//!
+//! [`measure`] reproduces `tool-output-store.ts`'s counting exactly, because a
+//! disagreement means output that the TypeScript binary stores and this one does
+//! not, or the reverse:
+//!
+//! - lines are `'\n'` occurrences plus one, so `""` is one line and `"a\n"` is two;
+//! - bytes are UTF-8 bytes (`Buffer.byteLength(text, "utf-8")`), not chars;
+//! - either limit alone being exceeded is enough.
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use zuno_config::schema::ToolOutputConfig;
+
+/// Lines of output before it is considered oversized. `tool-output-store.ts:13`.
+pub const DEFAULT_MAX_LINES: usize = 2_000;
+
+/// Bytes of output before it is considered oversized. `50 * 1024`, `:14`.
+pub const DEFAULT_MAX_BYTES: usize = 51_200;
+
+/// The metadata key recording where full output was persisted.
+///
+/// Named for the oracle's persisted tool state, which carries `outputPaths` as an
+/// array (`session/message-updater.ts:313`). An array because a single result can
+/// spill more than once over its lifetime, and because the reader is the oracle's
+/// own shape.
+pub const METADATA_OUTPUT_PATHS_KEY: &str = "outputPaths";
+
+/// A file a tool produced alongside its text.
+///
+/// The oracle types these as `Omit<FilePart, "id" | "sessionID" | "messageID">`
+/// (`tool.ts:52`): the three identifiers are assigned when the part is persisted,
+/// so a tool never supplies them.
+///
+/// `source` stays a [`Value`]. It is the `FileSource | SymbolSource` union owned by
+/// the message-part layer; re-declaring it here would be a second copy of a type
+/// this crate does not own, and it is pass-through payload rather than anything
+/// this crate reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename = "file")]
+pub struct Attachment {
+    /// The media type, spelled `mime` on the wire.
+    pub mime: String,
+    /// The display name, when there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    /// Where the bytes are: a `file://` path or a data URL.
+    pub url: String,
+    /// Provenance for a citation, when the producer knows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<Value>,
+}
+
+impl Attachment {
+    /// An attachment with no filename and no source.
+    #[must_use]
+    pub fn new(mime: impl Into<String>, url: impl Into<String>) -> Self {
+        Self {
+            mime: mime.into(),
+            filename: None,
+            url: url.into(),
+            source: None,
+        }
+    }
+}
+
+/// The result of a successful tool execution.
+///
+/// Mirrors the oracle's `ExecuteResult` (`tool.ts:48-53`) field for field: a `title`
+/// for the transcript, the `output` the model reads, free-form `metadata`, and any
+/// `attachments`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolOutput {
+    /// The one-line summary shown in the transcript.
+    pub title: String,
+    /// The text handed to the model.
+    pub output: String,
+    /// Tool-specific detail for renderers and later turns.
+    #[serde(default)]
+    pub metadata: Map<String, Value>,
+    /// Files produced by this call.
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
+}
+
+impl ToolOutput {
+    /// Text output with no metadata and no attachments.
+    #[must_use]
+    pub fn text(title: impl Into<String>, output: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            output: output.into(),
+            metadata: Map::new(),
+            attachments: Vec::new(),
+        }
+    }
+
+    /// Adds one metadata entry, chaining.
+    #[must_use]
+    pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.metadata.insert(key.into(), value.into());
+        self
+    }
+
+    /// Adds one attachment, chaining.
+    #[must_use]
+    pub fn with_attachment(mut self, attachment: Attachment) -> Self {
+        self.attachments.push(attachment);
+        self
+    }
+
+    /// Measures this output against `limits`.
+    #[must_use]
+    pub fn measure(&self, limits: OutputLimits) -> SizeMeasurement {
+        measure(&self.output, limits)
+    }
+
+    /// Appends a persisted-output path to [`METADATA_OUTPUT_PATHS_KEY`].
+    ///
+    /// Bookkeeping, not policy: it records where the full text can be found and says
+    /// nothing about what the model is shown. Existing entries are preserved, and a
+    /// key holding a non-array is replaced, since no reader could use it.
+    pub fn record_output_path(&mut self, path: &std::path::Path) {
+        let entry = Value::String(path.to_string_lossy().into_owned());
+        match self.metadata.get_mut(METADATA_OUTPUT_PATHS_KEY) {
+            Some(Value::Array(paths)) => paths.push(entry),
+            Some(_) | None => {
+                self.metadata.insert(
+                    METADATA_OUTPUT_PATHS_KEY.to_owned(),
+                    Value::Array(vec![entry]),
+                );
+            }
+        }
+    }
+
+    /// The persisted-output paths recorded on this result, in the order added.
+    #[must_use]
+    pub fn output_paths(&self) -> Vec<&str> {
+        self.metadata
+            .get(METADATA_OUTPUT_PATHS_KEY)
+            .and_then(Value::as_array)
+            .map(|paths| paths.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default()
+    }
+}
+
+/// The thresholds above which output is oversized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputLimits {
+    /// Maximum lines, inclusive.
+    pub max_lines: usize,
+    /// Maximum UTF-8 bytes, inclusive.
+    pub max_bytes: usize,
+}
+
+impl Default for OutputLimits {
+    fn default() -> Self {
+        Self {
+            max_lines: DEFAULT_MAX_LINES,
+            max_bytes: DEFAULT_MAX_BYTES,
+        }
+    }
+}
+
+impl OutputLimits {
+    /// Resolves limits from configuration, defaulting each field independently.
+    ///
+    /// The oracle applies its defaults with per-field `??` at read time
+    /// (`tool-output-store.ts:126`) rather than at parse time, so a config that sets
+    /// only `max_lines` keeps the default `max_bytes`. Both keys and the block itself
+    /// are optional, which is why every level here is an `Option`.
+    #[must_use]
+    pub fn from_config(config: Option<&ToolOutputConfig>) -> Self {
+        let widen =
+            |value: std::num::NonZeroU32| usize::try_from(value.get()).unwrap_or(usize::MAX);
+        Self {
+            max_lines: config
+                .and_then(|c| c.max_lines)
+                .map_or(DEFAULT_MAX_LINES, widen),
+            max_bytes: config
+                .and_then(|c| c.max_bytes)
+                .map_or(DEFAULT_MAX_BYTES, widen),
+        }
+    }
+}
+
+/// Which threshold a measurement crossed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitExceeded {
+    /// Too many lines; the byte count is within its limit.
+    Lines,
+    /// Too many bytes; the line count is within its limit.
+    Bytes,
+    /// Both thresholds crossed.
+    Both,
+}
+
+/// Whether output fits.
+///
+/// Deliberately not `bool`: a caller reporting *why* output was withheld needs to
+/// name the threshold, and reconstructing it from the numbers at the reporting site
+/// is how the reported reason drifts from the decided one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeVerdict {
+    /// Within both thresholds.
+    WithinLimits,
+    /// Over at least one threshold.
+    Oversized(LimitExceeded),
+}
+
+impl SizeVerdict {
+    /// Whether this verdict is over a threshold.
+    #[must_use]
+    pub fn is_oversized(self) -> bool {
+        match self {
+            Self::WithinLimits => false,
+            Self::Oversized(_) => true,
+        }
+    }
+}
+
+/// A size verdict together with the numbers and limits that produced it.
+///
+/// Carries the limits so a caller can state the threshold it applied without
+/// re-reading configuration, which is the only way the number in a message and the
+/// number in the decision are guaranteed to be the same one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SizeMeasurement {
+    /// Lines counted, `'\n'` occurrences plus one.
+    pub lines: usize,
+    /// UTF-8 bytes counted.
+    pub bytes: usize,
+    /// The thresholds applied.
+    pub limits: OutputLimits,
+    /// The verdict.
+    pub verdict: SizeVerdict,
+}
+
+impl SizeMeasurement {
+    /// Whether the measured text is over a threshold.
+    #[must_use]
+    pub fn is_oversized(&self) -> bool {
+        self.verdict.is_oversized()
+    }
+}
+
+/// Measures text against `limits` without altering it.
+///
+/// Returns the counts, the limits and the verdict. It never truncates, never
+/// allocates a preview, and never decides what a caller should do about the answer.
+#[must_use]
+pub fn measure(text: &str, limits: OutputLimits) -> SizeMeasurement {
+    let lines = line_count(text);
+    let bytes = text.len();
+    let over_lines = lines > limits.max_lines;
+    let over_bytes = bytes > limits.max_bytes;
+    let verdict = match (over_lines, over_bytes) {
+        (false, false) => SizeVerdict::WithinLimits,
+        (true, false) => SizeVerdict::Oversized(LimitExceeded::Lines),
+        (false, true) => SizeVerdict::Oversized(LimitExceeded::Bytes),
+        (true, true) => SizeVerdict::Oversized(LimitExceeded::Both),
+    };
+    SizeMeasurement {
+        lines,
+        bytes,
+        limits,
+        verdict,
+    }
+}
+
+/// `'\n'` occurrences plus one, matching `tool-output-store.ts:105-109`.
+#[must_use]
+pub fn line_count(text: &str) -> usize {
+    text.bytes().filter(|byte| *byte == b'\n').count() + 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroU32;
+    use std::path::Path;
+
+    fn limits(max_lines: usize, max_bytes: usize) -> OutputLimits {
+        OutputLimits {
+            max_lines,
+            max_bytes,
+        }
+    }
+
+    #[test]
+    fn line_count_matches_the_oracles_arithmetic() {
+        assert_eq!(line_count(""), 1);
+        assert_eq!(line_count("a"), 1);
+        assert_eq!(line_count("a\n"), 2);
+        assert_eq!(line_count("a\nb"), 2);
+        assert_eq!(line_count("\n\n"), 3);
+    }
+
+    #[test]
+    fn bytes_are_utf8_bytes_not_characters() {
+        // Four CJK characters are twelve UTF-8 bytes. Counting chars would let
+        // output three times over a byte budget through.
+        let text = "工具输出";
+        assert_eq!(text.chars().count(), 4);
+
+        let measurement = measure(text, limits(10, 8));
+
+        assert_eq!(measurement.bytes, 12);
+        assert_eq!(
+            measurement.verdict,
+            SizeVerdict::Oversized(LimitExceeded::Bytes)
+        );
+    }
+
+    #[test]
+    fn verdict_names_which_threshold_was_crossed() {
+        assert_eq!(
+            measure("a\nb\nc", limits(2, 1_000)).verdict,
+            SizeVerdict::Oversized(LimitExceeded::Lines)
+        );
+        assert_eq!(
+            measure("abcdef", limits(1_000, 3)).verdict,
+            SizeVerdict::Oversized(LimitExceeded::Bytes)
+        );
+        assert_eq!(
+            measure("a\nb\nc", limits(2, 3)).verdict,
+            SizeVerdict::Oversized(LimitExceeded::Both)
+        );
+        assert_eq!(
+            measure("a\nb", limits(2, 3)).verdict,
+            SizeVerdict::WithinLimits
+        );
+    }
+
+    #[test]
+    fn limits_are_inclusive() {
+        // Exactly at the limit fits; the oracle compares with `<=`.
+        let measurement = measure("a\nb", limits(2, 3));
+        assert_eq!(measurement.lines, 2);
+        assert_eq!(measurement.bytes, 3);
+        assert!(!measurement.is_oversized());
+    }
+
+    #[test]
+    fn measurement_reports_the_limits_it_applied() {
+        let applied = limits(7, 11);
+        let measurement = measure("a", applied);
+
+        assert_eq!(measurement.limits, applied);
+    }
+
+    #[test]
+    fn config_defaults_each_field_independently() {
+        assert_eq!(OutputLimits::from_config(None), OutputLimits::default());
+        assert_eq!(OutputLimits::default().max_lines, 2_000);
+        assert_eq!(OutputLimits::default().max_bytes, 51_200);
+
+        let only_lines = ToolOutputConfig {
+            max_lines: NonZeroU32::new(10),
+            max_bytes: None,
+        };
+        let resolved = OutputLimits::from_config(Some(&only_lines));
+        assert_eq!(resolved.max_lines, 10);
+        assert_eq!(resolved.max_bytes, DEFAULT_MAX_BYTES);
+
+        let both = ToolOutputConfig {
+            max_lines: NonZeroU32::new(10),
+            max_bytes: NonZeroU32::new(20),
+        };
+        assert_eq!(OutputLimits::from_config(Some(&both)), limits(10, 20),);
+    }
+
+    #[test]
+    fn output_paths_accumulate_in_order() {
+        let mut output = ToolOutput::text("bash", "hello");
+        assert!(output.output_paths().is_empty());
+
+        output.record_output_path(Path::new("/data/tool-output/tool_a"));
+        output.record_output_path(Path::new("/data/tool-output/tool_b"));
+
+        assert_eq!(
+            output.output_paths(),
+            vec!["/data/tool-output/tool_a", "/data/tool-output/tool_b"]
+        );
+    }
+
+    #[test]
+    fn output_paths_replaces_a_key_no_reader_could_use() {
+        let mut output =
+            ToolOutput::text("bash", "hello").with_metadata(METADATA_OUTPUT_PATHS_KEY, "oops");
+
+        output.record_output_path(Path::new("/data/tool_a"));
+
+        assert_eq!(output.output_paths(), vec!["/data/tool_a"]);
+    }
+
+    #[test]
+    fn attachment_serializes_to_the_oracles_file_part_shape() {
+        let attachment = Attachment {
+            mime: "image/png".to_owned(),
+            filename: Some("plot.png".to_owned()),
+            url: "file:///tmp/plot.png".to_owned(),
+            source: None,
+        };
+
+        let json = serde_json::to_value(&attachment).expect("serializable");
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "file",
+                "mime": "image/png",
+                "filename": "plot.png",
+                "url": "file:///tmp/plot.png",
+            }),
+            "id, sessionID and messageID are assigned when the part is persisted"
+        );
+    }
+
+    #[test]
+    fn tool_output_round_trips() {
+        let output = ToolOutput::text("read", "contents")
+            .with_metadata("lines", 3)
+            .with_attachment(Attachment::new("text/plain", "file:///a.txt"));
+
+        let json = serde_json::to_string(&output).expect("serializable");
+        let back: ToolOutput = serde_json::from_str(&json).expect("deserializable");
+
+        assert_eq!(back, output);
+    }
+
+    #[test]
+    fn measure_never_alters_the_text_it_measures() {
+        let output = ToolOutput::text("bash", "a\nb\nc\nd");
+        let before = output.output.clone();
+
+        let measurement = output.measure(limits(1, 1));
+
+        assert!(measurement.is_oversized());
+        assert_eq!(output.output, before, "detection must not truncate");
+    }
+}

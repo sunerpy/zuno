@@ -37,7 +37,7 @@ ZUNO_DB="${XDG_DATA_HOME:-$HOME/.local/share}/zuno/zuno.db" zuno session list
 
 `ZUNO_DISABLE_CHANNEL_DB` is matched **case-sensitively** against exactly `1`
 or `true`. `TRUE`, `yes`, and `on` do nothing —
-`crates/oc-paths/src/files.rs::disable_channel_db_forces_the_unsuffixed_name_case_sensitively`
+`crates/zuno-paths/src/files.rs::disable_channel_db_forces_the_unsuffixed_name_case_sensitively`
 pins that.
 
 Confirm which file you are on before concluding anything:
@@ -109,7 +109,7 @@ contract. Keep the backup before allowing any version to migrate the file.
 
 ## The 38 migrations
 
-Generated from `oc_db::migration::MIGRATION_IDS`, in execution order.
+Generated from `zuno_db::migration::MIGRATION_IDS`, in execution order.
 `CURRENT_VERSION` equals this list's length; the documentation gate asserts that,
 so adding a migration without documenting it fails.
 
@@ -159,7 +159,7 @@ so adding a migration without documenting it fails.
 Regenerate with:
 
 ```sh
-OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs
+OC_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
 ```
 
 ## Configuration that is rejected rather than reinterpreted

@@ -50,7 +50,7 @@ ZUNO_VERSION=0.1.0 ZUNO_INSTALL_DIR=/usr/local/bin \
 ```
 
 也可以从 [GitHub Releases](https://github.com/sunerpy/zuno/releases) 下载对应平台的预编译归档，
-或在克隆仓库后运行 `cargo install --path crates/oc-cli --locked` 从源码安装。
+或在克隆仓库后运行 `cargo install --path crates/zuno-cli --locked` 从源码安装。
 
 ## 快速开始
 
@@ -78,9 +78,9 @@ share URL。两者都是**顶层命令**，不是 `session` 的子命令 —— 
 | [docs/perf-methodology.md](docs/perf-methodology.md) | 内存和活性门禁的测量方法 |
 
 只有 `<!-- generated:BEGIN … -->` 与 `<!-- generated:END … -->` 标记之间的区域从代码生成并由
-`cargo test -p oc-cli --test docs` 做字节级防漂移检查；该测试还针对少量关键章节做派生断言。
+`cargo test -p zuno-cli --test docs` 做字节级防漂移检查；该测试还针对少量关键章节做派生断言。
 标记外的说明性表格与 prose 仍需评审，不能因测试通过就视为已从代码生成。使用
-`OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs` 重新生成受管区域。
+`OC_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs` 重新生成受管区域。
 
 ## 独立运行与插件接入
 
@@ -98,8 +98,8 @@ Zuno 自己 `zuno export` 出的文档。旧路径只会在 oracle fixture、上
 
 该决定已经作出：按整个接口面逐字节比对 Zuno 与已发布 `opencode` 二进制输出的 differential
 suites 已被删除，要求它们的成功准则也一并退役。剩下的比对是逐项具名的验证资产，而不是产品承诺：
-`cargo test -p oc-cli --test cli_parity` 仍会拿每条已实现命令的规范化输出与本机固定版本发布二进制
-对比，`crates/oc-cli/tests/rollback.rs` 与 `crates/oc-testkit/tests/session_interop.rs` 仍会跨两个
+`cargo test -p zuno-cli --test cli_parity` 仍会拿每条已实现命令的规范化输出与本机固定版本发布二进制
+对比，`crates/zuno-cli/tests/rollback.rs` 与 `crates/zuno-testkit/tests/session_interop.rs` 仍会跨两个
 真实程序驱动同一个会话，找不到发布二进制时打印可见的 `SKIPPED`。保留这些测试不等于把跨二进制
 兼容重新定义为产品目标，也不构成新增接管 opencode 会话的能力或旧目录 fallback 的理由。
 
@@ -164,8 +164,8 @@ is the shape being avoided: a 164,552 KiB spread around a median that finished
 spread 决定真实余量，两者的大小关系比任何单个数字更重要。
 
 **G6 的 Windows 部分从未执行。** 上方实测结果来自
-`crates/oc-process/tests/containment.rs`，该文件受 `#![cfg(target_os = "linux")]` 限制。
-Windows Job Object 路径位于 `crates/oc-process/tests/windows_containment.rs`，受
+`crates/zuno-process/tests/containment.rs`，该文件受 `#![cfg(target_os = "linux")]` 限制。
+Windows Job Object 路径位于 `crates/zuno-process/tests/windows_containment.rs`，受
 `#![cfg(windows)]` 限制；它在 Linux 主机上是 **NOT EXECUTED**，不是“跳过但视为通过”，也不能
 由 Linux 结果推断。只有在原生 Windows CI 或 Windows 主机上执行后，才能声明 G6 跨平台通过。
 
@@ -174,22 +174,22 @@ Windows Job Object 路径位于 `crates/oc-process/tests/windows_containment.rs`
 
 ```sh
 # G1 + G2：仅当 mode 为 `run` 时执行。
-OC_MEMORY_GATE_MODE=run cargo test -p oc-testkit --test memory -- --nocapture --test-threads=1
+OC_MEMORY_GATE_MODE=run cargo test -p zuno-testkit --test memory -- --nocapture --test-threads=1
 
 # G3 + G4：真实 driver soak。该测试被 #[ignore]，会占用两个真实 language server、
 # 一个 50,000 文件 watcher、一个 PTY，以及两小时 wall clock。
-OC_MEMORY_GATE_MODE=skip cargo test -p oc-testkit --test soak \
+OC_MEMORY_GATE_MODE=skip cargo test -p zuno-testkit --test soak \
   g3_and_g4_real_driver_soak_stays_bounded_and_live -- \
   --ignored --exact --nocapture --test-threads=1
 
 # G5 与 G6 会在普通套件中运行。
-cargo test -p oc-testkit --test backpressure
-cargo test -p oc-process --test containment
+cargo test -p zuno-testkit --test backpressure
+cargo test -p zuno-process --test containment
 ```
 
 **G2 测试对象已固定，在其他环境复现需要重新捕获。** 实测 session 为
 `ses_2bcaee257ffeFZNJrmtpi3ZglR`（931 条消息、3,620 个 part、105,118,812 part bytes），位于
-一个以 sha256 标识的 2.6 GB 数据库快照中。`crates/oc-testkit/src/perf/subject.rs` 保存该 pin；
+一个以 sha256 标识的 2.6 GB 数据库快照中。`crates/zuno-testkit/src/perf/subject.rs` 保存该 pin；
 发生不匹配时会打印四步重新捕获流程，第四步要求重测 TypeScript 基线，因为测试对象与上限必须
 来自同一次测量。没有该快照的机器会在 pin 校验处失败，而不会测量其他对象并称其为 G2。
 

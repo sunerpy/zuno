@@ -1,0 +1,34 @@
+[package]
+name = "zuno-observability"
+description = "Tracing subscriber setup, log file rotation, and structured span conventions."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# `tracing-subscriber` inherits the workspace's `env-filter` and `fmt` features.
+# Neither `json` nor `local-time` is enabled: the file format is the plain `fmt`
+# format (which prints the span stack inline) and timestamps come from the
+# unconditional `fmt::time::SystemTime` writer, so no extra feature is needed.
+[dependencies]
+zuno-error = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Test-only. `serde_json` is what makes the stdout assertion structural rather than
+# a substring match: every captured stdout line has to *parse* as a protocol frame.
+# `tempfile` gives each test its own log directory, so no test writes to the real
+# `zuno_paths::log()`. `walkdir` powers the source guard in
+# `tests/no_stdout_in_library.rs`.
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+walkdir = { workspace = true }
+
+[lints]
+workspace = true

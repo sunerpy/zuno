@@ -43,7 +43,7 @@ GH_TOKEN="$(gh auth token)" sh -c "$(gh api -H 'Accept: application/vnd.github.r
 
 Set `ZUNO_VERSION` to pin a release or `ZUNO_INSTALL_DIR` to change the destination. You can also
 download a prebuilt archive from [GitHub Releases](https://github.com/sunerpy/zuno/releases), or
-build from source with `cargo install --path crates/oc-cli --locked`.
+build from source with `cargo install --path crates/zuno-cli --locked`.
 
 ## Quick start
 
@@ -71,9 +71,9 @@ session` carries only `list`, `prune`, and `delete`.
 | [Performance methodology](../perf-methodology.md)  | How memory and liveness gates are measured                               |
 
 Only regions delimited by `generated:BEGIN` and `generated:END` comments are generated from code and
-checked byte-for-byte by `cargo test -p oc-cli --test docs`; the test also derives assertions for a
+checked byte-for-byte by `cargo test -p zuno-cli --test docs`; the test also derives assertions for a
 small set of critical sections. Explanatory tables and prose outside those markers still require
-review. Use `OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs` to regenerate managed regions.
+review. Use `OC_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs` to regenerate managed regions.
 
 ## Independent runtime and plugin ABI
 
@@ -91,9 +91,9 @@ They identify the plugin contract, not Zuno itself.
 That decision has since been taken. The whole-surface differential suites that byte-compared
 Zuno's output against a released `opencode` binary are gone, and the success criteria that
 required them are retired. What remains is named, per surface, and is a verification asset rather
-than a product promise: `cargo test -p oc-cli --test cli_parity` still compares every implemented
-command's normalized output against the pinned release, and `crates/oc-cli/tests/rollback.rs` plus
-`crates/oc-testkit/tests/session_interop.rs` still drive one session through both real programs,
+than a product promise: `cargo test -p zuno-cli --test cli_parity` still compares every implemented
+command's normalized output against the pinned release, and `crates/zuno-cli/tests/rollback.rs` plus
+`crates/zuno-testkit/tests/session_interop.rs` still drive one session through both real programs,
 printing a visible `SKIPPED` when that release is absent. Their presence does not make cross-binary
 compatibility a product goal or justify adding legacy-path fallback or adoption of opencode
 sessions.

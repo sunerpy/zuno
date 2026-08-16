@@ -24,7 +24,7 @@ gaps. Five states are used throughout:
 Every table on this page is generated from the code it describes. Regenerate with:
 
 ```sh
-OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs
+OC_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
 ```
 
 ## Declared divergences
@@ -32,15 +32,15 @@ OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs
 <!-- generated:BEGIN divergence-index -->
 | # | id | surface |
 |---:|---|---|
-| 1 | [`session-list-default-sort`](divergences.md#session-list-default-sort) | CLI `session list`; HTTP `GET /api/session`; `oc-db` session listing |
+| 1 | [`session-list-default-sort`](divergences.md#session-list-default-sort) | CLI `session list`; HTTP `GET /api/session`; `zuno-db` session listing |
 | 2 | [`tool-output-filename-carries-session`](divergences.md#tool-output-filename-carries-session) | on-disk `$XDG_DATA_HOME/zuno/tool-output/tool_<session>_<uuidv7>` |
-| 3 | [`no-eager-directory-creation`](divergences.md#no-eager-directory-creation) | process startup; `oc-paths` layout getters |
+| 3 | [`no-eager-directory-creation`](divergences.md#no-eager-directory-creation) | process startup; `zuno-paths` layout getters |
 | 4 | [`split-version-identity`](divergences.md#split-version-identity) | CLI `--version` and `--version --long`; the npm plugin compatibility gate |
 | 5 | [`execute-parameter-contract`](divergences.md#execute-parameter-contract) | tool `execute` — the model-facing parameter schema |
 | 6 | [`c8-maintenance-endpoints`](divergences.md#c8-maintenance-endpoints) | HTTP `GET /api/session/prune`, `POST /api/session/prune` |
 | 7 | [`provider-coverage-by-wire-family`](divergences.md#provider-coverage-by-wire-family) | provider selection for a model whose resolved `api.npm` transport is unknown to this build |
 | 8 | [`cross-session-resident-memory`](divergences.md#cross-session-resident-memory) | system-prompt resident blocks; model-facing `memory` tool; post-response reflection |
-| 9 | [`session-subpath-is-applied`](divergences.md#session-subpath-is-applied) | HTTP `GET /api/session?project=…&subpath=…`; `oc-db` session listing in project scope |
+| 9 | [`session-subpath-is-applied`](divergences.md#session-subpath-is-applied) | HTTP `GET /api/session?project=…&subpath=…`; `zuno-db` session listing in project scope |
 | 10 | [`context-md-excluded`](divergences.md#context-md-excluded) | project instruction cascade — the filename list probed by `findUp` |
 | 11 | [`malformed-auth-json-is-an-error`](divergences.md#malformed-auth-json-is-an-error) | `$XDG_DATA_HOME/zuno/auth.json` — reading the credential store |
 | 12 | [`failed-format-restores-pre-format-bytes`](divergences.md#failed-format-restores-pre-format-bytes) | post-edit formatter execution — the file's bytes after a formatter exits non-zero |
@@ -56,8 +56,8 @@ OC_DOCS_REGENERATE=1 cargo test -p oc-cli --test docs
 A surface that is merely **unimplemented** is not a decision, so it is never an
 entry on [divergences.md](divergences.md). It is recorded here and in the
 compatibility report's `known_gaps` section, which this table is generated from —
-`oc_testkit::compat_report::known_gaps`, the same list
-`crates/oc-testkit/tests/compat_suite.rs` writes into
+`zuno_testkit::compat_report::known_gaps`, the same list
+`crates/zuno-testkit/tests/compat_suite.rs` writes into
 `target/compat/compat-report.json`.
 
 Until plan todo 140 this section did not exist, so every gap lived only in that
@@ -88,19 +88,19 @@ loses and, where one exists, the test that fails if the gap closes or goes stale
 
 **Surface.** the `part` rows one assistant turn persists — the step-boundary parts
 
-**What is missing.** For one plain single-step turn the release persists [step-start, text, step-finish] and this port persists [text], so [step-start, step-finish] is never written. Measured on the `run` path at 1.18.18 in .omo/evidence/task-178-opencode-rust.txt, inside a git repository and outside one; the user's production database holds 280,859 step-start rows, so the release's shape is the normal one rather than an artefact. This is a GAP and not a declared divergence because nothing chose it: `oc-db` already models both types as first-class wire tags (crates/oc-db/src/message.rs:139-142,181-182) and `oc-engine::stream::StreamProjector` already writes upstream's exact shape including the snapshot hashes (crates/oc-engine/src/stream.rs:211-265,869-977), but no production caller reaches it — the live turn path accumulates and then checkpoints only text, reasoning and tool parts (crates/oc-engine/src/loop.rs:1547-1588). An unwired implementation is work outstanding, so declaring it in docs/divergences.toml would dress an omission up as a decision. What a consumer loses: upstream reads `step-finish.cost`/`tokens` to aggregate session usage (packages/core/src/session/projector.ts:36-42,90-108) and takes the first `step-start.snapshot` and last `step-finish.snapshot` as the bounds of a turn's diff (packages/opencode/src/session/summary.ts:82-99), which `revert` then refreshes (packages/opencode/src/session/revert.ts:70-77). Interoperability is unaffected and was measured to be: every assertion in crates/oc-testkit/tests/session_interop.rs holds across this difference in both directions. Witnessed by crates/oc-testkit/tests/session_interop.rs::the_recorded_turn_part_gap_matches_what_a_turn_actually_persists.
+**What is missing.** For one plain single-step turn the release persists [step-start, text, step-finish] and this port persists [text], so [step-start, step-finish] is never written. Measured on the `run` path at 1.18.18 in .omo/evidence/task-178-opencode-rust.txt, inside a git repository and outside one; the user's production database holds 280,859 step-start rows, so the release's shape is the normal one rather than an artefact. This is a GAP and not a declared divergence because nothing chose it: `zuno-db` already models both types as first-class wire tags (crates/zuno-db/src/message.rs:139-142,181-182) and `zuno-engine::stream::StreamProjector` already writes upstream's exact shape including the snapshot hashes (crates/zuno-engine/src/stream.rs:211-265,869-977), but no production caller reaches it — the live turn path accumulates and then checkpoints only text, reasoning and tool parts (crates/zuno-engine/src/loop.rs:1547-1588). An unwired implementation is work outstanding, so declaring it in docs/divergences.toml would dress an omission up as a decision. What a consumer loses: upstream reads `step-finish.cost`/`tokens` to aggregate session usage (packages/core/src/session/projector.ts:36-42,90-108) and takes the first `step-start.snapshot` and last `step-finish.snapshot` as the bounds of a turn's diff (packages/opencode/src/session/summary.ts:82-99), which `revert` then refreshes (packages/opencode/src/session/revert.ts:70-77). Interoperability is unaffected and was measured to be: every assertion in crates/zuno-testkit/tests/session_interop.rs holds across this difference in both directions. Witnessed by crates/zuno-testkit/tests/session_interop.rs::the_recorded_turn_part_gap_matches_what_a_turn_actually_persists.
 
 ### v1-surface-unbacked
 
 **Surface.** 6 of the 20 measured pre-/api (v1) routes the installed plugins actually call
 
-**What is missing.** The pre-/api surface exists because the published SDK sends unprefixed paths, so every resident plugin talks to it. It registers 20 routes, each with a recorded plugin callsite, and 14 do real local work. Ten adapters reuse the corresponding /api implementations for app.agents, provider.list, session.list, session.create, session.get, session.abort, session.summarize, session.messages, session.prompt and session.promptAsync. Three local authentication backends persist auth.set credentials and invoke the installed provider OAuth authorize/callback closures. POST /tui/show-toast remains a recording sink rather than a display — no server entry point attaches a forwarder (crates/oc-server/src/main.rs and crates/oc-cli/src/cmd/serve.rs both build a bare CompatV1State::new). 6 of the 20 answer `501 not_implemented`. 0 of those 6 name a served /api alternative; the other 6 have no served /api spelling at all — app.log, config.get, session.status, session.update, session.children and session.todo — so a plugin that needs one has no working call today. The installed auth plugins' measured authentication routes are served; the remaining gaps are non-authentication operations. This is a GAP and not a declared divergence because nothing chose it, and docs/divergences.toml:11-14 forbids recording an unimplemented surface as a decision. Witnessed by crates/oc-server/tests/compat_v1.rs::compat_v1_declared_backing_matches_what_the_router_answers, which drives every route and fails if a declared status disagrees with what the router answers.
+**What is missing.** The pre-/api surface exists because the published SDK sends unprefixed paths, so every resident plugin talks to it. It registers 20 routes, each with a recorded plugin callsite, and 14 do real local work. Ten adapters reuse the corresponding /api implementations for app.agents, provider.list, session.list, session.create, session.get, session.abort, session.summarize, session.messages, session.prompt and session.promptAsync. Three local authentication backends persist auth.set credentials and invoke the installed provider OAuth authorize/callback closures. POST /tui/show-toast remains a recording sink rather than a display — no server entry point attaches a forwarder (crates/zuno-server/src/main.rs and crates/zuno-cli/src/cmd/serve.rs both build a bare CompatV1State::new). 6 of the 20 answer `501 not_implemented`. 0 of those 6 name a served /api alternative; the other 6 have no served /api spelling at all — app.log, config.get, session.status, session.update, session.children and session.todo — so a plugin that needs one has no working call today. The installed auth plugins' measured authentication routes are served; the remaining gaps are non-authentication operations. This is a GAP and not a declared divergence because nothing chose it, and docs/divergences.toml:11-14 forbids recording an unimplemented surface as a decision. Witnessed by crates/zuno-server/tests/compat_v1.rs::compat_v1_declared_backing_matches_what_the_router_answers, which drives every route and fails if a declared status disagrees with what the router answers.
 
 ### v1-agent-projection-drift
 
 **Surface.** the `Agent` body shape `GET /agent` serves the pre-/api (v1) SDK
 
-**What is missing.** The projection serves three keys the oracle `Agent` schema does not declare — builtIn, maxSteps and tools, against a schema with additionalProperties:false — and omits six it declares as optional: hidden, native, steps, temperature, topP and variant. maxSteps against the oracle's steps reads as a rename. What is NOT missing is any required key: all four of name, mode, permission and options are served, so no v1 caller reads a promised field and gets nothing. That is the line between this and the `Session` slug omission the same review wave found, which was a defect because the dropped key was required by the oracle AND by the OpenAPI this build publishes at /doc, making the build contradict itself. Here the build publishes no `Agent` schema at all. The committed 1.18.18 oracle capture is byte-identical to the live `/doc` recapture, so this optional-key drift is confirmed against the current executable pin. It remains a gap, not a declared divergence, because no implementation decision chose the difference; docs/divergences.toml:11-14 forbids recording an omission as a decision. Witnessed by crates/oc-server/tests/compat_v1.rs::compat_v1_agent_projection_residual_drift_matches_pinned_capture_and_drops_no_required_key, which measures the served key set against the oracle schema and fails if a required key is ever dropped or if this build starts publishing an `Agent` schema of its own — either event ends the reason recorded here.
+**What is missing.** The projection serves three keys the oracle `Agent` schema does not declare — builtIn, maxSteps and tools, against a schema with additionalProperties:false — and omits six it declares as optional: hidden, native, steps, temperature, topP and variant. maxSteps against the oracle's steps reads as a rename. What is NOT missing is any required key: all four of name, mode, permission and options are served, so no v1 caller reads a promised field and gets nothing. That is the line between this and the `Session` slug omission the same review wave found, which was a defect because the dropped key was required by the oracle AND by the OpenAPI this build publishes at /doc, making the build contradict itself. Here the build publishes no `Agent` schema at all. The committed 1.18.18 oracle capture is byte-identical to the live `/doc` recapture, so this optional-key drift is confirmed against the current executable pin. It remains a gap, not a declared divergence, because no implementation decision chose the difference; docs/divergences.toml:11-14 forbids recording an omission as a decision. Witnessed by crates/zuno-server/tests/compat_v1.rs::compat_v1_agent_projection_residual_drift_matches_pinned_capture_and_drops_no_required_key, which measures the served key set against the oracle schema and fails if a required key is ever dropped or if this build starts publishing an `Agent` schema of its own — either event ends the reason recorded here.
 
 ### openapi-body-schema-bindings
 
@@ -136,8 +136,8 @@ Reflection must not learn any of these negative cases:
 
 ## CLI commands
 
-Derived from `oc_cli::dispositions()` — the same table
-`crates/oc-cli/tests/surface.rs::surface_registered_commands_match_their_dispositions`
+Derived from `zuno_cli::dispositions()` — the same table
+`crates/zuno-cli/tests/surface.rs::surface_registered_commands_match_their_dispositions`
 asserts against the registered `clap` tree, and
 `surface_every_upstream_command_has_exactly_one_disposition` asserts against a
 committed capture of upstream 1.18.13's command symbols. So a command that gains
@@ -155,7 +155,7 @@ as identifiers for the work that owns a surface, not as anything a user needs.
 <!-- generated:BEGIN cli-disposition -->
 | upstream symbol | command | disposition | why |
 |---|---|---|---|
-| `AcpCommand` | `acp` | not-registered | todo 78 owns the oc-acp protocol adapter; registering it before that handler exists would advertise a server that cannot speak ACP |
+| `AcpCommand` | `acp` | not-registered | todo 78 owns the zuno-acp protocol adapter; registering it before that handler exists would advertise a server that cannot speak ACP |
 | `AgentCommand` | `agent` | implemented | registered through the headless-command seam for todo 56 |
 | `AttachCommand` | `attach` | not-registered | attach requires the TUI client and terminal lifecycle owned by the TUI wave; no headless substitute is equivalent |
 | `ConsoleCommand` | `console` | rejected | the hosted OpenCode Console is excluded from Zuno's local-agent scope; use `providers` (alias `auth`) for local credentials instead |
@@ -171,10 +171,10 @@ as identifiers for the work that owns a surface, not as anything a user needs.
 | `PrCommand` | `pr` | rejected | the GitHub checkout helper is excluded from the local-agent runtime; use `gh pr checkout <number>` and then `zuno run` instead |
 | `ProvidersCommand` | `providers` | implemented | registered with the upstream `auth` alias through the headless-command seam for todo 56 |
 | `RunCommand` | `run` | implemented | registered through the headless-command seam for todo 56 |
-| `ServeCommand` | `serve` | implemented | registered through the headless-command seam; todo 56 wraps oc-server's public builder rather than duplicating its server logic |
+| `ServeCommand` | `serve` | implemented | registered through the headless-command seam; todo 56 wraps zuno-server's public builder rather than duplicating its server logic |
 | `SessionCommand` | `session` | implemented | registered through the headless-command seam for todo 56 and session maintenance todos 80-85 |
 | `StatsCommand` | `stats` | rejected | upstream stats reads the excluded stats package's session SQL directly; use `db stats` from todo 84 instead |
-| `TuiThreadCommand` | `tui` | implemented | registered as `tui` and as the bare invocation upstream spells `$0`; it boots oc-tui's application over the terminal lease from todo 73 and the views from todo 76 |
+| `TuiThreadCommand` | `tui` | implemented | registered as `tui` and as the bare invocation upstream spells `$0`; it boots zuno-tui's application over the terminal lease from todo 73 and the views from todo 76 |
 | `UninstallCommand` | `uninstall` | rejected | self-uninstallation is excluded from the runtime; remove `zuno` with the package manager or installer that placed it |
 | `UpgradeCommand` | `upgrade` | rejected | the TypeScript self-updater cannot safely replace this Rust artifact and is excluded; install the desired release through the Rust release installer instead |
 | `WebCommand` | `web` | rejected | the bundled hosted web application is excluded from this headless Rust scope; use `serve` and connect a supported client instead |
@@ -182,7 +182,7 @@ as identifiers for the work that owns a surface, not as anything a user needs.
 
 ## HTTP `/api` operations
 
-Derived by set-differencing the document `oc_server::api::openapi()` serves
+Derived by set-differencing the document `zuno_server::api::openapi()` serves
 against the committed capture of the pinned 1.18.18 release's document
 (`.omo/fixtures/oracle-openapi-1.18.18.json`), then probing each served route
 through the real router and recording which explicitly answer
@@ -274,15 +274,15 @@ responses.
 
 ## v1 plugin compatibility routes
 
-Derived from `oc_server::V1_SURFACE`. This is **not** upstream's full v1 surface:
+Derived from `zuno_server::V1_SURFACE`. This is **not** upstream's full v1 surface:
 it is the set of routes the installed JavaScript plugins were measured calling,
-each carrying its callsite evidence. `crates/oc-server/tests/compat_v1.rs`
+each carrying its callsite evidence. `crates/zuno-server/tests/compat_v1.rs`
 asserts every route has a recorded callsite and that none answers 404.
 
 <!-- generated:BEGIN v1-summary -->
 **20 v1 routes** are registered from measured installed-plugin callsites. A route with no recorded callsite is scope creep, and a test fails on it.
 
-Registering a route is not the same as backing it: **14 of the 20 do real local work**, while **6 of the 20 answer `501 not_implemented`**. 0 of those 6 name a served `/api` alternative; the other 6 have no served `/api` spelling here. The generated route table below names every backing. The installed auth plugins' `auth.set` and provider OAuth routes are served; the remaining gaps are non-authentication operations. These figures come from `oc_server::v1_coverage()`, which counts the same route and backend tables the server mounts.
+Registering a route is not the same as backing it: **14 of the 20 do real local work**, while **6 of the 20 answer `501 not_implemented`**. 0 of those 6 name a served `/api` alternative; the other 6 have no served `/api` spelling here. The generated route table below names every backing. The installed auth plugins' `auth.set` and provider OAuth routes are served; the remaining gaps are non-authentication operations. These figures come from `zuno_server::v1_coverage()`, which counts the same route and backend tables the server mounts.
 <!-- generated:END v1-summary -->
 
 <!-- generated:BEGIN v1-routes -->
@@ -312,24 +312,24 @@ Registering a route is not the same as backing it: **14 of the 20 do real local 
 
 ## Surfaces compared differentially
 
-`crates/oc-testkit/tests/compat_suite.rs` used to write a per-surface verdict to
+`crates/zuno-testkit/tests/compat_suite.rs` used to write a per-surface verdict to
 `target/compat/compat-report.json`. That suite is **deleted** and nothing writes
 that file any more, so this section no longer points at it — a page telling a
 reader to run a test that does not exist is worse than a page that says what is
 actually asserted.
 
 The `known_gaps` half of that report was moved into
-`oc_testkit::compat_report::known_gaps`, which renders the generated
+`zuno_testkit::compat_report::known_gaps`, which renders the generated
 [Known gaps](#known-gaps) table above. So a gap is now published in a committed
 document rather than in an artifact nobody commits, and it is checked by:
 
 ```sh
-cargo test -p oc-cli --test docs
+cargo test -p zuno-cli --test docs
 ```
 
 What remains of the comparison is per-surface and named. Every implemented CLI
 command's normalized exit status, stdout and stderr are compared against the
-installed pinned release by `cargo test -p oc-cli --test cli_parity`, whose
+installed pinned release by `cargo test -p zuno-cli --test cli_parity`, whose
 exemption floor is frozen by name and whose every exemption must keep a two-sided
 witness. Three surfaces are deliberately **never** compared, and each says so
 where it lives: live provider wire bytes (the harness has no HTTP client by
