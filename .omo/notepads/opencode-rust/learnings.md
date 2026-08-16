@@ -7622,3 +7622,62 @@ canary 验证本身是对的——只是撤销方式错了。
 `crates/zuno-cli/tests/docs.rs` 又按字面断言 README 与 docs 内容——"仅目录"和
 "仅代码不含文档"的提交都过不了 gate。想拆分要先确认拆出来的每一半各自能过 gate，
 否则单个原子提交才是诚实的选择。
+
+## Task r12 — "ready" 不等于"fork 完成"，以及 env 改名的两个真实陷阱
+
+**`wait_for_ready` 返回 ≠ 进程树建好了，这两个条件之间没有任何同步。**
+`crates/zuno-testkit/tests/backpressure.rs` 的 G6 两个 reaping 测试在
+`wait_for_ready` 之后立刻采样进程树并断言 `>= 33`，CI run 31929364100 在
+CodeBuild 上只拿到 27 个 pid 而失败，重跑即过，本机 3/3 通过、每次 0.22-0.30s，
+同一测试在 runner 上耗时 24s。差额正好可以算出来：每个受 guard 保护的 host 是
+4 进程链（`supervise` guard → `monitor` guard → host → grandchild），而
+`PtyService::create` 只等最外层 guard spawn 就返回，2 个 PTY session 各欠 3 个
+pid = 6，33 − 6 = **27**，与 CI 数字逐一吻合。lsp/mcp/plugin 三类不漏，是因为它们
+的 handshake 要求子进程先应答，而 `spawn_grandchild()` 在应答循环之前执行，所以
+parent 写 `ready` 时它们的孙进程必然已存在。**只有 PTY 这条路径没有任何回执。**
+
+**修法是补同步，不是降阈值。** 阈值 33 是"完整拓扑"的定义，降到慢机器恰好能到的
+数字，会让 reaping 断言跑在一棵从没建完的树上——这个 gate 存在的唯一目的就是证明
+`parent_sigkill` 能回收*整棵*树。改成有界轮询（复用同文件 `wait_for_ready` 的
+`REAP_TIMEOUT` + 10ms 睡眠模式），并让超时消息区分"fork 没建完"和"reap 没回收干净"：
+原消息只说 "tree is incomplete"，把两种完全不同的缺陷混成一句话。
+
+**证明race修好而不是藏起来，用"同一注入、两种实现"对照。** 只跑一遍通过什么都不能
+说明——它本来在本机就通过。做法：在 fixture 的 `run_sleeping_child`（PTY 模式）
+`spawn_grandchild()` 之前注入 `sleep(3s)`，确定性地制造 31/33 的欠额，然后
+- 轮询版：2 passed，**耗时 9.67s**（正常 0.3s）——它真的等了；
+- 把超时上界临时改成 `Duration::ZERO` 复现旧的立即断言：**2 FAILED，0.31s**，
+  消息为 "31 PIDs … incomplete fork, not an incomplete reap"。
+两个注入都要撤销，且撤销前先 `cp` 备份（不要 `git checkout --`，见 Task 上一节）。
+补充独立验证：不改代码、用 96 个忙循环把 32 核的 load average 压到 105，测试
+5.27s 通过（正常 0.3s），轮询把真实竞争吸收掉了。
+
+**`ZUNO_ENV_NAME_MAP` 只接受 `OPENCODE_* → ZUNO_*`，`OC_*` 不能进这张表。**
+`crates/zuno-paths/src/env.rs` 的 pin 测试
+`every_project_owned_name_accepts_only_its_zuno_spelling` 断言
+`internal.starts_with("OPENCODE_")` 且 `external.starts_with("ZUNO_")`，共 66 条。
+那张表的语义是"上游继承来的名字，旧拼写要被拒绝"；`OC_*` 是本项目自己发明的
+开发期开关，仓库外无人设置（`.github/`、`Makefile`、`scripts/` 全部 grep 干净），
+所以是**直接改名、不留兼容路径**，不是加映射。判断依据不是前缀长得像，而是
+"这个名字有没有外部设置者"。
+
+**`OC_MODEL → ZUNO_MODEL` 是一次真实的命名碰撞，不能机械替换。**
+`ZUNO_MODEL` 已经是 `OPENCODE_MODEL` 的对外拼写（env.rs:127），而 `OC_MODEL`
+在 `zuno-config` 里只是变量替换测试的**样本变量名**，还出现在
+`variable.rs:126` 的公开 rustdoc 例子里。机械改名会让 doctest 读成
+"Zuno 通过 `{env:ZUNO_MODEL}` 读取模型"——两套机制被缝成一句半真话。
+改为 `ZUNO_SAMPLE_MODEL`。**批量 env 改名前先把目标名字与既有 env 全集对一遍碰撞。**
+
+**fixture 与 host 必须同一个提交改完，否则得到一个"通过但不再测试任何东西"的测试。**
+`OC_EXAMPLE_*` 6 个名字横跨 `examples/rust_plugin.rs`（被 spawn 的 fixture 二进制）
+与 `crates/zuno-plugin/tests/{jsonrpc,integration}.rs`（设置 env 的 host）；
+`OC_JS_HOST_{PORT,TOKEN}` 横跨 `js/host.rs` 与 `js/shim.mjs`。只改一侧，fixture
+会静默走默认分支，测试照样绿。
+
+**改名会让"为什么用这个前缀"的旧注释变成假话，要一并重写。**
+`zuno-log-probe.rs` 原注释说 `OC_PROBE_*` "deliberately not in the `OPENCODE_*`
+namespace… configure this test fixture, not the product"——改成 `ZUNO_PROBE_*`
+后它就与产品共享前缀了，理由的前半段不再成立。改名清单之外还要扫一遍"解释前缀选择"
+的散文。同理 `oracle.rs:844` 提到的 `OC_TESTKIT_ALLOW_MISSING_ORACLE` 是**已删除**
+机制的历史拼写（无任何代码读它），改名会伪造历史记录，所以保留原拼写并在散文里
+标注"since-removed / 不再指向本 crate 读取的任何东西"。

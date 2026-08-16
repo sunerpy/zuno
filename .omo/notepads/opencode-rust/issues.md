@@ -8980,3 +8980,28 @@ it to .../zuno-local.db before continuing"。这是 `zuno-paths` 的 legacy DB �
 `auth.json` 复制进去**——凭据也存在 data root 下，只换 data home 会变成 401
 `Incorrect API key provided`，那不是配置坏了。这个遗留文件仍在用户家目录里，下一个
 在真机上跑 `zuno` 的人会再撞一次，建议由所有者决定是改名还是删除。
+
+## Task r12 — 残留与后续需要注意的点
+
+**`OC_TESTKIT_ALLOW_MISSING_ORACLE` 是全仓唯一保留的 `OC_` 字符串，且是故意的。**
+位置 `crates/zuno-testkit/src/oracle.rs:844`，只出现在描述一个**已删除**要求的
+散文里，没有任何代码读取它。改名会让历史记录变成假的（当年那个变量的字面拼写就是
+`OC_`）。已在原句标注 "since-removed … no longer names anything this crate reads"。
+**下一个做 `grep -rn OC_` 清扫的人：这不是漏项，不要改。**
+
+**`zuno-log-probe.rs` 环境表里的 `OPENCODE_LOG_LEVEL` / `OPENCODE_PRINT_LOGS`
+没有动，但它们的对外拼写准确性没有被本任务验证。** 那两行写着 "read by the library
+under test"，而这两个名字在 `ZUNO_ENV_NAME_MAP` 里是**内部**拼写，对外只接受
+`ZUNO_LOG_LEVEL` / `ZUNO_PRINT_LOGS`。probe 二进制通过 `LogConfig::from_env`
+读取，是否经过 `accepted_env_name` 我没有追。若结论是"经过"，那张表对一个真的想
+手动运行 probe 的人是错的，应改成 `ZUNO_*`。属于本任务范围外（这两个是 `OPENCODE_*`
+而非 `OC_*`），但相邻，记在这里免得下次又只是路过。
+
+**G6 两个 reaping 测试的耗时从 ~0.3s 变成"取决于机器"。**
+轮询上界是既有的 `REAP_TIMEOUT = 10s`，最坏情况每个测试多等 10s 才失败。实测：
+空载 0.3s、load average 105 时 5.27s。如果将来 CI 上看到它们稳定接近 10s，说明
+fork 风暴真的变慢了（或 host 数量增加了），那时该查的是 fixture 拓扑，不是这个上界。
+
+**`smoke` / `smoke-artifact` 仍然忽略 `CARGO_TARGET_DIR`**（`Makefile:28`
+`TARGET_DIR := target`），本次同样是 unset 后运行，写进了 worktree 内的 `target/`。
+本任务实测 `13 tools offered`、`--version -> 1.18.13`、PASS。
