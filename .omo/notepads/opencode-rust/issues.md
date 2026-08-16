@@ -9180,3 +9180,20 @@ worktree 建在 `3b46b5f` 上。`cargo test --workspace` 实测
 `g2_robustness_prose` 生成的 superseded artefact 链接一直是仓库根相对；在 `README.md`
 里恰好正确，所以从未暴露。生成块一旦搬到子目录就变成死链。已修：`link_prefix` 同时作用于
 主段落与 superseded 段落，并新增链接解析断言（至少 3 条 `../` 链接必须存在于文件系统）。
+## 兼容层网关不回 usage，导致所有 token 展示面永远为空（未修复，provider 侧）
+
+`StreamEvent::TokenUsage` 的四个字段全靠 provider 发；`zuno-provider-compatible/src/stream.rs`
+在 chunk 带 `usage` 时才推事件（:167 chat surface、:433 responses surface）。
+而 OpenAI 兼容的流式补全**默认不返回 usage**，需要请求里带 `stream_options.include_usage`。
+
+实测：给 `request.rs:build_chat` 加上该字段后，`myopenai` 网关（走
+`global.anthropic.claude-haiku-4-5-20251001-v1:0`）依旧不回 usage，TUI 侧栏仍显示
+"no usage reported yet"。因此该改动**无法在本机验证**，已 revert，不留未验证的线路改动。
+
+后续要修的人需要知道：
+- bedrock 走 `eventstream.rs:604/646` 会回 usage，但本机对 nova/claude 都是 404，拿不到权限。
+- 判断"是 provider 缺口还是 TUI 缺口"的最短路径：`zuno run --model X "hi"` 之后查
+  `zuno-engine/src/loop.rs:530` 那四个字段是否被填过，不要从 UI 往回猜。
+- TUI 侧的折叠、累加、百分比都有测试（`views_transcript_folds_provider_token_usage_for_the_ambient_panel`
+  等），逻辑正确；空白是数据没来，不是渲染没接。UI 显示"no usage reported yet"而不是 0，
+  正是为了区分"未测量"和"测得为零"。

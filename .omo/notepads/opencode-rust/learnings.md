@@ -8001,3 +8001,51 @@ opencode 插件，新插件推荐用 Rust（`zuno-plugin-sdk`），并链到 `do
 改成「插件 / 独立运行」后，目录与 `README.en.md` 里那条
 `../../README.md#g1-与-g2--峰值常驻内存` 交叉链接全部失效。用脚本重算三份文档的全部锚点
 （含中文），共校验 46 条链接 0 失效；同时校验每个 `##` 标题都在目录里、目录里没有多余项。
+## r17-solo TUI 重建：落地记录与可复用判据
+
+最终形态：欢迎界面 + 环境侧栏 + 重做的对话渲染 + 四个可达的选择器。
+基线 3500 passed / 213 suites，落地后 3550 / 213，+50 恰好等于新增的 50 个测试
+（welcome 15、ambient 17、message +5、session +10、dialog +2、picker +1）。
+注意：任务书给的 3512 passed / 3 ignored / 219 suites 在本机复现不出来 —— 我在
+**同一个 commit（3b46b5f）上 stash 后重跑基线**，得到的是 3500 / 2 ignored / 213 suites。
+差异不是我引入的；报数前务必自己跑一遍同 commit 基线，不要拿别人报的数字做减法。
+
+### 这一轮抓到的四个"门禁抓不到"的缺陷（都靠实机驱动发现）
+
+1. **模态框不独占键盘**。picker 打开时输入过滤词，字符落进背后的 prompt：
+   每次按键同时做错两件事（没过滤 + 给用户没在写的消息追加文本），Enter 于是
+   选中未过滤时光标所在项。根因在 `DialogHost::handle_event`：未匹配绑定的按键
+   一律转给 base。441 个测试全绿也没抓到——因为没人从"host 之上"喂过普通字符。
+2. **`esc cancel` 是个假承诺**。escape 解析成 `session_interrupt`，SelectDialog
+   不认 → host 吸收 → 只能靠选中才能离开。页脚写着的出路不存在。
+3. **scope 缺失 = 最安静的死键**。`scopes()` 原本只有 input/prompt/messages/app，
+   而 model_list 在 `model` scope、agent_list 在 `agent`、theme_list 在 `theme`、
+   sidebar_toggle 在 `sidebar`、tool_details 在 `tool`、display_thinking 在 `display`。
+   绑定表有行、和弦拼得出、handle_action 有分支，但 KeyDispatcher 按 scope 解析，
+   永远解析不到。**加了 handle_action 分支就以为通了，是本轮最容易犯的错。**
+4. **多步 turn 打五个 `Assistant` 标题**。每步开一条 assistant message，逐条打标题
+   把"一次回复"渲染成五段。标题应只在说话人变化时出现。
+
+### 反向验证是必须的
+`views_dialog_typed_keys_filter_the_dialog_and_never_reach_the_base` 与
+`..._reject_box_can_still_be_typed_into`：把修复用 `if false &&` 注掉后**两个都失败**，
+证明有牙。本仓库有过"guard 冻结了它本该抓的缺陷"的先例，新写的每个 guard 都该这么试一次。
+
+### 视图层的两个新事实
+- `ActionComponent` 新增 `drain_dialogs` / `apply_dialog_outcome`：组件在 DialogHost
+  **之下**，无法自己开对话框；请求携带已构造的 dialog（待选列表在组件手里）。
+- `Dialog` 新增 `handle_typed`：动作来自 KeyDispatcher，未认领按键作为普通事件到达
+  host，两条路径不同。permission 拒绝框 / question 自由文本 / help 过滤框原先都只从
+  动作兜底分支读字符，迁移时**必须保留各自的阶段判断**（question 的 `editing`、
+  permission 的 `Stage::RejectMessage`），否则会在不该收字符的阶段收字符。
+
+### 未达成项与原因（不要当成已完成）
+- **token 统计在本机拿不到真实数字**。折叠逻辑、侧栏、百分比都有测试覆盖并通过，
+  但 `myopenai` 网关在流式响应里不回 `usage`，所以实机永远显示 "no usage reported yet"。
+  我试过在 `request.rs` 给 chat 请求加 `stream_options.include_usage`，网关**照旧不回**，
+  于是这是一处无法验证的线路改动 → 已 revert。bedrock 会回 usage，但本机 404 无模型权限。
+  结论：这是 provider/网关侧的缺口，不是 TUI 侧；UI 如实报告"未收到"而非编数字。
+- `tool_details` 与 `display_thinking` 在绑定表里是 `keys: "none"`（上游 43 个 none 绑定
+  之一，`keybind_tests.rs:229` 钉住这个数字），所以只能通过用户自定义绑定或命令面板触发。
+  路由已打通并有测试，但实机截图只能证明路由存在，不能证明有默认键。
+- 会话切换给的是空列表：无法在不丢弃可能正在运行的 turn 的前提下切会话。
