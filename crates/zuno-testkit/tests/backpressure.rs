@@ -193,6 +193,15 @@ const CHANNELS: &[ChannelGate] = &[
         "zuno-tui/src/views/session.rs",
         "prompts.try_send(text.clone())",
     ),
+    gate(
+        "tui-turn-cancellations",
+        "zuno-cli/src/cmd/tui.rs",
+        "let (cancel_sender, cancel_receiver) = mpsc::channel(CANCEL_CHANNEL_CAPACITY);",
+        "CANCEL_CHANNEL_CAPACITY=1",
+        Policy::CoalesceFull,
+        "zuno-tui/src/views/session.rs",
+        "cancels.try_send(()).is_ok()",
+    ),
     excluded(
         "plugin-wasm-completion",
         "zuno-plugin/src/wasm.rs",
@@ -259,7 +268,7 @@ fn source_channel_inventory_matches_the_declared_registry() {
             .iter()
             .filter(|entry| entry.exclusion.is_none())
             .count(),
-        17
+        18
     );
     assert_eq!(
         CHANNELS

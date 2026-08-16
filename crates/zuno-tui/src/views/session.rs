@@ -226,11 +226,9 @@ impl SessionScreen {
         {
             self.cancel_requested = true;
             self.cancellations += 1;
-            self.transcript
-                .transcript_mut()
-                .push(Message::user(String::from(
-                    "cancelling the turn; press the same key again to exit",
-                )));
+            self.transcript.transcript_mut().push(Message::notice(
+                "cancelling the turn; press the same key again to exit",
+            ));
             return EventResult::REDRAW;
         }
         let _requested = self.shutdown.try_send(TerminalEvent::Shutdown);

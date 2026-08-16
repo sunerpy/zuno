@@ -9087,3 +9087,50 @@ README 与 docs 都不列 target triple。同一提交内同步更新了 `Makefi
 **顺带记录**：README 里 G6 "Windows 部分未执行" 的披露**依然成立**，本次没有改变它。
 Windows leg 现在会跑发布 smoke，但 `crates/zuno-process/tests/windows_containment.rs`
 （`#![cfg(windows)]` 的 Job Object 路径）仍未在任何 Windows CI 上执行。
+
+## task r15（2026-08-17）：TUI 无法退出 / JS 插件默认加载 / 无条件 eprintln 污染 TUI
+
+三个用户报告的缺陷，全部实测确认并修复。
+
+### A. Ctrl+C / Ctrl+D 无法退出 TUI（最严重，用户被困）
+
+* 现象：raw mode 下 SIGINT 已被拿走，两个键都不退出，且**打开 permission 对话框后
+  完全失效**。
+* 真因不是「没有关闭机制」而是**没有任何按键会产出 `TerminalEvent::Shutdown`**，
+  外加 modal 吸收了按键（详见 learnings.md 的和弦判据一节）。
+* 修法：`keybind::is_exit_chord` 按和弦判断退出意图；`DialogHost` 只对这一类
+  被忽略的 action 放行给 base；运行中先接 `SessionControl::abort` 取消、
+  第二次无条件退出；退出键显示在状态条右侧。
+* 已在 tmux 真实终端验证：两键各自 `TUI-EXIT=0`，退出后 `stty` 报
+  `isig icanon echo`。
+
+### B. JS 插件默认加载，占启动耗时 98%
+
+* 实测 `zuno models`（**debug 构建**，各 3 次）：默认 0.10–0.13 s，
+  `ZUNO_ENABLE_JS_PLUGINS=1` 1.32–1.65 s，配置键开启 1.28 s，`--pure` 0.11 s。
+* 改为 opt-in：`ZUNO_ENABLE_JS_PLUGINS=1` 或 `"plugin_runtime": {"javascript": true}`，
+  优先级 `--pure` > env > config > 默认关。门下在**发现之前**。
+* 插件 ABI 未动：`COMPATIBILITY_VERSION`、六个 `OPENCODE_*`、`engines.opencode`、
+  `v1_coverage()` 全部原样。门控的是**是否加载**，不是**怎么对话**。
+* Rust / WASM 插件**不受影响**：WASM 走 `zuno-plugin` 的 `wasm` feature，
+  是独立的 in-process 机制，且当前在 zuno-plugin 之外零生产调用者，
+  完全不经过被门控的 `PluginRuntime::load`。
+* 三个测试族（`plugin_models.rs` / `tool_turn.rs` / `session_mutation.rs` /
+  `tui_turn.rs`）改为显式 opt-in，断言强度未降。新增一条**反向**守卫
+  `auto_discovered_plugins_do_not_load_without_the_explicit_opt_in`：
+  它刻意**不设** `ZUNO_PURE`，以证明拦住加载的是缺失的 opt-in 而不是既有 kill switch。
+
+### C. 无条件 `eprintln!` 污染 TUI
+
+* `zuno-tools/src/registry.rs:67` 的遮蔽诊断改为 `tracing::warn!` + 结构化上抛，
+  由 host 选 surface。**遮蔽依然可见**：headless `run` 打 stderr（原文不变，
+  `tool_turn.rs:1931` 的断言意图原样存活），TUI 画进 transcript 的 `Role::System` 通知。
+* 顺带修掉：`StatusDetail` 此前只有 `--json` 渲染，普通 `run` 看不到 prelude 的任何报告。
+
+### 本次踩到的既有门（**没有削弱，按要求补登记**）
+
+`zuno-testkit/tests/backpressure.rs` 的 `source_channel_inventory_matches_the_declared_registry`
+要求每条生产 channel 都在注册表里声明容量与背压策略。新增的 cancel channel
+起初未登记，该测试如实报红。已按 `Policy::CoalesceFull` 登记
+（容量 1，满即丢弃冗余取消请求，`try_send` 失败落到 shutdown），
+并把 gated 计数 17 → 18。这是一个**设计良好、真的会失败**的门。

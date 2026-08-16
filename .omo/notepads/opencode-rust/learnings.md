@@ -7822,3 +7822,114 @@ Windows leg 从来没真正跑过，于是四个独立缺陷叠在一起，每�
 
 教训：一条从未在 CI 里执行过的路径，它的"支持"是声明而不是事实。四个环境相关缺陷 + 两个
 代码缺陷，全都是在第一次真正运行时一次性掉出来的。
+
+## 「机制齐备但无人触发」的用户侧变体，以及退出意图为何不能按 action 名判断（task r15，2026-08-17）
+
+### 第 12 次「不会失败的门」：这次是用户先发现的
+
+`TerminalEvent::Shutdown` 有枚举成员、有文档、`Dispatch::Shutdown` 有两处
+`return Ok(())`、`app.rs` 还专门算了 `let shutdown = matches!(event, ...)`——整条
+关闭链路建好且被测试覆盖，但**没有任何按键会产出这个事件**。`app.rs` 的
+`other => TerminalEvent::Input(other)` 把 Ctrl+C / Ctrl+D 一律当输入下发，而 TUI
+处于 raw mode，SIGINT 已被拿走，于是用户被困死。
+
+这是本项目重复 11 次的「门不会失败」主题的第 12 例，也是**第一次从用户侧暴露**：
+前 11 次都是测试绿着而生产无调用者（`zuno-goal` 整个 crate 零依赖者最典型），
+这次是关闭机制零触发者。教训不变：**一条从未被真实入口执行过的路径，它的"支持"是
+声明而不是事实**；单元测试断言「按键映射到某个枚举成员」完全不能替代真实终端验证。
+
+同一趟里还抓到一个同族新鲜实例（**由我自己新写出来的**）：新增的
+`Config::javascript_plugins_enabled()` 带 `#[must_use]`、文档写得很足，但零调用者——
+真正的决策点 `JsPluginPolicy::resolve` 里我把同一段查找**内联抄了一遍**。
+处置是让 resolve 调用它，把"缺省即关闭"的定义收敛到一处，而不是删掉其中一份。
+**新增一个"看起来该被调用"的 helper，必须当场 grep 它的调用者**；同样重要的是，
+写完一个 helper 后不要在别处内联同样的逻辑——那会同时制造零调用者和两个真相。
+
+### 退出意图属于「和弦」，不属于「action 名」
+
+修复过程中真正难的不是发 Shutdown，而是**哪个组件能看到按键**。链条：
+
+1. permission 对话框聚焦时 scope 链前置 `session`，于是 `ctrl+d` 解析成
+   `session_delete`、`ctrl+c` 解析成 `input_clear`，**都不是 `app_exit`**。
+2. permission 对话框不认这两个 action，落到 `DialogStep::Ignored`。
+3. `DialogHost` 对 `Ignored` **明确不转发给 base**（这条本身是对的，否则
+   `session_new` 会在权限提示后面偷偷触发）。
+
+结论：**同一个物理和弦会被多个 scope claim（`input_clear` / `input_delete` /
+`session_delete` / `stash_delete`），所以 action 名无法告诉组件"用户想退出"**。
+正确的判据是问键位表：该 chord 是否是 `app_exit` 的单和弦拼写之一
+（`keybind::is_exit_chord`，从 `DEFINITIONS` 派生，重新生成上游表时自动跟随）。
+反向收益：`input_delete` 的默认拼写含 `delete,shift+delete`，按 action 名判断会让
+空 prompt 上的裸 `Delete` 也退出应用——按 chord 判断顺手修掉了这个。
+
+### 「取消还是退出」不能从状态条反推
+
+turn 运行中首次按退出键应当**取消**而非拆掉应用。但**第二次按键必须无条件退出**，
+且「是否已取消过」必须显式记住，不能重读状态条的 running：**停在 permission ask
+上的 turn 永远走不到引擎的中断检查点**，`abort` 之后状态条仍是 running，靠状态条
+判断就会永远取消、永远不退——同一个陷阱换了个更礼貌的形式。
+另一条守则：取消 sink 缺失或 `try_send` 拒收时**直接落到 shutdown**。坏掉的协作者
+只该损失一次取消，不该损失退出能力。
+
+### JS 插件是启动耗时的 98%，且「关掉」和「你没开」必须可区分
+
+实测（**debug 二进制**，本机 3 个 JS 插件，各取 3 次）：
+
+| 状态 | `zuno models` 耗时 |
+|---|---|
+| 默认（JS host 关） | 0.10 / 0.11 / 0.13 s |
+| `ZUNO_ENABLE_JS_PLUGINS=1` | 1.65 / 1.35 / 1.32 s |
+| 配置键开启 | 1.28 s |
+| `--pure` | 0.11 s |
+
+即约 1.2 s ≈ 92–98% 花在 JS 插件加载，每个插件 spawn 一个 Node 进程；关掉之后
+与 `--pure` 持平（0.11 s），说明门确实落在插件路径上而非顺带砍了别的东西。
+**记录耗时必须写清构建配置**：debug 与 release 的绝对值差一个量级，只写"实测 0.03 s"
+会让下一个人拿 release 的数字去对 debug 的观测，得出"回归了"的错误结论。
+门要下在**发现之前**：扫四个目录 + 读 package manifest 也是关掉的 runtime 不该做的活。
+
+两个设计要点：
+
+* **`source` 要能回答"为什么没加载"**，因为「关掉了」和「你没开」从外面看一模一样，
+  而这正是"一行配置就能修"与"提一个 bug"的分界。落地为
+  `JsPluginPolicy { enabled, source }`，`source` 取 `pure` / `environment` /
+  `config` / `default` 四值（当前是 `&'static str`；若将来要给某个取值挂行为——
+  例如 `--pure` 下不该提示如何开启，因为那条路径原先是安静的——就该升成 enum，
+  字符串比较表达同样的意思但没有任何检查）。`debug config` 无条件输出它，
+  并与 `plugin_origins` **并列而非取代**：「发现了这些插件但 host 关着」才是要看的状态。
+* **`plugin_runtime` 不叫 `plugins`**。与既有的 `plugin` 列表构成近似同形词时，
+  打错一个字母会静默命中另一个键。
+
+优先级 `--pure` > 环境变量 > 配置 > 默认关：`--pure` 是既有 kill switch，
+不能被一个用户没写的配置文件推翻；环境变量胜过配置，一次性运行不必改文件。
+
+### 库不能自己往终端写：`eprintln!` 在 alternate screen 下等于「延迟污染」
+
+`zuno-tools/src/registry.rs` 的工具遮蔽诊断此前是无条件 `eprintln!`——这个"无条件"
+是上一次修复**故意**加的（安静的 log 曾把真实缺陷藏掉），所以不能改回安静。
+但它在 TUI 下会写进 raw mode 终端：这些行躺在 primary screen 上，被 alternate
+screen 盖住，**直到用户退出才连同上下文丢失地一起继承出来**。
+
+修法是分层而不是消音：库侧 `tracing::warn!` + 结构化 `diagnostics` 上抛，
+由 host 决定落到哪个 surface——headless `run` 打 stderr（原文一字不改，
+既有断言的意图原样存活），TUI 画进 transcript。附带发现：`StatusDetail` 事件此前
+**只有 `--json` 会渲染**，所以 prelude 报告的一切（被遮蔽的工具、跳过的 internal）
+对普通 `run` 是隐形的。
+
+TUI 侧还有个细节：状态条只存**一条** detail，下一条会覆盖上一条，所以警告只放状态条
+等于「闪一下就没了」。必须进 transcript，并且需要一个 `Role::System`——把会话自己的
+警告挂在 user 或 assistant 名下是**对"谁说的"撒谎**。
+
+### 真实终端验证的最小可信形态（tmux）
+
+```
+tmux send-keys -t S 'stty -a | tr " " "\n" | grep -E "^-?(isig|icanon|echo)$" | tr "\n" " "; \
+  echo BEFORE; ./zuno tui; echo "TUI-EXIT=$?"; stty -a | ... ; echo AFTER' Enter
+tmux send-keys -t S C-c   # 或 C-d
+tmux capture-pane -t S -p
+```
+
+三个必须同时成立的证据：`TUI-EXIT=0`、退出后 `stty` 报 `isig icanon echo`
+（raw mode 与 SIGINT 都已归还）、capture-pane 里没有继承的 `warning:` 行。
+注意首次 `send-keys` 常被 zsh 的 fancy prompt 初始化吃掉（本次只剩一个 `c`），
+所以要先发一条无害命令确认 shell 已就绪，再发真正的验证命令。
