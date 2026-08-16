@@ -8,11 +8,11 @@
 # So the topology is build -> smoke -> publish, and `publish` lists BOTH earlier
 # jobs in `needs`. GitHub's default `needs` semantics require every listed job to
 # have succeeded, so a single failed or skipped smoke leg blocks publication of
-# all six archives. There is no path from a compiled binary to a release asset
+# all five archives. There is no path from a compiled binary to a release asset
 # that does not pass through a process that ran it.
 #
 # `crates/zuno-cli/tests/release_surface.rs` asserts from outside this file that the
-# two matrices name the same six targets, because a target added to `build` and
+# two matrices name the same five targets, because a target added to `build` and
 # forgotten in `smoke` would otherwise ship unexecuted and CI would stay green.
 # ---------------------------------------------------------------------------
 #
@@ -30,8 +30,12 @@
 # images, or per-target apt packages. Zig ships a complete hermetic C
 # cross-compiler as ONE download, and `cargo-zigbuild` points rustc's linker at
 # it. So the two Linux/musl legs need no system cross-gcc, no docker, and no
-# apt-get. The other four legs build natively on runners of their own
-# architecture, where no cross-compilation happens at all.
+# apt-get.
+#
+# The `x86_64-apple-darwin` leg needs none of that either, and not because it is
+# native: Apple's own clang and SDK are multi-architecture, so `-arch x86_64` is
+# a flag rather than a second toolchain. That is why `use_zigbuild` stays false
+# for both darwin legs — there is nothing for Zig to supply.
 #
 # `release_surface.rs` also asserts this file installs no cross-gcc, invokes no
 # docker, and runs no `cross` — an assertion, because a future "fix" for a
@@ -52,7 +56,7 @@
 # ---------------------------------------------------------------------------
 # WHEN THIS RUNS
 #
-# On a `v*` tag, and on manual dispatch. NOT on every push: a six-target matrix
+# On a `v*` tag, and on manual dispatch. NOT on every push: a five-target matrix
 # with a full smoke leg each is far too slow for a per-commit gate, and CI already
 # exercises the same packaging and smoke path on the host leg for every push and
 # pull request (see ci.yml's `artifact` job). The manual `workflow_dispatch` path
@@ -61,9 +65,58 @@
 # ever run is the real release is not a pipeline anybody has tested.
 # ---------------------------------------------------------------------------
 #
-# Only Linux legs use the `zuno-runner` CodeBuild-hosted runner. The two macOS
-# and two Windows legs deliberately remain GitHub-hosted because a Linux
-# container cannot execute their native artifacts; all six release targets stay.
+# ---------------------------------------------------------------------------
+# WHERE EACH LEG RUNS, AND WHY NOT ON GITHUB
+#
+# Every job here runs on a CodeBuild-hosted GitHub Actions runner. None uses a
+# GitHub-hosted runner, because this account has no Actions minutes left — which
+# is why the pipeline had never run at all before this file was rewritten.
+# `release_surface.rs` asserts the absence, so the constraint is enforced rather
+# than remembered.
+#
+# Three runner projects, because CodeBuild picks the machine from the PROJECT and
+# a project has exactly one environment type:
+#
+#   zuno-runner          us-east-2  LINUX_CONTAINER               Linux legs, version, checksums, publish
+#   zuno-runner-windows  us-east-2  WINDOWS_SERVER_2022_CONTAINER x86_64-pc-windows-msvc
+#   zuno-runner-macos    us-west-2  MAC_ARM                       both darwin targets
+#
+# macOS sits in us-west-2 and the rest in us-east-2 for one measured reason:
+# CodeBuild macOS is reserved-capacity only (`MAC_ARM is not supported for
+# on-demand compute`), MAC_ARM accepts exactly one compute shape
+# (`BUILD_GENERAL1_LARGE`; XLARGE and attribute-based are both rejected), and a
+# new fleet of that shape in us-east-2 and us-east-1 comes up
+# status=ACTIVE / context=INSUFFICIENT_CAPACITY. us-west-2 came up clean. The
+# region split is capacity, not preference; the fleet name is `zuno-macos` in
+# both places so moving back is a one-line change if Ohio frees up.
+#
+# BOTH darwin targets share the one ARM macOS runner. `x86_64-apple-darwin` is
+# cross-compiled there and then EXECUTED there under Rosetta 2, which the image
+# ships (`/usr/libexec/rosetta/oahd` present, `arch -x86_64` succeeds). Measured
+# on macOS 26.2 / Xcode 26.2: a `Mach-O 64-bit executable x86_64` built on the
+# ARM host ran and printed `ran on x86_64`. So the smoke leg genuinely runs the
+# artifact rather than inspecting it. The honest caveat: Rosetta translates the
+# same machine code, so this proves the binary links and its logic runs, not that
+# it behaves identically on native Intel silicon.
+# ---------------------------------------------------------------------------
+#
+# ---------------------------------------------------------------------------
+# WHY aarch64-pc-windows-msvc IS NOT HERE
+#
+# It was dropped, and the drop is a consequence of the rule at the top of this
+# file rather than a convenience. CodeBuild has no ARM Windows compute in any
+# region: the reserved-capacity table lists Windows only as `reserved.x86-64.*`,
+# and the on-demand runner images are Windows Server 2019/2022 on x86_64 only.
+# An x86_64 Windows host cannot execute an ARM64 binary either — the emulation
+# only runs the other way, on ARM64 Windows. So the target could be cross-built
+# and never executed, which is precisely the artifact this pipeline refuses to
+# publish. The alternative was a GitHub-hosted `windows-11-arm` runner, which is
+# what left the pipeline unable to run in the first place.
+#
+# Nothing user-facing promised it: `scripts/install.sh` handles only Linux and
+# Darwin, and no document lists target triples. `Makefile`'s RELEASE_TARGETS and
+# `release_surface.rs`'s RELEASE_TARGETS were updated in the same commit.
+# ---------------------------------------------------------------------------
 
 name: Release
 
@@ -138,7 +191,7 @@ jobs:
           fi
 
   # -------------------------------------------------------------------------
-  # build: one archive per target. Adapted from the proven six-target matrix at
+  # build: one archive per target. Adapted from the proven matrix at
   # codegraph-rust's .github/workflows/release-please.yml.
   # -------------------------------------------------------------------------
   build:
@@ -166,22 +219,20 @@ jobs:
             use_zigbuild: false
             archive: tar.gz
             runs_on:
-              - macos-15-intel
+              - codebuild-zuno-runner-macos-${{ github.run_id }}-${{ github.run_attempt }}
+              - zuno-release-build-x86_64-darwin
           - target: aarch64-apple-darwin
             use_zigbuild: false
             archive: tar.gz
             runs_on:
-              - macos-latest
+              - codebuild-zuno-runner-macos-${{ github.run_id }}-${{ github.run_attempt }}
+              - zuno-release-build-aarch64-darwin
           - target: x86_64-pc-windows-msvc
             use_zigbuild: false
             archive: zip
             runs_on:
-              - windows-latest
-          - target: aarch64-pc-windows-msvc
-            use_zigbuild: false
-            archive: zip
-            runs_on:
-              - windows-11-arm
+              - codebuild-zuno-runner-windows-${{ github.run_id }}-${{ github.run_attempt }}
+              - zuno-release-build-x86_64-windows
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
@@ -262,13 +313,16 @@ jobs:
   # smoke: run every archive's binary on a runner of its own architecture.
   #
   # `runs_on` is chosen per target so the artifact is EXECUTED rather than merely
-  # inspected. The two Linux cases worth knowing:
+  # inspected. The cases worth knowing:
   #
   #   * x86_64-unknown-linux-musl smokes on the x86_64 CodeBuild route: a static
   #     musl binary runs on any Linux of the same architecture, glibc host included.
   #   * aarch64-unknown-linux-musl is BUILT on x86_64 (zigbuild) and cannot run
   #     there, so the ARM CodeBuild image label routes it to native aarch64. That
   #     architecture-crossing handoff is why smoke is separate from build.
+  #   * x86_64-apple-darwin is cross-built on the ARM macOS runner and smoked on
+  #     that same runner through Rosetta 2 — see the header block for the
+  #     measurement and for what Rosetta does and does not prove.
   #
   # `zuno-smoke` is compiled from this checkout on the smoke runner, then pointed at
   # the unpacked artifact. It runs `--version`, `--help`, and a headless `run`
@@ -300,19 +354,18 @@ jobs:
           - target: x86_64-apple-darwin
             archive: tar.gz
             runs_on:
-              - macos-15-intel
+              - codebuild-zuno-runner-macos-${{ github.run_id }}-${{ github.run_attempt }}
+              - zuno-release-smoke-x86_64-darwin
           - target: aarch64-apple-darwin
             archive: tar.gz
             runs_on:
-              - macos-latest
+              - codebuild-zuno-runner-macos-${{ github.run_id }}-${{ github.run_attempt }}
+              - zuno-release-smoke-aarch64-darwin
           - target: x86_64-pc-windows-msvc
             archive: zip
             runs_on:
-              - windows-latest
-          - target: aarch64-pc-windows-msvc
-            archive: zip
-            runs_on:
-              - windows-11-arm
+              - codebuild-zuno-runner-windows-${{ github.run_id }}-${{ github.run_attempt }}
+              - zuno-release-smoke-x86_64-windows
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
@@ -384,8 +437,8 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           archives=(*.tar.gz *.zip)
-          if [ "${#archives[@]}" -ne 6 ]; then
-            echo "::error title=Checksums::expected 6 archives, found ${#archives[@]}: ${archives[*]-none}"
+          if [ "${#archives[@]}" -ne 5 ]; then
+            echo "::error title=Checksums::expected 5 archives, found ${#archives[@]}: ${archives[*]-none}"
             exit 1
           fi
           mapfile -t sorted < <(printf '%s\n' "${archives[@]}" | LC_ALL=C sort)
@@ -405,7 +458,7 @@ jobs:
   # -------------------------------------------------------------------------
   # publish: the only job that writes anything public, and the only one with
   # `contents: write`. It lists build, smoke and checksums in `needs`, so it
-  # cannot run unless all six artifacts were built AND all six were executed.
+  # cannot run unless all five artifacts were built AND all five were executed.
   #
   # Skipped on a dry run: `version.outputs.publish` is false unless a `v*` tag was
   # pushed or the dispatcher explicitly asked for it.

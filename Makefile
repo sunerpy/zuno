@@ -40,17 +40,17 @@ OXFMT_FILES := \
 #   make package TARGET=x86_64-unknown-linux-musl
 TARGET ?=
 
-# The six targets the release pipeline ships. Listed here so `make help` can show
+# The targets the release pipeline ships. Listed here so `make help` can show
 # them next to the command that builds one; the authoritative matrix lives in
 # `.github/workflows/release.yml` and
 # `crates/zuno-cli/tests/release_surface.rs` asserts the two agree.
+# `aarch64-pc-windows-msvc` is absent deliberately — see release.yml's header.
 RELEASE_TARGETS := \
   x86_64-unknown-linux-musl \
   aarch64-unknown-linux-musl \
   x86_64-apple-darwin \
   aarch64-apple-darwin \
-  x86_64-pc-windows-msvc \
-  aarch64-pc-windows-msvc
+  x86_64-pc-windows-msvc
 
 all: build
 

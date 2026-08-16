@@ -50,14 +50,30 @@ const WASM_RUNTIME_FAMILIES: &[&str] = &["wasmtime", "cranelift", "wasmparser", 
 const REQUIRED_TLS_CRATES: &[&str] = &["reqwest", "rustls", "rustls-webpki"];
 
 /// The targets the release pipeline builds, smoke-tests, and publishes.
-const RELEASE_TARGETS: [&str; 6] = [
+///
+/// `aarch64-pc-windows-msvc` is deliberately absent. CodeBuild has no ARM Windows
+/// compute in any region and an x86_64 Windows host cannot execute an ARM64
+/// binary, so that target could only ever have been built and never run — the one
+/// thing this pipeline exists to refuse. Its only other home was a GitHub-hosted
+/// `windows-11-arm` runner, and the exhausted Actions minutes there are why the
+/// release pipeline had never completed a single run. See release.yml's header.
+const RELEASE_TARGETS: [&str; 5] = [
     "x86_64-unknown-linux-musl",
     "aarch64-unknown-linux-musl",
     "x86_64-apple-darwin",
     "aarch64-apple-darwin",
     "x86_64-pc-windows-msvc",
-    "aarch64-pc-windows-msvc",
 ];
+
+/// The CodeBuild runner projects the workflows may route jobs to.
+///
+/// Three rather than one because CodeBuild takes the machine from the project and
+/// a project has exactly one environment type: Linux, Windows, and macOS need one
+/// each. Held as a list so [`codebuild_label_sets`] sees every routed job — a
+/// helper that recognised only the Linux project would silently stop counting the
+/// macOS and Windows legs, and the uniqueness invariant below would then be
+/// asserted over a subset while reading as though it covered everything.
+const RUNNER_PROJECTS: [&str; 3] = ["zuno-runner", "zuno-runner-macos", "zuno-runner-windows"];
 
 /// The one cassette the artifact smoke test replays.
 const SMOKE_CASSETTE: &str = "openai-chat/drives-a-tool-loop-end-to-end";
@@ -796,15 +812,22 @@ fn matrix_targets(text: &str, job: &str) -> BTreeSet<String> {
         .collect()
 }
 
+/// The label a job uses to route itself to `project`'s CodeBuild runner.
+fn project_label(project: &str) -> String {
+    format!("codebuild-{project}-${{{{ github.run_id }}}}-${{{{ github.run_attempt }}}}")
+}
+
 fn codebuild_label_sets(text: &str) -> Vec<Vec<String>> {
-    const PROJECT_LABEL: &str =
-        "codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}";
+    let project_labels: Vec<String> = RUNNER_PROJECTS.iter().map(|p| project_label(p)).collect();
 
     let lines: Vec<&str> = text.lines().collect();
     let mut sets = Vec::new();
     for (index, line) in lines.iter().enumerate() {
         let trimmed = line.trim_start();
-        if trimmed.strip_prefix("- ") != Some(PROJECT_LABEL) {
+        let Some(label) = trimmed.strip_prefix("- ") else {
+            continue;
+        };
+        if !project_labels.iter().any(|known| known == label) {
             continue;
         }
 
@@ -885,9 +908,12 @@ fn every_built_target_is_also_smoke_tested() {
 
 #[test]
 fn every_codebuild_job_has_a_unique_label_set() {
-    const EXPECTED_MIGRATED_JOBS: usize = 11;
-    const PROJECT_LABEL: &str =
-        "codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}";
+    // Was 11 when only Linux jobs ran on CodeBuild. The four non-Linux release
+    // legs that used to sit on GitHub-hosted runners are now two macOS build legs,
+    // two macOS smoke legs, one Windows build leg and one Windows smoke leg — six
+    // more routed jobs, less the two `aarch64-pc-windows-msvc` legs that were
+    // dropped because no CodeBuild machine can execute that artifact.
+    const EXPECTED_MIGRATED_JOBS: usize = 17;
 
     let workflows = [
         ("ci.yml", workflow("ci.yml")),
@@ -904,16 +930,19 @@ fn every_codebuild_job_has_a_unique_label_set() {
     assert_eq!(
         named_sets.len(),
         EXPECTED_MIGRATED_JOBS,
-        "expected one CodeBuild label set for each migrated Linux job or matrix leg"
+        "expected one CodeBuild label set for each job or matrix leg"
     );
 
+    let known_project_labels: Vec<String> =
+        RUNNER_PROJECTS.iter().map(|p| project_label(p)).collect();
     let mut routing_labels = BTreeSet::new();
     let mut complete_sets = BTreeSet::new();
     for (workflow_name, labels) in &named_sets {
-        assert_eq!(
-            labels.first().map(String::as_str),
-            Some(PROJECT_LABEL),
-            "{workflow_name} does not name the CodeBuild project verbatim"
+        let first = labels.first().map(String::as_str).unwrap_or_default();
+        assert!(
+            known_project_labels.iter().any(|known| known == first),
+            "{workflow_name} routes a job to {first:?}, which is not one of the \
+             CodeBuild runner projects {RUNNER_PROJECTS:?}"
         );
         let routing_label = labels
             .get(1)
@@ -942,10 +971,74 @@ fn every_codebuild_job_has_a_unique_label_set() {
     );
 }
 
+/// The release path must not depend on a GitHub-hosted runner.
+///
+/// This is the assertion that would have caught the state this file was written
+/// out of: `release.yml` named `macos-15-intel`, `macos-latest`, `windows-latest`
+/// and `windows-11-arm`, this account has no Actions minutes, and `publish` needs
+/// every build and smoke leg — so the pipeline could never once reach publication,
+/// and nothing failed loudly enough to say so. A hosted label is easy to
+/// reintroduce while debugging a runner problem, which is exactly when it must be
+/// refused.
+///
+/// Scoped to `release.yml` on purpose. `ci.yml` keeps one hosted `windows` job
+/// behind `if: vars.GITHUB_HOSTED_RUNNERS == 'true'`, off by default, and that job
+/// gates nothing that ships.
+#[test]
+fn the_release_path_uses_no_github_hosted_runner() {
+    let text = workflow("release.yml");
+    const HOSTED_LABELS: &[&str] = &[
+        "macos-latest",
+        "macos-15",
+        "macos-14",
+        "macos-13",
+        "windows-latest",
+        "windows-2022",
+        "windows-2019",
+        "windows-11-arm",
+        "ubuntu-latest",
+        "ubuntu-24.04",
+        "ubuntu-22.04",
+    ];
+
+    let mut offenders = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let code = line.split('#').next().unwrap_or_default();
+        for hosted in HOSTED_LABELS {
+            if code
+                .split_whitespace()
+                .any(|word| word.trim_start_matches("- ").trim_matches(['"', '\'']) == *hosted)
+            {
+                offenders.push(format!("  release.yml:{}: {}", index + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "release.yml routes a job to a GitHub-hosted runner:\n{}\n\
+         This repository's Actions minutes are exhausted, so such a job never \
+         starts, and `publish` needs every build and smoke leg — one hosted label \
+         means no release can ever be published. Route it to one of \
+         {RUNNER_PROJECTS:?} instead.",
+        offenders.join("\n")
+    );
+
+    // The positive half: no hosted label proves nothing if the file stopped
+    // selecting runners at all, or if a whole matrix leg vanished.
+    for project in RUNNER_PROJECTS {
+        let label = project_label(project);
+        assert!(
+            text.contains(&label),
+            "release.yml never routes to {project}; with the hosted runners gone \
+             there would be no machine for that platform's legs at all"
+        );
+    }
+}
+
 #[test]
 fn release_matrices_use_the_effective_runner_fields() {
-    const PROJECT_LABEL: &str =
-        "codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}";
+    let linux_project_label = project_label("zuno-runner");
+    let project_label = linux_project_label.as_str();
 
     let text = workflow("release.yml");
     for job in ["build", "smoke"] {
@@ -964,7 +1057,7 @@ fn release_matrices_use_the_effective_runner_fields() {
     }
 
     let x86_smoke = matrix_entry(&text, "smoke", "x86_64-unknown-linux-musl").join("\n");
-    for required in [PROJECT_LABEL, "zuno-release-smoke-x86_64-linux"] {
+    for required in [project_label, "zuno-release-smoke-x86_64-linux"] {
         assert!(
             x86_smoke.contains(required),
             "the x86_64 Linux smoke leg is missing CodeBuild label {required:?}"
@@ -973,7 +1066,7 @@ fn release_matrices_use_the_effective_runner_fields() {
 
     let arm_smoke = matrix_entry(&text, "smoke", "aarch64-unknown-linux-musl").join("\n");
     for required in [
-        PROJECT_LABEL,
+        project_label,
         "zuno-release-smoke-aarch64-linux",
         "image:arm-3.0",
         "instance-size:large",
