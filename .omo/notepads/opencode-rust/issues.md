@@ -9005,3 +9005,85 @@ fork 风暴真的变慢了（或 host 数量增加了），那时该查的是 fi
 **`smoke` / `smoke-artifact` 仍然忽略 `CARGO_TARGET_DIR`**（`Makefile:28`
 `TARGET_DIR := target`），本次同样是 unset 后运行，写进了 worktree 内的 `target/`。
 本任务实测 `13 tools offered`、`--version -> 1.18.13`、PASS。
+
+## RESOLVED — Zuno 从未产出 release，根因是流水线一次都没跑成过（task r14，2026-08-16）
+
+**现象**：README 里的一行安装命令必然失败，`scripts/install.sh` 报 `release not found`。
+
+**根因链（不是安装脚本的问题）**：
+`release.yml` 只在 `push: tags: v*` 与 `workflow_dispatch` 上触发，而仓库从来没有 tag
+（`git tag -l` 与 `gh api repos/sunerpy/zuno/tags` 都是空）。即便打 tag 也不会成功：六目标
+矩阵里四个非 Linux 腿跑在 GitHub 托管 runner 上，本账号 Actions 额度已耗尽，而 `publish`
+声明 `needs: [version, build, smoke, checksums]`，任何一腿失败即挡住整个发布。
+
+**处置**：非 Linux 腿全部迁到 CodeBuild 托管 runner，release 路径不再依赖任何 GitHub 托管
+runner，并加了断言（`the_release_path_uses_no_github_hosted_runner`）防回归。
+
+**最终基础设施**（全部读回验证）：
+* `zuno-runner`（us-east-2, LINUX_CONTAINER）— 复用，Linux 两腿 + version/checksums/publish
+* `zuno-runner-windows`（us-east-2, WINDOWS_SERVER_2022_CONTAINER, on-demand）
+  role `zuno-runner-windows`，webhook 666534345
+* `zuno-runner-macos`（**us-west-2**, MAC_ARM, fleet `zuno-macos` baseCapacity=2）
+  role `zuno-runner-macos-usw2`，webhook 666541088
+* 两个新 role 都是最小权限：仅本项目 log group + 指定 connection 的三个 codeconnections 动作
+* 两个新项目都设了项目级 `source.auth`（CODECONNECTIONS），不碰账号级共享凭据槽
+* `test-mac-us-east-2` 未被触碰：`lastModified` 仍等于 `created`（2026-04-02T07:17:11）
+
+**纠正一条继承的错误认知**：`zuno-github` connection 不是 PENDING，实测是 **AVAILABLE**
+（`arn:…:connection/3d7401e1-0481-43a3-b037-22bd91070eae`），Windows 项目就用它建 webhook
+成功。us-west-2 没有 codeconnections，那边复用了已存在的 `workkit-github`
+（codestar-connections，us-west-2）。
+
+**最终结果**：tag `v0.1.0` → run 31952230418 全绿（5 build + 5 smoke + checksums +
+publish），release 已发布，5 个平台归档 + SHA256SUMS 齐全且 `sha256sum -c` 全 OK，
+`scripts/install.sh` 与 README 的一行命令都装成功，
+`zuno --version --long` 输出 `Zuno 0.1.0 (Rust package 0.1.0; plugin compatibility 1.18.13)`。
+
+**runner 归属证据**：GitHub 的 `runner_name` 与 CodeBuild build id 完全一致，例如
+`Build x86_64-apple-darwin` → `b07e73fd-…` = `zuno-runner-macos:b07e73fd-…`；
+`Smoke x86_64-pc-windows-msvc` → `ff1cf2e2-…` = `zuno-runner-windows:ff1cf2e2-…`。
+再次确认 `webhook.lastTriggeredAt` 对 runner 类型项目恒为 null，不能作为证据。
+
+## RESOLVED — aarch64-pc-windows-msvc 移除（task r14）
+
+不是妥协，是那条"不得发布从未被执行过的产物"规则的推论。CodeBuild 在任何 region 都没有
+ARM Windows 计算资源（预留容量表 Windows 只有 `reserved.x86-64.*`，on-demand 镜像只有
+x86_64 的 Windows Server 2019/2022），而 x86_64 Windows 主机无法执行 ARM64 产物（仿真只有
+反方向，在 ARM64 Windows 上）。所以该目标只能被构建、永远无法被执行。它唯一的另一个落点是
+GitHub 托管 `windows-11-arm`，而那正是流水线跑不起来的原因。
+
+用户可见面确认没有承诺过它：`scripts/install.sh` 只处理 Linux/Darwin（无 install.ps1），
+README 与 docs 都不列 target triple。同一提交内同步更新了 `Makefile` 的 RELEASE_TARGETS、
+`release_surface.rs` 的 `RELEASE_TARGETS`（6→5）与 checksums 的归档数量校验（6→5）。
+
+## RESOLVED — 两个项目自身的 Windows 缺陷，因平台从未运行而积压（task r14）
+
+这两个都不是 CI 配置问题，是**代码在 Windows 上从来编译不过/跑不通**，只有 Windows leg
+真正运行后才暴露：
+
+1. **`zuno-testkit` 在 Windows 上编译失败**：
+   `crates/zuno-testkit/src/perf/database.rs` 无条件
+   `use std::os::unix::fs::PermissionsExt`，Windows 上 E0433 + 两处 `from_mode` E0599。
+   smoke 作业要在目标平台编译 `zuno-smoke`，所以 Windows smoke **从设计上就不可能通过**。
+   已按平台拆出 `set_owner_read_write` / `set_read_only`；Windows 分支用 `set_readonly`
+   而**不是空实现**（调用方依赖克隆可写，且共享快照必须不可写回）。
+
+2. **`ScriptedEnv` 在 Windows 上导致 WinSock 初始化失败**：
+   `zuno-smoke` 用 `env_clear()` 起子进程并只注入 POSIX 形状变量，Windows 子进程于是没有
+   `SystemRoot`，WinSock 无法定位 catalog，报
+   `os error 10106`（`WSAEPROVIDERFAILEDINIT`）。**症状极具误导性**：`--version` 与
+   `--help` 两项照常通过，只有需要建 socket 的第三项失败，报错文本长得像 provider/网络
+   问题（`error sending request for url (http://127.0.0.1:…)`）。
+   已在 `ScriptedEnv::env_vars` 里加 `insert_os_mandatory_variables`：Unix 空实现，
+   Windows 透传 SystemRoot/SystemDrive/windir/ComSpec/PATHEXT/NUMBER_OF_PROCESSORS/
+   PROCESSOR_ARCHITECTURE，并把 USERPROFILE/TEMP/TMP 指回 fixture 自己的目录——隔离性不减。
+
+**这两处修复目前只被 CI 的 Windows leg 覆盖**，本机是 Linux，只能用
+`rustc --target x86_64-pc-windows-msvc --emit=metadata` 对 cfg 分支做类型检查
+（注意：本机 `cargo check --target x86_64-pc-windows-msvc` 会因 `lib.exe` 缺失而失败，
+所以单文件 rustc 类型检查是本机能做到的最强验证）。真正的证明是 CI 上
+`Smoke x86_64-pc-windows-msvc` 变绿。
+
+**顺带记录**：README 里 G6 "Windows 部分未执行" 的披露**依然成立**，本次没有改变它。
+Windows leg 现在会跑发布 smoke，但 `crates/zuno-process/tests/windows_containment.rs`
+（`#![cfg(windows)]` 的 Job Object 路径）仍未在任何 Windows CI 上执行。

@@ -7728,3 +7728,97 @@ Linux 把 `comm` 截断到 15 字符，而 `zuno-reaping-fixture` 有 20 字符�
 这是"编译器不会把两份同名字符串链接起来"这一主题的第三个变体
 （前两个：insta 把 crate 名编码进**快照文件名**、`\b` 在下划线后不成立导致
 11 处 `CARGO_BIN_EXE_oc-*` 被漏）。
+
+## CodeBuild 上的非 Linux 发布腿：能力边界与四个连环缺陷（task r14，2026-08-16）
+
+### AWS 侧的硬边界（全部实测，不是读文档推断）
+
+* **macOS 只能预留容量**：`create-project` 用 `MAC_ARM` + 不带 fleet 直接报
+  `MAC_ARM is not supported for on-demand compute`。
+* **MAC_ARM 只接受一种规格**：`BUILD_GENERAL1_LARGE`。`BUILD_GENERAL1_XLARGE` 报
+  `Compute type BUILD_GENERAL1_XLARGE is not supported for MAC_ARM`；
+  `ATTRIBUTE_BASED_COMPUTE` 报 `Attribute based compute is not supported for MAC_ARM`；
+  `update-fleet` 改 computeType 报 `Updating environmentType, vpcConfig, imageId, or
+  computeType is not allowed for Mac Arm`（即 macOS fleet 建完就不能改规格，只能重建）。
+* **fleet 的 statusCode 会骗人**：新建的 us-east-2 / us-east-1 macOS fleet 是
+  `status.statusCode = ACTIVE`，但 `status.context = INSUFFICIENT_CAPACITY`，
+  `status.message = "We currently do not have sufficient capacity…"`。**判断可用性要看
+  context，不能看 statusCode**；只看 statusCode 会得到"fleet 正常"的错误结论，然后作业
+  永远停在 QUEUED（实测卡了 40+ 分钟无任何报错）。us-west-2 的 context 是 null，可用。
+* **`list-fleets` 不可信**：us-east-2 只返回了 `test-mac-us-east-2` 一个，但
+  `web-test-genie-macos` 项目实际引用着另一个同区 fleet `web-test-genie-macos`。要盘点
+  fleet，得从项目的 `environment.fleet.fleetArn` 反查。
+* **fleet ARN 必须带 ID 后缀**：`create-project` 传 `…:fleet/zuno-macos` 报
+  `Invalid fleet ARN`，必须是 `…:fleet/zuno-macos:b75653d8-…`。
+* **新建 IAM role 后要等**：立刻 `create-project` 报
+  `CodeBuild is not authorized to perform: sts:AssumeRole on service role`，等约 25 秒
+  再建就成功。这个报错文本会把人引向信任策略，实际只是传播延迟。
+* **`create-webhook` 的 buildType**：GitHub Actions runner 项目**不要**传
+  `--build-type`（传 `RUNNER_BUILDKITE_BUILD` 报 `Invalid build type provided`），
+  只传 `--filter-groups '[[{"type":"EVENT","pattern":"WORKFLOW_JOB_QUEUED"}]]'` 即可。
+* **枚举探测法**：想知道某参数接受哪些值，用一个明显非法的值调用一次，服务端会回
+  `Invalid environment type provided` 之类；配合 `service-quotas` 查不到 fleet 配额的
+  情况，这是唯一能问出真相的办法。注意 fleet 名只允许字母数字/短横/下划线。
+
+### CodeBuild Windows 镜像根本没有 C 工具链
+
+实测三个环境全都没有 MSVC、没有 Windows SDK，连 mingw 的 gcc/dlltool 也没有：
+
+* `aws/codebuild/windows-base:2022-1.0`（WINDOWS_SERVER_2022_CONTAINER）
+* `aws/codebuild/windows-base:2019-3.0`（WINDOWS_SERVER_2019_CONTAINER）
+* `aws/codebuild/ami/windows-base:2022`（WINDOWS_EC2 预留容量）
+
+2022 容器里唯一的 `link.exe` 是 `C:\tools\msys64\usr\bin\link.exe`——MSYS2 的 coreutils
+`link`。rustc 找不到 MSVC 时会**静默回退**到它，于是每个 build script 都报
+`link: extra operand`，看起来像链接器参数问题，其实是链接器本身是错的程序。
+`vswhere.exe` 不存在也是个快速判据。
+
+**可行解**：镜像自带 Chocolatey，
+`choco install visualstudio2022buildtools --package-parameters "--add
+Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --add
+Microsoft.VisualStudio.Component.Windows11SDK.22621 --quiet --norestart"`
+约 6 分钟装好，之后 vswhere 能报出 BuildTools 路径，MSVC link.exe 在
+`VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64`。**装完不需要 vcvars**：rustc 自己的 MSVC
+探测会在链接时把真 linker 排到 MSYS2 前面。
+**被排除的方案**：`x86_64-pc-windows-gnu` 同样不可行，gcc 不在 PATH、
+`dlltool.exe` 不存在（`error: error calling dlltool 'dlltool.exe': program not found`）。
+
+### Windows 容器上 rustup 的两个坑
+
+1. **默认 profile 不可写**：`rustup toolchain install stable` 报
+   `could not create component directory:
+   'C:\Users\ContainerAdministrator\.rustup\toolchains\...'` +
+   `The specified path is invalid. (os error 161)`。同一处写入失败还有个更隐蔽的表现：
+   `rustup target add` 看起来成功，随后 rustc 报 `can't find crate for std`。
+   解法：`RUSTUP_HOME=C:\rustup`、`CARGO_HOME=C:\cargo`（系统盘短路径可写）。
+2. **镜像自带旧 cargo 抢 PATH**：Chocolatey 装的 cargo 1.84.1 在 PATH 上胜出，
+   于是 `feature `edition2024` is required`，而刚装好的 1.97.1 完全没被用到。解法：显式把
+   `C:\rustup\toolchains\stable-x86_64-pc-windows-msvc\bin` 前置，并在该目录缺
+   cargo.exe 时直接 throw——静默回退正是上面那个费解报错的根源。
+
+### macOS ARM 上可以真实执行 x86_64 产物
+
+CodeBuild 的 `macos-arm-base:15`（实测 macOS 26.2 / Xcode 26.2）**自带 Rosetta 2**：
+`/usr/libexec/rosetta/{oahd,oahd-helper,oahd-root-helper}` 存在，`arch -x86_64` 可用。
+在 ARM 主机上 `rustc --target x86_64-apple-darwin` 产出的
+`Mach-O 64-bit executable x86_64` 直接运行并输出 `ran on x86_64`。
+注意 `pgrep -l oahd` 返回空不代表没有 Rosetta——oahd 是按需拉起的守护进程，
+要判断能力应该用 `arch -x86_64 /usr/bin/true` 的退出码。
+
+意义：`x86_64-apple-darwin` 不需要 Intel 机器就能既构建又**执行**，所以它满足"不得发布
+从未被执行过的产物"这条规则，不必降覆盖。诚实的限制：Rosetta 翻译的是同一份机器码，
+能证明链接与逻辑可运行，不能证明在原生 Intel 芯片上行为一致。
+
+### 一个平台从未运行 ⇒ 该平台的缺陷全部积压
+
+Windows leg 从来没真正跑过，于是四个独立缺陷叠在一起，每修一个才暴露下一个：
+
+1. `version` 作业没装 Rust 工具链 → `cargo: command not found`
+   （它此前跑在 GitHub 托管 ubuntu 镜像上，cargo 自带，所以这个缺失一直隐形）。
+2. rustup 写不进容器默认 profile（os error 161）。
+3. 旧 cargo 抢 PATH（edition2024）。
+4. 镜像没有 MSVC（link: extra operand）。
+再往后还有两个**项目自身**的 Windows 缺陷（见 issues.md）。
+
+教训：一条从未在 CI 里执行过的路径，它的"支持"是声明而不是事实。四个环境相关缺陷 + 两个
+代码缺陷，全都是在第一次真正运行时一次性掉出来的。
