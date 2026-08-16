@@ -124,15 +124,15 @@ impl JsPluginPolicy {
                 source: "environment",
             };
         }
-        match config.plugin_runtime.as_ref().and_then(|it| it.javascript) {
-            Some(enabled) => Self {
-                enabled,
-                source: "config",
-            },
-            None => Self {
+        if config.plugin_runtime.is_none() {
+            return Self {
                 enabled: false,
                 source: "default",
-            },
+            };
+        }
+        Self {
+            enabled: config.javascript_plugins_enabled(),
+            source: "config",
         }
     }
 }
