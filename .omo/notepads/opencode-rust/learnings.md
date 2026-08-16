@@ -7681,3 +7681,50 @@ namespace… configure this test fixture, not the product"——改成 `ZUNO_PRO
 的散文。同理 `oracle.rs:844` 提到的 `OC_TESTKIT_ALLOW_MISSING_ORACLE` 是**已删除**
 机制的历史拼写（无任何代码读它），改名会伪造历史记录，所以保留原拼写并在散文里
 标注"since-removed / 不再指向本 crate 读取的任何东西"。
+
+**清理泄漏的 fixture 进程树：只杀树根，让 guard 链自己收尾；全量 kill 会制造收不掉的孤儿。**
+`zuno-process` 的测试会 spawn 真实进程树，异常中断后可能残留。66 个残留
+= 2 棵 fixture 树 × 33 个进程，正是
+`parent_sigkill_reaps_every_host_process_tree` 断言的拓扑
+（`1 + HOST_SESSION_COUNT * HOST_KIND_COUNT * CONTAINED_PROCESSES_PER_HOST`）。
+
+**guard 链本身就是 reaper**（`crates/zuno-process/src/lib.rs`）：
+`supervise` → `monitor` → `exec`。其中 `monitor`（:215 起）先给自己挂
+`set_parent_process_death_signal(TERM)`，再 spawn 的 `exec` 子进程通过
+`setpgid(None, None)`（:225）成为**进程组组长**；`monitor` 的轮询循环在
+子进程退出（:202）或父进程消失（:206-208）时调用
+`terminate_process_group(child_pid)`，即 `kill_process_group(pid, KILL)`
+（:292-295）——**这一步才是把整组 payload 一次扫掉的动作**。
+`supervise` 只发 `terminate_process`（TERM，单进程，不带组）。
+
+所以"收集全部匹配 PID 逐个 `kill -9`"是错的：先杀掉 `monitor` 就摧毁了那个
+会发组 KILL 的角色，剩下的 payload 成为没人回收的孤儿。实测连跑 6 轮全量 kill，
+计数始终钉在 66。正确做法是**只杀树根**（argv 含 `parent` 的进程），
+让 PDEATHSIG 逐级向下触发 guard 链自己回收，66 个一次全消失：
+
+```sh
+ps -eo pid=,args= | awk '/[z]uno-reaping-fixture/ && /parent/ {print $1}' | xargs -r kill -9
+```
+
+**测量陷阱一：`pgrep -x` 对这个二进制静默返回 0。**
+Linux 把 `comm` 截断到 15 字符，而 `zuno-reaping-fixture` 有 20 字符，
+所以 `pgrep -c -x zuno-reaping-fixture` 在 66 个进程存在时返回 `0`。
+能匹配的名字是截断后的 `zuno-reaping-fi`。`pgrep -f zuno-reaping-fixture`
+可用但会多出 1（命令行含该模式的 shell 自身）。
+**凡二进制名超过 15 字符都有这个坑，本仓库有多个 crate 超长。**
+
+**测量陷阱二：不同计数写法自匹配行为不同，会给出互相矛盾的数字。**
+同一批残留先后数出 101 / 99 / 66，差异来自
+`ps -eo args | grep -c '[z]uno...'` 与 `awk '/pattern/ && !/awk/'` 的
+自匹配处理不同。本二进制**唯一可靠的计数形式**是
+`pgrep -c -x zuno-reaping-fi`。
+
+**`__oc_child_guard` → `__zuno_child_guard` 是改名清单里最后一个 `oc` 字面量，
+漏掉的原因是同一个名字存在第二份拷贝。**
+`GUARD_MARKER` 常量在 `lib.rs:10`，但 `tests/containment.rs:183` 把字面量
+硬编码了一遍，不跟随常量。改名安全的依据：该 marker 是二进制 re-exec 成 guard 时
+传给**自己**的 argv token，spawner 与 receiver 恒为同一个二进制，不落盘、
+不入库、无跨版本契约。修法是把常量 `pub` 出去让测试引用它，消掉可再次漂移的第二份拷贝。
+这是"编译器不会把两份同名字符串链接起来"这一主题的第三个变体
+（前两个：insta 把 crate 名编码进**快照文件名**、`\b` 在下划线后不成立导致
+11 处 `CARGO_BIN_EXE_oc-*` 被漏）。

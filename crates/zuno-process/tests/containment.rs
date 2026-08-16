@@ -180,7 +180,7 @@ impl GuardedPty {
         let parent_pid = std::process::id().to_string();
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_zuno-process-fixture"));
         command.args([
-            "__oc_child_guard",
+            zuno_process::GUARD_MARKER,
             "supervise",
             &parent_pid,
             "--",

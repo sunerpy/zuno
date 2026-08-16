@@ -7,7 +7,11 @@ use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-const GUARD_MARKER: &str = "__oc_child_guard";
+/// First argv token marking an invocation as a hidden guard request.
+///
+/// Public only so tests build guard argv from this definition rather than
+/// repeating the literal.
+pub const GUARD_MARKER: &str = "__zuno_child_guard";
 const SUPERVISE_MODE: &str = "supervise";
 const MONITOR_MODE: &str = "monitor";
 const EXEC_MODE: &str = "exec";
