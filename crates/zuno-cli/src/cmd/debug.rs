@@ -124,7 +124,7 @@ fn config(context: &Context) -> Result<(), String> {
         "plugin_runtime_resolved".to_owned(),
         serde_json::json!({
             "javascript": policy.enabled,
-            "source": policy.source,
+            "source": policy.source.as_str(),
         }),
     );
     normalize_json_numbers(&mut output);

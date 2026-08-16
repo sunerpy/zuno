@@ -101,7 +101,38 @@ impl PluginRuntimeTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct JsPluginPolicy {
     pub(crate) enabled: bool,
-    pub(crate) source: &'static str,
+    pub(crate) source: JsPluginSource,
+}
+
+/// What decided whether the JavaScript plugin host may start.
+///
+/// An enum and not the reported string because one case carries behaviour:
+/// [`Self::Pure`] is a caller who asked for no external plugins, and telling that
+/// caller how to switch them on is noise on a path that was previously silent. A
+/// string compare would express the same rule with none of the checking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JsPluginSource {
+    /// `--pure`: an explicit request for no external plugins.
+    Pure,
+    Environment,
+    Config,
+    /// Nobody said anything either way, which means off.
+    Default,
+    #[cfg(test)]
+    Test,
+}
+
+impl JsPluginSource {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pure => "pure",
+            Self::Environment => "environment",
+            Self::Config => "config",
+            Self::Default => "default",
+            #[cfg(test)]
+            Self::Test => "test",
+        }
+    }
 }
 
 impl JsPluginPolicy {
@@ -115,25 +146,34 @@ impl JsPluginPolicy {
         if env.flag(crate::ZUNO_PURE) {
             return Self {
                 enabled: false,
-                source: "pure",
+                source: JsPluginSource::Pure,
             };
         }
         if env.flag(crate::ZUNO_ENABLE_JS_PLUGINS) {
             return Self {
                 enabled: true,
-                source: "environment",
+                source: JsPluginSource::Environment,
             };
         }
         if config.plugin_runtime.is_none() {
             return Self {
                 enabled: false,
-                source: "default",
+                source: JsPluginSource::Default,
             };
         }
         Self {
             enabled: config.javascript_plugins_enabled(),
-            source: "config",
+            source: JsPluginSource::Config,
         }
+    }
+
+    /// Whether a caller with configured plugins deserves to be told they are idle.
+    ///
+    /// False under `--pure`: that caller asked for no external plugins, so naming the
+    /// switch that would undo their own request is noise, on a path that printed
+    /// nothing before the host became opt-in.
+    pub(crate) fn should_explain_absence(self) -> bool {
+        !self.enabled && self.source != JsPluginSource::Pure
     }
 }
 
@@ -1044,6 +1084,89 @@ mod tests {
         ShellEnvOutput, TextCompleteInput, TextCompleteOutput, ToolDefinition, ToolDefinitionInput,
         ToolExecuteAfterInput, ToolExecuteBeforeInput, ToolExecuteBeforeOutput, ToolOutput,
     };
+    use super::{JsPluginPolicy, JsPluginSource};
+
+    fn config_with_javascript(javascript: Option<bool>) -> zuno_config::Config {
+        zuno_config::Config {
+            plugin_runtime: javascript.map(|javascript| zuno_config::schema::PluginRuntimeConfig {
+                javascript: Some(javascript),
+            }),
+            ..zuno_config::Config::default()
+        }
+    }
+
+    /// An absent key means off, which is the whole of the opt-in.
+    ///
+    /// Pinned apart from the precedence cases because it is the one a user reaches
+    /// without doing anything: each JavaScript plugin spawns a Node process, measured
+    /// at 1.4s of a 1.47s `models` run, so silence has to mean "do not pay that".
+    #[test]
+    fn an_absent_plugin_runtime_key_leaves_javascript_off() {
+        let policy =
+            JsPluginPolicy::resolve(&config_with_javascript(None), &zuno_paths::Env::empty());
+
+        assert!(!policy.enabled, "no request must mean no Node process");
+        assert_eq!(policy.source, JsPluginSource::Default);
+    }
+
+    /// `--pure` outranks both opt-ins, and says nothing about undoing itself.
+    ///
+    /// The silence is the assertion that matters: `--pure` printed nothing before the
+    /// host became opt-in, and offering that caller the switch they just declined
+    /// would be a behaviour regression dressed up as helpfulness.
+    #[test]
+    fn pure_refuses_the_host_even_when_the_environment_and_config_ask_for_it() {
+        let env = zuno_paths::Env::empty()
+            .with(crate::ZUNO_PURE, "1")
+            .with(crate::ZUNO_ENABLE_JS_PLUGINS, "1");
+
+        let policy = JsPluginPolicy::resolve(&config_with_javascript(Some(true)), &env);
+
+        assert!(!policy.enabled, "the existing kill switch must still kill");
+        assert_eq!(policy.source, JsPluginSource::Pure);
+        assert!(
+            !policy.should_explain_absence(),
+            "`--pure` must stay as quiet as it was before the host became opt-in"
+        );
+    }
+
+    /// The environment beats the configuration, so a one-off run needs no file edit.
+    #[test]
+    fn the_environment_opt_in_overrides_a_config_that_disables_the_host() {
+        let env = zuno_paths::Env::empty().with(crate::ZUNO_ENABLE_JS_PLUGINS, "1");
+
+        let policy = JsPluginPolicy::resolve(&config_with_javascript(Some(false)), &env);
+
+        assert!(policy.enabled);
+        assert_eq!(policy.source, JsPluginSource::Environment);
+    }
+
+    /// A configured setting is honoured either way, and reported as a choice.
+    ///
+    /// Both directions in one test because the distinction that matters is `source`:
+    /// `Config` and `Default` mean the same thing to the loader but different things
+    /// to a user reading `debug config`, and only one of them names a key to change.
+    #[test]
+    fn a_configured_javascript_setting_is_honoured_in_both_directions() {
+        let enabled = JsPluginPolicy::resolve(
+            &config_with_javascript(Some(true)),
+            &zuno_paths::Env::empty(),
+        );
+        assert!(enabled.enabled);
+        assert_eq!(enabled.source, JsPluginSource::Config);
+
+        let disabled = JsPluginPolicy::resolve(
+            &config_with_javascript(Some(false)),
+            &zuno_paths::Env::empty(),
+        );
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.source, JsPluginSource::Config);
+        assert!(
+            disabled.should_explain_absence(),
+            "a config that turned the host off is still worth naming: the user may \
+             have inherited the file rather than written it"
+        );
+    }
 
     const COMPACTION_PLUGIN: &str = r#"
 export default {
@@ -1507,7 +1630,7 @@ export default {
             // has to ask for the host the product no longer starts by default.
             super::JsPluginPolicy {
                 enabled: true,
-                source: "test",
+                source: super::JsPluginSource::Test,
             },
             super::PluginRuntimeTarget::server("catalog-test"),
         )
@@ -1735,7 +1858,7 @@ export default {
             // has to ask for the host the product no longer starts by default.
             super::JsPluginPolicy {
                 enabled: true,
-                source: "test",
+                source: super::JsPluginSource::Test,
             },
             super::PluginRuntimeTarget::server("compaction-test"),
         )
@@ -1841,7 +1964,7 @@ export default {
             // has to ask for the host the product no longer starts by default.
             super::JsPluginPolicy {
                 enabled: true,
-                source: "test",
+                source: super::JsPluginSource::Test,
             },
             super::PluginRuntimeTarget::server_with_stdio(
                 "oauth-test",

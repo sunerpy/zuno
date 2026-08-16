@@ -51,13 +51,15 @@ pub(super) fn execute(args: &ModelsArgs, environment: &StartupEnvironment) -> Re
         // configured plugin stopped contributing models is the "no results" and
         // "cannot see the data" confusion. stderr, so piped stdout stays a clean
         // `provider/model` list.
-        if !policy.enabled && config.plugin.as_ref().is_some_and(|list| !list.is_empty()) {
+        if policy.should_explain_absence()
+            && config.plugin.as_ref().is_some_and(|list| !list.is_empty())
+        {
             eprintln!(
                 "note: {} configured plugin(s) are not loaded because the JavaScript \
                  plugin host is off ({}); enable it with `{}=1` or \
                  `\"plugin_runtime\": {{\"javascript\": true}}`",
                 config.plugin.as_ref().map_or(0, Vec::len),
-                policy.source,
+                policy.source.as_str(),
                 crate::ZUNO_ENABLE_JS_PLUGINS,
             );
         }
