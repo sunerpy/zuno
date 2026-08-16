@@ -9149,3 +9149,20 @@ Windows leg 现在会跑发布 smoke，但 `crates/zuno-process/tests/windows_co
 `cargo fmt --check` 0；`clippy -D warnings` 0；`make smoke-artifact` PASS
 （`13 tools offered` 未变，因 smoke 自身设了 `OPENCODE_PURE=1`）。
 基线 3487 + 13 个新增测试 = 3500，逐条对得上：缺陷 A 7 个、缺陷 B 5 个、缺陷 C 1 个。
+
+### 附带发现（task r15，**未修，不在本次范围**）：zuno-smoke 有四个已失效的 env 拼写
+
+`crates/zuno-testkit/src/bin/zuno-smoke.rs:453-472` 的 `turn_variables` 设置了
+`OPENCODE_PURE` / `OPENCODE_AUTH_CONTENT` / `OPENCODE_DISABLE_MODELS_FETCH` /
+`OPENCODE_MODELS_PATH`，但这四个名字在 `ZUNO_ENV_NAME_MAP` 里都只接受 `ZUNO_*`
+拼写（`accepted_env_name`），所以**它们没有一个到达被测二进制**。五个里只有
+`OPENCODE_CONFIG_CONTENT` 是 `PLUGIN_ABI_ENV_NAMES` 成员，因此有效。
+
+后果：smoke 自认为在测 `--pure` 路径，其实没有。它仍然通过且仍有意义——
+`ScriptedEnv` 给的是临时 XDG 目录、注入的 config 不声明 `plugin` 列表，
+所以无论有没有 `--pure`，都没有插件可发现；`13 tools offered` 是内建工具集，
+与本次的 JS 插件门控无关（改动前后都是 13，已实测）。
+
+这是 notepad 里「fixture 与 host 必须同一提交改完」那条的又一实例：`oc-` → `zuno-`
+改名扫干净了产品侧，却把这个 fixture 的旧拼写留下了，而它静默走默认分支，测试照样绿。
+**修它需要单独验证**（打开 `--pure` 后 smoke 的行为是否仍如预期），因此本次只登记不动。
