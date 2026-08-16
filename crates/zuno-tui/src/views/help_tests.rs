@@ -312,3 +312,51 @@ fn views_help_closes_on_escape_and_on_its_own_action() {
         );
     }
 }
+
+#[test]
+fn help_keeps_the_description_separated_from_a_long_key_list() {
+    // Measured on a real terminal before the fix: `ctrl+c, ctrl+d, ctrl+x q` is 23 columns
+    // wide against a 22-column field, so the row rendered as `ctrl+x qExit the application`
+    // — the separator vanished and the description read as part of the chord.
+    let keymap = Keymap::defaults().expect("the shipped binding table resolves");
+    let mut view = HelpView::new(ViewContext::defaults(), &keymap);
+    view.set_filter("Exit the application");
+    let rows = view
+        .lines(120)
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    let row = rows
+        .iter()
+        .find(|row| row.contains("Exit the application"))
+        .unwrap_or_else(|| panic!("the exit row is missing: {rows:?}"));
+    assert!(
+        row.contains("  Exit the application"),
+        "the description is not separated from the keys: [{row}]"
+    );
+    assert!(
+        !row.contains("qExit"),
+        "the key column overflowed into the description: [{row}]"
+    );
+}
+
+#[test]
+fn help_rows_all_fill_the_width_they_were_given() {
+    let keymap = Keymap::defaults().expect("the shipped binding table resolves");
+    let mut view = HelpView::new(ViewContext::defaults(), &keymap);
+    for width in [80_u16, 120, 200] {
+        for line in view.lines(width) {
+            let used: usize = line
+                .spans
+                .iter()
+                .map(|span| crate::views::display_width(&span.content))
+                .sum();
+            assert_eq!(used, usize::from(width), "at width {width}");
+        }
+    }
+}

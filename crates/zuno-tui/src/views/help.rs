@@ -36,6 +36,12 @@ pub const DIALOG_ID: &str = "help_show";
 /// What an action with no key renders as.
 pub const UNBOUND: &str = "(unbound)";
 
+/// Columns the key column occupies.
+///
+/// Wide enough for `ctrl+alt+home` and for [`UNBOUND`]; a list of synonyms longer than this
+/// is truncated rather than allowed to run into the description.
+pub const KEY_COLUMN: usize = 22;
+
 /// One help row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -178,17 +184,27 @@ impl Dialog for HelpView {
                     } else {
                         self.context.text()
                     };
-                    Line::from(vec![
-                        Span::styled(format!("   {:<22}", entry.keys), self.context.accent()),
+                    // The key column is truncated rather than allowed to overflow. Measured
+                    // on a real terminal: `ctrl+c, ctrl+d, ctrl+x q` is 23 columns wide, so
+                    // the row rendered as `ctrl+x qExit the application` — the separator
+                    // disappeared and the description read as part of the chord. The full
+                    // list stays discoverable because the filter searches this same column.
+                    let keys = if crate::views::display_width(&entry.keys) > KEY_COLUMN {
+                        format!("{}…", crate::views::truncate(&entry.keys, KEY_COLUMN - 1))
+                    } else {
+                        entry.keys.clone()
+                    };
+                    let head = format!("   {keys:<KEY_COLUMN$}  ");
+                    let used = crate::views::display_width(&head)
+                        + crate::views::display_width(entry.description);
+                    let mut spans = vec![
+                        Span::styled(head, self.context.accent()),
                         Span::styled(entry.description.to_owned(), style),
-                        Span::styled(
-                            " ".repeat(
-                                usize::from(width)
-                                    .saturating_sub(25 + entry.description.chars().count()),
-                            ),
-                            style,
-                        ),
-                    ])
+                    ];
+                    if used < usize::from(width) {
+                        spans.push(Span::styled(" ".repeat(usize::from(width) - used), style));
+                    }
+                    Line::from(spans)
                 }
             })
             .collect()
