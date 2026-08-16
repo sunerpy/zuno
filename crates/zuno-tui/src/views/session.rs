@@ -74,6 +74,46 @@ pub struct SessionScreen {
     cancellations: usize,
     cancel_requested: bool,
     sidebar_visible: bool,
+    /// The resolved palette and configuration, for the pickers this screen builds.
+    context: ViewContext,
+    /// What the pickers offer, stated by the host.
+    catalog: SessionCatalog,
+    /// Dialogs asked for but not yet opened by the host.
+    requested: Vec<Box<dyn crate::views::dialog::Dialog>>,
+    /// Selections the user made, for a host that applies them to the next turn.
+    selections: Option<mpsc::Sender<Selection>>,
+}
+
+/// One choice the user made in a picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Selection {
+    /// A different `provider/model` for subsequent turns.
+    Model(String),
+    /// A different agent for subsequent turns.
+    Agent(String),
+    /// A different session to continue in.
+    Session(String),
+    /// A different theme.
+    Theme(String),
+}
+
+/// What the pickers can offer, as the host resolved it.
+///
+/// Plain lists rather than a live query: a picker redraws on every keystroke, and a
+/// surface that re-listed sessions per frame would put a database read in the render
+/// path. The host states them once and restates them when they change.
+#[derive(Debug, Clone, Default)]
+pub struct SessionCatalog {
+    /// Every model the catalog offers.
+    pub models: Vec<crate::views::picker::ModelEntry>,
+    /// Every agent discovery found.
+    pub agents: Vec<crate::views::picker::AgentEntry>,
+    /// Recent sessions.
+    pub sessions: Vec<crate::views::picker::SessionEntry>,
+    /// `provider/model` currently in use, so the picker opens on it.
+    pub model: Option<String>,
+    /// The agent currently in use.
+    pub agent: Option<String>,
 }
 
 impl SessionScreen {
@@ -85,7 +125,7 @@ impl SessionScreen {
             status: StatusView::new(context.clone()),
             welcome: crate::views::welcome::WelcomeView::new(context.clone()),
             sidebar: crate::views::ambient::SidebarView::new(context.clone()),
-            editor: InputEditor::new(context),
+            editor: InputEditor::new(context.clone()),
             shutdown,
             prompts: None,
             cancels: None,
@@ -93,6 +133,10 @@ impl SessionScreen {
             cancellations: 0,
             cancel_requested: false,
             sidebar_visible: true,
+            context,
+            catalog: SessionCatalog::default(),
+            requested: Vec::new(),
+            selections: None,
         }
     }
 
@@ -139,6 +183,29 @@ impl SessionScreen {
     /// The welcome screen, for the host that resolves the facts it states.
     pub const fn welcome_mut(&mut self) -> &mut crate::views::welcome::WelcomeView {
         &mut self.welcome
+    }
+
+    /// State what the pickers offer.
+    #[must_use]
+    pub fn with_catalog(mut self, catalog: SessionCatalog) -> Self {
+        self.catalog = catalog;
+        self
+    }
+
+    /// Forward every picker choice to a host that can apply it.
+    ///
+    /// Optional and `try_send`, for the same reasons the prompt sink is: a screen with
+    /// no host is still a legitimate screen, and blocking here would stall the loop
+    /// that has to draw the choice.
+    #[must_use]
+    pub fn with_selection_sink(mut self, selections: mpsc::Sender<Selection>) -> Self {
+        self.selections = Some(selections);
+        self
+    }
+
+    /// What the pickers offer, mutably, for a host that restates it.
+    pub const fn catalog_mut(&mut self) -> &mut SessionCatalog {
+        &mut self.catalog
     }
 
     /// The status strip, for the host that states the configured agent and model.
@@ -353,8 +420,77 @@ impl SessionScreen {
                 self.transcript.follow();
                 EventResult::REDRAW
             }
+            "model_list" => self.request(self.model_picker()),
+            "agent_list" => self.request(self.agent_picker()),
+            "session_list" => self.request(self.session_picker()),
+            "theme_list" => self.request(self.theme_picker()),
             _ => EventResult::IGNORED,
         }
+    }
+
+    /// Ask the host to open `dialog`, or say why it cannot be opened.
+    ///
+    /// A picker with nothing in it is the failure mode that reads as a broken key: the
+    /// dialog opens, says `no matches`, and the user cannot tell an empty catalog from
+    /// a surface that did not load. Saying so in the transcript keeps the two apart.
+    fn request(&mut self, dialog: Option<Box<dyn crate::views::dialog::Dialog>>) -> EventResult {
+        match dialog {
+            Some(dialog) => {
+                self.requested.push(dialog);
+                EventResult::REDRAW
+            }
+            None => {
+                self.transcript
+                    .transcript_mut()
+                    .push(Message::notice("nothing to choose from here yet"));
+                EventResult::REDRAW
+            }
+        }
+    }
+
+    fn model_picker(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
+        if self.catalog.models.is_empty() {
+            return None;
+        }
+        let mut picker =
+            crate::views::picker::model_picker(self.context.clone(), self.catalog.models.clone());
+        if let Some(model) = &self.catalog.model {
+            picker = picker.selecting(model);
+        }
+        Some(Box::new(picker))
+    }
+
+    fn agent_picker(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
+        if self.catalog.agents.is_empty() {
+            return None;
+        }
+        let mut picker =
+            crate::views::picker::agent_picker(self.context.clone(), self.catalog.agents.clone());
+        if let Some(agent) = &self.catalog.agent {
+            picker = picker.selecting(agent);
+        }
+        Some(Box::new(picker))
+    }
+
+    fn session_picker(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
+        if self.catalog.sessions.is_empty() {
+            return None;
+        }
+        Some(Box::new(crate::views::picker::session_picker(
+            self.context.clone(),
+            self.catalog.sessions.clone(),
+        )))
+    }
+
+    fn theme_picker(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
+        // The registry is built here rather than held, because the picker resolves every
+        // theme once at construction for its preview and then never consults it again.
+        let registry = crate::theme::ThemeRegistry::new();
+        Some(Box::new(crate::views::picker::theme_picker(
+            self.context.clone(),
+            &registry,
+            crate::theme::Mode::Dark,
+        )))
     }
 
     /// Cancel a running turn, or leave the application when none is running.
@@ -379,7 +515,74 @@ impl SessionScreen {
     }
 }
 
+impl SessionScreen {
+    /// Adopt a picker's answer, and forward it to whoever can act on it.
+    ///
+    /// The strip and the welcome facts are updated here so the choice is visible
+    /// immediately, while the sink carries it to the host that can only apply it to the
+    /// *next* turn. Saying so in the transcript is the point: a model that changed on
+    /// screen but not in the running turn, with nothing said, is a surface that lies.
+    fn adopt(&mut self, dialog: &'static str, value: &str) -> EventResult {
+        let selection = match dialog {
+            crate::views::picker::MODEL_DIALOG_ID => {
+                self.catalog.model = Some(value.to_owned());
+                self.status.set_configured_model(value);
+                self.welcome.facts_mut().model = Some(value.to_owned());
+                self.sidebar.ambient_mut().model = Some(value.to_owned());
+                Selection::Model(value.to_owned())
+            }
+            crate::views::picker::AGENT_DIALOG_ID => {
+                self.catalog.agent = Some(value.to_owned());
+                self.status.set_configured_agent(value);
+                self.welcome.facts_mut().agent = Some(value.to_owned());
+                self.sidebar.ambient_mut().agent = Some(value.to_owned());
+                Selection::Agent(value.to_owned())
+            }
+            crate::views::picker::SESSION_DIALOG_ID => Selection::Session(value.to_owned()),
+            crate::views::picker::THEME_DIALOG_ID => Selection::Theme(value.to_owned()),
+            _ => return EventResult::IGNORED,
+        };
+        let notice = match &selection {
+            Selection::Model(model) => format!("model set to {model} for the next turn"),
+            Selection::Agent(agent) => format!("agent set to {agent} for the next turn"),
+            Selection::Session(id) => format!("session {id} selected"),
+            Selection::Theme(theme) => format!("theme {theme} selected"),
+        };
+        let delivered = self
+            .selections
+            .as_ref()
+            .is_some_and(|sink| sink.try_send(selection).is_ok());
+        let text = if delivered {
+            notice
+        } else {
+            // A refused sink is reported rather than swallowed. The alternative is the
+            // defect this whole change is about: a picker that appears to work, a
+            // selection that reached nothing, and no way for the user to tell.
+            format!("{notice} (not applied: nothing is listening)")
+        };
+        self.transcript.transcript_mut().push(Message::notice(text));
+        EventResult::REDRAW
+    }
+}
+
 impl ActionComponent for SessionScreen {
+    fn drain_dialogs(&mut self) -> Vec<Box<dyn crate::views::dialog::Dialog>> {
+        std::mem::take(&mut self.requested)
+    }
+
+    fn apply_dialog_outcome(
+        &mut self,
+        dialog: &'static str,
+        outcome: &crate::views::dialog::DialogOutcome,
+    ) -> EventResult {
+        match outcome {
+            crate::views::dialog::DialogOutcome::Selected { value, .. } => {
+                self.adopt(dialog, value)
+            }
+            _ => EventResult::IGNORED,
+        }
+    }
+
     fn handle_action(&mut self, action: &'static Definition, event: &KeyEvent) -> EventResult {
         // `ctrl+c` and `ctrl+d` are each claimed by the `input` scope before `app`,
         // so a screen that only watched for `app_exit` could never be left. Asking
@@ -414,14 +617,27 @@ impl ActionComponent for SessionScreen {
 /// `input` and `prompt` before `app` so a binding the editor claims wins over an
 /// application-wide one on the same chord, and `app` last so `app_exit` still
 /// resolves while the prompt has focus.
+/// Every scope whose actions this screen can act on, plus `app` last.
+///
+/// A scope missing from this list is the quietest possible dead key: the binding table
+/// has the row, the chord is spelled, [`SessionScreen::handle_action`] has an arm for
+/// it — and [`crate::keybind::KeyDispatcher`] never resolves the press, because
+/// resolution is scoped. The four pickers were unreachable for two independent reasons
+/// at once, and this was the second one; a screen that handles an action must therefore
+/// list the scope that action lives in.
 #[must_use]
 pub fn scopes() -> Vec<String> {
-    vec![
-        String::from("input"),
-        String::from("prompt"),
-        String::from("messages"),
-        String::from("app"),
+    [
+        // `input` and `prompt` first, so a chord the editor claims wins over an
+        // application-wide one on the same keys.
+        "input", "prompt", "messages", "model", "agent", "session", "theme", "sidebar", "tool",
+        "display", "tips", "command", "help",
+        // `app` last, so `app_exit` still resolves while the prompt has focus.
+        "app",
     ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 
 #[cfg(test)]

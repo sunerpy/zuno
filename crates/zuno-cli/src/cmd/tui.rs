@@ -63,6 +63,12 @@ const PROMPT_CHANNEL_CAPACITY: usize = 1;
 /// to shutdown rather than swallow the key.
 const CANCEL_CHANNEL_CAPACITY: usize = 1;
 
+/// How many picker choices may be queued.
+///
+/// A few, not one: a user can pick a model and an agent in quick succession, and a full
+/// channel would make the second choice a visible refusal for no reason.
+const SELECTION_CHANNEL_CAPACITY: usize = 8;
+
 pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Result<(), String> {
     if !std::io::stdout().is_terminal() {
         return Err(
@@ -96,23 +102,30 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
     // Read before `TurnHost::open` consumes the plan, and before raw mode, so a slow
     // skill scan cannot delay the first frame of an already-entered alternate screen.
     let facts = runtime.block_on(SessionFacts::resolve(&plan, environment));
+    let catalog = runtime.block_on(session_catalog(&plan, environment));
     let broker = Arc::new(PermissionBroker::new(terminal_sender.clone()));
     let approval: Arc<dyn PermissionAsker> = if args.auto {
         Arc::new(AutoApproval)
     } else {
         Arc::clone(&broker) as Arc<dyn PermissionAsker>
     };
+    let driver_approval = Arc::clone(&approval);
+    let driver_options = options.clone();
+    let driver_environment = environment.clone();
     let host = TurnHost::open(plan, environment, approval)?;
     let engine_sender = host.with_event_hooks(engine_sender);
     let plugins = host.plugin_runtime();
     broker.bind_session(host.session_id());
 
     let (cancel_sender, cancel_receiver) = mpsc::channel(CANCEL_CHANNEL_CAPACITY);
+    let (selection_sender, selection_receiver) = mpsc::channel(SELECTION_CHANNEL_CAPACITY);
     let control = host.control();
 
     let mut screen = SessionScreen::new(context.clone(), terminal_sender.clone())
         .with_prompt_sink(prompt_sender)
-        .with_cancel_sink(cancel_sender);
+        .with_cancel_sink(cancel_sender)
+        .with_selection_sink(selection_sender)
+        .with_catalog(catalog);
     facts.describe(&mut screen, host.tool_count());
     if let Some(prompt) = args
         .prompt
@@ -139,7 +152,17 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
     let session = TerminalSession::start(lifecycle).map_err(to_string)?;
     let outcome = runtime.block_on(async move {
         let input = tokio::spawn(zuno_tui::app::forward_terminal_input(terminal_sender));
-        let turns = tokio::spawn(drive_turns(host, prompt_receiver, engine_sender));
+        let turns = tokio::spawn(drive_turns(
+            TurnDriver {
+                host,
+                options: driver_options,
+                approval: driver_approval,
+            },
+            prompt_receiver,
+            selection_receiver,
+            driver_environment,
+            engine_sender,
+        ));
         let cancels = tokio::spawn(forward_cancellations(control, cancel_receiver));
         let outcome = app.run().await;
         input.abort();
@@ -349,12 +372,159 @@ async fn forward_cancellations(
 /// on stderr under raw mode is either invisible or corrupts the frame. The interrupt
 /// event goes first so the status strip stops claiming a running turn, and the error
 /// second so the strip's detail is what remains on screen.
+/// What the model, agent and session pickers offer.
+///
+/// Models are limited to the **session provider's own**, which is a correctness bound
+/// rather than a shortcut: a turn wires exactly one provider credential, so offering
+/// another vendor's model would offer a choice that could only fail — and it would fail
+/// by presenting this provider's key to that vendor's endpoint. Switching provider is a
+/// relaunch, and a picker that said otherwise would be lying about what it can do.
+async fn session_catalog(
+    plan: &TurnPlan,
+    environment: &StartupEnvironment,
+) -> zuno_tui::views::session::SessionCatalog {
+    let env = environment.resolved();
+    let provider = plan.provider_id().to_owned();
+    let models = plan
+        .provider_model_ids()
+        .into_iter()
+        .map(|id| zuno_tui::views::picker::ModelEntry {
+            id: format!("{provider}/{id}"),
+            name: id,
+            provider: provider.clone(),
+        })
+        .collect();
+    let agents = zuno_catalog::agent::load(plan.directory(), plan.worktree(), env)
+        .map(|agents| {
+            agents
+                .into_iter()
+                .map(|agent| zuno_tui::views::picker::AgentEntry {
+                    name: agent.name,
+                    description: agent.description.unwrap_or_default(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    zuno_tui::views::session::SessionCatalog {
+        models,
+        agents,
+        // Sessions are deliberately absent: the picker would list them, and this task
+        // cannot switch session without discarding the turn it may be running. An empty
+        // list makes the key report "nothing to choose from" rather than open a surface
+        // whose selection would be silently ignored.
+        sessions: Vec::new(),
+        model: Some(plan.qualified_model()),
+        agent: Some(plan.agent_name().to_owned()),
+    }
+}
+
+/// Rebuild the turn host whenever the user picks a different model or agent.
+///
+/// A new host rather than a mutated one, and that is the safety argument rather than a
+/// convenience: a host wires exactly one provider credential, so moving it to another
+/// provider's model in place would present that credential to a different vendor's
+/// endpoint. Going back through [`TurnPlan::resolve`] and [`TurnHost::open`] — the same
+/// path the launch takes — re-resolves the credential, the tool set and the token window
+/// together, so there is no combination reachable here that a launch could not produce.
+///
+/// The session id is carried over, so the conversation continues rather than restarting.
+///
+/// A failure leaves the previous host in place and says so on the transcript's own
+/// channel. The alternative — tearing down a working host on a bad pick — would lose the
+/// session over a keystroke.
+async fn apply_selection(
+    selection: zuno_tui::views::session::Selection,
+    host: &mut TurnHost,
+    options: &TurnOptions,
+    environment: &StartupEnvironment,
+    approval: &Arc<dyn PermissionAsker>,
+    events: &TurnEventSender,
+) -> Option<TurnEventSender> {
+    let mut next = options.clone();
+    next.session = SessionChoice::Existing(host.session_id().to_owned());
+    match selection {
+        zuno_tui::views::session::Selection::Model(model) => next.model = Some(model),
+        zuno_tui::views::session::Selection::Agent(agent) => next.agent = Some(agent),
+        // A theme is the view layer's own business and a session change is not something
+        // this task can honour without discarding the turn it may be running.
+        zuno_tui::views::session::Selection::Session(_)
+        | zuno_tui::views::session::Selection::Theme(_) => return None,
+    }
+    let rebuilt = async {
+        let plan = TurnPlan::resolve(&next, environment).await?;
+        TurnHost::open(plan, environment, Arc::clone(approval))
+    }
+    .await;
+    match rebuilt {
+        Ok(replacement) => {
+            let hooked = replacement.with_event_hooks(events.clone());
+            *host = replacement;
+            Some(hooked)
+        }
+        Err(message) => {
+            let _reported = events
+                .publish(TurnEvent::Provider {
+                    step: 0,
+                    event: StreamEvent::StatusDetail {
+                        detail: format!("warning: keeping the previous model: {message}"),
+                    },
+                })
+                .await;
+            None
+        }
+    }
+}
+
+struct TurnDriver {
+    host: TurnHost,
+    options: TurnOptions,
+    approval: Arc<dyn PermissionAsker>,
+}
+
 async fn drive_turns(
-    mut host: TurnHost,
+    mut driver: TurnDriver,
     mut prompts: mpsc::Receiver<String>,
-    events: TurnEventSender,
+    mut selections: mpsc::Receiver<zuno_tui::views::session::Selection>,
+    environment: StartupEnvironment,
+    mut events: TurnEventSender,
 ) {
-    while let Some(prompt) = prompts.recv().await {
+    loop {
+        // A selection is taken only between turns, never during one: rebuilding the host
+        // mid-turn would drop the stream the loop is still reading.
+        let prompt = tokio::select! {
+            biased;
+            prompt = prompts.recv() => match prompt {
+                Some(prompt) => prompt,
+                None => return,
+            },
+            selection = selections.recv() => {
+                let Some(selection) = selection else { return };
+                if let Some(rebuilt) = apply_selection(
+                    selection,
+                    &mut driver.host,
+                    &driver.options,
+                    &environment,
+                    &driver.approval,
+                    &events,
+                )
+                .await
+                {
+                    events = rebuilt;
+                }
+                continue;
+            }
+        };
+        drive_one(&mut driver.host, prompt, &mut prompts, &events).await;
+    }
+}
+
+async fn drive_one(
+    host: &mut TurnHost,
+    prompt: String,
+    prompts: &mut mpsc::Receiver<String>,
+    events: &TurnEventSender,
+) {
+    {
         let outcome = async {
             host.drive(&prompt, events.clone()).await?;
             loop {
@@ -388,9 +558,9 @@ async fn drive_turns(
                         })
                         .await,
                 );
-            if reported.is_err() {
-                return;
-            }
+            // A closed event channel means the render loop has gone; there is nothing
+            // left to report a failure to.
+            let _closed = reported.is_err();
         }
     }
 }

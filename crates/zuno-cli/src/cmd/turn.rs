@@ -130,6 +130,8 @@ pub(crate) struct TurnPlan {
     notes: Vec<String>,
     plugin_tools: Vec<Arc<dyn zuno_tool::Tool>>,
     plugins: Option<Arc<super::plugin_runtime::PluginRuntime>>,
+    /// The session provider's model ids, kept for the model picker.
+    provider_models: Vec<String>,
 }
 
 impl TurnPlan {
@@ -260,6 +262,13 @@ impl TurnPlan {
             },
             &mut notes,
         )?;
+        let provider_models = catalog
+            .provider(&provider_id)
+            .map_or_else(Vec::new, |provider| {
+                let mut ids = provider.models.keys().cloned().collect::<Vec<_>>();
+                ids.sort_by(|left, right| zuno_llm::catalog::collate::compare(left, right));
+                ids
+            });
         Ok(Self {
             directory,
             project,
@@ -279,6 +288,7 @@ impl TurnPlan {
             notes,
             plugin_tools,
             plugins,
+            provider_models,
         })
     }
 
@@ -307,6 +317,19 @@ impl TurnPlan {
     /// The agent that will answer.
     pub(crate) fn agent_name(&self) -> &str {
         &self.agent.name
+    }
+
+    /// The provider whose credential this turn wired.
+    pub(crate) fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    /// Every model id the session provider offers, sorted as `zuno models` prints them.
+    ///
+    /// Kept from resolution rather than re-derived: rebuilding the catalog means reading
+    /// the cache and re-applying plugin extensions, and a picker must not do that.
+    pub(crate) fn provider_model_ids(&self) -> Vec<String> {
+        self.provider_models.clone()
     }
 
     /// `provider/model`, as resolved.

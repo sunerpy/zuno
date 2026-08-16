@@ -573,3 +573,239 @@ async fn session_screen_exit_key_ends_the_application_loop() {
         .expect("pressing the exit key must end the loop")
         .expect("the loop must end cleanly");
 }
+
+// ---------------------------------------------------------------------------
+// Pickers: the four surfaces nothing could previously reach
+// ---------------------------------------------------------------------------
+
+fn catalog() -> SessionCatalog {
+    SessionCatalog {
+        models: vec![
+            crate::views::picker::ModelEntry {
+                id: String::from("prov/haiku"),
+                name: String::from("haiku"),
+                provider: String::from("prov"),
+            },
+            crate::views::picker::ModelEntry {
+                id: String::from("prov/sonnet"),
+                name: String::from("sonnet"),
+                provider: String::from("prov"),
+            },
+        ],
+        agents: vec![crate::views::picker::AgentEntry {
+            name: String::from("plan"),
+            description: String::from("read-only planning"),
+        }],
+        sessions: Vec::new(),
+        model: Some(String::from("prov/haiku")),
+        agent: Some(String::from("build")),
+    }
+}
+
+#[test]
+fn session_screen_asks_the_host_to_open_the_model_picker() {
+    // Before the `drain_dialogs` seam existed, `model_picker` was constructible only
+    // from its own tests: the screen sits *below* the dialog host, so it could not open
+    // anything, and `<leader>m` resolved to an action nothing acted on.
+    let (mut screen, _shutdown) = screen();
+    *screen.catalog_mut() = catalog();
+    let result = screen.handle_action(action("model_list"), &press_none());
+    assert!(result.handled && result.redraw);
+    let requested = screen.drain_dialogs();
+    assert_eq!(requested.len(), 1, "no dialog was requested");
+    assert_eq!(requested[0].id(), crate::views::picker::MODEL_DIALOG_ID);
+    assert!(
+        screen.drain_dialogs().is_empty(),
+        "a drained request was offered twice"
+    );
+}
+
+#[test]
+fn session_screen_opens_a_picker_through_the_dialog_host() {
+    // The end-to-end proof: a key press resolved by the dispatcher reaches the screen,
+    // the screen asks, and the host opens — with no component naming a key.
+    let keymap = Keymap::defaults().expect("the shipped table builds");
+    let (sender, _receiver) = terminal_event_channel();
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender);
+    *screen.catalog_mut() = catalog();
+    let host = crate::views::dialog::DialogHost::new(ViewContext::defaults(), Box::new(screen));
+    let mut dispatcher = KeyDispatcher::new(keymap, scopes(), Box::new(host));
+
+    for chord in ["ctrl+x", "m"] {
+        let parsed = crate::keybind::Chord::parse(chord).expect("a valid spelling");
+        let event = KeyEvent {
+            code: match parsed.to_string().rsplit('+').next() {
+                Some("m") => crossterm::event::KeyCode::Char('m'),
+                _ => crossterm::event::KeyCode::Char('x'),
+            },
+            modifiers: if parsed.to_string().contains("ctrl+") {
+                crossterm::event::KeyModifiers::CONTROL
+            } else {
+                crossterm::event::KeyModifiers::NONE
+            },
+            kind: crossterm::event::KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        };
+        dispatcher.handle_event(&crate::app::AppEvent::Terminal(TerminalEvent::Input(
+            crossterm::event::Event::Key(event),
+        )));
+    }
+    let joined = rows(&render_offscreen(&mut dispatcher, 80, 24).expect("infallible")).join("\n");
+    assert!(
+        joined.contains("Models"),
+        "the leader sequence did not open the model picker:\n{joined}"
+    );
+    assert!(joined.contains("haiku"), "{joined}");
+}
+
+#[test]
+fn session_screen_says_so_when_a_picker_would_be_empty() {
+    // An empty picker that opened would say `no matches`, which a user cannot tell from
+    // a surface that failed to load its list.
+    let (mut screen, _shutdown) = screen();
+    let result = screen.handle_action(action("model_list"), &press_none());
+    assert!(result.redraw);
+    assert!(
+        screen.drain_dialogs().is_empty(),
+        "an empty picker was opened anyway"
+    );
+    let joined = rows(&render_offscreen(&mut screen, 80, 12).expect("infallible")).join("\n");
+    assert!(
+        joined.contains("nothing to choose from"),
+        "the refusal was silent:\n{joined}"
+    );
+}
+
+#[test]
+fn session_screen_applies_a_model_choice_and_forwards_it() {
+    let (sender, _receiver) = terminal_event_channel();
+    let (selections, mut chosen) = mpsc::channel(4);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_selection_sink(selections)
+        .with_catalog(catalog());
+    let result = screen.apply_dialog_outcome(
+        crate::views::picker::MODEL_DIALOG_ID,
+        &crate::views::dialog::DialogOutcome::Selected {
+            dialog: crate::views::picker::MODEL_DIALOG_ID,
+            value: String::from("prov/sonnet"),
+        },
+    );
+    assert!(result.redraw);
+    assert_eq!(
+        chosen.try_recv(),
+        Ok(Selection::Model(String::from("prov/sonnet"))),
+        "the choice never reached the host"
+    );
+    let joined = rows(&render_offscreen(&mut screen, 90, 14).expect("infallible")).join("\n");
+    assert!(
+        joined.contains("prov/sonnet"),
+        "the strip still names the previous model:\n{joined}"
+    );
+    assert!(
+        joined.contains("next turn"),
+        "the transcript does not say when the choice takes effect:\n{joined}"
+    );
+}
+
+#[test]
+fn session_screen_reports_a_choice_that_reached_nobody() {
+    // The defect class this whole seam is about: a picker that appears to work and a
+    // selection that went nowhere.
+    let (mut screen, _shutdown) = screen();
+    *screen.catalog_mut() = catalog();
+    screen.apply_dialog_outcome(
+        crate::views::picker::AGENT_DIALOG_ID,
+        &crate::views::dialog::DialogOutcome::Selected {
+            dialog: crate::views::picker::AGENT_DIALOG_ID,
+            value: String::from("plan"),
+        },
+    );
+    let joined = rows(&render_offscreen(&mut screen, 90, 14).expect("infallible")).join("\n");
+    assert!(
+        joined.contains("not applied"),
+        "a selection with no listener was reported as applied:\n{joined}"
+    );
+}
+
+#[test]
+fn session_screen_theme_picker_opens_without_a_catalog() {
+    // Themes come from the registry, not the host, so this picker is never empty.
+    let (mut screen, _shutdown) = screen();
+    screen.handle_action(action("theme_list"), &press_none());
+    let requested = screen.drain_dialogs();
+    assert_eq!(requested.len(), 1);
+    assert_eq!(requested[0].id(), crate::views::picker::THEME_DIALOG_ID);
+}
+
+#[test]
+fn session_screen_thinking_and_tool_detail_keys_reach_the_transcript() {
+    // Both actions ship unbound in the oracle's table, so they are reachable only
+    // through a user binding or a palette — but the *routing* must exist, or binding
+    // them would still do nothing.
+    let (mut screen, _shutdown) = screen();
+    let before = screen.transcript_mut().thinking();
+    screen.handle_action(action("display_thinking"), &press_none());
+    assert_ne!(
+        screen.transcript_mut().thinking(),
+        before,
+        "`display_thinking` did not reach the transcript"
+    );
+    let tools = screen.transcript_mut().tool_output();
+    screen.handle_action(action("tool_details"), &press_none());
+    assert_ne!(
+        screen.transcript_mut().tool_output(),
+        tools,
+        "`tool_details` did not reach the transcript"
+    );
+}
+
+#[test]
+fn session_screen_sidebar_toggle_hides_the_ambient_panel() {
+    let (mut screen, _shutdown) = screen();
+    assert!(screen.sidebar_visible());
+    let wide = rows(&render_offscreen(&mut screen, 200, 30).expect("infallible")).join("\n");
+    assert!(wide.contains("Context"), "the panel is not drawn:\n{wide}");
+
+    screen.handle_action(action("sidebar_toggle"), &press_none());
+    assert!(!screen.sidebar_visible());
+    let hidden = rows(&render_offscreen(&mut screen, 200, 30).expect("infallible")).join("\n");
+    assert!(
+        !hidden.contains("Context"),
+        "the panel is still drawn after being toggled off:\n{hidden}"
+    );
+}
+
+#[test]
+fn session_screen_drops_the_panel_rather_than_squeezing_it() {
+    let (mut screen, _shutdown) = screen();
+    let narrow = rows(&render_offscreen(&mut screen, 100, 30).expect("infallible")).join("\n");
+    assert!(
+        !narrow.contains("Context"),
+        "the panel was drawn at 100 columns, below the threshold:\n{narrow}"
+    );
+    let wide = rows(&render_offscreen(&mut screen, 120, 30).expect("infallible")).join("\n");
+    assert!(
+        wide.contains("Context"),
+        "the panel is missing at exactly the threshold width:\n{wide}"
+    );
+}
+
+#[test]
+fn session_screen_shows_the_welcome_surface_only_while_the_transcript_is_empty() {
+    let (mut screen, _shutdown) = screen();
+    let empty = rows(&render_offscreen(&mut screen, 200, 40).expect("infallible")).join("\n");
+    assert!(
+        empty.contains("a coding agent"),
+        "the welcome surface is missing on an empty transcript:\n{empty}"
+    );
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .push(Message::user("first prompt"));
+    let used = rows(&render_offscreen(&mut screen, 200, 40).expect("infallible")).join("\n");
+    assert!(
+        !used.contains("a coding agent"),
+        "the welcome surface survived the first message:\n{used}"
+    );
+    assert!(used.contains("first prompt"), "{used}");
+}

@@ -46,6 +46,7 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
             wire_model: "model".to_owned(),
             spec: Spec::new(COMPATIBLE_PROVIDER).with_surface(ApiSurface::Chat),
         },
+        provider_models: Vec::new(),
         directory,
         project,
         config: zuno_config::schema::Config::default(),

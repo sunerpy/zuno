@@ -194,6 +194,15 @@ const CHANNELS: &[ChannelGate] = &[
         "prompts.try_send(text.clone())",
     ),
     gate(
+        "tui-picker-selections",
+        "zuno-cli/src/cmd/tui.rs",
+        "let (selection_sender, selection_receiver) = mpsc::channel(SELECTION_CHANNEL_CAPACITY);",
+        "SELECTION_CHANNEL_CAPACITY=8",
+        Policy::RefuseNewest,
+        "zuno-tui/src/views/session.rs",
+        "sink.try_send(selection).is_ok()",
+    ),
+    gate(
         "tui-turn-cancellations",
         "zuno-cli/src/cmd/tui.rs",
         "let (cancel_sender, cancel_receiver) = mpsc::channel(CANCEL_CHANNEL_CAPACITY);",
@@ -268,7 +277,7 @@ fn source_channel_inventory_matches_the_declared_registry() {
             .iter()
             .filter(|entry| entry.exclusion.is_none())
             .count(),
-        18
+        19
     );
     assert_eq!(
         CHANNELS
