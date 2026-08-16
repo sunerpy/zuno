@@ -1231,6 +1231,13 @@ fn docs_migration_guide_lists_every_migration_in_execution_order() {
 /// Directory holding the committed measurement artefacts.
 const EVIDENCE_DIR: &str = ".omo/evidence";
 
+/// The page that owns the resource-gate measurements.
+///
+/// These figures used to sit in `README.md`. They are a measurement record, not a
+/// project introduction, so the README links here instead. Every assertion below
+/// that used to name the README names this constant, at the same strength.
+const RESOURCE_GATES_PAGE: &str = "docs/resource-gates.md";
+
 /// Prefix and suffix of an evidence artefact's filename, around its task number.
 const EVIDENCE_PREFIX: &str = "task-";
 const EVIDENCE_SUFFIX: &str = "-opencode-rust.txt";
@@ -1519,6 +1526,7 @@ fn memory_gate_measurements() -> Vec<MemoryGateMeasurement> {
 fn g2_robustness_prose(
     current: &MemoryGateMeasurement,
     superseded: Option<&MemoryGateMeasurement>,
+    link_prefix: &str,
 ) -> String {
     let g2 = current.g2;
     let peaks = g2
@@ -1566,7 +1574,8 @@ fn g2_robustness_prose(
 
     let history = match superseded {
         Some(previous) if !previous.g2.passes() => format!(
-            " The superseded measurement in [`{path}`]({path}) is the shape being avoided: a {} \
+            " The superseded measurement in [`{path}`]({link_prefix}{path}) is the shape being \
+             avoided: a {} \
              KiB spread around a median that finished {} KiB over the same ceiling — {}.",
             grouped(previous.g2.spread_kib()),
             grouped(previous.g2.excess_kib().unwrap_or_default()),
@@ -1574,7 +1583,8 @@ fn g2_robustness_prose(
             path = previous.artefact,
         ),
         Some(previous) => format!(
-            " The superseded measurement in [`{path}`]({path}) recorded a {} KiB median against a \
+            " The superseded measurement in [`{path}`]({link_prefix}{path}) recorded a {} KiB \
+             median against a \
              {} KiB spread — {}.",
             grouped(previous.g2.median_kib()),
             grouped(previous.g2.spread_kib()),
@@ -1590,19 +1600,28 @@ fn g2_robustness_prose(
     )
 }
 
-/// Renders the README's memory-gate block from a measurement.
+/// Renders the memory-gate block from a measurement.
+///
+/// `link_prefix` is prepended to every repository-root-relative link the block
+/// emits, so the block renders correctly from whichever depth the page that hosts
+/// it sits at. It lives one directory down (`docs/resource-gates.md`), so the
+/// prefix is `../`; a hard-coded root-relative link would resolve to nothing
+/// there, and a broken link is exactly the failure this block's citations exist
+/// to prevent.
 fn memory_gate_block(
     current: &MemoryGateMeasurement,
     superseded: Option<&MemoryGateMeasurement>,
+    link_prefix: &str,
 ) -> String {
     let artefact = &current.artefact;
     let mut out = wrap(
         &format!(
             "Derived from the newest committed measurement artefact, \
-             [`{artefact}`]({artefact}). The ceilings are not measured here: \
-             [`benchmarks/ts-baseline.json`](benchmarks/ts-baseline.json) freezes each one at \
-             half the TypeScript median for the same workload, and every other column below is \
-             computed from the five per-repetition Rust peaks the artefact records."
+             [`{artefact}`]({link_prefix}{artefact}). The ceilings are not measured here: \
+             [`benchmarks/ts-baseline.json`]({link_prefix}benchmarks/ts-baseline.json) freezes \
+             each one at half the TypeScript median for the same workload, and every other \
+             column below is computed from the five per-repetition Rust peaks the artefact \
+             records."
         ),
         PROSE_WIDTH,
     );
@@ -1627,7 +1646,7 @@ fn memory_gate_block(
         );
     }
     out.push('\n');
-    out.push_str(&g2_robustness_prose(current, superseded));
+    out.push_str(&g2_robustness_prose(current, superseded, link_prefix));
     out.push('\n');
     out
 }
@@ -1640,23 +1659,51 @@ fn readme_publishes_the_newest_measured_memory_figures_not_a_remembered_one() {
         .expect("memory_gate_measurements asserts the list is non-empty");
     let superseded = measurements.pop();
 
-    // The block is derived end to end, so a stale digit in the README fails here.
+    // The block is derived end to end, so a stale digit on the page fails here.
     check_block(
-        "README.md",
+        RESOURCE_GATES_PAGE,
         "memory-gate-measurement",
-        &memory_gate_block(&current, superseded.as_ref()),
+        &memory_gate_block(&current, superseded.as_ref(), "../"),
     );
 
-    // Both cited artefacts must actually be present, so the README cannot point a
+    // Both cited artefacts must actually be present, so the page cannot point a
     // reader at a measurement that was never committed.
     for measurement in std::iter::once(&current).chain(superseded.as_ref()) {
         let path = workspace_root().join(&measurement.artefact);
         assert!(
             path.is_file(),
-            "{} is cited by the README's memory block but absent",
+            "{} is cited by the memory block but absent",
             path.display()
         );
     }
+
+    // Every link the block emits has to resolve from the page that hosts it. The
+    // block is one directory deep, so its `../`-prefixed targets are checked
+    // against the real filesystem here rather than trusted; that is the only way
+    // a wrong prefix fails instead of shipping dead citations.
+    let page = workspace_root().join(RESOURCE_GATES_PAGE);
+    let base = page.parent().expect("the page sits inside docs/");
+    let text = std::fs::read_to_string(&page).expect("read the resource-gates page");
+    let mut checked = 0usize;
+    for target in text
+        .split("](")
+        .skip(1)
+        .filter_map(|rest| rest.split_once(')'))
+        .map(|(target, _)| target)
+        .filter(|target| target.starts_with("../"))
+    {
+        assert!(
+            base.join(target).exists(),
+            "{RESOURCE_GATES_PAGE} links to `{target}`, which does not resolve from {}",
+            base.display()
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 3,
+        "the memory block cites two evidence artefacts and the frozen baseline, so at least three \
+         `../` links must have been checked; found {checked}"
+    );
 }
 
 /// The derived side has to dominate the artefact's prose, not defer to it.
@@ -1701,15 +1748,76 @@ fn a_measurement_whose_prose_contradicts_its_own_peaks_is_rejected() {
 // README
 // ---------------------------------------------------------------------------
 
-#[test]
-fn readme_states_the_pinned_baseline_the_binary_actually_reports() {
-    contains_all(
-        "README.md",
-        &[
-            zuno_cli::COMPATIBILITY_VERSION,
-            &format!("--version` 输出 `{}`", zuno_cli::COMPATIBILITY_VERSION),
-        ],
+/// The name the plugin SDK crate publishes under, read from its manifest.
+///
+/// Both READMEs steer plugin authors at this crate, so a rename has to fail the
+/// documentation gate rather than leave two files naming a crate that no longer
+/// exists. Parsed from the manifest instead of restated here for that reason.
+fn plugin_sdk_crate_name() -> String {
+    const MANIFEST: &str = "crates/zuno-plugin-sdk/Cargo.toml";
+    let path = workspace_root().join(MANIFEST);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    let name = text
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("name = \""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or_else(|| panic!("{MANIFEST} must declare a package name"));
+    assert!(
+        !name.is_empty(),
+        "{MANIFEST} declares an empty package name, which would make the README assertion vacuous"
     );
+    name.to_owned()
+}
+
+/// Both READMEs must recommend the Rust SDK, and neither may explain a pinned
+/// compatibility version.
+///
+/// This replaces an assertion that required the READMEs to publish
+/// `COMPATIBILITY_VERSION` and explain why `zuno --version` reports it. That
+/// version is frozen plugin ABI and stays in the code; the explanation is
+/// implementation detail that told a reader to reason about opencode releases
+/// instead of about Zuno. So the positive half now pins what the project actually
+/// offers a plugin author — opencode plugins load, and the first-party Rust SDK is
+/// the recommended path — and the negative half forbids the removed prose from
+/// creeping back, with the forbidden string derived from the constant rather than
+/// typed. It cannot pass with the old text restored: the old text contained
+/// `COMPATIBILITY_VERSION`'s value, which the negative half now rejects.
+#[test]
+fn both_readmes_recommend_the_rust_plugin_sdk_without_explaining_a_pinned_version() {
+    let sdk = plugin_sdk_crate_name();
+    let forbidden = vec![(
+        zuno_cli::COMPATIBILITY_VERSION.to_owned(),
+        "the pinned plugin-compatibility version is frozen ABI in \
+         `crates/zuno-cli/src/version.rs`, not a fact a reader of the introduction has to hold; \
+         the READMEs state that opencode plugins are supported and recommend the Rust SDK instead"
+            .to_owned(),
+    )];
+
+    for (relative, needles) in [
+        (
+            "README.md",
+            [
+                "支持 opencode 插件",
+                "推荐使用 Rust",
+                "docs/plugin-authoring.md",
+            ],
+        ),
+        (
+            "docs/readme/README.en.md",
+            [
+                "supports opencode plugins",
+                "Rust plugins are the recommended",
+                "plugin-authoring.md",
+            ],
+        ),
+    ] {
+        let prose = unwrapped(relative);
+        contains_all_in(&prose, relative, &needles);
+        contains_none_in(&prose, relative, &forbidden);
+        contains_all(relative, &[sdk.as_str()]);
+    }
 }
 
 #[test]
@@ -1756,7 +1864,6 @@ fn readmes_define_zuno_as_independent_while_retaining_the_plugin_abi() {
                 &config_root,
                 &data_root,
                 zuno_paths::PROJECT_CONFIG_DIRECTORY,
-                zuno_cli::COMPATIBILITY_VERSION,
             ],
         );
         contains_all(relative, &plugin_abi);
@@ -1764,9 +1871,12 @@ fn readmes_define_zuno_as_independent_while_retaining_the_plugin_abi() {
 }
 
 #[test]
-fn readme_reports_every_non_functional_gate_with_its_opt_in_command() {
+fn the_gate_page_reports_every_non_functional_gate_with_its_opt_in_command() {
+    // The README must keep pointing readers here, or moving the measurements out
+    // of it would have quietly deleted them from the documentation.
+    contains_all("README.md", &[RESOURCE_GATES_PAGE]);
     contains_all(
-        "README.md",
+        RESOURCE_GATES_PAGE,
         &[
             "ZUNO_MEMORY_GATE_MODE=run",
             "--ignored",
@@ -1789,12 +1899,12 @@ fn readme_reports_every_non_functional_gate_with_its_opt_in_command() {
 ///
 /// The narrowing accepts a Linux-only G6 execution *provided* the Windows half is
 /// implemented in source behind a `cfg(windows)` test and the unexecuted state is
-/// stated in `README.md` **and** in the evidence. That makes it a disclosure
-/// requirement rather than a waiver, so all three halves are asserted here:
-/// the source gate really is `#![cfg(windows)]` (a test that silently started
-/// running everywhere would make the disclosure false), the README says so, and at
-/// least one committed evidence artefact says so too. Deleting the sentence from
-/// either document fails this test.
+/// stated on `docs/resource-gates.md` **and** in the evidence. That makes it a
+/// disclosure requirement rather than a waiver, so all three halves are asserted
+/// here: the source gate really is `#![cfg(windows)]` (a test that silently
+/// started running everywhere would make the disclosure false), the gate page says
+/// so, and at least one committed evidence artefact says so too. Deleting the
+/// sentence from either document fails this test.
 #[test]
 fn criterion_15_states_the_windows_g6_half_is_not_executed_in_the_readme_and_the_evidence() {
     const WINDOWS_TEST: &str = "crates/zuno-process/tests/windows_containment.rs";
@@ -1816,7 +1926,7 @@ fn criterion_15_states_the_windows_g6_half_is_not_executed_in_the_readme_and_the
     }
 
     contains_all(
-        "README.md",
+        RESOURCE_GATES_PAGE,
         &[
             WINDOWS_TEST.rsplit('/').next().expect("the test file name"),
             DISCLOSURE,
@@ -1845,12 +1955,14 @@ fn criterion_15_states_the_windows_g6_half_is_not_executed_in_the_readme_and_the
     assert!(
         !disclosing.is_empty(),
         "no artefact in {} states that {WINDOWS_TEST} is {DISCLOSURE}. Criterion 15's narrowing \
-         requires the unexecuted state in the evidence as well as the README, so that nobody \
+         requires the unexecuted state in the evidence as well as on the gate page, so that \
+         nobody \
          reads a Linux-only G6 result as a cross-platform one.",
         dir.display()
     );
     eprintln!(
-        "criterion 15: the Windows G6 half is disclosed as {DISCLOSURE} in README.md and in {} \
+        "criterion 15: the Windows G6 half is disclosed as {DISCLOSURE} on \
+         {RESOURCE_GATES_PAGE} and in {} \
          evidence artefact(s): {disclosing:?}",
         disclosing.len()
     );

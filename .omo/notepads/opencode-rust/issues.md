@@ -9166,3 +9166,17 @@ Windows leg 现在会跑发布 smoke，但 `crates/zuno-process/tests/windows_co
 这是 notepad 里「fixture 与 host 必须同一提交改完」那条的又一实例：`oc-` → `zuno-`
 改名扫干净了产品侧，却把这个 fixture 的旧拼写留下了，而它静默走默认分支，测试照样绿。
 **修它需要单独验证**（打开 `--pure` 后 smoke 的行为是否仍如预期），因此本次只登记不动。
+
+## origin/main 已推进到 3b46b5f，任务书里的 d8ade4c 已过期（task r16）
+
+任务书给的基线是 `d8ade4c`，实测 `git fetch origin main` 后 `origin/main` 是
+`3b46b5f`（其后有 6 个提交，含 JS 插件 opt-in 优先级修正与 cancel channel 背压登记）。
+worktree 建在 `3b46b5f` 上。`cargo test --workspace` 实测
+**3500 passed / 0 failed / 2 ignored / 213 suites**，与任务书给的数字一致，说明这 6 个
+提交没有改变测试总数，基线差异不影响本次结论。
+
+## `.omo/evidence/task-122` 链接曾是死链，只是没人检查（task r16）
+
+`g2_robustness_prose` 生成的 superseded artefact 链接一直是仓库根相对；在 `README.md`
+里恰好正确，所以从未暴露。生成块一旦搬到子目录就变成死链。已修：`link_prefix` 同时作用于
+主段落与 superseded 段落，并新增链接解析断言（至少 3 条 `../` 链接必须存在于文件系统）。

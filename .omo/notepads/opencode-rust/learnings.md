@@ -7972,3 +7972,32 @@ JS 插件改成 opt-in 之后，`models` 会在「配了插件但 host 关着」
 教训：**在共享 worktree 上，任何「我改完了」的结论都必须用 `git show HEAD:<file>`
 或重新构建的二进制复核，不能依赖自己的编辑记忆**。本次正是靠重新读 HEAD 才发现
 `--pure` 的回归还留在树上——如果按记忆汇报，就会汇报一个并不存在的修复。
+
+## README 从「兼容说明」改为「公开介绍」（task r16）
+
+**`1.18.13` 的解释性 prose 与常量是两回事。** `COMPATIBILITY_VERSION`
+（`crates/zuno-cli/src/version.rs:14`）是冻结的插件 ABI，必须留在代码里；但 README 里
+「为什么 `zuno --version` 输出 1.18.13」的那段说明，是让读者去推理 opencode 发行版而不是
+推理 Zuno，属于实现细节。两个 README 各 5 处引用，全部移除后插件消息收敛成一句：支持
+opencode 插件，新插件推荐用 Rust（`zuno-plugin-sdk`），并链到 `docs/plugin-authoring.md`。
+
+**needle 从「要求写出版本号」翻转成「禁止写出版本号」，并且是派生的。**
+`readme_states_the_pinned_baseline_the_binary_actually_reports` 曾要求两个 README 都出现
+`COMPATIBILITY_VERSION` 及 `--version` 输出句式；它被
+`both_readmes_recommend_the_rust_plugin_sdk_without_explaining_a_pinned_version` 取代：
+正向 needle 钉住插件推荐语与 SDK crate 名（crate 名从
+`crates/zuno-plugin-sdk/Cargo.toml` 解析，改名会红），负向 needle 用
+`zuno_cli::COMPATIBILITY_VERSION` 的值作为禁止串。已实测falsification：把旧那句
+「`zuno --version` 输出 `1.18.13`」加回 README，该测试立刻以
+`must not mention "1.18.13"` 失败 —— 旧文本无法让新门禁通过。
+
+**generated 块换页面必须带链接前缀，否则悄悄产出死链。** `memory-gate-measurement` 从
+`README.md` 移到 `docs/resource-gates.md`（深一层），`memory_gate_block` 因此新增
+`link_prefix` 参数。第一次只改了主段落，`g2_robustness_prose` 里 superseded artefact 的
+链接仍是根相对 —— 是我为此新写的「每条 `../` 链接都要能从宿主页面解析、且至少 3 条」断言
+把它抓出来的，不是人眼。教训：搬迁生成块时，链接解析要有断言，不能靠 review。
+
+**中文 README 换标题 = 换锚点，必须脚本校验。** 章节从「非功能门禁 / 独立运行与插件接入」
+改成「插件 / 独立运行」后，目录与 `README.en.md` 里那条
+`../../README.md#g1-与-g2--峰值常驻内存` 交叉链接全部失效。用脚本重算三份文档的全部锚点
+（含中文），共校验 46 条链接 0 失效；同时校验每个 `##` 标题都在目录里、目录里没有多余项。

@@ -1,7 +1,7 @@
 # Zuno
 
-> An independent AI coding agent. Zuno keeps [`opencode`](https://github.com/sst/opencode) plugin
-> ABI integration, but binary, configuration, and session compatibility are not product goals.
+> An independent AI coding agent. Written in Rust, it loads opencode plugins, but binary,
+> configuration, and session compatibility are not product goals.
 
 [简体中文](../../README.md) · English
 
@@ -10,26 +10,20 @@
 - [Project identity](#project-identity)
 - [Install](#install)
 - [Quick start](#quick-start)
+- [Plugins](#plugins)
 - [Documentation](#documentation)
-- [Independent runtime and plugin ABI](#independent-runtime-and-plugin-abi)
+- [Independent runtime](#independent-runtime)
 - [Development](#development)
-- [Resource gates](#resource-gates)
 - [License](#license)
 
 ## Project identity
 
-`zuno --version` reports `1.18.13`. This is the npm-plugin compatibility version, not the build
-identity: plugins use the running version as a semver constraint and skip loading when it does not
-match. Use the long form when you need the package version:
+Zuno is a standalone command-line AI coding agent: local session storage, pluggable model
+providers, its own tool set, and a built-in TUI. `unsafe_code` is forbidden workspace-wide.
 
-```console
-$ zuno --version
-1.18.13
-$ zuno --version --long
-Zuno 0.1.0 (Rust package 0.1.0; plugin compatibility 1.18.13)
-```
-
-Keeping these identities separate is the declared `split-version-identity` divergence.
+It reads its own configuration and data, not opencode's. Cross-binary compatibility is not a
+goal — the plugin tier is the only retained compatibility surface, described under
+[Plugins](#plugins).
 
 ## Install
 
@@ -48,26 +42,41 @@ build from source with `cargo install --path crates/zuno-cli --locked`.
 ## Quick start
 
 ```console
-$ zuno --version
-1.18.13
 $ zuno --help
+$ zuno --version --long
 ```
 
-Zuno reads only its own configuration and data roots. `zuno export` and `zuno import` close Zuno's
-own round trip: `import` accepts only a local document that `export` produced, never an opencode
-session and never a share URL. Both are **top-level** commands, not subcommands of `session` — `zuno
-session` carries only `list`, `prune`, and `delete`.
+`zuno export` and `zuno import` close Zuno's own round trip: `import` accepts only a local document
+that `export` produced, never an opencode session and never a share URL. Both are **top-level**
+commands, not subcommands of `session` — `zuno session` carries only `list`, `prune`, and `delete`.
+
+## Plugins
+
+Zuno supports opencode plugins: an installed npm plugin loads against its existing ABI, including
+the six handshake environment variables `OPENCODE_CLIENT`, `OPENCODE_CONFIG_CONTENT`,
+`OPENCODE_CONFIG_DIR`, `OPENCODE_DISABLE_CLAUDE_CODE`, `OPENCODE_SERVER_PASSWORD`, and
+`OPENCODE_SERVER_USERNAME`. They identify the plugin contract, not Zuno itself.
+
+The JavaScript plugin runtime is off by default and must be enabled explicitly
+(`ZUNO_ENABLE_JS_PLUGINS=1`, or `"plugin_runtime": {"javascript": true}`). Not starting a JS
+runtime by default cuts startup from roughly 1465 ms to roughly 30 ms.
+
+**Rust plugins are the recommended way to write a new one.** The first-party SDK is
+`zuno-plugin-sdk`: in-process, no runtime dependency, and shipped with a conformance suite. The
+three plugin tiers, the 21 hooks, and a runnable Rust example are in
+[plugin authoring](../plugin-authoring.md).
 
 ## Documentation
 
 | Page                                               | Purpose                                                                  |
 | -------------------------------------------------- | ------------------------------------------------------------------------ |
+| [Plugin authoring](../plugin-authoring.md)         | The three plugin tiers, the hook table, and a Rust example               |
 | [Compatibility matrix](../compatibility-matrix.md) | Implemented, added, rejected, not-registered, and explicit 503 surfaces  |
 | [Declared divergences](../divergences.md)          | Every intentional difference and its reason                              |
 | [Rejected inputs](../rejected-inputs.md)           | Deprecated configuration forms, replacements, and exact errors           |
 | [Database lifecycle](../migration.md)              | Zuno database selection, legacy-filename diagnostics, and schema changes |
 | [Session retention](../session-retention.md)       | Reversible archive and irreversible delete operations                    |
-| [Plugin authoring](../plugin-authoring.md)         | The three plugin tiers and a Rust example                                |
+| [Resource gates](../resource-gates.md)             | Measured results for the six gates, opt-in commands, and known limits    |
 | [Performance methodology](../perf-methodology.md)  | How memory and liveness gates are measured                               |
 
 Only regions delimited by `generated:BEGIN` and `generated:END` comments are generated from code and
@@ -75,23 +84,15 @@ checked byte-for-byte by `cargo test -p zuno-cli --test docs`; the test also der
 small set of critical sections. Explanatory tables and prose outside those markers still require
 review. Use `ZUNO_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs` to regenerate managed regions.
 
-## Independent runtime and plugin ABI
+## Independent runtime
 
 Zuno uses `$XDG_CONFIG_HOME/zuno`, project `.zuno` directories, and `$XDG_DATA_HOME/zuno`. It never
 falls back to the corresponding opencode roots, and it provides no way to adopt an opencode session:
 `zuno import` reads Zuno's own `zuno export` documents only. Old roots appear only in
 upstream-only fixtures, source notes, or historical evidence.
 
-The plugin tier is the sole retained compatibility layer. `COMPATIBILITY_VERSION = "1.18.13"`
-continues to satisfy npm `engines.opencode` checks. The six plugin-ABI names also remain unchanged:
-`OPENCODE_CLIENT`, `OPENCODE_CONFIG_CONTENT`, `OPENCODE_CONFIG_DIR`,
-`OPENCODE_DISABLE_CLAUDE_CODE`, `OPENCODE_SERVER_PASSWORD`, and `OPENCODE_SERVER_USERNAME`.
-They identify the plugin contract, not Zuno itself.
-
-A few tests still compare against a released `opencode` binary (`cli_parity`, `rollback`,
-`session_interop`, each printing `SKIPPED` when that binary is absent). They are verification
-assets, not product promises: cross-binary compatibility is not a goal, and their presence does
-not add adoption of opencode sessions or legacy-path fallback.
+Outside the plugin ABI, Zuno's user interface, default paths, and own environment variables all use
+Zuno's identity.
 
 ## Development
 
@@ -103,15 +104,9 @@ cargo fmt --all --check
 make hooks
 ```
 
-`unsafe_code` is forbidden workspace-wide. `make hooks` installs commit-time formatting and a fast
-push-time test gate; the full workspace suite remains an explicit `make test` and CI gate.
-
-## Resource gates
-
-The Chinese root README is the canonical, test-generated owner of the current memory measurements:
-[read the measured G1/G2 section](../../README.md#g1-与-g2--峰值常驻内存). Repeating those figures
-here would create an unguarded translated snapshot. The formulas, pinned inputs, and reproduction
-steps live in the [performance methodology](../perf-methodology.md).
+`make hooks` installs commit-time formatting and a fast push-time test gate; the full workspace
+suite remains an explicit `make test` and CI gate. The resource gates need explicit opt-in — see
+[resource gates](../resource-gates.md).
 
 ## License
 
