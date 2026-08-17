@@ -24,7 +24,7 @@
 //!
 //! # `always` is remembered here, for the process
 //!
-//! The prompt's own copy promises "until OpenCode is restarted", and the dispatcher's
+//! The prompt's own copy promises "until Zuno is restarted", and the dispatcher's
 //! per-call asker cannot carry a grant between calls. The broker therefore keeps the
 //! approved `(permission, patterns)` pairs and answers a matching later ask without
 //! prompting again — which is what makes `always` different from `once` rather than a

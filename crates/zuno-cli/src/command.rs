@@ -602,7 +602,7 @@ pub enum DebugSnapshotCommand {
 /// Every command intentionally registered by this skeleton.
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
-    /// Run OpenCode with a message.
+    /// Run Zuno with a message.
     Run(RunArgs),
     /// Start the interactive terminal application. Also the default with no command.
     Tui(TuiArgs),

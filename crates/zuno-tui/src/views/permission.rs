@@ -14,7 +14,7 @@
 //! `always` and `reject` are the two replies a user can regret, so each gets a
 //! second surface (`permission.tsx:127-186`):
 //!
-//! - **always** shows what it is about to grant — either "until OpenCode is
+//! - **always** shows what it is about to grant — either "until Zuno is
 //!   restarted" for the `*` pattern, or the concrete pattern list — and asks for a
 //!   confirmation. The pattern list comes from the request's `always` field, which
 //!   is what the engine will install as rules.
@@ -477,7 +477,7 @@ impl PermissionPrompt {
         if self.request.always.len() == 1 && self.request.always[0] == "*" {
             lines.push(padded(
                 &format!(
-                    "  This will allow {} until OpenCode is restarted.",
+                    "  This will allow {} until Zuno is restarted.",
                     self.request.permission
                 ),
                 width,
@@ -485,7 +485,7 @@ impl PermissionPrompt {
             ));
         } else {
             lines.push(padded(
-                "  This will allow the following patterns until OpenCode is restarted",
+                "  This will allow the following patterns until Zuno is restarted",
                 width,
                 self.context.muted(),
             ));
@@ -523,7 +523,7 @@ impl PermissionPrompt {
                 Span::styled(String::from("Reject permission"), self.context.title()),
             ]),
             padded(
-                "  Tell OpenCode what to do differently",
+                "  Tell Zuno what to do differently",
                 width,
                 self.context.muted(),
             ),

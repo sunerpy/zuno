@@ -247,7 +247,7 @@ fn views_permission_always_stage_says_so_for_a_blanket_grant() {
     prompt.handle_action(action("dialog.select.submit"), &key(KeyCode::Enter));
     let joined = render(prompt, 70, 12).join("\n");
     assert!(
-        joined.contains("This will allow bash until OpenCode is restarted"),
+        joined.contains("This will allow bash until Zuno is restarted"),
         "a `*` grant rendered as a pattern list instead of as a blanket grant:\n{joined}"
     );
 }
