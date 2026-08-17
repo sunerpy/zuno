@@ -9298,3 +9298,53 @@ CJK 名称撑破边框。新增 `display_width` / `truncate`，并把用错单�
   换会话。main 的 `adopt` 也只是发出选择。属于 main 既有状态，本轮未扩大范围。
 - **MCP 开关**：`mcp_list` 只读。切换意味着重启服务器，属于 turn host 的职责，一个
   静默什么都不做的开关比没有开关更糟。
+
+## [2026-08-17] Atlas 真机验收 TUI：四个缺陷，两个是我误判后纠正的
+
+在 tmux 200×50 与 80×30 上逐项驱动 release 二进制，验收 owner 列的十一项能力。
+**已确证可用**：欢迎页 49/50 行（原 2/50）、`ctrl+x m` 114 模型、`ctrl+x a` 7 agent、
+`ctrl+x k` 30 skill、`ctrl+x p` 8 MCP、`F1` 帮助页（未绑定项如实标 `(unbound)`）、
+真实 turn 的角色标识与工具行、`634 tokens` 统计、80 列降级重排。
+
+### 缺陷 1：`ctrl+x d` 永远打不开 diff（owner 明确要验收的「代码差异对比」）
+
+`latest_diff`（`views/message.rs:456`）只认**输出本身看起来像 unified diff** 的工具结果：
+
+    MessagePart::Tool { output: Some(output), .. } if looks_like_diff(output)
+
+但 edit 工具的输出是一句话 —— `crates/zuno-tools/src/edit.rs:122`：
+
+    ToolOutput::text(self.runtime.title(&target), "Edit applied successfully.")
+
+实测：让模型改 `demo.rs` 第 3 行，文件确实改了（`TWO-EDITED` 命中 1），
+`ctrl+x d` 仍报 `nothing to choose from here yet`。**edit 工具从不产出 diff，
+所以 diff 视图对 edit 结果永久为空。** 修法要么让 edit 输出 unified diff，
+要么让 `latest_diff` 从 edit 的前后内容自行构造。
+
+### 缺陷 2：权限确认框对用户说 "until OpenCode is restarted"
+
+`views/permission.rs:480` 与 `:488`，面向用户的过时身份文案（项目已是 Zuno）。
+`tui_permission.rs:27` 的注释与 `permission_tests.rs:250` 的断言都钉着这句话，
+所以改文案必须同 commit 改注释与断言 —— 又一次「守卫钉住缺陷」。
+
+### 缺陷 3（次要）：等权限批准时对话区只显示 `⠹ working`
+
+权限对话框在 50 行终端的第 44-50 行，**是可见的**。但对话区顶部同时显示
+`⠹ working` 转轮，读起来像「系统在忙」而不是「系统在等你」。转轮和待批准
+是互斥状态，不该同时出现。
+
+### 我误判后纠正的两处（方法论教训）
+
+**误判 A**：我 grep `DEFINITIONS` 表发现六个动作仍 `keys: "none"`，据此判定
+"绑键工作没做"。**错了** —— 实现在 `keybind.rs:125-137` 的 `SHIPPED_DEFAULTS`
+覆盖表里，`shipped_spelling()` 在 `definition.keys == NO_KEY` 时回退到它。
+这比直接改上游表更好（上游表保持可对照），且每条都注释了选键理由。
+**教训：断言"未实现"之前，先找实现可能在的另一层。**
+
+**误判 B**：我用 `ctrl+x o` 前后的「整屏非空行数」判折叠是否生效，4→4 无变化，
+判定失效。**错了** —— 那次工具输出只有 1 行，且已滚出可视区。换 12 行输出并
+数折叠标记 `▸` 才看出 1→2，功能是好的。**教训：判据必须能区分"功能没生效"
+与"我的观测窗口看不到"。**
+
+还有一次更基础的：我只截了前 26 行就说"用户完全看不出在等批准"，而对话框在
+第 44 行。**截屏取样不全 = 观测不足，不是被观测对象的缺陷。**
