@@ -71,6 +71,19 @@ pub enum RootPolicy {
     NixWorkspace,
 }
 
+/// Whether an enabled server can start, as [`ServerSpec::availability`] reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Availability {
+    /// Its program resolves on `PATH` now.
+    Present,
+    /// Its program is absent but a built-in provisioning source would fetch it.
+    Installable,
+    /// Its program is absent and nothing would provide it.
+    Missing,
+    /// It has no command at all, which the schema should have refused.
+    NoCommand,
+}
+
 /// One enabled server after built-ins and `lsp` overrides are merged.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServerSpec {
@@ -97,6 +110,28 @@ impl ServerSpec {
         self.extensions.iter().any(|candidate| {
             extension.as_deref() == Some(candidate.as_str()) || filename == Some(candidate.as_str())
         })
+    }
+
+    /// Whether this server could actually start, without starting it.
+    ///
+    /// Answers the question a status surface has to answer before any file is read, and
+    /// answers it with the *same* `PATH` resolution [`ServerRegistry::launch_command`]
+    /// will use — a second rule would let the panel promise a start the launch then
+    /// refuses. It deliberately does not consult an installer, so it never provisions
+    /// anything as a side effect of drawing a frame; a server that would be installed on
+    /// demand reports [`Availability::Installable`] rather than being called present.
+    #[must_use]
+    pub fn availability(&self) -> Availability {
+        let Some(executable) = self.command.first() else {
+            return Availability::NoCommand;
+        };
+        if resolve_executable(executable).is_some() {
+            Availability::Present
+        } else if self.install.is_some() {
+            Availability::Installable
+        } else {
+            Availability::Missing
+        }
     }
 
     /// Resolve the project root without walking above `workspace`.
@@ -868,6 +903,71 @@ mod tests {
         assert_eq!(
             ids.iter().copied().collect::<BTreeSet<_>>().len(),
             BUILTIN_SERVER_IDS.len()
+        );
+    }
+
+    /// The census defect: a status surface built from `ResolvedLsp::servers()` — the
+    /// *overrides* — reported `0 lsp` while `lsp: true` had every built-in enabled and the
+    /// diagnostics probe was happily running them. The registry is the only honest count.
+    #[test]
+    fn enabling_lsp_wholesale_enables_every_builtin_not_zero_servers() {
+        let overrides_only = ResolvedLsp::resolve(Some(&LspConfig::Enabled(true)));
+        assert_eq!(
+            overrides_only.servers().count(),
+            0,
+            "the trap: `lsp: true` declares no per-server override"
+        );
+        assert_eq!(
+            ServerRegistry::offline(&overrides_only).servers().len(),
+            BUILTIN_SERVER_IDS.len(),
+            "every built-in is enabled, so a count of zero is a live feature reported absent"
+        );
+    }
+
+    /// A truthful zero: with no `lsp` key nothing is enabled, so nothing will ever start.
+    #[test]
+    fn an_absent_lsp_key_really_does_enable_nothing() {
+        let registry = ServerRegistry::offline(&ResolvedLsp::resolve(None));
+        assert!(registry.servers().is_empty());
+    }
+
+    /// A status surface must be able to tell "will start when a file is read" from "can
+    /// never start", and must not install anything to find out.
+    #[test]
+    fn availability_separates_a_present_program_from_a_missing_one() {
+        let config: LspConfig = serde_json::from_value(serde_json::json!({
+            "present": { "command": ["cargo"], "extensions": [".present"] },
+            "absent": {
+                "command": ["zuno-no-such-language-server"],
+                "extensions": [".absent"]
+            }
+        }))
+        .expect("valid LSP config");
+        let registry = ServerRegistry::offline(&ResolvedLsp::resolve(Some(&config)));
+        let availability = |id: &str| {
+            registry
+                .servers()
+                .iter()
+                .find(|server| server.id == id)
+                .expect("the server stayed enabled")
+                .availability()
+        };
+        assert_eq!(availability("present"), Availability::Present);
+        assert_eq!(availability("absent"), Availability::Missing);
+        // A built-in with a provisioning source is neither present nor hopeless, and
+        // collapsing it into `Missing` would report an installable server as broken.
+        let rust = registry
+            .servers()
+            .iter()
+            .find(|server| server.id == "rust")
+            .expect("rust is a built-in");
+        assert!(
+            matches!(
+                rust.availability(),
+                Availability::Present | Availability::Installable
+            ),
+            "a built-in that can be provisioned must never report Missing: {:?}",
+            rust.availability()
         );
     }
 

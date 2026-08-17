@@ -93,13 +93,52 @@ fn views_sidebar_distinguishes_empty_from_broken() {
         empty.contains("none configured"),
         "an unconfigured MCP section says nothing at all:\n{empty}"
     );
+    // Was "starts as files are read", which is false for an empty list: with no server
+    // enabled nothing will ever start no matter what is read, and that copy made "no `lsp`
+    // key at all" indistinguishable from "configured and merely idle".
     assert!(
-        empty.contains("starts as files are read"),
+        empty.contains(SidebarView::NO_LSP_CONFIGURED.trim()),
         "an empty LSP section does not explain itself:\n{empty}"
+    );
+    assert!(
+        crate::views::display_width(SidebarView::NO_LSP_CONFIGURED) < usize::from(SIDEBAR_WIDTH),
+        "the explanation is wider than the panel, so it renders cut off mid-word"
+    );
+    assert!(
+        !empty.contains("starts as files are read"),
+        "an empty section promised a start that will never happen:\n{empty}"
     );
     assert!(
         !empty.contains("failed"),
         "an empty panel claimed something failed:\n{empty}"
+    );
+}
+
+/// The other half of the same distinction: a configured server that *can* start says so,
+/// and one that cannot is a fault rather than silence.
+#[test]
+fn views_sidebar_separates_a_server_that_will_start_from_one_that_cannot() {
+    let mut view = SidebarView::new(ViewContext::defaults());
+    view.ambient_mut().lsp = vec![
+        Service::new(String::from("rust"), Health::Pending)
+            .detailed("starts on first matching file"),
+        Service::new(String::from("gopls"), Health::Faulted).detailed("gopls not found on PATH"),
+    ];
+    let drawn = drawn(&mut view);
+    assert!(
+        !drawn.contains(SidebarView::NO_LSP_CONFIGURED.trim()),
+        "two configured servers rendered as none:\n{drawn}"
+    );
+    // The tails, not the whole detail: a 34-column panel elides the middle of a long
+    // detail, so asserting the full sentence would fail on a frame that is in fact correct.
+    assert!(drawn.contains("first matching file"), "{drawn}");
+    assert!(
+        drawn.contains("not found on PATH"),
+        "a server that can never start was not distinguished from an idle one:\n{drawn}"
+    );
+    assert!(
+        drawn.contains(Health::Faulted.glyph()) && drawn.contains(Health::Pending.glyph()),
+        "the two states share a gutter glyph, so only the elided text tells them apart:\n{drawn}"
     );
 }
 

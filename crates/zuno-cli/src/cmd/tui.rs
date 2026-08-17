@@ -240,18 +240,14 @@ impl SessionFacts {
         let config = plan.config();
 
         let resolved_lsp = zuno_catalog::lsp_config::ResolvedLsp::resolve(config.lsp.as_ref());
-        let lsp = resolved_lsp
+        // The same registry the diagnostics probe runs — `ResolvedLsp::servers()` is only
+        // the *overrides*, so a census built from it reported `0 lsp` while the probe was
+        // happily running all twenty-odd built-ins that `lsp: true` enables. Two
+        // collectors over one fact is how a live feature comes to be advertised as absent.
+        let lsp = zuno_lsp::registry::ServerRegistry::offline(&resolved_lsp)
             .servers()
-            .map(|server| {
-                // `Pending`, never `Ready`: a server is spawned lazily when a file it
-                // handles is first read, so claiming it is up would name a process that
-                // does not exist yet.
-                zuno_tui::views::ambient::Service::new(
-                    server.id.clone(),
-                    zuno_tui::views::ambient::Health::Pending,
-                )
-                .detailed("starts on first matching file")
-            })
+            .iter()
+            .map(lsp_service)
             .collect();
 
         let mut mcp = config
@@ -367,6 +363,27 @@ fn current_branch(worktree: &std::path::Path) -> Option<String> {
     }
     let branch = String::from_utf8(output.stdout).ok()?.trim().to_owned();
     (!branch.is_empty() && branch != "HEAD").then_some(branch)
+}
+
+/// One enabled language server, as the ambient panel shows it.
+///
+/// The health distinction is the point. A server whose program is on `PATH` really will
+/// start when a file it claims is first read, so `Pending` plus that promise is true. One
+/// whose program is missing never will, and the old copy said "starts on first matching
+/// file" for it too — a promise the process cannot keep, and indistinguishable from a
+/// server that is merely idle. `Faulted` names it as something to fix, because the user
+/// enabled it: a built-in nobody asked for is not in this list at all.
+fn lsp_service(server: &zuno_lsp::registry::ServerSpec) -> zuno_tui::views::ambient::Service {
+    use zuno_lsp::registry::Availability;
+    use zuno_tui::views::ambient::{Health, Service};
+    let program = server.command.first().map_or("", String::as_str);
+    let (health, detail) = match server.availability() {
+        Availability::Present => (Health::Pending, "starts on first matching file".to_owned()),
+        Availability::Installable => (Health::Pending, format!("installs {program} on first use")),
+        Availability::Missing => (Health::Faulted, format!("{program} not found on PATH")),
+        Availability::NoCommand => (Health::Faulted, "no command configured".to_owned()),
+    };
+    Service::new(server.id.clone(), health).detailed(detail)
 }
 
 /// Whether a configured MCP server is switched on, defaulting to on.
