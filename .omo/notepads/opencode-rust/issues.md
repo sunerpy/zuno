@@ -9470,3 +9470,80 @@ picker / help 是用户**在工作进行中**打开的，压掉转轮等于谎�
 
 诊断真的到了 transcript（真实 rust-analyzer）：`⌁ src/demo.rs: no problems (rust)`，
 状态条同时带上 `· src/demo.rs: no problems (rust)`。
+
+### 并发写者接手：我补的证据与我改的东西（同一轮，第二个执行体）
+
+同一个 worktree 上有第二个执行体在改同一批文件（文件 mtime 每 30 秒推进一次，
+`git status` 从 15 个文件涨到 32 个）。**没有另起 worktree、也没有回滚它的改动** ——
+未提交的工作只有这一份，抢写会两边都毁。做法：先 `git diff > /tmp/.../snap.patch`
+留底，再等它连续 4 分钟无写入，然后接手并**逐项复验**而不是相信它。
+
+它已完成且我复核后保留的：缺陷 1 的元数据链路、缺陷 2 的五处文案、缺陷 3 的
+`observe_modal` 机制、缺陷 4 的 registry census + `availability()`。
+
+**我补上的（它没做的部分）**：
+
+1. **闸门实际跑过**。它一次也没跑。`cargo test --workspace` = **3637 passed /
+   0 failed / 2 ignored / 213 suites**（基线 3594/0/2，+43）。
+   43 的账：新增 `#[test]` 属性 24 个（`git grep -c` 比对 HEAD 与工作树），
+   其余 19 来自基线 `0ef1c86` 到 `972a9a0` 之间的 4 个提交（命令面板那一轮）——
+   `0ef1c86` 处属性数 3478、`972a9a0` 处 3497，差 19。**43 = 24 + 19，对齐。**
+2. **`make lint` 原本是红的**：`tui.rs:250` 的 `.map(|server| lsp_service(server))`
+   触发 `clippy::redundant_closure`，`-D warnings` 直接 fail。改成 `.map(lsp_service)`。
+   **一个没跑过 lint 的"完成"就是没完成。**
+3. **`make fmt-check` 原本也是红的**（我自己新写的 `assert!` 一行超宽）。`make fmt` 修掉。
+4. **`make smoke-artifact` PASS**（必须 unset `CARGO_TARGET_DIR`，`Makefile:28`
+   硬写 `TARGET_DIR := target`）。跑之前先 `rm -rf /tmp/opencode/r19/debug` 腾了 19G ——
+   磁盘到 80% 时 release 构建会造假编译错误。**没有动 `/tmp/opencode/rn`：
+   那 15G 属于另一个任务，且它有活进程在里面跑。**
+5. **八个"会失败"的测试**（它写的测试只是给旧调用点补 `diff: None`，
+   没有一个断言 `diff` 字段真的能取到 patch）：
+   - `message_tests.rs` 3 个：句子输出也能取到 patch / output 形态的 patch 仍能取到 /
+     没有 patch 时如实返回 `None`。
+   - `file_tools.rs` 3 个 + 扩了 `apply_patch` 那个：`edit`/`write` 真的挂上
+     `metadata["diff"]`、内容未变时**不挂**、多文件 patch 三个文件都在一个 patch 里。
+   - `session_tests.rs` 2 个：**`DialogHost` → `SessionScreen` 那条接缝**
+     （它只测了 transcript 层的 `set_awaiting_permission`，没测有没有人去调它 ——
+     那正是"功能对、但不可达"的形状，和缺陷 1 一模一样）。
+   每一个都**先摘掉产品代码确认会红**再装回去：摘 `latest_diff` 的 `diff` 分支 →
+   1 红 2 绿；摘 `report_diff` 的挂载 → edit/write 红、"未变不挂"仍绿；
+   把 `apply_patch` 的挂载改成 `if false` → 那条红；注释掉
+   `DialogHost::render` 里的 `observe_modal` 调用 → 接缝测试红、picker 测试仍绿。
+
+**两个我自己踩的观测坑（值得记）**：
+
+- 接缝测试第一版用空 transcript，`busy.contains("working")` 竟然过了 ——
+  因为**空 transcript 时渲染的是欢迎屏，转轮根本没画**，那个 `working` 是
+  状态条的。判据命中了错的 surface。补一条 `Message::user` 才让判据落在被测对象上。
+  **和 owner 那次"折叠 4→4"是同一个错误：判据要能区分"功能没生效"与"我看错地方了"。**
+- picker 的 dialog id 是 `model_list` 不是 `model`；断言 `host.active()` 时才发现。
+  先钉"东西真的挂上了"再钉"它的效果"，不然测试可能在什么都没打开的情况下通过。
+
+**运行态/待批准态对照（缺陷 3 的两态，同一二进制）**：
+
+    运行态：第 6 行  ⠴ working                     working=1  awaiting=0
+    待批准：第 8 行  △ waiting for your approval   working=0  awaiting=1
+
+运行态那张要**亚秒轮询**才截得到（0.4s × 40 次，第 5 次命中）——
+1.5s 间隔连打 14 次全是 0，不是没生效，是回合在两次采样之间就结束了。
+稳定复现要用 `bash` 跑 `sleep 20` 这种真的会挂住的工具调用。
+
+**缺陷 4 的一个额外发现：项目级配置文件名是 `opencode.json`，不是 `zuno.json`**
+（`zuno-config/src/discovery.rs:172`）。我先写了 `zuno.json`，`zuno debug config`
+显示 `lsp key present: False` —— 看起来像"配了也不生效"的缺陷，其实文件从没被读。
+**`zuno debug config` 是分辨"配置没被读"与"读了但没生效"的最短路径。**
+
+真机复证（我这轮，`myopenai/global.anthropic.claude-haiku-4-5-20251001-v1:0`）：
+- `ctrl+x d` 两次都开出真实 patch：`demo.txt` 的 `2-two / 2+TWO-EDITED`
+  与 `src/main.rs` 的 `2-    println!("hello"); / 2+    let x: i32 = "oops";`。
+  **diff 视图在 50 行终端里位于第 43-50 行 —— 只截前 26 行会判成"没开"。**
+- `0 lsp` → **`38 lsp`**，侧边栏 `0 up, 11 failed`，`rust` 显示
+  `◐ …n first matching file`（rust-analyzer 在 PATH 上）。
+- 真实 rust-analyzer 诊断进 transcript（这次是**真的报错**，不是 no problems）：
+  `⌁ src/main.rs: 1 error, 1 other (rust)` /
+  `✗ 2:18 error [rustc] mismatched types expected \`i32\`, found \`&str\`` /
+  `· 2:12 hint [rustc] expected due to this`，状态条同步带上。
+- 回归：Ctrl+C `EXIT=0`、Ctrl+D `EXIT=0`（都不经管道取 `$?`）、
+  `ctrl+x m` 25 模型、`ctrl+x a` 7 agent、`ctrl+x k` 30 skill、`ctrl+x p` 8 MCP、
+  `F1` 仍如实标 `(unbound)`、`ctrl+x o` 折叠标记 0→1 且可见输出行 **12→3**。
+  折叠这条**必须先造出 12 行真实输出**（`seq 1 12`）才有得折。

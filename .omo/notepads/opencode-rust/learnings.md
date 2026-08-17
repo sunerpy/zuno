@@ -8367,3 +8367,88 @@ census 用了前者 → 欢迎屏报 `0 lsp`，同时诊断探针用后者 → �
 
 换 `claude-sonnet-4-6`（13 tools）才验到 edit。
 **教训**：真机验收某个工具前，先看欢迎屏的 tools 计数对不对得上。
+
+## 同一 worktree 上有第二个执行体在写：留底、等静默、接手、逐项复验
+
+未提交的工作只有 worktree 这一份，所以抢写或回滚都会两边都毁。可用的手法：
+
+1. **先留底**：`git diff > /tmp/.../snap.patch`，未跟踪文件单独 `cp`。这是唯一
+   能在对方 session 半途死掉时救回来的东西。
+2. **判活不判猜**：`find crates -name '*.rs' -newermt '-100 seconds'` 空 = 静默。
+   `ls -l --time-style=full-iso` 看 mtime 推进节奏。`/proc/*/cwd` 可能查不到 ——
+   对方用绝对路径从别处驱动，cwd 不在这里，**查不到进程不等于没人在写**。
+3. **等连续静默**（我等了 4 分钟）再接手，不要在对方半途的编译错误上下结论：
+   我中途看到 `Transcript::AWAITING_PERMISSION` 未定义，那是**编辑只落了一半**，
+   不是缺陷。
+4. **接手后逐项复验，不相信对方**。它四个缺陷都改对了，但**一个闸门都没跑**：
+   `make lint` 是红的（`clippy::redundant_closure`）、`make fmt-check` 是红的。
+   而且它的测试只给旧调用点补了 `diff: None`，**没有一个断言新字段真的能取到值**。
+
+**教训**：并发写者产出的"看起来完成"里，最可能缺的是闸门和"会失败的测试"这两样 ——
+因为它们不产生可见的代码变化。接手时优先补这两样。
+
+## 一个通过的测试什么都不证明，直到你摘掉产品代码看它变红
+
+这轮八个新测试，每一个都做了这件事，两次因此发现测试本身有问题：
+
+- 摘掉 `latest_diff` 的 `diff` 分支 → 目标测试红、另两条仍绿（说明它们钉的是别的东西，对）。
+- 摘掉 `report_diff` 的挂载 → edit/write 红，而"内容未变时不挂 patch"**仍绿** ——
+  这正是它该有的行为，一条永远绿的测试反而说明它不该由这个开关控制。
+- `apply_patch` 的挂载改 `if false` → 那条红。
+- 注释掉 `DialogHost::render` 里的 `observe_modal` → 接缝测试红、picker 测试仍绿。
+
+**"红了"还不够，要"为正确的原因红"**：我读了 panic 消息确认是
+`a mutation's patch must be reachable...` 而不是编译错误或别的断言。
+
+## 判据落在错的 surface 上：空 transcript 时 `working` 来自状态条，不是转轮
+
+接缝测试第一版：空 transcript + `assert!(busy.contains("working"))` —— **过了**，
+但转轮根本没画，因为**空 transcript 时那块区域是欢迎屏**，命中的是状态条那一行的
+`working`。补一条 `Message::user` 才让判据落到被测对象上。
+
+同一个错误的三种形态（这个仓库里已经三次）：
+- owner 数"整屏非空行数"判折叠，4→4，其实那次输出只有 1 行且已滚出视区。
+- owner 只截前 26 行说对话框不可见，其实它在第 44 行。
+- 我用 `contains("working")` 判转轮，其实命中的是另一个 surface 上同名的词。
+
+**判据必须能区分「功能没生效」与「我看的地方不对」。** 具体做法：断言之前先断言
+"被测对象真的在场"（`host.active() == Some("model_list")`、transcript 非空、
+输出真的有 12 行）。我因此还发现 picker 的 dialog id 是 `model_list` 不是 `model`。
+
+## 真机截转轮要亚秒轮询，且要用真的会挂住的工具调用
+
+`1.5s × 14` 次全采到 `working=0`，看起来像"转轮不显示"；换 `0.4s × 40`
+第 5 次就命中。回合在两次采样之间就结束了。
+
+- 让模型"慢慢数到 200"**不可靠**：生成很快，且 token 越多越快跑完。
+- 可靠的做法：`use the bash tool to run: sleep 20`，回合真的挂在工具上。
+- 命中即存盘 `break`，不要跑完循环再截 —— 那时候已经 idle 了。
+
+## `zuno debug config` 是分辨"配置没被读"与"读了没生效"的最短路径
+
+我先写 `zuno.json` 配 lsp，欢迎屏仍 `0 lsp`，差点记成"配了也不生效"。
+`zuno debug config | python3 -c "...print('lsp' in d)"` 显示 `False` ——
+**文件从没被读**：项目级配置名是 `opencode.json`（`zuno-config/src/discovery.rs:172`
+的 `["config.json", "opencode.json", "opencode.jsonc"]`），没有 `zuno.json`。
+
+**教训**：真机验一个配置驱动的功能，先证明配置进了合并结果，再证明功能。
+否则会把"我文件名写错了"记成产品缺陷。
+
+## 磁盘：跑 release 闸门前先腾自己的 debug 树，但不要碰别人的
+
+`smoke-artifact` 忽略 `CARGO_TARGET_DIR`（`Makefile:28` 硬写 `TARGET_DIR := target`），
+所以它会在仓库里再造一棵 release 树。80% 时 release 构建会造假编译错误。
+
+`rm -rf /tmp/opencode/r19/debug` 腾了 19G（闸门结果已经记下来了，debug 树可弃）。
+**没有动 `/tmp/opencode/rn` 的 15G**：`ps` 显示另一个任务有活进程正跑
+`/tmp/opencode/rn/debug/zuno`。**清盘前先 `ps -eo cmd | grep -F <目录>`。**
+
+## 测试数增量要能对账，否则闸门是"看起来绿"
+
+3594 → 3637，+43，而我只新增 24 个 `#[test]`。差的 19 不是幽灵：
+基线 `0ef1c86` 到 `972a9a0` 之间有 4 个提交，用
+`git grep -hcE '^\s*#\[(tokio::)?test\]' <rev> -- 'crates/**/*.rs' | paste -sd+ | bc`
+量得 3478 → 3497，正好 19。**43 = 24 + 19。**
+
+**每个数字都要有出处**，否则"+43"既可能是新测试，也可能是某条测试被参数化展开、
+或某个 suite 被意外重复注册。对不上账就等于没验。
