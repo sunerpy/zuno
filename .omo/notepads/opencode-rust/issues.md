@@ -9348,3 +9348,125 @@ CJK 名称撑破边框。新增 `display_width` / `truncate`，并把用错单�
 
 还有一次更基础的：我只截了前 26 行就说"用户完全看不出在等批准"，而对话框在
 第 44 行。**截屏取样不全 = 观测不足，不是被观测对象的缺陷。**
+
+## [2026-08-17] 修掉真机验收的四个缺陷：diff 视图、身份文案、转轮互斥、lsp 计数
+
+基线 972a9a0。四项都先在真机上复现，再改，再在真机上复证。
+
+### 缺陷 1（阻塞项）：`ctrl+x d` 永远打不开 —— 修法是**结构化元数据**，不是把 diff 塞进 output
+
+`latest_diff` 只认 `looks_like_diff(output)`，而 edit 的 output 是一句
+`Edit applied successfully.`，所以 diff 视图对唯一会改代码的工具永久为空。
+
+**两个候选里选了元数据这条**，理由不是"上游也这么做"，而是两条独立的代价：
+1. **output 是模型按 token 付费读的东西**。把 patch 放进 output，等于每次改一行
+   都要多付一整段 patch 的钱；transcript 里那一行工具摘要也会变成一屏 `+/-`。
+2. **`metadata["diff"]` 这个 key 本工程已经在用了** ——
+   `views/permission.rs` 的 `edit_patch` 就是读它来渲染"要批准的改动"。
+   用同一个 key 意味着「这次改动的 patch」只有一种拼法，不是两种。
+
+落地链路（每一环都必须动，少一环 diff 就到不了视图）：
+`zuno-tools/src/diff.rs`（新增，`similar` 做 unified diff）
+→ `read/support.rs::report_diff` 挂到结果上
+→ `edit` / `write` / `apply_patch` 三个工具都挂
+→ `TurnEvent::ToolDispatchCompleted` 加 `diff: Option<String>` 字段
+→ acp / server / plugin / run 四个投影透传
+→ `MessagePart::Tool` 加 `diff`，`latest_diff` 优先读它、**保留** output 形态的分支。
+
+**保留 output 分支是必须的**：shell 里跑 `git diff` 的 patch 就在 output 里、没有
+`diff` 字段，砍掉那条等于把一个空视图换成另一个空视图。`looks_like_diff` 一个字没改。
+
+几个刻意的决定：
+- **post-image 取格式化之后从磁盘重读的字节**，不是工具自己算出的新内容。
+  edit 之后 rustfmt 还会改，patch 少了 formatter 那部分就是在描述一个从未存在过的
+  文件状态。所以 `report_diff` 放在 `support.rs`（拿得到 `final_bytes`），
+  不放在各工具的替换算术里。
+- **`apply_patch` 的 `Delete` 必须在 prepare 阶段读 pre-image**，应用完就没文件可读了。
+  为此给 `FileChange` 加了 `old_bytes`。多文件 patch 直接 concat —— unified diff
+  每个文件自带 `---`/`+++`，天然可拼。
+- **相同内容不挂 patch**（`unified_diff` 对相等输入返回 `None`）。
+  `diff` 存在就一定意味着"这是改动"，不会退化成"有东西跑过"。
+- **没有移植上游的 `trimDiff`**（去掉公共前导空白省列宽）。它是有损的：缩进恰恰
+  是编辑最常改错的东西，而视图能横向滚，那点列宽不值得撒这个谎。
+- `similar` **已经在 Cargo.lock 里**（`insta` 的 diff 引擎），指名依赖不增加任何下载。
+
+真机复证（200×50，`myopenai/global.anthropic.claude-sonnet-4-6`，13 tools 才有 edit）：
+edit 输出仍是 `Edit applied successfully.`（缺陷前提没变），`ctrl+x d` 打开：
+
+    │ Diff — 9 lines
+    │--- src/demo.rs
+    │+++ src/demo.rs
+    │@@ -1,5 +1,5 @@
+    │   1 fn main() {                        1 fn main() {
+    │   2     let one = 1;                   2     let one = 1;
+    │   3-    let two = 2;                   3+    let two = 222;
+    │   4     println!("{one} {two}");       4     println!("{one} {two}")
+    │   5 }                                  5 }
+
+`apply_patch` 那条也单独验过（gpt-5.4 只有 12 tools、没有 edit，见下）。
+
+### 缺陷 2：`until OpenCode is restarted` —— 守卫与被守卫的缺陷同一个提交改
+
+`permission.rs:480/488` 两处文案 + 模块头注释 + `tui_permission.rs:27` 注释 +
+`permission_tests.rs:250` 断言，五处同提交改成 `Zuno`。
+真机确认：`This will allow the following patterns until Zuno is restarted`。
+
+`crates/*/src` 里剩下的 `OpenCode` 全部逐条判过，**都是正当的**：
+`OpenCodeFlags` / `OPENCODE_*` env（装好的 JS 插件在读，属 ABI）、
+`opencode.default` 音效包 id、mcp OAuth 的 `client_name`、
+provider 目录里 `"OpenCode"` 这个**真实存在的上游 provider 名**（还有一条
+`openai` vs `OpenCode` 大小写排序的断言，是 load-bearing 的）、
+以及若干引用上游源码的注释。只改了 `command.rs:605` 的 `Run OpenCode with a message`
+（clap help，用户可见）。
+
+### 缺陷 3：转轮与待批准同时在屏 —— 而且是**两个**surface，不是一个
+
+原判断只提到 transcript 的 `⠹ working`。写测试时才发现**状态条（永远在屏那一行）
+也在说 `working`**，而且第一条消息产生之前 transcript 区域是欢迎屏占着的 ——
+那时候状态条是屏幕上唯一一个说状态的地方。只修 transcript 会在用户真正在看的那个
+surface 上留下原缺陷。
+
+机制：`ActionComponent::observe_modal(Option<&'static str>)`，`DialogHost::render`
+**每帧**从自己即将绘制的栈里派生后告知 base。刻意不是 open/close 时推送 ——
+一个派生调用点不可能和屏幕不一致，两个通知点（open 和每个 pop）可以，
+失效模式是横幅活得比对话框久。判据收窄到 `DIALOG_ID == "permission"`：
+picker / help 是用户**在工作进行中**打开的，压掉转轮等于谎称回合停了。
+
+真机（rows 39-49，同一屏）：
+
+    │ ⠧ → read                  ← 工具行自己的转轮，标"哪个工具在飞"，仍然准确
+    △ waiting for your approval  ← 原来这里是 ⠹ working
+    │ Permission required
+    │ Allow once   Allow always   Reject
+
+状态条那半边由 `views_status_strip_says_it_is_waiting_rather_than_working_during_a_permission_ask`
+守着（对话框在 50 行终端会盖住状态条那一行，帧断言看不到它 —— 所以拆成两层守）。
+
+### 缺陷 4：`0 lsp` 是假的 —— 又一次"两个采集器算同一个事实"
+
+`ResolvedLsp::servers()` 返回的是**逐服务器 override**，不是启用集合。
+`lsp: true` 时它是空的，而 `ServerRegistry` 那边 38 个内置全都启用着、
+诊断探针一直在正常跑。census 用前者 ⇒ 把一个活着的功能报成不存在。
+
+改成和探针同一个 `ServerRegistry::offline(&resolved)`。顺带把健康度做实：
+新增 `ServerSpec::availability()`，用**和 `launch_command` 同一套 PATH 解析**
+（两套规则会让面板承诺一个启动、而 launch 随后拒绝），且**绝不碰 installer**
+—— 画一帧不该有安装副作用。四态：Present / Installable / Missing / NoCommand。
+
+真机对比：
+
+    配了 lsp：13 tools · 8 mcp · 38 lsp · 30 skills
+             ◐ rust …n first matching file      （PATH 上有）
+             ✗ deno deno not found on PATH      （永远起不来）
+             ◐ vue …ge-server on first use      （会按需装）
+    没配 lsp：13 tools · 8 mcp · 0 lsp · 30 skills
+             ▾ LSP                      none
+               none enabled — set `lsp`
+
+**"0 是诚实的"和"0 是假的"现在能分开**：空列表的文案原来是
+`starts as files are read` —— 一个空列表永远不会有东西起来，这句是假的，
+而且让"根本没配"和"配了但闲着"长得一样。改成 `none enabled — set `lsp``，
+并加断言钉住它 `< SIDEBAR_WIDTH`（这个面板会截断，截半句比不说更糟）。
+
+诊断真的到了 transcript（真实 rust-analyzer）：`⌁ src/demo.rs: no problems (rust)`，
+状态条同时带上 `· src/demo.rs: no problems (rust)`。
