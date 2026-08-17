@@ -1,6 +1,6 @@
 use crate::read::{
     FileToolRuntime, PathKind, check_interrupt, decode_text, encode_text, failed, invalid,
-    report_formatting, write_with_dirs,
+    report_diff, report_formatting, write_with_dirs,
 };
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -118,11 +118,17 @@ impl TypedTool for EditTool {
             .state
             .record_write(&ctx.session_id, &target.canonical, &final_bytes);
 
+        let label = self.runtime.title(&target);
         Ok(report_formatting(
-            ToolOutput::text(self.runtime.title(&target), "Edit applied successfully.")
-                .with_metadata("filepath", target.canonical.to_string_lossy().into_owned())
-                .with_metadata("replacements", replacements)
-                .with_metadata("formatted", outcome.changed),
+            report_diff(
+                ToolOutput::text(label.clone(), "Edit applied successfully.")
+                    .with_metadata("filepath", target.canonical.to_string_lossy().into_owned())
+                    .with_metadata("replacements", replacements)
+                    .with_metadata("formatted", outcome.changed),
+                &label,
+                &source,
+                &final_bytes,
+            ),
             &outcome.failures,
         ))
     }

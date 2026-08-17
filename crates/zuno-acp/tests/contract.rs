@@ -51,6 +51,7 @@ fn engine_stream_events_project_to_protocol_updates() {
         name: "write".to_owned(),
         title: "Wrote file".to_owned(),
         output: "ok".to_owned(),
+        diff: None,
         is_error: false,
     })
     .expect("tool completion is client-visible");

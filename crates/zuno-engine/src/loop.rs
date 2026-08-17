@@ -149,6 +149,15 @@ pub enum TurnEvent {
         name: String,
         title: String,
         output: String,
+        /// The unified patch this call produced, when it changed a file.
+        ///
+        /// Lifted out of the result's `metadata["diff"]` rather than carrying the whole
+        /// metadata map, because this enum is a typed event stream for hosts: a
+        /// `Map<String, Value>` here would make every projection decide which
+        /// tool-private keys to leak, and the only thing a host needs is the patch.
+        /// `None` for every tool that changed nothing — see
+        /// `zuno_tools::diff` for why an absent patch is not an empty one.
+        diff: Option<String>,
         is_error: bool,
     },
     ToolResultAppended {
@@ -1020,6 +1029,13 @@ pub async fn run_turn(
                     name: call.name,
                     title: dispatch.output.title.clone(),
                     output: dispatch.output.output.clone(),
+                    diff: dispatch
+                        .output
+                        .metadata
+                        .get("diff")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|patch| !patch.is_empty())
+                        .map(str::to_owned),
                     is_error: dispatch.is_error,
                 })
                 .await?;

@@ -824,6 +824,7 @@ fn session_reports_the_files_a_finished_turn_wrote_and_no_others() {
             name: name.to_owned(),
             title: title.to_owned(),
             output: String::new(),
+            diff: None,
             is_error,
         })
     };
@@ -879,6 +880,7 @@ fn session_reports_an_interrupted_turns_writes_too() {
         name: String::from("edit"),
         title: String::from("src/lib.rs"),
         output: String::new(),
+        diff: None,
         is_error: false,
     }));
     screen.handle_event(&AppEvent::Engine(TurnEvent::TurnInterrupted {
@@ -1065,6 +1067,7 @@ fn furnished_screen() -> SessionScreen {
             output: String::from(
                 "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n-old line\n+new line\n",
             ),
+            diff: None,
             is_error: false,
         });
     screen
@@ -1364,4 +1367,98 @@ fn session_skill_picker_lists_discovered_skills_on_one_row_each() {
         rendered.contains("navigate a codebase"),
         "the description kept its newlines: {rendered}"
     );
+}
+
+/// The seam defect 3's fix depends on: the transcript can suppress its spinner, but only
+/// if something tells it a permission prompt is open. `SessionScreen` sits *below* the
+/// dialog stack and cannot see it, so the host reports it on every frame. Without this the
+/// suppression is correct, tested, and unreachable — the same shape as the diff viewer that
+/// could never open.
+#[test]
+fn session_stops_spinning_while_a_permission_prompt_is_mounted_over_it() {
+    let (mut screen, _shutdown) = screen();
+    // A message is required, not decoration: an empty transcript hands the region to the
+    // welcome screen, and the spinner this test is about lives in the transcript. Without
+    // it the assertions would pass on the status strip's own `working` and prove nothing.
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .push(Message::user("edit something"));
+    let context = ViewContext::defaults();
+    let mut host = crate::views::dialog::DialogHost::new(context.clone(), Box::new(screen));
+    host.handle_event(&AppEvent::Engine(TurnEvent::TurnStarted {
+        session_id: String::from("s"),
+    }));
+
+    let busy = rows(&render_offscreen(&mut host, 70, 20).expect("infallible")).join("\n");
+    assert!(
+        busy.contains("working"),
+        "a running turn with nothing outstanding must still spin:\n{busy}"
+    );
+
+    host.open(Box::new(crate::views::permission::PermissionPrompt::new(
+        context,
+        zuno_permission::PermissionRequest {
+            id: String::from("req_1"),
+            session_id: String::from("s"),
+            permission: String::from("edit"),
+            patterns: vec![String::from("src/**")],
+            metadata: serde_json::Map::new(),
+            always: vec![String::from("src/**")],
+            tool: None,
+        },
+        &serde_json::json!({"filePath": "src/main.rs"}),
+    )));
+
+    let waiting = rows(&render_offscreen(&mut host, 70, 20).expect("infallible")).join("\n");
+    assert!(
+        !waiting.contains("working"),
+        "the spinner claimed the process was busy while the prompt asked the user to \
+         decide:\n{waiting}"
+    );
+    assert!(
+        waiting.contains("waiting for your approval"),
+        "nothing told the user they are the one being waited on:\n{waiting}"
+    );
+
+    assert!(
+        host.dismiss(),
+        "the prompt was mounted, so it can be closed"
+    );
+    let resumed = rows(&render_offscreen(&mut host, 70, 20).expect("infallible")).join("\n");
+    assert!(
+        resumed.contains("working"),
+        "the wait notice outlived the prompt that justified it:\n{resumed}"
+    );
+}
+
+/// A picker is opened *by* the user while work continues, so suppressing the spinner
+/// behind one would claim the turn had stopped when it had not. Only a permission ask
+/// means the turn is blocked on a human.
+#[test]
+fn session_keeps_spinning_behind_a_dialog_that_is_not_a_permission_ask() {
+    let (mut screen, _shutdown) = screen();
+    *screen.catalog_mut() = catalog();
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .push(Message::user("edit something"));
+    let context = ViewContext::defaults();
+    let mut host = crate::views::dialog::DialogHost::new(context, Box::new(screen));
+    host.handle_event(&AppEvent::Engine(TurnEvent::TurnStarted {
+        session_id: String::from("s"),
+    }));
+    host.handle_action(action("model_list"), &press_none());
+    assert_eq!(
+        host.active(),
+        Some("model_list"),
+        "the picker must actually be mounted, or this asserts nothing"
+    );
+
+    let joined = rows(&render_offscreen(&mut host, 70, 20).expect("infallible")).join("\n");
+    assert!(
+        joined.contains("working"),
+        "a picker opened during a live turn is not the turn waiting on the user:\n{joined}"
+    );
+    assert!(!joined.contains("waiting for your approval"), "{joined}");
 }

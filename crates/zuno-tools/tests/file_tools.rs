@@ -469,6 +469,20 @@ async fn file_apply_patch_adds_updates_moves_and_deletes_files() {
     assert!(output.output.contains("M moved.txt"));
     assert!(output.output.contains("D delete.txt"));
     assert_eq!(formatter.paths().len(), 2);
+
+    // One patch spanning every file the call touched, so the viewer scrolls the whole
+    // change rather than whichever file happened to be applied last.
+    let patch = output.metadata["diff"]
+        .as_str()
+        .expect("a multi-file patch carries its own patch");
+    assert!(patch.contains("added.txt"), "{patch}");
+    assert!(patch.contains("+one"), "{patch}");
+    assert!(patch.contains("moved.txt"), "{patch}");
+    assert!(patch.contains("+new"), "{patch}");
+    assert!(
+        patch.contains("delete.txt") && patch.contains("-gone"),
+        "a delete's pre-image is captured before it is removed:\n{patch}"
+    );
 }
 
 #[tokio::test]
@@ -500,4 +514,117 @@ fn file_model_condition_matches_the_oracle_registry_rule() {
     assert!(!uses_apply_patch("gpt-4.1"));
     assert!(!uses_apply_patch("openai/gpt-oss-120b"));
     assert!(!uses_apply_patch("claude-sonnet-4"));
+}
+
+/// Defect: the TUI diff viewer was permanently empty for every tool that edits code,
+/// because `edit` reports `"Edit applied successfully."` and the patch existed nowhere.
+/// This pins the patch onto the result, which is the only place the viewer can read it.
+#[tokio::test]
+async fn file_edit_reports_the_patch_of_what_it_changed() {
+    let (workspace, tools, permission) = setup();
+    let path = workspace.path().join("edited.txt");
+    std::fs::write(&path, "one\ntwo\nthree\n").expect("fixture");
+
+    tools
+        .read
+        .execute(
+            json!({ "filePath": path }),
+            normal_context(permission.clone()),
+        )
+        .await
+        .expect("read first");
+    let output = tools
+        .edit
+        .execute(
+            json!({ "filePath": path, "oldString": "two", "newString": "TWO" }),
+            normal_context(permission),
+        )
+        .await
+        .expect("edit");
+
+    // The sentence stays the output: the patch must not displace what the model reads.
+    assert_eq!(output.output, "Edit applied successfully.");
+    let patch = output.metadata["diff"]
+        .as_str()
+        .expect("a mutation carries its patch as metadata");
+    assert!(patch.lines().any(|line| line.starts_with("@@")), "{patch}");
+    assert!(patch.contains("-two"), "{patch}");
+    assert!(patch.contains("+TWO"), "{patch}");
+    assert!(
+        patch.contains("edited.txt"),
+        "the patch names the file it changed:\n{patch}"
+    );
+}
+
+#[tokio::test]
+async fn file_write_reports_the_patch_for_both_a_creation_and_an_overwrite() {
+    let (workspace, tools, permission) = setup();
+    let path = workspace.path().join("written.txt");
+
+    let created = tools
+        .write
+        .execute(
+            json!({ "filePath": path, "content": "first\n" }),
+            normal_context(permission.clone()),
+        )
+        .await
+        .expect("create");
+    let patch = created.metadata["diff"]
+        .as_str()
+        .expect("creating a file is a change");
+    assert!(patch.contains("+first"), "{patch}");
+
+    tools
+        .read
+        .execute(
+            json!({ "filePath": path }),
+            normal_context(permission.clone()),
+        )
+        .await
+        .expect("read before overwrite");
+    let overwritten = tools
+        .write
+        .execute(
+            json!({ "filePath": path, "content": "second\n" }),
+            normal_context(permission),
+        )
+        .await
+        .expect("overwrite");
+    let patch = overwritten.metadata["diff"]
+        .as_str()
+        .expect("an overwrite is a change");
+    assert!(patch.contains("-first"), "{patch}");
+    assert!(patch.contains("+second"), "{patch}");
+}
+
+/// A write of byte-identical content attaches nothing, so a present `diff` always means
+/// "here is the change" rather than "something ran". An empty viewer beats a lying one.
+#[tokio::test]
+async fn file_write_reports_no_patch_when_the_content_is_unchanged() {
+    let (workspace, tools, permission) = setup();
+    let path = workspace.path().join("same.txt");
+    std::fs::write(&path, "identical\n").expect("fixture");
+
+    tools
+        .read
+        .execute(
+            json!({ "filePath": path }),
+            normal_context(permission.clone()),
+        )
+        .await
+        .expect("read first");
+    let output = tools
+        .write
+        .execute(
+            json!({ "filePath": path, "content": "identical\n" }),
+            normal_context(permission),
+        )
+        .await
+        .expect("rewrite");
+
+    assert!(
+        output.metadata.get("diff").is_none(),
+        "an unchanged file has no patch to show, got {:?}",
+        output.metadata.get("diff")
+    );
 }

@@ -45,6 +45,11 @@ struct FileChange {
     source: ResolvedPath,
     destination: Option<ResolvedPath>,
     kind: ChangeKind,
+    /// The file as it was, so the reported patch can be taken against it.
+    ///
+    /// Captured during preparation rather than re-read during application because a
+    /// `Delete` has no pre-image left to read once it has run.
+    old_bytes: Vec<u8>,
     new_bytes: Vec<u8>,
 }
 
@@ -121,6 +126,11 @@ impl TypedTool for ApplyPatchTool {
         let mut files = Vec::<Value>::new();
         let mut formatted_files = Vec::<Value>::new();
         let mut failures = Vec::<FormatFailure>::new();
+        // One patch covering every file this call touched, in application order. A
+        // unified diff concatenates by construction — each file re-labels itself with its
+        // own `---`/`+++` pair — so the viewer scrolls through the whole change rather
+        // than showing whichever file happened to be last.
+        let mut patches = Vec::<String>::new();
         for change in changes {
             check_interrupt("apply_patch", &ctx)?;
             let source_path = change.source.canonical.clone();
@@ -166,6 +176,19 @@ impl TypedTool for ApplyPatchTool {
                 ChangeKind::Update | ChangeKind::Move => "M",
             };
             let relative = self.runtime.title(target);
+            // The post-image is taken from disk for anything that still exists, so a
+            // formatter's contribution is inside the patch; a delete's post-image is
+            // empty because there is no file left to read.
+            let post = if change.kind == ChangeKind::Delete {
+                Vec::new()
+            } else {
+                std::fs::read(&target_path).map_err(|error| failed("apply_patch", error))?
+            };
+            if let Some(patch) =
+                crate::diff::unified_diff_bytes(&relative, &change.old_bytes, &post)
+            {
+                patches.push(patch);
+            }
             summaries.push(format!("{marker} {relative}"));
             files.push(json!({
                 "filePath": slash(&source_path),
@@ -178,12 +201,13 @@ impl TypedTool for ApplyPatchTool {
             "Success. Updated the following files:\n{}",
             summaries.join("\n")
         );
-        Ok(report_formatting(
-            ToolOutput::text(output.clone(), output)
-                .with_metadata("files", Value::Array(files))
-                .with_metadata("formattedFiles", Value::Array(formatted_files)),
-            &failures,
-        ))
+        let mut result = ToolOutput::text(output.clone(), output)
+            .with_metadata("files", Value::Array(files))
+            .with_metadata("formattedFiles", Value::Array(formatted_files));
+        if !patches.is_empty() {
+            result = result.with_metadata(crate::diff::METADATA_DIFF_KEY, patches.concat());
+        }
+        Ok(report_formatting(result, &failures))
     }
 }
 
@@ -245,15 +269,19 @@ impl ApplyPatchTool {
                         source,
                         destination: None,
                         kind: ChangeKind::Add,
+                        old_bytes: Vec::new(),
                         new_bytes: content.as_bytes().to_vec(),
                     });
                 }
                 PatchOperation::Delete { .. } => {
                     ensure_regular_file(&source.canonical)?;
+                    let old_bytes = std::fs::read(&source.canonical)
+                        .map_err(|error| failed("apply_patch", error))?;
                     changes.push(FileChange {
                         source,
                         destination: None,
                         kind: ChangeKind::Delete,
+                        old_bytes,
                         new_bytes: Vec::new(),
                     });
                 }
@@ -294,6 +322,7 @@ impl ApplyPatchTool {
                         source,
                         destination,
                         kind,
+                        old_bytes: bytes,
                         new_bytes: encode_text(&content, decoded.bom),
                     });
                 }

@@ -238,6 +238,7 @@ fn turn_event(event: &TurnEvent) -> NewEvent {
             name,
             title,
             output,
+            diff,
             is_error,
         } => (
             "tool.dispatch.completed",
@@ -247,6 +248,7 @@ fn turn_event(event: &TurnEvent) -> NewEvent {
                 "name": name,
                 "title": title,
                 "output": output,
+                "diff": diff,
                 "isError": is_error,
             })),
         ),

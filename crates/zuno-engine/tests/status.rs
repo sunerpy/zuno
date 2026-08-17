@@ -244,6 +244,7 @@ fn status_urgent_soft_interrupt_skips_remaining_tools_in_event_sequence() {
                 name: "first".to_owned(),
                 title: "first complete".to_owned(),
                 output: "first output".to_owned(),
+                diff: None,
                 is_error: false,
             },
             TurnEvent::ToolResultAppended {
@@ -271,6 +272,7 @@ fn emit_tool_events(events: &mut Vec<TurnEvent>, call_id: &str, name: &str) {
         name: name.to_owned(),
         title: format!("{name} complete"),
         output: format!("{name} output"),
+        diff: None,
         is_error: false,
     });
     events.push(TurnEvent::ToolResultAppended {

@@ -162,6 +162,12 @@ tree-sitter-powershell = "0.26.4"
 walkdir = "2.5.0"
 which = "8.0.5"
 
+# Already in the lockfile as `insta`'s own diff engine, so naming it directly adds
+# no crate and no new download. It replaces the oracle's `diff` npm package, whose
+# `createTwoFilesPatch` is what `zuno-tools::diff` reproduces; hand-rolling a Myers
+# implementation to avoid one already-vendored dependency would be strictly worse.
+similar = "2.7.0"
+
 # -- storage ----------------------------------------------------------------
 # `bundled` compiles the SQLite C amalgamation, which is the point: the session
 # store must be byte-compatible with an `opencode.db` the TypeScript binary also

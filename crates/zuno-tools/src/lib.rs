@@ -90,9 +90,21 @@
 //! after three consolidation failures in one turn the next attempt is told to stop
 //! and answer the user: a failed memory side effect must never cost the turn's
 //! reply.
+//!
+//! # The patch a mutation reports
+//!
+//! Every tool that changes a file on disk — [`edit`], [`write`], [`apply_patch`] —
+//! attaches the unified patch of what it changed as `metadata["diff"]`, built by
+//! [`diff::unified_diff_bytes`]. The patch is metadata rather than output because
+//! `output` is what the model is charged for and what the transcript prints inline; see
+//! [`diff`] for the full argument and for what of the oracle's post-processing is
+//! deliberately not ported. Without it the TUI's diff viewer has nothing to open on,
+//! which is exactly the state this crate shipped in before: `edit` said
+//! `"Edit applied successfully."` and the patch existed nowhere.
 
 pub mod apply_patch;
 pub mod batch;
+pub mod diff;
 pub mod edit;
 pub mod format;
 pub mod output_policy;

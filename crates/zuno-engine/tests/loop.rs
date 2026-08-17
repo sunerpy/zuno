@@ -720,6 +720,7 @@ fn expected_full_turn_events() -> Vec<TurnEvent> {
             name: "echo".to_owned(),
             title: "echo".to_owned(),
             output: "hello".to_owned(),
+            diff: None,
             is_error: false,
         },
         TurnEvent::ToolResultAppended {

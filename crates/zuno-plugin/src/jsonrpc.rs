@@ -1311,9 +1311,10 @@ fn event_value(event: &zuno_engine::r#loop::TurnEvent) -> Result<Value, HookCode
             name,
             title,
             output,
+            diff,
             is_error,
         } => {
-            json!({ "type": "tool.dispatch.completed", "step": step, "callID": call_id, "name": name, "title": title, "output": output, "isError": is_error })
+            json!({ "type": "tool.dispatch.completed", "step": step, "callID": call_id, "name": name, "title": title, "output": output, "diff": diff, "isError": is_error })
         }
         TurnEvent::ToolResultAppended {
             step,

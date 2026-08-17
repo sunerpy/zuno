@@ -58,6 +58,7 @@ fn views_chat_transcript_renders_every_part_kind_offscreen() {
             name: String::from("read"),
             title: String::from("Read src/main.rs"),
             output: String::from("fn main() {}"),
+            diff: None,
             is_error: false,
         },
         provider(StreamEvent::GeneratedImage {
@@ -305,6 +306,7 @@ fn views_tool_call_walks_pending_running_and_terminal_states() {
         name: String::from("bash"),
         title: String::from("ls"),
         output: String::from("a\nb"),
+        diff: None,
         is_error: true,
     });
     assert_eq!(status(&transcript), ToolStatus::Error);
@@ -806,6 +808,7 @@ fn views_transcript_renders_a_tool_patch_as_a_diff() {
         name: String::from("edit"),
         title: String::from("Edit src/main.rs"),
         output: String::from("@@ -1,3 +1,3 @@\n fn main() {\n-    old();\n+    new();\n }\n"),
+        diff: None,
         is_error: false,
     }));
     view.toggle_tool_output();
@@ -822,6 +825,85 @@ fn views_transcript_renders_a_tool_patch_as_a_diff() {
         joined.contains('2') && joined.contains('3'),
         "the diff was rendered without line numbers:\n{joined}"
     );
+}
+
+/// The defect this whole `diff` field exists for: `edit` reports a sentence, so a viewer
+/// that could only recognise a patch *in the output* was permanently empty for the one
+/// tool that changes code.
+#[test]
+fn views_transcript_finds_the_patch_of_a_mutation_whose_output_is_a_sentence() {
+    let mut view = view();
+    view.handle_event(&AppEvent::Engine(started()));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseStart {
+        id: String::from("c1"),
+        name: String::from("edit"),
+    })));
+    let patch = "--- src/main.rs\n+++ src/main.rs\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n";
+    view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
+        step: 1,
+        call_id: String::from("c1"),
+        name: String::from("edit"),
+        title: String::from("src/main.rs"),
+        // Exactly what `edit` really returns, and deliberately not a patch.
+        output: String::from("Edit applied successfully."),
+        diff: Some(String::from(patch)),
+        is_error: false,
+    }));
+    assert!(
+        !looks_like_diff("Edit applied successfully."),
+        "the premise of this test is that the output alone is not recognisable as a patch"
+    );
+    assert_eq!(
+        view.transcript().latest_diff().as_deref(),
+        Some(patch),
+        "a mutation's patch must be reachable even though its output is a sentence"
+    );
+}
+
+/// The pre-existing source must keep working: a shell `git diff` carries its patch *as*
+/// its output and has no `diff` field, so dropping that branch would trade one empty
+/// viewer for another.
+#[test]
+fn views_transcript_still_finds_a_patch_that_arrived_as_output() {
+    let mut view = view();
+    view.handle_event(&AppEvent::Engine(started()));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseStart {
+        id: String::from("c1"),
+        name: String::from("bash"),
+    })));
+    let patch = "@@ -1,2 +1,2 @@\n-old\n+new\n";
+    view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
+        step: 1,
+        call_id: String::from("c1"),
+        name: String::from("bash"),
+        title: String::from("git diff"),
+        output: String::from(patch),
+        diff: None,
+        is_error: false,
+    }));
+    assert_eq!(view.transcript().latest_diff().as_deref(), Some(patch));
+}
+
+/// An honest empty viewer beats one showing something that is not the change: a tool that
+/// mutated nothing attaches no patch, and `read` never had one to attach.
+#[test]
+fn views_transcript_reports_no_patch_when_no_tool_produced_one() {
+    let mut view = view();
+    view.handle_event(&AppEvent::Engine(started()));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseStart {
+        id: String::from("c1"),
+        name: String::from("read"),
+    })));
+    view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
+        step: 1,
+        call_id: String::from("c1"),
+        name: String::from("read"),
+        title: String::from("src/main.rs"),
+        output: String::from("fn main() {}"),
+        diff: None,
+        is_error: false,
+    }));
+    assert_eq!(view.transcript().latest_diff(), None);
 }
 
 #[test]
@@ -846,6 +928,7 @@ fn views_transcript_collapses_long_tool_output_and_says_how_much_it_hid() {
         name: String::from("bash"),
         title: String::from("ls"),
         output: body,
+        diff: None,
         is_error: false,
     }));
     let collapsed = draw(&mut view, 60, 30).join("\n");
@@ -976,5 +1059,122 @@ fn views_status_strip_omits_a_cache_column_a_provider_never_reported() {
     assert!(
         !text.contains('⚡'),
         "a permanent `cache 0` is a column of noise: [{text}]"
+    );
+}
+
+/// `working` and `waiting for you` are mutually exclusive claims about who the turn is
+/// blocked on, and the defect was that both rendered at once: the spinner said the process
+/// was busy while a permission prompt sat below asking the user to decide.
+#[test]
+fn views_transcript_stops_claiming_it_is_working_while_a_permission_ask_is_open() {
+    let mut view = view();
+    view.handle_event(&AppEvent::Engine(TurnEvent::TurnStarted {
+        session_id: String::from("s"),
+    }));
+    let busy = draw(&mut view, 60, 12).join("\n");
+    assert!(
+        busy.contains("working"),
+        "a running turn with nothing outstanding still spins:\n{busy}"
+    );
+
+    assert!(
+        view.transcript_mut().set_awaiting_permission(true),
+        "the first ask is a change, which is what a caller turns into a redraw"
+    );
+    let waiting = draw(&mut view, 60, 12).join("\n");
+    assert!(
+        !waiting.contains("working"),
+        "the spinner outlived the ask it contradicts:\n{waiting}"
+    );
+    assert!(
+        waiting.contains("waiting for your approval"),
+        "nothing told the user they are the one being waited on:\n{waiting}"
+    );
+
+    // Answered: the turn is running again and the spinner is the honest signal.
+    assert!(view.transcript_mut().set_awaiting_permission(false));
+    let resumed = draw(&mut view, 60, 12).join("\n");
+    assert!(
+        resumed.contains("working"),
+        "the wait notice outlived the prompt:\n{resumed}"
+    );
+    assert!(!resumed.contains("waiting for your approval"), "{resumed}");
+}
+
+/// A repeated report is not a change, so it must not cost a redraw.
+#[test]
+fn views_transcript_reports_an_unchanged_permission_state_as_no_change() {
+    let mut transcript = Transcript::new();
+    assert!(transcript.set_awaiting_permission(true));
+    assert!(!transcript.set_awaiting_permission(true));
+    assert!(transcript.is_awaiting_permission());
+}
+
+/// The strip must not say `working` while a permission prompt is waiting on the user.
+///
+/// The strip and not only the transcript, because the transcript's spinner is on screen
+/// only after a turn has produced a message; before that the welcome surface owns that
+/// area and this row is the only thing on screen saying anything about state.
+#[test]
+fn views_status_strip_says_it_is_waiting_rather_than_working_during_a_permission_ask() {
+    let mut status = StatusView::new(ViewContext::defaults());
+    let state = |status: &mut StatusView| {
+        let row = rows(&render_offscreen(status, 60, 1).expect("infallible")).remove(0);
+        row.strip_suffix(StatusView::EXIT_HINT)
+            .unwrap_or(&row)
+            .trim()
+            .to_owned()
+    };
+
+    status.mark_running();
+    assert_eq!(state(&mut status), StatusView::WORKING);
+
+    assert!(status.set_awaiting_permission(true));
+    assert_eq!(
+        state(&mut status),
+        StatusView::AWAITING_PERMISSION,
+        "the always-visible row still pointed the user at the wrong thing to wait for"
+    );
+
+    assert!(status.set_awaiting_permission(false));
+    assert_eq!(
+        state(&mut status),
+        StatusView::WORKING,
+        "the notice outlived the prompt"
+    );
+    assert!(
+        !status.set_awaiting_permission(false),
+        "no change, no redraw"
+    );
+}
+
+/// An outstanding ask outranks a resolved agent and model rather than being hidden by
+/// them: those describe the turn's configuration, this describes what it is stopped on.
+#[test]
+fn views_status_strip_names_an_outstanding_ask_beside_a_resolved_turn() {
+    let mut status = StatusView::new(ViewContext::defaults());
+    for event in [
+        TurnEvent::AgentResolved {
+            step: 1,
+            agent: String::from("build"),
+        },
+        TurnEvent::ModelResolved {
+            step: 1,
+            provider_id: String::from("anthropic"),
+            model_id: String::from("claude"),
+        },
+    ] {
+        status.handle_event(&AppEvent::Engine(event));
+    }
+    status.set_awaiting_permission(true);
+    let row = rows(&render_offscreen(&mut status, 80, 1).expect("infallible")).remove(0);
+    assert!(row.contains("build"), "{row:?}");
+    assert!(
+        row.contains(StatusView::AWAITING_PERMISSION),
+        "a resolved turn hid the fact that it is blocked on the user: {row:?}"
+    );
+    assert!(
+        !row.contains(StatusView::IDLE),
+        "a blocked turn is not idle: {row:?}"
     );
 }

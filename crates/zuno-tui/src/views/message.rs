@@ -265,6 +265,14 @@ pub enum MessagePart {
         status: ToolStatus,
         /// The tool's output, once it completes.
         output: Option<String>,
+        /// The unified patch it produced, when it changed a file.
+        ///
+        /// Separate from `output` because a mutating tool's output is a sentence — the
+        /// patch travels beside it as `metadata["diff"]` and arrives here through
+        /// [`zuno_engine::r#loop::TurnEvent::ToolDispatchCompleted`]. Keeping the two
+        /// apart is what lets the transcript print one line while the diff viewer opens
+        /// on the whole change.
+        diff: Option<String>,
     },
     /// A file the user attached or the model produced.
     Attachment {
@@ -386,13 +394,42 @@ pub struct Transcript {
     context_limit: u64,
     /// How many events have been folded, which is what advances the spinner.
     ticks: usize,
+    /// Whether a permission prompt is asking the user to decide right now.
+    ///
+    /// Not folded from an engine event, because a parked ask produces none: the
+    /// dispatcher blocks inside `ctx.ask` and the engine's last word was
+    /// `ToolDispatchStarted`, which is equally true of a shell command that is simply
+    /// slow. The dialog stack is the only thing that knows the difference, so it is what
+    /// sets this.
+    awaiting_permission: bool,
 }
 
 impl Transcript {
+    /// What the transcript says instead of the spinner while a permission ask is open.
+    ///
+    /// Phrased as an instruction rather than a state — "waiting" alone leaves the user
+    /// looking for what to wait for, when they are the thing being waited on.
+    pub const AWAITING_PERMISSION: &'static str = "△ waiting for your approval";
+
     /// An empty transcript.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record whether a permission prompt is asking the user to decide.
+    ///
+    /// Returns whether the answer changed, which is what a caller turns into a redraw.
+    pub const fn set_awaiting_permission(&mut self, awaiting: bool) -> bool {
+        let changed = self.awaiting_permission != awaiting;
+        self.awaiting_permission = awaiting;
+        changed
+    }
+
+    /// Whether a permission prompt is currently asking the user to decide.
+    #[must_use]
+    pub const fn is_awaiting_permission(&self) -> bool {
+        self.awaiting_permission
     }
 
     /// The messages so far.
@@ -447,11 +484,20 @@ impl Transcript {
         SPINNER[self.ticks % SPINNER.len()]
     }
 
-    /// The most recent tool output that is a unified diff.
+    /// The most recent patch a tool reported.
     ///
-    /// Searched newest-first because the interesting patch is the one just produced, and
-    /// recognised with the same [`looks_like_diff`] the transcript colours by, so the
-    /// diff viewer opens on exactly what the transcript already treats as a patch.
+    /// Searched newest-first because the interesting patch is the one just produced. Two
+    /// sources, in this order:
+    ///
+    /// 1. the tool's own `diff`, which every file-mutating tool now attaches — this is
+    ///    the only source that works for `edit`, `write` and `patch`, whose output is a
+    ///    sentence rather than a patch;
+    /// 2. failing that, an output that *is* a patch, recognised with the same
+    ///    [`looks_like_diff`] the transcript colours by — which is how a `git diff` run
+    ///    through the shell tool still opens here.
+    ///
+    /// Before the first source existed this method could only ever return the second, so
+    /// the viewer was permanently empty for the one tool that edits code.
     #[must_use]
     pub fn latest_diff(&self) -> Option<String> {
         self.messages
@@ -459,6 +505,9 @@ impl Transcript {
             .rev()
             .flat_map(|message| message.parts.iter().rev())
             .find_map(|part| match part {
+                MessagePart::Tool {
+                    diff: Some(patch), ..
+                } => Some(patch.clone()),
                 MessagePart::Tool {
                     output: Some(output),
                     ..
@@ -508,6 +557,7 @@ impl Transcript {
                         title: None,
                         status: ToolStatus::Running,
                         output: None,
+                        diff: None,
                     });
                     true
                 }
@@ -516,6 +566,7 @@ impl Transcript {
                 call_id,
                 title,
                 output,
+                diff,
                 is_error,
                 ..
             } => self.update_tool(call_id, |part| {
@@ -523,6 +574,7 @@ impl Transcript {
                     status,
                     title: slot,
                     output: body,
+                    diff: patch,
                     ..
                 } = part
                 {
@@ -533,6 +585,7 @@ impl Transcript {
                     };
                     *slot = Some(title.clone());
                     *body = Some(output.clone());
+                    *patch = diff.clone();
                 }
             }),
             TurnEvent::TurnCompleted { .. } | TurnEvent::TurnInterrupted { .. } => {
@@ -609,6 +662,7 @@ impl Transcript {
                     title: None,
                     status: ToolStatus::Pending,
                     output: None,
+                    diff: None,
                 });
                 true
             }
@@ -848,7 +902,17 @@ impl TranscriptView {
             }
             lines.push(padded("", width, self.context.surface()));
         }
-        if self.transcript.running {
+        // `working` and `waiting for you` are mutually exclusive claims about who the
+        // turn is blocked on, so exactly one of them may be on screen. A spinner beside
+        // an open permission prompt says the process is busy while it is in fact idle,
+        // waiting for the very key press the prompt is asking for.
+        if self.transcript.awaiting_permission {
+            lines.push(padded(
+                Transcript::AWAITING_PERMISSION,
+                width,
+                self.context.warning(),
+            ));
+        } else if self.transcript.running {
             lines.push(padded(
                 &format!("{} working", self.transcript.spinner()),
                 width,
@@ -1146,6 +1210,12 @@ pub struct StatusView {
     /// "connected". It is the same reasoning that put the shadowing warning in the
     /// transcript.
     diagnostics: Option<String>,
+    /// Whether a permission prompt is asking the user to decide.
+    ///
+    /// The strip is the one row always on screen, so it is where a user looks when a
+    /// turn seems stuck. Saying `working` there while the process is parked on an ask
+    /// points them at the wrong thing to wait for.
+    awaiting_permission: bool,
 }
 
 /// Token counts for the session, accumulated across every step of every turn.
@@ -1232,6 +1302,13 @@ impl StatusView {
     /// The word the strip shows the instant a turn starts, before anything resolves.
     pub const WORKING: &'static str = "working";
 
+    /// What the strip says while a permission prompt is waiting on the user.
+    ///
+    /// It replaces [`Self::WORKING`] rather than sitting beside it: the two are opposite
+    /// answers to "who is this turn blocked on", and a strip that printed both would make
+    /// the user read the prompt as background noise.
+    pub const AWAITING_PERMISSION: &'static str = "awaiting approval";
+
     /// The key shown as the way out, and what it does while a turn is running.
     ///
     /// The strip is the one row always on screen, so it is where a binding a user
@@ -1253,7 +1330,17 @@ impl StatusView {
             configured_model: None,
             usage: TokenUsage::default(),
             diagnostics: None,
+            awaiting_permission: false,
         }
+    }
+
+    /// Record whether a permission prompt is waiting on the user.
+    ///
+    /// Returns whether the answer changed, which is what a caller turns into a redraw.
+    pub const fn set_awaiting_permission(&mut self, awaiting: bool) -> bool {
+        let changed = self.awaiting_permission != awaiting;
+        self.awaiting_permission = awaiting;
+        changed
     }
 
     /// Record the latest language-server verdict.
@@ -1401,7 +1488,15 @@ impl StatusView {
             }
             text.push_str(diagnostics);
         }
-        if text.is_empty() {
+        if self.awaiting_permission {
+            // Appended even beside a resolved agent and model, because those describe the
+            // turn's configuration while this describes what it is stopped on. It also
+            // displaces `working`/`idle` below: an outstanding ask outranks both.
+            if !text.is_empty() {
+                text.push_str(" · ");
+            }
+            text.push_str(Self::AWAITING_PERMISSION);
+        } else if text.is_empty() {
             text.push_str(if self.running {
                 Self::WORKING
             } else {

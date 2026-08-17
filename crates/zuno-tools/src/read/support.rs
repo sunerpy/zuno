@@ -299,6 +299,25 @@ pub(crate) fn report_formatting(mut output: ToolOutput, failures: &[FormatFailur
     )
 }
 
+/// Attach the patch of `old` → `new` to a mutation's result, when there is one.
+///
+/// The post-image is the bytes re-read *after* the formatter ran, so the patch describes
+/// what actually landed on disk rather than what the tool asked for. That is the whole
+/// point of taking it here instead of inside each tool's replacement arithmetic: an edit
+/// followed by `rustfmt` changed more than the edit did, and a patch that omits the
+/// formatter's part is a patch of a file state that never existed.
+///
+/// A file with no line-oriented patch — binary, or unchanged after formatting — attaches
+/// nothing, so `metadata["diff"]` being present means "here is the change" and its
+/// absence means "there is none to show". See [`crate::diff`] for why this is metadata
+/// and not output.
+pub(crate) fn report_diff(output: ToolOutput, label: &str, old: &[u8], new: &[u8]) -> ToolOutput {
+    match crate::diff::unified_diff_bytes(label, old, new) {
+        Some(patch) => output.with_metadata(crate::diff::METADATA_DIFF_KEY, patch),
+        None => output,
+    }
+}
+
 pub(crate) fn write_with_dirs(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
