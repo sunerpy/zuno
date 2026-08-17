@@ -981,6 +981,19 @@ pub trait ActionComponent: Component {
     ) -> EventResult {
         EventResult::IGNORED
     }
+
+    /// Observe which modal currently owns the keyboard, or `None` for none.
+    ///
+    /// A component below [`crate::views::dialog::DialogHost`] cannot see the stack, and
+    /// some of what it draws depends on it: a transcript that keeps spinning `working`
+    /// while a permission prompt asks the user to decide is claiming the process is busy
+    /// when it is in fact waiting, and those two states are mutually exclusive.
+    ///
+    /// Called by the host on every frame from the stack it is about to draw, rather than
+    /// pushed when a dialog opens or closes. One derived call site cannot disagree with
+    /// what is on screen; two notification sites — `open` and each of the pops — can, and
+    /// the failure mode is a banner that outlives its dialog.
+    fn observe_modal(&mut self, _active: Option<&'static str>) {}
 }
 
 /// Turns key presses into actions before the component tree sees them.

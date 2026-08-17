@@ -315,6 +315,11 @@ impl Component for DialogHost {
         // not a replacement for it, so a streaming answer stays visible behind a
         // permission prompt — which is the whole reason a user can judge the
         // prompt.
+        //
+        // Told first, so the base draws the frame knowing what is over it. See
+        // `ActionComponent::observe_modal` for why this is derived here every frame
+        // rather than pushed when the stack changes.
+        self.base.observe_modal(self.active());
         self.base.render(frame, area);
         self.render_dialog(frame, area);
     }

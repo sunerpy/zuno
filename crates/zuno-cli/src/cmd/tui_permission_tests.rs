@@ -610,3 +610,99 @@ async fn a_wake_reaches_the_component_below_the_bridge() {
         "the report never reached the transcript, so the wake was absorbed:\n{joined}"
     );
 }
+
+/// The spinner and the prompt are mutually exclusive, end to end through the real host.
+///
+/// `SessionScreen` sits under `DialogHost` and cannot see the stack, so this asserts the
+/// whole path: a parked ask opens a prompt, the host reports the active modal down to the
+/// screen while it draws, and the transcript drops `working`. Asserting
+/// `Transcript::set_awaiting_permission` directly would pass with the notification
+/// unwired, which is the state that shipped.
+///
+/// A turn message is streamed first on purpose. With an empty transcript the welcome
+/// surface owns that area and the prompt overlays the status strip, so a frame assertion
+/// would be checking rows the user never sees — the strip's own wording is asserted in
+/// `zuno-tui`'s unit tests instead.
+#[tokio::test]
+async fn cmd_tui_permission_prompt_replaces_the_working_spinner() {
+    let (broker, mut wake) = broker();
+    let context = ViewContext::defaults();
+    let (shutdown, _held) = tokio::sync::mpsc::channel(4);
+    let screen = zuno_tui::views::session::SessionScreen::new(context.clone(), shutdown);
+    let host = zuno_tui::views::dialog::DialogHost::new(context.clone(), Box::new(screen));
+    let mut bridge = PermissionBridge::new(context, Arc::clone(&broker), host);
+
+    for event in [
+        zuno_engine::r#loop::TurnEvent::TurnStarted {
+            session_id: String::from("s"),
+        },
+        zuno_engine::r#loop::TurnEvent::AssistantMessageCreated {
+            step: 1,
+            message_id: String::from("m"),
+        },
+        zuno_engine::r#loop::TurnEvent::Provider {
+            step: 1,
+            event: zuno_llm::event::StreamEvent::TextDelta(String::from("on it")),
+        },
+    ] {
+        bridge.handle_event(&AppEvent::Engine(event));
+    }
+    let busy = frame(&mut bridge);
+    assert!(
+        busy.contains("working"),
+        "a running turn with nothing outstanding still spins:\n{busy}"
+    );
+
+    let asked = tokio::spawn({
+        let broker = Arc::clone(&broker);
+        async move {
+            broker
+                .ask(
+                    "bash",
+                    PermissionAsk {
+                        permission: String::from("bash"),
+                        patterns: vec![String::from("rm -rf /")],
+                        metadata: serde_json::Map::new(),
+                        always: vec![String::from("*")],
+                    },
+                )
+                .await
+        }
+    });
+    // The broker nudges the loop once the request is parked, which is the same
+    // synchronisation the production loop uses — waiting on it rather than on a clock
+    // means this test cannot pass by being slow.
+    let nudge = tokio::time::timeout(Duration::from_secs(5), wake.recv())
+        .await
+        .expect("the broker nudges the loop when it parks a request");
+    assert!(matches!(nudge, Some(TerminalEvent::Wake)));
+
+    bridge.handle_event(&AppEvent::Terminal(TerminalEvent::Wake));
+    let waiting = frame(&mut bridge);
+    assert!(
+        waiting.contains("Permission required"),
+        "the prompt never opened, so this proves nothing about the spinner:\n{waiting}"
+    );
+    assert!(
+        !waiting.contains("working"),
+        "the transcript still claimed to be working while asking the user to decide:\n{waiting}"
+    );
+    assert!(
+        waiting.contains("waiting for your approval"),
+        "nothing said who the turn is blocked on:\n{waiting}"
+    );
+
+    asked.abort();
+}
+
+fn frame(bridge: &mut PermissionBridge) -> String {
+    let buffer = render_offscreen(bridge, 120, 30).expect("the offscreen backend is infallible");
+    (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}

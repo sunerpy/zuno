@@ -824,6 +824,21 @@ impl ActionComponent for SessionScreen {
         }
     }
 
+    fn observe_modal(&mut self, active: Option<&'static str>) {
+        // Only a permission prompt makes the turn wait on the user; a picker or the help
+        // view is something the user opened *while* work continued, and suppressing the
+        // spinner behind those would claim the turn had stopped when it had not.
+        let awaiting = active == Some(crate::views::permission::DIALOG_ID);
+        // Both surfaces, from one answer. The transcript's spinner is only on screen once
+        // a turn has produced a message — before that the welcome surface has the area and
+        // the strip is the only row saying anything about state, so fixing one and not the
+        // other leaves the claim on whichever surface the user is actually looking at.
+        self.transcript
+            .transcript_mut()
+            .set_awaiting_permission(awaiting);
+        self.status.set_awaiting_permission(awaiting);
+    }
+
     fn handle_action(&mut self, action: &'static Definition, event: &KeyEvent) -> EventResult {
         // `ctrl+c` and `ctrl+d` are each claimed by the `input` scope before `app`,
         // so a screen that only watched for `app_exit` could never be left. Asking
