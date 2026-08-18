@@ -35,9 +35,10 @@
 //! honours it and a test asserts the discard.
 
 use crate::app::{AppEvent, Component, EventResult};
-use crate::views::{ViewContext, fill, padded};
+use crate::keybind::APP_EXIT;
+use crate::views::{ViewContext, display_width, fill, key_label, padded, truncate};
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Frame, symbols};
@@ -116,12 +117,30 @@ impl ToolStatus {
 
 /// The per-tool icon and the placeholder shown before the arguments arrive.
 ///
-/// Verbatim from the oracle's `InlineTool` call sites: bash `$`/"Writing
-/// command...", glob `✱`/"Finding files...", grep `✱`/"Searching content...",
-/// read `→`/"Reading file...", write `→`/"Preparing write...", webfetch
+/// The first eight rows are verbatim from the oracle's `InlineTool` call sites: bash
+/// `$`/"Writing command...", glob `✱`/"Finding files...", grep `✱`/"Searching
+/// content...", read `→`/"Reading file...", write `→`/"Preparing write...", webfetch
 /// `%`/"Fetching from the web...", websearch `◈`/"Searching web...", task
-/// `#`/"Delegating..." (`index.tsx:2090,2138,2186,2163,2124,2198,2206,2296`), with
-/// `⚙` as the generic fallback (`index.tsx:1808`).
+/// `#`/"Delegating..." (`index.tsx:2090,2138,2186,2163,2124,2198,2206,2296`), with `⚙`
+/// as the generic fallback (`index.tsx:1808`).
+///
+/// The rest are this project's, because this project registers tools the oracle does not
+/// (`memory`, the three goal tools) and exposes slots the oracle reaches only through a
+/// palette. They are added rather than left on `⚙` for the reason
+/// [`crate::views::tool::summary`] exists at all: a column of identical `⚙` rows is a
+/// column a reader cannot scan.
+///
+/// **`apply_patch`, not `patch`.** The arm here read `"patch"` and could therefore never
+/// match: `BuiltinSlot::Patch::wire_id()` is `apply_patch`, so every patch call in this
+/// project's history rendered as the generic `⚙`. That is the same class of defect as
+/// `editor_open`'s unreachable binding — a hand-written name that no longer agreed with
+/// the table it was copied from — which is why
+/// `tool_summaries_cover_every_tool_the_registry_can_expose` now reads the names out of
+/// the registry's own source instead of trusting this list.
+///
+/// Every icon is one terminal column wide, so a column of tool rows aligns without the
+/// caller having to measure. Widths are still measured downstream; this only means the
+/// table does not *depend* on that.
 #[must_use]
 pub fn tool_affordance(name: &str) -> (&'static str, &'static str) {
     match name {
@@ -129,10 +148,33 @@ pub fn tool_affordance(name: &str) -> (&'static str, &'static str) {
         "glob" => ("✱", "Finding files..."),
         "grep" => ("✱", "Searching content..."),
         "read" => ("→", "Reading file..."),
-        "write" | "edit" | "patch" => ("→", "Preparing write..."),
+        "write" | "edit" => ("→", "Preparing write..."),
         "webfetch" => ("%", "Fetching from the web..."),
         "websearch" => ("◈", "Searching web..."),
         "task" => ("#", "Delegating..."),
+        // A patch is a write, so it shares the write arrow rather than inventing a glyph:
+        // the two differ in how the change is expressed, not in what happens to the file.
+        "apply_patch" => ("→", "Preparing patch..."),
+        // A ballot box for the plan, which is what a todo list is here.
+        "todowrite" => ("☑", "Updating plan..."),
+        // The only tool that is about to block on the user, so it gets the one glyph that
+        // reads as a question.
+        "question" => ("?", "Asking..."),
+        "skill" => ("✦", "Loading skill..."),
+        "lsp" => ("⌁", "Querying language server..."),
+        // Leaving plan mode is a transition, and the tab arrow is this codebase's
+        // vocabulary for one.
+        "plan_exit" => ("⇥", "Leaving plan mode..."),
+        // Nested calls, so a nesting mark: `execute` is the only tool whose arguments are
+        // other tools.
+        "execute" => ("»", "Batching..."),
+        // Not the status glyph `✗`, which says *this call* failed. `invalid` is a call the
+        // model should not have made at all, and the two are worth telling apart.
+        "invalid" => ("!", "Rejecting..."),
+        "memory" => ("≡", "Updating memory..."),
+        // One glyph for all three goal tools: they read, set and amend one object, and
+        // three glyphs would imply three subjects.
+        "get_goal" | "create_goal" | "update_goal" => ("◎", "Reading the goal..."),
         _ => ("⚙", "Preparing..."),
     }
 }
@@ -229,6 +271,13 @@ pub fn looks_like_diff(text: &str) -> bool {
             .any(|line| line.starts_with('+') || line.starts_with('-'))
 }
 
+/// The mark that says content was cut rather than absent.
+///
+/// Named so the transcript's collapse notice and [`crate::views::truncate`]'s cut make
+/// the same promise with the same character: one vocabulary for "there is more here"
+/// across every surface, which is what lets a reader learn it once.
+pub const ELIDED: &str = "…";
+
 /// The braille spinner frames, in order.
 ///
 /// A moving glyph is the cheapest honest signal that a turn is alive: a static word
@@ -259,6 +308,22 @@ pub enum MessagePart {
         call_id: String,
         /// The tool's wire name.
         name: String,
+        /// The raw JSON arguments, accumulated from the provider's input deltas.
+        ///
+        /// Raw and not parsed, because the deltas arrive as a byte stream and a *prefix*
+        /// of a JSON object is not a JSON object: parsing per delta would fail on every
+        /// one but the last. [`crate::views::tool::summary`] parses when it renders and
+        /// treats failure as "not yet", which is what makes a half-written argument
+        /// render as the placeholder instead of as an error.
+        ///
+        /// This is the transcript's own accumulator rather than a field on the engine
+        /// event, and that is the whole reason the per-tool summary is renderable at all.
+        /// [`TurnEvent::ToolDispatchCompleted`] carries `title`, `output` and `diff` and
+        /// **not** the arguments, so nothing downstream of the engine knew which file a
+        /// `read` had read. But [`StreamEvent::ToolInputDelta`] does reach here, through
+        /// [`TurnEvent::Provider`], and was being dropped on the floor. Folding it costs
+        /// one `String` per call and keeps the change inside this crate.
+        arguments: String,
         /// The human-readable title, once the call completes.
         title: Option<String>,
         /// How far it has got.
@@ -554,6 +619,7 @@ impl Transcript {
                     self.append(MessagePart::Tool {
                         call_id: call_id.clone(),
                         name: name.clone(),
+                        arguments: String::new(),
                         title: None,
                         status: ToolStatus::Running,
                         output: None,
@@ -659,12 +725,26 @@ impl Transcript {
                 self.append(MessagePart::Tool {
                     call_id: id.clone(),
                     name: name.clone(),
+                    arguments: String::new(),
                     title: None,
                     status: ToolStatus::Pending,
                     output: None,
                     diff: None,
                 });
                 true
+            }
+            // The provider writes the arguments one fragment at a time, and this is the
+            // only place they are ever visible to the view layer — see
+            // [`MessagePart::Tool::arguments`]. Reporting a redraw on every fragment is
+            // right rather than chatty: the summary grows as the JSON completes, so the
+            // row genuinely changes.
+            StreamEvent::ToolInputDelta(delta) => {
+                if let Some(MessagePart::Tool { arguments, .. }) = self.last_tool_mut() {
+                    arguments.push_str(delta);
+                    true
+                } else {
+                    false
+                }
             }
             StreamEvent::GeneratedImage { path, .. } => {
                 self.append(MessagePart::Attachment {
@@ -729,6 +809,22 @@ impl Transcript {
     fn last_part_mut(&mut self) -> Option<&mut MessagePart> {
         let index = self.streaming?;
         self.messages.get_mut(index)?.parts.last_mut()
+    }
+
+    /// The tool part currently receiving argument fragments.
+    ///
+    /// Searched backwards for a `Tool` rather than taking the last part outright, the same
+    /// way [`StreamEvent::ToolUseSignature`] is handled: a provider that interleaves a
+    /// text delta between `ToolUseStart` and the input deltas would otherwise append the
+    /// arguments to the prose.
+    fn last_tool_mut(&mut self) -> Option<&mut MessagePart> {
+        let index = self.streaming?;
+        self.messages
+            .get_mut(index)?
+            .parts
+            .iter_mut()
+            .rev()
+            .find(|part| matches!(part, MessagePart::Tool { .. }))
     }
 
     fn close_reasoning(&mut self) {
@@ -887,7 +983,21 @@ impl TranscriptView {
             // message printed `Assistant` five times for what the user experienced as
             // one reply. The header marks a change of speaker, which is what it was
             // always for; the left rule already runs down every row of the turn.
-            if previous != Some(message.role) {
+            if previous == Some(message.role) {
+                // The same speaker again, which is the *inside* of one reply rather than a
+                // boundary between two. Its separator carries the rule, because a bare
+                // blank row here cut the rule into one fragment per step and so broke the
+                // very continuity the header was suppressed in order to preserve — the
+                // claim above was false for every multi-step turn.
+                lines.push(self.ruled(message.role, rule, "", self.context.surface(), width));
+            } else {
+                // A change of speaker is the one boundary a reader scans for, so it gets
+                // the stronger of the two separators: a row with no rule at all. Two
+                // grades of gap is what lets the eye tell "the other party is talking now"
+                // from "this reply took another step" without reading either row.
+                if previous.is_some() {
+                    lines.push(padded("", width, self.context.surface()));
+                }
                 lines.push(self.ruled(
                     message.role,
                     rule,
@@ -900,6 +1010,10 @@ impl TranscriptView {
             for part in &message.parts {
                 self.part_lines(message.role, rule, part, width, &mut lines);
             }
+        }
+        if previous.is_some() {
+            // The transcript's own bottom margin, so the spinner or the approval notice
+            // below is not flush against the last row of the reply.
             lines.push(padded("", width, self.context.surface()));
         }
         // `working` and `waiting for you` are mutually exclusive claims about who the
@@ -934,8 +1048,8 @@ impl TranscriptView {
         match role {
             Role::User => self.context.accent(),
             Role::Assistant => Style::new()
-                .fg(self.context.palette.border_subtle.into())
-                .bg(self.context.palette.background_panel.into()),
+                .fg(self.context.palette().border_subtle.into())
+                .bg(self.context.palette().background_panel.into()),
             Role::System => self.context.warning(),
         }
     }
@@ -945,6 +1059,12 @@ impl TranscriptView {
     /// Two spans rather than one padded string because the rule and the body are
     /// different colours; a single span could only be one, which is precisely how the
     /// old renderer ended up with a transcript that had no visible structure.
+    ///
+    /// Both spans are measured in terminal columns, the same rule [`padded`] follows and
+    /// for the same reason. Taking `room` *characters* of a CJK body produced a row about
+    /// twice as wide as the frame, which ratatui then clipped: the user's own Chinese
+    /// prompt lost its tail on screen while the wrap above had already accounted for it,
+    /// so the missing text was not on the next row either.
     fn ruled(
         &self,
         role: Role,
@@ -954,11 +1074,11 @@ impl TranscriptView {
         width: u16,
     ) -> Line<'static> {
         let marker = role.marker();
-        let gutter = marker.chars().count() + 1;
+        let gutter = display_width(marker) + 1;
         let columns = usize::from(width);
         let room = columns.saturating_sub(gutter);
-        let mut text = body.chars().take(room).collect::<String>();
-        let used = text.chars().count();
+        let mut text = truncate(body, room);
+        let used = display_width(&text);
         if used < room {
             text.extend(std::iter::repeat_n(' ', room - used));
         }
@@ -966,6 +1086,35 @@ impl TranscriptView {
             Span::styled(format!("{marker} "), rule),
             Span::styled(text, style),
         ])
+    }
+
+    /// One row carrying the role's left rule, then pre-styled `spans`.
+    ///
+    /// The [`Self::ruled`] shape for content that is already several colours: markdown
+    /// prose is a heading, a bullet and a code frame in one row, and a `&str` plus one
+    /// `Style` cannot say that. Both functions pad to the same width and both measure in
+    /// terminal columns, so a markdown row and a plain one occupy the frame identically.
+    fn ruled_spans(
+        &self,
+        role: Role,
+        rule: Style,
+        spans: Vec<Span<'static>>,
+        width: u16,
+    ) -> Line<'static> {
+        let marker = role.marker();
+        let gutter = display_width(marker) + 1;
+        let room = usize::from(width).saturating_sub(gutter);
+        let mut out = vec![Span::styled(format!("{marker} "), rule)];
+        let mut body = crate::views::markdown::truncate_row(spans, room);
+        let used = crate::views::markdown::row_width(&body);
+        if used < room {
+            body.push(Span::styled(
+                " ".repeat(room - used),
+                self.context.surface(),
+            ));
+        }
+        out.append(&mut body);
+        Line::from(out)
     }
 
     fn part_lines(
@@ -976,12 +1125,23 @@ impl TranscriptView {
         width: u16,
         out: &mut Vec<Line<'static>>,
     ) {
-        let gutter = u16::try_from(role.marker().chars().count() + 1).unwrap_or(2);
+        let gutter = u16::try_from(display_width(role.marker()) + 1).unwrap_or(2);
         let body_width = width.saturating_sub(gutter);
         let push = |body: &str, style: Style, out: &mut Vec<Line<'static>>| {
             out.push(self.ruled(role, rule, body, style, width));
         };
         match part {
+            // Only the assistant's prose is parsed as markdown. A user's prompt is taken
+            // literally: someone typing `**maybe**` about a shell glob meant the
+            // asterisks, and re-rendering their own input in a shape they did not write
+            // is the surface editing them. A session notice is composed here rather than
+            // by a model, so there is no markup in it to find.
+            MessagePart::Text { text } if role == Role::Assistant => {
+                for row in crate::views::markdown::render(text, body_width, &self.context.palette())
+                {
+                    out.push(self.ruled_spans(role, rule, row, width));
+                }
+            }
             MessagePart::Text { text } => {
                 for row in wrap(text, body_width) {
                     push(&row, self.context.text(), out);
@@ -992,49 +1152,73 @@ impl TranscriptView {
                 duration_secs,
                 streaming,
             } => {
-                let hidden = text.lines().filter(|line| !line.trim().is_empty()).count();
-                let elapsed = match (duration_secs, streaming) {
-                    (Some(secs), _) => format!(" ({secs:.1}s)"),
-                    (None, true) => String::from("…"),
-                    (None, false) => String::new(),
+                // Present tense while the deltas are still arriving, past tense once they
+                // stop. `thought for 2.5s` printed beside a block that is still growing is
+                // a claim about a finished action that has not finished, and the duration
+                // it quotes is the one the provider has not reported yet.
+                let header = match (duration_secs, streaming) {
+                    (_, true) => String::from("thinking…"),
+                    (Some(secs), false) => format!("thought for {secs:.1}s"),
+                    (None, false) => String::from("thought"),
                 };
-                let header = match self.thinking {
-                    // The row states the size of what it hides, so the affordance says
-                    // "there is more here" without the reader having to open it to find
-                    // out whether opening it was worth doing.
-                    ThinkingDisplay::Collapsed if hidden > 1 => format!(
-                        "{} Thinking{elapsed} · {hidden} lines",
-                        self.thinking.glyph()
-                    ),
-                    _ => format!("{} Thinking{elapsed}", self.thinking.glyph()),
-                };
-                push(&header, self.context.thinking(), out);
+                // Inset one column past the prose, the same inset a tool call takes. Both are
+                // things that happened *inside* the reply rather than being the reply, so
+                // they share one indentation vocabulary: a reader learns the rule once and
+                // then reads column 2 as "the answer" and column 3 as "the work". Flush with
+                // the prose, a `thought for 12.0s` header sat exactly where the first
+                // sentence of the answer sits and competed with it for the eye.
+                let header = format!(" {} {header}", self.thinking.glyph());
                 match self.thinking {
                     ThinkingDisplay::Collapsed => {
-                        if let Some(summary) = summary(text) {
-                            push(&format!("  {summary}"), self.context.thinking(), out);
-                        }
+                        // One row, not two. Reasoning is secondary content that recurs on
+                        // every step of every turn, so a collapsed block that spent two
+                        // rows could out-measure the answer it precedes. The summary rides
+                        // on the header instead of owning a row, and is dropped rather
+                        // than wrapped when it does not fit: the glyph and the duration
+                        // are what the row is for, and a summary continued onto a second
+                        // row would spend exactly the row this form exists to save.
+                        let row = match summary(text) {
+                            Some(gist)
+                                if display_width(&header) + 3 + display_width(&gist)
+                                    <= usize::from(body_width) =>
+                            {
+                                format!("{header} · {gist}")
+                            }
+                            _ => header,
+                        };
+                        push(&row, self.context.thinking(), out);
                     }
                     ThinkingDisplay::Expanded => {
-                        for row in wrap(text, body_width.saturating_sub(2)) {
-                            push(&format!("  {row}"), self.context.thinking(), out);
+                        push(&header, self.context.thinking(), out);
+                        // Aligned under the header's glyph, the same relationship a tool
+                        // result has to its call row. Expanded reasoning is routinely longer
+                        // than the answer, so its body has to be unmistakably a nested block
+                        // — otherwise a long thought reads as the reply and the reply reads
+                        // as a footnote to it.
+                        // Italic on the body and not on the header: the body is the part
+                        // that must read as subordinate to the answer below it, while the
+                        // header is the affordance a user aims at and wants crisp. A
+                        // terminal without italics loses nothing it had before, because
+                        // the indent and the dimmed colour already carried the hierarchy.
+                        let body = self.context.thinking().add_modifier(Modifier::ITALIC);
+                        let inset = Self::RESULT_INSET;
+                        let inset_columns = u16::try_from(display_width(inset)).unwrap_or(3);
+                        for row in wrap(text, body_width.saturating_sub(inset_columns)) {
+                            push(&format!("{inset}{row}"), body, out);
                         }
                     }
                 }
             }
             MessagePart::Tool {
                 name,
+                arguments,
                 title,
                 status,
                 output,
+                diff,
                 ..
             } => {
                 let (icon, placeholder) = tool_affordance(name);
-                let label = match (title, status) {
-                    (Some(title), _) => title.clone(),
-                    (None, ToolStatus::Pending) => placeholder.to_owned(),
-                    (None, _) => name.clone(),
-                };
                 // Only a *dispatched* call spins. `Pending` keeps the oracle's `~`
                 // because the two states differ in a way a user acts on: pending means
                 // the model is still writing the arguments, running means the tool is
@@ -1044,14 +1228,57 @@ impl TranscriptView {
                 } else {
                     status.glyph()
                 };
-                let style = match status {
-                    ToolStatus::Error => self.context.error(),
-                    ToolStatus::Completed => self.context.success(),
-                    ToolStatus::Pending | ToolStatus::Running => self.context.muted(),
+                // `" {glyph} {icon} {name}"` — one leading space, so the tool block sits one
+                // column inside the assistant's prose. That inset plus the two-column rule
+                // is §7.5's three-column tool indent, and it is what makes a tool call read
+                // as something the reply *did* rather than as another paragraph of it.
+                let head = format!(" {glyph} {icon} {name}");
+                // The tool's wire name plus the argument that matters, which is the whole of
+                // §7.5. `title` is no longer preferred over the arguments: a completed
+                // `read` reported `Read diff.rs`, which names the kind of work and drops the
+                // path, so six reads in one turn produced six rows a reader could not tell
+                // apart. The name stays beside the summary because the summary alone is
+                // ambiguous — `crates/…/diff.rs` could be a read, a write or a patch — and
+                // one icon does not carry that much resolution.
+                //
+                // `title` remains the fallback for a completed call whose arguments never
+                // parsed, because a provider's own sentence beats a bare wire name.
+                let row = match (crate::views::tool::summary(name, arguments), title, status) {
+                    (Some(summary), _, _) => {
+                        // Measured against what the head actually spent, not against a
+                        // constant: the name's width runs from `read` to `update_goal`, and
+                        // the summary has to be fitted to what is left after it. One more
+                        // column is charged for the space that joins them.
+                        let room = usize::from(body_width)
+                            .saturating_sub(display_width(&head))
+                            .saturating_sub(1);
+                        format!("{head} {}", summary.fit(room))
+                    }
+                    (None, Some(title), _) => format!(" {glyph} {icon} {title}"),
+                    (None, None, ToolStatus::Pending) => format!(" {glyph} {icon} {placeholder}"),
+                    (None, None, _) => head,
                 };
-                push(&format!("{glyph} {icon} {label}"), style, out);
-                if let Some(output) = output {
-                    self.tool_output_lines(role, rule, output, width, out);
+                push(
+                    &row,
+                    crate::views::tool::status_style(*status, &self.context),
+                    out,
+                );
+                // A patch travels beside the output rather than inside it, so a result that
+                // has one is rendered from it — and before this it was rendered from neither.
+                // `tool_output_lines` only ever diff-sniffed `output`, and every mutating
+                // tool's output is a *sentence* (`applied 1 change`), so the patch that
+                // `TurnEvent::ToolDispatchCompleted` had faithfully carried all the way here
+                // was dropped on the floor at the last step. The diff viewer could open it;
+                // the transcript could not show it.
+                let frame = RowFrame { role, rule, width };
+                match (diff, output) {
+                    (Some(patch), _) => {
+                        self.tool_result_lines(frame, name, patch, *status, out);
+                    }
+                    (None, Some(output)) => {
+                        self.tool_result_lines(frame, name, output, *status, out);
+                    }
+                    (None, None) => {}
                 }
             }
             MessagePart::Attachment { filename, mime } => {
@@ -1062,9 +1289,16 @@ impl TranscriptView {
                 push(&label, self.context.accent(), out);
             }
             MessagePart::Retry { attempt, max } => {
+                // `warning`, not `error`. A retry is a recovery under way and the turn
+                // still usually succeeds, whereas `error` is what a failed tool call and a
+                // failed turn render in — and a user scanning a transcript for red needs
+                // those two answers to look different. Compact for a measured reason: the
+                // old sentence `↻ Retrying provider request (attempt 2/3)` ran to 45
+                // columns and was clipped at 40 after `attempt 2`, so the count it existed
+                // to state was the first thing cut.
                 push(
-                    &format!("↻ Retrying provider request (attempt {attempt}/{max})"),
-                    self.context.error(),
+                    &format!("⟳ retry {attempt}/{max}"),
+                    self.context.warning(),
                     out,
                 );
             }
@@ -1083,67 +1317,167 @@ impl TranscriptView {
         }
     }
 
-    /// A tool's output, as a diff when it is one and as capped prose otherwise.
+    /// The inset a tool result's rows are laid out at.
+    ///
+    /// Three columns past the rule, so a result row starts under its call row's icon
+    /// rather than under the call row's own inset. Rule (2) plus this (3) is §7.5's
+    /// five-column continuation indent, and the alignment under the icon is what makes a
+    /// long result read as belonging to the call above it instead of floating between two.
+    const RESULT_INSET: &'static str = "   ";
+
+    /// A tool's result, as a diff when it is one and as budgeted prose otherwise.
     ///
     /// The diff branch is why an `edit` is worth reading in the transcript at all: an
-    /// unstyled patch is a wall of text whose `+` and `-` a reader has to scan for,
-    /// and the same patch with line numbers and the theme's eleven diff colours is a
-    /// review surface.
-    fn tool_output_lines(
+    /// unstyled patch is a wall of text whose `+` and `-` a reader has to scan for, and the
+    /// same patch with line numbers and the theme's eleven diff colours is a review
+    /// surface. It reuses [`crate::views::diff::DiffView`] — the one diff renderer this
+    /// crate has, paired delete/insert runs and all — rather than growing a second one that
+    /// would be free to disagree with the viewer the same patch opens in.
+    fn tool_result_lines(
         &self,
-        role: Role,
-        rule: Style,
-        output: &str,
-        width: u16,
+        frame: RowFrame,
+        name: &str,
+        result: &str,
+        status: ToolStatus,
         out: &mut Vec<Line<'static>>,
     ) {
-        let gutter = u16::try_from(role.marker().chars().count() + 3).unwrap_or(4);
-        let body_width = width.saturating_sub(gutter);
+        let RowFrame { role, rule, width } = frame;
+        let body_width = width.saturating_sub(frame.gutter(Self::RESULT_INSET));
         let marker = role.marker();
-        if looks_like_diff(output) {
-            let mut view = crate::views::diff::DiffView::new(self.context.clone(), output);
+        let budget = crate::views::tool::output_budget(name, self.tool_output);
+        // Trimmed before the wrap, not after. A single-line minified bundle is one row to
+        // the row cap and a megabyte to the wrap, so a cap applied afterwards would already
+        // have paid for the work it exists to avoid.
+        let (result, capped) = match result.char_indices().nth(budget.chars) {
+            Some((cut, _)) => (&result[..cut], true),
+            None => (result, false),
+        };
+        if looks_like_diff(result) {
+            let mut view = crate::views::diff::DiffView::new(self.context.clone(), result);
             let rows = view.lines(body_width);
             let total = rows.len();
-            for row in rows.into_iter().take(self.tool_output.rows()) {
-                let mut spans = vec![Span::styled(format!("{marker}   "), rule)];
+            for row in rows.into_iter().take(budget.rows) {
+                let mut spans = vec![Span::styled(
+                    format!("{marker} {}", Self::RESULT_INSET),
+                    rule,
+                )];
                 spans.extend(row.spans);
                 out.push(Line::from(spans));
             }
-            self.push_overflow(role, rule, total, width, out);
+            self.push_overflow(frame, total, budget, capped, out);
             return;
         }
-        let rows = wrap(output, body_width);
+        // A failed call's output *is* the failure, so it is painted as one. In `muted` it
+        // read as ordinary output two shades quieter than the red row above it, which is
+        // backwards: §7.5 asks for the error to hang below the tool row, and hanging it
+        // there in the colour of success-adjacent noise is only half of that.
+        let body = if status == ToolStatus::Error {
+            self.context.error()
+        } else {
+            self.context.muted()
+        };
+        let rows = wrap(result, body_width);
         let total = rows.len();
-        for row in rows.into_iter().take(self.tool_output.rows()) {
-            out.push(self.ruled(role, rule, &format!("  {row}"), self.context.muted(), width));
+        for row in rows.into_iter().take(budget.rows) {
+            out.push(self.ruled(
+                role,
+                rule,
+                &format!("{}{row}", Self::RESULT_INSET),
+                body,
+                width,
+            ));
         }
-        self.push_overflow(role, rule, total, width, out);
+        self.push_overflow(frame, total, budget, capped, out);
     }
 
+    /// The row that says content was withheld, and which key returns it.
+    ///
+    /// Never silent. Two things can hide output — the row cap and the character cap — and
+    /// a reader who cannot tell "that is all of it" from "that is the first three lines of
+    /// it" will trust a truncated result as complete. The two are reported together rather
+    /// than one winning, because they answer different questions: how much was left, and
+    /// whether what *is* shown was itself cut short.
     fn push_overflow(
         &self,
-        role: Role,
-        rule: Style,
+        frame: RowFrame,
         total: usize,
-        width: u16,
+        budget: crate::views::tool::OutputBudget,
+        capped: bool,
         out: &mut Vec<Line<'static>>,
     ) {
-        let shown = self.tool_output.rows();
-        if total <= shown {
+        // The budget is passed in rather than re-derived. Deriving it here needed the tool's
+        // name, and a version of this that reached for it without one silently quoted the
+        // 4,000-character cap on a `read`, whose cap is 6,000 — a notice stating a limit
+        // that was not the one applied.
+        let shown = budget.rows;
+        if total <= shown && !capped {
             return;
         }
-        let hidden = total - shown;
-        let notice = match crate::views::key_label("tool_details", &self.context) {
-            Some(key) => format!(
-                "  {} {hidden} more lines · {key}",
-                ThinkingDisplay::Collapsed.glyph()
-            ),
-            None => format!(
-                "  {} {hidden} more lines",
-                ThinkingDisplay::Collapsed.glyph()
-            ),
-        };
-        out.push(self.ruled(role, rule, &notice, self.context.accent(), width));
+        // `…` rather than the collapsed-reasoning triangle this row used to borrow. The
+        // triangle is a *header* affordance — it opens the block it labels, and a collapsed
+        // reasoning header two rows above is using it for exactly that — so a triangle here
+        // read as a second nested section rather than as the tail of the one above it. An
+        // ellipsis is the mark this codebase already uses for "content was cut here"
+        // (`views::truncate`, `ambient::elide_left`), and the key that lifts the cap is
+        // named on the same row, so the glyph does not have to carry that meaning too.
+        let mut notice = format!("{}{ELIDED}", Self::RESULT_INSET);
+        if total > shown {
+            notice.push_str(&format!(" {} more lines", total - shown));
+        }
+        if capped {
+            if total > shown {
+                notice.push(',');
+            }
+            let chars = u64::try_from(budget.chars).unwrap_or(u64::MAX);
+            notice.push_str(&format!(" cut at {} chars", thousands(chars)));
+        }
+        // Resolved through the *keymap* and not `key_label`: `tool_details` ships as `none`
+        // and is bound by this build's own `SHIPPED_DEFAULTS`, so `key_label` reported no
+        // key for a key that works. See [`crate::views::pressable_label`] — the notice read
+        // `… 9 more lines` with nothing after it for exactly that reason.
+        if let Some(key) = crate::views::pressable_label("tool_details", &self.context) {
+            notice.push_str(&format!(" · {key}"));
+        }
+        out.push(self.ruled(
+            frame.role,
+            frame.rule,
+            &notice,
+            self.context.accent(),
+            frame.width,
+        ));
+    }
+}
+
+/// The three values that jointly decide where a transcript row starts and ends.
+///
+/// One value rather than three parameters because they are never chosen independently:
+/// the role picks the rule glyph, the rule carries its colour, and the width is what both
+/// are measured against. Passing them separately grew the tool-result path to eight
+/// arguments, and clippy was right to object — the length was the symptom, and the
+/// missing name for "the frame a row is laid into" was the cause. Naming it also removes
+/// the chance of handing one function a `Role::User` marker beside a `Role::Assistant`
+/// rule, which the three loose parameters allowed.
+///
+/// `Copy`, because it is three machine words and every row in a message needs it.
+#[derive(Debug, Clone, Copy)]
+struct RowFrame {
+    /// Whose message this row belongs to; picks the left rule's glyph.
+    role: Role,
+    /// The left rule's style.
+    rule: Style,
+    /// The full row width in terminal columns, rule included.
+    width: u16,
+}
+
+impl RowFrame {
+    /// Columns spent before the body starts: the rule, its trailing space, and `inset`.
+    ///
+    /// Measured with [`display_width`] rather than `len`, because the rule glyph differs
+    /// per role (`▌`, `│`, `▲`) and a future one could be two columns wide — at which point
+    /// a byte count would silently shift every body row by a column.
+    fn gutter(self, inset: &str) -> u16 {
+        u16::try_from(display_width(self.role.marker()) + 1 + display_width(inset))
+            .unwrap_or(u16::MAX)
     }
 }
 
@@ -1216,6 +1550,26 @@ pub struct StatusView {
     /// turn seems stuck. Saying `working` there while the process is parked on an ask
     /// points them at the wrong thing to wait for.
     awaiting_permission: bool,
+    /// The checkout's branch, as the host measured it.
+    ///
+    /// Not folded from an engine event, because no engine event carries it: the branch
+    /// describes the working tree rather than the turn, which is also why
+    /// [`Self::reset`] leaves it alone — the same reasoning that keeps `diagnostics`
+    /// across a turn boundary.
+    git_branch: Option<String>,
+    /// What the session has cost, already computed and already formatted.
+    ///
+    /// **Computing this is not this layer's job.** There is no usage-to-money function
+    /// in the workspace, and prices are per-million-token with tiered rates and a
+    /// separate `context_over_200k` band (`zuno-llm/src/catalog/models_dev.rs:129-198`),
+    /// so a view multiplying [`Self::usage`] by one rate would render a confidently
+    /// wrong number on exactly the long-context models where the figure matters most.
+    /// A wrong price is worse than no price, so the strip renders only what a caller
+    /// hands it, including the currency mark: the string is printed verbatim.
+    ///
+    /// Survives [`Self::reset`] for the same reason `usage` does — it is cumulative
+    /// over the session, not a property of the turn that happens to be running.
+    cost: Option<String>,
 }
 
 /// Token counts for the session, accumulated across every step of every turn.
@@ -1309,12 +1663,40 @@ impl StatusView {
     /// the user read the prompt as background noise.
     pub const AWAITING_PERMISSION: &'static str = "awaiting approval";
 
+    /// What the exit hint says the key *does*, appended to whichever key
+    /// [`Self::exit_hint`] resolved.
+    ///
+    /// Split out from [`Self::EXIT_HINT`] so that only the key varies: the verb is the
+    /// strip's own wording and has nothing to do with the binding table.
+    const EXIT_ACTION: &'static str = "cancel/exit";
+
     /// The key shown as the way out, and what it does while a turn is running.
     ///
     /// The strip is the one row always on screen, so it is where a binding a user
     /// cannot otherwise guess belongs. An application whose exit key is undiscoverable
     /// is only marginally better than one that has none.
+    ///
+    /// This is the **fallback**, not the rendered text: [`Self::exit_hint`] looks the
+    /// key up. It is reached only when the user explicitly disabled `app_exit`, and it
+    /// still names a key that works — see that method for why that is not a lie. A test
+    /// pins it to the shipped table's own first spelling so it cannot drift from the
+    /// derived form.
     pub const EXIT_HINT: &'static str = "ctrl+c cancel/exit";
+
+    /// What marks the branch segment, borrowed from the ambient sidebar so the two
+    /// surfaces name the same field the same way.
+    ///
+    /// Aliased to [`crate::views::ambient::BRANCH_GLYPH`] rather than spelled again here:
+    /// "the two surfaces agree" was a claim held up by a copied literal, and a copied
+    /// literal is a claim only until somebody edits one of the two.
+    ///
+    /// Written tight against the name — `⑂main`, not `⑂ main` — because the strip is one
+    /// shared row and every segment on it is already compacted for the same reason
+    /// [`TokenUsage::compact`] writes `↑3,000` rather than spelling the count out.
+    pub const BRANCH_GLYPH: &'static str = crate::views::ambient::BRANCH_GLYPH;
+
+    /// What separates two segments of the right-hand group.
+    const TRAILER_GAP: &'static str = "  ";
 
     /// A status strip over `context`.
     #[must_use]
@@ -1331,7 +1713,31 @@ impl StatusView {
             usage: TokenUsage::default(),
             diagnostics: None,
             awaiting_permission: false,
+            git_branch: None,
+            cost: None,
         }
+    }
+
+    /// Record the checkout's branch, as `zuno-cli/src/cmd/tui.rs` measured it.
+    ///
+    /// An empty string is treated as "not on a branch" rather than adopted, matching
+    /// [`Self::describe`]: a blank segment on the strip is indistinguishable from a
+    /// field that failed to resolve, and it would still cost the separator's columns.
+    pub fn set_git_branch(&mut self, branch: impl Into<String>) {
+        let branch = branch.into();
+        self.git_branch = (!branch.is_empty()).then_some(branch);
+    }
+
+    /// Adopt an already-computed, already-formatted session cost from
+    /// `zuno-cli/src/cmd/tui.rs`.
+    ///
+    /// The caller owns the arithmetic and the currency mark; see [`Self::cost`] for why
+    /// the view must not derive either from [`Self::usage`]. Empty is treated as absent,
+    /// so a host with no pricing data for the active model pushes `""` rather than a
+    /// placeholder the user would read as free.
+    pub fn set_cost(&mut self, cost: impl Into<String>) {
+        let cost = cost.into();
+        self.cost = (!cost.is_empty()).then_some(cost);
     }
 
     /// Record whether a permission prompt is waiting on the user.
@@ -1420,28 +1826,96 @@ impl StatusView {
         // true. The next report replaces it.
     }
 
-    /// The right-hand group: token usage, then the exit hint.
-    fn trailer(&self) -> String {
-        if self.usage.is_empty() {
-            return Self::EXIT_HINT.to_owned();
-        }
-        format!("{}  {}", self.usage.compact(), Self::EXIT_HINT)
+    /// The exit hint, naming the key the *user's* keymap resolved for `app_exit`.
+    ///
+    /// Derived rather than written down because a hardcoded spelling goes stale the
+    /// moment overrides become real: with `{"keybinds": {"app_exit": "ctrl+q"}}` the
+    /// welcome grid and the command palette both said `ctrl+q` while this row still
+    /// said `ctrl+c`, so one frame advertised two different ways out.
+    ///
+    /// [`key_label`] and not [`crate::keybind::Keymap::sequences`], for two reasons.
+    /// The welcome grid is already built on [`key_label`]
+    /// (`views/welcome.rs:351`), and agreeing with the surface this row contradicted
+    /// is the entire fix — a second lookup could resolve the same override to a
+    /// different spelling and reintroduce the disagreement one layer down. And
+    /// `sequences` returns *every* binding: `app_exit` ships three
+    /// (`ctrl+c,ctrl+d,<leader>q`), and comma-joining them would spend about
+    /// twenty-four columns of a one-row strip advertising alternatives, evicting the
+    /// token counts at widths where they fit today. One key is what a hint is for, and
+    /// [`key_label`] takes the first because the table lists its preferred spelling
+    /// first and a user's override lists theirs.
+    ///
+    /// When the user *disabled* `app_exit` there is no resolved spelling, and the row
+    /// falls back to [`Self::EXIT_HINT`] rather than going quiet. That is still true,
+    /// not a guess: [`crate::keybind::is_exit_chord`] reads the static table on
+    /// purpose, so `ctrl+c` leaves the application even with no binding pointing at it
+    /// (`keybind.rs:191`). Dropping the hint would make the one row that survives every
+    /// width degradation silent about the only guaranteed way out.
+    fn exit_hint(&self) -> String {
+        key_label(APP_EXIT, &self.context).map_or_else(
+            || Self::EXIT_HINT.to_owned(),
+            |key| format!("{key} {}", Self::EXIT_ACTION),
+        )
     }
 
-    /// The rendered row, with [`Self::EXIT_HINT`] right-aligned when it fits.
+    /// Every right-hand group the row will try, richest first.
+    ///
+    /// The fields are laid out in *ascending* priority left to right — branch, token
+    /// counts, cost, exit key — and each rung is built by dropping the leftmost, which
+    /// is to say the lowest-ranked, field still present. Ordering them that way is what
+    /// keeps the right edge from reflowing as the terminal narrows: a dropped field
+    /// vanishes and nothing beside it moves.
+    ///
+    /// The ranking, lowest first, and why:
+    ///
+    /// * **branch** — the ambient sidebar already prints it (`views/ambient.rs:470`), so
+    ///   it is the one field a narrow row loses nothing unique by dropping.
+    /// * **token counts** — informational, and the sidebar carries the same accumulator
+    ///   (`views/session.rs:469`).
+    /// * **cost** — the only figure here that appears nowhere else on screen, and the
+    ///   summary that the raw counts beside it are merely the detail of. A user down to
+    ///   one number wants the money one.
+    /// * **exit key** — the only way out, so it is last to go. It already outranked the
+    ///   token counts before either new field existed; both join below it rather than
+    ///   displacing that order. Its spelling comes from [`Self::exit_hint`]; the rank
+    ///   does not depend on how wide that spelling turns out to be.
+    ///
+    /// With neither new field set this reduces to today's two rungs — counts plus the
+    /// key, then the key alone — so the pre-existing degradation is unchanged.
+    fn trailers(&self) -> Vec<String> {
+        let mut ranked = Vec::with_capacity(4);
+        if let Some(branch) = &self.git_branch {
+            ranked.push(format!("{}{branch}", Self::BRANCH_GLYPH));
+        }
+        if !self.usage.is_empty() {
+            ranked.push(self.usage.compact());
+        }
+        if let Some(cost) = &self.cost {
+            ranked.push(cost.clone());
+        }
+        ranked.push(self.exit_hint());
+        (0..ranked.len())
+            .map(|dropped| ranked[dropped..].join(Self::TRAILER_GAP))
+            .collect()
+    }
+
+    /// The rendered row, with [`Self::exit_hint`] right-aligned when it fits.
     ///
     /// The hint is dropped rather than truncated on a narrow terminal: half a key
     /// name is worse than none, and the turn state it shares the row with is what a
-    /// user needs more.
+    /// user needs more. The state itself is never dropped, only padded or truncated by
+    /// [`padded`], which is why a field that must yield to the exit key belongs in
+    /// [`Self::trailers`] and not in [`Self::state`].
     #[must_use]
     pub fn line(&self, width: u16) -> Line<'static> {
         let state = format!(" {}", self.state());
         let columns = usize::from(width);
-        // The trailer is tried whole first, then the exit hint alone, then nothing.
-        // Dropping the token counts before the exit key is the deliberate order: the
-        // counts are informational and the key is the only way out.
-        for trailer in [self.trailer(), Self::EXIT_HINT.to_owned()] {
-            let used = state.chars().count() + trailer.chars().count() + 1;
+        // Terminal columns, not `chars().count()`: the cache glyph `⚡` and a CJK model
+        // name each occupy two cells, so counting characters here claims the row is
+        // narrower than it is and over-fills it by one column per wide glyph.
+        let state_columns = display_width(&state);
+        for trailer in self.trailers() {
+            let used = state_columns + display_width(&trailer) + 1;
             if used < columns {
                 return Line::from(vec![
                     Span::styled(state, self.context.element()),
@@ -1449,8 +1923,8 @@ impl StatusView {
                     Span::styled(
                         trailer,
                         Style::new()
-                            .fg(self.context.palette.text_muted.into())
-                            .bg(self.context.palette.background_element.into()),
+                            .fg(self.context.palette().text_muted.into())
+                            .bg(self.context.palette().background_element.into()),
                     ),
                     Span::styled(String::from(" "), self.context.element()),
                 ]);
@@ -1624,11 +2098,11 @@ impl ScrollbarView {
 impl Component for ScrollbarView {
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let track = Style::new()
-            .fg(self.context.palette.border_subtle.into())
-            .bg(self.context.palette.background.into());
+            .fg(self.context.palette().border_subtle.into())
+            .bg(self.context.palette().background.into());
         let thumb = Style::new()
-            .fg(self.context.palette.border_active.into())
-            .bg(self.context.palette.background.into());
+            .fg(self.context.palette().border_active.into())
+            .bg(self.context.palette().background.into());
         fill(frame.buffer_mut(), area, track);
         let height = usize::from(area.height);
         if height == 0 || area.width == 0 {
@@ -1683,11 +2157,23 @@ pub fn summary(text: &str) -> Option<String> {
         })
 }
 
-/// Break `text` into rows no wider than `width`, on word boundaries where possible.
+/// Break `text` into rows no wider than `width` **columns**, on word boundaries where
+/// possible.
 ///
 /// ratatui can wrap for us, but not while also letting the transcript *count* the
 /// rows it will occupy — which the scroll offset and the scrollbar both need. So
 /// the wrap happens here and the produced lines are handed over already broken.
+///
+/// # Columns, not characters
+///
+/// Every measurement here is [`display_width`]. Counting characters instead was
+/// measured producing rows twice as wide as the frame for Chinese prose: at 40 columns
+/// the prompt `帮我把 diff viewer 接上文件树，顺便看一下 wrap 的宽字符行为` wrapped after
+/// 38 *characters*, ratatui clipped the row at 38 *columns*, and the nineteen columns of
+/// text past the cut — `一下 wrap` and everything after it — were silently discarded.
+/// The row count the scroller trusts was wrong by the same factor. Wrapping a CJK
+/// transcript is the single case this helper exists for that character counting cannot
+/// get right, and the wider a word is the more of it disappears.
 #[must_use]
 pub fn wrap(text: &str, width: u16) -> Vec<String> {
     let width = usize::from(width).max(1);
@@ -1701,19 +2187,28 @@ pub fn wrap(text: &str, width: u16) -> Vec<String> {
         for word in paragraph.split(' ') {
             let mut word = word;
             // A word longer than the row is broken rather than allowed to overflow;
-            // paths and URLs are common here and both are unbreakable on spaces.
-            while word.chars().count() > width {
+            // paths and URLs are common here and both are unbreakable on spaces. CJK
+            // prose reaches here too, because it carries no spaces at all: the whole
+            // paragraph arrives as one "word".
+            while display_width(word) > width {
                 if !row.is_empty() {
                     rows.push(std::mem::take(&mut row));
                 }
-                let head = word.chars().take(width).collect::<String>();
+                let mut head = truncate(word, width);
+                if head.is_empty() {
+                    // One column cannot hold a two-column glyph, so `truncate` returns
+                    // nothing and consuming zero bytes would spin here forever. Emit the
+                    // glyph on a row of its own: one column of overflow is a rendering
+                    // artefact a terminal absorbs, an infinite loop is a hung TUI.
+                    head.extend(word.chars().next());
+                }
                 let consumed = head.len();
                 rows.push(head);
                 word = &word[consumed..];
             }
             if row.is_empty() {
                 row.push_str(word);
-            } else if row.chars().count() + 1 + word.chars().count() <= width {
+            } else if display_width(&row) + 1 + display_width(word) <= width {
                 row.push(' ');
                 row.push_str(word);
             } else {

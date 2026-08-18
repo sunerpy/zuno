@@ -615,4 +615,12 @@ impl TerminalLease for HeadlessTerminalLease {
             detail: "this test cannot host an interactive plugin prompt".to_owned(),
         })
     }
+
+    async fn acquire_with_cleanup(
+        &self,
+        reason: LeaseReason,
+        _cleanup: Arc<dyn zuno_engine::terminal_lease::TerminalLeaseCleanup>,
+    ) -> Result<TerminalLeaseGuard, TerminalLeaseError> {
+        self.acquire(reason).await
+    }
 }

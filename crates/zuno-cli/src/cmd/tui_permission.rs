@@ -47,6 +47,8 @@ use zuno_tui::views::ViewContext;
 use zuno_tui::views::dialog::{DialogHost, DialogOutcome};
 use zuno_tui::views::permission::PermissionPrompt;
 
+use super::tui_question::QuestionBridge;
+
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -170,6 +172,7 @@ pub(crate) struct PermissionBridge {
     context: ViewContext,
     broker: Arc<PermissionBroker>,
     host: DialogHost,
+    question: Option<QuestionBridge>,
 }
 
 impl PermissionBridge {
@@ -183,7 +186,13 @@ impl PermissionBridge {
             context,
             broker,
             host,
+            question: None,
         }
+    }
+
+    pub(crate) fn with_question(mut self, question: QuestionBridge) -> Self {
+        self.question = Some(question);
+        self
     }
 
     /// Open a prompt for every request waiting, and deliver every decision made.
@@ -203,10 +212,21 @@ impl PermissionBridge {
             result = EventResult::REDRAW;
         }
         for (_dialog, outcome) in self.host.drain_outcomes() {
-            if let DialogOutcome::Permission(decision) = outcome {
-                self.broker.resolve(&decision.request_id, decision.reply);
-                result = EventResult::REDRAW;
+            match outcome {
+                DialogOutcome::Permission(decision) => {
+                    self.broker.resolve(&decision.request_id, decision.reply);
+                    result = EventResult::REDRAW;
+                }
+                DialogOutcome::Question(answers) => {
+                    if let Some(question) = self.question.as_mut() {
+                        result = result.merge(question.resolve(answers));
+                    }
+                }
+                _ => {}
             }
+        }
+        if let Some(question) = self.question.as_mut() {
+            result = result.merge(question.open_next(&mut self.host));
         }
         result
     }
@@ -250,16 +270,7 @@ impl ActionComponent for PermissionBridge {
     }
 
     fn focused_scopes(&self) -> Vec<&'static str> {
-        if self.host.is_open() {
-            vec![
-                "permission.prompt",
-                "dialog.select",
-                "dialog.prompt",
-                "session",
-            ]
-        } else {
-            Vec::new()
-        }
+        self.host.focused_scopes()
     }
 
     fn pending_changed(&mut self, pending: &[Chord]) -> EventResult {

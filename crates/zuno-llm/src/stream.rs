@@ -6,6 +6,8 @@
 //! request from the beginning.
 
 use crate::event::{StreamEvent, ThoughtSignature};
+use crate::sse::{StreamLimits, append_tool_input};
+use zuno_error::ProviderError;
 
 /// A tool call whose JSON input is still arriving as text fragments.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,8 +37,11 @@ impl ToolCallAccumulator {
 ///
 /// Tools are only data here. The engine executes them after a stream completes,
 /// which is the safety precondition that makes rollback side-effect free.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamAccumulator {
+    provider: String,
+    stream: String,
+    tool_input_limit: usize,
     text: String,
     tool_calls: Vec<ToolCallAccumulator>,
     reasoning: String,
@@ -47,14 +52,47 @@ impl StreamAccumulator {
     /// Create an empty attempt accumulator.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self::for_stream("stream-accumulator", "unattributed")
+    }
+
+    /// Create an empty accumulator with provider context and environment limits.
+    #[must_use]
+    pub fn for_stream(provider: impl Into<String>, stream: impl Into<String>) -> Self {
+        Self::with_limits(
+            provider,
+            stream,
+            StreamLimits::from_environment().max_tool_input_bytes(),
+        )
+    }
+
+    /// Create an empty accumulator with an explicit tool-input limit.
+    #[must_use]
+    pub fn with_limits(
+        provider: impl Into<String>,
+        stream: impl Into<String>,
+        tool_input_limit: usize,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            stream: stream.into(),
+            tool_input_limit,
+            text: String::new(),
+            tool_calls: Vec::new(),
+            reasoning: String::new(),
+            reasoning_signature: String::new(),
+        }
     }
 
     /// Apply one event's attempt-local effect.
     ///
     /// Every event variant is listed explicitly so extending the vocabulary
     /// forces this rollback boundary to be reviewed.
-    pub fn apply(&mut self, event: &StreamEvent) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Fatal`] rather than retaining a tool input over the
+    /// configured stream limit.
+    pub fn apply(&mut self, event: &StreamEvent) -> Result<(), ProviderError> {
         match event {
             StreamEvent::TextDelta(delta) => self.text.push_str(delta),
             StreamEvent::ToolUseStart { id, name } => self
@@ -62,7 +100,13 @@ impl StreamAccumulator {
                 .push(ToolCallAccumulator::new(id.clone(), name.clone())),
             StreamEvent::ToolInputDelta(delta) => {
                 if let Some(tool_call) = self.tool_calls.last_mut() {
-                    tool_call.raw_input.push_str(delta);
+                    append_tool_input(
+                        &mut tool_call.raw_input,
+                        delta,
+                        &self.provider,
+                        &self.stream,
+                        self.tool_input_limit,
+                    )?;
                 }
             }
             StreamEvent::ToolUseEnd => {}
@@ -93,6 +137,7 @@ impl StreamAccumulator {
             | StreamEvent::UpstreamProvider { .. }
             | StreamEvent::NativeToolCall { .. } => {}
         }
+        Ok(())
     }
 
     /// Discard every partial value belonging to the interrupted attempt.
@@ -134,5 +179,11 @@ impl StreamAccumulator {
             && self.tool_calls.is_empty()
             && self.reasoning.is_empty()
             && self.reasoning_signature.is_empty()
+    }
+}
+
+impl Default for StreamAccumulator {
+    fn default() -> Self {
+        Self::new()
     }
 }

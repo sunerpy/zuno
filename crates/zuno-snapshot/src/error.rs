@@ -19,6 +19,51 @@ use std::process::ExitStatus;
 /// A snapshot-store failure.
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {
+    /// A caller attempted to restore a checkpoint for a disabled store.
+    ///
+    /// Refusing is safer than treating the request as a successful no-op: the
+    /// latter would let a UI claim that user files were restored when none were.
+    #[error("refusing to restore a turn because snapshots are disabled")]
+    SnapshotsDisabled,
+
+    /// The captured worktree no longer equals the boundary restoration expects.
+    ///
+    /// This catches manual edits, deletions, and any other captured change before
+    /// the first target file is touched. The caller gets the full drift list so it
+    /// can explain the refusal instead of reducing it to a generic failure.
+    #[error(
+        "refusing to overwrite worktree drift: expected tree {expected}, found {actual}; changed paths: {}",
+        files.join(", ")
+    )]
+    WorktreeDrift {
+        /// Tree hash restoration required as its source boundary.
+        expected: String,
+        /// Tree hash captured from the current worktree.
+        actual: String,
+        /// Forward-slashed worktree-relative paths that drifted.
+        files: Vec<String>,
+    },
+
+    /// At least one path the transition would touch is now ignored by the user's
+    /// repository. Ignore rules are an ownership boundary, so guessing that an
+    /// ignored generated file is disposable would be unsafe.
+    #[error("refusing to modify files that are now gitignored: {}", files.join(", "))]
+    IgnoredFiles {
+        /// Forward-slashed worktree-relative ignored paths.
+        files: Vec<String>,
+    },
+
+    /// Git reported success but the resulting tree did not equal the requested
+    /// boundary. This is an invariant failure, not a result a caller may present as
+    /// a successful partial undo.
+    #[error("turn restore verification failed: expected tree {expected}, found {actual}")]
+    RestoreVerification {
+        /// Requested target tree.
+        expected: String,
+        /// Tree captured after applying the transition.
+        actual: String,
+    },
+
     /// `git` could not be spawned at all — not installed, not executable, or the
     /// working directory does not exist.
     #[error("failed to spawn `git {}` in {}", args.join(" "), cwd.display())]

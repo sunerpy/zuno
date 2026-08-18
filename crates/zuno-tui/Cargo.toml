@@ -19,15 +19,32 @@ crossterm = { workspace = true }
 zuno-engine = { workspace = true }
 zuno-llm = { workspace = true }
 zuno-permission = { workspace = true }
+pulldown-cmark = { workspace = true }
 ratatui = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-go = { workspace = true }
+tree-sitter-highlight = { workspace = true }
+tree-sitter-javascript = { workspace = true }
+tree-sitter-json = { workspace = true }
+tree-sitter-md = { workspace = true }
+tree-sitter-python = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-toml-ng = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+tree-sitter-yaml = { workspace = true }
+unicode-segmentation = { workspace = true }
 unicode-width = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }
+# The configuration-discovery tests write real files, because the failure this
+# module has to get right — a missing layer versus an unreadable one — is a
+# filesystem distinction that an in-memory fixture cannot reproduce.
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

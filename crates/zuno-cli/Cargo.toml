@@ -13,8 +13,13 @@ publish.workspace = true
 name = "zuno"
 path = "src/main.rs"
 
+[features]
+default = ["jemalloc"]
+jemalloc = ["dep:tikv-jemallocator"]
+
 [dependencies]
 async-trait = { workspace = true }
+base64 = { workspace = true }
 clap = { workspace = true }
 zuno-agent = { workspace = true }
 zuno-auth = { workspace = true }
@@ -44,6 +49,7 @@ zuno-snapshot = { workspace = true }
 zuno-tool = { workspace = true }
 zuno-tools = { workspace = true }
 zuno-tui = { workspace = true }
+zuno-watch = { workspace = true }
 reqwest = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
@@ -53,9 +59,14 @@ time = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+walkdir = { workspace = true }
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+portable-pty = { workspace = true }
 zuno-testkit = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

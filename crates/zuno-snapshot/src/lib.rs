@@ -40,6 +40,7 @@ mod git;
 mod lock;
 mod refcount;
 mod store;
+mod turn;
 
 pub use crate::error::{Result, SnapshotError};
 pub use crate::gc::{Collect, GcHandle, GcSchedule, spawn as spawn_gc};
@@ -48,3 +49,6 @@ pub use crate::refcount::{
     unreferenced_stores,
 };
 pub use crate::store::{GC_ARGS, GcOutcome, LARGE_FILE_LIMIT, Location, PRUNE, Patch, Store};
+pub use crate::turn::{
+    FileOperation, RestoredFile, TurnCapture, TurnCheckpoint, TurnRestore, TurnRestoreReport,
+};

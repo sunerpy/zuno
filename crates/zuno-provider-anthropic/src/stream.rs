@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use zuno_error::ProviderError;
 use zuno_llm::event::{ConnectionPhase, FinishReason, RequestContentBlock, StreamEvent};
-use zuno_llm::sse::{SseEvent, SseParser};
+use zuno_llm::sse::{SseEvent, SseParser, append_tool_input, ensure_tool_input_size};
 
 use crate::error::{AnthropicErrorBody, map_stream_error};
 
@@ -28,9 +28,11 @@ impl AnthropicDecoder {
     /// Start decoding a response for `requested_model`.
     #[must_use]
     pub fn new(provider: impl Into<String>, requested_model: impl Into<String>) -> Self {
+        let provider = provider.into();
+        let requested_model = requested_model.into();
         Self {
-            parser: SseParser::new(),
-            state: StreamState::new(provider.into(), requested_model.into()),
+            parser: SseParser::for_stream(provider.clone(), requested_model.clone()),
+            state: StreamState::new(provider, requested_model),
             completed: Vec::new(),
             finished: false,
         }
@@ -90,12 +92,23 @@ impl AnthropicDecoder {
         self.completed
     }
 
-    fn decode_frames(&mut self, frames: Vec<SseEvent>) -> Vec<Result<StreamEvent, ProviderError>> {
+    fn decode_frames(
+        &mut self,
+        frames: Vec<Result<SseEvent, ProviderError>>,
+    ) -> Vec<Result<StreamEvent, ProviderError>> {
         let mut output = Vec::new();
         for frame in frames {
             if self.state.failed {
                 break;
             }
+            let frame = match frame {
+                Ok(frame) => frame,
+                Err(error) => {
+                    self.state.failed = true;
+                    output.push(Err(error));
+                    break;
+                }
+            };
             match self.decode_frame(&frame) {
                 Ok(events) => output.extend(events.into_iter().map(Ok)),
                 Err(error) => {
@@ -204,6 +217,12 @@ impl AnthropicDecoder {
                 ActiveBlock::RedactedThinking { data }
             }
             ApiContentBlock::ToolUse { id, name, input } => {
+                ensure_tool_input_size(
+                    input.to_string().len(),
+                    &self.state.provider,
+                    &self.state.requested_model,
+                    self.parser.limits().max_tool_input_bytes(),
+                )?;
                 events.push(StreamEvent::ToolUseStart {
                     id: id.clone(),
                     name: name.clone(),
@@ -238,7 +257,13 @@ impl AnthropicDecoder {
                 Ok(vec![StreamEvent::TextDelta(text)])
             }
             (ActiveBlock::ToolUse { input_json, .. }, ApiDelta::InputJson { partial_json }) => {
-                input_json.push_str(&partial_json);
+                append_tool_input(
+                    input_json,
+                    &partial_json,
+                    &self.state.provider,
+                    &self.state.requested_model,
+                    self.parser.limits().max_tool_input_bytes(),
+                )?;
                 Ok(vec![StreamEvent::ToolInputDelta(partial_json)])
             }
             (

@@ -214,7 +214,7 @@ impl DiffView {
     }
 
     fn style(&self, kind: LineKind) -> Style {
-        let palette = &self.context.palette;
+        let palette = self.context.palette();
         match kind {
             LineKind::Header => Style::new()
                 .fg(palette.diff_hunk_header.into())
@@ -232,7 +232,7 @@ impl DiffView {
     }
 
     fn number_style(&self, kind: LineKind) -> Style {
-        let palette = &self.context.palette;
+        let palette = self.context.palette();
         let background = match kind {
             LineKind::Added => palette.diff_added_line_number_bg,
             LineKind::Removed => palette.diff_removed_line_number_bg,
@@ -244,7 +244,7 @@ impl DiffView {
     }
 
     fn sign_style(&self, kind: LineKind) -> Style {
-        let palette = &self.context.palette;
+        let palette = self.context.palette();
         match kind {
             LineKind::Added => Style::new()
                 .fg(palette.diff_highlight_added.into())

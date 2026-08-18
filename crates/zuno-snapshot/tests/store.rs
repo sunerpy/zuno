@@ -8,7 +8,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
-use zuno_snapshot::{GcOutcome, Location, SessionRef, Store, reference_counts};
+use zuno_snapshot::{
+    FileOperation, GcOutcome, Location, SessionRef, SnapshotError, Store, TurnCheckpoint,
+    TurnRestore, reference_counts,
+};
 
 /// A temp directory holding a worktree and a snapshot root as siblings, so the
 /// store's own files can never appear as untracked worktree content.
@@ -183,6 +186,207 @@ fn a_second_track_records_the_mutation() {
     assert_eq!(fixture.read("a.txt"), "hello\n");
     store.restore(&second).expect("restore");
     assert_eq!(fixture.read("a.txt"), "hello\nworld\n");
+}
+
+#[test]
+fn a_turn_checkpoint_undoes_and_redoes_every_captured_file_with_a_complete_report() {
+    let fixture = Fixture::new("wt");
+    fixture.write("removed-by-turn.txt", "restore this exact content\n");
+    let store = fixture.store();
+    let turn = store
+        .begin_turn()
+        .expect("begin turn")
+        .expect("snapshots are enabled");
+
+    fixture.write("a.txt", "changed by the turn\n");
+    fixture.write("added-by-turn.txt", "new and still untracked by user git\n");
+    fs::remove_file(fixture.path("removed-by-turn.txt")).expect("turn deletes file");
+    let checkpoint = turn.finish().expect("finish turn");
+    assert!(
+        git(
+            &fixture.worktree,
+            &["status", "--short", "--", "added-by-turn.txt"]
+        )
+        .starts_with("??"),
+        "the fixture must exercise a file that is untracked in the user's repository"
+    );
+
+    let undo = store
+        .restore_turn(&checkpoint, TurnRestore::Undo)
+        .expect("undo exact post-turn tree");
+    assert_eq!(undo.from(), checkpoint.after());
+    assert_eq!(undo.to(), checkpoint.before());
+    assert_eq!(
+        undo.files()
+            .iter()
+            .map(|file| (file.path.as_str(), file.operation))
+            .collect::<Vec<_>>(),
+        vec![
+            ("a.txt", FileOperation::Modified),
+            ("added-by-turn.txt", FileOperation::Deleted),
+            ("removed-by-turn.txt", FileOperation::Created),
+        ]
+    );
+    assert_eq!(fixture.read("a.txt"), "hello\n");
+    assert!(
+        !fixture.path("added-by-turn.txt").exists(),
+        "undo must remove a file created by the turn rather than merely restoring old files"
+    );
+    assert_eq!(
+        fixture.read("removed-by-turn.txt"),
+        "restore this exact content\n",
+        "undo must recreate a file deleted by the turn with its original bytes"
+    );
+
+    let redo = store
+        .restore_turn(&checkpoint, TurnRestore::Redo)
+        .expect("redo exact pre-turn tree");
+    assert_eq!(redo.from(), checkpoint.before());
+    assert_eq!(redo.to(), checkpoint.after());
+    assert_eq!(
+        redo.files()
+            .iter()
+            .map(|file| (file.path.as_str(), file.operation))
+            .collect::<Vec<_>>(),
+        vec![
+            ("a.txt", FileOperation::Modified),
+            ("added-by-turn.txt", FileOperation::Created),
+            ("removed-by-turn.txt", FileOperation::Deleted),
+        ]
+    );
+    assert_eq!(fixture.read("a.txt"), "changed by the turn\n");
+    assert_eq!(
+        fixture.read("added-by-turn.txt"),
+        "new and still untracked by user git\n"
+    );
+    assert!(
+        !fixture.path("removed-by-turn.txt").exists(),
+        "redo must delete the file again; an assertion that only read surviving files would miss this"
+    );
+}
+
+#[test]
+fn a_turn_checkpoint_is_serializable_for_session_owned_ordering() {
+    let checkpoint = TurnCheckpoint::new("before-tree", "after-tree");
+    let encoded = serde_json::to_string(&checkpoint).expect("serialize checkpoint");
+    let decoded: TurnCheckpoint = serde_json::from_str(&encoded).expect("deserialize checkpoint");
+
+    assert_eq!(decoded, checkpoint);
+    assert_eq!(decoded.before(), "before-tree");
+    assert_eq!(decoded.after(), "after-tree");
+}
+
+#[test]
+fn undo_refuses_a_manually_drifted_file_without_touching_any_other_file() {
+    let fixture = Fixture::new("wt");
+    fixture.write("second.txt", "before second\n");
+    let store = fixture.store();
+    let turn = store
+        .begin_turn()
+        .expect("begin turn")
+        .expect("snapshots are enabled");
+    fixture.write("a.txt", "after first\n");
+    fixture.write("second.txt", "after second\n");
+    let checkpoint = turn.finish().expect("finish turn");
+
+    fixture.write("a.txt", "manual edit after the turn\n");
+    let error = store
+        .restore_turn(&checkpoint, TurnRestore::Undo)
+        .expect_err("manual drift must refuse undo");
+
+    match error {
+        SnapshotError::WorktreeDrift {
+            expected,
+            actual,
+            files,
+        } => {
+            assert_eq!(expected, checkpoint.after());
+            assert_ne!(actual, expected);
+            assert_eq!(files, vec!["a.txt"]);
+        }
+        other => panic!("unexpected refusal: {other}"),
+    }
+    assert_eq!(fixture.read("a.txt"), "manual edit after the turn\n");
+    assert_eq!(
+        fixture.read("second.txt"),
+        "after second\n",
+        "the all-or-nothing preflight must not undo an unchanged sibling before reporting drift"
+    );
+}
+
+#[test]
+fn undo_refuses_a_file_deleted_after_the_checkpoint_and_does_not_recreate_it() {
+    let fixture = Fixture::new("wt");
+    let store = fixture.store();
+    let turn = store
+        .begin_turn()
+        .expect("begin turn")
+        .expect("snapshots are enabled");
+    fixture.write("a.txt", "after turn\n");
+    let checkpoint = turn.finish().expect("finish turn");
+
+    fs::remove_file(fixture.path("a.txt")).expect("manual delete after turn");
+    let error = store
+        .restore_turn(&checkpoint, TurnRestore::Undo)
+        .expect_err("a missing expected file must refuse undo");
+
+    assert!(
+        matches!(
+            error,
+            SnapshotError::WorktreeDrift { ref files, .. } if files == &["a.txt"]
+        ),
+        "unexpected refusal: {error}"
+    );
+    assert!(
+        !fixture.path("a.txt").exists(),
+        "refusal must not silently recreate a file the user deleted after the turn"
+    );
+}
+
+#[test]
+fn undo_refuses_an_affected_file_that_became_gitignored() {
+    let fixture = Fixture::new("wt");
+    let store = fixture.store();
+    let turn = store
+        .begin_turn()
+        .expect("begin turn")
+        .expect("snapshots are enabled");
+    fixture.write("generated.txt", "created by turn\n");
+    let checkpoint = turn.finish().expect("finish turn");
+
+    fixture.write(".git/info/exclude", "generated.txt\n");
+    let error = store
+        .restore_turn(&checkpoint, TurnRestore::Undo)
+        .expect_err("an affected path becoming ignored must refuse undo");
+
+    assert!(
+        matches!(
+            error,
+            SnapshotError::IgnoredFiles { ref files } if files == &["generated.txt"]
+        ),
+        "unexpected refusal: {error}"
+    );
+    assert_eq!(
+        fixture.read("generated.txt"),
+        "created by turn\n",
+        "the ignored file must survive the refusal byte-for-byte"
+    );
+}
+
+#[test]
+fn a_disabled_store_creates_no_turn_checkpoint() {
+    let fixture = Fixture::new("wt");
+    let store =
+        Store::open(Location::new(&fixture.root, "proj", &fixture.worktree).with_enabled(false));
+
+    assert!(
+        store
+            .begin_turn()
+            .expect("disabled begin is inert")
+            .is_none(),
+        "a caller must not receive a checkpoint it could later mistake for restorable state"
+    );
+    assert!(!store.exists(), "an inert capture must not create a store");
 }
 
 #[test]

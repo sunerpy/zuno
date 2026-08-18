@@ -162,6 +162,82 @@ fn views_theme_picker_starts_on_the_active_theme() {
     );
 }
 
+#[test]
+fn views_theme_picker_opening_paints_nothing_new() {
+    // The cursor starts on the theme already showing, so the hook must not fire on the
+    // way in. Guards the builder order inside `theme_picker`: attaching the highlight
+    // before `selecting` would announce the first row in the list instead.
+    let context = ViewContext::defaults();
+    let registry = ThemeRegistry::new();
+    let before = context.theme();
+    let _dialog = theme_picker(context.clone(), &registry, Mode::Dark);
+    assert_eq!(
+        context.theme().name,
+        before.name,
+        "merely opening the theme picker changed the theme"
+    );
+}
+
+#[test]
+fn views_theme_picker_moving_the_cursor_repaints_the_shared_context() {
+    // The behaviour the whole change exists for: the choice is applied as the cursor
+    // arrives, not on submit, so a user judges a theme by the screen rather than by six
+    // swatches. Asserted against the context the *caller* still holds, which is the part
+    // that proves the switch is not confined to the dialog's own copy.
+    let context = ViewContext::defaults();
+    let registry = ThemeRegistry::new();
+    let mut dialog = theme_picker(context.clone(), &registry, Mode::Dark);
+    let before = context.theme();
+
+    assert_eq!(
+        dialog.handle_action(action("dialog.select.next"), &press(KeyCode::Down)),
+        DialogStep::Redraw
+    );
+
+    let moved = dialog
+        .selected()
+        .expect("the picker has 33 rows")
+        .value
+        .clone();
+    assert_ne!(moved, before.name, "the cursor did not move");
+    let after = context.theme();
+    assert_eq!(
+        after.name, moved,
+        "the highlighted theme was not applied to the context every view reads"
+    );
+    assert_eq!(
+        after.palette,
+        registry.resolve(&moved, Mode::Dark).palette,
+        "the applied palette is not the highlighted theme's"
+    );
+}
+
+#[test]
+fn views_theme_picker_filtering_to_a_theme_applies_it() {
+    // The second way the selection changes. `set_filter` re-ranks, so the cursor index
+    // can stay put while a different row lands under it — which is why the hook compares
+    // the selected *value* rather than the index.
+    let context = ViewContext::defaults();
+    let registry = ThemeRegistry::new();
+    let mut dialog = theme_picker(context.clone(), &registry, Mode::Dark);
+    for character in "gruvbox".chars() {
+        assert_eq!(
+            dialog.handle_typed(&press(KeyCode::Char(character))),
+            DialogStep::Redraw
+        );
+    }
+    assert_eq!(
+        dialog.selected().map(|item| item.value.clone()),
+        Some(String::from("gruvbox")),
+        "typing the theme's name did not select it"
+    );
+    assert_eq!(
+        context.theme().name,
+        "gruvbox",
+        "a filter that changed the highlighted row did not repaint"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Filtering
 // ---------------------------------------------------------------------------

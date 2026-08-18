@@ -113,10 +113,10 @@ fn views_welcome_paints_the_wordmark_shadow_in_its_own_colour() {
     let context = ViewContext::defaults();
     let mut view = view();
     let buffer = render_offscreen(&mut view, 200, 50).expect("infallible");
-    let brand = ratatui::style::Color::from(context.palette.primary);
+    let brand = ratatui::style::Color::from(context.palette().primary);
     let shadow = ratatui::style::Color::from(crate::theme::tint(
-        context.palette.background_panel,
-        context.palette.primary,
+        context.palette().background_panel,
+        context.palette().primary,
         SHADOW_MIX,
     ));
     let mut brand_cells = 0;
@@ -193,7 +193,7 @@ fn views_welcome_zero_counts_are_shown_because_zero_is_a_fact() {
 fn views_welcome_every_hint_names_an_action_the_shipped_table_has() {
     // The guard against a dead hint: a typo'd action name would render no key at all,
     // and the row would silently vanish from the grid.
-    for (action, label) in HINTS {
+    for (action, label) in KEY_HINTS {
         assert!(
             crate::keybind::definition(action).is_some(),
             "the welcome grid advertises `{action}` ({label}), which is not in the \
@@ -217,6 +217,185 @@ fn views_welcome_hints_show_the_users_own_spelling_not_the_default() {
     assert!(
         joined.contains("ctrl+j send"),
         "the grid advertised the default spelling after the user rebound it:\n{joined}"
+    );
+}
+
+#[test]
+fn views_welcome_leads_with_slash_commands_and_the_users_palette_binding() {
+    use crate::config::BindingValue;
+    let mut config = crate::config::ResolvedTuiConfig::default();
+    config
+        .keybinds
+        .insert(String::from("command_list"), BindingValue::parse("ctrl+g"));
+    let registry = crate::theme::ThemeRegistry::new();
+    let resolved = registry.resolve(crate::theme::DEFAULT_THEME, crate::theme::Mode::Dark);
+    let context = ViewContext::new(&resolved, config);
+    let mut view = WelcomeView::new(context).with_facts(facts());
+    let joined = rows(&render_offscreen(&mut view, 200, 50).expect("infallible")).join("\n");
+
+    assert!(joined.contains("type / for commands"), "{joined}");
+    assert!(joined.contains("ctrl+g command palette"), "{joined}");
+    assert!(!joined.contains("ctrl+p command palette"), "{joined}");
+}
+
+#[test]
+fn views_welcome_advertises_its_capabilities_as_slash_commands_at_every_supported_width() {
+    // The measured complaint, asserted: the grid used to say `<leader>m models`, and
+    // nothing on the screen defined `<leader>`. Each capability is now spelled the way the
+    // user types it, and the *whole* row is required at each width — a substring check on
+    // the name alone would pass on a row the frame had clipped mid-label.
+    let mut view = view();
+    for (width, height) in [(120u16, 40u16), (80, 30), (60, 26)] {
+        let joined =
+            rows(&render_offscreen(&mut view, width, height).expect("infallible")).join("\n");
+        assert!(
+            joined.contains("type / for commands"),
+            "{width}x{height} does not teach `/` at all:\n{joined}"
+        );
+        for (name, label) in SLASH_HINTS {
+            assert!(
+                joined.contains(&format!("/{name} {label}")),
+                "`/{name} {label}` is missing or clipped at {width}x{height}:\n{joined}"
+            );
+        }
+    }
+}
+
+#[test]
+fn views_welcome_never_renders_the_literal_leader_token() {
+    // `<leader>` is `ctrl+x` and nothing on this screen says so, which is what made the
+    // earlier grid undecodable. Asserted across the widths the grid reflows at, because a
+    // column count change is what decides which rows are drawn at all.
+    //
+    // Two configurations, not one. Under the shipped defaults no remaining hint is bound to
+    // a leader sequence, so the default render alone would keep passing even if the
+    // resolution were removed — measured, by reverting `spelling` to `key_label` and
+    // watching this test stay green while the two rebind tests failed. The second view
+    // binds a hint to a leader sequence, which is the only shape that can produce the token.
+    use crate::config::BindingValue;
+    let mut config = crate::config::ResolvedTuiConfig::default();
+    config.keybinds.insert(
+        String::from("input_submit"),
+        BindingValue::parse("<leader>j"),
+    );
+    let registry = crate::theme::ThemeRegistry::new();
+    let resolved = registry.resolve(crate::theme::DEFAULT_THEME, crate::theme::Mode::Dark);
+
+    for mut screen in [
+        view(),
+        WelcomeView::new(ViewContext::new(&resolved, config)).with_facts(facts()),
+    ] {
+        for (width, height) in [(200u16, 50u16), (120, 40), (80, 30), (60, 26)] {
+            for row in rows(&render_offscreen(&mut screen, width, height).expect("infallible")) {
+                assert!(
+                    !row.contains(crate::keybind::LEADER_TOKEN),
+                    "a row at {width}x{height} shows the literal leader token, which a user \
+                     cannot decode: {row:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn views_welcome_resolves_a_leader_sequence_to_the_chords_actually_pressed() {
+    // The half of the fix that the curated hint list alone does not buy. A user is free to
+    // bind a hinted action to a leader sequence, and `views::key_label` would hand the raw
+    // `<leader>j` straight to the screen — so the spelling is taken from a resolved
+    // `Keymap`, which substitutes the leader chord the way a real keypress resolves it.
+    use crate::config::BindingValue;
+    let mut config = crate::config::ResolvedTuiConfig::default();
+    config.keybinds.insert(
+        String::from("input_submit"),
+        BindingValue::parse("<leader>j"),
+    );
+    let registry = crate::theme::ThemeRegistry::new();
+    let resolved = registry.resolve(crate::theme::DEFAULT_THEME, crate::theme::Mode::Dark);
+    let mut view = WelcomeView::new(ViewContext::new(&resolved, config)).with_facts(facts());
+    let joined = rows(&render_offscreen(&mut view, 200, 50).expect("infallible")).join("\n");
+
+    assert!(
+        joined.contains("ctrl+x j send"),
+        "the leader sequence was not resolved to the chords a user presses:\n{joined}"
+    );
+    assert!(
+        !joined.contains(crate::keybind::LEADER_TOKEN),
+        "the raw leader token reached the screen:\n{joined}"
+    );
+}
+
+#[test]
+fn views_welcome_follows_the_users_own_leader_chord_rather_than_assuming_one() {
+    // `ctrl+x` is not a fact about this program, it is a default. A spelling hard-coded
+    // against it would read correctly today and lie the moment the leader was rebound —
+    // which is exactly how a hard-coded exit key on the status strip went stale in this
+    // project once overrides became real.
+    use crate::config::BindingValue;
+    let mut config = crate::config::ResolvedTuiConfig::default();
+    // `ctrl+y` because the shipped table claims no binding for it. `ctrl+b` is
+    // `session_background`, and a leader colliding with a real binding makes the keymap
+    // refuse to build — which this screen degrades from rather than fails on, so the test
+    // would have reported a missing row instead of a wrong chord.
+    config
+        .keybinds
+        .insert(String::from("leader"), BindingValue::parse("ctrl+y"));
+    config.keybinds.insert(
+        String::from("input_submit"),
+        BindingValue::parse("<leader>j"),
+    );
+    let registry = crate::theme::ThemeRegistry::new();
+    let resolved = registry.resolve(crate::theme::DEFAULT_THEME, crate::theme::Mode::Dark);
+    let mut view = WelcomeView::new(ViewContext::new(&resolved, config)).with_facts(facts());
+    assert!(
+        view.keymap().is_some(),
+        "the override no longer builds a keymap, so this asserts the fallback path instead \
+         of the leader substitution it was written for"
+    );
+    let joined = rows(&render_offscreen(&mut view, 200, 50).expect("infallible")).join("\n");
+
+    assert!(
+        joined.contains("ctrl+y j send"),
+        "the grid ignored the user's own leader chord:\n{joined}"
+    );
+    assert!(
+        !joined.contains("ctrl+x j"),
+        "the grid advertised the default leader chord after it was rebound:\n{joined}"
+    );
+}
+
+#[test]
+fn views_welcome_spells_out_the_exit_key_down_to_sixty_columns() {
+    // The regression the two-group layout was shaped to fix. The single eleven-entry grid
+    // filled its column budget with leader rows and dropped `cancel / exit` entirely below
+    // eighty columns — the one hint a stuck user needs, missing at the width most likely to
+    // belong to somebody with a small window.
+    let mut view = view();
+    for (width, height) in [(120u16, 40u16), (80, 30), (60, 26)] {
+        let joined =
+            rows(&render_offscreen(&mut view, width, height).expect("infallible")).join("\n");
+        for (action, label) in KEY_HINTS {
+            let spelling = view
+                .spelling(view.keymap().as_ref(), action)
+                .unwrap_or_else(|| panic!("`{action}` resolved to no spelling"));
+            assert!(
+                joined.contains(&format!("{spelling} {label}")),
+                "`{spelling} {label}` is missing at {width}x{height}, so a key with no \
+                 slash spelling is advertised nowhere:\n{joined}"
+            );
+        }
+    }
+}
+
+#[test]
+fn views_welcome_every_slash_hint_resolves_through_the_real_router() {
+    // `advertised_actions` panics on a name the router does not route to a UI action, so
+    // calling it is the assertion. The count is pinned as well, because a helper that
+    // silently returned an empty set would also never panic.
+    let advertised = advertised_actions();
+    assert_eq!(
+        advertised.len(),
+        KEY_HINTS.len() + SLASH_HINTS.len(),
+        "the advertised set lost an entry: {advertised:?}"
     );
 }
 
@@ -276,8 +455,12 @@ fn views_welcome_facts_can_be_stated_after_construction() {
 
 #[test]
 fn views_welcome_renders_into_a_degenerate_area_without_panicking() {
+    // `20x10` is in the list because it is the frame where the hint block's row budget goes
+    // negative: the brand, facts, lead line and tip already exceed ten rows, so the budget
+    // arithmetic that splits rows between the two groups has to reach zero by saturating
+    // rather than by wrapping.
     let mut view = view();
-    for (width, height) in [(0, 0), (1, 1), (200, 1), (1, 50), (36, 20)] {
+    for (width, height) in [(0, 0), (1, 1), (200, 1), (1, 50), (36, 20), (20, 10)] {
         let _ = render_offscreen(&mut view, width, height).expect("infallible");
     }
 }
@@ -295,7 +478,7 @@ fn views_welcome_every_advertised_key_is_routed_by_the_session_screen() {
     // action as handled.
     let (shutdown, _receiver) = crate::app::terminal_event_channel();
     let mut unrouted = Vec::new();
-    for (action, label) in HINTS {
+    for (action, label) in advertised_actions() {
         let definition = crate::keybind::definition(action)
             .unwrap_or_else(|| panic!("`{action}` is not in the binding table"));
         // Each action gets a screen with everything a picker could need, so a refusal is
@@ -352,6 +535,8 @@ fn views_welcome_every_advertised_key_is_routed_by_the_session_screen() {
 #[test]
 fn views_welcome_mcp_and_help_hints_open_a_real_surface() {
     // The complement: routed *and* actually produces a dialog, not just a handled action.
+    // These two are now advertised as `/mcp` and `/help` rather than as leader chords, so
+    // the action behind each slash row is what has to open something.
     let (sender, _receiver) = crate::app::terminal_event_channel();
     let mut screen = crate::views::session::SessionScreen::new(ViewContext::defaults(), sender)
         .with_keymap(keymap());
@@ -386,7 +571,7 @@ fn views_welcome_every_advertised_action_lives_in_a_scope_the_screen_resolves() 
     // press. Routing and scope are two independent requirements, and a hint needs both.
     let resolved = crate::views::session::scopes();
     let mut missing = Vec::new();
-    for (action, label) in HINTS {
+    for (action, label) in KEY_HINTS {
         let definition = crate::keybind::definition(action)
             .unwrap_or_else(|| panic!("`{action}` is not in the binding table"));
         if !resolved.iter().any(|scope| scope == definition.scope) {
@@ -410,7 +595,7 @@ fn views_welcome_advertised_keys_resolve_through_a_real_dispatcher() {
     // advertises, through `KeyDispatcher`, and require that something consumed it. This is
     // the only form of the assertion that could have caught the missing `mcp` scope, so it
     // is the one worth keeping.
-    for (action, label) in HINTS {
+    for (action, label) in KEY_HINTS {
         let Some(spelling) = crate::views::key_label(action, &ViewContext::defaults()) else {
             // Unbound in the shipped table (`tool_details`, `display_thinking`, `mcp_list`,
             // `help_show`). The grid renders no key for these, so there is no chord to
@@ -452,6 +637,39 @@ fn views_welcome_advertised_keys_resolve_through_a_real_dispatcher() {
              dispatcher"
         );
     }
+}
+
+/// Every action this screen advertises, paired with how the screen spells it.
+///
+/// The two hint lists reach an action by different routes — [`KEY_HINTS`] names it
+/// outright, [`SLASH_HINTS`] names a command the real router resolves to one — so the
+/// routing guard takes its set from here rather than from either list alone. A slash row
+/// that reached nothing would be precisely the defect the key guards were written for,
+/// wearing a different spelling.
+///
+/// Resolving through [`crate::views::slash::SlashRouter`] rather than deriving the action
+/// name locally is the point: it is the same object the prompt submits through, so a
+/// renamed command, a typo, and a name the router deliberately excludes from the slash
+/// surface all fail here instead of rendering as an inert row.
+fn advertised_actions() -> Vec<(&'static str, String)> {
+    use crate::views::slash::{SlashRouter, SlashSubmission};
+    let router = SlashRouter::default();
+    let mut actions = KEY_HINTS
+        .iter()
+        .map(|(action, label)| (*action, (*label).to_owned()))
+        .collect::<Vec<_>>();
+    for (name, label) in SLASH_HINTS {
+        match router.resolve(&format!("/{name}")) {
+            SlashSubmission::UiAction(action) => {
+                actions.push((action, format!("/{name} {label}")));
+            }
+            other => panic!(
+                "the welcome grid advertises `/{name}` ({label}), which the slash router \
+                 resolves to {other:?} rather than to a UI action"
+            ),
+        }
+    }
+    actions
 }
 
 /// A screen with everything a picker could ask for, so a refusal is never an empty list.

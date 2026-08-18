@@ -69,12 +69,12 @@ where
     Ok(seen.into_iter().collect())
 }
 
-pub(crate) fn find_oracle_descendant(launcher: u32) -> Result<Option<u32>> {
+pub(crate) fn find_named_descendant(launcher: u32, process_name: &str) -> Result<Option<u32>> {
     let pids = collect_transitive_pids(launcher, linux_children)?;
     for pid in pids.into_iter().rev() {
         let comm = PathBuf::from(format!("/proc/{pid}/comm"));
         match std::fs::read_to_string(&comm) {
-            Ok(name) if name.trim() == "opencode" => return Ok(Some(pid)),
+            Ok(name) if name.trim() == process_name => return Ok(Some(pid)),
             Ok(_) => {}
             Err(source) if source.kind() == ErrorKind::NotFound => {}
             Err(source) => {

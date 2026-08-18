@@ -161,7 +161,7 @@ fn views_sidebar_warns_once_the_context_window_is_nearly_full() {
     let mut view = view();
     view.ambient_mut().context_used = Some(91);
     let buffer = render_offscreen(&mut view, SIDEBAR_WIDTH, 40).expect("infallible");
-    let warning = ratatui::style::Color::from(ViewContext::defaults().palette.warning);
+    let warning = ratatui::style::Color::from(ViewContext::defaults().palette().warning);
     let row = (0..40)
         .find(|y| {
             (0..SIDEBAR_WIDTH)
@@ -316,7 +316,13 @@ fn views_ambient_elide_left_keeps_the_identifying_tail() {
     assert_eq!(elide_left("abcdefghij", 5), "…ghij");
     assert_eq!(elide_left("abc", 1), "a");
     assert_eq!(elide_left("abc", 0), "");
-    assert_eq!(elide_left("日本語テスト", 4).chars().count(), 4);
+    let wide = elide_left("日本語テスト", 4);
+    assert_eq!(wide, "…ト", "the identifying tail was not preserved");
+    assert!(
+        display_width(&wide) <= 4,
+        "the elided text still occupies {} columns: {wide:?}",
+        display_width(&wide)
+    );
 }
 
 #[test]

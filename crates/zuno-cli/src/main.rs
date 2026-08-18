@@ -1,6 +1,15 @@
 //! Command-line entry point and subcommand dispatch.
 
+mod allocator;
+
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn main() -> std::process::ExitCode {
+    if let Some(code) = allocator::ensure_tuned_allocator() {
+        return code;
+    }
     if let Some(code) = zuno_process::run_guard_from_args() {
         return code;
     }

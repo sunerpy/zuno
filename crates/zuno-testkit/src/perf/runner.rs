@@ -1,6 +1,6 @@
 //! TypeScript-only baseline orchestration and paired-run ordering.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::Oracle;
@@ -141,6 +141,78 @@ pub async fn measure_typescript_baseline(options: &BaselineRunOptions) -> Result
     let oracle = released_oracle()?;
     let database = RealDatabaseSnapshot::capture()?;
     let machine = machine_facts(&oracle)?;
+    let (idle_runs, real_runs) =
+        measure_g1_g2_runs(oracle.program(), "opencode", &database).await?;
+
+    let (soak_turns, soak_duration, smoke_only) = if options.soak_smoke_only {
+        (SOAK_SMOKE_TURNS, window(WorkloadName::WSoak), true)
+    } else {
+        (FULL_SOAK_TURNS, FULL_SOAK_DURATION, false)
+    };
+    let soak = measure_one(
+        oracle.program(),
+        "opencode",
+        WorkloadName::WSoak,
+        1,
+        soak_turns,
+        soak_duration,
+        None,
+    )
+    .await;
+    let (soak_runs, soak_deferred) = soak_outcome(soak, smoke_only)?;
+
+    let mut workloads = g1_g2_workloads(&database, idle_runs, real_runs)?;
+    workloads.push(WorkloadMeasurement {
+        name: WorkloadName::WSoak,
+        smoke_only,
+        turns: soak_turns,
+        wall_clock_seconds: soak_duration.as_secs(),
+        session_id: None,
+        message_count: None,
+        part_count: None,
+        part_data_bytes: None,
+        median_peak_rss_kib: None,
+        runs: soak_runs,
+        deferred_reason: soak_deferred,
+    });
+    let report = BaselineReport {
+        schema_version: 1,
+        methodology_revision: PERF_METHODOLOGY_REVISION,
+        subject: "typescript-only".to_owned(),
+        machine,
+        workloads,
+    };
+    write_report(&options.output, &report)?;
+    Ok(report)
+}
+
+/// Measure the frozen G1/G2 workloads against one caller-selected executable.
+///
+/// # Errors
+/// Returns a typed snapshot, helper-command, workload, or sampling failure.
+pub async fn measure_g1_g2_subject(
+    program: &Path,
+    database: &Path,
+) -> Result<Vec<WorkloadMeasurement>> {
+    let database = RealDatabaseSnapshot::capture_from(database)?;
+    let process_name = program
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| TestkitError::BaselineInvariant {
+            detail: format!(
+                "subject executable has no UTF-8 file name: {}",
+                program.display()
+            ),
+        })?;
+    let (idle_runs, real_runs) = measure_g1_g2_runs(program, process_name, &database).await?;
+    g1_g2_workloads(&database, idle_runs, real_runs)
+}
+
+async fn measure_g1_g2_runs(
+    program: &Path,
+    process_name: &str,
+    database: &RealDatabaseSnapshot,
+) -> Result<(Vec<RunMeasurement>, Vec<RunMeasurement>)> {
     let mut idle_runs = Vec::with_capacity(5);
     let mut real_runs = Vec::with_capacity(5);
 
@@ -152,12 +224,13 @@ pub async fn measure_typescript_baseline(options: &BaselineRunOptions) -> Result
         };
         for workload in order {
             let run = measure_one(
-                oracle.program(),
+                program,
+                process_name,
                 workload,
                 repetition,
                 1,
                 window(workload),
-                uses_real_database(workload).then_some(&database),
+                uses_real_database(workload).then_some(database),
             )
             .await?;
             match workload {
@@ -167,72 +240,42 @@ pub async fn measure_typescript_baseline(options: &BaselineRunOptions) -> Result
             }
         }
     }
+    Ok((idle_runs, real_runs))
+}
 
-    let (soak_turns, soak_duration, smoke_only) = if options.soak_smoke_only {
-        (SOAK_SMOKE_TURNS, window(WorkloadName::WSoak), true)
-    } else {
-        (FULL_SOAK_TURNS, FULL_SOAK_DURATION, false)
-    };
-    let soak = measure_one(
-        oracle.program(),
-        WorkloadName::WSoak,
-        1,
-        soak_turns,
-        soak_duration,
-        None,
-    )
-    .await;
-    let (soak_runs, soak_deferred) = soak_outcome(soak, smoke_only)?;
-
-    let report = BaselineReport {
-        schema_version: 1,
-        methodology_revision: PERF_METHODOLOGY_REVISION,
-        subject: "typescript-only".to_owned(),
-        machine,
-        workloads: vec![
-            WorkloadMeasurement {
-                name: WorkloadName::WIdle,
-                smoke_only: false,
-                turns: 1,
-                wall_clock_seconds: window(WorkloadName::WIdle).as_secs(),
-                session_id: None,
-                message_count: None,
-                part_count: None,
-                part_data_bytes: None,
-                median_peak_rss_kib: Some(median_peak(&idle_runs)?),
-                runs: idle_runs,
-                deferred_reason: None,
-            },
-            WorkloadMeasurement {
-                name: WorkloadName::WReal,
-                smoke_only: false,
-                turns: 1,
-                wall_clock_seconds: window(WorkloadName::WReal).as_secs(),
-                session_id: Some(database.session.id.clone()),
-                message_count: Some(database.session.message_count),
-                part_count: Some(database.session.part_count),
-                part_data_bytes: Some(database.session.part_data_bytes),
-                median_peak_rss_kib: Some(median_peak(&real_runs)?),
-                runs: real_runs,
-                deferred_reason: None,
-            },
-            WorkloadMeasurement {
-                name: WorkloadName::WSoak,
-                smoke_only,
-                turns: soak_turns,
-                wall_clock_seconds: soak_duration.as_secs(),
-                session_id: None,
-                message_count: None,
-                part_count: None,
-                part_data_bytes: None,
-                median_peak_rss_kib: None,
-                runs: soak_runs,
-                deferred_reason: soak_deferred,
-            },
-        ],
-    };
-    write_report(&options.output, &report)?;
-    Ok(report)
+fn g1_g2_workloads(
+    database: &RealDatabaseSnapshot,
+    idle_runs: Vec<RunMeasurement>,
+    real_runs: Vec<RunMeasurement>,
+) -> Result<Vec<WorkloadMeasurement>> {
+    Ok(vec![
+        WorkloadMeasurement {
+            name: WorkloadName::WIdle,
+            smoke_only: false,
+            turns: 1,
+            wall_clock_seconds: window(WorkloadName::WIdle).as_secs(),
+            session_id: None,
+            message_count: None,
+            part_count: None,
+            part_data_bytes: None,
+            median_peak_rss_kib: Some(median_peak(&idle_runs)?),
+            runs: idle_runs,
+            deferred_reason: None,
+        },
+        WorkloadMeasurement {
+            name: WorkloadName::WReal,
+            smoke_only: false,
+            turns: 1,
+            wall_clock_seconds: window(WorkloadName::WReal).as_secs(),
+            session_id: Some(database.session.id.clone()),
+            message_count: Some(database.session.message_count),
+            part_count: Some(database.session.part_count),
+            part_data_bytes: Some(database.session.part_data_bytes),
+            median_peak_rss_kib: Some(median_peak(&real_runs)?),
+            runs: real_runs,
+            deferred_reason: None,
+        },
+    ])
 }
 
 /// Accept a failed W-soak **smoke** as an explicitly deferred workload.

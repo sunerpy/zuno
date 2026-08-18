@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::error::Error as _;
 use std::mem::discriminant;
 
 use serde_json::{Value, json};
@@ -186,15 +187,23 @@ fn event_vocabulary_has_twenty_four_distinct_variants() {
 #[test]
 fn retry_rollback_event_clears_text_and_tool_call_accumulators() {
     let mut accumulator = StreamAccumulator::new();
-    accumulator.apply(&StreamEvent::TextDelta("partial answer".to_owned()));
-    accumulator.apply(&StreamEvent::ToolUseStart {
-        id: "call-1".to_owned(),
-        name: "bash".to_owned(),
-    });
-    accumulator.apply(&StreamEvent::ToolInputDelta(
-        r#"{"command":"cargo test"}"#.to_owned(),
-    ));
-    accumulator.apply(&StreamEvent::ReasoningDelta("partial reasoning".to_owned()));
+    accumulator
+        .apply(&StreamEvent::TextDelta("partial answer".to_owned()))
+        .expect("text remains within stream limits");
+    accumulator
+        .apply(&StreamEvent::ToolUseStart {
+            id: "call-1".to_owned(),
+            name: "bash".to_owned(),
+        })
+        .expect("tool start remains within stream limits");
+    accumulator
+        .apply(&StreamEvent::ToolInputDelta(
+            r#"{"command":"cargo test"}"#.to_owned(),
+        ))
+        .expect("tool input remains within stream limits");
+    accumulator
+        .apply(&StreamEvent::ReasoningDelta("partial reasoning".to_owned()))
+        .expect("reasoning remains within stream limits");
 
     assert_eq!(accumulator.text(), "partial answer");
     assert_eq!(accumulator.tool_calls().len(), 1);
@@ -203,7 +212,9 @@ fn retry_rollback_event_clears_text_and_tool_call_accumulators() {
         r#"{"command":"cargo test"}"#
     );
 
-    accumulator.apply(&StreamEvent::RetryRollback { attempt: 2, max: 3 });
+    accumulator
+        .apply(&StreamEvent::RetryRollback { attempt: 2, max: 3 })
+        .expect("rollback remains within stream limits");
 
     assert!(accumulator.text().is_empty());
     assert!(accumulator.tool_calls().is_empty());
@@ -216,4 +227,29 @@ fn retry_rollback_event_clears_text_and_tool_call_accumulators() {
         accumulator.tool_calls(),
         accumulator.reasoning()
     );
+}
+
+#[test]
+fn tool_input_accumulator_rejects_json_over_its_cap() {
+    let mut accumulator = StreamAccumulator::with_limits("openai", "tool-stream", 8);
+    accumulator
+        .apply(&StreamEvent::ToolUseStart {
+            id: "call-1".to_owned(),
+            name: "write".to_owned(),
+        })
+        .expect("tool call starts");
+
+    let error = accumulator
+        .apply(&StreamEvent::ToolInputDelta("123456789".to_owned()))
+        .expect_err("the ninth byte must exceed an eight-byte cap");
+    let detail = error
+        .source()
+        .expect("the provider error retains the stream limit detail")
+        .to_string();
+
+    assert!(detail.contains("openai"), "{detail}");
+    assert!(detail.contains("tool-stream"), "{detail}");
+    assert!(detail.contains("9 bytes"), "{detail}");
+    assert!(detail.contains("limit 8 bytes"), "{detail}");
+    assert!(accumulator.tool_calls()[0].raw_input.is_empty());
 }

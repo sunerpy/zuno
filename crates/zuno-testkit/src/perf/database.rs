@@ -71,6 +71,10 @@ impl RealDatabaseSnapshot {
         Self::capture_pinned(&source, &W_REAL_SUBJECT)
     }
 
+    pub(crate) fn capture_from(source: &Path) -> Result<Self> {
+        Self::capture_pinned(source, &W_REAL_SUBJECT)
+    }
+
     /// Copy `source` and return the **pinned** session, or fail naming the pin.
     ///
     /// The database is verified against the pin before it is copied, because a

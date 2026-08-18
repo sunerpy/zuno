@@ -45,6 +45,13 @@
 //! mutual exclusion, the deadline and the diagnostic are written once. An owner free
 //! to implement [`TerminalLease`] itself would also be free to get the policy subtly
 //! wrong, which is the duplication this split refuses.
+//!
+//! # Child cleanup invariant
+//!
+//! A lease may register [`TerminalLeaseCleanup`] when its holder gives the inherited
+//! TTY to a child process. Normal release and deadline reclaim run that cleanup first.
+//! If cleanup cannot confirm that the child was terminated and reaped, the broker
+//! fails closed: **the TTY is never reclaimed while a child that inherited it is alive.**
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -221,10 +228,25 @@ pub trait TerminalLease: Send + Sync {
     /// The returned guard *is* the lease: hold it for the prompt, drop it when done.
     /// See [`TerminalBroker`] for what happens if you do not.
     async fn acquire(&self, reason: LeaseReason) -> Result<TerminalLeaseGuard, TerminalLeaseError>;
+
+    /// Takes the terminal with a mandatory pre-reclaim cleanup hook.
+    ///
+    /// A holder that starts a child inheriting the TTY must use this form. The hook may
+    /// return `Ok` only after that child has exited and been reaped.
+    async fn acquire_with_cleanup(
+        &self,
+        reason: LeaseReason,
+        cleanup: Arc<dyn TerminalLeaseCleanup>,
+    ) -> Result<TerminalLeaseGuard, TerminalLeaseError>;
+}
+
+/// Cleanup that must succeed before an inherited TTY can return to its owner.
+pub trait TerminalLeaseCleanup: Send + Sync + 'static {
+    /// Terminates and reaps the holder's child, or refuses terminal reclaim.
+    fn before_reclaim(&self) -> Result<(), String>;
 }
 
 /// The lease that is currently out, if any.
-#[derive(Debug)]
 struct Held {
     reason: LeaseReason,
     /// When the deadline passes. Compared against [`Instant::now`], so a loaded
@@ -234,6 +256,14 @@ struct Held {
     /// Set by whichever of release-or-reclaim gets there first. The loser then does
     /// nothing, which is what makes `reclaim_terminal` exactly-once under a race.
     settled: Arc<AtomicBool>,
+    cleanup: Option<Arc<dyn TerminalLeaseCleanup>>,
+}
+
+struct ReclaimWork {
+    reason: LeaseReason,
+    diagnostic: ForcedReclaim,
+    settled: Arc<AtomicBool>,
+    cleanup: Option<Arc<dyn TerminalLeaseCleanup>>,
 }
 
 /// State shared by the broker, every outstanding guard, and the watchdog task.
@@ -265,6 +295,9 @@ impl SharedSlot {
     /// keeps a late arrival from evicting the *next* holder.
     fn settle(&self, settled: &Arc<AtomicBool>) -> bool {
         let won = !settled.swap(true, Ordering::SeqCst);
+        if !won {
+            return false;
+        }
         let mut slot = self.locked();
         if slot
             .as_ref()
@@ -272,40 +305,74 @@ impl SharedSlot {
         {
             slot.take();
         }
-        won
+        true
     }
 
-    /// Removes an expired holder, returning what has to be reclaimed for it.
+    /// Marks an expired holder as reclaiming while leaving its slot occupied.
     ///
-    /// Split from the reclaim itself so that `reclaim_terminal` — arbitrary owner code
-    /// that writes to a terminal — never runs while this mutex is held. A panic in
-    /// there would otherwise poison the slot for every later lease.
-    fn take_expired(&self, now: Instant) -> Option<(LeaseReason, ForcedReclaim)> {
-        let mut slot = self.locked();
-        let won = match slot.as_ref() {
-            Some(held) if now >= held.deadline => !held.settled.swap(true, Ordering::SeqCst),
+    /// Keeping the slot prevents a second acquirer from yielding the same TTY while
+    /// registered child cleanup is still proving that the old holder is gone.
+    fn begin_expired_reclaim(&self, now: Instant) -> Option<ReclaimWork> {
+        let slot = self.locked();
+        let held = match slot.as_ref() {
+            Some(held) if now >= held.deadline && !held.settled.swap(true, Ordering::SeqCst) => {
+                held
+            }
             _ => return None,
         };
-        let held = slot.take();
-        drop(slot);
-        if !won {
-            return None;
-        }
-        let held = held?;
         let diagnostic = ForcedReclaim {
             plugin: held.reason.plugin.clone(),
             purpose: held.reason.purpose.clone(),
             timeout: held.timeout,
         };
-        Some((held.reason, diagnostic))
+        Some(ReclaimWork {
+            reason: held.reason.clone(),
+            diagnostic,
+            settled: Arc::clone(&held.settled),
+            cleanup: held.cleanup.clone(),
+        })
+    }
+
+    fn finish_expired_reclaim(&self, settled: &Arc<AtomicBool>) -> bool {
+        let mut slot = self.locked();
+        if slot
+            .as_ref()
+            .is_some_and(|held| Arc::ptr_eq(&held.settled, settled))
+        {
+            slot.take();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn abandon_expired_reclaim(&self, settled: &Arc<AtomicBool>) {
+        let slot = self.locked();
+        if slot
+            .as_ref()
+            .is_some_and(|held| Arc::ptr_eq(&held.settled, settled))
+        {
+            settled.store(false, Ordering::SeqCst);
+        }
     }
 
     /// Reclaims an expired lease. Returns the diagnostic raised, if one was.
     fn reclaim_if_expired(&self) -> Option<ForcedReclaim> {
-        let (reason, diagnostic) = self.take_expired(Instant::now())?;
-        self.owner
-            .reclaim_terminal(&reason, ReclaimCause::Deadline(diagnostic.clone()));
-        Some(diagnostic)
+        let work = self.begin_expired_reclaim(Instant::now())?;
+        if let Some(cleanup) = &work.cleanup
+            && cleanup.before_reclaim().is_err()
+        {
+            self.abandon_expired_reclaim(&work.settled);
+            return None;
+        }
+        if !self.finish_expired_reclaim(&work.settled) {
+            return None;
+        }
+        self.owner.reclaim_terminal(
+            &work.reason,
+            ReclaimCause::Deadline(work.diagnostic.clone()),
+        );
+        Some(work.diagnostic)
     }
 }
 
@@ -403,19 +470,14 @@ impl TerminalBroker {
     pub fn reclaim_if_expired(&self) -> Option<ForcedReclaim> {
         self.shared.reclaim_if_expired()
     }
-}
 
-#[async_trait]
-impl TerminalLease for TerminalBroker {
-    async fn acquire(&self, reason: LeaseReason) -> Result<TerminalLeaseGuard, TerminalLeaseError> {
-        // Sweep first: an expired holder is not a holder. Doing this before the busy
-        // check is what stops one leaked guard from wedging the terminal for the rest
-        // of the session.
+    async fn acquire_inner(
+        &self,
+        reason: LeaseReason,
+        cleanup: Option<Arc<dyn TerminalLeaseCleanup>>,
+    ) -> Result<TerminalLeaseGuard, TerminalLeaseError> {
         self.shared.reclaim_if_expired();
 
-        // Decide under the lock, but do not reserve the slot yet: `yield_terminal` may
-        // refuse, and a reserved-then-released slot would let a concurrent acquire see
-        // a holder that never existed.
         if let Some(held) = self.shared.locked().as_ref() {
             return Err(TerminalLeaseError::Busy {
                 holder: held.reason.plugin.clone(),
@@ -437,9 +499,6 @@ impl TerminalLease for TerminalBroker {
         {
             let mut slot = self.shared.locked();
             if let Some(held) = slot.as_ref() {
-                // Another task took the terminal while this one awaited the owner. The
-                // terminal is already yielded, so hand it straight back rather than
-                // leaving it in a state nobody owns.
                 let error = TerminalLeaseError::Busy {
                     holder: held.reason.plugin.clone(),
                     holder_purpose: held.reason.purpose.clone(),
@@ -456,20 +515,10 @@ impl TerminalLease for TerminalBroker {
                 deadline: Instant::now() + self.timeout,
                 timeout: self.timeout,
                 settled: Arc::clone(&settled),
+                cleanup: cleanup.clone(),
             });
         }
 
-        // The watchdog. `released_rx` resolves the moment the guard is dropped, because
-        // the guard owns the sender — including on a panic unwind, which a
-        // notification-based scheme would miss. There is no lost-wakeup window either:
-        // a dropped sender leaves the channel permanently closed rather than depending
-        // on a waiter having registered first.
-        //
-        // `try_current` rather than an unconditional spawn: `acquire` is async, but an
-        // executor other than Tokio can poll it, and panicking inside the terminal
-        // protocol is a worse outcome than degrading to sweep-only reclaim. When there
-        // is no Tokio runtime the deadline is enforced by the next `acquire` or by
-        // `reclaim_if_expired`.
         let (released_tx, released_rx) = oneshot::channel::<()>();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let shared = Arc::clone(&self.shared);
@@ -477,7 +526,9 @@ impl TerminalLease for TerminalBroker {
             handle.spawn(async move {
                 tokio::select! {
                     () = tokio::time::sleep(timeout) => {
-                        shared.reclaim_if_expired();
+                        let _finished = tokio::task::spawn_blocking(move || {
+                            shared.reclaim_if_expired()
+                        }).await;
                     }
                     _ = released_rx => {}
                 }
@@ -488,8 +539,24 @@ impl TerminalLease for TerminalBroker {
             shared: Arc::clone(&self.shared),
             reason,
             settled,
+            cleanup,
             _released: released_tx,
         })
+    }
+}
+
+#[async_trait]
+impl TerminalLease for TerminalBroker {
+    async fn acquire(&self, reason: LeaseReason) -> Result<TerminalLeaseGuard, TerminalLeaseError> {
+        self.acquire_inner(reason, None).await
+    }
+
+    async fn acquire_with_cleanup(
+        &self,
+        reason: LeaseReason,
+        cleanup: Arc<dyn TerminalLeaseCleanup>,
+    ) -> Result<TerminalLeaseGuard, TerminalLeaseError> {
+        self.acquire_inner(reason, Some(cleanup)).await
     }
 }
 
@@ -502,6 +569,7 @@ pub struct TerminalLeaseGuard {
     shared: Arc<SharedSlot>,
     reason: LeaseReason,
     settled: Arc<AtomicBool>,
+    cleanup: Option<Arc<dyn TerminalLeaseCleanup>>,
     /// Dropped with the guard, which is what stops the watchdog. Never read.
     _released: oneshot::Sender<()>,
 }
@@ -544,6 +612,14 @@ impl fmt::Debug for TerminalLeaseGuard {
 
 impl Drop for TerminalLeaseGuard {
     fn drop(&mut self) {
+        if self.settled.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Some(cleanup) = &self.cleanup
+            && cleanup.before_reclaim().is_err()
+        {
+            return;
+        }
         // Losing the settle means the deadline already force-reclaimed this lease.
         // Reclaiming again would restore a terminal the owner has since redrawn.
         if !self.shared.settle(&self.settled) {
@@ -630,6 +706,17 @@ mod tests {
             .iter()
             .filter(|line| line.starts_with("reclaim"))
             .count()
+    }
+
+    struct RecordingCleanup {
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl TerminalLeaseCleanup for RecordingCleanup {
+        fn before_reclaim(&self) -> Result<(), String> {
+            self.log.lock().unwrap().push(String::from("cleanup"));
+            Ok(())
+        }
     }
 
     /// A deadline no test run can reach, for the assertions that must observe the
@@ -742,6 +829,32 @@ mod tests {
             "an already-settled guard must not reclaim on top of the new holder"
         );
         drop(second);
+    }
+
+    #[tokio::test]
+    async fn lease_deadline_runs_registered_cleanup_before_reclaiming_the_terminal() {
+        let (owner, log) = RecordingOwner::new();
+        let broker = TerminalBroker::with_timeout(owner, Duration::ZERO);
+        let cleanup: Arc<dyn TerminalLeaseCleanup> = Arc::new(RecordingCleanup {
+            log: Arc::clone(&log),
+        });
+        let guard = broker
+            .acquire_with_cleanup(LeaseReason::new("tui", "external editor"), cleanup)
+            .await
+            .expect("acquire");
+
+        broker
+            .reclaim_if_expired()
+            .expect("the elapsed lease is reclaimed");
+
+        let lines = entries(&log);
+        assert_eq!(lines[0], "yield tui");
+        assert_eq!(lines[1], "cleanup");
+        assert!(
+            lines[2].starts_with("reclaim-forced"),
+            "the terminal was reclaimed before cleanup: {lines:?}"
+        );
+        drop(guard);
     }
 
     #[tokio::test]

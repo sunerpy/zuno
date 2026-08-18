@@ -9,7 +9,7 @@
 //! # A submitted prompt leaves through a channel, and the turn comes back as events
 //!
 //! [`SessionScreen::with_prompt_sink`] is the only outward edge this screen has
-//! besides shutdown, and it is deliberately as thin as one: a `String` out, and
+//! besides shutdown, and it is deliberately as thin as one: a typed submission out, and
 //! [`zuno_engine::r#loop::TurnEvent`]s back in through
 //! [`crate::app::AppEvent::Engine`]. The screen therefore knows nothing about
 //! sessions, providers, databases or tools — a turn driver is not a collaborator it
@@ -48,30 +48,69 @@
 use crate::app::{AppEvent, Component, EventResult, TerminalEvent};
 use crate::keybind::{APP_EXIT, ActionComponent, Definition, is_exit_request};
 use crate::views::ViewContext;
+use crate::views::autocomplete::{AutocompleteStep, AutocompleteView, SlashSource};
 use crate::views::editor::{EditorSignal, InputEditor};
+use crate::views::external::{Clipboard, EditorRequest, ExternalError, SystemClipboard};
 use crate::views::message::{Message, StatusView, TranscriptView};
 use crate::views::permission::typed_character;
-use crossterm::event::{Event as CrosstermEvent, KeyEvent, KeyEventKind};
+use crate::views::scroll::Scroller;
+use crate::views::slash::{CatalogCommand, SlashRouter, SlashSubmission};
+use crossterm::event::{
+    Event as CrosstermEvent, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind,
+};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
+use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
 
 /// The dialog id the skill browser reports under.
 pub const SKILL_DIALOG_ID: &str = "prompt_skills";
 
-/// Rows reserved for the status strip and the prompt.
+/// Rows reserved for the status strip.
 const STATUS_ROWS: u16 = 1;
-const PROMPT_ROWS: u16 = 2;
+
+/// The prompt's floor, and the share of the screen it may grow to.
+///
+/// Two rows is what the prompt occupied when its height was fixed, so a single-line
+/// buffer keeps the proportions a user already knows rather than shrinking to one.
+/// The cap is a third because the prompt is only ever half of a conversation: a
+/// pasted diff allowed to take the whole height would evict the transcript it is
+/// about to be sent against, and a prompt the user has to scroll is a smaller loss
+/// than a reply they cannot see at all.
+const PROMPT_MIN_ROWS: u16 = 2;
+const PROMPT_MAX_SHARE: u16 = 3;
+
+/// Rows the prompt gets for `content_lines` of typed text on a `height`-row screen.
+///
+/// One row more than the content so the line the cursor is about to open is already
+/// on screen; below the floor that extra row is what the floor supplies anyway.
+///
+/// The floor is raised over the cap *before* clamping, and that ordering is the whole
+/// reason this is a function. `height / PROMPT_MAX_SHARE` falls under
+/// `PROMPT_MIN_ROWS` for any viewport shorter than six rows, and `u16::clamp` panics
+/// when its minimum exceeds its maximum — so a naive
+/// `wanted.clamp(PROMPT_MIN_ROWS, height / PROMPT_MAX_SHARE)` aborts the process on a
+/// 20x10 terminal, which is a size a real pane reaches.
+fn prompt_rows(content_lines: usize, height: u16) -> u16 {
+    let wanted = u16::try_from(content_lines)
+        .unwrap_or(u16::MAX)
+        .saturating_add(1);
+    let cap = (height / PROMPT_MAX_SHARE).max(PROMPT_MIN_ROWS);
+    wanted.clamp(PROMPT_MIN_ROWS, cap)
+}
 
 /// The transcript, the status strip and the prompt as one screen.
 pub struct SessionScreen {
     transcript: TranscriptView,
     status: StatusView,
     editor: InputEditor,
+    autocomplete: AutocompleteView,
+    slash: SlashRouter,
     welcome: crate::views::welcome::WelcomeView,
     sidebar: crate::views::ambient::SidebarView,
     shutdown: mpsc::Sender<TerminalEvent>,
-    prompts: Option<mpsc::Sender<String>>,
+    prompts: Option<mpsc::Sender<PromptSubmission>>,
     cancels: Option<mpsc::Sender<()>>,
     /// Language-server reports produced beside the loop.
     ///
@@ -93,6 +132,16 @@ pub struct SessionScreen {
     sidebar_visible: bool,
     /// The resolved palette and configuration, for the pickers this screen builds.
     context: ViewContext,
+    /// The theme showing when the theme picker opened, for escape to put back.
+    ///
+    /// A whole [`crate::theme::Resolved`] rather than a name, so restoring costs no
+    /// second walk of the theme's colour references and cannot fall back to something
+    /// else than what was on screen.
+    ///
+    /// Held here and not in the picker because the picker is gone by the time its
+    /// cancellation is routed: [`crate::views::dialog::DialogHost`] pops the dialog and
+    /// *then* tells the base.
+    theme_restore: Option<Arc<crate::theme::Resolved>>,
     /// The user's resolved keymap, for the keybinding reference.
     ///
     /// Optional because every view test builds a screen without one, and a help view
@@ -105,6 +154,42 @@ pub struct SessionScreen {
     requested: Vec<Box<dyn crate::views::dialog::Dialog>>,
     /// Selections the user made, for a host that applies them to the next turn.
     selections: Option<mpsc::Sender<Selection>>,
+    /// The dialog currently over this screen, as [`Self::observe_modal`] last saw it.
+    ///
+    /// Recorded only so a bracketed paste can be refused while a modal is up.
+    /// [`crate::views::dialog::DialogHost`] forwards every *non-key* event to the base
+    /// unconditionally — that single line is what keeps an open dialog from stalling
+    /// the loop — and a paste is a non-key event, so without this the text would land
+    /// in the prompt hidden behind a picker. That is the defect the host's own comment
+    /// describes for keys: a modal owns the keyboard.
+    modal: Option<&'static str>,
+    /// The user's `scroll_speed` and `scroll_acceleration`, applied to wheel input.
+    ///
+    /// Held for the life of the screen rather than built per event, and that is the
+    /// whole reason either key works. The curve is a function of the intervals
+    /// *between* notches and the fractional carry is what survives a sub-row multiplier,
+    /// so a scroller constructed inside `handle_event` would measure its first notch
+    /// every time — reporting a multiplier of one forever, and rounding every
+    /// `scroll_speed` under 1.0 to no movement at all. Nothing would fail loudly: a
+    /// constant multiplier is a legal answer, so the defect would be invisible to any
+    /// test that only asked whether the wheel moved something.
+    scroller: Scroller,
+    /// The monotonic origin wheel timestamps are measured from.
+    ///
+    /// A baseline plus an explicit `now_ms` parameter, rather than a clock read inside
+    /// the curve, for the reason `KeyDispatcher::dispatch_key` takes its `Instant`: a
+    /// streak that read the clock itself could only be tested by sleeping.
+    started: Instant,
+    /// Where [`EditorSignal::Copy`] puts the text.
+    ///
+    /// Injected, and `Arc` rather than `Box`, so a test can hold the same
+    /// [`crate::views::external::MemoryClipboard`] the screen writes through and read it
+    /// back afterwards. A process-global would make the assertion "did the copy land"
+    /// order-dependent across the suite, which is the reason every other collaborator
+    /// here is a field too.
+    clipboard: Arc<dyn Clipboard>,
+    editor_requests: Option<mpsc::Sender<EditorRequest>>,
+    editor_results: Option<mpsc::Receiver<Result<Option<String>, ExternalError>>>,
 }
 
 /// One choice the user made in a picker.
@@ -118,6 +203,25 @@ pub enum Selection {
     Session(String),
     /// A different theme.
     Theme(String),
+}
+
+/// A prompt-channel message. Catalog invocations stay typed until the CLI host
+/// resolves their templates; plain text goes directly to the turn driver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptSubmission {
+    /// Ordinary model input.
+    Text(String),
+    /// Model input after the host resolved one or more `@` references.
+    ///
+    /// Kept on the prompt channel rather than a parallel attachment channel so the text
+    /// and its blocks cannot be reordered across turns. `text` is the user-authored form
+    /// retained for hooks and diagnostics; `content` is what the provider receives.
+    Content {
+        text: String,
+        content: Vec<zuno_llm::event::RequestContentBlock>,
+    },
+    /// A catalog command plus its still-unexpanded argument tail.
+    Command { name: String, arguments: String },
 }
 
 /// What the pickers can offer, as the host resolved it.
@@ -143,12 +247,18 @@ impl SessionScreen {
     /// A screen that requests shutdown through `shutdown` when `app_exit` resolves.
     #[must_use]
     pub fn new(context: ViewContext, shutdown: mpsc::Sender<TerminalEvent>) -> Self {
+        let slash = SlashRouter::default();
         Self {
             transcript: TranscriptView::new(context.clone()),
             status: StatusView::new(context.clone()),
             welcome: crate::views::welcome::WelcomeView::new(context.clone()),
             sidebar: crate::views::ambient::SidebarView::new(context.clone()),
             editor: InputEditor::new(context.clone()),
+            autocomplete: AutocompleteView::new(
+                context.clone(),
+                Box::new(SlashSource::new(slash.clone())),
+            ),
+            slash,
             shutdown,
             prompts: None,
             cancels: None,
@@ -159,12 +269,71 @@ impl SessionScreen {
             cancellations: 0,
             cancel_requested: false,
             sidebar_visible: true,
-            context,
             keymap: None,
             catalog: SessionCatalog::default(),
             requested: Vec::new(),
             selections: None,
+            theme_restore: None,
+            modal: None,
+            scroller: Scroller::new(&context.config),
+            started: Instant::now(),
+            // The real host clipboard, so a copy works in production without the CLI
+            // constructing anything: `SystemClipboard::host` resolves the platform, the
+            // installed programs and whether stdout is a terminal, and yields a
+            // clipboard with no mechanisms when there is no terminal — which is also
+            // what keeps the suite from spawning `xclip` or painting escape sequences
+            // into captured test output. `with_clipboard` replaces it.
+            clipboard: Arc::new(SystemClipboard::host()),
+            editor_requests: None,
+            editor_results: None,
+            // Last, because the two fields above borrow it and a struct literal
+            // evaluates its fields in written order.
+            context,
         }
+    }
+
+    /// Install prompts a previous run submitted, and record new ones to `records`.
+    ///
+    /// The entries and the sink arrive together because they are two halves of one
+    /// feature, and the host supplies both: `zuno-tui` names the file
+    /// ([`crate::views::editor::PROMPT_HISTORY_FILE`]) but resolves no directory, so
+    /// the reading and the writing both live in `crates/zuno-cli/src/cmd/tui.rs`.
+    ///
+    /// Only prompts typed into this editor are recorded. A prompt supplied on the
+    /// command line goes through [`Self::submit_prompt`], which never touches the
+    /// editor — it was not typed here, and treating it as though it were would put an
+    /// unattended invocation into the list a user walks back with.
+    #[must_use]
+    pub fn with_prompt_history(
+        mut self,
+        entries: Vec<String>,
+        records: mpsc::Sender<String>,
+    ) -> Self {
+        self.editor.load_history(entries);
+        self.editor.record_history_to(records);
+        self
+    }
+
+    /// Send copied text somewhere other than the host's own clipboard.
+    ///
+    /// Optional for the reason every other collaborator here is: the default already
+    /// works, and a test needs a clipboard it can read back.
+    #[must_use]
+    pub fn with_clipboard(mut self, clipboard: Arc<dyn Clipboard>) -> Self {
+        self.clipboard = clipboard;
+        self
+    }
+
+    /// Connect external-editor requests to a host worker and receive its results.
+    #[must_use]
+    pub fn with_external_editor(
+        mut self,
+        requests: mpsc::Sender<EditorRequest>,
+        results: mpsc::Receiver<Result<Option<String>, ExternalError>>,
+    ) -> Self {
+        self.editor_requests = Some(requests);
+        self.editor_results = Some(results);
+        self
     }
 
     /// Forward every submitted prompt to a turn driver.
@@ -177,8 +346,35 @@ impl SessionScreen {
     /// Optional because a screen with no driver is still a legitimate screen — every
     /// view test builds one — and a `Sender` it could not answer would be worse.
     #[must_use]
-    pub fn with_prompt_sink(mut self, prompts: mpsc::Sender<String>) -> Self {
+    pub fn with_prompt_sink(mut self, prompts: mpsc::Sender<PromptSubmission>) -> Self {
         self.prompts = Some(prompts);
+        self
+    }
+
+    /// Install host-projected catalog metadata without importing the catalog crate.
+    #[must_use]
+    pub fn with_slash_commands(
+        mut self,
+        commands: impl IntoIterator<Item = CatalogCommand>,
+    ) -> Self {
+        self.slash = SlashRouter::new(commands);
+        self.autocomplete
+            .set_source(Box::new(SlashSource::new(self.slash.clone())));
+        self
+    }
+
+    /// Install the host's `@` candidates without teaching this leaf crate about filesystems.
+    ///
+    /// Completion is called from the keystroke path while the UI state is locked, so the
+    /// implementation supplied here must already be bounded and must not perform a walk.
+    /// The production CLI satisfies that contract with a capped index built before raw mode;
+    /// tests keep using [`crate::views::autocomplete::StaticSource`].
+    #[must_use]
+    pub fn with_reference_source(
+        mut self,
+        source: Box<dyn crate::views::autocomplete::CompletionSource>,
+    ) -> Self {
+        self.autocomplete.set_reference_source(source);
         self
     }
 
@@ -284,6 +480,49 @@ impl SessionScreen {
         EventResult::REDRAW
     }
 
+    fn drain_editor_results(&mut self) -> EventResult {
+        let mut drained = Vec::new();
+        if let Some(results) = self.editor_results.as_mut() {
+            while let Ok(result) = results.try_recv() {
+                drained.push(result);
+            }
+        }
+        if drained.is_empty() {
+            return EventResult::IGNORED;
+        }
+        for result in drained {
+            match result {
+                Ok(Some(text)) => self.editor.set_text(&text),
+                Ok(None) => {}
+                Err(error) => self
+                    .transcript
+                    .transcript_mut()
+                    .push(Message::notice(format!("external editor failed: {error}"))),
+            }
+        }
+        EventResult::REDRAW
+    }
+
+    fn request_external_editor(&mut self) -> EventResult {
+        let Some(requests) = self.editor_requests.as_ref() else {
+            self.transcript
+                .transcript_mut()
+                .push(Message::notice("external editor is unavailable"));
+            return EventResult::REDRAW;
+        };
+        let request = EditorRequest::new(self.editor.text());
+        if let Err(error) = requests.try_send(request) {
+            let reason = match error {
+                mpsc::error::TrySendError::Full(_) => "an external editor is already running",
+                mpsc::error::TrySendError::Closed(_) => "the external editor worker has stopped",
+            };
+            self.transcript
+                .transcript_mut()
+                .push(Message::notice(reason));
+        }
+        EventResult::REDRAW
+    }
+
     /// Append a language-server report to the transcript.
     ///
     /// A method rather than letting the host reach through `transcript_mut` because the
@@ -378,11 +617,41 @@ impl SessionScreen {
     /// had gone away, rendered identically to one accepted, is the defect where "no
     /// results" and "cannot see the data" look the same.
     fn submit(&mut self, text: String) {
+        match self.slash.resolve(&text) {
+            SlashSubmission::Prompt(prompt) => {
+                self.submit_to_driver(prompt.clone(), PromptSubmission::Text(prompt))
+            }
+            SlashSubmission::UiAction(action) => {
+                self.dispatch_action(action);
+            }
+            SlashSubmission::Catalog { command, arguments } => self.submit_to_driver(
+                text,
+                PromptSubmission::Command {
+                    name: command,
+                    arguments,
+                },
+            ),
+            SlashSubmission::Unknown(name) => {
+                let shown = if name.is_empty() {
+                    String::from("/")
+                } else {
+                    format!("/{name}")
+                };
+                self.transcript
+                    .transcript_mut()
+                    .push(Message::notice(format!(
+                        "unknown command `{shown}`; type `/` to browse commands or press ctrl+p"
+                    )));
+            }
+        }
+    }
+
+    fn submit_to_driver(&mut self, shown: String, submission: PromptSubmission) {
         self.transcript
             .transcript_mut()
-            .push(Message::user(text.clone()));
+            .push(Message::user(shown.clone()));
         if let Some(prompts) = self.prompts.as_ref() {
-            match prompts.try_send(text.clone()) {
+            match prompts.try_send(submission) {
                 Ok(()) => self.mark_turn_accepted(),
                 Err(error) => {
                     let reason = match error {
@@ -395,7 +664,122 @@ impl SessionScreen {
                 }
             }
         }
-        self.submissions.push(text);
+        self.submissions.push(shown);
+    }
+
+    fn refresh_autocomplete(&mut self) {
+        let text = self.editor.text();
+        let cursor = self.editor.cursor();
+        let before = text
+            .split('\n')
+            .take(cursor.line)
+            .map(|line| line.chars().count() + 1)
+            .sum::<usize>()
+            .saturating_add(cursor.column);
+        self.autocomplete.refresh(&text, before);
+    }
+
+    fn complete_autocomplete(&mut self) -> EventResult {
+        let text = self.editor.text();
+        let Some((completed, cursor)) = self.autocomplete.complete(&text) else {
+            return EventResult::IGNORED;
+        };
+        self.editor.apply_completion(&completed, cursor);
+        self.refresh_autocomplete();
+        EventResult::REDRAW
+    }
+
+    fn autocomplete_step(&mut self, action: &'static str) -> EventResult {
+        let Some(definition) = crate::keybind::definition(action) else {
+            return EventResult::IGNORED;
+        };
+        match self.autocomplete.handle_action(definition) {
+            AutocompleteStep::Ignored => EventResult::IGNORED,
+            AutocompleteStep::Redraw => EventResult::REDRAW,
+            AutocompleteStep::Complete => self.complete_autocomplete(),
+        }
+    }
+
+    /// Put `text` on the clipboard, and say in the transcript what happened.
+    ///
+    /// Both outcomes are reported, not just the failure. A copy key that paints nothing
+    /// teaches the user the binding is broken, so "it worked" and "it did not" have to
+    /// be told apart on screen — the same reason [`Self::submit`] reports a refused
+    /// prompt and [`Self::adopt`] reports a selection nothing listened to.
+    ///
+    /// The transcript rather than the status strip: a copy is one event, and the strip
+    /// carries state that persists — a notice pinned there would still be claiming a
+    /// copy minutes later.
+    /// Put `text` into the prompt, and submit nothing.
+    ///
+    /// Submitting nothing is the whole behaviour being bought here. A real-terminal
+    /// session before this existed turned an eight-line paste into eight turns and
+    /// filled the transcript with `not sent: a turn is already running`, because
+    /// without bracketed paste each newline was a separate key that resolved to
+    /// `input_submit`.
+    fn paste(&mut self, text: &str) -> EventResult {
+        if let Some(dialog) = self.modal {
+            // Refused rather than swallowed silently: a picker's filter box cannot take
+            // pasted text — `Dialog::handle_typed` receives a key, not a string — and a
+            // paste that vanished with nothing said is indistinguishable from a broken
+            // terminal. The notice is behind the dialog and reads once it closes, which
+            // is when the user can act on it.
+            self.transcript
+                .transcript_mut()
+                .push(Message::notice(format!(
+                    "paste ignored: `{dialog}` is open and owns the keyboard"
+                )));
+            return EventResult::REDRAW;
+        }
+        if self.editor.insert_paste(text) == EditorSignal::None {
+            return EventResult::IGNORED;
+        }
+        self.refresh_autocomplete();
+        EventResult::REDRAW
+    }
+
+    /// Insert whatever the clipboard holds, or say why it could not be read.
+    ///
+    /// The `input_paste` binding, for terminals that deliver a paste chord as an
+    /// ordinary key rather than as a bracketed paste. A bracketed paste arrives as an
+    /// event and never reaches here.
+    ///
+    /// Reporting the refusal is the point, and it is what makes
+    /// [`Clipboard::read`]'s deliberate error worth returning: the binding used to fall
+    /// into a bare redraw, so pressing it did nothing and said nothing.
+    fn paste_from_clipboard(&mut self) -> EventResult {
+        let notice = match self.clipboard.read() {
+            Ok(Some(content)) if content.is_image() => String::from(
+                "the clipboard holds an image; pasting an attachment is not supported yet",
+            ),
+            Ok(Some(content)) => return self.paste(&content.data),
+            Ok(None) => String::from("nothing to paste: the clipboard is empty"),
+            Err(error) => format!("paste failed: {error}"),
+        };
+        self.transcript
+            .transcript_mut()
+            .push(Message::notice(notice));
+        EventResult::REDRAW
+    }
+
+    fn copy(&mut self, text: String) -> EventResult {
+        // An empty buffer with nothing selected is not a copy, and writing the empty
+        // string would destroy whatever the user already had on their clipboard.
+        let notice = if text.is_empty() {
+            String::from("nothing to copy: the prompt is empty and no text is selected")
+        } else {
+            match self.clipboard.write(&text) {
+                Ok(()) => format!(
+                    "copied {} characters to the clipboard",
+                    text.chars().count()
+                ),
+                Err(error) => format!("copy failed: {error}"),
+            }
+        };
+        self.transcript
+            .transcript_mut()
+            .push(Message::notice(notice));
+        EventResult::REDRAW
     }
 }
 
@@ -404,7 +788,7 @@ impl Component for SessionScreen {
         let [body, status, prompt] = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(STATUS_ROWS),
-            Constraint::Length(PROMPT_ROWS),
+            Constraint::Length(prompt_rows(self.editor.height(), area.height)),
         ])
         .areas(area);
 
@@ -444,9 +828,26 @@ impl Component for SessionScreen {
 
         self.status.render(frame, status);
         self.editor.render(frame, prompt);
+        if self.autocomplete.is_open() {
+            let height = self.autocomplete.height().min(main.height);
+            let overlay = Rect::new(
+                main.x,
+                main.y + main.height.saturating_sub(height),
+                main.width,
+                height,
+            );
+            self.autocomplete.render(frame, overlay);
+        }
     }
 
     fn handle_event(&mut self, event: &AppEvent) -> EventResult {
+        // A bracketed paste is one event carrying the whole block, so it goes straight
+        // to the editor and resolves to no action at all. That is the point: before
+        // bracketed paste was enabled the same paste arrived as individual keys, and
+        // every newline among them resolved to `input_submit`.
+        if let AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Paste(text))) = event {
+            return self.paste(text);
+        }
         // A printable key resolves to no action, so the dispatcher forwards it here
         // and the screen is what routes it into the prompt. Without this the editor
         // could not be typed into at all — see `permission::typed_character`, the
@@ -456,13 +857,25 @@ impl Component for SessionScreen {
             && let Some(character) = typed_character(key)
         {
             self.editor.insert_char(character);
+            self.refresh_autocomplete();
             return EventResult::REDRAW;
         }
+        // A wheel notch is the one terminal event the transcript acts on. Merged rather
+        // than returned early, so the drain below still runs on a scroll — see its
+        // comment: an event that skips it can be the last event the loop ever sees.
+        let wheel = match event {
+            AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Mouse(mouse))) => {
+                self.handle_wheel(mouse, self.now_ms())
+            }
+            _ => EventResult::IGNORED,
+        };
         // Drained on every event rather than only on a wake, for the reason the
         // permission bridge pumps on every event: a dropped nudge must not leave a
         // verdict the user is waiting for sitting in a channel forever.
         self.observe_edits(event);
-        self.drain_reports()
+        wheel
+            .merge(self.drain_editor_results())
+            .merge(self.drain_reports())
             .merge(self.transcript.handle_event(event))
             .merge(self.status.handle_event(event))
     }
@@ -472,6 +885,44 @@ impl SessionScreen {
     fn mark_turn_accepted(&mut self) {
         self.cancel_requested = false;
         self.status.mark_running();
+    }
+
+    /// Milliseconds since this screen was built.
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Scroll the transcript by one wheel notch observed at `now_ms`.
+    ///
+    /// Wheel input only. The `messages_*` actions in [`Self::handle_view_action`] keep
+    /// moving whole rows, unaccelerated, because a line the user asked for by name must
+    /// not become four just because they pressed the key quickly — acceleration is a
+    /// property of a continuous gesture, not of a deliberate step.
+    ///
+    /// No hit-testing against the pointer's position: the transcript is the only
+    /// scrollable region on this screen, so a notch anywhere means the transcript, the
+    /// same way `messages_line_up` does not care where the pointer is.
+    fn handle_wheel(&mut self, mouse: &MouseEvent, now_ms: u64) -> EventResult {
+        let notches = match mouse.kind {
+            MouseEventKind::ScrollUp => -1.0,
+            MouseEventKind::ScrollDown => 1.0,
+            // Horizontal wheels, buttons and drags: the transcript has one axis, and a
+            // screen that claimed the rest would stop a later surface from seeing them.
+            _ => return EventResult::IGNORED,
+        };
+        // Re-stated per notch from the transcript, which measured all three on its last
+        // render and is the only thing that owns them. This is what keeps the wheel from
+        // drifting away from the view while a live turn grows the content underneath it.
+        self.scroller.total = self.transcript.content_height();
+        self.scroller.viewport = self.transcript.viewport_height();
+        self.scroller.sync_offset(self.transcript.offset());
+        if self.scroller.wheel(notches, now_ms) == 0 {
+            // A notch whose multiplier has not yet accumulated a whole row moved
+            // nothing, so repainting would cost a frame to redraw identical rows.
+            return EventResult::IGNORED;
+        }
+        self.transcript.set_offset(self.scroller.offset());
+        EventResult::REDRAW
     }
 
     /// Route the actions that change what is *shown* rather than what is typed.
@@ -555,7 +1006,12 @@ impl SessionScreen {
             "model_list" => self.request(self.model_picker()),
             "agent_list" => self.request(self.agent_picker()),
             "session_list" => self.request(self.session_picker()),
-            "theme_list" => self.request(self.theme_picker()),
+            // Two statements because opening the theme picker also records the theme to
+            // put back on escape, which needs `&mut self` while `request` does too.
+            "theme_list" => {
+                let dialog = self.theme_picker();
+                self.request(dialog)
+            }
             "mcp_list" => self.request(self.mcp_list()),
             "prompt_skills" => self.request(self.skill_list()),
             "diff_open" => self.request(self.diff_view()),
@@ -710,15 +1166,36 @@ impl SessionScreen {
         )))
     }
 
-    fn theme_picker(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
+    /// The theme picker, and the restore point escape needs.
+    ///
+    /// Moving the cursor in this picker re-themes the screen immediately — see
+    /// [`crate::views::ViewContext::set_theme`] — so the theme showing when it opened is
+    /// recorded here first. Without it, cancelling would leave the user in whichever
+    /// theme they happened to be scrolling past, which is the one outcome they did not
+    /// ask for.
+    fn theme_picker(&mut self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
         // The registry is built here rather than held, because the picker resolves every
         // theme once at construction for its preview and then never consults it again.
         let registry = crate::theme::ThemeRegistry::new();
+        let active = self.context.theme();
+        self.theme_restore = Some(Arc::clone(&active));
         Some(Box::new(crate::views::picker::theme_picker(
             self.context.clone(),
             &registry,
-            crate::theme::Mode::Dark,
+            // The mode the host resolved at startup, carried on the active theme rather
+            // than re-decided here. A second mode policy in this crate would preview
+            // dark variants on a terminal the CLI had already found to be light.
+            active.mode,
         )))
+    }
+
+    /// Put back the theme the picker opened over.
+    fn restore_theme(&mut self) -> EventResult {
+        let Some(previous) = self.theme_restore.take() else {
+            return EventResult::IGNORED;
+        };
+        self.context.set_theme(&previous);
+        EventResult::REDRAW
     }
 
     /// Cancel a running turn, or leave the application when none is running.
@@ -767,7 +1244,24 @@ impl SessionScreen {
                 Selection::Agent(value.to_owned())
             }
             crate::views::picker::SESSION_DIALOG_ID => Selection::Session(value.to_owned()),
-            crate::views::picker::THEME_DIALOG_ID => Selection::Theme(value.to_owned()),
+            // No [`Selection::Theme`] is sent, and that is the change. The variant stays
+            // because the host still matches on it, but a theme is the view layer's own
+            // state now: the palette on screen is already the chosen one — the picker's
+            // highlight hook applied it as the cursor arrived — so committing only has to
+            // drop the restore point. Sending it would put a colour change through the
+            // channel that rebuilds the turn host, and would earn the "not applied:
+            // nothing is listening" notice from a host that deliberately discards it,
+            // which would be a lie about a theme that visibly did apply.
+            crate::views::picker::THEME_DIALOG_ID => {
+                self.theme_restore = None;
+                // The resolved name, not `value`: a theme that fell back is showing the
+                // fallback, and the notice should say what the user is looking at.
+                let name = self.context.theme().name.clone();
+                self.transcript
+                    .transcript_mut()
+                    .push(Message::notice(format!("theme set to {name}")));
+                return EventResult::REDRAW;
+            }
             // The palette resolves to *another action's name*, so it re-enters the same
             // routing a key press takes. That is what makes an unbound action reachable
             // without a second copy of the routing table. Re-entry is bounded because the
@@ -807,6 +1301,24 @@ impl SessionScreen {
 }
 
 impl ActionComponent for SessionScreen {
+    fn focused_scopes(&self) -> Vec<&'static str> {
+        if self.autocomplete.is_open() {
+            vec!["prompt.autocomplete"]
+        } else if self.editor.cursor().line == 0
+            || self.editor.cursor().line + 1 == self.editor.height()
+        {
+            // Scope ordering cannot vary by chord, so both history arrows are promoted at
+            // either vertical edge. `InputEditor` then applies the directional half of the
+            // rule: an arrow pointing into a multi-line buffer still moves the cursor, while
+            // one pointing out past its first/last line walks history. Promoting everywhere
+            // would shadow `input_move_up/down` throughout pasted blocks; never promoting is
+            // the original bug that made persisted history unreachable.
+            vec!["history"]
+        } else {
+            Vec::new()
+        }
+    }
+
     fn drain_dialogs(&mut self) -> Vec<Box<dyn crate::views::dialog::Dialog>> {
         std::mem::take(&mut self.requested)
     }
@@ -820,11 +1332,19 @@ impl ActionComponent for SessionScreen {
             crate::views::dialog::DialogOutcome::Selected { value, .. } => {
                 self.adopt(dialog, value)
             }
+            // Escape arrives as a cancelled outcome through the same routing a selection
+            // takes, so no key is named here — which is the discipline this layer keeps.
+            crate::views::dialog::DialogOutcome::Cancelled
+                if dialog == crate::views::picker::THEME_DIALOG_ID =>
+            {
+                self.restore_theme()
+            }
             _ => EventResult::IGNORED,
         }
     }
 
     fn observe_modal(&mut self, active: Option<&'static str>) {
+        self.modal = active;
         // Only a permission prompt makes the turn wait on the user; a picker or the help
         // view is something the user opened *while* work continued, and suppressing the
         // spinner behind those would claim the turn had stopped when it had not.
@@ -840,6 +1360,23 @@ impl ActionComponent for SessionScreen {
     }
 
     fn handle_action(&mut self, action: &'static Definition, event: &KeyEvent) -> EventResult {
+        if self.autocomplete.is_open() {
+            let autocomplete_action = match action.name {
+                "prompt.autocomplete.prev"
+                | "prompt.autocomplete.next"
+                | "prompt.autocomplete.hide"
+                | "prompt.autocomplete.select"
+                | "prompt.autocomplete.complete" => Some(action.name),
+                "input_submit" | "prompt_submit" => Some("prompt.autocomplete.select"),
+                "input_move_up" | "command_list" => Some("prompt.autocomplete.prev"),
+                "input_move_down" => Some("prompt.autocomplete.next"),
+                "session_interrupt" => Some("prompt.autocomplete.hide"),
+                _ => None,
+            };
+            if let Some(autocomplete_action) = autocomplete_action {
+                return self.autocomplete_step(autocomplete_action);
+            }
+        }
         // `ctrl+c` and `ctrl+d` are each claimed by the `input` scope before `app`,
         // so a screen that only watched for `app_exit` could never be left. Asking
         // the keymap whether the *chord* is an exit chord — rather than matching the
@@ -858,12 +1395,16 @@ impl ActionComponent for SessionScreen {
             EditorSignal::None => EventResult::IGNORED,
             EditorSignal::Submit(text) => {
                 self.submit(text);
+                self.autocomplete.hide();
                 EventResult::REDRAW
             }
-            EditorSignal::Changed
-            | EditorSignal::OpenExternalEditor
-            | EditorSignal::Paste
-            | EditorSignal::Copy(_) => EventResult::REDRAW,
+            EditorSignal::Copy(text) => self.copy(text),
+            EditorSignal::OpenExternalEditor => self.request_external_editor(),
+            EditorSignal::Changed => {
+                self.refresh_autocomplete();
+                EventResult::REDRAW
+            }
+            EditorSignal::Paste => self.paste_from_clipboard(),
         }
     }
 }
@@ -886,8 +1427,29 @@ pub fn scopes() -> Vec<String> {
     [
         // `input` and `prompt` first, so a chord the editor claims wins over an
         // application-wide one on the same keys.
-        "input", "prompt", "messages", "model", "agent", "session", "theme", "sidebar", "mcp",
-        "tool", "display", "tips", "command", "help",
+        "input", "prompt",
+        // `history` stays after `input` in the static chain, preserving the rule above that
+        // editor bindings win ordinary collisions. Its complete scope is only `up` and
+        // `down`, so registering it cannot consume a typeable character. At a buffer's
+        // vertical edge `focused_scopes` temporarily promotes it; the editor then decides
+        // from direction whether that arrow moves inward or crosses into history.
+        "history",
+        // `editor` with them, because `editor_open` *is* a prompt action — its command is
+        // `prompt.editor` and it opens `$EDITOR` on the buffer the prompt owns — so it
+        // belongs beside the family above rather than among the surfaces below.
+        //
+        // Safe at any position, which is the part worth stating. The scope carries exactly
+        // one row, `editor_open` on `<leader>e`, and no other row in the table spells
+        // `<leader>e`, so this cannot take a chord from a scope before or after it. It also
+        // cannot do what `diff` below does: a leader sequence opens with `ctrl+x`, which no
+        // text entry produces, so registering this scope costs no typeable character.
+        //
+        // Unregistered it was the quietest possible dead key: `ctrl+x` resolved to
+        // `Pending`, the `e` then matched nothing, fell through to the editor and was
+        // inserted — `ctrl+x e` left `beforee` in the prompt, and the contained-editor
+        // stack behind it could not be opened by any means.
+        "editor", "messages", "model", "agent", "session", "theme", "sidebar", "mcp", "tool",
+        "display", "tips", "command", "help",
         // `diff` after `input` and `messages`, and only for `diff_open`'s sake. The scope
         // also carries the viewer's own bare letters — `q`, `n`, `p`, `d`, `v`, `s`, `b`,
         // `[`, `]` — which resolve here whether or not the viewer is open. That is

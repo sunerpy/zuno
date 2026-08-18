@@ -159,6 +159,16 @@ pub enum RemoteError {
 }
 
 impl RemoteError {
+    /// Whether OAuth could not proceed because dynamic client registration is unavailable.
+    #[must_use]
+    pub fn needs_client_registration(&self) -> bool {
+        matches!(
+            self,
+            Self::OAuth { message, .. }
+                if message.contains("does not support dynamic client registration")
+        )
+    }
+
     /// Whether a direct or fallback transport failure was caused by a deadline.
     #[must_use]
     pub fn is_timeout(&self) -> bool {

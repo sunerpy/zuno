@@ -81,6 +81,48 @@ fn stub_internals() -> Internals {
 }
 
 #[test]
+fn resolved_prompt_blocks_become_the_text_and_file_parts_the_engine_projects() {
+    let input = UserMessageInput {
+        session_id: "ses_reference",
+        agent: "build",
+        provider_id: "provider",
+        model_id: "model",
+        text: "inspect @note.txt @diagram.png",
+        message_id: None,
+        now: 1_780_000_000_000,
+    };
+    let content = vec![
+        RequestContentBlock::Text {
+            text: "inspect @note.txt @diagram.png".to_owned(),
+        },
+        RequestContentBlock::Text {
+            text: "--- BEGIN REFERENCED FILE: note.txt ---\nreal body\n--- END REFERENCED FILE: note.txt ---".to_owned(),
+        },
+        RequestContentBlock::Image {
+            media_type: "image/png".to_owned(),
+            data: "aW1hZ2U=".to_owned(),
+        },
+    ];
+
+    let parts = request_content_parts(&input, "msg_reference", &content)
+        .expect("text and image request blocks are valid user content");
+
+    assert_eq!(
+        parts
+            .iter()
+            .filter(|part| part.kind == zuno_db::message::PartKind::Text)
+            .count(),
+        2
+    );
+    let image = parts
+        .iter()
+        .find(|part| part.kind == zuno_db::message::PartKind::File)
+        .expect("the image became a stored file part");
+    assert_eq!(image.data["mime"], "image/png");
+    assert_eq!(image.data["data"], "aW1hZ2U=");
+}
+
+#[test]
 fn production_prompt_composition_honours_the_memory_master_switch() {
     let directory = tempfile::TempDir::new().expect("temporary memory paths");
     let paths = zuno_tools::ScopePaths::at(

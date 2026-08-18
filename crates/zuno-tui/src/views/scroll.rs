@@ -222,6 +222,24 @@ impl Scroller {
         self.accumulator = 0.0;
     }
 
+    /// Adopt an offset that something else owns.
+    ///
+    /// The wheel is not the only thing that moves a view: a keybind, a re-measure and
+    /// following a live turn all move it with no notch involved, and the surface being
+    /// scrolled is what observes those. A scroller holding a private copy of the offset
+    /// would apply the next notch to a stale position and yank the view back to wherever
+    /// the previous gesture ended — two sources of truth, in the one place a user would
+    /// read as "scrolling is broken".
+    ///
+    /// Deliberately leaves the accumulator and the streak alone. Content growing under
+    /// a gesture does not end the gesture, and discarding sub-row carry here would make
+    /// every fractional `scroll_speed` round to zero. [`Self::by_rows`] is the method
+    /// for the movement that *does* end a streak.
+    pub const fn sync_offset(&mut self, offset: usize) {
+        let max = self.max_offset();
+        self.offset = if offset > max { max } else { offset };
+    }
+
     /// Apply one wheel event of `notches` (negative is up) at `now_ms`.
     ///
     /// Returns the rows actually moved, which is zero while the accumulator is still

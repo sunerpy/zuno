@@ -41,6 +41,7 @@ use crate::config::{DiffStyle, ResolvedTuiConfig};
 use crate::theme::{Mode, Palette, Resolved, ThemeRegistry};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use std::sync::{Arc, PoisonError, RwLock};
 
 pub mod ambient;
 pub mod autocomplete;
@@ -49,7 +50,9 @@ pub mod diff;
 pub mod editor;
 pub mod external;
 pub mod help;
+mod highlight;
 pub mod lsp;
+pub mod markdown;
 pub mod message;
 pub mod palette;
 pub mod permission;
@@ -57,6 +60,8 @@ pub mod picker;
 pub mod question;
 pub mod scroll;
 pub mod session;
+pub mod slash;
+pub mod tool;
 pub mod welcome;
 
 #[cfg(test)]
@@ -70,18 +75,82 @@ mod views_tests;
 /// on each side, and 60 columns is about the floor for that.
 pub const SPLIT_DIFF_MIN_WIDTH: u16 = 120;
 
+/// One resolved theme, shared by every clone of a [`ViewContext`].
+///
+/// `Arc<Resolved>` inside the lock rather than `Resolved`, so a reader clones a
+/// pointer and drops the guard immediately instead of copying a fifty-field palette
+/// or holding a lock across a render. See [`ViewContext`] for why the cell exists at
+/// all.
+type ThemeCell = Arc<RwLock<Arc<Resolved>>>;
+
 /// Everything a view needs from the layers below it.
 ///
 /// One value rather than a palette argument threaded through every `render`,
 /// because the two things travel together: a view that paints also needs the
-/// user's size, scroll, and diff preferences, and both are immutable for the life
-/// of a frame.
+/// user's size, scroll, and diff preferences.
+///
+/// # Why the theme is shared and the configuration is not
+///
+/// A `ViewContext` is **cloned into every component at construction** —
+/// [`session::SessionScreen::new`] hands one to each of its five children, every
+/// picker gets one, [`dialog::DialogHost`] keeps its own. If the palette were an
+/// owned field, changing one component's copy would re-theme that component and
+/// nothing else, and the screen would render half in the new theme and half in the
+/// old. Half a screen re-themed is worse than none.
+///
+/// Two shapes were weighed:
+///
+/// * **Push a `retheme` call down the component tree.** Every construction site and
+///   every future one has to remember to forward it, and the one that forgets leaves
+///   a surface painting yesterday's colours with nothing failing. It is the same trap
+///   as the modal banner that outlived its dialog, which is why
+///   [`crate::keybind::ActionComponent::observe_modal`] is *derived* every frame
+///   rather than pushed on open and close.
+/// * **Share one theme behind interior mutability**, which is what this is. There is
+///   exactly one `Resolved` in the process; every painter reads it when it paints, so
+///   there is no notification to forget and no component that can hold a stale
+///   palette. Adding a view later costs nothing.
+///
+/// The configuration stays owned per clone because nothing changes it after startup:
+/// [`crate::config::ResolvedTuiConfig`] is resolved once from the discovered files
+/// and a second source of truth for it would buy nothing.
+///
+/// # Locking
+///
+/// [`Self::palette`] and [`Self::theme`] take the read lock, clone an `Arc`, and drop
+/// the guard before returning, so no lock is ever held across a render or across a
+/// call into another component. The cell is a leaf: nothing acquires
+/// [`crate::app::UiState`]'s mutex while holding it, which matters because
+/// `handle_event` — where [`Self::set_theme`] is reached from — already runs under
+/// that mutex. A poisoned lock is read through rather than panicked on; a palette
+/// somebody panicked beside is still a palette, and aborting the renderer over it
+/// would turn a cosmetic fault into a dead terminal.
 #[derive(Debug, Clone)]
 pub struct ViewContext {
-    /// The resolved colours. The only legal source of a colour in this module.
-    pub palette: Palette,
+    /// The resolved theme. The only legal source of a colour in this module.
+    theme: ThemeCell,
     /// The resolved TUI configuration.
     pub config: ResolvedTuiConfig,
+}
+
+/// A borrow of the active palette, held for as long as the caller needs it.
+///
+/// Returned instead of `&Palette` because the palette lives behind a lock, and
+/// instead of `Palette` because a colour read happens hundreds of times per frame.
+/// It `Deref`s, so `context.palette().text` and `selected_foreground(&palette, …)`
+/// both read the way a plain field would.
+///
+/// Holding one pins the theme it was taken from, which is the property a single
+/// `render` wants: a frame paints one theme even if a re-theme lands mid-frame.
+#[derive(Debug, Clone)]
+pub struct PaletteRef(Arc<Resolved>);
+
+impl std::ops::Deref for PaletteRef {
+    type Target = Palette;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0.palette
+    }
 }
 
 impl ViewContext {
@@ -89,7 +158,7 @@ impl ViewContext {
     #[must_use]
     pub fn new(resolved: &Resolved, config: ResolvedTuiConfig) -> Self {
         Self {
-            palette: resolved.palette.clone(),
+            theme: Arc::new(RwLock::new(Arc::new(resolved.clone()))),
             config,
         }
     }
@@ -105,20 +174,57 @@ impl ViewContext {
         Self::new(&resolved, ResolvedTuiConfig::default())
     }
 
+    /// The theme in force, including the name it resolved under and its mode.
+    ///
+    /// The mode is read from here rather than re-derived, so the picker previews in
+    /// the same light/dark mode the host resolved at startup
+    /// (`ThemeRegistry::refresh_system_theme`, falling back to [`Mode::Dark`]). A
+    /// second mode policy in the view layer would disagree with the first the day the
+    /// terminal reported light.
+    #[must_use]
+    pub fn theme(&self) -> Arc<Resolved> {
+        Arc::clone(&self.theme.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// The colours in force.
+    #[must_use]
+    pub fn palette(&self) -> PaletteRef {
+        PaletteRef(self.theme())
+    }
+
+    /// Repaint every surface in this context's tree with `resolved`.
+    ///
+    /// `&self` on purpose: the whole point is that a component holding a clone can
+    /// change what *every* clone paints with, which an owned field could not express.
+    ///
+    /// This is a live view-layer switch and nothing else. It does not write the user's
+    /// configuration file — the theme lasts for this session, and persisting it is a
+    /// separate decision about mutating a file the user owns — and it does not touch
+    /// session or turn state: no channel is sent on, so a running turn cannot be
+    /// disturbed by a colour change. That is deliberate, and it is why the CLI's
+    /// selection channel (which rebuilds the turn host) is *not* the route a theme
+    /// takes.
+    pub fn set_theme(&self, resolved: &Resolved) {
+        let mut theme = self.theme.write().unwrap_or_else(PoisonError::into_inner);
+        *theme = Arc::new(resolved.clone());
+    }
+
     /// Body text on the panel background.
     #[must_use]
     pub fn text(&self) -> Style {
+        let palette = self.palette();
         Style::new()
-            .fg(self.palette.text.into())
-            .bg(self.palette.background_panel.into())
+            .fg(palette.text.into())
+            .bg(palette.background_panel.into())
     }
 
     /// De-emphasised text: labels, hints, and metadata.
     #[must_use]
     pub fn muted(&self) -> Style {
+        let palette = self.palette();
         Style::new()
-            .fg(self.palette.text_muted.into())
-            .bg(self.palette.background_panel.into())
+            .fg(palette.text_muted.into())
+            .bg(palette.background_panel.into())
     }
 
     /// A section title.
@@ -130,9 +236,10 @@ impl ViewContext {
     /// An accent used for the active element's border and marker.
     #[must_use]
     pub fn accent(&self) -> Style {
+        let palette = self.palette();
         Style::new()
-            .fg(self.palette.border_active.into())
-            .bg(self.palette.background_panel.into())
+            .fg(palette.border_active.into())
+            .bg(palette.background_panel.into())
     }
 
     /// The style for a row the cursor is on.
@@ -142,34 +249,38 @@ impl ViewContext {
     /// contrast-derived answer (`packages/tui/src/theme/index.ts:98-110`).
     #[must_use]
     pub fn selected(&self) -> Style {
-        let background = self.palette.primary;
+        let palette = self.palette();
+        let background = palette.primary;
         Style::new()
-            .fg(crate::theme::selected_foreground(&self.palette, Some(background)).into())
+            .fg(crate::theme::selected_foreground(&palette, Some(background)).into())
             .bg(background.into())
     }
 
     /// A warning, used by every prompt that asks a human to decide.
     #[must_use]
     pub fn warning(&self) -> Style {
+        let palette = self.palette();
         Style::new()
-            .fg(self.palette.warning.into())
-            .bg(self.palette.background_panel.into())
+            .fg(palette.warning.into())
+            .bg(palette.background_panel.into())
     }
 
     /// A failure or a rejection.
     #[must_use]
     pub fn error(&self) -> Style {
+        let palette = self.palette();
         Style::new()
-            .fg(self.palette.error.into())
-            .bg(self.palette.background_panel.into())
+            .fg(palette.error.into())
+            .bg(palette.background_panel.into())
     }
 
     /// A completed operation.
     #[must_use]
     pub fn success(&self) -> Style {
+        let palette = self.palette();
         Style::new()
-            .fg(self.palette.success.into())
-            .bg(self.palette.background_panel.into())
+            .fg(palette.success.into())
+            .bg(palette.background_panel.into())
     }
 
     /// Reasoning text, dimmed by the theme's own `thinkingOpacity`.
@@ -180,30 +291,33 @@ impl ViewContext {
     /// colour is emitted.
     #[must_use]
     pub fn thinking(&self) -> Style {
+        let palette = self.palette();
         let color = crate::theme::tint(
-            self.palette.background,
-            self.palette.warning,
-            self.palette.thinking_opacity,
+            palette.background,
+            palette.warning,
+            palette.thinking_opacity,
         );
         Style::new()
             .fg(color.into())
-            .bg(self.palette.background_panel.into())
+            .bg(palette.background_panel.into())
     }
 
     /// The fill used behind a whole surface.
     #[must_use]
     pub fn surface(&self) -> Style {
+        let palette = self.palette();
         Style::new()
-            .fg(self.palette.text.into())
-            .bg(self.palette.background_panel.into())
+            .fg(palette.text.into())
+            .bg(palette.background_panel.into())
     }
 
     /// The fill used behind an inset element such as a footer or a menu.
     #[must_use]
     pub fn element(&self) -> Style {
+        let palette = self.palette();
         Style::new()
-            .fg(self.palette.text.into())
-            .bg(self.palette.background_element.into())
+            .fg(palette.text.into())
+            .bg(palette.background_element.into())
     }
 
     /// How many columns wide a diff should be laid out, for this width.
@@ -329,17 +443,55 @@ pub fn key_label(action: &str, context: &ViewContext) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The chord a user can actually press for `action`, or `None` when there is none.
+///
+/// [`key_label`] is not enough on its own, and the difference is not cosmetic. It reads
+/// [`crate::keybind::Definition::keys`], which is the **upstream** spelling and is
+/// deliberately `"none"` for the six actions this build binds itself through
+/// [`crate::keybind::SHIPPED_DEFAULTS`] — that table cannot move into `DEFINITIONS`
+/// because `DEFINITIONS` is asserted row-for-row against upstream's own fixture. So for
+/// `tool_details`, `display_thinking`, `diff_open`, `help_show`, `prompt_skills` and
+/// `mcp_list`, `key_label` reports "unbound" about actions the running binary has bound.
+/// Measured: the transcript's collapse notice rendered `… 9 more lines` with no key,
+/// while `<leader>o` was live the whole time.
+///
+/// It also substitutes the leader token, which [`key_label`] cannot: a hint reading
+/// `<leader>o` names a key no keyboard has.
+///
+/// Building a [`crate::keybind::Keymap`] per call rather than caching one: it is
+/// constructed from the resolved configuration and this is reached once per collapsed
+/// tool result, not per cell. A cached keymap would need invalidating on a config change
+/// and would be a second source of truth for the binding — the trap
+/// [`ViewContext`]'s shared theme exists to avoid.
+///
+/// `views/welcome.rs` resolves the same fact through its own private `spelling()`, which
+/// predates this and does the same two steps. That is one derivation too many and should
+/// collapse onto this function; it is left alone here only because this change's scope
+/// does not include that file.
+#[must_use]
+pub fn pressable_label(action: &str, context: &ViewContext) -> Option<String> {
+    crate::keybind::Keymap::from_config(&context.config)
+        .ok()
+        .and_then(|keymap| keymap.sequences(action).into_iter().next())
+        .or_else(|| key_label(action, context))
+        // A spelling that still carries the leader token after resolution is unreadable,
+        // and an unreadable key is worse than a missing one — the same filter
+        // `welcome.rs` applies for the same reason.
+        .filter(|spelling| !spelling.contains(crate::keybind::LEADER_TOKEN))
+}
+
 /// A `key label` hint pair, the footer vocabulary every prompt shares.
 #[must_use]
 pub fn hint(key: &str, label: &str, context: &ViewContext) -> Vec<Span<'static>> {
+    let palette = context.palette();
     vec![
         Span::styled(key.to_owned(), context.element()),
         Span::styled(String::from(" "), context.element()),
         Span::styled(
             label.to_owned(),
             Style::new()
-                .fg(context.palette.text_muted.into())
-                .bg(context.palette.background_element.into()),
+                .fg(palette.text_muted.into())
+                .bg(palette.background_element.into()),
         ),
         Span::styled(String::from("  "), context.element()),
     ]

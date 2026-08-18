@@ -415,6 +415,19 @@ impl ActionComponent for DialogHost {
         result
     }
 
+    fn focused_scopes(&self) -> Vec<&'static str> {
+        if self.is_open() {
+            vec![
+                "permission.prompt",
+                "dialog.select",
+                "dialog.prompt",
+                "session",
+            ]
+        } else {
+            self.base.focused_scopes()
+        }
+    }
+
     fn pending_changed(&mut self, pending: &[Chord]) -> EventResult {
         self.pending = pending.to_vec();
         if self.is_open() {

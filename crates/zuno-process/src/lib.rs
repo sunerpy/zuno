@@ -5,7 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// First argv token marking an invocation as a hidden guard request.
 ///
@@ -13,7 +13,9 @@ use std::time::Duration;
 /// repeating the literal.
 pub const GUARD_MARKER: &str = "__zuno_child_guard";
 const SUPERVISE_MODE: &str = "supervise";
+const SUPERVISE_FOREGROUND_MODE: &str = "supervise-foreground";
 const MONITOR_MODE: &str = "monitor";
+const MONITOR_FOREGROUND_MODE: &str = "monitor-foreground";
 const EXEC_MODE: &str = "exec";
 const EXEC_FOREGROUND_MODE: &str = "exec-foreground";
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -45,6 +47,34 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    guarded_argv_for_mode(program, arguments, SUPERVISE_MODE)
+}
+
+/// Rewrites one interactive program through containment with terminal foreground ownership.
+///
+/// This mode is reserved for a short-lived child that must read the terminal, such as an
+/// external editor. Resident background hosts must use [`guarded_argv`] so they cannot take
+/// foreground ownership merely because their parent currently owns the terminal.
+pub fn guarded_foreground_argv<I, S>(
+    program: impl AsRef<OsStr>,
+    arguments: I,
+) -> (OsString, Vec<OsString>)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    guarded_argv_for_mode(program, arguments, SUPERVISE_FOREGROUND_MODE)
+}
+
+fn guarded_argv_for_mode<I, S>(
+    program: impl AsRef<OsStr>,
+    arguments: I,
+    mode: &'static str,
+) -> (OsString, Vec<OsString>)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let program = program.as_ref().to_os_string();
     let arguments: Vec<OsString> = arguments
         .into_iter()
@@ -55,7 +85,7 @@ where
     };
     let mut guarded = Vec::with_capacity(arguments.len() + 5);
     guarded.push(OsString::from(GUARD_MARKER));
-    guarded.push(OsString::from(SUPERVISE_MODE));
+    guarded.push(OsString::from(mode));
     guarded.push(OsString::from(std::process::id().to_string()));
     guarded.push(OsString::from("--"));
     guarded.push(program);
@@ -92,7 +122,9 @@ struct GuardRequest {
 fn parse_guard(arguments: &[OsString]) -> io::Result<GuardRequest> {
     let mode = match arguments.get(2).and_then(|value| value.to_str()) {
         Some(SUPERVISE_MODE) => SUPERVISE_MODE,
+        Some(SUPERVISE_FOREGROUND_MODE) => SUPERVISE_FOREGROUND_MODE,
         Some(MONITOR_MODE) => MONITOR_MODE,
+        Some(MONITOR_FOREGROUND_MODE) => MONITOR_FOREGROUND_MODE,
         Some(EXEC_MODE) => EXEC_MODE,
         Some(EXEC_FOREGROUND_MODE) => EXEC_FOREGROUND_MODE,
         _ => return Err(io::Error::other("invalid child-process guard mode")),
@@ -120,8 +152,8 @@ fn parse_guard(arguments: &[OsString]) -> io::Result<GuardRequest> {
 
 fn run_guard(request: GuardRequest) -> io::Result<ExitStatus> {
     match request.mode {
-        SUPERVISE_MODE => supervise(request),
-        MONITOR_MODE => monitor(request),
+        SUPERVISE_MODE | SUPERVISE_FOREGROUND_MODE => supervise(request),
+        MONITOR_MODE | MONITOR_FOREGROUND_MODE => monitor(request),
         EXEC_MODE | EXEC_FOREGROUND_MODE => exec_guarded(request),
         _ => unreachable!("guard mode was validated while parsing"),
     }
@@ -139,9 +171,14 @@ fn supervise(request: GuardRequest) -> io::Result<ExitStatus> {
     }
 
     let executable = std::env::current_exe()?;
+    let monitor_mode = if request.mode == SUPERVISE_FOREGROUND_MODE {
+        MONITOR_FOREGROUND_MODE
+    } else {
+        MONITOR_MODE
+    };
     let mut child = Command::new(executable)
         .arg(GUARD_MARKER)
-        .arg(MONITOR_MODE)
+        .arg(monitor_mode)
         .arg(std::process::id().to_string())
         .arg("--")
         .arg(&request.program)
@@ -168,6 +205,8 @@ fn supervise(request: GuardRequest) -> io::Result<ExitStatus> {
 
 #[cfg(unix)]
 fn monitor(request: GuardRequest) -> io::Result<ExitStatus> {
+    use std::io::IsTerminal as _;
+
     #[cfg(target_os = "linux")]
     rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::TERM))?;
     let terminate = termination_flag()?;
@@ -177,7 +216,13 @@ fn monitor(request: GuardRequest) -> io::Result<ExitStatus> {
         ));
     }
 
-    let transfer_foreground = terminal_foreground_is(request.expected_parent)?;
+    let transfer_foreground =
+        request.mode == MONITOR_FOREGROUND_MODE && std::io::stdin().is_terminal();
+    if transfer_foreground && !terminal_foreground_is_process_group_of(request.expected_parent)? {
+        return Err(io::Error::other(
+            "guard supervisor does not own the terminal foreground process group",
+        ));
+    }
     let executable = std::env::current_exe()?;
     let mut child = Command::new(executable)
         .arg(GUARD_MARKER)
@@ -196,21 +241,30 @@ fn monitor(request: GuardRequest) -> io::Result<ExitStatus> {
         .spawn()?;
     let child_pid = child.id();
     if transfer_foreground && let Err(error) = transfer_terminal_foreground(child_pid) {
-        terminate_process_group(child_pid);
-        let _status = child.wait();
-        return Err(error);
+        return Err(with_cleanup_error(
+            error,
+            terminate_guarded_process_group(&mut child, child_pid, true),
+        ));
     }
 
     loop {
-        if let Some(status) = child.try_wait()? {
-            terminate_process_group(child_pid);
-            return Ok(status);
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                terminate_process_group(child_pid);
+                return Ok(status);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(with_cleanup_error(
+                    error,
+                    terminate_guarded_process_group(&mut child, child_pid, transfer_foreground),
+                ));
+            }
         }
         if terminate.load(std::sync::atomic::Ordering::Acquire)
             || parent_pid() != Some(request.expected_parent)
         {
-            terminate_process_group(child_pid);
-            return child.wait();
+            return terminate_guarded_process_group(&mut child, child_pid, transfer_foreground);
         }
         std::thread::sleep(POLL_INTERVAL);
     }
@@ -220,19 +274,123 @@ fn monitor(request: GuardRequest) -> io::Result<ExitStatus> {
 fn exec_guarded(request: GuardRequest) -> io::Result<ExitStatus> {
     use std::os::unix::process::CommandExt as _;
 
+    let foreground = request.mode == EXEC_FOREGROUND_MODE;
+    let terminate = foreground.then(foreground_termination_flag).transpose()?;
     #[cfg(target_os = "linux")]
-    rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))?;
+    rustix::process::set_parent_process_death_signal(Some(if foreground {
+        rustix::process::Signal::TERM
+    } else {
+        rustix::process::Signal::KILL
+    }))?;
     if parent_pid() != Some(request.expected_parent) {
         return Err(io::Error::other(
             "guard supervisor exited before exec was armed",
         ));
     }
-    rustix::process::setpgid(None, None)?;
-    if request.mode == EXEC_FOREGROUND_MODE {
-        rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::STOP)?;
+    if foreground {
+        return run_foreground_guard(request, terminate.expect("foreground guard has a flag"));
     }
+    rustix::process::setpgid(None, None)?;
     let error = Command::new(request.program).args(request.arguments).exec();
     Err(error)
+}
+
+#[cfg(unix)]
+fn run_foreground_guard(
+    request: GuardRequest,
+    terminate: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> io::Result<ExitStatus> {
+    let original_process_group = rustix::process::getpgrp();
+    rustix::process::setpgid(None, None)?;
+    let guarded_process_group = rustix::process::getpgrp();
+    let restoration = TerminalForegroundRestoration::new(original_process_group);
+    rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::STOP)?;
+
+    let result = if rustix::termios::tcgetpgrp(std::io::stdin())? != guarded_process_group {
+        Err(io::Error::other(
+            "guarded child resumed before terminal foreground handoff",
+        ))
+    } else {
+        run_foreground_payload(request, terminate)
+    };
+    restoration.finish(result)
+}
+
+#[cfg(unix)]
+fn run_foreground_payload(
+    request: GuardRequest,
+    terminate: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> io::Result<ExitStatus> {
+    let mut child = Command::new(request.program)
+        .args(request.arguments)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if terminate.load(std::sync::atomic::Ordering::Acquire)
+            || parent_pid() != Some(request.expected_parent)
+        {
+            terminate_process(child.id());
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_millis(100) {
+                if let Some(status) = child.try_wait()? {
+                    return Ok(status);
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "guarded foreground child did not exit after termination",
+            ));
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+#[cfg(unix)]
+struct TerminalForegroundRestoration {
+    process_group: rustix::process::Pid,
+    restored: bool,
+}
+
+#[cfg(unix)]
+impl TerminalForegroundRestoration {
+    fn new(process_group: rustix::process::Pid) -> Self {
+        Self {
+            process_group,
+            restored: false,
+        }
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        rustix::termios::tcsetpgrp(std::io::stdin(), self.process_group)?;
+        self.restored = true;
+        Ok(())
+    }
+
+    fn finish<T>(mut self, result: io::Result<T>) -> io::Result<T> {
+        match (result, self.restore()) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(restore_error)) => Err(io::Error::other(format!(
+                "{error}; restoring the terminal foreground process group failed: {restore_error}"
+            ))),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalForegroundRestoration {
+    fn drop(&mut self) {
+        if !self.restored {
+            let _restored = rustix::termios::tcsetpgrp(std::io::stdin(), self.process_group);
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -252,19 +410,40 @@ fn termination_flag() -> io::Result<std::sync::Arc<std::sync::atomic::AtomicBool
 }
 
 #[cfg(unix)]
+fn foreground_termination_flag() -> io::Result<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let terminate = Arc::new(AtomicBool::new(false));
+    for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGHUP] {
+        signal_hook::flag::register(signal, Arc::clone(&terminate))?;
+    }
+    let terminal_interrupt = Arc::new(AtomicBool::new(false));
+    for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGQUIT] {
+        signal_hook::flag::register(signal, Arc::clone(&terminal_interrupt))?;
+    }
+    Ok(terminate)
+}
+
+#[cfg(unix)]
 fn parent_pid() -> Option<u32> {
     rustix::process::getppid().map(|pid| pid.as_raw_nonzero().get() as u32)
 }
 
 #[cfg(unix)]
-fn terminal_foreground_is(process_group: u32) -> io::Result<bool> {
+fn terminal_foreground_is_process_group_of(process: u32) -> io::Result<bool> {
     use std::io::IsTerminal as _;
 
     if !std::io::stdin().is_terminal() {
         return Ok(false);
     }
-    let process_group = rustix::process::Pid::from_raw(process_group as i32)
-        .ok_or_else(|| io::Error::other("terminal foreground process group is invalid"))?;
+    let process = rustix::process::Pid::from_raw(process as i32)
+        .ok_or_else(|| io::Error::other("guard supervisor PID is invalid"))?;
+    // `expected_parent` identifies the supervisor process, but `tcgetpgrp`
+    // returns a process-group ID. The supervisor inherited the launching TUI's
+    // group, so its PGID is the group that legitimately owned the terminal
+    // before the contained editor gets a new one.
+    let process_group = rustix::process::getpgid(Some(process))?;
     Ok(rustix::termios::tcgetpgrp(std::io::stdin())? == process_group)
 }
 
@@ -294,8 +473,46 @@ fn terminate_process(pid: u32) {
 
 #[cfg(unix)]
 fn terminate_process_group(pid: u32) {
+    signal_process_group(pid, rustix::process::Signal::KILL);
+}
+
+#[cfg(unix)]
+fn signal_process_group(pid: u32, signal: rustix::process::Signal) {
     if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
-        let _result = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        let _result = rustix::process::kill_process_group(pid, signal);
+    }
+}
+
+#[cfg(unix)]
+fn terminate_guarded_process_group(
+    child: &mut std::process::Child,
+    child_pid: u32,
+    restore_foreground: bool,
+) -> io::Result<ExitStatus> {
+    if restore_foreground {
+        signal_process_group(child_pid, rustix::process::Signal::TERM);
+        terminate_process_group_member(child_pid, rustix::process::Signal::CONT);
+    } else {
+        terminate_process_group(child_pid);
+    }
+    let status = child.wait()?;
+    terminate_process_group(child_pid);
+    Ok(status)
+}
+
+#[cfg(unix)]
+fn terminate_process_group_member(pid: u32, signal: rustix::process::Signal) {
+    if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
+        let _result = rustix::process::kill_process(pid, signal);
+    }
+}
+
+fn with_cleanup_error(error: io::Error, cleanup: io::Result<ExitStatus>) -> io::Error {
+    match cleanup {
+        Ok(_) => error,
+        Err(cleanup_error) => io::Error::other(format!(
+            "{error}; guarded process cleanup failed: {cleanup_error}"
+        )),
     }
 }
 

@@ -29,6 +29,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use zuno_error::ProviderError;
 use zuno_llm::registry::{ApiSurface, FinishReason, StreamEvent};
+use zuno_llm::sse::{StreamLimits, append_tool_input, ensure_tool_input_size};
 
 use crate::wire::{ChatChunk, ChunkDelta, DONE_SENTINEL, WireError};
 
@@ -45,10 +46,28 @@ impl SurfaceTranslator {
     /// A translator for one resolved request surface.
     #[must_use]
     pub fn new(provider: impl Into<String>, model: impl Into<String>, surface: ApiSurface) -> Self {
+        Self::with_tool_input_limit(
+            provider,
+            model,
+            surface,
+            StreamLimits::from_environment().max_tool_input_bytes(),
+        )
+    }
+
+    pub(crate) fn with_tool_input_limit(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        surface: ApiSurface,
+        tool_input_limit: usize,
+    ) -> Self {
         let provider = provider.into();
         let model = model.into();
         if surface == ApiSurface::Responses {
-            Self::Responses(ResponsesTranslator::new(provider, model))
+            Self::Responses(ResponsesTranslator::with_tool_input_limit(
+                provider,
+                model,
+                tool_input_limit,
+            ))
         } else {
             Self::Chat(ChunkTranslator::new(provider, model))
         }
@@ -258,6 +277,7 @@ impl ChunkTranslator {
 pub struct ResponsesTranslator {
     provider: String,
     model: String,
+    tool_input_limit: usize,
     reasoning: BTreeMap<String, ActiveReasoning>,
     tools: BTreeMap<String, ActiveTool>,
     saw_tool: bool,
@@ -269,9 +289,22 @@ impl ResponsesTranslator {
     /// A translator for one Responses request.
     #[must_use]
     pub fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        Self::with_tool_input_limit(
+            provider,
+            model,
+            StreamLimits::from_environment().max_tool_input_bytes(),
+        )
+    }
+
+    fn with_tool_input_limit(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        tool_input_limit: usize,
+    ) -> Self {
         Self {
             provider: provider.into(),
             model: model.into(),
+            tool_input_limit,
             reasoning: BTreeMap::new(),
             tools: BTreeMap::new(),
             saw_tool: false,
@@ -335,7 +368,13 @@ impl ResponsesTranslator {
             ResponsesEvent::OutputItemAdded { item } => self.item_added(item),
             ResponsesEvent::FunctionCallArgumentsDelta { item_id, delta } => {
                 if let Some(tool) = self.tools.get_mut(&item_id) {
-                    tool.arguments.push_str(&delta);
+                    append_tool_input(
+                        &mut tool.arguments,
+                        &delta,
+                        &self.provider,
+                        &self.model,
+                        self.tool_input_limit,
+                    )?;
                 }
                 Ok(vec![StreamEvent::ToolInputDelta(delta)])
             }
@@ -370,12 +409,14 @@ impl ResponsesTranslator {
                 let item_id = item.id;
                 let call_id = item.call_id.unwrap_or_default();
                 let name = item.name.unwrap_or_default();
-                self.tools.insert(
-                    item_id,
-                    ActiveTool {
-                        arguments: item.arguments.unwrap_or_default(),
-                    },
-                );
+                let arguments = item.arguments.unwrap_or_default();
+                ensure_tool_input_size(
+                    arguments.len(),
+                    &self.provider,
+                    &self.model,
+                    self.tool_input_limit,
+                )?;
+                self.tools.insert(item_id, ActiveTool { arguments });
                 Ok(vec![StreamEvent::ToolUseStart { id: call_id, name }])
             }
             _ => Ok(Vec::new()),
@@ -404,6 +445,14 @@ impl ResponsesTranslator {
                 Ok(events)
             }
             "function_call" => {
+                if let Some(arguments) = item.arguments.as_deref() {
+                    ensure_tool_input_size(
+                        arguments.len(),
+                        &self.provider,
+                        &self.model,
+                        self.tool_input_limit,
+                    )?;
+                }
                 self.tools.remove(&item.id);
                 Ok(vec![StreamEvent::ToolUseEnd])
             }

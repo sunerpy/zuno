@@ -8,7 +8,7 @@ use serde_json::Value;
 use zuno_error::ProviderError;
 use zuno_llm::event::{FinishReason, RequestContentBlock, StreamEvent};
 use zuno_llm::registry::ApiSurface;
-use zuno_llm::sse::{SseEvent, SseParser};
+use zuno_llm::sse::{SseEvent, SseParser, append_tool_input, ensure_tool_input_size};
 
 use crate::error::{OpenAiErrorBody, map_stream_error};
 use crate::request::resolve_surface;
@@ -19,6 +19,7 @@ pub struct OpenAiDecoder {
     parser: SseParser,
     protocol: ProtocolDecoder,
     finished: bool,
+    failed: bool,
 }
 
 impl OpenAiDecoder {
@@ -27,17 +28,22 @@ impl OpenAiDecoder {
     pub fn new(provider: impl Into<String>, model: impl Into<String>, surface: ApiSurface) -> Self {
         let provider = provider.into();
         let model = model.into();
+        let parser = SseParser::for_stream(provider.clone(), model.clone());
+        let tool_input_limit = parser.limits().max_tool_input_bytes();
         let protocol = match resolve_surface(surface) {
-            ApiSurface::Chat => ProtocolDecoder::Chat(ChatDecoder::new(provider, model)),
+            ApiSurface::Chat => {
+                ProtocolDecoder::Chat(ChatDecoder::new(provider, model, tool_input_limit))
+            }
             ApiSurface::Responses | ApiSurface::Default => {
-                ProtocolDecoder::Responses(ResponsesDecoder::new(provider, model))
+                ProtocolDecoder::Responses(ResponsesDecoder::new(provider, model, tool_input_limit))
             }
             ApiSurface::Messages => ProtocolDecoder::Unsupported,
         };
         Self {
-            parser: SseParser::new(),
+            parser,
             protocol,
             finished: false,
+            failed: false,
         }
     }
 
@@ -45,6 +51,9 @@ impl OpenAiDecoder {
     pub fn push(&mut self, chunk: &[u8]) -> Vec<Result<StreamEvent, ProviderError>> {
         if self.finished {
             return vec![Err(ProviderError::fatal(ProtocolError::AlreadyFinished))];
+        }
+        if self.failed {
+            return Vec::new();
         }
         let frames = self.parser.push(chunk);
         self.decode_frames(frames)
@@ -56,9 +65,14 @@ impl OpenAiDecoder {
             return Vec::new();
         }
         self.finished = true;
+        if self.failed {
+            return Vec::new();
+        }
         let frames = self.parser.finish();
         let mut output = self.decode_frames(frames);
-        output.extend(self.protocol.finish().into_iter().map(Ok));
+        if !self.failed {
+            output.extend(self.protocol.finish().into_iter().map(Ok));
+        }
         output
     }
 
@@ -74,12 +88,24 @@ impl OpenAiDecoder {
         self.protocol.into_completed_blocks()
     }
 
-    fn decode_frames(&mut self, frames: Vec<SseEvent>) -> Vec<Result<StreamEvent, ProviderError>> {
+    fn decode_frames(
+        &mut self,
+        frames: Vec<Result<SseEvent, ProviderError>>,
+    ) -> Vec<Result<StreamEvent, ProviderError>> {
         let mut output = Vec::new();
         for frame in frames {
+            let frame = match frame {
+                Ok(frame) => frame,
+                Err(error) => {
+                    self.failed = true;
+                    output.push(Err(error));
+                    break;
+                }
+            };
             match self.protocol.frame(&frame) {
                 Ok(events) => output.extend(events.into_iter().map(Ok)),
                 Err(error) => {
+                    self.failed = true;
                     output.push(Err(error));
                     break;
                 }
@@ -134,6 +160,7 @@ impl ProtocolDecoder {
 struct ChatDecoder {
     provider: String,
     model: String,
+    tool_input_limit: usize,
     tools: BTreeMap<u32, ChatTool>,
     text: String,
     completed: Vec<RequestContentBlock>,
@@ -141,10 +168,11 @@ struct ChatDecoder {
 }
 
 impl ChatDecoder {
-    fn new(provider: String, model: String) -> Self {
+    fn new(provider: String, model: String, tool_input_limit: usize) -> Self {
         Self {
             provider,
             model,
+            tool_input_limit,
             tools: BTreeMap::new(),
             text: String::new(),
             completed: Vec::new(),
@@ -185,11 +213,13 @@ impl ChatDecoder {
                     if let Some(arguments) = function.arguments
                         && !arguments.is_empty()
                     {
-                        self.tools
-                            .entry(index)
-                            .or_default()
-                            .arguments
-                            .push_str(&arguments);
+                        append_tool_input(
+                            &mut self.tools.entry(index).or_default().arguments,
+                            &arguments,
+                            &self.provider,
+                            &self.model,
+                            self.tool_input_limit,
+                        )?;
                         events.push(StreamEvent::ToolInputDelta(arguments));
                     }
                 }
@@ -254,6 +284,7 @@ struct ChatTool {
 struct ResponsesDecoder {
     provider: String,
     model: String,
+    tool_input_limit: usize,
     active_reasoning: BTreeMap<String, ActiveReasoning>,
     active_tools: BTreeMap<String, ActiveTool>,
     text: String,
@@ -263,10 +294,11 @@ struct ResponsesDecoder {
 }
 
 impl ResponsesDecoder {
-    fn new(provider: String, model: String) -> Self {
+    fn new(provider: String, model: String, tool_input_limit: usize) -> Self {
         Self {
             provider,
             model,
+            tool_input_limit,
             active_reasoning: BTreeMap::new(),
             active_tools: BTreeMap::new(),
             text: String::new(),
@@ -319,7 +351,13 @@ impl ResponsesDecoder {
             ResponsesEvent::OutputItemAdded { item } => self.item_added(item),
             ResponsesEvent::FunctionCallArgumentsDelta { item_id, delta } => {
                 if let Some(tool) = self.active_tools.get_mut(&item_id) {
-                    tool.arguments.push_str(&delta);
+                    append_tool_input(
+                        &mut tool.arguments,
+                        &delta,
+                        &self.provider,
+                        &self.model,
+                        self.tool_input_limit,
+                    )?;
                 }
                 Ok(vec![StreamEvent::ToolInputDelta(delta)])
             }
@@ -347,12 +385,19 @@ impl ResponsesDecoder {
                 let id = item.id;
                 let call_id = item.call_id.unwrap_or_default();
                 let name = item.name.unwrap_or_default();
+                let arguments = item.arguments.unwrap_or_default();
+                ensure_tool_input_size(
+                    arguments.len(),
+                    &self.provider,
+                    &self.model,
+                    self.tool_input_limit,
+                )?;
                 self.active_tools.insert(
                     id,
                     ActiveTool {
                         call_id: call_id.clone(),
                         name: name.clone(),
-                        arguments: item.arguments.unwrap_or_default(),
+                        arguments,
                     },
                 );
                 Ok(vec![StreamEvent::ToolUseStart { id: call_id, name }])
@@ -394,6 +439,12 @@ impl ResponsesDecoder {
                     arguments: item.arguments.clone().unwrap_or_default(),
                 });
                 let arguments = item.arguments.unwrap_or(active.arguments);
+                ensure_tool_input_size(
+                    arguments.len(),
+                    &self.provider,
+                    &self.model,
+                    self.tool_input_limit,
+                )?;
                 let input = serde_json::from_str(&arguments).map_err(|source| {
                     ProviderError::fatal(ToolInputError {
                         tool_use_id: active.call_id.clone(),

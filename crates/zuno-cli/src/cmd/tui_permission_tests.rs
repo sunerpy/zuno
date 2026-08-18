@@ -168,6 +168,52 @@ async fn answer_through_production_keys(
     (broker, answer)
 }
 
+#[test]
+fn production_component_chain_reaches_persisted_prompt_history() {
+    // This is deliberately the exact composition in `cmd/tui.rs`, not a direct drive of
+    // `SessionScreen`: either wrapper can silently drop the screen's dynamic `history`
+    // promotion before `KeyDispatcher` resolves Up.
+    let (broker, _wake) = broker();
+    let context = ViewContext::defaults();
+    let (shutdown, _held) = tokio::sync::mpsc::channel(4);
+    let (records, _recorded) = tokio::sync::mpsc::channel(4);
+    let screen = zuno_tui::views::session::SessionScreen::new(context.clone(), shutdown)
+        .with_prompt_history(vec![String::from("persisted through production")], records);
+    let dialogs = DialogHost::new(context.clone(), Box::new(screen));
+    let bridge = PermissionBridge::new(context, broker, dialogs);
+    let mut root = KeyDispatcher::new(
+        Keymap::defaults().expect("the shipped keymap builds"),
+        scopes(),
+        Box::new(bridge),
+    );
+
+    let result = root.handle_event(&AppEvent::Terminal(TerminalEvent::Input(
+        zuno_tui::crossterm::event::Event::Key(key(
+            zuno_tui::crossterm::event::KeyCode::Up,
+            zuno_tui::crossterm::event::KeyModifiers::NONE,
+        )),
+    )));
+
+    assert!(result.redraw, "Up did not recall persisted history");
+    let rendered = rendered_text(&mut root, 100, 16);
+    assert!(
+        rendered.contains("persisted through production"),
+        "Up never crossed the production wrapper chain:\n{rendered}"
+    );
+}
+
+#[test]
+fn production_wrappers_preserve_the_screens_focused_scope() {
+    let (broker, _wake) = broker();
+    let context = ViewContext::defaults();
+    let (shutdown, _held) = tokio::sync::mpsc::channel(4);
+    let screen = zuno_tui::views::session::SessionScreen::new(context.clone(), shutdown);
+    let dialogs = DialogHost::new(context.clone(), Box::new(screen));
+    let bridge = PermissionBridge::new(context, broker, dialogs);
+
+    assert_eq!(bridge.focused_scopes(), ["history"]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_ask_becomes_a_prompt_and_the_decision_answers_it() {
     let (broker, mut wake) = broker();

@@ -31,6 +31,7 @@ use zuno_llm::event::{
     FinishReason, Message, RequestContentBlock, Role, StreamEvent, ThoughtSignature,
 };
 use zuno_llm::registry::{ApiSurface, ProviderRegistry, Spec};
+use zuno_llm::sse::{StreamLimits, append_tool_input};
 use zuno_tool::{ToolDefinition, ToolOutput};
 
 use crate::hooks::{HookMessageWithParts, NoopHooks, RequestHookInput, TurnHooks};
@@ -454,8 +455,11 @@ struct ToolBuilder {
     thought_signature: Option<ThoughtSignature>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct StepAccumulator {
+    provider: String,
+    stream: String,
+    tool_input_limit: usize,
     text: String,
     reasoning: String,
     reasoning_signature: String,
@@ -471,6 +475,26 @@ struct StepAccumulator {
 }
 
 impl StepAccumulator {
+    fn new(provider: String, stream: String, tool_input_limit: usize) -> Self {
+        Self {
+            provider,
+            stream,
+            tool_input_limit,
+            text: String::new(),
+            reasoning: String::new(),
+            reasoning_signature: String::new(),
+            provider_reasoning: Vec::new(),
+            calls: Vec::new(),
+            active_tool: None,
+            finish_reason: None,
+            saw_message_end: false,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_input_tokens: None,
+            cache_write_input_tokens: None,
+        }
+    }
+
     fn apply(&mut self, step: u32, event: &StreamEvent) -> Result<(), TurnError> {
         match event {
             StreamEvent::TextDelta(text) => self.text.push_str(text),
@@ -486,7 +510,13 @@ impl StepAccumulator {
             }
             StreamEvent::ToolInputDelta(delta) => {
                 if let Some(tool) = &mut self.active_tool {
-                    tool.raw_input.push_str(delta);
+                    append_tool_input(
+                        &mut tool.raw_input,
+                        delta,
+                        &self.provider,
+                        &self.stream,
+                        self.tool_input_limit,
+                    )?;
                 }
             }
             StreamEvent::ToolUseEnd => self.finish_active_tool(step)?,
@@ -804,7 +834,11 @@ pub async fn run_turn(
             )
             .await
             .map_err(TurnError::Hook)?;
-        let accumulator = Arc::new(Mutex::new(StepAccumulator::default()));
+        let accumulator = Arc::new(Mutex::new(StepAccumulator::new(
+            model.catalog_provider_id.clone(),
+            model.catalog_model_id.clone(),
+            StreamLimits::from_environment().max_tool_input_bytes(),
+        )));
         let policy = ProviderRetryPolicy::new(
             NonZeroU32::new(PROVIDER_RETRY_MAX_ATTEMPTS)
                 .expect("provider retry maximum is non-zero"),
@@ -916,7 +950,12 @@ pub async fn run_turn(
         };
         let mut accumulator = {
             let mut accumulator = accumulator.lock().expect("step accumulator lock");
-            std::mem::take(&mut *accumulator)
+            let replacement = StepAccumulator::new(
+                accumulator.provider.clone(),
+                accumulator.stream.clone(),
+                accumulator.tool_input_limit,
+            );
+            std::mem::replace(&mut *accumulator, replacement)
         };
 
         if !accumulator.text.is_empty() {

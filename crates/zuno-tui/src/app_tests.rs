@@ -3,7 +3,7 @@ use std::io;
 use std::panic::{AssertUnwindSafe, PanicHookInfo, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::Event as CrosstermEvent;
 use ratatui::Terminal;
@@ -212,6 +212,86 @@ fn app_terminal_session_can_drop_while_a_panic_is_unwinding() {
     drop(replacement);
 }
 
+// ---------------------------------------------------------------------------
+// The escape sequences that enter and leave the TUI
+// ---------------------------------------------------------------------------
+
+/// `\e[?2004h` / `\e[?2004l`, the DEC private mode a terminal reads as bracketed
+/// paste. Spelled out rather than derived from the crossterm command so that
+/// exchanging one command for the other cannot make this test agree with itself.
+const ENABLE_BRACKETED_PASTE: &str = "\u{1b}[?2004h";
+const DISABLE_BRACKETED_PASTE: &str = "\u{1b}[?2004l";
+
+/// Windows only: `execute!` falls back to a console API that has no bracketed-paste
+/// call, so the bytes below exist only on an ANSI terminal. The paired-teardown
+/// property is asserted on every platform by the source scan that follows.
+#[cfg(not(windows))]
+#[test]
+fn app_entering_the_terminal_enables_bracketed_paste_and_leaving_disables_it() {
+    let mut entered = Vec::new();
+    enter_terminal(&mut entered, false).expect("a vector accepts every write");
+    let entered = String::from_utf8(entered).expect("crossterm writes utf-8");
+
+    let mut left = Vec::new();
+    assert!(
+        restore_terminal(&mut left, false).is_none(),
+        "restoring into a vector reported a failure"
+    );
+    let left = String::from_utf8(left).expect("crossterm writes utf-8");
+
+    assert!(
+        entered.contains(ENABLE_BRACKETED_PASTE),
+        "entering the TUI did not enable bracketed paste, so a multi-line paste \
+         arrives as individual keys and every newline submits a turn: {entered:?}"
+    );
+    assert!(
+        left.contains(DISABLE_BRACKETED_PASTE),
+        "leaving the TUI did not disable bracketed paste, so the user's shell is left \
+         wrapping every later paste in \\e[200~: {left:?}"
+    );
+}
+
+#[test]
+fn app_every_mode_entering_the_terminal_enables_is_disabled_on_the_way_out() {
+    // A source scan rather than a byte comparison, and that is deliberate: it holds on
+    // Windows too, where `execute!` may take a console-API path that writes no ANSI at
+    // all. A terminal left in a mode the program enabled is a defect the user only sees
+    // *after* quitting, so it needs a guard that cannot be skipped by platform.
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app.rs"),
+    )
+    .expect("read this module's own source");
+    let body = |name: &str| -> String {
+        let start = source
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("{name} is gone; this scan is checking nothing"));
+        let rest = &source[start..];
+        let end = rest.find("\n}\n").expect("a top-level function body ends");
+        rest[..end].to_owned()
+    };
+    let entering = body("enter_terminal");
+    let leaving = body("restore_terminal");
+
+    let enabled: Vec<&str> = ["EnableBracketedPaste", "EnableMouseCapture"]
+        .into_iter()
+        .filter(|command| entering.contains(command))
+        .collect();
+    assert_eq!(
+        enabled.len(),
+        2,
+        "the scan did not find the commands it exists to pair, so it would pass \
+         vacuously: {enabled:?}"
+    );
+    for command in enabled {
+        let paired = command.replace("Enable", "Disable");
+        assert!(
+            leaving.contains(&paired),
+            "`{command}` is enabled on the way in and `{paired}` never runs on the way \
+             out, which leaves the terminal altered after the process ends"
+        );
+    }
+}
+
 fn return_early(lifecycle: Arc<dyn TerminalLifecycle>) -> io::Result<()> {
     let _session = TerminalSession::start(lifecycle)?;
     Err(io::Error::other("early return"))
@@ -235,24 +315,36 @@ struct Screen {
     buffer: Buffer,
     draws: usize,
     clears: usize,
+    draw_started: Vec<Instant>,
 }
 
 struct SharedTestTarget {
     screen: Arc<Mutex<Screen>>,
+    draw_delay: Duration,
 }
 
 impl SharedTestTarget {
     fn new(width: u16, height: u16) -> (Self, Arc<Mutex<Screen>>) {
+        Self::with_draw_delay(width, height, Duration::ZERO)
+    }
+
+    fn with_draw_delay(
+        width: u16,
+        height: u16,
+        draw_delay: Duration,
+    ) -> (Self, Arc<Mutex<Screen>>) {
         let screen = Arc::new(Mutex::new(Screen {
             width,
             height,
             buffer: Buffer::empty(Rect::new(0, 0, width, height)),
             draws: 0,
             clears: 0,
+            draw_started: Vec::new(),
         }));
         (
             Self {
                 screen: Arc::clone(&screen),
+                draw_delay,
             },
             screen,
         )
@@ -265,6 +357,8 @@ fn impossible(error: Infallible) -> io::Error {
 
 impl DrawTarget for SharedTestTarget {
     fn draw(&mut self, root: &mut dyn Component) -> io::Result<()> {
+        locked(&self.screen).draw_started.push(Instant::now());
+        std::thread::sleep(self.draw_delay);
         let (width, height) = {
             let screen = locked(&self.screen);
             (screen.width, screen.height)
@@ -456,6 +550,181 @@ async fn wait_until(mut predicate: impl FnMut() -> bool) {
     .expect("the event loop makes progress under the test budget");
 }
 
+async fn wait_until_within(timeout: Duration, mut predicate: impl FnMut() -> bool) {
+    tokio::time::timeout(timeout, async {
+        while !predicate() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the event loop missed the latency budget");
+}
+
+const TEST_REDRAW_CONFIG: RedrawConfig = RedrawConfig {
+    active: Duration::from_millis(10),
+    idle: Duration::from_millis(30),
+    deep_idle_after: Duration::from_millis(60),
+    deep_idle: Duration::from_millis(100),
+};
+
+struct RecordingInput {
+    polls: Arc<AtomicUsize>,
+    reads: Arc<AtomicUsize>,
+    events: Mutex<VecDeque<CrosstermEvent>>,
+}
+
+impl RecordingInput {
+    fn new(events: impl IntoIterator<Item = CrosstermEvent>) -> Arc<Self> {
+        Arc::new(Self {
+            polls: Arc::new(AtomicUsize::new(0)),
+            reads: Arc::new(AtomicUsize::new(0)),
+            events: Mutex::new(events.into_iter().collect()),
+        })
+    }
+}
+
+impl TerminalInput for RecordingInput {
+    fn poll(&self, timeout: Duration) -> io::Result<bool> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        if locked(&self.events).is_empty() {
+            std::thread::sleep(timeout.min(Duration::from_millis(2)));
+            Ok(false)
+        } else {
+            Ok(true)
+        }
+    }
+
+    fn read(&self) -> io::Result<CrosstermEvent> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        locked(&self.events)
+            .pop_front()
+            .ok_or_else(|| io::Error::other("the scripted terminal input is empty"))
+    }
+}
+
+#[tokio::test]
+async fn app_pause_wait_retains_acknowledgement_published_before_wait_registration() {
+    let control = Arc::new(TerminalInputControl::new());
+    let _producer = control.attach();
+    let epoch = control.request_pause();
+    let probe = Arc::new(WaitRegistrationProbe::default());
+    control.probe_wait_registration(Arc::clone(&probe));
+    let waiter = tokio::spawn({
+        let control = Arc::clone(&control);
+        async move { control.wait_for_pause(epoch).await }
+    });
+    probe.wait_until_observed().await;
+
+    control.acknowledge(epoch);
+    probe.allow_wait();
+
+    tokio::time::timeout(Duration::from_millis(100), waiter)
+        .await
+        .expect("the retained acknowledgement must wake the pause waiter")
+        .expect("the pause waiter must not panic")
+        .expect("the pause waiter must observe the acknowledgement");
+}
+
+#[tokio::test]
+async fn app_resume_wait_retains_resume_published_before_wait_registration() {
+    let control = Arc::new(TerminalInputControl::new());
+    let epoch = control.request_pause();
+    let probe = Arc::new(WaitRegistrationProbe::default());
+    control.probe_wait_registration(Arc::clone(&probe));
+    let waiter = tokio::spawn({
+        let control = Arc::clone(&control);
+        async move { control.wait_for_resume(epoch).await }
+    });
+    probe.wait_until_observed().await;
+
+    control.resume(epoch);
+    probe.allow_wait();
+
+    tokio::time::timeout(Duration::from_millis(100), waiter)
+        .await
+        .expect("the retained resume must wake the input producer")
+        .expect("the resume waiter must not panic");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn app_old_reclaim_cannot_resume_a_successor_pause_epoch() {
+    let lifecycle = Arc::new(FakeLifecycle::default());
+    lifecycle.enter().expect("fake terminal enters");
+    let (target, screen) = SharedTestTarget::new(10, 2);
+    let (terminal_tx, terminal_rx) = terminal_event_channel();
+    let (_engine_tx, engine_rx) = mpsc::channel(1);
+    let (mut app, owner) = App::new(
+        Box::new(Label("ready")),
+        Box::new(target),
+        Arc::clone(&lifecycle) as Arc<_>,
+        terminal_rx,
+        engine_rx,
+    );
+    let app_task = tokio::spawn(async move { app.run().await });
+    wait_until(|| locked(&screen).draws == 1).await;
+    let input = RecordingInput::new([]);
+    let producer = tokio::spawn(forward_terminal_input_from(
+        Arc::clone(&input) as Arc<_>,
+        terminal_tx.clone(),
+        owner.input_control(),
+    ));
+    wait_until(|| input.polls.load(Ordering::SeqCst) > 0).await;
+
+    let broker = Arc::new(owner.broker_with_timeout(Duration::from_secs(3_600)));
+    let first_lease = broker
+        .acquire(LeaseReason::new("first", "old terminal lease"))
+        .await
+        .expect("the first lease acquires");
+    let first_epoch = owner.input.state.borrow().requested;
+    let probe = Arc::new(ReclaimResumeProbe::default());
+    owner.probe_reclaim_resume(Arc::clone(&probe));
+    let old_reclaim = std::thread::spawn(move || first_lease.release());
+    probe.wait_until_observed();
+
+    let successor = tokio::spawn({
+        let broker = Arc::clone(&broker);
+        async move {
+            broker
+                .acquire(LeaseReason::new("second", "successor terminal lease"))
+                .await
+        }
+    });
+    wait_until(|| owner.input.state.borrow().requested > first_epoch).await;
+    let successor_epoch = owner.input.state.borrow().requested;
+    probe.allow_resume();
+    old_reclaim
+        .join()
+        .expect("the old reclaim thread does not panic");
+
+    let successor_lease = tokio::time::timeout(INPUT_PAUSE_TIMEOUT / 2, successor)
+        .await
+        .expect("the successor pause is acknowledged before the acquisition timeout")
+        .expect("the successor acquisition task does not panic")
+        .expect("the successor lease acquires");
+    let state = *owner.input.state.borrow();
+    assert_eq!(
+        state.acknowledged, successor_epoch,
+        "the producer must emit and the loop must acknowledge the successor pause"
+    );
+    assert_eq!(
+        state.resumed, first_epoch,
+        "the old reclaim must not consume the successor epoch"
+    );
+
+    successor_lease.release();
+    terminal_tx
+        .send(TerminalEvent::Shutdown)
+        .await
+        .expect("terminal event channel is open");
+    app_task
+        .await
+        .expect("the event loop task does not panic")
+        .expect("the event loop exits cleanly");
+    producer
+        .await
+        .expect("the input producer exits after its consumer");
+}
+
 #[tokio::test]
 async fn app_event_loop_consumes_both_bounded_channels_and_resize_relays_out() {
     let lifecycle = Arc::new(FakeLifecycle::default());
@@ -513,6 +782,403 @@ async fn app_event_loop_consumes_both_bounded_channels_and_resize_relays_out() {
 }
 
 #[tokio::test]
+async fn app_coalesces_queued_engine_redraws_into_one_frame() {
+    const EVENTS: usize = 32;
+
+    let lifecycle = Arc::new(FakeLifecycle::default());
+    lifecycle.enter().expect("fake terminal enters");
+    let engine_events = Arc::new(AtomicUsize::new(0));
+    let root = EventRecorder {
+        terminal_events: Arc::new(AtomicUsize::new(0)),
+        engine_events: Arc::clone(&engine_events),
+    };
+    let (target, screen) = SharedTestTarget::new(10, 2);
+    let (terminal_tx, terminal_rx) = terminal_event_channel();
+    let (engine_tx, engine_rx) = mpsc::channel(EVENTS);
+    for index in 0..EVENTS {
+        engine_tx
+            .send(TurnEvent::TurnStarted {
+                session_id: format!("ses_{index}"),
+            })
+            .await
+            .expect("the queued burst fits the bounded engine channel");
+    }
+    let (mut app, _owner) = App::new(
+        Box::new(root),
+        Box::new(target),
+        Arc::clone(&lifecycle) as Arc<_>,
+        terminal_rx,
+        engine_rx,
+    );
+    let task = tokio::spawn(async move { app.run().await });
+
+    wait_until(|| engine_events.load(Ordering::SeqCst) == EVENTS).await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let draws_after_burst = locked(&screen).draws;
+
+    terminal_tx
+        .send(TerminalEvent::Shutdown)
+        .await
+        .expect("terminal event channel is open");
+    task.await
+        .expect("the event loop task does not panic")
+        .expect("the event loop exits cleanly");
+    eprintln!(
+        "queued engine burst: events={EVENTS}, total_frames={draws_after_burst}, event_frames={}",
+        draws_after_burst.saturating_sub(1)
+    );
+    assert_eq!(
+        draws_after_burst, 2,
+        "one initial frame plus one coalesced frame must cover the entire burst"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn app_streaming_burst_never_exceeds_the_frame_rate_ceiling() {
+    const EVENTS: usize = 120;
+
+    let lifecycle = Arc::new(FakeLifecycle::default());
+    lifecycle.enter().expect("fake terminal enters");
+    let engine_events = Arc::new(AtomicUsize::new(0));
+    let root = EventRecorder {
+        terminal_events: Arc::new(AtomicUsize::new(0)),
+        engine_events: Arc::clone(&engine_events),
+    };
+    let (target, screen) = SharedTestTarget::new(10, 2);
+    let (terminal_tx, terminal_rx) = terminal_event_channel();
+    let (engine_tx, engine_rx) = mpsc::channel(ENGINE_EVENT_CHANNEL_CAPACITY);
+    let (app, _owner) = App::new(
+        Box::new(root),
+        Box::new(target),
+        Arc::clone(&lifecycle) as Arc<_>,
+        terminal_rx,
+        engine_rx,
+    );
+    let mut app = app.with_redraw_config(REDRAW_CONFIG);
+    let task = tokio::spawn(async move { app.run().await });
+    let burst_tx = engine_tx.clone();
+    let producer = tokio::spawn(async move {
+        for index in 0..EVENTS {
+            burst_tx
+                .send(TurnEvent::TurnStarted {
+                    session_id: format!("ses_{index}"),
+                })
+                .await
+                .expect("engine event channel is open");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+
+    producer.await.expect("the burst producer does not panic");
+    wait_until(|| engine_events.load(Ordering::SeqCst) == EVENTS).await;
+    tokio::time::sleep(REDRAW_CONFIG.active * 2).await;
+    let draw_started = locked(&screen).draw_started.clone();
+
+    terminal_tx
+        .send(TerminalEvent::Shutdown)
+        .await
+        .expect("terminal event channel is open");
+    task.await
+        .expect("the event loop task does not panic")
+        .expect("the event loop exits cleanly");
+    let streaming_frames = &draw_started[1..];
+    eprintln!(
+        "paced streaming burst: events={EVENTS}, frames={}",
+        streaming_frames.len()
+    );
+    assert!(
+        streaming_frames.len() < EVENTS / 4,
+        "{EVENTS} redraw requests produced {} frames",
+        streaming_frames.len()
+    );
+    for pair in streaming_frames.windows(2) {
+        assert!(
+            pair[1].duration_since(pair[0]) >= REDRAW_CONFIG.active,
+            "two streaming frames bypassed the {:?} ceiling: {:?}",
+            REDRAW_CONFIG.active,
+            pair[1].duration_since(pair[0])
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn app_slow_frame_does_not_trigger_a_catch_up_burst() {
+    const EVENTS: usize = 80;
+    const SLOW_FRAME: Duration = Duration::from_millis(35);
+
+    let lifecycle = Arc::new(FakeLifecycle::default());
+    lifecycle.enter().expect("fake terminal enters");
+    let engine_events = Arc::new(AtomicUsize::new(0));
+    let root = EventRecorder {
+        terminal_events: Arc::new(AtomicUsize::new(0)),
+        engine_events: Arc::clone(&engine_events),
+    };
+    let (target, screen) = SharedTestTarget::with_draw_delay(10, 2, SLOW_FRAME);
+    let (terminal_tx, terminal_rx) = terminal_event_channel();
+    let (engine_tx, engine_rx) = mpsc::channel(ENGINE_EVENT_CHANNEL_CAPACITY);
+    let (app, _owner) = App::new(
+        Box::new(root),
+        Box::new(target),
+        Arc::clone(&lifecycle) as Arc<_>,
+        terminal_rx,
+        engine_rx,
+    );
+    let mut app = app.with_redraw_config(REDRAW_CONFIG);
+    let task = tokio::spawn(async move { app.run().await });
+    let burst_tx = engine_tx.clone();
+    let producer = tokio::spawn(async move {
+        for index in 0..EVENTS {
+            burst_tx
+                .send(TurnEvent::TurnStarted {
+                    session_id: format!("ses_slow_{index}"),
+                })
+                .await
+                .expect("engine event channel is open");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+
+    producer.await.expect("the burst producer does not panic");
+    wait_until(|| engine_events.load(Ordering::SeqCst) == EVENTS).await;
+    wait_until(|| locked(&screen).draw_started.len() >= 4).await;
+    let draw_started = locked(&screen).draw_started.clone();
+
+    terminal_tx
+        .send(TerminalEvent::Shutdown)
+        .await
+        .expect("terminal event channel is open");
+    task.await
+        .expect("the event loop task does not panic")
+        .expect("the event loop exits cleanly");
+    let minimum_gap = draw_started[1..]
+        .windows(2)
+        .map(|pair| pair[1].duration_since(pair[0]))
+        .min()
+        .expect("the fixture produced multiple scheduled frames");
+    eprintln!("slow-frame cadence: frame_cost={SLOW_FRAME:?}, minimum_start_gap={minimum_gap:?}");
+    for pair in draw_started[1..].windows(2) {
+        let gap = pair[1].duration_since(pair[0]);
+        assert!(
+            gap >= SLOW_FRAME + REDRAW_CONFIG.active - Duration::from_millis(2),
+            "a {:?} frame was followed after {gap:?}; missed ticks were replayed",
+            SLOW_FRAME
+        );
+    }
+}
+
+#[tokio::test]
+async fn app_keystrokes_draw_immediately_instead_of_waiting_for_the_stream_cadence() {
+    const SAMPLES: usize = 25;
+    let input_budget = Duration::from_millis(50);
+    let config = RedrawConfig {
+        active: Duration::from_millis(100),
+        ..TEST_REDRAW_CONFIG
+    };
+    let lifecycle = Arc::new(FakeLifecycle::default());
+    lifecycle.enter().expect("fake terminal enters");
+    let terminal_events = Arc::new(AtomicUsize::new(0));
+    let engine_events = Arc::new(AtomicUsize::new(0));
+    let root = EventRecorder {
+        terminal_events: Arc::clone(&terminal_events),
+        engine_events: Arc::clone(&engine_events),
+    };
+    let (target, screen) = SharedTestTarget::new(10, 2);
+    let (terminal_tx, terminal_rx) = terminal_event_channel();
+    let (engine_tx, engine_rx) = mpsc::channel(1);
+    let (app, _owner) = App::new(
+        Box::new(root),
+        Box::new(target),
+        Arc::clone(&lifecycle) as Arc<_>,
+        terminal_rx,
+        engine_rx,
+    );
+    let mut app = app.with_redraw_config(config);
+    let task = tokio::spawn(async move { app.run().await });
+    wait_until(|| locked(&screen).draws == 1).await;
+    engine_tx
+        .send(TurnEvent::TurnStarted {
+            session_id: "ses_typing".to_owned(),
+        })
+        .await
+        .expect("engine event channel is open");
+    wait_until(|| engine_events.load(Ordering::SeqCst) == 1).await;
+
+    let mut latencies = Vec::with_capacity(SAMPLES);
+    for sample in 1..=SAMPLES {
+        let draws_before = locked(&screen).draws;
+        let started = Instant::now();
+        terminal_tx
+            .send(TerminalEvent::Input(CrosstermEvent::FocusGained))
+            .await
+            .expect("terminal event channel is open");
+        wait_until_within(input_budget, || {
+            terminal_events.load(Ordering::SeqCst) == sample
+                && locked(&screen).draws == draws_before + 1
+        })
+        .await;
+        latencies.push(started.elapsed());
+    }
+    latencies.sort_unstable();
+    let p50 = latencies[SAMPLES / 2];
+    let p95 = latencies[(SAMPLES * 95).div_ceil(100) - 1];
+
+    terminal_tx
+        .send(TerminalEvent::Shutdown)
+        .await
+        .expect("terminal event channel is open");
+    task.await
+        .expect("the event loop task does not panic")
+        .expect("the event loop exits cleanly");
+    eprintln!("keystroke latency over {SAMPLES} samples: p50={p50:?}, p95={p95:?}");
+    assert!(p95 < input_budget, "p50={p50:?}, p95={p95:?}");
+    assert!(
+        p95 < config.active,
+        "keystrokes waited for the streaming cadence: p95={p95:?}"
+    );
+}
+
+#[tokio::test]
+async fn app_idle_schedule_backs_off_and_activity_wakes_it() {
+    let now = TokioInstant::now();
+    let mut schedule = RedrawSchedule::new(REDRAW_CONFIG, now);
+    assert_eq!(schedule.cadence(), REDRAW_CONFIG.idle);
+    assert_eq!(
+        schedule.missed_tick_behavior(),
+        MissedTickBehavior::Skip,
+        "slow frames must skip stale deadlines instead of replaying them"
+    );
+
+    schedule.refresh(now + REDRAW_CONFIG.deep_idle_after);
+    assert_eq!(schedule.cadence(), REDRAW_CONFIG.deep_idle);
+
+    let activity = now + REDRAW_CONFIG.deep_idle_after + Duration::from_millis(1);
+    schedule.record_terminal_activity(activity);
+    assert_eq!(schedule.cadence(), REDRAW_CONFIG.idle);
+    schedule.record_engine_activity(
+        &TurnEvent::TurnStarted {
+            session_id: "ses_awake".to_owned(),
+        },
+        activity,
+    );
+    assert_eq!(schedule.cadence(), REDRAW_CONFIG.active);
+}
+
+#[tokio::test]
+async fn app_deep_idle_wakes_at_the_idle_tier_when_new_work_arrives() {
+    let config = RedrawConfig {
+        deep_idle_after: Duration::from_millis(60),
+        ..REDRAW_CONFIG
+    };
+    let lifecycle = Arc::new(FakeLifecycle::default());
+    lifecycle.enter().expect("fake terminal enters");
+    let engine_events = Arc::new(AtomicUsize::new(0));
+    let root = EventRecorder {
+        terminal_events: Arc::new(AtomicUsize::new(0)),
+        engine_events: Arc::clone(&engine_events),
+    };
+    let (target, screen) = SharedTestTarget::new(10, 2);
+    let (terminal_tx, terminal_rx) = terminal_event_channel();
+    let (engine_tx, engine_rx) = mpsc::channel(1);
+    let (app, _owner) = App::new(
+        Box::new(root),
+        Box::new(target),
+        Arc::clone(&lifecycle) as Arc<_>,
+        terminal_rx,
+        engine_rx,
+    );
+    let mut app = app.with_redraw_config(config);
+    let task = tokio::spawn(async move { app.run().await });
+    wait_until(|| locked(&screen).draws == 1).await;
+    tokio::time::sleep(config.deep_idle_after + config.idle).await;
+
+    let activity_started = Instant::now();
+    engine_tx
+        .send(TurnEvent::TurnCompleted {
+            assistant_message_id: "msg_idle_wake".to_owned(),
+            steps: 1,
+        })
+        .await
+        .expect("engine event channel is open");
+    wait_until(|| engine_events.load(Ordering::SeqCst) == 1).await;
+    tokio::time::sleep(config.idle / 2).await;
+    assert_eq!(
+        locked(&screen).draws,
+        1,
+        "idle work must back off instead of drawing as an active stream"
+    );
+    wait_until_within(config.idle * 2, || locked(&screen).draws == 2).await;
+    let idle_wake_latency = activity_started.elapsed();
+
+    terminal_tx
+        .send(TerminalEvent::Shutdown)
+        .await
+        .expect("terminal event channel is open");
+    task.await
+        .expect("the event loop task does not panic")
+        .expect("the event loop exits cleanly");
+    eprintln!(
+        "deep-idle activity wake: idle_tier={:?}, deep_tier={:?}, frame_latency={idle_wake_latency:?}",
+        config.idle, config.deep_idle
+    );
+}
+
+#[tokio::test]
+async fn app_dirty_timer_never_draws_while_a_terminal_lease_is_held() {
+    let config = RedrawConfig {
+        active: Duration::from_millis(40),
+        ..TEST_REDRAW_CONFIG
+    };
+    let lifecycle = Arc::new(FakeLifecycle::default());
+    lifecycle.enter().expect("fake terminal enters");
+    let engine_events = Arc::new(AtomicUsize::new(0));
+    let root = EventRecorder {
+        terminal_events: Arc::new(AtomicUsize::new(0)),
+        engine_events: Arc::clone(&engine_events),
+    };
+    let (target, screen) = SharedTestTarget::new(10, 2);
+    let (terminal_tx, terminal_rx) = terminal_event_channel();
+    let (engine_tx, engine_rx) = mpsc::channel(1);
+    let (app, owner) = App::new(
+        Box::new(root),
+        Box::new(target),
+        Arc::clone(&lifecycle) as Arc<_>,
+        terminal_rx,
+        engine_rx,
+    );
+    let mut app = app.with_redraw_config(config);
+    let task = tokio::spawn(async move { app.run().await });
+    wait_until(|| locked(&screen).draws == 1).await;
+    engine_tx
+        .send(TurnEvent::TurnStarted {
+            session_id: "ses_dirty_lease".to_owned(),
+        })
+        .await
+        .expect("engine event channel is open");
+    wait_until(|| engine_events.load(Ordering::SeqCst) == 1).await;
+    let lease = owner
+        .broker_with_timeout(Duration::from_secs(3_600))
+        .acquire(LeaseReason::new("tui", "external editor"))
+        .await
+        .expect("the TUI yields before the dirty deadline");
+
+    tokio::time::sleep(config.active * 2).await;
+    assert_eq!(
+        locked(&screen).draws,
+        1,
+        "a timer wrote to the TTY while the external editor owned it"
+    );
+
+    lease.release();
+    terminal_tx
+        .send(TerminalEvent::Shutdown)
+        .await
+        .expect("terminal event channel is open");
+    task.await
+        .expect("the event loop task does not panic")
+        .expect("the event loop exits cleanly");
+}
+
+#[tokio::test]
 async fn app_event_loop_defers_engine_rendering_while_a_lease_owns_the_tty() {
     let lifecycle = Arc::new(FakeLifecycle::default());
     lifecycle.enter().expect("fake terminal enters");
@@ -554,6 +1220,7 @@ async fn app_event_loop_defers_engine_rendering_while_a_lease_owns_the_tty() {
 
     lease.release();
     wait_until(|| engine_events.load(Ordering::SeqCst) == 1).await;
+    wait_until(|| locked(&screen).draws == 3).await;
     assert_eq!(
         locked(&screen).draws,
         3,
@@ -566,6 +1233,121 @@ async fn app_event_loop_defers_engine_rendering_while_a_lease_owns_the_tty() {
     task.await
         .expect("the event loop task does not panic")
         .expect("the event loop exits cleanly");
+}
+
+#[tokio::test]
+async fn app_discards_terminal_input_that_was_buffered_at_the_lease_boundary() {
+    let lifecycle = Arc::new(FakeLifecycle::default());
+    lifecycle.enter().expect("fake terminal enters");
+    let terminal_events = Arc::new(AtomicUsize::new(0));
+    let root = EventRecorder {
+        terminal_events: Arc::clone(&terminal_events),
+        engine_events: Arc::new(AtomicUsize::new(0)),
+    };
+    let (target, _screen) = SharedTestTarget::new(10, 2);
+    let (terminal_tx, terminal_rx) = terminal_event_channel();
+    let (_engine_tx, engine_rx) = mpsc::channel(1);
+    let (mut app, owner) = App::new(
+        Box::new(root),
+        Box::new(target),
+        Arc::clone(&lifecycle) as Arc<_>,
+        terminal_rx,
+        engine_rx,
+    );
+    let input = RecordingInput::new([CrosstermEvent::FocusGained]);
+    let producer = tokio::spawn(forward_terminal_input_from(
+        Arc::clone(&input) as Arc<_>,
+        terminal_tx.clone(),
+        owner.input_control(),
+    ));
+    wait_until(|| input.reads.load(Ordering::SeqCst) == 1).await;
+    let broker = Arc::new(owner.broker_with_timeout(Duration::from_secs(3_600)));
+    let lease_task = tokio::spawn({
+        let broker = Arc::clone(&broker);
+        async move {
+            broker
+                .acquire(LeaseReason::new("tui", "external editor"))
+                .await
+        }
+    });
+    wait_until(|| owner.suspended.load(Ordering::SeqCst)).await;
+    let task = tokio::spawn(async move { app.run().await });
+    let lease = lease_task
+        .await
+        .expect("the lease task does not panic")
+        .expect("the producer confirms its pause");
+
+    lease.release();
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(
+        terminal_events.load(Ordering::SeqCst),
+        0,
+        "input read for the old TUI ownership epoch must not execute after the editor returns"
+    );
+    terminal_tx
+        .send(TerminalEvent::Shutdown)
+        .await
+        .expect("terminal event channel is open");
+    task.await
+        .expect("the event loop task does not panic")
+        .expect("the event loop exits cleanly");
+    producer
+        .await
+        .expect("the input producer exits after its consumer");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn app_input_producer_performs_no_reads_while_a_lease_is_held() {
+    let lifecycle = Arc::new(FakeLifecycle::default());
+    lifecycle.enter().expect("fake terminal enters");
+    let (target, screen) = SharedTestTarget::new(10, 2);
+    let (terminal_tx, terminal_rx) = terminal_event_channel();
+    let (_engine_tx, engine_rx) = mpsc::channel(1);
+    let (mut app, owner) = App::new(
+        Box::new(Label("ready")),
+        Box::new(target),
+        Arc::clone(&lifecycle) as Arc<_>,
+        terminal_rx,
+        engine_rx,
+    );
+    let task = tokio::spawn(async move { app.run().await });
+    wait_until(|| locked(&screen).draws == 1).await;
+    let input = RecordingInput::new([]);
+    let producer = tokio::spawn(forward_terminal_input_from(
+        Arc::clone(&input) as Arc<_>,
+        terminal_tx.clone(),
+        owner.input_control(),
+    ));
+    wait_until(|| input.polls.load(Ordering::SeqCst) > 0).await;
+    let lease = owner
+        .broker_with_timeout(Duration::from_secs(3_600))
+        .acquire(LeaseReason::new("kiro", "device-code prompt"))
+        .await
+        .expect("the producer acknowledges that it stopped reading");
+    let polls_while_paused = input.polls.load(Ordering::SeqCst);
+
+    tokio::time::sleep(INPUT_POLL_INTERVAL * 2).await;
+
+    assert_eq!(
+        input.polls.load(Ordering::SeqCst),
+        polls_while_paused,
+        "the parent entered another terminal poll while the lease holder owned stdin"
+    );
+    lease.release();
+    wait_until(|| input.polls.load(Ordering::SeqCst) > polls_while_paused).await;
+    terminal_tx
+        .send(TerminalEvent::Shutdown)
+        .await
+        .expect("terminal event channel is open");
+    task.await
+        .expect("the event loop task does not panic")
+        .expect("the event loop exits cleanly");
+    producer
+        .await
+        .expect("the input producer exits after its consumer");
 }
 
 #[test]
@@ -585,7 +1367,10 @@ async fn app_the_input_producer_returns_once_its_consumer_is_gone() {
     // aborted would keep a blocking thread alive across a clean exit. One poll
     // interval is the whole budget.
     let (sender, receiver) = terminal_event_channel();
-    let producer = tokio::spawn(forward_terminal_input(sender));
+    let producer = tokio::spawn(forward_terminal_input(
+        sender,
+        Arc::new(TerminalInputControl::new()),
+    ));
     drop(receiver);
 
     tokio::time::timeout(INPUT_POLL_INTERVAL * 4, producer)

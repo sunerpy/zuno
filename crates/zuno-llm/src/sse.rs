@@ -16,6 +16,12 @@ use zuno_error::ProviderError;
 /// Environment override for the maximum gap between streamed chunks.
 pub const STREAM_IDLE_TIMEOUT_ENV: &str = "ZUNO_STREAM_IDLE_TIMEOUT_SECS";
 
+/// Environment override for the maximum wire bytes in one SSE event.
+pub const STREAM_MAX_EVENT_BYTES_ENV: &str = "ZUNO_STREAM_MAX_EVENT_BYTES";
+
+/// Environment override for the maximum accumulated JSON bytes in one tool call.
+pub const STREAM_MAX_TOOL_INPUT_BYTES_ENV: &str = "ZUNO_STREAM_MAX_TOOL_INPUT_BYTES";
+
 /// Longest user-visible wait budget for one provider recovery sequence.
 ///
 /// Compatible transports also cap one silent response window at this value. The
@@ -26,6 +32,82 @@ pub const MAX_PROVIDER_WAIT: Duration = Duration::from_secs(180);
 
 /// Default idle allowance for reasoning models that may pause before emitting.
 pub const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 300;
+
+/// Default maximum wire bytes in one SSE event.
+///
+/// The local tool-output gate is 51,200 bytes
+/// (`crates/zuno-tool/src/output.rs:29-32`), while the reference implementation's
+/// limit is 524,288 characters (`.omo/plans/memory-perf-optimization.md` §3.2).
+/// A real event may contain a long code block or an escaped large tool argument,
+/// so 8 MiB leaves more than 16x the larger reference allowance without making a
+/// missing SSE delimiter an unbounded allocation.
+pub const DEFAULT_MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Default maximum accumulated JSON bytes in one tool call.
+///
+/// Four MiB is over 80x the local 51,200-byte tool-output gate and 8x the
+/// reference implementation's 524,288-character gate cited above. That is ample
+/// for a legitimate large patch or source payload while bounding JSON fragments
+/// spread across many individually valid SSE events.
+pub const DEFAULT_MAX_TOOL_INPUT_BYTES: usize = 4 * 1024 * 1024;
+
+const SSE_DECODE_CHUNK_BYTES: usize = 8 * 1024;
+
+/// Size limits resolved once for a provider stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamLimits {
+    max_event_bytes: usize,
+    max_tool_input_bytes: usize,
+}
+
+impl StreamLimits {
+    /// Creates explicit limits without consulting the environment.
+    #[must_use]
+    pub const fn new(max_event_bytes: usize, max_tool_input_bytes: usize) -> Self {
+        Self {
+            max_event_bytes,
+            max_tool_input_bytes,
+        }
+    }
+
+    /// Resolves both limits from the process environment.
+    ///
+    /// A positive integer wins. Missing, zero, malformed, or out-of-range values
+    /// retain the documented default for that limit independently.
+    #[must_use]
+    pub fn from_environment() -> Self {
+        Self {
+            max_event_bytes: resolve_stream_limit(
+                DEFAULT_MAX_EVENT_BYTES,
+                std::env::var(STREAM_MAX_EVENT_BYTES_ENV).ok().as_deref(),
+            ),
+            max_tool_input_bytes: resolve_stream_limit(
+                DEFAULT_MAX_TOOL_INPUT_BYTES,
+                std::env::var(STREAM_MAX_TOOL_INPUT_BYTES_ENV)
+                    .ok()
+                    .as_deref(),
+            ),
+        }
+    }
+
+    /// Maximum wire bytes accepted for one SSE event, inclusive.
+    #[must_use]
+    pub const fn max_event_bytes(self) -> usize {
+        self.max_event_bytes
+    }
+
+    /// Maximum UTF-8 bytes accepted for one tool input, inclusive.
+    #[must_use]
+    pub const fn max_tool_input_bytes(self) -> usize {
+        self.max_tool_input_bytes
+    }
+}
+
+impl Default for StreamLimits {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_EVENT_BYTES, DEFAULT_MAX_TOOL_INPUT_BYTES)
+    }
+}
 
 /// Incrementally decodes UTF-8 without treating a network chunk as a text unit.
 #[derive(Debug, Default)]
@@ -96,6 +178,10 @@ impl Utf8StreamDecoder {
     pub fn has_pending_bytes(&self) -> bool {
         !self.pending.is_empty()
     }
+
+    fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
 }
 
 /// One decoded server-sent event.
@@ -130,50 +216,181 @@ impl SseEvent {
 }
 
 /// Incremental parser shared by all text/event-stream provider transports.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SseParser {
     decoder: Utf8StreamDecoder,
     buffer: String,
+    provider: String,
+    stream: String,
+    limits: StreamLimits,
+    failed: bool,
 }
 
 impl SseParser {
-    /// Creates an empty parser.
+    /// Creates an empty parser with default limits and generic test context.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self::for_stream("shared-sse", "unattributed")
+    }
+
+    /// Creates a parser for one provider/model stream using environment limits.
+    #[must_use]
+    pub fn for_stream(provider: impl Into<String>, stream: impl Into<String>) -> Self {
+        Self::with_limits(provider, stream, StreamLimits::from_environment())
+    }
+
+    /// Creates a parser with explicit context and limits.
+    #[must_use]
+    pub fn with_limits(
+        provider: impl Into<String>,
+        stream: impl Into<String>,
+        limits: StreamLimits,
+    ) -> Self {
+        Self {
+            decoder: Utf8StreamDecoder::new(),
+            buffer: String::new(),
+            provider: provider.into(),
+            stream: stream.into(),
+            limits,
+            failed: false,
+        }
+    }
+
+    /// The limits frozen when this stream was created.
+    #[must_use]
+    pub const fn limits(&self) -> StreamLimits {
+        self.limits
     }
 
     /// Accepts one raw network chunk and returns every complete SSE event in it.
     ///
     /// Both LF and CRLF blank-line separators are accepted, including separators
     /// and UTF-8 code points split across calls.
-    pub fn push(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
-        self.buffer.push_str(&self.decoder.decode(chunk));
-        self.take_complete_events()
-    }
-
-    /// Ends the stream and emits a final frame even when it has no blank line.
-    pub fn finish(&mut self) -> Vec<SseEvent> {
-        self.buffer.push_str(&self.decoder.finish());
-        let mut events = self.take_complete_events();
-        let trailing = std::mem::take(&mut self.buffer);
-        if let Some(event) = parse_frame(&trailing) {
-            events.push(event);
+    pub fn push(&mut self, chunk: &[u8]) -> Vec<Result<SseEvent, ProviderError>> {
+        if self.failed {
+            return Vec::new();
         }
-        events
-    }
 
-    fn take_complete_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
-        while let Some((position, separator_len)) = next_separator(&self.buffer) {
-            let frame = self.buffer[..position].to_owned();
-            self.buffer.drain(..position + separator_len);
-            if let Some(event) = parse_frame(&frame) {
-                events.push(event);
+        for bytes in chunk.chunks(SSE_DECODE_CHUNK_BYTES) {
+            self.buffer.push_str(&self.decoder.decode(bytes));
+            self.take_complete_events(&mut events);
+            if self.failed {
+                break;
+            }
+
+            let actual = incomplete_event_bytes(&self.buffer, self.decoder.pending_len());
+            if actual > self.limits.max_event_bytes {
+                let error = self.fail(StreamPayload::SseEvent, actual);
+                events.push(Err(error));
+                break;
             }
         }
         events
     }
+
+    /// Ends the stream and emits a final frame even when it has no blank line.
+    pub fn finish(&mut self) -> Vec<Result<SseEvent, ProviderError>> {
+        if self.failed {
+            return Vec::new();
+        }
+
+        let wire_bytes = self.buffer.len().saturating_add(self.decoder.pending_len());
+        if wire_bytes > self.limits.max_event_bytes {
+            return vec![Err(self.fail(StreamPayload::SseEvent, wire_bytes))];
+        }
+
+        self.buffer.push_str(&self.decoder.finish());
+        let mut events = Vec::new();
+        self.take_complete_events(&mut events);
+        if self.failed {
+            return events;
+        }
+        let trailing = std::mem::take(&mut self.buffer);
+        if let Some(event) = parse_frame(&trailing) {
+            events.push(Ok(event));
+        }
+        events
+    }
+
+    fn take_complete_events(&mut self, events: &mut Vec<Result<SseEvent, ProviderError>>) {
+        while let Some((position, separator_len)) = next_separator(&self.buffer) {
+            if position > self.limits.max_event_bytes {
+                let error = self.fail(StreamPayload::SseEvent, position);
+                events.push(Err(error));
+                return;
+            }
+            let frame = self.buffer[..position].to_owned();
+            self.buffer.drain(..position + separator_len);
+            if let Some(event) = parse_frame(&frame) {
+                events.push(Ok(event));
+            }
+        }
+    }
+
+    fn fail(&mut self, payload: StreamPayload, actual_bytes: usize) -> ProviderError {
+        self.failed = true;
+        self.buffer.clear();
+        self.decoder = Utf8StreamDecoder::new();
+        ProviderError::fatal(StreamLimitError {
+            provider: self.provider.clone(),
+            stream: self.stream.clone(),
+            payload,
+            actual_bytes,
+            limit_bytes: self.limits.max_event_bytes,
+        })
+    }
+}
+
+impl Default for SseParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Appends one tool-input fragment only when the complete JSON remains bounded.
+///
+/// The target is unchanged on error. This is intentionally refusal rather than
+/// truncation: a truncated JSON argument would fail later with unrelated syntax.
+///
+/// # Errors
+///
+/// Returns [`ProviderError::Fatal`] with the provider, stream, actual byte count,
+/// configured limit, and environment override when the append would exceed `limit`.
+pub fn append_tool_input(
+    target: &mut String,
+    fragment: &str,
+    provider: &str,
+    stream: &str,
+    limit: usize,
+) -> Result<(), ProviderError> {
+    let actual_bytes = target.len().saturating_add(fragment.len());
+    ensure_tool_input_size(actual_bytes, provider, stream, limit)?;
+    target.push_str(fragment);
+    Ok(())
+}
+
+/// Validates a complete tool-input string before it is retained.
+///
+/// # Errors
+///
+/// Returns [`ProviderError::Fatal`] when `actual_bytes` exceeds `limit`.
+pub fn ensure_tool_input_size(
+    actual_bytes: usize,
+    provider: &str,
+    stream: &str,
+    limit: usize,
+) -> Result<(), ProviderError> {
+    if actual_bytes <= limit {
+        return Ok(());
+    }
+    Err(ProviderError::fatal(StreamLimitError {
+        provider: provider.to_owned(),
+        stream: stream.to_owned(),
+        payload: StreamPayload::ToolInput,
+        actual_bytes,
+        limit_bytes: limit,
+    }))
 }
 
 /// Configured maximum time between two chunks from an SSE response.
@@ -246,6 +463,27 @@ fn resolve_idle_timeout(configured: Duration, environment: Option<&str>) -> Dura
         .unwrap_or(configured)
 }
 
+fn resolve_stream_limit(default: usize, environment: Option<&str>) -> usize {
+    environment
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(default)
+}
+
+fn incomplete_event_bytes(buffer: &str, pending_utf8_bytes: usize) -> usize {
+    buffer
+        .len()
+        .saturating_sub(possible_separator_prefix_len(buffer.as_bytes()))
+        .saturating_add(pending_utf8_bytes)
+}
+
+fn possible_separator_prefix_len(bytes: &[u8]) -> usize {
+    [b"\r\n\r".as_slice(), b"\r\n", b"\r", b"\n"]
+        .into_iter()
+        .find(|prefix| bytes.ends_with(prefix))
+        .map_or(0, <[u8]>::len)
+}
+
 fn next_separator(buffer: &str) -> Option<(usize, usize)> {
     let lf = buffer.find("\n\n").map(|position| (position, 2));
     let crlf = buffer.find("\r\n\r\n").map(|position| (position, 4));
@@ -283,6 +521,54 @@ fn parse_frame(frame: &str) -> Option<SseEvent> {
         data: data.join("\n"),
     })
 }
+
+#[derive(Debug, Clone, Copy)]
+enum StreamPayload {
+    SseEvent,
+    ToolInput,
+}
+
+impl StreamPayload {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::SseEvent => "SSE event",
+            Self::ToolInput => "tool input_json",
+        }
+    }
+
+    const fn environment(self) -> &'static str {
+        match self {
+            Self::SseEvent => STREAM_MAX_EVENT_BYTES_ENV,
+            Self::ToolInput => STREAM_MAX_TOOL_INPUT_BYTES_ENV,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct StreamLimitError {
+    provider: String,
+    stream: String,
+    payload: StreamPayload,
+    actual_bytes: usize,
+    limit_bytes: usize,
+}
+
+impl fmt::Display for StreamLimitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} from provider `{}` stream `{}` reached {} bytes, exceeding limit {} bytes; raise {} only for a provider that legitimately emits larger payloads",
+            self.payload.label(),
+            self.provider,
+            self.stream,
+            self.actual_bytes,
+            self.limit_bytes,
+            self.payload.environment()
+        )
+    }
+}
+
+impl StdError for StreamLimitError {}
 
 #[derive(Debug)]
 struct SseJsonError {
@@ -348,6 +634,14 @@ mod tests {
                 resolve_idle_timeout(Duration::from_secs(300), value),
                 Duration::from_secs(300)
             );
+        }
+    }
+
+    #[test]
+    fn stream_size_environment_values_must_be_positive_integers() {
+        assert_eq!(resolve_stream_limit(17, Some("23")), 23);
+        for value in [None, Some(""), Some("unlimited"), Some("0")] {
+            assert_eq!(resolve_stream_limit(17, value), 17);
         }
     }
 }

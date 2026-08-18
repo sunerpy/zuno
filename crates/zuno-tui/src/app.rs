@@ -9,12 +9,17 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::io::{self, Stdout};
 use std::panic::{self, PanicHookInfo};
+#[cfg(test)]
+use std::sync::Barrier;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event as CrosstermEvent,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -23,7 +28,8 @@ use ratatui::backend::{CrosstermBackend, TestBackend};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::{Frame, Terminal};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
+use tokio::time::{Instant as TokioInstant, Interval, MissedTickBehavior};
 use zuno_engine::r#loop::{TURN_EVENT_CHANNEL_CAPACITY, TurnEvent};
 use zuno_engine::terminal_lease::{
     DEFAULT_LEASE_TIMEOUT, LeaseReason, ReclaimCause, TerminalBroker, TerminalOwner,
@@ -34,6 +40,115 @@ pub const TERMINAL_EVENT_CHANNEL_CAPACITY: usize = 64;
 
 /// Capacity expected of the engine event stream consumed by [`App`].
 pub const ENGINE_EVENT_CHANNEL_CAPACITY: usize = TURN_EVENT_CHANNEL_CAPACITY;
+
+// The plan's 60 FPS starting point caps streaming redraws at one frame every
+// 16.67 ms. On this project, 32 queued events fell from 32 frames to 1, while 120
+// paced events produced 15 frames; five 25-keystroke runs retained median
+// p50=8.572 us / p95=19.848 us because input bypasses this ceiling.
+const ACTIVE_REDRAW_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
+// The plan's 250 ms idle starting point drops timer wakeups from 60/s to 4/s once
+// a turn ends. This project's deep-idle wake fixture measured 250.199 ms from a
+// new idle event to its frame, matching the intended quarter-second backoff.
+const IDLE_REDRAW_INTERVAL: Duration = Duration::from_millis(250);
+// The plan's 30 s starting point avoids treating short pauses as deep idle. This
+// project's deterministic schedule fixture crosses at exactly 30 s and verifies
+// that terminal or engine activity immediately resets the tier.
+const DEEP_IDLE_AFTER: Duration = Duration::from_secs(30);
+// The plan's 5 s deep-idle starting point cuts an inactive loop from 4 timer wakeups/s
+// to 0.2/s. This project has no decorative animation; its wake fixture entered the
+// 5 s tier, then activity selected the measured 250.199 ms idle frame instead.
+const DEEP_IDLE_REDRAW_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy)]
+struct RedrawConfig {
+    active: Duration,
+    idle: Duration,
+    deep_idle_after: Duration,
+    deep_idle: Duration,
+}
+
+const REDRAW_CONFIG: RedrawConfig = RedrawConfig {
+    active: ACTIVE_REDRAW_INTERVAL,
+    idle: IDLE_REDRAW_INTERVAL,
+    deep_idle_after: DEEP_IDLE_AFTER,
+    deep_idle: DEEP_IDLE_REDRAW_INTERVAL,
+};
+
+struct RedrawSchedule {
+    config: RedrawConfig,
+    interval: Interval,
+    cadence: Duration,
+    last_activity: TokioInstant,
+    turn_active: bool,
+}
+
+impl RedrawSchedule {
+    fn new(config: RedrawConfig, now: TokioInstant) -> Self {
+        let cadence = config.idle;
+        Self {
+            config,
+            interval: redraw_interval(now, cadence),
+            cadence,
+            last_activity: now,
+            turn_active: false,
+        }
+    }
+
+    async fn tick(&mut self) {
+        self.interval.tick().await;
+        self.refresh(TokioInstant::now());
+    }
+
+    fn record_terminal_activity(&mut self, now: TokioInstant) {
+        self.last_activity = now;
+        self.refresh(now);
+    }
+
+    fn record_engine_activity(&mut self, event: &TurnEvent, now: TokioInstant) {
+        self.last_activity = now;
+        self.turn_active = !matches!(
+            event,
+            TurnEvent::TurnCompleted { .. } | TurnEvent::TurnInterrupted { .. }
+        );
+        self.refresh(now);
+    }
+
+    fn refresh(&mut self, now: TokioInstant) {
+        let cadence = if self.turn_active {
+            self.config.active
+        } else if now.duration_since(self.last_activity) >= self.config.deep_idle_after {
+            self.config.deep_idle
+        } else {
+            self.config.idle
+        };
+        if cadence != self.cadence {
+            self.cadence = cadence;
+            self.interval = redraw_interval(now, cadence);
+        }
+    }
+
+    fn frame_drawn(&mut self, now: TokioInstant) {
+        self.interval = redraw_interval(now, self.cadence);
+    }
+
+    #[cfg(test)]
+    const fn cadence(&self) -> Duration {
+        self.cadence
+    }
+
+    #[cfg(test)]
+    fn missed_tick_behavior(&self) -> MissedTickBehavior {
+        self.interval.missed_tick_behavior()
+    }
+}
+
+fn redraw_interval(now: TokioInstant, cadence: Duration) -> Interval {
+    let mut interval = tokio::time::interval_at(now + cadence, cadence);
+    // A slow full frame can miss several deadlines. Replaying those deadlines would
+    // render the same newest state repeatedly and can trap the UI in a catch-up loop.
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    interval
+}
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -54,6 +169,12 @@ pub enum TerminalEvent {
     /// say "look again". Carrying no payload is deliberate — a wake that described
     /// the change would be a second, racing copy of the state it announces.
     Wake,
+    /// The physical input producer reached a pause barrier.
+    ///
+    /// Internal to the event loop. Its position in the bounded FIFO proves that every
+    /// input event read before this barrier has been consumed and discarded before a
+    /// terminal lease is granted.
+    InputPaused(u64),
     /// Stop the render loop after components observe the shutdown.
     Shutdown,
 }
@@ -202,6 +323,51 @@ impl CrosstermLifecycle {
     }
 }
 
+/// Write the escape sequences that put a terminal into the TUI.
+///
+/// Split out from [`CrosstermLifecycle::enter`] so the sequences are assertable
+/// without a TTY: `enable_raw_mode` is a terminal-attribute call with nothing to
+/// observe, while these are bytes a test can collect into a vector.
+///
+/// Bracketed paste is the one whose absence is invisible until somebody pastes.
+/// Without it a multi-line paste arrives as individual key events, every newline
+/// resolves to `input_submit`, and an eight-line paste starts eight turns — which is
+/// exactly what a real terminal did, filling the transcript with
+/// `not sent: a turn is already running`.
+fn enter_terminal(output: &mut impl io::Write, mouse_capture: bool) -> io::Result<()> {
+    execute!(output, EnterAlternateScreen)?;
+    // Each step unwinds only the steps before it, so a partial failure never leaves
+    // the terminal in a mode the paired teardown will not reach.
+    if let Err(error) = execute!(output, EnableBracketedPaste) {
+        let _ = execute!(output, LeaveAlternateScreen);
+        return Err(error);
+    }
+    if mouse_capture && let Err(error) = execute!(output, EnableMouseCapture) {
+        let _ = execute!(output, DisableBracketedPaste);
+        let _ = execute!(output, LeaveAlternateScreen);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Undo [`enter_terminal`], reporting the first failure but running every step.
+///
+/// A readable cooked terminal matters more than returning early, which is why none of
+/// these are `?`. Every mode enabled above is disabled here: a terminal left in
+/// bracketed-paste mode wraps every later paste *in the user's shell* with
+/// `\e[200~`/`\e[201~`, which the shell then shows literally — a visible bug in a
+/// program the user has already exited.
+fn restore_terminal(output: &mut impl io::Write, mouse_capture: bool) -> Option<io::Error> {
+    let mut first_error = execute!(output, LeaveAlternateScreen).err();
+    if let Err(error) = execute!(output, DisableBracketedPaste) {
+        first_error.get_or_insert(error);
+    }
+    if mouse_capture && let Err(error) = execute!(output, DisableMouseCapture) {
+        first_error.get_or_insert(error);
+    }
+    first_error
+}
+
 impl TerminalLifecycle for CrosstermLifecycle {
     fn enter(&self) -> io::Result<()> {
         let _operation = locked(&self.operation);
@@ -210,15 +376,7 @@ impl TerminalLifecycle for CrosstermLifecycle {
         }
 
         enable_raw_mode()?;
-        let mut output = io::stdout();
-        if let Err(error) = execute!(output, EnterAlternateScreen) {
-            let _ = disable_raw_mode();
-            return Err(error);
-        }
-        if self.mouse_capture
-            && let Err(error) = execute!(output, EnableMouseCapture)
-        {
-            let _ = execute!(output, LeaveAlternateScreen);
+        if let Err(error) = enter_terminal(&mut io::stdout(), self.mouse_capture) {
             let _ = disable_raw_mode();
             return Err(error);
         }
@@ -232,15 +390,7 @@ impl TerminalLifecycle for CrosstermLifecycle {
             return Ok(());
         }
 
-        // Run every restoration step even if an earlier write fails. A readable
-        // cooked terminal is more important than returning the first error early.
-        let mut output = io::stdout();
-        let mut first_error = execute!(output, LeaveAlternateScreen).err();
-        if self.mouse_capture
-            && let Err(error) = execute!(output, DisableMouseCapture)
-        {
-            first_error.get_or_insert(error);
-        }
+        let mut first_error = restore_terminal(&mut io::stdout(), self.mouse_capture);
         if let Err(error) = disable_raw_mode() {
             first_error.get_or_insert(error);
         }
@@ -425,8 +575,12 @@ pub struct TerminalLeaseOwner {
     lifecycle: Arc<dyn TerminalLifecycle>,
     ui: Arc<Mutex<UiState>>,
     suspended: AtomicBool,
+    input: Arc<TerminalInputControl>,
+    yielded_pause: Mutex<Option<u64>>,
     wake: Arc<Notify>,
     diagnostics: Mutex<Vec<TerminalDiagnostic>>,
+    #[cfg(test)]
+    reclaim_resume_probe: Mutex<Option<Arc<ReclaimResumeProbe>>>,
 }
 
 impl TerminalLeaseOwner {
@@ -449,6 +603,25 @@ impl TerminalLeaseOwner {
         locked(&self.diagnostics).clone()
     }
 
+    /// The pause controller the one physical input producer must use.
+    #[must_use]
+    pub fn input_control(&self) -> Arc<TerminalInputControl> {
+        Arc::clone(&self.input)
+    }
+
+    #[cfg(test)]
+    fn probe_reclaim_resume(&self, probe: Arc<ReclaimResumeProbe>) {
+        *locked(&self.reclaim_resume_probe) = Some(probe);
+    }
+
+    #[cfg(test)]
+    fn stop_before_resume_if_probed(&self) {
+        let probe = locked(&self.reclaim_resume_probe).take();
+        if let Some(probe) = probe {
+            probe.stop_before_resume();
+        }
+    }
+
     fn surface(&self, diagnostic: TerminalDiagnostic) {
         eprintln!("{}", diagnostic.message);
         locked(&self.diagnostics).push(diagnostic);
@@ -465,23 +638,51 @@ impl TerminalOwner for TerminalLeaseOwner {
             return Err("the TUI terminal is already yielded".to_owned());
         }
 
-        // Wait for any in-progress component handler or frame to finish. Once the
-        // atomic is set, the loop will retain a concurrently received input event
-        // rather than dispatching it while the child owns stdin.
+        // Setting `suspended` stops dispatch first. The producer then finishes any
+        // in-flight bounded poll/read and places a FIFO barrier after every event it
+        // already sent. The loop acknowledges only after discarding through that
+        // barrier, so neither an active reader nor a stale key can cross the handoff.
+        let pause = self.input.request_pause();
+        self.wake.notify_one();
+        if let Err(error) = self.input.wait_for_pause(pause).await {
+            self.suspended.store(false, Ordering::SeqCst);
+            self.input.resume(pause);
+            self.wake.notify_one();
+            return Err(format!(
+                "failed to pause terminal input before yielding for {reason}: {error}"
+            ));
+        }
+
+        // Wait for any in-progress component handler or frame to finish only after the
+        // reader is parked. Taking this lock before waiting for the producer would
+        // deadlock: the loop needs the same lock to drain and acknowledge the barrier.
         let ui = locked(&self.ui);
         if let Err(error) = self.lifecycle.restore() {
             drop(ui);
             self.suspended.store(false, Ordering::SeqCst);
+            self.input.resume(pause);
             self.wake.notify_one();
             return Err(format!(
                 "failed to yield the terminal for {reason}: {error}"
             ));
         }
+        let previous_pause = locked(&self.yielded_pause).replace(pause);
+        assert!(
+            previous_pause.is_none(),
+            "a granted terminal lease must reclaim its pause before another yield completes"
+        );
         drop(ui);
         Ok(())
     }
 
     fn reclaim_terminal(&self, reason: &LeaseReason, cause: ReclaimCause) {
+        // Move the granted lease's epoch into this reclaim before publishing
+        // `suspended = false`. A successor may request a newer epoch as soon as that
+        // value is visible; keeping the old epoch local makes it impossible for the
+        // successor to change which generation this reclaim resumes.
+        let pause = locked(&self.yielded_pause)
+            .take()
+            .expect("every granted terminal lease owns one pause epoch");
         if let ReclaimCause::Deadline(forced) = &cause {
             self.surface(TerminalDiagnostic {
                 reason: Some(reason.clone()),
@@ -504,8 +705,13 @@ impl TerminalOwner for TerminalLeaseOwner {
             }
         }
 
+        // Input resumes last. In particular, it cannot enter another `poll` until raw
+        // mode, alternate-screen state, clear and repaint have all completed.
         self.suspended.store(false, Ordering::SeqCst);
         self.wake.notify_one();
+        #[cfg(test)]
+        self.stop_before_resume_if_probed();
+        self.input.resume(pause);
         if let Some(message) = failed {
             self.surface(TerminalDiagnostic {
                 reason: Some(reason.clone()),
@@ -528,6 +734,209 @@ pub fn terminal_event_channel() -> (mpsc::Sender<TerminalEvent>, mpsc::Receiver<
 /// enough that an idle terminal is not a busy loop.
 pub const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Maximum time a lease acquisition waits for the live input producer to park.
+///
+/// A poll is bounded by [`INPUT_POLL_INTERVAL`], so four intervals allow a loaded
+/// blocking worker to return without turning a broken acknowledgement into a hang.
+pub const INPUT_PAUSE_TIMEOUT: Duration = Duration::from_millis(400);
+
+#[cfg(test)]
+struct ReclaimResumeProbe {
+    observed: Barrier,
+    proceed: Barrier,
+}
+
+#[cfg(test)]
+impl Default for ReclaimResumeProbe {
+    fn default() -> Self {
+        Self {
+            observed: Barrier::new(2),
+            proceed: Barrier::new(2),
+        }
+    }
+}
+
+#[cfg(test)]
+impl ReclaimResumeProbe {
+    fn stop_before_resume(&self) {
+        self.observed.wait();
+        self.proceed.wait();
+    }
+
+    fn wait_until_observed(&self) {
+        self.observed.wait();
+    }
+
+    fn allow_resume(&self) {
+        self.proceed.wait();
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct WaitRegistrationProbe {
+    observed: Notify,
+    proceed: Notify,
+}
+
+#[cfg(test)]
+impl WaitRegistrationProbe {
+    async fn wait_until_observed(&self) {
+        self.observed.notified().await;
+    }
+
+    fn allow_wait(&self) {
+        self.proceed.notify_one();
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct TerminalInputState {
+    requested: u64,
+    acknowledged: u64,
+    resumed: u64,
+    producer_attached: bool,
+    producer_seen: bool,
+}
+
+/// Coordinates the one physical TTY reader with terminal ownership transitions.
+pub struct TerminalInputControl {
+    // Epochs are retained state, not transient notifications. A `watch` receiver that
+    // observes an old value before `changed().await` still sees an intervening update,
+    // eliminating the check-then-register window that `Notify::notify_waiters` cannot fill.
+    state: watch::Sender<TerminalInputState>,
+    #[cfg(test)]
+    wait_registration_probe: Mutex<Option<Arc<WaitRegistrationProbe>>>,
+}
+
+impl TerminalInputControl {
+    fn new() -> Self {
+        Self {
+            state: watch::Sender::new(TerminalInputState::default()),
+            #[cfg(test)]
+            wait_registration_probe: Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn probe_wait_registration(&self, probe: Arc<WaitRegistrationProbe>) {
+        *locked(&self.wait_registration_probe) = Some(probe);
+    }
+
+    #[cfg(test)]
+    async fn stop_before_wait_if_probed(&self) {
+        let probe = locked(&self.wait_registration_probe).clone();
+        if let Some(probe) = probe {
+            probe.observed.notify_one();
+            probe.proceed.notified().await;
+        }
+    }
+
+    fn attach(self: &Arc<Self>) -> InputProducerGuard {
+        self.state.send_modify(|state| {
+            state.producer_seen = true;
+            state.producer_attached = true;
+        });
+        InputProducerGuard {
+            control: Arc::clone(self),
+        }
+    }
+
+    fn request_pause(&self) -> u64 {
+        let mut epoch = 0;
+        self.state.send_modify(|state| {
+            state.requested += 1;
+            epoch = state.requested;
+        });
+        epoch
+    }
+
+    async fn wait_for_pause(&self, epoch: u64) -> Result<(), &'static str> {
+        let mut state = self.state.subscribe();
+        tokio::time::timeout(INPUT_PAUSE_TIMEOUT, async {
+            loop {
+                let snapshot = *state.borrow_and_update();
+                if snapshot.acknowledged >= epoch {
+                    return Ok(());
+                }
+                if !snapshot.producer_attached {
+                    return if snapshot.producer_seen {
+                        Err("the input producer stopped before acknowledging the pause")
+                    } else {
+                        Ok(())
+                    };
+                }
+                #[cfg(test)]
+                self.stop_before_wait_if_probed().await;
+                if state.changed().await.is_err() {
+                    return Err("the input state channel closed before acknowledging the pause");
+                }
+            }
+        })
+        .await
+        .map_err(|_| "the input producer did not acknowledge the pause")?
+    }
+
+    fn acknowledge(&self, epoch: u64) {
+        self.state
+            .send_modify(|state| state.acknowledged = state.acknowledged.max(epoch));
+    }
+
+    fn resume(&self, epoch: u64) {
+        self.state
+            .send_modify(|state| state.resumed = state.resumed.max(epoch));
+    }
+
+    fn pending_pause(&self) -> Option<u64> {
+        let state = *self.state.borrow();
+        (state.requested > state.resumed).then_some(state.requested)
+    }
+
+    async fn wait_for_resume(&self, epoch: u64) {
+        let mut state = self.state.subscribe();
+        loop {
+            let snapshot = *state.borrow_and_update();
+            if snapshot.resumed >= epoch {
+                return;
+            }
+            #[cfg(test)]
+            self.stop_before_wait_if_probed().await;
+            if state.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+struct InputProducerGuard {
+    control: Arc<TerminalInputControl>,
+}
+
+impl Drop for InputProducerGuard {
+    fn drop(&mut self) {
+        self.control
+            .state
+            .send_modify(|state| state.producer_attached = false);
+    }
+}
+
+trait TerminalInput: Send + Sync + 'static {
+    fn poll(&self, timeout: Duration) -> io::Result<bool>;
+    fn read(&self) -> io::Result<CrosstermEvent>;
+}
+
+struct CrosstermInput;
+
+impl TerminalInput for CrosstermInput {
+    fn poll(&self, timeout: Duration) -> io::Result<bool> {
+        crossterm::event::poll(timeout)
+    }
+
+    fn read(&self) -> io::Result<CrosstermEvent> {
+        crossterm::event::read()
+    }
+}
+
 /// Read the physical terminal and forward every event until the consumer is gone.
 ///
 /// This is the producer half of [`App`]'s terminal channel, and it lives here
@@ -536,14 +945,39 @@ pub const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// send is **awaited**, so a burst of input applies backpressure instead of being
 /// dropped. Returning on a closed channel is what lets the task end promptly once
 /// the application has exited.
-pub async fn forward_terminal_input(sender: mpsc::Sender<TerminalEvent>) {
+pub async fn forward_terminal_input(
+    sender: mpsc::Sender<TerminalEvent>,
+    control: Arc<TerminalInputControl>,
+) {
+    forward_terminal_input_from(Arc::new(CrosstermInput), sender, control).await;
+}
+
+async fn forward_terminal_input_from(
+    input: Arc<dyn TerminalInput>,
+    sender: mpsc::Sender<TerminalEvent>,
+    control: Arc<TerminalInputControl>,
+) {
+    let _attached = control.attach();
     while !sender.is_closed() {
-        match tokio::task::spawn_blocking(|| crossterm::event::poll(INPUT_POLL_INTERVAL)).await {
+        if pause_input_if_requested(&sender, &control).await.is_err() {
+            return;
+        }
+        let polling = Arc::clone(&input);
+        match tokio::task::spawn_blocking(move || polling.poll(INPUT_POLL_INTERVAL)).await {
             Ok(Ok(true)) => {}
-            Ok(Ok(false)) => continue,
+            Ok(Ok(false)) => {
+                if pause_input_if_requested(&sender, &control).await.is_err() {
+                    return;
+                }
+                continue;
+            }
             Ok(Err(_)) | Err(_) => return,
         }
-        let Ok(Ok(event)) = tokio::task::spawn_blocking(crossterm::event::read).await else {
+        if pause_input_if_requested(&sender, &control).await.is_err() {
+            return;
+        }
+        let reading = Arc::clone(&input);
+        let Ok(Ok(event)) = tokio::task::spawn_blocking(move || reading.read()).await else {
             return;
         };
         let event = match event {
@@ -553,7 +987,32 @@ pub async fn forward_terminal_input(sender: mpsc::Sender<TerminalEvent>) {
         if sender.send(event).await.is_err() {
             return;
         }
+        // A pause may have raced the blocking read. Queue that completed read first,
+        // then put the pause marker behind it in the same FIFO. The suspended event
+        // loop discards the event before acknowledging the marker, so no old-epoch
+        // input can be replayed after reclaim.
+        if pause_input_if_requested(&sender, &control).await.is_err() {
+            return;
+        }
     }
+}
+
+async fn pause_input_if_requested(
+    sender: &mpsc::Sender<TerminalEvent>,
+    control: &TerminalInputControl,
+) -> Result<(), ()> {
+    let Some(epoch) = control.pending_pause() else {
+        return Ok(());
+    };
+    // This marker is sent by the same producer as physical input. FIFO ordering makes
+    // it a drain barrier: once the loop sees it, every old key is before it and can be
+    // dropped. The producer remains parked until reclaim has repainted the TUI.
+    sender
+        .send(TerminalEvent::InputPaused(epoch))
+        .await
+        .map_err(|_| ())?;
+    control.wait_for_resume(epoch).await;
+    Ok(())
 }
 
 /// A TUI event-loop failure.
@@ -578,6 +1037,7 @@ pub struct App {
     engine_events: mpsc::Receiver<TurnEvent>,
     pending_terminal: VecDeque<TerminalEvent>,
     pending_engine: VecDeque<TurnEvent>,
+    redraw_config: RedrawConfig,
 }
 
 impl App {
@@ -592,12 +1052,17 @@ impl App {
     ) -> (Self, Arc<TerminalLeaseOwner>) {
         let ui = Arc::new(Mutex::new(UiState { root, target }));
         let wake = Arc::new(Notify::new());
+        let input = Arc::new(TerminalInputControl::new());
         let owner = Arc::new(TerminalLeaseOwner {
             lifecycle,
             ui: Arc::clone(&ui),
             suspended: AtomicBool::new(false),
+            input,
+            yielded_pause: Mutex::new(None),
             wake,
             diagnostics: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            reclaim_resume_probe: Mutex::new(None),
         });
         (
             Self {
@@ -607,23 +1072,29 @@ impl App {
                 engine_events,
                 pending_terminal: VecDeque::new(),
                 pending_engine: VecDeque::new(),
+                redraw_config: REDRAW_CONFIG,
             },
             owner,
         )
     }
 
+    #[cfg(test)]
+    fn with_redraw_config(mut self, redraw_config: RedrawConfig) -> Self {
+        self.redraw_config = redraw_config;
+        self
+    }
+
     /// Run until an explicit terminal shutdown event arrives.
     pub async fn run(&mut self) -> Result<(), AppError> {
-        {
-            let mut ui = locked(&self.ui);
-            if !self.owner.suspended.load(Ordering::SeqCst) {
-                ui.draw()?;
-            }
-        }
+        self.draw_if_owned()?;
+        let mut redraw = RedrawSchedule::new(self.redraw_config, TokioInstant::now());
+        // This is the loop's single dirty bit. Engine events only set it; terminal
+        // input can satisfy and clear it with the immediate frame that preserves typing latency.
+        let mut needs_redraw = false;
         loop {
             if !self.owner.suspended.load(Ordering::SeqCst) {
                 if let Some(event) = self.pending_terminal.pop_front() {
-                    match self.handle_terminal(event)? {
+                    match self.dispatch_terminal(event, &mut redraw, &mut needs_redraw)? {
                         Dispatch::Deferred(event) => self.pending_terminal.push_front(event),
                         Dispatch::Continue => {}
                         Dispatch::Shutdown => return Ok(()),
@@ -631,7 +1102,9 @@ impl App {
                     continue;
                 }
                 if let Some(event) = self.pending_engine.pop_front() {
-                    if let Some(event) = self.handle_engine(event)? {
+                    if let Some(event) =
+                        self.dispatch_engine(event, &mut redraw, &mut needs_redraw)?
+                    {
                         self.pending_engine.push_front(event);
                     }
                     continue;
@@ -642,12 +1115,26 @@ impl App {
             tokio::select! {
                 biased;
                 () = self.owner.wake.notified() => {}
-                event = self.terminal_events.recv(), if !suspended => {
+                event = self.terminal_events.recv() => {
                     let event = event.ok_or(AppError::TerminalEventsClosed)?;
                     if self.owner.suspended.load(Ordering::SeqCst) {
-                        self.pending_terminal.push_back(event);
+                        match event {
+                            TerminalEvent::InputPaused(epoch) => {
+                                // Discard is deliberate: a key read before the handoff
+                                // belongs to neither the editor nor the resumed TUI.
+                                // Replaying it could submit a prompt or exit the app.
+                                self.pending_terminal.clear();
+                                self.owner.input.acknowledge(epoch);
+                            }
+                            TerminalEvent::Shutdown => return Ok(()),
+                            TerminalEvent::Input(_) | TerminalEvent::Wake => {}
+                            TerminalEvent::Resize { .. } => {
+                                // Safe to discard at the lease boundary: ratatui checks the
+                                // backend size and autoresizes on the next complete draw.
+                            }
+                        }
                     } else {
-                        match self.handle_terminal(event)? {
+                        match self.dispatch_terminal(event, &mut redraw, &mut needs_redraw)? {
                             Dispatch::Deferred(event) => self.pending_terminal.push_back(event),
                             Dispatch::Continue => {}
                             Dispatch::Shutdown => return Ok(()),
@@ -658,44 +1145,116 @@ impl App {
                     let event = event.ok_or(AppError::EngineEventsClosed)?;
                     if self.owner.suspended.load(Ordering::SeqCst) {
                         self.pending_engine.push_back(event);
-                    } else if let Some(event) = self.handle_engine(event)? {
+                    } else if let Some(event) =
+                        self.dispatch_engine(event, &mut redraw, &mut needs_redraw)?
+                    {
                         self.pending_engine.push_back(event);
+                    }
+                }
+                () = redraw.tick() => {
+                    if needs_redraw && self.draw_if_owned()? {
+                        needs_redraw = false;
+                        // Skip prevents multiple stale ticks; resetting from frame end
+                        // also removes the one already-due tick left behind by a slow draw.
+                        redraw.frame_drawn(TokioInstant::now());
                     }
                 }
             }
         }
     }
 
-    fn handle_terminal(&mut self, event: TerminalEvent) -> Result<Dispatch, AppError> {
+    fn draw_if_owned(&self) -> Result<bool, AppError> {
+        let mut ui = locked(&self.ui);
+        if self.owner.suspended.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        ui.draw()?;
+        Ok(true)
+    }
+
+    fn dispatch_terminal(
+        &mut self,
+        event: TerminalEvent,
+        redraw: &mut RedrawSchedule,
+        needs_redraw: &mut bool,
+    ) -> Result<Dispatch, AppError> {
+        let records_activity = matches!(
+            event,
+            TerminalEvent::Input(_) | TerminalEvent::Resize { .. } | TerminalEvent::Wake
+        );
+        let outcome = self.handle_terminal(event)?;
+        if !matches!(outcome.dispatch, Dispatch::Deferred(_)) {
+            if records_activity {
+                redraw.record_terminal_activity(TokioInstant::now());
+            }
+            if outcome.redraw && self.draw_if_owned()? {
+                // The immediate input frame includes every engine state mutation already
+                // handled under the same UiState mutex, so it also satisfies prior dirt.
+                *needs_redraw = false;
+                redraw.frame_drawn(TokioInstant::now());
+            }
+        }
+        Ok(outcome.dispatch)
+    }
+
+    fn dispatch_engine(
+        &mut self,
+        event: TurnEvent,
+        redraw: &mut RedrawSchedule,
+        needs_redraw: &mut bool,
+    ) -> Result<Option<TurnEvent>, AppError> {
+        redraw.record_engine_activity(&event, TokioInstant::now());
+        let outcome = self.handle_engine(event)?;
+        if outcome.deferred.is_none() {
+            *needs_redraw |= outcome.redraw;
+        }
+        Ok(outcome.deferred)
+    }
+
+    fn handle_terminal(&mut self, event: TerminalEvent) -> Result<TerminalDispatch, AppError> {
+        if let TerminalEvent::InputPaused(epoch) = event {
+            self.pending_terminal.clear();
+            self.owner.input.acknowledge(epoch);
+            return Ok(TerminalDispatch {
+                dispatch: Dispatch::Continue,
+                redraw: false,
+            });
+        }
         let shutdown = matches!(event, TerminalEvent::Shutdown);
         let mut ui = locked(&self.ui);
         if self.owner.suspended.load(Ordering::SeqCst) {
-            return Ok(Dispatch::Deferred(event));
+            return Ok(TerminalDispatch {
+                dispatch: Dispatch::Deferred(event),
+                redraw: false,
+            });
         }
         if let TerminalEvent::Resize { width, height } = &event {
             ui.target.resize(*width, *height)?;
         }
         let result = ui.root.handle_event(&AppEvent::Terminal(event));
-        if result.redraw || shutdown {
-            ui.draw()?;
-        }
-        Ok(if shutdown {
-            Dispatch::Shutdown
-        } else {
-            Dispatch::Continue
+        Ok(TerminalDispatch {
+            dispatch: if shutdown {
+                Dispatch::Shutdown
+            } else {
+                Dispatch::Continue
+            },
+            redraw: result.redraw || shutdown,
         })
     }
 
-    fn handle_engine(&mut self, event: TurnEvent) -> Result<Option<TurnEvent>, AppError> {
+    fn handle_engine(&mut self, event: TurnEvent) -> Result<EngineDispatch, AppError> {
         let mut ui = locked(&self.ui);
         if self.owner.suspended.load(Ordering::SeqCst) {
-            return Ok(Some(event));
+            return Ok(EngineDispatch {
+                deferred: Some(event),
+                redraw: false,
+            });
         }
         let result = ui.root.handle_event(&AppEvent::Engine(event));
-        if result.redraw {
-            ui.draw()?;
-        }
-        Ok(None)
+        Ok(EngineDispatch {
+            deferred: None,
+            redraw: result.redraw,
+        })
     }
 }
 
@@ -703,6 +1262,16 @@ enum Dispatch {
     Deferred(TerminalEvent),
     Continue,
     Shutdown,
+}
+
+struct TerminalDispatch {
+    dispatch: Dispatch,
+    redraw: bool,
+}
+
+struct EngineDispatch {
+    deferred: Option<TurnEvent>,
+    redraw: bool,
 }
 
 #[cfg(test)]

@@ -31,7 +31,7 @@ use zuno_llm::registry::{
     Capabilities, CompletionRequest, Declined, FactoryOutcome, Provider, ProviderStream, Spec,
     Unavailable,
 };
-use zuno_llm::sse::{SseEvent, SseParser};
+use zuno_llm::sse::{SseEvent, SseParser, ensure_tool_input_size};
 
 /// Registry identity for Google AI Studio's Generative Language API.
 pub const GOOGLE_PROVIDER_ID: &str = "google";
@@ -807,10 +807,12 @@ pub struct GeminiStreamDecoder {
 impl GeminiStreamDecoder {
     /// Construct a decoder with provider/model context for typed parse errors.
     pub fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        let provider = provider.into();
+        let model = model.into();
         Self {
-            provider: provider.into(),
-            model: model.into(),
-            parser: SseParser::new(),
+            parser: SseParser::for_stream(provider.clone(), model.clone()),
+            provider,
+            model,
             next_tool_call_id: 0,
             has_tool_calls: false,
             reasoning_open: false,
@@ -820,13 +822,17 @@ impl GeminiStreamDecoder {
 
     /// Decode one raw network chunk.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<StreamEvent>, ProviderError> {
-        let frames = self.parser.push(chunk);
+        let frames = self
+            .parser
+            .push(chunk)
+            .into_iter()
+            .collect::<Result<_, _>>()?;
         self.decode_frames(frames)
     }
 
     /// Finish UTF-8 and SSE framing and decode any trailing event.
     pub fn finish(&mut self) -> Result<Vec<StreamEvent>, ProviderError> {
-        let frames = self.parser.finish();
+        let frames = self.parser.finish().into_iter().collect::<Result<_, _>>()?;
         self.decode_frames(frames)
     }
 
@@ -915,6 +921,12 @@ impl GeminiStreamDecoder {
                     source,
                 })
             })?;
+            ensure_tool_input_size(
+                input.len(),
+                &self.provider,
+                &self.model,
+                self.parser.limits().max_tool_input_bytes(),
+            )?;
             output.push(StreamEvent::ToolInputDelta(input));
             if let Some(signature) = part.thought_signature {
                 output.push(StreamEvent::ToolUseSignature(ThoughtSignature::new(
@@ -1363,10 +1375,12 @@ enum AnthropicBlockKind {
 impl AnthropicStreamDecoder {
     /// Construct a decoder with provider/model context.
     pub fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        let provider = provider.into();
+        let model = model.into();
         Self {
-            provider: provider.into(),
-            model: model.into(),
-            parser: SseParser::new(),
+            parser: SseParser::for_stream(provider.clone(), model.clone()),
+            provider,
+            model,
             blocks: HashMap::new(),
             message_ended: false,
         }
@@ -1374,13 +1388,17 @@ impl AnthropicStreamDecoder {
 
     /// Decode one raw network chunk.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<StreamEvent>, ProviderError> {
-        let frames = self.parser.push(chunk);
+        let frames = self
+            .parser
+            .push(chunk)
+            .into_iter()
+            .collect::<Result<_, _>>()?;
         self.decode_frames(frames)
     }
 
     /// Finish UTF-8 and SSE framing.
     pub fn finish(&mut self) -> Result<Vec<StreamEvent>, ProviderError> {
-        let frames = self.parser.finish();
+        let frames = self.parser.finish().into_iter().collect::<Result<_, _>>()?;
         self.decode_frames(frames)
     }
 

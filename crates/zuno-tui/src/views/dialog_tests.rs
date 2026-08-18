@@ -81,6 +81,26 @@ fn host() -> (DialogHost, ViewContext) {
     (DialogHost::new(context.clone(), Box::new(base)), context)
 }
 
+struct FocusedBase;
+
+impl Component for FocusedBase {
+    fn render(&mut self, _frame: &mut ratatui::Frame<'_>, _area: ratatui::layout::Rect) {}
+
+    fn handle_event(&mut self, _event: &AppEvent) -> EventResult {
+        EventResult::IGNORED
+    }
+}
+
+impl ActionComponent for FocusedBase {
+    fn handle_action(&mut self, _action: &'static Definition, _event: &KeyEvent) -> EventResult {
+        EventResult::IGNORED
+    }
+
+    fn focused_scopes(&self) -> Vec<&'static str> {
+        vec!["history"]
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The stack
 // ---------------------------------------------------------------------------
@@ -101,6 +121,32 @@ fn views_dialog_host_starts_closed_and_reports_its_stack() {
         host.active(),
         Some("second"),
         "the newest dialog does not have the keyboard"
+    );
+}
+
+#[test]
+fn views_dialog_closed_host_forwards_the_bases_focused_scopes() {
+    let context = ViewContext::defaults();
+    let host = DialogHost::new(context, Box::new(FocusedBase));
+
+    assert_eq!(host.focused_scopes(), ["history"]);
+}
+
+#[test]
+fn views_dialog_open_host_replaces_the_bases_focused_scopes() {
+    let context = ViewContext::defaults();
+    let mut host = DialogHost::new(context, Box::new(FocusedBase));
+    let (dialog, _) = Probe::new("probe", "value");
+    host.open(Box::new(dialog));
+
+    assert_eq!(
+        host.focused_scopes(),
+        [
+            "permission.prompt",
+            "dialog.select",
+            "dialog.prompt",
+            "session"
+        ]
     );
 }
 
@@ -277,13 +323,15 @@ impl TerminalLifecycle for CountingLifecycle {
 /// A draw target that counts frames and never touches a terminal.
 struct CountingTarget {
     frames: Arc<AtomicUsize>,
+    last_frame: Arc<Mutex<Option<ratatui::buffer::Buffer>>>,
 }
 
 impl DrawTarget for CountingTarget {
     fn draw(&mut self, root: &mut dyn Component) -> io::Result<()> {
         // `render_offscreen` already owns the `TestBackend` plumbing and its
         // infallible-error conversion; reusing it keeps one seam.
-        render_offscreen(root, 40, 10)?;
+        let buffer = render_offscreen(root, 40, 30)?;
+        *locked(&self.last_frame) = Some(buffer);
         self.frames.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -344,6 +392,7 @@ async fn views_dialog_does_not_stall_event_processing() {
     lifecycle.enter().expect("the fake lifecycle enters");
     let observed = Arc::new(AtomicUsize::new(0));
     let frames = Arc::new(AtomicUsize::new(0));
+    let last_frame = Arc::new(Mutex::new(None));
     let context = ViewContext::defaults();
 
     let base = SharedCounter {
@@ -361,6 +410,7 @@ async fn views_dialog_does_not_stall_event_processing() {
         Box::new(host),
         Box::new(CountingTarget {
             frames: Arc::clone(&frames),
+            last_frame: Arc::clone(&last_frame),
         }),
         Arc::clone(&lifecycle) as Arc<_>,
         terminal_rx,
@@ -370,15 +420,36 @@ async fn views_dialog_does_not_stall_event_processing() {
 
     const EVENTS: usize = 10;
     for index in 0..EVENTS {
-        engine_tx
-            .send(TurnEvent::AssistantMessageCreated {
+        let event = if index + 1 == EVENTS {
+            TurnEvent::Provider {
+                step: u32::try_from(index).expect("small"),
+                event: zuno_llm::event::StreamEvent::TextDelta(format!("tail event {index}")),
+            }
+        } else {
+            TurnEvent::AssistantMessageCreated {
                 step: u32::try_from(index).expect("small"),
                 message_id: format!("msg_{index}"),
-            })
+            }
+        };
+        engine_tx
+            .send(event)
             .await
             .expect("the engine channel stays open, which a stalled loop would close");
     }
     wait_until(|| observed.load(Ordering::SeqCst) == EVENTS).await;
+    let tail_rendered_before_shutdown = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let tail_is_visible = locked(&last_frame)
+                .as_ref()
+                .is_some_and(|buffer| rows(buffer).join("\n").contains("tail event 9"));
+            if tail_is_visible {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok();
 
     // Terminal input also keeps flowing: a key the dialog does not claim reaches the
     // loop and is dispatched rather than queued behind a modal.
@@ -402,10 +473,19 @@ async fn views_dialog_does_not_stall_event_processing() {
         EVENTS,
         "the base did not observe every engine event delivered while a dialog was open"
     );
+    // Per-event frame counting was only a liveness proxy; coalescing intentionally
+    // retired it. The final buffer is stronger: it proves both that a frame happened
+    // and that the coalesced frame includes the tail event rather than stale state.
+    let rendered = locked(&last_frame);
+    let joined = rendered.as_ref().map(rows).unwrap_or_default().join("\n");
     assert!(
-        frames.load(Ordering::SeqCst) >= EVENTS,
-        "the loop drew {} frames for {EVENTS} redraw-worthy events, so rendering stalled",
-        frames.load(Ordering::SeqCst)
+        frames.load(Ordering::SeqCst) > 0
+            && tail_rendered_before_shutdown
+            && joined.contains("tail event 9"),
+        "rendering stalled or lost the tail event: the final coalesced frame must contain \
+         the last event's state before shutdown (frames={}, before_shutdown={}):\n{joined}",
+        frames.load(Ordering::SeqCst),
+        tail_rendered_before_shutdown
     );
 }
 
@@ -429,6 +509,7 @@ async fn views_dialog_stack_survives_a_resize_without_losing_events() {
         Box::new(host),
         Box::new(CountingTarget {
             frames: Arc::new(AtomicUsize::new(0)),
+            last_frame: Arc::new(Mutex::new(None)),
         }),
         Arc::clone(&lifecycle) as Arc<_>,
         terminal_rx,

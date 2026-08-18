@@ -42,6 +42,9 @@ use crate::error::{Result, SnapshotError};
 use crate::git::{self, Argv, CFG, CORE, QUOTE};
 use crate::lock;
 use crate::refcount::StoreKey;
+use crate::turn::{
+    FileOperation, RestoredFile, TurnCapture, TurnCheckpoint, TurnRestore, TurnRestoreReport,
+};
 
 /// `prune` in `packages/opencode/src/snapshot/index.ts:23` — the argument to
 /// `git gc --prune=`.
@@ -229,6 +232,76 @@ impl Store {
         }
         let _guard = lock::acquire(&self.git_dir);
 
+        self.track_locked().map(Some)
+    }
+
+    /// Capture the tree before one complete user turn.
+    ///
+    /// The caller must keep the returned value across every provider step and tool
+    /// call in that turn, then call [`TurnCapture::finish`] exactly once at the
+    /// terminal turn boundary. No capture is returned when snapshots are disabled.
+    pub fn begin_turn(&self) -> Result<Option<TurnCapture>> {
+        let Some(before) = self.track()? else {
+            return Ok(None);
+        };
+        Ok(Some(TurnCapture::new(self.clone(), before)))
+    }
+
+    /// Move one complete turn checkpoint backward or forward, but only when the
+    /// current captured worktree is still exactly the expected source tree.
+    ///
+    /// Safety is deliberately whole-worktree and fail-closed. A manual edit to any
+    /// captured path refuses the entire operation before the patch is applied;
+    /// files are never restored one-by-one around a conflict. The generated patch
+    /// is applied through Git with both the private index and worktree checked, so
+    /// additions and deletions are handled as well as content replacement.
+    pub fn restore_turn(
+        &self,
+        checkpoint: &TurnCheckpoint,
+        restore: TurnRestore,
+    ) -> Result<TurnRestoreReport> {
+        if !self.enabled() {
+            return Err(SnapshotError::SnapshotsDisabled);
+        }
+        let _guard = lock::acquire(&self.git_dir);
+        let (expected, target) = checkpoint.transition(restore);
+        let current = self.track_locked()?;
+        if current != expected {
+            return Err(SnapshotError::WorktreeDrift {
+                files: self.changed_paths(expected, &current)?,
+                expected: expected.to_owned(),
+                actual: current,
+            });
+        }
+
+        let files = self.transition_files(expected, target)?;
+        let affected: Vec<String> = files.iter().map(|file| file.path.clone()).collect();
+        let mut ignored: Vec<String> = self.ignore(&affected)?.into_iter().collect();
+        if !ignored.is_empty() {
+            ignored.sort();
+            return Err(SnapshotError::IgnoredFiles { files: ignored });
+        }
+
+        if !files.is_empty() {
+            let patch = self.transition_patch(expected, target)?;
+            self.apply_transition(&patch, true)?;
+            // `git apply --index` repeats this same precondition check. Running both
+            // closes the ordinary check/apply window while retaining a no-mutation
+            // preflight whose failure is guaranteed to leave every file untouched.
+            self.apply_transition(&patch, false)?;
+        }
+
+        let actual = self.track_locked()?;
+        if actual != target {
+            return Err(SnapshotError::RestoreVerification {
+                expected: target.to_owned(),
+                actual,
+            });
+        }
+        Ok(TurnRestoreReport::new(restore, expected, target, files))
+    }
+
+    fn track_locked(&self) -> Result<String> {
         let existed = self.git_dir.is_dir();
         self.create_dir(&self.git_dir)?;
         if !existed {
@@ -248,7 +321,88 @@ impl Store {
         }
         let hash = output.text(&argv.display())?.trim().to_owned();
         tracing::info!(hash = %hash, git_dir = %self.git_dir.display(), "tracking");
-        Ok(Some(hash))
+        Ok(hash)
+    }
+
+    fn changed_paths(&self, from: &str, to: &str) -> Result<Vec<String>> {
+        self.diff_paths(from, to, None)
+    }
+
+    fn transition_files(&self, from: &str, to: &str) -> Result<Vec<RestoredFile>> {
+        let mut files = Vec::new();
+        for (filter, operation) in [
+            ("A", FileOperation::Created),
+            ("MT", FileOperation::Modified),
+            ("D", FileOperation::Deleted),
+        ] {
+            files.extend(
+                self.diff_paths(from, to, Some(filter))?
+                    .into_iter()
+                    .map(|path| RestoredFile { path, operation }),
+            );
+        }
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(files)
+    }
+
+    fn diff_paths(&self, from: &str, to: &str, filter: Option<&str>) -> Result<Vec<String>> {
+        let mut argv = self.scoped(QUOTE);
+        argv.extend(["diff", "--name-only", "-z", "--no-renames"]);
+        if let Some(filter) = filter {
+            argv.push(format!("--diff-filter={filter}"));
+        }
+        argv.push(from).push(to).extend(["--", "."]);
+        let output = self.run(&argv, &self.location.worktree, None)?;
+        if !output.ok() {
+            return Err(SnapshotError::git(
+                &argv.display(),
+                output.status,
+                output.stderr,
+            ));
+        }
+        let mut files = git::split_nul(&output.text(&argv.display())?);
+        files.sort();
+        Ok(files)
+    }
+
+    fn transition_patch(&self, from: &str, to: &str) -> Result<Vec<u8>> {
+        let mut argv = self.scoped(CFG);
+        argv.extend([
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-renames",
+        ])
+        .push(from)
+        .push(to)
+        .extend(["--", "."]);
+        let output = self.run(&argv, &self.location.worktree, None)?;
+        if !output.ok() {
+            return Err(SnapshotError::git(
+                &argv.display(),
+                output.status,
+                output.stderr,
+            ));
+        }
+        Ok(output.stdout)
+    }
+
+    fn apply_transition(&self, patch: &[u8], check: bool) -> Result<()> {
+        let mut argv = self.scoped(CFG);
+        argv.push("apply").push("--index").push("--binary");
+        if check {
+            argv.push("--check");
+        }
+        let output = self.run(&argv, &self.location.worktree, Some(patch))?;
+        if !output.ok() {
+            return Err(SnapshotError::git(
+                &argv.display(),
+                output.status,
+                output.stderr,
+            ));
+        }
+        Ok(())
     }
 
     /// The files that changed since `hash`, as absolute forward-slashed paths.
