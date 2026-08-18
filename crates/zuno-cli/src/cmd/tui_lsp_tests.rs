@@ -3,17 +3,60 @@
 
 use super::*;
 
-/// Whether `command` is runnable, for a test that needs a real language server.
+/// Why a real language server cannot be exercised, phrased to complete
+/// `SKIPPED {test}: rust-analyzer {reason}`.
 ///
-/// A `PATH` walk rather than spawning it with `--version`: several language servers have
-/// no `--version` that exits, and this only has to answer "is it there".
-fn on_path(command: &str) -> bool {
-    if command.contains('/') {
-        return Path::new(command).is_file();
+/// Two variants rather than one boolean, for the reason spelled out on
+/// [`usable_server`]: "absent" and "present but not a working server" look identical to a
+/// `PATH` lookup and have to be told apart before a skip can be trusted.
+enum Unusable {
+    /// Nothing by that name resolves on `PATH`.
+    Missing,
+    /// A path resolved, but the program behind it is not a usable server.
+    Broken(String),
+}
+
+impl std::fmt::Display for Unusable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => formatter.write_str("was not found on PATH"),
+            Self::Broken(reason) => formatter.write_str(reason),
+        }
     }
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|directory| directory.join(command).is_file())
-    })
+}
+
+/// Resolve `name` on `PATH` and prove the program can at least run.
+///
+/// This used to be a `PATH` walk that answered `is_file()`, and that is precisely how this
+/// test failed on CI while passing locally. `rustup` installs a *proxy* at
+/// `~/.cargo/bin/rust-analyzer` whether or not the `rust-analyzer` component was ever
+/// added, so the file exists on a runner that has no language server at all; the proxy
+/// then exits non-zero with `Unknown binary 'rust-analyzer' in official toolchain`, the
+/// manager never brings a server up, and [`report`] flattens that into
+/// [`Report::unchecked`] — a red assertion that said nothing about the missing component.
+/// `crates/zuno-lsp/tests/live_rust_analyzer.rs` already models the same three states for
+/// the same binary, and this is the same probe, so the two cannot drift.
+///
+/// [`which::which`] rather than a hand-rolled walk because it is what
+/// [`zuno_lsp::registry::ServerRegistry`] itself uses to resolve `argv[0]`: the probe now
+/// answers with the same mechanism, and the same executable, that production will launch.
+/// An `is_file()` walk also accepts a file with no executable bit, which `which` does not.
+fn usable_server(name: &str) -> Result<PathBuf, Unusable> {
+    let path = which::which(name).map_err(|_| Unusable::Missing)?;
+    match std::process::Command::new(&path).arg("--version").output() {
+        Err(error) => Err(Unusable::Broken(format!(
+            "at {} could not be executed: {error}",
+            path.display()
+        ))),
+        Ok(output) if !output.status.success() => Err(Unusable::Broken(format!(
+            "at {} exited with {} for `--version` (a rustup proxy for an uninstalled \
+             component does exactly this): {}",
+            path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))),
+        Ok(_) => Ok(path),
+    }
 }
 
 /// A wake sink whose receiver is dropped, which is the shape a nudge has to survive.
@@ -26,6 +69,19 @@ fn wake() -> mpsc::Sender<zuno_tui::app::TerminalEvent> {
 
 fn config(json: &str) -> zuno_config::schema::Config {
     serde_json::from_str(json).expect("valid configuration")
+}
+
+/// The built-ins, with `rust` pinned to `server` rather than re-resolved.
+///
+/// `{"lsp":true}` leaves the registry to look `rust-analyzer` up on `PATH` again, so a probe
+/// that validated one executable could hand the assertions a different one. Pinning the
+/// path [`usable_server`] actually ran makes the thing probed and the thing launched the
+/// same file.
+fn pinned_rust_config(server: &Path) -> zuno_config::schema::Config {
+    serde_json::from_value(serde_json::json!({
+        "lsp": { "rust": { "command": [server.to_string_lossy()] } }
+    }))
+    .expect("valid configuration")
 }
 
 fn lsp_diagnostic(
@@ -156,12 +212,19 @@ async fn tui_lsp_check_edits_skips_a_path_that_is_not_a_file() {
 async fn tui_lsp_reports_a_real_diagnostic_from_a_real_language_server() {
     // The end-to-end claim, against `rust-analyzer` itself rather than a fake: a file
     // that does not type-check must produce a report with a position and a message.
-    // Skipped rather than failed when the binary is absent, because a machine without
-    // `rust-analyzer` cannot prove or disprove anything here.
-    if !on_path("rust-analyzer") {
-        eprintln!("skipping: rust-analyzer is not on PATH");
-        return;
-    }
+    // Skipped rather than failed when no usable server exists, because a machine without
+    // one cannot prove or disprove anything here. The skip names the reason and says the
+    // claim went unverified: a skip nobody can see is indistinguishable from a pass.
+    let server = match usable_server("rust-analyzer") {
+        Ok(path) => path,
+        Err(reason) => {
+            eprintln!(
+                "SKIPPED tui_lsp_reports_a_real_diagnostic_from_a_real_language_server: \
+                 rust-analyzer {reason}; the end-to-end LSP report path was NOT exercised"
+            );
+            return;
+        }
+    };
     let root = tempfile::tempdir().expect("a temporary directory");
     std::fs::write(
         root.path().join("Cargo.toml"),
@@ -176,7 +239,7 @@ async fn tui_lsp_reports_a_real_diagnostic_from_a_real_language_server() {
     )
     .expect("a source file");
 
-    let probe = Probe::resolve(&config(r#"{"lsp":true}"#), root.path(), wake()).expect("a probe");
+    let probe = Probe::resolve(&pinned_rust_config(&server), root.path(), wake()).expect("a probe");
     let (edits, edit_receiver) = mpsc::channel(4);
     let (reports, mut report_receiver) = mpsc::channel(4);
     let task = tokio::spawn(check_edits(Some(probe), edit_receiver, reports));
@@ -196,8 +259,10 @@ async fn tui_lsp_reports_a_real_diagnostic_from_a_real_language_server() {
     assert_eq!(report.path, "src/lib.rs");
     assert!(
         report.is_checked(),
-        "rust-analyzer claims .rs, so the file must not be reported as unchecked: {}",
-        report.summary()
+        "rust-analyzer claims .rs, so the file must not be reported as unchecked: {} \
+         (the server probed and launched was {})",
+        report.summary(),
+        server.display()
     );
     assert!(
         !report.diagnostics.is_empty(),
