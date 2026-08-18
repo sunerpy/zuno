@@ -2594,3 +2594,606 @@ fn views_transcript_visual_probe() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The per-message row cache (plan §11.3 R2-R5)
+// ---------------------------------------------------------------------------
+
+/// The text of every row, which is what a reader sees and what a cache must preserve.
+fn row_text(lines: &[Line<'static>]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect()
+}
+
+/// The text *and* the style of every span, which is the whole of a rendered row.
+///
+/// Text alone would let a cache serve a correctly worded row in the wrong colour, which
+/// is exactly the failure a theme change under a live cache produces.
+fn row_spans(lines: &[Line<'static>]) -> Vec<Vec<(String, Style)>> {
+    lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| (span.content.to_string(), span.style))
+                .collect()
+        })
+        .collect()
+}
+
+/// Every transcript shape the cache has to be right about.
+fn cache_subjects() -> Vec<(&'static str, TranscriptView)> {
+    let mut empty = view();
+    empty.transcript_mut().set_awaiting_permission(true);
+
+    let mut running = view();
+    for event in [
+        started(),
+        provider(StreamEvent::ToolUseStart {
+            id: String::from("r1"),
+            name: String::from("bash"),
+        }),
+        TurnEvent::ToolDispatchStarted {
+            step: 1,
+            call_id: String::from("r1"),
+            name: String::from("bash"),
+        },
+    ] {
+        running.transcript_mut().observe(&event);
+    }
+
+    let mut diagnostics = view();
+    diagnostics
+        .transcript_mut()
+        .push(Message::diagnostics(crate::views::lsp::Report::unchecked(
+            "src/main.rs",
+        )));
+    diagnostics
+        .transcript_mut()
+        .push(Message::notice(String::from("warning: something")));
+
+    let mut same_role = view();
+    for index in 0..4 {
+        same_role
+            .transcript_mut()
+            .push(Message::user(format!("prompt {index}")));
+    }
+
+    let mut retried = view();
+    for event in [
+        started(),
+        provider(StreamEvent::TextDelta(String::from("discarded"))),
+        provider(StreamEvent::RetryRollback { attempt: 2, max: 3 }),
+        provider(StreamEvent::TextDelta(String::from("kept"))),
+    ] {
+        retried.transcript_mut().observe(&event);
+    }
+
+    vec![
+        ("empty transcript awaiting permission", empty),
+        ("a running tool call", running),
+        ("diagnostics and a notice", diagnostics),
+        ("four consecutive user prompts", same_role),
+        ("a retried turn", retried),
+        ("the realistic multi-part turn", realistic()),
+    ]
+}
+
+/// The load-bearing test: the cache changes nothing about what is drawn.
+///
+/// `lines` is the specification and `cached_lines` the implementation, so this renders
+/// every subject at every width both ways and requires span-for-span, style-for-style
+/// equality. A cache that alters output is not a faster renderer, it is a wrong one.
+#[test]
+fn views_transcript_cache_returns_what_the_uncached_path_would() {
+    for (name, mut subject) in cache_subjects() {
+        for pass in 0..3 {
+            for width in [20_u16, 40, 80, 120] {
+                let expected = row_spans(&subject.lines(width));
+                let actual = row_spans(&subject.cached_lines_for_test(width));
+                assert_eq!(
+                    actual, expected,
+                    "{name}: pass {pass} at {width} columns rendered differently through the \
+                     cache than through the uncached path"
+                );
+            }
+        }
+        // And once more with both affordances flipped, which changes how many rows a
+        // reasoning block and a tool result produce.
+        subject.toggle_thinking();
+        subject.toggle_tool_output();
+        for width in [20_u16, 80] {
+            let expected = row_spans(&subject.lines(width));
+            let actual = row_spans(&subject.cached_lines_for_test(width));
+            assert_eq!(
+                actual, expected,
+                "{name}: with both affordances expanded, the cache disagreed with the \
+                 uncached path at {width} columns"
+            );
+        }
+    }
+}
+
+#[test]
+fn views_transcript_cache_recalls_an_unchanged_frame_instead_of_re_rendering_it() {
+    let mut view = realistic();
+    let first = row_text(&view.cached_lines_for_test(80));
+    let (hits_after_first, misses_after_first) = view.cache().counts();
+    assert_eq!(
+        hits_after_first, 0,
+        "the first frame reported a cache hit, so it recalled rows nothing had stored"
+    );
+    assert!(
+        misses_after_first > 0,
+        "the first frame consulted the cache for no message at all"
+    );
+    assert!(
+        view.cache().stored_entries() > 0,
+        "the first frame stored nothing, so a second frame cannot be cheaper"
+    );
+
+    let second = row_text(&view.cached_lines_for_test(80));
+    let (hits, _) = view.cache().counts();
+    assert_eq!(
+        second, first,
+        "an unchanged transcript rendered differently"
+    );
+    assert_eq!(
+        hits, misses_after_first,
+        "the second frame recalled {hits} of {misses_after_first} messages; an unchanged \
+         transcript must recall every one it stored"
+    );
+}
+
+#[test]
+fn views_transcript_cache_misses_when_the_width_changes() {
+    let mut view = realistic();
+    view.cached_lines_for_test(80);
+    let (_, before) = view.cache().counts();
+    view.cached_lines_for_test(80);
+    let (hits, _) = view.cache().counts();
+    assert!(hits > 0, "the fixture never hit at a stable width");
+
+    let narrow = row_text(&view.cached_lines_for_test(40));
+    let (hits_after, _) = view.cache().counts();
+    assert_eq!(
+        hits_after, hits,
+        "a width change was served from the cache, so rows laid out for 80 columns were \
+         drawn into 40"
+    );
+    assert_eq!(
+        narrow,
+        row_text(&view.lines(40)),
+        "the re-rendered frame does not match the uncached path"
+    );
+    assert!(before > 0);
+}
+
+#[test]
+fn views_transcript_cache_misses_when_the_theme_changes() {
+    // `ViewContext` shares one `Arc<RwLock<Arc<Resolved>>>`, so a live re-theme happens
+    // underneath an already-populated cache. This is the case a palette-hash key would
+    // have got wrong for `thinkingOpacity`, which `Palette::entries` does not report.
+    let context = ViewContext::defaults();
+    let mut view = TranscriptView::new(context.clone());
+    view.transcript_mut().push(Message::user("hello"));
+    let dark = row_spans(&view.cached_lines_for_test(60));
+    view.cached_lines_for_test(60);
+    let (hits_before, _) = view.cache().counts();
+    assert!(hits_before > 0, "the fixture never hit before the re-theme");
+
+    let registry = crate::theme::ThemeRegistry::new();
+    let light = registry.resolve(crate::theme::DEFAULT_THEME, crate::theme::Mode::Light);
+    context.set_theme(&light);
+
+    let repainted = row_spans(&view.cached_lines_for_test(60));
+    let (hits_after, _) = view.cache().counts();
+    assert_eq!(
+        hits_after, hits_before,
+        "a re-theme was served from the cache, so the transcript kept painting the old \
+         palette while every other surface had switched"
+    );
+    assert_ne!(
+        repainted, dark,
+        "the two themes produced identical styles, so this cannot detect a stale palette"
+    );
+    assert_eq!(
+        repainted,
+        row_spans(&view.lines(60)),
+        "after a re-theme the cached path disagrees with the uncached one"
+    );
+}
+
+#[test]
+fn views_transcript_cache_misses_when_a_display_affordance_changes() {
+    for (name, toggle) in [("thinking", 0_u8), ("tool output", 1)] {
+        let mut view = realistic();
+        view.cached_lines_for_test(80);
+        view.cached_lines_for_test(80);
+        let (hits_before, _) = view.cache().counts();
+        assert!(
+            hits_before > 0,
+            "{name}: the fixture never hit before the toggle"
+        );
+
+        if toggle == 0 {
+            view.toggle_thinking();
+        } else {
+            view.toggle_tool_output();
+        }
+        let after = row_spans(&view.cached_lines_for_test(80));
+        let (hits_after, _) = view.cache().counts();
+        assert_eq!(
+            hits_after, hits_before,
+            "{name}: the affordance changed and the cache still served the old rows"
+        );
+        assert_eq!(
+            after,
+            row_spans(&view.lines(80)),
+            "{name}: after the toggle the cached path disagrees with the uncached one"
+        );
+    }
+}
+
+/// A streaming append re-renders the tail and recalls the prefix.
+///
+/// This is the plan's O(n²) stated as a test: the work a delta forces must be
+/// proportional to what changed, not to the transcript's length.
+#[test]
+fn views_transcript_cache_recalls_the_prefix_across_a_streaming_append() {
+    let mut view = view();
+    for index in 0..40 {
+        view.transcript_mut()
+            .push(Message::user(format!("prompt {index}")));
+    }
+    view.cached_lines_for_test(80);
+    view.cached_lines_for_test(80);
+    let (hits_before, _) = view.cache().counts();
+    let stored = view.cache().stored_entries();
+    assert_eq!(stored, 40, "the fixture stored {stored} of 40 messages");
+
+    for event in [
+        started(),
+        provider(StreamEvent::TextDelta(String::from("partial"))),
+    ] {
+        view.transcript_mut().observe(&event);
+    }
+    let (_, misses_before) = view.cache().counts();
+    let grown = row_text(&view.cached_lines_for_test(80));
+    let (hits_after, misses_after) = view.cache().counts();
+    assert_eq!(
+        hits_after - hits_before,
+        40,
+        "the 40 unchanged messages were not all recalled, so a delta still costs the \
+         whole transcript"
+    );
+    assert_eq!(
+        misses_after - misses_before,
+        1,
+        "more than the appended message was re-rendered"
+    );
+    assert_eq!(
+        grown,
+        row_text(&view.lines(80)),
+        "the incrementally built frame disagrees with a full render"
+    );
+
+    // A second delta into the same message must still re-render only that message.
+    view.transcript_mut()
+        .observe(&provider(StreamEvent::TextDelta(String::from(" more"))));
+    let (hits_two, misses_two) = view.cache().counts();
+    let again = row_text(&view.cached_lines_for_test(80));
+    let (hits_three, misses_three) = view.cache().counts();
+    // Content first: a message mutated in place and served from its own stale entry is
+    // the failure that reaches a user, and it must be what fails rather than a count.
+    assert!(
+        again.iter().any(|row| row.contains("partial more")),
+        "the second delta is missing, so the tail was served from a stale entry: {again:?}"
+    );
+    assert_eq!(
+        again,
+        row_text(&view.lines(80)),
+        "after a second delta the cached path disagrees with the uncached one"
+    );
+    assert_eq!(
+        hits_three - hits_two,
+        40,
+        "the second delta recalled {} messages rather than the 40 unchanged ones",
+        hits_three - hits_two
+    );
+    assert_eq!(
+        misses_three - misses_two,
+        1,
+        "the second delta re-rendered {} messages rather than only the one it changed",
+        misses_three - misses_two
+    );
+}
+
+#[test]
+fn views_transcript_cache_never_recalls_a_row_carrying_the_spinner() {
+    // A running call renders `Transcript::spinner()`, which advances on every folded
+    // event. Recalling it would freeze the animation and, worse, claim a frame is current
+    // when its liveness signal is stale.
+    let mut view = view();
+    view.transcript_mut().push(Message::user("go"));
+    for event in [
+        started(),
+        provider(StreamEvent::ToolUseStart {
+            id: String::from("c"),
+            name: String::from("bash"),
+        }),
+        TurnEvent::ToolDispatchStarted {
+            step: 1,
+            call_id: String::from("c"),
+            name: String::from("bash"),
+        },
+    ] {
+        view.transcript_mut().observe(&event);
+    }
+    view.cached_lines_for_test(80);
+
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..SPINNER.len() {
+        view.transcript_mut()
+            .observe(&provider(StreamEvent::TextDelta(String::new())));
+        let frame = row_text(&view.cached_lines_for_test(80));
+        let glyph = frame
+            .iter()
+            .find(|row| row.contains(" $ "))
+            .and_then(|row| {
+                SPINNER
+                    .iter()
+                    .find(|frame| row.contains(**frame))
+                    .map(|frame| (*frame).to_owned())
+            });
+        if let Some(glyph) = glyph {
+            seen.insert(glyph);
+        }
+        assert_eq!(
+            frame,
+            row_text(&view.lines(80)),
+            "a spinner frame served from the cache disagreed with a fresh render"
+        );
+    }
+    assert!(
+        seen.len() > 1,
+        "the running call's glyph never changed across {} folded events, so its row was \
+         recalled: {seen:?}",
+        SPINNER.len()
+    );
+    // Asserted after the animation, so the user-visible property is what fails first if
+    // the exclusion is removed. Only the settled user prompt may be stored.
+    assert_eq!(
+        view.cache().stored_entries(),
+        1,
+        "the message with the running call was stored, or the settled one was not"
+    );
+}
+
+#[test]
+fn views_transcript_cache_stays_inside_its_row_bound() {
+    // Overrun the budget with *tall* messages rather than many, because that is the
+    // hazard the bound is expressed in rows to cover: `MessagePart::Notice` wraps with no
+    // row cap, so a handful of messages can outweigh thousands and an entry-count bound
+    // would have admitted all of them.
+    let mut view = view();
+    let rows_each = 512;
+    let messages = MAX_CACHED_ROWS / rows_each + 8;
+    for index in 0..messages {
+        let body = (0..rows_each)
+            .map(|row| format!("line {row} of notice {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        view.transcript_mut().push(Message::notice(body));
+    }
+    let frame = view.cached_lines_for_test(60);
+    assert!(
+        frame.len() > MAX_CACHED_ROWS,
+        "the fixture produced {} rows, which does not exceed the {MAX_CACHED_ROWS}-row \
+         bound, so nothing was evicted",
+        frame.len()
+    );
+    assert!(
+        view.cache().stored_rows() <= MAX_CACHED_ROWS,
+        "the cache holds {} rows against a {MAX_CACHED_ROWS}-row bound",
+        view.cache().stored_rows()
+    );
+    // Rendering again must not grow it either: an eviction policy that re-admitted
+    // everything each frame would satisfy the bound only between frames.
+    view.cached_lines_for_test(60);
+    assert!(
+        view.cache().stored_rows() <= MAX_CACHED_ROWS,
+        "a second frame pushed the cache to {} rows",
+        view.cache().stored_rows()
+    );
+    assert_eq!(
+        row_text(&view.cached_lines_for_test(60)),
+        row_text(&view.lines(60)),
+        "an evicting cache stopped agreeing with the uncached path"
+    );
+}
+
+#[test]
+fn views_transcript_cache_forgets_a_message_that_no_longer_exists() {
+    // A replaced transcript is shorter than the cache. Without the truncation those
+    // slots would hold their rows against the bound for the rest of the process.
+    let mut view = view();
+    for index in 0..30 {
+        view.transcript_mut()
+            .push(Message::user(format!("prompt {index}")));
+    }
+    view.cached_lines_for_test(60);
+    assert_eq!(view.cache().stored_entries(), 30);
+    let held = view.cache().stored_rows();
+    assert!(held > 0);
+
+    *view.transcript_mut() = Transcript::new();
+    view.transcript_mut().push(Message::user("fresh"));
+    view.cached_lines_for_test(60);
+    assert_eq!(
+        view.cache().stored_entries(),
+        1,
+        "the cache kept entries for messages the transcript no longer has"
+    );
+    assert!(
+        view.cache().stored_rows() < held,
+        "the discarded messages' rows are still counted against the bound"
+    );
+}
+
+/// Two different messages must not share a fingerprint.
+///
+/// The cache is keyed on it, so a collision between two shapes a transcript actually
+/// produces would draw one message's rows in another's place.
+#[test]
+fn views_transcript_fingerprint_separates_every_part_shape() {
+    let report = crate::views::lsp::Report::unchecked("src/main.rs");
+    let shapes: Vec<(&str, Message)> = vec![
+        ("text", Message::user("same")),
+        (
+            "notice with the same string",
+            Message::notice(String::from("same")),
+        ),
+        ("diagnostics", Message::diagnostics(report)),
+        (
+            "reasoning, streaming",
+            Message {
+                role: Role::Assistant,
+                id: None,
+                parts: vec![MessagePart::Reasoning {
+                    text: String::from("same"),
+                    duration_secs: None,
+                    streaming: true,
+                }],
+            },
+        ),
+        (
+            "reasoning, settled",
+            Message {
+                role: Role::Assistant,
+                id: None,
+                parts: vec![MessagePart::Reasoning {
+                    text: String::from("same"),
+                    duration_secs: None,
+                    streaming: false,
+                }],
+            },
+        ),
+        (
+            "reasoning, timed",
+            Message {
+                role: Role::Assistant,
+                id: None,
+                parts: vec![MessagePart::Reasoning {
+                    text: String::from("same"),
+                    duration_secs: Some(1.0),
+                    streaming: false,
+                }],
+            },
+        ),
+        (
+            "attachment",
+            Message {
+                role: Role::User,
+                id: None,
+                parts: vec![MessagePart::Attachment {
+                    filename: String::from("same"),
+                    mime: None,
+                }],
+            },
+        ),
+        (
+            "retry",
+            Message {
+                role: Role::System,
+                id: None,
+                parts: vec![MessagePart::Retry { attempt: 2, max: 3 }],
+            },
+        ),
+        (
+            "retry, different count",
+            Message {
+                role: Role::System,
+                id: None,
+                parts: vec![MessagePart::Retry { attempt: 1, max: 3 }],
+            },
+        ),
+        (
+            "tool, pending",
+            Message {
+                role: Role::Assistant,
+                id: None,
+                parts: vec![MessagePart::Tool {
+                    call_id: String::from("c"),
+                    name: String::from("bash"),
+                    arguments: String::new(),
+                    title: None,
+                    status: ToolStatus::Pending,
+                    output: None,
+                    diff: None,
+                }],
+            },
+        ),
+        (
+            "tool, completed",
+            Message {
+                role: Role::Assistant,
+                id: None,
+                parts: vec![MessagePart::Tool {
+                    call_id: String::from("c"),
+                    name: String::from("bash"),
+                    arguments: String::new(),
+                    title: None,
+                    status: ToolStatus::Completed,
+                    output: None,
+                    diff: None,
+                }],
+            },
+        ),
+        (
+            "tool, completed with output",
+            Message {
+                role: Role::Assistant,
+                id: None,
+                parts: vec![MessagePart::Tool {
+                    call_id: String::from("c"),
+                    name: String::from("bash"),
+                    arguments: String::new(),
+                    title: None,
+                    status: ToolStatus::Completed,
+                    output: Some(String::new()),
+                    diff: None,
+                }],
+            },
+        ),
+    ];
+    let mut seen: std::collections::BTreeMap<u64, &str> = std::collections::BTreeMap::new();
+    for (name, message) in &shapes {
+        let print = fingerprint(message);
+        if let Some(other) = seen.insert(print, name) {
+            panic!("`{name}` and `{other}` share fingerprint {print}");
+        }
+        assert_eq!(
+            print,
+            fingerprint(message),
+            "`{name}` fingerprinted differently on a second call, so the key is unstable"
+        );
+    }
+    // The role is part of the key: the same parts from a different speaker render a
+    // different header and a different rule.
+    let mut assistant = Message::user("same");
+    assistant.role = Role::Assistant;
+    assert_ne!(
+        fingerprint(&Message::user("same")),
+        fingerprint(&assistant),
+        "two roles carrying the same text fingerprint alike, so a cached user row could \
+         be served for an assistant message"
+    );
+}

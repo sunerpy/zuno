@@ -9,6 +9,7 @@
 use crate::theme::Palette;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
+use std::sync::OnceLock;
 use tree_sitter::Language;
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 
@@ -77,14 +78,17 @@ enum Grammar {
     Ruby,
 }
 
-/// Each grammar's position in [`ALL_GRAMMARS`].
+/// Each grammar's position in [`ALL_GRAMMARS`], and its slot in [`CONFIGURATIONS`].
 ///
 /// The match is exhaustive, so a new variant cannot compile without being given a number
 /// here, and `highlight_every_grammar_in_the_table_produces_spans_for_its_own_alias`
 /// rejects a number outside the array's range. Together that is what stops a grammar being
 /// added and never tested — the failure a hand-kept list produces silently, as the diff
 /// scope's comment did when it named nine of eleven bare characters.
-#[cfg(test)]
+///
+/// It is production code rather than test-only because [`configured`] indexes the
+/// configuration cache with it. The same exhaustiveness that made it a good test helper is
+/// what makes it a safe index: a new grammar cannot reach the cache without a slot.
 const fn grammar_ordinal(grammar: Grammar) -> usize {
     match grammar {
         Grammar::Rust => 0,
@@ -108,7 +112,7 @@ const fn grammar_ordinal(grammar: Grammar) -> usize {
 
 /// Every grammar, for the guards that must not miss one.
 #[cfg(test)]
-const ALL_GRAMMARS: [Grammar; 16] = [
+const ALL_GRAMMARS: [Grammar; GRAMMAR_COUNT] = [
     Grammar::Rust,
     Grammar::Python,
     Grammar::Go,
@@ -127,14 +131,71 @@ const ALL_GRAMMARS: [Grammar; 16] = [
     Grammar::Ruby,
 ];
 
+/// How many grammars this build can highlight, and so how large the cache is.
+///
+/// Kept beside [`grammar_ordinal`] because the two are one fact: the ordinals are
+/// `0..GRAMMAR_COUNT` and a variant without a slot cannot compile.
+const GRAMMAR_COUNT: usize = 16;
+
+/// One built-and-configured [`HighlightConfiguration`] per grammar.
+///
+/// # What this fixes, measured
+///
+/// [`configuration`] compiles a tree-sitter query from its grammar's `HIGHLIGHTS_QUERY`
+/// source text, and until this cache existed it ran **once per code fence, per frame**.
+/// The transcript re-renders every message on every frame, so a session with 465
+/// assistant replies re-compiled 465 queries per frame. Measured on this project at 100
+/// columns, five runs (`crates/zuno-tui/tests/render_cost.rs`, and
+/// `docs/perf-methodology.md`): rendering prose alone cost a median 11.544 µs, one Rust
+/// fence took that to 17.237 ms, and two fences to 34.571 ms — exactly twice, so there
+/// was no amortisation of any kind. A JSON fence added only 20.236 µs, which is what
+/// identifies the cost as query compilation rather than parsing: Rust's query is large
+/// and JSON's is tiny, and the ~850x gap tracks the query, not the source.
+///
+/// # Why this cache needs no invalidation key
+///
+/// A configuration is a pure function of the grammar. Its inputs are a `Language` and a
+/// `&'static str` query, both fixed at compile time, and [`HIGHLIGHT_NAMES`] is a
+/// constant. It does **not** depend on width, and it does **not** depend on the palette:
+/// colour is applied afterwards by [`capture_style`] from the events, which is why a live
+/// theme change cannot stale this entry. So the key is the grammar alone, and there is no
+/// condition under which a cached entry becomes wrong. That is the whole reason this, and
+/// not the transcript, is the right place to start caching.
+///
+/// # The bound
+///
+/// Exactly [`GRAMMAR_COUNT`] slots, allocated as part of the static and never grown: the
+/// cache is keyed on a `Copy` enum, so it cannot grow with content, session length, or
+/// uptime. At its bound it holds all 16 configurations — measured below at 5,865,048
+/// bytes of RSS for the full set, against M1's 1,198,872 KiB W-real median, or 0.478%.
+/// This is deliberately *not* a content-keyed cache: `.omo/plans/memory-perf-optimization.md`
+/// §10.2's rule against unbounded growth in a long-running interactive process is the class
+/// of defect this plan exists to fix, and a per-source cache would reintroduce it.
+///
+/// A failed build is cached as `None` rather than retried. §6.5 records the reference
+/// implementation's own finding here: an uncached failure re-runs the expensive failing
+/// path on every redraw, which is the worst of both outcomes.
+static CONFIGURATIONS: [OnceLock<Option<HighlightConfiguration>>; GRAMMAR_COUNT] =
+    [const { OnceLock::new() }; GRAMMAR_COUNT];
+
+/// `grammar`'s configured highlighter, built at most once per process.
+fn configured(grammar: Grammar) -> Option<&'static HighlightConfiguration> {
+    CONFIGURATIONS[grammar_ordinal(grammar)]
+        .get_or_init(|| {
+            let mut configuration = configuration(grammar)?;
+            configuration.configure(&HIGHLIGHT_NAMES);
+            Some(configuration)
+        })
+        .as_ref()
+}
+
 pub(super) fn spans(hint: Option<&str>, source: &str, palette: &Palette) -> Option<Vec<Row>> {
     if source.len() > MAX_HIGHLIGHT_BYTES || source.split('\n').count() > MAX_HIGHLIGHT_LINES {
         return None;
     }
 
     let grammar = Grammar::detect(hint?)?;
-    let mut configuration = configuration(grammar)?;
-    configuration.configure(&HIGHLIGHT_NAMES);
+    let configuration = configured(grammar)?;
 
     let long_lines = source
         .split('\n')
@@ -142,7 +203,7 @@ pub(super) fn spans(hint: Option<&str>, source: &str, palette: &Palette) -> Opti
         .collect::<Vec<_>>();
     let mut highlighter = Highlighter::new();
     let events = highlighter
-        .highlight(&configuration, source.as_bytes(), None, |_| None)
+        .highlight(configuration, source.as_bytes(), None, |_| None)
         .ok()?;
     let mut rows = vec![Vec::new()];
     let mut styles = Vec::new();
