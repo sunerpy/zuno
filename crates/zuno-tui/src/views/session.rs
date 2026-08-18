@@ -55,6 +55,7 @@ use crate::views::message::{Message, StatusView, TranscriptView};
 use crate::views::permission::typed_character;
 use crate::views::scroll::Scroller;
 use crate::views::slash::{CatalogCommand, HostCommand, SlashRouter, SlashSubmission};
+use crate::views::toast::Toast;
 use crossterm::event::{
     Event as CrosstermEvent, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind,
 };
@@ -66,6 +67,25 @@ use tokio::sync::mpsc;
 
 /// The dialog id the skill browser reports under.
 pub const SKILL_DIALOG_ID: &str = "prompt_skills";
+
+/// The id the `/undo` confirmation reports under.
+///
+/// `/undo` restores the worktree to the boundary before the last completed turn, so it
+/// overwrites files on disk and discards anything edited since — the only action this
+/// screen routes that can destroy work the model never saw. It reached the driver with
+/// nothing asked, which made a mistyped `/undo` unrecoverable by any means the TUI has.
+///
+/// `/redo` is deliberately *not* confirmed. It reapplies the boundary the user just left
+/// by confirming an undo, so it restores a state they were shown and agreed to moments
+/// earlier; a second prompt for the same round trip only teaches people to press through
+/// both of them.
+pub const UNDO_CONFIRM_DIALOG_ID: &str = "confirm.undo";
+
+/// The id the in-dialog prompt editor reports under.
+pub const EDITOR_FALLBACK_DIALOG_ID: &str = "prompt.editor.fallback";
+
+/// The id the external-editor failure alert reports under.
+pub const EDITOR_ALERT_DIALOG_ID: &str = "alert.editor";
 
 /// Rows reserved for the status strip.
 const STATUS_ROWS: u16 = 1;
@@ -154,6 +174,13 @@ pub struct SessionScreen {
     catalog: SessionCatalog,
     /// Dialogs asked for but not yet opened by the host.
     requested: Vec<Box<dyn crate::views::dialog::Dialog>>,
+    /// Transient notices asked for but not yet raised by the host.
+    ///
+    /// A queue for exactly as long as it takes the host to drain it, even though the
+    /// slot it feeds holds one. Handling one action can produce at most one notice, and
+    /// the host takes the last; a `Vec` is what makes `drain_toasts` the same shape as
+    /// `drain_dialogs` rather than a second, subtly different seam.
+    toasts: Vec<Toast>,
     /// Selections the user made, for a host that applies them to the next turn.
     selections: Option<mpsc::Sender<Selection>>,
     /// The dialog currently over this screen, as [`Self::observe_modal`] last saw it.
@@ -278,6 +305,7 @@ impl SessionScreen {
             keymap: None,
             catalog: SessionCatalog::default(),
             requested: Vec::new(),
+            toasts: Vec::new(),
             selections: None,
             theme_restore: None,
             modal: None,
@@ -512,10 +540,21 @@ impl SessionScreen {
             match result {
                 Ok(Some(text)) => self.editor.set_text(&text),
                 Ok(None) => {}
-                Err(error) => self
-                    .transcript
-                    .transcript_mut()
-                    .push(Message::notice(format!("external editor failed: {error}"))),
+                // An alert rather than the transcript line this used to be, and rather
+                // than a toast. `$EDITOR` failures carry the child's own diagnostic —
+                // a path, an exit status, sometimes several lines — which a five-second
+                // corner notice can only truncate, and the transcript scrolls it away
+                // behind whatever the turn prints next. The user has to read this one to
+                // know whether their draft survived, so it waits to be dismissed.
+                Err(error) => {
+                    self.requested
+                        .push(Box::new(crate::views::basics::AlertDialog::new(
+                            self.context.clone(),
+                            EDITOR_ALERT_DIALOG_ID,
+                            "External editor failed",
+                            format!("{error}\n\nThe prompt is unchanged."),
+                        )))
+                }
             }
         }
         EventResult::REDRAW
@@ -523,9 +562,18 @@ impl SessionScreen {
 
     fn request_external_editor(&mut self) -> EventResult {
         let Some(requests) = self.editor_requests.as_ref() else {
-            self.transcript
-                .transcript_mut()
-                .push(Message::notice("external editor is unavailable"));
+            // A prompt dialog rather than the dead end this used to be. The action means
+            // "give me more room for this text"; answering it with one line saying no
+            // leaves the request unserved. The dialog serves it through the *same* sink
+            // the real editor's result uses — `self.editor.set_text` in
+            // `drain_editor_results` above — so the two routes cannot diverge.
+            self.requested
+                .push(Box::new(crate::views::basics::PromptDialog::new(
+                    self.context.clone(),
+                    EDITOR_FALLBACK_DIALOG_ID,
+                    "Edit prompt (no $EDITOR available)",
+                    self.editor.text(),
+                )));
             return EventResult::REDRAW;
         };
         let request = EditorRequest::new(self.editor.text());
@@ -649,6 +697,18 @@ impl SessionScreen {
                     arguments,
                 },
             ),
+            SlashSubmission::Host(HostCommand::Undo) => {
+                self.requested.push(Box::new(
+                    crate::views::basics::ConfirmDialog::new(
+                        self.context.clone(),
+                        UNDO_CONFIRM_DIALOG_ID,
+                        "Undo the last turn",
+                        "The worktree is restored to the boundary before the last completed \
+                         turn. Anything edited since is discarded and cannot be recovered.",
+                    )
+                    .with_labels("Restore", "Keep"),
+                ));
+            }
             SlashSubmission::Host(command) => {
                 self.submit_to_driver(text, PromptSubmission::Host(command));
             }
@@ -721,16 +781,6 @@ impl SessionScreen {
         }
     }
 
-    /// Put `text` on the clipboard, and say in the transcript what happened.
-    ///
-    /// Both outcomes are reported, not just the failure. A copy key that paints nothing
-    /// teaches the user the binding is broken, so "it worked" and "it did not" have to
-    /// be told apart on screen — the same reason [`Self::submit`] reports a refused
-    /// prompt and [`Self::adopt`] reports a selection nothing listened to.
-    ///
-    /// The transcript rather than the status strip: a copy is one event, and the strip
-    /// carries state that persists — a notice pinned there would still be claiming a
-    /// copy minutes later.
     /// Put `text` into the prompt, and submit nothing.
     ///
     /// Submitting nothing is the whole behaviour being bought here. A real-terminal
@@ -783,23 +833,40 @@ impl SessionScreen {
         EventResult::REDRAW
     }
 
+    /// Put `text` on the clipboard, and raise a toast saying what happened.
+    ///
+    /// Both outcomes are reported, not just the failure. A copy key that paints nothing
+    /// teaches the user the binding is broken, so "it worked" and "it did not" have to
+    /// be told apart on screen — the same reason [`Self::submit`] reports a refused
+    /// prompt and [`Self::adopt`] reports a selection nothing listened to.
+    ///
+    /// A toast rather than the transcript, which is where this used to go. Two things
+    /// were wrong with a transcript line. It is *permanent*: `copied 41 characters`
+    /// stays in the conversation forever and is then exported and re-read as though the
+    /// user had said it. And it is *invisible when it matters* — a copy made while a
+    /// picker is open lands behind the modal, so the one keystroke whose feedback the
+    /// user is actively waiting for is the one they cannot see. `§11.4` puts the toast
+    /// above the dialog for exactly this case, and `§6.1` names copy feedback as the
+    /// example of a fact that must not interrupt the input flow.
+    ///
+    /// Not the status strip either: the strip carries state that persists, and a notice
+    /// pinned there would still be claiming a copy minutes later.
     fn copy(&mut self, text: String) -> EventResult {
         // An empty buffer with nothing selected is not a copy, and writing the empty
         // string would destroy whatever the user already had on their clipboard.
-        let notice = if text.is_empty() {
-            String::from("nothing to copy: the prompt is empty and no text is selected")
+        self.toasts.push(if text.is_empty() {
+            // `warning`, not `error`: nothing failed, and there is something the user can
+            // do about it. `§11.5` reserves `error` for a failure.
+            Toast::warning("nothing to copy: the prompt is empty and no text is selected")
         } else {
             match self.clipboard.write(&text) {
-                Ok(()) => format!(
+                Ok(()) => Toast::success(format!(
                     "copied {} characters to the clipboard",
                     text.chars().count()
-                ),
-                Err(error) => format!("copy failed: {error}"),
+                )),
+                Err(error) => Toast::error(format!("copy failed: {error}")),
             }
-        };
-        self.transcript
-            .transcript_mut()
-            .push(Message::notice(notice));
+        });
         EventResult::REDRAW
     }
 }
@@ -1349,14 +1416,45 @@ impl ActionComponent for SessionScreen {
         std::mem::take(&mut self.requested)
     }
 
+    fn drain_toasts(&mut self) -> Vec<Toast> {
+        std::mem::take(&mut self.toasts)
+    }
+
     fn apply_dialog_outcome(
         &mut self,
         dialog: &'static str,
         outcome: &crate::views::dialog::DialogOutcome,
     ) -> EventResult {
         match outcome {
+            // The confirmation is checked before the general `Selected` arm because
+            // `adopt` routes on the dialog id and would report this one as unknown.
+            crate::views::dialog::DialogOutcome::Selected { value, .. }
+                if dialog == UNDO_CONFIRM_DIALOG_ID =>
+            {
+                if value == crate::views::basics::CONFIRM_VALUE {
+                    // The same call the unconfirmed path made, reached only now. The
+                    // shown text is `/undo` rather than a sentence about it, so the
+                    // transcript records what the user invoked.
+                    self.submit_to_driver(
+                        String::from("/undo"),
+                        PromptSubmission::Host(HostCommand::Undo),
+                    );
+                }
+                EventResult::REDRAW
+            }
             crate::views::dialog::DialogOutcome::Selected { value, .. } => {
                 self.adopt(dialog, value)
+            }
+            // The dialog the external-editor fallback opened answered, so the text goes
+            // where the real editor's result goes. Cancelling leaves the buffer alone,
+            // which is `Ok(None)`'s behaviour in `drain_editor_results` — the two routes
+            // agree on both outcomes, not just the successful one.
+            crate::views::dialog::DialogOutcome::Submitted { text, .. }
+                if dialog == EDITOR_FALLBACK_DIALOG_ID =>
+            {
+                self.editor.set_text(text);
+                self.refresh_autocomplete();
+                EventResult::REDRAW
             }
             // Escape arrives as a cancelled outcome through the same routing a selection
             // takes, so no key is named here — which is the discipline this layer keeps.

@@ -167,6 +167,15 @@ impl Dialog for HelpView {
         }
     }
 
+    /// `§11.4`'s widest tier, by the same argument that table makes for status and debug.
+    ///
+    /// Those three are read-only reference tables rather than pick-one lists, and each
+    /// row here carries two columns — a chord and a sentence. At 88 the description of a
+    /// leader sequence is what gets truncated, which is the half a user came for.
+    fn width(&self) -> crate::views::dialog::DialogWidth {
+        crate::views::dialog::DialogWidth::XLarge
+    }
+
     fn lines(&mut self, width: u16) -> Vec<Line<'static>> {
         let rows = self.rows();
         let total = rows.len();

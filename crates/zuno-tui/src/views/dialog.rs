@@ -49,9 +49,32 @@
 //! Dialogs stack, because upstream's do: a permission prompt escalates into an
 //! "always allow" confirmation, and a session picker can open a rename prompt. The
 //! top of the stack has the keys; everything below it renders nothing.
+//!
+//! # Width is the host's decision, not each dialog's
+//!
+//! `§11.4` fixes three widths — 60, 88 and 116 columns — and a dialog picks a tier
+//! rather than a number ([`Dialog::width`]). The clamp, the centring and the
+//! narrow-terminal fallback all happen once, here, for the reason the theme is shared
+//! rather than copied: a per-dialog width computation is a rule that only *some* future
+//! dialog remembers, and the failure is a stack whose two halves disagree about where
+//! their left edge is.
+//!
+//! Fixed columns rather than a fraction of the terminal, again from `§11.4`: 60 columns
+//! is about the floor for a readable list, and a percentage stretches that list into a
+//! sparse band on a wide terminal. See [`dialog_columns`] for what happens when the
+//! terminal is narrower than the tier — the case the plan does not name.
+//!
+//! # Toasts sit above the stack
+//!
+//! `§11.4` orders the layers backdrop, dialog, toast, and the host owns the toast slot
+//! for that reason: a toast the base screen drew would be *under* an open modal, so a
+//! copy made while a picker was up would be confirmed behind it. The base asks for one
+//! through [`ActionComponent::drain_toasts`], the same seam it asks for a dialog
+//! through.
 
 use crate::app::{AppEvent, Component, EventResult};
 use crate::keybind::{ActionComponent, Chord, Definition, is_exit_request};
+use crate::views::toast::ToastLayer;
 use crate::views::{ViewContext, fill, hint, padded};
 use crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -108,6 +131,86 @@ pub enum DialogOutcome {
     McpToggle(crate::views::picker::McpToggleRequest),
 }
 
+/// One of `§11.4`'s three fixed dialog widths.
+///
+/// Three named tiers rather than a `u16` per dialog. A number lets a caller pick 62,
+/// and then two dialogs in one stack have edges a column apart for no reason a reader
+/// can recover; a tier makes "which of the three is this" the only question, and the
+/// answer is reviewable against the plan's table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogWidth {
+    /// 60 columns: confirm, alert, prompt, rename, variant.
+    Medium,
+    /// 88 columns: model, agent, session, theme, skill, palette.
+    Large,
+    /// 116 columns: status, debug, inline diff, the permission prompt.
+    XLarge,
+}
+
+impl DialogWidth {
+    /// This tier's width in terminal columns.
+    #[must_use]
+    pub const fn columns(self) -> u16 {
+        match self {
+            Self::Medium => 60,
+            Self::Large => 88,
+            Self::XLarge => 116,
+        }
+    }
+}
+
+/// Columns left free around a dialog when the terminal cannot hold its tier.
+///
+/// `§11.4`'s `term_width - 4`: two columns of breathing room on each side once the
+/// dialog is centred, so the surface behind it still reads as a surface rather than as
+/// a border the dialog forgot to draw.
+pub const DIALOG_GUTTER: u16 = 4;
+
+/// How many columns a dialog at `tier` gets on a terminal `available` columns wide.
+///
+/// `§11.4` specifies `min(tier, available - 4)` and stops there. Two cases it does not
+/// name, both reachable:
+///
+/// * **Below 60 columns** the tier is abandoned entirely and the dialog takes
+///   `available - 4`. There is no lower tier to fall back to, and refusing to shrink
+///   would draw a 60-column dialog into a 20-column frame — either clipped by the
+///   backend or panicking on an out-of-bounds `Rect`, depending on which widget got
+///   there first. The plan's acceptance case is exactly this: 20×10 must not panic.
+/// * **At four columns or fewer** the gutter itself is abandoned and the dialog takes
+///   the whole width. `available - 4` saturates to zero there, and a zero-width dialog
+///   is not a small dialog — it is an *invisible modal that still owns the keyboard*,
+///   which leaves the user pressing keys at something they cannot see. A cramped prompt
+///   is recoverable; an invisible one is the trap the exit-chord forwarding above exists
+///   to prevent, arrived at from the other direction.
+#[must_use]
+pub const fn dialog_columns(tier: DialogWidth, available: u16) -> u16 {
+    let usable = available.saturating_sub(DIALOG_GUTTER);
+    if usable == 0 {
+        return available;
+    }
+    let tier = tier.columns();
+    if tier < usable { tier } else { usable }
+}
+
+/// Which end of a body that does not fit is kept.
+///
+/// `§11.4` asks for internal scrolling on overflow, which the list dialogs implement
+/// themselves by windowing. For the base forms the whole question is which row must not
+/// be the one lost, and that is answerable without a scrollbar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyAnchor {
+    /// Keep the first rows. What a list wants: the cursor is windowed into view already.
+    Head,
+    /// Keep the last rows.
+    ///
+    /// For a form whose final row is its buttons. Measured at 20×10: the confirmation's
+    /// wrapped question filled the frame and pushed `Restore` / `Keep` off the bottom, so
+    /// a destructive prompt was showing a question with no visible answer and no way to
+    /// see which button `Enter` would press. Losing the head of a sentence whose title
+    /// still names the action is the smaller loss by a wide margin.
+    Tail,
+}
+
 /// A modal surface.
 ///
 /// Deliberately not `Component`: a dialog is rendered by its host inside a computed
@@ -127,6 +230,24 @@ pub trait Dialog: Send {
     /// The footer hints, as `(key label, description)` pairs.
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
         vec![("↑↓", "move"), ("enter", "select"), ("esc", "cancel")]
+    }
+
+    /// Which end of an over-long body survives when the frame cannot hold all of it.
+    ///
+    /// [`BodyAnchor::Head`] by default, which is what a list wants and what clipping did
+    /// before this existed. A form whose decisive row is the *last* one says so — see
+    /// [`BodyAnchor::Tail`] for the measured reason.
+    fn anchor(&self) -> BodyAnchor {
+        BodyAnchor::Head
+    }
+
+    /// Which of `§11.4`'s three tiers this dialog is laid out at.
+    ///
+    /// `Large` by default because that is the tier the majority of the shipped set sits
+    /// in — every list surface — so the default is the answer a new list dialog wants
+    /// without thinking about it. The two forms that want something else say so.
+    fn width(&self) -> DialogWidth {
+        DialogWidth::Large
     }
 
     /// Additional keybind scopes active only while this dialog owns the keyboard.
@@ -170,6 +291,7 @@ pub struct DialogHost {
     stack: Vec<Box<dyn Dialog>>,
     outcomes: Vec<(&'static str, DialogOutcome)>,
     pending: Vec<Chord>,
+    toasts: ToastLayer,
 }
 
 impl DialogHost {
@@ -177,12 +299,45 @@ impl DialogHost {
     #[must_use]
     pub fn new(context: ViewContext, base: Box<dyn ActionComponent>) -> Self {
         Self {
+            toasts: ToastLayer::new(context.clone()),
             context,
             base,
             stack: Vec::new(),
             outcomes: Vec::new(),
             pending: Vec::new(),
         }
+    }
+
+    /// Let a toast wake the loop when it expires.
+    ///
+    /// Without this a toast still disappears, but only once something else brings the
+    /// loop round — see [`crate::views::toast`] for why one deadline and one wake is the
+    /// shape chosen over polling.
+    #[must_use]
+    pub fn with_toast_waker(
+        mut self,
+        waker: tokio::sync::mpsc::Sender<crate::app::TerminalEvent>,
+    ) -> Self {
+        self.toasts = ToastLayer::new(self.context.clone()).with_waker(waker);
+        self
+    }
+
+    /// The toast slot, for a host that wants to raise one itself.
+    pub const fn toasts_mut(&mut self) -> &mut ToastLayer {
+        &mut self.toasts
+    }
+
+    /// Move anything the base asked to show into the toast slot.
+    ///
+    /// Only the last survives, because the slot holds one. A base that raised two in a
+    /// single action meant the second.
+    fn take_toasts(&mut self) -> bool {
+        let requested = self.base.drain_toasts();
+        let raised = !requested.is_empty();
+        if let Some(toast) = requested.into_iter().next_back() {
+            self.toasts.show(toast);
+        }
+        raised
     }
 
     /// Push a dialog onto the stack.
@@ -241,18 +396,25 @@ impl DialogHost {
         let Some(dialog) = self.stack.last_mut() else {
             return;
         };
-        let inner_width = area.width.saturating_sub(2);
+        // `§11.4`'s tier, clamped once here rather than by each dialog. Everything below
+        // measures from `columns`, so a dialog cannot disagree with its own frame.
+        let columns = dialog_columns(dialog.width(), area.width);
+        let inner_width = columns.saturating_sub(2);
         let title = dialog.title();
         let hints = dialog.hints();
+        let anchor = dialog.anchor();
         let body = dialog.lines(inner_width);
         let content_rows = u16::try_from(body.len()).unwrap_or(u16::MAX);
         let desired = dialog.desired_height(content_rows, area.height);
 
-        let height = desired.min(area.height).max(3);
+        // `max(3)` after `min(area.height)` and not before: a frame with one or two rows
+        // has to yield a one- or two-row dialog, and clamping up first would place a
+        // three-row region outside the buffer.
+        let height = desired.min(area.height).max(3).min(area.height);
         let region = Rect {
-            x: area.x,
+            x: area.x + (area.width.saturating_sub(columns)) / 2,
             y: area.y + area.height.saturating_sub(height),
-            width: area.width,
+            width: columns,
             height,
         };
         fill(frame.buffer_mut(), region, self.context.surface());
@@ -293,6 +455,14 @@ impl DialogHost {
             frame.buffer_mut(),
         );
 
+        // Clipped here rather than left to `Paragraph`, which always drops the tail. Which
+        // end is dropped is the dialog's call; see `BodyAnchor`.
+        let rows = usize::from(body_area.height);
+        let body = if body.len() > rows && anchor == BodyAnchor::Tail {
+            body[body.len() - rows..].to_vec()
+        } else {
+            body
+        };
         Paragraph::new(body).style(self.context.surface()).render(
             Rect {
                 x: body_area.x + 1,
@@ -331,6 +501,8 @@ impl Component for DialogHost {
         self.base.observe_modal(self.active());
         self.base.render(frame, area);
         self.render_dialog(frame, area);
+        // Last, so it is on top of the modal. `§11.4`: backdrop, dialog, toast.
+        self.toasts.render(frame.buffer_mut(), area);
     }
 
     fn handle_event(&mut self, event: &AppEvent) -> EventResult {
@@ -373,7 +545,21 @@ impl Component for DialogHost {
                 self.base.handle_event(event)
             }
             _ => {
-                let result = self.base.handle_event(event);
+                let mut result = self.base.handle_event(event);
+                // Both seams are serviced here as well as after an action, because not
+                // every request comes from a key. A wake is how the base learns its
+                // external-editor worker answered, and a failed edit has to raise an alert
+                // — which was requested and never opened while this branch only drained
+                // for keys. The engine's own events reach the base the same way.
+                //
+                // The prune is what makes `TerminalEvent::Wake` remove an expired toast.
+                let opened = self.open_requested();
+                if opened || self.take_toasts() || self.toasts.prune(std::time::Instant::now()) {
+                    result = EventResult {
+                        handled: result.handled,
+                        redraw: true,
+                    };
+                }
                 if self.is_open() {
                     // A dialog is drawn over the base, so a base repaint has to
                     // repaint the dialog too.
@@ -412,6 +598,7 @@ impl ActionComponent for DialogHost {
                 DialogStep::Emitted(outcome) => {
                     self.base.apply_dialog_outcome(id, &outcome);
                     self.outcomes.push((id, outcome));
+                    self.take_toasts();
                     EventResult::REDRAW
                 }
                 DialogStep::Resolved(outcome) => {
@@ -421,14 +608,21 @@ impl ActionComponent for DialogHost {
                     // queue a host also drains.
                     self.base.apply_dialog_outcome(id, &outcome);
                     self.outcomes.push((id, outcome));
+                    // Both seams are serviced, and in this order: answering one dialog is
+                    // exactly how a confirmation escalates into the next surface, and how
+                    // it reports what it did. Servicing only one of the two is how a
+                    // confirmed action ends in silence.
                     self.open_requested();
+                    self.take_toasts();
                     EventResult::REDRAW
                 }
             };
         }
         let result = self.base.handle_action(action, event);
         // Drained after the action, never before: the action is what asks.
-        if self.open_requested() {
+        let opened = self.open_requested();
+        let raised = self.take_toasts();
+        if opened || raised {
             return EventResult::REDRAW;
         }
         result

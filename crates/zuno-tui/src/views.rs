@@ -45,6 +45,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 
 pub mod ambient;
 pub mod autocomplete;
+pub mod basics;
 pub mod dialog;
 pub mod diff;
 pub mod editor;
@@ -61,6 +62,7 @@ pub mod question;
 pub mod scroll;
 pub mod session;
 pub mod slash;
+pub mod toast;
 pub mod tool;
 pub mod welcome;
 
