@@ -10,8 +10,9 @@ use std::collections::HashMap;
 use serde_json::{Map, Value, json};
 use zuno_db::message::{MessageStore, PartRecord, now_millis};
 use zuno_db::{Connection, open};
-use zuno_error::DbError;
+use zuno_error::{DbError, ProviderError};
 use zuno_llm::event::{FinishReason, StreamEvent, ThoughtSignature};
+use zuno_llm::sse::{StreamLimits, append_tool_input};
 
 /// Dirty delta bytes accumulated before live text/reasoning is upserted.
 pub const DELTA_BATCH_BYTES: usize = 4 * 1024;
@@ -166,6 +167,9 @@ pub enum ProjectionError {
     /// An event arrived after the projector had already terminated.
     #[error("stream projection already finished")]
     AlreadyFinished,
+    /// A provider payload exceeded a stream limit.
+    #[error(transparent)]
+    Provider(#[from] ProviderError),
     /// SQLite or record decoding failed.
     #[error(transparent)]
     Database(#[from] DbError),
@@ -222,6 +226,7 @@ where
     reasoning: Option<ReasoningBuffer>,
     tools: HashMap<String, StoredTool>,
     active_tool: Option<ActiveTool>,
+    tool_input_limit: usize,
     last_tool_id: Option<String>,
     attempt_part_ids: Vec<String>,
     dirty_delta_bytes: usize,
@@ -252,6 +257,7 @@ where
             reasoning: None,
             tools: HashMap::new(),
             active_tool: None,
+            tool_input_limit: StreamLimits::from_environment().max_tool_input_bytes(),
             last_tool_id: None,
             attempt_part_ids: Vec::new(),
             dirty_delta_bytes: 0,
@@ -286,7 +292,13 @@ where
             StreamEvent::ToolUseStart { id, name } => self.start_tool(id, name)?,
             StreamEvent::ToolInputDelta(delta) => {
                 if let Some(tool) = &mut self.active_tool {
-                    tool.raw_input.push_str(&delta);
+                    append_tool_input(
+                        &mut tool.raw_input,
+                        &delta,
+                        "stream-projector",
+                        &self.context.message_id,
+                        self.tool_input_limit,
+                    )?;
                 }
             }
             StreamEvent::ToolUseEnd => self.finish_active_tool()?,

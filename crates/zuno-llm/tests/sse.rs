@@ -4,9 +4,19 @@ use std::time::Duration;
 
 use zuno_error::ProviderError;
 use zuno_llm::sse::{
-    DEFAULT_STREAM_IDLE_TIMEOUT_SECS, SseEvent, SseParser, StreamIdleTimeout, Utf8StreamDecoder,
+    DEFAULT_STREAM_IDLE_TIMEOUT_SECS, SseEvent, SseParser, StreamIdleTimeout, StreamLimits,
+    Utf8StreamDecoder, append_tool_input,
 };
 use zuno_testkit::{CassettePlayer, list_cassettes};
+
+fn successful_events(
+    items: impl IntoIterator<Item = Result<SseEvent, ProviderError>>,
+) -> Vec<SseEvent> {
+    items
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("SSE framing succeeds")
+}
 
 fn mixed_script_frame() -> (String, String) {
     let unit = "中文流式响应 preserves English, Ελληνικά, العربية, and emoji 🧠🚀。";
@@ -24,9 +34,10 @@ fn sse_every_byte_split_round_trips_a_four_kib_mixed_script_payload() {
 
     for split in 0..=frame.len() {
         let mut parser = SseParser::new();
-        let mut events = parser.push(&frame.as_bytes()[..split]);
-        events.extend(parser.push(&frame.as_bytes()[split..]));
-        events.extend(parser.finish());
+        let mut items = parser.push(&frame.as_bytes()[..split]);
+        items.extend(parser.push(&frame.as_bytes()[split..]));
+        items.extend(parser.finish());
+        let events = successful_events(items);
 
         assert_eq!(events.len(), 1, "unexpected event count at offset {split}");
         let value: serde_json::Value = events[0]
@@ -65,8 +76,9 @@ fn sse_decoder_holds_incomplete_code_points_between_chunks() {
 #[test]
 fn sse_crlf_frames_parse_without_leaking_carriage_returns() {
     let mut parser = SseParser::new();
-    let events =
-        parser.push(b"event: message\r\ndata: {\"text\":\"hello\"}\r\n\r\ndata: [DONE]\r\n\r\n");
+    let events = successful_events(
+        parser.push(b"event: message\r\ndata: {\"text\":\"hello\"}\r\n\r\ndata: [DONE]\r\n\r\n"),
+    );
 
     assert_eq!(
         events,
@@ -88,7 +100,7 @@ fn sse_finish_emits_a_trailing_unterminated_frame() {
     let mut parser = SseParser::new();
     assert!(parser.push(b"event: delta\ndata: final").is_empty());
     assert_eq!(
-        parser.finish(),
+        successful_events(parser.finish()),
         vec![SseEvent {
             event: Some("delta".to_owned()),
             data: "final".to_owned(),
@@ -102,7 +114,8 @@ fn sse_malformed_json_error_names_provider_and_model() {
     let event = parser
         .push(b"data: {\"broken\":]\n\n")
         .pop()
-        .expect("one malformed frame");
+        .expect("one malformed frame")
+        .expect("SSE framing succeeds");
     let error = event
         .deserialize::<serde_json::Value>("anthropic", "claude-opus-4-7")
         .expect_err("malformed JSON must fail");
@@ -182,11 +195,12 @@ fn sse_real_provider_recordings_parse_with_the_shared_parser() {
 
             let expected = response.sse_frames();
             let mut parser = SseParser::new();
-            let mut actual = Vec::new();
+            let mut items = Vec::new();
             for chunk in body.chunks(17) {
-                actual.extend(parser.push(chunk));
+                items.extend(parser.push(chunk));
             }
-            actual.extend(parser.finish());
+            items.extend(parser.finish());
+            let actual = successful_events(items);
 
             assert_eq!(actual.len(), expected.len(), "frame count in {name}");
             for (frame_index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
@@ -218,6 +232,87 @@ fn sse_real_provider_recordings_parse_with_the_shared_parser() {
         crlf_separators > 0,
         "the corpus should exercise CRLF frames"
     );
+}
+
+#[test]
+fn sse_stream_without_a_delimiter_errors_at_the_event_cap() {
+    let limit = 64;
+    let limits = StreamLimits::new(limit, 32);
+    let mut parser = SseParser::with_limits("hostile-provider", "no-delimiter", limits);
+
+    assert!(parser.push(&vec![b'x'; limit]).is_empty());
+    let error = parser
+        .push(b"x")
+        .pop()
+        .expect("the first byte over the cap must produce an item")
+        .expect_err("an unterminated event must be refused before further growth");
+    let detail = error
+        .source()
+        .expect("the provider error retains the size failure")
+        .to_string();
+
+    assert!(detail.contains("hostile-provider"), "{detail}");
+    assert!(detail.contains("no-delimiter"), "{detail}");
+    assert!(detail.contains("65 bytes"), "{detail}");
+    assert!(detail.contains("limit 64 bytes"), "{detail}");
+}
+
+#[test]
+fn sse_large_event_below_the_cap_parses_intact() {
+    let text = "x".repeat(96 * 1024);
+    let frame = format!("event: content\ndata: {text}\n\n");
+    let limits = StreamLimits::new(frame.len(), 32);
+    let mut parser = SseParser::with_limits("large-provider", "long-code", limits);
+
+    let events = successful_events(parser.push(frame.as_bytes()));
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event.as_deref(), Some("content"));
+    assert_eq!(events[0].data, text);
+}
+
+#[test]
+fn sse_cap_boundary_retains_a_split_multibyte_code_point() {
+    let content = "x".repeat(29);
+    let frame_without_separator = format!("data: {content}界");
+    let boundary = frame_without_separator.len();
+    let bytes = frame_without_separator.as_bytes();
+    let multibyte_start = boundary - "界".len();
+    let limits = StreamLimits::new(boundary, 32);
+    let mut parser = SseParser::with_limits("utf8-provider", "boundary", limits);
+
+    assert!(parser.push(&bytes[..multibyte_start + 1]).is_empty());
+    assert!(parser.push(&bytes[multibyte_start + 1..]).is_empty());
+    assert!(parser.push(b"\n").is_empty());
+    let events = successful_events(parser.push(b"\n"));
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].data, format!("{content}界"));
+}
+
+#[test]
+fn input_json_over_the_cap_errors_without_truncating_or_appending() {
+    let mut input = String::from("{\"path\":\"");
+    let before = input.clone();
+    let limit = input.len() + 3;
+
+    let error = append_tool_input(
+        &mut input,
+        "toolong\"}",
+        "anthropic",
+        "claude-tool-stream",
+        limit,
+    )
+    .expect_err("tool JSON beyond the cap must be refused");
+    let detail = error
+        .source()
+        .expect("the provider error retains the size failure")
+        .to_string();
+
+    assert_eq!(input, before, "a rejected fragment must not be appended");
+    assert!(detail.contains("anthropic"), "{detail}");
+    assert!(detail.contains("claude-tool-stream"), "{detail}");
+    assert!(detail.contains(&format!("limit {limit} bytes")), "{detail}");
 }
 
 #[test]
