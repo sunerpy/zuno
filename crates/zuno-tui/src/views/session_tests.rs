@@ -341,6 +341,51 @@ fn session_screen_catalog_slash_stays_typed_for_the_host() {
 }
 
 #[test]
+fn session_screen_undo_and_redo_stay_typed_for_the_runtime_host() {
+    for (text, expected) in [
+        ("/undo", PromptSubmission::Host(HostCommand::Undo)),
+        ("/redo", PromptSubmission::Host(HostCommand::Redo)),
+    ] {
+        let (sender, _shutdown) = terminal_event_channel();
+        let (prompts, mut submitted) = mpsc::channel(1);
+        let mut screen =
+            SessionScreen::new(ViewContext::defaults(), sender).with_prompt_sink(prompts);
+        screen.editor.set_text(text);
+
+        screen.handle_action(action("input_submit"), &press_none());
+
+        assert_eq!(submitted.try_recv(), Ok(expected));
+        assert_eq!(screen.submissions(), [text]);
+    }
+}
+
+#[test]
+fn session_screen_forwards_mcp_toggle_requests_without_waiting() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (toggles, mut requested) = mpsc::channel(1);
+    let projection =
+        crate::views::picker::McpProjection::new(vec![crate::views::picker::McpServer {
+            name: "context7".to_owned(),
+            state: crate::views::picker::McpState::Connected,
+            desired_enabled: true,
+        }]);
+    let mut screen =
+        SessionScreen::new(ViewContext::defaults(), sender).with_mcp_control(projection, toggles);
+    let request = crate::views::picker::McpToggleRequest {
+        server: "context7".to_owned(),
+        desired_enabled: false,
+    };
+
+    let result = screen.apply_dialog_outcome(
+        crate::views::picker::MCP_DIALOG_ID,
+        &crate::views::dialog::DialogOutcome::McpToggle(request.clone()),
+    );
+
+    assert!(result.redraw);
+    assert_eq!(requested.try_recv(), Ok(request));
+}
+
+#[test]
 fn session_screen_unknown_slash_is_visible_and_never_reaches_the_prompt_sink() {
     let (sender, _shutdown) = terminal_event_channel();
     let (prompts, mut submitted) = mpsc::channel(1);
@@ -1530,14 +1575,19 @@ fn session_down_past_the_newest_history_entry_restores_the_draft() {
 /// A screen with every catalog and ambient list the six bound surfaces read from.
 fn furnished_screen() -> SessionScreen {
     let (sender, _receiver) = terminal_event_channel();
+    let (mcp_toggles, _mcp_requests) = mpsc::channel(1);
     let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_mcp_control(
+            crate::views::picker::McpProjection::new(vec![crate::views::picker::McpServer {
+                name: "context7".to_owned(),
+                state: crate::views::picker::McpState::Connected,
+                desired_enabled: true,
+            }]),
+            mcp_toggles,
+        )
         .with_keymap(Keymap::defaults().expect("the shipped table builds"));
     *screen.catalog_mut() = catalog();
     let ambient = screen.sidebar_mut().ambient_mut();
-    ambient.mcp = vec![crate::views::ambient::Service::new(
-        "context7",
-        crate::views::ambient::Health::Ready,
-    )];
     ambient.skills = vec![crate::views::ambient::SkillSummary {
         name: String::from("codegraph"),
         description: String::from("navigate an indexed codebase"),

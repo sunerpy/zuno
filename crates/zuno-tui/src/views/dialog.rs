@@ -72,6 +72,8 @@ pub enum DialogStep {
     Redraw,
     /// The dialog is finished; `outcome` is its answer.
     Resolved(DialogOutcome),
+    /// The dialog produced an answer but remains mounted.
+    Emitted(DialogOutcome),
 }
 
 /// A finished dialog's answer.
@@ -102,6 +104,8 @@ pub enum DialogOutcome {
     Permission(crate::views::permission::PermissionDecision),
     /// A question was answered, one label list per question.
     Question(Vec<Vec<String>>),
+    /// The MCP dialog requested an explicit lifecycle target.
+    McpToggle(crate::views::picker::McpToggleRequest),
 }
 
 /// A modal surface.
@@ -123,6 +127,11 @@ pub trait Dialog: Send {
     /// The footer hints, as `(key label, description)` pairs.
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
         vec![("↑↓", "move"), ("enter", "select"), ("esc", "cancel")]
+    }
+
+    /// Additional keybind scopes active only while this dialog owns the keyboard.
+    fn focused_scopes(&self) -> Vec<&'static str> {
+        Vec::new()
     }
 
     /// Act on one resolved binding.
@@ -350,6 +359,11 @@ impl Component for DialogHost {
                             EventResult::REDRAW
                         }
                         DialogStep::Redraw => EventResult::REDRAW,
+                        DialogStep::Emitted(outcome) => {
+                            self.base.apply_dialog_outcome(id, &outcome);
+                            self.outcomes.push((id, outcome));
+                            EventResult::REDRAW
+                        }
                         DialogStep::Ignored => EventResult {
                             handled: true,
                             redraw: false,
@@ -395,6 +409,11 @@ impl ActionComponent for DialogHost {
                     }
                 }
                 DialogStep::Redraw => EventResult::REDRAW,
+                DialogStep::Emitted(outcome) => {
+                    self.base.apply_dialog_outcome(id, &outcome);
+                    self.outcomes.push((id, outcome));
+                    EventResult::REDRAW
+                }
                 DialogStep::Resolved(outcome) => {
                     self.stack.pop();
                     // The base is told before the outcome is queued, so a component that
@@ -416,13 +435,15 @@ impl ActionComponent for DialogHost {
     }
 
     fn focused_scopes(&self) -> Vec<&'static str> {
-        if self.is_open() {
-            vec![
+        if let Some(dialog) = self.stack.last() {
+            let mut scopes = dialog.focused_scopes();
+            scopes.extend([
                 "permission.prompt",
                 "dialog.select",
                 "dialog.prompt",
                 "session",
-            ]
+            ]);
+            scopes
         } else {
             self.base.focused_scopes()
         }

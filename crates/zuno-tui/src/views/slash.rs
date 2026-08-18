@@ -58,6 +58,17 @@ pub enum SlashCommandKind {
     UiAction(&'static str),
     /// Ask the host to resolve a catalog template.
     Catalog,
+    /// Ask the runtime host to perform a session-local control operation.
+    Host(HostCommand),
+}
+
+/// A slash command executed by the runtime host rather than the model or view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostCommand {
+    /// Restore the worktree boundary before the most recent completed turn.
+    Undo,
+    /// Reapply the most recently undone turn boundary.
+    Redo,
 }
 
 /// One discoverable slash command.
@@ -93,6 +104,8 @@ pub enum SlashSubmission {
         /// Unexpanded argument tail.
         arguments: String,
     },
+    /// A session-local operation for the runtime host.
+    Host(HostCommand),
     /// A slash-prefixed name owned by neither command class.
     Unknown(String),
 }
@@ -172,6 +185,7 @@ impl SlashRouter {
                 command: command.name.clone(),
                 arguments,
             },
+            SlashCommandKind::Host(command) => SlashSubmission::Host(command),
         }
     }
 }
@@ -282,6 +296,20 @@ fn ui_commands() -> Vec<SlashCommand> {
                 kind: SlashCommandKind::UiAction(definition.name),
             })
         })
+        .chain([
+            SlashCommand {
+                name: "undo".to_owned(),
+                aliases: Vec::new(),
+                description: "Restore the worktree before the last completed turn".to_owned(),
+                kind: SlashCommandKind::Host(HostCommand::Undo),
+            },
+            SlashCommand {
+                name: "redo".to_owned(),
+                aliases: Vec::new(),
+                description: "Reapply the most recently undone turn".to_owned(),
+                kind: SlashCommandKind::Host(HostCommand::Redo),
+            },
+        ])
         .collect()
 }
 

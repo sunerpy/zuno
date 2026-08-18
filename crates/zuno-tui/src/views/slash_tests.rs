@@ -6,7 +6,10 @@ fn route(input: &str) -> SlashSubmission {
 
 #[test]
 fn every_ui_route_is_backed_by_the_keybind_source_of_truth() {
-    let commands = ui_commands();
+    let commands = ui_commands()
+        .into_iter()
+        .filter(|command| matches!(command.kind, SlashCommandKind::UiAction(_)))
+        .collect::<Vec<_>>();
     assert_eq!(commands.len(), UI_SPECS.len());
     for command in commands {
         let SlashCommandKind::UiAction(action) = command.kind else {
@@ -23,7 +26,10 @@ fn every_ui_route_is_backed_by_the_keybind_source_of_truth() {
 #[test]
 fn every_ui_slash_action_lives_in_a_session_scope() {
     let scopes = crate::views::session::scopes();
-    for command in ui_commands() {
+    for command in ui_commands()
+        .into_iter()
+        .filter(|command| matches!(command.kind, SlashCommandKind::UiAction(_)))
+    {
         let SlashCommandKind::UiAction(action) = command.kind else {
             panic!("UI projection produced a catalog command");
         };
@@ -38,6 +44,45 @@ fn every_ui_slash_action_lives_in_a_session_scope() {
             definition.scope
         );
     }
+}
+
+#[test]
+fn undo_and_redo_are_host_commands_not_ui_actions_or_catalog_prompts() {
+    assert_eq!(route("/undo"), SlashSubmission::Host(HostCommand::Undo));
+    assert_eq!(route("/redo"), SlashSubmission::Host(HostCommand::Redo));
+    let router = SlashRouter::default();
+    for name in ["undo", "redo"] {
+        let command = router
+            .commands()
+            .iter()
+            .find(|command| command.name == name)
+            .unwrap_or_else(|| panic!("/{name} is absent from autocomplete"));
+        assert!(matches!(command.kind, SlashCommandKind::Host(_)));
+    }
+}
+
+#[test]
+fn host_commands_win_catalog_name_collisions() {
+    let router = SlashRouter::new([
+        CatalogCommand::new("undo", None),
+        CatalogCommand::new("redo", None),
+    ]);
+    assert_eq!(
+        router.resolve("/undo"),
+        SlashSubmission::Host(HostCommand::Undo)
+    );
+    assert_eq!(
+        router.resolve("/redo"),
+        SlashSubmission::Host(HostCommand::Redo)
+    );
+    assert_eq!(
+        router
+            .commands()
+            .iter()
+            .filter(|command| command.name == "undo" || command.name == "redo")
+            .count(),
+        2
+    );
 }
 
 #[test]

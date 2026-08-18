@@ -636,11 +636,22 @@ impl TurnHost {
     }
 
     pub(crate) fn open_with_runtime(
+        plan: TurnPlan,
+        environment: &StartupEnvironment,
+        approval: Arc<dyn PermissionAsker>,
+        question: Option<Arc<dyn zuno_tools::question::QuestionAsker>>,
+        runs: SessionRunRegistry,
+    ) -> Result<Self, String> {
+        Self::open_with_runtime_and_mcp(plan, environment, approval, question, runs, None)
+    }
+
+    pub(crate) fn open_with_runtime_and_mcp(
         mut plan: TurnPlan,
         environment: &StartupEnvironment,
         approval: Arc<dyn PermissionAsker>,
         question: Option<Arc<dyn zuno_tools::question::QuestionAsker>>,
         runs: SessionRunRegistry,
+        mcp: Option<zuno_mcp::Catalog>,
     ) -> Result<Self, String> {
         let env = environment.resolved();
         let worktree = plan
@@ -672,9 +683,13 @@ impl TurnHost {
                 .map_err(to_string)?,
             None => discovered_commands,
         };
+        let mcp_prompts = mcp
+            .as_ref()
+            .map_or_else(Vec::new, zuno_mcp::Catalog::prompts);
         let commands = zuno_catalog::command::Registry::build(
             &zuno_catalog::command::Sources::new(&command_worktree)
-                .with_config(Some(&configured_commands)),
+                .with_config(Some(&configured_commands))
+                .with_mcp_prompts(&mcp_prompts),
         );
         configure_resident_memory(
             &mut plan.resolver,
@@ -696,6 +711,9 @@ impl TurnHost {
                 plugins: plan.plugins.clone(),
                 todo_store,
                 goal_store: Arc::clone(&goal_store),
+                mcp_loader: mcp.map(|catalog| {
+                    Arc::new(catalog.loader()) as Arc<dyn zuno_tools::registry::McpToolLoader>
+                }),
             },
         )?;
         // Joins the notes so shadowing reaches whatever surface is watching: the
@@ -757,6 +775,14 @@ impl TurnHost {
     pub(crate) fn tool_count(&self) -> usize {
         use zuno_engine::r#loop::ToolDispatcher as _;
         self.dispatcher.available_tools().definitions.len()
+    }
+
+    pub(crate) fn agent_name(&self) -> &str {
+        &self.agent
+    }
+
+    pub(crate) fn qualified_model(&self) -> String {
+        format!("{}/{}", self.provider_id, self.model_id)
     }
 
     /// Commands available to interactive discovery, in catalog listing order.

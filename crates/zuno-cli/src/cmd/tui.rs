@@ -34,9 +34,13 @@
 //! before [`zuno_tui::app::TerminalSession::start`]. An error printed into a raw-mode
 //! alternate screen that is about to be torn down is an error nobody reads.
 
+use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::{mpsc, watch};
 use zuno_engine::r#loop::{TurnEvent, TurnEventSender, event_channel};
@@ -45,7 +49,7 @@ use zuno_engine::terminal_lease::{TerminalLease, TerminalLeaseCleanup};
 use zuno_llm::event::StreamEvent;
 use zuno_tool::PermissionAsker;
 use zuno_tools::question::QuestionAsker;
-use zuno_tui::app::{App, CrosstermDrawTarget, CrosstermLifecycle, TerminalSession};
+use zuno_tui::app::{App, CrosstermDrawTarget, CrosstermLifecycle, TerminalEvent, TerminalSession};
 use zuno_tui::config::{ResolveOptions, ResolvedTuiConfig};
 use zuno_tui::keybind::{KeyDispatcher, Keymap};
 use zuno_tui::theme::{EnvironmentPalette, Mode, SystemThemeOutcome, ThemeRegistry};
@@ -56,8 +60,9 @@ use zuno_tui::views::external::{
     ExternalError, SystemEditor,
 };
 use zuno_tui::views::message::Message;
+use zuno_tui::views::picker::{McpProjection, McpServer, McpState, McpToggleRequest};
 use zuno_tui::views::session::{PromptSubmission, SessionScreen, scopes};
-use zuno_tui::views::slash::CatalogCommand;
+use zuno_tui::views::slash::{CatalogCommand, HostCommand};
 
 use super::tui_permission::{AutoApproval, PermissionBridge, PermissionBroker};
 use super::tui_question::{QuestionBridge, QuestionBroker};
@@ -67,6 +72,8 @@ use crate::environment::StartupEnvironment;
 
 /// How many prompts may be in flight. One, so a second is refused and not queued.
 const PROMPT_CHANNEL_CAPACITY: usize = 1;
+
+const MCP_TOGGLE_CHANNEL_CAPACITY: usize = 1;
 
 /// How many language-server reports may be queued.
 const LSP_CHANNEL_CAPACITY: usize = super::tui_lsp::REPORT_CHANNEL_CAPACITY;
@@ -204,6 +211,10 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
     };
     let plan = runtime.block_on(TurnPlan::resolve(&options, environment))?;
     let layout = zuno_paths::Layout::resolve(environment.resolved());
+    let snapshot_store = zuno_snapshot::Store::open(
+        zuno_snapshot::Location::discover_in(layout.snapshot_root(), plan.directory())
+            .with_enabled(plan.config().snapshot.unwrap_or(true)),
+    );
     let config_paths = tui_config_paths(layout.config(), plan.directory(), plan.worktree());
     let config =
         ResolvedTuiConfig::discover(&config_paths, ResolveOptions::default()).map_err(to_string)?;
@@ -241,6 +252,34 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         .unwrap_or_else(|| plan.directory())
         .to_path_buf();
     let reference_root = lsp_workspace.clone();
+    let mcp_configs = plan
+        .config()
+        .mcp
+        .as_ref()
+        .map(|servers| {
+            servers
+                .iter()
+                .map(|(name, server)| (name.to_owned(), server.clone()))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let initial_mcp_targets = mcp_configs
+        .iter()
+        .filter(|(_, server)| mcp_enabled(server))
+        .map(|(name, _)| McpToggleRequest {
+            server: name.clone(),
+            desired_enabled: true,
+        })
+        .collect::<Vec<_>>();
+    let mcp_catalog = zuno_mcp::Catalog::new(mcp_configs.keys().cloned());
+    let mcp_controller = zuno_mcp::McpServerController::from_config(
+        mcp_catalog.clone(),
+        &lsp_workspace,
+        mcp_configs,
+        zuno_mcp::McpLifecycleOptions::default(),
+    );
+    let mcp_projection = McpProjection::new(project_mcp_snapshots(&mcp_controller.snapshots()));
+    let mcp_dirty = Arc::new(AtomicBool::new(!initial_mcp_targets.is_empty()));
     let reference_source = super::tui_reference::ProjectFiles::build(&reference_root)?;
     let tui_plugins = runtime.block_on(plan.load_tui_plugins(environment));
     // Read before `TurnHost::open` consumes the plan, and before raw mode, so a slow
@@ -258,12 +297,13 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
     let driver_approval = Arc::clone(&approval);
     let driver_options = options.clone();
     let driver_environment = environment.clone();
-    let host = TurnHost::open_with_runtime(
+    let host = TurnHost::open_with_runtime_and_mcp(
         plan,
         environment,
         approval,
         Some(Arc::clone(&question)),
         SessionRunRegistry::new(),
+        Some(mcp_catalog.clone()),
     )?;
     let engine_sender = host.with_event_hooks(engine_sender);
     let plugins = host.plugin_runtime();
@@ -275,6 +315,7 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
 
     let (cancel_sender, cancel_receiver) = mpsc::channel(CANCEL_CHANNEL_CAPACITY);
     let (selection_sender, selection_receiver) = mpsc::channel(SELECTION_CHANNEL_CAPACITY);
+    let (mcp_toggle_sender, mcp_toggle_receiver) = mpsc::channel(MCP_TOGGLE_CHANNEL_CAPACITY);
     let (editor_sender, editor_receiver) = mpsc::channel(EDITOR_CHANNEL_CAPACITY);
     let (editor_result_sender, editor_result_receiver) = mpsc::channel(EDITOR_CHANNEL_CAPACITY);
     let control = host.control();
@@ -293,6 +334,7 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         .with_reference_source(Box::new(reference_source))
         .with_cancel_sink(cancel_sender)
         .with_selection_sink(selection_sender)
+        .with_mcp_control(mcp_projection.clone(), mcp_toggle_sender)
         .with_catalog(catalog)
         .with_diagnostics_source(report_receiver)
         .with_edit_sink(edit_sender)
@@ -349,6 +391,7 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         Arc::new(ContainedEditorLauncher),
     ));
     let editor_wake = terminal_sender.clone();
+    let mcp_wake = terminal_sender.clone();
 
     let session = TerminalSession::start(lifecycle).map_err(to_string)?;
     let outcome = runtime.block_on(async move {
@@ -363,11 +406,22 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
                 approval: driver_approval,
                 question,
                 reference_root,
+                mcp_catalog,
+                mcp_dirty: Arc::clone(&mcp_dirty),
+                snapshots: SnapshotHistory::new(snapshot_store),
             },
             prompt_receiver,
             selection_receiver,
             driver_environment,
             engine_sender,
+        ));
+        let mcp = tokio::spawn(drive_mcp_lifecycle(
+            mcp_controller,
+            mcp_toggle_receiver,
+            initial_mcp_targets,
+            mcp_projection,
+            mcp_dirty,
+            mcp_wake,
         ));
         let checks = tokio::spawn(super::tui_lsp::check_edits(
             probe,
@@ -398,6 +452,7 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         turns.abort();
         checks.abort();
         cancels.abort();
+        mcp.abort();
         // Aborted with the rest rather than awaited, because the sender lives inside the
         // render tree that several `Arc`s outlive here — the channel never closes, so a
         // wait would be a hang and a timed wait would tax every exit. The cost is one
@@ -847,16 +902,21 @@ async fn session_catalog(
 /// A failure leaves the previous host in place and says so on the transcript's own
 /// channel. The alternative — tearing down a working host on a bad pick — would lose the
 /// session over a keystroke.
+struct TurnRebuild<'a> {
+    options: &'a TurnOptions,
+    environment: &'a StartupEnvironment,
+    approval: &'a Arc<dyn PermissionAsker>,
+    question: &'a Arc<dyn QuestionAsker>,
+    events: &'a TurnEventSender,
+    mcp_catalog: &'a zuno_mcp::Catalog,
+}
+
 async fn apply_selection(
     selection: zuno_tui::views::session::Selection,
     host: &mut TurnHost,
-    options: &TurnOptions,
-    environment: &StartupEnvironment,
-    approval: &Arc<dyn PermissionAsker>,
-    question: &Arc<dyn QuestionAsker>,
-    events: &TurnEventSender,
+    rebuild: &TurnRebuild<'_>,
 ) -> Option<TurnEventSender> {
-    let mut next = options.clone();
+    let mut next = rebuild.options.clone();
     next.session = SessionChoice::Existing(host.session_id().to_owned());
     match selection {
         zuno_tui::views::session::Selection::Model(model) => next.model = Some(model),
@@ -867,24 +927,26 @@ async fn apply_selection(
         | zuno_tui::views::session::Selection::Theme(_) => return None,
     }
     let rebuilt = async {
-        let plan = TurnPlan::resolve(&next, environment).await?;
-        TurnHost::open_with_runtime(
+        let plan = TurnPlan::resolve(&next, rebuild.environment).await?;
+        TurnHost::open_with_runtime_and_mcp(
             plan,
-            environment,
-            Arc::clone(approval),
-            Some(Arc::clone(question)),
+            rebuild.environment,
+            Arc::clone(rebuild.approval),
+            Some(Arc::clone(rebuild.question)),
             SessionRunRegistry::new(),
+            Some(rebuild.mcp_catalog.clone()),
         )
     }
     .await;
     match rebuilt {
         Ok(replacement) => {
-            let hooked = replacement.with_event_hooks(events.clone());
+            let hooked = replacement.with_event_hooks(rebuild.events.clone());
             *host = replacement;
             Some(hooked)
         }
         Err(message) => {
-            let _reported = events
+            let _reported = rebuild
+                .events
                 .publish(TurnEvent::Provider {
                     step: 0,
                     event: StreamEvent::StatusDetail {
@@ -903,6 +965,25 @@ struct TurnDriver {
     approval: Arc<dyn PermissionAsker>,
     question: Arc<dyn QuestionAsker>,
     reference_root: PathBuf,
+    mcp_catalog: zuno_mcp::Catalog,
+    mcp_dirty: Arc<AtomicBool>,
+    snapshots: SnapshotHistory,
+}
+
+struct SnapshotHistory {
+    store: zuno_snapshot::Store,
+    undo: Vec<zuno_snapshot::TurnCheckpoint>,
+    redo: Vec<zuno_snapshot::TurnCheckpoint>,
+}
+
+impl SnapshotHistory {
+    fn new(store: zuno_snapshot::Store) -> Self {
+        Self {
+            store,
+            undo: Vec::new(),
+            redo: Vec::new(),
+        }
+    }
 }
 
 async fn drive_turns(
@@ -923,14 +1004,18 @@ async fn drive_turns(
             },
             selection = selections.recv() => {
                 let Some(selection) = selection else { return };
+                let rebuild = TurnRebuild {
+                    options: &driver.options,
+                    environment: &environment,
+                    approval: &driver.approval,
+                    question: &driver.question,
+                    events: &events,
+                    mcp_catalog: &driver.mcp_catalog,
+                };
                 if let Some(rebuilt) = apply_selection(
                     selection,
                     &mut driver.host,
-                    &driver.options,
-                    &environment,
-                    &driver.approval,
-                    &driver.question,
-                    &events,
+                    &rebuild,
                 )
                 .await
                 {
@@ -939,14 +1024,144 @@ async fn drive_turns(
                 continue;
             }
         };
+        if driver.mcp_dirty.swap(false, Ordering::AcqRel)
+            && let Some(rebuilt) = refresh_mcp_host(&mut driver, &environment, &events).await
+        {
+            events = rebuilt;
+        }
         drive_one(
             &mut driver.host,
             prompt,
             &mut prompts,
             &driver.reference_root,
             &events,
+            &mut driver.snapshots,
         )
         .await;
+    }
+}
+
+async fn refresh_mcp_host(
+    driver: &mut TurnDriver,
+    environment: &StartupEnvironment,
+    events: &TurnEventSender,
+) -> Option<TurnEventSender> {
+    let mut next = driver.options.clone();
+    next.session = SessionChoice::Existing(driver.host.session_id().to_owned());
+    next.model = Some(driver.host.qualified_model());
+    next.agent = Some(driver.host.agent_name().to_owned());
+    let rebuilt = async {
+        let plan = TurnPlan::resolve(&next, environment).await?;
+        TurnHost::open_with_runtime_and_mcp(
+            plan,
+            environment,
+            Arc::clone(&driver.approval),
+            Some(Arc::clone(&driver.question)),
+            SessionRunRegistry::new(),
+            Some(driver.mcp_catalog.clone()),
+        )
+    }
+    .await;
+    match rebuilt {
+        Ok(replacement) => {
+            let hooked = replacement.with_event_hooks(events.clone());
+            driver.host = replacement;
+            Some(hooked)
+        }
+        Err(message) => {
+            driver.mcp_dirty.store(true, Ordering::Release);
+            let _reported = events
+                .publish(TurnEvent::Provider {
+                    step: 0,
+                    event: StreamEvent::StatusDetail {
+                        detail: format!("warning: MCP tools were not refreshed: {message}"),
+                    },
+                })
+                .await;
+            None
+        }
+    }
+}
+
+fn project_mcp_snapshots(snapshots: &[zuno_mcp::McpServerSnapshot]) -> Vec<McpServer> {
+    snapshots
+        .iter()
+        .map(|snapshot| McpServer {
+            name: snapshot.server.clone(),
+            state: match &snapshot.state {
+                zuno_mcp::McpServerState::Disabled => McpState::Disabled,
+                zuno_mcp::McpServerState::Connecting => McpState::Connecting,
+                zuno_mcp::McpServerState::Connected => McpState::Connected,
+                zuno_mcp::McpServerState::Disconnecting => McpState::Disconnecting,
+                zuno_mcp::McpServerState::Failed { error } => McpState::Failed(error.clone()),
+                zuno_mcp::McpServerState::NeedsAuth => McpState::NeedsAuth,
+                zuno_mcp::McpServerState::NeedsClientRegistration { error } => {
+                    McpState::NeedsClientRegistration(error.clone())
+                }
+            },
+            desired_enabled: snapshot.desired_enabled,
+        })
+        .collect()
+}
+
+async fn drive_mcp_lifecycle(
+    controller: zuno_mcp::McpServerController,
+    mut requests: mpsc::Receiver<McpToggleRequest>,
+    initial: Vec<McpToggleRequest>,
+    projection: McpProjection,
+    dirty: Arc<AtomicBool>,
+    wake: mpsc::Sender<TerminalEvent>,
+) {
+    type ToggleFuture = Pin<
+        Box<
+            dyn Future<Output = Result<zuno_mcp::McpServerSnapshot, zuno_mcp::McpLifecycleError>>
+                + Send,
+        >,
+    >;
+
+    let mut changes = controller.subscribe();
+    let mut initial = VecDeque::from(initial);
+    let mut active: Option<ToggleFuture> = None;
+    loop {
+        if active.is_none()
+            && let Some(request) = initial.pop_front()
+        {
+            let controller = controller.clone();
+            active = Some(Box::pin(async move {
+                controller
+                    .set_enabled(&request.server, request.desired_enabled)
+                    .await
+            }));
+        }
+
+        tokio::select! {
+            change = changes.recv() => match change {
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    projection.replace(project_mcp_snapshots(&controller.snapshots()));
+                    dirty.store(true, Ordering::Release);
+                    let _nudged = wake.try_send(TerminalEvent::Wake);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            },
+            result = async { active.as_mut().expect("guarded active MCP operation").await }, if active.is_some() => {
+                let _completed = result;
+                active = None;
+                projection.replace(project_mcp_snapshots(&controller.snapshots()));
+                dirty.store(true, Ordering::Release);
+                let _nudged = wake.try_send(TerminalEvent::Wake);
+            },
+            request = requests.recv(), if active.is_none() && initial.is_empty() => match request {
+                Some(request) => {
+                    let controller = controller.clone();
+                    active = Some(Box::pin(async move {
+                        controller
+                            .set_enabled(&request.server, request.desired_enabled)
+                            .await
+                    }));
+                }
+                None => return,
+            },
+        }
     }
 }
 
@@ -956,10 +1171,15 @@ async fn drive_one(
     prompts: &mut mpsc::Receiver<PromptSubmission>,
     reference_root: &Path,
     events: &TurnEventSender,
+    snapshots: &mut SnapshotHistory,
 ) {
     {
         let outcome = async {
             let prompt = super::tui_reference::resolve_submission(reference_root, prompt).await?;
+            if let PromptSubmission::Host(command) = prompt {
+                return restore_snapshot(command, snapshots, events).await;
+            }
+            let capture = begin_snapshot(&snapshots.store, events).await;
             match prompt {
                 PromptSubmission::Text(prompt) => host.drive(&prompt, events.clone()).await?,
                 PromptSubmission::Content { text, content } => {
@@ -969,6 +1189,7 @@ async fn drive_one(
                     host.drive_command(&name, &arguments, events.clone())
                         .await?
                 }
+                PromptSubmission::Host(_) => unreachable!("host submissions return before driving"),
             }
             loop {
                 let queued = if prompts.is_empty() {
@@ -979,6 +1200,11 @@ async fn drive_one(
                 if !host.continue_goal_if_idle(queued, events.clone()).await? {
                     break;
                 }
+            }
+            if let Some(capture) = capture {
+                finish_snapshot(capture, snapshots, events).await;
+            } else {
+                snapshots.redo.clear();
             }
             Ok::<(), String>(())
         }
@@ -1005,6 +1231,124 @@ async fn drive_one(
             // left to report a failure to.
             let _closed = reported.is_err();
         }
+    }
+}
+
+async fn finish_snapshot(
+    capture: zuno_snapshot::TurnCapture,
+    snapshots: &mut SnapshotHistory,
+    events: &TurnEventSender,
+) {
+    snapshots.redo.clear();
+    match tokio::task::spawn_blocking(move || capture.finish()).await {
+        Ok(Ok(checkpoint)) => snapshots.undo.push(checkpoint),
+        Ok(Err(error)) => {
+            publish_snapshot_detail(
+                events,
+                format!("warning: turn snapshot could not be completed: {error}"),
+            )
+            .await;
+        }
+        Err(error) => {
+            publish_snapshot_detail(
+                events,
+                format!("warning: turn snapshot task failed: {error}"),
+            )
+            .await;
+        }
+    }
+}
+
+async fn begin_snapshot(
+    store: &zuno_snapshot::Store,
+    events: &TurnEventSender,
+) -> Option<zuno_snapshot::TurnCapture> {
+    let store = store.clone();
+    match tokio::task::spawn_blocking(move || store.begin_turn()).await {
+        Ok(Ok(capture)) => capture,
+        Ok(Err(error)) => {
+            publish_snapshot_detail(
+                events,
+                format!("warning: turn snapshot could not start: {error}"),
+            )
+            .await;
+            None
+        }
+        Err(error) => {
+            publish_snapshot_detail(
+                events,
+                format!("warning: turn snapshot task failed: {error}"),
+            )
+            .await;
+            None
+        }
+    }
+}
+
+async fn restore_snapshot(
+    command: HostCommand,
+    snapshots: &mut SnapshotHistory,
+    events: &TurnEventSender,
+) -> Result<(), String> {
+    let (source, restore) = match command {
+        HostCommand::Undo => (&mut snapshots.undo, zuno_snapshot::TurnRestore::Undo),
+        HostCommand::Redo => (&mut snapshots.redo, zuno_snapshot::TurnRestore::Redo),
+    };
+    let Some(checkpoint) = source.last().cloned() else {
+        return Err(format!("nothing to {}", restore_name(restore)));
+    };
+    let store = snapshots.store.clone();
+    let report = tokio::task::spawn_blocking(move || store.restore_turn(&checkpoint, restore))
+        .await
+        .map_err(|error| format!("{} snapshot task failed: {error}", restore_name(restore)))?
+        .map_err(|error| format!("{} refused: {error}", restore_name(restore)))?;
+    let checkpoint = source
+        .pop()
+        .expect("the restored checkpoint remains at the top of its stack");
+    match restore {
+        zuno_snapshot::TurnRestore::Undo => snapshots.redo.push(checkpoint),
+        zuno_snapshot::TurnRestore::Redo => snapshots.undo.push(checkpoint),
+    }
+    publish_restore_report(events, &report).await;
+    Ok(())
+}
+
+async fn publish_restore_report(
+    events: &TurnEventSender,
+    report: &zuno_snapshot::TurnRestoreReport,
+) {
+    let action = restore_name(report.restore());
+    if report.files().is_empty() {
+        publish_snapshot_detail(events, format!("{action}: no files changed")).await;
+        return;
+    }
+    publish_snapshot_detail(
+        events,
+        format!("{action}: restored {} file(s)", report.files().len()),
+    )
+    .await;
+    for file in report.files() {
+        publish_snapshot_detail(
+            events,
+            format!("{action}: {:?} {}", file.operation, file.path),
+        )
+        .await;
+    }
+}
+
+async fn publish_snapshot_detail(events: &TurnEventSender, detail: String) {
+    let _reported = events
+        .publish(TurnEvent::Provider {
+            step: 0,
+            event: StreamEvent::StatusDetail { detail },
+        })
+        .await;
+}
+
+fn restore_name(restore: zuno_snapshot::TurnRestore) -> &'static str {
+    match restore {
+        zuno_snapshot::TurnRestore::Undo => "undo",
+        zuno_snapshot::TurnRestore::Redo => "redo",
     }
 }
 
@@ -1864,5 +2208,186 @@ mod tests {
             }
             other => panic!("nearest on-disk override did not resolve: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn mcp_worker_applies_toggle_request_and_replaces_projection() {
+        const SERVER: &str = "configured-toggle";
+        let catalog = zuno_mcp::Catalog::new([SERVER]);
+        let controller = zuno_mcp::McpServerController::from_config(
+            catalog,
+            ".",
+            BTreeMap::from([(
+                SERVER.to_owned(),
+                zuno_config::schema::mcp::McpServerConfig::Toggle(
+                    zuno_config::schema::mcp::McpToggle { enabled: false },
+                ),
+            )]),
+            zuno_mcp::McpLifecycleOptions::default(),
+        );
+        let projection = McpProjection::new(project_mcp_snapshots(&controller.snapshots()));
+        let observed = projection.clone();
+        let dirty = Arc::new(AtomicBool::new(false));
+        let observed_dirty = Arc::clone(&dirty);
+        let (requests, request_source) = mpsc::channel(MCP_TOGGLE_CHANNEL_CAPACITY);
+        let (wake, mut wake_source) = zuno_tui::app::terminal_event_channel();
+        let worker = tokio::spawn(drive_mcp_lifecycle(
+            controller,
+            request_source,
+            Vec::new(),
+            projection,
+            dirty,
+            wake,
+        ));
+
+        requests
+            .send(McpToggleRequest {
+                server: SERVER.to_owned(),
+                desired_enabled: true,
+            })
+            .await
+            .expect("worker accepts one toggle");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    observed.snapshot().as_slice(),
+                    [McpServer {
+                        state: McpState::Failed(_),
+                        desired_enabled: true,
+                        ..
+                    }]
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("toggle reaches the controller and projection");
+
+        assert!(observed_dirty.load(Ordering::Acquire));
+        assert!(matches!(wake_source.try_recv(), Ok(TerminalEvent::Wake)));
+        drop(requests);
+        worker
+            .await
+            .expect("worker exits after request channel closes");
+    }
+
+    #[tokio::test]
+    async fn snapshot_history_moves_only_after_checked_undo_and_redo() {
+        let temp = tempfile::tempdir().expect("snapshot fixture");
+        let root = temp.path().join("snapshot");
+        let worktree = temp.path().join("worktree");
+        fs::create_dir_all(&root).expect("create snapshot root");
+        fs::create_dir_all(&worktree).expect("create worktree");
+        for args in [
+            vec!["init", "-q", "."],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&worktree)
+                .status()
+                .expect("run git fixture command");
+            assert!(status.success());
+        }
+        let file = worktree.join("turn.txt");
+        fs::write(&file, "before\n").expect("seed tracked file");
+        let status = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&worktree)
+            .status()
+            .expect("stage fixture");
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .args(["commit", "-qm", "init"])
+            .current_dir(&worktree)
+            .status()
+            .expect("commit fixture");
+        assert!(status.success());
+
+        let store =
+            zuno_snapshot::Store::open(zuno_snapshot::Location::new(root, "project", &worktree));
+        let mut history = SnapshotHistory::new(store.clone());
+        let (events, _event_source) = event_channel();
+        let capture = store
+            .begin_turn()
+            .expect("capture before turn")
+            .expect("snapshots enabled");
+        fs::write(&file, "after\n").expect("simulate turn edit");
+        finish_snapshot(capture, &mut history, &events).await;
+        assert_eq!(history.undo.len(), 1);
+        assert!(history.redo.is_empty());
+
+        restore_snapshot(HostCommand::Undo, &mut history, &events)
+            .await
+            .expect("undo succeeds");
+        assert_eq!(fs::read_to_string(&file).expect("read undo"), "before\n");
+        assert!(history.undo.is_empty());
+        assert_eq!(history.redo.len(), 1);
+
+        restore_snapshot(HostCommand::Redo, &mut history, &events)
+            .await
+            .expect("redo succeeds");
+        assert_eq!(fs::read_to_string(&file).expect("read redo"), "after\n");
+        assert_eq!(history.undo.len(), 1);
+        assert!(history.redo.is_empty());
+
+        fs::write(&file, "manual drift\n").expect("introduce drift");
+        let error = restore_snapshot(HostCommand::Undo, &mut history, &events)
+            .await
+            .expect_err("drift refuses the whole restore");
+        assert!(error.contains("refused"), "{error}");
+        assert_eq!(history.undo.len(), 1);
+        assert!(history.redo.is_empty());
+        assert_eq!(
+            fs::read_to_string(&file).expect("read drifted file"),
+            "manual drift\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_new_turn_clears_redo_history() {
+        let temp = tempfile::tempdir().expect("snapshot fixture");
+        let root = temp.path().join("snapshot");
+        let worktree = temp.path().join("worktree");
+        fs::create_dir_all(&root).expect("create snapshot root");
+        fs::create_dir_all(&worktree).expect("create worktree");
+        let status = std::process::Command::new("git")
+            .args(["init", "-q", "."])
+            .current_dir(&worktree)
+            .status()
+            .expect("initialize git fixture");
+        assert!(status.success());
+        let file = worktree.join("turn.txt");
+        fs::write(&file, "one\n").expect("seed file");
+        let store =
+            zuno_snapshot::Store::open(zuno_snapshot::Location::new(root, "project", &worktree));
+        let mut history = SnapshotHistory::new(store.clone());
+        let (events, _event_source) = event_channel();
+
+        let first = store
+            .begin_turn()
+            .expect("first capture")
+            .expect("snapshots enabled");
+        fs::write(&file, "two\n").expect("first edit");
+        finish_snapshot(first, &mut history, &events).await;
+        restore_snapshot(HostCommand::Undo, &mut history, &events)
+            .await
+            .expect("undo first turn");
+        assert_eq!(history.redo.len(), 1);
+
+        let second = store
+            .begin_turn()
+            .expect("second capture")
+            .expect("snapshots enabled");
+        fs::write(&file, "three\n").expect("new edit after undo");
+        finish_snapshot(second, &mut history, &events).await;
+
+        assert!(history.redo.is_empty());
+        assert_eq!(history.undo.len(), 1);
+        assert_eq!(fs::read_to_string(file).expect("read new turn"), "three\n");
     }
 }
