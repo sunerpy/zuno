@@ -1,0 +1,6 @@
+[env]
+# `tikv-jemalloc-sys` passes this value to jemalloc's `--with-malloc-conf`, so
+# tuning is embedded before the allocator initializes. This avoids the unsafe
+# exported `malloc_conf` symbol used by the reference implementation and keeps
+# direct binary launches identical to `cargo run`.
+JEMALLOC_SYS_WITH_MALLOC_CONF = { value = "dirty_decay_ms:1000,muzzy_decay_ms:1000,narenas:4", force = true }

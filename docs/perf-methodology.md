@@ -79,6 +79,40 @@ is wider than a two-pass 10% agreement criterion would have tolerated — 1.14x
 for `W-idle` and 1.18x for `W-real`. Reporting the spread states that variance
 instead of asserting a tolerance the machine does not meet.
 
+## Allocator comparison
+
+M1 measured two release-profile Zuno binaries on 2026-08-18 with the same pinned
+W-real snapshot, workload implementation, 2-second process-tree sampler, windows,
+and five-run aggregation above. The default binary used jemalloc with
+`dirty_decay_ms:1000,muzzy_decay_ms:1000,narenas:4`; the control used
+`--no-default-features`, which selects the Linux GNU fallback
+`MALLOC_ARENA_MAX=4,MALLOC_MMAP_THRESHOLD_=262144`.
+
+| allocator | workload | five peak RSS runs (KiB) | min / median / max (KiB) | max/min |
+| --- | --- | --- | --- | --- |
+| tuned jemalloc | W-idle | 27,340; 27,352; 27,920; 27,132; 27,044 | 27,044 / 27,340 / 27,920 | 1.0324x |
+| tuned glibc | W-idle | 26,404; 26,204; 26,536; 25,332; 25,364 | 25,332 / 26,204 / 26,536 | 1.0475x |
+| tuned jemalloc | W-real | 878,000; 1,198,872; 1,210,148; 1,549,164; 862,132 | 862,132 / 1,198,872 / 1,549,164 | 1.7969x |
+| tuned glibc | W-real | 1,656,720; 1,653,376; 1,653,348; 1,653,236; 1,652,628 | 1,652,628 / 1,653,348 / 1,656,720 | 1.0025x |
+
+The jemalloc W-real median is 454,476 KiB (27.49%) below tuned glibc, while its
+W-idle median is 1,136 KiB (4.34%) higher. W-real also has a wide 1.7969x spread,
+so the five raw peaks remain part of the result rather than presenting the median
+as a stability claim. The default remains tuned jemalloc because the sustained,
+large-session workload is the memory risk this setting addresses. A 1-second
+decay can add `mmap`/`munmap` work and page faults during repeated large
+allocation/free cycles; throughput was not measured here, so the decision is a
+deliberate peak-RSS trade-off, not a throughput improvement claim.
+
+The measured binaries had SHA-256
+`acc509815cc2179fd02549e095672aa775954e44d31faebd5d28f0da0dc49796`
+(jemalloc) and
+`458193fc429efdda280b2b0f5838dcf5f94d19484f4313d66383763a90bd7480`
+(glibc). Raw JSON reports were written to `target/perf/allocator-jemalloc.json`
+and `target/perf/allocator-system.json`; their SHA-256 digests were
+`dbeee391b90397b7e48b1c26bf45b1d799a9271fcd7db805766c5598072f44e0`
+and `795d9cfa9c492867280a97628ae026fad6c36d592213dd3f08ec7bbdc1b45ed4`.
+
 ## W-real subject pin
 
 `W-real` measures one specific session in one specific database snapshot. Both

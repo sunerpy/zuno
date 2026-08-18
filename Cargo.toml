@@ -109,6 +109,13 @@ tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 
+# -- allocator ---------------------------------------------------------------
+# Optional at the crate edge so `zuno-cli --no-default-features` remains the
+# system-allocator control used by the memory gates. The shipped/default CLI
+# enables it; MSVC stays on the platform allocator because tikv-jemallocator's
+# supported global-allocator configuration excludes that target environment.
+tikv-jemallocator = "=0.7.0"
+
 # -- CLI --------------------------------------------------------------------
 clap = { version = "4.6.5", features = ["derive", "env"] }
 
@@ -122,6 +129,14 @@ tower-http = { version = "0.7.0", features = ["fs", "trace", "cors"] }
 # -- terminal UI ------------------------------------------------------------
 crossterm = "0.29.0"
 ratatui = { version = "0.30.2", features = ["serde"] }
+# CommonMark parsing for the transcript's assistant bodies (plan §7.1). A *pull*
+# parser rather than an AST builder is what the renderer wants: the events arrive
+# in document order, so a body becomes rows in one pass with no intermediate tree
+# to own. `default-features = false` drops `getopts` (the crate's own CLI) and
+# `html` (which pulls `pulldown-cmark-escape` to emit HTML we never emit) — the
+# only added crate in the resolved graph is `unicase`, since `bitflags` and
+# `memchr` are already there.
+pulldown-cmark = { version = "0.13.3", default-features = false }
 
 # -- pseudo-terminals -------------------------------------------------------
 # One crate covering unix `openpty` and Windows ConPTY, compiled into the binary.
@@ -158,7 +173,17 @@ ignore = "0.4.33"
 notify = "8.2.0"
 tree-sitter = "0.26.11"
 tree-sitter-bash = "0.25.1"
+tree-sitter-highlight = "=0.26.11"
+tree-sitter-go = "=0.25.0"
+tree-sitter-javascript = "=0.25.0"
+tree-sitter-json = "=0.24.8"
+tree-sitter-md = "=0.5.3"
+tree-sitter-python = "=0.25.0"
 tree-sitter-powershell = "0.26.4"
+tree-sitter-rust = "=0.24.2"
+tree-sitter-toml-ng = "=0.7.0"
+tree-sitter-typescript = "=0.23.2"
+tree-sitter-yaml = "=0.7.2"
 walkdir = "2.5.0"
 which = "8.0.5"
 
@@ -219,6 +244,11 @@ uuid = { version = "1.24.0", features = ["v4", "v7", "serde"] }
 # a skill description running past the right edge and wrapping the frame. Already
 # in the lock file through ratatui, so naming it here adds no download.
 unicode-width = "0.2.2"
+# Already in the resolved graph through `ratatui-core`, so naming it directly adds
+# no crate and no download. Needed because `chars()` splits a ZWJ emoji and a
+# combining mark into pieces a terminal cannot draw; the markdown renderer breaks
+# an over-long word at *cluster* boundaries instead.
+unicode-segmentation = "1.13.3"
 
 # -- optional plugin runtimes ------------------------------------------------
 # Kept out of every default build: only `zuno-plugin/wasm` activates this exact
