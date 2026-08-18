@@ -33,6 +33,9 @@
 
 use crate::app::{AppEvent, Component, EventResult};
 use crate::keybind::Definition;
+use crate::views::diff_browser::{
+    DiffBrowser, MAX_WORD_DIFF_PAIRS, WordSpan, fitted_spans, hunk_indices, refine,
+};
 use crate::views::{DiffColumns, ViewContext, fill, padded};
 use crossterm::event::KeyEvent;
 use ratatui::Frame;
@@ -169,6 +172,12 @@ pub struct DiffView {
     /// First rendered row.
     offset: usize,
     columns: DiffColumns,
+    /// Line pairs this view may still refine to words.
+    ///
+    /// A budget rather than a flag because it is shared across the files of one patch:
+    /// a browser hands each file what the previous files left, so the ceiling bounds the
+    /// whole frame instead of bounding each file and multiplying by the file count.
+    refine_budget: usize,
 }
 
 impl DiffView {
@@ -181,7 +190,17 @@ impl DiffView {
             forced: None,
             offset: 0,
             columns: DiffColumns::Unified,
+            refine_budget: MAX_WORD_DIFF_PAIRS,
         }
+    }
+
+    pub const fn set_refine_budget(&mut self, pairs: usize) {
+        self.refine_budget = pairs;
+    }
+
+    #[must_use]
+    pub const fn refine_budget(&self) -> usize {
+        self.refine_budget
     }
 
     /// Force a layout, ignoring width and configuration.
@@ -258,6 +277,15 @@ impl DiffView {
 
     /// The rows this diff renders at `width`, honouring `diff_style`.
     pub fn lines(&mut self, width: u16) -> Vec<Line<'static>> {
+        self.rows_with_hunks(width).0
+    }
+
+    /// The rows, paired with the row numbers of the `@@` headers among them.
+    ///
+    /// Two returns rather than a second pass because in a split layout a hunk's row
+    /// number is not derivable from the parse: several parsed lines collapse into one
+    /// row, so only the code that emitted the rows knows where the headers landed.
+    pub fn rows_with_hunks(&mut self, width: u16) -> (Vec<Line<'static>>, Vec<usize>) {
         self.columns = self
             .forced
             .unwrap_or_else(|| self.context.diff_columns(width));
@@ -267,102 +295,196 @@ impl DiffView {
         }
     }
 
-    fn unified(&self, width: u16) -> Vec<Line<'static>> {
-        self.lines
+    /// The removal run at `index`, the addition run following it, and the index past both.
+    ///
+    /// Cloned rather than borrowed so the caller can then take `&mut self` to spend the
+    /// refinement budget. Either the removals or the additions is non-empty whenever
+    /// `index` names a changed line, which is what guarantees the walk advances.
+    fn runs(&self, index: usize) -> (Vec<DiffLine>, Vec<DiffLine>, usize) {
+        let removals = self.lines[index..]
             .iter()
-            .map(|line| {
-                if line.kind == LineKind::Header {
-                    return padded(&line.text, width, self.style(LineKind::Header));
+            .take_while(|line| line.kind == LineKind::Removed)
+            .cloned()
+            .collect::<Vec<_>>();
+        let after = index + removals.len();
+        let additions = self.lines[after..]
+            .iter()
+            .take_while(|line| line.kind == LineKind::Added)
+            .cloned()
+            .collect::<Vec<_>>();
+        let end = after + additions.len();
+        (removals, additions, end)
+    }
+
+    fn refine_runs(
+        &mut self,
+        removals: &[DiffLine],
+        additions: &[DiffLine],
+    ) -> Vec<Option<(Vec<WordSpan>, Vec<WordSpan>)>> {
+        (0..removals.len().min(additions.len()))
+            .map(|offset| {
+                if self.refine_budget == 0 {
+                    return None;
                 }
-                let sign = match line.kind {
-                    LineKind::Added => '+',
-                    LineKind::Removed => '-',
-                    _ => ' ',
-                };
-                let number = line
-                    .new
-                    .or(line.old)
-                    .map_or_else(|| String::from("    "), |value| format!("{value:>4}"));
-                let body_width = usize::from(width).saturating_sub(6);
-                let body = fit(&line.text, body_width);
-                Line::from(vec![
-                    Span::styled(number, self.number_style(line.kind)),
-                    Span::styled(format!("{sign}"), self.sign_style(line.kind)),
-                    Span::styled(format!(" {body}"), self.style(line.kind)),
-                ])
+                let pair = refine(&removals[offset].text, &additions[offset].text);
+                if pair.is_some() {
+                    self.refine_budget -= 1;
+                }
+                pair
             })
             .collect()
     }
 
-    fn split(&self, width: u16) -> Vec<Line<'static>> {
-        let half = usize::from(width / 2).max(1);
-        let cell = half.saturating_sub(5).max(1);
+    fn text_spans(
+        &self,
+        line: &DiffLine,
+        spans: Option<&[WordSpan]>,
+        width: usize,
+    ) -> Vec<Span<'static>> {
+        let base = self.style(line.kind);
+        match spans {
+            // The changed runs take `diffHighlightAdded`/`diffHighlightRemoved`, which is
+            // what those two palette keys are for and what makes the refinement legible
+            // in the themes that pick a deliberately low-contrast diff background.
+            Some(spans) => fitted_spans(spans, width, base, self.sign_style(line.kind)),
+            None => fitted_spans(
+                &[WordSpan {
+                    text: line.text.clone(),
+                    changed: false,
+                }],
+                width,
+                base,
+                base,
+            ),
+        }
+    }
+
+    fn unified(&mut self, width: u16) -> (Vec<Line<'static>>, Vec<usize>) {
+        // Rows are one-to-one with parsed lines in this layout — a run is emitted as all
+        // its removals then all its additions, which is the order they were parsed in —
+        // so the parse's own hunk positions are the row positions.
+        let hunks = hunk_indices(&self.lines);
+        let body_width = usize::from(width).saturating_sub(6);
         let mut rows = Vec::new();
         let mut index = 0;
         while index < self.lines.len() {
-            let line = &self.lines[index];
+            let line = self.lines[index].clone();
             if line.kind == LineKind::Header {
                 rows.push(padded(&line.text, width, self.style(LineKind::Header)));
                 index += 1;
                 continue;
             }
             if line.kind == LineKind::Context {
-                rows.push(Line::from(vec![
-                    Span::styled(
-                        format!("{:>4} ", line.old.unwrap_or_default()),
-                        self.number_style(LineKind::Context),
-                    ),
-                    Span::styled(fit(&line.text, cell), self.style(LineKind::Context)),
-                    Span::styled(
-                        format!("{:>4} ", line.new.unwrap_or_default()),
-                        self.number_style(LineKind::Context),
-                    ),
-                    Span::styled(fit(&line.text, cell), self.style(LineKind::Context)),
-                ]));
+                rows.push(self.unified_row(&line, None, body_width));
+                index += 1;
+                continue;
+            }
+            let (removals, additions, end) = self.runs(index);
+            let refined = self.refine_runs(&removals, &additions);
+            for (offset, line) in removals.iter().enumerate() {
+                let spans = refined
+                    .get(offset)
+                    .and_then(|pair| pair.as_ref().map(|(old, _)| old.as_slice()));
+                rows.push(self.unified_row(line, spans, body_width));
+            }
+            for (offset, line) in additions.iter().enumerate() {
+                let spans = refined
+                    .get(offset)
+                    .and_then(|pair| pair.as_ref().map(|(_, new)| new.as_slice()));
+                rows.push(self.unified_row(line, spans, body_width));
+            }
+            index = end;
+        }
+        (rows, hunks)
+    }
+
+    fn unified_row(
+        &self,
+        line: &DiffLine,
+        spans: Option<&[WordSpan]>,
+        body_width: usize,
+    ) -> Line<'static> {
+        let sign = match line.kind {
+            LineKind::Added => '+',
+            LineKind::Removed => '-',
+            _ => ' ',
+        };
+        let number = line
+            .new
+            .or(line.old)
+            .map_or_else(|| String::from("    "), |value| format!("{value:>4}"));
+        let mut out = vec![
+            Span::styled(number, self.number_style(line.kind)),
+            Span::styled(sign.to_string(), self.sign_style(line.kind)),
+            Span::styled(String::from(" "), self.style(line.kind)),
+        ];
+        out.extend(self.text_spans(line, spans, body_width));
+        Line::from(out)
+    }
+
+    fn split(&mut self, width: u16) -> (Vec<Line<'static>>, Vec<usize>) {
+        let half = usize::from(width / 2).max(1);
+        let cell = half.saturating_sub(5).max(1);
+        let mut rows = Vec::new();
+        let mut hunks = Vec::new();
+        let mut index = 0;
+        while index < self.lines.len() {
+            let line = self.lines[index].clone();
+            if line.kind == LineKind::Header {
+                if line.text.starts_with("@@") {
+                    hunks.push(rows.len());
+                }
+                rows.push(padded(&line.text, width, self.style(LineKind::Header)));
+                index += 1;
+                continue;
+            }
+            if line.kind == LineKind::Context {
+                let mut spans = vec![Span::styled(
+                    format!("{:>4} ", line.old.unwrap_or_default()),
+                    self.number_style(LineKind::Context),
+                )];
+                spans.extend(self.text_spans(&line, None, cell));
+                spans.push(Span::styled(
+                    format!("{:>4} ", line.new.unwrap_or_default()),
+                    self.number_style(LineKind::Context),
+                ));
+                spans.extend(self.text_spans(&line, None, cell));
+                rows.push(Line::from(spans));
                 index += 1;
                 continue;
             }
             // Pair a removal run with the addition run that follows it, so the two
             // sides line up the way a reviewer reads them.
-            let removals = self.lines[index..]
-                .iter()
-                .take_while(|line| line.kind == LineKind::Removed)
-                .collect::<Vec<_>>();
-            let after = index + removals.len();
-            let additions = self.lines[after..]
-                .iter()
-                .take_while(|line| line.kind == LineKind::Added)
-                .collect::<Vec<_>>();
+            let (removals, additions, end) = self.runs(index);
+            let refined = self.refine_runs(&removals, &additions);
             for offset in 0..removals.len().max(additions.len()) {
-                let left = removals.get(offset);
-                let right = additions.get(offset);
                 let mut spans = Vec::new();
-                match left {
+                match removals.get(offset) {
                     Some(line) => {
                         spans.push(Span::styled(
                             format!("{:>4}-", line.old.unwrap_or_default()),
                             self.sign_style(LineKind::Removed),
                         ));
-                        spans.push(Span::styled(
-                            fit(&line.text, cell),
-                            self.style(LineKind::Removed),
-                        ));
+                        let refined = refined
+                            .get(offset)
+                            .and_then(|pair| pair.as_ref().map(|(old, _)| old.as_slice()));
+                        spans.extend(self.text_spans(line, refined, cell));
                     }
                     None => spans.push(Span::styled(
                         " ".repeat(half),
                         self.style(LineKind::Context),
                     )),
                 }
-                match right {
+                match additions.get(offset) {
                     Some(line) => {
                         spans.push(Span::styled(
                             format!("{:>4}+", line.new.unwrap_or_default()),
                             self.sign_style(LineKind::Added),
                         ));
-                        spans.push(Span::styled(
-                            fit(&line.text, cell),
-                            self.style(LineKind::Added),
-                        ));
+                        let refined = refined
+                            .get(offset)
+                            .and_then(|pair| pair.as_ref().map(|(_, new)| new.as_slice()));
+                        spans.extend(self.text_spans(line, refined, cell));
                     }
                     None => spans.push(Span::styled(
                         " ".repeat(half),
@@ -371,9 +493,9 @@ impl DiffView {
                 }
                 rows.push(Line::from(spans));
             }
-            index = after + additions.len();
+            index = end;
         }
-        rows
+        (rows, hunks)
     }
 }
 
@@ -404,12 +526,20 @@ const PAGE_ROWS: isize = 20;
 
 /// The diff viewer as a modal, which is how `diff_open` reaches it.
 ///
-/// A wrapper rather than a `Dialog` impl on [`DiffView`] itself, because the view is also
-/// mounted as a plain [`Component`] and the two want different scroll ownership: the
-/// component form offsets inside its own `render`, while a dialog is asked for rows by
-/// its host and must therefore apply the offset before returning them.
+/// A wrapper rather than a `Dialog` impl on [`DiffBrowser`] itself, because the line
+/// renderer is also mounted as a plain [`Component`] and the two want different scroll
+/// ownership: the component form offsets inside its own `render`, while a dialog is asked
+/// for rows by its host and must therefore apply the offset before returning them.
+///
+/// # Why the browser lives here and not behind a second action
+///
+/// `diff_open` is the only production route to a diff viewer
+/// (`views/session.rs::diff_view`), so the file tree had to arrive *inside* this dialog
+/// or arrive unreachable. Adding a `diff_browser_open` action instead would have left
+/// `DiffDialog` as the thing users actually reach and the tree as a surface with zero
+/// production constructors — the failure mode this project has now recorded four times.
 pub struct DiffDialog {
-    view: DiffView,
+    browser: DiffBrowser,
     offset: usize,
     rows: usize,
 }
@@ -418,12 +548,10 @@ impl DiffDialog {
     /// Open `patch` in a modal diff viewer.
     #[must_use]
     pub fn new(context: ViewContext, patch: &str) -> Self {
-        let view = DiffView::new(context, patch);
-        let rows = view.parsed().len();
         Self {
-            view,
+            browser: DiffBrowser::new(context, patch),
             offset: 0,
-            rows,
+            rows: 0,
         }
     }
 
@@ -431,13 +559,11 @@ impl DiffDialog {
         let target = isize::try_from(self.offset)
             .unwrap_or(isize::MAX)
             .saturating_add(delta);
-        let next = usize::try_from(target.max(0))
-            .unwrap_or(0)
-            .min(self.rows.saturating_sub(1));
-        if next == self.offset {
-            return crate::views::dialog::DialogStep::Redraw;
-        }
-        self.offset = next;
+        self.jump(usize::try_from(target.max(0)).unwrap_or(0))
+    }
+
+    fn jump(&mut self, row: usize) -> crate::views::dialog::DialogStep {
+        self.offset = row.min(self.rows.saturating_sub(1));
         crate::views::dialog::DialogStep::Redraw
     }
 }
@@ -448,16 +574,68 @@ impl crate::views::dialog::Dialog for DiffDialog {
     }
 
     fn title(&self) -> String {
-        format!("Diff — {} lines", self.rows)
+        let files = self.browser.files();
+        let additions: usize = files.iter().map(|file| file.additions).sum();
+        let deletions: usize = files.iter().map(|file| file.deletions).sum();
+        let current = files
+            .get(self.browser.selected())
+            .map_or("", |file| file.path.as_str());
+        if files.len() > 1 {
+            return format!(
+                "Diff — {} files  +{additions} -{deletions}  ·  {current}",
+                files.len()
+            );
+        }
+        format!("Diff — {current}  +{additions} -{deletions}")
+    }
+
+    /// `§11.4` puts the inline diff at `XLarge`, and a browser needs at least as much:
+    /// the tree takes [`crate::views::diff_browser::FILE_TREE_WIDTH`] columns off the
+    /// front, so a `Large` tier would leave the patch below
+    /// [`crate::views::diff_browser::PATCH_MIN_WIDTH`] on any terminal narrower than
+    /// about 120 and drop the tree it exists to show.
+    fn width(&self) -> crate::views::dialog::DialogWidth {
+        crate::views::dialog::DialogWidth::XLarge
+    }
+
+    /// The whole frame, always.
+    ///
+    /// The default sizes a dialog to the rows its body produced, and this body shrinks as
+    /// the offset advances — so scrolling toward the end of a patch made the modal shrink
+    /// and slide down the frame under the reader, moving every row they were reading.
+    /// Measured while writing the hunk-navigation test: after `]` reached the last hunk,
+    /// the title had migrated from the first row of the frame to the third. Empty rows
+    /// below the last line of a patch are the smaller cost by a wide margin.
+    fn desired_height(&self, _content_rows: u16, available: u16) -> u16 {
+        available
     }
 
     fn lines(&mut self, width: u16) -> Vec<Line<'static>> {
-        let all = self.view.lines(width);
+        let all = self.browser.lines(width);
+        self.rows = all.len();
+        // Clamped after the row count is known: a `]` pressed on the last hunk of a
+        // patch that has since been re-rendered narrower would otherwise hold an offset
+        // past the end and show an empty viewer.
+        self.offset = self.offset.min(self.rows.saturating_sub(1));
         all.into_iter().skip(self.offset).collect()
     }
 
+    /// Five hints, and `↑↓ scroll` is deliberately not among them.
+    ///
+    /// The host renders the footer through a `Paragraph`, which drops the *tail* — so the
+    /// hint list is ordered by what may be lost, and `esc close` must never be it. Six
+    /// hints measured 62 columns and the `XLarge` tier collapses to 54 on a 60-column
+    /// terminal, which silently truncated the only hint saying how to leave a modal that
+    /// still owns the keyboard. Arrow-key scrolling is the one affordance a reader tries
+    /// without being told, so it is what pays for `esc` surviving.
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("↑↓", "scroll"), ("v", "split/unified"), ("esc", "close")]
+        vec![
+            ("[]", "hunk"),
+            ("pn", "file"),
+            ("b", "tree"),
+            ("v", "split"),
+            ("esc", "close"),
+        ]
     }
 
     fn handle_action(
@@ -482,24 +660,44 @@ impl crate::views::dialog::Dialog for DiffDialog {
             "dialog.select.page_down" | "messages_page_down" => self.scroll(PAGE_ROWS),
             "dialog.select.home" | "messages_first" => self.scroll(isize::MIN),
             "dialog.select.end" | "messages_last" => self.scroll(isize::MAX),
-            "diff_toggle_view" => {
-                self.view.set_columns(match self.view.columns() {
-                    DiffColumns::Unified => DiffColumns::Split,
-                    DiffColumns::Split => DiffColumns::Unified,
-                });
+            // These six are the `diff` scope's bare letters. Claiming them here cannot
+            // stop them being typed into the prompt: a dialog is only offered an action
+            // while it is on `DialogHost`'s stack, and with the stack empty the same
+            // action reaches `SessionScreen`, which has no arm for any of them and
+            // therefore lets the key fall through to the editor. That fall-through is
+            // the entire reason `session::scopes()` can afford to list `diff` at all, so
+            // the arm that must never be added is there, not here.
+            "diff_next_hunk" => match self.browser.next_hunk(self.offset) {
+                Some(row) => self.jump(row),
+                None => crate::views::dialog::DialogStep::Redraw,
+            },
+            "diff_previous_hunk" => match self.browser.previous_hunk(self.offset) {
+                Some(row) => self.jump(row),
+                None => crate::views::dialog::DialogStep::Redraw,
+            },
+            // Moving files rewinds the viewport, because the selected file's patch is
+            // what the reader just asked to see and it is above the current offset.
+            "diff_next_file" => {
+                self.browser.next_file();
+                self.jump(0)
+            }
+            "diff_previous_file" => {
+                self.browser.previous_file();
+                self.jump(0)
+            }
+            "diff_toggle_file_tree" => {
+                self.browser.toggle_tree();
                 crate::views::dialog::DialogStep::Redraw
+            }
+            "diff_single_patch" => {
+                self.browser.toggle_single();
+                self.jump(0)
+            }
+            "diff_toggle_view" => {
+                self.browser.toggle_columns();
+                self.jump(0)
             }
             _ => crate::views::dialog::DialogStep::Ignored,
         }
     }
-}
-
-/// Truncate or pad `text` to exactly `width` display cells.
-fn fit(text: &str, width: usize) -> String {
-    let mut out = text.chars().take(width).collect::<String>();
-    let len = out.chars().count();
-    if len < width {
-        out.extend(std::iter::repeat_n(' ', width - len));
-    }
-    out
 }

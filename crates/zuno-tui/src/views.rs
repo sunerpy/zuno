@@ -49,6 +49,7 @@ pub mod basics;
 pub mod diagnostics;
 pub mod dialog;
 pub mod diff;
+pub mod diff_browser;
 pub mod editor;
 pub mod external;
 pub mod help;
