@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use crossterm::event::Event as CrosstermEvent;
+use crossterm::event::{Event as CrosstermEvent, MouseButton, MouseEventKind};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
@@ -272,7 +272,7 @@ fn app_every_mode_entering_the_terminal_enables_is_disabled_on_the_way_out() {
     let entering = body("enter_terminal");
     let leaving = body("restore_terminal");
 
-    let enabled: Vec<&str> = ["EnableBracketedPaste", "EnableMouseCapture"]
+    let enabled: Vec<&str> = ["EnableBracketedPaste", "NarrowMouseCapture"]
         .into_iter()
         .filter(|command| entering.contains(command))
         .collect();
@@ -283,12 +283,231 @@ fn app_every_mode_entering_the_terminal_enables_is_disabled_on_the_way_out() {
          vacuously: {enabled:?}"
     );
     for command in enabled {
-        let paired = command.replace("Enable", "Disable");
+        let paired = command
+            .replace("Enable", "Disable")
+            .replace("Capture", "Release");
         assert!(
             leaving.contains(&paired),
             "`{command}` is enabled on the way in and `{paired}` never runs on the way \
              out, which leaves the terminal altered after the process ends"
         );
+    }
+
+    // The command-name half above cannot see inside a hand-written sequence, and this
+    // build now writes DEC private modes directly. So the modes are paired too, derived
+    // from whatever the source actually asks for rather than from a list: `?1000h` with no
+    // `?1000l` leaves the user's shell reporting mouse clicks as garbage input, and a list
+    // of names went silent the moment `EnableMouseCapture` stopped being the thing called.
+    let private_modes = |source: &str, suffix: char| -> std::collections::BTreeSet<String> {
+        let mut found = std::collections::BTreeSet::new();
+        let mut rest = source;
+        while let Some(at) = rest.find("[?") {
+            rest = &rest[at + 2..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            if digits.is_empty() {
+                continue;
+            }
+            if rest[digits.len()..].starts_with(suffix) {
+                found.insert(digits);
+            }
+        }
+        found
+    };
+    let whole = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app.rs"),
+    )
+    .expect("read this module's own source");
+    let set = private_modes(&whole, 'h');
+    let unset = private_modes(&whole, 'l');
+    assert!(
+        set.len() >= 2,
+        "the mode scan found {} enabled modes, so it is inspecting nothing: {set:?}",
+        set.len()
+    );
+    let orphans: Vec<&String> = set.difference(&unset).collect();
+    assert!(
+        orphans.is_empty(),
+        "these DEC private modes are set and never unset, so they outlive the process: \
+         {orphans:?}"
+    );
+}
+
+#[test]
+fn app_mouse_reporting_asks_only_for_the_events_a_screen_consumes() {
+    // `EnableMouseCapture` requests `?1002` and `?1003`, which report drag and every
+    // pointer motion. Nothing in this binary reads either, and each arriving event costs
+    // two `spawn_blocking` hops and a slot in the bounded input channel — so requesting
+    // them makes pointer movement delay keystrokes. This pins the narrowed request.
+    let mut entered = Vec::new();
+    enter_terminal(&mut entered, true).expect("a vector accepts every write");
+    let entered = String::from_utf8(entered).expect("crossterm writes utf-8");
+
+    assert!(
+        entered.contains("\u{1b}[?1000h"),
+        "press/release reporting is off, so the wheel sends nothing: {entered:?}"
+    );
+    assert!(
+        entered.contains("\u{1b}[?1006h"),
+        "SGR encoding is off, so a click past column 223 reports the wrong cell: \
+         {entered:?}"
+    );
+    for (mode, what) in [("1002", "drag"), ("1003", "any pointer motion")] {
+        assert!(
+            !entered.contains(&format!("\u{1b}[?{mode}h")),
+            "mode ?{mode} ({what}) is requested and nothing consumes it: {entered:?}"
+        );
+    }
+
+    // And nothing is requested when the user turned the mouse off.
+    let mut without = Vec::new();
+    enter_terminal(&mut without, false).expect("a vector accepts every write");
+    let without = String::from_utf8(without).expect("crossterm writes utf-8");
+    assert!(
+        !without.contains("\u{1b}[?1000h"),
+        "`mouse = false` still grabbed the pointer, so native selection stays broken for \
+         the user who opted out: {without:?}"
+    );
+}
+
+#[tokio::test]
+async fn app_motion_is_dropped_at_the_boundary_while_the_wheel_still_arrives() {
+    // The functional risk in narrowing the mouse pipeline: drop too much and the wheel
+    // stops scrolling. Driven through the real producer, so what is asserted is what the
+    // event loop would actually receive.
+    let mouse = |kind| {
+        CrosstermEvent::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column: 4,
+            row: 4,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        })
+    };
+    let input = RecordingInput::new([
+        mouse(MouseEventKind::Moved),
+        mouse(MouseEventKind::Drag(MouseButton::Left)),
+        mouse(MouseEventKind::Down(MouseButton::Left)),
+        mouse(MouseEventKind::ScrollDown),
+        mouse(MouseEventKind::Moved),
+        mouse(MouseEventKind::ScrollUp),
+    ]);
+    let (sender, mut receiver) = terminal_event_channel();
+    let control = Arc::new(TerminalInputControl::new());
+    let producer = tokio::spawn(forward_terminal_input_from(
+        Arc::clone(&input) as Arc<_>,
+        sender,
+        Arc::clone(&control),
+    ));
+
+    let mut delivered = Vec::new();
+    for _ in 0..2 {
+        let event = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("the wheel notches arrive well inside the timeout")
+            .expect("the producer is still running");
+        delivered.push(event);
+    }
+    drop(receiver);
+    let _ = producer.await;
+
+    let kinds: Vec<MouseEventKind> = delivered
+        .iter()
+        .filter_map(|event| match event {
+            TerminalEvent::Input(CrosstermEvent::Mouse(mouse)) => Some(mouse.kind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![MouseEventKind::ScrollDown, MouseEventKind::ScrollUp],
+        "the producer forwarded something other than the two wheel notches, so either \
+         motion reached the queue or the wheel stopped arriving: {delivered:?}"
+    );
+    assert_eq!(
+        input.reads.load(Ordering::SeqCst),
+        6,
+        "the filter is meant to drop after the read, not to skip reading; a changed count \
+         means this test is no longer exercising the path it describes"
+    );
+}
+
+#[test]
+fn app_the_input_filter_forwards_exactly_what_a_screen_consumes() {
+    // Two hand-written match arms, in different files, that have to agree: the filter in
+    // `is_consumable_mouse` and `SessionScreen::handle_wheel`'s own match. A source scan
+    // rather than a shared constant because the screen's arms are what actually decide
+    // behaviour, and the day a screen learns to drag this must fail rather than silently
+    // drop the event before the screen ever sees it.
+    let screen = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/views/session.rs"),
+    )
+    .expect("read the screen's source");
+    let start = screen
+        .find("fn handle_wheel(")
+        .expect("handle_wheel is gone; this scan is checking nothing");
+    let rest = &screen[start..];
+    let end = rest.find("\n    }\n").expect("a method body ends");
+    let consumed: std::collections::BTreeSet<&str> = rest[..end]
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .filter_map(|line| line.split("MouseEventKind::").nth(1))
+        .map(|tail| {
+            tail.split(|character: char| !character.is_alphanumeric())
+                .next()
+                .unwrap_or_default()
+        })
+        .filter(|name| !name.is_empty())
+        .collect();
+    assert!(
+        consumed.len() >= 2,
+        "the scan found {} consumed mouse kinds, so it is measuring nothing: {consumed:?}",
+        consumed.len()
+    );
+
+    for name in &consumed {
+        let kind = match *name {
+            "ScrollUp" => MouseEventKind::ScrollUp,
+            "ScrollDown" => MouseEventKind::ScrollDown,
+            "ScrollLeft" => MouseEventKind::ScrollLeft,
+            "ScrollRight" => MouseEventKind::ScrollRight,
+            "Moved" => MouseEventKind::Moved,
+            other => panic!(
+                "`{other}` is consumed by the screen and this test cannot construct it, so \
+                 the filter's agreement with the screen is unproven"
+            ),
+        };
+        assert!(
+            is_consumable_mouse(kind),
+            "the screen acts on `{name}` but the input filter drops it before the channel, \
+             so that arm can never run"
+        );
+    }
+    // The complement: a kind the screen ignores must not reach the queue.
+    for kind in [
+        MouseEventKind::Moved,
+        MouseEventKind::Drag(MouseButton::Left),
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        if consumable_name(kind).is_some_and(|name| consumed.contains(name)) {
+            continue;
+        }
+        assert!(
+            !is_consumable_mouse(kind),
+            "{kind:?} is forwarded but no screen consumes it, so it only costs a channel \
+             slot a keystroke needs"
+        );
+    }
+}
+
+/// The scan-comparable name of a mouse kind, for kinds this test enumerates.
+const fn consumable_name(kind: MouseEventKind) -> Option<&'static str> {
+    match kind {
+        MouseEventKind::ScrollUp => Some("ScrollUp"),
+        MouseEventKind::ScrollDown => Some("ScrollDown"),
+        MouseEventKind::ScrollLeft => Some("ScrollLeft"),
+        MouseEventKind::ScrollRight => Some("ScrollRight"),
+        MouseEventKind::Moved => Some("Moved"),
+        _ => None,
     }
 }
 

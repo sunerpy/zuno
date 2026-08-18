@@ -38,6 +38,25 @@ const HIGHLIGHT_NAMES: [&str; 14] = [
     "punctuation",
 ];
 
+/// A language this build can highlight.
+///
+/// `§7.2`'s second batch is `c`, `cpp`, `java`, `ruby`, `php`, `html`, `css`, `sql` and
+/// `diff`. Six of those are here, plus `bash`, which the workspace already carried for
+/// `zuno-tools`. Four are absent, each for a checkable reason rather than a preference:
+///
+/// * `tree-sitter-sql`'s only unyanked release is `0.0.2`, which requires
+///   `tree-sitter ^0.19.3`. This workspace resolves `tree-sitter 0.26.11`, and a `Language`
+///   from 0.19 is not the type `tree_sitter_highlight 0.26` accepts, so it could not be
+///   passed to [`make_configuration`] even if a second copy were allowed into the graph.
+/// * `tree-sitter-diff` is not published under that name at all.
+/// * `css` and `html` were built, measured and then **left out**. Their queries capture
+///   `@tag`, `@attribute` and `@property`, none of which are in [`HIGHLIGHT_NAMES`], so the
+///   words a reader looks at stay unstyled: measured on `.panel { color: red; }` CSS
+///   coloured three spans (the comment, a number and a unit) and HTML two (a comment and an
+///   attribute *value*) — every tag name plain. Adding those three capture names is the fix,
+///   and it is deliberately not done here: `@property` is also emitted by Go, Python, Rust,
+///   TOML, YAML and JavaScript, so it would recolour six already-shipped languages that
+///   `P2-2` verified by eye. That is a `§7.2` table change, not a grammar addition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Grammar {
     Rust,
@@ -50,7 +69,63 @@ enum Grammar {
     Yaml,
     Toml,
     Markdown,
+    Bash,
+    C,
+    Cpp,
+    Java,
+    Php,
+    Ruby,
 }
+
+/// Each grammar's position in [`ALL_GRAMMARS`].
+///
+/// The match is exhaustive, so a new variant cannot compile without being given a number
+/// here, and `highlight_every_grammar_in_the_table_produces_spans_for_its_own_alias`
+/// rejects a number outside the array's range. Together that is what stops a grammar being
+/// added and never tested — the failure a hand-kept list produces silently, as the diff
+/// scope's comment did when it named nine of eleven bare characters.
+#[cfg(test)]
+const fn grammar_ordinal(grammar: Grammar) -> usize {
+    match grammar {
+        Grammar::Rust => 0,
+        Grammar::Python => 1,
+        Grammar::Go => 2,
+        Grammar::TypeScript => 3,
+        Grammar::JavaScript => 4,
+        Grammar::Tsx => 5,
+        Grammar::Json => 6,
+        Grammar::Yaml => 7,
+        Grammar::Toml => 8,
+        Grammar::Markdown => 9,
+        Grammar::Bash => 10,
+        Grammar::C => 11,
+        Grammar::Cpp => 12,
+        Grammar::Java => 13,
+        Grammar::Php => 14,
+        Grammar::Ruby => 15,
+    }
+}
+
+/// Every grammar, for the guards that must not miss one.
+#[cfg(test)]
+const ALL_GRAMMARS: [Grammar; 16] = [
+    Grammar::Rust,
+    Grammar::Python,
+    Grammar::Go,
+    Grammar::TypeScript,
+    Grammar::JavaScript,
+    Grammar::Tsx,
+    Grammar::Json,
+    Grammar::Yaml,
+    Grammar::Toml,
+    Grammar::Markdown,
+    Grammar::Bash,
+    Grammar::C,
+    Grammar::Cpp,
+    Grammar::Java,
+    Grammar::Php,
+    Grammar::Ruby,
+];
 
 pub(super) fn spans(hint: Option<&str>, source: &str, palette: &Palette) -> Option<Vec<Row>> {
     if source.len() > MAX_HIGHLIGHT_BYTES || source.split('\n').count() > MAX_HIGHLIGHT_LINES {
@@ -138,6 +213,15 @@ pub(super) fn detect_filetype(path: &str) -> Option<&'static str> {
         "yaml" | "yml" => Some("yaml"),
         "toml" => Some("toml"),
         "md" | "markdown" | "mdx" => Some("markdown"),
+        "sh" | "bash" | "zsh" | "bashrc" | "zshrc" => Some("bash"),
+        // `.h` to C, not C++. It is ambiguous in reality, and C is the safer read: a C++
+        // header parsed as C loses some highlighting, whereas C parsed as C++ can report a
+        // syntax error and lose the block instead.
+        "c" | "h" => Some("c"),
+        "cc" | "cpp" | "cxx" | "hpp" | "hxx" => Some("cpp"),
+        "java" => Some("java"),
+        "php" => Some("php"),
+        "rb" => Some("ruby"),
         _ => None,
     }
 }
@@ -206,6 +290,14 @@ impl Grammar {
             "yaml" | "yml" => Some(Self::Yaml),
             "toml" => Some(Self::Toml),
             "markdown" | "md" | "mdx" => Some(Self::Markdown),
+            "bash" | "sh" | "shell" | "zsh" => Some(Self::Bash),
+            "c" | "h" => Some(Self::C),
+            // `c++` as well as `cpp`: a fence commonly says `c++`, and rejecting it would
+            // read as a broken highlighter rather than an unknown alias.
+            "cpp" | "c++" | "cc" | "cxx" | "hpp" | "hxx" => Some(Self::Cpp),
+            "java" => Some(Self::Java),
+            "php" => Some(Self::Php),
+            "ruby" | "rb" => Some(Self::Ruby),
             _ => None,
         }
     }
@@ -269,6 +361,45 @@ fn configuration(grammar: Grammar) -> Option<HighlightConfiguration> {
             tree_sitter_md::INLINE_LANGUAGE.into(),
             "markdown",
             tree_sitter_md::HIGHLIGHT_QUERY_INLINE.to_owned(),
+        ),
+        // The constant is `HIGHLIGHT_QUERY` in bash, c and cpp and `HIGHLIGHTS_QUERY` in
+        // the rest. Upstream's own naming; spelling it per arm is the only way to be right.
+        Grammar::Bash => (
+            tree_sitter_bash::LANGUAGE.into(),
+            "bash",
+            tree_sitter_bash::HIGHLIGHT_QUERY.to_owned(),
+        ),
+        Grammar::C => (
+            tree_sitter_c::LANGUAGE.into(),
+            "c",
+            tree_sitter_c::HIGHLIGHT_QUERY.to_owned(),
+        ),
+        Grammar::Cpp => (
+            tree_sitter_cpp::LANGUAGE.into(),
+            "cpp",
+            // C++ is a superset, and its own query does not restate C's rules; without C's
+            // the shared constructs in a C++ block go unhighlighted.
+            join_queries(&[
+                tree_sitter_c::HIGHLIGHT_QUERY,
+                tree_sitter_cpp::HIGHLIGHT_QUERY,
+            ]),
+        ),
+        Grammar::Java => (
+            tree_sitter_java::LANGUAGE.into(),
+            "java",
+            tree_sitter_java::HIGHLIGHTS_QUERY.to_owned(),
+        ),
+        // `LANGUAGE_PHP`, not `LANGUAGE_PHP_ONLY`: the former starts outside PHP and enters
+        // on `<?php`, which is how a fenced PHP block is actually written.
+        Grammar::Php => (
+            tree_sitter_php::LANGUAGE_PHP.into(),
+            "php",
+            tree_sitter_php::HIGHLIGHTS_QUERY.to_owned(),
+        ),
+        Grammar::Ruby => (
+            tree_sitter_ruby::LANGUAGE.into(),
+            "ruby",
+            tree_sitter_ruby::HIGHLIGHTS_QUERY.to_owned(),
         ),
     };
     make_configuration(language, name, &highlights)

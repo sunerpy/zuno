@@ -40,7 +40,7 @@ use zuno_error::ToolError;
 use zuno_permission::{PermissionRequest, ReplyKind};
 use zuno_tool::{PermissionAsk, PermissionAsker};
 use zuno_tui::app::{AppEvent, Component, EventResult, TerminalEvent};
-use zuno_tui::keybind::{ActionComponent, Chord, Definition};
+use zuno_tui::keybind::{ActionComponent, Definition, PendingPrefix};
 use zuno_tui::ratatui::Frame;
 use zuno_tui::ratatui::layout::Rect;
 use zuno_tui::views::ViewContext;
@@ -273,7 +273,7 @@ impl ActionComponent for PermissionBridge {
         self.host.focused_scopes()
     }
 
-    fn pending_changed(&mut self, pending: &[Chord]) -> EventResult {
+    fn pending_changed(&mut self, pending: &PendingPrefix) -> EventResult {
         self.host.pending_changed(pending)
     }
 }

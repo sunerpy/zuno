@@ -2153,6 +2153,172 @@ fn exposing_the_diff_scope_did_not_stop_its_bare_letters_being_typed() {
     );
 }
 
+/// The shortest description among the leader's continuations in the production chain.
+///
+/// Derived rather than named: a grid cell truncates a long description legitimately, so an
+/// assertion must target one that fits at any cell width, and which row that is changes
+/// whenever the table does.
+fn shortest_leader_description() -> &'static str {
+    let mut keymap = Keymap::defaults().expect("the shipped table builds");
+    let leader = keymap.leader();
+    let chain = scopes();
+    let chain = chain.iter().map(String::as_str).collect::<Vec<_>>();
+    assert_eq!(
+        keymap.resolve(&chain, leader, std::time::Instant::now()),
+        crate::keybind::Resolution::Pending
+    );
+    let mut all = keymap.continuations(&chain);
+    assert!(all.len() >= 20, "only {} continuations", all.len());
+    all.sort_by_key(|entry| crate::views::display_width(entry.definition.description));
+    all[0].definition.description
+}
+
+#[test]
+fn session_pressing_the_leader_paints_a_which_key_panel_end_to_end() {
+    // The reachability bar, and the reason it is asserted here rather than on the view:
+    // `WhichKeyView` was complete, tested and had zero production construction sites for
+    // as long as it existed. This drives one real `ctrl+x` through `KeyDispatcher` into
+    // the same `DialogHost`-over-`SessionScreen` stack `cmd/tui.rs` builds, then reads
+    // the frame. Nothing short of that distinguishes "wired" from "built".
+    let keymap = Keymap::defaults().expect("the shipped table builds");
+    let leader = keymap.leader();
+    let (sender, _shutdown) = terminal_event_channel();
+    let screen = SessionScreen::new(ViewContext::defaults(), sender);
+    let host = crate::views::dialog::DialogHost::new(ViewContext::defaults(), Box::new(screen));
+    let mut dispatcher = KeyDispatcher::new(keymap, scopes(), Box::new(host));
+
+    let before = rows(&render_offscreen(&mut dispatcher, 100, 14).expect("infallible")).join("\n");
+    dispatcher.handle_event(&AppEvent::Terminal(TerminalEvent::Input(
+        crossterm::event::Event::Key(key_event_for(&leader.to_string())),
+    )));
+    let after = rows(&render_offscreen(&mut dispatcher, 100, 14).expect("infallible")).join("\n");
+
+    let expected = crate::keybind::Keymap::defaults()
+        .expect("builds")
+        .continuations(&["session"]);
+    assert!(
+        expected.is_empty(),
+        "continuations must be empty with nothing pending, or this test proves nothing"
+    );
+    assert_ne!(
+        before, after,
+        "one leader press changed no cell, so the panel is not mounted in the production \
+         stack:\n{after}"
+    );
+    // A description from the table, so this cannot pass on incidental chrome.
+    let needle = shortest_leader_description();
+    assert!(
+        after.contains(needle),
+        "`{leader}` did not paint the leader's continuations; `{needle}` is absent:\n{after}"
+    );
+}
+
+#[test]
+fn session_an_abandoned_leader_sequence_takes_its_panel_with_it() {
+    // The `Unmatched` branch. Before it reported an inactive prefix, the panel opened by
+    // `ctrl+x` stayed on screen over every later keystroke — a stuck overlay reporting
+    // continuations for a sequence that had already been abandoned.
+    let keymap = Keymap::defaults().expect("the shipped table builds");
+    let leader = keymap.leader();
+    let (sender, _shutdown) = terminal_event_channel();
+    let screen = SessionScreen::new(ViewContext::defaults(), sender);
+    let host = crate::views::dialog::DialogHost::new(ViewContext::defaults(), Box::new(screen));
+    let mut dispatcher = KeyDispatcher::new(keymap, scopes(), Box::new(host));
+
+    dispatcher.handle_event(&AppEvent::Terminal(TerminalEvent::Input(
+        crossterm::event::Event::Key(key_event_for(&leader.to_string())),
+    )));
+    let needle = shortest_leader_description();
+    let open = rows(&render_offscreen(&mut dispatcher, 100, 14).expect("infallible")).join("\n");
+    assert!(open.contains(needle), "{open}");
+
+    // `~` begins no sequence in any registered scope, so the leader is abandoned.
+    dispatcher.handle_event(&AppEvent::Terminal(TerminalEvent::Input(
+        crossterm::event::Event::Key(crate::views::testkit::press(
+            crossterm::event::KeyCode::Char('~'),
+        )),
+    )));
+    let closed = rows(&render_offscreen(&mut dispatcher, 100, 14).expect("infallible")).join("\n");
+    assert!(
+        !closed.contains(needle),
+        "the panel outlived the sequence it was explaining:\n{closed}"
+    );
+    // And the key that abandoned it still reached the prompt. Notifying the panel from
+    // this branch made the result `handled` for one revision, which swallowed exactly
+    // this character — the panel closed correctly and the keystroke vanished.
+    assert!(
+        closed.contains('~'),
+        "the key that abandoned the sequence was consumed instead of typed:\n{closed}"
+    );
+}
+
+#[test]
+fn session_completing_a_leader_sequence_closes_the_panel() {
+    // The `Action` branch, which is the common case: `ctrl+x` then a bound key. The panel
+    // must be gone by the frame that shows the action's own effect.
+    let keymap = Keymap::defaults().expect("the shipped table builds");
+    let leader = keymap.leader();
+    let (sender, _shutdown) = terminal_event_channel();
+    let screen = SessionScreen::new(ViewContext::defaults(), sender);
+    let host = crate::views::dialog::DialogHost::new(ViewContext::defaults(), Box::new(screen));
+    let mut dispatcher = KeyDispatcher::new(keymap, scopes(), Box::new(host));
+
+    dispatch_sequence(&mut dispatcher, "<leader>s", leader);
+    let after = rows(&render_offscreen(&mut dispatcher, 100, 14).expect("infallible")).join("\n");
+    assert!(
+        !after.contains(shortest_leader_description()),
+        "the which-key panel survived a completed sequence:\n{after}"
+    );
+}
+
+#[test]
+fn session_the_leader_panel_does_not_stop_its_continuation_keys_being_typed() {
+    // The diff-scope precedent. Every continuation the panel advertises is reached
+    // through the leader, so none of them is a bare binding and the prompt must still
+    // accept each as text. Derived from the table, because a hand-kept list stops
+    // covering the row added after it.
+    let keymap = Keymap::defaults().expect("the shipped table builds");
+    let leader = keymap.leader();
+    let mut probe = Keymap::defaults().expect("builds");
+    assert_eq!(
+        probe.resolve(
+            &scopes().iter().map(String::as_str).collect::<Vec<_>>(),
+            leader,
+            std::time::Instant::now()
+        ),
+        crate::keybind::Resolution::Pending
+    );
+    let single = probe
+        .continuations(&scopes().iter().map(String::as_str).collect::<Vec<_>>())
+        .into_iter()
+        .filter(|entry| entry.keys.chars().count() == 1)
+        .filter_map(|entry| entry.keys.chars().next())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        single.len() >= 10,
+        "only {} single-character continuations; this guard is measuring nothing",
+        single.len()
+    );
+
+    let (sender, _receiver) = terminal_event_channel();
+    let screen = SessionScreen::new(ViewContext::defaults(), sender);
+    let mut dispatcher = KeyDispatcher::new(keymap, scopes(), Box::new(screen));
+    let typed = single.iter().copied().collect::<String>();
+    for character in single {
+        dispatcher.handle_event(&AppEvent::Terminal(TerminalEvent::Input(
+            crossterm::event::Event::Key(crate::views::testkit::press(
+                crossterm::event::KeyCode::Char(character),
+            )),
+        )));
+    }
+    let joined = rows(&render_offscreen(&mut dispatcher, 100, 12).expect("infallible")).join("\n");
+    assert!(
+        joined.contains(&typed),
+        "a leader continuation's letter stopped reaching the prompt; `{typed}` is not on \
+         screen:\n{joined}"
+    );
+}
+
 #[test]
 fn every_action_the_screen_consumes_lives_in_a_scope_it_resolves() {
     // The hole the two guards above leave. Both derive their set from a hand-kept list —

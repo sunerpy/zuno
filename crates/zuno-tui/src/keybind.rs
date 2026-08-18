@@ -52,7 +52,7 @@ use crossterm::event::{
 };
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::ops::BitOr;
 use std::time::{Duration, Instant};
@@ -695,6 +695,44 @@ pub enum Resolution {
     Unmatched,
 }
 
+/// The pending leader sequence and everything it can still become.
+///
+/// Carried together because a consumer that held only the chords would have to find the
+/// continuations itself, from a scope chain only [`KeyDispatcher`] knows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PendingPrefix {
+    /// The chords pressed so far. Empty once the sequence resolved or was abandoned.
+    pub chords: Vec<Chord>,
+    /// What the next press can do.
+    pub continuations: Vec<Continuation>,
+}
+
+impl PendingPrefix {
+    /// Whether a sequence is in flight.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        !self.chords.is_empty()
+    }
+
+    /// The chords pressed so far, rendered as one label.
+    #[must_use]
+    pub fn label(&self) -> String {
+        render_sequence(&self.chords)
+    }
+}
+
+/// One way a pending sequence can be completed.
+///
+/// `keys` is the remainder still to press, not the whole sequence: after `ctrl+x` the
+/// user needs to know `d`, and showing `ctrl+x d` would read as a second leader press.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Continuation {
+    /// The chords left to press, rendered.
+    pub keys: String,
+    /// The row that will fire.
+    pub definition: &'static Definition,
+}
+
 /// The resolved binding table plus the pending-sequence state machine.
 #[derive(Debug, Clone)]
 pub struct Keymap {
@@ -837,6 +875,56 @@ impl Keymap {
             .collect()
     }
 
+    /// What the pending sequence can still complete to, in `scopes` order.
+    ///
+    /// Derived from the same two things [`Self::resolve`] reads — this `scopes` map and
+    /// [`starts_with`] — so a which-key panel cannot name a key the next press will not
+    /// honour. Living in the view instead is what would allow that disagreement.
+    ///
+    /// Scope order is precedence, as in [`Self::resolve`]: the first scope that binds a
+    /// sequence owns it, so a later scope's row for the same remainder is dropped rather
+    /// than listed twice. Empty while nothing is pending — the question it answers is
+    /// "I pressed the leader, what now?".
+    ///
+    /// # The order is load-bearing, and it is not alphabetical
+    ///
+    /// Rows come back in scope-precedence order and, within a scope, in [`DEFINITIONS`]
+    /// order. Sorting by spelling was tried and reverted: it puts `1`-`9` first, and the
+    /// leader's nine `session_quick_switch_*` rows then fill a narrow panel with nine lines of
+    /// `Switch to session in quick slot N` while `List all sessions` and
+    /// `Create a new session` fall past the cut. A caller that re-sorts this reintroduces
+    /// that, so [`crate::views::autocomplete`] has a test holding the order.
+    #[must_use]
+    pub fn continuations(&self, scopes: &[&str]) -> Vec<Continuation> {
+        let prefix = self.pending();
+        if prefix.is_empty() {
+            return Vec::new();
+        }
+        let mut claimed: BTreeSet<Vec<Chord>> = BTreeSet::new();
+        let mut seen: BTreeSet<&'static str> = BTreeSet::new();
+        let mut found = Vec::new();
+        for scope in scopes {
+            for binding in self.scopes.get(scope).into_iter().flatten() {
+                if !starts_with(&binding.sequence, prefix) {
+                    continue;
+                }
+                // A sequence already claimed by an earlier scope resolves there, so
+                // listing this row would advertise a key that fires something else.
+                if !claimed.insert(binding.sequence.clone()) {
+                    continue;
+                }
+                if !seen.insert(binding.definition.name) {
+                    continue;
+                }
+                found.push(Continuation {
+                    keys: render_sequence(&binding.sequence[prefix.len()..]),
+                    definition: binding.definition,
+                });
+            }
+        }
+        found
+    }
+
     /// Drop a pending sequence that has outlived the configured timeout.
     ///
     /// Callers with a timer tick can invoke this so a which-key panel closes on
@@ -954,7 +1042,11 @@ pub trait ActionComponent: Component {
     }
 
     /// Observe a change to the pending sequence, for a which-key surface.
-    fn pending_changed(&mut self, _pending: &[Chord]) -> EventResult {
+    ///
+    /// Called on every resolution, including with an inactive prefix when a sequence
+    /// completes or is abandoned. A consumer that only heard about *arriving* prefixes
+    /// could never learn one had gone.
+    fn pending_changed(&mut self, _pending: &PendingPrefix) -> EventResult {
         EventResult::IGNORED
     }
 
@@ -1052,12 +1144,32 @@ impl KeyDispatcher {
             Resolution::Action {
                 definition,
                 prevent_default: _,
-            } => self.inner.handle_action(definition, event),
-            Resolution::Pending => {
-                let pending = self.keymap.pending().to_vec();
-                EventResult::REDRAW.merge(self.inner.pending_changed(&pending))
+            } => {
+                let cleared = self.inner.pending_changed(&PendingPrefix::default());
+                self.inner.handle_action(definition, event).merge(cleared)
             }
-            Resolution::Unmatched => EventResult::IGNORED,
+            Resolution::Pending => {
+                let prefix = PendingPrefix {
+                    chords: self.keymap.pending().to_vec(),
+                    continuations: self.keymap.continuations(&scopes),
+                };
+                EventResult::REDRAW.merge(self.inner.pending_changed(&prefix))
+            }
+            // Cleared here too, and this is the branch that made it necessary: an
+            // abandoned sequence left the last prefix standing, so a which-key panel
+            // opened by `ctrl+x` stayed open over every later keystroke.
+            //
+            // Only the redraw bit is kept. `handled` must stay false: this branch is what
+            // lets an unmatched key fall through to the editor and be typed, and merging
+            // a consumer's `REDRAW` here swallowed the very keystroke that abandoned the
+            // sequence — `ctrl+x` then `z` stopped putting `z` in the prompt.
+            Resolution::Unmatched => {
+                let cleared = self.inner.pending_changed(&PendingPrefix::default());
+                EventResult {
+                    handled: false,
+                    redraw: cleared.redraw,
+                }
+            }
         }
     }
 }
