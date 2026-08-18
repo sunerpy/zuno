@@ -30,14 +30,16 @@
 //! own order. Deterministic, which is what a test can assert; the exactness of `/`
 //! is preserved by requiring a prefix match for that trigger.
 
-use crate::app::{AppEvent, Component, EventResult};
-use crate::keybind::Definition;
+use crate::app::{AppEvent, Component, EventResult, TerminalEvent};
+use crate::keybind::{Definition, PendingPrefix};
 use crate::views::slash::SlashRouter;
-use crate::views::{ViewContext, fill, padded};
+use crate::views::{ViewContext, display_width, fill, padded, truncate};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget};
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 
 #[cfg(test)]
 #[path = "autocomplete_tests.rs"]
@@ -576,51 +578,192 @@ impl Component for AutocompleteView {
     }
 }
 
+/// The widest a single which-key cell may be, including its key and gap.
+///
+/// A cap rather than "share the width equally": with three continuations a frame-wide
+/// third of a 200-column terminal puts 60 columns of gap between a key and its
+/// description, which reads as two unrelated lists.
+const WHICH_KEY_MAX_CELL: u16 = 34;
+
+/// The narrowest cell worth drawing: a key, a space, and something of a description.
+const WHICH_KEY_MIN_CELL: u16 = 14;
+
 /// A which-key surface: the actions reachable from the pending leader sequence.
 ///
 /// Autocomplete's neighbour rather than its own module because it is the same
-/// affordance — a filtered list of what the next keystroke can do — and it shares the
-/// row rendering.
+/// affordance — a filtered list of what the next keystroke can do.
+///
+/// # Why this is a layer and not just a renderer
+///
+/// The panel has to *close* on the leader timeout. Following [`crate::views::toast`],
+/// it holds its own deadline and arms one wake, and [`Self::render`] prunes before
+/// drawing so a dropped wake still cannot leave a stale panel on screen. Polling was
+/// rejected there for the same reason it is rejected here: a fourth redraw tier would
+/// defeat the deep idle the scheduler exists to reach.
 pub struct WhichKeyView {
     context: ViewContext,
-    /// `(key spelling, description)` pairs.
-    pub entries: Vec<(String, String)>,
+    prefix: PendingPrefix,
+    shown: Option<Instant>,
+    timeout: Duration,
+    waker: Option<mpsc::Sender<TerminalEvent>>,
 }
 
 impl WhichKeyView {
     /// A which-key surface over `context`.
     #[must_use]
-    pub const fn new(context: ViewContext) -> Self {
+    pub fn new(context: ViewContext) -> Self {
+        let timeout = context.config.leader_timeout;
         Self {
             context,
-            entries: Vec::new(),
+            prefix: PendingPrefix::default(),
+            shown: None,
+            timeout,
+            waker: None,
         }
+    }
+
+    /// Send expiry wakes on `waker`.
+    #[must_use]
+    pub fn with_waker(mut self, waker: mpsc::Sender<TerminalEvent>) -> Self {
+        self.waker = Some(waker);
+        self
+    }
+
+    /// Whether a prefix is in flight and the panel should be drawn.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.shown.is_some() && self.prefix.is_active()
+    }
+
+    /// Take the dispatcher's new prefix, reporting whether the screen changed.
+    ///
+    /// `now` is a parameter rather than `Instant::now()` so expiry is assertable without
+    /// a sleep, matching [`crate::views::toast::ToastLayer::prune`].
+    pub fn observe(&mut self, prefix: &PendingPrefix, now: Instant) -> bool {
+        let was = self.is_active();
+        if prefix.is_active() {
+            self.prefix = prefix.clone();
+            self.shown = Some(now);
+            self.arm();
+        } else {
+            self.prefix = PendingPrefix::default();
+            self.shown = None;
+        }
+        was != self.is_active()
+    }
+
+    /// Drop a prefix that has outlived the leader timeout by `now`.
+    pub fn prune(&mut self, now: Instant) -> bool {
+        let expired = self
+            .shown
+            .is_some_and(|shown| now.saturating_duration_since(shown) >= self.timeout);
+        if expired {
+            self.shown = None;
+            self.prefix = PendingPrefix::default();
+        }
+        expired
+    }
+
+    /// Rows the panel wants in a frame `available` rows tall.
+    ///
+    /// Never more than half the frame: the panel exists to explain the next keystroke,
+    /// and one that covers the transcript it is explaining has taken more than it gave.
+    #[must_use]
+    pub fn desired_height(&self, available: u16) -> u16 {
+        if !self.is_active() {
+            return 0;
+        }
+        let ceiling = (available / 2).max(1);
+        let wanted = u16::try_from(self.prefix.continuations.len()).unwrap_or(u16::MAX);
+        wanted.min(ceiling)
+    }
+
+    /// The grid: how many columns of what width to use for `entries` over `rows`.
+    ///
+    /// Takes the entry count, and that is the whole point. Packing the width full of
+    /// minimum-width columns instead produced seven 14-column cells on a 100-column
+    /// frame, which cut every description to eleven characters — nine rows reading
+    /// `Switch to s`, a panel that names keys and explains nothing. So: use the fewest
+    /// columns that hold the entries, then spend the leftover width on making them
+    /// legible. Same rule as `§7.1`'s degradation order — content before decoration.
+    fn plan_columns(width: u16, rows: u16, entries: usize) -> (u16, u16) {
+        if width < WHICH_KEY_MIN_CELL || rows == 0 {
+            return (1, width);
+        }
+        let fits = (width / WHICH_KEY_MIN_CELL).max(1);
+        let needed = entries.div_ceil(usize::from(rows).max(1));
+        let columns = u16::try_from(needed).unwrap_or(u16::MAX).clamp(1, fits);
+        let cell = (width / columns).min(WHICH_KEY_MAX_CELL);
+        (columns, cell)
+    }
+
+    fn arm(&self) {
+        let Some(waker) = self.waker.clone() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let timeout = self.timeout;
+        handle.spawn(async move {
+            tokio::time::sleep(timeout).await;
+            let _dropped_when_busy = waker.try_send(TerminalEvent::Wake);
+        });
     }
 }
 
 impl Component for WhichKeyView {
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        self.prune(Instant::now());
+        if !self.is_active() || area.width == 0 || area.height == 0 {
+            return;
+        }
         fill(frame.buffer_mut(), area, self.context.element());
-        let width = area.width;
-        let lines = self
-            .entries
-            .iter()
-            .map(|(key, description)| {
-                Line::from(vec![
-                    Span::styled(format!(" {key:<12}"), self.context.accent()),
-                    Span::styled(description.clone(), self.context.muted()),
-                    Span::styled(
-                        " ".repeat(
-                            usize::from(width).saturating_sub(13 + description.chars().count()),
-                        ),
-                        self.context.element(),
-                    ),
-                ])
-            })
-            .collect::<Vec<_>>();
-        Paragraph::new(lines)
-            .style(self.context.element())
-            .render(area, frame.buffer_mut());
+
+        let rows = area.height;
+        let total = self.prefix.continuations.len();
+        let (columns, cell) = Self::plan_columns(area.width, rows, total);
+        let capacity = usize::from(rows) * usize::from(columns);
+        // The last cell becomes a count when the grid cannot hold everything, so the
+        // panel never implies the leader has fewer continuations than it does.
+        let shown = if total > capacity {
+            capacity.saturating_sub(1)
+        } else {
+            total
+        };
+
+        for row in 0..rows {
+            let mut spans = Vec::new();
+            for column in 0..columns {
+                let index = usize::from(row) + usize::from(column) * usize::from(rows);
+                let text = if index < shown {
+                    let entry = &self.prefix.continuations[index];
+                    let keys = truncate(&entry.keys, usize::from(cell).saturating_sub(2));
+                    let used = display_width(&keys);
+                    let room = usize::from(cell).saturating_sub(used + 2);
+                    format!(" {keys} {}", truncate(entry.definition.description, room))
+                } else if index == shown && total > capacity {
+                    format!(" +{} more", total - shown)
+                } else {
+                    String::new()
+                };
+                let style = if index < shown {
+                    self.context.accent()
+                } else {
+                    self.context.muted()
+                };
+                spans.extend(padded(&text, cell, style).spans);
+            }
+            let region = Rect {
+                x: area.x,
+                y: area.y + row,
+                width: area.width,
+                height: 1,
+            };
+            Paragraph::new(vec![Line::from(spans)])
+                .style(self.context.element())
+                .render(region, frame.buffer_mut());
+        }
     }
 
     fn handle_event(&mut self, _event: &AppEvent) -> EventResult {

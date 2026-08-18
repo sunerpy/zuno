@@ -73,7 +73,8 @@
 //! through.
 
 use crate::app::{AppEvent, Component, EventResult};
-use crate::keybind::{ActionComponent, Chord, Definition, is_exit_request};
+use crate::keybind::{ActionComponent, Definition, PendingPrefix, is_exit_request};
+use crate::views::autocomplete::WhichKeyView;
 use crate::views::toast::ToastLayer;
 use crate::views::{ViewContext, fill, hint, padded};
 use crossterm::event::KeyEvent;
@@ -81,6 +82,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Frame, symbols};
+use std::time::Instant;
 
 #[cfg(test)]
 #[path = "dialog_tests.rs"]
@@ -290,7 +292,8 @@ pub struct DialogHost {
     base: Box<dyn ActionComponent>,
     stack: Vec<Box<dyn Dialog>>,
     outcomes: Vec<(&'static str, DialogOutcome)>,
-    pending: Vec<Chord>,
+    pending: PendingPrefix,
+    which_key: WhichKeyView,
     toasts: ToastLayer,
 }
 
@@ -300,25 +303,30 @@ impl DialogHost {
     pub fn new(context: ViewContext, base: Box<dyn ActionComponent>) -> Self {
         Self {
             toasts: ToastLayer::new(context.clone()),
+            which_key: WhichKeyView::new(context.clone()),
             context,
             base,
             stack: Vec::new(),
             outcomes: Vec::new(),
-            pending: Vec::new(),
+            pending: PendingPrefix::default(),
         }
     }
 
-    /// Let a toast wake the loop when it expires.
+    /// Let this host's timed layers wake the loop when they expire.
     ///
-    /// Without this a toast still disappears, but only once something else brings the
-    /// loop round — see [`crate::views::toast`] for why one deadline and one wake is the
-    /// shape chosen over polling.
+    /// Without this they still expire, but only once something else brings the loop
+    /// round — see [`crate::views::toast`] for why one deadline and one wake is the shape
+    /// chosen over polling.
+    ///
+    /// Both layers are armed from one call on purpose. Two setters would let a host wire
+    /// one and forget the other, which is how a surface ends up finished and untriggered.
     #[must_use]
-    pub fn with_toast_waker(
+    pub fn with_waker(
         mut self,
         waker: tokio::sync::mpsc::Sender<crate::app::TerminalEvent>,
     ) -> Self {
-        self.toasts = ToastLayer::new(self.context.clone()).with_waker(waker);
+        self.toasts = ToastLayer::new(self.context.clone()).with_waker(waker.clone());
+        self.which_key = WhichKeyView::new(self.context.clone()).with_waker(waker);
         self
     }
 
@@ -386,10 +394,37 @@ impl DialogHost {
         opened
     }
 
-    /// The pending leader chords, for a which-key surface.
+    /// The pending leader sequence and its continuations.
     #[must_use]
-    pub fn pending(&self) -> &[Chord] {
+    pub const fn pending(&self) -> &PendingPrefix {
         &self.pending
+    }
+
+    /// Draw the which-key panel across the bottom of `area`, if one is due.
+    ///
+    /// Above the dialog and below the toast. Above, because a user who pressed the
+    /// leader while a modal was open asked this question most recently and the modal is
+    /// still answering the previous one; below, because `§11.4` puts a toast on top of
+    /// everything and a notice that a copy failed must not be the thing that gets hidden.
+    fn render_which_key(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        // Pruned here, before the height is asked for, and that ordering is the whole
+        // correctness of the timeout. `WhichKeyView::render` prunes too, but it is only
+        // reached when `desired_height` returns non-zero — and `desired_height` reports on
+        // an unpruned prefix. So an expired panel kept answering "still active", kept being
+        // drawn, and never pruned: on a real terminal it sat on screen indefinitely after
+        // its 2000 ms wake, which no offscreen test saw because they call `prune` directly.
+        // `ToastLayer` avoids this by being rendered unconditionally every frame.
+        let height = self.which_key.desired_height(area.height);
+        if height == 0 {
+            return;
+        }
+        let region = Rect {
+            x: area.x,
+            y: area.y + area.height.saturating_sub(height),
+            width: area.width,
+            height,
+        };
+        self.which_key.render(frame, region);
     }
 
     fn render_dialog(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -501,6 +536,7 @@ impl Component for DialogHost {
         self.base.observe_modal(self.active());
         self.base.render(frame, area);
         self.render_dialog(frame, area);
+        self.render_which_key(frame, area);
         // Last, so it is on top of the modal. `§11.4`: backdrop, dialog, toast.
         self.toasts.render(frame.buffer_mut(), area);
     }
@@ -552,9 +588,17 @@ impl Component for DialogHost {
                 // — which was requested and never opened while this branch only drained
                 // for keys. The engine's own events reach the base the same way.
                 //
-                // The prune is what makes `TerminalEvent::Wake` remove an expired toast.
+                // The prunes are what make `TerminalEvent::Wake` remove an expired toast and
+                // close an expired which-key panel. Both are needed *here*, not in `render`:
+                // a wake only paints a frame if some component reports `redraw`, so pruning
+                // during `render` would leave the stale panel on the physical terminal until
+                // an unrelated event happened to redraw. Measured on a real terminal — the
+                // panel sat there indefinitely past its 2000 ms deadline, while every
+                // offscreen test passed because rendering a frame is what those tests do.
                 let opened = self.open_requested();
-                if opened || self.take_toasts() || self.toasts.prune(std::time::Instant::now()) {
+                let now = std::time::Instant::now();
+                let expired = self.toasts.prune(now) | self.which_key.prune(now);
+                if opened || self.take_toasts() || expired {
                     result = EventResult {
                         handled: result.handled,
                         redraw: true,
@@ -643,12 +687,17 @@ impl ActionComponent for DialogHost {
         }
     }
 
-    fn pending_changed(&mut self, pending: &[Chord]) -> EventResult {
-        self.pending = pending.to_vec();
-        if self.is_open() {
-            return EventResult::REDRAW;
+    fn pending_changed(&mut self, pending: &PendingPrefix) -> EventResult {
+        self.pending = pending.clone();
+        let changed = self.which_key.observe(pending, Instant::now());
+        // The base is told either way. It is the only component that can act on a
+        // prefix, and gating that on this host's own redraw need would make the
+        // notification arrive only sometimes.
+        let below = self.base.pending_changed(pending);
+        if changed || self.is_open() {
+            return EventResult::REDRAW.merge(below);
         }
-        self.base.pending_changed(pending)
+        below
     }
 }
 

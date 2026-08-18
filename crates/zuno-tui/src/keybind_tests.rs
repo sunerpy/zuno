@@ -693,6 +693,7 @@ fn every_default_spelling_parses() {
 struct Recorder {
     actions: Vec<&'static str>,
     pending: Vec<String>,
+    continuations: Vec<usize>,
     raw_events: usize,
 }
 
@@ -711,8 +712,9 @@ impl ActionComponent for Recorder {
         EventResult::REDRAW
     }
 
-    fn pending_changed(&mut self, pending: &[Chord]) -> EventResult {
-        self.pending.push(render_sequence(pending));
+    fn pending_changed(&mut self, pending: &PendingPrefix) -> EventResult {
+        self.pending.push(pending.label());
+        self.continuations.push(pending.continuations.len());
         EventResult::REDRAW
     }
 }
@@ -736,9 +738,49 @@ fn the_dispatcher_hands_actions_not_keys_to_the_component() {
     let fired = dispatcher.dispatch_key(&key(KeyCode::Char('c'), CrosstermModifiers::NONE), start);
     assert_eq!(fired, EventResult::REDRAW);
 
+    // Unmatched must not consume the key — that fall-through is what lets a bare letter
+    // reach the editor — but it may still need a frame, because this recorder is a
+    // which-key consumer and the panel it opened has to disappear. The two bits are
+    // therefore asserted separately rather than against `IGNORED`, which conflates them.
     let unmatched =
         dispatcher.dispatch_key(&key(KeyCode::Char('z'), CrosstermModifiers::NONE), start);
-    assert_eq!(unmatched, EventResult::IGNORED);
+    assert!(
+        !unmatched.handled,
+        "an unmatched chord was consumed, so its key never reaches the prompt"
+    );
+    assert!(
+        unmatched.redraw,
+        "the consumer was told the sequence ended but no frame was requested, so a \
+         which-key panel would stay on screen until something else redrew"
+    );
+    // A component that does not consume pending changes still sees the old contract
+    // exactly: nothing happened.
+    let mut plain = KeyDispatcher::new(
+        Keymap::defaults().expect("defaults build"),
+        vec!["session".to_owned()],
+        Box::new(Silent),
+    );
+    assert_eq!(
+        plain.dispatch_key(&key(KeyCode::Char('z'), CrosstermModifiers::NONE), start),
+        EventResult::IGNORED
+    );
+}
+
+/// A component with no which-key surface, using every default trait method.
+struct Silent;
+
+impl Component for Silent {
+    fn render(&mut self, _frame: &mut Frame<'_>, _area: Rect) {}
+
+    fn handle_event(&mut self, _event: &AppEvent) -> EventResult {
+        EventResult::IGNORED
+    }
+}
+
+impl ActionComponent for Silent {
+    fn handle_action(&mut self, _action: &'static Definition, _event: &KeyEvent) -> EventResult {
+        EventResult::IGNORED
+    }
 }
 
 #[test]

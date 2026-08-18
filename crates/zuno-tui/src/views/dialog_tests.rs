@@ -5,14 +5,15 @@ use super::*;
 use crate::app::{
     App, DrawTarget, TerminalEvent, TerminalLifecycle, render_offscreen, terminal_event_channel,
 };
-use crate::keybind::Keymap;
+use crate::config::ResolvedTuiConfig;
+use crate::keybind::{Chord, Keymap};
 use crate::views::message::TranscriptView;
 use crate::views::testkit::{action, press, rows};
 use crossterm::event::{Event as CrosstermEvent, KeyCode};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use zuno_engine::r#loop::TurnEvent;
 
@@ -540,15 +541,166 @@ async fn views_dialog_stack_survives_a_resize_without_losing_events() {
     task.await.expect("no panic").expect("clean exit");
 }
 
+/// The prefix the dispatcher hands down after one leader press.
+fn leader_prefix() -> crate::keybind::PendingPrefix {
+    let mut keymap = Keymap::defaults().expect("the shipped table builds");
+    let leader = keymap.leader();
+    assert_eq!(
+        keymap.resolve(&["session", "app"], leader, Instant::now()),
+        crate::keybind::Resolution::Pending
+    );
+    crate::keybind::PendingPrefix {
+        chords: keymap.pending().to_vec(),
+        continuations: keymap.continuations(&["session", "app"]),
+    }
+}
+
+/// The continuation with the shortest description, which survives any cell width.
+fn shortest_continuation(prefix: &crate::keybind::PendingPrefix) -> crate::keybind::Continuation {
+    let mut all = prefix.continuations.clone();
+    all.sort_by_key(|entry| crate::views::display_width(entry.definition.description));
+    all.into_iter()
+        .next()
+        .expect("the leader reaches something")
+}
+
 #[test]
 fn views_dialog_pending_leader_sequence_is_recorded_for_which_key() {
     let (mut host, _) = host();
     let (probe, _) = Probe::new("probe", "body");
     host.open(Box::new(probe));
-    let chord = crate::keybind::Chord::parse("ctrl+x").expect("a valid spelling");
-    let result = host.pending_changed(&[chord]);
+    let result = host.pending_changed(&leader_prefix());
     assert!(result.redraw);
-    assert_eq!(host.pending().len(), 1);
+    assert_eq!(host.pending().chords.len(), 1);
+}
+
+#[test]
+fn views_dialog_draws_the_which_key_panel_it_was_told_about() {
+    // Recording the prefix is not the property; painting it is. `WhichKeyView` had a
+    // complete renderer and zero production construction sites, so a state-only
+    // assertion is exactly what would have passed for the whole time it was unreachable.
+    let (mut host, _) = host();
+    let prefix = leader_prefix();
+    assert!(
+        !prefix.continuations.is_empty(),
+        "the leader reaches nothing, so this test cannot show a panel"
+    );
+    let before = rows(&render_offscreen(&mut host, 100, 12).expect("infallible")).join("\n");
+
+    host.pending_changed(&prefix);
+    let after = rows(&render_offscreen(&mut host, 100, 12).expect("infallible")).join("\n");
+
+    // The shortest description, so a grid cell's legitimate truncation of a long one
+    // cannot fail this.
+    let entry = shortest_continuation(&prefix);
+    assert!(
+        !before.contains(entry.definition.description),
+        "the description was on screen before the leader was pressed, so this proves \
+         nothing:\n{before}"
+    );
+    assert!(
+        after.contains(entry.definition.description),
+        "the leader prefix did not paint a which-key panel:\n{after}"
+    );
+}
+
+/// A host whose leader timeout is short enough to wait out in a test.
+fn host_with_leader_timeout(timeout: Duration) -> (DialogHost, ViewContext) {
+    let config = ResolvedTuiConfig {
+        leader_timeout: timeout,
+        ..ResolvedTuiConfig::default()
+    };
+    let registry = crate::theme::ThemeRegistry::new();
+    let resolved = registry.resolve(crate::theme::DEFAULT_THEME, crate::theme::Mode::Dark);
+    let context = ViewContext::new(&resolved, config);
+    let base = ObservedBase::new(TranscriptView::new(context.clone()));
+    (DialogHost::new(context.clone(), Box::new(base)), context)
+}
+
+#[test]
+fn views_dialog_an_expired_which_key_prefix_asks_for_the_frame_that_removes_it() {
+    // Found on a real terminal, and the offscreen tests could not have found it: they all
+    // *render*, and rendering is what hid the bug. In production a `Wake` only paints a
+    // frame if some component reports `redraw` from `handle_event`. The which-key panel
+    // reported nothing there, so its 2000 ms wake arrived, no frame was drawn, and the
+    // stale panel stayed on the physical terminal until an unrelated event repainted.
+    //
+    // So the assertion is on the `EventResult`, not on a frame: the panel must *ask* for
+    // the repaint. `ToastLayer` has pruned here since P3-1 for exactly this reason.
+    //
+    // A real sleep against a shortened timeout, because `prune` reads `std::time::Instant`,
+    // which `tokio::time::advance` does not move.
+    let (mut host, _) = host_with_leader_timeout(Duration::from_millis(20));
+    host.pending_changed(&leader_prefix());
+    assert!(host.pending().is_active());
+
+    let before = host.handle_event(&AppEvent::Terminal(TerminalEvent::Wake));
+    assert!(
+        !before.redraw,
+        "a wake before the deadline asked for a frame, so the panel would repaint forever"
+    );
+
+    std::thread::sleep(Duration::from_millis(40));
+    let after = host.handle_event(&AppEvent::Terminal(TerminalEvent::Wake));
+    assert!(
+        after.redraw,
+        "the expired which-key prefix did not request a repaint, so on a real terminal the \
+         panel stays on screen until something else happens to redraw"
+    );
+
+    // And the frame that wake produces no longer carries it.
+    let needle = shortest_continuation(&leader_prefix());
+    let frame = rows(&render_offscreen(&mut host, 100, 14).expect("infallible")).join("\n");
+    assert!(
+        !frame.contains(needle.definition.description),
+        "the panel was still painted after expiring:\n{frame}"
+    );
+}
+
+#[test]
+fn views_dialog_which_key_leaves_the_frame_when_its_prefix_times_out() {
+    // The render-path half of the property above: whatever the wake did, a frame drawn
+    // after the deadline must not show the panel.
+    let (mut host, context) = host_with_leader_timeout(Duration::from_millis(20));
+    let needle = shortest_continuation(&leader_prefix());
+    host.pending_changed(&leader_prefix());
+    let shown = rows(&render_offscreen(&mut host, 100, 14).expect("infallible")).join("\n");
+    assert!(
+        shown.contains(needle.definition.description),
+        "the panel never appeared, so its disappearance proves nothing:\n{shown}"
+    );
+
+    std::thread::sleep(context.config.leader_timeout * 2);
+
+    let after = rows(&render_offscreen(&mut host, 100, 14).expect("infallible")).join("\n");
+    assert!(
+        !after.contains(needle.definition.description),
+        "the which-key panel outlived its leader timeout on the render path:\n{after}"
+    );
+}
+
+#[test]
+fn views_dialog_which_key_sits_above_a_modal_and_below_a_toast() {
+    // `§11.4`'s order, extended by one layer. A user who pressed the leader over a modal
+    // asked this question most recently; a toast still outranks both.
+    let (mut host, _) = host();
+    let (probe, _) = Probe::new("probe", "body");
+    host.open(Box::new(probe));
+    host.pending_changed(&leader_prefix());
+    host.toasts_mut()
+        .show(crate::views::toast::Toast::info("copied"));
+
+    let rendered = rows(&render_offscreen(&mut host, 100, 12).expect("infallible"));
+    let joined = rendered.join("\n");
+    assert!(
+        joined.contains("copied"),
+        "the which-key panel hid the toast:\n{joined}"
+    );
+    let entry = shortest_continuation(&leader_prefix());
+    assert!(
+        joined.contains(entry.definition.description),
+        "the modal hid the which-key panel:\n{joined}"
+    );
 }
 
 #[test]

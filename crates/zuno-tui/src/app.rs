@@ -16,10 +16,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event as CrosstermEvent,
-};
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, Event as CrosstermEvent};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -323,6 +320,77 @@ impl CrosstermLifecycle {
     }
 }
 
+/// Mouse reporting narrowed to the events this application can act on.
+///
+/// # Why not crossterm's `EnableMouseCapture`
+///
+/// That command requests five DEC private modes, two of which are `?1002` (report motion
+/// while a button is held) and `?1003` (report **every** pointer motion). The only mouse
+/// consumer in this binary is `SessionScreen::handle_wheel`, which acts on `ScrollUp` and
+/// `ScrollDown` and returns `IGNORED` for buttons, drags and motion. So those two modes
+/// ask the terminal to send a packet per pointer pixel that nothing will ever read.
+///
+/// The cost is not hypothetical, and it is not merely CPU. Each arriving event is two
+/// `spawn_blocking` round trips in [`forward_terminal_input_from`] — one to poll, one to
+/// read — followed by an **awaited** send into a bounded channel. Moving the pointer
+/// across the window therefore fills the same queue a keystroke needs, and backpressure
+/// makes that a latency defect: the keypress waits behind motion nobody wanted.
+///
+/// `?1000` alone reports press and release, which is how a wheel notch arrives, and
+/// `?1006` is the SGR encoding that keeps coordinates past column 223 correct. Requesting
+/// only those loses no behaviour this application has.
+///
+/// # What this does not do
+///
+/// It does not restore the terminal's own text selection. Any mouse reporting mode takes
+/// the pointer, so a user who wants native selection either holds their terminal's bypass
+/// modifier (`shift` in xterm, GNOME Terminal, iTerm2 and Windows Terminal) or sets
+/// `mouse = false`, which this build already honours. Re-implementing selection inside the
+/// application was rejected — see the module header.
+struct NarrowMouseCapture;
+
+impl crossterm::Command for NarrowMouseCapture {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str("\u{1b}[?1000h\u{1b}[?1006h")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        // The console API has one mouse switch and no way to decline motion records, so
+        // Windows keeps crossterm's behaviour. The pipeline filter in
+        // `forward_terminal_input_from` is what bounds the cost there.
+        crossterm::event::EnableMouseCapture.execute_winapi()
+    }
+}
+
+/// The paired teardown for [`NarrowMouseCapture`], in reverse order.
+struct NarrowMouseRelease;
+
+impl crossterm::Command for NarrowMouseRelease {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str("\u{1b}[?1006l\u{1b}[?1000l")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        crossterm::event::DisableMouseCapture.execute_winapi()
+    }
+}
+
+/// Whether the application has any consumer for this mouse event.
+///
+/// The allow-list is deliberately narrow and deliberately duplicated from
+/// `SessionScreen::handle_wheel`'s own match; `app_the_input_filter_forwards_exactly_what_a_screen_consumes`
+/// scans that function's source and fails if the two stop agreeing. Dropping here rather
+/// than in the screen is what keeps an unconsumed event out of the bounded channel, where
+/// it would otherwise delay a keystroke.
+const fn is_consumable_mouse(kind: crossterm::event::MouseEventKind) -> bool {
+    matches!(
+        kind,
+        crossterm::event::MouseEventKind::ScrollUp | crossterm::event::MouseEventKind::ScrollDown
+    )
+}
+
 /// Write the escape sequences that put a terminal into the TUI.
 ///
 /// Split out from [`CrosstermLifecycle::enter`] so the sequences are assertable
@@ -342,7 +410,7 @@ fn enter_terminal(output: &mut impl io::Write, mouse_capture: bool) -> io::Resul
         let _ = execute!(output, LeaveAlternateScreen);
         return Err(error);
     }
-    if mouse_capture && let Err(error) = execute!(output, EnableMouseCapture) {
+    if mouse_capture && let Err(error) = execute!(output, NarrowMouseCapture) {
         let _ = execute!(output, DisableBracketedPaste);
         let _ = execute!(output, LeaveAlternateScreen);
         return Err(error);
@@ -362,7 +430,7 @@ fn restore_terminal(output: &mut impl io::Write, mouse_capture: bool) -> Option<
     if let Err(error) = execute!(output, DisableBracketedPaste) {
         first_error.get_or_insert(error);
     }
-    if mouse_capture && let Err(error) = execute!(output, DisableMouseCapture) {
+    if mouse_capture && let Err(error) = execute!(output, NarrowMouseRelease) {
         first_error.get_or_insert(error);
     }
     first_error
@@ -980,6 +1048,14 @@ async fn forward_terminal_input_from(
         let Ok(Ok(event)) = tokio::task::spawn_blocking(move || reading.read()).await else {
             return;
         };
+        // Dropped before the queue, not after: the send below is awaited on a bounded
+        // channel, so an event nothing can act on does not just cost a dispatch — it
+        // occupies a slot a keystroke is waiting for.
+        if let CrosstermEvent::Mouse(mouse) = &event
+            && !is_consumable_mouse(mouse.kind)
+        {
+            continue;
+        }
         let event = match event {
             CrosstermEvent::Resize(width, height) => TerminalEvent::Resize { width, height },
             other => TerminalEvent::Input(other),
