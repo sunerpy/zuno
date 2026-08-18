@@ -18,8 +18,8 @@
 //!
 //! Files come from a disk walk and agents from the agent registry. Neither belongs
 //! in a render path, and neither may be required by a test. [`CompletionSource`] is
-//! the seam; [`StaticSource`] is the test double and also the real implementation for
-//! commands, which are a fixed list.
+//! the seam; [`StaticSource`] is the test double, while [`SlashSource`] projects the
+//! runtime command router used by the production prompt.
 //!
 //! # Ranking is a subsequence match with a prefix bonus
 //!
@@ -32,6 +32,7 @@
 
 use crate::app::{AppEvent, Component, EventResult};
 use crate::keybind::Definition;
+use crate::views::slash::SlashRouter;
 use crate::views::{ViewContext, fill, padded};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -91,6 +92,7 @@ pub struct Candidate {
     pub description: String,
     /// What it is.
     pub kind: CandidateKind,
+    search: Vec<String>,
 }
 
 impl Candidate {
@@ -103,6 +105,7 @@ impl Candidate {
             display,
             description: String::new(),
             kind,
+            search: Vec::new(),
         }
     }
 
@@ -119,6 +122,11 @@ impl Candidate {
         self.insert = insert.into();
         self
     }
+
+    fn searching(mut self, terms: impl IntoIterator<Item = String>) -> Self {
+        self.search.extend(terms);
+        self
+    }
 }
 
 /// Where candidates come from.
@@ -131,8 +139,7 @@ pub trait CompletionSource: Send {
     fn candidates(&self, trigger: Trigger, query: &str) -> Vec<Candidate>;
 }
 
-/// A source over a fixed list. The real implementation for commands and agents, and
-/// the double for files.
+/// A source over a fixed list used by tests and host-projected reference data.
 #[derive(Debug, Default, Clone)]
 pub struct StaticSource {
     commands: Vec<Candidate>,
@@ -196,6 +203,38 @@ impl CompletionSource for StaticSource {
             Trigger::Command => self.commands.clone(),
             Trigger::Reference => self.references.clone(),
         }
+    }
+}
+
+/// Production slash candidates projected from the merged UI/catalog router.
+#[derive(Debug, Clone)]
+pub struct SlashSource {
+    router: SlashRouter,
+}
+
+impl SlashSource {
+    /// Build the production source over `router`.
+    #[must_use]
+    pub const fn new(router: SlashRouter) -> Self {
+        Self { router }
+    }
+}
+
+impl CompletionSource for SlashSource {
+    fn candidates(&self, trigger: Trigger, _query: &str) -> Vec<Candidate> {
+        if trigger != Trigger::Command {
+            return Vec::new();
+        }
+        self.router
+            .commands()
+            .iter()
+            .map(|command| {
+                Candidate::new(format!("/{}", command.name), CandidateKind::Command)
+                    .described(&command.description)
+                    .inserting(format!("/{} ", command.name))
+                    .searching(command.aliases.clone())
+            })
+            .collect()
     }
 }
 
@@ -287,6 +326,7 @@ pub fn score(candidate: &str, query: &str) -> Option<u32> {
 pub struct AutocompleteView {
     context: ViewContext,
     source: Box<dyn CompletionSource>,
+    reference_source: Option<Box<dyn CompletionSource>>,
     activation: Option<Activation>,
     matches: Vec<Candidate>,
     cursor: usize,
@@ -301,11 +341,27 @@ impl AutocompleteView {
         Self {
             context,
             source,
+            reference_source: None,
             activation: None,
             matches: Vec::new(),
             cursor: 0,
-            visible_rows: 8,
+            visible_rows: 10,
         }
+    }
+
+    /// Replace the slash-command source without disturbing host-projected references.
+    ///
+    /// The two sources have different owners: the screen rebuilds its command router when
+    /// catalog commands arrive, while the CLI owns the prebuilt filesystem index. Replacing
+    /// the whole view here would silently discard that index whenever those operations occur
+    /// in the opposite order.
+    pub fn set_source(&mut self, source: Box<dyn CompletionSource>) {
+        self.source = source;
+    }
+
+    /// Install the host-owned source used for `@` completion.
+    pub fn set_reference_source(&mut self, source: Box<dyn CompletionSource>) {
+        self.reference_source = Some(source);
     }
 
     /// Whether the popup is showing.
@@ -351,9 +407,12 @@ impl AutocompleteView {
             self.matches.clear();
             return;
         }
-        let candidates = self
-            .source
-            .candidates(activation.trigger, &activation.query);
+        let source = if activation.trigger == Trigger::Reference {
+            self.reference_source.as_deref().unwrap_or(&*self.source)
+        } else {
+            &*self.source
+        };
+        let candidates = source.candidates(activation.trigger, &activation.query);
         let mut ranked = candidates
             .into_iter()
             .filter_map(|candidate| {
@@ -363,7 +422,17 @@ impl AutocompleteView {
                     Trigger::Command => candidate.display.trim_start_matches('/').to_owned(),
                     Trigger::Reference => candidate.display.trim_start_matches('@').to_owned(),
                 };
-                let score = score(&against, &activation.query)?;
+                let mut match_score = score(&against, &activation.query);
+                if activation.trigger == Trigger::Command {
+                    match_score = candidate
+                        .search
+                        .iter()
+                        .chain(std::iter::once(&candidate.description))
+                        .filter_map(|term| score(term, &activation.query))
+                        .chain(match_score)
+                        .max();
+                }
+                let score = match_score?;
                 // The exact-match requirement upstream gives `/` (`threshold: 0`)
                 // becomes "must be a prefix": a slash command the user half-typed
                 // should not match by scattered letters.
@@ -377,6 +446,9 @@ impl AutocompleteView {
         // deliberate ordering upstream survives ranking.
         ranked.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
         self.matches = ranked.into_iter().map(|(_, candidate)| candidate).collect();
+        if activation.trigger == Trigger::Command {
+            self.matches.truncate(10);
+        }
         self.cursor = self.cursor.min(self.matches.len().saturating_sub(1));
         self.activation = Some(activation);
     }

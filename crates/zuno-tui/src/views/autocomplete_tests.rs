@@ -3,13 +3,13 @@
 
 use super::*;
 use crate::app::render_offscreen;
+use crate::views::slash::{CatalogCommand, SlashRouter};
 use crate::views::testkit::{action, rows};
 
 fn source() -> StaticSource {
     StaticSource::new()
-        .command("session-new", "Start a new session")
-        .command("session-list", "Switch sessions")
-        .command("share", "Share this session")
+        .command("new", "Start a new session")
+        .command("session", "Switch sessions")
         .agent("build", "The default agent")
         .agent("explore", "Read-only investigation")
         .file("src/main.rs")
@@ -49,13 +49,13 @@ fn views_autocomplete_slash_opens_only_at_the_start_of_the_prompt() {
 #[test]
 fn views_autocomplete_slash_closes_once_the_query_has_whitespace() {
     // `autocomplete.tsx:684` — a slash command is one word.
-    assert_eq!(detect("/share now", 10), None);
-    let mut view = open("/share ");
+    assert_eq!(detect("/session now", 12), None);
+    let mut view = open("/session ");
     assert!(
         !view.is_open(),
         "the command list stayed open past the command word"
     );
-    view.refresh("/share", 6);
+    view.refresh("/session", 8);
     assert!(view.is_open());
 }
 
@@ -141,7 +141,98 @@ fn views_autocomplete_command_matching_requires_a_prefix_or_boundary() {
         view.matches()
     );
     let view = open("/sess");
-    assert_eq!(view.matches().len(), 2);
+    assert!(
+        view.matches()
+            .iter()
+            .any(|candidate| candidate.display == "/session"),
+        "the canonical session command did not surface: {:?}",
+        view.matches()
+    );
+}
+
+#[test]
+fn views_autocomplete_production_slash_source_projects_ui_and_catalog_commands() {
+    let router = SlashRouter::new([CatalogCommand::new(
+        "review",
+        Some("Review the current changes".to_owned()),
+    )]);
+    let mut view =
+        AutocompleteView::new(ViewContext::defaults(), Box::new(SlashSource::new(router)));
+
+    view.refresh("/mo", 3);
+    assert!(
+        view.matches()
+            .iter()
+            .any(|candidate| candidate.display == "/model")
+    );
+    view.refresh("/review", 7);
+    assert!(
+        view.matches()
+            .iter()
+            .any(|candidate| candidate.display == "/review")
+    );
+}
+
+#[test]
+fn views_autocomplete_production_slash_source_matches_aliases_and_descriptions() {
+    let router = SlashRouter::new([CatalogCommand::new(
+        "audit",
+        Some("Inspect release safety".to_owned()),
+    )]);
+    let mut view =
+        AutocompleteView::new(ViewContext::defaults(), Box::new(SlashSource::new(router)));
+
+    view.refresh("/continue", 9);
+    assert_eq!(view.matches()[0].display, "/session");
+    view.refresh("/inspect", 8);
+    assert_eq!(view.matches()[0].display, "/audit");
+}
+
+#[test]
+fn views_autocomplete_slash_results_are_capped_at_ten() {
+    let router =
+        SlashRouter::new((0..15).map(|index| CatalogCommand::new(format!("task-{index}"), None)));
+    let mut view =
+        AutocompleteView::new(ViewContext::defaults(), Box::new(SlashSource::new(router)));
+    view.refresh("/task", 5);
+    assert_eq!(view.matches().len(), 10);
+    assert_eq!(view.height(), 10);
+}
+
+#[test]
+fn views_autocomplete_never_offers_unsupported_command_families() {
+    let forbidden = [
+        "share",
+        "unshare",
+        "console-org",
+        "org",
+        "connect",
+        "github-app",
+        "workspace-list",
+        "warp",
+        "move-session",
+        "stash",
+    ];
+    let router = SlashRouter::new(
+        forbidden
+            .iter()
+            .map(|name| CatalogCommand::new(*name, Some(format!("forbidden {name}")))),
+    );
+    let mut view =
+        AutocompleteView::new(ViewContext::defaults(), Box::new(SlashSource::new(router)));
+    for name in forbidden {
+        let input = format!("/{name}");
+        view.refresh(&input, input.chars().count());
+        let offered = view
+            .matches()
+            .iter()
+            .map(|candidate| candidate.display.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            !offered.contains(&input.as_str()),
+            "`/{name}` leaked into autocomplete: {offered:?}"
+        );
+    }
 }
 
 #[test]
@@ -313,10 +404,7 @@ fn views_autocomplete_renders_offscreen() {
     assert!(height > 0);
     let rendered = rows(&render_offscreen(&mut view, 44, height).expect("infallible"));
     let joined = rendered.join("\n");
-    assert!(
-        joined.contains("/session-new"),
-        "a candidate is missing:\n{joined}"
-    );
+    assert!(joined.contains("/new"), "a candidate is missing:\n{joined}");
     assert!(
         joined.contains("Start a new session"),
         "a candidate description is missing:\n{joined}"
@@ -346,7 +434,7 @@ fn views_autocomplete_highlights_the_cursor_from_the_palette() {
     let buffer = render_offscreen(&mut view, 44, height).expect("infallible");
     assert_eq!(
         buffer[(0, 0)].bg,
-        ratatui::style::Color::from(context.palette.primary),
+        ratatui::style::Color::from(context.palette().primary),
         "the highlighted row does not carry the palette's selection background"
     );
 }
