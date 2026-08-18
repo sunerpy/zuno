@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use zuno_lsp::manager::Manager;
-use zuno_tui::views::lsp::{Diagnostic, Report, Severity};
+use zuno_tui::views::lsp::{Diagnostic, PendingEditReader, Report, Severity};
 
 /// How many reports may be queued.
 ///
@@ -162,16 +162,30 @@ impl Probe {
 /// is seconds on a cold cache. Nothing the loop touches may await that.
 pub(super) async fn check_edits(
     probe: Option<Probe>,
-    mut edits: mpsc::Receiver<Vec<String>>,
+    pending: PendingEditReader,
+    mut signals: mpsc::Receiver<()>,
     reports: mpsc::Sender<Report>,
 ) {
     let Some(probe) = probe else {
         // Drained rather than dropped: a closed receiver would make the screen's
         // `try_send` fail, and a failure it reports nowhere is worse than a no-op.
-        while edits.recv().await.is_some() {}
+        while signals.recv().await.is_some() {
+            let _discarded = pending.take();
+        }
         return;
     };
-    while let Some(batch) = edits.recv().await {
+    while signals.recv().await.is_some() {
+        // Everything waiting, not the one batch a message carried. A nudge lost to a full
+        // capacity-one channel therefore costs nothing: this drain finds what it would
+        // have carried, which is the whole reason the paths do not travel as messages.
+        let (batch, overflowed) = pending.take();
+        if overflowed > 0 {
+            tracing::warn!(
+                overflowed,
+                limit = zuno_tui::views::lsp::PENDING_EDIT_LIMIT,
+                "more files were written than the pending-edit set holds; some are unchecked"
+            );
+        }
         let paths = batch
             .into_iter()
             .map(|path| {

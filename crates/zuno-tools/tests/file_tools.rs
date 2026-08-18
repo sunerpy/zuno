@@ -486,6 +486,131 @@ async fn file_apply_patch_adds_updates_moves_and_deletes_files() {
 }
 
 #[tokio::test]
+async fn file_every_writing_tool_a_model_can_see_reports_the_paths_it_wrote() {
+    // The defect this pins: a downstream host — the TUI's language-server check — decided
+    // which completions had changed a file by matching the tool's *name* against a
+    // hand-kept `["edit", "write", "patch"]`. The registry's third id is `apply_patch`,
+    // and a GPT model is shown only `read` and `apply_patch`, so on those models a
+    // successful patch matched nothing and no file was ever checked.
+    //
+    // Driven off `exposed_for_model` — the very function that decides what a model sees —
+    // rather than a literal list here, so a tool added or renamed cannot quietly stop
+    // reporting. Every exposed tool is invoked for real and answered against the disk: a
+    // tool that wrote something must name it, and one that wrote nothing must name
+    // nothing.
+    for model in ["gpt-5", "claude-sonnet-4"] {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let tools = FileTools::with_formatter(workspace.path(), Arc::new(NoopFormatter))
+            .expect("file tools");
+        std::fs::write(workspace.path().join("existing.txt"), "old\n").expect("fixture");
+
+        for tool in tools.exposed_for_model(model) {
+            let id = tool.definition().id.clone();
+            let arguments = match id.as_str() {
+                "read" => json!({ "filePath": workspace.path().join("existing.txt") }),
+                "write" => json!({
+                    "filePath": workspace.path().join("written.txt"),
+                    "content": "fresh\n",
+                }),
+                "edit" => json!({
+                    "filePath": workspace.path().join("existing.txt"),
+                    "oldString": "old\n",
+                    "newString": "edited\n",
+                }),
+                "apply_patch" => json!({
+                    "patchText": concat!(
+                        "*** Begin Patch\n",
+                        "*** Add File: patched-one.txt\n",
+                        "+one\n",
+                        "*** Add File: patched-two.txt\n",
+                        "+two\n",
+                        "*** End Patch"
+                    )
+                }),
+                other => panic!(
+                    "model {model} is shown a tool this test does not exercise: {other}. \
+                     A new file tool must state which paths it writes, or the \
+                     language-server check silently skips its edits."
+                ),
+            };
+            let output = tool
+                .execute(
+                    arguments,
+                    normal_context(Arc::new(RecordingPermission::default())),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{id} on {model}: {error}"));
+
+            let reported = output.written_paths();
+            let expected: Vec<String> = match id.as_str() {
+                "read" => Vec::new(),
+                "write" => vec![slash(&workspace.path().join("written.txt"))],
+                "edit" => vec![slash(&workspace.path().join("existing.txt"))],
+                "apply_patch" => vec![
+                    slash(&workspace.path().join("patched-one.txt")),
+                    slash(&workspace.path().join("patched-two.txt")),
+                ],
+                _ => unreachable!("the arguments match arm already panicked"),
+            };
+            assert_eq!(
+                reported, expected,
+                "{id} on {model} reported {reported:?} as written; a host checking \
+                 diagnostics reads exactly this list"
+            );
+            for path in &reported {
+                assert!(
+                    Path::new(path).is_file(),
+                    "{id} reported {path} as written but nothing is there"
+                );
+            }
+        }
+    }
+}
+
+/// A path spelled the way the tools spell one in metadata.
+fn slash(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+#[tokio::test]
+async fn file_apply_patch_does_not_report_a_file_it_deleted_as_written() {
+    // A deleted file has no diagnostics, and asking a language server about one produces
+    // a report about a file that is not there — which reads as a problem with this turn.
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let tools =
+        FileTools::with_formatter(workspace.path(), Arc::new(NoopFormatter)).expect("file tools");
+    std::fs::write(workspace.path().join("source.txt"), "old\n").expect("source fixture");
+    std::fs::write(workspace.path().join("delete.txt"), "gone\n").expect("delete fixture");
+
+    let output = tools
+        .apply_patch
+        .execute(
+            json!({
+                "patchText": concat!(
+                    "*** Begin Patch\n",
+                    "*** Update File: source.txt\n",
+                    "*** Move to: moved.txt\n",
+                    "@@\n",
+                    "-old\n",
+                    "+new\n",
+                    "*** Delete File: delete.txt\n",
+                    "*** End Patch"
+                )
+            }),
+            normal_context(Arc::new(RecordingPermission::default())),
+        )
+        .await
+        .expect("apply patch");
+
+    assert_eq!(
+        output.written_paths(),
+        vec![slash(&workspace.path().join("moved.txt"))],
+        "only the surviving destination is written; neither the deleted file nor the \
+         move's vacated source still exists"
+    );
+}
+
+#[tokio::test]
 async fn file_walks_honor_an_already_set_interrupt() {
     let workspace = tempfile::tempdir().expect("temporary workspace");
     let tools =

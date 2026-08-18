@@ -149,8 +149,8 @@ pub struct SessionScreen {
     /// shape the permission bridge uses: a receiver awaited here would stop the one loop
     /// that consumes terminal input, engine events and the lease wake.
     reports: Option<mpsc::Receiver<crate::views::lsp::Report>>,
-    /// Where the set of files a finished turn wrote is sent for checking.
-    edits: Option<mpsc::Sender<Vec<String>>>,
+    /// Where the files a finished turn wrote are handed over for checking.
+    edits: Option<crate::views::lsp::PendingEdits>,
     /// The files the running turn has written so far.
     ///
     /// Accumulated from the same `ToolDispatchCompleted` events the transcript renders,
@@ -457,37 +457,45 @@ impl SessionScreen {
 
     /// Report the files each finished turn wrote, for checking.
     #[must_use]
-    pub fn with_edit_sink(mut self, edits: mpsc::Sender<Vec<String>>) -> Self {
+    pub fn with_edit_sink(mut self, edits: crate::views::lsp::PendingEdits) -> Self {
         self.edits = Some(edits);
         self
     }
 
-    /// The tools whose completion means a file on disk changed.
+    /// Note the files a completed call wrote, and hand them over when the turn ends.
     ///
-    /// `read` is deliberately absent: reporting the pre-existing diagnostics of a file
-    /// the model only read would attribute somebody else's problem to this turn.
-    pub const WRITING_TOOLS: [&'static str; 3] = ["edit", "write", "patch"];
-
-    /// Note a written file, and hand the batch over when the turn ends.
+    /// The paths come from [`TurnEvent::ToolDispatchCompleted::written_paths`], which
+    /// each writing tool fills where it writes. Nothing here matches on a tool's *name*:
+    /// this used to hold a `WRITING_TOOLS` list of `["edit", "write", "patch"]`, and the
+    /// registry's third id is `apply_patch`, so on the models whose only writing tool is
+    /// `apply_patch` — every GPT model, which sees just `read` and `apply_patch` — a
+    /// successful patch never entered the set and no file was ever checked. A list that
+    /// has to be kept in step with a registry by hand is the same defect waiting to
+    /// happen again; a path the tool reported cannot drift.
+    ///
+    /// `read` needs no exclusion any more for the same reason: a tool that writes nothing
+    /// reports nothing, so it cannot attribute a file's pre-existing diagnostics to this
+    /// turn.
     fn observe_edits(&mut self, event: &AppEvent) {
         let AppEvent::Engine(turn) = event else {
             return;
         };
         match turn {
             zuno_engine::r#loop::TurnEvent::ToolDispatchCompleted {
-                name,
-                title,
+                written_paths,
                 is_error,
                 ..
             } => {
                 // A failed write changed nothing, so its diagnostics would describe the
                 // file as it already was.
-                if !*is_error
-                    && Self::WRITING_TOOLS.contains(&name.as_str())
-                    && !title.trim().is_empty()
-                    && !self.touched.iter().any(|seen| seen == title.trim())
-                {
-                    self.touched.push(title.trim().to_owned());
+                if *is_error {
+                    return;
+                }
+                for path in written_paths {
+                    let path = path.trim();
+                    if !path.is_empty() && !self.touched.iter().any(|seen| seen == path) {
+                        self.touched.push(path.to_owned());
+                    }
                 }
             }
             zuno_engine::r#loop::TurnEvent::TurnCompleted { .. }
@@ -497,9 +505,7 @@ impl SessionScreen {
                 }
                 let batch = std::mem::take(&mut self.touched);
                 if let Some(edits) = self.edits.as_ref() {
-                    // `try_send` for the reason every sink here uses it: a full channel
-                    // costs a check, never a stalled render loop.
-                    let _sent = edits.try_send(batch);
+                    edits.merge(batch);
                 }
             }
             _ => {}

@@ -124,6 +124,9 @@ impl TypedTool for ApplyPatchTool {
         let changes = self.prepare_changes(&operations, &ctx)?;
         let mut summaries = Vec::new();
         let mut files = Vec::<Value>::new();
+        // Only the paths that still exist afterwards: a deleted file has no diagnostics,
+        // and asking a language server about one reports somebody else's absent file.
+        let mut written = Vec::<PathBuf>::new();
         let mut formatted_files = Vec::<Value>::new();
         let mut failures = Vec::<FormatFailure>::new();
         // One patch covering every file this call touched, in application order. A
@@ -163,6 +166,7 @@ impl TypedTool for ApplyPatchTool {
             if change.kind != ChangeKind::Delete {
                 let final_bytes =
                     std::fs::read(&target_path).map_err(|error| failed("apply_patch", error))?;
+                written.push(target_path.clone());
                 self.runtime
                     .state
                     .record_write(&ctx.session_id, &target_path, &final_bytes);
@@ -204,6 +208,9 @@ impl TypedTool for ApplyPatchTool {
         let mut result = ToolOutput::text(output.clone(), output)
             .with_metadata("files", Value::Array(files))
             .with_metadata("formattedFiles", Value::Array(formatted_files));
+        for path in &written {
+            result = result.with_written_path(path);
+        }
         if !patches.is_empty() {
             result = result.with_metadata(crate::diff::METADATA_DIFF_KEY, patches.concat());
         }

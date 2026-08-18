@@ -275,9 +275,10 @@ fn event_json(event: TurnEvent) -> Value {
             title,
             output,
             diff,
+            written_paths,
             is_error,
         } => {
-            json!({"type":"tool_dispatch_completed","step":step,"callID":call_id,"name":name,"title":title,"output":output,"diff":diff,"isError":is_error})
+            json!({"type":"tool_dispatch_completed","step":step,"callID":call_id,"name":name,"title":title,"output":output,"diff":diff,"writtenPaths":written_paths,"isError":is_error})
         }
         TurnEvent::ToolResultAppended {
             step,
@@ -358,8 +359,9 @@ fn stream_event_json(step: u32, event: StreamEvent) -> Value {
             output_tokens,
             cache_read_input_tokens,
             cache_write_input_tokens,
+            accounting,
         } => {
-            json!({"type":"token_usage","step":step,"inputTokens":input_tokens,"outputTokens":output_tokens,"cacheReadInputTokens":cache_read_input_tokens,"cacheWriteInputTokens":cache_write_input_tokens})
+            json!({"type":"token_usage","step":step,"inputTokens":input_tokens,"outputTokens":output_tokens,"cacheReadInputTokens":cache_read_input_tokens,"cacheWriteInputTokens":cache_write_input_tokens,"promptAccounting":accounting.as_str()})
         }
         StreamEvent::ConnectionType { connection } => {
             json!({"type":"connection_type","step":step,"connection":connection})

@@ -120,9 +120,27 @@ pub fn run_process() -> ExitCode {
         Action::Dispatch(_) | Action::Rejected { .. } | Action::Version { .. } => None,
     };
 
+    // Only for the commands that live long enough for growth to mean something —
+    // `DispatchArguments::deserves_a_memory_sampler` decides, exhaustively. Started here
+    // rather than inside `tui` and `serve` so both are covered by one wiring: the four
+    // attribution levels in `zuno_observability::memory` were implemented, tested, and
+    // reachable from nothing, and two separate call sites are how the next one gets missed.
+    let memory = match &action {
+        Action::Dispatch(request) if request.args.deserves_a_memory_sampler() => {
+            Some(zuno_observability::memory::MemorySampler::spawn(
+                std::sync::Arc::clone(zuno_observability::memory::active_sessions()),
+            ))
+        }
+        Action::Dispatch(_) | Action::Rejected { .. } | Action::Version { .. } => None,
+    };
+
     let code = execute_action(action, &mut cmd::HeadlessCommandDispatcher);
 
     drop(work);
+    // Before the watchdog, so the sampler's last report still has a logging sink.
+    if let Some(memory) = memory {
+        memory.shutdown();
+    }
     watchdog.shutdown();
     profile.emit(startup::StartupPhase::Dispatch);
     code

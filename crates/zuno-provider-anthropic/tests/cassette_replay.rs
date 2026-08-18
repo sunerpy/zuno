@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 
 use serde_json::json;
 use zuno_error::ProviderError;
-use zuno_llm::event::{ConnectionPhase, FinishReason, Message, Role, StreamEvent};
+use zuno_llm::event::{
+    ConnectionPhase, FinishReason, Message, PromptAccounting, Role, StreamEvent,
+};
 use zuno_llm::registry::CompletionRequest;
 use zuno_provider_anthropic::{
     AnthropicConfig, AnthropicDecoder, build_request_body, map_http_error,
@@ -55,6 +57,7 @@ fn text_transcript(
         output_tokens: Some(output_tokens),
         cache_read_input_tokens: Some(cache_read),
         cache_write_input_tokens: Some(cache_write),
+        accounting: PromptAccounting::CacheBesideInput,
     });
     events
 }
@@ -155,6 +158,7 @@ fn recorded_streams_tool_call_matches_request_and_exact_events() {
                 output_tokens: Some(33),
                 cache_read_input_tokens: Some(0),
                 cache_write_input_tokens: Some(0),
+                accounting: PromptAccounting::CacheBesideInput,
             },
         ]
     );
@@ -194,6 +198,7 @@ fn recorded_two_turn_tool_loop_matches_both_exact_event_sequences() {
                 output_tokens: Some(66),
                 cache_read_input_tokens: Some(0),
                 cache_write_input_tokens: Some(0),
+                accounting: PromptAccounting::CacheBesideInput,
             },
         ]
     );

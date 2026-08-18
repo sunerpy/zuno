@@ -124,7 +124,8 @@ impl TypedTool for EditTool {
                 ToolOutput::text(label.clone(), "Edit applied successfully.")
                     .with_metadata("filepath", target.canonical.to_string_lossy().into_owned())
                     .with_metadata("replacements", replacements)
-                    .with_metadata("formatted", outcome.changed),
+                    .with_metadata("formatted", outcome.changed)
+                    .with_written_path(&target.canonical),
                 &label,
                 &source,
                 &final_bytes,

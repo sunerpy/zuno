@@ -169,15 +169,15 @@ fn tui_lsp_conversion_carries_the_severity_and_the_source() {
 async fn tui_lsp_check_edits_drains_its_inlet_when_there_is_no_probe() {
     // Dropping the receiver instead would make the screen's `try_send` fail, and a
     // failure reported nowhere is worse than a no-op.
-    let (edits, edit_receiver) = mpsc::channel(4);
+    let (wake_sender, edit_receiver) = mpsc::channel(1);
+    let pending = zuno_tui::views::lsp::PendingEdits::new(wake_sender);
+    let reader = pending.reader();
     let (reports, mut report_receiver) = mpsc::channel(4);
-    let task = tokio::spawn(check_edits(None, edit_receiver, reports));
+    let task = tokio::spawn(check_edits(None, reader, edit_receiver, reports));
     for _ in 0..4 {
-        edits
-            .try_send(vec![String::from("src/lib.rs")])
-            .expect("the inlet accepts a batch with no probe attached");
+        pending.merge([String::from("src/lib.rs")]);
     }
-    drop(edits);
+    drop(pending);
     task.await.expect("the task finishes when the inlet closes");
     assert!(
         report_receiver.try_recv().is_err(),
@@ -191,13 +191,13 @@ async fn tui_lsp_check_edits_skips_a_path_that_is_not_a_file() {
     // language server about it would fail per file and produce a row per failure.
     let root = tempfile::tempdir().expect("a temporary directory");
     let probe = Probe::resolve(&config(r#"{"lsp":true}"#), root.path(), wake()).expect("a probe");
-    let (edits, edit_receiver) = mpsc::channel(4);
+    let (wake_sender, edit_receiver) = mpsc::channel(1);
+    let pending = zuno_tui::views::lsp::PendingEdits::new(wake_sender);
+    let reader = pending.reader();
     let (reports, mut report_receiver) = mpsc::channel(4);
-    let task = tokio::spawn(check_edits(Some(probe), edit_receiver, reports));
-    edits
-        .try_send(vec![String::from("does/not/exist.rs")])
-        .expect("the inlet accepts the batch");
-    drop(edits);
+    let task = tokio::spawn(check_edits(Some(probe), reader, edit_receiver, reports));
+    pending.merge([String::from("does/not/exist.rs")]);
+    drop(pending);
     tokio::time::timeout(std::time::Duration::from_secs(20), task)
         .await
         .expect("the check finishes rather than hanging on a missing file")
@@ -240,13 +240,13 @@ async fn tui_lsp_reports_a_real_diagnostic_from_a_real_language_server() {
     .expect("a source file");
 
     let probe = Probe::resolve(&pinned_rust_config(&server), root.path(), wake()).expect("a probe");
-    let (edits, edit_receiver) = mpsc::channel(4);
+    let (wake_sender, edit_receiver) = mpsc::channel(1);
+    let pending = zuno_tui::views::lsp::PendingEdits::new(wake_sender);
+    let reader = pending.reader();
     let (reports, mut report_receiver) = mpsc::channel(4);
-    let task = tokio::spawn(check_edits(Some(probe), edit_receiver, reports));
-    edits
-        .try_send(vec![String::from("src/lib.rs")])
-        .expect("the inlet accepts the batch");
-    drop(edits);
+    let task = tokio::spawn(check_edits(Some(probe), reader, edit_receiver, reports));
+    pending.merge([String::from("src/lib.rs")]);
+    drop(pending);
 
     let report = tokio::time::timeout(std::time::Duration::from_secs(120), async {
         report_receiver.recv().await

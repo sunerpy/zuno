@@ -34,7 +34,7 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use zuno_error::ProviderError;
-use zuno_llm::event::{Message, Role};
+use zuno_llm::event::{Message, PromptAccounting, Role};
 use zuno_llm::registry::{
     ApiSurface, CompletionRequest, FinishReason, Provider, Spec, StreamEvent,
 };
@@ -192,6 +192,7 @@ async fn deepseek_text_replays_to_the_recorded_event_sequence() {
                 output_tokens: Some(2),
                 cache_read_input_tokens: Some(0),
                 cache_write_input_tokens: None,
+                accounting: PromptAccounting::CacheInsideInput,
             },
         ]
     );
@@ -221,6 +222,7 @@ async fn groq_tool_call_replays_to_the_recorded_event_sequence() {
         output_tokens: Some(10),
         cache_read_input_tokens: None,
         cache_write_input_tokens: None,
+        accounting: PromptAccounting::CacheInsideInput,
     };
     assert_eq!(
         events,
@@ -270,6 +272,7 @@ async fn openrouter_text_reports_its_upstream_and_ignores_the_comment_frame() {
                 output_tokens: Some(3),
                 cache_read_input_tokens: Some(0),
                 cache_write_input_tokens: None,
+                accounting: PromptAccounting::CacheInsideInput,
             },
         ]
     );
@@ -304,6 +307,7 @@ async fn togetherai_tool_call_survives_a_split_tool_fragment() {
                 output_tokens: Some(19),
                 cache_read_input_tokens: None,
                 cache_write_input_tokens: None,
+                accounting: PromptAccounting::CacheInsideInput,
             },
         ]
     );
@@ -460,6 +464,7 @@ async fn the_canonical_openai_chat_shape_parses_under_a_declared_compatible_id()
                 output_tokens: Some(2),
                 cache_read_input_tokens: Some(0),
                 cache_write_input_tokens: None,
+                accounting: PromptAccounting::CacheInsideInput,
             },
         ]
     );

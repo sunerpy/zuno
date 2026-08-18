@@ -348,6 +348,14 @@ where
                 output_tokens,
                 cache_read_input_tokens,
                 cache_write_input_tokens,
+                // Deliberately not applied: the `tokens` object this builds is the
+                // oracle's persisted shape, and it records each figure as the provider
+                // reported it. Re-deriving one here would change a stored value and
+                // diverge from `session/prompt.ts`'s own arithmetic, which
+                // `prelude::measured_tokens` mirrors. Consumers that need a single
+                // comparable number normalise with `PromptAccounting` at the point of
+                // display — see `zuno_tui::views::message::TokenUsage`.
+                accounting: _,
             } => {
                 if let Some(value) = input_tokens {
                     self.usage.input = value;

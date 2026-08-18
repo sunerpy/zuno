@@ -6,7 +6,9 @@ use std::fmt;
 use serde::Deserialize;
 use serde_json::Value;
 use zuno_error::ProviderError;
-use zuno_llm::event::{ConnectionPhase, FinishReason, RequestContentBlock, StreamEvent};
+use zuno_llm::event::{
+    ConnectionPhase, FinishReason, PromptAccounting, RequestContentBlock, StreamEvent,
+};
 use zuno_llm::sse::{SseEvent, SseParser, append_tool_input, ensure_tool_input_size};
 
 use crate::error::{AnthropicErrorBody, map_stream_error};
@@ -74,6 +76,7 @@ impl AnthropicDecoder {
                 output_tokens: self.state.usage.output_tokens,
                 cache_read_input_tokens: self.state.usage.cache_read_input_tokens,
                 cache_write_input_tokens: self.state.usage.cache_creation_input_tokens,
+                accounting: PromptAccounting::CacheBesideInput,
             }));
         }
         output
@@ -780,6 +783,7 @@ mod tests {
                     output_tokens: Some(20),
                     cache_read_input_tokens: None,
                     cache_write_input_tokens: None,
+                    accounting: PromptAccounting::CacheBesideInput,
                 },
             ]
         );

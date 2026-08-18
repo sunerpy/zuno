@@ -8,7 +8,9 @@ use zuno_engine::stream::{
     DELTA_BATCH_BYTES, ProjectionContext, ProjectionEffects, SnapshotPatch, StepUsage,
     StreamProjector,
 };
-use zuno_llm::event::{ConnectionPhase, FinishReason, StreamEvent, ThoughtSignature};
+use zuno_llm::event::{
+    ConnectionPhase, FinishReason, PromptAccounting, StreamEvent, ThoughtSignature,
+};
 
 const SESSION_ID: &str = "ses_stream_test";
 const MESSAGE_ID: &str = "msg_stream_test";
@@ -307,6 +309,7 @@ fn stream_step_finish_updates_usage_writes_patch_and_triggers_summary_and_overfl
             output_tokens: Some(40),
             cache_read_input_tokens: Some(20),
             cache_write_input_tokens: Some(5),
+            accounting: PromptAccounting::CacheInsideInput,
         })
         .expect("record usage");
     projector
@@ -427,6 +430,7 @@ fn stream_event_families_project_to_their_terminal_part_shapes() {
             output_tokens: Some(5),
             cache_read_input_tokens: Some(2),
             cache_write_input_tokens: Some(1),
+            accounting: PromptAccounting::CacheInsideInput,
         },
         StreamEvent::MessageEnd {
             stop_reason: Some(FinishReason::Stop),

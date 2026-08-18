@@ -27,7 +27,7 @@ use zuno_engine::r#loop::{
 };
 use zuno_error::ProviderError;
 use zuno_llm::cache::{CacheTracker, DynamicContext, LockedTools, McpToolStatus};
-use zuno_llm::event::StreamEvent;
+use zuno_llm::event::{PromptAccounting, StreamEvent};
 use zuno_llm::registry::{
     ApiSurface, Capabilities, CompletionRequest, Provider, ProviderRegistry, ProviderStream, Spec,
 };
@@ -242,6 +242,7 @@ impl ProgressTracker {
                         output_tokens,
                         cache_read_input_tokens,
                         cache_write_input_tokens,
+                        accounting: PromptAccounting::CacheInsideInput,
                     },
                 ..
             } => {
@@ -1021,6 +1022,7 @@ fn heartbeats_raw_bytes_and_repeated_state_do_not_reset_g4_progress() {
             output_tokens: Some(2),
             cache_read_input_tokens: Some(0),
             cache_write_input_tokens: None,
+            accounting: PromptAccounting::CacheInsideInput,
         },
     };
     assert!(progress.observe(&usage));

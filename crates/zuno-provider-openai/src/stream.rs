@@ -6,7 +6,7 @@ use std::fmt;
 use serde::Deserialize;
 use serde_json::Value;
 use zuno_error::ProviderError;
-use zuno_llm::event::{FinishReason, RequestContentBlock, StreamEvent};
+use zuno_llm::event::{FinishReason, PromptAccounting, RequestContentBlock, StreamEvent};
 use zuno_llm::registry::ApiSurface;
 use zuno_llm::sse::{SseEvent, SseParser, append_tool_input, ensure_tool_input_size};
 
@@ -236,6 +236,7 @@ impl ChatDecoder {
                     .prompt_tokens_details
                     .and_then(|details| details.cached_tokens),
                 cache_write_input_tokens: None,
+                accounting: PromptAccounting::CacheInsideInput,
             });
         }
         Ok(events)
@@ -497,6 +498,7 @@ impl ResponsesDecoder {
                     .input_tokens_details
                     .and_then(|details| details.cached_tokens),
                 cache_write_input_tokens: None,
+                accounting: PromptAccounting::CacheInsideInput,
             });
         }
         events

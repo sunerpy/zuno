@@ -17,7 +17,7 @@ use zuno_engine::r#loop::{
 };
 use zuno_error::ProviderError;
 use zuno_llm::cache::{DynamicContext, McpToolStatus};
-use zuno_llm::event::{FinishReason, RequestContentBlock, Role, StreamEvent};
+use zuno_llm::event::{FinishReason, PromptAccounting, RequestContentBlock, Role, StreamEvent};
 use zuno_llm::registry::{
     ApiSurface, Capabilities, CompletionRequest, Provider, ProviderRegistry, ProviderStream, Spec,
 };
@@ -721,6 +721,7 @@ fn expected_full_turn_events() -> Vec<TurnEvent> {
             title: "echo".to_owned(),
             output: "hello".to_owned(),
             diff: None,
+            written_paths: Vec::new(),
             is_error: false,
         },
         TurnEvent::ToolResultAppended {
@@ -1711,6 +1712,7 @@ fn trailing_usage_responses() -> Vec<ScriptedResponse> {
             output_tokens: Some(186),
             cache_read_input_tokens: Some(1024),
             cache_write_input_tokens: Some(64),
+            accounting: PromptAccounting::CacheInsideInput,
         },
     ])]
 }

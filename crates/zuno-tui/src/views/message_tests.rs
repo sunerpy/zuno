@@ -3,7 +3,7 @@
 use super::*;
 use crate::app::render_offscreen;
 use crate::views::testkit::rows;
-use zuno_llm::event::FinishReason;
+use zuno_llm::event::{FinishReason, PromptAccounting};
 
 fn draw(view: &mut TranscriptView, width: u16, height: u16) -> Vec<String> {
     let buffer =
@@ -75,6 +75,7 @@ fn views_chat_transcript_renders_every_part_kind_offscreen() {
             title: String::from("Read src/main.rs"),
             output: String::from("fn main() {}"),
             diff: None,
+            written_paths: Vec::new(),
             is_error: false,
         },
         provider(StreamEvent::GeneratedImage {
@@ -355,6 +356,7 @@ fn views_tool_call_walks_pending_running_and_terminal_states() {
         title: String::from("ls"),
         output: String::from("a\nb"),
         diff: None,
+        written_paths: Vec::new(),
         is_error: true,
     });
     assert_eq!(status(&transcript), ToolStatus::Error);
@@ -798,12 +800,20 @@ fn views_transcript_folds_provider_token_usage_for_the_ambient_panel() {
         output_tokens: Some(340),
         cache_read_input_tokens: Some(80),
         cache_write_input_tokens: None,
+        accounting: PromptAccounting::CacheInsideInput,
     })));
     let tokens = view.transcript().tokens();
-    assert_eq!(tokens.input, 1_200);
+    // 1,120 and not 1,200: OpenAI's `prompt_tokens` of 1,200 *contains* the 80
+    // `cached_tokens`, so the plain-rate prompt tokens are the 1,120 that remain. The
+    // buckets are stored disjoint, which is what lets `total` be a sum.
+    assert_eq!(tokens.input, 1_120);
     assert_eq!(tokens.output, 340);
     assert_eq!(tokens.cache_read, 80);
-    assert_eq!(tokens.total(), 1_620);
+    // 1,540 and not the 1,620 this test used to freeze. The old figure was
+    // `1200 + 340 + 80`, which counted the 80 cached tokens twice — once inside the
+    // prompt figure that already contained them and once again as cache. The provider
+    // billed 1,200 prompt tokens plus 340 completion tokens, and 1,200 + 340 is 1,540.
+    assert_eq!(tokens.total(), 1_540);
     assert!(!tokens.is_empty());
 
     // Two reports accumulate rather than replace, because a turn bills per step.
@@ -812,8 +822,108 @@ fn views_transcript_folds_provider_token_usage_for_the_ambient_panel() {
         output_tokens: Some(10),
         cache_read_input_tokens: None,
         cache_write_input_tokens: None,
+        accounting: PromptAccounting::CacheInsideInput,
     })));
-    assert_eq!(view.transcript().tokens().input, 1_300);
+    assert_eq!(view.transcript().tokens().input, 1_220);
+}
+
+#[test]
+fn views_transcript_counts_a_cached_token_once_whichever_convention_the_provider_uses() {
+    // Two providers reporting the *same* request, in their own conventions: a 1,200-token
+    // prompt of which 80 came from cache. OpenAI puts the 80 inside its 1,200; Anthropic
+    // reports 1,120 alongside its 80. A session total and a context percentage must not
+    // depend on which of the two answered — and before this they did, because both figures
+    // were arithmetic on the raw fields.
+    let openai = {
+        let mut view = view();
+        view.handle_event(&AppEvent::Engine(started()));
+        view.handle_event(&AppEvent::Engine(provider(StreamEvent::TokenUsage {
+            input_tokens: Some(1_200),
+            output_tokens: Some(340),
+            cache_read_input_tokens: Some(80),
+            cache_write_input_tokens: None,
+            accounting: PromptAccounting::CacheInsideInput,
+        })));
+        view
+    };
+    let anthropic = {
+        let mut view = view();
+        view.handle_event(&AppEvent::Engine(started()));
+        view.handle_event(&AppEvent::Engine(provider(StreamEvent::TokenUsage {
+            input_tokens: Some(1_120),
+            output_tokens: Some(340),
+            cache_read_input_tokens: Some(80),
+            cache_write_input_tokens: None,
+            accounting: PromptAccounting::CacheBesideInput,
+        })));
+        view
+    };
+
+    assert_eq!(
+        openai.transcript().tokens(),
+        anthropic.transcript().tokens(),
+        "the same request billed the same way must land in the same buckets"
+    );
+    assert_eq!(openai.transcript().tokens().total(), 1_540);
+    assert_eq!(
+        openai.transcript().last_prompt_tokens(),
+        1_200,
+        "the whole prompt, cache included, is what occupies the window"
+    );
+    assert_eq!(anthropic.transcript().last_prompt_tokens(), 1_200);
+}
+
+#[test]
+fn views_transcript_context_percentage_measures_the_last_prompt_not_the_session() {
+    // The `125%` defect. `context_used` read `tokens.input + tokens.cache_read` from an
+    // accumulator whose `add` is `+=`, so two 80k prompts against a 128k window summed to
+    // 160k and displayed a percentage that cannot exist. The second prompt did not make
+    // the window fuller; it replaced what was in it.
+    let mut view = view();
+    view.handle_event(&AppEvent::Engine(started()));
+    view.transcript_mut().set_context_limit(128_000);
+    for _ in 0..2 {
+        view.handle_event(&AppEvent::Engine(provider(StreamEvent::TokenUsage {
+            input_tokens: Some(80_000),
+            output_tokens: Some(500),
+            cache_read_input_tokens: None,
+            cache_write_input_tokens: None,
+            accounting: PromptAccounting::CacheInsideInput,
+        })));
+    }
+
+    assert_eq!(
+        view.transcript().context_used(),
+        Some(62),
+        "80,000 of a 128,000-token window is 62%, however many turns have run"
+    );
+    assert_eq!(
+        view.transcript().tokens().input,
+        160_000,
+        "the cumulative figure is still cumulative; it is simply not the percentage"
+    );
+}
+
+#[test]
+fn views_transcript_context_percentage_counts_cached_prompt_tokens_as_occupying_the_window() {
+    // Cache changes what a prompt *costs*, not how much of the window it fills: a
+    // 100k-token prompt read from cache still leaves only 28k of a 128k window. A
+    // percentage computed from the uncached remainder alone would report an almost-empty
+    // window right before the model refuses the next turn.
+    let mut view = view();
+    view.handle_event(&AppEvent::Engine(started()));
+    view.transcript_mut().set_context_limit(128_000);
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::TokenUsage {
+        input_tokens: Some(100_000),
+        output_tokens: Some(200),
+        cache_read_input_tokens: Some(96_000),
+        cache_write_input_tokens: None,
+        accounting: PromptAccounting::CacheInsideInput,
+    })));
+
+    assert_eq!(view.transcript().context_used(), Some(78));
+    assert_eq!(view.transcript().tokens().input, 4_000);
+    assert_eq!(view.transcript().tokens().cache_read, 96_000);
 }
 
 #[test]
@@ -825,6 +935,7 @@ fn views_transcript_context_percentage_needs_a_declared_window() {
         output_tokens: Some(1_000),
         cache_read_input_tokens: None,
         cache_write_input_tokens: None,
+        accounting: PromptAccounting::CacheInsideInput,
     })));
     assert_eq!(
         view.transcript().context_used(),
@@ -857,6 +968,7 @@ fn views_transcript_renders_a_tool_patch_as_a_diff() {
         title: String::from("Edit src/main.rs"),
         output: String::from("@@ -1,3 +1,3 @@\n fn main() {\n-    old();\n+    new();\n }\n"),
         diff: None,
+        written_paths: Vec::new(),
         is_error: false,
     }));
     view.toggle_tool_output();
@@ -895,6 +1007,7 @@ fn views_transcript_finds_the_patch_of_a_mutation_whose_output_is_a_sentence() {
         // Exactly what `edit` really returns, and deliberately not a patch.
         output: String::from("Edit applied successfully."),
         diff: Some(String::from(patch)),
+        written_paths: Vec::new(),
         is_error: false,
     }));
     assert!(
@@ -927,6 +1040,7 @@ fn views_transcript_still_finds_a_patch_that_arrived_as_output() {
         title: String::from("git diff"),
         output: String::from(patch),
         diff: None,
+        written_paths: Vec::new(),
         is_error: false,
     }));
     assert_eq!(view.transcript().latest_diff().as_deref(), Some(patch));
@@ -949,6 +1063,7 @@ fn views_transcript_reports_no_patch_when_no_tool_produced_one() {
         title: String::from("src/main.rs"),
         output: String::from("fn main() {}"),
         diff: None,
+        written_paths: Vec::new(),
         is_error: false,
     }));
     assert_eq!(view.transcript().latest_diff(), None);
@@ -977,6 +1092,7 @@ fn views_transcript_collapses_long_tool_output_and_says_how_much_it_hid() {
         title: String::from("ls"),
         output: body,
         diff: None,
+        written_paths: Vec::new(),
         is_error: false,
     }));
     let collapsed = draw(&mut view, 60, 30).join("\n");
@@ -1051,17 +1167,27 @@ fn views_status_strip_reports_cumulative_token_usage_and_never_loses_the_exit_hi
             output_tokens: Some(250),
             cache_read_input_tokens: Some(10),
             cache_write_input_tokens: Some(5),
+            accounting: PromptAccounting::CacheInsideInput,
         })));
     }
     assert_eq!(
         view.usage(),
         crate::views::message::TokenUsage {
-            input: 3_000,
+            // 2,955 and not 3,000: each step's 1,000 `prompt_tokens` already contained
+            // that step's 10 cache reads and 5 cache writes, so 985 were billed at the
+            // plain input rate. Storing 1,000 here would count the 15 twice, and the
+            // buckets have to stay disjoint for `total` to be a sum.
+            input: 2_955,
             output: 750,
             cache_read: 30,
             cache_write: 15,
         },
         "usage is per-step rather than cumulative"
+    );
+    assert_eq!(
+        view.usage().total(),
+        3_750,
+        "three steps of 1,000 prompt plus 250 completion tokens is 3,750 billed tokens"
     );
     let text = view
         .line(160)
@@ -1069,7 +1195,7 @@ fn views_status_strip_reports_cumulative_token_usage_and_never_loses_the_exit_hi
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>();
-    assert!(text.contains("↑3,000"), "[{text}]");
+    assert!(text.contains("↑2,955"), "[{text}]");
     assert!(text.contains("↓750"), "[{text}]");
     assert!(text.contains("⚡45"), "[{text}]");
     assert!(text.contains(StatusView::EXIT_HINT), "[{text}]");
@@ -1085,7 +1211,7 @@ fn views_status_strip_reports_cumulative_token_usage_and_never_loses_the_exit_hi
         narrow.contains(StatusView::EXIT_HINT),
         "the exit hint was dropped before the token counts: [{narrow}]"
     );
-    assert!(!narrow.contains("↑3,000"), "[{narrow}]");
+    assert!(!narrow.contains("↑2,955"), "[{narrow}]");
 }
 
 #[test]
@@ -1096,6 +1222,7 @@ fn views_status_strip_omits_a_cache_column_a_provider_never_reported() {
         output_tokens: Some(3),
         cache_read_input_tokens: None,
         cache_write_input_tokens: None,
+        accounting: PromptAccounting::CacheInsideInput,
     })));
     let text = view
         .line(160)
@@ -1148,65 +1275,65 @@ fn priced_strip_in(context: ViewContext) -> StatusView {
     // keeps ` · idle` off the state — the widths below are chosen against this state.
     view.mark_running();
     view.set_git_branch("feature/status-cost-strip");
-    view.set_cost("$1.23");
     view.handle_event(&AppEvent::Engine(provider(StreamEvent::TokenUsage {
         input_tokens: Some(3_000),
         output_tokens: Some(750),
         cache_read_input_tokens: Some(30),
         cache_write_input_tokens: Some(15),
+        accounting: PromptAccounting::CacheInsideInput,
     })));
     view
 }
 
 #[test]
-fn views_status_strip_sheds_the_branch_then_the_counts_then_the_cost_before_the_exit_key() {
+fn views_status_strip_sheds_the_branch_then_the_counts_before_the_exit_key() {
     let view = priced_strip();
     let branch = format!("{}feature/status-cost-strip", StatusView::BRANCH_GLYPH);
 
-    // Wide: every field is on the row, and the two new ones sit either side of nothing
-    // they displaced — the exit key is still the rightmost thing on it.
+    // Wide: every field is on the row, and the branch sits beside nothing it displaced —
+    // the exit key is still the rightmost thing on it.
     let wide = strip(&view, 200);
     assert!(
         wide.contains(&branch),
         "the branch never rendered: [{wide}]"
     );
-    assert!(wide.contains("$1.23"), "the cost never rendered: [{wide}]");
-    assert!(wide.contains("↑3,000 ↓750 ⚡45"), "[{wide}]");
+    assert!(wide.contains("↑2,955 ↓750 ⚡45"), "[{wide}]");
     assert!(wide.trim_end().ends_with(StatusView::EXIT_HINT), "[{wide}]");
 
-    // 80: the branch goes first. It is the only field the ambient sidebar also prints,
-    // so it is the only one whose loss costs the user nothing they cannot read elsewhere.
+    // 80: the narrowest width that still holds everything. Asserted so the rung below
+    // measures the branch being shed rather than a row that never fitted to begin with.
     let at_80 = strip(&view, 80);
-    assert!(
-        !at_80.contains(&branch),
-        "the branch outranked the cost it should yield to: [{at_80}]"
-    );
-    assert!(at_80.contains("↑3,000 ↓750 ⚡45"), "[{at_80}]");
-    assert!(at_80.contains("$1.23"), "[{at_80}]");
+    assert!(at_80.contains(&branch), "[{at_80}]");
+    assert!(at_80.contains("↑2,955 ↓750 ⚡45"), "[{at_80}]");
     assert!(at_80.contains(StatusView::EXIT_HINT), "[{at_80}]");
 
-    // 50: the raw counts go next, and the cost — their summary — outlives them.
+    // 76: the branch goes first. It is the only field the ambient sidebar also prints,
+    // so it is the only one whose loss costs the user nothing they cannot read elsewhere.
+    let at_76 = strip(&view, 76);
+    assert!(
+        !at_76.contains(&branch),
+        "the branch outranked the counts it should yield to: [{at_76}]"
+    );
+    assert!(at_76.contains("↑2,955 ↓750 ⚡45"), "[{at_76}]");
+    assert!(at_76.contains(StatusView::EXIT_HINT), "[{at_76}]");
+
+    // 50: the counts go next. Between a report and the way out, the way out stays.
     let at_50 = strip(&view, 50);
     assert!(
-        !at_50.contains("↑3,000"),
-        "the counts outranked the cost that summarises them: [{at_50}]"
-    );
-    assert!(
-        at_50.contains("$1.23"),
-        "the cost went before the counts it summarises: [{at_50}]"
+        !at_50.contains("↑2,955"),
+        "the counts outranked the exit key they should yield to: [{at_50}]"
     );
     assert!(at_50.contains(StatusView::EXIT_HINT), "[{at_50}]");
 
-    // 40: only the exit key. Both new fields have now yielded to it, which is the whole
-    // ranking claim: the key is the way out, and everything else on the row is a report.
+    // 40: still only the exit key, well below the width that shed the counts — the row
+    // must not start keeping a report again as it narrows further.
     let at_40 = strip(&view, 40);
     assert!(
         at_40.contains(StatusView::EXIT_HINT),
-        "a new field was kept at the exit key's expense: [{at_40}]"
+        "a field was kept at the exit key's expense: [{at_40}]"
     );
-    assert!(!at_40.contains("$1.23"), "[{at_40}]");
     assert!(!at_40.contains(&branch), "[{at_40}]");
-    assert!(!at_40.contains("↑3,000"), "[{at_40}]");
+    assert!(!at_40.contains("↑2,955"), "[{at_40}]");
 
     // 20: 18 of the 20 columns are the exit key itself, so it cannot share the row with
     // even the 6-column state — the pre-existing last rung drops it whole rather than
@@ -1217,7 +1344,6 @@ fn views_status_strip_sheds_the_branch_then_the_counts_then_the_cost_before_the_
         !at_20.contains("ctrl+c"),
         "the exit key was truncated instead of dropped: [{at_20}]"
     );
-    assert!(!at_20.contains('$'), "[{at_20}]");
     assert!(
         !at_20.contains(StatusView::BRANCH_GLYPH),
         "a branch fragment survived the row that had no space for it: [{at_20}]"
@@ -1229,21 +1355,28 @@ fn views_status_strip_sheds_the_branch_then_the_counts_then_the_cost_before_the_
     );
 }
 
-/// The strip renders no cost segment until a caller pushes one, and never derives one
-/// from the token counts beside it: pricing is tiered and per-model, so a figure this
-/// layer computed would be confidently wrong exactly where it matters.
+/// The strip renders no price, and has no way to be given one.
+///
+/// Stronger than the claim this replaced. There used to be a `set_cost` setter, no
+/// production caller for it, and a comment naming a caller that did not exist — so the
+/// segment was empty in every real session while the code advertised otherwise. Removing
+/// the setter makes "no price" a property of the type instead of an accident: pricing is
+/// per-million-token and the resolved catalog drops the `context_over_200k` band, so a
+/// figure derived here would be confidently wrong exactly where it matters, and the only
+/// stored figure is permanently zero.
 #[test]
-fn views_status_strip_shows_no_cost_and_no_branch_until_a_caller_pushes_them() {
+fn views_status_strip_never_shows_a_price_and_shows_no_branch_until_one_is_pushed() {
     let mut view = StatusView::new(ViewContext::defaults());
     view.handle_event(&AppEvent::Engine(provider(StreamEvent::TokenUsage {
         input_tokens: Some(3_000),
         output_tokens: Some(750),
         cache_read_input_tokens: Some(30),
         cache_write_input_tokens: Some(15),
+        accounting: PromptAccounting::CacheInsideInput,
     })));
     let text = strip(&view, 200);
     assert!(
-        text.contains("↑3,000 ↓750 ⚡45"),
+        text.contains("↑2,955 ↓750 ⚡45"),
         "the counts a cost would be derived from are not even there: [{text}]"
     );
     assert!(
@@ -1255,10 +1388,9 @@ fn views_status_strip_shows_no_cost_and_no_branch_until_a_caller_pushes_them() {
         "a branch nobody pushed rendered: [{text}]"
     );
 
-    // Empty is absent, not adopted: a host with no branch or no pricing for the active
-    // model must not spend the row's columns on a blank segment and its separator.
+    // Empty is absent, not adopted: a host not on a branch must not spend the row's
+    // columns on a blank segment and its separator.
     view.set_git_branch("");
-    view.set_cost("");
     let blanked = strip(&view, 200);
     assert_eq!(
         blanked, text,
@@ -1270,7 +1402,7 @@ fn views_status_strip_shows_no_cost_and_no_branch_until_a_caller_pushes_them() {
 /// this repo has already paid for was a status field that a component method reported
 /// correctly while the surface on screen still showed the old text.
 #[test]
-fn views_status_strip_draws_the_branch_and_the_cost_onto_the_frame() {
+fn views_status_strip_draws_the_branch_and_the_counts_onto_the_frame() {
     let mut view = priced_strip();
     let buffer = render_offscreen(&mut view, 200, 1).expect("the offscreen backend is infallible");
     let row = rows(&buffer).join("\n");
@@ -1281,7 +1413,12 @@ fn views_status_strip_draws_the_branch_and_the_cost_onto_the_frame() {
         )),
         "the branch reached no cell of the frame:\n{row}"
     );
-    assert!(row.contains("$1.23"), "the cost reached no cell:\n{row}");
+    // Asserted piecewise: the cell grid may space a double-width glyph, so `⚡45` can
+    // reach the frame as `⚡ 45` and a joined needle would fail on a correct frame.
+    assert!(
+        row.contains("↑2,955") && row.contains("↓750"),
+        "the token counts reached no cell:\n{row}"
+    );
     assert!(row.contains(StatusView::EXIT_HINT), "\n{row}");
 }
 
@@ -1346,8 +1483,8 @@ fn views_status_strip_keeps_naming_ctrl_c_when_the_user_unbound_the_exit_action(
 
 /// The degradation chain is a property of the ranking, not of the hint's wording.
 ///
-/// The same four widths as
-/// [`views_status_strip_sheds_the_branch_then_the_counts_then_the_cost_before_the_exit_key`],
+/// The same widths as
+/// [`views_status_strip_sheds_the_branch_then_the_counts_before_the_exit_key`],
 /// re-measured against a rebound key: `ctrl+q cancel/exit` is the same eighteen columns
 /// as the shipped spelling, so every rung must break at exactly the same place. What
 /// this pins is that deriving the text did not smuggle a width change into the ranking.
@@ -1359,16 +1496,14 @@ fn views_status_strip_sheds_fields_in_the_same_order_when_the_exit_key_is_reboun
 
     let wide = strip(&view, 200);
     assert!(wide.contains(&branch), "[{wide}]");
-    assert!(wide.contains("↑3,000 ↓750 ⚡45"), "[{wide}]");
-    assert!(wide.contains("$1.23"), "[{wide}]");
+    assert!(wide.contains("↑2,955 ↓750 ⚡45"), "[{wide}]");
     assert!(wide.trim_end().ends_with(hint), "[{wide}]");
 
-    // 80: the branch first, exactly as with the shipped spelling.
-    let at_80 = strip(&view, 80);
-    assert!(!at_80.contains(&branch), "[{at_80}]");
-    assert!(at_80.contains("↑3,000 ↓750 ⚡45"), "[{at_80}]");
-    assert!(at_80.contains("$1.23"), "[{at_80}]");
-    assert!(at_80.contains(hint), "[{at_80}]");
+    // 76: the branch first, exactly as with the shipped spelling.
+    let at_76 = strip(&view, 76);
+    assert!(!at_76.contains(&branch), "[{at_76}]");
+    assert!(at_76.contains("↑2,955 ↓750 ⚡45"), "[{at_76}]");
+    assert!(at_76.contains(hint), "[{at_76}]");
 
     // 40: only the exit key is left, and it is the rebound one.
     let at_40 = strip(&view, 40);
@@ -1376,8 +1511,7 @@ fn views_status_strip_sheds_fields_in_the_same_order_when_the_exit_key_is_reboun
         at_40.contains(hint),
         "a field was kept at the rebound exit key's expense: [{at_40}]"
     );
-    assert!(!at_40.contains("$1.23"), "[{at_40}]");
-    assert!(!at_40.contains("↑3,000"), "[{at_40}]");
+    assert!(!at_40.contains("↑2,955"), "[{at_40}]");
 
     // 20: dropped whole, never truncated — a rebound key name must not be halved either.
     let at_20 = strip(&view, 20);
@@ -1767,6 +1901,7 @@ fn views_tool_output_overflow_is_marked_as_a_cut_not_as_a_header() {
             .collect::<Vec<_>>()
             .join("\n"),
         diff: None,
+        written_paths: Vec::new(),
         is_error: false,
     }));
     let rendered = draw(&mut view, 60, 20);
@@ -1817,6 +1952,7 @@ fn views_transcript_renders_at_every_width_without_overrunning_or_panicking() {
                 title: String::from("读取 crates/zuno-tui/src/views/message.rs"),
                 output: String::from("一行\n二行\n三行\n四行\n五行"),
                 diff: None,
+                written_paths: Vec::new(),
                 is_error: false,
             },
             provider(StreamEvent::RetryRollback { attempt: 1, max: 3 }),
@@ -1919,6 +2055,7 @@ fn tool_call_shown(
         title: String::from("Ran a tool"),
         output: output.to_owned(),
         diff: diff.map(str::to_owned),
+        written_paths: Vec::new(),
         is_error: false,
     }));
     draw(&mut view, 90, 30)
@@ -1964,6 +2101,7 @@ fn views_tool_row_falls_back_to_the_title_when_the_arguments_never_parsed() {
         title: String::from("Read something"),
         output: String::from("x"),
         diff: None,
+        written_paths: Vec::new(),
         is_error: false,
     }));
     let joined = draw(&mut view, 60, 12).join("\n");
@@ -2036,6 +2174,7 @@ fn views_tool_row_of_each_tool_is_distinguishable_from_the_others() {
             title: String::from("Ran a tool"),
             output: String::new(),
             diff: None,
+            written_paths: Vec::new(),
             is_error: false,
         }));
     }
@@ -2172,6 +2311,7 @@ fn views_expanding_tool_output_lifts_the_cap_and_removes_the_notice() {
             .collect::<Vec<_>>()
             .join("\n"),
         diff: None,
+        written_paths: Vec::new(),
         is_error: false,
     }));
     let collapsed = draw(&mut view, 60, 24).join("\n");
@@ -2261,6 +2401,7 @@ fn views_a_diff_bearing_result_uses_the_diff_palette_not_the_muted_output_style(
         title: String::from("Edit"),
         output: String::from("applied 1 change"),
         diff: Some(String::from("@@ -1,2 +1,2 @@\n-old\n+new\n")),
+        written_paths: Vec::new(),
         is_error: false,
     }));
     let context = ViewContext::defaults();
@@ -2297,6 +2438,7 @@ fn views_a_failed_tool_paints_its_output_as_an_error_below_the_call_row() {
         title: String::from("false"),
         output: String::from("exit status 1"),
         diff: None,
+        written_paths: Vec::new(),
         is_error: true,
     }));
     let rendered = draw(&mut view, 60, 12);
@@ -2441,6 +2583,7 @@ fn views_a_cjk_tool_argument_stays_inside_the_frame_at_every_width() {
             title: String::from("Read"),
             output: String::from("说明\n読み\n混合 mixed 内容\nfourth"),
             diff: None,
+            written_paths: Vec::new(),
             is_error: false,
         }));
         for line in view.lines(width) {
@@ -2478,6 +2621,7 @@ fn views_a_tool_call_survives_the_smallest_supported_frame() {
         diff: Some(String::from(
             "@@ -1,4 +1,4 @@\n context\n-removed line\n+added line\n more context\n",
         )),
+        written_paths: Vec::new(),
         is_error: false,
     }));
     for line in view.lines(20) {
@@ -2534,6 +2678,7 @@ fn realistic() -> TranscriptView {
             title: String::from("Read diff.rs"),
             output: String::from("pub fn parse(patch: &str) -> Vec<DiffLine> {"),
             diff: None,
+            written_paths: Vec::new(),
             is_error: false,
         },
         provider(StreamEvent::ToolUseStart {
@@ -2551,6 +2696,7 @@ fn realistic() -> TranscriptView {
             title: String::from("Find files"),
             output: long,
             diff: None,
+            written_paths: Vec::new(),
             is_error: false,
         },
         provider(StreamEvent::ToolUseStart {
@@ -2568,6 +2714,7 @@ fn realistic() -> TranscriptView {
             title: String::from("Edit session.rs"),
             output: String::from("applied 1 change"),
             diff: Some(String::from(patch)),
+            written_paths: vec![String::from("crates/zuno-tui/src/views/session.rs")],
             is_error: false,
         },
         provider(StreamEvent::TextDelta(String::from(
@@ -3196,4 +3343,14 @@ fn views_transcript_fingerprint_separates_every_part_shape() {
         "two roles carrying the same text fingerprint alike, so a cached user row could \
          be served for an assistant message"
     );
+}
+
+#[test]
+fn zzz_probe_widths() {
+    let view = priced_strip();
+    for width in [
+        200, 90, 80, 76, 72, 70, 68, 66, 64, 60, 56, 52, 50, 48, 44, 40, 20,
+    ] {
+        eprintln!("{width}: [{}]", strip(&view, width).trim_end());
+    }
 }

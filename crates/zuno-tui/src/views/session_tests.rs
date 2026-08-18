@@ -1460,60 +1460,111 @@ fn session_screen_shows_the_welcome_surface_only_while_the_transcript_is_empty()
     assert!(used.contains("first prompt"), "{used}");
 }
 
+/// A screen wired to a pending-edit set, with the nudge receiver and the set itself.
+///
+/// The shutdown receiver comes back so the caller keeps it alive: a dropped one closes
+/// the channel and the screen would then be reporting into nothing.
+fn screen_with_edit_sink() -> (
+    SessionScreen,
+    crate::views::lsp::PendingEditReader,
+    mpsc::Receiver<()>,
+    mpsc::Receiver<crate::app::TerminalEvent>,
+) {
+    let (shutdown, keep) = mpsc::channel(4);
+    let (wake, nudges) = mpsc::channel(1);
+    let pending = crate::views::lsp::PendingEdits::new(wake);
+    let reader = pending.reader();
+    let screen = SessionScreen::new(ViewContext::defaults(), shutdown).with_edit_sink(pending);
+    (screen, reader, nudges, keep)
+}
+
 #[test]
 fn session_reports_the_files_a_finished_turn_wrote_and_no_others() {
     use zuno_engine::r#loop::TurnEvent;
-    let (shutdown, _keep) = mpsc::channel(4);
-    let (edits, mut written) = mpsc::channel(4);
-    let mut screen = SessionScreen::new(ViewContext::defaults(), shutdown).with_edit_sink(edits);
+    let (mut screen, reader, mut nudges, _keep) = screen_with_edit_sink();
 
-    let dispatched = |name: &str, title: &str, is_error: bool| {
+    let dispatched = |name: &str, paths: &[&str], is_error: bool| {
         AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
             step: 1,
             call_id: String::from("c"),
             name: name.to_owned(),
-            title: title.to_owned(),
+            // Prose, as `apply_patch`'s really is: nothing may read a path out of it.
+            title: String::from("Success. Updated the following files:"),
             output: String::new(),
             diff: None,
+            written_paths: paths.iter().map(|path| (*path).to_owned()).collect(),
             is_error,
         })
     };
 
-    screen.handle_event(&dispatched("edit", "src/lib.rs", false));
-    // A read changed nothing; reporting its pre-existing diagnostics would attribute
-    // somebody else's problem to this turn.
-    screen.handle_event(&dispatched("read", "src/other.rs", false));
-    // A failed write changed nothing either.
-    screen.handle_event(&dispatched("write", "src/failed.rs", true));
-    screen.handle_event(&dispatched("write", "src/new.rs", false));
+    screen.handle_event(&dispatched("edit", &["src/lib.rs"], false));
+    // A read wrote nothing, so it reports nothing: attributing a file's pre-existing
+    // diagnostics to this turn would blame the user for somebody else's problem.
+    screen.handle_event(&dispatched("read", &[], false));
+    // A failed write changed nothing either, even though it names a path.
+    screen.handle_event(&dispatched("write", &["src/failed.rs"], true));
+    screen.handle_event(&dispatched("write", &["src/new.rs"], false));
     // The same file twice is one entry.
-    screen.handle_event(&dispatched("edit", "src/lib.rs", false));
+    screen.handle_event(&dispatched("edit", &["src/lib.rs"], false));
     assert!(
-        written.try_recv().is_err(),
-        "the batch was sent before the turn finished"
+        nudges.try_recv().is_err(),
+        "the set was handed over before the turn finished"
     );
+    assert_eq!(reader.take().0, Vec::<String>::new());
 
     screen.handle_event(&AppEvent::Engine(TurnEvent::TurnCompleted {
         assistant_message_id: String::from("msg_1"),
         steps: 1,
     }));
+    assert_eq!(nudges.try_recv(), Ok(()));
     assert_eq!(
-        written.try_recv(),
-        Ok(vec![String::from("src/lib.rs"), String::from("src/new.rs")])
+        reader.take().0,
+        vec![String::from("src/lib.rs"), String::from("src/new.rs")]
+    );
+}
+
+#[test]
+fn session_reports_every_file_one_multi_file_patch_wrote() {
+    // The `apply_patch` shape, which is the only writing tool a GPT model is shown: one
+    // call, several files, and a `title` that is a summary sentence rather than a path.
+    // A host reading `title` would check a file called
+    // `Success. Updated the following files:`, and `path.is_file()` would then drop it —
+    // so the turn's real writes were silently never checked.
+    use zuno_engine::r#loop::TurnEvent;
+    let (mut screen, reader, mut nudges, _keep) = screen_with_edit_sink();
+    screen.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
+        step: 1,
+        call_id: String::from("c"),
+        name: String::from("apply_patch"),
+        title: String::from("Success. Updated the following files:\nM a.rs\nA b.rs"),
+        output: String::from("Success. Updated the following files:\nM a.rs\nA b.rs"),
+        diff: Some(String::from("@@ -1 +1 @@\n-old\n+new\n")),
+        written_paths: vec![String::from("a.rs"), String::from("b.rs")],
+        is_error: false,
+    }));
+    screen.handle_event(&AppEvent::Engine(TurnEvent::TurnCompleted {
+        assistant_message_id: String::from("msg_1"),
+        steps: 1,
+    }));
+
+    assert_eq!(nudges.try_recv(), Ok(()));
+    assert_eq!(
+        reader.take().0,
+        vec![String::from("a.rs"), String::from("b.rs")],
+        "a multi-file patch must report every file it wrote, not one and not none"
     );
 }
 
 #[test]
 fn session_sends_nothing_for_a_turn_that_wrote_nothing() {
     use zuno_engine::r#loop::TurnEvent;
-    let (shutdown, _keep) = mpsc::channel(4);
-    let (edits, mut written) = mpsc::channel(4);
-    let mut screen = SessionScreen::new(ViewContext::defaults(), shutdown).with_edit_sink(edits);
+    let (mut screen, reader, mut nudges, _keep) = screen_with_edit_sink();
     screen.handle_event(&AppEvent::Engine(TurnEvent::TurnCompleted {
         assistant_message_id: String::from("msg_1"),
         steps: 1,
     }));
-    assert!(written.try_recv().is_err());
+    assert!(nudges.try_recv().is_err());
+    assert_eq!(reader.take().0, Vec::<String>::new());
 }
 
 #[test]
@@ -1521,9 +1572,7 @@ fn session_reports_an_interrupted_turns_writes_too() {
     // An aborted turn may already have written; the user still needs to know whether what
     // landed compiles.
     use zuno_engine::r#loop::TurnEvent;
-    let (shutdown, _keep) = mpsc::channel(4);
-    let (edits, mut written) = mpsc::channel(4);
-    let mut screen = SessionScreen::new(ViewContext::defaults(), shutdown).with_edit_sink(edits);
+    let (mut screen, reader, mut nudges, _keep) = screen_with_edit_sink();
     screen.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
         step: 1,
         call_id: String::from("c"),
@@ -1531,13 +1580,99 @@ fn session_reports_an_interrupted_turns_writes_too() {
         title: String::from("src/lib.rs"),
         output: String::new(),
         diff: None,
+        written_paths: vec![String::from("src/lib.rs")],
         is_error: false,
     }));
     screen.handle_event(&AppEvent::Engine(TurnEvent::TurnInterrupted {
         assistant_message_id: None,
         steps: 1,
     }));
-    assert_eq!(written.try_recv(), Ok(vec![String::from("src/lib.rs")]));
+    assert_eq!(nudges.try_recv(), Ok(()));
+    assert_eq!(reader.take().0, vec![String::from("src/lib.rs")]);
+}
+
+#[test]
+fn a_full_nudge_channel_never_loses_a_files_place_in_the_set() {
+    // The dropped-batch defect. The checker awaits a language server's startup and then
+    // its diagnostics per file, so several short turns finishing in a row leave the nudge
+    // unconsumed. When the paths travelled *as* the message, the second `try_send` failed
+    // with `Full` and the files unique to that batch were never checked again — the screen
+    // kept showing the first turn's diagnostics, or none, and said nothing about it.
+    use zuno_engine::r#loop::TurnEvent;
+    let (mut screen, reader, mut nudges, _keep) = screen_with_edit_sink();
+    let wrote = |path: &str| {
+        AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
+            step: 1,
+            call_id: String::from("c"),
+            name: String::from("apply_patch"),
+            title: String::from("Success. Updated the following files:"),
+            output: String::new(),
+            diff: None,
+            written_paths: vec![path.to_owned()],
+            is_error: false,
+        })
+    };
+    let finished = || {
+        AppEvent::Engine(TurnEvent::TurnCompleted {
+            assistant_message_id: String::from("msg"),
+            steps: 1,
+        })
+    };
+
+    // Three turns, no drain in between: the capacity-one channel is full from the first.
+    for path in ["first.rs", "second.rs", "third.rs"] {
+        screen.handle_event(&wrote(path));
+        screen.handle_event(&finished());
+    }
+
+    assert_eq!(nudges.try_recv(), Ok(()), "the first nudge is queued");
+    assert!(
+        nudges.try_recv().is_err(),
+        "the later nudges coalesced into the queued one, which is the point"
+    );
+    assert_eq!(
+        reader.take().0,
+        vec![
+            String::from("first.rs"),
+            String::from("second.rs"),
+            String::from("third.rs")
+        ],
+        "a coalesced nudge must still hand over every file, including the two turns \
+         whose nudge found the channel full"
+    );
+}
+
+#[test]
+fn the_pending_edit_set_stops_growing_at_its_bound_and_counts_what_it_refused() {
+    // Fed through the screen rather than by calling `merge` directly: the set is durable
+    // across turns, so its bound is what stops a long session from growing without limit,
+    // and the path that fills it in production is a completed turn.
+    use zuno_engine::r#loop::TurnEvent;
+    let (mut screen, reader, mut _nudges, _keep) = screen_with_edit_sink();
+    let limit = crate::views::lsp::PENDING_EDIT_LIMIT;
+    screen.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
+        step: 1,
+        call_id: String::from("c"),
+        name: String::from("apply_patch"),
+        title: String::from("Success. Updated the following files:"),
+        output: String::new(),
+        diff: None,
+        written_paths: (0..limit + 5)
+            .map(|index| format!("file{index}.rs"))
+            .collect(),
+        is_error: false,
+    }));
+    screen.handle_event(&AppEvent::Engine(TurnEvent::TurnCompleted {
+        assistant_message_id: String::from("msg"),
+        steps: 1,
+    }));
+
+    let (files, overflowed) = reader.take();
+    assert_eq!(files.len(), limit, "the set grew past its bound");
+    assert_eq!(
+        overflowed, 5,
+        "a refused path must be counted, so the report can say the set was truncated"
+    );
 }
 
 #[test]
@@ -1840,6 +1975,7 @@ fn furnished_screen() -> SessionScreen {
                 "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n-old line\n+new line\n",
             ),
             diff: None,
+            written_paths: Vec::new(),
             is_error: false,
         });
     screen

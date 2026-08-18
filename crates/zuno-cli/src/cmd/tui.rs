@@ -78,6 +78,14 @@ const MCP_TOGGLE_CHANNEL_CAPACITY: usize = 1;
 /// How many language-server reports may be queued.
 const LSP_CHANNEL_CAPACITY: usize = super::tui_lsp::REPORT_CHANNEL_CAPACITY;
 
+/// How many "files are waiting" nudges may be queued.
+///
+/// One, because the message is a signal and not the work: the paths themselves live in
+/// [`zuno_tui::views::lsp::PendingEdits`], so a nudge that finds the queue full is
+/// redundant rather than lost. Sizing this like a batch queue is what let a whole edit
+/// set be dropped.
+const EDIT_SIGNAL_CHANNEL_CAPACITY: usize = 1;
+
 /// How many cancellation requests may be queued.
 ///
 /// One, because aborting a turn is idempotent: a second request for the same turn
@@ -321,7 +329,11 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
     let control = host.control();
 
     let (report_sender, report_receiver) = mpsc::channel(LSP_CHANNEL_CAPACITY);
-    let (edit_sender, edit_receiver) = mpsc::channel(LSP_CHANNEL_CAPACITY);
+    let (edit_sender, edit_receiver) = mpsc::channel(EDIT_SIGNAL_CHANNEL_CAPACITY);
+    let pending_edits = zuno_tui::views::lsp::PendingEdits::new(edit_sender);
+    // The reader holds no sender, so the screen dropping its handle really does close
+    // the channel and end the checker task.
+    let edit_reader = pending_edits.reader();
     let (history_sender, history_receiver) = mpsc::channel(PROMPT_HISTORY_CHANNEL_CAPACITY);
     let probe = super::tui_lsp::Probe::resolve(
         &lsp_config,
@@ -337,7 +349,7 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         .with_mcp_control(mcp_projection.clone(), mcp_toggle_sender)
         .with_catalog(catalog)
         .with_diagnostics_source(report_receiver)
-        .with_edit_sink(edit_sender)
+        .with_edit_sink(pending_edits)
         .with_prompt_history(history.into_entries(), history_sender)
         .with_external_editor(editor_sender, editor_result_receiver)
         // A clone rather than a borrow: `KeyDispatcher` takes the keymap by value below,
@@ -434,6 +446,7 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         ));
         let checks = tokio::spawn(super::tui_lsp::check_edits(
             probe,
+            edit_reader,
             edit_receiver,
             report_sender,
         ));
@@ -1260,6 +1273,10 @@ async fn drive_one(
     snapshots: &mut SnapshotHistory,
 ) {
     {
+        // Counted for the memory sampler's session attribution, which is what tells
+        // "one session leaking" from "many sessions, each fine". A guard rather than a
+        // manual increment so an early `?` or a panic cannot leave the count high.
+        let _session = zuno_observability::memory::SessionCount::enter();
         let outcome = async {
             let prompt = super::tui_reference::resolve_submission(reference_root, prompt).await?;
             if let PromptSubmission::Host(command) = prompt {

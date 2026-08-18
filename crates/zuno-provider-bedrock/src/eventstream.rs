@@ -6,7 +6,7 @@ use base64::Engine as _;
 use serde_json::Value;
 use zuno_error::ProviderError;
 use zuno_llm::buffer::release_byte_capacity;
-use zuno_llm::event::{FinishReason, StreamEvent};
+use zuno_llm::event::{FinishReason, PromptAccounting, StreamEvent};
 use zuno_llm::sse::Utf8StreamDecoder;
 
 const PRELUDE_LEN: usize = 12;
@@ -611,6 +611,9 @@ impl BedrockEventDecoder {
             output_tokens: usage.get("outputTokens").and_then(Value::as_u64),
             cache_read_input_tokens: usage.get("cacheReadInputTokens").and_then(Value::as_u64),
             cache_write_input_tokens: usage.get("cacheWriteInputTokens").and_then(Value::as_u64),
+            // Converse defines `totalTokens` as `inputTokens + outputTokens` with no
+            // cache term, so the cache figures itemise `inputTokens`.
+            accounting: PromptAccounting::CacheInsideInput,
         });
     }
 
@@ -657,6 +660,10 @@ impl BedrockEventDecoder {
                         cache_write_input_tokens: usage
                             .get("cache_creation_input_tokens")
                             .and_then(Value::as_u64),
+                        // `InvokeModelWithResponseStream` passes Anthropic's own Messages
+                        // payload through, and its three prompt figures are disjoint —
+                        // unlike Converse's above.
+                        accounting: PromptAccounting::CacheBesideInput,
                     });
                 }
                 let stop_reason = value

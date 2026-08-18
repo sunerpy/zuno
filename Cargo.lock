@@ -6142,6 +6142,7 @@ dependencies = [
  "zuno-engine",
  "zuno-error",
  "zuno-llm",
+ "zuno-observability",
  "zuno-paths",
  "zuno-permission",
  "zuno-plugin-sdk",
