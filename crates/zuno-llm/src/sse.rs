@@ -51,7 +51,11 @@ pub const DEFAULT_MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
 /// spread across many individually valid SSE events.
 pub const DEFAULT_MAX_TOOL_INPUT_BYTES: usize = 4 * 1024 * 1024;
 
-const SSE_DECODE_CHUNK_BYTES: usize = 8 * 1024;
+/// Bytes handed to the UTF-8 decoder at a time.
+///
+/// [`crate::buffer::STEADY_STATE_CAPACITY_BYTES`] is calibrated to stay above
+/// this, so an ordinary stream never reaches a capacity release.
+pub const SSE_DECODE_CHUNK_BYTES: usize = 8 * 1024;
 
 /// Size limits resolved once for a provider stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -326,11 +330,15 @@ impl SseParser {
                 events.push(Ok(event));
             }
         }
+        // `drain` keeps the allocation, so without this one large event pins up to
+        // `max_event_bytes` resident for the rest of the stream. See `crate::buffer`.
+        crate::buffer::release_text_capacity(&mut self.buffer);
     }
 
     fn fail(&mut self, payload: StreamPayload, actual_bytes: usize) -> ProviderError {
         self.failed = true;
         self.buffer.clear();
+        crate::buffer::release_text_capacity(&mut self.buffer);
         self.decoder = Utf8StreamDecoder::new();
         ProviderError::fatal(StreamLimitError {
             provider: self.provider.clone(),
@@ -643,5 +651,86 @@ mod tests {
         for value in [None, Some(""), Some("unlimited"), Some("0")] {
             assert_eq!(resolve_stream_limit(17, value), 17);
         }
+    }
+
+    fn one_event(bytes: usize) -> String {
+        format!("data: {}\n\n", "x".repeat(bytes))
+    }
+
+    /// Measured before the release existed: 8,388,608 resident bytes at `len() == 0`.
+    #[test]
+    fn a_large_event_does_not_strand_its_capacity_for_the_rest_of_the_stream() {
+        let mut parser = SseParser::new();
+        let events = parser.push(one_event(4 * 1024 * 1024).as_bytes());
+        assert_eq!(
+            events.len(),
+            1,
+            "the large event itself must still be parsed"
+        );
+
+        assert_eq!(parser.buffer.len(), 0, "the event should have drained");
+        assert!(
+            parser.buffer.capacity() <= crate::buffer::STEADY_STATE_CAPACITY_BYTES,
+            "a drained stream is still holding {} bytes of capacity for zero live bytes, \
+             against a {}-byte floor",
+            parser.buffer.capacity(),
+            crate::buffer::STEADY_STATE_CAPACITY_BYTES
+        );
+    }
+
+    #[test]
+    fn a_thousand_small_events_after_a_large_one_run_on_the_floor() {
+        let mut parser = SseParser::new();
+        let _ = parser.push(one_event(4 * 1024 * 1024).as_bytes());
+        let before = parser.buffer.capacity();
+        for _ in 0..1_000 {
+            let events = parser.push(b"data: {\"delta\":\"tok\"}\n\n");
+            assert_eq!(events.len(), 1);
+        }
+        assert!(
+            parser.buffer.capacity() <= crate::buffer::STEADY_STATE_CAPACITY_BYTES,
+            "1,000 small events after one large event are still running on {} bytes of \
+             capacity, against a {}-byte floor",
+            parser.buffer.capacity(),
+            crate::buffer::STEADY_STATE_CAPACITY_BYTES
+        );
+        assert_eq!(
+            parser.buffer.capacity(),
+            before,
+            "steady-state framing reallocated after the large event"
+        );
+    }
+
+    #[test]
+    fn a_rejected_oversized_event_leaves_no_capacity_behind() {
+        let limits = StreamLimits::new(64 * 1024, DEFAULT_MAX_TOOL_INPUT_BYTES);
+        let mut parser = SseParser::with_limits("probe", "stream", limits);
+        let events = parser.push("z".repeat(4 * 1024 * 1024).as_bytes());
+        assert_eq!(events.len(), 1);
+        assert!(events[0].is_err(), "the cap must still reject the event");
+
+        assert!(
+            parser.buffer.capacity() <= crate::buffer::STEADY_STATE_CAPACITY_BYTES,
+            "the rejection path stranded {} bytes",
+            parser.buffer.capacity()
+        );
+    }
+
+    /// A partial frame must keep its room, or framing would corrupt mid-event.
+    #[test]
+    fn an_event_still_arriving_keeps_the_room_it_needs() {
+        let mut parser = SseParser::new();
+        let partial = "data: ".to_owned() + &"q".repeat(1024 * 1024);
+        let events = parser.push(partial.as_bytes());
+        assert!(events.is_empty(), "there is no separator yet");
+        assert_eq!(parser.buffer.len(), partial.len());
+
+        let completed = parser.push(b"\n\n");
+        let event = completed
+            .into_iter()
+            .next()
+            .expect("the completed event must parse")
+            .expect("framing must succeed");
+        assert_eq!(event.data.len(), 1024 * 1024);
     }
 }

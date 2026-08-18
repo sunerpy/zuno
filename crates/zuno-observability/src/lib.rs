@@ -83,6 +83,8 @@
 
 mod config;
 mod error;
+pub mod frame;
+pub mod memory;
 pub mod span;
 pub mod tool;
 pub mod watchdog;

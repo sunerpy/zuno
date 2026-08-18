@@ -1185,6 +1185,136 @@ async fn app_slow_frame_does_not_trigger_a_catch_up_burst() {
     }
 }
 
+/// Drives the *shipped* 40 ms threshold, not a lowered one, so what the test proves
+/// is what a user's binary would report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn app_reports_a_frame_that_exceeds_the_shipped_slow_frame_threshold() {
+    // 60 ms is above `SLOW_FRAME_THRESHOLD` and below nothing else in the loop, so the
+    // only reason a frame here is slow is the draw itself.
+    const FRAME_COST: Duration = Duration::from_millis(60);
+
+    let lifecycle = Arc::new(FakeLifecycle::default());
+    lifecycle.enter().expect("fake terminal enters");
+    let terminal_events = Arc::new(AtomicUsize::new(0));
+    let root = EventRecorder {
+        terminal_events: Arc::clone(&terminal_events),
+        engine_events: Arc::new(AtomicUsize::new(0)),
+    };
+    let (target, screen) = SharedTestTarget::with_draw_delay(10, 2, FRAME_COST);
+    let (terminal_tx, terminal_rx) = terminal_event_channel();
+    let (_engine_tx, engine_rx) = mpsc::channel(ENGINE_EVENT_CHANNEL_CAPACITY);
+    let (app, owner) = App::new(
+        Box::new(root),
+        Box::new(target),
+        Arc::clone(&lifecycle) as Arc<_>,
+        terminal_rx,
+        engine_rx,
+    );
+    let ui = Arc::clone(&owner.ui);
+    let mut app = app.with_redraw_config(TEST_REDRAW_CONFIG);
+    let task = tokio::spawn(async move { app.run().await });
+
+    terminal_tx
+        .send(TerminalEvent::Input(CrosstermEvent::FocusGained))
+        .await
+        .expect("terminal event channel is open");
+    wait_until(|| locked(&screen).draws >= 2).await;
+    terminal_tx
+        .send(TerminalEvent::Shutdown)
+        .await
+        .expect("terminal event channel is open");
+    task.await
+        .expect("the event loop task does not panic")
+        .expect("the event loop exits cleanly");
+
+    let frames = &locked(&ui).frames;
+    assert_eq!(
+        frames.threshold(),
+        zuno_observability::frame::SLOW_FRAME_THRESHOLD,
+        "the shipped threshold was not the one under test"
+    );
+    let recorded = frames.recent();
+    assert!(
+        !recorded.is_empty(),
+        "{FRAME_COST:?} frames drawn against a {:?} threshold produced no report at all; \
+         {} frames were measured",
+        frames.threshold(),
+        frames.drawn()
+    );
+    let startup = recorded
+        .iter()
+        .find(|frame| frame.cause == zuno_observability::frame::cause::STARTUP)
+        .expect("the pre-loop frame must be attributed to startup");
+    assert!(
+        Duration::from_micros(startup.elapsed_micros) >= FRAME_COST,
+        "a {FRAME_COST:?} draw was recorded as {} us",
+        startup.elapsed_micros
+    );
+    assert!(
+        recorded
+            .iter()
+            .any(|frame| frame.cause == zuno_observability::frame::cause::TERMINAL_INPUT),
+        "the keystroke's immediate frame was not attributed to terminal input: {recorded:?}"
+    );
+    assert_eq!(
+        frames.slow(),
+        frames.drawn(),
+        "every {FRAME_COST:?} frame should be slow, but {} of {} were",
+        frames.slow(),
+        frames.drawn()
+    );
+}
+
+/// A frame that is fast must leave the log silent, or the threshold is decoration.
+#[tokio::test]
+async fn app_leaves_a_fast_frame_unreported() {
+    let lifecycle = Arc::new(FakeLifecycle::default());
+    lifecycle.enter().expect("fake terminal enters");
+    let root = EventRecorder {
+        terminal_events: Arc::new(AtomicUsize::new(0)),
+        engine_events: Arc::new(AtomicUsize::new(0)),
+    };
+    let (target, screen) = SharedTestTarget::new(10, 2);
+    let (terminal_tx, terminal_rx) = terminal_event_channel();
+    let (_engine_tx, engine_rx) = mpsc::channel(ENGINE_EVENT_CHANNEL_CAPACITY);
+    let (app, owner) = App::new(
+        Box::new(root),
+        Box::new(target),
+        Arc::clone(&lifecycle) as Arc<_>,
+        terminal_rx,
+        engine_rx,
+    );
+    let ui = Arc::clone(&owner.ui);
+    let mut app = app.with_redraw_config(TEST_REDRAW_CONFIG);
+    let task = tokio::spawn(async move { app.run().await });
+
+    terminal_tx
+        .send(TerminalEvent::Input(CrosstermEvent::FocusGained))
+        .await
+        .expect("terminal event channel is open");
+    wait_until(|| locked(&screen).draws >= 2).await;
+    terminal_tx
+        .send(TerminalEvent::Shutdown)
+        .await
+        .expect("terminal event channel is open");
+    task.await
+        .expect("the event loop task does not panic")
+        .expect("the event loop exits cleanly");
+
+    let frames = &locked(&ui).frames;
+    assert!(
+        frames.drawn() >= 2,
+        "the fixture drew {} frames",
+        frames.drawn()
+    );
+    assert_eq!(
+        frames.slow(),
+        0,
+        "an offscreen 10x2 frame was reported slow: {:?}",
+        frames.recent()
+    );
+}
+
 #[tokio::test]
 async fn app_keystrokes_draw_immediately_instead_of_waiting_for_the_stream_cadence() {
     const SAMPLES: usize = 25;

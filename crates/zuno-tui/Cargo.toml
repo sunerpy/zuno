@@ -18,6 +18,7 @@ async-trait = { workspace = true }
 crossterm = { workspace = true }
 zuno-engine = { workspace = true }
 zuno-llm = { workspace = true }
+zuno-observability = { workspace = true }
 zuno-permission = { workspace = true }
 pulldown-cmark = { workspace = true }
 ratatui = { workspace = true }

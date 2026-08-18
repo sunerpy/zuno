@@ -115,6 +115,20 @@ fn watchdog_defaults_are_the_frozen_constants() {
         "the stall threshold must stay under G4's frozen 120s progress timeout, so \
          a stalled turn is described before the gate that fails on it trips"
     );
+    // The threshold alone does not establish that ordering. A stall is *noticed* at
+    // the first check after it crosses `stall_after`, so the worst case is
+    // `stall_after + check_every`. At the shipped 90s + 5s that is 95s, 25s ahead of
+    // the gate; raising `check_every` to 40s would push it to 130s and invert the
+    // ordering while the assertion above still passed. G4's review added this.
+    let worst_case_detection = config.stall_after.saturating_add(config.check_every);
+    assert!(
+        worst_case_detection < Duration::from_secs(120),
+        "a stall can go unnoticed for {worst_case_detection:?} ({:?} threshold plus one \
+         {:?} check), which is past G4's frozen 120s progress timeout — the gate would \
+         fail with nothing in the log to explain it",
+        config.stall_after,
+        config.check_every
+    );
 }
 
 #[test]
