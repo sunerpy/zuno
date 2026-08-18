@@ -23,18 +23,47 @@
 //! because upstream reports it too (`packages/tui/src/config/keybind.ts:450-451`).
 //! A typo there is silent breakage of a key the user believes they rebound.
 //!
-//! # Scope
+//! # Scope: this module reads files, but does not choose them
 //!
-//! Discovery and the multi-file merge order (`tui.ts:150-206`) are not
-//! implemented here. This module owns the *vocabulary* and its defaults; the
-//! layer that walks directories and merges files is a separate concern.
+//! [`ResolvedTuiConfig::discover`] reads and merges the multi-file layer stack
+//! (`tui.ts:150-206`), but the *caller* supplies the ordered candidate paths.
+//! `zuno-tui` depends on `zuno-engine`, `zuno-llm` and `zuno-permission` and
+//! deliberately has no `zuno-paths` dependency: path policy — which XDG root, which
+//! project marker, how far up the tree to walk — belongs to the layer that already
+//! owns it, `zuno-cli`, which resolves paths and projects data into the TUI. Taking
+//! a path list keeps this a leaf crate, and keeps the merge order auditable by the
+//! one layer that can see every candidate at once instead of being reconstructed
+//! from a directory walk buried here.
+//!
+//! Layers are ordered from lowest to highest precedence: **later paths win**. The
+//! win is per key, not per document — a file that sets only `theme` leaves a lower
+//! layer's `keybinds` intact — and nested objects merge the same way, so a file
+//! that sets only `prompt.max_height` does not erase `prompt.max_width`.
+//!
+//! # Where a bad layer is reported, and how precisely
+//!
+//! A missing file is not an error; it is a layer that contributes nothing. A file
+//! that exists but cannot be read or parsed is an error that **names the path**
+//! ([`TuiConfigError::Read`], [`TuiConfigError::ParseFile`]).
+//!
+//! Shape errors are therefore per layer, but the range checks in
+//! [`TuiConfig::resolve`] run once on the *merged* document and name the key rather
+//! than a path. That asymmetry is deliberate: after merging, an out-of-range value
+//! has no single file to blame, and validating each layer separately would reject a
+//! bad value that a higher layer already replaced — failing on configuration that
+//! has no effect. This diverges from `zuno-config`, which validates every layer
+//! (`discovery.rs:150-155`), because that crate's layers each stand alone as a
+//! published schema and these do not.
 
 use serde::de::{self, MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::fs;
+use std::io;
 use std::num::{NonZeroU16, NonZeroU64};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[cfg(test)]
@@ -67,6 +96,37 @@ pub enum TuiConfigError {
         expected: &'static str,
         /// The rejected value, rendered.
         found: String,
+    },
+    /// A layer's file exists but could not be read.
+    ///
+    /// A *missing* file is not this error — it is a layer that contributes nothing
+    /// ([`TuiConfig::from_path`]). This is the case where the file is there, so the
+    /// user's intent is visible on disk, but unreachable: a permission bit, a
+    /// directory where a file was expected. Continuing would start a TUI that
+    /// ignores settings the user can see.
+    #[error("failed to read the TUI configuration at {path}: {message}")]
+    Read {
+        /// The layer that could not be read.
+        path: PathBuf,
+        /// The operating system's own message.
+        ///
+        /// A rendered `String` rather than the `std::io::Error`, because this enum
+        /// is `Clone + Eq` — which is what lets a test assert a whole error value —
+        /// and `io::Error` is neither. [`Parse`](Self::Parse) already keeps its
+        /// `serde_json::Error` this way.
+        message: String,
+    },
+    /// A layer was read but its contents were rejected.
+    ///
+    /// The path is the one thing [`Parse`](Self::Parse) cannot carry: with several
+    /// layers in play, "invalid JSON" without a filename leaves the user opening
+    /// every candidate looking for the typo.
+    #[error("failed to parse the TUI configuration at {path}: {message}")]
+    ParseFile {
+        /// The offending layer.
+        path: PathBuf,
+        /// The deserializer's own message, which already names the failing key.
+        message: String,
     },
 }
 
@@ -437,14 +497,172 @@ pub struct ResolvedTuiConfig {
     pub diff_style: Option<DiffStyle>,
     /// Whether mouse capture is enabled (`index.tsx:115` — default `true`).
     pub mouse: bool,
+    /// The theme name to render with, with the default already applied.
+    ///
+    /// A `String` rather than an `Option<String>` because this struct is the layer
+    /// where defaults live, and the absent key has exactly one meaning:
+    /// [`crate::theme::DEFAULT_THEME`]. Keeping the `Option` here would push that
+    /// same `unwrap_or` onto every render site, which is how a default drifts.
+    /// [`crate::theme::ThemeRegistry::resolve`] takes a name, so a caller passes
+    /// this field directly.
+    ///
+    /// An unknown name — the empty string included — is carried through verbatim
+    /// rather than normalized or rejected. The raw [`TuiConfig::theme`] field
+    /// already documents that a name no layer provides is not an error: the
+    /// registry falls back and reports a diagnostic *naming* it. Rewriting `""` to
+    /// the default here would be the one behaviour that loses what the user wrote,
+    /// and rejecting it would make a cosmetic key fatal while a mere typo stays
+    /// survivable — the inconsistent half of "reject rather than ignore". Carrying
+    /// the value is the option that neither ignores nor over-rejects.
+    pub theme: String,
+    /// Notification and sound-cue settings, deliberately still unresolved.
+    ///
+    /// This is [`crate::attention::AttentionSettings`] and *not* `ResolvedAttention`
+    /// because [`crate::attention::Attention::from_settings`] is the constructor a
+    /// caller wants, and it takes the settings: it derives the resolved block and
+    /// the load-time diagnostics together, so the volume-clamp report survives.
+    /// Storing the resolved block here would force a caller onto
+    /// `Attention::new`, which takes no diagnostics and would silently drop that
+    /// report — resolving early would cost information, not save work.
+    pub attention: crate::attention::AttentionSettings,
+}
+
+/// Overwrite `base` only when the higher layer spoke.
+///
+/// The whole per-key merge rests on this: `None` is "said nothing", so it must not
+/// be able to clear a value a lower layer set. `Option::or` reads the other way
+/// round and is the easy way to invert the precedence by accident.
+fn merge_option<T>(base: &mut Option<T>, higher: Option<T>) {
+    if let Some(value) = higher {
+        *base = Some(value);
+    }
+}
+
+/// Merge `higher`'s prompt keys over `base`'s, one key at a time.
+///
+/// Replacing the whole block would make `{"prompt": {"max_height": 12}}` in a
+/// higher layer erase a lower layer's `max_width`, which is the per-document
+/// override this module exists to avoid.
+fn merge_prompt(base: &mut Option<PromptConfig>, higher: Option<PromptConfig>) {
+    let Some(higher) = higher else { return };
+    match base {
+        Some(base) => {
+            merge_option(&mut base.max_height, higher.max_height);
+            merge_option(&mut base.max_width, higher.max_width);
+        }
+        None => *base = Some(higher),
+    }
+}
+
+/// Merge `higher`'s attention keys over `base`'s, one key at a time.
+///
+/// Lives here rather than on [`crate::attention::AttentionSettings`] because merge
+/// order is this module's concern, not the audio layer's; every field it touches is
+/// public. `sounds` is a map, so it unions per slot: a higher layer that overrides
+/// the permission cue keeps a lower layer's done cue.
+fn merge_attention(
+    base: &mut Option<crate::attention::AttentionSettings>,
+    higher: Option<crate::attention::AttentionSettings>,
+) {
+    let Some(higher) = higher else { return };
+    match base {
+        Some(base) => {
+            merge_option(&mut base.enabled, higher.enabled);
+            merge_option(&mut base.notifications, higher.notifications);
+            merge_option(&mut base.sound, higher.sound);
+            merge_option(&mut base.volume, higher.volume);
+            merge_option(&mut base.sound_pack, higher.sound_pack);
+            base.sounds.extend(higher.sounds);
+        }
+        None => *base = Some(higher),
+    }
 }
 
 impl TuiConfig {
     /// Parse one TUI configuration document from JSON text.
     pub fn from_json_str(text: &str) -> Result<Self, TuiConfigError> {
-        serde_json::from_str(text).map_err(|error| TuiConfigError::Parse {
-            message: error.to_string(),
-        })
+        Self::parse_json(text).map_err(|message| TuiConfigError::Parse { message })
+    }
+
+    /// The one parser, so the two error skins cannot drift apart.
+    fn parse_json(text: &str) -> Result<Self, String> {
+        serde_json::from_str(text).map_err(|error| error.to_string())
+    }
+
+    /// Read one configuration layer from `path`.
+    ///
+    /// `Ok(None)` is a file that is not there: the overwhelmingly common case, since
+    /// a caller offers every candidate path and a user writes at most one or two.
+    ///
+    /// # Errors
+    ///
+    /// [`TuiConfigError::Read`] when the file exists but cannot be read, and
+    /// [`TuiConfigError::ParseFile`] when it is not valid JSON or a value has the
+    /// wrong shape. Both name `path`.
+    pub fn from_path(path: &Path) -> Result<Option<Self>, TuiConfigError> {
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            // Only `NotFound` is absence. Anything else — a permission bit, a
+            // directory — is a file the user can see, and skipping it would be the
+            // silent ignore this schema refuses everywhere else.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(TuiConfigError::Read {
+                    path: path.to_path_buf(),
+                    message: error.to_string(),
+                });
+            }
+        };
+        Self::parse_json(&text)
+            .map(Some)
+            .map_err(|message| TuiConfigError::ParseFile {
+                path: path.to_path_buf(),
+                message,
+            })
+    }
+
+    /// Fold `higher` onto `self` key by key, with `higher` winning every collision.
+    ///
+    /// Scalars and whole binding values are replaced; maps union per key; the two
+    /// nested blocks ([`PromptConfig`], [`crate::attention::AttentionSettings`])
+    /// merge field-wise. This mirrors `zuno-config`'s rule — objects merge deeply,
+    /// scalars are replaced (`discovery.rs:6-8`) — so the two crates do not teach a
+    /// user two different precedence models.
+    pub fn merge(&mut self, higher: Self) {
+        merge_option(&mut self.schema, higher.schema);
+        // Per key, so a higher layer that rebinds one action leaves every other
+        // binding a lower layer set. Replacing the map would make the nearest file
+        // the only file whose keybinds exist at all.
+        self.keybinds.extend(higher.keybinds);
+        merge_option(&mut self.leader_timeout, higher.leader_timeout);
+        merge_prompt(&mut self.prompt, higher.prompt);
+        merge_option(&mut self.scroll_speed, higher.scroll_speed);
+        merge_option(&mut self.scroll_acceleration, higher.scroll_acceleration);
+        merge_option(&mut self.diff_style, higher.diff_style);
+        merge_option(&mut self.mouse, higher.mouse);
+        merge_option(&mut self.theme, higher.theme);
+        merge_attention(&mut self.attention, higher.attention);
+    }
+
+    /// Read every layer in `paths` and merge them, lowest precedence first.
+    ///
+    /// `paths` is ordered by the caller: index `0` is the weakest layer and the last
+    /// entry wins. Absent files drop out silently, so a caller offers candidates
+    /// rather than having to probe for them first.
+    ///
+    /// # Errors
+    ///
+    /// As [`from_path`](Self::from_path), for the first layer that exists and cannot
+    /// be read or parsed. Later layers are not read: reporting the first failure is
+    /// what keeps the message about one file.
+    pub fn layered(paths: &[PathBuf]) -> Result<Self, TuiConfigError> {
+        let mut merged = Self::default();
+        for path in paths {
+            if let Some(layer) = Self::from_path(path)? {
+                merged.merge(layer);
+            }
+        }
+        Ok(merged)
     }
 
     /// Apply defaults and the host-dependent rewrites.
@@ -488,7 +706,35 @@ impl TuiConfig {
             scroll_acceleration: self.scroll_acceleration,
             diff_style: self.diff_style,
             mouse: self.mouse.unwrap_or(true),
+            theme: self
+                .theme
+                .unwrap_or_else(|| crate::theme::DEFAULT_THEME.to_owned()),
+            attention: self.attention.unwrap_or_default(),
         })
+    }
+}
+
+impl ResolvedTuiConfig {
+    /// Read every layer in `paths`, merge them, and apply defaults — the whole
+    /// file-to-usable-configuration path in one call.
+    ///
+    /// `paths` runs from lowest to highest precedence, so the last entry wins; see
+    /// this module's header for why the caller owns that order. Absent files
+    /// contribute nothing, so passing every candidate is the expected use.
+    ///
+    /// Merging finishes before [`TuiConfig::resolve`] runs, which is what the
+    /// terminal-suspend rewrite depends on: that rewrite only prepends `ctrl+z` to
+    /// `input_undo` when the user has *not* spoken about `input_undo`, and resolving
+    /// per layer would hide an `input_undo` written in a lower layer behind a higher
+    /// layer that is silent about it.
+    ///
+    /// # Errors
+    ///
+    /// As [`TuiConfig::layered`] for a layer that cannot be read or parsed, naming
+    /// the path; and as [`TuiConfig::resolve`] for a value outside its legal range in
+    /// the merged result, naming the key.
+    pub fn discover(paths: &[PathBuf], options: ResolveOptions) -> Result<Self, TuiConfigError> {
+        TuiConfig::layered(paths)?.resolve(options)
     }
 }
 
@@ -502,6 +748,8 @@ impl Default for ResolvedTuiConfig {
             scroll_acceleration: None,
             diff_style: None,
             mouse: true,
+            theme: crate::theme::DEFAULT_THEME.to_owned(),
+            attention: crate::attention::AttentionSettings::default(),
         }
     }
 }
