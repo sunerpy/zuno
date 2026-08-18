@@ -279,10 +279,17 @@ fn translate(
         drained: bool,
     }
 
+    let parser = SseParser::for_stream(provider.clone(), model.clone());
+    let tool_input_limit = parser.limits().max_tool_input_bytes();
     let state = State {
         chunks,
-        parser: SseParser::new(),
-        translator: SurfaceTranslator::new(provider.clone(), model.clone(), surface),
+        parser,
+        translator: SurfaceTranslator::with_tool_input_limit(
+            provider.clone(),
+            model.clone(),
+            surface,
+            tool_input_limit,
+        ),
         pending: std::collections::VecDeque::new(),
         provider,
         model,
@@ -316,12 +323,19 @@ fn translate(
                 None => {
                     state.drained = true;
                     let mut frames = state.parser.finish();
-                    frames.retain(|frame| !frame.data.is_empty());
+                    frames.retain(|frame| match frame {
+                        Ok(frame) => !frame.data.is_empty(),
+                        Err(_) => true,
+                    });
                     frames
                 }
             };
 
             for frame in frames {
+                let frame = match frame {
+                    Ok(frame) => frame,
+                    Err(error) => return Some((Err(error), None)),
+                };
                 match state.translator.frame(&frame.data) {
                     Ok(events) => state.pending.extend(events),
                     Err(error) => return Some((Err(error), None)),

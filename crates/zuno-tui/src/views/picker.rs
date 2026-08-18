@@ -28,6 +28,7 @@ use crate::views::dialog::{Dialog, DialogOutcome, DialogStep};
 use crate::views::{ViewContext, padded};
 use crossterm::event::KeyEvent;
 use ratatui::text::{Line, Span};
+use std::sync::Arc;
 
 #[cfg(test)]
 #[path = "picker_tests.rs"]
@@ -117,6 +118,16 @@ impl Item {
 /// value; spelled out three times it drifts.
 pub type PreviewFn = dyn Fn(&Item, &ViewContext) -> Vec<Line<'static>> + Send;
 
+/// A side effect run when the highlighted row changes.
+///
+/// Separate from [`PreviewFn`] even though both are handed the highlighted row,
+/// because they fire at different times and only one of them may have effects. A
+/// preview runs inside [`Dialog::lines`], which the host calls *after* it has already
+/// drawn the base component, so a preview that re-themed the screen would leave the
+/// transcript one keystroke behind the list. This runs while the keystroke is still
+/// being handled, before anything is painted.
+pub type HighlightFn = dyn Fn(&Item, &ViewContext) + Send;
+
 /// A filterable list dialog.
 pub struct SelectDialog {
     id: &'static str,
@@ -130,6 +141,19 @@ pub struct SelectDialog {
     rows: usize,
     /// A per-row preview, drawn under the list. The theme picker's reason to exist.
     preview: Option<Box<PreviewFn>>,
+    /// Run when the highlighted row changes. The theme picker's live switch.
+    highlight: Option<Box<HighlightFn>>,
+    /// The value [`Self::highlight`] was last told about.
+    ///
+    /// Compared against the current selection on the way out of every input entry
+    /// point, which is what makes this derived rather than pushed: the cursor moves
+    /// from six actions and the filter reorders the list from two more, and a hook
+    /// fired at each of those eight sites is a hook the ninth forgets. One comparison
+    /// at one place cannot be forgotten by a later action arm.
+    ///
+    /// The *value* and not the cursor index, because re-ranking can leave the index
+    /// alone while putting a different row under it.
+    announced: Option<String>,
 }
 
 impl SelectDialog {
@@ -152,6 +176,8 @@ impl SelectDialog {
             cursor: 0,
             rows: 10,
             preview: None,
+            highlight: None,
+            announced: None,
         }
     }
 
@@ -162,6 +188,23 @@ impl SelectDialog {
         preview: impl Fn(&Item, &ViewContext) -> Vec<Line<'static>> + Send + 'static,
     ) -> Self {
         self.preview = Some(Box::new(preview));
+        self
+    }
+
+    /// Run `highlight` whenever the highlighted row changes.
+    ///
+    /// Attach this **after** [`Self::selecting`]: the row the picker opens on is
+    /// recorded as already announced, so opening a picker fires nothing. Attaching it
+    /// first would make merely opening the theme picker repaint the screen with the
+    /// theme it is already showing — harmless today, and the kind of thing that stops
+    /// being harmless once a hook does more than one thing.
+    #[must_use]
+    pub fn with_highlight(
+        mut self,
+        highlight: impl Fn(&Item, &ViewContext) + Send + 'static,
+    ) -> Self {
+        self.announced = self.selected().map(|item| item.value.clone());
+        self.highlight = Some(Box::new(highlight));
         self
     }
 
@@ -245,6 +288,25 @@ impl SelectDialog {
         self.cursor = self.cursor.min(self.filtered.len().saturating_sub(1));
     }
 
+    /// Tell [`Self::highlight`] about the highlighted row, if it changed.
+    ///
+    /// Derived from the current selection rather than fired by whichever arm moved the
+    /// cursor — see [`Self::announced`].
+    fn refresh_highlight(&mut self) {
+        if self.highlight.is_none() {
+            return;
+        }
+        let current = self.selected().cloned();
+        let value = current.as_ref().map(|item| item.value.clone());
+        if value == self.announced {
+            return;
+        }
+        self.announced = value;
+        if let (Some(highlight), Some(item)) = (self.highlight.as_ref(), current.as_ref()) {
+            highlight(item, &self.context);
+        }
+    }
+
     fn move_cursor(&mut self, delta: isize) {
         if self.filtered.is_empty() {
             return;
@@ -314,6 +376,21 @@ impl Dialog for SelectDialog {
     }
 
     fn handle_action(&mut self, action: &'static Definition, event: &KeyEvent) -> DialogStep {
+        let step = self.dispatch(action, event);
+        self.refresh_highlight();
+        step
+    }
+
+    fn handle_typed(&mut self, key: &KeyEvent) -> DialogStep {
+        let step = self.type_into_filter(key);
+        self.refresh_highlight();
+        step
+    }
+}
+
+impl SelectDialog {
+    /// Every action arm, with the highlight bookkeeping factored out to its one caller.
+    fn dispatch(&mut self, action: &'static Definition, event: &KeyEvent) -> DialogStep {
         match action.name {
             "dialog.select.prev" => {
                 self.move_cursor(-1);
@@ -358,11 +435,12 @@ impl Dialog for SelectDialog {
                 self.set_filter(&filter);
                 DialogStep::Redraw
             }
-            _ => self.handle_typed(event),
+            _ => self.type_into_filter(event),
         }
     }
 
-    fn handle_typed(&mut self, key: &KeyEvent) -> DialogStep {
+    /// Append a typed character to the filter, the other way the selection can change.
+    fn type_into_filter(&mut self, key: &KeyEvent) -> DialogStep {
         if let Some(character) = crate::views::permission::typed_character(key) {
             let filter = format!("{}{character}", self.filter);
             self.set_filter(&filter);
@@ -488,28 +566,37 @@ pub fn theme_picker(context: ViewContext, registry: &ThemeRegistry, mode: Mode) 
         })
         .collect::<Vec<_>>();
     // Every theme is resolved once here rather than on each frame: resolution walks
-    // colour references and a picker redraws on every keystroke.
-    let resolved = names
-        .iter()
-        .map(|name| (name.clone(), registry.resolve(name, mode)))
-        .collect::<Vec<(String, Resolved)>>();
-    let selected = context
-        .config
-        .keybinds
-        .is_empty()
-        .then(|| crate::theme::DEFAULT_THEME.to_owned());
-    let dialog = SelectDialog::new(THEME_DIALOG_ID, "Themes", context, items)
+    // colour references and a picker redraws on every keystroke. Shared with the
+    // highlight hook rather than resolved twice — an `Arc` because both closures own
+    // their captures and a registry cannot be borrowed past this function.
+    let resolved = Arc::new(
+        names
+            .iter()
+            .map(|name| (name.clone(), registry.resolve(name, mode)))
+            .collect::<Vec<(String, Resolved)>>(),
+    );
+    // The theme actually in force, not a configuration guess: after an in-session
+    // switch the file still names the theme the user started with, so reopening the
+    // picker from the file would put the cursor on a theme that is no longer showing.
+    let active = context.theme().name.clone();
+    let previews = Arc::clone(&resolved);
+    SelectDialog::new(THEME_DIALOG_ID, "Themes", context, items)
         .with_rows(8)
         .with_preview(move |item, context| {
-            let Some((_, resolved)) = resolved.iter().find(|(name, _)| *name == item.value) else {
+            let Some((_, resolved)) = previews.iter().find(|(name, _)| *name == item.value) else {
                 return Vec::new();
             };
             preview_lines(resolved, context)
-        });
-    match selected {
-        Some(name) => dialog.selecting(&name),
-        None => dialog,
-    }
+        })
+        .selecting(&active)
+        // After `selecting`, so opening the picker announces nothing. This is the whole
+        // live switch: moving the cursor repaints every surface in the context's tree,
+        // because they all read the one theme this writes.
+        .with_highlight(move |item, context| {
+            if let Some((_, resolved)) = resolved.iter().find(|(name, _)| *name == item.value) {
+                context.set_theme(resolved);
+            }
+        })
 }
 
 /// Six swatch rows summarising a palette, the theme picker's preview.

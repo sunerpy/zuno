@@ -460,7 +460,7 @@ fn allow_has_reason(attribute: &str) -> bool {
 /// attribute here instead of changing `tests/memory.rs` after the measured run.
 const FROZEN_ALLOW_WITH_EXTERNAL_REASON: (&str, usize, &str) = (
     "crates/zuno-testkit/tests/memory.rs",
-    844,
+    915,
     "#[allow(clippy::too_many_arguments)]",
 );
 

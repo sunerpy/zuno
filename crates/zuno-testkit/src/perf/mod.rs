@@ -20,7 +20,7 @@ pub use fixtures::create_watcher_tree;
 pub use methodology::{FrozenThresholds, PERF_METHODOLOGY_REVISION};
 pub use process_tree::sample_process_tree;
 pub use runner::{
-    BaselineRunOptions, PairedSide, interleaved_pair_order, measure_typescript_baseline,
-    verify_typescript_oracle,
+    BaselineRunOptions, PairedSide, interleaved_pair_order, measure_g1_g2_subject,
+    measure_typescript_baseline, verify_typescript_oracle,
 };
 pub use subject::{PinnedSubject, W_REAL_RECAPTURE, W_REAL_SUBJECT};

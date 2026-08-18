@@ -222,18 +222,20 @@ fn views_diff_uses_the_dedicated_diff_palette_keys_not_the_status_colours() {
         .map(|(x, y)| buffer[(x, y)].bg)
         .collect::<Vec<_>>();
     assert!(
-        backgrounds.contains(&ratatui::style::Color::from(context.palette.diff_added_bg)),
+        backgrounds.contains(&ratatui::style::Color::from(
+            context.palette().diff_added_bg
+        )),
         "no cell uses `diffAddedBg`"
     );
     assert!(
         backgrounds.contains(&ratatui::style::Color::from(
-            context.palette.diff_removed_bg
+            context.palette().diff_removed_bg
         )),
         "no cell uses `diffRemovedBg`"
     );
     assert!(
         backgrounds.contains(&ratatui::style::Color::from(
-            context.palette.diff_added_line_number_bg
+            context.palette().diff_added_line_number_bg
         )),
         "no cell uses `diffAddedLineNumberBg`, so the gutter is not distinguished"
     );
@@ -246,7 +248,7 @@ fn views_diff_hunk_header_uses_its_own_colour() {
     let buffer = render_offscreen(&mut view, 20, 2).expect("infallible");
     assert_eq!(
         buffer[(0, 0)].fg,
-        ratatui::style::Color::from(context.palette.diff_hunk_header)
+        ratatui::style::Color::from(context.palette().diff_hunk_header)
     );
 }
 

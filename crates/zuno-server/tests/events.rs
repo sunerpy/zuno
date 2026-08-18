@@ -334,6 +334,8 @@ fn decode_frame(frame: &str) -> (Option<EventCursor>, Value) {
     let parsed = parser.push(frame.as_bytes());
     assert_eq!(parsed.len(), 1, "axum must emit one complete event frame");
     let payload = parsed[0]
+        .as_ref()
+        .expect("the server event stays below the SSE frame cap")
         .deserialize("zuno-server", "event-stream")
         .expect("the SSE data is valid JSON");
     (cursor, payload)

@@ -23,7 +23,36 @@ use zuno_testkit::perf::{
 const MEMORY_GATE_MODE: &str = "ZUNO_MEMORY_GATE_MODE";
 const MEMORY_GATE_WORKER_OUTPUT: &str = "ZUNO_MEMORY_GATE_WORKER_OUTPUT";
 const MEMORY_GATE_DATABASE: &str = "ZUNO_MEMORY_GATE_DATABASE";
+const MEMORY_GATE_ALLOCATOR: &str = "ZUNO_MEMORY_GATE_ALLOCATOR";
 const WORKER_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AllocatorConfiguration {
+    Jemalloc,
+    System,
+}
+
+impl AllocatorConfiguration {
+    fn from_environment() -> Self {
+        match std::env::var(MEMORY_GATE_ALLOCATOR).as_deref() {
+            Ok("jemalloc") | Err(std::env::VarError::NotPresent) => Self::Jemalloc,
+            Ok("system") => Self::System,
+            Ok(other) => panic!(
+                "unsupported {MEMORY_GATE_ALLOCATOR}={other:?}; accepted values are `jemalloc` and `system`"
+            ),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                panic!("{MEMORY_GATE_ALLOCATOR} must be valid UTF-8")
+            }
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Jemalloc => "jemalloc",
+            Self::System => "system",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct GateVerdict {
@@ -96,7 +125,8 @@ fn g1_and_g2_use_at_most_half_the_committed_typescript_baseline() {
 
     let workspace = workspace_root();
     let target = target_dir(&workspace);
-    let rust_release = build_release_subject(&workspace, &target);
+    let allocator = AllocatorConfiguration::from_environment();
+    let rust_release = build_release_subject(&workspace, &target, allocator);
     let rust_version = binary_version(&rust_release);
     let database = database_path();
     assert_pinned_database(&database);
@@ -108,7 +138,13 @@ fn g1_and_g2_use_at_most_half_the_committed_typescript_baseline() {
         typescript_binary.display()
     );
 
-    let root = prepare_measurement_root(&target, &rust_release, &typescript_binary, &database);
+    let root = prepare_measurement_root(
+        &target,
+        &rust_release,
+        &typescript_binary,
+        &database,
+        allocator,
+    );
     let rust_as_opencode = root.join("rust-subject/opencode");
     copy_subject(&rust_release, &rust_as_opencode);
 
@@ -178,6 +214,7 @@ fn g1_and_g2_use_at_most_half_the_committed_typescript_baseline() {
         &rust_release,
         &rust_version,
         &database,
+        allocator,
     );
     eprintln!(
         "G1: Rust={} KiB, paired TS={} KiB, committed TS={} KiB, ceiling={} KiB, Rust/committed={:.4}, paired/committed={:.4}, verdict={}",
@@ -374,11 +411,23 @@ fn a_completed_pass_survives_preparing_the_same_measurement_root_again() {
     std::fs::write(&rust, b"rust-v1").expect("write Rust fixture");
     std::fs::write(&typescript, b"typescript-v1").expect("write TypeScript fixture");
     std::fs::write(&database, b"database-v1").expect("write database fixture");
-    let root = prepare_measurement_root(target.path(), &rust, &typescript, &database);
+    let root = prepare_measurement_root(
+        target.path(),
+        &rust,
+        &typescript,
+        &database,
+        AllocatorConfiguration::Jemalloc,
+    );
     let completed = root.join("pass-0.json");
     std::fs::write(&completed, b"completed\n").expect("write completed-pass marker");
 
-    let resumed = prepare_measurement_root(target.path(), &rust, &typescript, &database);
+    let resumed = prepare_measurement_root(
+        target.path(),
+        &rust,
+        &typescript,
+        &database,
+        AllocatorConfiguration::Jemalloc,
+    );
 
     assert_eq!(resumed, root);
     assert!(
@@ -396,12 +445,24 @@ fn changing_a_measured_binary_invalidates_completed_passes() {
     std::fs::write(&rust, b"rust-v1").expect("write Rust fixture");
     std::fs::write(&typescript, b"typescript-v1").expect("write TypeScript fixture");
     std::fs::write(&database, b"database-v1").expect("write database fixture");
-    let root = prepare_measurement_root(target.path(), &rust, &typescript, &database);
+    let root = prepare_measurement_root(
+        target.path(),
+        &rust,
+        &typescript,
+        &database,
+        AllocatorConfiguration::Jemalloc,
+    );
     let completed = root.join("pass-0.json");
     std::fs::write(&completed, b"completed\n").expect("write completed-pass marker");
 
     std::fs::write(&rust, b"rust-v2").expect("replace Rust fixture");
-    prepare_measurement_root(target.path(), &rust, &typescript, &database);
+    prepare_measurement_root(
+        target.path(),
+        &rust,
+        &typescript,
+        &database,
+        AllocatorConfiguration::Jemalloc,
+    );
 
     assert!(
         !completed.exists(),
@@ -466,8 +527,9 @@ fn prepare_measurement_root(
     rust_binary: &Path,
     typescript_binary: &Path,
     database: &Path,
+    allocator: AllocatorConfiguration,
 ) -> PathBuf {
-    let root = target.join("perf/task-88-work");
+    let root = target.join(format!("perf/task-88-work-{}", allocator.label()));
     let context = measurement_context(rust_binary, typescript_binary, database);
     let context_path = root.join("context.json");
     if root.exists() && !std::fs::read(&context_path).is_ok_and(|existing| existing == context) {
@@ -511,9 +573,14 @@ fn file_sha256(path: &Path) -> String {
         .to_owned()
 }
 
-fn build_release_subject(workspace: &Path, target: &Path) -> PathBuf {
+fn build_release_subject(
+    workspace: &Path,
+    target: &Path,
+    allocator: AllocatorConfiguration,
+) -> PathBuf {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let status = Command::new(cargo)
+    let mut command = Command::new(cargo);
+    command
         .args([
             OsStr::new("build"),
             OsStr::new("--release"),
@@ -523,7 +590,11 @@ fn build_release_subject(workspace: &Path, target: &Path) -> PathBuf {
             OsStr::new("zuno"),
             OsStr::new("--offline"),
         ])
-        .current_dir(workspace)
+        .current_dir(workspace);
+    if allocator == AllocatorConfiguration::System {
+        command.arg("--no-default-features");
+    }
+    let status = command
         .status()
         .expect("spawn release build for the Rust subject");
     assert!(status.success(), "Rust release build failed with {status}");
@@ -685,7 +756,7 @@ fn spawn_worker(
         ])
         .env(MEMORY_GATE_WORKER_OUTPUT, report)
         .env("ZUNO_TESTKIT_ORACLE", wrapper)
-        .env("OPENCODE_DB", database)
+        .env("ZUNO_DB", database)
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(stderr))
         .spawn()
@@ -854,10 +925,11 @@ fn write_gate_artifact(
     rust_binary: &Path,
     rust_version: &str,
     database: &Path,
+    allocator: AllocatorConfiguration,
 ) {
     let directory = target.join("perf");
     std::fs::create_dir_all(&directory).expect("create performance artifact directory");
-    let path = directory.join("task-88-memory.json");
+    let path = directory.join(format!("task-88-memory-{}.json", allocator.label()));
     let gate = |verdict: GateVerdict, paired_ts_median: u64| {
         serde_json::json!({
             "rust_median_peak_rss_kib": verdict.rust_median_kib,
@@ -881,6 +953,7 @@ fn write_gate_artifact(
     let artifact = serde_json::json!({
         "topology": "released TypeScript TUI vs release-profile Rust TUI under the frozen real PTY runner",
         "pairing": "five AB/BA pairs per workload from interleaved_pair_order(5)",
+        "rust_allocator": allocator.label(),
         "rust_binary": rust_binary,
         "rust_version": rust_version,
         "w_real_database": database,

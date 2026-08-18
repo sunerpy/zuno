@@ -12,7 +12,7 @@ use crate::{CassettePlayer, DbChoice, MockProvider, Scenario, ScriptedEnv};
 use super::baseline::{RssSample, RunMeasurement, WorkloadName};
 use super::database::RealDatabaseSnapshot;
 use super::fixtures::{create_watcher_tree, provider_config, write_memory_driver_tool};
-use super::process_tree::{find_oracle_descendant, sample};
+use super::process_tree::{find_named_descendant, sample};
 use super::runner::{SAMPLE_INTERVAL, WARM_UP, warm_up_discard};
 
 const RESPONSES_PER_TURN: usize = 2;
@@ -72,6 +72,7 @@ struct RunShape {
 
 pub(crate) async fn measure_one(
     oracle_program: &Path,
+    process_name: &str,
     workload: WorkloadName,
     repetition: usize,
     turns: usize,
@@ -122,7 +123,7 @@ pub(crate) async fn measure_one(
     ];
     let mut child = spawn_script(&script, &args, env.working_dir(), &variables)?;
     let started = Instant::now();
-    let oracle_pid = wait_for_oracle_pid(&mut child, workload, started).await?;
+    let oracle_pid = wait_for_subject_pid(&mut child, process_name, workload, started).await?;
     let shape = RunShape {
         workload,
         plan,
@@ -237,13 +238,14 @@ fn spawn_script(
     })
 }
 
-async fn wait_for_oracle_pid(
+async fn wait_for_subject_pid(
     child: &mut Child,
+    process_name: &str,
     workload: WorkloadName,
     started: Instant,
 ) -> Result<u32> {
     while started.elapsed() < Duration::from_secs(30) {
-        if let Some(pid) = find_oracle_descendant(child.id())? {
+        if let Some(pid) = find_named_descendant(child.id(), process_name)? {
             return Ok(pid);
         }
         fail_if_exited(child, workload)?;
@@ -251,7 +253,7 @@ async fn wait_for_oracle_pid(
     }
     Err(TestkitError::BaselineRunFailed {
         workload: workload_label(workload),
-        detail: "no opencode process appeared under the PTY launcher within 30s".to_owned(),
+        detail: format!("no {process_name} process appeared under the PTY launcher within 30s"),
     })
 }
 

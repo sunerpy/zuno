@@ -759,6 +759,11 @@ impl TurnHost {
         self.dispatcher.available_tools().definitions.len()
     }
 
+    /// Commands available to interactive discovery, in catalog listing order.
+    pub(crate) fn commands(&self) -> impl Iterator<Item = &zuno_catalog::command::Info> {
+        self.commands.list()
+    }
+
     /// A handle that aborts whichever turn this host has live.
     ///
     /// Resolving the live turn by session id rather than capturing a signal is what
@@ -825,6 +830,27 @@ impl TurnHost {
         self.drive_with_message_id(prompt, None, events).await
     }
 
+    pub(crate) async fn drive_content(
+        &mut self,
+        prompt: &str,
+        content: &[RequestContentBlock],
+        events: TurnEventSender,
+    ) -> Result<(), String> {
+        let guard = self
+            .runs
+            .begin_turn(self.session_id.clone())
+            .map_err(to_string)?;
+        self.drive_input(
+            prompt,
+            None,
+            None,
+            Some(content),
+            guard.interrupt_signal(),
+            events,
+        )
+        .await
+    }
+
     pub(crate) async fn drive_command(
         &mut self,
         command: &str,
@@ -856,6 +882,7 @@ impl TurnHost {
             &resolved.prompt,
             None,
             Some((command, arguments)),
+            None,
             guard.interrupt_signal(),
             events,
         )
@@ -872,8 +899,15 @@ impl TurnHost {
             .runs
             .begin_turn(self.session_id.clone())
             .map_err(to_string)?;
-        self.drive_input(prompt, message_id, None, guard.interrupt_signal(), events)
-            .await
+        self.drive_input(
+            prompt,
+            message_id,
+            None,
+            None,
+            guard.interrupt_signal(),
+            events,
+        )
+        .await
     }
 
     pub(crate) async fn drive_with_message_id_and_guard(
@@ -883,8 +917,15 @@ impl TurnHost {
         guard: SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<(), String> {
-        self.drive_input(prompt, message_id, None, guard.interrupt_signal(), events)
-            .await
+        self.drive_input(
+            prompt,
+            message_id,
+            None,
+            None,
+            guard.interrupt_signal(),
+            events,
+        )
+        .await
     }
 
     async fn drive_input(
@@ -892,6 +933,7 @@ impl TurnHost {
         prompt: &str,
         message_id: Option<&str>,
         command: Option<(&str, &str)>,
+        content: Option<&[RequestContentBlock]>,
         interrupt: &InterruptSignal,
         events: TurnEventSender,
     ) -> Result<(), String> {
@@ -901,7 +943,7 @@ impl TurnHost {
         let usage_before = goal_usage(&self.connection, &self.session_id)?;
         let started = Instant::now();
         let result = self
-            .drive_input_unaccounted(prompt, message_id, command, interrupt, events)
+            .drive_input_unaccounted(prompt, message_id, command, content, interrupt, events)
             .await;
         match result {
             Ok(outcome) => {
@@ -928,6 +970,7 @@ impl TurnHost {
         prompt: &str,
         message_id: Option<&str>,
         command: Option<(&str, &str)>,
+        content: Option<&[RequestContentBlock]>,
         interrupt: &InterruptSignal,
         events: TurnEventSender,
     ) -> Result<Option<TurnOutcome>, String> {
@@ -944,6 +987,7 @@ impl TurnHost {
                 message_id,
                 now: zuno_db::message::created_after(zuno_db::message::now_millis(), latest),
             },
+            content,
             self.plugins.as_deref(),
             command,
         )
@@ -2088,6 +2132,7 @@ fn persist_user_message(
 
 async fn prepare_user_message_with_hooks(
     input: UserMessageInput<'_>,
+    content: Option<&[RequestContentBlock]>,
     plugins: Option<&super::plugin_runtime::PluginRuntime>,
     command: Option<(&str, &str)>,
 ) -> Result<
@@ -2109,19 +2154,22 @@ async fn prepare_user_message_with_hooks(
         "model": {"providerID": input.provider_id, "modelID": input.model_id}
     }))
     .map_err(to_string)?;
-    let mut parts = vec![
-        zuno_db::message::PartRecord::from_json(
-            json!({
-                "id": prefixed_id("prt"),
-                "sessionID": input.session_id,
-                "messageID": message.id,
-                "type": "text",
-                "text": input.text
-            }),
-            input.now,
-        )
-        .map_err(to_string)?,
-    ];
+    let mut parts = match content {
+        Some(content) => request_content_parts(&input, &message.id, content)?,
+        None => vec![
+            zuno_db::message::PartRecord::from_json(
+                json!({
+                    "id": prefixed_id("prt"),
+                    "sessionID": input.session_id,
+                    "messageID": message.id,
+                    "type": "text",
+                    "text": input.text
+                }),
+                input.now,
+            )
+            .map_err(to_string)?,
+        ],
+    };
 
     if let (Some(plugins), Some((command, arguments))) = (plugins, command) {
         plugins
@@ -2165,6 +2213,48 @@ async fn prepare_user_message_with_hooks(
         .data
         .insert("role".to_owned(), Value::String("user".to_owned()));
     Ok((message, parts))
+}
+
+fn request_content_parts(
+    input: &UserMessageInput<'_>,
+    message_id: &str,
+    content: &[RequestContentBlock],
+) -> Result<Vec<zuno_db::message::PartRecord>, String> {
+    if content.is_empty() {
+        return Err("resolved prompt content must not be empty".to_owned());
+    }
+    content
+        .iter()
+        .map(|block| {
+            let value = match block {
+                RequestContentBlock::Text { text } => json!({
+                    "id": prefixed_id("prt"),
+                    "sessionID": input.session_id,
+                    "messageID": message_id,
+                    "type": "text",
+                    "text": text,
+                }),
+                RequestContentBlock::Image { media_type, data } => json!({
+                    "id": prefixed_id("prt"),
+                    "sessionID": input.session_id,
+                    "messageID": message_id,
+                    "type": "file",
+                    "mime": media_type,
+                    "data": data,
+                    "url": format!("data:{media_type};base64,{data}"),
+                }),
+                RequestContentBlock::SignedThinking { .. }
+                | RequestContentBlock::ProviderEncryptedReasoning { .. }
+                | RequestContentBlock::ToolUse { .. }
+                | RequestContentBlock::ToolResult { .. } => {
+                    return Err(
+                        "resolved user prompt content may contain only text and images".to_owned(),
+                    );
+                }
+            };
+            zuno_db::message::PartRecord::from_json(value, input.now).map_err(to_string)
+        })
+        .collect()
 }
 
 fn persist_prepared_user_message(

@@ -195,7 +195,7 @@ fn views_help_unbound_row_is_muted_from_the_palette() {
     let mut view = HelpView::new(context.clone(), &keymap);
     view.set_filter("unbound");
     let lines = view.lines(60);
-    let muted = ratatui::style::Color::from(context.palette.text_muted);
+    let muted = ratatui::style::Color::from(context.palette().text_muted);
     assert!(
         lines
             .iter()

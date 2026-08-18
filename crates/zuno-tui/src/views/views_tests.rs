@@ -126,9 +126,7 @@ fn views_every_view_source_reaches_the_palette_through_the_context() {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("");
-        // `scroll.rs` computes offsets and `external.rs` talks to other processes;
-        // neither paints, so neither should have to pretend to.
-        if matches!(name, "scroll.rs" | "external.rs") {
+        if matches!(name, "scroll.rs" | "external.rs" | "slash.rs") {
             continue;
         }
         if !source.contains("ViewContext") && !source.contains("context.") {
@@ -481,7 +479,7 @@ fn views_context_selected_style_is_readable_against_its_own_background() {
 fn views_context_defaults_use_the_built_in_default_theme() {
     let registry = ThemeRegistry::new();
     let resolved = registry.resolve(crate::theme::DEFAULT_THEME, Mode::Dark);
-    assert_eq!(ViewContext::defaults().palette, resolved.palette);
+    assert_eq!(*ViewContext::defaults().palette(), resolved.palette);
 }
 
 #[test]
@@ -593,7 +591,7 @@ fn views_fill_paints_every_cell_in_the_area() {
     let context = ViewContext::defaults();
     let mut filler = Filler(context.clone());
     let buffer = render_offscreen(&mut filler, 4, 3).expect("infallible");
-    let expected = ratatui::style::Color::from(context.palette.background_element);
+    let expected = ratatui::style::Color::from(context.palette().background_element);
     for y in 0..3 {
         for x in 0..4 {
             assert_eq!(

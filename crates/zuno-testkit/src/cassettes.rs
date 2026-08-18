@@ -337,6 +337,7 @@ fn decode_compatible(interaction: &HttpInteraction) -> Vec<StreamEvent> {
     let mut events = Vec::new();
     for chunk in interaction.response.body.as_bytes().chunks(11) {
         for frame in parser.push(chunk) {
+            let frame = frame.expect("compatible SSE frame is bounded");
             events.extend(
                 translator
                     .frame(&frame.data)
@@ -345,6 +346,7 @@ fn decode_compatible(interaction: &HttpInteraction) -> Vec<StreamEvent> {
         }
     }
     for frame in parser.finish() {
+        let frame = frame.expect("compatible trailing SSE frame is bounded");
         events.extend(
             translator
                 .frame(&frame.data)

@@ -212,7 +212,7 @@ fn views_permission_prompt_highlights_the_cursor_from_the_palette() {
     let mut host = DialogHost::new(context.clone(), Box::new(base));
     host.open(Box::new(prompt("bash", json!({}))));
     let buffer = render_offscreen(&mut host, 60, 20).expect("infallible");
-    let expected = ratatui::style::Color::from(context.palette.primary);
+    let expected = ratatui::style::Color::from(context.palette().primary);
     let highlighted = (0..buffer.area.height)
         .any(|y| (0..buffer.area.width).any(|x| buffer[(x, y)].bg == expected));
     assert!(

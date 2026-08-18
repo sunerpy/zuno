@@ -104,6 +104,24 @@ const CHANNELS: &[ChannelGate] = &[
         ".send(CatalogEvent::ToolsChanged { server })",
     ),
     gate(
+        "mcp-lifecycle-events",
+        "zuno-mcp/src/lifecycle.rs",
+        "let (events, _) = broadcast::channel(EVENT_CAPACITY);",
+        "EVENT_CAPACITY=64",
+        Policy::BroadcastLag,
+        "zuno-mcp/src/lifecycle.rs",
+        "fn publish(&self, snapshot: McpServerSnapshot) { let _receivers = self.inner.events.send(McpServerEvent::StateChanged { snapshot }); }",
+    ),
+    gate(
+        "mcp-lifecycle-cancel",
+        "zuno-mcp/src/lifecycle.rs",
+        "let (cancel, _receiver) = watch::channel(false);",
+        "latest value",
+        Policy::LatestValue,
+        "zuno-mcp/src/lifecycle.rs",
+        "if operation.kind == OperationKind::Connect && !enabled { let _replaced = operation.cancel.send(true);",
+    ),
+    gate(
         "lsp-manager-events",
         "zuno-lsp/src/manager.rs",
         "let (events, _) = broadcast::channel(64);",
@@ -191,7 +209,7 @@ const CHANNELS: &[ChannelGate] = &[
         "PROMPT_CHANNEL_CAPACITY=1",
         Policy::RefuseNewest,
         "zuno-tui/src/views/session.rs",
-        "prompts.try_send(text.clone())",
+        "match prompts.try_send(submission) { Ok(()) => self.mark_turn_accepted(),",
     ),
     gate(
         "tui-picker-selections",
@@ -228,6 +246,51 @@ const CHANNELS: &[ChannelGate] = &[
         Policy::RefuseNewest,
         "zuno-cli/src/cmd/tui_lsp.rs",
         "let _sent = reports.try_send(Report::unchecked(display));",
+    ),
+    gate(
+        "tui-questions",
+        "zuno-cli/src/cmd/tui_question.rs",
+        "let (waiting, pending) = mpsc::channel(QUESTION_CHANNEL_CAPACITY);",
+        "QUESTION_CHANNEL_CAPACITY=8",
+        Policy::LosslessBlock,
+        "zuno-cli/src/cmd/tui_question.rs",
+        ".send(PendingQuestion {",
+    ),
+    gate(
+        "tui-prompt-history",
+        "zuno-cli/src/cmd/tui.rs",
+        "let (history_sender, history_receiver) = mpsc::channel(PROMPT_HISTORY_CHANNEL_CAPACITY);",
+        "PROMPT_HISTORY_CHANNEL_CAPACITY=16",
+        Policy::RefuseNewest,
+        "zuno-tui/src/views/editor.rs",
+        "let _recorded = sink.try_send(text.to_owned());",
+    ),
+    gate(
+        "tui-editor-requests",
+        "zuno-cli/src/cmd/tui.rs",
+        "let (editor_sender, editor_receiver) = mpsc::channel(EDITOR_CHANNEL_CAPACITY);",
+        "EDITOR_CHANNEL_CAPACITY=1",
+        Policy::RefuseNewest,
+        "zuno-tui/src/views/session.rs",
+        "requests.try_send(request)",
+    ),
+    gate(
+        "tui-editor-results",
+        "zuno-cli/src/cmd/tui.rs",
+        "let (editor_result_sender, editor_result_receiver) = mpsc::channel(EDITOR_CHANNEL_CAPACITY);",
+        "EDITOR_CHANNEL_CAPACITY=1",
+        Policy::LosslessBlock,
+        "zuno-cli/src/cmd/tui.rs",
+        "results.send(outcome).await",
+    ),
+    gate(
+        "tui-editor-shutdown",
+        "zuno-cli/src/cmd/tui.rs",
+        "let (editor_shutdown, editor_shutdown_source) = watch::channel(false);",
+        "latest value",
+        Policy::LatestValue,
+        "zuno-cli/src/cmd/tui.rs",
+        "editor_shutdown.send(true)",
     ),
     excluded(
         "plugin-wasm-completion",
@@ -295,7 +358,7 @@ fn source_channel_inventory_matches_the_declared_registry() {
             .iter()
             .filter(|entry| entry.exclusion.is_none())
             .count(),
-        21
+        28
     );
     assert_eq!(
         CHANNELS
@@ -368,6 +431,14 @@ channel_gate!(
     "mcp-remote-refresh"
 );
 channel_gate!(mcp_catalog_events_lag_one_subscriber, "mcp-catalog-events");
+channel_gate!(
+    mcp_lifecycle_events_lag_one_subscriber,
+    "mcp-lifecycle-events"
+);
+channel_gate!(
+    mcp_lifecycle_cancel_keeps_latest_value,
+    "mcp-lifecycle-cancel"
+);
 channel_gate!(lsp_manager_events_lag_one_subscriber, "lsp-manager-events");
 channel_gate!(lsp_server_changed_keeps_latest_value, "lsp-server-changed");
 channel_gate!(
@@ -417,6 +488,13 @@ channel_gate!(
     "tui-terminal-events"
 );
 channel_gate!(tui_prompts_refuse_the_newest_prompt, "tui-prompts");
+channel_gate!(tui_questions_apply_backpressure, "tui-questions");
+channel_gate!(tui_editor_requests_refuse_the_newest, "tui-editor-requests");
+channel_gate!(tui_editor_results_apply_backpressure, "tui-editor-results");
+channel_gate!(
+    tui_editor_shutdown_keeps_latest_value,
+    "tui-editor-shutdown"
+);
 
 #[cfg(target_os = "linux")]
 #[test]
