@@ -46,6 +46,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 pub mod ambient;
 pub mod autocomplete;
 pub mod basics;
+pub mod diagnostics;
 pub mod dialog;
 pub mod diff;
 pub mod editor;

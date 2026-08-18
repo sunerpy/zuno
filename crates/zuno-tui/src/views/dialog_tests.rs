@@ -887,6 +887,19 @@ fn base_forms(context: &ViewContext) -> Vec<Box<dyn Dialog>> {
             "heading",
             "text",
         )),
+        // The two `§8.7` panels join the derived guard rather than getting one of their
+        // own. Both claim their *opening* action as a close — `status_view` and
+        // `debug_view` — which only resolves while the panel is open if the screen's
+        // static chain carries those scopes, and that registration is the exact thing
+        // `editor_open` was missing.
+        Box::new(crate::views::diagnostics::StatusPanel::new(
+            context.clone(),
+            Vec::new(),
+        )),
+        Box::new(crate::views::diagnostics::DebugPanel::new(
+            context.clone(),
+            crate::views::diagnostics::DebugFacts::default(),
+        )),
     ]
 }
 
@@ -908,7 +921,10 @@ fn views_dialog_every_action_a_base_form_consumes_resolves_while_it_is_open() {
     let mut offences = Vec::new();
     let mut checked = 0;
 
-    for (index, id) in ["confirm", "alert", "prompt"].into_iter().enumerate() {
+    for (index, id) in ["confirm", "alert", "prompt", "status", "debug"]
+        .into_iter()
+        .enumerate()
+    {
         // The chain a key actually resolves against while this dialog owns the keyboard:
         // the host's own list first, then the screen's static one. Asked of the host so
         // the test cannot disagree with production about what is in scope.
@@ -998,8 +1014,8 @@ fn views_dialog_every_action_a_base_form_consumes_resolves_while_it_is_open() {
         }
     }
     assert!(
-        checked >= 12,
-        "the dialog scope guard checked only {checked} actions across three forms, so it is \
+        checked >= 24,
+        "the dialog scope guard checked only {checked} actions across five forms, so it is \
          not finding what it exists to check"
     );
     assert!(offences.is_empty(), "{}", offences.join("\n"));

@@ -344,7 +344,11 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         // and the keybinding reference has to list what the *user's* keymap resolved
         // rather than the shipped defaults.
         .with_keymap(keymap.clone());
-    facts.describe(&mut screen, host.tool_count());
+    facts.describe(
+        &mut screen,
+        host.tool_count(),
+        RuntimeIdentity::resolve(host.session_id(), plugins.as_ref(), environment.resolved()),
+    );
     // Theme fallback is recoverable, unlike an unreadable or malformed config file.
     // Put its diagnostic in the transcript rather than stderr: the alternate screen
     // would hide a pre-raw warning until shutdown, while this is visible on frame one.
@@ -701,7 +705,32 @@ impl SessionFacts {
     }
 
     /// State them on the screen's welcome surface, status strip and ambient panel.
-    fn describe(self, screen: &mut SessionScreen, tools: usize) {
+    fn describe(self, screen: &mut SessionScreen, tools: usize, runtime: RuntimeIdentity) {
+        // Built before the moves below, which hand `lsp` to the ambient panel. The MCP
+        // group is deliberately absent: the screen reads that from its live projection at
+        // open time, so the census cannot state a connection state the MCP dialog has
+        // already moved on from.
+        screen.set_diagnostics(
+            vec![
+                zuno_tui::views::diagnostics::Group::new("LSP servers", self.lsp.clone()),
+                zuno_tui::views::diagnostics::Group::new("Plugins", runtime.plugins),
+            ],
+            zuno_tui::views::diagnostics::DebugFacts {
+                build: Some(crate::version::BUILD_ID.to_owned()),
+                version: Some(self.version.clone()),
+                channel: Some(zuno_paths::files::installation_channel().to_owned()),
+                os: Some(format!(
+                    "{} {}",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                )),
+                terminal: runtime.terminal,
+                session: Some(runtime.session),
+                model: Some(self.model.clone()),
+                agent: Some(self.agent.clone()),
+                directory: (!self.directory.is_empty()).then(|| self.directory.clone()),
+            },
+        );
         screen
             .transcript_mut()
             .transcript_mut()
@@ -733,6 +762,58 @@ impl SessionFacts {
         ambient.lsp = self.lsp;
         ambient.mcp = self.mcp;
         ambient.skills = self.skills;
+    }
+}
+
+/// The facts `§8.7`'s panels need that only exist once the turn host is open.
+///
+/// Separate from [`SessionFacts`] because that value is resolved *before* raw mode and
+/// before the host is created, and the session id does not exist until then.
+struct RuntimeIdentity {
+    session: String,
+    plugins: Vec<zuno_tui::views::ambient::Service>,
+    terminal: Option<String>,
+}
+
+impl RuntimeIdentity {
+    /// Read the host-derived halves of the census and the debug report.
+    ///
+    /// `TERM_PROGRAM` before `TERM`: the former names the emulator (`tmux`,
+    /// `WezTerm`), while the latter names its termcap entry (`xterm-256color`), and
+    /// several unrelated emulators report the same `TERM`. Neither is guaranteed, so an
+    /// absent value is omitted rather than guessed.
+    fn resolve(
+        session: &str,
+        plugins: Option<&std::sync::Arc<super::plugin_runtime::PluginRuntime>>,
+        env: &zuno_paths::Env,
+    ) -> Self {
+        use zuno_tui::views::ambient::{Health, Service};
+        let plugins = plugins
+            .map(|runtime| {
+                runtime
+                    .census()
+                    .into_iter()
+                    .map(|(id, hooks)| {
+                        let detail = if hooks.is_empty() {
+                            String::from("no hooks")
+                        } else {
+                            hooks.join(", ")
+                        };
+                        // `Ready`, because a plugin in this list is loaded: the load either
+                        // succeeded or the plugin is not here to be listed.
+                        Service::new(id, Health::Ready).detailed(detail)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            session: session.to_owned(),
+            plugins,
+            terminal: env
+                .value("TERM_PROGRAM")
+                .or_else(|| env.value("TERM"))
+                .map(str::to_owned),
+        }
     }
 }
 

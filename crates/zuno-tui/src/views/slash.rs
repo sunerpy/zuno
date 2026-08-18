@@ -216,6 +216,14 @@ const UI_SPECS: &[UiSpec] = &[
         aliases: &[],
     },
     UiSpec {
+        action: "status_view",
+        aliases: &[],
+    },
+    UiSpec {
+        action: "debug_view",
+        aliases: &[],
+    },
+    UiSpec {
         action: "prompt_skills",
         aliases: &["skill"],
     },
