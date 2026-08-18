@@ -1,6 +1,7 @@
 //! Model Context Protocol client: stdio and remote transports, tools, resources, prompts.
 
 pub mod catalog;
+mod lifecycle;
 mod oauth;
 mod protocol;
 pub mod remote;
@@ -11,6 +12,11 @@ pub use catalog::{
     LIST_RESOURCE_TEMPLATES_TOOL, LIST_RESOURCES_TOOL, MAX_RESOURCE_BLOB_BYTES, PromptArgument,
     PromptDefinition, READ_RESOURCE_TOOL, RESOURCE_TOOLS, RefreshError, ResourceContents,
     ResourceDefinition, ResourceTemplate, ServerStatus, resource_permission_patterns,
+};
+
+pub use lifecycle::{
+    McpConnectOutcome, McpConnection, McpConnector, McpLifecycleError, McpLifecycleOptions,
+    McpServerController, McpServerEvent, McpServerSnapshot, McpServerState,
 };
 
 pub use remote::{AuthorizationRequest, RemoteClient, RemoteConnect, RemoteError, RemoteTransport};
