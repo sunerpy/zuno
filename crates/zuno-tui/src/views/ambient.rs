@@ -26,7 +26,7 @@
 //! [`SIDEBAR_WIDTH`] is why the threshold is where it is.
 
 use crate::app::{AppEvent, Component, EventResult};
-use crate::views::{ViewContext, fill, padded};
+use crate::views::{ViewContext, display_width, fill, padded, truncate};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -42,6 +42,14 @@ mod tests;
 /// Wide enough for `typescript-language-server` plus its state glyph without
 /// truncating, which is the longest name the shipped LSP registry can produce.
 pub const SIDEBAR_WIDTH: u16 = 34;
+
+/// The glyph that marks a git branch.
+///
+/// Declared here because this panel is where the field was first drawn, and
+/// [`crate::views::message::StatusView::BRANCH_GLYPH`] defers to it so the two surfaces
+/// that state the branch cannot drift to two different glyphs. Only the spacing differs
+/// between them, deliberately — see the footer that renders it.
+pub const BRANCH_GLYPH: &str = "⑂";
 
 /// The glyph marking a collapsible section that is open.
 pub const OPEN_GLYPH: &str = "▾";
@@ -155,17 +163,31 @@ pub const DETAIL_MIN_COLUMNS: usize = 6;
 ///
 /// The tail is kept because that is what identifies a path or a failure message; a cut
 /// at the other end preserves the prefix every sibling shares.
+///
+/// `width` is **columns**, and the ellipsis is charged one of them. Counting characters
+/// instead returned a string that satisfied the caller's arithmetic and still overran the
+/// panel by one column per wide glyph: a Chinese failure reason came back "short enough",
+/// was laid out flush against the right edge, and had its tail — the part this function
+/// exists to preserve — clipped off the frame.
 #[must_use]
 pub fn elide_left(text: &str, width: usize) -> String {
-    let length = text.chars().count();
-    if length <= width {
+    if display_width(text) <= width {
         return text.to_owned();
     }
     if width <= 1 {
-        return text.chars().take(width).collect();
+        return truncate(text, width);
     }
-    let tail = text.chars().skip(length - (width - 1)).collect::<String>();
-    format!("…{tail}")
+    // Walk back from the end, keeping the longest suffix that fits beside the mark. Char
+    // boundaries are the step, so a two-column glyph is either taken whole or not at all —
+    // half of one is not something a terminal can draw.
+    let mut kept = text.len();
+    for (index, _) in text.char_indices().rev() {
+        if 1 + display_width(&text[index..]) > width {
+            break;
+        }
+        kept = index;
+    }
+    format!("{}{}", crate::views::message::ELIDED, &text[kept..])
 }
 
 /// Abbreviate a token count for a row that has no space for the grouped form.
@@ -282,7 +304,7 @@ impl SidebarView {
         };
         let head = format!("{glyph} {label}");
         let columns = usize::from(width);
-        let used = head.chars().count() + summary.chars().count();
+        let used = display_width(&head) + display_width(summary);
         let gap = columns.saturating_sub(used).max(1);
         Line::from(vec![
             Span::styled(head, self.context.title()),
@@ -293,26 +315,57 @@ impl SidebarView {
 
     fn service_row(&self, service: &Service, width: u16) -> Line<'static> {
         let columns = usize::from(width);
-        let head = format!("  {} {}", service.health.glyph(), service.name);
-        let head_len = head.chars().count();
+        // Truncated here rather than left to the frame: a name wider than the panel gets
+        // cut either way, and cutting it in columns is what keeps the cut off the middle
+        // of a wide glyph.
+        let head = truncate(
+            &format!("  {} {}", service.health.glyph(), service.name),
+            columns,
+        );
+        let head_columns = display_width(&head);
         let mut spans = vec![Span::styled(head, self.health_style(service.health))];
         // The detail is dropped, never abbreviated to a stub. A long server name leaves
         // two or three columns, and `…d` is not a shorter way of saying `configured` —
         // it is a fragment a reader has to decode, while the health glyph already
         // carries the state the detail was repeating.
-        let room = columns.saturating_sub(head_len + 1);
-        if !service.detail.is_empty() && room >= DETAIL_MIN_COLUMNS {
-            let detail = elide_left(&service.detail, room);
-            let pad = columns.saturating_sub(head_len + detail.chars().count());
-            spans.push(Span::styled(" ".repeat(pad), self.context.surface()));
-            spans.push(Span::styled(detail, self.context.muted()));
+        //
+        // Both the room and the pad are counted in columns. Counting characters made a
+        // CJK-named server lose its detail outright: `◐ 语言服务器` measured 9 characters
+        // where it occupies 14, so `正在启动中` was laid out starting past the right edge
+        // and the reason the server had not come up never reached the screen — the one
+        // thing the detail column exists to say.
+        let room = columns.saturating_sub(head_columns + 1);
+        let tail = if !service.detail.is_empty() && room >= DETAIL_MIN_COLUMNS {
+            elide_left(&service.detail, room)
+        } else {
+            String::new()
+        };
+        let pad = columns.saturating_sub(head_columns + display_width(&tail));
+        spans.push(Span::styled(" ".repeat(pad), self.context.surface()));
+        if !tail.is_empty() {
+            spans.push(Span::styled(tail, self.context.muted()));
         }
         Line::from(spans)
     }
 
+    /// What a section with nothing in it says, so every section says it the same way.
+    ///
+    /// `none` rather than `0`. [`Self::summarise`] already answers `none` for an empty
+    /// server list, so a panel that printed `Skills 0` two sections below `MCP none` made a
+    /// reader stop and work out whether the two were reporting the same thing. They are.
+    pub const EMPTY_SECTION: &'static str = "none";
+
+    /// How a section states a plain count, with zero spelled [`Self::EMPTY_SECTION`].
+    fn tally(total: usize) -> String {
+        if total == 0 {
+            return Self::EMPTY_SECTION.to_owned();
+        }
+        total.to_string()
+    }
+
     fn summarise(services: &[Service]) -> String {
         if services.is_empty() {
-            return String::from("none");
+            return Self::EMPTY_SECTION.to_owned();
         }
         let faulted = services
             .iter()
@@ -429,7 +482,7 @@ impl SidebarView {
         lines.push(blank());
         lines.push(self.heading(
             "Skills",
-            &format!("{}", self.ambient.skills.len()),
+            &Self::tally(self.ambient.skills.len()),
             Some(self.expanded.skills),
             width,
         ));
@@ -467,9 +520,23 @@ impl SidebarView {
                 width,
                 self.context.muted(),
             ));
-            if let Some(branch) = &self.ambient.branch {
-                lines.push(padded(&format!("⑂ {branch}"), width, self.context.muted()));
-            }
+        }
+        if let Some(branch) = &self.ambient.branch {
+            // Its own condition, not nested under the directory. A branch is a fact about
+            // the checkout and stays true whether or not the host resolved a display path,
+            // and the nesting meant the one field that changes as a user works could be
+            // suppressed by the absence of the one that does not.
+            //
+            // Written `⑂ main`, spaced, where the status strip writes `⑂main` tight
+            // (`message.rs::BRANCH_GLYPH`). Both surfaces state the branch and the
+            // difference is deliberate: the strip compacts every segment because it shares
+            // one row with the turn state, while this panel owns the row and the space is
+            // what stops the glyph reading as part of the name.
+            lines.push(padded(
+                &format!("{BRANCH_GLYPH} {branch}"),
+                width,
+                self.context.muted(),
+            ));
         }
         if let Some(version) = &self.ambient.version {
             lines.push(padded(
@@ -494,8 +561,8 @@ impl Component for SidebarView {
             let cell = &mut frame.buffer_mut()[(area.left(), y)];
             cell.set_style(
                 Style::new()
-                    .fg(self.context.palette.border_subtle.into())
-                    .bg(self.context.palette.background_panel.into()),
+                    .fg(self.context.palette().border_subtle.into())
+                    .bg(self.context.palette().background_panel.into()),
             );
             cell.set_symbol(ratatui::symbols::line::VERTICAL);
         }

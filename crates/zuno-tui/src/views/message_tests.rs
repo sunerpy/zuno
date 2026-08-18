@@ -26,6 +26,22 @@ fn view() -> TranscriptView {
     TranscriptView::new(ViewContext::defaults())
 }
 
+/// The terminal columns one produced [`Line`] occupies.
+///
+/// Measured on the `Line` rather than on a rendered buffer row, and that distinction is the
+/// whole point. `testkit::rows` yields one character per *cell*, so a wide glyph arrives as
+/// the glyph plus the blank continuation cell the terminal reserved — a string whose
+/// `display_width` is three for two columns. Worse, ratatui has already clipped anything
+/// that overran, so an assertion made after rendering can never see the overrun it is
+/// looking for. The `Line` is the last place the transcript's own arithmetic is still
+/// visible.
+fn line_columns(line: &Line<'_>) -> usize {
+    line.spans
+        .iter()
+        .map(|span| crate::views::display_width(&span.content))
+        .sum()
+}
+
 // ---------------------------------------------------------------------------
 // The off-screen assertion for the chat view
 // ---------------------------------------------------------------------------
@@ -91,7 +107,7 @@ fn views_chat_transcript_renders_every_part_kind_offscreen() {
         "the assistant's turn is missing its header:\n{joined}"
     );
     assert!(
-        joined.contains("Thinking (2.5s)"),
+        joined.contains("thought for 2.5s"),
         "the reasoning affordance did not render its duration:\n{joined}"
     );
     assert!(
@@ -129,17 +145,17 @@ fn views_chat_transcript_paints_from_the_palette_not_from_a_literal() {
     let body = &buffer[(2, 0)];
     assert_eq!(
         body.bg,
-        ratatui::style::Color::from(context.palette.background_panel),
+        ratatui::style::Color::from(context.palette().background_panel),
         "the transcript background did not come from the resolved palette"
     );
     assert_eq!(
         body.fg,
-        ratatui::style::Color::from(context.palette.text),
+        ratatui::style::Color::from(context.palette().text),
         "the transcript foreground did not come from the resolved palette"
     );
     assert_eq!(
         rule.fg,
-        ratatui::style::Color::from(context.palette.border_active),
+        ratatui::style::Color::from(context.palette().border_active),
         "the user's left rule did not come from the resolved palette"
     );
     assert_ne!(
@@ -242,8 +258,13 @@ fn views_retry_rollback_discards_the_interrupted_attempt() {
     );
 }
 
+/// A retry is rendered as a warning, not as an error.
+///
+/// §11.5 assigns `warning` to retry and `error` to failure, and the two must differ: a
+/// replay that goes on to succeed painted the same red as a dead turn means a user
+/// scanning the transcript for red cannot tell "the provider hiccuped" from "this failed".
 #[test]
-fn views_retry_rollback_notice_is_visible_in_the_error_colour() {
+fn views_retry_rollback_notice_is_visible_in_the_warning_colour() {
     let context = ViewContext::defaults();
     let mut view = TranscriptView::new(context.clone());
     view.handle_event(&AppEvent::Engine(started()));
@@ -259,7 +280,7 @@ fn views_retry_rollback_notice_is_visible_in_the_error_colour() {
     let rendered_rows = rows(&buffer);
     let retry_row = rendered_rows
         .iter()
-        .position(|row| row.contains("Retrying provider request (attempt 2/3)"))
+        .position(|row| row.contains("retry 2/3"))
         .expect("retry notice is rendered");
     assert!(
         !rendered_rows.join("\n").contains("discard me"),
@@ -269,9 +290,36 @@ fn views_retry_rollback_notice_is_visible_in_the_error_colour() {
     // would read the rule's colour and never see the notice's.
     assert_eq!(
         buffer[(2, u16::try_from(retry_row).expect("test row fits u16"))].fg,
-        ratatui::style::Color::from(context.palette.error),
-        "retry notice did not use the theme's red/error colour"
+        ratatui::style::Color::from(context.palette().warning),
+        "retry notice did not use the theme's warning colour"
     );
+    assert_ne!(
+        context.palette().warning,
+        context.palette().error,
+        "the theme collapsed warning and error, so this assertion proves nothing"
+    );
+}
+
+/// The retry notice survives the narrowest terminal the layout supports.
+///
+/// The sentence it replaced ran to 45 columns and was cut after `attempt 2` at 40, which
+/// discarded the `2/3` the row existed to state — a notice whose only payload is the part
+/// that gets clipped is worse than no notice, because it looks complete.
+#[test]
+fn views_retry_notice_states_its_count_at_the_narrowest_width() {
+    let mut view = view();
+    view.handle_event(&AppEvent::Engine(started()));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::RetryRollback {
+        attempt: 2,
+        max: 3,
+    })));
+    for width in [40_u16, 60, 80, 120, 200] {
+        let joined = draw(&mut view, width, 8).join("\n");
+        assert!(
+            joined.contains("retry 2/3"),
+            "the retry count did not survive {width} columns:\n{joined}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -403,7 +451,7 @@ fn views_reasoning_summary_drops_a_markdown_heading_and_truncates() {
 fn views_thinking_style_is_the_theme_opacity_composite_not_the_raw_warning() {
     let context = ViewContext::defaults();
     let thinking = context.thinking().fg.expect("a foreground");
-    let warning = ratatui::style::Color::from(context.palette.warning);
+    let warning = ratatui::style::Color::from(context.palette().warning);
     assert_ne!(
         thinking, warning,
         "thinkingOpacity was ignored, so reasoning is indistinguishable from a warning"
@@ -1062,6 +1110,288 @@ fn views_status_strip_omits_a_cache_column_a_provider_never_reported() {
     );
 }
 
+/// The strip's rendered text, as one string.
+fn strip(view: &StatusView, width: u16) -> String {
+    view.line(width)
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+/// A status strip carrying a branch, a cost, and one step of token usage.
+fn priced_strip() -> StatusView {
+    priced_strip_in(ViewContext::defaults())
+}
+
+/// A context whose configuration rebinds `app_exit` to `spelling`.
+///
+/// Built the way `welcome_tests` builds its rebound context, because the whole claim
+/// under test is that these two surfaces read the same override the same way.
+fn rebound_exit(spelling: &str) -> ViewContext {
+    let mut config = crate::config::ResolvedTuiConfig::default();
+    config.keybinds.insert(
+        String::from("app_exit"),
+        crate::config::BindingValue::parse(spelling),
+    );
+    let registry = crate::theme::ThemeRegistry::new();
+    let resolved = registry.resolve(crate::theme::DEFAULT_THEME, crate::theme::Mode::Dark);
+    ViewContext::new(&resolved, config)
+}
+
+/// [`priced_strip`] over an arbitrary context, so the width rungs can be re-measured
+/// against a rebound exit key without duplicating the fixture.
+fn priced_strip_in(context: ViewContext) -> StatusView {
+    let mut view = StatusView::new(context);
+    view.describe("build", "gpt-5");
+    // A turn is in flight, which is both when a running cost is worth reading and what
+    // keeps ` · idle` off the state — the widths below are chosen against this state.
+    view.mark_running();
+    view.set_git_branch("feature/status-cost-strip");
+    view.set_cost("$1.23");
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::TokenUsage {
+        input_tokens: Some(3_000),
+        output_tokens: Some(750),
+        cache_read_input_tokens: Some(30),
+        cache_write_input_tokens: Some(15),
+    })));
+    view
+}
+
+#[test]
+fn views_status_strip_sheds_the_branch_then_the_counts_then_the_cost_before_the_exit_key() {
+    let view = priced_strip();
+    let branch = format!("{}feature/status-cost-strip", StatusView::BRANCH_GLYPH);
+
+    // Wide: every field is on the row, and the two new ones sit either side of nothing
+    // they displaced — the exit key is still the rightmost thing on it.
+    let wide = strip(&view, 200);
+    assert!(
+        wide.contains(&branch),
+        "the branch never rendered: [{wide}]"
+    );
+    assert!(wide.contains("$1.23"), "the cost never rendered: [{wide}]");
+    assert!(wide.contains("↑3,000 ↓750 ⚡45"), "[{wide}]");
+    assert!(wide.trim_end().ends_with(StatusView::EXIT_HINT), "[{wide}]");
+
+    // 80: the branch goes first. It is the only field the ambient sidebar also prints,
+    // so it is the only one whose loss costs the user nothing they cannot read elsewhere.
+    let at_80 = strip(&view, 80);
+    assert!(
+        !at_80.contains(&branch),
+        "the branch outranked the cost it should yield to: [{at_80}]"
+    );
+    assert!(at_80.contains("↑3,000 ↓750 ⚡45"), "[{at_80}]");
+    assert!(at_80.contains("$1.23"), "[{at_80}]");
+    assert!(at_80.contains(StatusView::EXIT_HINT), "[{at_80}]");
+
+    // 50: the raw counts go next, and the cost — their summary — outlives them.
+    let at_50 = strip(&view, 50);
+    assert!(
+        !at_50.contains("↑3,000"),
+        "the counts outranked the cost that summarises them: [{at_50}]"
+    );
+    assert!(
+        at_50.contains("$1.23"),
+        "the cost went before the counts it summarises: [{at_50}]"
+    );
+    assert!(at_50.contains(StatusView::EXIT_HINT), "[{at_50}]");
+
+    // 40: only the exit key. Both new fields have now yielded to it, which is the whole
+    // ranking claim: the key is the way out, and everything else on the row is a report.
+    let at_40 = strip(&view, 40);
+    assert!(
+        at_40.contains(StatusView::EXIT_HINT),
+        "a new field was kept at the exit key's expense: [{at_40}]"
+    );
+    assert!(!at_40.contains("$1.23"), "[{at_40}]");
+    assert!(!at_40.contains(&branch), "[{at_40}]");
+    assert!(!at_40.contains("↑3,000"), "[{at_40}]");
+
+    // 20: 18 of the 20 columns are the exit key itself, so it cannot share the row with
+    // even the 6-column state — the pre-existing last rung drops it whole rather than
+    // truncating it. What this width proves is that nothing is left half-drawn: no
+    // fragment of the key, and no fragment of either new field.
+    let at_20 = strip(&view, 20);
+    assert!(
+        !at_20.contains("ctrl+c"),
+        "the exit key was truncated instead of dropped: [{at_20}]"
+    );
+    assert!(!at_20.contains('$'), "[{at_20}]");
+    assert!(
+        !at_20.contains(StatusView::BRANCH_GLYPH),
+        "a branch fragment survived the row that had no space for it: [{at_20}]"
+    );
+    assert_eq!(
+        at_20.trim(),
+        "build · gpt-5",
+        "the state is what a row too narrow for a trailer keeps: [{at_20}]"
+    );
+}
+
+/// The strip renders no cost segment until a caller pushes one, and never derives one
+/// from the token counts beside it: pricing is tiered and per-model, so a figure this
+/// layer computed would be confidently wrong exactly where it matters.
+#[test]
+fn views_status_strip_shows_no_cost_and_no_branch_until_a_caller_pushes_them() {
+    let mut view = StatusView::new(ViewContext::defaults());
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::TokenUsage {
+        input_tokens: Some(3_000),
+        output_tokens: Some(750),
+        cache_read_input_tokens: Some(30),
+        cache_write_input_tokens: Some(15),
+    })));
+    let text = strip(&view, 200);
+    assert!(
+        text.contains("↑3,000 ↓750 ⚡45"),
+        "the counts a cost would be derived from are not even there: [{text}]"
+    );
+    assert!(
+        !text.contains('$'),
+        "usage alone produced a price: [{text}]"
+    );
+    assert!(
+        !text.contains(StatusView::BRANCH_GLYPH),
+        "a branch nobody pushed rendered: [{text}]"
+    );
+
+    // Empty is absent, not adopted: a host with no branch or no pricing for the active
+    // model must not spend the row's columns on a blank segment and its separator.
+    view.set_git_branch("");
+    view.set_cost("");
+    let blanked = strip(&view, 200);
+    assert_eq!(
+        blanked, text,
+        "an empty push changed the row: [{blanked}] vs [{text}]"
+    );
+}
+
+/// Asserted on the drawn frame, not on [`StatusView::line`]'s return value: the defect
+/// this repo has already paid for was a status field that a component method reported
+/// correctly while the surface on screen still showed the old text.
+#[test]
+fn views_status_strip_draws_the_branch_and_the_cost_onto_the_frame() {
+    let mut view = priced_strip();
+    let buffer = render_offscreen(&mut view, 200, 1).expect("the offscreen backend is infallible");
+    let row = rows(&buffer).join("\n");
+    assert!(
+        row.contains(&format!(
+            "{}feature/status-cost-strip",
+            StatusView::BRANCH_GLYPH
+        )),
+        "the branch reached no cell of the frame:\n{row}"
+    );
+    assert!(row.contains("$1.23"), "the cost reached no cell:\n{row}");
+    assert!(row.contains(StatusView::EXIT_HINT), "\n{row}");
+}
+
+/// The defect, in one assertion: with `app_exit` rebound, three surfaces stated the way
+/// out and this was the one that had not been told.
+///
+/// Asserted on the drawn frame rather than on [`StatusView::exit_hint`] for the reason
+/// this repo has already paid for once — a component method reporting the right value
+/// while the surface on screen still shows the old text is exactly the shape of the
+/// defect that survived here before.
+#[test]
+fn views_status_strip_names_the_users_own_exit_key_not_the_shipped_default() {
+    let mut view = StatusView::new(rebound_exit("ctrl+q"));
+    let row = rows(&render_offscreen(&mut view, 60, 1).expect("infallible")).remove(0);
+    assert!(
+        row.contains("ctrl+q cancel/exit"),
+        "the strip advertised a key the user did not bind:\n{row}"
+    );
+    assert!(
+        !row.contains("ctrl+c"),
+        "the shipped spelling outlived the override, so one frame names two exit keys \
+         (welcome and the palette both say ctrl+q):\n{row}"
+    );
+}
+
+/// No override means no change: the row reads exactly what it read before this became
+/// derived, so the fix cannot have moved the default text by a column.
+#[test]
+fn views_status_strip_still_shows_the_shipped_exit_key_when_nothing_is_rebound() {
+    let mut view = StatusView::new(ViewContext::defaults());
+    let row = rows(&render_offscreen(&mut view, 60, 1).expect("infallible")).remove(0);
+    assert!(row.ends_with("ctrl+c cancel/exit"), "{row:?}");
+    assert!(row.ends_with(StatusView::EXIT_HINT), "{row:?}");
+}
+
+/// [`StatusView::EXIT_HINT`] is the fallback, so it has to keep agreeing with what the
+/// shipped table would resolve to — otherwise re-spelling `app_exit`'s first binding
+/// makes the disabled-binding path advertise a key the table no longer prefers, which is
+/// the same staleness this task removed, one branch deeper.
+#[test]
+fn views_status_strip_exit_fallback_matches_the_shipped_tables_own_first_spelling() {
+    let shipped = crate::views::key_label("app_exit", &ViewContext::defaults())
+        .expect("the shipped table binds app_exit");
+    assert_eq!(StatusView::EXIT_HINT, format!("{shipped} cancel/exit"));
+}
+
+/// A user who unbinds `app_exit` still gets told how to leave.
+///
+/// Not a fabricated value: [`crate::keybind::is_exit_chord`] reads the static table on
+/// purpose (`keybind.rs:191`), so `ctrl+c` exits with no binding pointing at it. The row
+/// that survives every width degradation must not be the one that goes silent about it.
+#[test]
+fn views_status_strip_keeps_naming_ctrl_c_when_the_user_unbound_the_exit_action() {
+    let mut view = StatusView::new(rebound_exit("none"));
+    let row = rows(&render_offscreen(&mut view, 60, 1).expect("infallible")).remove(0);
+    assert!(
+        row.contains(StatusView::EXIT_HINT),
+        "unbinding app_exit left the always-visible row silent about the only \
+         guaranteed way out:\n{row}"
+    );
+}
+
+/// The degradation chain is a property of the ranking, not of the hint's wording.
+///
+/// The same four widths as
+/// [`views_status_strip_sheds_the_branch_then_the_counts_then_the_cost_before_the_exit_key`],
+/// re-measured against a rebound key: `ctrl+q cancel/exit` is the same eighteen columns
+/// as the shipped spelling, so every rung must break at exactly the same place. What
+/// this pins is that deriving the text did not smuggle a width change into the ranking.
+#[test]
+fn views_status_strip_sheds_fields_in_the_same_order_when_the_exit_key_is_rebound() {
+    let view = priced_strip_in(rebound_exit("ctrl+q"));
+    let hint = "ctrl+q cancel/exit";
+    let branch = format!("{}feature/status-cost-strip", StatusView::BRANCH_GLYPH);
+
+    let wide = strip(&view, 200);
+    assert!(wide.contains(&branch), "[{wide}]");
+    assert!(wide.contains("↑3,000 ↓750 ⚡45"), "[{wide}]");
+    assert!(wide.contains("$1.23"), "[{wide}]");
+    assert!(wide.trim_end().ends_with(hint), "[{wide}]");
+
+    // 80: the branch first, exactly as with the shipped spelling.
+    let at_80 = strip(&view, 80);
+    assert!(!at_80.contains(&branch), "[{at_80}]");
+    assert!(at_80.contains("↑3,000 ↓750 ⚡45"), "[{at_80}]");
+    assert!(at_80.contains("$1.23"), "[{at_80}]");
+    assert!(at_80.contains(hint), "[{at_80}]");
+
+    // 40: only the exit key is left, and it is the rebound one.
+    let at_40 = strip(&view, 40);
+    assert!(
+        at_40.contains(hint),
+        "a field was kept at the rebound exit key's expense: [{at_40}]"
+    );
+    assert!(!at_40.contains("$1.23"), "[{at_40}]");
+    assert!(!at_40.contains("↑3,000"), "[{at_40}]");
+
+    // 20: dropped whole, never truncated — a rebound key name must not be halved either.
+    let at_20 = strip(&view, 20);
+    assert!(
+        !at_20.contains("ctrl+"),
+        "the rebound exit key was truncated instead of dropped: [{at_20}]"
+    );
+    assert!(
+        !at_20.contains("cancel"),
+        "the hint's verb survived without its key: [{at_20}]"
+    );
+    assert_eq!(at_20.trim(), "build · gpt-5", "[{at_20}]");
+}
+
 /// `working` and `waiting for you` are mutually exclusive claims about who the turn is
 /// blocked on, and the defect was that both rendered at once: the spinner said the process
 /// was busy while a permission prompt sat below asking the user to decide.
@@ -1177,4 +1507,1090 @@ fn views_status_strip_names_an_outstanding_ask_beside_a_resolved_turn() {
         !row.contains(StatusView::IDLE),
         "a blocked turn is not idle: {row:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Layout: wide glyphs, vertical rhythm, and the width sweep
+// ---------------------------------------------------------------------------
+
+/// A CJK prompt is wrapped in columns, so none of it is lost to the frame.
+///
+/// This is the defect the width sweep exists for. At 40 columns the transcript used to
+/// wrap after 38 *characters*, ratatui clipped the row at 38 *columns*, and everything
+/// past the cut was gone — not pushed to the next row, gone, because the wrap had already
+/// counted it as delivered. The assertion is therefore in two halves: no row may be wider
+/// than the frame, **and** the text must still all be there.
+#[test]
+fn views_transcript_wraps_wide_glyph_prose_without_losing_any_of_it() {
+    let prompt = "帮我把 diff viewer 接上文件树，顺便看一下 wrap 的宽字符行为";
+    for width in [40_u16, 60, 80, 120, 200] {
+        let mut view = view();
+        view.transcript_mut().push(Message::user(prompt));
+        for line in view.lines(width) {
+            assert_eq!(
+                line_columns(&line),
+                usize::from(width),
+                "a produced row measured {} columns in a {width}-column frame",
+                line_columns(&line)
+            );
+        }
+        // Every fragment of the prompt, across however many rows it took. Reconstructed
+        // from the produced spans and not from the buffer, because a buffer row interleaves
+        // the blank continuation cell the terminal reserves after each wide glyph: `帮我把`
+        // comes back as `帮 我 把` there and no substring search can tell that apart from
+        // three characters that really were spaced. The tail is the half that a character
+        // count used to drop.
+        let flowed = view
+            .lines(width)
+            .iter()
+            .flat_map(|line| line.spans.iter().skip(1))
+            .map(|span| span.content.trim_end().to_owned())
+            .collect::<Vec<_>>()
+            .join("");
+        for fragment in [
+            "帮我把",
+            "diff viewer",
+            "接上文件树",
+            "一下",
+            "wrap",
+            "宽字符行为",
+        ] {
+            assert!(
+                flowed.contains(fragment),
+                "{fragment:?} was never laid out at {width} columns: {flowed:?}"
+            );
+        }
+        // And the rows do reach real cells: an assertion that stopped at the produced lines
+        // would pass on a view that never rendered.
+        let rendered = draw(&mut view, width, 24);
+        assert!(
+            rendered.iter().any(|row| row.contains("wrap")),
+            "the produced rows never reached the buffer at {width} columns:\n{rendered:#?}"
+        );
+    }
+}
+
+/// An emoji is two columns wide too, and the tool row that carries one must still fit.
+#[test]
+fn views_transcript_keeps_emoji_rows_inside_the_frame() {
+    let mut view = view();
+    view.transcript_mut()
+        .push(Message::user("🎉 done 🚀 shipped 🔥 fast"));
+    view.handle_event(&AppEvent::Engine(started()));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::TextDelta(
+        String::from("結果は ✅ です — 🎯 命中"),
+    ))));
+    for width in [20_u16, 40, 60, 80] {
+        for line in view.lines(width) {
+            assert_eq!(
+                line_columns(&line),
+                usize::from(width),
+                "an emoji row measured {} columns in a {width}-column frame: {line:?}",
+                line_columns(&line)
+            );
+        }
+        // And it still reaches a real buffer without panicking.
+        let _ = draw(&mut view, width, 20);
+    }
+}
+
+/// The left rule runs unbroken through a multi-step turn, and breaks between speakers.
+///
+/// Both halves matter, and they are the same decision seen from two sides. The header is
+/// deliberately printed only on a change of speaker so that a five-step reply does not say
+/// `Assistant` five times — but the blank row that used to separate two assistant messages
+/// cut the rule into one fragment per step, which is exactly the continuity the suppressed
+/// header was relying on. So a same-role gap carries the rule and a role change does not,
+/// which is also what gives the eye two distinguishable grades of gap.
+#[test]
+fn views_transcript_rule_survives_a_step_boundary_and_breaks_between_speakers() {
+    let mut view = view();
+    view.transcript_mut().push(Message::user("go"));
+    for event in [
+        started(),
+        provider(StreamEvent::TextDelta(String::from("step one"))),
+        TurnEvent::AssistantMessageCreated {
+            step: 2,
+            message_id: String::from("msg_2"),
+        },
+        provider(StreamEvent::TextDelta(String::from("step two"))),
+    ] {
+        view.transcript_mut().observe(&event);
+    }
+    view.transcript_mut()
+        .push(Message::notice("warning: heads up"));
+
+    let rendered = draw(&mut view, 48, 20);
+    let one = rendered
+        .iter()
+        .position(|row| row.contains("step one"))
+        .expect("the first step is rendered");
+    let two = rendered
+        .iter()
+        .position(|row| row.contains("step two"))
+        .expect("the second step is rendered");
+    assert_eq!(
+        two,
+        one + 2,
+        "the two steps are not separated by exactly one row:\n{rendered:#?}"
+    );
+    let step_gap = &rendered[one + 1];
+    assert!(
+        step_gap.starts_with(Role::Assistant.marker()),
+        "the gap inside one reply dropped the rule, so the turn reads as two: {step_gap:?}"
+    );
+    assert!(
+        step_gap.trim().len() <= Role::Assistant.marker().len(),
+        "the gap row carries content as well as the rule: {step_gap:?}"
+    );
+
+    let session = rendered
+        .iter()
+        .position(|row| row.contains("Session"))
+        .expect("the notice's header is rendered");
+    let speaker_gap = &rendered[session - 1];
+    assert!(
+        speaker_gap.trim().is_empty(),
+        "the change of speaker is not marked by a blank row: {speaker_gap:?}"
+    );
+    assert!(
+        !speaker_gap.starts_with(Role::Assistant.marker())
+            && !speaker_gap.starts_with(Role::System.marker()),
+        "the change of speaker kept a rule, so it reads like another step: {speaker_gap:?}"
+    );
+}
+
+/// Collapsed reasoning costs one row, and says whether it has finished.
+///
+/// Two rows was the previous form: a header plus an indented summary. Reasoning arrives on
+/// every step of every turn, so at four steps that is eight rows of secondary content ahead
+/// of an answer that might be three. The summary moves onto the header instead.
+#[test]
+fn views_collapsed_reasoning_is_one_row_and_reports_its_tense() {
+    let mut view = view();
+    view.handle_event(&AppEvent::Engine(started()));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ReasoningDelta(
+        String::from("## Approach\nread the file first\nthen decide"),
+    ))));
+
+    let streaming = draw(&mut view, 60, 12);
+    let live = streaming
+        .iter()
+        .filter(|row| row.contains("thinking…") || row.contains("thought"))
+        .count();
+    assert_eq!(
+        live, 1,
+        "collapsed reasoning spent more than one row:\n{streaming:#?}"
+    );
+    let header = streaming
+        .iter()
+        .find(|row| row.contains("thinking…"))
+        .expect("a block still receiving deltas says so in the present tense");
+    assert!(
+        header.contains("Approach"),
+        "the one row it gets does not say what the reasoning is about: {header:?}"
+    );
+    assert!(
+        !header.contains("thought for"),
+        "an unfinished block claimed a duration it has not been told: {header:?}"
+    );
+
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ReasoningDone {
+        duration_secs: 12.0,
+    })));
+    let done = draw(&mut view, 60, 12).join("\n");
+    assert!(
+        done.contains("thought for 12.0s"),
+        "a finished block did not switch to the past tense with its duration:\n{done}"
+    );
+}
+
+/// A summary is dropped rather than wrapped when the row cannot hold it.
+///
+/// Wrapping it would spend the second row the one-row form exists to save, and the glyph
+/// plus the duration are what the row is actually for.
+#[test]
+fn views_collapsed_reasoning_drops_a_summary_that_would_not_fit() {
+    let mut view = view();
+    view.handle_event(&AppEvent::Engine(started()));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ReasoningDelta(
+        String::from("a summary far too long for a narrow terminal to carry\nmore"),
+    ))));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ReasoningDone {
+        duration_secs: 1.0,
+    })));
+    let narrow = draw(&mut view, 30, 10);
+    let rows_used = narrow.iter().filter(|row| row.contains("thought")).count();
+    assert_eq!(
+        rows_used, 1,
+        "the summary took a row of its own:\n{narrow:#?}"
+    );
+    let joined = narrow.join("\n");
+    assert!(
+        joined.contains("thought for 1.0s"),
+        "the duration was dropped instead of the summary:\n{joined}"
+    );
+    assert!(
+        !joined.contains("summary far too long"),
+        "an unfittable summary was rendered anyway and clipped:\n{joined}"
+    );
+    for line in view.lines(30) {
+        assert_eq!(
+            line_columns(&line),
+            30,
+            "the collapsed row measured {} columns in a 30-column frame",
+            line_columns(&line)
+        );
+    }
+}
+
+/// The collapse notice is marked as elided, not as another collapsible header.
+///
+/// `▸` opens the block it labels, and a collapsed reasoning header a few rows above is
+/// using it for exactly that, so the same glyph on a truncation notice read as a second
+/// nested section. `…` is the mark this crate already uses for a cut.
+#[test]
+fn views_tool_output_overflow_is_marked_as_a_cut_not_as_a_header() {
+    let mut view = view();
+    view.handle_event(&AppEvent::Engine(started()));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseStart {
+        id: String::from("c1"),
+        name: String::from("bash"),
+    })));
+    view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
+        step: 1,
+        call_id: String::from("c1"),
+        name: String::from("bash"),
+        title: String::from("ls"),
+        output: (1..=9)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        diff: None,
+        is_error: false,
+    }));
+    let rendered = draw(&mut view, 60, 20);
+    let notice = rendered
+        .iter()
+        .find(|row| row.contains("more lines"))
+        .expect("the collapse notice is rendered");
+    assert!(
+        notice.contains(ELIDED),
+        "the notice does not mark itself as a cut: {notice:?}"
+    );
+    assert!(
+        !notice.contains(ThinkingDisplay::Collapsed.glyph()),
+        "the notice still borrows the reasoning header's expand glyph: {notice:?}"
+    );
+}
+
+/// The transcript renders at every supported width, and does not panic when squeezed.
+///
+/// 20x10 is §11.6's floor. The wide-glyph body is included because the arithmetic that
+/// breaks at a small width is the same arithmetic wide glyphs break.
+#[test]
+fn views_transcript_renders_at_every_width_without_overrunning_or_panicking() {
+    for (width, height) in [
+        (200_u16, 40_u16),
+        (120, 30),
+        (80, 24),
+        (60, 20),
+        (40, 16),
+        (20, 10),
+    ] {
+        let mut view = view();
+        view.transcript_mut().push(Message::user("测试宽字符 wrap"));
+        for event in [
+            started(),
+            provider(StreamEvent::ReasoningDelta(String::from(
+                "推理内容\n第二行",
+            ))),
+            provider(StreamEvent::TextDelta(String::from("回答 with ascii"))),
+            provider(StreamEvent::ToolUseStart {
+                id: String::from("c1"),
+                name: String::from("read"),
+            }),
+            TurnEvent::ToolDispatchCompleted {
+                step: 1,
+                call_id: String::from("c1"),
+                name: String::from("read"),
+                title: String::from("读取 crates/zuno-tui/src/views/message.rs"),
+                output: String::from("一行\n二行\n三行\n四行\n五行"),
+                diff: None,
+                is_error: false,
+            },
+            provider(StreamEvent::RetryRollback { attempt: 1, max: 3 }),
+        ] {
+            view.transcript_mut().observe(&event);
+        }
+        view.transcript_mut().push(Message::notice("warning: 注意"));
+        for line in view.lines(width) {
+            assert_eq!(
+                line_columns(&line),
+                usize::from(width),
+                "a row measured {} columns at {width}x{height}",
+                line_columns(&line)
+            );
+        }
+        // Then prove the rows reach a buffer of that size at all: §11.6's floor is 20x10,
+        // and a view that computes correct rows and panics on the way out is still broken.
+        let _ = draw(&mut view, width, height);
+    }
+}
+
+/// `wrap` measures columns, and never hangs on a glyph wider than the row.
+#[test]
+fn views_wrap_measures_columns_and_survives_a_one_column_row() {
+    // Six columns of CJK in a four-column row: two glyphs, then one.
+    assert_eq!(wrap("日本語", 4), vec!["日本", "語"]);
+    assert_eq!(wrap("日本語", 6), vec!["日本語"]);
+    // A two-column glyph cannot fit a one-column row. It is emitted alone rather than
+    // consuming zero bytes forever, which is what an unguarded `truncate` would do. The
+    // trailing empty row is the pre-existing shape of a word consumed exactly: it predates
+    // the column measurement and only occurs at width one, which no transcript body is
+    // ever laid out at.
+    assert_eq!(wrap("日本", 1), vec!["日", "本", ""]);
+    for row in wrap("帮我把 diff viewer 接上文件树", 12) {
+        assert!(
+            crate::views::display_width(&row) <= 12,
+            "wrap produced a row wider than it was asked for: {row:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P2-4: the argument summary reaches the frame
+// ---------------------------------------------------------------------------
+
+/// How far a row's body sits past the role's left rule, in columns.
+///
+/// Measured *after* the rule rather than from column zero, and that is the whole reason
+/// this helper exists: a naive `row.len() - row.trim_start().len()` returns zero for every
+/// transcript row, because the first character is `▌`, `│` or `▲` and none of them is
+/// whitespace. A first version of the indent assertions used exactly that and reported
+/// `0 > 0` for a pair of rows the rendered frame showed correctly inset — the test was
+/// wrong, not the layout.
+fn body_indent(row: &str) -> usize {
+    let body = row
+        .strip_prefix(Role::User.marker())
+        .or_else(|| row.strip_prefix(Role::Assistant.marker()))
+        .or_else(|| row.strip_prefix(Role::System.marker()))
+        .unwrap_or(row);
+    body.len() - body.trim_start().len()
+}
+
+/// Feed one complete tool call, arguments included, and return the drawn rows.
+fn tool_call(name: &str, arguments: &str, output: &str, diff: Option<&str>) -> Vec<String> {
+    tool_call_shown(name, arguments, output, diff, ToolDisplay::Collapsed)
+}
+
+/// [`tool_call`], with the output affordance set to `display`.
+///
+/// Expanded is a distinct fixture rather than a flag on the assertions, because the
+/// collapsed cap is only three rows: a diff assertion written against the collapsed view
+/// was looking for an added line that the cap had correctly withheld, and read as a
+/// missing-diff failure when the diff was in fact rendering.
+fn tool_call_shown(
+    name: &str,
+    arguments: &str,
+    output: &str,
+    diff: Option<&str>,
+    display: ToolDisplay,
+) -> Vec<String> {
+    let mut view = view();
+    if display == ToolDisplay::Expanded {
+        view.toggle_tool_output();
+    }
+    view.handle_event(&AppEvent::Engine(started()));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseStart {
+        id: String::from("c1"),
+        name: name.to_owned(),
+    })));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolInputDelta(
+        arguments.to_owned(),
+    ))));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseEnd)));
+    view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
+        step: 1,
+        call_id: String::from("c1"),
+        name: name.to_owned(),
+        // Deliberately a title that names the *kind* of work and drops the argument, which
+        // is what a real provider sends and what used to be all the row said.
+        title: String::from("Ran a tool"),
+        output: output.to_owned(),
+        diff: diff.map(str::to_owned),
+        is_error: false,
+    }));
+    draw(&mut view, 90, 30)
+}
+
+#[test]
+fn views_tool_row_names_the_argument_and_not_only_the_kind_of_work() {
+    // The P2-4 defect, stated as an assertion: `title` alone said `Read src/main.rs` for
+    // one call and `Read src/lib.rs` for the next only because the provider chose to put
+    // the path in its sentence — and for `glob`, `grep` and `bash` it did not. The
+    // arguments are the only reliable source, so the row is built from them.
+    let rendered = tool_call(
+        "read",
+        r#"{"filePath":"crates/zuno-tui/src/views/diff.rs"}"#,
+        "x",
+        None,
+    );
+    let joined = rendered.join("\n");
+    assert!(
+        joined.contains("read crates/zuno-tui/src/views/diff.rs"),
+        "the tool row did not name the file it read:\n{joined}"
+    );
+    assert!(
+        !joined.contains("Ran a tool"),
+        "the provider's generic title displaced the argument summary:\n{joined}"
+    );
+}
+
+#[test]
+fn views_tool_row_falls_back_to_the_title_when_the_arguments_never_parsed() {
+    // A completed call whose argument JSON never arrived still has the provider's sentence,
+    // and a sentence beats the bare wire name.
+    let mut view = view();
+    view.handle_event(&AppEvent::Engine(started()));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseStart {
+        id: String::from("c1"),
+        name: String::from("read"),
+    })));
+    view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
+        step: 1,
+        call_id: String::from("c1"),
+        name: String::from("read"),
+        title: String::from("Read something"),
+        output: String::from("x"),
+        diff: None,
+        is_error: false,
+    }));
+    let joined = draw(&mut view, 60, 12).join("\n");
+    assert!(
+        joined.contains("Read something"),
+        "a call with no parseable arguments lost the provider's title too:\n{joined}"
+    );
+}
+
+#[test]
+fn views_tool_arguments_accumulate_across_the_deltas_that_carry_them() {
+    // The provider writes the JSON in fragments, and this is the fold that keeps them.
+    // Nothing downstream of the engine carries the arguments — `ToolDispatchCompleted` has
+    // `title`, `output` and `diff` only — so if this fold is dropped, every per-tool
+    // summary silently reverts to the title.
+    let mut transcript = Transcript::new();
+    transcript.observe(&started());
+    transcript.observe(&provider(StreamEvent::ToolUseStart {
+        id: String::from("c1"),
+        name: String::from("bash"),
+    }));
+    for fragment in [r#"{"comm"#, r#"and":"cargo "#, r#"test"}"#] {
+        assert!(
+            transcript.observe(&provider(StreamEvent::ToolInputDelta(String::from(
+                fragment
+            )))),
+            "an argument fragment reported nothing changed, so the row would not redraw"
+        );
+    }
+    match &transcript.messages()[0].parts[0] {
+        MessagePart::Tool { arguments, .. } => {
+            assert_eq!(arguments, r#"{"command":"cargo test"}"#);
+        }
+        other => panic!("expected a tool part, found {other:?}"),
+    }
+}
+
+#[test]
+fn views_tool_row_of_each_tool_is_distinguishable_from_the_others() {
+    // The property the whole of §7.5 exists for. Six calls in one turn, each rendering a
+    // row that names what *it* did — the failure being six identical rows.
+    let mut view = view();
+    view.handle_event(&AppEvent::Engine(started()));
+    for (index, (name, arguments)) in [
+        ("read", r#"{"filePath":"src/a.rs"}"#),
+        ("grep", r#"{"pattern":"fn main"}"#),
+        ("bash", r#"{"command":"cargo build"}"#),
+        ("websearch", r#"{"query":"ratatui spans"}"#),
+        (
+            "todowrite",
+            r#"{"todos":[{"content":"ship it","status":"pending","priority":"high"}]}"#,
+        ),
+        ("memory", r#"{"target":"project","action":"add"}"#),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = format!("c{index}");
+        view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseStart {
+            id: id.clone(),
+            name: name.to_owned(),
+        })));
+        view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolInputDelta(
+            arguments.to_owned(),
+        ))));
+        view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
+            step: 1,
+            call_id: id,
+            name: name.to_owned(),
+            title: String::from("Ran a tool"),
+            output: String::new(),
+            diff: None,
+            is_error: false,
+        }));
+    }
+    let rendered = draw(&mut view, 90, 30);
+    for expected in [
+        "read src/a.rs",
+        "grep \"fn main\"",
+        "bash cargo build",
+        "websearch ratatui spans",
+        "todowrite 1 items · ship it",
+        "memory add project",
+    ] {
+        assert!(
+            rendered.iter().any(|row| row.contains(expected)),
+            "no row carried {expected:?}, so this call is indistinguishable from its \
+             siblings:\n{}",
+            rendered.join("\n")
+        );
+    }
+}
+
+#[test]
+fn views_tool_row_is_inset_one_column_past_the_prose_it_belongs_to() {
+    // §7.5's tool indent, asserted positionally rather than by searching for a label: the
+    // rule occupies column 0, the prose starts at column 2, and a tool row starts at 3.
+    let mut view = view();
+    view.handle_event(&AppEvent::Engine(started()));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::TextDelta(
+        String::from("plain prose"),
+    ))));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseStart {
+        id: String::from("c1"),
+        name: String::from("read"),
+    })));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolInputDelta(
+        String::from(r#"{"filePath":"src/a.rs"}"#),
+    ))));
+    let rendered = draw(&mut view, 60, 12);
+    let prose = rendered
+        .iter()
+        .find(|row| row.contains("plain prose"))
+        .expect("the prose row");
+    let tool = rendered
+        .iter()
+        .find(|row| row.contains("src/a.rs"))
+        .expect("the tool row");
+    assert!(
+        body_indent(tool) > body_indent(prose),
+        "the tool row is not inset past the prose, so it reads as another paragraph of \
+         the reply:\nprose {prose:?}\ntool  {tool:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P2-4: collapse, and its affordance
+// ---------------------------------------------------------------------------
+
+#[test]
+fn views_collapsed_tool_output_names_the_key_that_expands_it() {
+    // The eye-caught defect: the notice rendered `… 9 more lines` with nothing after it,
+    // because `key_label` reads the upstream table where `tool_details` is `none` — while
+    // this build binds it through `SHIPPED_DEFAULTS` and the key worked the whole time. A
+    // cap the user cannot discover how to lift is a cap that hides content permanently.
+    let rendered = tool_call(
+        "bash",
+        r#"{"command":"ls"}"#,
+        &(1..=9)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        None,
+    );
+    let notice = rendered
+        .iter()
+        .find(|row| row.contains("more lines"))
+        .expect("the collapse notice is rendered");
+    let key = crate::views::pressable_label("tool_details", &ViewContext::defaults())
+        .expect("this build binds tool_details");
+    assert!(
+        notice.contains(&key),
+        "the notice hides output without saying which key returns it — it must name the \
+         binding the running keymap resolved ({key}): {notice:?}"
+    );
+    assert!(
+        !notice.contains("<leader>"),
+        "the notice printed a leader token, which names no key a user can press: {notice:?}"
+    );
+}
+
+#[test]
+fn views_collapse_threshold_is_the_preview_row_count_and_the_notice_counts_the_rest() {
+    // The boundary, on both sides. One row under the cap must produce no notice at all —
+    // a notice reading `… 0 more lines` is worse than none — and one row over must state
+    // exactly how many were withheld.
+    let rows = |count: usize| {
+        let output = (1..=count)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        tool_call("bash", r#"{"command":"ls"}"#, &output, None).join("\n")
+    };
+    let under = rows(TOOL_OUTPUT_PREVIEW_ROWS);
+    assert!(
+        !under.contains("more lines"),
+        "output that fitted still claimed it was cut:\n{under}"
+    );
+    let over = rows(TOOL_OUTPUT_PREVIEW_ROWS + 1);
+    assert!(
+        over.contains("1 more lines"),
+        "one row over the cap did not report exactly one hidden row:\n{over}"
+    );
+    let far_over = rows(TOOL_OUTPUT_PREVIEW_ROWS + 12);
+    assert!(
+        far_over.contains("12 more lines"),
+        "the hidden count is wrong:\n{far_over}"
+    );
+}
+
+#[test]
+fn views_expanding_tool_output_lifts_the_cap_and_removes_the_notice() {
+    let mut view = view();
+    view.handle_event(&AppEvent::Engine(started()));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseStart {
+        id: String::from("c1"),
+        name: String::from("bash"),
+    })));
+    view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
+        step: 1,
+        call_id: String::from("c1"),
+        name: String::from("bash"),
+        title: String::from("ls"),
+        output: (1..=9)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        diff: None,
+        is_error: false,
+    }));
+    let collapsed = draw(&mut view, 60, 24).join("\n");
+    assert!(collapsed.contains("more lines"), "{collapsed}");
+    assert!(!collapsed.contains("line 9"), "{collapsed}");
+
+    view.toggle_tool_output();
+    let expanded = draw(&mut view, 60, 24).join("\n");
+    assert!(
+        expanded.contains("line 9"),
+        "expanding did not reveal the withheld rows:\n{expanded}"
+    );
+    assert!(
+        !expanded.contains("more lines"),
+        "the notice survived after the cap it describes was lifted:\n{expanded}"
+    );
+}
+
+#[test]
+fn views_a_single_enormous_line_is_reported_as_cut_rather_than_silently_clipped() {
+    // The other way output hides: one row to the row cap, a megabyte to the wrap. Without
+    // the character cap the wrap pays for the whole thing; without the *notice* the reader
+    // trusts a truncated line as complete.
+    let huge = "x".repeat(crate::views::tool::COLLAPSED_CHARS + 500);
+    let rendered = tool_call("bash", r#"{"command":"cat big"}"#, &huge, None).join("\n");
+    assert!(
+        rendered.contains("cut at"),
+        "an over-long single line was clipped with no notice, so the reader cannot tell \
+         it from a complete result:\n{rendered}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P2-4: a result that carries a patch renders as a diff
+// ---------------------------------------------------------------------------
+
+#[test]
+fn views_tool_result_renders_the_patch_field_and_not_only_a_diff_shaped_output() {
+    // The dropped-`diff` defect. `TurnEvent::ToolDispatchCompleted` carries the patch
+    // beside the output, `Transcript::latest_diff` reads it, and the *transcript* ignored
+    // it: `tool_output_lines` only ever diff-sniffed `output`, and every mutating tool's
+    // output is a sentence. So `edit` — the one tool that changes code — showed
+    // `applied 1 change` and nothing else, while the patch sat in the part unread.
+    let rendered = tool_call_shown(
+        "edit",
+        r#"{"filePath":"src/a.rs","oldString":"old();","newString":"new();"}"#,
+        "applied 1 change",
+        Some("@@ -1,3 +1,4 @@\n fn main() {\n-    old();\n+    new();\n }\n"),
+        ToolDisplay::Expanded,
+    );
+    let joined = rendered.join("\n");
+    assert!(
+        joined.contains("@@ -1,3 +1,4 @@"),
+        "the hunk header is missing, so the patch was not rendered as a diff:\n{joined}"
+    );
+    assert!(
+        rendered.iter().any(|row| row.contains("old();")),
+        "the removed line is missing:\n{joined}"
+    );
+    assert!(
+        rendered.iter().any(|row| row.contains("new();")),
+        "the added line is missing:\n{joined}"
+    );
+    // And it went through the real diff renderer, which is what puts line numbers on it —
+    // rather than through the prose path, which would print the patch text unstyled.
+    assert!(
+        rendered
+            .iter()
+            .any(|row| row.contains("1") && row.contains("fn main()")),
+        "the context row carries no line number, so this is unstyled prose rather than \
+         the diff view:\n{joined}"
+    );
+}
+
+#[test]
+fn views_a_diff_bearing_result_uses_the_diff_palette_not_the_muted_output_style() {
+    let mut view = view();
+    view.handle_event(&AppEvent::Engine(started()));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseStart {
+        id: String::from("c1"),
+        name: String::from("edit"),
+    })));
+    view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
+        step: 1,
+        call_id: String::from("c1"),
+        name: String::from("edit"),
+        title: String::from("Edit"),
+        output: String::from("applied 1 change"),
+        diff: Some(String::from("@@ -1,2 +1,2 @@\n-old\n+new\n")),
+        is_error: false,
+    }));
+    let context = ViewContext::defaults();
+    let added = ratatui::style::Color::from(context.palette().diff_added);
+    let painted = view.lines(60).into_iter().any(|line| {
+        line.spans
+            .iter()
+            .any(|span| span.style.fg == Some(added) && span.content.contains("new"))
+    });
+    assert!(
+        painted,
+        "the added line is not painted in the palette's diff colour, so the patch is \
+         rendering as plain output"
+    );
+}
+
+#[test]
+fn views_a_failed_tool_paints_its_output_as_an_error_below_the_call_row() {
+    // §7.5: the error hangs below the tool row rather than replacing it — the call is still
+    // worth naming — and it is painted as a failure rather than as quiet output.
+    let mut view = view();
+    view.handle_event(&AppEvent::Engine(started()));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseStart {
+        id: String::from("c1"),
+        name: String::from("bash"),
+    })));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolInputDelta(
+        String::from(r#"{"command":"false"}"#),
+    ))));
+    view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
+        step: 1,
+        call_id: String::from("c1"),
+        name: String::from("bash"),
+        title: String::from("false"),
+        output: String::from("exit status 1"),
+        diff: None,
+        is_error: true,
+    }));
+    let rendered = draw(&mut view, 60, 12);
+    let joined = rendered.join("\n");
+    assert!(
+        joined.contains("bash false"),
+        "the failing call stopped naming itself, so the error replaced the row instead of \
+         hanging below it:\n{joined}"
+    );
+    let context = ViewContext::defaults();
+    let error = ratatui::style::Color::from(context.palette().error);
+    let painted = view.lines(60).into_iter().any(|line| {
+        line.spans
+            .iter()
+            .any(|span| span.style.fg == Some(error) && span.content.contains("exit status 1"))
+    });
+    assert!(
+        painted,
+        "a failed call's output is painted as ordinary muted output, so it reads as noise \
+         rather than as the failure it is"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P2-5: reasoning is visually subordinate to the answer
+// ---------------------------------------------------------------------------
+
+#[test]
+fn views_reasoning_is_inset_past_the_answer_in_both_display_states() {
+    // §11.2's fourth item. Reasoning recurs on every step and is frequently longer than
+    // the reply, so flush with the prose it competes with the answer for the eye: the
+    // header sat exactly where the reply's first sentence sits.
+    let mut view = view();
+    view.handle_event(&AppEvent::Engine(started()));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ReasoningDelta(
+        String::from("weighing the options\nsecond thought"),
+    ))));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ReasoningDone {
+        duration_secs: 12.0,
+    })));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::TextDelta(
+        String::from("the answer"),
+    ))));
+
+    let indent = |rows: &[String], needle: &str| {
+        let row = rows
+            .iter()
+            .find(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("no row carried {needle:?} in {rows:#?}"));
+        body_indent(row)
+    };
+
+    let collapsed = draw(&mut view, 70, 16);
+    let answer = indent(&collapsed, "the answer");
+    assert!(
+        indent(&collapsed, "thought for") > answer,
+        "the collapsed reasoning header is flush with the answer, so it competes with it:\n{}",
+        collapsed.join("\n")
+    );
+
+    view.toggle_thinking();
+    let expanded = draw(&mut view, 70, 16);
+    assert!(
+        indent(&expanded, "second thought") > indent(&expanded, "thought for"),
+        "the reasoning body is not nested under its own header, so a long thought reads \
+         as the reply:\n{}",
+        expanded.join("\n")
+    );
+    assert!(
+        indent(&expanded, "second thought") > answer,
+        "the reasoning body is not subordinate to the answer:\n{}",
+        expanded.join("\n")
+    );
+}
+
+#[test]
+fn views_reasoning_body_is_dimmer_than_the_answer_and_the_answer_is_not_italic() {
+    // Colour and weight carry the same hierarchy the indent does, so a terminal that drops
+    // one still shows it. Asserted on the produced spans, because a rendered cell cannot
+    // report a modifier.
+    let mut view = view();
+    view.handle_event(&AppEvent::Engine(started()));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ReasoningDelta(
+        String::from("weighing the options"),
+    ))));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::TextDelta(
+        String::from("the answer"),
+    ))));
+    view.toggle_thinking();
+    let lines = view.lines(70);
+    let span_with = |needle: &str| {
+        lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.contains(needle))
+            .unwrap_or_else(|| panic!("no span carried {needle:?}"))
+            .clone()
+    };
+    let reasoning = span_with("weighing the options");
+    // `"answer"`, not `"the answer"`: markdown emits one span per word, so the assistant's
+    // prose arrives as `["the", " ", "answer"]` and no single span holds the phrase. The
+    // reasoning body is plain-wrapped and does keep its whole row in one span, which is why
+    // the two needles differ in shape.
+    let answer = span_with("answer");
+    assert!(
+        reasoning.style.add_modifier.contains(Modifier::ITALIC),
+        "the reasoning body is not italic, so one of the two hierarchy signals is missing"
+    );
+    assert!(
+        !answer.style.add_modifier.contains(Modifier::ITALIC),
+        "the answer is italic too, which erases the distinction"
+    );
+    assert_ne!(
+        reasoning.style.fg, answer.style.fg,
+        "reasoning and the answer are the same colour, so the transcript buries the reply"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P2-4/P2-5 at width: wide glyphs, and the narrow frames
+// ---------------------------------------------------------------------------
+
+#[test]
+fn views_a_cjk_tool_argument_stays_inside_the_frame_at_every_width() {
+    // The §11.5 rule on the surface P2-4 added. A CJK path measured in characters comes
+    // back "short enough", and ratatui then clips it — so the tail this row exists to show
+    // is discarded, and the row count the scroller trusts is wrong by the same factor.
+    for width in [200_u16, 120, 80, 60, 40, 20] {
+        let mut view = view();
+        view.handle_event(&AppEvent::Engine(started()));
+        view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseStart {
+            id: String::from("c1"),
+            name: String::from("read"),
+        })));
+        view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolInputDelta(
+            String::from(r#"{"filePath":"crates/文档/说明书/読み方.rs","offset":1,"limit":9}"#),
+        ))));
+        view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
+            step: 1,
+            call_id: String::from("c1"),
+            name: String::from("read"),
+            title: String::from("Read"),
+            output: String::from("说明\n読み\n混合 mixed 内容\nfourth"),
+            diff: None,
+            is_error: false,
+        }));
+        for line in view.lines(width) {
+            assert_eq!(
+                line_columns(&line),
+                usize::from(width),
+                "a CJK tool row measured {} columns at width {width}",
+                line_columns(&line)
+            );
+        }
+        // And it reaches a buffer of that size without panicking, including §11.6's floor.
+        let _ = draw(&mut view, width, if width == 20 { 10 } else { 24 });
+    }
+}
+
+#[test]
+fn views_a_tool_call_survives_the_smallest_supported_frame() {
+    // 20x10, §11.6's floor, with every part kind a tool call can bring: a summary too long
+    // for the row, a collapse notice too long for the row, and a diff.
+    let mut view = view();
+    view.handle_event(&AppEvent::Engine(started()));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseStart {
+        id: String::from("c1"),
+        name: String::from("edit"),
+    })));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolInputDelta(
+        String::from(r#"{"filePath":"crates/zuno-tui/src/views/message.rs","oldString":"a","newString":"b"}"#),
+    ))));
+    view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
+        step: 1,
+        call_id: String::from("c1"),
+        name: String::from("edit"),
+        title: String::from("Edit"),
+        output: String::from("applied"),
+        diff: Some(String::from(
+            "@@ -1,4 +1,4 @@\n context\n-removed line\n+added line\n more context\n",
+        )),
+        is_error: false,
+    }));
+    for line in view.lines(20) {
+        assert_eq!(
+            line_columns(&line),
+            20,
+            "a row overran the 20-column floor: {line:?}"
+        );
+    }
+    let rendered = draw(&mut view, 20, 10);
+    assert_eq!(rendered.len(), 10);
+}
+
+// ---------------------------------------------------------------------------
+// The eyeball probe: one realistic transcript, printed
+// ---------------------------------------------------------------------------
+
+/// Build the transcript every visual assertion below reads: a user prompt, an
+/// assistant reply with markdown, three tool calls (one long-output, one carrying a
+/// unified diff), and a reasoning block.
+fn realistic() -> TranscriptView {
+    let mut view = view();
+    view.transcript_mut()
+        .push(Message::user("帮我把 diff viewer 接上文件树"));
+    let long = (1..=12)
+        .map(|n| format!("crates/zuno-tui/src/views/file{n}.rs"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let patch = "@@ -1,3 +1,4 @@\n fn main() {\n-    old();\n+    new();\n+    extra();\n }\n";
+    for event in [
+        started(),
+        provider(StreamEvent::ReasoningStart),
+        provider(StreamEvent::ReasoningDelta(String::from(
+            "## Plan\nread the parser, then wire the tree",
+        ))),
+        provider(StreamEvent::ReasoningDone {
+            duration_secs: 12.0,
+        }),
+        provider(StreamEvent::TextDelta(String::from(
+            "## Approach\n\nI will do **two** things:\n\n- read `diff.rs`\n- wire the tree\n",
+        ))),
+        provider(StreamEvent::ToolUseStart {
+            id: String::from("c1"),
+            name: String::from("read"),
+        }),
+        provider(StreamEvent::ToolInputDelta(String::from(
+            r#"{"filePath":"crates/zuno-tui/src/views/diff.rs","offset":1,"limit":162}"#,
+        ))),
+        provider(StreamEvent::ToolUseEnd),
+        TurnEvent::ToolDispatchCompleted {
+            step: 1,
+            call_id: String::from("c1"),
+            name: String::from("read"),
+            title: String::from("Read diff.rs"),
+            output: String::from("pub fn parse(patch: &str) -> Vec<DiffLine> {"),
+            diff: None,
+            is_error: false,
+        },
+        provider(StreamEvent::ToolUseStart {
+            id: String::from("c2"),
+            name: String::from("glob"),
+        }),
+        provider(StreamEvent::ToolInputDelta(String::from(
+            r#"{"pattern":"**/*.rs","path":"crates/zuno-tui/src/views"}"#,
+        ))),
+        provider(StreamEvent::ToolUseEnd),
+        TurnEvent::ToolDispatchCompleted {
+            step: 1,
+            call_id: String::from("c2"),
+            name: String::from("glob"),
+            title: String::from("Find files"),
+            output: long,
+            diff: None,
+            is_error: false,
+        },
+        provider(StreamEvent::ToolUseStart {
+            id: String::from("c3"),
+            name: String::from("edit"),
+        }),
+        provider(StreamEvent::ToolInputDelta(String::from(
+            r#"{"filePath":"crates/zuno-tui/src/views/session.rs","oldString":"old();","newString":"new();"}"#,
+        ))),
+        provider(StreamEvent::ToolUseEnd),
+        TurnEvent::ToolDispatchCompleted {
+            step: 1,
+            call_id: String::from("c3"),
+            name: String::from("edit"),
+            title: String::from("Edit session.rs"),
+            output: String::from("applied 1 change"),
+            diff: Some(String::from(patch)),
+            is_error: false,
+        },
+        provider(StreamEvent::TextDelta(String::from(
+            "\nThe tree is wired now.",
+        ))),
+    ] {
+        view.transcript_mut().observe(&event);
+    }
+    view
+}
+
+#[test]
+#[ignore = "printer, not an assertion: run with --ignored --nocapture to eyeball the rendering"]
+fn views_transcript_visual_probe() {
+    for width in [80u16, 60, 40] {
+        println!("\n=========== width {width} ===========");
+        for line in realistic().lines(width) {
+            let text = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            println!("|{}|", text.trim_end());
+        }
+    }
 }
