@@ -28,7 +28,7 @@ use crate::views::dialog::{Dialog, DialogOutcome, DialogStep};
 use crate::views::{ViewContext, padded};
 use crossterm::event::KeyEvent;
 use ratatui::text::{Line, Span};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 
 #[cfg(test)]
 #[path = "picker_tests.rs"]
@@ -56,22 +56,254 @@ pub const SKILL_DIALOG_ID: &str = "prompt_skills";
 /// reused rather than a bespoke view so that filtering by name behaves the way it does
 /// everywhere else.
 #[must_use]
-pub fn mcp_list(
+pub fn mcp_list(context: ViewContext, servers: McpProjection) -> McpDialog {
+    McpDialog::new(context, servers)
+}
+
+/// Runtime-neutral lifecycle state shown by the MCP dialog and sidebar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpState {
+    Disabled,
+    Connecting,
+    Connected,
+    Disconnecting,
+    Failed(String),
+    NeedsAuth,
+    NeedsClientRegistration(String),
+}
+
+/// Complete plain-data projection of one configured MCP server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServer {
+    pub name: String,
+    pub state: McpState,
+    pub desired_enabled: bool,
+}
+
+impl McpServer {
+    fn detail(&self) -> String {
+        match &self.state {
+            McpState::Disabled => "○ Disabled".to_owned(),
+            McpState::Connecting => "◐ Connecting".to_owned(),
+            McpState::Connected => "● Connected".to_owned(),
+            McpState::Disconnecting => "◐ Disconnecting".to_owned(),
+            McpState::Failed(error) => format!("✗ Failed · {error}"),
+            McpState::NeedsAuth => "✗ Needs authentication".to_owned(),
+            McpState::NeedsClientRegistration(error) => {
+                format!("✗ Needs client registration · {error}")
+            }
+        }
+    }
+
+    /// Project lifecycle detail onto the sidebar's compact health vocabulary.
+    #[must_use]
+    pub fn service(&self) -> crate::views::ambient::Service {
+        use crate::views::ambient::{Health, Service};
+        let health = match self.state {
+            McpState::Connected => Health::Ready,
+            McpState::Connecting | McpState::Disconnecting => Health::Pending,
+            McpState::Disabled => Health::Disabled,
+            McpState::Failed(_) | McpState::NeedsAuth | McpState::NeedsClientRegistration(_) => {
+                Health::Faulted
+            }
+        };
+        Service::new(self.name.clone(), health).detailed(self.detail())
+    }
+}
+
+/// Explicit target emitted by the MCP dialog when Space is pressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpToggleRequest {
+    pub server: String,
+    pub desired_enabled: bool,
+}
+
+/// Shared, atomically replaced MCP projection. Rendering performs no I/O.
+#[derive(Debug, Clone, Default)]
+pub struct McpProjection(Arc<RwLock<Vec<McpServer>>>);
+
+impl McpProjection {
+    #[must_use]
+    pub fn new(servers: Vec<McpServer>) -> Self {
+        Self(Arc::new(RwLock::new(servers)))
+    }
+
+    pub fn replace(&self, servers: Vec<McpServer>) {
+        *self.0.write().unwrap_or_else(PoisonError::into_inner) = servers;
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<McpServer> {
+        self.0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty()
+    }
+}
+
+/// Live MCP server list. Unlike ordinary pickers, Space emits without closing it.
+pub struct McpDialog {
     context: ViewContext,
-    servers: Vec<crate::views::ambient::Service>,
-) -> SelectDialog {
-    let items = servers
-        .into_iter()
-        .map(|service| {
-            let detail = if service.detail.is_empty() {
-                String::new()
-            } else {
-                format!("{} · {}", service.health.glyph(), service.detail)
-            };
-            Item::new(service.name).described(detail)
-        })
-        .collect();
-    SelectDialog::new(MCP_DIALOG_ID, "MCP servers", context, items)
+    servers: McpProjection,
+    filter: String,
+    cursor: usize,
+    rows: usize,
+}
+
+impl McpDialog {
+    fn new(context: ViewContext, servers: McpProjection) -> Self {
+        Self {
+            context,
+            servers,
+            filter: String::new(),
+            cursor: 0,
+            rows: 10,
+        }
+    }
+
+    fn visible(&self) -> Vec<McpServer> {
+        let mut ranked = self
+            .servers
+            .snapshot()
+            .into_iter()
+            .filter_map(|server| {
+                let rank = score(&server.name, &self.filter)
+                    .into_iter()
+                    .chain(score(&server.detail(), &self.filter).map(|value| value / 2))
+                    .max()?;
+                Some((rank, server))
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_by_key(|(rank, server)| (std::cmp::Reverse(*rank), server.name.clone()));
+        ranked.into_iter().map(|(_, server)| server).collect()
+    }
+
+    fn selected(&self) -> Option<McpServer> {
+        self.visible().get(self.cursor).cloned()
+    }
+
+    fn clamp_cursor(&mut self) {
+        self.cursor = self.cursor.min(self.visible().len().saturating_sub(1));
+    }
+
+    fn move_cursor(&mut self, delta: isize) {
+        let length = self.visible().len();
+        if length > 0 {
+            self.cursor = ((self.cursor as isize + delta).rem_euclid(length as isize)) as usize;
+        }
+    }
+}
+
+impl Dialog for McpDialog {
+    fn id(&self) -> &'static str {
+        MCP_DIALOG_ID
+    }
+
+    fn title(&self) -> String {
+        let count = self.visible().len();
+        if self.filter.is_empty() {
+            format!("MCP servers ({count})")
+        } else {
+            format!("MCP servers ({count}) — {}", self.filter)
+        }
+    }
+
+    fn lines(&mut self, width: u16) -> Vec<Line<'static>> {
+        self.clamp_cursor();
+        let visible = self.visible();
+        if visible.is_empty() {
+            return vec![padded(" no matches", width, self.context.muted())];
+        }
+        let first = self.cursor.saturating_sub(self.rows.saturating_sub(1));
+        visible
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(self.rows)
+            .map(|(position, server)| {
+                let marker = if position == self.cursor { ">" } else { " " };
+                let style = if position == self.cursor {
+                    self.context.selected()
+                } else {
+                    self.context.text()
+                };
+                padded(
+                    &format!(" {marker} {}  {}", server.name, server.detail()),
+                    width,
+                    style,
+                )
+            })
+            .collect()
+    }
+
+    fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        vec![("↑↓", "move"), ("space", "toggle"), ("esc", "close")]
+    }
+
+    fn focused_scopes(&self) -> Vec<&'static str> {
+        vec!["dialog.mcp"]
+    }
+
+    fn handle_action(&mut self, action: &'static Definition, event: &KeyEvent) -> DialogStep {
+        match action.name {
+            "dialog.select.prev" => {
+                self.move_cursor(-1);
+                DialogStep::Redraw
+            }
+            "dialog.select.next" => {
+                self.move_cursor(1);
+                DialogStep::Redraw
+            }
+            "dialog.select.home" => {
+                self.cursor = 0;
+                DialogStep::Redraw
+            }
+            "dialog.select.end" => {
+                self.cursor = self.visible().len().saturating_sub(1);
+                DialogStep::Redraw
+            }
+            "dialog.select.page_up" => {
+                self.move_cursor(-(self.rows as isize));
+                DialogStep::Redraw
+            }
+            "dialog.select.page_down" => {
+                self.move_cursor(self.rows as isize);
+                DialogStep::Redraw
+            }
+            "dialog.mcp.toggle" => self.selected().map_or(DialogStep::Ignored, |server| {
+                DialogStep::Emitted(DialogOutcome::McpToggle(McpToggleRequest {
+                    server: server.name,
+                    desired_enabled: !server.desired_enabled,
+                }))
+            }),
+            "app_exit" | "session_interrupt" => DialogStep::Resolved(DialogOutcome::Cancelled),
+            "input_backspace" => {
+                self.filter.pop();
+                self.clamp_cursor();
+                DialogStep::Redraw
+            }
+            "dialog.select.submit" | "dialog.prompt.submit" => DialogStep::Ignored,
+            _ => self.handle_typed(event),
+        }
+    }
+
+    fn handle_typed(&mut self, key: &KeyEvent) -> DialogStep {
+        if let Some(character) = crate::views::permission::typed_character(key) {
+            self.filter.push(character);
+            self.clamp_cursor();
+            DialogStep::Redraw
+        } else {
+            DialogStep::Ignored
+        }
+    }
 }
 
 /// One row of a picker.

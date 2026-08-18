@@ -2125,6 +2125,7 @@ fn production_registry_exposes_all_three_goal_tools() {
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
             ),
+            mcp_loader: None,
         },
     )
     .expect("production registry assembles");

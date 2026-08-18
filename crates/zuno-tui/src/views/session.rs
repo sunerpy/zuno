@@ -54,7 +54,7 @@ use crate::views::external::{Clipboard, EditorRequest, ExternalError, SystemClip
 use crate::views::message::{Message, StatusView, TranscriptView};
 use crate::views::permission::typed_character;
 use crate::views::scroll::Scroller;
-use crate::views::slash::{CatalogCommand, SlashRouter, SlashSubmission};
+use crate::views::slash::{CatalogCommand, HostCommand, SlashRouter, SlashSubmission};
 use crossterm::event::{
     Event as CrosstermEvent, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind,
 };
@@ -111,6 +111,8 @@ pub struct SessionScreen {
     sidebar: crate::views::ambient::SidebarView,
     shutdown: mpsc::Sender<TerminalEvent>,
     prompts: Option<mpsc::Sender<PromptSubmission>>,
+    mcp_toggles: Option<mpsc::Sender<crate::views::picker::McpToggleRequest>>,
+    mcp: crate::views::picker::McpProjection,
     cancels: Option<mpsc::Sender<()>>,
     /// Language-server reports produced beside the loop.
     ///
@@ -222,6 +224,8 @@ pub enum PromptSubmission {
     },
     /// A catalog command plus its still-unexpanded argument tail.
     Command { name: String, arguments: String },
+    /// A session-local operation executed by the runtime host.
+    Host(HostCommand),
 }
 
 /// What the pickers can offer, as the host resolved it.
@@ -261,6 +265,8 @@ impl SessionScreen {
             slash,
             shutdown,
             prompts: None,
+            mcp_toggles: None,
+            mcp: crate::views::picker::McpProjection::default(),
             cancels: None,
             reports: None,
             edits: None,
@@ -348,6 +354,18 @@ impl SessionScreen {
     #[must_use]
     pub fn with_prompt_sink(mut self, prompts: mpsc::Sender<PromptSubmission>) -> Self {
         self.prompts = Some(prompts);
+        self
+    }
+
+    /// Install the live MCP projection and non-blocking lifecycle request sink.
+    #[must_use]
+    pub fn with_mcp_control(
+        mut self,
+        projection: crate::views::picker::McpProjection,
+        toggles: mpsc::Sender<crate::views::picker::McpToggleRequest>,
+    ) -> Self {
+        self.mcp = projection;
+        self.mcp_toggles = Some(toggles);
         self
     }
 
@@ -631,6 +649,9 @@ impl SessionScreen {
                     arguments,
                 },
             ),
+            SlashSubmission::Host(command) => {
+                self.submit_to_driver(text, PromptSubmission::Host(command));
+            }
             SlashSubmission::Unknown(name) => {
                 let shown = if name.is_empty() {
                     String::from("/")
@@ -785,6 +806,12 @@ impl SessionScreen {
 
 impl Component for SessionScreen {
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        self.sidebar.ambient_mut().mcp = self
+            .mcp
+            .snapshot()
+            .iter()
+            .map(crate::views::picker::McpServer::service)
+            .collect();
         let [body, status, prompt] = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(STATUS_ROWS),
@@ -1116,13 +1143,12 @@ impl SessionScreen {
     }
 
     fn mcp_list(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
-        let servers = self.sidebar.ambient().mcp.clone();
-        if servers.is_empty() {
+        if self.mcp.is_empty() {
             return None;
         }
         Some(Box::new(crate::views::picker::mcp_list(
             self.context.clone(),
-            servers,
+            self.mcp.clone(),
         )))
     }
 
@@ -1338,6 +1364,21 @@ impl ActionComponent for SessionScreen {
                 if dialog == crate::views::picker::THEME_DIALOG_ID =>
             {
                 self.restore_theme()
+            }
+            crate::views::dialog::DialogOutcome::McpToggle(request) => {
+                let delivered = self
+                    .mcp_toggles
+                    .as_ref()
+                    .is_some_and(|sink| sink.try_send(request.clone()).is_ok());
+                if !delivered {
+                    self.transcript
+                        .transcript_mut()
+                        .push(Message::notice(format!(
+                            "MCP server `{}` was not toggled: lifecycle worker is busy or unavailable",
+                            request.server
+                        )));
+                }
+                EventResult::REDRAW
             }
             _ => EventResult::IGNORED,
         }

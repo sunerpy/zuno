@@ -44,7 +44,8 @@ use zuno_tool::{PermissionAsk, PermissionAsker, Tool, erase};
 use zuno_tools::exposure::ExposureFlags;
 use zuno_tools::question::{QuestionAsker, QuestionTool};
 use zuno_tools::registry::{
-    BuiltinSlot, CustomTool, CustomToolLoader, RegistryFlags, ResolveInput, ToolRegistryBuilder,
+    BuiltinSlot, CustomTool, CustomToolLoader, McpToolLoader, RegistryFlags, ResolveInput,
+    ToolRegistryBuilder,
 };
 use zuno_tools::search_common::{SearchScope, SearchTooling};
 use zuno_tools::websearch::gating::SearchConfig;
@@ -72,6 +73,7 @@ pub(crate) struct ToolSelection<'a> {
     pub(crate) plugins: Option<Arc<super::plugin_runtime::PluginRuntime>>,
     pub(crate) todo_store: Arc<zuno_db::pool::Pool>,
     pub(crate) goal_store: Arc<zuno_goal::GoalStore>,
+    pub(crate) mcp_loader: Option<Arc<dyn McpToolLoader>>,
 }
 
 /// Assemble the registry for `agent` and project it onto `provider_id`/`model_id`.
@@ -152,6 +154,9 @@ pub(crate) fn assemble(
     builder = builder.with_custom_loader(Arc::new(ProductionCustomTools {
         plugin_tools: selection.plugin_tools.to_vec(),
     }));
+    if let Some(loader) = selection.mcp_loader {
+        builder = builder.with_mcp_loader(loader);
+    }
 
     let memory_root = worktree.unwrap_or(directory);
     if let Some(memory) = configured_memory_tool(memory_root, config) {

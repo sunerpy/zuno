@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::app::render_offscreen;
+use crate::keybind::ActionComponent;
 use crate::views::dialog::{DialogHost, ObservedBase};
 use crate::views::message::TranscriptView;
 use crate::views::testkit::{action, press, rows};
@@ -107,6 +108,96 @@ fn views_agent_picker_renders_offscreen() {
         joined.contains("explore") && joined.contains("Read-only investigation"),
         "{joined}"
     );
+}
+
+fn mcp_servers() -> Vec<McpServer> {
+    vec![
+        McpServer {
+            name: "context7".to_owned(),
+            state: McpState::Connected,
+            desired_enabled: true,
+        },
+        McpServer {
+            name: "codegraph".to_owned(),
+            state: McpState::Failed("handshake failed".to_owned()),
+            desired_enabled: false,
+        },
+    ]
+}
+
+#[test]
+fn views_mcp_dialog_renders_live_states_and_toggle_hint() {
+    let dialog = mcp_list(ViewContext::defaults(), McpProjection::new(mcp_servers()));
+    let joined = render_mcp(dialog, 72, 10).join("\n");
+    assert!(
+        joined.contains("context7") && joined.contains("Connected"),
+        "{joined}"
+    );
+    assert!(
+        joined.contains("codegraph") && joined.contains("handshake failed"),
+        "{joined}"
+    );
+    assert!(
+        joined.contains("space") && joined.contains("toggle"),
+        "{joined}"
+    );
+}
+
+fn render_mcp(dialog: McpDialog, width: u16, height: u16) -> Vec<String> {
+    let context = ViewContext::defaults();
+    let mut host = DialogHost::new(
+        context.clone(),
+        Box::new(ObservedBase::new(TranscriptView::new(context))),
+    );
+    host.open(Box::new(dialog));
+    rows(&render_offscreen(&mut host, width, height).expect("infallible"))
+}
+
+#[test]
+fn views_mcp_space_emits_explicit_target_and_keeps_dialog_open() {
+    let context = ViewContext::defaults();
+    let mut host = DialogHost::new(
+        context.clone(),
+        Box::new(ObservedBase::new(TranscriptView::new(context.clone()))),
+    );
+    host.open(Box::new(mcp_list(
+        context,
+        McpProjection::new(mcp_servers()),
+    )));
+
+    let result = host.handle_action(action("dialog.mcp.toggle"), &press(KeyCode::Char(' ')));
+
+    assert!(result.redraw);
+    assert_eq!(host.active(), Some(MCP_DIALOG_ID));
+    assert_eq!(
+        host.drain_outcomes(),
+        vec![(
+            MCP_DIALOG_ID,
+            DialogOutcome::McpToggle(McpToggleRequest {
+                server: "codegraph".to_owned(),
+                desired_enabled: true,
+            })
+        )]
+    );
+}
+
+#[test]
+fn views_mcp_dialog_reads_replaced_projection_without_reopening() {
+    let projection = McpProjection::new(vec![McpServer {
+        name: "context7".to_owned(),
+        state: McpState::Connecting,
+        desired_enabled: true,
+    }]);
+    let mut dialog = mcp_list(ViewContext::defaults(), projection.clone());
+    assert!(dialog.lines(60)[0].to_string().contains("Connecting"));
+
+    projection.replace(vec![McpServer {
+        name: "context7".to_owned(),
+        state: McpState::Connected,
+        desired_enabled: true,
+    }]);
+
+    assert!(dialog.lines(60)[0].to_string().contains("Connected"));
 }
 
 #[test]
@@ -400,6 +491,7 @@ fn views_picker_ids_are_distinct() {
         MODEL_DIALOG_ID,
         AGENT_DIALOG_ID,
         THEME_DIALOG_ID,
+        MCP_DIALOG_ID,
     ];
     let unique = ids.iter().collect::<std::collections::BTreeSet<_>>();
     assert_eq!(

@@ -212,6 +212,15 @@ const CHANNELS: &[ChannelGate] = &[
         "match prompts.try_send(submission) { Ok(()) => self.mark_turn_accepted(),",
     ),
     gate(
+        "tui-mcp-toggles",
+        "zuno-cli/src/cmd/tui.rs",
+        "let (mcp_toggle_sender, mcp_toggle_receiver) = mpsc::channel(MCP_TOGGLE_CHANNEL_CAPACITY);",
+        "MCP_TOGGLE_CHANNEL_CAPACITY=1",
+        Policy::RefuseNewest,
+        "zuno-tui/src/views/session.rs",
+        "if let Err(error) = requests.try_send(request) {",
+    ),
+    gate(
         "tui-picker-selections",
         "zuno-cli/src/cmd/tui.rs",
         "let (selection_sender, selection_receiver) = mpsc::channel(SELECTION_CHANNEL_CAPACITY);",
@@ -358,7 +367,7 @@ fn source_channel_inventory_matches_the_declared_registry() {
             .iter()
             .filter(|entry| entry.exclusion.is_none())
             .count(),
-        28
+        29
     );
     assert_eq!(
         CHANNELS
@@ -488,6 +497,7 @@ channel_gate!(
     "tui-terminal-events"
 );
 channel_gate!(tui_prompts_refuse_the_newest_prompt, "tui-prompts");
+channel_gate!(tui_mcp_toggles_refuse_the_newest_request, "tui-mcp-toggles");
 channel_gate!(tui_questions_apply_backpressure, "tui-questions");
 channel_gate!(tui_editor_requests_refuse_the_newest, "tui-editor-requests");
 channel_gate!(tui_editor_results_apply_backpressure, "tui-editor-results");

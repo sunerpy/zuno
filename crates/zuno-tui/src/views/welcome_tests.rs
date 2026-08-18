@@ -538,12 +538,17 @@ fn views_welcome_mcp_and_help_hints_open_a_real_surface() {
     // These two are now advertised as `/mcp` and `/help` rather than as leader chords, so
     // the action behind each slash row is what has to open something.
     let (sender, _receiver) = crate::app::terminal_event_channel();
+    let (mcp_toggles, _mcp_requests) = tokio::sync::mpsc::channel(1);
     let mut screen = crate::views::session::SessionScreen::new(ViewContext::defaults(), sender)
+        .with_mcp_control(
+            crate::views::picker::McpProjection::new(vec![crate::views::picker::McpServer {
+                name: "alpha".to_owned(),
+                state: crate::views::picker::McpState::Failed("handshake timed out".to_owned()),
+                desired_enabled: true,
+            }]),
+            mcp_toggles,
+        )
         .with_keymap(keymap());
-    screen.sidebar_mut().ambient_mut().mcp = vec![
-        crate::views::ambient::Service::new("alpha", crate::views::ambient::Health::Faulted)
-            .detailed("handshake timed out"),
-    ];
 
     screen.handle_action(
         crate::views::testkit::action("mcp_list"),
