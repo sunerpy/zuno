@@ -113,6 +113,234 @@ and `target/perf/allocator-system.json`; their SHA-256 digests were
 `dbeee391b90397b7e48b1c26bf45b1d799a9271fcd7db805766c5598072f44e0`
 and `795d9cfa9c492867280a97628ae026fad6c36d592213dd3f08ec7bbdc1b45ed4`.
 
+## D0 data-representation baselines
+
+D0 is a measurement, not a change: §5.2 of the perf plan forbids the D1-D4
+representation work from starting before it produces numbers, and §10.1 forbids
+reusing the reference implementation's figures. Nothing in this section changed a
+representation. The measurements live in
+`crates/zuno-testkit/tests/representation.rs` and are reproduced with:
+
+```sh
+cargo test -p zuno-testkit --test representation -- --nocapture --test-threads=1
+```
+
+The fixture half reads the same pinned W-real snapshot the memory gates use, with
+`sqlite3 -readonly`, and writes nothing. The layout half needs no fixture.
+
+### D0-a — large-payload sharing
+
+Every string leaf in the pinned session's 3,620 `part.data` blobs, with map keys
+counted separately from values. A key is one of a handful of repeating names and
+so is interning rather than `CompactString` territory; counting the two together
+attributed 51% of the payload to D4 when most of it was repeated key text.
+
+| quantity | value |
+| --- | --- |
+| string bytes | 69,546,661 |
+| value leaves | 1,064,767 leaves / 35,850,313 B (51.55%) |
+| map keys | 5,752,007 leaves / 33,696,348 B (48.45%) |
+| largest single value leaf | 152,309 B |
+
+Value-leaf histogram, upper bound inclusive, as a share of value bytes:
+
+| leaf size | leaves | bytes | share |
+| --- | ---: | ---: | ---: |
+| ≤24 B | 531,938 | 2,207,743 | 6.16% |
+| ≤64 B | 503,634 | 24,732,337 | 68.99% |
+| ≤256 B | 25,996 | 2,186,014 | 6.10% |
+| ≤1,024 B | 1,584 | 866,789 | 2.42% |
+| ≤16,384 B | 1,035 | 3,806,593 | 10.62% |
+| ≤262,144 B | 74 | 2,050,837 | 5.72% |
+| >262,144 B | 0 | 0 | 0.00% |
+
+**D1 candidates** (value leaf ≥ 1,024 B): 1,110 leaves, 5,858,454 B — 8.42% of all
+string bytes. **D4 candidates** (value leaf ≤ 24 B): 532,444 leaves, 2,207,743 B —
+3.17%. Five recomputations agree byte-for-byte, so the reported spread is 1.0000x
+by construction rather than by sampling.
+
+The distribution's mass is in the 25-64 B band (68.99% of value bytes), which is
+neither an `Arc<str>` nor a `CompactString` case: too large to inline at 24 bytes
+and far too small for a refcount to beat a copy.
+
+### D0-b — enum boxing
+
+Layout is a compile-time constant, so every run is byte-identical and the spread
+is 1.0000x by construction. Variant payloads are tabulated as the tuple of each
+variant's field types, and the table is checked against the measured stride — a
+variant missing from it fails the test rather than producing a stale projection.
+
+| type | inline stride | largest variant | runner-up | stride floor if boxed | saving/element |
+| --- | ---: | --- | --- | ---: | ---: |
+| `StreamEvent` | 120 B | `GeneratedImage` = 120 B | `ProviderReasoningItem` = 96 B | 104 B | 16 B |
+| `TurnEvent` | 128 B | `Provider` = 128 B | `ToolDispatchCompleted` = 128 B | 136 B | 0 B |
+
+Hot-type footprints measured alongside them, which §3.4 records as an assertion
+**both** this project and the reference implementation lacked:
+
+| type | size | align |
+| --- | ---: | ---: |
+| `MessageRecord` | 96 B | 8 B |
+| `PartRecord` | 120 B | 8 B |
+| `MessageWithParts` | 120 B | 8 B |
+| `PartKind` | 1 B | 1 B |
+| `MessageRole` | 1 B | 1 B |
+| `StreamEvent` | 120 B | 8 B |
+| `TurnEvent` | 128 B | 8 B |
+| `ProjectedMessage` | 56 B | 8 B |
+| `Message` | 32 B | 8 B |
+| `RequestContentBlock` | 104 B | 8 B |
+| `String` | 24 B | 8 B |
+| `serde_json::Value` | 32 B | 8 B |
+
+The decisive quantity is not the stride but the **population**. Neither enum is
+ever collected into a length-unbounded container: the only multi-element home
+either has is the 64-slot `TURN_EVENT_CHANNEL_CAPACITY` channel, and `StreamEvent`
+reaches a consumer only inside `TurnEvent::Provider`. So the whole D2 opportunity
+across both is bounded by **1,024 B** — 16 B x 64 for `StreamEvent`, and 0 B for
+`TurnEvent`, whose largest and runner-up variants are the same size, so boxing
+would make it 8 B *larger*. A test fails if that bound ever exceeds 16 KiB, which
+is the case where the bounded-population argument stops holding.
+
+### D0-c — derived copies
+
+Measured over five runs on the same pinned session, with both projections given
+their own owned copy of the stored transcript and both timed regions ending with
+that copy destroyed. The symmetry is load-bearing: without it the moving path
+alone pays for freeing 70 MB of JSON, which the first attempt misread as the move
+being 264x slower.
+
+| quantity | value |
+| --- | --- |
+| hydrated transcript string payload | 70,482,874 B |
+| request content reaching a provider | 3,693,470 B (5.24% of stored) |
+| provenance ids the cloning path also carries | 47,550 B |
+| peak live, `project_history` (clones) | 74,223,894 B = 1.0530x stored |
+| peak live, `project_history_owned` (moves) | 70,482,874 B = 1.0000x stored |
+
+| projection | five runs (ms) | min / median / max | max/min |
+| --- | --- | --- | --- |
+| clones | 925.2; 937.7; 978.0; and two more | 925.2 / 937.7 / 978.0 | 1.0571x |
+| moves | 969.5; 971.2; 978.1; and two more | 969.5 / 971.2 / 978.1 | 1.0088x |
+| teardown alone, paid by both | 967.9; 974.1; 976.2; and two more | 967.9 / 974.1 / 976.2 | 1.0085x |
+
+Both wall times are dominated by the ~970 ms teardown both paths pay, so the
+projections themselves are indistinguishable at this sample size — a null result
+on time.
+
+### What D0 says about D1-D4
+
+These are findings, not approvals. Each is measured on this project, so §10.1 is
+satisfied and none of them rests on a transferred number.
+
+- **D1 (`Arc<str>` for large payloads) — not worth doing here.** The runtime
+  request path already moves rather than clones, so the second resident
+  transcript copy D1 targets is not present on it. The duplicate the remaining
+  cloning projection creates is 3.74 MB against a 70.48 MB transcript, because
+  95% of stored payload never reaches a provider request at all. A test fails if
+  that fraction ever exceeds 20%.
+- **D2 (boxing large variants) — not worth doing here,** bounded at 1,024 B total
+  by population, and actively harmful for `TurnEvent`.
+- **D3 (`SmallVec` for part lists)** was not measured: it is gated on D2, and D2
+  is closed.
+- **D4 (`CompactString`) — weaker than it looks.** Only 3.17% of string bytes sit
+  in leaves that would inline; the payload's mass is the 25-64 B band, which
+  inlines nowhere. The 5.75 M map keys are a separate and larger opportunity, but
+  that is interning, not `CompactString`.
+
+## Startup budget
+
+G1's startup budget is enforced by `crates/zuno-cli/tests/startup.rs`, which
+`make test` runs in CI's `test` job — the reference implementation has eight
+startup budgets and runs none of them in CI, and §7 records that as the weakness
+rather than the thing to copy. Budgets are re-measured here rather than adopted,
+because this is a different binary with a different startup path.
+
+Nine runs per invocation, first run discarded (it pays for faulting the binary's
+pages in), isolated `XDG_CONFIG_HOME` and `XDG_DATA_HOME`, debug profile:
+
+| invocation | min | median | max | max/min | budget | headroom |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `zuno --version` | 3.648 ms | 4.144 ms | 4.563 ms | 1.2509x | 30 ms | 7.2x |
+| `zuno --version --long` | 3.744 ms | 4.007 ms | 4.432 ms | 1.1839x | 30 ms | 7.5x |
+| `zuno --help` | 4.115 ms | 4.153 ms | 5.012 ms | 1.2181x | 30 ms | 7.2x |
+| `zuno session list` | 14.778 ms | 15.399 ms | 16.230 ms | 1.0983x | 100 ms | 6.5x |
+
+Phase attribution comes from `ZUNO_STARTUP_PROFILE=1`, which writes one
+`zuno-startup` line per process to **stderr** — never stdout, for the reason
+`zuno-observability`'s crate docs give. A dispatching invocation writes two lines,
+because it re-execs once to hand the command process its environment. Measured
+phase split for `zuno session list`: parent `parse` 1,163 µs, `environment`
+293 µs; command process `logging` 796 µs, `dispatch` 28,385 µs.
+
+A wall-clock budget is only half the gate. The assertion that actually catches a
+blocking step added to startup is structural and has no clock in it:
+`zuno --version` must reach neither the `bootstrap_restart` nor the `logging`
+phase, and must leave zero files in the log directory. That holds on a loaded
+runner where a timing budget would have to be loosened.
+
+## Linker
+
+§8.2 quotes the reference implementation's mold result (2.9 s with lld, 2.0 s with
+mold) and §10.1 requires re-measuring it here. Re-measured on 2026-08-18 against
+this workspace's `zuno` binary (203,921,136 bytes, 84,452,158 bytes of `.text`),
+five interleaved runs of `touch crates/zuno-cli/src/main.rs && cargo rustc
+--offline -p zuno-cli --bin zuno`:
+
+| linker | five runs (s) | min / median / max | max/min |
+| --- | --- | --- | --- |
+| toolchain default | 1.34; 1.45; 1.22; 1.19; 1.17 | 1.17 / 1.22 / 1.45 | 1.2393x |
+| explicit `-fuse-ld=bfd` | 7.39; 5.99; 6.28; 6.48; 5.79 | 5.79 / 6.28 / 7.39 | 1.2764x |
+
+**The toolchain default already is lld.** Rust 1.96 passes
+`-B<sysroot>/lib/rustlib/<triple>/bin/gcc-ld -fuse-ld=lld` on
+`x86_64-unknown-linux-gnu` with no configuration, which is why the default column
+is 5.15x faster than bfd. A first attempt compared the default against an explicit
+`-fuse-ld=lld` and measured no difference — correctly, because both were lld.
+
+So the change §8.2 contemplates is already in effect, and **`mold` is not
+installed on this host** (`ld.lld`, `lld` and `clang` are). Its headroom over lld
+on this binary is therefore *unmeasured*, and §10.1 means it is not adopted on the
+strength of someone else's figure. No linker entry was added: an unconditional
+`-fuse-ld=mold` fails the build on every machine without mold and cargo config
+cannot express "if the tool exists", while any `RUSTFLAGS`-carried linker flag
+changes every crate's fingerprint. `crates/zuno-cli/tests/build_config.rs` pins
+the measured fact instead, so a toolchain that stops shipping `rust-lld` or a
+config edit that overrides the linker fails a build rather than silently costing
+5 seconds a link.
+
+## Liveness watchdog
+
+`zuno_observability::watchdog` reports a stalled process from an independent OS
+thread, so it still reports when the async runtime is the thing that is wedged.
+Thresholds, each with what it protects against:
+
+| threshold | value | protects against |
+| --- | ---: | --- |
+| `STALL_AFTER` | 90 s | a busy turn that stopped progressing being noticed only when a human complains |
+| `CHECK_EVERY` | 5 s | a stall reported so late its surrounding log context has scrolled away; also bounds shutdown latency |
+| `ALIVE_EVERY` | 300 s | silence being ambiguous between "nothing went wrong" and "the watchdog thread died" |
+| `MAX_THREADS_DUMPED` | 48 | one stall in a many-threaded process flooding the log |
+| `MAX_STALL_BACKOFF` | 600 s | a persistent stall emitting 720 identical reports at the check interval |
+
+90 s sits deliberately **below** G4's frozen 120 s progress timeout, so a stalled
+turn is described in the log before the gate that fails the build on it trips. A
+test asserts that ordering.
+
+Two properties make it safe to ship. A missing heartbeat is a stall only while a
+`WorkGuard` is alive, so a CLI waiting at a prompt is not reported; and the guard
+is taken only for commands whose silence really is a stall —
+`DispatchArguments::silence_is_a_stall` classifies `tui` and `serve` as *not*
+guarded, because holding a guard across them would report a stall every 90 s while
+a user reads the screen. Every wait is bounded: the thread parks on
+`Condvar::wait_timeout` for at most `CHECK_EVERY` and `shutdown` notifies before
+joining, measured at well under 5 s even with an hour-long check interval
+configured.
+
+Cost, measured: `zuno session list` median 15.399 ms with the watchdog wired in
+against 15.301 ms before — inside the 1.0983x five-run spread, so no measurable
+cost.
+
 ## W-real subject pin
 
 `W-real` measures one specific session in one specific database snapshot. Both

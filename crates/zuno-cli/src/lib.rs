@@ -10,6 +10,7 @@ mod cmd;
 mod command;
 mod disposition;
 mod environment;
+pub mod startup;
 mod version;
 
 pub use command::{
@@ -47,13 +48,29 @@ const BOOTSTRAP_MARKER: &str = "ZUNO_RUST_CLI_BOOTSTRAPPED";
 /// code the real `AGENT`, `OPENCODE`, PID, logging, and pure values it expects.
 #[must_use]
 pub fn run_process() -> ExitCode {
+    // The guard work `main` did before calling in is already behind us, so the
+    // first mark closes it rather than opening the profile.
+    let mut profile = startup::StartupProfile::new();
+    profile.mark(startup::StartupPhase::ProcessGuard);
+
     let args: Vec<OsString> = std::env::args_os().collect();
     let cli = match Cli::try_parse_from(&args) {
         Ok(cli) => cli,
-        Err(error) => return render_clap_error(error),
+        Err(error) => {
+            // `--help` and `--version` both leave through here, and both are
+            // budgeted startup paths, so this arm has to emit or they would be the
+            // two invocations the profile cannot describe.
+            profile.mark(startup::StartupPhase::Parse);
+            let code = render_clap_error(error);
+            profile.emit(startup::StartupPhase::Dispatch);
+            return code;
+        }
     };
+    profile.mark(startup::StartupPhase::Parse);
+
     let base = Env::from_process();
     let action = cli.action(&base);
+    profile.mark(startup::StartupPhase::Environment);
 
     if let Action::Version { long } = action {
         let output = if long {
@@ -62,6 +79,7 @@ pub fn run_process() -> ExitCode {
             compatibility_version().to_owned()
         };
         println!("{output}");
+        profile.emit(startup::StartupPhase::Dispatch);
         return ExitCode::SUCCESS;
     }
 
@@ -74,6 +92,7 @@ pub fn run_process() -> ExitCode {
     if std::env::var_os(BOOTSTRAP_MARKER).is_none()
         && let Some(environment) = environment
     {
+        profile.emit(startup::StartupPhase::BootstrapRestart);
         return restart_with_environment(&args, environment);
     }
 
@@ -84,9 +103,32 @@ pub fn run_process() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    profile.mark(startup::StartupPhase::Logging);
 
-    execute_action(action, &mut cmd::HeadlessCommandDispatcher)
+    // Started after logging so its reports have a sink, and only on the dispatch
+    // path: the fast paths return before here, where a watchdog thread would be
+    // spawned to observe a `println!`. The guard is taken only for commands whose
+    // silence really is a stall — `DispatchArguments::silence_is_a_stall` records
+    // why holding one across `tui` or `serve` would defeat the BUSY gate.
+    let watchdog = zuno_observability::watchdog::Watchdog::spawn(
+        zuno_observability::watchdog::WatchdogConfig::default(),
+    );
+    let work = match &action {
+        Action::Dispatch(request) if request.args.silence_is_a_stall() => {
+            Some(watchdog.begin_work(watchdog.phase(WATCHDOG_DISPATCH_PHASE)))
+        }
+        Action::Dispatch(_) | Action::Rejected { .. } | Action::Version { .. } => None,
+    };
+
+    let code = execute_action(action, &mut cmd::HeadlessCommandDispatcher);
+
+    drop(work);
+    watchdog.shutdown();
+    profile.emit(startup::StartupPhase::Dispatch);
+    code
 }
+
+const WATCHDOG_DISPATCH_PHASE: &str = "cli.dispatch";
 
 fn restart_with_environment(args: &[OsString], environment: &StartupEnvironment) -> ExitCode {
     let executable = match std::env::current_exe() {

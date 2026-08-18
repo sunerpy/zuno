@@ -85,6 +85,7 @@ mod config;
 mod error;
 pub mod span;
 pub mod tool;
+pub mod watchdog;
 
 pub use crate::config::{
     DEFAULT_MAX_LOG_FILES, ENV_LOG_LEVEL, ENV_PRINT_LOGS, LOG_FILE_PREFIX, LOG_FILE_SUFFIX,

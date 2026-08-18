@@ -801,6 +801,38 @@ impl DispatchArguments {
         }
     }
 
+    /// Whether this command's silence is evidence of a stall.
+    ///
+    /// The liveness watchdog holds a `WorkGuard` for the whole of a command that
+    /// answers this `true`, so a stall in one is reported. `false` means the
+    /// command legitimately blocks on something outside the process — a key
+    /// press, an inbound request — and holding a guard across it would report a
+    /// stall every stall interval while the user reads the screen. That is the
+    /// exact false positive `zuno_observability::watchdog`'s BUSY gate exists to
+    /// prevent, so getting this classification wrong defeats the gate rather than
+    /// merely being noisy.
+    ///
+    /// Exhaustive, so a new command has to decide which it is. `Run` is bounded
+    /// because it takes one turn and exits; `Tui` and `Serve` are not.
+    /// An interactive command that wants coverage should take its own guards
+    /// around its bounded segments rather than being reclassified here.
+    #[must_use]
+    pub const fn silence_is_a_stall(&self) -> bool {
+        match self {
+            Self::Run(_)
+            | Self::Session(_)
+            | Self::Agent(_)
+            | Self::Models(_)
+            | Self::Providers(_)
+            | Self::Mcp(_)
+            | Self::Db(_)
+            | Self::Debug(_)
+            | Self::Export(_)
+            | Self::Import(_) => true,
+            Self::Tui(_) | Self::Serve(_) | Self::Pending(_, _) => false,
+        }
+    }
+
     /// Whether this command still routes to [`PendingCommandDispatcher`].
     ///
     /// This is the *behavioural* answer to "is there a handler", and it is what
