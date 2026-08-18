@@ -52,6 +52,7 @@ fn engine_stream_events_project_to_protocol_updates() {
         title: "Wrote file".to_owned(),
         output: "ok".to_owned(),
         diff: None,
+        written_paths: Vec::new(),
         is_error: false,
     })
     .expect("tool completion is client-visible");

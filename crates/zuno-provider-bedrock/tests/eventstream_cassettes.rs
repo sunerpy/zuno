@@ -1,4 +1,4 @@
-use zuno_llm::event::{FinishReason, StreamEvent};
+use zuno_llm::event::{FinishReason, PromptAccounting, StreamEvent};
 use zuno_provider_bedrock::{BedrockDecodeError, BedrockEventDecoder, CrcKind, EventStreamError};
 use zuno_testkit::CassettePlayer;
 
@@ -57,6 +57,7 @@ fn recorded_stream_decodes_identically_when_split_at_every_byte_offset() {
                 output_tokens: Some(2),
                 cache_read_input_tokens: None,
                 cache_write_input_tokens: None,
+                accounting: PromptAccounting::CacheInsideInput,
             },
         ]
     );

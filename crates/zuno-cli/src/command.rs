@@ -833,6 +833,39 @@ impl DispatchArguments {
         }
     }
 
+    /// Whether this command runs long enough for resident growth to mean anything.
+    ///
+    /// A memory sampler is started for the whole of a command that answers this `true`.
+    /// It is a separate question from [`Self::silence_is_a_stall`] and not its negation:
+    /// that one asks whether *silence* is a fault, this one asks whether the process lives
+    /// long enough to leak. `Pending` answers `false` to both — it prints and exits — so
+    /// the two lists differ by exactly that arm, which is why deriving one from the other
+    /// would be wrong.
+    ///
+    /// Exhaustive, so a new long-running command cannot be added without deciding. That
+    /// matters here more than most: [`zuno_observability::memory`]'s four attribution
+    /// levels were fully implemented and tested, and shipped with **no** production
+    /// sampler at all, so the alert could not fire however far memory grew. A predicate
+    /// the compiler forces a choice on is what keeps the next command from re-creating
+    /// that hole silently.
+    #[must_use]
+    pub const fn deserves_a_memory_sampler(&self) -> bool {
+        match self {
+            Self::Tui(_) | Self::Serve(_) => true,
+            Self::Run(_)
+            | Self::Session(_)
+            | Self::Agent(_)
+            | Self::Models(_)
+            | Self::Providers(_)
+            | Self::Mcp(_)
+            | Self::Db(_)
+            | Self::Debug(_)
+            | Self::Export(_)
+            | Self::Import(_)
+            | Self::Pending(_, _) => false,
+        }
+    }
+
     /// Whether this command still routes to [`PendingCommandDispatcher`].
     ///
     /// This is the *behavioural* answer to "is there a handler", and it is what

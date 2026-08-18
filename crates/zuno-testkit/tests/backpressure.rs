@@ -239,13 +239,13 @@ const CHANNELS: &[ChannelGate] = &[
         "cancels.try_send(()).is_ok()",
     ),
     gate(
-        "tui-edited-files",
+        "tui-edit-signal",
         "zuno-cli/src/cmd/tui.rs",
-        "let (edit_sender, edit_receiver) = mpsc::channel(LSP_CHANNEL_CAPACITY);",
-        "LSP_CHANNEL_CAPACITY=16",
-        Policy::RefuseNewest,
-        "zuno-tui/src/views/session.rs",
-        "let _sent = edits.try_send(batch);",
+        "let (edit_sender, edit_receiver) = mpsc::channel(EDIT_SIGNAL_CHANNEL_CAPACITY);",
+        "EDIT_SIGNAL_CHANNEL_CAPACITY=1",
+        Policy::CoalesceFull,
+        "zuno-tui/src/views/lsp.rs",
+        "let _nudged = self.wake.try_send(());",
     ),
     gate(
         "tui-diagnostic-reports",
@@ -497,6 +497,7 @@ channel_gate!(
     "tui-terminal-events"
 );
 channel_gate!(tui_prompts_refuse_the_newest_prompt, "tui-prompts");
+channel_gate!(tui_edit_signal_coalesces_when_full, "tui-edit-signal");
 channel_gate!(tui_mcp_toggles_refuse_the_newest_request, "tui-mcp-toggles");
 channel_gate!(tui_questions_apply_backpressure, "tui-questions");
 channel_gate!(tui_editor_requests_refuse_the_newest, "tui-editor-requests");

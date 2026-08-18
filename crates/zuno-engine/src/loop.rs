@@ -159,6 +159,17 @@ pub enum TurnEvent {
         /// `None` for every tool that changed nothing — see
         /// `zuno_tools::diff` for why an absent patch is not an empty one.
         diff: Option<String>,
+        /// The files this call wrote, lifted from
+        /// [`zuno_tool::output::METADATA_WRITTEN_PATHS_KEY`].
+        ///
+        /// Typed and plural rather than left in `metadata` for the reason `diff` is, and
+        /// plural rather than derived from `title` because a title is prose: `apply_patch`
+        /// summarises a whole patch set as `Success. Updated the following files:` and one
+        /// call can write several files. A host checking the paths a turn wrote — the
+        /// TUI's language-server hook — had neither, so it matched tool *names* against a
+        /// hand-kept list and silently checked nothing on the models whose only writing
+        /// tool is `apply_patch`.
+        written_paths: Vec<String>,
         is_error: bool,
     },
     ToolResultAppended {
@@ -580,6 +591,9 @@ impl StepAccumulator {
                 output_tokens,
                 cache_read_input_tokens,
                 cache_write_input_tokens,
+                // Not applied here for the reason given in `stream.rs`: these four are
+                // persisted verbatim as the provider's own report.
+                accounting: _,
             } => {
                 self.input_tokens = *input_tokens;
                 self.output_tokens = *output_tokens;
@@ -1075,6 +1089,12 @@ pub async fn run_turn(
                         .and_then(serde_json::Value::as_str)
                         .filter(|patch| !patch.is_empty())
                         .map(str::to_owned),
+                    written_paths: dispatch
+                        .output
+                        .written_paths()
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
                     is_error: dispatch.is_error,
                 })
                 .await?;

@@ -25,7 +25,8 @@ use zuno_llm::effort::{
     DeclaredVariants, EffortCapabilities, ProviderFamily, ReasoningEffort, resolve_effort,
 };
 use zuno_llm::event::{
-    FinishReason, Message, RequestContentBlock, Role, StreamEvent, ThoughtSignature,
+    FinishReason, Message, PromptAccounting, RequestContentBlock, Role, StreamEvent,
+    ThoughtSignature,
 };
 use zuno_llm::registry::{
     Capabilities, CompletionRequest, Declined, FactoryOutcome, Provider, ProviderStream, Spec,
@@ -869,6 +870,8 @@ impl GeminiStreamDecoder {
                     .map(|visible| visible.saturating_add(usage.thoughts_token_count.unwrap_or(0))),
                 cache_read_input_tokens: usage.cached_content_token_count,
                 cache_write_input_tokens: None,
+                // `cachedContentTokenCount` is part of `promptTokenCount`.
+                accounting: PromptAccounting::CacheInsideInput,
             });
         }
         if let Some(reason) = finish_reason
@@ -1513,6 +1516,9 @@ impl AnthropicStreamDecoder {
                 cache_write_input_tokens: usage
                     .get("cache_creation_input_tokens")
                     .and_then(Value::as_u64),
+                // This surface speaks the Anthropic Messages shape, whose three prompt
+                // figures are disjoint — unlike Gemini's native one above.
+                accounting: PromptAccounting::CacheBesideInput,
             });
         }
         let reason = value["delta"].get("stop_reason").and_then(Value::as_str);

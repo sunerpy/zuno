@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use zuno_error::ProviderError;
+use zuno_llm::event::PromptAccounting;
 use zuno_llm::registry::{ApiSurface, FinishReason, StreamEvent};
 use zuno_llm::sse::{StreamLimits, append_tool_input, ensure_tool_input_size};
 
@@ -190,6 +191,7 @@ impl ChunkTranslator {
                     .prompt_tokens_details
                     .and_then(|details| details.cached_tokens),
                 cache_write_input_tokens: None,
+                accounting: PromptAccounting::CacheInsideInput,
             });
         }
 
@@ -486,6 +488,7 @@ impl ResponsesTranslator {
                     .input_tokens_details
                     .and_then(|details| details.cached_tokens),
                 cache_write_input_tokens: None,
+                accounting: PromptAccounting::CacheInsideInput,
             });
         }
         events
@@ -760,6 +763,7 @@ mod tests {
                     output_tokens: Some(4),
                     cache_read_input_tokens: Some(3),
                     cache_write_input_tokens: None,
+                    accounting: PromptAccounting::CacheInsideInput,
                 },
             ]
         );
@@ -859,6 +863,7 @@ mod tests {
             output_tokens: Some(3),
             cache_read_input_tokens: Some(8),
             cache_write_input_tokens: None,
+            accounting: PromptAccounting::CacheInsideInput,
         }));
     }
 

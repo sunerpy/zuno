@@ -296,6 +296,64 @@ impl fmt::Display for FinishReason {
     }
 }
 
+/// How a provider's prompt figure relates to its cache figures.
+///
+/// Providers disagree, the numbers look identical either way, and no consumer can tell
+/// them apart from the values alone — so the adapter that knows states it here rather
+/// than leaving every reader to assume. A reader that assumes wrong either double-counts
+/// the cache or loses it, and both were live: the status strip's session total added
+/// `input + output + cache_read + cache_write` unconditionally, and the context
+/// percentage added `input + cache_read`.
+///
+/// | Provider surface | Variant | Source |
+/// | --- | --- | --- |
+/// | OpenAI Chat Completions and Responses | [`Self::CacheInsideInput`] | `prompt_tokens_details.cached_tokens` is a breakdown of `prompt_tokens` |
+/// | OpenAI-compatible endpoints | [`Self::CacheInsideInput`] | the OpenAI wire shape, so the OpenAI rule |
+/// | Google Gemini `generateContent` | [`Self::CacheInsideInput`] | `cachedContentTokenCount` is part of `promptTokenCount` |
+/// | Amazon Bedrock `ConverseStream` | [`Self::CacheInsideInput`] | `totalTokens` is `inputTokens + outputTokens`, cache excluded |
+/// | Anthropic Messages | [`Self::CacheBesideInput`] | `input_tokens` excludes both cache figures; the three sum to the prompt |
+/// | Google's Anthropic-compatible surface | [`Self::CacheBesideInput`] | the Anthropic wire shape |
+/// | Bedrock `InvokeModelWithResponseStream` on Anthropic | [`Self::CacheBesideInput`] | the Anthropic wire shape |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptAccounting {
+    /// The prompt figure is the whole prompt; the cache figures itemise part of it.
+    CacheInsideInput,
+    /// The prompt figure excludes the cache figures; all three sum to the prompt.
+    CacheBesideInput,
+}
+
+impl PromptAccounting {
+    /// The wire spelling, for hosts that forward this to their own clients.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CacheInsideInput => "cache-inside-input",
+            Self::CacheBesideInput => "cache-beside-input",
+        }
+    }
+
+    /// The whole prompt this request sent, however the provider split it.
+    #[must_use]
+    pub const fn prompt_total(self, input: u64, cache_read: u64, cache_write: u64) -> u64 {
+        match self {
+            Self::CacheInsideInput => input,
+            Self::CacheBesideInput => input.saturating_add(cache_read).saturating_add(cache_write),
+        }
+    }
+
+    /// The prompt tokens that were neither read from nor written to the cache.
+    ///
+    /// The complement of [`Self::prompt_total`]: what remains once the cache figures are
+    /// accounted for, which is the only part billed at the plain input rate.
+    #[must_use]
+    pub const fn uncached_input(self, input: u64, cache_read: u64, cache_write: u64) -> u64 {
+        match self {
+            Self::CacheInsideInput => input.saturating_sub(cache_read).saturating_sub(cache_write),
+            Self::CacheBesideInput => input,
+        }
+    }
+}
+
 /// Connection progress reported while opening and consuming a provider stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionPhase {
@@ -383,11 +441,16 @@ pub enum StreamEvent {
     /// after the provider stream completes.
     RetryRollback { attempt: u32, max: u32 },
     /// Provider token accounting, once known.
+    ///
+    /// The numbers are the provider's own, unaltered. `accounting` states how they fit
+    /// together, because that differs by provider and no consumer can derive it: see
+    /// [`PromptAccounting`].
     TokenUsage {
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
         cache_read_input_tokens: Option<u64>,
         cache_write_input_tokens: Option<u64>,
+        accounting: PromptAccounting,
     },
     /// The active transport or connection implementation.
     ConnectionType { connection: String },

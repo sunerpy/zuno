@@ -24,6 +24,7 @@ zuno-db = { workspace = true }
 zuno-engine = { workspace = true }
 zuno-error = { workspace = true }
 zuno-llm = { workspace = true }
+zuno-observability = { workspace = true }
 zuno-paths = { workspace = true }
 zuno-permission = { workspace = true }
 zuno-plugin-sdk = { workspace = true }

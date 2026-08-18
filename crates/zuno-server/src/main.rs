@@ -61,7 +61,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             writeln!(stdout, "http://{}", server.local_addr())?;
             stdout.flush()?;
             drop(stdout);
-            server.serve().await?;
+            // This binary is a second long-lived entry point: `zuno serve` gets its
+            // sampler from the CLI's `run_process`, and a process started here would
+            // otherwise have none. Wiring only the CLI is how one of two entry points
+            // silently keeps the hole.
+            let memory = zuno_observability::memory::MemorySampler::spawn(Arc::clone(
+                zuno_observability::memory::active_sessions(),
+            ));
+            let served = server.serve().await;
+            memory.shutdown();
+            served?;
         }
     }
     Ok(())

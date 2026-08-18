@@ -9,7 +9,9 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 use zuno_engine::retry::{ProviderRetryPolicy, retry_provider_with_sleep};
 use zuno_error::ProviderError;
-use zuno_llm::event::{ConnectionPhase, FinishReason, StreamEvent, ThoughtSignature};
+use zuno_llm::event::{
+    ConnectionPhase, FinishReason, PromptAccounting, StreamEvent, ThoughtSignature,
+};
 use zuno_llm::registry::{Declined, ProviderRegistry, Unavailable};
 use zuno_llm::sse::SseParser;
 use zuno_provider_anthropic::AnthropicDecoder;
@@ -806,6 +808,7 @@ fn exact_openai_parallel_tools() -> Vec<StreamEvent> {
             output_tokens: Some(5),
             cache_read_input_tokens: None,
             cache_write_input_tokens: None,
+            accounting: PromptAccounting::CacheInsideInput,
         },
     ]
 }
@@ -853,6 +856,7 @@ fn replay_recorded_plain_text(family: Family, cassette: &str) {
                 output_tokens: Some(5),
                 cache_read_input_tokens: Some(0),
                 cache_write_input_tokens: Some(0),
+                accounting: PromptAccounting::CacheBesideInput,
             },
         ],
         Family::OpenAi => vec![
@@ -866,6 +870,7 @@ fn replay_recorded_plain_text(family: Family, cassette: &str) {
                 output_tokens: Some(2),
                 cache_read_input_tokens: Some(0),
                 cache_write_input_tokens: None,
+                accounting: PromptAccounting::CacheInsideInput,
             },
         ],
         Family::Compatible => vec![
@@ -879,6 +884,7 @@ fn replay_recorded_plain_text(family: Family, cassette: &str) {
                 output_tokens: Some(2),
                 cache_read_input_tokens: Some(0),
                 cache_write_input_tokens: None,
+                accounting: PromptAccounting::CacheInsideInput,
             },
         ],
         Family::Bedrock => vec![
@@ -891,6 +897,7 @@ fn replay_recorded_plain_text(family: Family, cassette: &str) {
                 output_tokens: Some(2),
                 cache_read_input_tokens: None,
                 cache_write_input_tokens: None,
+                accounting: PromptAccounting::CacheInsideInput,
             },
         ],
         Family::Gemini => vec![
@@ -900,6 +907,7 @@ fn replay_recorded_plain_text(family: Family, cassette: &str) {
                 output_tokens: Some(18),
                 cache_read_input_tokens: None,
                 cache_write_input_tokens: None,
+                accounting: PromptAccounting::CacheInsideInput,
             },
             StreamEvent::MessageEnd {
                 stop_reason: Some(FinishReason::Stop),
@@ -939,6 +947,7 @@ fn replay_interleaved_reasoning(family: Family, reason: &str) {
                     output_tokens: Some(5),
                     cache_read_input_tokens: None,
                     cache_write_input_tokens: None,
+                    accounting: PromptAccounting::CacheBesideInput,
                 },
             ]);
             (decode_anthropic(&interaction), expected)
@@ -964,6 +973,7 @@ fn replay_interleaved_reasoning(family: Family, reason: &str) {
                     output_tokens: Some(5),
                     cache_read_input_tokens: None,
                     cache_write_input_tokens: None,
+                    accounting: PromptAccounting::CacheInsideInput,
                 },
             ],
         ),
@@ -1025,6 +1035,7 @@ fn replay_signed_thinking(family: Family, reason: &str) {
                 output_tokens: Some(5),
                 cache_read_input_tokens: None,
                 cache_write_input_tokens: None,
+                accounting: PromptAccounting::CacheBesideInput,
             },
         ]);
     } else {
@@ -1070,6 +1081,7 @@ fn replay_encrypted_reasoning(family: Family, reason: &str) {
                         output_tokens: Some(1),
                         cache_read_input_tokens: None,
                         cache_write_input_tokens: None,
+                        accounting: PromptAccounting::CacheBesideInput,
                     },
                 ],
             )
@@ -1101,6 +1113,7 @@ fn replay_encrypted_reasoning(family: Family, reason: &str) {
                         output_tokens: Some(1),
                         cache_read_input_tokens: None,
                         cache_write_input_tokens: None,
+                        accounting: PromptAccounting::CacheInsideInput,
                     },
                 ],
             )
@@ -1402,6 +1415,7 @@ fn cassettes_gemini_tool_signature_keeps_opaque_recorded_bytes() {
                 output_tokens: Some(60),
                 cache_read_input_tokens: None,
                 cache_write_input_tokens: None,
+                accounting: PromptAccounting::CacheInsideInput,
             },
             StreamEvent::MessageEnd {
                 stop_reason: Some(FinishReason::ToolCalls),

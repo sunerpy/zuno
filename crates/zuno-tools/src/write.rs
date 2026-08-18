@@ -115,7 +115,8 @@ impl TypedTool for WriteTool {
                 ToolOutput::text(label.clone(), "Wrote file successfully.")
                     .with_metadata("filepath", json!(target.canonical))
                     .with_metadata("exists", json!(existing.is_some()))
-                    .with_metadata("formatted", outcome.changed),
+                    .with_metadata("formatted", outcome.changed)
+                    .with_written_path(&target.canonical),
                 &label,
                 existing.as_deref().unwrap_or_default(),
                 &final_bytes,

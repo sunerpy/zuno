@@ -4,8 +4,8 @@ use std::mem::discriminant;
 
 use serde_json::{Value, json};
 use zuno_llm::event::{
-    ConnectionPhase, ContentBlock, RequestContentBlock, Role, StreamEvent, ThoughtSignature,
-    TranscriptMessage,
+    ConnectionPhase, ContentBlock, PromptAccounting, RequestContentBlock, Role, StreamEvent,
+    ThoughtSignature, TranscriptMessage,
 };
 use zuno_llm::stream::StreamAccumulator;
 
@@ -149,6 +149,7 @@ fn event_vocabulary_has_twenty_four_distinct_variants() {
             output_tokens: None,
             cache_read_input_tokens: None,
             cache_write_input_tokens: None,
+            accounting: PromptAccounting::CacheInsideInput,
         },
         StreamEvent::ConnectionType {
             connection: String::new(),

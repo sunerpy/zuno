@@ -457,6 +457,14 @@ pub struct Transcript {
     /// running total free to disagree with the strip's, and two token figures on one
     /// screen that differ is worse than either alone.
     tokens: TokenUsage,
+    /// The whole prompt the most recent request sent.
+    ///
+    /// Separate from [`Self::tokens`], and replaced rather than accumulated, because the
+    /// two answer different questions: `tokens` is what the session has been billed for
+    /// so far, and this is what is currently in the window. Deriving the second from the
+    /// first is the defect [`Transcript::context_used`] documents — a cumulative figure
+    /// passes any window on the second turn.
+    last_prompt_tokens: u64,
     /// The model's context ceiling, when the catalog states one.
     context_limit: u64,
     /// How many events have been folded, which is what advances the spinner.
@@ -528,11 +536,23 @@ impl Transcript {
         self.context_limit
     }
 
+    /// The whole prompt the most recent request sent, as the provider counted it.
+    ///
+    /// Replaced on every usage report rather than accumulated, which is the distinction
+    /// [`Self::context_used`] needs and [`Self::tokens`] cannot provide.
+    #[must_use]
+    pub const fn last_prompt_tokens(&self) -> u64 {
+        self.last_prompt_tokens
+    }
+
     /// How full the context window is, as a percentage, when a ceiling is known.
     ///
-    /// Computed from the last prompt's billed input plus its cache reads, never from
-    /// the cumulative total: the total exceeds any window as soon as a second turn
-    /// happens, so a percentage derived from it climbs past 100 and means nothing.
+    /// Computed from [`Self::last_prompt_tokens`] — the last request's whole prompt —
+    /// never from [`Self::tokens`], which is cumulative over the session. This used to
+    /// read `tokens.input + tokens.cache_read`, and because `TokenUsage::add` is `+=`
+    /// per step, two 80k-token prompts against a 128k window displayed `125%`: a number
+    /// that cannot happen, on the models where the figure matters most.
+    ///
     /// A zero ceiling is "no window declared" — see `token_count` in the CLI's turn
     /// plan, which maps a non-finite catalog limit to zero — so it yields `None`
     /// rather than dividing.
@@ -541,8 +561,7 @@ impl Transcript {
         if self.context_limit == 0 {
             return None;
         }
-        let used = self.tokens.input.saturating_add(self.tokens.cache_read);
-        Some(used.saturating_mul(100) / self.context_limit)
+        Some(self.last_prompt_tokens.saturating_mul(100) / self.context_limit)
     }
 
     /// The spinner frame this transcript is on.
@@ -760,12 +779,18 @@ impl Transcript {
                 output_tokens,
                 cache_read_input_tokens,
                 cache_write_input_tokens,
+                accounting,
             } => {
+                let input = input_tokens.unwrap_or_default();
+                let cache_read = cache_read_input_tokens.unwrap_or_default();
+                let cache_write = cache_write_input_tokens.unwrap_or_default();
+                // Replaced, not added: this is the window's current occupancy.
+                self.last_prompt_tokens = accounting.prompt_total(input, cache_read, cache_write);
                 self.tokens.add(
-                    input_tokens.unwrap_or_default(),
+                    accounting.uncached_input(input, cache_read, cache_write),
                     output_tokens.unwrap_or_default(),
-                    cache_read_input_tokens.unwrap_or_default(),
-                    cache_write_input_tokens.unwrap_or_default(),
+                    cache_read,
+                    cache_write,
                 );
                 true
             }
@@ -1957,19 +1982,6 @@ pub struct StatusView {
     /// [`Self::reset`] leaves it alone — the same reasoning that keeps `diagnostics`
     /// across a turn boundary.
     git_branch: Option<String>,
-    /// What the session has cost, already computed and already formatted.
-    ///
-    /// **Computing this is not this layer's job.** There is no usage-to-money function
-    /// in the workspace, and prices are per-million-token with tiered rates and a
-    /// separate `context_over_200k` band (`zuno-llm/src/catalog/models_dev.rs:129-198`),
-    /// so a view multiplying [`Self::usage`] by one rate would render a confidently
-    /// wrong number on exactly the long-context models where the figure matters most.
-    /// A wrong price is worse than no price, so the strip renders only what a caller
-    /// hands it, including the currency mark: the string is printed verbatim.
-    ///
-    /// Survives [`Self::reset`] for the same reason `usage` does — it is cumulative
-    /// over the session, not a property of the turn that happens to be running.
-    cost: Option<String>,
 }
 
 /// Token counts for the session, accumulated across every step of every turn.
@@ -1977,9 +1989,14 @@ pub struct StatusView {
 /// Cumulative rather than per-step because the number a user is watching for is what
 /// the session has cost so far; a per-step count resets to a small number at every
 /// step boundary and reads as if usage went down.
+/// The four buckets are **disjoint**, which is what makes [`Self::total`] a sum. Getting
+/// there takes work at the fold, because providers disagree about whether their prompt
+/// figure already contains their cache figure: `zuno_llm::event::PromptAccounting` states
+/// which, and [`Transcript::observe`] normalises with it before adding. Adding the raw
+/// numbers is what made the sidebar's total count OpenAI's cache reads twice.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenUsage {
-    /// Prompt tokens sent.
+    /// Prompt tokens that were neither read from nor written to the cache.
     pub input: u64,
     /// Completion tokens received.
     pub output: u64,
@@ -1996,10 +2013,17 @@ impl TokenUsage {
         self.input == 0 && self.output == 0 && self.cache_read == 0 && self.cache_write == 0
     }
 
-    /// Every token the session has been billed for, cache included.
+    /// Every token the session has been billed for, cache included and counted once.
+    ///
+    /// A plain sum only because the four buckets are disjoint — see the type's own note.
+    /// Saturating rather than wrapping: a long session's total is large, and a figure
+    /// that wrapped to a small number would read as usage going down.
     #[must_use]
     pub const fn total(&self) -> u64 {
-        self.input + self.output + self.cache_read + self.cache_write
+        self.input
+            .saturating_add(self.output)
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_write)
     }
 
     /// Add one step's report.
@@ -2114,7 +2138,6 @@ impl StatusView {
             diagnostics: None,
             awaiting_permission: false,
             git_branch: None,
-            cost: None,
         }
     }
 
@@ -2126,18 +2149,6 @@ impl StatusView {
     pub fn set_git_branch(&mut self, branch: impl Into<String>) {
         let branch = branch.into();
         self.git_branch = (!branch.is_empty()).then_some(branch);
-    }
-
-    /// Adopt an already-computed, already-formatted session cost from
-    /// `zuno-cli/src/cmd/tui.rs`.
-    ///
-    /// The caller owns the arithmetic and the currency mark; see [`Self::cost`] for why
-    /// the view must not derive either from [`Self::usage`]. Empty is treated as absent,
-    /// so a host with no pricing data for the active model pushes `""` rather than a
-    /// placeholder the user would read as free.
-    pub fn set_cost(&mut self, cost: impl Into<String>) {
-        let cost = cost.into();
-        self.cost = (!cost.is_empty()).then_some(cost);
     }
 
     /// Record whether a permission prompt is waiting on the user.
@@ -2261,37 +2272,48 @@ impl StatusView {
     /// Every right-hand group the row will try, richest first.
     ///
     /// The fields are laid out in *ascending* priority left to right — branch, token
-    /// counts, cost, exit key — and each rung is built by dropping the leftmost, which
-    /// is to say the lowest-ranked, field still present. Ordering them that way is what
-    /// keeps the right edge from reflowing as the terminal narrows: a dropped field
-    /// vanishes and nothing beside it moves.
+    /// counts, exit key — and each rung is built by dropping the leftmost, which is to
+    /// say the lowest-ranked, field still present. Ordering them that way is what keeps
+    /// the right edge from reflowing as the terminal narrows: a dropped field vanishes
+    /// and nothing beside it moves.
     ///
     /// The ranking, lowest first, and why:
     ///
     /// * **branch** — the ambient sidebar already prints it (`views/ambient.rs:470`), so
     ///   it is the one field a narrow row loses nothing unique by dropping.
-    /// * **token counts** — informational, and the sidebar carries the same accumulator
-    ///   (`views/session.rs:469`).
-    /// * **cost** — the only figure here that appears nowhere else on screen, and the
-    ///   summary that the raw counts beside it are merely the detail of. A user down to
-    ///   one number wants the money one.
+    /// * **token counts** — informational, and the sidebar carries the same accumulator.
     /// * **exit key** — the only way out, so it is last to go. It already outranked the
-    ///   token counts before either new field existed; both join below it rather than
+    ///   token counts before the branch existed; the branch joins below it rather than
     ///   displacing that order. Its spelling comes from [`Self::exit_hint`]; the rank
     ///   does not depend on how wide that spelling turns out to be.
     ///
-    /// With neither new field set this reduces to today's two rungs — counts plus the
-    /// key, then the key alone — so the pre-existing degradation is unchanged.
+    /// With no branch set this reduces to two rungs — counts plus the key, then the key
+    /// alone — so the pre-existing degradation is unchanged.
+    ///
+    /// # Why there is no cost rung
+    ///
+    /// There was one, and it could never be populated. It had a `set_cost` setter whose
+    /// comment named `zuno-cli/src/cmd/tui.rs` as the caller, and no such call existed:
+    /// only tests ever set it, so the segment was empty in every real session while the
+    /// comment asserted a contract nobody honoured.
+    ///
+    /// It was removed rather than wired because no authoritative figure is reachable to
+    /// wire it *to*. `zuno_engine::stream::ProjectionContext::with_cost` is called only
+    /// from `zuno-engine/tests/stream.rs`, so every persisted `"cost"` is `0.0` and the
+    /// session's column always sums to zero — a wired segment would read `$0.00` forever,
+    /// which a user reads as *free* rather than as *unknown*. Computing one here is worse:
+    /// prices are per-million-token and `catalog::merge::cost_from_catalog` drops the
+    /// `context_over_200k` band at resolve time, so a multiplication in this layer would
+    /// be confidently wrong on exactly the long-context models where the number matters.
+    /// A wrong price is worse than no price, and an empty segment claiming to be a price
+    /// is worse than neither.
     fn trailers(&self) -> Vec<String> {
-        let mut ranked = Vec::with_capacity(4);
+        let mut ranked = Vec::with_capacity(3);
         if let Some(branch) = &self.git_branch {
             ranked.push(format!("{}{branch}", Self::BRANCH_GLYPH));
         }
         if !self.usage.is_empty() {
             ranked.push(self.usage.compact());
-        }
-        if let Some(cost) = &self.cost {
-            ranked.push(cost.clone());
         }
         ranked.push(self.exit_hint());
         (0..ranked.len())
@@ -2441,14 +2463,21 @@ impl Component for StatusView {
                         output_tokens,
                         cache_read_input_tokens,
                         cache_write_input_tokens,
+                        accounting,
                     },
                 ..
             } => {
+                let input = input_tokens.unwrap_or(0);
+                let cache_read = cache_read_input_tokens.unwrap_or(0);
+                let cache_write = cache_write_input_tokens.unwrap_or(0);
+                // Normalised the same way [`Transcript::observe`] does, and it has to be:
+                // the strip and the sidebar show the same session, so two accumulators
+                // folding the same event differently would put two totals on one screen.
                 self.usage.add(
-                    input_tokens.unwrap_or(0),
+                    accounting.uncached_input(input, cache_read, cache_write),
                     output_tokens.unwrap_or(0),
-                    cache_read_input_tokens.unwrap_or(0),
-                    cache_write_input_tokens.unwrap_or(0),
+                    cache_read,
+                    cache_write,
                 );
                 EventResult::REDRAW
             }

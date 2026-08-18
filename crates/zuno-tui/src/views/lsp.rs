@@ -28,12 +28,131 @@
 //! confusion that this codebase's other surfaces refuse, and it is more dangerous here
 //! than elsewhere: it is a claim about correctness.
 
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex, PoisonError};
+
 use crate::views::{ViewContext, display_width, padded, truncate};
 use ratatui::text::{Line, Span};
+use tokio::sync::mpsc;
 
 #[cfg(test)]
 #[path = "lsp_tests.rs"]
 mod tests;
+
+/// How many paths may wait to be checked.
+///
+/// Distinct files, not batches: a session that writes more than this has produced more
+/// diagnostics than a transcript can show. Bounded because the set outlives the turn
+/// that filled it, so an unbounded one would be session-lifetime growth.
+pub const PENDING_EDIT_LIMIT: usize = 4_096;
+
+/// The files waiting to be checked, and the nudge that says so.
+///
+/// # Why the state is shared and only the wakeup is a message
+///
+/// The obvious shape — send the batch itself down a bounded channel — loses work. The
+/// receiver serially awaits a language server's startup and its per-file diagnostics, so
+/// several short turns finishing in a row fill the queue; a `try_send` that then reports
+/// `Full` has dropped a *whole batch*, and the files unique to it are never re-checked.
+/// The screen shows stale diagnostics, or none, with nothing saying so.
+///
+/// Refusing the newest is right for a prompt — the user can retype it — and wrong for
+/// accumulated state, which nobody can retype. So the accumulated part is durable: paths
+/// merge into one set that survives any number of missed wakeups, and the channel carries
+/// `()` at capacity one purely as "there is something to do". Losing that signal costs
+/// nothing, because the next one finds everything the lost one would have.
+#[derive(Clone)]
+pub struct PendingEdits {
+    files: Arc<Mutex<BTreeSet<String>>>,
+    /// Paths refused once [`PENDING_EDIT_LIMIT`] was reached.
+    ///
+    /// Counted rather than discarded silently: a truncated set is a gap in a claim about
+    /// correctness, and the same reasoning that makes an unchecked file a reported state
+    /// makes a dropped one worth naming.
+    overflowed: Arc<Mutex<usize>>,
+    wake: mpsc::Sender<()>,
+}
+
+impl PendingEdits {
+    /// A handle that merges into a fresh set and nudges `wake`.
+    #[must_use]
+    pub fn new(wake: mpsc::Sender<()>) -> Self {
+        Self {
+            files: Arc::new(Mutex::new(BTreeSet::new())),
+            overflowed: Arc::new(Mutex::new(0)),
+            wake,
+        }
+    }
+
+    /// Merge `paths` into the set and signal the checker.
+    ///
+    /// A poisoned lock is recovered rather than propagated: the guarded value is a set of
+    /// strings, so a panic elsewhere cannot have left it in a state that makes an insert
+    /// wrong, and a render loop that panicked over somebody else's panic would lose the
+    /// whole session.
+    pub fn merge(&self, paths: impl IntoIterator<Item = String>) {
+        let mut files = self.files.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut refused = 0_usize;
+        for path in paths {
+            if files.len() >= PENDING_EDIT_LIMIT && !files.contains(&path) {
+                refused += 1;
+                continue;
+            }
+            files.insert(path);
+        }
+        let empty = files.is_empty();
+        drop(files);
+        if refused > 0 {
+            *self
+                .overflowed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) += refused;
+        }
+        if empty {
+            return;
+        }
+        // `try_send` on a capacity-one channel: a full queue means a wakeup is already
+        // pending, and that pending one will drain everything this call just merged.
+        let _nudged = self.wake.try_send(());
+    }
+
+    /// A read handle over the same set, holding no wakeup sender.
+    ///
+    /// The consumer must not hold one. It would be its own producer, so the channel could
+    /// never close, `recv` would never return `None`, and the checker task would outlive
+    /// the screen that fed it — a task waiting forever on a sender only it still owns.
+    /// Splitting the handle makes that unrepresentable rather than merely discouraged, and
+    /// it states who may do what: the screen merges, the checker takes.
+    #[must_use]
+    pub fn reader(&self) -> PendingEditReader {
+        PendingEditReader {
+            files: Arc::clone(&self.files),
+            overflowed: Arc::clone(&self.overflowed),
+        }
+    }
+}
+
+/// The consumer half of a [`PendingEdits`]: drains the set, cannot signal it.
+#[derive(Clone)]
+pub struct PendingEditReader {
+    files: Arc<Mutex<BTreeSet<String>>>,
+    overflowed: Arc<Mutex<usize>>,
+}
+
+impl PendingEditReader {
+    /// Take every waiting path, and how many were refused for space.
+    #[must_use]
+    pub fn take(&self) -> (Vec<String>, usize) {
+        let taken = std::mem::take(&mut *self.files.lock().unwrap_or_else(PoisonError::into_inner));
+        let overflowed = std::mem::take(
+            &mut *self
+                .overflowed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        (taken.into_iter().collect(), overflowed)
+    }
+}
 
 /// How serious one diagnostic is.
 ///

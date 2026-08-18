@@ -727,6 +727,11 @@ pub async fn prompt(
         let event_session_id = request.session_id.clone();
         let (sender, receiver) = event_channel();
         tokio::spawn(async move {
+            // Counted for the memory sampler's session attribution: a server holding many
+            // concurrent sessions is a different diagnosis from one session leaking, and
+            // that is the distinction the count decides. A guard, so a task that returns
+            // early or panics still decrements.
+            let _session = zuno_observability::memory::SessionCount::enter();
             let outcome = if let Some(events) = durable_events.as_ref() {
                 let (outcome, ()) = tokio::join!(
                     executor.prompt(request, guard, sender),

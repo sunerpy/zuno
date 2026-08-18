@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
-use zuno_llm::event::{FinishReason, Message, RequestContentBlock, Role, StreamEvent};
+use zuno_llm::event::{
+    FinishReason, Message, PromptAccounting, RequestContentBlock, Role, StreamEvent,
+};
 use zuno_llm::registry::{ApiSurface, CompletionRequest};
 use zuno_provider_openai::{OpenAiConfig, OpenAiDecoder, Sampling, build_request_body};
 use zuno_testkit::{CassettePlayer, HttpInteraction, RequestSnapshot};
@@ -118,6 +120,7 @@ fn recorded_chat_text_matches_request_and_exact_events() {
                 output_tokens: Some(2),
                 cache_read_input_tokens: Some(0),
                 cache_write_input_tokens: None,
+                accounting: PromptAccounting::CacheInsideInput,
             },
         ]
     );
@@ -180,6 +183,7 @@ fn recorded_chat_tool_call_matches_request_and_exact_events() {
                 output_tokens: Some(5),
                 cache_read_input_tokens: Some(0),
                 cache_write_input_tokens: None,
+                accounting: PromptAccounting::CacheInsideInput,
             },
         ]
     );
@@ -256,6 +260,7 @@ fn recorded_chat_two_turn_tool_loop_matches_both_requests() {
             output_tokens: Some(15),
             cache_read_input_tokens: Some(0),
             cache_write_input_tokens: None,
+            accounting: PromptAccounting::CacheInsideInput,
         })
     );
     player.finish().expect("cassette consumed");
@@ -303,6 +308,7 @@ fn recorded_responses_text_uses_default_surface_and_exact_events() {
                 output_tokens: Some(18),
                 cache_read_input_tokens: Some(0),
                 cache_write_input_tokens: None,
+                accounting: PromptAccounting::CacheInsideInput,
             },
         ]
     );
@@ -353,6 +359,7 @@ fn recorded_responses_tool_call_matches_request_and_exact_events() {
                 output_tokens: Some(18),
                 cache_read_input_tokens: Some(0),
                 cache_write_input_tokens: None,
+                accounting: PromptAccounting::CacheInsideInput,
             },
         ]
     );
@@ -441,6 +448,7 @@ fn recorded_encrypted_reasoning_survives_store_false_continuation() {
             output_tokens: Some(20),
             cache_read_input_tokens: Some(0),
             cache_write_input_tokens: None,
+            accounting: PromptAccounting::CacheInsideInput,
         })
     );
     player.finish().expect("cassette consumed");

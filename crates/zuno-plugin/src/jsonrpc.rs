@@ -1312,9 +1312,10 @@ fn event_value(event: &zuno_engine::r#loop::TurnEvent) -> Result<Value, HookCode
             title,
             output,
             diff,
+            written_paths,
             is_error,
         } => {
-            json!({ "type": "tool.dispatch.completed", "step": step, "callID": call_id, "name": name, "title": title, "output": output, "diff": diff, "isError": is_error })
+            json!({ "type": "tool.dispatch.completed", "step": step, "callID": call_id, "name": name, "title": title, "output": output, "diff": diff, "writtenPaths": written_paths, "isError": is_error })
         }
         TurnEvent::ToolResultAppended {
             step,
@@ -1399,8 +1400,9 @@ fn stream_event_value(event: &zuno_llm::event::StreamEvent) -> Value {
             output_tokens,
             cache_read_input_tokens,
             cache_write_input_tokens,
+            accounting,
         } => {
-            json!({ "type": "token.usage", "inputTokens": input_tokens, "outputTokens": output_tokens, "cacheReadInputTokens": cache_read_input_tokens, "cacheWriteInputTokens": cache_write_input_tokens })
+            json!({ "type": "token.usage", "inputTokens": input_tokens, "outputTokens": output_tokens, "cacheReadInputTokens": cache_read_input_tokens, "cacheWriteInputTokens": cache_write_input_tokens, "promptAccounting": accounting.as_str() })
         }
         StreamEvent::ConnectionType { connection } => {
             json!({ "type": "connection.type", "connection": connection })

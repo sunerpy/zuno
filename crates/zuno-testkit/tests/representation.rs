@@ -181,7 +181,16 @@ fn turn_event_payloads() -> Vec<VariantPayload> {
         payload("ToolDispatchStarted", size_of::<(u32, String, String)>()),
         payload(
             "ToolDispatchCompleted",
-            size_of::<(u32, String, String, String, String, Option<String>, bool)>(),
+            size_of::<(
+                u32,
+                String,
+                String,
+                String,
+                String,
+                Option<String>,
+                Vec<String>,
+                bool,
+            )>(),
         ),
         payload("ToolResultAppended", size_of::<(u32, String, bool)>()),
         payload("StepCompleted", size_of::<(u32, Option<FinishReason>)>()),

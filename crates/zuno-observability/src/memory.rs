@@ -39,7 +39,10 @@
 //! for a week uses exactly the same bytes as one that ran for a minute.
 
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 /// How many samples the short-term ring retains.
 ///
@@ -389,9 +392,270 @@ fn dominates(region: u64, total: u64) -> bool {
 /// `error` for critical and `warn` for warning, matching the watchdog's mapping so
 /// one log can be read at one level without learning two conventions.
 pub fn report(incident: &MemoryIncident) {
-    match incident.severity {
-        Severity::Critical => tracing::error!(target: "memory", "{}", incident.summary()),
-        Severity::Warning => tracing::warn!(target: "memory", "{}", incident.summary()),
+    TracingSink.report(incident);
+}
+
+/// How a sampler's findings leave the process.
+///
+/// A seam for the same reason [`crate::watchdog::WatchdogSink`] is one: the alert path
+/// is the whole point of the sampler, and a test that called [`MemoryRing::incident`]
+/// directly would prove the arithmetic while saying nothing about whether anything runs
+/// it. Every level below was implemented and tested that way, and none of it was reachable
+/// — there was no sampler at all.
+pub trait MemorySink: Send + 'static {
+    /// Record one incident. Must not block: it runs on the sampler thread.
+    fn report(&self, incident: &MemoryIncident);
+
+    /// Record that the process came back under every threshold.
+    ///
+    /// A default no-op because recovery is not a problem, but the transition is worth a
+    /// line: without it a log shows a warning and then silence, which reads the same as
+    /// a sampler that died.
+    fn recovered(&self, _latest: &MemorySample) {}
+}
+
+/// The production sink: `tracing` at a level matching the incident's severity.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TracingSink;
+
+impl MemorySink for TracingSink {
+    fn report(&self, incident: &MemoryIncident) {
+        match incident.severity {
+            Severity::Critical => tracing::error!(target: "memory", "{}", incident.summary()),
+            Severity::Warning => tracing::warn!(target: "memory", "{}", incident.summary()),
+        }
+    }
+
+    fn recovered(&self, latest: &MemorySample) {
+        tracing::warn!(
+            target: "memory",
+            "memory.recovered rss_kib={} active_sessions={}",
+            latest.total_rss_kib(),
+            latest.active_sessions
+        );
+    }
+}
+
+/// How many identical repeats are logged before the interval starts doubling.
+///
+/// One. An incident that persists is one fact, not one fact per sample: at
+/// [`SAMPLE_EVERY`] an unattended process past 2 GiB would otherwise write a line every
+/// two seconds for as long as it runs — 43,200 lines a day saying what the first one
+/// said. That is its own defect, and it is the one that fills a disk while claiming to
+/// diagnose memory. Matches [`crate::watchdog::STALL_BACKOFF_FACTOR`]'s reasoning.
+pub const REPEAT_BACKOFF_FACTOR: u32 = 2;
+
+/// The longest gap between repeats of an unchanged incident.
+///
+/// Ten minutes, so a process that has been over the threshold for hours still proves the
+/// sampler is alive and still says so, without the log being mostly repetition.
+pub const MAX_REPEAT_BACKOFF: Duration = Duration::from_secs(600);
+
+/// A change worth reporting immediately, regardless of the backoff.
+///
+/// Severity or attribution moving is new information — `warning` becoming `critical`, or
+/// growth switching from mapped files to the heap — so it resets the interval rather than
+/// waiting it out. Growth alone does not: it changes on almost every sample.
+const fn is_new_information(previous: &MemoryIncident, current: &MemoryIncident) -> bool {
+    previous.severity as u8 != current.severity as u8
+        || previous.attribution as u8 != current.attribution as u8
+}
+
+/// Where a sampler reads its resident split and its session count from.
+///
+/// A trait rather than a closure so a test can drive the sampler through synthetic growth
+/// without waiting for a real process to leak, while production passes [`ProcSource`] and
+/// exercises the same loop.
+pub trait MemorySource: Send + 'static {
+    /// The current sample, or `None` when the platform cannot report one.
+    fn sample(&mut self, elapsed: Duration) -> Option<MemorySample>;
+}
+
+/// The production source: `/proc/self/status`, plus a caller-supplied session count.
+pub struct ProcSource {
+    sessions: Arc<AtomicU32>,
+}
+
+impl ProcSource {
+    /// A source counting sessions through `sessions`.
+    ///
+    /// Shared rather than captured because the count changes while the sampler runs, and
+    /// a figure read once at startup would attribute a 40-session process to whatever it
+    /// had at launch — turning [`Attribution::SessionCount`] into a permanent wrong answer.
+    #[must_use]
+    pub const fn new(sessions: Arc<AtomicU32>) -> Self {
+        Self { sessions }
+    }
+}
+
+impl MemorySource for ProcSource {
+    fn sample(&mut self, elapsed: Duration) -> Option<MemorySample> {
+        observe(elapsed, self.sessions.load(Ordering::Relaxed))
+    }
+}
+
+/// The process-wide count of sessions currently in flight.
+///
+/// A process global, and deliberately: [`Attribution::SessionCount`] is the level that
+/// tells "many sessions, each reasonably sized" apart from "one session leaking", and it
+/// needs the count as it is *now*. The sampler starts before any command has built a
+/// session registry, so threading a handle from the entry point down to whatever owns the
+/// sessions would mean either wiring it through every command or reading the count once at
+/// launch and being permanently wrong. A counter the owner increments and the sampler reads
+/// costs one atomic and cannot go stale.
+///
+/// Guard with [`SessionCount`] rather than by hand, so an early return or a panic cannot
+/// leave the count above zero and make a healthy process look like it is hoarding sessions.
+pub fn active_sessions() -> &'static Arc<AtomicU32> {
+    static ACTIVE: OnceLock<Arc<AtomicU32>> = OnceLock::new();
+    ACTIVE.get_or_init(|| Arc::new(AtomicU32::new(0)))
+}
+
+/// RAII marker that one session is in flight.
+#[derive(Debug)]
+pub struct SessionCount;
+
+impl SessionCount {
+    /// Count one session until the returned guard drops.
+    #[must_use]
+    pub fn enter() -> Self {
+        active_sessions().fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for SessionCount {
+    fn drop(&mut self) {
+        // Saturating rather than wrapping: a decrement that underflowed would report
+        // 4 billion sessions and send the attribution to the wrong level entirely.
+        let _previous =
+            active_sessions().fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                Some(count.saturating_sub(1))
+            });
+    }
+}
+
+/// A running memory sampler: a thread, a bounded ring, and a rate-limited alert path.
+///
+/// # Why this exists as a type
+///
+/// Every level of [`MemoryRing::incident`] was implemented and unit-tested, and a
+/// repo-wide search found no production construction of a ring and no production call to
+/// [`observe`] or [`report`]. The alert could not fire however far resident memory grew.
+/// This is the missing driver, and it is a thread rather than a `tokio::spawn` for the
+/// reason the watchdog's is: it must keep sampling while the runtime's workers are all
+/// blocked, which is exactly the state worth a report.
+pub struct MemorySampler {
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl MemorySampler {
+    /// Start sampling `/proc` every [`SAMPLE_EVERY`], reporting through [`TracingSink`].
+    #[must_use]
+    pub fn spawn(sessions: Arc<AtomicU32>) -> Self {
+        Self::spawn_with(SAMPLE_EVERY, ProcSource::new(sessions), TracingSink)
+    }
+
+    /// Start sampling `source` every `every`, reporting through `sink`.
+    #[must_use]
+    pub fn spawn_with(every: Duration, source: impl MemorySource, sink: impl MemorySink) -> Self {
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker = Arc::clone(&stop);
+        let thread = std::thread::Builder::new()
+            .name("zuno-memory-sampler".to_owned())
+            .spawn(move || sample_until_stopped(&worker, every, source, sink))
+            .ok();
+        Self { stop, thread }
+    }
+
+    /// Stop sampling and wait for the thread.
+    ///
+    /// Joined rather than detached so a caller that shuts logging down next cannot race a
+    /// report into a closed writer.
+    pub fn shutdown(mut self) {
+        if let Ok(mut stop) = self.stop.0.lock() {
+            *stop = true;
+        }
+        self.stop.1.notify_all();
+        if let Some(thread) = self.thread.take() {
+            let _joined = thread.join();
+        }
+    }
+}
+
+impl Drop for MemorySampler {
+    fn drop(&mut self) {
+        if let Ok(mut stop) = self.stop.0.lock() {
+            *stop = true;
+        }
+        self.stop.1.notify_all();
+    }
+}
+
+fn sample_until_stopped(
+    stop: &Arc<(Mutex<bool>, Condvar)>,
+    every: Duration,
+    mut source: impl MemorySource,
+    sink: impl MemorySink,
+) {
+    let started = Instant::now();
+    let mut ring = MemoryRing::new();
+    let mut reported: Option<MemoryIncident> = None;
+    let mut next_repeat = Duration::ZERO;
+    let mut backoff = every;
+
+    loop {
+        if park(stop, every) {
+            return;
+        }
+        let now = started.elapsed();
+        let Some(sample) = source.sample(now) else {
+            // Off Linux there is no split to read, so there is nothing to say. Returning
+            // rather than spinning: the answer will not change.
+            return;
+        };
+        ring.push(sample);
+        match ring.incident() {
+            Some(incident) => {
+                let escalated = reported
+                    .as_ref()
+                    .is_none_or(|previous| is_new_information(previous, &incident));
+                if escalated {
+                    backoff = every;
+                    next_repeat = Duration::ZERO;
+                }
+                if now >= next_repeat {
+                    sink.report(&incident);
+                    next_repeat = now.saturating_add(backoff);
+                    backoff = backoff
+                        .saturating_mul(REPEAT_BACKOFF_FACTOR)
+                        .min(MAX_REPEAT_BACKOFF);
+                }
+                reported = Some(incident);
+            }
+            None => {
+                if reported.take().is_some() {
+                    sink.recovered(&sample);
+                    backoff = every;
+                    next_repeat = Duration::ZERO;
+                }
+            }
+        }
+    }
+}
+
+/// Park for at most `timeout`. `true` means shutdown was requested.
+fn park(stop: &Arc<(Mutex<bool>, Condvar)>, timeout: Duration) -> bool {
+    let Ok(guard) = stop.0.lock() else {
+        return true;
+    };
+    if *guard {
+        return true;
+    }
+    match stop.1.wait_timeout(guard, timeout) {
+        Ok((guard, _)) => *guard,
+        Err(_) => true,
     }
 }
 

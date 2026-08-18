@@ -159,11 +159,15 @@ fn seeded() -> Connection {
 }
 
 fn provider_events(calls: &[(&str, &str)]) -> Vec<Vec<StreamEvent>> {
+    named_provider_events("bash", calls)
+}
+
+fn named_provider_events(tool: &str, calls: &[(&str, &str)]) -> Vec<Vec<StreamEvent>> {
     let mut first = Vec::new();
     for (id, command) in calls {
         first.push(StreamEvent::ToolUseStart {
             id: (*id).to_owned(),
-            name: "bash".to_owned(),
+            name: tool.to_owned(),
         });
         first.push(StreamEvent::ToolInputDelta(
             json!({ "command": command, "intent": "qa" }).to_string(),
@@ -349,4 +353,107 @@ async fn dispatch_loop_appends_denial_and_continues_to_the_next_call() {
     assert_eq!(statuses, ["error", "completed"]);
     assert_eq!(order, ["git status"]);
     eprintln!("DENIAL_QA transcript={transcript:?} persisted={statuses:?} order={order:?}");
+}
+
+/// A tool that writes files and reports them the way the real file tools do.
+///
+/// Named `apply_patch` and reporting two paths on purpose: those are the two properties
+/// that made the defect invisible. A host cannot recognise this tool from the shipped
+/// `["edit", "write", "patch"]` name list, and it writes more files than any single
+/// `filepath` field or prose `title` could carry.
+struct PatchingTool;
+
+#[async_trait]
+impl Tool for PatchingTool {
+    fn id(&self) -> &str {
+        "apply_patch"
+    }
+
+    fn description(&self) -> &str {
+        "Apply a patch to several files."
+    }
+
+    fn raw_parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "required": ["command"]
+        })
+    }
+
+    async fn execute(&self, _args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text(
+            "Success. Updated the following files:",
+            "M first.rs\nM second.rs",
+        )
+        .with_written_path(std::path::Path::new("first.rs"))
+        .with_written_path(std::path::Path::new("second.rs")))
+    }
+}
+
+#[tokio::test]
+async fn dispatch_loop_carries_every_written_path_from_the_tool_onto_the_event() {
+    // The link a green suite did not cover. `ToolDispatchCompleted` forwarded only name,
+    // title, output and diff, dropping the result's metadata — so even a tool that stated
+    // which files it wrote had that answer discarded here, and the host downstream was
+    // left inferring paths from a prose `title` and a name list. Both inferences fail on
+    // exactly this shape: one call, two files, a title that is a sentence.
+    //
+    // Driven through `run_turn` with a real `ToolRegistryDispatcher` rather than by
+    // constructing the event, because constructing it is what hides a dropped field.
+    let mut connection = seeded();
+    let provider = Arc::new(ScriptedProvider::new(named_provider_events(
+        "apply_patch",
+        &[("call-patch", "patch")],
+    )));
+    let providers = registry(provider);
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![Arc::new(PatchingTool)],
+        vec![Rule {
+            permission: "*".to_owned(),
+            pattern: "*".to_owned(),
+            action: PermissionAction::Allow,
+        }],
+        Arc::new(AllowAll),
+        InterruptSignal::new(),
+        McpToolStatus::Ready,
+    );
+    let resolver = Resolver;
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+    let turn = run_turn(
+        RunTurnRequest::new(SESSION_ID, "turn-written-paths", DynamicContext::default()),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, events) = tokio::join!(turn, collect_events(receiver));
+    assert!(matches!(outcome, Ok(TurnOutcome::Completed { .. })));
+
+    let completed = events
+        .iter()
+        .find_map(|event| match event {
+            TurnEvent::ToolDispatchCompleted {
+                name,
+                written_paths,
+                is_error,
+                ..
+            } => Some((name.clone(), written_paths.clone(), *is_error)),
+            _ => None,
+        })
+        .expect("the turn dispatched the patching tool");
+
+    assert_eq!(completed.0, "apply_patch");
+    assert!(!completed.2, "the call succeeded");
+    assert_eq!(
+        completed.1,
+        vec![String::from("first.rs"), String::from("second.rs")],
+        "the event must carry every path the tool reported writing; a host checking \
+         diagnostics has no other source for them"
+    );
 }

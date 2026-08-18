@@ -39,6 +39,18 @@ pub const DEFAULT_MAX_BYTES: usize = 51_200;
 /// own shape.
 pub const METADATA_OUTPUT_PATHS_KEY: &str = "outputPaths";
 
+/// The metadata key recording which files this call wrote to disk.
+///
+/// An array because one call can write several — `apply_patch` applies a whole patch
+/// set — and the reader needs every path, not a representative one.
+///
+/// A tool records this *where it writes*, so no downstream consumer has to recognise a
+/// writing tool by name. That mattered: the TUI's language-server hook kept a list of
+/// tool ids and the list did not contain `apply_patch`, so on the models that expose
+/// only `read` and `apply_patch` a successful patch was never checked. A path the tool
+/// itself reported cannot fall out of a list nobody remembered to update.
+pub const METADATA_WRITTEN_PATHS_KEY: &str = "writtenPaths";
+
 /// A file a tool produced alongside its text.
 ///
 /// The oracle types these as `Omit<FilePart, "id" | "sessionID" | "messageID">`
@@ -151,6 +163,40 @@ impl ToolOutput {
     pub fn output_paths(&self) -> Vec<&str> {
         self.metadata
             .get(METADATA_OUTPUT_PATHS_KEY)
+            .and_then(Value::as_array)
+            .map(|paths| paths.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default()
+    }
+
+    /// Records that this call wrote `path`, chaining.
+    ///
+    /// Repeats are dropped so a tool that writes and then re-reads the same file reports
+    /// it once; a key holding a non-array is replaced, since no reader could use it.
+    /// Deletions are deliberately not recorded — see [`METADATA_WRITTEN_PATHS_KEY`].
+    #[must_use]
+    pub fn with_written_path(mut self, path: &std::path::Path) -> Self {
+        let entry = Value::String(path.to_string_lossy().into_owned());
+        match self.metadata.get_mut(METADATA_WRITTEN_PATHS_KEY) {
+            Some(Value::Array(paths)) => {
+                if !paths.contains(&entry) {
+                    paths.push(entry);
+                }
+            }
+            Some(_) | None => {
+                self.metadata.insert(
+                    METADATA_WRITTEN_PATHS_KEY.to_owned(),
+                    Value::Array(vec![entry]),
+                );
+            }
+        }
+        self
+    }
+
+    /// The files this call wrote, in the order written.
+    #[must_use]
+    pub fn written_paths(&self) -> Vec<&str> {
+        self.metadata
+            .get(METADATA_WRITTEN_PATHS_KEY)
             .and_then(Value::as_array)
             .map(|paths| paths.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default()

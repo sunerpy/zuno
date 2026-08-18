@@ -76,17 +76,28 @@ impl SseDecoder {
     }
 }
 
+/// Where the first event separator ends, and how many bytes it spans.
+///
+/// The **earlier** of the two spellings wins, which is the whole reason this is not two
+/// chained `or_else` lookups: both are legal in one stream, and searching for `\r\n\r\n`
+/// unconditionally first skips an earlier `\n\n` and hands `parse_event` two events as
+/// one frame. It then joins their `data:` payloads and the caller decodes the pair as a
+/// single malformed JSON-RPC message. Matches `zuno_llm::sse`'s `next_separator`, which
+/// compares the two positions for the same reason.
 fn frame_end(bytes: &[u8]) -> Option<(usize, usize)> {
-    bytes
+    let crlf = bytes
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .map(|index| (index, 4))
-        .or_else(|| {
-            bytes
-                .windows(2)
-                .position(|window| window == b"\n\n")
-                .map(|index| (index, 2))
-        })
+        .map(|index| (index, 4));
+    let lf = bytes
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|index| (index, 2));
+    match (lf, crlf) {
+        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
+        (Some(separator), None) | (None, Some(separator)) => Some(separator),
+        (None, None) => None,
+    }
 }
 
 fn parse_event(frame: &str) -> Option<SseEvent> {
@@ -177,6 +188,73 @@ mod tests {
         assert_eq!(
             SseDecoder::default().max_event_bytes,
             StreamLimits::from_environment().max_event_bytes()
+        );
+    }
+
+    /// Every `data:` payload the decoder handed back, in order.
+    fn drain(decoder: &mut SseDecoder) -> Vec<String> {
+        std::iter::from_fn(|| decoder.pop())
+            .map(|event| event.data)
+            .collect()
+    }
+
+    #[test]
+    fn an_lf_separated_event_is_not_merged_into_a_later_crlf_separated_one() {
+        // Both separators are legal in the same stream — the wire format permits either
+        // per line — and a decoder that looks for CRLFCRLF first skips the earlier LFLF
+        // and returns both events as one frame. `parse_event` then joins the two `data:`
+        // payloads with a newline, so the caller decodes `{"id":1}\n{"id":2}` as one
+        // JSON-RPC message, fails, and errors out the *first* call as malformed.
+        let mut decoder = decoder(64 * 1024);
+        decoder
+            .push(b"data: {\"id\":1}\n\ndata: {\"id\":2}\r\n\r\n")
+            .expect("both events are far under the cap");
+
+        assert_eq!(
+            drain(&mut decoder),
+            vec![String::from("{\"id\":1}"), String::from("{\"id\":2}")],
+            "the LF separator came first, so it ends the first frame"
+        );
+    }
+
+    #[test]
+    fn a_crlf_separated_event_is_not_merged_into_a_later_lf_separated_one() {
+        // The mirror case, which a fix that merely swapped the search order would break:
+        // whichever separator appears *earlier* ends the frame, not whichever spelling
+        // the decoder happens to try first.
+        let mut decoder = decoder(64 * 1024);
+        decoder
+            .push(b"data: {\"id\":1}\r\n\r\ndata: {\"id\":2}\n\n")
+            .expect("both events are far under the cap");
+
+        assert_eq!(
+            drain(&mut decoder),
+            vec![String::from("{\"id\":1}"), String::from("{\"id\":2}")],
+            "the CRLF separator came first, so it ends the first frame"
+        );
+    }
+
+    #[test]
+    fn a_separator_split_across_two_chunks_still_ends_its_frame() {
+        // A separator is four bytes and a socket read is whatever the kernel had, so the
+        // split is routine rather than adversarial: the decoder must hold the partial
+        // separator and complete the frame when the rest of it arrives.
+        let mut decoder = decoder(64 * 1024);
+        decoder
+            .push(b"data: {\"id\":1}\r\n")
+            .expect("a partial separator is not an event");
+        assert!(
+            decoder.pop().is_none(),
+            "half a separator must not end a frame"
+        );
+        decoder
+            .push(b"\r\ndata: {\"id\":2}\n\n")
+            .expect("the rest of the separator completes the first frame");
+
+        assert_eq!(
+            drain(&mut decoder),
+            vec![String::from("{\"id\":1}"), String::from("{\"id\":2}")],
+            "a separator split across a chunk boundary lost an event"
         );
     }
 }

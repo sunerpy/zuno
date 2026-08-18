@@ -239,6 +239,7 @@ fn turn_event(event: &TurnEvent) -> NewEvent {
             title,
             output,
             diff,
+            written_paths,
             is_error,
         } => (
             "tool.dispatch.completed",
@@ -249,6 +250,7 @@ fn turn_event(event: &TurnEvent) -> NewEvent {
                 "title": title,
                 "output": output,
                 "diff": diff,
+                "writtenPaths": written_paths,
                 "isError": is_error,
             })),
         ),
@@ -351,17 +353,23 @@ fn provider_event(event: &ProviderEvent) -> Value {
         ProviderEvent::RetryRollback { attempt, max } => {
             json!({"type": "retry.rollback", "attempt": attempt, "max": max})
         }
+        // `promptAccounting` travels with the four numbers because a client has the same
+        // ambiguity the TUI had: whether the cache figures are inside the prompt figure or
+        // beside it decides both the session total and the context percentage, and it
+        // cannot be told from the values.
         ProviderEvent::TokenUsage {
             input_tokens,
             output_tokens,
             cache_read_input_tokens,
             cache_write_input_tokens,
+            accounting,
         } => json!({
             "type": "token.usage",
             "inputTokens": input_tokens,
             "outputTokens": output_tokens,
             "cacheReadInputTokens": cache_read_input_tokens,
             "cacheWriteInputTokens": cache_write_input_tokens,
+            "promptAccounting": accounting.as_str(),
         }),
         ProviderEvent::ConnectionType { connection } => {
             json!({"type": "connection.type", "connection": connection})
