@@ -248,6 +248,219 @@ satisfied and none of them rests on a transferred number.
   inlines nowhere. The 5.75 M map keys are a separate and larger opportunity, but
   that is interning, not `CompactString`.
 
+## R2-R5 transcript render cost
+
+R2-R5 are the plan's four render-side items: a prepared-frame cache, incremental
+body reuse for an O(n²), a per-message line cache, and a large-buffer shrink.
+§10.1 forbids adopting the reference implementation's numbers and §1 requires a
+measured one, so the cost each item claims to fix was measured on this project
+first. The measurements live in `crates/zuno-tui/tests/render_cost.rs` and are
+reproduced with:
+
+```sh
+ZUNO_RENDER_COST=1 cargo test -p zuno-tui --offline --release \
+  --test render_cost -- --nocapture --test-threads=1
+```
+
+Five runs per point, min / median / max and `max/min`, the shape *Allocator
+comparison* and *D0* use. Release profile, because a debug frame is not the frame
+a user pays for. The workload alternates user prompts with assistant replies
+carrying reasoning, markdown prose with a bullet list, a fenced Rust block and a
+completed tool call; 931 messages is the pinned W-real subject's message count.
+The assertions that run without `ZUNO_RENDER_COST` carry no clock: they pin the
+workload's shape and the properties any reuse depends on.
+
+### The attribution, which reordered the work
+
+Before deciding what to cache, the cost was attributed. One `markdown::render`
+call, five runs:
+
+| body | min | median | max | max/min | delta over prose |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| prose only | 10.410 µs | 11.544 µs | 14.720 µs | 1.4140x | — |
+| prose + 1 Rust fence | 17.029 ms | 17.237 ms | 17.279 ms | 1.0147x | 17.225 ms |
+| prose + 2 Rust fences | 34.213 ms | 34.571 ms | 35.029 ms | 1.0239x | 34.560 ms |
+| prose + 1 JSON fence | 26.040 µs | 31.780 µs | 40.802 µs | 1.5669x | 20.236 µs |
+
+Laying rows out costs 11.544 µs. One Rust fence cost **1,493x that**, two cost
+exactly twice one, and a JSON fence cost 851x less than a Rust one. The
+proportionality to fence count rules out a one-off, and the gap between two
+languages parsing bodies of the same size identifies the cost as
+`HighlightConfiguration::new` compiling the grammar's `HIGHLIGHTS_QUERY` — Rust's
+query is large and JSON's is small. It ran once per fence per frame.
+
+At 931 messages, 465 replies × 17.225 ms is 8.01 s of the 8.269 s frame measured
+below: **96.9%** of the cost of rendering a transcript was recompiling queries
+that never change. §3.3's row for a syntax-highlight cache reads "未实现高亮" —
+accurate when the plan was written and stale since highlighting shipped, which is
+the drift §10.1 warns about. Memoising it is not one of R2-R5 and it was the
+largest item in the area by two orders of magnitude.
+
+The configuration is now built at most once per grammar
+(`crates/zuno-tui/src/views/highlight.rs`). Its key is the grammar alone, and no
+input can stale it: a configuration is a function of a `Language` and a
+`&'static str` query, both fixed at compile time, and colour is applied
+afterwards from the highlight events, so a live re-theme does not reach it. The
+bound is 16 slots, one per grammar, allocated with the static — a cache keyed on a
+`Copy` enum cannot grow with content, session length or uptime. A failed build is
+cached rather than retried, per §6.5.
+
+### One full frame, `TranscriptView::lines`, before and after the memo
+
+| msgs | rows | before, min / median / max | max/min | after, min / median / max | max/min | speedup |
+| ---: | ---: | --- | ---: | --- | ---: | ---: |
+| 2 | 28 | 17.569 / 17.943 / 21.439 ms | 1.2203x | 156.582 / 160.613 / 176.938 µs | 1.1300x | 111.7x |
+| 16 | 224 | 139.575 / 141.500 / 145.759 ms | 1.0443x | 1.157 / 1.206 / 1.340 ms | 1.1581x | 117.3x |
+| 64 | 896 | 561.889 / 563.248 / 576.490 ms | 1.0260x | 4.525 / 4.591 / 5.401 ms | 1.1935x | 122.7x |
+| 256 | 3,584 | 2.282 / 2.306 / 2.334 s | 1.0225x | 17.713 / 18.478 / 19.352 ms | 1.0925x | 124.8x |
+| 512 | 7,168 | 4.530 / 4.564 / 4.604 s | 1.0165x | 35.106 / 35.304 / 36.238 ms | 1.0322x | 129.3x |
+| 931 | 13,023 | 8.191 / 8.269 / 8.378 s | 1.0228x | 63.568 / 63.696 / 63.787 ms | 1.0034x | 129.8x |
+
+Per-frame cost is linear in transcript size both before and after: 465.5x the
+messages cost 460.86x the time before and 396.58x after, at a steady 68-80 µs per
+message. So there is no O(n²) *within* one frame.
+
+### The O(n²) is across frames, and it is real
+
+A streaming delta changes only the tail, so the frame it forces should cost what
+the tail costs. Measured with the memo in place, whole frame versus the tail alone:
+
+| msgs | whole frame, min / median / max | max/min | tail as % of frame |
+| ---: | --- | ---: | ---: |
+| 2 | 292.048 / 297.505 / 323.649 µs | 1.1082x | 53.72% |
+| 16 | 1.305 / 1.317 / 1.355 ms | 1.0384x | 11.71% |
+| 64 | 4.652 / 4.713 / 4.977 ms | 1.0700x | 3.40% |
+| 256 | 17.910 / 18.325 / 18.447 ms | 1.0300x | 0.88% |
+| 512 | 35.136 / 35.532 / 35.975 ms | 1.0239x | 0.45% |
+| 931 | 64.051 / 64.819 / 67.202 ms | 1.0492x | 0.24% |
+
+At 931 messages **99.76%** of every streaming frame re-derived rows that could not
+have changed. F frames each doing O(n) work for an O(1) change is the plan's
+O(n²), and the share grows with the transcript, which is what makes it that shape
+rather than a constant overhead. A keystroke is the same frame with 100% of it
+redundant, since no message changed at all.
+
+### What a cache hit can cost, measured before building one
+
+`lines` returns owned rows, so any cache above it pays a clone per hit. If the
+clone cost the render, the right answer was to close the items.
+
+| msgs | rows | clone, min / median / max | max/min | clone as % of a render |
+| ---: | ---: | --- | ---: | ---: |
+| 2 | 28 | 4.795 / 5.645 / 6.977 µs | 1.4551x | 3.51% |
+| 16 | 224 | 36.540 / 46.940 / 49.026 µs | 1.3417x | 3.89% |
+| 64 | 896 | 157.012 / 169.717 / 204.648 µs | 1.3034x | 3.70% |
+| 256 | 3,584 | 565.287 / 595.067 µs / 1.428 ms | 2.5270x | 3.22% |
+| 512 | 7,168 | 1.117 / 1.148 / 2.410 ms | 2.1568x | 3.25% |
+| 931 | 13,023 | 3.799 / 3.933 / 5.779 ms | 1.5210x | 6.17% |
+
+A hit costs 6.17% of a miss at 931 messages, so reuse was worth building.
+
+### R4 as built, and what it delivered
+
+`crates/zuno-tui/src/views/message.rs` caches rows **per message**, not per
+frame. Per frame would miss on every delta of a streaming turn, because the
+trailer carries a spinner that advances on every folded event.
+
+The key is the width, the two display affordances, the preceding role, a
+content fingerprint of the message, and the resolved theme compared by `Arc`
+identity. `ViewContext` holds `Arc<RwLock<Arc<Resolved>>>` and `set_theme`
+installs a new `Arc`, so a pointer comparison is a *complete* test for a palette
+change — including `thinkingOpacity`, which `Palette::entries` does not report and
+which a field-by-field hash would have missed. The comparison is free of an ABA
+hazard only because the entry holds the `Arc` it rendered with, so that address
+cannot be reused. The fingerprint is derived from the parts rather than tracked as
+a revision counter, because the fold mutates parts in place from several places
+and a counter is a thing an edit can forget to bump, whose failure mode is a frame
+showing content the transcript no longer holds.
+
+The bound is **32,768 rows** across all entries, not an entry count: an expanded
+`Reasoning` body is wrapped with no row cap, so one entry can be arbitrarily tall
+and §6.2's 2,048-entry reference bound would have admitted an unbounded number of
+bytes. At 396 measured bytes per row (5,156,568 bytes over 13,023 rows) a full
+cache holds about **12.98 MB, or 1.08%** of the 1,198,872 KiB tuned-jemalloc
+W-real median in *Allocator comparison*. The measured 931-message session occupies
+13,023 rows, 39.7% of the budget, so an ordinary long session caches whole and
+never evicts.
+
+`Component::render` is the only caller of the cached path, so it is what a user
+pays. Both cases were previously the full-frame cost in the table above:
+
+| msgs | case | min / median / max | max/min | uncached frame | speedup |
+| ---: | --- | --- | ---: | ---: | ---: |
+| 2 | unchanged | 398.320 / 409.788 / 413.685 µs | 1.0386x | 160.613 µs | — |
+| 2 | streaming delta | 670.411 / 731.135 / 976.780 µs | 1.4570x | 297.505 µs | — |
+| 16 | unchanged | 503.670 / 505.388 / 517.883 µs | 1.0282x | 1.206 ms | 2.4x |
+| 16 | streaming delta | 719.830 / 735.289 / 762.197 µs | 1.0589x | 1.317 ms | 1.8x |
+| 64 | unchanged | 724.302 / 741.633 / 784.725 µs | 1.0834x | 4.591 ms | 6.2x |
+| 64 | streaming delta | 1.013 / 1.033 / 1.349 ms | 1.3309x | 4.713 ms | 4.6x |
+| 256 | unchanged | 2.150 / 2.203 / 2.791 ms | 1.2982x | 18.478 ms | 8.4x |
+| 256 | streaming delta | 2.694 / 2.731 / 3.267 ms | 1.2127x | 18.325 ms | 6.7x |
+| 512 | unchanged | 4.500 / 4.586 / 4.799 ms | 1.0665x | 35.304 ms | 7.7x |
+| 512 | streaming delta | 5.322 / 5.434 / 6.002 ms | 1.1278x | 35.532 ms | 6.5x |
+| 931 | unchanged | 8.462 / 9.905 / 10.853 ms | 1.2826x | 63.696 ms | 6.4x |
+| 931 | streaming delta | 9.553 / 10.501 / 11.544 ms | 1.2084x | 64.819 ms | 6.2x |
+
+The two smallest sizes are dominated by the harness: `render_offscreen` builds a
+fresh 100x40 terminal per call, which the 2-message *unchanged* row prices at
+about 410 µs. That floor is why those two rows show no speedup, and it is subtracted
+from nothing else — it is present in every row of this table equally.
+
+The result that matters: at 931 messages a frame went from 63.696 ms to 9.905 ms
+and a streaming frame from 64.819 ms to 10.501 ms, so both now fit inside the
+16.67 ms active redraw interval that `app.rs` caps streaming at. Before this
+neither did, at any transcript longer than about 250 messages.
+
+Combined with the highlight memo, one frame of the 931-message transcript went
+from 8.269 s to 9.905 ms — **835x**.
+
+### R2, R3 and R5
+
+- **R3 (incremental body reuse for the O(n²)) — done, by R4.** The quadratic is
+  confirmed above and removed: `views_transcript_cache_recalls_the_prefix_across_a_streaming_append`
+  asserts that appending to the tail re-renders exactly one message and recalls
+  all 40 others, so a delta's cost is proportional to the change and not to the
+  transcript. Keying per message yields exact, prefix and suffix reuse at once, so
+  §6.2's four-way `build_body_from_base` and its longest-common-prefix search are
+  not reproduced — there is no prefix to search for when each message answers for
+  itself.
+- **R2 (prepared-frame cache) — closed on the numbers.** Layered on R4 it cannot
+  beat the 3.933 ms clone floor measured above, so its ceiling is the 5.97 ms
+  between that floor and the 9.905 ms shipping frame: a 1.6x improvement on a path
+  already 6.4x faster and already inside the frame budget. Against that it would
+  add a second cache with its own key, and it would miss on every streaming delta
+  — the case §6.2 opened it for — because the frame's trailer holds the spinner.
+  A real opportunity does remain and it is not this one: an unchanged frame
+  materialises and clones all 13,023 rows to draw a 40-row viewport, so 99.7% of
+  the clone is never seen. Windowing that needs the per-message row counts R4
+  already holds, which is §6.2's "行映射"; it is recorded here as measured and
+  deferred rather than folded into R2.
+- **R5 (large-buffer shrink) — closed on the numbers, twice over.** There was no
+  retained large buffer to shrink: a prepared frame is built and dropped inside
+  one `render`, and at its largest it measured 5,156,568 bytes, 0.42% of the
+  W-real median; the render loop's only other buffers are the two deferred-event
+  queues, bounded by the terminal and engine channel capacities. R4 does introduce
+  the first long-lived render buffer, and R5's concern is answered there by
+  construction rather than by a shrink after the fact: the bound is stated above,
+  `views_transcript_cache_stays_inside_its_row_bound` enforces it across frames,
+  and `views_transcript_cache_forgets_a_message_that_no_longer_exists` prevents a
+  replaced transcript from holding rows against it forever.
+
+### Prepared frame footprint
+
+| msgs | rows | spans | bytes | % of the W-real median |
+| ---: | ---: | ---: | ---: | ---: |
+| 2 | 28 | 168 | 11,088 | 0.0009% |
+| 16 | 224 | 1,344 | 88,704 | 0.0072% |
+| 64 | 896 | 5,376 | 354,816 | 0.0289% |
+| 256 | 3,584 | 21,504 | 1,419,264 | 0.1156% |
+| 512 | 7,168 | 43,008 | 2,838,528 | 0.2312% |
+| 931 | 13,023 | 78,125 | 5,156,568 | 0.4200% |
+
+Counted as each `Line`, each `Span` and the bytes of its text. Layout is a
+compile-time constant and the workload is deterministic, so these are exact rather
+than sampled.
+
 ## Startup budget
 
 G1's startup budget is enforced by `crates/zuno-cli/tests/startup.rs`, which

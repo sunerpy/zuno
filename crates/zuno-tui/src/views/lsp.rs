@@ -41,7 +41,7 @@ mod tests;
 /// (`zuno_lsp::client::Diagnostic::severity`); a server that omits the field is
 /// treated as an error, because a message with no stated severity that turns out to be
 /// a compile failure is the expensive direction to be wrong in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Severity {
     /// Severity `1`, or absent.
     Error,
@@ -88,7 +88,7 @@ impl Severity {
 }
 
 /// One diagnostic, flattened for display.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Diagnostic {
     /// How serious it is.
     pub severity: Severity,
@@ -106,7 +106,7 @@ pub struct Diagnostic {
 }
 
 /// What a language server said about one file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Report {
     /// The file, as the user would name it.
     pub path: String,

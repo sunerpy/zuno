@@ -42,6 +42,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Frame, symbols};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::Arc;
 use zuno_engine::r#loop::TurnEvent;
 use zuno_llm::event::StreamEvent;
 
@@ -872,6 +874,12 @@ pub struct TranscriptView {
     /// does not fight them: a transcript that always jumped to the bottom would make
     /// scrolling back through a long tool result impossible while a turn ran.
     following: bool,
+    /// Recalled rows, per message.
+    ///
+    /// Owned by the view rather than shared, so its bound is per view and one screen's
+    /// transcript cannot evict another's. See [`Self::cached_lines`] for the key and
+    /// [`MAX_CACHED_ROWS`] for the bound.
+    cache: RowCache,
 }
 
 impl TranscriptView {
@@ -887,6 +895,7 @@ impl TranscriptView {
             content_height: 0,
             viewport_height: 0,
             following: true,
+            cache: RowCache::default(),
         }
     }
 
@@ -924,6 +933,16 @@ impl TranscriptView {
     /// The folded transcript, mutably, for locally composed messages.
     pub const fn transcript_mut(&mut self) -> &mut Transcript {
         &mut self.transcript
+    }
+
+    #[cfg(test)]
+    const fn cache(&self) -> &RowCache {
+        &self.cache
+    }
+
+    #[cfg(test)]
+    fn cached_lines_for_test(&mut self, width: u16) -> Vec<Line<'static>> {
+        self.cached_lines(width)
     }
 
     /// Flip the reasoning affordance, the `display_thinking` action.
@@ -973,45 +992,84 @@ impl TranscriptView {
     /// Public because it is the transcript's testable surface: an assertion over
     /// lines is readable where the same assertion over cells is not, and the
     /// off-screen buffer test then proves the lines reach cells.
+    ///
+    /// # This is the specification, and [`Self::cached_lines`] is the implementation
+    ///
+    /// It consults no cache and mutates nothing, so it stays a pure function of the
+    /// transcript, the width and the palette. That is deliberate and it is what
+    /// [`Self::cached_lines`] is checked against: `views_transcript_cache_returns_what_the_uncached_path_would`
+    /// renders every state both ways and requires span-for-span equality. A cache whose
+    /// only description of correct output is the cache itself cannot be checked at all,
+    /// which is why the uncached path is kept in the shipping code rather than deleted
+    /// once the cache worked.
     #[must_use]
     pub fn lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         let mut previous: Option<Role> = None;
         for message in &self.transcript.messages {
-            let rule = self.rule_style(message.role);
-            // A multi-step turn opens one assistant message per step, so a header per
-            // message printed `Assistant` five times for what the user experienced as
-            // one reply. The header marks a change of speaker, which is what it was
-            // always for; the left rule already runs down every row of the turn.
-            if previous == Some(message.role) {
-                // The same speaker again, which is the *inside* of one reply rather than a
-                // boundary between two. Its separator carries the rule, because a bare
-                // blank row here cut the rule into one fragment per step and so broke the
-                // very continuity the header was suppressed in order to preserve — the
-                // claim above was false for every multi-step turn.
-                lines.push(self.ruled(message.role, rule, "", self.context.surface(), width));
-            } else {
-                // A change of speaker is the one boundary a reader scans for, so it gets
-                // the stronger of the two separators: a row with no rule at all. Two
-                // grades of gap is what lets the eye tell "the other party is talking now"
-                // from "this reply took another step" without reading either row.
-                if previous.is_some() {
-                    lines.push(padded("", width, self.context.surface()));
-                }
-                lines.push(self.ruled(
-                    message.role,
-                    rule,
-                    self.role_label(message.role),
-                    self.context.title(),
-                    width,
-                ));
-            }
+            lines.append(&mut self.message_rows(message, previous, width));
             previous = Some(message.role);
-            for part in &message.parts {
-                self.part_lines(message.role, rule, part, width, &mut lines);
-            }
         }
-        if previous.is_some() {
+        self.push_trailer(&mut lines, previous.is_some(), width);
+        lines
+    }
+
+    /// One message's rows: its separator or header, then each of its parts.
+    ///
+    /// Factored out of [`Self::lines`] rather than duplicated into the cached path,
+    /// because "the two paths produce the same rows" is a property worth having
+    /// structurally rather than by inspection. Both callers reach the frame through
+    /// exactly this function, so the only difference between them is whether the rows
+    /// were computed now or recalled.
+    fn message_rows(
+        &self,
+        message: &Message,
+        previous: Option<Role>,
+        width: u16,
+    ) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        let rule = self.rule_style(message.role);
+        // A multi-step turn opens one assistant message per step, so a header per
+        // message printed `Assistant` five times for what the user experienced as
+        // one reply. The header marks a change of speaker, which is what it was
+        // always for; the left rule already runs down every row of the turn.
+        if previous == Some(message.role) {
+            // The same speaker again, which is the *inside* of one reply rather than a
+            // boundary between two. Its separator carries the rule, because a bare
+            // blank row here cut the rule into one fragment per step and so broke the
+            // very continuity the header was suppressed in order to preserve — the
+            // claim above was false for every multi-step turn.
+            lines.push(self.ruled(message.role, rule, "", self.context.surface(), width));
+        } else {
+            // A change of speaker is the one boundary a reader scans for, so it gets
+            // the stronger of the two separators: a row with no rule at all. Two
+            // grades of gap is what lets the eye tell "the other party is talking now"
+            // from "this reply took another step" without reading either row.
+            if previous.is_some() {
+                lines.push(padded("", width, self.context.surface()));
+            }
+            lines.push(self.ruled(
+                message.role,
+                rule,
+                self.role_label(message.role),
+                self.context.title(),
+                width,
+            ));
+        }
+        for part in &message.parts {
+            self.part_lines(message.role, rule, part, width, &mut lines);
+        }
+        lines
+    }
+
+    /// The bottom margin and whichever liveness row the turn's state calls for.
+    ///
+    /// Never cached, and it is the reason the cache is per message rather than per
+    /// frame: the spinner advances on every folded event, so a frame-level entry would
+    /// miss on every single delta of a streaming turn — the exact case the cache exists
+    /// to make cheap.
+    fn push_trailer(&self, lines: &mut Vec<Line<'static>>, any_message: bool, width: u16) {
+        if any_message {
             // The transcript's own bottom margin, so the spinner or the approval notice
             // below is not flush against the last row of the reply.
             lines.push(padded("", width, self.context.surface()));
@@ -1033,6 +1091,89 @@ impl TranscriptView {
                 self.context.accent(),
             ));
         }
+    }
+
+    /// The same rows as [`Self::lines`], recalling every message whose inputs are unchanged.
+    ///
+    /// # What this fixes, measured
+    ///
+    /// Every frame re-rendered every message, so both of the transcript's hot paths cost
+    /// the whole transcript. Measured on this project at 100 columns over five runs
+    /// (`crates/zuno-tui/tests/render_cost.rs`, recorded in `docs/perf-methodology.md`),
+    /// with the syntax-highlight configuration already memoised: one frame of a
+    /// 931-message transcript took a median 63.128 ms, while the tail a streaming delta
+    /// actually changed accounted for 0.24% of it. A keystroke in the editor forces the
+    /// same frame and changes no message at all.
+    ///
+    /// That is the plan's O(n²): F frames of a streaming turn each doing O(n) work for an
+    /// O(1) change. Recalling per message removes it without a longest-common-prefix
+    /// search — exact, prefix and suffix reuse all fall out of keying per message, which
+    /// is why §6.2's four-way `build_body_from_base` shape is not reproduced here.
+    ///
+    /// # The invalidation key, and why each part of it is present
+    ///
+    /// An entry is used only when every one of these matches:
+    ///
+    /// * **the resolved theme, by `Arc` identity.** [`crate::views::ViewContext`] holds
+    ///   `Arc<RwLock<Arc<Resolved>>>` and `set_theme` installs a *new* `Arc`, so a pointer
+    ///   comparison is a complete test for "the palette changed" — including
+    ///   `thinking_opacity`, which `Palette::entries` does not report and which a
+    ///   field-by-field hash would therefore have missed. Comparing addresses is only
+    ///   sound because the entry *holds* the `Arc` it rendered with: a held `Arc` cannot be
+    ///   freed, so its address cannot be reused by a later theme, which is what would
+    ///   otherwise make this an ABA hazard.
+    /// * **the width**, since every row is laid out and padded to it.
+    /// * **the two display affordances**, `thinking` and `tool_output`, which decide how
+    ///   many rows a reasoning block and a tool result produce.
+    /// * **the preceding role**, which decides whether the message opens with a header or
+    ///   with a same-speaker separator.
+    /// * **a fingerprint of the message's content**, via [`fingerprint`]. Derived from the
+    ///   parts rather than tracked as a revision counter on purpose: the fold mutates
+    ///   parts in place from several places (`observe_stream`, `update_tool`,
+    ///   `close_reasoning`), and a counter is a thing a future edit can forget to bump,
+    ///   whose failure mode is a frame showing content the transcript no longer holds. A
+    ///   fingerprint cannot be forgotten because it is read from the content itself. It is
+    ///   the same reasoning that derives the modal banner every frame instead of pushing it
+    ///   on open and close.
+    ///
+    /// One dependency is deliberately **not** in the key: `self.context.config`, which
+    /// reaches the rows through the diff style and through the key spelling in a collapsed
+    /// tool result's overflow notice. [`crate::views::ViewContext`] documents that the
+    /// resolved configuration is owned per clone and never changes after startup, so it is
+    /// constant for this view's whole life. If that ever stops being true this key becomes
+    /// incomplete.
+    ///
+    /// A message whose tool call is [`ToolStatus::Running`] is never stored, because its
+    /// glyph is the spinner and so depends on the fold's event count rather than on the
+    /// message. `Pending` is stored: its glyph is a constant.
+    fn cached_lines(&mut self, width: u16) -> Vec<Line<'static>> {
+        let theme = self.context.theme();
+        let mut lines = Vec::new();
+        let mut previous: Option<Role> = None;
+        for index in 0..self.transcript.messages.len() {
+            let message = &self.transcript.messages[index];
+            let key = RowKey {
+                width,
+                thinking: self.thinking,
+                tool_output: self.tool_output,
+                previous,
+                content: fingerprint(message),
+            };
+            previous = Some(message.role);
+            if let Some(rows) = self.cache.get(index, &key, &theme) {
+                lines.extend(rows.iter().cloned());
+                continue;
+            }
+            let rows = self.message_rows(&self.transcript.messages[index], key.previous, width);
+            lines.extend(rows.iter().cloned());
+            if is_recallable(&self.transcript.messages[index]) {
+                self.cache.put(index, key, Arc::clone(&theme), rows);
+            } else {
+                self.cache.forget(index);
+            }
+        }
+        self.cache.truncate_to(self.transcript.messages.len());
+        self.push_trailer(&mut lines, previous.is_some(), width);
         lines
     }
 
@@ -1448,6 +1589,265 @@ impl TranscriptView {
     }
 }
 
+/// Rows the per-message cache may hold at once, across every entry.
+///
+/// A **row** budget rather than an entry count, because rows are what cost memory and
+/// entries are not comparable to each other: a one-line user prompt and an expanded
+/// reasoning block both occupy one entry, and `MessagePart::Reasoning`'s expanded body is
+/// wrapped with no row cap at all, so a single entry can be arbitrarily tall. §6.2's
+/// reference point is a 2,048-entry FIFO; an entry bound here would have permitted an
+/// unbounded number of bytes, which is the failure class
+/// `.omo/plans/memory-perf-optimization.md` exists to remove rather than relocate.
+///
+/// **What it costs at the bound.** A prepared 931-message frame was measured at
+/// 5,156,568 bytes over 13,023 rows — 396 bytes per row including each `Line`, its
+/// `Span`s and their text (`crates/zuno-tui/tests/render_cost.rs`). So a full cache holds
+/// about 12.98 MB, which is 1.08% of M1's 1,198,872 KiB tuned-jemalloc W-real median in
+/// `docs/perf-methodology.md`. The figure is a ceiling and not a typical cost: the same
+/// measured session fills 13,023 of these rows, 39.7% of the budget, so an ordinary long
+/// session is cached whole and never evicts.
+const MAX_CACHED_ROWS: usize = 32_768;
+
+/// Everything besides the theme that decides a message's rows.
+///
+/// The theme is held separately because it is compared by `Arc` identity rather than by
+/// value; see [`TranscriptView::cached_lines`] for why that comparison is both complete
+/// and free of an ABA hazard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowKey {
+    width: u16,
+    thinking: ThinkingDisplay,
+    tool_output: ToolDisplay,
+    previous: Option<Role>,
+    content: u64,
+}
+
+/// One message's recalled rows, beside the inputs that produced them.
+struct CachedRows {
+    key: RowKey,
+    theme: Arc<crate::theme::Resolved>,
+    rows: Vec<Line<'static>>,
+}
+
+/// The per-message row cache: one slot per message, bounded by total rows.
+///
+/// Indexed by message position rather than keyed in a map, because the transcript only
+/// ever appends: [`Transcript::push`] and the fold's `append` add at the end, and nothing
+/// removes or reorders. So a position is a stable identity for as long as it exists, and
+/// the content fingerprint in [`RowKey`] catches the case a position's message was
+/// mutated in place. An index also makes a lookup a bounds check rather than a hash of
+/// the whole key.
+#[derive(Default)]
+struct RowCache {
+    slots: Vec<Option<CachedRows>>,
+    rows: usize,
+    /// Hits and misses, so a test can assert that a frame was *recalled* and not merely
+    /// that it was correct. Without it a cache that never hit would pass every
+    /// correctness test in the file, which is the way a cache silently stops working.
+    #[cfg(test)]
+    hits: usize,
+    #[cfg(test)]
+    misses: usize,
+}
+
+impl RowCache {
+    /// The rows stored for `index`, when every input still matches.
+    fn get(
+        &mut self,
+        index: usize,
+        key: &RowKey,
+        theme: &Arc<crate::theme::Resolved>,
+    ) -> Option<&[Line<'static>]> {
+        let recalled = self.slots.get(index).is_some_and(|slot| {
+            slot.as_ref()
+                .is_some_and(|entry| entry.key == *key && Arc::ptr_eq(&entry.theme, theme))
+        });
+        #[cfg(test)]
+        if recalled {
+            self.hits += 1;
+        } else {
+            self.misses += 1;
+        }
+        if !recalled {
+            return None;
+        }
+        Some(self.slots[index].as_ref()?.rows.as_slice())
+    }
+
+    /// Store `rows` for `index`, evicting the oldest entries to stay inside the bound.
+    fn put(
+        &mut self,
+        index: usize,
+        key: RowKey,
+        theme: Arc<crate::theme::Resolved>,
+        rows: Vec<Line<'static>>,
+    ) {
+        // A message taller than the whole budget is never stored. Storing it would evict
+        // every other entry to make room for one that cannot be reused often enough to
+        // pay for that, and the eviction loop below could not reach the budget anyway.
+        if rows.len() > MAX_CACHED_ROWS {
+            self.forget(index);
+            return;
+        }
+        if self.slots.len() <= index {
+            self.slots.resize_with(index + 1, || None);
+        }
+        self.forget(index);
+        self.rows += rows.len();
+        self.slots[index] = Some(CachedRows { key, theme, rows });
+        // Oldest first, which is the top of the transcript. The viewport follows the
+        // newest row, so the rows evicted are the ones least likely to be drawn next.
+        let mut oldest = 0;
+        while self.rows > MAX_CACHED_ROWS && oldest < self.slots.len() {
+            if oldest != index {
+                self.forget(oldest);
+            }
+            oldest += 1;
+        }
+    }
+
+    /// Drop `index`'s entry, if it has one.
+    fn forget(&mut self, index: usize) {
+        if let Some(slot) = self.slots.get_mut(index)
+            && let Some(entry) = slot.take()
+        {
+            self.rows -= entry.rows.len();
+        }
+    }
+
+    /// Drop every slot at or past `len`.
+    ///
+    /// The fold's `RetryRollback` clears a message's parts but never shortens the
+    /// message list, so this is reached only by a transcript that was replaced wholesale.
+    /// Without it those slots would keep their rows alive against the bound forever.
+    fn truncate_to(&mut self, len: usize) {
+        for index in len..self.slots.len() {
+            self.forget(index);
+        }
+        self.slots.truncate(len);
+    }
+
+    #[cfg(test)]
+    const fn stored_rows(&self) -> usize {
+        self.rows
+    }
+
+    #[cfg(test)]
+    fn stored_entries(&self) -> usize {
+        self.slots.iter().filter(|slot| slot.is_some()).count()
+    }
+
+    #[cfg(test)]
+    const fn counts(&self) -> (usize, usize) {
+        (self.hits, self.misses)
+    }
+}
+
+/// Whether `message`'s rows may be recalled on a later frame.
+///
+/// The one disqualifier is a [`ToolStatus::Running`] call, whose glyph is the transcript's
+/// spinner and therefore a function of how many events have been folded rather than of the
+/// message. Everything else a part renders is decided by the part itself, the width and
+/// the palette, all of which are in [`RowKey`] or compared beside it.
+fn is_recallable(message: &Message) -> bool {
+    !message.parts.iter().any(|part| {
+        matches!(
+            part,
+            MessagePart::Tool {
+                status: ToolStatus::Running,
+                ..
+            }
+        )
+    })
+}
+
+/// A fingerprint of everything about `message` that reaches a rendered row.
+///
+/// The match over [`MessagePart`] is exhaustive with no wildcard arm, so a new variant
+/// cannot compile without deciding what identifies it. That is the property this needs
+/// most: a variant that silently fell through to a shared arm would make two different
+/// messages fingerprint alike, and the cache would then serve one message's rows for
+/// another. Each arm also writes a distinct tag before its fields, so a `Text` and a
+/// `Notice` carrying the same string do not collide.
+fn fingerprint(message: &Message) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    match message.role {
+        Role::User => 0_u8,
+        Role::Assistant => 1,
+        Role::System => 2,
+    }
+    .hash(&mut hasher);
+    // The id is hashed even though no row prints it: two messages equal in every rendered
+    // field are interchangeable, but a fingerprint that ignored the id would be a claim
+    // this function cannot check, and the cost is one `Option<String>`.
+    message.id.hash(&mut hasher);
+    message.parts.len().hash(&mut hasher);
+    for part in &message.parts {
+        match part {
+            MessagePart::Text { text } => {
+                0_u8.hash(&mut hasher);
+                text.hash(&mut hasher);
+            }
+            MessagePart::Reasoning {
+                text,
+                duration_secs,
+                streaming,
+            } => {
+                1_u8.hash(&mut hasher);
+                text.hash(&mut hasher);
+                // `f64` is not `Hash` because `NaN != NaN`. The bits are hashed instead,
+                // which is the right comparison here regardless: two entries differ if the
+                // rendered `{secs:.1}s` could differ, and identical bits cannot.
+                duration_secs.map(f64::to_bits).hash(&mut hasher);
+                streaming.hash(&mut hasher);
+            }
+            MessagePart::Tool {
+                call_id,
+                name,
+                arguments,
+                title,
+                status,
+                output,
+                diff,
+            } => {
+                2_u8.hash(&mut hasher);
+                call_id.hash(&mut hasher);
+                name.hash(&mut hasher);
+                arguments.hash(&mut hasher);
+                title.hash(&mut hasher);
+                match status {
+                    ToolStatus::Pending => 0_u8,
+                    ToolStatus::Running => 1,
+                    ToolStatus::Completed => 2,
+                    ToolStatus::Error => 3,
+                }
+                .hash(&mut hasher);
+                output.hash(&mut hasher);
+                diff.hash(&mut hasher);
+            }
+            MessagePart::Attachment { filename, mime } => {
+                3_u8.hash(&mut hasher);
+                filename.hash(&mut hasher);
+                mime.hash(&mut hasher);
+            }
+            MessagePart::Retry { attempt, max } => {
+                4_u8.hash(&mut hasher);
+                attempt.hash(&mut hasher);
+                max.hash(&mut hasher);
+            }
+            MessagePart::Notice { text } => {
+                5_u8.hash(&mut hasher);
+                text.hash(&mut hasher);
+            }
+            MessagePart::Diagnostics { report } => {
+                6_u8.hash(&mut hasher);
+                report.hash(&mut hasher);
+            }
+        }
+    }
+    hasher.finish()
+}
+
 /// The three values that jointly decide where a transcript row starts and ends.
 ///
 /// One value rather than three parameters because they are never chosen independently:
@@ -1484,7 +1884,7 @@ impl RowFrame {
 impl Component for TranscriptView {
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
         fill(frame.buffer_mut(), area, self.context.surface());
-        let lines = self.lines(area.width);
+        let lines = self.cached_lines(area.width);
         self.content_height = lines.len();
         self.viewport_height = usize::from(area.height);
         let max = self.content_height.saturating_sub(self.viewport_height);
