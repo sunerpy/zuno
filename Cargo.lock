@@ -6289,6 +6289,7 @@ dependencies = [
  "unicode-width",
  "zuno-engine",
  "zuno-llm",
+ "zuno-observability",
  "zuno-permission",
 ]
 

@@ -13,7 +13,7 @@ use std::panic::{self, PanicHookInfo};
 use std::sync::Barrier;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant as StdInstant};
 
 use async_trait::async_trait;
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, Event as CrosstermEvent};
@@ -31,6 +31,7 @@ use zuno_engine::r#loop::{TURN_EVENT_CHANNEL_CAPACITY, TurnEvent};
 use zuno_engine::terminal_lease::{
     DEFAULT_LEASE_TIMEOUT, LeaseReason, ReclaimCause, TerminalBroker, TerminalOwner,
 };
+use zuno_observability::frame::{SlowFrameHistory, cause};
 
 /// Maximum queued terminal events before their producer is backpressured.
 pub const TERMINAL_EVENT_CHANNEL_CAPACITY: usize = 64;
@@ -619,11 +620,21 @@ impl DrawTarget for CrosstermDrawTarget {
 struct UiState {
     root: Box<dyn Component>,
     target: Box<dyn DrawTarget>,
+    /// Frame timing lives behind the same mutex that already serialises drawing, so
+    /// every draw site is measured once without a second lock or a shared counter.
+    frames: SlowFrameHistory,
 }
 
 impl UiState {
-    fn draw(&mut self) -> io::Result<()> {
-        self.target.draw(self.root.as_mut())
+    fn draw(&mut self, cause: &'static str) -> io::Result<()> {
+        // `std::time::Instant`, not the runtime clock: a frame's cost is real time, and
+        // a paused test clock would measure every draw as free.
+        let started = StdInstant::now();
+        let result = self.target.draw(self.root.as_mut());
+        if let Some(slow) = self.frames.record(started.elapsed(), cause) {
+            zuno_observability::frame::report(&slow);
+        }
+        result
     }
 }
 
@@ -766,7 +777,7 @@ impl TerminalOwner for TerminalLeaseOwner {
             ));
         } else {
             let mut ui = locked(&self.ui);
-            if let Err(error) = ui.target.clear().and_then(|()| ui.draw()) {
+            if let Err(error) = ui.target.clear().and_then(|()| ui.draw(cause::RECLAIM)) {
                 failed = Some(format!(
                     "reclaimed the terminal for {reason}, but repaint failed: {error}"
                 ));
@@ -1126,7 +1137,11 @@ impl App {
         terminal_events: mpsc::Receiver<TerminalEvent>,
         engine_events: mpsc::Receiver<TurnEvent>,
     ) -> (Self, Arc<TerminalLeaseOwner>) {
-        let ui = Arc::new(Mutex::new(UiState { root, target }));
+        let ui = Arc::new(Mutex::new(UiState {
+            root,
+            target,
+            frames: SlowFrameHistory::from_environment(),
+        }));
         let wake = Arc::new(Notify::new());
         let input = Arc::new(TerminalInputControl::new());
         let owner = Arc::new(TerminalLeaseOwner {
@@ -1162,7 +1177,7 @@ impl App {
 
     /// Run until an explicit terminal shutdown event arrives.
     pub async fn run(&mut self) -> Result<(), AppError> {
-        self.draw_if_owned()?;
+        self.draw_if_owned(cause::STARTUP)?;
         let mut redraw = RedrawSchedule::new(self.redraw_config, TokioInstant::now());
         // This is the loop's single dirty bit. Engine events only set it; terminal
         // input can satisfy and clear it with the immediate frame that preserves typing latency.
@@ -1228,7 +1243,7 @@ impl App {
                     }
                 }
                 () = redraw.tick() => {
-                    if needs_redraw && self.draw_if_owned()? {
+                    if needs_redraw && self.draw_if_owned(cause::SCHEDULED)? {
                         needs_redraw = false;
                         // Skip prevents multiple stale ticks; resetting from frame end
                         // also removes the one already-due tick left behind by a slow draw.
@@ -1239,12 +1254,12 @@ impl App {
         }
     }
 
-    fn draw_if_owned(&self) -> Result<bool, AppError> {
+    fn draw_if_owned(&self, cause: &'static str) -> Result<bool, AppError> {
         let mut ui = locked(&self.ui);
         if self.owner.suspended.load(Ordering::SeqCst) {
             return Ok(false);
         }
-        ui.draw()?;
+        ui.draw(cause)?;
         Ok(true)
     }
 
@@ -1263,7 +1278,7 @@ impl App {
             if records_activity {
                 redraw.record_terminal_activity(TokioInstant::now());
             }
-            if outcome.redraw && self.draw_if_owned()? {
+            if outcome.redraw && self.draw_if_owned(cause::TERMINAL_INPUT)? {
                 // The immediate input frame includes every engine state mutation already
                 // handled under the same UiState mutex, so it also satisfies prior dirt.
                 *needs_redraw = false;

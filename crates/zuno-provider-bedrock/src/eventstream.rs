@@ -5,6 +5,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use serde_json::Value;
 use zuno_error::ProviderError;
+use zuno_llm::buffer::release_byte_capacity;
 use zuno_llm::event::{FinishReason, StreamEvent};
 use zuno_llm::sse::Utf8StreamDecoder;
 
@@ -181,6 +182,10 @@ impl EventStreamDecoder {
             self.buffer.drain(..total_length);
             self.stream_offset += total_length;
         }
+        // `drain` keeps the allocation, so one `MAX_FRAME_LEN`-sized frame would
+        // otherwise pin 16 MiB resident for the rest of the stream. See
+        // `zuno_llm::buffer`.
+        release_byte_capacity(&mut self.buffer);
         Ok(messages)
     }
 
@@ -802,6 +807,56 @@ mod tests {
     #[test]
     fn crc32_matches_the_standard_check_value() {
         assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+    }
+
+    /// One header-free frame carrying `payload`, with both CRCs computed.
+    fn frame(payload: &[u8]) -> Vec<u8> {
+        let total_length = u32::try_from(OVERHEAD_LEN + payload.len()).expect("frame fits in u32");
+        let mut frame = Vec::with_capacity(total_length as usize);
+        frame.extend_from_slice(&total_length.to_be_bytes());
+        frame.extend_from_slice(&0_u32.to_be_bytes());
+        let prelude_crc = crc32(&frame[..8]);
+        frame.extend_from_slice(&prelude_crc.to_be_bytes());
+        frame.extend_from_slice(payload);
+        let message_crc = crc32(&frame);
+        frame.extend_from_slice(&message_crc.to_be_bytes());
+        frame
+    }
+
+    #[test]
+    fn a_large_frame_does_not_strand_its_capacity_for_the_rest_of_the_stream() {
+        let mut decoder = EventStreamDecoder::new();
+        let messages = decoder
+            .push(&frame(&vec![b'p'; 4 * 1024 * 1024]))
+            .expect("a 4 MiB frame is under the 16 MiB cap");
+        assert_eq!(messages.len(), 1, "the frame itself must still be decoded");
+        assert_eq!(messages[0].payload.len(), 4 * 1024 * 1024);
+
+        assert!(
+            decoder.buffer.capacity() <= zuno_llm::buffer::STEADY_STATE_CAPACITY_BYTES,
+            "the drained decoder holds {} bytes of capacity",
+            decoder.buffer.capacity()
+        );
+    }
+
+    #[test]
+    fn ordinary_frames_after_a_large_one_never_reallocate() {
+        let mut decoder = EventStreamDecoder::new();
+        let _ = decoder
+            .push(&frame(&vec![b'q'; 4 * 1024 * 1024]))
+            .expect("the large frame decodes");
+        let settled = decoder.buffer.capacity();
+
+        for _ in 0..500 {
+            let messages = decoder.push(&frame(b"{}")).expect("a small frame decodes");
+            assert_eq!(messages.len(), 1);
+        }
+
+        assert_eq!(
+            decoder.buffer.capacity(),
+            settled,
+            "steady-state decoding reallocated after the large frame"
+        );
     }
 
     #[test]

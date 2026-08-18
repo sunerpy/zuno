@@ -23,6 +23,22 @@ const DIAGNOSTICS_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Capacity the framing buffer keeps once a message has been drained off it.
+///
+/// Protects against: one large server message — a whole-project diagnostics push,
+/// a long completion list — pinning up to [`MAX_MESSAGE_BYTES`] resident for the
+/// rest of the process. This buffer outlives any single stream: one framer per
+/// language server, alive for as long as the server is. 64 MiB is 5.47% of M1's
+/// 1,198,872 KiB W-real median in `docs/perf-methodology.md`, and it is the
+/// largest single reusable buffer in the workspace.
+///
+/// Calibrated separately from `zuno_llm::buffer::STEADY_STATE_CAPACITY_BYTES`
+/// rather than imported, because `zuno-lsp` has no business depending on the
+/// model-provider crate. Both land on 64 KiB for the same reason: it clears
+/// [`MAX_HEADER_BYTES`], so an ordinary request/response pair never reallocates.
+/// Holding it costs 65,536 bytes per language server, 0.0053% of that median.
+const STEADY_STATE_BUFFER_BYTES: usize = 64 * 1024;
+
 type BoxWriter = Pin<Box<dyn AsyncWrite + Send>>;
 
 /// A zero-based position in an LSP document.
@@ -683,6 +699,9 @@ impl Framer {
         }
         let body: Vec<u8> = self.buffer.drain(..length).collect();
         self.body_len = None;
+        if self.buffer.capacity() > STEADY_STATE_BUFFER_BYTES {
+            self.buffer.shrink_to(STEADY_STATE_BUFFER_BYTES);
+        }
         serde_json::from_slice(&body)
             .map(Some)
             .map_err(|source| ClientError::Protocol { source })
@@ -784,6 +803,58 @@ mod tests {
             assert_ne!(count, 0, "client closed before writing a frame");
             framer.push(&chunk[..count]);
         }
+    }
+
+    /// The framer outlives every message, so its capacity is a process-lifetime cost.
+    #[test]
+    fn a_large_server_message_does_not_strand_its_buffer_for_the_process() {
+        let payload = "d".repeat(4 * 1024 * 1024);
+        let large = json!({"jsonrpc":"2.0","method":"diagnostics","params":{"text":payload}});
+        let mut framer = Framer::default();
+        framer.push(&framed(&large));
+
+        let delivered = framer
+            .next_message()
+            .expect("a 4 MiB message is under the 64 MiB cap")
+            .expect("the message itself must still be delivered");
+        assert_eq!(delivered["method"], "diagnostics");
+
+        assert!(
+            framer.buffer.capacity() <= STEADY_STATE_BUFFER_BYTES,
+            "the framer holds {} bytes of capacity with {} live bytes, against a \
+             {STEADY_STATE_BUFFER_BYTES}-byte floor",
+            framer.buffer.capacity(),
+            framer.buffer.len()
+        );
+    }
+
+    #[test]
+    fn ordinary_traffic_after_a_large_message_never_reallocates() {
+        let payload = "e".repeat(4 * 1024 * 1024);
+        let mut framer = Framer::default();
+        framer.push(&framed(
+            &json!({"jsonrpc":"2.0","method":"big","params":{"text":payload}}),
+        ));
+        let _ = framer.next_message().expect("the large frame parses");
+        let settled = framer.buffer.capacity();
+
+        for id in 0..500 {
+            framer.push(&framed(
+                &json!({"jsonrpc":"2.0","id":id,"result":{"ok":true}}),
+            ));
+            assert!(
+                framer
+                    .next_message()
+                    .expect("a small frame parses")
+                    .is_some()
+            );
+        }
+
+        assert_eq!(
+            framer.buffer.capacity(),
+            settled,
+            "steady-state framing reallocated after the large message"
+        );
     }
 
     #[test]

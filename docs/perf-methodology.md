@@ -538,7 +538,8 @@ Thresholds, each with what it protects against:
 
 90 s sits deliberately **below** G4's frozen 120 s progress timeout, so a stalled
 turn is described in the log before the gate that fails the build on it trips. A
-test asserts that ordering.
+test asserts that ordering. **G4's review tightened what it asserts** — see
+*G4 review* below.
 
 Two properties make it safe to ship. A missing heartbeat is a stall only while a
 `WorkGuard` is alive, so a CLI waiting at a prompt is not reported; and the guard
@@ -553,6 +554,225 @@ configured.
 Cost, measured: `zuno session list` median 15.399 ms with the watchdog wired in
 against 15.301 ms before — inside the 1.0983x five-run spread, so no measurable
 cost.
+
+## G4 review
+
+G4 was a review of the soak and liveness gates, not new machinery. Two findings.
+
+**The ordering assertion did not assert the ordering.** It compared `STALL_AFTER`
+against G4's 120 s, but a stall is *noticed* at the first check after it crosses
+the threshold, so the worst case is `STALL_AFTER + CHECK_EVERY`. At the shipped
+values that is 95 s, 25 s ahead of the gate, and the ordering holds. It would also
+have held in the assertion while being false in fact: raising `CHECK_EVERY` to
+40 s puts worst-case detection at 130 s, past the gate, and the original assertion
+passed. `watchdog_defaults_are_the_frozen_constants` now asserts the sum.
+Mutation: raising `CHECK_EVERY` to 40 s and updating the frozen-value pin to match
+— which is what a future author would do — fails with *"a stall can go unnoticed
+for 130s (90s threshold plus one 40s check), which is past G4's frozen 120s
+progress timeout — the gate would fail with nothing in the log to explain it"*.
+
+**The ordering is about the shipped binary, not about the soak run.** The G3/G4
+soak's liveness watchdog is a struct local to
+`crates/zuno-testkit/tests/soak.rs:156`, and `zuno-testkit` does not depend on
+`zuno-observability` at all. So during a soak run no `Watchdog` thread exists and
+no `WorkGuard` is ever held; the 90 s line cannot precede the 120 s failure there.
+Where the ordering does hold is a `zuno run` turn in the shipped binary, which
+`DispatchArguments::silence_is_a_stall` classifies as guarded. This is not a
+defect — the soak harness is not the product — but the sentence above previously
+invited the wrong reading, so it now names which.
+
+Nothing else changed. The 500-turn count, the two-hour floor, G3's Theil–Sen
+slope and peak-ratio predicates, G4's 120 s and 1800 s, and the `busy > 0` gate
+are all as they were.
+
+## M2 retained buffer capacity
+
+M2 was `shrink_to_fit` plus an allocator purge. Measurement split it: the shrink
+found real retained bytes, and the purge is redundant with tuning already shipped.
+
+**What the shrink found.** Every incremental framer in the workspace appends
+network chunks to one buffer and `drain`s complete frames off the front. `drain`
+and `clear` keep the allocation, so the buffer's capacity becomes the high-water
+mark of the largest frame the stream ever carried and stays there. Measured on
+`zuno_llm::sse::SseParser` by a throwaway probe before any change:
+
+| after | `len()` | `capacity()` |
+| --- | ---: | ---: |
+| one 4 MiB event | 0 | 8,388,608 |
+| 1,000 further small events | 0 | 8,388,608 |
+| `finish()` (drops the parser's buffer) | 0 | 0 |
+
+8,388,608 bytes held for zero live bytes, per live stream. That is 0.68% of M1's
+1,198,872 KiB tuned-jemalloc W-real median and 1.63x the largest prepared TUI
+frame R5 measured at 5,156,568 bytes. A separate probe confirmed the buffer's
+growth carries no overshoot to reclaim — 8,388,608 bytes of capacity for
+8,388,608 live bytes, ratio 1.0000 — so the recoverable bytes are exactly the
+ones stranded after a drain.
+
+Four buffers have this shape. Each keeps a 64 KiB floor rather than shrinking to
+`len`, so the steady-state path never reallocates:
+
+| buffer | cap on one frame | what it strands without the release |
+| --- | ---: | ---: |
+| `zuno_llm::sse::SseParser::buffer` | 8 MiB | 8,388,608 B, measured |
+| `zuno_provider_bedrock::eventstream::EventStreamDecoder::buffer` | 16 MiB | up to 16,777,216 B |
+| `zuno_mcp::remote::sse::SseDecoder::bytes` | **was unbounded** | unbounded |
+| `zuno_lsp::client::Framer::buffer` | 64 MiB | up to 67,108,864 B |
+
+The MCP decoder had no per-event cap at all — the §2 defect this plan says not to
+port, present in this workspace. It now takes the same 8 MiB cap and the same
+`ZUNO_STREAM_MAX_EVENT_BYTES` override the provider transports use, and refuses
+rather than truncates. Mutating the cap away fails with *"the decoder accepted
+270336 bytes with no delimiter and no refusal, against a 65536-byte cap, so it is
+unbounded"*.
+
+The LSP framer is the largest and the worst-placed: one per language server,
+alive as long as the server, so its 64 MiB is a process-lifetime cost rather than
+a per-stream one. It carries its own 64 KiB constant rather than importing
+`zuno_llm`'s, because `zuno-lsp` has no business depending on the model-provider
+crate.
+
+**What the 64 KiB floor costs.** 65,536 bytes per live buffer, 0.0053% of the
+W-real median — against 8,388,608 bytes measured stranded without it, a 128x
+reduction in what one stream can hold. The floor clears both the 8 KiB SSE decode
+chunk and the LSP client's 16 KiB header cap, so an ordinary stream never reaches
+a shrink. Two tests assert that directly: after one large event, 1,000 further
+small events and 500 further LSP messages leave `capacity()` unchanged.
+
+**The purge half is closed on the allocator's configuration.**
+`.cargo/config.toml` gives jemalloc `dirty_decay_ms:1000,muzzy_decay_ms:1000`, so
+freed pages return to the OS within about a second unasked. An explicit purge
+would only advance that by less than one second, while the process-tree sampler
+runs every 2 seconds — so a purge could not even be *observed* by the gates it
+would be added to satisfy. Retained capacity is not free memory, which is why the
+shrink is the part that mattered: it is what makes those pages free at all.
+
+**What M2 did not find.** R5 already established there is no long-lived oversized
+render buffer (largest prepared frame 5,156,568 B = 0.42% of the median), and R4's
+row cache is bounded by construction at 32,768 rows. A probe of that cache
+measured its retained-versus-logical bytes at ratio **1.0000** over a
+931-message fixture — 707,560 bytes allocated for 707,560 logical — so there is
+nothing there to shrink. Its one recoverable structure is the slot vector, 49,152
+bytes at a 1,024-slot capacity, which `truncate_to` already shortens on a replaced
+transcript and which is 0.004% of the median. Left alone.
+
+## G2 slow-frame threshold
+
+A slow frame is one pass of the TUI draw path, measured around the single call
+that renders the component tree. Before this, **no frame duration was measured
+anywhere**: `crates/zuno-tui/src/app.rs` used `Instant` only for redraw-cadence
+timestamps, and the one `slow_frame` reference in the workspace was a test that
+*injected* a 35 ms delay to check tick behaviour.
+
+The threshold, and why 40 ms against frames that now cost 10 ms:
+
+| anchor | value | ratio to the 40 ms threshold |
+| --- | ---: | ---: |
+| active redraw interval (`app.rs`) | 16.67 ms | 2.40x |
+| unchanged 931-message frame (R4) | 9.905 ms | 4.04x |
+| streaming frame (R4) | 10.501 ms | 3.81x |
+| the same frame before R2-R5 | 8,269 ms | 0.005x |
+
+The last row is the point. Today's frames are comfortably silent, and the reason a
+threshold is worth having is that the 8.269 s frame shipped undetected until it
+was measured deliberately. 2.4x the active interval means a frame must miss two
+consecutive slots to trip it, so cadence jitter cannot. 40 ms is also the
+reference implementation's value; that is a coincidence worth stating rather than
+a derivation, since the multiples above stand on this project's own numbers.
+
+Placement: the history lives inside `UiState`, behind the mutex that already
+serialises every draw, so all four draw sites — startup, terminal input, the
+scheduled frame, and the post-reclaim repaint — are measured once with no second
+lock and no shared counter. `views/` is untouched. Timing uses
+`std::time::Instant`, not the runtime clock, because a paused test clock would
+record every draw as free.
+
+The history is bounded at 64 records. Each `SlowFrame` is two `u64`s and a
+`&'static str` — 32 bytes, asserted — so the entry count *is* the byte bound:
+2,048 bytes, 0.00017% of the W-real median. That is the opposite of R4's row
+cache, where an entry could be arbitrarily tall and the bound had to be expressed
+in rows. 64 rather than the reference's 512 because a rendering regression
+produces slow frames continuously, so the oldest 448 would be the same answer
+repeated. The slow-frame *count* is kept separately from the retained records,
+since a count derived from them would stop growing at the bound.
+
+Tests drive the **shipped** 40 ms threshold rather than a lowered one: a fixture
+with a 60 ms draw asserts the report exists, carries a duration at or above 60 ms,
+and attributes the pre-loop frame to `startup` and the keystroke frame to
+`terminal_input`. A second test asserts an ordinary offscreen frame is silent, so
+the threshold is not merely reachable. Mutation: raising the constant to 400 ms
+fails with *"60ms frames drawn against a 400ms threshold produced no report at
+all; 3 frames were measured"*.
+
+## G3 short-term memory ring and incident attribution
+
+An **incident** here is a runtime alert about a live process, never a gate.
+Conflating the two would either fail builds on healthy sessions or let a leaking
+process run silently, so these thresholds are derived independently of G1-G4's
+ceilings and are never compared against them.
+
+**The reference implementation's thresholds could not be adopted.** It warns at
+1 GiB of PSS and escalates at 2 GiB. M1 measured a *healthy* 931-message W-real
+session at a 1,198,872 KiB (1.143 GiB) median with its highest of five runs at
+1,549,164 KiB (1.477 GiB). A 1 GiB warning fires on every normal large session
+and a 2 GiB critical fires on the ordinary run-to-run spread. A test pins that
+premise, so the derivation cannot be quietly replaced by the borrowed figure.
+
+| threshold | value | derivation from this project's measurements |
+| --- | ---: | --- |
+| `WARNING_RSS_KIB` | 2 GiB | 1.354x the highest healthy peak (1,549,164 KiB); 1.789x the median |
+| `CRITICAL_RSS_KIB` | 4 GiB | 2x the warning; 2.71x the highest healthy peak |
+| `WARNING_GROWTH_KIB` | 512 MiB | 42.7% of what one whole measured 931-message session costs |
+| `CRITICAL_GROWTH_KIB` | 2 GiB | 1.71x that entire session, so no single session explains it |
+| `WARNING_ACTIVE_SESSIONS` | 32 | at the measured per-session cost, already far past what the workload implies |
+| `CRITICAL_ACTIVE_SESSIONS` | 128 | 4x the warning |
+| `DOMINANT_SHARE` | 2/3 | see below |
+
+Deliberately *not* derived from G2's ceiling: that ceiling constrains a five-run
+median while this compares a single live sample, and M1's own run 4 (1,549,164
+KiB) exceeded the ceiling while the gate passed.
+
+**The ring, the sample interval and the growth window are one decision.** 512
+samples at a 2-second interval covers 17.07 minutes, which contains the
+15-minute growth window with 62 samples of margin. A window longer than the ring
+would silently measure growth against whatever sample happened to survive and
+under-report it, so the relationship is asserted rather than assumed. The
+2-second interval is the one `crates/zuno-testkit/src/perf/workload.rs` already
+uses for the gates, so a runtime trace and a gate trace describe growth at the
+same resolution.
+
+Bound: every `MemorySample` is fixed-size at 40 bytes, asserted, so 512 samples
+is 20,480 bytes — 0.0017% of the W-real median, allocated once at construction.
+Observation count is kept separately from the retained samples, or a week-old
+process would look newly started. Mutation: removing the eviction fails with
+*"the ring grew to 1536 samples against a 512-sample bound"*.
+
+**Attribution comes from `/proc`, not from the allocator.** The reference reads
+jemalloc's `retained` through `jemalloc-ctl`, which is not in this workspace's
+dependency graph. Linux publishes the split this needs — `RssAnon`, `RssFile` and
+`RssShmem`, which sum to `VmRSS` — so the levels are measured rather than
+inferred. What is lost is separating "the allocator is holding freed pages" from
+"the heap is live"; the 1-second decay makes that distinction short-lived anyway,
+so one level names both and says so. A test checks the split sums to this
+process's own `VmRSS` within 5%.
+
+The four levels, in the order they are tried — each reached only when the ones
+above do not explain the size, so the answer is the most specific cause that fits:
+
+| level | condition | why it is at this position |
+| --- | --- | --- |
+| `SessionCount` | ≥ 32 active sessions | the one cause that is not a defect; reporting a leak here sends a reader hunting one that does not exist |
+| `MappedGrowth` | file + shmem ≥ 2/3 of RSS | file-backed growth is not something a heap fix addresses |
+| `AnonymousHeap` | anonymous ≥ 2/3 of RSS | heap, stacks, and pages freed but not yet returned |
+| `Unattributed` | nothing dominates | "we do not know" and "it is the heap" send a reader to different places |
+
+The 2/3 share is load-bearing and was found by testing: at a bare majority,
+anonymous and mapped bytes **partition** `VmRSS`, so one always wins and
+`Unattributed` is unreachable — a dead fourth level. Two thirds leaves a genuine
+middle. Real profiles still land decisively: this process's own startup split is
+2,320 KiB file-backed against 184 KiB anonymous, 92.6% mapped. A test walks all
+four levels from concrete splits so none can become unreachable again, and the
+50/50 case asserts `Unattributed` rather than a coin flip.
 
 ## W-real subject pin
 
