@@ -1663,8 +1663,11 @@ pub fn scopes() -> Vec<String> {
         // does, and no other row in the table spells `<leader>s`.
         "status", "debug",
         // `diff` after `input` and `messages`, and only for `diff_open`'s sake. The scope
-        // also carries the viewer's own bare letters — `q`, `n`, `p`, `d`, `v`, `s`, `b`,
-        // `[`, `]` — which resolve here whether or not the viewer is open. That is
+        // also carries the viewer's own bare characters — `q`, `n`, `p`, `d`, `v`, `s`,
+        // `b`, `[`, `]`, `?`, `E` — which resolve here whether or not the viewer is open.
+        // That list is derived and asserted by
+        // `exposing_the_diff_scope_did_not_stop_its_bare_letters_being_typed`, because
+        // this comment named only nine of the eleven for as long as it existed. That is
         // survivable, and only because of two facts together: this screen returns
         // `IGNORED` for every diff action except `diff_open`, and an unhandled action
         // falls through to the editor, which inserts the character. Give this screen an

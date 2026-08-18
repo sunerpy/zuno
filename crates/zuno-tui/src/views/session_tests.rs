@@ -2099,17 +2099,23 @@ fn the_two_display_toggles_change_what_the_transcript_renders() {
 
 #[test]
 fn exposing_the_diff_scope_did_not_stop_its_bare_letters_being_typed() {
-    // `scopes()` now lists `diff`, whose viewer owns bare `q`, `n`, `p`, `d`, `v`, `s`
-    // and `b`. Those resolve on the session screen whether or not the viewer is open, so
-    // typing survives only because this screen returns `IGNORED` for them and an
+    // `scopes()` lists `diff`, whose viewer owns bare `q`, `n`, `p`, `d`, `v`, `s`, `b`,
+    // `[`, `]`, `?` and `E` — eleven, not the nine the `scopes()` comment used to name.
+    // Those resolve on the session screen whether or not the viewer is open,
+    // so typing survives only because this screen returns `IGNORED` for them and an
     // unhandled action falls through to the editor. Give the screen an arm for one of
-    // those letters and this test is what says the prompt stopped accepting it.
+    // those characters and this test is what says the prompt stopped accepting it.
+    //
+    // `DiffDialog` *does* have arms for seven of them, and that is safe for a reason this
+    // test cannot see: a dialog is only offered an action while it sits on
+    // `DialogHost`'s stack. With the stack empty the same action arrives at this screen
+    // instead, which is the case under test.
     let keymap = Keymap::defaults().expect("the shipped table builds");
     let (sender, _receiver) = terminal_event_channel();
     let screen = SessionScreen::new(ViewContext::defaults(), sender);
     let mut dispatcher = KeyDispatcher::new(keymap, scopes(), Box::new(screen));
 
-    let typed = "qnpdvsb";
+    let typed = "qnpdvsb[]?E";
     for character in typed.chars() {
         dispatcher.handle_event(&AppEvent::Terminal(TerminalEvent::Input(
             crossterm::event::Event::Key(crate::views::testkit::press(
@@ -2121,8 +2127,29 @@ fn exposing_the_diff_scope_did_not_stop_its_bare_letters_being_typed() {
     let joined = rows(&render_offscreen(&mut dispatcher, 100, 12).expect("infallible")).join("\n");
     assert!(
         joined.contains(typed),
-        "the diff scope's bare letters stopped reaching the prompt; `{typed}` is not on \
-         screen:\n{joined}"
+        "the diff scope's bare characters stopped reaching the prompt; `{typed}` is not \
+         on screen:\n{joined}"
+    );
+
+    // Derived, not hand-maintained: a bare character added to the `diff` scope later is
+    // reachable from the prompt the moment the row lands, and the list above would
+    // otherwise silently stop covering it. `[` and `]` were in the table and missing from
+    // this test for exactly that reason.
+    let bare = crate::keybind::DEFINITIONS
+        .iter()
+        .filter(|definition| definition.scope == "diff")
+        .flat_map(|definition| definition.keys.split(','))
+        .filter(|spelling| spelling.chars().count() == 1)
+        .filter_map(|spelling| spelling.chars().next())
+        .collect::<std::collections::BTreeSet<_>>();
+    let uncovered = bare
+        .iter()
+        .filter(|character| !typed.contains(**character))
+        .collect::<Vec<_>>();
+    assert!(
+        uncovered.is_empty(),
+        "the `diff` scope binds {uncovered:?} to a bare character that this test never \
+         types, so nothing proves the prompt still accepts it"
     );
 }
 
