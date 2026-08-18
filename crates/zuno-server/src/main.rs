@@ -37,6 +37,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let Cli { command } = Cli::parse();
     match command {
         Command::Serve { hostname, port } => {
+            // Before anything that might report. This binary previously started a memory
+            // sampler and installed no subscriber, so every alert it raised went to
+            // `tracing`'s no-op dispatcher: a process could pass 2 GiB, the sampler would
+            // observe it, format the incident, and emit it nowhere. That is the same
+            // "machinery that runs and cannot be observed" defect the sampler was added to
+            // fix, one layer further out.
+            //
+            // Bound to a named local for the whole of `run`, and not `_`: the handle owns
+            // the appender's worker guard, so dropping it early stops file logging and
+            // would silence everything the sampler goes on to find. `init` is idempotent
+            // and never panics on an already-installed subscriber, so this is safe even
+            // when something else got there first — it simply reports `installed() == false`.
+            let logging = zuno_observability::init(zuno_observability::LogConfig::from_env(
+                zuno_paths::log(),
+            ))
+            .map_err(|error| format!("failed to initialize logging: {error}"))?;
             let directory = std::env::current_dir()?.to_string_lossy().into_owned();
             // One pool backs both surfaces: the `/api` handlers and the event
             // stream's durable sequence must see the same database, or a cursor
@@ -69,7 +85,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 zuno_observability::memory::active_sessions(),
             ));
             let served = server.serve().await;
+            // Sampler first, then the log sink it writes to: reversing these would discard
+            // whatever the sampler reports on its way out.
             memory.shutdown();
+            drop(logging);
             served?;
         }
     }

@@ -185,6 +185,153 @@ async fn tui_lsp_check_edits_drains_its_inlet_when_there_is_no_probe() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tui_lsp_no_report_is_lost_when_a_turn_writes_more_files_than_the_channel_holds() {
+    // The dropped-report defect. `report` used `try_send` and discarded the outcome, so a
+    // turn whose edit set is larger than the channel silently lost the overflow: with only
+    // a Rust server configured, seventeen `.txt` writes take the `has_server == false`
+    // branch seventeen times, the seventeenth `try_send` fails against a sixteen-slot
+    // channel, and the screen shows sixteen results as if the check were complete.
+    //
+    // That is not a display nicety. This module's own contract is that a file no server
+    // claims must be *reported* as unchecked, because silence on it reads as a clean bill
+    // of health — a false claim about correctness. A lost report makes the same false
+    // claim, and makes it invisibly.
+    //
+    // Driven through `check_edits` — the production task, with a real `Probe` and the real
+    // `PendingEdits` inlet — rather than by calling `report` or the sender directly. The
+    // first round's fix was tested at the sender and that is exactly how this survived.
+    let root = tempfile::tempdir().expect("a temporary directory");
+    let written = REPORT_CHANNEL_CAPACITY + 1;
+    let mut names = Vec::new();
+    for index in 0..written {
+        let name = format!("note{index}.txt");
+        std::fs::write(root.path().join(&name), "text\n").expect("a written file");
+        names.push(name);
+    }
+
+    // A Rust-only configuration, so every `.txt` is legitimately unclaimed and no language
+    // server has to start for this to be a faithful run of the branch.
+    //
+    // The nudge receiver is *kept*, because when the screen drains is the whole defect. The
+    // render loop drains reports only when something wakes it, so a test that drained
+    // concurrently would keep the channel empty and the sixteenth slot would never be
+    // reached — it would pass against the broken code. Nothing is read here until the
+    // checker says there is something to read.
+    let (nudges, mut woken) = zuno_tui::app::terminal_event_channel();
+    let probe = Probe::resolve(&config(r#"{"lsp":true}"#), root.path(), nudges).expect("a probe");
+    let (wake_sender, edit_receiver) = mpsc::channel(1);
+    let pending = zuno_tui::views::lsp::PendingEdits::new(wake_sender);
+    let reader = pending.reader();
+    let (reports, mut report_receiver) = mpsc::channel(REPORT_CHANNEL_CAPACITY);
+    let _task = tokio::spawn(check_edits(Some(probe), reader, edit_receiver, reports));
+    pending.merge(names.clone());
+    // Closes the signal channel, so the task ends after this batch and the drain below
+    // terminates on its own rather than on a timeout.
+    drop(pending);
+
+    let mut received = Vec::new();
+    let drained = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        // Wait to be told, exactly as the loop does, and only then read.
+        let _woken = woken.recv().await;
+        while let Some(report) = report_receiver.recv().await {
+            received.push(report);
+        }
+    })
+    .await;
+    assert!(
+        drained.is_ok(),
+        "the checker never finished; it delivered {} of {written} reports",
+        received.len()
+    );
+
+    assert_eq!(
+        received.len(),
+        written,
+        "{written} files were written and {} reports reached the screen, so {} unchecked \
+         file(s) were silently dropped against a {REPORT_CHANNEL_CAPACITY}-slot channel",
+        received.len(),
+        written - received.len()
+    );
+    let mut reported: Vec<String> = received.iter().map(|report| report.path.clone()).collect();
+    reported.sort();
+    names.sort();
+    assert_eq!(
+        reported, names,
+        "the reports name different files than were written"
+    );
+    assert!(
+        received.iter().all(|report| !report.is_checked()),
+        "a `.txt` file cannot have been checked by a Rust server"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tui_lsp_a_truncated_check_says_so_on_screen_and_not_only_in_the_log() {
+    // A codemod that writes past `PENDING_EDIT_LIMIT` gets its overflow refused, and the
+    // only record of that used to be a `tracing::warn!`. The default TUI displays no log,
+    // so the screen showed a check over a subset and looked complete — the same "silence
+    // reads as a clean bill of health" this module refuses for a file no server claims.
+    //
+    // Driven through `check_edits` so the notice has to survive the real path: the set's
+    // own bound refuses the paths, and the checker has to turn that count into something
+    // the screen is fed.
+    let root = tempfile::tempdir().expect("a temporary directory");
+    let limit = zuno_tui::views::lsp::PENDING_EDIT_LIMIT;
+    let overflow = 3;
+    // One real file, so the batch is not empty and the notice travels beside a report
+    // rather than instead of one.
+    std::fs::write(root.path().join("real.txt"), "text\n").expect("a written file");
+
+    let (nudges, mut woken) = zuno_tui::app::terminal_event_channel();
+    let probe = Probe::resolve(&config(r#"{"lsp":true}"#), root.path(), nudges).expect("a probe");
+    let (wake_sender, edit_receiver) = mpsc::channel(1);
+    let pending = zuno_tui::views::lsp::PendingEdits::new(wake_sender);
+    let reader = pending.reader();
+    let (reports, mut report_receiver) = mpsc::channel(REPORT_CHANNEL_CAPACITY);
+    let _task = tokio::spawn(check_edits(Some(probe), reader, edit_receiver, reports));
+
+    pending.merge(std::iter::once(String::from("real.txt")).chain(
+        // Names, not files: these are refused before anything looks at the disk.
+        (0..limit + overflow - 1).map(|index| format!("ghost{index}.rs")),
+    ));
+    drop(pending);
+
+    let mut received = Vec::new();
+    let drained = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let _woken = woken.recv().await;
+        while let Some(report) = report_receiver.recv().await {
+            received.push(report);
+        }
+    })
+    .await;
+    assert!(drained.is_ok(), "the checker never finished");
+
+    let notice = received
+        .iter()
+        .find(|report| report.dropped() > 0)
+        .unwrap_or_else(|| {
+            panic!(
+                "{overflow} paths were refused for space and no report said so, so the \
+                 screen shows a check over a subset as if it were complete. Reports: {:?}",
+                received
+                    .iter()
+                    .map(|report| report.summary())
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(notice.dropped(), overflow);
+    let summary = notice.summary();
+    assert!(
+        summary.contains("unchecked") && summary.contains(&overflow.to_string()),
+        "the notice must name how many files have no result: [{summary}]"
+    );
+    assert!(
+        received.iter().any(|report| report.path == "real.txt"),
+        "the notice replaced the report it was meant to qualify"
+    );
+}
+
 #[tokio::test]
 async fn tui_lsp_check_edits_skips_a_path_that_is_not_a_file() {
     // A model may report a write to a path it then removed, or to a directory. Asking a

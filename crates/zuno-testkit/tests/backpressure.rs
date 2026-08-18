@@ -248,13 +248,18 @@ const CHANNELS: &[ChannelGate] = &[
         "let _nudged = self.wake.try_send(());",
     ),
     gate(
+        // Lossless, not refuse-newest, and the change is the point: a language server's
+        // finding is not a value the producer can regenerate, so a refused one left the
+        // screen claiming a file was clean when nothing had checked it. The producer is a
+        // task of its own whose only blocked work is the next query, so waiting for a slot
+        // costs a query nobody could read yet.
         "tui-diagnostic-reports",
         "zuno-cli/src/cmd/tui.rs",
         "let (report_sender, report_receiver) = mpsc::channel(LSP_CHANNEL_CAPACITY);",
         "LSP_CHANNEL_CAPACITY=16",
-        Policy::RefuseNewest,
+        Policy::LosslessBlock,
         "zuno-cli/src/cmd/tui_lsp.rs",
-        "let _sent = reports.try_send(Report::unchecked(display));",
+        "if reports.send(report).await.is_err()",
     ),
     gate(
         "tui-questions",
@@ -498,6 +503,10 @@ channel_gate!(
 );
 channel_gate!(tui_prompts_refuse_the_newest_prompt, "tui-prompts");
 channel_gate!(tui_edit_signal_coalesces_when_full, "tui-edit-signal");
+channel_gate!(
+    tui_diagnostic_reports_apply_backpressure,
+    "tui-diagnostic-reports"
+);
 channel_gate!(tui_mcp_toggles_refuse_the_newest_request, "tui-mcp-toggles");
 channel_gate!(tui_questions_apply_backpressure, "tui-questions");
 channel_gate!(tui_editor_requests_refuse_the_newest, "tui-editor-requests");
