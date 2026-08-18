@@ -5,6 +5,7 @@ use super::*;
 use crate::app::{
     App, DrawTarget, TerminalEvent, TerminalLifecycle, render_offscreen, terminal_event_channel,
 };
+use crate::keybind::Keymap;
 use crate::views::message::TranscriptView;
 use crate::views::testkit::{action, press, rows};
 use crossterm::event::{Event as CrosstermEvent, KeyCode};
@@ -666,4 +667,340 @@ fn views_dialog_a_reject_box_can_still_be_typed_into() {
         joined.contains("nope"),
         "the reject box no longer receives typed text:\n{joined}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `§11.4`'s three width tiers, applied at this layer
+// ---------------------------------------------------------------------------
+
+/// A dialog that reports the tier it was built with and nothing else.
+struct Tiered(&'static str, DialogWidth, ViewContext);
+
+impl Dialog for Tiered {
+    fn id(&self) -> &'static str {
+        self.0
+    }
+
+    fn title(&self) -> String {
+        String::from("tier")
+    }
+
+    fn width(&self) -> DialogWidth {
+        self.1
+    }
+
+    fn lines(&mut self, width: u16) -> Vec<Line<'static>> {
+        // A full-width row of a single character, so the frame shows the dialog's own
+        // measure rather than the length of whatever text happened to be in it.
+        vec![padded(
+            &"#".repeat(usize::from(width)),
+            width,
+            self.2.text(),
+        )]
+    }
+
+    fn handle_action(&mut self, _action: &'static Definition, _event: &KeyEvent) -> DialogStep {
+        DialogStep::Ignored
+    }
+}
+
+/// The columns the body row actually occupied, from a rendered frame.
+///
+/// Derived from the painted `#`s rather than from `dialog_columns`, because a test that
+/// recomputed the function under test would pass for any function.
+fn measured_columns(host: &mut DialogHost, width: u16, height: u16) -> usize {
+    let rendered = rows(&render_offscreen(host, width, height).expect("infallible"));
+    rendered
+        .iter()
+        .map(|row| row.chars().filter(|character| *character == '#').count())
+        .max()
+        .unwrap_or(0)
+}
+
+#[test]
+fn views_dialog_each_tier_gets_its_own_width_on_a_wide_terminal() {
+    for (tier, expected) in [
+        (DialogWidth::Medium, 60_u16),
+        (DialogWidth::Large, 88),
+        (DialogWidth::XLarge, 116),
+    ] {
+        assert_eq!(tier.columns(), expected, "{tier:?} moved off its tier");
+        let (mut host, context) = host();
+        host.open(Box::new(Tiered("tier", tier, context)));
+        // Two columns of the tier are the left rule and the right inner margin, so the
+        // body is the tier less two.
+        assert_eq!(
+            measured_columns(&mut host, 200, 12),
+            usize::from(expected - 2),
+            "{tier:?} did not lay out at {expected} columns on a 200-column terminal"
+        );
+    }
+}
+
+#[test]
+fn views_dialog_a_tier_is_centred_rather_than_flush_left() {
+    let (mut host, context) = host();
+    host.open(Box::new(Tiered("tier", DialogWidth::Medium, context)));
+    let rendered = rows(&render_offscreen(&mut host, 200, 12).expect("infallible"));
+    let row = rendered
+        .iter()
+        .find(|row| row.contains('#'))
+        .expect("a body row");
+    // The first painted column is the left rule, so it is the dialog's own left edge.
+    let lead = row.len() - row.trim_start().len();
+    assert_eq!(
+        lead,
+        usize::from((200_u16 - 60) / 2),
+        "a 60-column dialog is not centred in a 200-column frame: {row:?}"
+    );
+}
+
+#[test]
+fn views_dialog_a_terminal_narrower_than_the_tier_converges_to_the_gutter() {
+    // `§11.4`: `min(tier, term_width - 4)`. Asserted for every tier at a width each one
+    // cannot have, so the fallback is not being read off whichever tier happens to fit.
+    for (tier, width) in [
+        (DialogWidth::Medium, 50_u16),
+        (DialogWidth::Large, 70),
+        (DialogWidth::XLarge, 100),
+    ] {
+        let (mut host, context) = host();
+        host.open(Box::new(Tiered("tier", tier, context)));
+        assert_eq!(
+            measured_columns(&mut host, width, 12),
+            usize::from(width - DIALOG_GUTTER - 2),
+            "{tier:?} did not converge to term_width - {DIALOG_GUTTER} at {width} columns"
+        );
+    }
+}
+
+#[test]
+fn views_dialog_below_the_smallest_tier_the_tier_is_abandoned_entirely() {
+    // The case `§11.4` does not name. There is no tier under 60, so every dialog takes
+    // the gutter width — which is what keeps a 60-column `Rect` from being drawn into a
+    // 20-column frame.
+    for width in [20_u16, 30, 40, 59] {
+        for tier in [DialogWidth::Medium, DialogWidth::Large, DialogWidth::XLarge] {
+            assert_eq!(
+                dialog_columns(tier, width),
+                width - DIALOG_GUTTER,
+                "{tier:?} kept its tier on a {width}-column terminal"
+            );
+            let (mut host, context) = host();
+            host.open(Box::new(Tiered("tier", tier, context)));
+            assert_eq!(
+                measured_columns(&mut host, width, 10),
+                usize::from(width - DIALOG_GUTTER - 2),
+                "{tier:?} did not shrink to fit a {width}-column frame"
+            );
+        }
+    }
+}
+
+#[test]
+fn views_dialog_keeps_a_visible_body_when_the_gutter_would_take_everything() {
+    // At four columns or fewer the gutter is abandoned too, because a zero-width dialog
+    // is not a small dialog — it is an invisible modal that still owns the keyboard.
+    for width in 1..=DIALOG_GUTTER {
+        assert_eq!(
+            dialog_columns(DialogWidth::Medium, width),
+            width,
+            "a {width}-column terminal produced an invisible dialog"
+        );
+    }
+    assert_eq!(dialog_columns(DialogWidth::Medium, 5), 1);
+}
+
+#[test]
+fn views_dialog_does_not_panic_on_a_degenerate_frame() {
+    // `§11.6`'s acceptance case and the sizes around it. Before the height was clamped
+    // back down after its `max(3)`, a two-row frame produced a three-row region and the
+    // fill walked off the end of the buffer.
+    for (width, height) in [(20_u16, 10_u16), (1, 1), (2, 2), (4, 3), (200, 1), (10, 2)] {
+        let (mut host, context) = host();
+        host.open(Box::new(Tiered("tier", DialogWidth::XLarge, context)));
+        let _no_panic = render_offscreen(&mut host, width, height).expect("infallible");
+    }
+}
+
+#[test]
+fn views_dialog_the_default_tier_is_large_and_the_two_reference_panels_are_xlarge() {
+    // The tier assignment is a table in the plan, and a dialog that silently took the
+    // default would be a row of that table quietly changed. Asserted through the trait so
+    // a new dialog inherits the check.
+    let context = ViewContext::defaults();
+    let (probe, _) = Probe::new("probe", "body");
+    assert_eq!(probe.width(), DialogWidth::Large);
+    assert_eq!(
+        crate::views::help::HelpView::new(
+            context.clone(),
+            &Keymap::defaults().expect("the table builds")
+        )
+        .width(),
+        DialogWidth::XLarge
+    );
+    assert_eq!(
+        crate::views::permission::PermissionPrompt::new(
+            context,
+            zuno_permission::PermissionRequest {
+                id: String::from("r"),
+                session_id: String::from("s"),
+                permission: String::from("bash"),
+                patterns: Vec::new(),
+                metadata: serde_json::Map::new(),
+                always: Vec::new(),
+                tool: None,
+            },
+            &serde_json::json!({"command": "make"}),
+        )
+        .width(),
+        DialogWidth::XLarge
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scope reachability, for dialogs rather than for the base screen
+// ---------------------------------------------------------------------------
+
+/// One instance of every dialog form the base layer ships, plus the probe.
+///
+/// Rebuilt per action because `handle_action` takes `&mut self` and several of these
+/// resolve, so one shared instance would answer the first action and then be a closed
+/// dialog answering nothing.
+fn base_forms(context: &ViewContext) -> Vec<Box<dyn Dialog>> {
+    vec![
+        Box::new(crate::views::basics::ConfirmDialog::new(
+            context.clone(),
+            "confirm",
+            "heading",
+            "body",
+        )),
+        Box::new(crate::views::basics::AlertDialog::new(
+            context.clone(),
+            "alert",
+            "heading",
+            "body",
+        )),
+        Box::new(crate::views::basics::PromptDialog::new(
+            context.clone(),
+            "prompt",
+            "heading",
+            "text",
+        )),
+    ]
+}
+
+#[test]
+fn views_dialog_every_action_a_base_form_consumes_resolves_while_it_is_open() {
+    // The dialog-side counterpart of `session_tests`'
+    // `every_action_the_screen_consumes_lives_in_a_scope_it_resolves`, and it exists for
+    // the same reason: that guard derives its set from `SessionScreen::handle_action`, so
+    // an action a *dialog* claims is covered by neither it nor the two hand-kept lists.
+    // A dialog whose scope `DialogHost::focused_scopes` does not carry is a footer
+    // advertising a key that resolves to something else entirely — `picker.rs`'s missing
+    // `session_interrupt` arm was exactly that, an `esc cancel` hint naming a way out
+    // that did not exist.
+    //
+    // The set is derived from the dialog, not listed: whatever a form consumes has to be
+    // pressable while that form is open.
+    let mut keymap = Keymap::defaults().expect("the shipped table builds");
+    let context = ViewContext::defaults();
+    let mut offences = Vec::new();
+    let mut checked = 0;
+
+    for (index, id) in ["confirm", "alert", "prompt"].into_iter().enumerate() {
+        // The chain a key actually resolves against while this dialog owns the keyboard:
+        // the host's own list first, then the screen's static one. Asked of the host so
+        // the test cannot disagree with production about what is in scope.
+        let scopes = {
+            let mut host = DialogHost::new(context.clone(), Box::new(FocusedBase));
+            host.open(base_forms(&context).into_iter().nth(index).expect("a form"));
+            let mut scopes = ActionComponent::focused_scopes(&host)
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>();
+            scopes.extend(crate::views::session::scopes());
+            scopes
+        };
+
+        for definition in crate::keybind::DEFINITIONS {
+            let sequences = keymap.sequences(definition.name);
+            let Some(spelling) = sequences.first() else {
+                continue;
+            };
+            let consumed = base_forms(&context)
+                .into_iter()
+                .nth(index)
+                .expect("a form")
+                .handle_action(definition, &press(KeyCode::Null))
+                != DialogStep::Ignored;
+            if !consumed {
+                continue;
+            }
+            checked += 1;
+            // `app_exit` is the documented exception, and it is the same one
+            // `session_tests`' guard carves out. `ctrl+c` is claimed by the `input` scope
+            // before `app`, so it resolves to `input_clear` and never to `app_exit` — and
+            // that is *why* `DialogHost::handle_action` forwards exactly one class of
+            // ignored action, the class whose chord the table binds to `APP_EXIT`. The
+            // dialog's own arm is for a chain where the resolution does land on it. Held
+            // to the resolution rule below, this row would demand the host stop
+            // compensating from the physical chord, which is what once left a user unable
+            // to leave a raw-mode terminal at all.
+            if definition.name == crate::keybind::APP_EXIT {
+                continue;
+            }
+            if !scopes.iter().any(|scope| scope == definition.scope) {
+                offences.push(format!(
+                    "`{id}` acts on {} but its scope `{}` is not in the chain a dialog \
+                     resolves against",
+                    definition.name, definition.scope
+                ));
+                continue;
+            }
+            // The shadowing half. Two dialog rows share `return` — `dialog.select.submit`
+            // and `dialog.prompt.submit` — so demanding that each resolve to *itself*
+            // would fail for a collision that is upstream's and cannot be edited away.
+            // The property that matters is weaker and sufficient: the action the chord
+            // really resolves to is one this same dialog also acts on, so the key does
+            // what its footer says.
+            let Ok(chord) = Chord::parse(spelling) else {
+                continue;
+            };
+            let resolved = match keymap.resolve(
+                &scopes.iter().map(String::as_str).collect::<Vec<_>>(),
+                chord,
+                std::time::Instant::now(),
+            ) {
+                crate::keybind::Resolution::Action { definition, .. } => Some(definition),
+                _ => None,
+            };
+            let Some(resolved) = resolved else {
+                offences.push(format!(
+                    "`{id}` acts on {} (`{spelling}`) but that chord resolves to nothing",
+                    definition.name
+                ));
+                continue;
+            };
+            let honoured = base_forms(&context)
+                .into_iter()
+                .nth(index)
+                .expect("a form")
+                .handle_action(resolved, &press(KeyCode::Null))
+                != DialogStep::Ignored;
+            if !honoured {
+                offences.push(format!(
+                    "`{id}` advertises {} on `{spelling}`, but that chord resolves to {} \
+                     which the dialog ignores — the key does nothing",
+                    definition.name, resolved.name
+                ));
+            }
+        }
+    }
+    assert!(
+        checked >= 12,
+        "the dialog scope guard checked only {checked} actions across three forms, so it is \
+         not finding what it exists to check"
+    );
+    assert!(offences.is_empty(), "{}", offences.join("\n"));
 }

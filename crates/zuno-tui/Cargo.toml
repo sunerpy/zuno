@@ -41,6 +41,12 @@ unicode-width = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }
+# `test-util` for the toast's own deadline, which is five seconds long: a test that
+# waited it out would be the slowest in the crate, and one that shortened the constant
+# would no longer be testing the shipped TTL. `tokio::time::pause` asserts the real
+# value in no time at all. Additive on the inherited entry, which is the pattern the
+# root manifest names for exactly this case; it adds no new package.
+tokio = { workspace = true, features = ["test-util"] }
 # The configuration-discovery tests write real files, because the failure this
 # module has to get right — a missing layer versus an unreadable one — is a
 # filesystem distinction that an in-memory fixture cannot reproduce.

@@ -371,7 +371,12 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
     {
         screen.submit_prompt(prompt);
     }
-    let dialogs = DialogHost::new(context.clone(), Box::new(screen));
+    // The waker is what makes a toast expire on its deadline rather than at the next
+    // event. It is the terminal channel that already exists, not a new one; see
+    // `zuno_tui::views::toast` for why one deadline and one wake was chosen over giving
+    // the redraw scheduler a fourth tier.
+    let dialogs = DialogHost::new(context.clone(), Box::new(screen))
+        .with_toast_waker(terminal_sender.clone());
     let bridge = PermissionBridge::new(context.clone(), broker, dialogs)
         .with_question(QuestionBridge::new(context, question_broker));
     let root = KeyDispatcher::new(keymap, scopes(), Box::new(bridge));

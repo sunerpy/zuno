@@ -973,6 +973,18 @@ pub trait ActionComponent: Component {
         Vec::new()
     }
 
+    /// Transient notices this component asked to show.
+    ///
+    /// The same seam as [`Self::drain_dialogs`], and for the same reason: the slot lives
+    /// in [`crate::views::dialog::DialogHost`] because `§11.4` puts a toast *above* the
+    /// modal stack, and a component below the host cannot paint above it. A base that
+    /// drew its own toast would have it hidden by any open dialog — which is precisely
+    /// the moment a "copied" confirmation matters, because the transcript behind the
+    /// modal cannot be read either.
+    fn drain_toasts(&mut self) -> Vec<crate::views::toast::Toast> {
+        Vec::new()
+    }
+
     /// Observe the answer to a dialog this component asked for.
     fn apply_dialog_outcome(
         &mut self,

@@ -550,6 +550,16 @@ impl Dialog for PermissionPrompt {
         }
     }
 
+    /// `§11.4`'s widest tier, which that table assigns to this prompt by name.
+    ///
+    /// It is the only dialog that renders a diff, and a diff is the one body whose
+    /// readability is a function of columns rather than rows: at 88 the split layout
+    /// this module can reach above [`crate::views::SPLIT_DIFF_MIN_WIDTH`] would have two
+    /// code columns of about forty, which is under the width the fork exists to require.
+    fn width(&self) -> crate::views::dialog::DialogWidth {
+        crate::views::dialog::DialogWidth::XLarge
+    }
+
     fn lines(&mut self, width: u16) -> Vec<Line<'static>> {
         match self.stage {
             Stage::Choose => self.choose_lines(width),

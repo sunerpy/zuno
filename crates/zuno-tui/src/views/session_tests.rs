@@ -3,8 +3,10 @@
 use super::*;
 use crate::app::{TerminalEvent, render_offscreen, terminal_event_channel};
 use crate::keybind::{KeyDispatcher, Keymap};
+use crate::views::dialog::DialogHost;
 use crate::views::editor::Position;
-use crate::views::testkit::{action, rows};
+use crate::views::testkit::{action, press, rows};
+use crate::views::toast::ToastLevel;
 use zuno_engine::r#loop::TurnEvent;
 use zuno_llm::event::StreamEvent;
 
@@ -341,22 +343,240 @@ fn session_screen_catalog_slash_stays_typed_for_the_host() {
 }
 
 #[test]
-fn session_screen_undo_and_redo_stay_typed_for_the_runtime_host() {
-    for (text, expected) in [
-        ("/undo", PromptSubmission::Host(HostCommand::Undo)),
-        ("/redo", PromptSubmission::Host(HostCommand::Redo)),
-    ] {
-        let (sender, _shutdown) = terminal_event_channel();
-        let (prompts, mut submitted) = mpsc::channel(1);
-        let mut screen =
-            SessionScreen::new(ViewContext::defaults(), sender).with_prompt_sink(prompts);
-        screen.editor.set_text(text);
+fn session_screen_redo_stays_typed_for_the_runtime_host_and_asks_nothing() {
+    // `/redo` reapplies the boundary the user just left by confirming an undo, so it
+    // restores a state they were shown and agreed to. Confirming it too would only teach
+    // people to press through both prompts. `/undo` is the one that asks; see below.
+    let (sender, _shutdown) = terminal_event_channel();
+    let (prompts, mut submitted) = mpsc::channel(1);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender).with_prompt_sink(prompts);
+    screen.editor.set_text("/redo");
 
-        screen.handle_action(action("input_submit"), &press_none());
+    screen.handle_action(action("input_submit"), &press_none());
 
-        assert_eq!(submitted.try_recv(), Ok(expected));
-        assert_eq!(screen.submissions(), [text]);
+    assert_eq!(
+        submitted.try_recv(),
+        Ok(PromptSubmission::Host(HostCommand::Redo))
+    );
+    assert_eq!(screen.submissions(), ["/redo"]);
+    assert!(
+        screen.drain_dialogs().is_empty(),
+        "`/redo` opened a dialog it does not need"
+    );
+}
+
+/// Type `text` into the hosted screen and submit it, the way a user would.
+///
+/// The dismissal in the middle is not ceremony: typing `/` opens the slash autocomplete,
+/// and while it is open the screen remaps `input_submit` to
+/// `prompt.autocomplete.select` — so a test that submitted straight away would be
+/// picking from a list rather than sending the command, and would see no dialog at all.
+fn type_and_submit(host: &mut DialogHost, text: &str) {
+    for character in text.chars() {
+        host.handle_event(&AppEvent::Terminal(TerminalEvent::Input(
+            crossterm::event::Event::Key(press(crossterm::event::KeyCode::Char(character))),
+        )));
     }
+    host.handle_action(action("session_interrupt"), &press_none());
+    host.handle_action(action("input_submit"), &press_none());
+}
+
+/// A screen with a prompt sink, mounted under the host that opens its dialogs.
+///
+/// Through the host on purpose: the screen can only *ask* for a dialog
+/// (`drain_dialogs`), so a test that inspected the request would prove the confirmation
+/// was built and never that it can be answered — the "built, tested, impossible to open"
+/// failure this project has removed four times.
+fn hosted_screen() -> (DialogHost, mpsc::Receiver<PromptSubmission>) {
+    let (sender, shutdown) = terminal_event_channel();
+    // Leaked deliberately: dropping the receiver closes the shutdown channel, and the
+    // screen reports a closed channel rather than the behaviour under test.
+    std::mem::forget(shutdown);
+    let (prompts, submitted) = mpsc::channel(1);
+    let context = ViewContext::defaults();
+    let screen = SessionScreen::new(context.clone(), sender).with_prompt_sink(prompts);
+    (DialogHost::new(context, Box::new(screen)), submitted)
+}
+
+#[test]
+fn session_screen_undo_asks_before_it_restores_the_worktree() {
+    let (mut host, mut submitted) = hosted_screen();
+    type_and_submit(&mut host, "/undo");
+
+    assert_eq!(
+        host.active(),
+        Some(crate::views::session::UNDO_CONFIRM_DIALOG_ID),
+        "`/undo` reached the driver with nothing asked"
+    );
+    assert!(
+        submitted.try_recv().is_err(),
+        "the worktree was restored before the user answered"
+    );
+    let shown = rows(&render_offscreen(&mut host, 70, 16).expect("infallible")).join("\n");
+    assert!(
+        shown.contains("cannot be recovered") && shown.contains("Restore"),
+        "the confirmation did not say what it would do:\n{shown}"
+    );
+
+    host.handle_action(action("dialog.select.submit"), &press_none());
+    assert_eq!(
+        submitted.try_recv(),
+        Ok(PromptSubmission::Host(HostCommand::Undo)),
+        "confirming the undo did not restore anything"
+    );
+    assert!(
+        !host.is_open(),
+        "the confirmation stayed up after answering"
+    );
+}
+
+#[test]
+fn session_screen_cancelling_the_undo_confirmation_restores_nothing() {
+    // The half that matters: a confirmation that ran the action either way is worse than
+    // none, because it teaches the user their answer is not read.
+    let (mut host, mut submitted) = hosted_screen();
+    type_and_submit(&mut host, "/undo");
+    host.handle_action(action("session_interrupt"), &press_none());
+
+    assert!(!host.is_open());
+    assert!(
+        submitted.try_recv().is_err(),
+        "cancelling the confirmation restored the worktree anyway"
+    );
+}
+
+#[test]
+fn session_screen_offers_a_prompt_dialog_when_there_is_no_external_editor() {
+    // The action means "give me more room for this text". Answering it with one
+    // transcript line saying no left the request unserved, which is what this replaces.
+    let (mut host, _submitted) = hosted_screen();
+    for character in "draft".chars() {
+        host.handle_event(&AppEvent::Terminal(TerminalEvent::Input(
+            crossterm::event::Event::Key(press(crossterm::event::KeyCode::Char(character))),
+        )));
+    }
+    host.handle_action(action("editor_open"), &press_none());
+    assert_eq!(
+        host.active(),
+        Some(crate::views::session::EDITOR_FALLBACK_DIALOG_ID),
+        "with no `$EDITOR` worker the request went nowhere"
+    );
+    let shown = rows(&render_offscreen(&mut host, 70, 16).expect("infallible")).join("\n");
+    assert!(
+        shown.contains("draft"),
+        "the fallback did not open on what the user had already typed:\n{shown}"
+    );
+
+    for character in "-more".chars() {
+        host.handle_event(&AppEvent::Terminal(TerminalEvent::Input(
+            crossterm::event::Event::Key(press(crossterm::event::KeyCode::Char(character))),
+        )));
+    }
+    host.handle_action(action("dialog.prompt.submit"), &press_none());
+    assert!(!host.is_open());
+    let after = rows(&render_offscreen(&mut host, 70, 16).expect("infallible")).join("\n");
+    assert!(
+        after.contains("draft-more"),
+        "the edited text did not land back in the prompt:\n{after}"
+    );
+}
+
+#[test]
+fn session_screen_cancelling_the_editor_fallback_leaves_the_prompt_untouched() {
+    // `Ok(None)`'s behaviour on the real editor path, matched here: the two routes agree
+    // on both outcomes and not only the successful one.
+    let (mut host, _submitted) = hosted_screen();
+    for character in "keep".chars() {
+        host.handle_event(&AppEvent::Terminal(TerminalEvent::Input(
+            crossterm::event::Event::Key(press(crossterm::event::KeyCode::Char(character))),
+        )));
+    }
+    host.handle_action(action("editor_open"), &press_none());
+    host.handle_action(action("session_interrupt"), &press_none());
+    let after = rows(&render_offscreen(&mut host, 70, 16).expect("infallible")).join("\n");
+    assert!(
+        after.contains("keep"),
+        "cancelling the fallback cleared the prompt:\n{after}"
+    );
+}
+
+#[test]
+fn session_screen_a_failed_external_editor_opens_an_alert_that_waits_to_be_read() {
+    // A toast would truncate a child's diagnostic into a corner for five seconds, and the
+    // transcript scrolls it away behind whatever the turn prints next. The user has to
+    // read this one to know whether their draft survived.
+    let (sender, shutdown) = terminal_event_channel();
+    std::mem::forget(shutdown);
+    let (results, result_source) = mpsc::channel(1);
+    let (requests, _request_source) = mpsc::channel(1);
+    let context = ViewContext::defaults();
+    let screen =
+        SessionScreen::new(context.clone(), sender).with_external_editor(requests, result_source);
+    let mut host = DialogHost::new(context, Box::new(screen));
+    results
+        .try_send(Err(crate::views::external::ExternalError::NoEditor))
+        .expect("capacity 1");
+
+    host.handle_event(&AppEvent::Terminal(TerminalEvent::Wake));
+    assert_eq!(
+        host.active(),
+        Some(crate::views::session::EDITOR_ALERT_DIALOG_ID),
+        "the editor failure was reported without waiting to be read"
+    );
+    let shown = rows(&render_offscreen(&mut host, 70, 16).expect("infallible")).join("\n");
+    assert!(
+        shown.contains("The prompt is unchanged"),
+        "the alert did not say what happened to the draft:\n{shown}"
+    );
+
+    host.handle_action(action("dialog.select.submit"), &press_none());
+    assert!(!host.is_open(), "enter did not dismiss the alert");
+}
+
+#[test]
+fn session_screen_copy_feedback_reaches_the_screen_and_survives_a_dialog_opening_over_it() {
+    // The end-to-end property from the real caller, in the order it actually happens. A
+    // modal owns the keyboard, so `messages_copy` cannot be pressed *while* a dialog is
+    // up — the host absorbs it, which is the behaviour that keeps `session_new` from
+    // firing behind a permission prompt. The reachable sequence is copy, then open
+    // something within the toast's five seconds, and the notice has to stay readable: a
+    // transcript line would be behind the modal, where the user cannot see the feedback
+    // they are waiting for.
+    let (sender, shutdown) = terminal_event_channel();
+    std::mem::forget(shutdown);
+    let context = ViewContext::defaults();
+    let clipboard = Arc::new(crate::views::external::MemoryClipboard::default());
+    let mut screen = SessionScreen::new(context.clone(), sender)
+        .with_clipboard(Arc::clone(&clipboard) as Arc<dyn Clipboard>);
+    for character in "abc".chars() {
+        screen.editor.insert_char(character);
+    }
+    let mut host = DialogHost::new(context.clone(), Box::new(screen));
+
+    host.handle_action(action("messages_copy"), &press_none());
+    let copied = rows(&render_offscreen(&mut host, 70, 14).expect("infallible"));
+    assert!(
+        copied[0].contains("copied"),
+        "the copy confirmation never reached the screen at all: {copied:?}"
+    );
+
+    host.open(Box::new(crate::views::basics::AlertDialog::new(
+        context,
+        "alert.test",
+        "In the way",
+        "body ".repeat(200),
+    )));
+    let after = rows(&render_offscreen(&mut host, 70, 14).expect("infallible"));
+    assert!(
+        after[1..]
+            .iter()
+            .any(|row| row.contains("In the way") || row.contains("body")),
+        "the dialog did not open, so this proves nothing about layering: {after:?}"
+    );
+    assert!(
+        after[0].contains("copied"),
+        "the dialog opened over the copy confirmation and hid it: {after:?}"
+    );
 }
 
 #[test]
@@ -2555,6 +2775,21 @@ fn broken_clipboard() -> Arc<dyn Clipboard> {
     ))
 }
 
+/// The toast the screen last asked its host to raise.
+///
+/// Drained the way [`crate::views::dialog::DialogHost`] drains it, so a test reads the
+/// same value production does. Copy feedback moved off the transcript because a
+/// transcript line is permanent and is hidden behind an open modal; see
+/// `SessionScreen::copy`. A frame-level assertion that it actually reaches the screen
+/// above a dialog lives in `views/toast_tests.rs`, and one from this real caller is
+/// below.
+fn last_toast(screen: &mut SessionScreen) -> Toast {
+    screen
+        .drain_toasts()
+        .pop()
+        .expect("the screen raised no toast at all")
+}
+
 /// The notice text of the last message in the transcript.
 fn last_message(screen: &mut SessionScreen) -> String {
     screen
@@ -2614,10 +2849,20 @@ fn session_screen_says_on_screen_that_the_copy_landed() {
         screen.editor.insert_char(character);
     }
     copy_action(&mut screen);
-    let notice = last_message(&mut screen);
+    let toast = last_toast(&mut screen);
     assert!(
-        notice.contains("copied") && notice.contains('3'),
-        "a successful copy said nothing useful: {notice:?}"
+        toast.text().contains("copied") && toast.text().contains('3'),
+        "a successful copy said nothing useful: {:?}",
+        toast.text()
+    );
+    assert_eq!(
+        toast.level(),
+        ToastLevel::Success,
+        "a copy that worked was not reported as a success"
+    );
+    assert!(
+        last_message(&mut screen).is_empty(),
+        "the copy also went into the transcript, where it is permanent"
     );
 }
 
@@ -2630,10 +2875,16 @@ fn session_screen_a_failed_copy_is_visible_rather_than_silent() {
 
     copy_action(&mut screen);
 
-    let notice = last_message(&mut screen);
+    let toast = last_toast(&mut screen);
     assert!(
-        notice.contains("copy failed"),
-        "a host with no clipboard mechanism reported success: {notice:?}"
+        toast.text().contains("copy failed"),
+        "a host with no clipboard mechanism reported success: {:?}",
+        toast.text()
+    );
+    assert_eq!(
+        toast.level(),
+        ToastLevel::Error,
+        "a failed copy was not reported as an error"
     );
 }
 
@@ -2648,10 +2899,16 @@ fn session_screen_copying_nothing_leaves_the_clipboard_alone() {
         None,
         "an empty prompt overwrote the clipboard"
     );
-    let notice = last_message(&mut screen);
+    let toast = last_toast(&mut screen);
     assert!(
-        notice.contains("nothing to copy"),
-        "an empty copy said nothing: {notice:?}"
+        toast.text().contains("nothing to copy"),
+        "an empty copy said nothing: {:?}",
+        toast.text()
+    );
+    assert_eq!(
+        toast.level(),
+        ToastLevel::Warning,
+        "nothing failed, so this is not an error: `§11.5` reserves that colour"
     );
 }
 
