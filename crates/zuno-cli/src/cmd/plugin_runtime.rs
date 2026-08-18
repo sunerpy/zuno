@@ -423,6 +423,31 @@ impl PluginRuntime {
             .any(|plugin| plugin.manifest().supports(hook))
     }
 
+    /// Each loaded plugin's id and the hooks its manifest claims.
+    ///
+    /// The hooks, not a version: the loaded manifest has no version field, and the version
+    /// in an npm install spec is the version that was *asked* for — the two diverge exactly
+    /// when a status panel is being read. Which hooks a plugin claims is also the fact that
+    /// explains why it is or is not running.
+    pub(crate) fn census(&self) -> Vec<(String, Vec<&'static str>)> {
+        self.bus
+            .plugins()
+            .iter()
+            .map(|plugin| {
+                let manifest = plugin.manifest();
+                (
+                    manifest.id().to_owned(),
+                    manifest
+                        .hooks()
+                        .iter()
+                        .copied()
+                        .map(HookName::as_str)
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
     fn catalog_context(
         &self,
         provider_id: &str,

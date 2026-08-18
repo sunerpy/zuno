@@ -1938,6 +1938,141 @@ fn every_shipped_default_binding_puts_something_on_the_screen() {
 }
 
 #[test]
+fn the_two_diagnostics_panels_open_from_the_keys_the_table_binds_them_to() {
+    // The counterpart of the test above for the two `§8.7` panels, which are bound by
+    // `DEFINITIONS` rather than by `SHIPPED_DEFAULTS` and so are outside its list. This is
+    // the whole-chain proof: a real chord through a real `KeyDispatcher` over the real
+    // scope list, asserted on the frame. `status_view` was reachable in the binding table
+    // and in `handle_view_action` long before its scope was registered — that gap is what
+    // left `editor_open` dead, and only a test shaped like this one sees it.
+    // Only the bound one is asserted here. `debug_view` ships with no key — upstream's
+    // choice, and the table is not editable to align with a newer upstream — so its route
+    // is the palette and it has a test of its own below. Pressing a null key at it here
+    // would assert nothing while looking like coverage.
+    let leader = Keymap::defaults()
+        .expect("the shipped table builds")
+        .leader();
+    let spelling = crate::keybind::definition("status_view")
+        .expect("the action is in the shipped table")
+        .keys;
+    assert_ne!(
+        spelling,
+        crate::keybind::NO_KEY,
+        "`status_view` lost its key, so this test is no longer exercising a chord"
+    );
+    let keymap = Keymap::defaults().expect("the shipped table builds");
+    let screen = furnished_screen();
+    let host = crate::views::dialog::DialogHost::new(ViewContext::defaults(), Box::new(screen));
+    let mut dispatcher = KeyDispatcher::new(keymap, scopes(), Box::new(host));
+
+    dispatch_sequence(&mut dispatcher, spelling, leader);
+    // Below `SIDEBAR_MIN_WIDTH`, so the ambient panel is not drawn at all. At 130 it is,
+    // and `render` copies the same `McpProjection` into `ambient.mcp` every frame — so a
+    // frame-wide `contains("context7")` passed off the *sidebar* whether or not the census
+    // read anything. Removing the census's live MCP read left this test green, which is
+    // the vacuous-needle failure `views_tests` warns about: the row under test was owned
+    // by another surface.
+    let drawn = rows(&render_offscreen(&mut dispatcher, 118, 24).expect("infallible"));
+    let joined = drawn.join("\n");
+    assert!(
+        joined.contains("Status"),
+        "`status_view` on `{spelling}` did not open the census:\n{joined}"
+    );
+    // `MCP servers` is the census's own heading; the sidebar's is `MCP`. Located
+    // positionally so this proves the member was grouped under it rather than merely
+    // present somewhere on the frame.
+    let heading = drawn
+        .iter()
+        .position(|row| row.contains("MCP servers"))
+        .unwrap_or_else(|| panic!("the census has no MCP group:\n{joined}"));
+    assert!(
+        drawn
+            .get(heading + 1)
+            .is_some_and(|row| row.contains("context7")),
+        "the live MCP server is not the first row under the census's own heading, so the \
+         census is not reading the projection the MCP dialog reads:\n{joined}"
+    );
+}
+
+#[test]
+fn the_debug_panel_is_reachable_from_the_palette_because_it_ships_unbound() {
+    // `debug_view` has no key in the shipped table, so the palette is its only route. The
+    // palette re-enters `dispatch_action` with the chosen action's name, which is exactly
+    // the path a user takes; asserting on the frame proves the panel opened rather than
+    // that the action was merely accepted.
+    let mut screen = furnished_screen();
+    screen.set_diagnostics(
+        Vec::new(),
+        crate::views::diagnostics::DebugFacts {
+            session: Some(String::from("ses_probe")),
+            ..crate::views::diagnostics::DebugFacts::default()
+        },
+    );
+    let mut host = crate::views::dialog::DialogHost::new(ViewContext::defaults(), Box::new(screen));
+    host.handle_action(
+        crate::views::testkit::action("debug_view"),
+        &crate::views::testkit::press(crossterm::event::KeyCode::Null),
+    );
+    let joined = rows(&render_offscreen(&mut host, 130, 24).expect("infallible")).join("\n");
+    assert!(
+        joined.contains("Debug") && joined.contains("ses_probe"),
+        "the debug report did not open with its facts on screen:\n{joined}"
+    );
+}
+
+#[test]
+fn copying_the_debug_report_reaches_the_clipboard_and_says_so() {
+    // `§8.7`'s "Enter 复制全部并 toast", end to end from the panel's own key through the
+    // screen's clipboard seam. A dialog that emitted an outcome nobody routed would look
+    // identical from inside the panel's own tests.
+    let (sender, _receiver) = terminal_event_channel();
+    let clipboard = Arc::new(crate::views::external::MemoryClipboard::default());
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_clipboard(Arc::clone(&clipboard) as Arc<dyn Clipboard>);
+    screen.set_diagnostics(
+        Vec::new(),
+        crate::views::diagnostics::DebugFacts {
+            version: Some(String::from("9.9.9")),
+            session: Some(String::from("ses_copy")),
+            ..crate::views::diagnostics::DebugFacts::default()
+        },
+    );
+    let mut host = crate::views::dialog::DialogHost::new(ViewContext::defaults(), Box::new(screen));
+    host.handle_action(
+        crate::views::testkit::action("debug_view"),
+        &crate::views::testkit::press(crossterm::event::KeyCode::Null),
+    );
+    host.handle_action(
+        crate::views::testkit::action("dialog.select.submit"),
+        &crate::views::testkit::press(crossterm::event::KeyCode::Null),
+    );
+
+    let copied = clipboard
+        .read()
+        .expect("a memory clipboard cannot fail")
+        .expect("the report never reached the clipboard");
+    assert!(
+        !copied.is_image(),
+        "the report was copied as an image rather than as text"
+    );
+    assert!(
+        copied.data.contains("version: 9.9.9") && copied.data.contains("session: ses_copy"),
+        "the clipboard holds something other than the report:\n{}",
+        copied.data
+    );
+    assert!(
+        host.is_open(),
+        "copying closed the report, so the fields cannot be read after copying them"
+    );
+    let raised = host.toasts_mut().current().is_some();
+    assert!(
+        raised,
+        "the copy landed but nothing on screen said so, which teaches the user the key \
+         is broken"
+    );
+}
+
+#[test]
 fn the_two_display_toggles_change_what_the_transcript_renders() {
     // The toggles have no modal to name them, so they are proven by their effect: tool
     // output visible, then hidden. Without this a toggle bound to a key that resolved and

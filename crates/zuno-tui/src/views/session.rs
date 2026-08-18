@@ -133,6 +133,15 @@ pub struct SessionScreen {
     prompts: Option<mpsc::Sender<PromptSubmission>>,
     mcp_toggles: Option<mpsc::Sender<crate::views::picker::McpToggleRequest>>,
     mcp: crate::views::picker::McpProjection,
+    /// The non-MCP halves of `§8.7`'s status census, resolved once by the host.
+    ///
+    /// MCP is deliberately *not* stored here: it is live, and `status_panel` reads it from
+    /// [`Self::mcp`] at open time so the census and the MCP dialog cannot disagree about a
+    /// server's state. These groups are static for the process — a language server's
+    /// availability and the loaded plugin set do not change once the screen is up.
+    census: Vec<crate::views::diagnostics::Group>,
+    /// The runtime facts `§8.7`'s debug report states.
+    debug: crate::views::diagnostics::DebugFacts,
     cancels: Option<mpsc::Sender<()>>,
     /// Language-server reports produced beside the loop.
     ///
@@ -294,6 +303,8 @@ impl SessionScreen {
             prompts: None,
             mcp_toggles: None,
             mcp: crate::views::picker::McpProjection::default(),
+            census: Vec::new(),
+            debug: crate::views::diagnostics::DebugFacts::default(),
             cancels: None,
             reports: None,
             edits: None,
@@ -507,6 +518,24 @@ impl SessionScreen {
     ) -> Self {
         self.reports = Some(reports);
         self
+    }
+
+    /// Install the census groups and runtime facts `§8.7`'s two panels report.
+    ///
+    /// One setter for both because a host that resolved one and not the other would ship a
+    /// half-populated troubleshooting surface, and the omission would look like a fact
+    /// that failed to load rather than one nobody wired.
+    ///
+    /// A setter rather than a builder because several of these facts come from the turn
+    /// host, which does not exist until after the screen is constructed — the same reason
+    /// `status_mut().describe` is a setter.
+    pub fn set_diagnostics(
+        &mut self,
+        census: Vec<crate::views::diagnostics::Group>,
+        debug: crate::views::diagnostics::DebugFacts,
+    ) {
+        self.census = census;
+        self.debug = debug;
     }
 
     /// Drain every report that has arrived.
@@ -1107,6 +1136,8 @@ impl SessionScreen {
                 self.request(dialog)
             }
             "mcp_list" => self.request(self.mcp_list()),
+            "status_view" => self.request(self.status_panel()),
+            "debug_view" => self.request(self.debug_panel()),
             "prompt_skills" => self.request(self.skill_list()),
             "diff_open" => self.request(self.diff_view()),
             "help_show" => self.request(self.help_view()),
@@ -1216,6 +1247,34 @@ impl SessionScreen {
         Some(Box::new(crate::views::picker::mcp_list(
             self.context.clone(),
             self.mcp.clone(),
+        )))
+    }
+
+    /// `§8.7`'s status census, with the MCP group read live at open time.
+    ///
+    /// Always present, unlike the pickers: a census whose groups are all empty is itself
+    /// the answer to "why is nothing working", so returning `None` here would replace a
+    /// useful report with "nothing to choose from here yet".
+    fn status_panel(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
+        let mcp = self
+            .mcp
+            .snapshot()
+            .iter()
+            .map(crate::views::picker::McpServer::service)
+            .collect();
+        let mut groups = vec![crate::views::diagnostics::Group::new("MCP servers", mcp)];
+        groups.extend(self.census.iter().cloned());
+        Some(Box::new(crate::views::diagnostics::StatusPanel::new(
+            self.context.clone(),
+            groups,
+        )))
+    }
+
+    /// `§8.7`'s debug report.
+    fn debug_panel(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
+        Some(Box::new(crate::views::diagnostics::DebugPanel::new(
+            self.context.clone(),
+            self.debug.clone(),
         )))
     }
 
@@ -1456,6 +1515,15 @@ impl ActionComponent for SessionScreen {
                 self.refresh_autocomplete();
                 EventResult::REDRAW
             }
+            // `§8.7`'s "Enter 复制全部并 toast": the report goes through the same `copy` the
+            // editor's own copy uses, so it reports success, an empty payload and a
+            // clipboard failure the one way this screen already reports them. A panel that
+            // wrote to the clipboard itself would need a second set of those messages.
+            crate::views::dialog::DialogOutcome::Submitted { text, .. }
+                if dialog == crate::views::diagnostics::DEBUG_DIALOG_ID =>
+            {
+                self.copy(text.clone())
+            }
             // Escape arrives as a cancelled outcome through the same routing a selection
             // takes, so no key is named here — which is the discipline this layer keeps.
             crate::views::dialog::DialogOutcome::Cancelled
@@ -1589,6 +1657,11 @@ pub fn scopes() -> Vec<String> {
         // stack behind it could not be opened by any means.
         "editor", "messages", "model", "agent", "session", "theme", "sidebar", "mcp", "tool",
         "display", "tips", "command", "help",
+        // `status` and `debug` cost no typeable character, which is the question this list
+        // exists to answer. Each is a one-row scope — `status_view` on `<leader>s` and an
+        // unbound `debug_view` — so neither can claim a bare letter the way `diff` below
+        // does, and no other row in the table spells `<leader>s`.
+        "status", "debug",
         // `diff` after `input` and `messages`, and only for `diff_open`'s sake. The scope
         // also carries the viewer's own bare letters — `q`, `n`, `p`, `d`, `v`, `s`, `b`,
         // `[`, `]` — which resolve here whether or not the viewer is open. That is
