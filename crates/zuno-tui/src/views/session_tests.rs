@@ -3,6 +3,7 @@
 use super::*;
 use crate::app::{TerminalEvent, render_offscreen, terminal_event_channel};
 use crate::keybind::{KeyDispatcher, Keymap};
+use crate::views::editor::Position;
 use crate::views::testkit::{action, rows};
 use zuno_engine::r#loop::TurnEvent;
 use zuno_llm::event::StreamEvent;
@@ -87,6 +88,22 @@ fn session_screen_renders_provider_text_as_it_streams() {
 }
 
 #[test]
+fn session_screen_renders_a_file_reference_refusal_in_the_transcript() {
+    let (mut screen, _shutdown) = screen();
+    screen.handle_event(&AppEvent::Engine(TurnEvent::Provider {
+        step: 0,
+        event: StreamEvent::Error {
+            message: "file reference `@src/missing.rs` not found".to_owned(),
+            retry_after: None,
+        },
+    }));
+
+    let rendered = rows(&render_offscreen(&mut screen, 80, 10).expect("infallible")).join("\n");
+    assert!(rendered.contains("@src/missing.rs"), "{rendered}");
+    assert!(rendered.contains("not found"), "{rendered}");
+}
+
+#[test]
 fn session_screen_types_a_printable_key_into_the_prompt() {
     // The keymap claims no binding for a bare letter, so the screen is the only
     // place that can put one in the buffer. A screen that forwarded only engine
@@ -120,6 +137,368 @@ fn session_screen_submitting_moves_the_prompt_into_the_transcript() {
         joined.contains("send this"),
         "the submitted text is not in the transcript:\n{joined}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Bracketed paste
+// ---------------------------------------------------------------------------
+
+/// The event a terminal in bracketed-paste mode delivers for one paste.
+fn paste(text: &str) -> AppEvent {
+    AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Paste(text.to_owned())))
+}
+
+#[test]
+fn session_screen_a_multi_line_paste_inserts_every_line_and_submits_no_turn() {
+    // The exact real-terminal failure this feature exists to fix. Without bracketed
+    // paste the same eight lines arrived as individual keys, every newline resolved to
+    // `input_submit`, and the transcript filled with `not sent: a turn is already
+    // running` — eight turns from one paste.
+    let (sender, _shutdown) = terminal_event_channel();
+    let (prompts, mut submitted) = mpsc::channel(1);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender).with_prompt_sink(prompts);
+
+    let pasted = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight";
+    let result = screen.handle_event(&paste(pasted));
+
+    assert!(result.redraw);
+    assert_eq!(
+        screen.editor.height(),
+        8,
+        "an eight-line paste did not become eight prompt lines: {:?}",
+        screen.editor.text()
+    );
+    assert_eq!(screen.editor.text(), pasted);
+    assert!(
+        submitted.try_recv().is_err(),
+        "a paste started a turn; nothing should have been submitted"
+    );
+    assert!(
+        screen.submissions().is_empty(),
+        "a paste was recorded as a submission: {:?}",
+        screen.submissions()
+    );
+}
+
+#[test]
+fn session_screen_a_large_paste_shows_a_summary_but_submits_the_whole_text() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (prompts, mut submitted) = mpsc::channel(1);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender).with_prompt_sink(prompts);
+
+    let lines: Vec<String> = (0..crate::views::editor::PASTE_SUMMARY_LINES + 4)
+        .map(|index| format!("line {index}"))
+        .collect();
+    let pasted = lines.join("\n");
+    screen.handle_event(&paste(&pasted));
+
+    let rendered = rows(&render_offscreen(&mut screen, 40, 8).expect("infallible"));
+    assert!(
+        rendered[6].contains("Pasted"),
+        "the prompt band does not show the summary affordance: {rendered:?}"
+    );
+    assert!(
+        !rendered.iter().any(|row| row.contains("line 12")),
+        "the prompt band was flooded with the paste instead of summarising it: {rendered:?}"
+    );
+
+    screen.handle_action(action("input_submit"), &press_none());
+    assert_eq!(
+        submitted.try_recv(),
+        Ok(PromptSubmission::Text(pasted.clone())),
+        "the summary was sent to the model instead of the pasted text"
+    );
+    assert_eq!(
+        screen.submissions(),
+        [pasted],
+        "the transcript recorded the summary rather than what was sent"
+    );
+}
+
+#[test]
+fn session_screen_a_pasted_path_is_not_taken_for_a_slash_command() {
+    // `/etc/hosts` resolves to `unknown command /etc`, which refuses the prompt *after*
+    // the editor has cleared it — so an unescaped pasted path is a discarded paste.
+    let (sender, _shutdown) = terminal_event_channel();
+    let (prompts, mut submitted) = mpsc::channel(1);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender).with_prompt_sink(prompts);
+
+    screen.handle_event(&paste("/etc/hosts"));
+    screen.handle_action(action("input_submit"), &press_none());
+
+    assert_eq!(
+        submitted.try_recv(),
+        Ok(PromptSubmission::Text(String::from("/etc/hosts"))),
+        "a pasted absolute path did not reach the model as literal text"
+    );
+    let joined = rows(&render_offscreen(&mut screen, 60, 10).expect("infallible")).join("\n");
+    assert!(
+        !joined.contains("unknown command"),
+        "a pasted path was routed as a command:\n{joined}"
+    );
+}
+
+#[test]
+fn session_screen_refuses_a_paste_while_a_modal_owns_the_keyboard() {
+    // `DialogHost` forwards every non-key event to the base unconditionally — that is
+    // what keeps an open dialog from stalling the loop — so a paste would otherwise land
+    // in the prompt hidden behind the dialog.
+    let (screen, _shutdown) = screen();
+    let mut host = crate::views::dialog::DialogHost::new(ViewContext::defaults(), Box::new(screen));
+    host.open(permission_prompt());
+    // The base learns which dialog is up from `observe_modal`, which the host derives
+    // per frame rather than pushing on change.
+    let _frame = render_offscreen(&mut host, 60, 12).expect("infallible");
+
+    host.handle_event(&paste("pasted\nwhile\nmodal"));
+
+    let joined = rows(&render_offscreen(&mut host, 60, 12).expect("infallible")).join("\n");
+    assert!(
+        !joined.contains("pasted"),
+        "pasted text reached the prompt behind an open dialog:\n{joined}"
+    );
+}
+
+#[test]
+fn session_screen_the_paste_binding_reports_that_it_could_not_read_the_clipboard() {
+    // `EditorSignal::Paste` used to fall into a bare redraw, so the binding did nothing
+    // and said nothing. The host clipboard still refuses to read — see
+    // `external::SystemClipboard::read` — and the point is that the refusal is now shown.
+    let (mut screen, _shutdown) = screen();
+    let result = screen.handle_action(action("input_paste"), &press_none());
+
+    assert!(result.redraw);
+    let joined = rows(&render_offscreen(&mut screen, 60, 12).expect("infallible")).join("\n");
+    assert!(
+        joined.contains("paste failed") || joined.contains("nothing to paste"),
+        "the paste binding neither pasted nor said why:\n{joined}"
+    );
+}
+
+#[test]
+fn session_screen_the_paste_binding_inserts_what_a_readable_clipboard_holds() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (prompts, mut submitted) = mpsc::channel(1);
+    let clipboard = Arc::new(crate::views::external::MemoryClipboard::holding(
+        crate::views::external::ClipboardContent::text("from\nthe\nclipboard"),
+    ));
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_prompt_sink(prompts)
+        .with_clipboard(clipboard);
+
+    screen.handle_action(action("input_paste"), &press_none());
+
+    assert_eq!(screen.editor.text(), "from\nthe\nclipboard");
+    assert!(
+        submitted.try_recv().is_err(),
+        "pasting from the clipboard started a turn"
+    );
+}
+
+#[test]
+fn session_screen_ui_slash_dispatches_without_reaching_the_prompt_sink() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (prompts, mut submitted) = mpsc::channel(1);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_prompt_sink(prompts)
+        .with_catalog(catalog());
+    screen.editor.set_text("/models");
+
+    let result = screen.handle_action(action("input_submit"), &press_none());
+
+    assert!(result.redraw);
+    assert!(
+        submitted.try_recv().is_err(),
+        "a UI action reached the model"
+    );
+    let dialogs = screen.drain_dialogs();
+    assert_eq!(dialogs.len(), 1);
+    assert_eq!(dialogs[0].id(), crate::views::picker::MODEL_DIALOG_ID);
+}
+
+#[test]
+fn session_screen_catalog_slash_stays_typed_for_the_host() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (prompts, mut submitted) = mpsc::channel(1);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_prompt_sink(prompts)
+        .with_slash_commands([CatalogCommand::new(
+            "review",
+            Some("Review changes".to_owned()),
+        )]);
+    screen.editor.set_text("/review src/lib.rs carefully");
+
+    screen.handle_action(action("input_submit"), &press_none());
+
+    assert_eq!(
+        submitted.try_recv(),
+        Ok(PromptSubmission::Command {
+            name: "review".to_owned(),
+            arguments: "src/lib.rs carefully".to_owned(),
+        })
+    );
+    assert_eq!(screen.submissions(), ["/review src/lib.rs carefully"]);
+}
+
+#[test]
+fn session_screen_unknown_slash_is_visible_and_never_reaches_the_prompt_sink() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (prompts, mut submitted) = mpsc::channel(1);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender).with_prompt_sink(prompts);
+    screen.editor.set_text("/not-a-command secret");
+
+    screen.handle_action(action("input_submit"), &press_none());
+
+    assert!(
+        submitted.try_recv().is_err(),
+        "unknown slash input was forwarded to the model"
+    );
+    assert!(screen.submissions().is_empty());
+    let rendered = rows(&render_offscreen(&mut screen, 100, 12).expect("infallible")).join("\n");
+    assert!(
+        rendered.contains("unknown command `/not-a-command`"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("type `/`") && rendered.contains("ctrl+p"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn session_screen_doubled_slash_submits_one_literal_slash() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (prompts, mut submitted) = mpsc::channel(1);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender).with_prompt_sink(prompts);
+    screen.editor.set_text("//review this literally");
+
+    screen.handle_action(action("input_submit"), &press_none());
+
+    assert_eq!(
+        submitted.try_recv(),
+        Ok(PromptSubmission::Text("/review this literally".to_owned()))
+    );
+    assert_eq!(screen.submissions(), ["/review this literally"]);
+}
+
+#[test]
+fn session_screen_slash_autocomplete_is_an_overlay_and_completion_does_not_submit() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (prompts, mut submitted) = mpsc::channel(1);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender).with_prompt_sink(prompts);
+    let before = prompt_band_rows(&mut screen, 80, 20);
+    screen.editor.set_text("/mo");
+    screen.refresh_autocomplete();
+
+    let rendered = rows(&render_offscreen(&mut screen, 80, 20).expect("infallible")).join("\n");
+    // Singular. `model_list` canonicalises to `/model` and keeps `/models` only as an
+    // alias, because `/model` is the spelling a user reaches for — and the plural is what
+    // this assertion used to demand while the overlay correctly offered the singular. The
+    // description is asserted alongside the name so this cannot pass on a bare substring
+    // that a half-drawn overlay would also satisfy.
+    assert!(rendered.contains("/model"), "{rendered}");
+    assert!(rendered.contains("List available models"), "{rendered}");
+    assert_eq!(prompt_band_rows(&mut screen, 80, 20), before);
+
+    screen.handle_action(action("input_submit"), &press_none());
+    assert_eq!(screen.editor.text(), "/model ");
+    assert!(submitted.try_recv().is_err(), "completion submitted a turn");
+}
+
+#[test]
+fn session_screen_reference_autocomplete_uses_the_host_source_without_growing_the_prompt_band() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (prompts, mut submitted) = mpsc::channel(1);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_prompt_sink(prompts)
+        .with_reference_source(Box::new(
+            crate::views::autocomplete::StaticSource::new().file("src/main.rs"),
+        ));
+    let before = prompt_band_rows(&mut screen, 80, 20);
+    screen.editor.set_text("@src/ma");
+    screen.refresh_autocomplete();
+
+    let rendered = rows(&render_offscreen(&mut screen, 80, 20).expect("infallible")).join("\n");
+    assert!(rendered.contains("src/main.rs"), "{rendered}");
+    assert_eq!(
+        prompt_band_rows(&mut screen, 80, 20),
+        before,
+        "the floating reference overlay participated in vertical allocation"
+    );
+
+    screen.handle_action(action("input_submit"), &press_none());
+    assert_eq!(screen.editor.text(), "@src/main.rs ");
+    assert!(submitted.try_recv().is_err(), "completion submitted a turn");
+}
+
+#[test]
+fn session_screen_exposes_the_autocomplete_scope_only_while_it_is_open() {
+    let (mut screen, _shutdown) = screen();
+    assert_eq!(ActionComponent::focused_scopes(&screen), ["history"]);
+
+    screen.editor.set_text("/mo");
+    screen.refresh_autocomplete();
+    assert_eq!(
+        ActionComponent::focused_scopes(&screen),
+        ["prompt.autocomplete"]
+    );
+
+    screen.editor.set_text("ordinary prompt");
+    screen.refresh_autocomplete();
+    assert_eq!(ActionComponent::focused_scopes(&screen), ["history"]);
+}
+
+#[test]
+fn session_screen_external_editor_request_carries_the_current_prompt() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (requests, mut requested) = mpsc::channel(1);
+    let (_results, result_source) = mpsc::channel(1);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_external_editor(requests, result_source);
+    screen.editor.set_text("draft body");
+
+    let result = screen.handle_action(action("editor_open"), &press_none());
+
+    assert!(result.redraw);
+    assert_eq!(
+        requested.try_recv().expect("one editor request"),
+        EditorRequest::new("draft body")
+    );
+}
+
+#[test]
+fn session_screen_external_editor_result_replaces_the_prompt() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (requests, _requested) = mpsc::channel(1);
+    let (results, result_source) = mpsc::channel(1);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_external_editor(requests, result_source);
+    screen.editor.set_text("draft body");
+    results
+        .try_send(Ok(Some(String::from("edited body"))))
+        .expect("result channel accepts the edit");
+
+    let result = screen.handle_event(&AppEvent::Terminal(TerminalEvent::Wake));
+
+    assert!(result.redraw);
+    assert_eq!(screen.editor.text(), "edited body");
+}
+
+#[test]
+fn session_screen_empty_external_editor_result_keeps_the_prompt() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (requests, _requested) = mpsc::channel(1);
+    let (results, result_source) = mpsc::channel(1);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_external_editor(requests, result_source);
+    screen.editor.set_text("keep this body");
+    results
+        .try_send(Ok(None))
+        .expect("result channel accepts the no-change result");
+
+    screen.handle_event(&AppEvent::Terminal(TerminalEvent::Wake));
+
+    assert_eq!(screen.editor.text(), "keep this body");
 }
 
 #[test]
@@ -395,12 +774,18 @@ fn session_screen_a_new_turn_can_be_cancelled_after_an_earlier_one_was() {
         .with_cancel_sink(cancels);
 
     screen.submit_prompt("first");
-    assert_eq!(submitted.try_recv().as_deref(), Ok("first"));
+    assert_eq!(
+        submitted.try_recv(),
+        Ok(PromptSubmission::Text(String::from("first")))
+    );
     screen.handle_action(action("app_exit"), &press_none());
     assert_eq!(cancelled.try_recv(), Ok(()));
 
     screen.submit_prompt("second");
-    assert_eq!(submitted.try_recv().as_deref(), Ok("second"));
+    assert_eq!(
+        submitted.try_recv(),
+        Ok(PromptSubmission::Text(String::from("second")))
+    );
     screen.handle_action(action("app_exit"), &press_none());
 
     assert_eq!(
@@ -979,6 +1364,8 @@ fn key_event_for(spelling: &str) -> KeyEvent {
         "return" => crossterm::event::KeyCode::Enter,
         "escape" => crossterm::event::KeyCode::Esc,
         "space" => crossterm::event::KeyCode::Char(' '),
+        "up" => crossterm::event::KeyCode::Up,
+        "down" => crossterm::event::KeyCode::Down,
         other => match other
             .strip_prefix('f')
             .filter(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
@@ -1023,6 +1410,121 @@ fn dispatch_sequence(
         )));
     }
     last
+}
+
+/// Resolve one spelling through the same focused-plus-static chain as `KeyDispatcher`,
+/// while retaining the screen so a test can inspect the editor state afterwards.
+fn dispatch_to_screen(
+    screen: &mut SessionScreen,
+    spelling: &str,
+) -> (&'static str, crate::app::EventResult) {
+    let mut keymap = Keymap::defaults().expect("the shipped table builds");
+    let sequence = crate::keybind::parse_sequence(spelling, keymap.leader())
+        .expect("a valid shipped spelling");
+    let owned = scopes();
+    let mut resolution = crate::keybind::Resolution::Unmatched;
+    let mut event = press_none();
+    for chord in sequence {
+        let mut chain = ActionComponent::focused_scopes(screen);
+        chain.extend(owned.iter().map(String::as_str));
+        event = key_event_for(&chord.to_string());
+        resolution = keymap.resolve(&chain, chord, std::time::Instant::now());
+    }
+    let crate::keybind::Resolution::Action { definition, .. } = resolution else {
+        panic!("`{spelling}` did not resolve through the session scope chain");
+    };
+    (definition.name, screen.handle_action(definition, &event))
+}
+
+#[test]
+fn session_up_on_an_empty_prompt_recalls_the_newest_persisted_prompt() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (records, _recorded) = mpsc::channel(1);
+    let screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_prompt_history(vec![String::from("persisted across restart")], records);
+    let keymap = Keymap::defaults().expect("the shipped table builds");
+    let leader = keymap.leader();
+    let mut dispatcher = KeyDispatcher::new(keymap, scopes(), Box::new(screen));
+
+    let result = dispatch_sequence(&mut dispatcher, "up", leader);
+
+    assert!(result.redraw, "Up did not change the restarted prompt");
+    let joined = rows(&render_offscreen(&mut dispatcher, 80, 12).expect("infallible")).join("\n");
+    assert!(
+        joined.contains("persisted across restart"),
+        "Up left persisted history unreachable after restart:\n{joined}"
+    );
+}
+
+#[test]
+fn session_up_on_line_three_of_a_multi_line_prompt_moves_the_cursor() {
+    let (mut screen, _shutdown) = screen();
+    let pasted = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight";
+    screen.editor.set_text(pasted);
+    screen.editor.handle_action(action("input_buffer_home"));
+    screen.editor.handle_action(action("input_move_down"));
+    screen.editor.handle_action(action("input_move_down"));
+    assert_eq!(screen.editor.cursor(), Position { line: 2, column: 0 });
+
+    let (resolved, result) = dispatch_to_screen(&mut screen, "up");
+
+    assert_eq!(resolved, "input_move_up");
+    assert!(result.redraw);
+    assert_eq!(screen.editor.cursor(), Position { line: 1, column: 0 });
+    assert_eq!(screen.editor.text(), pasted);
+}
+
+#[test]
+fn session_up_on_the_first_line_of_a_multi_line_prompt_walks_history() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (records, _recorded) = mpsc::channel(1);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_prompt_history(vec![String::from("remembered prompt")], records);
+    screen.editor.set_text("draft one\ndraft two\ndraft three");
+    screen.editor.handle_action(action("input_buffer_home"));
+
+    let (resolved, result) = dispatch_to_screen(&mut screen, "up");
+
+    assert_eq!(resolved, "history_previous");
+    assert!(result.redraw);
+    assert_eq!(screen.editor.text(), "remembered prompt");
+}
+
+#[test]
+fn session_down_above_the_last_line_moves_within_the_multi_line_prompt() {
+    let (mut screen, _shutdown) = screen();
+    screen.editor.set_text("one\ntwo\nthree");
+    screen.editor.handle_action(action("input_buffer_home"));
+
+    let (resolved, result) = dispatch_to_screen(&mut screen, "down");
+
+    assert_eq!(resolved, "history_next");
+    assert!(result.redraw);
+    assert_eq!(screen.editor.cursor(), Position { line: 1, column: 0 });
+    assert_eq!(screen.editor.text(), "one\ntwo\nthree");
+}
+
+#[test]
+fn session_down_past_the_newest_history_entry_restores_the_draft() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (records, _recorded) = mpsc::channel(1);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_prompt_history(vec![String::from("remembered prompt")], records);
+    let draft = "draft one\ndraft two\ndraft three";
+    screen.editor.set_text(draft);
+    screen.editor.handle_action(action("input_buffer_home"));
+    let _recalled = dispatch_to_screen(&mut screen, "up");
+    assert_eq!(screen.editor.text(), "remembered prompt");
+
+    let (resolved, result) = dispatch_to_screen(&mut screen, "down");
+
+    assert_eq!(resolved, "history_next");
+    assert!(result.redraw);
+    assert_eq!(
+        screen.editor.text(),
+        draft,
+        "the in-progress draft was silently destroyed by a history round trip"
+    );
 }
 
 /// A screen with every catalog and ambient list the six bound surfaces read from.
@@ -1216,6 +1718,181 @@ fn exposing_the_diff_scope_did_not_stop_its_bare_letters_being_typed() {
         joined.contains(typed),
         "the diff scope's bare letters stopped reaching the prompt; `{typed}` is not on \
          screen:\n{joined}"
+    );
+}
+
+#[test]
+fn every_action_the_screen_consumes_lives_in_a_scope_it_resolves() {
+    // The hole the two guards above leave. Both derive their set from a hand-kept list —
+    // `SHIPPED_DEFAULTS` there, `HINTS` in
+    // `views_welcome_every_advertised_action_lives_in_a_scope_the_screen_resolves` — so an
+    // action that upstream's table *already* spells and the welcome grid does not advertise
+    // is covered by neither. `editor_open` was exactly that: `<leader>e` in the table, an
+    // arm in `handle_action`, `editor` missing from `scopes()`. On a real terminal
+    // `ctrl+x e` therefore left `beforee` in the prompt — the chord never resolved and the
+    // unmatched `e` fell through and was typed.
+    //
+    // So the set is derived from the screen instead of from a list: whatever
+    // `handle_action` consumes has to be reachable. A derived set cannot fall out of step
+    // with a list nobody remembered to extend.
+    let keymap = Keymap::defaults().expect("the shipped table builds");
+    let static_scopes = scopes();
+    let mut unreachable = Vec::new();
+    for definition in crate::keybind::DEFINITIONS {
+        // A row with no spelling is the palette's business, not this chain's. Asked of the
+        // keymap rather than of `definition.keys`, so a spelling this build adds through
+        // `SHIPPED_DEFAULTS` counts as pressable — which is what the running binary sees.
+        let sequences = keymap.sequences(definition.name);
+        if sequences.is_empty() {
+            continue;
+        }
+        let consumed = reachability_screens()
+            .into_iter()
+            .any(|mut screen| screen.handle_action(definition, &press_none()).handled);
+        if !consumed {
+            continue;
+        }
+        let registered = static_scopes.iter().any(|scope| scope == definition.scope)
+            || reachability_screens()
+                .into_iter()
+                .any(|screen| ActionComponent::focused_scopes(&screen).contains(&definition.scope));
+        if !registered {
+            unreachable.push(format!(
+                "{} (`{}`) lives in unregistered scope `{}`",
+                definition.name,
+                sequences.join("` or `"),
+                definition.scope
+            ));
+            continue;
+        }
+
+        // Exact-resolution is enforceable for editor actions because their action identity
+        // is their behaviour. It is not enforceable for every screen action: `app_exit` is
+        // intentionally reached through shadowing and compensated from the physical chord,
+        // while unrelated legacy leader collisions also exist. Restricting the ordering half
+        // to every action the editor consumes is the narrowest general rule that catches this
+        // defect family without pretending those deliberate/non-L1 cases are equivalent.
+        let editor_consumes = reachability_screens()
+            .into_iter()
+            .any(|mut screen| screen.editor.handle_action(definition) != EditorSignal::None);
+        if editor_consumes
+            && !editor_action_resolves_in_a_reachable_screen_state(definition.name, &sequences)
+        {
+            unreachable.push(format!(
+                "{} (`{}`) in scope `{}` is shadowed in every reachable editor state",
+                definition.name,
+                sequences.join("` or `"),
+                definition.scope
+            ));
+        }
+    }
+    assert!(
+        unreachable.is_empty(),
+        "the screen acts on these actions, but their scope is absent or an earlier scope \
+         shadows every editor state:\n{}",
+        unreachable.join("\n")
+    );
+}
+
+/// Representative focus/editor states that can change the ordered scope chain.
+///
+/// The guard derives actions from the screen and states from every conditional branch in
+/// `focused_scopes`; adding another branch requires adding its reachable state here. This is
+/// what lets the assertion distinguish "scope listed" from "action can actually win" without
+/// hard-coding the history action names into the guard.
+fn reachability_screens() -> Vec<SessionScreen> {
+    let mut boundary = furnished_screen();
+    boundary
+        .editor
+        .load_history(vec![String::from("older"), String::from("newest")]);
+
+    let mut in_history = furnished_screen();
+    in_history
+        .editor
+        .load_history(vec![String::from("older"), String::from("newest")]);
+    in_history.editor.handle_action(action("history_previous"));
+
+    let mut interior = furnished_screen();
+    interior.editor.set_text("first\nsecond\nthird");
+    interior.editor.handle_action(action("input_move_up"));
+
+    let mut autocomplete = furnished_screen();
+    autocomplete.editor.set_text("/mo");
+    autocomplete.refresh_autocomplete();
+
+    vec![boundary, in_history, interior, autocomplete]
+}
+
+fn editor_action_resolves_in_a_reachable_screen_state(
+    action_name: &str,
+    sequences: &[String],
+) -> bool {
+    let owned = scopes();
+    reachability_screens().into_iter().any(|screen| {
+        let host = crate::views::dialog::DialogHost::new(ViewContext::defaults(), Box::new(screen));
+        let mut chain = ActionComponent::focused_scopes(&host);
+        chain.extend(owned.iter().map(String::as_str));
+        sequences.iter().any(|spelling| {
+            let mut keymap = Keymap::defaults().expect("the shipped table builds");
+            let sequence = crate::keybind::parse_sequence(spelling, keymap.leader())
+                .expect("a spelling returned by Keymap parses");
+            let mut resolution = crate::keybind::Resolution::Unmatched;
+            let now = std::time::Instant::now();
+            for chord in sequence {
+                resolution = keymap.resolve(&chain, chord, now);
+            }
+            matches!(
+                resolution,
+                crate::keybind::Resolution::Action { definition, .. }
+                    if definition.name == action_name
+            )
+        })
+    })
+}
+
+#[test]
+fn the_external_editor_chord_reaches_the_worker_channel() {
+    // The strong form of the assertion above, for the one action it was written for.
+    // Asserting `"editor"` is in `scopes()` would pass while any hop between the keymap
+    // and the worker was broken; this presses the real chord through `KeyDispatcher` and
+    // requires the request to arrive on the channel `drive_external_editor` reads, so it
+    // only passes when the whole path works.
+    //
+    // The leader is the half that failed on a real terminal, so both presses go through
+    // `handle_event`: `ctrl+x` alone only resolves to `Pending`, and it is the second
+    // press that either resolves to `editor_open` or falls through and types `e`.
+    let keymap = Keymap::defaults().expect("the shipped table builds");
+    let leader = keymap.leader();
+    let spelling = keymap
+        .sequences("editor_open")
+        .into_iter()
+        .next()
+        .expect("`editor_open` is pressable in the shipped table");
+    let (sender, _shutdown) = terminal_event_channel();
+    let (requests, mut requested) = mpsc::channel(1);
+    let (_results, result_source) = mpsc::channel(1);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_external_editor(requests, result_source);
+    screen.editor.set_text("before");
+    let mut dispatcher = KeyDispatcher::new(keymap, scopes(), Box::new(screen));
+
+    dispatch_sequence(&mut dispatcher, &spelling, leader);
+
+    let request = requested.try_recv().unwrap_or_else(|error| {
+        panic!("`{spelling}` reached no external editor request ({error}); `editor_open` is unreachable")
+    });
+    assert_eq!(
+        request,
+        EditorRequest::new("before"),
+        "the request did not carry the prompt as typed"
+    );
+    // The symptom, asserted directly: an unresolved chord types its trailing key. `beforee`
+    // on screen is what a user sees when this regresses, and it is the observation that
+    // found the defect.
+    let joined = rows(&render_offscreen(&mut dispatcher, 100, 12).expect("infallible")).join("\n");
+    assert!(
+        !joined.contains("beforee"),
+        "`{spelling}` did not resolve; its trailing key was typed into the prompt:\n{joined}"
     );
 }
 
@@ -1461,4 +2138,754 @@ fn session_keeps_spinning_behind_a_dialog_that_is_not_a_permission_ask() {
         "a picker opened during a live turn is not the turn waiting on the user:\n{joined}"
     );
     assert!(!joined.contains("waiting for your approval"), "{joined}");
+}
+
+// ---------------------------------------------------------------------------
+// Live theme switching
+// ---------------------------------------------------------------------------
+
+/// A theme other than the default, for the switch to land on.
+const OTHER_THEME: &str = "gruvbox";
+
+/// A screen with a transcript, and the context it shares with every surface it built.
+///
+/// The context is returned rather than re-derived because that is the property under
+/// test: a caller holding a clone sees what the screen's children paint with, so an
+/// assertion on it is an assertion about the whole tree rather than about the dialog.
+fn themed_screen() -> (SessionScreen, ViewContext, mpsc::Receiver<TerminalEvent>) {
+    let (sender, receiver) = terminal_event_channel();
+    let context = ViewContext::defaults();
+    let mut screen = SessionScreen::new(context.clone(), sender)
+        .with_keymap(Keymap::defaults().expect("the shipped table builds"));
+    screen.transcript_mut().transcript_mut().push(Message::user(
+        "a message, so the transcript owns the body area",
+    ));
+    (screen, context, receiver)
+}
+
+/// The theme picker, open over `screen`, driven through the real host.
+fn opened_theme_picker(
+    screen: SessionScreen,
+    context: &ViewContext,
+) -> crate::views::dialog::DialogHost {
+    let mut host = crate::views::dialog::DialogHost::new(context.clone(), Box::new(screen));
+    host.handle_action(action("theme_list"), &press_none());
+    assert_eq!(
+        host.active(),
+        Some(crate::views::picker::THEME_DIALOG_ID),
+        "the theme picker did not open"
+    );
+    host
+}
+
+/// Reopen the theme picker on a host whose base is already a session screen.
+fn reopen_theme_picker(
+    mut host: crate::views::dialog::DialogHost,
+) -> crate::views::dialog::DialogHost {
+    host.handle_action(action("theme_list"), &press_none());
+    assert_eq!(
+        host.active(),
+        Some(crate::views::picker::THEME_DIALOG_ID),
+        "the theme picker did not reopen"
+    );
+    host
+}
+
+/// Type `text` into the open dialog's filter, the way an unclaimed key reaches it.
+fn filter_dialog(host: &mut crate::views::dialog::DialogHost, text: &str) {
+    for character in text.chars() {
+        host.handle_event(&AppEvent::Terminal(TerminalEvent::Input(
+            CrosstermEvent::Key(crate::views::testkit::press(
+                crossterm::event::KeyCode::Char(character),
+            )),
+        )));
+    }
+}
+
+/// Submit the open dialog through the action `enter` resolves to.
+fn submit_dialog(host: &mut crate::views::dialog::DialogHost) {
+    host.handle_action(
+        action("dialog.select.submit"),
+        &crate::views::testkit::press(crossterm::event::KeyCode::Enter),
+    );
+}
+
+/// Cancel the open dialog through the action `escape` resolves to.
+fn cancel_dialog(host: &mut crate::views::dialog::DialogHost) {
+    host.handle_action(
+        action("session_interrupt"),
+        &crate::views::testkit::press(crossterm::event::KeyCode::Esc),
+    );
+}
+
+/// Every background colour on `row` of a freshly rendered frame.
+///
+/// A whole row rather than one cell, and 100 columns rather than 130, so the sidebar is
+/// absent and the transcript owns the width. The row is read from the top of the frame
+/// because the dialog is drawn at the *bottom*: a frame assertion in this crate has
+/// already once passed vacuously by inspecting a row a dialog was covering, so the row
+/// under test must be one the overlay cannot reach.
+fn row_backgrounds(
+    host: &mut crate::views::dialog::DialogHost,
+    row: u16,
+) -> Vec<ratatui::style::Color> {
+    let buffer = render_offscreen(host, 100, 30).expect("infallible");
+    assert!(
+        buffer.area.height > row,
+        "the frame is shorter than the row under test"
+    );
+    (0..buffer.area.width)
+        .map(|column| {
+            buffer[(column, row)]
+                .style()
+                .bg
+                .expect("every cell is filled")
+        })
+        .collect()
+}
+
+/// A theme's panel background, as a ratatui colour.
+fn panel_of(theme: &str, mode: crate::theme::Mode) -> ratatui::style::Color {
+    ratatui::style::Color::from(
+        crate::theme::ThemeRegistry::new()
+            .resolve(theme, mode)
+            .palette
+            .background_panel,
+    )
+}
+
+#[test]
+fn session_theme_switch_repaints_the_transcript_and_not_only_the_picker() {
+    // The requirement the shared-theme design exists for. Asserted on the transcript —
+    // a surface built *before* the picker existed and living outside the dialog — because
+    // a re-theme confined to the dialog is exactly the half-themed screen that would be
+    // worse than no switching at all.
+    let (screen, context, _shutdown) = themed_screen();
+    let mode = context.theme().mode;
+    let starting_panel = panel_of(&context.theme().name, mode);
+    let other_panel = panel_of(OTHER_THEME, mode);
+    assert_ne!(
+        starting_panel, other_panel,
+        "the two themes share a panel background, so this test could not tell them apart"
+    );
+
+    let mut host = opened_theme_picker(screen, &context);
+    let before = row_backgrounds(&mut host, 0);
+    assert!(
+        before.contains(&starting_panel),
+        "the transcript row was not painted in the starting theme, so the frame under \
+         test is the wrong one: {before:?}"
+    );
+
+    filter_dialog(&mut host, OTHER_THEME);
+
+    let after = row_backgrounds(&mut host, 0);
+    assert_ne!(
+        before, after,
+        "the transcript kept its old colours while the picker previewed a new theme"
+    );
+    assert!(
+        after.contains(&other_panel),
+        "the transcript is not painted in the highlighted theme: {after:?}"
+    );
+    assert!(
+        !after.contains(&starting_panel),
+        "part of the transcript row still carries the old theme: {after:?}"
+    );
+}
+
+#[test]
+fn session_theme_switch_also_repaints_the_status_strip() {
+    // A second surface outside the dialog, because a propagation bug that reached the
+    // transcript by some other route would still be a bug.
+    //
+    // Read *after* the picker closes, not while it is open. A 13-row theme picker drawn
+    // at the bottom of a 30-row frame covers rows 17 onwards, and the strip sits at row
+    // 27 — so the open-dialog version of this test inspected the dialog's own footer and
+    // reported "the row under test is not the status strip". That is the vacuous frame
+    // assertion this crate has hit before, caught here by asserting the starting colour
+    // first instead of only asserting that something changed.
+    let (screen, context, _shutdown) = themed_screen();
+    let mode = context.theme().mode;
+    let element = |theme: &str| {
+        ratatui::style::Color::from(
+            crate::theme::ThemeRegistry::new()
+                .resolve(theme, mode)
+                .palette
+                .background_element,
+        )
+    };
+    let starting = element(&context.theme().name);
+    let other = element(OTHER_THEME);
+    assert_ne!(
+        starting, other,
+        "the two themes share an element background"
+    );
+
+    let mut host = crate::views::dialog::DialogHost::new(context.clone(), Box::new(screen));
+    // The strip sits directly above the prompt, and the prompt's floor is two rows.
+    let strip_row = 30 - 1 - 2;
+    let before = row_backgrounds(&mut host, strip_row);
+    assert!(
+        before.contains(&starting),
+        "the row under test is not the status strip: {before:?}"
+    );
+
+    host.handle_action(action("theme_list"), &press_none());
+    filter_dialog(&mut host, OTHER_THEME);
+    submit_dialog(&mut host);
+    assert!(!host.is_open(), "the picker is still covering the strip");
+
+    let after = row_backgrounds(&mut host, strip_row);
+    assert!(
+        after.contains(&other) && !after.contains(&starting),
+        "the status strip did not follow the theme: {after:?}"
+    );
+}
+
+#[test]
+fn session_theme_picker_escape_restores_the_theme_it_opened_over() {
+    let (screen, context, _shutdown) = themed_screen();
+    let original = context.theme();
+    let mut host = opened_theme_picker(screen, &context);
+
+    filter_dialog(&mut host, OTHER_THEME);
+    assert_eq!(
+        context.theme().name,
+        OTHER_THEME,
+        "the preview never applied, so cancelling has nothing to undo"
+    );
+
+    cancel_dialog(&mut host);
+
+    assert!(!host.is_open(), "escape did not close the picker");
+    assert_eq!(
+        context.theme().name,
+        original.name,
+        "cancelling left the user in a theme they only scrolled past"
+    );
+    assert_eq!(
+        context.palette().background_panel,
+        original.palette.background_panel,
+        "the name came back but the colours did not"
+    );
+}
+
+#[test]
+fn session_theme_picker_enter_commits_and_the_theme_survives_the_dialog_closing() {
+    let (screen, context, _shutdown) = themed_screen();
+    let mut host = opened_theme_picker(screen, &context);
+    filter_dialog(&mut host, OTHER_THEME);
+
+    submit_dialog(&mut host);
+
+    assert!(!host.is_open(), "enter did not close the picker");
+    assert_eq!(
+        context.theme().name,
+        OTHER_THEME,
+        "the committed theme was dropped when the dialog closed"
+    );
+
+    // A commit must also survive whatever the *next* picker does, which is the failure a
+    // restore point left behind would cause: escape out of any later theme picker and the
+    // earlier commit would be silently undone.
+    let mut reopened = reopen_theme_picker(host);
+    cancel_dialog(&mut reopened);
+    assert_eq!(
+        context.theme().name,
+        OTHER_THEME,
+        "cancelling a second picker undid the first picker's commit"
+    );
+}
+
+#[test]
+fn session_reopening_the_theme_picker_starts_from_the_committed_theme() {
+    // The configuration file still names the theme the session started with, so a picker
+    // that opened on `config.theme` would put the cursor on a theme that is no longer
+    // showing — and escaping would then "restore" the user out of their own choice.
+    let (screen, context, _shutdown) = themed_screen();
+    let mut host = opened_theme_picker(screen, &context);
+    filter_dialog(&mut host, OTHER_THEME);
+    submit_dialog(&mut host);
+
+    let registry = crate::theme::ThemeRegistry::new();
+    let reopened =
+        crate::views::picker::theme_picker(context.clone(), &registry, context.theme().mode);
+    assert_eq!(
+        reopened.selected().map(|item| item.value.clone()),
+        Some(String::from(OTHER_THEME)),
+        "the reopened picker did not start on the committed theme"
+    );
+}
+
+#[test]
+fn session_committing_a_theme_sends_nothing_a_host_would_rebuild_a_turn_for() {
+    // The deliberate CLI discard (`cmd/tui.rs`: `Selection::Theme(_) => return None`)
+    // exists because that channel rebuilds the turn host. A theme must therefore not
+    // travel on it at all: nothing is sent, no turn is disturbed, and the user is not
+    // told "not applied: nothing is listening" about a theme that visibly did apply.
+    let (sender, mut selections) = mpsc::channel(4);
+    let context = ViewContext::defaults();
+    let (shutdown, _receiver) = terminal_event_channel();
+    let mut screen = SessionScreen::new(context.clone(), shutdown)
+        .with_keymap(Keymap::defaults().expect("the shipped table builds"))
+        .with_selection_sink(sender);
+    *screen.catalog_mut() = catalog();
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .push(Message::user("a message"));
+
+    let mut host = opened_theme_picker(screen, &context);
+    filter_dialog(&mut host, OTHER_THEME);
+    submit_dialog(&mut host);
+
+    assert_eq!(
+        context.theme().name,
+        OTHER_THEME,
+        "the theme did not apply, so this test proves nothing about the channel"
+    );
+    assert!(
+        selections.try_recv().is_err(),
+        "a theme was pushed onto the channel that rebuilds the turn host"
+    );
+
+    // The same sink still carries the selections that genuinely belong to the host, so
+    // the assertion above cannot be passing because the channel is broken.
+    host.handle_action(action("agent_list"), &press_none());
+    assert_eq!(
+        host.active(),
+        Some(crate::views::picker::AGENT_DIALOG_ID),
+        "the agent picker did not open"
+    );
+    submit_dialog(&mut host);
+    assert!(
+        matches!(selections.try_recv(), Ok(Selection::Agent(_))),
+        "the selection channel carries nothing at all, so the theme assertion was vacuous"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The prompt band, the wheel, and the clipboard
+// ---------------------------------------------------------------------------
+//
+// Rewritten after this file was reverted to HEAD during the theme task and eighteen
+// uncommitted tests were lost with it. The implementations they covered — `prompt_rows`,
+// the `Scroller` wiring and the injected `Clipboard` — were untouched, so what follows
+// re-derives the coverage from those implementations rather than restoring the originals,
+// which are not recoverable. Recorded in the notepad; the names are the originals' so a
+// future reader can match them against the lost set.
+
+/// A screen whose copies land in a clipboard the caller can read back.
+///
+/// Injected rather than global so the assertion is not order-dependent across the suite,
+/// and so the suite never spawns `xclip` or paints an escape sequence into captured
+/// output.
+fn screen_with_clipboard() -> (
+    SessionScreen,
+    Arc<crate::views::external::MemoryClipboard>,
+    mpsc::Receiver<TerminalEvent>,
+) {
+    let (sender, receiver) = terminal_event_channel();
+    let clipboard = Arc::new(crate::views::external::MemoryClipboard::default());
+    let screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_clipboard(Arc::clone(&clipboard) as Arc<dyn Clipboard>);
+    (screen, clipboard, receiver)
+}
+
+/// A clipboard with no mechanism at all, which is how a real host with neither a
+/// terminal nor a native program behaves.
+fn broken_clipboard() -> Arc<dyn Clipboard> {
+    let log = crate::views::external::CopyLog::shared();
+    Arc::new(crate::views::external::SystemClipboard::new(
+        None,
+        false,
+        None,
+        Box::new(crate::views::external::ScriptedRunner::failing(log)),
+    ))
+}
+
+/// The notice text of the last message in the transcript.
+fn last_message(screen: &mut SessionScreen) -> String {
+    screen
+        .transcript_mut()
+        .transcript()
+        .messages()
+        .last()
+        .map(message_text)
+        .unwrap_or_default()
+}
+
+/// Every human-readable part of `message`, joined.
+///
+/// `Notice` as well as `Text`: the screen reports a copy through
+/// [`crate::views::message::Message::notice`], so a helper that only read `Text` would
+/// report an empty string and every assertion below would be about nothing.
+fn message_text(message: &Message) -> String {
+    message
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            crate::views::message::MessagePart::Text { text }
+            | crate::views::message::MessagePart::Notice { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Ask the screen to copy, the way the keymap does.
+fn copy_action(screen: &mut SessionScreen) -> EventResult {
+    screen.handle_action(action("messages_copy"), &press_none())
+}
+
+#[test]
+fn session_screen_copying_puts_the_text_on_the_clipboard() {
+    let (mut screen, clipboard, _shutdown) = screen_with_clipboard();
+    for character in "copy me".chars() {
+        screen.editor.insert_char(character);
+    }
+
+    assert!(copy_action(&mut screen).redraw);
+
+    assert_eq!(
+        clipboard.read().expect("a memory clipboard cannot fail"),
+        Some(crate::views::external::ClipboardContent::text("copy me")),
+        "the copy signal's payload never reached the clipboard"
+    );
+}
+
+#[test]
+fn session_screen_says_on_screen_that_the_copy_landed() {
+    // A copy key that paints nothing teaches the user the binding is broken, so success
+    // has to be visible and not only silent.
+    let (mut screen, _clipboard, _shutdown) = screen_with_clipboard();
+    for character in "abc".chars() {
+        screen.editor.insert_char(character);
+    }
+    copy_action(&mut screen);
+    let notice = last_message(&mut screen);
+    assert!(
+        notice.contains("copied") && notice.contains('3'),
+        "a successful copy said nothing useful: {notice:?}"
+    );
+}
+
+#[test]
+fn session_screen_a_failed_copy_is_visible_rather_than_silent() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let mut screen =
+        SessionScreen::new(ViewContext::defaults(), sender).with_clipboard(broken_clipboard());
+    screen.editor.insert_char('x');
+
+    copy_action(&mut screen);
+
+    let notice = last_message(&mut screen);
+    assert!(
+        notice.contains("copy failed"),
+        "a host with no clipboard mechanism reported success: {notice:?}"
+    );
+}
+
+#[test]
+fn session_screen_copying_nothing_leaves_the_clipboard_alone() {
+    // Writing the empty string would destroy whatever the user already had.
+    let (mut screen, clipboard, _shutdown) = screen_with_clipboard();
+    copy_action(&mut screen);
+
+    assert_eq!(
+        clipboard.read().expect("a memory clipboard cannot fail"),
+        None,
+        "an empty prompt overwrote the clipboard"
+    );
+    let notice = last_message(&mut screen);
+    assert!(
+        notice.contains("nothing to copy"),
+        "an empty copy said nothing: {notice:?}"
+    );
+}
+
+#[test]
+fn session_screen_copying_prefers_the_selection_over_the_whole_buffer() {
+    let (mut screen, clipboard, _shutdown) = screen_with_clipboard();
+    for character in "abcdef".chars() {
+        screen.editor.insert_char(character);
+    }
+    // Two selecting movements from the end, so the selection is the tail and not the lot.
+    screen.editor.handle_action(action("input_select_left"));
+    screen.editor.handle_action(action("input_select_left"));
+    assert_eq!(
+        screen.editor.selection(),
+        Some(String::from("ef")),
+        "the fixture failed to select, so this test would pass for the wrong reason"
+    );
+
+    copy_action(&mut screen);
+
+    assert_eq!(
+        clipboard.read().expect("a memory clipboard cannot fail"),
+        Some(crate::views::external::ClipboardContent::text("ef")),
+        "the whole buffer was copied over the user's selection"
+    );
+}
+
+/// How many rows the prompt band occupied in a `width` × `height` frame.
+///
+/// Measured back out of the frame — the status strip is located by the state word it
+/// always prints, and everything below it is the prompt — rather than by calling
+/// `prompt_rows`. Asserting the function's return value would keep passing if `render`
+/// stopped consulting it, which is the second-source-of-truth hole this measurement
+/// exists to close.
+fn prompt_band_rows(screen: &mut SessionScreen, width: u16, height: u16) -> usize {
+    let rendered = rows(&render_offscreen(screen, width, height).expect("infallible"));
+    let status = rendered
+        .iter()
+        .position(|row| row.contains("idle") || row.contains("working"))
+        .expect("the status strip is always on screen");
+    rendered.len() - status - 1
+}
+
+#[test]
+fn session_prompt_keeps_two_rows_for_a_single_line() {
+    // Two rows is what the prompt occupied when its height was fixed, so a single-line
+    // buffer keeps proportions the user already knows rather than shrinking to one.
+    let (mut screen, _shutdown) = screen();
+    assert_eq!(prompt_band_rows(&mut screen, 40, 20), 2);
+}
+
+#[test]
+fn session_prompt_grows_with_the_typed_line_count() {
+    let (mut screen, _shutdown) = screen();
+    for _ in 0..3 {
+        screen.editor.insert_char('x');
+        screen.editor.insert_char('\n');
+    }
+    assert_eq!(
+        screen.editor.height(),
+        4,
+        "the fixture did not produce the line count this test is about"
+    );
+    assert_eq!(
+        prompt_band_rows(&mut screen, 40, 30),
+        5,
+        "the prompt did not grow to content plus the row the cursor is about to open"
+    );
+}
+
+#[test]
+fn session_prompt_growth_stops_at_a_third_of_the_screen() {
+    // A pasted diff allowed to take the whole height would evict the transcript it is
+    // about to be sent against.
+    let (mut screen, _shutdown) = screen();
+    for _ in 0..40 {
+        screen.editor.insert_char('x');
+        screen.editor.insert_char('\n');
+    }
+    assert_eq!(prompt_band_rows(&mut screen, 40, 30), 30 / 3);
+}
+
+#[test]
+fn session_prompt_survives_a_viewport_shorter_than_the_floor_allows() {
+    // `height / 3` is under the two-row floor for any viewport shorter than six rows, and
+    // `u16::clamp` panics when its minimum exceeds its maximum — so the naive
+    // `wanted.clamp(PROMPT_MIN_ROWS, height / PROMPT_MAX_SHARE)` aborts the process on a
+    // 20x10 terminal, a size a real pane reaches.
+    for height in 1..=10 {
+        let (mut screen, _shutdown) = screen();
+        let rendered = render_offscreen(&mut screen, 20, height);
+        assert!(
+            rendered.is_ok(),
+            "rendering a {height}-row viewport failed instead of degrading"
+        );
+    }
+}
+
+/// A context carrying the two scroll keys.
+fn scroll_config(speed: Option<f64>, acceleration: Option<bool>) -> ViewContext {
+    let registry = crate::theme::ThemeRegistry::new();
+    let resolved = registry.resolve(crate::theme::DEFAULT_THEME, crate::theme::Mode::Dark);
+    ViewContext::new(
+        &resolved,
+        crate::config::ResolvedTuiConfig {
+            scroll_speed: speed,
+            scroll_acceleration: acceleration
+                .map(|enabled| crate::config::ScrollAcceleration { enabled }),
+            ..crate::config::ResolvedTuiConfig::default()
+        },
+    )
+}
+
+/// A screen with more transcript than fits, so an offset has somewhere to go.
+fn scrollable(context: ViewContext) -> (SessionScreen, mpsc::Receiver<TerminalEvent>) {
+    let (sender, receiver) = terminal_event_channel();
+    let mut screen = SessionScreen::new(context, sender);
+    for index in 0..80 {
+        screen
+            .transcript_mut()
+            .transcript_mut()
+            .push(Message::user(format!("line {index}")));
+    }
+    // The scroller reads the transcript's own measurements, which only exist after a
+    // render: a wheel event on an unmeasured transcript has a zero viewport and moves
+    // nothing, which would make every assertion below vacuous.
+    let _ = render_offscreen(&mut screen, 40, 12).expect("infallible");
+    (screen, receiver)
+}
+
+/// One wheel notch downwards, observed at `now_ms`.
+fn notch(screen: &mut SessionScreen, now_ms: u64) -> EventResult {
+    screen.handle_wheel(
+        &crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollDown,
+            column: 4,
+            row: 4,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        },
+        now_ms,
+    )
+}
+
+/// One wheel notch upwards, observed at `now_ms`.
+fn notch_up(screen: &mut SessionScreen, now_ms: u64) -> EventResult {
+    screen.handle_wheel(
+        &crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollUp,
+            column: 4,
+            row: 4,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        },
+        now_ms,
+    )
+}
+
+#[test]
+fn session_wheel_notch_uses_the_default_three_lines_when_nothing_is_configured() {
+    // `scroll.ts:26` — the default is three lines per notch, not one. Getting it wrong is
+    // a difference every user notices.
+    let (mut screen, _shutdown) = scrollable(scroll_config(None, None));
+    notch(&mut screen, 1_000);
+    // The literal three, not `DEFAULT_SCROLL_SPEED`. Asserting against the constant is a
+    // tautology that survives editing the constant, which is exactly the change this test
+    // is here to catch.
+    assert_eq!(screen.transcript.offset(), 3);
+}
+
+#[test]
+fn session_wheel_notch_moves_the_transcript_by_the_configured_scroll_speed() {
+    let (mut screen, _shutdown) = scrollable(scroll_config(Some(5.0), None));
+    notch(&mut screen, 1_000);
+    assert_eq!(screen.transcript.offset(), 5);
+}
+
+#[test]
+fn session_wheel_carries_a_fractional_speed_across_separate_events() {
+    // The whole reason the scroller is a field rather than built per event: a multiplier
+    // under one row would otherwise round to no movement forever.
+    let (mut screen, _shutdown) = scrollable(scroll_config(Some(0.5), None));
+    let first = notch(&mut screen, 1_000);
+    assert!(
+        !first.redraw && screen.transcript.offset() == 0,
+        "half a row moved the view, so there is no carry to test"
+    );
+    let second = notch(&mut screen, 2_000);
+    assert!(second.redraw, "the carried half row never arrived");
+    assert_eq!(screen.transcript.offset(), 1);
+}
+
+#[test]
+fn session_wheel_scrolls_back_up_and_stops_at_the_top() {
+    let (mut screen, _shutdown) = scrollable(scroll_config(Some(3.0), None));
+    notch(&mut screen, 1_000);
+    assert!(screen.transcript.offset() > 0);
+    for step in 0..10 {
+        notch_up(&mut screen, 2_000 + step * 1_000);
+    }
+    assert_eq!(
+        screen.transcript.offset(),
+        0,
+        "scrolling up past the top did not clamp"
+    );
+}
+
+#[test]
+fn session_wheel_acceleration_compounds_a_fast_streak_but_not_a_slow_one() {
+    // A streak inside `STREAK_TIMEOUT_MS` accelerates; one outside it resets to a
+    // multiplier of one.
+    let fast = {
+        let (mut screen, _shutdown) = scrollable(scroll_config(None, Some(true)));
+        for step in 0..4 {
+            notch(&mut screen, 1_000 + step * 10);
+        }
+        screen.transcript.offset()
+    };
+    let slow = {
+        let (mut screen, _shutdown) = scrollable(scroll_config(None, Some(true)));
+        for step in 0..4 {
+            notch(
+                &mut screen,
+                1_000 + step * (crate::views::scroll::STREAK_TIMEOUT_MS + 50),
+            );
+        }
+        screen.transcript.offset()
+    };
+    assert!(
+        fast > slow,
+        "a fast streak ({fast}) did not out-scroll a slow one ({slow})"
+    );
+}
+
+#[test]
+fn session_wheel_acceleration_disabled_keeps_a_constant_speed_under_a_fast_streak() {
+    // `scroll_speed` set and acceleration absent means a constant multiplier, so four
+    // rapid notches move exactly four times the speed.
+    let (mut screen, _shutdown) = scrollable(scroll_config(Some(2.0), Some(false)));
+    for step in 0..4 {
+        notch(&mut screen, 1_000 + step * 10);
+    }
+    assert_eq!(screen.transcript.offset(), 8);
+}
+
+#[test]
+fn session_keyboard_scrolling_stays_one_row_per_press_whatever_the_wheel_is_configured_to() {
+    // Acceleration is a property of a continuous gesture. A line the user asked for by
+    // name must not become four because they pressed the key quickly.
+    let (mut screen, _shutdown) = scrollable(scroll_config(Some(7.0), Some(true)));
+    screen.handle_action(action("messages_line_down"), &press_none());
+    assert_eq!(screen.transcript.offset(), 1);
+    screen.handle_action(action("messages_line_down"), &press_none());
+    assert_eq!(screen.transcript.offset(), 2);
+}
+
+#[test]
+fn session_wheel_landing_on_the_bottom_re_arms_following_a_live_turn() {
+    // A transcript the user scrolled away from must not be yanked by a streaming reply;
+    // one they scrolled back to the bottom of must follow again.
+    let (mut screen, _shutdown) = scrollable(scroll_config(Some(3.0), None));
+    notch_up(&mut screen, 1_000);
+    for step in 0..60 {
+        notch(&mut screen, 2_000 + step * 1_000);
+    }
+    let bottom = screen.transcript.content_height() - screen.transcript.viewport_height();
+    assert_eq!(
+        screen.transcript.offset(),
+        bottom,
+        "the wheel reached the bottom without re-arming following"
+    );
+}
+
+#[test]
+fn session_ignores_a_mouse_event_that_is_not_a_vertical_wheel() {
+    // The transcript has one axis. Claiming a click or a drag would take it away from
+    // whatever surface grows a use for it next.
+    let (mut screen, _shutdown) = scrollable(scroll_config(Some(3.0), None));
+    let moved = screen.handle_event(&AppEvent::Terminal(TerminalEvent::Input(
+        CrosstermEvent::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: 4,
+            row: 4,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }),
+    )));
+    assert!(!moved.redraw);
+    assert_eq!(screen.transcript.offset(), 0);
 }

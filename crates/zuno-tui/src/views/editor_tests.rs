@@ -65,11 +65,11 @@ fn views_input_editor_paints_from_the_palette() {
     let buffer = render_offscreen(&mut editor, 6, 1).expect("infallible");
     assert_eq!(
         buffer[(0, 0)].fg,
-        ratatui::style::Color::from(context.palette.text)
+        ratatui::style::Color::from(context.palette().text)
     );
     assert_eq!(
         buffer[(1, 0)].fg,
-        ratatui::style::Color::from(context.palette.border_active),
+        ratatui::style::Color::from(context.palette().border_active),
         "the cursor glyph did not use the palette's active border colour"
     );
 }
@@ -84,7 +84,7 @@ fn views_input_editor_renders_a_selection_from_the_palette() {
     let buffer = render_offscreen(&mut editor, 8, 1).expect("infallible");
     assert_eq!(
         buffer[(0, 0)].bg,
-        ratatui::style::Color::from(context.palette.primary),
+        ratatui::style::Color::from(context.palette().primary),
         "the selected cell does not carry the selection background"
     );
 }
@@ -130,6 +130,24 @@ fn views_input_paste_keeps_the_line_structure() {
     editor.insert_text("#!/bin/sh\nset -e\necho ok");
     assert_eq!(editor.height(), 3);
     assert_eq!(editor.text(), "#!/bin/sh\nset -e\necho ok");
+}
+
+#[test]
+fn views_input_completion_preserves_its_absolute_cursor() {
+    let mut editor = typing("old");
+    editor.apply_completion("/models and more", 8);
+    assert_eq!(editor.text(), "/models and more");
+    assert_eq!(editor.cursor(), Position { line: 0, column: 8 });
+
+    editor.apply_completion("first\n/review tail", 14);
+    assert_eq!(editor.cursor(), Position { line: 1, column: 8 });
+}
+
+#[test]
+fn views_input_completion_clamps_a_cursor_past_the_buffer_end() {
+    let mut editor = editor();
+    editor.apply_completion("short", usize::MAX);
+    assert_eq!(editor.cursor(), Position { line: 0, column: 5 });
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +434,52 @@ fn views_input_history_stashes_a_half_written_prompt() {
 }
 
 #[test]
+fn views_input_history_actions_move_within_a_multi_line_buffer_before_walking_history() {
+    let mut editor = editor();
+    editor.load_history(vec![String::from("remembered")]);
+    editor.set_text("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
+
+    assert_eq!(editor.cursor(), Position { line: 7, column: 5 });
+    act(&mut editor, &["history_previous"]);
+    assert_eq!(
+        editor.cursor(),
+        Position { line: 6, column: 5 },
+        "Up from the last line walked history instead of keeping the pasted block editable"
+    );
+    assert_eq!(
+        editor.text(),
+        "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight"
+    );
+
+    act(&mut editor, &["input_buffer_home", "history_next"]);
+    assert_eq!(
+        editor.cursor(),
+        Position { line: 1, column: 0 },
+        "Down from the first line walked history instead of moving into the buffer"
+    );
+}
+
+#[test]
+fn views_input_history_actions_walk_only_beyond_the_vertical_edges() {
+    let mut editor = editor();
+    editor.load_history(vec![String::from("older"), String::from("newest")]);
+    editor.set_text("draft one\ndraft two\ndraft three");
+    act(&mut editor, &["input_buffer_home", "history_previous"]);
+    assert_eq!(
+        editor.text(),
+        "newest",
+        "Up on the first line did not recall the newest history entry"
+    );
+
+    act(&mut editor, &["history_next"]);
+    assert_eq!(
+        editor.text(),
+        "draft one\ndraft two\ndraft three",
+        "Down past the newest history entry did not restore the in-progress draft"
+    );
+}
+
+#[test]
 fn views_input_history_clamps_at_the_oldest_entry() {
     let mut editor = editor();
     editor.set_text("only");
@@ -507,6 +571,350 @@ fn views_input_unknown_action_is_ignored() {
 }
 
 // ---------------------------------------------------------------------------
+// Persisted history
+// ---------------------------------------------------------------------------
+
+/// A history file holding `entries`, written the way the host writes it.
+fn history_file(directory: &std::path::Path, entries: &[&str]) -> std::path::PathBuf {
+    let path = directory.join(PROMPT_HISTORY_FILE);
+    let mut text = String::new();
+    for entry in entries {
+        text.push_str(&PromptHistory::encode(entry).expect("a short entry encodes"));
+    }
+    std::fs::write(&path, text).expect("write the history file");
+    path
+}
+
+#[test]
+fn views_input_history_round_trips_through_a_real_file() {
+    // A real file, not an in-memory fixture: the whole failure this feature exists to
+    // fix is that nothing was written down, and a fake writer would pass whether or not
+    // `encode` and `load` agree about the format.
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join(PROMPT_HISTORY_FILE);
+
+    let mut writing = editor();
+    let (sender, mut records) = tokio::sync::mpsc::channel(8);
+    writing.record_history_to(sender);
+    for prompt in ["first", "second"] {
+        writing.set_text(prompt);
+        writing.handle_action(action("input_submit"));
+    }
+    let mut text = String::new();
+    while let Ok(entry) = records.try_recv() {
+        text.push_str(&PromptHistory::encode(&entry).expect("a short entry encodes"));
+    }
+    std::fs::write(&path, text).expect("write the history file");
+
+    let loaded = PromptHistory::load(&path);
+    assert_eq!(loaded.notice(), None, "a clean file produced a diagnostic");
+    let mut restarted = editor();
+    restarted.load_history(loaded.into_entries());
+    act(&mut restarted, &["history_previous"]);
+    assert_eq!(
+        restarted.text(),
+        "second",
+        "a restarted editor could not recall the newest persisted prompt"
+    );
+    act(&mut restarted, &["history_previous"]);
+    assert_eq!(restarted.text(), "first");
+}
+
+#[test]
+fn views_input_history_round_trips_a_multi_line_prompt() {
+    // The reason the format is JSON per line rather than one prompt per line: a
+    // multi-line prompt written raw would come back as several entries, and a prompt
+    // containing a `}` or a quote would come back corrupt.
+    let directory = tempfile::tempdir().expect("temp dir");
+    let prompt = "fix this:\n```sh\nset -e \"quoted\"\n```\n{\"json\": true}";
+    let path = history_file(directory.path(), &[prompt]);
+
+    let loaded = PromptHistory::load(&path);
+    assert_eq!(loaded.entries(), [String::from(prompt)]);
+    assert_eq!(
+        std::fs::read_to_string(&path)
+            .expect("readable")
+            .lines()
+            .count(),
+        1,
+        "a multi-line prompt was written as more than one line, so it cannot round-trip"
+    );
+}
+
+#[test]
+fn views_input_history_from_a_missing_file_is_empty_and_silent() {
+    // Every first run takes this path, so a notice here would greet every new user
+    // with a warning about a file they were never supposed to have.
+    let directory = tempfile::tempdir().expect("temp dir");
+    let loaded = PromptHistory::load(&directory.path().join(PROMPT_HISTORY_FILE));
+    assert!(loaded.entries().is_empty());
+    assert_eq!(loaded.notice(), None);
+}
+
+#[test]
+fn views_input_history_from_a_corrupt_file_is_empty_and_says_so() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join(PROMPT_HISTORY_FILE);
+    std::fs::write(&path, "not json\n{\"input\": \n\u{0}\u{1}garbage\n").expect("write");
+
+    let loaded = PromptHistory::load(&path);
+    assert!(
+        loaded.entries().is_empty(),
+        "unparseable lines were loaded as prompts: {:?}",
+        loaded.entries()
+    );
+    let notice = loaded.notice().expect("a corrupt file must be reported");
+    assert!(
+        notice.contains("skipped 3"),
+        "the notice does not say how much was lost: {notice}"
+    );
+}
+
+#[test]
+fn views_input_history_keeps_the_lines_before_a_truncated_one() {
+    // The reason for JSONL over one JSON document: a process killed mid-append
+    // truncates its final line only, and every earlier prompt still loads. A single
+    // document would be unparseable in its entirety.
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = history_file(directory.path(), &["kept", "also kept"]);
+    let mut text = std::fs::read_to_string(&path).expect("readable");
+    text.push_str("{\"input\": \"cut off in the mi");
+    std::fs::write(&path, text).expect("write");
+
+    let loaded = PromptHistory::load(&path);
+    assert_eq!(
+        loaded.entries(),
+        [String::from("kept"), String::from("also kept")]
+    );
+    assert!(
+        loaded.notice().is_some(),
+        "the truncated line went unreported"
+    );
+}
+
+#[test]
+fn views_input_history_is_capped_on_load_as_well_as_on_record() {
+    // The record-time cap alone does not bound this: a file grown by an older build,
+    // or edited by hand, arrives already over the limit.
+    let directory = tempfile::tempdir().expect("temp dir");
+    let entries: Vec<String> = (0..HISTORY_LIMIT + 10)
+        .map(|index| format!("prompt {index}"))
+        .collect();
+    let borrowed: Vec<&str> = entries.iter().map(String::as_str).collect();
+    let path = history_file(directory.path(), &borrowed);
+
+    let loaded = PromptHistory::load(&path);
+    assert_eq!(loaded.entries().len(), HISTORY_LIMIT);
+    assert_eq!(
+        loaded.entries()[0],
+        "prompt 10",
+        "the load cap dropped the newest entries instead of the oldest"
+    );
+
+    let mut editor = editor();
+    editor.load_history(entries);
+    assert_eq!(
+        editor.history().len(),
+        HISTORY_LIMIT,
+        "an over-long list installed into the editor was not capped"
+    );
+}
+
+#[test]
+fn views_input_history_does_not_persist_an_over_long_prompt() {
+    // Bounded because a paste is one keystroke now: without this, the startup read the
+    // whole feature depends on becomes the slowest thing the TUI does.
+    assert!(PromptHistory::encode("short").is_some());
+    let huge = "x".repeat(HISTORY_ENTRY_LIMIT + 1);
+    assert!(
+        PromptHistory::encode(&huge).is_none(),
+        "an entry over the limit was encoded for the file anyway"
+    );
+}
+
+#[test]
+fn views_input_history_records_only_what_it_remembered() {
+    // The file and the in-memory list have to agree, so a de-duplicated repeat must not
+    // reach the sink either — otherwise the next run's history differs from the one the
+    // user was walking a moment ago.
+    let mut editor = editor();
+    let (sender, mut records) = tokio::sync::mpsc::channel(8);
+    editor.record_history_to(sender);
+    for _ in 0..3 {
+        editor.set_text("same");
+        editor.handle_action(action("input_submit"));
+    }
+    assert_eq!(records.try_recv(), Ok(String::from("same")));
+    assert!(
+        records.try_recv().is_err(),
+        "a repeat the editor refused to remember was still written down"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Paste
+// ---------------------------------------------------------------------------
+
+#[test]
+fn views_input_paste_inserts_every_line_and_submits_nothing() {
+    let mut editor = editor();
+    let pasted = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight";
+    assert_eq!(editor.insert_paste(pasted), EditorSignal::Changed);
+    assert_eq!(
+        editor.height(),
+        8,
+        "an eight-line paste did not become eight lines: {:?}",
+        editor.text()
+    );
+    assert_eq!(editor.text(), pasted);
+    assert_eq!(editor.submission_text(), pasted);
+}
+
+#[test]
+fn views_input_paste_below_the_threshold_is_shown_in_full() {
+    let mut editor = editor();
+    editor.insert_paste("a\nb\nc");
+    assert_eq!(editor.text(), "a\nb\nc", "a short paste was summarised");
+}
+
+#[test]
+fn views_input_a_large_paste_is_summarised_but_sent_in_full() {
+    let mut editor = editor();
+    let lines: Vec<String> = (0..PASTE_SUMMARY_LINES + 5)
+        .map(|index| format!("line {index}"))
+        .collect();
+    let pasted = lines.join("\n");
+    editor.insert_paste(&pasted);
+
+    assert_eq!(
+        editor.height(),
+        1,
+        "a summarised paste still occupied the prompt: {:?}",
+        editor.text()
+    );
+    assert!(
+        editor.text().contains(&format!("~{} lines", lines.len())),
+        "the summary does not state the line count: {:?}",
+        editor.text()
+    );
+    assert_eq!(
+        editor.submission_text(),
+        pasted,
+        "the placeholder, not the paste, would have been sent"
+    );
+    assert_eq!(
+        editor.handle_action(action("input_submit")),
+        EditorSignal::Submit(pasted.clone()),
+        "submitting sent the summary instead of the text"
+    );
+    assert_eq!(
+        editor.history(),
+        [pasted],
+        "history recorded the summary rather than what was sent"
+    );
+}
+
+#[test]
+fn views_input_a_very_long_single_line_paste_is_summarised_too() {
+    // The character limit exists for this shape: one line, far wider than the prompt,
+    // which the line count alone would let through.
+    let mut editor = editor();
+    let pasted = "x".repeat(PASTE_SUMMARY_CHARS + 1);
+    editor.insert_paste(&pasted);
+    assert!(
+        editor.text().starts_with("[Pasted #1"),
+        "a very long single line was inserted whole: {} chars",
+        editor.text().chars().count()
+    );
+    assert_eq!(editor.submission_text(), pasted);
+}
+
+#[test]
+fn views_input_two_large_pastes_expand_to_their_own_text() {
+    // The placeholder's ordinal is what makes this work. Without it both pastes would
+    // carry the same placeholder and one would expand with the other's text — sending
+    // the model content the user never pasted there.
+    let mut editor = editor();
+    let first = (0..PASTE_SUMMARY_LINES + 1)
+        .map(|_| String::from("first"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let second = (0..PASTE_SUMMARY_LINES + 1)
+        .map(|_| String::from("second"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    editor.insert_paste(&first);
+    editor.insert_char(' ');
+    editor.insert_paste(&second);
+
+    let submitted = editor.submission_text();
+    assert!(
+        submitted.starts_with(&first) && submitted.ends_with(&second),
+        "the two pastes did not expand to their own text: {submitted:?}"
+    );
+}
+
+#[test]
+fn views_input_a_deleted_placeholder_sends_nothing_of_its_paste() {
+    let mut editor = editor();
+    let pasted = (0..PASTE_SUMMARY_LINES + 1)
+        .map(|_| String::from("body"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    editor.insert_paste(&pasted);
+    act(&mut editor, &["input_clear"]);
+    editor.insert_text("never mind");
+    assert_eq!(
+        editor.submission_text(),
+        "never mind",
+        "a placeholder the user deleted still expanded"
+    );
+}
+
+#[test]
+fn views_input_a_paste_starting_with_a_slash_is_escaped_as_literal_text() {
+    // A pasted path is not a command. Unescaped, `/etc/hosts` resolves to `unknown
+    // command /etc` and the paste is discarded — the buffer has already been cleared by
+    // then. `//` is the slash router's own literal escape; see `views/slash.rs`.
+    let mut editor = editor();
+    editor.insert_paste("/etc/hosts");
+    assert_eq!(editor.text(), "//etc/hosts");
+    assert_eq!(editor.submission_text(), "//etc/hosts");
+}
+
+#[test]
+fn views_input_a_slash_pasted_mid_prompt_is_left_alone() {
+    // Only a leading slash can be read as a command, so escaping anywhere else would
+    // corrupt the text for no reason.
+    let mut editor = editor();
+    editor.insert_text("look at ");
+    editor.insert_paste("/etc/hosts");
+    assert_eq!(editor.text(), "look at /etc/hosts");
+}
+
+#[test]
+fn views_input_an_empty_paste_changes_nothing() {
+    let mut editor = typing("draft");
+    assert_eq!(editor.insert_paste(""), EditorSignal::None);
+    assert_eq!(editor.insert_paste("\n"), EditorSignal::None);
+    assert_eq!(editor.text(), "draft");
+}
+
+#[test]
+fn views_input_setting_the_text_drops_a_held_paste() {
+    // `$EDITOR` returns through `set_text`, so a retained placeholder would either
+    // expand a string the editor happened to contain or be submitted literally.
+    let mut editor = editor();
+    let pasted = (0..PASTE_SUMMARY_LINES + 1)
+        .map(|_| String::from("body"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    editor.insert_paste(&pasted);
+    editor.set_text("edited elsewhere");
+    assert_eq!(editor.submission_text(), "edited elsewhere");
+}
+
+// ---------------------------------------------------------------------------
 // Paste normalisation
 // ---------------------------------------------------------------------------
 
@@ -531,7 +939,7 @@ fn views_prompt_gutter_renders_its_marker_from_the_palette() {
     assert_eq!(buffer[(0, 0)].symbol(), ">");
     assert_eq!(
         buffer[(0, 0)].fg,
-        ratatui::style::Color::from(context.palette.border_active)
+        ratatui::style::Color::from(context.palette().border_active)
     );
 }
 

@@ -181,7 +181,7 @@ impl GuardedPty {
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_zuno-process-fixture"));
         command.args([
             zuno_process::GUARD_MARKER,
-            "supervise",
+            "supervise-foreground",
             &parent_pid,
             "--",
             "/bin/sh",

@@ -16,6 +16,8 @@ mod tool_runtime;
 mod tui;
 mod tui_lsp;
 mod tui_permission;
+mod tui_question;
+mod tui_reference;
 mod turn;
 
 use crate::{
