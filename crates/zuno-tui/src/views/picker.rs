@@ -315,6 +315,11 @@ pub struct Item {
     pub description: String,
     /// The opaque value reported in [`DialogOutcome::Selected`].
     pub value: String,
+    /// The heading this row belongs under, when the picker groups.
+    ///
+    /// Empty for every ungrouped picker, which is what makes grouping opt-in per
+    /// constructor rather than a mode the list has to be told about.
+    pub group: String,
 }
 
 impl Item {
@@ -326,7 +331,15 @@ impl Item {
             value: label.clone(),
             label,
             description: String::new(),
+            group: String::new(),
         }
+    }
+
+    /// Put this row under the `group` heading.
+    #[must_use]
+    pub fn grouped(mut self, group: impl Into<String>) -> Self {
+        self.group = group.into();
+        self
     }
 
     /// Attach a description.
@@ -342,6 +355,15 @@ impl Item {
         self.value = value.into();
         self
     }
+}
+
+/// One heading's rows while [`SelectDialog::rank_groups`] orders them.
+struct Group<'a> {
+    name: &'a str,
+    /// The best score any member scored, which is what orders the groups.
+    best: u32,
+    /// `(score, index)` per member, ordered as `items` holds them until sorted.
+    members: Vec<(u32, usize)>,
 }
 
 /// A per-row preview renderer.
@@ -490,6 +512,25 @@ impl SelectDialog {
     }
 
     /// Set the filter and re-rank.
+    ///
+    /// # Grouping and filtering together
+    ///
+    /// When any item carries a [`Item::group`], groups are kept **contiguous** and ordered by
+    /// their best-scoring member, and members are ordered by score inside each group.
+    /// Headings therefore persist under a query, and each one still introduces a real run of
+    /// rows. With no query every candidate scores alike, so both orderings collapse to the
+    /// order the items were built in — which every grouped constructor sorts by name.
+    ///
+    /// The alternative — rank every row globally — was rejected because it interleaves
+    /// providers, and a heading that introduces one row before the next heading is not a
+    /// group. Dropping the headings while filtering was rejected for a worse reason: the
+    /// provider is no longer repeated on each row, so a filtered list without headings
+    /// would not say which provider a model belongs to at all, and two providers offering
+    /// the same model name would be indistinguishable.
+    ///
+    /// The cost, stated because it is real: the single best-matching *row* need not be first
+    /// overall. The best-matching *group* leads, and the best match within each group leads
+    /// that group.
     pub fn set_filter(&mut self, filter: &str) {
         self.filter = filter.to_owned();
         let mut ranked = self
@@ -507,17 +548,110 @@ impl SelectDialog {
                 // the id — because that is what `--model` and the config file spell —
                 // otherwise types it and is told there are no matches. "No results" and
                 // "searching the wrong field" look identical from the outside.
+                // And the group, at the same halved weight. The grouped pickers moved the
+                // provider off every row and into a heading; searching it here is what keeps
+                // typing `bedrock` working after that move, which it would otherwise
+                // silently stop doing.
                 let best = score(&item.label, filter)
                     .into_iter()
                     .chain(score(&item.description, filter).map(|value| value / 2))
                     .chain(score(&item.value, filter).map(|value| value / 2))
+                    .chain(score(&item.group, filter).map(|value| value / 2))
                     .max()?;
                 Some((best, index))
             })
             .collect::<Vec<_>>();
-        ranked.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
-        self.filtered = ranked.into_iter().map(|(_, index)| index).collect();
+        if self.is_grouped() {
+            self.filtered = Self::rank_groups(&self.items, ranked);
+        } else {
+            ranked.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+            self.filtered = ranked.into_iter().map(|(_, index)| index).collect();
+        }
         self.cursor = self.cursor.min(self.filtered.len().saturating_sub(1));
+    }
+
+    /// Whether any row carries a group, and so whether headings are drawn.
+    fn is_grouped(&self) -> bool {
+        self.items.iter().any(|item| !item.group.is_empty())
+    }
+
+    /// `scored` re-ordered so each group is one contiguous run, best group first.
+    ///
+    /// Groups appear in the order of their best-scoring member; ties keep the order the
+    /// groups first appear in `items`, which is the name-sorted order a grouped constructor
+    /// built. Within a group the items keep their `items` order for the same reason.
+    fn rank_groups(items: &[Item], scored: Vec<(u32, usize)>) -> Vec<usize> {
+        let mut groups: Vec<Group<'_>> = Vec::new();
+        // `scored` is in `items` order, so pushing a new group the first time its name is
+        // seen records groups in first-appearance order and members in name order.
+        for (score, index) in scored {
+            let name = items[index].group.as_str();
+            match groups.iter_mut().find(|group| group.name == name) {
+                Some(group) => {
+                    group.best = group.best.max(score);
+                    group.members.push((score, index));
+                }
+                None => groups.push(Group {
+                    name,
+                    best: score,
+                    members: vec![(score, index)],
+                }),
+            }
+        }
+        groups.sort_by_key(|group| std::cmp::Reverse(group.best));
+        groups
+            .into_iter()
+            .flat_map(|Group { mut members, .. }| {
+                // Members are score-ordered too, and this is not the same as leaving them in
+                // name order: with only the group ranked, `sonnet` put the cursor on the row
+                // whose *id* contained it because that row sorted first alphabetically, while
+                // the model actually named `Sonnet` sat below it. A picker that does not put
+                // an exact name match under the cursor is worse than an unsorted one.
+                //
+                // Name order still governs the unfiltered list, for free rather than by a
+                // branch: an empty query scores every candidate 1, so a stable sort by score
+                // is a no-op and the name-sorted order this was built in survives.
+                members.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+                members.into_iter().map(|(_, index)| index)
+            })
+            .collect()
+    }
+
+    /// The first visible row, chosen so the cursor's row is inside the row budget.
+    ///
+    /// Headings spend rows the items would otherwise have, so the plain
+    /// `cursor - (rows - 1)` this replaces could put the cursor one or two rows past the
+    /// bottom edge of a grouped list — the cursor would be on a row nobody can see, which is
+    /// indistinguishable from the arrow keys having stopped working. The start is advanced
+    /// until the cursor fits; the loop is bounded by the budget because each step drops one
+    /// row from the window.
+    fn window_start(&self) -> usize {
+        let budget = self.rows.max(1);
+        let mut start = self.cursor.saturating_sub(budget.saturating_sub(1));
+        while start < self.cursor && self.display_rows(start, self.cursor) > budget {
+            start += 1;
+        }
+        start
+    }
+
+    /// Rows the window `start..=end` occupies once its headings are counted.
+    fn display_rows(&self, start: usize, end: usize) -> usize {
+        if !self.is_grouped() {
+            return end.saturating_sub(start) + 1;
+        }
+        let mut rows = 0;
+        let mut previous: Option<&str> = None;
+        for index in self.filtered.get(start..=end).unwrap_or_default() {
+            let group = self.items[*index].group.as_str();
+            // The topmost visible row always carries its heading, so a window opened in the
+            // middle of a group still says which group that is.
+            if previous != Some(group) {
+                rows += 1;
+                previous = Some(group);
+            }
+            rows += 1;
+        }
+        rows
     }
 
     /// Tell [`Self::highlight`] about the highlighted row, if it changed.
@@ -574,20 +708,44 @@ impl Dialog for SelectDialog {
             lines.push(padded(" no matches", width, self.context.muted()));
             return lines;
         }
-        // Keep the cursor in view by scrolling the window, not the cursor.
-        let first = self.cursor.saturating_sub(self.rows.saturating_sub(1));
-        for (position, index) in self.filtered.iter().enumerate().skip(first).take(self.rows) {
+        // Keep the cursor in view by scrolling the window, not the cursor. Headings are
+        // counted in the budget, so this is not simply `cursor - (rows - 1)`.
+        let first = self.window_start();
+        let grouped = self.is_grouped();
+        let mut heading: Option<&str> = None;
+        for (position, index) in self.filtered.iter().enumerate().skip(first) {
+            if lines.len() >= self.rows {
+                break;
+            }
             let item = &self.items[*index];
+            // A heading is emitted here and never added to `filtered`, which is what makes
+            // it unselectable: the cursor indexes `filtered`, so there is no index it could
+            // hold that names a heading. A cursor-skipping rule would be the other design,
+            // and the row it forgot to skip would be a dead row the user can land on.
+            if grouped && heading != Some(item.group.as_str()) {
+                heading = Some(item.group.as_str());
+                lines.push(padded(
+                    &format!(" {}", item.group),
+                    width,
+                    self.context.accent(),
+                ));
+                if lines.len() >= self.rows {
+                    break;
+                }
+            }
             let style = if position == self.cursor {
                 self.context.selected()
             } else {
                 self.context.text()
             };
             let marker = if position == self.cursor { ">" } else { " " };
+            // Indented one column under its heading when grouped, so the heading reads as a
+            // heading rather than as another row that happens to have no marker.
+            let indent = if grouped { "  " } else { "" };
             let body = if item.description.is_empty() {
-                format!(" {marker} {}", item.label)
+                format!(" {marker} {indent}{}", item.label)
             } else {
-                format!(" {marker} {}  {}", item.label, item.description)
+                format!(" {marker} {indent}{}  {}", item.label, item.description)
             };
             lines.push(padded(&body, width, style));
         }
@@ -602,6 +760,10 @@ impl Dialog for SelectDialog {
         vec![
             ("↑↓", "move"),
             ("pgup/pgdn", "page"),
+            // The filter has been typeable since this dialog shipped and nothing said so:
+            // with 114 models the list reads as something you can only scroll. A capability
+            // no surface announces is one the user does not have.
+            ("type", "search"),
             ("enter", "select"),
             ("esc", "cancel"),
         ]
@@ -718,18 +880,45 @@ pub struct ModelEntry {
     pub provider: String,
 }
 
-/// The model picker.
+/// The model picker, grouped by provider and sorted by name inside each provider.
 ///
 /// The value is `provider/model` rather than a bare model id, because a bare id is
 /// exactly the unqualified form the model policy treats as unavailable
 /// (`zuno-agent/src/model_policy.rs`).
+///
+/// # Why a heading and not a column
+///
+/// Measured at 120x34 with 114 models, the flat list repeated `amazon-bedrock` on every one
+/// of its rows: a hundred-odd copies of the one fact that was the same everywhere, and no
+/// answer at all to "what else is there". The provider moves into a heading, which states it
+/// once per run and makes the runs countable.
+///
+/// None of the four reference implementations does this, and each was checked: `codex` builds
+/// one flat `SelectionItem` per preset
+/// (`.omo/refs/codex/codex-rs/tui/src/chatwidget/model_popups.rs:198-220`), `omo-slim` hands
+/// the host a flattened list with the provider id as each row's description
+/// (`.omo/refs/omo-slim/src/tui-preset.ts:513-525`), `jcode`'s terminal picker makes the
+/// provider a per-row switchable option, and its desktop picker walks provider → connection →
+/// model as three separate stages
+/// (`.omo/refs/jcode/crates/jcode-desktop2/src/model_picker.rs:3-9`). The staged walk was
+/// rejected: it hides every model until a provider is chosen, so it cannot answer "which
+/// provider has the model I want" — which is the question a search box exists for.
 #[must_use]
 pub fn model_picker(context: ViewContext, models: Vec<ModelEntry>) -> SelectDialog {
+    let mut models = models;
+    // Sorted here rather than relied upon from the host: the ordering is what makes each
+    // provider's rows one contiguous run, and a heading drawn over a list that is not
+    // actually grouped would repeat the same heading further down.
+    models.sort_by(|left, right| {
+        left.provider
+            .cmp(&right.provider)
+            .then_with(|| left.name.cmp(&right.name))
+    });
     let items = models
         .into_iter()
         .map(|model| {
             Item::new(model.name)
-                .described(model.provider)
+                .grouped(model.provider)
                 .valued(model.id)
         })
         .collect();

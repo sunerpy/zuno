@@ -55,7 +55,7 @@ use crate::views::message::{Message, StatusView, TranscriptView};
 use crate::views::permission::typed_character;
 use crate::views::scroll::Scroller;
 use crate::views::slash::{CatalogCommand, HostCommand, SlashRouter, SlashSubmission};
-use crate::views::toast::Toast;
+use crate::views::toast::{Toast, ToastLevel};
 use crossterm::event::{
     Event as CrosstermEvent, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind,
 };
@@ -143,6 +143,53 @@ const PROMPT_PLACEHOLDER: &str = "ask anything, or / for commands";
 /// notice was reported as. One column of air is the whole difference between "wrapped" and
 /// "truncated" to a reader.
 const SIDEBAR_GAP_COLS: u16 = 1;
+
+/// Rows left below the prompt so the empty state reads as one centred column.
+///
+/// Only ever non-zero while the transcript is empty. The complaint this answers is that the
+/// welcome block is centred in the body region ([`crate::views::welcome::WelcomeView::lines`]
+/// pads above) while the prompt is pinned to the terminal's last row, so the two sat a third
+/// of a screen apart and the input did not read as part of the composition.
+///
+/// A fourth band rather than moving the prompt out of the split: the order
+/// body / status / prompt is what every other assertion about this screen measures from, and
+/// the strip has to stay directly above the prompt it describes. Lifting the pair by a tail
+/// keeps that order and every existing row relationship intact, and reduces to today's exact
+/// layout the moment a message arrives — which is what makes this cost nothing in the state
+/// the user spends their time in.
+///
+/// This is *not* a per-keystroke reflow: the tail is a function of the frame and of whether
+/// the transcript is empty, and typing into the prompt changes neither. `jcode`'s desktop
+/// composer is the reference for the arrangement (`.omo/refs/jcode/crates/jcode-desktop2/
+/// src/layout.rs:306-322`, hero stack immediately above the composer, centred fallback when
+/// the hero does not fit); its rounded border is deliberately **not** taken, for the reason
+/// [`PROMPT_GUTTER_COLS`] already gives.
+fn welcome_tail_rows(empty: bool, height: u16, status: u16, prompt: u16) -> u16 {
+    if !empty {
+        return 0;
+    }
+    let chrome = status.saturating_add(prompt);
+    // The body keeps at least one row: the welcome screen is the thing being centred, and a
+    // tail that consumed the region it is centring would leave the brand nowhere to draw.
+    // At 20x10 this is what holds — `Min(1)` would otherwise be starved by a `Length` tail.
+    let spare = height
+        .saturating_sub(chrome)
+        .saturating_sub(WELCOME_MIN_BODY_ROWS);
+    // Half the slack, so the composite sits on the optical middle: the welcome block already
+    // pads itself above, and giving the tail the other half is what balances the two.
+    (spare / 2).min(WELCOME_TAIL_MAX_ROWS)
+}
+
+/// The rows the body must keep before the welcome tail may take any.
+const WELCOME_MIN_BODY_ROWS: u16 = 1;
+
+/// The most the prompt is ever lifted off the bottom edge.
+///
+/// A cap because the welcome block grows with the terminal but the prompt does not: on a
+/// fifty-row pane an uncapped half-slack tail floats the input a dozen rows above the strip's
+/// usual place, and a prompt that moves that far between an empty and a used session reads as
+/// two different applications.
+const WELCOME_TAIL_MAX_ROWS: u16 = 6;
 
 /// Rows the prompt gets for `content_lines` of typed text on a `height`-row screen.
 ///
@@ -935,17 +982,27 @@ impl SessionScreen {
     /// [`Clipboard::read`]'s deliberate error worth returning: the binding used to fall
     /// into a bare redraw, so pressing it did nothing and said nothing.
     fn paste_from_clipboard(&mut self) -> EventResult {
-        let notice = match self.clipboard.read() {
-            Ok(Some(content)) if content.is_image() => String::from(
-                "the clipboard holds an image; pasting an attachment is not supported yet",
+        // The three outcomes are not one grade: an unsupported kind and an empty clipboard
+        // are refusals the user can act on, while a clipboard that errored is a failure —
+        // `§11.5` gives those different colours, and the copy path beside this one already
+        // makes exactly that distinction with its toasts.
+        let (level, notice) = match self.clipboard.read() {
+            Ok(Some(content)) if content.is_image() => (
+                ToastLevel::Warning,
+                String::from(
+                    "the clipboard holds an image; pasting an attachment is not supported yet",
+                ),
             ),
             Ok(Some(content)) => return self.paste(&content.data),
-            Ok(None) => String::from("nothing to paste: the clipboard is empty"),
-            Err(error) => format!("paste failed: {error}"),
+            Ok(None) => (
+                ToastLevel::Warning,
+                String::from("nothing to paste: the clipboard is empty"),
+            ),
+            Err(error) => (ToastLevel::Error, format!("paste failed: {error}")),
         };
         self.transcript
             .transcript_mut()
-            .push(Message::notice(notice));
+            .push(Message::noticed(level, notice));
         EventResult::REDRAW
     }
 
@@ -995,10 +1052,18 @@ impl Component for SessionScreen {
             .iter()
             .map(crate::views::picker::McpServer::service)
             .collect();
-        let [body, status, prompt] = Layout::vertical([
+        let empty = self.transcript.transcript().messages().is_empty();
+        let prompt_band = prompt_rows(self.editor.height(), area.height);
+        let [body, status, prompt, _tail] = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(STATUS_ROWS),
-            Constraint::Length(prompt_rows(self.editor.height(), area.height)),
+            Constraint::Length(prompt_band),
+            Constraint::Length(welcome_tail_rows(
+                empty,
+                area.height,
+                STATUS_ROWS,
+                prompt_band,
+            )),
         ])
         .areas(area);
 
@@ -1023,7 +1088,7 @@ impl Component for SessionScreen {
         // The transcript owns this region as soon as there is anything to show, so the
         // welcome screen can never hide content — it only fills rows that would
         // otherwise be blank.
-        if self.transcript.transcript().messages().is_empty() {
+        if empty {
             self.welcome.render(frame, main);
         } else {
             self.transcript.render(frame, main);
@@ -1049,14 +1114,10 @@ impl Component for SessionScreen {
                 .render(frame, gutter);
         }
         self.editor.render(frame, buffer);
-        if self.autocomplete.is_open() {
-            let height = self.autocomplete.height().min(main.height);
-            let overlay = Rect::new(
-                main.x,
-                main.y + main.height.saturating_sub(height),
-                main.width,
-                height,
-            );
+        // Last, and over `main` rather than inside the split above: the popup is a floating
+        // layer, so opening it cannot reflow the transcript. It owns its own geometry —
+        // see `AutocompleteView::overlay_frame`.
+        if let Some(overlay) = self.autocomplete.overlay_frame(main) {
             self.autocomplete.render(frame, overlay);
         }
     }
@@ -1462,7 +1523,10 @@ impl SessionScreen {
         {
             self.cancel_requested = true;
             self.cancellations += 1;
-            self.transcript.transcript_mut().push(Message::notice(
+            // `Info`: the cancel was accepted and is under way. Nothing was refused, so the
+            // warning colour would claim the keypress had failed.
+            self.transcript.transcript_mut().push(Message::noticed(
+                ToastLevel::Info,
                 "cancelling the turn; press the same key again to exit",
             ));
             return EventResult::REDRAW;
@@ -1484,14 +1548,12 @@ impl SessionScreen {
             crate::views::picker::MODEL_DIALOG_ID => {
                 self.catalog.model = Some(value.to_owned());
                 self.status.set_configured_model(value);
-                self.welcome.facts_mut().model = Some(value.to_owned());
                 self.sidebar.ambient_mut().model = Some(value.to_owned());
                 Selection::Model(value.to_owned())
             }
             crate::views::picker::AGENT_DIALOG_ID => {
                 self.catalog.agent = Some(value.to_owned());
                 self.status.set_configured_agent(value);
-                self.welcome.facts_mut().agent = Some(value.to_owned());
                 self.sidebar.ambient_mut().agent = Some(value.to_owned());
                 Selection::Agent(value.to_owned())
             }
@@ -1509,9 +1571,10 @@ impl SessionScreen {
                 // The resolved name, not `value`: a theme that fell back is showing the
                 // fallback, and the notice should say what the user is looking at.
                 let name = self.context.theme().name.clone();
-                self.transcript
-                    .transcript_mut()
-                    .push(Message::notice(format!("theme set to {name}")));
+                self.transcript.transcript_mut().push(Message::noticed(
+                    ToastLevel::Success,
+                    format!("theme set to {name}"),
+                ));
                 return EventResult::REDRAW;
             }
             // The palette resolves to *another action's name*, so it re-enters the same
@@ -1520,17 +1583,20 @@ impl SessionScreen {
             // palette is excluded from what it can dispatch.
             crate::views::palette::DIALOG_ID => return self.dispatch_action(value),
             SKILL_DIALOG_ID => {
-                self.transcript
-                    .transcript_mut()
-                    .push(Message::notice(format!(
-                        "skill `{value}` — name it in a prompt to invoke it"
-                    )));
+                // `Info`: nothing was refused and nothing succeeded — the picker exists to
+                // report the name, and this states it.
+                self.transcript.transcript_mut().push(Message::noticed(
+                    ToastLevel::Info,
+                    format!("skill `{value}` — name it in a prompt to invoke it"),
+                ));
                 return EventResult::REDRAW;
             }
             _ => return EventResult::IGNORED,
         };
-        let (text, _delivered) = self.commit_selection(selection);
-        self.transcript.transcript_mut().push(Message::notice(text));
+        let (text, level) = self.commit_selection(selection);
+        self.transcript
+            .transcript_mut()
+            .push(Message::noticed(level, text));
         EventResult::REDRAW
     }
 
@@ -1538,9 +1604,16 @@ impl SessionScreen {
     ///
     /// Split out of [`Self::adopt`] so the cycling keys can reuse the *delivery* while
     /// reporting on a different surface. Both callers must keep the refusal branch, which is
-    /// the whole reason the boolean comes back: a selection that reached nothing and said so
+    /// the whole reason the level comes back: a selection that reached nothing and said so
     /// nowhere is the defect class the sink was made fallible to expose.
-    fn commit_selection(&mut self, selection: Selection) -> (String, bool) {
+    ///
+    /// A [`ToastLevel`] rather than the `bool` this returned before, because the two callers
+    /// render on different surfaces — a toast and a transcript notice — and each was mapping
+    /// the boolean itself. One of them got it wrong: the picker's notice was drawn at warning
+    /// grade whether the selection was delivered or refused, so a model switch that worked
+    /// was announced with the same `!` as one that had not. Returning the level is what makes
+    /// the two surfaces agree by construction.
+    fn commit_selection(&mut self, selection: Selection) -> (String, ToastLevel) {
         let notice = match &selection {
             Selection::Model(model) => format!("model set to {model} for the next turn"),
             Selection::Agent(agent) => format!("agent set to {agent} for the next turn"),
@@ -1551,15 +1624,17 @@ impl SessionScreen {
             .selections
             .as_ref()
             .is_some_and(|sink| sink.try_send(selection).is_ok());
-        let text = if delivered {
-            notice
+        if delivered {
+            (notice, ToastLevel::Success)
         } else {
             // A refused sink is reported rather than swallowed. The alternative is the
             // defect this whole change is about: a picker that appears to work, a
             // selection that reached nothing, and no way for the user to tell.
-            format!("{notice} (not applied: nothing is listening)")
-        };
-        (text, delivered)
+            (
+                format!("{notice} (not applied: nothing is listening)"),
+                ToastLevel::Warning,
+            )
+        }
     }
 
     /// Move to the agent `step` places along the catalog, wrapping at both ends.
@@ -1618,14 +1693,9 @@ impl SessionScreen {
         let name = names[next].clone();
         self.catalog.agent = Some(name.clone());
         self.status.set_configured_agent(&name);
-        self.welcome.facts_mut().agent = Some(name.clone());
         self.sidebar.ambient_mut().agent = Some(name.clone());
-        let (text, delivered) = self.commit_selection(Selection::Agent(name));
-        self.toasts.push(if delivered {
-            Toast::success(text)
-        } else {
-            Toast::warning(text)
-        });
+        let (text, level) = self.commit_selection(Selection::Agent(name));
+        self.toasts.push(Toast::new(level, text));
         EventResult::REDRAW
     }
 }

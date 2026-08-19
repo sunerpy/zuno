@@ -38,11 +38,11 @@ fn session_screen_renders_the_transcript_the_status_strip_and_the_prompt() {
         "the transcript region is empty:\n{joined}"
     );
     assert!(
-        rendered[5].contains("idle"),
+        rendered[strip_index(&rendered, &screen, 8)].contains("idle"),
         "the status strip did not render in its own region: {rendered:?}"
     );
     assert!(
-        rendered[6].contains("what I am typing"),
+        content_row(&rendered, &screen, 8).contains("what I am typing"),
         "the prompt did not render in its own region: {rendered:?}"
     );
 }
@@ -58,7 +58,7 @@ fn session_screen_folds_an_engine_event_into_the_status_strip() {
 
     let rendered = rows(&render_offscreen(&mut screen, 40, 8).expect("infallible"));
     assert!(
-        rendered[5].contains("test/test-model"),
+        rendered[strip_index(&rendered, &screen, 8)].contains("test/test-model"),
         "the resolved model did not reach the status strip: {rendered:?}"
     );
 }
@@ -121,7 +121,7 @@ fn session_screen_types_a_printable_key_into_the_prompt() {
 
     let rendered = rows(&render_offscreen(&mut screen, 40, 8).expect("infallible"));
     assert!(
-        rendered[6].contains("hi"),
+        content_row(&rendered, &screen, 8).contains("hi"),
         "the typed characters did not reach the prompt: {rendered:?}"
     );
 }
@@ -196,7 +196,7 @@ fn session_screen_a_large_paste_shows_a_summary_but_submits_the_whole_text() {
 
     let rendered = rows(&render_offscreen(&mut screen, 40, 8).expect("infallible"));
     assert!(
-        rendered[6].contains("Pasted"),
+        content_row(&rendered, &screen, 8).contains("Pasted"),
         "the prompt band does not show the summary affordance: {rendered:?}"
     );
     assert!(
@@ -1442,10 +1442,17 @@ fn session_screen_drops_the_panel_rather_than_squeezing_it() {
 
 #[test]
 fn session_screen_shows_the_welcome_surface_only_while_the_transcript_is_empty() {
+    // The anchor has to satisfy two properties, and only the lead line satisfies both: it
+    // is unconditional in `WelcomeView::lines`, and it appears on no other surface. A
+    // looser needle such as `/ for commands` also matches the *composer's* placeholder
+    // (`ask anything, or / for commands`), which is drawn in both halves of this test — so
+    // the negative assertion would hold vacuously and this test would pass with the
+    // welcome screen gone entirely.
+    const WELCOME_ONLY: &str = "type / for commands";
     let (mut screen, _shutdown) = screen();
     let empty = rows(&render_offscreen(&mut screen, 200, 40).expect("infallible")).join("\n");
     assert!(
-        empty.contains("a coding agent"),
+        empty.contains(WELCOME_ONLY),
         "the welcome surface is missing on an empty transcript:\n{empty}"
     );
     screen
@@ -1454,7 +1461,7 @@ fn session_screen_shows_the_welcome_surface_only_while_the_transcript_is_empty()
         .push(Message::user("first prompt"));
     let used = rows(&render_offscreen(&mut screen, 200, 40).expect("infallible")).join("\n");
     assert!(
-        !used.contains("a coding agent"),
+        !used.contains(WELCOME_ONLY),
         "the welcome surface survived the first message:\n{used}"
     );
     assert!(used.contains("first prompt"), "{used}");
@@ -3276,7 +3283,7 @@ fn message_text(message: &Message) -> String {
         .iter()
         .filter_map(|part| match part {
             crate::views::message::MessagePart::Text { text }
-            | crate::views::message::MessagePart::Notice { text } => Some(text.clone()),
+            | crate::views::message::MessagePart::Notice { text, .. } => Some(text.clone()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -3400,20 +3407,35 @@ fn session_screen_copying_prefers_the_selection_over_the_whole_buffer() {
     );
 }
 
-/// How many rows the prompt band occupied in a `width` × `height` frame.
+/// How many rows the prompt band occupied in a `width` x `height` frame.
 ///
-/// Measured back out of the frame — the status strip is located by the state word it
-/// always prints, and everything below it is the prompt — rather than by calling
-/// `prompt_rows`. Asserting the function's return value would keep passing if `render`
-/// stopped consulting it, which is the second-source-of-truth hole this measurement
-/// exists to close.
+/// Measured back out of the frame rather than by calling `prompt_rows`. Asserting that
+/// function's return value would keep passing if `render` stopped consulting it, which is the
+/// second-source-of-truth hole this measurement exists to close.
+///
+/// The band's top edge is found from the gutter marker `render` paints there — content, so it
+/// moves when the band moves. Its bottom edge cannot be found the same way: the band ends in a
+/// blank spacer and the rows below it are blank too, so the only thing that separates them is
+/// the tail's length, which comes from the same function `render` uses. Deriving the *whole*
+/// span from `prompt_rows` instead would make this arithmetic rather than a measurement and
+/// would reopen exactly the hole above.
+///
+/// `prompt_band` deliberately locates the band the other way round — counted from the bottom,
+/// never from the marker — because one of its callers asserts that the marker is there.
 fn prompt_band_rows(screen: &mut SessionScreen, width: u16, height: u16) -> usize {
+    let empty = screen.transcript.transcript().messages().is_empty();
+    let tail = usize::from(welcome_tail_rows(
+        empty,
+        height,
+        STATUS_ROWS,
+        prompt_rows(screen.editor.height(), height),
+    ));
     let rendered = rows(&render_offscreen(screen, width, height).expect("infallible"));
-    let status = rendered
+    let first = rendered
         .iter()
-        .position(|row| row.contains("idle") || row.contains("working"))
-        .expect("the status strip is always on screen");
-    rendered.len() - status - 1
+        .position(|row| row.starts_with(PROMPT_MARKER))
+        .expect("the prompt paints its gutter marker at every width these tests use");
+    rendered.len() - first - tail
 }
 
 #[test]
@@ -3806,9 +3828,60 @@ fn every_bound_action_in_a_registered_scope_either_reaches_something_or_is_a_nam
     );
 }
 
-/// The last row of a rendered frame, which the prompt band's spacer owns.
-fn last_row(rendered: &[String]) -> &str {
-    rendered.last().map_or("", String::as_str)
+/// Where the prompt band starts in a rendered frame, counted back from the bottom.
+///
+/// Not located by the strip's own text: the strip degrades through four tiers and drops its
+/// state word on the way, so `idle`/`working` is not a row every frame has — a 40-column frame
+/// reporting a resolved model prints the model and the exit hint and no state at all.
+///
+/// Not located by the prompt's gutter marker either, and that is the more important exclusion:
+/// `the_prompt_is_contained_by_a_gutter_and_a_spacer_at_every_supported_width` asserts the
+/// located row *starts with* that marker, so finding the row by the marker would make its
+/// assertion true by construction. A guard that reads the value it is checking only restates it.
+///
+/// So the position is counted from the frame's last row through the two lengths `render` gives
+/// those bands. A `render` that stopped consulting either would point this at the wrong row and
+/// the content assertions would fail, which is the direction that has to work.
+fn prompt_first(rendered: &[String], screen: &SessionScreen, height: u16) -> usize {
+    let empty = screen.transcript.transcript().messages().is_empty();
+    let band = prompt_rows(screen.editor.height(), height);
+    let tail = welcome_tail_rows(empty, height, STATUS_ROWS, band);
+    rendered
+        .len()
+        .saturating_sub(usize::from(tail) + usize::from(band))
+}
+
+/// Where the status strip is, which is directly above the prompt band by construction.
+fn strip_index(rendered: &[String], screen: &SessionScreen, height: u16) -> usize {
+    prompt_first(rendered, screen, height).saturating_sub(STATUS_ROWS as usize)
+}
+
+/// The prompt band's rows, located rather than assumed to be the frame's last band.
+///
+/// Twelve assertions used to index the frame absolutely — `rendered[6]`, `rendered[len - 2]` —
+/// which silently encoded "the prompt is the final band". It is not, while the transcript is
+/// empty: a tail below it lifts the welcome block and the input into one centred column. An
+/// absolute index does not fail informatively when that changes; it reports that some
+/// unrelated row lacks the caret. Locating the band keeps every one of those assertions about
+/// the band itself.
+fn prompt_band<'a>(rendered: &'a [String], screen: &SessionScreen, height: u16) -> &'a [String] {
+    let first = prompt_first(rendered, screen, height);
+    let band = usize::from(prompt_rows(screen.editor.height(), height));
+    &rendered[first.min(rendered.len())..(first + band).min(rendered.len())]
+}
+
+/// The prompt band's spacer, which is its last row whenever the band has more than one.
+fn spacer_row<'a>(rendered: &'a [String], screen: &SessionScreen, height: u16) -> &'a str {
+    prompt_band(rendered, screen, height)
+        .last()
+        .map_or("", String::as_str)
+}
+
+/// The prompt band's first row, the one the caret and the gutter marker share.
+fn content_row<'a>(rendered: &'a [String], screen: &SessionScreen, height: u16) -> &'a str {
+    prompt_band(rendered, screen, height)
+        .first()
+        .map_or("", String::as_str)
 }
 
 #[test]
@@ -3820,7 +3893,7 @@ fn the_prompt_is_contained_by_a_gutter_and_a_spacer_at_every_supported_width() {
     for width in [200u16, 120, 80, 60, 40] {
         let (mut blank, _shutdown) = screen();
         let rendered = rows(&render_offscreen(&mut blank, width, 24).expect("infallible"));
-        let band = &rendered[rendered.len() - 2];
+        let band = content_row(&rendered, &blank, 24);
         assert!(
             band.starts_with("› "),
             "at {width} columns the prompt has no gutter marker: {band:?}"
@@ -3845,22 +3918,22 @@ fn the_prompt_is_contained_by_a_gutter_and_a_spacer_at_every_supported_width() {
             "at {width} columns the tall fixture did not fill the band: {filled:?}"
         );
         assert_eq!(
-            last_row(&filled),
+            spacer_row(&filled, &tall, 24),
             "",
-            "at {width} columns the prompt is flush against the terminal's last row, which is \
-             the reported defect"
+            "at {width} columns the prompt is flush against its last row, which is the \
+             reported defect"
         );
         assert_eq!(
-            last_row(&rendered),
+            spacer_row(&rendered, &blank, 24),
             "",
-            "at {width} columns an empty prompt reaches the terminal's last row"
+            "at {width} columns an empty prompt has no spacer under it"
         );
         // The right inset, measured rather than assumed: a full row of typed text must stop
         // short of the frame, or the band is only nominally contained.
         let (mut typed, _shutdown) = screen();
         typed.editor.set_text(&"x".repeat(usize::from(width) * 2));
         let rendered = rows(&render_offscreen(&mut typed, width, 24).expect("infallible"));
-        let band = &rendered[rendered.len() - 2];
+        let band = content_row(&rendered, &typed, 24);
         assert!(
             crate::views::display_width(band) < usize::from(width),
             "at {width} columns the prompt used its last column, leaving no right inset: \
@@ -3878,13 +3951,13 @@ fn the_prompt_keeps_a_typeable_row_on_a_twenty_by_ten_pane() {
     let (mut screen, _shutdown) = screen();
     screen.editor.set_text("hi");
     let rendered = rows(&render_offscreen(&mut screen, 20, 10).expect("infallible"));
-    let band = &rendered[rendered.len() - 2];
+    let band = content_row(&rendered, &screen, 10);
     assert!(
         band.contains("hi") && band.contains('▏'),
         "the 20x10 prompt lost its content row to chrome: {band:?}"
     );
     assert_eq!(
-        last_row(&rendered),
+        spacer_row(&rendered, &screen, 10),
         "",
         "the spacer row is missing at 20x10"
     );
@@ -3949,12 +4022,23 @@ const OVERLONG_NOTICE: &str = "MCP server `context7` was not toggled: lifecycle 
 /// the terminal, and reassembling it interleaves the panel into the sentence. Both mistakes
 /// were made writing these tests, and both looked like failures of the shipping code.
 fn notice_body(rendered: &[String]) -> Vec<String> {
+    notice_body_at(rendered, ToastLevel::Warning)
+}
+
+/// The same, for a notice drawn at `level`.
+///
+/// Split out because the marker is no longer always `!`: a notice carries one of `§11.5`'s four
+/// levels and prints that level's glyph, so a helper hard-coded to the warning marker would
+/// silently return no rows for a success and every assertion over it would be about nothing —
+/// which is the failure mode this helper's own docs already warn about.
+fn notice_body_at(rendered: &[String], level: ToastLevel) -> Vec<String> {
+    let prefix = format!("▲ {} ", level.glyph());
     rendered
         .iter()
-        .filter(|row| row.starts_with("▲ ! "))
+        .filter(|row| row.starts_with(&prefix))
         .map(|row| {
             let main = row.split('│').next().unwrap_or(row);
-            main.trim_start_matches("▲ ! ").trim_end().to_owned()
+            main.trim_start_matches(&prefix).trim_end().to_owned()
         })
         .collect()
 }
@@ -4306,5 +4390,118 @@ fn cycling_a_catalog_with_nothing_to_cycle_says_so_rather_than_going_quiet() {
                 .any(|toast| toast.text().contains("no other agent")),
             "a {count}-agent catalog cycled in silence: {toasts:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `§11.5` grades: a notice says which of the four it is
+// ---------------------------------------------------------------------------
+
+/// A committed model choice is reported as a success, not as a warning.
+#[test]
+fn a_delivered_model_choice_is_reported_with_the_success_affordance() {
+    let (selections, _keep) = mpsc::channel(4);
+    let (screen, _shutdown) = screen();
+    let mut screen = screen.with_selection_sink(selections);
+    screen.adopt(
+        crate::views::picker::MODEL_DIALOG_ID,
+        "amazon-bedrock/amazon.nova-lite-v1:0",
+    );
+    let rendered = rows(&render_offscreen(&mut screen, 120, 24).expect("infallible"));
+
+    let success = notice_body_at(&rendered, ToastLevel::Success);
+    assert!(
+        success
+            .iter()
+            .any(|row| row.contains("model set to amazon-bedrock/amazon.nova-lite-v1:0")),
+        "a model that was set is not reported at success grade: {rendered:?}"
+    );
+    // The other half, and the half that fails on the shipped behaviour: the same sentence must
+    // not also be reachable through the warning marker. Asserting only the success row would
+    // pass a renderer that drew both, and `▲ !` on a confirmation is the reported defect.
+    let warned = notice_body_at(&rendered, ToastLevel::Warning);
+    assert!(
+        !warned.iter().any(|row| row.contains("model set to")),
+        "the model confirmation still carries the warning marker: {warned:?}"
+    );
+}
+
+/// A model choice nobody is listening for stays a warning, because it did not take effect.
+#[test]
+fn a_refused_model_choice_keeps_the_warning_affordance() {
+    // No selection sink, which is the refusal path.
+    let (mut screen, _shutdown) = screen();
+    screen.adopt(crate::views::picker::MODEL_DIALOG_ID, "p/m");
+    let rendered = rows(&render_offscreen(&mut screen, 120, 24).expect("infallible"));
+
+    let warned = notice_body_at(&rendered, ToastLevel::Warning);
+    assert!(
+        warned
+            .iter()
+            .any(|row| row.contains("not applied: nothing is listening")),
+        "a refused selection is not reported at warning grade: {rendered:?}"
+    );
+    assert!(
+        notice_body_at(&rendered, ToastLevel::Success).is_empty(),
+        "a selection that reached nothing was reported as a success: {rendered:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The welcome tail, and the fact that it costs a used session nothing
+// ---------------------------------------------------------------------------
+
+/// The input is lifted off the bottom edge while the transcript is empty, and only then.
+#[test]
+fn the_welcome_screen_lifts_the_prompt_and_a_used_session_does_not() {
+    for (width, height) in [(120u16, 34u16), (60, 34), (200, 50), (80, 24)] {
+        let (mut blank, _shutdown) = screen();
+        let rendered = rows(&render_offscreen(&mut blank, width, height).expect("infallible"));
+        let first = prompt_first(&rendered, &blank, height);
+        let band = usize::from(prompt_rows(blank.editor.height(), height));
+        assert!(
+            first + band < rendered.len(),
+            "at {width}x{height} the welcome prompt still reaches the frame's last row"
+        );
+        // The lift is the whole point, so it is asserted as a distance and not as "non-zero":
+        // a one-row tail would satisfy `<` above and leave the complaint exactly as reported.
+        assert!(
+            rendered.len() - (first + band) >= 2,
+            "at {width}x{height} the welcome prompt is lifted by only {} row(s)",
+            rendered.len() - (first + band)
+        );
+
+        let (mut used, _shutdown) = screen();
+        used.transcript_mut()
+            .transcript_mut()
+            .push(Message::user("a first prompt"));
+        let rendered = rows(&render_offscreen(&mut used, width, height).expect("infallible"));
+        let first = prompt_first(&rendered, &used, height);
+        let band = usize::from(prompt_rows(used.editor.height(), height));
+        assert_eq!(
+            first + band,
+            rendered.len(),
+            "at {width}x{height} a used session pays for the welcome tail it cannot see"
+        );
+    }
+}
+
+/// The tail cannot starve the region it exists to centre, including at 20x10.
+#[test]
+fn the_welcome_tail_never_takes_the_row_the_welcome_needs() {
+    for height in 1..=12u16 {
+        let band = prompt_rows(0, height);
+        let tail = welcome_tail_rows(true, height, STATUS_ROWS, band);
+        assert!(
+            STATUS_ROWS + band + tail < height || height <= STATUS_ROWS + band,
+            "at {height} rows the chrome and the tail leave the body nothing: \
+             status {STATUS_ROWS} + prompt {band} + tail {tail}"
+        );
+        let (mut screen, _shutdown) = screen();
+        screen.editor.set_text("hi");
+        // The panic guard, exercised through the frame rather than the arithmetic: a tail that
+        // fabricated a row the buffer does not own panics inside ratatui.
+        let rendered = rows(&render_offscreen(&mut screen, 20, height).expect("infallible"));
+        assert_eq!(rendered.len(), usize::from(height));
     }
 }

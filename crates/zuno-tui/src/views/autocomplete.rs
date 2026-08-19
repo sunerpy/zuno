@@ -33,7 +33,7 @@
 use crate::app::{AppEvent, Component, EventResult, TerminalEvent};
 use crate::keybind::{Definition, PendingPrefix};
 use crate::views::slash::SlashRouter;
-use crate::views::{ViewContext, display_width, fill, padded, truncate};
+use crate::views::{ViewContext, display_width, fill, hint, padded, truncate};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
@@ -70,15 +70,29 @@ pub enum CandidateKind {
 }
 
 impl CandidateKind {
-    /// The glyph shown beside a candidate of this kind.
+    /// The marker naming this kind, or `None` when `display` already opens with it.
+    ///
+    /// A command is built as `/{name}` and an agent as `@{name}`, so emitting the marker
+    /// for those two printed the sigil twice: `/mcp` rendered as ` / /mcp`.
     #[must_use]
-    pub const fn glyph(self) -> &'static str {
+    pub const fn marker(self) -> Option<&'static str> {
         match self {
-            Self::Command => "/",
-            Self::File => "≡",
-            Self::Directory => "▸",
-            Self::Agent => "@",
-            Self::Reference => "◈",
+            Self::Command | Self::Agent => None,
+            Self::File => Some("≡"),
+            Self::Directory => Some("▸"),
+            Self::Reference => Some("◈"),
+        }
+    }
+
+    /// The marker column's contents, a space when there is no marker.
+    ///
+    /// The column is spent either way: dropping it for some rows would step their
+    /// `display` one column left of the rest of the same list.
+    #[must_use]
+    pub const fn marker_cell(self) -> &'static str {
+        match self.marker() {
+            Some(marker) => marker,
+            None => " ",
         }
     }
 }
@@ -324,6 +338,26 @@ pub fn score(candidate: &str, query: &str) -> Option<u32> {
     Some(10)
 }
 
+/// The literal spaces a candidate row spends on separation: one leading, one after the
+/// marker, and two between the display and its description.
+const OVERLAY_ROW_PADDING: usize = 4;
+
+/// Rows the popup spends on its own hint line.
+const OVERLAY_HINT_ROWS: u16 = 1;
+
+/// The separation columns [`hint`] puts around one `(key, label)` pair.
+///
+/// One space between the key and its label, two after it. Kept beside the only reader rather
+/// than inferred at the call site, because it is a property of `hint` and a stale copy here
+/// under-measures the row and clips the last pair.
+const HINT_PAIR_PADDING: usize = 3;
+
+/// The narrowest popup worth centring, matching `§11.4`'s floor for a readable list.
+///
+/// Below this the popup takes the whole of `main` instead — see
+/// [`AutocompleteView::overlay_frame`], which clamps rather than refusing to draw.
+const OVERLAY_MIN_COLS: u16 = 30;
+
 /// The autocomplete popup.
 pub struct AutocompleteView {
     context: ViewContext,
@@ -512,10 +546,125 @@ impl AutocompleteView {
         }
     }
 
-    /// Rows the popup needs.
+    /// Rows the popup needs, its hint row included.
+    ///
+    /// The hint row is counted here rather than added by the caller because this is what
+    /// "how tall is the popup" has to mean: a caller that sized a frame from a list-only
+    /// count would hand the popup one row too few, and `render` would drop a candidate to
+    /// make room for the hints — losing content to chrome without saying so.
     #[must_use]
     pub fn height(&self) -> u16 {
+        self.list_height().saturating_add(OVERLAY_HINT_ROWS)
+    }
+
+    /// Rows the candidate list alone occupies.
+    fn list_height(&self) -> u16 {
         u16::try_from(self.matches.len().min(self.visible_rows)).unwrap_or(u16::MAX)
+    }
+
+    /// The keys the hint row advertises, and what each one does.
+    ///
+    /// One list, read by both the row and [`Self::content_width`]. A width computed from a
+    /// second copy is a width that stops matching the row when one of them is edited, and the
+    /// symptom is a clipped hint — measured as `esc dis` on a 120-column frame.
+    const HINTS: [(&'static str, &'static str); 3] =
+        [("↑↓", "move"), ("tab", "complete"), ("esc", "dismiss")];
+
+    /// The hint row shown along the popup's bottom edge.
+    ///
+    /// Built from the same [`hint`] helper every dialog footer uses, so the keys are spelled
+    /// once and cannot drift between the two surfaces.
+    #[must_use]
+    pub fn hint_row(&self, width: u16) -> Line<'static> {
+        let mut spans = Vec::new();
+        for (key, label) in Self::HINTS {
+            spans.extend(hint(key, label, &self.context));
+        }
+        let used = u16::try_from(
+            spans
+                .iter()
+                .map(|span| display_width(&span.content))
+                .sum::<usize>(),
+        )
+        .unwrap_or(u16::MAX);
+        // Padded to the popup's own width so the hint row carries the popup's background
+        // across its whole edge rather than letting the frame behind it show through the
+        // tail of the row.
+        spans.push(ratatui::text::Span::styled(
+            " ".repeat(usize::from(width.saturating_sub(used))),
+            self.context.element(),
+        ));
+        Line::from(spans)
+    }
+
+    /// Columns the widest row the popup will draw wants, hint row included.
+    ///
+    /// The hint row is measured too, and that is not incidental: sized from the candidates
+    /// alone, a popup listing one short command came out narrower than its own hints and the
+    /// last of them rendered as `esc dis` on a 120-column frame. A surface that clips the row
+    /// explaining it is worse than one with no hints, because a half-spelled key reads as a key.
+    fn content_width(&self) -> u16 {
+        let candidates = self
+            .matches
+            .iter()
+            .take(self.visible_rows)
+            .map(|candidate| {
+                // The literal spaces of `" {marker} {display}  {description}"`, in terminal
+                // columns rather than characters so a CJK description is measured as the cells
+                // it occupies.
+                let marker = display_width(candidate.kind.marker_cell());
+                let body =
+                    display_width(&candidate.display) + display_width(&candidate.description);
+                marker + body + OVERLAY_ROW_PADDING
+            })
+            .max()
+            .unwrap_or(0);
+        let hints = Self::HINTS
+            .iter()
+            .map(|(key, label)| {
+                // `hint` spells a pair as `" {key} {label} "`, so four columns of separation.
+                display_width(key) + display_width(label) + HINT_PAIR_PADDING
+            })
+            .sum::<usize>();
+        u16::try_from(candidates.max(hints)).unwrap_or(u16::MAX)
+    }
+
+    /// Where the popup floats inside `main`, and nothing else.
+    ///
+    /// A [`Rect`] rather than a [`ratatui::layout::Constraint`], and that is the whole
+    /// contract: the popup opens and closes on a keystroke, so a popup that took part in
+    /// the screen's vertical split would reflow the transcript on every character typed.
+    /// It is drawn over `main` instead, after `main` has been painted.
+    ///
+    /// Centred on both axes. Vertically, because a list anchored to the bottom edge sat
+    /// under the caret it was completing and read as part of the status strip. Horizontally
+    /// and content-derived rather than full width, for the reason
+    /// [`crate::views::dialog`] gives fixed tiers over fractions: a 200-column popup
+    /// holding a nine-column command is a sparse band, not a list.
+    ///
+    /// Degradation at narrow widths is a clamp, never a refusal: the popup takes what is
+    /// available once it cannot have [`OVERLAY_MIN_COLS`], because a completion list is the
+    /// one surface that has to survive the pane a user has squeezed. Returns `None` only
+    /// when `main` has no rows for it at all, which is the 20x10 case where the transcript
+    /// region is a single row.
+    #[must_use]
+    pub fn overlay_frame(&self, main: Rect) -> Option<Rect> {
+        if !self.is_open() || main.width == 0 || main.height == 0 {
+            return None;
+        }
+        let height = self.height().min(main.height);
+        if height == 0 {
+            return None;
+        }
+        let width = self
+            .content_width()
+            .clamp(OVERLAY_MIN_COLS.min(main.width), main.width);
+        Some(Rect {
+            x: main.x + (main.width - width) / 2,
+            y: main.y + (main.height - height) / 2,
+            width,
+            height,
+        })
     }
 
     /// The rendered rows.
@@ -536,11 +685,11 @@ impl AutocompleteView {
                     self.context.element()
                 };
                 let body = if candidate.description.is_empty() {
-                    format!(" {} {}", candidate.kind.glyph(), candidate.display)
+                    format!(" {} {}", candidate.kind.marker_cell(), candidate.display)
                 } else {
                     format!(
                         " {} {}  {}",
-                        candidate.kind.glyph(),
+                        candidate.kind.marker_cell(),
                         candidate.display,
                         candidate.description
                     )
@@ -564,11 +713,20 @@ pub enum AutocompleteStep {
 
 impl Component for AutocompleteView {
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        if !self.is_open() {
+        if !self.is_open() || area.width == 0 || area.height == 0 {
             return;
         }
         fill(frame.buffer_mut(), area, self.context.element());
-        Paragraph::new(self.lines(area.width))
+        // The hint row is dropped rather than allowed to evict a candidate when the frame
+        // is down to one row: the list is what the user opened, and a popup showing only
+        // its own keys explains a list that is not there.
+        let mut rows = self.lines(area.width);
+        let list_rows = usize::from(area.height.saturating_sub(OVERLAY_HINT_ROWS));
+        if area.height > OVERLAY_HINT_ROWS {
+            rows.truncate(list_rows);
+            rows.push(self.hint_row(area.width));
+        }
+        Paragraph::new(rows)
             .style(self.context.element())
             .render(area, frame.buffer_mut());
     }

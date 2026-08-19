@@ -754,11 +754,12 @@ impl SessionFacts {
         }
 
         let directory = (!self.directory.is_empty()).then(|| self.directory.clone());
+        // No agent or model: `status_mut().describe` above already states both on the one
+        // row that is never dropped at any width, and the welcome screen sat directly on
+        // top of it repeating them verbatim.
         *screen.welcome_mut().facts_mut() = zuno_tui::views::welcome::WelcomeFacts {
             directory: directory.clone(),
             branch: self.branch.clone(),
-            model: Some(self.model.clone()),
-            agent: Some(self.agent.clone()),
             version: Some(self.version.clone()),
             tools: Some(tools),
             mcp: Some(self.mcp.len()),

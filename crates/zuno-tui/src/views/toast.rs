@@ -90,7 +90,7 @@ pub const TOAST_MAX_WIDTH: u16 = 60;
 /// statement. The four are a closed set for the same reason the permission prompt has
 /// exactly three replies — a fifth state would need a fifth colour, and the palette
 /// does not define one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ToastLevel {
     /// A neutral statement of fact.
     Info,

@@ -10,12 +10,17 @@ fn keymap() -> Keymap {
     Keymap::defaults().expect("the shipped binding table resolves")
 }
 
+/// The agent and model this screen must **not** state, and the strip must.
+const STRIP_AGENT: &str = "build";
+const STRIP_MODEL: &str = "myopenai/claude-haiku-4-5";
+
+/// The one row `WelcomeView::lines` emits unconditionally, used to bound the block.
+const LEAD_LINE: &str = "type / for commands";
+
 fn facts() -> WelcomeFacts {
     WelcomeFacts {
         directory: Some(String::from("~/src/zuno")),
         branch: Some(String::from("task-r17-solo")),
-        model: Some(String::from("myopenai/claude-haiku-4-5")),
-        agent: Some(String::from("build")),
         version: Some(String::from("0.1.0")),
         tools: Some(13),
         mcp: Some(2),
@@ -38,21 +43,52 @@ fn painted(view: &mut WelcomeView, width: u16, height: u16) -> usize {
         .count()
 }
 
+/// Rows from the block's first painted row to its last, blank spacers included.
+///
+/// The measure a reader of the screen actually experiences: a spacer costs a row of
+/// height exactly as much as a sentence does, so counting only painted rows would call a
+/// block double-spaced into twice the height "the same size".
+fn extent(view: &mut WelcomeView, width: u16, height: u16) -> usize {
+    let rendered = rows(&render_offscreen(view, width, height).expect("infallible"));
+    let painted = |row: &String| !row.trim().is_empty();
+    let first = rendered.iter().position(painted);
+    let last = rendered.iter().rposition(painted);
+    match (first, last) {
+        (Some(first), Some(last)) => last - first + 1,
+        _ => 0,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The defect this module exists to fix
 // ---------------------------------------------------------------------------
 
 #[test]
-fn views_welcome_fills_a_large_frame_instead_of_leaving_it_blank() {
-    // The measured defect: two non-empty rows out of fifty. A floor rather than an
-    // exact count so that editing a tip cannot fail this test, and a high enough floor
-    // that a screen which regressed to a couple of rows cannot pass it.
+fn views_welcome_fills_a_large_frame_without_sprawling_across_it() {
+    // Two bounds, because this screen has been wrong in both directions. The floor is the
+    // original defect: two non-empty rows out of fifty, indistinguishable from a rendering
+    // failure. The ceiling is the second one: twenty-two rows of vertical extent, four of
+    // them restating what the strip and the sidebar already carried.
+    //
+    // A band rather than an equality so that editing a tip or a slash label cannot fail
+    // this, and wide enough at the bottom that a screen which regressed to a couple of rows
+    // still cannot pass. The ceiling is on *extent* rather than on painted rows because a
+    // blank spacer occupies the screen exactly as much as a row of text does, and spacers
+    // are how the previous version spent a third of its height.
     let mut view = view();
-    let count = painted(&mut view, 200, 50);
+    let painted_rows = painted(&mut view, 200, 50);
     assert!(
-        count >= 14,
-        "the welcome screen painted only {count} of 50 rows, which is the emptiness it \
-         exists to replace"
+        painted_rows >= 10,
+        "the welcome screen painted only {painted_rows} of 50 rows, which is the emptiness \
+         it exists to replace"
+    );
+
+    let extent = extent(&mut view, 200, 50);
+    assert!(
+        extent <= 18,
+        "the welcome block spans {extent} rows; it spanned 22 before the trim and the \
+         references it follows spend 11 (`jcode`), 13 (`codex`) and 16 (`claw-code`), so \
+         growing back past 18 means a row was added without a fact to justify it"
     );
 }
 
@@ -145,14 +181,16 @@ fn views_welcome_paints_the_wordmark_shadow_in_its_own_colour() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn views_welcome_states_the_directory_model_and_inventory() {
+fn views_welcome_states_every_fact_no_other_surface_keeps_at_every_width() {
+    // The positive half of the trim. The list is shorter than it was by exactly the agent
+    // and the model, which the negative test below now forbids; everything still here is a
+    // fact that has *no* other carrier at some supported width — the sidebar vanishes below
+    // `SIDEBAR_MIN_WIDTH`, and the strip drops the branch before anything else.
     let mut view = view();
     let joined = rows(&render_offscreen(&mut view, 200, 50).expect("infallible")).join("\n");
     for needle in [
         "~/src/zuno",
         "task-r17-solo",
-        "build",
-        "myopenai/claude-haiku-4-5",
         "13 tools",
         "2 mcp",
         "1 lsp",
@@ -161,6 +199,82 @@ fn views_welcome_states_the_directory_model_and_inventory() {
     ] {
         assert!(joined.contains(needle), "`{needle}` is missing:\n{joined}");
     }
+}
+
+#[test]
+fn views_welcome_does_not_restate_the_agent_and_model_the_status_strip_carries() {
+    // The measured duplication this trim removes: at 120x34 the welcome screen's own row
+    // read `build   ·   myopenai/claude-haiku-4-5` while the strip two rows below read
+    // `build · myopenai/claude-haiku-4-5 · idle`.
+    //
+    // Asserted on the **composite**, not on `WelcomeView` alone, and that is the point. A
+    // welcome-only assertion would pass the moment the row was deleted here even if a host
+    // re-added it, and it could not show that the fact is still on screen. Both halves are
+    // required together: absent from the welcome region, present on the strip.
+    let mut screen = composed();
+    let rendered = rows(&render_offscreen(&mut screen, 120, 34).expect("infallible"));
+    let joined = rendered.join("\n");
+    // The whole welcome block sits above this row, and the row is unconditional in
+    // `WelcomeView::lines`, so "below the lead line" is a layout-free way of saying "not on
+    // the welcome screen". The status strip's own words cannot be used as the anchor: it
+    // degrades through four tiers, and at 40 columns it prints `idl` rather than `idle`.
+    let lead = rendered
+        .iter()
+        .position(|row| row.contains(LEAD_LINE))
+        .expect("the welcome screen always teaches `/`");
+
+    for needle in [STRIP_AGENT, STRIP_MODEL] {
+        let rows_with = rendered
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.contains(needle))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows_with.len(),
+            1,
+            "`{needle}` is stated on {} rows; it belongs on the status strip alone, which \
+             is the one row never dropped at any width:\n{joined}",
+            rows_with.len()
+        );
+        assert!(
+            rows_with[0] > lead,
+            "`{needle}` is stated on row {} at or above the welcome screen's lead line \
+             (row {lead}), so the one remaining copy is the welcome screen's own:\n{joined}",
+            rows_with[0]
+        );
+    }
+}
+
+#[test]
+fn views_welcome_keeps_the_branch_because_both_other_carriers_drop_it() {
+    // The asymmetry that decides which duplicates may go. The agent and model are cut
+    // because `StatusView::state` is padded or clipped but never omitted; the branch is
+    // kept because it lives in `StatusView::trailers`, which is dropped front-first, and in
+    // the sidebar, which is not drawn below `SIDEBAR_MIN_WIDTH`. Forty columns is where
+    // both of those give out at once, so it is the width that proves the branch needs a
+    // carrier here.
+    let mut screen = composed();
+    let rendered = rows(&render_offscreen(&mut screen, 40, 24).expect("infallible"));
+    let joined = rendered.join("\n");
+    let carriers = rendered
+        .iter()
+        .filter(|row| row.contains("task-r17-solo"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        carriers.len(),
+        1,
+        "at 40 columns the branch should have exactly one carrier — more means the strip \
+         did not drop its trailer and this test proves nothing, none means the trim took \
+         the last one:\n{joined}"
+    );
+    // The surviving carrier has to be the welcome screen's location row, which is the row
+    // that also names the directory. Counting alone would be satisfied by the strip keeping
+    // it, which is the case this test exists to distinguish.
+    assert!(
+        carriers[0].contains("~/src/zuno"),
+        "the branch survived on some row other than the welcome location row:\n{joined}"
+    );
 }
 
 #[test]
@@ -447,10 +561,14 @@ fn views_welcome_tip_index_wraps_instead_of_panicking() {
 
 #[test]
 fn views_welcome_facts_can_be_stated_after_construction() {
+    // The carrier changed with the trim — `model` is no longer a field, because the status
+    // strip states it — but the property is unchanged and still worth a test: a host that
+    // resolves a fact *after* constructing the screen must see it rendered. `version` is
+    // used because it is resolved on the same late path `model` was.
     let mut view = WelcomeView::new(ViewContext::defaults());
-    view.facts_mut().model = Some(String::from("provider/model"));
+    view.facts_mut().version = Some(String::from("9.9.9-probe"));
     let joined = rows(&render_offscreen(&mut view, 200, 50).expect("infallible")).join("\n");
-    assert!(joined.contains("provider/model"), "{joined}");
+    assert!(joined.contains("zuno 9.9.9-probe"), "{joined}");
 }
 
 #[test]
@@ -675,6 +793,61 @@ fn advertised_actions() -> Vec<(&'static str, String)> {
         }
     }
     actions
+}
+
+// ---------------------------------------------------------------------------
+// Printers
+// ---------------------------------------------------------------------------
+
+/// The whole composed screen, so duplication *between* surfaces is visible.
+///
+/// A welcome-only printer cannot answer the question this screen is judged on. The
+/// complaint is that rows restate what the status strip and the sidebar already carry
+/// permanently, and neither of those is part of [`WelcomeView`] — so the only rendering
+/// that can show a repeat is the composite, at the widths where the sidebar appears and
+/// disappears.
+#[test]
+#[ignore = "printer, not an assertion: run with --ignored --nocapture to eyeball the rendering"]
+fn views_welcome_visual_probe() {
+    for (width, height) in [(200u16, 34u16), (120, 34), (80, 34), (60, 30), (40, 24)] {
+        println!("\n=========== {width}x{height} ===========");
+        let mut screen = composed();
+        for (index, row) in rows(&render_offscreen(&mut screen, width, height).expect("infallible"))
+            .iter()
+            .enumerate()
+        {
+            println!("{:>2}|{}|", index, row.trim_end());
+        }
+    }
+}
+
+/// A session screen dressed the way a host dresses it on the first frame.
+///
+/// The facts are stated on all three surfaces — welcome, strip, sidebar — because that is
+/// what the host does, and a probe that fed only the welcome screen would show no
+/// duplication however much of it there was.
+fn composed() -> crate::views::session::SessionScreen {
+    let (sender, receiver) = crate::app::terminal_event_channel();
+    std::mem::forget(receiver);
+    let mut screen = crate::views::session::SessionScreen::new(ViewContext::defaults(), sender)
+        .with_keymap(keymap());
+    *screen.welcome_mut().facts_mut() = facts();
+    screen.status_mut().set_configured_agent("build");
+    screen
+        .status_mut()
+        .set_configured_model("myopenai/claude-haiku-4-5");
+    screen.status_mut().set_git_branch("task-r17-solo");
+    let ambient = screen.sidebar_mut().ambient_mut();
+    ambient.directory = Some(String::from("~/src/zuno"));
+    ambient.branch = Some(String::from("task-r17-solo"));
+    ambient.agent = Some(String::from("build"));
+    ambient.model = Some(String::from("myopenai/claude-haiku-4-5"));
+    ambient.version = Some(String::from("0.1.0"));
+    ambient.mcp = vec![crate::views::ambient::Service::new(
+        "alpha",
+        crate::views::ambient::Health::Ready,
+    )];
+    screen
 }
 
 /// A screen with everything a picker could ask for, so a refusal is never an empty list.

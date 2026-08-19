@@ -197,7 +197,15 @@ fn views_autocomplete_slash_results_are_capped_at_ten() {
         AutocompleteView::new(ViewContext::defaults(), Box::new(SlashSource::new(router)));
     view.refresh("/task", 5);
     assert_eq!(view.matches().len(), 10);
-    assert_eq!(view.height(), 10);
+    // Eleven, not ten: `height` reports the rows the *popup* needs, and one of them is its
+    // hint row. The cap being asserted is on the candidates, so it is asserted on the
+    // candidates above; restating it here as a height would only re-derive the same number
+    // through the row that is not a candidate.
+    assert_eq!(
+        view.height(),
+        11,
+        "the popup no longer asks for its ten candidates plus a hint row"
+    );
 }
 
 #[test]
@@ -410,9 +418,19 @@ fn views_autocomplete_renders_offscreen() {
         joined.contains("Start a new session"),
         "a candidate description is missing:\n{joined}"
     );
+    // This asserted `rendered[0].starts_with(" / ")`, which is the defect written down as the
+    // expectation: the ` / ` was the kind's marker, and the `/session` that followed brought
+    // its own. The assertion that should have caught the doubled sigil is what froze it, so
+    // the claim is now about the command being legible rather than about a glyph before it.
+    let first = &rendered[0];
     assert!(
-        rendered[0].starts_with(" / "),
-        "the command glyph is missing: {rendered:?}"
+        first.trim_start().starts_with('/'),
+        "the command row does not lead with the command: {first:?}"
+    );
+    assert_eq!(
+        first.matches('/').count(),
+        1,
+        "the command row repeats the slash: {first:?}"
     );
 }
 
@@ -440,21 +458,89 @@ fn views_autocomplete_highlights_the_cursor_from_the_palette() {
     );
 }
 
+/// The markers that exist are distinct, and the kinds without one say why.
+///
+/// This asserted all five `glyph()`s were distinct. The property it protected — a reader can
+/// tell one kind from another — is kept; what changed is the *carrier*. `Command` and `Agent`
+/// have no marker of their own because their `display` opens with `/` or `@` already, and
+/// emitting a marker for them printed the sigil twice (` / /mcp`). So the claim is split: the
+/// markers that are drawn must not collide, and a kind without one must be a kind whose
+/// display supplies the sigil instead. Asserting only the first half would let a future
+/// `File` marker be dropped to `None` and lose its identity silently.
 #[test]
-fn views_autocomplete_kind_glyphs_are_distinct() {
-    let glyphs = [
+fn views_autocomplete_every_kind_stays_distinguishable() {
+    let kinds = [
         CandidateKind::Command,
         CandidateKind::File,
         CandidateKind::Directory,
         CandidateKind::Agent,
         CandidateKind::Reference,
-    ]
-    .map(CandidateKind::glyph);
-    let unique = glyphs.iter().collect::<std::collections::BTreeSet<_>>();
+    ];
+    let markers: Vec<&str> = kinds.iter().filter_map(|kind| kind.marker()).collect();
+    let unique = markers.iter().collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
         unique.len(),
-        glyphs.len(),
-        "two candidate kinds share a glyph, so the list cannot be read"
+        markers.len(),
+        "two candidate kinds share a marker, so the list cannot be read: {markers:?}"
+    );
+    for kind in kinds {
+        if kind.marker().is_some() {
+            continue;
+        }
+        // A markerless kind must be one whose rendered display carries the sigil. Checked
+        // against a real candidate from the production sources rather than against a list
+        // written here, so a kind that lost its marker without its display gaining a sigil
+        // fails instead of being excused by this test's own table.
+        // The probe carries a letter as well as the sigil: a bare `/` scores every command at
+        // the empty-query floor of 1, which the `Command` branch then discards for being
+        // under its prefix threshold, so a sigil-only query returns nothing to inspect.
+        let (sigil, probe) = match kind {
+            CandidateKind::Command => ('/', "/sess"),
+            CandidateKind::Agent => ('@', "@expl"),
+            other => panic!("{other:?} has no marker and no sigil, so its rows are unlabelled"),
+        };
+        let view = open(probe);
+        let found = view
+            .matches()
+            .iter()
+            .find(|candidate| candidate.kind == kind)
+            .unwrap_or_else(|| panic!("no {kind:?} candidate to check the sigil against"));
+        assert!(
+            found.display.starts_with(sigil),
+            "{kind:?} draws no marker, so its display must open with {sigil:?}: {:?}",
+            found.display
+        );
+    }
+}
+
+/// A slash candidate's row carries exactly one `/`, the one in its own name.
+///
+/// The measured defect: `/mcp` rendered as ` / /mcp` — the kind's marker plus a display that
+/// already began with `/`. Counted over the row rather than compared to a fixed string so the
+/// assertion survives a change to the padding, and asserted on the row `lines()` actually
+/// produces rather than on `display` alone, because the duplication was introduced by the row
+/// composer and not by the candidate.
+#[test]
+fn views_autocomplete_a_command_row_carries_one_slash() {
+    // The reported command, so the row under assertion is the one that was captured.
+    let mut view = AutocompleteView::new(
+        ViewContext::defaults(),
+        Box::new(StaticSource::new().command("mcp", "List MCP servers")),
+    );
+    view.refresh("/mcp", 4);
+    let rows = view.lines(60);
+    let row = rows
+        .first()
+        .expect("a `/mcp` query matches at least the mcp command");
+    let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
+    assert_eq!(
+        text.matches('/').count(),
+        1,
+        "the candidate row repeats the slash: {text:?}"
+    );
+    assert!(
+        text.contains("/mcp"),
+        "the row lost the command it is offering: {text:?}"
     );
 }
 
@@ -689,4 +775,152 @@ fn views_which_key_visual_probe() {
             println!("|{}|", row.trim_end());
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Where the popup floats
+// ---------------------------------------------------------------------------
+
+/// The popup is centred in the region it floats over, at every supported width.
+#[test]
+fn views_autocomplete_floats_centred_at_every_supported_width() {
+    for width in [200u16, 120, 80, 60, 40] {
+        let view = open("/sess");
+        let main = Rect::new(0, 0, width, 24);
+        let frame = view
+            .overlay_frame(main)
+            .expect("an open popup wants a frame in a 24-row region");
+
+        // Centred, to within the odd-remainder column and row a centre cannot split. Asserted
+        // as a symmetry between the two margins rather than against a computed x/y, which would
+        // just restate the implementation's own arithmetic.
+        let left = frame.x - main.x;
+        let right = main.width - frame.width - left;
+        assert!(
+            left.abs_diff(right) <= 1,
+            "at {width} columns the popup is not horizontally centred: {left} left, {right} right"
+        );
+        let above = frame.y - main.y;
+        let below = main.height - frame.height - above;
+        assert!(
+            above.abs_diff(below) <= 1,
+            "at {width} columns the popup is not vertically centred: {above} above, {below} below"
+        );
+        assert!(
+            frame.y > main.y,
+            "at {width} columns the popup still starts at the region's top edge"
+        );
+        assert!(
+            frame.y + frame.height < main.y + main.height,
+            "at {width} columns the popup still reaches the region's bottom edge, which is the \
+             reported placement"
+        );
+        assert!(
+            frame.width <= main.width && frame.height <= main.height,
+            "at {width} columns the popup does not fit the region it floats over: {frame:?}"
+        );
+        // Symmetry alone is satisfied by a full-width band — margins of zero on both sides — and
+        // a band spanning the terminal is the placement being replaced, not a centred popup. So
+        // the width has to be content-derived wherever there is room for it to be.
+        if width > OVERLAY_MIN_COLS {
+            assert!(
+                frame.width < main.width,
+                "at {width} columns the popup spans the whole region instead of taking the \
+                 columns its candidates need: {frame:?}"
+            );
+        }
+    }
+}
+
+/// The popup keeps its own hint row along its bottom edge.
+#[test]
+fn views_autocomplete_hints_sit_along_the_bottom_of_the_popup() {
+    // Rendered at the width the popup itself asks for, not at an arbitrary one: sizing is part
+    // of the claim, so a test that handed it 60 columns would hide a popup that asks for 30.
+    let mut view = open("/sess");
+    let height = view.height();
+    let width = view
+        .overlay_frame(Rect::new(0, 0, 120, 24))
+        .expect("an open popup wants a frame")
+        .width;
+    let rendered = rows(&render_offscreen(&mut view, width, height).expect("infallible"));
+    let last = rendered.last().expect("the popup drew rows");
+    assert!(
+        last.contains("tab") && last.contains("complete") && last.contains("esc"),
+        "the popup's last row is not its hint row: {rendered:?}"
+    );
+    // The *last* pair spelled in full, which the first assertion does not cover: sized from its
+    // candidates alone the popup came out narrower than its own hints and this row rendered as
+    // `esc dis` on a real 120-column frame. A half-spelled key still reads as a key.
+    assert!(
+        last.contains("dismiss"),
+        "the popup clipped its own hint row: {last:?}"
+    );
+    // And the candidates are all still there, so the hint row was added rather than taken out of
+    // the list — the degradation this could have introduced.
+    let joined = rendered.join("\n");
+    for expected in ["/session", "/new"] {
+        assert!(
+            joined.contains(expected),
+            "the hint row cost the list a candidate ({expected}):\n{joined}"
+        );
+    }
+}
+
+/// A popup narrower than its floor takes the region instead of overflowing it.
+#[test]
+fn views_autocomplete_degrades_rather_than_overflowing_a_narrow_region() {
+    for width in [30u16, 20, 12, 4, 1] {
+        let view = open("/sess");
+        let Some(frame) = view.overlay_frame(Rect::new(0, 0, width, 12)) else {
+            continue;
+        };
+        assert!(
+            frame.width <= width,
+            "at {width} columns the popup asked for {} and would be clipped",
+            frame.width
+        );
+    }
+    // A region with no rows yields no frame rather than a zero-height one, which would be an
+    // invisible layer the renderer still walked.
+    let view = open("/sess");
+    assert_eq!(view.overlay_frame(Rect::new(0, 0, 40, 0)), None);
+}
+
+/// A candidate whose text is CJK is measured in columns, not characters.
+#[test]
+fn views_autocomplete_measures_a_cjk_candidate_in_terminal_columns() {
+    let mut view = AutocompleteView::new(
+        ViewContext::defaults(),
+        // Sixteen characters of description, thirty-two columns of it.
+        Box::new(StaticSource::new().command("session", "切换会话并保留上下文与历史记录")),
+    );
+    view.refresh("/sess", 5);
+    let frame = view
+        .overlay_frame(Rect::new(0, 0, 120, 24))
+        .expect("an open popup wants a frame");
+
+    let display = crate::views::display_width("/session");
+    let description = crate::views::display_width("切换会话并保留上下文与历史记录");
+    assert!(
+        description > "切换会话并保留上下文与历史记录".chars().count(),
+        "the fixture is not wide-character text, so this test proves nothing"
+    );
+    assert!(
+        usize::from(frame.width) >= display + description,
+        "the popup was sized by characters rather than columns, so the row will be clipped: \
+         {} columns for {} of content",
+        frame.width,
+        display + description
+    );
+
+    // And nothing is dropped when it is drawn: the row is one cell per column, so the text is
+    // reassembled from the frame with ratatui's wide-character padding removed.
+    let popup_height = view.height();
+    let rendered = rows(&render_offscreen(&mut view, frame.width, popup_height).expect("ok"));
+    let joined: String = rendered.join("").chars().filter(|c| *c != ' ').collect();
+    assert!(
+        joined.contains("切换会话并保留上下文与历史记录"),
+        "a wide-character description lost characters on the way to the frame: {rendered:?}"
+    );
 }
