@@ -55,7 +55,7 @@ use crate::views::message::{Message, StatusView, TranscriptView};
 use crate::views::permission::typed_character;
 use crate::views::scroll::Scroller;
 use crate::views::slash::{CatalogCommand, HostCommand, SlashRouter, SlashSubmission};
-use crate::views::toast::Toast;
+use crate::views::toast::{Toast, ToastLevel};
 use crossterm::event::{
     Event as CrosstermEvent, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind,
 };
@@ -90,15 +90,40 @@ pub const EDITOR_ALERT_DIALOG_ID: &str = "alert.editor";
 /// Rows reserved for the status strip.
 const STATUS_ROWS: u16 = 1;
 
-/// The prompt's floor, and the share of the screen it may grow to.
+/// The prompt's survival floor, its preferred floor, and the share it may grow to.
 ///
-/// Two rows is what the prompt occupied when its height was fixed, so a single-line
-/// buffer keeps the proportions a user already knows rather than shrinking to one.
-/// The cap is a third because the prompt is only ever half of a conversation: a
-/// pasted diff allowed to take the whole height would evict the transcript it is
-/// about to be sent against, and a prompt the user has to scroll is a smaller loss
-/// than a reply they cannot see at all.
+/// [`PROMPT_MIN_ROWS`] is the absolute floor and stays at two: one row of text plus the
+/// spacer is the least that can be typed into, and it is what a pane too short to afford
+/// anything else gets.
+///
+/// [`PROMPT_PREFERRED_ROWS`] is what the prompt asks for when the pane can pay. Four rows
+/// is three rows of text plus the spacer — the same *band* height the empty prompt occupied
+/// before was two, so a single-line buffer read as a one-line field rather than as a place
+/// to compose a paragraph, which is what was reported twice: once for the empty welcome
+/// screen and once mid-conversation.
+///
+/// **One value for both states, not two.** The welcome screen has no transcript competing
+/// for the region, so a taller floor there costs only hint rows, and a taller floor during
+/// a conversation costs transcript rows — which argues for diverging. It is still one
+/// number, because the prompt would then *shrink by two rows the instant the first message
+/// lands*, while the user is watching the reply they just asked for. That is the same
+/// objection [`WELCOME_TAIL_MAX_ROWS`] records about the prompt's position, applied to its
+/// height: a composer that changes size between an empty and a used session reads as two
+/// different applications.
+///
+/// **Four rather than five, and the arithmetic is the reason.** On a 24-row pane — the
+/// shortest common one — the status strip takes one row and the transcript keeps the rest:
+/// 21 rows at a floor of two, 20 at three, 19 at four, 18 at five. Four spends two of the
+/// user's twenty-one transcript rows; five spends three. Both sit inside the range the
+/// report asked for, and the cheaper one is the one to take.
+///
+/// The cap is a third because the prompt is only ever half of a conversation: a pasted diff
+/// allowed to take the whole height would evict the transcript it is about to be sent
+/// against, and a prompt the user has to scroll is a smaller loss than a reply they cannot
+/// see at all. The preferred floor is granted *through* that cap rather than over it — see
+/// [`prompt_rows`], where that ordering is what keeps the clamp from aborting.
 const PROMPT_MIN_ROWS: u16 = 2;
+const PROMPT_PREFERRED_ROWS: u16 = 4;
 const PROMPT_MAX_SHARE: u16 = 3;
 
 /// The prompt's own chrome: a marker gutter, a right inset and a bottom spacer.
@@ -144,23 +169,82 @@ const PROMPT_PLACEHOLDER: &str = "ask anything, or / for commands";
 /// "truncated" to a reader.
 const SIDEBAR_GAP_COLS: u16 = 1;
 
+/// Rows left below the prompt so the empty state reads as one centred column.
+///
+/// Only ever non-zero while the transcript is empty. The complaint this answers is that the
+/// welcome block is centred in the body region ([`crate::views::welcome::WelcomeView::lines`]
+/// pads above) while the prompt is pinned to the terminal's last row, so the two sat a third
+/// of a screen apart and the input did not read as part of the composition.
+///
+/// A fourth band rather than moving the prompt out of the split: the order
+/// body / status / prompt is what every other assertion about this screen measures from, and
+/// the strip has to stay directly above the prompt it describes. Lifting the pair by a tail
+/// keeps that order and every existing row relationship intact, and reduces to today's exact
+/// layout the moment a message arrives — which is what makes this cost nothing in the state
+/// the user spends their time in.
+///
+/// This is *not* a per-keystroke reflow: the tail is a function of the frame and of whether
+/// the transcript is empty, and typing into the prompt changes neither. `jcode`'s desktop
+/// composer is the reference for the arrangement (`.omo/refs/jcode/crates/jcode-desktop2/
+/// src/layout.rs:306-322`, hero stack immediately above the composer, centred fallback when
+/// the hero does not fit); its rounded border is deliberately **not** taken, for the reason
+/// [`PROMPT_GUTTER_COLS`] already gives.
+fn welcome_tail_rows(empty: bool, height: u16, status: u16, prompt: u16) -> u16 {
+    if !empty {
+        return 0;
+    }
+    let chrome = status.saturating_add(prompt);
+    // The body keeps at least one row: the welcome screen is the thing being centred, and a
+    // tail that consumed the region it is centring would leave the brand nowhere to draw.
+    // At 20x10 this is what holds — `Min(1)` would otherwise be starved by a `Length` tail.
+    let spare = height
+        .saturating_sub(chrome)
+        .saturating_sub(WELCOME_MIN_BODY_ROWS);
+    // Half the slack, so the composite sits on the optical middle: the welcome block already
+    // pads itself above, and giving the tail the other half is what balances the two.
+    (spare / 2).min(WELCOME_TAIL_MAX_ROWS)
+}
+
+/// The rows the body must keep before the welcome tail may take any.
+const WELCOME_MIN_BODY_ROWS: u16 = 1;
+
+/// The most the prompt is ever lifted off the bottom edge.
+///
+/// A cap because the welcome block grows with the terminal but the prompt does not: on a
+/// fifty-row pane an uncapped half-slack tail floats the input a dozen rows above the strip's
+/// usual place, and a prompt that moves that far between an empty and a used session reads as
+/// two different applications.
+const WELCOME_TAIL_MAX_ROWS: u16 = 6;
+
 /// Rows the prompt gets for `content_lines` of typed text on a `height`-row screen.
 ///
 /// One row more than the content so the line the cursor is about to open is already
 /// on screen; below the floor that extra row is what the floor supplies anyway.
 ///
-/// The floor is raised over the cap *before* clamping, and that ordering is the whole
-/// reason this is a function. `height / PROMPT_MAX_SHARE` falls under
-/// `PROMPT_MIN_ROWS` for any viewport shorter than six rows, and `u16::clamp` panics
-/// when its minimum exceeds its maximum — so a naive
-/// `wanted.clamp(PROMPT_MIN_ROWS, height / PROMPT_MAX_SHARE)` aborts the process on a
-/// 20x10 terminal, which is a size a real pane reaches.
+/// # The clamp is provably safe, and that is the whole reason this is a function
+///
+/// `u16::clamp` **panics when its minimum exceeds its maximum**, so both bounds have to be
+/// ordered before they are handed over. Two steps do that, and neither is optional:
+///
+/// 1. `cap` is raised to [`PROMPT_MIN_ROWS`]. `height / PROMPT_MAX_SHARE` is under two for
+///    any viewport shorter than six rows, so without this the 20x10 pane a real terminal
+///    reaches would abort the process.
+/// 2. `floor` is lowered *to* `cap`. [`PROMPT_PREFERRED_ROWS`] is four, which exceeds the
+///    cap on every viewport shorter than twelve rows — so a preferred floor granted *over*
+///    the cap would move the abort from "shorter than six rows" to "shorter than twelve",
+///    a far commoner size. Taking `min(cap)` after step 1 leaves `PROMPT_MIN_ROWS <= floor
+///    <= cap` for every `height`, `u16::MAX` and `0` included.
+///
+/// The consequence is that the preferred floor is *earned*: it arrives at twelve rows and
+/// above, three rows at nine to eleven, and two below that. A prompt is never more than a
+/// third of the screen, whatever it would prefer.
 fn prompt_rows(content_lines: usize, height: u16) -> u16 {
     let wanted = u16::try_from(content_lines)
         .unwrap_or(u16::MAX)
         .saturating_add(1);
     let cap = (height / PROMPT_MAX_SHARE).max(PROMPT_MIN_ROWS);
-    wanted.clamp(PROMPT_MIN_ROWS, cap)
+    let floor = PROMPT_PREFERRED_ROWS.min(cap);
+    wanted.clamp(floor, cap)
 }
 
 /// The prompt band carved into a gutter, the buffer's own area, and the spacer below.
@@ -214,6 +298,19 @@ pub struct SessionScreen {
     prompts: Option<mpsc::Sender<PromptSubmission>>,
     mcp_toggles: Option<mpsc::Sender<crate::views::picker::McpToggleRequest>>,
     mcp: crate::views::picker::McpProjection,
+    /// The MCP generation this screen last painted.
+    ///
+    /// The MCP list and the sidebar both re-read [`Self::mcp`] while they draw, so they
+    /// cannot disagree *within* a frame. What they could do — and did — is share one stale
+    /// frame: the lifecycle worker publishes a state change and nudges the loop with a
+    /// [`TerminalEvent::Wake`], and a wake repaints only if some component reports
+    /// `redraw`. Nothing did, so a `◐ Connecting` row survived the connection's own
+    /// 30-second timeout on both surfaces at once.
+    ///
+    /// One counter compared here is the whole report. Pushing the news into the dialog
+    /// instead would need the push to find every open surface, and the surface a push
+    /// forgets is precisely the one that goes stale.
+    mcp_generation: u64,
     /// The non-MCP halves of `§8.7`'s status census, resolved once by the host.
     ///
     /// MCP is deliberately *not* stored here: it is live, and `status_panel` reads it from
@@ -384,6 +481,7 @@ impl SessionScreen {
             prompts: None,
             mcp_toggles: None,
             mcp: crate::views::picker::McpProjection::default(),
+            mcp_generation: 0,
             census: Vec::new(),
             debug: crate::views::diagnostics::DebugFacts::default(),
             cancels: None,
@@ -484,6 +582,7 @@ impl SessionScreen {
         projection: crate::views::picker::McpProjection,
         toggles: mpsc::Sender<crate::views::picker::McpToggleRequest>,
     ) -> Self {
+        self.mcp_generation = projection.generation();
         self.mcp = projection;
         self.mcp_toggles = Some(toggles);
         self
@@ -935,17 +1034,27 @@ impl SessionScreen {
     /// [`Clipboard::read`]'s deliberate error worth returning: the binding used to fall
     /// into a bare redraw, so pressing it did nothing and said nothing.
     fn paste_from_clipboard(&mut self) -> EventResult {
-        let notice = match self.clipboard.read() {
-            Ok(Some(content)) if content.is_image() => String::from(
-                "the clipboard holds an image; pasting an attachment is not supported yet",
+        // The three outcomes are not one grade: an unsupported kind and an empty clipboard
+        // are refusals the user can act on, while a clipboard that errored is a failure —
+        // `§11.5` gives those different colours, and the copy path beside this one already
+        // makes exactly that distinction with its toasts.
+        let (level, notice) = match self.clipboard.read() {
+            Ok(Some(content)) if content.is_image() => (
+                ToastLevel::Warning,
+                String::from(
+                    "the clipboard holds an image; pasting an attachment is not supported yet",
+                ),
             ),
             Ok(Some(content)) => return self.paste(&content.data),
-            Ok(None) => String::from("nothing to paste: the clipboard is empty"),
-            Err(error) => format!("paste failed: {error}"),
+            Ok(None) => (
+                ToastLevel::Warning,
+                String::from("nothing to paste: the clipboard is empty"),
+            ),
+            Err(error) => (ToastLevel::Error, format!("paste failed: {error}")),
         };
         self.transcript
             .transcript_mut()
-            .push(Message::notice(notice));
+            .push(Message::noticed(level, notice));
         EventResult::REDRAW
     }
 
@@ -989,16 +1098,26 @@ impl SessionScreen {
 
 impl Component for SessionScreen {
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        self.sidebar.ambient_mut().mcp = self
-            .mcp
-            .snapshot()
+        // Recorded with the servers it belongs to, so the generation this frame claims to
+        // have painted is the generation it did paint. See `Self::mcp_generation`.
+        let (generation, servers) = self.mcp.observe();
+        self.mcp_generation = generation;
+        self.sidebar.ambient_mut().mcp = servers
             .iter()
             .map(crate::views::picker::McpServer::service)
             .collect();
-        let [body, status, prompt] = Layout::vertical([
+        let empty = self.transcript.transcript().messages().is_empty();
+        let prompt_band = prompt_rows(self.editor.height(), area.height);
+        let [body, status, prompt, _tail] = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(STATUS_ROWS),
-            Constraint::Length(prompt_rows(self.editor.height(), area.height)),
+            Constraint::Length(prompt_band),
+            Constraint::Length(welcome_tail_rows(
+                empty,
+                area.height,
+                STATUS_ROWS,
+                prompt_band,
+            )),
         ])
         .areas(area);
 
@@ -1023,7 +1142,7 @@ impl Component for SessionScreen {
         // The transcript owns this region as soon as there is anything to show, so the
         // welcome screen can never hide content — it only fills rows that would
         // otherwise be blank.
-        if self.transcript.transcript().messages().is_empty() {
+        if empty {
             self.welcome.render(frame, main);
         } else {
             self.transcript.render(frame, main);
@@ -1037,6 +1156,11 @@ impl Component for SessionScreen {
             ambient.tokens = self.transcript.transcript().tokens();
             ambient.context_used = self.transcript.transcript().context_used();
             self.sidebar.render(frame, aside);
+        } else {
+            // The panel's click targets are frame geometry, so the frame that stops drawing
+            // it is the frame that has to retract them — otherwise the sidebar toggle hides
+            // the panel and its old rows keep swallowing clicks on the transcript beneath.
+            self.sidebar.forget_hit_targets();
         }
 
         self.status.render(frame, status);
@@ -1049,14 +1173,10 @@ impl Component for SessionScreen {
                 .render(frame, gutter);
         }
         self.editor.render(frame, buffer);
-        if self.autocomplete.is_open() {
-            let height = self.autocomplete.height().min(main.height);
-            let overlay = Rect::new(
-                main.x,
-                main.y + main.height.saturating_sub(height),
-                main.width,
-                height,
-            );
+        // Last, and over `main` rather than inside the split above: the popup is a floating
+        // layer, so opening it cannot reflow the transcript. It owns its own geometry —
+        // see `AutocompleteView::overlay_frame`.
+        if let Some(overlay) = self.autocomplete.overlay_frame(main) {
             self.autocomplete.render(frame, overlay);
         }
     }
@@ -1086,7 +1206,7 @@ impl Component for SessionScreen {
         // comment: an event that skips it can be the last event the loop ever sees.
         let wheel = match event {
             AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Mouse(mouse))) => {
-                self.handle_wheel(mouse, self.now_ms())
+                self.handle_mouse(mouse, self.now_ms())
             }
             _ => EventResult::IGNORED,
         };
@@ -1095,6 +1215,7 @@ impl Component for SessionScreen {
         // verdict the user is waiting for sitting in a channel forever.
         self.observe_edits(event);
         wheel
+            .merge(self.observe_mcp())
             .merge(self.drain_editor_results())
             .merge(self.drain_reports())
             .merge(self.transcript.handle_event(event))
@@ -1103,6 +1224,29 @@ impl Component for SessionScreen {
 }
 
 impl SessionScreen {
+    /// Report whether the MCP projection moved since this screen last painted.
+    ///
+    /// The only thing that turns a lifecycle change into a frame. The worker's
+    /// [`TerminalEvent::Wake`] reaches [`Component::handle_event`] on every surface and is
+    /// claimed by none of them, so before this a server's transition from `Connecting` to
+    /// a 30-second timeout changed the shared projection and changed nothing on the
+    /// terminal — the open MCP list *and* the sidebar both kept showing the previous
+    /// frame's bytes.
+    ///
+    /// Not `REDRAW` unconditionally: the worker republishes on a broadcast lag and after
+    /// every completed toggle, and a frame per republication would repaint identical rows
+    /// on a screen the redraw scheduler is otherwise allowed to leave alone.
+    /// Read-only on purpose: the generation is recorded by [`Component::render`], the one
+    /// place that actually paints. A reader that recorded here would mark the change seen
+    /// on an event whose frame the app then declined to draw — a suspended terminal holding
+    /// a plugin's lease is exactly that case — and the repaint would be owed and forgotten.
+    fn observe_mcp(&self) -> EventResult {
+        if self.mcp.generation() == self.mcp_generation {
+            return EventResult::IGNORED;
+        }
+        EventResult::REDRAW
+    }
+
     fn mark_turn_accepted(&mut self) {
         self.cancel_requested = false;
         self.status.mark_running();
@@ -1113,24 +1257,60 @@ impl SessionScreen {
         u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
-    /// Scroll the transcript by one wheel notch observed at `now_ms`.
+    /// Act on one mouse event observed at `now_ms`.
     ///
-    /// Wheel input only. The `messages_*` actions in [`Self::handle_view_action`] keep
-    /// moving whole rows, unaccelerated, because a line the user asked for by name must
-    /// not become four just because they pressed the key quickly — acceleration is a
-    /// property of a continuous gesture, not of a deliberate step.
+    /// The single `MouseEventKind` match on this screen, and it has to stay single:
+    /// `app::is_consumable_mouse` filters the same set *before* the bounded channel so an
+    /// unconsumed event cannot delay a keystroke, and
+    /// `app_the_input_filter_forwards_exactly_what_a_screen_consumes` scans this function's
+    /// body to prove the two lists agree. An arm added in a sibling method would be a kind
+    /// the filter still drops, so the arm could never run.
+    ///
+    /// `Down(Left)` is a press, not a drag: `?1000` reports button presses and releases
+    /// only, and `?1002`/`?1003` were removed deliberately once measured — motion reporting
+    /// cost keystroke latency for a consumer that did not exist. A section header needs one
+    /// press, so nothing here asks for them back.
+    fn handle_mouse(&mut self, mouse: &MouseEvent, now_ms: u64) -> EventResult {
+        let notches = match mouse.kind {
+            MouseEventKind::ScrollUp => -1.0,
+            MouseEventKind::ScrollDown => 1.0,
+            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                return self.handle_click(mouse.column, mouse.row);
+            }
+            // Horizontal wheels, other buttons and drags: the transcript has one axis, and a
+            // screen that claimed the rest would stop a later surface from seeing them.
+            _ => return EventResult::IGNORED,
+        };
+        self.scroll_transcript(notches, now_ms)
+    }
+
+    /// Give a press to whichever surface owns the cell under it.
+    ///
+    /// Hit-tested against the geometry of the frame that **was drawn**, which the sidebar
+    /// records while it paints. Deriving it there rather than here is the point: this method
+    /// has no `Rect`, and a copy kept on this screen would need re-deriving on every resize
+    /// and every sidebar toggle — the update that is forgotten is the one that makes a click
+    /// land on a row that has moved.
+    fn handle_click(&mut self, column: u16, row: u16) -> EventResult {
+        if self.sidebar.click(column, row) {
+            return EventResult::REDRAW;
+        }
+        // Unhandled rather than swallowed: the transcript and the prompt do not act on a
+        // press yet, and claiming it here would silently forbid one that later does.
+        EventResult::IGNORED
+    }
+
+    /// Scroll the transcript by `notches` observed at `now_ms`.
+    ///
+    /// The `messages_*` actions in [`Self::handle_view_action`] keep moving whole rows,
+    /// unaccelerated, because a line the user asked for by name must not become four just
+    /// because they pressed the key quickly — acceleration is a property of a continuous
+    /// gesture, not of a deliberate step.
     ///
     /// No hit-testing against the pointer's position: the transcript is the only
     /// scrollable region on this screen, so a notch anywhere means the transcript, the
     /// same way `messages_line_up` does not care where the pointer is.
-    fn handle_wheel(&mut self, mouse: &MouseEvent, now_ms: u64) -> EventResult {
-        let notches = match mouse.kind {
-            MouseEventKind::ScrollUp => -1.0,
-            MouseEventKind::ScrollDown => 1.0,
-            // Horizontal wheels, buttons and drags: the transcript has one axis, and a
-            // screen that claimed the rest would stop a later surface from seeing them.
-            _ => return EventResult::IGNORED,
-        };
+    fn scroll_transcript(&mut self, notches: f64, now_ms: u64) -> EventResult {
         // Re-stated per notch from the transcript, which measured all three on its last
         // render and is the only thing that owns them. This is what keeps the wheel from
         // drifting away from the view while a live turn grows the content underneath it.
@@ -1462,7 +1642,10 @@ impl SessionScreen {
         {
             self.cancel_requested = true;
             self.cancellations += 1;
-            self.transcript.transcript_mut().push(Message::notice(
+            // `Info`: the cancel was accepted and is under way. Nothing was refused, so the
+            // warning colour would claim the keypress had failed.
+            self.transcript.transcript_mut().push(Message::noticed(
+                ToastLevel::Info,
                 "cancelling the turn; press the same key again to exit",
             ));
             return EventResult::REDRAW;
@@ -1484,14 +1667,12 @@ impl SessionScreen {
             crate::views::picker::MODEL_DIALOG_ID => {
                 self.catalog.model = Some(value.to_owned());
                 self.status.set_configured_model(value);
-                self.welcome.facts_mut().model = Some(value.to_owned());
                 self.sidebar.ambient_mut().model = Some(value.to_owned());
                 Selection::Model(value.to_owned())
             }
             crate::views::picker::AGENT_DIALOG_ID => {
                 self.catalog.agent = Some(value.to_owned());
                 self.status.set_configured_agent(value);
-                self.welcome.facts_mut().agent = Some(value.to_owned());
                 self.sidebar.ambient_mut().agent = Some(value.to_owned());
                 Selection::Agent(value.to_owned())
             }
@@ -1509,9 +1690,10 @@ impl SessionScreen {
                 // The resolved name, not `value`: a theme that fell back is showing the
                 // fallback, and the notice should say what the user is looking at.
                 let name = self.context.theme().name.clone();
-                self.transcript
-                    .transcript_mut()
-                    .push(Message::notice(format!("theme set to {name}")));
+                self.transcript.transcript_mut().push(Message::noticed(
+                    ToastLevel::Success,
+                    format!("theme set to {name}"),
+                ));
                 return EventResult::REDRAW;
             }
             // The palette resolves to *another action's name*, so it re-enters the same
@@ -1520,17 +1702,20 @@ impl SessionScreen {
             // palette is excluded from what it can dispatch.
             crate::views::palette::DIALOG_ID => return self.dispatch_action(value),
             SKILL_DIALOG_ID => {
-                self.transcript
-                    .transcript_mut()
-                    .push(Message::notice(format!(
-                        "skill `{value}` — name it in a prompt to invoke it"
-                    )));
+                // `Info`: nothing was refused and nothing succeeded — the picker exists to
+                // report the name, and this states it.
+                self.transcript.transcript_mut().push(Message::noticed(
+                    ToastLevel::Info,
+                    format!("skill `{value}` — name it in a prompt to invoke it"),
+                ));
                 return EventResult::REDRAW;
             }
             _ => return EventResult::IGNORED,
         };
-        let (text, _delivered) = self.commit_selection(selection);
-        self.transcript.transcript_mut().push(Message::notice(text));
+        let (text, level) = self.commit_selection(selection);
+        self.transcript
+            .transcript_mut()
+            .push(Message::noticed(level, text));
         EventResult::REDRAW
     }
 
@@ -1538,9 +1723,16 @@ impl SessionScreen {
     ///
     /// Split out of [`Self::adopt`] so the cycling keys can reuse the *delivery* while
     /// reporting on a different surface. Both callers must keep the refusal branch, which is
-    /// the whole reason the boolean comes back: a selection that reached nothing and said so
+    /// the whole reason the level comes back: a selection that reached nothing and said so
     /// nowhere is the defect class the sink was made fallible to expose.
-    fn commit_selection(&mut self, selection: Selection) -> (String, bool) {
+    ///
+    /// A [`ToastLevel`] rather than the `bool` this returned before, because the two callers
+    /// render on different surfaces — a toast and a transcript notice — and each was mapping
+    /// the boolean itself. One of them got it wrong: the picker's notice was drawn at warning
+    /// grade whether the selection was delivered or refused, so a model switch that worked
+    /// was announced with the same `!` as one that had not. Returning the level is what makes
+    /// the two surfaces agree by construction.
+    fn commit_selection(&mut self, selection: Selection) -> (String, ToastLevel) {
         let notice = match &selection {
             Selection::Model(model) => format!("model set to {model} for the next turn"),
             Selection::Agent(agent) => format!("agent set to {agent} for the next turn"),
@@ -1551,15 +1743,17 @@ impl SessionScreen {
             .selections
             .as_ref()
             .is_some_and(|sink| sink.try_send(selection).is_ok());
-        let text = if delivered {
-            notice
+        if delivered {
+            (notice, ToastLevel::Success)
         } else {
             // A refused sink is reported rather than swallowed. The alternative is the
             // defect this whole change is about: a picker that appears to work, a
             // selection that reached nothing, and no way for the user to tell.
-            format!("{notice} (not applied: nothing is listening)")
-        };
-        (text, delivered)
+            (
+                format!("{notice} (not applied: nothing is listening)"),
+                ToastLevel::Warning,
+            )
+        }
     }
 
     /// Move to the agent `step` places along the catalog, wrapping at both ends.
@@ -1618,14 +1812,9 @@ impl SessionScreen {
         let name = names[next].clone();
         self.catalog.agent = Some(name.clone());
         self.status.set_configured_agent(&name);
-        self.welcome.facts_mut().agent = Some(name.clone());
         self.sidebar.ambient_mut().agent = Some(name.clone());
-        let (text, delivered) = self.commit_selection(Selection::Agent(name));
-        self.toasts.push(if delivered {
-            Toast::success(text)
-        } else {
-            Toast::warning(text)
-        });
+        let (text, level) = self.commit_selection(Selection::Agent(name));
+        self.toasts.push(Toast::new(level, text));
         EventResult::REDRAW
     }
 }

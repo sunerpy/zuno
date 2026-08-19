@@ -513,9 +513,37 @@ impl DialogHost {
             ..footer_area
         };
         fill(frame.buffer_mut(), footer, self.context.element());
+        // Whole pairs, and the last one that does not fit ends the row rather than being cut
+        // through. `Paragraph` clips at the column, which spelled `esc cancel` as `es` — and a
+        // key spelled halfway still reads as a key, so the footer was naming a chord that does
+        // not exist. Dropping the pair says less; it does not say something false. Same
+        // degradation order as `§7.1` and the same call `WhichKeyView` makes on its last cell.
+        //
+        // Reachable at two of the widths this crate is accepted at: the shipped four-hint
+        // footer is 51 columns against the 34 a 40-column terminal leaves, and a fifth hint
+        // puts it past the 54 a 60-column terminal leaves.
         let mut spans = Vec::new();
+        let mut used = 0_usize;
         for (key, label) in hints {
-            spans.extend(hint(key, label, &self.context));
+            let pair = hint(key, label, &self.context);
+            let cost = pair
+                .iter()
+                .map(|span| crate::views::display_width(&span.content))
+                .sum::<usize>();
+            // The pair's *trailing separator* is excluded from the fit test, because it is
+            // spacing before the next pair rather than part of this one. The shipped
+            // three-hint footer is 35 columns against the 34 a 40-column terminal leaves, and
+            // the single overflowing column is that trailing space — so a test on the whole
+            // cost would drop `esc cancel` from a row it has always fitted in.
+            let separator = pair
+                .last()
+                .filter(|span| span.content.trim().is_empty())
+                .map_or(0, |span| crate::views::display_width(&span.content));
+            if used + cost - separator > usize::from(inner_width) {
+                break;
+            }
+            used += cost;
+            spans.extend(pair);
         }
         Paragraph::new(vec![Line::from(spans)])
             .style(self.context.element())

@@ -19,6 +19,32 @@
 //! A welcome screen that had to be closed would be noise on the second launch; one
 //! that occupies only space nothing else wants cannot be.
 //!
+//! # A row is earned by being the only place a fact appears
+//!
+//! Occupying space nothing else wants is not a licence to say things twice. Measured at
+//! 120×34, the first draft spent twenty-two rows and stated the agent and model
+//! **verbatim** on the row the status strip below already carried, the branch three times
+//! over (here, the strip's trailer, and the sidebar's footer), and a tagline that named no
+//! fact at all — and at forty columns that tagline, the census and the tip were each cut
+//! mid-word, so the rows that duplicated the most were also the ones that read as broken.
+//!
+//! The rule the surviving rows are chosen by is *whether the fact survives without them*,
+//! and the answer differs per carrier because both other carriers degrade:
+//!
+//! * [`crate::views::message::StatusView`] never drops its left-hand `state()` — agent,
+//!   model and turn state are padded or clipped, never omitted — so those are stated
+//!   **only** there. That is the one cut that costs nothing at any width.
+//! * The strip *does* drop its `trailers()` front-first, and the branch is the first to
+//!   go: at forty columns the strip carries neither branch nor exit key. So the branch
+//!   stays here, priced at zero extra rows by sharing the directory's row.
+//! * The sidebar is not drawn at all below [`crate::views::SIDEBAR_MIN_WIDTH`], so
+//!   everything it alone would carry — the directory, the version, the census — stays
+//!   here too, and is accepted as duplicated at 120 columns rather than absent at 80.
+//!
+//! Of the four references, `codex` states its model and directory and nothing else,
+//! `jcode` draws no welcome at all on an authenticated session, and `claw-code` spends
+//! sixteen rows. Eighteen is inside that band; twenty-two was above all of it.
+//!
 //! # `/` is taught first, and a key is only spelled when nothing else can teach it
 //!
 //! The measured complaint about the first draft of this grid was not that it lied — it
@@ -106,15 +132,22 @@ pub const WORDMARK_MIN_WIDTH: u16 = WORDMARK_WIDTH + 4;
 
 /// The shortest terminal that still gets the wordmark.
 ///
-/// Six wordmark rows plus the facts, a tip and one hint row is sixteen; below twenty
-/// the brand would crowd out the information it exists to introduce.
+/// Six wordmark rows plus two fact rows, the lead line, a tip and one hint row is
+/// fourteen; below twenty the brand would crowd out the information it exists to
+/// introduce.
 pub const WORDMARK_MIN_HEIGHT: u16 = 20;
 
 /// The one-row brand used when the wordmark does not fit.
 pub const COMPACT_BRAND: &str = "▌ ZUNO";
 
-/// The one-line description under the brand.
-pub const TAGLINE: &str = "a coding agent that lives in your terminal";
+/// What separates two facts sharing the census row.
+///
+/// Tight, where the location row spaces its branch glyph out. Five facts share this row
+/// and the wide `   ·   ` form spent twenty-eight of its columns on air — enough that at
+/// forty columns the row was cut mid-count. It is the same reason
+/// [`crate::views::message::TokenUsage::compact`] writes `↑3,000` rather than spelling
+/// the count out: a row carrying several facts compacts, a row owning one does not.
+const CENSUS_GAP: &str = " · ";
 
 /// The rotating hints shown one at a time under the brand.
 ///
@@ -197,15 +230,22 @@ pub const SLASH_HINTS: [SlashHint; 6] = [
 /// most. An absent fact is omitted rather than shown as a placeholder: `unknown` in
 /// the model row would be indistinguishable from a model actually called `unknown`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// There is deliberately **no agent or model field**. Both are on
+/// [`crate::views::message::StatusView`], whose left-hand group is never dropped at any
+/// width, and this screen carried them verbatim on the row directly above it. The fields
+/// are gone rather than merely unrendered so that the three call sites which used to
+/// write the same value to the strip, the sidebar and here cannot quietly restore the
+/// repeat.
 pub struct WelcomeFacts {
     /// The working directory, already abbreviated for display.
     pub directory: Option<String>,
     /// The version-control branch, when the directory is a checkout.
+    ///
+    /// Kept even though the strip and the sidebar both name it, because neither keeps it
+    /// at every width: the sidebar is absent below [`crate::views::SIDEBAR_MIN_WIDTH`]
+    /// and the branch is the *first* trailer the strip drops, so at forty columns this is
+    /// the only carrier left. It shares the directory's row, so the cost is zero rows.
     pub branch: Option<String>,
-    /// `provider/model`, as the plan resolved it.
-    pub model: Option<String>,
-    /// The agent that will answer.
-    pub agent: Option<String>,
     /// The build's version string.
     pub version: Option<String>,
     /// How many tools the session offers.
@@ -230,25 +270,29 @@ impl WelcomeFacts {
         }
     }
 
-    /// The `agent · model` row, when either is known.
-    #[must_use]
-    pub fn engine(&self) -> Option<String> {
-        match (&self.agent, &self.model) {
-            (Some(agent), Some(model)) => Some(format!("{agent}   ·   {model}")),
-            (Some(agent), None) => Some(agent.clone()),
-            (None, Some(model)) => Some(model.clone()),
-            (None, None) => None,
-        }
-    }
-
-    /// The capability census, e.g. `13 tools · 2 mcp · 1 lsp · 25 skills`.
+    /// What this build is and what it brought, e.g. `zuno 0.1.0 · 13 tools · 2 mcp`.
     ///
-    /// A zero count is shown rather than dropped: `0 mcp` is precisely the fact a user
-    /// chasing a missing MCP tool needs, and omitting the row would read as
-    /// "not measured".
+    /// The version leads its own row rather than owning one. Both halves are read-once
+    /// static facts — a user checks them and then stops looking — so the split into
+    /// `zuno 0.1.0` above `13 tools · …` spent a row separating two things nobody reads
+    /// separately. `codex` puts its version on the wordmark line for the same reason; ours
+    /// is block glyphs and cannot carry text, so the census row is where it goes.
+    ///
+    /// A zero count is still shown rather than dropped: `0 mcp` is precisely the fact a
+    /// user chasing a missing MCP tool needs, and omitting it would read as "not
+    /// measured".
+    ///
+    /// **Segments are dropped from the end, never cut through.** That is the whole reason
+    /// this takes a width. At forty columns the old pair of rows rendered
+    /// `13 tools   ·   2 mcp   ·   1 lsp   ·   0` — a count severed from its noun, which a
+    /// reader cannot tell from a smaller number. Whole facts or nothing, which is the rule
+    /// [`crate::views::message::StatusView::line`] already applies to its own trailers.
     #[must_use]
-    pub fn inventory(&self) -> Option<String> {
-        let parts = [
+    pub fn census(&self, width: u16) -> Option<String> {
+        let segments = [
+            self.version
+                .as_ref()
+                .map(|version| format!("zuno {version}")),
             self.tools.map(|count| format!("{count} tools")),
             self.mcp.map(|count| format!("{count} mcp")),
             self.lsp.map(|count| format!("{count} lsp")),
@@ -257,10 +301,20 @@ impl WelcomeFacts {
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
-        if parts.is_empty() {
-            return None;
-        }
-        Some(parts.join("   ·   "))
+        let first = segments.first()?.clone();
+        // Terminal columns, not `chars().count()`: a CJK skill count or a version string
+        // carrying a wide glyph is otherwise under-measured by one column per glyph, and
+        // the row overflows the frame — a mistake this crate has already made and now
+        // measures for.
+        (1..=segments.len())
+            .rev()
+            .map(|kept| segments[..kept].join(CENSUS_GAP))
+            .find(|row| display_width(row) <= usize::from(width))
+            // Even one segment can exceed a very narrow frame. Returning it anyway keeps
+            // the row present and lets the paragraph clip it, which is what every other
+            // row on this screen does; returning `None` would make the census vanish
+            // entirely at the widths where the terminal is least self-explanatory.
+            .or(Some(first))
     }
 }
 
@@ -281,8 +335,6 @@ impl WelcomeView {
             facts: WelcomeFacts {
                 directory: None,
                 branch: None,
-                model: None,
-                agent: None,
                 version: None,
                 tools: None,
                 mcp: None,
@@ -585,25 +637,16 @@ impl WelcomeView {
             for row in WORDMARK {
                 body.push(self.wordmark_row(row, indent));
             }
-            body.push(padded("", width, self.context.surface()));
-            body.push(self.centred(TAGLINE, width, self.context.muted()));
         } else {
             body.push(self.centred(COMPACT_BRAND, width, self.brand()));
-            body.push(self.centred(TAGLINE, width, self.context.muted()));
         }
 
         let mut facts = Vec::new();
         if let Some(location) = self.facts.location() {
             facts.push((location, self.context.text()));
         }
-        if let Some(engine) = self.facts.engine() {
-            facts.push((engine, self.context.accent()));
-        }
-        if let Some(inventory) = self.facts.inventory() {
-            facts.push((inventory, self.context.muted()));
-        }
-        if let Some(version) = self.facts.version.clone() {
-            facts.push((format!("zuno {version}"), self.context.muted()));
+        if let Some(census) = self.facts.census(width) {
+            facts.push((census, self.context.muted()));
         }
         if !facts.is_empty() {
             body.push(padded("", width, self.context.surface()));

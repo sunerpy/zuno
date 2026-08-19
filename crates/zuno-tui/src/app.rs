@@ -327,9 +327,9 @@ impl CrosstermLifecycle {
 ///
 /// That command requests five DEC private modes, two of which are `?1002` (report motion
 /// while a button is held) and `?1003` (report **every** pointer motion). The only mouse
-/// consumer in this binary is `SessionScreen::handle_wheel`, which acts on `ScrollUp` and
-/// `ScrollDown` and returns `IGNORED` for buttons, drags and motion. So those two modes
-/// ask the terminal to send a packet per pointer pixel that nothing will ever read.
+/// consumer in this binary is `SessionScreen::handle_mouse`, which acts on `ScrollUp`,
+/// `ScrollDown` and a left press, and returns `IGNORED` for drags and motion. So those two
+/// modes ask the terminal to send a packet per pointer pixel that nothing will ever read.
 ///
 /// The cost is not hypothetical, and it is not merely CPU. Each arriving event is two
 /// `spawn_blocking` round trips in [`forward_terminal_input_from`] — one to poll, one to
@@ -381,14 +381,21 @@ impl crossterm::Command for NarrowMouseRelease {
 /// Whether the application has any consumer for this mouse event.
 ///
 /// The allow-list is deliberately narrow and deliberately duplicated from
-/// `SessionScreen::handle_wheel`'s own match; `app_the_input_filter_forwards_exactly_what_a_screen_consumes`
+/// `SessionScreen::handle_mouse`'s own match; `app_the_input_filter_forwards_exactly_what_a_screen_consumes`
 /// scans that function's source and fails if the two stop agreeing. Dropping here rather
 /// than in the screen is what keeps an unconsumed event out of the bounded channel, where
 /// it would otherwise delay a keystroke.
+///
+/// A left press is forwarded because the ambient panel's section headings draw a disclosure
+/// triangle and a click is how one is actuated. The matching *release* is still dropped: a
+/// toggle needs one event, and forwarding both would double the channel cost of every
+/// click for a consumer that does not exist.
 const fn is_consumable_mouse(kind: crossterm::event::MouseEventKind) -> bool {
     matches!(
         kind,
-        crossterm::event::MouseEventKind::ScrollUp | crossterm::event::MouseEventKind::ScrollDown
+        crossterm::event::MouseEventKind::ScrollUp
+            | crossterm::event::MouseEventKind::ScrollDown
+            | crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
     )
 }
 

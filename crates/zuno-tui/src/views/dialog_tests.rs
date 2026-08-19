@@ -1172,3 +1172,48 @@ fn views_dialog_every_action_a_base_form_consumes_resolves_while_it_is_open() {
     );
     assert!(offences.is_empty(), "{}", offences.join("\n"));
 }
+
+/// No dialog footer ever spells a key halfway, at any accepted width.
+///
+/// The footer used to be clipped by `Paragraph` at the column, so `esc cancel` rendered as `es`
+/// — a footer naming a chord that does not exist. Reachable on the shipped four-hint footer at
+/// 40 columns, and on a five-hint one at 60.
+#[test]
+fn a_dialog_footer_drops_a_hint_rather_than_spelling_one_halfway() {
+    for width in [200u16, 120, 80, 60, 40] {
+        let dialog = crate::views::picker::model_picker(
+            ViewContext::defaults(),
+            vec![crate::views::picker::ModelEntry {
+                id: String::from("p/m"),
+                name: String::from("m"),
+                provider: String::from("p"),
+            }],
+        );
+        let hints = dialog.hints();
+        let (mut screen, _context) = host();
+        screen.open(Box::new(dialog));
+        let rendered = rows(&render_offscreen(&mut screen, width, 16).expect("infallible"));
+        let footer = rendered
+            .iter()
+            .find(|row| row.contains("move"))
+            .unwrap_or_else(|| panic!("at {width} columns no footer row was drawn: {rendered:?}"));
+
+        // Every label present is present in full. A partial spelling is what this guards, so the
+        // claim is per label rather than about the row's total width — a width assertion would
+        // pass on a row that fit by cutting a word.
+        for (key, label) in hints {
+            if !footer.contains(key) {
+                continue;
+            }
+            assert!(
+                footer.contains(label),
+                "at {width} columns the footer shows `{key}` without its `{label}`: {footer:?}"
+            );
+        }
+        // And something always survives, or the footer would be a blank row claiming nothing.
+        assert!(
+            footer.contains("move"),
+            "at {width} columns the footer dropped every hint: {footer:?}"
+        );
+    }
+}

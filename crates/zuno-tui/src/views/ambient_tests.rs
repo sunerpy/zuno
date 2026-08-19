@@ -225,6 +225,182 @@ fn views_sidebar_toggle_mcp_is_independent_of_the_other_sections() {
     assert!(view.expanded().lsp, "toggling MCP closed the LSP section");
 }
 
+/// The row each section's heading was drawn on, measured out of the frame.
+///
+/// Read from the rendered rows rather than from `rows()`'s own header indices, because the
+/// indices are what the hit map is built from — locating the row that way would make every
+/// assertion below true by construction, including under an implementation that recorded
+/// the wrong `y`. The label is the anchor and it is unconditional: `heading` always emits
+/// `{glyph} {label}`, so unlike the status strip's state word this text cannot degrade away.
+fn heading_rows(view: &mut SidebarView, width: u16, height: u16) -> Vec<(u16, String)> {
+    rows(&render_offscreen(view, width, height).expect("infallible"))
+        .into_iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            ["LSP", "MCP", "Skills"]
+                .iter()
+                .any(|label| row.contains(label))
+        })
+        .map(|(index, row)| {
+            (
+                u16::try_from(index).expect("a frame is under 65536 rows"),
+                row,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn views_sidebar_a_click_on_each_section_heading_toggles_that_section_and_only_it() {
+    // The defect: the headings have drawn a disclosure triangle since the panel was written
+    // and no mouse event reached this file at all, so the one advertised interaction did
+    // nothing. `▾` that does not answer a click is worse than no `▾` — it invites a gesture
+    // and reports nothing.
+    //
+    // Every heading in one test, driven off the rows actually painted, because the hazard is
+    // per-section: an off-by-one in the recorded `y` toggles the section above or below the
+    // one aimed at, which a single-section test on the first heading cannot see.
+    let mut view = view();
+    let headings = heading_rows(&mut view, SIDEBAR_WIDTH, 40);
+    assert_eq!(
+        headings.len(),
+        3,
+        "the frame does not show three section headings, so the coordinates below are \
+         guesses: {headings:?}"
+    );
+
+    for (row, label) in headings {
+        let before = view.expanded();
+        assert!(
+            view.click(0, row),
+            "a click on the {label:?} heading at row {row} was not claimed"
+        );
+        let after = view.expanded();
+        let flipped = [
+            (before.lsp != after.lsp, "LSP"),
+            (before.mcp != after.mcp, "MCP"),
+            (before.skills != after.skills, "Skills"),
+        ];
+        let changed: Vec<&str> = flipped
+            .iter()
+            .filter(|(changed, _)| *changed)
+            .map(|(_, name)| *name)
+            .collect();
+        assert_eq!(
+            changed.len(),
+            1,
+            "a click on {label:?} changed {changed:?} rather than exactly one section"
+        );
+        assert!(
+            label.contains(changed[0]),
+            "a click on the {label:?} row toggled {} instead, so the recorded rows are off \
+             by one section",
+            changed[0]
+        );
+        // Put it back, so the next heading is tested against the layout this frame drew
+        // rather than against one a previous collapse shifted upwards.
+        view.click(0, row);
+    }
+}
+
+#[test]
+fn views_sidebar_a_click_away_from_a_heading_changes_nothing_and_is_not_claimed() {
+    let mut view = view();
+    let headings: Vec<u16> = heading_rows(&mut view, SIDEBAR_WIDTH, 40)
+        .into_iter()
+        .map(|(row, _)| row)
+        .collect();
+    let before = view.expanded();
+
+    // Every row of the frame that is not a heading, rather than one hand-picked coordinate:
+    // a hit map recorded with the wrong height — a `Rect` spanning to the panel's bottom
+    // instead of one row — passes any single-point test that happens to miss.
+    for row in 0..40 {
+        if headings.contains(&row) {
+            continue;
+        }
+        assert!(
+            !view.click(0, row),
+            "row {row} is not a heading but claimed the click"
+        );
+    }
+    // A column past the panel's right edge, which is where the transcript lives when this
+    // panel is drawn beside one.
+    assert!(!view.click(SIDEBAR_WIDTH + 5, headings[0]));
+    assert_eq!(
+        before,
+        view.expanded(),
+        "a click that hit no heading still changed a section"
+    );
+}
+
+#[test]
+fn views_sidebar_advertises_no_disclosure_triangle_when_the_mouse_is_switched_off() {
+    // A click is the only way to actuate a section, so with `mouse = false` the triangle
+    // advertises a gesture the build has switched off. It is withdrawn rather than left
+    // drawn-but-dead, which is the same call `StatusView` makes about a key it cannot spell.
+    //
+    // Both halves are asserted. Without the second, an implementation that stopped drawing
+    // the whole heading — losing the label and the count with it — would pass: the section's
+    // *facts* must survive, only the affordance goes.
+    let context = ViewContext::new(
+        &crate::theme::ThemeRegistry::new()
+            .resolve(crate::theme::DEFAULT_THEME, crate::theme::Mode::Dark),
+        crate::config::ResolvedTuiConfig {
+            mouse: false,
+            ..crate::config::ResolvedTuiConfig::default()
+        },
+    );
+    let mut view = SidebarView::new(context);
+    *view.ambient_mut() = ambient();
+    let joined = drawn(&mut view);
+
+    assert!(
+        !joined.contains(OPEN_GLYPH) && !joined.contains(CLOSED_GLYPH),
+        "a disclosure triangle is still advertised with the mouse off:\n{joined}"
+    );
+    for needle in ["LSP", "MCP", "Skills", "1/2", "rust-analyzer"] {
+        assert!(
+            joined.contains(needle),
+            "withdrawing the triangle also withdrew `{needle}`, which is a fact rather than \
+             an affordance:\n{joined}"
+        );
+    }
+    // And nothing is clickable, because no target was recorded.
+    for row in 0..40 {
+        assert!(
+            !view.click(0, row),
+            "row {row} answers a click although the build reports no mouse"
+        );
+    }
+}
+
+#[test]
+fn views_sidebar_forgets_its_click_targets_once_it_stops_being_drawn() {
+    // The panel's targets are frame geometry, so the frame that stops drawing it has to
+    // retract them. Otherwise hiding the sidebar leaves its old rows swallowing clicks aimed
+    // at the transcript that took those columns.
+    let mut view = view();
+    let row = heading_rows(&mut view, SIDEBAR_WIDTH, 40)[0].0;
+    assert!(view.click(0, row), "the target was never recorded");
+
+    view.forget_hit_targets();
+    assert!(
+        !view.click(0, row),
+        "a retracted target still answered a click"
+    );
+
+    // A zero-width frame is the other way the panel stops being drawn, and it must retract
+    // them by itself rather than relying on the owner to remember.
+    let _ = render_offscreen(&mut view, SIDEBAR_WIDTH, 40).expect("infallible");
+    assert!(view.click(0, row), "the redraw did not restore the target");
+    let _ = render_offscreen(&mut view, 0, 40).expect("infallible");
+    assert!(
+        !view.click(0, row),
+        "a frame that drew nothing left its previous targets live"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Layout
 // ---------------------------------------------------------------------------

@@ -588,3 +588,218 @@ fn picker_ranks_a_label_match_above_a_value_match() {
         "a value match outranked a label match"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Grouping: the model picker states its provider once per run
+// ---------------------------------------------------------------------------
+
+fn two_providers() -> Vec<ModelEntry> {
+    vec![
+        ModelEntry {
+            id: String::from("openai/gpt-5-mini"),
+            name: String::from("gpt-5-mini"),
+            provider: String::from("openai"),
+        },
+        ModelEntry {
+            id: String::from("amazon-bedrock/anthropic.claude-opus-4-6-v1"),
+            name: String::from("anthropic.claude-opus-4-6-v1"),
+            provider: String::from("amazon-bedrock"),
+        },
+        ModelEntry {
+            id: String::from("openai/gpt-5-codex"),
+            name: String::from("gpt-5-codex"),
+            provider: String::from("openai"),
+        },
+        ModelEntry {
+            id: String::from("amazon-bedrock/amazon.nova-lite-v1:0"),
+            name: String::from("amazon.nova-lite-v1:0"),
+            provider: String::from("amazon-bedrock"),
+        },
+    ]
+}
+
+/// Each provider is named once, above its own contiguous run of models.
+#[test]
+fn the_model_picker_groups_by_provider_and_sorts_names_inside_a_group() {
+    let dialog = model_picker(ViewContext::defaults(), two_providers()).with_rows(10);
+    let rendered = render(dialog, 88, 16);
+    let body: Vec<&String> = rendered
+        .iter()
+        .filter(|row| !row.trim().is_empty())
+        .collect();
+
+    let joined = body
+        .iter()
+        .map(|row| row.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    // Named once, which is the complaint: the flat list repeated the provider on all 114 rows.
+    assert_eq!(
+        joined.matches("amazon-bedrock").count(),
+        1,
+        "the provider is still repeated per row:\n{joined}"
+    );
+    assert_eq!(
+        joined.matches("openai").count(),
+        1,
+        "the provider is still repeated per row:\n{joined}"
+    );
+
+    let position = |needle: &str| {
+        body.iter()
+            .position(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} is not on screen:\n{joined}"))
+    };
+    // The heading introduces its run, and the run is alphabetical inside it.
+    assert!(
+        position("amazon-bedrock") < position("amazon.nova-lite-v1:0"),
+        "a provider's models render above its heading:\n{joined}"
+    );
+    assert!(
+        position("amazon.nova-lite-v1:0") < position("anthropic.claude-opus-4-6-v1"),
+        "models are not name-sorted inside their provider:\n{joined}"
+    );
+    assert!(
+        position("anthropic.claude-opus-4-6-v1") < position("openai"),
+        "the groups are interleaved rather than contiguous:\n{joined}"
+    );
+    assert!(
+        position("gpt-5-codex") < position("gpt-5-mini"),
+        "models are not name-sorted inside their provider:\n{joined}"
+    );
+}
+
+/// A heading is not a row the cursor can reach, whatever it is asked to do.
+#[test]
+fn a_group_heading_is_never_selectable() {
+    let mut dialog = model_picker(ViewContext::defaults(), two_providers());
+    let providers = ["openai", "amazon-bedrock"];
+
+    // Every navigation action, from every position, and the filter's re-ranking too: the cursor
+    // indexes the filtered items and a heading is never among them, so there is no sequence of
+    // keys that can land on one. Walking the whole list is what makes that a claim about the
+    // design rather than about one lucky starting point.
+    let steps = [
+        "dialog.select.next",
+        "dialog.select.prev",
+        "dialog.select.page_down",
+        "dialog.select.page_up",
+        "dialog.select.home",
+        "dialog.select.end",
+    ];
+    for step in steps {
+        for _ in 0..(two_providers().len() + 2) {
+            dialog.handle_action(action(step), &press(KeyCode::Down));
+            let selected = dialog
+                .selected()
+                .expect("a non-empty list always has a selection");
+            assert!(
+                !providers.contains(&selected.label.as_str()),
+                "`{step}` put the cursor on the `{}` heading",
+                selected.label
+            );
+            assert!(
+                selected.value.contains('/'),
+                "`{step}` selected something that is not a `provider/model` value: {selected:?}"
+            );
+        }
+    }
+
+    // And submitting can only ever answer with a model.
+    dialog.set_filter("amazon");
+    let step = dialog.handle_action(action("dialog.select.submit"), &press(KeyCode::Enter));
+    match step {
+        DialogStep::Resolved(DialogOutcome::Selected { value, .. }) => assert!(
+            value.starts_with("amazon-bedrock/"),
+            "submitting answered with {value:?}, which is not a model"
+        ),
+        other => panic!("submitting a filtered grouped list did not resolve: {other:?}"),
+    }
+}
+
+/// A query that matches two providers keeps both headings, and each still leads its own run.
+#[test]
+fn filtering_across_providers_keeps_a_heading_over_every_run() {
+    let mut dialog = model_picker(ViewContext::defaults(), two_providers()).with_rows(10);
+    // `a` is in a model of both providers — `amazon.nova…` and `gpt-5-codex` — so the filter
+    // spans them. A query matching only one provider would not test the interleaving question.
+    dialog.set_filter("a");
+    let visible: Vec<&Item> = dialog.visible();
+    assert!(
+        visible.iter().any(|item| item.group == "openai")
+            && visible.iter().any(|item| item.group == "amazon-bedrock"),
+        "the fixture query does not span both providers: {visible:?}"
+    );
+
+    let rendered = render(dialog, 88, 16);
+    let body: Vec<&String> = rendered
+        .iter()
+        .filter(|row| !row.trim().is_empty())
+        .collect();
+    let joined = body
+        .iter()
+        .map(|row| row.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for provider in ["openai", "amazon-bedrock"] {
+        assert_eq!(
+            joined.matches(provider).count(),
+            1,
+            "under a filter the `{provider}` heading is missing or repeated:\n{joined}"
+        );
+    }
+
+    // Contiguity under a filter is the property that makes the heading mean anything: a heading
+    // followed by one row of its own and then a row of the other provider's is a mislabel.
+    let mut seen: Vec<String> = Vec::new();
+    for row in &body {
+        let owner = ["openai", "amazon-bedrock"]
+            .into_iter()
+            .find(|provider| row.contains(provider));
+        if let Some(owner) = owner {
+            assert!(
+                !seen.iter().any(|group| group == owner),
+                "the `{owner}` group is split into two runs under a filter:\n{joined}"
+            );
+            seen.push(owner.to_owned());
+        }
+    }
+    assert_eq!(
+        seen.len(),
+        2,
+        "a heading went missing under a filter:\n{joined}"
+    );
+}
+
+/// Typing a provider's name still finds its models after the provider left the rows.
+#[test]
+fn a_provider_name_is_still_searchable_once_it_is_only_a_heading() {
+    let mut dialog = model_picker(ViewContext::defaults(), two_providers());
+    dialog.set_filter("bedrock");
+    let visible = dialog.visible();
+    assert!(
+        !visible.is_empty(),
+        "searching the provider name found nothing once it moved into the heading"
+    );
+    assert!(
+        visible.iter().all(|item| item.group == "amazon-bedrock"),
+        "a provider query matched another provider's models: {visible:?}"
+    );
+}
+
+/// The cursor stays inside the row budget even though headings spend rows.
+#[test]
+fn a_grouped_window_keeps_the_cursor_on_screen() {
+    let mut dialog = model_picker(ViewContext::defaults(), two_providers()).with_rows(3);
+    dialog.handle_action(action("dialog.select.end"), &press(KeyCode::End));
+    let selected = dialog
+        .selected()
+        .expect("a non-empty list has a selection")
+        .clone();
+    let rendered = render(dialog, 88, 10);
+    let joined = rendered.join("\n");
+    assert!(
+        joined.contains(&selected.label),
+        "the cursor is on a row the window does not show, so the arrows look dead:\n{joined}"
+    );
+}

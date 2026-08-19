@@ -281,6 +281,22 @@ pub fn looks_like_diff(text: &str) -> bool {
 /// panel having cut the sentence.
 const NOTICE_MARKER_COLS: u16 = 2;
 
+/// A notice's colour for `level`, on the transcript's own background.
+///
+/// Deliberately not [`crate::views::toast::ToastLevel`]'s own style: a toast floats and takes
+/// the inset background with it, while a notice is a transcript row and must sit on the same
+/// surface as the message above it. The *foreground* mapping is the one `§11.5` fixes, and it
+/// is the same one on both surfaces.
+fn notice_style(level: crate::views::toast::ToastLevel, context: &ViewContext) -> Style {
+    use crate::views::toast::ToastLevel;
+    match level {
+        ToastLevel::Info => context.muted(),
+        ToastLevel::Success => context.success(),
+        ToastLevel::Warning => context.warning(),
+        ToastLevel::Error => context.error(),
+    }
+}
+
 /// Rows one notice may occupy before the rest is counted instead of drawn.
 ///
 /// Derived, not picked. The longest notice this crate composes is the 72-column
@@ -380,6 +396,13 @@ pub enum MessagePart {
     Notice {
         /// The message, already human-readable.
         text: String,
+        /// What kind of fact it is, which decides its glyph and its colour.
+        ///
+        /// [`crate::views::toast::ToastLevel`] and not a second enum, so a notice and a
+        /// toast cannot disagree about what `§11.5`'s four levels look like. Every notice
+        /// was drawn with the warning marker before this field existed, which announced
+        /// `model set to …` — a confirmation — as `!` in warning colour.
+        level: crate::views::toast::ToastLevel,
     },
     /// What a language server said about a file the turn touched.
     ///
@@ -445,14 +468,29 @@ impl Message {
         }
     }
 
-    /// A session notice carrying one line the user has to see.
+    /// A session notice at `level`, carrying one line the user has to see.
     #[must_use]
-    pub fn notice(text: impl Into<String>) -> Self {
+    pub fn noticed(level: crate::views::toast::ToastLevel, text: impl Into<String>) -> Self {
         Self {
             role: Role::System,
             id: None,
-            parts: vec![MessagePart::Notice { text: text.into() }],
+            parts: vec![MessagePart::Notice {
+                text: text.into(),
+                level,
+            }],
         }
+    }
+
+    /// A session notice reporting something the user can act on.
+    ///
+    /// [`ToastLevel::Warning`](crate::views::toast::ToastLevel::Warning), because that is
+    /// what the majority of this crate's notices are — a refusal, an unknown command, an
+    /// unavailable worker. Anything that *succeeded* or that merely states a fact says so
+    /// with [`Self::noticed`]; the levels are not interchangeable, and `§11.5` reserves the
+    /// warning colour for something the user has to do something about.
+    #[must_use]
+    pub fn notice(text: impl Into<String>) -> Self {
+        Self::noticed(crate::views::toast::ToastLevel::Warning, text)
     }
 
     /// Append an attachment.
@@ -1490,7 +1528,7 @@ impl TranscriptView {
                     out,
                 );
             }
-            MessagePart::Notice { text } => {
+            MessagePart::Notice { text, level } => {
                 let rows = wrap(text, body_width.saturating_sub(NOTICE_MARKER_COLS));
                 let (shown, elided) = if rows.len() <= NOTICE_MAX_ROWS {
                     (rows.as_slice(), 0)
@@ -1498,12 +1536,14 @@ impl TranscriptView {
                     let keep = NOTICE_MAX_ROWS - 1;
                     (&rows[..keep], rows.len() - keep)
                 };
+                let marker = level.glyph();
+                let style = notice_style(*level, &self.context);
                 for row in shown {
-                    push(&format!("! {row}"), self.context.warning(), out);
+                    push(&format!("{marker} {row}"), style, out);
                 }
                 if elided > 0 {
                     push(
-                        &format!("! {ELIDED} {elided} more lines"),
+                        &format!("{marker} {ELIDED} {elided} more lines"),
                         self.context.muted(),
                         out,
                     );
@@ -1896,9 +1936,13 @@ fn fingerprint(message: &Message) -> u64 {
                 attempt.hash(&mut hasher);
                 max.hash(&mut hasher);
             }
-            MessagePart::Notice { text } => {
+            MessagePart::Notice { text, level } => {
                 5_u8.hash(&mut hasher);
                 text.hash(&mut hasher);
+                // The level reaches a rendered row — it picks the glyph and the colour — so
+                // omitting it here would let two notices with the same words and different
+                // grades serve each other's cached rows.
+                level.hash(&mut hasher);
             }
             MessagePart::Diagnostics { report } => {
                 6_u8.hash(&mut hasher);
