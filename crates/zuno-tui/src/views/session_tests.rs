@@ -606,6 +606,95 @@ fn session_screen_forwards_mcp_toggle_requests_without_waiting() {
 }
 
 #[test]
+fn session_an_mcp_status_change_after_the_panel_opened_reaches_the_panel_and_the_sidebar() {
+    // The defect, as reported from a real terminal: with the MCP list open, the panel row
+    // read `◐ Connecting` while the sidebar had already moved on to
+    // `✗ … out after 30s`. The two never actually disagreed — both re-read the same
+    // projection while they draw — they shared one *stale frame*, because the lifecycle
+    // worker's `TerminalEvent::Wake` reached every surface, was claimed by none, and so
+    // painted nothing.
+    //
+    // Driven through the real `DialogHost` with the dialog genuinely open, and through a
+    // `Wake` rather than a direct render: a test that simply rendered again would repaint by
+    // construction and be silent about the only thing that was broken.
+    let (sender, _shutdown) = terminal_event_channel();
+    let (toggles, _requested) = mpsc::channel(1);
+    let projection =
+        crate::views::picker::McpProjection::new(vec![crate::views::picker::McpServer {
+            name: "adk-docs-mcp".to_owned(),
+            state: crate::views::picker::McpState::Connecting,
+            desired_enabled: true,
+        }]);
+    let screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_mcp_control(projection.clone(), toggles);
+    let mut host = crate::views::dialog::DialogHost::new(ViewContext::defaults(), Box::new(screen));
+    host.handle_action(action("mcp_list"), &press_none());
+    assert_eq!(
+        host.active(),
+        Some(crate::views::picker::MCP_DIALOG_ID),
+        "the MCP list did not open, so nothing below is about an open panel"
+    );
+
+    // Wide enough for the sidebar, so both surfaces are on the same frame and the assertion
+    // cannot be satisfied by whichever one happens to be drawn.
+    let opened = rows(&render_offscreen(&mut host, 130, 30).expect("infallible")).join("\n");
+    assert!(
+        opened.contains("Connecting"),
+        "the panel did not open on the state the projection held:\n{opened}"
+    );
+
+    // The failure the user actually hit: not a different state, a *terminal* one arriving
+    // after the panel was built.
+    projection.replace(vec![crate::views::picker::McpServer {
+        name: "adk-docs-mcp".to_owned(),
+        state: crate::views::picker::McpState::Failed("handshake timed out after 30s".to_owned()),
+        desired_enabled: true,
+    }]);
+
+    let woken = host.handle_event(&crate::app::AppEvent::Terminal(TerminalEvent::Wake));
+    assert!(
+        woken.redraw,
+        "a projection change reported no redraw, so the scheduler leaves the stale frame on \
+         the terminal — which is the whole defect"
+    );
+
+    let after = rows(&render_offscreen(&mut host, 130, 30).expect("infallible"));
+    let joined = after.join("\n");
+    // Located per surface rather than frame-wide. A frame-wide `contains("Failed")` would be
+    // satisfied by the sidebar alone — which was never the broken half — so each row is
+    // pinned by the text only its own surface prints: the dialog states the reason, the
+    // sidebar states its section heading's summary.
+    let panel_row = after
+        .iter()
+        .find(|row| row.contains("handshake timed out"))
+        .unwrap_or_else(|| panic!("the open panel still shows no failure reason:\n{joined}"));
+    assert!(
+        !panel_row.contains("Connecting"),
+        "the panel row carries both states at once: {panel_row:?}"
+    );
+    assert!(
+        after
+            .iter()
+            .any(|row| row.contains("MCP") && row.contains("failed")),
+        "the sidebar's summary did not follow the same change, so this proves one surface \
+         rather than the single source both read:\n{joined}"
+    );
+    assert!(
+        !joined.contains("Connecting"),
+        "some surface is still painting the state the server left:\n{joined}"
+    );
+
+    // Idempotence: the worker republishes on a broadcast lag and after every toggle, and a
+    // frame per republication is a repaint of identical rows on a screen the redraw
+    // scheduler is otherwise entitled to leave alone.
+    let unchanged = host.handle_event(&crate::app::AppEvent::Terminal(TerminalEvent::Wake));
+    assert!(
+        !unchanged.redraw,
+        "a wake with no projection change still asked for a frame"
+    );
+}
+
+#[test]
 fn session_screen_unknown_slash_is_visible_and_never_reaches_the_prompt_sink() {
     let (sender, _shutdown) = terminal_event_channel();
     let (prompts, mut submitted) = mpsc::channel(1);
@@ -3064,8 +3153,13 @@ fn session_theme_switch_also_repaints_the_status_strip() {
     );
 
     let mut host = crate::views::dialog::DialogHost::new(context.clone(), Box::new(screen));
-    // The strip sits directly above the prompt, and the prompt's floor is two rows.
-    let strip_row = 30 - 1 - 2;
+    // The strip sits directly above the prompt. Derived from `prompt_rows` rather than
+    // restated as a literal: this test is about a *repaint*, not about the prompt's height,
+    // and the literal that used to be here silently became "some transcript row" the moment
+    // the prompt's floor changed — which reports "the row under test is not the status
+    // strip" about a frame that has one. The transcript is non-empty here, so there is no
+    // welcome tail below the prompt to account for.
+    let strip_row = 30 - 1 - prompt_rows(0, 30);
     let before = row_backgrounds(&mut host, strip_row);
     assert!(
         before.contains(&starting),
@@ -3438,12 +3532,195 @@ fn prompt_band_rows(screen: &mut SessionScreen, width: u16, height: u16) -> usiz
     rendered.len() - first - tail
 }
 
+/// One left press at `(column, row)`, delivered the way the event loop delivers one.
+///
+/// Through `handle_event` rather than `handle_mouse`, because the defect was not a missing
+/// hit test — it was that nothing on this screen consumed a press at all. A test that called
+/// the hit test directly would pass against a screen whose `handle_event` still discards
+/// every mouse event, which is precisely the shipped state being fixed.
+fn click_at(screen: &mut SessionScreen, column: u16, row: u16) -> EventResult {
+    screen.handle_event(&crate::app::AppEvent::Terminal(TerminalEvent::Input(
+        crossterm::event::Event::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }),
+    )))
+}
+
 #[test]
-fn session_prompt_keeps_two_rows_for_a_single_line() {
-    // Two rows is what the prompt occupied when its height was fixed, so a single-line
-    // buffer keeps proportions the user already knows rather than shrinking to one.
+fn session_a_click_on_a_sidebar_section_heading_collapses_it_through_the_event_loop() {
+    // The whole route: the input filter forwards the press
+    // (`app_the_input_filter_forwards_exactly_what_a_screen_consumes`), the screen's mouse
+    // match dispatches it, and the panel's recorded geometry answers. Before this the only
+    // mouse consumer on the screen was the wheel, so a click on a heading that draws a
+    // disclosure triangle was discarded.
     let (mut screen, _shutdown) = screen();
-    assert_eq!(prompt_band_rows(&mut screen, 40, 20), 2);
+    screen.sidebar_mut().ambient_mut().lsp = vec![crate::views::ambient::Service::new(
+        "rust-analyzer",
+        crate::views::ambient::Health::Ready,
+    )];
+    // Wide enough that the panel is drawn at all — below `SIDEBAR_MIN_WIDTH` it is dropped,
+    // and this test would be asserting against a screen that has no sidebar.
+    let rendered = rows(&render_offscreen(&mut screen, 130, 30).expect("infallible"));
+    let heading = rendered
+        .iter()
+        .position(|row| row.contains("LSP"))
+        .unwrap_or_else(|| panic!("the sidebar is not on this frame:\n{}", rendered.join("\n")));
+    let heading = u16::try_from(heading).expect("a 30-row frame");
+    assert!(
+        screen.sidebar.expanded().lsp,
+        "the section under test starts collapsed, so opening it proves nothing"
+    );
+
+    // A column inside the panel. Derived from the frame's own width so the coordinate cannot
+    // drift away from `SIDEBAR_WIDTH`.
+    let inside = 130 - crate::views::ambient::SIDEBAR_WIDTH + 4;
+    let outcome = click_at(&mut screen, inside, heading);
+
+    assert!(
+        outcome.redraw,
+        "the click changed the panel but reported no repaint, so the collapse would not \
+         reach the terminal until something unrelated redrew"
+    );
+    assert!(
+        !screen.sidebar.expanded().lsp,
+        "a click on the LSP heading did not collapse it"
+    );
+    let after = rows(&render_offscreen(&mut screen, 130, 30).expect("infallible")).join("\n");
+    assert!(
+        !after.contains("rust-analyzer"),
+        "the section reports itself collapsed but still draws its rows:\n{after}"
+    );
+
+    // A press on the transcript side of the same row is not the panel's, and claiming it
+    // would silently forbid a future consumer there.
+    let elsewhere = click_at(&mut screen, 2, heading);
+    assert!(
+        !elsewhere.handled,
+        "a press over the transcript was claimed by the screen"
+    );
+    assert!(
+        !screen.sidebar.expanded().lsp,
+        "a press over the transcript reached the panel anyway"
+    );
+}
+
+#[test]
+fn session_a_click_where_the_sidebar_used_to_be_does_nothing_once_it_is_hidden() {
+    // The staleness half. The panel's targets are frame geometry, so the frame that stops
+    // drawing it must retract them — otherwise hiding the sidebar leaves its old rows
+    // swallowing presses aimed at the transcript that took those columns.
+    let (mut screen, _shutdown) = screen();
+    let rendered = rows(&render_offscreen(&mut screen, 130, 30).expect("infallible"));
+    let heading = u16::try_from(
+        rendered
+            .iter()
+            .position(|row| row.contains("MCP"))
+            .expect("the sidebar is on this frame"),
+    )
+    .expect("a 30-row frame");
+    let inside = 130 - crate::views::ambient::SIDEBAR_WIDTH + 4;
+    let before = screen.sidebar.expanded();
+
+    screen.handle_action(action("sidebar_toggle"), &press_none());
+    assert!(!screen.sidebar_visible(), "the sidebar is still visible");
+    let _ = render_offscreen(&mut screen, 130, 30).expect("infallible");
+
+    let outcome = click_at(&mut screen, inside, heading);
+    assert!(
+        !outcome.handled,
+        "the hidden panel still claimed a press at its old coordinates"
+    );
+    assert_eq!(
+        before,
+        screen.sidebar.expanded(),
+        "a press at the hidden panel's old coordinates toggled a section the user cannot see"
+    );
+}
+
+#[test]
+fn session_prompt_offers_four_rows_to_an_empty_buffer_once_the_pane_can_pay_for_them() {
+    // The complaint, twice: the empty prompt was two rows — one of text and one spacer — so
+    // it read as a one-line field rather than a place to compose a paragraph.
+    //
+    // A table over heights rather than a single assertion, because the interesting property
+    // is not "four" but *how the floor degrades*: it is granted through the third-of-screen
+    // cap, never over it, which is also what keeps `u16::clamp` from aborting (see
+    // `prompt_rows`). Literals on both sides — a row count derived from the constants would
+    // follow them wherever they went and pin nothing.
+    //
+    // Each row states what the transcript is left with, because that is the cost being
+    // accepted. The transcript is empty in this fixture, so `body` here excludes the welcome
+    // tail as well as the strip and the prompt.
+    for (height, band) in [
+        // Under six rows the cap is at the survival floor and the prompt gets two.
+        (4_u16, 2_usize),
+        (6, 2),
+        // Six to eight rows: the cap is two, still the survival floor.
+        (8, 2),
+        // Nine to eleven: the cap is three, so the preferred four is cut down to it.
+        (9, 3),
+        (11, 3),
+        // Twelve and up the preferred floor is affordable and stops growing.
+        (12, 4),
+        (24, 4),
+        (50, 4),
+    ] {
+        let (mut screen, _shutdown) = screen();
+        assert_eq!(
+            prompt_band_rows(&mut screen, 40, height),
+            band,
+            "an empty prompt on a {height}-row pane"
+        );
+    }
+
+    // The 24-row pane is the one the decision was made on: the shortest common size. One row
+    // goes to the status strip and the rest to the transcript, so a four-row prompt spends
+    // two of the twenty-one rows a two-row prompt left. Asserted rather than asserted-in-a-
+    // comment, so a future floor of five has to come back here and account for the third.
+    let (mut screen, _shutdown) = screen();
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .push(Message::user("so the transcript owns the body region"));
+    let transcript_rows = 24 - i32::from(STATUS_ROWS) - i32::from(prompt_rows(0, 24));
+    assert_eq!(
+        transcript_rows, 19,
+        "the 24-row arithmetic this floor was chosen on no longer holds"
+    );
+    assert_eq!(
+        prompt_band_rows(&mut screen, 40, 24),
+        4,
+        "a conversation gets the same prompt height as the welcome screen; a composer that \
+         shrinks when the first reply lands reads as two different applications"
+    );
+}
+
+#[test]
+fn session_prompt_never_panics_on_any_viewport_the_preferred_floor_cannot_fit() {
+    // `PROMPT_PREFERRED_ROWS` is four and `height / PROMPT_MAX_SHARE` is under four for
+    // every viewport shorter than twelve rows, so the floor exceeds the cap on far more
+    // sizes than the old two-row floor did — it moved the hazard from "shorter than six
+    // rows" to "shorter than twelve". `u16::clamp` panics when its minimum exceeds its
+    // maximum, so every one of those heights is a potential abort.
+    //
+    // Rendered, not just computed: the band feeds a `Layout` and then `prompt_frame`, and
+    // `.max(1)` in the latter once fabricated a row the band did not own and panicked inside
+    // ratatui's buffer. Only a real frame covers both.
+    for height in 1..=12 {
+        let (mut screen, _shutdown) = screen();
+        assert!(
+            render_offscreen(&mut screen, 20, height).is_ok(),
+            "rendering a 20x{height} viewport failed instead of degrading"
+        );
+        let band = prompt_rows(screen.editor.height(), height);
+        assert!(
+            band <= (height / PROMPT_MAX_SHARE).max(PROMPT_MIN_ROWS),
+            "the prompt took {band} rows of a {height}-row pane, which is over its own cap"
+        );
+    }
 }
 
 #[test]
@@ -3527,7 +3804,7 @@ fn scrollable(context: ViewContext) -> (SessionScreen, mpsc::Receiver<TerminalEv
 
 /// One wheel notch downwards, observed at `now_ms`.
 fn notch(screen: &mut SessionScreen, now_ms: u64) -> EventResult {
-    screen.handle_wheel(
+    screen.handle_mouse(
         &crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::ScrollDown,
             column: 4,
@@ -3540,7 +3817,7 @@ fn notch(screen: &mut SessionScreen, now_ms: u64) -> EventResult {
 
 /// One wheel notch upwards, observed at `now_ms`.
 fn notch_up(screen: &mut SessionScreen, now_ms: u64) -> EventResult {
-    screen.handle_wheel(
+    screen.handle_mouse(
         &crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::ScrollUp,
             column: 4,

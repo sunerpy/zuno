@@ -370,10 +370,16 @@ fn app_mouse_reporting_asks_only_for_the_events_a_screen_consumes() {
 }
 
 #[tokio::test]
-async fn app_motion_is_dropped_at_the_boundary_while_the_wheel_still_arrives() {
+async fn app_motion_is_dropped_at_the_boundary_while_the_wheel_and_a_press_still_arrive() {
     // The functional risk in narrowing the mouse pipeline: drop too much and the wheel
-    // stops scrolling. Driven through the real producer, so what is asserted is what the
-    // event loop would actually receive.
+    // stops scrolling, or the ambient panel's disclosure triangles stop answering. Driven
+    // through the real producer, so what is asserted is what the event loop would actually
+    // receive.
+    //
+    // `Moved` and `Drag` are what must not survive. A press must, and `Drag(Left)` sitting
+    // immediately before it in the input is deliberate: the two differ only in their
+    // variant, so a filter widened to "any left-button event" would let the drag through
+    // and be caught here rather than reintroducing the motion cost `?1002` was removed for.
     let mouse = |kind| {
         CrosstermEvent::Mouse(crossterm::event::MouseEvent {
             kind,
@@ -399,10 +405,10 @@ async fn app_motion_is_dropped_at_the_boundary_while_the_wheel_still_arrives() {
     ));
 
     let mut delivered = Vec::new();
-    for _ in 0..2 {
+    for _ in 0..3 {
         let event = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
             .await
-            .expect("the wheel notches arrive well inside the timeout")
+            .expect("the consumable events arrive well inside the timeout")
             .expect("the producer is still running");
         delivered.push(event);
     }
@@ -418,9 +424,14 @@ async fn app_motion_is_dropped_at_the_boundary_while_the_wheel_still_arrives() {
         .collect();
     assert_eq!(
         kinds,
-        vec![MouseEventKind::ScrollDown, MouseEventKind::ScrollUp],
-        "the producer forwarded something other than the two wheel notches, so either \
-         motion reached the queue or the wheel stopped arriving: {delivered:?}"
+        vec![
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::ScrollDown,
+            MouseEventKind::ScrollUp
+        ],
+        "the producer forwarded something other than the press and the two wheel notches, \
+         so either motion reached the queue or a consumed event stopped arriving: \
+         {delivered:?}"
     );
     assert_eq!(
         input.reads.load(Ordering::SeqCst),
@@ -433,7 +444,7 @@ async fn app_motion_is_dropped_at_the_boundary_while_the_wheel_still_arrives() {
 #[test]
 fn app_the_input_filter_forwards_exactly_what_a_screen_consumes() {
     // Two hand-written match arms, in different files, that have to agree: the filter in
-    // `is_consumable_mouse` and `SessionScreen::handle_wheel`'s own match. A source scan
+    // `is_consumable_mouse` and `SessionScreen::handle_mouse`'s own match. A source scan
     // rather than a shared constant because the screen's arms are what actually decide
     // behaviour, and the day a screen learns to drag this must fail rather than silently
     // drop the event before the screen ever sees it.
@@ -442,8 +453,8 @@ fn app_the_input_filter_forwards_exactly_what_a_screen_consumes() {
     )
     .expect("read the screen's source");
     let start = screen
-        .find("fn handle_wheel(")
-        .expect("handle_wheel is gone; this scan is checking nothing");
+        .find("fn handle_mouse(")
+        .expect("handle_mouse is gone; this scan is checking nothing");
     let rest = &screen[start..];
     let end = rest.find("\n    }\n").expect("a method body ends");
     let consumed: std::collections::BTreeSet<&str> = rest[..end]
@@ -470,6 +481,7 @@ fn app_the_input_filter_forwards_exactly_what_a_screen_consumes() {
             "ScrollLeft" => MouseEventKind::ScrollLeft,
             "ScrollRight" => MouseEventKind::ScrollRight,
             "Moved" => MouseEventKind::Moved,
+            "Down" => MouseEventKind::Down(MouseButton::Left),
             other => panic!(
                 "`{other}` is consumed by the screen and this test cannot construct it, so \
                  the filter's agreement with the screen is unproven"
@@ -486,6 +498,10 @@ fn app_the_input_filter_forwards_exactly_what_a_screen_consumes() {
         MouseEventKind::Moved,
         MouseEventKind::Drag(MouseButton::Left),
         MouseEventKind::Down(MouseButton::Left),
+        // A right press: the screen hit-tests the left button only, so a filter widened to
+        // "any button" would be caught here rather than by a user wondering why a
+        // context-menu attempt collapsed a panel section.
+        MouseEventKind::Down(MouseButton::Right),
         MouseEventKind::Up(MouseButton::Left),
     ] {
         if consumable_name(kind).is_some_and(|name| consumed.contains(name)) {
@@ -507,6 +523,7 @@ const fn consumable_name(kind: MouseEventKind) -> Option<&'static str> {
         MouseEventKind::ScrollLeft => Some("ScrollLeft"),
         MouseEventKind::ScrollRight => Some("ScrollRight"),
         MouseEventKind::Moved => Some("Moved"),
+        MouseEventKind::Down(MouseButton::Left) => Some("Down"),
         _ => None,
     }
 }

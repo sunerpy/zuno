@@ -229,11 +229,44 @@ impl Default for Expanded {
     }
 }
 
+/// One collapsible section of the panel.
+///
+/// Named rather than indexed because a hit map keyed by position would have to be read
+/// against the same row order that produced it, and the two would drift the first time a
+/// section moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    /// The language-server list.
+    Lsp,
+    /// The MCP server list.
+    Mcp,
+    /// The discovered-skill list.
+    Skills,
+}
+
+/// The panel's rows plus the index of each section heading among them.
+struct PanelRows {
+    lines: Vec<Line<'static>>,
+    headers: Vec<(usize, Section)>,
+}
+
 /// The ambient panel.
 pub struct SidebarView {
     context: ViewContext,
     ambient: Ambient,
     expanded: Expanded,
+    /// Where each section's heading was drawn in the frame that was drawn.
+    ///
+    /// Absolute screen rows, recorded by [`Component::render`] from the same `lines()`
+    /// output it paints and the same `Rect` it paints into. Derived once, in the one place
+    /// that knows both — a map maintained anywhere else would have to be told about a
+    /// resize, and the resize that forgot to tell it is a click landing on the wrong
+    /// section.
+    ///
+    /// Cleared by [`Self::forget_hit_targets`] whenever the owner does not draw the panel,
+    /// so a click at the sidebar's old coordinates cannot toggle a section the user can no
+    /// longer see.
+    hits: Vec<(Rect, Section)>,
 }
 
 impl SidebarView {
@@ -252,6 +285,7 @@ impl SidebarView {
             context,
             ambient: Ambient::default(),
             expanded: Expanded::default(),
+            hits: Vec::new(),
         }
     }
 
@@ -285,6 +319,55 @@ impl SidebarView {
     /// Open or close the skill section.
     pub const fn toggle_skills(&mut self) {
         self.expanded.skills = !self.expanded.skills;
+    }
+
+    /// Open or close `section`.
+    pub const fn toggle(&mut self, section: Section) {
+        match section {
+            Section::Lsp => self.toggle_lsp(),
+            Section::Mcp => self.toggle_mcp(),
+            Section::Skills => self.toggle_skills(),
+        }
+    }
+
+    /// Toggle whichever section's heading occupies `(column, row)`, if any.
+    ///
+    /// Absolute frame coordinates, because that is what a `MouseEvent` carries and
+    /// translating at the boundary is what keeps the caller from having to know this
+    /// panel's geometry.
+    ///
+    /// The whole heading row is the target, rule column included: the row holds nothing but
+    /// the label and its summary, so there is no neighbouring control a generous target
+    /// could steal from — and a two-column triangle is a target most users miss.
+    ///
+    /// Answers `false` when nothing was hit, which is how the owner tells "consumed" from
+    /// "pass it on". It is also `false` for every coordinate while mouse capture is off,
+    /// because [`Component::render`] records no targets then.
+    pub fn click(&mut self, column: u16, row: u16) -> bool {
+        let Some(section) = self
+            .hits
+            .iter()
+            .find(|(area, _)| {
+                column >= area.left()
+                    && column < area.right()
+                    && row >= area.top()
+                    && row < area.bottom()
+            })
+            .map(|(_, section)| *section)
+        else {
+            return false;
+        };
+        self.toggle(section);
+        true
+    }
+
+    /// Discard the recorded heading positions.
+    ///
+    /// Called by the owner on any frame that does not draw this panel — the user hid it, or
+    /// the pane fell under [`crate::views::SIDEBAR_MIN_WIDTH`]. Without it the last drawn
+    /// geometry would keep answering clicks aimed at whatever now occupies those columns.
+    pub fn forget_hit_targets(&mut self) {
+        self.hits.clear();
     }
 
     fn health_style(&self, health: Health) -> Style {
@@ -381,13 +464,42 @@ impl SidebarView {
         format!("{ready}/{}", services.len())
     }
 
+    /// Whether a collapsible section may advertise itself as collapsible.
+    ///
+    /// `None` — which [`Self::heading`] draws as a blank, exactly like the non-collapsible
+    /// `Context` heading — whenever mouse capture is off, because a click is the only way
+    /// to actuate one. A `▾` a user cannot press is worse than no `▾`: it invites a gesture
+    /// the build has switched off and reports nothing when the gesture is made.
+    ///
+    /// Nothing is hidden by this. The state still holds, the summary still states the
+    /// count, and each section's contents have their own keyboard surface — the MCP list,
+    /// the status census and the skill selector — so the triangle is an affordance for a
+    /// space problem, not the only route to the facts behind it.
+    const fn disclosure(&self, open: bool) -> Option<bool> {
+        if self.context.config.mouse {
+            Some(open)
+        } else {
+            None
+        }
+    }
+
     /// The rows this panel draws at `width`.
     ///
     /// Public for the same reason the transcript's is: a row list is the readable
     /// surface to assert against, and the buffer test then proves the rows land.
     #[must_use]
     pub fn lines(&self, width: u16) -> Vec<Line<'static>> {
-        let mut lines = Vec::new();
+        self.rows(width).lines
+    }
+
+    /// The rows and, in the same pass, which of them is a section heading.
+    ///
+    /// One pass rather than a second method that recomputes the offsets: two collectors
+    /// over one fact is how this panel came to advertise `0 lsp` while twenty servers ran,
+    /// and here the drift would put a click on the row above the header it aimed at.
+    fn rows(&self, width: u16) -> PanelRows {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut headers: Vec<(usize, Section)> = Vec::new();
         let blank = || padded("", width, self.context.surface());
 
         let tokens = &self.ambient.tokens;
@@ -441,10 +553,11 @@ impl SidebarView {
         }
 
         lines.push(blank());
+        headers.push((lines.len(), Section::Lsp));
         lines.push(self.heading(
             "LSP",
             &Self::summarise(&self.ambient.lsp),
-            Some(self.expanded.lsp),
+            self.disclosure(self.expanded.lsp),
             width,
         ));
         if self.expanded.lsp {
@@ -463,10 +576,11 @@ impl SidebarView {
         }
 
         lines.push(blank());
+        headers.push((lines.len(), Section::Mcp));
         lines.push(self.heading(
             "MCP",
             &Self::summarise(&self.ambient.mcp),
-            Some(self.expanded.mcp),
+            self.disclosure(self.expanded.mcp),
             width,
         ));
         if self.expanded.mcp {
@@ -480,10 +594,11 @@ impl SidebarView {
         }
 
         lines.push(blank());
+        headers.push((lines.len(), Section::Skills));
         lines.push(self.heading(
             "Skills",
             &Self::tally(self.ambient.skills.len()),
-            Some(self.expanded.skills),
+            self.disclosure(self.expanded.skills),
             width,
         ));
         if self.expanded.skills {
@@ -500,7 +615,7 @@ impl SidebarView {
             }
         }
 
-        lines
+        PanelRows { lines, headers }
     }
 
     /// The rows drawn at the very bottom of the panel, whatever the content above.
@@ -551,6 +666,9 @@ impl SidebarView {
 
 impl Component for SidebarView {
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        // Cleared before any early return, so a frame that draws nothing leaves no target
+        // behind. Every path below that does draw refills it.
+        self.hits.clear();
         fill(frame.buffer_mut(), area, self.context.surface());
         if area.width == 0 || area.height == 0 {
             return;
@@ -578,11 +696,33 @@ impl Component for SidebarView {
 
         let footer = self.footer_lines(inner.width);
         let body_rows = usize::from(inner.height).saturating_sub(footer.len());
-        let body = self
-            .lines(inner.width)
-            .into_iter()
-            .take(body_rows)
-            .collect::<Vec<_>>();
+        let rows = self.rows(inner.width);
+        // Recorded from `body_rows` — the count actually painted — not from `headers`. The
+        // panel is clipped by `take` whenever the pane is short, and a heading that was
+        // dropped has no row on screen for a click to land on. Recording it anyway would
+        // make the section below the fold answer to a click on whatever survived there.
+        if self.context.config.mouse {
+            self.hits = rows
+                .headers
+                .iter()
+                .filter(|(index, _)| *index < body_rows)
+                .filter_map(|(index, section)| {
+                    let offset = u16::try_from(*index).ok()?;
+                    Some((
+                        Rect {
+                            y: inner.y.checked_add(offset)?,
+                            height: 1,
+                            // The whole panel row, not just the heading's own columns: the
+                            // rule and the two-column indent belong to no other control.
+                            x: area.x,
+                            width: area.width,
+                        },
+                        *section,
+                    ))
+                })
+                .collect();
+        }
+        let body = rows.lines.into_iter().take(body_rows).collect::<Vec<_>>();
         Paragraph::new(body)
             .style(self.context.surface())
             .render(inner, frame.buffer_mut());

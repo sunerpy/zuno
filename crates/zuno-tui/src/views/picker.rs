@@ -118,18 +118,56 @@ pub struct McpToggleRequest {
     pub desired_enabled: bool,
 }
 
+/// The servers plus the count of content changes they have been through.
+///
+/// One value behind one lock, so a reader that wants both cannot observe a generation
+/// from before a replacement beside the servers from after it — which would make the
+/// reader believe it had already painted the newer list.
+#[derive(Debug, Default)]
+struct Projected {
+    generation: u64,
+    servers: Vec<McpServer>,
+}
+
 /// Shared, atomically replaced MCP projection. Rendering performs no I/O.
+///
+/// # Why the generation exists
+///
+/// Both surfaces that state an MCP server's health already *derive* it from here: the
+/// sidebar re-reads [`Self::snapshot`] at the top of every
+/// [`crate::views::session::SessionScreen::render`], and [`McpDialog`] re-reads it inside
+/// its own `lines`. So within any painted frame the two cannot disagree — and yet the
+/// panel a user was looking at sat on `◐ Connecting` while the server had already timed
+/// out, because **no frame was painted at all**. The lifecycle worker publishes a
+/// replacement and nudges the loop with a [`crate::app::TerminalEvent::Wake`], and a wake
+/// only reaches the terminal if some component reports `redraw` — which nothing did for a
+/// projection change. Deriving the fact at one point is not enough; something has to
+/// report that the derived fact moved.
+///
+/// The counter is what lets one observer answer that in constant time, and it advances
+/// **only when the content actually differs**: the worker also replaces on a broadcast lag
+/// and after every completed toggle, and a bump for an identical list would spend a frame
+/// repainting bytes that did not change.
 #[derive(Debug, Clone, Default)]
-pub struct McpProjection(Arc<RwLock<Vec<McpServer>>>);
+pub struct McpProjection(Arc<RwLock<Projected>>);
 
 impl McpProjection {
     #[must_use]
     pub fn new(servers: Vec<McpServer>) -> Self {
-        Self(Arc::new(RwLock::new(servers)))
+        Self(Arc::new(RwLock::new(Projected {
+            generation: 0,
+            servers,
+        })))
     }
 
+    /// Publish `servers`, advancing the generation only if they differ from the current set.
     pub fn replace(&self, servers: Vec<McpServer>) {
-        *self.0.write().unwrap_or_else(PoisonError::into_inner) = servers;
+        let mut projected = self.0.write().unwrap_or_else(PoisonError::into_inner);
+        if projected.servers == servers {
+            return;
+        }
+        projected.servers = servers;
+        projected.generation = projected.generation.wrapping_add(1);
     }
 
     #[must_use]
@@ -137,7 +175,28 @@ impl McpProjection {
         self.0
             .read()
             .unwrap_or_else(PoisonError::into_inner)
+            .servers
             .clone()
+    }
+
+    /// How many content changes this projection has published.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .generation
+    }
+
+    /// The generation and the servers it belongs to, under one read.
+    ///
+    /// Two separate calls could straddle a [`Self::replace`] and pair a stale generation
+    /// with fresh servers, which is exactly the mistake that makes an observer record a
+    /// frame it never painted.
+    #[must_use]
+    pub fn observe(&self) -> (u64, Vec<McpServer>) {
+        let projected = self.0.read().unwrap_or_else(PoisonError::into_inner);
+        (projected.generation, projected.servers.clone())
     }
 
     #[must_use]
@@ -145,6 +204,7 @@ impl McpProjection {
         self.0
             .read()
             .unwrap_or_else(PoisonError::into_inner)
+            .servers
             .is_empty()
     }
 }
