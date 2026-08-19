@@ -208,25 +208,121 @@ fn the_status_strip_has_no_setter_that_nothing_in_production_ever_calls() {
     );
 }
 
+/// Every `fn` in `source`, as `(name, body)`.
+///
+/// Bodies are cut by brace depth from the signature's opening `{`, so a nested `fn`,
+/// closure or `match` cannot leak a neighbour's contents into the answer. That precision
+/// is the whole point here: a per-*file* search is what let the defect through.
+fn functions(source: &str) -> Vec<(String, String)> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut found = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        let trimmed = line.trim_start();
+        let Some(after) = trimmed
+            .strip_prefix("fn ")
+            .or_else(|| trimmed.strip_prefix("async fn "))
+            .or_else(|| trimmed.strip_prefix("pub fn "))
+            .or_else(|| trimmed.strip_prefix("pub async fn "))
+            .or_else(|| trimmed.strip_prefix("pub(crate) fn "))
+            .or_else(|| trimmed.strip_prefix("pub(crate) async fn "))
+            .or_else(|| trimmed.strip_prefix("pub(super) fn "))
+            .or_else(|| trimmed.strip_prefix("pub(super) async fn "))
+        else {
+            index += 1;
+            continue;
+        };
+        let name = after
+            .split(['(', '<', ' '])
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        // Walk to the signature's opening brace, which may be lines below on a wrapped
+        // signature, then to its match.
+        let mut depth = 0_i32;
+        let mut opened = false;
+        let mut body = String::new();
+        let mut cursor = index;
+        while cursor < lines.len() {
+            for character in lines[cursor].chars() {
+                match character {
+                    '{' => {
+                        depth += 1;
+                        opened = true;
+                    }
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+            }
+            if opened {
+                body.push_str(lines[cursor]);
+                body.push('\n');
+                if depth <= 0 {
+                    break;
+                }
+            }
+            cursor += 1;
+        }
+        found.push((name, body));
+        index = cursor.max(index + 1);
+    }
+    found
+}
+
 #[test]
-fn a_session_in_flight_is_counted_where_the_session_actually_runs() {
+fn every_place_that_admits_a_turn_also_counts_the_session() {
     // `Attribution::SessionCount` is the level that tells a busy server from a leaking one,
-    // and it is meaningless unless something maintains the count. Both places that run a
-    // session must take a guard.
-    for (surface, relative) in [
-        ("the TUI's turn driver", "src/cmd/tui.rs"),
-        (
-            "the server's session task",
-            "../zuno-server/src/api/session.rs",
-        ),
-    ] {
-        let source = compact(&cli_source(relative));
+    // and it is meaningless unless something maintains the count.
+    //
+    // The entry points are *derived*, not listed: the server admits a live turn through
+    // `services.runs.begin_turn(...)`, so every function that admits one is a place a
+    // session starts and must therefore take a guard. A third endpoint added later cannot
+    // avoid this gate, because it cannot avoid admitting its turn.
+    //
+    // The previous version of this test searched the whole of `session.rs` for one
+    // occurrence of `SessionCount::enter()`, so the prompt path's guard satisfied it for
+    // the file and the explicit-compact path went uncounted — the hand-kept-sample failure
+    // this repository keeps paying for, in a test written to prevent it.
+    const ADMISSION: &str = "services .runs .begin_turn(";
+    let server = cli_source("../zuno-server/src/api/session.rs");
+    let admitting: Vec<(String, String)> = functions(&server)
+        .into_iter()
+        .filter(|(_, body)| compact(body).contains(ADMISSION))
+        .collect();
+
+    assert!(
+        admitting.len() >= 2,
+        "found {} function(s) admitting a turn; the prompt and compact paths are both \
+         expected, so this gate is no longer looking at the right thing",
+        admitting.len()
+    );
+    for (name, body) in &admitting {
         assert!(
-            source.contains(&compact(
+            compact(body).contains(&compact(
                 "zuno_observability::memory::SessionCount::enter()"
             )),
-            "{surface} does not count its session, so the sampler's session attribution \
-             would read zero however many are running"
+            "`{name}` admits a live turn without counting the session, so the sampler \
+             under-reports active sessions and mis-attributes that growth to the heap"
         );
     }
+}
+
+#[test]
+fn the_tui_turn_driver_counts_its_session_inside_the_function_that_drives_it() {
+    // The TUI has one place a turn runs, and the guard has to be *in* it: a guard anywhere
+    // else in the file would be dropped at the wrong time, so the count would not describe
+    // what is actually in flight.
+    let tui = cli_source("src/cmd/tui.rs");
+    let (_, body) = functions(&tui)
+        .into_iter()
+        .find(|(name, _)| name == "drive_one")
+        .expect("the TUI drives a turn in `drive_one`");
+    assert!(
+        compact(&body).contains(&compact(
+            "zuno_observability::memory::SessionCount::enter()"
+        )),
+        "`drive_one` does not count its session, so the sampler's session attribution \
+         would read zero however many turns have run"
+    );
 }

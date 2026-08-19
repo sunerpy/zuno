@@ -233,6 +233,13 @@ pub struct Report {
     pub server: Option<String>,
     /// What it found, worst first.
     pub diagnostics: Vec<Diagnostic>,
+    /// How many files were refused for space, when this report is a truncation notice.
+    ///
+    /// `0` on every report about a file, so the three states — checked, unclaimed and
+    /// *incomplete* — stay distinguishable. Without the third, a codemod that wrote past
+    /// [`PENDING_EDIT_LIMIT`] left the screen showing a complete-looking check while the
+    /// only record of the gap was a `tracing::warn!` the TUI does not display.
+    dropped: usize,
 }
 
 impl Report {
@@ -243,7 +250,29 @@ impl Report {
             path: path.into(),
             server: None,
             diagnostics: Vec::new(),
+            dropped: 0,
         }
+    }
+
+    /// A notice that `dropped` files were never checked, because the set was full.
+    ///
+    /// Sent down the same channel as a real report, and deliberately: the user is looking
+    /// at the transcript and the status strip, and those are fed by reports. A log line is
+    /// invisible there, so an incomplete check that only logged read as a complete one.
+    #[must_use]
+    pub fn truncated(dropped: usize, limit: usize) -> Self {
+        Self {
+            path: format!("{dropped} file(s) beyond the {limit}-file check limit"),
+            server: None,
+            diagnostics: Vec::new(),
+            dropped,
+        }
+    }
+
+    /// How many files this notice says went unchecked; `0` for a report about a file.
+    #[must_use]
+    pub const fn dropped(&self) -> usize {
+        self.dropped
     }
 
     /// A report from `server`, sorted worst-first.
@@ -265,6 +294,7 @@ impl Report {
             path: path.into(),
             server: Some(server.into()),
             diagnostics,
+            dropped: 0,
         }
     }
 
@@ -286,6 +316,14 @@ impl Report {
     /// The one-line summary, which is what the status strip carries.
     #[must_use]
     pub fn summary(&self) -> String {
+        if self.dropped > 0 {
+            // Named as unchecked rather than as a count, because the number alone reads
+            // like a result. The point is that these files have no result at all.
+            return format!(
+                "{} went unchecked: more files were written than one check can hold",
+                self.path
+            );
+        }
         let Some(server) = &self.server else {
             return format!("{}: no language server claims this file", self.path);
         };

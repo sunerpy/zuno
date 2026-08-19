@@ -809,6 +809,11 @@ pub(crate) async fn compact_session(
     let fanout = services.events.clone();
     let durable_events = state.events().cloned();
     let (sender, receiver) = event_channel();
+    // Counted for the same reason the prompt path is, and it is a *separate* entry point:
+    // a compaction re-reads the whole transcript and re-prompts the model, so it is one of
+    // the most memory-expensive things this server does. Leaving it uncounted made the
+    // sampler under-report active sessions and attribute that growth to the heap instead.
+    let _session = zuno_observability::memory::SessionCount::enter();
     let outcome = if let Some(events) = durable_events.as_ref() {
         let (outcome, ()) = tokio::join!(
             executor.compact(request, guard, sender),

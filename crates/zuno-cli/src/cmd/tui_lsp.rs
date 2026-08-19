@@ -39,50 +39,94 @@ use zuno_tui::views::lsp::{Diagnostic, PendingEditReader, Report, Severity};
 pub(super) const REPORT_CHANNEL_CAPACITY: usize = 16;
 
 /// Ask `manager` about each of `paths` and send one report per file.
-pub(super) async fn report(
-    manager: Arc<Manager>,
-    workspace: PathBuf,
+///
+/// Returns `false` once the screen is gone, so the caller stops asking language servers
+/// about files nobody will be shown.
+///
+/// # Why every send is awaited
+///
+/// These used to be `try_send` with the outcome discarded, and a turn with a larger edit
+/// set than the channel silently lost the overflow: seventeen writes against a sixteen-slot
+/// channel showed sixteen results and looked complete. That breaks this module's own
+/// contract — an unclaimed file must be *reported* as unclaimed, because silence on it
+/// reads as a clean bill of health.
+///
+/// `try_send`'s refuse-newest is right for a value the producer can regenerate and wrong
+/// for a finding nobody can. There is no stall to fear: this runs in its own task, and the
+/// only thing awaiting a slot is the next language-server query — work whose result has
+/// nowhere to go until the screen has read what is already queued.
+async fn report(
+    manager: &Arc<Manager>,
+    workspace: &Path,
     paths: Vec<PathBuf>,
-    reports: mpsc::Sender<Report>,
-) {
+    reports: &mpsc::Sender<Report>,
+    wake: &mpsc::Sender<zuno_tui::app::TerminalEvent>,
+) -> bool {
     for path in paths {
         let display = path
-            .strip_prefix(&workspace)
+            .strip_prefix(workspace)
             .unwrap_or(&path)
             .to_string_lossy()
             .into_owned();
-        if !manager.has_server(&path) {
-            let _sent = reports.try_send(Report::unchecked(display));
-            continue;
-        }
-        // `touch_file` before `diagnostics`: a server that has never seen the file has
-        // nothing to say about it, and the empty answer would be indistinguishable from
-        // a clean one.
-        if let Err(error) = manager.touch_file(&path).await {
-            tracing::debug!(%error, path = %path.display(), "lsp could not open the file");
-            let _sent = reports.try_send(Report::unchecked(display));
-            continue;
-        }
-        let server = manager
-            .status()
-            .await
-            .into_iter()
-            .find(|status| path.starts_with(&status.root))
-            .map_or_else(|| String::from("lsp"), |status| status.id);
-        match manager.diagnostics(&path).await {
-            Ok(diagnostics) => {
-                let _sent = reports.try_send(Report::checked(
-                    display,
-                    server,
-                    diagnostics.iter().map(convert).collect(),
-                ));
+        let report = if manager.has_server(&path) {
+            // `touch_file` before `diagnostics`: a server that has never seen the file has
+            // nothing to say about it, and the empty answer would be indistinguishable from
+            // a clean one.
+            if let Err(error) = manager.touch_file(&path).await {
+                tracing::debug!(%error, path = %path.display(), "lsp could not open the file");
+                Report::unchecked(display)
+            } else {
+                let server = manager
+                    .status()
+                    .await
+                    .into_iter()
+                    .find(|status| path.starts_with(&status.root))
+                    .map_or_else(|| String::from("lsp"), |status| status.id);
+                match manager.diagnostics(&path).await {
+                    Ok(diagnostics) => {
+                        Report::checked(display, server, diagnostics.iter().map(convert).collect())
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, path = %path.display(), "lsp diagnostics failed");
+                        Report::unchecked(display)
+                    }
+                }
             }
-            Err(error) => {
-                tracing::debug!(%error, path = %path.display(), "lsp diagnostics failed");
-                let _sent = reports.try_send(Report::unchecked(display));
-            }
+        } else {
+            Report::unchecked(display)
+        };
+        if !deliver(report, reports, wake).await {
+            return false;
         }
     }
+    true
+}
+
+/// Hand one report over, waiting for room, and nudge the loop to read it.
+///
+/// The nudge is per report rather than per batch, and that is load-bearing rather than
+/// eager: the loop drains only when woken, so a batch larger than the channel would have
+/// the producer waiting for room that only a drain can make and the loop waiting for a
+/// wake that only the finished batch would send. Each side would be waiting for the other.
+///
+/// `false` means the receiver is closed — the screen has gone — which is the one case
+/// where dropping a report is correct, and it terminates the caller rather than being
+/// ignored.
+async fn deliver(
+    report: Report,
+    reports: &mpsc::Sender<Report>,
+    wake: &mpsc::Sender<zuno_tui::app::TerminalEvent>,
+) -> bool {
+    let path = report.path.clone();
+    if reports.send(report).await.is_err() {
+        tracing::debug!(%path, "the screen closed before its diagnostics were read");
+        return false;
+    }
+    // `try_send` here and not `send`: a full wake queue already holds a "look again" the
+    // loop has not consumed, so a second one carries no information. Losing it cannot lose
+    // the report, which is already queued.
+    let _nudged = wake.try_send(zuno_tui::app::TerminalEvent::Wake);
+    true
 }
 
 /// Flatten one LSP diagnostic for display.
@@ -167,8 +211,10 @@ pub(super) async fn check_edits(
     reports: mpsc::Sender<Report>,
 ) {
     let Some(probe) = probe else {
-        // Drained rather than dropped: a closed receiver would make the screen's
-        // `try_send` fail, and a failure it reports nowhere is worse than a no-op.
+        // Drained rather than dropped, so the set does not grow for the lifetime of a
+        // session nobody is checking. No truncation notice here and that is deliberate:
+        // with no server enabled — the default — nothing was going to be checked anyway,
+        // so saying a subset went unchecked would be a row per turn about nothing.
         while signals.recv().await.is_some() {
             let _discarded = pending.take();
         }
@@ -180,11 +226,24 @@ pub(super) async fn check_edits(
         // have carried, which is the whole reason the paths do not travel as messages.
         let (batch, overflowed) = pending.take();
         if overflowed > 0 {
+            // On screen, not only in the log. The default TUI shows no log, so a
+            // `tracing::warn!` alone left a truncated check looking like a complete one —
+            // the same "silence reads as a clean bill of health" this module refuses for a
+            // file no server claims. It goes first, before the reports it qualifies.
             tracing::warn!(
                 overflowed,
                 limit = zuno_tui::views::lsp::PENDING_EDIT_LIMIT,
                 "more files were written than the pending-edit set holds; some are unchecked"
             );
+            if !deliver(
+                Report::truncated(overflowed, zuno_tui::views::lsp::PENDING_EDIT_LIMIT),
+                &reports,
+                &probe.wake,
+            )
+            .await
+            {
+                break;
+            }
         }
         let paths = batch
             .into_iter()
@@ -201,15 +260,19 @@ pub(super) async fn check_edits(
         if paths.is_empty() {
             continue;
         }
-        report(
-            Arc::clone(&probe.manager),
-            probe.workspace.clone(),
+        // Each report nudges as it lands — see [`deliver`]. Nudging only once the whole
+        // batch was queued is what made a batch larger than the channel unable to drain.
+        if !report(
+            &probe.manager,
+            &probe.workspace,
             paths,
-            reports.clone(),
+            &reports,
+            &probe.wake,
         )
-        .await;
-        // Nudge *after* the reports are queued, so the frame the loop draws includes them.
-        let _nudged = probe.wake.try_send(zuno_tui::app::TerminalEvent::Wake);
+        .await
+        {
+            break;
+        }
     }
     probe.manager.shutdown().await;
 }
