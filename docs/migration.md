@@ -167,8 +167,9 @@ ZUNO_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
 A configuration carrying a deprecated form is refused with a message naming the
 replacement and the offending file. This is deliberate: quietly accepting a
 deprecated key leaves a configuration that behaves differently from what it says.
-All ten forms, with the exact messages, are in
-[rejected-inputs.md](rejected-inputs.md).
+All eleven forms, with the exact messages, are in
+[rejected-inputs.md](rejected-inputs.md) — including a config file still under its
+pre-rename name, which Zuno reports rather than silently ignoring.
 
 ## Provider configuration
 

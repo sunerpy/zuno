@@ -89,8 +89,8 @@ mod tests {
         fs::create_dir_all(&deep).expect("create tree");
         fs::create_dir_all(root.path().join("a/.opencode")).expect("create a/.opencode");
         fs::create_dir_all(root.path().join("a/b/c/.opencode")).expect("create c/.opencode");
-        fs::write(root.path().join("a/b/opencode.json"), "{}").expect("write json");
-        fs::write(root.path().join("a/b/opencode.jsonc"), "{}").expect("write jsonc");
+        fs::write(root.path().join("a/b/zuno.json"), "{}").expect("write json");
+        fs::write(root.path().join("a/b/zuno.jsonc"), "{}").expect("write jsonc");
         root
     }
 
@@ -154,15 +154,15 @@ mod tests {
     fn targets_are_probed_in_the_given_order() {
         let root = tree();
         let found = up(
-            &["opencode.jsonc", "opencode.json"],
+            &["zuno.jsonc", "zuno.json"],
             &root.path().join("a/b"),
             Some(&root.path().join("a/b")),
         );
         assert_eq!(
             found,
             vec![
-                root.path().join("a/b/opencode.jsonc"),
-                root.path().join("a/b/opencode.json")
+                root.path().join("a/b/zuno.jsonc"),
+                root.path().join("a/b/zuno.json")
             ]
         );
     }

@@ -17,7 +17,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use zuno_error::ConfigError;
-use zuno_paths::{Env, Layout};
+use zuno_paths::{CONFIG_FILE_STEM, Env, Layout};
 
 /// The schema reference injected into file-backed config layers.
 pub const DEFAULT_SCHEMA: &str = "https://opencode.ai/config.json";
@@ -29,7 +29,6 @@ const OPENCODE_DISABLE_AUTOCOMPACT: &str = "OPENCODE_DISABLE_AUTOCOMPACT";
 const OPENCODE_DISABLE_PRUNE: &str = "OPENCODE_DISABLE_PRUNE";
 const OPENCODE_TEST_MANAGED_CONFIG_DIR: &str = "OPENCODE_TEST_MANAGED_CONFIG_DIR";
 const MERGED_CONFIG_SOURCE: &str = "<merged config>";
-const GLOBAL_CONFIG_NAMES: [&str; 3] = ["opencode.jsonc", "opencode.json", "config.json"];
 
 /// A decoded macOS managed-preferences document and the plist it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,13 +163,14 @@ pub fn discover(directory: &Path, worktree: Option<&Path>) -> Result<Config, Con
 /// Returns [`ConfigError`] for the first existing layer that cannot be read,
 /// parsed, or validated.
 pub fn discover_with(options: &DiscoveryOptions) -> Result<Config, ConfigError> {
+    reject_legacy_config_names(options)?;
     ensure_default_global_config(options)?;
     let mut result = RawJson::empty_object();
 
     // config.ts:258-260. The compatibility contract treats each file as a layer,
-    // so the instructions exception applies between all three global files too.
-    for name in ["config.json", "opencode.json", "opencode.jsonc"] {
-        merge_file(&mut result, &options.layout.config().join(name))?;
+    // so the instructions exception applies between both global files too.
+    for path in Layout::file_in_directory(options.layout.config(), CONFIG_FILE_STEM) {
+        merge_file(&mut result, &path)?;
     }
 
     // config.ts:401-404.
@@ -180,7 +180,7 @@ pub fn discover_with(options: &DiscoveryOptions) -> Result<Config, ConfigError> 
 
     // config.ts:406-410 and ConfigPaths.files: ancestors first, nearest last.
     if !options.layout.project_config_disabled() {
-        for path in Layout::config_files("opencode", &options.directory, options.worktree()) {
+        for path in Layout::config_files(CONFIG_FILE_STEM, &options.directory, options.worktree()) {
             merge_file(&mut result, &path)?;
         }
     }
@@ -190,19 +190,11 @@ pub fn discover_with(options: &DiscoveryOptions) -> Result<Config, ConfigError> 
     result.insert_if_absent("agent", RawJson::empty_object());
     result.insert_if_absent("plugin", RawJson::Array(Vec::new()));
 
-    for directory in options
-        .layout
-        .config_directories(&options.directory, options.worktree())
+    for directory in
+        read_config_directories(&options.layout, &options.directory, options.worktree())
     {
-        let is_override = options
-            .layout
-            .config_dir_override()
-            .filter(|value| !value.is_empty())
-            .is_some_and(|value| directory == Path::new(value));
-        if directory.to_string_lossy().ends_with(".zuno") || is_override {
-            for path in Layout::file_in_directory(&directory, "opencode") {
-                merge_file(&mut result, &path)?;
-            }
+        for path in Layout::file_in_directory(&directory, CONFIG_FILE_STEM) {
+            merge_file(&mut result, &path)?;
         }
     }
     result.insert_if_absent("command", RawJson::empty_object());
@@ -215,7 +207,7 @@ pub fn discover_with(options: &DiscoveryOptions) -> Result<Config, ConfigError> 
 
     // config.ts:516-522.
     if options.managed_config_dir.exists() {
-        for path in Layout::file_in_directory(&options.managed_config_dir, "opencode") {
+        for path in Layout::file_in_directory(&options.managed_config_dir, CONFIG_FILE_STEM) {
             merge_file(&mut result, &path)?;
         }
     }
@@ -280,6 +272,81 @@ pub fn json_error_byte_offset(text: &str, error: &serde_json::Error) -> usize {
         .min(text.len())
 }
 
+/// The subset of [`Layout::config_directories`] that discovery reads config files
+/// from, in precedence order.
+///
+/// `config_directories` also yields the global root and `$HOME/.zuno`, which the
+/// file walk deliberately skips. This is public because `zuno debug` replays
+/// discovery to attribute plugin origins: two copies of this predicate is how the
+/// diagnostic comes to report plugins from a file the runtime does not load.
+#[must_use]
+pub fn read_config_directories(
+    layout: &Layout,
+    directory: &Path,
+    worktree: Option<&Path>,
+) -> Vec<PathBuf> {
+    layout
+        .config_directories(directory, worktree)
+        .into_iter()
+        .filter(|candidate| {
+            let is_override = layout
+                .config_dir_override()
+                .filter(|value| !value.is_empty())
+                .is_some_and(|value| candidate == Path::new(value));
+            candidate
+                .to_string_lossy()
+                .ends_with(zuno_paths::PROJECT_CONFIG_DIRECTORY)
+                || is_override
+        })
+        .collect()
+}
+
+/// Refuse a config file that is still under one of the pre-rename filenames.
+///
+/// Every layer, in the order discovery would have read them. Deleting a filename
+/// from the probe list without this check is how a working config silently stops
+/// being read, so the two changes belong in the same function's blast radius:
+/// what discovery no longer reads, this rejects.
+///
+/// All offenders are collected before reporting, so one run names every file the
+/// user has to rename rather than sending them round the loop once per layer. The
+/// error's own path is the first offender, because [`ConfigError::Invalid`]
+/// renders it as "config file … failed validation" and a directory there would
+/// read as a lie.
+fn reject_legacy_config_names(options: &DiscoveryOptions) -> Result<(), ConfigError> {
+    let mut found = crate::legacy::inspect_global_config_directory(options.layout.config());
+
+    if !options.layout.project_config_disabled() {
+        for path in Layout::config_files(
+            zuno_paths::LEGACY_CONFIG_FILE_STEM,
+            &options.directory,
+            options.worktree(),
+        ) {
+            found.extend(crate::legacy::inspect_config_filename(
+                &path,
+                crate::legacy::ConfigFileScope::ProjectAncestor,
+            ));
+        }
+    }
+
+    for directory in
+        read_config_directories(&options.layout, &options.directory, options.worktree())
+    {
+        found.extend(crate::legacy::inspect_config_directory(&directory));
+    }
+
+    if options.managed_config_dir.exists() {
+        found.extend(crate::legacy::inspect_config_directory(
+            &options.managed_config_dir,
+        ));
+    }
+
+    let Some(root) = found.first().map(|first| first.path().to_path_buf()) else {
+        return Ok(());
+    };
+    crate::legacy::reject(&root, found)
+}
+
 fn ensure_default_global_config(options: &DiscoveryOptions) -> Result<(), ConfigError> {
     if [
         OPENCODE_CONFIG,
@@ -292,22 +359,32 @@ fn ensure_default_global_config(options: &DiscoveryOptions) -> Result<(), Config
         return Ok(());
     }
 
-    let candidates = GLOBAL_CONFIG_NAMES.map(|name| options.layout.config().join(name));
+    let candidates = Layout::file_in_directory(options.layout.config(), CONFIG_FILE_STEM);
     if candidates.iter().any(|path| path.exists()) {
         return Ok(());
     }
 
-    let legacy_config_root = sibling_product_root(options.layout.config(), "opencode");
-    if let Some(old_path) = GLOBAL_CONFIG_NAMES
+    // The sibling `~/.config/opencode/` diagnosis, unchanged in behaviour: it
+    // detects and hard-fails, and never reads or merges that directory. Only the
+    // names move — the probe keeps looking for the filenames the legacy directory
+    // really carries, while the suggested target is the canonical Zuno filename,
+    // so the migration command no longer teaches the old name.
+    let legacy_config_root =
+        sibling_product_root(options.layout.config(), zuno_paths::LEGACY_CONFIG_FILE_STEM);
+    if let Some(old_path) = zuno_paths::LEGACY_GLOBAL_CONFIG_NAMES
         .iter()
         .map(|name| legacy_config_root.join(name))
         .find(|path| path.exists())
     {
-        let new_path = options.layout.config().join(
-            old_path
-                .file_name()
-                .expect("a config candidate always has a filename"),
-        );
+        let old_name = old_path
+            .file_name()
+            .expect("a config candidate always has a filename")
+            .to_string_lossy()
+            .into_owned();
+        let new_path = options
+            .layout
+            .config()
+            .join(crate::legacy::canonical_config_name(&old_name));
         return Err(ConfigError::LegacyConfig {
             copy_command: legacy_copy_command(options, &old_path, &new_path),
             old_path,

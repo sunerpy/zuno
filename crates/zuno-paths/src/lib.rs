@@ -79,6 +79,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 pub use crate::config_chain::{
+    CONFIG_FILE_STEM, LEGACY_CONFIG_FILE_STEM, LEGACY_CONFIG_NAMES, LEGACY_GLOBAL_CONFIG_NAMES,
     LEGACY_PROJECT_DIRECTORY, PROJECT_CONFIG_DIRECTORY, PROJECT_DIRECTORY, unmigrated_project_path,
 };
 pub use crate::ensure::PathsError;
@@ -304,8 +305,8 @@ mod tests {
             layout.config_directories(&cwd, Some(&cwd))
         );
         assert_eq!(
-            config_files("opencode", &cwd, Some(&cwd)),
-            Layout::config_files("opencode", &cwd, Some(&cwd))
+            config_files(CONFIG_FILE_STEM, &cwd, Some(&cwd)),
+            Layout::config_files(CONFIG_FILE_STEM, &cwd, Some(&cwd))
         );
     }
 }

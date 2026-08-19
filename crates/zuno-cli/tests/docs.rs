@@ -924,10 +924,11 @@ struct Rejection {
 /// reworded replacement fails the documentation gate.
 fn rejections() -> Vec<Rejection> {
     use zuno_config::legacy::{
-        inspect_agent_frontmatter, inspect_auth, inspect_config, inspect_global_directory,
+        ConfigFileScope, inspect_agent_frontmatter, inspect_auth, inspect_config,
+        inspect_config_filename, inspect_global_directory,
     };
 
-    let config = Path::new("/example/opencode.json");
+    let config = Path::new("/example/zuno.json");
     let auth = Path::new("/example/auth.json");
     let agent = Path::new("/example/agent/build.md");
 
@@ -966,6 +967,16 @@ fn rejections() -> Vec<Rejection> {
     std::fs::write(dir.path().join("CONTEXT.md"), "legacy").expect("write CONTEXT.md");
     std::fs::write(dir.path().join("config"), "model = \"x\"\n").expect("write config");
     found.extend(inspect_global_directory(dir.path()));
+    // Both scopes of the filename form: they carry different replacements, because
+    // only the project walk can be fixed by switching project config off. A page
+    // showing one would leave the other's message undocumented.
+    std::fs::write(dir.path().join("opencode.json"), "{}").expect("write legacy config");
+    std::fs::write(dir.path().join("opencode.jsonc"), "{}").expect("write legacy JSONC");
+    for scope in [ConfigFileScope::Owned, ConfigFileScope::ProjectAncestor] {
+        for name in ["opencode.json", "opencode.jsonc"] {
+            found.extend(inspect_config_filename(&dir.path().join(name), scope));
+        }
+    }
 
     let scratch = dir.path().display().to_string();
     let mut rejections: Vec<Rejection> = found
@@ -1016,8 +1027,8 @@ fn docs_every_rejected_form_is_documented_with_the_message_the_code_renders() {
         .collect();
     assert_eq!(
         forms.len(),
-        10,
-        "all ten deprecated forms must be reachable for the page to be complete; got {forms:?}"
+        11,
+        "all eleven deprecated forms must be reachable for the page to be complete; got {forms:?}"
     );
 
     check_block(
@@ -1824,6 +1835,26 @@ fn both_readmes_recommend_the_rust_plugin_sdk_without_explaining_a_pinned_versio
 fn readmes_define_zuno_as_independent_while_retaining_the_plugin_abi() {
     let config_root = format!("$XDG_CONFIG_HOME/{}", zuno_paths::APP);
     let data_root = format!("$XDG_DATA_HOME/{}", zuno_paths::APP);
+    // The directory claim held while the *filenames* were still opencode's, and
+    // this gate stayed green throughout because nothing pinned a filename. Both
+    // live spellings are therefore required, derived from `zuno-paths` so a future
+    // rename fails here before it reaches a user.
+    //
+    // A blanket ban on the retired spellings is deliberately *not* the second
+    // half: these READMEs name them on purpose, to say they are no longer read, and
+    // a bare-substring ban would force that sentence out. The checkable property is
+    // the conditional one — a document may name a retired filename only while also
+    // carrying the migration claim, so prose that reverts to *teaching* the old
+    // name (and therefore drops the claim) fails.
+    let config_files = [
+        format!("{}.jsonc", zuno_paths::CONFIG_FILE_STEM),
+        format!("{}.json", zuno_paths::CONFIG_FILE_STEM),
+    ];
+    let retired_config_files: Vec<String> = zuno_paths::LEGACY_GLOBAL_CONFIG_NAMES
+        .iter()
+        .chain(zuno_paths::LEGACY_CONFIG_NAMES.iter())
+        .map(|name| format!("`{name}`"))
+        .collect();
     let plugin_abi = zuno_paths::env::PLUGIN_ABI_ENV_NAMES.to_vec();
     let rejected = rejected_round_trip_spellings();
     // Each document must carry all four claims, because any subset reads as a
@@ -1835,7 +1866,7 @@ fn readmes_define_zuno_as_independent_while_retaining_the_plugin_abi() {
     // `zuno session` has never carried, while this gate stayed green. So the
     // spellings come from the registered `clap` tree and the rejected ones are
     // forbidden outright.
-    for (relative, independence) in [
+    for (relative, independence, migration_claim) in [
         (
             "README.md",
             [
@@ -1844,6 +1875,7 @@ fn readmes_define_zuno_as_independent_while_retaining_the_plugin_abi() {
                 "`zuno export` 与 `zuno import` 构成",
                 "`zuno import` 只读取 Zuno 自己 `zuno export` 出的文档",
             ],
+            "都不再被读取",
         ),
         (
             "docs/readme/README.en.md",
@@ -1853,6 +1885,7 @@ fn readmes_define_zuno_as_independent_while_retaining_the_plugin_abi() {
                 "`zuno export` and `zuno import` close Zuno's own round trip",
                 "`zuno import` reads Zuno's own `zuno export` documents only",
             ],
+            "no longer read",
         ),
     ] {
         let prose = unwrapped(relative);
@@ -1866,6 +1899,18 @@ fn readmes_define_zuno_as_independent_while_retaining_the_plugin_abi() {
                 zuno_paths::PROJECT_CONFIG_DIRECTORY,
             ],
         );
+        let names: Vec<&str> = config_files.iter().map(String::as_str).collect();
+        contains_all_in(&prose, relative, &names);
+        for retired in &retired_config_files {
+            if prose.contains(retired.as_str()) {
+                assert!(
+                    prose.contains(migration_claim),
+                    "{relative} names the retired config filename {retired} without stating that \
+                     it is no longer read; a reader would write that file and be rejected at \
+                     startup with no idea the name changed"
+                );
+            }
+        }
         contains_all(relative, &plugin_abi);
     }
 }

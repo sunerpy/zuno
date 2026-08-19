@@ -49,8 +49,9 @@ use crate::family::{Profile, SurfaceRule};
 
 /// The `provider.*.options` key that gates Azure's walk.
 ///
-/// Spelled exactly as the oracle spells it (`provider.ts:265`), so a user's
-/// existing `opencode.json` keeps working unchanged.
+/// Spelled exactly as the oracle spells it (`provider.ts:265`), so config
+/// *content* authored for opencode keeps working once it is under Zuno's
+/// filename.
 pub const USE_COMPLETION_URLS_OPTION: &str = "useCompletionUrls";
 
 /// The `provider.*.options` key declaring which surfaces an endpoint exposes.

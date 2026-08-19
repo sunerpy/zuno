@@ -23,7 +23,7 @@
 //! `unlink`s the old file; this pass only reports. Detection and reporting, never
 //! repair.
 //!
-//! # The ten forms
+//! # The eleven forms
 //!
 //! | Form | Oracle |
 //! |---|---|
@@ -37,6 +37,7 @@
 //! | a global TOML `config` file | `packages/opencode/src/config/config.ts:262-275` |
 //! | `reference` | `packages/core/src/v1/config/config.ts:48-50` |
 //! | auth-prompt `condition` | `packages/plugin/src/index.ts:102-103,115-116` |
+//! | a legacy-named config file | Zuno-only: the pre-rename `opencode.json(c)` / global `config.json` |
 //!
 //! # Overlap with the schema
 //!
@@ -58,8 +59,16 @@ use zuno_error::{ConfigError, ConfigIssue};
 /// The name of the deprecated TOML config file in the global config directory.
 ///
 /// `packages/opencode/src/config/config.ts:262` joins `Global.Path.config` with
-/// the literal `"config"` — no extension, which is how it is told apart from
-/// `config.json`.
+/// the literal `"config"` — no extension, which is how it was told apart from the
+/// `config.json` the oracle rewrote it into.
+///
+/// Zuno accepts JSONC and strict JSON only, and has no TOML parser at all: the
+/// deeply nested `provider.*.models.*.variants` schema, and the JSON-shaped
+/// keybind, MCP, and agent definitions, are what the config vocabulary is built
+/// around, and [`crate::discovery::strip_jsonc`] already covers comments, trailing
+/// commas, and a BOM while preserving byte offsets so error positions stay
+/// accurate. This constant therefore exists to *reject*, and the replacement it
+/// names is a JSON file.
 pub const LEGACY_TOML_CONFIG_FILE: &str = "config";
 
 /// The deprecated instruction filename (`session/instruction.ts:68`, where the
@@ -73,7 +82,7 @@ pub const LEGACY_AGENT_DIRECTORIES: &[&str] = &["mode", "modes"];
 /// One deprecated input form.
 ///
 /// A closed set, deliberately not `#[non_exhaustive]`: a caller that wants to
-/// react per form should be forced to revisit its `match` when an eleventh form
+/// react per form should be forced to revisit its `match` when a twelfth form
 /// appears.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeprecatedForm {
@@ -97,6 +106,8 @@ pub enum DeprecatedForm {
     Reference,
     /// An auth-prompt `condition` predicate.
     AuthPromptCondition,
+    /// A configuration file under one of the pre-rename filenames.
+    ConfigFileName,
 }
 
 impl DeprecatedForm {
@@ -115,6 +126,7 @@ impl DeprecatedForm {
             Self::ModeDirectory => "agent definition",
             Self::ContextFile => "instruction file",
             Self::TomlConfig => "TOML config file",
+            Self::ConfigFileName => "config filename",
         }
     }
 }
@@ -590,11 +602,98 @@ pub fn inspect_global_directory(dir: &Path) -> Vec<Deprecation> {
             &toml,
             DeprecatedForm::TomlConfig,
             LEGACY_TOML_CONFIG_FILE,
-            "migrate it to `config.json`",
+            format!(
+                "migrate it to `{}` — there is no TOML config path",
+                canonical_config_name("config.json")
+            ),
         ));
     }
     found.extend(inspect_directory(dir));
     found
+}
+
+/// Which config directory a legacy-named file turned up in.
+///
+/// It decides what the repair instruction can honestly offer. In one of Zuno's
+/// own directories the file was unambiguously written *for Zuno*, so renaming it
+/// is the whole fix. On the walk up from the working directory it is a bare file
+/// at somebody's repository root, where it may belong to opencode rather than to
+/// Zuno — so that message additionally names the switch that stops Zuno reading
+/// project config at all, which is the correct fix for that case and would be
+/// misleading advice at the global root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConfigFileScope {
+    /// The global root, `.zuno/`, `OPENCODE_CONFIG_DIR`, or the managed directory.
+    Owned,
+    /// A bare file on the walk up from the working directory to the worktree root.
+    ProjectAncestor,
+}
+
+impl ConfigFileScope {
+    fn escape_hatch(self) -> &'static str {
+        match self {
+            Self::Owned => "",
+            Self::ProjectAncestor => {
+                ", or set `ZUNO_DISABLE_PROJECT_CONFIG=1` if the file belongs to another product"
+            }
+        }
+    }
+}
+
+/// The canonical filename that replaces a legacy one, keeping its extension.
+///
+/// `opencode.jsonc` becomes `zuno.jsonc`; every other legacy spelling — including
+/// the global-only `config.json` — becomes `zuno.json`. Migration advice has to
+/// preserve the extension, because a JSONC document renamed to `.json` stops
+/// parsing the moment it contains the comment it was given the extension for.
+#[must_use]
+pub fn canonical_config_name(legacy: &str) -> String {
+    let stem = zuno_paths::CONFIG_FILE_STEM;
+    if legacy.ends_with(".jsonc") {
+        format!("{stem}.jsonc")
+    } else {
+        format!("{stem}.json")
+    }
+}
+
+/// The deprecation for one candidate config file, or `None` when it is absent.
+///
+/// **This is the seam config discovery calls, and it must run before the file is
+/// read.** A legacy-named file that is merely skipped presents as a config that
+/// changes nothing — the exact silent failure this module exists to prevent, and
+/// the one that would be introduced by deleting a filename from the probe list.
+#[must_use]
+pub fn inspect_config_filename(path: &Path, scope: ConfigFileScope) -> Option<Deprecation> {
+    if !path.is_file() {
+        return None;
+    }
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    let canonical = canonical_config_name(&name);
+    Some(Deprecation::filed(
+        path,
+        DeprecatedForm::ConfigFileName,
+        name,
+        format!("rename it to `{canonical}`{}", scope.escape_hatch()),
+    ))
+}
+
+/// Legacy-named config files in one of Zuno's own config directories.
+#[must_use]
+pub fn inspect_config_directory(dir: &Path) -> Vec<Deprecation> {
+    zuno_paths::LEGACY_CONFIG_NAMES
+        .iter()
+        .filter_map(|name| inspect_config_filename(&dir.join(name), ConfigFileScope::Owned))
+        .collect()
+}
+
+/// Legacy-named config files in the global config root, which also accepted
+/// `config.json` and therefore has one more name to report than any other layer.
+#[must_use]
+pub fn inspect_global_config_directory(dir: &Path) -> Vec<Deprecation> {
+    zuno_paths::LEGACY_GLOBAL_CONFIG_NAMES
+        .iter()
+        .filter_map(|name| inspect_config_filename(&dir.join(name), ConfigFileScope::Owned))
+        .collect()
 }
 
 /// Reject every deprecated form in one config document.

@@ -1,8 +1,8 @@
 //! The one skill that ships inside the binary.
 //!
-//! `skill/index.ts:27-35` and `:276-283`. The model's intuition for
-//! `opencode.json` is often wrong and opencode hard-fails on invalid config, so
-//! this skill hands it the real schemas. It is registered **before** disk
+//! `skill/index.ts:27-35` and `:276-283`. The model's intuition for `zuno.json`
+//! is often wrong and Zuno hard-fails on invalid config, so this skill hands it
+//! the real schemas. It is registered **before** disk
 //! discovery so a user's own `customize-opencode` on disk overrides it.
 //!
 //! Two things here have to be exact rather than approximately right:
@@ -24,7 +24,7 @@ pub const NAME: &str = "customize-opencode";
 pub const LOCATION: &str = "<built-in>";
 
 /// `CUSTOMIZE_OPENCODE_SKILL_DESCRIPTION` (`skill/index.ts:33-34`), verbatim.
-pub const DESCRIPTION: &str = "Use ONLY when the user is editing or creating Zuno's own configuration: opencode.json, opencode.jsonc, files under .zuno/, or files under ~/.config/zuno/. Also use when creating or fixing Zuno agents, subagents, skills, plugins, MCP servers, or permission rules. Do not use for the user's own application code, or for any project that is not configuring Zuno itself.";
+pub const DESCRIPTION: &str = "Use ONLY when the user is editing or creating Zuno's own configuration: zuno.json, zuno.jsonc, files under .zuno/, or files under ~/.config/zuno/. Also use when creating or fixing Zuno agents, subagents, skills, plugins, MCP servers, or permission rules. Do not use for the user's own application code, or for any project that is not configuring Zuno itself.";
 
 /// The body, byte-identical to
 /// `packages/core/src/plugin/skill/customize-opencode.md` at 1.18.13.

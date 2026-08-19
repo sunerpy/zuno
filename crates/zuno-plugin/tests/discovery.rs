@@ -8,8 +8,8 @@ use zuno_plugin::{ConfigDirectory, ConfigLayer, PluginOrigin, PluginScope, disco
 fn relative_specs_resolve_against_each_declaring_config_file() {
     // Given
     let root = tempfile::tempdir().expect("tempdir");
-    let global_file = root.path().join("global/opencode.json");
-    let local_file = root.path().join("repo/.opencode/opencode.json");
+    let global_file = root.path().join("global/zuno.json");
+    let local_file = root.path().join("repo/.zuno/zuno.json");
     fs::create_dir_all(global_file.parent().expect("global parent")).expect("global directory");
     fs::create_dir_all(local_file.parent().expect("local parent")).expect("local directory");
     let global = Config {
@@ -41,7 +41,7 @@ fn relative_specs_resolve_against_each_declaring_config_file() {
     );
     assert_eq!(
         discovered[1].spec.name(),
-        url::Url::from_file_path(root.path().join("repo/.opencode/plugin.ts"))
+        url::Url::from_file_path(root.path().join("repo/.zuno/plugin.ts"))
             .expect("local file URL")
             .as_str()
     );

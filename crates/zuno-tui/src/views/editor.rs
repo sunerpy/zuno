@@ -299,6 +299,8 @@ pub struct InputEditor {
     paste_counter: usize,
     /// First rendered line, for a buffer taller than its area.
     offset: usize,
+    /// Muted text standing where the buffer is empty, or empty for none.
+    placeholder: String,
 }
 
 impl InputEditor {
@@ -319,7 +321,20 @@ impl InputEditor {
             pastes: Vec::new(),
             paste_counter: 0,
             offset: 0,
+            placeholder: String::new(),
         }
+    }
+
+    /// Show `text` in [`ViewContext::muted`] while the buffer is empty.
+    ///
+    /// Held here rather than drawn by the screen over the editor's area, because only the
+    /// editor knows whether the buffer is empty *and* where the caret is: a hint painted
+    /// from outside would either cover the caret or leave it stranded in the middle of a
+    /// sentence the user cannot edit.
+    #[must_use]
+    pub fn with_placeholder(mut self, text: impl Into<String>) -> Self {
+        self.placeholder = text.into();
+        self
     }
 
     /// Install prompts a previous run submitted, oldest first.
@@ -1020,6 +1035,19 @@ impl InputEditor {
                     let at = self.cursor.column.min(spans.len());
                     spans.insert(at, Span::styled(String::from("▏"), self.context.accent()));
                 }
+                // After the caret, so the hint sits beside it rather than under it, and only
+                // on the first row of a wholly empty buffer — a placeholder repeated down a
+                // multi-line buffer would claim every blank line was unwritten.
+                if index == 0 && !self.placeholder.is_empty() && self.is_empty() {
+                    // Truncated in columns, and it has to be: the caret glyph already holds
+                    // one, so a hint measured against the full width would put its tail past
+                    // the right inset the band reserved.
+                    let room = usize::from(width).saturating_sub(1);
+                    let hint = crate::views::truncate(&self.placeholder, room);
+                    if !hint.is_empty() {
+                        spans.push(Span::styled(hint, self.context.muted()));
+                    }
+                }
                 let rendered: String = spans.iter().map(|span| span.content.as_ref()).collect();
                 let pad = usize::from(width).saturating_sub(rendered.chars().count());
                 if pad > 0 {
@@ -1089,7 +1117,10 @@ impl PromptGutter {
 
 impl Component for PromptGutter {
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        fill(frame.buffer_mut(), area, self.context.accent());
+        // `text`, not `accent`: accent is the *marker's* colour, and filling the gutter's
+        // background with it makes two columns a solid bar down the band that reads as a
+        // selection rather than a margin. The two styles differ on purpose.
+        fill(frame.buffer_mut(), area, self.context.text());
         Paragraph::new(vec![padded(&self.label, area.width, self.context.accent())])
             .render(area, frame.buffer_mut());
     }

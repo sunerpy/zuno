@@ -963,10 +963,20 @@ async fn session_catalog(
             provider: provider.clone(),
         })
         .collect();
+    // Filtered here rather than in `agent::list`, which must keep returning everything: the
+    // turn loop resolves a delegation by name and needs the subagents this drops. Both TUI
+    // surfaces read this one list — the `<leader>a` picker and the cycling keys — so one
+    // filter is what stops them disagreeing about what "the agents" are. A subagent is
+    // reachable only by delegation and `hidden` is its author asking not to be offered, so
+    // neither is a valid choice for the session's own agent.
     let agents = zuno_catalog::agent::load(plan.directory(), plan.worktree(), env)
         .map(|agents| {
             agents
                 .into_iter()
+                .filter(|agent| {
+                    !matches!(agent.mode, zuno_catalog::agent::AgentMode::Subagent)
+                        && agent.hidden != Some(true)
+                })
                 .map(|agent| zuno_tui::views::picker::AgentEntry {
                     name: agent.name,
                     description: agent.description.unwrap_or_default(),

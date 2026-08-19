@@ -15,6 +15,22 @@ const FIXTURE: &str = include_str!("../tests/fixtures/upstream-keybinds-1.18.13.
 /// The count the plan and the oracle agree on.
 const EXPECTED_ROWS: usize = 184;
 
+/// Rows whose default spelling deliberately differs from the oracle, and why.
+///
+/// The fixture is a compatibility surface, so a difference has to be declared rather than
+/// tolerated — `table_matches_the_upstream_fixture_row_for_row` requires the shipped value to
+/// equal the declared replacement *and* to still differ from upstream, so an entry cannot
+/// linger as a blanket suppression after the reason expires.
+const SPELLING_DIVERGENCES: &[(&str, &str, &str)] = &[(
+    "agent_cycle_reverse",
+    "shift+backtab,backtab,shift+tab",
+    "upstream's `shift+tab` cannot resolve here: crossterm reports the press as \
+     `KeyCode::BackTab` with `SHIFT`, so the chord it produces is `shift+backtab` and the \
+     oracle's spelling never matches. Upstream reads keys through a different runtime and does \
+     not have this fold. The upstream spelling is kept last for the Kitty protocol, which does \
+     report `Tab` with `SHIFT`.",
+)];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Row {
     name: String,
@@ -111,7 +127,25 @@ fn table_matches_the_upstream_fixture_row_for_row() {
                 index + 1
             )
         });
-        assert_eq!(found.keys, row.keys, "`{}` default keys differ", row.name);
+        if let Some((_, expected, _)) = SPELLING_DIVERGENCES
+            .iter()
+            .find(|(name, _, _)| *name == row.name)
+        {
+            assert_eq!(
+                found.keys, *expected,
+                "`{}` is a declared spelling divergence, but its keys are neither upstream's \
+                 nor the declared replacement",
+                row.name
+            );
+            assert_ne!(
+                found.keys, row.keys,
+                "`{}` is listed in `SPELLING_DIVERGENCES` but now matches upstream; remove the \
+                 entry rather than leaving a suppression behind",
+                row.name
+            );
+        } else {
+            assert_eq!(found.keys, row.keys, "`{}` default keys differ", row.name);
+        }
         assert_eq!(found.command, row.command, "`{}` command differs", row.name);
         assert_eq!(
             found.prevent_default, row.prevent_default,
@@ -895,4 +929,135 @@ fn the_object_form_of_a_binding_carries_prevent_default() {
         }
         other => panic!("the override should resolve: {other:?}"),
     }
+}
+
+/// The key event a default terminal delivers for `chord`, or `None` when unmodelled.
+///
+/// Not the naive inverse of [`Chord::from_key_event`], and that distinction is the whole
+/// value of this helper. A terminal in its default encoding does not report shift-tab as Tab
+/// with a shift flag: it sends the legacy `CSI Z`, which crossterm surfaces as
+/// [`KeyCode::BackTab`] — with `SHIFT` set, because the sequence implies it. So the spelling
+/// `shift+tab` describes a chord the table can parse and a terminal will never send. Folding
+/// that here is what makes the guard below able to fail; an inverse that simply mirrored the
+/// parser would agree with every spelling by construction, including the broken one.
+///
+/// The Kitty keyboard protocol does disambiguate and report `Tab` with `SHIFT`, which is why
+/// the guard asks only that *one* of an action's spellings survive this fold rather than all
+/// of them: a table may carry the modern spelling as well, and should.
+fn legacy_event_for(chord: &Chord) -> Option<KeyEvent> {
+    let rendered = chord.to_string();
+    let mut modifiers = crossterm::event::KeyModifiers::NONE;
+    for (token, flag) in [
+        ("ctrl+", crossterm::event::KeyModifiers::CONTROL),
+        ("alt+", crossterm::event::KeyModifiers::ALT),
+        ("shift+", crossterm::event::KeyModifiers::SHIFT),
+        ("super+", crossterm::event::KeyModifiers::SUPER),
+        ("hyper+", crossterm::event::KeyModifiers::HYPER),
+        ("meta+", crossterm::event::KeyModifiers::META),
+    ] {
+        if rendered.contains(token) {
+            modifiers |= flag;
+        }
+    }
+    let last = rendered.rsplit('+').next().unwrap_or_default();
+    let mut code = match last {
+        "return" => KeyCode::Enter,
+        "escape" => KeyCode::Esc,
+        "tab" => KeyCode::Tab,
+        "backtab" => KeyCode::BackTab,
+        "backspace" => KeyCode::Backspace,
+        "delete" => KeyCode::Delete,
+        "insert" => KeyCode::Insert,
+        "left" => KeyCode::Left,
+        "right" => KeyCode::Right,
+        "up" => KeyCode::Up,
+        "down" => KeyCode::Down,
+        "home" => KeyCode::Home,
+        "end" => KeyCode::End,
+        "pageup" => KeyCode::PageUp,
+        "pagedown" => KeyCode::PageDown,
+        "space" => KeyCode::Char(' '),
+        other if other.starts_with('f') && other.len() > 1 => KeyCode::F(other[1..].parse().ok()?),
+        other => {
+            let mut characters = other.chars();
+            match (characters.next(), characters.next()) {
+                (Some(character), None) => KeyCode::Char(character),
+                _ => return None,
+            }
+        }
+    };
+    if code == KeyCode::Tab && modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
+        code = KeyCode::BackTab;
+    }
+    Some(KeyEvent {
+        code,
+        modifiers,
+        kind: KeyEventKind::Press,
+        state: KeyEventState::NONE,
+    })
+}
+
+#[test]
+fn every_bound_action_has_a_spelling_a_default_terminal_can_actually_send() {
+    // A spelling no terminal produces is a binding that resolves to `Unmatched` forever, and
+    // nothing downstream can rescue it — which makes it the quietest member of the "built but
+    // unreachable" family: the action exists, the scope is registered, the arm is written, and
+    // the key still does nothing. `agent_cycle_reverse` shipped exactly so, spelled
+    // `shift+tab`, against a terminal that sends `BackTab`.
+    //
+    // Nothing else in this file could see it. The fixture comparison checks this table against
+    // upstream's *spellings*, so a spelling wrong on both sides agrees; the parser tests check
+    // that a spelling parses, which this one does. The missing property is the round trip
+    // through the event a terminal actually sends, and it is asserted per *action* rather than
+    // per spelling so a table may also carry the Kitty-protocol form.
+    let keymap = Keymap::defaults().expect("the shipped table builds");
+    let mut unsendable = Vec::new();
+    let mut checked = 0usize;
+    for definition in DEFINITIONS {
+        let spellings = keymap.sequences(definition.name);
+        if spellings.is_empty() {
+            continue;
+        }
+        let mut reports = Vec::new();
+        let mut sendable = false;
+        for spelling in &spellings {
+            let Ok(sequence) = parse_sequence(spelling, keymap.leader()) else {
+                continue;
+            };
+            let mut whole = true;
+            for chord in sequence {
+                let Some(event) = legacy_event_for(&chord) else {
+                    continue;
+                };
+                checked += 1;
+                let observed = Chord::from_key_event(&event);
+                if observed != Some(chord) {
+                    whole = false;
+                    reports.push(format!(
+                        "`{spelling}`'s chord `{chord}` arrives as {}",
+                        observed.map_or_else(
+                            || String::from("an unmodelled key"),
+                            |chord| format!("`{chord}`")
+                        )
+                    ));
+                }
+            }
+            if whole {
+                sendable = true;
+            }
+        }
+        if !sendable {
+            unsendable.push(format!("{}: {}", definition.name, reports.join("; ")));
+        }
+    }
+    assert!(
+        checked >= 200,
+        "the round-trip scan checked only {checked} chords, so it is not reaching the table"
+    );
+    assert!(
+        unsendable.is_empty(),
+        "these actions have no spelling a default terminal can send, so they can never \
+         resolve:\n{}",
+        unsendable.join("\n")
+    );
 }

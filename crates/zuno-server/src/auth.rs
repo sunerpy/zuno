@@ -3,7 +3,9 @@
 //! The enable rule is intentionally not `Option::is_some`: upstream treats both
 //! an absent variable and an empty `OPENCODE_SERVER_PASSWORD` as disabled
 //! (`packages/opencode/src/server/auth.ts:17-26`). A configured username may be
-//! empty; only an absent username receives the upstream default `opencode`.
+//! empty; only an absent username receives the upstream default
+//! [`zuno_paths::env::DEFAULT_SERVER_USERNAME`], which is an ABI value and stays
+//! `opencode`.
 
 use axum::http::HeaderMap;
 use base64::Engine as _;
@@ -26,7 +28,8 @@ impl AuthConfig {
     #[must_use]
     pub fn new(password: Option<String>, username: Option<String>) -> Self {
         Self {
-            username: username.unwrap_or_else(|| "opencode".to_owned()),
+            username: username
+                .unwrap_or_else(|| zuno_paths::env::DEFAULT_SERVER_USERNAME.to_owned()),
             password,
         }
     }

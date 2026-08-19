@@ -141,7 +141,7 @@ const V2_NATIVE_ORDER: &[&str] = &[
 /// `packages/core/src/plugin/skill.ts:23`, which unlike the v1 copy at
 /// `skill/index.ts:33-34` also lists `commands`. `zuno-catalog`'s own doc comment
 /// already records that the two strings differ; this is the V2 one.
-const V2_BUILTIN_SKILL_DESCRIPTION: &str = "Use ONLY when the user is editing or creating Zuno's own configuration: opencode.json, opencode.jsonc, files under .zuno/, or files under ~/.config/zuno/. Also use when creating or fixing Zuno agents, subagents, commands, skills, plugins, MCP servers, or permission rules. Do not use for the user's own application code, or for any project that is not configuring Zuno itself.";
+const V2_BUILTIN_SKILL_DESCRIPTION: &str = "Use ONLY when the user is editing or creating Zuno's own configuration: zuno.json, zuno.jsonc, files under .zuno/, or files under ~/.config/zuno/. Also use when creating or fixing Zuno agents, subagents, commands, skills, plugins, MCP servers, or permission rules. Do not use for the user's own application code, or for any project that is not configuring Zuno itself.";
 
 /// Upstream's `{location, data}` success envelope.
 ///

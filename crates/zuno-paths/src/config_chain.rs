@@ -63,6 +63,56 @@ pub const PROJECT_CONFIG_DIRECTORY: &str = PROJECT_DIRECTORY;
 /// The pre-rename project directory name, used only to detect unmigrated state.
 pub const LEGACY_PROJECT_DIRECTORY: &str = ".opencode";
 
+/// The stem of Zuno's own configuration filename — `zuno.jsonc` / `zuno.json`.
+///
+/// This is the single definition, and it is the name at **every** layer: the
+/// global root, a bare file on the walk up from the working directory,
+/// `.zuno/`, `OPENCODE_CONFIG_DIR`, and the managed directory. One name
+/// everywhere is the property that did not hold before: the global root also
+/// accepted `config.json`, which no other layer ever probed, so the same
+/// document was live in one directory and dead in the next.
+///
+/// # Why `zuno`, and not `config`
+///
+/// `config.jsonc` would match the XDG convention and was already half-accepted
+/// at the global root — but the name has to survive the *project-ancestor*
+/// layer, where it is a bare file at a repository root. `config.json` at a
+/// repository root belongs to whatever that repository is, and Zuno's schema is
+/// `deny_unknown_fields`, so adopting it would turn an unrelated file into a
+/// hard config failure in a great many checkouts. Choosing `config.*` would
+/// therefore mean *adding* that collision to four layers rather than removing it
+/// from one. The cost of `zuno` is that the global path reads
+/// `~/.config/zuno/zuno.json`, repeating the product name; that redundancy is
+/// worth one name that is safe everywhere.
+///
+/// # Format
+///
+/// JSONC and strict JSON only. [`crate::walk::up`] and
+/// [`Layout::file_in_directory`] probe both extensions; there is no TOML config
+/// path, and `zuno-config` has no TOML parser — see
+/// `zuno_config::legacy::LEGACY_TOML_CONFIG_FILE`, which *rejects* an
+/// extensionless TOML `config` file rather than reading it.
+pub const CONFIG_FILE_STEM: &str = "zuno";
+
+/// The pre-rename configuration filename stem, used only to detect unmigrated
+/// config. Never read, never merged — the same hard cut
+/// [`LEGACY_PROJECT_DIRECTORY`] makes for the project directory.
+pub const LEGACY_CONFIG_FILE_STEM: &str = "opencode";
+
+/// Every filename the global config root accepted before the rename.
+///
+/// `config.json` is in this list and `LEGACY_CONFIG_FILE_STEM`'s two spellings
+/// are not enough on their own, because the global root was the *only* layer
+/// that ever probed `config.json`. It is therefore legacy **at the global root
+/// and nowhere else**: reporting a `config.json` under `.zuno/` or at a
+/// repository root would name a file Zuno has never read, which is a false
+/// positive on a very common filename.
+pub const LEGACY_GLOBAL_CONFIG_NAMES: [&str; 3] =
+    ["opencode.jsonc", "opencode.json", "config.json"];
+
+/// The legacy filenames every config directory accepted, `.json` then `.jsonc`.
+pub const LEGACY_CONFIG_NAMES: [&str; 2] = ["opencode.json", "opencode.jsonc"];
+
 /// The pre-rename path of a project-local state file that was never migrated.
 ///
 /// | `.zuno` file | `.opencode` file | result |
@@ -194,9 +244,9 @@ mod tests {
             ] {
                 fs::create_dir_all(path.join(directory)).expect("create directory");
             }
-            fs::write(path.join("repo/opencode.json"), "{}").expect("write root json");
-            fs::write(path.join("repo/a/b/opencode.json"), "{}").expect("write mid json");
-            fs::write(path.join("repo/a/b/opencode.jsonc"), "{}").expect("write mid jsonc");
+            fs::write(path.join("repo/zuno.json"), "{}").expect("write root json");
+            fs::write(path.join("repo/a/b/zuno.json"), "{}").expect("write mid json");
+            fs::write(path.join("repo/a/b/zuno.jsonc"), "{}").expect("write mid jsonc");
             Self { root }
         }
 
@@ -421,16 +471,16 @@ mod tests {
     fn files_are_outermost_first_with_json_before_jsonc() {
         let fixture = Fixture::new();
         let found = Layout::config_files(
-            "opencode",
+            CONFIG_FILE_STEM,
             &fixture.path("repo/a/b/c"),
             Some(&fixture.path("repo")),
         );
         assert_eq!(
             found,
             vec![
-                fixture.path("repo/opencode.json"),
-                fixture.path("repo/a/b/opencode.json"),
-                fixture.path("repo/a/b/opencode.jsonc"),
+                fixture.path("repo/zuno.json"),
+                fixture.path("repo/a/b/zuno.json"),
+                fixture.path("repo/a/b/zuno.jsonc"),
             ]
         );
     }
@@ -449,18 +499,18 @@ mod tests {
     #[test]
     fn file_in_directory_is_json_then_jsonc() {
         assert_eq!(
-            Layout::file_in_directory(Path::new("/cfg"), "opencode"),
+            Layout::file_in_directory(Path::new("/cfg"), CONFIG_FILE_STEM),
             [
-                PathBuf::from("/cfg/opencode.json"),
-                PathBuf::from("/cfg/opencode.jsonc")
+                PathBuf::from("/cfg/zuno.json"),
+                PathBuf::from("/cfg/zuno.jsonc")
             ]
         );
         // Node's join normalizes here too.
         assert_eq!(
-            Layout::file_in_directory(Path::new("/cfg/"), "opencode"),
+            Layout::file_in_directory(Path::new("/cfg/"), CONFIG_FILE_STEM),
             [
-                PathBuf::from("/cfg/opencode.json"),
-                PathBuf::from("/cfg/opencode.jsonc")
+                PathBuf::from("/cfg/zuno.json"),
+                PathBuf::from("/cfg/zuno.jsonc")
             ]
         );
     }

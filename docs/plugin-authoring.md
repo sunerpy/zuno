@@ -212,5 +212,5 @@ ZUNO_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
 `zuno plugin` is **not registered**. Installing a plugin through the CLI
 waits on the resident JavaScript host's compatibility gate; accepting installs
 before plugins can load would write configuration that does not work. Declare
-plugins in `opencode.json` instead. See the CLI table in
+plugins in `zuno.json` instead. See the CLI table in
 [compatibility-matrix.md](compatibility-matrix.md).

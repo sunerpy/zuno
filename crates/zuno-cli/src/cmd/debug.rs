@@ -165,10 +165,11 @@ fn plugin_origins(context: &Context) -> Result<Vec<PluginOriginOutput>, String> 
     let layout = zuno_paths::Layout::resolve(&context.env);
     let mut origins = Vec::new();
 
-    for name in ["config.json", "opencode.json", "opencode.jsonc"] {
+    for path in zuno_paths::Layout::file_in_directory(layout.config(), zuno_paths::CONFIG_FILE_STEM)
+    {
         add_plugin_file(
             &mut origins,
-            &layout.config().join(name),
+            &path,
             layout.config().display().to_string(),
             PluginScope::Global,
         )?;
@@ -180,7 +181,7 @@ fn plugin_origins(context: &Context) -> Result<Vec<PluginOriginOutput>, String> 
     }
     if !layout.project_config_disabled() {
         for path in zuno_paths::Layout::config_files(
-            "opencode",
+            zuno_paths::CONFIG_FILE_STEM,
             &context.directory,
             context.worktree.as_deref(),
         ) {
@@ -194,13 +195,19 @@ fn plugin_origins(context: &Context) -> Result<Vec<PluginOriginOutput>, String> 
     }
 
     let directories = layout.config_directories(&context.directory, context.worktree.as_deref());
+    // Membership in discovery's own list, rather than a second copy of its
+    // `.zuno`-or-override predicate: a divergence here makes this diagnostic
+    // attribute plugins to a file the runtime never loads.
+    let read_from = zuno_config::discovery::read_config_directories(
+        &layout,
+        &context.directory,
+        context.worktree.as_deref(),
+    );
     for directory in &directories {
-        let is_override = layout
-            .config_dir_override()
-            .filter(|value| !value.is_empty())
-            .is_some_and(|value| directory == Path::new(value));
-        if directory.to_string_lossy().ends_with(".zuno") || is_override {
-            for path in zuno_paths::Layout::file_in_directory(directory, "opencode") {
+        if read_from.contains(directory) {
+            for path in
+                zuno_paths::Layout::file_in_directory(directory, zuno_paths::CONFIG_FILE_STEM)
+            {
                 let scope = plugin_scope(context, &path);
                 add_plugin_file(&mut origins, &path, path.display().to_string(), scope)?;
             }
@@ -231,7 +238,7 @@ fn plugin_origins(context: &Context) -> Result<Vec<PluginOriginOutput>, String> 
 
     let managed = managed_config_dir(&context.env);
     if managed.exists() {
-        for path in zuno_paths::Layout::file_in_directory(&managed, "opencode") {
+        for path in zuno_paths::Layout::file_in_directory(&managed, zuno_paths::CONFIG_FILE_STEM) {
             add_plugin_file(
                 &mut origins,
                 &path,

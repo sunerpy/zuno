@@ -224,7 +224,7 @@ fn mcp_add_list_auth_and_logout_persist_headless_state() {
         String::from_utf8_lossy(&added.stderr)
     );
 
-    let config_path = root.path().join("config/zuno/opencode.json");
+    let config_path = root.path().join("config/zuno/zuno.json");
     let config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&config_path).expect("read generated config"))
             .expect("config JSON");
@@ -480,4 +480,56 @@ fn import_reports_a_missing_file() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("File not found"), "{stderr}");
+}
+
+/// A user whose config is still under the pre-rename filename must be told, on the
+/// path the TUI and `zuno run` take.
+///
+/// That path used to render the error with `Display`, which for
+/// `ConfigError::Invalid` is a bare "failed validation (1 issue(s))" — the count
+/// without the instruction. So the assertion is on the *repair instruction* rather
+/// than on failure: exiting non-zero while saying nothing actionable is the outcome
+/// this test exists to reject, and it passes for the wrong reason if it only checks
+/// the exit code.
+#[test]
+fn a_legacy_named_config_is_reported_on_the_turn_path() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let stale = root.path().join("config/zuno/opencode.json");
+    std::fs::create_dir_all(stale.parent().expect("parent")).expect("config dir");
+    std::fs::write(&stale, r#"{"model":"anthropic/claude-sonnet-4-5"}"#).expect("seed config");
+
+    let output = run(root.path(), &["run", "hello"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&stale.display().to_string()),
+        "the error must name the file to rename: {stderr}"
+    );
+    assert!(
+        stderr.contains("rename it to `zuno.json`"),
+        "the error must carry the repair instruction, not just an issue count: {stderr}"
+    );
+}
+
+/// The same config under the canonical filename is read, and its setting takes
+/// effect — the other half of the pair, so a rename that broke reading as well as
+/// rejecting could not pass.
+#[test]
+fn a_canonically_named_config_takes_effect() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let config = root.path().join("config/zuno/zuno.json");
+    std::fs::create_dir_all(config.parent().expect("parent")).expect("config dir");
+    std::fs::write(&config, r#"{"username":"canonical-name-reader"}"#).expect("seed config");
+
+    let output = run(root.path(), &["debug", "config"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("canonical-name-reader"),
+        "the canonically named config was accepted but its setting did not appear: {stdout}"
+    );
 }

@@ -160,7 +160,12 @@ impl TurnPlan {
                 worktree.as_deref(),
                 env.clone(),
             ))
-            .map_err(to_string)?;
+            // `report()`, not `to_string()`: `ConfigError::Invalid` keeps its
+            // per-issue detail out of `Display` deliberately, so `to_string` here
+            // printed "failed validation (1 issue(s))" and dropped every repair
+            // instruction. This is the path both the TUI and `zuno run` take, which
+            // made it the one place a config error reached a user unactionable.
+            .map_err(|error| error.report())?;
         let credentials = zuno_auth::AuthStore::resolve(&layout, env)
             .all()
             .map_err(to_string)?
@@ -1616,8 +1621,8 @@ const ENDPOINT_OPTIONS: [&str; 2] = ["endpoint", "baseURL"];
 
 /// The option key carrying a configured API key.
 ///
-/// Spelled as the oracle spells it (`provider.ts:1719`), so an existing
-/// `opencode.json` keeps working. Like the endpoint keys it is **excluded** from the
+/// Spelled as the oracle spells it (`provider.ts:1719`), so config *content*
+/// authored for opencode keeps working once it is under Zuno's filename. Like the endpoint keys it is **excluded** from the
 /// forwarded SDK bag — see [`resolved_elsewhere`] — because it is the credential, and
 /// the credential travels one way only, through [`zuno_provider_compatible::factory`]'s
 /// lookup.
