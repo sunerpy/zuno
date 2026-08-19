@@ -109,9 +109,9 @@ async fn report(
 /// the producer waiting for room that only a drain can make and the loop waiting for a
 /// wake that only the finished batch would send. Each side would be waiting for the other.
 ///
-/// `false` means the receiver is closed — the screen has gone — which is the one case
-/// where dropping a report is correct, and it terminates the caller rather than being
-/// ignored.
+/// `false` means either channel's receiver is closed — the screen or the loop has gone —
+/// which is the one case where giving up is correct, and it terminates the caller rather
+/// than being ignored.
 async fn deliver(
     report: Report,
     reports: &mpsc::Sender<Report>,
@@ -122,10 +122,24 @@ async fn deliver(
         tracing::debug!(%path, "the screen closed before its diagnostics were read");
         return false;
     }
-    // `try_send` here and not `send`: a full wake queue already holds a "look again" the
-    // loop has not consumed, so a second one carries no information. Losing it cannot lose
-    // the report, which is already queued.
-    let _nudged = wake.try_send(zuno_tui::app::TerminalEvent::Wake);
+    // Awaited, like the report itself. This was `try_send` on the reasoning that a full
+    // queue must already hold a "look again" the loop has not read — which is false: the
+    // sixty-four slots are shared with every keystroke and resize, so a burst of typing
+    // fills them with events that say nothing about diagnostics. The report was then
+    // queued and the only thing that would have drawn it was gone.
+    //
+    // Queueing the report is not enough on its own. The screen drains reports when it
+    // handles an event, and nothing guarantees another arrives: `SessionScreen`'s handler
+    // returns early for paste and printable keys, so "some later event will drain it" is
+    // not a backstop. The nudge is the guarantee.
+    //
+    // Waiting cannot deadlock: the event loop receives terminal events unconditionally,
+    // including while a lease is held, so a slot always comes free.
+    if wake.send(zuno_tui::app::TerminalEvent::Wake).await.is_err() {
+        // The one case where giving up is right — no loop remains to show anything.
+        tracing::debug!(%path, "the event loop closed before it could be nudged");
+        return false;
+    }
     true
 }
 

@@ -1727,3 +1727,365 @@ async fn app_the_input_producer_returns_once_its_consumer_is_gone() {
         .expect("the producer must notice a closed channel within a few polls")
         .expect("the producer must not panic");
 }
+
+/// Counts terminal events by kind, so a wake can be told from a keystroke.
+///
+/// [`EventRecorder`] counts every terminal event together, which cannot distinguish "the
+/// wake was dispatched" from "a resize happened to arrive". This one names the kinds.
+struct WakeRecorder {
+    wakes: Arc<AtomicUsize>,
+    inputs: Arc<AtomicUsize>,
+}
+
+impl Component for WakeRecorder {
+    fn render(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        frame.render_widget(Paragraph::new("ready"), area);
+    }
+
+    fn handle_event(&mut self, event: &AppEvent) -> EventResult {
+        match event {
+            AppEvent::Terminal(TerminalEvent::Wake) => {
+                self.wakes.fetch_add(1, Ordering::SeqCst);
+            }
+            AppEvent::Terminal(TerminalEvent::Input(_)) => {
+                self.inputs.fetch_add(1, Ordering::SeqCst);
+            }
+            _ => {}
+        }
+        EventResult::REDRAW
+    }
+}
+
+/// A suspended app, its terminal sender, and the counters its root increments.
+///
+/// # Why the pause barrier is sent by hand
+///
+/// The interleaving is the whole subject, and with a real input producer the barrier's
+/// position in the queue is a race — the test would prove whichever order it happened to
+/// win. Sending it here makes the order the assertion instead of the weather.
+///
+/// Everything else is production: the real [`TerminalOwner::yield_terminal`] publishes
+/// `suspended`, the real `reclaim_terminal` resumes, and the epoch is the one the real
+/// handshake allocated, so the loop's `acknowledge` is fed the value the producer would
+/// have sent. With no producer attached `wait_for_pause` returns immediately, which is why
+/// the lease can be taken without one.
+struct SuspendedApp {
+    terminal_tx: mpsc::Sender<TerminalEvent>,
+    wakes: Arc<AtomicUsize>,
+    inputs: Arc<AtomicUsize>,
+    owner: Arc<TerminalLeaseOwner>,
+    /// Held for the whole fixture: dropping it closes the engine inlet, and the loop
+    /// treats that as a fatal `EngineEventsClosed` rather than as an idle app.
+    _engine_tx: mpsc::Sender<TurnEvent>,
+    lease: Option<zuno_engine::terminal_lease::TerminalLeaseGuard>,
+    task: tokio::task::JoinHandle<Result<(), AppError>>,
+    epoch: u64,
+}
+
+impl SuspendedApp {
+    async fn new() -> Self {
+        let lifecycle = Arc::new(FakeLifecycle::default());
+        lifecycle.enter().expect("fake terminal enters");
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let inputs = Arc::new(AtomicUsize::new(0));
+        let root = WakeRecorder {
+            wakes: Arc::clone(&wakes),
+            inputs: Arc::clone(&inputs),
+        };
+        let (target, screen) = SharedTestTarget::new(10, 2);
+        let (terminal_tx, terminal_rx) = terminal_event_channel();
+        let (engine_tx, engine_rx) = mpsc::channel(1);
+        let (mut app, owner) = App::new(
+            Box::new(root),
+            Box::new(target),
+            Arc::clone(&lifecycle) as Arc<_>,
+            terminal_rx,
+            engine_rx,
+        );
+        let task = tokio::spawn(async move { app.run().await });
+        wait_until(move || locked(&screen).draws == 1).await;
+
+        let lease = owner
+            .broker_with_timeout(Duration::from_secs(3_600))
+            .acquire(LeaseReason::new("tui", "external editor"))
+            .await
+            .expect("the lease is granted with no producer attached");
+        wait_until(|| owner.suspended.load(Ordering::SeqCst)).await;
+        let epoch = owner.input.state.borrow().requested;
+
+        Self {
+            terminal_tx,
+            wakes,
+            inputs,
+            owner,
+            _engine_tx: engine_tx,
+            lease: Some(lease),
+            task,
+            epoch,
+        }
+    }
+
+    async fn send(&self, event: TerminalEvent) {
+        self.terminal_tx
+            .send(event)
+            .await
+            .expect("the terminal channel is open");
+    }
+
+    /// The barrier the input producer places after the last key it read.
+    async fn send_pause_barrier(&self) {
+        self.send(TerminalEvent::InputPaused(self.epoch)).await;
+        // The loop acknowledges the barrier as it consumes it, so this is the observable
+        // proof that the suspended branch really ran — no sleep required.
+        wait_until(|| self.owner.input.state.borrow().acknowledged >= self.epoch).await;
+    }
+
+    /// Wait until the loop has taken every event sent so far, then prove it is still
+    /// suspended.
+    ///
+    /// Without this the tests are races rather than interleavings. An event still sitting
+    /// in the channel when the lease releases is received by the *resumed* loop and
+    /// dispatched normally, so a test that released the lease straight after sending would
+    /// pass against a build that discards wakes while suspended — which is exactly what one
+    /// of these did before this probe existed.
+    ///
+    /// A restored channel capacity is the observable: the sender reports a slot free only
+    /// once the receiver has moved the value out, and the loop yields only at its `select!`,
+    /// so a test task that sees an empty channel is running after the loop's match arm for
+    /// that event has already executed.
+    async fn drained(&self) {
+        wait_until(|| self.terminal_tx.capacity() == TERMINAL_EVENT_CHANNEL_CAPACITY).await;
+        assert!(
+            self.owner.suspended.load(Ordering::SeqCst),
+            "the lease ended before the loop consumed the events under test, so this \
+             interleaving was never actually exercised"
+        );
+    }
+
+    /// Release the lease and wait for the resumed loop to finish what it owes.
+    async fn resume(&mut self) {
+        self.lease
+            .take()
+            .expect("the lease is still held")
+            .release();
+        wait_until(|| !self.owner.suspended.load(Ordering::SeqCst)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn shutdown(self) {
+        self.send(TerminalEvent::Shutdown).await;
+        self.task
+            .await
+            .expect("the event loop task does not panic")
+            .expect("the event loop exits cleanly");
+    }
+}
+
+#[tokio::test]
+async fn app_dispatches_a_wake_that_arrived_before_the_pause_barrier() {
+    // The interleaving that actually tests the rule: the wake is remembered *first*, and
+    // then `InputPaused` clears the deferral queue. A fix that parked the wake in that
+    // queue would pass the other ordering and fail here.
+    let mut app = SuspendedApp::new().await;
+
+    app.send(TerminalEvent::Wake).await;
+    app.send_pause_barrier().await;
+    app.drained().await;
+    assert_eq!(
+        app.wakes.load(Ordering::SeqCst),
+        0,
+        "a wake must not be dispatched while the editor owns the terminal"
+    );
+
+    app.resume().await;
+
+    assert_eq!(
+        app.wakes.load(Ordering::SeqCst),
+        1,
+        "the wake raised during the lease never reached the screen, so a diagnostics \
+         batch that finished while the editor was open would sit in its channel forever"
+    );
+    app.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_dispatches_a_wake_that_arrived_after_the_pause_barrier() {
+    // The production ordering: the producer parks promptly and the checker finishes much
+    // later, well inside a long editing session.
+    let mut app = SuspendedApp::new().await;
+
+    app.send_pause_barrier().await;
+    app.send(TerminalEvent::Wake).await;
+    app.drained().await;
+    assert_eq!(
+        app.wakes.load(Ordering::SeqCst),
+        0,
+        "a wake must not be dispatched while the editor owns the terminal"
+    );
+
+    app.resume().await;
+
+    assert_eq!(
+        app.wakes.load(Ordering::SeqCst),
+        1,
+        "a wake raised after the barrier but still during the lease was discarded"
+    );
+    app.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_collapses_many_wakes_raised_during_one_lease_into_a_single_dispatch() {
+    // A wake carries no payload, so seventeen of them ask the same question once. This is
+    // what makes a `bool` the right shape: it cannot grow across an editing session of any
+    // length, and one dispatch drains every report the seventeen were raised for.
+    let mut app = SuspendedApp::new().await;
+
+    for _ in 0..17 {
+        app.send(TerminalEvent::Wake).await;
+    }
+    app.send_pause_barrier().await;
+    app.drained().await;
+    app.resume().await;
+
+    assert_eq!(
+        app.wakes.load(Ordering::SeqCst),
+        1,
+        "seventeen wakes must coalesce into one dispatch, not seventeen"
+    );
+    app.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_still_discards_physical_input_buffered_across_the_lease() {
+    // The other half of the distinction, asserted so the fix cannot be "remember
+    // everything". A key read before the handoff belongs to neither the editor nor the
+    // resumed TUI, and replaying it could submit a prompt or exit the app.
+    let mut app = SuspendedApp::new().await;
+
+    app.send(TerminalEvent::Input(CrosstermEvent::FocusGained))
+        .await;
+    app.send(TerminalEvent::Wake).await;
+    app.send_pause_barrier().await;
+    app.drained().await;
+    app.resume().await;
+
+    assert_eq!(
+        app.inputs.load(Ordering::SeqCst),
+        0,
+        "input buffered at the lease boundary must still be discarded"
+    );
+    assert_eq!(
+        app.wakes.load(Ordering::SeqCst),
+        1,
+        "the wake beside it must still survive"
+    );
+    app.shutdown().await;
+}
+
+/// An app that is never run, for asserting on its deferral bookkeeping directly.
+fn idle_app() -> (App, Arc<TerminalLeaseOwner>, mpsc::Sender<TerminalEvent>) {
+    let lifecycle = Arc::new(FakeLifecycle::default());
+    lifecycle.enter().expect("fake terminal enters");
+    let (target, _screen) = SharedTestTarget::new(10, 2);
+    let (terminal_tx, terminal_rx) = terminal_event_channel();
+    let (_engine_tx, engine_rx) = mpsc::channel(1);
+    let (app, owner) = App::new(
+        Box::new(Label("ready")),
+        Box::new(target),
+        lifecycle as Arc<_>,
+        terminal_rx,
+        engine_rx,
+    );
+    (app, owner, terminal_tx)
+}
+
+#[test]
+fn app_a_deferred_wake_is_remembered_as_a_bit_and_survives_the_next_pause_barrier() {
+    // The resume race, asserted where it is decidable. The lease can be taken again between
+    // the loop's `suspended` check and `handle_terminal`'s own, which yields
+    // `Dispatch::Deferred(Wake)`. Routing that into `pending_terminal` compiles and looks
+    // right, and the very next `InputPaused` then erases it — so the wake would be lost
+    // exactly when a second lease follows the first.
+    //
+    // Driven through `defer_terminal`, the one funnel every deferral passes, rather than by
+    // racing two leases: the interleaving that produces `Deferred` is not schedulable on
+    // demand, and a test that waited for it would be a flake rather than a proof. The
+    // outcome across two real leases is covered by
+    // [`app_a_wake_survives_a_second_lease_taken_immediately_after_the_first`].
+    let (mut app, owner, _terminal_tx) = idle_app();
+
+    app.defer_terminal(TerminalEvent::Wake, Placement::Back);
+    assert!(app.pending_wake, "a deferred wake must be remembered");
+    assert!(
+        app.pending_terminal.is_empty(),
+        "a deferred wake must not enter the queue that `InputPaused` clears"
+    );
+
+    // A real key beside it, so the assertion below distinguishes "the barrier cleared
+    // everything" from "the barrier cleared the right thing".
+    app.defer_terminal(
+        TerminalEvent::Input(CrosstermEvent::FocusGained),
+        Placement::Back,
+    );
+    assert_eq!(app.pending_terminal.len(), 1);
+
+    let epoch = owner.input.state.borrow().requested + 1;
+    app.handle_terminal(TerminalEvent::InputPaused(epoch))
+        .expect("the barrier is handled");
+
+    assert!(
+        app.pending_terminal.is_empty(),
+        "the barrier must still retire stale physical input"
+    );
+    assert!(
+        app.pending_wake,
+        "the barrier erased the owed wake, so a wake deferred by the resume race would be \
+         lost and the reports it was raised for would never be drawn"
+    );
+}
+
+#[tokio::test]
+async fn app_a_wake_survives_a_second_lease_taken_immediately_after_the_first() {
+    // The same claim over the production path: two leases back to back, with the wake
+    // raised during the first. Whichever way the loop and the successor interleave — the
+    // wake dispatched in the gap, or deferred and re-owed — it must reach the screen
+    // exactly once, and the successor's own barrier must not erase it.
+    //
+    // Honest about its own reach: which interleaving occurs is the scheduler's choice, so
+    // this passes when the wake is dispatched in the gap even against a build that routes a
+    // deferred wake into the queue. It is a guard on the outcome, and the sibling test
+    // above is the proof of the routing rule. Both are kept because they fail to different
+    // mistakes: that one to wrong routing, this one to a wake lost across two real leases.
+    let mut app = SuspendedApp::new().await;
+    app.send(TerminalEvent::Wake).await;
+    app.drained().await;
+
+    // Resume, then immediately take the terminal again before asserting anything.
+    app.resume().await;
+    let second = app
+        .owner
+        .broker_with_timeout(Duration::from_secs(3_600))
+        .acquire(LeaseReason::new("tui", "a second external editor"))
+        .await
+        .expect("the second lease is granted");
+    wait_until(|| app.owner.suspended.load(Ordering::SeqCst)).await;
+    let second_epoch = app.owner.input.state.borrow().requested;
+    app.send(TerminalEvent::InputPaused(second_epoch)).await;
+    wait_until(|| app.owner.input.state.borrow().acknowledged >= second_epoch).await;
+
+    second.release();
+    wait_until(|| !app.owner.suspended.load(Ordering::SeqCst)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(
+        app.wakes.load(Ordering::SeqCst),
+        1,
+        "the wake raised during the first lease must be dispatched exactly once across \
+         both leases, never erased by the second lease's pause barrier"
+    );
+    app.shutdown().await;
+}
