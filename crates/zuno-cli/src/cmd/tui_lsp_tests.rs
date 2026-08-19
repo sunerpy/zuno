@@ -59,12 +59,23 @@ fn usable_server(name: &str) -> Result<PathBuf, Unusable> {
     }
 }
 
-/// A wake sink whose receiver is dropped, which is the shape a nudge has to survive.
+/// A wake sink **and its receiver**, which the caller must keep alive.
 ///
-/// `try_send` on a closed channel fails, and it must cost nothing: the reports are still
-/// queued, and a nudge nobody is listening for is not an error.
-fn wake() -> mpsc::Sender<zuno_tui::app::TerminalEvent> {
-    zuno_tui::app::terminal_event_channel().0
+/// This used to return the sender alone and drop the receiver, on the reasoning that a
+/// nudge nobody listens for costs nothing. That stopped being true when the nudge became
+/// awaited: a closed wake channel now means "no event loop remains", which ends the
+/// checker on purpose. A test that dropped the receiver would therefore be asserting
+/// against the give-up path while looking like it asserted against the healthy one — the
+/// nudge would never be attempted, and the very loss these tests exist to catch would be
+/// invisible to them.
+///
+/// Returning the pair makes that unrepresentable: the receiver has to be bound to be
+/// ignored, and `_wake` in a caller is a visible decision rather than an accident.
+fn wake() -> (
+    mpsc::Sender<zuno_tui::app::TerminalEvent>,
+    mpsc::Receiver<zuno_tui::app::TerminalEvent>,
+) {
+    zuno_tui::app::terminal_event_channel()
 }
 
 fn config(json: &str) -> zuno_config::schema::Config {
@@ -111,15 +122,15 @@ fn tui_lsp_no_probe_when_configuration_enables_nothing() {
     // unchecked, putting a row in the transcript per write for the many users who have no
     // `lsp` key at all.
     let root = tempfile::tempdir().expect("a temporary directory");
-    assert!(Probe::resolve(&config("{}"), root.path(), wake()).is_none());
-    assert!(Probe::resolve(&config(r#"{"lsp":false}"#), root.path(), wake()).is_none());
+    assert!(Probe::resolve(&config("{}"), root.path(), wake().0).is_none());
+    assert!(Probe::resolve(&config(r#"{"lsp":false}"#), root.path(), wake().0).is_none());
 }
 
 #[test]
 fn tui_lsp_probe_exists_once_a_server_is_enabled() {
     let root = tempfile::tempdir().expect("a temporary directory");
     assert!(
-        Probe::resolve(&config(r#"{"lsp":true}"#), root.path(), wake()).is_some(),
+        Probe::resolve(&config(r#"{"lsp":true}"#), root.path(), wake().0).is_some(),
         "`lsp: true` enables the built-in definitions, so a probe must exist"
     );
 }
@@ -333,11 +344,121 @@ async fn tui_lsp_a_truncated_check_says_so_on_screen_and_not_only_in_the_log() {
 }
 
 #[tokio::test]
+async fn tui_lsp_a_nudge_waits_for_room_instead_of_being_dropped_when_the_terminal_queue_is_full() {
+    // The third place this lossiness moved to. Awaiting the *report* only guarantees the
+    // data is in its channel; the screen drains reports when it handles an event, and the
+    // nudge is what makes an event happen. `try_send` for the nudge was justified by "a full
+    // queue already holds a look again the loop has not read", and that is false: the
+    // sixty-four slots are shared with every keystroke and resize, so a burst of typing
+    // fills them with events that say nothing about diagnostics. The report was queued and
+    // the only thing that would have drawn it was thrown away.
+    //
+    // Deterministic rather than timed: the queue is filled to exactly capacity with ordinary
+    // printable keys, so the nudge provably has nowhere to go until a slot is freed here.
+    let (wake_tx, mut wake_rx) = wake();
+    for index in 0..zuno_tui::app::TERMINAL_EVENT_CHANNEL_CAPACITY {
+        let key = char::from(b'a' + u8::try_from(index % 26).expect("index fits a byte"));
+        wake_tx
+            .try_send(zuno_tui::app::TerminalEvent::Input(
+                zuno_tui::crossterm::event::Event::Key(zuno_tui::crossterm::event::KeyEvent::from(
+                    zuno_tui::crossterm::event::KeyCode::Char(key),
+                )),
+            ))
+            .expect("the queue accepts events up to its capacity");
+    }
+    assert_eq!(
+        wake_tx.capacity(),
+        0,
+        "the queue must be full for this test to mean anything"
+    );
+
+    let (reports, mut report_receiver) = mpsc::channel(REPORT_CHANNEL_CAPACITY);
+    let delivering = tokio::spawn({
+        let wake_tx = wake_tx.clone();
+        async move {
+            deliver(
+                zuno_tui::views::lsp::Report::unchecked("src/lib.rs"),
+                &reports,
+                &wake_tx,
+            )
+            .await
+        }
+    });
+
+    // The report lands immediately — its channel has room — and then the task must be
+    // parked on the nudge. Asserted by making no room and confirming it has not finished.
+    let report = tokio::time::timeout(std::time::Duration::from_secs(5), report_receiver.recv())
+        .await
+        .expect("the report is queued without waiting")
+        .expect("a report arrives");
+    assert_eq!(report.path, "src/lib.rs");
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !delivering.is_finished(),
+        "the nudge did not wait for room: it was dropped, and with it the only thing that \
+         would have made the screen read the report already sitting in its channel"
+    );
+
+    // One slot, which is all a coalescing wake needs.
+    let displaced = wake_rx.recv().await.expect("a queued key");
+    assert!(
+        matches!(displaced, zuno_tui::app::TerminalEvent::Input(_)),
+        "the first event out must be the oldest key, not the nudge"
+    );
+
+    let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), delivering)
+        .await
+        .expect("the nudge is sent once a slot frees")
+        .expect("the delivering task does not panic");
+    assert!(delivered, "delivery reported failure with both ends open");
+
+    let mut sent = Vec::new();
+    while let Ok(event) = wake_rx.try_recv() {
+        sent.push(event);
+    }
+    assert!(
+        sent.iter()
+            .any(|event| matches!(event, zuno_tui::app::TerminalEvent::Wake)),
+        "no wake ever reached the queue, so the report would never be drawn"
+    );
+    assert_eq!(
+        sent.iter()
+            .filter(|event| matches!(event, zuno_tui::app::TerminalEvent::Wake))
+            .count(),
+        1,
+        "one report owes one nudge"
+    );
+}
+
+#[tokio::test]
+async fn tui_lsp_delivery_gives_up_when_the_event_loop_is_gone() {
+    // The one case where dropping a nudge is right, and it must be reported rather than
+    // ignored: with no loop left there is nothing to draw anything, so the caller should
+    // stop querying language servers instead of working for a screen that no longer exists.
+    let (wake_tx, wake_rx) = wake();
+    drop(wake_rx);
+    let (reports, _report_receiver) = mpsc::channel(REPORT_CHANNEL_CAPACITY);
+
+    assert!(
+        !deliver(
+            zuno_tui::views::lsp::Report::unchecked("src/lib.rs"),
+            &reports,
+            &wake_tx,
+        )
+        .await,
+        "a closed event loop must end delivery, not be silently ignored"
+    );
+}
+
+#[tokio::test]
 async fn tui_lsp_check_edits_skips_a_path_that_is_not_a_file() {
     // A model may report a write to a path it then removed, or to a directory. Asking a
     // language server about it would fail per file and produce a row per failure.
     let root = tempfile::tempdir().expect("a temporary directory");
-    let probe = Probe::resolve(&config(r#"{"lsp":true}"#), root.path(), wake()).expect("a probe");
+    let (wake_tx, _wake_rx) = wake();
+    let probe = Probe::resolve(&config(r#"{"lsp":true}"#), root.path(), wake_tx).expect("a probe");
     let (wake_sender, edit_receiver) = mpsc::channel(1);
     let pending = zuno_tui::views::lsp::PendingEdits::new(wake_sender);
     let reader = pending.reader();
@@ -386,7 +507,11 @@ async fn tui_lsp_reports_a_real_diagnostic_from_a_real_language_server() {
     )
     .expect("a source file");
 
-    let probe = Probe::resolve(&pinned_rust_config(&server), root.path(), wake()).expect("a probe");
+    // The receiver is held for the whole test: a dropped one now ends the checker, so the
+    // report below would be racing a shutdown instead of arriving normally.
+    let (wake_tx, _wake_rx) = wake();
+    let probe =
+        Probe::resolve(&pinned_rust_config(&server), root.path(), wake_tx).expect("a probe");
     let (wake_sender, edit_receiver) = mpsc::channel(1);
     let pending = zuno_tui::views::lsp::PendingEdits::new(wake_sender);
     let reader = pending.reader();

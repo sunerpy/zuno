@@ -1124,6 +1124,31 @@ pub struct App {
     engine_events: mpsc::Receiver<TurnEvent>,
     pending_terminal: VecDeque<TerminalEvent>,
     pending_engine: VecDeque<TurnEvent>,
+    /// Whether a [`TerminalEvent::Wake`] arrived while the terminal was leased away.
+    ///
+    /// # Why a `bool` and not a queue
+    ///
+    /// A wake carries no payload. It means only "re-read durable state", so N of them
+    /// answer the same question as one and coalescing loses nothing. A `bool` also cannot
+    /// grow, which a `VecDeque` fed by a background task across an unbounded editor
+    /// session could.
+    ///
+    /// # Why it is not [`Self::pending_terminal`]
+    ///
+    /// `InputPaused` clears that queue on purpose — a key read before the handoff belongs
+    /// to neither the editor nor the resumed TUI. This bit must survive exactly that
+    /// clear, which is the whole reason it is a separate field: a wake describes no past
+    /// keystroke, only a future refresh that has not happened yet.
+    ///
+    /// # What was lost without it
+    ///
+    /// The suspended branch discarded `Wake` alongside `Input`, and the two are different
+    /// in kind: discarding input drops a stale fact, discarding a wake cancels a refresh
+    /// nobody will ask for again. A diagnostics batch that finished while an external
+    /// editor held the lease left its reports queued and never drew them, because
+    /// `SessionScreen::handle_event` returns early for paste and printable keys, so no
+    /// later event is guaranteed to drain them.
+    pending_wake: bool,
     redraw_config: RedrawConfig,
 }
 
@@ -1163,6 +1188,7 @@ impl App {
                 engine_events,
                 pending_terminal: VecDeque::new(),
                 pending_engine: VecDeque::new(),
+                pending_wake: false,
                 redraw_config: REDRAW_CONFIG,
             },
             owner,
@@ -1186,7 +1212,26 @@ impl App {
             if !self.owner.suspended.load(Ordering::SeqCst) {
                 if let Some(event) = self.pending_terminal.pop_front() {
                     match self.dispatch_terminal(event, &mut redraw, &mut needs_redraw)? {
-                        Dispatch::Deferred(event) => self.pending_terminal.push_front(event),
+                        Dispatch::Deferred(event) => self.defer_terminal(event, Placement::Front),
+                        Dispatch::Continue => {}
+                        Dispatch::Shutdown => return Ok(()),
+                    }
+                    continue;
+                }
+                // After real input, so a keystroke buffered across the handoff still draws
+                // first; before engine events, because the refresh this stands for was
+                // already earned by work that finished during the lease.
+                if std::mem::take(&mut self.pending_wake) {
+                    match self.dispatch_terminal(
+                        TerminalEvent::Wake,
+                        &mut redraw,
+                        &mut needs_redraw,
+                    )? {
+                        // Back into the bit, never into `pending_terminal`: the lease can be
+                        // taken again between this loop's check and `handle_terminal`'s own,
+                        // and a wake parked in that queue would be erased by the next
+                        // `InputPaused`. Re-setting keeps it owed until it is actually run.
+                        Dispatch::Deferred(_) => self.pending_wake = true,
                         Dispatch::Continue => {}
                         Dispatch::Shutdown => return Ok(()),
                     }
@@ -1214,11 +1259,23 @@ impl App {
                                 // Discard is deliberate: a key read before the handoff
                                 // belongs to neither the editor nor the resumed TUI.
                                 // Replaying it could submit a prompt or exit the app.
+                                //
+                                // `pending_wake` is deliberately *not* cleared here. This
+                                // barrier retires stale physical input, and a wake is not
+                                // input: it names no key and no past moment, only state
+                                // that still needs re-reading after the lease ends.
                                 self.pending_terminal.clear();
                                 self.owner.input.acknowledge(epoch);
                             }
                             TerminalEvent::Shutdown => return Ok(()),
-                            TerminalEvent::Input(_) | TerminalEvent::Wake => {}
+                            TerminalEvent::Input(_) => {}
+                            // Remembered rather than discarded, and that is the difference
+                            // between the two arms: an input is a fact about the past, so
+                            // dropping it loses nothing the resumed TUI should act on. A
+                            // wake is a request about the future, and dropping it cancels
+                            // the only thing that would have drawn work finished during the
+                            // lease. Coalesced into one bit — see [`Self::pending_wake`].
+                            TerminalEvent::Wake => self.pending_wake = true,
                             TerminalEvent::Resize { .. } => {
                                 // Safe to discard at the lease boundary: ratatui checks the
                                 // backend size and autoresizes on the next complete draw.
@@ -1226,7 +1283,7 @@ impl App {
                         }
                     } else {
                         match self.dispatch_terminal(event, &mut redraw, &mut needs_redraw)? {
-                            Dispatch::Deferred(event) => self.pending_terminal.push_back(event),
+                            Dispatch::Deferred(event) => self.defer_terminal(event, Placement::Back),
                             Dispatch::Continue => {}
                             Dispatch::Shutdown => return Ok(()),
                         }
@@ -1251,6 +1308,25 @@ impl App {
                     }
                 }
             }
+        }
+    }
+
+    /// Hold a deferred terminal event until the lease ends.
+    ///
+    /// Every deferral goes through here so a `Wake` cannot reach [`Self::pending_terminal`]
+    /// by any route. It can be deferred from three places — the queue's own retry, the
+    /// live-receive arm, and the pending-wake dispatch — because the lease may be taken
+    /// between this loop's `suspended` check and [`Self::handle_terminal`]'s own. In the
+    /// queue it would be erased by the next `InputPaused`, which is the clear that must
+    /// retire stale keys and nothing else.
+    fn defer_terminal(&mut self, event: TerminalEvent, placement: Placement) {
+        if matches!(event, TerminalEvent::Wake) {
+            self.pending_wake = true;
+            return;
+        }
+        match placement {
+            Placement::Front => self.pending_terminal.push_front(event),
+            Placement::Back => self.pending_terminal.push_back(event),
         }
     }
 
@@ -1304,6 +1380,8 @@ impl App {
 
     fn handle_terminal(&mut self, event: TerminalEvent) -> Result<TerminalDispatch, AppError> {
         if let TerminalEvent::InputPaused(epoch) = event {
+            // Stale keys only, and `pending_wake` is untouched for the reason given at the
+            // other barrier: a wake owes a future refresh rather than replaying a past key.
             self.pending_terminal.clear();
             self.owner.input.acknowledge(epoch);
             return Ok(TerminalDispatch {
@@ -1353,6 +1431,15 @@ enum Dispatch {
     Deferred(TerminalEvent),
     Continue,
     Shutdown,
+}
+
+/// Which end of the deferral queue an event returns to.
+///
+/// `Front` for one taken off the queue and refused again, so retrying cannot reorder what
+/// the user typed; `Back` for one that never reached it.
+enum Placement {
+    Front,
+    Back,
 }
 
 struct TerminalDispatch {
