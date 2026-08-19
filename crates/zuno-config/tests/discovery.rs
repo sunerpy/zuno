@@ -61,7 +61,7 @@ fn legacy_copy_command_executes_with_or_without_an_auth_file() {
         let temp = tempfile::tempdir().expect("tempdir");
         let project = temp.path().join("project");
         let old_path = temp.path().join("xdg-config/opencode/opencode.json");
-        let new_path = temp.path().join("xdg-config/zuno/opencode.json");
+        let new_path = temp.path().join("xdg-config/zuno/zuno.json");
         let old_auth = temp.path().join("home/.local/share/opencode/auth.json");
         let new_auth = temp.path().join("home/.local/share/zuno/auth.json");
         let old_body = r#"{"model":"provider/legacy"}"#;
@@ -135,7 +135,7 @@ fn an_empty_zuno_root_without_legacy_config_still_gets_the_default() {
     let config = discover_with(&fixture_options(temp.path(), &project, std::iter::empty()))
         .expect("a genuinely fresh install gets a default config");
 
-    let generated = temp.path().join("xdg-config/zuno/opencode.jsonc");
+    let generated = temp.path().join("xdg-config/zuno/zuno.json");
     assert_eq!(config.schema.as_deref(), Some(DEFAULT_SCHEMA));
     assert!(generated.is_file());
     assert!(
@@ -154,7 +154,7 @@ fn populated_zuno_config_wins_even_when_legacy_config_exists() {
         r#"{"model":"provider/legacy"}"#,
     );
     write(
-        &temp.path().join("xdg-config/zuno/opencode.json"),
+        &temp.path().join("xdg-config/zuno/zuno.json"),
         r#"{"model":"provider/zuno"}"#,
     );
 
@@ -177,7 +177,7 @@ fn explicit_config_overrides_bypass_the_legacy_location_diagnostic() {
             &temp.path().join("xdg-config/opencode/opencode.json"),
             r#"{"model":"provider/legacy"}"#,
         );
-        let override_file = temp.path().join("override/opencode.json");
+        let override_file = temp.path().join("override/zuno.json");
         let override_dir = temp.path().join("override-dir");
         let value = match key {
             "OPENCODE_CONFIG" => {
@@ -186,7 +186,7 @@ fn explicit_config_overrides_bypass_the_legacy_location_diagnostic() {
             }
             "OPENCODE_CONFIG_DIR" => {
                 write(
-                    &override_dir.join("opencode.json"),
+                    &override_dir.join("zuno.json"),
                     r#"{"model":"provider/override"}"#,
                 );
                 override_dir.display().to_string()
@@ -268,57 +268,56 @@ fn discovery_walks_every_layer_in_oracle_precedence_order() {
     let cwd = project.join("nested");
     fs::create_dir_all(project.join(".git")).expect("worktree marker");
 
+    // Every layer under the one canonical filename. The global root used to have a
+    // third entry, `config.json`, which no other layer ever probed; it is gone, so
+    // this list is now the same two spellings everywhere.
     let global = root.join("xdg-config/zuno");
     write(
-        &global.join("config.json"),
-        r#"{"model":"global-config","instructions":["global-config"]}"#,
-    );
-    write(
-        &global.join("opencode.json"),
+        &global.join("zuno.json"),
         r#"{"model":"global-json","instructions":["global-json"]}"#,
     );
     write(
-        &global.join("opencode.jsonc"),
+        &global.join("zuno.jsonc"),
         r#"{"model":"global-jsonc","instructions":["global-jsonc",],}"#,
     );
 
-    let env_file = root.join("env/opencode.json");
+    let env_file = root.join("env/zuno.json");
     write(
         &env_file,
         r#"{"model":"env-file","instructions":["env-file"]}"#,
     );
     write(
-        &project.join("opencode.json"),
+        &project.join("zuno.json"),
         r#"{"model":"project-root","instructions":["project-root"]}"#,
     );
     write(
-        &cwd.join("opencode.jsonc"),
+        &cwd.join("zuno.jsonc"),
         r#"{"model":"project-nearest","instructions":["project-nearest"]}"#,
     );
     write(
-        &cwd.join(".zuno/opencode.json"),
+        &cwd.join(".zuno/zuno.json"),
         r#"{"model":"dot-nearest","instructions":["dot-nearest"]}"#,
     );
     write(
-        &project.join(".zuno/opencode.json"),
+        &project.join(".zuno/zuno.json"),
         r#"{"model":"dot-root","instructions":["dot-root"]}"#,
     );
     write(
-        &root.join("home/.zuno/opencode.json"),
+        &root.join("home/.zuno/zuno.json"),
         r#"{"model":"home-dot","instructions":["home-dot"]}"#,
     );
     let override_dir = root.join("override");
     write(
-        &override_dir.join("opencode.jsonc"),
+        &override_dir.join("zuno.jsonc"),
         r#"{"model":"config-dir","instructions":["config-dir"]}"#,
     );
     let managed_dir = root.join("managed");
     write(
-        &managed_dir.join("opencode.json"),
+        &managed_dir.join("zuno.json"),
         r#"{"model":"managed-json","instructions":["managed-json"]}"#,
     );
     write(
-        &managed_dir.join("opencode.jsonc"),
+        &managed_dir.join("zuno.jsonc"),
         r#"{"model":"managed-jsonc","instructions":["managed-jsonc"]}"#,
     );
 
@@ -352,7 +351,6 @@ fn discovery_walks_every_layer_in_oracle_precedence_order() {
     assert_eq!(
         instructions(&config),
         [
-            "global-config",
             "global-json",
             "global-jsonc",
             "env-file",
@@ -375,7 +373,7 @@ fn discovery_jsonc_accepts_comments_and_trailing_commas_and_reports_bad_offset()
     let valid = tempfile::tempdir().expect("valid tempdir");
     let valid_project = valid.path().join("project");
     fs::create_dir_all(valid_project.join(".git")).expect("worktree marker");
-    let valid_path = valid_project.join(".zuno/opencode.jsonc");
+    let valid_path = valid_project.join(".zuno/zuno.jsonc");
     write(
         &valid_path,
         "{\n  // accepted comment\n  \"model\": \"provider/valid\",\n  \"instructions\": [\"one\",],\n}\n",
@@ -392,7 +390,7 @@ fn discovery_jsonc_accepts_comments_and_trailing_commas_and_reports_bad_offset()
     let invalid = tempfile::tempdir().expect("invalid tempdir");
     let invalid_project = invalid.path().join("project");
     fs::create_dir_all(invalid_project.join(".git")).expect("worktree marker");
-    let invalid_path = invalid_project.join(".zuno/opencode.jsonc");
+    let invalid_path = invalid_project.join(".zuno/zuno.jsonc");
     let malformed = "{\n  \"model\": ,\n}\n";
     write(&invalid_path, malformed);
 
@@ -416,7 +414,7 @@ fn discovery_injects_the_default_schema_into_file_layers() {
     let temp = tempfile::tempdir().expect("tempdir");
     let project = temp.path().join("project");
     fs::create_dir_all(project.join(".git")).expect("worktree marker");
-    let path = project.join("opencode.json");
+    let path = project.join("zuno.json");
     write(&path, r#"{"model":"provider/model"}"#);
 
     let config = discover_with(&fixture_options(temp.path(), &project, std::iter::empty()))
@@ -501,4 +499,255 @@ fn discovery_preserves_permission_pattern_order() {
         patterns.keys().collect::<Vec<_>>(),
         ["*", "*.secret", "README.md"]
     );
+}
+
+// ---------------------------------------------------------------------------
+// The config filename is Zuno's own, at every layer
+// ---------------------------------------------------------------------------
+
+/// The layers a config file can live in, each as `(label, relative path)`.
+///
+/// One list, used by both directions of the pair below: every layer must reject a
+/// legacy-named file *and* read a canonically named one. Two separate lists is how
+/// a layer comes to be covered in one direction only — the failure mode recorded
+/// for the keybind scope guard, where "consumed implies reachable" was proven and
+/// the converse was structurally silent.
+fn layers() -> [(&'static str, &'static str); 5] {
+    [
+        ("global root", "xdg-config/zuno"),
+        ("project ancestor", "project"),
+        ("project .zuno", "project/.zuno"),
+        ("config-dir override", "override"),
+        ("managed", "managed"),
+    ]
+}
+
+fn layer_options(root: &Path, cwd: &Path) -> DiscoveryOptions {
+    fixture_options(
+        root,
+        cwd,
+        [
+            (
+                "OPENCODE_CONFIG_DIR".to_owned(),
+                root.join("override").display().to_string(),
+            ),
+            (
+                "ZUNO_TEST_MANAGED_CONFIG_DIR".to_owned(),
+                root.join("managed").display().to_string(),
+            ),
+        ],
+    )
+}
+
+#[test]
+fn a_legacy_named_config_is_reported_at_every_layer_never_silently_skipped() {
+    for (label, relative) in layers() {
+        for name in ["opencode.json", "opencode.jsonc"] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let root = temp.path();
+            let project = root.join("project");
+            fs::create_dir_all(project.join(".git")).expect("worktree marker");
+            fs::create_dir_all(root.join("managed")).expect("managed directory");
+            let stale = root.join(relative).join(name);
+            write(&stale, r#"{"model":"provider/stale"}"#);
+
+            let Err(error) = discover_with(&layer_options(root, &project)) else {
+                panic!(
+                    "a {name} in the {label} layer must be reported, not skipped: a user whose \
+                     config stops being read sees no error and no effect"
+                );
+            };
+            let ConfigError::Invalid { issues, .. } = &error else {
+                panic!("expected ConfigError::Invalid for {label}/{name}, got {error:?}");
+            };
+            let detail = issues
+                .iter()
+                .map(|issue| issue.detail.clone())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                detail.contains(&stale.display().to_string()),
+                "the report must name the exact file so it can be renamed without \
+                 guessing which layer it was in: {detail}"
+            );
+            let canonical = name.replace("opencode", "zuno");
+            assert!(
+                detail.contains(&canonical),
+                "the report must name `{canonical}`, keeping the extension, or a JSONC \
+                 document is renamed to `.json` and stops parsing: {detail}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_canonically_named_config_is_read_at_every_layer() {
+    for (label, relative) in layers() {
+        for name in ["zuno.json", "zuno.jsonc"] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let root = temp.path();
+            let project = root.join("project");
+            fs::create_dir_all(project.join(".git")).expect("worktree marker");
+            fs::create_dir_all(root.join("managed")).expect("managed directory");
+            write(
+                &root.join(relative).join(name),
+                r#"{"model":"provider/live"}"#,
+            );
+
+            let config = discover_with(&layer_options(root, &project))
+                .unwrap_or_else(|error| panic!("{label}/{name} must be read: {error:?}"));
+            assert_eq!(
+                config.model.as_deref(),
+                Some("provider/live"),
+                "{label}/{name} was found but its setting did not take effect"
+            );
+        }
+    }
+}
+
+/// `config.json` was accepted at the global root and nowhere else, so it is legacy
+/// there and an ordinary unrelated file everywhere else. Reporting it at a
+/// repository root would fail a great many checkouts over a filename Zuno has
+/// never read.
+#[test]
+fn a_global_config_json_is_reported_while_a_project_one_is_left_alone() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let project = root.join("project");
+    fs::create_dir_all(project.join(".git")).expect("worktree marker");
+    write(
+        &root.join("xdg-config/zuno/config.json"),
+        r#"{"model":"provider/stale"}"#,
+    );
+
+    let error = discover_with(&fixture_options(root, &project, std::iter::empty()))
+        .expect_err("a config.json in the global root is no longer read");
+    assert!(error.report().contains("config.json"), "{}", error.report());
+
+    let elsewhere = tempfile::tempdir().expect("tempdir");
+    let root = elsewhere.path();
+    let project = root.join("project");
+    fs::create_dir_all(project.join(".git")).expect("worktree marker");
+    write(&project.join("config.json"), r#"{"nonsense":true}"#);
+    write(&project.join("zuno.json"), r#"{"model":"provider/live"}"#);
+
+    let config = discover_with(&fixture_options(root, &project, std::iter::empty()))
+        .expect("an unrelated project config.json is not Zuno's business");
+    assert_eq!(config.model.as_deref(), Some("provider/live"));
+}
+
+/// Both names present in one directory is refused as ambiguous, not resolved.
+///
+/// The alternative — letting the new name win silently — is what the *old* code
+/// did to `config.json`, whose only effect was to be shadowed by `opencode.json`.
+/// Deleting the shadowing name would have made that dead file suddenly live for
+/// everyone holding both, changing behaviour with no message. Refusing is the only
+/// option that cannot silently start or stop honouring a file: the user says which
+/// document they meant by deleting the other.
+#[test]
+fn both_names_in_one_directory_are_refused_rather_than_resolved() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let project = root.join("project");
+    fs::create_dir_all(project.join(".git")).expect("worktree marker");
+    let stale = project.join("opencode.json");
+    write(&stale, r#"{"model":"provider/stale"}"#);
+    write(&project.join("zuno.json"), r#"{"model":"provider/live"}"#);
+
+    let error = discover_with(&fixture_options(root, &project, std::iter::empty())).expect_err(
+        "with both names present the old one must still be reported: silently preferring \
+         the new one would change which document is honoured without saying so",
+    );
+    assert!(
+        error.report().contains(&stale.display().to_string()),
+        "{}",
+        error.report()
+    );
+}
+
+/// Every legacy-named file in one run, so the user renames once instead of
+/// rediscovering the same error per layer.
+#[test]
+fn every_offending_file_is_reported_in_one_run() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let project = root.join("project");
+    fs::create_dir_all(project.join(".git")).expect("worktree marker");
+    fs::create_dir_all(root.join("managed")).expect("managed directory");
+    let stale: Vec<_> = layers()
+        .iter()
+        .map(|(_, relative)| root.join(relative).join("opencode.json"))
+        .collect();
+    for path in &stale {
+        write(path, r#"{"model":"provider/stale"}"#);
+    }
+
+    let error = discover_with(&layer_options(root, &project)).expect_err("all layers are stale");
+    let report = error.report();
+    for path in &stale {
+        assert!(
+            report.contains(&path.display().to_string()),
+            "one run must name every file to rename; {} is missing from:\n{report}",
+            path.display()
+        );
+    }
+}
+
+/// A bare legacy file at a repository root may belong to opencode rather than to
+/// Zuno, so that message alone names the switch that stops Zuno reading project
+/// config — advice that would be wrong at the global root, where the file was
+/// unambiguously written for Zuno.
+#[test]
+fn only_the_project_ancestor_message_offers_the_project_config_switch() {
+    let switch = "ZUNO_DISABLE_PROJECT_CONFIG=1";
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let project = root.join("project");
+    fs::create_dir_all(project.join(".git")).expect("worktree marker");
+    write(&project.join("opencode.json"), "{}");
+    let ancestor = discover_with(&fixture_options(root, &project, std::iter::empty()))
+        .expect_err("stale project config")
+        .report();
+    assert!(ancestor.contains(switch), "{ancestor}");
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let project = root.join("project");
+    fs::create_dir_all(project.join(".git")).expect("worktree marker");
+    write(&root.join("xdg-config/zuno/opencode.json"), "{}");
+    let global = discover_with(&fixture_options(root, &project, std::iter::empty()))
+        .expect_err("stale global config")
+        .report();
+    assert!(
+        !global.contains(switch),
+        "the global config is unambiguously Zuno's, so disabling project config would \
+         not fix it and naming the switch would send the reader the wrong way: {global}"
+    );
+}
+
+/// Turning project config off must not turn the diagnostic on for files that layer
+/// no longer reads — otherwise the documented escape hatch cannot be taken.
+#[test]
+fn disabling_project_config_also_silences_its_diagnostic() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let project = root.join("project");
+    fs::create_dir_all(project.join(".git")).expect("worktree marker");
+    write(
+        &project.join("opencode.json"),
+        r#"{"model":"provider/stale"}"#,
+    );
+    write(
+        &root.join("xdg-config/zuno/zuno.json"),
+        r#"{"model":"provider/live"}"#,
+    );
+
+    let config = discover_with(&fixture_options(
+        root,
+        &project,
+        [("ZUNO_DISABLE_PROJECT_CONFIG".to_owned(), "1".to_owned())],
+    ))
+    .expect("a file in a layer that is switched off is not a problem to report");
+    assert_eq!(config.model.as_deref(), Some("provider/live"));
 }

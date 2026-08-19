@@ -613,7 +613,25 @@ mod tests {
         assert!(!builtin::DESCRIPTION.contains("opencode's own configuration"));
         assert!(built_in.content.contains("# Customizing Zuno"));
         assert!(built_in.content.contains(".zuno/agent/"));
-        assert!(built_in.content.contains("opencode.json"));
+        assert!(
+            built_in
+                .content
+                .contains(&format!("{}.json", zuno_paths::CONFIG_FILE_STEM))
+        );
+        // The skill is what a model reads before writing config, so a stale
+        // filename here teaches the old name to every session. `opencode.ai` is
+        // still the published schema URL and `@opencode-ai/plugin` is the plugin
+        // ABI, so only the *filename* spellings are forbidden.
+        for stale in [
+            &format!("{}.json", zuno_paths::LEGACY_CONFIG_FILE_STEM),
+            &format!("{}.jsonc", zuno_paths::LEGACY_CONFIG_FILE_STEM),
+        ] {
+            assert!(
+                !built_in.content.contains(stale.as_str()),
+                "the built-in customization skill still names `{stale}`, which Zuno no longer \
+                 reads; a model following it would write a file that is rejected at startup"
+            );
+        }
     }
 
     #[test]

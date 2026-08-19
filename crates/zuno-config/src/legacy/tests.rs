@@ -32,7 +32,7 @@ fn assert_names(deprecation: &Deprecation, deprecated: &str, replacement: &str) 
 }
 
 fn config_path() -> PathBuf {
-    PathBuf::from("/repo/opencode.json")
+    PathBuf::from("/repo/zuno.json")
 }
 
 // ---------------------------------------------------------------------------
@@ -198,17 +198,23 @@ fn context_file_names_agents_md() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. a global TOML `config` file -> `config.json`
+// 8. a global TOML `config` file -> `zuno.json`
 // ---------------------------------------------------------------------------
 
 #[test]
-fn toml_config_names_config_json() {
+fn toml_config_names_the_canonical_json_config() {
     let dir = TempDir::new().expect("tempdir");
     fs::write(dir.path().join("config"), "provider = \"anthropic\"\n").expect("write");
     let found = only(inspect_global_directory(dir.path()));
     assert_eq!(found.form(), DeprecatedForm::TomlConfig);
     assert_eq!(found.path(), dir.path().join("config"));
-    assert_names(&found, "`config`", "config.json");
+    // The replacement is derived, so renaming the canonical config file cannot
+    // leave this message pointing at a filename Zuno no longer reads.
+    assert_names(
+        &found,
+        "`config`",
+        &format!("{}.json", zuno_paths::CONFIG_FILE_STEM),
+    );
     assert!(
         found.message().contains("TOML"),
         "the extensionless `config` is only recognizable as TOML if the message says so: {}",
@@ -229,7 +235,9 @@ fn the_toml_config_file_is_never_rewritten_or_removed() {
         "the oracle migrates and unlinks; this pass reports and leaves the file alone"
     );
     assert!(
-        !dir.path().join("config.json").exists(),
+        !dir.path()
+            .join(format!("{}.json", zuno_paths::CONFIG_FILE_STEM))
+            .exists(),
         "no migration output may be written"
     );
 }
@@ -409,7 +417,7 @@ fn every_finding_becomes_one_issue_keeping_its_own_pointer() {
     );
     for issue in &issues {
         assert!(
-            issue.detail.contains("/repo/opencode.json"),
+            issue.detail.contains("/repo/zuno.json"),
             "every issue names its own file: {}",
             issue.detail
         );

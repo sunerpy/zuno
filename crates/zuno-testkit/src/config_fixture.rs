@@ -44,7 +44,7 @@ pub enum ConfigLayer {
     HomeDotOpencode,
     /// A `.opencode/` directory inside the project tree.
     ProjectDotOpencode,
-    /// An `opencode.json` or `.jsonc` file inside the project tree.
+    /// A bare config file inside the project tree, in both products' spellings.
     ProjectFile,
     /// The file `$OPENCODE_CONFIG` points at.
     EnvConfigFile,
@@ -112,7 +112,7 @@ impl ConfigFixture {
             .xdg_config()
             .join(CONFIG_BASENAME)
             .join("opencode.json");
-        let zuno = self.env.xdg_config().join("zuno").join("opencode.json");
+        let zuno = self.env.xdg_config().join("zuno").join("zuno.json");
         self.place_with_zuno_mirror(ConfigLayer::Global, path, zuno, contents)
     }
 
@@ -127,7 +127,7 @@ impl ConfigFixture {
             .xdg_config()
             .join(CONFIG_BASENAME)
             .join("opencode.jsonc");
-        let zuno = self.env.xdg_config().join("zuno").join("opencode.jsonc");
+        let zuno = self.env.xdg_config().join("zuno").join("zuno.jsonc");
         self.place_with_zuno_mirror(ConfigLayer::Global, path, zuno, contents)
     }
 
@@ -138,11 +138,11 @@ impl ConfigFixture {
     /// [`TestkitError::Io`] when the file cannot be written.
     pub fn home_dot_opencode(self, contents: &str) -> Result<Self> {
         let path = self.env.home().join(".opencode").join("opencode.json");
-        let zuno = self.env.home().join(".zuno").join("opencode.json");
+        let zuno = self.env.home().join(".zuno").join("zuno.json");
         self.place_with_zuno_mirror(ConfigLayer::HomeDotOpencode, path, zuno, contents)
     }
 
-    /// Write `<project>/<relative>/opencode.json`.
+    /// Write `<project>/<relative>/opencode.json` and Zuno's `zuno.json` beside it.
     ///
     /// Pass `""` for the project root itself.
     ///
@@ -151,17 +151,19 @@ impl ConfigFixture {
     /// [`TestkitError::Io`] when the file cannot be written.
     pub fn project_file(self, relative: &str, contents: &str) -> Result<Self> {
         let path = self.env.project().join(relative).join("opencode.json");
-        self.place(ConfigLayer::ProjectFile, path, contents)
+        let zuno = self.env.project().join(relative).join("zuno.json");
+        self.place_with_zuno_mirror(ConfigLayer::ProjectFile, path, zuno, contents)
     }
 
-    /// Write `<project>/<relative>/opencode.jsonc`.
+    /// Write `<project>/<relative>/opencode.jsonc` and Zuno's `zuno.jsonc` beside it.
     ///
     /// # Errors
     ///
     /// [`TestkitError::Io`] when the file cannot be written.
     pub fn project_file_jsonc(self, relative: &str, contents: &str) -> Result<Self> {
         let path = self.env.project().join(relative).join("opencode.jsonc");
-        self.place(ConfigLayer::ProjectFile, path, contents)
+        let zuno = self.env.project().join(relative).join("zuno.jsonc");
+        self.place_with_zuno_mirror(ConfigLayer::ProjectFile, path, zuno, contents)
     }
 
     /// Write `<project>/<relative>/.opencode/opencode.json`.
@@ -181,7 +183,7 @@ impl ConfigFixture {
             .project()
             .join(relative)
             .join(".zuno")
-            .join("opencode.json");
+            .join("zuno.json");
         self.place_with_zuno_mirror(ConfigLayer::ProjectDotOpencode, path, zuno, contents)
     }
 
@@ -224,9 +226,15 @@ impl ConfigFixture {
     /// # Errors
     ///
     /// [`TestkitError::Io`] when the file cannot be written.
+    /// Writes Zuno's filename only, unlike the mirrored layers above.
+    ///
+    /// One environment variable names this directory for both binaries, and Zuno
+    /// rejects a legacy-named file in any directory it probes — so the usual
+    /// side-by-side mirror is not available here. A differential over this layer
+    /// has to run each binary with the variable pointing at its own directory.
     pub fn env_config_dir(mut self, contents: &str) -> Result<Self> {
         let dir = self.env.root().join("env-config-dir");
-        let path = dir.join("opencode.json");
+        let path = dir.join(format!("{}.json", zuno_paths::CONFIG_FILE_STEM));
         write_file(&path, contents)?;
         self.env = self
             .env
@@ -330,16 +338,13 @@ impl ConfigFixture {
         &self.env
     }
 
-    fn place(mut self, layer: ConfigLayer, path: PathBuf, contents: &str) -> Result<Self> {
-        write_file(&path, contents)?;
-        self.layers.push(PlacedLayer {
-            layer,
-            path: Some(path),
-            contents: contents.to_owned(),
-        });
-        Ok(self)
-    }
-
+    /// Write one config layer as both products' filenames.
+    ///
+    /// There is no single-path variant any more: the two products' canonical config
+    /// filenames are now disjoint, so every file-backed layer needs both spellings
+    /// or one binary reads nothing. `path` is the oracle's, and it is the one
+    /// recorded in [`PlacedLayer`] because the differential's assertions are about
+    /// what the oracle was given.
     fn place_with_zuno_mirror(
         mut self,
         layer: ConfigLayer,

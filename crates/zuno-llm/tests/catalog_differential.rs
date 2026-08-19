@@ -80,6 +80,11 @@ fn document() -> CatalogDocument {
 /// identically on both sides.
 fn oracle_models_without_a_catalog(oracle: Oracle, config_json: &str) -> Option<(String, String)> {
     let env = ScriptedEnv::new().expect("scripted env");
+    // `opencode.json`, deliberately not Zuno's `zuno.json`: this file is read by the
+    // released opencode binary. The Rust side of the differential never touches the
+    // filesystem (`rust_models` deserializes the string), so renaming this would
+    // leave the oracle unconfigured while the Rust side is configured, and the
+    // comparison would stop being a parity test without failing.
     std::fs::write(env.project().join("opencode.json"), config_json).expect("write config");
     let env = env.set("OPENCODE_DISABLE_MODELS_FETCH", "1");
     assert!(
@@ -119,6 +124,7 @@ fn oracle_models(
     let fixture = env.root().join("models-dev-pinned.json");
     std::fs::write(&fixture, PINNED).expect("write the pinned fixture");
     if let Some(config_json) = config_json {
+        // The oracle's own filename; see `oracle_models_without_a_catalog`.
         std::fs::write(env.project().join("opencode.json"), config_json).expect("write config");
     }
     let mut env = env

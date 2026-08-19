@@ -91,6 +91,13 @@ falls back to the corresponding opencode roots, and it provides no way to adopt 
 `zuno import` reads Zuno's own `zuno export` documents only. Old roots appear only in
 upstream-only fixtures, source notes, or historical evidence.
 
+The config **filename** is Zuno's own too: every layer reads `zuno.jsonc` and `zuno.json` and
+nothing else — the config root, a bare file on the walk up from the working directory to the
+worktree root, `.zuno/`, the directory named by `OPENCODE_CONFIG_DIR`, and the managed directory.
+JSONC and strict JSON only; there is **no TOML config path**. `opencode.jsonc`, `opencode.json`, and
+a `config.json` in the config root are no longer read: a user still holding one of those names gets
+a startup error naming the file, its directory, and the name to rename it to, rather than silence.
+
 Outside the plugin ABI, Zuno's user interface, default paths, and own environment variables all use
 Zuno's identity.
 

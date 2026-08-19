@@ -387,12 +387,20 @@ fn parse_assignments(values: &[String], kind: &str) -> Result<BTreeMap<String, S
         .collect()
 }
 
+/// The config file `mcp add` will edit, creating it when neither spelling exists.
+///
+/// `.json` is preferred and is also what a fresh install is given, so the common
+/// path is editable. `.jsonc` is only ever returned when it is the *only* config
+/// present, and [`update_json_config`] then refuses it rather than dropping the
+/// author's comments — so on a JSONC-only install `mcp add` reports what to do by
+/// hand instead of silently rewriting the file or silently creating a second one
+/// that would then take precedence over it.
 fn writable_config_path(directory: &Path) -> PathBuf {
-    let json = directory.join("opencode.json");
+    let [json, jsonc] =
+        zuno_paths::Layout::file_in_directory(directory, zuno_paths::CONFIG_FILE_STEM);
     if json.exists() {
         return json;
     }
-    let jsonc = directory.join("opencode.jsonc");
     if jsonc.exists() {
         return jsonc;
     }
@@ -405,8 +413,9 @@ fn update_json_config(path: &Path, name: &str, server: Value) -> Result<(), Stri
         .is_some_and(|extension| extension == "jsonc")
     {
         return Err(format!(
-            "cannot safely update {}: this build has no comment-preserving JSONC editor; add the MCP entry manually or provide an opencode.json target",
-            path.display()
+            "cannot safely update {}: this build has no comment-preserving JSONC editor; add the MCP entry manually or provide a {}.json target",
+            path.display(),
+            zuno_paths::CONFIG_FILE_STEM,
         ));
     }
     let mut root = if path.exists() {
@@ -570,7 +579,7 @@ mod tests {
     #[test]
     fn json_update_preserves_unrelated_fields() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let path = directory.path().join("opencode.json");
+        let path = directory.path().join("zuno.json");
         fs::write(&path, r#"{"theme":"dark","mcp":{"old":{"enabled":false}}}"#)
             .expect("seed config");
         update_json_config(
@@ -589,7 +598,7 @@ mod tests {
     #[test]
     fn existing_jsonc_is_never_rewritten() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let path = directory.path().join("opencode.jsonc");
+        let path = directory.path().join("zuno.jsonc");
         let original = b"{ // keep me\n}\n";
         fs::write(&path, original).expect("seed JSONC");
         let error = update_json_config(&path, "new", json!({"enabled":false}))

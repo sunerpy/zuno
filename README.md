@@ -96,6 +96,12 @@ Zuno 的默认配置根是 `$XDG_CONFIG_HOME/zuno`，项目配置目录是 `.zun
 Zuno 自己 `zuno export` 出的文档。旧路径只会在 oracle fixture、上游源码说明或历史证据中以
 **upstream-only** 身份出现。
 
+配置**文件名**同样是 Zuno 自己的：每一层都只读 `zuno.jsonc` 与 `zuno.json` —— 配置根、
+从工作目录向上走到 worktree 根的裸文件、`.zuno/`、`OPENCODE_CONFIG_DIR` 指定的目录，以及
+托管目录。仅支持 JSONC 与严格 JSON，**没有 TOML 配置路径**。`opencode.jsonc`、
+`opencode.json` 以及配置根下的 `config.json` 都不再被读取；仍留着旧文件名的用户会得到一条
+指明该文件、该目录与应改成的新文件名的启动错误，而不是被静默忽略。
+
 除插件 ABI 之外，Zuno 的用户界面、默认路径和自有环境变量均使用 Zuno 身份。
 
 ## 构建与开发

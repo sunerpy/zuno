@@ -61,7 +61,7 @@ fn variable_expands_env_and_tilde_file_into_a_parsable_config() {
     let site = Site::new();
     site.write("home/notes.md", "  Always cite the file you edited.  \n");
     let config = site.write(
-        "opencode.json",
+        "zuno.json",
         r#"{
   "model": "{env:ZUNO_SAMPLE_MODEL}",
   "instructions": ["{file:~/notes.md}"]
@@ -97,10 +97,7 @@ fn variable_expands_env_and_tilde_file_into_a_parsable_config() {
 #[test]
 fn variable_absent_file_reference_names_the_path_instead_of_substituting_empty() {
     let site = Site::new();
-    let config = site.write(
-        "opencode.json",
-        r#"{"instructions":["{file:/nonexistent}"]}"#,
-    );
+    let config = site.write("zuno.json", r#"{"instructions":["{file:/nonexistent}"]}"#);
 
     let process = Env::empty();
     let error = Substitution::for_file(&config)
@@ -136,10 +133,7 @@ fn variable_hostile_file_content_still_parses_as_json() {
     let site = Site::new();
     let body = "He said \"hi\".\nPath: C:\\tmp\ttabbed\r\nDone.\u{1}";
     site.write("prompt.md", &format!("\n  {body}  \n"));
-    let config = site.write(
-        "opencode.json",
-        r#"{"instructions":["{file:./prompt.md}"]}"#,
-    );
+    let config = site.write("zuno.json", r#"{"instructions":["{file:./prompt.md}"]}"#);
 
     let process = Env::empty();
     let expanded = Substitution::for_file(&config)
@@ -172,7 +166,7 @@ fn variable_relative_reference_follows_the_config_file_not_the_cwd() {
     let text = r#"{"instructions":["{file:./shared.md}"]}"#;
 
     for (directory, expected) in [("a", "from-a"), ("b", "from-b")] {
-        let config = site.path(directory).join("opencode.json");
+        let config = site.path(directory).join("zuno.json");
         let expanded = Substitution::for_file(&config)
             .with_process_env(&process)
             .apply(text)
@@ -196,7 +190,7 @@ fn variable_relative_reference_follows_the_config_file_not_the_cwd() {
 fn variable_comment_lines_hold_back_file_tokens_only() {
     let site = Site::new();
     site.write("prompt.md", "real");
-    let config = site.write("opencode.json", "{}");
+    let config = site.write("zuno.json", "{}");
     let env = Env::empty().with("ZUNO_SAMPLE_MODEL", "expanded");
     let process = Env::empty();
 

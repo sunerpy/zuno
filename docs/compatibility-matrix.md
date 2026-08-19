@@ -163,7 +163,7 @@ identifiers for the work that owns a surface, not as anything a user needs.
 | `ImportCommand` | `import` | implemented | reads a local `export` document into Zuno's database; share-URL imports are not accepted because Zuno does not integrate with the hosted share service |
 | `McpCommand` | `mcp` | implemented | registered through the headless-command seam for todo 56 |
 | `ModelsCommand` | `models` | implemented | registered through the headless-command seam for todo 56 |
-| `PluginCommand` | `plugin` | not-registered | the resident host loads configured plugins, but Zuno does not own an npm installer; declare plugins in opencode.json so compatibility is checked before import |
+| `PluginCommand` | `plugin` | not-registered | the resident host loads configured plugins, but Zuno does not own an npm installer; declare plugins in zuno.json so compatibility is checked before import |
 | `PrCommand` | `pr` | rejected | the GitHub checkout helper is excluded from the local-agent runtime; use `gh pr checkout <number>` and then `zuno run` instead |
 | `ProvidersCommand` | `providers` | implemented | registered with the upstream `auth` alias through the headless-command seam for todo 56 |
 | `RunCommand` | `run` | implemented | registered through the headless-command seam for todo 56 |

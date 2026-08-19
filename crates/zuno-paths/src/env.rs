@@ -37,6 +37,21 @@ pub const PLUGIN_ABI_ENV_NAMES: [&str; 6] = [
     "OPENCODE_SERVER_USERNAME",
 ];
 
+/// The HTTP Basic username used when `OPENCODE_SERVER_USERNAME` is absent.
+///
+/// **`opencode`, deliberately not `zuno`, and it is part of the plugin ABI.** The
+/// variable it defaults for is one of the six [`PLUGIN_ABI_ENV_NAMES`], and this
+/// value goes on the wire: a plugin or SDK client that authenticates to the server
+/// with upstream's default username must keep working
+/// (`packages/opencode/src/server/auth.ts:17-26`). Renaming it would answer such a
+/// client with a bare `401` that names nothing.
+///
+/// It is a constant rather than a literal in each place because the server
+/// validates against it while the CLI's liveness probe *sends* it, and that probe
+/// reports a rejected credential as `Unreachable`. Two literals drifting apart
+/// would therefore present as "every server is down".
+pub const DEFAULT_SERVER_USERNAME: &str = "opencode";
+
 /// Project-owned environment names and their only accepted external spellings.
 pub const ZUNO_ENV_NAME_MAP: [(&str, &str); 67] = [
     ("OPENCODE_ALWAYS_NOTIFY_UPDATE", "ZUNO_ALWAYS_NOTIFY_UPDATE"),

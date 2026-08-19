@@ -1,9 +1,15 @@
 # Rejected inputs
 
-Ten configuration forms upstream still accepts, or once accepted, are rejected
+Eleven configuration forms upstream still accepts, or once accepted, are rejected
 here with a message naming the modern replacement and the exact file. Rejecting
 is the deliberate choice: silently accepting a deprecated form leaves a
 configuration that behaves differently from what it says.
+
+`ConfigFileName` is the one form that is Zuno's own rather than upstream's: Zuno
+reads `zuno.jsonc` and `zuno.json` at every layer, so a config still named
+`opencode.jsonc`, `opencode.json`, or — in the config root only — `config.json` is
+reported rather than skipped. Skipping it would leave a file that parses, validates,
+and changes nothing.
 
 Each rejection is reported as a `ConfigIssue` inside a `ConfigError::Invalid`
 whose own path is the *scanned root*, which for a directory scan is not the
@@ -28,7 +34,7 @@ ZUNO_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
 - Rejected: `agent.build.maxSteps` — use `steps`
 
   ```text
-  deprecated key `agent.build.maxSteps` at /example/opencode.json; use `steps`
+  deprecated key `agent.build.maxSteps` at /example/zuno.json; use `steps`
   ```
 
 - Rejected: `maxSteps` — use `steps`
@@ -43,7 +49,7 @@ ZUNO_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
 - Rejected: `agent.build.tools` — use `permission` — `write`, `edit`, and `patch` all collapse to `permission.edit`
 
   ```text
-  deprecated key `agent.build.tools` at /example/opencode.json; use `permission` — `write`, `edit`, and `patch` all collapse to `permission.edit`
+  deprecated key `agent.build.tools` at /example/zuno.json; use `permission` — `write`, `edit`, and `patch` all collapse to `permission.edit`
   ```
 
 - Rejected: `tools` — use `permission` — `write`, `edit`, and `patch` all collapse to `permission.edit`
@@ -73,7 +79,34 @@ ZUNO_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
 - Rejected: `autoshare` — use `share` — `autoshare: true` is `share: "auto"`
 
   ```text
-  deprecated key `autoshare` at /example/opencode.json; use `share` — `autoshare: true` is `share: "auto"`
+  deprecated key `autoshare` at /example/zuno.json; use `share` — `autoshare: true` is `share: "auto"`
+  ```
+
+
+### ConfigFileName
+
+- Rejected: `opencode.json` — rename it to `zuno.json`
+
+  ```text
+  deprecated config filename `opencode.json` at <file>/opencode.json; rename it to `zuno.json`
+  ```
+
+- Rejected: `opencode.json` — rename it to `zuno.json`, or set `ZUNO_DISABLE_PROJECT_CONFIG=1` if the file belongs to another product
+
+  ```text
+  deprecated config filename `opencode.json` at <file>/opencode.json; rename it to `zuno.json`, or set `ZUNO_DISABLE_PROJECT_CONFIG=1` if the file belongs to another product
+  ```
+
+- Rejected: `opencode.jsonc` — rename it to `zuno.jsonc`
+
+  ```text
+  deprecated config filename `opencode.jsonc` at <file>/opencode.jsonc; rename it to `zuno.jsonc`
+  ```
+
+- Rejected: `opencode.jsonc` — rename it to `zuno.jsonc`, or set `ZUNO_DISABLE_PROJECT_CONFIG=1` if the file belongs to another product
+
+  ```text
+  deprecated config filename `opencode.jsonc` at <file>/opencode.jsonc; rename it to `zuno.jsonc`, or set `ZUNO_DISABLE_PROJECT_CONFIG=1` if the file belongs to another product
   ```
 
 
@@ -91,7 +124,7 @@ ZUNO_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
 - Rejected: `layout` — removed — delete it; the layout is always stretched
 
   ```text
-  deprecated key `layout` at /example/opencode.json; removed — delete it; the layout is always stretched
+  deprecated key `layout` at /example/zuno.json; removed — delete it; the layout is always stretched
   ```
 
 
@@ -100,7 +133,7 @@ ZUNO_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
 - Rejected: `mode.build` — use `agent.build` with `mode: "primary"`
 
   ```text
-  deprecated key `mode.build` at /example/opencode.json; use `agent.build` with `mode: "primary"`
+  deprecated key `mode.build` at /example/zuno.json; use `agent.build` with `mode: "primary"`
   ```
 
 
@@ -118,16 +151,16 @@ ZUNO_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
 - Rejected: `reference` — use `references`
 
   ```text
-  deprecated key `reference` at /example/opencode.json; use `references`
+  deprecated key `reference` at /example/zuno.json; use `references`
   ```
 
 
 ### TomlConfig
 
-- Rejected: `config` — migrate it to `config.json`
+- Rejected: `config` — migrate it to `zuno.json` — there is no TOML config path
 
   ```text
-  deprecated TOML config file `config` at <file>/config; migrate it to `config.json`
+  deprecated TOML config file `config` at <file>/config; migrate it to `zuno.json` — there is no TOML config path
   ```
 <!-- generated:END rejected-inputs -->
 
