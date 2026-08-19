@@ -273,6 +273,28 @@ pub fn looks_like_diff(text: &str) -> bool {
             .any(|line| line.starts_with('+') || line.starts_with('-'))
 }
 
+/// Columns a notice's `! ` marker takes out of the body.
+///
+/// Subtracted before wrapping rather than after, because the marker is prefixed to every
+/// row: wrapping to the full body width and then adding two columns puts the last two
+/// columns of each row past the frame, and against the ambient sidebar that reads as the
+/// panel having cut the sentence.
+const NOTICE_MARKER_COLS: u16 = 2;
+
+/// Rows one notice may occupy before the rest is counted instead of drawn.
+///
+/// Derived, not picked. The longest notice this crate composes is the 72-column
+/// `MCP server ... is busy or unavailable`; at 40 columns — the narrowest width the layout
+/// is accepted at — that wraps to three rows, so five clears every authored notice with
+/// headroom and bites only on text this crate did not write, such as a provider error
+/// interpolated into one of these sentences. That case is the one worth bounding because it
+/// is unbounded: measured without a cap, one long MCP failure took 17 of the 21 transcript
+/// rows on a 24-column pane, evicting the reply it was annotating.
+///
+/// The fifth row states the count rather than showing more text, because a reader cannot
+/// tell a wrapped row from a cut one and an honest `… N more lines` says which it was.
+pub const NOTICE_MAX_ROWS: usize = 5;
+
 /// The mark that says content was cut rather than absent.
 ///
 /// Named so the transcript's collapse notice and [`crate::views::truncate`]'s cut make
@@ -1469,8 +1491,22 @@ impl TranscriptView {
                 );
             }
             MessagePart::Notice { text } => {
-                for row in wrap(text, body_width.saturating_sub(2)) {
+                let rows = wrap(text, body_width.saturating_sub(NOTICE_MARKER_COLS));
+                let (shown, elided) = if rows.len() <= NOTICE_MAX_ROWS {
+                    (rows.as_slice(), 0)
+                } else {
+                    let keep = NOTICE_MAX_ROWS - 1;
+                    (&rows[..keep], rows.len() - keep)
+                };
+                for row in shown {
                     push(&format!("! {row}"), self.context.warning(), out);
+                }
+                if elided > 0 {
+                    push(
+                        &format!("! {ELIDED} {elided} more lines"),
+                        self.context.muted(),
+                        out,
+                    );
                 }
             }
             MessagePart::Diagnostics { report } => {

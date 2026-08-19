@@ -3126,19 +3126,25 @@ fn views_transcript_cache_never_recalls_a_row_carrying_the_spinner() {
 
 #[test]
 fn views_transcript_cache_stays_inside_its_row_bound() {
-    // Overrun the budget with *tall* messages rather than many, because that is the
-    // hazard the bound is expressed in rows to cover: `MessagePart::Notice` wraps with no
-    // row cap, so a handful of messages can outweigh thousands and an entry-count bound
-    // would have admitted all of them.
+    // Overrun the budget with *tall* messages rather than many, because that is the hazard the
+    // bound is expressed in rows to cover: one message can outweigh thousands, and an
+    // entry-count bound would have admitted all of them.
+    //
+    // A user prompt is the vehicle, and it used to be a notice. That is worth recording rather
+    // than quietly editing: this fixture read `Message::notice` precisely because notices then
+    // wrapped with no row cap, and [`NOTICE_MAX_ROWS`] has since given them one — a 512-line
+    // notice now renders as five rows and the fixture stopped reaching the bound at all, which
+    // is how the change was noticed here. `MessagePart::Text` on a user message is still
+    // uncapped `wrap`, so it carries the same hazard the bound exists for.
     let mut view = view();
     let rows_each = 512;
     let messages = MAX_CACHED_ROWS / rows_each + 8;
     for index in 0..messages {
         let body = (0..rows_each)
-            .map(|row| format!("line {row} of notice {index}"))
+            .map(|row| format!("line {row} of prompt {index}"))
             .collect::<Vec<_>>()
             .join("\n");
-        view.transcript_mut().push(Message::notice(body));
+        view.transcript_mut().push(Message::user(body));
     }
     let frame = view.cached_lines_for_test(60);
     assert!(

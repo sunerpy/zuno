@@ -1848,7 +1848,13 @@ pub const DEFINITIONS: &[Definition] = &[
     Definition {
         name: "agent_cycle_reverse",
         scope: "agent",
-        keys: "shift+tab",
+        // `shift+tab` alone is unresolvable: crossterm reports the press as
+        // `KeyCode::BackTab` *with* `SHIFT`, so `from_key_event` yields `shift+backtab`,
+        // while the spelling parses to `SHIFT` + `Key::Tab` — a chord no key event can
+        // equal. The row therefore shipped resolving to `Unmatched`, which no handler
+        // could have rescued. `backtab` covers terminals that omit the modifier and
+        // `shift+tab` the Kitty protocol, which really does report `Tab` with `SHIFT`.
+        keys: "shift+backtab,backtab,shift+tab",
         command: "agent.cycle.reverse",
         prevent_default: None,
         description: "Previous agent",

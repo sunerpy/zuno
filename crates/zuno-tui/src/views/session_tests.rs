@@ -3660,3 +3660,651 @@ fn session_ignores_a_mouse_event_that_is_not_a_vertical_wheel() {
     assert!(!moved.redraw);
     assert_eq!(screen.transcript.offset(), 0);
 }
+
+/// Every action that resolves on a real key press and reaches nothing.
+///
+/// A frozen census, not an approval. `PRESSABLE_BUT_DEAD` exists because before it nothing
+/// in this crate could name a single member of this set: the previous eight defects of the
+/// family were each found by a person pressing a key on a terminal and noticing silence, one
+/// at a time. The list is what turns that into a build failure.
+///
+/// Two kinds of row live here and the difference is stated per row. `diff_*` is deliberate —
+/// `focused_scopes` documents why the whole `diff` scope is registered from the prompt for
+/// `diff_open`'s sake, and why an arm for any of its bare characters would stop that
+/// character being typeable; those actions reach the viewer through `DialogHost`, which owns
+/// the keyboard while it is open. Everything else is a spelling upstream's table ships for a
+/// capability this screen has not grown yet, recorded so the next author sees the backlog
+/// instead of rediscovering one row of it.
+const PRESSABLE_BUT_DEAD: &[&str] = &[
+    // Deliberate: bare characters the diff viewer owns; an arm here would make them untypeable.
+    "diff_close",
+    "diff_collapse",
+    "diff_expand",
+    "diff_expand_all",
+    "diff_help",
+    "diff_next_file",
+    "diff_next_hunk",
+    "diff_previous_file",
+    "diff_previous_hunk",
+    "diff_single_patch",
+    "diff_stage_hunk",
+    "diff_switch_focus",
+    "diff_switch_source",
+    "diff_toggle",
+    "diff_toggle_file_tree",
+    "diff_toggle_layout",
+    "diff_toggle_view",
+    "diff_unstage_hunk",
+    // Backlog: bound by the shipped table, no capability behind it on this screen yet.
+    "input_redo",
+    "messages_redo",
+    "messages_toggle_conceal",
+    "messages_undo",
+    "model_cycle_recent",
+    "model_cycle_recent_reverse",
+    "model_favorite_toggle",
+    "model_provider_list",
+    "session_background",
+    "session_child_cycle",
+    "session_child_cycle_reverse",
+    "session_child_first",
+    "session_compact",
+    "session_delete",
+    "session_export",
+    "session_new",
+    "session_parent",
+    "session_pin_toggle",
+    "session_queued_prompts",
+    "session_quick_switch_1",
+    "session_quick_switch_2",
+    "session_quick_switch_3",
+    "session_quick_switch_4",
+    "session_quick_switch_5",
+    "session_quick_switch_6",
+    "session_quick_switch_7",
+    "session_quick_switch_8",
+    "session_quick_switch_9",
+    "session_rename",
+    "session_timeline",
+];
+
+#[test]
+fn every_bound_action_in_a_registered_scope_either_reaches_something_or_is_a_named_gap() {
+    // The hole `every_action_the_screen_consumes_lives_in_a_scope_it_resolves` leaves, and the
+    // reason `agent_cycle` shipped dead as the eighth of its kind. That guard opens with
+    //
+    //     let consumed = ...any(|screen| screen.handle_action(definition, ..).handled);
+    //     if !consumed { continue; }
+    //
+    // so its subject is only ever an action the screen *already acts on*. It proves
+    // "consumed implies reachable" and is structurally silent about the converse.
+    // `agent_cycle` was bound to `tab`, sat in the registered `agent` scope, and resolved
+    // correctly on a real terminal — it simply had no `handle_action` arm, so `consumed` was
+    // false, so the loop `continue`d past it and reported nothing. Every earlier defect of
+    // this family was a missing *scope* for an arm that existed, which is the direction that
+    // guard covers; this one was a missing *arm* for a scope that existed, which is the
+    // direction no guard covered. The two neighbouring guards miss it for their own reasons:
+    // both derive their subject from a hand-kept list (`SHIPPED_DEFAULTS` there, `HINTS` in
+    // the welcome grid's), and `agent_cycle` is on neither.
+    //
+    // This asserts the converse, as an equality in both directions. A newly bound action with
+    // no arm fails until its author wires it up or names it here; an action that gains an arm
+    // fails until its name is removed. The second direction is what stops the list decaying
+    // into a blanket suppression — a stale entry is itself a failure.
+    let keymap = Keymap::defaults().expect("the shipped table builds");
+    let static_scopes = scopes();
+    let mut dead = Vec::new();
+    let mut live_but_listed = Vec::new();
+    for definition in crate::keybind::DEFINITIONS {
+        if keymap.sequences(definition.name).is_empty() {
+            continue;
+        }
+        let in_scope = static_scopes.iter().any(|scope| scope == definition.scope)
+            || reachability_screens()
+                .into_iter()
+                .any(|screen| ActionComponent::focused_scopes(&screen).contains(&definition.scope));
+        if !in_scope {
+            continue;
+        }
+        let consumed = reachability_screens()
+            .into_iter()
+            .any(|mut screen| screen.handle_action(definition, &press_none()).handled);
+        let listed = PRESSABLE_BUT_DEAD.contains(&definition.name);
+        if !consumed && !listed {
+            dead.push(format!(
+                "{} (`{}`) resolves in scope `{}` and reaches nothing",
+                definition.name,
+                keymap.sequences(definition.name).join("` or `"),
+                definition.scope
+            ));
+        }
+        if consumed && listed {
+            live_but_listed.push(definition.name);
+        }
+    }
+    assert!(
+        dead.is_empty(),
+        "these actions are pressable and reach nothing, which is how `agent_cycle` shipped \
+         as the eighth 'built but unreachable'. Give each an arm in `handle_action`, or add \
+         it to `PRESSABLE_BUT_DEAD` with the reason it is a gap:\n{}",
+        dead.join("\n")
+    );
+    assert!(
+        live_but_listed.is_empty(),
+        "`PRESSABLE_BUT_DEAD` still names these, but the screen now acts on them; a stale \
+         entry suppresses this guard for a row it no longer describes, so remove them: \
+         {live_but_listed:?}"
+    );
+    // The census is a number as well as a set, so shrinking it is a visible event in a diff
+    // and growing it silently is impossible. `agent_cycle` and `agent_cycle_reverse` are the
+    // two this change took off the list.
+    assert_eq!(
+        PRESSABLE_BUT_DEAD.len(),
+        48,
+        "the pressable-but-dead census changed size; that is a real event either way and the \
+         count is pinned so it cannot pass unremarked"
+    );
+}
+
+/// The last row of a rendered frame, which the prompt band's spacer owns.
+fn last_row(rendered: &[String]) -> &str {
+    rendered.last().map_or("", String::as_str)
+}
+
+#[test]
+fn the_prompt_is_contained_by_a_gutter_and_a_spacer_at_every_supported_width() {
+    // The defect this pins was reported from a real 120x32 pane: the whole prompt rendered as
+    // one bare `▏` on the terminal's final row, with nothing between it and the screen edge.
+    // Asserting `prompt_rows` would not have caught it — the band was the right height and
+    // empty. Only the frame says whether anything is *in* it, so this reads the frame.
+    for width in [200u16, 120, 80, 60, 40] {
+        let (mut blank, _shutdown) = screen();
+        let rendered = rows(&render_offscreen(&mut blank, width, 24).expect("infallible"));
+        let band = &rendered[rendered.len() - 2];
+        assert!(
+            band.starts_with("› "),
+            "at {width} columns the prompt has no gutter marker: {band:?}"
+        );
+        assert!(
+            band.contains('▏'),
+            "at {width} columns the caret is not in the band: {band:?}"
+        );
+        // A buffer tall enough to fill the band, because that is the only state in which the
+        // spacer is load-bearing: an empty prompt never reaches the last row, so asserting the
+        // blank against one would pass with no spacer at all.
+        let (mut tall, _shutdown) = screen();
+        tall.editor.set_text(
+            &(0..12)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let filled = rows(&render_offscreen(&mut tall, width, 24).expect("infallible"));
+        assert!(
+            filled.iter().any(|row| row.contains("line 11")),
+            "at {width} columns the tall fixture did not fill the band: {filled:?}"
+        );
+        assert_eq!(
+            last_row(&filled),
+            "",
+            "at {width} columns the prompt is flush against the terminal's last row, which is \
+             the reported defect"
+        );
+        assert_eq!(
+            last_row(&rendered),
+            "",
+            "at {width} columns an empty prompt reaches the terminal's last row"
+        );
+        // The right inset, measured rather than assumed: a full row of typed text must stop
+        // short of the frame, or the band is only nominally contained.
+        let (mut typed, _shutdown) = screen();
+        typed.editor.set_text(&"x".repeat(usize::from(width) * 2));
+        let rendered = rows(&render_offscreen(&mut typed, width, 24).expect("infallible"));
+        let band = &rendered[rendered.len() - 2];
+        assert!(
+            crate::views::display_width(band) < usize::from(width),
+            "at {width} columns the prompt used its last column, leaving no right inset: \
+             {} of {width}",
+            crate::views::display_width(band)
+        );
+    }
+}
+
+#[test]
+fn the_prompt_keeps_a_typeable_row_on_a_twenty_by_ten_pane() {
+    // `prompt_rows` refuses to panic at this size and has its own tests for that. What chrome
+    // adds is a second way to lose: a spacer or a gutter that takes the band's only row leaves
+    // a prompt that cannot be typed into, which no arithmetic assertion would notice.
+    let (mut screen, _shutdown) = screen();
+    screen.editor.set_text("hi");
+    let rendered = rows(&render_offscreen(&mut screen, 20, 10).expect("infallible"));
+    let band = &rendered[rendered.len() - 2];
+    assert!(
+        band.contains("hi") && band.contains('▏'),
+        "the 20x10 prompt lost its content row to chrome: {band:?}"
+    );
+    assert_eq!(
+        last_row(&rendered),
+        "",
+        "the spacer row is missing at 20x10"
+    );
+}
+
+#[test]
+fn prompt_chrome_is_dropped_before_the_buffer_is_squeezed() {
+    // Chrome that costs more than it gives is dropped, and the threshold is asserted on both
+    // sides so neither branch can rot into being unreachable — the failure mode that made a
+    // fourth attribution level dead code elsewhere in this repo.
+    let wide = Rect::new(0, 0, 20, 2);
+    let (gutter, editor) = prompt_frame(wide);
+    assert!(gutter.is_some(), "20 columns can afford the gutter");
+    assert_eq!(editor.width, 20 - PROMPT_GUTTER_COLS - PROMPT_RIGHT_INSET);
+    assert_eq!(editor.height, 1, "the spacer took the second of two rows");
+
+    let narrow = Rect::new(0, 0, PROMPT_GUTTER_COLS + PROMPT_RIGHT_INSET + 1, 2);
+    let (gutter, editor) = prompt_frame(narrow);
+    assert!(
+        gutter.is_none(),
+        "a pane this narrow kept chrome instead of columns"
+    );
+    assert_eq!(
+        editor.width, narrow.width,
+        "dropping the gutter must give the columns back to the buffer"
+    );
+
+    let single = Rect::new(0, 0, 40, 1);
+    let (_gutter, editor) = prompt_frame(single);
+    assert_eq!(
+        editor.height, 1,
+        "a one-row band spent its only row on the spacer"
+    );
+}
+
+#[test]
+fn the_empty_prompt_says_what_to_do_and_a_typed_one_does_not() {
+    let (mut screen, _shutdown) = screen();
+    let empty = rows(&render_offscreen(&mut screen, 60, 24).expect("infallible")).join("\n");
+    assert!(
+        empty.contains(PROMPT_PLACEHOLDER),
+        "the empty prompt offers no hint:\n{empty}"
+    );
+    screen.editor.set_text("a real prompt");
+    let typed = rows(&render_offscreen(&mut screen, 60, 24).expect("infallible")).join("\n");
+    assert!(
+        !typed.contains(PROMPT_PLACEHOLDER),
+        "the hint survived the text it was standing in for:\n{typed}"
+    );
+}
+
+/// A notice long enough that no supported width can render it whole.
+const OVERLONG_NOTICE: &str = "MCP server `context7` was not toggled: lifecycle worker is busy \
+     or unavailable, and the request was dropped rather than queued because a queued toggle \
+     would apply at an unpredictable time long after the user asked for it and the panel would \
+     disagree with the server about its own state for the whole interval";
+
+/// The notice's own rows, cut to the transcript's columns and stripped of the `! ` marker.
+///
+/// The cut is the load-bearing part. `rows` returns a whole frame row, so with the ambient
+/// panel drawn a notice row carries the panel's text too — measuring that row's width measures
+/// the terminal, and reassembling it interleaves the panel into the sentence. Both mistakes
+/// were made writing these tests, and both looked like failures of the shipping code.
+fn notice_body(rendered: &[String]) -> Vec<String> {
+    rendered
+        .iter()
+        .filter(|row| row.starts_with("▲ ! "))
+        .map(|row| {
+            let main = row.split('│').next().unwrap_or(row);
+            main.trim_start_matches("▲ ! ").trim_end().to_owned()
+        })
+        .collect()
+}
+
+fn noticed(text: &str, width: u16) -> Vec<String> {
+    let (mut screen, _shutdown) = screen();
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .push(Message::notice(text));
+    rows(&render_offscreen(&mut screen, width, 24).expect("infallible"))
+}
+
+#[test]
+fn a_long_notice_stops_at_the_cap_and_says_how_much_it_kept_back() {
+    for width in [60u16, 40, 24] {
+        let rendered = noticed(OVERLONG_NOTICE, width);
+        let body = notice_body(&rendered);
+        // The literal, not `NOTICE_MAX_ROWS`. An assertion that reads the constant follows it:
+        // raising the cap to six would keep this green while the notice quietly took another
+        // row of the reply. Five rows out of a 24-row frame is the property; the constant is
+        // pinned separately below so the two cannot drift apart unremarked.
+        assert_eq!(
+            body.len(),
+            5,
+            "at {width} columns the notice took {} rows: {body:?}",
+            body.len()
+        );
+        // The affordance before the count, because a cut with no mark is indistinguishable
+        // from a sentence that simply ended — which is what the reported capture looked like.
+        let last = body.last().expect("the cap is not zero");
+        assert!(
+            last.contains(crate::views::message::ELIDED) && last.contains("more lines"),
+            "at {width} columns the notice was cut with nothing to say so: {last:?}"
+        );
+        assert!(
+            last.split_whitespace()
+                .any(|word| word.parse::<usize>().is_ok()),
+            "the overflow row states no count, so the reader cannot tell how much is missing: \
+             {last:?}"
+        );
+    }
+}
+
+#[test]
+fn the_notice_cap_is_the_number_the_assertions_were_written_against() {
+    assert_eq!(
+        crate::views::message::NOTICE_MAX_ROWS,
+        5,
+        "the notice cap moved; the row assertions in this file spell 5 as a literal on purpose, \
+         so change them together and re-derive the number from a measurement"
+    );
+}
+
+#[test]
+fn a_short_notice_is_shown_whole_with_no_overflow_row() {
+    // The other side of the cap. Without this the cap could be `0` and the test above would
+    // still pass on its `ELIDED` assertion alone.
+    let body = notice_body(&noticed("agent set to plan for the next turn", 80));
+    assert_eq!(
+        body.len(),
+        1,
+        "a one-line notice did not fit in one row: {body:?}"
+    );
+    assert!(
+        !body[0].contains("more lines"),
+        "an uncut notice claimed it was cut: {body:?}"
+    );
+}
+
+#[test]
+fn a_notice_never_reaches_the_sidebar_column_with_or_without_the_panel() {
+    // The reported capture: rows 2 and 3 of a 120-column frame ended flush against the
+    // panel's `│`, and the guidance the sentence carried was read as truncated. The assertion
+    // is positional rather than a substring search, because "the text stops before the rule"
+    // is the property and a substring test cannot see a missing column.
+    let with_panel = noticed(OVERLONG_NOTICE, crate::views::SIDEBAR_MIN_WIDTH);
+    // The panel's own left rule, which sits at the start of the sidebar's area; the gap
+    // column is the one immediately before it.
+    let rule_column =
+        usize::from(crate::views::SIDEBAR_MIN_WIDTH - crate::views::ambient::SIDEBAR_WIDTH);
+    let mut inspected = 0;
+    for row in with_panel.iter().filter(|row| row.starts_with("▲ ! ")) {
+        inspected += 1;
+        let columns: Vec<char> = row.chars().collect();
+        assert_eq!(
+            columns.get(rule_column),
+            Some(&'│'),
+            "the sidebar rule is not where the layout puts it: {row:?}"
+        );
+        assert_eq!(
+            columns.get(rule_column - 1),
+            Some(&' '),
+            "a notice row touched the sidebar rule, which reads as the panel cutting the \
+             sentence: {row:?}"
+        );
+    }
+    assert!(
+        inspected >= 2,
+        "the wrapped notice produced only {inspected} rows to check"
+    );
+
+    // With the panel hidden at the *same* total width, the notice must take the columns it
+    // gave up. Compared at one width on purpose: a narrower frame would be narrower for
+    // reasons that have nothing to do with the panel, and the comparison would prove nothing.
+    let (mut hidden, _shutdown) = screen();
+    hidden
+        .transcript_mut()
+        .transcript_mut()
+        .push(Message::notice(OVERLONG_NOTICE));
+    hidden.handle_action(action("sidebar_toggle"), &press_none());
+    let rendered = rows(
+        &render_offscreen(&mut hidden, crate::views::SIDEBAR_MIN_WIDTH, 24).expect("infallible"),
+    );
+    let widest = |rows: &[String]| {
+        notice_body(rows)
+            .iter()
+            .map(|row| row.chars().count())
+            .max()
+            .unwrap_or(0)
+    };
+    assert!(
+        rendered.iter().all(|row| !row.contains('│')),
+        "the panel is still drawn after the toggle, so this proves nothing"
+    );
+    assert!(
+        widest(&rendered) > widest(&with_panel),
+        "hiding the panel did not widen the notice: {} columns either way",
+        widest(&rendered)
+    );
+    assert!(
+        widest(&rendered) <= usize::from(crate::views::SIDEBAR_MIN_WIDTH),
+        "the notice overflowed a panel-less frame: {} columns",
+        widest(&rendered)
+    );
+}
+
+#[test]
+fn a_notice_wraps_between_words_and_never_inside_one() {
+    // A prior fix in this crate broke `discar`/`ded`. Reassembling the rows and requiring the
+    // words back is what catches that, rather than eyeballing a frame.
+    let joined = notice_body(&noticed(OVERLONG_NOTICE, 60))
+        .into_iter()
+        .filter(|row| !row.contains("more lines"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    for word in ["lifecycle", "unavailable", "unpredictable", "context7"] {
+        if OVERLONG_NOTICE.contains(word) && joined.contains(&word[..4]) {
+            assert!(
+                joined.contains(word),
+                "`{word}` was split across rows: {joined:?}"
+            );
+        }
+    }
+}
+
+/// A rendered row's text with the blank ratatui writes into a wide glyph's second cell removed.
+///
+/// [`crate::views::testkit::rows`] emits one character per *cell*, so a double-width glyph
+/// arrives as the glyph followed by a space that is not in the content. Stripping those is what
+/// makes the row comparable to the string it was rendered from — and measuring the raw row with
+/// `display_width` instead counts a wide glyph as three columns, which is how the first version
+/// of the test below "failed" on correct output.
+fn cells_to_text(row: &str) -> String {
+    let mut out = String::new();
+    let mut skip = false;
+    for character in row.chars() {
+        if skip && character == ' ' {
+            skip = false;
+            continue;
+        }
+        skip = unicode_width::UnicodeWidthChar::width(character) == Some(2);
+        out.push(character);
+    }
+    out
+}
+
+#[test]
+fn a_cjk_notice_keeps_every_glyph_inside_the_transcript_column() {
+    // Columns, not characters — and the assertion has to be "nothing was lost" rather than
+    // "the row is narrow enough", because the row is one character per cell by construction and
+    // so is trivially in range. A wrap that measured characters would break CJK at twice the
+    // available columns, `ruled` would cut each row at the frame, and the glyphs past the cut
+    // would be discarded silently. Reassembling the rows and requiring a prefix of the source
+    // is what sees that.
+    let text = "服务器连接失败：生命周期工作线程正忙或不可用，这条请求被丢弃而不是排队，\
+                因为排队的切换会在用户请求之后一段无法预测的时间才生效";
+    for width in [crate::views::SIDEBAR_MIN_WIDTH, 80, 40] {
+        let rendered = noticed(text, width);
+        let body: Vec<String> = notice_body(&rendered)
+            .into_iter()
+            .filter(|row| !row.contains("more lines"))
+            .map(|row| cells_to_text(&row).trim_end().to_owned())
+            .collect();
+        assert!(
+            !body.is_empty(),
+            "at {width} columns the CJK notice rendered nothing"
+        );
+        let reassembled: String = body.concat();
+        assert!(
+            text.starts_with(&reassembled),
+            "at {width} columns the CJK notice lost or reordered glyphs:\n{reassembled}"
+        );
+        for row in &body {
+            assert!(
+                crate::views::display_width(row) <= usize::from(width),
+                "a CJK notice row measures {} columns in a {width}-column frame: {row:?}",
+                crate::views::display_width(row)
+            );
+        }
+    }
+}
+
+/// A screen with agents to walk and a sink that records where they went.
+fn cyclable() -> (SessionScreen, mpsc::Receiver<Selection>) {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (selections, applied) = mpsc::channel(8);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_selection_sink(selections)
+        .with_keymap(Keymap::defaults().expect("the shipped table builds"));
+    screen.catalog_mut().agents = ["build", "general", "plan"]
+        .into_iter()
+        .map(|name| crate::views::picker::AgentEntry {
+            name: String::from(name),
+            description: String::from("an agent"),
+        })
+        .collect();
+    screen.catalog_mut().agent = Some(String::from("build"));
+    (screen, applied)
+}
+
+#[test]
+fn tab_cycles_the_agent_through_the_production_dispatch_chain() {
+    // Pressed as a key event through `KeyDispatcher`, not called as a method: the defect was
+    // that `tab` resolved to `agent_cycle` correctly and no arm existed, so every assertion
+    // short of the real chain passed while the key did nothing. The frame and the channel are
+    // both read, because a switch the strip shows and the host never hears is the other half
+    // of the same defect.
+    let (screen, mut applied) = cyclable();
+    let mut dispatcher = KeyDispatcher::new(
+        Keymap::defaults().expect("the shipped table builds"),
+        scopes(),
+        Box::new(DialogHost::new(ViewContext::defaults(), Box::new(screen))),
+    );
+    let result = dispatcher.handle_event(&AppEvent::Terminal(TerminalEvent::Input(
+        CrosstermEvent::Key(press(crossterm::event::KeyCode::Tab)),
+    )));
+    assert!(
+        result.handled,
+        "`tab` reached nothing; `agent_cycle` is unreachable"
+    );
+    let selection = applied
+        .try_recv()
+        .expect("`tab` reached no host; the agent did not actually change");
+    assert_eq!(
+        selection,
+        Selection::Agent(String::from("general")),
+        "`tab` did not move one place along the catalog"
+    );
+    let joined = rows(&render_offscreen(&mut dispatcher, 100, 14).expect("infallible")).join("\n");
+    assert!(
+        joined.contains("general"),
+        "the switch reached the host but nothing on screen says so, which is \
+         indistinguishable from a dead key:\n{joined}"
+    );
+}
+
+#[test]
+fn shift_tab_cycles_back_from_the_event_a_terminal_really_sends() {
+    // `KeyCode::BackTab` with `SHIFT`, which is what crossterm reports for the `CSI Z` a
+    // default terminal sends. Constructing `Tab` with `SHIFT` here would test the Kitty
+    // encoding and pass against the broken spelling this test exists for.
+    let (screen, mut applied) = cyclable();
+    let mut dispatcher = KeyDispatcher::new(
+        Keymap::defaults().expect("the shipped table builds"),
+        scopes(),
+        Box::new(DialogHost::new(ViewContext::defaults(), Box::new(screen))),
+    );
+    let mut event = press(crossterm::event::KeyCode::BackTab);
+    event.modifiers = crossterm::event::KeyModifiers::SHIFT;
+    let result = dispatcher.handle_event(&AppEvent::Terminal(TerminalEvent::Input(
+        CrosstermEvent::Key(event),
+    )));
+    assert!(
+        result.handled,
+        "shift-tab reached nothing from the key event a terminal actually sends"
+    );
+    assert_eq!(
+        applied.try_recv().expect("shift-tab reached no host"),
+        Selection::Agent(String::from("plan")),
+        "cycling backwards from the first agent must wrap to the last"
+    );
+}
+
+#[test]
+fn cycling_wraps_at_both_ends_and_reports_a_refused_sink() {
+    let (mut screen, mut applied) = cyclable();
+    screen.catalog_mut().agent = Some(String::from("plan"));
+    screen.handle_action(action("agent_cycle"), &press_none());
+    assert_eq!(
+        applied.try_recv().expect("delivered"),
+        Selection::Agent(String::from("build")),
+        "cycling forward off the last agent must wrap to the first"
+    );
+
+    // No sink at all: the notice-vs-silence decision is what separates this from the defect
+    // family. A key that appears to switch and reaches nothing must say so.
+    let (sender, _shutdown) = terminal_event_channel();
+    let mut orphan = SessionScreen::new(ViewContext::defaults(), sender);
+    orphan.catalog_mut().agents = ["build", "plan"]
+        .into_iter()
+        .map(|name| crate::views::picker::AgentEntry {
+            name: String::from(name),
+            description: String::new(),
+        })
+        .collect();
+    orphan.handle_action(action("agent_cycle"), &press_none());
+    let toasts = ActionComponent::drain_toasts(&mut orphan);
+    assert!(
+        toasts
+            .iter()
+            .any(|toast| toast.level() == ToastLevel::Warning
+                && toast.text().contains("not applied")),
+        "a cycle that reached no host reported success or nothing: {toasts:?}"
+    );
+}
+
+#[test]
+fn cycling_a_catalog_with_nothing_to_cycle_says_so_rather_than_going_quiet() {
+    // Silence here would be indistinguishable from the dead key this action shipped as, which
+    // is the whole reason the empty and single-agent cases are not early `IGNORED` returns.
+    for agents in [Vec::new(), vec![String::from("build")]] {
+        let (sender, _shutdown) = terminal_event_channel();
+        let mut screen = SessionScreen::new(ViewContext::defaults(), sender);
+        let count = agents.len();
+        screen.catalog_mut().agents = agents
+            .into_iter()
+            .map(|name| crate::views::picker::AgentEntry {
+                name,
+                description: String::new(),
+            })
+            .collect();
+        let result = screen.handle_action(action("agent_cycle"), &press_none());
+        assert!(result.handled, "a {count}-agent catalog left the key dead");
+        let toasts = ActionComponent::drain_toasts(&mut screen);
+        assert!(
+            toasts
+                .iter()
+                .any(|toast| toast.text().contains("no other agent")),
+            "a {count}-agent catalog cycled in silence: {toasts:?}"
+        );
+    }
+}

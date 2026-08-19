@@ -101,6 +101,49 @@ const STATUS_ROWS: u16 = 1;
 const PROMPT_MIN_ROWS: u16 = 2;
 const PROMPT_MAX_SHARE: u16 = 3;
 
+/// The prompt's own chrome: a marker gutter, a right inset and a bottom spacer.
+///
+/// No border, and that is a decision rather than an omission. None of the three reference
+/// composers draws one, `codex` — a ratatui composer, so the closest analogue — least of
+/// all: it calls `Block::default().style(..)` with no `.borders(..)` and takes its
+/// containment from insets plus a `›` glyph in a two-column gutter. A border costs two rows
+/// of a band whose floor is two, so on the 20x10 pane [`prompt_rows`] exists to survive it
+/// would leave zero rows for the text it frames.
+///
+/// Taken from `codex`: the gutter and its marker, a column of air on the right, and a blank
+/// row under the text so the caret never sits on the terminal's last line. Not taken:
+/// `codex`'s *top* inset, because the status strip is already a filled full-width row
+/// directly above and a second blank row would spend a transcript row on separation the
+/// strip already supplies.
+const PROMPT_GUTTER_COLS: u16 = 2;
+const PROMPT_RIGHT_INSET: u16 = 1;
+const PROMPT_SPACER_ROWS: u16 = 1;
+
+/// Columns the text must keep before the chrome is dropped instead of the text.
+///
+/// Chrome that squeezes the buffer below this is chrome that costs more than it gives: at
+/// 20 columns the gutter and inset leave 17, which still holds a phrase, while a pane
+/// narrow enough to fall under this floor needs every column for the words.
+const PROMPT_MIN_CONTENT_COLS: u16 = 12;
+
+/// The marker drawn in the prompt's gutter.
+const PROMPT_MARKER: &str = "›";
+
+/// What the empty prompt says about itself.
+///
+/// One sentence rather than a list of keys: the band is a single row at its floor, and a
+/// hint long enough to be truncated there teaches less than a short one that fits.
+const PROMPT_PLACEHOLDER: &str = "ask anything, or / for commands";
+
+/// One blank column between the transcript and the ambient sidebar's rule.
+///
+/// Measured, not stylistic. Without it a wrapped row that used its full width ended flush
+/// against the panel's `│`, and a sentence whose last word touches a vertical rule reads as
+/// a sentence the panel cut off — which is exactly what a 120-column capture of a wrapped
+/// notice was reported as. One column of air is the whole difference between "wrapped" and
+/// "truncated" to a reader.
+const SIDEBAR_GAP_COLS: u16 = 1;
+
 /// Rows the prompt gets for `content_lines` of typed text on a `height`-row screen.
 ///
 /// One row more than the content so the line the cursor is about to open is already
@@ -118,6 +161,44 @@ fn prompt_rows(content_lines: usize, height: u16) -> u16 {
         .saturating_add(1);
     let cap = (height / PROMPT_MAX_SHARE).max(PROMPT_MIN_ROWS);
     wanted.clamp(PROMPT_MIN_ROWS, cap)
+}
+
+/// The prompt band carved into a gutter, the buffer's own area, and the spacer below.
+///
+/// A function rather than inline `Layout` calls for the reason [`prompt_rows`] is one: every
+/// subtraction here has to hold at 20x10, where the band is two rows and twenty columns, and
+/// a helper is what lets that be asserted directly instead of inferred from a frame. The
+/// gutter is `None` — chrome dropped rather than text squeezed — whenever the pane cannot
+/// spare [`PROMPT_MIN_CONTENT_COLS`] after it, and the spacer is dropped whenever the band
+/// is a single row, because a spacer that takes the only row leaves nowhere to type.
+fn prompt_frame(band: Rect) -> (Option<Rect>, Rect) {
+    // Clamped to the band rather than floored at one: a `max(1)` here fabricates a row the
+    // band does not own, and writing into it panics inside ratatui's buffer. The three-band
+    // split really does hand out a zero-row prompt — on a one-row viewport the status strip
+    // takes the only row — so this is a reachable input, not a defensive branch.
+    let content_height = if band.height <= PROMPT_SPACER_ROWS {
+        band.height
+    } else {
+        band.height - PROMPT_SPACER_ROWS
+    };
+    let content = Rect {
+        height: content_height,
+        ..band
+    };
+    let chrome = PROMPT_GUTTER_COLS.saturating_add(PROMPT_RIGHT_INSET);
+    if content.width < chrome.saturating_add(PROMPT_MIN_CONTENT_COLS) {
+        return (None, content);
+    }
+    let gutter = Rect {
+        width: PROMPT_GUTTER_COLS,
+        ..content
+    };
+    let editor = Rect {
+        x: content.x + PROMPT_GUTTER_COLS,
+        width: content.width - chrome,
+        ..content
+    };
+    (Some(gutter), editor)
 }
 
 /// The transcript, the status strip and the prompt as one screen.
@@ -293,7 +374,7 @@ impl SessionScreen {
             status: StatusView::new(context.clone()),
             welcome: crate::views::welcome::WelcomeView::new(context.clone()),
             sidebar: crate::views::ambient::SidebarView::new(context.clone()),
-            editor: InputEditor::new(context.clone()),
+            editor: InputEditor::new(context.clone()).with_placeholder(PROMPT_PLACEHOLDER),
             autocomplete: AutocompleteView::new(
                 context.clone(),
                 Box::new(SlashSource::new(slash.clone())),
@@ -926,8 +1007,11 @@ impl Component for SessionScreen {
         // costing the reply the columns it needed.
         let (main, aside) = if self.sidebar_visible && area.width >= crate::views::SIDEBAR_MIN_WIDTH
         {
-            let [main, aside] = Layout::horizontal([
+            // The gap column is between the two, not inside either, so neither the
+            // transcript's wrap width nor the panel's own layout has to know about it.
+            let [main, _gap, aside] = Layout::horizontal([
                 Constraint::Min(1),
+                Constraint::Length(SIDEBAR_GAP_COLS),
                 Constraint::Length(crate::views::ambient::SIDEBAR_WIDTH),
             ])
             .areas(body);
@@ -956,7 +1040,15 @@ impl Component for SessionScreen {
         }
 
         self.status.render(frame, status);
-        self.editor.render(frame, prompt);
+        // The whole band is painted first, so the spacer row and the right inset carry the
+        // prompt's own background rather than whatever the previous frame left there.
+        crate::views::fill(frame.buffer_mut(), prompt, self.context.text());
+        let (gutter, buffer) = prompt_frame(prompt);
+        if let Some(gutter) = gutter {
+            crate::views::editor::PromptGutter::new(self.context.clone(), PROMPT_MARKER.to_owned())
+                .render(frame, gutter);
+        }
+        self.editor.render(frame, buffer);
         if self.autocomplete.is_open() {
             let height = self.autocomplete.height().min(main.height);
             let overlay = Rect::new(
@@ -1134,6 +1226,8 @@ impl SessionScreen {
             }
             "model_list" => self.request(self.model_picker()),
             "agent_list" => self.request(self.agent_picker()),
+            "agent_cycle" => self.cycle_agent(1),
+            "agent_cycle_reverse" => self.cycle_agent(-1),
             "session_list" => self.request(self.session_picker()),
             // Two statements because opening the theme picker also records the theme to
             // put back on escape, which needs `&mut self` while `request` does too.
@@ -1435,6 +1529,18 @@ impl SessionScreen {
             }
             _ => return EventResult::IGNORED,
         };
+        let (text, _delivered) = self.commit_selection(selection);
+        self.transcript.transcript_mut().push(Message::notice(text));
+        EventResult::REDRAW
+    }
+
+    /// Send `selection` to the host, and say what happened without choosing where.
+    ///
+    /// Split out of [`Self::adopt`] so the cycling keys can reuse the *delivery* while
+    /// reporting on a different surface. Both callers must keep the refusal branch, which is
+    /// the whole reason the boolean comes back: a selection that reached nothing and said so
+    /// nowhere is the defect class the sink was made fallible to expose.
+    fn commit_selection(&mut self, selection: Selection) -> (String, bool) {
         let notice = match &selection {
             Selection::Model(model) => format!("model set to {model} for the next turn"),
             Selection::Agent(agent) => format!("agent set to {agent} for the next turn"),
@@ -1453,7 +1559,73 @@ impl SessionScreen {
             // selection that reached nothing, and no way for the user to tell.
             format!("{notice} (not applied: nothing is listening)")
         };
-        self.transcript.transcript_mut().push(Message::notice(text));
+        (text, delivered)
+    }
+
+    /// Move to the agent `step` places along the catalog, wrapping at both ends.
+    ///
+    /// Cycles [`SessionCatalog::agents`] in its own order — the same list and sequence
+    /// `<leader>a` opens. Deriving a second list here is the failure this codebase keeps
+    /// paying for: two surfaces that each decide what "the agents" are will disagree, and the
+    /// user cannot tell which is lying. Subagent-only and hidden rows are excluded where the
+    /// catalog is built, so both surfaces drop the same rows for the same reason.
+    ///
+    /// Reports through a toast where the picker pushes a transcript notice: cycling is
+    /// exploratory and repeated, so walking seven agents would leave seven permanent rows in
+    /// a transcript being read for a reply, and the status strip already holds the durable
+    /// answer. A refused sink still reports, at warning grade — a key that appears to switch
+    /// and reaches nothing is worse than a dead one, because the strip agrees with it.
+    ///
+    /// Mid-turn is not special-cased, deliberately: `drive_turns` reads this channel only
+    /// between turns, the same deferral the MCP toggle relies on.
+    fn cycle_agent(&mut self, step: isize) -> EventResult {
+        let names: Vec<String> = self
+            .catalog
+            .agents
+            .iter()
+            .map(|agent| agent.name.clone())
+            .collect();
+        if names.len() < 2 {
+            // One agent is not a cycle, and silence would be indistinguishable from the dead
+            // key this action shipped as. Naming the count is what tells the user the key
+            // works and the catalog is short.
+            self.toasts.push(Toast::warning(format!(
+                "no other agent to switch to: the catalog has {}",
+                match names.len() {
+                    0 => String::from("none"),
+                    _ => format!("only `{}`", names[0]),
+                }
+            )));
+            return EventResult::REDRAW;
+        }
+        let current = self
+            .catalog
+            .agent
+            .as_ref()
+            .and_then(|active| names.iter().position(|name| name == active));
+        // An agent absent from the list — launched with `--agent` naming a subagent, say —
+        // has no position to step from, so the first row is where the cycle starts rather
+        // than nowhere. `rem_euclid` over the signed sum is what makes one implementation
+        // serve both directions, including the wrap from the first row backwards.
+        let next = match current {
+            Some(index) => {
+                let length = isize::try_from(names.len()).unwrap_or(isize::MAX);
+                let moved = isize::try_from(index).unwrap_or(0).saturating_add(step);
+                usize::try_from(moved.rem_euclid(length)).unwrap_or(0)
+            }
+            None => 0,
+        };
+        let name = names[next].clone();
+        self.catalog.agent = Some(name.clone());
+        self.status.set_configured_agent(&name);
+        self.welcome.facts_mut().agent = Some(name.clone());
+        self.sidebar.ambient_mut().agent = Some(name.clone());
+        let (text, delivered) = self.commit_selection(Selection::Agent(name));
+        self.toasts.push(if delivered {
+            Toast::success(text)
+        } else {
+            Toast::warning(text)
+        });
         EventResult::REDRAW
     }
 }
