@@ -944,25 +944,29 @@ async fn forward_cancellations(
 /// second so the strip's detail is what remains on screen.
 /// What the model, agent and session pickers offer.
 ///
-/// Models are limited to the **session provider's own**, which is a correctness bound
-/// rather than a shortcut: a turn wires exactly one provider credential, so offering
-/// another vendor's model would offer a choice that could only fail — and it would fail
-/// by presenting this provider's key to that vendor's endpoint. Switching provider is a
-/// relaunch, and a picker that said otherwise would be lying about what it can do.
+/// Models are **every provider's**, which is what [`zuno models`] already reports and
+/// what this surface used to contradict. The previous bound — the session provider's
+/// models alone — was justified as a correctness guard, on the grounds that a turn wires
+/// exactly one credential and so another vendor's model could only fail by presenting
+/// the wrong key. That reasoning was wrong about this program: a selection does not
+/// mutate the live host, it goes back through [`TurnPlan::resolve`]
+/// ([`apply_selection`]), which splits the provider off the `/` prefix and re-resolves
+/// the credential, the token window and the tool set from *that* provider. Every
+/// cross-provider pick a launch could make, the rebuild can make too — so withholding
+/// them hid working choices rather than preventing broken ones.
+///
+/// One list, from [`TurnPlan::catalog_model_ids`], which is filled by
+/// `Catalog::model_lines` — the same enumeration `zuno models` prints. Two enumerations
+/// is precisely how the surfaces came to disagree.
 async fn session_catalog(
     plan: &TurnPlan,
     environment: &StartupEnvironment,
 ) -> zuno_tui::views::session::SessionCatalog {
     let env = environment.resolved();
-    let provider = plan.provider_id().to_owned();
     let models = plan
-        .provider_model_ids()
+        .catalog_model_ids()
         .into_iter()
-        .map(|id| zuno_tui::views::picker::ModelEntry {
-            id: format!("{provider}/{id}"),
-            name: id,
-            provider: provider.clone(),
-        })
+        .map(|qualified| model_entry(&qualified))
         .collect();
     // Filtered here rather than in `agent::list`, which must keep returning everything: the
     // turn loop resolves a delegation by name and needs the subagents this drops. Both TUI
@@ -995,6 +999,27 @@ async fn session_catalog(
         sessions: Vec::new(),
         model: Some(plan.qualified_model()),
         agent: Some(plan.agent_name().to_owned()),
+    }
+}
+
+/// Split one `provider/model` line into the entry the picker groups by.
+///
+/// `split_once`, never `rsplit_once` or `split`: a model id may itself contain slashes —
+/// `anyapi/openai/gpt` is a real catalog shape, pinned by `turn_tests.rs`'s
+/// `model_selection_splits_only_the_provider_prefix`. This has to divide the string
+/// exactly where `select_model` will divide it again, or a row would resolve to a
+/// different model than the one it named.
+///
+/// A line with no slash cannot come from `Catalog::model_lines`, which formats every one
+/// as `{provider}/{model}`. Should one arrive anyway the whole string becomes the name
+/// under an empty heading rather than being dropped: a visibly odd row is debuggable, and
+/// a silently missing model is the defect this function exists to fix.
+fn model_entry(qualified: &str) -> zuno_tui::views::picker::ModelEntry {
+    let (provider, name) = qualified.split_once('/').unwrap_or(("", qualified));
+    zuno_tui::views::picker::ModelEntry {
+        id: qualified.to_owned(),
+        name: name.to_owned(),
+        provider: provider.to_owned(),
     }
 }
 
@@ -1472,6 +1497,7 @@ fn to_string(error: impl std::fmt::Display) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::fs;
     use std::io::{Read as _, Write};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2503,5 +2529,69 @@ mod tests {
         assert!(history.redo.is_empty());
         assert_eq!(history.undo.len(), 1);
         assert_eq!(fs::read_to_string(file).expect("read new turn"), "three\n");
+    }
+
+    /// The owner's report, at the surface he saw it: `/model` offered only the session
+    /// provider's models. The picker groups by provider and already could have shown more
+    /// than one, so the failure was upstream of the view — every entry arrived carrying
+    /// the same hard-bound provider. Asserting on **distinct** headings is what makes this
+    /// fail for that cause rather than for a shorter list.
+    #[test]
+    fn the_model_picker_offers_every_provider_the_catalog_holds() {
+        let lines = [
+            "amazon-bedrock/anthropic.claude-opus-4-6-v1",
+            "amazon-bedrock/amazon.nova-lite-v1:0",
+            "myopenai/gpt-5",
+            "myopenai/o4",
+        ];
+        let entries = lines
+            .iter()
+            .map(|line| model_entry(line))
+            .collect::<Vec<_>>();
+
+        let providers = entries
+            .iter()
+            .map(|entry| entry.provider.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            providers.len() >= 2,
+            "every entry was bound to one provider, so no second vendor can reach the \
+             picker: {providers:?}"
+        );
+
+        let picker = zuno_tui::views::picker::model_picker(
+            zuno_tui::views::ViewContext::defaults(),
+            entries,
+        )
+        .selecting("myopenai/o4");
+        let offered = picker
+            .visible()
+            .iter()
+            .map(|item| item.group.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            offered,
+            BTreeSet::from(["amazon-bedrock", "myopenai"]),
+            "the picker's own rows do not span both providers"
+        );
+        // `selecting` must still land on the session's model now that it is one row among
+        // hundreds rather than one among a single provider's list.
+        assert_eq!(
+            picker.selected().map(|item| item.value.as_str()),
+            Some("myopenai/o4"),
+            "the current model is no longer pre-selected"
+        );
+    }
+
+    /// A model id may itself contain slashes, so only the first one is the provider.
+    #[test]
+    fn a_nested_model_id_keeps_every_segment_past_the_provider() {
+        let entry = model_entry("anyapi/openai/gpt");
+        assert_eq!(entry.provider, "anyapi");
+        assert_eq!(entry.name, "openai/gpt");
+        assert_eq!(
+            entry.id, "anyapi/openai/gpt",
+            "the value the rebuild re-resolves must be the line verbatim"
+        );
     }
 }

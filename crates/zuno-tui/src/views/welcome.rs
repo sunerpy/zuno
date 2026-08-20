@@ -37,9 +37,12 @@
 //! * The strip *does* drop its `trailers()` front-first, and the branch is the first to
 //!   go: at forty columns the strip carries neither branch nor exit key. So the branch
 //!   stays here, priced at zero extra rows by sharing the directory's row.
-//! * The sidebar is not drawn at all below [`crate::views::SIDEBAR_MIN_WIDTH`], so
-//!   everything it alone would carry — the directory, the version, the census — stays
-//!   here too, and is accepted as duplicated at 120 columns rather than absent at 80.
+//! * The sidebar is not drawn beside this screen **at any width** — see
+//!   [`crate::views::session`]'s `sidebar_drawn`, which withholds the panel until there is a
+//!   transcript for it to sit beside. So everything it alone would carry — the directory, the
+//!   version, the census — stays here, and the duplication this bullet used to accept at 120
+//!   columns no longer happens: below `SIDEBAR_MIN_WIDTH` the panel was already absent, and
+//!   above it the panel is now absent too until the first message lands.
 //!
 //! Of the four references, `codex` states its model and directory and nothing else,
 //! `jcode` draws no welcome at all on an authenticated session, and `claw-code` spends
@@ -76,8 +79,8 @@
 //!   whereas nothing lists the send, newline and exit keys, which is why those three stayed.
 //!
 //! What survives does so because it has no other carrier at some supported width. The
-//! location and census rows are the only carriers below [`crate::views::SIDEBAR_MIN_WIDTH`],
-//! where the sidebar is not drawn at all; `type / for commands` is now the *whole* of
+//! location and census rows are the only carriers at **every** width, since the sidebar is
+//! withheld from this screen entirely; `type / for commands` is now the *whole* of
 //! command discovery, so it is the least cuttable row on the screen; and the key row spells
 //! what `/` cannot express.
 //!
@@ -294,10 +297,10 @@ pub struct WelcomeFacts {
     pub directory: Option<String>,
     /// The version-control branch, when the directory is a checkout.
     ///
-    /// Kept even though the strip and the sidebar both name it, because neither keeps it
-    /// at every width: the sidebar is absent below [`crate::views::SIDEBAR_MIN_WIDTH`]
-    /// and the branch is the *first* trailer the strip drops, so at forty columns this is
-    /// the only carrier left. It shares the directory's row, so the cost is zero rows.
+    /// Kept even though the strip and the sidebar both name it, because neither carries it
+    /// where this screen is drawn: the sidebar is withheld from the welcome screen at every
+    /// width, and the branch is the *first* trailer the strip drops, so at forty columns this
+    /// is the only carrier left. It shares the directory's row, so the cost is zero rows.
     pub branch: Option<String>,
     /// The build's version string.
     pub version: Option<String>,

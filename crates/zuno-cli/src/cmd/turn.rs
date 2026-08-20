@@ -130,8 +130,18 @@ pub(crate) struct TurnPlan {
     notes: Vec<String>,
     plugin_tools: Vec<Arc<dyn zuno_tool::Tool>>,
     plugins: Option<Arc<super::plugin_runtime::PluginRuntime>>,
-    /// The session provider's model ids, kept for the model picker.
-    provider_models: Vec<String>,
+    /// Every `provider/model` the resolved catalog offers, kept for the model picker.
+    ///
+    /// The **whole** catalog rather than the session provider's slice, and that is the
+    /// correctness argument rather than a convenience: [`select_model`] derives the
+    /// provider from the `/` prefix of whatever it is handed, and [`TurnPlan::resolve`]
+    /// re-resolves the credential, the token window and the tool set from that provider.
+    /// A picker offering only one provider's models therefore withheld choices the
+    /// rebuild path could already honour — the defect this field exists to close.
+    ///
+    /// Filled from [`Catalog::model_lines`], which is the same enumeration `zuno models`
+    /// prints. One function, so the two surfaces cannot disagree again.
+    catalog_models: Vec<String>,
 }
 
 impl TurnPlan {
@@ -267,13 +277,7 @@ impl TurnPlan {
             },
             &mut notes,
         )?;
-        let provider_models = catalog
-            .provider(&provider_id)
-            .map_or_else(Vec::new, |provider| {
-                let mut ids = provider.models.keys().cloned().collect::<Vec<_>>();
-                ids.sort_by(|left, right| zuno_llm::catalog::collate::compare(left, right));
-                ids
-            });
+        let catalog_models = picker_model_ids(&catalog);
         Ok(Self {
             directory,
             project,
@@ -293,7 +297,7 @@ impl TurnPlan {
             notes,
             plugin_tools,
             plugins,
-            provider_models,
+            catalog_models,
         })
     }
 
@@ -324,17 +328,12 @@ impl TurnPlan {
         &self.agent.name
     }
 
-    /// The provider whose credential this turn wired.
-    pub(crate) fn provider_id(&self) -> &str {
-        &self.provider_id
-    }
-
-    /// Every model id the session provider offers, sorted as `zuno models` prints them.
+    /// Every `provider/model` the catalog offers, in the order `zuno models` prints them.
     ///
     /// Kept from resolution rather than re-derived: rebuilding the catalog means reading
     /// the cache and re-applying plugin extensions, and a picker must not do that.
-    pub(crate) fn provider_model_ids(&self) -> Vec<String> {
-        self.provider_models.clone()
+    pub(crate) fn catalog_model_ids(&self) -> Vec<String> {
+        self.catalog_models.clone()
     }
 
     /// `provider/model`, as resolved.
@@ -1684,6 +1683,17 @@ fn resolved_credential(
             metadata: None,
         })
         .or_else(|| stored.cloned())
+}
+
+/// Every `provider/model` a picker may offer.
+///
+/// A named function rather than an inline call so the choice of enumeration is one
+/// testable decision. It is [`Catalog::model_lines`] — the same function `zuno models`
+/// prints from (`models.rs`'s `provider_ids` + `print_models` walk resolves to the same
+/// pairs in the same order). Reading the session provider's slice here instead is exactly
+/// the defect that let `/model` show one provider while `zuno models` showed ten.
+fn picker_model_ids(catalog: &Catalog) -> Vec<String> {
+    catalog.model_lines()
 }
 
 /// The SDK option bag for one model: the provider's options, with the model's on top.
