@@ -95,7 +95,7 @@ test:
 # `cargo test` builds in parallel but runs its 224 suites one at a time. With a
 # warm target that build is a 0.7s no-op and the run is 219.9s, so the loop is
 # bound by serialised execution. This target reaches the same 4280 passed / 0
-# failed / 8 ignored in 57.6s median. See docs/perf-methodology.md.
+# failed / 8 ignored in 53.2s median. See docs/perf-methodology.md.
 test-par:
 	./scripts/test-parallel.sh
 
