@@ -180,7 +180,7 @@ impl ToolDispatcher for ToolRegistryDispatcher {
         );
         let args = request.call.input.clone();
         let tool_name = resolved_name.to_owned();
-        let mut execution = tokio::spawn(async move { tool.execute(args, context).await });
+        let mut execution = tokio::spawn(async move { tool.invoke(args, context).await });
 
         let mut result = tokio::select! {
             biased;

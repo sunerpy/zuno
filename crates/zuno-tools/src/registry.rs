@@ -597,7 +597,7 @@ impl RegistryCore {
             })?;
         ctx.ask(resolved, PermissionAsk::new(permission_key(resolved), "*"))
             .await?;
-        tool.execute(arguments, ctx).await
+        tool.invoke(arguments, ctx).await
     }
 }
 

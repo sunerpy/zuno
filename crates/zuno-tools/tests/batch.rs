@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::error::Error as _;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zuno_error::ToolError;
 use zuno_tool::{
@@ -90,6 +90,60 @@ impl Tool for LargeTool {
 
     async fn execute(&self, _args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
         Ok(ToolOutput::text("large", "x".repeat(50_001)))
+    }
+}
+
+/// A stand-in for a schema-validating callee, of which an MCP server is the case
+/// that failed in production: `list_pages` reported `Unknown argument for tool
+/// "list_pages": "intent"` and refused the whole call. This rejects the same way
+/// rather than tolerating an argument it never declared, which is what makes it
+/// able to observe the leak; a permissive fake cannot.
+struct StrictTool {
+    received: Arc<Mutex<Option<Value>>>,
+}
+
+#[async_trait]
+impl Tool for StrictTool {
+    fn id(&self) -> &str {
+        "strict"
+    }
+
+    fn description(&self) -> &str {
+        "Reject any argument this tool did not declare."
+    }
+
+    fn raw_parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "label": { "type": "string" } },
+            "required": ["label"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        *self.received.lock().expect("received lock") = Some(args.clone());
+        let declared = ["label"];
+        let undeclared: Vec<String> = args
+            .as_object()
+            .map(|object| {
+                object
+                    .keys()
+                    .filter(|key| !declared.contains(&key.as_str()))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !undeclared.is_empty() {
+            return Err(ToolError::InvalidArgs {
+                tool: "strict".to_owned(),
+                source: Box::new(std::io::Error::other(format!(
+                    "Unknown argument for tool \"strict\": {}",
+                    undeclared.join(", ")
+                ))),
+            });
+        }
+        Ok(ToolOutput::text("strict", "accepted"))
     }
 }
 
@@ -427,6 +481,51 @@ async fn batch_a_missing_binding_is_refused_and_names_the_available_bindings() {
     let message = source(&error);
     assert!(message.contains("missing"));
     assert!(message.contains("Available bindings: first"));
+}
+
+#[tokio::test]
+async fn batch_forwards_only_the_arguments_the_model_supplied_to_a_strict_subtool() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let received = Arc::new(Mutex::new(None));
+    let registry = registry(
+        root.path(),
+        vec![Arc::new(StrictTool {
+            received: Arc::clone(&received),
+        })],
+    );
+
+    let output = registry
+        .execute(
+            "execute",
+            json!({
+                "tool_calls": [{
+                    "tool": "strict",
+                    "intent": "prove no injected key is forwarded",
+                    "accept_large_output": true,
+                    "label": "only-mine"
+                }]
+            }),
+            context(Arc::new(zuno_tool::AllowAll)),
+        )
+        .await
+        .expect("the batch completes");
+
+    let arguments = received
+        .lock()
+        .expect("received lock")
+        .clone()
+        .expect("the sub-tool was invoked");
+    assert_eq!(
+        arguments,
+        json!({ "label": "only-mine" }),
+        "a sub-call must receive exactly the arguments the model supplied"
+    );
+    assert!(
+        !output.output.contains("Unknown argument"),
+        "a strict sub-tool must not reject the call: {}",
+        output.output
+    );
+    assert!(output.output.contains("Completed: 1 succeeded, 0 failed"));
 }
 
 #[tokio::test]

@@ -127,11 +127,36 @@ pub trait Tool: Send + Sync {
     /// send.
     fn raw_parameters_schema(&self) -> Value;
 
-    /// Runs the tool against raw arguments.
+    /// Runs the tool against arguments carrying only the injected properties this
+    /// implementation claimed through [`Tool::consumed_injected_keys`].
     ///
-    /// The arguments still carry the injected properties; [`erase`]'s adapter strips
-    /// them before a typed params struct sees them.
+    /// Reached through [`Tool::invoke`], never called directly by the dispatch or
+    /// registry boundary.
     async fn execute(&self, args: Value, ctx: ToolContext) -> Result<ToolOutput, ToolError>;
+
+    /// The injected properties this implementation reads off its raw arguments.
+    ///
+    /// Empty by default, and that default is the whole safety property. An
+    /// implementation that forwards its arguments to a callee with its own declared
+    /// schema — an MCP proxy, a plugin host, a config-directory tool — must not pass
+    /// on a property that callee never declared, or a strict server rejects the
+    /// entire call. Claiming a key is therefore a deliberate act; forgetting to claim
+    /// one cannot leak it.
+    fn consumed_injected_keys(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Runs the tool. **The single point where injected properties are removed.**
+    ///
+    /// Every caller outside this crate goes through here rather than
+    /// [`Tool::execute`], so the removal covers derived and proxied tools alike, in
+    /// the same spirit as [`Tool::definition`] covering both for injection. Runs
+    /// after the permission gate, which reads the intent off the un-stripped
+    /// arguments. Not intended to be overridden.
+    async fn invoke(&self, mut args: Value, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        guard::strip_injected_except(&mut args, self.consumed_injected_keys());
+        self.execute(args, ctx).await
+    }
 
     /// The provider-facing definition. **The single augmentation point.**
     ///
@@ -366,6 +391,74 @@ mod tests {
             .expect("valid arguments");
 
         assert_eq!(output.output, "ababab");
+    }
+
+    #[tokio::test]
+    async fn a_proxied_tool_receives_no_injected_property_it_did_not_claim() {
+        // The defect this closes: `Proxied` forwards its arguments verbatim to a
+        // remote server, and claims nothing, so `invoke` must hand it neither key.
+        let proxy = Proxied {
+            remote_schema: json!({ "type": "object", "properties": {} }),
+        };
+
+        let output = proxy
+            .invoke(
+                json!({ INTENT_KEY: "why", ACCEPT_LARGE_OUTPUT_KEY: true, "query": "x" }),
+                context(),
+            )
+            .await
+            .expect("the proxy runs");
+
+        assert_eq!(output.output, json!({ "query": "x" }).to_string());
+        assert!(
+            proxy.consumed_injected_keys().is_empty(),
+            "claiming nothing is the default that makes forwarding safe"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_claimed_key_survives_invocation_while_the_rest_are_removed() {
+        struct Claiming;
+
+        #[async_trait]
+        impl Tool for Claiming {
+            fn id(&self) -> &str {
+                "claiming"
+            }
+
+            fn description(&self) -> &str {
+                "Read the size opt-in off its own raw arguments."
+            }
+
+            fn raw_parameters_schema(&self) -> Value {
+                json!({ "type": "object", "properties": {} })
+            }
+
+            fn consumed_injected_keys(&self) -> &'static [&'static str] {
+                &[ACCEPT_LARGE_OUTPUT_KEY]
+            }
+
+            async fn execute(
+                &self,
+                args: Value,
+                _ctx: ToolContext,
+            ) -> Result<ToolOutput, ToolError> {
+                Ok(ToolOutput::text("claiming", args.to_string()))
+            }
+        }
+
+        let output = Claiming
+            .invoke(
+                json!({ INTENT_KEY: "why", ACCEPT_LARGE_OUTPUT_KEY: true }),
+                context(),
+            )
+            .await
+            .expect("the tool runs");
+
+        assert_eq!(
+            output.output,
+            json!({ ACCEPT_LARGE_OUTPUT_KEY: true }).to_string()
+        );
     }
 
     #[tokio::test]

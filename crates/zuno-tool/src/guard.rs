@@ -62,11 +62,24 @@ pub fn accepts_large_output(input: &Value) -> bool {
 /// Non-object arguments are left alone — rejecting them is the deserializer's job,
 /// and it produces a better message than anything this function could.
 pub fn strip_cross_cutting(input: &mut Value) {
+    strip_injected_except(input, &[]);
+}
+
+/// Removes every injected property except the ones the callee claims to read.
+///
+/// Used by [`crate::Tool::invoke`], where claiming nothing has to be the safe
+/// default: a schema-validating callee rejects the whole call over one property it
+/// never declared, and the adapter forwarding to it is the last place that would
+/// think to remove one. Only [`INJECTED_KEYS`] entries are removal candidates, so a
+/// `retained` key outside that set has no effect.
+pub fn strip_injected_except(input: &mut Value, retained: &[&str]) {
     let Some(object) = input.as_object_mut() else {
         return;
     };
     for key in INJECTED_KEYS {
-        object.remove(key);
+        if !retained.contains(&key) {
+            object.remove(key);
+        }
     }
 }
 
