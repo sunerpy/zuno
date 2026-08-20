@@ -3200,3 +3200,37 @@ fn the_headless_surfaces_wire_every_capability_the_tui_has() {
         "`zuno serve` must reach the constructor that takes a catalog"
     );
 }
+
+/// A placeholder title is not a name, so no surface should be handed one.
+///
+/// `session.title` is `NOT NULL` and `create` fills it with `New session - <instant>`, so
+/// the raw column is never empty and a surface reading it directly would print that string
+/// as though the user had chosen it — then replace it a second later with the generated
+/// name. The filter is what makes "unnamed" expressible, and it reuses the generator's own
+/// predicate so the two cannot disagree about which titles are real.
+#[test]
+fn turn_a_placeholder_session_title_reads_as_no_title_at_all() {
+    for placeholder in [
+        format!(
+            "{}2026-08-07T00:00:00.000Z",
+            zuno_db::session::PARENT_TITLE_PREFIX
+        ),
+        format!(
+            "{}2026-08-07T00:00:00.000Z",
+            zuno_db::session::CHILD_TITLE_PREFIX
+        ),
+        String::new(),
+    ] {
+        assert!(
+            zuno_db::session::is_default_title(&placeholder),
+            "`{placeholder}` must be recognised as a placeholder, or the sidebar will \
+             display it as a chosen name"
+        );
+    }
+
+    assert!(
+        !zuno_db::session::is_default_title("Refactoring user service"),
+        "a generated name was mistaken for a placeholder, so a named session would render \
+         as unnamed"
+    );
+}

@@ -663,6 +663,131 @@ async fn a_provider_failure_skips_the_title_and_never_fails_the_turn() {
 }
 
 #[tokio::test]
+async fn the_title_is_requested_once_per_session_and_not_once_per_turn() {
+    // Given: an unnamed session whose opening exchange has just been persisted.
+    let mut connection = seeded("New session - 2026-08-07T00:00:00.000Z", None);
+    put_user(&connection, "msg_001", 10, "Refactor the user service");
+    // Two answers queued, so a second request would succeed rather than fail — the count
+    // has to be what fails, not an exhausted queue. A provider that ran dry would make
+    // this test pass for the wrong reason on any regression that asks twice.
+    let provider = RecordingProvider::answering(&["Refactoring user service", "Second title"]);
+    let providers = OneProvider(Arc::clone(&provider));
+    let internals = internals();
+    let config = CompactionConfig::default();
+    let mut state = CompactionState::default();
+
+    // When: the prelude runs for the first turn.
+    run_prelude(
+        SESSION_ID,
+        &mut context(
+            &mut connection,
+            &providers,
+            &internals,
+            &config,
+            ROOMY_WINDOW,
+            &mut state,
+        ),
+    )
+    .await
+    .expect("the first prelude succeeds");
+
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "the opening turn must spend exactly one request on the title"
+    );
+
+    // And: the conversation continues into a second turn.
+    put_assistant(&connection, "msg_002", 20, "Done", 10);
+    put_user(&connection, "msg_003", 30, "Now add a test");
+    run_prelude(
+        SESSION_ID,
+        &mut context(
+            &mut connection,
+            &providers,
+            &internals,
+            &config,
+            ROOMY_WINDOW,
+            &mut state,
+        ),
+    )
+    .await
+    .expect("the second prelude succeeds");
+
+    // Then: still one request in total. A title is a fact about the session, so a second
+    // one would be a per-turn charge on every turn the session ever runs.
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "the title was requested again on a later turn; requests: {:#?}",
+        provider.requests()
+    );
+
+    // And: the name the first turn chose is the one that stands.
+    assert_eq!(title_of(&connection), "Refactoring user service");
+}
+
+#[tokio::test]
+async fn a_failed_title_leaves_the_session_usable_and_unnamed() {
+    // Given: an unnamed session and a title model that is down.
+    let mut connection = seeded("New session - 2026-08-07T00:00:00.000Z", None);
+    put_user(&connection, "msg_001", 10, "Anything");
+    let failing = RecordingProvider::failing("upstream is down");
+    let internals = internals();
+    let config = CompactionConfig::default();
+    let mut state = CompactionState::default();
+
+    // When: the prelude runs against it.
+    let outcome = run_prelude(
+        SESSION_ID,
+        &mut context(
+            &mut connection,
+            &OneProvider(Arc::clone(&failing)),
+            &internals,
+            &config,
+            ROOMY_WINDOW,
+            &mut state,
+        ),
+    )
+    .await
+    .expect("a failed title must not fail the turn");
+
+    // Then: no name was produced and none was written.
+    assert_eq!(outcome.title, None);
+    assert!(
+        zuno_db::session::is_default_title(&title_of(&connection)),
+        "a failed generation must leave the placeholder, so the surface shows no name: {:?}",
+        title_of(&connection)
+    );
+
+    // And: nothing latched. The session is still usable and still nameable — the very next
+    // prelude, given a provider that answers, names it. A failure that quietly disqualified
+    // the session would look identical on the failing turn and leave it unnamed forever.
+    let recovered = RecordingProvider::answering(&["Recovered title"]);
+    let outcome = run_prelude(
+        SESSION_ID,
+        &mut context(
+            &mut connection,
+            &OneProvider(Arc::clone(&recovered)),
+            &internals,
+            &config,
+            ROOMY_WINDOW,
+            &mut state,
+        ),
+    )
+    .await
+    .expect("the session is still usable after a failed title");
+
+    assert_eq!(
+        outcome.title.as_deref(),
+        Some("Recovered title"),
+        "skipped: {:?}",
+        outcome.skipped
+    );
+    assert_eq!(title_of(&connection), "Recovered title");
+}
+
+#[tokio::test]
 async fn a_session_with_no_provider_for_the_internals_reports_both_and_runs_neither() {
     let mut connection = seeded("New session - 2026-08-07T00:00:00.000Z", None);
     put_user(&connection, "msg_001", 10, "Anything");

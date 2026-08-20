@@ -617,6 +617,16 @@ pub(crate) struct TurnHost {
     resolver: Resolver,
     dispatcher: ToolRegistryDispatcher,
     session_id: String,
+    /// The title the session already carried when this host opened it.
+    ///
+    /// A snapshot, deliberately not kept current: the only writer is the prelude, and a
+    /// surface that watches [`TurnEvent::SessionTitled`] learns about that write the
+    /// moment it happens. Refreshing this field afterwards would give a reader two ways
+    /// to ask the same question and one of them would lag.
+    ///
+    /// Still the placeholder `create` invented for a session that has never been named,
+    /// which is why the accessor filters rather than the field.
+    session_title: String,
     agent: String,
     provider_id: String,
     model_id: String,
@@ -632,6 +642,23 @@ pub(crate) struct TurnHost {
     goal_continuation: GoalContinuation,
     runs: SessionRunRegistry,
     last_turn_completed: bool,
+    title_sink: Option<Arc<dyn SessionTitleSink>>,
+}
+
+/// Told when the prelude names the session, so a live surface can show the name.
+///
+/// A trait, and declared here rather than taking the TUI's projection directly, for the
+/// reason [`RegistryProviders`] gives just below: this module is shared with `zuno run`,
+/// which has no panel and must not acquire a view dependency to compile. The interactive
+/// surface implements this over its own projection; the headless one supplies nothing and
+/// loses nothing, because it already prints the name as a prelude note.
+///
+/// Synchronous and infallible on purpose. The implementation publishes to a lock and
+/// nudges a channel, so there is no failure a turn could act on — and a title that could
+/// not be shown must never be able to fail the turn that earned it.
+pub(crate) trait SessionTitleSink: Send + Sync {
+    /// Note that the session is now named `title`.
+    fn publish(&self, title: &str);
 }
 
 /// The registry answering for whichever spec an internal agent resolved to.
@@ -811,6 +838,7 @@ impl TurnHost {
             resolver: plan.resolver,
             dispatcher,
             session_id: session.id,
+            session_title: session.title,
             agent: plan.agent.name,
             provider_id: plan.provider_id,
             model_id: plan.model_id,
@@ -826,12 +854,34 @@ impl TurnHost {
             goal_continuation,
             runs,
             last_turn_completed: false,
+            title_sink: None,
         })
+    }
+
+    /// Report generated session names to `sink` as well as to the transcript.
+    pub(crate) fn set_title_sink(&mut self, sink: Arc<dyn SessionTitleSink>) {
+        self.title_sink = Some(sink);
     }
 
     /// The session every turn this host drives belongs to.
     pub(crate) fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// The name a resumed session already had, or [`None`] for one never named.
+    ///
+    /// Filtered through [`zuno_db::session::is_default_title`] rather than returned raw,
+    /// because the column is `NOT NULL` and a brand-new session holds
+    /// `New session - <instant>` — a machine-generated placeholder that would read as a
+    /// real name on any surface that displays it, and would then be replaced by the
+    /// generated title a moment later. One predicate, shared with the generator that
+    /// decides whether to spend a request, so a title this answers `None` for is exactly
+    /// a title the prelude is about to write.
+    pub(crate) fn session_title(&self) -> Option<&str> {
+        if zuno_db::session::is_default_title(&self.session_title) {
+            return None;
+        }
+        Some(&self.session_title)
     }
 
     /// Carry notes a caller produced *before* the host existed onto the transcript.
@@ -1335,9 +1385,26 @@ impl TurnHost {
             state: &mut self.compaction_state,
             hooks,
         };
-        run_prelude(&self.session_id, &mut context)
+        let outcome = run_prelude(&self.session_id, &mut context)
             .await
-            .map_err(to_string)
+            .map_err(to_string)?;
+        // Here rather than in either caller, because both `drive_input` and
+        // `continue_goal_unaccounted` reach the prelude through this method — and a title
+        // published from only one of them appears or not depending on whether the turn was
+        // typed or continued, which is not a distinction the panel should show.
+        //
+        // At most one publish per session, and that is the generator's guarantee rather
+        // than a count kept here: `generate_title` answers `None` unless
+        // `zuno_db::session::is_default_title` still holds, and the write that answers it
+        // clears the predicate before any later turn asks. So this runs on the turn that
+        // named the session and on no other.
+        if let Some(title) = &outcome.title {
+            self.session_title = title.clone();
+            if let Some(sink) = &self.title_sink {
+                sink.publish(title);
+            }
+        }
+        Ok(outcome)
     }
 }
 

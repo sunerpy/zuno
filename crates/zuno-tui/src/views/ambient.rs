@@ -130,6 +130,16 @@ pub struct SkillSummary {
 /// Every ambient fact the sidebar states.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Ambient {
+    /// What this session is about, as the model named it after the opening exchange.
+    ///
+    /// [`None`] until it is named, and that state is drawn as *nothing* — no heading, no
+    /// placeholder row. A session acquires its name one small-model request after the
+    /// first prompt, so any stand-in would be on screen for about a second and would
+    /// occupy the row the real name is about to take; the panel would visibly reflow for
+    /// no information. It is also `None` for every session that could not be named,
+    /// which is the same absence and deliberately indistinguishable here — the reason is
+    /// reported on the transcript, where a user can act on it.
+    pub title: Option<String>,
     /// The working directory, already abbreviated.
     pub directory: Option<String>,
     /// The checkout's branch.
@@ -150,6 +160,149 @@ pub struct Ambient {
     pub skills: Vec<SkillSummary>,
     /// The build's version.
     pub version: Option<String>,
+}
+
+/// The session name and a counter that advances when it changes.
+#[derive(Debug, Default)]
+struct Titled {
+    generation: u64,
+    title: Option<String>,
+}
+
+/// The session's name, published by whoever generates it and read by the panel.
+///
+/// # Why a projection and not a turn event
+///
+/// The name is produced by the turn prelude, which runs on the driver task, while the
+/// panel is drawn on the render loop — so something has to cross that boundary. The
+/// obvious route was a new `zuno_engine::r#loop::TurnEvent` variant, and it was tried and
+/// withdrawn: `TurnEvent` is matched exhaustively by
+/// `zuno_plugin::jsonrpc::event_value`, which is the **plugin ABI** event codec. A new
+/// variant there is a change to the one compatibility surface this project promises to
+/// keep, spent on a fact no plugin asked for. This carries the same information between
+/// the same two tasks without touching that surface.
+///
+/// # The counter exists because a wake alone paints nothing
+///
+/// Copied deliberately from [`crate::views::picker::McpProjection`], whose own header
+/// records the failure: a wake only reaches the terminal if some component reports
+/// `redraw`, so a projection that changed with nothing reporting it leaves the old frame
+/// on screen. The generation lets one observer answer "did this move" in constant time,
+/// and it advances **only** on a real change — a bump for an identical title would spend a
+/// frame repainting bytes that did not change.
+#[derive(Debug, Clone, Default)]
+pub struct SessionTitle(std::sync::Arc<std::sync::RwLock<Titled>>);
+
+impl SessionTitle {
+    /// A projection already holding `title`, for a session that was resumed.
+    #[must_use]
+    pub fn new(title: Option<String>) -> Self {
+        Self(std::sync::Arc::new(std::sync::RwLock::new(Titled {
+            generation: 0,
+            title,
+        })))
+    }
+
+    /// Publish `title`, advancing the generation only if it differs.
+    pub fn replace(&self, title: Option<String>) {
+        let mut titled = self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if titled.title == title {
+            return;
+        }
+        titled.title = title;
+        titled.generation = titled.generation.wrapping_add(1);
+    }
+
+    /// How many content changes this projection has published.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generation
+    }
+
+    /// The generation and the title it belongs to, under one read.
+    ///
+    /// One lock for both, for the reason [`crate::views::picker::McpProjection::observe`]
+    /// documents: two calls could straddle a [`Self::replace`] and pair a stale generation
+    /// with a fresh title, which makes an observer record a frame it never painted.
+    #[must_use]
+    pub fn observe(&self) -> (u64, Option<String>) {
+        let titled = self
+            .0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (titled.generation, titled.title.clone())
+    }
+}
+
+/// The most rows the session name may occupy.
+///
+/// Two, not one and not unbounded. The generator caps a title at 100 characters and this
+/// panel is [`SIDEBAR_WIDTH`] wide, so a long title needs four rows to be shown whole —
+/// and those rows come out of the server lists below it, which report state that changes.
+/// One row is the other failure: at roughly thirty columns it holds about four words,
+/// which is often not enough to tell two sessions in the same repository apart. Two rows
+/// covers an ordinary title outright and cuts the rest, which is the cheaper loss.
+pub const TITLE_MAX_ROWS: usize = 2;
+
+/// Break `text` into at most `rows` rows of `width` columns, marking a cut.
+///
+/// Prefers a whitespace break and falls back to a column break, which is not a
+/// nicety — a Chinese title contains no spaces at all, so a word-only wrapper returns
+/// the whole title as one over-long row and the panel then clips it at the frame edge,
+/// losing the tail with no mark that anything was dropped.
+///
+/// Counted in **columns** throughout, for the reason [`elide_left`] documents: a CJK
+/// title measures far fewer characters than the cells it occupies, so a character-counted
+/// wrapper produces rows that satisfy their own arithmetic and still overrun the panel.
+fn wrap(text: &str, width: usize, rows: usize) -> Vec<String> {
+    if width == 0 || rows == 0 {
+        return Vec::new();
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut rest = text.trim();
+    while !rest.is_empty() && lines.len() < rows {
+        if display_width(rest) <= width {
+            lines.push(rest.to_owned());
+            return lines;
+        }
+        // The last row cannot continue anywhere, so it is elided rather than broken: a
+        // clean word break on the final row silently discards the remainder.
+        if lines.len() + 1 == rows {
+            lines.push(format!(
+                "{}{}",
+                truncate(rest, width.saturating_sub(1)),
+                crate::views::message::ELIDED
+            ));
+            return lines;
+        }
+        let head = truncate(rest, width);
+        // Back up to the last space *inside* the row, unless the row already ends on a
+        // boundary — `rest[head.len()..]` starting with whitespace means the cut is
+        // already between words and moving it would waste a column for nothing.
+        let taken = if rest[head.len()..].starts_with(char::is_whitespace) {
+            head.len()
+        } else {
+            head.rfind(char::is_whitespace).map_or(head.len(), |at| at)
+        };
+        let (line, remainder) = rest.split_at(taken);
+        let line = line.trim_end();
+        if line.is_empty() {
+            // A single glyph wider than the row: emit the column break rather than
+            // looping forever on a break point that cannot advance.
+            lines.push(head.clone());
+            rest = rest[head.len()..].trim_start();
+            continue;
+        }
+        lines.push(line.to_owned());
+        rest = remainder.trim_start();
+    }
+    lines
 }
 
 /// The fewest columns a detail needs before it says more than the glyph beside it.
@@ -501,6 +654,20 @@ impl SidebarView {
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut headers: Vec<(usize, Section)> = Vec::new();
         let blank = || padded("", width, self.context.surface());
+
+        // Above `Context`, and above it specifically because this is the one row that says
+        // *which* session the numbers below belong to. Everything else in the panel
+        // describes the machine — token spend, servers, skills — and is true of any session
+        // this build could be running; the name is the only fact that identifies this one,
+        // so it reads first for the same reason a document's title precedes its body.
+        //
+        // Styled `title()` rather than `text()` so it does not read as another data row.
+        if let Some(name) = &self.ambient.title {
+            for row in wrap(name, usize::from(width), TITLE_MAX_ROWS) {
+                lines.push(padded(&row, width, self.context.title()));
+            }
+            lines.push(blank());
+        }
 
         let tokens = &self.ambient.tokens;
         lines.push(self.heading("Context", "", None, width));
