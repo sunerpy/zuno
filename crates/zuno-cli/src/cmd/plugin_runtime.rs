@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,11 +28,12 @@ use zuno_plugin::{
     CompactionAutocontinueInput, CompactionAutocontinueOutput, ConfigDirectory, HookBus,
     HookInvocation, HookName, JsHostConfig, JsPluginKind, JsPluginLoad, JsPluginSpec,
     MessageWithParts, PermissionAskInput, PermissionAskOutput, PermissionStatus, Plugin,
-    PluginOrigin, PluginScope, PluginTools, ProviderContext, ProviderHookContext,
-    ProviderSmallModelInput, ProviderSmallModelOutput, ProviderSource, SessionCompactingInput,
-    SessionCompactingOutput, ShellEnvInput as PluginShellEnvInput, ShellEnvOutput,
-    TextCompleteInput, TextCompleteOutput, ToolDefinitionInput, ToolExecuteAfterInput,
-    ToolExecuteBeforeInput, ToolExecuteBeforeOutput, discover_plugins, load_js_plugins_ordered,
+    PluginLoad, PluginOrigin, PluginProcessSpec, PluginScope, PluginTools, ProviderContext,
+    ProviderHookContext, ProviderSmallModelInput, ProviderSmallModelOutput, ProviderSource,
+    SessionCompactingInput, SessionCompactingOutput, ShellEnvInput as PluginShellEnvInput,
+    ShellEnvOutput, TextCompleteInput, TextCompleteOutput, ToolDefinitionInput,
+    ToolExecuteAfterInput, ToolExecuteBeforeInput, ToolExecuteBeforeOutput, discover_plugins,
+    discover_process_plugins, load_js_plugins_ordered, load_plugins_ordered,
 };
 use zuno_server::{
     ProviderOAuthAuthorization, ProviderOAuthAuthorizeRequest, ProviderOAuthBackend,
@@ -42,12 +43,31 @@ use zuno_tool::{ToolDefinition, ToolOutput};
 use zuno_tools::shell::{ShellEnvHook, ShellEnvInput};
 
 pub(crate) struct PluginRuntime {
-    load: JsPluginLoad,
+    load: Option<JsPluginLoad>,
+    processes: Option<PluginLoad>,
     bus: HookBus,
     providers: RwLock<BTreeMap<String, ResolvedProvider>>,
     oauth_callbacks: Arc<Mutex<BTreeMap<(String, usize), AuthOAuthCallback>>>,
-    reported_diagnostics: Mutex<usize>,
+    reported_diagnostics: Mutex<BTreeSet<String>>,
     shutdown: AtomicBool,
+}
+
+impl PluginRuntime {
+    /// The `auth` and `provider` resources are JavaScript-only.
+    ///
+    /// Not an oversight in the process tier: the Rust SDK rejects both hook names
+    /// outright (`zuno-plugin-sdk/src/lib.rs:112`), and `JsonRpcPlugin` implements
+    /// only `manifest`, `tools`, and `call`. A process plugin therefore cannot
+    /// contribute a credential loader or a model list, and iterating it here would
+    /// promise a capability the wire has no shape for.
+    fn javascript_plugins(&self) -> impl Iterator<Item = &Arc<zuno_plugin::JsPlugin>> {
+        self.load.iter().flat_map(JsPluginLoad::plugins)
+    }
+}
+
+fn diagnostic_message(plugin: &str, hook: Option<&str>, message: &str) -> String {
+    let hook = hook.map_or_else(|| "startup".to_owned(), |hook| format!("hook `{hook}`"));
+    format!("disabled plugin `{plugin}` after {hook} failed: {message}")
 }
 
 pub(crate) struct PluginRuntimeTarget {
@@ -177,6 +197,60 @@ impl JsPluginPolicy {
     }
 }
 
+/// Whether out-of-process plugins found on disk may start, and what decided it.
+///
+/// A separate type from [`JsPluginPolicy`] because the two tiers answer to different
+/// costs and must not share a switch. `jsonrpc.rs` is compiled into every binary with
+/// no feature gate, and a discovered executable needs no runtime installed; the only
+/// thing the two tiers genuinely share is `--pure`, which means "no external
+/// plugins" for any tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProcessPluginPolicy {
+    pub(crate) enabled: bool,
+    pub(crate) source: ProcessPluginSource,
+}
+
+/// What decided whether out-of-process plugins may start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessPluginSource {
+    /// `--pure`: an explicit request for no external plugins, whatever the tier.
+    Pure,
+    Config,
+    /// Nobody said anything, which for this tier means on.
+    Default,
+}
+
+impl ProcessPluginPolicy {
+    /// Honour `--pure`, then the configuration, and default to on.
+    ///
+    /// Reads `--pure` off the JavaScript policy rather than the environment a second
+    /// time: [`JsPluginSource::Pure`] already *is* the record that the caller asked
+    /// for no external plugins, and re-deriving it would let the two tiers disagree
+    /// about whether `--pure` was passed.
+    pub(crate) fn resolve(config: &zuno_config::Config, javascript: JsPluginPolicy) -> Self {
+        if javascript.source == JsPluginSource::Pure {
+            return Self {
+                enabled: false,
+                source: ProcessPluginSource::Pure,
+            };
+        }
+        match config
+            .plugin_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.process)
+        {
+            Some(enabled) => Self {
+                enabled,
+                source: ProcessPluginSource::Config,
+            },
+            None => Self {
+                enabled: config.process_plugins_enabled(),
+                source: ProcessPluginSource::Default,
+            },
+        }
+    }
+}
+
 impl PluginRuntime {
     pub(crate) async fn load(
         config: &zuno_config::Config,
@@ -187,36 +261,56 @@ impl PluginRuntime {
         policy: JsPluginPolicy,
         target: PluginRuntimeTarget,
     ) -> Option<Self> {
+        let process_policy = ProcessPluginPolicy::resolve(config, policy);
         // Before discovery, not after: scanning four directories and reading package
         // manifests is work a disabled runtime must not do either.
-        if !policy.enabled {
-            return None;
-        }
-        let mut specs = configured_plugins(config, target.kind);
-        specs.extend(auto_discovered_plugins(
-            directory,
-            worktree,
-            layout,
-            target.kind,
-            target.surface,
-        ));
-        if specs.is_empty() {
-            return None;
-        }
-        let terminal: Arc<dyn TerminalLease> = match target.terminal {
-            PluginRuntimeTerminal::Reject => Arc::new(HeadlessTerminalLease),
-            PluginRuntimeTerminal::Stdio => Arc::new(TerminalBroker::new(Arc::new(StdioTerminal))),
+        let js_specs = if policy.enabled {
+            let mut specs = configured_plugins(config, target.kind);
+            specs.extend(auto_discovered_plugins(
+                directory,
+                worktree,
+                layout,
+                target.kind,
+                target.surface,
+            ));
+            specs
+        } else {
+            Vec::new()
         };
-        let server_url = target.server_url.unwrap_or_else(|| {
-            reqwest::Url::parse("http://127.0.0.1:0").expect("static plugin server URL")
-        });
-        let host = JsHostConfig::new(project.clone(), server_url, terminal)
-            .directory(directory)
-            .worktree(worktree)
-            .cache_dir(layout.cache());
-        let load = load_js_plugins_ordered(specs, host).await;
-        let diagnostics = load.diagnostics();
-        for diagnostic in &diagnostics {
+        let process_specs = if process_policy.enabled {
+            auto_discovered_process_plugins(directory, worktree, layout, target.surface)
+        } else {
+            Vec::new()
+        };
+        if js_specs.is_empty() && process_specs.is_empty() {
+            return None;
+        }
+
+        let load = if js_specs.is_empty() {
+            None
+        } else {
+            let terminal: Arc<dyn TerminalLease> = match target.terminal {
+                PluginRuntimeTerminal::Reject => Arc::new(HeadlessTerminalLease),
+                PluginRuntimeTerminal::Stdio => {
+                    Arc::new(TerminalBroker::new(Arc::new(StdioTerminal)))
+                }
+            };
+            let server_url = target.server_url.unwrap_or_else(|| {
+                reqwest::Url::parse("http://127.0.0.1:0").expect("static plugin server URL")
+            });
+            let host = JsHostConfig::new(project.clone(), server_url, terminal)
+                .directory(directory)
+                .worktree(worktree)
+                .cache_dir(layout.cache());
+            Some(load_js_plugins_ordered(js_specs, host).await)
+        };
+        let processes = if process_specs.is_empty() {
+            None
+        } else {
+            Some(load_plugins_ordered(process_specs).await)
+        };
+
+        for diagnostic in load.iter().flat_map(JsPluginLoad::diagnostics) {
             tracing::warn!(
                 plugin = %diagnostic.plugin,
                 hook = ?diagnostic.hook,
@@ -226,43 +320,79 @@ impl PluginRuntime {
                 "JavaScript plugin did not fully load"
             );
         }
-        let plugins = load
-            .plugins()
-            .iter()
-            .cloned()
-            .map(|plugin| plugin as Arc<dyn Plugin>)
-            .collect();
+        for diagnostic in processes.iter().flat_map(PluginLoad::diagnostics) {
+            tracing::warn!(
+                plugin = %diagnostic.plugin,
+                hook = ?diagnostic.hook,
+                kind = ?diagnostic.kind,
+                message = %diagnostic.message,
+                surface = target.surface,
+                "out-of-process plugin did not fully load"
+            );
+        }
+
+        let mut plugins: Vec<Arc<dyn Plugin>> = Vec::new();
+        plugins.extend(
+            load.iter()
+                .flat_map(JsPluginLoad::plugins)
+                .cloned()
+                .map(|plugin| plugin as Arc<dyn Plugin>),
+        );
+        plugins.extend(
+            processes
+                .iter()
+                .flat_map(PluginLoad::plugins)
+                .cloned()
+                .map(|plugin| plugin as Arc<dyn Plugin>),
+        );
         Some(Self {
             load,
+            processes,
             bus: HookBus::new(plugins),
             providers: RwLock::new(BTreeMap::new()),
             oauth_callbacks: Arc::new(Mutex::new(BTreeMap::new())),
-            reported_diagnostics: Mutex::new(diagnostics.len()),
+            // Empty, not "everything so far": seeding this with the startup count is
+            // what made a plugin that never started invisible to everyone but the log.
+            // `turn` renders these as transcript notices and `models` prints them to
+            // stderr, and a boot-time failure is exactly the one a user needs to see.
+            reported_diagnostics: Mutex::new(BTreeSet::new()),
             shutdown: AtomicBool::new(false),
         })
     }
 
     pub(crate) fn take_diagnostics(&self) -> Vec<String> {
-        let diagnostics = self.load.diagnostics();
+        let messages = self
+            .load
+            .iter()
+            .flat_map(JsPluginLoad::diagnostics)
+            .map(|diagnostic| {
+                diagnostic_message(
+                    &diagnostic.plugin,
+                    diagnostic.hook.as_deref(),
+                    &diagnostic.message,
+                )
+            })
+            .chain(
+                self.processes
+                    .iter()
+                    .flat_map(PluginLoad::diagnostics)
+                    .map(|diagnostic| {
+                        diagnostic_message(
+                            &diagnostic.plugin,
+                            diagnostic.hook.as_deref(),
+                            &diagnostic.message,
+                        )
+                    }),
+            );
         let Ok(mut reported) = self.reported_diagnostics.lock() else {
             return vec!["plugin diagnostic cursor lock was poisoned".to_owned()];
         };
-        let messages = diagnostics
-            .iter()
-            .skip(*reported)
-            .map(|diagnostic| {
-                let hook = diagnostic
-                    .hook
-                    .as_deref()
-                    .map_or_else(|| "startup".to_owned(), |hook| format!("hook `{hook}`"));
-                format!(
-                    "disabled plugin `{}` after {hook} failed: {}",
-                    diagnostic.plugin, diagnostic.message
-                )
-            })
-            .collect();
-        *reported = diagnostics.len();
+        // Identity, not a running index. A plugin latches disabled after one failure,
+        // so a repeated message is the same event; an index would misreport as soon as
+        // an earlier plugin failed after a later one and shifted the list under it.
         messages
+            .filter(|message| reported.insert(message.clone()))
+            .collect()
     }
 
     pub(crate) async fn apply_config(
@@ -280,7 +410,7 @@ impl PluginRuntime {
         catalog: &mut zuno_llm::catalog::Catalog,
         credentials: &BTreeMap<String, zuno_auth::Credential>,
     ) -> Result<(), String> {
-        for plugin in self.load.plugins() {
+        for plugin in self.javascript_plugins() {
             let Some(hook) = plugin.auth() else {
                 continue;
             };
@@ -307,7 +437,7 @@ impl PluginRuntime {
             }
         }
 
-        for plugin in self.load.plugins() {
+        for plugin in self.javascript_plugins() {
             let Some(hook) = plugin.provider() else {
                 continue;
             };
@@ -360,7 +490,12 @@ impl PluginRuntime {
         if let Err(error) = self.bus.dispatch(HookInvocation::Dispose).await {
             tracing::warn!(%error, "plugin dispose hook failed");
         }
-        self.load.shutdown().await;
+        if let Some(load) = &self.load {
+            load.shutdown().await;
+        }
+        if let Some(processes) = &self.processes {
+            processes.shutdown().await;
+        }
     }
 
     pub(crate) async fn apply_chat_message(
@@ -980,6 +1115,54 @@ fn configured_plugins(config: &zuno_config::Config, kind: JsPluginKind) -> Vec<J
         .collect()
 }
 
+/// Turn every executable in a scanned directory into a spawnable process spec.
+///
+/// The missing half of the out-of-process tier. `jsonrpc.rs` has been complete and
+/// compiled into every binary since it landed, but nothing ever built a
+/// [`PluginProcessSpec`], so no user could reach it. This is that constructor.
+fn auto_discovered_process_plugins(
+    directory: &Path,
+    worktree: &Path,
+    layout: &zuno_paths::Layout,
+    surface: &str,
+) -> Vec<PluginProcessSpec> {
+    let directories = layout.config_directories(directory, Some(worktree));
+    let mut specs = Vec::new();
+    for config_directory in directories {
+        let scope = if config_directory.starts_with(worktree) {
+            PluginScope::Local
+        } else {
+            PluginScope::Global
+        };
+        let discovered = match discover_process_plugins(&[ConfigDirectory::new(
+            config_directory.as_path(),
+            scope,
+        )]) {
+            Ok(discovered) => discovered,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    directory = %config_directory.display(),
+                    surface,
+                    "failed to auto-discover out-of-process plugins"
+                );
+                continue;
+            }
+        };
+        for plugin in discovered {
+            tracing::debug!(
+                plugin = %plugin.name,
+                program = %plugin.program.display(),
+                scope = ?plugin.scope,
+                surface,
+                "auto-discovered out-of-process plugin"
+            );
+            specs.push(PluginProcessSpec::new(plugin.name, plugin.program).current_dir(directory));
+        }
+    }
+    specs
+}
+
 fn auto_discovered_plugins(
     directory: &Path,
     worktree: &Path,
@@ -1105,6 +1288,7 @@ mod tests {
         ProviderOAuthAuthorizeRequest, ProviderOAuthBackend, ProviderOAuthCallbackRequest,
     };
     use zuno_testkit::{MockProvider, Scenario, ScriptedEnv};
+    use zuno_tools::shell::{ShellEnvHook as _, ShellEnvInput};
 
     use super::{
         ChatContext, ChatHeadersOutput, ChatMessageInput, ChatMessageOutput,
@@ -1117,12 +1301,13 @@ mod tests {
         ShellEnvOutput, TextCompleteInput, TextCompleteOutput, ToolDefinition, ToolDefinitionInput,
         ToolExecuteAfterInput, ToolExecuteBeforeInput, ToolExecuteBeforeOutput, ToolOutput,
     };
-    use super::{JsPluginPolicy, JsPluginSource};
+    use super::{JsPluginPolicy, JsPluginSource, ProcessPluginPolicy, ProcessPluginSource};
 
     fn config_with_javascript(javascript: Option<bool>) -> zuno_config::Config {
         zuno_config::Config {
             plugin_runtime: javascript.map(|javascript| zuno_config::schema::PluginRuntimeConfig {
                 javascript: Some(javascript),
+                process: None,
             }),
             ..zuno_config::Config::default()
         }
@@ -1618,6 +1803,246 @@ export default {
         }
     }
 
+    /// A language-agnostic plugin: POSIX `sh`, no SDK, no compiler.
+    ///
+    /// Deliberately not Rust. The claim under test is that the process tier is
+    /// reachable by *dropping an executable in a directory*, and a fixture that
+    /// needed this workspace's own SDK to build could not distinguish that claim
+    /// from "Rust plugins work".
+    ///
+    /// `tr ',{}'` splits the frame so `"id":N` lands on its own line: `serde_json`
+    /// has no `preserve_order` here, so keys arrive alphabetically and a greedy
+    /// `.*"id":` would bind to whichever `"id":` came last.
+    #[cfg(unix)]
+    const SH_PLUGIN: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | tr ',{}' '\n\n\n' | sed -n 's/^"id":\([0-9]*\)$/\1/p' | head -n1)
+  case "$line" in
+    *plugin.initialize*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"1.0","plugin":{"id":"sh-example","hooks":["shell.env"],"tools":[]}}}\n' "$id"
+      ;;
+    *hook.call*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"output":{"env":{"SH_PLUGIN":"enabled"}}}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+
+    /// An executable that exits before answering `plugin.initialize`.
+    #[cfg(unix)]
+    const SH_PLUGIN_THAT_DIES: &str = "#!/bin/sh\nexit 3\n";
+
+    #[cfg(unix)]
+    fn write_executable_plugin(
+        directory: &std::path::Path,
+        name: &str,
+        body: &str,
+    ) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::create_dir_all(directory).expect("create the plugin discovery directory");
+        let path = directory.join(name);
+        std::fs::write(&path, body).expect("write the executable plugin");
+        let mut permissions = std::fs::metadata(&path)
+            .expect("stat the executable plugin")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("mark the plugin executable");
+        path
+    }
+
+    /// Drive `PluginRuntime::load` exactly as production does, with JavaScript off.
+    #[cfg(unix)]
+    async fn load_process_plugins(env: &ScriptedEnv) -> Option<PluginRuntime> {
+        // No `plugin_runtime` key at all: the JavaScript host stays off, which is the
+        // point — a process plugin must not need the JavaScript switch.
+        load_process_plugins_with(
+            env,
+            &zuno_config::Config::default(),
+            JsPluginPolicy {
+                enabled: false,
+                source: JsPluginSource::Default,
+            },
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    async fn load_process_plugins_with(
+        env: &ScriptedEnv,
+        config: &zuno_config::Config,
+        policy: JsPluginPolicy,
+    ) -> Option<PluginRuntime> {
+        let process_env = zuno_paths::Env::from_pairs(env.env_vars());
+        let layout = zuno_paths::Layout::resolve(&process_env);
+        let project = zuno_paths::project::resolve_project(env.project());
+        PluginRuntime::load(
+            config,
+            &project,
+            env.project(),
+            env.project(),
+            &layout,
+            policy,
+            super::PluginRuntimeTarget::server("process-discovery-test"),
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    fn shell_env_input(cwd: &std::path::Path) -> ShellEnvInput {
+        ShellEnvInput {
+            cwd: cwd.to_path_buf(),
+            session_id: "ses_process_discovery".to_owned(),
+            call_id: "call_process_discovery".to_owned(),
+        }
+    }
+
+    /// An executable dropped in `.zuno/plugin/` must have its hook invoked.
+    ///
+    /// The whole reachability claim in one assertion. `jsonrpc.rs` has carried a
+    /// complete out-of-process tier — spec, handshake, timeout, permanent disable —
+    /// since it landed, with no feature gate, so it is in every shipped binary. What
+    /// it has never had is a caller: nothing in `zuno-cli` ever built a
+    /// `PluginProcessSpec`. A complete API with no way in is the defect this
+    /// repository has shipped before, so the test drives the real
+    /// `PluginRuntime::load` and the real `ShellEnvHook`, not a hand-assembled bus.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_executable_dropped_in_the_plugin_directory_has_its_hook_invoked() {
+        let env = ScriptedEnv::new().expect("isolated process-plugin environment");
+        let directory = env.project().join(".zuno").join("plugin");
+        let plugin = write_executable_plugin(&directory, "sh-example", SH_PLUGIN);
+
+        let runtime = load_process_plugins(&env).await.unwrap_or_else(|| {
+            panic!(
+                "dropping {} in a scanned directory must produce a runtime; \
+                 the process tier is reachable or it is not",
+                plugin.display()
+            )
+        });
+
+        let values = runtime
+            .env(shell_env_input(env.project()))
+            .await
+            .expect("the shell.env hook must reach the discovered executable");
+
+        assert_eq!(
+            values.get("SH_PLUGIN").map(String::as_str),
+            Some("enabled"),
+            "the executable answered `shell.env`, so its output must arrive: {values:?}"
+        );
+        runtime.shutdown().await;
+    }
+
+    /// `--pure` still means no external plugins, for the new tier as much as the old.
+    ///
+    /// The paired half of the separation. Freeing process plugins from the JavaScript
+    /// switch must not free them from the kill switch, and the two claims fail in
+    /// opposite directions: a tier that inherits `javascript` is unreachable, and a
+    /// tier that ignores `--pure` is unstoppable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pure_refuses_a_discovered_executable() {
+        let env = ScriptedEnv::new().expect("isolated pure-policy environment");
+        let directory = env.project().join(".zuno").join("plugin");
+        write_executable_plugin(&directory, "sh-example", SH_PLUGIN);
+
+        let runtime = load_process_plugins_with(
+            &env,
+            &zuno_config::Config::default(),
+            JsPluginPolicy {
+                enabled: false,
+                source: JsPluginSource::Pure,
+            },
+        )
+        .await;
+
+        assert!(
+            runtime.is_none(),
+            "`--pure` asked for no external plugins, and an executable is external"
+        );
+    }
+
+    /// The tier has its own key, and turning that key off turns this tier off only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_configured_process_false_refuses_a_discovered_executable() {
+        let env = ScriptedEnv::new().expect("isolated process-policy environment");
+        let directory = env.project().join(".zuno").join("plugin");
+        write_executable_plugin(&directory, "sh-example", SH_PLUGIN);
+        let config = zuno_config::Config {
+            plugin_runtime: Some(zuno_config::schema::PluginRuntimeConfig {
+                javascript: None,
+                process: Some(false),
+            }),
+            ..zuno_config::Config::default()
+        };
+
+        let runtime = load_process_plugins_with(
+            &env,
+            &config,
+            JsPluginPolicy {
+                enabled: false,
+                source: JsPluginSource::Config,
+            },
+        )
+        .await;
+
+        assert!(runtime.is_none(), "`process: false` must be honoured");
+    }
+
+    /// An absent key leaves the process tier on, which is the reachability claim.
+    ///
+    /// Pinned next to `an_absent_plugin_runtime_key_leaves_javascript_off` on purpose:
+    /// the same absent key means opposite things for the two tiers, and a reader who
+    /// finds only one of these tests will assume symmetry.
+    #[test]
+    fn an_absent_plugin_runtime_key_leaves_the_process_tier_on() {
+        let policy = ProcessPluginPolicy::resolve(
+            &zuno_config::Config::default(),
+            JsPluginPolicy {
+                enabled: false,
+                source: JsPluginSource::Default,
+            },
+        );
+
+        assert!(
+            policy.enabled,
+            "a discovered executable needs no runtime installed, so there is no cost \
+             left for a user to consent to"
+        );
+        assert_eq!(policy.source, ProcessPluginSource::Default);
+    }
+
+    /// A plugin that never starts must be visible to the user, not only to `tracing`.
+    ///
+    /// dsh documents this exact failure shape in its own plugin guide: a module whose
+    /// path cannot be resolved is reported through the logger, "and at boot that
+    /// report can be lost before a console exporter is watching". Our tier must not
+    /// have that shape, so the diagnostic has to survive as far as
+    /// `take_diagnostics`, which is what `turn` turns into a transcript notice and
+    /// what `models` prints to stderr.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_process_plugin_that_fails_to_start_is_reported_to_the_user() {
+        let env = ScriptedEnv::new().expect("isolated failing-plugin environment");
+        let directory = env.project().join(".zuno").join("plugin");
+        write_executable_plugin(&directory, "sh-broken", SH_PLUGIN_THAT_DIES);
+
+        let runtime = load_process_plugins(&env)
+            .await
+            .expect("a failing plugin still has to produce a runtime that can report it");
+
+        let diagnostics = runtime.take_diagnostics();
+
+        assert_eq!(diagnostics.len(), 1, "diagnostics={diagnostics:?}");
+        assert!(
+            diagnostics[0].contains("sh-broken"),
+            "a user cannot act on a failure that does not name the plugin: {diagnostics:?}"
+        );
+        runtime.shutdown().await;
+    }
+
     fn plugin_catalog(config: &zuno_config::Config) -> Catalog {
         let document = serde_json::from_value(json!({
             "groq": {
@@ -1798,7 +2223,11 @@ export default {
             "the diagnostic must name plugin, hook, and cause: {diagnostics:?}"
         );
         assert!(
-            runtime.load.plugins()[0].is_disabled(),
+            runtime
+                .javascript_plugins()
+                .next()
+                .expect("the loaded plugin")
+                .is_disabled(),
             "the failing auth plugin must remain disabled"
         );
         runtime.shutdown().await;

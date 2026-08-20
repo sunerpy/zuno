@@ -1,0 +1,108 @@
+#!/usr/bin/env node
+// A minimal out-of-process zuno plugin in JavaScript, no dependencies.
+//
+// Copy it into a scanned directory and mark it executable:
+//
+//   install -m 755 examples/js_plugin ~/.zuno/plugin/js-example
+//
+// The filename has no extension deliberately. Discovery hands `.js` and `.ts` to
+// the JavaScript plugin tier, which speaks a different protocol; an executable
+// `.js` file would otherwise be a candidate for both and get started twice. The
+// shebang is what makes it runnable, so this tier needs no build step for it.
+//
+// Standard output carries newline-delimited JSON-RPC and nothing else. `console.log`
+// writes there, so every diagnostic below uses `console.error`: one stray line on
+// stdout is an unparseable frame and the host permanently disables the plugin.
+
+const PROTOCOL_VERSION = "1.0";
+
+const MANIFEST = {
+  id: "js-example",
+  // `tool` must be declared for the tool below to be accepted: the host rejects a
+  // plugin that returns tools without naming the resource.
+  hooks: ["tool", "shell.env"],
+  tools: [
+    {
+      id: "js_echo",
+      description: "Echo text from a JavaScript plugin",
+      parameters: {
+        type: "object",
+        properties: { text: { type: "string" } },
+        required: ["text"],
+      },
+    },
+  ],
+};
+
+let initialized = false;
+
+function initialize(params) {
+  const offered = params?.protocolVersions ?? [];
+  if (!offered.includes(PROTOCOL_VERSION)) {
+    return { error: { code: -32001, message: `plugin supports protocol ${PROTOCOL_VERSION}` } };
+  }
+  initialized = true;
+  return { result: { protocolVersion: PROTOCOL_VERSION, plugin: MANIFEST } };
+}
+
+function callHook(params) {
+  const output = params?.output ?? {};
+  if (params?.hook === "shell.env") {
+    output.env = { ...(output.env ?? {}), JS_PLUGIN: "enabled" };
+  }
+  return { result: { output } };
+}
+
+function callTool(params) {
+  if (params?.tool !== "js_echo") {
+    return { error: { code: -32010, message: `tool \`${params?.tool}\` is not registered` } };
+  }
+  const text = params?.arguments?.text;
+  if (typeof text !== "string") {
+    return { error: { code: -32010, message: "text must be a string" } };
+  }
+  return { result: { title: "JS echo", output: text } };
+}
+
+function handle(request) {
+  if (request.method === "plugin.initialize") {
+    return initialize(request.params);
+  }
+  if (!initialized) {
+    return { error: { code: -32002, message: "plugin is not initialized" } };
+  }
+  if (request.method === "hook.call") {
+    return callHook(request.params);
+  }
+  if (request.method === "tool.call") {
+    return callTool(request.params);
+  }
+  return { error: { code: -32601, message: "method not found" } };
+}
+
+let buffered = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffered += chunk;
+  // Split on the newline the host frames with, and keep the trailing partial: a
+  // large hook payload arrives across several `data` events, and parsing a
+  // half-received frame would look like malformed JSON.
+  let newline = buffered.indexOf("\n");
+  while (newline !== -1) {
+    const frame = buffered.slice(0, newline).trim();
+    buffered = buffered.slice(newline + 1);
+    newline = buffered.indexOf("\n");
+    if (frame.length === 0) {
+      continue;
+    }
+    let request;
+    try {
+      request = JSON.parse(frame);
+    } catch (error) {
+      console.error(`js-example: malformed frame: ${error}`);
+      continue;
+    }
+    const outcome = handle(request);
+    process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: request.id, ...outcome })}\n`);
+  }
+});

@@ -296,6 +296,23 @@ impl Config {
             .and_then(|runtime| runtime.javascript)
             .unwrap_or(false)
     }
+
+    /// Whether out-of-process plugins found on disk may be started.
+    ///
+    /// `true` for an absent key, which is the opposite of
+    /// [`Self::javascript_plugins_enabled`] and deliberately so. JavaScript is
+    /// opt-in because it installs and starts a Node process the user never asked
+    /// for. A process plugin needs no runtime and no install: the user marked a file
+    /// executable and put it in a scanned directory, and there is no second step
+    /// left for them to consent to. Gating it behind the JavaScript switch would
+    /// make one tier's cost decide another tier's reachability.
+    #[must_use]
+    pub fn process_plugins_enabled(&self) -> bool {
+        self.plugin_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.process)
+            .unwrap_or(true)
+    }
 }
 
 /// Log level (`config/config.ts:27-30`).
@@ -488,6 +505,9 @@ pub struct PluginRuntimeConfig {
     /// Start the JavaScript plugin host. Absent means no.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub javascript: Option<bool>,
+    /// Start out-of-process plugins found on disk. Absent means yes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process: Option<bool>,
 }
 
 /// Persistent memory: a master boolean, or component settings.
