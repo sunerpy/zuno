@@ -776,6 +776,33 @@ impl Component for EventRecorder {
     }
 }
 
+/// A root that claims nothing, which is what every shipped view does with a resize.
+///
+/// [`EventRecorder`] answers `REDRAW` to everything, so it cannot be used to ask whether the
+/// *host* forces a frame — it would report one either way. `TranscriptView` answers the whole
+/// `Terminal` arm with `IGNORED` (`message.rs`), so this is the real production shape, and it
+/// is what makes `draws` attributable: with no view ever setting the loop's dirty bit, the
+/// scheduled tick draws nothing, and every frame after the startup one has exactly one cause.
+struct IgnoringRoot {
+    terminal_events: Arc<AtomicUsize>,
+}
+
+impl Component for IgnoringRoot {
+    fn render(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        frame.render_widget(
+            Paragraph::new(format!("{}x{}", area.width, area.height)),
+            area,
+        );
+    }
+
+    fn handle_event(&mut self, event: &AppEvent) -> EventResult {
+        if matches!(event, AppEvent::Terminal(_)) {
+            self.terminal_events.fetch_add(1, Ordering::SeqCst);
+        }
+        EventResult::IGNORED
+    }
+}
+
 async fn wait_until(mut predicate: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(5), async {
         while !predicate() {
@@ -1014,6 +1041,63 @@ async fn app_event_loop_consumes_both_bounded_channels_and_resize_relays_out() {
         locked(&screen).buffer,
         Buffer::with_lines(["6x2   ", "      "]),
         "the smaller frame has no stale cells from the old layout"
+    );
+}
+
+#[tokio::test]
+async fn app_a_resize_alone_repaints_without_waiting_for_another_event() {
+    let lifecycle = Arc::new(FakeLifecycle::default());
+    lifecycle.enter().expect("fake terminal enters");
+    let terminal_events = Arc::new(AtomicUsize::new(0));
+    let root = IgnoringRoot {
+        terminal_events: Arc::clone(&terminal_events),
+    };
+    let (target, screen) = SharedTestTarget::new(10, 4);
+    let (terminal_tx, terminal_rx) = terminal_event_channel();
+    let (_engine_tx, engine_rx) = mpsc::channel(1);
+    let (app, _owner) = App::new(
+        Box::new(root),
+        Box::new(target),
+        Arc::clone(&lifecycle) as Arc<_>,
+        terminal_rx,
+        engine_rx,
+    );
+    let mut app = app.with_redraw_config(TEST_REDRAW_CONFIG);
+    let task = tokio::spawn(async move { app.run().await });
+
+    wait_until(|| locked(&screen).draws == 1).await;
+    terminal_tx
+        .send(TerminalEvent::Resize {
+            width: 6,
+            height: 3,
+        })
+        .await
+        .expect("terminal event channel is open");
+    wait_until(|| terminal_events.load(Ordering::SeqCst) == 1).await;
+    // Two tiers of the scheduled cadence, so a frame that only arrived because the timer
+    // eventually fired would be counted here and the equality below would read 3.
+    tokio::time::sleep(TEST_REDRAW_CONFIG.deep_idle + TEST_REDRAW_CONFIG.deep_idle).await;
+    let drawn = locked(&screen).draws;
+    let painted = locked(&screen).buffer.clone();
+
+    terminal_tx
+        .send(TerminalEvent::Shutdown)
+        .await
+        .expect("terminal event channel is open");
+    task.await
+        .expect("the event loop task does not panic")
+        .expect("the event loop exits cleanly");
+
+    assert_eq!(
+        drawn, 2,
+        "the startup frame plus exactly one resize frame; a root that claims nothing leaves \
+         the loop's dirty bit clear, so any other count means the resize either painted \
+         nothing or painted twice"
+    );
+    assert_eq!(
+        painted,
+        Buffer::with_lines(["6x3   ", "      ", "      "]),
+        "the frame the resize produced must already describe the new geometry"
     );
 }
 

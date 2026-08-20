@@ -161,9 +161,7 @@ impl ToolDispatcher for ToolRegistryDispatcher {
             Arc::clone(&self.rules),
             Arc::clone(&self.approval),
         ));
-        if plugin_permission == PermissionHookDecision::Ask
-            && let Err(error) = permission.ask(resolved_name, ask).await
-        {
+        if let Err(error) = permission.gate(resolved_name, ask, plugin_permission).await {
             return tool_error_result(resolved_name, &error);
         }
 
@@ -269,6 +267,13 @@ struct RulePermissionAsker {
     approved_once: Mutex<BTreeSet<(String, String)>>,
 }
 
+/// What the configured rules decided about one ask, before anyone is prompted.
+enum RuleOutcome {
+    Permitted,
+    Denied,
+    Pending(Vec<String>),
+}
+
 impl RulePermissionAsker {
     fn new(rules: Arc<[Rule]>, approval: Arc<dyn PermissionAsker>) -> Self {
         Self {
@@ -277,24 +282,13 @@ impl RulePermissionAsker {
             approved_once: Mutex::new(BTreeSet::new()),
         }
     }
-}
 
-#[async_trait]
-impl PermissionAsker for RulePermissionAsker {
-    async fn ask(&self, tool: &str, mut ask: PermissionAsk) -> Result<(), zuno_error::ToolError> {
-        if ask.patterns.is_empty() {
-            ask.patterns.push("*".to_owned());
-        }
-
+    fn evaluate_patterns(&self, ask: &PermissionAsk) -> RuleOutcome {
         let mut pending = Vec::new();
         for pattern in &ask.patterns {
             match evaluate(&ask.permission, pattern, &self.rules) {
                 PermissionAction::Allow => {}
-                PermissionAction::Deny => {
-                    return Err(zuno_error::ToolError::Denied {
-                        tool: tool.to_owned(),
-                    });
-                }
+                PermissionAction::Deny => return RuleOutcome::Denied,
                 PermissionAction::Ask => {
                     let approved = self
                         .approved_once
@@ -307,11 +301,42 @@ impl PermissionAsker for RulePermissionAsker {
                 }
             }
         }
-
         if pending.is_empty() {
-            return Ok(());
+            RuleOutcome::Permitted
+        } else {
+            RuleOutcome::Pending(pending)
         }
+    }
 
+    /// The dispatch-time gate, which the rule set always passes through.
+    ///
+    /// A plugin `Allow` may only resolve patterns the rules left at `ask`; it can
+    /// never cross a pattern an explicit `deny` rule matched. Consulting the rules
+    /// only when the plugin returned `Ask` is what let a plugin silently discard the
+    /// user's written prohibition.
+    async fn gate(
+        &self,
+        tool: &str,
+        mut ask: PermissionAsk,
+        plugin: PermissionHookDecision,
+    ) -> Result<(), zuno_error::ToolError> {
+        normalize_patterns(&mut ask);
+        match self.evaluate_patterns(&ask) {
+            RuleOutcome::Denied => Err(zuno_error::ToolError::Denied {
+                tool: tool.to_owned(),
+            }),
+            RuleOutcome::Permitted => Ok(()),
+            RuleOutcome::Pending(_) if plugin == PermissionHookDecision::Allow => Ok(()),
+            RuleOutcome::Pending(pending) => self.prompt(tool, ask, pending).await,
+        }
+    }
+
+    async fn prompt(
+        &self,
+        tool: &str,
+        mut ask: PermissionAsk,
+        pending: Vec<String>,
+    ) -> Result<(), zuno_error::ToolError> {
         let approved_patterns = pending.clone();
         ask.patterns = pending;
         self.approval.ask(tool, ask.clone()).await?;
@@ -322,6 +347,26 @@ impl PermissionAsker for RulePermissionAsker {
                 .map(|pattern| (ask.permission.clone(), pattern)),
         );
         Ok(())
+    }
+}
+
+fn normalize_patterns(ask: &mut PermissionAsk) {
+    if ask.patterns.is_empty() {
+        ask.patterns.push("*".to_owned());
+    }
+}
+
+#[async_trait]
+impl PermissionAsker for RulePermissionAsker {
+    async fn ask(&self, tool: &str, mut ask: PermissionAsk) -> Result<(), zuno_error::ToolError> {
+        normalize_patterns(&mut ask);
+        match self.evaluate_patterns(&ask) {
+            RuleOutcome::Denied => Err(zuno_error::ToolError::Denied {
+                tool: tool.to_owned(),
+            }),
+            RuleOutcome::Permitted => Ok(()),
+            RuleOutcome::Pending(pending) => self.prompt(tool, ask, pending).await,
+        }
     }
 }
 

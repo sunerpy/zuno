@@ -1993,7 +1993,20 @@ impl Component for TranscriptView {
         self.content_height = lines.len();
         self.viewport_height = usize::from(area.height);
         let max = self.content_height.saturating_sub(self.viewport_height);
-        if self.offset > max {
+        // Pinned to the newest row unless the reader has scrolled away from it, which is
+        // the only thing that ever raised the offset. Without this half the transcript
+        // rested at row 0 for a session's whole life: `following` was armed in `new` and
+        // read by nothing, and the clamp below is one-directional by construction — it
+        // lowers an offset that ran past the end and can never advance one the growing
+        // content just left behind. So every row past `area.height` was below the fold,
+        // and a reply that overflowed the pane looked cut off at whatever row the pane
+        // happened to end on rather than scrolled.
+        //
+        // Conditional, not an unconditional pin: a reader who scrolled back mid-turn must
+        // not be yanked to the bottom by the next delta. `set_offset` disarms `following`
+        // on the way up and re-arms it on landing at the last row, so returning to the
+        // bottom resumes following without another key press.
+        if self.following || self.offset > max {
             self.offset = max;
         }
         let visible = lines

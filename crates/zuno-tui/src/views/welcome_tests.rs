@@ -35,9 +35,44 @@ fn view() -> WelcomeView {
         .with_tip(0)
 }
 
+/// The whole surface as its owner composes it: the head above, the foot at the bottom.
+///
+/// [`Component::render`] draws the head alone, because the foot belongs on the far side of two
+/// rows the session owns — the status strip and the prompt band. A test that rendered only the
+/// head would therefore assert against half a screen and would call the lead line, the tip and
+/// every hint "absent", so this makes the two calls the owner makes.
+///
+/// The strip and the band are *not* stood in for. Their heights belong to
+/// [`crate::views::session::SessionScreen`] and are asserted there; what this fixture owes is
+/// that every row the welcome surface states reaches cells, on the side of the input it belongs
+/// to. The foot is bottom-anchored for the same reason the owner puts it in the last band: it
+/// is what makes "below the input" checkable without this file knowing how tall the input is.
+fn screen_buffer(view: &mut WelcomeView, width: u16, height: u16) -> ratatui::buffer::Buffer {
+    let foot = view.foot_rows(width).min(height);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+        .expect("the test backend is infallible");
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            let head = Rect {
+                height: area.height - foot,
+                ..area
+            };
+            let tail = Rect {
+                y: head.height,
+                height: foot,
+                ..area
+            };
+            view.render(frame, head);
+            view.render_foot(frame, tail);
+        })
+        .expect("the test backend is infallible");
+    terminal.backend().buffer().clone()
+}
+
 /// How many of `height` rows carry at least one non-space character.
 fn painted(view: &mut WelcomeView, width: u16, height: u16) -> usize {
-    rows(&render_offscreen(view, width, height).expect("infallible"))
+    rows(&screen_buffer(view, width, height))
         .iter()
         .filter(|row| !row.trim().is_empty())
         .count()
@@ -49,7 +84,7 @@ fn painted(view: &mut WelcomeView, width: u16, height: u16) -> usize {
 /// height exactly as much as a sentence does, so counting only painted rows would call a
 /// block double-spaced into twice the height "the same size".
 fn extent(view: &mut WelcomeView, width: u16, height: u16) -> usize {
-    let rendered = rows(&render_offscreen(view, width, height).expect("infallible"));
+    let rendered = rows(&screen_buffer(view, width, height));
     let painted = |row: &String| !row.trim().is_empty();
     let first = rendered.iter().position(painted);
     let last = rendered.iter().rposition(painted);
@@ -75,6 +110,25 @@ fn views_welcome_fills_a_large_frame_without_sprawling_across_it() {
     // still cannot pass. The ceiling is on *extent* rather than on painted rows because a
     // blank spacer occupies the screen exactly as much as a row of text does, and spacers
     // are how the previous version spent a third of its height.
+    //
+    // The ceiling moved 18 -> 14, and the reason is not editorial. Every row above the input
+    // is a row the input sits further from the middle — the eighteen-row block was inside the
+    // reference band and still produced the top-heavy screen that was reported twice. 14 is
+    // what the current composition costs exactly, so this is a ratchet: any new row has to be
+    // paid for by retiring one, and there is no slack left to grow into unnoticed.
+    //
+    // # It is measured as head + foot, not as extent, because the two halves are separated
+    //
+    // The surface now spans the input: `head_rows` above it and `foot_rows` below. Extent on a
+    // composed frame therefore measures the *frame*, not the screen — the two halves are at
+    // opposite ends of it — so an extent ceiling would pass on any composition whatsoever and
+    // this ratchet would silently stop ratcheting. That is the "compared against nothing"
+    // shape this crate has already been bitten by twice, so the total is taken from the two
+    // functions that produce the rows.
+    //
+    // The head is bounded on its own as well, and more tightly. It is the half that has to fit
+    // in the space above the band on a 24-row pane, which is the whole reason for the split:
+    // rows in the foot cost the centring nothing, rows in the head cost it directly.
     let mut view = view();
     let painted_rows = painted(&mut view, 200, 50);
     assert!(
@@ -83,12 +137,64 @@ fn views_welcome_fills_a_large_frame_without_sprawling_across_it() {
          it exists to replace"
     );
 
+    let head = view.head_rows(200, 50);
+    let foot = view.foot_rows(200);
+    assert!(
+        head + foot <= 14,
+        "the welcome surface states {head} rows above the input and {foot} below, {} in all; \
+         it spanned 22, then 18, and the references it follows spend 10 (`jcode`), \
+         15 (`codex`) and 17 (`claw-code`)",
+        head + foot
+    );
+    assert!(
+        head <= 9,
+        "the welcome screen states {head} rows above the input; past nine the input cannot \
+         reach the middle of a 24-row pane, which is what `welcome_tail_rows` centres. Move \
+         the row into `foot` rather than raising this"
+    );
+
+    // And every row the two halves state reaches cells, so the bounds above are on a screen
+    // rather than on two vectors. Extent is the right measure for *that*: on a frame this tall
+    // the head is bottom-anchored and the foot is at the very bottom, so the span between them
+    // is the frame minus the rows above the head.
     let extent = extent(&mut view, 200, 50);
     assert!(
-        extent <= 18,
-        "the welcome block spans {extent} rows; it spanned 22 before the trim and the \
-         references it follows spend 11 (`jcode`), 13 (`codex`) and 16 (`claw-code`), so \
-         growing back past 18 means a row was added without a fact to justify it"
+        extent >= usize::from(head + foot),
+        "the surface claims {head} + {foot} rows but only {extent} rows of the frame carry \
+         anything, so some of them were never painted"
+    );
+}
+
+#[test]
+fn views_welcome_hides_the_tip_row_until_it_is_asked_for() {
+    // The cut, asserted from the shipped composition rather than from the constant. The tip
+    // was the one block here carrying neither a fact nor a key, and the two rows it spent are
+    // two rows the input sat further from the frame's middle.
+    //
+    // Hidden, not deleted: `tips_toggle` is a real binding in the shipped table, and a bound
+    // key that reaches nothing is the defect class this whole surface exists to remove. So the
+    // negative and the positive are one test — the row is absent by default *and* one call to
+    // the thing the key calls brings it back.
+    let mut view = view();
+    assert!(
+        !view.tips_visible(),
+        "the shipped composition still shows the tip row"
+    );
+    let shipped = rows(&screen_buffer(&mut view, 200, 50)).join("\n");
+    assert!(
+        !shipped.contains("● tip"),
+        "the tip row is drawn on a screen that reports it hidden:\n{shipped}"
+    );
+
+    view.next_tip();
+    let asked = rows(&screen_buffer(&mut view, 200, 50)).join("\n");
+    assert!(
+        asked.contains("● tip"),
+        "`tips_toggle` cannot bring the row back, so the binding reaches nothing:\n{asked}"
+    );
+    assert!(
+        asked.contains(view.tip()),
+        "the row came back without the tip it names:\n{asked}"
     );
 }
 
@@ -98,8 +204,7 @@ fn views_welcome_degrades_to_a_compact_brand_when_the_wordmark_cannot_fit() {
     // it plus the facts. Either alone is enough to fall back.
     let mut view = view();
     for (width, height) in [(30, 40), (200, 14)] {
-        let narrow =
-            rows(&render_offscreen(&mut view, width, height).expect("infallible")).join("\n");
+        let narrow = rows(&screen_buffer(&mut view, width, height)).join("\n");
         assert!(
             narrow.contains("ZUNO"),
             "the compact brand is missing at {width}x{height}:\n{narrow}"
@@ -116,13 +221,13 @@ fn views_welcome_never_overflows_eighty_columns() {
     // A row wider than the frame is what makes a narrow terminal look broken rather
     // than narrow, and 80 columns is the width that has to stay correct.
     let mut view = view();
-    for row in rows(&render_offscreen(&mut view, 80, 24).expect("infallible")) {
+    for row in rows(&screen_buffer(&mut view, 80, 24)) {
         assert!(
             row.chars().count() <= 80,
             "a row overflowed 80 columns: {row:?}"
         );
     }
-    let joined = rows(&render_offscreen(&mut view, 80, 24).expect("infallible")).join("\n");
+    let joined = rows(&screen_buffer(&mut view, 80, 24)).join("\n");
     assert!(
         joined.contains("~/src/zuno"),
         "80 columns lost the location row:\n{joined}"
@@ -132,7 +237,7 @@ fn views_welcome_never_overflows_eighty_columns() {
 #[test]
 fn views_welcome_draws_the_wordmark_when_it_fits() {
     let mut view = view();
-    let wide = rows(&render_offscreen(&mut view, 200, 50).expect("infallible")).join("\n");
+    let wide = rows(&screen_buffer(&mut view, 200, 50)).join("\n");
     assert!(
         wide.contains("███████╗"),
         "the wordmark is missing on a terminal with room for it:\n{wide}"
@@ -148,7 +253,7 @@ fn views_welcome_paints_the_wordmark_shadow_in_its_own_colour() {
     // styled string could carry only one colour, so this asserts two.
     let context = ViewContext::defaults();
     let mut view = view();
-    let buffer = render_offscreen(&mut view, 200, 50).expect("infallible");
+    let buffer = screen_buffer(&mut view, 200, 50);
     let brand = ratatui::style::Color::from(context.palette().primary);
     let shadow = ratatui::style::Color::from(crate::theme::tint(
         context.palette().background_panel,
@@ -187,7 +292,7 @@ fn views_welcome_states_every_fact_no_other_surface_keeps_at_every_width() {
     // fact that has *no* other carrier at some supported width — the sidebar vanishes below
     // `SIDEBAR_MIN_WIDTH`, and the strip drops the branch before anything else.
     let mut view = view();
-    let joined = rows(&render_offscreen(&mut view, 200, 50).expect("infallible")).join("\n");
+    let joined = rows(&screen_buffer(&mut view, 200, 50)).join("\n");
     for needle in [
         "~/src/zuno",
         "task-r17-solo",
@@ -214,14 +319,30 @@ fn views_welcome_does_not_restate_the_agent_and_model_the_status_strip_carries()
     let mut screen = composed();
     let rendered = rows(&render_offscreen(&mut screen, 120, 34).expect("infallible"));
     let joined = rendered.join("\n");
-    // The whole welcome block sits above this row, and the row is unconditional in
-    // `WelcomeView::lines`, so "below the lead line" is a layout-free way of saying "not on
-    // the welcome screen". The status strip's own words cannot be used as the anchor: it
-    // degrades through four tiers, and at 40 columns it prints `idl` rather than `idle`.
+    // Bracketed by both halves of the welcome surface rather than by one, which is stronger
+    // than the version this replaces and is not a matter of taste: the surface now sits on
+    // **both** sides of the strip — the census above, the lead line below — so a one-sided
+    // "below the lead line" check would place the strip beneath the whole screen and hold for
+    // rows that are on the welcome surface's own upper half. Two anchors pin the occurrence
+    // into the strip-and-band region exactly.
+    //
+    // The strip's own words cannot be the anchor: it degrades through four tiers and at 40
+    // columns prints `idl` rather than `idle`. Both anchors here are unconditional at this
+    // width — the census is stated whenever any fact is known, and the lead line is the one
+    // row `WelcomeView::foot` always emits.
+    let census = rendered
+        .iter()
+        .position(|row| row.contains("zuno 0.1.0"))
+        .expect("the welcome screen states the census whenever it knows a fact");
     let lead = rendered
         .iter()
         .position(|row| row.contains(LEAD_LINE))
         .expect("the welcome screen always teaches `/`");
+    assert!(
+        census < lead,
+        "the census is meant to be above the input and the lead line below it, but they came \
+         back in rows {census} and {lead}:\n{joined}"
+    );
 
     for needle in [STRIP_AGENT, STRIP_MODEL] {
         let rows_with = rendered
@@ -238,9 +359,10 @@ fn views_welcome_does_not_restate_the_agent_and_model_the_status_strip_carries()
             rows_with.len()
         );
         assert!(
-            rows_with[0] > lead,
-            "`{needle}` is stated on row {} at or above the welcome screen's lead line \
-             (row {lead}), so the one remaining copy is the welcome screen's own:\n{joined}",
+            rows_with[0] > census && rows_with[0] < lead,
+            "`{needle}` is stated on row {}, outside the strip-and-band region the welcome \
+             surface brackets (census row {census}, lead line row {lead}), so the one \
+             remaining copy is the welcome screen's own:\n{joined}",
             rows_with[0]
         );
     }
@@ -280,7 +402,7 @@ fn views_welcome_keeps_the_branch_because_both_other_carriers_drop_it() {
 #[test]
 fn views_welcome_omits_a_fact_it_does_not_have_rather_than_inventing_one() {
     let mut view = WelcomeView::new(ViewContext::defaults());
-    let joined = rows(&render_offscreen(&mut view, 200, 50).expect("infallible")).join("\n");
+    let joined = rows(&screen_buffer(&mut view, 200, 50)).join("\n");
     for forbidden in ["unknown", "n/a", "None"] {
         assert!(
             !joined.contains(forbidden),
@@ -296,7 +418,7 @@ fn views_welcome_zero_counts_are_shown_because_zero_is_a_fact() {
         skills: Some(0),
         ..WelcomeFacts::default()
     });
-    let joined = rows(&render_offscreen(&mut view, 200, 50).expect("infallible")).join("\n");
+    let joined = rows(&screen_buffer(&mut view, 200, 50)).join("\n");
     assert!(
         joined.contains("0 mcp") && joined.contains("0 skills"),
         "a zero count was dropped, which reads as `not measured`:\n{joined}"
@@ -327,7 +449,7 @@ fn views_welcome_hints_show_the_users_own_spelling_not_the_default() {
     let resolved = registry.resolve(crate::theme::DEFAULT_THEME, crate::theme::Mode::Dark);
     let context = ViewContext::new(&resolved, config);
     let mut view = WelcomeView::new(context).with_facts(facts());
-    let joined = rows(&render_offscreen(&mut view, 200, 50).expect("infallible")).join("\n");
+    let joined = rows(&screen_buffer(&mut view, 200, 50)).join("\n");
     assert!(
         joined.contains("ctrl+j send"),
         "the grid advertised the default spelling after the user rebound it:\n{joined}"
@@ -345,7 +467,7 @@ fn views_welcome_leads_with_slash_commands_and_the_users_palette_binding() {
     let resolved = registry.resolve(crate::theme::DEFAULT_THEME, crate::theme::Mode::Dark);
     let context = ViewContext::new(&resolved, config);
     let mut view = WelcomeView::new(context).with_facts(facts());
-    let joined = rows(&render_offscreen(&mut view, 200, 50).expect("infallible")).join("\n");
+    let joined = rows(&screen_buffer(&mut view, 200, 50)).join("\n");
 
     assert!(joined.contains("type / for commands"), "{joined}");
     assert!(joined.contains("ctrl+g command palette"), "{joined}");
@@ -360,8 +482,7 @@ fn views_welcome_advertises_its_capabilities_as_slash_commands_at_every_supporte
     // the name alone would pass on a row the frame had clipped mid-label.
     let mut view = view();
     for (width, height) in [(120u16, 40u16), (80, 30), (60, 26)] {
-        let joined =
-            rows(&render_offscreen(&mut view, width, height).expect("infallible")).join("\n");
+        let joined = rows(&screen_buffer(&mut view, width, height)).join("\n");
         assert!(
             joined.contains("type / for commands"),
             "{width}x{height} does not teach `/` at all:\n{joined}"
@@ -373,6 +494,36 @@ fn views_welcome_advertises_its_capabilities_as_slash_commands_at_every_supporte
             );
         }
     }
+}
+
+#[test]
+fn views_welcome_advertises_three_commands_and_not_the_six_it_used_to() {
+    // The cut, named. The extent ratchet would also fail if these came back, but it would
+    // report "the block spans 15 rows" — true, and no help at all in finding out why. This
+    // names the rows instead.
+    //
+    // The three that went are settings a user goes looking for *after* they know `/` exists,
+    // which the row above has just told them; `/` lists all of them and the palette chord lists
+    // every binding. So the requirement is not "these strings are absent" — it is that the path
+    // to them is still on the screen, which is why the lead row is asserted in the same test.
+    let mut view = view();
+    let joined = rows(&screen_buffer(&mut view, 200, 50)).join("\n");
+    for retired in ["/agent", "/theme", "/mcp"] {
+        assert!(
+            !joined.contains(retired),
+            "`{retired}` is advertised again; the grid is back to teaching a list `/` opens \
+             in one keystroke:\n{joined}"
+        );
+    }
+    assert!(
+        joined.contains("type / for commands"),
+        "the retired rows were cut without leaving the path that replaces them:\n{joined}"
+    );
+    assert_eq!(
+        SLASH_HINTS.len(),
+        3,
+        "the grid grew back; every row here is a row the input sits further from the middle"
+    );
 }
 
 #[test]
@@ -426,7 +577,7 @@ fn views_welcome_resolves_a_leader_sequence_to_the_chords_actually_pressed() {
     let registry = crate::theme::ThemeRegistry::new();
     let resolved = registry.resolve(crate::theme::DEFAULT_THEME, crate::theme::Mode::Dark);
     let mut view = WelcomeView::new(ViewContext::new(&resolved, config)).with_facts(facts());
-    let joined = rows(&render_offscreen(&mut view, 200, 50).expect("infallible")).join("\n");
+    let joined = rows(&screen_buffer(&mut view, 200, 50)).join("\n");
 
     assert!(
         joined.contains("ctrl+x j send"),
@@ -465,7 +616,7 @@ fn views_welcome_follows_the_users_own_leader_chord_rather_than_assuming_one() {
         "the override no longer builds a keymap, so this asserts the fallback path instead \
          of the leader substitution it was written for"
     );
-    let joined = rows(&render_offscreen(&mut view, 200, 50).expect("infallible")).join("\n");
+    let joined = rows(&screen_buffer(&mut view, 200, 50)).join("\n");
 
     assert!(
         joined.contains("ctrl+y j send"),
@@ -485,8 +636,7 @@ fn views_welcome_spells_out_the_exit_key_down_to_sixty_columns() {
     // belong to somebody with a small window.
     let mut view = view();
     for (width, height) in [(120u16, 40u16), (80, 30), (60, 26)] {
-        let joined =
-            rows(&render_offscreen(&mut view, width, height).expect("infallible")).join("\n");
+        let joined = rows(&screen_buffer(&mut view, width, height)).join("\n");
         for (action, label) in KEY_HINTS {
             let spelling = view
                 .spelling(view.keymap().as_ref(), action)
@@ -533,30 +683,50 @@ fn views_welcome_drops_a_hint_the_user_disabled() {
 
 #[test]
 fn views_welcome_tips_advance_and_can_be_hidden() {
+    // The same three claims as before — next advances, hide removes the row, next after hide
+    // restores it — reordered for the composition that now starts hidden. The reorder is the
+    // point: the first `next_tip` on a hidden row must *reveal* rather than advance, or a user
+    // who pressed the key would silently skip a tip they never saw. That is the assertion the
+    // old ordering could not make, because the row was already visible when it started.
     let mut view = view();
+    assert!(!view.tips_visible(), "the shipped default is a hidden row");
     let first = view.tip();
     view.next_tip();
-    assert_ne!(view.tip(), first, "the tip did not change");
+    assert!(view.tips_visible(), "the row did not come back");
+    assert_eq!(
+        view.tip(),
+        first,
+        "revealing the row also advanced it, so the first tip a user ever sees is the second one"
+    );
+
+    view.next_tip();
+    assert_ne!(view.tip(), first, "the tip did not change on a visible row");
 
     view.hide_tips();
     assert!(!view.tips_visible());
-    let hidden = rows(&render_offscreen(&mut view, 200, 50).expect("infallible")).join("\n");
+    let hidden = rows(&screen_buffer(&mut view, 200, 50)).join("\n");
     assert!(
         !hidden.contains("● tip"),
         "the tip row is still drawn after being hidden:\n{hidden}"
     );
-
-    // A hidden row plus "next" means "show me one again", not "silently advance".
-    view.next_tip();
-    assert!(view.tips_visible());
 }
 
 #[test]
 fn views_welcome_tip_index_wraps_instead_of_panicking() {
+    // `TIPS[self.tip % TIPS.len()]` on `usize::MAX`, and then on the wrap past it. The second
+    // `next_tip` is what advances: the first only reveals the row, so a single call would leave
+    // this asserting the same index twice and the wrapping arithmetic untested.
     let mut view = WelcomeView::new(ViewContext::defaults()).with_tip(usize::MAX);
     assert!(TIPS.contains(&view.tip()));
     view.next_tip();
+    let revealed = view.tip();
+    view.next_tip();
     assert!(TIPS.contains(&view.tip()));
+    assert_ne!(
+        view.tip(),
+        revealed,
+        "the index did not advance past usize::MAX"
+    );
 }
 
 #[test]
@@ -567,7 +737,7 @@ fn views_welcome_facts_can_be_stated_after_construction() {
     // used because it is resolved on the same late path `model` was.
     let mut view = WelcomeView::new(ViewContext::defaults());
     view.facts_mut().version = Some(String::from("9.9.9-probe"));
-    let joined = rows(&render_offscreen(&mut view, 200, 50).expect("infallible")).join("\n");
+    let joined = rows(&screen_buffer(&mut view, 200, 50)).join("\n");
     assert!(joined.contains("zuno 9.9.9-probe"), "{joined}");
 }
 
@@ -579,7 +749,7 @@ fn views_welcome_renders_into_a_degenerate_area_without_panicking() {
     // rather than by wrapping.
     let mut view = view();
     for (width, height) in [(0, 0), (1, 1), (200, 1), (1, 50), (36, 20), (20, 10)] {
-        let _ = render_offscreen(&mut view, width, height).expect("infallible");
+        let _ = screen_buffer(&mut view, width, height);
     }
 }
 
@@ -653,8 +823,12 @@ fn views_welcome_every_advertised_key_is_routed_by_the_session_screen() {
 #[test]
 fn views_welcome_mcp_and_help_hints_open_a_real_surface() {
     // The complement: routed *and* actually produces a dialog, not just a handled action.
-    // These two are now advertised as `/mcp` and `/help` rather than as leader chords, so
-    // the action behind each slash row is what has to open something.
+    //
+    // `/help` is still advertised, so the action behind its row has to open something. `/mcp`
+    // is not, and it stays here for the opposite reason: the trim removed a *row*, not a
+    // capability. `mcp_list` is still bound and `/mcp` still resolves, and a later change that
+    // broke either while nothing advertised them would be invisible — which is why the
+    // no-longer-advertised half is the half worth keeping under a guard.
     let (sender, _receiver) = crate::app::terminal_event_channel();
     let (mcp_toggles, _mcp_requests) = tokio::sync::mpsc::channel(1);
     let mut screen = crate::views::session::SessionScreen::new(ViewContext::defaults(), sender)
@@ -809,7 +983,14 @@ fn advertised_actions() -> Vec<(&'static str, String)> {
 #[test]
 #[ignore = "printer, not an assertion: run with --ignored --nocapture to eyeball the rendering"]
 fn views_welcome_visual_probe() {
-    for (width, height) in [(200u16, 34u16), (120, 34), (80, 34), (60, 30), (40, 24)] {
+    for (width, height) in [
+        (200u16, 50u16),
+        (120, 32),
+        (80, 24),
+        (60, 30),
+        (40, 24),
+        (20, 10),
+    ] {
         println!("\n=========== {width}x{height} ===========");
         let mut screen = composed();
         for (index, row) in rows(&render_offscreen(&mut screen, width, height).expect("infallible"))

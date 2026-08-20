@@ -659,25 +659,54 @@ fn park(stop: &Arc<(Mutex<bool>, Condvar)>, timeout: Duration) -> bool {
     }
 }
 
+/// One `Key:\t<value> kB` field of a `/proc/self/status` snapshot, in KiB.
+///
+/// Shared with the tests that check the split against `VmRSS`, so those read the
+/// kernel's own total through the *same* scraper the shipped path reads the three
+/// parts through. A second scraper written for a test could agree with this one
+/// while both misread the file, and the test would still be green.
+#[cfg(target_os = "linux")]
+fn status_field_kib(status: &str, key: &str) -> Option<u64> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix(key))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+/// The resident split carried by **one** `/proc/self/status` snapshot.
+///
+/// Split out of [`observe`] so the sample comes from a single read, and so a test
+/// can compare the anon/file/shmem sum against the `VmRSS` of *that same
+/// snapshot* — exactly, with no tolerance. The four figures in one snapshot agree
+/// to the KiB because the kernel prints `VmRSS` as `anon + file + shmem` from a
+/// single read of the three counters (`task_mem` in `fs/proc/task_mmu.c`), and
+/// `/proc/self/status` is rendered by one `show` call; measured here at 400 reads
+/// under allocation churn with zero mismatches.
+///
+/// Two reads do not agree: the process's own memory moves in between. An earlier
+/// form of the test below read the file once inside [`observe`] and once for
+/// `VmRSS` and allowed 5% drift, which passed locally and failed on a loaded CI
+/// runner — it was measuring the scheduler, not the accounting.
+#[cfg(target_os = "linux")]
+fn parse_status(status: &str, elapsed: Duration, active_sessions: u32) -> Option<MemorySample> {
+    Some(MemorySample {
+        elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        anon_kib: status_field_kib(status, "RssAnon:")?,
+        file_kib: status_field_kib(status, "RssFile:")?,
+        // Absent before Linux 4.5 and zero for most processes, so a missing field
+        // is not a failed read.
+        shmem_kib: status_field_kib(status, "RssShmem:").unwrap_or(0),
+        active_sessions,
+    })
+}
+
 /// Read the current resident split from Linux, or `None` off Linux.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn observe(elapsed: Duration, active_sessions: u32) -> Option<MemorySample> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    let field = |key: &str| {
-        status
-            .lines()
-            .find_map(|line| line.strip_prefix(key))
-            .and_then(|rest| rest.split_whitespace().next())
-            .and_then(|value| value.parse::<u64>().ok())
-    };
-    Some(MemorySample {
-        elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
-        anon_kib: field("RssAnon:")?,
-        file_kib: field("RssFile:")?,
-        shmem_kib: field("RssShmem:").unwrap_or(0),
-        active_sessions,
-    })
+    parse_status(&status, elapsed, active_sessions)
 }
 
 /// Read the current resident split from Linux, or `None` off Linux.
@@ -922,26 +951,120 @@ mod tests {
         );
     }
 
+    /// A verbatim `Vm*`/`Rss*` block from a real `/proc/<pid>/status`.
+    ///
+    /// `RssShmem` is non-zero on purpose. It is zero for most processes, so a
+    /// snapshot taken from this test's own process would let a sum that drops
+    /// shmem pass. The three parts are also pairwise distinct, so a sum that
+    /// preserves the total by swapping two fields is still caught. `VmHWM` and
+    /// `VmData` are kept because they are the neighbours a scraper could misread:
+    /// same units, immediately above and below `VmRSS`.
+    #[cfg(target_os = "linux")]
+    const CAPTURED_STATUS: &str = "\
+VmPeak:\t  770196 kB
+VmSize:\t  245908 kB
+VmLck:\t       0 kB
+VmPin:\t       0 kB
+VmHWM:\t   11856 kB
+VmRSS:\t   10904 kB
+RssAnon:\t    2768 kB
+RssFile:\t    7448 kB
+RssShmem:\t     688 kB
+VmData:\t   19136 kB
+VmStk:\t     132 kB
+VmExe:\t      44 kB
+VmLib:\t   15688 kB
+VmPTE:\t     124 kB
+VmSwap:\t       0 kB
+";
+
+    /// The split is the same accounting as `VmRSS`, at exactly known values.
+    ///
+    /// Exact and against a fixture, so nothing can move between the two figures
+    /// being compared. The per-field assertion is not redundant with the sum: a
+    /// parse that swapped `RssFile` for `RssShmem` would keep the total intact and
+    /// still send the attribution to the wrong level.
     #[cfg(target_os = "linux")]
     #[test]
-    fn observing_this_process_returns_a_split_that_sums_to_its_resident_size() {
-        let sample = observe(Duration::from_secs(1), 0).expect("Linux publishes the split");
-        assert!(sample.total_rss_kib() > 0);
-        assert_eq!(sample.elapsed_ms, 1_000);
+    fn the_parsed_split_sums_to_the_vm_rss_of_the_same_snapshot() {
+        let sample = parse_status(CAPTURED_STATUS, Duration::from_secs(1), 0)
+            .expect("the captured snapshot publishes the split");
 
-        let vm_rss = std::fs::read_to_string("/proc/self/status")
-            .expect("status is readable")
-            .lines()
-            .find_map(|line| line.strip_prefix("VmRSS:"))
-            .and_then(|rest| rest.split_whitespace().next())
-            .and_then(|value| value.parse::<u64>().ok())
-            .expect("VmRSS is published");
-        let drift = vm_rss.abs_diff(sample.total_rss_kib());
-        assert!(
-            drift * 20 <= vm_rss,
-            "the anon/file/shmem split summed to {} against a VmRSS of {vm_rss}, so it is not \
-             the same accounting",
+        assert_eq!(
+            (sample.anon_kib, sample.file_kib, sample.shmem_kib),
+            (2_768, 7_448, 688),
+            "the three fields were read off the wrong lines of the snapshot"
+        );
+        let vm_rss = status_field_kib(CAPTURED_STATUS, "VmRSS:").expect("VmRSS is published");
+        assert_eq!(
+            vm_rss, 10_904,
+            "the scraper read {vm_rss} for the fixture's VmRSS, so it is not reading VmRSS"
+        );
+        assert_eq!(
+            sample.total_rss_kib(),
+            vm_rss,
+            "the anon/file/shmem split summed to {} against the VmRSS of {vm_rss} published in \
+             the same snapshot, so it is not the same accounting",
             sample.total_rss_kib()
+        );
+    }
+
+    /// The same contract against the kernel this build actually runs on.
+    ///
+    /// One read, both figures derived from it, so the comparison is exact. The
+    /// earlier form read `/proc/self/status` twice — once inside [`observe`], once
+    /// for `VmRSS` — and allowed 5% drift; on a loaded runner the process's own
+    /// memory moves between the reads and the drift exceeds the bound, so it
+    /// failed in CI while passing locally. Reading once removes the race rather
+    /// than lowering its odds.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn one_live_snapshot_of_this_process_splits_exactly_into_its_vm_rss() {
+        let status =
+            std::fs::read_to_string("/proc/self/status").expect("/proc/self/status is readable");
+        let sample =
+            parse_status(&status, Duration::from_secs(1), 0).expect("Linux publishes the split");
+        let vm_rss = status_field_kib(&status, "VmRSS:").expect("VmRSS is published");
+
+        assert!(
+            sample.total_rss_kib() > 0,
+            "a running process reported no resident memory, so every field parsed as zero"
+        );
+        assert_eq!(
+            sample.total_rss_kib(),
+            vm_rss,
+            "this kernel's anon/file/shmem summed to {} against the VmRSS of {vm_rss} it \
+             published in the same snapshot, so the split does not partition VmRSS",
+            sample.total_rss_kib()
+        );
+    }
+
+    /// [`observe`] reaches the real file and carries its caller's arguments.
+    ///
+    /// The two tests above call [`parse_status`] directly, so neither would notice
+    /// `observe` reading the wrong path, dropping a field on the way through, or
+    /// substituting its own session count. The accounting contract is not
+    /// re-checked here: that needs two figures from one snapshot and `observe`
+    /// returns only the sample, which is what made the earlier test read twice.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn observe_reads_this_process_through_the_shipped_entry_point() {
+        let sample = observe(Duration::from_secs(1), 7).expect("Linux publishes the split");
+
+        assert!(
+            sample.anon_kib > 0,
+            "this process's heap and thread stacks read as zero anonymous KiB, so observe did \
+             not reach the real file"
+        );
+        assert!(sample.total_rss_kib() > 0);
+        assert_eq!(
+            sample.elapsed_ms, 1_000,
+            "the elapsed argument was not carried, so every sample would land at one instant"
+        );
+        assert_eq!(
+            sample.active_sessions, 7,
+            "the session count was not carried, so attribution would judge whatever observe \
+             substituted"
         );
     }
 }

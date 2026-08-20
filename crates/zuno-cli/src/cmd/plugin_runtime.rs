@@ -833,7 +833,7 @@ impl ToolHooks for PluginRuntime {
             })
             .await
             .map_err(|error| error.to_string())?;
-        Ok(match output.status {
+        Ok(match output.status() {
             PermissionStatus::Ask => PermissionHookDecision::Ask,
             PermissionStatus::Deny => PermissionHookDecision::Deny,
             PermissionStatus::Allow => PermissionHookDecision::Allow,

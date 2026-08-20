@@ -1024,7 +1024,7 @@ impl InputEditor {
                     let style = if selected {
                         self.context.selected()
                     } else {
-                        self.context.text()
+                        self.context.on_element(self.context.text())
                     };
                     spans.push(Span::styled(character.to_string(), style));
                 }
@@ -1033,7 +1033,13 @@ impl InputEditor {
                     // also what an off-screen assertion sees, and a hardware cursor
                     // leaves no trace in the buffer.
                     let at = self.cursor.column.min(spans.len());
-                    spans.insert(at, Span::styled(String::from("▏"), self.context.accent()));
+                    spans.insert(
+                        at,
+                        Span::styled(
+                            String::from("▏"),
+                            self.context.on_element(self.context.accent()),
+                        ),
+                    );
                 }
                 // After the caret, so the hint sits beside it rather than under it, and only
                 // on the first row of a wholly empty buffer — a placeholder repeated down a
@@ -1045,13 +1051,22 @@ impl InputEditor {
                     let room = usize::from(width).saturating_sub(1);
                     let hint = crate::views::truncate(&self.placeholder, room);
                     if !hint.is_empty() {
-                        spans.push(Span::styled(hint, self.context.muted()));
+                        spans.push(Span::styled(
+                            hint,
+                            self.context.on_element(self.context.muted()),
+                        ));
                     }
                 }
                 let rendered: String = spans.iter().map(|span| span.content.as_ref()).collect();
                 let pad = usize::from(width).saturating_sub(rendered.chars().count());
                 if pad > 0 {
-                    spans.push(Span::styled(" ".repeat(pad), self.context.text()));
+                    // The row's own tail, and it is the widest span on the line — painting it in
+                    // `text` put the transcript's surface across most of the composer and was
+                    // what made a four-row band read as one row of text.
+                    spans.push(Span::styled(
+                        " ".repeat(pad),
+                        self.context.on_element(self.context.text()),
+                    ));
                 }
                 Line::from(spans)
             })
@@ -1073,7 +1088,13 @@ impl InputEditor {
 
 impl Component for InputEditor {
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        fill(frame.buffer_mut(), area, self.context.text());
+        // `element`, not `text`. The two differ only in background, and `text`'s is
+        // `background_panel` — the surface the transcript and the welcome screen are filled
+        // with, so an editor painted with it is invisible as a region and the band's four rows
+        // read as one. Its owner fills the surrounding band with the same role for that reason;
+        // a two-tone box would be worse than a flat one. See
+        // `crate::views::session::PROMPT_GUTTER_COLS`.
+        fill(frame.buffer_mut(), area, self.context.element());
         let height = usize::from(area.height);
         // Keep the cursor's line on screen; a prompt whose cursor has scrolled out
         // is unusable, and this is the only place that knows both numbers.
@@ -1089,7 +1110,7 @@ impl Component for InputEditor {
             .take(height)
             .collect::<Vec<_>>();
         Paragraph::new(visible)
-            .style(self.context.text())
+            .style(self.context.element())
             .render(area, frame.buffer_mut());
     }
 
@@ -1117,12 +1138,17 @@ impl PromptGutter {
 
 impl Component for PromptGutter {
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        // `text`, not `accent`: accent is the *marker's* colour, and filling the gutter's
-        // background with it makes two columns a solid bar down the band that reads as a
-        // selection rather than a margin. The two styles differ on purpose.
-        fill(frame.buffer_mut(), area, self.context.text());
-        Paragraph::new(vec![padded(&self.label, area.width, self.context.accent())])
-            .render(area, frame.buffer_mut());
+        // Not `accent`: accent is the *marker's* colour, and filling the gutter's background
+        // with it makes two columns a solid bar down the band that reads as a selection rather
+        // than a margin. The two styles differ on purpose. `element` rather than `text` so the
+        // gutter shares the band's surface — see `InputEditor::render`.
+        fill(frame.buffer_mut(), area, self.context.element());
+        Paragraph::new(vec![padded(
+            &self.label,
+            area.width,
+            self.context.on_element(self.context.accent()),
+        )])
+        .render(area, frame.buffer_mut());
     }
 
     fn handle_event(&mut self, _event: &AppEvent) -> EventResult {

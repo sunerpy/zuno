@@ -239,8 +239,79 @@ impl ToolHooks for MutatingHooks {
     }
 }
 
+/// A plugin that resolves the permission decision and leaves the arguments alone.
+///
+/// [`MutatingHooks`] cannot stand in for this: its `before` rewrites `command`, so
+/// a rule keyed on the original argument stops matching before the permission layer
+/// ever evaluates it. Keeping the arguments untouched is what makes an explicit
+/// `deny` rule actually reachable in the test below.
+#[derive(Default)]
+struct AllowingHooks;
+
+#[async_trait]
+impl ToolHooks for AllowingHooks {
+    async fn permission(
+        &self,
+        _request: &zuno_permission::PermissionRequest,
+    ) -> Result<PermissionHookDecision, String> {
+        Ok(PermissionHookDecision::Allow)
+    }
+}
+
 #[tokio::test]
-async fn production_dispatch_applies_before_permission_and_after_hooks() {
+async fn a_plugin_allow_cannot_cross_an_explicit_deny_rule() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let approver = Arc::new(RecordingApprover::default());
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
+        vec![allow_all_rule(), deny_rule("bash", "rm -rf /")],
+        Arc::clone(&approver) as Arc<dyn PermissionAsker>,
+        InterruptSignal::new(),
+        McpToolStatus::Ready,
+    )
+    .with_hooks(Arc::new(AllowingHooks));
+
+    let result = dispatcher
+        .dispatch(request(
+            &dispatcher,
+            "call-plugin-allow-versus-deny-rule",
+            "bash",
+            json!({"command": "rm -rf /", "intent": "prove the deny rule still holds"}),
+        ))
+        .await;
+
+    assert!(
+        result.is_error,
+        "a plugin allow crossed the user's explicit deny rule: {}",
+        result.output.output
+    );
+    assert!(
+        result.output.output.contains("denied"),
+        "the refusal must name the denial: {}",
+        result.output.output
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the denied tool must never execute"
+    );
+    assert!(
+        approver.asks().is_empty(),
+        "an explicit deny is a refusal, not a prompt"
+    );
+}
+
+/// The `deny_rule("bash", "original")` here is not testing denial.
+///
+/// `MutatingHooks::before` rewrites `command` from `original` to `hooked`, and the
+/// permission patterns are derived from the arguments *after* that rewrite, so the
+/// rule no longer matches. It used to be a pure decoy: the pre-latch dispatcher
+/// skipped the rule set entirely whenever a plugin returned `Allow`, so the rule
+/// could not have fired either way. Now that the rules are always consulted, the
+/// rule earns its place — if the rewrite ever stopped reaching the permission layer,
+/// the patterns would be `["original"]` and this call would be refused.
+#[tokio::test]
+async fn production_dispatch_rewrites_arguments_before_permission_and_execution() {
     let calls = Arc::new(AtomicUsize::new(0));
     let approver = Arc::new(RecordingApprover::default());
     let dispatcher = ToolRegistryDispatcher::new(
@@ -264,9 +335,35 @@ async fn production_dispatch_applies_before_permission_and_after_hooks() {
     assert!(!result.is_error, "{}", result.output.output);
     assert_eq!(result.output.output, "\"hooked\"");
     assert_eq!(result.output.title, "hooked title");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_plugin_allow_resolves_an_ask_without_prompting() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let approver = Arc::new(RecordingApprover::default());
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
+        Vec::new(),
+        Arc::clone(&approver) as Arc<dyn PermissionAsker>,
+        InterruptSignal::new(),
+        McpToolStatus::Ready,
+    )
+    .with_hooks(Arc::new(AllowingHooks));
+
+    let result = dispatcher
+        .dispatch(request(
+            &dispatcher,
+            "call-plugin-allow-resolves-ask",
+            "bash",
+            json!({"command": "git status", "intent": "inspect"}),
+        ))
+        .await;
+
+    assert!(!result.is_error, "{}", result.output.output);
     assert!(
         approver.asks().is_empty(),
-        "plugin allow must bypass approval"
+        "a plugin allow must still resolve a rule that left the decision at ask"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }

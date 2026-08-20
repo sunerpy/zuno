@@ -464,6 +464,214 @@ fn views_thinking_style_is_the_theme_opacity_composite_not_the_raw_warning() {
 // Scrolling and the scrollbar
 // ---------------------------------------------------------------------------
 
+/// The reply the real provider produced for `write a markdown table with 2 rows, then a
+/// rust code block`, which is the shape the truncation was reported on.
+const TABLE_THEN_CODE: &str = "| Name | Value |\n|---|---:|\n| Alpha | 1 |\n| Beta | 2 |\n\n\
+     ```rust\nfn main() {\n    println!(\"Hello, Rust!\");\n}\n```\n";
+
+/// Fold `source` into `view` the way the provider delivers it: one delta per chunk.
+///
+/// One delta at a time rather than one `TextDelta` carrying the whole reply, because the
+/// frames that matter are the ones *between* the deltas — a test that pushed a finished
+/// message would render exactly one frame and so could not observe a viewport that fails
+/// to keep up with content growing underneath it.
+fn stream_reply(view: &mut TranscriptView, source: &str, width: u16, height: u16) {
+    view.handle_event(&AppEvent::Engine(started()));
+    for chunk in source.split_inclusive('\n') {
+        view.handle_event(&AppEvent::Engine(provider(StreamEvent::TextDelta(
+            chunk.to_owned(),
+        ))));
+        // A frame per delta, which is what the host does: `observe` reports a redraw for
+        // every one of them. The offset the last frame leaves behind is the whole subject.
+        draw(view, width, height);
+    }
+    view.handle_event(&AppEvent::Engine(TurnEvent::TurnCompleted {
+        assistant_message_id: String::from("msg_1"),
+        steps: 1,
+    }));
+}
+
+/// A streaming reply taller than the pane has to end on screen, not above the fold.
+///
+/// # What this catches
+///
+/// The transcript's viewport never followed the newest row: `following` was set at
+/// construction and read by nothing, and `Component::render` only ever *lowered* an
+/// offset that had run past the end. So `offset` stayed at 0 for a session's whole life
+/// and every row past `area.height` was below the fold — a reply that overflowed the pane
+/// appeared cut off at whatever row the pane happened to end on, which for the reported
+/// case was the table's first row.
+///
+/// # Why it has to stream
+///
+/// Rendering a finished message would draw one frame, and one frame cannot show a
+/// viewport failing to keep up. Neither could a test of `markdown::render`, which returned
+/// all ten rows of this reply at every width, nor one of [`TranscriptView::lines`], which
+/// is measured before the viewport is applied. The defect lived in exactly the gap between
+/// `lines()` and the cells, so the assertion has to be made on painted rows after a
+/// sequence of frames.
+#[test]
+fn views_transcript_follows_the_newest_row_as_a_reply_streams_in() {
+    let mut view = view();
+    view.transcript_mut().push(Message::user(
+        "write a markdown table with 2 rows, then a rust code block",
+    ));
+    stream_reply(&mut view, TABLE_THEN_CODE, 80, 8);
+    let painted = draw(&mut view, 80, 8);
+    let screen = painted.join("\n");
+    let produced = view.lines(80);
+    assert!(
+        produced.len() > 8,
+        "the fixture stopped overflowing an 8-row pane, so this asserts nothing: \
+         {} rows",
+        produced.len()
+    );
+
+    // Both dimensions, because either alone has a degenerate solution. "The tail is
+    // visible" is satisfied by a pane that grew; "the head is gone" is satisfied by a
+    // transcript that lost its first message. Together they say the viewport moved.
+    assert!(
+        screen.contains("println!"),
+        "the code block the reply ended with is off screen:\n{screen}"
+    );
+    assert!(
+        !screen.contains("write a markdown table"),
+        "the prompt is still on screen, so nothing scrolled and the pane must have grown:\n{screen}"
+    );
+    assert_eq!(
+        view.offset(),
+        produced.len() - 8,
+        "the viewport is not resting on the newest row"
+    );
+
+    // The painted rows are the tail of the produced rows, span for span. Asserting the
+    // window rather than two landmarks is what stops a fix that scrolls to some *other*
+    // position from passing: only one offset makes this equality hold.
+    let tail: Vec<String> = produced[produced.len() - 8..]
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .collect();
+    let shown: Vec<String> = painted
+        .iter()
+        .map(|row| row.trim_end().to_owned())
+        .collect();
+    assert_eq!(
+        shown, tail,
+        "the painted window is not the tail of the transcript"
+    );
+}
+
+/// A reader who scrolled back stays where they were while the turn keeps growing.
+///
+/// The counter-dimension to the test above, and the reason the fix is conditional on
+/// `following` rather than an unconditional pin to the bottom. An unconditional pin passes
+/// every assertion up there and makes the transcript unreadable during a live turn: each
+/// delta would yank the view away from the row being read.
+#[test]
+fn views_transcript_leaves_a_reader_who_scrolled_away_where_they_left_off() {
+    let mut view = view();
+    view.transcript_mut().push(Message::user(
+        "write a markdown table with 2 rows, then a rust code block",
+    ));
+    view.handle_event(&AppEvent::Engine(started()));
+    let mut chunks = TABLE_THEN_CODE.split_inclusive('\n');
+    for chunk in chunks.by_ref().take(4) {
+        view.handle_event(&AppEvent::Engine(provider(StreamEvent::TextDelta(
+            chunk.to_owned(),
+        ))));
+        draw(&mut view, 80, 8);
+    }
+    // The reader scrolls to the top, which disarms following.
+    view.set_offset(0);
+    for chunk in chunks {
+        view.handle_event(&AppEvent::Engine(provider(StreamEvent::TextDelta(
+            chunk.to_owned(),
+        ))));
+        draw(&mut view, 80, 8);
+    }
+    let screen = draw(&mut view, 80, 8).join("\n");
+    assert_eq!(view.offset(), 0, "a live turn yanked the viewport");
+    assert!(
+        screen.contains("write a markdown table"),
+        "the row the reader was on is gone:\n{screen}"
+    );
+}
+
+/// Every overflowing shape ends on screen, not just markdown prose.
+///
+/// The cause is the viewport rather than any one block emitter, so a fix that special-cased
+/// the reported shape would be a fix to the symptom. Each of these was truncated by the
+/// same offset for the same reason, and each is checked by the row it must end on.
+#[test]
+fn views_transcript_follows_the_newest_row_for_every_overflowing_shape() {
+    // Long plain prose: no table, no fence, nothing markdown-specific to blame.
+    let mut prose = view();
+    prose.transcript_mut().push(Message::user("summarise"));
+    let sentences = (0..12)
+        .map(|index| format!("Sentence number {index} of the answer.\n"))
+        .collect::<String>();
+    stream_reply(&mut prose, &sentences, 80, 8);
+    assert!(
+        draw(&mut prose, 80, 8).join("\n").contains("number 11"),
+        "the end of a long prose reply is below the fold"
+    );
+
+    // An expanded reasoning block, which wraps with no row cap at all.
+    let mut thinking = view();
+    thinking.toggle_thinking();
+    assert_eq!(thinking.thinking(), ThinkingDisplay::Expanded);
+    thinking.transcript_mut().push(Message::user("think"));
+    thinking.handle_event(&AppEvent::Engine(started()));
+    thinking.handle_event(&AppEvent::Engine(provider(StreamEvent::ReasoningStart)));
+    for index in 0..12 {
+        thinking.handle_event(&AppEvent::Engine(provider(StreamEvent::ReasoningDelta(
+            format!("thought step {index}\n"),
+        ))));
+        draw(&mut thinking, 80, 8);
+    }
+    thinking.handle_event(&AppEvent::Engine(provider(StreamEvent::ReasoningDone {
+        duration_secs: 1.0,
+    })));
+    assert!(
+        draw(&mut thinking, 80, 8).join("\n").contains("step 11"),
+        "the end of an expanded reasoning block is below the fold"
+    );
+
+    // A tool result, which arrives on one event rather than as deltas.
+    let mut tool = view();
+    tool.transcript_mut().push(Message::user("read the file"));
+    tool.handle_event(&AppEvent::Engine(started()));
+    tool.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseStart {
+        id: String::from("call_1"),
+        name: String::from("read"),
+    })));
+    draw(&mut tool, 80, 8);
+    tool.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
+        step: 1,
+        call_id: String::from("call_1"),
+        name: String::from("read"),
+        title: String::from("Read src/main.rs"),
+        output: (0..6)
+            .map(|index| format!("output row {index}\n"))
+            .collect::<String>(),
+        diff: None,
+        written_paths: Vec::new(),
+        is_error: false,
+    }));
+    let painted = draw(&mut tool, 80, 8).join("\n");
+    assert!(
+        painted.contains("row 5") || painted.contains("more"),
+        "a tool result's last row is below the fold:\n{painted}"
+    );
+}
+
 #[test]
 fn views_transcript_offset_clamps_to_the_content_it_rendered() {
     let mut view = view();

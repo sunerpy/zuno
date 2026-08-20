@@ -122,7 +122,7 @@ impl Plugin for RecordingPlugin {
             }
             HookInvocation::PermissionAsk { input, output } => {
                 assert_eq!(input.request.permission, "read");
-                output.status = PermissionStatus::Allow;
+                output.record(PermissionStatus::Allow);
             }
             HookInvocation::CommandExecuteBefore { input, output } => {
                 assert_eq!(input.command, "build");
@@ -195,6 +195,79 @@ impl Plugin for TemperaturePlugin {
         }
         Ok(())
     }
+}
+
+struct PermissionPlugin {
+    manifest: PluginManifest,
+    status: PermissionStatus,
+}
+
+impl PermissionPlugin {
+    fn new(id: &str, status: PermissionStatus) -> Self {
+        Self {
+            manifest: PluginManifest::new(id, vec![HookName::PermissionAsk]).expect("manifest"),
+            status,
+        }
+    }
+}
+
+#[async_trait]
+impl Plugin for PermissionPlugin {
+    fn manifest(&self) -> &PluginManifest {
+        &self.manifest
+    }
+
+    async fn call(&self, hook: &mut HookInvocation<'_>) -> Result<(), BoxSource> {
+        if let HookInvocation::PermissionAsk { output, .. } = hook {
+            output.record(self.status);
+        }
+        Ok(())
+    }
+}
+
+fn permission_request() -> PermissionRequest {
+    PermissionRequest {
+        id: "perm".to_owned(),
+        session_id: "ses".to_owned(),
+        permission: "bash".to_owned(),
+        patterns: vec!["rm -rf /".to_owned()],
+        metadata: serde_json::Map::new(),
+        always: Vec::new(),
+        tool: None,
+    }
+}
+
+async fn permission_status_after(order: [PermissionStatus; 2]) -> PermissionStatus {
+    let bus = HookBus::new(vec![
+        Arc::new(PermissionPlugin::new("first", order[0])),
+        Arc::new(PermissionPlugin::new("second", order[1])),
+    ]);
+    let request = permission_request();
+    let mut output = PermissionAskOutput::default();
+    bus.dispatch(HookInvocation::PermissionAsk {
+        input: &PermissionAskInput { request: &request },
+        output: &mut output,
+    })
+    .await
+    .expect("permission.ask");
+    output.status()
+}
+
+#[tokio::test]
+async fn a_plugin_deny_is_absorbing_against_a_later_plugin_allow() {
+    // Given two plugins in configuration order that disagree, and one shared output.
+    // When the bus dispatches `permission.ask` through both of them.
+    // Then the deny survives regardless of which plugin ran last.
+    assert_eq!(
+        permission_status_after([PermissionStatus::Deny, PermissionStatus::Allow]).await,
+        PermissionStatus::Deny,
+        "a later plugin flipped an earlier plugin's deny back to allow"
+    );
+    assert_eq!(
+        permission_status_after([PermissionStatus::Allow, PermissionStatus::Deny]).await,
+        PermissionStatus::Deny,
+        "a deny recorded last must also stand"
+    );
 }
 
 fn model() -> ResolvedModel {

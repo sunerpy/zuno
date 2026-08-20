@@ -914,9 +914,25 @@ fn markdown_survives_the_degenerate_frame() {
     let drawn = frame(SAMPLE, 20, 10);
     assert_eq!(drawn.len(), 10);
     let out = drawn.join("\n");
+    // Asserted on the rows rather than on the frame, because at 20 columns this reply is
+    // far taller than ten rows and the viewport rests on its *newest* row. The header is
+    // the first row of the message, so a frame that showed it would be one that had not
+    // scrolled — which is the truncation
+    // `message_tests::views_transcript_follows_the_newest_row_as_a_reply_streams_in`
+    // exists to forbid. What §11.6 wants here is that the header survives the degenerate
+    // width, and that is a property of the rows.
+    let produced = transcript(SAMPLE).lines(20);
     assert!(
-        out.contains("Assistant"),
-        "the role header was lost at 20×10:\n{out}"
+        produced.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.contains("Assistant"))
+        }),
+        "the role header was lost at width 20:\n{produced:?}"
+    );
+    assert!(
+        !out.trim().is_empty(),
+        "the degenerate frame drew nothing at all:\n{out}"
     );
     let widest = drawn
         .iter()
