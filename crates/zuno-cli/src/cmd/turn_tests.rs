@@ -46,7 +46,7 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
             wire_model: "model".to_owned(),
             spec: Spec::new(COMPATIBLE_PROVIDER).with_surface(ApiSurface::Chat),
         },
-        provider_models: Vec::new(),
+        catalog_models: Vec::new(),
         directory,
         project,
         config: zuno_config::schema::Config::default(),
@@ -2802,5 +2802,66 @@ async fn a_slow_but_progressing_real_turn_outlives_one_transport_idle_window() {
     assert!(
         elapsed > idle,
         "the fixture did not outlive one idle window: {elapsed:?} <= {idle:?}"
+    );
+}
+
+/// Two providers, each with two models, both reachable with the credentials present.
+fn two_provider_catalog() -> Catalog {
+    let document: zuno_llm::catalog::models_dev::CatalogDocument = serde_json::from_str(
+        r#"{"amazon-bedrock":{"id":"amazon-bedrock","name":"Bedrock","env":[],
+             "npm":"@ai-sdk/amazon-bedrock",
+             "models":{"claude":{"id":"claude","name":"Claude","limit":{"context":1,"output":1}},
+                       "nova":{"id":"nova","name":"Nova","limit":{"context":1,"output":1}}}},
+           "myopenai":{"id":"myopenai","name":"My OpenAI","env":[],
+             "npm":"@ai-sdk/openai-compatible","api":"https://gateway.internal/v1",
+             "models":{"gpt-5":{"id":"gpt-5","name":"GPT-5","limit":{"context":1,"output":1}},
+                       "o4":{"id":"o4","name":"O4","limit":{"context":1,"output":1}}}}}"#,
+    )
+    .expect("catalog document");
+    let config: zuno_config::schema::Config =
+        serde_json::from_str(r#"{"provider":{"amazon-bedrock":{},"myopenai":{}}}"#)
+            .expect("config");
+    Catalog::resolve(&document, &ResolveInput::new().with_config(&config))
+}
+
+/// The owner's defect: `/model` listed one provider while `zuno models` listed ten.
+///
+/// The picker's data came from the resolved plan's single provider, so no second vendor's
+/// model could reach the surface however the view rendered it. Asserting on *distinct
+/// provider prefixes* rather than on a count is what makes this fail for that cause: a
+/// list that grew but stayed inside one provider still fails here.
+#[test]
+fn the_picker_enumeration_spans_every_provider_the_catalog_holds() {
+    let catalog = two_provider_catalog();
+
+    let offered = picker_model_ids(&catalog);
+    let providers = offered
+        .iter()
+        .filter_map(|qualified| qualified.split_once('/').map(|(provider, _)| provider))
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert!(
+        providers.len() >= 2,
+        "the picker was offered {} provider(s) from a catalog holding 2: {offered:?}",
+        providers.len()
+    );
+    assert_eq!(
+        offered,
+        catalog.model_lines(),
+        "the picker must enumerate through the same function `zuno models` prints from, \
+         or the two surfaces can disagree again"
+    );
+    // Pins the defect's mechanism, not just its symptom: the session provider's own slice
+    // is what used to be handed over, and it can never span two providers.
+    let session_slice = catalog
+        .provider("amazon-bedrock")
+        .expect("the fixture resolves bedrock")
+        .models
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        session_slice.len() < offered.len(),
+        "the fixture cannot distinguish one provider's slice from the whole catalog"
     );
 }
