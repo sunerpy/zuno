@@ -4264,7 +4264,10 @@ fn prompt_band(
 /// copy that drifted would point every assertion below at the wrong columns, and the row it read
 /// would be blank, so the failure would name the wrong thing.
 fn composer_span(screen: &SessionScreen, width: u16, height: u16) -> (usize, usize) {
-    let empty = screen.transcript.transcript().messages().is_empty();
+    // The production predicate, not `messages().is_empty()`: a session notice leaves the
+    // composer narrowed, so a helper that counted notices as a transcript would hand every
+    // assertion below the full-frame columns and read the margin instead of the band.
+    let empty = !screen.transcript.transcript().conversation_started();
     let region = composer_region(Rect::new(0, 0, width, height), empty);
     (usize::from(region.x), usize::from(region.width))
 }
@@ -4457,6 +4460,26 @@ fn noticed(text: &str, width: u16) -> Vec<String> {
     rows(&render_offscreen(&mut screen, width, 24).expect("infallible"))
 }
 
+/// The same, in a session that has actually started.
+///
+/// The distinction is load-bearing for anything that needs the ambient panel on screen: a
+/// notice is a [`Role::System`] message and no longer counts as a conversation, so
+/// `sidebar_drawn` keeps the panel off a transcript that holds nothing else — see
+/// `Transcript::conversation_started`. A fixture that pushed only a notice would therefore
+/// assert about a panel that is not drawn, which is an assertion about nothing.
+fn noticed_in_conversation(text: &str, width: u16) -> Vec<String> {
+    let (mut screen, _shutdown) = screen();
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .push(Message::user("a first prompt"));
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .push(Message::notice(text));
+    rows(&render_offscreen(&mut screen, width, 24).expect("infallible"))
+}
+
 #[test]
 fn a_long_notice_stops_at_the_cap_and_says_how_much_it_kept_back() {
     for width in [60u16, 40, 24] {
@@ -4520,7 +4543,7 @@ fn a_notice_never_reaches_the_sidebar_column_with_or_without_the_panel() {
     // panel's `│`, and the guidance the sentence carried was read as truncated. The assertion
     // is positional rather than a substring search, because "the text stops before the rule"
     // is the property and a substring test cannot see a missing column.
-    let with_panel = noticed(OVERLONG_NOTICE, crate::views::SIDEBAR_MIN_WIDTH);
+    let with_panel = noticed_in_conversation(OVERLONG_NOTICE, crate::views::SIDEBAR_MIN_WIDTH);
     // The panel's own left rule, which sits at the start of the sidebar's area; the gap
     // column is the one immediately before it.
     let rule_column =
@@ -4550,6 +4573,12 @@ fn a_notice_never_reaches_the_sidebar_column_with_or_without_the_panel() {
     // gave up. Compared at one width on purpose: a narrower frame would be narrower for
     // reasons that have nothing to do with the panel, and the comparison would prove nothing.
     let (mut hidden, _shutdown) = screen();
+    // The same first prompt as `with_panel`, so the toggle really is the only difference
+    // between the two frames being compared.
+    hidden
+        .transcript_mut()
+        .transcript_mut()
+        .push(Message::user("a first prompt"));
     hidden
         .transcript_mut()
         .transcript_mut()
@@ -5577,4 +5606,234 @@ fn the_input_band_grows_on_both_input_paths_and_stays_centred() {
              centre: {above} above, {below} below"
         );
     }
+}
+
+/// The whole welcome surface survives a startup diagnostic, and the diagnostic is readable.
+///
+/// # The regression, exactly as it was reported
+///
+/// A startup notice — a theme that fell back, a prompt history that could not be read — is
+/// pushed into the transcript before the first frame. The welcome surface was drawn under
+/// `messages().is_empty()`, so one such line reported "the conversation has begun" and took
+/// the wordmark, the hint grid, the hidden sidebar and the composer's centring with it. What
+/// the owner saw was a screen of orange warnings and nothing else. Every one of those four is
+/// therefore asserted here, in one test, because they failed together and a test for any one
+/// of them alone would let the other three come back.
+///
+/// # And the diagnostic still has to be visible
+///
+/// Split across two tests deliberately. The cheapest way to satisfy "the welcome screen is
+/// intact" is to stop drawing the notice at all, which trades the reported defect for a worse
+/// one: a user whose theme failed would be told nothing. `a_startup_notice_is_readable_beside_
+/// the_welcome_screen` is what refuses that trade.
+#[test]
+fn the_welcome_surface_survives_a_startup_notice() {
+    for (width, height) in [(80u16, 24u16), (120, 32), (120, 50), (130, 50)] {
+        let (mut plain, _plain_shutdown) = screen();
+        plain.sidebar_mut().ambient_mut().lsp = vec![crate::views::ambient::Service::new(
+            "rust-analyzer",
+            crate::views::ambient::Health::Ready,
+        )];
+        let (mut warned, _warned_shutdown) = screen();
+        warned.sidebar_mut().ambient_mut().lsp = vec![crate::views::ambient::Service::new(
+            "rust-analyzer",
+            crate::views::ambient::Health::Ready,
+        )];
+        // Exactly what `tui.rs` pushes for a theme that could not be resolved.
+        warned
+            .transcript_mut()
+            .transcript_mut()
+            .push(Message::notice(
+                "warning: theme `nord` was not found; falling back to the built-in palette",
+            ));
+
+        let clean = rows(&render_offscreen(&mut plain, width, height).expect("infallible"));
+        let rendered = rows(&render_offscreen(&mut warned, width, height).expect("infallible"));
+
+        // 1. The brand. Compared against the unwarned frame rather than against a literal, so
+        //    this keeps measuring the wordmark at widths where it degrades to the compact form.
+        let brand = |frame: &[String]| {
+            frame
+                .iter()
+                .any(|row| row.contains(crate::views::welcome::WORDMARK[0].trim()))
+                || frame.iter().any(|row| row.contains("ZUNO"))
+        };
+        assert!(
+            brand(&clean),
+            "at {width}x{height} the fixture draws no brand even with no notice, so this \
+             proves nothing:\n{}",
+            clean.join("\n")
+        );
+        assert!(
+            brand(&rendered),
+            "at {width}x{height} a startup notice took the wordmark with it:\n{}",
+            rendered.join("\n")
+        );
+
+        // 2. The hint grid, which is the welcome surface's foot below the composer.
+        assert!(
+            rendered.iter().any(|row| row.contains("/model")),
+            "at {width}x{height} a startup notice took the hint grid with it:\n{}",
+            rendered.join("\n")
+        );
+
+        // 3. The sidebar stays away. Located by a service only the panel names — `Context` and
+        //    `MCP` also occur in the welcome census, the needle collision
+        //    `the_ambient_panel_waits_for_a_transcript` records.
+        assert!(
+            warned.sidebar_visible(),
+            "the fixture has the panel toggled off, so its absence would prove nothing"
+        );
+        assert!(
+            !rendered.iter().any(|row| row.contains("rust-analyzer")),
+            "at {width}x{height} a startup notice brought the ambient panel onto the welcome \
+             screen, where every figure it carries is zero or unresolved:\n{}",
+            rendered.join("\n")
+        );
+
+        // 4. The composer stays a centred box. Read from the production region, and required to
+        //    be closed on both sides — a narrowed band with no rules is the "reads as a band
+        //    rather than a box" defect, and a full-width one is the original complaint.
+        let (x, columns) = composer_span(&warned, width, height);
+        assert_eq!(
+            (x, columns),
+            composer_span(&plain, width, height),
+            "at {width}x{height} a startup notice changed the composer's region"
+        );
+        if width > COMPOSER_MAX_COLS {
+            assert!(
+                columns < usize::from(width),
+                "at {width}x{height} the composer spans the whole frame, so it reads as a band"
+            );
+        }
+        let first = content_row(&rendered, &warned, width, height);
+        let full = &rendered[prompt_first(&rendered, &warned, width, height)];
+        let edges = full.chars().collect::<Vec<_>>();
+        assert!(
+            first.contains(PROMPT_MARKER),
+            "at {width}x{height} the composer lost its gutter marker: {first:?}"
+        );
+        if x > 0 {
+            assert_eq!(
+                (edges.get(x - 1).copied(), edges.get(x + columns).copied()),
+                (Some('▌'), Some('▐')),
+                "at {width}x{height} the composer is not closed on both sides: {full:?}"
+            );
+        }
+    }
+}
+
+/// A startup diagnostic is still on screen while the welcome surface holds the frame.
+///
+/// The other half of `the_welcome_surface_survives_a_startup_notice`: the layout must not be
+/// repaired by suppressing the warning. Its text is required verbatim, and required to sit
+/// above the composer rather than merely somewhere on the frame — a notice drawn under the
+/// hint grid would read as a hint.
+#[test]
+fn a_startup_notice_is_readable_beside_the_welcome_screen() {
+    const WARNING: &str = "warning: theme `nord` was not found; falling back to the built-in";
+
+    for (width, height) in [(80u16, 24u16), (120, 32), (120, 50)] {
+        let (mut screen, _shutdown) = screen();
+        screen
+            .transcript_mut()
+            .transcript_mut()
+            .push(Message::notice(WARNING));
+        let rendered = rows(&render_offscreen(&mut screen, width, height).expect("infallible"));
+
+        let notice = rendered
+            .iter()
+            .position(|row| row.contains("was not found"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "at {width}x{height} the startup notice is nowhere on the frame, so the \
+                     welcome layout was repaired by hiding the warning:\n{}",
+                    rendered.join("\n")
+                )
+            });
+        // Verbatim, not just the needle: a notice cut mid-sentence with no elision mark is
+        // indistinguishable from one that fitted, which is the failure `a_long_notice_stops_at_
+        // the_cap_and_says_how_much_it_kept_back` exists for.
+        assert!(
+            rendered[notice].contains(WARNING),
+            "at {width}x{height} the notice was clipped: {:?}",
+            rendered[notice]
+        );
+        assert!(
+            notice < prompt_first(&rendered, &screen, width, height),
+            "at {width}x{height} the notice is drawn at row {notice}, at or below the composer, \
+             so it reads as part of the hint grid rather than as a report:\n{}",
+            rendered.join("\n")
+        );
+        // Above the brand, so it used the rows the bottom-anchored head leaves blank rather
+        // than displacing the head.
+        let brand = brand_row(&rendered);
+        assert!(
+            notice < brand,
+            "at {width}x{height} the notice is below the brand at row {brand}, so it displaced \
+             the head instead of using the rows above it:\n{}",
+            rendered.join("\n")
+        );
+    }
+}
+
+/// The notice block is bottom-anchored in the blank run, not pinned to row zero.
+///
+/// # Why this is measured across two heights rather than as a gap of `n` rows
+///
+/// The transcript draws its own role header above a notice and its own bottom margin below it,
+/// so the distance from the notice's text to the brand is a transcript-internal number. An
+/// assertion spelling it out would pass for a top-anchored block on a short frame and would
+/// have to be re-tuned every time the transcript's own chrome changed.
+///
+/// Bottom-anchoring has a height-independent signature instead: growing the frame lengthens the
+/// blank run *above* the block and leaves the rows below it alone. Top-anchoring is the exact
+/// mirror — the gap below grows and the gap above stays at zero — so comparing 32 rows with 50
+/// at one width separates them with no constant to maintain. One width, because a different
+/// width would re-wrap the notice and change the block's own height.
+#[test]
+fn a_startup_notice_sits_against_the_brand_rather_than_the_frame_top() {
+    let measure = |height: u16| {
+        let (mut screen, _shutdown) = screen();
+        screen
+            .transcript_mut()
+            .transcript_mut()
+            .push(Message::notice(
+                "warning: theme `nord` was not found; falling back to the built-in palette",
+            ));
+        let rendered = rows(&render_offscreen(&mut screen, 120, height).expect("infallible"));
+        let notice = rendered
+            .iter()
+            .position(|row| row.contains("was not found"))
+            .expect("the notice is drawn");
+        (notice, brand_row(&rendered) - notice)
+    };
+
+    let (short_above, short_below) = measure(32);
+    let (tall_above, tall_below) = measure(50);
+
+    assert_eq!(
+        short_below, tall_below,
+        "the rows between the notice and the brand grew with the frame ({short_below} at 32 \
+         rows, {tall_below} at 50), which is what a top-anchored block does"
+    );
+    assert!(
+        tall_above > short_above,
+        "the notice stayed {tall_above} rows from the top of both frames, so it is pinned to \
+         the top rather than riding the brand down"
+    );
+}
+
+/// The row the welcome brand is on, by either of the two forms it takes.
+///
+/// The wordmark degrades to a compact word below `WORDMARK_MIN_HEIGHT`, so a needle for the
+/// block glyphs alone would silently find nothing on a short frame and every assertion built on
+/// it would be about row zero.
+fn brand_row(rendered: &[String]) -> usize {
+    rendered
+        .iter()
+        .position(|row| {
+            row.contains(crate::views::welcome::WORDMARK[0].trim()) || row.contains("ZUNO")
+        })
+        .expect("the welcome brand is drawn")
 }

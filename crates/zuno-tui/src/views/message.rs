@@ -573,6 +573,29 @@ impl Transcript {
         &self.messages
     }
 
+    /// Whether either party has actually said anything yet.
+    ///
+    /// [`Role::System`] is excluded, and that exclusion is the whole point: a session
+    /// notice is something the *program* said about itself, not a turn. Startup
+    /// diagnostics — a theme that fell back, an unreadable prompt history — are pushed
+    /// before the first frame, so a predicate that merely asked whether the buffer held
+    /// any message reported "the conversation has begun" on a session where nothing had
+    /// happened. The welcome surface is drawn under exactly that predicate, so one
+    /// recoverable warning silently cost the wordmark, the hint grid, the hidden sidebar
+    /// and the composer's centring all at once — reported by the owner as a screen of
+    /// warnings with no welcome screen behind them.
+    ///
+    /// Defined here, on the transcript, rather than at either of the two places in
+    /// `session.rs` that need it: those two must never disagree about whether the
+    /// welcome screen is in force, because one sizes the centring tail and the other
+    /// decides what fills the body.
+    #[must_use]
+    pub fn conversation_started(&self) -> bool {
+        self.messages
+            .iter()
+            .any(|message| matches!(message.role, Role::User | Role::Assistant))
+    }
+
     /// Whether a turn is in flight.
     #[must_use]
     pub const fn is_running(&self) -> bool {

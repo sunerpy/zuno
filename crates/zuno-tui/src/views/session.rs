@@ -1241,7 +1241,7 @@ impl Component for SessionScreen {
             .iter()
             .map(crate::views::picker::McpServer::service)
             .collect();
-        let empty = self.transcript.transcript().messages().is_empty();
+        let empty = !self.transcript.transcript().conversation_started();
         let (prompt_band, tail) = self.prompt_and_tail(area.width, area.height);
         // Prompt above strip: the agent and the model are what the *composer* is set to, so they
         // belong under the box the way a caption belongs under a figure. See `welcome_tail_rows`,
@@ -1277,6 +1277,13 @@ impl Component for SessionScreen {
         // otherwise be blank.
         if empty {
             self.welcome.render(frame, main);
+            // Both, not either: the welcome screen is in force because no *turn* has
+            // happened, which says nothing about whether the session has already had to
+            // report something — a theme that fell back or a prompt history it could not
+            // read are pushed before frame one. Drawing only the welcome screen would
+            // make those warnings unreachable, and drawing only the transcript is the
+            // bug this pair replaces.
+            self.render_session_notices(frame, main, area.height);
         } else {
             self.transcript.render(frame, main);
         }
@@ -1436,15 +1443,91 @@ impl SessionScreen {
         }
     }
 
+    /// How many rows the session's own notices need at `width`.
+    ///
+    /// One function for two callers, because they must agree: [`Self::prompt_and_tail`]
+    /// counts these rows into the head so the tail leaves room for them, and
+    /// [`Self::render_session_notices`] sizes the region it draws them into. If the two
+    /// measured separately, a notice would be allotted rows it did not fill or — worse —
+    /// clipped in a frame whose arithmetic said it fitted.
+    ///
+    /// Measured through the transcript's own renderer rather than by counting messages: a
+    /// notice wraps, and a long one is capped with a line saying how much was held back
+    /// (`NOTICE_MAX_ROWS`), so message count and row count are unrelated numbers.
+    fn session_notice_rows(&self, width: u16) -> u16 {
+        u16::try_from(self.transcript.lines(width).len()).unwrap_or(u16::MAX)
+    }
+
+    /// Draw the session's own notices into the rows the welcome head does not use.
+    ///
+    /// # Why this costs no geometry
+    ///
+    /// The head is **bottom-anchored** in the body region — [`WelcomeView::lines_in`] pads
+    /// with blank rows above it, deliberately, so the brand sits directly on the status
+    /// strip. Those leading rows are the only part of this screen that is blank by
+    /// construction, so notices drawn there displace nothing: `head_rows`,
+    /// [`welcome_tail_rows`], [`composer_region`] and the band order are all untouched, and
+    /// the head can never be clipped because the region handed over is what is left after
+    /// subtracting the head's own height.
+    ///
+    /// # Bottom-anchored, for the reason the head is
+    ///
+    /// The slice is placed flush *above* the head rather than at the top of the body. On a
+    /// 200×50 frame the body's blank run is tall, and a warning pinned to row zero with
+    /// twenty empty rows under it reads as an unrelated third block — the same "two blocks
+    /// a third of a screen apart" failure [`WelcomeView::lines_in`] and
+    /// [`WelcomeView::render_foot`] both exist to avoid. Sized to the content and pushed
+    /// down against the brand, the notices read as one column with it.
+    ///
+    /// The transcript renders them, rather than this drawing its own rows, because the
+    /// transcript is where they live: a second store would be a second copy of one fact,
+    /// and it would be the copy that goes stale. It also means a notice looks the same
+    /// before and after the first prompt.
+    fn render_session_notices(&mut self, frame: &mut Frame<'_>, main: Rect, frame_height: u16) {
+        if main.width == 0 || main.height == 0 {
+            return;
+        }
+        let wanted = self.session_notice_rows(main.width);
+        if wanted == 0 {
+            return;
+        }
+        // `frame_height`, not `main.height`: the wordmark's fit is decided by the frame, so
+        // asking the head how tall it is with the region's height would answer a different
+        // question than the one the tail was computed from — see `WelcomeView::head_rows`.
+        let head = self.welcome.head_rows(main.width, frame_height);
+        let blank = main.height.saturating_sub(head);
+        let rows = wanted.min(blank);
+        if rows == 0 {
+            return;
+        }
+        let area = Rect {
+            x: main.x,
+            y: main.y.saturating_add(blank.saturating_sub(rows)),
+            width: main.width,
+            height: rows,
+        };
+        self.transcript.render(frame, area);
+    }
+
     pub(crate) fn prompt_and_tail(&self, width: u16, height: u16) -> (u16, u16) {
         let band = prompt_rows(self.editor.height(), height);
-        let empty = self.transcript.transcript().messages().is_empty();
+        let empty = !self.transcript.transcript().conversation_started();
         // At the *frame* height and the *frame* width — the same pair `WelcomeView::render`
         // decides the wordmark from. The width is no longer adjusted for the panel because the
         // panel is not drawn while this head is: see `sidebar_drawn`, and the head's own
         // measurement note in `welcome_tail_rows`.
+        // The session's notices are counted into the head, and that reuses the existing
+        // mechanism rather than adding one: `head` is already "the rows above the band that
+        // must not be clipped", and `welcome_tail_rows` already trades the tail against it.
+        // So a frame carrying a theme warning gives the band a shorter tail and a taller
+        // body, which is the documented behaviour when the head binds — the band sits
+        // slightly low rather than the warning being cut. Measured at `width`, the frame's
+        // own, which is what the notices are drawn at: the panel that would narrow the body
+        // is never drawn while this head is (see `sidebar_drawn`).
         let head = if empty {
-            self.welcome.head_rows(width, height)
+            self.welcome
+                .head_rows(width, height)
+                .saturating_add(self.session_notice_rows(width))
         } else {
             0
         };
