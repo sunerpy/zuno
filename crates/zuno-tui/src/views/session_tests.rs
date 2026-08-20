@@ -4831,13 +4831,19 @@ fn the_welcome_screen_lifts_the_prompt_and_a_used_session_does_not() {
     }
 }
 
-/// The tail cannot starve the region it exists to centre, including at 20x10.
+/// The tail cannot starve the region it centres the input inside, including at 20x10.
 ///
-/// Restated for the arithmetic that replaced the capped half-region tail, not relaxed: the
-/// claim is still "the body keeps a row", and it is still checked at every height from one to
-/// twelve. What changed is that the guarantee no longer comes from a subtracted constant but
-/// from the halving itself, so the test now derives `body_max` the way `render` does and reads
-/// the tail back out of the one function `render` calls.
+/// Restated for the arithmetic that replaced the halved-slack tail, not relaxed: the claim is
+/// still "the body keeps a row", and it is still checked at every height from one to twelve.
+/// What changed is where the guarantee comes from. Halving guaranteed it structurally — half of
+/// anything leaves the other half — and the new formula does not halve the region at all, it
+/// takes `min(centred, body_max - head)`. So the guarantee now rests entirely on that second
+/// term, and specifically on its `max(1)`: the head is what the body is reserved *for*, and a
+/// head measured as zero rows would otherwise let the tail take everything.
+///
+/// The zero-head case is reachable rather than hypothetical, which is what makes the range here
+/// the right one: a frame these short gives the welcome screen a region it cannot state a brand
+/// into, and `render` still has to hand the body a row.
 #[test]
 fn the_welcome_tail_never_takes_the_row_the_welcome_needs() {
     for height in 1..=12u16 {
@@ -4850,12 +4856,13 @@ fn the_welcome_tail_never_takes_the_row_the_welcome_needs() {
             "at {height} rows the chrome and the tail leave the body nothing: \
              status {STATUS_ROWS} + prompt {band} + tail {tail}"
         );
-        // The halving, asserted directly. A tail allowed to take the whole slack would satisfy
-        // the bound above on every even height and starve the body on the odd ones, so the
-        // inequality alone does not pin which half the tail may have.
+        // The `max(1)` in `welcome_tail_rows`, asserted as the property it buys rather than as
+        // the expression: whatever the head measures, the body is left at least one row to put
+        // it in. Drop the `max(1)` and a frame whose head is empty fails here rather than
+        // panicking somewhere downstream.
         assert!(
-            tail <= body_max / 2,
-            "at {height} rows the tail took {tail} of a {body_max}-row body"
+            tail < body_max || body_max == 0,
+            "at {height} rows the tail took all {body_max} rows of the body"
         );
         // The panic guard, exercised through the frame rather than the arithmetic: a tail that
         // fabricated a row the buffer does not own panics inside ratatui.
@@ -4864,79 +4871,123 @@ fn the_welcome_tail_never_takes_the_row_the_welcome_needs() {
     }
 }
 
-/// The empty screen's composite sits on the frame's middle, at three real terminal heights.
+/// The empty screen's **input band** sits on the frame's middle, at five real terminal sizes.
 ///
-/// The complaint this answers, twice reported and measured on a real 120x32 pane: the block
-/// was drawn against the top and the input was pinned to the bottom, leaving nine dead rows
-/// below the prompt. The previous tail satisfied
-/// `the_welcome_screen_lifts_the_prompt_and_a_used_session_does_not` — it lifted the prompt by
-/// six rows — and still produced that screen, because a *lift* says nothing about where the
-/// composite ends up. So this asserts the balance instead: the blank rows above the block and
-/// the blank rows below the prompt must differ by at most one, which is the odd row a frame of
-/// odd slack cannot split.
+/// # What is centred, and why the previous two answers were both wrong
 ///
-/// Measured at five sizes rather than derived at one: 24 is the shortest common pane, 32 is the
-/// reported one, and 50 is where the previous six-row cap did its worst.
+/// Reported three times. The first arrangement pinned the prompt to the bottom outright. The
+/// second lifted it by a capped half-region tail, which satisfied
+/// `the_welcome_screen_lifts_the_prompt_and_a_used_session_does_not` — a six-row lift — and
+/// still left nine dead rows under a prompt at row 22 of 32, because a *lift* says nothing
+/// about where anything ends up. The third balanced the whole *composite*: block, strip and
+/// prompt as one object, blank rows above the brand against blank rows below the composer. That
+/// arithmetic was exact, provable, and measured on a real pane as an input box at rows 23–26 of
+/// 32 — because centring an object whose top nine-tenths is text puts the *text* in the middle
+/// and the input near the bottom.
 ///
-/// # Both edges are measured from the frame, and the previous version measured one of them wrong
+/// So the thing measured here is the band, and it is measured from the frame's two edges: the
+/// rows above it and the rows below it must differ by at most one, which is the odd row an odd
+/// frame cannot split. That is what "the input box is in the centre of the area" says, and
+/// unlike the composite version it cannot be satisfied by a screen with the input anywhere else.
 ///
-/// This test passed against a build the user then measured as *not centred*, reporting nine dead
-/// rows under a one-row prompt. It was right about the arithmetic and wrong about the screen,
-/// because it took `gap_below` from `prompt_first` — the same function `render` splits by — so it
-/// asked "did the tail get the rows the formula says" and never "is the thing above the tail
-/// something a reader can see". The band was allocated four rows and painted in the transcript's
-/// own surface, so three of its rows were air to a reader and the visible gap below the composer
-/// was `3 + 6 = 9` against seven above.
+/// # Both edges are found by paint, and one of them was once found by arithmetic
 ///
-/// So the bottom edge is now found the way the top edge always was: **by paint**. The composite's
-/// last row is the last row whose background is not the body surface — the strip and the band
-/// carry `element`, everything else carries `surface`, and the centring band is filled precisely
-/// so this question has an answer. That couples the assertion to the visibility: revert the
-/// band's fill to `text` and its rows join the surface, the edge found here jumps up to the
-/// strip, and this fails with a skew of three at 32 rows without the arithmetic changing at all.
+/// The version this replaces took its lower edge from `prompt_first` — the same function
+/// `render` splits by — so it asked "did the tail get the rows the formula says" and never
+/// "is the row above the tail something a reader can see". It passed against a build the user
+/// measured as a one-row prompt with nine dead rows beneath it.
 ///
-/// `gap_above` is unchanged — the wordmark's block glyph, content only this block paints, which
-/// neither the sidebar (`│ ▾ ▸ ●`) nor the filled strip contains. A `render` that dropped the
-/// tail from its split would bottom-anchor the block 31 rows down on a 200x50 frame instead of
-/// 16 and fail with a skew of sixteen.
+/// Both edges of the band are therefore located by background: the strip and the band carry
+/// `element`, every other row carries `surface`, and the centring band is filled precisely so
+/// this question has an answer. The band is the *last* run of `element` rows — the strip is one
+/// row of `element` directly above it, so the run is found from the bottom and the strip is
+/// excluded by requiring the row above the run's start to be the strip and the one above that
+/// to be surface. Revert the band's fill to `text` and its rows join the surface: the run
+/// collapses to the strip alone and this fails, without the arithmetic changing at all.
+///
+/// # The foot is required to be below it, which is what stops the head from being trimmed again
+///
+/// A band centred by *deleting* rows above it would satisfy the skew bound while removing the
+/// screen. So the lead line — the one row `WelcomeView::foot` always emits — has to be found
+/// strictly below the band, and the wordmark strictly above it. Together they say the surface
+/// still brackets the input rather than having been cut away from it.
+///
+/// Measured at five sizes rather than derived at one: 24 is the shortest common pane and the
+/// one the old arrangement could not centre at any tail length, 32 is the reported one, 50 is
+/// where the earlier six-row cap did its worst, and 80 columns is the width with no sidebar.
 #[test]
-fn the_welcome_composite_is_centred_on_the_frame() {
+fn the_prompt_band_is_centred_on_the_frame() {
     for (width, height) in [(120u16, 24u16), (120, 32), (120, 50), (80, 32), (200, 50)] {
         let (mut blank, _shutdown) = screen();
         let buffer = render_offscreen(&mut blank, width, height).expect("infallible");
         let rendered = rows(&buffer);
+        let palette = blank.context.palette();
+        let surface = ratatui::style::Color::from(palette.background_panel);
+        let element = ratatui::style::Color::from(palette.background_element);
+        assert_ne!(
+            surface, element,
+            "the theme gives the composer no surface to be distinct in"
+        );
 
-        let surface = ratatui::style::Color::from(blank.context.palette().background_panel);
-        let last_visible = (0..height)
-            .rposition(|y| buffer[(0, y)].bg != surface)
+        let bg = |y: usize| buffer[(0, u16::try_from(y).expect("in frame"))].bg;
+        let last = (0..rendered.len())
+            .rposition(|y| bg(y) == element)
             .expect("the composer is painted in its own surface");
-        let gap_below = rendered.len() - 1 - last_visible;
-        let gap_above = rendered
-            .iter()
-            .position(|row| row.contains('█'))
-            .expect("every size here is wide and tall enough for the wordmark");
+        let first = (0..=last)
+            .rev()
+            .take_while(|y| bg(*y) == element)
+            .last()
+            .expect("the run contains the row it ends on");
+        // The run's first row is the status strip, and the band starts one row below it. Both
+        // are `element` by design — see `PROMPT_GUTTER_COLS` — so the run has to be split, and
+        // the split is checked rather than assumed: the row above the run must be the body
+        // surface, or what was found is not the strip and every row index below is off by one.
+        assert_eq!(
+            bg(first.saturating_sub(1)),
+            surface,
+            "at {width}x{height} the run of composer rows starts at {first} with another \
+             non-surface row above it, so the strip could not be told from the band"
+        );
+        let band_first = first + 1;
+        let gap_above = band_first;
+        let gap_below = rendered.len() - 1 - last;
 
         let skew = gap_above.abs_diff(gap_below);
         assert!(
             skew <= 1,
-            "at {width}x{height} the composite a reader can see is {gap_above} rows from the \
-             top and {gap_below} from the bottom, a skew of {skew}"
+            "at {width}x{height} the input band a reader can see runs {band_first}..={last}, \
+             which is {gap_above} rows from the top and {gap_below} from the bottom, a skew of \
+             {skew}"
         );
-        // Both halves non-zero, because a screen with nothing above *and* nothing below would
-        // report a skew of zero while being the flush-to-the-edges layout being replaced.
+        // Both halves non-zero, because a band flush against both edges would report a skew of
+        // zero while being the layout this replaces.
         assert!(
             gap_above > 0 && gap_below > 0,
-            "at {width}x{height} the composite is flush against an edge: \
+            "at {width}x{height} the band is flush against an edge: \
              {gap_above} above, {gap_below} below"
         );
-        // The edge found by paint has to be the edge the split produced, or the two measures
+        // The edges found by paint have to be the edges the split produced, or the measures
         // above are of different things and the skew is a coincidence.
         let (band, tail) = blank.prompt_and_tail(width, height);
         assert_eq!(
-            gap_below,
-            usize::from(tail),
-            "at {width}x{height} the painted composer ends {gap_below} rows from the bottom but \
-             the split gave the tail {tail} and the band {band}"
+            (last + 1 - band_first, gap_below),
+            (usize::from(band), usize::from(tail)),
+            "at {width}x{height} the painted band is rows {band_first}..={last} with \
+             {gap_below} rows below it, but the split gave the band {band} and the tail {tail}"
+        );
+        // And the surface still brackets the input rather than having been trimmed off it.
+        let wordmark = rendered
+            .iter()
+            .position(|row| row.contains('█'))
+            .expect("every size here is wide and tall enough for the wordmark");
+        let lead = rendered
+            .iter()
+            .position(|row| row.contains("type / for commands"))
+            .expect("the welcome surface always teaches `/`");
+        assert!(
+            wordmark < band_first && lead > last,
+            "at {width}x{height} the welcome surface no longer brackets the input: wordmark \
+             on row {wordmark}, band {band_first}..={last}, lead line on row {lead}"
         );
     }
 }
@@ -5047,6 +5098,141 @@ fn the_first_message_takes_the_whole_welcome_band_with_it() {
             prompt_first(&after, &screen, width, height) + usize::from(band_after),
             after.len(),
             "at {width}x{height} the prompt is still lifted after the first message"
+        );
+        // The rows are gone *and* so is what was drawn in them. The band the empty screen used
+        // to centre the input now carries the far half of the welcome surface, so "the tail is
+        // zero" no longer implies "nothing of the welcome screen is left" — a `render` that
+        // dropped the `empty` guard on `render_foot` would paint hint rows over the transcript
+        // while every row count above still balanced.
+        let joined = after.join("\n");
+        for absent in ["type / for commands", "all keys", "past sessions"] {
+            assert!(
+                !joined.contains(absent),
+                "at {width}x{height} `{absent}` survived the first message, so the welcome \
+                 surface is being drawn under a transcript:\n{joined}"
+            );
+        }
+        assert!(
+            before.join("\n").contains("type / for commands"),
+            "at {width}x{height} the empty screen never stated the lead line, so the check \
+             above passed without anything having to be retracted"
+        );
+    }
+}
+
+/// The input band grows as lines are added, and stays centred while it grows.
+///
+/// # Two paths, because they are two different code paths
+///
+/// `session_prompt_grows_with_the_typed_line_count` drives `editor.insert_char('\n')`
+/// directly, which is neither of the paths a user has. A newline arrives either as a chord the
+/// keymap resolves to `input_newline` — `shift+return`, `ctrl+return`, `alt+return` or
+/// `ctrl+j`, all four in the shipped table — or as a bracketed paste, which reaches
+/// `SessionScreen::paste` and never touches the keymap at all. Both are exercised here through
+/// the surfaces that own them: the chord through a real `KeyDispatcher` over the real shipped
+/// keymap, the paste through `handle_event`.
+///
+/// # Centring is asserted at every step, not only at the end
+///
+/// The tail is `(height - band) / 2`, so band and tail move in opposite directions by the same
+/// amount and the band stays centred by construction. That is precisely the kind of claim that
+/// is easy to believe and easy to break — a tail computed from the *empty* band, or memoised
+/// across frames, would pass a check made only before typing and only after. So the frame is
+/// re-measured after each line, and the band's two gaps are re-compared each time.
+///
+/// The heights are the ones where growth is actually affordable. The cap is a third of the
+/// pane, so a 32-row frame grants ten rows and a 24-row frame eight; both are above the
+/// four-row floor, which is what makes "it grew" observable at all.
+#[test]
+fn the_input_band_grows_on_both_input_paths_and_stays_centred() {
+    /// The band's painted extent and the blank rows on either side of it.
+    ///
+    /// By paint, for the reason `the_prompt_band_is_centred_on_the_frame` records at length:
+    /// the band's own arithmetic cannot be used to check where the band ended up.
+    ///
+    /// Over `dyn Component` rather than over `SessionScreen`, because one of the two paths
+    /// drives the screen through a `KeyDispatcher` that owns it — asking the screen directly
+    /// would render a different object from the one the chord reached.
+    fn measured(
+        root: &mut dyn Component,
+        element: ratatui::style::Color,
+        width: u16,
+        height: u16,
+    ) -> (usize, usize, usize) {
+        let buffer = render_offscreen(root, width, height).expect("infallible");
+        let bg = |y: usize| buffer[(0, u16::try_from(y).expect("in frame"))].bg;
+        let last = (0..usize::from(height))
+            .rposition(|y| bg(y) == element)
+            .expect("the composer is painted in its own surface");
+        let strip = (0..=last)
+            .rev()
+            .take_while(|y| bg(*y) == element)
+            .last()
+            .expect("the run contains the row it ends on");
+        let first = strip + 1;
+        (last + 1 - first, first, usize::from(height) - 1 - last)
+    }
+
+    let newline = crate::views::testkit::action("input_newline");
+    assert!(
+        newline.keys.split(',').any(|key| key == "ctrl+j"),
+        "the shipped table no longer binds `ctrl+j` to `input_newline`, so the chord this \
+         drives is not a newline: {}",
+        newline.keys
+    );
+
+    let element = ratatui::style::Color::from(ViewContext::defaults().palette().background_element);
+    for (width, height) in [(120u16, 32u16), (80, 24)] {
+        // The chord path. `shift+return` cannot be delivered through a real terminal — the
+        // legacy encoding gives it the same bytes as `return` — so `ctrl+j` is the spelling
+        // driven here, and it is the same binding.
+        let keymap = Keymap::defaults().expect("the shipped table builds");
+        let (typed, _shutdown) = screen();
+        let mut dispatcher = KeyDispatcher::new(keymap, scopes(), Box::new(typed));
+        let mut seen = Vec::new();
+        for line in 1..=4 {
+            assert!(
+                dispatcher
+                    .handle_event(&AppEvent::Terminal(TerminalEvent::Input(
+                        crossterm::event::Event::Key(KeyEvent {
+                            code: crossterm::event::KeyCode::Char('j'),
+                            modifiers: crossterm::event::KeyModifiers::CONTROL,
+                            kind: crossterm::event::KeyEventKind::Press,
+                            state: crossterm::event::KeyEventState::NONE,
+                        })
+                    )))
+                    .handled,
+                "the dispatcher did not resolve `ctrl+j` to a newline on line {line}"
+            );
+            let (band, above, below) = measured(&mut dispatcher, element, width, height);
+            assert!(
+                above.abs_diff(below) <= 1,
+                "at {width}x{height} a {band}-row band after {line} newline(s) sits {above} \
+                 rows from the top and {below} from the bottom"
+            );
+            seen.push(band);
+        }
+        assert!(
+            seen.last() > seen.first(),
+            "at {width}x{height} four newlines through the keymap left the band at {seen:?}; \
+             the floor is four rows, so a fifth line has to buy a fifth row"
+        );
+
+        // The paste path, which reaches the editor without passing the keymap at all. One
+        // event carrying every line, which is what a terminal in bracketed-paste mode sends.
+        let (mut pasted, _shutdown) = screen();
+        let (band_before, _, _) = measured(&mut pasted, element, width, height);
+        pasted.handle_event(&paste("one\ntwo\nthree\nfour\nfive\nsix"));
+        let (band_after, above, below) = measured(&mut pasted, element, width, height);
+        assert!(
+            band_after > band_before,
+            "at {width}x{height} a six-line paste left the band at {band_after} rows, the \
+             same as the empty {band_before}"
+        );
+        assert!(
+            above.abs_diff(below) <= 1,
+            "at {width}x{height} the band grew to {band_after} rows on a paste and went off \
+             centre: {above} above, {below} below"
         );
     }
 }

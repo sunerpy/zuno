@@ -1404,6 +1404,23 @@ impl App {
                 redraw: false,
             });
         }
+        // A resize is decided here rather than reported by a view, and the distinction is
+        // load-bearing. The line below has *already* changed the backend's size, so every
+        // cell of the frame still on the terminal describes a geometry that no longer
+        // exists — that is a fact about the host, not a judgement any component is
+        // entitled to make. No view claims `Terminal(Resize)` today (`message.rs` answers
+        // the whole `Terminal` arm with `IGNORED`), so `result.redraw` came back false and
+        // the stale frame stayed up until an *unrelated* event happened to arrive — at the
+        // deep-idle tier, up to five seconds later. Asking components to report it instead
+        // would put the correctness of every resize behind every view remembering to, which
+        // is the same defect class as a `focused_scopes` layer silently swallowing a
+        // promotion: one forgetful branch and the bug is back with nothing to notice it.
+        //
+        // Note the two are independent: `record_terminal_activity` in
+        // `Self::dispatch_terminal` steps the cadence tier back up so the *next* frames are
+        // prompt, but it schedules nothing for the frame that is already wrong. This bit is
+        // what paints it now.
+        let resized = matches!(event, TerminalEvent::Resize { .. });
         if let TerminalEvent::Resize { width, height } = &event {
             ui.target.resize(*width, *height)?;
         }
@@ -1414,7 +1431,7 @@ impl App {
             } else {
                 Dispatch::Continue
             },
-            redraw: result.redraw || shutdown,
+            redraw: result.redraw || shutdown || resized,
         })
     }
 

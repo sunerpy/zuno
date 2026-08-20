@@ -45,14 +45,20 @@
 //! `jcode` draws no welcome at all on an authenticated session, and `claw-code` spends
 //! sixteen rows. Eighteen is inside that band; twenty-two was above all of it.
 //!
-//! # Fourteen rows, because the block is also what gets centred
+//! # Fourteen rows, and then nine of them above the input and four below
 //!
 //! Eighteen was inside the reference band and still wrong, and the reason is positional
-//! rather than editorial. The composite the reader sees is *block + strip + prompt*, and
-//! [`crate::views::session::SessionScreen`] centres that composite on the frame — so every
-//! row here is a row the input sits further from the middle. Measured at 120×32 the
-//! eighteen-row block left nine dead rows under the prompt and none above the brand, which
-//! is the same top-heavy screen the trim was supposed to fix.
+//! rather than editorial. Every row above the input is a row the input sits further from the
+//! middle of the frame, and cutting rows only ever moves it closer — it cannot get it there.
+//! Measured at 120×32 the eighteen-row block left nine dead rows under the prompt and none
+//! above the brand; the fourteen-row block that replaced it still put the band at rows 23–26
+//! of 32. On a twenty-four-row pane the arithmetic makes it impossible outright: half the
+//! frame is twelve rows and the block plus the strip needed fifteen.
+//!
+//! So the trim below is real and kept, and the *position* is fixed separately by splitting
+//! the surface at the input — [`WelcomeView::head`] above, [`WelcomeView::foot`] below. That
+//! is also how the reference lays it out: `opencode` shows its logo, then the input, then its
+//! hint row and tip line underneath. Nothing here is cut to achieve the split.
 //!
 //! Two blocks were cut, and both were cut for the same reason: something else already
 //! answers the question they answered.
@@ -162,18 +168,22 @@ pub const WORDMARK_MIN_WIDTH: u16 = WORDMARK_WIDTH + 4;
 
 /// The shortest terminal that still gets the wordmark.
 ///
-/// Derived rather than chosen. The wordmark block is fourteen rows — six of letterform, two
-/// facts, the lead line, the two hint rows and three blank separators — and the composite it
-/// belongs to adds the status strip and the prompt's four-row band, so nineteen rows is the
-/// first frame that holds the whole thing. Twenty is that figure with one row to spare,
-/// which is what keeps the row [`crate::views::session::SessionScreen`] gives the tail from
-/// having to come out of the block.
+/// Derived rather than chosen, and re-derived when the hints moved below the prompt. The
+/// screen is now nine rows above the input — six of letterform, a separator and two facts —
+/// and four below it: a separator, the lead line, and the two hint rows sharing one more
+/// separator. With the status strip and the prompt's four-row band between them the whole
+/// screen is eighteen rows, so eighteen is the first frame that holds all of it and twenty is
+/// that figure with two rows to spare.
 ///
-/// **Measured against the frame, not against the region the block is painted into.** The
-/// owner lifts the prompt by a tail computed from this block's height, so a fit decision
-/// that read the shrunken region would be a fixpoint: a shorter region drops the wordmark,
-/// a shorter block earns a longer tail, and a longer tail shortens the region again. See
-/// [`WelcomeView::block_rows`].
+/// The spare rows are not slack, they are what the centring spends: at exactly eighteen the
+/// band would have to sit flush against the head with nothing above the wordmark, which is the
+/// flush-to-the-edge layout the arrangement exists to avoid. Two rows is the least that leaves
+/// one on each side.
+///
+/// **Measured against the frame, not against the region the head is painted into.** The owner
+/// bounds the tail by this head's height, so a fit decision that read the shrunken region
+/// would be a fixpoint: a shorter region drops the wordmark, a shorter head allows a longer
+/// tail, and a longer tail shortens the region again. See [`WelcomeView::head_rows`].
 pub const WORDMARK_MIN_HEIGHT: u16 = 20;
 
 /// The one-row brand used when the wordmark does not fit.
@@ -657,7 +667,7 @@ impl WelcomeView {
         Line::from(spans)
     }
 
-    /// Every row this screen draws at `width` by `height`, already positioned.
+    /// Every row this screen draws above the prompt at `width` by `height`, positioned.
     ///
     /// Public because it is the assertable surface: a claim about rows is readable
     /// where the same claim about cells is not, and the off-screen buffer test then
@@ -670,34 +680,42 @@ impl WelcomeView {
         self.lines_in(width, height, height)
     }
 
-    /// How many rows [`Self::block`] would occupy at `width` on a `frame`-row terminal.
+    /// How many rows [`Self::head`] would occupy at `width` on a `frame`-row terminal.
     ///
-    /// The owner calls this *before* it splits the frame, because the tail that lifts the
-    /// prompt is half the slack the block leaves over — so the block's height is an input to
-    /// the layout rather than an output of it. Measured by building the block rather than
-    /// counted from a constant: a constant would be a second copy of the composition, and the
-    /// copy that drifted would put the input a row off centre with nothing to notice it.
+    /// The owner calls this *before* it splits the frame, because the tail that centres the
+    /// prompt is bounded by the rows the head needs — so the head's height is an input to the
+    /// layout rather than an output of it. Measured by building the head rather than counted
+    /// from a constant: a constant would be a second copy of the composition, and the copy
+    /// that drifted would put the input a row off centre with nothing to notice it.
     #[must_use]
-    pub fn block_rows(&self, width: u16, frame: u16) -> u16 {
-        u16::try_from(self.block(width, frame).len()).unwrap_or(u16::MAX)
+    pub fn head_rows(&self, width: u16, frame: u16) -> u16 {
+        u16::try_from(self.head(width, frame).len()).unwrap_or(u16::MAX)
     }
 
-    /// The block bottom-anchored in a `region`-row area, its fit decided by `frame`.
+    /// How many rows [`Self::foot`] would occupy at `width`.
     ///
-    /// **Bottom-anchored rather than centred, and the owner is why.** The composite a reader
-    /// sees is block, strip, prompt — so the block has to sit directly on top of the strip,
-    /// and the rows that centre the composite belong *above* it. The owner sizes this region
-    /// to the block plus the upper half of the slack and takes the lower half as a tail below
-    /// the prompt, so padding to the bottom here is exactly what puts the whole composite on
-    /// the frame's middle. Centring within the region instead would split the upper half in
-    /// two and open a gap between the block and the strip, which is the "two blocks a third
-    /// of a screen apart" reading this arrangement exists to avoid.
+    /// No `frame` argument, and the asymmetry with [`Self::head_rows`] is real: nothing in the
+    /// foot degrades by height. The wordmark does, which is the whole reason the head has to
+    /// be measured against the frame rather than the region it lands in.
+    #[must_use]
+    pub fn foot_rows(&self, width: u16) -> u16 {
+        u16::try_from(self.foot(width).len()).unwrap_or(u16::MAX)
+    }
+
+    /// The head bottom-anchored in a `region`-row area, its fit decided by `frame`.
+    ///
+    /// **Bottom-anchored rather than centred, and the owner is why.** What a reader sees above
+    /// the input is head, strip, prompt — so the head has to sit directly on top of the strip,
+    /// and the rows that push the band down to the middle belong *above* it. Centring within
+    /// the region instead would split those rows in two and open a gap between the head and
+    /// the strip, which is the "two blocks a third of a screen apart" reading this arrangement
+    /// exists to avoid.
     ///
     /// `frame` rather than `region` decides the wordmark, for the reason
-    /// [`WORDMARK_MIN_HEIGHT`] records: the region is derived from the block's height, so a
-    /// block whose height depended on the region would be a fixpoint.
+    /// [`WORDMARK_MIN_HEIGHT`] records: the region is derived from the head's height, so a
+    /// head whose height depended on the region would be a fixpoint.
     fn lines_in(&self, width: u16, region: u16, frame: u16) -> Vec<Line<'static>> {
-        let body = self.block(width, frame);
+        let body = self.head(width, frame);
         let leading = usize::from(region).saturating_sub(body.len());
         let mut lines = Vec::with_capacity(leading + body.len());
         lines.extend(std::iter::repeat_n(
@@ -708,8 +726,11 @@ impl WelcomeView {
         lines
     }
 
-    /// The rows the screen states, with no positioning padding.
-    fn block(&self, width: u16, height: u16) -> Vec<Line<'static>> {
+    /// What the screen *is*: the brand, and the facts that identify this checkout.
+    ///
+    /// The half that goes above the prompt, and it is short on purpose — see
+    /// [`Self::foot`] for why the rest goes below.
+    fn head(&self, width: u16, height: u16) -> Vec<Line<'static>> {
         let mut body = Vec::new();
         if Self::wordmark_fits(width, height) {
             let indent = usize::from(width.saturating_sub(WORDMARK_WIDTH)) / 2;
@@ -734,7 +755,39 @@ impl WelcomeView {
             }
         }
 
-        body.push(padded("", width, self.context.surface()));
+        body
+    }
+
+    /// How to reach everything else: the lead line, the optional tip, and the hint grid.
+    ///
+    /// # These rows are below the prompt, and that is what puts the prompt in the middle
+    ///
+    /// Every row this screen states above the input is a row the input sits further from the
+    /// centre of the frame, and the arithmetic is unforgiving: the owner can only centre the
+    /// band if the rows above it fit in half the frame minus the strip. With all fourteen rows
+    /// above, half of a twenty-four-row pane is twelve and the block alone needed fifteen — so
+    /// on the shortest common terminal the band could not reach the middle *at any* tail
+    /// length. Measured at 120x32 the band landed at rows 23–26 of 32 with fourteen dead rows
+    /// under it, which is what was reported: an input box pinned near the bottom.
+    ///
+    /// Splitting is what makes it reachable rather than merely closer. The head is nine rows
+    /// (six of letterform, a spacer and two facts), so the rows above the band are
+    /// `9 + 1` — inside half of twenty-four — and the band centres exactly from there up.
+    ///
+    /// The split is also the reference layout. `opencode` puts its logo above the input and
+    /// its `tab agents` / `ctrl+alt+l commands` hint row and its tip line *below*, and the
+    /// reason is the same one that governs every row on this surface: the brand answers "what
+    /// is this", which a reader wants before they type, and the hints answer "what else can I
+    /// do", which they want after. Reading order and centring want the same arrangement.
+    ///
+    /// Nothing is cut to achieve it. All three groups still render, the tip still toggles, and
+    /// the grid still degrades by column count — they are simply on the other side of the
+    /// input, where the rows were dead anyway.
+    fn foot(&self, width: u16) -> Vec<Line<'static>> {
+        // The prompt's own spacer row is inside the band and carries the band's background, so
+        // this blank is the first row of the *body* surface below the composer. Without it the
+        // lead line sits flush against the box.
+        let mut body = vec![padded("", width, self.context.surface())];
         body.push(self.command_row(width));
 
         if self.tips_visible {
@@ -760,18 +813,44 @@ impl WelcomeView {
 
         body
     }
+
+    /// Draw the rows that belong below the prompt into `area`, top-anchored.
+    ///
+    /// Top-anchored, not centred in the region: the lead line has to read as belonging to the
+    /// input directly above it, and a hint group floating in the middle of the lower third
+    /// reads as a third block on the screen. Clipped from the bottom when the region is short,
+    /// which drops the slash row before the key row for the reason [`Self::grid`] records.
+    ///
+    /// A separate entry point rather than a taller [`Component::render`] area, because the two
+    /// halves are on opposite sides of rows the session owns — the status strip and the prompt
+    /// band — so there is no single `Rect` that could carry both.
+    pub fn render_foot(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        fill(frame.buffer_mut(), area, self.context.surface());
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let lines = self
+            .foot(area.width)
+            .into_iter()
+            .take(usize::from(area.height))
+            .collect::<Vec<_>>();
+        Paragraph::new(lines)
+            .style(self.context.surface())
+            .render(area, frame.buffer_mut());
+    }
 }
 
 impl Component for WelcomeView {
+    /// Draws the head only. The owner draws the rest with [`Self::render_foot`].
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
         fill(frame.buffer_mut(), area, self.context.surface());
         if area.width == 0 || area.height == 0 {
             return;
         }
         // `frame.area().height`, not `area.height`: the owner shrank this region by the tail
-        // it computed from this block's own height, so reading the region back would let a
-        // block that lost the wordmark earn a longer tail and lose it again. The frame is the
-        // one height both sides can agree on. See `Self::block_rows`.
+        // it computed from this head's own height, so reading the region back would let a
+        // head that lost the wordmark earn a longer tail and lose it again. The frame is the
+        // one height both sides can agree on. See `Self::head_rows`.
         let frame_height = frame.area().height;
         let lines = self
             .lines_in(area.width, area.height, frame_height)

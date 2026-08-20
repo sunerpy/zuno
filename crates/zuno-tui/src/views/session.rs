@@ -192,41 +192,49 @@ const PROMPT_PLACEHOLDER: &str = "ask anything, or / for commands";
 /// "truncated" to a reader.
 const SIDEBAR_GAP_COLS: u16 = 1;
 
-/// The rows below the prompt that put the empty state's composite on the frame's middle.
+/// The rows below the prompt that put the empty state's **input band** on the frame's middle.
 ///
-/// Only ever non-zero while the transcript is empty. `content` is the welcome block's own
-/// height, from [`crate::views::welcome::WelcomeView::block_rows`], and `body_max` is what the
-/// body region would be with no tail at all — so `body_max - content` is the whole slack the
-/// composite has to spend, and half of it below the prompt is what balances the half the
-/// block leaves above itself.
+/// Only ever non-zero while the transcript is empty. `head` is the welcome screen's own height
+/// above the input, from [`crate::views::welcome::WelcomeView::head_rows`], and `body_max` is
+/// what the body region would be with no tail at all.
 ///
-/// # Why this is exact rather than capped
+/// # What is centred is the band, not the composite, and that is the third revision
 ///
-/// The previous version halved `body_max` — the *region*, not the slack — and then capped the
-/// result at six rows. Both were wrong in the same direction. Measured at 120×32 it produced a
-/// six-row tail against an eighteen-row block, leaving one blank row above the brand and nine
-/// dead rows below the prompt: the screen was still weighted to the top, which is what was
-/// reported. Halving the slack instead makes the arithmetic close:
+/// The previous version halved the slack the *composite* had — block, strip and prompt as one
+/// object — and balanced that. The arithmetic was exact and the screen was still wrong,
+/// because a composite whose top nine-tenths is text puts the input near its bottom: measured
+/// at 120×32 the band landed on rows 23–26 of 32 with fourteen dead rows below it, which is
+/// what was reported for the third time. "Centre the input box" is a claim about the band, so
+/// the band is what this balances:
 ///
 /// ```text
-/// gap_above = body_max - tail - content = (content + slack) - slack/2 - content = ⌈slack/2⌉
-/// gap_below = tail                                                              = ⌊slack/2⌋
+/// height = above + band + tail        (the whole frame, by definition)
+/// tail   = (height - band) / 2   ⟹    above = ⌈(height - band) / 2⌉
 /// ```
 ///
-/// so the two differ by at most the odd row, whatever the frame. The cap went with the
-/// halving: it existed because a block that grew with the terminal made an uncapped tail float
-/// the input absurdly high, and the block is now a fixed fourteen rows above the wordmark
-/// threshold. A fifty-row frame therefore spends sixteen rows above and fifteen below a
-/// nineteen-row composite, which reads as a centred card rather than as a misplaced composer.
+/// so the rows above the band and the rows below it differ by at most the odd row, whatever
+/// the frame and whatever the band's height. That last clause is what makes growth safe: the
+/// band and the tail move in opposite directions by the same amount, so a prompt growing from
+/// four rows to ten stays centred the whole way.
 ///
-/// # The body cannot be starved, and it is the halving that guarantees it
+/// # The head bounds it, and that is the only thing that can push the band off centre
 ///
-/// `tail <= body_max / 2`, so the body keeps `⌈body_max / 2⌉` — at least one row whenever
-/// `body_max` is at least one, and zero only when the chrome already took the whole frame.
-/// That is what holds at 20×10, where `Min(1)` would otherwise be starved by a `Length` tail.
-/// When the block is *taller* than `body_max` the subtraction saturates to zero and the tail
-/// vanishes, which is the right answer: a frame that cannot hold the block has nothing to
-/// centre.
+/// The rows above the band are not free: the head and the status strip live there, so the tail
+/// cannot exceed `body_max - head` without clipping the wordmark. Both terms are taken and the
+/// smaller wins. With a nine-row head the centring term is the smaller one from twenty-four
+/// rows up — every common pane — and the head term binds only below that, where the frame
+/// genuinely cannot hold both. Clipping a wordmark mid-glyph reads as a rendering fault, so on
+/// those frames the band sits slightly low rather than the brand being cut.
+///
+/// # The body cannot be starved, and it is the head term that guarantees it
+///
+/// `tail <= body_max - max(head, 1)`, so the body keeps at least `max(head, 1)` rows whenever
+/// `head <= body_max`, and when the head is *taller* than the region the subtraction saturates
+/// to zero and the tail vanishes — the right answer, since a frame that cannot hold the head
+/// has nothing to arrange. Either way `body >= 1` whenever `body_max >= 1`, which is what
+/// holds at 20×10 where `Min(1)` would otherwise be starved by a `Length` tail. The `max(1)`
+/// is load-bearing rather than defensive: without it a head measured as zero rows would let
+/// the tail take the entire region.
 ///
 /// A fourth band rather than moving the prompt out of the split: the order
 /// body / status / prompt is what every other assertion about this screen measures from, and
@@ -235,14 +243,16 @@ const SIDEBAR_GAP_COLS: u16 = 1;
 /// layout the moment a message arrives — which is what makes this cost nothing in the state
 /// the user spends their time in.
 ///
-/// This is *not* a per-keystroke reflow: the tail is a function of the frame, of the block and
+/// This is *not* a per-keystroke reflow: the tail is a function of the frame, of the band and
 /// of whether the transcript is empty. Typing into the prompt changes the band's height, and
 /// the tail follows it, but nothing here re-measures per character.
-const fn welcome_tail_rows(empty: bool, body_max: u16, content: u16) -> u16 {
+fn welcome_tail_rows(empty: bool, height: u16, band: u16, body_max: u16, head: u16) -> u16 {
     if !empty {
         return 0;
     }
-    body_max.saturating_sub(content) / 2
+    let centred = height.saturating_sub(band) / 2;
+    let room = body_max.saturating_sub(head.max(1));
+    centred.min(room)
 }
 
 /// Columns the transcript region keeps once the ambient sidebar has taken its own.
@@ -1203,14 +1213,38 @@ impl Component for SessionScreen {
         }
 
         self.status.render(frame, status);
-        // The centring band carries the body's surface, so the frame has one background from
-        // top to bottom. Unpainted it kept ratatui's `Color::Reset` and rendered as the
-        // *terminal's* background, which put a colour seam under the composer on any theme whose
-        // panel is not the user's terminal colour — and made "where does the composite end" a
-        // question the frame could not be asked, since an unpainted row is indistinguishable
-        // from a deliberately plain one. See `the_welcome_composite_is_centred_on_the_frame`,
-        // which locates the composite's bottom edge by exactly that difference.
+        // Either way the centring band is painted, so the frame has one background from top to
+        // bottom. Unpainted it kept ratatui's `Color::Reset` and rendered as the *terminal's*
+        // background, which put a colour seam under the composer on any theme whose panel is
+        // not the user's terminal colour — and made "where does the band end" a question the
+        // frame could not be asked, since an unpainted row is indistinguishable from a
+        // deliberately plain one. See `the_prompt_band_is_centred_on_the_frame`, which locates
+        // the band's bottom edge by exactly that difference.
+        //
+        // Empty means these rows carry the far half of the welcome surface — the lead line, the
+        // tip and the hint grid — which fills them itself. The `empty` guard is the same one
+        // the head is drawn under, and it is what stops a hint block from surviving under a
+        // transcript.
         crate::views::fill(frame.buffer_mut(), tail, self.context.surface());
+        if empty {
+            // Narrowed by `welcome_width`, the same function the head's region is narrowed by,
+            // and for a reason that is visible rather than structural: the two halves of this
+            // surface centre their rows independently, so a foot centred on the full frame
+            // while the head is centred inside the sidebar's remainder puts the wordmark and
+            // the lead line on different axes. Measured at 120x32 with the sidebar drawn, the
+            // brand began at column 25 and `type / for commands` at column 39 — fourteen
+            // columns apart, which reads as two unrelated blocks rather than one screen.
+            //
+            // The sidebar itself is not drawn here — it belongs to `body` — so this narrows
+            // only to borrow the same axis, and the columns it gives up were filled above.
+            self.welcome.render_foot(
+                frame,
+                Rect {
+                    width: welcome_width(tail.width, self.sidebar_visible),
+                    ..tail
+                },
+            );
+        }
         // The whole band is painted first, so the spacer row and the right inset carry the
         // prompt's own background rather than whatever the previous frame left there. `element`
         // rather than `text`: they differ only in background, and `text`'s is the surface the
@@ -1286,14 +1320,14 @@ impl SessionScreen {
         let empty = self.transcript.transcript().messages().is_empty();
         // At the *frame* height and at the sidebar-adjusted width — the same pair
         // `WelcomeView::render` decides the wordmark from. See `welcome_tail_rows`.
-        let content = if empty {
+        let head = if empty {
             self.welcome
-                .block_rows(welcome_width(width, self.sidebar_visible), height)
+                .head_rows(welcome_width(width, self.sidebar_visible), height)
         } else {
             0
         };
         let body_max = height.saturating_sub(STATUS_ROWS.saturating_add(band));
-        (band, welcome_tail_rows(empty, body_max, content))
+        (band, welcome_tail_rows(empty, height, band, body_max, head))
     }
 
     /// Report whether the MCP projection moved since this screen last painted.
