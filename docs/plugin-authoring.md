@@ -115,6 +115,65 @@ let spec = PluginProcessSpec::new("my-plugin", "/usr/local/bin/my-plugin")
     .env("MY_PLUGIN_LOG", "debug");
 ```
 
+### Install it: drop the executable in a directory
+
+No manifest, no config entry, no install step. Put an executable file in
+`plugin/` or `plugins/` under any configuration directory and it is a plugin:
+
+```sh
+install -m 755 ./my-plugin ~/.zuno/plugin/my-plugin     # every project
+install -m 755 ./my-plugin .zuno/plugin/my-plugin       # this project only
+```
+
+The scan matches the JavaScript tier's: both child directories, one level deep,
+**not** recursive, sorted by filename, and symlinks are followed — a symlink into
+a build directory is the normal way to iterate on a plugin.
+
+What counts as a candidate:
+
+| | |
+|---|---|
+| **Unix** | the executable bit, for any user (`0o111`). It is what `PATH` lookup itself uses, so no extension convention is imposed on a language that has no build step. |
+| **Windows** | there is no executable bit, so the extension carries the meaning: `.exe`, `.com`, `.bat`, `.cmd`. `.ps1` is **excluded** — it needs an interpreter argument the host cannot infer. |
+
+`.js` and `.ts` are excluded on every platform even when executable. They belong
+to the JavaScript tier, which speaks a different protocol; a file that is both a
+script and executable would otherwise be started twice. Name a JavaScript
+process-tier plugin without an extension and give it a shebang, as
+[`examples/js_plugin`](../examples/js_plugin) does.
+
+The plugin's name in diagnostics is the file stem, until `plugin.initialize`
+returns a manifest id. A plugin that dies before answering has no id, and this is
+what lets the failure still name a file you can find.
+
+This tier is **on by default**, unlike the JavaScript tier. A discovered
+executable needs no runtime installed and no package fetched, so there is no cost
+left to consent to. Turn it off with:
+
+```json
+{ "plugin_runtime": { "process": false } }
+```
+
+`--pure` disables it too: that flag means no external plugins, whatever the tier.
+
+### The Go example
+
+[`examples/go_plugin/main.go`](../examples/go_plugin/main.go) — standard library
+only, no module required:
+
+```sh
+go build -o ~/.zuno/plugin/go-example ./examples/go_plugin
+```
+
+### The JavaScript example
+
+[`examples/js_plugin`](../examples/js_plugin) — no dependencies, and no build
+step, because the shebang is what makes it runnable:
+
+```sh
+install -m 755 examples/js_plugin ~/.zuno/plugin/js-example
+```
+
 ### The Rust example
 
 A complete, compiling plugin lives at
@@ -169,11 +228,35 @@ initialize, then the hook and tool cases you declare — so a protocol mistake
 surfaces in your own test run rather than as a disabled plugin in someone's
 session. `examples/rust_plugin.rs` uses it; copy that shape.
 
+The SDK is **not published to any registry**: this workspace is `publish = false`.
+Vendor `crates/zuno-plugin-sdk` or copy the example, and for Go and JavaScript
+copy the example outright — those two speak the wire directly and depend on
+nothing.
+
+### What this tier does not support
+
+Stated plainly, because a capability that half-works costs more than one that is
+absent:
+
+| not supported | why |
+|---|---|
+| the `auth` hook | the Rust SDK rejects the name at construction (`crates/zuno-plugin-sdk/src/lib.rs:112`), and `JsonRpcPlugin` implements only `manifest`, `tools`, and `call`. A process plugin cannot contribute a credential loader. |
+| the `provider` hook | same rejection. A process plugin cannot contribute a model list. |
+| interactive flows | the transport is response-only. A frame from the plugin that is not a reply to a host request is logged and dropped (`crates/zuno-plugin/src/jsonrpc.rs:446`), so a plugin cannot prompt the user, request a terminal, or call back into the host. |
+| sub-turn orchestration | a plugin cannot start a turn, spawn an agent, or drive the loop. Hooks observe and amend the data they are handed. |
+
+Those four are the JavaScript tier's, and only the JavaScript tier's. Everything
+else in the hook table below works here.
+
 ## The hooks
 
-Every tier dispatches the same 21 hooks, in upstream declaration order. The table
-is generated from `zuno_plugin::hook_support()`, whose exhaustive mapping requires
-every advertised hook to name its production lifecycle trigger.
+Every tier dispatches from the same 21 hooks, in upstream declaration order. The
+table is generated from `zuno_plugin::hook_support()`, whose exhaustive mapping
+requires every advertised hook to name its production lifecycle trigger.
+
+Rows 5 (`auth`) and 6 (`provider`) are JavaScript-only; see
+[what this tier does not support](#what-this-tier-does-not-support) above. The
+other 19 are dispatched to every tier.
 
 <!-- generated:BEGIN plugin-hooks -->
 | hook | JavaScript / JSON-RPC name | production trigger |

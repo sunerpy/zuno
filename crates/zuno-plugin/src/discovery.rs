@@ -60,6 +60,19 @@ pub struct DiscoveredPlugin {
     pub origin: PluginOrigin,
 }
 
+/// One executable found in a scanned directory, ready for the process tier.
+///
+/// Carries a `name` distinct from `program` because the process tier reports
+/// failures against the entry a user can find on disk. A plugin that dies before
+/// `plugin.initialize` never returns a manifest id, and "plugin `` failed" is not
+/// something anybody can act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredProcessPlugin {
+    pub name: String,
+    pub program: PathBuf,
+    pub scope: PluginScope,
+}
+
 /// Failure while resolving or scanning plugin declarations.
 #[derive(Debug, thiserror::Error)]
 pub enum DiscoveryError {
@@ -119,6 +132,101 @@ pub fn discover_plugins(
         }
     }
     Ok(plugins)
+}
+
+/// Scan both auto-plugin directories for executables the process tier can spawn.
+///
+/// Mirrors [`discover_plugins`]'s shape — same two child directories, single level,
+/// sorted by filename, symlinks accepted — and differs only in what counts as a
+/// candidate. `.js` and `.ts` are excluded rather than merely unmatched: they are
+/// the JavaScript tier's, and a file that is both a script and executable must not
+/// be started twice.
+///
+/// # Errors
+/// Returns [`DiscoveryError::Scan`] when an existing directory cannot be read.
+pub fn discover_process_plugins(
+    directories: &[ConfigDirectory<'_>],
+) -> Result<Vec<DiscoveredProcessPlugin>, DiscoveryError> {
+    let mut plugins = Vec::new();
+    for directory in directories {
+        for child in ["plugin", "plugins"] {
+            let path = directory.path.join(child);
+            for program in scan_executables(&path)? {
+                let Some(name) = program.file_stem().and_then(|stem| stem.to_str()) else {
+                    continue;
+                };
+                plugins.push(DiscoveredProcessPlugin {
+                    name: name.to_owned(),
+                    program,
+                    scope: directory.scope,
+                });
+            }
+        }
+    }
+    Ok(plugins)
+}
+
+fn scan_executables(path: &Path) -> Result<Vec<PathBuf>, DiscoveryError> {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(DiscoveryError::Scan {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| DiscoveryError::Scan {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let file = entry.path();
+        if is_script(&file) {
+            continue;
+        }
+        // `fs::metadata` and not `entry.metadata()`: the former follows symlinks, and a
+        // symlink into a build directory is how a plugin author iterates. A broken link
+        // resolves to nothing executable, so it is not a candidate either way.
+        let Ok(metadata) = fs::metadata(&file) else {
+            continue;
+        };
+        if metadata.is_file() && is_executable(&file, &metadata) {
+            files.push(file);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// The executable bit is the signal: it is what `PATH` lookup itself uses.
+///
+/// No manifest and no extension convention, because requiring either would mean a
+/// plugin author in a language with no build step could not ship one file.
+#[cfg(unix)]
+fn is_executable(_path: &Path, metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+/// Windows has no executable bit, so the extension carries the same meaning.
+///
+/// This is the `PATHEXT` set minus the script hosts: a `.ps1` needs an interpreter
+/// argument that `Command::new` cannot infer, so it is left out rather than spawned
+/// in a way that would fail at run time.
+#[cfg(windows)]
+fn is_executable(path: &Path, _metadata: &fs::Metadata) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "exe" | "com" | "bat" | "cmd"
+            )
+        })
 }
 
 fn resolve_plugin_spec(

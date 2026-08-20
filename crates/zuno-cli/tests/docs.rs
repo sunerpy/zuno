@@ -1150,6 +1150,41 @@ fn docs_plugin_guide_matches_the_hooks_and_the_example_the_host_ships() {
             "examples/rust_plugin.rs no longer uses {symbol}, which the guide documents"
         );
     }
+
+    // Every example the guide offers must exist. A guide that names a file nobody
+    // shipped is the same defect as an API nobody can reach, one layer up.
+    for relative in ["examples/go_plugin/main.go", "examples/js_plugin"] {
+        let path = workspace_root().join(relative);
+        assert!(
+            path.is_file(),
+            "the guide points at {}, which must exist",
+            path.display()
+        );
+        contains_all("docs/plugin-authoring.md", &[relative]);
+    }
+
+    // The guide must keep saying how a process plugin is installed, and must keep
+    // refusing to promise the four capabilities this tier does not have. Both are
+    // load-bearing: the first is the only way in, and the second is what stops an
+    // author building against `auth` or an interactive prompt that cannot work.
+    contains_all_in(
+        &section(
+            "docs/plugin-authoring.md",
+            "## Tier 3 — Out-of-process, over JSON-RPC",
+        ),
+        "the out-of-process tier section",
+        &[
+            "plugin/",
+            "executable bit",
+            "\"process\": false",
+            "--pure",
+            "the `auth` hook",
+            "the `provider` hook",
+            "interactive flows",
+            "sub-turn orchestration",
+            "publish = false",
+        ],
+    );
 }
 
 // ---------------------------------------------------------------------------
