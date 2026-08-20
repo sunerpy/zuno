@@ -16,7 +16,7 @@
 
 .PHONY: all help \
 		fmt fmt-check fmt-rust fmt-rust-check fmt-oxfmt fmt-oxfmt-check \
-		lint check test test-fast hook-fmt hook-test hooks ci \
+		lint check test test-par test-fast hook-fmt hook-test hooks ci \
 		deny metadata \
         build release release-target package smoke smoke-artifact \
         clean
@@ -87,6 +87,17 @@ check:
 
 test:
 	$(CARGO) test --workspace $(OFFLINE)
+
+# Same tests as `test`, run concurrently across suites. A LOCAL FAST PATH ONLY:
+# `ci` still depends on `test`, so the gate is unchanged and this cannot make CI
+# green by running less.
+#
+# `cargo test` builds in parallel but runs its 224 suites one at a time. With a
+# warm target that build is a 0.7s no-op and the run is 219.9s, so the loop is
+# bound by serialised execution. This target reaches the same 4280 passed / 0
+# failed / 8 ignored in 57.6s median. See docs/perf-methodology.md.
+test-par:
+	./scripts/test-parallel.sh
 
 test-fast:
 	$(CARGO) test -p $(CLI_CRATE) --test docs --test release_surface $(OFFLINE)
@@ -205,6 +216,7 @@ help:
 	@echo "  lint            cargo clippy --workspace --all-targets -D warnings"
 	@echo "  check           cargo check --workspace --all-targets"
 	@echo "  test            cargo test --workspace"
+	@echo "  test-par        same tests, concurrent across suites (local fast path)"
 	@echo "  test-fast       focused docs/release tests + installer syntax"
 	@echo "  hook-fmt        commit-time formatting gate"
 	@echo "  hook-test       push-time fast test gate"

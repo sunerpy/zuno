@@ -829,6 +829,213 @@ or completing, or a token-usage update resets the G4 progress watchdog. A
 heartbeat, repeated identical status, or bytes arriving on a stream that never
 completes a turn do not count as progress.
 
+## Local build and test loop
+
+Measured on 2026-08-20 on the 32-core / 61 GB development host, `cargo 1.96.0`.
+Every figure below is wall-clock over at least three runs reported as
+min / median / max with the max/min ratio, on the same target directory state.
+
+### Where the time actually goes
+
+The starting hypothesis was link time and disk I/O: `target/debug` was 155 GB and
+a single test binary was 197 MB. **That hypothesis was wrong**, and the
+measurement that refuted it is the first table.
+
+| probe | runs (s) | min / median / max | max/min |
+| --- | --- | --- | --- |
+| warm `cargo build --workspace` (no-op) | 0.352; 0.376; 0.410 | 0.352 / 0.376 / 0.410 | 1.1648x |
+| warm `cargo test --workspace --no-run` | 0.705 | — | — |
+| warm `cargo test --workspace` | 219.876 | — | — |
+
+A warm build is a **0.7 s no-op** while the same warm `cargo test` takes
+**219.9 s**. Compilation is not the cost; running the tests is. Cargo builds test
+binaries in parallel and then runs the resulting suites strictly one at a time.
+The 224 suites sum to 206.1 s of in-harness time — so ~94% of the wall-clock is
+serialised execution, and the top 10 suites alone are 143.3 s of it (70%). The
+slowest single suite, `crates/zuno-testkit/tests/representation.rs`, is 46.9 s
+across 4 tests; it is the D0 measurement suite, so its cost is the measurement
+itself.
+
+Compilation was then measured on its own, from a workspace-cold state produced by
+`cargo clean -p` over all 36 workspace crates (registry dependencies stay warm,
+which is what a branch switch or a `touch` on a low crate actually resembles):
+
+| probe | runs (s) | min / median / max | max/min |
+| --- | --- | --- | --- |
+| L1 — touch one test file, rebuild that suite | 1.143; 1.033; 1.067; 1.038; 1.045 | 1.033 / 1.045 / 1.143 | 1.1065x |
+| L2 — touch `zuno-error` (30 dependents), all suites | 12.734; 13.663; 13.969 | 12.734 / 13.663 / 13.969 | 1.0970x |
+| L3 — workspace-cold, 36 crates + 186 test binaries | 29.551; 33.723; 27.878 | 27.878 / 29.551 / 33.723 | 1.2097x |
+
+A single relink is 1.0 s and a full workspace-cold rebuild of every test binary
+is 29.6 s. `zuno-error` and `zuno-process` have the largest fan-out in the graph
+at 30 transitive workspace dependents, so L2 is the worst realistic edit, and it
+costs 13.7 s. Decomposing L3 bounds the remaining structural lever:
+
+| stage of L3 | runs (s) | min / median / max | max/min |
+| --- | --- | --- | --- |
+| `cargo check --workspace --all-targets` (analysis only) | 21.999; 12.479; 13.643 | 12.479 / 13.643 / 21.999 | 1.7630x |
+| `cargo build --workspace` (libs + bins, no test binaries) | 17.946; 17.953; 17.775 | 17.775 / 17.946 / 17.953 | 1.0100x |
+
+So of a 29.6 s cold rebuild, 17.9 s is the libraries and the `zuno` binary, and
+linking all **186 test binaries adds 11.6 s**. That figure is the ceiling on
+consolidating the 141 integration-test files into fewer, larger binaries — see
+*Rejected* below.
+
+### Adopted: `split-debuginfo = "unpacked"` for dev and test
+
+`line-tables-only` was already set, but `size -A` on a 196 MB test binary showed
+83.0 MB still in `.debug*` sections against 49.8 MB of `.text` — 42% of every
+binary is DWARF the linker must copy. `unpacked` leaves it in `.dwo` sidecars
+instead.
+
+| probe | before (s) | after (s) | change |
+| --- | --- | --- | --- |
+| L3 workspace-cold | 27.878 / 29.551 / 33.723 (1.2097x) | 26.661 / 26.734 / 27.007 (1.0130x) | **−9.5% median**, and the spread collapses |
+| L1 single relink | 0.993 / 1.047 / 19.763 | 0.954 / 0.961 / 20.378 | **−8.2% median** |
+| `target/debug/zuno` | 196.3 MB | 168.6 MB | −14.1% |
+| 186 test binaries, total | 6.98 GB | 5.52 GB | −20.9% |
+
+The L1 rows each carry one ~20 s first run: the first build after any profile
+change rebuilds the workspace. Both columns share that shape, so the medians are
+comparable.
+
+The tighter L3 spread is worth as much as the median: 1.2097x → 1.0130x means the
+cold rebuild became predictable, not just faster.
+
+**The `line-tables-only` panic behaviour survives**, verified rather than
+assumed. Forcing a real panic under the new profile still reports
+`panicked at crates/zuno-paths/src/project.rs:410:9`, and with `RUST_BACKTRACE=full`
+43 of 47 frames resolve to `file:line` including this workspace's own frames. The
+cost is 79,973 `.dwo` sidecar files totalling 0.28 GB — cheap against the 1.46 GB
+removed from the binaries, but it is a large file count, and `cargo clean`
+removes them with everything else.
+
+Release behaviour is untouched: the profile keys are `[profile.dev]` and
+`[profile.test]` only.
+
+### Adopted: `make test-par` — run the suites concurrently
+
+`scripts/test-parallel.sh` builds with `--no-run`, then launches the resulting
+test binaries concurrently, then runs doctests through cargo. It is an **additive
+local fast path**: `make ci` still depends on `make test`, so the gate is
+unchanged and this cannot make CI green by running less.
+
+Matched pair, both measured on the final adopted profile:
+
+| runner | runs (s) | min / median / max | max/min | result |
+| --- | --- | --- | --- | --- |
+| `cargo test --workspace` | 196.258; 197.209; 194.626 | 194.626 / 196.258 / 197.209 | 1.0133x | 4280 passed / 0 failed / 8 ignored |
+| `make test-par` | 53.20; 53.15; 53.86 | 53.15 / 53.20 / 53.86 | 1.0134x | 4280 passed / 0 failed / 8 ignored |
+
+**3.69x, with byte-identical test counts** — 224 harness summaries, the same 4280
+passes, 0 failures and 8 ignored in every run. The parallel floor is the 46.9 s
+`representation.rs` suite, which is why the scheduler is longest-first and caches
+per-suite durations in `target/test-parallel-durations.json`.
+
+Concurrency width was swept rather than guessed; all four configurations produced
+4280 / 0 / 8:
+
+| JOBS x THREADS | width | wall (s) |
+| --- | ---: | ---: |
+| 4 x 4 | 16 | 63.04 |
+| 8 x 4 | 32 | 58.61 |
+| 12 x 4 | 48 | 56.73 |
+| 16 x 2 | 32 | 54.37 |
+
+The default is `JOBS=8 THREADS=4`; both are environment overrides. Returns are
+flat past width 32 because the run is floored by its longest suite.
+
+**The script captures cargo's environment instead of assuming it**, and this is
+the load-bearing detail. A first version invoked the test binaries straight from
+a shell and three suites failed — `session_mutation`, `plugin_models`,
+`tool_turn`, 17 tests — each exhausting a 30 s "plugin did not connect back"
+budget. That reads like contention from over-parallelising, and it is not:
+
+| `session_mutation` suite | wall (s) | result |
+| --- | ---: | --- |
+| via `cargo test -p zuno-cli --test session_mutation` | 3.57 | 11 passed |
+| same binary, same cwd, plain shell | 31.21 | 3 failed |
+| same binary, under cargo's captured environment | 1.45 | 11 passed |
+
+The cause is `PATH`: cargo resolves mise **installs**, a bare shell inherits mise
+**shims** first, and a shim cannot be spawned directly by the host — the same
+failure `docs/plugin-authoring.md` records for shebang plugins. Cargo also
+exports `LD_LIBRARY_PATH` for the aws-lc-sys, libsqlite3-sys and jemalloc
+build-script outputs, plus `SSL_CERT_FILE` and `SSL_CERT_DIR`. The script
+therefore captures the real environment from a real cargo run through
+`CARGO_TARGET_<TRIPLE>_RUNNER` on every invocation, because `LD_LIBRARY_PATH`
+embeds build-script output hashes that move when a build script reruns.
+
+It also refuses to look successful without evidence: it fails if the number of
+suites that ran differs from the number built, if any suite produced no harness
+summary, or if zero tests passed. Doctests are a separate step for the same
+reason — `--no-run` does not build them and no test binary contains them, so
+omitting them would silently drop 31 tests.
+
+### Reclaimed: 105 GB of `target/debug`
+
+`target` was 158 GB, of which `target/debug/incremental` was 80 GB and
+`target/debug/deps` 73 GB. Of 1,156 executables in `deps`, **975 were stale** —
+artifacts from long-superseded builds — holding 53.2 GB. Pruning brought `target`
+to 53 GB and returned 77 GB of free space. Cargo never garbage-collects these, so
+this grows without bound; a periodic `cargo clean` is the only control.
+
+No build-time win is claimed for the pruning. L2 was 13.663 s median on the
+155 GB target and 12.633 s on the pruned one — a 7.5% difference against a
+1.0970x/1.178x spread, which is not separable from noise.
+
+### Rejected
+
+Each was measured, and the measurement is why it was rejected.
+
+- **`cargo test -p <crate>` for all 36 crates in parallel.** Exactly correct
+  (4280 / 0 / 8) and keeps cargo's environment for free, but **slower than
+  sequential: 284.570 s against 219.876 s.** Cargo holds an exclusive lock on the
+  build directory for the whole run, and all 36 invocations logged `Blocking
+  waiting for file lock on build directory`. This also rejects a shared
+  `CARGO_TARGET_DIR` across worktrees by the same mechanism: it would share the
+  cache and then serialise every build behind one lock.
+- **Stripping debuginfo to make spawns cheaper.** 43 suites spawn the 196 MB
+  `zuno` binary, so its size looked like a per-spawn cost. Three interleaved
+  rounds of 30 spawns each: full 196.3 MB binary 4.4 / 4.5 / 4.5 ms per spawn,
+  stripped 84.3 MB binary 5.1 / 5.1 / 4.9 ms. Spawn cost is **size-independent**
+  here — `mmap` does not read what is never touched.
+- **`codegen-units` tuning.** Forcing `codegen-units = 1`, which serialises
+  codegen completely, gave L3 of 28.547 / 29.222 / 42.114 (1.4753x) against the
+  default's 29.551 median. If codegen were the bottleneck this would have been
+  catastrophic; it is inside the spread. Raising it to 512 gave 40.221 and 28.288
+  over two runs — too few to report, and pointless once cgu=1 costs nothing.
+- **Disabling incremental.** `CARGO_INCREMENTAL=0` is genuinely faster cold —
+  L3 of 23.347 / 24.638 / 27.491 against 29.551 — but slower on the edit loop it
+  exists for: L1 median 1.236 s against 1.047 s with it on. The 80 GB was
+  accumulated garbage, not working set, so pruning keeps the edit-loop win without
+  the disk cost. Incremental stays on.
+- **Consolidating the 141 integration-test files into fewer binaries.** Bounded
+  above at **11.6 s** — the difference between a 29.6 s workspace-cold rebuild of
+  everything and a 17.9 s rebuild with no test binaries at all. Since the whole
+  cold rebuild is 29.6 s and the test *run* is 196 s, this is the wrong axis, and
+  it would mean restructuring 141 files. Not pursued.
+- **`mold`** and **`cargo-nextest`** are both absent from this host. `nextest` is
+  the productised form of `test-parallel.sh` and would be the better answer;
+  installing it was out of scope. `mold`'s status is unchanged from *Linker*
+  above: the toolchain default is already lld.
+
+### Effect on `make ci`
+
+| state | runs (s) | min / median / max | max/min |
+| --- | --- | --- | --- |
+| before | 254.167; 220.811; 199.689 | 199.689 / 220.811 / 254.167 | 1.2728x |
+| after | 237.469; 212.111; 198.004 | 198.004 / 212.111 / 237.469 | 1.1993x |
+
+**`make ci` is not measurably faster.** The medians differ by 8.700 s (3.9%),
+which is well inside both spreads, so the honest reading is no measurable change.
+That is expected: `make ci` is ~93% serialised test execution, and
+`split-debuginfo` only touches the build. `make ci` passed on every run in both
+states.
+
+The local loop is where the win lands: `make test-par` at 53.20 s against
+196.258 s for the same 4280 tests.
+
 ## Frozen threshold formulas
 
 The text between the markers is hashed by `zuno-testkit`. Changing it requires an
