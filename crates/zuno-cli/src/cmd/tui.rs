@@ -54,6 +54,7 @@ use zuno_tui::config::{ResolveOptions, ResolvedTuiConfig};
 use zuno_tui::keybind::{KeyDispatcher, Keymap};
 use zuno_tui::theme::{EnvironmentPalette, Mode, SystemThemeOutcome, ThemeRegistry};
 use zuno_tui::views::ViewContext;
+use zuno_tui::views::ambient::SessionTitle;
 use zuno_tui::views::dialog::DialogHost;
 use zuno_tui::views::external::{
     EditorCancellation, EditorProcess, EditorProcessLauncher, EditorRequest, ExternalEditor,
@@ -305,7 +306,7 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
     let driver_approval = Arc::clone(&approval);
     let driver_options = options.clone();
     let driver_environment = environment.clone();
-    let host = TurnHost::open_with_runtime_and_mcp(
+    let mut host = TurnHost::open_with_runtime_and_mcp(
         plan,
         environment,
         approval,
@@ -313,6 +314,18 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         SessionRunRegistry::new(),
         Some(mcp_catalog.clone()),
     )?;
+    // Seeded from the row the host already read, so a session resumed with `-s` shows its
+    // name on frame one instead of waiting for a turn that will never re-title it — the
+    // generator declines outright once a session is named.
+    let session_title = SessionTitle::new(host.session_title().map(str::to_owned));
+    host.set_title_sink(Arc::new(TitleProjectionSink {
+        projection: session_title.clone(),
+        wake: terminal_sender.clone(),
+    }));
+    // Copied before the host is moved into the turn driver. The id is what the hint
+    // printed after teardown has to name, and by then the host is gone — a driver task
+    // owns it and is aborted, not joined, so nothing survives to be asked.
+    let resumed_session = host.session_id().to_owned();
     let engine_sender = host.with_event_hooks(engine_sender);
     let plugins = host.plugin_runtime();
     let slash_commands = host
@@ -347,6 +360,7 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         .with_cancel_sink(cancel_sender)
         .with_selection_sink(selection_sender)
         .with_mcp_control(mcp_projection.clone(), mcp_toggle_sender)
+        .with_session_title(session_title)
         .with_catalog(catalog)
         .with_diagnostics_source(report_receiver)
         .with_edit_sink(pending_edits)
@@ -491,7 +505,67 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         outcome
     });
     drop(session);
+    println!("{}", resume_hint(&resumed_session));
     outcome.map_err(to_string)
+}
+
+/// The flag that reopens an existing session, as `command.rs` declares it.
+///
+/// Named rather than spelled at the call site so the hint and the parser cannot drift:
+/// a hint advertising a flag `TuiArgs` does not accept is worse than no hint, because
+/// the user pastes it and gets a parse error for a session that is intact.
+///
+/// `-s <id>` and not `-c`, although `-c` is shorter and reads like the obvious choice for
+/// "the one you just left". It is not equivalent: `--continue` resolves to the most
+/// recently updated *active session in the current directory*
+/// (`resolve_session`'s `ListQuery::directory(..).active_only().with_limit(1)`), so it
+/// names the session just left only while the user stays in that directory and nothing
+/// else touches a session there. Both conditions fail in ordinary use — a second terminal,
+/// or pasting the hint from a different `cd` — and when they fail `-c` silently reopens a
+/// *different* conversation, which is worse than an error. An explicit id is unambiguous
+/// from anywhere and cannot resolve to the wrong session.
+const RESUME_FLAG: &str = "-s";
+
+/// What to print once the alternate screen is gone, so the session can be reopened.
+///
+/// Written to stdout **after** teardown and never during the run. Inside raw mode the
+/// alternate screen owns the viewport, so this line would be drawn into a buffer the
+/// terminal discards on exit — visible for the frame it corrupts and gone afterwards.
+/// After `LeaveAlternateScreen` the primary buffer is back and the line lands in the
+/// user's scrollback, which is the only place a command they may want tomorrow is any
+/// use.
+///
+/// Unconditional because every TUI session has a persisted row by the time the screen
+/// opens: `resolve_session` either found one, continued one, or inserted one before
+/// `TurnHost` was returned, so there is no state in which the id names nothing. A
+/// session with no messages is still resumable — reopening it is how a user gets back
+/// to a prompt they abandoned.
+fn resume_hint(session_id: &str) -> String {
+    format!("resume this session: zuno {RESUME_FLAG} {session_id}")
+}
+
+/// Publishes a generated session name into the panel's projection and asks for a frame.
+///
+/// The composition root's half of [`super::turn::SessionTitleSink`]: `turn.rs` declares the
+/// trait so it stays free of view types, and this is the one place allowed to name both it
+/// and [`SessionTitle`].
+///
+/// The wake is not optional and not belt-and-braces. `SessionTitle::replace` moves state
+/// the render loop only reads when it draws, and the prelude runs *before* the model is
+/// called — so on a slow first token there may be no other event for seconds, and the name
+/// would sit in the projection unseen. The nudge is `try_send` with the result discarded,
+/// like every other wake on this path: a full queue already means a frame is coming, and a
+/// title must never block the turn that produced it.
+struct TitleProjectionSink {
+    projection: SessionTitle,
+    wake: mpsc::Sender<TerminalEvent>,
+}
+
+impl super::turn::SessionTitleSink for TitleProjectionSink {
+    fn publish(&self, title: &str) {
+        self.projection.replace(Some(title.to_owned()));
+        let _nudged = self.wake.try_send(TerminalEvent::Wake);
+    }
 }
 
 /// Where submitted prompts are remembered between runs.
@@ -1530,6 +1604,39 @@ mod tests {
                 .store(self.transcript.acquired_by("tui"), Ordering::SeqCst);
             Ok(Some(format!("{} edited", request.value)))
         }
+    }
+
+    #[test]
+    fn tui_the_exit_hint_names_the_session_just_left_with_a_flag_the_parser_accepts() {
+        // Given: the id a real host would have carried, in the shape `prefixed_id` mints.
+        let session_id = "ses_4f9c1d2e8a7b6c5d4e3f2a1b0c9d8e7f";
+
+        // When: the hint printed after teardown is composed.
+        let hint = resume_hint(session_id);
+
+        // Then: it names that exact session, not a placeholder or a truncation.
+        assert!(
+            hint.contains(session_id),
+            "the hint must carry the id a user has to paste; got {hint:?}"
+        );
+
+        // And: the whole command is copy-pasteable as written.
+        assert!(
+            hint.contains(&format!("zuno {RESUME_FLAG} {session_id}")),
+            "the hint must read as one runnable command; got {hint:?}"
+        );
+
+        // And: the flag is one `TuiArgs` really declares. Parsed rather than compared to
+        // a literal, because a literal would agree with itself after the flag was
+        // renamed — which is the only way this hint can fail while still looking right.
+        use clap::Parser as _;
+        let parsed = crate::command::Cli::try_parse_from(["zuno", RESUME_FLAG, session_id])
+            .expect("the hint's flag must be one the top-level parser accepts");
+        assert_eq!(
+            parsed.tui.session.as_deref(),
+            Some(session_id),
+            "the flag parsed, but not into the session slot"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

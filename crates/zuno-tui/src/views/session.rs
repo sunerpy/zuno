@@ -536,6 +536,13 @@ pub struct SessionScreen {
     shutdown: mpsc::Sender<TerminalEvent>,
     prompts: Option<mpsc::Sender<PromptSubmission>>,
     mcp_toggles: Option<mpsc::Sender<crate::views::picker::McpToggleRequest>>,
+    title: crate::views::ambient::SessionTitle,
+    /// The session-name generation this screen last painted.
+    ///
+    /// Kept for exactly the reason [`Self::mcp_generation`] below is, and against the same
+    /// failure: the name is published from the turn driver, so without a counter to compare
+    /// nothing reports `redraw` and the panel keeps the frame it already had.
+    title_generation: u64,
     mcp: crate::views::picker::McpProjection,
     /// The MCP generation this screen last painted.
     ///
@@ -725,6 +732,8 @@ impl SessionScreen {
             shutdown,
             prompts: None,
             mcp_toggles: None,
+            title: crate::views::ambient::SessionTitle::default(),
+            title_generation: 0,
             mcp: crate::views::picker::McpProjection::default(),
             mcp_generation: 0,
             census: Vec::new(),
@@ -831,6 +840,14 @@ impl SessionScreen {
         self.mcp_generation = projection.generation();
         self.mcp = projection;
         self.mcp_toggles = Some(toggles);
+        self
+    }
+
+    /// Install the live session-name projection the sidebar reads.
+    #[must_use]
+    pub fn with_session_title(mut self, title: crate::views::ambient::SessionTitle) -> Self {
+        self.title_generation = title.generation();
+        self.title = title;
         self
     }
 
@@ -1422,7 +1439,13 @@ impl Component for SessionScreen {
         // panel was their only reader; the info row reads `context_used` as well, so at 80
         // columns it would have reported a figure from an unrelated frame — or, on a session
         // that never drew a panel, nothing at all.
+        // Read here with the token figures, and outside the `if let Some(aside)` below for
+        // the reason recorded there: facts refreshed only on a panel-bearing frame keep
+        // whatever an unrelated frame left behind.
+        let (title_generation, title) = self.title.observe();
+        self.title_generation = title_generation;
         let ambient = self.sidebar.ambient_mut();
+        ambient.title = title;
         ambient.tokens = self.transcript.transcript().tokens();
         ambient.context_used = self.transcript.transcript().context_used();
         if let Some(aside) = aside {
@@ -1534,6 +1557,7 @@ impl Component for SessionScreen {
         // verdict the user is waiting for sitting in a channel forever.
         self.observe_edits(event);
         wheel
+            .merge(self.observe_session_title())
             .merge(self.observe_mcp())
             .merge(self.drain_editor_results())
             .merge(self.drain_reports())
@@ -1788,6 +1812,13 @@ impl SessionScreen {
     /// a plugin's lease is exactly that case — and the repaint would be owed and forgotten.
     fn observe_mcp(&self) -> EventResult {
         if self.mcp.generation() == self.mcp_generation {
+            return EventResult::IGNORED;
+        }
+        EventResult::REDRAW
+    }
+
+    fn observe_session_title(&self) -> EventResult {
+        if self.title.generation() == self.title_generation {
             return EventResult::IGNORED;
         }
         EventResult::REDRAW

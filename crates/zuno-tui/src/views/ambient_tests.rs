@@ -7,6 +7,10 @@ use crate::views::testkit::rows;
 
 fn ambient() -> Ambient {
     Ambient {
+        // Unnamed in the shared fixture, so every assertion written before the name
+        // existed still describes the panel it was written against. The tests that care
+        // about the name set it themselves.
+        title: None,
         directory: Some(String::from("~/src/zuno")),
         branch: Some(String::from("task-r17-solo")),
         agent: Some(String::from("build")),
@@ -530,4 +534,150 @@ fn views_sidebar_footer_path_is_cut_at_the_front_not_the_end() {
         "the identifying tail of the path was discarded:\n{footer}"
     );
     assert!(footer.contains('…'), "the cut was not marked:\n{footer}");
+}
+
+// ---------------------------------------------------------------------------
+// The session's name
+// ---------------------------------------------------------------------------
+
+/// The row index of the first line containing `needle`, or a failure naming the panel.
+fn row_of(lines: &[String], needle: &str) -> usize {
+    lines
+        .iter()
+        .position(|line| line.contains(needle))
+        .unwrap_or_else(|| panic!("`{needle}` is not on the panel:\n{}", lines.join("\n")))
+}
+
+#[test]
+fn views_sidebar_states_the_session_name_above_the_context_block() {
+    // Given: a named session.
+    let mut view = view();
+    view.ambient_mut().title = Some(String::from("Refactoring user service"));
+
+    // When: the panel is drawn at the width it is allotted.
+    let lines = rows(&render_offscreen(&mut view, SIDEBAR_WIDTH, 40).expect("infallible"));
+
+    // Then: the name is on the panel, and above `Context` rather than below it. The
+    // ordering is the assertion — a name rendered under the token figures reads as another
+    // measurement rather than as the thing being measured.
+    assert!(
+        row_of(&lines, "Refactoring user service") < row_of(&lines, "Context"),
+        "the session name must precede the Context block:\n{}",
+        lines.join("\n")
+    );
+}
+
+#[test]
+fn views_sidebar_says_nothing_at_all_when_the_session_has_no_name_yet() {
+    // Given: a session that has not been named — the state every session starts in.
+    let mut view = view();
+    view.ambient_mut().title = None;
+
+    // When: the panel is drawn.
+    let lines = rows(&render_offscreen(&mut view, SIDEBAR_WIDTH, 40).expect("infallible"));
+
+    // Then: `Context` is the panel's first row. No placeholder, and no blank spacer left
+    // behind by one — a reserved row would make the panel reflow the moment the name
+    // arrives, which is the flicker `Ambient::title` documents.
+    assert_eq!(
+        row_of(&lines, "Context"),
+        0,
+        "an unnamed session must not reserve a row:\n{}",
+        lines.join("\n")
+    );
+}
+
+#[test]
+fn views_sidebar_keeps_a_long_session_name_inside_the_panel_and_marks_the_cut() {
+    // Given: a name at the length the generator permits, which no panel this wide can show
+    // whole.
+    let mut view = view();
+    let long = "Investigate why the nightly integration suite intermittently fails on the \
+                macOS runner but never on Linux";
+    view.ambient_mut().title = Some(String::from(long));
+
+    let lines = rows(&render_offscreen(&mut view, SIDEBAR_WIDTH, 40).expect("infallible"));
+
+    // Then: every row the panel composes fits the columns it was given. Asserted against
+    // `lines`, the panel's own output, and not against the rendered buffer: `testkit::rows`
+    // reconstructs a row cell by cell, and a wide glyph's blank continuation cell comes back
+    // as a space — so the reconstruction is wider than the panel by one per wide glyph and
+    // could never fail this. The buffer proof is the ordering assertion below.
+    for line in view.lines(SIDEBAR_WIDTH) {
+        let width = crate::views::display_width(&line.to_string());
+        assert!(
+            width <= usize::from(SIDEBAR_WIDTH),
+            "a composed row overran the panel at {width} columns: {line:?}"
+        );
+    }
+
+    // And: the name is bounded to its row budget rather than pushing the sections off. The
+    // budget is `TITLE_MAX_ROWS` rows plus the one spacer, so `Context` lands at a known
+    // index no matter how long the name is — an unbounded wrap would push it further with
+    // every extra word.
+    assert_eq!(
+        row_of(&lines, "Context"),
+        TITLE_MAX_ROWS + 1,
+        "an over-long name spent more than its row budget:\n{}",
+        lines.join("\n")
+    );
+
+    // And: the discarded tail is marked, so the reader knows the name continues.
+    assert!(
+        lines.join("\n").contains('…'),
+        "the truncation was silent:\n{}",
+        lines.join("\n")
+    );
+}
+
+#[test]
+fn views_sidebar_wraps_a_cjk_session_name_by_columns_not_characters() {
+    // Given: a name with no spaces in it at all, which is the ordinary case in Chinese and
+    // the one a word-only wrapper returns as a single over-long row.
+    let mut view = view();
+    view.ambient_mut().title = Some(String::from(
+        "重构用户服务并修复登录接口的并发缺陷以及补齐相关的回归测试",
+    ));
+
+    let lines = rows(&render_offscreen(&mut view, SIDEBAR_WIDTH, 40).expect("infallible"));
+
+    // Composed rows rather than reconstructed ones, for the reason the long-name test
+    // records: a cell-by-cell reconstruction gains a space per wide glyph.
+    for line in view.lines(SIDEBAR_WIDTH) {
+        let width = crate::views::display_width(&line.to_string());
+        assert!(
+            width <= usize::from(SIDEBAR_WIDTH),
+            "a wide-glyph row overran the panel at {width} columns: {line:?}"
+        );
+    }
+    // A single glyph as the needle: `testkit::rows` reads the buffer cell by cell and a wide
+    // glyph's continuation cell comes back as a space, so `"重构"` is `"重 构"` here and a
+    // multi-glyph needle can never match however correct the panel is.
+    assert!(
+        row_of(&lines, "重") < row_of(&lines, "Context"),
+        "the name must still precede Context:\n{}",
+        lines.join("\n")
+    );
+}
+
+#[test]
+fn views_session_title_projection_advances_only_on_a_real_change() {
+    let projection = SessionTitle::default();
+    assert_eq!(projection.observe(), (0, None));
+
+    projection.replace(Some(String::from("A name")));
+    let (first, title) = projection.observe();
+    assert_eq!(title.as_deref(), Some("A name"));
+    assert_eq!(first, 1);
+
+    // Republishing the same name must not spend a frame repainting identical bytes.
+    projection.replace(Some(String::from("A name")));
+    assert_eq!(
+        projection.generation(),
+        first,
+        "an identical title advanced the generation"
+    );
+
+    projection.replace(Some(String::from("Another name")));
+    assert_eq!(projection.generation(), first + 1);
 }

@@ -6251,3 +6251,74 @@ fn a_press_on_the_prompt_opens_a_menu_that_copies_and_reverts() {
         );
     }
 }
+
+/// The session's name is drawn above the panel's `Context` block on a real frame.
+///
+/// The panel-level test in `ambient_tests` proves the row order the panel composes; this
+/// proves the whole wiring it depends on — a projection published from outside the render
+/// loop, an observer that reports the change, and a frame at a width where the sidebar is
+/// actually drawn.
+///
+/// Both halves are load-bearing and fail separately. Drop `observe_session_title` from the
+/// merge chain and the `redraw` assertion fails while the frame stays correct — which is
+/// the real defect, a named session that does not repaint until something unrelated
+/// happens to. Stop reading the projection in `render` and the ordering assertion fails
+/// instead. Nothing here sets `Ambient::title` by hand, so the name can only arrive by the
+/// seam production uses.
+#[test]
+fn session_screen_states_the_session_name_above_the_sidebars_context_block() {
+    for width in [crate::views::SIDEBAR_MIN_WIDTH, 160] {
+        assert!(
+            width >= crate::views::SIDEBAR_MIN_WIDTH,
+            "{width} is below the threshold, so the sidebar would not be drawn at all"
+        );
+        let projection = crate::views::ambient::SessionTitle::default();
+        let (sender, _shutdown) = terminal_event_channel();
+        let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+            .with_session_title(projection.clone());
+        // The panel is withheld until there is a transcript beside it, so a name asserted on
+        // the welcome screen would prove nothing about where the panel puts it.
+        screen
+            .transcript_mut()
+            .transcript_mut()
+            .push(Message::user("refactor the user service"));
+
+        // Published from outside the render loop, exactly as the turn driver publishes it.
+        projection.replace(Some(String::from("Refactoring user service")));
+        assert!(
+            screen
+                .handle_event(&AppEvent::Terminal(TerminalEvent::Wake))
+                .redraw,
+            "a newly named session must ask for a frame, or the name sits unseen until \
+             something else happens to repaint"
+        );
+
+        let frame = rows(&render_offscreen(&mut screen, width, 30).expect("infallible"));
+        let row_of = |needle: &str| {
+            frame
+                .iter()
+                .position(|row| row.contains(needle))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`{needle}` is not on the {width}-column frame:\n{}",
+                        frame.join("\n")
+                    )
+                })
+        };
+        // `no usage reported yet` is the panel's own copy, so finding it proves the `Context`
+        // located below is the sidebar's heading and not some other row carrying the word.
+        assert!(
+            frame
+                .iter()
+                .any(|row| row.contains("no usage reported yet")),
+            "the ambient panel was not drawn at {width} columns, so this proves nothing \
+             about where it puts the name:\n{}",
+            frame.join("\n")
+        );
+        assert!(
+            row_of("Refactoring user service") < row_of("Context"),
+            "at {width} columns the session name is not above the Context block:\n{}",
+            frame.join("\n")
+        );
+    }
+}
