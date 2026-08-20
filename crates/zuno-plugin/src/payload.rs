@@ -88,10 +88,36 @@ pub enum PermissionStatus {
     Allow,
 }
 
-/// Mutable output of `permission.ask`.
+/// Mutable output of `permission.ask`, shared by every plugin in configuration order.
+///
+/// The field is private on purpose. One `PermissionAskOutput` is threaded through
+/// the whole plugin sequence, so a writable field would let the last plugin to run
+/// decide the outcome — including turning an earlier plugin's refusal back into
+/// permission. [`Self::record`] is the only way in, and it cannot produce
+/// [`PermissionStatus::Allow`] once a deny is on the books, so the flip is not
+/// expressible rather than merely rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PermissionAskOutput {
-    pub status: PermissionStatus,
+    status: PermissionStatus,
+}
+
+impl PermissionAskOutput {
+    /// The decision the host will act on.
+    #[must_use]
+    pub const fn status(&self) -> PermissionStatus {
+        self.status
+    }
+
+    /// Record one plugin's decision, keeping a deny absorbing.
+    ///
+    /// `ask` and `allow` still follow last-writer-wins, which only ever moves the
+    /// outcome between "prompt the user" and "resolve the prompt".
+    pub const fn record(&mut self, status: PermissionStatus) {
+        if matches!(self.status, PermissionStatus::Deny) {
+            return;
+        }
+        self.status = status;
+    }
 }
 
 /// Input of `command.execute.before`.

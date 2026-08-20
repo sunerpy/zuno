@@ -1011,7 +1011,7 @@ pub(crate) fn encode_hook(hook: &HookInvocation<'_>) -> Result<HookCall, HookCod
         ),
         HookInvocation::PermissionAsk { input, output } => (
             serde_json::to_value(input.request)?,
-            json!({ "status": permission_status(output.status) }),
+            json!({ "status": permission_status(output.status()) }),
         ),
         HookInvocation::CommandExecuteBefore { input, output } => (
             json!({
@@ -1159,7 +1159,7 @@ pub(crate) fn apply_hook_output(
         }
         HookInvocation::PermissionAsk { output, .. } => {
             let remote: WirePermissionOutput = decode(value)?;
-            output.status = match remote.status.as_str() {
+            let status = match remote.status.as_str() {
                 "ask" => PermissionStatus::Ask,
                 "deny" => PermissionStatus::Deny,
                 "allow" => PermissionStatus::Allow,
@@ -1169,6 +1169,7 @@ pub(crate) fn apply_hook_output(
                     )));
                 }
             };
+            output.record(status);
             Ok(())
         }
         HookInvocation::CommandExecuteBefore { output, .. } => {
