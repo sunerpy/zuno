@@ -1,9 +1,11 @@
 mod agent;
+mod child_turn;
 mod db;
 mod db_maint;
 mod debug;
 mod export;
 mod mcp;
+mod mcp_runtime;
 mod models;
 mod plugin_runtime;
 mod providers;

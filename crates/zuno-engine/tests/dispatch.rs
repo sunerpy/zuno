@@ -123,6 +123,35 @@ impl Tool for RecordingTool {
     }
 }
 
+struct ArgumentCapturingTool {
+    received: Arc<Mutex<Option<Value>>>,
+}
+
+#[async_trait]
+impl Tool for ArgumentCapturingTool {
+    fn id(&self) -> &str {
+        "bash"
+    }
+
+    fn description(&self) -> &str {
+        "Record the arguments as the callee receives them."
+    }
+
+    fn raw_parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "required": ["command"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        *self.received.lock().expect("received lock") = Some(args.clone());
+        Ok(ToolOutput::text("bash", "captured"))
+    }
+}
+
 struct DetachedTool {
     started: Arc<Notify>,
     release: Arc<Notify>,
@@ -366,6 +395,53 @@ async fn a_plugin_allow_resolves_an_ask_without_prompting() {
         "a plugin allow must still resolve a rule that left the decision at ask"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// The intent is what the approval prompt and the audit record are built from, so
+/// removing it from the callee's arguments must not remove it from the ask. The two
+/// halves are asserted together because either one alone permits the wrong fix:
+/// stripping earlier would silence the prompt, and stripping later would leak.
+#[tokio::test]
+async fn the_intent_reaches_the_permission_layer_but_not_the_tool() {
+    let received = Arc::new(Mutex::new(None));
+    let approver = Arc::new(RecordingApprover::default());
+    let dispatcher = dispatcher(
+        vec![Arc::new(ArgumentCapturingTool {
+            received: Arc::clone(&received),
+        })],
+        Vec::new(),
+        Arc::clone(&approver) as Arc<dyn PermissionAsker>,
+        InterruptSignal::new(),
+    );
+
+    let result = dispatcher
+        .dispatch(request(
+            &dispatcher,
+            "call-intent-hand-off",
+            "bash",
+            json!({
+                "command": "git status",
+                "intent": "read the working tree state",
+                "accept_large_output": true
+            }),
+        ))
+        .await;
+
+    assert!(!result.is_error, "{}", result.output.output);
+
+    let asks = approver.asks();
+    let ask = asks.first().expect("the permission layer was consulted");
+    assert_eq!(
+        ask.metadata["arguments"]["intent"], "read the working tree state",
+        "the prompt and the audit record are built from this"
+    );
+
+    let arguments = received
+        .lock()
+        .expect("received lock")
+        .clone()
+        .expect("the tool ran");
+    assert_eq!(arguments, json!({ "command": "git status" }));
 }
 
 #[tokio::test]

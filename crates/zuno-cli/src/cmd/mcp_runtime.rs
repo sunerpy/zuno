@@ -1,0 +1,144 @@
+//! MCP bring-up for the two surfaces with no screen attached.
+//!
+//! # Why this exists rather than living in each command
+//!
+//! MCP was wired into exactly one of three surfaces. `zuno tui` built a
+//! [`zuno_mcp::Catalog`] and a [`zuno_mcp::McpServerController`] and handed the
+//! catalog to [`super::turn::TurnHost::open_with_runtime_and_mcp`]; `zuno run` and
+//! `zuno serve` reached the same constructor through
+//! [`super::turn::TurnHost::open_with_runtime`], which passes `None`. The result was
+//! silent rather than broken: the same configuration produced a working MCP tool in
+//! the TUI and **zero** MCP tools headlessly, with nothing said either way.
+//!
+//! Both headless surfaces now come through here, for the reason
+//! [`super::tool_runtime`] gives for tool assembly: a second bring-up site is how the
+//! surfaces diverge again.
+//!
+//! # Connect-then-open, rather than the TUI's connect-then-rebuild
+//!
+//! The registry reads [`zuno_tools::registry::McpToolLoader::tools`] once, while it is
+//! being built, so a server that finishes connecting after the host is open
+//! contributes nothing to that host. The TUI answers this by rebuilding the host on a
+//! dirty flag before the next turn — correct there, because it has many turns and a
+//! render loop to hang the retry on.
+//!
+//! Neither headless surface does. `zuno run` has exactly one turn, so a late
+//! connection has no later turn to appear in; `zuno serve` opens a fresh host per
+//! request, so it re-reads the catalog anyway. So the wait happens **before** the
+//! host is built, bounded by [`zuno_mcp::McpLifecycleOptions`]'s own timeouts, and a
+//! server that fails is reported as a note rather than failing the run — a broken MCP
+//! server must not make `zuno run` unusable.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use zuno_config::schema::Config;
+use zuno_config::schema::mcp::McpServerConfig;
+
+/// Whether a configured server is one this surface should connect at startup.
+///
+/// `zuno tui` carries a private copy of this predicate (`tui.rs:913`). Collapse the
+/// two the next time that file is touched: three surfaces disagreeing about which
+/// servers are enabled is the same defect class this module closes.
+pub(crate) fn enabled(server: &McpServerConfig) -> bool {
+    match server {
+        McpServerConfig::Local(local) => local.enabled.unwrap_or(true),
+        McpServerConfig::Remote(remote) => remote.enabled.unwrap_or(true),
+        McpServerConfig::Toggle(toggle) => toggle.enabled,
+    }
+}
+
+/// A connected MCP catalog and the controller that owns its transports.
+pub(crate) struct McpRuntime {
+    catalog: zuno_mcp::Catalog,
+    controller: zuno_mcp::McpServerController,
+    enabled: Vec<String>,
+}
+
+impl McpRuntime {
+    /// Build a runtime for the servers `config` declares, or [`None`] for none.
+    ///
+    /// [`None`] rather than an empty runtime so a caller with no MCP configuration
+    /// spawns no controller and pays nothing — and so the `mcp` argument the host
+    /// takes stays `None` in exactly the case it always was.
+    pub(crate) fn from_config(config: &Config, workspace: &Path) -> Option<Self> {
+        let configs: BTreeMap<String, McpServerConfig> = config
+            .mcp
+            .as_ref()?
+            .iter()
+            .map(|(name, server)| ((*name).to_owned(), server.clone()))
+            .collect();
+        if configs.is_empty() {
+            return None;
+        }
+        let enabled = configs
+            .iter()
+            .filter(|(_, server)| self::enabled(server))
+            .map(|(name, _)| name.clone())
+            .collect();
+        let catalog = zuno_mcp::Catalog::new(configs.keys().cloned());
+        let controller = zuno_mcp::McpServerController::from_config(
+            catalog.clone(),
+            workspace,
+            configs,
+            zuno_mcp::McpLifecycleOptions::default(),
+        );
+        Some(Self {
+            catalog,
+            controller,
+            enabled,
+        })
+    }
+
+    /// Connect every enabled server, returning one note per server that did not.
+    ///
+    /// Sequential rather than joined: [`zuno_mcp::McpServerController`] serialises one
+    /// operation per server anyway, and a stdio server that spawns a subprocess is
+    /// better started in a declared order than a racing one when a failure has to be
+    /// attributed to a name.
+    pub(crate) async fn connect(&self) -> Vec<String> {
+        let mut notes = Vec::new();
+        for server in &self.enabled {
+            match self.controller.set_enabled(server, true).await {
+                Ok(snapshot) => match snapshot.state {
+                    zuno_mcp::McpServerState::Failed { error }
+                    | zuno_mcp::McpServerState::NeedsClientRegistration { error } => {
+                        notes.push(format!("warning: MCP server `{server}` failed: {error}"));
+                    }
+                    zuno_mcp::McpServerState::NeedsAuth => {
+                        notes.push(format!(
+                            "warning: MCP server `{server}` needs authorization completed \
+                             before its tools are available; run `zuno mcp` to authorize it"
+                        ));
+                    }
+                    zuno_mcp::McpServerState::Connected
+                    | zuno_mcp::McpServerState::Connecting
+                    | zuno_mcp::McpServerState::Disconnecting
+                    | zuno_mcp::McpServerState::Disabled => {}
+                },
+                Err(error) => {
+                    notes.push(format!("warning: MCP server `{server}` failed: {error}"));
+                }
+            }
+        }
+        notes
+    }
+
+    /// The catalog to hand a host.
+    pub(crate) fn catalog(&self) -> zuno_mcp::Catalog {
+        self.catalog.clone()
+    }
+
+    /// Close every transport, waiting for each.
+    ///
+    /// Dropping the controller would abort the transport tasks and let `Drop` signal
+    /// any subprocess, which the TUI relies on (`tui.rs:477`). That leaves a remote
+    /// server's HTTP session open on the far side, because only
+    /// [`zuno_mcp::McpConnection::close`] deletes it. A headless surface has an exit
+    /// it can await, so it awaits.
+    pub(crate) async fn shutdown(self) {
+        for server in &self.enabled {
+            let _result = self.controller.set_enabled(server, false).await;
+        }
+    }
+}

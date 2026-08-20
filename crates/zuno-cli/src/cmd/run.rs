@@ -35,11 +35,24 @@ pub(super) fn execute(args: &RunArgs, environment: &StartupEnvironment) -> Resul
     };
     let runtime = runtime()?;
     let plan = runtime.block_on(TurnPlan::resolve(&options, environment))?;
-    let mut host = TurnHost::open(
+    // Before the host, not after: the registry reads the MCP loader once while it is
+    // being assembled, and this surface has no second turn for a late connection to
+    // appear in. See `super::mcp_runtime`.
+    let mcp = super::mcp_runtime::McpRuntime::from_config(
+        plan.config(),
+        plan.worktree().unwrap_or_else(|| plan.directory()),
+    );
+    let mcp_notes = match mcp.as_ref() {
+        Some(mcp) => runtime.block_on(mcp.connect()),
+        None => Vec::new(),
+    };
+    let mut host = TurnHost::open_with_mcp(
         plan,
         environment,
         Arc::new(crate::cmd::tool_runtime::HeadlessApproval),
+        mcp.as_ref().map(super::mcp_runtime::McpRuntime::catalog),
     )?;
+    host.push_notes(mcp_notes);
 
     let (sender, receiver) = event_channel();
     let sender = host.with_event_hooks(sender);
@@ -64,6 +77,9 @@ pub(super) fn execute(args: &RunArgs, environment: &StartupEnvironment) -> Resul
         )
     });
     runtime.block_on(host.shutdown());
+    if let Some(mcp) = mcp {
+        runtime.block_on(mcp.shutdown());
+    }
     outcome?;
     rendered?;
     Ok(())

@@ -455,6 +455,12 @@ impl Tool for ShellTool {
         zuno_tool::schema::derive_params_schema::<ShellParams>()
     }
 
+    /// Claimed because this tool decides for itself whether an oversized result is
+    /// returned; the invocation boundary would otherwise remove the opt-in first.
+    fn consumed_injected_keys(&self) -> &'static [&'static str] {
+        &[zuno_tool::ACCEPT_LARGE_OUTPUT_KEY]
+    }
+
     async fn execute(&self, mut args: Value, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
         let accept_large_output = zuno_tool::guard::accepts_large_output(&args);
         zuno_tool::guard::strip_cross_cutting(&mut args);

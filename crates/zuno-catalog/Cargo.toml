@@ -34,6 +34,10 @@ insta = { workspace = true }
 zuno-testkit = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
+# `tests/skill.rs` asserts the *level* a duplicate-skill override logs at, not just
+# that it is recorded. Nothing but a subscriber can observe that, and the level is
+# the whole fix: at WARN it emitted 189 lines per launch on a real install.
+tracing-subscriber = { workspace = true }
 wiremock = { workspace = true }
 
 [lints]

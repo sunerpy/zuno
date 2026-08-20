@@ -62,41 +62,140 @@ pub const NO_SKILLS: &str = "No skills are currently available.";
 /// [`locale_compare`], and the result has no trailing newline.
 #[must_use]
 pub fn fmt(list: &[Skill], form: Form) -> String {
+    let described = described_sorted(list);
+    if described.is_empty() {
+        return NO_SKILLS.to_string();
+    }
+    assemble(&described, form)
+}
+
+/// A render that had to leave skills out, and how many.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Budgeted {
+    /// The rendered form, never longer than the requested budget.
+    pub text: String,
+    /// How many skills the text describes.
+    pub rendered: usize,
+    /// How many describable skills did not fit.
+    pub omitted: usize,
+}
+
+/// Render at most `budget` bytes of `list`, reporting what did not fit.
+///
+/// [`fmt`] is unbounded because the oracle's is. At 189 skills averaging ~600 bytes
+/// of description that is ~113 KB prepended to **every** request in the session, so
+/// the caller that puts this in a system prompt uses this instead.
+///
+/// Selection is cheapest-first — which fits the most names in — while the output
+/// stays sorted by name, so the bytes are stable across runs. Dropping the
+/// alphabetic tail instead would hide skills for no reason but their initial.
+/// [`Budgeted::omitted`] is returned rather than swallowed because a skill the model
+/// is never told about is indistinguishable from one that does not exist.
+#[must_use]
+pub fn fmt_within(list: &[Skill], form: Form, budget: usize) -> Budgeted {
+    let described = described_sorted(list);
+    if described.is_empty() {
+        return Budgeted {
+            text: NO_SKILLS.to_string(),
+            rendered: 0,
+            omitted: 0,
+        };
+    }
+
+    let mut by_cost: Vec<(usize, &Skill)> = described
+        .iter()
+        .map(|skill| (entry_cost(skill, form), *skill))
+        .collect();
+    by_cost.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| locale_compare(&left.1.name, &right.1.name))
+    });
+
+    let mut spent = frame_cost(form);
+    let mut kept: Vec<&Skill> = Vec::new();
+    for (cost, skill) in by_cost {
+        if spent.saturating_add(cost) > budget {
+            break;
+        }
+        spent += cost;
+        kept.push(skill);
+    }
+    if kept.is_empty() {
+        return Budgeted {
+            text: String::new(),
+            rendered: 0,
+            omitted: described.len(),
+        };
+    }
+    kept.sort_by(|left, right| locale_compare(&left.name, &right.name));
+
+    Budgeted {
+        text: assemble(&kept, form),
+        rendered: kept.len(),
+        omitted: described.len() - kept.len(),
+    }
+}
+
+fn described_sorted(list: &[Skill]) -> Vec<&Skill> {
     let mut described: Vec<&Skill> = list
         .iter()
         .filter(|skill| skill.description.is_some())
         .collect();
-    if described.is_empty() {
-        return NO_SKILLS.to_string();
-    }
     described.sort_by(|left, right| locale_compare(&left.name, &right.name));
+    described
+}
 
-    let mut lines: Vec<String> = Vec::new();
-    match form {
-        Form::Verbose => {
-            lines.push("<available_skills>".to_string());
-            for skill in described {
-                let description = skill.description.as_deref().unwrap_or_default();
-                lines.push("  <skill>".to_string());
-                lines.push(format!("    <name>{}</name>", skill.name));
-                lines.push(format!("    <description>{description}</description>"));
-                lines.push(format!(
-                    "    <location>{}</location>",
-                    escape_html(&skill.location)
-                ));
-                lines.push("  </skill>".to_string());
-            }
-            lines.push("</available_skills>".to_string());
-        }
-        Form::List => {
-            lines.push("## Available Skills".to_string());
-            for skill in described {
-                let description = skill.description.as_deref().unwrap_or_default();
-                lines.push(format!("- **{}**: {description}", skill.name));
-            }
-        }
+fn assemble(described: &[&Skill], form: Form) -> String {
+    let mut lines: Vec<String> = vec![open_line(form).to_string()];
+    for skill in described {
+        lines.extend(entry_lines(skill, form));
+    }
+    if let Some(close) = close_line(form) {
+        lines.push(close.to_string());
     }
     lines.join("\n")
+}
+
+const fn open_line(form: Form) -> &'static str {
+    match form {
+        Form::Verbose => "<available_skills>",
+        Form::List => "## Available Skills",
+    }
+}
+
+const fn close_line(form: Form) -> Option<&'static str> {
+    match form {
+        Form::Verbose => Some("</available_skills>"),
+        Form::List => None,
+    }
+}
+
+fn entry_lines(skill: &Skill, form: Form) -> Vec<String> {
+    let description = skill.description.as_deref().unwrap_or_default();
+    match form {
+        Form::Verbose => vec![
+            "  <skill>".to_string(),
+            format!("    <name>{}</name>", skill.name),
+            format!("    <description>{description}</description>"),
+            format!("    <location>{}</location>", escape_html(&skill.location)),
+            "  </skill>".to_string(),
+        ],
+        Form::List => vec![format!("- **{}**: {description}", skill.name)],
+    }
+}
+
+/// Bytes one entry adds to [`assemble`]'s output, including its leading newline.
+fn entry_cost(skill: &Skill, form: Form) -> usize {
+    entry_lines(skill, form)
+        .iter()
+        .map(|line| line.len() + 1)
+        .sum()
+}
+
+/// Bytes [`assemble`] spends on the opening and closing lines alone.
+fn frame_cost(form: Form) -> usize {
+    open_line(form).len() + close_line(form).map_or(0, |close| close.len() + 1)
 }
 
 /// `escapeHtml` (`packages/opencode/src/util/html.ts`), entity-for-entity.

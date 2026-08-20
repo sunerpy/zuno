@@ -21,15 +21,27 @@ use super::turn::{SessionChoice, TurnHost, TurnOptions, TurnPlan};
 use crate::command::ServeArgs;
 use crate::environment::StartupEnvironment;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct ServerSessionMutationExecutor {
     environment: StartupEnvironment,
     requests: RequestBroker,
     runs: SessionRunRegistry,
+    /// The one MCP catalog every session on this server shares.
+    ///
+    /// A host is built per request here, so building a *catalog* per request would
+    /// spawn and tear down every configured MCP server on every prompt — for a stdio
+    /// server that is a subprocess launch and an `initialize` round trip per turn. The
+    /// controller that owns the transports lives in [`execute`] for the server's whole
+    /// lifetime; each host only reads the merged tool list out of this clone.
+    mcp: Option<zuno_mcp::Catalog>,
 }
 
 impl ServerSessionMutationExecutor {
-    fn new(requests: RequestBroker, runs: SessionRunRegistry) -> Self {
+    fn new(
+        requests: RequestBroker,
+        runs: SessionRunRegistry,
+        mcp: Option<zuno_mcp::Catalog>,
+    ) -> Self {
         Self {
             environment: StartupEnvironment::resolve(
                 &zuno_paths::Env::from_process(),
@@ -37,17 +49,22 @@ impl ServerSessionMutationExecutor {
             ),
             requests,
             runs,
+            mcp,
         }
     }
 
+    /// Open a host for one request.
+    ///
+    /// Takes `self` by value rather than the executor's four fields as arguments: the
+    /// environment, the request broker, the run registry and the MCP catalog all
+    /// belong to the executor, and unpacking them at each call site only to pass them
+    /// back in is what pushed this past the argument limit when MCP was added.
     async fn open(
-        environment: StartupEnvironment,
+        self,
         session_id: String,
         directory: std::path::PathBuf,
         agent: Option<String>,
         model: Option<zuno_server::SessionModelSelection>,
-        requests: RequestBroker,
-        runs: SessionRunRegistry,
     ) -> Result<TurnHost, String> {
         let options = TurnOptions {
             directory: Some(directory),
@@ -56,13 +73,22 @@ impl ServerSessionMutationExecutor {
             session: SessionChoice::Existing(session_id.clone()),
             title: None,
         };
-        let plan = TurnPlan::resolve(&options, &environment).await?;
+        let plan = TurnPlan::resolve(&options, &self.environment).await?;
         let approval: Arc<dyn PermissionAsker> = Arc::new(ServerPermissionAsker {
-            requests: requests.clone(),
+            requests: self.requests.clone(),
             session_id,
         });
-        let question: Arc<dyn QuestionAsker> = Arc::new(ServerQuestionAsker { requests });
-        TurnHost::open_with_runtime(plan, &environment, approval, Some(question), runs)
+        let question: Arc<dyn QuestionAsker> = Arc::new(ServerQuestionAsker {
+            requests: self.requests,
+        });
+        TurnHost::open_with_runtime_and_mcp(
+            plan,
+            &self.environment,
+            approval,
+            Some(question),
+            self.runs,
+            self.mcp,
+        )
     }
 }
 
@@ -133,6 +159,22 @@ impl QuestionAsker for ServerQuestionAsker {
     }
 }
 
+/// Hand-written because [`zuno_mcp::Catalog`] is deliberately not [`Debug`].
+///
+/// Deriving it would need a `Debug` on the catalog, and the useful fact here is
+/// whether MCP is attached at all — not a dump of every discovered tool into whatever
+/// log formats this executor.
+impl std::fmt::Debug for ServerSessionMutationExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerSessionMutationExecutor")
+            .field("environment", &self.environment)
+            .field("requests", &self.requests)
+            .field("runs", &self.runs)
+            .field("mcp", &self.mcp.is_some())
+            .finish()
+    }
+}
+
 impl SessionMutationExecutor for ServerSessionMutationExecutor {
     fn prompt(
         &self,
@@ -140,20 +182,16 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
         guard: SessionRunGuard,
         events: TurnEventSender,
     ) -> SessionMutationFuture {
-        let environment = self.environment.clone();
-        let requests = self.requests.clone();
-        let runs = self.runs.clone();
+        let executor = self.clone();
         Box::pin(async move {
-            let mut host = Self::open(
-                environment,
-                request.session_id,
-                request.directory,
-                request.agent,
-                request.model,
-                requests,
-                runs,
-            )
-            .await?;
+            let mut host = executor
+                .open(
+                    request.session_id,
+                    request.directory,
+                    request.agent,
+                    request.model,
+                )
+                .await?;
             let events = host.with_event_hooks(events);
             let outcome = async {
                 host.drive_with_message_id_and_guard(
@@ -181,20 +219,16 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
         guard: SessionRunGuard,
         events: TurnEventSender,
     ) -> SessionMutationFuture {
-        let environment = self.environment.clone();
-        let requests = self.requests.clone();
-        let runs = self.runs.clone();
+        let executor = self.clone();
         Box::pin(async move {
-            let mut host = Self::open(
-                environment,
-                request.session_id,
-                request.directory,
-                request.agent,
-                request.model,
-                requests,
-                runs,
-            )
-            .await?;
+            let mut host = executor
+                .open(
+                    request.session_id,
+                    request.directory,
+                    request.agent,
+                    request.model,
+                )
+                .await?;
             let events = host.with_event_hooks(events);
             let outcome = host.compact(request.automatic).await;
             drop(guard);
@@ -265,9 +299,18 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
         let requests = RequestBroker::with_events(events.clone());
         let services =
             ServerServices::new(DEFAULT_EVENT_SUBSCRIBER_CAPACITY).with_requests(requests.clone());
+        // Connected once for the server's lifetime, not per request: every host this
+        // executor builds reads the same merged catalog. See `super::mcp_runtime`.
+        let mcp = super::mcp_runtime::McpRuntime::from_config(&plugin_config, worktree);
+        if let Some(mcp) = mcp.as_ref() {
+            for note in mcp.connect().await {
+                println!("{note}");
+            }
+        }
         let mutations = Arc::new(ServerSessionMutationExecutor::new(
             requests,
             services.runs.clone(),
+            mcp.as_ref().map(super::mcp_runtime::McpRuntime::catalog),
         ));
         let services = services.with_mutations(mutations);
         let server = ServerBuilder::new(config)
@@ -308,6 +351,9 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
         let result = server.serve().await.map_err(|error| error.to_string());
         if let Some(plugins) = plugins {
             plugins.shutdown().await;
+        }
+        if let Some(mcp) = mcp {
+            mcp.shutdown().await;
         }
         result
     })
