@@ -246,6 +246,22 @@ pub const DIAGNOSTICS_PREVIEW_ROWS: usize = 4;
 /// Diagnostics an expanded report lists.
 pub const DIAGNOSTICS_MAX_ROWS: usize = 200;
 
+/// The glyphs that close the user's message box on the right and along its rules.
+///
+/// `▐` matches [`crate::views::session::COMPOSER_RIGHT_RULE`] rather than the `│` a border
+/// set would give, because `│` is [`Role::Assistant`]'s own marker: a right edge drawn with
+/// it would put the assistant's glyph on the user's rows, which is the one distinction this
+/// box exists to sharpen.
+pub(crate) const USER_BOX_RIGHT: &str = "▐";
+pub(crate) const USER_BOX_RULE: &str = "─";
+
+/// The fewest body columns the user's box keeps before the frame is dropped instead.
+///
+/// The same judgement [`PROMPT_MIN_CONTENT_COLS`](crate::views::session) records for the
+/// composer's chrome: below this the frame costs more columns than the words can spare, and
+/// a prompt wrapped every eight characters is less readable than an unframed one.
+const USER_BOX_MIN_INNER_COLS: u16 = 12;
+
 /// Rows of tool output shown before the collapse notice.
 ///
 /// Three is enough to see that a command produced the shape of output expected and
@@ -988,6 +1004,23 @@ pub struct TranscriptView {
     /// transcript cannot evict another's. See [`Self::cached_lines`] for the key and
     /// [`MAX_CACHED_ROWS`] for the bound.
     cache: RowCache,
+    /// Which message produced each row of the last measured line list, `None` for chrome.
+    ///
+    /// Built beside the rows in [`Self::cached_lines`] rather than reconstructed afterwards,
+    /// which is the only way it can be right: the number of rows a message occupies is
+    /// decided by the two display affordances, by the wrap width and by whether the message
+    /// opens with a header — every one of them already an input to the cache key. Anything
+    /// that recomputed the mapping would be a second implementation of `message_rows`, and
+    /// the copy that drifted would attribute a click to the neighbouring message.
+    line_owners: Vec<Option<usize>>,
+    /// Where each message was drawn in the frame that **was drawn**.
+    ///
+    /// Absolute screen rows, recorded by [`Component::render`] from the same slice it paints,
+    /// for the reason [`crate::views::ambient::SidebarView`] records its section headings the
+    /// same way: this view has no `Rect` outside `render`, and a map kept anywhere else would
+    /// need re-deriving on every resize, scroll and affordance toggle — and the update that is
+    /// forgotten is a click landing on a message that has moved.
+    hits: Vec<(Rect, usize)>,
 }
 
 impl TranscriptView {
@@ -1004,7 +1037,43 @@ impl TranscriptView {
             viewport_height: 0,
             following: true,
             cache: RowCache::default(),
+            line_owners: Vec::new(),
+            hits: Vec::new(),
         }
+    }
+
+    /// Which message occupies `(column, row)` in the frame that was drawn, if any.
+    ///
+    /// Absolute frame coordinates, because that is what a [`crossterm::event::MouseEvent`]
+    /// carries; translating at the boundary is what keeps the caller from having to know this
+    /// view's geometry. `None` for chrome rows, for a row below the fold, and for every
+    /// coordinate while mouse reporting is off — see [`Component::render`].
+    ///
+    /// The whole row is the target, rule column included. A transcript row holds nothing but
+    /// one message's own text, so there is no neighbouring control a generous target could
+    /// steal from, and the same argument [`crate::views::ambient::SidebarView::click`] makes
+    /// about its heading rows applies unchanged.
+    #[must_use]
+    pub fn message_at(&self, column: u16, row: u16) -> Option<usize> {
+        self.hits
+            .iter()
+            .find(|(area, _)| {
+                column >= area.left()
+                    && column < area.right()
+                    && row >= area.top()
+                    && row < area.bottom()
+            })
+            .map(|(_, index)| *index)
+    }
+
+    /// Discard the recorded message positions.
+    ///
+    /// Called by the owner on any frame that draws the welcome surface instead of this view,
+    /// for the reason [`crate::views::ambient::SidebarView::forget_hit_targets`] exists: the
+    /// last drawn geometry would otherwise keep answering clicks aimed at whatever now
+    /// occupies those rows.
+    pub fn forget_hit_targets(&mut self) {
+        self.hits.clear();
     }
 
     /// Flip the tool-output affordance, the `tool_details` action.
@@ -1148,26 +1217,113 @@ impl TranscriptView {
             // very continuity the header was suppressed in order to preserve — the
             // claim above was false for every multi-step turn.
             lines.push(self.ruled(message.role, rule, "", self.context.surface(), width));
-        } else {
+        } else if previous.is_some() {
             // A change of speaker is the one boundary a reader scans for, so it gets
             // the stronger of the two separators: a row with no rule at all. Two
             // grades of gap is what lets the eye tell "the other party is talking now"
             // from "this reply took another step" without reading either row.
-            if previous.is_some() {
-                lines.push(padded("", width, self.context.surface()));
-            }
-            lines.push(self.ruled(
-                message.role,
-                rule,
-                self.role_label(message.role),
-                self.context.title(),
-                width,
-            ));
+            lines.push(padded("", width, self.context.surface()));
+        }
+        if message.role == Role::User {
+            self.push_boxed(message, rule, width, &mut lines);
+            return lines;
+        }
+        if previous != Some(message.role)
+            && let Some(label) = self.role_label(message.role)
+        {
+            lines.push(self.ruled(message.role, rule, label, self.context.title(), width));
         }
         for part in &message.parts {
             self.part_lines(message.role, rule, part, width, &mut lines);
         }
         lines
+    }
+
+    /// The user's message as a closed box: a titled top rule, the body, a closing rule.
+    ///
+    /// # Why the user's turn is framed and the assistant's is not
+    ///
+    /// Both sides used to be a label over flowing text, told apart only by one glyph in
+    /// column zero — `▌` against `│`. Reported: a long conversation was hard to scan,
+    /// because "what I asked" and "what it answered" look the same from a metre away and
+    /// the glyph that distinguishes them is one cell wide. Upstream frames the same side
+    /// and leaves the other unframed (`routes/session/index.tsx:1395-1420`), and a real
+    /// `opencode 1.18.18` pane confirms it: the user's turn carries a rule down its left
+    /// edge while the reply is bare prose.
+    ///
+    /// So only one side is framed, and it is the user's, for two reasons that point the
+    /// same way. The prompt is short and finite, so a frame costs it two rows out of
+    /// three or four rather than two out of forty; and prose the model wrote is the thing
+    /// being *read*, which a box interrupts. Framing both would restore the symmetry this
+    /// exists to break.
+    ///
+    /// # The box's edges are the crate's existing vocabulary, not new glyphs
+    ///
+    /// The left edge is [`Role::marker`]'s own `▌`, unchanged, so every positional
+    /// assertion that reads a user row at column zero still reads one and the accent
+    /// colour still runs down the turn. The right edge is
+    /// [`crate::views::session::COMPOSER_RIGHT_RULE`]'s `▐`, which is already what this
+    /// crate uses to close a region on the right. Nothing here invents a symbol, which is
+    /// why the box reads as part of the same surface family as the composer.
+    ///
+    /// # The heading rides the top rule instead of owning a row
+    ///
+    /// A separate `You` row plus a top rule would spend two rows on chrome before the
+    /// first word. The label sits *in* the rule — `▌ You ─────▐` — so the box costs the
+    /// same two rows the old header-plus-nothing arrangement did, and the top row still
+    /// contains the literal `▌ You` every existing assertion looks for.
+    ///
+    /// The rule is dropped rather than the label when the pane cannot hold both: a
+    /// truncated `Yo` names nobody, while a label with no dashes beside it is still a
+    /// heading.
+    fn push_boxed(&self, message: &Message, rule: Style, width: u16, out: &mut Vec<Line<'static>>) {
+        let marker = Role::User.marker();
+        // The columns the frame itself spends: the marker, the space after it, and the
+        // right edge. Everything below is measured against what is left, so a pane too
+        // narrow to hold a body degrades to the unframed rows rather than to a box with
+        // negative width.
+        let gutter = u16::try_from(display_width(marker) + 1).unwrap_or(2);
+        let edge = u16::try_from(display_width(USER_BOX_RIGHT)).unwrap_or(1);
+        let inner = width.saturating_sub(gutter.saturating_add(edge));
+        if inner < USER_BOX_MIN_INNER_COLS {
+            // No frame at all rather than a broken one, the same degradation the composer
+            // rules and the ambient panel make. The header is restored here because the
+            // top rule that would have carried it is what has just been dropped.
+            if let Some(label) = self.role_label(Role::User) {
+                out.push(self.ruled(Role::User, rule, label, self.context.title(), width));
+            }
+            for part in &message.parts {
+                self.part_lines(Role::User, rule, part, width, out);
+            }
+            return;
+        }
+        out.push(self.boxed_edge(rule, self.role_label(Role::User), inner));
+        let mut body = Vec::new();
+        for part in &message.parts {
+            self.part_lines(Role::User, rule, part, gutter + inner, &mut body);
+        }
+        for mut line in body {
+            line.spans
+                .push(Span::styled(USER_BOX_RIGHT.to_owned(), rule));
+            out.push(line);
+        }
+        out.push(self.boxed_edge(rule, None, inner));
+    }
+
+    /// One horizontal rule of the user's box, carrying `label` when it has one.
+    fn boxed_edge(&self, rule: Style, label: Option<&'static str>, inner: u16) -> Line<'static> {
+        let marker = Role::User.marker();
+        let mut spans = vec![Span::styled(format!("{marker} "), rule)];
+        let mut spent = 0usize;
+        if let Some(label) = label {
+            let text = format!("{label} ");
+            spent = display_width(&text);
+            spans.push(Span::styled(text, self.context.title()));
+        }
+        let dashes = usize::from(inner).saturating_sub(spent);
+        spans.push(Span::styled(USER_BOX_RULE.repeat(dashes), rule));
+        spans.push(Span::styled(USER_BOX_RIGHT.to_owned(), rule));
+        Line::from(spans)
     }
 
     /// The bottom margin and whichever liveness row the turn's state calls for.
@@ -1257,6 +1413,10 @@ impl TranscriptView {
     fn cached_lines(&mut self, width: u16) -> Vec<Line<'static>> {
         let theme = self.context.theme();
         let mut lines = Vec::new();
+        // Cleared here rather than in `render`, because this is the function that knows how
+        // many rows each message produced; a `render` that cleared it would be describing a
+        // list it did not build.
+        self.line_owners.clear();
         let mut previous: Option<Role> = None;
         for index in 0..self.transcript.messages.len() {
             let message = &self.transcript.messages[index];
@@ -1269,10 +1429,14 @@ impl TranscriptView {
             };
             previous = Some(message.role);
             if let Some(rows) = self.cache.get(index, &key, &theme) {
+                self.line_owners
+                    .extend(std::iter::repeat_n(Some(index), rows.len()));
                 lines.extend(rows.iter().cloned());
                 continue;
             }
             let rows = self.message_rows(&self.transcript.messages[index], key.previous, width);
+            self.line_owners
+                .extend(std::iter::repeat_n(Some(index), rows.len()));
             lines.extend(rows.iter().cloned());
             if is_recallable(&self.transcript.messages[index]) {
                 self.cache.put(index, key, Arc::clone(&theme), rows);
@@ -1282,14 +1446,34 @@ impl TranscriptView {
         }
         self.cache.truncate_to(self.transcript.messages.len());
         self.push_trailer(&mut lines, previous.is_some(), width);
+        // The trailer belongs to no message — it is the bottom margin and the liveness row —
+        // so its rows own nothing and a click on them falls through. Padding to the full
+        // length rather than leaving the vector short is what keeps `render` from having to
+        // know which rows are chrome.
+        self.line_owners.resize(lines.len(), None);
         lines
     }
 
-    const fn role_label(&self, role: Role) -> &'static str {
+    /// The heading a change of speaker prints, when the speaker is a party to the
+    /// conversation.
+    ///
+    /// `None` for [`Role::System`], and that absence is the whole change. The session is
+    /// not a speaker: everything it says is already marked as its own by the `▲` rule at
+    /// column zero and by a level glyph — `✓`, `!`, `✗` — that no party's text carries. A
+    /// `Session` heading therefore restated what the row beneath it already said, and it
+    /// restated it *at the top of the frame*: a one-line `model set to … for the next
+    /// turn` opened a fresh conversation with a blank row, a `Session` heading and the
+    /// notice, three rows of which one was content. That was reported, in the owner's
+    /// words, as a session hint that need not be shown at all on a first conversation.
+    ///
+    /// The blank separator above it is deliberately kept — see [`Self::message_rows`] —
+    /// because it is what stops a notice from reading as the tail of the reply above it.
+    /// Only the heading goes.
+    const fn role_label(&self, role: Role) -> Option<&'static str> {
         match role {
-            Role::User => "You",
-            Role::Assistant => "Assistant",
-            Role::System => "Session",
+            Role::User => Some("You"),
+            Role::Assistant => Some("Assistant"),
+            Role::System => None,
         }
     }
 
@@ -2012,6 +2196,10 @@ impl RowFrame {
 impl Component for TranscriptView {
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
         fill(frame.buffer_mut(), area, self.context.surface());
+        // Cleared before anything can return early, so a frame that draws nothing leaves no
+        // target behind — the same discipline `SidebarView::render` keeps, and for the same
+        // reason: stale geometry answers clicks aimed at whatever now occupies those rows.
+        self.hits.clear();
         let lines = self.cached_lines(area.width);
         self.content_height = lines.len();
         self.viewport_height = usize::from(area.height);
@@ -2031,6 +2219,33 @@ impl Component for TranscriptView {
         // bottom resumes following without another key press.
         if self.following || self.offset > max {
             self.offset = max;
+        }
+        // Recorded from the same `skip`/`take` window the rows below are drawn through, so a
+        // scrolled transcript's targets move with it and a row below the fold has none. Gated
+        // on the mouse setting for the reason the sidebar gates its own: with reporting off no
+        // press ever arrives, and a map maintained for nobody is a map that can be wrong
+        // unnoticed.
+        if self.context.config.mouse {
+            self.hits = self
+                .line_owners
+                .iter()
+                .skip(self.offset)
+                .take(self.viewport_height)
+                .enumerate()
+                .filter_map(|(row, owner)| {
+                    let owner = (*owner)?;
+                    let y = area.y.checked_add(u16::try_from(row).ok()?)?;
+                    Some((
+                        Rect {
+                            x: area.x,
+                            y,
+                            width: area.width,
+                            height: 1,
+                        },
+                        owner,
+                    ))
+                })
+                .collect();
         }
         let visible = lines
             .into_iter()

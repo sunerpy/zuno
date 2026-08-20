@@ -81,6 +81,18 @@ pub const SKILL_DIALOG_ID: &str = "prompt_skills";
 /// both of them.
 pub const UNDO_CONFIRM_DIALOG_ID: &str = "confirm.undo";
 
+/// The id the per-message action menu reports under.
+pub const MESSAGE_ACTIONS_DIALOG_ID: &str = "message.actions";
+
+/// The values that menu's rows report.
+///
+/// Spelled as constants rather than matched as literals at both ends because the producer and
+/// the consumer are two hundred lines apart, and a typo in either would silently reduce the
+/// menu to a row that closes the dialog and does nothing — which is precisely the dead
+/// affordance this whole change is about.
+const MESSAGE_ACTION_COPY: &str = "copy";
+const MESSAGE_ACTION_REVERT: &str = "revert";
+
 /// The id the in-dialog prompt editor reports under.
 pub const EDITOR_FALLBACK_DIALOG_ID: &str = "prompt.editor.fallback";
 
@@ -89,6 +101,43 @@ pub const EDITOR_ALERT_DIALOG_ID: &str = "alert.editor";
 
 /// Rows reserved for the status strip.
 const STATUS_ROWS: u16 = 1;
+
+/// The info row's height on a `height`-row frame: [`INFO_ROWS`], or none when it costs the
+/// prompt its survival floor.
+///
+/// Measured, not defensive. On a four-row pane the bands demand `body 1 + prompt 2 + strip 1 +
+/// info 1 = 5`, and ratatui resolves the overflow by shrinking the prompt — so adding this row
+/// unconditionally left a one-row composer whose only row is the spacer, which is nowhere to
+/// type. [`PROMPT_MIN_ROWS`] calls two rows the least that can be typed into, and that floor
+/// outranks knowing which directory you are in.
+///
+/// The threshold is the sum of those minimums rather than a chosen number, so it cannot drift
+/// away from the bands it protects: raise [`PROMPT_MIN_ROWS`] and this moves with it. Above it
+/// the prompt is capped at a third of the frame ([`PROMPT_MAX_SHARE`]), so `1 + height/3 + 2`
+/// never exceeds `height` and the row is always affordable.
+///
+/// A function rather than a constant because two places need the same answer — the vertical
+/// split and [`welcome_tail_rows`]'s subtraction — and a frame whose tail was computed against
+/// a row the split then dropped is off centre by one.
+pub(crate) const fn info_rows(height: u16) -> u16 {
+    if height >= 1 + PROMPT_MIN_ROWS + STATUS_ROWS + INFO_ROWS {
+        INFO_ROWS
+    } else {
+        0
+    }
+}
+
+/// Rows reserved for the ambient info row below the strip.
+///
+/// One, and always drawn — on the welcome screen as well as mid-conversation. Both halves of
+/// that are taken from a real `opencode 1.18.18` pane rather than chosen: measured at 120x32,
+/// its welcome frame carries the working directory on the frame's **last** row while the
+/// composer sits centred above it, and its conversation frame carries the same row with the
+/// command hints moved onto its right end. So the row is not a property of having a
+/// conversation, and a row that appeared with the first message would move the composer up by
+/// one the instant a reply landed — the objection [`PROMPT_PREFERRED_ROWS`] records about the
+/// prompt's height, applied to the frame's floor.
+const INFO_ROWS: u16 = 1;
 
 /// The prompt's survival floor, its preferred floor, and the share it may grow to.
 ///
@@ -192,6 +241,21 @@ const PROMPT_MARKER: &str = "›";
 /// hint long enough to be truncated there teaches less than a short one that fits.
 const PROMPT_PLACEHOLDER: &str = "ask anything, or / for commands";
 
+/// What separates the info row's right-hand facts from each other.
+///
+/// The transcript's own `·` rather than two spaces, so the row reads as one list; the status
+/// strip above joins its state fields with the same glyph.
+const INFO_SEPARATOR: &str = " · ";
+
+/// The fewest columns the info row keeps for the directory before dropping a right-hand fact.
+///
+/// A path elided to four columns is `…uno`, which names no directory — so on a narrow pane the
+/// context figure and then the key hint yield instead, and the path keeps its tail. That is the
+/// opposite priority from the status strip, and deliberately: the strip's last survivor is the
+/// exit key because it is the only way out, while this row's reason to exist is saying *where
+/// you are*.
+const INFO_MIN_DIRECTORY_COLS: usize = 8;
+
 /// One blank column between the transcript and the ambient sidebar's rule.
 ///
 /// Measured, not stylistic. Without it a wrapped row that used its full width ended flush
@@ -217,9 +281,9 @@ const SIDEBAR_GAP_COLS: u16 = 1;
 /// the band is what this balances:
 ///
 /// ```text
-/// height = above + band + STATUS_ROWS + tail   (the whole frame, by definition)
-/// below  = STATUS_ROWS + tail = (height - band) / 2
-///   ⟹    tail = (height - band) / 2 - STATUS_ROWS
+/// height = above + band + STATUS_ROWS + tail + INFO_ROWS   (the frame, by definition)
+/// below  = STATUS_ROWS + tail + INFO_ROWS = (height - band) / 2
+///   ⟹    tail = (height - band) / 2 - STATUS_ROWS - INFO_ROWS
 ///   ⟹    above = ⌈(height - band) / 2⌉
 /// ```
 ///
@@ -228,11 +292,12 @@ const SIDEBAR_GAP_COLS: u16 = 1;
 /// band and the tail move in opposite directions by the same amount, so a prompt growing from
 /// four rows to ten stays centred the whole way.
 ///
-/// **The strip is counted as rows below the band, because that is where it is drawn.** It used
-/// to sit above, and a tail of `(height - band) / 2` balanced the band exactly. Now that the
-/// strip is the composer's footer the same tail leaves the band two rows high — the strip's own
-/// row, counted twice — so the subtraction is not a tweak, it is what keeps this function
-/// measuring the thing its name claims.
+/// **Every row drawn below the band is subtracted, because that is where it is drawn.** The
+/// strip used to sit above, and a tail of `(height - band) / 2` balanced the band exactly. Now
+/// that the strip is the composer's footer and [`INFO_ROWS`] sits under it, the unsubtracted
+/// tail leaves the band two rows off centre — those two rows, counted twice — so this is not a
+/// tweak, it is what keeps this function measuring the thing its name claims. Add a band below
+/// the prompt and it has to be subtracted here or the centring silently drifts by its height.
 ///
 /// # The head bounds it, and that is the only thing that can push the band off centre
 ///
@@ -268,7 +333,9 @@ fn welcome_tail_rows(empty: bool, height: u16, band: u16, body_max: u16, head: u
     if !empty {
         return 0;
     }
-    let centred = (height.saturating_sub(band) / 2).saturating_sub(STATUS_ROWS);
+    let centred = (height.saturating_sub(band) / 2)
+        .saturating_sub(STATUS_ROWS)
+        .saturating_sub(info_rows(height));
     let room = body_max.saturating_sub(head.max(1));
     centred.min(room)
 }
@@ -300,21 +367,29 @@ const fn sidebar_drawn(sidebar_visible: bool, empty: bool, width: u16) -> bool {
 /// pane it leaves twenty columns of air on each side — enough to be air rather than a rounding
 /// error.
 ///
-/// # Only while the transcript is empty, and that is a decision rather than an omission
+/// # It applies in a used session too, and the reasoning that said otherwise was half right
 ///
-/// The composer is narrowed on the welcome screen and left full width once a message lands.
-/// Three reasons, in the order they bind:
+/// This used to narrow the composer only while the transcript was empty, on three grounds. The
+/// second of them — that a composer centred on the *frame* would sit off the transcript's own
+/// axis once the ambient panel split the body — was correct, and was the reason the whole
+/// narrowing was abandoned mid-conversation rather than the reason it should be. It is answered
+/// by [`composer_bounds`], which measures the composer inside the body's columns instead of the
+/// frame's, so the box is centred on the same axis the transcript is and stops at the panel's
+/// rule. That was the reported defect: at 120 columns the composer and the strip ran edge to
+/// edge underneath a sidebar that occupies the last thirty-eight of them.
 ///
-/// 1. Mid-conversation the composer is what a pasted diff or stack trace goes into, and
-///    [`PROMPT_MAX_SHARE`] already rations its rows; rationing its columns as well would evict
-///    the one region whose content the user supplies.
-/// 2. The body is split by the ambient panel from [`crate::views::SIDEBAR_MIN_WIDTH`] up, so a
-///    composer centred on the *frame* would sit off the transcript's own axis — the exact
-///    two-blocks-on-different-axes defect the welcome head and foot are centred together to
-///    avoid.
-/// 3. The welcome arrangement is already a separate composition: the tail exists only while the
-///    transcript is empty and "reduces to today's exact layout the moment a message arrives".
-///    The width follows the same rule, so there are two compositions rather than three.
+/// The first ground — that mid-conversation the composer is where a pasted diff goes, so
+/// rationing its columns evicts the one region whose content the user supplies — is superseded
+/// on the horizontal axis and still stands on the vertical one. A pasted block wraps; it does
+/// not need the panel's columns to be readable, and [`PROMPT_MAX_SHARE`] keeps rationing rows.
+/// The third — that the welcome arrangement is a separate composition — remains true of the
+/// *tail*, which is still empty-only, but a width rule does not have to follow a row rule.
+///
+/// Eighty columns is the same measure prose has been set to for a century, it is exactly what
+/// the transcript keeps beside the panel at [`crate::views::SIDEBAR_MIN_WIDTH`] (120 less the
+/// panel and its gap), and that equality is now load-bearing rather than incidental: at 120
+/// columns the body is 80 wide, so the composer fills it and the two regions share an axis by
+/// arithmetic rather than by coincidence.
 const COMPOSER_MAX_COLS: u16 = 80;
 
 /// The glyphs that close the composer's left and right edges.
@@ -328,26 +403,55 @@ const COMPOSER_MAX_COLS: u16 = 80;
 const COMPOSER_LEFT_RULE: &str = "▌";
 const COMPOSER_RIGHT_RULE: &str = "▐";
 
-/// `band` narrowed to the composer's central region, or `band` itself when not `centred`.
+/// The columns of `band` the composer may use, given whether the ambient panel is drawn.
+///
+/// The panel is drawn over the *body* region only — see [`Component::render`]'s horizontal
+/// split — but the prompt band and the status strip are separate bands spanning the whole
+/// frame, so nothing stopped them from running underneath it. Measured at 120x32 with a
+/// conversation in progress, the composer and its footer reached column 119 while the panel's
+/// rule stood at column 81, which is what was reported as the input box crossing into the
+/// right-hand region.
+///
+/// The subtraction is the *same* one the body's split performs, spelled once here and read by
+/// both the render path and the tests, for the reason [`prompt_and_tail`](SessionScreen::prompt_and_tail)
+/// is one function: a second copy of this arithmetic that drifted would leave every assertion
+/// about the composer reading the panel's columns, where the row is blank, so the failure would
+/// name the wrong thing.
+///
+/// Saturating rather than checked: a frame narrow enough for the panel not to be drawn never
+/// reaches the subtraction, and one wide enough to draw it has the columns by construction —
+/// but the guard costs nothing and the alternative is an underflow on a `Rect` field.
+const fn composer_bounds(band: Rect, sidebar: bool) -> Rect {
+    if !sidebar {
+        return band;
+    }
+    let taken = SIDEBAR_GAP_COLS.saturating_add(crate::views::ambient::SIDEBAR_WIDTH);
+    Rect {
+        width: band.width.saturating_sub(taken),
+        ..band
+    }
+}
+
+/// `bounds` narrowed to the composer's central region.
 ///
 /// The narrowing is a `min`, never a `clamp`. [`u16::clamp`] **panics when its minimum exceeds
 /// its maximum** — the hazard [`prompt_rows`] documents at length — and on the 20-column pane a
 /// real terminal reaches, [`COMPOSER_MAX_COLS`] is four times the frame. Taking the smaller of
 /// the two orders them by construction, so a narrow pane degrades to the full width rather than
 /// to a slit or an abort.
-const fn composer_region(band: Rect, centred: bool) -> Rect {
-    if !centred {
-        return band;
-    }
-    let width = if band.width < COMPOSER_MAX_COLS {
-        band.width
+///
+/// Centred within `bounds` and not within the frame, which is what keeps the box on the
+/// transcript's own axis once [`composer_bounds`] has taken the panel's columns away.
+const fn composer_region(bounds: Rect) -> Rect {
+    let width = if bounds.width < COMPOSER_MAX_COLS {
+        bounds.width
     } else {
         COMPOSER_MAX_COLS
     };
     Rect {
-        x: band.x + (band.width - width) / 2,
+        x: bounds.x + (bounds.width - width) / 2,
         width,
-        ..band
+        ..bounds
     }
 }
 
@@ -486,6 +590,12 @@ pub struct SessionScreen {
     /// cancellation is routed: [`crate::views::dialog::DialogHost`] pops the dialog and
     /// *then* tells the base.
     theme_restore: Option<Arc<crate::theme::Resolved>>,
+    /// The transcript index [`Self::message_actions`] last opened a menu for.
+    ///
+    /// Held for the reason [`Self::theme_restore`] is: the dialog is gone by the time its
+    /// answer is routed. Cleared when the answer arrives, so a later outcome from some other
+    /// dialog cannot be applied to a message the user is no longer looking at.
+    message_menu: Option<usize>,
     /// The user's resolved keymap, for the keybinding reference.
     ///
     /// Optional because every view test builds a screen without one, and a help view
@@ -633,6 +743,7 @@ impl SessionScreen {
             toasts: Vec::new(),
             selections: None,
             theme_restore: None,
+            message_menu: None,
             modal: None,
             scroller: Scroller::new(&context.config),
             started: Instant::now(),
@@ -1246,11 +1357,18 @@ impl Component for SessionScreen {
         // Prompt above strip: the agent and the model are what the *composer* is set to, so they
         // belong under the box the way a caption belongs under a figure. See `welcome_tail_rows`,
         // which counts the strip among the rows below the band for exactly this reason.
-        let [body, prompt, status, tail] = Layout::vertical([
+        // The info row is last, so `body / prompt / status / tail` — the order every other
+        // assertion about this screen measures from — is untouched and the new band is appended
+        // rather than inserted. That is also where the reference puts it: a real
+        // `opencode 1.18.18` frame carries its directory row on the terminal's final line,
+        // under the composer on a used session and under the whole welcome surface on an empty
+        // one. See `INFO_ROWS`.
+        let [body, prompt, status, tail, info] = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(prompt_band),
             Constraint::Length(STATUS_ROWS),
             Constraint::Length(tail),
+            Constraint::Length(info_rows(area.height)),
         ])
         .areas(area);
 
@@ -1284,17 +1402,30 @@ impl Component for SessionScreen {
             // make those warnings unreachable, and drawing only the transcript is the
             // bug this pair replaces.
             self.render_session_notices(frame, main, area.height);
+            // *After* those notices, because drawing them goes through the transcript and so
+            // records their rows as click targets. `message_actions` refuses a `Role::System`
+            // message anyway, but the map is retracted rather than relied on to be harmless:
+            // the geometry of a two-row notice region has nothing to do with where the
+            // transcript's own rows land once a conversation starts.
+            self.transcript.forget_hit_targets();
         } else {
             self.transcript.render(frame, main);
         }
 
+        // Both the panel and the strip read the transcript's single accumulator rather than
+        // folding the provider stream again, which is what keeps the two token figures on
+        // screen from ever disagreeing.
+        //
+        // Refreshed on *every* frame, and that is a fix rather than a move. It used to happen
+        // inside the branch that draws the panel, so on a frame with no panel the ambient facts
+        // kept whatever the last panel-bearing frame left there. That was invisible while the
+        // panel was their only reader; the info row reads `context_used` as well, so at 80
+        // columns it would have reported a figure from an unrelated frame — or, on a session
+        // that never drew a panel, nothing at all.
+        let ambient = self.sidebar.ambient_mut();
+        ambient.tokens = self.transcript.transcript().tokens();
+        ambient.context_used = self.transcript.transcript().context_used();
         if let Some(aside) = aside {
-            // Both the panel and the strip read the transcript's single accumulator
-            // rather than folding the provider stream again, which is what keeps the
-            // two token figures on screen from ever disagreeing.
-            let ambient = self.sidebar.ambient_mut();
-            ambient.tokens = self.transcript.transcript().tokens();
-            ambient.context_used = self.transcript.transcript().context_used();
             self.sidebar.render(frame, aside);
         } else {
             // The panel's click targets are frame geometry, so the frame that stops drawing
@@ -1332,7 +1463,12 @@ impl Component for SessionScreen {
         // colour seam the centring band's fill exists to avoid, reintroduced sideways.
         crate::views::fill(frame.buffer_mut(), prompt, self.context.surface());
         crate::views::fill(frame.buffer_mut(), status, self.context.surface());
-        let composer = composer_region(prompt, empty);
+        // `sidebar_drawn` and not `empty`: the composer's columns are bounded by whether the
+        // panel is on screen, which is what makes the box share the transcript's axis instead of
+        // running under the panel. The same predicate the horizontal split above used, so the
+        // two cannot disagree about where the body ends.
+        let sidebar = sidebar_drawn(self.sidebar_visible, empty, area.width);
+        let composer = composer_region(composer_bounds(prompt, sidebar));
         // The whole band is painted next, so the spacer row and the right inset carry the
         // prompt's own background rather than whatever the previous frame left there. `element`
         // rather than `text`: they differ only in background, and `text`'s is the surface the
@@ -1342,8 +1478,14 @@ impl Component for SessionScreen {
         // Narrowed to the same region as the band it describes, and by the same call: a
         // full-width strip under a centred box would put the composer's own footer on a
         // different axis from the composer.
-        self.status.render(frame, composer_region(status, empty));
-        self.composer_rules(frame, prompt.union(status), composer);
+        self.status
+            .render(frame, composer_region(composer_bounds(status, sidebar)));
+        self.composer_rules(
+            frame,
+            composer_bounds(prompt, sidebar).union(composer_bounds(status, sidebar)),
+            composer,
+        );
+        self.render_info(frame, info);
         let (gutter, buffer) = prompt_frame(composer);
         if let Some(gutter) = gutter {
             crate::views::editor::PromptGutter::new(self.context.clone(), PROMPT_MARKER.to_owned())
@@ -1443,6 +1585,88 @@ impl SessionScreen {
         }
     }
 
+    /// Draw the ambient info row: the working directory, the context spend, the command key.
+    ///
+    /// # A third surface, deliberately, and why the strip could not carry these
+    ///
+    /// The strip directly above states what the *composer is set to* — agent, model, step,
+    /// and what the turn is blocked on. These three facts are about the **session's
+    /// surroundings** and none of them changes when a turn does, which is why
+    /// [`StatusView::reset`](crate::views::message::StatusView) would be wrong for them: it
+    /// clears the strip at every turn boundary on the grounds that the strip reports what is
+    /// happening rather than what last happened. A directory does not stop being true when a
+    /// turn ends.
+    ///
+    /// So it is its own band with its own surface — [`crate::views::ViewContext::muted`] on the
+    /// body's background, where the strip is [`crate::views::ViewContext::element`]. That is
+    /// what makes it read as a footer *outside* the composer rather than as a second row of it,
+    /// and it is why it spans the frame while the composer does not: it belongs to the screen,
+    /// not to the box.
+    ///
+    /// # Three facts and no more, in ascending priority
+    ///
+    /// The directory is truncated from the left when it does not fit
+    /// ([`crate::views::ambient::elide_left`], whose note explains why the tail is what
+    /// identifies a path), and the right-hand pair is dropped whole rather than cut — the same
+    /// ladder [`StatusView::trailers`](crate::views::message::StatusView) uses, for the same
+    /// reason: a fragment of a key name names no key.
+    ///
+    /// The command hint comes from [`crate::views::pressable_label`] rather than a literal, so
+    /// a user who rebound `command_list` is told their own chord. A hint that resolves to
+    /// nothing is omitted instead of printed as `none`.
+    fn render_info(&self, frame: &mut Frame<'_>, area: Rect) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        crate::views::fill(frame.buffer_mut(), area, self.context.surface());
+        ratatui::widgets::Widget::render(
+            ratatui::widgets::Paragraph::new(vec![self.info_line(area.width)])
+                .style(self.context.surface()),
+            area,
+            frame.buffer_mut(),
+        );
+    }
+
+    /// The info row's single line, for a `width`-column frame.
+    pub(crate) fn info_line(&self, width: u16) -> ratatui::text::Line<'static> {
+        let ambient = self.sidebar.ambient();
+        let directory = ambient.directory.clone().unwrap_or_default();
+        let mut trailing = Vec::new();
+        if let Some(used) = ambient.context_used {
+            trailing.push(format!("{used}% context"));
+        }
+        if let Some(key) = crate::views::pressable_label("command_list", &self.context) {
+            trailing.push(format!("{key} commands"));
+        }
+        let columns = usize::from(width);
+        let muted = self.context.muted();
+        // Rungs richest first, dropping the leftmost — which is to say the lowest-ranked —
+        // field still present, so the right edge does not reflow as the terminal narrows. The
+        // same construction `StatusView::trailers` documents.
+        for dropped in 0..=trailing.len() {
+            let trailer = trailing[dropped..].join(INFO_SEPARATOR);
+            let right = crate::views::display_width(&trailer);
+            // One column of air at each end plus one between the two halves, so neither half
+            // ever touches the frame's edge or the other.
+            let room = columns.saturating_sub(right + if right == 0 { 2 } else { 3 });
+            if room < INFO_MIN_DIRECTORY_COLS && !directory.is_empty() {
+                continue;
+            }
+            let left = crate::views::ambient::elide_left(&directory, room);
+            let gap = columns
+                .saturating_sub(crate::views::display_width(&left) + right + 2)
+                .max(usize::from(right > 0));
+            return ratatui::text::Line::from(vec![
+                ratatui::text::Span::styled(String::from(" "), self.context.surface()),
+                ratatui::text::Span::styled(left, muted),
+                ratatui::text::Span::styled(" ".repeat(gap), self.context.surface()),
+                ratatui::text::Span::styled(trailer, muted),
+                ratatui::text::Span::styled(String::from(" "), self.context.surface()),
+            ]);
+        }
+        crate::views::padded(&format!(" {directory}"), width, muted)
+    }
+
     /// How many rows the session's own notices need at `width`.
     ///
     /// One function for two callers, because they must agree: [`Self::prompt_and_tail`]
@@ -1531,7 +1755,18 @@ impl SessionScreen {
         } else {
             0
         };
-        let body_max = height.saturating_sub(STATUS_ROWS.saturating_add(band));
+        // Every band other than the body and the tail, which is what `body_max` means: the rows
+        // the body would get if the tail took none. `info_rows` belongs here for the same reason
+        // `STATUS_ROWS` does, and leaving it out is not a rounding error — it overstates the
+        // room the tail may take by one, so the tail takes a row the body needed and the head
+        // this term exists to protect is clipped by exactly that row. Measured: a startup notice
+        // at 40 columns lost its first line, and a CJK notice reassembled to a *suffix* of
+        // itself because the transcript follows its newest row.
+        let body_max = height.saturating_sub(
+            STATUS_ROWS
+                .saturating_add(info_rows(height))
+                .saturating_add(band),
+        );
         (band, welcome_tail_rows(empty, height, band, body_max, head))
     }
 
@@ -1606,9 +1841,136 @@ impl SessionScreen {
         if self.sidebar.click(column, row) {
             return EventResult::REDRAW;
         }
-        // Unhandled rather than swallowed: the transcript and the prompt do not act on a
-        // press yet, and claiming it here would silently forbid one that later does.
+        // The panel first, because it is drawn *over* the body's right-hand columns and its
+        // rows would otherwise be claimed by whichever transcript row lies beneath them.
+        if let Some(dialog) = self.message_actions(column, row) {
+            self.requested.push(dialog);
+            return EventResult::REDRAW;
+        }
+        // Unhandled rather than swallowed: the prompt does not act on a press yet, and
+        // claiming it here would silently forbid one that later does.
         EventResult::IGNORED
+    }
+
+    /// The action menu for whichever message was pressed, or nothing when none was.
+    ///
+    /// # Only the user's own messages, and the box is the reason that reads correctly
+    ///
+    /// The owner asked for a menu on "the message you typed", and a framed user turn is now
+    /// visibly a distinct object on screen — see
+    /// [`TranscriptView::push_boxed`](crate::views::message) — so a box that answers a press
+    /// while the prose beside it does not is a distinction the frame already taught. An
+    /// assistant reply and a session notice therefore fall through, which keeps a press on
+    /// them available to a later surface rather than opening a menu whose only honest row
+    /// would be `Copy`.
+    ///
+    /// # `Revert` is offered on the newest prompt only, and that is a real limit rather than
+    /// caution
+    ///
+    /// Revert is not a new capability: it is `/undo`, which reaches
+    /// `zuno_snapshot::Store::restore_turn` through [`HostCommand::Undo`] and restores the
+    /// worktree to the boundary before the last completed turn. That boundary is the one the
+    /// *newest* prompt opened, so offering it there is exact.
+    ///
+    /// On an older prompt it would have to mean "undo N turns", and the TUI cannot express
+    /// that: `SnapshotHistory` is a stack held by the host (`zuno-cli/src/cmd/tui.rs`), the
+    /// screen has no handle on it, and nothing in this crate maps a transcript index to a
+    /// checkpoint — a message is not a turn, since one turn appends the prompt, several
+    /// assistant steps and any number of notices. So the row is *absent* on older messages
+    /// rather than present and inert. A menu entry that silently does nothing is worse than a
+    /// shorter menu, and it is the failure mode this codebase has paid for repeatedly.
+    ///
+    /// Whether the host has a checkpoint to restore is deliberately **not** asked here. It
+    /// cannot be — the stack is the host's — and it does not need to be: `restore_snapshot`
+    /// answers `nothing to undo` and that refusal is reported. The same fallible-sink
+    /// discipline [`Self::commit_selection`] documents.
+    fn message_actions(
+        &mut self,
+        column: u16,
+        row: u16,
+    ) -> Option<Box<dyn crate::views::dialog::Dialog>> {
+        let index = self.transcript.message_at(column, row)?;
+        let messages = self.transcript.transcript().messages();
+        let message = messages.get(index)?;
+        if message.role != crate::views::message::Role::User {
+            return None;
+        }
+        let newest = messages
+            .iter()
+            .rposition(|held| held.role == crate::views::message::Role::User)
+            == Some(index);
+        let mut items = vec![
+            crate::views::picker::Item::new("Copy message")
+                .described("put this prompt on the clipboard")
+                .valued(MESSAGE_ACTION_COPY),
+        ];
+        if newest {
+            items.push(
+                crate::views::picker::Item::new("Revert this turn")
+                    .described("restore the worktree to before this prompt ran")
+                    .valued(MESSAGE_ACTION_REVERT),
+            );
+        }
+        // Remembered here rather than encoded into the row's value, for the reason
+        // `theme_restore` is a field: `DialogHost` pops the dialog and *then* routes its
+        // outcome, so by the time the answer arrives the menu that knew which message it was
+        // about no longer exists. A value like `copy:7` would work and would also make the
+        // index a string parsed at the far end, where a parse failure is a silently dead row.
+        self.message_menu = Some(index);
+        Some(Box::new(crate::views::picker::SelectDialog::new(
+            MESSAGE_ACTIONS_DIALOG_ID,
+            "Message",
+            self.context.clone(),
+            items,
+        )))
+    }
+
+    /// Act on a row of the message menu.
+    ///
+    /// `Copy` goes through [`Self::copy`], the same function the editor's own copy key and the
+    /// debug panel use, so the clipboard ladder, the OSC 52 preference and all three outcome
+    /// toasts are shared rather than reimplemented — see
+    /// [`crate::views::external`], whose module note explains why OSC 52 is tried first and is
+    /// what makes this work over SSH.
+    ///
+    /// `Revert` opens [`UNDO_CONFIRM_DIALOG_ID`] rather than submitting, and reuses the very
+    /// dialog `/undo` opens. Reaching the driver directly would be the defect that
+    /// confirmation was added for: this overwrites files on disk and discards anything edited
+    /// since, and a mistyped click is at least as easy as a mistyped `/undo`.
+    fn act_on_message(&mut self, index: usize, action: &str) -> EventResult {
+        match action {
+            MESSAGE_ACTION_COPY => {
+                let text = self
+                    .transcript
+                    .transcript()
+                    .messages()
+                    .get(index)
+                    .map(|message| {
+                        message
+                            .parts
+                            .iter()
+                            .filter_map(crate::views::message::MessagePart::text)
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+                self.copy(text)
+            }
+            MESSAGE_ACTION_REVERT => {
+                self.requested.push(Box::new(
+                    crate::views::basics::ConfirmDialog::new(
+                        self.context.clone(),
+                        UNDO_CONFIRM_DIALOG_ID,
+                        "Revert the last turn",
+                        "The worktree is restored to the boundary before the last completed \
+                         turn. Anything edited since is discarded and cannot be recovered.",
+                    )
+                    .with_labels("Restore", "Keep"),
+                ));
+                EventResult::REDRAW
+            }
+            _ => EventResult::IGNORED,
+        }
     }
 
     /// Scroll the transcript by `notches` observed at `now_ms`.
@@ -1971,8 +2333,31 @@ impl SessionScreen {
     ///
     /// The strip and the welcome facts are updated here so the choice is visible
     /// immediately, while the sink carries it to the host that can only apply it to the
-    /// *next* turn. Saying so in the transcript is the point: a model that changed on
-    /// screen but not in the running turn, with nothing said, is a surface that lies.
+    /// *next* turn. Saying so is the point: a model that changed on screen but not in the
+    /// running turn, with nothing said, is a surface that lies.
+    ///
+    /// # Said in a toast, not in the transcript, and that is the reported defect
+    ///
+    /// Every notice here used to be pushed onto the transcript. On a fresh session the
+    /// first thing a user did — press `<leader>m`, pick a model — therefore opened the
+    /// conversation with `model set to … for the next turn` as its *first message*, which
+    /// the owner reported as a session hint with no reason to be at the top of a first
+    /// conversation. Two things were wrong with it, and they are the two
+    /// [`Self::copy`] already records about the same choice:
+    ///
+    /// * It is **permanent.** A confirmation of a switch is true for one moment and is
+    ///   then exported, re-read and re-rendered forever as though it were part of the
+    ///   conversation. The durable answer already lives on the status strip, which states
+    ///   the agent and the model on every frame.
+    /// * It is **invisible when it matters.** A picker's answer is routed while the picker
+    ///   is closing, and a transcript row lands behind whatever modal is still up.
+    ///   `§11.4` puts a toast over the dialog for exactly this case.
+    ///
+    /// [`Self::cycle_agent`] already reached this conclusion for the *same* facts by a
+    /// different route — "cycling is exploratory and repeated, so walking seven agents
+    /// would leave seven permanent rows in a transcript being read for a reply" — so the
+    /// two surfaces that switch a model or an agent now report identically instead of one
+    /// of them writing history.
     fn adopt(&mut self, dialog: &'static str, value: &str) -> EventResult {
         let selection = match dialog {
             crate::views::picker::MODEL_DIALOG_ID => {
@@ -2001,10 +2386,8 @@ impl SessionScreen {
                 // The resolved name, not `value`: a theme that fell back is showing the
                 // fallback, and the notice should say what the user is looking at.
                 let name = self.context.theme().name.clone();
-                self.transcript.transcript_mut().push(Message::noticed(
-                    ToastLevel::Success,
-                    format!("theme set to {name}"),
-                ));
+                self.toasts
+                    .push(Toast::success(format!("theme set to {name}")));
                 return EventResult::REDRAW;
             }
             // The palette resolves to *another action's name*, so it re-enters the same
@@ -2015,7 +2398,7 @@ impl SessionScreen {
             SKILL_DIALOG_ID => {
                 // `Info`: nothing was refused and nothing succeeded — the picker exists to
                 // report the name, and this states it.
-                self.transcript.transcript_mut().push(Message::noticed(
+                self.toasts.push(Toast::new(
                     ToastLevel::Info,
                     format!("skill `{value}` — name it in a prompt to invoke it"),
                 ));
@@ -2024,9 +2407,7 @@ impl SessionScreen {
             _ => return EventResult::IGNORED,
         };
         let (text, level) = self.commit_selection(selection);
-        self.transcript
-            .transcript_mut()
-            .push(Message::noticed(level, text));
+        self.toasts.push(Toast::new(level, text));
         EventResult::REDRAW
     }
 
@@ -2178,6 +2559,18 @@ impl ActionComponent for SessionScreen {
                     );
                 }
                 EventResult::REDRAW
+            }
+            // Before the general `Selected` arm for the reason the undo confirmation is:
+            // `adopt` routes on the dialog id and would report this one as unknown.
+            crate::views::dialog::DialogOutcome::Selected { value, .. }
+                if dialog == MESSAGE_ACTIONS_DIALOG_ID =>
+            {
+                // Taken, not read: the menu is answered once, and an index left behind would
+                // let a later outcome act on a message the user is no longer pointing at.
+                match self.message_menu.take() {
+                    Some(index) => self.act_on_message(index, value),
+                    None => EventResult::IGNORED,
+                }
             }
             crate::views::dialog::DialogOutcome::Selected { value, .. } => {
                 self.adopt(dialog, value)

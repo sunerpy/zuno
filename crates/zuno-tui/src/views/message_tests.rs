@@ -754,9 +754,20 @@ fn views_transcript_keeps_a_warning_detail_that_the_status_strip_would_overwrite
         joined.contains("suppressed by same-named tool from plugin"),
         "the shadowing warning is not visible in the transcript:\n{joined}"
     );
+    // The `▲` rule at column zero, not the `Session` heading this used to look for. The
+    // heading is gone — see `TranscriptView::role_label` — and the property it was standing
+    // in for is unchanged and still checked here: the row must open with the session's own
+    // marker and with neither party's. `Role::marker`'s own note says this is what those
+    // three glyphs are for, so this reads the stronger carrier rather than a weaker one.
     assert!(
-        joined.contains("▲ Session"),
+        joined
+            .lines()
+            .any(|row| row.starts_with(Role::System.marker())),
         "the warning must be attributed to the session, not to the user or the model:\n{joined}"
+    );
+    assert!(
+        !joined.contains(Role::User.marker()) && !joined.contains(Role::Assistant.marker()),
+        "the warning is attributed to a party to the conversation:\n{joined}"
     );
     assert!(
         !joined.contains("session titled"),
@@ -1986,10 +1997,13 @@ fn views_transcript_rule_survives_a_step_boundary_and_breaks_between_speakers() 
         "the gap row carries content as well as the rule: {step_gap:?}"
     );
 
+    // Located by the notice's own text rather than by a `Session` heading, which no longer
+    // exists. The assertions below are unchanged: what is being checked is the *separator*
+    // above the session's first row, and that row is now the notice itself.
     let session = rendered
         .iter()
-        .position(|row| row.contains("Session"))
-        .expect("the notice's header is rendered");
+        .position(|row| row.contains("heads up"))
+        .expect("the notice is rendered");
     let speaker_gap = &rendered[session - 1];
     assert!(
         speaker_gap.trim().is_empty(),
