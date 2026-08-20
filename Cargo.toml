@@ -282,9 +282,11 @@ wiremock = "0.6.5"
 # ---------------------------------------------------------------------------
 [profile.dev]
 debug = "line-tables-only"
+split-debuginfo = "unpacked"
 
 [profile.test]
 debug = "line-tables-only"
+split-debuginfo = "unpacked"
 
 # Keep the terminal render stack optimized even in dev and test builds.
 #

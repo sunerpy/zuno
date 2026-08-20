@@ -1185,6 +1185,28 @@ fn docs_plugin_guide_matches_the_hooks_and_the_example_the_host_ships() {
             "publish = false",
         ],
     );
+
+    // The shebang example's deployment dependency, established by running the
+    // shipped examples against the real binary on a host where `node` is a
+    // version-manager shim: the compiled Go plugin loaded and the shebang script
+    // closed stdout at startup, from one binary, one directory, one run. The
+    // mechanism was not proved, so the guarded text claims none. What it does claim
+    // is the dependency, the exact failure string a user will search for, and both
+    // remedies -- and every one of those is load-bearing, because a reader who
+    // chooses the shebang without them has no way to recognise the failure. Matched
+    // against the unwrapped page so a reflow does not read as a broken edit.
+    contains_all_in(
+        &unwrapped("docs/plugin-authoring.md"),
+        "the shebang deployment caveat",
+        &[
+            "the interpreter it names has to resolve when the host spawns the file **directly**",
+            "a version-manager shim — mise, asdf, volta — can satisfy the interpreter \
+             interactively and still fail at this spawn",
+            "disabled plugin ... after startup failed: plugin connection is closed",
+            "Name the interpreter by absolute path in the shebang",
+            "ship a compiled executable, which removes the interpreter entirely",
+        ],
+    );
 }
 
 // ---------------------------------------------------------------------------

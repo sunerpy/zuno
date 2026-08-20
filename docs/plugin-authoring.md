@@ -140,7 +140,9 @@ What counts as a candidate:
 to the JavaScript tier, which speaks a different protocol; a file that is both a
 script and executable would otherwise be started twice. Name a JavaScript
 process-tier plugin without an extension and give it a shebang, as
-[`examples/js_plugin`](../examples/js_plugin) does.
+[`examples/js_plugin`](../examples/js_plugin) does — weighing first what
+[the shebang costs at deployment time](#the-javascript-example) against shipping a
+compiled file, because that is the choice this row is really between.
 
 The plugin's name in diagnostics is the file stem, until `plugin.initialize`
 returns a manifest id. A plugin that dies before answering has no id, and this is
@@ -173,6 +175,26 @@ step, because the shebang is what makes it runnable:
 ```sh
 install -m 755 examples/js_plugin ~/.zuno/plugin/js-example
 ```
+
+The shebang does not remove that build step so much as move it to deployment
+time: the interpreter it names has to resolve when the host spawns the file
+**directly**, which is a stronger requirement than being runnable from an
+interactive shell. Nothing a shell would have arranged is in play here, and a
+version-manager shim — mise, asdf, volta — can satisfy the interpreter
+interactively and still fail at this spawn. Zuno cannot tell that apart from a
+plugin that crashed on its own: the child closes stdout with nothing on stderr,
+and the user sees
+
+```text
+disabled plugin ... after startup failed: plugin connection is closed
+```
+
+with the file stem in place of the ellipsis. Two remedies, both removing the
+lookup rather than repairing it. Name the interpreter by absolute path in the
+shebang, which takes the `PATH` search and any shim out of the picture; or ship a
+compiled executable, which removes the interpreter entirely — [the Go
+example](#the-go-example) has nothing left to resolve, so this class of failure
+cannot reach it.
 
 ### The Rust example
 
