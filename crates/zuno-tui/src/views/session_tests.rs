@@ -5,6 +5,7 @@ use crate::app::{TerminalEvent, render_offscreen, terminal_event_channel};
 use crate::keybind::{KeyDispatcher, Keymap};
 use crate::views::dialog::DialogHost;
 use crate::views::editor::Position;
+use crate::views::message::{Role, USER_BOX_RIGHT, USER_BOX_RULE};
 use crate::views::testkit::{action, press, rows};
 use crate::views::toast::ToastLevel;
 use zuno_engine::r#loop::TurnEvent;
@@ -1446,9 +1447,15 @@ fn session_screen_applies_a_model_choice_and_forwards_it() {
         joined.contains("prov/sonnet"),
         "the strip still names the previous model:\n{joined}"
     );
+    // On the toast rather than in the transcript — see `SessionScreen::adopt`. The claim is
+    // unchanged: the user is told *when* the choice takes effect, because a strip that already
+    // names the new model without saying that would imply the running turn had switched.
+    let toasts = ActionComponent::drain_toasts(&mut screen);
     assert!(
-        joined.contains("next turn"),
-        "the transcript does not say when the choice takes effect:\n{joined}"
+        toasts
+            .iter()
+            .any(|toast| toast.text().contains("next turn")),
+        "nothing says when the choice takes effect: {toasts:?}"
     );
 }
 
@@ -1465,10 +1472,12 @@ fn session_screen_reports_a_choice_that_reached_nobody() {
             value: String::from("plan"),
         },
     );
-    let joined = rows(&render_offscreen(&mut screen, 90, 14).expect("infallible")).join("\n");
+    let toasts = ActionComponent::drain_toasts(&mut screen);
     assert!(
-        joined.contains("not applied"),
-        "a selection with no listener was reported as applied:\n{joined}"
+        toasts
+            .iter()
+            .any(|toast| toast.text().contains("not applied")),
+        "a selection with no listener was reported as applied: {toasts:?}"
     );
 }
 
@@ -3542,11 +3551,12 @@ fn prompt_band_rows(screen: &mut SessionScreen, width: u16, height: u16) -> usiz
         .iter()
         .position(|row| row.starts_with(PROMPT_MARKER))
         .expect("the prompt paints its gutter marker at every width these tests use");
-    // `STATUS_ROWS` as well as the tail, because the strip is now drawn *below* the band it
-    // describes — see the band order in `Component::render`. Without this term every caller
-    // would be told the band is one row taller than it is, and the whole table of degradation
-    // heights below would silently move by one.
-    rendered.len() - first - tail - usize::from(STATUS_ROWS)
+    // Every band below the prompt is subtracted — the strip and `INFO_ROWS` as well as the
+    // tail — because all of them are drawn *below* the band this measures. See the band order
+    // in `Component::render`. Without these terms every caller would be told the band is two
+    // rows taller than it is, and the whole table of degradation heights below would silently
+    // move by two.
+    rendered.len() - first - tail - usize::from(STATUS_ROWS) - usize::from(info_rows(height))
 }
 
 /// One left press at `(column, row)`, delivered the way the event loop delivers one.
@@ -4019,7 +4029,15 @@ fn session_wheel_landing_on_the_bottom_re_arms_following_a_live_turn() {
     // one they scrolled back to the bottom of must follow again.
     let (mut screen, _shutdown) = scrollable(scroll_config(Some(3.0), None));
     notch_up(&mut screen, 1_000);
-    for step in 0..60 {
+    // Derived from the measured transcript rather than the literal `60` this used to be.
+    // Each notch moves at least one row, so a notch per row cannot fail to reach the
+    // bottom — whereas a fixed count silently stops reaching it the moment a message
+    // occupies more rows than it used to, which is what framing the user's turn did:
+    // 60 notches at speed 3.0 moved 180 rows against a transcript that had become 313.
+    // The claim being tested is about what happens *at* the bottom, so a count that no
+    // longer arrives there tests nothing.
+    let notches = u64::try_from(screen.transcript.content_height()).unwrap_or(u64::MAX);
+    for step in 0..notches {
         notch(&mut screen, 2_000 + step * 1_000);
     }
     let bottom = screen.transcript.content_height() - screen.transcript.viewport_height();
@@ -4211,9 +4229,16 @@ fn every_bound_action_in_a_registered_scope_either_reaches_something_or_is_a_nam
 /// helper that assumed one width would point every caller at the wrong row on the others.
 fn prompt_first(rendered: &[String], screen: &SessionScreen, width: u16, height: u16) -> usize {
     let (band, tail) = screen.prompt_and_tail(width, height);
-    rendered
-        .len()
-        .saturating_sub(usize::from(tail) + usize::from(STATUS_ROWS) + usize::from(band))
+    // Every band `render` draws below the prompt is subtracted, `INFO_ROWS` included. One
+    // function, so a band added to the frame's foot moves every assertion that locates the
+    // prompt at once rather than leaving them reading a row that has shifted — which is the
+    // reason this helper exists at all.
+    rendered.len().saturating_sub(
+        usize::from(tail)
+            + usize::from(STATUS_ROWS)
+            + usize::from(info_rows(height))
+            + usize::from(band),
+    )
 }
 
 /// Where the status strip is, which is directly below the prompt band by construction.
@@ -4265,10 +4290,11 @@ fn prompt_band(
 /// would be blank, so the failure would name the wrong thing.
 fn composer_span(screen: &SessionScreen, width: u16, height: u16) -> (usize, usize) {
     // The production predicate, not `messages().is_empty()`: a session notice leaves the
-    // composer narrowed, so a helper that counted notices as a transcript would hand every
-    // assertion below the full-frame columns and read the margin instead of the band.
+    // composer bounded by the body, so a helper that counted notices as a transcript would hand
+    // every assertion below the wrong columns and read the margin instead of the band.
     let empty = !screen.transcript.transcript().conversation_started();
-    let region = composer_region(Rect::new(0, 0, width, height), empty);
+    let sidebar = sidebar_drawn(screen.sidebar_visible(), empty, width);
+    let region = composer_region(composer_bounds(Rect::new(0, 0, width, height), sidebar));
     (usize::from(region.x), usize::from(region.width))
 }
 
@@ -4832,6 +4858,11 @@ fn cycling_a_catalog_with_nothing_to_cycle_says_so_rather_than_going_quiet() {
 // ---------------------------------------------------------------------------
 
 /// A committed model choice is reported as a success, not as a warning.
+///
+/// Read off the toast rather than off a rendered transcript notice, because that is where the
+/// confirmation now goes — see [`SessionScreen::adopt`]. The grade distinction this test exists
+/// for is unchanged and is if anything more directly checked: `Toast::level` is the level, where
+/// the previous form inferred it from a marker glyph painted into a row.
 #[test]
 fn a_delivered_model_choice_is_reported_with_the_success_affordance() {
     let (selections, _keep) = mpsc::channel(4);
@@ -4841,22 +4872,32 @@ fn a_delivered_model_choice_is_reported_with_the_success_affordance() {
         crate::views::picker::MODEL_DIALOG_ID,
         "amazon-bedrock/amazon.nova-lite-v1:0",
     );
-    let rendered = rows(&render_offscreen(&mut screen, 120, 24).expect("infallible"));
-
-    let success = notice_body_at(&rendered, ToastLevel::Success);
+    let toasts = ActionComponent::drain_toasts(&mut screen);
     assert!(
-        success
-            .iter()
-            .any(|row| row.contains("model set to amazon-bedrock/amazon.nova-lite-v1:0")),
-        "a model that was set is not reported at success grade: {rendered:?}"
+        toasts.iter().any(|toast| {
+            toast.level() == ToastLevel::Success
+                && toast
+                    .text()
+                    .contains("model set to amazon-bedrock/amazon.nova-lite-v1:0")
+        }),
+        "a model that was set is not reported at success grade: {toasts:?}"
     );
     // The other half, and the half that fails on the shipped behaviour: the same sentence must
-    // not also be reachable through the warning marker. Asserting only the success row would
-    // pass a renderer that drew both, and `▲ !` on a confirmation is the reported defect.
-    let warned = notice_body_at(&rendered, ToastLevel::Warning);
+    // not also be reachable at warning grade. Asserting only the success toast would pass a
+    // surface that raised both, and `!` on a confirmation is the reported defect.
     assert!(
-        !warned.iter().any(|row| row.contains("model set to")),
-        "the model confirmation still carries the warning marker: {warned:?}"
+        !toasts.iter().any(|toast| {
+            toast.level() == ToastLevel::Warning && toast.text().contains("model set to")
+        }),
+        "the model confirmation still carries the warning affordance: {toasts:?}"
+    );
+    // And it does not also write history, which is the defect the toast replaces: a
+    // confirmation left in the transcript is exported and re-read as part of the conversation.
+    assert!(
+        rows(&render_offscreen(&mut screen, 120, 24).expect("infallible"))
+            .iter()
+            .all(|row| !row.contains("model set to")),
+        "the confirmation is still pushed onto the transcript as well"
     );
 }
 
@@ -4866,18 +4907,19 @@ fn a_refused_model_choice_keeps_the_warning_affordance() {
     // No selection sink, which is the refusal path.
     let (mut screen, _shutdown) = screen();
     screen.adopt(crate::views::picker::MODEL_DIALOG_ID, "p/m");
-    let rendered = rows(&render_offscreen(&mut screen, 120, 24).expect("infallible"));
-
-    let warned = notice_body_at(&rendered, ToastLevel::Warning);
+    let toasts = ActionComponent::drain_toasts(&mut screen);
     assert!(
-        warned
-            .iter()
-            .any(|row| row.contains("not applied: nothing is listening")),
-        "a refused selection is not reported at warning grade: {rendered:?}"
+        toasts.iter().any(|toast| {
+            toast.level() == ToastLevel::Warning
+                && toast.text().contains("not applied: nothing is listening")
+        }),
+        "a refused selection is not reported at warning grade: {toasts:?}"
     );
     assert!(
-        notice_body_at(&rendered, ToastLevel::Success).is_empty(),
-        "a selection that reached nothing was reported as a success: {rendered:?}"
+        !toasts
+            .iter()
+            .any(|toast| toast.level() == ToastLevel::Success),
+        "a selection that reached nothing was reported as a success: {toasts:?}"
     );
 }
 
@@ -4913,7 +4955,7 @@ fn the_welcome_screen_lifts_the_prompt_and_a_used_session_does_not() {
         let first = prompt_first(&rendered, &used, width, height);
         let band = usize::from(prompt_rows(used.editor.height(), height));
         assert_eq!(
-            first + band + usize::from(STATUS_ROWS),
+            first + band + usize::from(STATUS_ROWS) + usize::from(info_rows(height)),
             rendered.len(),
             "at {width}x{height} a used session pays for the welcome tail it cannot see"
         );
@@ -5067,17 +5109,19 @@ fn the_prompt_band_is_centred_on_the_frame() {
         );
         // The edges found by paint have to be the edges the split produced, or the measures
         // above are of different things and the skew is a coincidence.
-        // `gap_below` counts the strip as well as the tail, because the strip is drawn below the
-        // band now — so the split's contribution to those rows is `STATUS_ROWS + tail`. Restore
-        // the old body / status / prompt / tail order and this is the assertion that fails: the
-        // painted band's lower edge stops being one row above the frame's `element` run.
+        // `gap_below` counts every band drawn below the composer — the strip, the tail and the
+        // info row — so the split's contribution to those rows is
+        // `STATUS_ROWS + tail + info_rows`. Restore the old body / status / prompt / tail order
+        // and this is the assertion that fails: the painted band's lower edge stops being one
+        // row above the frame's `element` run.
         let (band, tail) = blank.prompt_and_tail(width, height);
+        let info = info_rows(height);
         assert_eq!(
             (last + 1 - band_first, gap_below),
-            (usize::from(band), usize::from(STATUS_ROWS + tail)),
+            (usize::from(band), usize::from(STATUS_ROWS + tail + info)),
             "at {width}x{height} the painted band is rows {band_first}..={last} with \
              {gap_below} rows below it, but the split gave the band {band}, the strip \
-             {STATUS_ROWS} and the tail {tail}"
+             {STATUS_ROWS}, the tail {tail} and the info row {info}"
         );
         // And the surface still brackets the input rather than having been trimmed off it.
         let wordmark = rendered
@@ -5431,7 +5475,8 @@ fn the_first_message_takes_the_whole_welcome_band_with_it() {
             tail_before > 0,
             "at {width}x{height} the empty screen has no band to yield"
         );
-        let body_before = before.len() - usize::from(tail_before + band_before + STATUS_ROWS);
+        let below = STATUS_ROWS + info_rows(height);
+        let body_before = before.len() - usize::from(tail_before + band_before + below);
 
         screen
             .transcript_mut()
@@ -5443,7 +5488,7 @@ fn the_first_message_takes_the_whole_welcome_band_with_it() {
             tail_after, 0,
             "at {width}x{height} a used session still pays for the welcome band"
         );
-        let body_after = after.len() - usize::from(band_after + STATUS_ROWS);
+        let body_after = after.len() - usize::from(band_after + below);
         assert_eq!(
             body_after,
             body_before + usize::from(tail_before),
@@ -5452,9 +5497,7 @@ fn the_first_message_takes_the_whole_welcome_band_with_it() {
         // And the prompt is back on the frame's last row, which is what "yields completely"
         // means to a reader: the input stops moving between turns.
         assert_eq!(
-            prompt_first(&after, &screen, width, height)
-                + usize::from(band_after)
-                + usize::from(STATUS_ROWS),
+            prompt_first(&after, &screen, width, height) + usize::from(band_after + below),
             after.len(),
             "at {width}x{height} the prompt is still lifted after the first message"
         );
@@ -5551,9 +5594,10 @@ fn the_input_band_grows_on_both_input_paths_and_stays_centred() {
 
     let element = ratatui::style::Color::from(ViewContext::defaults().palette().background_element);
     for (width, height) in [(120u16, 32u16), (80, 24)] {
-        // Every fixture here has an empty transcript, so the composer is centred and the probe
-        // has to follow it. Taken from the production narrowing rather than re-derived.
-        let probe = composer_region(Rect::new(0, 0, width, height), true).x;
+        // Every fixture here has an empty transcript, so the panel is not drawn and the composer
+        // is centred on the whole frame. Taken from the production narrowing rather than
+        // re-derived.
+        let probe = composer_region(composer_bounds(Rect::new(0, 0, width, height), false)).x;
         // The chord path. `shift+return` cannot be delivered through a real terminal — the
         // legacy encoding gives it the same bytes as `return` — so `ctrl+j` is the spelling
         // driven here, and it is the same binding.
@@ -5836,4 +5880,374 @@ fn brand_row(rendered: &[String]) -> usize {
             row.contains(crate::views::welcome::WORDMARK[0].trim()) || row.contains("ZUNO")
         })
         .expect("the welcome brand is drawn")
+}
+
+// ---------------------------------------------------------------------------
+// The conversation screen: the four defects reported from a live 120x32 pane
+// ---------------------------------------------------------------------------
+
+/// A screen mid-conversation, with the ambient facts a real host resolves.
+///
+/// Both roles, because three of the four assertions below are about telling them apart, and a
+/// fixture holding only a prompt would let a renderer that framed *every* message pass. The
+/// directory and the context figure are set because the info row states them, and a fixture
+/// that left them unresolved would assert about an empty row.
+///
+/// The two widths every test here runs at are 120 and 80: [`crate::views::SIDEBAR_MIN_WIDTH`]
+/// is 120, so the first is the only one where the panel is drawn and the second is the widest
+/// common pane where it is not. A defect about the composer's columns can only be seen at the
+/// first, and a regression that fixed it by narrowing unconditionally can only be seen at the
+/// second.
+fn conversing() -> (SessionScreen, mpsc::Receiver<TerminalEvent>) {
+    let (mut screen, shutdown) = screen();
+    screen.sidebar_mut().ambient_mut().directory = Some(String::from("~/work/zuno"));
+    // Through the transcript, not by setting `Ambient::context_used` directly: `render`
+    // re-derives that field from the transcript on every frame so the panel, the strip and the
+    // info row cannot disagree, and a fixture that wrote the field would be overwritten before
+    // the first assertion — while appearing to work at whatever width the panel is not drawn.
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .set_context_limit(100_000);
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .observe(&zuno_engine::r#loop::TurnEvent::Provider {
+            step: 1,
+            event: zuno_llm::event::StreamEvent::TokenUsage {
+                input_tokens: Some(37_000),
+                output_tokens: Some(0),
+                cache_read_input_tokens: None,
+                cache_write_input_tokens: None,
+                accounting: zuno_llm::event::PromptAccounting::CacheInsideInput,
+            },
+        });
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .push(Message::user("summarise the plan"));
+    let mut assistant = Message::new(crate::views::message::Role::Assistant);
+    assistant
+        .parts
+        .push(crate::views::message::MessagePart::Text {
+            text: String::from("Here is the summary of the plan."),
+        });
+    screen.transcript_mut().transcript_mut().push(assistant);
+    (screen, shutdown)
+}
+
+/// Defect 1: a fresh conversation does not open with a `Session` header block.
+///
+/// The reported frame spent its first two rows on a `⚠ Session` heading over a one-line
+/// `model set to …` confirmation. Both halves are asserted, because either alone is satisfiable
+/// by the defect: the heading must be gone from the transcript, *and* a model switch must not
+/// put a row there at all — it is a toast now, so the row it used to own does not exist.
+///
+/// The notice used here is a `Role::System` message, which is what a startup warning is, so the
+/// session can still say things about itself; what it may not do is wear a header while doing
+/// so. That distinction is the whole test: a renderer that dropped session notices entirely
+/// would pass the first assertion and fail the second-to-last.
+#[test]
+fn the_conversation_does_not_open_with_a_session_header() {
+    for width in [120u16, 80] {
+        let (mut screen, _shutdown) = conversing();
+        screen
+            .transcript_mut()
+            .transcript_mut()
+            .push(Message::notice("warning: theme `nord` was not found"));
+        let rendered = rows(&render_offscreen(&mut screen, width, 32).expect("infallible"));
+        let joined = rendered.join("\n");
+        assert!(
+            !joined.contains("Session"),
+            "at {width} columns the transcript still wears a `Session` header:\n{joined}"
+        );
+        // The notice itself survives, attributed by its own rule. Without this the test would
+        // be satisfied by a renderer that hid every session message, which would make a theme
+        // fallback unreportable.
+        assert!(
+            rendered.iter().any(|row| row.contains("was not found")
+                && row.trim_start().starts_with(Role::System.marker())),
+            "at {width} columns the session's own notice is gone or unattributed:\n{joined}"
+        );
+        // And a model switch does not write a row at all: it is the reported example, and it
+        // reaches the same renderer through `adopt`.
+        let (mut switched, _shutdown) = conversing();
+        switched.adopt(crate::views::picker::MODEL_DIALOG_ID, "prov/model");
+        let after =
+            rows(&render_offscreen(&mut switched, width, 32).expect("infallible")).join("\n");
+        assert!(
+            !after.contains("model set to"),
+            "at {width} columns a model switch still opens the conversation with a notice:\n{after}"
+        );
+    }
+}
+
+/// Defect 2: the composer stops at the body's edge, and a second info row sits under the strip.
+///
+/// # Two claims, and the first is only visible at 120 columns
+///
+/// At 120 the panel occupies the last `SIDEBAR_WIDTH + SIDEBAR_GAP_COLS` columns, so the
+/// composer and its footer must end before them — the reported defect was both running to
+/// column 119 under a panel whose rule stands at 81. At 80 the panel is not drawn, so the
+/// composer may use the whole frame; asserting the narrowing at both widths would forbid that
+/// and is why the two are checked differently rather than in one loop body.
+///
+/// # The info row is asserted by content *and* by surface
+///
+/// Content alone would pass a row that merely repeated the strip. So the row must carry the
+/// directory and the command key, must be the frame's last row, and must be painted in the body
+/// surface rather than the strip's `element` — that is what makes it read as a footer outside
+/// the composer instead of a second row of it.
+#[test]
+fn the_composer_stays_inside_the_body_and_gains_an_info_row() {
+    for width in [120u16, 80] {
+        let (mut screen, _shutdown) = conversing();
+        let buffer = render_offscreen(&mut screen, width, 32).expect("infallible");
+        let rendered = rows(&buffer);
+        let (x, columns) = composer_span(&screen, width, 32);
+        let sidebar = width >= crate::views::SIDEBAR_MIN_WIDTH;
+
+        if sidebar {
+            let body = usize::from(width)
+                - usize::from(crate::views::ambient::SIDEBAR_WIDTH)
+                - usize::from(SIDEBAR_GAP_COLS);
+            assert!(
+                x + columns <= body,
+                "at {width} columns the composer runs to column {} while the body ends at \
+                 {body}, so the input box crosses into the sidebar's region",
+                x + columns
+            );
+            // The strip is the composer's footer and is narrowed by the same call, so it has to
+            // stop at the same place. A footer that crossed the panel would put the agent and
+            // the model under it while the box above stopped short — two axes again.
+            let strip = strip_index(&rendered, &screen, width, 32);
+            let footer: String = rendered[strip].chars().skip(body).collect();
+            assert!(
+                footer.trim().is_empty(),
+                "at {width} columns the status strip reaches into the sidebar's columns: \
+                 {footer:?}"
+            );
+        } else {
+            assert_eq!(
+                (x, columns),
+                (0, usize::from(width)),
+                "at {width} columns there is no panel, so the composer must keep the frame"
+            );
+        }
+
+        // The info row: last row of the frame, its own content, its own surface.
+        let info = rendered.last().expect("the frame has rows");
+        assert!(
+            info.contains("~/work/zuno"),
+            "at {width} columns the info row does not say where the session is: {info:?}"
+        );
+        assert!(
+            info.contains("commands"),
+            "at {width} columns the info row does not name the command key: {info:?}"
+        );
+        assert!(
+            info.contains("37% context"),
+            "at {width} columns the info row does not report the context spend: {info:?}"
+        );
+        let palette = screen.context.palette();
+        let last = u16::try_from(rendered.len() - 1).expect("in frame");
+        assert_eq!(
+            buffer[(1, last)].bg,
+            ratatui::style::Color::from(palette.background_panel),
+            "at {width} columns the info row shares the composer's surface, so it reads as \
+             another row of the box rather than as the screen's own footer"
+        );
+        // Strictly below the strip, which is what "its own row" means: a row that shared the
+        // strip's would have displaced the agent and the model rather than joined them.
+        let strip = strip_index(&rendered, &screen, width, 32);
+        assert!(
+            strip < rendered.len() - 1,
+            "at {width} columns the strip is on the frame's last row, so there is no info row \
+             beneath it"
+        );
+    }
+}
+
+/// Defect 3: the user's prompt is wrapped in a bordered container and the reply is not.
+///
+/// # Both sides, because a renderer that framed everything is the same failure in reverse
+///
+/// The complaint was that the two were indistinguishable. So the prompt's row must open with
+/// the user's rule *and* close with the box's right edge, and the reply's rows must do neither.
+/// Checking only the prompt would pass a renderer that framed the assistant too, leaving the
+/// two as alike as before.
+///
+/// The heading is asserted on the top rule rather than on a row of its own, which is where it
+/// now rides — see `TranscriptView::push_boxed`.
+#[test]
+fn the_users_prompt_is_framed_and_the_reply_is_not() {
+    for width in [120u16, 80] {
+        let (mut screen, _shutdown) = conversing();
+        let rendered = rows(&render_offscreen(&mut screen, width, 32).expect("infallible"));
+        // Sliced to the body's own columns, because at 120 the panel is drawn *on the same
+        // rows*: a whole frame row carries `▌ You ───▐ │   Context`, so an `ends_with` against
+        // the frame would be asserting about the sidebar rather than about the box. This is the
+        // same subtraction `composer_bounds` performs, taken from the production predicate.
+        let body = if sidebar_drawn(screen.sidebar_visible(), false, width) {
+            usize::from(width)
+                - usize::from(crate::views::ambient::SIDEBAR_WIDTH)
+                - usize::from(SIDEBAR_GAP_COLS)
+        } else {
+            usize::from(width)
+        };
+        let rendered: Vec<String> = rendered
+            .iter()
+            .map(|row| row.chars().take(body).collect())
+            .collect();
+        let joined = rendered.join("\n");
+
+        let top = rendered
+            .iter()
+            .position(|row| row.contains("You"))
+            .unwrap_or_else(|| panic!("at {width} columns the prompt has no heading:\n{joined}"));
+        assert!(
+            rendered[top].starts_with(Role::User.marker())
+                && rendered[top].trim_end().ends_with(USER_BOX_RIGHT),
+            "at {width} columns the prompt's top rule is not closed on both sides: {:?}",
+            rendered[top]
+        );
+        let body = rendered
+            .iter()
+            .position(|row| row.contains("summarise the plan"))
+            .unwrap_or_else(|| panic!("at {width} columns the prompt is missing:\n{joined}"));
+        assert!(
+            rendered[body].starts_with(Role::User.marker())
+                && rendered[body].trim_end().ends_with(USER_BOX_RIGHT),
+            "at {width} columns the prompt's own text is not inside the box: {:?}",
+            rendered[body]
+        );
+        // The closing rule, which is what makes it a container rather than a header with a
+        // right edge. Located as the first row after the body that carries no text of its own.
+        assert!(
+            rendered[body + 1..]
+                .iter()
+                .take(2)
+                .any(|row| row.starts_with(Role::User.marker())
+                    && row.contains(USER_BOX_RULE)
+                    && row.trim_end().ends_with(USER_BOX_RIGHT)),
+            "at {width} columns the prompt's box is never closed:\n{joined}"
+        );
+
+        // And the reply is bare prose: its own rule, no frame.
+        let reply = rendered
+            .iter()
+            .position(|row| row.contains("Here is the summary"))
+            .unwrap_or_else(|| panic!("at {width} columns the reply is missing:\n{joined}"));
+        assert!(
+            rendered[reply].starts_with(Role::Assistant.marker()),
+            "at {width} columns the reply lost its own rule: {:?}",
+            rendered[reply]
+        );
+        assert!(
+            !rendered[reply].trim_end().ends_with(USER_BOX_RIGHT),
+            "at {width} columns the reply is framed too, so the two sides are as alike as \
+             before: {:?}",
+            rendered[reply]
+        );
+    }
+}
+
+/// Defect 4: a press on the prompt opens a menu offering copy and revert.
+///
+/// # Driven through `handle_event`, and the copy is read back off a clipboard
+///
+/// The press goes through the event loop's own path for the reason `click_at` exists: a test
+/// that called the hit test directly would pass against a screen that never consumes a press.
+/// And the copy is asserted by reading the text back out of an injected
+/// [`crate::views::external::MemoryClipboard`], not by finding a toast — a toast saying
+/// `copied 18 characters` is exactly what a menu row that wrote nowhere would also produce.
+///
+/// # Revert is asserted to *confirm*, not to submit
+///
+/// It overwrites files on disk, so the row must open the same confirmation `/undo` opens. A
+/// test that accepted a submitted `/undo` would pass a build in which one stray click destroys
+/// uncommitted work.
+#[test]
+fn a_press_on_the_prompt_opens_a_menu_that_copies_and_reverts() {
+    for width in [120u16, 80] {
+        let clipboard = Arc::new(crate::views::external::MemoryClipboard::default());
+        let (screen, _shutdown) = conversing();
+        let mut screen = screen.with_clipboard(clipboard.clone());
+        let rendered = rows(&render_offscreen(&mut screen, width, 32).expect("infallible"));
+        let row = rendered
+            .iter()
+            .position(|row| row.contains("summarise the plan"))
+            .expect("the prompt is drawn");
+        let row = u16::try_from(row).expect("in frame");
+
+        assert!(
+            click_at(&mut screen, 3, row).redraw,
+            "at {width} columns a press on the prompt was not consumed, so no menu can open"
+        );
+        let opened = screen.drain_dialogs();
+        assert_eq!(
+            opened.len(),
+            1,
+            "at {width} columns a press on the prompt opened {} dialogs",
+            opened.len()
+        );
+        assert_eq!(opened[0].id(), MESSAGE_ACTIONS_DIALOG_ID);
+
+        // Copy: the text has to reach a clipboard, not just a toast.
+        screen.apply_dialog_outcome(
+            MESSAGE_ACTIONS_DIALOG_ID,
+            &crate::views::dialog::DialogOutcome::Selected {
+                dialog: MESSAGE_ACTIONS_DIALOG_ID,
+                value: String::from(MESSAGE_ACTION_COPY),
+            },
+        );
+        // Read back through the trait, which is what the screen wrote through: `read` returns
+        // whatever `write` last stored, so this is the round trip rather than a claim about it.
+        let held = crate::views::external::Clipboard::read(clipboard.as_ref())
+            .expect("a memory clipboard never fails to read");
+        assert_eq!(
+            held.as_ref().map(|content| content.data.as_str()),
+            Some("summarise the plan"),
+            "at {width} columns the copy row put nothing on the clipboard: {held:?}"
+        );
+
+        // Revert: the row exists, and it confirms rather than submitting.
+        let (mut reverting, _shutdown) = conversing();
+        let rendered = rows(&render_offscreen(&mut reverting, width, 32).expect("infallible"));
+        let row = u16::try_from(
+            rendered
+                .iter()
+                .position(|row| row.contains("summarise the plan"))
+                .expect("the prompt is drawn"),
+        )
+        .expect("in frame");
+        click_at(&mut reverting, 3, row);
+        let mut opened = reverting.drain_dialogs();
+        let offered = opened[0].lines(60).iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.contains("Revert"))
+        });
+        assert!(
+            offered,
+            "at {width} columns the menu on the newest prompt offers no revert row"
+        );
+        reverting.apply_dialog_outcome(
+            MESSAGE_ACTIONS_DIALOG_ID,
+            &crate::views::dialog::DialogOutcome::Selected {
+                dialog: MESSAGE_ACTIONS_DIALOG_ID,
+                value: String::from(MESSAGE_ACTION_REVERT),
+            },
+        );
+        let confirm = reverting.drain_dialogs();
+        assert_eq!(
+            confirm.first().map(|dialog| dialog.id()),
+            Some(UNDO_CONFIRM_DIALOG_ID),
+            "at {width} columns revert did not ask before overwriting the worktree"
+        );
+        assert!(
+            reverting.submissions().iter().all(|sent| sent != "/undo"),
+            "at {width} columns revert reached the driver without a confirmation"
+        );
+    }
 }
