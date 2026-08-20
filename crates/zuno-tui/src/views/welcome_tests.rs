@@ -75,6 +75,13 @@ fn views_welcome_fills_a_large_frame_without_sprawling_across_it() {
     // still cannot pass. The ceiling is on *extent* rather than on painted rows because a
     // blank spacer occupies the screen exactly as much as a row of text does, and spacers
     // are how the previous version spent a third of its height.
+    //
+    // The ceiling moved 18 -> 14, and the reason is not editorial. The owner centres
+    // *block + strip + prompt* on the frame, so every row here is a row the input sits
+    // further from the middle — the eighteen-row block was inside the reference band and
+    // still produced the top-heavy screen that was reported twice. 14 is what the current
+    // composition costs exactly, so this is now a ratchet: any new row has to be paid for
+    // by retiring one, and there is no slack left to grow into unnoticed.
     let mut view = view();
     let painted_rows = painted(&mut view, 200, 50);
     assert!(
@@ -85,10 +92,44 @@ fn views_welcome_fills_a_large_frame_without_sprawling_across_it() {
 
     let extent = extent(&mut view, 200, 50);
     assert!(
-        extent <= 18,
-        "the welcome block spans {extent} rows; it spanned 22 before the trim and the \
-         references it follows spend 11 (`jcode`), 13 (`codex`) and 16 (`claw-code`), so \
-         growing back past 18 means a row was added without a fact to justify it"
+        extent <= 14,
+        "the welcome block spans {extent} rows; it spanned 22, then 18, and the references \
+         it follows spend 10 (`jcode`), 15 (`codex`) and 17 (`claw-code`). Past 14 the \
+         composite this block is centred inside stops fitting a 24-row pane, so a new row \
+         has to retire one"
+    );
+}
+
+#[test]
+fn views_welcome_hides_the_tip_row_until_it_is_asked_for() {
+    // The cut, asserted from the shipped composition rather than from the constant. The tip
+    // was the one block here carrying neither a fact nor a key, and the two rows it spent are
+    // two rows the input sat further from the frame's middle.
+    //
+    // Hidden, not deleted: `tips_toggle` is a real binding in the shipped table, and a bound
+    // key that reaches nothing is the defect class this whole surface exists to remove. So the
+    // negative and the positive are one test — the row is absent by default *and* one call to
+    // the thing the key calls brings it back.
+    let mut view = view();
+    assert!(
+        !view.tips_visible(),
+        "the shipped composition still shows the tip row"
+    );
+    let shipped = rows(&render_offscreen(&mut view, 200, 50).expect("infallible")).join("\n");
+    assert!(
+        !shipped.contains("● tip"),
+        "the tip row is drawn on a screen that reports it hidden:\n{shipped}"
+    );
+
+    view.next_tip();
+    let asked = rows(&render_offscreen(&mut view, 200, 50).expect("infallible")).join("\n");
+    assert!(
+        asked.contains("● tip"),
+        "`tips_toggle` cannot bring the row back, so the binding reaches nothing:\n{asked}"
+    );
+    assert!(
+        asked.contains(view.tip()),
+        "the row came back without the tip it names:\n{asked}"
     );
 }
 
@@ -376,6 +417,36 @@ fn views_welcome_advertises_its_capabilities_as_slash_commands_at_every_supporte
 }
 
 #[test]
+fn views_welcome_advertises_three_commands_and_not_the_six_it_used_to() {
+    // The cut, named. The extent ratchet would also fail if these came back, but it would
+    // report "the block spans 15 rows" — true, and no help at all in finding out why. This
+    // names the rows instead.
+    //
+    // The three that went are settings a user goes looking for *after* they know `/` exists,
+    // which the row above has just told them; `/` lists all of them and the palette chord lists
+    // every binding. So the requirement is not "these strings are absent" — it is that the path
+    // to them is still on the screen, which is why the lead row is asserted in the same test.
+    let mut view = view();
+    let joined = rows(&render_offscreen(&mut view, 200, 50).expect("infallible")).join("\n");
+    for retired in ["/agent", "/theme", "/mcp"] {
+        assert!(
+            !joined.contains(retired),
+            "`{retired}` is advertised again; the grid is back to teaching a list `/` opens \
+             in one keystroke:\n{joined}"
+        );
+    }
+    assert!(
+        joined.contains("type / for commands"),
+        "the retired rows were cut without leaving the path that replaces them:\n{joined}"
+    );
+    assert_eq!(
+        SLASH_HINTS.len(),
+        3,
+        "the grid grew back; every row here is a row the input sits further from the middle"
+    );
+}
+
+#[test]
 fn views_welcome_never_renders_the_literal_leader_token() {
     // `<leader>` is `ctrl+x` and nothing on this screen says so, which is what made the
     // earlier grid undecodable. Asserted across the widths the grid reflows at, because a
@@ -533,10 +604,24 @@ fn views_welcome_drops_a_hint_the_user_disabled() {
 
 #[test]
 fn views_welcome_tips_advance_and_can_be_hidden() {
+    // The same three claims as before — next advances, hide removes the row, next after hide
+    // restores it — reordered for the composition that now starts hidden. The reorder is the
+    // point: the first `next_tip` on a hidden row must *reveal* rather than advance, or a user
+    // who pressed the key would silently skip a tip they never saw. That is the assertion the
+    // old ordering could not make, because the row was already visible when it started.
     let mut view = view();
+    assert!(!view.tips_visible(), "the shipped default is a hidden row");
     let first = view.tip();
     view.next_tip();
-    assert_ne!(view.tip(), first, "the tip did not change");
+    assert!(view.tips_visible(), "the row did not come back");
+    assert_eq!(
+        view.tip(),
+        first,
+        "revealing the row also advanced it, so the first tip a user ever sees is the second one"
+    );
+
+    view.next_tip();
+    assert_ne!(view.tip(), first, "the tip did not change on a visible row");
 
     view.hide_tips();
     assert!(!view.tips_visible());
@@ -545,18 +630,24 @@ fn views_welcome_tips_advance_and_can_be_hidden() {
         !hidden.contains("● tip"),
         "the tip row is still drawn after being hidden:\n{hidden}"
     );
-
-    // A hidden row plus "next" means "show me one again", not "silently advance".
-    view.next_tip();
-    assert!(view.tips_visible());
 }
 
 #[test]
 fn views_welcome_tip_index_wraps_instead_of_panicking() {
+    // `TIPS[self.tip % TIPS.len()]` on `usize::MAX`, and then on the wrap past it. The second
+    // `next_tip` is what advances: the first only reveals the row, so a single call would leave
+    // this asserting the same index twice and the wrapping arithmetic untested.
     let mut view = WelcomeView::new(ViewContext::defaults()).with_tip(usize::MAX);
     assert!(TIPS.contains(&view.tip()));
     view.next_tip();
+    let revealed = view.tip();
+    view.next_tip();
     assert!(TIPS.contains(&view.tip()));
+    assert_ne!(
+        view.tip(),
+        revealed,
+        "the index did not advance past usize::MAX"
+    );
 }
 
 #[test]
@@ -653,8 +744,12 @@ fn views_welcome_every_advertised_key_is_routed_by_the_session_screen() {
 #[test]
 fn views_welcome_mcp_and_help_hints_open_a_real_surface() {
     // The complement: routed *and* actually produces a dialog, not just a handled action.
-    // These two are now advertised as `/mcp` and `/help` rather than as leader chords, so
-    // the action behind each slash row is what has to open something.
+    //
+    // `/help` is still advertised, so the action behind its row has to open something. `/mcp`
+    // is not, and it stays here for the opposite reason: the trim removed a *row*, not a
+    // capability. `mcp_list` is still bound and `/mcp` still resolves, and a later change that
+    // broke either while nothing advertised them would be invisible — which is why the
+    // no-longer-advertised half is the half worth keeping under a guard.
     let (sender, _receiver) = crate::app::terminal_event_channel();
     let (mcp_toggles, _mcp_requests) = tokio::sync::mpsc::channel(1);
     let mut screen = crate::views::session::SessionScreen::new(ViewContext::defaults(), sender)
@@ -809,7 +904,14 @@ fn advertised_actions() -> Vec<(&'static str, String)> {
 #[test]
 #[ignore = "printer, not an assertion: run with --ignored --nocapture to eyeball the rendering"]
 fn views_welcome_visual_probe() {
-    for (width, height) in [(200u16, 34u16), (120, 34), (80, 34), (60, 30), (40, 24)] {
+    for (width, height) in [
+        (200u16, 50u16),
+        (120, 32),
+        (80, 24),
+        (60, 30),
+        (40, 24),
+        (20, 10),
+    ] {
         println!("\n=========== {width}x{height} ===========");
         let mut screen = composed();
         for (index, row) in rows(&render_offscreen(&mut screen, width, height).expect("infallible"))

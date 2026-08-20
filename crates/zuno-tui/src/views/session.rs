@@ -140,6 +140,29 @@ const PROMPT_MAX_SHARE: u16 = 3;
 /// `codex`'s *top* inset, because the status strip is already a filled full-width row
 /// directly above and a second blank row would spend a transcript row on separation the
 /// strip already supplies.
+///
+/// # The band's own surface is the third element of that containment, and it was missing
+///
+/// With no border, the only thing that can say "this four-row region is one box" is its
+/// background. The band was filled with [`crate::views::ViewContext::text`], whose background
+/// is `background_panel` — **the same colour the transcript and the welcome screen are filled
+/// with**. So the three rows below the caret were painted, and painted invisible: measured on a
+/// real 120x32 pane the composer read as a single row of text with nine dead rows beneath it,
+/// and was reported that way twice. The rows were allocated exactly as
+/// [`prompt_rows`] intends and bought nothing, because a region indistinguishable from the
+/// surface above it is not a region.
+///
+/// It is filled with [`crate::views::ViewContext::element`] instead, the role documented as the
+/// fill behind an inset element, and the role [`crate::views::message::StatusView`] already
+/// uses — which is the proof it reads on a real terminal, since the strip is the one row of
+/// this composite a user could always see. Strip and band therefore share a surface and read as
+/// one composer with a status header, which is `codex`'s bottom pane
+/// (`.omo/refs/codex/codex-rs/tui/src/chatwidget/rendering.rs:49-56`, status and composer in one
+/// `bottom_pane`) and is the same judgement the refused top inset already recorded: the strip
+/// belongs to the prompt it describes.
+///
+/// A fill rather than the border this constant's note rejects, because the objection to the
+/// border was that it costs two rows of a two-row floor. A background costs none.
 const PROMPT_GUTTER_COLS: u16 = 2;
 const PROMPT_RIGHT_INSET: u16 = 1;
 const PROMPT_SPACER_ROWS: u16 = 1;
@@ -169,12 +192,41 @@ const PROMPT_PLACEHOLDER: &str = "ask anything, or / for commands";
 /// "truncated" to a reader.
 const SIDEBAR_GAP_COLS: u16 = 1;
 
-/// Rows left below the prompt so the empty state reads as one centred column.
+/// The rows below the prompt that put the empty state's composite on the frame's middle.
 ///
-/// Only ever non-zero while the transcript is empty. The complaint this answers is that the
-/// welcome block is centred in the body region ([`crate::views::welcome::WelcomeView::lines`]
-/// pads above) while the prompt is pinned to the terminal's last row, so the two sat a third
-/// of a screen apart and the input did not read as part of the composition.
+/// Only ever non-zero while the transcript is empty. `content` is the welcome block's own
+/// height, from [`crate::views::welcome::WelcomeView::block_rows`], and `body_max` is what the
+/// body region would be with no tail at all — so `body_max - content` is the whole slack the
+/// composite has to spend, and half of it below the prompt is what balances the half the
+/// block leaves above itself.
+///
+/// # Why this is exact rather than capped
+///
+/// The previous version halved `body_max` — the *region*, not the slack — and then capped the
+/// result at six rows. Both were wrong in the same direction. Measured at 120×32 it produced a
+/// six-row tail against an eighteen-row block, leaving one blank row above the brand and nine
+/// dead rows below the prompt: the screen was still weighted to the top, which is what was
+/// reported. Halving the slack instead makes the arithmetic close:
+///
+/// ```text
+/// gap_above = body_max - tail - content = (content + slack) - slack/2 - content = ⌈slack/2⌉
+/// gap_below = tail                                                              = ⌊slack/2⌋
+/// ```
+///
+/// so the two differ by at most the odd row, whatever the frame. The cap went with the
+/// halving: it existed because a block that grew with the terminal made an uncapped tail float
+/// the input absurdly high, and the block is now a fixed fourteen rows above the wordmark
+/// threshold. A fifty-row frame therefore spends sixteen rows above and fifteen below a
+/// nineteen-row composite, which reads as a centred card rather than as a misplaced composer.
+///
+/// # The body cannot be starved, and it is the halving that guarantees it
+///
+/// `tail <= body_max / 2`, so the body keeps `⌈body_max / 2⌉` — at least one row whenever
+/// `body_max` is at least one, and zero only when the chrome already took the whole frame.
+/// That is what holds at 20×10, where `Min(1)` would otherwise be starved by a `Length` tail.
+/// When the block is *taller* than `body_max` the subtraction saturates to zero and the tail
+/// vanishes, which is the right answer: a frame that cannot hold the block has nothing to
+/// centre.
 ///
 /// A fourth band rather than moving the prompt out of the split: the order
 /// body / status / prompt is what every other assertion about this screen measures from, and
@@ -183,38 +235,30 @@ const SIDEBAR_GAP_COLS: u16 = 1;
 /// layout the moment a message arrives — which is what makes this cost nothing in the state
 /// the user spends their time in.
 ///
-/// This is *not* a per-keystroke reflow: the tail is a function of the frame and of whether
-/// the transcript is empty, and typing into the prompt changes neither. `jcode`'s desktop
-/// composer is the reference for the arrangement (`.omo/refs/jcode/crates/jcode-desktop2/
-/// src/layout.rs:306-322`, hero stack immediately above the composer, centred fallback when
-/// the hero does not fit); its rounded border is deliberately **not** taken, for the reason
-/// [`PROMPT_GUTTER_COLS`] already gives.
-fn welcome_tail_rows(empty: bool, height: u16, status: u16, prompt: u16) -> u16 {
+/// This is *not* a per-keystroke reflow: the tail is a function of the frame, of the block and
+/// of whether the transcript is empty. Typing into the prompt changes the band's height, and
+/// the tail follows it, but nothing here re-measures per character.
+const fn welcome_tail_rows(empty: bool, body_max: u16, content: u16) -> u16 {
     if !empty {
         return 0;
     }
-    let chrome = status.saturating_add(prompt);
-    // The body keeps at least one row: the welcome screen is the thing being centred, and a
-    // tail that consumed the region it is centring would leave the brand nowhere to draw.
-    // At 20x10 this is what holds — `Min(1)` would otherwise be starved by a `Length` tail.
-    let spare = height
-        .saturating_sub(chrome)
-        .saturating_sub(WELCOME_MIN_BODY_ROWS);
-    // Half the slack, so the composite sits on the optical middle: the welcome block already
-    // pads itself above, and giving the tail the other half is what balances the two.
-    (spare / 2).min(WELCOME_TAIL_MAX_ROWS)
+    body_max.saturating_sub(content) / 2
 }
 
-/// The rows the body must keep before the welcome tail may take any.
-const WELCOME_MIN_BODY_ROWS: u16 = 1;
-
-/// The most the prompt is ever lifted off the bottom edge.
+/// Columns the transcript region keeps once the ambient sidebar has taken its own.
 ///
-/// A cap because the welcome block grows with the terminal but the prompt does not: on a
-/// fifty-row pane an uncapped half-slack tail floats the input a dozen rows above the strip's
-/// usual place, and a prompt that moves that far between an empty and a used session reads as
-/// two different applications.
-const WELCOME_TAIL_MAX_ROWS: u16 = 6;
+/// Split out of [`Component::render`] because the welcome block's height depends on this
+/// width — the wordmark needs forty columns and the hint grid falls to one column below
+/// sixty — and the height has to be known *before* the vertical split that the horizontal
+/// split is carved from. The two conditions here are the same two the horizontal split
+/// applies, so a change to either has one place to be made.
+const fn welcome_width(width: u16, sidebar_visible: bool) -> u16 {
+    if sidebar_visible && width >= crate::views::SIDEBAR_MIN_WIDTH {
+        width.saturating_sub(SIDEBAR_GAP_COLS + crate::views::ambient::SIDEBAR_WIDTH)
+    } else {
+        width
+    }
+}
 
 /// Rows the prompt gets for `content_lines` of typed text on a `height`-row screen.
 ///
@@ -1107,17 +1151,12 @@ impl Component for SessionScreen {
             .map(crate::views::picker::McpServer::service)
             .collect();
         let empty = self.transcript.transcript().messages().is_empty();
-        let prompt_band = prompt_rows(self.editor.height(), area.height);
-        let [body, status, prompt, _tail] = Layout::vertical([
+        let (prompt_band, tail) = self.prompt_and_tail(area.width, area.height);
+        let [body, status, prompt, tail] = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(STATUS_ROWS),
             Constraint::Length(prompt_band),
-            Constraint::Length(welcome_tail_rows(
-                empty,
-                area.height,
-                STATUS_ROWS,
-                prompt_band,
-            )),
+            Constraint::Length(tail),
         ])
         .areas(area);
 
@@ -1164,9 +1203,20 @@ impl Component for SessionScreen {
         }
 
         self.status.render(frame, status);
+        // The centring band carries the body's surface, so the frame has one background from
+        // top to bottom. Unpainted it kept ratatui's `Color::Reset` and rendered as the
+        // *terminal's* background, which put a colour seam under the composer on any theme whose
+        // panel is not the user's terminal colour — and made "where does the composite end" a
+        // question the frame could not be asked, since an unpainted row is indistinguishable
+        // from a deliberately plain one. See `the_welcome_composite_is_centred_on_the_frame`,
+        // which locates the composite's bottom edge by exactly that difference.
+        crate::views::fill(frame.buffer_mut(), tail, self.context.surface());
         // The whole band is painted first, so the spacer row and the right inset carry the
-        // prompt's own background rather than whatever the previous frame left there.
-        crate::views::fill(frame.buffer_mut(), prompt, self.context.text());
+        // prompt's own background rather than whatever the previous frame left there. `element`
+        // rather than `text`: they differ only in background, and `text`'s is the surface the
+        // transcript already uses, which is why four allocated rows read as one. See
+        // `PROMPT_GUTTER_COLS`.
+        crate::views::fill(frame.buffer_mut(), prompt, self.context.element());
         let (gutter, buffer) = prompt_frame(prompt);
         if let Some(gutter) = gutter {
             crate::views::editor::PromptGutter::new(self.context.clone(), PROMPT_MARKER.to_owned())
@@ -1224,6 +1274,28 @@ impl Component for SessionScreen {
 }
 
 impl SessionScreen {
+    /// The prompt band's height and the tail below it, for a `width` by `height` frame.
+    ///
+    /// One function rather than two calls at each site, because the tail depends on the band
+    /// — the band is chrome the slack is measured after — and on the welcome block, which is
+    /// measured at the width the sidebar leaves. Composing those three facts in more than one
+    /// place is how a test comes to locate the prompt one row off from where `render` put it,
+    /// and the row it would then read is blank, so the failure names the wrong thing.
+    pub(crate) fn prompt_and_tail(&self, width: u16, height: u16) -> (u16, u16) {
+        let band = prompt_rows(self.editor.height(), height);
+        let empty = self.transcript.transcript().messages().is_empty();
+        // At the *frame* height and at the sidebar-adjusted width — the same pair
+        // `WelcomeView::render` decides the wordmark from. See `welcome_tail_rows`.
+        let content = if empty {
+            self.welcome
+                .block_rows(welcome_width(width, self.sidebar_visible), height)
+        } else {
+            0
+        };
+        let body_max = height.saturating_sub(STATUS_ROWS.saturating_add(band));
+        (band, welcome_tail_rows(empty, body_max, content))
+    }
+
     /// Report whether the MCP projection moved since this screen last painted.
     ///
     /// The only thing that turns a lifecycle change into a frame. The worker's

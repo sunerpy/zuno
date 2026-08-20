@@ -324,6 +324,23 @@ impl ViewContext {
             .bg(palette.background_element.into())
     }
 
+    /// `style` re-seated on the inset-element surface.
+    ///
+    /// Every named style on this type fixes a background as well as a foreground, and all but
+    /// [`Self::selected`] fix it to `background_panel`. That is correct on the surfaces filled
+    /// with [`Self::surface`] and wrong inside anything filled with [`Self::element`]: the span
+    /// then repaints the element's background back to the panel's, one cell at a time, and the
+    /// region loses the boundary its fill was drawn to give it. The prompt band paid for this
+    /// exactly — filled in `element`, then written over in `accent` and `muted`, leaving a
+    /// two-tone box whose gutter was the surface colour.
+    ///
+    /// Foreground and modifiers are kept, so a caller still says *what kind* of text it is and
+    /// only the seat changes.
+    #[must_use]
+    pub fn on_element(&self, style: Style) -> Style {
+        style.bg(self.palette().background_element.into())
+    }
+
     /// How many columns wide a diff should be laid out, for this width.
     ///
     /// `permission.tsx:38-42`: an explicit `stacked` is always one column; `auto`

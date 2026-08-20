@@ -45,6 +45,36 @@
 //! `jcode` draws no welcome at all on an authenticated session, and `claw-code` spends
 //! sixteen rows. Eighteen is inside that band; twenty-two was above all of it.
 //!
+//! # Fourteen rows, because the block is also what gets centred
+//!
+//! Eighteen was inside the reference band and still wrong, and the reason is positional
+//! rather than editorial. The composite the reader sees is *block + strip + prompt*, and
+//! [`crate::views::session::SessionScreen`] centres that composite on the frame — so every
+//! row here is a row the input sits further from the middle. Measured at 120×32 the
+//! eighteen-row block left nine dead rows under the prompt and none above the brand, which
+//! is the same top-heavy screen the trim was supposed to fix.
+//!
+//! Two blocks were cut, and both were cut for the same reason: something else already
+//! answers the question they answered.
+//!
+//! * **The tip row is hidden by default** rather than deleted. It was the one block on this
+//!   screen carrying neither a fact nor a key — prose about behaviour, which the behaviour
+//!   itself teaches on the second turn. `tips_toggle` is a real upstream action, so
+//!   deleting the row would have left a bound key that reaches nothing, which is precisely
+//!   the defect class this surface exists to remove. Hidden-by-default turns that key into
+//!   "show me a tip", and [`Self::next_tip`] already treats a hidden row that way.
+//! * **The slash grid fell from six commands to three**, and lost its blank separator, so
+//!   keys and commands now read as one two-row block: what you type on the left, what it
+//!   does on the right. `/` lists every command and the palette chord lists all 184
+//!   bindings, so rows four through six were teaching a list the user can already open —
+//!   whereas nothing lists the send, newline and exit keys, which is why those three stayed.
+//!
+//! What survives does so because it has no other carrier at some supported width. The
+//! location and census rows are the only carriers below [`crate::views::SIDEBAR_MIN_WIDTH`],
+//! where the sidebar is not drawn at all; `type / for commands` is now the *whole* of
+//! command discovery, so it is the least cuttable row on the screen; and the key row spells
+//! what `/` cannot express.
+//!
 //! # `/` is taught first, and a key is only spelled when nothing else can teach it
 //!
 //! The measured complaint about the first draft of this grid was not that it lied — it
@@ -132,9 +162,18 @@ pub const WORDMARK_MIN_WIDTH: u16 = WORDMARK_WIDTH + 4;
 
 /// The shortest terminal that still gets the wordmark.
 ///
-/// Six wordmark rows plus two fact rows, the lead line, a tip and one hint row is
-/// fourteen; below twenty the brand would crowd out the information it exists to
-/// introduce.
+/// Derived rather than chosen. The wordmark block is fourteen rows — six of letterform, two
+/// facts, the lead line, the two hint rows and three blank separators — and the composite it
+/// belongs to adds the status strip and the prompt's four-row band, so nineteen rows is the
+/// first frame that holds the whole thing. Twenty is that figure with one row to spare,
+/// which is what keeps the row [`crate::views::session::SessionScreen`] gives the tail from
+/// having to come out of the block.
+///
+/// **Measured against the frame, not against the region the block is painted into.** The
+/// owner lifts the prompt by a tail computed from this block's height, so a fit decision
+/// that read the shrunken region would be a fixpoint: a shorter region drops the wordmark,
+/// a shorter block earns a longer tail, and a longer tail shortens the region again. See
+/// [`WelcomeView::block_rows`].
 pub const WORDMARK_MIN_HEIGHT: u16 = 20;
 
 /// The one-row brand used when the wordmark does not fit.
@@ -209,17 +248,21 @@ pub type SlashHint = (&'static str, &'static str);
 /// makes a typo, a renamed command, and a name the router deliberately excludes all fail
 /// loudly rather than render as an inert row.
 ///
-/// Order pairs them the way the two-column layouts fall out at 60 and 80 columns —
-/// `model`/`agent` (what answers), `session`/`theme` (what the workspace looks like),
-/// `mcp`/`help` (what is available). `help` is last because it is the row that supersedes
-/// this whole grid: it lists every key, which is the question a hint grid can only ever
-/// answer partially.
-pub const SLASH_HINTS: [SlashHint; 6] = [
+/// Three rather than six, and the cut is about what a *list* is for.
+///
+/// Six commands over two rows plus a separator spent four rows advertising a list `/` opens
+/// in one keystroke, on the screen that had just taught `/`. Three is enough to make the
+/// convention concrete — the reader sees `/name does thing` and generalises — and the row
+/// they cost is a row the input sits closer to the middle of the frame.
+///
+/// Which three: one for each question a first launch actually asks. `model` is what answers,
+/// `session` is how to get back to yesterday, and `help` is the row that supersedes the
+/// whole grid by listing every key. `agent`, `theme` and `mcp` went because each is a
+/// setting a user goes looking for once they already know `/` exists, which the row above
+/// has just told them.
+pub const SLASH_HINTS: [SlashHint; 3] = [
     ("model", "switch model"),
-    ("agent", "switch agent"),
     ("session", "past sessions"),
-    ("theme", "change theme"),
-    ("mcp", "mcp servers"),
     ("help", "all keys"),
 ];
 
@@ -342,7 +385,7 @@ impl WelcomeView {
                 skills: None,
             },
             tip: 0,
-            tips_visible: true,
+            tips_visible: false,
         }
     }
 
@@ -357,6 +400,10 @@ impl WelcomeView {
     ///
     /// The caller chooses rather than this module rolling a die, so a test can pin a
     /// tip and a host can vary it per launch without either owning the pool.
+    ///
+    /// Pinning an index does **not** reveal the row: the shipped composition hides it, so a
+    /// fixture that named an index and thereby also un-hid it would be measuring a screen no
+    /// user sees. [`Self::next_tip`] is what shows it, which is also what the bound key does.
     #[must_use]
     pub const fn with_tip(mut self, index: usize) -> Self {
         self.tip = index;
@@ -472,7 +519,7 @@ impl WelcomeView {
             .filter(|spelling| !spelling.contains(crate::keybind::LEADER_TOKEN))
     }
 
-    /// `entries` laid out in as many columns as `width` affords, capped at `rows_available`.
+    /// `entries` laid out in as many columns as `width` affords.
     ///
     /// The column count is derived rather than fixed so that eighty columns gets two
     /// readable columns and two hundred gets four, instead of one layout being cramped
@@ -482,13 +529,16 @@ impl WelcomeView {
     /// once for keys and once for slash commands — and each group then gets a cell width
     /// measured from its own entries. One shared width would pad the shorter group out to
     /// the longer group's widest row and open a gap the eye reads as a missing column.
-    fn grid(
-        &self,
-        entries: &[(String, &'static str)],
-        width: u16,
-        rows_available: usize,
-    ) -> Vec<Line<'static>> {
-        if entries.is_empty() || rows_available == 0 {
+    ///
+    /// **No row budget, and that is what makes the block measurable.** This used to take the
+    /// rows still unspent on the frame and truncate to them, which made the block's height a
+    /// function of the height it was given — and the owner has to know that height *before*
+    /// it can size the region, so the dependency was circular. Both groups are three entries
+    /// now, so the widest they ever get is three rows at forty columns; a frame too short for
+    /// that clips from the bottom, which drops the slash row before the key row, in the same
+    /// priority order the budget used to enforce.
+    fn grid(&self, entries: &[(String, &'static str)], width: u16) -> Vec<Line<'static>> {
+        if entries.is_empty() {
             return Vec::new();
         }
         // Terminal columns, not characters. A label carrying a wide glyph is otherwise
@@ -501,8 +551,7 @@ impl WelcomeView {
             .unwrap_or(1)
             + 3;
         let columns = (usize::from(width) / cell).clamp(1, 4);
-        let capacity = columns * rows_available;
-        let shown = &entries[..entries.len().min(capacity)];
+        let shown = entries;
         let rows = shown.len().div_ceil(columns);
         (0..rows)
             .map(|row| {
@@ -527,46 +576,30 @@ impl WelcomeView {
             .collect()
     }
 
-    /// The two hint groups, keys above slash commands, within `rows_available` rows.
+    /// The two hint groups as one block: keys, then slash commands, with no blank between.
     ///
-    /// Keys are laid out first and are served from the budget first. `/` is already taught
-    /// by the line above and typing it lists every slash command, so a slash row lost to a
-    /// short terminal costs a shortcut the user can still find; nothing anywhere announces
-    /// the send key, so a key row lost costs a capability. Two rows is enough for all
-    /// three key hints down to sixty columns, which is the width the earlier single grid
-    /// dropped the exit hint at.
+    /// Keys come first because nothing anywhere else announces the send, newline or exit
+    /// spelling, whereas `/` is taught by the line above and typing it lists every command —
+    /// so if a short frame clips this block, the row it clips is the cheaper one.
     ///
-    /// Both groups share one accent-then-muted grammar — what you type on the left, what
-    /// it does on the right — so the eye learns one column meaning rather than two.
-    fn hint_block(&self, width: u16, rows_available: usize) -> Vec<Line<'static>> {
+    /// **The blank separator between the groups is gone.** It was there to say "these are two
+    /// lists", and that reading was the problem: both groups share one accent-then-muted
+    /// grammar — what you type on the left, what it does on the right — so the eye already
+    /// learns one column meaning, and the blank spent a row insisting on a distinction the
+    /// reader does not need to make.
+    fn hint_block(&self, width: u16) -> Vec<Line<'static>> {
         let keymap = self.keymap();
         let resolved = KEY_HINTS
             .iter()
             .filter_map(|(action, label)| Some((self.spelling(keymap.as_ref(), action)?, *label)))
             .collect::<Vec<_>>();
-        let keys = self.grid(&resolved, width, rows_available.min(2));
+        let mut block = self.grid(&resolved, width);
 
         let commands = SLASH_HINTS
             .iter()
             .map(|(name, label)| (format!("/{name}"), *label))
             .collect::<Vec<_>>();
-        // The separator is charged to the budget before the slash rows are measured, so a
-        // terminal with one row to spare spends it on a hint instead of on a blank.
-        let spent = keys.len() + usize::from(!keys.is_empty());
-        let slash = self.grid(
-            &commands,
-            width,
-            rows_available.saturating_sub(spent).min(3),
-        );
-
-        let mut block = keys;
-        if !block.is_empty() && !slash.is_empty() {
-            // A zero-width line, not a padded one: the caller centres the block on its
-            // widest row, and a full-width blank would report the frame's own width and
-            // pin the indent to zero.
-            block.push(Line::default());
-        }
-        block.extend(slash);
+        block.extend(self.grid(&commands, width));
         block
     }
 
@@ -624,13 +657,59 @@ impl WelcomeView {
         Line::from(spans)
     }
 
-    /// Every row this screen draws at `width` by `height`, already centred.
+    /// Every row this screen draws at `width` by `height`, already positioned.
     ///
     /// Public because it is the assertable surface: a claim about rows is readable
     /// where the same claim about cells is not, and the off-screen buffer test then
     /// proves the rows reach cells.
+    ///
+    /// `height` is both the region and the frame here, which is what a standalone render
+    /// is. The composite passes them separately — see [`Self::lines_in`].
     #[must_use]
     pub fn lines(&self, width: u16, height: u16) -> Vec<Line<'static>> {
+        self.lines_in(width, height, height)
+    }
+
+    /// How many rows [`Self::block`] would occupy at `width` on a `frame`-row terminal.
+    ///
+    /// The owner calls this *before* it splits the frame, because the tail that lifts the
+    /// prompt is half the slack the block leaves over — so the block's height is an input to
+    /// the layout rather than an output of it. Measured by building the block rather than
+    /// counted from a constant: a constant would be a second copy of the composition, and the
+    /// copy that drifted would put the input a row off centre with nothing to notice it.
+    #[must_use]
+    pub fn block_rows(&self, width: u16, frame: u16) -> u16 {
+        u16::try_from(self.block(width, frame).len()).unwrap_or(u16::MAX)
+    }
+
+    /// The block bottom-anchored in a `region`-row area, its fit decided by `frame`.
+    ///
+    /// **Bottom-anchored rather than centred, and the owner is why.** The composite a reader
+    /// sees is block, strip, prompt — so the block has to sit directly on top of the strip,
+    /// and the rows that centre the composite belong *above* it. The owner sizes this region
+    /// to the block plus the upper half of the slack and takes the lower half as a tail below
+    /// the prompt, so padding to the bottom here is exactly what puts the whole composite on
+    /// the frame's middle. Centring within the region instead would split the upper half in
+    /// two and open a gap between the block and the strip, which is the "two blocks a third
+    /// of a screen apart" reading this arrangement exists to avoid.
+    ///
+    /// `frame` rather than `region` decides the wordmark, for the reason
+    /// [`WORDMARK_MIN_HEIGHT`] records: the region is derived from the block's height, so a
+    /// block whose height depended on the region would be a fixpoint.
+    fn lines_in(&self, width: u16, region: u16, frame: u16) -> Vec<Line<'static>> {
+        let body = self.block(width, frame);
+        let leading = usize::from(region).saturating_sub(body.len());
+        let mut lines = Vec::with_capacity(leading + body.len());
+        lines.extend(std::iter::repeat_n(
+            padded("", width, self.context.surface()),
+            leading,
+        ));
+        lines.extend(body);
+        lines
+    }
+
+    /// The rows the screen states, with no positioning padding.
+    fn block(&self, width: u16, height: u16) -> Vec<Line<'static>> {
         let mut body = Vec::new();
         if Self::wordmark_fits(width, height) {
             let indent = usize::from(width.saturating_sub(WORDMARK_WIDTH)) / 2;
@@ -663,12 +742,7 @@ impl WelcomeView {
             body.push(self.tip_row(width));
         }
 
-        // The grid takes whatever rows are left, so a short terminal loses hint rows
-        // one at a time instead of losing the whole grid or overflowing the region. Six is
-        // the block's own ceiling — two key rows, a separator, three slash rows — reached
-        // only at sixty columns, where both groups fall to two columns.
-        let spare = usize::from(height).saturating_sub(body.len() + 2);
-        let grid = self.hint_block(width, spare.min(6));
+        let grid = self.hint_block(width);
         if !grid.is_empty() {
             body.push(padded("", width, self.context.surface()));
             let widest = grid
@@ -684,16 +758,7 @@ impl WelcomeView {
             }
         }
 
-        // Centre vertically by padding above, so the block sits on the optical middle
-        // rather than clinging to the top of a tall terminal.
-        let leading = usize::from(height).saturating_sub(body.len()) / 2;
-        let mut lines = Vec::with_capacity(leading + body.len());
-        lines.extend(std::iter::repeat_n(
-            padded("", width, self.context.surface()),
-            leading,
-        ));
-        lines.extend(body);
-        lines
+        body
     }
 }
 
@@ -703,8 +768,13 @@ impl Component for WelcomeView {
         if area.width == 0 || area.height == 0 {
             return;
         }
+        // `frame.area().height`, not `area.height`: the owner shrank this region by the tail
+        // it computed from this block's own height, so reading the region back would let a
+        // block that lost the wordmark earn a longer tail and lose it again. The frame is the
+        // one height both sides can agree on. See `Self::block_rows`.
+        let frame_height = frame.area().height;
         let lines = self
-            .lines(area.width, area.height)
+            .lines_in(area.width, area.height, frame_height)
             .into_iter()
             .take(usize::from(area.height))
             .collect::<Vec<_>>();

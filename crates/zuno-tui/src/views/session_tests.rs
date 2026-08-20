@@ -38,11 +38,11 @@ fn session_screen_renders_the_transcript_the_status_strip_and_the_prompt() {
         "the transcript region is empty:\n{joined}"
     );
     assert!(
-        rendered[strip_index(&rendered, &screen, 8)].contains("idle"),
+        rendered[strip_index(&rendered, &screen, 40, 8)].contains("idle"),
         "the status strip did not render in its own region: {rendered:?}"
     );
     assert!(
-        content_row(&rendered, &screen, 8).contains("what I am typing"),
+        content_row(&rendered, &screen, 40, 8).contains("what I am typing"),
         "the prompt did not render in its own region: {rendered:?}"
     );
 }
@@ -58,7 +58,7 @@ fn session_screen_folds_an_engine_event_into_the_status_strip() {
 
     let rendered = rows(&render_offscreen(&mut screen, 40, 8).expect("infallible"));
     assert!(
-        rendered[strip_index(&rendered, &screen, 8)].contains("test/test-model"),
+        rendered[strip_index(&rendered, &screen, 40, 8)].contains("test/test-model"),
         "the resolved model did not reach the status strip: {rendered:?}"
     );
 }
@@ -121,7 +121,7 @@ fn session_screen_types_a_printable_key_into_the_prompt() {
 
     let rendered = rows(&render_offscreen(&mut screen, 40, 8).expect("infallible"));
     assert!(
-        content_row(&rendered, &screen, 8).contains("hi"),
+        content_row(&rendered, &screen, 40, 8).contains("hi"),
         "the typed characters did not reach the prompt: {rendered:?}"
     );
 }
@@ -196,7 +196,7 @@ fn session_screen_a_large_paste_shows_a_summary_but_submits_the_whole_text() {
 
     let rendered = rows(&render_offscreen(&mut screen, 40, 8).expect("infallible"));
     assert!(
-        content_row(&rendered, &screen, 8).contains("Pasted"),
+        content_row(&rendered, &screen, 40, 8).contains("Pasted"),
         "the prompt band does not show the summary affordance: {rendered:?}"
     );
     assert!(
@@ -3517,13 +3517,7 @@ fn session_screen_copying_prefers_the_selection_over_the_whole_buffer() {
 /// `prompt_band` deliberately locates the band the other way round — counted from the bottom,
 /// never from the marker — because one of its callers asserts that the marker is there.
 fn prompt_band_rows(screen: &mut SessionScreen, width: u16, height: u16) -> usize {
-    let empty = screen.transcript.transcript().messages().is_empty();
-    let tail = usize::from(welcome_tail_rows(
-        empty,
-        height,
-        STATUS_ROWS,
-        prompt_rows(screen.editor.height(), height),
-    ));
+    let tail = usize::from(screen.prompt_and_tail(width, height).1);
     let rendered = rows(&render_offscreen(screen, width, height).expect("infallible"));
     let first = rendered
         .iter()
@@ -3799,6 +3793,19 @@ fn scrollable(context: ViewContext) -> (SessionScreen, mpsc::Receiver<TerminalEv
     // render: a wheel event on an unmeasured transcript has a zero viewport and moves
     // nothing, which would make every assertion below vacuous.
     let _ = render_offscreen(&mut screen, 40, 12).expect("infallible");
+    // Explicitly to the top, because that render leaves the viewport on the *newest* row —
+    // see `TranscriptView`'s `following`. Every wheel assertion below counts rows moved
+    // from a known start, and the top is the only start a downward notch can move from.
+    // This used to be implicit: the offset happened to stay at 0 because nothing ever
+    // raised it, which is the truncation
+    // `message_tests::views_transcript_follows_the_newest_row_as_a_reply_streams_in`
+    // reports. Disarming `following` here is what these tests always relied on, now said
+    // out loud rather than inherited from a defect.
+    screen.transcript.set_offset(0);
+    assert!(
+        !screen.transcript.is_following(),
+        "the fixture is still following, so a downward notch has nowhere to go"
+    );
     (screen, receiver)
 }
 
@@ -3826,6 +3833,51 @@ fn notch_up(screen: &mut SessionScreen, now_ms: u64) -> EventResult {
         },
         now_ms,
     )
+}
+
+/// The composed screen's first frame shows the newest row, not the oldest.
+///
+/// The layer the user meets, and the one the report came from: a reply longer than the
+/// transcript pane appeared cut off at whatever row the pane ended on. Asserted here as
+/// well as in `message_tests` because `SessionScreen` is what decides how tall the
+/// transcript's region is — the pane is `area` minus the status strip, the prompt band and
+/// the welcome tail, so a screen that gave the transcript the whole area would hide the
+/// defect from a `TranscriptView`-only test.
+///
+/// Its own fixture rather than `scrollable`, which now scrolls to the top on purpose.
+#[test]
+fn session_a_fresh_render_rests_on_the_newest_row_not_the_oldest() {
+    let (sender, _receiver) = terminal_event_channel();
+    let mut screen = SessionScreen::new(scroll_config(None, None), sender);
+    for index in 0..80 {
+        screen
+            .transcript_mut()
+            .transcript_mut()
+            .push(Message::user(format!("line {index}")));
+    }
+    let painted =
+        crate::views::testkit::rows(&render_offscreen(&mut screen, 40, 24).expect("infallible"))
+            .join("\n");
+    let transcript = &screen.transcript;
+    assert!(
+        transcript.content_height() > transcript.viewport_height(),
+        "the fixture fits the pane, so this asserts nothing"
+    );
+    assert_eq!(
+        transcript.offset(),
+        transcript.content_height() - transcript.viewport_height(),
+        "the first frame rested away from the newest row"
+    );
+    // Both dimensions again: the newest message present and the oldest gone. Either alone
+    // is satisfied by a pane that grew rather than a viewport that moved.
+    assert!(
+        painted.contains("line 79"),
+        "the newest message is below the fold:\n{painted}"
+    );
+    assert!(
+        !painted.contains("line 0\n") && !painted.contains("line 0 "),
+        "the oldest message is still on screen, so nothing scrolled:\n{painted}"
+    );
 }
 
 #[test]
@@ -4119,18 +4171,19 @@ fn every_bound_action_in_a_registered_scope_either_reaches_something_or_is_a_nam
 /// So the position is counted from the frame's last row through the two lengths `render` gives
 /// those bands. A `render` that stopped consulting either would point this at the wrong row and
 /// the content assertions would fail, which is the direction that has to work.
-fn prompt_first(rendered: &[String], screen: &SessionScreen, height: u16) -> usize {
-    let empty = screen.transcript.transcript().messages().is_empty();
-    let band = prompt_rows(screen.editor.height(), height);
-    let tail = welcome_tail_rows(empty, height, STATUS_ROWS, band);
+/// `width` as well as `height`, because the tail depends on the welcome block's height and
+/// that block loses the wordmark below forty columns and gains hint rows below sixty. A
+/// helper that assumed one width would point every caller at the wrong row on the others.
+fn prompt_first(rendered: &[String], screen: &SessionScreen, width: u16, height: u16) -> usize {
+    let (band, tail) = screen.prompt_and_tail(width, height);
     rendered
         .len()
         .saturating_sub(usize::from(tail) + usize::from(band))
 }
 
 /// Where the status strip is, which is directly above the prompt band by construction.
-fn strip_index(rendered: &[String], screen: &SessionScreen, height: u16) -> usize {
-    prompt_first(rendered, screen, height).saturating_sub(STATUS_ROWS as usize)
+fn strip_index(rendered: &[String], screen: &SessionScreen, width: u16, height: u16) -> usize {
+    prompt_first(rendered, screen, width, height).saturating_sub(STATUS_ROWS as usize)
 }
 
 /// The prompt band's rows, located rather than assumed to be the frame's last band.
@@ -4141,22 +4194,37 @@ fn strip_index(rendered: &[String], screen: &SessionScreen, height: u16) -> usiz
 /// absolute index does not fail informatively when that changes; it reports that some
 /// unrelated row lacks the caret. Locating the band keeps every one of those assertions about
 /// the band itself.
-fn prompt_band<'a>(rendered: &'a [String], screen: &SessionScreen, height: u16) -> &'a [String] {
-    let first = prompt_first(rendered, screen, height);
-    let band = usize::from(prompt_rows(screen.editor.height(), height));
+fn prompt_band<'a>(
+    rendered: &'a [String],
+    screen: &SessionScreen,
+    width: u16,
+    height: u16,
+) -> &'a [String] {
+    let first = prompt_first(rendered, screen, width, height);
+    let band = usize::from(screen.prompt_and_tail(width, height).0);
     &rendered[first.min(rendered.len())..(first + band).min(rendered.len())]
 }
 
 /// The prompt band's spacer, which is its last row whenever the band has more than one.
-fn spacer_row<'a>(rendered: &'a [String], screen: &SessionScreen, height: u16) -> &'a str {
-    prompt_band(rendered, screen, height)
+fn spacer_row<'a>(
+    rendered: &'a [String],
+    screen: &SessionScreen,
+    width: u16,
+    height: u16,
+) -> &'a str {
+    prompt_band(rendered, screen, width, height)
         .last()
         .map_or("", String::as_str)
 }
 
 /// The prompt band's first row, the one the caret and the gutter marker share.
-fn content_row<'a>(rendered: &'a [String], screen: &SessionScreen, height: u16) -> &'a str {
-    prompt_band(rendered, screen, height)
+fn content_row<'a>(
+    rendered: &'a [String],
+    screen: &SessionScreen,
+    width: u16,
+    height: u16,
+) -> &'a str {
+    prompt_band(rendered, screen, width, height)
         .first()
         .map_or("", String::as_str)
 }
@@ -4170,7 +4238,7 @@ fn the_prompt_is_contained_by_a_gutter_and_a_spacer_at_every_supported_width() {
     for width in [200u16, 120, 80, 60, 40] {
         let (mut blank, _shutdown) = screen();
         let rendered = rows(&render_offscreen(&mut blank, width, 24).expect("infallible"));
-        let band = content_row(&rendered, &blank, 24);
+        let band = content_row(&rendered, &blank, width, 24);
         assert!(
             band.starts_with("› "),
             "at {width} columns the prompt has no gutter marker: {band:?}"
@@ -4195,13 +4263,13 @@ fn the_prompt_is_contained_by_a_gutter_and_a_spacer_at_every_supported_width() {
             "at {width} columns the tall fixture did not fill the band: {filled:?}"
         );
         assert_eq!(
-            spacer_row(&filled, &tall, 24),
+            spacer_row(&filled, &tall, width, 24),
             "",
             "at {width} columns the prompt is flush against its last row, which is the \
              reported defect"
         );
         assert_eq!(
-            spacer_row(&rendered, &blank, 24),
+            spacer_row(&rendered, &blank, width, 24),
             "",
             "at {width} columns an empty prompt has no spacer under it"
         );
@@ -4210,7 +4278,7 @@ fn the_prompt_is_contained_by_a_gutter_and_a_spacer_at_every_supported_width() {
         let (mut typed, _shutdown) = screen();
         typed.editor.set_text(&"x".repeat(usize::from(width) * 2));
         let rendered = rows(&render_offscreen(&mut typed, width, 24).expect("infallible"));
-        let band = content_row(&rendered, &typed, 24);
+        let band = content_row(&rendered, &typed, width, 24);
         assert!(
             crate::views::display_width(band) < usize::from(width),
             "at {width} columns the prompt used its last column, leaving no right inset: \
@@ -4228,13 +4296,13 @@ fn the_prompt_keeps_a_typeable_row_on_a_twenty_by_ten_pane() {
     let (mut screen, _shutdown) = screen();
     screen.editor.set_text("hi");
     let rendered = rows(&render_offscreen(&mut screen, 20, 10).expect("infallible"));
-    let band = content_row(&rendered, &screen, 10);
+    let band = content_row(&rendered, &screen, 20, 10);
     assert!(
         band.contains("hi") && band.contains('▏'),
         "the 20x10 prompt lost its content row to chrome: {band:?}"
     );
     assert_eq!(
-        spacer_row(&rendered, &screen, 10),
+        spacer_row(&rendered, &screen, 20, 10),
         "",
         "the spacer row is missing at 20x10"
     );
@@ -4734,7 +4802,7 @@ fn the_welcome_screen_lifts_the_prompt_and_a_used_session_does_not() {
     for (width, height) in [(120u16, 34u16), (60, 34), (200, 50), (80, 24)] {
         let (mut blank, _shutdown) = screen();
         let rendered = rows(&render_offscreen(&mut blank, width, height).expect("infallible"));
-        let first = prompt_first(&rendered, &blank, height);
+        let first = prompt_first(&rendered, &blank, width, height);
         let band = usize::from(prompt_rows(blank.editor.height(), height));
         assert!(
             first + band < rendered.len(),
@@ -4753,7 +4821,7 @@ fn the_welcome_screen_lifts_the_prompt_and_a_used_session_does_not() {
             .transcript_mut()
             .push(Message::user("a first prompt"));
         let rendered = rows(&render_offscreen(&mut used, width, height).expect("infallible"));
-        let first = prompt_first(&rendered, &used, height);
+        let first = prompt_first(&rendered, &used, width, height);
         let band = usize::from(prompt_rows(used.editor.height(), height));
         assert_eq!(
             first + band,
@@ -4764,21 +4832,221 @@ fn the_welcome_screen_lifts_the_prompt_and_a_used_session_does_not() {
 }
 
 /// The tail cannot starve the region it exists to centre, including at 20x10.
+///
+/// Restated for the arithmetic that replaced the capped half-region tail, not relaxed: the
+/// claim is still "the body keeps a row", and it is still checked at every height from one to
+/// twelve. What changed is that the guarantee no longer comes from a subtracted constant but
+/// from the halving itself, so the test now derives `body_max` the way `render` does and reads
+/// the tail back out of the one function `render` calls.
 #[test]
 fn the_welcome_tail_never_takes_the_row_the_welcome_needs() {
     for height in 1..=12u16 {
-        let band = prompt_rows(0, height);
-        let tail = welcome_tail_rows(true, height, STATUS_ROWS, band);
+        let (mut screen, _shutdown) = screen();
+        screen.editor.set_text("hi");
+        let (band, tail) = screen.prompt_and_tail(20, height);
+        let body_max = height.saturating_sub(STATUS_ROWS.saturating_add(band));
         assert!(
             STATUS_ROWS + band + tail < height || height <= STATUS_ROWS + band,
             "at {height} rows the chrome and the tail leave the body nothing: \
              status {STATUS_ROWS} + prompt {band} + tail {tail}"
         );
-        let (mut screen, _shutdown) = screen();
-        screen.editor.set_text("hi");
+        // The halving, asserted directly. A tail allowed to take the whole slack would satisfy
+        // the bound above on every even height and starve the body on the odd ones, so the
+        // inequality alone does not pin which half the tail may have.
+        assert!(
+            tail <= body_max / 2,
+            "at {height} rows the tail took {tail} of a {body_max}-row body"
+        );
         // The panic guard, exercised through the frame rather than the arithmetic: a tail that
         // fabricated a row the buffer does not own panics inside ratatui.
         let rendered = rows(&render_offscreen(&mut screen, 20, height).expect("infallible"));
         assert_eq!(rendered.len(), usize::from(height));
+    }
+}
+
+/// The empty screen's composite sits on the frame's middle, at three real terminal heights.
+///
+/// The complaint this answers, twice reported and measured on a real 120x32 pane: the block
+/// was drawn against the top and the input was pinned to the bottom, leaving nine dead rows
+/// below the prompt. The previous tail satisfied
+/// `the_welcome_screen_lifts_the_prompt_and_a_used_session_does_not` — it lifted the prompt by
+/// six rows — and still produced that screen, because a *lift* says nothing about where the
+/// composite ends up. So this asserts the balance instead: the blank rows above the block and
+/// the blank rows below the prompt must differ by at most one, which is the odd row a frame of
+/// odd slack cannot split.
+///
+/// Measured at five sizes rather than derived at one: 24 is the shortest common pane, 32 is the
+/// reported one, and 50 is where the previous six-row cap did its worst.
+///
+/// # Both edges are measured from the frame, and the previous version measured one of them wrong
+///
+/// This test passed against a build the user then measured as *not centred*, reporting nine dead
+/// rows under a one-row prompt. It was right about the arithmetic and wrong about the screen,
+/// because it took `gap_below` from `prompt_first` — the same function `render` splits by — so it
+/// asked "did the tail get the rows the formula says" and never "is the thing above the tail
+/// something a reader can see". The band was allocated four rows and painted in the transcript's
+/// own surface, so three of its rows were air to a reader and the visible gap below the composer
+/// was `3 + 6 = 9` against seven above.
+///
+/// So the bottom edge is now found the way the top edge always was: **by paint**. The composite's
+/// last row is the last row whose background is not the body surface — the strip and the band
+/// carry `element`, everything else carries `surface`, and the centring band is filled precisely
+/// so this question has an answer. That couples the assertion to the visibility: revert the
+/// band's fill to `text` and its rows join the surface, the edge found here jumps up to the
+/// strip, and this fails with a skew of three at 32 rows without the arithmetic changing at all.
+///
+/// `gap_above` is unchanged — the wordmark's block glyph, content only this block paints, which
+/// neither the sidebar (`│ ▾ ▸ ●`) nor the filled strip contains. A `render` that dropped the
+/// tail from its split would bottom-anchor the block 31 rows down on a 200x50 frame instead of
+/// 16 and fail with a skew of sixteen.
+#[test]
+fn the_welcome_composite_is_centred_on_the_frame() {
+    for (width, height) in [(120u16, 24u16), (120, 32), (120, 50), (80, 32), (200, 50)] {
+        let (mut blank, _shutdown) = screen();
+        let buffer = render_offscreen(&mut blank, width, height).expect("infallible");
+        let rendered = rows(&buffer);
+
+        let surface = ratatui::style::Color::from(blank.context.palette().background_panel);
+        let last_visible = (0..height)
+            .rposition(|y| buffer[(0, y)].bg != surface)
+            .expect("the composer is painted in its own surface");
+        let gap_below = rendered.len() - 1 - last_visible;
+        let gap_above = rendered
+            .iter()
+            .position(|row| row.contains('█'))
+            .expect("every size here is wide and tall enough for the wordmark");
+
+        let skew = gap_above.abs_diff(gap_below);
+        assert!(
+            skew <= 1,
+            "at {width}x{height} the composite a reader can see is {gap_above} rows from the \
+             top and {gap_below} from the bottom, a skew of {skew}"
+        );
+        // Both halves non-zero, because a screen with nothing above *and* nothing below would
+        // report a skew of zero while being the flush-to-the-edges layout being replaced.
+        assert!(
+            gap_above > 0 && gap_below > 0,
+            "at {width}x{height} the composite is flush against an edge: \
+             {gap_above} above, {gap_below} below"
+        );
+        // The edge found by paint has to be the edge the split produced, or the two measures
+        // above are of different things and the skew is a coincidence.
+        let (band, tail) = blank.prompt_and_tail(width, height);
+        assert_eq!(
+            gap_below,
+            usize::from(tail),
+            "at {width}x{height} the painted composer ends {gap_below} rows from the bottom but \
+             the split gave the tail {tail} and the band {band}"
+        );
+    }
+}
+
+/// The whole input band is painted in a surface of its own, so a reader can see how tall it is.
+///
+/// This is what makes "the input is centred" a claim about something visible. The band is four
+/// rows and only the first carries text, so unless the other three are painted in a background
+/// the surrounding surface does not use, the box reads as one row of text over three rows of air
+/// — which is the complaint, twice, not the fix.
+///
+/// # The earlier version of this test asserted the defect
+///
+/// It compared the band's background against the frame's **last row** and required them to
+/// differ. They did, and it passed, and the screen was still wrong: the last row was the centring
+/// band, which nothing painted, so it held ratatui's `Color::Reset`. The comparison was therefore
+/// against the *absence* of a paint decision rather than against a colour the design chose, and
+/// `text` — whose background is the transcript's own `background_panel` — cleared it easily while
+/// being exactly the colour that makes the box vanish.
+///
+/// So the comparison is against `background_panel` by name, and it is made in both directions: the
+/// band must not be the surface, and every row of it must be the same non-surface colour. That is
+/// checkable. Whether the difference is *perceptible* is not, and this test does not claim it —
+/// the choice of `element` rests on the status strip having been the one row of this composite
+/// users could always see, which is evidence from a terminal rather than from an assertion.
+#[test]
+fn the_prompt_band_is_painted_to_its_full_height() {
+    for (width, height) in [(120u16, 32u16), (80, 24)] {
+        let (mut blank, _shutdown) = screen();
+        let buffer = render_offscreen(&mut blank, width, height).expect("infallible");
+        let rendered = rows(&buffer);
+        let first = prompt_first(&rendered, &blank, width, height);
+        let band = usize::from(blank.prompt_and_tail(width, height).0);
+        assert!(band >= 2, "at {width}x{height} there is no band to measure");
+
+        let palette = blank.context.palette();
+        let surface = ratatui::style::Color::from(palette.background_panel);
+        let element = ratatui::style::Color::from(palette.background_element);
+        assert_ne!(
+            surface, element,
+            "the theme gives the composer no surface to be distinct in"
+        );
+
+        let row_of = |y: usize| buffer[(1, u16::try_from(y).expect("in frame"))].bg;
+        for offset in 0..band {
+            assert_eq!(
+                row_of(first + offset),
+                element,
+                "at {width}x{height} row {offset} of the band is not in the composer's own \
+                 surface, so the box reads as fewer than {band} rows"
+            );
+        }
+        // And the rows on either side are the surface, which is what makes the band an edge
+        // rather than the start of an unbounded region.
+        assert_eq!(
+            row_of(rendered.len() - 1),
+            surface,
+            "at {width}x{height} the centring band is unpainted, so the composite's bottom edge \
+             cannot be told from the terminal's own background"
+        );
+        assert_eq!(
+            row_of(first.saturating_sub(2)),
+            surface,
+            "at {width}x{height} the row above the status strip is not the body surface"
+        );
+    }
+}
+
+/// The instant a message lands the welcome composition yields completely.
+///
+/// The transition, not the two end states — those are asserted above and by
+/// `the_welcome_screen_lifts_the_prompt_and_a_used_session_does_not`. What can go wrong only
+/// *between* them is a centring band that outlives the screen it centred: the transcript would
+/// then be pushed around by rows belonging to a welcome block nobody can see. So this renders
+/// the empty frame, pushes one message, renders again, and requires the tail to be gone and the
+/// body to have grown by exactly the rows it gave up.
+#[test]
+fn the_first_message_takes_the_whole_welcome_band_with_it() {
+    for (width, height) in [(120u16, 32u16), (80, 24), (200, 50)] {
+        let (mut screen, _shutdown) = screen();
+        let before = rows(&render_offscreen(&mut screen, width, height).expect("infallible"));
+        let (band_before, tail_before) = screen.prompt_and_tail(width, height);
+        assert!(
+            tail_before > 0,
+            "at {width}x{height} the empty screen has no band to yield"
+        );
+        let body_before = before.len() - usize::from(tail_before + band_before + STATUS_ROWS);
+
+        screen
+            .transcript_mut()
+            .transcript_mut()
+            .push(Message::user("the first thing anyone types"));
+        let after = rows(&render_offscreen(&mut screen, width, height).expect("infallible"));
+        let (band_after, tail_after) = screen.prompt_and_tail(width, height);
+        assert_eq!(
+            tail_after, 0,
+            "at {width}x{height} a used session still pays for the welcome band"
+        );
+        let body_after = after.len() - usize::from(band_after + STATUS_ROWS);
+        assert_eq!(
+            body_after,
+            body_before + usize::from(tail_before),
+            "at {width}x{height} the transcript did not inherit every row the band held"
+        );
+        // And the prompt is back on the frame's last row, which is what "yields completely"
+        // means to a reader: the input stops moving between turns.
+        assert_eq!(
+            prompt_first(&after, &screen, width, height) + usize::from(band_after),
+            after.len(),
+            "at {width}x{height} the prompt is still lifted after the first message"
+        );
     }
 }
