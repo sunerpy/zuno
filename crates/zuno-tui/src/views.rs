@@ -429,6 +429,11 @@ pub fn truncate(text: &str, width: usize) -> String {
 /// beside it. [`ambient::SIDEBAR_WIDTH`] out of 120 leaves 86 for the reply, which is
 /// about where prose stops being comfortable; the same panel taken out of 100 would
 /// leave the answer narrower than the column describing it.
+///
+/// Width is a necessary condition and not the only one: the panel is also withheld while the
+/// transcript is empty, because there is nothing for it to describe then. That term lives in
+/// [`session`]'s `sidebar_drawn` rather than in this constant, so the boundary a used session
+/// observes stays exactly 120.
 pub const SIDEBAR_MIN_WIDTH: u16 = 120;
 
 /// The spelling a user would actually press for `action`, or `None` when unbound.

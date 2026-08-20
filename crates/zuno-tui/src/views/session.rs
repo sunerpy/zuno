@@ -137,9 +137,9 @@ const PROMPT_MAX_SHARE: u16 = 3;
 ///
 /// Taken from `codex`: the gutter and its marker, a column of air on the right, and a blank
 /// row under the text so the caret never sits on the terminal's last line. Not taken:
-/// `codex`'s *top* inset, because the status strip is already a filled full-width row
-/// directly above and a second blank row would spend a transcript row on separation the
-/// strip already supplies.
+/// `codex`'s *top* inset, because the status strip is a filled row directly **below** — see
+/// the band order in [`Component::render`] — and a second blank row above would spend a
+/// transcript row on separation the strip already supplies from the other side.
 ///
 /// # The band's own surface is the third element of that containment, and it was missing
 ///
@@ -156,10 +156,19 @@ const PROMPT_MAX_SHARE: u16 = 3;
 /// fill behind an inset element, and the role [`crate::views::message::StatusView`] already
 /// uses — which is the proof it reads on a real terminal, since the strip is the one row of
 /// this composite a user could always see. Strip and band therefore share a surface and read as
-/// one composer with a status header, which is `codex`'s bottom pane
+/// one composer with a status *footer*, which is `codex`'s bottom pane
 /// (`.omo/refs/codex/codex-rs/tui/src/chatwidget/rendering.rs:49-56`, status and composer in one
 /// `bottom_pane`) and is the same judgement the refused top inset already recorded: the strip
 /// belongs to the prompt it describes.
+///
+/// # The fill alone is not a box, and at full width it never was
+///
+/// A shared surface says "these rows are one object"; it cannot say "this object is the thing
+/// you type into", because a fill that runs the frame's whole width is a *band* rather than a
+/// box — it has no left or right edge for the eye to close. That is what was reported as an
+/// input box indistinguishable from its surroundings, and no colour choice fixes it while the
+/// region is edge to edge. [`COMPOSER_MAX_COLS`] gives the composer two margins, and
+/// [`SessionScreen::composer_rules`] paints the two edges into them.
 ///
 /// A fill rather than the border this constant's note rejects, because the objection to the
 /// border was that it costs two rows of a two-row floor. A background costs none.
@@ -208,14 +217,22 @@ const SIDEBAR_GAP_COLS: u16 = 1;
 /// the band is what this balances:
 ///
 /// ```text
-/// height = above + band + tail        (the whole frame, by definition)
-/// tail   = (height - band) / 2   ⟹    above = ⌈(height - band) / 2⌉
+/// height = above + band + STATUS_ROWS + tail   (the whole frame, by definition)
+/// below  = STATUS_ROWS + tail = (height - band) / 2
+///   ⟹    tail = (height - band) / 2 - STATUS_ROWS
+///   ⟹    above = ⌈(height - band) / 2⌉
 /// ```
 ///
 /// so the rows above the band and the rows below it differ by at most the odd row, whatever
 /// the frame and whatever the band's height. That last clause is what makes growth safe: the
 /// band and the tail move in opposite directions by the same amount, so a prompt growing from
 /// four rows to ten stays centred the whole way.
+///
+/// **The strip is counted as rows below the band, because that is where it is drawn.** It used
+/// to sit above, and a tail of `(height - band) / 2` balanced the band exactly. Now that the
+/// strip is the composer's footer the same tail leaves the band two rows high — the strip's own
+/// row, counted twice — so the subtraction is not a tweak, it is what keeps this function
+/// measuring the thing its name claims.
 ///
 /// # The head bounds it, and that is the only thing that can push the band off centre
 ///
@@ -237,11 +254,12 @@ const SIDEBAR_GAP_COLS: u16 = 1;
 /// the tail take the entire region.
 ///
 /// A fourth band rather than moving the prompt out of the split: the order
-/// body / status / prompt is what every other assertion about this screen measures from, and
-/// the strip has to stay directly above the prompt it describes. Lifting the pair by a tail
-/// keeps that order and every existing row relationship intact, and reduces to today's exact
-/// layout the moment a message arrives — which is what makes this cost nothing in the state
-/// the user spends their time in.
+/// body / prompt / status / tail is what every other assertion about this screen measures from,
+/// and the strip has to stay directly attached to the prompt it describes — below it, so the
+/// agent and model read as the composer's footer rather than as a header the transcript wears.
+/// Lifting the pair by a tail keeps that order and every existing row relationship intact, and
+/// reduces to today's exact layout the moment a message arrives — which is what makes this cost
+/// nothing in the state the user spends their time in.
 ///
 /// This is *not* a per-keystroke reflow: the tail is a function of the frame, of the band and
 /// of whether the transcript is empty. Typing into the prompt changes the band's height, and
@@ -250,23 +268,86 @@ fn welcome_tail_rows(empty: bool, height: u16, band: u16, body_max: u16, head: u
     if !empty {
         return 0;
     }
-    let centred = height.saturating_sub(band) / 2;
+    let centred = (height.saturating_sub(band) / 2).saturating_sub(STATUS_ROWS);
     let room = body_max.saturating_sub(head.max(1));
     centred.min(room)
 }
 
-/// Columns the transcript region keeps once the ambient sidebar has taken its own.
+/// Whether the ambient panel is drawn at all, for a `width`-column frame.
 ///
-/// Split out of [`Component::render`] because the welcome block's height depends on this
-/// width — the wordmark needs forty columns and the hint grid falls to one column below
-/// sixty — and the height has to be known *before* the vertical split that the horizontal
-/// split is carved from. The two conditions here are the same two the horizontal split
-/// applies, so a change to either has one place to be made.
-const fn welcome_width(width: u16, sidebar_visible: bool) -> u16 {
-    if sidebar_visible && width >= crate::views::SIDEBAR_MIN_WIDTH {
-        width.saturating_sub(SIDEBAR_GAP_COLS + crate::views::ambient::SIDEBAR_WIDTH)
+/// Three terms, and the middle one is the one that was missing. A panel is worth its columns
+/// only when there is a transcript beside it: on the empty screen every figure it carries —
+/// token spend, context used, LSP and MCP state — is zero or unresolved, so it spent a third of
+/// the frame stating nothing while pushing the welcome surface and the composer off the axis
+/// they are centred on. That is what was reported, and the fix is this term rather than
+/// [`crate::views::SIDEBAR_MIN_WIDTH`]: the threshold still governs the used session, where the
+/// panel has something to say.
+///
+/// Split out of [`Component::render`] because the welcome block's height is measured before the
+/// vertical split that the horizontal split is carved from, so two places need the same answer
+/// and neither may guess it.
+const fn sidebar_drawn(sidebar_visible: bool, empty: bool, width: u16) -> bool {
+    sidebar_visible && !empty && width >= crate::views::SIDEBAR_MIN_WIDTH
+}
+
+/// The widest the composer ever gets.
+///
+/// The complaint was that the input box took the whole frame, and a box the width of the frame
+/// has no edges: what a reader sees is a horizontal band, which is why no amount of background
+/// contrast made it read as a box. Eighty columns is the same measure prose has been set to for
+/// a century, it is what the transcript keeps beside the panel at
+/// [`crate::views::SIDEBAR_MIN_WIDTH`] (120 less the panel and its gap), and on a 120-column
+/// pane it leaves twenty columns of air on each side — enough to be air rather than a rounding
+/// error.
+///
+/// # Only while the transcript is empty, and that is a decision rather than an omission
+///
+/// The composer is narrowed on the welcome screen and left full width once a message lands.
+/// Three reasons, in the order they bind:
+///
+/// 1. Mid-conversation the composer is what a pasted diff or stack trace goes into, and
+///    [`PROMPT_MAX_SHARE`] already rations its rows; rationing its columns as well would evict
+///    the one region whose content the user supplies.
+/// 2. The body is split by the ambient panel from [`crate::views::SIDEBAR_MIN_WIDTH`] up, so a
+///    composer centred on the *frame* would sit off the transcript's own axis — the exact
+///    two-blocks-on-different-axes defect the welcome head and foot are centred together to
+///    avoid.
+/// 3. The welcome arrangement is already a separate composition: the tail exists only while the
+///    transcript is empty and "reduces to today's exact layout the moment a message arrives".
+///    The width follows the same rule, so there are two compositions rather than three.
+const COMPOSER_MAX_COLS: u16 = 80;
+
+/// The glyphs that close the composer's left and right edges.
+///
+/// Half blocks rather than `│`, because they are the crate's existing vocabulary for "this
+/// region is the one in focus" — [`crate::views::message`] marks a speaking role with `▌` and
+/// [`crate::views::welcome::COMPACT_BRAND`] leads with it. Drawn in the *margin* beside the
+/// band rather than inside it, so the edges cost the text no columns and the band's own
+/// arithmetic is untouched; a frame with no margin to spare simply has no rules, which is the
+/// same degradation the panel and the wordmark already make.
+const COMPOSER_LEFT_RULE: &str = "▌";
+const COMPOSER_RIGHT_RULE: &str = "▐";
+
+/// `band` narrowed to the composer's central region, or `band` itself when not `centred`.
+///
+/// The narrowing is a `min`, never a `clamp`. [`u16::clamp`] **panics when its minimum exceeds
+/// its maximum** — the hazard [`prompt_rows`] documents at length — and on the 20-column pane a
+/// real terminal reaches, [`COMPOSER_MAX_COLS`] is four times the frame. Taking the smaller of
+/// the two orders them by construction, so a narrow pane degrades to the full width rather than
+/// to a slit or an abort.
+const fn composer_region(band: Rect, centred: bool) -> Rect {
+    if !centred {
+        return band;
+    }
+    let width = if band.width < COMPOSER_MAX_COLS {
+        band.width
     } else {
-        width
+        COMPOSER_MAX_COLS
+    };
+    Rect {
+        x: band.x + (band.width - width) / 2,
+        width,
+        ..band
     }
 }
 
@@ -1162,19 +1243,22 @@ impl Component for SessionScreen {
             .collect();
         let empty = self.transcript.transcript().messages().is_empty();
         let (prompt_band, tail) = self.prompt_and_tail(area.width, area.height);
-        let [body, status, prompt, tail] = Layout::vertical([
+        // Prompt above strip: the agent and the model are what the *composer* is set to, so they
+        // belong under the box the way a caption belongs under a figure. See `welcome_tail_rows`,
+        // which counts the strip among the rows below the band for exactly this reason.
+        let [body, prompt, status, tail] = Layout::vertical([
             Constraint::Min(1),
-            Constraint::Length(STATUS_ROWS),
             Constraint::Length(prompt_band),
+            Constraint::Length(STATUS_ROWS),
             Constraint::Length(tail),
         ])
         .areas(area);
 
         // The sidebar is dropped rather than narrowed below the threshold: a panel
         // squeezed until its server names truncate says less than no panel while still
-        // costing the reply the columns it needed.
-        let (main, aside) = if self.sidebar_visible && area.width >= crate::views::SIDEBAR_MIN_WIDTH
-        {
+        // costing the reply the columns it needed. And it is dropped outright while the
+        // transcript is empty — see `sidebar_drawn`.
+        let (main, aside) = if sidebar_drawn(self.sidebar_visible, empty, area.width) {
             // The gap column is between the two, not inside either, so neither the
             // transcript's wrap width nor the panel's own layout has to know about it.
             let [main, _gap, aside] = Layout::horizontal([
@@ -1212,7 +1296,6 @@ impl Component for SessionScreen {
             self.sidebar.forget_hit_targets();
         }
 
-        self.status.render(frame, status);
         // Either way the centring band is painted, so the frame has one background from top to
         // bottom. Unpainted it kept ratatui's `Color::Reset` and rendered as the *terminal's*
         // background, which put a colour seam under the composer on any theme whose panel is
@@ -1227,31 +1310,34 @@ impl Component for SessionScreen {
         // transcript.
         crate::views::fill(frame.buffer_mut(), tail, self.context.surface());
         if empty {
-            // Narrowed by `welcome_width`, the same function the head's region is narrowed by,
-            // and for a reason that is visible rather than structural: the two halves of this
-            // surface centre their rows independently, so a foot centred on the full frame
-            // while the head is centred inside the sidebar's remainder puts the wordmark and
-            // the lead line on different axes. Measured at 120x32 with the sidebar drawn, the
-            // brand began at column 25 and `type / for commands` at column 39 — fourteen
-            // columns apart, which reads as two unrelated blocks rather than one screen.
-            //
-            // The sidebar itself is not drawn here — it belongs to `body` — so this narrows
-            // only to borrow the same axis, and the columns it gives up were filled above.
-            self.welcome.render_foot(
-                frame,
-                Rect {
-                    width: welcome_width(tail.width, self.sidebar_visible),
-                    ..tail
-                },
-            );
+            // The full frame width, and so is the head's region: the two halves of this surface
+            // centre their rows independently, so both have to be handed the same measure or the
+            // wordmark and the lead line land on different axes. That used to mean subtracting
+            // the panel's columns from both — measured at 120x32 with the panel drawn, the brand
+            // began at column 25 and `type / for commands` at column 39, fourteen columns apart
+            // and reading as two unrelated blocks. The panel is no longer drawn on this screen
+            // at all (see `sidebar_drawn`), so the shared measure is simply the frame.
+            self.welcome.render_foot(frame, tail);
         }
-        // The whole band is painted first, so the spacer row and the right inset carry the
+        // The composer's two rows are narrower than the frame, so the columns beside them belong
+        // to the body surface and are painted with it *first* — an unpainted margin keeps
+        // ratatui's `Color::Reset` and renders as the terminal's own background, which is the
+        // colour seam the centring band's fill exists to avoid, reintroduced sideways.
+        crate::views::fill(frame.buffer_mut(), prompt, self.context.surface());
+        crate::views::fill(frame.buffer_mut(), status, self.context.surface());
+        let composer = composer_region(prompt, empty);
+        // The whole band is painted next, so the spacer row and the right inset carry the
         // prompt's own background rather than whatever the previous frame left there. `element`
         // rather than `text`: they differ only in background, and `text`'s is the surface the
         // transcript already uses, which is why four allocated rows read as one. See
         // `PROMPT_GUTTER_COLS`.
-        crate::views::fill(frame.buffer_mut(), prompt, self.context.element());
-        let (gutter, buffer) = prompt_frame(prompt);
+        crate::views::fill(frame.buffer_mut(), composer, self.context.element());
+        // Narrowed to the same region as the band it describes, and by the same call: a
+        // full-width strip under a centred box would put the composer's own footer on a
+        // different axis from the composer.
+        self.status.render(frame, composer_region(status, empty));
+        self.composer_rules(frame, prompt.union(status), composer);
+        let (gutter, buffer) = prompt_frame(composer);
         if let Some(gutter) = gutter {
             crate::views::editor::PromptGutter::new(self.context.clone(), PROMPT_MARKER.to_owned())
                 .render(frame, gutter);
@@ -1315,14 +1401,50 @@ impl SessionScreen {
     /// measured at the width the sidebar leaves. Composing those three facts in more than one
     /// place is how a test comes to locate the prompt one row off from where `render` put it,
     /// and the row it would then read is blank, so the failure names the wrong thing.
+    /// Close the composer's left and right edges in the margins of `band`.
+    ///
+    /// `band` is the composer's two rows at their full frame width and `composer` is the region
+    /// actually filled, so the difference between them is the air the rules are painted into.
+    /// Written cell by cell rather than as two one-column `Paragraph`s because a rule is one
+    /// glyph repeated down a column, and a widget per column would be two more render calls for
+    /// a shape that has no layout of its own.
+    ///
+    /// Both edges are optional and independently so. A frame with no margin — the 80-column pane
+    /// where the composer is already the frame, or any used session — gets neither, and the band
+    /// falls back to being told from its surroundings by its fill alone. That is the same
+    /// degradation the panel and the wordmark make, and it is why this cannot be the *only*
+    /// thing distinguishing the composer.
+    fn composer_rules(&self, frame: &mut Frame<'_>, band: Rect, composer: Rect) {
+        if composer.width == 0 || composer.height == 0 {
+            return;
+        }
+        let style = self.context.accent();
+        let left = composer.x.checked_sub(1).filter(|x| *x >= band.x);
+        let right = Some(composer.x + composer.width).filter(|x| *x < band.x + band.width);
+        let buffer = frame.buffer_mut();
+        for y in band.y..band.y.saturating_add(band.height) {
+            if let Some(x) = left {
+                buffer[(x, y)]
+                    .set_symbol(COMPOSER_LEFT_RULE)
+                    .set_style(style);
+            }
+            if let Some(x) = right {
+                buffer[(x, y)]
+                    .set_symbol(COMPOSER_RIGHT_RULE)
+                    .set_style(style);
+            }
+        }
+    }
+
     pub(crate) fn prompt_and_tail(&self, width: u16, height: u16) -> (u16, u16) {
         let band = prompt_rows(self.editor.height(), height);
         let empty = self.transcript.transcript().messages().is_empty();
-        // At the *frame* height and at the sidebar-adjusted width — the same pair
-        // `WelcomeView::render` decides the wordmark from. See `welcome_tail_rows`.
+        // At the *frame* height and the *frame* width — the same pair `WelcomeView::render`
+        // decides the wordmark from. The width is no longer adjusted for the panel because the
+        // panel is not drawn while this head is: see `sidebar_drawn`, and the head's own
+        // measurement note in `welcome_tail_rows`.
         let head = if empty {
-            self.welcome
-                .head_rows(welcome_width(width, self.sidebar_visible), height)
+            self.welcome.head_rows(width, height)
         } else {
             0
         };
