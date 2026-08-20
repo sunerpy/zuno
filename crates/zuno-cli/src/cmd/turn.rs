@@ -142,6 +142,16 @@ pub(crate) struct TurnPlan {
     /// Filled from [`Catalog::model_lines`], which is the same enumeration `zuno models`
     /// prints. One function, so the two surfaces cannot disagree again.
     catalog_models: Vec<String>,
+    /// Every discovered skill, shared by the prompt catalogue and the `skill` tool.
+    ///
+    /// One load, one [`Arc`], two consumers — because a tool answering from a second
+    /// load could hand back a body for a name the prompt never advertised, or refuse
+    /// one it did.
+    skills: Arc<zuno_catalog::skill::Skills>,
+    /// Catalog facts for the models a delegation may name. See [`delegation_facts`].
+    delegation_facts: Arc<zuno_tools::task::FixedFacts>,
+    /// Whether any reachable model accepts images, which gates one delegation target.
+    vision_available: bool,
 }
 
 impl TurnPlan {
@@ -278,6 +288,23 @@ impl TurnPlan {
             &mut notes,
         )?;
         let catalog_models = picker_model_ids(&catalog);
+        let vision_available = catalog_models.iter().any(|line| {
+            line.split_once('/').is_some_and(|(provider, model)| {
+                catalog
+                    .model(provider, model)
+                    .is_some_and(|model| model.capabilities.input.image)
+            })
+        });
+        let delegation_facts = Arc::new(delegation_facts(&catalog));
+        let skills = Arc::new(
+            zuno_catalog::skill::load(&zuno_catalog::skill::SkillOptions::from_config(
+                &directory,
+                worktree.as_deref(),
+                env,
+                &config,
+            ))
+            .await,
+        );
         Ok(Self {
             directory,
             project,
@@ -298,6 +325,9 @@ impl TurnPlan {
             plugin_tools,
             plugins,
             catalog_models,
+            skills,
+            delegation_facts,
+            vision_available,
         })
     }
 
@@ -400,7 +430,7 @@ fn token_count(limit: f64) -> u64 {
 /// # Why an internal cannot leave the session's provider
 ///
 /// [`ModelPolicy`] may legitimately answer with a model under a different provider,
-/// and this function then declines it and records why. [`TurnHost::open`] wires
+/// and this function then declines it and records why. [`TurnHost::open_with_mcp`] wires
 /// exactly one credential — the session provider's — so honouring a cross-provider
 /// answer would mean presenting that credential to a different vendor's endpoint.
 /// Falling back to the session's own model costs a larger model for a small job;
@@ -631,24 +661,35 @@ impl TurnHost {
     ///
     /// Returns a message when the database cannot be opened or migrated, when the
     /// session cannot be resolved, or when the tools cannot be assembled.
-    pub(crate) fn open(
+    /// The headless entry point: no live user to ask, one optional MCP catalog.
+    ///
+    /// There was an `open` beside this taking no catalog at all, and `zuno run` called
+    /// it — which is how the same configuration produced MCP tools in the TUI and none
+    /// headlessly. It is gone rather than deprecated: a constructor that silently
+    /// drops a capability is one a future caller reaches for again.
+    pub(crate) fn open_with_mcp(
         plan: TurnPlan,
         environment: &StartupEnvironment,
         approval: Arc<dyn PermissionAsker>,
+        mcp: Option<zuno_mcp::Catalog>,
     ) -> Result<Self, String> {
-        Self::open_with_runtime(plan, environment, approval, None, SessionRunRegistry::new())
+        Self::open_with_runtime_and_mcp(
+            plan,
+            environment,
+            approval,
+            None,
+            SessionRunRegistry::new(),
+            mcp,
+        )
     }
 
-    pub(crate) fn open_with_runtime(
-        plan: TurnPlan,
-        environment: &StartupEnvironment,
-        approval: Arc<dyn PermissionAsker>,
-        question: Option<Arc<dyn zuno_tools::question::QuestionAsker>>,
-        runs: SessionRunRegistry,
-    ) -> Result<Self, String> {
-        Self::open_with_runtime_and_mcp(plan, environment, approval, question, runs, None)
-    }
-
+    /// The full constructor. **Every** surface reaches this one.
+    ///
+    /// There is deliberately no wrapper that defaults `mcp` away. Two existed — `open`
+    /// and `open_with_runtime` — and between them they were how `zuno run` and
+    /// `zuno serve` came to advertise fewer tools than `zuno tui` from identical
+    /// configuration, with no error on either path. A surface that genuinely wants no
+    /// MCP passes `None` here and says so at its own call site.
     pub(crate) fn open_with_runtime_and_mcp(
         mut plan: TurnPlan,
         environment: &StartupEnvironment,
@@ -700,6 +741,8 @@ impl TurnHost {
             &plan.config,
             zuno_tools::ScopePaths::discover(memory_root),
         )?;
+        let mut notes = plan.notes;
+        announce_skills(&mut plan.resolver, &plan.skills, &mut notes);
 
         let runtime_tools = super::tool_runtime::assemble(
             &plan.directory,
@@ -718,12 +761,32 @@ impl TurnHost {
                 mcp_loader: mcp.map(|catalog| {
                     Arc::new(catalog.loader()) as Arc<dyn zuno_tools::registry::McpToolLoader>
                 }),
+                skills: Arc::clone(&plan.skills),
+                delegation: super::tool_runtime::Delegation {
+                    host: Arc::new(super::child_turn::ChildSessionHost::new(
+                        environment.clone(),
+                        plan.directory.clone(),
+                        Arc::clone(&approval),
+                    )),
+                    facts: Arc::clone(&plan.delegation_facts)
+                        as Arc<dyn zuno_tools::task::ProviderFacts>,
+                    session_model: zuno_agent::model_policy::ModelChoice::new(format!(
+                        "{}/{}",
+                        plan.provider_id, plan.model_id
+                    )),
+                    limits: zuno_tools::task::DelegationLimits {
+                        subagent_depth: plan
+                            .config
+                            .subagent_depth
+                            .unwrap_or(zuno_tools::task::DEFAULT_SUBAGENT_DEPTH),
+                    },
+                    vision_available: plan.vision_available,
+                },
             },
         )?;
         // Joins the notes so shadowing reaches whatever surface is watching: the
         // headless runs print them, and the TUI draws them in the transcript. This is
         // what replaces the registry's own `eprintln!` without going quiet.
-        let mut notes = plan.notes;
         notes.extend(
             runtime_tools
                 .suppressions
@@ -769,6 +832,16 @@ impl TurnHost {
     /// The session every turn this host drives belongs to.
     pub(crate) fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// Carry notes a caller produced *before* the host existed onto the transcript.
+    ///
+    /// An MCP server that fails to connect is discovered before the host is built —
+    /// the catalog has to be populated first — so its note has nowhere to go until
+    /// there is a host to report through. Dropping it instead is this defect class
+    /// exactly: a server whose tools are silently absent.
+    pub(crate) fn push_notes(&mut self, notes: impl IntoIterator<Item = String>) {
+        self.notes.extend(notes);
     }
 
     /// How many tools this session offers the model.
@@ -1335,6 +1408,56 @@ async fn report_plugin_diagnostics(
     }
 }
 
+/// How many bytes of skill catalogue may enter the system prompt.
+///
+/// Sized against the real corpus rather than picked round: this machine's 189 skills
+/// render to roughly 113 KB verbose, and 32 KB fits the great majority of them while
+/// keeping the catalogue a fraction of a small model's context. The trim is reported,
+/// never silent — see [`announce_skills`].
+const SKILL_PROMPT_BUDGET: usize = 32 * 1024;
+
+/// Put the discovered skills in the system prompt, and say so if any did not fit.
+///
+/// Discovery has run since todo 14, and until now its only consumer was a TUI status
+/// line: the model was never told a single skill existed, so no skill could ever
+/// activate and the `skill` tool had no names to be called with. This is the other
+/// half of that tool — a catalogue without a loader is unusable, and a loader without
+/// a catalogue is uncallable.
+///
+/// [`zuno_catalog::skill::Form::Verbose`] rather than `List` because it carries each
+/// skill's `location`, which leaves `read` as a working fallback if the `skill` tool
+/// is denied by an agent's permissions.
+fn announce_skills(
+    resolver: &mut Resolver,
+    skills: &zuno_catalog::skill::Skills,
+    notes: &mut Vec<String>,
+) {
+    if skills.all().is_empty() {
+        return;
+    }
+    let rendered = skills.render_within(zuno_catalog::skill::Form::Verbose, SKILL_PROMPT_BUDGET);
+    if rendered.rendered == 0 {
+        notes.push(format!(
+            "warning: no skill fits the {SKILL_PROMPT_BUDGET}-byte prompt budget, so none \
+             were advertised; shorten the longest `description` in your skill frontmatter"
+        ));
+        return;
+    }
+    if rendered.omitted > 0 {
+        notes.push(format!(
+            "warning: {} of {} skills did not fit the {SKILL_PROMPT_BUDGET}-byte prompt \
+             budget and were not advertised to the model",
+            rendered.omitted,
+            rendered.rendered + rendered.omitted,
+        ));
+    }
+    resolver.system_prompt = if resolver.system_prompt.is_empty() {
+        rendered.text
+    } else {
+        format!("{}\n\n{}", resolver.system_prompt, rendered.text)
+    };
+}
+
 fn configure_resident_memory(
     resolver: &mut Resolver,
     config: &zuno_config::schema::Config,
@@ -1535,6 +1658,72 @@ const COMPATIBLE_TRANSPORTS: &[(&str, &str)] = &[
     ("vercel", "@ai-sdk/vercel"),
     ("xai", "@ai-sdk/xai"),
 ];
+
+/// Catalog facts for every reachable model, for [`zuno_tools::task::ProviderFacts`].
+///
+/// Built here because this is where the catalog is already resolved, and keyed on the
+/// same `provider/model` string [`zuno_agent::model_policy::ModelChoice`] carries, so
+/// a delegation naming a model and this map agree by construction.
+///
+/// Three of the four facts are read from the catalog: `reasoning` from the model's
+/// declared capability, `variants` from its declared variants, and `family` from the
+/// transport [`provider_factory_key`] already resolves — reused rather than
+/// re-switched on `api.npm`, so a transport added there cannot silently fall through
+/// to the wrong request shape here.
+///
+/// `effort` is [`EffortCapabilities::default`], and that is a real limitation rather
+/// than a chosen value: nothing in the resolved catalog carries a model's adaptive or
+/// token-budget reasoning shape, so there is nothing to read. The consequence is
+/// bounded — it applies only when a delegation passes an explicit `effort` that the
+/// model does not itself declare a variant for, and it yields the named-effort shape
+/// rather than a budget one. Everything else about the delegation is unaffected.
+fn delegation_facts(catalog: &Catalog) -> zuno_tools::task::FixedFacts {
+    let mut facts = zuno_tools::task::FixedFacts::new();
+    // Walked through `model_lines`, the same enumeration `zuno models` prints and
+    // `picker_model_ids` fills the model picker from, so "a model a delegation may
+    // name" and "a model this build offers" are one list.
+    for line in catalog.model_lines() {
+        let Some((provider_id, model_id)) = line.split_once('/') else {
+            continue;
+        };
+        let Some(model) = catalog.model(provider_id, model_id) else {
+            continue;
+        };
+        let Some(family) = effort_family(provider_id, &model.api.npm) else {
+            continue;
+        };
+        facts = facts.with(
+            line.clone(),
+            zuno_tools::task::ModelFacts {
+                family,
+                reasoning: model.capabilities.reasoning,
+                effort: zuno_llm::effort::EffortCapabilities::default(),
+                variants: model.variants.clone(),
+            },
+        );
+    }
+    facts
+}
+
+/// Which request-shape family a transport's reasoning options belong to.
+///
+/// Keyed off [`provider_factory_key`]'s answer rather than `npm` directly, so the two
+/// cannot disagree about what a transport is.
+fn effort_family(provider_id: &str, npm: &str) -> Option<zuno_llm::effort::ProviderFamily> {
+    use zuno_llm::effort::ProviderFamily;
+    let family = match provider_factory_key(provider_id, npm)? {
+        "anthropic" | "google-vertex/anthropic" => ProviderFamily::Anthropic,
+        "amazon-bedrock" | "amazon-bedrock/mantle" => ProviderFamily::Bedrock,
+        "google" | "google-vertex" => ProviderFamily::Google,
+        "openai" => ProviderFamily::OpenAi,
+        // Every remaining transport reaches a provider through the OpenAI-compatible
+        // factory, and OpenRouter is the one whose reasoning options differ from
+        // OpenAI's own — it nests them under `reasoning.effort`.
+        _ if npm == "@openrouter/ai-sdk-provider" => ProviderFamily::OpenRouter,
+        _ => ProviderFamily::OpenAi,
+    };
+    Some(family)
+}
 
 fn provider_factory_key(provider_id: &str, npm: &str) -> Option<&'static str> {
     match npm {
@@ -2315,7 +2504,7 @@ fn persist_prepared_user_message(
     Ok(())
 }
 
-fn prefixed_id(prefix: &str) -> String {
+pub(super) fn prefixed_id(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4().simple())
 }
 

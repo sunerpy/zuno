@@ -306,11 +306,21 @@ async fn download_all(
     files: &[String],
     dest_root: &Path,
 ) -> Vec<SkillWarning> {
-    let results = futures::stream::iter(files.iter().map(|file| {
+    // Owned pairs, and `name` cloned per job, so the closure takes no reference and
+    // its returned future borrows nothing from the caller. With `files.iter()` the
+    // closure was `fn(&'0 String) -> impl Future` for one inferred `'0` rather than
+    // `for<'a>`, which made this future — and therefore `load`'s — **not `Send`**.
+    // Nothing caught it because the only caller awaited it from a `!Send` context;
+    // the first `Send` caller (`TurnPlan::resolve`, which `serve` boxes into a
+    // `Send` trait future and the TUI `tokio::spawn`s) failed to compile.
+    let jobs: Vec<(String, PathBuf)> = files
+        .iter()
+        .map(|file| (file.clone(), dest_root.join(file)))
+        .collect();
+    let results = futures::stream::iter(jobs.into_iter().map(|(file, dest)| {
         let client = client.clone();
         let base = base.clone();
-        let dest = dest_root.join(file);
-        let file = file.clone();
+        let name = name.to_owned();
         async move {
             let Ok(url) = base.join(&format!("{name}/{file}")) else {
                 return Err(SkillWarning::new(

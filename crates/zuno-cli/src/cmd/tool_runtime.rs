@@ -22,12 +22,21 @@
 //! # Which built-ins are registered, and why the list is short of the slot table
 //!
 //! [`zuno_tools::registry::BUILTIN_ORDER`] has seventeen positions. This module
-//! registers the ones whose implementation needs nothing but the workspace and the
-//! database. `question` and `plan_exit` need a live user to answer, `task` needs a
-//! child-session host, `skill` and `lsp` have no implementation in `zuno-tools` at
-//! all, and `execute` is registered by the builder itself behind an experimental
-//! flag. An unregistered slot is simply absent from the assembled vector, so the
-//! model is never told about a tool that cannot run.
+//! registers the ones whose implementation needs nothing but the workspace, the
+//! database, and the collaborators [`ToolSelection`] carries. `plan_exit` needs a
+//! live user to answer, `lsp` has no implementation in `zuno-tools` at all, and
+//! `execute` is registered by the builder itself behind an experimental flag. An
+//! unregistered slot is simply absent from the assembled vector, so the model is
+//! never told about a tool that cannot run.
+//!
+//! # Why an absent slot is a defect and not a default
+//!
+//! `task` and `skill` sat unregistered here while both implementations were complete
+//! and tested. Nothing failed loudly: the model was told those tools did not exist,
+//! so it never called them, so no test that built its own registry noticed. A test
+//! asserting a slot is present must therefore call [`assemble`] — the function
+//! `zuno run`, `zuno serve` and the TUI all reach — because a hand-assembled registry
+//! would have passed throughout. `tests/tool_runtime.rs` is that assertion.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -74,6 +83,29 @@ pub(crate) struct ToolSelection<'a> {
     pub(crate) todo_store: Arc<zuno_db::pool::Pool>,
     pub(crate) goal_store: Arc<zuno_goal::GoalStore>,
     pub(crate) mcp_loader: Option<Arc<dyn McpToolLoader>>,
+    pub(crate) skills: Arc<zuno_catalog::skill::Skills>,
+    pub(crate) delegation: Delegation,
+}
+
+/// The collaborators `task` needs, which only a surface that can drive a turn has.
+///
+/// **Deliberately not `Option`.** `task` went unregistered for exactly as long as it
+/// took nobody to pass a host, and an optional field turns that back into a runtime
+/// choice a test can only catch by looking. Required, the compiler catches it: the
+/// sole caller of [`assemble`] is [`super::turn::TurnHost::open_with_runtime_and_mcp`],
+/// which by construction can host a child turn, so there is no surface that legitimately
+/// assembles a turn's tools and cannot delegate.
+pub(crate) struct Delegation {
+    /// Creates the child session and drives its turn.
+    pub(crate) host: Arc<dyn zuno_tools::task::ChildTurnHost>,
+    /// Catalog facts for the models a delegation may name.
+    pub(crate) facts: Arc<dyn zuno_tools::task::ProviderFacts>,
+    /// The parent session's model, the precedence ladder's floor.
+    pub(crate) session_model: zuno_agent::model_policy::ModelChoice,
+    /// The hop budget from `subagent_depth`.
+    pub(crate) limits: zuno_tools::task::DelegationLimits,
+    /// Whether the catalog holds a vision-capable model, which gates one target.
+    pub(crate) vision_available: bool,
 }
 
 /// Assemble the registry for `agent` and project it onto `provider_id`/`model_id`.
@@ -122,6 +154,14 @@ pub(crate) fn assemble(
             .register_builtin(BuiltinSlot::Question, erase(QuestionTool::new(asker)))
             .map_err(|error| error.to_string())?;
     }
+    let delegation = selection.delegation;
+    let task = zuno_tools::task::TaskTool::new(delegation.host, delegation.facts)
+        .with_session_model(delegation.session_model)
+        .with_limits(delegation.limits)
+        .with_vision_available(delegation.vision_available);
+    builder
+        .register_builtin(BuiltinSlot::Task, erase(task))
+        .map_err(|error| error.to_string())?;
     for (slot, tool) in [
         (
             BuiltinSlot::Invalid,
@@ -145,6 +185,10 @@ pub(crate) fn assemble(
             erase(zuno_tools::WebSearchTool::with_config(
                 SearchConfig::from_lookup(|key| env.value(key).map(str::to_owned)),
             )),
+        ),
+        (
+            BuiltinSlot::Skill,
+            erase(zuno_tools::SkillTool::new(Arc::clone(&selection.skills))),
         ),
     ] {
         builder

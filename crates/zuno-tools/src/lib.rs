@@ -217,7 +217,13 @@ pub use crate::todo::{
 };
 
 pub mod memory;
+pub mod skill;
 pub mod task;
+
+pub use crate::skill::{
+    DESCRIPTION as SKILL_DESCRIPTION, SUGGESTION_LIMIT as SKILL_SUGGESTION_LIMIT, SkillParams,
+    SkillRejection, SkillTool, WIRE_ID as SKILL_WIRE_ID,
+};
 
 pub use crate::task::{
     BACKGROUND_ID_PREFIX, ChildTurn, ChildTurnError, ChildTurnHost, ChildTurnRequest,

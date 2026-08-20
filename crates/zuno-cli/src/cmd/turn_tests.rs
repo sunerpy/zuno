@@ -27,6 +27,22 @@ fn agent(name: &str) -> Agent {
     }
 }
 
+/// The delegation collaborators a test supplies to reach [`tool_runtime::assemble`].
+///
+/// A recording host and no catalog facts, because none of these assertions drive a
+/// child turn. That this compiles at all is the point the production wiring rests on:
+/// `Delegation` is a required field, so `turn.rs` cannot assemble a turn's tools
+/// without handing over a real `ChildTurnHost`.
+fn test_delegation() -> tool_runtime::Delegation {
+    tool_runtime::Delegation {
+        host: Arc::new(zuno_tools::task::RecordingHost::new()),
+        facts: Arc::new(zuno_tools::task::NoProviders),
+        session_model: zuno_agent::model_policy::ModelChoice::new("provider/model"),
+        limits: zuno_tools::task::DelegationLimits::default(),
+        vision_available: false,
+    }
+}
+
 fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
     let directory = PathBuf::from(directory);
     let project = zuno_paths::project::ResolvedProject {
@@ -47,6 +63,9 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
             spec: Spec::new(COMPATIBLE_PROVIDER).with_surface(ApiSurface::Chat),
         },
         catalog_models: Vec::new(),
+        skills: Arc::new(zuno_catalog::skill::Skills::default()),
+        delegation_facts: Arc::new(zuno_tools::task::FixedFacts::new()),
+        vision_available: false,
         directory,
         project,
         config: zuno_config::schema::Config::default(),
@@ -2126,6 +2145,8 @@ fn production_registry_exposes_all_three_goal_tools() {
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
             ),
             mcp_loader: None,
+            skills: Arc::new(zuno_catalog::skill::Skills::default()),
+            delegation: test_delegation(),
         },
     )
     .expect("production registry assembles");
@@ -2863,5 +2884,319 @@ fn the_picker_enumeration_spans_every_provider_the_catalog_holds() {
     assert!(
         session_slice.len() < offered.len(),
         "the fixture cannot distinguish one provider's slice from the whole catalog"
+    );
+}
+
+/// Every assertion below calls [`tool_runtime::assemble`] — the one function
+/// `zuno run`, `zuno serve` and the TUI all reach — and never a registry built here.
+///
+/// That distinction is the whole point. `task` and `skill` were fully implemented and
+/// tested in `zuno-tools` while unregistered in the production assembly, and every one
+/// of those tests passed the entire time, because each built its own registry. A slot
+/// missing from the composition root is only observable from the composition root.
+mod production_registry {
+    use super::*;
+
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        _goal_spill: tempfile::TempDir,
+        ids: Vec<String>,
+    }
+
+    fn assemble_with(skills: zuno_catalog::skill::Skills) -> Fixture {
+        let directory = tempfile::TempDir::new().expect("temporary tool workspace");
+        let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
+        let selected_agent = agent("build");
+        let runtime = tool_runtime::assemble(
+            directory.path(),
+            None,
+            &Env::empty(),
+            &zuno_config::schema::Config::default(),
+            &selected_agent,
+            tool_runtime::ToolSelection {
+                provider_id: "provider",
+                model_id: "model",
+                question: None,
+                plugin_tools: &[],
+                plugins: None,
+                todo_store: Arc::new(
+                    zuno_db::Pool::open(&zuno_paths::DbLocation::Memory)
+                        .expect("in-memory todo store"),
+                ),
+                goal_store: Arc::new(
+                    GoalStore::open_memory(goal_spill.path().to_owned())
+                        .expect("in-memory goal store"),
+                ),
+                mcp_loader: None,
+                skills: Arc::new(skills),
+                delegation: test_delegation(),
+            },
+        )
+        .expect("production registry assembles");
+        let ids = runtime
+            .tools
+            .iter()
+            .map(|tool| tool.id().to_owned())
+            .collect();
+        Fixture {
+            _directory: directory,
+            _goal_spill: goal_spill,
+            ids,
+        }
+    }
+
+    fn assemble() -> Fixture {
+        assemble_with(zuno_catalog::skill::Skills::default())
+    }
+
+    #[test]
+    fn advertises_the_skill_tool_so_a_skill_body_can_be_loaded_on_demand() {
+        let fixture = assemble();
+
+        assert!(
+            fixture.ids.iter().any(|id| id == zuno_tools::SKILL_WIRE_ID),
+            "the production registry has no `{}`, so no discovered skill can be loaded; \
+             visible tools: {:?}",
+            zuno_tools::SKILL_WIRE_ID,
+            fixture.ids
+        );
+    }
+
+    #[test]
+    fn advertises_the_task_tool_so_work_can_be_delegated_to_a_subagent() {
+        let fixture = assemble();
+
+        assert!(
+            fixture.ids.iter().any(|id| id == zuno_tools::TASK_WIRE_ID),
+            "the production registry has no `{}`, so the model cannot delegate at all; \
+             visible tools: {:?}",
+            zuno_tools::TASK_WIRE_ID,
+            fixture.ids
+        );
+    }
+
+    /// The `skill` tool must answer from the same set the prompt advertised.
+    ///
+    /// One load shared by both consumers, so a name in `<available_skills>` is
+    /// necessarily a name the tool can load. Two loads would let them disagree.
+    #[tokio::test]
+    async fn the_skill_tool_answers_from_the_very_set_the_prompt_was_built_from() {
+        use zuno_tool::{AllowAll, NeverInterrupted, ToolContext};
+
+        let skills = zuno_catalog::skill::Skills::from_loaded([zuno_catalog::skill::Skill {
+            name: "wired".to_owned(),
+            description: Some("proves the registry holds this exact set".to_owned()),
+            location: "/skills/wired/SKILL.md".to_owned(),
+            content: "the body the model must receive".to_owned(),
+        }]);
+        let advertised = skills.render(zuno_catalog::skill::Form::Verbose);
+        let directory = tempfile::TempDir::new().expect("temporary tool workspace");
+        let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
+        let selected_agent = agent("build");
+        let runtime = tool_runtime::assemble(
+            directory.path(),
+            None,
+            &Env::empty(),
+            &zuno_config::schema::Config::default(),
+            &selected_agent,
+            tool_runtime::ToolSelection {
+                provider_id: "provider",
+                model_id: "model",
+                question: None,
+                plugin_tools: &[],
+                plugins: None,
+                todo_store: Arc::new(
+                    zuno_db::Pool::open(&zuno_paths::DbLocation::Memory)
+                        .expect("in-memory todo store"),
+                ),
+                goal_store: Arc::new(
+                    GoalStore::open_memory(goal_spill.path().to_owned())
+                        .expect("in-memory goal store"),
+                ),
+                mcp_loader: None,
+                skills: Arc::new(skills),
+                delegation: test_delegation(),
+            },
+        )
+        .expect("production registry assembles");
+
+        assert!(advertised.contains("<name>wired</name>"));
+        let tool = runtime
+            .tools
+            .iter()
+            .find(|tool| tool.id() == zuno_tools::SKILL_WIRE_ID)
+            .expect("the assembled registry advertises `skill`");
+        let output = tool
+            .invoke(
+                serde_json::json!({"name": "wired"}),
+                ToolContext::new(
+                    "ses_registry",
+                    "msg_registry",
+                    "call_registry",
+                    "build",
+                    Arc::new(AllowAll),
+                    Arc::new(NeverInterrupted),
+                ),
+            )
+            .await
+            .expect("the advertised skill loads through the assembled tool");
+
+        assert_eq!(output.output, "the body the model must receive");
+    }
+}
+
+/// The skill catalogue must reach the system prompt, bounded, and say when it trims.
+mod skill_prompt {
+    use super::*;
+
+    fn skill(name: &str, description: &str) -> zuno_catalog::skill::Skill {
+        zuno_catalog::skill::Skill {
+            name: name.to_owned(),
+            description: Some(description.to_owned()),
+            location: format!("/skills/{name}/SKILL.md"),
+            content: "body".to_owned(),
+        }
+    }
+
+    fn resolver() -> Resolver {
+        Resolver {
+            requested_agent: "build".to_owned(),
+            system_prompt: "AGENT PROMPT".to_owned(),
+            max_steps: DEFAULT_MAX_STEPS,
+            requested_provider: "provider".to_owned(),
+            requested_model: "model".to_owned(),
+            wire_model: "model".to_owned(),
+            spec: Spec::new(COMPATIBLE_PROVIDER),
+        }
+    }
+
+    #[test]
+    fn a_discovered_skill_reaches_the_prompt_without_displacing_the_agents_own() {
+        let skills = zuno_catalog::skill::Skills::from_loaded([skill("deploy", "Ship it.")]);
+        let mut resolver = resolver();
+        let mut notes = Vec::new();
+
+        announce_skills(&mut resolver, &skills, &mut notes);
+
+        assert!(
+            resolver.system_prompt.starts_with("AGENT PROMPT"),
+            "the agent's own prompt must stay first: {}",
+            resolver.system_prompt
+        );
+        assert!(resolver.system_prompt.contains("<name>deploy</name>"));
+        assert!(
+            resolver
+                .system_prompt
+                .contains("<description>Ship it.</description>")
+        );
+        assert!(
+            resolver.system_prompt.contains("/skills/deploy/SKILL.md"),
+            "the location is what leaves `read` as a fallback"
+        );
+        assert!(notes.is_empty(), "nothing was trimmed: {notes:?}");
+    }
+
+    #[test]
+    fn an_empty_catalogue_leaves_the_prompt_byte_identical() {
+        let mut resolver = resolver();
+        let before = resolver.system_prompt.clone();
+        let mut notes = Vec::new();
+
+        announce_skills(
+            &mut resolver,
+            &zuno_catalog::skill::Skills::default(),
+            &mut notes,
+        );
+
+        assert_eq!(resolver.system_prompt.as_bytes(), before.as_bytes());
+        assert!(notes.is_empty());
+    }
+
+    /// A corpus past the budget is trimmed, bounded, and **reported**.
+    ///
+    /// The report is the point. A skill silently absent from the prompt is a skill the
+    /// model will never use and the user will never learn was dropped.
+    #[test]
+    fn a_corpus_past_the_budget_is_trimmed_and_the_trim_is_reported() {
+        let padding = "d".repeat(2_000);
+        let skills = zuno_catalog::skill::Skills::from_loaded(
+            (0..64).map(|at| skill(&format!("skill-{at:03}"), &padding)),
+        );
+        let mut resolver = resolver();
+        let mut notes = Vec::new();
+
+        announce_skills(&mut resolver, &skills, &mut notes);
+
+        assert!(
+            resolver.system_prompt.len() < "AGENT PROMPT".len() + SKILL_PROMPT_BUDGET + 1,
+            "the prompt exceeded the budget: {} bytes",
+            resolver.system_prompt.len()
+        );
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("did not fit"), "{}", notes[0]);
+        assert!(
+            notes[0].contains("were not advertised to the model"),
+            "{}",
+            notes[0]
+        );
+    }
+}
+
+/// The three wirings this task closed, asserted at their production call sites.
+///
+/// # Why a source scan and not a behavioural assertion
+///
+/// The same reason [`only_this_module_composes_a_turn`] is one, and the defect class
+/// is identical: each of these was **absent**, and absence produced no error, no
+/// warning, and no failing test — the model was simply told less than the build could
+/// do. Reaching these through behaviour needs a resolved catalog, a credential and a
+/// live provider, which is why nothing covered them for as long as it did.
+///
+/// A scan is crude and it is also the only check that fails the moment someone deletes
+/// one of these lines, because deleting any of them compiles, passes clippy, and
+/// passes every other test in this workspace.
+#[test]
+fn the_headless_surfaces_wire_every_capability_the_tui_has() {
+    let cmd = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd");
+    let read = |name: &str| {
+        std::fs::read_to_string(cmd.join(name)).unwrap_or_else(|_| panic!("{name} is readable"))
+    };
+
+    let turn = read("turn.rs");
+    assert!(
+        turn.contains("announce_skills(&mut plan.resolver"),
+        "`turn.rs` no longer injects the skill catalogue into the system prompt, so \
+         discovery runs and the model is told about none of it"
+    );
+    assert!(
+        turn.contains("skills: Arc::clone(&plan.skills)"),
+        "`turn.rs` no longer hands the loaded skills to the tool assembly, so the \
+         `skill` tool would answer from a different set than the prompt advertised"
+    );
+    assert!(
+        turn.contains("delegation: super::tool_runtime::Delegation {"),
+        "`turn.rs` no longer supplies a delegation host; `task` cannot be registered"
+    );
+
+    for surface in ["run.rs", "serve.rs"] {
+        let source = read(surface);
+        assert!(
+            source.contains("mcp_runtime::McpRuntime::from_config"),
+            "`{surface}` no longer builds an MCP runtime, so the same configuration \
+             that gives the TUI its MCP tools gives this surface none"
+        );
+        assert!(
+            source.contains("mcp.shutdown()"),
+            "`{surface}` no longer closes its MCP transports, leaving a remote \
+             server's session open on the far side"
+        );
+    }
+    assert!(
+        read("run.rs").contains("TurnHost::open_with_mcp"),
+        "`zuno run` must reach the constructor that takes a catalog"
+    );
+    assert!(
+        read("serve.rs").contains("TurnHost::open_with_runtime_and_mcp"),
+        "`zuno serve` must reach the constructor that takes a catalog"
     );
 }

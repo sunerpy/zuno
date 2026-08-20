@@ -9,7 +9,7 @@
 //! spacing, indentation, tag names, or ordering shows up as a diff before it
 //! reaches a prompt.
 
-use zuno_catalog::skill::{Form, NO_SKILLS, Skill, escape_html, render};
+use zuno_catalog::skill::{Form, NO_SKILLS, Skill, escape_html, render, render_within};
 
 fn skill(name: &str, description: Option<&str>, location: &str) -> Skill {
     Skill {
@@ -138,4 +138,80 @@ fn verbose_form_has_a_fixed_line_budget() {
     assert_eq!(lines.last(), Some(&"</available_skills>"));
     assert_eq!(lines[1], "  <skill>");
     assert!(lines[2].starts_with("    <name>"));
+}
+
+/// A budget large enough for everything must produce the very bytes [`render`] does.
+///
+/// The two functions share [`Form`]'s framing and entry layout through one private
+/// helper precisely so this can hold. If it ever fails, the budgeted path has grown
+/// a second opinion about the wire format and the snapshots above no longer describe
+/// what reaches a prompt.
+#[test]
+fn an_unspent_budget_is_byte_identical_to_the_unbounded_form() {
+    for form in [Form::List, Form::Verbose] {
+        let unbounded = render(&corpus(), form);
+        let budgeted = render_within(&corpus(), form, unbounded.len());
+        assert_eq!(budgeted.text, unbounded, "{form:?}");
+        assert_eq!(budgeted.rendered, 4, "one of the five has no description");
+        assert_eq!(budgeted.omitted, 0, "{form:?}");
+    }
+}
+
+#[test]
+fn a_budget_never_returns_more_bytes_than_it_was_given() {
+    let full = render(&corpus(), Form::Verbose).len();
+    for budget in 0..=full {
+        let budgeted = render_within(&corpus(), Form::Verbose, budget);
+        assert!(
+            budgeted.text.len() <= budget,
+            "budget {budget} produced {} bytes",
+            budgeted.text.len()
+        );
+        assert_eq!(
+            budgeted.rendered + budgeted.omitted,
+            4,
+            "every describable skill is either rendered or counted as omitted"
+        );
+    }
+}
+
+/// The trim keeps the cheapest entries, so the count that fits is the largest one.
+#[test]
+fn a_partial_budget_keeps_the_most_names_and_still_sorts_them_by_name() {
+    let full = render(&corpus(), Form::Verbose);
+    let budgeted = render_within(&corpus(), Form::Verbose, full.len() * 2 / 3);
+
+    assert!(budgeted.omitted > 0, "two thirds must not fit everything");
+    assert!(budgeted.rendered > 0, "two thirds must fit something");
+    assert!(budgeted.text.starts_with("<available_skills>"));
+    assert!(budgeted.text.ends_with("</available_skills>"));
+
+    let names: Vec<&str> = budgeted
+        .text
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("<name>"))
+        .filter_map(|line| line.strip_suffix("</name>"))
+        .collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(names, sorted, "survivors stay in name order");
+    assert_eq!(names.len(), budgeted.rendered);
+}
+
+#[test]
+fn a_budget_too_small_for_one_entry_renders_nothing_rather_than_a_broken_block() {
+    let budgeted = render_within(&corpus(), Form::Verbose, 1);
+
+    assert_eq!(budgeted.text, "", "a half-open XML block would be worse");
+    assert_eq!(budgeted.rendered, 0);
+    assert_eq!(budgeted.omitted, 4);
+}
+
+#[test]
+fn an_empty_corpus_answers_the_oracles_sentence_at_any_budget() {
+    let budgeted = render_within(&[], Form::Verbose, 0);
+
+    assert_eq!(budgeted.text, NO_SKILLS);
+    assert_eq!(budgeted.rendered, 0);
+    assert_eq!(budgeted.omitted, 0);
 }

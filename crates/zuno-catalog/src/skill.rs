@@ -74,7 +74,10 @@ use serde::Serialize;
 use zuno_error::{ConfigError, ConfigIssue};
 
 pub use crate::skill::discovery::{Root, SkillOptions, SkillPath, SkillSources};
-pub use crate::skill::render::{Form, NO_SKILLS, escape_html, fmt as render, locale_compare};
+pub use crate::skill::render::{
+    Budgeted, Form, NO_SKILLS, escape_html, fmt as render, fmt_within as render_within,
+    locale_compare,
+};
 
 /// How many `SKILL.md` files are read at once.
 ///
@@ -308,6 +311,27 @@ impl Skills {
         render(&self.ordered, form)
     }
 
+    /// [`Self::render`], bounded to `budget` bytes.
+    #[must_use]
+    pub fn render_within(&self, form: Form, budget: usize) -> Budgeted {
+        render_within(&self.ordered, form, budget)
+    }
+
+    /// A set assembled from skills some other layer already loaded.
+    ///
+    /// [`load`] is the production path and this is not a second one: it exists so a
+    /// caller holding skills from a non-disk source — or a test that must not touch
+    /// the filesystem — gets the same name index and the same last-one-wins
+    /// precedence as discovery, rather than reimplementing either.
+    #[must_use]
+    pub fn from_loaded(skills: impl IntoIterator<Item = Skill>) -> Self {
+        let mut set = Self::default();
+        for skill in skills {
+            set.insert(skill);
+        }
+        set
+    }
+
     /// `state.skills[name] = info` (`skill/index.ts:125-139`) — register a skill,
     /// warning when it displaces one.
     fn insert(&mut self, skill: Skill) {
@@ -331,9 +355,32 @@ impl Skills {
     }
 }
 
+/// Record `warning`, logging it at the level its actionability deserves.
+///
+/// Twelve of the thirteen variants name something a user must fix, so they stay at
+/// `WARN`. [`SkillWarningKind::DuplicateName`] is not a fault — the root order in
+/// [`crate::skill::discovery`] is a deliberate precedence ladder and every override
+/// it reports is that ladder working. At `WARN` it emitted **189 lines per launch**
+/// on an install whose `.claude` tree is reachable from `.agents`
+/// (`~/.local/share/zuno/log/opencode.2026-08-20.log`: 202 lines, 189 of them this
+/// one), burying the twelve that are faults. It still reaches
+/// [`Skills::warnings`] for any surface that lists it and still logs at `DEBUG`;
+/// [`load`] states the total once at `INFO`.
 fn warn(sink: &mut Vec<SkillWarning>, warning: SkillWarning) {
-    tracing::warn!(skill.source = %warning.source(), "{warning}");
+    if matches!(warning.kind(), SkillWarningKind::DuplicateName { .. }) {
+        tracing::debug!(skill.source = %warning.source(), "{warning}");
+    } else {
+        tracing::warn!(skill.source = %warning.source(), "{warning}");
+    }
     sink.push(warning);
+}
+
+/// How many of `warnings` are precedence overrides rather than faults.
+fn duplicate_count(warnings: &[SkillWarning]) -> usize {
+    warnings
+        .iter()
+        .filter(|warning| matches!(warning.kind(), SkillWarningKind::DuplicateName { .. }))
+        .count()
 }
 
 /// Discover and load every skill, in the oracle's root order.
@@ -407,7 +454,17 @@ pub async fn load(options: &SkillOptions) -> Skills {
         }
     }
 
-    tracing::info!(count = skills.all().len(), "skills loaded");
+    let overrides = duplicate_count(&skills.warnings);
+    if overrides == 0 {
+        tracing::info!(count = skills.all().len(), "skills loaded");
+    } else {
+        tracing::info!(
+            count = skills.all().len(),
+            overrides,
+            "skills loaded; a later root replaced an earlier same-named skill \
+             {overrides} time(s) — run with `--log-level debug` to see each pair"
+        );
+    }
     skills
 }
 
