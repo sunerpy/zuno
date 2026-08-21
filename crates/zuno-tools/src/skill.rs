@@ -43,13 +43,7 @@ pub const WIRE_ID: &str = "skill";
 pub const SUGGESTION_LIMIT: usize = 40;
 
 /// The description the model reads.
-pub const DESCRIPTION: &str = concat!(
-    "Load the full instructions for one skill named in <available_skills>.\n",
-    "Pass the skill's `name` exactly as the catalog gives it. The reply is that ",
-    "skill's complete SKILL.md body; follow it for the current task.\n",
-    "Call this before acting whenever a skill's description matches what you are ",
-    "about to do — the catalog only tells you a skill exists, not how to use it."
-);
+pub const DESCRIPTION: &str = include_str!("description/skill.txt");
 
 /// Arguments for one skill load.
 #[derive(Debug, Default, Deserialize, JsonSchema)]

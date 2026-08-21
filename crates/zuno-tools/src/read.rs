@@ -21,21 +21,8 @@ const MAX_LINE_LENGTH: usize = 2_000;
 const MAX_BYTES: usize = 50 * 1_024;
 const SAMPLE_BYTES: usize = 4_096;
 
-const DESCRIPTION: &str = concat!(
-    "Read a file or directory from the local filesystem. If the path does not exist, an error is returned.\n\n",
-    "Usage:\n",
-    "- The filePath parameter should be an absolute path.\n",
-    "- By default, this tool returns up to 2000 lines from the start of the file.\n",
-    "- The offset parameter is the line number to start from (1-indexed).\n",
-    "- To read later sections, call this tool again with a larger offset.\n",
-    "- Use the grep tool to find specific content in large files or files with long lines.\n",
-    "- If you are unsure of the correct file path, use the glob tool to look up filenames by glob pattern.\n",
-    "- Contents are returned with each line prefixed by its line number as `<line>: <content>`. For directories, entries are returned one per line (without line numbers) with a trailing `/` for subdirectories.\n",
-    "- Any line longer than 2000 characters is truncated.\n",
-    "- Call this tool in parallel when you know there are multiple files you want to read.\n",
-    "- Avoid tiny repeated slices (30 line chunks). If you need more context, read a larger window.\n",
-    "- This tool can read image files and PDFs and return them as file attachments."
-);
+/// The description the model reads.
+pub const DESCRIPTION: &str = include_str!("description/read.txt");
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

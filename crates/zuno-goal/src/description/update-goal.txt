@@ -1,0 +1,1 @@
+Mark the current goal complete, or report a blocking condition for the current turn. Complete requires evidence for every requirement. Blocked requires blocking_condition and becomes terminal only after the same condition persists for three consecutive goal turns.

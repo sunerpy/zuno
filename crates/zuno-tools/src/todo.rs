@@ -71,7 +71,7 @@ pub const PERMISSION: &str = "todowrite";
 ///
 /// Kept byte-identical to the oracle's file. The prompt-visible text is part of the
 /// behaviour being ported: rewording it changes when a model reaches for the tool.
-pub const DESCRIPTION: &str = include_str!("todo/todowrite.txt");
+pub const DESCRIPTION: &str = include_str!("description/todowrite.txt");
 
 /// Where a written todo list goes.
 ///

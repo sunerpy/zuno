@@ -65,6 +65,9 @@ pub struct SessionSearchParams {
     pub window: Option<u32>,
 }
 
+/// The description the model reads.
+pub const DESCRIPTION: &str = include_str!("description/session-search.txt");
+
 /// FTS-backed session history tool over one opencode database file.
 #[derive(Debug, Clone)]
 pub struct SessionSearchTool {
@@ -96,7 +99,7 @@ impl TypedTool for SessionSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search past sessions with local FTS5, scroll around a matched message, or browse recent sessions. No provider or LLM calls are made."
+        DESCRIPTION
     }
 
     async fn run(

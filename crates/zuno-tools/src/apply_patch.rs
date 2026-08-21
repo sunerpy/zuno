@@ -16,13 +16,8 @@ use std::sync::Arc;
 use zuno_error::ToolError;
 use zuno_tool::{ToolContext, ToolOutput, TypedTool};
 
-const DESCRIPTION: &str = concat!(
-    "Use the `apply_patch` tool to edit files. Your patch language is a stripped-down, file-oriented diff format.\n\n",
-    "A patch starts with `*** Begin Patch`, ends with `*** End Patch`, and contains one or more file sections.\n",
-    "Each section starts with `*** Add File: <path>`, `*** Delete File: <path>`, or `*** Update File: <path>`.\n",
-    "An update may include `*** Move to: <path>` and uses `@@` hunks with context, removed, and added lines.\n",
-    "Every initial-content line in an Add File section must start with `+`."
-);
+/// The description the model reads.
+pub const DESCRIPTION: &str = include_str!("description/apply-patch.txt");
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

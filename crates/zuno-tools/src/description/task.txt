@@ -1,0 +1,5 @@
+Delegate a self-contained unit of work to a subagent in its own session.
+Name exactly one of `subagent_type` (a specific agent) or `category` (a preset shorthand, which runs the generic worker at that preset's model).
+Foreground is the default and blocks until the child answers; `background: true` returns immediately with a job id and notifies you on completion — use it only for work that does not overlap what you continue doing.
+Pass `task_id` from a previous call to continue that same child session instead of starting a fresh one.
+Skills are not an argument: each agent's permissions already decide which skills it can load.
