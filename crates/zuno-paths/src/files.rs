@@ -32,7 +32,7 @@ pub const AUTH_FILE: &str = "auth.json";
 pub const MCP_AUTH_FILE: &str = "mcp-auth.json";
 
 /// The model catalog source that gets the unsuffixed cache file name.
-pub const DEFAULT_MODELS_SOURCE: &str = "https://models.opencode.ai";
+pub const DEFAULT_MODELS_SOURCE: &str = "https://models.dev";
 
 /// The cache file name used for [`DEFAULT_MODELS_SOURCE`].
 pub const DEFAULT_MODELS_FILE: &str = "models.json";
@@ -54,7 +54,7 @@ pub const MEMORY_SENTINEL: &str = ":memory:";
 
 /// Where the session database lives.
 ///
-/// A plain [`PathBuf`] cannot express the oracle's third case: `OPENCODE_DB`
+/// A plain [`PathBuf`] cannot express the oracle's third case: `ZUNO_DB`
 /// may be the literal `":memory:"`, which SQLite treats as a sentinel rather
 /// than a filename. Modelling that as a variant means a consumer cannot
 /// accidentally `create_dir_all` its parent — which is precisely the mistake the
@@ -197,7 +197,7 @@ impl Layout {
     ///
     /// `cache()/models.json` for the default source, and
     /// `cache()/models-<sha1(source)>.json` for anything else — so pointing
-    /// `OPENCODE_MODELS_URL` at a mirror cannot poison the default cache.
+    /// `ZUNO_MODELS_URL` at a mirror cannot poison the default cache.
     #[must_use]
     pub fn models_cache_for_source(&self, source: &str) -> PathBuf {
         let file = if source == DEFAULT_MODELS_SOURCE {
@@ -365,7 +365,7 @@ mod tests {
         );
     }
 
-    /// The trap: a relative `OPENCODE_DB` resolves under `data()`, never under
+    /// The trap: a relative `ZUNO_DB` resolves under `data()`, never under
     /// the working directory.
     #[test]
     fn db_override_relative_resolves_under_data_not_cwd() {

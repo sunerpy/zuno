@@ -146,7 +146,7 @@ impl Scope {
     ///
     /// `$CONFIG` comes from [`zuno_paths::config`] rather than from a local reading
     /// of `XDG_CONFIG_HOME`, so this store lands in the same directory the
-    /// TypeScript binary's config does and an `OPENCODE_CONFIG_DIR` override is
+    /// TypeScript binary's config does and an `ZUNO_CONFIG_DIR` override is
     /// honoured for free. The reference makes the same point from the other
     /// direction (`memory_tool.py:50-56`): it resolves its directory through a
     /// *function* rather than an import-time constant precisely so a profile

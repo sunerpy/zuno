@@ -4,8 +4,8 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use zuno_server::api::{self, ApiState};
 use zuno_server::{
-    AuthConfig, CompatV1State, DEFAULT_EVENT_SUBSCRIBER_CAPACITY, EventService, ServerBuilder,
-    ServerConfig, compat_v1_router, events_router,
+    AuthConfig, DEFAULT_EVENT_SUBSCRIBER_CAPACITY, EventService, ServerBuilder, ServerConfig,
+    events_router,
 };
 
 #[derive(Debug, Parser)]
@@ -66,11 +66,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .with_default_directory(&directory);
             let state = ApiState::open_default(directory)?.with_events(events.clone());
             let server = ServerBuilder::new(config)
-                .with_routes(
-                    api::router(state.clone())
-                        .merge(events_router(events))
-                        .merge(compat_v1_router(CompatV1State::new(), state)),
-                )
+                .with_routes(api::router(state.clone()).merge(events_router(events)))
                 .bind()
                 .await?;
             let mut stdout = io::stdout().lock();

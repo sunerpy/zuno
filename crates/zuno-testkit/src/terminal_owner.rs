@@ -2,8 +2,8 @@
 //!
 //! # Why a fake is the right instrument here, not a shortcut
 //!
-//! The lease exists because a plugin's `readline` prompt and a ratatui render loop
-//! cannot share one TTY (blocker B7). The plugin side of that protocol has to be
+//! The lease exists because a requester's `readline` prompt and a ratatui render loop
+//! cannot share one TTY (blocker B7). The requester side of that protocol has to be
 //! provable *now*, and the TUI that implements the real owner arrives thirteen todos
 //! later. Even once it exists, driving it would mean a pty, a real raw-mode
 //! transition, and a test that cannot run on a machine with no controlling terminal.
@@ -59,27 +59,27 @@ use zuno_engine::terminal_lease::{LeaseReason, ReclaimCause, TerminalOwner};
 pub enum TerminalTransition {
     /// The owner gave the terminal up and the lease was granted.
     Acquired {
-        /// The plugin the lease went to.
-        plugin: String,
+        /// The requester the lease went to.
+        requester: String,
         /// What it said it was doing.
         purpose: String,
     },
     /// The owner refused to give the terminal up, so no lease was granted.
     Refused {
-        /// The plugin that asked.
-        plugin: String,
+        /// The requester that asked.
+        requester: String,
         /// The reason handed back to it.
         detail: String,
     },
     /// The guard was dropped and the terminal came back in order.
     Released {
-        /// The plugin that returned it.
-        plugin: String,
+        /// The requester that returned it.
+        requester: String,
     },
     /// The deadline passed and the terminal was taken back.
     ForceReclaimed {
-        /// The plugin that failed to release.
-        plugin: String,
+        /// The requester that failed to release.
+        requester: String,
         /// The rendered diagnostic, exactly as a user would read it.
         ///
         /// Stored rendered so a test asserts on the sentence that will actually be
@@ -91,14 +91,14 @@ pub enum TerminalTransition {
 }
 
 impl TerminalTransition {
-    /// The plugin this transition concerns.
+    /// The requester this transition concerns.
     #[must_use]
-    pub fn plugin(&self) -> &str {
+    pub fn requester(&self) -> &str {
         match self {
-            Self::Acquired { plugin, .. }
-            | Self::Refused { plugin, .. }
-            | Self::Released { plugin }
-            | Self::ForceReclaimed { plugin, .. } => plugin,
+            Self::Acquired { requester, .. }
+            | Self::Refused { requester, .. }
+            | Self::Released { requester }
+            | Self::ForceReclaimed { requester, .. } => requester,
         }
     }
 }
@@ -138,36 +138,36 @@ impl TerminalTranscript {
         self.locked().is_empty()
     }
 
-    /// Whether `plugin` was granted the terminal at least once.
+    /// Whether `requester` was granted the terminal at least once.
     #[must_use]
-    pub fn acquired_by(&self, plugin: &str) -> bool {
+    pub fn acquired_by(&self, requester: &str) -> bool {
         self.transitions().iter().any(
-            |transition| matches!(transition, TerminalTransition::Acquired { plugin: p, .. } if p == plugin),
+            |transition| matches!(transition, TerminalTransition::Acquired { requester: p, .. } if p == requester),
         )
     }
 
-    /// Whether `plugin` returned the terminal in order at least once.
+    /// Whether `requester` returned the terminal in order at least once.
     #[must_use]
-    pub fn released_by(&self, plugin: &str) -> bool {
+    pub fn released_by(&self, requester: &str) -> bool {
         self.transitions().iter().any(
-            |transition| matches!(transition, TerminalTransition::Released { plugin: p } if p == plugin),
+            |transition| matches!(transition, TerminalTransition::Released { requester: p } if p == requester),
         )
     }
 
-    /// The diagnostic of the first force-reclaim recorded against `plugin`.
+    /// The diagnostic of the first force-reclaim recorded against `requester`.
     ///
     /// `Option` rather than a bool so the test asserts on the sentence, which is what
-    /// the QA failure scenario is about: the diagnostic has to name the plugin.
+    /// the QA failure scenario is about: the diagnostic has to name the requester.
     #[must_use]
-    pub fn forced_diagnostic(&self, plugin: &str) -> Option<String> {
+    pub fn forced_diagnostic(&self, requester: &str) -> Option<String> {
         self.transitions()
             .into_iter()
             .find_map(|transition| match transition {
                 TerminalTransition::ForceReclaimed {
-                    plugin: p,
+                    requester: p,
                     diagnostic,
                     ..
-                } if p == plugin => Some(diagnostic),
+                } if p == requester => Some(diagnostic),
                 _ => None,
             })
     }
@@ -218,18 +218,18 @@ impl TerminalTranscript {
         }
     }
 
-    /// Waits for a force-reclaim naming `plugin`, returning its diagnostic.
+    /// Waits for a force-reclaim naming `requester`, returning its diagnostic.
     ///
     /// The shape the timeout test needs: assert that the reclaim *happens*, with a
     /// budget generous enough that load cannot turn a late timer into a failure.
-    pub async fn wait_for_forced(&self, plugin: &str, budget: Duration) -> Option<String> {
+    pub async fn wait_for_forced(&self, requester: &str, budget: Duration) -> Option<String> {
         self.wait_until(budget, |transitions| {
             transitions.iter().any(|transition| {
-                matches!(transition, TerminalTransition::ForceReclaimed { plugin: p, .. } if p == plugin)
+                matches!(transition, TerminalTransition::ForceReclaimed { requester: p, .. } if p == requester)
             })
         })
         .await;
-        self.forced_diagnostic(plugin)
+        self.forced_diagnostic(requester)
     }
 }
 
@@ -313,13 +313,13 @@ impl TerminalOwner for FakeTerminalOwner {
         self.yields_requested.fetch_add(1, Ordering::SeqCst);
         if let Some(detail) = &self.refuse_with {
             self.record(TerminalTransition::Refused {
-                plugin: reason.plugin.clone(),
+                requester: reason.requester.clone(),
                 detail: detail.clone(),
             });
             return Err(detail.clone());
         }
         self.record(TerminalTransition::Acquired {
-            plugin: reason.plugin.clone(),
+            requester: reason.requester.clone(),
             purpose: reason.purpose.clone(),
         });
         Ok(())
@@ -328,10 +328,10 @@ impl TerminalOwner for FakeTerminalOwner {
     fn reclaim_terminal(&self, reason: &LeaseReason, cause: ReclaimCause) {
         let transition = match cause {
             ReclaimCause::Released => TerminalTransition::Released {
-                plugin: reason.plugin.clone(),
+                requester: reason.requester.clone(),
             },
             ReclaimCause::Deadline(forced) => TerminalTransition::ForceReclaimed {
-                plugin: reason.plugin.clone(),
+                requester: reason.requester.clone(),
                 diagnostic: forced.to_string(),
                 timeout: forced.timeout,
             },
@@ -359,11 +359,11 @@ mod tests {
             transcript.transitions(),
             vec![
                 TerminalTransition::Acquired {
-                    plugin: "kiro".to_owned(),
+                    requester: "kiro".to_owned(),
                     purpose: "device-code prompt".to_owned(),
                 },
                 TerminalTransition::Released {
-                    plugin: "kiro".to_owned()
+                    requester: "kiro".to_owned()
                 },
             ]
         );
@@ -387,7 +387,7 @@ mod tests {
         assert_eq!(transcript.len(), 1);
         assert_eq!(transcript.ownership_changes(), 0);
         assert!(!transcript.acquired_by("kiro"));
-        assert_eq!(transcript.transitions()[0].plugin(), "kiro");
+        assert_eq!(transcript.transitions()[0].requester(), "kiro");
     }
 
     #[test]
@@ -399,7 +399,7 @@ mod tests {
         owner.reclaim_terminal(
             &reason,
             ReclaimCause::Deadline(ForcedReclaim {
-                plugin: "kiro".to_owned(),
+                requester: "kiro".to_owned(),
                 purpose: "device-code prompt".to_owned(),
                 timeout: Duration::from_millis(25),
             }),
@@ -408,7 +408,7 @@ mod tests {
         let diagnostic = transcript
             .forced_diagnostic("kiro")
             .expect("a force-reclaim was recorded");
-        assert!(diagnostic.contains("plugin `kiro`"), "{diagnostic}");
+        assert!(diagnostic.contains("requester `kiro`"), "{diagnostic}");
         assert!(diagnostic.contains("25 ms deadline"), "{diagnostic}");
         assert_eq!(transcript.forced_count(), 1);
         assert!(transcript.forced_diagnostic("other").is_none());

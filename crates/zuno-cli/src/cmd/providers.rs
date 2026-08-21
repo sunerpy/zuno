@@ -101,7 +101,7 @@ fn login(
         && !method.eq_ignore_ascii_case("api key")
     {
         return Err(format!(
-            "login method {method:?} requires a provider plugin, which is unavailable in pure headless mode"
+            "login method {method:?} is not supported; use --method api"
         ));
     }
 
@@ -225,6 +225,8 @@ struct WellKnownAuth {
     env: String,
 }
 
+const WELL_KNOWN_PATH: &str = "/.well-known/zuno";
+
 fn login_well_known(store: &zuno_auth::AuthStore, raw_url: &str) -> Result<(), String> {
     let url = raw_url.trim_end_matches('/');
     if !(url.starts_with("https://") || url.starts_with("http://127.0.0.1")) {
@@ -235,7 +237,7 @@ fn login_well_known(store: &zuno_auth::AuthStore, raw_url: &str) -> Result<(), S
         .build()
         .map_err(|error| error.to_string())?;
     let metadata: WellKnown = runtime.block_on(async {
-        reqwest::get(format!("{url}/.well-known/opencode"))
+        reqwest::get(format!("{url}{WELL_KNOWN_PATH}"))
             .await
             .map_err(|error| format!("Failed to load auth provider metadata from {url}: {error}"))?
             .error_for_status()
@@ -282,6 +284,11 @@ fn login_well_known(store: &zuno_auth::AuthStore, raw_url: &str) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn well_known_login_uses_the_zuno_protocol_path() {
+        assert_eq!(WELL_KNOWN_PATH, "/.well-known/zuno");
+    }
 
     #[test]
     fn provider_ids_are_deliberately_narrow() {

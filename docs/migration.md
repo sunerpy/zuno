@@ -23,10 +23,8 @@ The filename is chosen by build channel:
 | otherwise | `zuno-<channel>.db` |
 
 A build from source has no channel define, so its channel is `local` and it
-resolves `zuno-local.db`. An installed release resolves `zuno.db`. The channel
-selection rule is retained as implementation heritage, but both filenames and
-their data root belong to Zuno. The resulting source-vs-release surprise is
-recorded as `channel-dependent-database-filename` in the compatibility report.
+resolves `zuno-local.db`. An installed release resolves `zuno.db`. Both filenames
+and their data root belong to Zuno.
 
 To read the Zuno release database from a source build, pick one:
 
@@ -173,10 +171,10 @@ pre-rename name, which Zuno reports rather than silently ignoring.
 
 ## Provider configuration
 
-Provider coverage here is stated per **wire-protocol family**, not per vendor name
-(`provider-coverage-by-wire-family` in [divergences.md](divergences.md)). SigV4
-plus EventStream, Gemini's wire format with Vertex auth, and the OpenAI-compatible
-family cannot share a request builder, so what is claimed is the family.
+Provider coverage is stated per **wire-protocol family**, not per vendor name.
+SigV4 plus EventStream, Gemini's wire format with Vertex auth, and the
+OpenAI-compatible family cannot share a request builder, so what is claimed is
+the family.
 
 The practical consequence: if your provider id is not claimed by any family, you
 get an error naming it rather than a silent attempt to route it through the

@@ -169,7 +169,11 @@ fn tool_summary_quotes_the_argument_that_identifies_each_call() {
             r#"{"url":"https://example.com/a"}"#,
             "https://example.com/a",
         ),
-        ("websearch", r#"{"query":"ratatui wrap"}"#, "ratatui wrap"),
+        (
+            "web_search",
+            r#"{"queries":["ratatui wrap","ratatui layout"]}"#,
+            "ratatui wrap, ratatui layout",
+        ),
         (
             "task",
             r#"{"subagent_type":"explore","description":"find the parser"}"#,

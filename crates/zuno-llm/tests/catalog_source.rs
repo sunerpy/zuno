@@ -60,7 +60,7 @@ async fn fetch_disabled_with_no_cache_yields_an_empty_catalog_rather_than_an_err
     assert_eq!(
         loaded.provenance(),
         &CatalogProvenance::FetchForbidden {
-            origin: "https://models.opencode.ai".to_owned(),
+            origin: "https://models.dev".to_owned(),
             cache: source.cache().to_owned(),
         },
         "the reason must travel with the document or an unknown model cannot be \
@@ -136,7 +136,7 @@ async fn a_model_nothing_defines_still_fails_immediately_and_actionably() {
         "must name the flag that caused it: {rendered}"
     );
     assert!(
-        rendered.contains("https://models.opencode.ai"),
+        rendered.contains("https://models.dev"),
         "must name the source that was not contacted: {rendered}"
     );
     assert!(

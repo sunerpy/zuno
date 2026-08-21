@@ -12,9 +12,9 @@
 //!    (`:13-21`).
 //! 3. An entry whose `files` does **not** list `SKILL.md` is warned about and
 //!    dropped (`:67-73`). It is never downloaded.
-//! 4. Each surviving entry caches to `$XDG_CACHE_HOME/opencode/skills/<name>/`.
+//! 4. Each surviving entry caches to `$XDG_CACHE_HOME/zuno/skills/<name>/`.
 //!    Files resolve against `<url>/<name>/` (`:90`).
-//! 5. With no `version`, or a cached `.opencode-version` that already matches,
+//! 5. With no `version`, or a cached `.zuno-version` that already matches,
 //!    files download in place and an existing file is left alone (`:38`, `:87-92`).
 //!    Otherwise the whole skill is staged in `<root>.tmp-<token>`, checked for a
 //!    `SKILL.md`, stamped with the version, and swapped in with the previous
@@ -64,7 +64,7 @@ pub const REMOTE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The stamp file that records which `version` a cached skill was built from
 /// (`discovery.ts:80`).
-pub const VERSION_FILE: &str = ".opencode-version";
+pub const VERSION_FILE: &str = ".zuno-version";
 
 /// The filename an index entry must list to be usable.
 pub const SKILL_FILENAME: &str = "SKILL.md";
@@ -95,7 +95,7 @@ pub struct Pulled {
 
 /// `Discovery.pull` (`discovery.ts:49-132`) for one configured URL.
 ///
-/// `cache_root` is `$XDG_CACHE_HOME/opencode/skills` — the caller passes it so
+/// `cache_root` is `$XDG_CACHE_HOME/zuno/skills` — the caller passes it so
 /// the whole module stays testable without touching process state.
 pub async fn pull(url: &str, cache_root: &Path) -> Pulled {
     let mut pulled = Pulled::default();
@@ -461,6 +461,11 @@ mod tests {
     fn trailing_slash_is_added_once() {
         assert_eq!(with_trailing_slash("https://h/sub"), "https://h/sub/");
         assert_eq!(with_trailing_slash("https://h/sub/"), "https://h/sub/");
+    }
+
+    #[test]
+    fn cached_skill_versions_use_the_zuno_marker() {
+        assert_eq!(VERSION_FILE, ".zuno-version");
     }
 
     #[test]

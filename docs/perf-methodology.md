@@ -790,7 +790,7 @@ are recorded as `W_REAL_SUBJECT` in `crates/zuno-testkit/src/perf/subject.rs`:
 | snapshot SHA-256 | `e2cde4df08cd580d0a4f03068b2d861275ca8aef983fef6578968f7f7a2a18a7` |
 
 Selection used to be *"whichever session holds the most `part.data` bytes at
-measurement time"* against whatever database `OPENCODE_DB` resolved to. That made
+measurement time"* against whatever database `ZUNO_DB` resolved to. That made
 the workload a moving target while the G2 ceiling stayed fixed at `0.50 x` the
 TypeScript median measured for **one** session, so the gate became arbitrarily
 harder or easier with no change in the code. Measured on 2026-08-08: the session
@@ -946,22 +946,12 @@ The default is `JOBS=8 THREADS=4`; both are environment overrides. Returns are
 flat past width 32 because the run is floored by its longest suite.
 
 **The script captures cargo's environment instead of assuming it**, and this is
-the load-bearing detail. A first version invoked the test binaries straight from
-a shell and three suites failed — `session_mutation`, `plugin_models`,
-`tool_turn`, 17 tests — each exhausting a 30 s "plugin did not connect back"
-budget. That reads like contention from over-parallelising, and it is not:
-
-| `session_mutation` suite | wall (s) | result |
-| --- | ---: | --- |
-| via `cargo test -p zuno-cli --test session_mutation` | 3.57 | 11 passed |
-| same binary, same cwd, plain shell | 31.21 | 3 failed |
-| same binary, under cargo's captured environment | 1.45 | 11 passed |
-
-The cause is `PATH`: cargo resolves mise **installs**, a bare shell inherits mise
-**shims** first, and a shim cannot be spawned directly by the host — the same
-failure `docs/plugin-authoring.md` records for shebang plugins. Cargo also
-exports `LD_LIBRARY_PATH` for the aws-lc-sys, libsqlite3-sys and jemalloc
-build-script outputs, plus `SSL_CERT_FILE` and `SSL_CERT_DIR`. The script
+the load-bearing detail. A first version invoked test binaries directly from a
+shell and subprocess-heavy suites failed even when run alone. The cause was
+`PATH`: Cargo resolves mise **installs**, while a bare shell inherits mise
+**shims** first and a shim cannot be spawned directly. Cargo also exports
+`LD_LIBRARY_PATH` for the aws-lc-sys, libsqlite3-sys and jemalloc build-script
+outputs, plus `SSL_CERT_FILE` and `SSL_CERT_DIR`. The script
 therefore captures the real environment from a real cargo run through
 `CARGO_TARGET_<TRIPLE>_RUNNER` on every invocation, because `LD_LIBRARY_PATH`
 embeds build-script output hashes that move when a build script reruns.

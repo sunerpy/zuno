@@ -9,12 +9,17 @@
 
 use super::*;
 use crate::command::GlobalOptions;
+use std::sync::Mutex;
 use zuno_paths::{DbLocation, Env};
+use zuno_tools::task::ReportDelivery;
 
 struct Fixture {
     _root: tempfile::TempDir,
     host: ChildSessionHost,
     database: DbLocation,
+    runner: Arc<RecordingRunner>,
+    wake: Arc<RecordingWake>,
+    jobs: BackgroundJobSupervisor,
 }
 
 impl Fixture {
@@ -26,16 +31,24 @@ impl Fixture {
         drop(connection);
 
         let environment = StartupEnvironment::resolve(&Env::empty(), &GlobalOptions::default());
-        let mut host = ChildSessionHost::new(
-            environment,
-            root.path().to_path_buf(),
-            Arc::new(zuno_tool::AllowAll),
-        );
-        host.database = database.clone();
+        let runner = Arc::new(RecordingRunner::default());
+        let wake = Arc::new(RecordingWake::default());
+        let jobs = BackgroundJobSupervisor::default();
+        let host = ChildSessionHost::with_components(
+            database.clone(),
+            runner.clone(),
+            wake.clone(),
+            jobs.clone(),
+        )
+        .expect("build child host");
+        let _ = environment;
         Self {
             _root: root,
             host,
             database,
+            runner,
+            wake,
+            jobs,
         }
     }
 
@@ -60,7 +73,7 @@ impl Fixture {
             "/tmp/proj",
             "/tmp/proj",
             "fixture session",
-            crate::COMPATIBILITY_VERSION,
+            crate::RUST_PACKAGE_VERSION,
         )
         .at(1);
         if let Some(parent) = parent {
@@ -82,7 +95,55 @@ impl Fixture {
             effort: None,
             provider_options: serde_json::Map::new(),
             background: false,
+            report_delivery: ReportDelivery::NextStep,
         }
+    }
+}
+
+#[derive(Default)]
+struct RecordingRunner {
+    result: Mutex<Option<Result<String, String>>>,
+}
+
+impl RecordingRunner {
+    fn complete_with(&self, result: Result<&str, &str>) {
+        *self.result.lock().expect("runner result lock") =
+            Some(result.map(str::to_owned).map_err(str::to_owned));
+    }
+}
+
+#[async_trait]
+impl DelegatedTurnRunner for RecordingRunner {
+    async fn run(&self, _session_id: &str, _request: &ChildTurnRequest) -> Result<String, String> {
+        loop {
+            if let Some(result) = self.result.lock().expect("runner result lock").take() {
+                return result;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
+#[derive(Default)]
+struct RecordingWake {
+    reports: Mutex<Vec<zuno_db::inbox::SessionInput>>,
+    failure: Mutex<Option<String>>,
+}
+
+impl RecordingWake {
+    fn fail_with(&self, error: &str) {
+        *self.failure.lock().expect("wake failure lock") = Some(error.to_owned());
+    }
+}
+
+#[async_trait]
+impl ParentReportWake for RecordingWake {
+    async fn wake(&self, report: zuno_db::inbox::SessionInput) -> Result<(), String> {
+        if let Some(error) = self.failure.lock().expect("wake failure lock").clone() {
+            return Err(error);
+        }
+        self.reports.lock().expect("wake reports lock").push(report);
+        Ok(())
     }
 }
 
@@ -228,35 +289,156 @@ fn resuming_this_parents_own_child_reuses_it_rather_than_forking() {
     );
 }
 
-/// Background dispatch must refuse, not hand back an id nobody can resolve.
-///
-/// The tool's own description promises the caller is notified on completion. Nothing
-/// in this build reports a finished job, so a job id would name work that can never be
-/// collected — a silent failure, where a refusal is one the model can act on.
 #[tokio::test]
-async fn background_delegation_is_refused_with_the_reason_and_the_alternative() {
+async fn background_dispatch_returns_a_durable_job_before_the_child_finishes() {
     let fixture = Fixture::new();
     fixture.session("ses_owner", None);
     let mut request = fixture.request("ses_owner");
     request.background = true;
 
-    let error = fixture
+    let turn = fixture
         .host
         .dispatch(request)
         .await
-        .expect_err("background delegation is not available");
-
-    let rendered = format!("{error}");
-    assert!(rendered.contains("background"), "{rendered}");
-    assert!(
-        rendered.contains("Drop `background`"),
-        "the refusal must name the alternative: {rendered}"
+        .expect("background delegation is admitted");
+    let job_id = turn.job_id.expect("background job id");
+    assert_ne!(job_id, turn.session_id);
+    assert_eq!(
+        fixture
+            .host
+            .job_store
+            .get(&job_id)
+            .expect("running job")
+            .status,
+        zuno_db::job::JobStatus::Running
     );
     assert_eq!(
         zuno_db::session::children(&fixture.connection(), "ses_owner")
             .expect("read children")
             .len(),
-        0,
-        "a refused delegation must not leave a child session behind"
+        1
+    );
+
+    fixture.runner.complete_with(Ok("child answer"));
+    fixture.jobs.wait_all().await;
+    let settled = fixture.host.job_store.get(&job_id).expect("settled job");
+    assert_eq!(settled.status, zuno_db::job::JobStatus::Completed);
+    assert_eq!(
+        settled
+            .result
+            .as_ref()
+            .and_then(|value| value["text"].as_str()),
+        Some("child answer")
+    );
+    assert_eq!(fixture.wake.reports.lock().expect("wake reports").len(), 1);
+    assert!(
+        fixture
+            .host
+            .inbox
+            .pending("ses_owner")
+            .expect("pending report")
+            .iter()
+            .any(|input| input.id == settled.report_input_id.as_deref().expect("report input id"))
+    );
+}
+
+#[tokio::test]
+async fn quiet_background_dispatch_persists_the_result_without_waking_the_parent() {
+    let fixture = Fixture::new();
+    fixture.session("ses_owner", None);
+    let mut request = fixture.request("ses_owner");
+    request.background = true;
+    request.report_delivery = ReportDelivery::Quiet;
+
+    let turn = fixture.host.dispatch(request).await.expect("dispatch");
+    fixture.runner.complete_with(Ok("quiet answer"));
+    fixture.jobs.wait_all().await;
+
+    let job = fixture
+        .host
+        .job_store
+        .get(turn.job_id.as_deref().expect("job id"))
+        .expect("settled job");
+    assert_eq!(job.status, zuno_db::job::JobStatus::Completed);
+    assert_eq!(job.report_input_id, None);
+    assert!(
+        fixture
+            .wake
+            .reports
+            .lock()
+            .expect("wake reports")
+            .is_empty()
+    );
+    assert!(
+        fixture
+            .host
+            .inbox
+            .pending("ses_owner")
+            .expect("pending")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_failed_background_child_is_persisted_and_reported() {
+    let fixture = Fixture::new();
+    fixture.session("ses_owner", None);
+    let mut request = fixture.request("ses_owner");
+    request.background = true;
+
+    let turn = fixture.host.dispatch(request).await.expect("dispatch");
+    fixture.runner.complete_with(Err("provider failed"));
+    fixture.jobs.wait_all().await;
+
+    let job = fixture
+        .host
+        .job_store
+        .get(turn.job_id.as_deref().expect("job id"))
+        .expect("settled job");
+    assert_eq!(job.status, zuno_db::job::JobStatus::Failed);
+    assert_eq!(job.error.as_deref(), Some("provider failed"));
+    let reports = fixture.wake.reports.lock().expect("wake reports");
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].prompt["status"], "failed");
+}
+
+#[tokio::test]
+async fn a_report_left_pending_by_process_loss_is_recovered_when_the_parent_reopens() {
+    let fixture = Fixture::new();
+    fixture.session("ses_owner", None);
+    fixture.wake.fail_with("process is stopping");
+    let mut request = fixture.request("ses_owner");
+    request.background = true;
+
+    let turn = fixture.host.dispatch(request).await.expect("dispatch");
+    fixture.runner.complete_with(Ok("survives restart"));
+    fixture.jobs.wait_all().await;
+    let job = fixture
+        .host
+        .job_store
+        .get(turn.job_id.as_deref().expect("job id"))
+        .expect("settled job");
+    assert!(job.report_input_id.is_some());
+
+    let recovered_wake = Arc::new(RecordingWake::default());
+    let recovered = ChildSessionHost::with_components(
+        fixture.database.clone(),
+        Arc::new(RecordingRunner::default()),
+        recovered_wake.clone(),
+        BackgroundJobSupervisor::default(),
+    )
+    .expect("reopen child host")
+    .recover_pending_reports("ses_owner")
+    .await
+    .expect("recover reports");
+
+    assert_eq!(recovered, 1);
+    assert_eq!(
+        recovered_wake
+            .reports
+            .lock()
+            .expect("recovered reports")
+            .len(),
+        1
     );
 }

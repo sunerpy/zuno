@@ -324,7 +324,7 @@ pub enum ServerError {
     NoAddress { hostname: String, port: u16 },
     /// The hard gate against silently exposed unauthenticated listeners.
     #[error(
-        "refusing --hostname `{hostname}`: a non-loopback listener would expose the unauthenticated server to the network; set OPENCODE_SERVER_PASSWORD to a non-empty value before using this --hostname"
+        "refusing --hostname `{hostname}`: a non-loopback listener would expose the unauthenticated server to the network; set ZUNO_SERVER_PASSWORD to a non-empty value before using this --hostname"
     )]
     UnsecuredNonLoopback { hostname: String },
     /// The selected, already-validated address could not be bound.

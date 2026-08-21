@@ -27,7 +27,6 @@ zuno-llm = { workspace = true }
 zuno-observability = { workspace = true }
 zuno-paths = { workspace = true }
 zuno-permission = { workspace = true }
-zuno-plugin-sdk = { workspace = true }
 zuno-pty = { workspace = true }
 rusqlite = { workspace = true }
 schemars = { workspace = true }

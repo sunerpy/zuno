@@ -14,7 +14,6 @@ zuno-catalog = { workspace = true }
 zuno-config = { workspace = true }
 zuno-lsp = { workspace = true }
 zuno-mcp = { workspace = true }
-zuno-plugin = { workspace = true }
 zuno-process = { workspace = true }
 zuno-pty = { workspace = true }
 serde_json = { workspace = true }

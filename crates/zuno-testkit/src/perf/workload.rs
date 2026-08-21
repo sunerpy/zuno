@@ -105,10 +105,9 @@ pub(crate) async fn measure_one(
     variables.extend([
         ("TERM".to_owned(), "xterm-256color".to_owned()),
         ("COLORTERM".to_owned(), "truecolor".to_owned()),
-        ("OPENCODE_PURE".to_owned(), "1".to_owned()),
-        ("OPENCODE_AUTH_CONTENT".to_owned(), "{}".to_owned()),
+        ("ZUNO_AUTH_CONTENT".to_owned(), "{}".to_owned()),
         (
-            "OPENCODE_CONFIG_CONTENT".to_owned(),
+            "ZUNO_CONFIG_CONTENT".to_owned(),
             provider_config(provider.base_url()),
         ),
     ]);
@@ -274,7 +273,6 @@ fn fail_if_exited(child: &mut Child, workload: WorkloadName) -> Result<()> {
 pub(crate) fn oracle_command(program: &Path, session: Option<&str>) -> String {
     let mut args = vec![
         shell_quote(&program.to_string_lossy()),
-        "--pure".to_owned(),
         "--prompt".to_owned(),
         shell_quote("Use get_weather for Paris."),
         "--model".to_owned(),

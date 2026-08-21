@@ -61,9 +61,9 @@ fn views_external_invocation_rejects_an_empty_spec() {
 #[test]
 fn views_external_editor_request_names_the_tui_as_the_lease_holder() {
     // The forced-reclaim diagnostic has to name a culprit, and for this path the
-    // culprit is the TUI rather than a plugin.
+    // culprit is the TUI rather than a requester.
     let reason = EditorRequest::new("draft").lease_reason();
-    assert_eq!(reason.plugin, "tui");
+    assert_eq!(reason.requester, "tui");
     assert!(reason.purpose.contains("editor"));
     assert!(
         reason.to_string().contains("tui"),

@@ -357,7 +357,7 @@ impl<'a> Substitution<'a> {
     /// non-empty.
     ///
     /// Deliberately *not* `zuno_paths::home()`: that is `Global.Path.home`, which
-    /// `OPENCODE_TEST_HOME` overrides. `variable.ts` calls `os.homedir()`
+    /// `ZUNO_TEST_HOME` overrides. `variable.ts` calls `os.homedir()`
     /// directly and never sees that override.
     ///
     /// With no usable `HOME`, Node falls through to the password database; there

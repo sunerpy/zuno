@@ -1,21 +1,18 @@
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::path::Path;
+use std::sync::Arc;
 use tempfile::TempDir;
 use zuno_error::ToolError;
 use zuno_permission::{PermissionAction, Rule};
-use zuno_testkit::pinned_oracle_or_skip;
 use zuno_tool::{Tool, ToolContext, ToolOutput};
 use zuno_tools::FileTools;
 use zuno_tools::SearchConfig;
 use zuno_tools::exposure::ExposureFlags;
 use zuno_tools::registry::{
-    BuiltinSlot, CustomTool, CustomToolLoader, McpToolLoader, RegistryError, RegistryFlags,
-    ResolveInput, TOOL_SOURCE_PRECEDENCE, ToolRegistry, ToolRegistryBuilder, ToolSource,
-    config_tool_id,
+    BuiltinSlot, CustomTool, McpToolLoader, RegistryError, RegistryFlags, ResolveInput,
+    TOOL_SOURCE_PRECEDENCE, ToolRegistry, ToolRegistryBuilder, ToolSource,
 };
 
 struct StubTool(&'static str);
@@ -79,9 +76,10 @@ fn register_non_file_builtins(builder: &mut ToolRegistryBuilder) {
         (BuiltinSlot::Glob, "glob"),
         (BuiltinSlot::Grep, "grep"),
         (BuiltinSlot::Task, "task"),
+        (BuiltinSlot::Job, "job"),
         (BuiltinSlot::Fetch, "webfetch"),
         (BuiltinSlot::Todo, "todowrite"),
-        (BuiltinSlot::Search, "websearch"),
+        (BuiltinSlot::Search, "web_search"),
         (BuiltinSlot::Skill, "skill"),
         (BuiltinSlot::Execute, "execute"),
         (BuiltinSlot::Lsp, "lsp"),
@@ -95,7 +93,7 @@ fn register_non_file_builtins(builder: &mut ToolRegistryBuilder) {
 
 fn registry(root: &Path, flags: RegistryFlags) -> ToolRegistry {
     let files = FileTools::new(root).expect("create file tools");
-    let mut builder = ToolRegistryBuilder::new(root, Some(root.to_path_buf()), files, flags);
+    let mut builder = ToolRegistryBuilder::new(root, files, flags);
     register_non_file_builtins(&mut builder);
     builder.build()
 }
@@ -113,7 +111,7 @@ fn deny(permission: &str, pattern: &str) -> Rule {
 }
 
 #[test]
-fn registry_builtin_order_matches_the_oracle_before_turn_filters() {
+fn registry_builtin_order_is_stable_before_turn_filters() {
     let root = TempDir::new().expect("temporary workspace");
     let registry = registry(root.path(), RegistryFlags::default());
 
@@ -129,13 +127,26 @@ fn registry_builtin_order_matches_the_oracle_before_turn_filters() {
             "edit",
             "write",
             "task",
+            "job",
             "webfetch",
             "todowrite",
-            "websearch",
+            "web_search",
             "skill",
             "apply_patch",
         ]
     );
+}
+
+#[test]
+fn a_harness_manifest_filters_automatic_file_tools_and_registered_builtins_together() {
+    let root = TempDir::new().expect("temporary workspace");
+    let files = FileTools::new(root.path()).expect("create file tools");
+    let mut builder = ToolRegistryBuilder::new(root.path(), files, RegistryFlags::default())
+        .with_builtin_slots([BuiltinSlot::Read, BuiltinSlot::Task]);
+    register_non_file_builtins(&mut builder);
+    let registry = builder.build();
+
+    assert_eq!(ids(registry.all()), ["read", "task"]);
 }
 
 #[test]
@@ -198,55 +209,11 @@ fn registry_execute_requires_both_code_mode_and_a_resolved_description() {
     assert!(with_catalog.contains(&"execute".to_owned()));
 }
 
-#[test]
-fn registry_config_export_ids_follow_default_and_named_rules() {
-    let path = Path::new("/config/.opencode/tools/release.notes.ts");
-    assert_eq!(
-        config_tool_id(path, "default").as_deref(),
-        Some("release.notes")
-    );
-    assert_eq!(
-        config_tool_id(path, "publish").as_deref(),
-        Some("release.notes_publish")
-    );
-    assert_eq!(config_tool_id(Path::new("/"), "default"), None);
-}
-
-struct FixedCustomLoader {
-    seen_directories: Arc<Mutex<Vec<PathBuf>>>,
-}
-
-impl CustomToolLoader for FixedCustomLoader {
-    fn config_directory_tools(&self, directories: &[PathBuf]) -> Vec<CustomTool> {
-        *self
-            .seen_directories
-            .lock()
-            .expect("record config directories") = directories.to_vec();
-        vec![stub("config_default"), stub("config_named")]
-    }
-
-    fn plugin_tools(&self) -> Vec<CustomTool> {
-        vec![stub("plugin_tool")]
-    }
-}
-
 struct FixedMcpLoader;
 
 impl McpToolLoader for FixedMcpLoader {
     fn tools(&self) -> Vec<CustomTool> {
         vec![stub("mcp_tool")]
-    }
-}
-
-struct CollidingCustomLoader;
-
-impl CustomToolLoader for CollidingCustomLoader {
-    fn config_directory_tools(&self, _directories: &[PathBuf]) -> Vec<CustomTool> {
-        vec![tagged("grep", "config-directory grep")]
-    }
-
-    fn plugin_tools(&self) -> Vec<CustomTool> {
-        vec![tagged("grep", "plugin grep")]
     }
 }
 
@@ -259,28 +226,18 @@ impl McpToolLoader for CollidingMcpLoader {
 }
 
 #[test]
-fn registry_de_duplicates_cross_source_names_with_upstreams_last_source_winning() {
+fn registry_de_duplicates_cross_source_names_with_last_source_winning() {
     assert_eq!(
         TOOL_SOURCE_PRECEDENCE,
-        [
-            ToolSource::Builtin,
-            ToolSource::ConfigDirectory,
-            ToolSource::Plugin,
-            ToolSource::Mcp,
-        ],
+        [ToolSource::Builtin, ToolSource::Harness, ToolSource::Mcp],
         "the exported low-to-high precedence contract must stay pinned"
     );
     let root = TempDir::new().expect("temporary workspace");
     let files = FileTools::new(root.path()).expect("create file tools");
-    let mut builder = ToolRegistryBuilder::new(
-        root.path(),
-        Some(root.path().to_path_buf()),
-        files,
-        RegistryFlags::default(),
-    );
+    let mut builder = ToolRegistryBuilder::new(root.path(), files, RegistryFlags::default());
     register_non_file_builtins(&mut builder);
     let registry = builder
-        .with_custom_loader(Arc::new(CollidingCustomLoader))
+        .with_harness_tools([tagged("grep", "harness grep")])
         .with_mcp_loader(Arc::new(CollidingMcpLoader))
         .build();
 
@@ -302,56 +259,39 @@ fn registry_de_duplicates_cross_source_names_with_upstreams_last_source_winning(
             ))
             .collect::<Vec<_>>(),
         vec![
-            ("grep", ToolSource::Builtin, ToolSource::ConfigDirectory),
-            ("grep", ToolSource::ConfigDirectory, ToolSource::Plugin),
-            ("grep", ToolSource::Plugin, ToolSource::Mcp),
+            ("grep", ToolSource::Builtin, ToolSource::Harness),
+            ("grep", ToolSource::Harness, ToolSource::Mcp),
         ]
     );
     assert_eq!(
-        registry.diagnostics()[2].to_string(),
-        "tool `grep` from plugin suppressed by same-named tool from MCP"
+        registry.diagnostics()[1].to_string(),
+        "tool `grep` from harness suppressed by same-named tool from MCP"
     );
 }
 
 #[test]
-fn registry_appends_config_plugin_and_mcp_sources_in_that_order() {
+fn registry_appends_harness_and_mcp_sources_in_that_order() {
     let root = TempDir::new().expect("temporary workspace");
     let files = FileTools::new(root.path()).expect("create file tools");
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let mut builder = ToolRegistryBuilder::new(
-        root.path(),
-        Some(root.path().to_path_buf()),
-        files,
-        RegistryFlags::default(),
-    );
+    let mut builder = ToolRegistryBuilder::new(root.path(), files, RegistryFlags::default());
     register_non_file_builtins(&mut builder);
     let registry = builder
-        .with_custom_loader(Arc::new(FixedCustomLoader {
-            seen_directories: Arc::clone(&seen),
-        }))
+        .with_harness_tools([stub("harness_default"), stub("harness_named")])
         .with_mcp_loader(Arc::new(FixedMcpLoader))
         .build();
 
     let all = ids(registry.all());
     assert_eq!(
-        &all[all.len() - 4..],
-        ["config_default", "config_named", "plugin_tool", "mcp_tool"]
+        &all[all.len() - 3..],
+        ["harness_default", "harness_named", "mcp_tool"]
     );
-    let expected = zuno_paths::config_directories(root.path(), Some(root.path()));
-    assert_eq!(registry.config_directories(), expected.as_slice());
-    assert_eq!(*seen.lock().expect("read recorded directories"), expected);
 }
 
 #[test]
 fn registry_rejects_wrong_ids_and_duplicate_slots() {
     let root = TempDir::new().expect("temporary workspace");
     let files = FileTools::new(root.path()).expect("create file tools");
-    let mut builder = ToolRegistryBuilder::new(
-        root.path(),
-        Some(root.path().to_path_buf()),
-        files,
-        RegistryFlags::default(),
-    );
+    let mut builder = ToolRegistryBuilder::new(root.path(), files, RegistryFlags::default());
 
     assert_eq!(
         builder
@@ -381,7 +321,6 @@ fn registry_rejects_wrong_ids_and_duplicate_slots() {
 #[derive(Clone, Copy)]
 struct DifferentialCase {
     label: &'static str,
-    agent: &'static str,
     provider_id: &'static str,
     model_id: &'static str,
     permission: PermissionCase,
@@ -389,7 +328,6 @@ struct DifferentialCase {
     enable_lsp: bool,
     enable_plan: bool,
     expected: &'static [&'static str],
-    expected_false: &'static [&'static str],
 }
 
 #[derive(Clone, Copy)]
@@ -402,7 +340,6 @@ enum PermissionCase {
 const DIFFERENTIAL_CASES: [DifferentialCase; 5] = [
     DifferentialCase {
         label: "gpt patch baseline",
-        agent: "build",
         provider_id: "openai",
         model_id: "gpt-5.2",
         permission: PermissionCase::Default,
@@ -417,16 +354,15 @@ const DIFFERENTIAL_CASES: [DifferentialCase; 5] = [
             "glob",
             "grep",
             "task",
+            "job",
             "webfetch",
             "todowrite",
             "skill",
             "apply_patch",
         ],
-        expected_false: &[],
     },
     DifferentialCase {
         label: "non-gpt with narrow bash deny",
-        agent: "build",
         provider_id: "anthropic",
         model_id: "claude-sonnet-4-5",
         permission: PermissionCase::DenyGitPush,
@@ -443,15 +379,14 @@ const DIFFERENTIAL_CASES: [DifferentialCase; 5] = [
             "edit",
             "write",
             "task",
+            "job",
             "webfetch",
             "todowrite",
             "skill",
         ],
-        expected_false: &[],
     },
     DifferentialCase {
         label: "gpt-4 carve-out with full bash deny",
-        agent: "build",
         provider_id: "openai",
         model_id: "gpt-4.1",
         permission: PermissionCase::DenyAllBash,
@@ -467,15 +402,14 @@ const DIFFERENTIAL_CASES: [DifferentialCase; 5] = [
             "edit",
             "write",
             "task",
+            "job",
             "webfetch",
             "todowrite",
             "skill",
         ],
-        expected_false: &["bash"],
     },
     DifferentialCase {
         label: "gpt-oss carve-out with search and lsp",
-        agent: "build",
         provider_id: "openai",
         model_id: "gpt-oss-120b",
         permission: PermissionCase::Default,
@@ -492,21 +426,20 @@ const DIFFERENTIAL_CASES: [DifferentialCase; 5] = [
             "edit",
             "write",
             "task",
+            "job",
             "webfetch",
             "todowrite",
-            "websearch",
+            "web_search",
             "skill",
             "lsp",
         ],
-        expected_false: &[],
     },
     DifferentialCase {
-        label: "hosted provider plan agent",
-        agent: "plan",
-        provider_id: "opencode",
+        label: "plan agent with native search",
+        provider_id: "openai",
         model_id: "gpt-5.2",
         permission: PermissionCase::Default,
-        enable_exa: false,
+        enable_exa: true,
         enable_lsp: false,
         enable_plan: true,
         expected: &[
@@ -517,14 +450,14 @@ const DIFFERENTIAL_CASES: [DifferentialCase; 5] = [
             "glob",
             "grep",
             "task",
+            "job",
             "webfetch",
             "todowrite",
-            "websearch",
+            "web_search",
             "skill",
             "apply_patch",
             "plan_exit",
         ],
-        expected_false: &[],
     },
 ];
 
@@ -556,88 +489,14 @@ fn expected_set(case: DifferentialCase) -> BTreeSet<String> {
     case.expected.iter().map(|id| (*id).to_owned()).collect()
 }
 
-fn permission_json(case: PermissionCase) -> Option<Value> {
-    match case {
-        PermissionCase::Default => None,
-        PermissionCase::DenyAllBash => Some(json!({ "bash": "deny" })),
-        PermissionCase::DenyGitPush => Some(json!({ "bash": { "git push*": "deny" } })),
-    }
-}
-
-fn oracle_config(case: DifferentialCase) -> String {
-    let mut agent = json!({
-        "model": format!("{}/{}", case.provider_id, case.model_id),
-    });
-    if let Some(permission) = permission_json(case.permission) {
-        agent["permission"] = permission;
-    }
-    let mut config = json!({ "agent": {} });
-    config["agent"][case.agent] = agent;
-    config.to_string()
-}
-
-fn run_oracle(binary: &Path, root: &Path, case: DifferentialCase) -> Value {
-    std::fs::create_dir_all(root.join(".git")).expect("bound config discovery");
-    let mut command = Command::new(binary);
-    command
-        .args(["debug", "agent", case.agent, "--pure"])
-        .current_dir(root)
-        .env_clear()
-        .env("HOME", root.join("home"))
-        .env("XDG_DATA_HOME", root.join("data"))
-        .env("XDG_CONFIG_HOME", root.join("config"))
-        .env("XDG_CACHE_HOME", root.join("cache"))
-        .env("XDG_STATE_HOME", root.join("state"))
-        .env("PATH", "/usr/bin:/bin")
-        .env("TERM", "dumb")
-        .env("OPENCODE_DISABLE_AUTOUPDATE", "1")
-        .env("OPENCODE_DISABLE_MODELS_FETCH", "1")
-        .env("OPENCODE_CONFIG_CONTENT", oracle_config(case));
-    if case.enable_exa {
-        command.env("OPENCODE_ENABLE_EXA", "true");
-    }
-    if case.enable_lsp {
-        command.env("OPENCODE_EXPERIMENTAL_LSP_TOOL", "true");
-    }
-    if case.enable_plan {
-        command.env("OPENCODE_EXPERIMENTAL_PLAN_MODE", "true");
-    }
-
-    let output = command.output().expect("run real opencode");
-    assert!(
-        output.status.success(),
-        "{} failed with {}\nstdout:\n{}\nstderr:\n{}",
-        case.label,
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    serde_json::from_slice(&output.stdout).expect("debug agent emits JSON")
-}
-
-fn oracle_visible_set(output: &Value) -> BTreeSet<String> {
-    output["tools"]
-        .as_object()
-        .expect("tools object")
-        .iter()
-        .filter(|(_, enabled)| enabled.as_bool() == Some(true))
-        .map(|(id, _)| id.clone())
-        .collect()
-}
-
 #[test]
-fn registry_resolved_sets_match_five_real_binary_combinations() {
+fn registry_resolved_sets_match_five_native_compositions() {
     assert_eq!(
         DIFFERENTIAL_CASES.len(),
         5,
         "the differential matrix is load-bearing"
     );
-    let binary = pinned_oracle_or_skip(
-        "registry_resolved_sets_match_five_real_binary_combinations",
-        "the five captured tool sets were NOT compared against a real release",
-    );
-
-    for (index, case) in DIFFERENTIAL_CASES.into_iter().enumerate() {
+    for case in DIFFERENTIAL_CASES {
         let workspace = TempDir::new().expect("temporary Rust workspace");
         let permission_rules = rules(case.permission);
         let subject = registry(workspace.path(), registry_flags(case));
@@ -651,26 +510,5 @@ fn registry_resolved_sets_match_five_real_binary_combinations() {
             .collect();
         let captured = expected_set(case);
         assert_eq!(subject_set, captured, "captured case: {}", case.label);
-
-        let Some(binary) = binary else {
-            return;
-        };
-        let oracle_root = TempDir::new().expect("temporary oracle workspace");
-        let output = run_oracle(binary, oracle_root.path(), case);
-        assert_eq!(
-            oracle_visible_set(&output),
-            captured,
-            "real binary case {}: {}",
-            index + 1,
-            case.label,
-        );
-        for id in case.expected_false {
-            assert_eq!(
-                output["tools"][id],
-                Value::Bool(false),
-                "{} must retain {id}: false in debug output",
-                case.label,
-            );
-        }
     }
 }

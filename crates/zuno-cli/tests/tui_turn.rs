@@ -60,34 +60,8 @@ const MODEL: &str = "test/test-model";
 /// one. `sunny` appears in the recording and nowhere else in a frame.
 const REPLY_FRAGMENT: &str = "sunny";
 
-const SERVER_PLUGIN: &str = r#"
-import { writeFileSync } from "node:fs";
-
-export default {
-  id: "production-server-kind-fixture",
-  server: async (_input, options) => {
-    writeFileSync(options.marker, "server");
-    return {};
-  },
-};
-"#;
-
-const TUI_PLUGIN: &str = r#"
-import { writeFileSync } from "node:fs";
-
-export default {
-  id: "production-tui-kind-fixture",
-  tui: async (_input, options) => {
-    writeFileSync(options.marker, "tui");
-    return {};
-  },
-};
-"#;
-
 /// Wall-clock budget. Everything the run talks to is loopback or local disk.
 const BUDGET: Duration = Duration::from_secs(60);
-
-const PLUGIN_STARTUP_BUDGET: Duration = Duration::from_secs(10);
 
 /// Viewport rows, wide enough that the transcript is not the tightest constraint.
 const VIEWPORT_ROWS: u16 = 40;
@@ -143,43 +117,17 @@ fn provider_config(base_url: &str) -> String {
     .to_string()
 }
 
-fn plugin_kind_config(
-    base_url: &str,
-    server_plugin: &Path,
-    server_marker: &Path,
-    tui_plugin: &Path,
-    tui_marker: &Path,
-) -> String {
-    let mut config: serde_json::Value =
-        serde_json::from_str(&provider_config(base_url)).expect("provider config is JSON");
-    config["plugin"] = serde_json::json!([
-        [
-            format!("file:{}", server_plugin.display()),
-            { "marker": server_marker }
-        ],
-        [
-            format!("file:{}", tui_plugin.display()),
-            { "marker": tui_marker }
-        ]
-    ]);
-    config.to_string()
-}
-
 fn variables(env: &ScriptedEnv, base_url: &str) -> BTreeMap<String, String> {
     let mut variables = env.env_vars();
     variables.extend([
         ("TERM".to_owned(), "xterm-256color".to_owned()),
         ("COLORTERM".to_owned(), "truecolor".to_owned()),
-        ("ZUNO_PURE".to_owned(), "1".to_owned()),
         ("ZUNO_AUTH_CONTENT".to_owned(), "{}".to_owned()),
-        // No `OPENCODE_MODELS_PATH`: the config below fully specifies `test/test-model`,
+        // No `ZUNO_MODELS_PATH`: the config below fully specifies `test/test-model`,
         // so a catalog is not needed to resolve it. Injecting a fixture here is what hid
         // todo 108 — the binary could not start without one — through five waves.
         ("ZUNO_DISABLE_MODELS_FETCH".to_owned(), "true".to_owned()),
-        (
-            "OPENCODE_CONFIG_CONTENT".to_owned(),
-            provider_config(base_url),
-        ),
+        ("ZUNO_CONFIG_CONTENT".to_owned(), provider_config(base_url)),
     ]);
     variables
 }
@@ -208,7 +156,7 @@ enum Submission {
 ///
 /// Reproduced rather than imported because `perf::workload::oracle_command` is
 /// private to that module and `perf/**` is a frozen input this task may not touch.
-/// The shape is `<program> --pure --prompt <text> --model <id> --auto`.
+/// The shape is `<program> --prompt <text> --model <id> --auto`.
 ///
 /// The `stty` prefix is this test's own addition and is not part of that shape.
 /// `script` copies its window size from its own stdin, which under a test harness is
@@ -219,7 +167,6 @@ enum Submission {
 fn harness_command(program: &Path, submission: Submission) -> String {
     let mut args = vec![
         shell_quote(&program.to_string_lossy()),
-        "--pure".to_owned(),
         "--model".to_owned(),
         MODEL.to_owned(),
         "--auto".to_owned(),
@@ -229,68 +176,6 @@ fn harness_command(program: &Path, submission: Submission) -> String {
     }
     let oracle = args.join(" ");
     format!("stty rows {VIEWPORT_ROWS} cols {VIEWPORT_COLUMNS}; {oracle}")
-}
-
-fn plugin_kind_command(program: &Path) -> String {
-    format!(
-        "stty rows {VIEWPORT_ROWS} cols {VIEWPORT_COLUMNS}; {} --model {MODEL} --auto",
-        shell_quote(&program.to_string_lossy())
-    )
-}
-
-fn run_plugin_kind_startup(
-    env: &ScriptedEnv,
-    base_url: &str,
-    server_plugin: &Path,
-    server_marker: &Path,
-    tui_plugin: &Path,
-    tui_marker: &Path,
-) -> Result<(), std::io::Error> {
-    let script = which::which("script").map_err(|_| {
-        std::io::Error::other("`script` is required to give the TUI a real PTY; install util-linux")
-    })?;
-    let mut variables = variables(env, base_url);
-    variables.remove("ZUNO_PURE");
-    // Removing `ZUNO_PURE` no longer loads anything: the JavaScript host is opt-in, so
-    // a test that asserts on plugin behaviour has to ask for it the way a user does.
-    variables.insert("ZUNO_ENABLE_JS_PLUGINS".to_owned(), "1".to_owned());
-    variables.insert(
-        "OPENCODE_CONFIG_CONTENT".to_owned(),
-        plugin_kind_config(
-            base_url,
-            server_plugin,
-            server_marker,
-            tui_plugin,
-            tui_marker,
-        ),
-    );
-    let mut child = Command::new(&script)
-        .args([
-            "-qefc".to_owned(),
-            plugin_kind_command(&binary()),
-            "/dev/null".to_owned(),
-        ])
-        .current_dir(env.working_dir())
-        .env_clear()
-        .envs(variables)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    let started = Instant::now();
-    while started.elapsed() < PLUGIN_STARTUP_BUDGET {
-        if server_marker.is_file() && tui_marker.is_file() {
-            break;
-        }
-        if child.try_wait()?.is_some() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    Ok(())
 }
 
 /// Everything the pseudo-terminal received, up to the point `wanted` appeared.
@@ -510,36 +395,4 @@ async fn a_submitted_prompt_drives_a_provider_request_and_renders_the_reply() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_prompt_typed_into_the_pty_drives_the_same_turn_as_the_flag() {
     one_turn_through(Submission::Typed).await;
-}
-
-#[test]
-fn interactive_tui_selects_tui_plugin_factory_from_production_config() {
-    let env = ScriptedEnv::new().expect("isolated environment");
-    let server_plugin = env.project().join("server-kind-plugin.mjs");
-    let tui_plugin = env.project().join("tui-kind-plugin.mjs");
-    let server_marker = env.project().join("server-kind.marker");
-    let tui_marker = env.project().join("tui-kind.marker");
-    std::fs::write(&server_plugin, SERVER_PLUGIN).expect("write server-kind plugin");
-    std::fs::write(&tui_plugin, TUI_PLUGIN).expect("write TUI-kind plugin");
-
-    run_plugin_kind_startup(
-        &env,
-        "http://127.0.0.1:9",
-        &server_plugin,
-        &server_marker,
-        &tui_plugin,
-        &tui_marker,
-    )
-    .expect("launch the production TUI under a PTY");
-
-    assert_eq!(
-        std::fs::read_to_string(&server_marker).unwrap_or_default(),
-        "server",
-        "the ordinary turn runtime must still select server()"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&tui_marker).unwrap_or_default(),
-        "tui",
-        "the interactive production path must additionally select tui(); a public PluginKind::Tui that only tests can construct is not a supported capability"
-    );
 }

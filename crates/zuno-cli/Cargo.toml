@@ -29,6 +29,7 @@ zuno-db = { workspace = true }
 zuno-engine = { workspace = true }
 zuno-error = { workspace = true }
 zuno-goal = { workspace = true }
+zuno-harness = { workspace = true }
 zuno-llm = { workspace = true }
 zuno-memory = { workspace = true }
 zuno-lsp = { workspace = true }
@@ -36,13 +37,13 @@ zuno-mcp = { workspace = true }
 zuno-observability = { workspace = true }
 zuno-paths = { workspace = true }
 zuno-permission = { workspace = true }
-zuno-plugin = { workspace = true }
 zuno-process = { workspace = true }
 zuno-provider-anthropic = { workspace = true }
 zuno-provider-bedrock = { workspace = true }
 zuno-provider-compatible = { workspace = true }
 zuno-provider-google = { workspace = true }
 zuno-provider-openai = { workspace = true }
+zuno-runtime = { workspace = true }
 zuno-search = { workspace = true }
 zuno-server = { workspace = true }
 zuno-snapshot = { workspace = true }
@@ -66,6 +67,7 @@ tikv-jemallocator = { workspace = true, optional = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+futures = { workspace = true }
 portable-pty = { workspace = true }
 zuno-testkit = { workspace = true }
 serde_json = { workspace = true }

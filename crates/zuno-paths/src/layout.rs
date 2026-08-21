@@ -11,7 +11,7 @@
 //! const tmp    = path.join(os.tmpdir(), app)
 //!
 //! paths = {
-//!   home:   process.env.OPENCODE_TEST_HOME ?? os.homedir(),
+//!   home:   process.env.ZUNO_TEST_HOME ?? os.homedir(),
 //!   data,
 //!   bin:    path.join(cache, "bin"),
 //!   log:    path.join(data,  "log"),
@@ -38,8 +38,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::env::{
-    Env, HOME, OPENCODE_CONFIG_DIR, TEMP, TMP, TMPDIR, XDG_CACHE_HOME, XDG_CONFIG_HOME,
-    XDG_DATA_HOME, XDG_STATE_HOME, ZUNO_DB, ZUNO_DISABLE_CHANNEL_DB, ZUNO_DISABLE_PROJECT_CONFIG,
+    Env, HOME, TEMP, TMP, TMPDIR, XDG_CACHE_HOME, XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_STATE_HOME,
+    ZUNO_CONFIG_DIR, ZUNO_DB, ZUNO_DISABLE_CHANNEL_DB, ZUNO_DISABLE_PROJECT_CONFIG,
     ZUNO_MODELS_URL, ZUNO_TEST_HOME,
 };
 use crate::node_path;
@@ -154,7 +154,7 @@ impl Layout {
             config: PathBuf::from(config),
             state: PathBuf::from(state),
             tmp: PathBuf::from(tmp),
-            config_dir_override: env.value(OPENCODE_CONFIG_DIR).map(str::to_owned),
+            config_dir_override: env.value(ZUNO_CONFIG_DIR).map(str::to_owned),
             disable_project_config: env.flag(ZUNO_DISABLE_PROJECT_CONFIG),
             db_override: env.truthy_value(ZUNO_DB).map(str::to_owned),
             disable_channel_db: env.exact_flag(ZUNO_DISABLE_CHANNEL_DB),
@@ -204,7 +204,7 @@ impl Layout {
     /// `Global.Path.config` — `$XDG_CONFIG_HOME/zuno`.
     ///
     /// This is the raw XDG directory, which is what `debug paths` prints and
-    /// what `global.ts:37` creates. `OPENCODE_CONFIG_DIR` does **not** change
+    /// what `global.ts:37` creates. `ZUNO_CONFIG_DIR` does **not** change
     /// it; see [`Layout::effective_config`].
     #[must_use]
     pub fn config(&self) -> &Path {
@@ -224,9 +224,9 @@ impl Layout {
     }
 
     /// The configuration directory the *service* sees:
-    /// `Flag.OPENCODE_CONFIG_DIR ?? Path.config` (`global.ts:64`).
+    /// `Flag.ZUNO_CONFIG_DIR ?? Path.config` (`global.ts:64`).
     ///
-    /// Nullish, not truthy — an `OPENCODE_CONFIG_DIR=""` overrides `config()`
+    /// Nullish, not truthy — an `ZUNO_CONFIG_DIR=""` overrides `config()`
     /// with an empty path here, while `config_directories` drops it. Both
     /// behaviours are the oracle's, in their respective places.
     #[must_use]
@@ -237,7 +237,7 @@ impl Layout {
         }
     }
 
-    /// The raw `OPENCODE_CONFIG_DIR` value, if the variable was present.
+    /// The raw `ZUNO_CONFIG_DIR` value, if the variable was present.
     #[must_use]
     pub fn config_dir_override(&self) -> Option<&str> {
         self.config_dir_override.as_deref()
@@ -449,12 +449,12 @@ mod tests {
 
     #[test]
     fn config_override_is_nullish_and_does_not_move_config() {
-        let resolved = layout(&[(HOME, "/config"), (OPENCODE_CONFIG_DIR, "/tmp/mycfg")]);
+        let resolved = layout(&[(HOME, "/config"), (ZUNO_CONFIG_DIR, "/tmp/mycfg")]);
         assert_eq!(resolved.config(), Path::new("/config/.config/zuno"));
         assert_eq!(resolved.effective_config(), Path::new("/tmp/mycfg"));
         assert_eq!(resolved.config_dir_override(), Some("/tmp/mycfg"));
 
-        let empty = layout(&[(HOME, "/config"), (OPENCODE_CONFIG_DIR, "")]);
+        let empty = layout(&[(HOME, "/config"), (ZUNO_CONFIG_DIR, "")]);
         assert_eq!(empty.effective_config(), Path::new(""));
 
         let unset = layout(&[(HOME, "/config")]);

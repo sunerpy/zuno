@@ -12,7 +12,7 @@ use zuno_engine::r#loop::{TURN_EVENT_CHANNEL_CAPACITY, TurnEvent, event_channel}
 const PROGRESS_TIMEOUT: Duration = Duration::from_secs(1);
 const REAP_TIMEOUT: Duration = Duration::from_secs(10);
 const HOST_SESSION_COUNT: usize = 2;
-const HOST_KIND_COUNT: usize = 4;
+const HOST_KIND_COUNT: usize = 3;
 const CONTAINED_PROCESSES_PER_HOST: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,7 +24,6 @@ enum Policy {
     RefuseNewest,
     SubscriberLag,
     ClosedDrop,
-    SingleCompletion,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -36,7 +35,6 @@ struct ChannelGate {
     policy: Policy,
     policy_file: &'static str,
     policy_needle: &'static str,
-    exclusion: Option<&'static str>,
 }
 
 const CHANNELS: &[ChannelGate] = &[
@@ -306,18 +304,6 @@ const CHANNELS: &[ChannelGate] = &[
         "zuno-cli/src/cmd/tui.rs",
         "editor_shutdown.send(true)",
     ),
-    excluded(
-        "plugin-wasm-completion",
-        "zuno-plugin/src/wasm.rs",
-        "let (finished, receiver) = mpsc::channel();",
-        "single completion result; no accumulating producer",
-    ),
-    excluded(
-        "plugin-js-call-completion",
-        "zuno-plugin/src/js/host.rs",
-        "let (sender, receiver) = std::sync::mpsc::sync_channel(1);",
-        "single completion result; producer sends exactly once",
-    ),
 ];
 
 const fn gate(
@@ -337,25 +323,6 @@ const fn gate(
         policy,
         policy_file,
         policy_needle,
-        exclusion: None,
-    }
-}
-
-const fn excluded(
-    id: &'static str,
-    file: &'static str,
-    construction: &'static str,
-    reason: &'static str,
-) -> ChannelGate {
-    ChannelGate {
-        id,
-        file,
-        construction,
-        capacity: "single completion",
-        policy: Policy::SingleCompletion,
-        policy_file: file,
-        policy_needle: construction,
-        exclusion: Some(reason),
     }
 }
 
@@ -367,20 +334,7 @@ fn source_channel_inventory_matches_the_declared_registry() {
         actual, expected,
         "channel registry differs from production source"
     );
-    assert_eq!(
-        CHANNELS
-            .iter()
-            .filter(|entry| entry.exclusion.is_none())
-            .count(),
-        29
-    );
-    assert_eq!(
-        CHANNELS
-            .iter()
-            .filter(|entry| entry.exclusion.is_some())
-            .count(),
-        2
-    );
+    assert_eq!(CHANNELS.len(), 29);
 
     let crates = crates_root();
     for entry in CHANNELS {
@@ -398,19 +352,6 @@ fn source_channel_inventory_matches_the_declared_registry() {
             entry.policy,
             entry.policy_needle
         );
-        if entry.policy == Policy::SingleCompletion {
-            assert!(
-                entry.exclusion.is_some(),
-                "{} needs an exclusion reason",
-                entry.id
-            );
-        } else {
-            assert!(
-                entry.exclusion.is_none(),
-                "{} cannot exclude a bounded queue",
-                entry.id
-            );
-        }
     }
 }
 
@@ -550,10 +491,6 @@ async fn run_channel_gate(id: &str) {
         .iter()
         .find(|entry| entry.id == id)
         .unwrap_or_else(|| panic!("missing channel gate {id}"));
-    assert!(
-        entry.exclusion.is_none(),
-        "excluded channel cannot run a gate: {id}"
-    );
     match entry.policy {
         Policy::LosslessBlock => probe_lossless_block().await,
         Policy::BroadcastLag => probe_broadcast_lag().await,
@@ -562,7 +499,6 @@ async fn run_channel_gate(id: &str) {
             probe_try_send_full().await;
         }
         Policy::ClosedDrop => probe_closed_drop().await,
-        Policy::SingleCompletion => panic!("single-completion channel cannot accumulate: {id}"),
     }
 }
 

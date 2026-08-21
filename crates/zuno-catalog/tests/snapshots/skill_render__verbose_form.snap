@@ -14,8 +14,8 @@ expression: "render(&corpus(), Form::Verbose)"
     <location>/config/.config/opencode/skill/amazon_quick_guide/SKILL.md</location>
   </skill>
   <skill>
-    <name>customize-opencode</name>
-    <description>Use ONLY when the user is editing or creating opencode's own configuration.</description>
+    <name>customize-zuno</name>
+    <description>Use ONLY when the user is editing or creating Zuno's own configuration.</description>
     <location>&lt;built-in&gt;</location>
   </skill>
   <skill>

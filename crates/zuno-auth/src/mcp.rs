@@ -177,7 +177,7 @@ impl McpAuthStore {
     /// The store for a resolved layout — `data()/mcp-auth.json`.
     ///
     /// There is no environment override for this file: `mcp/auth.ts` has no
-    /// counterpart to `OPENCODE_AUTH_CONTENT`.
+    /// counterpart to `ZUNO_AUTH_CONTENT`.
     #[must_use]
     pub fn resolve(layout: &Layout) -> Self {
         Self::new(layout.mcp_auth_file())

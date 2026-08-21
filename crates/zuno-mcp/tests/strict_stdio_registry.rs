@@ -116,7 +116,6 @@ async fn a_schema_strict_stdio_server_is_called_through_batch_without_the_inject
 
     let registry = ToolRegistryBuilder::new(
         workspace.path(),
-        Some(workspace.path().to_path_buf()),
         FileTools::new(workspace.path()).expect("file tools"),
         RegistryFlags {
             experimental_code_mode: true,

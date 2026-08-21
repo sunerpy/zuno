@@ -26,8 +26,7 @@ fn run_db(root: &Path, database: &Path, query: &str) -> Output {
         .env("XDG_STATE_HOME", root.join("state"))
         .env("ZUNO_DB", database)
         .env("ZUNO_DISABLE_AUTOUPDATE", "true")
-        .env("ZUNO_DISABLE_MODELS_FETCH", "true")
-        .env("ZUNO_DISABLE_DEFAULT_PLUGINS", "true");
+        .env("ZUNO_DISABLE_MODELS_FETCH", "true");
     command.output().expect("run the production db command")
 }
 

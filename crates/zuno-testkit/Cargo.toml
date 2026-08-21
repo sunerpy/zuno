@@ -33,10 +33,6 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-# `src/divergence.rs` parses the committed `docs/divergences.toml`. It is a
-# runtime dependency and not a dev one because plan todo 92's documentation test
-# reads the same allow-list through this loader.
-toml = { workspace = true }
 which = { workspace = true }
 
 [dev-dependencies]

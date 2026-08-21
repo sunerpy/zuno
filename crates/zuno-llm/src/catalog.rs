@@ -56,7 +56,7 @@
 //! # No network in any test
 //!
 //! Every test drives both sides from a pinned fixture through
-//! `OPENCODE_MODELS_PATH`. A differential that depends on models.dev being
+//! `ZUNO_MODELS_PATH`. A differential that depends on models.dev being
 //! reachable is a flaky test and a false claim of determinism.
 
 pub mod availability;
@@ -404,10 +404,10 @@ mod tests {
     }
 
     #[test]
-    fn opencode_providers_lead_the_listing() {
+    fn provider_ids_receive_no_branded_listing_priority() {
         let mut doc = document();
         let opencode: CatalogProvider = serde_json::from_str(
-            r#"{"name":"opencode","id":"opencode","env":["OPENCODE_API_KEY"],
+            r#"{"name":"opencode","id":"opencode","env":["ZUNO_API_KEY"],
                 "models":{"zen":{"id":"zen","name":"Zen","limit":{"context":1,"output":1}}}}"#,
         )
         .expect("fixture parses");
@@ -416,7 +416,7 @@ mod tests {
         let catalog = Catalog::resolve(&doc, &ResolveInput::new().with_config(&cfg));
         assert_eq!(
             catalog.model_lines(),
-            vec!["opencode/zen", "deepseek/deepseek-chat", "groq/allam-2-7b"]
+            vec!["deepseek/deepseek-chat", "groq/allam-2-7b", "opencode/zen"]
         );
     }
 

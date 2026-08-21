@@ -46,6 +46,7 @@ zuno-db = { path = "crates/zuno-db" }
 zuno-engine = { path = "crates/zuno-engine" }
 zuno-error = { path = "crates/zuno-error" }
 zuno-goal = { path = "crates/zuno-goal" }
+zuno-harness = { path = "crates/zuno-harness" }
 zuno-llm = { path = "crates/zuno-llm" }
 zuno-lsp = { path = "crates/zuno-lsp" }
 zuno-mcp = { path = "crates/zuno-mcp" }
@@ -53,8 +54,6 @@ zuno-memory = { path = "crates/zuno-memory" }
 zuno-observability = { path = "crates/zuno-observability" }
 zuno-paths = { path = "crates/zuno-paths" }
 zuno-permission = { path = "crates/zuno-permission" }
-zuno-plugin = { path = "crates/zuno-plugin" }
-zuno-plugin-sdk = { path = "crates/zuno-plugin-sdk" }
 zuno-process = { path = "crates/zuno-process" }
 zuno-provider-anthropic = { path = "crates/zuno-provider-anthropic" }
 zuno-provider-bedrock = { path = "crates/zuno-provider-bedrock" }
@@ -62,6 +61,7 @@ zuno-provider-compatible = { path = "crates/zuno-provider-compatible" }
 zuno-provider-google = { path = "crates/zuno-provider-google" }
 zuno-provider-openai = { path = "crates/zuno-provider-openai" }
 zuno-pty = { path = "crates/zuno-pty" }
+zuno-runtime = { path = "crates/zuno-runtime" }
 zuno-search = { path = "crates/zuno-search" }
 zuno-server = { path = "crates/zuno-server" }
 zuno-snapshot = { path = "crates/zuno-snapshot" }
@@ -254,18 +254,6 @@ unicode-width = "0.2.2"
 # combining mark into pieces a terminal cannot draw; the markdown renderer breaks
 # an over-long word at *cluster* boundaries instead.
 unicode-segmentation = "1.13.3"
-
-# -- optional plugin runtimes ------------------------------------------------
-# Kept out of every default build: only `zuno-plugin/wasm` activates this exact
-# runtime. WASI is intentionally absent; the component host starts with no
-# filesystem, network, clock, or environment authority.
-wasmtime = { version = "=47.0.3", default-features = false, features = [
-  "component-model",
-  "cranelift",
-  "runtime",
-  "std",
-  "wat",
-] }
 
 # -- test-only --------------------------------------------------------------
 insta = { version = "1.48.0", features = ["json", "yaml", "redactions"] }

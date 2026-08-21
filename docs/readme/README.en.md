@@ -1,7 +1,7 @@
 # Zuno
 
-> An independent AI coding agent. Written in Rust, it loads opencode plugins, but binary,
-> configuration, and session compatibility are not product goals.
+> An independent Rust AI coding agent with a native Harness Runtime for composing drivers,
+> capabilities, and tool sets.
 
 [简体中文](../../README.md) · English
 
@@ -10,7 +10,7 @@
 - [Project identity](#project-identity)
 - [Install](#install)
 - [Quick start](#quick-start)
-- [Plugins](#plugins)
+- [Harness runtime](#harness-runtime)
 - [Documentation](#documentation)
 - [Independent runtime](#independent-runtime)
 - [Development](#development)
@@ -21,9 +21,9 @@
 Zuno is a standalone command-line AI coding agent: local session storage, pluggable model
 providers, its own tool set, and a built-in TUI. `unsafe_code` is forbidden workspace-wide.
 
-It reads its own configuration and data, not opencode's. Cross-binary compatibility is not a
-goal — the plugin tier is the only retained compatibility surface, described under
-[Plugins](#plugins).
+It reads its own configuration and data, not opencode's. Zuno does not retain the OpenCode plugin
+ABI, JavaScript hooks, HTTP compatibility routes, or configuration shims. Extensions use the
+native [Harness runtime](#harness-runtime).
 
 ## Install
 
@@ -50,39 +50,35 @@ $ zuno --version --long
 that `export` produced, never an opencode session and never a share URL. Both are **top-level**
 commands, not subcommands of `session` — `zuno session` carries only `list`, `prune`, and `delete`.
 
-## Plugins
+## Harness runtime
 
-Zuno supports opencode plugins: an installed npm plugin loads against its existing ABI, including
-the six handshake environment variables `OPENCODE_CLIENT`, `OPENCODE_CONFIG_CONTENT`,
-`OPENCODE_CONFIG_DIR`, `OPENCODE_DISABLE_CLAUDE_CODE`, `OPENCODE_SERVER_PASSWORD`, and
-`OPENCODE_SERVER_USERNAME`. They identify the plugin contract, not Zuno itself.
+Zuno's native extension unit is a Rust `Component`. Components form a `ProfileBundle`, and a
+`HarnessProfile` mounts all bundles in one transaction: candidates are published only after full
+validation, failures roll back in reverse order, and the old profile remains available during a
+hot replacement. `AgentDriver` and `ToolManifest` are profile services, so benchmark, workflow,
+remote, and specialized coding harnesses can replace the loop and tool surface without editing a
+fixed main loop.
 
-The JavaScript plugin runtime is off by default and must be enabled explicitly
-(`ZUNO_ENABLE_JS_PLUGINS=1`, or `"plugin_runtime": {"javascript": true}`). Not starting a JS
-runtime by default cuts startup from roughly 1465 ms to roughly 30 ms.
-
-**Rust plugins are the recommended way to write a new one.** The first-party SDK is
-`zuno-plugin-sdk`: in-process, no runtime dependency, and shipped with a conformance suite. The
-three plugin tiers, the 21 hooks, and a runnable Rust example are in
-[plugin authoring](../plugin-authoring.md).
+Session input uses a durable FIFO inbox shared by user prompts, live steering, and subagent
+reports. Background `task` calls support `reportDelivery: nextStep | quiet`, while the `job` tool
+queries durable status. `web_search` accepts a `queries` array, runs queries concurrently, cancels
+sibling requests after the first failure, waits for settlement, and merges results deterministically
+with URL deduplication. See [the Harness Runtime guide](../harness-runtime.md).
 
 ## Documentation
 
-| Page                                               | Purpose                                                                  |
-| -------------------------------------------------- | ------------------------------------------------------------------------ |
-| [Plugin authoring](../plugin-authoring.md)         | The three plugin tiers, the hook table, and a Rust example               |
-| [Compatibility matrix](../compatibility-matrix.md) | Implemented, added, rejected, not-registered, and explicit 503 surfaces  |
-| [Declared divergences](../divergences.md)          | Every intentional difference and its reason                              |
-| [Rejected inputs](../rejected-inputs.md)           | Deprecated configuration forms, replacements, and exact errors           |
-| [Database lifecycle](../migration.md)              | Zuno database selection, legacy-filename diagnostics, and schema changes |
-| [Session retention](../session-retention.md)       | Reversible archive and irreversible delete operations                    |
-| [Resource gates](../resource-gates.md)             | Measured results for the six gates, opt-in commands, and known limits    |
-| [Performance methodology](../perf-methodology.md)  | How memory and liveness gates are measured                               |
+| Page                                              | Purpose                                                                  |
+| ------------------------------------------------- | ------------------------------------------------------------------------ |
+| [Harness Runtime](../harness-runtime.md)          | Native components, profile transactions, durable input, custom harnesses |
+| [Rejected inputs](../rejected-inputs.md)          | Deprecated configuration forms, replacements, and exact errors           |
+| [Database lifecycle](../migration.md)             | Zuno database selection, legacy-filename diagnostics, and schema changes |
+| [Session retention](../session-retention.md)      | Reversible archive and irreversible delete operations                    |
+| [Resource gates](../resource-gates.md)            | Measured results for the six gates, opt-in commands, and known limits    |
+| [Performance methodology](../perf-methodology.md) | How memory and liveness gates are measured                               |
 
-Only regions delimited by `generated:BEGIN` and `generated:END` comments are generated from code and
-checked byte-for-byte by `cargo test -p zuno-cli --test docs`; the test also derives assertions for a
-small set of critical sections. Explanatory tables and prose outside those markers still require
-review. Use `ZUNO_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs` to regenerate managed regions.
+`cargo test -p zuno-cli --test docs` checks that the Harness guide covers runtime lifecycle,
+durable delivery, and concurrent search, and prevents the READMEs from advertising retired
+compatibility surfaces.
 
 ## Independent runtime
 
@@ -93,13 +89,13 @@ upstream-only fixtures, source notes, or historical evidence.
 
 The config **filename** is Zuno's own too: every layer reads `zuno.jsonc` and `zuno.json` and
 nothing else — the config root, a bare file on the walk up from the working directory to the
-worktree root, `.zuno/`, the directory named by `OPENCODE_CONFIG_DIR`, and the managed directory.
+worktree root, `.zuno/`, the directory named by `ZUNO_CONFIG_DIR`, and the managed directory.
 JSONC and strict JSON only; there is **no TOML config path**. `opencode.jsonc`, `opencode.json`, and
 a `config.json` in the config root are no longer read: a user still holding one of those names gets
 a startup error naming the file, its directory, and the name to rename it to, rather than silence.
 
-Outside the plugin ABI, Zuno's user interface, default paths, and own environment variables all use
-Zuno's identity.
+Zuno's user interface, default paths, environment variables, and extension protocol all use Zuno's
+identity.
 
 ## Development
 

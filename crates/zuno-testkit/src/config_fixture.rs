@@ -9,10 +9,10 @@
 //! 2. every `.opencode` directory from the working directory up to the worktree
 //!    root, nearest last;
 //! 3. `$HOME/.opencode`;
-//! 4. `$OPENCODE_CONFIG_DIR`, when set;
+//! 4. `$ZUNO_CONFIG_DIR`, when set;
 //! 5. `opencode.{json,jsonc}` files walked up from the working directory, in
 //!    reverse so the nearest wins;
-//! 6. `$OPENCODE_CONFIG` naming one file, and `$OPENCODE_CONFIG_CONTENT` carrying
+//! 6. `$ZUNO_CONFIG` naming one file, and `$ZUNO_CONFIG_CONTENT` carrying
 //!    one inline.
 //!
 //! The precise order and semantics are Todo 7-12's subject, not this builder's.
@@ -46,11 +46,11 @@ pub enum ConfigLayer {
     ProjectDotOpencode,
     /// A bare config file inside the project tree, in both products' spellings.
     ProjectFile,
-    /// The file `$OPENCODE_CONFIG` points at.
+    /// The file `$ZUNO_CONFIG` points at.
     EnvConfigFile,
-    /// The directory `$OPENCODE_CONFIG_DIR` points at.
+    /// The directory `$ZUNO_CONFIG_DIR` points at.
     EnvConfigDir,
-    /// Inline JSON in `$OPENCODE_CONFIG_CONTENT`; no file is written.
+    /// Inline JSON in `$ZUNO_CONFIG_CONTENT`; no file is written.
     EnvConfigContent,
 }
 
@@ -201,7 +201,7 @@ impl ConfigFixture {
         Ok(self)
     }
 
-    /// Write a config file outside the tree and point `$OPENCODE_CONFIG` at it.
+    /// Write a config file outside the tree and point `$ZUNO_CONFIG` at it.
     ///
     /// # Errors
     ///
@@ -211,7 +211,7 @@ impl ConfigFixture {
         write_file(&path, contents)?;
         self.env = self
             .env
-            .set("OPENCODE_CONFIG", path.to_string_lossy().into_owned());
+            .set("ZUNO_CONFIG", path.to_string_lossy().into_owned());
         self.layers.push(PlacedLayer {
             layer: ConfigLayer::EnvConfigFile,
             path: Some(path),
@@ -220,7 +220,7 @@ impl ConfigFixture {
         Ok(self)
     }
 
-    /// Write a config directory outside the tree and point `$OPENCODE_CONFIG_DIR`
+    /// Write a config directory outside the tree and point `$ZUNO_CONFIG_DIR`
     /// at it.
     ///
     /// # Errors
@@ -238,7 +238,7 @@ impl ConfigFixture {
         write_file(&path, contents)?;
         self.env = self
             .env
-            .set("OPENCODE_CONFIG_DIR", dir.to_string_lossy().into_owned());
+            .set("ZUNO_CONFIG_DIR", dir.to_string_lossy().into_owned());
         self.layers.push(PlacedLayer {
             layer: ConfigLayer::EnvConfigDir,
             path: Some(path),
@@ -247,10 +247,10 @@ impl ConfigFixture {
         Ok(self)
     }
 
-    /// Carry config inline in `$OPENCODE_CONFIG_CONTENT`, writing nothing.
+    /// Carry config inline in `$ZUNO_CONFIG_CONTENT`, writing nothing.
     #[must_use]
     pub fn env_config_content(mut self, contents: &str) -> Self {
-        self.env = self.env.set("OPENCODE_CONFIG_CONTENT", contents);
+        self.env = self.env.set("ZUNO_CONFIG_CONTENT", contents);
         self.layers.push(PlacedLayer {
             layer: ConfigLayer::EnvConfigContent,
             path: None,
@@ -259,11 +259,11 @@ impl ConfigFixture {
         self
     }
 
-    /// Set `OPENCODE_DISABLE_PROJECT_CONFIG=1`, which drops the project `.opencode`
+    /// Set `ZUNO_DISABLE_PROJECT_CONFIG=1`, which drops the project `.opencode`
     /// chain from discovery.
     #[must_use]
     pub fn disable_project_config(mut self) -> Self {
-        self.env = self.env.set("OPENCODE_DISABLE_PROJECT_CONFIG", "1");
+        self.env = self.env.set("ZUNO_DISABLE_PROJECT_CONFIG", "1");
         self
     }
 
@@ -468,15 +468,15 @@ mod tests {
 
         let vars = fixture.env().env_vars();
         assert!(
-            vars.get("OPENCODE_CONFIG")
+            vars.get("ZUNO_CONFIG")
                 .is_some_and(|v| v.ends_with("opencode.json"))
         );
         assert!(
-            vars.get("OPENCODE_CONFIG_DIR")
+            vars.get("ZUNO_CONFIG_DIR")
                 .is_some_and(|v| v.ends_with("env-config-dir"))
         );
         assert_eq!(
-            vars.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+            vars.get("ZUNO_CONFIG_CONTENT").map(String::as_str),
             Some(r#"{"g":7}"#)
         );
 
@@ -571,7 +571,7 @@ mod tests {
             disabled
                 .env()
                 .env_vars()
-                .get("OPENCODE_DISABLE_PROJECT_CONFIG")
+                .get("ZUNO_DISABLE_PROJECT_CONFIG")
                 .map(String::as_str),
             Some("1")
         );

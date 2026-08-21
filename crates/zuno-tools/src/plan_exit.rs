@@ -13,7 +13,7 @@
 //! # There is a second gate, and it is not in this crate
 //!
 //! Measured against the real 1.18.12 binary: with
-//! `OPENCODE_EXPERIMENTAL_PLAN_MODE=true`, `plan_exit` is **absent** from the `build`
+//! `ZUNO_EXPERIMENTAL_PLAN_MODE=true`, `plan_exit` is **absent** from the `build`
 //! agent and **present** on `plan`. The registry offered it in both cases; the
 //! permission ruleset took it away from `build` — `plan_exit: "deny"` in the defaults
 //! and `plan_exit: "allow"` only for the `plan` agent

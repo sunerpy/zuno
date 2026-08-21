@@ -10,7 +10,7 @@
 //! * **has `session`** — someone's real history. Never recreate it; run only the
 //!   migrations its journal does not already record ([`apply_only`]).
 //! * **empty** — a fresh install. Create the current schema in one statement batch
-//!   and pre-seed all 38 journal ids, so no migration ever replays.
+//!   and pre-seed all 39 journal ids, so no migration ever replays.
 //! * **non-empty without `session`** — unrecognised. Fail; touching it would be
 //!   guesswork over someone's data.
 //!
@@ -328,13 +328,13 @@ mod tests {
 
     #[test]
     fn migration_ids_are_derived_from_the_statements_that_actually_run() {
-        assert_eq!(MIGRATION_IDS.len(), 38);
-        assert_eq!(CURRENT_VERSION, 38);
+        assert_eq!(MIGRATION_IDS.len(), 39);
+        assert_eq!(CURRENT_VERSION, 39);
         for (index, migration) in MIGRATIONS.iter().enumerate() {
             assert_eq!(MIGRATION_IDS[index], migration.id);
         }
         assert_eq!(MIGRATION_IDS[0], "20260127222353_familiar_lady_ursula");
-        assert_eq!(MIGRATION_IDS[37], "20260622202450_simplify_session_input");
+        assert_eq!(MIGRATION_IDS[38], "20260821160000_agent_job");
     }
 
     #[test]

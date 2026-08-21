@@ -505,7 +505,7 @@ async fn start_real_memory_drivers(
     zuno_pty::PtyId,
 ) {
     create_watcher_tree(project).expect("create the 50,000-file W-soak tree");
-    let watcher_env = Env::from_process().with("OPENCODE_EXPERIMENTAL_FILEWATCHER", "true");
+    let watcher_env = Env::from_process().with("ZUNO_EXPERIMENTAL_FILEWATCHER", "true");
     let (watcher, events) = Watcher::start(
         WatchOptions::new(project)
             .env(watcher_env)

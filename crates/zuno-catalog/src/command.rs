@@ -86,7 +86,7 @@ pub const BUILTIN_REVIEW: &str = "review";
 /// Path prefixes excluded from derived command names.
 pub const COMMAND_DIRECTORY_PREFIXES: [&str; 2] = ["command/", "commands/"];
 
-/// `command/template/initialize.txt`, byte-identical to the oracle's copy.
+/// The built-in repository-instruction prompt.
 const TEMPLATE_INITIALIZE: &str = include_str!("command/initialize.txt");
 
 /// `command/template/review.txt`, byte-identical to the oracle's copy.
@@ -216,8 +216,8 @@ pub struct SkillCommand {
 /// : path.dirname(item.location)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkillLocation {
-    /// A skill compiled into the binary. Observed on the real binary as
-    /// `customize-opencode`, whose command template is its body with no footer.
+    /// A skill compiled into the binary, whose command template is its body with
+    /// no filesystem footer.
     Builtin,
     /// The skill's `SKILL.md` path. The footer names its *parent* directory.
     File(PathBuf),
@@ -350,7 +350,7 @@ pub fn load_map(
         }
     }
 
-    if let Some(text) = env.truthy_value("OPENCODE_CONFIG_CONTENT")
+    if let Some(text) = env.truthy_value("ZUNO_CONFIG_CONTENT")
         && let Ok(layer) = serde_json::from_str::<Config>(text)
         && let Some(from_env) = layer.command
     {

@@ -4,8 +4,8 @@ use crate::migration;
 use rusqlite::Transaction;
 use zuno_error::DbError;
 
-/// Number of application tables created by the upstream schema's single `up`.
-pub const TABLE_COUNT: usize = 19;
+/// Number of application tables created by the current schema's single `up`.
+pub const TABLE_COUNT: usize = 20;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE `workspace` (
@@ -182,6 +182,27 @@ CREATE TABLE `session` (
   `time_archived` integer,
   CONSTRAINT `fk_session_project_id_project_id_fk` FOREIGN KEY (`project_id`) REFERENCES `project`(`id`) ON DELETE CASCADE
 );
+CREATE TABLE `agent_job` (
+  `id` text PRIMARY KEY,
+  `parent_session_id` text NOT NULL,
+  `child_session_id` text NOT NULL,
+  `status` text NOT NULL,
+  `report_delivery` text NOT NULL,
+  `result` text,
+  `error` text,
+  `report_input_id` text,
+  `created_seq` integer NOT NULL,
+  `settled_seq` integer,
+  `time_created` integer NOT NULL,
+  `time_updated` integer NOT NULL,
+  `time_completed` integer,
+  CONSTRAINT `agent_job_distinct_sessions` CHECK (`parent_session_id` <> `child_session_id`),
+  CONSTRAINT `agent_job_status` CHECK (`status` IN ('running','completed','failed','cancelled')),
+  CONSTRAINT `agent_job_report_delivery` CHECK (`report_delivery` IN ('next-step','quiet')),
+  CONSTRAINT `fk_agent_job_parent_session_id_session_id_fk` FOREIGN KEY (`parent_session_id`) REFERENCES `session`(`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_agent_job_child_session_id_session_id_fk` FOREIGN KEY (`child_session_id`) REFERENCES `session`(`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_agent_job_report_input_id_session_input_id_fk` FOREIGN KEY (`report_input_id`) REFERENCES `session_input`(`id`) ON DELETE SET NULL
+);
 CREATE TABLE `todo` (
   `session_id` text NOT NULL,
   `content` text NOT NULL,
@@ -215,6 +236,8 @@ CREATE UNIQUE INDEX `session_message_session_seq_idx` ON `session_message` (`ses
 CREATE INDEX `session_message_session_type_seq_idx` ON `session_message` (`session_id`,`type`,`seq`);
 CREATE INDEX `session_message_session_time_created_id_idx` ON `session_message` (`session_id`,`time_created`,`id`);
 CREATE INDEX `session_message_time_created_idx` ON `session_message` (`time_created`);
+CREATE UNIQUE INDEX `agent_job_child_running_idx` ON `agent_job` (`child_session_id`) WHERE `status` = 'running';
+CREATE INDEX `agent_job_parent_status_created_idx` ON `agent_job` (`parent_session_id`,`status`,`time_created`);
 CREATE INDEX `session_project_idx` ON `session` (`project_id`);
 CREATE INDEX `session_workspace_idx` ON `session` (`workspace_id`);
 CREATE INDEX `session_parent_idx` ON `session` (`parent_id`);

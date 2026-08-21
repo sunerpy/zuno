@@ -31,11 +31,11 @@
 //! | `ZUNO_PROBE_LOG_DIR` | required; the log directory to write to |
 //! | `ZUNO_PROBE_ROTATION` | optional; `daily`, `hourly` or `never` (default `never`, so the test knows the file name) |
 //! | `ZUNO_PROBE_DIRECTIVES` | optional; raw filter directives, the only way to reach `TRACE` |
-//! | `OPENCODE_LOG_LEVEL` | read by the library under test |
-//! | `OPENCODE_PRINT_LOGS` | read by the library under test |
+//! | `ZUNO_LOG_LEVEL` | read by the library under test |
+//! | `ZUNO_PRINT_LOGS` | read by the library under test |
 //!
 //! The `ZUNO_PROBE_*` names configure this fixture, never the product: no crate
-//! outside this file reads one. They are also outside the `OPENCODE_*` namespace the
+//! outside this file reads one. They are also outside the `ZUNO_*` namespace the
 //! oracle's flag surface occupies, so neither half of the table can be mistaken for
 //! the other.
 
@@ -80,7 +80,7 @@ fn rotation_from_env() -> Rotation {
     {
         "daily" => Rotation::Daily,
         "hourly" => Rotation::Hourly,
-        // `Never` by default: a single `opencode.log` is what the test asserts on, so
+        // `Never` by default: a single `zuno.log` is what the test asserts on, so
         // the file name must not depend on today's date.
         _ => Rotation::Never,
     }

@@ -32,13 +32,17 @@ pub const DEFAULT_MAX_IDLE: usize = 4;
 /// # Concurrency
 ///
 /// [`Connection`] is `Send` but not `Sync`, so a connection is checked out
-/// exclusively and returned on drop. Concurrent writers are serialized by SQLite
-/// itself: WAL lets readers run during a write, and `busy_timeout = 5000` makes a
-/// second writer wait rather than fail.
+/// exclusively and returned on drop. The pool serializes writers in-process before
+/// opening or checking out their connections. This matches SQLite's single-writer
+/// model and avoids a shared-memory database returning `SQLITE_LOCKED` when one
+/// thread opens a connection and applies its pragmas while another holds a write
+/// transaction. SQLite still serializes writers from other processes; WAL keeps
+/// readers concurrent with either kind of writer.
 pub struct Pool {
     location: DbLocation,
     target: String,
     max_idle: usize,
+    writer: Mutex<()>,
     state: Mutex<State>,
 }
 
@@ -93,6 +97,7 @@ impl Pool {
             location: location.clone(),
             target,
             max_idle: max_idle.max(1),
+            writer: Mutex::new(()),
             state: Mutex::new(State {
                 idle: vec![first],
                 anchor,
@@ -147,6 +152,20 @@ impl Pool {
     #[must_use]
     pub fn holds_memory_anchor(&self) -> bool {
         self.lock().anchor.is_some()
+    }
+
+    /// Open an owned connection to this pool's database.
+    ///
+    /// Unlike [`Self::get`], the connection is not returned to the idle set when
+    /// dropped. It still uses the pool's configured target, so an in-memory
+    /// connection shares the database kept alive by this pool's anchor. The pool
+    /// must therefore outlive an owned connection to an in-memory database.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError::Open`] when the connection cannot be opened or configured.
+    pub fn open_connection(&self) -> Result<Connection, DbError> {
+        open::open_target(&self.target, &self.location)
     }
 
     /// Check out a connection, opening a new one if none is idle.
@@ -208,6 +227,7 @@ impl Pool {
     where
         F: FnOnce(&Transaction<'_>) -> Result<T, DbError>,
     {
+        let _writer = self.lock_writer();
         let mut connection = self.get()?;
         let transaction = connection
             .transaction_with_behavior(behavior)
@@ -219,6 +239,10 @@ impl Pool {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn lock_writer(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.writer.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn put_back(&self, connection: Connection) {
@@ -259,6 +283,8 @@ impl PooledConnection<'_> {
     where
         F: FnOnce(&Transaction<'_>) -> Result<T, DbError>,
     {
+        let pool = self.pool;
+        let _writer = pool.lock_writer();
         let transaction = self
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(open::map_error)?;
@@ -337,6 +363,27 @@ mod tests {
             .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
             .expect("count rows");
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn an_owned_connection_shares_the_pools_database() {
+        let pool = Pool::open(&DbLocation::Memory).expect("open in-memory pool");
+        let owned = pool
+            .open_connection()
+            .expect("open an owned connection from the pool");
+        owned
+            .execute_batch("CREATE TABLE t (id integer primary key); INSERT INTO t VALUES (1)")
+            .expect("seed through the owned connection");
+
+        let pooled = pool.get().expect("check out a pooled connection");
+        pooled
+            .execute("INSERT INTO t VALUES (2)", [])
+            .expect("write through the pooled connection");
+        let count: i64 = owned
+            .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+            .expect("read both writes through the owned connection");
+
+        assert_eq!(count, 2);
     }
 
     #[test]

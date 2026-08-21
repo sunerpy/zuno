@@ -370,7 +370,7 @@ mod tests {
             "codegraph",
             "codegraph-release",
             "lark-im",
-            "customize-opencode",
+            "customize-zuno",
         ];
         names.sort_by(|left, right| locale_compare(left, right));
         assert_eq!(
@@ -380,7 +380,7 @@ mod tests {
                 "amazon_quick_guide",
                 "codegraph",
                 "codegraph-release",
-                "customize-opencode",
+                "customize-zuno",
                 "design-taste-frontend-v1",
                 "lark-im",
             ]

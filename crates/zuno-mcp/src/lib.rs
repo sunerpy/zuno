@@ -7,6 +7,8 @@ mod protocol;
 pub mod remote;
 pub mod stdio;
 
+pub(crate) const CLIENT_NAME: &str = "zuno";
+
 pub use catalog::{
     ATTACHABLE_MIMES, Catalog, CatalogEvent, CatalogLoader, ConnectedServer, Diagnostic,
     LIST_RESOURCE_TEMPLATES_TOOL, LIST_RESOURCES_TOOL, MAX_RESOURCE_BLOB_BYTES, PromptArgument,

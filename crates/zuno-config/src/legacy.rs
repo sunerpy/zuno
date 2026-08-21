@@ -640,7 +640,7 @@ pub fn inspect_global_directory(dir: &Path) -> Vec<Deprecation> {
 /// misleading advice at the global root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConfigFileScope {
-    /// The global root, `.zuno/`, `OPENCODE_CONFIG_DIR`, or the managed directory.
+    /// The global root, `.zuno/`, `ZUNO_CONFIG_DIR`, or the managed directory.
     Owned,
     /// A bare file on the walk up from the working directory to the worktree root.
     ProjectAncestor,

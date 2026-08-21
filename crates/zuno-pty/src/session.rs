@@ -88,7 +88,7 @@ pub const DRAIN_GRACE: Duration = Duration::from_millis(500);
 /// Terminal type advertised to the child (`packages/core/src/pty.ts:177`).
 const TERM_VALUE: &str = "xterm-256color";
 
-/// Marks a shell as running inside opencode (`packages/core/src/pty.ts:178`).
+/// Marks a shell as running inside Zuno.
 const TERMINAL_MARKER_ENV: &str = "ZUNO_TERMINAL";
 
 /// A PTY session identifier, `pty_`-prefixed as `packages/schema/src/pty.ts:9`.

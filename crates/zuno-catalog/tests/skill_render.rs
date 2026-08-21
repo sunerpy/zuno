@@ -32,8 +32,8 @@ fn corpus() -> Vec<Skill> {
         ),
         skill("quiet", None, "/config/.agents/skills/quiet/SKILL.md"),
         skill(
-            "customize-opencode",
-            Some("Use ONLY when the user is editing or creating opencode's own configuration."),
+            "customize-zuno",
+            Some("Use ONLY when the user is editing or creating Zuno's own configuration."),
             "<built-in>",
         ),
         skill(

@@ -1,7 +1,6 @@
 # Zuno
 
-> 独立的 AI 编程代理。用 Rust 写成，可加载 opencode 插件，但不以其二进制、配置或会话兼容为
-> 产品目标。
+> 独立的 Rust AI 编程代理，可通过原生 Harness Runtime 组合不同的 Agent 驱动、能力和工具集。
 
 简体中文 · [English](docs/readme/README.en.md)
 
@@ -10,7 +9,7 @@
 - [项目定位](#项目定位)
 - [安装](#安装)
 - [快速开始](#快速开始)
-- [插件](#插件)
+- [Harness Runtime](#harness-runtime)
 - [文档](#文档)
 - [独立运行](#独立运行)
 - [构建与开发](#构建与开发)
@@ -21,8 +20,8 @@
 Zuno 是一个独立的命令行 AI 编程代理：本地会话存储、可插拔的模型 provider、自带工具集，以及
 一个内置 TUI。整个 workspace 禁止 `unsafe_code`。
 
-它读自己的配置与数据，不读 opencode 的。跨二进制兼容不是目标 —— 唯一保留的兼容面是插件层，
-见下方[插件](#插件)。
+它读自己的配置与数据，不读 opencode 的。Zuno 不保留 OpenCode 插件 ABI、JS hook、HTTP
+兼容路由或配置兼容层；扩展统一使用下方的原生 [Harness Runtime](#harness-runtime)。
 
 ## 安装
 
@@ -55,38 +54,32 @@ $ zuno --version --long
 生成的本地文档，不接受 opencode 会话，也不接受 share URL。两者都是**顶层命令**，不是
 `session` 的子命令 —— `zuno session` 只有 `list`、`prune`、`delete`。
 
-## 插件
+## Harness Runtime
 
-Zuno 支持 opencode 插件：已安装的 npm 插件按其原有 ABI 加载，包括
-`OPENCODE_CLIENT`、`OPENCODE_CONFIG_CONTENT`、`OPENCODE_CONFIG_DIR`、
-`OPENCODE_DISABLE_CLAUDE_CODE`、`OPENCODE_SERVER_PASSWORD`、`OPENCODE_SERVER_USERNAME`
-这六个握手环境变量。它们标识插件契约，不是 Zuno 自身的身份。
+Zuno 的扩展单元是原生 Rust `Component`。多个组件组成 `ProfileBundle`，再由
+`HarnessProfile` 在一次事务中挂载：候选 Profile 完整验证后才发布，失败时按逆序回滚，热替换
+期间旧 Profile 始终可用。`AgentDriver` 与 `ToolManifest` 都是 Profile 服务，因此 benchmark、
+workflow、远程执行器或专用编码 Agent 可以替换循环和工具面，而无需修改固定主循环。
 
-JavaScript 插件运行时默认关闭，需显式开启（`ZUNO_ENABLE_JS_PLUGINS=1`，或配置
-`"plugin_runtime": {"javascript": true}`）—— 默认不启动 JS 运行时，启动耗时从约 1465 ms
-降到约 30 ms。
-
-**新插件推荐使用 Rust 编写。** 一等公民 SDK 是 `zuno-plugin-sdk`：进程内、无运行时依赖、
-自带一致性测试套件。三类插件层级、21 个 hook 与可运行的 Rust 示例见
-[docs/plugin-authoring.md](docs/plugin-authoring.md)。
+会话输入进入持久化 FIFO inbox；用户 prompt、运行中 steer 与子代理报告共享同一交付协议。
+后台 `task` 支持 `reportDelivery: nextStep | quiet`，完成状态可用 `job` 工具查询。
+`web_search` 接收 `queries` 数组，并发执行、首错取消兄弟请求、等待收敛后按稳定顺序合并及 URL
+去重。完整生命周期、作用域和自定义 Harness 示例见
+[docs/harness-runtime.md](docs/harness-runtime.md)。
 
 ## 文档
 
 | 页面 | 内容 |
 | --- | --- |
-| [docs/plugin-authoring.md](docs/plugin-authoring.md) | 三类插件层级、hook 表与 Rust 示例 |
-| [docs/compatibility-matrix.md](docs/compatibility-matrix.md) | 每个接口面的状态：implemented、显式 503 gap、added、rejected、not-registered |
-| [docs/divergences.md](docs/divergences.md) | 17 项有意差异及各自原因 |
+| [docs/harness-runtime.md](docs/harness-runtime.md) | 原生组件、Profile 事务、持久 inbox 与自定义 Harness |
 | [docs/rejected-inputs.md](docs/rejected-inputs.md) | 已弃用配置、替代形式与准确错误信息 |
 | [docs/migration.md](docs/migration.md) | Zuno 数据库文件选择、旧默认文件名诊断及 schema 演进 |
 | [docs/session-retention.md](docs/session-retention.md) | 清理操作指南：`--archive` 可逆，`--delete` 不可逆 |
 | [docs/resource-gates.md](docs/resource-gates.md) | 六项资源门禁的实测结果、opt-in 命令与已知限制 |
 | [docs/perf-methodology.md](docs/perf-methodology.md) | 内存和活性门禁的测量方法 |
 
-只有 `<!-- generated:BEGIN … -->` 与 `<!-- generated:END … -->` 标记之间的区域从代码生成并由
-`cargo test -p zuno-cli --test docs` 做字节级防漂移检查；该测试还针对少量关键章节做派生断言。
-标记外的说明性表格与 prose 仍需评审，不能因测试通过就视为已从代码生成。使用
-`ZUNO_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs` 重新生成受管区域。
+`cargo test -p zuno-cli --test docs` 校验 Harness 指南覆盖运行时、持久交付和并发搜索，并防止
+README 再次宣传已经退役的兼容面。
 
 ## 独立运行
 
@@ -97,12 +90,12 @@ Zuno 自己 `zuno export` 出的文档。旧路径只会在 oracle fixture、上
 **upstream-only** 身份出现。
 
 配置**文件名**同样是 Zuno 自己的：每一层都只读 `zuno.jsonc` 与 `zuno.json` —— 配置根、
-从工作目录向上走到 worktree 根的裸文件、`.zuno/`、`OPENCODE_CONFIG_DIR` 指定的目录，以及
+从工作目录向上走到 worktree 根的裸文件、`.zuno/`、`ZUNO_CONFIG_DIR` 指定的目录，以及
 托管目录。仅支持 JSONC 与严格 JSON，**没有 TOML 配置路径**。`opencode.jsonc`、
 `opencode.json` 以及配置根下的 `config.json` 都不再被读取；仍留着旧文件名的用户会得到一条
 指明该文件、该目录与应改成的新文件名的启动错误，而不是被静默忽略。
 
-除插件 ABI 之外，Zuno 的用户界面、默认路径和自有环境变量均使用 Zuno 身份。
+Zuno 的用户界面、默认路径、环境变量与扩展协议均使用 Zuno 身份。
 
 ## 构建与开发
 

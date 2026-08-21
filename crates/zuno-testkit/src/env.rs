@@ -8,14 +8,12 @@
 //!
 //! Two variables are set unconditionally, and they are part of how the crate's
 //! "never make a live call" invariant is enforced rather than merely asserted:
-//! `OPENCODE_DISABLE_AUTOUPDATE` and `OPENCODE_DISABLE_MODELS_FETCH`. A run that
+//! `ZUNO_DISABLE_AUTOUPDATE` and `ZUNO_DISABLE_MODELS_FETCH`. A run that
 //! reached the network for a models catalogue or a new release would be a live
 //! call, so the scripted environment forbids both at the process boundary.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-
-use zuno_paths::env::ZUNO_ENV_NAME_MAP;
 
 use tempfile::TempDir;
 
@@ -24,19 +22,19 @@ use crate::normalize::Normalizer;
 
 /// Where the run's SQLite database should live.
 ///
-/// Mirrors the three shapes `OPENCODE_DB` accepts in
+/// Mirrors the three shapes `ZUNO_DB` accepts in
 /// `packages/core/src/database/database.ts`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DbChoice {
-    /// `OPENCODE_DB=:memory:` — nothing touches the disk.
+    /// `ZUNO_DB=:memory:` — nothing touches the disk.
     Memory,
     /// A path under the scripted data directory, set as an absolute path.
     TempFile,
-    /// `OPENCODE_DB=<relative>` — exercises data-relative resolution.
+    /// `ZUNO_DB=<relative>` — exercises data-relative resolution.
     DataRelative(String),
     /// An absolute path chosen by the caller.
     Absolute(PathBuf),
-    /// Leave `OPENCODE_DB` unset and let the default location apply.
+    /// Leave `ZUNO_DB` unset and let the default location apply.
     Default,
 }
 
@@ -252,33 +250,28 @@ impl ScriptedEnv {
         env.insert("XDG_CACHE_HOME".to_owned(), display(&self.cache));
         env.insert("XDG_STATE_HOME".to_owned(), display(&self.state));
         env.insert("TMPDIR".to_owned(), display(&self.tmp));
-        env.insert("OPENCODE_TEST_HOME".to_owned(), display(&self.home));
-        env.insert("OPENCODE_DISABLE_AUTOUPDATE".to_owned(), "1".to_owned());
-        env.insert("OPENCODE_DISABLE_MODELS_FETCH".to_owned(), "1".to_owned());
+        env.insert("ZUNO_TEST_HOME".to_owned(), display(&self.home));
+        env.insert("ZUNO_DISABLE_AUTOUPDATE".to_owned(), "1".to_owned());
+        env.insert("ZUNO_DISABLE_MODELS_FETCH".to_owned(), "1".to_owned());
         match &self.db {
             DbChoice::Memory => {
-                env.insert("OPENCODE_DB".to_owned(), ":memory:".to_owned());
+                env.insert("ZUNO_DB".to_owned(), ":memory:".to_owned());
             }
             DbChoice::TempFile => {
                 env.insert(
-                    "OPENCODE_DB".to_owned(),
+                    "ZUNO_DB".to_owned(),
                     display(&self.data.join("scripted.db")),
                 );
             }
             DbChoice::DataRelative(rel) => {
-                env.insert("OPENCODE_DB".to_owned(), rel.clone());
+                env.insert("ZUNO_DB".to_owned(), rel.clone());
             }
             DbChoice::Absolute(path) => {
-                env.insert("OPENCODE_DB".to_owned(), display(path));
+                env.insert("ZUNO_DB".to_owned(), display(path));
             }
             DbChoice::Default => {}
         }
         env.extend(self.extra.iter().map(|(k, v)| (k.clone(), v.clone())));
-        for (legacy, zuno) in ZUNO_ENV_NAME_MAP {
-            if let Some(value) = env.get(legacy).cloned() {
-                env.entry(zuno.to_owned()).or_insert(value);
-            }
-        }
         env
     }
 
@@ -327,7 +320,7 @@ mod tests {
             "XDG_CACHE_HOME",
             "XDG_STATE_HOME",
             "TMPDIR",
-            "OPENCODE_TEST_HOME",
+            "ZUNO_TEST_HOME",
             "ZUNO_TEST_HOME",
         ] {
             let value = vars.get(key).unwrap_or_else(|| panic!("{key} must be set"));
@@ -341,7 +334,7 @@ mod tests {
             .keys()
             .filter(|k| {
                 !k.starts_with("XDG_")
-                    && !k.starts_with("OPENCODE_")
+                    && !k.starts_with("ZUNO_")
                     && !k.starts_with("ZUNO_")
                     && !matches!(k.as_str(), "HOME" | "TMPDIR" | "PATH")
             })
@@ -357,12 +350,11 @@ mod tests {
     fn network_reaching_features_are_disabled_for_every_run() {
         let vars = ScriptedEnv::new().expect("scripted env").env_vars();
         assert_eq!(
-            vars.get("OPENCODE_DISABLE_AUTOUPDATE").map(String::as_str),
+            vars.get("ZUNO_DISABLE_AUTOUPDATE").map(String::as_str),
             Some("1")
         );
         assert_eq!(
-            vars.get("OPENCODE_DISABLE_MODELS_FETCH")
-                .map(String::as_str),
+            vars.get("ZUNO_DISABLE_MODELS_FETCH").map(String::as_str),
             Some("1")
         );
         assert_eq!(
@@ -379,7 +371,7 @@ mod tests {
     fn every_db_choice_produces_the_documented_value() {
         let base = ScriptedEnv::new().expect("scripted env");
         assert_eq!(
-            base.env_vars().get("OPENCODE_DB").map(String::as_str),
+            base.env_vars().get("ZUNO_DB").map(String::as_str),
             Some(":memory:")
         );
         assert_eq!(
@@ -391,23 +383,19 @@ mod tests {
             .expect("scripted env")
             .with_db(DbChoice::DataRelative("sub/dir.db".to_owned()));
         assert_eq!(
-            rel.env_vars().get("OPENCODE_DB").map(String::as_str),
+            rel.env_vars().get("ZUNO_DB").map(String::as_str),
             Some("sub/dir.db")
         );
 
         let none = ScriptedEnv::new()
             .expect("scripted env")
             .with_db(DbChoice::Default);
-        assert!(!none.env_vars().contains_key("OPENCODE_DB"));
+        assert!(!none.env_vars().contains_key("ZUNO_DB"));
 
         let file = ScriptedEnv::new()
             .expect("scripted env")
             .with_db(DbChoice::TempFile);
-        let value = file
-            .env_vars()
-            .get("OPENCODE_DB")
-            .cloned()
-            .expect("db path");
+        let value = file.env_vars().get("ZUNO_DB").cloned().expect("db path");
         assert!(value.starts_with(&file.xdg_data().to_string_lossy().into_owned()));
     }
 
@@ -415,11 +403,11 @@ mod tests {
     fn caller_supplied_variables_win() {
         let env = ScriptedEnv::new()
             .expect("scripted env")
-            .set("OPENCODE_DB", "/explicit/path.db")
-            .set("OPENCODE_CONFIG_CONTENT", "{}");
+            .set("ZUNO_DB", "/explicit/path.db")
+            .set("ZUNO_CONFIG_CONTENT", "{}");
         let vars = env.env_vars();
         assert_eq!(
-            vars.get("OPENCODE_DB").map(String::as_str),
+            vars.get("ZUNO_DB").map(String::as_str),
             Some("/explicit/path.db")
         );
         assert_eq!(
@@ -427,7 +415,7 @@ mod tests {
             Some("/explicit/path.db")
         );
         assert_eq!(
-            vars.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+            vars.get("ZUNO_CONFIG_CONTENT").map(String::as_str),
             Some("{}")
         );
     }

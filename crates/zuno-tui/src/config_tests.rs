@@ -97,13 +97,13 @@ fn keys_owned_by_sibling_todos_are_tolerated_rather_than_rejected() {
     // `theme` and `attention` have since landed, so they are asserted rather than
     // merely tolerated.
     let config = TuiConfig::from_json_str(
-        r#"{ "theme": "opencode", "attention": { "enabled": true },
+        r#"{ "theme": "zuno", "attention": { "enabled": true },
              "plugin": ["acme/tui"], "plugin_enabled": { "acme/tui": true },
              "mouse": true }"#,
     )
     .expect("unknown keys are ignored, as Effect Schema does");
     assert_eq!(config.mouse, Some(true));
-    assert_eq!(config.theme(), Some("opencode"));
+    assert_eq!(config.theme(), Some("zuno"));
     assert_eq!(
         config.attention.and_then(|attention| attention.enabled),
         Some(true)
@@ -232,7 +232,7 @@ fn an_absent_theme_resolves_to_the_built_in_default() {
     let resolved = resolve("{}");
     assert_eq!(resolved.theme, DEFAULT_THEME);
     assert_eq!(
-        resolved.theme, "opencode",
+        resolved.theme, "zuno",
         "the default is spelled out so a rename of DEFAULT_THEME is a visible change here"
     );
 }

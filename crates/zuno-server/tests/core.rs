@@ -59,7 +59,7 @@ async fn core_non_empty_password_requires_matching_basic_credentials_on_every_ro
     assert_eq!(wrong_username.status(), StatusCode::UNAUTHORIZED);
 
     let authorized = app
-        .oneshot(request("/health", Some("Basic b3BlbmNvZGU6c2VjcmV0")))
+        .oneshot(request("/health", Some("Basic enVubzpzZWNyZXQ=")))
         .await
         .expect("the health handler responds");
     assert_eq!(authorized.status(), StatusCode::OK);
@@ -81,7 +81,7 @@ async fn core_directory_header_and_query_forms_reach_extension_routes() {
         .oneshot(
             Request::builder()
                 .uri("/core/directory")
-                .header("x-opencode-directory", "%2Fworkspace%2Fheader")
+                .header("x-zuno-directory", "%2Fworkspace%2Fheader")
                 .body(Body::empty())
                 .expect("the header request is valid"),
         )
@@ -99,7 +99,7 @@ async fn core_directory_header_and_query_forms_reach_extension_routes() {
         .oneshot(
             Request::builder()
                 .uri("/core/directory?directory=%252Fworkspace%252Fquery")
-                .header("x-opencode-directory", "%2Fworkspace%2Fheader")
+                .header("x-zuno-directory", "%2Fworkspace%2Fheader")
                 .body(Body::empty())
                 .expect("the query request is valid"),
         )
@@ -138,7 +138,7 @@ async fn core_non_loopback_without_password_is_refused_before_binding() {
     let message = error.to_string();
     assert!(message.contains("--hostname"), "{message}");
     assert!(message.contains("expose"), "{message}");
-    assert!(message.contains("OPENCODE_SERVER_PASSWORD"), "{message}");
+    assert!(message.contains("ZUNO_SERVER_PASSWORD"), "{message}");
 }
 
 #[tokio::test]

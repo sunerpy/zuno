@@ -79,7 +79,7 @@ pub(super) async fn connect_transport(
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {},
-                "clientInfo": { "name": "opencode", "version": env!("CARGO_PKG_VERSION") },
+                "clientInfo": { "name": crate::CLIENT_NAME, "version": env!("CARGO_PKG_VERSION") },
             }),
         )
         .await?;

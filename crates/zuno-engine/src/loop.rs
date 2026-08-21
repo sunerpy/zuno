@@ -20,6 +20,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
+use uuid::Uuid;
+use zuno_db::inbox::SessionInbox;
 use zuno_db::message::{
     MessageRecord, MessageRole, MessageStore, MessageWithParts, PartKind, PartRecord,
     created_after, now_millis,
@@ -35,10 +37,11 @@ use zuno_llm::sse::{StreamLimits, append_tool_input};
 use zuno_tool::{ToolDefinition, ToolOutput};
 
 use crate::hooks::{HookMessageWithParts, NoopHooks, RequestHookInput, TurnHooks};
-use crate::interrupt::InterruptSignal;
+use crate::interrupt::{InterruptSignal, SoftInterruptMessage};
 use crate::retry::{
     PROVIDER_RETRY_MAX_ATTEMPTS, ProviderRetryError, ProviderRetryPolicy, retry_provider,
 };
+use crate::status::SessionRunGuard;
 
 /// Maximum queued transitions before the turn applies lossless backpressure.
 pub const TURN_EVENT_CHANNEL_CAPACITY: usize = 64;
@@ -445,6 +448,12 @@ pub struct TurnContext<'a> {
     dispatcher: &'a dyn ToolDispatcher,
     interrupt: &'a InterruptSignal,
     hooks: Arc<dyn TurnHooks>,
+    live_inputs: Option<LiveInputs<'a>>,
+}
+
+struct LiveInputs<'a> {
+    guard: &'a SessionRunGuard,
+    inbox: &'a SessionInbox,
 }
 
 impl<'a> TurnContext<'a> {
@@ -463,12 +472,20 @@ impl<'a> TurnContext<'a> {
             dispatcher,
             interrupt,
             hooks: Arc::new(NoopHooks),
+            live_inputs: None,
         }
     }
 
     #[must_use]
     pub fn with_hooks(mut self, hooks: Arc<dyn TurnHooks>) -> Self {
         self.hooks = hooks;
+        self
+    }
+
+    /// Enable durable soft-input injection for a live session lease.
+    #[must_use]
+    pub fn with_live_inputs(mut self, guard: &'a SessionRunGuard, inbox: &'a SessionInbox) -> Self {
+        self.live_inputs = Some(LiveInputs { guard, inbox });
         self
     }
 }
@@ -708,7 +725,7 @@ impl StepAccumulator {
 /// this same loop and emits through the same bounded channel.
 pub async fn run_turn(
     request: RunTurnRequest,
-    context: TurnContext<'_>,
+    mut context: TurnContext<'_>,
     events: TurnEventSender,
 ) -> Result<TurnOutcome, TurnError> {
     let events = events.with_hooks(Arc::clone(&context.hooks));
@@ -1079,65 +1096,73 @@ pub async fn run_turn(
             })
             .await?;
 
-        for (call_index, call) in accumulator.calls.iter().cloned().enumerate() {
-            events
-                .send(TurnEvent::ToolDispatchStarted {
+        let mut injected = inject_live_inputs(&mut context, &request, &requested)?;
+        if !injected.skip_remaining_tools {
+            for (call_index, call) in accumulator.calls.iter().cloned().enumerate() {
+                events
+                    .send(TurnEvent::ToolDispatchStarted {
+                        step,
+                        call_id: call.id.clone(),
+                        name: call.name.clone(),
+                    })
+                    .await?;
+                let dispatch = context
+                    .dispatcher
+                    .dispatch(DispatchRequest {
+                        call: call.clone(),
+                        session_id: request.session_id.clone(),
+                        message_id: assistant_id.clone(),
+                        agent: agent.name.clone(),
+                        available_tools: Arc::clone(&locked_tools),
+                        interrupt: context.interrupt.clone(),
+                    })
+                    .await;
+                persist_tool_result(
+                    context.connection,
+                    &request,
                     step,
-                    call_id: call.id.clone(),
-                    name: call.name.clone(),
-                })
-                .await?;
-            let dispatch = context
-                .dispatcher
-                .dispatch(DispatchRequest {
-                    call: call.clone(),
-                    session_id: request.session_id.clone(),
-                    message_id: assistant_id.clone(),
-                    agent: agent.name.clone(),
-                    available_tools: Arc::clone(&locked_tools),
-                    interrupt: context.interrupt.clone(),
-                })
-                .await;
-            persist_tool_result(
-                context.connection,
-                &request,
-                step,
-                call_index,
-                &assistant_id,
-                &call,
-                &dispatch,
-            )?;
-            events
-                .send(TurnEvent::ToolDispatchCompleted {
-                    step,
-                    call_id: call.id.clone(),
-                    name: call.name,
-                    title: dispatch.output.title.clone(),
-                    output: dispatch.output.output.clone(),
-                    diff: dispatch
-                        .output
-                        .metadata
-                        .get("diff")
-                        .and_then(serde_json::Value::as_str)
-                        .filter(|patch| !patch.is_empty())
-                        .map(str::to_owned),
-                    written_paths: dispatch
-                        .output
-                        .written_paths()
-                        .into_iter()
-                        .map(str::to_owned)
-                        .collect(),
-                    is_error: dispatch.is_error,
-                })
-                .await?;
-            events
-                .send(TurnEvent::ToolResultAppended {
-                    step,
-                    call_id: call.id,
-                    is_error: dispatch.is_error,
-                })
-                .await?;
+                    call_index,
+                    &assistant_id,
+                    &call,
+                    &dispatch,
+                )?;
+                events
+                    .send(TurnEvent::ToolDispatchCompleted {
+                        step,
+                        call_id: call.id.clone(),
+                        name: call.name,
+                        title: dispatch.output.title.clone(),
+                        output: dispatch.output.output.clone(),
+                        diff: dispatch
+                            .output
+                            .metadata
+                            .get("diff")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|patch| !patch.is_empty())
+                            .map(str::to_owned),
+                        written_paths: dispatch
+                            .output
+                            .written_paths()
+                            .into_iter()
+                            .map(str::to_owned)
+                            .collect(),
+                        is_error: dispatch.is_error,
+                    })
+                    .await?;
+                events
+                    .send(TurnEvent::ToolResultAppended {
+                        step,
+                        call_id: call.id,
+                        is_error: dispatch.is_error,
+                    })
+                    .await?;
+                injected.merge(inject_live_inputs(&mut context, &request, &requested)?);
+                if injected.skip_remaining_tools {
+                    break;
+                }
+            }
         }
+        injected.merge(inject_live_inputs(&mut context, &request, &requested)?);
 
         events
             .send(TurnEvent::StepCompleted {
@@ -1146,7 +1171,7 @@ pub async fn run_turn(
             })
             .await?;
 
-        if !accumulator.calls.is_empty() {
+        if !accumulator.calls.is_empty() || injected.count > 0 {
             continue;
         }
 
@@ -1161,6 +1186,101 @@ pub async fn run_turn(
             steps,
         });
     }
+}
+
+#[derive(Debug, Default)]
+struct InjectedLiveInputs {
+    count: usize,
+    skip_remaining_tools: bool,
+}
+
+impl InjectedLiveInputs {
+    fn merge(&mut self, other: Self) {
+        self.count = self.count.saturating_add(other.count);
+        self.skip_remaining_tools |= other.skip_remaining_tools;
+    }
+}
+
+fn inject_live_inputs(
+    context: &mut TurnContext<'_>,
+    request: &RunTurnRequest,
+    requested: &RequestedTurn,
+) -> Result<InjectedLiveInputs, TurnError> {
+    let Some(live) = context.live_inputs.as_ref() else {
+        return Ok(InjectedLiveInputs::default());
+    };
+    let delivery = live.guard.take_soft_interrupts_at_safe_point();
+    let mut injected = InjectedLiveInputs::default();
+    for message in delivery.messages {
+        if let Some(input_id) = message.input_id.as_deref()
+            && live
+                .inbox
+                .promote_id(&request.session_id, input_id)?
+                .is_none()
+        {
+            continue;
+        }
+        persist_live_input(context.connection, request, requested, &message)?;
+        injected.count = injected.count.saturating_add(1);
+        injected.skip_remaining_tools |= message.urgent;
+    }
+    Ok(injected)
+}
+
+fn persist_live_input(
+    connection: &Connection,
+    request: &RunTurnRequest,
+    requested: &RequestedTurn,
+    input: &SoftInterruptMessage,
+) -> Result<(), TurnError> {
+    let store = MessageStore::new(connection);
+    let latest = store.latest_time_created(&request.session_id)?;
+    let created = created_after(now_millis(), latest);
+    let message_id = input
+        .input_id
+        .clone()
+        .unwrap_or_else(|| format!("msg_{}", Uuid::new_v4().simple()));
+    let message = MessageRecord::from_json(json!({
+        "id": message_id,
+        "sessionID": request.session_id,
+        "role": "user",
+        "time": { "created": created },
+        "agent": requested.agent,
+        "model": {
+            "providerID": requested.provider_id,
+            "modelID": requested.model_id
+        }
+    }))?;
+    let mut parts = Vec::with_capacity(input.images.len().saturating_add(1));
+    parts.push(PartRecord::from_json(
+        json!({
+            "id": format!("prt_{}", Uuid::new_v4().simple()),
+            "sessionID": request.session_id,
+            "messageID": message.id,
+            "type": "text",
+            "text": input.content
+        }),
+        created,
+    )?);
+    for (media_type, data) in &input.images {
+        parts.push(PartRecord::from_json(
+            json!({
+                "id": format!("prt_{}", Uuid::new_v4().simple()),
+                "sessionID": request.session_id,
+                "messageID": message.id,
+                "type": "file",
+                "mime": media_type,
+                "data": data,
+                "url": format!("data:{media_type};base64,{data}")
+            }),
+            created,
+        )?);
+    }
+    store.put_message_at(&message, created)?;
+    for part in parts {
+        store.put_part_at(&part, created)?;
+    }
+    Ok(())
 }
 
 fn touch_session(connection: &mut Connection, session_id: &str) -> Result<(), TurnError> {

@@ -2,7 +2,7 @@
 //!
 //! Every test here reads `tests/fixtures/models-dev-pinned.json` and never the
 //! network. The fixture is a verbatim subset of a real
-//! `https://models.opencode.ai/api.json` response — seven providers chosen because
+//! `https://models.dev/api.json` response — seven providers chosen because
 //! between them they exercise every shape the resolver has to handle:
 //!
 //! | provider | why it is in the fixture |

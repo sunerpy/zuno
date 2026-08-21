@@ -216,7 +216,7 @@ async fn the_task_tool_registers_in_its_upstream_slot_and_resolves() {
     let workspace = tempfile::tempdir().expect("a temp workspace");
     let file_tools = FileTools::new(workspace.path()).expect("file tools");
     let mut builder =
-        ToolRegistryBuilder::new(workspace.path(), None, file_tools, RegistryFlags::default());
+        ToolRegistryBuilder::new(workspace.path(), file_tools, RegistryFlags::default());
     builder
         .register_builtin(
             BuiltinSlot::Task,

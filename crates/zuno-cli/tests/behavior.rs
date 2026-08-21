@@ -17,7 +17,6 @@ fn isolated(command: &mut Command, root: &Path) {
         .env("XDG_STATE_HOME", root.join("state"))
         .env("ZUNO_DISABLE_AUTOUPDATE", "true")
         .env("ZUNO_DISABLE_MODELS_FETCH", "true")
-        .env("ZUNO_DISABLE_DEFAULT_PLUGINS", "true")
         .env("ZUNO_DISABLE_LSP_DOWNLOAD", "true");
 }
 
@@ -35,7 +34,7 @@ fn models_fixture() -> PathBuf {
 fn configure_models(command: &mut Command) {
     command
         .env("ZUNO_MODELS_PATH", models_fixture())
-        .env("OPENCODE_CONFIG_CONTENT", r#"{"provider":{"anyapi":{}}}"#);
+        .env("ZUNO_CONFIG_CONTENT", r#"{"provider":{"anyapi":{}}}"#);
 }
 
 #[test]
@@ -273,8 +272,8 @@ fn debug_config_emits_only_resolved_json() {
         .args(["debug", "config"])
         .current_dir(root.path())
         .env(
-            "OPENCODE_CONFIG_CONTENT",
-            r#"{"username":"debug-user","share":"disabled","plugin":["probe-plugin@1.0.0"]}"#,
+            "ZUNO_CONFIG_CONTENT",
+            r#"{"username":"debug-user","share":"disabled","web_search":{"provider":"exa","max_queries":3,"max_results":7,"timeout_ms":12000}}"#,
         );
     isolated(&mut command, root.path());
     let output = command.output().expect("debug config");
@@ -287,14 +286,14 @@ fn debug_config_emits_only_resolved_json() {
         serde_json::from_slice(&output.stdout).expect("stdout contains only JSON");
     assert_eq!(config["username"], "debug-user");
     assert_eq!(config["share"], "disabled");
-    assert_eq!(config["plugin"], serde_json::json!(["probe-plugin@1.0.0"]));
     assert_eq!(
-        config["plugin_origins"],
-        serde_json::json!([{
-            "spec": "probe-plugin@1.0.0",
-            "source": "OPENCODE_CONFIG_CONTENT",
-            "scope": "local"
-        }])
+        config["web_search"],
+        serde_json::json!({
+            "provider": "exa",
+            "max_queries": 3,
+            "max_results": 7,
+            "timeout_ms": 12000
+        })
     );
 }
 
@@ -319,10 +318,7 @@ fn debug_config_includes_runtime_markdown_agents_and_commands() {
     .expect("command markdown");
 
     let mut command = zuno();
-    command
-        .args(["debug", "config"])
-        .current_dir(root.path())
-        .env("ZUNO_PURE", "1");
+    command.args(["debug", "config"]).current_dir(root.path());
     isolated(&mut command, root.path());
     let output = command.output().expect("debug config");
     assert!(

@@ -604,7 +604,7 @@ fn conditional_the_exposed_set_matches_the_measured_binary_for_each_case() {
     let cases: &[MeasuredCase] = &[
         // case 1: a bare invocation.
         (&[], &["invalid", "question", "todowrite"]),
-        // case 2: OPENCODE_CLIENT=tui.
+        // case 2: ZUNO_CLIENT=tui.
         (&[(ENV_CLIENT, "tui")], &["invalid", "todowrite"]),
         // case 3: tui with the question override.
         (

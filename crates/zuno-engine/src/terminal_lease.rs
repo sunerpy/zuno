@@ -2,13 +2,11 @@
 //!
 //! # The deadlock this exists to prevent
 //!
-//! A plugin's compat host is a `bun`/`node` child process, and real plugins prompt
-//! on stdin: kiro@0.18.0 uses `node:readline/promises` for its interactive OAuth
-//! code entry. Meanwhile the Rust TUI holds the same TTY in raw mode inside the
-//! alternate screen, consuming every keystroke. Run both at once and the child waits
-//! forever for a line it will never receive while the user's typing is eaten by a
-//! render loop. That is blocker B7/B11: a runtime deadlock class, not a rendering
-//! glitch.
+//! An external editor, authentication flow, or subprocess may need cooked stdin
+//! while the Rust TUI owns the same TTY in raw mode inside the alternate screen.
+//! Run both at once and the subprocess waits forever for a line it will never
+//! receive while the render loop consumes the user's typing. This is a runtime
+//! deadlock, not a rendering glitch.
 //!
 //! The fix is a lease. Exactly one party may hold the terminal; a host asks for it,
 //! the owner suspends and yields the TTY, the host prompts, and the lease is
@@ -18,19 +16,17 @@
 //!
 //! # Why the protocol lives here and not in `zuno-tui`
 //!
-//! Both sides speak it: `zuno-plugin` acquires, `zuno-tui` grants. Putting it in
-//! `zuno-tui` would force `zuno-plugin -> zuno-tui`, i.e. the plugin host would depend on
-//! ratatui in order to ask for stdin. `zuno-engine` is already below `zuno-plugin`, and
-//! `zuno-tui` can depend on it when todo 73 implements the real owner, so this crate
-//! is the only place the edge points the right way for both. Same reasoning as
-//! [`zuno_tool::InterruptHandle`]: the lower crate names the operations, the higher
-//! crate supplies the implementation.
+//! Both sides speak it: a requester acquires and `zuno-tui` grants. Putting the
+//! protocol in `zuno-tui` would force every terminal client to depend on ratatui
+//! merely to ask for stdin. `zuno-engine` is below both the clients and the TUI,
+//! so it owns the state machine while higher crates provide concrete terminal
+//! transitions.
 //!
 //! A consequence worth stating: **nothing here touches a terminal.** No `crossterm`,
 //! no ioctl, no `isatty`. This module is the state machine and the vocabulary; the
-//! two physical transitions belong to [`TerminalOwner`], and todo 73 implements them
-//! over ratatui. That is what lets the plugin wave prove its half against
-//! `zuno_testkit::FakeTerminalOwner` with no TTY in the picture at all.
+//! two physical transitions belong to [`TerminalOwner`]. This separation lets
+//! clients prove their behavior against `zuno_testkit::FakeTerminalOwner` without
+//! requiring a real TTY.
 //!
 //! # Shape
 //!
@@ -65,30 +61,30 @@ use tokio::sync::oneshot;
 ///
 /// Sized for the thing that actually holds it: a human reading a device code off a
 /// browser and typing it back. Five minutes is generous for that and still short
-/// enough that a wedged plugin does not strand the session. Override with
+/// enough that a wedged requester does not strand the session. Override with
 /// [`TerminalBroker::with_timeout`]; tests must, so that no test waits a production
 /// interval.
 pub const DEFAULT_LEASE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Why a host wants the terminal, and on whose behalf.
 ///
-/// The plugin name is carried separately from the human-readable purpose because the
+/// The requester name is carried separately from the human-readable purpose because the
 /// force-reclaim diagnostic has to name a culprit. "A lease expired" is not
-/// actionable; "plugin `kiro` did not release it" is.
+/// actionable; "requester `kiro` did not release it" is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseReason {
-    /// The plugin the lease is granted to. Appears in every diagnostic.
-    pub plugin: String,
+    /// The requester the lease is granted to. Appears in every diagnostic.
+    pub requester: String,
     /// What it is about to do, phrased for a user who sees the TUI step aside.
     pub purpose: String,
 }
 
 impl LeaseReason {
-    /// A reason naming the plugin and its purpose.
+    /// A reason naming the requester and its purpose.
     #[must_use]
-    pub fn new(plugin: impl Into<String>, purpose: impl Into<String>) -> Self {
+    pub fn new(requester: impl Into<String>, purpose: impl Into<String>) -> Self {
         Self {
-            plugin: plugin.into(),
+            requester: requester.into(),
             purpose: purpose.into(),
         }
     }
@@ -96,7 +92,7 @@ impl LeaseReason {
 
 impl fmt::Display for LeaseReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "plugin `{}` ({})", self.plugin, self.purpose)
+        write!(f, "requester `{}` ({})", self.requester, self.purpose)
     }
 }
 
@@ -107,15 +103,15 @@ pub enum TerminalLeaseError {
     ///
     /// Refusal, not queueing — see [`TerminalBroker`] for the argument.
     #[error(
-        "the terminal is held by plugin `{holder}` ({holder_purpose}); \
-         plugin `{requested_by}` cannot prompt until it is released"
+        "the terminal is held by requester `{holder}` ({holder_purpose}); \
+         requester `{requested_by}` cannot prompt until it is released"
     )]
     Busy {
-        /// The plugin currently holding the lease.
+        /// The requester currently holding the lease.
         holder: String,
         /// What the holder said it was doing.
         holder_purpose: String,
-        /// The plugin that was refused.
+        /// The requester that was refused.
         requested_by: String,
     },
 
@@ -124,9 +120,9 @@ pub enum TerminalLeaseError {
     /// Distinct from [`Self::Busy`]: nobody holds the lease, the terminal itself is
     /// unavailable — no TTY, a render loop that will not stop, a mode restore that
     /// failed. The host must not prompt.
-    #[error("plugin `{requested_by}` was not given the terminal: {detail}")]
+    #[error("requester `{requested_by}` was not given the terminal: {detail}")]
     Unavailable {
-        /// The plugin that asked.
+        /// The requester that asked.
         requested_by: String,
         /// The owner's explanation, rendered into the message.
         detail: String,
@@ -159,9 +155,9 @@ impl ReclaimCause {
 /// can read [`fmt::Display`] without the two drifting apart.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForcedReclaim {
-    /// The plugin that failed to release. The point of the whole type.
-    pub plugin: String,
-    /// What the plugin said it was doing when it took the lease.
+    /// The requester that failed to release. The point of the whole type.
+    pub requester: String,
+    /// What the requester said it was doing when it took the lease.
     pub purpose: String,
     /// The deadline it blew.
     pub timeout: Duration,
@@ -171,9 +167,9 @@ impl fmt::Display for ForcedReclaim {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "plugin `{}` held the terminal for `{}` past its {} ms deadline \
+            "requester `{}` held the terminal for `{}` past its {} ms deadline \
              and did not release it; the terminal was reclaimed by force",
-            self.plugin,
+            self.requester,
             self.purpose,
             self.timeout.as_millis()
         )
@@ -321,7 +317,7 @@ impl SharedSlot {
             _ => return None,
         };
         let diagnostic = ForcedReclaim {
-            plugin: held.reason.plugin.clone(),
+            requester: held.reason.requester.clone(),
             purpose: held.reason.purpose.clone(),
             timeout: held.timeout,
         };
@@ -388,11 +384,11 @@ impl SharedSlot {
 ///    typing into a device-code field. A second prompt that appears whenever the
 ///    first happens to finish arrives with no context, on a terminal the user has
 ///    since moved on from, and is indistinguishable from the first. Refusing lets the
-///    host say "another plugin is prompting" *now*.
+///    host say "another requester is prompting" *now*.
 /// 2. **Queueing hides the deadlock this module removes.** A host that never releases
 ///    would make every later acquirer block, so the symptom would again be a hang —
 ///    one level further out — and the force-reclaim would only free the head of the
-///    queue. A refusal is observable at the call site, which is where a plugin author
+///    queue. A refusal is observable at the call site, which is where a requester author
 ///    can act on it.
 /// 3. **Preemption corrupts the thing being protected.** Revoking a lease mid-prompt
 ///    yanks the terminal out from under half-typed input. Preemption is reserved for
@@ -402,7 +398,7 @@ impl SharedSlot {
 ///
 /// # Two paths reclaim an expired lease, and that is deliberate
 ///
-/// A watchdog task fires at the deadline, so a wedged plugin is reclaimed even when
+/// A watchdog task fires at the deadline, so a wedged requester is reclaimed even when
 /// nothing else ever happens. And `acquire` sweeps an expired holder before deciding
 /// busy-or-grant, so a leaked guard cannot wedge the terminal permanently even if the
 /// watchdog never ran — no Tokio runtime at acquire time, a runtime shut down while
@@ -454,13 +450,13 @@ impl TerminalBroker {
         self.shared.locked().is_some()
     }
 
-    /// The plugin holding the lease, if one is.
+    /// The requester holding the lease, if one is.
     #[must_use]
     pub fn holder(&self) -> Option<String> {
         self.shared
             .locked()
             .as_ref()
-            .map(|held| held.reason.plugin.clone())
+            .map(|held| held.reason.requester.clone())
     }
 
     /// Reclaims the lease if its deadline has passed, returning the diagnostic raised.
@@ -480,9 +476,9 @@ impl TerminalBroker {
 
         if let Some(held) = self.shared.locked().as_ref() {
             return Err(TerminalLeaseError::Busy {
-                holder: held.reason.plugin.clone(),
+                holder: held.reason.requester.clone(),
                 holder_purpose: held.reason.purpose.clone(),
-                requested_by: reason.plugin.clone(),
+                requested_by: reason.requester.clone(),
             });
         }
 
@@ -491,7 +487,7 @@ impl TerminalBroker {
             .yield_terminal(&reason)
             .await
             .map_err(|detail| TerminalLeaseError::Unavailable {
-                requested_by: reason.plugin.clone(),
+                requested_by: reason.requester.clone(),
                 detail,
             })?;
 
@@ -500,9 +496,9 @@ impl TerminalBroker {
             let mut slot = self.shared.locked();
             if let Some(held) = slot.as_ref() {
                 let error = TerminalLeaseError::Busy {
-                    holder: held.reason.plugin.clone(),
+                    holder: held.reason.requester.clone(),
                     holder_purpose: held.reason.purpose.clone(),
-                    requested_by: reason.plugin.clone(),
+                    requested_by: reason.requester.clone(),
                 };
                 drop(slot);
                 self.shared
@@ -603,7 +599,7 @@ impl TerminalLeaseGuard {
 impl fmt::Debug for TerminalLeaseGuard {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TerminalLeaseGuard")
-            .field("plugin", &self.reason.plugin)
+            .field("requester", &self.reason.requester)
             .field("purpose", &self.reason.purpose)
             .field("reclaimed", &self.was_reclaimed())
             .finish_non_exhaustive()
@@ -637,7 +633,7 @@ mod tests {
 
     /// The smallest owner that can prove ordering: an append-only transition log.
     /// `zuno_testkit::FakeTerminalOwner` is the same idea plus the waiting helpers the
-    /// plugin wave needs; this one stays here so the protocol's own tests do not
+    /// requester wave needs; this one stays here so the protocol's own tests do not
     /// depend on a crate above it.
     struct RecordingOwner {
         log: Arc<Mutex<Vec<String>>>,
@@ -675,13 +671,13 @@ mod tests {
                 self.log
                     .lock()
                     .unwrap()
-                    .push(format!("refused {}", reason.plugin));
+                    .push(format!("refused {}", reason.requester));
                 return Err(detail.clone());
             }
             self.log
                 .lock()
                 .unwrap()
-                .push(format!("yield {}", reason.plugin));
+                .push(format!("yield {}", reason.requester));
             Ok(())
         }
 
@@ -693,7 +689,7 @@ mod tests {
             self.log
                 .lock()
                 .unwrap()
-                .push(format!("{tag} {}", reason.plugin));
+                .push(format!("{tag} {}", reason.requester));
         }
     }
 
@@ -817,9 +813,9 @@ mod tests {
             log_lines
                 .iter()
                 .any(|line| line.starts_with("reclaim-forced")
-                    && line.contains("plugin `kiro`")
+                    && line.contains("requester `kiro`")
                     && line.contains("did not release it")),
-            "the force-reclaim diagnostic must name the plugin: {log_lines:?}"
+            "the force-reclaim diagnostic must name the requester: {log_lines:?}"
         );
         assert!(leaked.was_reclaimed());
         drop(leaked);
@@ -888,7 +884,7 @@ mod tests {
         assert_eq!(broker.timeout(), NEVER);
         assert_eq!(
             guard.reason().to_string(),
-            "plugin `kiro` (device-code prompt)"
+            "requester `kiro` (device-code prompt)"
         );
     }
 
@@ -898,7 +894,7 @@ mod tests {
         assert!(!ReclaimCause::Released.is_forced());
         assert!(
             ReclaimCause::Deadline(ForcedReclaim {
-                plugin: "kiro".to_owned(),
+                requester: "kiro".to_owned(),
                 purpose: "device-code prompt".to_owned(),
                 timeout: Duration::from_millis(25),
             })

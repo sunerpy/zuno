@@ -9,7 +9,6 @@ use crate::schema::lsp::{BUILTIN_SERVER_IDS, LspConfig};
 use crate::schema::mcp::{McpOauth, McpServerConfig};
 use crate::schema::ordered::False;
 use crate::schema::permission::{PermissionAction, PermissionConfig, PermissionRule};
-use crate::schema::plugin::PluginSpec;
 use crate::schema::provider::Timeout;
 use crate::schema::reference::ReferenceEntry;
 use serde_json::{Value, json};
@@ -450,20 +449,12 @@ fn references_is_a_three_way_union() {
 }
 
 #[test]
-fn plugin_entries_are_a_string_or_a_string_and_options() {
-    let config = parse_value(json!({
-        "plugin": ["bare@1.0.0", ["with-options", { "level": "verbose" }]]
-    }))
-    .expect("deserializes");
-    let plugins = config.plugin.as_ref().expect("plugin present");
-    assert!(matches!(plugins[0], PluginSpec::Name(_)));
-    assert_eq!(plugins[0].name(), "bare@1.0.0");
-    assert!(plugins[0].options().is_none());
-    assert!(matches!(plugins[1], PluginSpec::WithOptions(..)));
-    assert_eq!(
-        plugins[1].options().expect("options")["level"],
-        json!("verbose")
-    );
+fn retired_plugin_keys_fail_at_the_config_boundary() {
+    for key in ["plugin", "plugin_runtime"] {
+        let error =
+            parse_value(json!({ key: [] })).expect_err("retired plugin key must be rejected");
+        assert_eq!(issue_path(&error), key);
+    }
 }
 
 #[test]
@@ -795,9 +786,6 @@ fn the_key_path_reaches_through_maps_and_arrays() {
         "provider.anthropic.models.m.limit.context"
     );
 
-    let error = parse_value(json!({ "plugin": ["ok", 7] })).expect_err("7 is not a plugin");
-    assert_eq!(issue_path(&error), "plugin.1");
-
     let error = parse_value(json!({
         "experimental": { "policies": [{ "action": "provider.use", "effect": "maybe", "resource": "*" }] }
     }))
@@ -827,7 +815,7 @@ fn malformed_json_is_reported_as_json_not_validation() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn the_documented_examples_all_deserialize() {
+fn the_curated_config_examples_all_deserialize() {
     let dir = PathBuf::from(FIXTURES).join("docs");
     let mut names: Vec<PathBuf> = std::fs::read_dir(&dir)
         .expect("docs fixtures exist")
@@ -837,8 +825,8 @@ fn the_documented_examples_all_deserialize() {
     names.sort();
     assert_eq!(
         names.len(),
-        33,
-        "every opencode.json block from config.mdx must be present"
+        32,
+        "the curated config example corpus must not silently shrink"
     );
     for path in &names {
         let text = std::fs::read_to_string(path).expect("readable");
@@ -868,7 +856,6 @@ fn the_real_user_config_deserializes() {
     assert!(after.get("theme").is_none(), "theme must not survive");
     assert_contains(&after, &before, "user-config.json");
     assert!(config.mcp.as_ref().expect("mcp present").len() >= 8);
-    assert!(config.plugin.as_ref().expect("plugin present").len() == 3);
     // `permission.todoread` is not one of the oracle's named keys and must survive.
     let Some(PermissionConfig::Object(permission)) = &config.permission else {
         panic!("expected the object arm");

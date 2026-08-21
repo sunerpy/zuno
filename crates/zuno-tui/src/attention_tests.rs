@@ -397,7 +397,7 @@ fn attention_a_missing_sound_pack_degrades_to_notification_only_with_a_diagnosti
     );
     assert_eq!(
         outcome.diagnostics[0].to_string(),
-        "sound pack \"opencode.default\" has no done sound and none is configured under `attention.sounds.done`; notifying without audio"
+        "sound pack \"zuno.default\" has no done sound and none is configured under `attention.sounds.done`; notifying without audio"
     );
     assert_eq!(
         player.count(),
@@ -437,7 +437,7 @@ fn attention_an_unregistered_pack_name_is_reported_and_falls_back() {
     );
     assert_eq!(
         outcome.diagnostics[0].to_string(),
-        "no sound pack named \"acme.chimes\" is registered (available: \"opencode.default\"); falling back to \"opencode.default\""
+        "no sound pack named \"acme.chimes\" is registered (available: \"zuno.default\"); falling back to \"zuno.default\""
     );
 }
 
@@ -553,7 +553,7 @@ fn attention_the_next_candidate_is_tried_when_one_will_not_play() {
 fn attention_the_builtin_pack_is_registered_and_empty() {
     let pack = builtin_pack();
     assert_eq!(pack.id(), DEFAULT_PACK_ID);
-    assert_eq!(pack.name(), Some("OpenCode Default"));
+    assert_eq!(pack.name(), Some("Zuno Default"));
     assert!(
         pack.is_empty(),
         "this crate ships no audio; see the module header for why and for how to supply a pack"
@@ -567,7 +567,7 @@ fn attention_the_builtin_pack_is_registered_and_empty() {
         attention.packs(),
         vec![SoundPackInfo {
             id: DEFAULT_PACK_ID.to_owned(),
-            name: Some("OpenCode Default".to_owned()),
+            name: Some("Zuno Default".to_owned()),
             active: true,
             builtin: true,
         }]
@@ -912,9 +912,9 @@ fn attention_an_empty_message_is_a_skip_and_reaches_no_channel() {
 #[test]
 fn attention_the_osc_notifier_writes_one_notification_sequence() {
     let notifier = OscNotifier::new(Vec::<u8>::new());
-    assert!(notifier.notify("opencode", "Session done"));
+    assert!(notifier.notify("zuno", "Session done"));
     let written = String::from_utf8(notifier.into_inner()).expect("utf-8");
-    assert_eq!(written, "\u{1b}]777;notify;opencode;Session done\u{1b}\\");
+    assert_eq!(written, "\u{1b}]777;notify;zuno;Session done\u{1b}\\");
 }
 
 #[test]

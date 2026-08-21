@@ -8,11 +8,11 @@
 //! Two things make these tests deterministic rather than dependent on the developer's
 //! shell:
 //!
-//! - Both `OPENCODE_*` variables are explicitly removed from the child's environment
-//!   before the case's own values are applied, so an ambient `OPENCODE_LOG_LEVEL`
+//! - Both `ZUNO_*` variables are explicitly removed from the child's environment
+//!   before the case's own values are applied, so an ambient `ZUNO_LOG_LEVEL`
 //!   cannot change a result.
 //! - The probe defaults to `Rotation::Never`, so the file it writes is always
-//!   `opencode.log` and never depends on today's date.
+//!   `zuno.log` and never depends on today's date.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -114,7 +114,7 @@ fn run_probe(env: &[(&str, &str)]) -> ProbeRun {
     }
 
     let output = command.output().expect("the probe binary runs");
-    let log_path = log_dir.join("opencode.log");
+    let log_path = log_dir.join("zuno.log");
     let log = std::fs::read_to_string(&log_path).unwrap_or_default();
 
     ProbeRun {
@@ -212,7 +212,7 @@ fn stdout_stays_pure_even_with_the_terminal_sink_enabled() {
 
 /// `packages/core/src/observability/logging.ts:68` compares with `=== "1"`, not
 /// through the `truthy()` helper at `packages/core/src/flag/flag.ts:3-6` that most
-/// other `OPENCODE_*` booleans use. `OPENCODE_PRINT_LOGS=true` therefore must not
+/// other `ZUNO_*` booleans use. `ZUNO_PRINT_LOGS=true` therefore must not
 /// enable printing. Matching `truthy()` here would be a silent divergence, and this
 /// is the test that would catch it.
 #[test]
@@ -230,7 +230,7 @@ fn print_logs_accepts_only_the_literal_one() {
         assert!(run.success, "probe failed.\nstderr:\n{}", run.stderr);
         assert!(
             !run.stderr.contains("probe-info"),
-            "OPENCODE_PRINT_LOGS={rejected:?} must not enable printing; the oracle \
+            "ZUNO_PRINT_LOGS={rejected:?} must not enable printing; the oracle \
              compares with === \"1\".\nstderr:\n{}",
             run.stderr
         );
@@ -283,20 +283,20 @@ fn the_log_level_environment_variable_follows_the_oracle() {
         assert_eq!(
             ready["params"]["level"].as_str(),
             Some(resolved),
-            "OPENCODE_LOG_LEVEL={value:?} should resolve to {resolved}"
+            "ZUNO_LOG_LEVEL={value:?} should resolve to {resolved}"
         );
 
         for marker in present {
             assert!(
                 run.log.contains(marker),
-                "OPENCODE_LOG_LEVEL={value:?} should record {marker}.\nfile:\n{}",
+                "ZUNO_LOG_LEVEL={value:?} should record {marker}.\nfile:\n{}",
                 run.log
             );
         }
         for marker in absent {
             assert!(
                 !run.log.contains(marker),
-                "OPENCODE_LOG_LEVEL={value:?} should filter out {marker}.\nfile:\n{}",
+                "ZUNO_LOG_LEVEL={value:?} should filter out {marker}.\nfile:\n{}",
                 run.log
             );
         }
@@ -321,7 +321,7 @@ fn trace_is_reachable_only_through_programmatic_directives() {
     );
     assert!(
         !via_env.log.contains("probe-trace"),
-        "OPENCODE_LOG_LEVEL=TRACE must not enable trace; the oracle maps it to INFO"
+        "ZUNO_LOG_LEVEL=TRACE must not enable trace; the oracle maps it to INFO"
     );
 
     let via_directives = run_probe(&[("ZUNO_PROBE_DIRECTIVES", "trace")]);
@@ -452,11 +452,11 @@ fn the_rotating_policy_writes_a_dated_file_in_the_configured_directory() {
     );
     let name = &files[0];
     assert!(
-        name.starts_with("opencode.") && name.ends_with(".log"),
-        "the rotating file name should be opencode.<date>.log, got {name:?}"
+        name.starts_with("zuno.") && name.ends_with(".log"),
+        "the rotating file name should be zuno.<date>.log, got {name:?}"
     );
     assert_ne!(
-        name, "opencode.log",
+        name, "zuno.log",
         "the daily policy must add a date component"
     );
 

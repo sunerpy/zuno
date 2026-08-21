@@ -274,7 +274,7 @@ impl Diagnostic {
                 self.server
             ),
             ServerStatus::NeedsAuth => format!(
-                "MCP server {} requires authentication and contributes no tools: run `opencode mcp auth {}`",
+                "MCP server {} requires authentication and contributes no tools: run `zuno mcp auth {}`",
                 self.server, self.server
             ),
             ServerStatus::NeedsClientRegistration { error } => format!(

@@ -173,14 +173,10 @@ struct Titled {
 ///
 /// # Why a projection and not a turn event
 ///
-/// The name is produced by the turn prelude, which runs on the driver task, while the
-/// panel is drawn on the render loop — so something has to cross that boundary. The
-/// obvious route was a new `zuno_engine::r#loop::TurnEvent` variant, and it was tried and
-/// withdrawn: `TurnEvent` is matched exhaustively by
-/// `zuno_plugin::jsonrpc::event_value`, which is the **plugin ABI** event codec. A new
-/// variant there is a change to the one compatibility surface this project promises to
-/// keep, spent on a fact no plugin asked for. This carries the same information between
-/// the same two tasks without touching that surface.
+/// The name is produced by the turn prelude on the driver task while the panel is
+/// drawn on the render loop, so the value must cross task ownership. A projection
+/// carries that state without widening the turn event stream with presentation-only
+/// data.
 ///
 /// # The counter exists because a wake alone paints nothing
 ///

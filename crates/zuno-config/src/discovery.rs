@@ -19,15 +19,12 @@ use std::path::{Path, PathBuf};
 use zuno_error::ConfigError;
 use zuno_paths::{CONFIG_FILE_STEM, Env, Layout};
 
-/// The schema reference injected into file-backed config layers.
-pub const DEFAULT_SCHEMA: &str = "https://opencode.ai/config.json";
-
-const OPENCODE_CONFIG: &str = "OPENCODE_CONFIG";
-const OPENCODE_CONFIG_CONTENT: &str = "OPENCODE_CONFIG_CONTENT";
-const OPENCODE_PERMISSION: &str = "OPENCODE_PERMISSION";
-const OPENCODE_DISABLE_AUTOCOMPACT: &str = "OPENCODE_DISABLE_AUTOCOMPACT";
-const OPENCODE_DISABLE_PRUNE: &str = "OPENCODE_DISABLE_PRUNE";
-const OPENCODE_TEST_MANAGED_CONFIG_DIR: &str = "OPENCODE_TEST_MANAGED_CONFIG_DIR";
+const ZUNO_CONFIG: &str = "ZUNO_CONFIG";
+const ZUNO_CONFIG_CONTENT: &str = "ZUNO_CONFIG_CONTENT";
+const ZUNO_PERMISSION: &str = "ZUNO_PERMISSION";
+const ZUNO_DISABLE_AUTOCOMPACT: &str = "ZUNO_DISABLE_AUTOCOMPACT";
+const ZUNO_DISABLE_PRUNE: &str = "ZUNO_DISABLE_PRUNE";
+const ZUNO_TEST_MANAGED_CONFIG_DIR: &str = "ZUNO_TEST_MANAGED_CONFIG_DIR";
 const MERGED_CONFIG_SOURCE: &str = "<merged config>";
 
 /// A decoded macOS managed-preferences document and the plist it came from.
@@ -92,7 +89,7 @@ impl DiscoveryOptions {
     ) -> Self {
         let layout = Layout::resolve(&env);
         let managed_config_dir = env
-            .truthy_value(OPENCODE_TEST_MANAGED_CONFIG_DIR)
+            .truthy_value(ZUNO_TEST_MANAGED_CONFIG_DIR)
             .map(PathBuf::from)
             .unwrap_or_else(|| system_managed_config_dir(&env));
         Self {
@@ -174,7 +171,7 @@ pub fn discover_with(options: &DiscoveryOptions) -> Result<Config, ConfigError> 
     }
 
     // config.ts:401-404.
-    if let Some(path) = options.env.truthy_value(OPENCODE_CONFIG) {
+    if let Some(path) = options.env.truthy_value(ZUNO_CONFIG) {
         merge_file(&mut result, &resolve_from(&options.directory, path))?;
     }
 
@@ -188,7 +185,6 @@ pub fn discover_with(options: &DiscoveryOptions) -> Result<Config, ConfigError> 
     // config.ts:412-414. `mode` is intentionally absent from the v1.18.13 Rust
     // schema because the legacy-rejection task owns that deprecated key.
     result.insert_if_absent("agent", RawJson::empty_object());
-    result.insert_if_absent("plugin", RawJson::Array(Vec::new()));
 
     for directory in
         read_config_directories(&options.layout, &options.directory, options.worktree())
@@ -200,8 +196,8 @@ pub fn discover_with(options: &DiscoveryOptions) -> Result<Config, ConfigError> 
     result.insert_if_absent("command", RawJson::empty_object());
 
     // config.ts:468-475. This virtual layer does not receive schema injection.
-    if let Some(text) = options.env.truthy_value(OPENCODE_CONFIG_CONTENT) {
-        let layer = parse_layer(Path::new(OPENCODE_CONFIG_CONTENT), text, false)?;
+    if let Some(text) = options.env.truthy_value(ZUNO_CONFIG_CONTENT) {
+        let layer = parse_layer(Path::new(ZUNO_CONFIG_CONTENT), text)?;
         merge_config(&mut result, layer);
     }
 
@@ -215,12 +211,12 @@ pub fn discover_with(options: &DiscoveryOptions) -> Result<Config, ConfigError> 
     // config.ts:524-534. This assignment is deliberately after every other
     // config source, making it testably highest precedence even on Linux.
     if let Some(preferences) = managed_preferences(options) {
-        let layer = parse_layer(preferences.source(), preferences.text(), false)?;
+        let layer = parse_layer(preferences.source(), preferences.text())?;
         merge_config(&mut result, layer);
     }
 
     // config.ts:545-551: invalid JSON is ignored, valid JSON deep-merges last.
-    if let Some(permission) = options.env.truthy_value(OPENCODE_PERMISSION)
+    if let Some(permission) = options.env.truthy_value(ZUNO_PERMISSION)
         && let Ok(layer) = serde_json::from_str::<RawJson>(permission)
     {
         let target = result.entry_or_insert("permission", RawJson::empty_object());
@@ -349,9 +345,9 @@ fn reject_legacy_config_names(options: &DiscoveryOptions) -> Result<(), ConfigEr
 
 fn ensure_default_global_config(options: &DiscoveryOptions) -> Result<(), ConfigError> {
     if [
-        OPENCODE_CONFIG,
-        zuno_paths::env::OPENCODE_CONFIG_DIR,
-        OPENCODE_CONFIG_CONTENT,
+        ZUNO_CONFIG,
+        zuno_paths::env::ZUNO_CONFIG_DIR,
+        ZUNO_CONFIG_CONTENT,
     ]
     .iter()
     .any(|key| options.env.truthy_value(key).is_some())
@@ -396,7 +392,7 @@ fn ensure_default_global_config(options: &DiscoveryOptions) -> Result<(), Config
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let _ = fs::write(path, format!("{{\n  \"$schema\": \"{DEFAULT_SCHEMA}\"\n}}"));
+    let _ = fs::write(path, "{}\n");
     Ok(())
 }
 
@@ -432,12 +428,12 @@ fn merge_file(result: &mut RawJson, path: &Path) -> Result<(), ConfigError> {
         path: path.to_path_buf(),
         source,
     })?;
-    let layer = parse_layer(path, &text, true)?;
+    let layer = parse_layer(path, &text)?;
     merge_config(result, layer);
     Ok(())
 }
 
-fn parse_layer(path: &Path, text: &str, inject_schema: bool) -> Result<RawJson, ConfigError> {
+fn parse_layer(path: &Path, text: &str) -> Result<RawJson, ConfigError> {
     // Todo 9's variable substitution seam is immediately before this byte-stable
     // JSONC pass. Discovery itself deliberately does not interpret {env:...} or
     // {file:...} tokens.
@@ -594,30 +590,16 @@ fn apply_username(result: &mut RawJson, fallback: &str) {
 }
 
 fn apply_compaction_flags(result: &mut RawJson, env: &Env) {
-    if !env.flag(OPENCODE_DISABLE_AUTOCOMPACT) && !env.flag(OPENCODE_DISABLE_PRUNE) {
+    if !env.flag(ZUNO_DISABLE_AUTOCOMPACT) && !env.flag(ZUNO_DISABLE_PRUNE) {
         return;
     }
     let compaction = result.entry_or_insert("compaction", RawJson::empty_object());
-    if env.flag(OPENCODE_DISABLE_AUTOCOMPACT) {
+    if env.flag(ZUNO_DISABLE_AUTOCOMPACT) {
         compaction.insert("auto", RawJson::Bool(false));
     }
-    if env.flag(OPENCODE_DISABLE_PRUNE) {
+    if env.flag(ZUNO_DISABLE_PRUNE) {
         compaction.insert("prune", RawJson::Bool(false));
     }
-}
-
-fn write_schema_best_effort(path: &Path, text: &str) {
-    let Some(open) = text.find('{') else {
-        return;
-    };
-    if !text[..open].chars().all(char::is_whitespace) {
-        return;
-    }
-    let mut updated = String::with_capacity(text.len() + DEFAULT_SCHEMA.len() + 20);
-    updated.push_str(&text[..=open]);
-    updated.push_str(&format!("\n  \"$schema\": \"{DEFAULT_SCHEMA}\","));
-    updated.push_str(&text[open + 1..]);
-    let _ = fs::write(path, updated);
 }
 
 fn resolve_from(directory: &Path, path: &str) -> PathBuf {

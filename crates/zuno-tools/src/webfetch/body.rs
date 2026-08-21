@@ -56,13 +56,17 @@ pub async fn read_bounded(
             return Err(WebError::Interrupted { read: body.len() });
         }
 
-        let chunk = response
-            .chunk()
-            .await
-            .map_err(|source| WebError::Transport {
-                url: url.clone(),
-                source,
-            })?;
+        let chunk = tokio::select! {
+            () = interrupt.notified() => {
+                return Err(WebError::Interrupted { read: body.len() });
+            }
+            chunk = response.chunk() => {
+                chunk.map_err(|source| WebError::Transport {
+                    url: url.clone(),
+                    source,
+                })?
+            }
+        };
 
         let Some(chunk) = chunk else { break };
         if chunk.is_empty() {

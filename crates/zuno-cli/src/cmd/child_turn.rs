@@ -1,64 +1,31 @@
-//! The production [`ChildTurnHost`]: delegation to a real child session.
+//! Production child-session delegation and durable background delivery.
 //!
-//! # What was missing, and what this is
-//!
-//! [`zuno_tools::task::TaskTool`] — every refusal, the two-measure depth guard, the
-//! model precedence ladder — was complete and tested, and `BuiltinSlot::Task` was
-//! never registered, because [`ChildTurnHost`] had no production implementation. The
-//! only one in the tree was `RecordingHost`, a test double. So the model was told no
-//! delegation tool existed and every `zuno-tools` test passed, forever.
-//!
-//! This is that implementation. It creates the child session, drives its turn through
-//! the same [`TurnPlan`]/[`TurnHost`] pair every surface uses, and hands back the
-//! child's final assistant text.
-//!
-//! # Why a fresh host per delegation rather than a seam into the parent's
-//!
-//! [`zuno_engine::r#loop::run_turn`] takes `&mut Connection`, a provider registry and
-//! **the dispatcher that is calling this tool** — so a tool cannot borrow its own
-//! caller's turn context, which is exactly why `zuno-tools` states this contract and
-//! satisfies it nowhere. A child is therefore composed from scratch: its own
-//! connection, its own agent, its own model, its own permission-filtered tool set.
-//!
-//! That is not a workaround, it is the semantics. A subagent runs *as* its agent —
-//! `plan`'s restrictions or `worker`'s narrower roster apply to the child and not to
-//! the parent — and re-resolving is the only thing that produces that. It costs one
-//! config and catalog resolution per delegation, paid once per child rather than per
-//! step.
-//!
-//! Nesting is safe by construction: this host builds no host, it builds a
-//! [`TurnHost`], whose own `task` tool gets its own copy of this host. Construction
-//! does not recurse; only dispatch does, and dispatch is depth-guarded before it
-//! reaches here.
-//!
-//! # Concurrency against the parent's live turn
-//!
-//! The child opens a second connection to the same database while the parent's turn
-//! holds one. Sound because `zuno-db` opens every connection `WAL` with
-//! `busy_timeout = 5000` (`zuno-db/src/open.rs:19-21`), and because the parent holds
-//! no transaction across tool dispatch — `run_turn`'s only transaction is the
-//! `touch_session` at `loop.rs:1135-1137`, which commits before any tool runs.
-//!
-//! # Background dispatch is refused, and why that is the honest answer
-//!
-//! `background: true` is [`ChildTurnError::Host`] naming what is absent. Returning a
-//! job id would be worse than refusing: the tool's own description promises the caller
-//! is "notified on completion", and there is no notification path —
-//! [`zuno_agent::continuation::JobBoard`] models exactly this and has no production
-//! caller, `SessionRunRegistry` tracks busy session ids with no agent or objective,
-//! and nothing persists a running job across a restart. A caller holding an id that
-//! can never be resolved, for work whose completion is never reported, is a silent
-//! failure; a refusal that names the gap is one the model can act on by running the
-//! work in the foreground.
+//! Foreground and background calls use the same child runner. A background call first
+//! creates a durable running job, returns its independent job id, and only then starts
+//! execution. Terminal state and the optional parent report commit in one SQLite
+//! transaction. Parent wake-up happens after that commit, so a process loss can delay
+//! delivery but cannot erase the report.
 
+use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use serde_json::{Value, json};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
+use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox, SessionInput};
+use zuno_db::job::{AgentJobStore, JobSettlement, NewAgentJob, ReportDelivery as DbReportDelivery};
+use zuno_engine::interrupt::{SoftInterruptMessage, SoftInterruptSource};
 use zuno_engine::r#loop::event_channel;
+use zuno_engine::status::{SessionRunGuard, SessionRunRegistry};
+use zuno_engine::wake::{PendingInputDriver, SessionWakeCoordinator};
 use zuno_tool::PermissionAsker;
-use zuno_tools::task::{ChildTurn, ChildTurnError, ChildTurnHost, ChildTurnRequest};
+use zuno_tools::question::QuestionAsker;
+use zuno_tools::task::{
+    ChildTurn, ChildTurnError, ChildTurnHost, ChildTurnRequest,
+    ReportDelivery as ToolReportDelivery,
+};
 
 use super::turn::{SessionChoice, TurnHost, TurnOptions, TurnPlan};
 use crate::environment::StartupEnvironment;
@@ -71,32 +38,163 @@ use crate::environment::StartupEnvironment;
 /// `subagent_depth`, which is single digits.
 const MAX_ANCESTRY_WALK: u32 = 64;
 
+/// Owns background tasks started by one turn host.
+///
+/// Waiting is part of host shutdown, so one-shot runtimes cannot discard a job after
+/// returning its id but before committing its terminal state.
+#[derive(Clone, Default)]
+pub(crate) struct BackgroundJobSupervisor {
+    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+}
+
+impl BackgroundJobSupervisor {
+    fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
+        self.tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(tokio::spawn(task));
+    }
+
+    /// Wait for every task this supervisor owns.
+    pub(crate) async fn wait_all(&self) {
+        loop {
+            let tasks = {
+                let mut tasks = self
+                    .tasks
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                std::mem::take(&mut *tasks)
+            };
+            if tasks.is_empty() {
+                return;
+            }
+            for task in tasks {
+                if let Err(error) = task.await {
+                    tracing::error!(%error, "background subagent task panicked");
+                }
+            }
+        }
+    }
+}
+
+#[async_trait]
+trait DelegatedTurnRunner: Send + Sync + 'static {
+    async fn run(&self, session_id: &str, request: &ChildTurnRequest) -> Result<String, String>;
+}
+
+#[async_trait]
+trait ParentReportWake: Send + Sync + 'static {
+    async fn wake(&self, report: SessionInput) -> Result<(), String>;
+}
+
+/// Everything a child host inherits from its parent composition.
+pub(crate) struct ChildSessionContext {
+    pub(crate) database: Arc<zuno_db::pool::Pool>,
+    pub(crate) environment: StartupEnvironment,
+    pub(crate) directory: PathBuf,
+    pub(crate) approval: Arc<dyn PermissionAsker>,
+    pub(crate) question: Option<Arc<dyn QuestionAsker>>,
+    pub(crate) runs: SessionRunRegistry,
+    pub(crate) mcp: Option<zuno_mcp::Catalog>,
+    pub(crate) parent_agent: String,
+    pub(crate) parent_model: String,
+    pub(crate) parent_effort: Option<zuno_llm::effort::ReasoningEffort>,
+    pub(crate) supervisor: BackgroundJobSupervisor,
+}
+
 /// Delegation backed by a real child session and a real turn.
+#[derive(Clone)]
 pub(crate) struct ChildSessionHost {
-    environment: StartupEnvironment,
-    directory: PathBuf,
-    approval: Arc<dyn PermissionAsker>,
-    /// Where the session database is, resolved once.
-    ///
-    /// Held rather than recomputed per call so every connection this host opens
-    /// answers from the same database the parent turn is writing to, even if the
-    /// process environment changes underneath it mid-turn.
-    database: zuno_paths::DbLocation,
+    database: Arc<zuno_db::pool::Pool>,
+    runner: Arc<dyn DelegatedTurnRunner>,
+    wake: Arc<dyn ParentReportWake>,
+    supervisor: BackgroundJobSupervisor,
+    job_store: AgentJobStore,
+    inbox: SessionInbox,
 }
 
 impl ChildSessionHost {
-    pub(crate) fn new(
-        environment: StartupEnvironment,
-        directory: PathBuf,
-        approval: Arc<dyn PermissionAsker>,
-    ) -> Self {
-        let database = zuno_paths::Layout::resolve(environment.resolved()).db_path();
-        Self {
-            environment,
-            directory,
-            approval,
-            database,
+    pub(crate) fn new(context: ChildSessionContext) -> Result<Self, String> {
+        let pool = Arc::clone(&context.database);
+        let inbox = SessionInbox::new(Arc::clone(&pool));
+        let runner: Arc<dyn DelegatedTurnRunner> = Arc::new(ProductionDelegatedTurnRunner {
+            database: Arc::clone(&pool),
+            environment: context.environment.clone(),
+            directory: context.directory.clone(),
+            approval: Arc::clone(&context.approval),
+            question: context.question.clone(),
+            runs: context.runs.clone(),
+            mcp: context.mcp.clone(),
+        });
+        let parent_driver: Arc<dyn PendingInputDriver> = Arc::new(ParentReportDriver {
+            database: Arc::clone(&pool),
+            environment: context.environment,
+            directory: context.directory,
+            approval: context.approval,
+            question: context.question,
+            runs: context.runs.clone(),
+            mcp: context.mcp,
+            inbox: inbox.clone(),
+            agent: context.parent_agent,
+            model: context.parent_model,
+            effort: context.parent_effort,
+        });
+        let wake: Arc<dyn ParentReportWake> = Arc::new(CoordinatedParentWake {
+            coordinator: SessionWakeCoordinator::new(inbox.clone(), context.runs, parent_driver),
+        });
+        Ok(Self {
+            database: pool,
+            runner,
+            wake,
+            supervisor: context.supervisor,
+            job_store: AgentJobStore::new(context.database),
+            inbox,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_components(
+        database: zuno_paths::DbLocation,
+        runner: Arc<dyn DelegatedTurnRunner>,
+        wake: Arc<dyn ParentReportWake>,
+        supervisor: BackgroundJobSupervisor,
+    ) -> Result<Self, String> {
+        let pool = Arc::new(zuno_db::pool::Pool::open(&database).map_err(to_string)?);
+        Ok(Self {
+            database: Arc::clone(&pool),
+            runner,
+            wake,
+            supervisor,
+            job_store: AgentJobStore::new(Arc::clone(&pool)),
+            inbox: SessionInbox::new(pool),
+        })
+    }
+
+    /// Re-deliver this parent's committed reports that no driver has claimed.
+    pub(crate) async fn recover_pending_reports(
+        &self,
+        parent_session_id: &str,
+    ) -> Result<usize, String> {
+        let jobs = self
+            .job_store
+            .pending_reports_for(parent_session_id)
+            .map_err(to_string)?;
+        if jobs.is_empty() {
+            return Ok(0);
         }
+        let pending = self.inbox.pending(parent_session_id).map_err(to_string)?;
+        let mut recovered = 0_usize;
+        for job in jobs {
+            let Some(input_id) = job.report_input_id.as_deref() else {
+                continue;
+            };
+            let Some(report) = pending.iter().find(|input| input.id == input_id).cloned() else {
+                continue;
+            };
+            self.wake.wake(report).await?;
+            recovered = recovered.saturating_add(1);
+        }
+        Ok(recovered)
     }
 
     /// Open a connection of this host's own.
@@ -104,7 +202,9 @@ impl ChildSessionHost {
     /// Not the parent's: `run_turn` holds that one mutably for the whole turn, and a
     /// tool has no way to reach it. See the module docs on why that is sound.
     fn connect(&self) -> Result<rusqlite::Connection, ChildTurnError> {
-        zuno_db::open::open(&self.database).map_err(|error| ChildTurnError::Host(error.to_string()))
+        self.database
+            .open_connection()
+            .map_err(|error| ChildTurnError::Host(error.to_string()))
     }
 
     /// The child session to run in: `task_id`'s, or a fresh one.
@@ -138,7 +238,7 @@ impl ChildSessionHost {
             parent.directory.clone(),
             parent.directory.clone(),
             title,
-            crate::COMPATIBILITY_VERSION,
+            crate::RUST_PACKAGE_VERSION,
         )
         .with_parent(&request.parent_session_id);
         input.agent = Some(request.agent.clone());
@@ -155,43 +255,194 @@ impl ChildSessionHost {
             .map_err(|error| ChildTurnError::Host(error.to_string()))?;
         Ok(child_id)
     }
+}
 
-    /// The text the child ended on, which is the whole point of a foreground call.
-    ///
-    /// The last assistant message's text parts, in part order. Reasoning and tool
-    /// parts are excluded: the parent asked for an answer, and a subagent's tool
-    /// traffic is precisely the context delegation exists to keep out of the parent.
-    fn answer(&self, session_id: &str) -> Result<String, ChildTurnError> {
-        let connection = self.connect()?;
-        let store = zuno_db::message::MessageStore::new(&connection);
-        let messages = store
-            .messages_for_session(session_id)
-            .map_err(|error| ChildTurnError::Host(error.to_string()))?;
-        let Some(last) = messages
-            .iter()
-            .rev()
-            .find(|message| message.role == zuno_db::message::MessageRole::Assistant)
-        else {
-            return Ok(String::new());
+struct ProductionDelegatedTurnRunner {
+    database: Arc<zuno_db::pool::Pool>,
+    environment: StartupEnvironment,
+    directory: PathBuf,
+    approval: Arc<dyn PermissionAsker>,
+    question: Option<Arc<dyn QuestionAsker>>,
+    runs: SessionRunRegistry,
+    mcp: Option<zuno_mcp::Catalog>,
+}
+
+#[async_trait]
+impl DelegatedTurnRunner for ProductionDelegatedTurnRunner {
+    async fn run(&self, session_id: &str, request: &ChildTurnRequest) -> Result<String, String> {
+        let options = TurnOptions {
+            directory: Some(self.directory.clone()),
+            model: request.model.as_ref().map(|model| model.model.clone()),
+            agent: Some(request.agent.clone()),
+            session: SessionChoice::Existing(session_id.to_owned()),
+            title: request.description.clone(),
+            effort: request.effort,
         };
-        let parts = store
-            .parts_by_message_kind(
-                std::slice::from_ref(&last.id),
-                zuno_db::message::PartKind::Text,
-            )
-            .map_err(|error| ChildTurnError::Host(error.to_string()))?;
-        let text = parts
-            .get(&last.id)
-            .map(|parts| {
-                parts
-                    .iter()
-                    .filter_map(|part| part.data.get("text").and_then(serde_json::Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join("")
-            })
-            .unwrap_or_default();
-        Ok(text)
+        let plan = TurnPlan::resolve(&options, &self.environment).await?;
+        let mut host = TurnHost::open_with_runtime_mcp_and_database(
+            plan,
+            &self.environment,
+            Arc::clone(&self.approval),
+            self.question.clone(),
+            self.runs.clone(),
+            self.mcp.clone(),
+            Arc::clone(&self.database),
+        )?;
+        let outcome = drive_and_drain(&mut host, &request.prompt, None, None).await;
+        host.shutdown().await;
+        outcome?;
+        child_answer(&self.database, session_id)
     }
+}
+
+struct ParentReportDriver {
+    database: Arc<zuno_db::pool::Pool>,
+    environment: StartupEnvironment,
+    directory: PathBuf,
+    approval: Arc<dyn PermissionAsker>,
+    question: Option<Arc<dyn QuestionAsker>>,
+    runs: SessionRunRegistry,
+    mcp: Option<zuno_mcp::Catalog>,
+    inbox: SessionInbox,
+    agent: String,
+    model: String,
+    effort: Option<zuno_llm::effort::ReasoningEffort>,
+}
+
+#[async_trait]
+impl PendingInputDriver for ParentReportDriver {
+    async fn drive(&self, input: SessionInput, guard: SessionRunGuard) -> Result<(), String> {
+        let text = input
+            .prompt
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "background report input `{}` has no string `text` field",
+                    input.id
+                )
+            })?
+            .to_owned();
+        let options = TurnOptions {
+            directory: Some(self.directory.clone()),
+            model: Some(self.model.clone()),
+            agent: Some(self.agent.clone()),
+            session: SessionChoice::Existing(input.session_id.clone()),
+            title: None,
+            effort: self.effort,
+        };
+        let plan = TurnPlan::resolve(&options, &self.environment).await?;
+        let mut host = TurnHost::open_with_runtime_mcp_and_database(
+            plan,
+            &self.environment,
+            Arc::clone(&self.approval),
+            self.question.clone(),
+            self.runs.clone(),
+            self.mcp.clone(),
+            Arc::clone(&self.database),
+        )?;
+        let promoted = self
+            .inbox
+            .promote_id(&input.session_id, &input.id)
+            .map_err(to_string)?;
+        if promoted.is_none() {
+            host.shutdown().await;
+            return Ok(());
+        }
+        let outcome = drive_and_drain(&mut host, &text, Some(input.id.as_str()), Some(guard)).await;
+        host.shutdown().await;
+        outcome
+    }
+}
+
+struct CoordinatedParentWake {
+    coordinator: SessionWakeCoordinator,
+}
+
+#[async_trait]
+impl ParentReportWake for CoordinatedParentWake {
+    async fn wake(&self, report: SessionInput) -> Result<(), String> {
+        let content = report
+            .prompt
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "background report input `{}` has no string `text` field",
+                    report.id
+                )
+            })?
+            .to_owned();
+        self.coordinator
+            .deliver(
+                &report.session_id,
+                &report.id,
+                SoftInterruptMessage {
+                    input_id: Some(report.id.clone()),
+                    content,
+                    images: Vec::new(),
+                    urgent: false,
+                    source: SoftInterruptSource::BackgroundTask,
+                },
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+async fn drive_and_drain(
+    host: &mut TurnHost,
+    prompt: &str,
+    message_id: Option<&str>,
+    guard: Option<SessionRunGuard>,
+) -> Result<(), String> {
+    let (sender, mut receiver) = event_channel();
+    let drive = async {
+        let outcome = match guard {
+            Some(guard) => {
+                host.drive_with_message_id_and_guard(prompt, message_id, guard, sender.clone())
+                    .await
+            }
+            None => {
+                host.drive_with_message_id(prompt, message_id, sender.clone())
+                    .await
+            }
+        };
+        drop(sender);
+        outcome
+    };
+    let drain = async { while receiver.recv().await.is_some() {} };
+    let (outcome, ()) = tokio::join!(drive, drain);
+    outcome
+}
+
+fn child_answer(database: &zuno_db::pool::Pool, session_id: &str) -> Result<String, String> {
+    let connection = database.open_connection().map_err(to_string)?;
+    let store = zuno_db::message::MessageStore::new(&connection);
+    let messages = store.messages_for_session(session_id).map_err(to_string)?;
+    let Some(last) = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == zuno_db::message::MessageRole::Assistant)
+    else {
+        return Ok(String::new());
+    };
+    let parts = store
+        .parts_by_message_kind(
+            std::slice::from_ref(&last.id),
+            zuno_db::message::PartKind::Text,
+        )
+        .map_err(to_string)?;
+    Ok(parts
+        .get(&last.id)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| part.data.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default())
 }
 
 #[async_trait]
@@ -219,65 +470,145 @@ impl ChildTurnHost for ChildSessionHost {
     }
 
     async fn dispatch(&self, request: ChildTurnRequest) -> Result<ChildTurn, ChildTurnError> {
-        if request.background {
-            return Err(ChildTurnError::Host(
-                "background delegation is not available in this build: nothing tracks a \
-                 running subagent job or reports its completion, so a job id would name \
-                 work you could never collect. Drop `background` to run this delegation \
-                 in the foreground and receive its result directly."
-                    .to_owned(),
-            ));
+        let session_id = self.session_for(&request)?;
+        if !request.background {
+            let output = self
+                .runner
+                .run(&session_id, &request)
+                .await
+                .map_err(ChildTurnError::Host)?;
+            return Ok(ChildTurn {
+                session_id,
+                job_id: None,
+                output,
+            });
         }
 
-        let session_id = self.session_for(&request)?;
-        let options = TurnOptions {
-            directory: Some(self.directory.clone()),
-            model: request.model.as_ref().map(|model| model.model.clone()),
-            agent: Some(request.agent.clone()),
-            session: SessionChoice::Existing(session_id.clone()),
-            title: request.description.clone(),
-            // The delegation's own level, which until this field existed was resolved
-            // by the `task` tool and then dropped here: the child ran at the
-            // provider's default no matter what `effort` the caller passed.
-            effort: request.effort,
+        let job_id = crate::cmd::turn::prefixed_id("job");
+        let delivery = match request.report_delivery {
+            ToolReportDelivery::NextStep => DbReportDelivery::NextStep,
+            ToolReportDelivery::Quiet => DbReportDelivery::Quiet,
         };
-        let plan = TurnPlan::resolve(&options, &self.environment)
-            .await
-            .map_err(ChildTurnError::Host)?;
-        let mut host = TurnHost::open_with_runtime_and_mcp(
-            plan,
-            &self.environment,
-            Arc::clone(&self.approval),
-            None,
-            zuno_engine::status::SessionRunRegistry::new(),
-            None,
-        )
-        .map_err(ChildTurnError::Host)?;
+        self.job_store
+            .create(NewAgentJob::new(
+                job_id.clone(),
+                request.parent_session_id.clone(),
+                session_id.clone(),
+                delivery,
+                zuno_db::message::now_millis(),
+            ))
+            .map_err(|error| ChildTurnError::Host(error.to_string()))?;
 
-        // The child's events are drained rather than forwarded. A subagent's steps and
-        // tool calls are what delegation exists to keep out of the parent's transcript
-        // and context; the parent receives the child's answer and its session id, and
-        // can read the rest by opening that session. Dropping the receiver instead
-        // would make the bounded channel back-pressure the child's own turn.
-        let (sender, mut receiver) = event_channel();
-        let sender = host.with_event_hooks(sender);
-        let drive = async {
-            let outcome = host.drive(&request.prompt, sender.clone()).await;
-            drop(sender);
-            outcome
-        };
-        let drain = async { while receiver.recv().await.is_some() {} };
-        let (outcome, ()) = tokio::join!(drive, drain);
-        host.shutdown().await;
-        outcome.map_err(ChildTurnError::Host)?;
+        let runner = Arc::clone(&self.runner);
+        let wake = Arc::clone(&self.wake);
+        let job_store = self.job_store.clone();
+        let background_job_id = job_id.clone();
+        let background_session_id = session_id.clone();
+        self.supervisor.spawn(async move {
+            let outcome = runner.run(&background_session_id, &request).await;
+            let completed = zuno_db::message::now_millis();
+            let (settlement, report_text) = match outcome {
+                Ok(output) => {
+                    let text = format!(
+                        "Background subagent `{background_session_id}` completed job \
+                         `{background_job_id}`.\n\n{output}"
+                    );
+                    (
+                        JobSettlement::completed(
+                            json!({"text": output}),
+                            completed,
+                            report_input(
+                                &request,
+                                &background_job_id,
+                                &background_session_id,
+                                "completed",
+                                &text,
+                                completed,
+                            ),
+                        ),
+                        text,
+                    )
+                }
+                Err(error) => {
+                    let text = format!(
+                        "Background subagent `{background_session_id}` failed job \
+                         `{background_job_id}`: {error}"
+                    );
+                    (
+                        JobSettlement::failed(
+                            error,
+                            completed,
+                            report_input(
+                                &request,
+                                &background_job_id,
+                                &background_session_id,
+                                "failed",
+                                &text,
+                                completed,
+                            ),
+                        ),
+                        text,
+                    )
+                }
+            };
+            match job_store.settle(&background_job_id, settlement) {
+                Ok(settled) => {
+                    if let Some(report) = settled.report
+                        && let Err(error) = wake.wake(report).await
+                    {
+                        tracing::error!(
+                            job_id = %background_job_id,
+                            %error,
+                            "background report remains pending after wake failure"
+                        );
+                    }
+                }
+                Err(error) => tracing::error!(
+                    job_id = %background_job_id,
+                    %error,
+                    report = %report_text,
+                    "background job settlement failed"
+                ),
+            }
+        });
 
-        let output = self.answer(&session_id)?;
         Ok(ChildTurn {
             session_id,
-            background_id: None,
-            output,
+            job_id: Some(job_id),
+            output: "Background subagent started. Its terminal state will be delivered according \
+                     to `reportDelivery`."
+                .to_owned(),
         })
     }
+}
+
+fn report_input(
+    request: &ChildTurnRequest,
+    job_id: &str,
+    child_session_id: &str,
+    status: &str,
+    text: &str,
+    created: i64,
+) -> Option<NewSessionInput> {
+    (request.report_delivery == ToolReportDelivery::NextStep).then(|| {
+        NewSessionInput::new(
+            crate::cmd::turn::prefixed_id("input"),
+            request.parent_session_id.clone(),
+            json!({
+                "kind": "subagentReport",
+                "jobID": job_id,
+                "childSessionID": child_session_id,
+                "status": status,
+                "text": text,
+            }),
+            InputDelivery::NextStep,
+            created,
+        )
+    })
+}
+
+fn to_string(error: impl std::fmt::Display) -> String {
+    error.to_string()
 }
 
 #[cfg(test)]

@@ -146,7 +146,7 @@ impl Summary {
 /// the render layer to learn twenty-one strings is a worse trade than a scan. It is the
 /// same technique [`crate::views::views_tests`] already uses for the colour and keybind
 /// disciplines.
-pub const SUMMARISED: [&str; 21] = [
+pub const SUMMARISED: [&str; 22] = [
     // The 17 `BuiltinSlot` positions, in `BUILTIN_ORDER`.
     "invalid",
     "question",
@@ -157,9 +157,10 @@ pub const SUMMARISED: [&str; 21] = [
     "edit",
     "write",
     "task",
+    "job",
     "webfetch",
     "todowrite",
-    "websearch",
+    "web_search",
     "skill",
     "apply_patch",
     "execute",
@@ -250,7 +251,16 @@ pub fn summary(name: &str, arguments: &str) -> Option<Summary> {
         }),
         // A URL's tail is its path, which is what distinguishes two fetches of one host.
         "webfetch" => text("url").map(Summary::head),
-        "websearch" => text("query").map(Summary::tail),
+        "web_search" => {
+            let queries = value
+                .get("queries")
+                .and_then(Value::as_array)?
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            (!queries.is_empty()).then(|| Summary::tail(queries))
+        }
         // `<subagent_type>: <description>`, so a transcript of six delegations says which
         // six. `description` alone would omit the agent; `prompt` is a paragraph.
         "task" => {
@@ -260,6 +270,7 @@ pub fn summary(name: &str, arguments: &str) -> Option<Summary> {
                 None => what,
             }))
         }
+        "job" => text("jobID").map(Summary::tail),
         // The count plus the first item. A bare count says nothing about the plan, and the
         // whole list is not a summary — it is the thing being summarised.
         "todowrite" => {

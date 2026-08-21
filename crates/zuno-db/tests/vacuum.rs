@@ -359,7 +359,7 @@ fn vacuum_refuses_when_free_disk_is_under_the_database_size() {
         );
     }
     assert!(
-        message.contains("OPENCODE_DB"),
+        message.contains("ZUNO_DB"),
         "the refusal must be actionable: {message}"
     );
 
@@ -486,7 +486,7 @@ fn vacuum_stats_counts_every_table_the_live_schema_actually_has() {
 
     // Read from `sqlite_master`, not from a list in this test: the plan's
     // milestone text and todo 82 disagreed about how many tables exist, and the
-    // schema is the only authority. `schema::TABLE_COUNT` is the 19 tables
+    // schema is the only authority. `schema::TABLE_COUNT` is the application tables
     // `schema::up` creates; `migration::apply` adds its own bookkeeping table.
     let names: Vec<&str> = summary
         .tables
@@ -498,6 +498,7 @@ fn vacuum_stats_counts_every_table_the_live_schema_actually_has() {
         [
             "account",
             "account_state",
+            "agent_job",
             "control_account",
             "credential",
             "data_migration",

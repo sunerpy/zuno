@@ -1,7 +1,7 @@
 //! The pinned `W-real` measurement subject.
 //!
 //! `W-real` used to be defined as *whichever* session held the most `part.data`
-//! bytes in whatever database `OPENCODE_DB` happened to resolve to. That made the
+//! bytes in whatever database `ZUNO_DB` happened to resolve to. That made the
 //! workload a moving target: the G2 ceiling is `0.50 x` the **TypeScript median
 //! measured for one particular session** and does not scale with a different one,
 //! so growing or deleting sessions moved the gate without any code change.

@@ -5,11 +5,9 @@
 //! unusable. So these tests do not stub the transport: they stand up servers that
 //! misbehave in each specific way and assert the load still succeeds.
 //!
-//! The protocol under test was captured from `opencode debug skill` 1.18.13
-//! driven against a local static file server, not read off `discovery.ts`:
-//! an entry whose `files` omits `SKILL.md` never appears in the output, an entry
-//! with a `version` gets a `.opencode-version` stamp next to its `SKILL.md`, and
-//! both land under `$XDG_CACHE_HOME/opencode/skills/<name>/`.
+//! An entry whose `files` omits `SKILL.md` never appears in the output, an entry
+//! with a `version` gets a `.zuno-version` stamp next to its `SKILL.md`, and both
+//! land under `$XDG_CACHE_HOME/zuno/skills/<name>/`.
 
 use std::fs;
 use std::path::PathBuf;

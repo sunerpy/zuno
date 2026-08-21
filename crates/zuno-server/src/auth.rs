@@ -1,11 +1,8 @@
 //! Password-gated HTTP Basic authentication.
 //!
-//! The enable rule is intentionally not `Option::is_some`: upstream treats both
-//! an absent variable and an empty `OPENCODE_SERVER_PASSWORD` as disabled
-//! (`packages/opencode/src/server/auth.ts:17-26`). A configured username may be
-//! empty; only an absent username receives the upstream default
-//! [`zuno_paths::env::DEFAULT_SERVER_USERNAME`], which is an ABI value and stays
-//! `opencode`.
+//! Authentication is disabled when `ZUNO_SERVER_PASSWORD` is absent or empty.
+//! A configured username may be empty; only an absent username receives
+//! [`zuno_paths::env::DEFAULT_SERVER_USERNAME`].
 
 use axum::http::HeaderMap;
 use base64::Engine as _;
@@ -21,7 +18,7 @@ pub struct AuthConfig {
 }
 
 impl AuthConfig {
-    /// Creates settings from the two upstream environment values.
+    /// Creates settings from the two Zuno environment values.
     ///
     /// `None` means the variable was absent. `Some("")` is retained as data but
     /// disables authentication exactly like absence.
@@ -34,12 +31,12 @@ impl AuthConfig {
         }
     }
 
-    /// Reads `OPENCODE_SERVER_PASSWORD` and `OPENCODE_SERVER_USERNAME` once.
+    /// Reads `ZUNO_SERVER_PASSWORD` and `ZUNO_SERVER_USERNAME` once.
     #[must_use]
     pub fn from_env() -> Self {
-        let password = std::env::var_os("OPENCODE_SERVER_PASSWORD")
+        let password = std::env::var_os("ZUNO_SERVER_PASSWORD")
             .map(|value| value.to_string_lossy().into_owned());
-        let username = std::env::var_os("OPENCODE_SERVER_USERNAME")
+        let username = std::env::var_os("ZUNO_SERVER_USERNAME")
             .map(|value| value.to_string_lossy().into_owned());
         Self::new(password, username)
     }
@@ -52,7 +49,7 @@ impl AuthConfig {
             .is_some_and(|password| !password.is_empty())
     }
 
-    /// The configured username, defaulting to `opencode` only when unset.
+    /// The configured username, defaulting to `zuno` only when unset.
     #[must_use]
     pub fn username(&self) -> &str {
         &self.username

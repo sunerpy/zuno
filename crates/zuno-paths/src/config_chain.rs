@@ -2,7 +2,7 @@
 //! `packages/opencode/src/config/paths.ts:10-45`.
 //!
 //! The transcription below is the **oracle's**, so it keeps upstream's own
-//! `.opencode` and `OPENCODE_DISABLE_PROJECT_CONFIG` spellings verbatim. Zuno
+//! `.opencode` and `ZUNO_DISABLE_PROJECT_CONFIG` spellings verbatim. Zuno
 //! walks [`PROJECT_CONFIG_DIRECTORY`] (`.zuno`) and reads
 //! `ZUNO_DISABLE_PROJECT_CONFIG`; the shape of the list is what is ported, not
 //! the names.
@@ -10,11 +10,11 @@
 //! ```text
 //! directories(directory, worktree) = unique([
 //!   Global.Path.config,
-//!   ...(!OPENCODE_DISABLE_PROJECT_CONFIG
+//!   ...(!ZUNO_DISABLE_PROJECT_CONFIG
 //!         ? up({ targets: [".opencode"], start: directory, stop: worktree })
 //!         : []),
 //!   ...up({ targets: [".opencode"], start: home, stop: home }),
-//!   ...(OPENCODE_CONFIG_DIR ? [OPENCODE_CONFIG_DIR] : []),
+//!   ...(ZUNO_CONFIG_DIR ? [ZUNO_CONFIG_DIR] : []),
 //! ])
 //!
 //! files(name, directory, worktree) =
@@ -27,7 +27,7 @@
 //! config merging. Two properties in particular:
 //!
 //! - `directories` runs **global first, then project directories nearest-first,
-//!   then `$HOME/.zuno`, then `OPENCODE_CONFIG_DIR`** — the walk is *not*
+//!   then `$HOME/.zuno`, then `ZUNO_CONFIG_DIR`** — the walk is *not*
 //!   reversed here.
 //! - `files` **is** reversed, so the outermost file comes first and the deepest
 //!   last. Because [`crate::walk::up`] probes `.jsonc` before `.json` per
@@ -53,7 +53,7 @@ use crate::walk;
 /// which is how the rename to `.zuno` landed in some of them and not others.
 ///
 /// The plugin ABI is deliberately out of scope: `engines.opencode` and the six
-/// `OPENCODE_*` handshake variables are a contract with someone else's code and
+/// `ZUNO_*` handshake variables are a contract with someone else's code and
 /// keep the upstream name.
 pub const PROJECT_DIRECTORY: &str = ".zuno";
 
@@ -67,7 +67,7 @@ pub const LEGACY_PROJECT_DIRECTORY: &str = ".opencode";
 ///
 /// This is the single definition, and it is the name at **every** layer: the
 /// global root, a bare file on the walk up from the working directory,
-/// `.zuno/`, `OPENCODE_CONFIG_DIR`, and the managed directory. One name
+/// `.zuno/`, `ZUNO_CONFIG_DIR`, and the managed directory. One name
 /// everywhere is the property that did not hold before: the global root also
 /// accepted `config.json`, which no other layer ever probed, so the same
 /// document was live in one directory and dead in the next.
@@ -219,9 +219,7 @@ fn unique(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::env::{
-        Env, HOME, OPENCODE_CONFIG_DIR, XDG_CONFIG_HOME, ZUNO_DISABLE_PROJECT_CONFIG,
-    };
+    use crate::env::{Env, HOME, XDG_CONFIG_HOME, ZUNO_CONFIG_DIR, ZUNO_DISABLE_PROJECT_CONFIG};
     use std::fs;
 
     struct Fixture {
@@ -433,11 +431,11 @@ mod tests {
     fn a_config_dir_override_is_appended_last_and_an_empty_one_is_dropped() {
         let fixture = Fixture::new();
         let extra = fixture.path("extra-config");
-        let layout = fixture.layout(&[(OPENCODE_CONFIG_DIR, extra.to_str().expect("utf8"))]);
+        let layout = fixture.layout(&[(ZUNO_CONFIG_DIR, extra.to_str().expect("utf8"))]);
         let found = layout.config_directories(&fixture.path("repo"), Some(&fixture.path("repo")));
         assert_eq!(found.last(), Some(&extra));
 
-        let empty = fixture.layout(&[(OPENCODE_CONFIG_DIR, "")]);
+        let empty = fixture.layout(&[(ZUNO_CONFIG_DIR, "")]);
         let without = empty.config_directories(&fixture.path("repo"), Some(&fixture.path("repo")));
         assert!(!without.iter().any(|path| path.as_os_str().is_empty()));
     }
@@ -449,7 +447,7 @@ mod tests {
     fn a_duplicate_override_keeps_its_first_position() {
         let fixture = Fixture::new();
         let global = fixture.path("xdgconfig/zuno");
-        let layout = fixture.layout(&[(OPENCODE_CONFIG_DIR, global.to_str().expect("utf8"))]);
+        let layout = fixture.layout(&[(ZUNO_CONFIG_DIR, global.to_str().expect("utf8"))]);
         let found = layout.config_directories(&fixture.path("repo"), Some(&fixture.path("repo")));
         assert_eq!(found.first(), Some(&global));
         assert_eq!(found.iter().filter(|path| **path == global).count(), 1);

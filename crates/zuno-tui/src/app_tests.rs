@@ -738,12 +738,12 @@ fn app_force_reclaim_surfaces_the_brokers_diagnostic_and_repaints() {
         .reclaim_if_expired()
         .expect("the elapsed lease is reclaimed");
 
-    assert_eq!(forced.plugin, "kiro");
+    assert_eq!(forced.requester, "kiro");
     assert!(lifecycle.is_active());
     assert_eq!(locked(&screen).draws, 1);
     let diagnostics = owner.diagnostics();
     assert_eq!(diagnostics.len(), 1);
-    assert!(diagnostics[0].message.contains("plugin `kiro`"));
+    assert!(diagnostics[0].message.contains("requester `kiro`"));
     assert!(diagnostics[0].forced);
     drop(leaked);
     assert_eq!(locked(&screen).draws, 1, "late guard drop must be inert");

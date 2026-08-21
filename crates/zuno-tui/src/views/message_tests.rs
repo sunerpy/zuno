@@ -386,7 +386,7 @@ fn views_tool_affordance_matches_the_oracle_icons() {
         ("read", "→"),
         ("write", "→"),
         ("webfetch", "%"),
-        ("websearch", "◈"),
+        ("web_search", "◈"),
         ("task", "#"),
         ("something_else", "⚙"),
     ] {
@@ -2371,7 +2371,7 @@ fn views_tool_row_of_each_tool_is_distinguishable_from_the_others() {
         ("read", r#"{"filePath":"src/a.rs"}"#),
         ("grep", r#"{"pattern":"fn main"}"#),
         ("bash", r#"{"command":"cargo build"}"#),
-        ("websearch", r#"{"query":"ratatui spans"}"#),
+        ("web_search", r#"{"queries":["ratatui spans"]}"#),
         (
             "todowrite",
             r#"{"todos":[{"content":"ship it","status":"pending","priority":"high"}]}"#,
@@ -2405,7 +2405,7 @@ fn views_tool_row_of_each_tool_is_distinguishable_from_the_others() {
         "read src/a.rs",
         "grep \"fn main\"",
         "bash cargo build",
-        "websearch ratatui spans",
+        "web_search ratatui spans",
         "todowrite 1 items · ship it",
         "memory add project",
     ] {

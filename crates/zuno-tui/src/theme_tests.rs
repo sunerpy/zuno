@@ -697,7 +697,7 @@ fn theme_missing_key_falls_back_with_a_diagnostic_naming_the_key() {
     assert_eq!(
         resolved.diagnostics(),
         vec![String::from(
-            "theme \"gappy\": missing color key \"primary\"; falling back to the built-in \"opencode\" theme's value for \"primary\""
+            "theme \"gappy\": missing color key \"primary\"; falling back to the built-in \"zuno\" theme's value for \"primary\""
         )]
     );
     // The fallback source is the built-in default theme, not the layer below and not
@@ -1054,7 +1054,7 @@ fn theme_config_key_selects_the_palette_with_no_code_change() {
     // The happy-path QA scenario: only the config value changes.
     let registry = ThemeRegistry::new();
     let mut seen = BTreeSet::new();
-    for name in ["opencode", "dracula", "nord", "github"] {
+    for name in ["zuno", "dracula", "nord", "github"] {
         let config: TuiConfig =
             serde_json::from_str(&format!("{{\"theme\": \"{name}\"}}")).expect("valid config");
         assert_eq!(config.theme(), Some(name));

@@ -89,9 +89,9 @@ pub const GLOBAL_INSTRUCTION_FILENAME: &str = "AGENTS.md";
 /// The Claude-Code global instruction file, relative to `$HOME`.
 pub const CLAUDE_GLOBAL_RELATIVE: [&str; 2] = [".claude", "CLAUDE.md"];
 
-/// `OPENCODE_DISABLE_CLAUDE_CODE` — the broad switch
+/// `ZUNO_DISABLE_CLAUDE_CODE` — the broad switch
 /// (`packages/opencode/src/effect/runtime-flags.ts:24`).
-pub const OPENCODE_DISABLE_CLAUDE_CODE: &str = "OPENCODE_DISABLE_CLAUDE_CODE";
+pub const ZUNO_DISABLE_CLAUDE_CODE: &str = "ZUNO_DISABLE_CLAUDE_CODE";
 
 /// `ZUNO_DISABLE_CLAUDE_CODE_PROMPT` — the targeted switch
 /// (`runtime-flags.ts:25`). Either variable disables the Claude instruction
@@ -216,7 +216,7 @@ impl InstructionOptions {
             worktree: worktree.map(Into::into),
             layout: Layout::resolve(env),
             instructions,
-            claude_prompt_disabled: env.flag(OPENCODE_DISABLE_CLAUDE_CODE)
+            claude_prompt_disabled: env.flag(ZUNO_DISABLE_CLAUDE_CODE)
                 || env.flag(ZUNO_DISABLE_CLAUDE_CODE_PROMPT),
         }
     }
@@ -274,7 +274,7 @@ impl InstructionOptions {
         self.claude_prompt_disabled
     }
 
-    /// Whether `OPENCODE_DISABLE_PROJECT_CONFIG` suppressed project discovery.
+    /// Whether `ZUNO_DISABLE_PROJECT_CONFIG` suppressed project discovery.
     #[must_use]
     pub fn project_config_disabled(&self) -> bool {
         self.layout.project_config_disabled()
@@ -832,10 +832,7 @@ mod tests {
     #[test]
     fn either_claude_flag_drops_the_claude_entries() {
         let root = tempfile::tempdir().expect("tempdir");
-        for flag in [
-            OPENCODE_DISABLE_CLAUDE_CODE,
-            ZUNO_DISABLE_CLAUDE_CODE_PROMPT,
-        ] {
+        for flag in [ZUNO_DISABLE_CLAUDE_CODE, ZUNO_DISABLE_CLAUDE_CODE_PROMPT] {
             let env = env_for(root.path()).with(flag, "true");
             let options = InstructionOptions::new(root.path(), None::<PathBuf>, &env, Vec::new());
             assert!(options.claude_prompt_disabled(), "{flag}");

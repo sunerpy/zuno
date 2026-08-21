@@ -57,7 +57,7 @@ const COMMAND_DISPOSITIONS: [CommandDisposition; 23] = [
         upstream_symbol: "ConsoleCommand",
         command: "console",
         disposition: Disposition::Rejected,
-        reason: "the hosted OpenCode Console is excluded from Zuno's local-agent scope; use `providers` (alias `auth`) for local credentials instead",
+        reason: "Zuno does not provide a hosted console; use `providers` (alias `auth`) for local credentials instead",
     },
     CommandDisposition {
         upstream_symbol: "DbCommand",

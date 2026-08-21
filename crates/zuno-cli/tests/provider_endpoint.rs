@@ -61,7 +61,7 @@ const DEAD_ENDPOINT: &str = "http://127.0.0.1:1/v1";
 
 /// The variable the placeholder tests parameterise the gateway's authority with.
 ///
-/// Deliberately not an `OPENCODE_*` name: expansion reads the whole resolved
+/// Deliberately not an `ZUNO_*` name: expansion reads the whole resolved
 /// environment, exactly as `resolveSDK` reads `env.all()`, so a test that could only
 /// pass through a name this program already knows would be proving the wrong thing.
 const PROBE_HOST: &str = "PROBE_HOST";
@@ -125,11 +125,7 @@ fn variables(
     config: String,
     extra: &[(&str, &str)],
 ) -> BTreeMap<String, String> {
-    let mut variables = env
-        .env_vars()
-        .into_iter()
-        .map(|(key, value)| (zuno_paths::env::accepted_env_name(&key).to_owned(), value))
-        .collect::<BTreeMap<_, _>>();
+    let mut variables = env.env_vars().into_iter().collect::<BTreeMap<_, _>>();
     variables.extend(
         extra
             .iter()
@@ -138,12 +134,11 @@ fn variables(
     variables.extend([
         ("NO_COLOR".to_owned(), "1".to_owned()),
         ("TERM".to_owned(), "dumb".to_owned()),
-        ("ZUNO_PURE".to_owned(), "1".to_owned()),
         ("ZUNO_AUTH_CONTENT".to_owned(), "{}".to_owned()),
         // No `ZUNO_MODELS_PATH` and no fetch: the config fully specifies
         // `test/test-model`, so nothing but the config may supply the endpoint.
         ("ZUNO_DISABLE_MODELS_FETCH".to_owned(), "true".to_owned()),
-        ("OPENCODE_CONFIG_CONTENT".to_owned(), config),
+        ("ZUNO_CONFIG_CONTENT".to_owned(), config),
     ]);
     variables
 }

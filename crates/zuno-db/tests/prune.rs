@@ -296,7 +296,11 @@ fn prune_default_preview_is_inert_across_every_real_table() {
     let fixture = Fixture::build();
     let mut connection = fixture.connection();
     let before = all_table_counts(&connection);
-    assert_eq!(before.len(), 20, "19 schema tables plus migration");
+    assert_eq!(
+        before.len(),
+        zuno_db::schema::TABLE_COUNT + 1,
+        "current schema tables plus migration"
+    );
     let remote = FakeRemote::default();
 
     let outcome = execute(

@@ -45,10 +45,9 @@
 //!
 //! # Registry
 //!
-//! [`registry`] preserves upstream's built-in order while making the final set a
-//! projection of the model, provider, runtime flags, extension sources, and merged
-//! permission rules. Plugin and MCP hosts enter through no-op-by-default seams so
-//! their later implementations cannot bypass the same visibility pass.
+//! [`registry`] preserves the built-in order while making the final set a projection
+//! of the model, provider, runtime flags, Harness contributions, MCP tools, and merged
+//! permission rules. Every source passes through the same visibility rules.
 //!
 //! # Session recall
 //!
@@ -192,10 +191,13 @@ pub mod websearch;
 pub use crate::webfetch::WebFetchTool;
 pub use crate::webfetch::bounds::WebError;
 pub use crate::websearch::WebSearchTool;
-pub use crate::websearch::gating::{Provider, SearchConfig, select_provider, web_search_enabled};
+pub use crate::websearch::gating::{
+    Provider, SearchConfig, require_provider, select_provider, web_search_enabled,
+};
 
 pub mod exposure;
 pub mod invalid;
+pub mod job;
 pub mod plan_exit;
 pub mod question;
 pub mod registry;
@@ -206,6 +208,7 @@ pub use crate::exposure::{
     exposes_plan_exit, exposes_question, exposes_todowrite, exposure_predicate,
 };
 pub use crate::invalid::{InvalidParams, InvalidTool};
+pub use crate::job::{DESCRIPTION as JOB_DESCRIPTION, JobParams, JobTool, WIRE_ID as JOB_WIRE_ID};
 pub use crate::plan_exit::{PlanExitHost, PlanExitParams, PlanExitTool, RecordingHost};
 pub use crate::question::{
     Answer, QuestionAsker, QuestionOption, QuestionParams, QuestionPrompt, QuestionRequest,
@@ -226,12 +229,11 @@ pub use crate::skill::{
 };
 
 pub use crate::task::{
-    BACKGROUND_ID_PREFIX, ChildTurn, ChildTurnError, ChildTurnHost, ChildTurnRequest,
-    DEFAULT_SUBAGENT_DEPTH, DESCRIPTION as TASK_DESCRIPTION, DelegationLimits, DelegationPlan,
-    FixedFacts, GENERIC_EXECUTOR, GUIDANCE_KEY, ModelFacts, NoProviders,
-    PERMISSION_KEY as TASK_PERMISSION_KEY, ProviderFacts, RecordingHost as RecordingChildTurnHost,
-    TaskParams, TaskRejection, TaskTool, WIRE_ID as TASK_WIRE_ID, background_id, denial_guidance,
-    valid_targets,
+    ChildTurn, ChildTurnError, ChildTurnHost, ChildTurnRequest, DEFAULT_SUBAGENT_DEPTH,
+    DESCRIPTION as TASK_DESCRIPTION, DelegationLimits, DelegationPlan, FixedFacts,
+    GENERIC_EXECUTOR, GUIDANCE_KEY, ModelFacts, NoProviders, PERMISSION_KEY as TASK_PERMISSION_KEY,
+    ProviderFacts, RecordingHost as RecordingChildTurnHost, ReportDelivery, TaskParams,
+    TaskRejection, TaskTool, WIRE_ID as TASK_WIRE_ID, denial_guidance, valid_targets,
 };
 
 pub use crate::memory::{

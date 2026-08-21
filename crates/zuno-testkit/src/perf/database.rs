@@ -125,7 +125,7 @@ fn resolve_source_database() -> Result<PathBuf> {
         .ok_or_else(|| TestkitError::RealDatabaseUnavailable {
             path: PathBuf::from(":memory:"),
             detail: format!(
-                "the installed TypeScript release resolves OPENCODE_DB to memory; point it at \
+                "the installed TypeScript release resolves ZUNO_DB to memory; point it at \
                  the pinned snapshot {}. {W_REAL_RECAPTURE}",
                 W_REAL_SUBJECT.database_path
             ),

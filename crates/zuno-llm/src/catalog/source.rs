@@ -6,8 +6,8 @@
 //! question and they are routinely conflated:
 //!
 //! The `ZUNO_*` names below are the spellings **this crate** accepts. Upstream
-//! reads the same three switches under `OPENCODE_MODELS_URL`,
-//! `OPENCODE_MODELS_PATH` and `OPENCODE_DISABLE_MODELS_FETCH`, so any sentence
+//! reads the same three switches under `ZUNO_MODELS_URL`,
+//! `ZUNO_MODELS_PATH` and `ZUNO_DISABLE_MODELS_FETCH`, so any sentence
 //! reporting what the oracle did names those instead.
 //!
 //! | variable | question it answers | effect |
@@ -41,7 +41,7 @@
 //! one, and none of them is an error:
 //!
 //! 1. the cache file (`models-dev.ts:218`),
-//! 2. a **catalog snapshot compiled into the binary** — the `OPENCODE_MODELS_DEV`
+//! 2. a **catalog snapshot compiled into the binary** — the `ZUNO_MODELS_DEV`
 //!    global at `models-dev.ts:198-200`, read at `:220-221`,
 //! 3. `{}` (`:222`) — an *empty catalog*, returned as a success.
 //!
@@ -50,7 +50,7 @@
 //! providers *over* whatever the load returned, so an empty document plus a config
 //! that names its own provider, model, cost and limits still resolves that model.
 //! Measured on 1.18.12 under `env -i`, an empty `XDG_CACHE_HOME`,
-//! `OPENCODE_DISABLE_MODELS_FETCH=1` and no `OPENCODE_MODELS_PATH` — the names
+//! `ZUNO_DISABLE_MODELS_FETCH=1` and no `ZUNO_MODELS_PATH` — the names
 //! that binary reads: `opencode
 //! models` exits 0 and prints `test/test-model` from config alone.
 //!
@@ -79,7 +79,7 @@
 //! workspace forbids, or a committed blob to keep current forever.
 //!
 //! The cost is a listing difference, not a functional one: with fetching disabled
-//! and no cache — `OPENCODE_DISABLE_MODELS_FETCH` upstream,
+//! and no cache — `ZUNO_DISABLE_MODELS_FETCH` upstream,
 //! `ZUNO_DISABLE_MODELS_FETCH` here — upstream lists its seven gateway models and
 //! this crate lists none. Anything the user's own config declares
 //! resolves identically on both sides, which is what
@@ -477,10 +477,10 @@ async fn backoff(attempt: u32) {
     tokio::time::sleep(FETCH_BACKOFF * 2_u32.pow(attempt)).await;
 }
 
-/// The `User-Agent` the oracle sends — `models-dev.ts:23`.
+/// The Zuno identity sent to the model catalog.
 fn user_agent() -> String {
     format!(
-        "opencode/{}/{}/cli",
+        "zuno/{}/{}/cli",
         zuno_paths::installation_channel(),
         env!("CARGO_PKG_VERSION")
     )
@@ -500,9 +500,9 @@ mod tests {
     #[test]
     fn the_default_source_caches_at_models_json() {
         let source = source_for(&[(HOME, "/h"), (XDG_CACHE_HOME, "/c")]);
-        assert_eq!(source.source(), "https://models.opencode.ai");
+        assert_eq!(source.source(), "https://models.dev");
         assert_eq!(source.cache(), Path::new("/c/zuno/models.json"));
-        assert_eq!(source.api_url(), "https://models.opencode.ai/api.json");
+        assert_eq!(source.api_url(), "https://models.dev/api.json");
     }
 
     #[test]
@@ -529,8 +529,15 @@ mod tests {
     fn an_empty_models_url_means_unset() {
         // JavaScript `||`: `models-dev.ts:160` treats "" as absent.
         let source = source_for(&[(HOME, "/h"), (XDG_CACHE_HOME, "/c"), (ZUNO_MODELS_URL, "")]);
-        assert_eq!(source.source(), "https://models.opencode.ai");
+        assert_eq!(source.source(), "https://models.dev");
         assert_eq!(source.cache(), Path::new("/c/zuno/models.json"));
+    }
+
+    #[test]
+    fn catalog_requests_use_the_zuno_identity() {
+        let user_agent = user_agent();
+        assert!(user_agent.starts_with("zuno/"), "{user_agent}");
+        assert!(!user_agent.starts_with("opencode/"), "{user_agent}");
     }
 
     #[test]

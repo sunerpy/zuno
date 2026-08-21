@@ -1,8 +1,7 @@
-# Session retention (C8)
+# Session retention
 
-Retention is Zuno's own scope; upstream `opencode` has no equivalent. That is why
-the two `/api/session/prune` operations are a declared divergence
-(`c8-maintenance-endpoints` in [divergences.md](divergences.md)).
+Retention is a Zuno-owned capability exposed by the two `/api/session/prune`
+operations and the matching CLI command.
 
 ## The one thing to get right
 

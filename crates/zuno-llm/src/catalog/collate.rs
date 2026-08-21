@@ -122,21 +122,10 @@ pub fn compare(left: &str, right: &str) -> Ordering {
     left.cmp(right)
 }
 
-/// Compare provider ids the way `opencode models` lists them.
-///
-/// `models.ts:56-62` floats every id starting with `opencode` to the front —
-/// the hosted zen gateway is the one a new user is expected to reach for — and
-/// falls back to [`compare`] otherwise. Two `opencode*` ids compare against
-/// each other normally, so `opencode` precedes `opencode-staging`.
+/// Compare provider ids with the same locale-like ordering as model ids.
 #[must_use]
 pub fn compare_provider_ids(left: &str, right: &str) -> Ordering {
-    let left_first = left.starts_with("opencode");
-    let right_first = right.starts_with("opencode");
-    match (left_first, right_first) {
-        (true, false) => Ordering::Less,
-        (false, true) => Ordering::Greater,
-        _ => compare(left, right),
-    }
+    compare(left, right)
 }
 
 #[cfg(test)]
@@ -227,12 +216,12 @@ mod tests {
     }
 
     #[test]
-    fn opencode_providers_float_to_the_front() {
+    fn provider_ids_use_the_same_collation_without_a_branded_priority() {
         let mut ids = vec!["zhipuai", "opencode", "anthropic", "opencode-staging"];
         ids.sort_by(|a, b| compare_provider_ids(a, b));
         assert_eq!(
             ids,
-            vec!["opencode", "opencode-staging", "anthropic", "zhipuai"]
+            vec!["anthropic", "opencode", "opencode-staging", "zhipuai"]
         );
     }
 }

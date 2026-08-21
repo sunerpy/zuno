@@ -216,6 +216,10 @@ impl ApiState {
         &self.pool
     }
 
+    pub(crate) fn pool_arc(&self) -> Arc<Pool> {
+        Arc::clone(&self.pool)
+    }
+
     pub(super) fn artifact_paths(&self) -> &ArtifactGcPaths {
         &self.artifact_paths
     }

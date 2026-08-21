@@ -23,6 +23,7 @@ zuno-agent = { workspace = true }
 # rather than re-reading the config shape. The edge is one-way; `zuno-catalog` does
 # not depend on this crate.
 zuno-catalog = { workspace = true }
+zuno-config = { workspace = true }
 zuno-db = { workspace = true }
 zuno-error = { workspace = true }
 # `task` names todo 31's canonical effort levels and todo 25's provider capability
@@ -53,10 +54,6 @@ url = { workspace = true }
 which = { workspace = true }
 
 [dev-dependencies]
-# `tests/format.rs` parses the real `formatter` union from JSON rather than
-# hand-building the resolved enum, so a typo in the config shape fails the test
-# instead of being papered over.
-zuno-config = { workspace = true }
 zuno-testkit = { workspace = true }
 tempfile = { workspace = true }
 wiremock = { workspace = true }

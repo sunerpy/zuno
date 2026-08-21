@@ -118,10 +118,17 @@ pub async fn call(
         request = request.header(name, value);
     }
 
-    let response = request.send().await.map_err(|source| WebError::Transport {
-        url: url.to_owned(),
-        source,
-    })?;
+    let response = tokio::select! {
+        () = interrupt.notified() => {
+            return Err(WebError::Interrupted { read: 0 });
+        }
+        response = request.send() => {
+            response.map_err(|source| WebError::Transport {
+                url: url.to_owned(),
+                source,
+            })?
+        }
+    };
 
     let status = response.status();
     if !status.is_success() {

@@ -221,7 +221,7 @@ impl Builtin {
                 ("list", allow()),
                 ("bash", allow()),
                 ("webfetch", allow()),
-                ("websearch", allow()),
+                ("web_search", allow()),
                 ("read", allow()),
             ],
             // agent.ts:221, :241, :256 — all three deny everything.
@@ -411,7 +411,7 @@ mod tests {
                 "list",
                 "bash",
                 "webfetch",
-                "websearch",
+                "web_search",
                 "read"
             ],
             "the wildcard deny must come first or the allows are overridden"

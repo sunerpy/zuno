@@ -7,7 +7,7 @@
 //! (`registry.ts:202,228`). A headless host that offered it would advertise a tool
 //! whose every call blocks forever, so the condition is a capability check and the
 //! predicate is [`crate::exposure::exposes_question`]. Verified against the real
-//! binary: `OPENCODE_CLIENT=tui` drops it, the same run with the override flag
+//! binary: `ZUNO_CLIENT=tui` drops it, the same run with the override flag
 //! restores it.
 //!
 //! # Where the answer comes from

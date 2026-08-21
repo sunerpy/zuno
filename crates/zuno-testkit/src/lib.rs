@@ -1,31 +1,7 @@
-//! The instrument behind this project's retained verification inventory.
+//! Shared deterministic test infrastructure for Zuno.
 //!
-//! Zuno is an independent product. It does **not** promise to be a drop-in
-//! replacement for `opencode`: its config root, data root, project directory, CLI
-//! identity and on-disk state are its own, and it neither reads the old paths nor
-//! imports opencode sessions. The one supported compatibility layer is the plugin
-//! ABI — `engines.opencode`, the six `OPENCODE_*` handshake variables, and the
-//! `COMPATIBILITY_VERSION` an npm plugin range-matches against.
-//!
-//! That decision has since been taken: the whole-surface differential suites that
-//! byte-compared Zuno against the released `opencode` binary are **gone**. What
-//! remains of this crate is the harness those suites happened to share — the
-//! scripted environment, the cassette-backed mock provider, the diff engine, and
-//! the pinned-release helpers — which 22 test files across 9 crates still use for
-//! their own assertions, including the docs generator and the plugin-ABI gate.
-//!
-//! So the oracle in these APIs is now a *tool*, not a contract. A test may still
-//! run the pinned release to source a fixture or to check the plugin handshake;
-//! nothing here asserts that Zuno's own output must match it. Where a surface has
-//! deliberately diverged, the difference is declared rather than normalised away —
-//! every design decision in this crate is still made in favour of *detecting* a
-//! difference rather than producing a green run.
-//!
-//! `1.18.13` is the **source baseline** — the tree this port was read from and the
-//! version it reports to the npm plugin gate. The binary the differentials
-//! actually execute is [`PINNED_RELEASE`], the newest installed release, currently
-//! `1.18.18`. The two numbers are separate pins and [`oracle`] documents why;
-//! recording one as though it were the other is the defect plan todo 130 closed.
+//! The crate provides scripted environments, cassette-backed providers, diff
+//! helpers, protocol fixtures, and optional upstream research tools.
 //!
 //! # The failure this crate exists to prevent
 //!
@@ -59,12 +35,11 @@
 //!
 //! | type | role |
 //! |---|---|
-//! | [`Oracle`] | the real `opencode`, as an installed binary or from the pinned source tree |
+//! | [`Oracle`] | optional upstream runner for cassette and performance research |
 //! | [`Subject`] | this project's `zuno` binary |
-//! | [`ScriptedEnv`] | the closed world both sides run in: temp `XDG_*`, temp `HOME`, temp `TMPDIR`, explicit `OPENCODE_DB` |
+//! | [`ScriptedEnv`] | the closed world both sides run in: temp `XDG_*`, temp `HOME`, temp `TMPDIR`, explicit `ZUNO_DB` |
 //! | [`ConfigFixture`] | layered config trees on disk, for a config differential matrix |
 //! | [`diff_normalized`] | the verdict, with provenance and masking in the report |
-//! | [`normalize_cli_stream`] | the four declared CLI *presentation* differences, so `crates/zuno-cli/tests/cli_parity.rs` can compare every implemented command's streams |
 //! | [`CassettePlayer`] | cursor replay of the oracle's recorded provider traffic |
 //! | [`MockProvider`] | a loopback provider stand-in that captures every request |
 //! | [`FakeTerminalOwner`] | a terminal-lease owner that records transitions and owns no TTY |
@@ -98,11 +73,8 @@
 //! ```
 
 pub mod cassette;
-pub mod cli_normalize;
-pub mod compat_report;
 pub mod config_fixture;
 pub mod diff;
-pub mod divergence;
 pub mod env;
 pub mod error;
 pub mod mock_provider;
@@ -118,19 +90,8 @@ pub use crate::cassette::{
     ResponseSnapshot, SseFrame, canonical_snapshot, list_cassettes, recordings_root,
     recordings_root_or_skip,
 };
-pub use crate::cli_normalize::{
-    CLI_RULE_NAMES, canonicalize_json, mask_program_name, normalize_cli_stream, strip_error_prefix,
-    strip_prompt_chrome, strip_sgr,
-};
-pub use crate::compat_report::{
-    BehaviouralDifference, ComparedSurface, CompatReport, DivergenceSummary, KnownGap,
-    Normalization, OracleAvailability, OracleKind, Verdict,
-};
 pub use crate::config_fixture::{ConfigFixture, ConfigLayer, PlacedLayer};
 pub use crate::diff::{DiffReport, Divergence, diff_normalized};
-pub use crate::divergence::{
-    DECLARED_COUNT, DeclaredDivergence, DivergenceList, EXECUTE_CONTRACT_ID, ExecuteContract,
-};
 pub use crate::env::{DbChoice, ScriptedEnv};
 pub use crate::error::{Result, TestkitError};
 pub use crate::mock_provider::{
@@ -148,9 +109,8 @@ pub use crate::terminal_owner::{FakeTerminalOwner, TerminalTranscript, TerminalT
 /// Compare two [`RunOutcome`]s, labelling each side with its own provenance.
 ///
 /// Prefer this over calling [`diff_normalized`] with hand-written labels: it is
-/// what guarantees the oracle flavour and both version numbers appear in the
-/// failure, so a patch-level version gap is never mistaken for a compatibility
-/// defect.
+/// what guarantees the upstream flavour and both version numbers appear in the
+/// result, so research data cannot be attributed to the wrong release.
 #[must_use]
 pub fn diff_runs(left: &RunOutcome, right: &RunOutcome, normalizer: &Normalizer) -> DiffReport {
     diff_normalized(
@@ -181,7 +141,7 @@ mod tests {
     }
 
     /// The two provenance version numbers must both survive into the report, which is
-    /// what stops a patch-level gap being read as a compatibility defect.
+    /// what stops a patch-level gap being attributed to the wrong executable.
     ///
     /// The pair used here is this machine's real one — the installed release
     /// [`PINNED_RELEASE`] against the `1.18.13` source tree at `aefaf140c1` — rather

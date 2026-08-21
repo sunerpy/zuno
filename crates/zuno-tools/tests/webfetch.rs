@@ -649,10 +649,10 @@ async fn a_server_error_is_reported_rather_than_handed_to_the_model_as_content()
 }
 
 #[tokio::test]
-async fn a_cloudflare_challenge_is_retried_with_an_honest_user_agent() {
+async fn a_cloudflare_challenge_is_retried_with_the_zuno_user_agent() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(header("user-agent", "opencode"))
+        .and(header("user-agent", "zuno"))
         .respond_with(html_response("<h1>Allowed</h1>"))
         .mount(&server)
         .await;

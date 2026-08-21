@@ -117,6 +117,11 @@ fn descriptions() -> Vec<Description> {
             text: zuno_tools::invalid::DESCRIPTION,
         },
         Description {
+            wire_id: "job",
+            file: "crates/zuno-tools/src/description/job.txt",
+            text: zuno_tools::job::DESCRIPTION,
+        },
+        Description {
             wire_id: "memory",
             file: "crates/zuno-tools/src/description/memory.txt",
             text: zuno_tools::memory::DESCRIPTION,

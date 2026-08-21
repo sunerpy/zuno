@@ -152,8 +152,9 @@ pub fn tool_affordance(name: &str) -> (&'static str, &'static str) {
         "read" => ("→", "Reading file..."),
         "write" | "edit" => ("→", "Preparing write..."),
         "webfetch" => ("%", "Fetching from the web..."),
-        "websearch" => ("◈", "Searching web..."),
+        "web_search" => ("◈", "Searching web..."),
         "task" => ("#", "Delegating..."),
+        "job" => ("◷", "Checking job..."),
         // A patch is a write, so it shares the write arrow rather than inventing a glyph:
         // the two differ in how the change is expressed, not in what happens to the file.
         "apply_patch" => ("→", "Preparing patch..."),

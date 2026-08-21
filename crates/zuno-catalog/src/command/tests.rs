@@ -96,6 +96,15 @@ fn builtin_init_matches_the_observed_shape() {
 }
 
 #[test]
+fn builtin_init_names_zuno_as_the_future_agent() {
+    let registry = Registry::build(&Sources::new(WORKTREE));
+    let template = text_of(registry.get("init").expect("init is built in"));
+
+    assert!(template.contains("future Zuno sessions"));
+    assert!(!template.contains("future OpenCode sessions"));
+}
+
+#[test]
 fn builtin_review_runs_as_a_subtask() {
     let registry = Registry::build(&Sources::new(WORKTREE));
     let review = registry.get("review").expect("review is built in");
@@ -427,7 +436,7 @@ fn skill_template_gets_a_base_directory_footer() {
 #[test]
 fn builtin_skill_gets_no_footer() {
     let skills = [SkillCommand {
-        name: "customize-opencode".to_owned(),
+        name: "customize-zuno".to_owned(),
         description: Some("built in".to_owned()),
         content: "BODY ONLY".to_owned(),
         location: SkillLocation::Builtin,
@@ -435,11 +444,7 @@ fn builtin_skill_gets_no_footer() {
     let registry = Registry::build(&Sources::new(WORKTREE).with_skills(&skills));
 
     assert_eq!(
-        text_of(
-            registry
-                .get("customize-opencode")
-                .expect("the skill resolves")
-        ),
+        text_of(registry.get("customize-zuno").expect("the skill resolves")),
         "BODY ONLY",
         "command/index.ts:136 skips the footer for the <built-in> sentinel"
     );

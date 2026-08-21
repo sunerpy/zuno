@@ -116,18 +116,13 @@ fn config(configured: Option<&str>, aaa_base_url: &str, zzz_base_url: &str) -> S
 }
 
 fn variables(env: &ScriptedEnv, config: String) -> BTreeMap<String, String> {
-    let mut variables = env
-        .env_vars()
-        .into_iter()
-        .map(|(key, value)| (zuno_paths::env::accepted_env_name(&key).to_owned(), value))
-        .collect::<BTreeMap<_, _>>();
+    let mut variables = env.env_vars().into_iter().collect::<BTreeMap<_, _>>();
     variables.extend([
         ("NO_COLOR".to_owned(), "1".to_owned()),
         ("TERM".to_owned(), "xterm-256color".to_owned()),
-        ("ZUNO_PURE".to_owned(), "1".to_owned()),
         ("ZUNO_AUTH_CONTENT".to_owned(), "{}".to_owned()),
         ("ZUNO_DISABLE_MODELS_FETCH".to_owned(), "true".to_owned()),
-        ("OPENCODE_CONFIG_CONTENT".to_owned(), config),
+        ("ZUNO_CONFIG_CONTENT".to_owned(), config),
     ]);
     variables
 }
@@ -158,7 +153,7 @@ fn run_tui(
         std::io::Error::other("`script` is required to give the TUI a real PTY; install util-linux")
     })?;
     let command = format!(
-        "stty rows {VIEWPORT_ROWS} cols {VIEWPORT_COLUMNS}; {} --pure --prompt 'route probe' --auto",
+        "stty rows {VIEWPORT_ROWS} cols {VIEWPORT_COLUMNS}; {} --prompt 'route probe' --auto",
         shell_quote(&binary().to_string_lossy())
     );
     let mut child = Command::new(script)

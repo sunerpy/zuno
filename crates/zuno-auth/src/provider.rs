@@ -43,11 +43,10 @@ use crate::store::{self, PermissionWarning};
 
 /// The environment variable that replaces every read of `auth.json` —
 /// `auth/index.ts:59`.
-pub const OPENCODE_AUTH_CONTENT: &str = "OPENCODE_AUTH_CONTENT";
+pub const ZUNO_AUTH_CONTENT: &str = "ZUNO_AUTH_CONTENT";
 
-/// The placeholder an OAuth provider stores where an API key would go —
-/// `auth/index.ts:8`.
-pub const OAUTH_DUMMY_KEY: &str = "opencode-oauth-dummy-key";
+/// The placeholder an OAuth provider stores where an API key would go.
+pub const OAUTH_DUMMY_KEY: &str = "zuno-oauth-dummy-key";
 
 /// One provider's credential.
 ///
@@ -151,7 +150,7 @@ impl Credentials {
 
 /// Reader and writer for `auth.json`.
 ///
-/// # `OPENCODE_AUTH_CONTENT` replaces reads, not writes
+/// # `ZUNO_AUTH_CONTENT` replaces reads, not writes
 ///
 /// When the variable holds a JSON object, it becomes the entire result of
 /// [`AuthStore::all`] and the file on disk is not consulted —
@@ -162,7 +161,7 @@ impl Credentials {
 /// mutation performed while the variable is set writes the **variable's** content
 /// plus the mutation to the **file**, erasing whatever the file held. Against the
 /// 1.18.12 binary, a file holding `filealpha` and `filebeta` plus
-/// `OPENCODE_AUTH_CONTENT={"envgamma":…,"filebeta":…}` plus
+/// `ZUNO_AUTH_CONTENT={"envgamma":…,"filebeta":…}` plus
 /// `opencode auth logout filebeta` left exactly `{"envgamma":…}` on disk;
 /// `filealpha` was gone. This crate reproduces that, because a divergence would
 /// mean the two binaries disagree about the user's credentials.
@@ -184,7 +183,7 @@ impl AuthStore {
         }
     }
 
-    /// A store over an explicit path, honouring `OPENCODE_AUTH_CONTENT` from
+    /// A store over an explicit path, honouring `ZUNO_AUTH_CONTENT` from
     /// `env`.
     ///
     /// Taking the environment as a value rather than reading the process's own
@@ -193,12 +192,12 @@ impl AuthStore {
     pub fn with_env(path: impl Into<PathBuf>, env: &Env) -> Self {
         Self {
             path: path.into(),
-            auth_content: env.value(OPENCODE_AUTH_CONTENT).map(str::to_owned),
+            auth_content: env.value(ZUNO_AUTH_CONTENT).map(str::to_owned),
         }
     }
 
     /// The store for a resolved layout — `data()/auth.json` — honouring
-    /// `OPENCODE_AUTH_CONTENT` from `env`.
+    /// `ZUNO_AUTH_CONTENT` from `env`.
     #[must_use]
     pub fn resolve(layout: &Layout, env: &Env) -> Self {
         Self::with_env(layout.auth_file(), env)
@@ -210,7 +209,7 @@ impl AuthStore {
         &self.path
     }
 
-    /// Whether an `OPENCODE_AUTH_CONTENT` override is in effect for reads.
+    /// Whether an `ZUNO_AUTH_CONTENT` override is in effect for reads.
     #[must_use]
     pub fn has_env_override(&self) -> bool {
         self.auth_content
@@ -232,7 +231,7 @@ impl AuthStore {
                 Err(_) => {
                     tracing::warn!(
                         provider = %provider,
-                        source = OPENCODE_AUTH_CONTENT,
+                        source = ZUNO_AUTH_CONTENT,
                         "credential is not a recognized shape and was ignored"
                     );
                 }
@@ -241,7 +240,7 @@ impl AuthStore {
         Some(entries)
     }
 
-    /// Every credential, from `OPENCODE_AUTH_CONTENT` if it parses and from the
+    /// Every credential, from `ZUNO_AUTH_CONTENT` if it parses and from the
     /// file otherwise — `auth/index.ts:58-67`.
     ///
     /// Entries that do not decode are dropped and listed in
@@ -379,6 +378,11 @@ mod tests {
         assert_eq!(loaded.get("acme"), Some(&wellknown()));
         assert!(loaded.skipped.is_empty());
         assert_eq!(loaded.permissions, None);
+    }
+
+    #[test]
+    fn oauth_credentials_use_the_zuno_placeholder_key() {
+        assert_eq!(OAUTH_DUMMY_KEY, "zuno-oauth-dummy-key");
     }
 
     /// The on-disk field names are what the TypeScript binary reads.

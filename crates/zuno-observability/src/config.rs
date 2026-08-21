@@ -8,14 +8,14 @@
 //! ```text
 //! // :56-65
 //! export function minimumLogLevel() {
-//!   const value = process.env.OPENCODE_LOG_LEVEL?.toUpperCase()
+//!   const value = process.env.ZUNO_LOG_LEVEL?.toUpperCase()
 //!   const levels = { DEBUG: "Debug", INFO: "Info", WARN: "Warn", ERROR: "Error" } as const
 //!   return value && value in levels ? levels[value as keyof typeof levels] : levels.INFO
 //! }
 //!
 //! // :67-69
 //! export function loggers() {
-//!   return process.env.OPENCODE_PRINT_LOGS === "1" ? [fileLogger(), stderrLogger] : [fileLogger()]
+//!   return process.env.ZUNO_PRINT_LOGS === "1" ? [fileLogger(), stderrLogger] : [fileLogger()]
 //! }
 //! ```
 //!
@@ -26,9 +26,9 @@
 //!    There are exactly four accepted values; `TRACE` is *not* one of them, and the
 //!    CLI's `--log-level` restricts itself to the same four
 //!    (`packages/opencode/src/index.ts:58-62`).
-//! 3. **`OPENCODE_PRINT_LOGS` is compared with `=== "1"`**, not through the
+//! 3. **`ZUNO_PRINT_LOGS` is compared with `=== "1"`**, not through the
 //!    `truthy()` helper in `packages/core/src/flag/flag.ts:3-6` that most other
-//!    `OPENCODE_*` booleans use. `OPENCODE_PRINT_LOGS=true` therefore does **not**
+//!    `ZUNO_*` booleans use. `ZUNO_PRINT_LOGS=true` therefore does **not**
 //!    enable printing. Matching `truthy()` here would be a silent behaviour
 //!    divergence.
 //!
@@ -50,10 +50,8 @@ pub const ENV_PRINT_LOGS: &str = "ZUNO_PRINT_LOGS";
 /// The only value of [`ENV_PRINT_LOGS`] the oracle treats as enabled.
 pub const PRINT_LOGS_ENABLED: &str = "1";
 
-/// The rolling log file name prefix, matching the oracle's `opencode.log`
-/// (`packages/core/src/observability/logging.ts:49`) as closely as a rotating
-/// scheme allows. See [`crate::LogConfig::rotation`].
-pub const LOG_FILE_PREFIX: &str = "opencode";
+/// The rolling log file name prefix.
+pub const LOG_FILE_PREFIX: &str = "zuno";
 
 /// The rolling log file name suffix.
 pub const LOG_FILE_SUFFIX: &str = "log";
@@ -65,7 +63,7 @@ pub const DEFAULT_MAX_LOG_FILES: usize = 14;
 ///
 /// Deliberately a closed set of four. The oracle accepts exactly `DEBUG`, `INFO`,
 /// `WARN` and `ERROR` and silently maps anything else to `INFO`, so adding a
-/// `Trace` variant here would let `OPENCODE_LOG_LEVEL=TRACE` behave differently in
+/// `Trace` variant here would let `ZUNO_LOG_LEVEL=TRACE` behave differently in
 /// the two implementations. `TRACE` is still reachable, but only through
 /// [`LogConfig::directives`], which is programmatic and therefore cannot diverge
 /// from a user's environment.
@@ -123,23 +121,20 @@ impl LogLevel {
 
 /// How the rolling file appender names and retires files.
 ///
-/// The oracle appends forever to a single `opencode.log`
-/// (`packages/core/src/observability/logging.ts:49-52`), which is why the file name
-/// prefix matches. A long-running agent that logs every tool call and every
-/// provider request cannot share that policy — an unrotated file grows without
-/// bound — so the default here rotates daily and keeps
-/// [`DEFAULT_MAX_LOG_FILES`] files, producing `opencode.<YYYY-MM-DD>.log`.
+/// A long-running agent can log every tool call and provider request, so the
+/// default rotates daily and keeps [`DEFAULT_MAX_LOG_FILES`] files, producing
+/// `zuno.<YYYY-MM-DD>.log`.
 ///
-/// [`Self::Never`] exists for tests and for the oracle-parity case, where a single
-/// predictable `opencode.log` is worth more than rotation.
+/// [`Self::Never`] exists for tests and deployments that prefer one predictable
+/// `zuno.log` file over rotation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Rotation {
-    /// One file per day: `opencode.2026-08-05.log`.
+    /// One file per day: `zuno.2026-08-05.log`.
     #[default]
     Daily,
-    /// One file per hour: `opencode.2026-08-05-14.log`.
+    /// One file per hour: `zuno.2026-08-05-14.log`.
     Hourly,
-    /// A single `opencode.log`, appended to forever. Matches the oracle.
+    /// A single `zuno.log`, appended to forever.
     Never,
 }
 
@@ -387,7 +382,7 @@ mod tests {
     /// `TRACE` is deliberately absent. The oracle's map has four keys and its CLI
     /// `--log-level` has the same four choices
     /// (`packages/opencode/src/index.ts:58-62`), so accepting a fifth here would
-    /// make `OPENCODE_LOG_LEVEL=TRACE` mean different things in the two
+    /// make `ZUNO_LOG_LEVEL=TRACE` mean different things in the two
     /// implementations.
     #[test]
     fn unrecognized_levels_including_trace_do_not_parse() {
@@ -443,17 +438,17 @@ mod tests {
     }
 
     #[test]
-    fn never_rotating_reproduces_the_oracles_single_file_name() {
+    fn never_rotating_uses_the_zuno_log_file_name() {
         let config =
             LogConfig::from_env("/tmp/zuno-observability-unit").with_rotation(Rotation::Never);
-        assert_eq!(config.file_name_prefix(), "opencode.log");
+        assert_eq!(config.file_name_prefix(), "zuno.log");
     }
 
     #[test]
-    fn rotating_files_share_the_oracles_prefix() {
+    fn rotating_files_share_the_zuno_prefix() {
         let config = LogConfig::from_env("/tmp/zuno-observability-unit");
         assert_eq!(config.rotation, Rotation::Daily);
-        assert_eq!(config.file_name_prefix(), "opencode.");
+        assert_eq!(config.file_name_prefix(), "zuno.");
     }
 
     #[test]

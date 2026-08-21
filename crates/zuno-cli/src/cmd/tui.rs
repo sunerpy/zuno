@@ -21,7 +21,7 @@
 //! [`zuno_engine::r#loop::TurnEvent`]s on the channel the application already
 //! consumes. Nothing about that is an optimisation: the loop is the only consumer of
 //! terminal input, engine events **and** the terminal-lease wake, so a turn awaited
-//! inside a component handler would stop all three and deadlock against a plugin's
+//! inside a component handler would stop all three and deadlock against a requester's
 //! terminal lease.
 //!
 //! The prompt channel holds exactly one message, which is what makes a second
@@ -291,7 +291,6 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
     let mcp_projection = McpProjection::new(project_mcp_snapshots(&mcp_controller.snapshots()));
     let mcp_dirty = Arc::new(AtomicBool::new(!initial_mcp_targets.is_empty()));
     let reference_source = super::tui_reference::ProjectFiles::build(&reference_root)?;
-    let tui_plugins = runtime.block_on(plan.load_tui_plugins(environment));
     // Read before `TurnHost::open` consumes the plan, and before raw mode, so a slow
     // skill scan cannot delay the first frame of an already-entered alternate screen.
     let facts = runtime.block_on(SessionFacts::resolve(&plan, environment));
@@ -327,8 +326,6 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
     // printed after teardown has to name, and by then the host is gone — a driver task
     // owns it and is aborted, not joined, so nothing survives to be asked.
     let resumed_session = host.session_id().to_owned();
-    let engine_sender = host.with_event_hooks(engine_sender);
-    let plugins = host.plugin_runtime();
     let slash_commands = host
         .commands()
         .map(|command| CatalogCommand::new(command.name.clone(), command.description.clone()))
@@ -374,7 +371,7 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
     facts.describe(
         &mut screen,
         host.tool_count(),
-        RuntimeIdentity::resolve(host.session_id(), plugins.as_ref(), environment.resolved()),
+        RuntimeIdentity::resolve(host.session_id(), host.profile_id(), environment.resolved()),
     );
     // Before every notice below, and that order is load-bearing in both directions.
     //
@@ -530,12 +527,6 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         // been appended. `try_send` wakes this task immediately and an append is a single
         // write, so what is lost is a recall, never the turn, which has already run.
         history.abort();
-        if let Some(plugins) = plugins {
-            plugins.shutdown().await;
-        }
-        if let Some(plugins) = tui_plugins {
-            plugins.shutdown().await;
-        }
         outcome
     });
     drop(session);
@@ -834,7 +825,7 @@ impl SessionFacts {
         screen.set_diagnostics(
             vec![
                 zuno_tui::views::diagnostics::Group::new("LSP servers", self.lsp.clone()),
-                zuno_tui::views::diagnostics::Group::new("Plugins", runtime.plugins),
+                zuno_tui::views::diagnostics::Group::new("Harness", runtime.harness),
             ],
             zuno_tui::views::diagnostics::DebugFacts {
                 build: Some(crate::version::BUILD_ID.to_owned()),
@@ -893,7 +884,7 @@ impl SessionFacts {
 /// before the host is created, and the session id does not exist until then.
 struct RuntimeIdentity {
     session: String,
-    plugins: Vec<zuno_tui::views::ambient::Service>,
+    harness: Vec<zuno_tui::views::ambient::Service>,
     terminal: Option<String>,
 }
 
@@ -904,33 +895,13 @@ impl RuntimeIdentity {
     /// `WezTerm`), while the latter names its termcap entry (`xterm-256color`), and
     /// several unrelated emulators report the same `TERM`. Neither is guaranteed, so an
     /// absent value is omitted rather than guessed.
-    fn resolve(
-        session: &str,
-        plugins: Option<&std::sync::Arc<super::plugin_runtime::PluginRuntime>>,
-        env: &zuno_paths::Env,
-    ) -> Self {
+    fn resolve(session: &str, profile_id: &str, env: &zuno_paths::Env) -> Self {
         use zuno_tui::views::ambient::{Health, Service};
-        let plugins = plugins
-            .map(|runtime| {
-                runtime
-                    .census()
-                    .into_iter()
-                    .map(|(id, hooks)| {
-                        let detail = if hooks.is_empty() {
-                            String::from("no hooks")
-                        } else {
-                            hooks.join(", ")
-                        };
-                        // `Ready`, because a plugin in this list is loaded: the load either
-                        // succeeded or the plugin is not here to be listed.
-                        Service::new(id, Health::Ready).detailed(detail)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
         Self {
             session: session.to_owned(),
-            plugins,
+            harness: vec![
+                Service::new(profile_id.to_owned(), Health::Ready).detailed("active profile"),
+            ],
             terminal: env
                 .value("TERM_PROGRAM")
                 .or_else(|| env.value("TERM"))
@@ -1206,9 +1177,8 @@ async fn apply_selection(
     .await;
     match rebuilt {
         Ok(replacement) => {
-            let hooked = replacement.with_event_hooks(rebuild.events.clone());
             *host = replacement;
-            Some(hooked)
+            Some(rebuild.events.clone())
         }
         Err(message) => {
             let _reported = rebuild
@@ -1330,9 +1300,8 @@ async fn refresh_mcp_host(
     .await;
     match rebuilt {
         Ok(replacement) => {
-            let hooked = replacement.with_event_hooks(events.clone());
             driver.host = replacement;
-            Some(hooked)
+            Some(events.clone())
         }
         Err(message) => {
             driver.mcp_dirty.store(true, Ordering::Release);
@@ -1796,7 +1765,10 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    async fn wait_for_editor_pid(path: &std::path::Path) -> u32 {
+    async fn wait_for_editor_pid(
+        path: &std::path::Path,
+        results: &mut mpsc::Receiver<Result<Option<String>, ExternalError>>,
+    ) -> u32 {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if let Ok(value) = std::fs::read_to_string(path)
@@ -1804,7 +1776,15 @@ mod tests {
                 {
                     return pid;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                tokio::select! {
+                    result = results.recv() => {
+                        panic!(
+                            "the editor finished before writing {}: {result:?}",
+                            path.display()
+                        );
+                    }
+                    () = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+                }
             }
         })
         .await
@@ -1907,13 +1887,16 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    const EDITOR_TEST_LEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn external_editor_timeout_kills_and_reaps_before_forced_reclaim() {
         let owner = Arc::new(FakeTerminalOwner::new());
         let transcript = owner.transcript();
         let lease: Arc<dyn TerminalLease> = Arc::new(TerminalBroker::with_timeout(
             owner,
-            std::time::Duration::from_millis(100),
+            EDITOR_TEST_LEASE_TIMEOUT,
         ));
         let (_directory, editor, pid_path) = hanging_system_editor();
         let (requests, request_source) = mpsc::channel(1);
@@ -1933,7 +1916,7 @@ mod tests {
             .send(EditorRequest::new("draft"))
             .await
             .expect("worker accepts the request");
-        let pid = wait_for_editor_pid(&pid_path).await;
+        let pid = wait_for_editor_pid(&pid_path, &mut result_source).await;
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), result_source.recv())
             .await
             .expect("the lease deadline cancels the editor")
@@ -1963,7 +1946,7 @@ mod tests {
         });
         let lease: Arc<dyn TerminalLease> = Arc::new(TerminalBroker::with_timeout(
             Arc::clone(&owner) as Arc<dyn zuno_engine::terminal_lease::TerminalOwner>,
-            std::time::Duration::from_millis(100),
+            EDITOR_TEST_LEASE_TIMEOUT,
         ));
         let (requests, request_source) = mpsc::channel(1);
         let (results, mut result_source) = mpsc::channel(1);
@@ -1982,8 +1965,8 @@ mod tests {
             .send(EditorRequest::new("draft"))
             .await
             .expect("worker accepts the request");
-        let wrapper_pid = wait_for_editor_pid(&wrapper_pid_path).await;
-        let descendant_pid = wait_for_editor_pid(&descendant_pid_path).await;
+        let wrapper_pid = wait_for_editor_pid(&wrapper_pid_path, &mut result_source).await;
+        let descendant_pid = wait_for_editor_pid(&descendant_pid_path, &mut result_source).await;
         let wrapper_cleanup = ProcessCleanup(wrapper_pid);
         let descendant_cleanup = ProcessCleanup(descendant_pid);
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), result_source.recv())
@@ -2085,7 +2068,7 @@ mod tests {
                 .wait_until(std::time::Duration::from_secs(5), |transitions| {
                     transitions
                         .iter()
-                        .any(|transition| transition.plugin() == "tui")
+                        .any(|transition| transition.requester() == "tui")
                 })
                 .await,
             "the editor did not acquire the lease"
@@ -2116,7 +2099,7 @@ mod tests {
         let lease: Arc<dyn TerminalLease> = Arc::new(TerminalBroker::new(owner));
         let (_directory, editor, pid_path) = hanging_system_editor();
         let (requests, request_source) = mpsc::channel(1);
-        let (results, _result_source) = mpsc::channel(1);
+        let (results, mut result_source) = mpsc::channel(1);
         let (wake, _wake_source) = zuno_tui::app::terminal_event_channel();
         let (_shutdown, shutdown_source) = tokio::sync::watch::channel(false);
         let worker = tokio::spawn(drive_external_editor(
@@ -2136,12 +2119,12 @@ mod tests {
                 .wait_until(std::time::Duration::from_secs(5), |transitions| {
                     transitions
                         .iter()
-                        .any(|transition| transition.plugin() == "tui")
+                        .any(|transition| transition.requester() == "tui")
                 })
                 .await,
             "the editor did not acquire the lease"
         );
-        let pid = wait_for_editor_pid(&pid_path).await;
+        let pid = wait_for_editor_pid(&pid_path, &mut result_source).await;
 
         worker.abort();
         let cancelled = worker.await.expect_err("the worker task was cancelled");

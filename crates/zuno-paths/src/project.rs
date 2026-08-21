@@ -32,8 +32,8 @@ use crate::walk;
 pub const GLOBAL_PROJECT_ID: &str = "global";
 
 /// The marker file inside the Git common directory that caches a previously
-/// resolved project id — `Project.cached` reads `<commonDirectory>/opencode`.
-pub const PROJECT_ID_MARKER: &str = "opencode";
+/// resolved project id.
+pub const PROJECT_ID_MARKER: &str = "zuno";
 
 /// The prefix hashed together with a normalized remote to form a project id.
 pub const REMOTE_ID_PREFIX: &str = "git-remote:";
@@ -116,18 +116,8 @@ pub fn discover_repository(start: &Path) -> Option<Repository> {
 /// # The returned id may not be the one on disk yet
 ///
 /// `remote ?? previous ?? root_commit` is the *current* precedence, but real
-/// disks predate it. Measured on this machine: the oracle's own checkout has
-/// `origin = github.com/anomalyco/opencode`, so this function returns
-/// `012780c4…`, while its existing snapshot store sits under `4b0ea68d…` — the
-/// root commit — and `.git/opencode` still caches that older value. Every
-/// `.git/opencode` marker found here holds a root commit, remote or not.
-///
-/// So a consumer that keys storage on `id` alone will silently abandon the user's
-/// existing data. Consult [`ResolvedProject::previous`] and migrate, the way
-/// `packages/opencode/src/project/project.ts:221`'s `migrateProjectId` does for
-/// database rows. Recorded in full in
-/// `.omo/notepads/opencode-rust/issues.md` for todos 20 and 23, which own the
-/// migration.
+/// The cached marker remains the second choice so a project without a usable
+/// remote keeps a stable id across root-history changes.
 #[must_use]
 pub fn resolve_project(start: &Path) -> ResolvedProject {
     let Some(repository) = discover_repository(start) else {
@@ -155,7 +145,7 @@ pub fn resolve_project(start: &Path) -> ResolvedProject {
     }
 }
 
-/// The id cached at `<common_directory>/opencode`, trimmed; `None` when the file
+/// The id cached at `<common_directory>/zuno`, trimmed; `None` when the file
 /// is missing or blank.
 #[must_use]
 pub fn cached_project_id(common_directory: &Path) -> Option<String> {
@@ -197,11 +187,8 @@ pub fn project_id_for_remote(normalized_remote: &str) -> String {
 /// graft or an octopus merge of unrelated histories; the oracle sorts and takes
 /// the first so the id is stable regardless of Git's traversal order.
 ///
-/// Historically this was the *only* id, which is why real disks are full of
-/// snapshot stores and `.git/opencode` markers holding a root commit even for
-/// repositories that have a remote. [`ResolvedProject::previous`] is how a
-/// consumer reaches that older id; see the migration warning on
-/// [`resolve_project`].
+/// The cached marker is the stable fallback for repositories without a usable
+/// remote; this value is only consulted when no marker is present.
 #[must_use]
 pub fn root_commit_project_id(repository: &Repository) -> Option<String> {
     let output = git(
@@ -402,6 +389,11 @@ mod tests {
         assert_eq!(resolved.directory, Path::new("/"));
         assert_eq!(resolved.vcs, None);
         assert_eq!(resolved.previous, None);
+    }
+
+    #[test]
+    fn the_project_id_marker_uses_the_zuno_identity() {
+        assert_eq!(PROJECT_ID_MARKER, "zuno");
     }
 
     #[test]

@@ -169,6 +169,7 @@ fn status_soft_interrupt_injects_at_safe_point_without_cancelling() {
     let control = registry.control(SESSION_ID);
     let turn = registry.begin_turn(SESSION_ID).expect("active turn");
     let message = SoftInterruptMessage {
+        input_id: None,
         content: "Please include the latest benchmark.".to_owned(),
         images: vec![("image/png".to_owned(), "aW1hZ2U=".to_owned())],
         urgent: false,
@@ -207,6 +208,7 @@ fn status_urgent_soft_interrupt_skips_remaining_tools_in_event_sequence() {
     emit_tool_events(&mut emitted, "call-1", "first");
     control
         .queue_soft_interrupt(SoftInterruptMessage {
+            input_id: None,
             content: "Stop the remaining tools and use this correction.".to_owned(),
             images: Vec::new(),
             urgent: true,

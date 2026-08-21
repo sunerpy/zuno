@@ -9,7 +9,7 @@ use zuno_llm::catalog::{Catalog, CatalogSource, CatalogStatus, ResolveInput};
 use crate::command::ModelsArgs;
 use crate::environment::StartupEnvironment;
 
-const OPENCODE_ENABLE_EXPERIMENTAL_MODELS: &str = "OPENCODE_ENABLE_EXPERIMENTAL_MODELS";
+const ZUNO_ENABLE_EXPERIMENTAL_MODELS: &str = "ZUNO_ENABLE_EXPERIMENTAL_MODELS";
 
 pub(super) fn execute(args: &ModelsArgs, environment: &StartupEnvironment) -> Result<(), String> {
     let directory = std::env::current_dir().map_err(|error| error.to_string())?;
@@ -17,7 +17,7 @@ pub(super) fn execute(args: &ModelsArgs, environment: &StartupEnvironment) -> Re
     let worktree = project.vcs.as_ref().map(|_| project.directory.as_path());
     let env = environment.resolved();
     let layout = zuno_paths::Layout::resolve(env);
-    let mut config = zuno_config::discovery::discover_with(
+    let config = zuno_config::discovery::discover_with(
         &zuno_config::discovery::DiscoveryOptions::new(&directory, worktree, env.clone()),
     )
     .map_err(|error| error.report())?;
@@ -45,49 +45,7 @@ pub(super) fn execute(args: &ModelsArgs, environment: &StartupEnvironment) -> Re
             .map(zuno_llm::catalog::LoadedCatalog::into_document)
             .map_err(|error| error.to_string())?;
 
-        let policy = super::plugin_runtime::JsPluginPolicy::resolve(&config, env);
-        // Named only when a plugin was configured and the host is off. Announcing it
-        // unprompted would be noise on every run; staying silent for someone whose
-        // configured plugin stopped contributing models is the "no results" and
-        // "cannot see the data" confusion. stderr, so piped stdout stays a clean
-        // `provider/model` list.
-        if policy.should_explain_absence()
-            && config.plugin.as_ref().is_some_and(|list| !list.is_empty())
-        {
-            eprintln!(
-                "note: {} configured plugin(s) are not loaded because the JavaScript \
-                 plugin host is off ({}); enable it with `{}=1` or \
-                 `\"plugin_runtime\": {{\"javascript\": true}}`",
-                config.plugin.as_ref().map_or(0, Vec::len),
-                policy.source.as_str(),
-                crate::ZUNO_ENABLE_JS_PLUGINS,
-            );
-        }
-        let Some(plugins) = super::plugin_runtime::PluginRuntime::load(
-            &config,
-            &project,
-            &directory,
-            worktree.unwrap_or(directory.as_path()),
-            &layout,
-            policy,
-            super::plugin_runtime::PluginRuntimeTarget::server("models"),
-        )
-        .await
-        else {
-            return Ok(resolve_catalog(&document, &config, &credentials, env));
-        };
-        let result: Result<Catalog, String> = async {
-            plugins.apply_config(&mut config).await?;
-            let mut catalog = resolve_catalog(&document, &config, &credentials, env);
-            plugins.apply_catalog(&mut catalog, &credentials).await?;
-            Ok(catalog)
-        }
-        .await;
-        for diagnostic in plugins.take_diagnostics() {
-            eprintln!("{diagnostic}");
-        }
-        plugins.shutdown().await;
-        result
+        Ok::<Catalog, String>(resolve_catalog(&document, &config, &credentials, env))
     })?;
 
     if let Some(provider_id) = args.provider.as_deref() {
@@ -121,7 +79,7 @@ fn resolve_catalog(
                 .map(|(key, value)| (key.to_owned(), value.to_owned()))
                 .collect(),
         )
-        .with_experimental_models(env.flag(OPENCODE_ENABLE_EXPERIMENTAL_MODELS));
+        .with_experimental_models(env.flag(ZUNO_ENABLE_EXPERIMENTAL_MODELS));
     Catalog::resolve(document, &input)
 }
 

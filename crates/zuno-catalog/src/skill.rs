@@ -383,11 +383,10 @@ fn duplicate_count(warnings: &[SkillWarning]) -> usize {
         .count()
 }
 
-/// Discover and load every skill, in the oracle's root order.
+/// Discover and load every skill.
 ///
-/// The built-in `customize-opencode` is registered **before** disk discovery
-/// (`skill/index.ts:276-283`), so a user's own skill of that name replaces it and
-/// gets a duplicate warning — exactly as the oracle intends.
+/// The built-in `customize-zuno` is registered before disk discovery, so a
+/// user's own skill of that name replaces it and gets a duplicate warning.
 ///
 /// Never fails: an unreadable file, an invalid frontmatter block, or an
 /// unreachable `skills.urls[]` entry becomes a [`SkillWarning`].
@@ -659,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn the_builtin_uses_zuno_identity_and_keeps_the_compatibility_config_filename() {
+    fn the_builtin_uses_zuno_identity_and_native_configuration() {
         let mut skills = Skills::default();
         skills.insert(builtin::skill());
         let built_in = skills.get(builtin::NAME).expect("present");
@@ -675,10 +674,10 @@ mod tests {
                 .content
                 .contains(&format!("{}.json", zuno_paths::CONFIG_FILE_STEM))
         );
+        assert!(!built_in.content.contains("opencode.ai/config.json"));
+        assert!(!built_in.content.contains("\"plugin\""));
         // The skill is what a model reads before writing config, so a stale
-        // filename here teaches the old name to every session. `opencode.ai` is
-        // still the published schema URL and `@opencode-ai/plugin` is the plugin
-        // ABI, so only the *filename* spellings are forbidden.
+        // filename here teaches the old name to every session.
         for stale in [
             &format!("{}.json", zuno_paths::LEGACY_CONFIG_FILE_STEM),
             &format!("{}.jsonc", zuno_paths::LEGACY_CONFIG_FILE_STEM),

@@ -179,11 +179,10 @@ pub const PATTERNS: &[(&str, &str)] = &[
         r"never\s+(?:\w+\s+){0,8}(?:create|write)\s+(?:\w+\s+){0,8}(?:script|file)\s+(?:\w+\s+){0,8}disk",
         "anti_forensic_disk",
     ),
-    // RETARGET: `OPENCODE` added to the reference's runtime list; unsetting this
-    // agent's own env is the same sub-session-bypass behaviour the pattern exists
-    // to catch.
+    // RETARGET: `ZUNO` covers this agent's own runtime variables; unsetting them
+    // is the same sub-session-bypass behaviour the pattern exists to catch.
     (
-        r"unset\s+\w*(?:CLAUDE|CODEX|HERMES|OPENCODE|AGENT|OPENAI|ANTHROPIC)\w*",
+        r"unset\s+\w*(?:CLAUDE|CODEX|HERMES|OPENCODE|ZUNO|AGENT|OPENAI|ANTHROPIC)\w*",
         "env_var_unset_agent",
     ),
     // ── Named C2 / red-team frameworks — scope "context" (3 of 17) ───────────
@@ -553,7 +552,7 @@ mod tests {
             );
         }
         assert_eq!(
-            first_threat("unset OPENCODE_CONFIG_DIR"),
+            first_threat("unset ZUNO_CONFIG_DIR"),
             Some(Threat::Pattern("env_var_unset_agent")),
         );
     }

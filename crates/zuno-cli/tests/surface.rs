@@ -2,8 +2,8 @@ use std::process::Command;
 
 use clap::{CommandFactory as _, Parser as _};
 use zuno_cli::{
-    Action, BUILD_ID, COMPATIBILITY_VERSION, Cli, CommandDispatcher as _, Disposition,
-    dispositions, long_version, user_agent, validate_upstream_surface,
+    Action, BUILD_ID, Cli, CommandDispatcher as _, Disposition, RUST_PACKAGE_VERSION, dispositions,
+    long_version, user_agent, validate_upstream_surface,
 };
 
 const UPSTREAM_COMMANDS: &str = include_str!("fixtures/upstream-commands-1.18.13.txt");
@@ -72,21 +72,18 @@ fn surface_registered_commands_match_their_dispositions() {
 }
 
 #[test]
-fn surface_compatibility_version_and_rust_identity_are_separate() {
-    // npm plugins compare this value with `engines.opencode`. It is the pinned
-    // upstream compatibility baseline, not Zuno's package or build version.
-    assert_eq!(COMPATIBILITY_VERSION, "1.18.13");
-    assert_ne!(BUILD_ID, COMPATIBILITY_VERSION);
+fn surface_version_reports_only_zuno_identity() {
     assert!(long_version().contains(BUILD_ID));
-    assert!(long_version().contains(COMPATIBILITY_VERSION));
+    assert!(long_version().contains(RUST_PACKAGE_VERSION));
+    assert!(!long_version().contains("opencode"));
     assert!(user_agent().starts_with("zuno/"));
-    assert!(!user_agent().starts_with("opencode/"));
+    assert!(!user_agent().contains("opencode"));
 
     let short = binary().arg("--version").output().expect("run --version");
     assert!(short.status.success());
     assert_eq!(
         String::from_utf8_lossy(&short.stdout).trim(),
-        COMPATIBILITY_VERSION
+        RUST_PACKAGE_VERSION
     );
 
     let long = binary()
@@ -96,17 +93,15 @@ fn surface_compatibility_version_and_rust_identity_are_separate() {
     assert!(long.status.success());
     let stdout = String::from_utf8_lossy(&long.stdout);
     assert!(stdout.contains(BUILD_ID));
-    assert!(stdout.contains(COMPATIBILITY_VERSION));
+    assert!(stdout.contains(RUST_PACKAGE_VERSION));
+    assert!(!stdout.contains("opencode"));
 }
 
 #[test]
 fn surface_zuno_user_agent_is_pinned() {
     assert_eq!(
         user_agent(),
-        format!(
-            "zuno/{} (build {BUILD_ID}; compatible-opencode/{COMPATIBILITY_VERSION})",
-            env!("CARGO_PKG_VERSION")
-        )
+        format!("zuno/{} (build {BUILD_ID})", env!("CARGO_PKG_VERSION"))
     );
 }
 
@@ -115,7 +110,8 @@ fn surface_zuno_long_display_version_is_pinned() {
     let display = long_version();
     assert!(display.starts_with("Zuno "), "{display}");
     assert!(display.contains(BUILD_ID), "{display}");
-    assert!(display.contains(COMPATIBILITY_VERSION), "{display}");
+    assert!(display.contains(RUST_PACKAGE_VERSION), "{display}");
+    assert!(!display.contains("opencode"), "{display}");
 }
 
 #[test]
@@ -132,8 +128,13 @@ fn surface_console_is_rejected_with_scope_and_replacement() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("hosted"), "{stderr}");
-    assert!(stderr.contains("excluded"), "{stderr}");
+    assert!(stderr.contains("does not provide"), "{stderr}");
     assert!(stderr.contains("providers"), "{stderr}");
+    assert!(stderr.contains("auth"), "{stderr}");
+    assert!(
+        !stderr.to_ascii_lowercase().contains("opencode"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -411,7 +412,6 @@ fn probe_binary(argv: &[&str], root: &std::path::Path) -> std::process::Output {
         .env("ZUNO_DB", root.join("opencode.db"))
         .env("ZUNO_DISABLE_AUTOUPDATE", "true")
         .env("ZUNO_DISABLE_MODELS_FETCH", "true")
-        .env("ZUNO_DISABLE_DEFAULT_PLUGINS", "true")
         .env("ZUNO_DISABLE_LSP_DOWNLOAD", "true")
         .output()
         .unwrap_or_else(|error| panic!("{argv:?} must run: {error}"))

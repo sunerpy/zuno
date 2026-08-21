@@ -64,7 +64,7 @@ impl MemorySource for OverThreshold {
 
 #[test]
 fn a_memory_incident_reaches_the_log_file_through_the_production_sink() {
-    // `Rotation::Never` so the file name is `opencode.log` and not today's date, which is
+    // `Rotation::Never` so the file name is `zuno.log` and not today's date, which is
     // what lets this assert on bytes rather than on a glob.
     let directory = tempfile::tempdir().expect("a temporary directory");
     let log_dir = directory.path().join("log");
@@ -78,7 +78,7 @@ fn a_memory_incident_reaches_the_log_file_through_the_production_sink() {
     );
 
     let sampler = MemorySampler::spawn_with(Duration::from_millis(20), OverThreshold, TracingSink);
-    let log_path = log_dir.join("opencode.log");
+    let log_path = log_dir.join("zuno.log");
     let deadline = Instant::now() + DEADLINE;
     let mut contents = String::new();
     while Instant::now() < deadline {

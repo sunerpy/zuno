@@ -1,6 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "{env:OPENCODE_MODEL}",
+  "model": "{env:ZUNO_MODEL}",
   "provider": {
     "anthropic": {
       "models": {},

@@ -6,7 +6,7 @@
     "port": 4096,
     "hostname": "127.0.0.1",
     "mdns": true,
-    "mdnsDomain": "opencode.local",
+    "mdnsDomain": "zuno.local",
     "cors": ["https://example.com"]
   },
   "command": {
@@ -44,11 +44,6 @@
     "ignore": ["node_modules/**", "target/**"]
   },
   "snapshot": false,
-  "plugin": [
-    "opencode-antigravity-auth@1.6.0",
-    ["@sunerpy/oh-my-openagent", { "level": "verbose", "retries": 3 }]
-  ],
-  "plugin_runtime": { "javascript": true },
   "share": "manual",
   "autoupdate": "notify",
   "disabled_providers": ["openai"],
@@ -211,7 +206,7 @@
     "todowrite": "allow",
     "question": "ask",
     "webfetch": "ask",
-    "websearch": "ask",
+    "web_search": "ask",
     "lsp": "allow",
     "doom_loop": "deny",
     "skill": "allow",
@@ -230,6 +225,12 @@
     }
   },
   "enterprise": { "url": "https://opencode.example.com" },
+  "web_search": {
+    "provider": "exa",
+    "max_queries": 4,
+    "max_results": 8,
+    "timeout_ms": 25000
+  },
   "tool_output": { "max_lines": 2000, "max_bytes": 51200 },
   "compaction": {
     "auto": true,

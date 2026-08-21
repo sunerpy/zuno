@@ -10,7 +10,7 @@
 //! `~/.local/share/opencode/opencode.db.bak.20260408` is 2.6 GB, has 14 tables
 //! including `session` with **2,345 sessions**, has no `migration` table, and has a
 //! `__drizzle_migrations` journal with 10 rows. The released TypeScript binary
-//! opens it. This one refused, with `DbError::Migration { version: 38 }`.
+//! opens it. This one refused, with `DbError::Migration { version: 39 }`.
 //!
 //! # Why the fixture is built rather than trimmed
 //!
@@ -59,7 +59,7 @@ const DRIZZLE_JOURNAL_NAMES: [&str; 10] = [
 const REAL_LEGACY_BACKUP: &str = "/config/.local/share/opencode/opencode.db.bak.20260408";
 
 /// Opt-in switch for the real-backup test, which copies a multi-gigabyte file.
-const REAL_LEGACY_ENV: &str = "OPENCODE_LEGACY_DB";
+const REAL_LEGACY_ENV: &str = "ZUNO_LEGACY_DB";
 
 fn temp_dir() -> tempfile::TempDir {
     tempfile::tempdir().expect("create temporary directory")
@@ -179,7 +179,7 @@ fn sorted_migration_ids() -> Vec<String> {
 }
 
 #[test]
-fn legacy_database_with_a_drizzle_journal_migrates_to_all_38_ids() {
+fn legacy_database_with_a_drizzle_journal_migrates_to_all_39_ids() {
     let dir = temp_dir();
     let path = dir.path().join("opencode.db");
     legacy_database(&path, true);
@@ -204,11 +204,11 @@ fn legacy_database_with_a_drizzle_journal_migrates_to_all_38_ids() {
         applied.executed.len(),
     );
 
-    assert_eq!(ids.len(), 38);
+    assert_eq!(ids.len(), 39);
     assert_eq!(sorted(ids.clone()), sorted_migration_ids());
     assert_eq!(&ids[..10], &DRIZZLE_JOURNAL_NAMES[..]);
 
-    assert_eq!(applied.executed.len(), 28);
+    assert_eq!(applied.executed.len(), 29);
     for recorded in DRIZZLE_JOURNAL_NAMES {
         assert!(
             !applied.executed.iter().any(|id| id == recorded),
@@ -288,7 +288,7 @@ fn legacy_migration_reaches_the_same_schema_the_current_creator_does() {
         migrated.len(),
         created.len()
     );
-    assert_eq!(created.len(), 20, "19 schema tables plus migration");
+    assert_eq!(created.len(), 21, "20 schema tables plus migration");
     let migrated_without_drizzle: Vec<String> = migrated
         .iter()
         .filter(|table| *table != "__drizzle_migrations")
@@ -340,10 +340,10 @@ fn legacy_migration_is_idempotent_and_the_second_open_runs_nothing() {
         first.executed.len(),
         second.executed.len()
     );
-    assert_eq!(first.executed.len(), 28);
+    assert_eq!(first.executed.len(), 29);
     assert!(second.executed.is_empty());
     assert!(second.seeded.is_empty());
-    assert_eq!(journal_ids_in_order(&connection).len(), 38);
+    assert_eq!(journal_ids_in_order(&connection).len(), 39);
 }
 
 #[test]
@@ -447,9 +447,9 @@ fn legacy_the_users_real_pre_migration_backup_opens_and_keeps_its_sessions() {
         applied.executed.len(),
     );
 
-    assert_eq!(ids.len(), 38);
+    assert_eq!(ids.len(), 39);
     assert_eq!(sorted(ids), sorted_migration_ids());
-    assert_eq!(applied.executed.len(), 28);
+    assert_eq!(applied.executed.len(), 29);
     assert_eq!(
         count(&connection, "SELECT count(*) FROM session"),
         before_sessions,

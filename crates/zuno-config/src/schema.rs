@@ -55,7 +55,6 @@ pub mod mcp;
 pub mod ordered;
 pub mod parse;
 pub mod permission;
-pub mod plugin;
 pub mod provider;
 pub mod reference;
 
@@ -68,11 +67,10 @@ use crate::schema::lsp::LspConfig;
 use crate::schema::mcp::McpServerConfig;
 use crate::schema::ordered::OrderedMap;
 use crate::schema::permission::PermissionConfig;
-use crate::schema::plugin::PluginSpec;
 use crate::schema::provider::ProviderConfig;
 use crate::schema::reference::ReferenceEntry;
 use serde::{Deserialize, Serialize};
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 
 /// A free-form JSON object, for the oracle's `Record(String, Any | Unknown)`.
 pub type JsonMap = serde_json::Map<String, serde_json::Value>;
@@ -92,8 +90,6 @@ pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "reference",
     "watcher",
     "snapshot",
-    "plugin",
-    "plugin_runtime",
     "share",
     "autoupdate",
     "disabled_providers",
@@ -113,6 +109,7 @@ pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "tools",
     "attachment",
     "enterprise",
+    "web_search",
     "tool_output",
     "compaction",
     "memory",
@@ -184,12 +181,6 @@ pub struct Config {
     /// Record filesystem snapshots so edits can be undone. Defaults to true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<bool>,
-    /// Plugins to load.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub plugin: Option<Vec<PluginSpec>>,
-    /// Which plugin runtimes may start. Absent leaves JavaScript off.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub plugin_runtime: Option<PluginRuntimeConfig>,
     /// Session sharing behaviour.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub share: Option<ShareMode>,
@@ -252,6 +243,9 @@ pub struct Config {
     /// Enterprise deployment settings.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enterprise: Option<EnterpriseConfig>,
+    /// Web-search provider and runtime-owned batch limits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub web_search: Option<WebSearchConfig>,
     /// Thresholds for truncating tool output.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_output: Option<ToolOutputConfig>,
@@ -282,36 +276,6 @@ impl Config {
         self.memory
             .as_ref()
             .map_or_else(ResolvedMemoryConfig::default, MemoryConfig::resolved)
-    }
-
-    /// Whether the configuration asks for the JavaScript plugin host.
-    ///
-    /// `false` for an absent key, which is what makes JavaScript plugins opt-in: each
-    /// one starts a Node process, and paying for that on every invocation is a cost a
-    /// user should choose rather than inherit.
-    #[must_use]
-    pub fn javascript_plugins_enabled(&self) -> bool {
-        self.plugin_runtime
-            .as_ref()
-            .and_then(|runtime| runtime.javascript)
-            .unwrap_or(false)
-    }
-
-    /// Whether out-of-process plugins found on disk may be started.
-    ///
-    /// `true` for an absent key, which is the opposite of
-    /// [`Self::javascript_plugins_enabled`] and deliberately so. JavaScript is
-    /// opt-in because it installs and starts a Node process the user never asked
-    /// for. A process plugin needs no runtime and no install: the user marked a file
-    /// executable and put it in a scanned directory, and there is no second step
-    /// left for them to consent to. Gating it behind the JavaScript switch would
-    /// make one tier's cost decide another tier's reachability.
-    #[must_use]
-    pub fn process_plugins_enabled(&self) -> bool {
-        self.plugin_runtime
-            .as_ref()
-            .and_then(|runtime| runtime.process)
-            .unwrap_or(true)
     }
 }
 
@@ -371,7 +335,7 @@ pub struct ServerConfig {
     /// Advertise the server over mDNS.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mdns: Option<bool>,
-    /// mDNS domain; the runtime defaults to `opencode.local`.
+    /// mDNS domain; the runtime defaults to `zuno.local`.
     #[serde(rename = "mdnsDomain", skip_serializing_if = "Option::is_none")]
     pub mdns_domain: Option<String>,
     /// Additional origins to allow for CORS.
@@ -453,6 +417,33 @@ pub struct EnterpriseConfig {
     pub url: Option<String>,
 }
 
+/// Web-search settings owned by the active profile.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct WebSearchConfig {
+    /// Hosted provider selected for this profile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<WebSearchBackend>,
+    /// Maximum queries accepted in one model call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_queries: Option<NonZeroU32>,
+    /// Maximum sources returned after combining all queries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_results: Option<NonZeroU32>,
+    /// Per-query provider time budget in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<NonZeroU64>,
+}
+
+/// Hosted web-search providers supported by the built-in adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WebSearchBackend {
+    /// Exa MCP search.
+    Exa,
+    /// Parallel MCP search.
+    Parallel,
+}
+
 /// Tool-output truncation thresholds (`config/config.ts:137-150`).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ToolOutputConfig {
@@ -492,23 +483,6 @@ pub const DEFAULT_PROJECT_MEMORY_CHAR_LIMIT: u32 = 3_000;
 
 /// Default delivered-turn interval for background reflection.
 pub const DEFAULT_MEMORY_NUDGE_INTERVAL: u32 = 10;
-
-/// Which plugin runtimes a session may start.
-///
-/// A table of its own rather than a field on any existing key because the decision
-/// is per-runtime: JavaScript costs a Node process per plugin and is therefore
-/// opt-in, while in-process runtimes are not gated here at all. Named
-/// `plugin_runtime` and not `plugins` deliberately — a near-homograph of the
-/// existing `plugin` list would let a typo silently mean the other key.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct PluginRuntimeConfig {
-    /// Start the JavaScript plugin host. Absent means no.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub javascript: Option<bool>,
-    /// Start out-of-process plugins found on disk. Absent means yes.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub process: Option<bool>,
-}
 
 /// Persistent memory: a master boolean, or component settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -29,18 +29,18 @@
 //! # Layer order
 //!
 //! `config/config.ts:398-533` interleaves the Markdown layer between the config
-//! files and `OPENCODE_CONFIG_CONTENT`:
+//! files and `ZUNO_CONFIG_CONTENT`:
 //!
 //! ```text
-//! global config < OPENCODE_CONFIG < project files < per-directory .opencode
-//!   < Markdown agents < OPENCODE_CONFIG_CONTENT < managed preferences
+//! global config < ZUNO_CONFIG < project files < per-directory .opencode
+//!   < Markdown agents < ZUNO_CONFIG_CONTENT < managed preferences
 //! ```
 //!
 //! Both boundaries were confirmed against the binary. A `collide` agent defined in
 //! `opencode.json` with `mode: primary` and in `agent/collide.md` with
 //! `mode: subagent` lists as `subagent` — Markdown wins over a config file. A
 //! `contentwin` agent defined in `agent/contentwin.md` with `mode: subagent` and in
-//! `OPENCODE_CONFIG_CONTENT` with `mode: all` lists as `all` — the env layer wins
+//! `ZUNO_CONFIG_CONTENT` with `mode: all` lists as `all` — the env layer wins
 //! over Markdown.
 //!
 //! # What is deliberately not here
@@ -653,7 +653,7 @@ fn locale_compare(left: &str, right: &str) -> std::cmp::Ordering {
 /// Discover and resolve every agent for one working directory.
 ///
 /// Assembles the layers in the order `config/config.ts:398-533` establishes:
-/// merged config first, then the Markdown layer, then `OPENCODE_CONFIG_CONTENT`
+/// merged config first, then the Markdown layer, then `ZUNO_CONFIG_CONTENT`
 /// re-applied on top — because the merged config already contains that layer's
 /// values, re-applying them is a no-op except that it restores their precedence
 /// over Markdown, which the binary was observed to require.
@@ -701,7 +701,7 @@ pub fn load_map(
     }
 
     let mut agents = merge_agent_maps(&base, &overlay)?;
-    if let Some(text) = env.truthy_value("OPENCODE_CONFIG_CONTENT")
+    if let Some(text) = env.truthy_value("ZUNO_CONFIG_CONTENT")
         && let Ok(layer) = serde_json::from_str::<Config>(text)
         && let Some(from_env) = layer.agent
     {

@@ -374,6 +374,7 @@ fn the_advertised_schema_never_mentions_load_skills() {
         "model",
         "effort",
         "background",
+        "reportDelivery",
         "task_id",
     ] {
         assert!(
@@ -726,12 +727,15 @@ async fn a_background_dispatch_reports_a_job_id_distinct_from_the_session_id() {
         .expect("a background delegation runs");
 
     let child = format!("ses_child_of_{PARENT}");
-    let job = background_id(&child);
-    assert_ne!(job, child);
     assert!(output.output.contains(&format!("<task id=\"{child}\"")));
-    assert!(output.output.contains(&format!("background=\"{job}\"")));
+    assert!(output.output.contains("job=\"job_"));
+    assert!(output.output.contains("reportDelivery=\"nextStep\""));
     assert!(output.output.contains("state=\"running\""));
     assert!(host.dispatched()[0].background);
+    assert_eq!(
+        host.dispatched()[0].report_delivery,
+        ReportDelivery::NextStep
+    );
 }
 
 #[tokio::test]
@@ -749,6 +753,80 @@ async fn a_host_that_reuses_the_session_id_as_its_job_id_is_refused() {
 
     assert!(matches!(error, ToolError::Failed { .. }));
     assert!(message(&error).contains("must be distinguishable"));
+}
+
+#[tokio::test]
+async fn quiet_report_delivery_reaches_the_background_host() {
+    let host = Arc::new(RecordingHost::new());
+    let output = tool(Arc::clone(&host))
+        .run(
+            TaskParams {
+                background: Some(true),
+                report_delivery: Some(ReportDelivery::Quiet),
+                ..to_explorer()
+            },
+            allowed(),
+        )
+        .await
+        .expect("quiet background delegation runs");
+
+    assert!(output.output.contains("reportDelivery=\"quiet\""));
+    assert_eq!(host.dispatched()[0].report_delivery, ReportDelivery::Quiet);
+}
+
+#[tokio::test]
+async fn report_delivery_without_background_is_refused_before_permission_or_dispatch() {
+    let host = Arc::new(RecordingHost::new());
+    let error = tool(Arc::clone(&host))
+        .run(
+            TaskParams {
+                report_delivery: Some(ReportDelivery::Quiet),
+                ..to_explorer()
+            },
+            allowed(),
+        )
+        .await
+        .expect_err("foreground report delivery has no meaning");
+
+    assert!(message(&error).contains("requires `background: true`"));
+    assert!(host.dispatched().is_empty());
+}
+
+#[tokio::test]
+async fn repeated_background_dispatches_receive_fresh_job_ids() {
+    let host = Arc::new(RecordingHost::new());
+    let first = tool(Arc::clone(&host))
+        .run(
+            TaskParams {
+                background: Some(true),
+                task_id: Some("ses_earlier".to_owned()),
+                ..to_explorer()
+            },
+            allowed(),
+        )
+        .await
+        .expect("first background dispatch");
+    let second = tool(host)
+        .run(
+            TaskParams {
+                background: Some(true),
+                task_id: Some("ses_earlier".to_owned()),
+                ..to_explorer()
+            },
+            allowed(),
+        )
+        .await
+        .expect("second background dispatch");
+
+    let job = |output: &str| {
+        output
+            .split("job=\"")
+            .nth(1)
+            .and_then(|tail| tail.split('"').next())
+            .expect("rendered job id")
+            .to_owned()
+    };
+    assert_ne!(job(&first.output), job(&second.output));
 }
 
 #[tokio::test]

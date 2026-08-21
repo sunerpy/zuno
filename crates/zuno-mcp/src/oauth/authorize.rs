@@ -17,7 +17,8 @@ use super::{Discovery, PendingAuthorization};
 struct ClientMetadata {
     redirect_uris: Vec<String>,
     client_name: &'static str,
-    client_uri: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_uri: Option<&'static str>,
     grant_types: [&'static str; 2],
     response_types: [&'static str; 1],
     token_endpoint_auth_method: &'static str,
@@ -142,8 +143,8 @@ async fn client_information(
         })?;
     let metadata = ClientMetadata {
         redirect_uris: vec![redirect_uri.to_owned()],
-        client_name: "OpenCode",
-        client_uri: "https://opencode.ai",
+        client_name: "Zuno",
+        client_uri: None,
         grant_types: ["authorization_code", "refresh_token"],
         response_types: ["code"],
         token_endpoint_auth_method: "none",

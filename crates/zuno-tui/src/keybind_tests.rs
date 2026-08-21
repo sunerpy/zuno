@@ -1,16 +1,16 @@
 //! Keybind engine tests.
 //!
-//! The binding table is a compatibility surface, so the coverage test is driven
-//! by the mechanically extracted upstream fixture rather than a hand-written
-//! list: a row that disappears from either side is named, not silently skipped.
+//! The binding table is a product surface, so the coverage test is driven by a
+//! checked-in Zuno fixture rather than a hand-written list: a row that disappears
+//! from either side is named, not silently skipped.
 
 use super::*;
 use crate::config::{BindingItem, ResolveOptions, TuiConfig};
 use crossterm::event::KeyEventState;
 use ratatui::layout::Rect;
 
-/// The oracle, extracted from `packages/tui/src/config/keybind.ts` at 1.18.13.
-const FIXTURE: &str = include_str!("../tests/fixtures/upstream-keybinds-1.18.13.tsv");
+/// The shipped Zuno keybind baseline.
+const FIXTURE: &str = include_str!("../tests/fixtures/zuno-keybinds.tsv");
 
 /// The count the plan and the oracle agree on.
 const EXPECTED_ROWS: usize = 184;
@@ -110,7 +110,7 @@ fn replay(keymap: &mut Keymap, scope: &str, sequence: &[Chord], now: Instant) ->
 }
 
 #[test]
-fn table_matches_the_upstream_fixture_row_for_row() {
+fn table_matches_the_zuno_fixture_row_for_row() {
     let rows = fixture_rows();
     assert_eq!(
         DEFINITIONS.len(),
@@ -122,7 +122,7 @@ fn table_matches_the_upstream_fixture_row_for_row() {
     for (index, row) in rows.iter().enumerate() {
         let found = definition(&row.name).unwrap_or_else(|| {
             panic!(
-                "upstream binding `{}` (fixture row {}) is missing from DEFINITIONS",
+                "Zuno binding `{}` (fixture row {}) is missing from DEFINITIONS",
                 row.name,
                 index + 1
             )
@@ -166,7 +166,7 @@ fn table_matches_the_upstream_fixture_row_for_row() {
         assert_eq!(
             DEFINITIONS[index].name,
             row.name,
-            "DEFINITIONS row {} is `{}` but upstream has `{}`; table order is part of the surface",
+            "DEFINITIONS row {} is `{}` but the Zuno fixture has `{}`; table order is part of the surface",
             index + 1,
             DEFINITIONS[index].name,
             row.name

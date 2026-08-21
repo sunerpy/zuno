@@ -9,10 +9,10 @@ use zuno_error::ToolError;
 use zuno_permission::ReplyKind;
 use zuno_server::api::{self, ApiState};
 use zuno_server::{
-    AuthConfig, CompatV1State, DEFAULT_EVENT_SUBSCRIBER_CAPACITY, EventService, PermissionRequest,
+    AuthConfig, DEFAULT_EVENT_SUBSCRIBER_CAPACITY, EventService, PermissionRequest,
     QuestionDecision, QuestionRequest, QuestionToolCall, RequestBroker, ServerBuilder,
     ServerConfig, ServerServices, SessionCompactExecution, SessionMutationExecutor,
-    SessionMutationFuture, SessionPromptExecution, compat_v1_router, events_router,
+    SessionMutationFuture, SessionPromptExecution, events_router,
 };
 use zuno_tool::{PermissionAsk, PermissionAsker};
 use zuno_tools::question::{Answer, QuestionAsker};
@@ -193,7 +193,6 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                     request.model,
                 )
                 .await?;
-            let events = host.with_event_hooks(events);
             let outcome = async {
                 host.drive_with_message_id_and_guard(
                     &request.prompt,
@@ -230,7 +229,6 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                     request.model,
                 )
                 .await?;
-            let events = host.with_event_hooks(events);
             let outcome = host.compact(request.automatic).await;
             drop(guard);
             let outcome = match outcome {
@@ -253,7 +251,7 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
     if args.mdns {
         return Err("--mdns is not supported by the Rust server runtime yet".to_owned());
     }
-    if args.mdns_domain != "opencode.local" {
+    if args.mdns_domain != "zuno.local" {
         return Err("--mdns-domain requires --mdns, which is not supported yet".to_owned());
     }
     if !args.cors.is_empty() {
@@ -264,7 +262,7 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
     let directory = directory_path.to_string_lossy().into_owned();
     let auth = AuthConfig::from_env();
     if !auth.required() {
-        println!("Warning: OPENCODE_SERVER_PASSWORD is not set; server is unsecured.");
+        println!("Warning: ZUNO_SERVER_PASSWORD is not set; server is unsecured.");
     }
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -278,18 +276,16 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
             .vcs
             .as_ref()
             .map_or(directory_path.as_path(), |_| project.directory.as_path());
-        let layout = zuno_paths::Layout::resolve(env);
-        let plugin_config =
+        let harness_config =
             zuno_config::discovery::discover_with(&zuno_config::discovery::DiscoveryOptions::new(
                 &directory_path,
                 Some(worktree),
                 env.clone(),
             ))
             .map_err(|error| error.report())?;
-        let compat = CompatV1State::new();
         let pool = Arc::new(zuno_db::Pool::open_default().map_err(|error| error.to_string())?);
         let events = EventService::new(Arc::clone(&pool), DEFAULT_EVENT_SUBSCRIBER_CAPACITY);
-        let config = ServerConfig::default()
+        let server_config = ServerConfig::default()
             .with_hostname(&args.hostname)
             .with_port(args.port)
             .with_auth(auth)
@@ -302,7 +298,7 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
             ServerServices::new(DEFAULT_EVENT_SUBSCRIBER_CAPACITY).with_requests(requests.clone());
         // Connected once for the server's lifetime, not per request: every host this
         // executor builds reads the same merged catalog. See `super::mcp_runtime`.
-        let mcp = super::mcp_runtime::McpRuntime::from_config(&plugin_config, worktree);
+        let mcp = super::mcp_runtime::McpRuntime::from_config(&harness_config, worktree);
         if let Some(mcp) = mcp.as_ref() {
             for note in mcp.connect().await {
                 println!("{note}");
@@ -314,45 +310,17 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
             mcp.as_ref().map(super::mcp_runtime::McpRuntime::catalog),
         ));
         let services = services.with_mutations(mutations);
-        let server = ServerBuilder::new(config)
+        let server = ServerBuilder::new(server_config)
             .with_services(services)
-            .with_routes(
-                api::router(state.clone())
-                    .merge(events_router(events))
-                    .merge(compat_v1_router(compat.clone(), state)),
-            )
+            .with_routes(api::router(state.clone()).merge(events_router(events)))
             .bind()
             .await
             .map_err(|error| error.to_string())?;
-        let plugin_server_url = reqwest::Url::parse(&format!("http://{}", server.local_addr()))
-            .map_err(|error| error.to_string())?;
-        let plugins = super::plugin_runtime::PluginRuntime::load(
-            &plugin_config,
-            &project,
-            &directory_path,
-            worktree,
-            &layout,
-            super::plugin_runtime::JsPluginPolicy::resolve(&plugin_config, env),
-            super::plugin_runtime::PluginRuntimeTarget::server_with_stdio(
-                "serve",
-                plugin_server_url,
-            ),
-        )
-        .await
-        .map(Arc::new);
-        if let Some(plugins) = &plugins {
-            compat.set_provider_oauth_backend(
-                Arc::clone(plugins) as Arc<dyn zuno_server::ProviderOAuthBackend>
-            );
-        }
         println!("{}", server_readiness_message(server.local_addr()));
         std::io::stdout()
             .flush()
             .map_err(|error| error.to_string())?;
         let result = server.serve().await.map_err(|error| error.to_string());
-        if let Some(plugins) = plugins {
-            plugins.shutdown().await;
-        }
         if let Some(mcp) = mcp {
             mcp.shutdown().await;
         }

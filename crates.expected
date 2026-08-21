@@ -8,6 +8,7 @@ zuno-db
 zuno-engine
 zuno-error
 zuno-goal
+zuno-harness
 zuno-llm
 zuno-lsp
 zuno-mcp
@@ -15,8 +16,6 @@ zuno-memory
 zuno-observability
 zuno-paths
 zuno-permission
-zuno-plugin
-zuno-plugin-sdk
 zuno-process
 zuno-provider-anthropic
 zuno-provider-bedrock
@@ -25,6 +24,7 @@ zuno-provider-google
 zuno-provider-openai
 zuno-pty
 zuno-reaping-fixture
+zuno-runtime
 zuno-search
 zuno-server
 zuno-snapshot

@@ -12,7 +12,6 @@ use zuno_config::schema::lsp::LspConfig;
 use zuno_config::schema::mcp::{LocalKind, McpLocal};
 use zuno_lsp::{Manager, RestartPolicy, ServerRegistry};
 use zuno_mcp::StdioClient;
-use zuno_plugin::{PluginLoad, PluginProcessSpec, load_plugins_ordered};
 use zuno_pty::{CreateInput, PtyId, PtyService};
 
 const SESSION_COUNT: usize = 2;
@@ -46,7 +45,6 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         "lsp" => run_lsp(),
         "mcp" => run_mcp(),
-        "plugin" => run_plugin(next_utf8(&mut arguments, "plugin id")?),
         "pty" => run_sleeping_child(),
         "grandchild" => loop {
             std::thread::sleep(Duration::from_secs(60));
@@ -103,25 +101,11 @@ async fn run_parent(ready: &Path, stop: &Path, root: &Path) -> Result<(), Box<dy
         pty_ids.push(info.id);
     }
 
-    let plugins = load_plugins_ordered(
-        (0..SESSION_COUNT)
-            .map(|index| {
-                PluginProcessSpec::new(format!("g6-plugin-{index}"), &executable)
-                    .arg("plugin")
-                    .arg(format!("g6-plugin-{index}"))
-            })
-            .collect(),
-    )
-    .await;
-    if plugins.plugins().len() != SESSION_COUNT {
-        return Err(format!("plugin hosts did not start: {:?}", plugins.diagnostics()).into());
-    }
-
     std::fs::write(ready, b"ready")?;
     while !stop.exists() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    shutdown_hosts(lsp, mcp, pty, pty_ids, plugins).await;
+    shutdown_hosts(lsp, mcp, pty, pty_ids).await;
     Ok(())
 }
 
@@ -130,9 +114,7 @@ async fn shutdown_hosts(
     mcp: Vec<StdioClient>,
     pty: PtyService,
     pty_ids: Vec<PtyId>,
-    plugins: PluginLoad,
 ) {
-    plugins.shutdown().await;
     for client in mcp {
         client.close().await;
     }
@@ -178,22 +160,6 @@ fn run_mcp() -> Result<(), Box<dyn Error>> {
                     "protocolVersion":zuno_mcp::PROTOCOL_VERSION,
                     "capabilities":{},
                     "serverInfo":{"name":"g6-mcp","version":"1"}
-                }
-            })
-        })
-    })
-}
-
-fn run_plugin(id: String) -> Result<(), Box<dyn Error>> {
-    let _grandchild = spawn_grandchild()?;
-    run_line_protocol(move |message| {
-        (message.get("method").and_then(Value::as_str) == Some("plugin.initialize")).then(|| {
-            json!({
-                "jsonrpc":"2.0",
-                "id":message["id"],
-                "result":{
-                    "protocolVersion":"1.0",
-                    "plugin":{"id":id,"hooks":[],"tools":[]}
                 }
             })
         })

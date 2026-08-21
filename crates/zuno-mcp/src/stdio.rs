@@ -202,10 +202,8 @@ impl StdioClient {
     /// Spawns a configured local server, initializes it, and sends
     /// `notifications/initialized`.
     ///
-    /// `cwd` is resolved lexically from `workspace`, matching
-    /// `mcp/index.ts:344-356`. The child inherits the process environment;
-    /// `BUN_BE_BUN=1` is then applied for an `opencode` command, and configured
-    /// `environment` entries are applied last, so user configuration wins.
+    /// `cwd` is resolved lexically from `workspace`. The child inherits the
+    /// process environment, then configured `environment` entries are applied.
     ///
     /// # Errors
     ///
@@ -471,7 +469,7 @@ impl StdioClient {
                     "protocolVersion": PROTOCOL_VERSION,
                     "capabilities": {},
                     "clientInfo": {
-                        "name": "opencode",
+                        "name": crate::CLIENT_NAME,
                         "version": env!("CARGO_PKG_VERSION"),
                     },
                 }),
@@ -850,11 +848,7 @@ fn build_command(workspace: &Path, config: &McpLocal) -> io::Result<Command> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    // `Command` inherits process env unless `env_clear` is called. Apply the two
-    // later layers in oracle order (`mcp/index.ts:352-356`).
-    if program == "opencode" {
-        command.env("BUN_BE_BUN", "1");
-    }
+    // `Command` inherits process env unless `env_clear` is called.
     if let Some(environment) = &config.environment {
         command.envs(environment);
     }
@@ -1189,10 +1183,10 @@ mod tests {
             kind: LocalKind::Local,
             command: vec!["opencode".to_owned(), "mcp".to_owned()],
             cwd: Some("nested/../server".to_owned()),
-            environment: Some(BTreeMap::from([
-                ("BUN_BE_BUN".to_owned(), "configured".to_owned()),
-                ("MCP_TEST_VALUE".to_owned(), "present".to_owned()),
-            ])),
+            environment: Some(BTreeMap::from([(
+                "MCP_TEST_VALUE".to_owned(),
+                "present".to_owned(),
+            )])),
             enabled: None,
             timeout: None,
         };
@@ -1211,10 +1205,7 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(
-            environments.get("BUN_BE_BUN"),
-            Some(&Some("configured".to_owned()))
-        );
+        assert!(!environments.contains_key("BUN_BE_BUN"));
         assert_eq!(
             environments.get("MCP_TEST_VALUE"),
             Some(&Some("present".to_owned()))

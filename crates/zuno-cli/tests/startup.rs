@@ -54,7 +54,7 @@ const RUNS: usize = 9;
 ///
 /// Measured debug-profile median 4.547 ms over nine runs (min 4.387, max 4.915,
 /// max/min 1.1205x); budget 30 ms, 6.6x headroom. It parses arguments, prints the
-/// compatibility version and returns; it opens no log file and does not re-exec,
+/// package version and returns; it opens no log file and does not re-exec,
 /// which [`startup_version_pays_for_no_log_file_and_no_reexec`] pins structurally.
 const BUDGET_VERSION: Duration = Duration::from_millis(30);
 

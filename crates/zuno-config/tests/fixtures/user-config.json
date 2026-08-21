@@ -84,12 +84,6 @@
     "todoread": "allow",
     "todowrite": "allow"
   },
-  "plugin": [
-    "opencode-antigravity-auth@1.6.0",
-    //"file:///config/workspace/ProdDir/AI/oh-my-openagent/packages/omo-opencode/src/index.ts",
-    "@sunerpy/opencode-kiro-auth@0.20.6",
-    "@sunerpy/oh-my-openagent@4.21.0"
-  ],
   "provider": {
     "awsopenai": {
       "models": {

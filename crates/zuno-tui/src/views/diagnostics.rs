@@ -10,8 +10,8 @@
 //! where an invented row is worse than a missing one, because its whole purpose is to be
 //! believed when something is already wrong.
 //!
-//! Two of the plan's fields are therefore absent, each for a reason established by
-//! reading the workspace rather than by preference:
+//! One of the plan's fields is therefore absent for a reason established by reading
+//! the workspace rather than by preference:
 //!
 //! * **The enabled-formatter group.** `zuno_tools::format::Formatters` has no production
 //!   construction site — every one is a test. Nothing formats anything in this build, so
@@ -20,11 +20,6 @@
 //!   the same defect as the `tool_affordance` arm that matched `"patch"` while the
 //!   registry spelled it `apply_patch`: a claim with nothing behind it. The group returns
 //!   when a formatter runtime is assembled.
-//! * **A plugin's version.** [`zuno_plugin`]'s loaded manifest carries an id and a hook
-//!   list and no version field, so plugins are listed by id with the hooks they claim —
-//!   which is also the fact a person debugging a plugin wants. An npm spec may encode a
-//!   version in its install string, but that is the requested spec, not the loaded
-//!   plugin's identity, and the two diverge exactly when it matters.
 //!
 //! # Why both panels are built from `Service`
 //!
@@ -219,8 +214,7 @@ fn window(rows: Vec<Row>, offset: &mut usize, height: usize) -> Vec<Row> {
     // Clamped to the last full screenful rather than to the last row. Stopping at
     // `total - 1` leaves a page-down at the end showing a single entry with its group
     // heading scrolled off, which is the one row that cannot be read without the heading
-    // above it — a bare `rust` says nothing about whether it is a language server or a
-    // plugin.
+    // above it — a bare `rust` says nothing about which service group owns it.
     let last = total.saturating_sub(height);
     if *offset > last {
         *offset = last;

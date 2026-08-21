@@ -421,7 +421,7 @@ fn update_json_config(path: &Path, name: &str, server: Value) -> Result<(), Stri
     let mut root = if path.exists() {
         serde_json::from_slice::<Value>(&fs::read(path).map_err(to_string)?).map_err(to_string)?
     } else {
-        json!({"$schema": "https://opencode.ai/config.json"})
+        json!({})
     };
     let object = root
         .as_object_mut()
@@ -593,6 +593,22 @@ mod tests {
         assert_eq!(value["theme"], "dark");
         assert_eq!(value["mcp"]["old"]["enabled"], false);
         assert_eq!(value["mcp"]["new"]["type"], "remote");
+    }
+
+    #[test]
+    fn json_update_creates_a_native_config_without_an_external_schema() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("zuno.json");
+        update_json_config(
+            &path,
+            "new",
+            json!({"type":"remote","url":"https://example.com/mcp"}),
+        )
+        .expect("create config");
+        let value: Value =
+            serde_json::from_slice(&fs::read(path).expect("read config")).expect("JSON");
+        assert_eq!(value["mcp"]["new"]["type"], "remote");
+        assert_eq!(value.get("$schema"), None);
     }
 
     #[test]

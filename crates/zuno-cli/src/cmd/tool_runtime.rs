@@ -53,8 +53,7 @@ use zuno_tool::{PermissionAsk, PermissionAsker, Tool, erase};
 use zuno_tools::exposure::ExposureFlags;
 use zuno_tools::question::{QuestionAsker, QuestionTool};
 use zuno_tools::registry::{
-    BuiltinSlot, CustomTool, CustomToolLoader, McpToolLoader, RegistryFlags, ResolveInput,
-    ToolRegistryBuilder,
+    BuiltinSlot, McpToolLoader, RegistryFlags, ResolveInput, ToolRegistryBuilder,
 };
 use zuno_tools::search_common::{SearchScope, SearchTooling};
 use zuno_tools::websearch::gating::SearchConfig;
@@ -77,9 +76,9 @@ pub(crate) struct ToolRuntime {
 pub(crate) struct ToolSelection<'a> {
     pub(crate) provider_id: &'a str,
     pub(crate) model_id: &'a str,
+    pub(crate) manifest: Arc<zuno_harness::ToolManifest>,
+    pub(crate) contributions: Arc<zuno_harness::ToolContributions>,
     pub(crate) question: Option<Arc<dyn QuestionAsker>>,
-    pub(crate) plugin_tools: &'a [Arc<dyn Tool>],
-    pub(crate) plugins: Option<Arc<super::plugin_runtime::PluginRuntime>>,
     pub(crate) todo_store: Arc<zuno_db::pool::Pool>,
     pub(crate) goal_store: Arc<zuno_goal::GoalStore>,
     pub(crate) mcp_loader: Option<Arc<dyn McpToolLoader>>,
@@ -124,44 +123,55 @@ pub(crate) fn assemble(
 ) -> Result<ToolRuntime, String> {
     let dynamic = super::agent::DynamicRules::resolve(directory, worktree, env, config);
     let rules = super::agent::resolved_rules(selected_agent, config, &dynamic);
+    let search = SearchConfig::from_profile(
+        |key| env.value(key).map(str::to_owned),
+        config.web_search.as_ref(),
+    );
 
     let flags = RegistryFlags {
         exposure: ExposureFlags::from_lookup(|key| env.value(key).map(str::to_owned)),
-        search: SearchConfig::from_lookup(|key| env.value(key).map(str::to_owned)),
+        search: search.clone(),
         experimental_lsp_tool: false,
         experimental_code_mode: false,
     };
 
     let file_tools = FileTools::new(directory).map_err(to_string)?;
-    let mut builder = ToolRegistryBuilder::new(
-        directory,
-        worktree.map(Path::to_path_buf),
-        file_tools,
-        flags,
-    );
+    let mut builder = ToolRegistryBuilder::new(directory, file_tools, flags)
+        .with_builtin_slots(selection.manifest.slots().iter().copied())
+        .with_harness_tools(selection.contributions.tools().iter().cloned());
     let scope = SearchScope {
         directory: directory.to_path_buf(),
         worktree: worktree.map_or_else(|| directory.to_path_buf(), Path::to_path_buf),
     };
     let tooling = SearchTooling::with_backend(scope, zuno_search::Backend::from_env());
-    let mut shell = zuno_tools::shell::ShellTool::new(directory).map_err(to_string)?;
-    if let Some(plugins) = selection.plugins.as_ref() {
-        let hook: Arc<dyn zuno_tools::shell::ShellEnvHook> = plugins.clone();
-        shell = shell.with_env_hook(hook);
-    }
-    if let Some(asker) = selection.question {
+    let shell = zuno_tools::shell::ShellTool::new(directory).map_err(to_string)?;
+    if selection.manifest.contains(BuiltinSlot::Question)
+        && let Some(asker) = selection.question
+    {
         builder
             .register_builtin(BuiltinSlot::Question, erase(QuestionTool::new(asker)))
             .map_err(|error| error.to_string())?;
     }
-    let delegation = selection.delegation;
-    let task = zuno_tools::task::TaskTool::new(delegation.host, delegation.facts)
-        .with_session_model(delegation.session_model)
-        .with_limits(delegation.limits)
-        .with_vision_available(delegation.vision_available);
-    builder
-        .register_builtin(BuiltinSlot::Task, erase(task))
-        .map_err(|error| error.to_string())?;
+    if selection.manifest.contains(BuiltinSlot::Task) {
+        let delegation = selection.delegation;
+        let task = zuno_tools::task::TaskTool::new(delegation.host, delegation.facts)
+            .with_session_model(delegation.session_model)
+            .with_limits(delegation.limits)
+            .with_vision_available(delegation.vision_available);
+        builder
+            .register_builtin(BuiltinSlot::Task, erase(task))
+            .map_err(|error| error.to_string())?;
+    }
+    if selection.manifest.contains(BuiltinSlot::Job) {
+        builder
+            .register_builtin(
+                BuiltinSlot::Job,
+                erase(zuno_tools::job::JobTool::new(Arc::clone(
+                    &selection.todo_store,
+                ))),
+            )
+            .map_err(|error| error.to_string())?;
+    }
     for (slot, tool) in [
         (
             BuiltinSlot::Invalid,
@@ -182,22 +192,19 @@ pub(crate) fn assemble(
         ),
         (
             BuiltinSlot::Search,
-            erase(zuno_tools::WebSearchTool::with_config(
-                SearchConfig::from_lookup(|key| env.value(key).map(str::to_owned)),
-            )),
+            erase(zuno_tools::WebSearchTool::with_config(search)),
         ),
         (
             BuiltinSlot::Skill,
             erase(zuno_tools::SkillTool::new(Arc::clone(&selection.skills))),
         ),
     ] {
-        builder
-            .register_builtin(slot, tool)
-            .map_err(|error| error.to_string())?;
+        if selection.manifest.contains(slot) {
+            builder
+                .register_builtin(slot, tool)
+                .map_err(|error| error.to_string())?;
+        }
     }
-    builder = builder.with_custom_loader(Arc::new(ProductionCustomTools {
-        plugin_tools: selection.plugin_tools.to_vec(),
-    }));
     if let Some(loader) = selection.mcp_loader {
         builder = builder.with_mcp_loader(loader);
     }
@@ -226,20 +233,6 @@ pub(crate) fn assemble(
         rules,
         suppressions,
     })
-}
-
-struct ProductionCustomTools {
-    plugin_tools: Vec<CustomTool>,
-}
-
-impl CustomToolLoader for ProductionCustomTools {
-    fn config_directory_tools(&self, _directories: &[std::path::PathBuf]) -> Vec<CustomTool> {
-        Vec::new()
-    }
-
-    fn plugin_tools(&self) -> Vec<CustomTool> {
-        self.plugin_tools.clone()
-    }
 }
 
 fn configured_memory_tool(root: &Path, config: &Config) -> Option<Arc<dyn Tool>> {

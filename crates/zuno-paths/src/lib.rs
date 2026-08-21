@@ -118,7 +118,7 @@ pub fn cache() -> &'static Path {
 }
 
 /// `Global.Path.config` — `$XDG_CONFIG_HOME/zuno`, before any
-/// `OPENCODE_CONFIG_DIR` override.
+/// `ZUNO_CONFIG_DIR` override.
 pub fn config() -> &'static Path {
     global().config()
 }
@@ -149,7 +149,7 @@ pub fn repos() -> &'static Path {
 }
 
 /// The configuration directory the service uses, honouring
-/// `OPENCODE_CONFIG_DIR`.
+/// `ZUNO_CONFIG_DIR`.
 pub fn effective_config() -> &'static Path {
     global().effective_config()
 }
@@ -290,7 +290,7 @@ mod tests {
         assert_eq!(DEFAULT_DB_FILE, "zuno.db");
         assert_eq!(LEGACY_DB_FILE, "opencode.db");
         assert_eq!(DEFAULT_MODELS_FILE, "models.json");
-        assert_eq!(DEFAULT_MODELS_SOURCE, "https://models.opencode.ai");
+        assert_eq!(DEFAULT_MODELS_SOURCE, "https://models.dev");
         assert_eq!(MEMORY_SENTINEL, ":memory:");
         assert_eq!(DEBUG_PATHS_KEYS.len(), 9);
         assert!(!installation_channel().is_empty());

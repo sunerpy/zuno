@@ -1,5 +1,4 @@
 {
-  "$schema": "https://opencode.ai/theme.json",
   "defs": {
     "ansiRed": { "dark": 9, "light": 1 },
     "ansiGreen": { "dark": 10, "light": 2 },

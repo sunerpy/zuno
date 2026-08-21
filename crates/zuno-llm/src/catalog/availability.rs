@@ -18,7 +18,7 @@
 //!
 //! # Each of the three, verified in isolation against the 1.18.12 binary
 //!
-//! With a pinned catalog (`OPENCODE_MODELS_PATH`), an isolated `HOME`, and nothing
+//! With a pinned catalog (`ZUNO_MODELS_PATH`), an isolated `HOME`, and nothing
 //! else set, `opencode models` printed **nothing**. Adding exactly one thing at a
 //! time, each on its own, made exactly one provider appear:
 //!

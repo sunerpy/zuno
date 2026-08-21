@@ -145,7 +145,7 @@ pub fn is_initialized() -> bool {
 /// # Sinks
 ///
 /// - A rolling file in [`LogConfig::dir`], always.
-/// - Additionally stderr, when `--print-logs` or `OPENCODE_PRINT_LOGS=1` asked for
+/// - Additionally stderr, when `--print-logs` or `ZUNO_PRINT_LOGS=1` asked for
 ///   it. This mirrors `packages/core/src/observability/logging.ts:67-69`, where
 ///   printing *adds* a stderr logger and never replaces the file one.
 ///

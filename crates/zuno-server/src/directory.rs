@@ -1,9 +1,8 @@
-//! Per-request project selection used by the JavaScript SDK.
+//! Per-request project selection used by Zuno clients.
 //!
-//! The observable names are `x-opencode-directory` and `directory`
-//! (`packages/sdk/js/src/client.ts:17-30`). Query wins over header, then the
-//! server's startup directory is the fallback, matching
-//! `workspace-routing.ts:86-88`. Values are URI-decoded once after extraction;
+//! The observable names are `x-zuno-directory` and `directory`. Query wins over
+//! header, then the server's startup directory is the fallback. Values are
+//! URI-decoded once after extraction;
 //! query parsing has already decoded its form layer, which is why the SDK's
 //! rewritten `%252Fworkspace` query and its `%2Fworkspace` header converge.
 
@@ -38,7 +37,7 @@ pub(crate) fn resolve(uri: &Uri, headers: &HeaderMap, fallback: &str) -> Request
             .map(|(_, value)| decode_component(&value))
     });
     let from_header = headers
-        .get("x-opencode-directory")
+        .get("x-zuno-directory")
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.is_empty())
         .map(decode_component);

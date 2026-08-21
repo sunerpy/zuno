@@ -7,7 +7,7 @@
 //! are declared with Effect's `Config.boolean` (`flag/flag.ts:37-42`):
 //!
 //! ```ts
-//! OPENCODE_EXPERIMENTAL_FILEWATCHER: Config.boolean("OPENCODE_EXPERIMENTAL_FILEWATCHER").pipe(
+//! ZUNO_EXPERIMENTAL_FILEWATCHER: Config.boolean("ZUNO_EXPERIMENTAL_FILEWATCHER").pipe(
 //!   Config.withDefault(false),
 //! ),
 //! ```
@@ -31,12 +31,11 @@
 
 use zuno_paths::Env;
 
-/// `OPENCODE_EXPERIMENTAL_FILEWATCHER` (`flag/flag.ts:37-39`).
-pub const OPENCODE_EXPERIMENTAL_FILEWATCHER: &str = "OPENCODE_EXPERIMENTAL_FILEWATCHER";
+/// `ZUNO_EXPERIMENTAL_FILEWATCHER` (`flag/flag.ts:37-39`).
+pub const ZUNO_EXPERIMENTAL_FILEWATCHER: &str = "ZUNO_EXPERIMENTAL_FILEWATCHER";
 
-/// `OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER` (`flag/flag.ts:40-42`).
-pub const OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: &str =
-    "OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER";
+/// `ZUNO_EXPERIMENTAL_DISABLE_FILEWATCHER` (`flag/flag.ts:40-42`).
+pub const ZUNO_EXPERIMENTAL_DISABLE_FILEWATCHER: &str = "ZUNO_EXPERIMENTAL_DISABLE_FILEWATCHER";
 
 /// The values Effect's `Config.boolean` reads as true, lower-cased.
 const TRUE_VALUES: [&str; 4] = ["true", "1", "yes", "on"];
@@ -51,7 +50,7 @@ const FALSE_VALUES: [&str; 4] = ["false", "0", "no", "off"];
 /// and logs nothing, a bad value is a misconfiguration the user wants told about.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DisabledReason {
-    /// `OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER` was set to a true value.
+    /// `ZUNO_EXPERIMENTAL_DISABLE_FILEWATCHER` was set to a true value.
     ///
     /// Checked first in `watcher.ts:59`, before the backend or the binding, so
     /// it wins over every other input including the enable flag.
@@ -79,7 +78,7 @@ pub enum Decision {
     Disabled(DisabledReason),
     /// Watch only the VCS metadata directory.
     ///
-    /// This is the default: `OPENCODE_EXPERIMENTAL_FILEWATCHER` gates *only* the
+    /// This is the default: `ZUNO_EXPERIMENTAL_FILEWATCHER` gates *only* the
     /// project-directory subscription (`watcher.ts:107`), while the `.git`
     /// subscription at `watcher.ts:112` is gated on nothing but the repository
     /// being git. With no flags set at all, the oracle therefore still watches
@@ -138,14 +137,14 @@ fn parse(env: &Env, key: &'static str) -> Result<Option<bool>, DisabledReason> {
 /// short-circuits, so setting both variables to true leaves the watcher off.
 #[must_use]
 pub fn decide(env: &Env) -> Decision {
-    let disable = match parse(env, OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER) {
+    let disable = match parse(env, ZUNO_EXPERIMENTAL_DISABLE_FILEWATCHER) {
         Ok(value) => value.unwrap_or(false),
         Err(reason) => return Decision::Disabled(reason),
     };
     if disable {
         return Decision::Disabled(DisabledReason::ExplicitlyDisabled);
     }
-    match parse(env, OPENCODE_EXPERIMENTAL_FILEWATCHER) {
+    match parse(env, ZUNO_EXPERIMENTAL_FILEWATCHER) {
         Ok(value) if value.unwrap_or(false) => Decision::Full,
         Ok(_) => Decision::VcsOnly,
         Err(reason) => Decision::Disabled(reason),
@@ -198,7 +197,7 @@ mod tests {
         assert_eq!(
             decide(&env),
             Decision::Disabled(DisabledReason::UnparseableFlag {
-                key: OPENCODE_EXPERIMENTAL_FILEWATCHER,
+                key: ZUNO_EXPERIMENTAL_FILEWATCHER,
                 value: "bogus".to_owned(),
             })
         );
@@ -212,7 +211,7 @@ mod tests {
         assert_eq!(
             decide(&env),
             Decision::Disabled(DisabledReason::UnparseableFlag {
-                key: OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER,
+                key: ZUNO_EXPERIMENTAL_DISABLE_FILEWATCHER,
                 value: "maybe".to_owned(),
             })
         );

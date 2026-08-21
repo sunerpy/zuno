@@ -56,7 +56,6 @@ pub(super) fn execute(args: &RunArgs, environment: &StartupEnvironment) -> Resul
     host.push_notes(mcp_notes);
 
     let (sender, receiver) = event_channel();
-    let sender = host.with_event_hooks(sender);
     let (outcome, rendered) = runtime.block_on(async {
         tokio::join!(
             async {

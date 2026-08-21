@@ -29,7 +29,7 @@
 //! The provider is `MockProvider`, always on loopback, replaying a committed
 //! recording (see `packaging/smoke/cassettes/PROVENANCE.md`). Credentials are a
 //! literal `test-key` that never leaves the machine, models come from a pinned
-//! fixture, and `OPENCODE_DISABLE_MODELS_FETCH` blocks the one fetch the binary
+//! fixture, and `ZUNO_DISABLE_MODELS_FETCH` blocks the one fetch the binary
 //! would otherwise attempt.
 
 use std::collections::BTreeMap;
@@ -455,20 +455,13 @@ fn turn_variables(env: &ScriptedEnv, base_url: &str, models: &Path) -> BTreeMap<
     variables.extend([
         ("NO_COLOR".to_owned(), "1".to_owned()),
         ("TERM".to_owned(), "dumb".to_owned()),
-        ("OPENCODE_PURE".to_owned(), "1".to_owned()),
-        ("OPENCODE_AUTH_CONTENT".to_owned(), "{}".to_owned()),
+        ("ZUNO_AUTH_CONTENT".to_owned(), "{}".to_owned()),
+        ("ZUNO_DISABLE_MODELS_FETCH".to_owned(), "true".to_owned()),
         (
-            "OPENCODE_DISABLE_MODELS_FETCH".to_owned(),
-            "true".to_owned(),
-        ),
-        (
-            "OPENCODE_MODELS_PATH".to_owned(),
+            "ZUNO_MODELS_PATH".to_owned(),
             models.to_string_lossy().into_owned(),
         ),
-        (
-            "OPENCODE_CONFIG_CONTENT".to_owned(),
-            provider_config(base_url),
-        ),
+        ("ZUNO_CONFIG_CONTENT".to_owned(), provider_config(base_url)),
     ]);
     variables
 }

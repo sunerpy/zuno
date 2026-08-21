@@ -57,6 +57,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use zuno_agent::builtin::{Agent, delegable};
 use zuno_agent::model_policy::{
     Diagnostic, EffortOutcome, ModelAvailability, ModelChoice, ModelPolicy, PresetLibrary,
@@ -98,9 +99,6 @@ pub const GENERIC_EXECUTOR: &str = "worker";
 /// exists only to render the refusal.
 pub const COORDINATOR: &str = "orchestrator";
 
-/// Prefix that keeps a background job id distinguishable from a session id.
-pub const BACKGROUND_ID_PREFIX: &str = "bg_";
-
 /// The description the model reads.
 ///
 /// Deliberately free of model ids: `model` and `effort` are pass-throughs to
@@ -109,10 +107,15 @@ pub const BACKGROUND_ID_PREFIX: &str = "bg_";
 /// [`zuno_agent::model_policy`] exists to refuse.
 pub const DESCRIPTION: &str = include_str!("description/task.txt");
 
-/// The background job id for `session_id`.
-#[must_use]
-pub fn background_id(session_id: &str) -> String {
-    format!("{BACKGROUND_ID_PREFIX}{session_id}")
+/// How a background child reports its terminal state.
+#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ReportDelivery {
+    /// Add the report to the parent's next step and wake it.
+    #[default]
+    NextStep,
+    /// Persist the result without adding parent input.
+    Quiet,
 }
 
 /// Arguments for one delegation.
@@ -140,6 +143,9 @@ pub struct TaskParams {
     /// Run asynchronously and report a job id immediately. Defaults to foreground.
     #[serde(default)]
     pub background: Option<bool>,
+    /// What to do with the terminal report of a background dispatch.
+    #[serde(default, rename = "reportDelivery")]
+    pub report_delivery: Option<ReportDelivery>,
     /// Continue a previous delegation's session instead of creating a new one.
     #[serde(default)]
     pub task_id: Option<String>,
@@ -247,6 +253,8 @@ pub struct ChildTurnRequest {
     pub provider_options: Map<String, Value>,
     /// Whether the caller asked not to wait.
     pub background: bool,
+    /// How a background child reports its terminal state.
+    pub report_delivery: ReportDelivery,
 }
 
 /// What a dispatched delegation produced.
@@ -255,7 +263,7 @@ pub struct ChildTurn {
     /// The child session, whether created or resumed.
     pub session_id: String,
     /// The job handle, for a background dispatch only. Never the session id.
-    pub background_id: Option<String>,
+    pub job_id: Option<String>,
     /// The child's final text, or the running-notice for a background dispatch.
     pub output: String,
 }
@@ -348,6 +356,11 @@ pub enum TaskRejection {
          already grant the skill you wanted instead of naming skills in the call."
     )]
     LoadSkillsRemoved,
+    #[error(
+        "`reportDelivery` requires `background: true`. Remove `reportDelivery` for a \
+         foreground delegation, or add `background: true` to receive the result later."
+    )]
+    ReportDeliveryRequiresBackground,
 }
 
 /// The guidance a `task` refusal from the permission layer carries.
@@ -669,6 +682,11 @@ impl TypedTool for TaskTool {
         if params.load_skills.is_some() {
             return Err(reject(TaskRejection::LoadSkillsRemoved));
         }
+        let background = params.background.unwrap_or(false);
+        if !background && params.report_delivery.is_some() {
+            return Err(reject(TaskRejection::ReportDeliveryRequiresBackground));
+        }
+        let report_delivery = params.report_delivery.unwrap_or_default();
 
         // Argument validity precedes the human prompt, unlike upstream, which asks
         // before checking the agent exists (`task.ts:118-183`). Asking a user to
@@ -699,7 +717,6 @@ impl TypedTool for TaskTool {
         .await?;
 
         let plan = self.plan(&agent, category.as_deref(), &params);
-        let background = params.background.unwrap_or(false);
         let turn = self
             .host
             .dispatch(ChildTurnRequest {
@@ -712,12 +729,13 @@ impl TypedTool for TaskTool {
                 effort: plan.effort,
                 provider_options: plan.provider_options.clone(),
                 background,
+                report_delivery,
             })
             .await
             .map_err(host_failure)?;
 
         if background {
-            let job = turn.background_id.as_deref().ok_or_else(|| {
+            let job = turn.job_id.as_deref().ok_or_else(|| {
                 host_failure(ChildTurnError::Host(
                     "a background dispatch must report a job id distinct from the child \
                      session id"
@@ -777,10 +795,14 @@ fn render(
     background: bool,
 ) -> ToolOutput {
     let state = if background { "running" } else { "completed" };
-    let mut lines = vec![match turn.background_id.as_deref() {
+    let mut lines = vec![match turn.job_id.as_deref() {
         Some(job) => format!(
-            "<task id=\"{}\" background=\"{job}\" state=\"{state}\">",
-            turn.session_id
+            "<task id=\"{}\" job=\"{job}\" state=\"{state}\" reportDelivery=\"{}\">",
+            turn.session_id,
+            match params.report_delivery.unwrap_or_default() {
+                ReportDelivery::NextStep => "nextStep",
+                ReportDelivery::Quiet => "quiet",
+            }
         ),
         None => format!("<task id=\"{}\" state=\"{state}\">", turn.session_id),
     }];
@@ -883,6 +905,7 @@ impl ProviderFacts for FixedFacts {
 pub struct RecordingHost {
     ancestry: u32,
     reuse_session_id_as_job: bool,
+    next_job: AtomicU64,
     dispatched: std::sync::Mutex<Vec<ChildTurnRequest>>,
 }
 
@@ -938,10 +961,13 @@ impl ChildTurnHost for RecordingHost {
         let job = if self.reuse_session_id_as_job {
             session_id.clone()
         } else {
-            background_id(&session_id)
+            format!(
+                "job_{:06}",
+                self.next_job.fetch_add(1, Ordering::Relaxed) + 1
+            )
         };
         Ok(ChildTurn {
-            background_id: background.then_some(job),
+            job_id: background.then_some(job),
             output: "done".to_owned(),
             session_id,
         })

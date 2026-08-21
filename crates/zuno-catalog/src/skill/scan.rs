@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! EXTERNAL_SKILL_PATTERN  = "skills/**/SKILL.md"          // ~/.claude, ~/.agents, project
-//! OPENCODE_SKILL_PATTERN  = "{skill,skills}/**/SKILL.md"   // every config directory
+//! ZUNO_SKILL_PATTERN  = "{skill,skills}/**/SKILL.md"   // every config directory
 //! SKILL_PATTERN           = "**/SKILL.md"                  // skills.paths[], pulled URLs
 //! ```
 //!
@@ -49,7 +49,7 @@ pub const EXTERNAL_PREFIXES: &[&str] = &["skills"];
 ///
 /// Brace order is the oracle's textual order. It only becomes observable when
 /// the same skill name lives under both, which is the duplicate-name case.
-pub const OPENCODE_PREFIXES: &[&str] = &["skill", "skills"];
+pub const ZUNO_PREFIXES: &[&str] = &["skill", "skills"];
 
 /// No prefix at all: `**/SKILL.md` from the root itself.
 pub const ROOT_PREFIXES: &[&str] = &[""];
@@ -149,7 +149,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let visible = write(dir.path(), "skill/a/SKILL.md");
         write(dir.path(), "skill/.hidden/b/SKILL.md");
-        let found = scan(dir.path(), OPENCODE_PREFIXES, false);
+        let found = scan(dir.path(), ZUNO_PREFIXES, false);
         assert_eq!(found.matches, vec![visible]);
     }
 
@@ -167,7 +167,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let singular = write(dir.path(), "skill/a/SKILL.md");
         let plural = write(dir.path(), "skills/b/SKILL.md");
-        let found = scan(dir.path(), OPENCODE_PREFIXES, false);
+        let found = scan(dir.path(), ZUNO_PREFIXES, false);
         assert!(found.matches.contains(&singular));
         assert!(found.matches.contains(&plural));
     }

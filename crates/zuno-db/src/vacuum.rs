@@ -215,7 +215,7 @@ impl fmt::Display for VacuumError {
                 formatter,
                 "refusing to VACUUM {}: rewriting the whole file needs {} ({required_bytes} bytes) \
                  free on its filesystem, but only {} ({available_bytes} bytes) is available; \
-                 free at least {} ({} bytes) there, or point OPENCODE_DB at a filesystem with \
+                 free at least {} ({} bytes) there, or point ZUNO_DB at a filesystem with \
                  more room",
                 path.display(),
                 format_bytes(*required_bytes),

@@ -1,5 +1,4 @@
-//! The 38 journalled migrations, transcribed from
-//! `packages/core/src/database/migration/*.ts`.
+//! The native schema migration chain.
 //!
 //! # Why the incremental SQL has to exist at all
 //!
@@ -61,7 +60,7 @@ pub(crate) enum Step {
 /// Order is load-bearing twice over: it is the order the statements must run in,
 /// and it is the order [`crate::migration::MIGRATION_IDS`] is derived from, which
 /// a freshly created database seeds its journal with.
-pub(crate) const MIGRATIONS: [Migration; 38] = [
+pub(crate) const MIGRATIONS: [Migration; 39] = [
     Migration {
         id: "20260127222353_familiar_lady_ursula",
         step: Step::Sql(&[
@@ -633,6 +632,34 @@ pub(crate) const MIGRATIONS: [Migration; 38] = [
             "DELETE FROM `event_sequence`;",
             "UPDATE `session` SET `workspace_id` = NULL WHERE `workspace_id` IS NOT NULL;",
             "DELETE FROM `workspace`;",
+        ]),
+    },
+    Migration {
+        id: "20260821160000_agent_job",
+        step: Step::Sql(&[
+            "CREATE TABLE `agent_job` (
+               `id` text PRIMARY KEY,
+               `parent_session_id` text NOT NULL,
+               `child_session_id` text NOT NULL,
+               `status` text NOT NULL,
+               `report_delivery` text NOT NULL,
+               `result` text,
+               `error` text,
+               `report_input_id` text,
+               `created_seq` integer NOT NULL,
+               `settled_seq` integer,
+               `time_created` integer NOT NULL,
+               `time_updated` integer NOT NULL,
+               `time_completed` integer,
+               CONSTRAINT `agent_job_distinct_sessions` CHECK (`parent_session_id` <> `child_session_id`),
+               CONSTRAINT `agent_job_status` CHECK (`status` IN ('running','completed','failed','cancelled')),
+               CONSTRAINT `agent_job_report_delivery` CHECK (`report_delivery` IN ('next-step','quiet')),
+               CONSTRAINT `fk_agent_job_parent_session_id_session_id_fk` FOREIGN KEY (`parent_session_id`) REFERENCES `session`(`id`) ON DELETE CASCADE,
+               CONSTRAINT `fk_agent_job_child_session_id_session_id_fk` FOREIGN KEY (`child_session_id`) REFERENCES `session`(`id`) ON DELETE CASCADE,
+               CONSTRAINT `fk_agent_job_report_input_id_session_input_id_fk` FOREIGN KEY (`report_input_id`) REFERENCES `session_input`(`id`) ON DELETE SET NULL
+             );",
+            "CREATE UNIQUE INDEX `agent_job_child_running_idx` ON `agent_job` (`child_session_id`) WHERE `status` = 'running';",
+            "CREATE INDEX `agent_job_parent_status_created_idx` ON `agent_job` (`parent_session_id`,`status`,`time_created`);",
         ]),
     },
 ];

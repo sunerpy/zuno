@@ -18,10 +18,10 @@
 //!
 //! **The Claude switch also silences the project walk.** `externalDirs` is built
 //! once (`:186-188`) and reused for both the `$HOME` probe and the ancestor walk,
-//! so `OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1` removes `.claude` from *both*.
+//! so `ZUNO_DISABLE_CLAUDE_CODE_SKILLS=1` removes `.claude` from *both*.
 //! Confirmed: a project `.claude/skills/x/SKILL.md` disappears with the flag set.
 //!
-//! **`OPENCODE_DISABLE_PROJECT_CONFIG` does not reach root 3.** It gates
+//! **`ZUNO_DISABLE_PROJECT_CONFIG` does not reach root 3.** It gates
 //! `ConfigPaths.directories` (root 4), not `fsys.up` (root 3). Confirmed: with the
 //! flag set, a project `.agents` skill is still found.
 //!
@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 use zuno_config::Config;
 use zuno_paths::{Env, Layout, node_path, walk};
 
-use crate::skill::scan::{self, EXTERNAL_PREFIXES, OPENCODE_PREFIXES, ROOT_PREFIXES};
+use crate::skill::scan::{self, EXTERNAL_PREFIXES, ROOT_PREFIXES, ZUNO_PREFIXES};
 use crate::skill::{SkillWarning, SkillWarningKind};
 
 /// `CLAUDE_EXTERNAL_DIR` (`skill/index.ts:21`).
@@ -54,17 +54,17 @@ pub const CLAUDE_EXTERNAL_DIR: &str = ".claude";
 /// `AGENTS_EXTERNAL_DIR` (`skill/index.ts:22`).
 pub const AGENTS_EXTERNAL_DIR: &str = ".agents";
 
-/// `OPENCODE_DISABLE_EXTERNAL_SKILLS` (`effect/runtime-flags.ts:22`). Removes
+/// `ZUNO_DISABLE_EXTERNAL_SKILLS` (`effect/runtime-flags.ts:22`). Removes
 /// roots 1, 2 and 3 outright.
-pub const OPENCODE_DISABLE_EXTERNAL_SKILLS: &str = "OPENCODE_DISABLE_EXTERNAL_SKILLS";
+pub const ZUNO_DISABLE_EXTERNAL_SKILLS: &str = "ZUNO_DISABLE_EXTERNAL_SKILLS";
 
-/// `OPENCODE_DISABLE_CLAUDE_CODE` (`effect/runtime-flags.ts:28`) — the broad
+/// `ZUNO_DISABLE_CLAUDE_CODE` (`effect/runtime-flags.ts:28`) — the broad
 /// switch. Either this or the targeted one drops `.claude`.
-pub const OPENCODE_DISABLE_CLAUDE_CODE: &str = "OPENCODE_DISABLE_CLAUDE_CODE";
+pub const ZUNO_DISABLE_CLAUDE_CODE: &str = "ZUNO_DISABLE_CLAUDE_CODE";
 
-/// `OPENCODE_DISABLE_CLAUDE_CODE_SKILLS` (`effect/runtime-flags.ts:29`) — the
+/// `ZUNO_DISABLE_CLAUDE_CODE_SKILLS` (`effect/runtime-flags.ts:29`) — the
 /// targeted switch.
-pub const OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: &str = "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS";
+pub const ZUNO_DISABLE_CLAUDE_CODE_SKILLS: &str = "ZUNO_DISABLE_CLAUDE_CODE_SKILLS";
 
 /// Everything skill discovery needs, with no hidden process state.
 ///
@@ -100,9 +100,9 @@ impl SkillOptions {
             layout: Layout::resolve(env),
             paths,
             urls,
-            external_disabled: env.flag(OPENCODE_DISABLE_EXTERNAL_SKILLS),
-            claude_skills_disabled: env.flag(OPENCODE_DISABLE_CLAUDE_CODE)
-                || env.flag(OPENCODE_DISABLE_CLAUDE_CODE_SKILLS),
+            external_disabled: env.flag(ZUNO_DISABLE_EXTERNAL_SKILLS),
+            claude_skills_disabled: env.flag(ZUNO_DISABLE_CLAUDE_CODE)
+                || env.flag(ZUNO_DISABLE_CLAUDE_CODE_SKILLS),
         }
     }
 
@@ -182,8 +182,7 @@ impl SkillOptions {
         &self.urls
     }
 
-    /// Where a pulled remote skill is cached: `$XDG_CACHE_HOME/opencode/skills`
-    /// (`discovery.ts:35`).
+    /// Where a pulled remote skill is cached: `$XDG_CACHE_HOME/zuno/skills`.
     #[must_use]
     pub fn remote_cache_root(&self) -> PathBuf {
         self.layout.cache().join("skills")
@@ -293,7 +292,7 @@ impl SkillSources {
             .layout
             .config_directories(&options.directory, options.worktree.as_deref())
         {
-            sources.absorb(&dir, OPENCODE_PREFIXES, false, Root::ConfigDirectory);
+            sources.absorb(&dir, ZUNO_PREFIXES, false, Root::ConfigDirectory);
         }
 
         // Root 5: `skills.paths[]`.
@@ -410,7 +409,7 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
-    use zuno_paths::env::{HOME, OPENCODE_CONFIG_DIR, XDG_CACHE_HOME, XDG_CONFIG_HOME};
+    use zuno_paths::env::{HOME, XDG_CACHE_HOME, XDG_CONFIG_HOME, ZUNO_CONFIG_DIR};
 
     struct Fixture {
         dir: TempDir,
@@ -535,7 +534,7 @@ mod tests {
         let fixture = Fixture::new();
         fixture.skill("home/.claude/skills/a", "a");
         fixture.skill("home/.agents/skills/b", "b");
-        let env = fixture.env().with(OPENCODE_DISABLE_CLAUDE_CODE, "1");
+        let env = fixture.env().with(ZUNO_DISABLE_CLAUDE_CODE, "1");
         let options = SkillOptions::new(
             fixture.dir.path().join("proj"),
             None::<PathBuf>,
@@ -687,7 +686,7 @@ mod tests {
         let fixture = Fixture::new();
         let overridden = fixture.skill("elsewhere/skill/a", "a");
         let env = fixture.env().with(
-            OPENCODE_CONFIG_DIR,
+            ZUNO_CONFIG_DIR,
             fixture
                 .dir
                 .path()

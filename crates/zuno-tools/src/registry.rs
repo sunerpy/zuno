@@ -1,18 +1,17 @@
 //! Ordered tool assembly and the final model-visible registry projection.
 //!
 //! The registry keeps loading order separate from visibility. Built-ins are first,
-//! followed by config-directory exports, plugin exports, and MCP tools. A later
-//! source replaces an earlier same-named tool in place, matching upstream's keyed
-//! projection without sending duplicate names to a provider. Model and provider gates
-//! run over that assembled sequence, and permission hiding runs last, so a blanket
-//! deny also hides tools that arrived from an extension host.
+//! followed by native harness contributions and MCP tools. A later source replaces
+//! an earlier same-named tool in place without sending duplicate names to a
+//! provider. Model and provider gates run over that assembled sequence, and
+//! permission hiding runs last.
 
 use crate::FileTools;
 use crate::batch::ExecuteTool;
 use crate::exposure::{ExposureFlags, exposure_predicate};
 use crate::websearch::gating::{SearchConfig, web_search_enabled};
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use zuno_permission::Rule;
 use zuno_permission::visibility::{permission_key, retain_visible_tools};
@@ -25,28 +24,21 @@ pub type CustomTool = Arc<dyn Tool>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolSource {
     Builtin,
-    ConfigDirectory,
-    Plugin,
+    Harness,
     Mcp,
 }
 
 /// Tool sources in assembly order, from lowest to highest precedence.
 ///
-/// Registry assembly and generated plugin-authoring documentation both consume
-/// this constant. A later source replaces an earlier same-named tool in place.
-pub const TOOL_SOURCE_PRECEDENCE: [ToolSource; 4] = [
-    ToolSource::Builtin,
-    ToolSource::ConfigDirectory,
-    ToolSource::Plugin,
-    ToolSource::Mcp,
-];
+/// A later source replaces an earlier same-named tool in place.
+pub const TOOL_SOURCE_PRECEDENCE: [ToolSource; 3] =
+    [ToolSource::Builtin, ToolSource::Harness, ToolSource::Mcp];
 
 impl std::fmt::Display for ToolSource {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::Builtin => "built-in",
-            Self::ConfigDirectory => "config-directory",
-            Self::Plugin => "plugin",
+            Self::Harness => "harness",
             Self::Mcp => "MCP",
         })
     }
@@ -85,6 +77,7 @@ pub enum BuiltinSlot {
     Edit,
     Write,
     Task,
+    Job,
     Fetch,
     Todo,
     Search,
@@ -109,9 +102,10 @@ impl BuiltinSlot {
             Self::Edit => "edit",
             Self::Write => "write",
             Self::Task => "task",
+            Self::Job => "job",
             Self::Fetch => "webfetch",
             Self::Todo => "todowrite",
-            Self::Search => "websearch",
+            Self::Search => "web_search",
             Self::Skill => "skill",
             Self::Patch => "apply_patch",
             Self::Execute => "execute",
@@ -136,7 +130,7 @@ impl BuiltinSlot {
 }
 
 /// The exact built-in order used before custom and MCP tools are appended.
-pub const BUILTIN_ORDER: [BuiltinSlot; 17] = [
+pub const BUILTIN_ORDER: [BuiltinSlot; 18] = [
     BuiltinSlot::Invalid,
     BuiltinSlot::Question,
     BuiltinSlot::Shell,
@@ -146,6 +140,7 @@ pub const BUILTIN_ORDER: [BuiltinSlot; 17] = [
     BuiltinSlot::Edit,
     BuiltinSlot::Write,
     BuiltinSlot::Task,
+    BuiltinSlot::Job,
     BuiltinSlot::Fetch,
     BuiltinSlot::Todo,
     BuiltinSlot::Search,
@@ -167,33 +162,6 @@ pub struct RegistryFlags {
     pub experimental_lsp_tool: bool,
     /// Whether an available code-mode tool is registered.
     pub experimental_code_mode: bool,
-}
-
-/// Config-directory and plugin tools supplied by the wave-9 plugin host.
-///
-/// The two methods are separate because `registry.ts:178-199` loads config exports
-/// before plugin-provided exports. A single combined callback would make that order
-/// impossible to preserve once both sources are live.
-pub trait CustomToolLoader: Send + Sync {
-    /// Load `{tool,tools}/*.{js,ts}` from the resolved config directory chain.
-    fn config_directory_tools(&self, directories: &[PathBuf]) -> Vec<CustomTool>;
-
-    /// Load tools exposed by configured plugins.
-    fn plugin_tools(&self) -> Vec<CustomTool>;
-}
-
-/// The default until the plugin host is wired.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NoopCustomToolLoader;
-
-impl CustomToolLoader for NoopCustomToolLoader {
-    fn config_directory_tools(&self, _directories: &[PathBuf]) -> Vec<CustomTool> {
-        Vec::new()
-    }
-
-    fn plugin_tools(&self) -> Vec<CustomTool> {
-        Vec::new()
-    }
 }
 
 /// MCP tools supplied by the wave-8 MCP host.
@@ -230,12 +198,12 @@ pub enum RegistryError {
 /// Incremental assembly for hosts whose concrete tools live in different crates.
 pub struct ToolRegistryBuilder {
     directory: PathBuf,
-    worktree: Option<PathBuf>,
     flags: RegistryFlags,
     file_tools: FileTools,
+    enabled_builtins: Option<HashSet<BuiltinSlot>>,
     builtins: BTreeMap<BuiltinSlot, Arc<dyn Tool>>,
     configured_builtins: Vec<Arc<dyn Tool>>,
-    custom_loader: Arc<dyn CustomToolLoader>,
+    harness_tools: Vec<CustomTool>,
     mcp_loader: Arc<dyn McpToolLoader>,
 }
 
@@ -245,12 +213,7 @@ impl ToolRegistryBuilder {
     /// Requiring [`FileTools`] here makes the model-family decision reuse
     /// [`FileTools::exposed_for_model`] instead of copying its substring rule.
     #[must_use]
-    pub fn new(
-        directory: impl Into<PathBuf>,
-        worktree: Option<PathBuf>,
-        file_tools: FileTools,
-        flags: RegistryFlags,
-    ) -> Self {
+    pub fn new(directory: impl Into<PathBuf>, file_tools: FileTools, flags: RegistryFlags) -> Self {
         let mut builtins = BTreeMap::new();
         builtins.insert(BuiltinSlot::Read, Arc::clone(&file_tools.read));
         builtins.insert(BuiltinSlot::Edit, Arc::clone(&file_tools.edit));
@@ -259,14 +222,21 @@ impl ToolRegistryBuilder {
 
         Self {
             directory: directory.into(),
-            worktree,
             flags,
             file_tools,
+            enabled_builtins: None,
             builtins,
             configured_builtins: Vec::new(),
-            custom_loader: Arc::new(NoopCustomToolLoader),
+            harness_tools: Vec::new(),
             mcp_loader: Arc::new(NoopMcpToolLoader),
         }
+    }
+
+    /// Restrict built-ins to the ordered slots selected by a harness profile.
+    #[must_use]
+    pub fn with_builtin_slots(mut self, slots: impl IntoIterator<Item = BuiltinSlot>) -> Self {
+        self.enabled_builtins = Some(slots.into_iter().collect());
+        self
     }
 
     /// Register one implementation at its upstream position.
@@ -297,18 +267,17 @@ impl ToolRegistryBuilder {
 
     /// Register a configured built-in that has no fixed upstream slot.
     ///
-    /// These tools are assembled after the slotted built-ins and before every
-    /// extension source, so the registry's normal last-source-wins precedence and
-    /// suppression diagnostic apply to any same-named config, plugin, or MCP tool.
+    /// These tools are assembled after the slotted built-ins and before harness
+    /// and MCP contributions.
     pub fn register_configured_builtin(&mut self, tool: Arc<dyn Tool>) -> &mut Self {
         self.configured_builtins.push(tool);
         self
     }
 
-    /// Install the wave-9 custom-tool seam.
+    /// Install native tools contributed by the active harness profile.
     #[must_use]
-    pub fn with_custom_loader(mut self, loader: Arc<dyn CustomToolLoader>) -> Self {
-        self.custom_loader = loader;
+    pub fn with_harness_tools(mut self, tools: impl IntoIterator<Item = CustomTool>) -> Self {
+        self.harness_tools = tools.into_iter().collect();
         self
     }
 
@@ -319,11 +288,9 @@ impl ToolRegistryBuilder {
         self
     }
 
-    /// Load every source once and freeze the oracle's source order.
+    /// Load every source once and freeze the native source order.
     #[must_use]
     pub fn build(self) -> ToolRegistry {
-        let config_directories =
-            zuno_paths::config_directories(&self.directory, self.worktree.as_deref());
         let output_store = ToolOutputStore::new(
             self.directory
                 .join(zuno_paths::PROJECT_DIRECTORY)
@@ -336,6 +303,13 @@ impl ToolRegistryBuilder {
                 match source {
                     ToolSource::Builtin => {
                         for slot in BUILTIN_ORDER {
+                            if self
+                                .enabled_builtins
+                                .as_ref()
+                                .is_some_and(|enabled| !enabled.contains(&slot))
+                            {
+                                continue;
+                            }
                             if !slot.exposed_by_flags(&self.flags) {
                                 continue;
                             }
@@ -365,17 +339,10 @@ impl ToolRegistryBuilder {
                             source,
                         );
                     }
-                    ToolSource::ConfigDirectory => insert_tools(
+                    ToolSource::Harness => insert_tools(
                         &mut sourced_tools,
                         &mut diagnostics,
-                        self.custom_loader
-                            .config_directory_tools(&config_directories),
-                        source,
-                    ),
-                    ToolSource::Plugin => insert_tools(
-                        &mut sourced_tools,
-                        &mut diagnostics,
-                        self.custom_loader.plugin_tools(),
+                        self.harness_tools.iter().cloned(),
                         source,
                     ),
                     ToolSource::Mcp => insert_tools(
@@ -397,7 +364,6 @@ impl ToolRegistryBuilder {
             core,
             file_tools: self.file_tools,
             flags: self.flags,
-            config_directories,
             diagnostics,
         }
     }
@@ -487,7 +453,6 @@ pub struct ToolRegistry {
     core: Arc<RegistryCore>,
     file_tools: FileTools,
     flags: RegistryFlags,
-    config_directories: Vec<PathBuf>,
     diagnostics: Vec<ToolSuppressionDiagnostic>,
 }
 
@@ -496,12 +461,6 @@ impl ToolRegistry {
     #[must_use]
     pub fn all(&self) -> &[Arc<dyn Tool>] {
         &self.core.tools
-    }
-
-    /// The config directory chain handed to the custom-tool loader.
-    #[must_use]
-    pub fn config_directories(&self) -> &[PathBuf] {
-        &self.config_directories
     }
 
     /// Same-name replacements performed while all registry sources were assembled.
@@ -536,9 +495,7 @@ impl ToolRegistry {
             .iter()
             .filter(|tool| {
                 let id = tool.id();
-                if id == crate::websearch::ID
-                    && !web_search_enabled(input.provider_id, &self.flags.search)
-                {
+                if id == crate::websearch::ID && !web_search_enabled(&self.flags.search) {
                     return false;
                 }
                 if model_conditional_file_ids.contains(&id) && !exposed_file_ids.contains(id) {
@@ -648,7 +605,7 @@ pub(crate) fn canonical_tool_name(name: &str) -> &str {
         "discover_tools" => "integration_tools",
         "todoread" | "todo_read" | "todo_write" | "todos" | "todo" | "TodoWrite" => "todowrite",
         "WebFetch" => "webfetch",
-        "WebSearch" => "websearch",
+        "WebSearch" => "web_search",
         "ApplyPatch" => "apply_patch",
         "Question" => "question",
         "PlanExit" => "plan_exit",
@@ -656,19 +613,5 @@ pub(crate) fn canonical_tool_name(name: &str) -> &str {
         "Execute" => "execute",
         "ScheduleWakeup" => "schedule",
         other => other,
-    }
-}
-
-/// Apply `registry.ts:183-190`'s config-export naming rule.
-///
-/// A default export takes the source file's basename. Every named export is
-/// namespaced as `{basename}_{export}`. `None` means the path has no basename.
-#[must_use]
-pub fn config_tool_id(path: &Path, export_id: &str) -> Option<String> {
-    let namespace = path.file_stem()?.to_string_lossy();
-    if export_id == "default" {
-        Some(namespace.into_owned())
-    } else {
-        Some(format!("{namespace}_{export_id}"))
     }
 }

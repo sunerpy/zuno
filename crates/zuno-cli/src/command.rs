@@ -31,7 +31,7 @@ pub enum CliLogLevel {
 }
 
 impl CliLogLevel {
-    /// Uppercase spelling written to `OPENCODE_LOG_LEVEL`.
+    /// Uppercase spelling written to `ZUNO_LOG_LEVEL`.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -61,8 +61,6 @@ pub struct GlobalOptions {
     pub print_logs: bool,
     /// Override the environment's log level.
     pub log_level: Option<CliLogLevel>,
-    /// Disable external plugins.
-    pub pure: bool,
 }
 
 /// The root command parser.
@@ -74,11 +72,11 @@ pub struct GlobalOptions {
     subcommand_precedence_over_arg = true
 )]
 pub struct Cli {
-    /// Show the plugin-compatible version number.
+    /// Show the Zuno package version.
     #[arg(short = 'v', long, global = true, action = ArgAction::SetTrue)]
     pub version: bool,
 
-    /// Include the real Rust build identity with the compatibility version.
+    /// Include the build identity with the package version.
     #[arg(long, global = true, hide = true, requires = "version", action = ArgAction::SetTrue)]
     pub long: bool,
 
@@ -89,10 +87,6 @@ pub struct Cli {
     /// Set the minimum log level.
     #[arg(long, global = true, value_enum)]
     pub log_level: Option<CliLogLevel>,
-
-    /// Run without external plugins.
-    #[arg(long, global = true, action = ArgAction::SetTrue)]
-    pub pure: bool,
 
     /// The default command's own options, accepted without naming it.
     #[command(flatten)]
@@ -110,7 +104,6 @@ impl Cli {
         GlobalOptions {
             print_logs: self.print_logs,
             log_level: self.log_level,
-            pure: self.pure,
         }
     }
 
@@ -255,7 +248,7 @@ pub struct ServeArgs {
     pub hostname: String,
     #[arg(long, default_value_t = false)]
     pub mdns: bool,
-    #[arg(long, default_value = "opencode.local")]
+    #[arg(long, default_value = "zuno.local")]
     pub mdns_domain: String,
     #[arg(long)]
     pub cors: Vec<String>,
@@ -1094,13 +1087,26 @@ mod tests {
     #[test]
     fn global_options_parse_before_and_after_a_command() {
         for args in [
-            vec!["zuno", "--print-logs", "--pure", "run"],
-            vec!["zuno", "run", "--print-logs", "--pure"],
+            vec!["zuno", "--print-logs", "run"],
+            vec!["zuno", "run", "--print-logs"],
         ] {
             let cli = Cli::try_parse_from(args).expect("global flags");
             assert!(cli.print_logs);
-            assert!(cli.pure);
         }
+    }
+
+    #[test]
+    fn removed_pure_flag_is_rejected() {
+        assert!(Cli::try_parse_from(["zuno", "--pure"]).is_err());
+    }
+
+    #[test]
+    fn serve_uses_the_zuno_mdns_domain_by_default() {
+        let cli = Cli::try_parse_from(["zuno", "serve"]).expect("serve parses");
+        let Some(Command::Serve(args)) = cli.command else {
+            panic!("expected serve command");
+        };
+        assert_eq!(args.mdns_domain, "zuno.local");
     }
 
     #[test]

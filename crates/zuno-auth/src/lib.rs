@@ -4,7 +4,7 @@
 //! the TypeScript `opencode` binary that may have written them:
 //!
 //! - [`AuthStore`] over `auth.json` — a provider-keyed map of three credential
-//!   shapes, with `OPENCODE_AUTH_CONTENT` replacing reads.
+//!   shapes, with `ZUNO_AUTH_CONTENT` replacing reads.
 //! - [`McpAuthStore`] over `mcp-auth.json` — per-MCP-server OAuth tokens, dynamic
 //!   client registration, the PKCE verifier, the CSRF state, and the server URL.
 //!
@@ -70,7 +70,7 @@
 //! | this crate | oracle |
 //! | --- | --- |
 //! | [`Credential`] | `packages/opencode/src/auth/index.ts:14-35` |
-//! | [`AuthStore::all`] and `OPENCODE_AUTH_CONTENT` | `auth/index.ts:58-67` |
+//! | [`AuthStore::all`] and `ZUNO_AUTH_CONTENT` | `auth/index.ts:58-67` |
 //! | [`AuthStore::set`], [`AuthStore::remove`] | `auth/index.ts:73-89` |
 //! | [`Entry`], [`Tokens`], [`ClientInfo`] | `packages/opencode/src/mcp/auth.ts:9-32` |
 //! | [`McpAuthStore`] reads and writes | `mcp/auth.ts:65-142` |
@@ -85,9 +85,7 @@ pub mod store;
 
 pub use crate::error::AuthError;
 pub use crate::mcp::{ClientInfo, Entry, McpAuthStore, McpCredentials, Tokens};
-pub use crate::provider::{
-    AuthStore, Credential, Credentials, OAUTH_DUMMY_KEY, OPENCODE_AUTH_CONTENT,
-};
+pub use crate::provider::{AuthStore, Credential, Credentials, OAUTH_DUMMY_KEY, ZUNO_AUTH_CONTENT};
 pub use crate::secret::{REDACTED, Secret};
 pub use crate::store::{CREDENTIAL_FILE_MODE, PermissionWarning};
 

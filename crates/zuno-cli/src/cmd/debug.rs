@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -6,9 +5,7 @@ use serde::Serialize;
 use zuno_catalog::lsp_config::ResolvedLsp;
 use zuno_catalog::skill::discovery::SkillOptions;
 use zuno_config::schema::Config;
-use zuno_config::schema::plugin::PluginSpec;
 use zuno_lsp::{Manager, RestartPolicy, ServerRegistry};
-use zuno_plugin::{ConfigDirectory, ConfigLayer, PluginScope, discover_plugins};
 use zuno_search::{Backend, GlobRequest, GrepRequest, NeverCancelled};
 use zuno_snapshot::{Location, Store};
 
@@ -66,13 +63,6 @@ pub(super) fn execute(args: &DebugArgs, environment: &StartupEnvironment) -> Res
     }
 }
 
-#[derive(Serialize)]
-struct PluginOriginOutput {
-    spec: PluginSpec,
-    source: String,
-    scope: &'static str,
-}
-
 fn config(context: &Context) -> Result<(), String> {
     let agents = zuno_catalog::agent::load_map(
         &context.directory,
@@ -86,8 +76,6 @@ fn config(context: &Context) -> Result<(), String> {
         &context.env,
     )
     .map_err(to_string)?;
-    let origins = plugin_origins(context)?;
-
     let mut output = serde_json::to_value(&context.config).map_err(to_string)?;
     let object = output
         .as_object_mut()
@@ -99,33 +87,6 @@ fn config(context: &Context) -> Result<(), String> {
     object.insert(
         "command".to_owned(),
         serde_json::to_value(commands).map_err(to_string)?,
-    );
-    if !origins.is_empty() {
-        object.insert(
-            "plugin".to_owned(),
-            serde_json::to_value(
-                origins
-                    .iter()
-                    .map(|origin| &origin.spec)
-                    .collect::<Vec<_>>(),
-            )
-            .map_err(to_string)?,
-        );
-        object.insert(
-            "plugin_origins".to_owned(),
-            serde_json::to_value(origins).map_err(to_string)?,
-        );
-    }
-    // Reported unconditionally, and alongside the discovered plugins rather than
-    // instead of them: "these were found but the host is off" is the state a user
-    // whose plugins stopped running actually needs to see.
-    let policy = super::plugin_runtime::JsPluginPolicy::resolve(&context.config, &context.env);
-    object.insert(
-        "plugin_runtime_resolved".to_owned(),
-        serde_json::json!({
-            "javascript": policy.enabled,
-            "source": policy.source.as_str(),
-        }),
     );
     normalize_json_numbers(&mut output);
     print_json(&output)
@@ -159,184 +120,6 @@ fn normalize_json_numbers(value: &mut serde_json::Value) {
         }
         _ => {}
     }
-}
-
-fn plugin_origins(context: &Context) -> Result<Vec<PluginOriginOutput>, String> {
-    let layout = zuno_paths::Layout::resolve(&context.env);
-    let mut origins = Vec::new();
-
-    for path in zuno_paths::Layout::file_in_directory(layout.config(), zuno_paths::CONFIG_FILE_STEM)
-    {
-        add_plugin_file(
-            &mut origins,
-            &path,
-            layout.config().display().to_string(),
-            PluginScope::Global,
-        )?;
-    }
-    if let Some(value) = context.env.truthy_value("OPENCODE_CONFIG") {
-        let path = resolve_path(&context.directory, value)?;
-        let scope = plugin_scope(context, &path);
-        add_plugin_file(&mut origins, &path, path.display().to_string(), scope)?;
-    }
-    if !layout.project_config_disabled() {
-        for path in zuno_paths::Layout::config_files(
-            zuno_paths::CONFIG_FILE_STEM,
-            &context.directory,
-            context.worktree.as_deref(),
-        ) {
-            add_plugin_file(
-                &mut origins,
-                &path,
-                path.display().to_string(),
-                PluginScope::Local,
-            )?;
-        }
-    }
-
-    let directories = layout.config_directories(&context.directory, context.worktree.as_deref());
-    // Membership in discovery's own list, rather than a second copy of its
-    // `.zuno`-or-override predicate: a divergence here makes this diagnostic
-    // attribute plugins to a file the runtime never loads.
-    let read_from = zuno_config::discovery::read_config_directories(
-        &layout,
-        &context.directory,
-        context.worktree.as_deref(),
-    );
-    for directory in &directories {
-        if read_from.contains(directory) {
-            for path in
-                zuno_paths::Layout::file_in_directory(directory, zuno_paths::CONFIG_FILE_STEM)
-            {
-                let scope = plugin_scope(context, &path);
-                add_plugin_file(&mut origins, &path, path.display().to_string(), scope)?;
-            }
-        }
-
-        let scope = plugin_scope(context, directory);
-        let discovered =
-            discover_plugins(&[], &[ConfigDirectory::new(directory, scope)]).map_err(to_string)?;
-        origins.extend(discovered.into_iter().map(|plugin| PluginOriginOutput {
-            spec: plugin.spec,
-            source: directory.display().to_string(),
-            scope: scope_label(scope),
-        }));
-    }
-
-    if let Some(text) = context.env.truthy_value("OPENCODE_CONFIG_CONTENT") {
-        let layer = Config::from_json_str(Path::new("OPENCODE_CONFIG_CONTENT"), text)
-            .map_err(|error| error.report())?;
-        let declaration = context.directory.join("OPENCODE_CONFIG_CONTENT");
-        add_plugin_config(
-            &mut origins,
-            &layer,
-            &declaration,
-            "OPENCODE_CONFIG_CONTENT".to_owned(),
-            PluginScope::Local,
-        )?;
-    }
-
-    let managed = managed_config_dir(&context.env);
-    if managed.exists() {
-        for path in zuno_paths::Layout::file_in_directory(&managed, zuno_paths::CONFIG_FILE_STEM) {
-            add_plugin_file(
-                &mut origins,
-                &path,
-                path.display().to_string(),
-                PluginScope::Global,
-            )?;
-        }
-    }
-
-    Ok(deduplicate_plugin_origins(origins))
-}
-
-fn add_plugin_file(
-    origins: &mut Vec<PluginOriginOutput>,
-    path: &Path,
-    source: String,
-    scope: PluginScope,
-) -> Result<(), String> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let text = std::fs::read_to_string(path).map_err(to_string)?;
-    let strict = zuno_config::discovery::strip_jsonc(&text);
-    let config = Config::from_json_str(path, &strict).map_err(|error| error.report())?;
-    add_plugin_config(origins, &config, path, source, scope)
-}
-
-fn add_plugin_config(
-    origins: &mut Vec<PluginOriginOutput>,
-    config: &Config,
-    declaration_source: &Path,
-    source: String,
-    scope: PluginScope,
-) -> Result<(), String> {
-    let discovered = discover_plugins(&[ConfigLayer::new(declaration_source, scope, config)], &[])
-        .map_err(to_string)?;
-    origins.extend(discovered.into_iter().map(|plugin| PluginOriginOutput {
-        spec: plugin.spec,
-        source: source.clone(),
-        scope: scope_label(scope),
-    }));
-    Ok(())
-}
-
-fn managed_config_dir(env: &zuno_paths::Env) -> PathBuf {
-    if let Some(path) = env.truthy_value("OPENCODE_TEST_MANAGED_CONFIG_DIR") {
-        return PathBuf::from(path);
-    }
-    #[cfg(target_os = "macos")]
-    {
-        PathBuf::from("/Library/Application Support/zuno")
-    }
-    #[cfg(target_os = "windows")]
-    {
-        PathBuf::from(env.truthy_value("ProgramData").unwrap_or("C:\\ProgramData")).join("zuno")
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        PathBuf::from("/etc/zuno")
-    }
-}
-
-fn plugin_scope(context: &Context, source: &Path) -> PluginScope {
-    let local_root = context.worktree.as_deref().unwrap_or(&context.directory);
-    if source.starts_with(local_root) {
-        PluginScope::Local
-    } else {
-        PluginScope::Global
-    }
-}
-
-const fn scope_label(scope: PluginScope) -> &'static str {
-    match scope {
-        PluginScope::Global => "global",
-        PluginScope::Local => "local",
-    }
-}
-
-fn plugin_identity(spec: &str) -> &str {
-    if spec.starts_with("file://") {
-        return spec;
-    }
-    let search_from = usize::from(spec.starts_with('@'));
-    spec[search_from..]
-        .rfind('@')
-        .map_or(spec, |index| &spec[..search_from + index])
-}
-
-fn deduplicate_plugin_origins(origins: Vec<PluginOriginOutput>) -> Vec<PluginOriginOutput> {
-    let mut seen = HashSet::new();
-    let mut reversed = Vec::new();
-    for origin in origins.into_iter().rev() {
-        if seen.insert(plugin_identity(origin.spec.name()).to_owned()) {
-            reversed.push(origin);
-        }
-    }
-    reversed.reverse();
-    reversed
 }
 
 struct Context {

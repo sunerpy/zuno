@@ -1,34 +1,29 @@
 //! The one skill that ships inside the binary.
 //!
-//! `skill/index.ts:27-35` and `:276-283`. The model's intuition for `zuno.json`
-//! is often wrong and Zuno hard-fails on invalid config, so this skill hands it
-//! the real schemas. It is registered **before** disk
-//! discovery so a user's own `customize-opencode` on disk overrides it.
+//! The model's intuition for `zuno.json` is often wrong and Zuno hard-fails on
+//! invalid config, so this skill documents the native forms. It is registered
+//! before disk discovery so a user's own `customize-zuno` overrides it.
 //!
 //! Two things here have to be exact rather than approximately right:
 //!
 //! * `location` is the literal string `<built-in>` — not a path. It is the only
 //!   `location` in the set that is not a filesystem path, which is why the
 //!   verbose render form HTML-escapes locations at all.
-//! * `description` is the copy at `skill/index.ts:33-34`, which is **not** the
-//!   same string as the v2 plugin's at `packages/core/src/plugin/skill.ts:23`:
-//!   the v2 copy also lists `commands`. `opencode debug skill` 1.18.13 prints the
-//!   v1 string, so that is the one reproduced here.
+//! * `description` names only configuration surfaces implemented by Zuno.
 
 use crate::skill::Skill;
 
 /// The built-in skill's name.
-pub const NAME: &str = "customize-opencode";
+pub const NAME: &str = "customize-zuno";
 
-/// The literal `location` the oracle reports for it.
+/// The catalog sentinel for a skill compiled into the binary.
 pub const LOCATION: &str = "<built-in>";
 
-/// `CUSTOMIZE_OPENCODE_SKILL_DESCRIPTION` (`skill/index.ts:33-34`), verbatim.
-pub const DESCRIPTION: &str = "Use ONLY when the user is editing or creating Zuno's own configuration: zuno.json, zuno.jsonc, files under .zuno/, or files under ~/.config/zuno/. Also use when creating or fixing Zuno agents, subagents, skills, plugins, MCP servers, or permission rules. Do not use for the user's own application code, or for any project that is not configuring Zuno itself.";
+/// Model-facing trigger for the native configuration skill.
+pub const DESCRIPTION: &str = "Use ONLY when the user is editing or creating Zuno's own configuration: zuno.json, zuno.jsonc, files under .zuno/, or files under ~/.config/zuno/. Also use when creating or fixing Zuno agents, subagents, commands, skills, MCP servers, web search, or permission rules. Do not use for the user's own application code, or for any project that is not configuring Zuno itself.";
 
-/// The body, byte-identical to
-/// `packages/core/src/plugin/skill/customize-opencode.md` at 1.18.13.
-pub const CONTENT: &str = include_str!("customize-opencode.md");
+/// The native configuration guide embedded in the binary.
+pub const CONTENT: &str = include_str!("customize-zuno.md");
 
 /// The built-in skill, as it appears in `Skill.all()`.
 #[must_use]

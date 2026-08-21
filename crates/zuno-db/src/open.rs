@@ -80,7 +80,7 @@ pub fn open_default_location(location: &DbLocation) -> Result<Connection, DbErro
 /// Open `location`, applying the oracle's pragmas.
 ///
 /// [`DbLocation::Memory`] yields a *private* in-memory database, matching what
-/// the oracle gets from `OPENCODE_DB=:memory:`. Use
+/// the oracle gets from `ZUNO_DB=:memory:`. Use
 /// [`open_shared_memory`] when more than one connection has to see the same
 /// in-memory data.
 ///
@@ -130,7 +130,7 @@ pub(crate) fn reject_legacy_default(location: &DbLocation) -> Result<(), DbError
 ///
 /// [`zuno_paths`] deliberately keeps every path getter pure, and the oracle relies
 /// on `global.ts` having already created `data()` at import. Doing it here is a
-/// documented superset: it also covers an `OPENCODE_DB` pointing at a nested
+/// documented superset: it also covers an `ZUNO_DB` pointing at a nested
 /// directory, which the oracle would fail to open.
 ///
 /// # Errors

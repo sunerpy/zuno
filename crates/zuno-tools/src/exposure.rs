@@ -18,7 +18,7 @@
 //! # The measured conditions
 //!
 //! Read off the real 1.18.12 binary rather than only off the source. `opencode debug
-//! agent <name> --pure` prints the resolved `tools` map; the full 18-case transcript
+//! agent <name>` prints the resolved `tools` map; the full 18-case transcript
 //! is in `.omo/evidence/task-43-opencode-rust.txt`. Summary:
 //!
 //! | wire id | condition | oracle |
@@ -39,15 +39,15 @@
 //! then hidden again from every agent except `plan` by the permission ruleset —
 //! `plan_exit: "deny"` in the defaults, `plan_exit: "allow"` for the `plan` agent
 //! (`packages/opencode/src/agent/agent.ts:128,164`). Measured: with
-//! `OPENCODE_EXPERIMENTAL_PLAN_MODE=true` the tool is **absent** from `build` and
+//! `ZUNO_EXPERIMENTAL_PLAN_MODE=true` the tool is **absent** from `build` and
 //! **present** on `plan`. That second layer is [`zuno_permission`]'s, so a caller of
 //! this module that stops here will over-offer `plan_exit` on non-plan agents.
 //! Todo 44 has to apply both, in that order.
 //!
 //! # Case and emptiness are load-bearing
 //!
-//! The client is compared as an exact string. `OPENCODE_CLIENT=CLI` offers neither
-//! `question` nor `plan_exit`, and `OPENCODE_CLIENT=` (set but empty) offers neither
+//! The client is compared as an exact string. `ZUNO_CLIENT=CLI` offers neither
+//! `question` nor `plan_exit`, and `ZUNO_CLIENT=` (set but empty) offers neither
 //! either — the `"cli"` default applies only when the variable is *absent*. Both
 //! verified against the binary (cases 17 and 18), and both are the kind of thing a
 //! well-meaning `eq_ignore_ascii_case` or `filter(|v| !v.is_empty())` would silently
@@ -55,27 +55,27 @@
 
 /// Selects the surface that started the process, which two tools are gated on.
 ///
-/// Oracle: `Config.string("OPENCODE_CLIENT").pipe(Config.withDefault("cli"))`
+/// Oracle: `Config.string("ZUNO_CLIENT").pipe(Config.withDefault("cli"))`
 /// (`packages/opencode/src/effect/runtime-flags.ts:57`).
-pub const ENV_CLIENT: &str = "OPENCODE_CLIENT";
+pub const ENV_CLIENT: &str = "ZUNO_CLIENT";
 
 /// Offers `question` regardless of the client.
 ///
 /// Oracle: `flags.enableQuestionTool` (`runtime-flags.ts:41`), the second half of
 /// `registry.ts:202`'s disjunction.
-pub const ENV_ENABLE_QUESTION_TOOL: &str = "OPENCODE_ENABLE_QUESTION_TOOL";
+pub const ENV_ENABLE_QUESTION_TOOL: &str = "ZUNO_ENABLE_QUESTION_TOOL";
 
 /// The blanket experimental switch, consulted only when the specific flag is unset.
 ///
 /// See [`ExposureFlags::from_lookup`] for the precedence, which is not the obvious
 /// one.
-pub const ENV_EXPERIMENTAL: &str = "OPENCODE_EXPERIMENTAL";
+pub const ENV_EXPERIMENTAL: &str = "ZUNO_EXPERIMENTAL";
 
 /// Enables plan mode, the first half of `plan_exit`'s condition.
 ///
-/// Oracle: `experimentalPlanMode: enabledByExperimental("OPENCODE_EXPERIMENTAL_PLAN_MODE")`
+/// Oracle: `experimentalPlanMode: enabledByExperimental("ZUNO_EXPERIMENTAL_PLAN_MODE")`
 /// (`runtime-flags.ts:48`).
-pub const ENV_EXPERIMENTAL_PLAN_MODE: &str = "OPENCODE_EXPERIMENTAL_PLAN_MODE";
+pub const ENV_EXPERIMENTAL_PLAN_MODE: &str = "ZUNO_EXPERIMENTAL_PLAN_MODE";
 
 /// The client assumed when [`ENV_CLIENT`] is absent.
 pub const DEFAULT_CLIENT: &str = "cli";
@@ -193,16 +193,16 @@ impl ExposureFlags {
     ///
     /// # The precedence that is not obvious
     ///
-    /// `OPENCODE_EXPERIMENTAL` is a *fallback*, not an override. Upstream's
+    /// `ZUNO_EXPERIMENTAL` is a *fallback*, not an override. Upstream's
     /// `enabledByExperimental` (`runtime-flags.ts:11-15`) reads the specific flag as
     /// an `Option` and only substitutes the blanket switch when it is absent, so
-    /// `OPENCODE_EXPERIMENTAL=true OPENCODE_EXPERIMENTAL_PLAN_MODE=false` leaves plan
+    /// `ZUNO_EXPERIMENTAL=true ZUNO_EXPERIMENTAL_PLAN_MODE=false` leaves plan
     /// mode **off**. Verified against the binary as transcript case 13 — a reading
     /// that treated the blanket switch as a disjunct would have offered `plan_exit`
     /// there.
     ///
     /// A variable that is present but unparseable as a boolean counts as absent, so
-    /// `OPENCODE_EXPERIMENTAL_PLAN_MODE=maybe` falls through to the blanket switch.
+    /// `ZUNO_EXPERIMENTAL_PLAN_MODE=maybe` falls through to the blanket switch.
     #[must_use]
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
         let experimental = lookup(ENV_EXPERIMENTAL)
@@ -312,7 +312,7 @@ pub fn exposes_question(flags: &ExposureFlags) -> bool {
 /// ```
 ///
 /// A **conjunction**, and unlike [`exposes_question`] there is no flag that rescues a
-/// non-CLI client: `OPENCODE_CLIENT=app` with plan mode on offers `question` and
+/// non-CLI client: `ZUNO_CLIENT=app` with plan mode on offers `question` and
 /// withholds `plan_exit` (transcript cases 10 and 4). Remember the second layer
 /// documented on this module — the permission ruleset withholds it again from every
 /// agent but `plan`.
@@ -465,7 +465,7 @@ mod tests {
 
     #[test]
     fn conditional_question_is_absent_for_a_client_that_cannot_render_it() {
-        // Transcript case 2: OPENCODE_CLIENT=tui drops `question` from the list.
+        // Transcript case 2: ZUNO_CLIENT=tui drops `question` from the list.
         let configuration = ExposureFlags::default().with_client("tui");
         assert!(!exposes_question(&configuration));
         assert!(!exposed_conditional_tools(&configuration).contains(&"question"));
@@ -480,7 +480,7 @@ mod tests {
 
     #[test]
     fn conditional_question_client_matching_is_case_sensitive() {
-        // Transcript case 17: OPENCODE_CLIENT=CLI offers neither conditional tool.
+        // Transcript case 17: ZUNO_CLIENT=CLI offers neither conditional tool.
         let configuration = ExposureFlags::default().with_client("CLI").with_plan_mode();
         assert!(!exposes_question(&configuration));
         assert!(!exposes_plan_exit(&configuration));
@@ -496,7 +496,7 @@ mod tests {
 
     #[test]
     fn conditional_plan_exit_is_present_under_plan_mode_with_a_cli_client() {
-        // The task's happy path: OPENCODE_CLIENT=cli and plan mode enabled.
+        // The task's happy path: ZUNO_CLIENT=cli and plan mode enabled.
         let configuration = flags(&[(ENV_CLIENT, "cli"), (ENV_EXPERIMENTAL_PLAN_MODE, "true")]);
         assert!(exposes_plan_exit(&configuration));
         assert!(exposed_conditional_tools(&configuration).contains(&"plan_exit"));

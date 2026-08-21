@@ -1,226 +1,250 @@
-//! `websearch`: query the session's search backend, when one is configured.
-//!
-//! # Gating, not failing
-//!
-//! Whether this tool is offered at all is [`gating::web_search_enabled`], evaluated
-//! before the tool list is built. An unconfigured `websearch` is **absent** from the
-//! list rather than present and failing — see the [`gating`] module docs for why a
-//! tool the model cannot use is worse than no tool.
-//!
-//! # Registry key versus wire id
-//!
-//! Upstream registers this under the key `search`
-//! (`packages/opencode/src/tool/registry.ts:218`, `search: Tool.init(websearch)`) while
-//! the id the model calls is `websearch` (`Tool.define("websearch", …)`). As with
-//! `webfetch`/`fetch`, [`Tool::id`](zuno_tool::Tool::id) is the wire id, which is also
-//! the permission key.
-//!
-//! # Results are data
-//!
-//! Search results are pages a stranger wrote. They land in
-//! [`ToolOutput::output`] as text with no structural privilege, exactly as
-//! `webfetch`'s do.
+//! Native Zuno web-search capability and model-facing batch consumer.
 
 pub mod gating;
 pub mod mcp;
+mod provider;
 
 use async_trait::async_trait;
-use gating::{Provider, SearchConfig};
+use gating::SearchConfig;
+use provider::McpSearchProvider;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use zuno_error::ToolError;
-use zuno_tool::{ToolContext, ToolOutput, TypedTool};
+use tokio::sync::Notify;
+use tokio::task::JoinSet;
+use zuno_error::{BoxSource, ToolError};
+use zuno_tool::{InterruptHandle, PermissionAsk, ToolContext, ToolOutput, TypedTool};
 
-/// The wire id, and the permission key.
-pub const ID: &str = "websearch";
+pub use provider::{SearchExecution, SearchRequest, SearchResult, SearchSource, WebSearchProvider};
 
-/// The message returned when the backend found nothing.
-///
-/// Oracle: `packages/core/src/tool/websearch.ts:20` (`NO_RESULTS`).
-pub const NO_RESULTS: &str = "No search results found. Please try a different query.";
+/// Native wire id and permission key.
+pub const ID: &str = "web_search";
 
-/// The default number of results requested.
-///
-/// Oracle: `params.numResults || 8` (`packages/core/src/tool/websearch.ts:221`).
-pub const DEFAULT_NUM_RESULTS: u32 = 8;
+/// Message returned when every provider result is empty.
+pub const NO_RESULTS: &str = "No search results found. Please try different queries.";
 
-/// The `{{year}}` placeholder the description carries.
-const YEAR_PLACEHOLDER: &str = "{{year}}";
+/// Default number of distinct queries accepted in one call.
+pub const DEFAULT_MAX_QUERIES: usize = 4;
 
-/// The description template, verbatim from
-/// `packages/opencode/src/tool/websearch.txt`.
-///
-/// `{{year}}` is substituted at construction, because upstream does the same
-/// (`websearch.ts:106-108`, `DESCRIPTION.replace("{{year}}", …)`) and the instruction
-/// only works if the year is the current one.
-pub const DESCRIPTION_TEMPLATE: &str = "- Search the web using the session's web search provider - performs real-time web searches and can scrape content from specific URLs
-- Provides up-to-date information for current events and recent data
-- Supports configurable result counts and returns the content from the most relevant websites
-- Use this tool for accessing information beyond knowledge cutoff
-- Searches are performed automatically within a single API call
+/// Default combined source count returned to the model.
+pub const DEFAULT_MAX_RESULTS: usize = 8;
 
-Usage notes:
-  - Supports live crawling modes when available: 'fallback' (backup if cached unavailable) or 'preferred' (prioritize live crawling)
-  - Search types when available: 'auto' (balanced), 'fast' (quick results), 'deep' (comprehensive search)
-  - Configurable context length for optimal LLM integration
-  - Domain filtering and advanced search options available
-
-The current year is {{year}}. You MUST use this year when searching for recent information or current events
-- Example: If the current year is 2026 and the user asks for \"latest AI news\", search for \"AI news 2026\", NOT \"AI news 2025\"";
-
-/// How aggressively the backend should crawl rather than serve cached content.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum LiveCrawl {
-    /// Use live crawling as backup if cached content unavailable.
-    Fallback,
-    /// Prioritize live crawling.
-    Preferred,
+/// Batch policy controlled by the runtime profile, never by model arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebSearchPolicy {
+    /// Maximum submitted queries before duplicate removal.
+    pub max_queries: usize,
+    /// Maximum sources after round-robin merge and URL deduplication.
+    pub max_results: usize,
+    /// Time budget for each provider request.
+    pub timeout: Duration,
 }
 
-impl LiveCrawl {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Fallback => "fallback",
-            Self::Preferred => "preferred",
+impl Default for WebSearchPolicy {
+    fn default() -> Self {
+        Self {
+            max_queries: DEFAULT_MAX_QUERIES,
+            max_results: DEFAULT_MAX_RESULTS,
+            timeout: mcp::TIMEOUT,
         }
     }
 }
 
-/// How much work the backend should spend on the query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum SearchType {
-    /// Balanced search.
-    Auto,
-    /// Quick results.
-    Fast,
-    /// Comprehensive search.
-    Deep,
-}
-
-impl SearchType {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Fast => "fast",
-            Self::Deep => "deep",
-        }
-    }
-}
-
-/// The arguments, deserialized and schema-derived from one declaration.
-///
-/// The wire names are camelCase because the model sees them: upstream's parameters
-/// are `numResults` and `contextMaxCharacters`
-/// (`packages/core/src/tool/websearch.ts:40-57`), and renaming them here would break
-/// every model tuned against upstream's schema. `rename_all` drives both the derived
-/// schema and the deserializer, so the two cannot drift.
+/// Model-facing arguments. Runtime bounds and provider controls are profile config.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct WebSearchParams {
-    /// Websearch query
-    pub query: String,
-    /// Number of search results to return (default: 8)
-    #[serde(default)]
-    pub num_results: Option<u32>,
-    /// Live crawl mode - 'fallback': use live crawling as backup if cached content unavailable, 'preferred': prioritize live crawling (default: 'fallback')
-    #[serde(default)]
-    pub livecrawl: Option<LiveCrawl>,
-    /// Search type - 'auto': balanced search (default), 'fast': quick results, 'deep': comprehensive search
-    #[serde(default)]
-    pub r#type: Option<SearchType>,
-    /// Maximum characters for context string optimized for LLMs (default: 10000)
-    #[serde(default)]
-    pub context_max_characters: Option<u32>,
+    /// One or more non-empty search queries.
+    pub queries: Vec<String>,
 }
 
-/// Searches the web through the session's configured backend.
+/// Concurrent batch consumer over a single-query provider.
+#[derive(Clone)]
 pub struct WebSearchTool {
-    client: reqwest::Client,
+    provider: Arc<dyn WebSearchProvider>,
     config: SearchConfig,
+    policy: WebSearchPolicy,
     description: String,
-    /// The endpoint override tests point at a `wiremock` server.
-    endpoint_override: Option<String>,
-    /// The time budget, defaulting to [`mcp::TIMEOUT`].
-    timeout: Duration,
+    mcp_backed: bool,
 }
 
 impl WebSearchTool {
-    /// A tool reading its configuration from the environment.
-    ///
-    /// # Panics
-    /// Never in practice; see [`crate::webfetch::WebFetchTool::new`].
+    /// Build the configured hosted-provider adapter.
     #[must_use]
     pub fn new() -> Self {
         Self::with_config(SearchConfig::from_env())
     }
 
-    /// A tool over an explicit configuration.
+    /// Build the hosted-provider adapter from explicit configuration.
     #[must_use]
     pub fn with_config(config: SearchConfig) -> Self {
+        let provider = Arc::new(McpSearchProvider::new(config.clone()));
+        let policy = WebSearchPolicy {
+            max_queries: config.max_queries,
+            max_results: config.max_results,
+            timeout: config.timeout,
+        };
         Self {
-            client: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::limited(
-                    crate::webfetch::bounds::MAX_REDIRECTS,
-                ))
-                .build()
-                .expect("reqwest client with a redirect policy"),
+            provider,
             config,
-            description: describe(current_year()),
-            endpoint_override: None,
-            timeout: mcp::TIMEOUT,
+            policy,
+            description: describe(policy.max_queries),
+            mcp_backed: true,
         }
     }
 
-    /// Points every call at `url` instead of the provider's real endpoint.
-    ///
-    /// Exists so the transport can be tested against `wiremock`; no test in this
-    /// workspace may reach a real search backend.
+    /// Build the consumer over a runtime-provided search backend.
     #[must_use]
-    pub fn with_endpoint(mut self, url: impl Into<String>) -> Self {
-        self.endpoint_override = Some(url.into());
+    pub fn with_provider(provider: Arc<dyn WebSearchProvider>, policy: WebSearchPolicy) -> Self {
+        Self {
+            provider,
+            config: SearchConfig::default(),
+            policy,
+            description: describe(policy.max_queries),
+            mcp_backed: false,
+        }
+    }
+
+    /// Point the hosted adapter at a test endpoint.
+    #[must_use]
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        assert!(
+            self.mcp_backed,
+            "with_endpoint is only valid for the hosted MCP adapter"
+        );
+        self.provider =
+            Arc::new(McpSearchProvider::new(self.config.clone()).with_endpoint(endpoint));
         self
     }
 
-    /// Shortens the time budget, so a test can prove the call is bounded without
-    /// waiting out upstream's real 25 seconds on every run.
-    ///
-    /// The default is pinned separately, so shortening it here cannot hide a wrong
-    /// default.
+    /// Override the per-query budget.
     #[must_use]
     pub const fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
+        self.policy.timeout = timeout;
         self
     }
 
-    /// The configuration in force.
+    /// Provider and exposure configuration.
     #[must_use]
     pub const fn config(&self) -> &SearchConfig {
         &self.config
     }
 
-    /// Whether this tool should be offered for a turn served by `provider_id`.
-    ///
-    /// The predicate todo 44's registry filters on; see
-    /// [`gating::web_search_enabled`].
+    /// Whether this consumer has a usable provider.
     #[must_use]
-    pub fn enabled_for(&self, provider_id: &str) -> bool {
-        gating::web_search_enabled(provider_id, &self.config)
+    pub fn enabled_for(&self, _model_provider_id: &str) -> bool {
+        !self.mcp_backed || gating::web_search_enabled(&self.config)
     }
 
-    /// The backend this session routes to.
+    /// Hosted backend selected for one session.
     #[must_use]
-    pub fn provider_for(&self, session_id: &str) -> Provider {
+    pub fn provider_for(&self, session_id: &str) -> gating::Provider {
         gating::select_provider(session_id, &self.config)
     }
 
-    fn endpoint(&self, provider: Provider) -> String {
-        self.endpoint_override
-            .clone()
-            .unwrap_or_else(|| mcp::endpoint(provider, self.config.api_key(provider)))
+    async fn search_queries(
+        &self,
+        queries: &[String],
+        ctx: &ToolContext,
+    ) -> Result<SearchResult, ToolError> {
+        if queries.len() == 1 {
+            return self
+                .search_one(&queries[0], Arc::clone(&ctx.interrupt), &ctx.session_id)
+                .await;
+        }
+
+        let batch = Arc::new(BatchInterrupt::new(Arc::clone(&ctx.interrupt)));
+        let mut tasks = JoinSet::new();
+        for (index, query) in queries.iter().cloned().enumerate() {
+            let provider = Arc::clone(&self.provider);
+            let interrupt = Arc::clone(&batch);
+            let session_id = ctx.session_id.clone();
+            let timeout = self.policy.timeout;
+            let max_results = self.policy.max_results;
+            tasks.spawn(async move {
+                let execution = SearchExecution {
+                    session_id,
+                    interrupt,
+                };
+                let result = tokio::time::timeout(
+                    timeout,
+                    provider.search(SearchRequest { query, max_results }, execution),
+                )
+                .await;
+                (index, result)
+            });
+        }
+
+        let mut results = vec![None; queries.len()];
+        let mut first_failure = None;
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok((index, Ok(Ok(result)))) => results[index] = Some(result),
+                Ok((_index, Ok(Err(source)))) => {
+                    if first_failure.is_none() {
+                        first_failure = Some(QueryFailure::Provider(source));
+                        batch.cancel();
+                    }
+                }
+                Ok((_index, Err(_elapsed))) => {
+                    if first_failure.is_none() {
+                        first_failure = Some(QueryFailure::Timeout(self.policy.timeout));
+                        batch.cancel();
+                    }
+                }
+                Err(source) => {
+                    if first_failure.is_none() {
+                        first_failure = Some(QueryFailure::Join(Box::new(source)));
+                        batch.cancel();
+                    }
+                }
+            }
+        }
+        if let Some(failure) = first_failure {
+            return Err(failure.into_tool_error());
+        }
+        let results = results
+            .into_iter()
+            .map(|result| result.expect("successful query stored its result"))
+            .collect::<Vec<_>>();
+        Ok(merge_results(queries, &results, self.policy.max_results))
+    }
+
+    async fn search_one(
+        &self,
+        query: &str,
+        interrupt: Arc<dyn InterruptHandle>,
+        session_id: &str,
+    ) -> Result<SearchResult, ToolError> {
+        match tokio::time::timeout(
+            self.policy.timeout,
+            self.provider.search(
+                SearchRequest {
+                    query: query.to_owned(),
+                    max_results: self.policy.max_results,
+                },
+                SearchExecution {
+                    session_id: session_id.to_owned(),
+                    interrupt,
+                },
+            ),
+        )
+        .await
+        {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(source)) => Err(ToolError::Failed {
+                tool: ID.to_owned(),
+                source,
+            }),
+            Err(_elapsed) => Err(ToolError::Timeout {
+                tool: ID.to_owned(),
+                elapsed: self.policy.timeout,
+            }),
+        }
     }
 }
 
@@ -247,171 +271,228 @@ impl TypedTool for WebSearchTool {
         params: WebSearchParams,
         ctx: ToolContext,
     ) -> Result<ToolOutput, ToolError> {
-        if params.query.trim().is_empty() {
-            return Err(ToolError::InvalidArgs {
-                tool: ID.to_owned(),
-                source: "query must not be empty".into(),
-            });
-        }
-
-        let provider = self.provider_for(&ctx.session_id);
-
+        let queries = validate_queries(params.queries, self.policy.max_queries)?;
         ctx.ask(
             ID,
-            zuno_tool::PermissionAsk {
+            PermissionAsk {
                 permission: ID.to_owned(),
-                patterns: vec![params.query.clone()],
-                metadata: metadata(&params, provider),
+                patterns: queries.clone(),
+                metadata: json!({
+                    "queries": queries,
+                    "provider": self.provider.id(),
+                })
+                .as_object()
+                .expect("object")
+                .clone(),
                 always: vec!["*".to_owned()],
             },
         )
         .await?;
 
-        let url = self.endpoint(provider);
-        let (tool, arguments) = match provider {
-            Provider::Exa => (mcp::EXA_TOOL, exa_arguments(&params)),
-            Provider::Parallel => (
-                mcp::PARALLEL_TOOL,
-                parallel_arguments(&params, &ctx.session_id),
-            ),
-        };
-        let headers = auth_headers(provider, self.config.api_key(provider));
+        let result = self.search_queries(&queries, &ctx).await?;
+        let title = format!("Web search: {}", queries.join(", "));
+        let mut output = ToolOutput::text(title, format_output(&result))
+            .with_metadata("provider", self.provider.id())
+            .with_metadata("queries", json!(queries))
+            .with_metadata("truncated", result.truncated);
+        output
+            .metadata
+            .insert("sources".to_owned(), json!(result.sources));
+        Ok(output)
+    }
+}
 
-        let call = mcp::call(
-            &self.client,
-            &url,
-            provider,
-            tool,
-            arguments,
-            &headers,
-            ctx.interrupt.as_ref(),
-        );
+fn validate_queries(queries: Vec<String>, max_queries: usize) -> Result<Vec<String>, ToolError> {
+    if queries.is_empty() {
+        return Err(invalid_args("queries must contain at least one query"));
+    }
+    if queries.len() > max_queries {
+        let noun = if max_queries == 1 { "query" } else { "queries" };
+        return Err(invalid_args(format!(
+            "queries must contain at most {max_queries} {noun}"
+        )));
+    }
+    if queries.iter().any(|query| query.trim().is_empty()) {
+        return Err(invalid_args("each query must be a non-empty string"));
+    }
+    let mut seen = HashSet::new();
+    Ok(queries
+        .into_iter()
+        .filter(|query| seen.insert(query.clone()))
+        .collect())
+}
 
-        let text = match tokio::time::timeout(self.timeout, call).await {
-            Ok(Ok(text)) => text,
-            Ok(Err(error)) => {
-                return Err(ToolError::Failed {
-                    tool: ID.to_owned(),
-                    source: Box::new(error),
-                });
+fn invalid_args(message: impl Into<String>) -> ToolError {
+    ToolError::InvalidArgs {
+        tool: ID.to_owned(),
+        source: Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            message.into(),
+        )),
+    }
+}
+
+fn merge_results(queries: &[String], results: &[SearchResult], max_results: usize) -> SearchResult {
+    let max_rank = results
+        .iter()
+        .map(|result| result.sources.len())
+        .max()
+        .unwrap_or(0);
+    let mut seen = HashSet::new();
+    let mut sources = Vec::new();
+    let mut dropped = false;
+    'rank: for rank in 0..max_rank {
+        for result in results {
+            let Some(source) = result.sources.get(rank) else {
+                continue;
+            };
+            if !seen.insert(source.url.clone()) {
+                continue;
             }
-            Err(_elapsed) => {
-                return Err(ToolError::Timeout {
-                    tool: ID.to_owned(),
-                    elapsed: self.timeout,
-                });
+            if sources.len() == max_results {
+                dropped = true;
+                break 'rank;
             }
-        };
-
-        let output = if text.trim().is_empty() {
-            NO_RESULTS.to_owned()
-        } else {
-            text
-        };
-
-        Ok(
-            ToolOutput::text(format!("{}: {}", provider.label(), params.query), output)
-                .with_metadata("provider", provider.as_str()),
-        )
+            sources.push(source.clone());
+        }
+    }
+    let content = results
+        .iter()
+        .enumerate()
+        .filter_map(|(index, result)| {
+            let content = result.content.as_deref()?.trim();
+            (!content.is_empty()).then(|| format!("### {}\n\n{content}", queries[index]))
+        })
+        .collect::<Vec<_>>();
+    SearchResult {
+        content: (!content.is_empty()).then(|| content.join("\n\n")),
+        sources,
+        truncated: dropped || results.iter().any(|result| result.truncated),
     }
 }
 
-/// Exa's argument shape, with upstream's defaults applied.
-///
-/// Oracle: `packages/core/src/tool/websearch.ts:218-224`.
-fn exa_arguments(params: &WebSearchParams) -> Value {
-    let mut arguments = json!({
-        "query": params.query,
-        "type": params.r#type.unwrap_or(SearchType::Auto).as_str(),
-        "numResults": params.num_results.unwrap_or(DEFAULT_NUM_RESULTS),
-        "livecrawl": params.livecrawl.unwrap_or(LiveCrawl::Fallback).as_str(),
-    });
-    if let Some(max) = params.context_max_characters {
-        arguments["contextMaxCharacters"] = json!(max);
+fn format_output(result: &SearchResult) -> String {
+    let mut sections = Vec::new();
+    if let Some(content) = result
+        .content
+        .as_ref()
+        .filter(|content| !content.is_empty())
+    {
+        sections.push(content.clone());
     }
-    arguments
-}
-
-/// Parallel's argument shape.
-///
-/// Oracle: `packages/core/src/tool/websearch.ts:226-236` — Parallel takes an
-/// objective plus a query list and ignores the Exa-shaped knobs, so passing them
-/// would be inventing an API.
-fn parallel_arguments(params: &WebSearchParams, session_id: &str) -> Value {
-    json!({
-        "objective": params.query,
-        "search_queries": [params.query],
-        "session_id": session_id,
-    })
-}
-
-/// The auth headers for `provider`.
-///
-/// Oracle: `packages/opencode/src/tool/websearch.ts:57-62` — Parallel takes a bearer
-/// token and a `User-Agent`; Exa's key is in the URL instead, so it contributes no
-/// header. A missing Parallel key sends the `User-Agent` alone rather than an empty
-/// `Authorization`, matching upstream's early return.
-fn auth_headers(
-    provider: Provider,
-    api_key: Option<&str>,
-) -> Vec<(reqwest::header::HeaderName, String)> {
-    if provider != Provider::Parallel {
-        return Vec::new();
+    if !result.sources.is_empty() {
+        let sources = result
+            .sources
+            .iter()
+            .map(|source| {
+                let label = source.title.as_deref().unwrap_or(&source.url);
+                let mut metadata = Vec::new();
+                if let Some(snippet) = source.snippet.as_ref().filter(|value| !value.is_empty()) {
+                    metadata.push(snippet.clone());
+                }
+                if let Some(date) = source
+                    .published_at
+                    .as_ref()
+                    .filter(|value| !value.is_empty())
+                {
+                    metadata.push(format!("({date})"));
+                }
+                let suffix = if metadata.is_empty() {
+                    String::new()
+                } else {
+                    format!(" - {}", metadata.join(" "))
+                };
+                format!("- [{label}]({}){suffix}", source.url)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        sections.push(format!("Sources:\n{sources}"));
     }
-
-    let mut headers = vec![(reqwest::header::USER_AGENT, user_agent())];
-    if let Some(key) = api_key {
-        headers.push((reqwest::header::AUTHORIZATION, format!("Bearer {key}")));
+    if sections.is_empty() {
+        sections.push(NO_RESULTS.to_owned());
     }
-    headers
+    if result.truncated {
+        sections.push(format!(
+            "(Showing the first {} sources. Refine the queries for more.)",
+            result.sources.len()
+        ));
+    }
+    sections.push("Cite the relevant URLs above as markdown links in your answer.".to_owned());
+    sections.join("\n\n")
 }
 
-/// The `User-Agent` Parallel is sent.
-///
-/// Oracle: `opencode/${InstallationVersion}`. The version is this crate's, which is
-/// the workspace version.
-fn user_agent() -> String {
-    format!("opencode/{}", env!("CARGO_PKG_VERSION"))
-}
-
-fn metadata(
-    params: &WebSearchParams,
-    provider: Provider,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut metadata = serde_json::Map::new();
-    metadata.insert("query".to_owned(), json!(params.query));
-    metadata.insert("numResults".to_owned(), json!(params.num_results));
-    metadata.insert(
-        "livecrawl".to_owned(),
-        json!(params.livecrawl.map(LiveCrawl::as_str)),
-    );
-    metadata.insert(
-        "type".to_owned(),
-        json!(params.r#type.map(SearchType::as_str)),
-    );
-    metadata.insert(
-        "contextMaxCharacters".to_owned(),
-        json!(params.context_max_characters),
-    );
-    metadata.insert("provider".to_owned(), json!(provider.as_str()));
-    metadata
-}
-
-/// Substitutes the year into [`DESCRIPTION_TEMPLATE`].
+/// Description names the configured query bound without exposing other controls.
 #[must_use]
-pub fn describe(year: i32) -> String {
-    DESCRIPTION_TEMPLATE.replace(YEAR_PLACEHOLDER, &year.to_string())
+pub fn describe(max_queries: usize) -> String {
+    format!(
+        "Search the web for current information. Provide 1-{max_queries} non-empty queries in the required queries array. Distinct queries run concurrently and their sources are merged."
+    )
 }
 
-/// The current year, local where the offset is knowable and UTC otherwise.
-///
-/// Upstream reads `new Date().getFullYear()`, which is local. A container with no
-/// timezone database cannot resolve a local offset, and being off by a year boundary
-/// for a few hours is a better failure than refusing to describe the tool.
-fn current_year() -> i32 {
-    time::OffsetDateTime::now_local()
-        .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
-        .year()
+enum QueryFailure {
+    Provider(BoxSource),
+    Timeout(Duration),
+    Join(BoxSource),
+}
+
+impl QueryFailure {
+    fn into_tool_error(self) -> ToolError {
+        match self {
+            Self::Provider(source) | Self::Join(source) => ToolError::Failed {
+                tool: ID.to_owned(),
+                source,
+            },
+            Self::Timeout(elapsed) => ToolError::Timeout {
+                tool: ID.to_owned(),
+                elapsed,
+            },
+        }
+    }
+}
+
+struct BatchInterrupt {
+    parent: Arc<dyn InterruptHandle>,
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+impl BatchInterrupt {
+    fn new(parent: Arc<dyn InterruptHandle>) -> Self {
+        Self {
+            parent,
+            cancelled: AtomicBool::new(false),
+            notify: Notify::new(),
+        }
+    }
+
+    fn cancel(&self) {
+        if !self.cancelled.swap(true, Ordering::AcqRel) {
+            self.notify.notify_waiters();
+        }
+    }
+}
+
+#[async_trait]
+impl InterruptHandle for BatchInterrupt {
+    fn is_set(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire) || self.parent.is_set()
+    }
+
+    async fn notified(&self) {
+        if self.is_set() {
+            return;
+        }
+        let local = self.notify.notified();
+        tokio::pin!(local);
+        local.as_mut().enable();
+        if self.is_set() {
+            return;
+        }
+        tokio::select! {
+            () = self.parent.notified() => {}
+            () = &mut local => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -419,144 +500,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_wire_id_is_websearch_not_the_registry_key_search() {
-        assert_eq!(WebSearchTool::new().id(), "websearch");
-    }
-
-    #[test]
-    fn the_year_is_substituted_and_the_placeholder_is_gone() {
-        let described = describe(2026);
-        assert!(
-            described.contains("The current year is 2026."),
-            "{described}"
+    fn validation_deduplicates_exact_queries_after_checking_the_bound() {
+        assert_eq!(
+            validate_queries(vec!["one".into(), "one".into(), " two ".into()], 4).expect("valid"),
+            vec!["one", " two "]
         );
-        assert!(!described.contains(YEAR_PLACEHOLDER));
-    }
-
-    #[test]
-    fn the_live_description_carries_a_plausible_year() {
-        let tool = WebSearchTool::with_config(SearchConfig::default());
-        assert!(!tool.description().contains(YEAR_PLACEHOLDER));
-        assert!(tool.description().contains("The current year is 20"));
-    }
-
-    #[test]
-    fn the_schema_is_derived_and_only_query_is_required() {
-        let schema = zuno_tool::Tool::raw_parameters_schema(&zuno_tool::Typed(
-            WebSearchTool::with_config(SearchConfig::default()),
-        ));
-        assert_eq!(schema["required"], json!(["query"]));
-    }
-
-    #[test]
-    fn exa_arguments_carry_upstreams_defaults() {
-        let params: WebSearchParams =
-            serde_json::from_value(json!({ "query": "rust" })).expect("params");
-        let arguments = exa_arguments(&params);
-        assert_eq!(arguments["query"], "rust");
-        assert_eq!(arguments["type"], "auto");
-        assert_eq!(arguments["numResults"], 8);
-        assert_eq!(arguments["livecrawl"], "fallback");
-        assert!(
-            arguments.get("contextMaxCharacters").is_none(),
-            "an absent limit must not be sent as null: {arguments}"
-        );
-    }
-
-    #[test]
-    fn exa_arguments_pass_explicit_values_through() {
-        let params: WebSearchParams = serde_json::from_value(json!({
-            "query": "rust",
-            "numResults": 3,
-            "livecrawl": "preferred",
-            "type": "deep",
-            "contextMaxCharacters": 500,
-        }))
-        .expect("params");
-        let arguments = exa_arguments(&params);
-        assert_eq!(arguments["numResults"], 3);
-        assert_eq!(arguments["livecrawl"], "preferred");
-        assert_eq!(arguments["type"], "deep");
-        assert_eq!(arguments["contextMaxCharacters"], 500);
-    }
-
-    #[test]
-    fn parallel_arguments_use_the_objective_shape() {
-        let params: WebSearchParams =
-            serde_json::from_value(json!({ "query": "rust", "numResults": 3 })).expect("params");
-        let arguments = parallel_arguments(&params, "ses_1");
-        assert_eq!(arguments["objective"], "rust");
-        assert_eq!(arguments["search_queries"], json!(["rust"]));
-        assert_eq!(arguments["session_id"], "ses_1");
-        assert!(
-            arguments.get("numResults").is_none(),
-            "Exa's knobs must not be invented for Parallel: {arguments}"
-        );
-    }
-
-    #[test]
-    fn exa_sends_no_auth_header_because_its_key_is_in_the_url() {
-        assert!(auth_headers(Provider::Exa, Some("exa-key")).is_empty());
-    }
-
-    #[test]
-    fn parallel_sends_a_bearer_token_and_a_user_agent() {
-        let headers = auth_headers(Provider::Parallel, Some("par-key"));
-        assert_eq!(headers.len(), 2);
-        assert_eq!(headers[0].0, reqwest::header::USER_AGENT);
-        assert!(headers[0].1.starts_with("opencode/"), "{:?}", headers[0].1);
-        assert_eq!(headers[1].0, reqwest::header::AUTHORIZATION);
-        assert_eq!(headers[1].1, "Bearer par-key");
-    }
-
-    #[test]
-    fn parallel_without_a_key_sends_no_empty_authorization() {
-        let headers = auth_headers(Provider::Parallel, None);
-        assert_eq!(headers.len(), 1);
-        assert_eq!(headers[0].0, reqwest::header::USER_AGENT);
-    }
-
-    #[test]
-    fn the_endpoint_carries_the_exa_key_and_never_the_parallel_one() {
-        let exa = WebSearchTool::with_config(SearchConfig {
-            exa_api_key: Some("exa-key".to_owned()),
-            parallel_api_key: Some("par-key".to_owned()),
-            ..SearchConfig::default()
-        });
-        assert!(exa.endpoint(Provider::Exa).contains("exaApiKey=exa-key"));
-        let parallel = exa.endpoint(Provider::Parallel);
-        assert_eq!(parallel, mcp::PARALLEL_URL);
-        assert!(!parallel.contains("par-key"));
-    }
-
-    #[test]
-    fn the_wire_parameter_names_are_upstreams_camel_case() {
-        let schema = zuno_tool::Tool::raw_parameters_schema(&zuno_tool::Typed(
-            WebSearchTool::with_config(SearchConfig::default()),
-        ));
-        let properties = schema["properties"].as_object().expect("properties");
-        for key in [
-            "query",
-            "numResults",
-            "livecrawl",
-            "type",
-            "contextMaxCharacters",
-        ] {
-            assert!(properties.contains_key(key), "missing {key}: {schema}");
-        }
-        assert!(
-            !properties.contains_key("num_results"),
-            "snake_case would break every model tuned against upstream: {schema}"
-        );
-    }
-
-    #[test]
-    fn an_unknown_field_is_rejected_rather_than_silently_dropped() {
-        let error = serde_json::from_value::<WebSearchParams>(json!({
-            "query": "rust",
-            "num_results": 3,
-        }))
-        .expect_err("snake_case num_results is not the wire field name");
-        assert!(error.to_string().contains("num_results"), "{error}");
+        assert!(validate_queries(vec!["one".into(), "one".into()], 1).is_err());
     }
 }

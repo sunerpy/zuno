@@ -30,16 +30,13 @@
 //! # Integrations are derived, not stored
 //!
 //! `/api/integration` is the union of every models.dev provider that declares
-//! `env` keys (`models-dev.ts:123-137`) and the two OAuth-capable integrations
-//! upstream's provider plugins register. Sorting is `name.localeCompare`, which is
-//! **case-insensitive first** — `openai` sorts before `OpenCode`, which a plain
-//! byte comparison gets backwards. [`locale_compare`] exists for that one reason.
+//! `env` keys and native authentication methods that Zuno implements. Sorting is
+//! case-insensitive first through [`locale_compare`].
 //!
 //! A connection is reported for an integration whose environment variable is set,
 //! which is what makes a provider available without a stored credential.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::{Path as PathParam, State};
@@ -53,43 +50,23 @@ use super::catalog::{LocationEnvelope, OptionalEnvelope, RequestBody};
 use super::error::ApiError;
 use super::state::ApiState;
 
-/// The OAuth integrations upstream registers outside models.dev.
-///
-/// `openai`'s two ChatGPT methods and `opencode`'s device flow are declared by
-/// provider plugins, not by the catalogue, so a models.dev-only derivation would
-/// omit both and the differential would disagree by two entries. The labels are
-/// the observed 1.18.12 strings.
-const PLUGIN_INTEGRATIONS: &[StaticIntegration] = &[
-    StaticIntegration {
-        id: "openai",
-        name: "openai",
-        methods: &[
-            StaticMethod::OAuth {
-                id: "chatgpt-browser",
-                label: "ChatGPT Pro/Plus (browser)",
-            },
-            StaticMethod::OAuth {
-                id: "chatgpt-headless",
-                label: "ChatGPT Pro/Plus (headless)",
-            },
-        ],
-    },
-    StaticIntegration {
-        id: "opencode",
-        name: "OpenCode",
-        methods: &[
-            StaticMethod::OAuth {
-                id: "device",
-                label: "OpenCode Console account",
-            },
-            StaticMethod::Key {
-                label: Some("API key (service account)"),
-            },
-        ],
-    },
-];
+/// Native authentication methods that are not described by models.dev.
+const NATIVE_INTEGRATIONS: &[StaticIntegration] = &[StaticIntegration {
+    id: "openai",
+    name: "openai",
+    methods: &[
+        StaticMethod::OAuth {
+            id: "chatgpt-browser",
+            label: "ChatGPT Pro/Plus (browser)",
+        },
+        StaticMethod::OAuth {
+            id: "chatgpt-headless",
+            label: "ChatGPT Pro/Plus (headless)",
+        },
+    ],
+}];
 
-/// A plugin-registered integration.
+/// A native integration.
 struct StaticIntegration {
     /// The integration id.
     id: &'static str,
@@ -99,7 +76,7 @@ struct StaticIntegration {
     methods: &'static [StaticMethod],
 }
 
-/// One plugin-registered connection method.
+/// One native connection method.
 enum StaticMethod {
     /// An OAuth flow.
     OAuth {
@@ -107,11 +84,6 @@ enum StaticMethod {
         id: &'static str,
         /// The button label.
         label: &'static str,
-    },
-    /// A pasted API key.
-    Key {
-        /// The optional label.
-        label: Option<&'static str>,
     },
 }
 
@@ -279,92 +251,6 @@ pub struct Limit {
     pub output: i64,
 }
 
-/// The generated legacy SDK's `GET /provider` payload.
-///
-/// This is deliberately projected from [`CatalogDocument`] rather than from
-/// [`ModelInfo`]. `ModelInfo.time.released` is already epoch milliseconds for
-/// the V2 wire contract; converting that value back into the legacy
-/// `release_date` string loses the canonical catalogue spelling and caused the
-/// old adapter to return strings such as `"1764547200000"`.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct LegacyProviderList {
-    pub all: Vec<LegacyProviderInfo>,
-    pub default: BTreeMap<String, String>,
-    pub connected: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct LegacyProviderInfo {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub api: Option<String>,
-    pub name: String,
-    pub env: Vec<String>,
-    pub id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub npm: Option<String>,
-    pub models: BTreeMap<String, LegacyModelInfo>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct LegacyModelInfo {
-    pub id: String,
-    pub name: String,
-    pub release_date: String,
-    pub attachment: bool,
-    pub reasoning: bool,
-    pub temperature: bool,
-    pub tool_call: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cost: Option<LegacyCost>,
-    pub limit: LegacyLimit,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub modalities: Option<LegacyModalities>,
-    pub status: &'static str,
-    pub options: Map<String, Value>,
-    pub headers: BTreeMap<String, String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider: Option<LegacyModelProvider>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct LegacyCost {
-    pub input: Number,
-    pub output: Number,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_read: Option<Number>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_write: Option<Number>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub context_over_200k: Option<LegacyCostBand>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct LegacyCostBand {
-    pub input: Number,
-    pub output: Number,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_read: Option<Number>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_write: Option<Number>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct LegacyLimit {
-    pub context: Number,
-    pub output: Number,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct LegacyModalities {
-    pub input: Vec<String>,
-    pub output: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct LegacyModelProvider {
-    pub npm: String,
-}
-
 /// Upstream's `Integration.Info` (`packages/schema/src/integration.ts:95-100`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct IntegrationInfo {
@@ -464,15 +350,6 @@ pub async fn models(
 ) -> Result<LocationEnvelope<Vec<ModelInfo>>, ApiError> {
     let view = CatalogView::open(&state)?;
     Ok(state.envelope(view.models()))
-}
-
-/// Projects the canonical catalogue onto the generated legacy SDK boundary.
-///
-/// Availability still comes from the same [`CatalogView`] as `/api/provider`
-/// and `/api/model`; only the wire projection differs.
-pub(crate) fn legacy_provider_list(state: &ApiState) -> Result<LegacyProviderList, ApiError> {
-    let view = CatalogView::open(state)?;
-    Ok(view.legacy_provider_list())
 }
 
 /// `GET /api/integration` — every integration and its live connections.
@@ -613,37 +490,6 @@ impl CatalogView {
         data
     }
 
-    fn legacy_provider_list(&self) -> LegacyProviderList {
-        let connected = self.available.clone();
-        let all = self
-            .available
-            .iter()
-            .filter_map(|provider_id| {
-                let provider = self.document.get(provider_id)?;
-                let selectable = self.selectable.get(provider_id)?;
-                let models = provider
-                    .models
-                    .iter()
-                    .filter(|(model_id, _)| selectable.contains(*model_id))
-                    .map(|(model_id, model)| (model_id.clone(), legacy_model_info(model_id, model)))
-                    .collect();
-                Some(LegacyProviderInfo {
-                    api: provider.api.clone(),
-                    name: provider.name.clone(),
-                    env: provider.env.clone(),
-                    id: provider_id.clone(),
-                    npm: provider.npm.clone(),
-                    models,
-                })
-            })
-            .collect();
-        LegacyProviderList {
-            all,
-            default: BTreeMap::new(),
-            connected,
-        }
-    }
-
     /// Every integration, name-ordered.
     fn integrations(&self) -> Vec<IntegrationInfo> {
         let mut data = Vec::new();
@@ -679,7 +525,7 @@ impl CatalogView {
                     .collect(),
             });
         }
-        for entry in PLUGIN_INTEGRATIONS {
+        for entry in NATIVE_INTEGRATIONS {
             if data.iter().any(|existing| existing.id == entry.id) {
                 continue;
             }
@@ -695,10 +541,6 @@ impl CatalogView {
                             kind: "oauth",
                             label: (*label).to_owned(),
                         },
-                        StaticMethod::Key { label } => Method::Key {
-                            kind: "key",
-                            label: label.map(ToOwned::to_owned),
-                        },
                     })
                     .collect(),
                 connections: Vec::new(),
@@ -709,15 +551,11 @@ impl CatalogView {
     }
 }
 
-/// `OPENCODE_ENABLE_EXPERIMENTAL_MODELS`, the flag that admits `alpha` models.
-const ENABLE_EXPERIMENTAL_MODELS: &str = "OPENCODE_ENABLE_EXPERIMENTAL_MODELS";
+/// `ZUNO_ENABLE_EXPERIMENTAL_MODELS`, the flag that admits `alpha` models.
+const ENABLE_EXPERIMENTAL_MODELS: &str = "ZUNO_ENABLE_EXPERIMENTAL_MODELS";
 
-/// `name.localeCompare` for ASCII names: case-insensitive first, case as the
+/// Locale-like ordering for ASCII names: case-insensitive first, case as the
 /// tie-break.
-///
-/// This is load-bearing, not pedantry: `openai` and `OpenCode` differ only in
-/// case at the fourth character, and a byte comparison puts `OpenCode` first
-/// while the oracle puts `openai` first.
 fn locale_compare(left: &str, right: &str) -> Ordering {
     let folded = left.to_lowercase().cmp(&right.to_lowercase());
     if folded == Ordering::Equal {
@@ -802,62 +640,6 @@ fn model_info(
             input: model.limit.input.map(whole),
             output: whole(model.limit.output),
         },
-    }
-}
-
-fn legacy_model_info(model_id: &str, model: &CatalogModel) -> LegacyModelInfo {
-    LegacyModelInfo {
-        id: model_id.to_owned(),
-        name: model.name.clone(),
-        release_date: model.release_date.clone(),
-        attachment: model.attachment,
-        reasoning: model.reasoning,
-        temperature: model.temperature,
-        tool_call: model.tool_call,
-        cost: model.cost.as_ref().map(legacy_cost),
-        limit: LegacyLimit {
-            context: number(model.limit.context),
-            output: number(model.limit.output),
-        },
-        modalities: model
-            .modalities
-            .as_ref()
-            .map(|modalities| LegacyModalities {
-                input: modality_names(&modalities.input),
-                output: modality_names(&modalities.output),
-            }),
-        status: status_name(model.status),
-        options: Map::new(),
-        headers: BTreeMap::new(),
-        provider: model
-            .provider
-            .as_ref()
-            .and_then(|provider| provider.npm.as_ref())
-            .map(|npm| LegacyModelProvider { npm: npm.clone() }),
-    }
-}
-
-fn legacy_cost(cost: &CatalogCost) -> LegacyCost {
-    LegacyCost {
-        input: number(cost.input),
-        output: number(cost.output),
-        cache_read: Some(number(cost.cache_read.unwrap_or(0.0))),
-        cache_write: Some(number(cost.cache_write.unwrap_or(0.0))),
-        context_over_200k: cost.context_over_200k.as_ref().map(|band| LegacyCostBand {
-            input: number(band.input),
-            output: number(band.output),
-            cache_read: Some(number(band.cache_read.unwrap_or(0.0))),
-            cache_write: Some(number(band.cache_write.unwrap_or(0.0))),
-        }),
-    }
-}
-
-fn status_name(status: Option<CatalogStatus>) -> &'static str {
-    match status.unwrap_or(CatalogStatus::Active) {
-        CatalogStatus::Alpha => "alpha",
-        CatalogStatus::Beta => "beta",
-        CatalogStatus::Deprecated => "deprecated",
-        CatalogStatus::Active => "active",
     }
 }
 
@@ -1040,9 +822,9 @@ mod tests {
     }
 
     #[test]
-    fn locale_ordering_puts_lowercase_openai_before_opencode() {
-        let mut names = vec!["OpenCode", "openai", "Zhipu AI", "AnyAPI"];
+    fn locale_ordering_is_case_insensitive_first() {
+        let mut names = vec!["zulu", "Alpha", "beta", "AnyAPI"];
         names.sort_by(|left, right| locale_compare(left, right));
-        assert_eq!(names, vec!["AnyAPI", "openai", "OpenCode", "Zhipu AI"]);
+        assert_eq!(names, vec!["Alpha", "AnyAPI", "beta", "zulu"]);
     }
 }

@@ -112,7 +112,7 @@ pub async fn connect_token(
     headers: HeaderMap,
 ) -> Result<Json<ConnectTokenResponse>, ApiError> {
     if headers
-        .get("x-opencode-ticket")
+        .get("x-zuno-ticket")
         .and_then(|value| value.to_str().ok())
         != Some("1")
     {

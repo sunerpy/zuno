@@ -65,8 +65,7 @@ const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Appl
 
 /// The user agent used on the Cloudflare-challenge retry.
 ///
-/// Oracle: `packages/opencode/src/tool/webfetch.ts:86` retries with `"opencode"`.
-const HONEST_USER_AGENT: &str = "opencode";
+const HONEST_USER_AGENT: &str = "zuno";
 
 /// The requested representation of the fetched document.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, JsonSchema)]

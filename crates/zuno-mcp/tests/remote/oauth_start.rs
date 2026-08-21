@@ -74,5 +74,17 @@ async fn remote_unauthorized_starts_dynamic_registration_and_pkce_by_default() {
     let rendered = format!("{request:?} {stored:?}");
     assert!(!rendered.contains("dynamic-secret"));
     assert!(!rendered.contains(state));
+    let requests = server.received_requests().await.expect("request journal");
+    let registration = requests
+        .iter()
+        .find(|request| request.url.path() == "/register")
+        .expect("dynamic registration request");
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&registration.body).expect("registration metadata JSON");
+    assert_eq!(metadata["client_name"], "Zuno");
+    assert!(
+        metadata.get("client_uri").is_none(),
+        "Zuno must not advertise a website it does not own: {metadata}"
+    );
     remote_support::assert_private_mode(store.path());
 }

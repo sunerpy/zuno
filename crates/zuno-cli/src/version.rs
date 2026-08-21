@@ -1,18 +1,4 @@
-//! The compatibility identity and the Rust build identity serve different peers.
-//!
-//! npm plugins inspect `engines.opencode` as a semver range and are skipped when
-//! the running version does not satisfy it (`plugin/shared.ts:194-204`, called
-//! from `plugin/loader.ts:123-130`). That peer must see the pinned compatibility
-//! baseline. Operators and HTTP peers must instead be able to identify this Rust
-//! build, so the long display and user agent never masquerade as the TypeScript
-//! binary.
-
-/// The version supplied to npm plugin compatibility checks.
-///
-/// This remains the pinned upstream baseline because existing npm plugins may
-/// declare `engines.opencode`; changing it to Zuno's package or build version
-/// would make compatible plugins skip themselves before their hooks can load.
-pub const COMPATIBILITY_VERSION: &str = "1.18.13";
+//! Zuno package and build identities.
 
 /// Cargo's package version for this Rust implementation.
 pub const RUST_PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -26,27 +12,20 @@ pub const BUILD_ID: &str = match option_env!("ZUNO_RUST_BUILD_ID") {
     None => RUST_PACKAGE_VERSION,
 };
 
-/// The short version intentionally matches the plugin compatibility baseline.
+/// The short operator-facing version.
 #[must_use]
-pub const fn compatibility_version() -> &'static str {
-    COMPATIBILITY_VERSION
+pub const fn version() -> &'static str {
+    RUST_PACKAGE_VERSION
 }
 
-/// The operator-facing identity, including both identities without conflating them.
+/// The operator-facing identity.
 #[must_use]
 pub fn long_version() -> String {
-    format!(
-        "Zuno {BUILD_ID} (Rust package {RUST_PACKAGE_VERSION}; plugin compatibility {COMPATIBILITY_VERSION})"
-    )
+    format!("Zuno {BUILD_ID} (Rust package {RUST_PACKAGE_VERSION})")
 }
 
 /// The HTTP identity for this implementation.
-///
-/// Starting with `zuno/` is load-bearing: telemetry and server logs can
-/// distinguish this implementation even though plugin semver checks see 1.18.13.
 #[must_use]
 pub fn user_agent() -> String {
-    format!(
-        "zuno/{RUST_PACKAGE_VERSION} (build {BUILD_ID}; compatible-opencode/{COMPATIBILITY_VERSION})"
-    )
+    format!("zuno/{RUST_PACKAGE_VERSION} (build {BUILD_ID})")
 }

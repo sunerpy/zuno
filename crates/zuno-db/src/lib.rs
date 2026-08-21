@@ -44,7 +44,10 @@
 //! ```
 
 pub mod artifact_gc;
+pub mod event_log;
 pub mod fts;
+pub mod inbox;
+pub mod job;
 pub mod message;
 pub mod migration;
 pub mod open;

@@ -66,7 +66,7 @@
 //! It is not constructed here, for two measured reasons:
 //!
 //! 1. **`zuno-watch`'s default decision does not watch the project directory.**
-//!    Without `OPENCODE_EXPERIMENTAL_FILEWATCHER` the flag resolution yields
+//!    Without `ZUNO_EXPERIMENTAL_FILEWATCHER` the flag resolution yields
 //!    `Decision::VcsOnly`, which watches only the VCS directory. A watcher built
 //!    inside this module would therefore be silently inert in the default
 //!    configuration, and forcing it on from here would override a user's flag.

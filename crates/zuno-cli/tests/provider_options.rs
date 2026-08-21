@@ -148,12 +148,11 @@ fn variables(env: &ScriptedEnv, config: String, stored: Option<&str>) -> BTreeMa
     variables.extend([
         ("NO_COLOR".to_owned(), "1".to_owned()),
         ("TERM".to_owned(), "dumb".to_owned()),
-        ("ZUNO_PURE".to_owned(), "1".to_owned()),
         ("ZUNO_AUTH_CONTENT".to_owned(), auth_content(stored)),
         // The config fully specifies `test/test-model`, so nothing but the config may
         // supply the endpoint or the key.
         ("ZUNO_DISABLE_MODELS_FETCH".to_owned(), "true".to_owned()),
-        ("OPENCODE_CONFIG_CONTENT".to_owned(), config),
+        ("ZUNO_CONFIG_CONTENT".to_owned(), config),
     ]);
     variables
 }

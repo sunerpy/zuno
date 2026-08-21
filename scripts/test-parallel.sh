@@ -18,14 +18,10 @@
 # WHY IT CAPTURES CARGO'S ENVIRONMENT INSTEAD OF ASSUMING IT
 #
 # The first version of this runner invoked the test binaries straight from a
-# shell and three suites failed — session_mutation, plugin_models and tool_turn —
-# each blowing a 30 s "plugin did not connect back" budget. That looked like
-# contention from over-parallelising, but it reproduced with the suites run one
-# at a time on an idle machine, so concurrency was not the cause. The cause is
-# PATH: cargo runs test binaries with mise *installs* resolved, while a bare
-# shell inherits mise *shims* first, and a shim cannot be spawned directly by the
-# host. That is the same failure mode docs/plugin-authoring.md records for
-# shebang plugins. Cargo also exports LD_LIBRARY_PATH for the aws-lc-sys,
+# shell and subprocess-heavy suites failed because their environment differed
+# from Cargo's. The cause is PATH: Cargo runs test binaries with mise *installs*
+# resolved, while a bare shell inherits mise *shims* first, and a shim cannot be
+# spawned directly. Cargo also exports LD_LIBRARY_PATH for the aws-lc-sys,
 # libsqlite3-sys and jemalloc build-script outputs, plus SSL_CERT_FILE and
 # SSL_CERT_DIR, and `.cargo/config.toml` force-sets
 # JEMALLOC_SYS_WITH_MALLOC_CONF.

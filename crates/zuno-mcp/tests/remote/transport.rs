@@ -35,6 +35,10 @@ async fn remote_streamable_http_accepts_plain_json_and_negotiates_the_server_ver
     assert_eq!(client.transport(), RemoteTransport::StreamableHttp);
     assert_eq!(client.initialization().protocol_version, "2025-03-26");
     assert_eq!(client.initialization().server_info.name, "json-server");
+    let requests = server.received_requests().await.expect("request journal");
+    let initialize: serde_json::Value =
+        serde_json::from_slice(&requests[0].body).expect("initialize request JSON");
+    assert_eq!(initialize["params"]["clientInfo"]["name"], "zuno");
 }
 
 #[tokio::test]

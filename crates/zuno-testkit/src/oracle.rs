@@ -1,4 +1,4 @@
-//! The oracle: the real `opencode`, run under a scripted environment.
+//! Optional upstream research runner.
 //!
 //! # Two flavours, and why the default is the installed binary
 //!
@@ -11,28 +11,26 @@
 //!
 //! The from-source flavour cannot state a version because the version is a
 //! build-time `define`: `packages/core/src/installation/version.ts` reads a
-//! global `OPENCODE_VERSION` that only the bundler injects, and falls back to the
+//! global `ZUNO_VERSION` that only the bundler injects, and falls back to the
 //! literal `"local"` otherwise.
 //!
-//! **The default is the installed binary**, for three reasons: it is the artifact
-//! users actually run, so a difference against it is a difference users would
-//! see; it self-reports a real version, so a report can name what it compared
-//! against; and it is roughly twice as fast per invocation, which matters when
-//! ninety later tasks each run it.
+//! **The default is the installed binary** because performance baselines need the
+//! released process tree and every recorded result must name the executable that
+//! produced it.
 //!
 //! **The cost of that default is a version gap**, and this module refuses to
 //! paper over it. When the installed release and the pinned source tree disagree,
 //! [`Oracle::version_gap`] says so and every [`Provenance::label`] carries both
-//! numbers, so a differential failure can never be silently attributed to a
-//! compatibility defect when it was a patch-level difference. A caller that needs
-//! the pinned code exactly asks for [`Oracle::from_source`].
+//! numbers, so research output cannot silently attribute a measurement to the
+//! wrong release. A caller that needs the pinned code exactly asks for
+//! [`Oracle::from_source`].
 //!
 //! # Two pins, and they are not the same number
 //!
 //! | pin | what it names | where it lives |
 //! |---|---|---|
-//! | [`PINNED_RELEASE`] | the installed binary every differential runs against | this module, verified by [`Oracle::discover_pinned`] |
-//! | the source baseline | the TypeScript tree this port was read from, and the version it reports to the npm plugin gate | `packages/opencode/package.json` in the located tree, and `zuno_plugin::js::spec::REPORTED_PLUGIN_API_VERSION` |
+//! | [`PINNED_RELEASE`] | the installed binary used by frozen research artifacts | this module, verified by [`Oracle::discover_pinned`] |
+//! | the source baseline | the TypeScript tree from which provider cassettes were recorded | `packages/opencode/package.json` in the located tree |
 //!
 //! They are currently `1.18.18` and `1.18.13`. Conflating them is what produced
 //! the artifact F1 rejected — a report recording the source baseline as though it
@@ -57,14 +55,13 @@ pub enum OracleFlavour {
     FromSource,
 }
 
-/// The installed release every compatibility claim in this workspace is measured
-/// against: the newest `opencode` release installed on this machine.
+/// The installed release used by frozen upstream research artifacts.
 ///
 /// # Why this is declared here and verified, rather than discovered
 ///
 /// A differential against "whatever `opencode` is on `PATH`" is a differential
 /// against an unknown, so a report that cannot name a version cannot support a
-/// compatibility claim. But a *named* version that nothing checks is worse than
+/// measurement. But a *named* version that nothing checks is worse than
 /// no name at all: until plan todo 130 the harness recorded `1.18.13` while
 /// resolving the installed `1.18.12`, and every artifact produced under that
 /// recording attributed its measurements to a build that never ran.

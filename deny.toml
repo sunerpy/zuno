@@ -19,10 +19,8 @@
 # all. Auditing every target is the stronger gate and, measured here, costs
 # nothing — the full graph passes.
 #
-# `wasm` stays off (plan todo 59 made it a cargo feature and
-# `crates/zuno-plugin/tests/wasmtime_feature_gate.rs` holds it off by default).
-# Enabling all features would pull `wasmtime` into the audited graph and make
-# this file assert something about a dependency no default artifact contains.
+# No optional execution runtime is excluded from this audit. Native harness
+# components use the same Rust dependency graph as the shipped binary.
 all-features = false
 # Dev-dependencies are IN scope. A compromised test-only crate still runs on
 # developer machines and on CI runners that hold a checkout and a token, which is

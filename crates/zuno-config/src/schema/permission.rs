@@ -52,7 +52,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "todowrite",
     "question",
     "webfetch",
-    "websearch",
+    "web_search",
     "lsp",
     "doom_loop",
     "skill",
@@ -64,7 +64,7 @@ pub const ACTION_ONLY_KEYS: &[&str] = &[
     "todowrite",
     "question",
     "webfetch",
-    "websearch",
+    "web_search",
     "doom_loop",
 ];
 

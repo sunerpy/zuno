@@ -6,6 +6,8 @@ use tokio::sync::Notify;
 /// A soft interruption to inject at the next safe point in the turn loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SoftInterruptMessage {
+    /// Durable inbox id, when this message was admitted before wake-up.
+    pub input_id: Option<String>,
     pub content: String,
     pub images: Vec<(String, String)>,
     /// Whether the turn loop may skip remaining tools before injecting this message.

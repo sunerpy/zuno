@@ -248,7 +248,7 @@ pub fn resolve_tool_name(name: &str) -> &str {
         "Agent" | "Task" => "task",
         "Skill" => "skill",
         "WebFetch" => "webfetch",
-        "WebSearch" => "websearch",
+        "WebSearch" => "web_search",
         "TodoWrite" => "todowrite",
         "ApplyPatch" => "apply_patch",
         "Question" => "question",
@@ -391,7 +391,7 @@ pub fn permission_patterns(tool: &str, args: &Value) -> Vec<String> {
         "apply_patch" => patch_paths(args),
         "glob" | "grep" => strings_at(args, &["pattern", "query"]),
         "webfetch" => strings_at(args, &["url"]),
-        "websearch" => strings_at(args, &["query"]),
+        "web_search" => strings_at(args, &["queries"]),
         "task" => strings_at(args, &["subagent_type", "subagentType"]),
         "skill" => strings_at(args, &["name"]),
         "read_mcp_resource" => strings_at(args, &["uri", "resource_name", "server"]),
@@ -715,7 +715,7 @@ mod tests {
     #[test]
     fn suggester_copies_reference_ranking_and_cutoff() {
         let suggestions =
-            closest_tool_names("ToolSerch", &["bash", "tool_search", "websearch", "todo"]);
+            closest_tool_names("ToolSerch", &["bash", "tool_search", "web_search", "todo"]);
         assert_eq!(suggestions.first().map(String::as_str), Some("tool_search"));
         assert!(!suggestions.contains(&"bash".to_owned()));
         assert!(suggestions.len() <= 3);

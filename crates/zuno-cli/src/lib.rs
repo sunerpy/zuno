@@ -2,7 +2,7 @@
 //! and the dispatch seam used by the command-owning todos.
 //!
 //! This crate deliberately keeps policy separate from behavior. Adding a command
-//! handler must not be able to change the compatibility version, forget startup
+//! handler must not be able to change the package identity, forget startup
 //! environment markers, or make another upstream command disappear. The frozen
 //! `index.ts` fixture and [`validate_upstream_surface`] guard that boundary.
 
@@ -23,13 +23,10 @@ pub use disposition::{
     validate_upstream_surface,
 };
 pub use environment::{
-    AGENT, OpenCodeFlags, StartupEnvironment, ZUNO, ZUNO_ENABLE_JS_PLUGINS, ZUNO_FLAG_NAMES,
-    ZUNO_LOG_LEVEL, ZUNO_PID, ZUNO_PRINT_LOGS, ZUNO_PURE,
+    AGENT, StartupEnvironment, ZUNO, ZUNO_FLAG_NAMES, ZUNO_LOG_LEVEL, ZUNO_PID, ZUNO_PRINT_LOGS,
+    ZunoFlags,
 };
-pub use version::{
-    BUILD_ID, COMPATIBILITY_VERSION, RUST_PACKAGE_VERSION, compatibility_version, long_version,
-    user_agent,
-};
+pub use version::{BUILD_ID, RUST_PACKAGE_VERSION, long_version, user_agent, version};
 
 use std::ffi::OsString;
 use std::io::Write as _;
@@ -45,7 +42,7 @@ const BOOTSTRAP_MARKER: &str = "ZUNO_RUST_CLI_BOOTSTRAPPED";
 ///
 /// Startup uses one child process because Rust 2024 correctly makes global
 /// environment mutation unsafe. `Command::env` is safe and gives command-owned
-/// code the real `AGENT`, `OPENCODE`, PID, logging, and pure values it expects.
+/// code the real `AGENT`, `ZUNO`, PID, and logging values it expects.
 #[must_use]
 pub fn run_process() -> ExitCode {
     // The guard work `main` did before calling in is already behind us, so the
@@ -76,7 +73,7 @@ pub fn run_process() -> ExitCode {
         let output = if long {
             long_version()
         } else {
-            compatibility_version().to_owned()
+            version().to_owned()
         };
         println!("{output}");
         profile.emit(startup::StartupPhase::Dispatch);
@@ -214,7 +211,7 @@ pub fn execute_action(action: Action, dispatcher: &mut dyn CommandDispatcher) ->
             let output = if long {
                 long_version()
             } else {
-                compatibility_version().to_owned()
+                version().to_owned()
             };
             println!("{output}");
             ExitCode::SUCCESS

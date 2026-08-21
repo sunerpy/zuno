@@ -364,7 +364,7 @@ fn the_worker_writes_researches_and_iterates_but_spawns_nothing() {
         "edit",
         "bash",
         "webfetch",
-        "websearch",
+        "web_search",
     ] {
         assert!(
             !is_tool_hidden(allowed, &rules),
@@ -405,7 +405,7 @@ fn external_research_is_the_librarians_lane_alone() {
             continue;
         }
         let rules = agent.rules();
-        for external in ["webfetch", "websearch"] {
+        for external in ["webfetch", "web_search"] {
             assert!(
                 is_tool_hidden(external, &rules),
                 "{}: only the librarian and the writing agents reach `{external}`",
@@ -415,7 +415,7 @@ fn external_research_is_the_librarians_lane_alone() {
     }
     let rules = LIBRARIAN.rules();
     assert!(!is_tool_hidden("webfetch", &rules));
-    assert!(!is_tool_hidden("websearch", &rules));
+    assert!(!is_tool_hidden("web_search", &rules));
 }
 
 #[test]

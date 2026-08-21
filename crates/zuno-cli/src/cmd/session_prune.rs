@@ -72,10 +72,10 @@ async fn probe_urls(urls: &[String]) -> Liveness {
     else {
         return Liveness::Unreachable;
     };
-    let password = std::env::var("OPENCODE_SERVER_PASSWORD")
+    let password = std::env::var("ZUNO_SERVER_PASSWORD")
         .ok()
         .filter(|value| !value.is_empty());
-    let username = std::env::var("OPENCODE_SERVER_USERNAME")
+    let username = std::env::var("ZUNO_SERVER_USERNAME")
         .unwrap_or_else(|_| zuno_paths::env::DEFAULT_SERVER_USERNAME.to_owned());
     let mut probes = tokio::task::JoinSet::new();
     for base in urls {

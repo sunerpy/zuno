@@ -10,23 +10,11 @@ use zuno_tool::{
     NeverInterrupted, PermissionAsk, PermissionAsker, Tool, ToolContext, ToolOutput, erase,
 };
 use zuno_tools::registry::{
-    BuiltinSlot, CustomTool, CustomToolLoader, RegistryFlags, ToolRegistry, ToolRegistryBuilder,
+    BuiltinSlot, CustomTool, RegistryFlags, ToolRegistry, ToolRegistryBuilder,
 };
 use zuno_tools::{FileTools, GrepTool, SearchTooling};
 
 const MAX_CALLS: usize = 10;
-
-struct FixedTools(Vec<CustomTool>);
-
-impl CustomToolLoader for FixedTools {
-    fn config_directory_tools(&self, _directories: &[std::path::PathBuf]) -> Vec<CustomTool> {
-        self.0.clone()
-    }
-
-    fn plugin_tools(&self) -> Vec<CustomTool> {
-        Vec::new()
-    }
-}
 
 struct ProbeTool {
     id: &'static str,
@@ -177,14 +165,13 @@ fn registry(root: &Path, tools: Vec<CustomTool>) -> ToolRegistry {
     let files = FileTools::new(root).expect("create file tools");
     ToolRegistryBuilder::new(
         root,
-        Some(root.to_path_buf()),
         files,
         RegistryFlags {
             experimental_code_mode: true,
             ..RegistryFlags::default()
         },
     )
-    .with_custom_loader(Arc::new(FixedTools(tools)))
+    .with_harness_tools(tools)
     .build()
 }
 
@@ -413,7 +400,6 @@ async fn batch_grep_fans_out_into_real_reads_without_exposing_the_match_list() {
     let files = FileTools::new(root.path()).expect("create file tools");
     let mut builder = ToolRegistryBuilder::new(
         root.path(),
-        Some(root.path().to_path_buf()),
         files,
         RegistryFlags {
             experimental_code_mode: true,

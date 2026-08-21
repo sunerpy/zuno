@@ -5,12 +5,12 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::Command;
+use zuno_config::Config;
 use zuno_config::discovery::{
     DiscoveryOptions, ManagedPreferences, discover_with, json_error_byte_offset, merge_layers,
 };
 use zuno_config::schema::ordered::OrderedMap;
 use zuno_config::schema::permission::{PermissionAction, PermissionConfig, PermissionRule};
-use zuno_config::{Config, DEFAULT_SCHEMA};
 use zuno_error::ConfigError;
 use zuno_paths::Env;
 
@@ -128,7 +128,7 @@ fn legacy_copy_command_executes_with_or_without_an_auth_file() {
 }
 
 #[test]
-fn an_empty_zuno_root_without_legacy_config_still_gets_the_default() {
+fn an_empty_zuno_root_without_legacy_config_gets_an_empty_native_file() {
     let temp = tempfile::tempdir().expect("tempdir");
     let project = temp.path().join("project");
 
@@ -136,12 +136,11 @@ fn an_empty_zuno_root_without_legacy_config_still_gets_the_default() {
         .expect("a genuinely fresh install gets a default config");
 
     let generated = temp.path().join("xdg-config/zuno/zuno.json");
-    assert_eq!(config.schema.as_deref(), Some(DEFAULT_SCHEMA));
+    assert_eq!(config.schema, None);
     assert!(generated.is_file());
-    assert!(
-        fs::read_to_string(generated)
-            .expect("read generated config")
-            .contains(DEFAULT_SCHEMA)
+    assert_eq!(
+        fs::read_to_string(generated).expect("read generated config"),
+        "{}\n"
     );
 }
 
@@ -166,11 +165,7 @@ fn populated_zuno_config_wins_even_when_legacy_config_exists() {
 
 #[test]
 fn explicit_config_overrides_bypass_the_legacy_location_diagnostic() {
-    for key in [
-        "OPENCODE_CONFIG",
-        "OPENCODE_CONFIG_DIR",
-        "OPENCODE_CONFIG_CONTENT",
-    ] {
+    for key in ["ZUNO_CONFIG", "ZUNO_CONFIG_DIR", "ZUNO_CONFIG_CONTENT"] {
         let temp = tempfile::tempdir().expect("tempdir");
         let project = temp.path().join("project");
         write(
@@ -180,25 +175,25 @@ fn explicit_config_overrides_bypass_the_legacy_location_diagnostic() {
         let override_file = temp.path().join("override/zuno.json");
         let override_dir = temp.path().join("override-dir");
         let value = match key {
-            "OPENCODE_CONFIG" => {
+            "ZUNO_CONFIG" => {
                 write(&override_file, r#"{"model":"provider/override"}"#);
                 override_file.display().to_string()
             }
-            "OPENCODE_CONFIG_DIR" => {
+            "ZUNO_CONFIG_DIR" => {
                 write(
                     &override_dir.join("zuno.json"),
                     r#"{"model":"provider/override"}"#,
                 );
                 override_dir.display().to_string()
             }
-            "OPENCODE_CONFIG_CONTENT" => r#"{"model":"provider/override"}"#.to_owned(),
+            "ZUNO_CONFIG_CONTENT" => r#"{"model":"provider/override"}"#.to_owned(),
             _ => unreachable!("the override list is closed"),
         };
 
         let config = discover_with(&fixture_options(
             temp.path(),
             &project,
-            [(zuno_paths::env::accepted_env_name(key).to_owned(), value)],
+            [(key.to_owned(), value)],
         ))
         .unwrap_or_else(|error| panic!("{key} must bypass the diagnostic: {error:?}"));
 
@@ -327,11 +322,11 @@ fn discovery_walks_every_layer_in_oracle_precedence_order() {
         [
             ("ZUNO_CONFIG".to_owned(), env_file.display().to_string()),
             (
-                "OPENCODE_CONFIG_DIR".to_owned(),
+                "ZUNO_CONFIG_DIR".to_owned(),
                 override_dir.display().to_string(),
             ),
             (
-                "OPENCODE_CONFIG_CONTENT".to_owned(),
+                "ZUNO_CONFIG_CONTENT".to_owned(),
                 r#"{"model":"content","instructions":["content","global-json"]}"#.to_owned(),
             ),
             (
@@ -410,7 +405,7 @@ fn discovery_jsonc_accepts_comments_and_trailing_commas_and_reports_bad_offset()
 }
 
 #[test]
-fn discovery_injects_the_default_schema_into_file_layers() {
+fn discovery_does_not_inject_an_external_schema_into_file_layers() {
     let temp = tempfile::tempdir().expect("tempdir");
     let project = temp.path().join("project");
     fs::create_dir_all(project.join(".git")).expect("worktree marker");
@@ -420,11 +415,10 @@ fn discovery_injects_the_default_schema_into_file_layers() {
     let config = discover_with(&fixture_options(temp.path(), &project, std::iter::empty()))
         .expect("discover config");
 
-    assert_eq!(config.schema.as_deref(), Some(DEFAULT_SCHEMA));
-    assert!(
-        fs::read_to_string(path)
-            .expect("read injected file")
-            .contains(DEFAULT_SCHEMA)
+    assert_eq!(config.schema, None);
+    assert_eq!(
+        fs::read_to_string(path).expect("read config"),
+        r#"{"model":"provider/model"}"#
     );
 }
 
@@ -438,7 +432,7 @@ fn discovery_applies_permission_after_managed_preferences_and_tools_defaults_fir
         &project,
         [
             (
-                "OPENCODE_CONFIG_CONTENT".to_owned(),
+                "ZUNO_CONFIG_CONTENT".to_owned(),
                 r#"{"tools":{"bash":false,"write":true},"permission":{"read":"ask"}}"#.to_owned(),
             ),
             (
@@ -528,7 +522,7 @@ fn layer_options(root: &Path, cwd: &Path) -> DiscoveryOptions {
         cwd,
         [
             (
-                "OPENCODE_CONFIG_DIR".to_owned(),
+                "ZUNO_CONFIG_DIR".to_owned(),
                 root.join("override").display().to_string(),
             ),
             (

@@ -13,23 +13,8 @@
 //!
 //! Nothing here is new: `zuno-catalog` already resolves agents, commands, skills
 //! and references for the CLI, and `zuno-config` already discovers the config tree.
-//! These handlers re-express those resolved values in upstream's wire shape,
-//! which is a different projection of the same values, not a second resolver.
-//!
-//! # What is honestly divergent
-//!
-//! - `/api/agent`'s `permissions` is this port's rule vocabulary
-//!   (`{action, resource, effect}` is upstream's spelling and is matched), but the
-//!   *ruleset content* is the agent's own declared rules; upstream additionally
-//!   folds in the resolved dynamic rules the CLI computes. Shape is parity; the
-//!   rule list is not claimed to be.
-//! - `/api/command`'s built-in templates are the ones checked into
-//!   `zuno-catalog/src/command/`, which have drifted from the 1.18.12 text (extra
-//!   guidance lines, and upstream substitutes the project directory into the
-//!   `init` body at request time). Shape is parity; the template bytes are not.
-//!
-//! Both are recorded as body exemptions in the differential rather than hidden
-//! behind a normalizer that would make them silently compare equal.
+//! These handlers project those resolved values into Zuno's HTTP response types,
+//! rather than maintaining a second resolver.
 
 use std::path::{Path, PathBuf};
 
@@ -49,35 +34,24 @@ use zuno_permission::rules_from_config;
 use super::error::ApiError;
 use super::state::ApiState;
 
-/// The V2 system prompts, and the V2 built-in command templates.
+/// The HTTP system prompts and built-in command templates.
 ///
 /// # Why these bytes live here rather than in `zuno-catalog`
 ///
-/// This port mirrors upstream's **v1** modules, and `zuno-catalog`'s prompt and
-/// template files are byte-verified against `packages/opencode/src/**`. The V2 HTTP
-/// surface serves **different** bytes for the same four prompts and two templates,
-/// because `packages/core/src/plugin/{agent,command}.ts` carries its own revision of
-/// each. Measured against 1.18.12: the V2 `title` prompt writes `->` and `<=50`
-/// where v1 writes `→` and `≤50`, and V2's `review` template drops a sentence v1
-/// has. Both are correct for their own surface. The compaction prompt was refreshed
-/// from the live 1.18.18 `/api/agent` response when that release changed its bytes.
-///
-/// So `zuno-catalog` keeps the v1 bytes untouched — other differentials pin them — and
-/// these assets carry the V2 bytes. The four prompts were captured from a live
-/// 1.18.12 `GET /api/agent`, which is the authority for what this endpoint answers;
-/// the two templates are byte copies of `packages/core/src/plugin/command/*.txt`.
+/// These assets are owned by the HTTP projection because that surface may evolve
+/// independently from the CLI catalogue.
 mod v2 {
-    /// `plugin/agent.ts:15-31` as served.
+    /// Explore-agent prompt.
     pub const PROMPT_EXPLORE: &str = include_str!("v2/agent-explore.txt");
-    /// `plugin/agent.ts:33-45` as served.
+    /// Compaction-agent prompt.
     pub const PROMPT_COMPACTION: &str = include_str!("v2/agent-compaction.txt");
-    /// `plugin/agent.ts:47-86` as served.
+    /// Title-agent prompt.
     pub const PROMPT_TITLE: &str = include_str!("v2/agent-title.txt");
-    /// `plugin/agent.ts:88-100` as served.
+    /// Summary-agent prompt.
     pub const PROMPT_SUMMARY: &str = include_str!("v2/agent-summary.txt");
-    /// `plugin/command/initialize.txt`, verbatim.
+    /// Repository-initialization command.
     pub const COMMAND_INITIALIZE: &str = include_str!("v2/command-initialize.txt");
-    /// `plugin/command/review.txt`, verbatim.
+    /// Review command.
     pub const COMMAND_REVIEW: &str = include_str!("v2/command-review.txt");
 }
 
@@ -117,7 +91,7 @@ const V2_BUILD_SYSTEM: &str = "You are an AI coding agent. Help the user accompl
 /// skill, where the v1 module the port mirrors uses the `<built-in>` sentinel
 /// (`zuno_catalog::skill::builtin::LOCATION`). Both are correct for their own
 /// surface; this is the one the HTTP response carries.
-const V2_BUILTIN_SKILL_LOCATION: &str = "/builtin/customize-opencode.md";
+const V2_BUILTIN_SKILL_LOCATION: &str = "/builtin/customize-zuno.md";
 
 /// The V2 native roster in its declaration order.
 ///
@@ -136,12 +110,8 @@ const V2_NATIVE_ORDER: &[&str] = &[
     "summary",
 ];
 
-/// The built-in skill's `description` on the V2 surface.
-///
-/// `packages/core/src/plugin/skill.ts:23`, which unlike the v1 copy at
-/// `skill/index.ts:33-34` also lists `commands`. `zuno-catalog`'s own doc comment
-/// already records that the two strings differ; this is the V2 one.
-const V2_BUILTIN_SKILL_DESCRIPTION: &str = "Use ONLY when the user is editing or creating Zuno's own configuration: zuno.json, zuno.jsonc, files under .zuno/, or files under ~/.config/zuno/. Also use when creating or fixing Zuno agents, subagents, commands, skills, plugins, MCP servers, or permission rules. Do not use for the user's own application code, or for any project that is not configuring Zuno itself.";
+/// The built-in skill's model-facing description.
+const V2_BUILTIN_SKILL_DESCRIPTION: &str = zuno_catalog::skill::builtin::DESCRIPTION;
 
 /// Upstream's `{location, data}` success envelope.
 ///
@@ -504,7 +474,7 @@ fn v2_permissions(name: &str, layout: &zuno_paths::Layout, worktree: &Path) -> V
                 v2_rule("grep", "*", "allow"),
                 v2_rule("glob", "*", "allow"),
                 v2_rule("webfetch", "*", "allow"),
-                v2_rule("websearch", "*", "allow"),
+                v2_rule("web_search", "*", "allow"),
                 v2_rule("read", "*", "allow"),
             ]);
             rules.extend(readonly_external);
@@ -642,14 +612,9 @@ fn model_ref(value: &str, variant: Option<String>) -> ModelRef {
 ///
 /// # V2 has three levels, not four
 ///
-/// `zuno-catalog`'s registry mirrors v1, which promotes **every discovered skill** to
-/// a command as its level 4. V2 does not: only `plugin/command.ts` (the built-ins)
-/// and `config/plugin/command.ts` (config and markdown commands) transform the V2
-/// command roster, and nothing promotes a skill. Measured against 1.18.12 in a clean
-/// worktree, the oracle answers `init` and `review` while the v1 registry also
-/// offers `customize-opencode`. So the skill sources are deliberately not supplied
-/// here — offering a command upstream does not have would make `/api/command` an
-/// unreliable basis for a client's command palette.
+/// Skills and commands are separate catalog entries. The command roster contains
+/// Zuno's built-ins plus configured command files; discovered skills are available
+/// through `/api/skill` and are not promoted into a client's command palette.
 ///
 /// The built-in templates substitute the **project** directory, which is what
 /// `plugin/command.ts:15` does through `location.project.directory`; the session

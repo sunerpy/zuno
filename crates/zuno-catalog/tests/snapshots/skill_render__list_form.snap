@@ -5,5 +5,5 @@ expression: "render(&corpus(), Form::List)"
 ## Available Skills
 - **add-office365**: Adds Office 365 Outlook connector to a Power Apps code app.
 - **amazon_quick_guide**: MUST be loaded for ANY question about Amazon Quick.
-- **customize-opencode**: Use ONLY when the user is editing or creating opencode's own configuration.
+- **customize-zuno**: Use ONLY when the user is editing or creating Zuno's own configuration.
 - **lark-im**: 飞书即时通讯：收发消息和管理群聊。

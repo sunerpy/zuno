@@ -416,7 +416,7 @@ fn catalog_diagnostics_distinguish_every_unavailable_reason() {
         .find(|diagnostic| diagnostic.server == "auth")
         .expect("auth diagnostic");
     assert!(
-        auth.message().contains("opencode mcp auth auth"),
+        auth.message().contains("zuno mcp auth auth"),
         "the needs_auth diagnostic must say how to fix it: {}",
         auth.message()
     );

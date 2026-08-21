@@ -23,7 +23,7 @@
 //! The oracle throws on an unresolvable reference (`index.ts:256`) and on a cycle
 //! (`index.ts:251`). Throwing is survivable in a JS render tree that can retry with
 //! `opencode`; here it would abort the frame. So resolution is total: every failure
-//! yields the corresponding colour from the built-in `opencode` theme plus a
+//! yields the corresponding colour from the built-in `zuno` theme plus a
 //! [`ThemeIssue`] naming the key. A hand-written theme with one typo renders, and
 //! says which key was wrong, instead of taking the TUI down.
 //!
@@ -51,10 +51,8 @@ use crate::app::{Component, EventResult};
 
 /// The theme resolved when configuration names nothing, or names something absent.
 ///
-/// The oracle uses this same name as its universal fallback: every failure path in
-/// `src/context/theme.tsx` (`:143`, `:162`, `:177`) sets the active theme to
-/// `opencode`.
-pub const DEFAULT_THEME: &str = "opencode";
+/// Every failure path resolves through this built-in palette.
+pub const DEFAULT_THEME: &str = "zuno";
 
 /// The one name the terminal-derived layer can occupy (`index.ts:181`).
 ///
@@ -67,7 +65,7 @@ pub const DEFAULT_THEME: &str = "opencode";
 /// 2. **Built-in asset**, otherwise: `assets/themes/system.json`, which is a static
 ///    stand-in for tier 1. It exists because the only probe this binary has is
 ///    `COLORFGBG` ([`EnvironmentPalette`]), which most emulators never set — so
-///    without it `theme: "system"` was a name that resolved to `opencode` with a
+///    without it `theme: "system"` was a name that resolved to `zuno` with a
 ///    diagnostic and could not be selected from the picker at all.
 ///
 /// Tier 1 still shadows tier 2, because [`ThemeRegistry::definition`] checks the
@@ -841,7 +839,7 @@ static BUILTIN_THEME_SOURCES: [(&str, &str); BUILTIN_THEME_COUNT] = [
     ("nightowl", include_str!("../assets/themes/nightowl.json")),
     ("nord", include_str!("../assets/themes/nord.json")),
     ("one-dark", include_str!("../assets/themes/one-dark.json")),
-    ("opencode", include_str!("../assets/themes/opencode.json")),
+    ("zuno", include_str!("../assets/themes/zuno.json")),
     ("orng", include_str!("../assets/themes/orng.json")),
     (
         "osaka-jade",

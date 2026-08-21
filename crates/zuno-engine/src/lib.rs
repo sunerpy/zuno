@@ -2,6 +2,7 @@
 
 pub mod compaction;
 pub mod dispatch;
+pub mod driver;
 pub mod hooks;
 pub mod interrupt;
 pub mod r#loop;
@@ -10,3 +11,4 @@ pub mod retry;
 pub mod status;
 pub mod stream;
 pub mod terminal_lease;
+pub mod wake;

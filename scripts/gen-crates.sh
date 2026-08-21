@@ -41,8 +41,8 @@ zuno-engine	The turn engine: the agent loop, tool dispatch, compaction, retry, a
 zuno-agent	Agent definitions, presets, and the sub-agent task boundary.
 zuno-goal	Goal store and continuation board that survive across sessions.
 zuno-memory	Character-capped resident memory: §-delimited entries, batch-atomic apply, injection scanning.
-zuno-plugin	Plugin host: the hook bus and the plugin lifecycle.
-zuno-plugin-sdk	The surface a plugin is written against, shared by hosts and plugin authors.
+zuno-runtime	Transactional component scopes, typed services, and profile lifecycle.
+zuno-harness	Native harness profiles combining drivers, capabilities, and tool manifests.
 zuno-server	HTTP server exposing the `/api` surface and the server-sent event stream.
 zuno-tui	Terminal user interface: views, keybindings, themes, and the render loop.
 zuno-acp	Agent Client Protocol adapter for external editor clients.

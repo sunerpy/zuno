@@ -37,10 +37,11 @@ use zuno_agent::model_policy::{AnyModel, ModelChoice, ModelPolicy};
 use zuno_auth::Credential;
 use zuno_engine::compaction::{CompactionState, TokenWindow};
 use zuno_engine::dispatch::ToolRegistryDispatcher;
+use zuno_engine::driver::AgentDriver;
 use zuno_engine::interrupt::InterruptSignal;
 use zuno_engine::r#loop::{
     AgentModelResolver, ResolvedAgent, ResolvedModel as EngineModel, RunTurnRequest, TurnContext,
-    TurnError, TurnEvent, TurnEventSender, TurnOutcome, run_turn,
+    TurnError, TurnEvent, TurnEventSender, TurnOutcome,
 };
 use zuno_engine::prelude::{
     InternalAgent, InternalProviders, Internals, PreludeContext, PreludeOutcome, compact_requested,
@@ -59,6 +60,7 @@ use zuno_llm::event::{RequestContentBlock, StreamEvent};
 use zuno_llm::registry::{ApiSurface, Provider, ProviderRegistry, Spec, generation};
 use zuno_memory::{ScopeLimits, SessionMemory, assemble_system_prompt};
 use zuno_provider_compatible::{ReqwestTransport, Transport};
+use zuno_runtime::HarnessRuntime;
 use zuno_tool::PermissionAsker;
 
 use crate::environment::StartupEnvironment;
@@ -69,7 +71,7 @@ const COMPATIBLE_PROVIDER: &str = "openai-compatible";
 pub(crate) const DEFAULT_AGENT: &str = "build";
 
 const DEFAULT_MAX_STEPS: u32 = 100;
-const OPENCODE_ENABLE_EXPERIMENTAL_MODELS: &str = "OPENCODE_ENABLE_EXPERIMENTAL_MODELS";
+const ZUNO_ENABLE_EXPERIMENTAL_MODELS: &str = "ZUNO_ENABLE_EXPERIMENTAL_MODELS";
 
 /// Which session a surface wants to talk in.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -123,6 +125,7 @@ pub(crate) struct TurnOptions {
 
 /// Everything resolved from configuration, with no handle open yet.
 pub(crate) struct TurnPlan {
+    runtime: HarnessRuntime,
     directory: PathBuf,
     project: zuno_paths::project::ResolvedProject,
     config: zuno_config::schema::Config,
@@ -136,8 +139,6 @@ pub(crate) struct TurnPlan {
     internals: Internals,
     window: TokenWindow,
     notes: Vec<String>,
-    plugin_tools: Vec<Arc<dyn zuno_tool::Tool>>,
-    plugins: Option<Arc<super::plugin_runtime::PluginRuntime>>,
     /// Every `provider/model` the resolved catalog offers, kept for the model picker.
     ///
     /// The **whole** catalog rather than the session provider's slice, and that is the
@@ -199,7 +200,7 @@ impl TurnPlan {
         let project = zuno_paths::project::resolve_project(&directory);
         let worktree = project.vcs.as_ref().map(|_| project.directory.clone());
         let layout = zuno_paths::Layout::resolve(env);
-        let mut config =
+        let config =
             zuno_config::discovery::discover_with(&zuno_config::discovery::DiscoveryOptions::new(
                 &directory,
                 worktree.as_deref(),
@@ -219,20 +220,6 @@ impl TurnPlan {
             .load()
             .await
             .map_err(to_string)?;
-        let plugins = super::plugin_runtime::PluginRuntime::load(
-            &config,
-            &project,
-            &directory,
-            worktree.as_deref().unwrap_or(directory.as_path()),
-            &layout,
-            super::plugin_runtime::JsPluginPolicy::resolve(&config, env),
-            super::plugin_runtime::PluginRuntimeTarget::server("turn"),
-        )
-        .await
-        .map(Arc::new);
-        if let Some(plugins) = &plugins {
-            plugins.apply_config(&mut config).await?;
-        }
         let input = ResolveInput::new()
             .with_config(&config)
             .with_credentials(credentials.clone())
@@ -241,20 +228,8 @@ impl TurnPlan {
                     .map(|(key, value)| (key.to_owned(), value.to_owned()))
                     .collect(),
             )
-            .with_experimental_models(env.flag(OPENCODE_ENABLE_EXPERIMENTAL_MODELS));
-        let mut catalog = Catalog::resolve(loaded.document(), &input);
-        if let Some(plugins) = &plugins {
-            plugins.apply_catalog(&mut catalog, &credentials).await?;
-        }
-        let plugin_tools = match &plugins {
-            Some(plugins) => plugins
-                .tools()
-                .await?
-                .into_iter()
-                .map(|(_, tool)| tool)
-                .collect(),
-            None => Vec::new(),
-        };
+            .with_experimental_models(env.flag(ZUNO_ENABLE_EXPERIMENTAL_MODELS));
+        let catalog = Catalog::resolve(loaded.document(), &input);
 
         let agents =
             zuno_catalog::agent::load(&directory, worktree.as_deref(), env).map_err(to_string)?;
@@ -298,14 +273,6 @@ impl TurnPlan {
             max_output: token_count(catalog_model.limit.output),
         };
         let mut notes = Vec::new();
-        let plugin_small_model = if config.small_model.is_none() {
-            match (&plugins, catalog.provider(&provider_id)) {
-                (Some(plugins), Some(provider)) => plugins.small_model(provider).await?,
-                (Some(_), None) | (None, _) => None,
-            }
-        } else {
-            None
-        };
         let internals = resolve_internals(
             ResolveInternalsInput {
                 config: &config,
@@ -314,7 +281,7 @@ impl TurnPlan {
                 model_id: &model_id,
                 session_model: catalog_model,
                 env,
-                plugin_small_model: plugin_small_model.as_ref(),
+                plugin_small_model: None,
             },
             &mut notes,
         )?;
@@ -336,6 +303,11 @@ impl TurnPlan {
             ))
             .await,
         );
+        let runtime = HarnessRuntime::new("profile");
+        runtime
+            .activate_profile(zuno_harness::default_profile())
+            .await
+            .map_err(to_string)?;
         let instructions =
             zuno_config::Instructions::discover(&zuno_config::InstructionOptions::from_config(
                 directory.as_path(),
@@ -346,6 +318,7 @@ impl TurnPlan {
             .load()
             .await;
         Ok(Self {
+            runtime,
             directory,
             project,
             config,
@@ -362,8 +335,6 @@ impl TurnPlan {
             internals,
             window,
             notes,
-            plugin_tools,
-            plugins,
             catalog_models,
             skills,
             instructions,
@@ -432,32 +403,6 @@ impl TurnPlan {
     /// The model's context ceiling, or zero when the catalog declares none.
     pub(crate) const fn context_window(&self) -> u64 {
         self.window.context
-    }
-
-    pub(crate) async fn load_tui_plugins(
-        &self,
-        environment: &StartupEnvironment,
-    ) -> Option<Arc<super::plugin_runtime::PluginRuntime>> {
-        let env = environment.resolved();
-        let layout = zuno_paths::Layout::resolve(env);
-        let worktree = self
-            .project
-            .vcs
-            .as_ref()
-            .map_or(self.directory.as_path(), |_| {
-                self.project.directory.as_path()
-            });
-        super::plugin_runtime::PluginRuntime::load(
-            &self.config,
-            &self.project,
-            &self.directory,
-            worktree,
-            &layout,
-            super::plugin_runtime::JsPluginPolicy::resolve(&self.config, env),
-            super::plugin_runtime::PluginRuntimeTarget::tui("tui"),
-        )
-        .await
-        .map(Arc::new)
     }
 }
 
@@ -662,7 +607,13 @@ fn internal_prompt(name: &str) -> Result<String, String> {
 
 /// An open database, an assembled tool set, and the session a turn runs in.
 pub(crate) struct TurnHost {
+    profile_runtime: HarnessRuntime,
+    runtime: HarnessRuntime,
+    profile_id: String,
+    driver: Arc<dyn AgentDriver>,
+    _database: Arc<zuno_db::pool::Pool>,
     connection: rusqlite::Connection,
+    inbox: zuno_db::inbox::SessionInbox,
     providers: ProviderRegistry,
     /// The credential this host presents, kept only so [`describe_turn_failure`]
     /// can prove it never echoes it.
@@ -699,12 +650,14 @@ pub(crate) struct TurnHost {
     compaction_state: CompactionState,
     window: TokenWindow,
     notes: Vec<String>,
-    plugins: Option<Arc<super::plugin_runtime::PluginRuntime>>,
     commands: zuno_catalog::command::Registry,
     goal_store: Arc<GoalStore>,
     goal_projection: GoalProjection,
     goal_continuation: GoalContinuation,
     runs: SessionRunRegistry,
+    background_jobs: super::child_turn::BackgroundJobSupervisor,
+    background_reports: super::child_turn::ChildSessionHost,
+    background_reports_recovered: bool,
     last_turn_completed: bool,
     title_sink: Option<Arc<dyn SessionTitleSink>>,
 }
@@ -782,12 +735,33 @@ impl TurnHost {
     /// configuration, with no error on either path. A surface that genuinely wants no
     /// MCP passes `None` here and says so at its own call site.
     pub(crate) fn open_with_runtime_and_mcp(
+        plan: TurnPlan,
+        environment: &StartupEnvironment,
+        approval: Arc<dyn PermissionAsker>,
+        question: Option<Arc<dyn zuno_tools::question::QuestionAsker>>,
+        runs: SessionRunRegistry,
+        mcp: Option<zuno_mcp::Catalog>,
+    ) -> Result<Self, String> {
+        let database = Arc::new(zuno_db::pool::Pool::open_default().map_err(to_string)?);
+        Self::open_with_runtime_mcp_and_database(
+            plan,
+            environment,
+            approval,
+            question,
+            runs,
+            mcp,
+            database,
+        )
+    }
+
+    pub(super) fn open_with_runtime_mcp_and_database(
         mut plan: TurnPlan,
         environment: &StartupEnvironment,
         approval: Arc<dyn PermissionAsker>,
         question: Option<Arc<dyn zuno_tools::question::QuestionAsker>>,
         runs: SessionRunRegistry,
         mcp: Option<zuno_mcp::Catalog>,
+        database: Arc<zuno_db::pool::Pool>,
     ) -> Result<Self, String> {
         let env = environment.resolved();
         let worktree = plan
@@ -798,12 +772,27 @@ impl TurnHost {
         let presented = plan.credential.as_ref().map(credential_value);
         let providers = provider_registry(&plan.provider_id, plan.credential.clone());
 
-        let mut connection = zuno_db::open_default().map_err(to_string)?;
+        let mut connection = database.open_connection().map_err(to_string)?;
         zuno_db::migration::apply(&mut connection).map_err(to_string)?;
         let now = zuno_db::message::now_millis();
         ensure_project(&connection, &plan.project, now)?;
         let session = resolve_session(&mut connection, &plan, now)?;
-        let todo_store = Arc::new(zuno_db::pool::Pool::open_default().map_err(to_string)?);
+        let profile_runtime = plan.runtime;
+        let profile_id = profile_runtime
+            .active_profile_id()
+            .ok_or_else(|| "profile runtime has no active profile".to_owned())?;
+        let runtime = profile_runtime.child(format!("session:{}", session.id));
+        let driver = runtime
+            .service::<dyn AgentDriver>()
+            .ok_or_else(|| "profile did not register an agent driver".to_owned())?;
+        let tool_manifest = runtime
+            .service::<zuno_harness::ToolManifest>()
+            .ok_or_else(|| "profile did not register a tool manifest".to_owned())?;
+        let tool_contributions = runtime
+            .service::<zuno_harness::ToolContributions>()
+            .ok_or_else(|| "profile did not register tool contributions".to_owned())?;
+        let todo_store = Arc::clone(&database);
+        let inbox = zuno_db::inbox::SessionInbox::new(Arc::clone(&todo_store));
         let goal_store = Arc::new(GoalStore::open_default().map_err(to_string)?);
         let goal_projection = GoalProjection::new(worktree.as_deref(), &session.id)
             .ok_or_else(|| format!("session id `{}` cannot name a goal projection", session.id))?;
@@ -835,6 +824,21 @@ impl TurnHost {
         let mut notes = plan.notes;
         announce_instructions(&mut plan.resolver, &plan.instructions, &mut notes);
         announce_skills(&mut plan.resolver, &plan.skills, &mut notes);
+        let background_jobs = super::child_turn::BackgroundJobSupervisor::default();
+        let child_host =
+            super::child_turn::ChildSessionHost::new(super::child_turn::ChildSessionContext {
+                database: Arc::clone(&database),
+                environment: environment.clone(),
+                directory: plan.directory.clone(),
+                approval: Arc::clone(&approval),
+                question: question.clone(),
+                runs: runs.clone(),
+                mcp: mcp.clone(),
+                parent_agent: plan.agent.name.clone(),
+                parent_model: format!("{}/{}", plan.provider_id, plan.model_id),
+                parent_effort: plan.effort,
+                supervisor: background_jobs.clone(),
+            })?;
 
         let runtime_tools = super::tool_runtime::assemble(
             &plan.directory,
@@ -845,9 +849,9 @@ impl TurnHost {
             super::tool_runtime::ToolSelection {
                 provider_id: &plan.provider_id,
                 model_id: &plan.model_id,
+                manifest: tool_manifest,
+                contributions: tool_contributions,
                 question,
-                plugin_tools: &plan.plugin_tools,
-                plugins: plan.plugins.clone(),
                 todo_store,
                 goal_store: Arc::clone(&goal_store),
                 mcp_loader: mcp.map(|catalog| {
@@ -855,11 +859,7 @@ impl TurnHost {
                 }),
                 skills: Arc::clone(&plan.skills),
                 delegation: super::tool_runtime::Delegation {
-                    host: Arc::new(super::child_turn::ChildSessionHost::new(
-                        environment.clone(),
-                        plan.directory.clone(),
-                        Arc::clone(&approval),
-                    )),
+                    host: Arc::new(child_host.clone()),
                     facts: Arc::clone(&plan.delegation_facts)
                         as Arc<dyn zuno_tools::task::ProviderFacts>,
                     session_model: zuno_agent::model_policy::ModelChoice::new(format!(
@@ -885,19 +885,21 @@ impl TurnHost {
                 .iter()
                 .map(|suppression| format!("warning: {suppression}")),
         );
-        let mut dispatcher = ToolRegistryDispatcher::new(
+        let dispatcher = ToolRegistryDispatcher::new(
             runtime_tools.tools,
             runtime_tools.rules,
             approval,
             InterruptSignal::new(),
             McpToolStatus::Ready,
         );
-        if let Some(plugins) = plan.plugins.as_ref() {
-            let hooks: Arc<dyn zuno_engine::hooks::ToolHooks> = plugins.clone();
-            dispatcher = dispatcher.with_hooks(hooks);
-        }
         Ok(Self {
+            profile_runtime,
+            runtime,
+            profile_id,
+            driver,
+            _database: database,
             connection,
+            inbox,
             providers,
             credential: presented,
             resolver: plan.resolver,
@@ -913,12 +915,14 @@ impl TurnHost {
             compaction_state: CompactionState::default(),
             window: plan.window,
             notes,
-            plugins: plan.plugins,
             commands,
             goal_store,
             goal_projection,
             goal_continuation,
             runs,
+            background_jobs,
+            background_reports: child_host,
+            background_reports_recovered: false,
             last_turn_completed: false,
             title_sink: None,
         })
@@ -932,6 +936,11 @@ impl TurnHost {
     /// The session every turn this host drives belongs to.
     pub(crate) fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// The active harness profile that assembled this session.
+    pub(crate) fn profile_id(&self) -> &str {
+        &self.profile_id
     }
 
     /// The name a resumed session already had, or [`None`] for one never named.
@@ -1021,24 +1030,16 @@ impl TurnHost {
         self.runs.control(self.session_id.clone())
     }
 
-    pub(crate) fn with_event_hooks(&self, events: TurnEventSender) -> TurnEventSender {
-        match &self.plugins {
-            Some(plugins) => {
-                let hooks: Arc<dyn zuno_engine::hooks::TurnHooks> = plugins.clone();
-                events.with_hooks(hooks)
-            }
-            None => events,
-        }
-    }
-
-    pub(crate) fn plugin_runtime(&self) -> Option<Arc<super::plugin_runtime::PluginRuntime>> {
-        self.plugins.clone()
-    }
-
     pub(crate) async fn shutdown(&mut self) {
-        if let Some(plugins) = &self.plugins {
-            plugins.shutdown().await;
-        }
+        self.background_jobs.wait_all().await;
+        self.runtime
+            .shutdown()
+            .await
+            .expect("session runtime shutdown is infallible");
+        self.profile_runtime
+            .shutdown()
+            .await
+            .expect("profile runtime shutdown is infallible");
     }
 
     /// Persist `prompt` as the user's message and run one turn over it.
@@ -1084,19 +1085,13 @@ impl TurnHost {
         content: &[RequestContentBlock],
         events: TurnEventSender,
     ) -> Result<(), String> {
+        self.recover_background_reports().await?;
         let guard = self
             .runs
             .begin_turn(self.session_id.clone())
             .map_err(to_string)?;
-        self.drive_input(
-            prompt,
-            None,
-            None,
-            Some(content),
-            guard.interrupt_signal(),
-            events,
-        )
-        .await
+        self.drive_input(prompt, None, Some(content), &guard, events)
+            .await
     }
 
     pub(crate) async fn drive_command(
@@ -1105,6 +1100,7 @@ impl TurnHost {
         arguments: &str,
         events: TurnEventSender,
     ) -> Result<(), String> {
+        self.recover_background_reports().await?;
         let resolved = match self
             .commands
             .resolve(command, arguments)
@@ -1126,15 +1122,8 @@ impl TurnHost {
             .runs
             .begin_turn(self.session_id.clone())
             .map_err(to_string)?;
-        self.drive_input(
-            &resolved.prompt,
-            None,
-            Some((command, arguments)),
-            None,
-            guard.interrupt_signal(),
-            events,
-        )
-        .await
+        self.drive_input(&resolved.prompt, None, None, &guard, events)
+            .await
     }
 
     pub(crate) async fn drive_with_message_id(
@@ -1143,19 +1132,24 @@ impl TurnHost {
         message_id: Option<&str>,
         events: TurnEventSender,
     ) -> Result<(), String> {
+        self.recover_background_reports().await?;
         let guard = self
             .runs
             .begin_turn(self.session_id.clone())
             .map_err(to_string)?;
-        self.drive_input(
-            prompt,
-            message_id,
-            None,
-            None,
-            guard.interrupt_signal(),
-            events,
-        )
-        .await
+        self.drive_input(prompt, message_id, None, &guard, events)
+            .await
+    }
+
+    async fn recover_background_reports(&mut self) -> Result<(), String> {
+        if self.background_reports_recovered {
+            return Ok(());
+        }
+        self.background_reports
+            .recover_pending_reports(&self.session_id)
+            .await?;
+        self.background_reports_recovered = true;
+        Ok(())
     }
 
     pub(crate) async fn drive_with_message_id_and_guard(
@@ -1165,24 +1159,16 @@ impl TurnHost {
         guard: SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<(), String> {
-        self.drive_input(
-            prompt,
-            message_id,
-            None,
-            None,
-            guard.interrupt_signal(),
-            events,
-        )
-        .await
+        self.drive_input(prompt, message_id, None, &guard, events)
+            .await
     }
 
     async fn drive_input(
         &mut self,
         prompt: &str,
         message_id: Option<&str>,
-        command: Option<(&str, &str)>,
         content: Option<&[RequestContentBlock]>,
-        interrupt: &InterruptSignal,
+        guard: &SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<(), String> {
         self.goal_projection
@@ -1191,7 +1177,7 @@ impl TurnHost {
         let usage_before = goal_usage(&self.connection, &self.session_id)?;
         let started = Instant::now();
         let result = self
-            .drive_input_unaccounted(prompt, message_id, command, content, interrupt, events)
+            .drive_input_unaccounted(prompt, message_id, content, guard, events)
             .await;
         match result {
             Ok(outcome) => {
@@ -1217,15 +1203,14 @@ impl TurnHost {
         &mut self,
         prompt: &str,
         message_id: Option<&str>,
-        command: Option<(&str, &str)>,
         content: Option<&[RequestContentBlock]>,
-        interrupt: &InterruptSignal,
+        guard: &SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<Option<TurnOutcome>, String> {
         let latest = zuno_db::message::MessageStore::new(&self.connection)
             .latest_time_created(&self.session_id)
             .map_err(to_string)?;
-        let (message, parts) = prepare_user_message_with_hooks(
+        let (message, parts) = prepare_user_message(
             UserMessageInput {
                 session_id: &self.session_id,
                 agent: &self.agent,
@@ -1236,19 +1221,15 @@ impl TurnHost {
                 now: zuno_db::message::created_after(zuno_db::message::now_millis(), latest),
             },
             content,
-            self.plugins.as_deref(),
-            command,
-        )
-        .await?;
+        )?;
         persist_prepared_user_message(&self.connection, &message, &parts)?;
         let outcome = self.run_prelude().await?;
         report_prelude(&events, &self.notes, &outcome).await?;
         if !outcome.continue_turn {
-            report_plugin_diagnostics(self.plugins.clone(), &events).await?;
             return Ok(None);
         }
         let dynamic_context = self.goal_dynamic_context()?;
-        self.execute_turn_unaccounted(dynamic_context, interrupt, events)
+        self.execute_turn_unaccounted(dynamic_context, guard, events)
             .await
     }
 
@@ -1312,42 +1293,36 @@ impl TurnHost {
             Err(error) => return Err(error),
         };
         report_prelude(&events, &self.notes, &prelude).await?;
-        self.execute_turn_unaccounted(
-            dynamic_context,
-            prepared.run_guard().interrupt_signal(),
-            events,
-        )
-        .await
+        self.execute_turn_unaccounted(dynamic_context, prepared.run_guard(), events)
+            .await
     }
 
     async fn execute_turn_unaccounted(
         &mut self,
         dynamic_context: DynamicContext,
-        interrupt: &InterruptSignal,
+        guard: &SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<Option<TurnOutcome>, String> {
-        let mut context = TurnContext::new(
+        let context = TurnContext::new(
             &mut self.connection,
             &self.providers,
             &self.resolver,
             &self.dispatcher,
-            interrupt,
-        );
-        if let Some(plugins) = self.plugins.as_ref() {
-            let hooks: Arc<dyn zuno_engine::hooks::TurnHooks> = plugins.clone();
-            context = context.with_hooks(hooks);
-        }
-        let outcome = run_turn(
-            RunTurnRequest::new(
-                self.session_id.clone(),
-                Uuid::new_v4().simple().to_string(),
-                dynamic_context,
-            ),
-            context,
-            events.clone(),
+            guard.interrupt_signal(),
         )
-        .await;
-        report_plugin_diagnostics(self.plugins.clone(), &events).await?;
+        .with_live_inputs(guard, &self.inbox);
+        let outcome = self
+            .driver
+            .drive(
+                RunTurnRequest::new(
+                    self.session_id.clone(),
+                    Uuid::new_v4().simple().to_string(),
+                    dynamic_context,
+                ),
+                context,
+                events.clone(),
+            )
+            .await;
         outcome
             .map(Some)
             .map_err(|error| describe_turn_failure(&error, self.credential.as_deref()))
@@ -1435,10 +1410,6 @@ impl TurnHost {
     async fn compact_unaccounted(&mut self, automatic: bool) -> Result<(), String> {
         let providers = RegistryProviders(&self.providers);
         let noop_hooks = zuno_engine::compaction::NoopCompactionHooks;
-        let hooks: &dyn zuno_engine::compaction::CompactionHooks = self
-            .plugins
-            .as_deref()
-            .map_or(&noop_hooks, |plugins| plugins);
         let mut context = PreludeContext {
             connection: &mut self.connection,
             providers: &providers,
@@ -1446,7 +1417,7 @@ impl TurnHost {
             compaction: &self.compaction_config,
             window: self.window,
             state: &mut self.compaction_state,
-            hooks,
+            hooks: &noop_hooks,
         };
         compact_requested(&self.session_id, &mut context, automatic)
             .await
@@ -1467,10 +1438,6 @@ impl TurnHost {
     async fn run_prelude(&mut self) -> Result<PreludeOutcome, String> {
         let providers = RegistryProviders(&self.providers);
         let noop_hooks = zuno_engine::compaction::NoopCompactionHooks;
-        let hooks: &dyn zuno_engine::compaction::CompactionHooks = self
-            .plugins
-            .as_deref()
-            .map_or(&noop_hooks, |plugins| plugins);
         let mut context = PreludeContext {
             connection: &mut self.connection,
             providers: &providers,
@@ -1478,7 +1445,7 @@ impl TurnHost {
             compaction: &self.compaction_config,
             window: self.window,
             state: &mut self.compaction_state,
-            hooks,
+            hooks: &noop_hooks,
         };
         let outcome = run_prelude(&self.session_id, &mut context)
             .await
@@ -1541,33 +1508,6 @@ fn dynamic_context_from_goal_entry(
         .collect::<Vec<_>>()
         .join("\n");
     DynamicContext::new(text)
-}
-
-async fn report_plugin_diagnostics(
-    plugins: Option<Arc<super::plugin_runtime::PluginRuntime>>,
-    events: &TurnEventSender,
-) -> Result<(), String> {
-    let Some(plugins) = plugins else {
-        return Ok(());
-    };
-    loop {
-        let diagnostics = plugins.take_diagnostics();
-        if diagnostics.is_empty() {
-            return Ok(());
-        }
-        for message in diagnostics {
-            events
-                .publish(TurnEvent::Provider {
-                    step: 0,
-                    event: StreamEvent::Error {
-                        message,
-                        retry_after: None,
-                    },
-                })
-                .await
-                .map_err(to_string)?;
-        }
-    }
 }
 
 /// How many bytes of skill catalogue may enter the system prompt.
@@ -2690,7 +2630,7 @@ fn resolve_session(
         plan.project.directory.to_string_lossy().into_owned(),
         plan.directory.to_string_lossy().into_owned(),
         title,
-        crate::COMPATIBILITY_VERSION,
+        crate::RUST_PACKAGE_VERSION,
     )
     .at(now);
     input.agent = Some(plan.agent.name.clone());
@@ -2750,11 +2690,9 @@ fn persist_user_message(
     Ok(())
 }
 
-async fn prepare_user_message_with_hooks(
+fn prepare_user_message(
     input: UserMessageInput<'_>,
     content: Option<&[RequestContentBlock]>,
-    plugins: Option<&super::plugin_runtime::PluginRuntime>,
-    command: Option<(&str, &str)>,
 ) -> Result<
     (
         zuno_db::message::MessageRecord,
@@ -2774,7 +2712,7 @@ async fn prepare_user_message_with_hooks(
         "model": {"providerID": input.provider_id, "modelID": input.model_id}
     }))
     .map_err(to_string)?;
-    let mut parts = match content {
+    let parts = match content {
         Some(content) => request_content_parts(&input, &message.id, content)?,
         None => vec![
             zuno_db::message::PartRecord::from_json(
@@ -2791,42 +2729,9 @@ async fn prepare_user_message_with_hooks(
         ],
     };
 
-    if let (Some(plugins), Some((command, arguments))) = (plugins, command) {
-        plugins
-            .apply_command(command, input.session_id, arguments, &mut parts)
-            .await?;
-    }
-    if let Some(plugins) = plugins {
-        let mut output = zuno_plugin::ChatMessageOutput {
-            message: message.clone(),
-            parts,
-        };
-        let hook_input = zuno_plugin::ChatMessageInput {
-            session_id: input.session_id,
-            agent: Some(input.agent),
-            model: Some(zuno_plugin::ModelSelection {
-                provider_id: input.provider_id,
-                model_id: input.model_id,
-            }),
-            message_id: Some(&message.id),
-            variant: None,
-        };
-        plugins.apply_chat_message(&hook_input, &mut output).await?;
-        if output.message.id != message.id {
-            return Err("chat.message cannot replace the user message id".to_owned());
-        }
-        if output.message.session_id != message.session_id {
-            return Err("chat.message cannot move a user message to another session".to_owned());
-        }
-        if output.message.role != zuno_db::message::MessageRole::User {
-            return Err("chat.message must return a user message".to_owned());
-        }
-        message = output.message;
-        parts = output.parts;
-    }
     for part in &parts {
         if part.session_id != input.session_id || part.message_id != message.id {
-            return Err("plugin returned a part for a different message or session".to_owned());
+            return Err("prepared part belongs to a different message or session".to_owned());
         }
     }
     message

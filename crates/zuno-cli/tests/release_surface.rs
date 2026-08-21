@@ -11,16 +11,6 @@
 //! `#[test]` means `cargo test` alone enforces it, with no separate gate to
 //! remember and no second CI step that can be dropped.
 //!
-//! # Relationship to `crates/zuno-plugin/tests/wasmtime_feature_gate.rs`
-//!
-//! That test asks whether `zuno-plugin --no-default-features` pulls in Wasmtime.
-//! This one asks whether the **shipped binary** does. They are not the same
-//! question and neither subsumes the other: `zuno-cli` depends on `zuno-plugin` with
-//! default features, so if `zuno-plugin`'s `default` ever became `["wasm"]`, todo
-//! 59's test would keep passing while every published artifact grew a JIT.
-//! Deliberately the same mechanism — an offline `cargo tree` over the real
-//! resolved graph — so there is one way to ask this kind of question.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -258,23 +248,31 @@ fn the_shipped_binary_pulls_in_no_wasm_runtime() {
     assert!(
         offenders.is_empty(),
         "the shipped binary's graph contains a WebAssembly runtime: {offenders:?}\n\
-         `zuno-plugin/wasm` is opt-in (plan todo 59) and must stay out of every \
-         published artifact; a JIT changes the security and size profile \
-         entirely.\n\
+         native harness profiles must not pull a JIT into published artifacts; \
+         that would change the security and size profile entirely.\n\
          How each one got in:\n{}",
         explain(&offenders)
     );
 }
 
-/// The plan's literal claim — "the default feature set pulls no wasmtime" — is
-/// about the whole workspace, not only the binary, so it is asserted separately.
-///
-/// This is also the test with the meaningful positive half: `zuno-plugin` IS in the
-/// workspace graph, so the absence of Wasmtime is provably a feature being off
-/// rather than the plugin subsystem being absent. The `-p zuno-cli` test above
-/// cannot make that argument, because `zuno-plugin` is not reachable from `zuno-cli`
-/// at all today — the CLI has no plugin host wired in yet, which is a fact worth
-/// knowing and not something this test should paper over.
+#[test]
+fn the_shipped_binary_has_no_legacy_plugin_runtime() {
+    let graph = default_graph(&["-p", "zuno-cli"]);
+    assert!(
+        graph.len() >= MINIMUM_GRAPH_PACKAGES,
+        "the graph for zuno-cli has only {} packages; this assertion would pass vacuously",
+        graph.len()
+    );
+    for legacy in ["zuno-plugin", "zuno-plugin-sdk"] {
+        assert!(
+            !contains_package(&graph, legacy),
+            "the shipped binary still depends on `{legacy}`; Zuno-native profiles and \
+             components are the only supported extension runtime\n{}",
+            inverted_path(legacy)
+        );
+    }
+}
+
 #[test]
 fn the_default_workspace_graph_pulls_in_no_wasm_runtime() {
     let graph = default_graph(&["--workspace"]);
@@ -283,46 +281,13 @@ fn the_default_workspace_graph_pulls_in_no_wasm_runtime() {
         "the workspace graph has only {} packages; this assertion would pass vacuously",
         graph.len()
     );
-    assert!(
-        contains_package(&graph, "zuno-plugin"),
-        "the default workspace graph has no `zuno-plugin`; the no-wasmtime result \
-         would then prove nothing about the `wasm` feature being off"
-    );
     let offenders = family_matches(&graph, WASM_RUNTIME_FAMILIES);
     assert!(
         offenders.is_empty(),
         "the default workspace graph contains a WebAssembly runtime: \
          {offenders:?}\n\
-         `zuno-plugin`'s `default` must stay `[]` (plan todo 59).\n\
          How each one got in:\n{}",
         explain(&offenders)
-    );
-}
-
-/// The positive control for the two tests above: with `zuno-plugin/wasm` ON, the
-/// runtime DOES appear.
-///
-/// Without this, both no-wasmtime tests could be passing because the query is
-/// broken — a wrong `-p`, a changed `cargo tree` output shape, a matcher that
-/// matches nothing — and a real leak would sail through. Measured here: the
-/// feature pulls in 32 packages of the Wasmtime/Cranelift families.
-#[test]
-fn the_graph_query_does_detect_the_runtime_when_the_feature_is_on() {
-    let graph = default_graph(&["-p", "zuno-plugin", "--features", "wasm"]);
-    let found = family_matches(&graph, WASM_RUNTIME_FAMILIES);
-    assert!(
-        found.len() >= 10,
-        "`zuno-plugin --features wasm` reported only {} Wasmtime-family package(s) \
-         ({found:?}). Either the feature no longer pulls the runtime, or this \
-         query no longer sees it — in which case the two no-wasmtime assertions \
-         above are passing vacuously and would miss a real leak.",
-        found.len()
-    );
-    assert!(
-        family_matches(&graph, &["wasmtime"])
-            .iter()
-            .any(|line| line.starts_with("wasmtime ")),
-        "the wasm graph has no `wasmtime` package itself: {found:?}"
     );
 }
 

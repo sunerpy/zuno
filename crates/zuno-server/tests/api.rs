@@ -15,6 +15,8 @@ use tokio::sync::Notify;
 use tower::ServiceExt;
 use zuno_db::Pool;
 use zuno_db::artifact_gc::ArtifactGcPaths;
+use zuno_db::event_log::SessionEventLog;
+use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox};
 use zuno_db::session::SessionCreate;
 use zuno_engine::r#loop::TurnEventSender;
 use zuno_engine::status::SessionStatus;
@@ -68,6 +70,17 @@ impl BlockingMutationExecutor {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    async fn wait_until_prompt_count(&self, count: usize) {
+        loop {
+            let mut notified = std::pin::pin!(self.prompt_started_notify.notified());
+            notified.as_mut().enable();
+            if self.prompts().len() >= count {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -251,6 +264,38 @@ struct ReadApiFixture {
     state: ApiState,
     events: EventService,
     pool: Arc<Pool>,
+}
+
+struct MutationApiFixture {
+    _temp: TempDir,
+    state: ApiState,
+    pool: Arc<Pool>,
+}
+
+impl MutationApiFixture {
+    fn new(session_id: &str) -> Self {
+        let temp = tempfile::tempdir().expect("temporary mutation fixture directory");
+        let location = DbLocation::File(temp.path().join("zuno.db"));
+        let state_pool = Pool::open(&location).expect("open mutation state pool");
+        let pool = Arc::new(Pool::open(&location).expect("open mutation inspection pool"));
+        let state = ApiState::from_pool(
+            state_pool,
+            "/repo",
+            ArtifactGcPaths::from_data_root(temp.path()),
+        )
+        .expect("initialize mutation API state");
+        state
+            .sessions()
+            .create(&SessionCreate::new(
+                session_id, session_id, "global", "/repo", "/repo", "mutation", "test",
+            ))
+            .expect("fixture session inserts");
+        Self {
+            _temp: temp,
+            state,
+            pool,
+        }
+    }
 }
 
 impl ReadApiFixture {
@@ -1111,24 +1156,12 @@ async fn question_without_an_observer_is_rejected_by_the_deadline() {
 
 #[tokio::test]
 async fn api_prompt_wait_and_interrupt_share_one_live_turn_signal() {
-    let state = ApiState::memory("/repo").expect("in-memory API state initializes");
-    state
-        .sessions()
-        .create(&SessionCreate::new(
-            "ses_mutation",
-            "ses_mutation",
-            "global",
-            "/repo",
-            "/repo",
-            "mutation",
-            "test",
-        ))
-        .expect("fixture session inserts");
+    let fixture = MutationApiFixture::new("ses_mutation");
     let executor = Arc::new(BlockingMutationExecutor::default());
     let services = ServerServices::new(64).with_mutations(executor.clone());
     let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
         .with_services(services.clone())
-        .with_routes(api::router(state))
+        .with_routes(api::router(fixture.state))
         .router();
 
     let response = app
@@ -1148,6 +1181,7 @@ async fn api_prompt_wait_and_interrupt_share_one_live_turn_signal() {
     let body = response_json(response).await;
     assert_eq!(body["data"]["id"], "msg_http");
     assert_eq!(body["data"]["sessionID"], "ses_mutation");
+    assert_eq!(body["data"]["admittedSeq"], 0);
     assert_eq!(body["data"]["prompt"]["files"], json!([]));
     assert_eq!(body["data"]["prompt"]["agents"], json!([]));
     executor.wait_until_prompt_started().await;
@@ -1209,6 +1243,217 @@ async fn api_prompt_wait_and_interrupt_share_one_live_turn_signal() {
             model: None,
         }]
     );
+}
+
+#[tokio::test]
+async fn api_prompt_resume_false_is_durable_without_starting_a_turn() {
+    let fixture = MutationApiFixture::new("ses_deferred");
+    let executor = Arc::new(BlockingMutationExecutor::default());
+    let services = ServerServices::new(64).with_mutations(executor.clone());
+    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
+        .with_services(services.clone())
+        .with_routes(api::router(fixture.state))
+        .router();
+
+    let response = app
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_deferred/prompt",
+            Some(json!({
+                "id": "msg_deferred",
+                "prompt": {"text": "later", "files": [], "agents": []},
+                "delivery": "nextStep",
+                "resume": false
+            })),
+        ))
+        .await
+        .expect("deferred prompt responds");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["data"]["admittedSeq"], 0);
+    assert_eq!(body["data"]["delivery"], "nextStep");
+    assert_eq!(services.runs.status("ses_deferred"), SessionStatus::Idle);
+    assert!(executor.prompts().is_empty());
+    let pending = SessionInbox::new(Arc::clone(&fixture.pool))
+        .pending("ses_deferred")
+        .expect("pending input reads");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, "msg_deferred");
+    let events = SessionEventLog::new(fixture.pool)
+        .read_after("ses_deferred", None)
+        .expect("admission event reads");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type, "session.input.admitted");
+}
+
+#[tokio::test]
+async fn api_busy_steer_is_durable_and_runs_after_the_active_prompt() {
+    let fixture = MutationApiFixture::new("ses_queued");
+    let executor = Arc::new(BlockingMutationExecutor::default());
+    let services = ServerServices::new(64).with_mutations(executor.clone());
+    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
+        .with_services(services.clone())
+        .with_routes(api::router(fixture.state))
+        .router();
+
+    let first = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_queued/prompt",
+            Some(json!({
+                "id": "msg_first",
+                "prompt": {"text": "first", "files": [], "agents": []},
+                "delivery": "steer"
+            })),
+        ))
+        .await
+        .expect("first prompt responds");
+    assert_eq!(first.status(), StatusCode::OK);
+    executor.wait_until_prompt_count(1).await;
+
+    let second = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_queued/prompt",
+            Some(json!({
+                "id": "msg_second",
+                "prompt": {"text": "second", "files": [], "agents": []},
+                "delivery": "steer"
+            })),
+        ))
+        .await
+        .expect("busy steer responds");
+    assert_eq!(second.status(), StatusCode::OK);
+    let body = response_json(second).await;
+    assert_eq!(body["data"]["admittedSeq"], 2);
+    assert_eq!(
+        SessionInbox::new(Arc::clone(&fixture.pool))
+            .pending("ses_queued")
+            .expect("queued input reads")
+            .len(),
+        1
+    );
+
+    assert!(services.runs.abort("ses_queued"));
+    executor.wait_until_prompt_count(2).await;
+    assert_eq!(
+        executor
+            .prompts()
+            .into_iter()
+            .map(|request| request.message_id)
+            .collect::<Vec<_>>(),
+        ["msg_first", "msg_second"]
+    );
+    assert!(
+        SessionInbox::new(fixture.pool)
+            .pending("ses_queued")
+            .expect("drained inbox reads")
+            .is_empty()
+    );
+    assert!(services.runs.abort("ses_queued"));
+    services.runs.wait_until_idle("ses_queued").await;
+}
+
+#[tokio::test]
+async fn api_prompt_driver_runs_a_durable_subagent_report_before_later_user_input() {
+    let fixture = MutationApiFixture::new("ses_report");
+    SessionInbox::new(Arc::clone(&fixture.pool))
+        .admit(NewSessionInput::new(
+            "input_report",
+            "ses_report",
+            json!({
+                "kind": "subagentReport",
+                "jobID": "job_1",
+                "childSessionID": "ses_child",
+                "status": "completed",
+                "text": "background result"
+            }),
+            InputDelivery::NextStep,
+            1,
+        ))
+        .expect("admit background report");
+    let executor = Arc::new(BlockingMutationExecutor::default());
+    let services = ServerServices::new(64).with_mutations(executor.clone());
+    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
+        .with_services(services.clone())
+        .with_routes(api::router(fixture.state))
+        .router();
+
+    let response = app
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_report/prompt",
+            Some(json!({
+                "id": "msg_user",
+                "prompt": {"text": "user input", "files": [], "agents": []},
+                "delivery": "nextStep"
+            })),
+        ))
+        .await
+        .expect("user prompt responds");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    executor.wait_until_prompt_count(1).await;
+    assert_eq!(executor.prompts()[0].message_id, "input_report");
+    assert_eq!(executor.prompts()[0].prompt, "background result");
+    assert!(services.runs.abort("ses_report"));
+    executor.wait_until_prompt_count(2).await;
+    assert_eq!(
+        executor
+            .prompts()
+            .into_iter()
+            .map(|request| (request.message_id, request.prompt))
+            .collect::<Vec<_>>(),
+        [
+            ("input_report".to_owned(), "background result".to_owned()),
+            ("msg_user".to_owned(), "user input".to_owned())
+        ]
+    );
+    assert!(services.runs.abort("ses_report"));
+    services.runs.wait_until_idle("ses_report").await;
+}
+
+#[tokio::test]
+async fn api_prompt_driver_skips_a_malformed_durable_input_without_stranding_the_queue() {
+    let fixture = MutationApiFixture::new("ses_malformed");
+    SessionInbox::new(Arc::clone(&fixture.pool))
+        .admit(NewSessionInput::new(
+            "input_malformed",
+            "ses_malformed",
+            json!({"kind": "unknown"}),
+            InputDelivery::NextStep,
+            1,
+        ))
+        .expect("admit malformed input");
+    let executor = Arc::new(BlockingMutationExecutor::default());
+    let services = ServerServices::new(64).with_mutations(executor.clone());
+    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
+        .with_services(services.clone())
+        .with_routes(api::router(fixture.state))
+        .router();
+
+    let response = app
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_malformed/prompt",
+            Some(json!({
+                "id": "msg_user",
+                "prompt": {"text": "user input", "files": [], "agents": []},
+                "delivery": "nextStep"
+            })),
+        ))
+        .await
+        .expect("user prompt responds");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    executor.wait_until_prompt_count(1).await;
+    assert_eq!(executor.prompts()[0].message_id, "msg_user");
+    assert_eq!(executor.prompts()[0].prompt, "user input");
+    assert!(services.runs.abort("ses_malformed"));
+    services.runs.wait_until_idle("ses_malformed").await;
 }
 
 #[tokio::test]
@@ -1573,7 +1818,7 @@ async fn api_pty_connect_requires_a_single_use_unexpired_ticket_without_echoing_
         None,
     );
     mint.headers_mut()
-        .insert("x-opencode-ticket", "1".parse().expect("valid header"));
+        .insert("x-zuno-ticket", "1".parse().expect("valid header"));
     let minted = app
         .clone()
         .oneshot(mint)
@@ -1722,7 +1967,7 @@ async fn api_pty_websocket_ticket_streams_real_terminal_input_and_output() {
 
     let token: Value = reqwest::Client::new()
         .post(format!("http://{address}/api/pty/{pty_id}/connect-token"))
-        .header("x-opencode-ticket", "1")
+        .header("x-zuno-ticket", "1")
         .send()
         .await
         .expect("ticket request sends")
@@ -2198,6 +2443,26 @@ async fn api_catalogue_operations_answer_in_the_location_envelope() {
 }
 
 #[tokio::test]
+async fn api_init_command_is_written_for_future_zuno_sessions() {
+    let (root, directory) = fs_fixture();
+    let state = ApiState::memory(directory)
+        .expect("API state")
+        .with_env(isolated_env(root.path()));
+    let (status, body) = fs_body(state, "/api/command").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_slice(&body).expect("command body is JSON");
+    let init = json["data"]
+        .as_array()
+        .expect("commands are an array")
+        .iter()
+        .find(|entry| entry["name"] == "init")
+        .expect("init command is present");
+    let template = init["template"].as_str().expect("init template is text");
+    assert!(template.contains("future Zuno sessions"), "{template}");
+    assert!(!template.contains("OpenCode"), "{template}");
+}
+
+#[tokio::test]
 async fn api_agent_roster_is_the_resolved_native_set() {
     let (root, directory) = fs_fixture();
     let state = ApiState::memory(directory)
@@ -2250,18 +2515,18 @@ async fn api_skill_reports_the_v2_builtin_location_and_description() {
         .as_array()
         .expect("skills are an array")
         .iter()
-        .find(|entry| entry["name"] == "customize-opencode")
+        .find(|entry| entry["name"] == "customize-zuno")
         .expect("the built-in skill is registered");
     assert_eq!(
-        builtin["location"], "/builtin/customize-opencode.md",
-        "the V2 surface reports the plugin's absolute location, not the v1 `<built-in>` sentinel"
+        builtin["location"], "/builtin/customize-zuno.md",
+        "the API reports the native built-in location rather than the catalog sentinel"
     );
     assert!(
         builtin["description"]
             .as_str()
             .expect("description is a string")
-            .contains("commands, skills, plugins"),
-        "the V2 description lists `commands`, which the v1 copy does not"
+            .contains("agents, commands, skills, MCP servers"),
+        "the description names the native configuration surfaces"
     );
     let description = builtin["description"].as_str().expect("description");
     assert!(description.contains("Zuno's own configuration"));
@@ -2382,10 +2647,9 @@ async fn api_catalogue_projects_a_pinned_models_document_onto_the_v2_shape() {
             "Inceptron",
             "Mistral",
             "openai",
-            "OpenCode",
             "Zhipu AI"
         ],
-        "integrations sort case-insensitively, which puts `openai` before `OpenCode`"
+        "integrations contain only catalogue providers and native authentication methods"
     );
     let deepseek = integrations
         .iter()

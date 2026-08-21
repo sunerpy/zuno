@@ -376,10 +376,10 @@ fn views_permission_describe_covers_every_oracle_branch() {
             "WebFetch https://x",
         ),
         (
-            "websearch",
-            json!({"query": "rust"}),
+            "web_search",
+            json!({"queries": ["rust", "cargo"]}),
             "◈",
-            "Web search \"rust\"",
+            "Web search \"rust, cargo\"",
         ),
         (
             "doom_loop",

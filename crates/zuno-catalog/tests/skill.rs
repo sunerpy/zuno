@@ -461,9 +461,8 @@ const SKILL_CORPUS_ENV: &str = "ZUNO_SKILL_CORPUS";
 /// absence is indistinguishable from success.
 ///
 /// The corpus itself is worth keeping — real authored skill files exercise
-/// frontmatter shapes the fixtures do not invent — so it follows the precedent
-/// `crates/zuno-plugin/tests/js.rs` set for its live config re-measurement: the
-/// check runs **only when asked for**, and once asked for it is **fail-closed**.
+/// frontmatter forms the fixtures do not invent — so the check runs **only when
+/// asked for**, and once asked for it is **fail-closed**.
 /// Three states, all distinguishable from the outside:
 ///
 /// * `ZUNO_SKILL_CORPUS` unset — announces a visible `SKIPPED` and asserts nothing.

@@ -11,9 +11,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
+use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox, SessionInput};
 use zuno_db::session::{ListQuery, Session, SessionCreate, SortDirection};
+use zuno_engine::interrupt::{SoftInterruptMessage, SoftInterruptSource};
 use zuno_engine::r#loop::event_channel;
-use zuno_engine::status::SessionStatus;
+use zuno_engine::status::{SessionRunGuard, SessionStatus};
 use zuno_error::DbError;
 use zuno_paths::GLOBAL_PROJECT_ID;
 
@@ -206,11 +208,20 @@ pub struct PromptInputBody {
     pub(crate) agents: Vec<Value>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub enum PromptDelivery {
     Steer,
-    Queue,
+    NextStep,
+}
+
+impl PromptDelivery {
+    fn into_inbox(self) -> InputDelivery {
+        match self {
+            Self::Steer => InputDelivery::Steer,
+            Self::NextStep => InputDelivery::NextStep,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,6 +244,50 @@ pub struct PromptAdmitted {
     prompt: PromptInputBody,
     delivery: PromptDelivery,
     time_created: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedModelSelection {
+    provider_id: String,
+    model_id: String,
+}
+
+impl From<SessionModelSelection> for PersistedModelSelection {
+    fn from(model: SessionModelSelection) -> Self {
+        Self {
+            provider_id: model.provider_id,
+            model_id: model.model_id,
+        }
+    }
+}
+
+impl From<PersistedModelSelection> for SessionModelSelection {
+    fn from(model: PersistedModelSelection) -> Self {
+        Self {
+            provider_id: model.provider_id,
+            model_id: model.model_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum PersistedDriverInput {
+    User {
+        prompt: PromptInputBody,
+        agent: Option<String>,
+        model: Option<PersistedModelSelection>,
+    },
+    SubagentReport {
+        #[serde(rename = "jobID")]
+        _job_id: String,
+        #[serde(rename = "childSessionID")]
+        _child_session_id: String,
+        #[serde(rename = "status")]
+        _status: String,
+        text: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -685,92 +740,231 @@ pub async fn prompt(
     Json(input): Json<PromptBody>,
 ) -> Result<Json<Data<PromptAdmitted>>, ApiError> {
     let session = state.sessions().get(&session_id)?;
-    let executor = services.mutations.as_ref().ok_or_else(|| {
+    let executor = Arc::clone(services.mutations.as_ref().ok_or_else(|| {
         ApiError::BackendUnavailable("POST /api/session/{sessionID}/prompt".to_owned())
-    })?;
-    let guard = services
-        .runs
-        .begin_turn(&session_id)
-        .map_err(|error| ApiError::Conflict(error.to_string()))?;
-    let message_id = input
-        .id
-        .unwrap_or_else(|| format!("msg_{}", Uuid::new_v4().simple()));
-    let delivery = input.delivery.unwrap_or(PromptDelivery::Steer);
+    })?);
+    let PromptBody {
+        id,
+        prompt,
+        delivery,
+        resume,
+        agent,
+        model,
+    } = input;
+    let message_id = id.unwrap_or_else(|| format!("msg_{}", Uuid::new_v4().simple()));
+    let delivery = delivery.unwrap_or(PromptDelivery::Steer);
     let created = zuno_db::message::now_millis();
+    let selected_model = match model {
+        Some(model) => Some(SessionModelSelection {
+            provider_id: model.provider_id,
+            model_id: model.id,
+        }),
+        None => session_model(session.model.as_deref())?,
+    };
+    let persisted = PersistedDriverInput::User {
+        prompt: prompt.clone(),
+        agent: agent.or(session.agent),
+        model: selected_model.map(PersistedModelSelection::from),
+    };
+    let admitted_input = SessionInbox::new(state.pool_arc()).admit(NewSessionInput::new(
+        message_id.clone(),
+        session_id.clone(),
+        serde_json::to_value(persisted)
+            .map_err(|error| ApiError::MutationFailed(error.to_string()))?,
+        delivery.into_inbox(),
+        created,
+    ))?;
+    let admitted_seq = u64::try_from(admitted_input.admitted_sequence)
+        .map_err(|_| ApiError::MutationFailed("negative admission sequence".to_owned()))?;
     let admitted = PromptAdmitted {
-        admitted_seq: 0,
+        admitted_seq,
         id: message_id.clone(),
         session_id: session_id.clone(),
-        prompt: input.prompt.clone(),
+        prompt: prompt.clone(),
         delivery,
         time_created: created,
     };
 
-    if input.resume != Some(false) {
-        let request = SessionPromptExecution {
-            session_id,
-            directory: session.directory.into(),
-            message_id,
-            prompt: input.prompt.text,
-            agent: input.agent.or(session.agent),
-            model: match input.model {
-                Some(model) => Some(SessionModelSelection {
-                    provider_id: model.provider_id,
-                    model_id: model.id,
-                }),
-                None => session_model(session.model.as_deref())?,
-            },
-        };
-        let executor = Arc::clone(executor);
-        let fanout = services.events.clone();
-        let durable_events = state.events().cloned();
-        let event_session_id = request.session_id.clone();
-        let (sender, receiver) = event_channel();
-        tokio::spawn(async move {
-            // Counted for the memory sampler's session attribution: a server holding many
-            // concurrent sessions is a different diagnosis from one session leaking, and
-            // that is the distinction the count decides. A guard, so a task that returns
-            // early or panics still decrements.
-            let _session = zuno_observability::memory::SessionCount::enter();
-            let outcome = if let Some(events) = durable_events.as_ref() {
-                let (outcome, ()) = tokio::join!(
-                    executor.prompt(request, guard, sender),
-                    events.forward_engine_events(&event_session_id, &fanout, receiver)
+    if resume != Some(false) {
+        match services.runs.begin_turn(&session_id) {
+            Ok(guard) => spawn_prompt_driver(state, services, executor, session_id, guard),
+            Err(_) if delivery == PromptDelivery::Steer => {
+                let _live_turn_won_race = services.runs.queue_soft_interrupt(
+                    &session_id,
+                    SoftInterruptMessage {
+                        input_id: Some(message_id),
+                        content: prompt.text,
+                        images: Vec::new(),
+                        urgent: false,
+                        source: SoftInterruptSource::User,
+                    },
                 );
-                outcome
-            } else {
-                let (outcome, ()) = tokio::join!(
-                    executor.prompt(request, guard, sender),
-                    fanout.forward_engine_events(receiver)
-                );
-                outcome
-            };
-            if let Err(error) = outcome {
-                eprintln!("session prompt execution failed: {error}");
-                if let Some(events) = durable_events {
-                    let properties = object(json!({
-                        "sessionID": event_session_id,
-                        "message": error,
-                    }));
-                    if let Err(publish_error) = events
-                        .publish(
-                            &event_session_id,
-                            crate::NewEvent::new("session.error", properties)
-                                .expect("fixed session error type is valid"),
-                        )
-                        .await
-                    {
-                        eprintln!(
-                            "failed to publish HTTP turn error for `{event_session_id}`: {publish_error}"
-                        );
-                    }
-                }
             }
-        });
-    } else {
-        drop(guard);
+            Err(_) => {}
+        }
     }
     Ok(Json(Data::new(admitted)))
+}
+
+fn spawn_prompt_driver(
+    state: ApiState,
+    services: ServerServices,
+    executor: Arc<dyn crate::SessionMutationExecutor>,
+    session_id: String,
+    guard: SessionRunGuard,
+) {
+    tokio::spawn(async move {
+        let _session_count = zuno_observability::memory::SessionCount::enter();
+        let inbox = SessionInbox::new(state.pool_arc());
+        let mut guard = Some(guard);
+        loop {
+            let promoted = match inbox.promote_next(&session_id, None) {
+                Ok(promoted) => promoted,
+                Err(error) => {
+                    eprintln!("session input promotion failed for `{session_id}`: {error}");
+                    return;
+                }
+            };
+            let Some(promoted) = promoted else {
+                return;
+            };
+            let request = match prompt_execution(&state, promoted) {
+                Ok(request) => request,
+                Err(error) => {
+                    publish_prompt_error(&state, &session_id, &error).await;
+                    if !continue_prompt_driver(&inbox, &services, &session_id, &mut guard) {
+                        return;
+                    }
+                    continue;
+                }
+            };
+            let current_guard = guard
+                .take()
+                .expect("prompt driver owns a guard before each execution");
+            let outcome = run_prompt_execution(
+                &state,
+                &services,
+                Arc::clone(&executor),
+                request,
+                current_guard,
+            )
+            .await;
+            if let Err(error) = outcome {
+                eprintln!("session prompt execution failed: {error}");
+                publish_prompt_error(&state, &session_id, &error).await;
+            }
+            if !continue_prompt_driver(&inbox, &services, &session_id, &mut guard) {
+                return;
+            }
+        }
+    });
+}
+
+fn continue_prompt_driver(
+    inbox: &SessionInbox,
+    services: &ServerServices,
+    session_id: &str,
+    guard: &mut Option<SessionRunGuard>,
+) -> bool {
+    match inbox.pending(session_id) {
+        Ok(pending) if pending.is_empty() => false,
+        Ok(_) if guard.is_some() => true,
+        Ok(_) => match services.runs.begin_turn(session_id) {
+            Ok(next_guard) => {
+                *guard = Some(next_guard);
+                true
+            }
+            Err(_) => false,
+        },
+        Err(error) => {
+            eprintln!("session input inspection failed for `{session_id}`: {error}");
+            false
+        }
+    }
+}
+
+fn prompt_execution(
+    state: &ApiState,
+    input: SessionInput,
+) -> Result<SessionPromptExecution, String> {
+    let stored = serde_json::from_value::<PersistedDriverInput>(input.prompt)
+        .map_err(|error| format!("invalid persisted session input `{}`: {error}", input.id))?;
+    let session = state
+        .sessions()
+        .get(&input.session_id)
+        .map_err(|error| error.to_string())?;
+    match stored {
+        PersistedDriverInput::User {
+            prompt,
+            agent,
+            model,
+        } => Ok(SessionPromptExecution {
+            session_id: input.session_id,
+            directory: session.directory.into(),
+            message_id: input.id,
+            prompt: prompt.text,
+            agent,
+            model: model.map(SessionModelSelection::from),
+        }),
+        PersistedDriverInput::SubagentReport { text, .. } => {
+            let model =
+                session_model(session.model.as_deref()).map_err(|error| error.to_string())?;
+            Ok(SessionPromptExecution {
+                session_id: input.session_id,
+                directory: session.directory.into(),
+                message_id: input.id,
+                prompt: text,
+                agent: session.agent,
+                model,
+            })
+        }
+    }
+}
+
+async fn run_prompt_execution(
+    state: &ApiState,
+    services: &ServerServices,
+    executor: Arc<dyn crate::SessionMutationExecutor>,
+    request: SessionPromptExecution,
+    guard: SessionRunGuard,
+) -> Result<(), String> {
+    let fanout = services.events.clone();
+    let durable_events = state.events().cloned();
+    let event_session_id = request.session_id.clone();
+    let (sender, receiver) = event_channel();
+    if let Some(events) = durable_events.as_ref() {
+        let (outcome, ()) = tokio::join!(
+            executor.prompt(request, guard, sender),
+            events.forward_engine_events(&event_session_id, &fanout, receiver)
+        );
+        outcome
+    } else {
+        let (outcome, ()) = tokio::join!(
+            executor.prompt(request, guard, sender),
+            fanout.forward_engine_events(receiver)
+        );
+        outcome
+    }
+}
+
+async fn publish_prompt_error(state: &ApiState, session_id: &str, error: &str) {
+    let Some(events) = state.events() else {
+        return;
+    };
+    let properties = object(json!({
+        "sessionID": session_id,
+        "message": error,
+    }));
+    if let Err(publish_error) = events
+        .publish(
+            session_id,
+            crate::NewEvent::new("session.error", properties)
+                .expect("fixed session error type is valid"),
+        )
+        .await
+    {
+        eprintln!("failed to publish HTTP turn error for `{session_id}`: {publish_error}");
+    }
 }
 
 pub async fn compact(

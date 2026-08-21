@@ -211,12 +211,22 @@ pub fn describe(request: &PermissionRequest, input: &Value) -> Subject {
                 detail: detail("URL", &url),
             }
         }
-        "websearch" => {
-            let query = arg("query");
+        "web_search" => {
+            let queries = input
+                .get("queries")
+                .and_then(Value::as_array)
+                .map(|queries| {
+                    queries
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
             Subject {
                 icon: "◈",
-                title: format!("Web search \"{query}\""),
-                detail: detail("Query", &query),
+                title: format!("Web search \"{queries}\""),
+                detail: detail("Queries", &queries),
             }
         }
         "external_directory" => {

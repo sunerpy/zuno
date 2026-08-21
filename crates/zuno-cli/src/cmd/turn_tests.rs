@@ -1,6 +1,7 @@
 //! What both surfaces must be able to trust about the shared composition root.
 
 use super::*;
+use zuno_engine::r#loop::run_turn;
 
 use crate::cmd::tool_runtime;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -52,7 +53,15 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         vcs: None,
     };
     let agent = agent("build");
+    let runtime = zuno_runtime::HarnessRuntime::new("test-profile");
+    futures::executor::block_on(
+        runtime.mount(zuno_engine::driver::AgentDriverComponent::new(Arc::new(
+            zuno_engine::driver::DefaultAgentDriver,
+        ))),
+    )
+    .expect("default test driver mounts");
     TurnPlan {
+        runtime,
         resolver: Resolver {
             requested_agent: agent.name.clone(),
             system_prompt: String::new(),
@@ -85,8 +94,6 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
             max_output: 0,
         },
         notes: Vec::new(),
-        plugin_tools: Vec::new(),
-        plugins: None,
     }
 }
 
@@ -1111,7 +1118,7 @@ async fn production_vertex_anthropic_registration_dispatches_and_decodes_recorde
 /// The catalog a forbidden fetch leaves behind, as [`CatalogSource::load`] builds it.
 fn forbidden_fetch() -> CatalogProvenance {
     CatalogProvenance::FetchForbidden {
-        origin: "https://models.opencode.ai".to_owned(),
+        origin: "https://models.dev".to_owned(),
         cache: PathBuf::from("/nowhere/cache/zuno/models.json"),
     }
 }
@@ -1169,7 +1176,7 @@ fn a_model_no_config_defines_fails_immediately_and_names_the_fix() {
         "private/absent-model",
         "provider",
         "ZUNO_DISABLE_MODELS_FETCH",
-        "https://models.opencode.ai",
+        "https://models.dev",
         "/nowhere/cache/zuno/models.json",
         "ZUNO_MODELS_PATH",
     ] {
@@ -2140,9 +2147,9 @@ fn production_registry_exposes_all_three_goal_tools() {
         tool_runtime::ToolSelection {
             provider_id: "provider",
             model_id: "model",
+            manifest: Arc::new(zuno_harness::ToolManifest::all()),
+            contributions: Arc::new(zuno_harness::ToolContributions::default()),
             question: None,
-            plugin_tools: &[],
-            plugins: None,
             todo_store: Arc::new(
                 zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
             ),
@@ -2256,17 +2263,19 @@ fn goal_usage_delta_includes_every_assistant_step_and_token_bucket() {
     assert_eq!(after.tokens - before.tokens, 165);
 }
 
-/// Neither surface may compose a turn of its own.
+/// Neither surface may compose a turn or bypass the selected driver.
 ///
 /// The whole point of this module is that `run` and the TUI cannot drift apart in
 /// which tools exist, which rules govern them, or how a session is resolved — and
-/// the way they would drift is a second call site. A source scan is crude and it is
-/// also the only check that fails when someone reintroduces one, because a duplicate
-/// composition compiles, passes clippy, and passes every behavioural test twice.
+/// the way they would drift is a second composition root or a direct loop call.
 #[test]
 fn only_this_module_composes_a_turn() {
     let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd");
-    let composition = ["ToolRegistryDispatcher::new", "run_turn("];
+    let composition = [
+        "ToolRegistryDispatcher::new",
+        ".service::<dyn AgentDriver>()",
+        "self\n            .driver\n            .drive(",
+    ];
     let mut scanned = 0_usize;
     for entry in std::fs::read_dir(&directory).expect("the command directory is readable") {
         let path = entry.expect("a readable directory entry").path();
@@ -2294,12 +2303,26 @@ fn only_this_module_composes_a_turn() {
                  second call site is how two surfaces come to offer different tools"
             );
         }
+        assert_eq!(
+            source.matches("run_turn(").count(),
+            0,
+            "`{name}` bypasses the active AgentDriver"
+        );
     }
     assert!(
         scanned >= 17,
         "scanned only {scanned} files under {}; the scan is looking in the wrong \
          place and would pass vacuously",
         directory.display()
+    );
+
+    let driver =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../zuno-engine/src/driver.rs");
+    let driver = std::fs::read_to_string(&driver).expect("the default driver source is readable");
+    assert_eq!(
+        driver.matches("run_turn(").count(),
+        1,
+        "only DefaultAgentDriver may own the built-in loop call"
     );
 }
 
@@ -2922,9 +2945,9 @@ mod production_registry {
             tool_runtime::ToolSelection {
                 provider_id: "provider",
                 model_id: "model",
+                manifest: Arc::new(zuno_harness::ToolManifest::all()),
+                contributions: Arc::new(zuno_harness::ToolContributions::default()),
                 question: None,
-                plugin_tools: &[],
-                plugins: None,
                 todo_store: Arc::new(
                     zuno_db::Pool::open(&zuno_paths::DbLocation::Memory)
                         .expect("in-memory todo store"),
@@ -3008,9 +3031,9 @@ mod production_registry {
             tool_runtime::ToolSelection {
                 provider_id: "provider",
                 model_id: "model",
+                manifest: Arc::new(zuno_harness::ToolManifest::all()),
+                contributions: Arc::new(zuno_harness::ToolContributions::default()),
                 question: None,
-                plugin_tools: &[],
-                plugins: None,
                 todo_store: Arc::new(
                     zuno_db::Pool::open(&zuno_paths::DbLocation::Memory)
                         .expect("in-memory todo store"),

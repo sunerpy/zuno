@@ -52,6 +52,14 @@ fn compact(source: &str) -> String {
     source.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Remove whitespace entirely when the assertion is about one Rust expression.
+fn squash_whitespace(source: &str) -> String {
+    source
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
 /// Every production Rust source in the workspace, tests excluded.
 ///
 /// Tests are excluded on purpose: a setter only a test calls is exactly the state this
@@ -275,37 +283,55 @@ fn every_place_that_admits_a_turn_also_counts_the_session() {
     // `Attribution::SessionCount` is the level that tells a busy server from a leaking one,
     // and it is meaningless unless something maintains the count.
     //
-    // The entry points are *derived*, not listed: the server admits a live turn through
-    // `services.runs.begin_turn(...)`, so every function that admits one is a place a
-    // session starts and must therefore take a guard. A third endpoint added later cannot
-    // avoid this gate, because it cannot avoid admitting its turn.
-    //
-    // The previous version of this test searched the whole of `session.rs` for one
-    // occurrence of `SessionCount::enter()`, so the prompt path's guard satisfied it for
-    // the file and the explicit-compact path went uncounted — the hand-kept-sample failure
-    // this repository keeps paying for, in a test written to prevent it.
-    const ADMISSION: &str = "services .runs .begin_turn(";
+    // Prompt admission starts one durable driver. That driver retains one count while it
+    // drains the FIFO, including the later leases `continue_prompt_driver` obtains.
+    // Compaction owns one synchronous lease and therefore owns its count directly.
+    const ADMISSION: &str = "services.runs.begin_turn(";
     let server = cli_source("../zuno-server/src/api/session.rs");
-    let admitting: Vec<(String, String)> = functions(&server)
-        .into_iter()
-        .filter(|(_, body)| compact(body).contains(ADMISSION))
-        .collect();
-
-    assert!(
-        admitting.len() >= 2,
-        "found {} function(s) admitting a turn; the prompt and compact paths are both \
-         expected, so this gate is no longer looking at the right thing",
-        admitting.len()
+    let functions = functions(&server);
+    let mut admitting = functions
+        .iter()
+        .filter(|(_, body)| squash_whitespace(body).contains(ADMISSION))
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>();
+    admitting.sort_unstable();
+    assert_eq!(
+        admitting,
+        ["compact_session", "continue_prompt_driver", "prompt"],
+        "every new server run admission must declare which session-count lifetime owns it"
     );
-    for (name, body) in &admitting {
-        assert!(
-            compact(body).contains(&compact(
-                "zuno_observability::memory::SessionCount::enter()"
-            )),
-            "`{name}` admits a live turn without counting the session, so the sampler \
-             under-reports active sessions and mis-attributes that growth to the heap"
-        );
-    }
+
+    let function = |name: &str| {
+        functions
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .map(|(_, body)| body)
+            .unwrap_or_else(|| panic!("server session API has no `{name}` function"))
+    };
+    let prompt = function("prompt");
+    assert!(
+        squash_whitespace(prompt).contains("spawn_prompt_driver("),
+        "`prompt` admits the first lease but does not hand it to the counted durable driver"
+    );
+    let driver = function("spawn_prompt_driver");
+    assert!(
+        compact(driver).contains(&compact(
+            "zuno_observability::memory::SessionCount::enter()"
+        )),
+        "the durable prompt driver drains live leases without counting its session"
+    );
+    assert!(
+        squash_whitespace(driver).contains("continue_prompt_driver("),
+        "the counted prompt driver no longer owns the FIFO continuation admissions"
+    );
+
+    let compact_session = function("compact_session");
+    assert!(
+        compact(compact_session).contains(&compact(
+            "zuno_observability::memory::SessionCount::enter()"
+        )),
+        "`compact_session` admits a live turn without counting the session"
+    );
 }
 
 #[test]

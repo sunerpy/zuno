@@ -1,19 +1,8 @@
-//! The diff engine's anti-widening guard, and its error reporting.
+//! The diff engine's anti-widening guard and optional research-runner diagnostics.
 //!
-//! This file is what survived the removal of `differential_self_test.rs`, whose
-//! module doc stated the premise plainly: *"This project's entire premise is
-//! differential compatibility against `opencode` v1.18.13, so a machine without the
-//! oracle cannot verify anything."* That premise is retired — Zuno is a standalone
-//! project — so the five tests there that ran a real `opencode` alongside `zuno` and
-//! compared their streams went with it.
-//!
-//! The two kept here never ran either binary. They matter because
-//! [`zuno_testkit::diff_normalized`] and [`zuno_testkit::Normalizer`] are still used by
-//! the eight comparison suites that remain (each of which skips cleanly when no
-//! second binary is installed), and a normalizer wide enough to force a pass is
-//! worse than no comparison at all. The first test is the check that stops the
-//! masking rules from swallowing a real difference; the second pins that a missing
-//! binary is reported with the path and a remedy rather than as an opaque error.
+//! A normalizer wide enough to force a pass is worse than no comparison at all.
+//! The first test stops masking rules from swallowing a real difference; the
+//! second pins that a missing research binary is reported with a path and remedy.
 
 use zuno_testkit::{Normalizer, Oracle, TestkitError, diff_normalized};
 

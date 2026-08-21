@@ -6,15 +6,18 @@ use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
+use zuno_db::Pool;
+use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox};
 use zuno_db::message::{MessageRecord, MessageStore, PartKind, PartRecord};
 use zuno_db::{Connection, migration, open};
-use zuno_engine::interrupt::InterruptSignal;
+use zuno_engine::interrupt::{InterruptSignal, SoftInterruptMessage, SoftInterruptSource};
 use zuno_engine::r#loop::{
     AgentModelResolver, AvailableTools, DispatchRequest, ResolvedAgent, ResolvedModel,
     RunTurnRequest, ToolDispatchResult, ToolDispatcher, TurnContext, TurnError, TurnEvent,
     TurnOutcome, event_channel, hydrate_retained_history, project_history, project_history_owned,
     retained_history, run_turn,
 };
+use zuno_engine::status::SessionRunRegistry;
 use zuno_error::ProviderError;
 use zuno_llm::cache::{DynamicContext, McpToolStatus};
 use zuno_llm::event::{FinishReason, PromptAccounting, RequestContentBlock, Role, StreamEvent};
@@ -650,6 +653,86 @@ async fn run_full_turn_once() -> (Vec<TurnEvent>, Vec<CompletionRequest>, Vec<Di
     assert_eq!(assistants[1].parts.len(), 1);
 
     (events, provider.requests(), dispatcher.calls())
+}
+
+#[tokio::test]
+async fn loop_injects_a_durable_steer_at_the_tool_safe_point() {
+    let pool = Arc::new(
+        Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared in-memory loop pool"),
+    );
+    {
+        let mut connection = pool.get().expect("seed connection");
+        migration::apply(&mut connection).expect("apply schema");
+        connection
+            .execute_batch(&format!(
+                "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) \
+                 VALUES ('project-loop', '/workspace', 1, 1, '[]');
+                 INSERT INTO session \
+                   (id, project_id, slug, directory, title, version, time_created, time_updated) \
+                 VALUES ('{SESSION_ID}', 'project-loop', 'loop', '/workspace', 'loop', '1', 1, 1);"
+            ))
+            .expect("seed project and session");
+    }
+    let mut connection = pool.get().expect("turn connection");
+    put_user(&connection, "msg_user", 10, "echo hello");
+    let inbox = SessionInbox::new(Arc::clone(&pool));
+    inbox
+        .admit(NewSessionInput::new(
+            "msg_steer",
+            SESSION_ID,
+            json!({"kind": "user", "prompt": {"text": "include benchmark"}}),
+            InputDelivery::Steer,
+            11,
+        ))
+        .expect("admit steer");
+    let run_registry = SessionRunRegistry::new();
+    let guard = run_registry.begin_turn(SESSION_ID).expect("live turn");
+    run_registry
+        .queue_soft_interrupt(
+            SESSION_ID,
+            SoftInterruptMessage {
+                input_id: Some("msg_steer".to_owned()),
+                content: "include benchmark".to_owned(),
+                images: Vec::new(),
+                urgent: false,
+                source: SoftInterruptSource::User,
+            },
+        )
+        .expect("queue steer");
+
+    let provider = Arc::new(FakeProvider::new(full_turn_responses()));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let (sender, receiver) = event_channel();
+    let turn = run_turn(
+        request("turn-steer"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            guard.interrupt_signal(),
+        )
+        .with_live_inputs(&guard, &inbox),
+        sender,
+    );
+    let (outcome, _events) = tokio::join!(turn, collect_events(receiver));
+
+    assert!(matches!(
+        outcome.expect("steered turn succeeds"),
+        TurnOutcome::Completed { steps: 2, .. }
+    ));
+    assert!(inbox.pending(SESSION_ID).expect("pending inbox").is_empty());
+    let hydrated = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .expect("hydrate steered turn");
+    let steer = hydrated
+        .iter()
+        .find(|message| message.info.id == "msg_steer")
+        .expect("steer became a logged user message");
+    assert_eq!(steer.parts[0].data["text"], "include benchmark");
+    assert_eq!(provider.requests().len(), 2);
 }
 
 fn expected_full_turn_events() -> Vec<TurnEvent> {

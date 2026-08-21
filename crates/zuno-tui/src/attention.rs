@@ -30,8 +30,7 @@
 //! routinely licensed on terms that forbid redistributing the assets standalone.
 //! Shipping bytes whose licence cannot be stated is worse than shipping silence.
 //!
-//! So [`builtin_pack`] is registered under the same id upstream uses
-//! (`opencode.default`) and is **empty**. Out of the box the audio half of every
+//! So [`builtin_pack`] is registered as `zuno.default` and is **empty**. Out of the box the audio half of every
 //! cue is unavailable and [`Attention::notify`] returns a
 //! [`AttentionDiagnostic::MissingSound`] naming the pack and the slot. Nothing
 //! panics, nothing is silently dropped, and the notification half is unaffected.
@@ -49,8 +48,8 @@
 //!     "enabled": true,
 //!     "volume": 0.4,
 //!     "sounds": {
-//!       "permission": "~/.config/opencode/sounds/permission.mp3",
-//!       "done": "~/.config/opencode/sounds/done.mp3"
+//!       "permission": "~/.config/zuno/sounds/permission.mp3",
+//!       "done": "~/.config/zuno/sounds/done.mp3"
 //!     }
 //!   }
 //! }
@@ -100,10 +99,10 @@ use serde::{Deserialize, Serialize};
 mod tests;
 
 /// The notification title used when the session has none (`attention.ts:41`).
-pub const DEFAULT_TITLE: &str = "opencode";
+pub const DEFAULT_TITLE: &str = "zuno";
 
 /// The id of the pack this crate registers (`attention.ts:42`).
-pub const DEFAULT_PACK_ID: &str = "opencode.default";
+pub const DEFAULT_PACK_ID: &str = "zuno.default";
 
 /// Upstream's title length cap (`attention.ts:44`).
 pub const TITLE_LIMIT: usize = 80;
@@ -537,12 +536,12 @@ impl SoundPack {
 
 /// The built-in pack: the right id, and no files.
 ///
-/// Registered so `sound_pack: "opencode.default"` resolves to *something* and the
+/// Registered so `sound_pack: "zuno.default"` resolves to *something* and the
 /// resulting diagnostic can name a pack that exists. See this module's header for
 /// why it is empty and how to fill it.
 #[must_use]
 pub fn builtin_pack() -> SoundPack {
-    SoundPack::new(DEFAULT_PACK_ID).with_name("OpenCode Default")
+    SoundPack::new(DEFAULT_PACK_ID).with_name("Zuno Default")
 }
 
 /// What one registered pack looks like from outside
