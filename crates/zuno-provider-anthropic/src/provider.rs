@@ -10,7 +10,7 @@ use zuno_error::ProviderError;
 use zuno_llm::event::StreamEvent;
 use zuno_llm::registry::{
     ApiSurface, Capabilities, CompletionRequest, Declined, FactoryOutcome, Provider,
-    ProviderStream, Spec, Unavailable,
+    ProviderStream, Spec, Unavailable, generation,
 };
 use zuno_llm::sse::StreamIdleTimeout;
 
@@ -51,6 +51,7 @@ pub struct AnthropicConfig {
     api_version: String,
     max_tokens: u64,
     temperature: Option<f64>,
+    top_p: Option<f64>,
     tools: Vec<Value>,
     tool_choice: Option<Value>,
     thinking: Option<Value>,
@@ -66,6 +67,7 @@ impl Default for AnthropicConfig {
             api_version: DEFAULT_API_VERSION.to_owned(),
             max_tokens: DEFAULT_MAX_TOKENS,
             temperature: None,
+            top_p: None,
             tools: Vec::new(),
             tool_choice: None,
             thinking: None,
@@ -94,15 +96,17 @@ impl AnthropicConfig {
         };
 
         if let Some(value) =
-            option(&spec.options, &["maxTokens", "max_tokens"]).and_then(Value::as_u64)
+            option(&spec.options, generation::MAX_TOKENS_KEYS).and_then(Value::as_u64)
         {
             config.max_tokens = value;
         }
-        config.temperature = spec.options.get("temperature").and_then(Value::as_f64);
+        config.temperature =
+            option(&spec.options, generation::TEMPERATURE_KEYS).and_then(Value::as_f64);
+        config.top_p = option(&spec.options, generation::TOP_P_KEYS).and_then(Value::as_f64);
         if let Some(tools) = spec.options.get("tools").and_then(Value::as_array) {
             config.tools = tools.clone();
         }
-        config.tool_choice = option(&spec.options, &["toolChoice", "tool_choice"]).cloned();
+        config.tool_choice = option(&spec.options, generation::TOOL_CHOICE_KEYS).cloned();
         config.thinking = spec.options.get("thinking").cloned();
         if let Some(enabled) =
             option(&spec.options, &["promptCache", "prompt_cache"]).and_then(Value::as_bool)
@@ -182,6 +186,13 @@ impl AnthropicConfig {
     #[must_use]
     pub const fn temperature(&self) -> Option<f64> {
         self.temperature
+    }
+
+    /// Optional nucleus-sampling cutoff, sent as `top_p`
+    /// (`packages/llm/src/protocols/anthropic-messages.ts:548`).
+    #[must_use]
+    pub const fn top_p(&self) -> Option<f64> {
+        self.top_p
     }
 
     /// Frozen tool definitions.

@@ -9,13 +9,19 @@ use url::Url;
 use zuno_error::ProviderError;
 use zuno_llm::event::{Message, RequestContentBlock, Role, StreamEvent};
 use zuno_llm::registry::{
-    ApiSurface, Capabilities, CompletionRequest, Provider, ProviderStream, Spec,
+    ApiSurface, Capabilities, CompletionRequest, Provider, ProviderStream, Spec, generation,
 };
 
 use crate::credentials::{CredentialChainConfig, CredentialResolver};
 use crate::error::{PROVIDER_ID, classify_bedrock_error};
 use crate::eventstream::{BedrockDecodeError, BedrockEventDecoder};
 use crate::sigv4::{SigV4Signer, encode_path_segment};
+
+/// The cap sent on the Anthropic-native path when nothing is configured.
+///
+/// The oracle's own fallback for the same required field
+/// (`packages/llm/src/protocols/anthropic-messages.ts:510`).
+const ANTHROPIC_NATIVE_DEFAULT_MAX_TOKENS: u64 = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BedrockOperation {
@@ -41,6 +47,64 @@ pub struct BedrockConfig {
     pub endpoint: Option<Url>,
     pub operation: BedrockOperation,
     pub credentials: CredentialChainConfig,
+    pub generation: BedrockGeneration,
+}
+
+/// The generation controls Bedrock accepts, in Bedrock's own spelling.
+///
+/// `InferenceConfiguration` in the Bedrock Runtime API reference documents exactly
+/// `maxTokens`, `temperature`, `topP` and `stopSequences`, all camelCase. That is a
+/// vendor fact, not an unlowered SDK name — the same distinction that makes
+/// `reasoningConfig` correct here while `reasoningEffort` was wrong on the OpenAI
+/// surfaces.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BedrockGeneration {
+    /// `inferenceConfig.maxTokens`.
+    pub max_tokens: Option<u64>,
+    /// `inferenceConfig.temperature`.
+    pub temperature: Option<f64>,
+    /// `inferenceConfig.topP`.
+    pub top_p: Option<f64>,
+}
+
+impl BedrockGeneration {
+    fn from_spec(spec: &Spec) -> Self {
+        Self {
+            max_tokens: numeric_option(spec, generation::MAX_TOKENS_KEYS)
+                .and_then(|value| u64::try_from(value.trunc() as i64).ok())
+                .filter(|value| *value > 0),
+            temperature: numeric_option(spec, generation::TEMPERATURE_KEYS),
+            top_p: numeric_option(spec, generation::TOP_P_KEYS),
+        }
+    }
+
+    /// `inferenceConfig`, or `None` when the caller set nothing.
+    ///
+    /// Omitted rather than sent empty because Converse treats an absent
+    /// `inferenceConfig` as "use the model's defaults", which is what a caller who
+    /// configured nothing asked for. The oracle makes the same all-absent check
+    /// (`packages/llm/src/protocols/bedrock-converse.ts:409-414`).
+    fn inference_config(&self) -> Option<Value> {
+        let mut config = Map::new();
+        if let Some(max_tokens) = self.max_tokens {
+            config.insert("maxTokens".to_owned(), Value::from(max_tokens));
+        }
+        insert_f64(&mut config, "temperature", self.temperature);
+        insert_f64(&mut config, "topP", self.top_p);
+        (!config.is_empty()).then_some(Value::Object(config))
+    }
+}
+
+fn insert_f64(target: &mut Map<String, Value>, name: &str, value: Option<f64>) {
+    if let Some(number) = value.and_then(serde_json::Number::from_f64) {
+        target.insert(name.to_owned(), Value::Number(number));
+    }
+}
+
+fn numeric_option(spec: &Spec, keys: &[&str]) -> Option<f64> {
+    keys.iter()
+        .find_map(|key| spec.options.get(*key))
+        .and_then(Value::as_f64)
 }
 
 impl BedrockConfig {
@@ -52,6 +116,7 @@ impl BedrockConfig {
             endpoint: None,
             operation: BedrockOperation::ConverseStream,
             credentials: CredentialChainConfig::default(),
+            generation: BedrockGeneration::default(),
         }
     }
 
@@ -102,6 +167,7 @@ impl BedrockConfig {
                 profile: string_option(spec, "profile"),
                 ..CredentialChainConfig::default()
             },
+            generation: BedrockGeneration::from_spec(spec),
         })
     }
 }
@@ -147,6 +213,21 @@ impl BedrockProvider {
         Self::new(BedrockConfig::from_spec(spec)?)
     }
 
+    /// The body one request will carry.
+    ///
+    /// Exposed for the reason `CompatibleProvider::body_for` is: the generation
+    /// controls are a property of the bytes, and asserting them should not require
+    /// SigV4 credentials and a socket. [`open_stream`](Self::open_stream) serialises
+    /// exactly this value, so an assertion here is an assertion about the wire.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the body builder rejects — a non-text system block, or content no
+    /// Bedrock operation can express.
+    pub fn body_for(&self, request: &CompletionRequest) -> Result<Value, ProviderError> {
+        request_body(request, self.config.operation, &self.config.generation)
+    }
+
     async fn open_stream(
         &self,
         mut request: CompletionRequest,
@@ -154,7 +235,7 @@ impl BedrockProvider {
         if request.surface == ApiSurface::Default && self.config.provider_id.ends_with("/mantle") {
             request.surface = mantle_surface(&request.model_id);
         }
-        let body = request_body(&request, self.config.operation)?;
+        let body = serde_json::to_vec(&self.body_for(&request)?).map_err(ProviderError::fatal)?;
         let url = self.request_url(&request.model_id)?;
         let resolved = self
             .credentials
@@ -324,18 +405,22 @@ pub fn mantle_surface(model_id: &str) -> ApiSurface {
 fn request_body(
     request: &CompletionRequest,
     operation: BedrockOperation,
-) -> Result<Vec<u8>, ProviderError> {
+    generation: &BedrockGeneration,
+) -> Result<Value, ProviderError> {
     let mut value = match operation {
-        BedrockOperation::ConverseStream => converse_body(request)?,
-        BedrockOperation::InvokeModelWithResponseStream => native_body(request)?,
+        BedrockOperation::ConverseStream => converse_body(request, generation)?,
+        BedrockOperation::InvokeModelWithResponseStream => native_body(request, generation)?,
     };
     // Bedrock speaks neither OpenAI surface; both operations are Anthropic-shaped
     // bodies posted to a Bedrock Runtime action.
     request.apply_parameters(&mut value, ApiSurface::Messages);
-    serde_json::to_vec(&value).map_err(ProviderError::fatal)
+    Ok(value)
 }
 
-fn converse_body(request: &CompletionRequest) -> Result<Value, ProviderError> {
+fn converse_body(
+    request: &CompletionRequest,
+    generation: &BedrockGeneration,
+) -> Result<Value, ProviderError> {
     let mut system = Vec::new();
     let mut messages = Vec::new();
     for message in &request.messages {
@@ -364,6 +449,9 @@ fn converse_body(request: &CompletionRequest) -> Result<Value, ProviderError> {
     ]);
     if !system.is_empty() {
         body.insert("system".to_owned(), Value::Array(system));
+    }
+    if let Some(config) = generation.inference_config() {
+        body.insert("inferenceConfig".to_owned(), config);
     }
     Ok(Value::Object(body))
 }
@@ -422,23 +510,53 @@ fn converse_content(blocks: &[RequestContentBlock]) -> Result<Vec<Value>, Provid
         .collect()
 }
 
-fn native_body(request: &CompletionRequest) -> Result<Value, ProviderError> {
+fn native_body(
+    request: &CompletionRequest,
+    generation: &BedrockGeneration,
+) -> Result<Value, ProviderError> {
     match request.surface {
-        ApiSurface::Messages | ApiSurface::Default => anthropic_native_body(request),
-        ApiSurface::Chat => Ok(json!({
-            "model": request.model_id,
-            "stream": true,
-            "messages": openai_messages(&request.messages)?,
-        })),
-        ApiSurface::Responses => Ok(json!({
-            "model": request.model_id,
-            "stream": true,
-            "input": openai_messages(&request.messages)?,
-        })),
+        ApiSurface::Messages | ApiSurface::Default => anthropic_native_body(request, generation),
+        ApiSurface::Chat => {
+            let mut body = json!({
+                "model": request.model_id,
+                "stream": true,
+                "messages": openai_messages(&request.messages)?,
+            });
+            insert_openai_generation(&mut body, "max_tokens", generation);
+            Ok(body)
+        }
+        ApiSurface::Responses => {
+            let mut body = json!({
+                "model": request.model_id,
+                "stream": true,
+                "input": openai_messages(&request.messages)?,
+            });
+            insert_openai_generation(&mut body, "max_output_tokens", generation);
+            Ok(body)
+        }
     }
 }
 
-fn anthropic_native_body(request: &CompletionRequest) -> Result<Value, ProviderError> {
+/// Write the generation controls onto a Mantle body under its OpenAI-surface names.
+///
+/// Mantle posts an OpenAI-shaped body to a Bedrock action, so the output cap is
+/// spelled as that surface spells it — `max_tokens` on chat, `max_output_tokens` on
+/// responses — and *not* as `inferenceConfig`, which belongs to Converse alone.
+fn insert_openai_generation(body: &mut Value, cap: &str, generation: &BedrockGeneration) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    if let Some(max_tokens) = generation.max_tokens {
+        object.insert(cap.to_owned(), Value::from(max_tokens));
+    }
+    insert_f64(object, "temperature", generation.temperature);
+    insert_f64(object, "top_p", generation.top_p);
+}
+
+fn anthropic_native_body(
+    request: &CompletionRequest,
+    generation: &BedrockGeneration,
+) -> Result<Value, ProviderError> {
     let mut system = Vec::new();
     let mut messages = Vec::new();
     for message in &request.messages {
@@ -464,9 +582,21 @@ fn anthropic_native_body(request: &CompletionRequest) -> Result<Value, ProviderE
             "anthropic_version".to_owned(),
             Value::String("bedrock-2023-05-31".to_owned()),
         ),
-        ("max_tokens".to_owned(), Value::from(4096)),
+        // Required by Anthropic's Messages schema (`max_tokens: Schema.Number`,
+        // `packages/llm/src/protocols/anthropic-messages.ts:163`), so unlike every
+        // other generation control this one has a fallback rather than being omitted.
+        (
+            "max_tokens".to_owned(),
+            Value::from(
+                generation
+                    .max_tokens
+                    .unwrap_or(ANTHROPIC_NATIVE_DEFAULT_MAX_TOKENS),
+            ),
+        ),
         ("messages".to_owned(), Value::Array(messages)),
     ]);
+    insert_f64(&mut body, "temperature", generation.temperature);
+    insert_f64(&mut body, "top_p", generation.top_p);
     if !system.is_empty() {
         body.insert("system".to_owned(), Value::String(system.join("\n")));
     }
@@ -604,12 +734,14 @@ mod tests {
             ],
         );
         assert_eq!(
-            converse_body(&request).expect("request body"),
+            converse_body(&request, &BedrockGeneration::default()).expect("request body"),
             json!({
                 "modelId": "us.amazon.nova-micro-v1:0",
                 "messages": [{"role": "user", "content": [{"text": "Say hello."}]}],
                 "system": [{"text": "Reply with one word."}]
-            })
+            }),
+            "a provider configured with no generation controls must still send the \
+             pre-`inferenceConfig` shape byte for byte"
         );
     }
 

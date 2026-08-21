@@ -450,3 +450,138 @@ fn render_chain(error: &dyn std::error::Error) -> String {
     }
     rendered
 }
+
+// ---------------------------------------------------------------------------
+// Generation controls read from the option bag
+//
+// Every case builds its provider from a `Spec` option bag — the only thing the
+// composition root writes — and asserts on `body_for`, the same value
+// `http_request` posts. Setting `RequestBody` fields directly would prove the
+// builder writes what it is told and say nothing about whether the provider ever
+// tells it, which is the shape of defect these cover.
+// ---------------------------------------------------------------------------
+
+fn generation_provider(options: serde_json::Value) -> CompatibleProvider {
+    let mut spec = Spec::new("openrouter").with_base_url("https://example.invalid/v1");
+    for (name, value) in options.as_object().expect("options are an object") {
+        spec = spec.with_option(name.clone(), value.clone());
+    }
+    provider(spec)
+}
+
+fn generation_request() -> CompletionRequest {
+    CompletionRequest::new("some-model", vec![Message::new(Role::User, "Say hello.")]).with_tools(
+        vec![zuno_llm::registry::ToolSchema {
+            name: "read".to_owned(),
+            description: "Read a file".to_owned(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }],
+    )
+}
+
+#[test]
+fn the_option_bag_supplies_every_chat_generation_control() {
+    let body = generation_provider(json!({
+        "maxTokens": 16_384,
+        "temperature": 0.3,
+        "topP": 0.9,
+        "toolChoice": "required"
+    }))
+    .body_for(&generation_request());
+
+    assert_eq!(
+        body["max_tokens"],
+        json!(16_384),
+        "`RequestBody::max_tokens` existed with no production assignment, so the field \
+         was written, documented, tested — and never set"
+    );
+    assert_eq!(body["temperature"], json!(0.3));
+    assert_eq!(body["top_p"], json!(0.9));
+    assert_eq!(
+        body["tool_choice"],
+        json!("required"),
+        "`tool_choice` was in PROTECTED_KEYS, so `extraBody` could not supply it \
+         either: there was no way at all to require a tool call"
+    );
+}
+
+#[test]
+fn the_snake_case_spellings_are_accepted_too() {
+    let body = generation_provider(json!({
+        "max_tokens": 4_096,
+        "top_p": 0.5,
+        "tool_choice": "none"
+    }))
+    .body_for(&generation_request());
+
+    assert_eq!(body["max_tokens"], json!(4_096));
+    assert_eq!(body["top_p"], json!(0.5));
+    assert_eq!(body["tool_choice"], json!("none"));
+}
+
+#[test]
+fn a_responses_surface_spells_the_cap_as_max_output_tokens() {
+    let mut spec = Spec::new("azure")
+        .with_base_url("https://example.invalid/v1")
+        .with_surface(ApiSurface::Responses);
+    spec = spec
+        .with_option("maxTokens", json!(16_384))
+        .with_option(SURFACES_OPTION, json!(["responses"]));
+    let body = provider(spec).body_for(&generation_request());
+
+    assert_eq!(
+        body["max_output_tokens"],
+        json!(16_384),
+        "one configured cap, two wire names: the surface the endpoint resolves to \
+         decides, not the request's own surface hint"
+    );
+    assert!(body.get("max_tokens").is_none());
+}
+
+#[test]
+fn a_zero_or_negative_cap_is_dropped_rather_than_sent() {
+    for cap in [json!(0), json!(-1)] {
+        let body = generation_provider(json!({"maxTokens": cap})).body_for(&generation_request());
+        assert!(
+            body.get("max_tokens").is_none(),
+            "`max_tokens: {cap}` asks the model for an empty completion, or is refused \
+             outright; neither is what the author meant"
+        );
+    }
+}
+
+#[test]
+fn an_empty_option_bag_leaves_the_body_byte_identical_to_the_pre_change_shape() {
+    let body = generation_provider(json!({})).body_for(&generation_request());
+    let keys: Vec<&String> = body
+        .as_object()
+        .expect("the body is an object")
+        .keys()
+        .collect();
+
+    assert_eq!(
+        keys,
+        vec!["messages", "model", "stream", "stream_options", "tools"],
+        "a provider configured with nothing must send exactly what it sent before \
+         these fields existed: {body}"
+    );
+}
+
+#[test]
+fn a_tool_choice_is_withheld_when_the_model_refuses_tools() {
+    let mut spec = Spec::new("openrouter").with_base_url("https://example.invalid/v1");
+    spec = spec
+        .with_option("toolChoice", json!("required"))
+        .with_option(
+            MODEL_CAPABILITIES_OPTION,
+            json!({"some-model": {"tool_calls": false}}),
+        );
+    let body = provider(spec).body_for(&generation_request());
+
+    assert!(
+        body.get("tools").is_none() && body.get("tool_choice").is_none(),
+        "a `tool_choice` with no `tools` to choose from is refused by both surfaces, \
+         so sending one to a model that takes no tools trades a silent drop for a \
+         hard failure: {body}"
+    );
+}

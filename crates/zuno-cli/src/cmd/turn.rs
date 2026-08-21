@@ -56,7 +56,7 @@ use zuno_llm::cache::{DynamicContext, McpToolStatus};
 use zuno_llm::catalog::resolved::ModelEndpoint;
 use zuno_llm::catalog::{Catalog, CatalogProvenance, CatalogSource, ResolveInput};
 use zuno_llm::event::{RequestContentBlock, StreamEvent};
-use zuno_llm::registry::{ApiSurface, Provider, ProviderRegistry, Spec};
+use zuno_llm::registry::{ApiSurface, Provider, ProviderRegistry, Spec, generation};
 use zuno_memory::{ScopeLimits, SessionMemory, assemble_system_prompt};
 use zuno_provider_compatible::{ReqwestTransport, Transport};
 use zuno_tool::PermissionAsker;
@@ -287,11 +287,11 @@ impl TurnPlan {
             requested_model: model_id.clone(),
             wire_model: catalog_model.api.id.clone(),
             reasoning_options: session_reasoning_options(
-                options.effort,
+                turn_effort(options.effort, &agent, &provider_id, &model_id),
                 &provider_id,
                 catalog_model,
             ),
-            spec: model_spec(&catalog, catalog_model, env)?,
+            spec: with_agent_options(model_spec(&catalog, catalog_model, env)?, &agent),
         };
         let window = TokenWindow {
             context: token_count(catalog_model.limit.context),
@@ -2075,6 +2075,33 @@ fn resolved_elsewhere(name: &str) -> bool {
     ENDPOINT_OPTIONS.contains(&name) || name == API_KEY_OPTION
 }
 
+/// The ceiling a build will accept even when a model's catalog entry claims more.
+///
+/// `ProviderTransform.OUTPUT_TOKEN_MAX` (`provider/transform.ts:18`).
+const OUTPUT_TOKEN_MAX: u64 = 32_000;
+
+/// The output-token ceiling for one model, as the oracle computes it.
+///
+/// `Math.min(model.limit.output, OUTPUT_TOKEN_MAX) || OUTPUT_TOKEN_MAX`
+/// (`provider/transform.ts:1412-1414`). The `||` is load-bearing rather than
+/// defensive: a catalog entry that declares no output limit deserialises to `0`
+/// (`catalog/models_dev.rs:116-127` defaults the field), and sending `max_tokens: 0`
+/// asks a model for an empty completion. JavaScript's falsy `0` turns that into the
+/// ceiling; this reproduces the same choice explicitly.
+///
+/// # Why a ceiling exists at all
+///
+/// Without it a catalog entry advertising a million-token output would be forwarded
+/// verbatim, and providers differ on whether that is rejected outright or silently
+/// billed. Clamping keeps a bad catalog row from becoming a bad request.
+fn output_ceiling(model: &zuno_llm::catalog::ResolvedModel) -> u64 {
+    let declared = token_count(model.limit.output);
+    match declared.min(OUTPUT_TOKEN_MAX) {
+        0 => OUTPUT_TOKEN_MAX,
+        ceiling => ceiling,
+    }
+}
+
 /// The key a provider's own options declare, if any.
 ///
 /// # Why this is primary and the stored credential is the fallback
@@ -2408,6 +2435,13 @@ fn model_spec(
     for (name, value) in forwarded_options(provider, model) {
         spec = spec.with_option(name, value);
     }
+    if !spec
+        .options
+        .keys()
+        .any(|name| generation::MAX_TOKENS_KEYS.contains(&name.as_str()))
+    {
+        spec = spec.with_option(generation::MAX_TOKENS, json!(output_ceiling(model)));
+    }
     if factory_key == COMPATIBLE_PROVIDER {
         // `family::resolve` accepts an unlisted identity only when its resolved
         // catalog metadata explicitly declares the generic compatible SDK. The
@@ -2447,6 +2481,79 @@ fn credential_value(credential: &Credential) -> String {
         Credential::Oauth { access, .. } => access.expose().to_owned(),
         Credential::WellKnown { token, .. } => token.expose().to_owned(),
     }
+}
+
+/// Overlay the agent's sampling declarations onto the model's resolved [`Spec`].
+///
+/// # Why the agent wins
+///
+/// The oracle merges the agent's option bag last —
+/// `mergeOptions(mergeOptions(base, model.options), agent.options)`
+/// (`session/llm/request.ts:91`) — and prefers the agent's sampling scalars over the
+/// per-model defaults it would otherwise compute:
+/// `input.agent.temperature ?? ProviderTransform.temperature(input.model)` and
+/// `input.agent.topP ?? ProviderTransform.topP(input.model)` (`:124-127`). Running
+/// after [`model_spec`] reproduces both, and it also means an agent may raise or
+/// lower the output ceiling `model_spec` defaulted, because `options` merges over it.
+///
+/// # Why `top_p` is written under the camelCase name
+///
+/// [`AgentConfig::top_p`](zuno_config::schema::AgentConfig) is the *config* spelling
+/// the oracle accepts (`v1/config/agent.ts:19` declares `top_p`), and
+/// `agent.ts:286` immediately assigns it to `item.topP`. Adapters read the SDK
+/// vocabulary, so the rename happens here rather than in six adapters.
+///
+/// A field the agent left unset writes nothing, so an agent that declares no
+/// sampling leaves the request byte-identical to one resolved without an agent.
+fn with_agent_options(mut spec: Spec, agent: &zuno_catalog::agent::Agent) -> Spec {
+    for (name, value) in &agent.options {
+        if resolved_elsewhere(name) {
+            continue;
+        }
+        spec = spec.with_option(name.clone(), value.clone());
+    }
+    if let Some(temperature) = agent.temperature {
+        spec = spec.with_option(generation::TEMPERATURE, json!(temperature));
+    }
+    if let Some(top_p) = agent.top_p {
+        spec = spec.with_option(generation::TOP_P, json!(top_p));
+    }
+    spec
+}
+
+/// The effort level this turn should resolve, session choice first.
+///
+/// # Why the agent's variant is a fallback and not an override
+///
+/// A session-level choice is a live user action — the effort picker — and the
+/// agent's `variant` is a configured default, so the live choice wins. That is also
+/// the oracle's order: `input.variant ?? (ag.variant && ...)`
+/// (`session/prompt.ts:654`).
+///
+/// # Why the agent's model must match
+///
+/// The same line gates the agent's variant on `same`, computed at `:648` as the
+/// agent's *own* configured model equalling the model being sent to, and the config
+/// schema says so in prose: "applies only when using the agent's configured model"
+/// (`v1/config/agent.ts:16-17`). The reason is that a variant names a level *this
+/// model* declares; carried onto a model switched to by hand it would either name a
+/// variant that model never declared or, worse, silently select a different level
+/// than the name means. An agent with no `model` therefore never contributes one —
+/// which is why that combination is rejected at parse time rather than accepted and
+/// ignored here (`zuno_config::legacy::Deprecation::AgentVariantWithoutModel`).
+fn turn_effort(
+    session: Option<zuno_llm::effort::ReasoningEffort>,
+    agent: &zuno_catalog::agent::Agent,
+    provider_id: &str,
+    model_id: &str,
+) -> Option<zuno_llm::effort::ReasoningEffort> {
+    session.or_else(|| {
+        let declared = agent.model.as_deref()?;
+        let (declared_provider, declared_model) = declared.split_once('/')?;
+        (declared_provider == provider_id && declared_model == model_id)
+            .then(|| agent.variant.as_deref()?.parse().ok())
+            .flatten()
+    })
 }
 
 /// The provider-native reasoning controls for `effort` on `model`, if any.

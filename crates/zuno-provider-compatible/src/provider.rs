@@ -23,7 +23,7 @@ use serde_json::{Map, Value};
 use zuno_error::ProviderError;
 use zuno_llm::registry::{
     ApiSurface, Capabilities, CompletionRequest, Declined, FactoryOutcome, Provider,
-    ProviderStream, Spec, StreamEvent, ToolSchema, Unavailable,
+    ProviderStream, Spec, StreamEvent, ToolSchema, Unavailable, generation,
 };
 use zuno_llm::sse::{SseParser, StreamIdleTimeout};
 
@@ -61,7 +61,9 @@ pub struct CompatibleProvider {
     base_url: String,
     capabilities: Capabilities,
     extra_body: Map<String, Value>,
+    max_tokens: Option<u64>,
     sampling: Sampling,
+    tool_choice: Option<Value>,
     credential: Option<String>,
     transport: Arc<dyn Transport>,
     idle: StreamIdleTimeout,
@@ -101,6 +103,22 @@ impl CompatibleProvider {
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default();
+        let max_tokens = numeric_option(&spec, generation::MAX_TOKENS_KEYS).and_then(|value| {
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a JSON number reaches this as f64; a negative or fractional \
+                          output cap is not a cap and is dropped by the guard above"
+            )]
+            (value > 0.0).then_some(value as u64)
+        });
+        let sampling = Sampling {
+            temperature: numeric_option(&spec, generation::TEMPERATURE_KEYS),
+            top_p: numeric_option(&spec, generation::TOP_P_KEYS),
+            frequency_penalty: numeric_option(&spec, &["frequencyPenalty", "frequency_penalty"]),
+            presence_penalty: numeric_option(&spec, &["presencePenalty", "presence_penalty"]),
+        };
+        let tool_choice = first_option(&spec, generation::TOOL_CHOICE_KEYS).cloned();
 
         Ok(Self {
             spec,
@@ -108,7 +126,9 @@ impl CompatibleProvider {
             base_url: base_url.trim_end_matches('/').to_owned(),
             capabilities,
             extra_body,
-            sampling: Sampling::default(),
+            max_tokens,
+            sampling,
+            tool_choice,
             credential,
             transport,
             idle: StreamIdleTimeout::default(),
@@ -183,6 +203,8 @@ impl CompatibleProvider {
         let mut body = RequestBody::new(request.model_id.clone(), request.messages.clone());
         body.tools = function_envelopes(&request.tools);
         body.sampling = self.sampling;
+        body.max_tokens = self.max_tokens;
+        body.tool_choice = self.tool_choice.clone();
         body.extra_body = self.extra_body.clone();
         let mut body = body.build(&quirks);
         // `quirks.surface`, not `request.surface`: the request usually carries
@@ -360,6 +382,19 @@ fn translate(
 /// user should configure instead — and naming it is the whole point. The variant is
 /// still terminal: `ProviderError::Fatal` maps to `Recovery::Fail`, so nothing
 /// retries a misrouted provider.
+fn first_option<'spec>(spec: &'spec Spec, keys: &[&str]) -> Option<&'spec Value> {
+    keys.iter().find_map(|key| spec.options.get(*key))
+}
+
+/// The first of `keys` the options bag carries as a number.
+///
+/// A non-numeric value is skipped rather than falling back to a later spelling:
+/// `temperature: "hot"` is a mistake to leave visible in the config, not a reason to
+/// read a different key.
+fn numeric_option(spec: &Spec, keys: &[&str]) -> Option<f64> {
+    first_option(spec, keys).and_then(Value::as_f64)
+}
+
 fn unsupported(error: UnsupportedProvider) -> Declined {
     Declined::Failed(ProviderError::fatal(error))
 }

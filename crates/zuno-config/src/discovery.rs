@@ -442,6 +442,18 @@ fn parse_layer(path: &Path, text: &str, inject_schema: bool) -> Result<RawJson, 
     // JSONC pass. Discovery itself deliberately does not interpret {env:...} or
     // {file:...} tokens.
     let strict = strip_jsonc(text);
+    // Before the strict parse, as `check_config` requires: the schema refuses
+    // `mode`, `layout` and `autoshare` as unrecognized keys, and whichever check
+    // runs first decides whether the author is told what to write instead. Keys the
+    // schema does *not* refuse — an agent's `tools`, `maxSteps`, or a `variant` with
+    // no `model` — reach the agent sweep and become provider options, so without
+    // this call they are accepted and silently inert.
+    let document: serde_json::Value =
+        serde_json::from_str(&strict).map_err(|source| ConfigError::Json {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    crate::legacy::check_config(path, &document)?;
     let mut config = Config::from_json_str(path, &strict)?;
     if inject_schema && config.schema.is_none() {
         config.schema = Some(DEFAULT_SCHEMA.to_owned());

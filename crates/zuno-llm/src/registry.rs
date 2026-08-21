@@ -102,7 +102,7 @@ pub use crate::registry::provider::{
     Capabilities, CompletionRequest, CredentialPresence, FinishReason, Message, Provider,
     ProviderStream, Role, StreamEvent, ToolSchema,
 };
-pub use crate::registry::spec::{ApiSurface, Spec};
+pub use crate::registry::spec::{ApiSurface, Spec, generation};
 
 use std::collections::HashMap;
 use std::sync::Arc;

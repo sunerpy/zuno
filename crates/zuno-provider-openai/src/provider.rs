@@ -10,7 +10,7 @@ use zuno_error::ProviderError;
 use zuno_llm::event::StreamEvent;
 use zuno_llm::registry::{
     ApiSurface, Capabilities, CompletionRequest, Declined, FactoryOutcome, Provider,
-    ProviderStream, Spec, Unavailable,
+    ProviderStream, Spec, Unavailable, generation,
 };
 use zuno_llm::sse::StreamIdleTimeout;
 
@@ -73,10 +73,11 @@ impl OpenAiConfig {
             ..Self::default()
         };
         config.max_tokens =
-            option(&spec.options, &["maxTokens", "max_tokens"]).and_then(Value::as_u64);
+            option(&spec.options, generation::MAX_TOKENS_KEYS).and_then(Value::as_u64);
         config.sampling = Sampling {
-            temperature: spec.options.get("temperature").and_then(Value::as_f64),
-            top_p: option(&spec.options, &["topP", "top_p"]).and_then(Value::as_f64),
+            temperature: option(&spec.options, generation::TEMPERATURE_KEYS)
+                .and_then(Value::as_f64),
+            top_p: option(&spec.options, generation::TOP_P_KEYS).and_then(Value::as_f64),
             frequency_penalty: option(&spec.options, &["frequencyPenalty", "frequency_penalty"])
                 .and_then(Value::as_f64),
             presence_penalty: option(&spec.options, &["presencePenalty", "presence_penalty"])
@@ -88,7 +89,7 @@ impl OpenAiConfig {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        config.tool_choice = option(&spec.options, &["toolChoice", "tool_choice"]).cloned();
+        config.tool_choice = option(&spec.options, generation::TOOL_CHOICE_KEYS).cloned();
         config.store = spec.options.get("store").and_then(Value::as_bool);
         config.include = spec
             .options

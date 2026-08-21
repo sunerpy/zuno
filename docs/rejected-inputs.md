@@ -1,9 +1,16 @@
 # Rejected inputs
 
-Eleven configuration forms upstream still accepts, or once accepted, are rejected
+Twelve configuration forms upstream still accepts, or once accepted, are rejected
 here with a message naming the modern replacement and the exact file. Rejecting
 is the deliberate choice: silently accepting a deprecated form leaves a
 configuration that behaves differently from what it says.
+
+`AgentVariantWithoutModel` is the second form that is Zuno's own. Upstream accepts
+the combination and then never applies it: `session/prompt.ts:648-654` gates an
+agent's `variant` on the agent's own `model`, so a `variant` with no `model` is
+inert there too. Rejecting is the same choice as everywhere else on this page — a
+key that validates and does nothing is worse than one that errors, because the
+author builds on a false belief about which reasoning level is in use.
 
 `ConfigFileName` is the one form that is Zuno's own rather than upstream's: Zuno
 reads `zuno.jsonc` and `zuno.json` at every layer, so a config still named
@@ -56,6 +63,15 @@ ZUNO_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
 
   ```text
   deprecated key `tools` at /example/agent/build.md; use `permission` — `write`, `edit`, and `patch` all collapse to `permission.edit`
+  ```
+
+
+### AgentVariantWithoutModel
+
+- Rejected: `agent.loose.variant` — add `model`, or delete `variant` — a variant names a level the agent's own model declares, so without `model` it can never be applied
+
+  ```text
+  deprecated key `agent.loose.variant` at /example/zuno.json; add `model`, or delete `variant` — a variant names a level the agent's own model declares, so without `model` it can never be applied
   ```
 
 

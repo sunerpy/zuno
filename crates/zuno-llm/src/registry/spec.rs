@@ -34,6 +34,52 @@
 
 use std::collections::BTreeMap;
 
+/// The generation controls every provider family reads out of [`Spec::options`].
+///
+/// # Why these names live here and not in each provider
+///
+/// Four of the six adapters already read these keys, and each had written its own
+/// string literal for them. That is exactly the arrangement that let the reasoning
+/// effort defect survive: the writer and the reader agreed only by coincidence, so
+/// a spelling drift on either side degraded silently instead of failing. The
+/// composition root writes these constants and every adapter reads them, so a
+/// rename is a compile error at both ends rather than a field that stops arriving.
+///
+/// # These are SDK provider-option names, not wire field names
+///
+/// The distinction is the same one
+/// [`lower_to_wire`](crate::effort::lower_to_wire) documents: one option becomes a
+/// different field on each protocol, and only the adapter knows which. `MAX_TOKENS`
+/// is `max_tokens` on OpenAI Chat (`packages/llm/src/protocols/openai-chat.ts:361`)
+/// and Anthropic Messages (`anthropic-messages.ts:546`), `max_output_tokens` on
+/// OpenAI Responses (`openai-responses.ts:493`), and `generationConfig.maxOutputTokens`
+/// on Gemini (`gemini.ts:307`) — from one `generation.maxTokens` in every case.
+/// Placing the value is the adapter's job; naming it is this module's.
+///
+/// Each `*_KEYS` slice lists the spellings an adapter accepts, in read precedence:
+/// the oracle's own camelCase name first, then the snake_case form, because a
+/// `provider.*.options` bag is hand-written and both appear in the wild.
+pub mod generation {
+    /// Upper bound on generated tokens — `GenerationOptions.maxTokens`
+    /// (`packages/llm/src/schema/options.ts:75`).
+    pub const MAX_TOKENS: &str = "maxTokens";
+    /// Sampling temperature — `GenerationOptions.temperature` (`options.ts:76`).
+    pub const TEMPERATURE: &str = "temperature";
+    /// Nucleus-sampling cutoff — `GenerationOptions.topP` (`options.ts:77`).
+    pub const TOP_P: &str = "topP";
+    /// Which tool, if any, the model must call.
+    pub const TOOL_CHOICE: &str = "toolChoice";
+
+    /// Accepted spellings of [`MAX_TOKENS`].
+    pub const MAX_TOKENS_KEYS: &[&str] = &[MAX_TOKENS, "max_tokens"];
+    /// Accepted spellings of [`TEMPERATURE`].
+    pub const TEMPERATURE_KEYS: &[&str] = &[TEMPERATURE];
+    /// Accepted spellings of [`TOP_P`].
+    pub const TOP_P_KEYS: &[&str] = &[TOP_P, "top_p"];
+    /// Accepted spellings of [`TOOL_CHOICE`].
+    pub const TOOL_CHOICE_KEYS: &[&str] = &[TOOL_CHOICE, "tool_choice"];
+}
+
 /// Which of a provider SDK's model surfaces to invoke.
 ///
 /// These four are the ones the oracle's Azure selector walks in order, and the

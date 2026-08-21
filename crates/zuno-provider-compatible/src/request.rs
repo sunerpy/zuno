@@ -108,8 +108,19 @@ pub struct RequestBody {
     pub tools: Option<Value>,
     /// Sampling parameters, subject to [`Quirks::accepts_sampling_params`].
     pub sampling: Sampling,
-    /// Output cap, written as `max_tokens`.
+    /// Output cap, written as `max_tokens` on Chat and `max_output_tokens` on
+    /// Responses.
     pub max_tokens: Option<u64>,
+    /// Which tool, if any, the model must call.
+    ///
+    /// `None` is not the same as `"auto"` even though the two request the same
+    /// behaviour: OpenAI documents `auto` as *the default when tools are present*
+    /// and `none` as the default when they are not
+    /// (`POST /v1/chat/completions`, `tool_choice`), so omitting the field asks for
+    /// exactly what the caller wanted and asks it of endpoints that reject an
+    /// explicit value they do not implement. Sending `"auto"` unprompted would be a
+    /// wire change with no behavioural one.
+    pub tool_choice: Option<Value>,
     /// The caller's own body keys, applied after everything derived.
     ///
     /// This is where reasoning-effort resolution lands: `zuno-llm`'s
@@ -140,6 +151,18 @@ impl RequestBody {
         }
     }
 
+    /// Write [`tool_choice`](Self::tool_choice), if set.
+    ///
+    /// Called only from inside the `tools` branch: a `tool_choice` with no `tools`
+    /// to choose from is rejected by both surfaces, so a caller that configured one
+    /// on a model whose capabilities refuse tools gets no tools *and* no choice,
+    /// rather than a request that cannot be served.
+    fn insert_tool_choice(&self, body: &mut Map<String, Value>) {
+        if let Some(tool_choice) = &self.tool_choice {
+            body.insert("tool_choice".to_owned(), tool_choice.clone());
+        }
+    }
+
     fn build_chat(&self, quirks: &Quirks) -> Value {
         let mut body = Map::new();
         body.insert("model".to_owned(), json!(self.model));
@@ -158,6 +181,7 @@ impl RequestBody {
             && quirks.accepts_tools()
         {
             body.insert("tools".to_owned(), tools.clone());
+            self.insert_tool_choice(&mut body);
         }
 
         if quirks.accepts_sampling_params() {
@@ -227,6 +251,7 @@ impl RequestBody {
             && quirks.accepts_tools()
         {
             body.insert("tools".to_owned(), response_tools(tools));
+            self.insert_tool_choice(&mut body);
         }
 
         if quirks.accepts_sampling_params() {

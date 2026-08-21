@@ -946,6 +946,12 @@ fn rejections() -> Vec<Rejection> {
         agent,
         &serde_json::json!({ "tools": {}, "maxSteps": 1 }),
     ));
+    // A separate definition, because this form fires on the *absence* of `model` and
+    // the one above would then carry two findings for one agent.
+    found.extend(inspect_config(
+        config,
+        &serde_json::json!({ "agent": { "loose": { "variant": "high" } } }),
+    ));
     found.extend(inspect_auth(
         auth,
         &serde_json::json!({ "prompts": [{ "condition": true }] }),
@@ -1027,8 +1033,8 @@ fn docs_every_rejected_form_is_documented_with_the_message_the_code_renders() {
         .collect();
     assert_eq!(
         forms.len(),
-        11,
-        "all eleven deprecated forms must be reachable for the page to be complete; got {forms:?}"
+        12,
+        "all twelve deprecated forms must be reachable for the page to be complete; got {forms:?}"
     );
 
     check_block(

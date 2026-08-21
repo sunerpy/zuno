@@ -3578,3 +3578,393 @@ fn turn_a_placeholder_session_title_reads_as_no_title_at_all() {
          as unnamed"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Generation controls: the catalog's output limit and the agent's sampling
+//
+// # How these differ from the tests that let the effort defect through
+//
+// Those tests hand-wrote the body key they then asserted (`reasoning_effort`), so
+// they proved `extraBody` is an identity function and said nothing about what a
+// session emits — production spelled the key `reasoningEffort` and the two never
+// met. Every test below writes only **user-facing configuration** — a provider
+// block, a model's `limit.output`, an `agent` entry — and asserts on the **body a
+// real provider builds**. No test here names an intermediate value, so none can be
+// satisfied by a fixture that production never produces.
+// ---------------------------------------------------------------------------
+
+/// A resolved catalog model from a user-shaped config, plus the catalog itself.
+///
+/// The `limit.output` and `agent` blocks are the only inputs, because they are the
+/// only things a user writes.
+fn generation_catalog(
+    model_id: &str,
+    output_limit: Option<u64>,
+    provider_options: serde_json::Value,
+) -> Catalog {
+    let mut model = serde_json::Map::from_iter([
+        ("id".to_owned(), serde_json::json!(model_id)),
+        ("name".to_owned(), serde_json::json!("Generation fixture")),
+        // Declared for every fixture model, not just the reasoning ones: a model
+        // whose catalog entry omits it resolves to no reasoning controls whatever
+        // level is chosen, which would make a variant assertion pass for the wrong
+        // reason.
+        ("reasoning".to_owned(), serde_json::json!(true)),
+        (
+            "variants".to_owned(),
+            serde_json::json!({
+                "high": {"reasoningEffort": "high"},
+                "low": {"reasoningEffort": "low"}
+            }),
+        ),
+    ]);
+    if let Some(output) = output_limit {
+        model.insert(
+            "limit".to_owned(),
+            serde_json::json!({"context": 100_000, "output": output}),
+        );
+    }
+    let config: zuno_config::schema::Config = serde_json::from_value(serde_json::json!({
+        "provider": {
+            "stub": {
+                "id": "stub",
+                "name": "Generation fixture",
+                "env": [],
+                "npm": "@ai-sdk/openai-compatible",
+                "options": provider_options,
+                "models": { model_id: serde_json::Value::Object(model) },
+            }
+        }
+    }))
+    .expect("generation fixture config");
+    Catalog::resolve(
+        &zuno_llm::catalog::models_dev::CatalogDocument::new(),
+        &ResolveInput::new().with_config(&config),
+    )
+}
+
+/// One agent from user-shaped config, through the real deserializer and merge.
+///
+/// Deliberately not [`agent`]: that helper constructs the struct field by field,
+/// which would let a test pass while the config schema dropped the key on the way
+/// in. Going through `AgentConfig` means the JSON a user writes is the input.
+fn configured_agent(definition: serde_json::Value) -> zuno_catalog::agent::Agent {
+    let config: zuno_config::schema::Config = serde_json::from_value(serde_json::json!({
+        "agent": { "tuned": definition }
+    }))
+    .expect("agent fixture config");
+    zuno_catalog::agent::resolve(
+        config.agent.as_ref().expect("the agent map deserializes"),
+        &[],
+    )
+    .into_iter()
+    .find(|entry| entry.name == "tuned")
+    .expect("the configured agent resolves")
+}
+
+/// The Chat body a real provider sends for `model_id`, resolved as production does.
+fn generation_body(
+    catalog: &Catalog,
+    model_id: &str,
+    agent: &zuno_catalog::agent::Agent,
+) -> serde_json::Value {
+    let model = catalog
+        .model("stub", model_id)
+        .expect("the generation fixture model resolves");
+    let spec = with_agent_options(
+        model_spec(catalog, model, &Env::empty()).expect("the generation fixture spec resolves"),
+        agent,
+    );
+    let provider = zuno_provider_compatible::CompatibleProvider::new(
+        spec,
+        Arc::new(zuno_provider_compatible::ReqwestTransport::new(
+            "generation",
+        )),
+        None,
+    )
+    .expect("the generation fixture provider builds");
+    let mut request = zuno_llm::registry::CompletionRequest::new(
+        model.api.id.clone(),
+        vec![zuno_llm::event::Message {
+            role: zuno_llm::event::Role::User,
+            content: vec![zuno_llm::event::RequestContentBlock::Text {
+                text: "Say hello.".to_owned(),
+            }],
+        }],
+    )
+    .with_tools(vec![zuno_llm::registry::ToolSchema {
+        name: "read".to_owned(),
+        description: "Read a file".to_owned(),
+        parameters: serde_json::json!({"type": "object", "properties": {}}),
+    }]);
+    request.parameters =
+        session_reasoning_options(turn_effort(None, agent, "stub", model_id), "stub", model);
+    provider.body_for(&request)
+}
+
+#[test]
+fn a_models_declared_output_limit_reaches_the_request_body() {
+    let catalog = generation_catalog(
+        "capped",
+        Some(16_384),
+        serde_json::json!({
+            "baseURL": "https://example.invalid/v1"
+        }),
+    );
+    let body = generation_body(&catalog, "capped", &agent("build"));
+
+    assert_eq!(
+        body.get("max_tokens"),
+        Some(&serde_json::json!(16_384)),
+        "the catalog's `limit.output` never reached the body, so every request runs on \
+         the vendor's own default: measured against a capture stub, upstream sends \
+         `max_tokens` where this build sent nothing"
+    );
+}
+
+#[test]
+fn an_output_limit_above_the_ceiling_is_clamped_rather_than_forwarded() {
+    let catalog = generation_catalog(
+        "huge",
+        Some(1_000_000),
+        serde_json::json!({
+            "baseURL": "https://example.invalid/v1"
+        }),
+    );
+    let body = generation_body(&catalog, "huge", &agent("build"));
+
+    assert_eq!(
+        body.get("max_tokens"),
+        Some(&serde_json::json!(32_000)),
+        "a catalog row claiming a million output tokens was forwarded verbatim; \
+         `ProviderTransform.maxOutputTokens` clamps to 32_000"
+    );
+}
+
+#[test]
+fn a_model_declaring_no_output_limit_still_sends_a_cap() {
+    let catalog = generation_catalog(
+        "uncapped",
+        None,
+        serde_json::json!({
+            "baseURL": "https://example.invalid/v1"
+        }),
+    );
+    let body = generation_body(&catalog, "uncapped", &agent("build"));
+
+    assert_eq!(
+        body.get("max_tokens"),
+        Some(&serde_json::json!(32_000)),
+        "an absent `limit.output` deserialises to 0, and `max_tokens: 0` asks the model \
+         for an empty completion"
+    );
+}
+
+#[test]
+fn a_configured_output_limit_outranks_the_catalogs_own() {
+    let catalog = generation_catalog(
+        "capped",
+        Some(16_384),
+        serde_json::json!({
+            "baseURL": "https://example.invalid/v1",
+            "maxTokens": 2_048
+        }),
+    );
+    let body = generation_body(&catalog, "capped", &agent("build"));
+
+    assert_eq!(
+        body.get("max_tokens"),
+        Some(&serde_json::json!(2_048)),
+        "the catalog default overwrote an explicitly configured cap, so a user lowering \
+         `maxTokens` to control cost had no way to do it"
+    );
+}
+
+#[test]
+fn an_agents_sampling_declarations_reach_the_request_body() {
+    let catalog = generation_catalog(
+        "capped",
+        Some(16_384),
+        serde_json::json!({
+            "baseURL": "https://example.invalid/v1"
+        }),
+    );
+    let tuned = configured_agent(serde_json::json!({
+        "model": "stub/capped",
+        "temperature": 0.21,
+        "top_p": 0.87
+    }));
+    let body = generation_body(&catalog, "capped", &tuned);
+
+    assert_eq!(
+        body.get("temperature"),
+        Some(&serde_json::json!(0.21)),
+        "`agent.tuned.temperature` was parsed, merged, and listed, and then the request \
+         went out on the provider's default"
+    );
+    assert_eq!(
+        body.get("top_p"),
+        Some(&serde_json::json!(0.87)),
+        "`top_p` is the config spelling and `topP` the option spelling; a request \
+         missing the field means the rename was dropped rather than applied"
+    );
+}
+
+#[test]
+fn an_agents_option_bag_reaches_the_provider_and_can_override_the_cap() {
+    let catalog = generation_catalog(
+        "capped",
+        Some(16_384),
+        serde_json::json!({
+            "baseURL": "https://example.invalid/v1"
+        }),
+    );
+    let tuned = configured_agent(serde_json::json!({
+        "model": "stub/capped",
+        "options": {
+            "maxTokens": 4_096,
+            "toolChoice": "required",
+            "extraBody": {"service_tier": "flex"}
+        }
+    }));
+    let body = generation_body(&catalog, "capped", &tuned);
+
+    assert_eq!(
+        body.get("max_tokens"),
+        Some(&serde_json::json!(4_096)),
+        "`agent.tuned.options` never reached the provider, so an agent could not raise \
+         or lower the cap the catalog set"
+    );
+    assert_eq!(
+        body.get("tool_choice"),
+        Some(&serde_json::json!("required")),
+        "a configured `toolChoice` was accepted and dropped, leaving the model free to \
+         answer without calling the tool the agent required"
+    );
+    assert_eq!(
+        body.get("service_tier"),
+        Some(&serde_json::json!("flex")),
+        "`extraBody` inside an agent's options is the documented channel for a \
+         provider-specific body key, and it did not arrive"
+    );
+}
+
+#[test]
+fn no_tool_choice_is_sent_when_none_was_configured() {
+    let catalog = generation_catalog(
+        "capped",
+        Some(16_384),
+        serde_json::json!({
+            "baseURL": "https://example.invalid/v1"
+        }),
+    );
+    let body = generation_body(&catalog, "capped", &agent("build"));
+
+    assert_eq!(
+        body.get("tool_choice"),
+        None,
+        "`auto` is what OpenAI documents as the default when tools are present, so \
+         sending it unprompted changes the bytes without changing the behaviour — and \
+         asks it of endpoints that reject a value they do not implement"
+    );
+}
+
+#[test]
+fn an_agents_variant_selects_the_models_declared_reasoning_options() {
+    let catalog = generation_catalog(
+        "reasoner",
+        Some(16_384),
+        serde_json::json!({
+            "baseURL": "https://example.invalid/v1"
+        }),
+    );
+    let reasoner = configured_agent(serde_json::json!({
+        "model": "stub/reasoner",
+        "variant": "high"
+    }));
+    let body = generation_body(&catalog, "reasoner", &reasoner);
+
+    assert_eq!(
+        body.get("reasoning_effort"),
+        Some(&serde_json::json!("high")),
+        "`agent.reasoner.variant` was accepted and never resolved, so an agent \
+         configured to think hard reasoned at the provider's default"
+    );
+}
+
+#[test]
+fn a_variant_is_ignored_on_a_model_the_agent_did_not_declare() {
+    let catalog = generation_catalog(
+        "reasoner",
+        Some(16_384),
+        serde_json::json!({
+            "baseURL": "https://example.invalid/v1"
+        }),
+    );
+    let elsewhere = configured_agent(serde_json::json!({
+        "model": "stub/other-model",
+        "variant": "high"
+    }));
+    let body = generation_body(&catalog, "reasoner", &elsewhere);
+
+    assert_eq!(
+        body.get("reasoning_effort"),
+        None,
+        "a variant names a level the agent's OWN model declares; carried onto a model \
+         switched to by hand it selects a level that name does not mean on this model"
+    );
+}
+
+#[test]
+fn a_session_chosen_effort_outranks_the_agents_variant() {
+    let catalog = generation_catalog(
+        "reasoner",
+        Some(16_384),
+        serde_json::json!({
+            "baseURL": "https://example.invalid/v1"
+        }),
+    );
+    let reasoner = configured_agent(serde_json::json!({
+        "model": "stub/reasoner",
+        "variant": "high"
+    }));
+
+    assert_eq!(
+        turn_effort(
+            Some(zuno_llm::effort::ReasoningEffort::Low),
+            &reasoner,
+            "stub",
+            "reasoner"
+        ),
+        Some(zuno_llm::effort::ReasoningEffort::Low),
+        "the effort picker is a live user action and the agent's variant a configured \
+         default, so the picker must win"
+    );
+    let _ = catalog;
+}
+
+#[test]
+fn the_generation_controls_are_wired_into_the_turns_own_resolution() {
+    let turn = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd/turn.rs"),
+    )
+    .expect("turn.rs is readable");
+
+    assert!(
+        turn.contains("spec: with_agent_options(model_spec("),
+        "`TurnPlan::resolve` no longer overlays the agent's options onto the resolved \
+         spec, so `temperature`, `top_p` and `options` are parsed, listed, and dropped \
+         — the defect this pair of tests exists to catch. A behavioural test alone \
+         cannot see it, because it calls the helper the turn stopped calling."
+    );
+    assert!(
+        turn.contains("turn_effort(options.effort, &agent,"),
+        "`TurnPlan::resolve` no longer consults the agent's `variant`, so an agent \
+         configured to reason at one level runs at the provider's default"
+    );
+    assert!(
+        turn.contains("generation::MAX_TOKENS, json!(output_ceiling(model))"),
+        "`model_spec` no longer defaults the output cap from the catalog, so every \
+         request runs uncapped"
+    );
+}

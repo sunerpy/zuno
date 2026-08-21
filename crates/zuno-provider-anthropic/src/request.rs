@@ -45,18 +45,16 @@ pub fn build_request_body(
         root.insert("messages".to_owned(), Value::Array(wire_messages));
     }
 
-    if let Some(temperature) = config.temperature() {
-        let number = if temperature.fract() == 0.0
-            && temperature >= i64::MIN as f64
-            && temperature <= i64::MAX as f64
-        {
-            serde_json::Number::from(temperature as i64)
-        } else {
-            serde_json::Number::from_f64(temperature).ok_or_else(|| {
-                ProviderError::fatal(RequestShapeError::InvalidTemperature(temperature))
-            })?
-        };
-        root.insert("temperature".to_owned(), Value::Number(number));
+    for (field, value) in [
+        ("temperature", config.temperature()),
+        ("top_p", config.top_p()),
+    ] {
+        if let Some(value) = value {
+            root.insert(
+                field.to_owned(),
+                Value::Number(finite_number(field, value)?),
+            );
+        }
     }
     if !config.tools().is_empty() {
         root.insert("tools".to_owned(), Value::Array(config.tools().to_vec()));
@@ -193,6 +191,26 @@ fn add_last_message_cache_breakpoint(messages: &mut [Value]) -> bool {
     true
 }
 
+/// `value` as a JSON number, preferring an integer encoding when it is whole.
+///
+/// The integer branch is not cosmetic: `serde_json` renders `1.0` as `1.0`, and a
+/// `temperature` of `1.0` therefore reached the wire as a float where the vendor's
+/// own SDK sends `1`. The `i64` range check guards the cast, and a non-finite value
+/// has no JSON encoding at all, so it is refused by name rather than silently
+/// serialised as `null`.
+fn finite_number(field: &'static str, value: f64) -> Result<serde_json::Number, ProviderError> {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the branch is entered only for a whole value already range-checked \
+                  against i64"
+    )]
+    if value.fract() == 0.0 && value >= i64::MIN as f64 && value <= i64::MAX as f64 {
+        return Ok(serde_json::Number::from(value as i64));
+    }
+    serde_json::Number::from_f64(value)
+        .ok_or_else(|| ProviderError::fatal(RequestShapeError::NotFinite(field, value)))
+}
+
 fn add_cache_control(block: &mut Value) {
     if let Some(object) = block.as_object_mut() {
         object.insert("cache_control".to_owned(), json!({ "type": "ephemeral" }));
@@ -205,7 +223,7 @@ enum RequestShapeError {
     SystemMessageInConversation,
     MissingRedactedThinkingData,
     ForeignEncryptedReasoning,
-    InvalidTemperature(f64),
+    NotFinite(&'static str, f64),
 }
 
 impl fmt::Display for RequestShapeError {
@@ -223,8 +241,8 @@ impl fmt::Display for RequestShapeError {
             Self::ForeignEncryptedReasoning => formatter.write_str(
                 "provider-encrypted reasoning from another provider cannot be sent to Anthropic",
             ),
-            Self::InvalidTemperature(value) => {
-                write!(formatter, "Anthropic temperature is not finite: {value}")
+            Self::NotFinite(field, value) => {
+                write!(formatter, "Anthropic {field} is not finite: {value}")
             }
         }
     }
@@ -310,6 +328,69 @@ mod tests {
             body["messages"][0]["content"][0]
                 .get("thought_signature")
                 .is_none()
+        );
+    }
+
+    /// The body a provider configured from an option bag sends.
+    ///
+    /// Through `AnthropicConfig::from_spec` rather than the `with_*` builders,
+    /// because the bag is what the composition root writes: a test using the
+    /// builders would keep passing if `from_spec` stopped reading a key.
+    fn body_from_options(options: serde_json::Value) -> Value {
+        let mut spec = zuno_llm::registry::Spec::new("anthropic");
+        for (name, value) in options.as_object().expect("options are an object") {
+            spec = spec.with_option(name.clone(), value.clone());
+        }
+        let request = CompletionRequest::new(
+            "claude-sonnet-4-6",
+            vec![Message::new(Role::User, "Say hello.")],
+        );
+        build_request_body(&request, &AnthropicConfig::from_spec(spec)).expect("request")
+    }
+
+    #[test]
+    fn the_generation_controls_reach_the_messages_body() {
+        let body = body_from_options(json!({
+            "maxTokens": 8_192,
+            "temperature": 0.3,
+            "topP": 0.9
+        }));
+
+        assert_eq!(body["max_tokens"], json!(8_192));
+        assert_eq!(body["temperature"], json!(0.3));
+        assert_eq!(
+            body["top_p"],
+            json!(0.9),
+            "`top_p` is one of the four sampling fields `anthropic-messages.ts:546-549` \
+             writes, and this build had no field to carry it, so a configured cutoff was \
+             accepted and dropped"
+        );
+    }
+
+    #[test]
+    fn a_whole_sampling_value_is_sent_as_an_integer() {
+        let body = body_from_options(json!({"temperature": 1.0, "topP": 1.0}));
+
+        assert_eq!(
+            serde_json::to_string(&body["temperature"]).expect("temperature serialises"),
+            "1",
+            "`1.0` renders as `1.0` unless the whole-number branch converts it, and the \
+             vendor's own SDK sends `1`"
+        );
+        assert_eq!(
+            serde_json::to_string(&body["top_p"]).expect("top_p serialises"),
+            "1"
+        );
+    }
+
+    #[test]
+    fn an_unset_sampling_control_writes_no_field() {
+        let body = body_from_options(json!({"maxTokens": 8_192}));
+
+        assert!(
+            body.get("temperature").is_none() && body.get("top_p").is_none(),
+            "an omitted control must stay omitted, or every request would pin a value \
+             the user never chose"
         );
     }
 }
