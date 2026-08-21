@@ -13,6 +13,29 @@
 //! 3. **`reasoning_content` is echoed only when the model requires it.** Sending it
 //!    unconditionally pays tokens on every later turn for a field most vendors did
 //!    not send and some reject.
+//! 4. **Visible text never shares an assistant message with tool calls**, unless
+//!    reasoning is echoed in band by rule 3. A gateway fronting an Anthropic-family
+//!    model has nowhere in this wire shape to put the reasoning it sealed, so it
+//!    seals it *into the tool call's id* and re-expands it immediately before that
+//!    call on replay. The reconstructed turn is therefore `content`, then
+//!    `[thinking, tool_use]` — and Anthropic requires replayed thinking to be the
+//!    **first** content of its assistant message. Merging the two makes the
+//!    reasoning un-first, which such a gateway rejects outright:
+//!
+//!    ```text
+//!    HTTP 400 assistant reasoning prefix does not match the reasoning capsule
+//!    ```
+//!
+//!    Measured against a live gateway: the merged shape is a deterministic 400,
+//!    while the split shape and a text-dropping shape both return 200. Splitting is
+//!    what this module does, because dropping the text would silently discard the
+//!    model's own words mid-turn. When rule 3 applies the split is not needed and
+//!    not taken — `reasoning_content` positions the reasoning explicitly, so that
+//!    vendor has no capsule to re-expand and wants text on the same message.
+//!
+//!    The condition is structural, not a model or gateway name: any turn that has
+//!    both text and tool calls is replayed this way, for every provider on this
+//!    surface.
 //!
 //! # What `extra_body` may not overwrite
 //!
@@ -501,6 +524,18 @@ fn translate_assistant(message: &Message, quirks: &Quirks) -> Vec<Value> {
 
     // Rule 3: echo reasoning only when this model requires it.
     let echo = quirks.reasoning_protocol && !reasoning.is_empty();
+
+    // Rule 4: text never shares a message with tool calls unless reasoning is
+    // echoed in band. See the module header.
+    if !echo && !text.is_empty() && !tool_calls.is_empty() {
+        let mut calls = Map::new();
+        calls.insert("role".to_owned(), json!("assistant"));
+        calls.insert("content".to_owned(), Value::Null);
+        calls.insert("tool_calls".to_owned(), Value::Array(tool_calls));
+        wire.insert("content".to_owned(), json!(text));
+        return vec![Value::Object(wire), Value::Object(calls)];
+    }
+
     if !text.is_empty() {
         wire.insert("content".to_owned(), json!(text));
     } else if !echo {
@@ -765,6 +800,109 @@ mod tests {
             wire["tool_calls"][0]["function"]["arguments"],
             json!("{\"city\":\"Paris\"}")
         );
+    }
+
+    /// An assistant turn shaped like the one the live 400 was produced by: the
+    /// model's visible text, then a tool call whose id is a gateway reasoning
+    /// capsule rather than a plain id.
+    fn text_then_tool_call(id: &str) -> Message {
+        Message::from_content(
+            Role::Assistant,
+            vec![
+                RequestContentBlock::Text {
+                    text: "The go shim is broken. Let me check for a toolchain.".to_owned(),
+                },
+                RequestContentBlock::ToolUse {
+                    id: id.to_owned(),
+                    name: "bash".to_owned(),
+                    input: json!({"command": "command -v go"}),
+                    thought_signature: None,
+                },
+            ],
+        )
+    }
+
+    #[test]
+    fn text_and_tool_calls_are_split_so_replayed_reasoning_can_stay_first() {
+        // Rule 4. A gateway fronting an Anthropic-family model seals the turn's
+        // reasoning into the tool call's id and re-expands it just before that call,
+        // so merging text into the same message makes the reasoning un-first and the
+        // gateway answers `400 assistant reasoning prefix does not match the
+        // reasoning capsule`. Splitting keeps the text *and* keeps reasoning first.
+        let capsule_id = "brtc_v1.eyJ2ZXJzaW9uIjoxLCJ0b29sX3VzZV9pZCI6InRvb2x1c2VfMSJ9";
+        let built = RequestBody::new("gateway/claude", vec![text_then_tool_call(capsule_id)])
+            .build(&quirks(false, true));
+        let messages = built["messages"]
+            .as_array()
+            .expect("the chat surface carries messages");
+
+        assert_eq!(
+            messages.len(),
+            2,
+            "text and tool calls must not share one assistant message: {messages:#?}"
+        );
+        assert_eq!(messages[0]["role"], json!("assistant"));
+        assert_eq!(
+            messages[0]["content"],
+            json!("The go shim is broken. Let me check for a toolchain."),
+            "the model's own words must survive the split"
+        );
+        assert!(
+            messages[0].get("tool_calls").is_none(),
+            "the text message must not carry the calls too"
+        );
+
+        assert_eq!(messages[1]["role"], json!("assistant"));
+        assert_eq!(
+            messages[1]["content"],
+            Value::Null,
+            "the call-bearing message must leave room for the re-expanded reasoning"
+        );
+        assert_eq!(
+            messages[1]["tool_calls"][0]["id"],
+            json!(capsule_id),
+            "the capsule travels in the id and must be echoed byte-for-byte"
+        );
+        assert_eq!(
+            messages[1]["tool_calls"][0]["function"]["name"],
+            json!("bash")
+        );
+    }
+
+    #[test]
+    fn the_split_does_not_apply_when_reasoning_is_echoed_in_band() {
+        // With rule 3 in force the vendor takes reasoning in `reasoning_content`, so
+        // its position is explicit, there is no capsule to re-expand, and that wire
+        // wants the text on the same message. Splitting here would be churn at best.
+        let message = Message::from_content(
+            Role::Assistant,
+            vec![
+                RequestContentBlock::SignedThinking {
+                    thinking: "the user wants a toolchain".to_owned(),
+                    signature: String::new(),
+                },
+                RequestContentBlock::Text {
+                    text: "Checking now.".to_owned(),
+                },
+                RequestContentBlock::ToolUse {
+                    id: "call_1".to_owned(),
+                    name: "bash".to_owned(),
+                    input: json!({"command": "command -v go"}),
+                    thought_signature: None,
+                },
+            ],
+        );
+        let built = RequestBody::new("a-protocol-model", vec![message]).build(&quirks(true, true));
+        let messages = built["messages"]
+            .as_array()
+            .expect("the chat surface carries messages");
+        assert_eq!(messages.len(), 1, "rule 3 keeps the turn on one message");
+        assert_eq!(messages[0]["content"], json!("Checking now."));
+        assert_eq!(
+            messages[0]["reasoning_content"],
+            json!("the user wants a toolchain")
+        );
+        assert_eq!(messages[0]["tool_calls"][0]["id"], json!("call_1"));
     }
 
     #[test]
