@@ -20,6 +20,7 @@ mod tui_lsp;
 mod tui_permission;
 mod tui_question;
 mod tui_reference;
+mod tui_replay;
 mod turn;
 
 use crate::{

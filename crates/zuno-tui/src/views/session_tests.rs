@@ -6545,3 +6545,281 @@ fn delegating_message() -> Message {
         ],
     }
 }
+
+// ---------------------------------------------------------------------------
+// Resuming a session with `-s`: the persisted transcript is put back on screen.
+
+/// The two messages a resumed session's persisted history would project to.
+///
+/// Written as view messages rather than read from a database, because `zuno-tui` has no
+/// database dependency and must not acquire one: the projection from stored rows lives in
+/// `zuno-cli/src/cmd/tui_replay.rs` and is tested against a real SQLite session there.
+/// What this crate owns, and what these tests pin, is what a replayed transcript *does*
+/// to the screen.
+fn resumed_history() -> Vec<Message> {
+    let mut assistant = Message::new(Role::Assistant);
+    assistant
+        .parts
+        .push(crate::views::message::MessagePart::Text {
+            text: String::from("The guard clamps the width to the frame."),
+        });
+    assistant.id = Some(String::from("msg_assistant_0"));
+    let mut user = Message::user("what does the guard do");
+    user.id = Some(String::from("msg_user_0"));
+    vec![user, assistant]
+}
+
+/// A resumed session shows the conversation the model has, on the first frame.
+///
+/// This is the defect in full: the TUI built its `TranscriptView` empty while the next
+/// request rehydrated the whole session from the database, so `zuno -s <id>` showed a
+/// welcome screen and the reply quoted turns that were nowhere on it.
+///
+/// Both halves are asserted at both widths because either alone is satisfied by the
+/// defect. A screen that replayed the prose but still drew the wordmark would pass the
+/// first; one that suppressed the welcome without replaying anything would pass the
+/// second and be the original bug.
+#[test]
+fn a_resumed_session_shows_its_prior_turns_instead_of_the_welcome_screen() {
+    for width in [crate::views::SIDEBAR_MIN_WIDTH, 80] {
+        let (mut screen, _shutdown) = screen();
+        screen
+            .transcript_mut()
+            .transcript_mut()
+            .replay(resumed_history());
+
+        let rendered = rows(&render_offscreen(&mut screen, width, 32).expect("infallible"));
+        let joined = rendered.join("\n");
+
+        assert!(
+            rendered
+                .iter()
+                .any(|row| row.contains("what does the guard do")),
+            "at {width} columns the resumed prompt is not on screen:\n{joined}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|row| row.contains("The guard clamps the width")),
+            "at {width} columns the resumed reply is not on screen:\n{joined}"
+        );
+        assert!(
+            !rendered.iter().any(|row| row.contains("ZUNO")),
+            "at {width} columns a resumed conversation still draws the wordmark, so the user \
+             reads a fresh start:\n{joined}"
+        );
+        assert!(
+            !rendered.iter().any(|row| row.contains("/model")),
+            "at {width} columns a resumed conversation still draws the welcome hint grid:\n\
+             {joined}"
+        );
+    }
+}
+
+/// The welcome guard reads `true` on a replayed transcript, which is what un-hides the panel.
+///
+/// Asserted on a real frame and located by a service only the ambient panel names, for the
+/// reason `the_welcome_surface_survives_a_startup_notice` records: `Context` and `MCP` also
+/// occur in the welcome census, so finding either would prove nothing.
+#[test]
+fn a_resumed_session_draws_the_sidebar_on_its_first_frame() {
+    let (mut screen, _shutdown) = screen();
+    screen.sidebar_mut().ambient_mut().lsp = vec![crate::views::ambient::Service::new(
+        "rust-analyzer",
+        crate::views::ambient::Health::Ready,
+    )];
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .replay(resumed_history());
+
+    assert!(
+        screen.transcript_mut().transcript().conversation_started(),
+        "a replayed conversation that does not count as started keeps the welcome screen"
+    );
+    let rendered = rows(
+        &render_offscreen(&mut screen, crate::views::SIDEBAR_MIN_WIDTH, 32).expect("infallible"),
+    );
+    assert!(
+        rendered.iter().any(|row| row.contains("rust-analyzer")),
+        "a resumed session opened without its ambient panel:\n{}",
+        rendered.join("\n")
+    );
+}
+
+/// PR #23's title and the replayed transcript coexist, which is the whole resumed frame.
+///
+/// The two arrived separately — the title in PR #23, the transcript here — and the panel
+/// that carries the name is only drawn once a transcript exists beside it. So a resume is
+/// the first configuration in which both are on screen at once, and this is the test that
+/// says so rather than trusting two features that were never rendered together.
+#[test]
+fn a_resumed_session_states_its_name_above_the_transcript_it_replayed() {
+    let projection =
+        crate::views::ambient::SessionTitle::new(Some(String::from("Explaining the width guard")));
+    let (sender, _shutdown) = terminal_event_channel();
+    let mut screen =
+        SessionScreen::new(ViewContext::defaults(), sender).with_session_title(projection);
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .replay(resumed_history());
+
+    let rendered = rows(
+        &render_offscreen(&mut screen, crate::views::SIDEBAR_MIN_WIDTH, 32).expect("infallible"),
+    );
+    let joined = rendered.join("\n");
+    assert!(
+        rendered
+            .iter()
+            .any(|row| row.contains("Explaining the width guard")),
+        "the name a resumed session already had is not on its first frame:\n{joined}"
+    );
+    assert!(
+        rendered
+            .iter()
+            .any(|row| row.contains("what does the guard do")),
+        "the title is shown but the transcript it names is not:\n{joined}"
+    );
+}
+
+/// A startup notice still gets the welcome screen when nothing was replayed.
+///
+/// The regression guard for PR #23's fix, aimed at the ordering this change introduced:
+/// `replay` runs *before* the notices in `tui.rs`, so a fresh session replays an empty
+/// list and must be indistinguishable from one that never called `replay` at all. An
+/// implementation that counted the call rather than the messages would fail here.
+#[test]
+fn replaying_nothing_leaves_a_fresh_sessions_welcome_screen_intact() {
+    let (mut screen, _shutdown) = screen();
+    screen.transcript_mut().transcript_mut().replay(Vec::new());
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .push(Message::notice(
+            "warning: theme `nord` was not found; falling back to the built-in palette",
+        ));
+
+    assert_eq!(screen.transcript_mut().transcript().replayed(), 0);
+    assert!(
+        !screen.transcript_mut().transcript().conversation_started(),
+        "an empty replay must not claim a conversation began"
+    );
+    let rendered = rows(&render_offscreen(&mut screen, 120, 32).expect("infallible"));
+    assert!(
+        rendered.iter().any(|row| row.contains("/model")),
+        "an empty replay took the welcome hint grid with it:\n{}",
+        rendered.join("\n")
+    );
+}
+
+/// Replay refuses a transcript that already holds messages, so the prefix is a fact.
+#[test]
+fn replay_declines_a_transcript_that_has_already_started() {
+    let (mut screen, _shutdown) = screen();
+    let transcript = screen.transcript_mut().transcript_mut();
+    transcript.push(Message::user("typed in this process"));
+    transcript.replay(resumed_history());
+
+    assert_eq!(
+        transcript.replayed(),
+        0,
+        "a replay after the first live message would make `replayed` a lie about which \
+         messages this process ran"
+    );
+    assert_eq!(transcript.messages().len(), 1);
+}
+
+/// The message menu withholds revert on a replayed prompt, newest included.
+///
+/// `SnapshotHistory` is rebuilt empty on every launch, so the worktree checkpoint a
+/// replayed turn opened belongs to a process that has exited. Offering the row there would
+/// produce a menu entry whose only possible outcome is `nothing to undo` — the exact
+/// failure mode `message_actions` documents and this codebase has already paid for.
+///
+/// `Copy` is asserted to remain, because a test that only counted rows would also pass
+/// against a menu that stopped opening at all.
+#[test]
+fn the_message_menu_offers_no_revert_on_a_replayed_prompt() {
+    for width in [120u16, 80] {
+        let (mut screen, _shutdown) = screen();
+        screen
+            .transcript_mut()
+            .transcript_mut()
+            .replay(resumed_history());
+        let rendered = rows(&render_offscreen(&mut screen, width, 32).expect("infallible"));
+        let row = u16::try_from(
+            rendered
+                .iter()
+                .position(|row| row.contains("what does the guard do"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "at {width} columns the replayed prompt is not drawn:\n{}",
+                        rendered.join("\n")
+                    )
+                }),
+        )
+        .expect("in frame");
+
+        assert!(
+            click_at(&mut screen, 3, row).redraw,
+            "at {width} columns a press on the replayed prompt was not consumed"
+        );
+        let mut opened = screen.drain_dialogs();
+        assert_eq!(opened.len(), 1, "at {width} columns no menu opened");
+        let mut offers = |needle: &str| {
+            opened[0]
+                .lines(60)
+                .iter()
+                .any(|line| line.spans.iter().any(|span| span.content.contains(needle)))
+        };
+        assert!(
+            offers("Copy"),
+            "at {width} columns the menu on a replayed prompt offers nothing at all, so the \
+             absence of revert proves nothing"
+        );
+        assert!(
+            !offers("Revert"),
+            "at {width} columns the menu offers revert on a prompt this process never ran, \
+             whose checkpoint no longer exists"
+        );
+    }
+}
+
+/// Revert returns on the first prompt this process actually ran.
+///
+/// The complement of the test above, and it is what keeps the gate from being "revert is
+/// gone": a resumed session that types a new prompt has a real checkpoint again, and the
+/// row must come back for it.
+#[test]
+fn the_message_menu_offers_revert_on_a_prompt_typed_after_a_resume() {
+    let (mut screen, _shutdown) = screen();
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .replay(resumed_history());
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .push(Message::user("now change the guard"));
+
+    let rendered = rows(&render_offscreen(&mut screen, 120, 32).expect("infallible"));
+    let row = u16::try_from(
+        rendered
+            .iter()
+            .position(|row| row.contains("now change the guard"))
+            .expect("the live prompt is drawn"),
+    )
+    .expect("in frame");
+    click_at(&mut screen, 3, row);
+    let mut opened = screen.drain_dialogs();
+
+    assert!(
+        opened[0].lines(60).iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.contains("Revert"))
+        }),
+        "the prompt this process ran has a live checkpoint and must still offer revert"
+    );
+}

@@ -950,6 +950,30 @@ impl TurnHost {
         Some(&self.session_title)
     }
 
+    /// The persisted history a resumed session opens with, exactly as the model will get it.
+    ///
+    /// [`zuno_engine::r#loop::hydrate_retained_history`] and not a second query, and that
+    /// is the whole point: it is the *same* function `run_turn` calls before it builds a
+    /// request, so the rows, their `(time_created, id)` order and the compaction boundary
+    /// are one decision rather than two that can drift. A surface reading
+    /// [`zuno_db::message::MessageStore::hydrate_session`] instead would show a compacted
+    /// head the model has already forgotten — the same class of lie as showing nothing,
+    /// pointed the other way.
+    ///
+    /// Returned as stored rows rather than as view messages because this module is shared
+    /// with `zuno run`, which has no panel; the projection onto transcript parts lives in
+    /// `tui_replay`.
+    ///
+    /// # Errors
+    ///
+    /// Any query or decode failure from the two phases of the hydration. A caller reports
+    /// it and opens the session anyway — see `tui_replay::replay_notice`.
+    pub(crate) fn resumed_history(
+        &self,
+    ) -> Result<Vec<zuno_db::message::MessageWithParts>, zuno_error::DbError> {
+        zuno_engine::r#loop::hydrate_retained_history(&self.connection, &self.session_id)
+    }
+
     /// Carry notes a caller produced *before* the host existed onto the transcript.
     ///
     /// An MCP server that fails to connect is discovered before the host is built —
