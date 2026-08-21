@@ -107,18 +107,14 @@ fn is_hex_color(value: &str) -> bool {
     digits.len() == 6 && digits.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Keys that reach [`AgentConfig::extra`] but must NOT be swept into `options`.
+/// Keys carried outside the provider-options map.
 ///
-/// All three are in the oracle's `KNOWN_KEYS` (`config/agent.ts:43-60`), so the
-/// oracle never sweeps them either:
-///
-/// * `name` — carried by the map key or the Markdown frontmatter, not a schema
-///   field even in the oracle.
-/// * `tools` and `maxSteps` — deprecated. This schema deliberately does not name
-///   them (they belong to the legacy-rejection pass), but sweeping them into
-///   provider options would be worse than either accepting or rejecting them:
-///   a deprecated key would silently become an API argument.
-pub const SWEEP_EXEMPT_KEYS: &[&str] = &["name", "tools", "maxSteps"];
+/// `name` belongs to the containing map or Markdown frontmatter and is therefore
+/// preserved in [`AgentConfig::extra`] without becoming a provider option.
+pub const SWEEP_EXEMPT_KEYS: &[&str] = &["name"];
+
+/// Field names that are not part of Zuno's agent schema.
+pub const UNSUPPORTED_AGENT_KEYS: &[&str] = &["tools", "maxSteps"];
 
 /// One entry of the `agent` map, or one Markdown agent definition's frontmatter.
 ///
@@ -168,15 +164,32 @@ pub struct AgentConfig {
     pub permission: Option<PermissionConfig>,
     /// Every key this struct does not name, verbatim and unswept.
     ///
-    /// A later pass reads this to reject deprecated keys; the sweep has already
-    /// copied the non-exempt ones into [`options`](Self::options).
+    /// Provider-specific keys are also copied into [`options`](Self::options).
     #[serde(flatten)]
     pub extra: JsonMap,
 }
 
 impl<'de> Deserialize<'de> for AgentConfig {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Ok(AgentWire::deserialize(deserializer)?.sweep())
+        let wire = AgentWire::deserialize(deserializer)?;
+        for key in UNSUPPORTED_AGENT_KEYS {
+            if wire.extra.contains_key(*key) {
+                let replacement = match *key {
+                    "tools" => "permission",
+                    "maxSteps" => "steps",
+                    _ => unreachable!("unsupported agent keys have a native replacement"),
+                };
+                return Err(de::Error::custom(format!(
+                    "unsupported agent field `{key}`; use `{replacement}` instead"
+                )));
+            }
+        }
+        if wire.variant.is_some() && wire.model.is_none() {
+            return Err(de::Error::custom(
+                "agent `variant` requires an explicit `model`",
+            ));
+        }
+        Ok(wire.sweep())
     }
 }
 
@@ -200,9 +213,7 @@ struct AgentWire {
 }
 
 impl AgentWire {
-    /// `normalize` from `config/agent.ts:62-81`, minus the parts that belong to
-    /// later passes: the `tools`-to-`permission` translation and the
-    /// `maxSteps`-to-`steps` fallback both act on keys this schema rejects.
+    /// Copy provider-specific top-level keys into the provider-options map.
     fn sweep(self) -> AgentConfig {
         let mut options = self.options;
         for (key, value) in &self.extra {

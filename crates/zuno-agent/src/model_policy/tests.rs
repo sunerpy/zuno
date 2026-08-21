@@ -38,14 +38,14 @@ impl ModelAvailability for Only {
 
 fn house() -> ModelPreset {
     ModelPreset::named("house")
-        .with_agent("orchestrator", ModelChoice::new(LARGE).with_variant("high"))
+        .with_agent("build", ModelChoice::new(LARGE).with_variant("high"))
         .with_agent("explorer", ModelChoice::new(SMALL).with_variant("low"))
         .with_category("cheap", ModelChoice::new(SMALL))
 }
 
 fn thrifty() -> ModelPreset {
     ModelPreset::named("thrifty")
-        .with_agent("orchestrator", ModelChoice::new(SMALL))
+        .with_agent("build", ModelChoice::new(SMALL))
         .with_agent("explorer", ModelChoice::new(SMALL))
         .with_category("deliberate", ModelChoice::new(LARGE))
 }
@@ -130,7 +130,7 @@ fn a_selected_preset_overrides_the_session_model() {
         .with_library(&library)
         .with_session_model(session_model());
 
-    let orchestrator = policy.resolve("orchestrator", &everything());
+    let orchestrator = policy.resolve("build", &everything());
     assert_eq!(
         orchestrator.model,
         Some(ModelChoice::new(LARGE).with_variant("high"))
@@ -165,7 +165,7 @@ fn switching_presets_changes_every_agent_with_no_code_change() {
         .with_library(&thrifty_library)
         .with_session_model(session_model());
 
-    let house_models: Vec<Option<String>> = ["orchestrator", "explorer"]
+    let house_models: Vec<Option<String>> = ["build", "explorer"]
         .iter()
         .map(|agent| {
             with_house
@@ -174,7 +174,7 @@ fn switching_presets_changes_every_agent_with_no_code_change() {
                 .map(|choice| choice.model)
         })
         .collect();
-    let thrifty_models: Vec<Option<String>> = ["orchestrator", "explorer"]
+    let thrifty_models: Vec<Option<String>> = ["build", "explorer"]
         .iter()
         .map(|agent| {
             with_thrifty
@@ -205,9 +205,9 @@ fn a_per_agent_override_beats_the_preset() {
     let policy = ModelPolicy::new()
         .with_library(&library)
         .with_session_model(session_model())
-        .with_agent_override("orchestrator", ModelChoice::new(SMALL).with_variant("max"));
+        .with_agent_override("build", ModelChoice::new(SMALL).with_variant("max"));
 
-    let resolved = policy.resolve("orchestrator", &everything());
+    let resolved = policy.resolve("build", &everything());
     assert_eq!(
         resolved.model,
         Some(ModelChoice::new(SMALL).with_variant("max")),
@@ -231,8 +231,7 @@ fn overrides_come_from_the_agent_config_keys_that_already_exist() {
     // a user needing a second mechanism for something they have already configured.
     let agents: OrderedMap<AgentConfig> = serde_json::from_value(json!({
         "worker": { "model": LARGE, "variant": "xhigh" },
-        "explorer": { "temperature": 0.2 },
-        "advisor": { "variant": "high" }
+        "explorer": { "temperature": 0.2 }
     }))
     .expect("agent config parses");
 
@@ -244,13 +243,10 @@ fn overrides_come_from_the_agent_config_keys_that_already_exist() {
         policy.resolve("worker", &everything()).model,
         Some(ModelChoice::new(LARGE).with_variant("xhigh"))
     );
-    // No `model` key is not an override: there is nothing to attach a variant to, so
-    // the rung is skipped rather than half-applied.
-    for silent in ["explorer", "advisor"] {
-        let resolved = policy.resolve(silent, &everything());
-        assert_eq!(resolved.source, ModelSource::SessionModel, "{silent}");
-        assert_eq!(resolved.model, Some(session_model()), "{silent}");
-    }
+    // No `model` key is not an override; unrelated agent settings leave the rung silent.
+    let resolved = policy.resolve("explorer", &everything());
+    assert_eq!(resolved.source, ModelSource::SessionModel);
+    assert_eq!(resolved.model, Some(session_model()));
 }
 
 // ---------------------------------------------------------------------------
@@ -422,7 +418,7 @@ fn a_stale_preset_name_is_a_diagnostic_not_a_startup_failure() {
         .with_library(&library)
         .with_session_model(session_model());
 
-    let resolved = policy.resolve("orchestrator", &everything());
+    let resolved = policy.resolve("build", &everything());
     assert_eq!(resolved.model, Some(session_model()));
     assert_eq!(
         resolved.diagnostics,
@@ -546,7 +542,7 @@ fn a_preset_document_reads_the_flat_shape_an_installer_writes() {
           "preset": "installed",
           "presets": {{
             "installed": {{
-              "orchestrator": {{ "model": "{LARGE}", "variant": "xhigh" }},
+              "build": {{ "model": "{LARGE}", "variant": "xhigh" }},
               "explorer": "{SMALL}"
             }}
           }}
@@ -559,9 +555,9 @@ fn a_preset_document_reads_the_flat_shape_an_installer_writes() {
     assert_eq!(library.selected(), Some("installed"));
 
     let preset = library.active().expect("the selected preset exists");
-    assert_eq!(preset.agents(), vec!["explorer", "orchestrator"]);
+    assert_eq!(preset.agents(), vec!["build", "explorer"]);
     assert_eq!(
-        preset.agent("orchestrator"),
+        preset.agent("build"),
         Some(&ModelChoice::new(LARGE).with_variant("xhigh"))
     );
     assert_eq!(
@@ -834,7 +830,7 @@ fn a_presets_variant_reaches_effort_resolution_unchanged() {
     let policy = ModelPolicy::new()
         .with_library(&library)
         .with_session_model(session_model());
-    let resolved = policy.resolve("orchestrator", &everything());
+    let resolved = policy.resolve("build", &everything());
     let choice = resolved.model.expect("the preset named a model");
 
     let (outcome, diagnostic) = resolve_variant(

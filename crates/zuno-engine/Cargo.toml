@@ -12,6 +12,7 @@ publish.workspace = true
 [dependencies]
 async-trait = { workspace = true }
 futures = { workspace = true }
+hex = { workspace = true }
 zuno-config = { workspace = true }
 zuno-db = { workspace = true }
 zuno-error = { workspace = true }
@@ -21,6 +22,7 @@ zuno-runtime = { workspace = true }
 zuno-tool = { workspace = true }
 jsonschema = { version = "=0.37.1", default-features = false }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }

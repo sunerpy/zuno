@@ -13,15 +13,6 @@ use std::time::Duration;
 /// match on the text of a message.
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
-    /// A database exists under Zuno's pre-rename filename and must be moved explicitly.
-    #[error(
-        "legacy Zuno database {old_path} was not opened; move it to {new_path} before continuing"
-    )]
-    LegacyDatabase {
-        old_path: PathBuf,
-        new_path: PathBuf,
-    },
-
     /// The database file could not be opened or created.
     #[error("database {path} could not be opened")]
     Open {
@@ -88,8 +79,7 @@ impl DbError {
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::Busy { retry_after } => *retry_after,
-            Self::LegacyDatabase { .. }
-            | Self::Open { .. }
+            Self::Open { .. }
             | Self::Migration { .. }
             | Self::MigrationTooNew { .. }
             | Self::Query { .. }
@@ -105,8 +95,7 @@ impl Recoverable for DbError {
             Self::Busy { retry_after } => Recovery::Retry {
                 after: *retry_after,
             },
-            Self::LegacyDatabase { .. }
-            | Self::Open { .. }
+            Self::Open { .. }
             | Self::Migration { .. }
             | Self::MigrationTooNew { .. }
             | Self::Query { .. }
@@ -123,12 +112,8 @@ mod tests {
     #[test]
     fn busy_is_the_only_retryable_variant() {
         let errors = [
-            DbError::LegacyDatabase {
-                old_path: PathBuf::from("opencode.db"),
-                new_path: PathBuf::from("zuno.db"),
-            },
             DbError::Open {
-                path: PathBuf::from("opencode.db"),
+                path: PathBuf::from("zuno.db"),
                 source: Box::new(std::io::Error::other("permission denied")),
             },
             DbError::Migration {

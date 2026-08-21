@@ -1,38 +1,25 @@
 use std::collections::VecDeque;
 
-use axum::extract::{Extension, Path, Query, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use futures::stream;
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 use crate::request_broker::SessionRequestObserver;
 use crate::{Delivery, ServerServices};
 
 use super::{EventCursor, EventService, EventStreamError, SessionSubscription, StreamEvent};
 
-/// Builds the legacy event route and both upstream `/api` SSE operations.
+/// Builds Zuno's global and session-scoped SSE operations.
 pub fn events_router(service: EventService) -> Router {
     Router::new()
-        .route("/event", get(stream_events))
         .route("/api/event", get(stream_global_events))
         .route("/api/session/{sessionID}/event", get(stream_session_events))
         .with_state(service)
-}
-
-#[derive(Debug, Deserialize)]
-struct EventQuery {
-    #[serde(rename = "sessionID")]
-    session_id: String,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct SessionEventQuery {
-    after: Option<i64>,
 }
 
 async fn stream_global_events(State(service): State<EventService>) -> Response {
@@ -50,36 +37,20 @@ async fn stream_session_events(
     State(service): State<EventService>,
     Extension(services): Extension<ServerServices>,
     Path(session_id): Path<String>,
-    Query(query): Query<SessionEventQuery>,
+    headers: HeaderMap,
 ) -> Result<Response, EventStreamError> {
-    if query.after.is_some_and(|after| after < 0) {
-        return Err(EventStreamError::InvalidCursor {
-            value: query.after.expect("checked as some").to_string(),
-        });
-    }
-    let cursor = Some(EventCursor {
-        session_id: session_id.clone(),
-        sequence: query.after.unwrap_or(0),
-    });
+    let cursor = cursor_from_headers(&headers)?;
     let subscription = service.subscribe(&session_id, cursor.as_ref()).await?;
     let observer = services.requests.observe_session(&session_id);
     let connection = SessionStream::new(subscription, observer);
     let stream = stream::unfold(connection, |mut connection| async move {
-        connection
-            .next_upstream_sse()
-            .await
-            .map(|event| (event, connection))
+        connection.next_sse().await.map(|event| (event, connection))
     });
     Ok(sse_response(stream, service.heartbeat_interval))
 }
 
-async fn stream_events(
-    State(service): State<EventService>,
-    Extension(services): Extension<ServerServices>,
-    Query(query): Query<EventQuery>,
-    headers: HeaderMap,
-) -> Result<Response, EventStreamError> {
-    let cursor = match headers.get("last-event-id") {
+fn cursor_from_headers(headers: &HeaderMap) -> Result<Option<EventCursor>, EventStreamError> {
+    Ok(match headers.get("last-event-id") {
         Some(value) => Some(
             value
                 .to_str()
@@ -89,16 +60,7 @@ async fn stream_events(
                 .parse::<EventCursor>()?,
         ),
         None => None,
-    };
-    let subscription = service
-        .subscribe(&query.session_id, cursor.as_ref())
-        .await?;
-    let observer = services.requests.observe_session(&query.session_id);
-    let connection = SessionStream::new(subscription, observer);
-    let stream = stream::unfold(connection, |mut connection| async move {
-        connection.next_sse().await.map(|event| (event, connection))
-    });
-    Ok(sse_response(stream, service.heartbeat_interval))
+    })
 }
 
 fn sse_response<S>(stream: S, heartbeat_interval: std::time::Duration) -> Response
@@ -136,7 +98,7 @@ impl GlobalStream {
             return Some(encode_connected());
         }
         match self.live.recv().await? {
-            Delivery::Event(event) => Some(encode_upstream_event(&event)),
+            Delivery::Event(event) => Some(encode_event(&event)),
             Delivery::Lagged { dropped } => Some(encode_global_lagged(dropped)),
         }
     }
@@ -191,49 +153,19 @@ impl SessionStream {
             }
         }
     }
-
-    async fn next_upstream_sse(&mut self) -> Option<Result<SseEvent, EventStreamError>> {
-        if self.finished {
-            return None;
-        }
-        if let Some(event) = self.replay.pop_front() {
-            self.last_cursor = Some(event.cursor.clone());
-            return Some(encode_upstream_event(&event));
-        }
-        loop {
-            match self.live.recv().await? {
-                Delivery::Event(event) if event.sequence() <= self.boundary => continue,
-                Delivery::Event(event) => {
-                    self.last_cursor = Some(event.cursor.clone());
-                    return Some(encode_upstream_event(&event));
-                }
-                Delivery::Lagged { dropped } => {
-                    self.finished = true;
-                    return Some(encode_lagged(
-                        &self.session_id,
-                        dropped,
-                        self.last_cursor.as_ref(),
-                    ));
-                }
-            }
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct WireEvent<'event> {
-    id: &'event str,
-    #[serde(rename = "type")]
-    event_type: &'event str,
-    properties: &'event Map<String, Value>,
 }
 
 fn encode_event(event: &StreamEvent) -> Result<SseEvent, EventStreamError> {
-    let data = serde_json::to_string(&WireEvent {
-        id: &event.id,
-        event_type: &event.event_type,
-        properties: &event.properties,
-    })?;
+    let data = serde_json::to_string(&json!({
+        "id": event.id,
+        "type": event.event_type,
+        "durable": {
+            "aggregateID": event.cursor.session_id,
+            "seq": event.cursor.sequence,
+            "version": event.version
+        },
+        "data": event.properties
+    }))?;
     Ok(SseEvent::default()
         .event("message")
         .id(event.cursor.to_string())
@@ -245,19 +177,6 @@ fn encode_connected() -> Result<SseEvent, EventStreamError> {
         "id": format!("evt_{}", uuid::Uuid::now_v7().simple()),
         "type": "server.connected",
         "data": {}
-    }))
-}
-
-fn encode_upstream_event(event: &StreamEvent) -> Result<SseEvent, EventStreamError> {
-    encode_data(json!({
-        "id": event.id,
-        "type": event.event_type,
-        "durable": {
-            "aggregateID": event.cursor.session_id,
-            "seq": event.cursor.sequence,
-            "version": event.version
-        },
-        "data": event.properties
     }))
 }
 
@@ -281,7 +200,7 @@ fn encode_lagged(
     let data = json!({
         "id": format!("evt_{}", uuid::Uuid::now_v7().simple()),
         "type": "server.stream.lagged",
-        "properties": {
+        "data": {
             "sessionID": session_id,
             "dropped": dropped,
             "lastCursor": last_cursor.map(ToString::to_string),

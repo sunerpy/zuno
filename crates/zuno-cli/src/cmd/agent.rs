@@ -130,7 +130,9 @@ pub(crate) fn resolved_rules(
                     rule("edit", &dynamic.relative_plan_glob, PermissionAction::Allow),
                 ]);
             }
-            "explore" => rules.extend(dynamic.readonly_external.clone()),
+            "explorer" | "librarian" | "advisor" | "looker" => {
+                rules.extend(dynamic.readonly_external.clone())
+            }
             _ => {}
         }
     }
@@ -177,7 +179,7 @@ fn default_rules(dynamic: &DynamicRules) -> Vec<Rule> {
 }
 
 fn reference_directories(config: &Config, directory: &Path) -> Vec<PathBuf> {
-    let declared = config.references.as_ref().or(config.reference.as_ref());
+    let declared = config.references.as_ref();
     ResolvedReferences::resolve(declared)
         .iter()
         .filter_map(|reference| match &reference.target {

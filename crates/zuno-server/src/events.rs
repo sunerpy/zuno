@@ -39,7 +39,7 @@ pub struct EventService {
 }
 
 impl EventService {
-    /// Creates a service over an initialized `opencode.db` pool.
+    /// Creates a service over an initialized Zuno session database pool.
     #[must_use]
     pub fn new(pool: Arc<Pool>, subscriber_capacity: usize) -> Self {
         Self {
@@ -105,17 +105,17 @@ impl EventService {
         Ok(EventPage { events, has_more })
     }
 
-    /// Projects one engine channel onto both the legacy process-local fan-out and
+    /// Projects one engine channel onto both the process-local fan-out and
     /// the durable HTTP event stream. The durable write happens before live HTTP
     /// delivery, so `/history` can always replay an event observed over SSE.
     pub async fn forward_engine_events(
         &self,
         session_id: &str,
-        legacy: &EventFanout<TurnEvent>,
+        local: &EventFanout<TurnEvent>,
         mut events: mpsc::Receiver<TurnEvent>,
     ) {
         while let Some(event) = events.recv().await {
-            legacy.publish(event.clone());
+            local.publish(event.clone());
             let projected = turn_event(&event);
             if let Err(error) = self.publish(session_id, projected).await {
                 eprintln!("failed to publish HTTP turn event for `{session_id}`: {error}");

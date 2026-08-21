@@ -12,6 +12,7 @@
 //! Retry, compaction, and the one-live-loop-per-session registry wrap the same
 //! [`run_turn`] entry point rather than copying its state machine.
 
+use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -21,6 +22,7 @@ use futures::StreamExt;
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 use uuid::Uuid;
+use zuno_db::event_log::{NewSessionEvent, append_with_connection};
 use zuno_db::inbox::SessionInbox;
 use zuno_db::message::{
     MessageRecord, MessageRole, MessageStore, MessageWithParts, PartKind, PartRecord,
@@ -34,10 +36,11 @@ use zuno_llm::event::{
 };
 use zuno_llm::registry::{ApiSurface, ProviderRegistry, Spec};
 use zuno_llm::sse::{StreamLimits, append_tool_input};
-use zuno_tool::{ToolDefinition, ToolOutput};
+use zuno_tool::{ToolDefinition, ToolOutput, ToolReplayPolicy};
 
 use crate::hooks::{HookMessageWithParts, NoopHooks, RequestHookInput, TurnHooks};
 use crate::interrupt::{InterruptSignal, SoftInterruptMessage};
+use crate::prompt::{PromptAssembly, PromptTraceSet};
 use crate::retry::{
     PROVIDER_RETRY_MAX_ATTEMPTS, ProviderRetryError, ProviderRetryPolicy, retry_provider,
 };
@@ -209,11 +212,24 @@ pub enum TurnOutcome {
     Completed {
         assistant_message_id: String,
         steps: u32,
+        /// Retryable tool failures not followed by a successful call to that tool.
+        unresolved_tool_failures: Vec<ToolFailureRecovery>,
     },
     Interrupted {
         assistant_message_id: Option<String>,
         steps: u32,
     },
+}
+
+/// Recovery information retained after a model-visible tool failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolFailureRecovery {
+    /// Tool whose most recent retryable failure remains unresolved.
+    pub tool: String,
+    /// Whether an identical call is safe to issue again.
+    pub replay_policy: ToolReplayPolicy,
+    /// Delay requested by the failed peer, when one was supplied.
+    pub retry_after: Option<Duration>,
 }
 
 /// A classified failure of the turn spine.
@@ -316,8 +332,7 @@ impl TurnError {
                 after: *retry_after,
             },
             Self::Database(
-                DbError::LegacyDatabase { .. }
-                | DbError::Open { .. }
+                DbError::Open { .. }
                 | DbError::Migration { .. }
                 | DbError::MigrationTooNew { .. }
                 | DbError::Query { .. }
@@ -358,17 +373,37 @@ impl TurnError {
 pub struct ResolvedAgent {
     pub name: String,
     pub system_prompt: String,
+    /// Ordered provenance for [`Self::system_prompt`].
+    pub prompt_assembly: PromptAssembly,
     pub max_steps: u32,
 }
 
 impl ResolvedAgent {
     #[must_use]
     pub fn new(name: impl Into<String>, system_prompt: impl Into<String>, max_steps: u32) -> Self {
+        let system_prompt = system_prompt.into();
+        let mut prompt_assembly = PromptAssembly::new();
+        prompt_assembly
+            .push(
+                "agent.resolved",
+                "AgentModelResolver",
+                system_prompt.clone(),
+            )
+            .expect("the built-in resolved prompt section id is valid");
         Self {
             name: name.into(),
-            system_prompt: system_prompt.into(),
+            system_prompt,
+            prompt_assembly,
             max_steps,
         }
+    }
+
+    /// Replace the opaque prompt with its ordered assembly.
+    #[must_use]
+    pub fn with_prompt_assembly(mut self, prompt_assembly: PromptAssembly) -> Self {
+        self.system_prompt = prompt_assembly.render();
+        self.prompt_assembly = prompt_assembly;
+        self
     }
 }
 
@@ -485,6 +520,7 @@ pub struct DispatchRequest {
 pub struct ToolDispatchResult {
     pub output: ToolOutput,
     pub is_error: bool,
+    pub recovery: Option<ToolFailureRecovery>,
 }
 
 impl ToolDispatchResult {
@@ -493,6 +529,7 @@ impl ToolDispatchResult {
         Self {
             output,
             is_error: false,
+            recovery: None,
         }
     }
 
@@ -501,6 +538,16 @@ impl ToolDispatchResult {
         Self {
             output,
             is_error: true,
+            recovery: None,
+        }
+    }
+
+    #[must_use]
+    pub fn retryable_error(output: ToolOutput, recovery: ToolFailureRecovery) -> Self {
+        Self {
+            output,
+            is_error: true,
+            recovery: Some(recovery),
         }
     }
 }
@@ -836,6 +883,8 @@ pub async fn run_turn(
     let mut steps = 0_u32;
     let mut last_assistant_id = None;
     let mut prompt_cache: Option<PromptCache<ToolDefinition>> = None;
+    let mut prompt_traces = PromptTraceSet::default();
+    let mut unresolved_tool_failures = BTreeMap::<String, ToolFailureRecovery>::new();
 
     loop {
         if context.interrupt.is_set() {
@@ -914,6 +963,15 @@ pub async fn run_turn(
             .await
             .map_err(TurnError::Hook)?;
         let system_prompt = system.join("\n");
+        if prompt_traces.insert(&system_prompt) {
+            let event = NewSessionEvent::new(
+                "session.prompt.assembled",
+                agent
+                    .prompt_assembly
+                    .event_properties(&agent.name, step, &system_prompt),
+            )?;
+            append_with_connection(context.connection, &request.session_id, event)?;
+        }
         let stable_history = if context.hooks.enabled() {
             let mut transformed = hook_messages(&history);
             context
@@ -1213,6 +1271,11 @@ pub async fn run_turn(
                         interrupt: context.interrupt.clone(),
                     })
                     .await;
+                if let Some(recovery) = dispatch.recovery.clone() {
+                    unresolved_tool_failures.insert(recovery.tool.clone(), recovery);
+                } else {
+                    unresolved_tool_failures.remove(&call.name);
+                }
                 persist_tool_result(
                     context.connection,
                     &request,
@@ -1280,6 +1343,7 @@ pub async fn run_turn(
         return Ok(TurnOutcome::Completed {
             assistant_message_id: assistant_id,
             steps,
+            unresolved_tool_failures: unresolved_tool_failures.into_values().collect(),
         });
     }
 }

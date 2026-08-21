@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::json;
 use zuno_error::ToolError;
 use zuno_search::GlobRequest;
-use zuno_tool::{PermissionAsk, ToolContext, ToolOutput, TypedTool};
+use zuno_tool::{PermissionAsk, ToolContext, ToolOutput, ToolReplayPolicy, TypedTool};
 
 /// The description the model reads, verbatim from `tool/glob.txt`.
 pub const DESCRIPTION: &str = include_str!("description/glob.txt");
@@ -56,6 +56,10 @@ impl TypedTool for GlobTool {
 
     fn description(&self) -> &str {
         DESCRIPTION
+    }
+
+    fn replay_policy(&self) -> ToolReplayPolicy {
+        ToolReplayPolicy::Safe
     }
 
     async fn run(&self, params: GlobParams, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
@@ -153,9 +157,11 @@ mod tests {
 
     #[test]
     fn the_schema_is_derived_and_names_the_oracles_parameters() {
-        let definition = erase(GlobTool::new(SearchTooling::new("/tmp"))).definition();
+        let tool = erase(GlobTool::new(SearchTooling::new("/tmp")));
+        let definition = tool.definition();
 
         assert_eq!(definition.id, "glob");
+        assert_eq!(tool.replay_policy(), ToolReplayPolicy::Safe);
         assert_eq!(
             definition.parameters["properties"]["pattern"]["type"],
             "string"

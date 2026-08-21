@@ -126,22 +126,6 @@ impl Cli {
     }
 }
 
-/// Remaining syntax owned by a later command implementation.
-///
-/// Keeping it opaque prevents this skeleton from copying per-command semantics.
-/// Todo 56 replaces each use with typed arguments while preserving
-/// [`DispatchRequest`] as the hand-off point.
-#[derive(Debug, Clone, Default, Args)]
-pub struct PendingArgs {
-    /// Command-specific arguments.
-    #[arg(
-        value_name = "ARGS",
-        trailing_var_arg = true,
-        allow_hyphen_values = true
-    )]
-    pub args: Vec<OsString>,
-}
-
 /// Arguments accepted only so a rejected command can explain its replacement.
 #[derive(Debug, Clone, Default, Args)]
 pub struct RejectedArgs {
@@ -592,6 +576,14 @@ pub enum DebugSnapshotCommand {
     Diff { hash: String },
 }
 
+/// Generate a shell completion script from Zuno's current clap command tree.
+#[derive(Debug, Clone, Args)]
+pub struct CompletionArgs {
+    /// Shell whose completion syntax should be emitted.
+    #[arg(value_enum, value_name = "SHELL")]
+    pub shell: clap_complete::Shell,
+}
+
 /// Every command intentionally registered by this skeleton.
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
@@ -619,18 +611,8 @@ pub enum Command {
     Db(DbArgs),
     /// Diagnostics and introspection.
     Debug(DebugArgs),
-    /// Explain why shell completion output is unavailable, and what to use instead.
-    ///
-    /// Registered because upstream registers it, but it cannot emit a completion
-    /// script. Upstream's script is a yargs shell function that asks the binary
-    /// back for candidates over `--get-yargs-completions`; this port serves no such
-    /// protocol, so a script emitted here would answer every request with nothing.
-    /// Every invocation therefore prints that reason on stderr and exits 1 instead
-    /// of writing a file that cannot work.
-    ///
-    /// To read the command tree and its flags — everything a completion would have
-    /// to know — run `--help` on the binary and on each subcommand.
-    Completion(PendingArgs),
+    /// Generate shell completion output.
+    Completion(CompletionArgs),
     /// Export session data as JSON.
     Export(ExportArgs),
     /// Import session data from a JSON file.
@@ -667,10 +649,7 @@ impl Command {
             Self::Mcp(args) => dispatch(DispatchArguments::Mcp(args), environment),
             Self::Db(args) => dispatch(DispatchArguments::Db(args), environment),
             Self::Debug(args) => dispatch(DispatchArguments::Debug(args), environment),
-            Self::Completion(args) => dispatch(
-                DispatchArguments::Pending(ImplementedCommand::Completion, args.args),
-                environment,
-            ),
+            Self::Completion(args) => dispatch(DispatchArguments::Completion(args), environment),
             Self::Export(args) => dispatch(DispatchArguments::Export(args), environment),
             Self::Import(args) => dispatch(DispatchArguments::Import(args), environment),
             Self::Console(_) => reject("console", environment),
@@ -769,9 +748,9 @@ pub enum DispatchArguments {
     Mcp(McpArgs),
     Db(DbArgs),
     Debug(DebugArgs),
+    Completion(CompletionArgs),
     Export(ExportArgs),
     Import(ImportArgs),
-    Pending(ImplementedCommand, Vec<OsString>),
 }
 
 impl DispatchArguments {
@@ -788,9 +767,9 @@ impl DispatchArguments {
             Self::Mcp(_) => ImplementedCommand::Mcp,
             Self::Db(_) => ImplementedCommand::Db,
             Self::Debug(_) => ImplementedCommand::Debug,
+            Self::Completion(_) => ImplementedCommand::Completion,
             Self::Export(_) => ImplementedCommand::Export,
             Self::Import(_) => ImplementedCommand::Import,
-            Self::Pending(command, _) => *command,
         }
     }
 
@@ -820,9 +799,10 @@ impl DispatchArguments {
             | Self::Mcp(_)
             | Self::Db(_)
             | Self::Debug(_)
+            | Self::Completion(_)
             | Self::Export(_)
             | Self::Import(_) => true,
-            Self::Tui(_) | Self::Serve(_) | Self::Pending(_, _) => false,
+            Self::Tui(_) | Self::Serve(_) => false,
         }
     }
 
@@ -853,25 +833,10 @@ impl DispatchArguments {
             | Self::Mcp(_)
             | Self::Db(_)
             | Self::Debug(_)
+            | Self::Completion(_)
             | Self::Export(_)
-            | Self::Import(_)
-            | Self::Pending(_, _) => false,
+            | Self::Import(_) => false,
         }
-    }
-
-    /// Whether this command still routes to [`PendingCommandDispatcher`].
-    ///
-    /// This is the *behavioural* answer to "is there a handler", and it is what
-    /// `zuno-cli/tests/surface.rs` asserts against [`Disposition::Implemented`].
-    /// Reading it off the disposition table instead would make the table agree
-    /// with itself: a row saying `implemented` next to a stub handler is exactly
-    /// the defect todo 116 fixed, and only a check anchored on the dispatch arm
-    /// can see it.
-    ///
-    /// [`Disposition::Implemented`]: crate::Disposition::Implemented
-    #[must_use]
-    pub const fn is_pending(&self) -> bool {
-        matches!(self, Self::Pending(_, _))
     }
 }
 
@@ -898,45 +863,6 @@ pub enum Action {
         message: &'static str,
         environment: StartupEnvironment,
     },
-}
-
-/// Every command this binary registers without a handler behind it, and why.
-///
-/// This exists so the set is enumerable rather than discoverable only by running
-/// each command. `zuno-cli/tests/surface.rs` asserts it in **both** directions: each
-/// entry really does reach [`PendingCommandDispatcher`], and no command outside it
-/// does. That is the check `export` needed and did not have — its disposition, the
-/// generated matrix and a checked-off todo all agreed it worked, because all three
-/// described intent and none of them ran the handler.
-///
-/// A command listed here must not carry [`Disposition::Implemented`], which is the
-/// invariant the same test enforces.
-///
-/// An entry here is also a claim about the command's **help text**, because help is
-/// the surface a user reads before running anything: a reader who only ever runs
-/// `--help` must learn the command does not work. Recording the reason here is not
-/// sufficient on its own — `completion` was recorded honestly in this table while
-/// `--help` advertised "Generate shell completion output" in both the root listing
-/// and the command's own help, and a reader following that help could not proceed.
-/// `zuno-cli/tests/help_honesty.rs` enforces the help side for every entry, so a
-/// future addition cannot repeat it.
-///
-/// [`Disposition::Implemented`]: crate::Disposition::Implemented
-pub const PENDING_COMMANDS: &[(&str, &str)] = &[(
-    "completion",
-    "upstream's completion script is a yargs shell function that asks the binary \
-     back for candidates over `--get-yargs-completions`, a protocol this port does \
-     not serve, so a script generated here would answer every request with nothing; \
-     run `--help` on the binary and on each subcommand to read the command tree and \
-     its flags instead",
-)];
-
-/// The recorded reason one registered command has no handler.
-#[must_use]
-pub fn pending_reason(command: &str) -> Option<&'static str> {
-    PENDING_COMMANDS
-        .iter()
-        .find_map(|(name, reason)| (*name == command).then_some(*reason))
 }
 
 /// Behavior supplied by todo 56 and later command-owning todos.
@@ -981,26 +907,6 @@ impl std::fmt::Display for DispatchError {
 
 impl std::error::Error for DispatchError {}
 
-/// The failure a command registered without a handler produces.
-///
-/// It reports the recorded reason from [`PENDING_COMMANDS`] when there is one, so
-/// a user reads why the command cannot work rather than the number of a build
-/// task that has since been closed.
-#[derive(Debug, Default)]
-pub struct PendingCommandDispatcher;
-
-impl CommandDispatcher for PendingCommandDispatcher {
-    fn dispatch(&mut self, request: DispatchRequest) -> Result<(), DispatchError> {
-        let command = request.command.as_str();
-        Err(DispatchError {
-            command,
-            owner: "todo 56",
-            detail: pending_reason(command)
-                .map(|reason| format!("`{command}` is not available: {reason}")),
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1036,7 +942,7 @@ mod tests {
             &["db"],
             &["debug", "paths"],
             &["tui"],
-            &["completion"],
+            &["completion", "bash"],
             &["export"],
             // `<file>` is required, as upstream's `demandOption: true`
             // (`cli/cmd/import.ts:98-102`) makes it; a bare `import` exits 1 on

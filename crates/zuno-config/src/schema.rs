@@ -1,52 +1,18 @@
-//! The opencode configuration vocabulary, translated from the TypeScript oracle.
-//!
-//! Oracle: `packages/core/src/v1/config/config.ts:32-190` for the top level, and
-//! the files under `packages/core/src/v1/config/` for each nested type. Every
-//! module here names its own oracle lines.
+//! Zuno's native configuration vocabulary.
 //!
 //! # Unknown keys
 //!
-//! The oracle's policy is not uniform, and neither is this module's:
-//!
-//! * **Top level — rejected.** `packages/opencode/src/config/parse.ts:40-53`
-//!   collects the keys the top-level struct does not name and throws
-//!   `unrecognized_keys` *before* validation runs. [`Config`] therefore carries
-//!   `deny_unknown_fields`, and [`parse::from_json_value`] reports each offending
-//!   key with its own [`zuno_error::ConfigIssue`].
-//! * **Nested — ignored.** Effect Schema's default `onExcessProperty` is
-//!   `"ignore"`, so an unknown key inside `server`, `command`, and friends is
-//!   dropped rather than rejected. These structs are plain `serde` structs, which
-//!   behave the same way.
-//! * **Where the oracle writes `StructWithRest` — captured.** Agent definitions
+//! * **Top level — rejected.** [`Config`] carries `deny_unknown_fields`, and
+//!   [`parse::from_json_value`] reports each offending key with its own
+//!   [`zuno_error::ConfigIssue`].
+//! * **Nested — ignored unless their type says otherwise.** Plain `serde` structs
+//!   drop unknown nested fields.
+//! * **Provider-extensible records — captured.** Agent definitions
 //!   ([`agent::AgentConfig`]), provider options ([`provider::ProviderOptions`]),
 //!   model variants ([`provider::ModelVariant`]), and permission objects
 //!   ([`permission::PermissionObject`]) keep their extra keys. For agents the
 //!   captured keys are additionally swept into `options`, which is how
 //!   `reasoningEffort` and `thinking` reach the provider.
-//!
-//! # Deprecated keys are absent on purpose
-//!
-//! `mode`, `layout`, `autoshare`, and the agent-level `tools` and `maxSteps` exist
-//! in the oracle but are **not** fields here. A config that uses them must fail
-//! with an actionable message rather than be silently accepted, and producing that
-//! message is the legacy-rejection pass's job — which is only possible if this
-//! schema does not quietly absorb them.
-//!
-//! # The legacy TUI keys are the one exception
-//!
-//! `theme`, `keybinds`, and `tui` are *also* absent from the oracle's top-level
-//! schema, and yet a config that carries them loads without complaint: the oracle
-//! deletes all three from the loaded document **before** the unrecognized-key check
-//! runs (`packages/opencode/src/config/config.ts:53-61`, applied at `:227`). They
-//! belong to `tui.json` now, and the migration that relocates them
-//! (`packages/opencode/src/config/tui-migrate.ts`) skips any directory that already
-//! has a `tui.json` — so on a long-lived installation the keys stay in
-//! `opencode.json` forever while the oracle keeps ignoring them.
-//!
-//! This port matches that exactly: [`LEGACY_TUI_KEYS`] is accepted, carried by a
-//! [`LegacyTuiKey`] field that holds nothing, and never serialized. Nothing else is
-//! relaxed — every other unrecognized top-level key is still rejected, and every
-//! form on the legacy-rejection list still fails.
 
 pub mod agent;
 pub mod formatter;
@@ -72,13 +38,11 @@ use crate::schema::reference::ReferenceEntry;
 use serde::{Deserialize, Serialize};
 use std::num::{NonZeroU32, NonZeroU64};
 
-/// A free-form JSON object, for the oracle's `Record(String, Any | Unknown)`.
+/// A free-form JSON object.
 pub type JsonMap = serde_json::Map<String, serde_json::Value>;
 
 /// Every key [`Config`] accepts, in declaration order.
 ///
-/// Mirrors the `known` set that `topLevelExtraKeys` builds from the schema's
-/// property signatures (`packages/opencode/src/config/parse.ts:74-78`).
 pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "$schema",
     "shell",
@@ -87,7 +51,6 @@ pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "command",
     "skills",
     "references",
-    "reference",
     "watcher",
     "snapshot",
     "share",
@@ -117,31 +80,7 @@ pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "experimental",
 ];
 
-/// The keys the oracle deletes from a loaded config before it checks for
-/// unrecognized keys (`packages/opencode/src/config/config.ts:53-61`).
-///
-/// Deliberately not part of [`KNOWN_TOP_LEVEL_KEYS`], which is the set that
-/// survives into the merged result. These are accepted and then dropped, which is
-/// why the two lists are separate rather than one.
-pub const LEGACY_TUI_KEYS: &[&str] = &["theme", "keybinds", "tui"];
-
-/// A legacy TUI key's value, accepted and discarded.
-///
-/// Any JSON shape deserializes into this, and it carries nothing — so a config
-/// that sets `theme` compares equal to one that does not, exactly as it would
-/// after the oracle's `delete copy.theme`. The field is never serialized, so the
-/// merged document matches the oracle's, which no longer has the key either.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LegacyTuiKey;
-
-impl<'de> Deserialize<'de> for LegacyTuiKey {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        serde::de::IgnoredAny::deserialize(deserializer)?;
-        Ok(Self)
-    }
-}
-
-/// A parsed opencode config file — one layer, not a merged result.
+/// One parsed Zuno config layer, not a merged result.
 ///
 /// Every field is optional because every field is optional in the oracle, and
 /// because merging layers depends on being able to tell "absent" from "set to the
@@ -158,7 +97,7 @@ pub struct Config {
     /// Log level.
     #[serde(rename = "logLevel", skip_serializing_if = "Option::is_none")]
     pub log_level: Option<LogLevel>,
-    /// Server configuration for `opencode serve` and the web command.
+    /// Server configuration for `zuno serve` and the web command.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server: Option<ServerConfig>,
     /// Custom commands, keyed by command name.
@@ -170,12 +109,6 @@ pub struct Config {
     /// Named git or local directory references.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub references: Option<OrderedMap<ReferenceEntry>>,
-    /// Deprecated spelling of [`references`](Self::references).
-    ///
-    /// Still accepted by the oracle (`config/config.ts:46-48`), and not on the
-    /// legacy-rejection list, so dropping it here would lose a real user's data.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reference: Option<OrderedMap<ReferenceEntry>>,
     /// File-watcher configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub watcher: Option<WatcherConfig>,
@@ -262,15 +195,6 @@ pub struct Config {
     /// Options under active development.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub experimental: Option<ExperimentalConfig>,
-    /// Legacy TUI theme, moved to `tui.json`. Accepted, then discarded.
-    #[serde(default, skip_serializing)]
-    pub theme: LegacyTuiKey,
-    /// Legacy TUI keybinds, moved to `tui.json`. Accepted, then discarded.
-    #[serde(default, skip_serializing)]
-    pub keybinds: LegacyTuiKey,
-    /// Legacy TUI block, moved to `tui.json`. Accepted, then discarded.
-    #[serde(default, skip_serializing)]
-    pub tui: LegacyTuiKey,
 }
 
 impl Config {

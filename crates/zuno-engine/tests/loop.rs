@@ -10,6 +10,7 @@ use zuno_db::Pool;
 use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox};
 use zuno_db::message::{MessageRecord, MessageStore, PartKind, PartRecord};
 use zuno_db::{Connection, migration, open};
+use zuno_engine::hooks::TurnHooks;
 use zuno_engine::interrupt::{InterruptSignal, SoftInterruptMessage, SoftInterruptSource};
 use zuno_engine::r#loop::{
     AgentModelResolver, AvailableTools, DispatchRequest, ResolvedAgent, ResolvedModel,
@@ -17,6 +18,7 @@ use zuno_engine::r#loop::{
     TurnOutcome, event_channel, hydrate_retained_history, project_history, project_history_owned,
     retained_history, run_turn,
 };
+use zuno_engine::prompt::PromptAssembly;
 use zuno_engine::status::SessionRunRegistry;
 use zuno_error::ProviderError;
 use zuno_llm::cache::{DynamicContext, McpToolStatus};
@@ -119,6 +121,45 @@ impl AgentModelResolver for FakeResolver {
     fn resolve_model(&self, provider_id: &str, model_id: &str) -> Option<ResolvedModel> {
         (provider_id == "fake" && model_id == "fake-model")
             .then(|| ResolvedModel::new(Spec::new("fake"), "fake-model", ApiSurface::Default))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TraceResolver;
+
+impl AgentModelResolver for TraceResolver {
+    fn resolve_agent(&self, requested: &str) -> Option<ResolvedAgent> {
+        (requested == "build").then(|| {
+            let mut assembly = PromptAssembly::new();
+            assembly
+                .push("agent.base", "native:build", "BASE")
+                .expect("base section");
+            assembly
+                .push("instructions.0", "/workspace/AGENTS.md", "RULES")
+                .expect("instruction section");
+            ResolvedAgent::new("build", assembly.render(), 8).with_prompt_assembly(assembly)
+        })
+    }
+
+    fn resolve_model(&self, provider_id: &str, model_id: &str) -> Option<ResolvedModel> {
+        (provider_id == "fake" && model_id == "fake-model")
+            .then(|| ResolvedModel::new(Spec::new("fake"), "fake-model", ApiSurface::Default))
+    }
+}
+
+#[derive(Debug)]
+struct AppendingSystemHook;
+
+#[async_trait]
+impl TurnHooks for AppendingSystemHook {
+    async fn transform_system(
+        &self,
+        _session_id: &str,
+        _model: &ResolvedModel,
+        system: &mut Vec<String>,
+    ) -> Result<(), String> {
+        system.push("HOOK".to_owned());
+        Ok(())
     }
 }
 
@@ -638,6 +679,7 @@ async fn run_full_turn_once() -> (Vec<TurnEvent>, Vec<CompletionRequest>, Vec<Di
         TurnOutcome::Completed {
             assistant_message_id: "msg_turn-full_0002".to_owned(),
             steps: 2,
+            unresolved_tool_failures: Vec::new(),
         }
     );
 
@@ -653,6 +695,75 @@ async fn run_full_turn_once() -> (Vec<TurnEvent>, Vec<CompletionRequest>, Vec<Di
     assert_eq!(assistants[1].parts.len(), 1);
 
     (events, provider.requests(), dispatcher.calls())
+}
+
+#[tokio::test]
+async fn loop_persists_ordered_prompt_provenance_and_the_post_hook_prompt() {
+    let mut connection = seeded();
+    put_user(&connection, "msg_prompt_trace", 10, "trace the prompt");
+    let provider = Arc::new(FakeProvider::new(vec![ScriptedResponse::complete(vec![
+        StreamEvent::TextDelta("done".to_owned()),
+        StreamEvent::MessageEnd {
+            stop_reason: Some(FinishReason::Stop),
+        },
+    ])]));
+    let providers = registry(&provider);
+    let resolver = TraceResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        request("turn-prompt-trace"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        )
+        .with_hooks(Arc::new(AppendingSystemHook)),
+        sender,
+    );
+    let (outcome, _events) = tokio::join!(turn, collect_events(receiver));
+    assert!(matches!(
+        outcome,
+        Ok(TurnOutcome::Completed { steps: 1, .. })
+    ));
+
+    let (stored_type, data): (String, String) = connection
+        .query_row(
+            "SELECT type, data FROM event \
+             WHERE aggregate_id = ?1 AND type = 'session.prompt.assembled.1'",
+            [SESSION_ID],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("prompt trace event");
+    assert_eq!(stored_type, "session.prompt.assembled.1");
+    let trace: Value = serde_json::from_str(&data).expect("prompt trace JSON");
+    assert_eq!(trace["agent"], "build");
+    assert_eq!(trace["step"], 1);
+    assert_eq!(trace["hookTransformed"], true);
+    assert_eq!(trace["actualSystemPrompt"], "BASE\n\nRULES\nHOOK");
+    assert_eq!(
+        trace["sections"]
+            .as_array()
+            .expect("section array")
+            .iter()
+            .map(|section| section["id"].as_str().expect("section id"))
+            .collect::<Vec<_>>(),
+        vec!["agent.base", "instructions.0"]
+    );
+    assert_eq!(trace["sections"][0]["source"], "native:build");
+    assert_eq!(trace["sections"][1]["source"], "/workspace/AGENTS.md");
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].messages[0],
+        zuno_llm::event::Message::new(Role::System, "BASE\n\nRULES\nHOOK"),
+        "the durable actual prompt must equal the system message sent to the provider"
+    );
 }
 
 #[tokio::test]
@@ -1733,6 +1844,7 @@ async fn loop_reply_sorts_after_a_prompt_stamped_ahead_of_the_clock() {
         TurnOutcome::Completed {
             assistant_message_id: "msg_turn-skew_0002".to_owned(),
             steps: 2,
+            unresolved_tool_failures: Vec::new(),
         }
     );
 
@@ -1828,6 +1940,7 @@ async fn loop_records_token_usage_that_arrives_after_the_finish_reason() {
         TurnOutcome::Completed {
             assistant_message_id: "msg_turn-usage_0001".to_owned(),
             steps: 1,
+            unresolved_tool_failures: Vec::new(),
         },
         "reading past the finish reason must not change how the turn ends"
     );
@@ -1934,6 +2047,7 @@ async fn loop_does_not_wait_forever_for_a_provider_that_streams_past_its_own_fin
         TurnOutcome::Completed {
             assistant_message_id: "msg_turn-chatty_0001".to_owned(),
             steps: 1,
+            unresolved_tool_failures: Vec::new(),
         }
     );
     let trailing = published

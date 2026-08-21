@@ -21,6 +21,7 @@ jemalloc = ["dep:tikv-jemallocator"]
 async-trait = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true }
+clap_complete = { workspace = true }
 zuno-agent = { workspace = true }
 zuno-auth = { workspace = true }
 zuno-catalog = { workspace = true }

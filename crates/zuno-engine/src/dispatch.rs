@@ -1,9 +1,8 @@
-//! Tool dispatch: name compatibility, argument validation, permission gating, and execution.
+//! Tool dispatch: exact-name lookup, argument validation, permission gating, and execution.
 //!
 //! Every call passes through [`ToolRegistryDispatcher::dispatch`]. Keeping lookup and
-//! miss recovery in one choke point is intentional: a second fallback path can execute
-//! an alias without applying the same permission policy, or report an unknown name
-//! without the recovery information the model needs.
+//! miss recovery in one choke point is intentional: every model-visible tool ID must
+//! name the registered implementation that permission policy and observability see.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -16,7 +15,7 @@ use zuno_permission::visibility::{is_tool_visible, permission_key};
 use zuno_permission::{PermissionAction, Rule, evaluate};
 use zuno_tool::{
     ACCEPT_LARGE_OUTPUT_KEY, INTENT_KEY, PermissionAsk, PermissionAsker, Tool, ToolContext,
-    ToolDefinition, ToolOutput,
+    ToolDefinition, ToolOutput, ToolReplayPolicy,
 };
 
 use crate::hooks::{NoopHooks, PermissionHookDecision, ToolHooks};
@@ -94,7 +93,7 @@ impl ToolDispatcher for ToolRegistryDispatcher {
 
     async fn dispatch(&self, mut request: DispatchRequest) -> ToolDispatchResult {
         let requested_name = request.call.name.clone();
-        let resolved_name = resolve_tool_name(&requested_name);
+        let resolved_name = requested_name.as_str();
         let available = available_names(&request.available_tools);
 
         let Some(tool) = self.tool(resolved_name).filter(|_| {
@@ -105,6 +104,7 @@ impl ToolDispatcher for ToolRegistryDispatcher {
         }) else {
             return unknown_tool_result(&requested_name, &available);
         };
+        let replay_policy = tool.replay_policy();
 
         if let Err(error) = self
             .hooks
@@ -161,7 +161,7 @@ impl ToolDispatcher for ToolRegistryDispatcher {
             Arc::clone(&self.approval),
         ));
         if let Err(error) = permission.gate(resolved_name, ask, plugin_permission).await {
-            return tool_error_result(resolved_name, &error);
+            return tool_error_result(resolved_name, replay_policy, &error);
         }
 
         let background_epoch = self.background_tool.epoch();
@@ -183,10 +183,10 @@ impl ToolDispatcher for ToolRegistryDispatcher {
 
         let mut result = tokio::select! {
             biased;
-            joined = &mut execution => joined_result(&tool_name, joined),
+            joined = &mut execution => joined_result(&tool_name, replay_policy, joined),
             () = self.background_tool.notified() => {
                 match tokio::time::timeout(BACKGROUND_GRACE_PERIOD, &mut execution).await {
-                    Ok(joined) => joined_result(&tool_name, joined),
+                    Ok(joined) => joined_result(&tool_name, replay_policy, joined),
                     Err(_) => ToolDispatchResult::success(ToolOutput::text(
                         format!("{tool_name} running in background"),
                         format!(
@@ -218,45 +218,6 @@ impl ToolDispatcher for ToolRegistryDispatcher {
             return error_result(resolved_name, error);
         }
         result
-    }
-}
-
-/// Normalize provider, cross-agent, and historical tool names to registry IDs.
-///
-/// Transport namespacing is stripped before alias matching so nested calls such as
-/// `functions.shell_exec` follow exactly the same path as top-level `shell_exec`.
-#[must_use]
-pub fn resolve_tool_name(name: &str) -> &str {
-    let name = name.strip_prefix("functions.").unwrap_or(name);
-    match name {
-        "communicate" => "task",
-        "task_runner" | "subagent" => "task",
-        "launch" => "open",
-        "shell" | "shell_exec" => "bash",
-        "read_file" | "file_read" => "read",
-        "write_file" | "file_write" => "write",
-        "edit_file" | "file_edit" => "edit",
-        "file_grep" => "grep",
-        "skill_manage" => "skill",
-        "discover_tools" => "integration_tools",
-        "todoread" | "todo_read" | "todo_write" | "todos" | "todo" => "todowrite",
-        "Bash" => "bash",
-        "Read" => "read",
-        "Write" => "write",
-        "Edit" => "edit",
-        "Grep" => "grep",
-        "Agent" | "Task" => "task",
-        "Skill" => "skill",
-        "WebFetch" => "webfetch",
-        "WebSearch" => "web_search",
-        "TodoWrite" => "todowrite",
-        "ApplyPatch" => "apply_patch",
-        "Question" => "question",
-        "PlanExit" => "plan_exit",
-        "Lsp" => "lsp",
-        "Execute" => "execute",
-        "ScheduleWakeup" => "schedule",
-        other => other,
     }
 }
 
@@ -595,11 +556,12 @@ fn levenshtein(left: &str, right: &str) -> usize {
 
 fn joined_result(
     tool: &str,
+    replay_policy: ToolReplayPolicy,
     joined: Result<Result<ToolOutput, zuno_error::ToolError>, tokio::task::JoinError>,
 ) -> ToolDispatchResult {
     match joined {
         Ok(Ok(output)) => ToolDispatchResult::success(output),
-        Ok(Err(error)) => tool_error_result(tool, &error),
+        Ok(Err(error)) => tool_error_result(tool, replay_policy, &error),
         Err(error) => error_result(tool, format!("Tool `{tool}` task failed: {error}")),
     }
 }
@@ -617,8 +579,31 @@ fn joined_result(
 /// for every variant, which is why it is called here rather than reimplemented — its
 /// own documentation records that reaching for a cause by hand at a call site fixes
 /// that site and leaves the next one broken.
-fn tool_error_result(tool: &str, error: &zuno_error::ToolError) -> ToolDispatchResult {
-    error_result(tool, zuno_error::source::describe(error))
+fn tool_error_result(
+    tool: &str,
+    replay_policy: ToolReplayPolicy,
+    error: &zuno_error::ToolError,
+) -> ToolDispatchResult {
+    let mut message = zuno_error::source::describe(error);
+    if !error.is_retryable() {
+        return error_result(tool, message);
+    }
+    match replay_policy {
+        ToolReplayPolicy::Safe => message.push_str(
+            "\n\nRecovery: this tool explicitly permits replay after backoff. Do not retry it in a tight loop; the active goal will schedule another turn.",
+        ),
+        ToolReplayPolicy::Never => message.push_str(
+            "\n\nRecovery: this tool may have produced a side effect before its result was lost. Do not replay the call until authoritative external state proves it did not complete.",
+        ),
+    }
+    ToolDispatchResult::retryable_error(
+        ToolOutput::text(format!("{tool} error"), message),
+        crate::r#loop::ToolFailureRecovery {
+            tool: tool.to_owned(),
+            replay_policy,
+            retry_after: error.retry_after(),
+        },
+    )
 }
 
 fn error_result(tool: &str, message: String) -> ToolDispatchResult {
@@ -628,44 +613,6 @@ fn error_result(tool: &str, message: String) -> ToolDispatchResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn resolver_keeps_all_compatibility_aliases_at_one_choke_point() {
-        let aliases = [
-            ("functions.bash", "bash"),
-            ("functions.shell_exec", "bash"),
-            ("communicate", "task"),
-            ("task_runner", "task"),
-            ("subagent", "task"),
-            ("launch", "open"),
-            ("read_file", "read"),
-            ("file_read", "read"),
-            ("write_file", "write"),
-            ("file_write", "write"),
-            ("edit_file", "edit"),
-            ("file_edit", "edit"),
-            ("file_grep", "grep"),
-            ("skill_manage", "skill"),
-            ("discover_tools", "integration_tools"),
-            ("todos", "todowrite"),
-            ("Bash", "bash"),
-            ("Read", "read"),
-            ("Write", "write"),
-            ("Edit", "edit"),
-            ("Grep", "grep"),
-            ("Agent", "task"),
-            ("Skill", "skill"),
-            ("ApplyPatch", "apply_patch"),
-            ("ScheduleWakeup", "schedule"),
-        ];
-        for (alias, expected) in aliases {
-            assert_eq!(resolve_tool_name(alias), expected, "alias {alias}");
-        }
-        assert_eq!(
-            resolve_tool_name("mcp.functions.bash"),
-            "mcp.functions.bash"
-        );
-    }
 
     #[test]
     fn argument_patterns_cover_builtin_resource_shapes() {
@@ -719,5 +666,51 @@ mod tests {
         assert_eq!(suggestions.first().map(String::as_str), Some("tool_search"));
         assert!(!suggestions.contains(&"bash".to_owned()));
         assert!(suggestions.len() <= 3);
+    }
+
+    #[test]
+    fn retryable_tool_errors_preserve_replay_policy_and_peer_delay() {
+        let retry_after = Duration::from_secs(7);
+        let error = zuno_error::ToolError::Transient {
+            tool: "web_search".to_owned(),
+            retry_after: Some(retry_after),
+            source: Box::new(std::io::Error::other("HTTP 429")),
+        };
+
+        let result = tool_error_result("web_search", ToolReplayPolicy::Safe, &error);
+
+        assert_eq!(
+            result.recovery,
+            Some(crate::r#loop::ToolFailureRecovery {
+                tool: "web_search".to_owned(),
+                replay_policy: ToolReplayPolicy::Safe,
+                retry_after: Some(retry_after),
+            })
+        );
+        assert!(result.output.output.contains("permits replay"));
+    }
+
+    #[test]
+    fn retryable_mutations_require_state_verification_before_replay() {
+        let error = zuno_error::ToolError::Timeout {
+            tool: "bash".to_owned(),
+            elapsed: Duration::from_secs(120),
+        };
+
+        let result = tool_error_result("bash", ToolReplayPolicy::Never, &error);
+
+        assert_eq!(
+            result
+                .recovery
+                .as_ref()
+                .map(|recovery| recovery.replay_policy),
+            Some(ToolReplayPolicy::Never)
+        );
+        assert!(
+            result
+                .output
+                .output
+                .contains("authoritative external state")
+        );
     }
 }

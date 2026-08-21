@@ -1,5 +1,6 @@
 mod agent;
 mod child_turn;
+mod completion;
 mod db;
 mod db_maint;
 mod debug;
@@ -22,9 +23,7 @@ mod tui_reference;
 mod tui_replay;
 mod turn;
 
-use crate::{
-    CommandDispatcher, DispatchArguments, DispatchError, DispatchRequest, PendingCommandDispatcher,
-};
+use crate::{CommandDispatcher, DispatchArguments, DispatchError, DispatchRequest};
 
 #[derive(Debug, Default)]
 pub(crate) struct HeadlessCommandDispatcher;
@@ -34,10 +33,8 @@ impl CommandDispatcher for HeadlessCommandDispatcher {
     ///
     /// This is one exhaustive `match` rather than a chain of `if let` probes so
     /// that adding a [`DispatchArguments`] variant without a handler fails to
-    /// compile. The previous chain fell through to [`PendingCommandDispatcher`]
-    /// for anything it did not recognise, which is how `export` came to be
-    /// registered, documented and advertised as implemented while every
-    /// invocation exited 1.
+    /// compile. There is no fallback handler: a command cannot be registered unless
+    /// this match names its concrete implementation.
     fn dispatch(&mut self, request: DispatchRequest) -> Result<(), DispatchError> {
         let command = request.command;
         let to_error = |error: String| DispatchError::command(command, error);
@@ -59,6 +56,7 @@ impl CommandDispatcher for HeadlessCommandDispatcher {
             DispatchArguments::Debug(args) => {
                 debug::execute(args, &request.environment).map_err(to_error)
             }
+            DispatchArguments::Completion(args) => completion::execute(args).map_err(to_error),
             DispatchArguments::Serve(args) => {
                 serve::execute(args, &request.environment).map_err(to_error)
             }
@@ -70,7 +68,6 @@ impl CommandDispatcher for HeadlessCommandDispatcher {
             }
             DispatchArguments::Export(args) => export::export(args).map_err(to_error),
             DispatchArguments::Import(args) => export::import(args).map_err(to_error),
-            DispatchArguments::Pending(_, _) => PendingCommandDispatcher.dispatch(request),
         }
     }
 }

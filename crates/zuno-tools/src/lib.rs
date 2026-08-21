@@ -240,3 +240,20 @@ pub use crate::memory::{
     DESCRIPTION as MEMORY_DESCRIPTION, MAX_CONSOLIDATION_FAILURES_PER_TURN, MEMORY_TOOL_ID,
     MemoryAction, MemoryOperation, MemoryParams, MemoryTarget, MemoryTool, ScopePaths,
 };
+
+#[cfg(test)]
+mod replay_policy_tests {
+    use super::*;
+    use zuno_tool::ToolReplayPolicy;
+
+    #[test]
+    fn file_reads_opt_in_but_file_mutations_keep_the_safe_default() {
+        let root = tempfile::tempdir().expect("temporary workspace");
+        let tools = FileTools::new(root.path()).expect("file tools");
+
+        assert_eq!(tools.read.replay_policy(), ToolReplayPolicy::Safe);
+        assert_eq!(tools.write.replay_policy(), ToolReplayPolicy::Never);
+        assert_eq!(tools.edit.replay_policy(), ToolReplayPolicy::Never);
+        assert_eq!(tools.apply_patch.replay_policy(), ToolReplayPolicy::Never);
+    }
+}

@@ -261,9 +261,10 @@ file, `disable: true` in frontmatter.
 
 ### Built-in agents
 
-Zuno ships with `build`, `plan`, `general`, `explore`. Hidden internal agents:
-`compaction`, `title`, `summary`. To override a built-in's fields, define the
-same key in `agent: { <name>: { ... } }`.
+Zuno ships with primary agents `build` and `plan`, plus `deep`, `explorer`,
+`librarian`, `advisor`, `worker`, and `looker` specialist entries. Hidden
+internal agents are `compaction`, `title`, and `summary`. To override a native
+agent's fields, define the same key in `agent: { <name>: { ... } }`.
 
 ## Commands
 

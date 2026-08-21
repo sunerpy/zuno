@@ -14,6 +14,35 @@ Zuno assembles an agent from a native harness profile. A profile is a set of bun
 
 Profile activation is transactional. Candidate components mount against a staging service view, duplicate component identifiers fail before mount, and no candidate service is visible outside the transaction until every component succeeds. Failure disposes candidates in reverse order. Successful replacement publishes the complete new profile atomically, then disposes the previous profile in reverse order.
 
+## Native agents
+
+The built-in catalog separates primary modes, delegable specialists, and hidden engine agents:
+
+| agent | role |
+| --- | --- |
+| `build` | End-to-end implementation owner and the only agent that may delegate. |
+| `plan` | Read-only repository research and implementation-ready planning. |
+| `deep` | Difficult cross-cutting implementation without recursive delegation. |
+| `explorer` | Read-only repository structure, definition, caller, and impact discovery. |
+| `librarian` | Current external documentation, release, and upstream research. |
+| `advisor` | Architecture review, failure-mode analysis, and explicit trade-off advice. |
+| `worker` | Bounded, well-specified implementation and verification. |
+| `looker` | Visual artifact inspection when a vision-capable model is available. |
+
+`compaction`, `title`, and `summary` are hidden engine agents. A user-defined agent may be declared under `agent.<name>` or as Markdown under `.zuno/agent/**/*.md`; it enters the same resolution, permission, prompt, and provenance pipeline as a native agent.
+
+## Prompt provenance
+
+Prompt assembly is ordered data, not string concatenation spread across the CLI. Every section has a stable identifier, source, exact content, and SHA-256 digest. The composition root currently orders:
+
+1. native or configured agent base prompt;
+2. generated agent policy;
+3. global and project memory;
+4. discovered instruction files;
+5. the available skill catalog.
+
+Before the provider request, the loop persists `session.prompt.assembled`. The event records the ordered sections and the actual post-hook system prompt, so a model request can be reconstructed even when a hook transformed the assembled text. Identical prompt content is logged once per turn.
+
 ## Durable inputs
 
 Every model-visible external input is admitted to the session event log and durable inbox in one SQLite transaction before execution is attempted. The inbox is the source of truth across active turns, idle sessions, process restarts, and competing drivers.
@@ -33,7 +62,7 @@ An active goal uses two recovery layers. The provider request layer retries a bo
 
 The retry row is tied to the exact `goal_id` and stores the attempt, typed reason, selected delay, schedule time, and next eligible time. Reopening the same session reconstructs the wait from SQLite. Queued user input has priority over an automatic turn, and long waits are split by `poll_interval_ms` so an interactive surface can notice that input promptly.
 
-Local delays use exponential backoff with symmetric jitter. A valid provider `Retry-After` value is used exactly and is never shortened by negative jitter. A provider delay beyond the local ceiling falls back to the capped local policy instead of stalling the harness for an unbounded interval.
+Local delays use exponential backoff with symmetric jitter and never collapse to zero. A valid provider `Retry-After` value is never shortened by jitter; it is clamped to the configured ceiling rather than replaced by an earlier local delay.
 
 ```json
 {
@@ -55,7 +84,9 @@ Recovery is selected from typed errors, never rendered messages:
 - Authentication failures, user interruption, and a closed event consumer pause the goal for human action.
 - Invalid provider protocol, unavailable agent/model configuration, corrupt durable state, and other permanent failures block the goal.
 
-Tool failures do not cause the harness to replay a call. The loop persists the failed tool result and gives it to the model in the next step, including timeouts that might have completed an external side effect before their response was lost. A later recovery turn receives a hidden, SQL-derived notice naming the retry attempt and requiring inspection of the worktree or external state before repeating an action with side effects.
+Tool execution is at-most-once by default. `ToolReplayPolicy::Never` is inherited by every tool unless the implementation explicitly declares `Safe`; current safe tools are read-only or idempotent inspection operations such as file reads, glob, grep, skill lookup, session search, job status, LSP inspection, goal status, and web search/fetch.
+
+The loop never mechanically replays a call. It persists the failed tool result and gives it to the model in the next step, including timeouts that might have completed an external side effect before their response was lost. A later recovery turn receives a hidden, SQL-derived notice naming the retry attempt. A `Safe` failure may be attempted again after backoff; a `Never` failure requires authoritative inspection of the worktree or external state before the model decides whether another mutation is appropriate.
 
 ## Background subagents
 
@@ -92,3 +123,9 @@ runtime.activate_profile(profile).await?;
 ```
 
 Registrations are effects: every component must return the exact cleanup needed to undo its contribution. Deployment choices belong in profile configuration rather than hardcoded branches in the agent loop.
+
+## Client surfaces
+
+The TUI, headless CLI, server, ACP adapter, and future GUI consume the same commands, durable events, inbox, and projections. Cursor replay closes gaps after disconnects; live delivery is only a wake/latency path. See [client interface architecture](design/client-interfaces.md).
+
+The design sources and explicit adopt/adapt/reject decisions are recorded in [the harness comparison](design/harness-comparison.md).

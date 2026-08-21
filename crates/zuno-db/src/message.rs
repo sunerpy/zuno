@@ -1,14 +1,14 @@
 //! Message and part persistence, and the batched hydration that reassembles a
 //! conversation out of them.
 //!
-//! # The contract this module exists to hold
+//! # Stored representation
 //!
 //! `message.data` and `part.data` are opaque JSON to SQLite and load-bearing to
-//! the TypeScript binary. `sql.ts:19-20` states their shape as a subtraction:
+//! Zuno session replay. Their representation is a subtraction:
 //!
 //! ```text
-//! type V1MessageData = Omit<SessionV1.Info, "id" | "sessionID">
-//! type V1PartData    = Omit<SessionV1.Part, "id" | "sessionID" | "messageID">
+//! message.data = message - {id, sessionID}
+//! part.data    = part - {id, sessionID, messageID}
 //! ```
 //!
 //! Those subtracted keys are not absent from the record — they live in real
@@ -17,20 +17,15 @@
 //! schema still matches, and the duplicate silently becomes a second source of
 //! truth that can disagree with the column. So the strip is performed once, in
 //! [`MessageRecord::from_json`] and [`PartRecord::from_json`], and the inverse is
-//! performed once, in [`MessageRecord::to_json`] and [`PartRecord::to_json`] —
-//! mirroring `messageData`/`partData` in `projector.ts:78-88` and
-//! `info`/`part` in `message-v2.ts:80-93` respectively.
+//! performed once, in [`MessageRecord::to_json`] and [`PartRecord::to_json`].
 //!
 //! # Twelve variants, not nine
 //!
-//! The `Part` union at `packages/schema/src/v1/session.ts:357-370` has twelve
-//! members. Nine of them (`text`, `reasoning`, `tool`, `step-start`,
-//! `step-finish`, `patch`, `file`, `compaction`, `subtask`) are the ones a
-//! long-running install actually accumulates; `snapshot`, `agent` and `retry`
-//! are declared by the schema and emitted by the engine but were absent from a
-//! 1,035,733-part census of a real `opencode.db`. All twelve are accepted here,
-//! because a part the engine can emit and this crate cannot store is a session
-//! that stops round-tripping the moment a user hits that path.
+//! Zuno's `Part` union has twelve members: `text`, `reasoning`, `tool`,
+//! `step-start`, `step-finish`, `patch`, `file`, `compaction`, `subtask`,
+//! `snapshot`, `agent`, and `retry`. All twelve are accepted here because a
+//! part the engine can emit and this crate cannot store would make the session
+//! stop round-tripping as soon as that path is used.
 //!
 //! # An unknown variant is an error, never a shrug
 //!
@@ -43,9 +38,9 @@
 //!
 //! # Hydration is two statements, not N+1
 //!
-//! [`MessageStore::hydrate`] follows `message-v2.ts:98-123`: collect the message
-//! ids, fetch every part for that set in one `IN (...)` pass, group by
-//! `message_id`, then zip. One statement for the messages and one per
+//! [`MessageStore::hydrate`] collects the message ids, fetches every part for
+//! that set in one `IN (...)` pass, groups by `message_id`, then zips. One
+//! statement for the messages and one per
 //! [`HYDRATION_CHUNK`] of ids for the parts — so 500 messages cost two
 //! statements, not 501. [`MessageStore::query_count`] reports the real number
 //! because every statement in this module is prepared through one private

@@ -31,6 +31,7 @@ fn ctx() -> ToolContext {
 async fn a_named_skill_answers_with_its_whole_body() {
     let body = "# Heading\n\nStep one.\n  indented\n\nStep two.\n";
     let subject = tool(vec![skill("deploy", Some("Ship it."), body)]);
+    assert_eq!(subject.replay_policy(), ToolReplayPolicy::Safe);
 
     let output = subject
         .run(

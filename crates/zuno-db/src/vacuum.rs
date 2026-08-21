@@ -2,12 +2,8 @@
 //!
 //! # Why any of this exists
 //!
-//! Nothing upstream ever reclaims space. `packages/opencode/src/cli/cmd/db.ts:8-62`
-//! is the whole `db` surface — a query runner and a path printer — and a search of
-//! the TypeScript tree finds **no `VACUUM` call at all**. Deleting a session there
-//! therefore returns its pages to SQLite's freelist and nothing to the filesystem,
-//! so `opencode.db` only ever grows. Todo 82's prune has exactly the same
-//! property, by design.
+//! Deleting a session returns pages to SQLite's freelist but not to the
+//! filesystem, so a Zuno database does not shrink until an explicit rewrite.
 //!
 //! # Why it is a separate command and never a side effect
 //!
@@ -32,10 +28,9 @@
 //!
 //! # Why the WAL is checkpointed on both sides of the measurement
 //!
-//! [`crate::open::PRAGMA_SEQUENCE`] puts every connection in WAL mode, a verbatim
-//! port of `packages/core/src/database/database.ts:22-33`. In WAL mode a delete's
-//! pages land in `opencode.db-wal`, and the main file does not change size until a
-//! checkpoint folds them in — so a naive "size before, size after" reads zero for
+//! [`crate::open::PRAGMA_SEQUENCE`] puts every connection in WAL mode. In WAL
+//! mode a delete's pages land in the `-wal` sidecar, and the main file does not
+//! change size until a checkpoint folds them in — so a naive "size before, size after" reads zero for
 //! work that did happen, and reads a *negative* reclaim for work that only moved
 //! bytes into the sidecar. [`vacuum`] therefore checkpoints with `TRUNCATE`
 //! before it measures and again after the rewrite, and every size is re-`stat`ed

@@ -1,56 +1,28 @@
-//! Agents: the seven native ones, the `agent.<name>` config entries, and the
-//! Markdown definitions discovered under `{agent,agents}/**/*.md`.
+//! Zuno's native agents, `agent.<name>` config entries, and Markdown definitions
+//! discovered under `{agent,agents}/**/*.md`.
 //!
-//! Oracle: `packages/opencode/src/config/agent.ts:11-30` (discovery, name
-//! derivation, body-to-prompt), `packages/opencode/src/config/entry-name.ts`
-//! (the name rule), `packages/core/src/v1/config/agent.ts:7-89` (the field set and
-//! the unknown-key sweep, both already implemented by
-//! [`zuno_config::schema::agent::AgentConfig`]), and
-//! `packages/opencode/src/agent/agent.ts:140-294` (the built-ins, the override
-//! rule, and the `mode: "all"` default).
-//!
-//! # The name rule, verified rather than inferred
+//! # Name rule
 //!
 //! An agent's name is its path relative to the config directory, minus the
 //! `agent/` or `agents/` prefix and minus the extension. So
 //! `agent/review/security.md` is the agent `review/security` — **not** `security`.
-//! Getting this wrong by one path segment silently relocates a user's agent, so it
-//! was confirmed against the real `opencode` 1.18.12 binary rather than read off
-//! the source: a fixture containing `agent/review/security.md` and
-//! `.opencode/agent/deep/nested/thing.md` made `opencode agent list` print
-//! `review/security` and `deep/nested/thing`.
 //!
 //! A frontmatter `name:` key overrides the derived name entirely, because the
-//! oracle spreads `md.data` over the derived name at `config/agent.ts:24-28` and
-//! then keys the result map on the *result* (`:29`). That was also confirmed
-//! against the binary: `agent/original.md` with `name: renamed-by-frontmatter`
-//! lists as `renamed-by-frontmatter`, and `original` does not appear at all.
+//! resolved map is keyed by the final name. `agent/original.md` with
+//! `name: renamed-by-frontmatter` therefore exposes only
+//! `renamed-by-frontmatter`.
 //!
 //! # Layer order
 //!
-//! `config/config.ts:398-533` interleaves the Markdown layer between the config
-//! files and `ZUNO_CONFIG_CONTENT`:
-//!
-//! ```text
-//! global config < ZUNO_CONFIG < project files < per-directory .opencode
-//!   < Markdown agents < ZUNO_CONFIG_CONTENT < managed preferences
-//! ```
-//!
-//! Both boundaries were confirmed against the binary. A `collide` agent defined in
-//! `opencode.json` with `mode: primary` and in `agent/collide.md` with
-//! `mode: subagent` lists as `subagent` — Markdown wins over a config file. A
-//! `contentwin` agent defined in `agent/contentwin.md` with `mode: subagent` and in
-//! `ZUNO_CONFIG_CONTENT` with `mode: all` lists as `all` — the env layer wins
-//! over Markdown.
+//! Global Zuno config, explicit config, project files, and `.zuno` directories
+//! are merged before Markdown agents. `ZUNO_CONFIG_CONTENT` is re-applied after
+//! Markdown so the explicit environment layer remains authoritative.
 //!
 //! # What is deliberately not here
 //!
-//! * `{mode,modes}/*.md` is **not** scanned. The oracle still loads it
-//!   (`config/agent.ts:32-58`) but this project rejects it as deprecated; see
-//!   [`zuno_config::legacy::DeprecatedForm::ModeDirectory`].
-//! * `tools` and `maxSteps` are not accepted. Both are rejected with an actionable
-//!   message by [`zuno_config::legacy::check_agent_frontmatter`], which this module
-//!   calls on every Markdown definition it reads.
+//! * `{mode,modes}/*.md` is not scanned. Zuno reads only `agent/` and `agents/`.
+//! * `tools` and `maxSteps` are not accepted. [`AgentConfig`] rejects them as
+//!   unsupported fields.
 //! * The unknown-key sweep into `options` is not reimplemented.
 //!   [`zuno_config::schema::agent::AgentConfig`]'s `Deserialize` performs it, and
 //!   this module simply consumes the result.
@@ -66,7 +38,6 @@ use serde_json::Value;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use zuno_config::discovery::{DiscoveryOptions, discover_with};
-use zuno_config::legacy;
 use zuno_config::schema::agent::{AgentColor, AgentConfig};
 use zuno_config::schema::ordered::OrderedMap;
 use zuno_config::schema::permission::PermissionConfig;
@@ -76,11 +47,12 @@ use zuno_paths::{Env, Layout};
 
 pub use zuno_config::schema::agent::AgentMode;
 
-/// The prefixes stripped from a Markdown agent's relative path
-/// (`config/agent.ts:22`). Order matters: the first match wins.
+/// Prefixes stripped from a Markdown agent's relative path.
+///
+/// Order matters: the first match wins.
 pub const AGENT_DIRECTORY_PREFIXES: [&str; 2] = ["agent/", "agents/"];
 
-/// The glob the oracle scans in every config directory (`config/agent.ts:12`).
+/// The Markdown layout scanned in every Zuno config directory.
 ///
 /// Reproduced here as documentation; the walk is implemented directly because
 /// `{a,b}` brace expansion plus `**` plus dotfile inclusion plus symlink following
@@ -91,7 +63,7 @@ pub const AGENT_GLOB: &str = "{agent,agents}/**/*.md";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentSource {
-    /// One of the seven native agents, with no user definition on top.
+    /// One of the eleven native agents, with no user definition on top.
     Native,
     /// A native agent a user definition has modified.
     NativeOverridden,
@@ -107,10 +79,8 @@ pub enum AgentSource {
 impl AgentSource {
     /// Whether this is a native agent, overridden or not.
     ///
-    /// `agent list` sorts natives before everything else
-    /// (`cli/cmd/agent.ts:241-246`), and an override does not change that: a `plan`
-    /// entry that sets `mode: all` still prints in the native block, which was
-    /// confirmed against the binary.
+    /// `agent list` sorts natives before everything else, and an override does not
+    /// change that classification.
     #[must_use]
     pub fn is_native(&self) -> bool {
         matches!(self, Self::Native | Self::NativeOverridden)
@@ -120,8 +90,7 @@ impl AgentSource {
 /// A resolved agent, after built-ins, config entries, and Markdown definitions
 /// have been folded together.
 ///
-/// Mirrors the oracle's `Agent.Info` (`agent/agent.ts:34-56`) minus the resolved
-/// permission ruleset, which the permission tasks own.
+/// The catalog representation before runtime permissions are resolved.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Agent {
     /// The agent's name, which is also how a user selects it.
@@ -130,7 +99,7 @@ pub struct Agent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Where the agent may be used. A newly defined agent defaults to
-    /// [`AgentMode::All`] (`agent/agent.ts:275`).
+    /// [`AgentMode::All`].
     pub mode: AgentMode,
     /// Hidden from the `@` autocomplete menu.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -144,7 +113,7 @@ pub struct Agent {
     /// Sampling temperature.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
-    /// Nucleus-sampling cutoff. Named `topP` on the oracle's `Agent.Info`.
+    /// Nucleus-sampling cutoff, serialized as `topP`.
     #[serde(rename = "topP", skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
     /// Display colour.
@@ -167,14 +136,14 @@ pub struct Agent {
 }
 
 impl Agent {
-    /// The `name (mode)` header `agent list` prints (`cli/cmd/agent.ts:249`).
+    /// The `name (mode)` header `agent list` prints.
     #[must_use]
     pub fn header(&self) -> String {
         format!("{} ({})", self.name, mode_label(self.mode))
     }
 }
 
-/// The lowercase mode name the oracle prints and accepts.
+/// The lowercase mode name the CLI prints and config accepts.
 #[must_use]
 pub fn mode_label(mode: AgentMode) -> &'static str {
     match mode {
@@ -197,9 +166,8 @@ pub struct MarkdownAgent {
 
 /// Which file each Markdown-defined agent was read from, keyed by agent name.
 ///
-/// Carried alongside the agent map rather than inside [`AgentConfig`] because the
-/// map is the oracle's own merge target and adding a field to it would change what
-/// `mergeDeep` sees.
+/// Carried alongside the agent map so provenance metadata does not participate in
+/// the user-config deep merge.
 pub type MarkdownOrigins = Vec<(String, PathBuf)>;
 
 /// The merged agent map and the provenance of its Markdown-defined entries.
@@ -211,16 +179,10 @@ pub struct LoadedAgents {
     pub origins: MarkdownOrigins,
 }
 
-/// Port of `configEntryNameFromPath` (`config/entry-name.ts:14-18`).
+/// Derive an agent name from a path relative to one scanned config directory.
 ///
-/// `relative` must already be relative to the scanned directory. The oracle's own
-/// comment records why: an earlier version matched the prefix anywhere in an
-/// absolute path and mis-keyed agents whose home or parent directories happened to
-/// contain a segment called `agent` (upstream issue #25713).
-///
-/// When no prefix matches, the oracle falls back to `path.basename` — so a file
-/// found outside the expected layout collapses to its own file name rather than
-/// keeping a path that would not round-trip.
+/// Prefix matching is anchored. When no prefix matches, the basename is used so
+/// an unexpected path cannot retain unrelated parent segments.
 #[must_use]
 pub fn entry_name_from_path(relative: &str, prefixes: &[&str]) -> String {
     let normalized = relative.replace('\\', "/");
@@ -253,19 +215,17 @@ fn strip_extension(candidate: &str) -> String {
 /// Read every Markdown agent under one config directory.
 ///
 /// Scans `agent/` and `agents/`, recursively, including dot-directories and
-/// following symlinks — the oracle's `Glob.scan` options at `config/agent.ts:13-17`.
+/// following symlinks.
 /// Files are visited in sorted order so a directory listing's arbitrary order
 /// cannot decide which of two same-named definitions wins.
 ///
-/// A file whose frontmatter cannot be parsed is **skipped**, not fatal: the oracle
-/// swallows the error at `config/agent.ts:19` (`.catch(() => undefined)`) and
-/// continues. A file whose frontmatter carries a deprecated key *is* fatal, because
-/// this project rejects those rather than silently ignoring them.
+/// A file whose frontmatter cannot be parsed is skipped with a warning. A
+/// document that parses but violates the Zuno agent schema is fatal.
 ///
 /// # Errors
 ///
 /// [`ConfigError::Io`] when a directory or file cannot be read, and
-/// [`ConfigError::Invalid`] when a definition uses a deprecated key.
+/// [`ConfigError::Invalid`] when a definition violates the agent schema.
 pub fn discover_in_directory(dir: &Path) -> Result<Vec<MarkdownAgent>, ConfigError> {
     let mut found = Vec::new();
     for root_name in ["agent", "agents"] {
@@ -291,7 +251,7 @@ pub(crate) fn markdown_files(root: &Path) -> Result<Vec<PathBuf>, ConfigError> {
     while let Some(dir) = queue.pop() {
         // Following symlinks means a cycle is reachable; canonicalizing each
         // visited directory bounds the walk without refusing legitimate symlinked
-        // agent trees, which the oracle's `symlink: true` explicitly permits.
+        // agent trees.
         let key = dir.canonicalize().unwrap_or_else(|_| dir.clone());
         if visited.contains(&key) {
             continue;
@@ -328,15 +288,15 @@ pub(crate) fn markdown_files(root: &Path) -> Result<Vec<PathBuf>, ConfigError> {
 /// # Errors
 ///
 /// [`ConfigError::Io`] when the file cannot be read, and [`ConfigError::Invalid`]
-/// when the frontmatter uses a deprecated key such as `tools` or `maxSteps`.
+/// when the frontmatter does not satisfy the native agent schema.
 pub fn read_markdown_agent(dir: &Path, file: &Path) -> Result<Option<MarkdownAgent>, ConfigError> {
     let text = std::fs::read_to_string(file).map_err(|source| ConfigError::Io {
         path: file.to_path_buf(),
         source,
     })?;
 
-    // config/agent.ts:19 — an unparseable head takes the file out of the list
-    // rather than failing the whole load.
+    // An unparseable head takes the file out of the list rather than failing the
+    // whole load.
     let Ok(document) = frontmatter::parse(&text) else {
         tracing::warn!(
             path = %file.display(),
@@ -349,8 +309,7 @@ pub fn read_markdown_agent(dir: &Path, file: &Path) -> Result<Option<MarkdownAge
     let derived = entry_name_from_path(&relative, &AGENT_DIRECTORY_PREFIXES);
 
     let mut object = document.data;
-    // `{ name, ...md.data, prompt: md.content.trim() }` (config/agent.ts:24-28):
-    // the derived name is a default a frontmatter `name:` may replace, while the
+    // The derived name is a default a frontmatter `name:` may replace, while the
     // body always wins over a frontmatter `prompt:`.
     let name = object
         .get("name")
@@ -369,12 +328,13 @@ pub fn read_markdown_agent(dir: &Path, file: &Path) -> Result<Option<MarkdownAge
     );
 
     let value = Value::Object(object);
-    legacy::check_agent_frontmatter(file, &value)?;
-
     let config: AgentConfig =
-        serde_json::from_value(value).map_err(|source| ConfigError::Json {
+        serde_json::from_value(value).map_err(|source| ConfigError::Invalid {
             path: file.to_path_buf(),
-            source,
+            issues: vec![zuno_error::ConfigIssue::new(
+                ["agent", name.as_str()],
+                source.to_string(),
+            )],
         })?;
 
     Ok(Some(MarkdownAgent {
@@ -392,11 +352,10 @@ pub(crate) fn relative_path(dir: &Path, file: &Path) -> String {
         .replace('\\', "/")
 }
 
-/// The Markdown agent layer across every config directory, in oracle order.
+/// The Markdown agent layer across every config directory, in discovery order.
 ///
-/// `config/config.ts:460` merges each directory's result over the accumulated map,
-/// so a later directory wins. [`zuno_paths::Layout::config_directories`] already
-/// returns them in that order.
+/// A later directory wins. [`zuno_paths::Layout::config_directories`] returns
+/// directories in that precedence order.
 ///
 /// # Errors
 ///
@@ -409,11 +368,9 @@ pub fn discover_markdown(dirs: &[PathBuf]) -> Result<Vec<MarkdownAgent>, ConfigE
     Ok(found)
 }
 
-/// Deep-merge one agent map over another, the oracle's `mergeDeep`
-/// (`config/config.ts:460`).
+/// Deep-merge one agent map over another.
 ///
-/// Merging happens on the JSON representation because that is what `mergeDeep`
-/// operates on, and because it is the only way an `options` map or a nested
+/// Merging happens on the JSON representation so an `options` map or nested
 /// `permission` object merges key-by-key rather than being replaced wholesale.
 ///
 /// # Errors
@@ -481,18 +438,15 @@ fn merge_deep(target: &mut Value, source: Value) {
     }
 }
 
-/// Fold an agent map over the seven built-ins, the oracle's `agent.ts:267-294`.
+/// Fold an agent map over the eleven native agents.
 ///
-/// * `disable: true` removes the agent, built-in or not (`:268-271`).
-/// * A name that is not a built-in becomes a new agent with `mode: "all"`
-///   (`:272-279`).
-/// * Every field is applied with `??`, so an absent key leaves the built-in's
-///   value in place (`:280-293`).
-/// * `options` deep-merges rather than replacing (`:291`).
+/// * `disable: true` removes the agent, native or not.
+/// * A name that is not native becomes a new agent with `mode: "all"`.
+/// * An absent key leaves the native value in place.
+/// * `options` deep-merges rather than replacing.
 ///
-/// The returned order is the oracle's insertion order: the seven built-ins first,
-/// then new agents in the order the map presents them. [`list`] applies the display
-/// sort separately.
+/// The returned order is the eleven native agents first, then new agents in map
+/// order. [`list`] applies the display sort separately.
 #[must_use]
 pub fn resolve(agents: &OrderedMap<AgentConfig>, origins: &[(String, PathBuf)]) -> Vec<Agent> {
     let mut resolved: Vec<Agent> = builtin::all().into_iter().map(from_builtin).collect();
@@ -540,8 +494,7 @@ fn from_builtin(builtin: builtin::Builtin) -> Agent {
     }
 }
 
-/// `agent.ts:274-279`: a name with no built-in becomes a primary-and-subagent
-/// agent with nothing else set.
+/// A name with no native definition becomes a primary-and-subagent agent.
 fn new_agent(name: &str) -> Agent {
     Agent {
         name: name.to_owned(),
@@ -561,11 +514,7 @@ fn new_agent(name: &str) -> Agent {
     }
 }
 
-/// `agent.ts:280-293`, field for field.
-///
-/// Every line is the oracle's `item.x = value.x ?? item.x`: an absent overlay key
-/// leaves the built-in's value alone, which is the whole reason an override may set
-/// only `model` and keep the built-in prompt.
+/// Apply one user overlay while preserving absent native fields.
 fn apply(agent: &mut Agent, config: &AgentConfig) {
     if agent.source == AgentSource::Native {
         agent.source = AgentSource::NativeOverridden;
@@ -601,8 +550,8 @@ fn apply(agent: &mut Agent, config: &AgentConfig) {
         agent.steps = Some(steps);
     }
 
-    // `agent.ts:288` — a `name` key renames the agent while the map key, and so
-    // the config the user writes to reach it, stays put.
+    // A `name` key renames the resolved agent while the config lookup key remains
+    // unchanged.
     if let Some(name) = config.extra.get("name").and_then(Value::as_str) {
         agent.name = name.to_owned();
     }
@@ -620,11 +569,7 @@ fn apply(agent: &mut Agent, config: &AgentConfig) {
     }
 }
 
-/// Every agent, in the order `opencode agent list` prints them.
-///
-/// `cli/cmd/agent.ts:241-246`: natives first, then a `localeCompare` on the name.
-/// A built-in a user has overridden stays native, which was confirmed against the
-/// binary — a `plan` entry setting `mode: all` still prints in the native block.
+/// Every agent in Zuno CLI display order: natives first, then name order.
 #[must_use]
 pub fn list(agents: &OrderedMap<AgentConfig>, origins: &[(String, PathBuf)]) -> Vec<Agent> {
     let mut resolved = resolve(agents, origins);
@@ -638,12 +583,10 @@ pub fn list(agents: &OrderedMap<AgentConfig>, origins: &[(String, PathBuf)]) -> 
     resolved
 }
 
-/// `String.prototype.localeCompare` for the names agents actually have.
+/// Case-insensitive primary ordering for agent names.
 ///
-/// Agent names come from file paths and config keys, so they are dominated by
-/// ASCII. The one behaviour worth reproducing is that `localeCompare` is
-/// case-insensitive-ish — it orders `a` before `B`, where a byte comparison would
-/// not — so the primary key is the lowercased name and the raw name breaks ties.
+/// Agent names come from file paths and config keys, so the primary key is the
+/// lowercase name and the raw name breaks ties deterministically.
 fn locale_compare(left: &str, right: &str) -> std::cmp::Ordering {
     left.to_lowercase()
         .cmp(&right.to_lowercase())
@@ -652,16 +595,14 @@ fn locale_compare(left: &str, right: &str) -> std::cmp::Ordering {
 
 /// Discover and resolve every agent for one working directory.
 ///
-/// Assembles the layers in the order `config/config.ts:398-533` establishes:
-/// merged config first, then the Markdown layer, then `ZUNO_CONFIG_CONTENT`
-/// re-applied on top — because the merged config already contains that layer's
-/// values, re-applying them is a no-op except that it restores their precedence
-/// over Markdown, which the binary was observed to require.
+/// Assembles merged Zuno config, Markdown definitions, then
+/// `ZUNO_CONFIG_CONTENT` re-applied on top so the explicit environment layer
+/// remains authoritative.
 ///
 /// # Errors
 ///
 /// Propagates [`ConfigError`] from config discovery, from reading an agent
-/// directory, or from a Markdown definition that uses a deprecated key.
+/// directory, or from a Markdown definition that violates the agent schema.
 pub fn load(
     directory: &Path,
     worktree: Option<&Path>,
@@ -728,8 +669,6 @@ mod tests {
 
     #[test]
     fn the_name_is_the_relative_path_minus_prefix_and_extension() {
-        // Verified against opencode 1.18.12: this fixture printed
-        // `review/security`, not `security`.
         assert_eq!(
             entry_name_from_path("agent/review/security.md", &AGENT_DIRECTORY_PREFIXES),
             "review/security"
@@ -754,8 +693,8 @@ mod tests {
 
     #[test]
     fn a_path_with_no_prefix_falls_back_to_its_basename() {
-        // entry-name.ts:11-12 — the prefix must be anchored, so a coincidental
-        // `agent` segment deeper in the path does not key the agent.
+        // The prefix is anchored, so a coincidental `agent` segment deeper in the
+        // path does not key the agent.
         assert_eq!(
             entry_name_from_path("other/agent/security.md", &AGENT_DIRECTORY_PREFIXES),
             "security"
@@ -789,15 +728,19 @@ mod tests {
     }
 
     #[test]
-    fn the_seven_built_ins_exist_with_no_user_config_at_all() {
+    fn the_native_roster_exists_with_no_user_config_at_all() {
         let agents = resolve(&OrderedMap::new(), &[]);
         assert_eq!(
             names(&agents),
             vec![
                 "build",
                 "plan",
-                "general",
-                "explore",
+                "deep",
+                "explorer",
+                "librarian",
+                "advisor",
+                "worker",
+                "looker",
                 "compaction",
                 "title",
                 "summary"
@@ -869,7 +812,7 @@ mod tests {
             &[],
         );
         assert!(!names(&agents).contains(&"plan"));
-        assert_eq!(agents.len(), 6);
+        assert_eq!(agents.len(), 10);
     }
 
     #[test]
@@ -915,8 +858,6 @@ mod tests {
 
     #[test]
     fn a_name_key_renames_the_agent() {
-        // Verified against opencode 1.18.12: `agent/original.md` carrying
-        // `name: renamed-by-frontmatter` listed as `renamed-by-frontmatter`.
         let agents = resolve(
             &map(serde_json::json!({ "original": { "name": "renamed" } })),
             &[],
@@ -954,13 +895,17 @@ mod tests {
         assert_eq!(
             names(&agents),
             vec![
+                "advisor",
                 "build",
                 "compaction",
-                "explore",
-                "general",
+                "deep",
+                "explorer",
+                "librarian",
+                "looker",
                 "plan",
                 "summary",
                 "title",
+                "worker",
                 "alpha",
                 "zebra"
             ]
@@ -971,8 +916,9 @@ mod tests {
     fn the_header_is_the_line_agent_list_prints() {
         let agents = list(&OrderedMap::new(), &[]);
         let headers: Vec<String> = agents.iter().map(Agent::header).collect();
-        assert_eq!(headers[0], "build (primary)");
-        assert!(headers.contains(&"explore (subagent)".to_owned()));
+        assert_eq!(headers[0], "advisor (subagent)");
+        assert!(headers.contains(&"build (primary)".to_owned()));
+        assert!(headers.contains(&"deep (subagent)".to_owned()));
     }
 
     #[test]
@@ -996,8 +942,7 @@ mod tests {
 
     #[test]
     fn locale_compare_orders_lowercase_before_a_later_uppercase() {
-        // `["B", "a"].sort((x, y) => x.localeCompare(y))` is `["a", "B"]`, which a
-        // byte comparison gets backwards.
+        // A byte comparison would put uppercase `B` before lowercase `a`.
         assert_eq!(locale_compare("a", "B"), std::cmp::Ordering::Less);
         assert_eq!(locale_compare("B", "a"), std::cmp::Ordering::Greater);
         assert_eq!(locale_compare("a", "a"), std::cmp::Ordering::Equal);

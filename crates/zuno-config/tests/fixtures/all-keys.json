@@ -37,9 +37,6 @@
       "hidden": true
     }
   },
-  "reference": {
-    "legacy": "github.com/sst/opencode"
-  },
   "watcher": {
     "ignore": ["node_modules/**", "target/**"]
   },

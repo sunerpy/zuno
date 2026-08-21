@@ -11,9 +11,7 @@ mod state;
 
 use axum::Json;
 use axum::Router;
-use axum::extract::MatchedPath;
-use axum::http::Method;
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, post};
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -131,7 +129,6 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/api/pty/{ptyID}/connect-token", post(pty::connect_token))
         .route("/api/pty/{ptyID}/connect", get(pty::connect))
-        .merge(unsupported_routes())
         .with_state(state)
 }
 
@@ -160,41 +157,4 @@ async fn location(
         directory: state.directory().to_owned(),
         project_id: zuno_paths::GLOBAL_PROJECT_ID,
     })
-}
-
-async fn unsupported(method: Method, path: MatchedPath) -> error::ApiError {
-    error::ApiError::BackendUnavailable(format!("{} {}", method.as_str(), path.as_str()))
-}
-
-fn unsupported_routes() -> Router<ApiState> {
-    Router::new()
-        .route(
-            "/api/integration/{integrationID}/connect/key",
-            post(unsupported),
-        )
-        .route(
-            "/api/integration/{integrationID}/connect/oauth",
-            post(unsupported),
-        )
-        .route(
-            "/api/integration/attempt/{attemptID}",
-            get(unsupported).delete(unsupported),
-        )
-        .route(
-            "/api/integration/attempt/{attemptID}/complete",
-            post(unsupported),
-        )
-        .route(
-            "/api/credential/{credentialID}",
-            patch(unsupported).delete(unsupported),
-        )
-        .route("/api/session/{sessionID}/permission", post(unsupported))
-        .route(
-            "/api/session/{sessionID}/permission/{requestID}",
-            get(unsupported),
-        )
-        .route(
-            "/api/session/{sessionID}/message/{messageID}",
-            get(unsupported),
-        )
 }

@@ -13,8 +13,8 @@ publish.workspace = true
 async-trait = { workspace = true }
 # `zuno-db` supplies the connection, the pragmas and the `IMMEDIATE` transaction
 # helper. It is a dependency and *not* a host: the goal lives in its own database
-# file so that adding it cannot perturb `zuno-db`'s byte-compatible 19-table
-# `opencode.db` schema. See `store.rs`.
+# file so session pruning and schema evolution cannot cascade goal state. See
+# `store.rs`.
 zuno-db = { workspace = true }
 zuno-engine = { workspace = true }
 zuno-error = { workspace = true }

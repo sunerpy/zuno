@@ -1,4 +1,4 @@
-//! The current `opencode.db` schema emitted by the TypeScript schema generator.
+//! The current Zuno session database schema.
 
 use crate::migration;
 use rusqlite::Transaction;

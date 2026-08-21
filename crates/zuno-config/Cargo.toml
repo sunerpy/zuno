@@ -1,6 +1,6 @@
 [package]
 name = "zuno-config"
-description = "Configuration schema, discovery, merge order, variable substitution, and legacy rejection."
+description = "Zuno configuration schema, discovery, merge order, and variable substitution."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

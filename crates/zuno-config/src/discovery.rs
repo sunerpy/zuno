@@ -160,12 +160,11 @@ pub fn discover(directory: &Path, worktree: Option<&Path>) -> Result<Config, Con
 /// Returns [`ConfigError`] for the first existing layer that cannot be read,
 /// parsed, or validated.
 pub fn discover_with(options: &DiscoveryOptions) -> Result<Config, ConfigError> {
-    reject_legacy_config_names(options)?;
     ensure_default_global_config(options)?;
     let mut result = RawJson::empty_object();
 
-    // config.ts:258-260. The compatibility contract treats each file as a layer,
-    // so the instructions exception applies between both global files too.
+    // Each file is one layer, so list-like values retain their per-layer merge
+    // semantics between JSON and JSONC too.
     for path in Layout::file_in_directory(options.layout.config(), CONFIG_FILE_STEM) {
         merge_file(&mut result, &path)?;
     }
@@ -182,8 +181,6 @@ pub fn discover_with(options: &DiscoveryOptions) -> Result<Config, ConfigError> 
         }
     }
 
-    // config.ts:412-414. `mode` is intentionally absent from the v1.18.13 Rust
-    // schema because the legacy-rejection task owns that deprecated key.
     result.insert_if_absent("agent", RawJson::empty_object());
 
     for directory in
@@ -232,7 +229,7 @@ pub fn discover_with(options: &DiscoveryOptions) -> Result<Config, ConfigError> 
 /// Merge already-validated config layers with the same semantics discovery uses.
 ///
 /// This is intentionally public so property tests and downstream config sources
-/// can share the compatibility-critical merge rather than reproducing it.
+/// share the same merge rather than reproducing it.
 ///
 /// # Errors
 ///
@@ -297,52 +294,6 @@ pub fn read_config_directories(
         .collect()
 }
 
-/// Refuse a config file that is still under one of the pre-rename filenames.
-///
-/// Every layer, in the order discovery would have read them. Deleting a filename
-/// from the probe list without this check is how a working config silently stops
-/// being read, so the two changes belong in the same function's blast radius:
-/// what discovery no longer reads, this rejects.
-///
-/// All offenders are collected before reporting, so one run names every file the
-/// user has to rename rather than sending them round the loop once per layer. The
-/// error's own path is the first offender, because [`ConfigError::Invalid`]
-/// renders it as "config file … failed validation" and a directory there would
-/// read as a lie.
-fn reject_legacy_config_names(options: &DiscoveryOptions) -> Result<(), ConfigError> {
-    let mut found = crate::legacy::inspect_global_config_directory(options.layout.config());
-
-    if !options.layout.project_config_disabled() {
-        for path in Layout::config_files(
-            zuno_paths::LEGACY_CONFIG_FILE_STEM,
-            &options.directory,
-            options.worktree(),
-        ) {
-            found.extend(crate::legacy::inspect_config_filename(
-                &path,
-                crate::legacy::ConfigFileScope::ProjectAncestor,
-            ));
-        }
-    }
-
-    for directory in
-        read_config_directories(&options.layout, &options.directory, options.worktree())
-    {
-        found.extend(crate::legacy::inspect_config_directory(&directory));
-    }
-
-    if options.managed_config_dir.exists() {
-        found.extend(crate::legacy::inspect_config_directory(
-            &options.managed_config_dir,
-        ));
-    }
-
-    let Some(root) = found.first().map(|first| first.path().to_path_buf()) else {
-        return Ok(());
-    };
-    crate::legacy::reject(&root, found)
-}
-
 fn ensure_default_global_config(options: &DiscoveryOptions) -> Result<(), ConfigError> {
     if [
         ZUNO_CONFIG,
@@ -360,64 +311,12 @@ fn ensure_default_global_config(options: &DiscoveryOptions) -> Result<(), Config
         return Ok(());
     }
 
-    // The sibling `~/.config/opencode/` diagnosis, unchanged in behaviour: it
-    // detects and hard-fails, and never reads or merges that directory. Only the
-    // names move — the probe keeps looking for the filenames the legacy directory
-    // really carries, while the suggested target is the canonical Zuno filename,
-    // so the migration command no longer teaches the old name.
-    let legacy_config_root =
-        sibling_product_root(options.layout.config(), zuno_paths::LEGACY_CONFIG_FILE_STEM);
-    if let Some(old_path) = zuno_paths::LEGACY_GLOBAL_CONFIG_NAMES
-        .iter()
-        .map(|name| legacy_config_root.join(name))
-        .find(|path| path.exists())
-    {
-        let old_name = old_path
-            .file_name()
-            .expect("a config candidate always has a filename")
-            .to_string_lossy()
-            .into_owned();
-        let new_path = options
-            .layout
-            .config()
-            .join(crate::legacy::canonical_config_name(&old_name));
-        return Err(ConfigError::LegacyConfig {
-            copy_command: legacy_copy_command(options, &old_path, &new_path),
-            old_path,
-            new_path,
-        });
-    }
-
     let path = &candidates[0];
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
     let _ = fs::write(path, "{}\n");
     Ok(())
-}
-
-fn sibling_product_root(root: &Path, product: &str) -> PathBuf {
-    root.parent()
-        .map_or_else(|| PathBuf::from(product), |parent| parent.join(product))
-}
-
-fn legacy_copy_command(options: &DiscoveryOptions, old_config: &Path, new_config: &Path) -> String {
-    let old_data = sibling_product_root(options.layout.data(), "opencode").join("auth.json");
-    let new_data = options.layout.data().join("auth.json");
-    format!(
-        "install -d -m 700 {} {} && install -m 600 {} {} && if [ ! -f {} ] || install -m 600 {} {}; then :; else exit 1; fi",
-        shell_quote(options.layout.config()),
-        shell_quote(options.layout.data()),
-        shell_quote(old_config),
-        shell_quote(new_config),
-        shell_quote(&old_data),
-        shell_quote(&old_data),
-        shell_quote(&new_data),
-    )
-}
-
-fn shell_quote(path: &Path) -> String {
-    format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
 }
 
 fn merge_file(result: &mut RawJson, path: &Path) -> Result<(), ConfigError> {
@@ -438,23 +337,7 @@ fn parse_layer(path: &Path, text: &str) -> Result<RawJson, ConfigError> {
     // JSONC pass. Discovery itself deliberately does not interpret {env:...} or
     // {file:...} tokens.
     let strict = strip_jsonc(text);
-    // Before the strict parse, as `check_config` requires: the schema refuses
-    // `mode`, `layout` and `autoshare` as unrecognized keys, and whichever check
-    // runs first decides whether the author is told what to write instead. Keys the
-    // schema does *not* refuse — an agent's `tools`, `maxSteps`, or a `variant` with
-    // no `model` — reach the agent sweep and become provider options, so without
-    // this call they are accepted and silently inert.
-    let document: serde_json::Value =
-        serde_json::from_str(&strict).map_err(|source| ConfigError::Json {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    crate::legacy::check_config(path, &document)?;
-    let mut config = Config::from_json_str(path, &strict)?;
-    if inject_schema && config.schema.is_none() {
-        config.schema = Some(DEFAULT_SCHEMA.to_owned());
-        write_schema_best_effort(path, text);
-    }
+    let config = Config::from_json_str(path, &strict)?;
     raw_from_config(path, &config)
 }
 

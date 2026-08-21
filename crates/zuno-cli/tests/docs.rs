@@ -35,12 +35,19 @@ fn harness_guide_documents_the_native_extension_contract() {
             "ToolContributions",
             "profile_with_tools",
             "transactional",
+            "Native agents",
+            "`build`",
+            "`plan`",
+            "`deep`",
+            "Prompt provenance",
+            "session.prompt.assembled",
             "durable inbox",
             "Durable goal recovery",
             "goal_retry",
             "initial_delay_ms",
             "Retry-After",
-            "Tool failures do not cause the harness to replay a call",
+            "ToolReplayPolicy::Never",
+            "authoritative inspection",
             "reportDelivery",
             "nextStep",
             "quiet",
@@ -51,24 +58,109 @@ fn harness_guide_documents_the_native_extension_contract() {
 }
 
 #[test]
-fn readmes_point_to_the_native_harness_and_do_not_advertise_opencode_plugins() {
+fn architecture_documents_pin_the_native_harness_decisions() {
+    contains_all(
+        "AGENTS.md",
+        &[
+            "Everything is a native component",
+            "Model-visible means logged",
+            "ToolReplayPolicy::Never",
+            "reportDelivery: nextStep",
+            "$zuno-dsh-sync",
+        ],
+    );
+    contains_all(
+        "docs/design/harness-comparison.md",
+        &[
+            "2026-08-21",
+            "dsh-v0.1.1-rc.1",
+            "528c682e061696f5a160f363f236ecbf53cbd006",
+            "dsh-v0.1.1-rc.2",
+            "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
+            "OpenAI Codex",
+            "oh-my-openagent",
+            "pi-agent",
+            "OpenCode",
+            "Claw Code",
+            "Cross-project compatibility",
+        ],
+    );
+    contains_all(
+        "docs/design/client-interfaces.md",
+        &[
+            "cursor-based replay",
+            "durable inbox",
+            "admission identifier",
+            "future GUI",
+            "A client disconnect never cancels an active goal",
+            "GET /api/session/{sessionID}/event",
+            "Last-Event-ID",
+            "does not mount an unscoped `/event` adapter",
+            "only when a real handler exists",
+        ],
+    );
+}
+
+#[test]
+fn readmes_document_extension_examples_and_do_not_advertise_compatibility() {
     for relative in ["README.md", "docs/readme/README.en.md"] {
         let text = read(relative);
         assert!(
             text.contains("harness-runtime.md"),
             "{relative} must link the native harness guide"
         );
+        for required in [
+            "profile_with_tools",
+            "AgentDriver",
+            "session.prompt.assembled",
+            "design/harness-comparison.md",
+            "design/client-interfaces.md",
+        ] {
+            assert!(
+                text.contains(required),
+                "{relative} must document extension surface {required:?}"
+            );
+        }
         for retired in [
             "supports opencode plugins",
             "支持 opencode 插件",
             "zuno-plugin-sdk",
             "plugin_runtime",
             "21 hooks",
+            "rejected-inputs.md",
+            "legacy-filename diagnostics",
+            "旧默认文件名诊断",
         ] {
             assert!(
                 !text.contains(retired),
                 "{relative} still advertises retired compatibility text {retired:?}"
             );
         }
+    }
+}
+
+#[test]
+fn database_docs_describe_a_hard_pre_release_format_cut() {
+    let text = read("docs/migration.md");
+    for required in [
+        "unsupported pre-release format",
+        "without modification",
+        "The 39 migrations",
+    ] {
+        assert!(
+            text.contains(required),
+            "migration guide must contain {required:?}"
+        );
+    }
+    for retired in [
+        "Pre-rename Zuno database filename",
+        "__drizzle_migrations",
+        "opencode.db",
+        "rejected-inputs.md",
+    ] {
+        assert!(
+            !text.contains(retired),
+            "migration guide still advertises retired migration surface {retired:?}"
+        );
     }
 }

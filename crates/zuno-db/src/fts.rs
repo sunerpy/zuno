@@ -1,11 +1,9 @@
 //! Opt-in FTS5 indexes for lexical recall across persisted conversations.
 //!
-//! The compatibility schema must remain byte-for-byte equal to the TypeScript
-//! binary, so [`ensure`] owns these objects instead of `schema::up`. Text lives
-//! in `part.data`, while ranking and navigation are message-shaped; the source
-//! views therefore aggregate parts onto the stable identity of `message.rowid`.
-//! This adapts Hermes' external-content and trigram design
-//! (`hermes_state_common.py:403-521`) to opencode's message/part split.
+//! [`ensure`] owns these optional objects instead of the core migration sequence.
+//! Text lives in `part.data`, while ranking and navigation operate on messages;
+//! the source views therefore aggregate parts onto the stable identity of
+//! `message.rowid`. The indexes use SQLite external-content and trigram FTS5.
 //!
 //! SQLite may renumber implicit rowids during `VACUUM`. Call [`rebuild`] after a
 //! vacuum so the external-content indexes are rebound to the new message rowids.
@@ -202,10 +200,10 @@ pub struct SearchHit {
 
 /// Install and backfill the optional FTS objects in one immediate transaction.
 ///
-/// Keeping this explicit preserves the 20-table compatibility contract of
-/// `migration::apply`. Repeated calls are safe and do not rebuild an existing
-/// index; use [`rebuild`] after an operation such as `VACUUM` that can renumber
-/// implicit message rowids.
+/// Keeping this explicit lets deployments opt into lexical indexes without
+/// changing the core session schema. Repeated calls are safe and do not rebuild
+/// an existing index; use [`rebuild`] after an operation such as `VACUUM` that
+/// can renumber implicit message rowids.
 ///
 /// # Errors
 ///

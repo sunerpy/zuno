@@ -1,34 +1,26 @@
-//! One session's full transcript, in the exact envelope `opencode export` prints
-//! and `opencode import` reads back.
+//! One session's full transcript in Zuno's export/import document.
 //!
 //! # Why this is a store concern and not a CLI concern
 //!
-//! Upstream's `export` is a thin wrapper: it asks the session service for one
-//! `Info` and every `WithParts`, then stringifies the pair
-//! (`cli/cmd/export.ts:283-291`). Everything that makes the payload *correct* —
+//! Everything that makes the payload correct —
 //! the field list, the message order, the part order, the identity keys the two
 //! `data` blobs do not carry — belongs to whoever owns the rows. Putting the
-//! envelope here means the CLI cannot invent a shape and the shape can be tested
+//! envelope here means the CLI cannot invent a format and the format can be tested
 //! without a process.
 //!
-//! # The redaction pass is a port, not an approximation
+//! # Redaction
 //!
 //! `--sanitize` is the flag a user reaches for before attaching a transcript to
-//! a bug report, so "mostly redacted" is the one failure mode that matters. Every
-//! rule in [`sanitize`] maps to a named function in `cli/cmd/export.ts:11-220`,
-//! including the two that look like bugs and are not: an all-whitespace string is
-//! left alone (`value.trim() ? … : value`, `:12`) and an empty object is left
-//! alone (`Object.keys(value).length ? … : value`, `:17`). Both are preserved
-//! because a differential against the real binary compares bytes, and because a
-//! reader who sees `""` learns that the field was empty rather than hidden.
+//! a bug report, so partial redaction is a failure. An all-whitespace string and
+//! an empty object remain structurally empty rather than being replaced with a
+//! marker, while populated sensitive values are redacted recursively.
 //!
-//! # Import writes what upstream writes
+//! # Import ownership
 //!
 //! `import` re-homes a transcript into the *current* project: the session's
-//! `projectID`, `directory` and `path` are replaced, and on a re-import only
-//! those three columns are updated (`cli/cmd/import.ts:178-193`). Messages and
-//! parts are inserted `ON CONFLICT DO NOTHING`, so importing the same file twice
-//! is not a way to mutate a transcript that already exists.
+//! project identifier, directory, and path are replaced. Messages and parts are
+//! inserted `ON CONFLICT DO NOTHING`, so importing the same file twice is not a
+//! way to mutate an existing transcript.
 
 use rusqlite::{Connection, Transaction, params};
 use serde::Serialize;
@@ -42,7 +34,7 @@ use crate::session_list::{SessionInfo, session_info};
 /// The table name reported when a document does not have the export shape.
 const DOCUMENT: &str = "export document";
 
-/// One message and its parts, upstream's `SessionV1.WithParts`.
+/// One message and its parts.
 ///
 /// Both halves stay as [`Value`] because the store keeps them as opaque blobs
 /// plus identity columns; re-typing them here would mean this module deciding
@@ -56,10 +48,9 @@ pub struct ExportMessage {
     pub parts: Vec<Value>,
 }
 
-/// A whole session as `export` prints it.
+/// A whole session as `zuno export` prints it.
 ///
-/// `info` is a bare [`SessionInfo`], not the listing's `GlobalInfo`: upstream
-/// exports `svc.get(sessionID)` (`export.ts:284`), which has no `project` key.
+/// `info` is a bare [`SessionInfo`], not the listing's project wrapper.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ExportDocument {
     /// The session itself.

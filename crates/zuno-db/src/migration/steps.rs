@@ -8,27 +8,22 @@
 //! from an older one is the sequence of edits that produced it — a `CREATE TABLE`
 //! run over live history would destroy it. So this table is not a duplicate of
 //! `schema.rs`; it is the other half of the same contract, and the two are
-//! reconciled by measurement rather than by inspection: running every step here
-//! against an empty database yields the same objects, columns, types, nullability,
-//! defaults and primary keys as the user's real `opencode.db`, which the
-//! TypeScript binary migrated itself.
+//! reconciled by measurement rather than by inspection.
 //!
 //! # Where the two shapes legitimately differ
 //!
 //! A migrated database is not column-for-column identical to a freshly created
-//! one, and upstream has the same seam. `account_state.id` is `integer PRIMARY KEY
+//! one. `account_state.id` is `integer PRIMARY KEY
 //! NOT NULL` here (migration 6) and `integer PRIMARY KEY` in `schema.gen.ts`;
 //! `workspace.time_used` carries `DEFAULT 0` here (migration 18, where SQLite
-//! demands a default to add a `NOT NULL` column) and none there. Both differences
-//! are present in the real binary's own migrated database, so reproducing them is
-//! fidelity, not drift.
+//! demands a default to add a `NOT NULL` column) and none there.
 
 use rusqlite::Transaction;
 
 /// One journalled migration: the id recorded in the `migration` table, and the
 /// edit it makes.
 pub(crate) struct Migration {
-    /// The id upstream writes into the journal. Also the migration file's name.
+    /// The id written into the journal.
     pub(crate) id: &'static str,
     /// What the migration does.
     pub(crate) step: Step,
@@ -36,19 +31,17 @@ pub(crate) struct Migration {
 
 /// How a migration changes the database.
 ///
-/// Almost every upstream migration is a fixed list of statements, so the default
-/// representation is data rather than code — a table can be read against the
-/// oracle line by line, and a `fn` per migration cannot.
+/// Almost every migration is a fixed list of statements, so the default
+/// representation is data rather than one function per statement list.
 pub(crate) enum Step {
     /// Statements run in order, each as its own batch.
     ///
-    /// One element per upstream `tx.run(...)` call, so a migration that passes
-    /// two statements in a single template literal stays a single element.
+    /// One element per atomic statement batch.
     Sql(&'static [&'static str]),
-    /// `20260511173437_session-metadata`, which is conditional upstream.
+    /// `20260511173437_session-metadata`, which is conditional.
     ///
     /// The column briefly shipped a second time under a migration that was later
-    /// withdrawn, so upstream re-reads `pragma_table_info` and returns early when
+    /// withdrawn, so the migration re-reads `pragma_table_info` and returns early when
     /// `session.metadata` is already present. Adding it unconditionally would fail
     /// with "duplicate column name" on exactly the installs that took that
     /// withdrawn release.

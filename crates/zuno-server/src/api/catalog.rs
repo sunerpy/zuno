@@ -741,11 +741,7 @@ pub async fn references(
     State(state): State<ApiState>,
 ) -> Result<LocationEnvelope<Vec<ReferenceInfo>>, ApiError> {
     let resolved = Resolution::open(&state)?;
-    let declared = resolved
-        .config
-        .references
-        .as_ref()
-        .or(resolved.config.reference.as_ref());
+    let declared = resolved.config.references.as_ref();
     let data = ResolvedReferences::resolve(declared)
         .iter()
         .map(|reference| reference_info(reference, &resolved.directory))

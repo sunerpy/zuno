@@ -358,7 +358,7 @@ impl PresetLibrary {
 ///   "preset": "house",
 ///   "presets": {
 ///     "house": {
-///       "orchestrator": { "model": "example-provider/example-large", "variant": "high" },
+///       "build": { "model": "example-provider/example-large", "variant": "high" },
 ///       "explorer": "example-provider/example-small"
 ///     },
 ///     "structured": {

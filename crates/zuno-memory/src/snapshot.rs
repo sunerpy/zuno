@@ -166,6 +166,18 @@ impl SessionMemory {
         }
     }
 
+    /// Exact rendered block captured for `scope` when the session opened.
+    ///
+    /// The composition root uses this accessor to retain per-scope provenance
+    /// without re-rendering the mutable store.
+    #[must_use]
+    pub fn frozen_block(&self, scope: Scope) -> &str {
+        match scope {
+            Scope::Global => &self.frozen_global,
+            Scope::Project => &self.frozen_project,
+        }
+    }
+
     /// Mutable access to one live store for durable writes.
     ///
     /// Mutating this handle intentionally does not update the frozen block used by

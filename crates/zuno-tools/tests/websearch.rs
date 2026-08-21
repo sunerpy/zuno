@@ -297,7 +297,11 @@ async fn a_failed_http_query_cancels_a_sibling_waiting_for_response_headers() {
         .and(body_partial_json(json!({
             "params": { "arguments": { "query": "fail" } }
         })))
-        .respond_with(ResponseTemplate::new(500).set_delay(Duration::from_millis(100)))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .insert_header("retry-after", "4")
+                .set_delay(Duration::from_millis(100)),
+        )
         .mount(&server)
         .await;
     Mock::given(method("POST"))
@@ -328,9 +332,15 @@ async fn a_failed_http_query_cancels_a_sibling_waiting_for_response_headers() {
         "the delayed sibling was not cancelled: {:?}",
         started.elapsed()
     );
-    let ToolError::Failed { source, .. } = error else {
-        panic!("expected provider failure");
+    let ToolError::Transient {
+        retry_after,
+        source,
+        ..
+    } = error
+    else {
+        panic!("expected transient provider failure");
     };
+    assert_eq!(retry_after, Some(Duration::from_secs(4)));
     assert!(matches!(
         source.downcast_ref::<WebError>(),
         Some(WebError::Status { status: 500, .. })

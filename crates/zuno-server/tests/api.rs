@@ -421,25 +421,27 @@ fn fixture_operations(document: &Value) -> BTreeSet<(String, String)> {
 }
 
 #[test]
-fn api_openapi_contains_every_owned_oracle_operation() {
-    let oracle: Value = serde_json::from_str(include_str!(
-        "../../../.omo/fixtures/oracle-openapi-1.18.18.json"
-    ))
-    .expect("checked-in oracle OpenAPI parses");
+fn api_openapi_contains_only_registered_zuno_operations() {
     let generated = api::openapi();
-    let expected = fixture_operations(&oracle);
-    assert_eq!(
-        expected.len(),
-        58,
-        "the measured task-owned surface changed"
-    );
-
     let actual = fixture_operations(&generated);
-    let missing = expected.difference(&actual).cloned().collect::<Vec<_>>();
-    assert!(
-        missing.is_empty(),
-        "generated OpenAPI is missing {missing:?}"
-    );
+    assert_eq!(actual.len(), 50, "the registered Zuno API surface changed");
+    for operation in [
+        ("/api/integration/{integrationID}/connect/key", "post"),
+        ("/api/integration/{integrationID}/connect/oauth", "post"),
+        ("/api/integration/attempt/{attemptID}", "get"),
+        ("/api/integration/attempt/{attemptID}/complete", "post"),
+        ("/api/integration/attempt/{attemptID}", "delete"),
+        ("/api/credential/{credentialID}", "patch"),
+        ("/api/credential/{credentialID}", "delete"),
+        ("/api/session/{sessionID}/permission", "post"),
+        ("/api/session/{sessionID}/permission/{requestID}", "get"),
+        ("/api/session/{sessionID}/message/{messageID}", "get"),
+    ] {
+        assert!(
+            !actual.contains(&(operation.0.to_owned(), operation.1.to_owned())),
+            "unimplemented operation is still advertised: {operation:?}"
+        );
+    }
 }
 
 #[test]
@@ -1211,7 +1213,7 @@ async fn api_prompt_wait_and_interrupt_share_one_live_turn_signal() {
         .oneshot(request(
             Method::POST,
             "/api/session/ses_mutation/agent",
-            Some(json!({"agent": "explore"})),
+            Some(json!({"agent": "explorer"})),
         ))
         .await
         .expect("busy mutation responds");
@@ -1540,7 +1542,7 @@ async fn api_agent_model_compact_and_revert_mutations_are_guarded_and_persisted(
         .router();
 
     for (path, body) in [
-        ("/api/session/ses_reads/agent", json!({"agent": "explore"})),
+        ("/api/session/ses_reads/agent", json!({"agent": "explorer"})),
         (
             "/api/session/ses_reads/model",
             json!({"model": {"providerID": "provider", "id": "model", "variant": "fast"}}),
@@ -1558,7 +1560,7 @@ async fn api_agent_model_compact_and_revert_mutations_are_guarded_and_persisted(
         .sessions()
         .get("ses_reads")
         .expect("session reads");
-    assert_eq!(session.agent.as_deref(), Some("explore"));
+    assert_eq!(session.agent.as_deref(), Some("explorer"));
     assert_eq!(
         session.model.as_deref(),
         Some(r#"{"id":"model","providerID":"provider","variant":"fast"}"#)
@@ -1588,12 +1590,12 @@ async fn api_agent_model_compact_and_revert_mutations_are_guarded_and_persisted(
         "both successful switch operations must append their projected messages: {context}"
     );
     assert_eq!(switched[0]["type"], "agent-switched");
-    assert_eq!(switched[0]["agent"], "explore");
+    assert_eq!(switched[0]["agent"], "explorer");
     assert!(
         switched[0]["id"]
             .as_str()
             .is_some_and(|id| id.starts_with("msg_")),
-        "agent switch uses an upstream-compatible message ID: {}",
+        "agent switch uses a native Zuno message ID: {}",
         switched[0]
     );
     assert!(switched[0]["time"]["created"].is_i64());
@@ -1606,7 +1608,7 @@ async fn api_agent_model_compact_and_revert_mutations_are_guarded_and_persisted(
         switched[1]["id"]
             .as_str()
             .is_some_and(|id| id.starts_with("msg_")),
-        "model switch uses an upstream-compatible message ID: {}",
+        "model switch uses a native Zuno message ID: {}",
         switched[1]
     );
     assert!(switched[1]["time"]["created"].is_i64());
@@ -1623,7 +1625,7 @@ async fn api_agent_model_compact_and_revert_mutations_are_guarded_and_persisted(
         .expect("message data is an array");
     assert!(
         message_data.iter().any(|message| {
-            message["type"] == "agent-switched" && message["agent"] == "explore"
+            message["type"] == "agent-switched" && message["agent"] == "explorer"
         }),
         "agent control message remains visible beside canonical messages: {messages}"
     );
@@ -1655,7 +1657,7 @@ async fn api_agent_model_compact_and_revert_mutations_are_guarded_and_persisted(
     assert_eq!(events.len(), 2, "both switch events are durable: {history}");
     assert_eq!(events[0]["type"], "session.next.agent.switched");
     assert_eq!(events[0]["data"]["sessionID"], "ses_reads");
-    assert_eq!(events[0]["data"]["agent"], "explore");
+    assert_eq!(events[0]["data"]["agent"], "explorer");
     assert!(events[0]["data"]["timestamp"].is_i64());
     assert!(
         events[0]["data"]["messageID"]

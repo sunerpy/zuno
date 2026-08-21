@@ -1,18 +1,16 @@
-//! The lean built-in agent roster: six named agents plus the engine's internals.
+//! The native delegation roster: `build`, six specialists, and engine internals.
 //!
-//! # Why this roster is small on purpose
+//! # Why this roster is bounded on purpose
 //!
 //! A delegation surface fails in two directions. Too few agents and every task
 //! funnels through one context window; too many and the primary agent spends its
-//! turn choosing a lane instead of doing work — delegation theater. The reference
-//! this project slims from, `oh-my-opencode-slim`, ships nine
-//! (`.omo/refs/omo-slim/src/config/constants.ts:7-20`); its parent ships ten. Six
-//! is the count that survives asking, for each agent, *what does the caller lose
-//! if this one is absent* — recorded as a keep/drop table in
-//! `.omo/drafts/opencode-rust.md`.
+//! turn choosing a lane instead of doing work. Each entry must justify what the
+//! caller loses if it is absent. `deep` is the deliberate seventh lane: unlike the
+//! bounded `worker`, it owns ambiguous cross-cutting implementation that needs a
+//! sustained research-to-verification pass.
 //!
-//! The mapping from slim's nine: `oracle` and `observer`'s advisory half collapse
-//! into [`ADVISOR`]; `fixer` becomes [`WORKER`] **without its amnesia**;
+//! The mapping from the OMO references: `oracle` and `observer`'s advisory half
+//! collapse into [`ADVISOR`]; `fixer` becomes [`WORKER`] **without its amnesia**;
 //! `designer` is dropped (this is not a UI-first tool, and its 0.7 temperature was
 //! the only thing the roster spent taste on); `council`/`councillor` are dropped —
 //! slim's own note prices multi-model consensus at "3x slower … 3x or more cost"
@@ -455,11 +453,28 @@ impl Agent {
         strings.push(self.summary_line());
         strings
     }
+
+    /// The model-visible policy derived from the roster.
+    ///
+    /// The catalog owns the base role prompt. This block adds the negative
+    /// delegation boundary and the output format from the same data the `task`
+    /// validator reads, so documentation, validation, and actual child behavior
+    /// cannot silently disagree.
+    #[must_use]
+    pub fn prompt_policy(&self) -> String {
+        let mut policy = self.boundary.render();
+        if let OutputContract::Envelope(envelope) = self.output {
+            policy.push_str("\n\n");
+            policy.push_str(&envelope.render());
+        }
+        policy
+    }
 }
 
-/// The names of the six agents this project designs, in roster order.
-pub const LEAN_NAMES: [&str; 6] = [
-    "orchestrator",
+/// The names of the seven user-facing agents, in roster order.
+pub const LEAN_NAMES: [&str; 7] = [
+    "build",
+    "deep",
     "explorer",
     "librarian",
     "advisor",
@@ -467,14 +482,10 @@ pub const LEAN_NAMES: [&str; 6] = [
     "looker",
 ];
 
-/// The engine's own agents, which the lean roster carries unchanged.
+/// The engine's own agents, which the delegation roster carries unchanged.
 ///
-/// This is the *hidden* subset of the upstream seven
-/// (`packages/opencode/src/agent/agent.ts:140-265`, ported as data in
-/// [`zuno_catalog::agent::builtin`]). The four visible natives are replaced rather
-/// than carried: `build` by [`ORCHESTRATOR`], `explore` by [`EXPLORER`], `general`
-/// by [`WORKER`], and `plan` — see the note on [`internals`] for why that one is a
-/// deliberate omission and not an oversight.
+/// The visible catalog entries are Zuno-native and align with this roster. `plan`
+/// remains a primary mode rather than a delegation target; see [`internals`].
 pub const INTERNAL_NAMES: [&str; 3] = ["compaction", "title", "summary"];
 
 const ORCHESTRATOR_ENVELOPE: Envelope = Envelope {
@@ -493,6 +504,32 @@ const ORCHESTRATOR_ENVELOPE: Envelope = Envelope {
         Section {
             tag: "next",
             hint: "Work deliberately left undone, and why.",
+            required: false,
+        },
+    ],
+};
+
+const DEEP_ENVELOPE: Envelope = Envelope {
+    root: "deep-work",
+    sections: &[
+        Section {
+            tag: "assessment",
+            hint: "The established current behavior and the owning implementation.",
+            required: true,
+        },
+        Section {
+            tag: "changes",
+            hint: "One line per material file or module changed.",
+            required: true,
+        },
+        Section {
+            tag: "verification",
+            hint: "Commands run, outcomes, and important recovery paths exercised.",
+            required: true,
+        },
+        Section {
+            tag: "residual",
+            hint: "Unverified assumptions or remaining risk.",
             required: false,
         },
     ],
@@ -627,9 +664,9 @@ const READ_ONLY_DENIED: &[&str] = &[
 /// The inspection tools every read-only agent may call.
 const READ_ONLY_ALLOWED: &[&str] = &["read", "glob", "grep", "lsp"];
 
-/// The primary, write-capable agent — the only one that may delegate.
-pub const ORCHESTRATOR: Agent = Agent {
-    name: "orchestrator",
+/// The primary, write-capable agent - the only one that may delegate.
+pub const BUILD: Agent = Agent {
+    name: "build",
     role: Role::Orchestrator,
     mode: AgentMode::Primary,
     hidden: false,
@@ -664,6 +701,45 @@ pub const ORCHESTRATOR: Agent = Agent {
         extension_tools: ExtensionTools::Inherit,
     },
     delegation: Delegation::MayDelegate,
+    write: Write::Capable,
+    research: Research::Allowed,
+    gate: Gate::Always,
+};
+
+/// Thorough cross-cutting implementation without recursive delegation.
+pub const DEEP: Agent = Agent {
+    name: "deep",
+    role: Role::Subagent,
+    mode: AgentMode::Subagent,
+    hidden: false,
+    description: "Owns one difficult cross-cutting objective from evidence gathering through \
+                  implementation and verification. Uses a larger investigation budget than a \
+                  bounded worker but cannot spawn children.",
+    boundary: Boundary::DontDelegateWhen(
+        "the change is already well specified and local enough for `worker` • the caller needs \
+         only repository locations or external research • the task still needs product \
+         decisions from the primary session • the work can be verified in one small edit.",
+    ),
+    temperature: 0.1,
+    output: OutputContract::Envelope(DEEP_ENVELOPE),
+    permissions: Permissions {
+        denied: &["task", "question", "plan_exit"],
+        allowed: &[
+            "read",
+            "glob",
+            "grep",
+            "lsp",
+            "edit",
+            "bash",
+            "webfetch",
+            "web_search",
+            "todowrite",
+            "skill",
+            "execute",
+        ],
+        extension_tools: ExtensionTools::Excluded,
+    },
+    delegation: Delegation::NoChildren,
     write: Write::Capable,
     research: Research::Allowed,
     gate: Gate::Always,
@@ -841,13 +917,13 @@ pub const LOOKER: Agent = Agent {
     gate: Gate::VisionModel,
 };
 
-/// The six named agents, gate ignored.
+/// The seven named agents, gate ignored.
 ///
 /// Use [`roster`] for the set that actually ships; this is the complete design, for
 /// tests and for `agent list --all`.
 #[must_use]
 pub fn lean() -> Vec<Agent> {
-    vec![ORCHESTRATOR, EXPLORER, LIBRARIAN, ADVISOR, WORKER, LOOKER]
+    vec![BUILD, DEEP, EXPLORER, LIBRARIAN, ADVISOR, WORKER, LOOKER]
 }
 
 /// The engine's internal agents.
@@ -862,16 +938,9 @@ pub fn lean() -> Vec<Agent> {
 /// carried here by reference to [`zuno_catalog::agent::builtin`] so the upstream
 /// prompt text stays in exactly one place.
 ///
-/// `plan` is the fourth native this roster does not reproduce, and that is a
-/// judgement call worth recording rather than hiding: it is a *visible* primary
-/// mode, not an engine internal, and its purpose — a primary agent that cannot
-/// edit — is a permission overlay over a primary agent, which is what
-/// `zuno_catalog::agent::builtin::plan` already carries. Reproducing it here would
-/// mean two roster entries claiming the same name. The consequence to be aware of
-/// is that `plan_exit` (`zuno-tools/src/registry.rs:68`) is denied by every entry in
-/// this roster, so plan mode continues to come from the catalog's natives; if a
-/// later todo makes this roster the *only* source of agents, plan mode has to be
-/// re-added here first.
+/// `plan` is a visible primary mode, not a task target. Its read-only edit policy
+/// depends on a session-specific plan path, so the catalog and CLI composition root
+/// own it instead of duplicating it in this static delegation roster.
 #[must_use]
 pub fn internals() -> Vec<Agent> {
     INTERNAL_NAMES
@@ -981,9 +1050,9 @@ pub fn get(name: &str, vision_available: bool) -> Option<Agent> {
 
 /// Valid `task` targets: everything a caller may actually name.
 ///
-/// Todo 65's `task` tool rejects a `subagent_type` outside this set, and rejects
-/// the orchestrator specifically — a coordinator cannot be a delegation target
-/// without reopening the recursion this roster closes with
+/// The `task` tool rejects a `subagent_type` outside this set, and rejects `build`
+/// specifically: a coordinator cannot be a delegation target without reopening
+/// the recursion this roster closes with
 /// [`Delegation::NoChildren`].
 #[must_use]
 pub fn delegable(vision_available: bool) -> Vec<Agent> {

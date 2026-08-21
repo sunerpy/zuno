@@ -28,6 +28,24 @@ fn agent(name: &str) -> Agent {
     }
 }
 
+fn traced_resolver(prompt: &str) -> Resolver {
+    let mut assembly = PromptAssembly::new();
+    assembly
+        .push("agent.base", "test:agent", prompt)
+        .expect("test prompt section");
+    Resolver {
+        requested_agent: "build".to_owned(),
+        system_prompt: assembly.render(),
+        prompt_assembly: Some(assembly),
+        max_steps: DEFAULT_MAX_STEPS,
+        requested_provider: "provider".to_owned(),
+        requested_model: "model".to_owned(),
+        wire_model: "model".to_owned(),
+        spec: Spec::new(COMPATIBLE_PROVIDER),
+        reasoning_options: serde_json::Map::new(),
+    }
+}
+
 /// The delegation collaborators a test supplies to reach [`tool_runtime::assemble`].
 ///
 /// A recording host and no catalog facts, because none of these assertions drive a
@@ -65,6 +83,7 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         resolver: Resolver {
             requested_agent: agent.name.clone(),
             system_prompt: String::new(),
+            prompt_assembly: None,
             max_steps: DEFAULT_MAX_STEPS,
             requested_provider: "provider".to_owned(),
             requested_model: "model".to_owned(),
@@ -130,6 +149,37 @@ fn goal_retry_policy_resolves_defaults_and_rejects_invalid_ranges() {
     });
     let error = resolve_goal_retry_policy(&config).expect_err("jitter above 100 is invalid");
     assert!(error.contains("0..=100"), "{error}");
+}
+
+#[test]
+fn unresolved_tool_failures_choose_safe_or_uncertain_goal_recovery() {
+    assert_eq!(goal_tool_failure(&[]), None);
+
+    let safe = ToolFailureRecovery {
+        tool: "web_search".to_owned(),
+        replay_policy: zuno_tool::ToolReplayPolicy::Safe,
+        retry_after: Some(Duration::from_secs(3)),
+    };
+    assert_eq!(
+        goal_tool_failure(std::slice::from_ref(&safe)),
+        Some(GoalTerminalFailure::Retry {
+            reason: GoalRetryReason::ToolTransient,
+            retry_after: Some(Duration::from_secs(3)),
+        })
+    );
+
+    let uncertain = ToolFailureRecovery {
+        tool: "bash".to_owned(),
+        replay_policy: zuno_tool::ToolReplayPolicy::Never,
+        retry_after: Some(Duration::from_secs(7)),
+    };
+    assert_eq!(
+        goal_tool_failure(&[safe, uncertain]),
+        Some(GoalTerminalFailure::Retry {
+            reason: GoalRetryReason::ToolUncertain,
+            retry_after: Some(Duration::from_secs(7)),
+        })
+    );
 }
 
 #[test]
@@ -238,16 +288,7 @@ fn production_prompt_composition_honours_the_memory_master_switch() {
         )])
         .expect("seed memory");
     let base = "SYSTEM\r\n${UNCHANGED}\n终";
-    let resolver = || Resolver {
-        requested_agent: "build".to_owned(),
-        system_prompt: base.to_owned(),
-        max_steps: DEFAULT_MAX_STEPS,
-        requested_provider: "provider".to_owned(),
-        requested_model: "model".to_owned(),
-        wire_model: "model".to_owned(),
-        spec: Spec::new(COMPATIBLE_PROVIDER),
-        reasoning_options: serde_json::Map::new(),
-    };
+    let resolver = || traced_resolver(base);
 
     let mut disabled = resolver();
     let config = serde_json::from_str(r#"{"memory":false}"#).expect("disabled config");
@@ -263,6 +304,99 @@ fn production_prompt_composition_honours_the_memory_master_switch() {
             .contains("production composition sentinel")
     );
     assert_ne!(enabled.system_prompt.as_bytes(), base.as_bytes());
+}
+
+#[tokio::test]
+async fn prompt_assembly_records_agent_memory_instructions_and_skills_in_order() {
+    let root = tempfile::TempDir::new().expect("temporary prompt root");
+    let repo = root.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo");
+    let paths = zuno_tools::ScopePaths::at(
+        root.path().join("global/MEMORY.md"),
+        repo.join(".zuno/RULES.md"),
+    );
+    for (scope, marker) in [
+        (zuno_memory::Scope::Global, "GLOBAL_MEMORY"),
+        (zuno_memory::Scope::Project, "PROJECT_MEMORY"),
+    ] {
+        let mut store = zuno_memory::MemoryStore::open(scope, paths.for_scope(scope).to_path_buf())
+            .expect("open memory store");
+        store
+            .apply_batch(&[zuno_memory::Operation::add(marker)])
+            .expect("seed memory");
+    }
+    std::fs::write(repo.join("AGENTS.md"), "PROJECT_INSTRUCTIONS").expect("write instructions");
+    let env = Env::empty()
+        .with(
+            zuno_paths::env::HOME,
+            root.path().join("home").to_string_lossy().into_owned(),
+        )
+        .with(
+            zuno_paths::env::XDG_CONFIG_HOME,
+            root.path()
+                .join("home/.config")
+                .to_string_lossy()
+                .into_owned(),
+        );
+    let loaded = zuno_config::Instructions::discover(&zuno_config::InstructionOptions::new(
+        repo.clone(),
+        Some(repo.clone()),
+        &env,
+        Vec::new(),
+    ))
+    .load()
+    .await;
+    let skills = zuno_catalog::skill::Skills::from_loaded([zuno_catalog::skill::Skill {
+        name: "verify".to_owned(),
+        description: Some("Verify the assembled result.".to_owned()),
+        location: "/skills/verify/SKILL.md".to_owned(),
+        content: "body".to_owned(),
+    }]);
+    let mut resolver = traced_resolver("AGENT");
+    let mut notes = Vec::new();
+
+    configure_resident_memory(
+        &mut resolver,
+        &zuno_config::schema::Config::default(),
+        paths,
+    )
+    .expect("inject memory");
+    announce_instructions(&mut resolver, &loaded, &mut notes).expect("inject instructions");
+    announce_skills(&mut resolver, &skills, &mut notes).expect("inject skills");
+
+    let assembly = resolver
+        .prompt_assembly
+        .as_ref()
+        .expect("structured prompt assembly");
+    assert_eq!(
+        assembly
+            .sections()
+            .iter()
+            .map(|section| section.id())
+            .collect::<Vec<_>>(),
+        vec![
+            "agent.base",
+            "memory.global",
+            "memory.project",
+            "instructions.0",
+            "skills.catalog",
+        ]
+    );
+    assert_eq!(
+        assembly.sections()[1].source(),
+        root.path().join("global/MEMORY.md").display().to_string()
+    );
+    assert_eq!(
+        assembly.sections()[2].source(),
+        repo.join(".zuno/RULES.md").display().to_string()
+    );
+    assert_eq!(
+        assembly.sections()[3].source(),
+        repo.join("AGENTS.md").display().to_string()
+    );
+    assert_eq!(assembly.sections()[4].source(), "discovered skills");
+    assert_eq!(resolver.system_prompt, assembly.render());
+    assert!(notes.is_empty(), "{notes:?}");
 }
 
 /// Two models under one provider, with `title` overridden to the smaller one.
@@ -2779,6 +2913,7 @@ async fn run_compatible_turn(
     let resolver = Resolver {
         requested_agent: "build".to_owned(),
         system_prompt: String::new(),
+        prompt_assembly: None,
         max_steps: DEFAULT_MAX_STEPS,
         requested_provider: "provider".to_owned(),
         requested_model: "model".to_owned(),
@@ -3156,16 +3291,7 @@ mod skill_prompt {
     }
 
     fn resolver() -> Resolver {
-        Resolver {
-            requested_agent: "build".to_owned(),
-            system_prompt: "AGENT PROMPT".to_owned(),
-            max_steps: DEFAULT_MAX_STEPS,
-            requested_provider: "provider".to_owned(),
-            requested_model: "model".to_owned(),
-            wire_model: "model".to_owned(),
-            spec: Spec::new(COMPATIBLE_PROVIDER),
-            reasoning_options: serde_json::Map::new(),
-        }
+        traced_resolver("AGENT PROMPT")
     }
 
     #[test]
@@ -3174,7 +3300,7 @@ mod skill_prompt {
         let mut resolver = resolver();
         let mut notes = Vec::new();
 
-        announce_skills(&mut resolver, &skills, &mut notes);
+        announce_skills(&mut resolver, &skills, &mut notes).expect("announce skills");
 
         assert!(
             resolver.system_prompt.starts_with("AGENT PROMPT"),
@@ -3204,7 +3330,8 @@ mod skill_prompt {
             &mut resolver,
             &zuno_catalog::skill::Skills::default(),
             &mut notes,
-        );
+        )
+        .expect("empty catalogue");
 
         assert_eq!(resolver.system_prompt.as_bytes(), before.as_bytes());
         assert!(notes.is_empty());
@@ -3223,7 +3350,7 @@ mod skill_prompt {
         let mut resolver = resolver();
         let mut notes = Vec::new();
 
-        announce_skills(&mut resolver, &skills, &mut notes);
+        announce_skills(&mut resolver, &skills, &mut notes).expect("announce bounded skills");
 
         assert!(
             resolver.system_prompt.len() < "AGENT PROMPT".len() + SKILL_PROMPT_BUDGET + 1,
@@ -3281,23 +3408,14 @@ mod instruction_prompt {
     }
 
     fn resolver() -> Resolver {
-        Resolver {
-            requested_agent: "build".to_owned(),
-            system_prompt: "AGENT PROMPT".to_owned(),
-            max_steps: DEFAULT_MAX_STEPS,
-            requested_provider: "provider".to_owned(),
-            requested_model: "model".to_owned(),
-            wire_model: "model".to_owned(),
-            spec: Spec::new(COMPATIBLE_PROVIDER),
-            reasoning_options: serde_json::Map::new(),
-        }
+        traced_resolver("AGENT PROMPT")
     }
 
     async fn inject(options: &zuno_config::InstructionOptions) -> (Resolver, Vec<String>) {
         let loaded = zuno_config::Instructions::discover(options).load().await;
         let mut resolver = resolver();
         let mut notes = Vec::new();
-        announce_instructions(&mut resolver, &loaded, &mut notes);
+        announce_instructions(&mut resolver, &loaded, &mut notes).expect("announce instructions");
         (resolver, notes)
     }
 

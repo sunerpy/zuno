@@ -11,6 +11,7 @@
 - [Install](#install)
 - [Quick start](#quick-start)
 - [Harness runtime](#harness-runtime)
+- [Extending agents and workflows](#extending-agents-and-workflows)
 - [Documentation](#documentation)
 - [Independent runtime](#independent-runtime)
 - [Development](#development)
@@ -21,9 +22,9 @@
 Zuno is a standalone command-line AI coding agent: local session storage, pluggable model
 providers, its own tool set, and a built-in TUI. `unsafe_code` is forbidden workspace-wide.
 
-It reads its own configuration and data, not opencode's. Zuno does not retain the OpenCode plugin
-ABI, JavaScript hooks, HTTP compatibility routes, or configuration shims. Extensions use the
-native [Harness runtime](#harness-runtime).
+Zuno defines only its own configuration, data, commands, tool arguments, and extension protocols.
+It does not retain the OpenCode plugin ABI, JavaScript hooks, HTTP compatibility routes, or
+configuration shims. Extensions use the native [Harness runtime](#harness-runtime).
 
 ## Install
 
@@ -46,9 +47,8 @@ $ zuno --help
 $ zuno --version --long
 ```
 
-`zuno export` and `zuno import` close Zuno's own round trip: `import` accepts only a local document
-that `export` produced, never an opencode session and never a share URL. Both are **top-level**
-commands, not subcommands of `session` — `zuno session` carries only `list`, `prune`, and `delete`.
+`zuno export` and `zuno import` close Zuno's own round trip. Both are **top-level** commands, not
+subcommands of `session`; `zuno session` carries only `list`, `prune`, and `delete`.
 
 ## Harness runtime
 
@@ -66,19 +66,67 @@ sibling requests after the first failure, waits for settlement, and merges resul
 with URL deduplication. Active goals persist exponential backoff for network, rate-limit, truncated
 stream, database-lock, and turn-budget failures, then reconstruct the deadline when the session is
 reopened. Human input wins over automatic work. Tool failures become model-visible tool results and
-are never replayed mechanically; authentication, cancellation, and permanent configuration failures
-pause or block instead. See [the Harness Runtime guide](../harness-runtime.md).
+are never replayed mechanically. Only read-only or idempotent tools that explicitly declare `Safe`
+may be attempted by the model in a later turn; uncertain side effects require authoritative-state
+inspection. Authentication, cancellation, and permanent configuration failures pause or block.
+
+`build`, `plan`, `deep`, and the specialist agents share one native catalog. The final model prompt
+is assembled as agent, policy, memory, instruction, and skill sections, then persisted as
+`session.prompt.assembled` with order, source, content digests, and the actual post-hook text. See
+[the Harness Runtime guide](../harness-runtime.md).
+
+## Extending agents and workflows
+
+Put a custom agent under `.zuno/agent/`. Its path supplies the default name, frontmatter selects
+model, mode, permissions, and steps, and the body becomes a traced prompt section:
+
+```markdown
+---
+description: Review a change for security and authorization defects
+mode: subagent
+permission:
+  edit: deny
+  bash: deny
+---
+
+Inspect trust boundaries, permission checks, durable state, and failure behavior.
+Return findings with exact file locations.
+```
+
+A native workflow does not modify the default loop. Implement `AgentDriver`, select a
+model-visible `ToolManifest`, contribute any native tools, and activate the result as one
+transactional profile:
+
+```rust
+let profile = zuno_harness::profile_with_tools(
+    "release-review",
+    Arc::new(ReleaseReviewDriver::new()),
+    ToolManifest::new([BuiltinSlot::Read, BuiltinSlot::Grep, BuiltinSlot::Task])?,
+    ToolContributions::new([Arc::new(ReleaseSummaryTool::new())])?,
+);
+
+runtime.activate_profile(profile).await?;
+```
+
+Profiles can also mount providers, remote executors, approvals, evaluations, or benchmark
+components. Each registration returns its exact disposer; a candidate profile is published only
+after complete validation and otherwise rolls back in reverse order. The same extension works
+through TUI, headless, ACP, HTTP, and future GUI clients because they consume shared commands,
+durable events, the inbox, and projections. See the
+[harness comparison](../design/harness-comparison.md) and
+[client interface architecture](../design/client-interfaces.md).
 
 ## Documentation
 
-| Page                                              | Purpose                                                                  |
-| ------------------------------------------------- | ------------------------------------------------------------------------ |
-| [Harness Runtime](../harness-runtime.md)          | Native components, profile transactions, durable input, custom harnesses |
-| [Rejected inputs](../rejected-inputs.md)          | Deprecated configuration forms, replacements, and exact errors           |
-| [Database lifecycle](../migration.md)             | Zuno database selection, legacy-filename diagnostics, and schema changes |
-| [Session retention](../session-retention.md)      | Reversible archive and irreversible delete operations                    |
-| [Resource gates](../resource-gates.md)            | Measured results for the six gates, opt-in commands, and known limits    |
-| [Performance methodology](../perf-methodology.md) | How memory and liveness gates are measured                               |
+| Page                                                  | Purpose                                                                  |
+| ----------------------------------------------------- | ------------------------------------------------------------------------ |
+| [Harness Runtime](../harness-runtime.md)              | Native components, profile transactions, durable input, custom harnesses |
+| [Harness comparison](../design/harness-comparison.md) | Decisions from DSH, Codex, OMO, pi-agent, OpenCode, and Claw Code        |
+| [Client interfaces](../design/client-interfaces.md)   | Shared events and projections for TUI, ACP, HTTP, and a future GUI       |
+| [Database lifecycle](../migration.md)                 | Zuno database selection and schema changes                               |
+| [Session retention](../session-retention.md)          | Reversible archive and irreversible delete operations                    |
+| [Resource gates](../resource-gates.md)                | Measured results for the six gates, opt-in commands, and known limits    |
+| [Performance methodology](../perf-methodology.md)     | How memory and liveness gates are measured                               |
 
 `cargo test -p zuno-cli --test docs` checks that the Harness guide covers runtime lifecycle,
 durable delivery, and concurrent search, and prevents the READMEs from advertising retired
@@ -86,17 +134,14 @@ compatibility surfaces.
 
 ## Independent runtime
 
-Zuno uses `$XDG_CONFIG_HOME/zuno`, project `.zuno` directories, and `$XDG_DATA_HOME/zuno`. It never
-falls back to the corresponding opencode roots, and it provides no way to adopt an opencode session:
-`zuno import` reads Zuno's own `zuno export` documents only. Old roots appear only in
-upstream-only fixtures, source notes, or historical evidence.
+Zuno uses `$XDG_CONFIG_HOME/zuno`, project `.zuno` directories, and `$XDG_DATA_HOME/zuno`. Other
+products' roots and files are not Zuno inputs and are not probed, migrated, or interpreted.
 
 The config **filename** is Zuno's own too: every layer reads `zuno.jsonc` and `zuno.json` and
 nothing else — the config root, a bare file on the walk up from the working directory to the
 worktree root, `.zuno/`, the directory named by `ZUNO_CONFIG_DIR`, and the managed directory.
-JSONC and strict JSON only; there is **no TOML config path**. `opencode.jsonc`, `opencode.json`, and
-a `config.json` in the config root are no longer read: a user still holding one of those names gets
-a startup error naming the file, its directory, and the name to rename it to, rather than silence.
+JSONC and strict JSON only; there is **no TOML config path**. Other filenames are ordinary files in
+the directory and never enter Zuno's configuration graph.
 
 Zuno's user interface, default paths, environment variables, and extension protocol all use Zuno's
 identity.

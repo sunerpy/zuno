@@ -8,7 +8,7 @@ use std::sync::Arc;
 use zuno_db::Pool;
 use zuno_db::job::{AgentJob, AgentJobStore, JobStatus, ReportDelivery};
 use zuno_error::{DbError, ToolError};
-use zuno_tool::{ToolContext, ToolOutput, TypedTool};
+use zuno_tool::{ToolContext, ToolOutput, ToolReplayPolicy, TypedTool};
 
 /// The tool identifier exposed to models.
 pub const WIRE_ID: &str = "job";
@@ -51,6 +51,10 @@ impl TypedTool for JobTool {
 
     fn description(&self) -> &str {
         DESCRIPTION
+    }
+
+    fn replay_policy(&self) -> ToolReplayPolicy {
+        ToolReplayPolicy::Safe
     }
 
     async fn run(&self, params: JobParams, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
@@ -121,5 +125,16 @@ fn not_found(job_id: &str) -> ToolError {
             std::io::ErrorKind::NotFound,
             format!("job `{job_id}` was not found for this session"),
         )),
+    }
+}
+
+#[cfg(test)]
+mod replay_policy_tests {
+    use super::*;
+
+    #[test]
+    fn durable_job_inspection_is_safe_to_repeat() {
+        let pool = Arc::new(Pool::open(&zuno_paths::DbLocation::Memory).expect("job database"));
+        assert_eq!(JobTool::new(pool).replay_policy(), ToolReplayPolicy::Safe);
     }
 }

@@ -38,6 +38,10 @@ pub enum GoalRetryReason {
     ContextLimit,
     /// Compaction completed durably and the provider request may be retried directly.
     ContextCompacted,
+    /// A read-only or idempotent tool failed transiently.
+    ToolTransient,
+    /// A retryable tool failure may already have produced an external side effect.
+    ToolUncertain,
 }
 
 impl GoalRetryReason {
@@ -54,6 +58,8 @@ impl GoalRetryReason {
             Self::EmptyAssistantMessage => "empty_assistant_message",
             Self::ContextLimit => "context_limit",
             Self::ContextCompacted => "context_compacted",
+            Self::ToolTransient => "tool_transient",
+            Self::ToolUncertain => "tool_uncertain",
         }
     }
 
@@ -68,6 +74,8 @@ impl GoalRetryReason {
             "empty_assistant_message" => Some(Self::EmptyAssistantMessage),
             "context_limit" => Some(Self::ContextLimit),
             "context_compacted" => Some(Self::ContextCompacted),
+            "tool_transient" => Some(Self::ToolTransient),
+            "tool_uncertain" => Some(Self::ToolUncertain),
             _ => None,
         }
     }
@@ -165,10 +173,10 @@ impl GoalRetryPolicy {
     /// Select the delay for a one-based consecutive failure count.
     #[must_use]
     pub fn delay(self, attempt: u32, retry_after: Option<Duration>, entropy: u64) -> Duration {
-        if let Some(retry_after) =
-            retry_after.filter(|delay| !delay.is_zero() && *delay <= self.max_delay)
-        {
-            return retry_after;
+        if let Some(retry_after) = retry_after.filter(|delay| !delay.is_zero()) {
+            return retry_after
+                .min(self.max_delay)
+                .max(Duration::from_millis(1));
         }
         let local = exponential_delay(self.initial_delay, self.max_delay, attempt);
         jittered_delay(local, self.max_delay, self.jitter_percent, entropy)
@@ -236,7 +244,7 @@ fn jittered_delay(base: Duration, maximum: Duration, jitter_percent: u8, entropy
         .checked_div(u128::from(u64::MAX))
         .unwrap_or_default();
     let jittered_ms = base_ms.saturating_sub(span).saturating_add(position);
-    let capped_ms = jittered_ms.min(maximum.as_millis());
+    let capped_ms = jittered_ms.max(1).min(maximum.as_millis());
     Duration::from_millis(u64::try_from(capped_ms).unwrap_or(u64::MAX))
 }
 

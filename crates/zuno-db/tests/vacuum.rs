@@ -90,7 +90,7 @@ impl Fixture {
     /// length of a file. An in-memory database has none.
     fn build() -> Self {
         let directory = tempfile::tempdir().expect("tempdir");
-        let path = directory.path().join("opencode.db");
+        let path = directory.path().join("zuno.db");
         let mut connection = open::open_at(&path).expect("open file database");
         migration::apply(&mut connection).expect("apply schema");
         seed(&mut connection);
@@ -234,7 +234,7 @@ fn vacuum_a_prune_alone_reclaims_nothing_and_an_explicit_vacuum_reclaims_bytes()
         )
         .expect("read auto_vacuum"),
         0,
-        "the compatibility schema must leave auto_vacuum NONE"
+        "the Zuno schema must leave auto_vacuum NONE"
     );
 
     let baseline = fixture.size();

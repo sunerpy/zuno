@@ -198,7 +198,7 @@ fn an_unknown_agent_key_lands_in_options() {
     let agent = agent(json!({ "reasoningEffort": "high" }));
     let options = agent.options.as_ref().expect("options materialized");
     assert_eq!(options["reasoningEffort"], json!("high"));
-    // The key is also kept verbatim, so the legacy-rejection pass can still see it.
+    // The source key remains available to config merging and diagnostics.
     assert_eq!(agent.extra["reasoningEffort"], json!("high"));
 }
 
@@ -248,8 +248,6 @@ fn an_explicit_empty_options_object_survives() {
 fn sweep_exempt_keys_never_become_provider_options() {
     let agent = agent(json!({
         "name": "build",
-        "tools": { "write": false },
-        "maxSteps": 40,
         "reasoningEffort": "high",
     }));
     let options = agent.options.as_ref().expect("options materialized");
@@ -260,7 +258,7 @@ fn sweep_exempt_keys_never_become_provider_options() {
         );
         assert!(
             agent.extra.contains_key(*exempt),
-            "{exempt} must still be visible for legacy rejection"
+            "{exempt} must remain available to the catalog"
         );
     }
     assert_eq!(options["reasoningEffort"], json!("high"));
@@ -332,8 +330,6 @@ fn deprecated_top_level_keys_are_not_accepted() {
 
 #[test]
 fn every_unrecognized_top_level_key_gets_its_own_issue() {
-    // Near-misses of the exempt legacy keys, so a substring or prefix match in the
-    // exemption would fail here rather than silently widen it.
     let error = parse_value(json!({ "themes": "system", "keybind": {}, "model": "a/b" }))
         .expect_err("must be rejected");
     let ConfigError::Invalid { issues, .. } = &error else {
@@ -348,78 +344,39 @@ fn every_unrecognized_top_level_key_gets_its_own_issue() {
 }
 
 // ---------------------------------------------------------------------------
-// Acceptance: the legacy TUI keys are accepted and discarded, as upstream does.
+// Acceptance: Zuno accepts no retired top-level spellings.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn the_legacy_tui_keys_are_accepted_and_do_not_survive() {
-    let config = parse_value(json!({
-        "model": "a/b",
-        "theme": "system",
-        "keybinds": { "leader": "ctrl+x" },
-        "tui": { "scroll_speed": 3, "diff_style": "stacked" },
-    }))
-    .expect("a live config carrying the legacy TUI keys must load");
-    assert_eq!(config.model.as_deref(), Some("a/b"));
-
-    let serialized = serde_json::to_value(&config).expect("serializes");
-    let keys: Vec<&str> = serialized
-        .as_object()
-        .expect("an object")
-        .keys()
-        .map(String::as_str)
-        .collect();
-    assert_eq!(keys, vec!["model"], "the legacy keys must be dropped");
-
-    // Equal to the same config without them, because the oracle deletes them.
-    assert_eq!(
-        config,
-        parse_value(json!({ "model": "a/b" })).expect("loads")
-    );
-}
-
-#[test]
-fn the_legacy_tui_keys_accept_any_shape_the_oracle_would_have_deleted() {
-    for shape in [
-        json!("system"),
-        json!(null),
-        json!(7),
-        json!(false),
-        json!([1, 2]),
-        json!({ "nested": { "deep": true } }),
-    ] {
-        for key in LEGACY_TUI_KEYS {
-            parse_value(json!({ *key: shape.clone() }))
-                .unwrap_or_else(|e| panic!("{key} = {shape} must load: {e:?}"));
-        }
-    }
-}
-
-#[test]
-fn the_legacy_exemption_covers_exactly_three_keys() {
-    assert_eq!(LEGACY_TUI_KEYS, &["theme", "keybinds", "tui"]);
-    for key in LEGACY_TUI_KEYS {
+fn retired_tui_keys_are_unknown_top_level_fields() {
+    for key in ["theme", "keybinds", "tui"] {
+        let error = parse_value(json!({ key: {} })).expect_err("retired key must be rejected");
         assert!(
-            !KNOWN_TOP_LEVEL_KEYS.contains(key),
-            "{key} must not join the set that survives the merge"
+            error.report().contains("unrecognized key"),
+            "{}",
+            error.report()
         );
     }
 }
 
 #[test]
-fn deprecated_agent_keys_stay_visible_but_unnamed() {
-    let config = parse_value(json!({
-        "agent": { "build": { "tools": { "write": false }, "maxSteps": 40 } }
-    }))
-    .expect("the oracle's rest record accepts them");
-    let build = config
-        .agent
-        .as_ref()
-        .and_then(|agents| agents.get("build"))
-        .expect("agent present");
-    assert!(build.extra.contains_key("tools"));
-    assert!(build.extra.contains_key("maxSteps"));
-    assert!(build.options.is_none(), "neither may reach options");
+fn unsupported_agent_fields_fail_inside_the_native_schema() {
+    for key in ["tools", "maxSteps"] {
+        let error = parse_value(json!({ "agent": { "build": { key: {} } } }))
+            .expect_err("unsupported field");
+        assert!(error.report().contains(key), "{}", error.report());
+    }
+}
+
+#[test]
+fn an_agent_variant_requires_an_explicit_model() {
+    let error = parse_value(json!({ "agent": { "build": { "variant": "high" } } }))
+        .expect_err("a model owns its variant vocabulary");
+    assert!(
+        error.report().contains("requires an explicit `model`"),
+        "{}",
+        error.report()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -867,18 +824,10 @@ fn the_curated_config_examples_all_deserialize() {
 fn the_real_user_config_deserializes() {
     let text = fixture("user-config.json");
     let strict = crate::discovery::strip_jsonc(&text);
-    let mut before: Value = serde_json::from_str(&strict).expect("valid JSONC");
+    let before: Value = serde_json::from_str(&strict).expect("valid JSONC");
     let config = parse(&strict).expect("the user's own config must load");
     let after = serde_json::to_value(&config).expect("serializes");
 
-    // `theme` stays in the fixture: a copy that omits it is friendlier than the
-    // live file and hides this defect. It is expected not to survive the parse.
-    let stripped = before
-        .as_object_mut()
-        .expect("fixture is an object")
-        .remove("theme");
-    assert_eq!(stripped, Some(Value::from("system")));
-    assert!(after.get("theme").is_none(), "theme must not survive");
     assert_contains(&after, &before, "user-config.json");
     assert!(config.mcp.as_ref().expect("mcp present").len() >= 8);
     // `permission.todoread` is not one of the oracle's named keys and must survive.

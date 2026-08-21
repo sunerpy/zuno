@@ -97,7 +97,7 @@ pub const GENERIC_EXECUTOR: &str = "worker";
 /// Not a special case bolted on here: it is the single [`zuno_agent::builtin::Role`]
 /// that is not `Subagent`, so [`delegable`] already excludes it and this constant
 /// exists only to render the refusal.
-pub const COORDINATOR: &str = "orchestrator";
+pub const COORDINATOR: &str = "build";
 
 /// The description the model reads.
 ///

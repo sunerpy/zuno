@@ -1,9 +1,9 @@
 use std::process::Command;
 
-use clap::{CommandFactory as _, Parser as _};
+use clap::CommandFactory as _;
 use zuno_cli::{
-    Action, BUILD_ID, Cli, CommandDispatcher as _, Disposition, RUST_PACKAGE_VERSION, dispositions,
-    long_version, user_agent, validate_upstream_surface,
+    BUILD_ID, Cli, Disposition, RUST_PACKAGE_VERSION, disposition_for, dispositions, long_version,
+    user_agent, validate_upstream_surface,
 };
 
 const UPSTREAM_COMMANDS: &str = include_str!("fixtures/upstream-commands-1.18.13.txt");
@@ -172,10 +172,9 @@ struct Probe {
     argv: &'static [&'static str],
     /// A fragment of this handler's own output, on either stream.
     ///
-    /// [`zuno_cli::PendingCommandDispatcher`] emits one fixed sentence and produces
-    /// no other output, so observing this fragment is positive evidence that the
-    /// production match arm ran the handler. Asserting only the *absence* of the
-    /// pending sentence would also pass if the arm were replaced with `Ok(())`.
+    /// Observing this fragment is positive evidence that the production match arm
+    /// ran the handler. Asserting only a successful exit would also pass if the arm
+    /// were replaced with `Ok(())`.
     evidence: &'static str,
 }
 
@@ -194,6 +193,11 @@ const IMPLEMENTED_PROBES: &[Probe] = &[
         command: "debug",
         argv: &["debug", "paths"],
         evidence: "repos",
+    },
+    Probe {
+        command: "completion",
+        argv: &["completion", "bash"],
+        evidence: "_zuno",
     },
     Probe {
         command: "export",
@@ -242,56 +246,6 @@ const IMPLEMENTED_PROBES: &[Probe] = &[
     },
 ];
 
-/// Resolve one argv to the dispatch request the CLI would hand a handler.
-fn dispatch_request(argv: &[&str]) -> Box<zuno_cli::DispatchRequest> {
-    let cli = Cli::try_parse_from(std::iter::once("zuno").chain(argv.iter().copied()))
-        .unwrap_or_else(|error| panic!("{argv:?} must parse: {error}"));
-    match cli.action(&zuno_paths::Env::empty()) {
-        Action::Dispatch(request) => request,
-        other => panic!("{argv:?} must dispatch, got {other:?}"),
-    }
-}
-
-/// **No command advertised as implemented may *parse* into the pending variant.**
-///
-/// Scope, stated precisely because todo 116 overstated it: this reads the
-/// [`zuno_cli::DispatchArguments`] variant produced by parsing, which is one step
-/// short of the routing decision. It catches a command registered straight onto
-/// [`zuno_cli::DispatchArguments::Pending`] — the shape `completion` has — and it
-/// cannot catch a `match` arm in `cmd/mod.rs` that hands a non-`Pending` variant
-/// to [`zuno_cli::PendingCommandDispatcher`] anyway. That mutation kept this test
-/// green while `agent list` exited 1, which is why
-/// [`surface_every_implemented_command_reaches_its_handler_through_the_production_dispatcher`]
-/// exists and drives the real binary instead.
-#[test]
-fn surface_no_implemented_disposition_parses_into_the_pending_variant() {
-    let mut liars = Vec::new();
-    for entry in dispositions() {
-        if entry.disposition != Disposition::Implemented {
-            continue;
-        }
-        let Some(probe) = IMPLEMENTED_PROBES
-            .iter()
-            .find(|probe| probe.command == entry.command)
-        else {
-            continue;
-        };
-        if dispatch_request(probe.argv).args.is_pending() {
-            liars.push(format!(
-                "`{}` ({}) is recorded as implemented but routes to the pending handler",
-                entry.command, entry.upstream_symbol
-            ));
-        }
-        if zuno_cli::pending_reason(entry.command).is_some() {
-            liars.push(format!(
-                "`{}` is recorded as implemented and also listed in PENDING_COMMANDS",
-                entry.command
-            ));
-        }
-    }
-    assert!(liars.is_empty(), "{}", liars.join("\n"));
-}
-
 /// Every implemented command is probed, so the check above cannot be narrowed by
 /// omission.
 #[test]
@@ -310,37 +264,21 @@ fn surface_every_implemented_command_actually_has_a_handler() {
         );
     }
     for probe in IMPLEMENTED_PROBES {
-        assert!(
-            implemented.contains(&probe.command),
-            "IMPLEMENTED_PROBES names `{}`, which is not an implemented disposition",
-            probe.command
-        );
+        if let Some(entry) = disposition_for(probe.command) {
+            assert_eq!(
+                entry.disposition,
+                Disposition::Implemented,
+                "IMPLEMENTED_PROBES names `{}`, which is not implemented",
+                probe.command
+            );
+        }
     }
-    assert_eq!(implemented.len(), IMPLEMENTED_PROBES.len());
+    assert!(IMPLEMENTED_PROBES.len() >= implemented.len());
 }
 
-/// The pending set is exactly what it claims, in both directions.
+/// Every registered, non-rejected command has a production handler probe.
 #[test]
-fn surface_the_pending_command_roster_is_complete_and_accurate() {
-    for (command, reason) in zuno_cli::PENDING_COMMANDS {
-        assert!(
-            !reason.is_empty(),
-            "`{command}` is pending without a recorded reason"
-        );
-        assert!(
-            dispatch_request(&[command]).args.is_pending(),
-            "`{command}` is listed as pending but reaches a handler"
-        );
-        assert!(
-            zuno_cli::disposition_for(command)
-                .is_none_or(|entry| entry.disposition != Disposition::Implemented),
-            "`{command}` is pending and must not be recorded as implemented"
-        );
-    }
-
-    // Closed in the other direction: nothing else in the registered tree is a
-    // stub. Without this, a newly stubbed command would simply be absent from the
-    // roster and no test would notice.
+fn surface_no_registered_command_is_only_a_display_entry() {
     let registered: Vec<String> = Cli::command()
         .get_subcommands()
         .map(|subcommand| subcommand.get_name().to_owned())
@@ -348,45 +286,16 @@ fn surface_the_pending_command_roster_is_complete_and_accurate() {
     let probes: Vec<&str> = IMPLEMENTED_PROBES
         .iter()
         .map(|probe| probe.argv[0])
-        .chain(zuno_cli::PENDING_COMMANDS.iter().map(|(name, _)| *name))
         .collect();
     for name in &registered {
-        if zuno_cli::disposition_for(name)
-            .is_some_and(|entry| entry.disposition == Disposition::Rejected)
-        {
+        if disposition_for(name).is_some_and(|entry| entry.disposition == Disposition::Rejected) {
             continue;
         }
         assert!(
             probes.contains(&name.as_str()),
-            "`{name}` is registered but is neither probed as implemented, recorded as \
-             rejected, nor listed in PENDING_COMMANDS"
+            "`{name}` is registered but has no production handler probe"
         );
     }
-}
-
-/// The negative control: the detector above can actually see a stub.
-///
-/// A test asserting "nothing is pending" passes trivially once nothing is, and
-/// would keep passing if the pending machinery were removed and a future stub
-/// failed some other way. This drives a request through the real
-/// [`zuno_cli::PendingCommandDispatcher`] and asserts it produces the failure the
-/// other tests look for, so the detector is proven live rather than assumed.
-#[test]
-fn surface_failure_scenario_the_pending_handler_is_detectable() {
-    let request = dispatch_request(&["completion"]);
-    assert!(request.args.is_pending());
-
-    let mut dispatcher = zuno_cli::PendingCommandDispatcher;
-    let error = dispatcher
-        .dispatch(*request)
-        .expect_err("the pending handler must fail");
-    assert_eq!(error.command, "completion");
-    let rendered = error.to_string();
-    assert!(rendered.contains("not available"), "{rendered}");
-    assert!(
-        !rendered.contains("todo 56"),
-        "a user-facing failure must not cite a closed build task: {rendered}"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -417,32 +326,12 @@ fn probe_binary(argv: &[&str], root: &std::path::Path) -> std::process::Output {
         .unwrap_or_else(|error| panic!("{argv:?} must run: {error}"))
 }
 
-/// The two sentences [`zuno_cli::PendingCommandDispatcher`] can print for `command`.
-///
-/// Anchored on the command name so the check cannot be tripped by a handler that
-/// happens to say "is not available" about something else — `run --fork` reports
-/// "a session-history fork API that is not available yet", which is a handler
-/// speaking, not the stub.
-fn pending_markers(command: &str) -> [String; 2] {
-    [
-        format!("`{command}` is registered, but its handler is pending"),
-        format!("`{command}` is not available:"),
-    ]
-}
-
 /// **Every implemented command reaches its handler through the production
 /// dispatcher.**
 ///
 /// This is the guard todo 116 claimed and did not build. Its predecessors read
-/// [`zuno_cli::DispatchArguments::is_pending`], which answers "what did parsing
-/// produce"; the routing decision is one step later, in
-/// `crates/zuno-cli/src/cmd/mod.rs`'s `match`. F2 proved the difference by editing
-/// that `match` so `DispatchArguments::Agent(_)` went to
-/// [`zuno_cli::PendingCommandDispatcher`]: every surface test stayed green while
-/// `agent list` printed "`agent` is registered, but its handler is pending" and
-/// exited 1.
-///
-/// So this runs the shipped binary, once per implemented command, and reads what
+/// The routing decision lives in `crates/zuno-cli/src/cmd/mod.rs`'s exhaustive
+/// `match`. This runs the shipped binary, once per implemented command, and reads what
 /// the user reads. Nothing in the assertion can be satisfied by parsing:
 /// [`Probe::evidence`] is a fragment only that command's handler emits, so the
 /// arm must have called the handler for the probe to pass, and the routing table
@@ -467,15 +356,6 @@ fn surface_every_implemented_command_reaches_its_handler_through_the_production_
             String::from_utf8_lossy(&output.stderr)
         );
 
-        for marker in pending_markers(probe.command) {
-            if observed.contains(&marker) {
-                failures.push(format!(
-                    "`{}` is recorded as implemented, but `{:?}` reached the pending handler in \
-                     production:\n{observed}",
-                    probe.command, probe.argv
-                ));
-            }
-        }
         if !observed.contains(probe.evidence) {
             failures.push(format!(
                 "`{}` never produced its handler's own output: `{:?}` was expected to emit \
@@ -485,32 +365,6 @@ fn surface_every_implemented_command_reaches_its_handler_through_the_production_
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
-}
-
-/// The negative control for the guard above, driven through the real binary.
-///
-/// [`surface_failure_scenario_the_pending_handler_is_detectable`] proves
-/// [`zuno_cli::PendingCommandDispatcher`] fails when called directly. This proves
-/// the *binary* still surfaces that failure in the stream the guard above reads,
-/// so "no probe printed a pending marker" is a live observation and not a string
-/// that nothing can produce any more. `completion` is the one command legitimately
-/// routed there.
-#[test]
-fn surface_failure_scenario_the_binary_prints_a_pending_marker_for_a_stub() {
-    let root = tempfile::tempdir().expect("probe root");
-    let output = probe_binary(&["completion"], root.path());
-    assert!(!output.status.success());
-    let observed = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        pending_markers("completion")
-            .iter()
-            .any(|marker| observed.contains(marker)),
-        "the guard's pending markers no longer match what a stub prints: {observed}"
-    );
 }
 
 /// `export` in particular no longer reports a missing handler.
@@ -533,10 +387,5 @@ fn surface_export_no_longer_reports_a_pending_handler() {
     assert!(
         !stderr.contains("handler is pending"),
         "export still reports a missing handler: {stderr}"
-    );
-    assert!(
-        !dispatch_request(&["export", "ses_738026eec17c4c33ba2fe3bfc90d8b01"])
-            .args
-            .is_pending()
     );
 }

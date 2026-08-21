@@ -302,7 +302,7 @@ pub struct SessionInfo {
     /// Model reference, carried through unparsed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<Json>,
-    /// The `opencode` version that created the session.
+    /// The Zuno version that created the session.
     pub version: String,
     /// Diff summary.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -573,15 +573,11 @@ fn opaque(text: Option<&str>) -> Option<Json> {
     Some(serde_json::from_str(text).unwrap_or_else(|_| Json::String(text.to_owned())))
 }
 
-/// Write a cost the way `JSON.stringify` writes a JavaScript number.
+/// Write an integral floating-point cost as an integral JSON number.
 ///
-/// JavaScript has one numeric type, so `JSON.stringify({cost: 2})` emits `2`
-/// even though the column is SQLite `real`; Rust's `f64` renders the same value
-/// as `2.0`. Both parse to the same number, but a client that hashes, caches or
-/// diffs the payload sees two different documents — and this crate's promise is
-/// that a user can switch between the two binaries. Measured against
-/// `/experimental/session` on a shared database: this was the **only** textual
-/// difference in the whole listing.
+/// Both `2` and `2.0` parse to the same numeric value, but stable session
+/// projections must not create needless cache, hash, or diff churn for an
+/// unchanged stored cost.
 fn serialize_cost<S: serde::Serializer>(cost: &f64, serializer: S) -> Result<S::Ok, S::Error> {
     if cost.fract() == 0.0
         && let Ok(whole) = i64::try_from(*cost as i128)

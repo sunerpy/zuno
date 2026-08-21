@@ -1,6 +1,6 @@
 [package]
 name = "zuno-db"
-description = "SQLite storage layer with schema parity against the TypeScript `opencode.db`."
+description = "Zuno-native SQLite sessions, events, inboxes, jobs, and migrations."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

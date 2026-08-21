@@ -2,22 +2,14 @@
 //!
 //! # Why a document exists at all
 //!
-//! codex deliberately has none: its goal is reachable only through `/goal` and
-//! the goal tools, and there is no file to open. That is a defensible choice and
-//! it is why this module is an *addition* to the port rather than a port of
-//! anything — the resolution recorded under "Q3" in `.omo/drafts/opencode-rust.md`
-//! ("Round 1 — RESOLVED", option A) asks for a rendered Markdown projection at
+//! Codex deliberately has none: its goal is reachable through goal controls and
+//! tools, with no file to open. Zuno adds a rendered Markdown projection at
 //! `.zuno/goal/<sessionID>.md` that a human can read and edit.
 //!
-//! The path parallels the sibling convention for plans, which the oracle writes
-//! to `<worktree>/.opencode/plans` — upstream's own directory name, quoted here
-//! as a citation rather than as a requirement; Zuno's equivalent is
-//! `.zuno/plans` — when the project is under version control and
-//! to the global data directory when it is not
-//! (`packages/opencode/src/session/session.ts:331-335`). [`document_path`] makes
-//! the same two-way choice for the same reason: a project-local file is the one a
-//! human will actually find, but a project that is not a repository has nowhere
-//! safe to put it.
+//! The projection is project-local when the project is under version control and
+//! uses the global data directory otherwise. [`document_path`] makes the choice
+//! explicit: a project-local file is easy to find, while a non-repository has no
+//! managed project directory for it.
 //!
 //! # The conflict rule, which is the whole point of this module
 //!
@@ -884,20 +876,7 @@ fn box_of(state: bool) -> &'static str {
 fn read_optional(path: &Path) -> Result<Option<String>, GoalError> {
     match std::fs::read_to_string(path) {
         Ok(raw) => Ok(Some(raw)),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            match zuno_paths::unmigrated_project_path(path) {
-                Some(old) => Err(GoalError::Document {
-                    operation: "read",
-                    path: old,
-                    source: std::io::Error::other(
-                        "this goal document predates the .zuno rename; Zuno does not read \
-                         .opencode/goal/, so move the file to the .zuno/goal/ path reported \
-                         above (or delete it) and run the command again",
-                    ),
-                }),
-                None => Ok(None),
-            }
-        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(GoalError::Document {
             operation: "read",
             path: path.to_path_buf(),

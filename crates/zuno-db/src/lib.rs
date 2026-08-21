@@ -1,25 +1,22 @@
-//! SQLite storage layer with schema parity against the TypeScript `opencode.db`.
+//! Zuno-native SQLite storage for sessions, events, inboxes, and projections.
 //!
-//! # What this crate promises
+//! # Storage contract
 //!
-//! A user must be able to switch between the TypeScript `opencode` binary and
-//! this one and back, keeping the same sessions. That promise is decided by one
-//! file on disk, so this crate opens it exactly the way `database.ts:22-33` does
-//! — the same five pragmas, in the same order, followed by the same passive WAL
-//! checkpoint — and takes its location from [`zuno_paths::db_path`] rather than
-//! deriving one. Pinned to `opencode` **1.18.13**.
+//! The selected Zuno database is the durable source of truth for session state.
+//! Every pooled connection receives the same explicit pragma sequence, and the
+//! location comes from [`zuno_paths::db_path`] rather than being re-derived by
+//! storage callers. Existing files must carry Zuno's migration journal; other
+//! pre-release or cross-product formats are rejected without mutation.
 //!
 //! # The pragma that is load-bearing
 //!
 //! `PRAGMA foreign_keys` is per-connection state, and *what it defaults to
 //! depends on which SQLite you are linked against*. Upstream SQLite and every
 //! distro `libsqlite3` default it off — measured at 0 on system SQLite 3.53.4 —
-//! while the amalgamation `libsqlite3-sys` bundles is compiled with
-//! `SQLITE_DEFAULT_FOREIGN_KEYS=1` and defaults it on. Both facts are pinned by
-//! tests. So the pragma is always issued explicitly, because a connection that
-//! inherits *off* leaves every `ON DELETE CASCADE` the session schema declares
-//! inert with nothing reporting it: the delete succeeds and orphans rows the
-//! TypeScript binary will later trip over.
+//! while the amalgamation `libsqlite3-sys` bundles may be compiled with a
+//! different default. Tests pin the observed behavior. The pragma is always
+//! issued explicitly, because a connection that inherits *off* leaves every
+//! `ON DELETE CASCADE` inert without reporting it.
 //!
 //! That is also why [`Pool`] owns connection creation outright — there is no way
 //! to put an unconfigured connection into it — and why

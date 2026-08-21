@@ -82,6 +82,8 @@ pub enum ContinuationSuppression {
 /// A continuation that atomically acquired both start guards.
 #[derive(Debug)]
 pub struct PreparedContinuation {
+    session_id: String,
+    goal_id: String,
     entry: TranscriptEntry,
     run_guard: SessionRunGuard,
     _start_slot: StartSlot,
@@ -188,6 +190,17 @@ impl GoalContinuation {
         self.store.defer_continuation_once(session_id)
     }
 
+    /// Re-read the goal after a continuation acquired its turn lease.
+    ///
+    /// Goal replacement, pause, completion, or budget enforcement may race with
+    /// preparation. A caller must check this immediately before starting provider
+    /// work so an entry captured for an older goal instance never runs afterward.
+    pub fn is_current(&self, prepared: &PreparedContinuation) -> Result<bool, GoalError> {
+        Ok(self.store.goal(&prepared.session_id)?.is_some_and(|goal| {
+            goal.goal_id == prepared.goal_id && goal.status == GoalStatus::Active
+        }))
+    }
+
     /// Apply all four start guards and prepare one fresh automatic turn.
     ///
     /// Plan mode and queued-input state are explicit because `zuno-engine` currently
@@ -277,6 +290,8 @@ impl GoalContinuation {
             }
         };
         Ok(ContinuationAttempt::Prepared(PreparedContinuation {
+            session_id: goal.session_id.clone(),
+            goal_id: goal.goal_id.clone(),
             entry: goal_entry(goal, retry.as_ref()),
             run_guard,
             _start_slot: start_slot,
@@ -437,11 +452,22 @@ fn render_goal_context_with_retry(goal: &Goal, retry: Option<&GoalRetryState>) -
         .tokens_remaining()
         .map_or_else(|| "unbounded".to_owned(), |tokens| tokens.to_string());
     let recovery = retry.map_or_else(String::new, |retry| {
+        let replay_guidance = match retry.reason {
+            crate::GoalRetryReason::ToolTransient => {
+                "- The failed tool explicitly permits replay after backoff. Re-read current evidence before choosing the next call; do not create a tight retry loop.\n"
+            }
+            crate::GoalRetryReason::ToolUncertain => {
+                "- The failed tool may have completed an external side effect before its result was lost. Verify authoritative external state before issuing any equivalent mutation.\n"
+            }
+            _ => {
+                "- Inspect the current worktree and external state before repeating an action with side effects. The action may have completed even if its result was lost.\n"
+            }
+        };
         format!(
             "\nRecovery:\n\
              - The previous goal turn ended before completion: {}.\n\
              - This is recovery attempt {}.\n\
-             - Inspect the current worktree and external state before repeating an action with side effects. The action may have completed even if its result was lost.\n",
+             {replay_guidance}",
             retry.reason.as_str(),
             retry.attempt
         )

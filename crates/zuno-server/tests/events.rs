@@ -47,7 +47,7 @@ async fn open_stream(
     session_id: &str,
     cursor: Option<&EventCursor>,
 ) -> BodyDataStream {
-    let uri = format!("/event?sessionID={session_id}");
+    let uri = format!("/api/session/{session_id}/event");
     open_stream_at(app, &uri, cursor).await
 }
 
@@ -79,13 +79,29 @@ async fn open_stream_at(
 }
 
 #[tokio::test]
-async fn upstream_global_event_stream_emits_connected_then_published_events() {
-    // Given: a client on the upstream global event path.
+async fn unscoped_pre_release_event_route_is_not_mounted() {
+    let (_pool, events) = event_service(8);
+    let response = event_app(events)
+        .oneshot(
+            Request::builder()
+                .uri("/event?sessionID=ses_retired")
+                .body(Body::empty())
+                .expect("the retired route request is valid"),
+        )
+        .await
+        .expect("the server returns its normal fallback");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn global_event_stream_emits_connected_then_published_events() {
+    // Given: a client on the global event path.
     let (_pool, events) = event_service(8);
     let app = event_app(events.clone());
     let mut stream = open_stream_at(&app, "/api/event", None).await;
 
-    // Then: connection establishment is immediately observable, matching 1.18.12.
+    // Then: connection establishment is immediately observable.
     let (_, connected) = decode_frame(&next_frame(&mut stream).await);
     assert_eq!(connected["type"], "server.connected");
     assert_eq!(connected["data"], json!({}));
@@ -103,8 +119,8 @@ async fn upstream_global_event_stream_emits_connected_then_published_events() {
 }
 
 #[tokio::test]
-async fn creating_a_session_is_observable_on_the_upstream_global_stream() {
-    // Given: one upstream global subscriber sharing the API's event service.
+async fn creating_a_session_is_observable_on_the_global_stream() {
+    // Given: one global subscriber sharing the API's event service.
     let (_pool, events) = event_service(8);
     let state = ApiState::memory("/repo").expect("in-memory API state initializes");
     let app = api_event_app(state.clone(), events);
@@ -141,7 +157,7 @@ async fn creating_a_session_is_observable_on_the_upstream_global_stream() {
 }
 
 #[tokio::test]
-async fn upstream_session_event_stream_replays_after_sequence_with_durable_shape() {
+async fn session_event_stream_replays_after_last_event_id() {
     // Given: two committed events in one session and one event in another session.
     let (_pool, events) = event_service(8);
     events
@@ -158,14 +174,17 @@ async fn upstream_session_event_stream_replays_after_sequence_with_durable_shape
         .expect("publish the other session event");
     let app = event_app(events);
 
-    // When: the upstream route resumes after aggregate sequence zero.
-    let mut stream = open_stream_at(&app, "/api/session/ses_target/event?after=0", None).await;
+    // When: the session route resumes after aggregate sequence zero.
+    let cursor = "ses_target:0"
+        .parse::<EventCursor>()
+        .expect("the fixture cursor is valid");
+    let mut stream = open_stream(&app, "ses_target", Some(&cursor)).await;
     let (cursor, replayed) = decode_frame(&next_frame(&mut stream).await);
 
-    // Then: the body is the upstream durable-event shape and stays session-scoped.
-    assert!(
-        cursor.is_none(),
-        "the upstream stream keeps the cursor in JSON"
+    // Then: the SSE id and durable body identify the same session-scoped event.
+    assert_eq!(
+        cursor.as_ref().map(ToString::to_string).as_deref(),
+        Some("ses_target:1")
     );
     assert_eq!(replayed["type"], "test.event");
     assert_eq!(replayed["durable"]["aggregateID"], "ses_target");
@@ -195,13 +214,13 @@ async fn session_sse_never_outpaces_the_history_route() {
     let mut stream = open_stream_at(&app, "/api/session/ses_order/event", None).await;
 
     // When: an engine event crosses the production projection into the session SSE stream.
-    let legacy = EventFanout::with_capacity(8);
+    let local = EventFanout::with_capacity(8);
     let (sender, receiver) = tokio::sync::mpsc::channel(1);
     let forwarder = tokio::spawn({
         let events = events.clone();
         async move {
             events
-                .forward_engine_events("ses_order", &legacy, receiver)
+                .forward_engine_events("ses_order", &local, receiver)
                 .await;
         }
     });
@@ -288,8 +307,8 @@ async fn dropping_the_only_session_observer_rejects_a_question() {
 }
 
 #[tokio::test]
-async fn upstream_session_event_stream_omits_legacy_creation_rows() {
-    // Given: the legacy creation row at sequence zero and a durable v2 event after it.
+async fn session_event_stream_replays_creation_at_sequence_zero() {
+    // Given: a creation event at sequence zero and another public event after it.
     let (_pool, events) = event_service(8);
     events
         .publish(
@@ -297,7 +316,7 @@ async fn upstream_session_event_stream_omits_legacy_creation_rows() {
             NewEvent::new("session.created", Map::new()).expect("created event type"),
         )
         .await
-        .expect("publish legacy creation event");
+        .expect("publish creation event");
     events
         .publish(
             "ses_target",
@@ -311,9 +330,9 @@ async fn upstream_session_event_stream_omits_legacy_creation_rows() {
     let mut stream = open_stream_at(&app, "/api/session/ses_target/event", None).await;
     let (_, replayed) = decode_frame(&next_frame(&mut stream).await);
 
-    // Then: the first public frame is the v2 durable event, not session.created.
-    assert_eq!(replayed["type"], "session.next.agent.switched");
-    assert_eq!(replayed["durable"]["seq"], json!(1));
+    // Then: replay starts at the first committed event without a hidden offset.
+    assert_eq!(replayed["type"], "session.created");
+    assert_eq!(replayed["durable"]["seq"], json!(0));
 }
 
 async fn next_frame(stream: &mut BodyDataStream) -> String {
@@ -455,7 +474,7 @@ async fn events_reconnect_delivers_exactly_the_one_thousand_published_events() {
             .expect("publish while the first client is connected");
         let (next_cursor, payload) = decode_frame(&next_frame(&mut first_connection).await);
         cursor = next_cursor;
-        observed.push(payload["properties"]["ordinal"].as_u64());
+        observed.push(payload["data"]["ordinal"].as_u64());
     }
     drop(first_connection);
     for ordinal in DISCONNECT_AT..TOTAL {
@@ -470,7 +489,7 @@ async fn events_reconnect_delivers_exactly_the_one_thousand_published_events() {
     let mut resumed = open_stream(&app, "ses_stream", Some(&cursor)).await;
     for _ in DISCONNECT_AT..TOTAL {
         let (_cursor, payload) = decode_frame(&next_frame(&mut resumed).await);
-        observed.push(payload["properties"]["ordinal"].as_u64());
+        observed.push(payload["data"]["ordinal"].as_u64());
     }
 
     // Then: replay plus live delivery is the exact sequence, without gaps or duplicates.
@@ -495,7 +514,7 @@ async fn events_two_concurrent_subscribers_receive_the_same_live_event() {
 
     // Then: both independently bounded subscribers observe it.
     assert_eq!(first_payload, second_payload);
-    assert_eq!(first_payload["properties"]["ordinal"], json!(7));
+    assert_eq!(first_payload["data"]["ordinal"], json!(7));
 }
 
 #[tokio::test]
@@ -517,12 +536,12 @@ async fn events_slow_subscriber_gets_a_diagnostic_then_disconnects() {
     let (diagnostic_cursor, diagnostic) = decode_frame(&next_frame(&mut stalled).await);
 
     // Then: retained events stay ordered, loss is explicit, and the stream terminates.
-    assert_eq!(first.1["properties"]["ordinal"], json!(0));
-    assert_eq!(second.1["properties"]["ordinal"], json!(1));
+    assert_eq!(first.1["data"]["ordinal"], json!(0));
+    assert_eq!(second.1["data"]["ordinal"], json!(1));
     assert!(diagnostic_cursor.is_none());
     assert_eq!(diagnostic["type"], "server.stream.lagged");
-    assert_eq!(diagnostic["properties"]["dropped"], json!(8));
-    assert_eq!(diagnostic["properties"]["action"], "reconnect");
+    assert_eq!(diagnostic["data"]["dropped"], json!(8));
+    assert_eq!(diagnostic["data"]["action"], "reconnect");
     assert!(stalled.next().await.is_none());
 }
 

@@ -64,10 +64,6 @@ impl Fixture {
                 .join("tool_ses_old_00000000000000000000000000000001"),
             b"old output",
         );
-        write(
-            &paths.legacy_storage.join("session_diff/ses_old.json"),
-            b"{}",
-        );
         Self { pool, temp }
     }
 
@@ -197,7 +193,7 @@ fn session_prune_preview_is_inert_and_projects_artifact_reclamation() {
     assert_eq!(report.database.cost, 3.0);
     assert_eq!(report.database.tokens.input, 14);
     assert_eq!(report.changed_sessions, 0);
-    assert_eq!(report.artifacts.total_bytes, 12);
+    assert_eq!(report.artifacts.total_bytes, 10);
     assert!(report.artifacts.items.iter().all(|item| !item.removed));
     assert!(
         fixture
@@ -419,11 +415,4 @@ fn session_prune_archive_and_confirmed_delete_share_the_same_selection() {
         "shared and other-project survive"
     );
     assert!(deleted.artifacts.items.iter().all(|item| item.removed));
-    assert!(
-        !fixture
-            .paths()
-            .legacy_storage
-            .join("session_diff/ses_old.json")
-            .exists()
-    );
 }

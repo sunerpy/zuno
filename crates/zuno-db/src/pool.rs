@@ -13,11 +13,11 @@ use zuno_paths::DbLocation;
 /// How many idle connections a pool keeps before it closes returned ones.
 pub const DEFAULT_MAX_IDLE: usize = 4;
 
-/// A pool of connections to one database, each carrying the oracle's pragmas.
+/// A pool of connections to one database, each carrying Zuno's pragmas.
 ///
 /// # Why a pool needs to own connection creation
 ///
-/// `journal_mode` is the only one of the oracle's pragmas that lives in the
+/// `journal_mode` is the only configured pragma that lives in the
 /// database file. `synchronous`, `busy_timeout`, `cache_size` and `foreign_keys`
 /// are per-connection settings that reset on every new connection — a reopened
 /// database reports `wal` and a `busy_timeout` of *zero*, so an unconfigured
@@ -25,7 +25,7 @@ pub const DEFAULT_MAX_IDLE: usize = 4;
 /// whether it enforces foreign keys depends on the linked SQLite's compile-time
 /// default rather than on anything visible in this code. A pool that handed out
 /// connections it had not configured would therefore hand out ones that behave
-/// differently from the oracle, with no error anywhere. So every connection this
+/// differently from its siblings, with no error anywhere. So every connection this
 /// pool produces goes through [`open`], and there is no constructor that takes a
 /// caller's own [`Connection`].
 ///
@@ -56,11 +56,9 @@ impl Pool {
     ///
     /// # Errors
     ///
-    /// [`DbError::LegacyDatabase`] when the old default filename must be moved,
-    /// or [`DbError::Open`] when the database cannot be opened or configured.
+    /// [`DbError::Open`] when the database cannot be opened or configured.
     pub fn open_default() -> Result<Self, DbError> {
         let location = zuno_paths::db_path();
-        open::reject_legacy_default(&location)?;
         Self::open(&location)
     }
 
@@ -115,7 +113,7 @@ impl Pool {
     ///
     /// For a file database this is the path. For [`DbLocation::Memory`] it is the
     /// shared-cache URI that lets several pooled connections see one in-memory
-    /// database, which the oracle's single connection never needed.
+    /// database.
     #[must_use]
     pub fn target(&self) -> &str {
         &self.target

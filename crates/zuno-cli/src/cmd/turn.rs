@@ -40,13 +40,15 @@ use zuno_engine::dispatch::ToolRegistryDispatcher;
 use zuno_engine::driver::AgentDriver;
 use zuno_engine::interrupt::InterruptSignal;
 use zuno_engine::r#loop::{
-    AgentModelResolver, ResolvedAgent, ResolvedModel as EngineModel, RunTurnRequest, TurnContext,
-    TurnError, TurnEvent, TurnEventSender, TurnOutcome, TurnRecovery,
+    AgentModelResolver, ResolvedAgent, ResolvedModel as EngineModel, RunTurnRequest,
+    ToolFailureRecovery, TurnContext, TurnError, TurnEvent, TurnEventSender, TurnOutcome,
+    TurnRecovery,
 };
 use zuno_engine::prelude::{
     CompactionSkipped, InternalAgent, InternalProviders, Internals, PreludeContext, PreludeOutcome,
     compact_requested, run_prelude,
 };
+use zuno_engine::prompt::PromptAssembly;
 use zuno_engine::status::{SessionRunGuard, SessionRunRegistry};
 use zuno_error::{DbError, ProviderError, Recovery};
 use zuno_goal::{
@@ -61,10 +63,10 @@ use zuno_llm::catalog::resolved::ModelEndpoint;
 use zuno_llm::catalog::{Catalog, CatalogProvenance, CatalogSource, ResolveInput};
 use zuno_llm::event::{RequestContentBlock, StreamEvent};
 use zuno_llm::registry::{ApiSurface, Provider, ProviderRegistry, Spec, generation};
-use zuno_memory::{ScopeLimits, SessionMemory, assemble_system_prompt};
+use zuno_memory::{Scope, ScopeLimits, SessionMemory};
 use zuno_provider_compatible::{ReqwestTransport, Transport};
 use zuno_runtime::HarnessRuntime;
-use zuno_tool::PermissionAsker;
+use zuno_tool::{PermissionAsker, ToolReplayPolicy};
 
 use crate::environment::StartupEnvironment;
 
@@ -258,9 +260,35 @@ impl TurnPlan {
             ));
         }
         let reasoning_supported = catalog_model.capabilities.reasoning;
+        let catalog_models = picker_model_ids(&catalog);
+        let vision_available = catalog_models.iter().any(|line| {
+            line.split_once('/').is_some_and(|(provider, model)| {
+                catalog
+                    .model(provider, model)
+                    .is_some_and(|model| model.capabilities.input.image)
+            })
+        });
+        let mut prompt_assembly = PromptAssembly::new();
+        prompt_assembly
+            .push(
+                "agent.base",
+                agent_prompt_source(&agent),
+                agent.prompt.clone().unwrap_or_default(),
+            )
+            .map_err(to_string)?;
+        if let Some(policy) = zuno_agent::builtin::get(&agent.name, vision_available) {
+            prompt_assembly
+                .push(
+                    "agent.policy",
+                    format!("zuno-agent::builtin:{}", agent.name),
+                    policy.prompt_policy(),
+                )
+                .map_err(to_string)?;
+        }
         let resolver = Resolver {
             requested_agent: agent.name.clone(),
-            system_prompt: agent.prompt.clone().unwrap_or_default(),
+            system_prompt: prompt_assembly.render(),
+            prompt_assembly: Some(prompt_assembly),
             max_steps: agent
                 .steps
                 .map_or(DEFAULT_MAX_STEPS, std::num::NonZeroU32::get),
@@ -291,14 +319,6 @@ impl TurnPlan {
             },
             &mut notes,
         )?;
-        let catalog_models = picker_model_ids(&catalog);
-        let vision_available = catalog_models.iter().any(|line| {
-            line.split_once('/').is_some_and(|(provider, model)| {
-                catalog
-                    .model(provider, model)
-                    .is_some_and(|model| model.capabilities.input.image)
-            })
-        });
         let delegation_facts = Arc::new(delegation_facts(&catalog));
         let skills = Arc::new(
             zuno_catalog::skill::load(&zuno_catalog::skill::SkillOptions::from_config(
@@ -921,8 +941,8 @@ impl TurnHost {
             zuno_tools::ScopePaths::discover(memory_root),
         )?;
         let mut notes = plan.notes;
-        announce_instructions(&mut plan.resolver, &plan.instructions, &mut notes);
-        announce_skills(&mut plan.resolver, &plan.skills, &mut notes);
+        announce_instructions(&mut plan.resolver, &plan.instructions, &mut notes)?;
+        announce_skills(&mut plan.resolver, &plan.skills, &mut notes)?;
         let background_jobs = super::child_turn::BackgroundJobSupervisor::default();
         let child_host =
             super::child_turn::ChildSessionHost::new(super::child_turn::ChildSessionContext {
@@ -1377,6 +1397,13 @@ impl TurnHost {
             }
             ContinuationAttempt::Suppressed(_) => return Ok(false),
         };
+        if !self
+            .goal_continuation
+            .is_current(&prepared)
+            .map_err(to_string)?
+        {
+            return Ok(true);
+        }
         let usage_before = goal_usage(&self.connection, &self.session_id)?;
         let started = Instant::now();
         let retry_reason = self
@@ -1521,10 +1548,19 @@ impl TurnHost {
     ) -> Result<(), String> {
         self.record_goal_usage(usage_before, started)?;
         match outcome {
-            Some(TurnOutcome::Completed { .. }) => {
-                self.goal_continuation
-                    .record_turn_outcome(&self.session_id, GoalTurnOutcome::Progress)
-                    .map_err(to_string)?;
+            Some(TurnOutcome::Completed {
+                unresolved_tool_failures,
+                ..
+            }) => {
+                if let Some(failure) = goal_tool_failure(unresolved_tool_failures) {
+                    self.goal_continuation
+                        .record_terminal_failure(&self.session_id, failure)
+                        .map_err(to_string)?;
+                } else {
+                    self.goal_continuation
+                        .record_turn_outcome(&self.session_id, GoalTurnOutcome::Progress)
+                        .map_err(to_string)?;
+                }
                 self.compaction_state.reset_after_turn_success();
             }
             Some(TurnOutcome::Interrupted { .. }) => {
@@ -1687,6 +1723,28 @@ impl TurnHost {
     }
 }
 
+fn goal_tool_failure(recoveries: &[ToolFailureRecovery]) -> Option<GoalTerminalFailure> {
+    if recoveries.is_empty() {
+        return None;
+    }
+    let reason = if recoveries
+        .iter()
+        .any(|recovery| recovery.replay_policy == ToolReplayPolicy::Never)
+    {
+        GoalRetryReason::ToolUncertain
+    } else {
+        GoalRetryReason::ToolTransient
+    };
+    let retry_after = recoveries
+        .iter()
+        .filter_map(|recovery| recovery.retry_after)
+        .max();
+    Some(GoalTerminalFailure::Retry {
+        reason,
+        retry_after,
+    })
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct GoalUsage {
     tokens: i64,
@@ -1750,9 +1808,9 @@ fn announce_skills(
     resolver: &mut Resolver,
     skills: &zuno_catalog::skill::Skills,
     notes: &mut Vec<String>,
-) {
+) -> Result<(), String> {
     if skills.all().is_empty() {
-        return;
+        return Ok(());
     }
     let rendered = skills.render_within(zuno_catalog::skill::Form::Verbose, SKILL_PROMPT_BUDGET);
     if rendered.rendered == 0 {
@@ -1760,7 +1818,7 @@ fn announce_skills(
             "warning: no skill fits the {SKILL_PROMPT_BUDGET}-byte prompt budget, so none \
              were advertised; shorten the longest `description` in your skill frontmatter"
         ));
-        return;
+        return Ok(());
     }
     if rendered.omitted > 0 {
         notes.push(format!(
@@ -1770,11 +1828,7 @@ fn announce_skills(
             rendered.rendered + rendered.omitted,
         ));
     }
-    resolver.system_prompt = if resolver.system_prompt.is_empty() {
-        rendered.text
-    } else {
-        format!("{}\n\n{}", resolver.system_prompt, rendered.text)
-    };
+    resolver.append_prompt_section("skills.catalog", "discovered skills", rendered.text)
 }
 
 /// How many bytes of instruction files may enter the system prompt.
@@ -1809,7 +1863,9 @@ const INSTRUCTION_PROMPT_BUDGET: usize = 64 * 1024;
 /// an absent one: "do X unless Y" truncated after "do X" inverts the rule the user
 /// wrote, while they go on believing it is in force. So the budget admits complete
 /// blocks in discovery order and names, by path and size, every file it had to leave
-/// out. Contents are never logged — they are user-authored and may say anything.
+/// out. Admitted contents are persisted in `session.prompt.assembled`, because
+/// model-visible input must remain reconstructable. They are not printed to the
+/// operational log.
 ///
 /// Warnings from the load ([`zuno_config::WarningKind`]) are surfaced the same way. A
 /// *missing* instruction file never reaches here at all, because discovery only
@@ -1819,18 +1875,18 @@ fn announce_instructions(
     resolver: &mut Resolver,
     loaded: &zuno_config::LoadedInstructions,
     notes: &mut Vec<String>,
-) {
+) -> Result<(), String> {
     for warning in loaded.warnings() {
         notes.push(format!("warning: {warning}"));
     }
 
-    let mut admitted = String::new();
-    for entry in loaded.entries() {
+    let mut admitted_bytes = 0usize;
+    for (index, entry) in loaded.entries().iter().enumerate() {
         let block = entry.render();
-        let projected = if admitted.is_empty() {
+        let projected = if admitted_bytes == 0 {
             block.len()
         } else {
-            admitted.len() + 2 + block.len()
+            admitted_bytes + 2 + block.len()
         };
         if projected > INSTRUCTION_PROMPT_BUDGET {
             notes.push(format!(
@@ -1842,20 +1898,11 @@ fn announce_instructions(
             ));
             continue;
         }
-        if !admitted.is_empty() {
-            admitted.push_str("\n\n");
-        }
-        admitted.push_str(&block);
+        admitted_bytes = projected;
+        resolver.append_prompt_section(format!("instructions.{index}"), entry.source(), block)?;
     }
 
-    if admitted.is_empty() {
-        return;
-    }
-    resolver.system_prompt = if resolver.system_prompt.is_empty() {
-        admitted
-    } else {
-        format!("{}\n\n{}", resolver.system_prompt, admitted)
-    };
+    Ok(())
 }
 
 fn configure_resident_memory(
@@ -1872,7 +1919,19 @@ fn configure_resident_memory(
         limits,
     )
     .map_err(to_string)?;
-    resolver.system_prompt = assemble_system_prompt(&resolver.system_prompt, session.as_ref());
+    let Some(session) = session else {
+        return Ok(());
+    };
+    for scope in Scope::ALL {
+        resolver.append_prompt_section(
+            match scope {
+                Scope::Global => "memory.global",
+                Scope::Project => "memory.project",
+            },
+            session.store(scope).path().display().to_string(),
+            session.frozen_block(scope),
+        )?;
+    }
     Ok(())
 }
 
@@ -2719,7 +2778,7 @@ fn with_agent_options(mut spec: Spec, agent: &zuno_catalog::agent::Agent) -> Spe
 /// variant that model never declared or, worse, silently select a different level
 /// than the name means. An agent with no `model` therefore never contributes one —
 /// which is why that combination is rejected at parse time rather than accepted and
-/// ignored here (`zuno_config::legacy::Deprecation::AgentVariantWithoutModel`).
+/// rejected by the native agent schema.
 fn turn_effort(
     session: Option<zuno_llm::effort::ReasoningEffort>,
     agent: &zuno_catalog::agent::Agent,
@@ -2776,6 +2835,7 @@ fn session_reasoning_options(
 struct Resolver {
     requested_agent: String,
     system_prompt: String,
+    prompt_assembly: Option<PromptAssembly>,
     max_steps: u32,
     requested_provider: String,
     requested_model: String,
@@ -2787,11 +2847,15 @@ struct Resolver {
 impl AgentModelResolver for Resolver {
     fn resolve_agent(&self, requested: &str) -> Option<ResolvedAgent> {
         (requested == self.requested_agent).then(|| {
-            ResolvedAgent::new(
+            let agent = ResolvedAgent::new(
                 self.requested_agent.clone(),
                 self.system_prompt.clone(),
                 self.max_steps,
-            )
+            );
+            match &self.prompt_assembly {
+                Some(assembly) => agent.with_prompt_assembly(assembly.clone()),
+                None => agent,
+            }
         })
     }
 
@@ -2805,6 +2869,41 @@ impl AgentModelResolver for Resolver {
             .with_catalog_identity(&self.requested_provider, &self.requested_model)
             .with_reasoning_options(self.reasoning_options.clone())
         })
+    }
+}
+
+impl Resolver {
+    fn append_prompt_section(
+        &mut self,
+        id: impl Into<String>,
+        source: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Result<(), String> {
+        let content = content.into();
+        if content.is_empty() {
+            return Ok(());
+        }
+        if let Some(assembly) = &mut self.prompt_assembly {
+            assembly.push(id, source, content).map_err(to_string)?;
+            self.system_prompt = assembly.render();
+        } else if self.system_prompt.is_empty() {
+            self.system_prompt = content;
+        } else {
+            self.system_prompt.push_str("\n\n");
+            self.system_prompt.push_str(&content);
+        }
+        Ok(())
+    }
+}
+
+fn agent_prompt_source(agent: &zuno_catalog::agent::Agent) -> String {
+    match &agent.source {
+        zuno_catalog::agent::AgentSource::Native => format!("native:{}", agent.name),
+        zuno_catalog::agent::AgentSource::NativeOverridden => {
+            format!("native+configuration:{}", agent.name)
+        }
+        zuno_catalog::agent::AgentSource::Config => format!("configuration:agent.{}", agent.name),
+        zuno_catalog::agent::AgentSource::Markdown { path } => path.display().to_string(),
     }
 }
 

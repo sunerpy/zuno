@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 use zuno_error::BoxSource;
 use zuno_tool::InterruptHandle;
 
@@ -56,6 +57,58 @@ pub struct SearchExecution {
     pub interrupt: Arc<dyn InterruptHandle>,
 }
 
+/// Typed provider failure so consumers never infer retryability from prose.
+#[derive(Debug, thiserror::Error)]
+pub enum WebSearchProviderError {
+    /// A transport, rate-limit, or upstream failure expected to clear.
+    #[error("web search provider failed transiently (retry_after={retry_after:?})")]
+    Transient {
+        /// Delay requested by the provider, when one was supplied.
+        retry_after: Option<Duration>,
+        /// Provider-specific cause.
+        #[source]
+        source: BoxSource,
+    },
+    /// A configuration, protocol, or response failure that replay cannot repair.
+    #[error("web search provider failed")]
+    Failed {
+        /// Provider-specific cause.
+        #[source]
+        source: BoxSource,
+    },
+}
+
+impl WebSearchProviderError {
+    /// Construct a transient provider failure.
+    pub fn transient(
+        source: impl std::error::Error + Send + Sync + 'static,
+        retry_after: Option<Duration>,
+    ) -> Self {
+        Self::Transient {
+            retry_after,
+            source: Box::new(source),
+        }
+    }
+
+    /// Construct a permanent provider failure.
+    pub fn failed(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::Failed {
+            source: Box::new(source),
+        }
+    }
+}
+
+impl From<crate::webfetch::bounds::WebError> for WebSearchProviderError {
+    fn from(source: crate::webfetch::bounds::WebError) -> Self {
+        if source.is_transient() {
+            let retry_after = source.retry_after();
+            Self::transient(source, retry_after)
+        } else {
+            Self::failed(source)
+        }
+    }
+}
+
 /// A backend that performs one normalized web search.
 #[async_trait]
 pub trait WebSearchProvider: Send + Sync {
@@ -67,7 +120,7 @@ pub trait WebSearchProvider: Send + Sync {
         &self,
         request: SearchRequest,
         execution: SearchExecution,
-    ) -> Result<SearchResult, BoxSource>;
+    ) -> Result<SearchResult, WebSearchProviderError>;
 }
 
 /// Exa/Parallel MCP adapter selected from native Zuno configuration.
@@ -113,7 +166,7 @@ impl WebSearchProvider for McpSearchProvider {
         &self,
         request: SearchRequest,
         execution: SearchExecution,
-    ) -> Result<SearchResult, BoxSource> {
+    ) -> Result<SearchResult, WebSearchProviderError> {
         let provider = select_provider(&execution.session_id, &self.config);
         let (tool, arguments) = match provider {
             Provider::Exa => (
@@ -144,7 +197,8 @@ impl WebSearchProvider for McpSearchProvider {
             &headers,
             execution.interrupt.as_ref(),
         )
-        .await?;
+        .await
+        .map_err(WebSearchProviderError::from)?;
         Ok(normalize_provider_text(&text))
     }
 }

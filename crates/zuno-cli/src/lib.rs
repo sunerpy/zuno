@@ -14,9 +14,8 @@ pub mod startup;
 mod version;
 
 pub use command::{
-    Action, Cli, CliLogLevel, Command, CommandDispatcher, DispatchArguments, DispatchError,
-    DispatchRequest, ExportArgs, GlobalOptions, ImplementedCommand, ImportArgs, PENDING_COMMANDS,
-    PendingCommandDispatcher, pending_reason,
+    Action, Cli, CliLogLevel, Command, CommandDispatcher, CompletionArgs, DispatchArguments,
+    DispatchError, DispatchRequest, ExportArgs, GlobalOptions, ImplementedCommand, ImportArgs,
 };
 pub use disposition::{
     CommandDisposition, Disposition, SurfaceError, disposition_for, dispositions,

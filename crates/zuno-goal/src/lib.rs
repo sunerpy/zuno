@@ -9,8 +9,8 @@
 //! status saying whether the run should continue, and the budget it is allowed to
 //! spend getting there.
 //!
-//! Ported from codex's `/goal` mechanism, `codex-rs/state/src/runtime/goals.rs`
-//! and `codex-rs/state/src/model/thread_goal.rs`.
+//! Inspired by Codex's goal mechanism and extended with Zuno's durable
+//! cross-turn retry controller.
 //!
 //! # The four decisions this crate makes
 //!
@@ -26,11 +26,10 @@
 //! both in the statements that perform the write, because as Rust-side checks
 //! they would be check-then-act races. See [`store`].
 //!
-//! **The goal has its own database file.** `zuno-db` owns a byte-compatible
-//! reproduction of the TypeScript `opencode.db`; a goal is a feature that binary
-//! does not have, so it does not belong in a file that binary also writes — and a
-//! goal that cascaded away with unrelated session state would defeat the whole
-//! point. See [`store`] for the full argument.
+//! **The goal has its own database file.** A goal that cascaded away with
+//! unrelated session pruning or migration state would defeat the whole point.
+//! The separate file also gives the goal schema an explicit generation. See
+//! [`store`] for the full argument.
 //!
 //! **The Markdown document is a projection, and the conflict rule is fixed.** The
 //! goal is also rendered to `.zuno/goal/<sessionID>.md` for a human to read

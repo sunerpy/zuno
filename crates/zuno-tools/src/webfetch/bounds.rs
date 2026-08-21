@@ -125,6 +125,8 @@ pub enum WebError {
         url: String,
         /// The status code returned.
         status: u16,
+        /// Delay requested by the server, when it supplied numeric seconds.
+        retry_after: Option<Duration>,
     },
 
     /// The content type is not something this tool can turn into text.
@@ -157,6 +159,52 @@ pub enum WebError {
         /// The provider whose response failed to parse.
         provider: &'static str,
     },
+}
+
+impl WebError {
+    /// Whether repeating the same HTTP request may succeed after backoff.
+    #[must_use]
+    pub const fn is_transient(&self) -> bool {
+        match self {
+            Self::Transport { .. } => true,
+            Self::Status { status, .. } => {
+                matches!(*status, 408 | 425 | 429) || (*status >= 500 && *status <= 599)
+            }
+            Self::UnsupportedScheme { .. }
+            | Self::MalformedUrl { .. }
+            | Self::TooLarge { .. }
+            | Self::TooManyRedirects { .. }
+            | Self::UnsupportedContentType { .. }
+            | Self::Interrupted { .. }
+            | Self::NoSearchProvider
+            | Self::MalformedSearchResponse { .. } => false,
+        }
+    }
+
+    /// Delay requested by the failed server, when one was supplied.
+    #[must_use]
+    pub const fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Status { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+}
+
+/// Parse a numeric `Retry-After` response header as seconds.
+#[must_use]
+pub fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let seconds = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<f64>()
+        .ok()?;
+    if !seconds.is_finite() || seconds.is_sign_negative() {
+        return None;
+    }
+    Some(Duration::from_secs_f64(seconds))
 }
 
 /// Clamps a caller-supplied timeout into `(0, MAX_TIMEOUT]`.

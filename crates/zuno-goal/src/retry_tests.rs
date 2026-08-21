@@ -57,7 +57,7 @@ fn retry_policy_applies_symmetric_jitter_after_selecting_a_delay() {
 }
 
 #[test]
-fn provider_retry_after_is_used_only_when_it_fits_the_local_ceiling() {
+fn provider_retry_after_never_schedules_an_earlier_retry() {
     let policy = GoalRetryPolicy::new(
         Duration::from_secs(2),
         Duration::from_secs(30),
@@ -78,12 +78,28 @@ fn provider_retry_after_is_used_only_when_it_fits_the_local_ceiling() {
     );
     assert_eq!(
         policy.delay(1, Some(Duration::from_secs(60)), 0),
-        Duration::from_millis(1_600),
-        "an unbounded peer delay must not stall the goal beyond its configured ceiling"
+        Duration::from_secs(30),
+        "a peer delay above the local ceiling is capped, not discarded in favor of an earlier retry"
     );
     assert_eq!(
         policy.delay(1, Some(Duration::ZERO), 0),
         Duration::from_millis(1_600)
+    );
+}
+
+#[test]
+fn maximum_jitter_never_creates_a_zero_delay() {
+    let policy = GoalRetryPolicy::new(
+        Duration::from_secs(2),
+        Duration::from_secs(30),
+        100,
+        Duration::from_millis(250),
+    )
+    .expect("valid retry policy");
+
+    assert!(
+        !policy.delay(1, None, 0).is_zero(),
+        "a persisted retry must never become an immediate hot loop"
     );
 }
 
@@ -109,6 +125,17 @@ fn retry_policy_rejects_an_inverted_window_or_invalid_jitter() {
         .expect_err("jitter above one hundred percent is invalid"),
         GoalRetryPolicyError::JitterPercentOutOfRange { actual: 101 }
     );
+}
+
+#[test]
+fn tool_retry_reasons_have_stable_persisted_discriminators() {
+    for (reason, persisted) in [
+        (GoalRetryReason::ToolTransient, "tool_transient"),
+        (GoalRetryReason::ToolUncertain, "tool_uncertain"),
+    ] {
+        assert_eq!(reason.as_str(), persisted);
+        assert_eq!(GoalRetryReason::parse(persisted), Some(reason));
+    }
 }
 
 #[test]

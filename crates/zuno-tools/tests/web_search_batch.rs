@@ -6,11 +6,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
-use zuno_error::{BoxSource, ToolError};
+use zuno_error::ToolError;
 use zuno_tool::{AllowAll, InterruptHandle, NeverInterrupted, Tool, ToolContext, Typed};
 use zuno_tools::websearch::{
     SearchExecution, SearchRequest, SearchResult, SearchSource, WebSearchPolicy, WebSearchProvider,
-    WebSearchTool,
+    WebSearchProviderError, WebSearchTool,
 };
 
 fn context(interrupt: Arc<dyn InterruptHandle>) -> ToolContext {
@@ -76,7 +76,7 @@ impl WebSearchProvider for OrderedProvider {
         &self,
         request: SearchRequest,
         _execution: SearchExecution,
-    ) -> Result<SearchResult, BoxSource> {
+    ) -> Result<SearchResult, WebSearchProviderError> {
         self.calls
             .lock()
             .expect("calls lock")
@@ -96,7 +96,7 @@ impl WebSearchProvider for OrderedProvider {
                 "answer two",
                 &["https://b.test", "https://shared.test"],
             )),
-            other => Err(Box::new(io::Error::other(format!(
+            other => Err(WebSearchProviderError::failed(io::Error::other(format!(
                 "unexpected query {other}"
             )))),
         }
@@ -168,20 +168,24 @@ impl WebSearchProvider for FailingProvider {
         &self,
         request: SearchRequest,
         execution: SearchExecution,
-    ) -> Result<SearchResult, BoxSource> {
+    ) -> Result<SearchResult, WebSearchProviderError> {
         match request.query.as_str() {
             "one" => {
                 self.sibling_started.notified().await;
-                Err(Box::new(io::Error::other("first search failed")))
+                Err(WebSearchProviderError::failed(io::Error::other(
+                    "first search failed",
+                )))
             }
             "two" => {
                 self.sibling_started.notify_waiters();
                 execution.interrupt.notified().await;
                 self.sibling_cancelled.store(true, Ordering::SeqCst);
                 self.sibling_settle.notified().await;
-                Err(Box::new(io::Error::other("sibling search stopped")))
+                Err(WebSearchProviderError::failed(io::Error::other(
+                    "sibling search stopped",
+                )))
             }
-            other => Err(Box::new(io::Error::other(format!(
+            other => Err(WebSearchProviderError::failed(io::Error::other(format!(
                 "unexpected query {other}"
             )))),
         }
@@ -243,7 +247,7 @@ impl WebSearchProvider for RecordingProvider {
         &self,
         request: SearchRequest,
         _execution: SearchExecution,
-    ) -> Result<SearchResult, BoxSource> {
+    ) -> Result<SearchResult, WebSearchProviderError> {
         self.calls.lock().expect("calls lock").push(request.query);
         Ok(SearchResult::default())
     }
@@ -332,14 +336,16 @@ impl WebSearchProvider for CancellingProvider {
         &self,
         request: SearchRequest,
         execution: SearchExecution,
-    ) -> Result<SearchResult, BoxSource> {
+    ) -> Result<SearchResult, WebSearchProviderError> {
         self.started.fetch_add(1, Ordering::SeqCst);
         execution.interrupt.notified().await;
         self.observed
             .lock()
             .expect("observed lock")
             .insert(request.query, execution.interrupt.is_set());
-        Err(Box::new(io::Error::other("search cancelled")))
+        Err(WebSearchProviderError::failed(io::Error::other(
+            "search cancelled",
+        )))
     }
 }
 

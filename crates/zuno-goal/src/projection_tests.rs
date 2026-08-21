@@ -847,8 +847,8 @@ fn the_render_is_atomic_under_a_concurrent_reader() {
     );
 }
 
-fn write_legacy_document(fixture: &Fixture, body: &str) {
-    let legacy = fixture
+fn write_unrelated_opencode_document(fixture: &Fixture, body: &str) {
+    let unrelated = fixture
         .projection
         .path()
         .parent()
@@ -857,33 +857,36 @@ fn write_legacy_document(fixture: &Fixture, body: &str) {
         .expect("the goal directory sits inside the project directory")
         .parent()
         .expect("the project directory sits inside the worktree")
-        .join(zuno_paths::LEGACY_PROJECT_DIRECTORY)
+        .join(".opencode")
         .join(GOAL_DIRECTORY);
-    std::fs::create_dir_all(&legacy).expect("create the legacy goal directory");
+    std::fs::create_dir_all(&unrelated).expect("create the unrelated goal directory");
     let name = fixture
         .projection
         .path()
         .file_name()
         .expect("the document has a file name")
         .to_owned();
-    std::fs::write(legacy.join(name), body).expect("write the legacy document");
+    std::fs::write(unrelated.join(name), body).expect("write the unrelated document");
 }
 
 #[test]
-fn a_goal_document_left_at_the_pre_rename_path_is_reported_rather_than_silently_restored() {
+fn an_opencode_goal_document_is_ignored_when_zunos_projection_is_restored() {
     let fixture = Fixture::new();
     fixture.create("ship the thing", None);
-    std::fs::remove_file(fixture.projection.path()).expect("remove the migrated document");
-    write_legacy_document(&fixture, "a human edit nobody would see\n");
+    std::fs::remove_file(fixture.projection.path()).expect("remove the Zuno projection");
+    write_unrelated_opencode_document(&fixture, "unrelated content\n");
 
-    let error = fixture
-        .projection
-        .ingest(&fixture.store)
-        .expect_err("the legacy document must be reported");
-    let message = error.to_string();
-    assert!(
-        message.contains(zuno_paths::LEGACY_PROJECT_DIRECTORY),
-        "the diagnostic must name the legacy directory, got: {message}"
+    assert!(matches!(fixture.ingest(), Ingest::Restored));
+    assert_eq!(
+        std::fs::read_to_string(fixture.projection.path()).expect("restored projection"),
+        render(
+            &fixture
+                .store
+                .goal(SESSION)
+                .expect("read goal")
+                .expect("goal exists"),
+            &Notes::default()
+        )
     );
 }
 
@@ -899,6 +902,6 @@ fn a_goal_document_with_no_legacy_counterpart_is_still_restored() {
 fn a_goal_document_present_in_both_locations_ingests_the_new_one() {
     let fixture = Fixture::new();
     fixture.create("ship the thing", None);
-    write_legacy_document(&fixture, "a stale pre-rename projection\n");
+    write_unrelated_opencode_document(&fixture, "unrelated projection\n");
     assert!(matches!(fixture.ingest(), Ingest::OwnRender));
 }

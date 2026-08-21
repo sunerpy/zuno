@@ -1,5 +1,4 @@
-//! Session rows in `opencode.db`: create, read, touch, the three list scopes,
-//! and the subtree delete.
+//! Zuno session rows: create, read, touch, list scopes, and subtree deletion.
 //!
 //! # Why a delete here is application code and not one `DELETE`
 //!
@@ -49,8 +48,7 @@
 //! pruning live elsewhere. Columns the schema declares as JSON — `model`,
 //! `metadata`, `revert`, `permission`, `summary_diffs` — are carried through
 //! verbatim as strings rather than parsed, because nothing here needs to look
-//! inside them and re-encoding is how a byte-compatible payload stops being
-//! byte-compatible.
+//! inside them and re-encoding would lose unknown fields or number formatting.
 
 pub mod path;
 
@@ -118,7 +116,7 @@ pub struct Session {
     pub path: Option<String>,
     /// Session title, defaulting to a prefixed timestamp upstream.
     pub title: String,
-    /// The `opencode` version that created the session.
+    /// The Zuno version that created the session.
     pub version: String,
     /// Share link, when the session has been shared.
     pub share_url: Option<String>,

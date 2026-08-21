@@ -154,10 +154,7 @@ async fn the_coordinator_is_refused_and_the_message_lists_the_valid_targets() {
 
     let text = message(&error);
     assert!(matches!(error, ToolError::InvalidArgs { .. }));
-    assert!(
-        text.contains("`orchestrator` coordinates delegations"),
-        "{text}"
-    );
+    assert!(text.contains("`build` coordinates delegations"), "{text}");
     assert!(text.contains("Set `subagent_type` to one of"), "{text}");
     let targets = valid_targets(false);
     assert!(!targets.is_empty(), "the roster must offer some target");

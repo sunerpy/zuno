@@ -293,12 +293,20 @@ impl Dialog for QuestionPrompt {
             } else {
                 self.context.muted()
             };
-            let body = if self.editing || !self.typed.is_empty() {
-                format!(" > {}▏", self.typed)
+            if self.editing || !self.typed.is_empty() {
+                let mut rows = crate::views::message::wrap(&self.typed, width.saturating_sub(4));
+                if self.editing
+                    && let Some(last) = rows.last_mut()
+                {
+                    last.push('▏');
+                }
+                for (index, row) in rows.into_iter().enumerate() {
+                    let prefix = if index == 0 { " > " } else { "   " };
+                    lines.push(padded(&format!("{prefix}{row}"), width, style));
+                }
             } else {
-                String::from(" > type your own answer")
-            };
-            lines.push(padded(&body, width, style));
+                lines.push(padded(" > type your own answer", width, style));
+            }
         }
         if selected.is_empty() && !self.editing {
             lines.push(Line::from(Span::styled(
@@ -310,6 +318,13 @@ impl Dialog for QuestionPrompt {
     }
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        if self.editing {
+            return vec![
+                ("shift+enter", "newline"),
+                ("enter", "submit"),
+                ("esc", "cancel"),
+            ];
+        }
         if self.question().is_multiple() {
             vec![
                 ("↑↓", "move"),
@@ -337,6 +352,10 @@ impl Dialog for QuestionPrompt {
         if self.editing {
             match action.name {
                 "dialog.prompt.submit" | "dialog.select.submit" => return self.submit(),
+                "input_newline" => {
+                    self.typed.push('\n');
+                    return DialogStep::Redraw;
+                }
                 "input_backspace" => {
                     self.typed.pop();
                     return DialogStep::Redraw;

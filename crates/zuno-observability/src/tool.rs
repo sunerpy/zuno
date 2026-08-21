@@ -103,6 +103,7 @@ pub fn error_kind(error: &ToolError) -> &'static str {
         ToolError::Denied { .. } => "denied",
         ToolError::InvalidArgs { .. } => "invalid_args",
         ToolError::Timeout { .. } => "timeout",
+        ToolError::Transient { .. } => "transient",
         ToolError::NotFound { .. } => "not_found",
         ToolError::Failed { .. } => "failed",
     }
@@ -284,6 +285,11 @@ mod tests {
                 tool: "bash".to_owned(),
                 elapsed: std::time::Duration::from_secs(1),
             },
+            ToolError::Transient {
+                tool: "web_search".to_owned(),
+                retry_after: Some(std::time::Duration::from_secs(1)),
+                source: Box::new(std::io::Error::other("HTTP 503")),
+            },
             ToolError::NotFound {
                 tool: "nope".to_owned(),
             },
@@ -295,7 +301,14 @@ mod tests {
         let kinds: Vec<&str> = errors.iter().map(error_kind).collect();
         assert_eq!(
             kinds,
-            ["denied", "invalid_args", "timeout", "not_found", "failed"]
+            [
+                "denied",
+                "invalid_args",
+                "timeout",
+                "transient",
+                "not_found",
+                "failed"
+            ]
         );
 
         let mut unique = kinds.clone();

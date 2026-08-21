@@ -36,7 +36,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::time::Duration;
 use zuno_error::ToolError;
-use zuno_tool::{Attachment, ToolContext, ToolOutput, TypedTool};
+use zuno_tool::{Attachment, ToolContext, ToolOutput, ToolReplayPolicy, TypedTool};
 
 /// The wire id, and the permission key.
 pub const ID: &str = "webfetch";
@@ -195,6 +195,7 @@ impl WebFetchTool {
             return Err(WebError::Status {
                 url: params.url.clone(),
                 status: status.as_u16(),
+                retry_after: bounds::retry_after(response.headers()),
             });
         }
 
@@ -241,6 +242,10 @@ impl TypedTool for WebFetchTool {
 
     fn description(&self) -> &str {
         DESCRIPTION
+    }
+
+    fn replay_policy(&self) -> ToolReplayPolicy {
+        ToolReplayPolicy::Safe
     }
 
     async fn run(&self, params: WebFetchParams, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
@@ -372,9 +377,18 @@ fn invalid_args(error: WebError) -> ToolError {
 }
 
 fn failed(error: WebError) -> ToolError {
-    ToolError::Failed {
-        tool: ID.to_owned(),
-        source: Box::new(error),
+    let retry_after = error.retry_after();
+    if error.is_transient() {
+        ToolError::Transient {
+            tool: ID.to_owned(),
+            retry_after,
+            source: Box::new(error),
+        }
+    } else {
+        ToolError::Failed {
+            tool: ID.to_owned(),
+            source: Box::new(error),
+        }
     }
 }
 

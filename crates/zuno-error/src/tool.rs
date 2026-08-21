@@ -36,6 +36,19 @@ pub enum ToolError {
     #[error("tool {tool} timed out after {elapsed:?}")]
     Timeout { tool: String, elapsed: Duration },
 
+    /// A typed transient failure whose identical request may succeed later.
+    ///
+    /// Whether replaying the call is safe is deliberately not encoded here. That
+    /// belongs to the tool definition: a timed-out read may be repeated, while a
+    /// timed-out mutation must first verify whether its side effect already landed.
+    #[error("tool {tool} failed transiently (retry_after={retry_after:?})")]
+    Transient {
+        tool: String,
+        retry_after: Option<Duration>,
+        #[source]
+        source: BoxSource,
+    },
+
     /// No tool by that name is registered. The model can pick a different one.
     #[error("tool {tool} is not registered")]
     NotFound { tool: String },
@@ -62,6 +75,7 @@ impl ToolError {
             Self::Denied { tool }
             | Self::InvalidArgs { tool, .. }
             | Self::Timeout { tool, .. }
+            | Self::Transient { tool, .. }
             | Self::NotFound { tool }
             | Self::Failed { tool, .. } => tool,
         }
@@ -79,6 +93,12 @@ impl ToolError {
         Recoverable::recovery(self).is_retry()
     }
 
+    /// Delay requested by the failed peer, when one was supplied.
+    #[must_use]
+    pub fn retry_after(&self) -> Option<Duration> {
+        Recoverable::retry_after(self)
+    }
+
     /// True when the model can fix this itself by issuing a corrected call.
     ///
     /// Bad arguments and a wrong tool name are both the model's mistake and both
@@ -89,7 +109,10 @@ impl ToolError {
     pub fn is_model_correctable(&self) -> bool {
         match self {
             Self::InvalidArgs { .. } | Self::NotFound { .. } => true,
-            Self::Denied { .. } | Self::Timeout { .. } | Self::Failed { .. } => false,
+            Self::Denied { .. }
+            | Self::Timeout { .. }
+            | Self::Transient { .. }
+            | Self::Failed { .. } => false,
         }
     }
 }
@@ -98,6 +121,9 @@ impl Recoverable for ToolError {
     fn recovery(&self) -> Recovery {
         match self {
             Self::Timeout { .. } => Recovery::Retry { after: None },
+            Self::Transient { retry_after, .. } => Recovery::Retry {
+                after: *retry_after,
+            },
             Self::Denied { .. }
             | Self::InvalidArgs { .. }
             | Self::NotFound { .. }
@@ -123,6 +149,11 @@ mod tests {
                 tool: "bash".to_owned(),
                 elapsed: Duration::from_secs(120),
             },
+            ToolError::Transient {
+                tool: "bash".to_owned(),
+                retry_after: Some(Duration::from_secs(3)),
+                source: Box::new(std::io::Error::other("connection reset")),
+            },
             ToolError::NotFound {
                 tool: "bash".to_owned(),
             },
@@ -141,11 +172,28 @@ mod tests {
     }
 
     #[test]
-    fn only_timeout_is_retryable() {
+    fn timeout_and_typed_transient_failures_are_retryable() {
         for e in every_variant() {
-            let expected = matches!(e, ToolError::Timeout { .. });
+            let expected = matches!(e, ToolError::Timeout { .. } | ToolError::Transient { .. });
             assert_eq!(e.is_retryable(), expected, "{e}");
         }
+    }
+
+    #[test]
+    fn transient_failure_preserves_the_peer_delay() {
+        let retry_after = Duration::from_secs(3);
+        let error = ToolError::Transient {
+            tool: "web_search".to_owned(),
+            retry_after: Some(retry_after),
+            source: Box::new(std::io::Error::other("HTTP 429")),
+        };
+
+        assert_eq!(
+            error.recovery(),
+            Recovery::Retry {
+                after: Some(retry_after)
+            }
+        );
     }
 
     #[test]

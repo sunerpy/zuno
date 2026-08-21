@@ -970,6 +970,8 @@ fn the_table_declares_the_check_constraint_and_deliberately_no_foreign_key() {
         "empty_assistant_message",
         "context_limit",
         "context_compacted",
+        "tool_transient",
+        "tool_uncertain",
     ] {
         assert!(
             retry_ddl.contains(&format!("'{reason}'")),
@@ -1046,6 +1048,6 @@ fn the_default_locations_sit_beside_the_session_database_without_being_in_it() {
     assert_ne!(
         session_database.as_path(),
         Some(database.as_path()),
-        "the goal must not be stored in opencode.db"
+        "the goal must not be stored in the session database"
     );
 }

@@ -105,6 +105,20 @@ pub struct ToolDefinition {
     pub parameters: Value,
 }
 
+/// Whether an identical tool call may be issued again after a transient failure.
+///
+/// `Never` is the default because a lost response does not prove a mutation failed:
+/// the external side effect may already exist. `Safe` is reserved for idempotent,
+/// read-only operations whose implementation owns that guarantee.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ToolReplayPolicy {
+    /// Verify authoritative external state before issuing another call.
+    #[default]
+    Never,
+    /// The identical call is read-only or otherwise idempotent and may be retried.
+    Safe,
+}
+
 /// An executable tool, erased to a trait object for the registry.
 ///
 /// Object-safe: `#[async_trait]` boxes the returned future so `Arc<dyn Tool>` works.
@@ -119,6 +133,11 @@ pub trait Tool: Send + Sync {
 
     /// The description the model reads.
     fn description(&self) -> &str;
+
+    /// Whether an identical call may be retried after a typed transient failure.
+    fn replay_policy(&self) -> ToolReplayPolicy {
+        ToolReplayPolicy::Never
+    }
 
     /// The parameter schema **before** central augmentation.
     ///
@@ -259,6 +278,11 @@ pub trait TypedTool: Send + Sync + 'static {
     /// The description the model reads.
     fn description(&self) -> &str;
 
+    /// Whether an identical call may be retried after a typed transient failure.
+    fn replay_policy(&self) -> ToolReplayPolicy {
+        ToolReplayPolicy::Never
+    }
+
     /// Runs the tool against decoded arguments.
     async fn run(&self, params: Self::Params, ctx: ToolContext) -> Result<ToolOutput, ToolError>;
 }
@@ -280,6 +304,10 @@ impl<T: TypedTool> Tool for Typed<T> {
 
     fn description(&self) -> &str {
         self.0.description()
+    }
+
+    fn replay_policy(&self) -> ToolReplayPolicy {
+        self.0.replay_policy()
     }
 
     fn raw_parameters_schema(&self) -> Value {
@@ -347,6 +375,10 @@ mod tests {
 
         fn description(&self) -> &str {
             "Echo text."
+        }
+
+        fn replay_policy(&self) -> ToolReplayPolicy {
+            ToolReplayPolicy::Safe
         }
 
         async fn run(
@@ -451,6 +483,16 @@ mod tests {
             raw["properties"].get(INTENT_KEY).is_none(),
             "augmentation happens at definition time, not derivation time"
         );
+    }
+
+    #[test]
+    fn replay_is_forbidden_by_default_and_typed_tools_delegate_explicit_opt_in() {
+        let proxy = Proxied {
+            remote_schema: json!({ "type": "object", "properties": {} }),
+        };
+
+        assert_eq!(proxy.replay_policy(), ToolReplayPolicy::Never);
+        assert_eq!(erase(Echo).replay_policy(), ToolReplayPolicy::Safe);
     }
 
     #[tokio::test]

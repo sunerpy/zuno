@@ -625,7 +625,11 @@ async fn the_permission_gate_is_consulted_before_the_request() {
 async fn a_server_error_is_reported_rather_than_handed_to_the_model_as_content() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(503).set_body_string("upstream is down"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .insert_header("retry-after", "3")
+                .set_body_string("upstream is down"),
+        )
         .mount(&server)
         .await;
 
@@ -636,9 +640,15 @@ async fn a_server_error_is_reported_rather_than_handed_to_the_model_as_content()
     .await
     .expect_err("a 503 body is not content");
 
-    let ToolError::Failed { source, .. } = error else {
-        panic!("expected a classified failure, got {error:?}");
+    let ToolError::Transient {
+        retry_after,
+        source,
+        ..
+    } = error
+    else {
+        panic!("expected a retryable classified failure, got {error:?}");
     };
+    assert_eq!(retry_after, Some(Duration::from_secs(3)));
     assert!(
         matches!(
             source.downcast_ref::<WebError>(),

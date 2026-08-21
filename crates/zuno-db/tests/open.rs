@@ -18,54 +18,22 @@ fn temp_dir() -> tempfile::TempDir {
 }
 
 #[test]
-fn default_database_filename_hard_cut_covers_old_new_both_and_neither() {
-    for (old_exists, new_exists) in [(true, false), (false, true), (true, true), (false, false)] {
-        let dir = temp_dir();
-        let old_path = dir.path().join("opencode.db");
-        let new_path = dir.path().join("zuno.db");
-        if old_exists {
-            std::fs::write(&old_path, []).expect("create legacy filename");
-        }
-        if new_exists {
-            std::fs::write(&new_path, []).expect("create current filename");
-        }
-
-        let location = DbLocation::File(new_path.clone());
-        let result = open::open_default_location(&location);
-        if old_exists && !new_exists {
-            let error = result.expect_err("old-only must require an explicit filename migration");
-            let message = error.to_string();
-            assert!(
-                message.contains(&old_path.display().to_string()),
-                "{message}"
-            );
-            assert!(
-                message.contains(&new_path.display().to_string()),
-                "{message}"
-            );
-            assert!(
-                old_path.is_file(),
-                "the diagnostic must not move the old file"
-            );
-            assert!(
-                !new_path.exists(),
-                "the diagnostic must not create the new file"
-            );
-        } else {
-            drop(result.expect("new-only, both, and neither open the Zuno filename"));
-            assert!(
-                new_path.is_file(),
-                "the Zuno filename must be authoritative"
-            );
-        }
-    }
-
+fn default_database_open_uses_only_the_zuno_path() {
     let dir = temp_dir();
-    let explicit_path = dir.path().join("zuno.db");
-    let legacy_path = dir.path().join("opencode.db");
-    std::fs::write(&legacy_path, []).expect("create unrelated legacy basename");
-    drop(open::open_at(&explicit_path).expect("an explicit path remains authoritative"));
-    assert!(explicit_path.is_file());
+    let unrelated = dir.path().join("opencode.db");
+    let zuno = dir.path().join("zuno.db");
+    std::fs::write(&unrelated, b"not a sqlite database").expect("create unrelated file");
+
+    drop(
+        open::open_default_location(&DbLocation::File(zuno.clone()))
+            .expect("the computed Zuno path opens independently"),
+    );
+
+    assert!(zuno.is_file());
+    assert_eq!(
+        std::fs::read(&unrelated).expect("read unrelated file"),
+        b"not a sqlite database"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -75,7 +43,7 @@ fn default_database_filename_hard_cut_covers_old_new_both_and_neither() {
 #[test]
 fn a_fresh_file_database_reports_all_four_pragmas_active() {
     let dir = temp_dir();
-    let path = dir.path().join("opencode.db");
+    let path = dir.path().join("zuno.db");
     let connection = open::open_at(&path).expect("open a fresh database");
 
     let journal_mode: String = connection
@@ -108,7 +76,7 @@ fn a_fresh_file_database_reports_all_four_pragmas_active() {
 #[test]
 fn wal_survives_a_close_but_the_per_connection_pragmas_do_not() {
     let dir = temp_dir();
-    let path = dir.path().join("opencode.db");
+    let path = dir.path().join("zuno.db");
     drop(open::open_at(&path).expect("open a fresh database"));
 
     let raw = zuno_db::Connection::open(&path).expect("reopen without pragmas");
@@ -149,14 +117,14 @@ fn wal_survives_a_close_but_the_per_connection_pragmas_do_not() {
 /// `rusqlite` calls `sqlite3_busy_timeout(db, 5000)` on every connection it
 /// opens, which happens to be exactly the value `database.ts:29` asks for.
 ///
-/// Together these mean two of the oracle's four pragmas would *appear* correct on
+/// Together these mean two required pragmas would *appear* correct on
 /// this driver even if the crate never issued them. The pragmas are issued
 /// explicitly anyway, because behaviour must not depend on which SQLite is linked
 /// or on a driver's undocumented default.
 #[test]
-fn the_stack_below_this_crate_already_defaults_two_pragmas_to_the_oracle_values() {
+fn the_stack_below_this_crate_already_defaults_two_required_pragmas() {
     let dir = temp_dir();
-    let path = dir.path().join("opencode.db");
+    let path = dir.path().join("zuno.db");
     let raw = zuno_db::Connection::open(&path).expect("open without pragmas");
 
     let foreign_keys: i64 = raw
@@ -175,7 +143,7 @@ fn the_stack_below_this_crate_already_defaults_two_pragmas_to_the_oracle_values(
     assert_eq!(
         busy_timeout,
         zuno_db::BUSY_TIMEOUT_MS,
-        "rusqlite no longer defaults busy_timeout to the oracle's 5000ms; \
+        "rusqlite no longer defaults busy_timeout to Zuno's 5000ms; \
          the explicit pragma is now the only thing making a writer wait"
     );
     drop(raw);
@@ -188,7 +156,7 @@ fn the_stack_below_this_crate_already_defaults_two_pragmas_to_the_oracle_values(
 #[test]
 fn every_pooled_connection_carries_the_pragmas() {
     let dir = temp_dir();
-    let path = dir.path().join("opencode.db");
+    let path = dir.path().join("zuno.db");
     let pool = Pool::open(&DbLocation::File(path)).expect("open pool");
 
     let first = pool.get().expect("first connection");
@@ -226,7 +194,7 @@ fn an_in_memory_database_reports_memory_journalling_and_still_enforces_foreign_k
 #[test]
 fn verify_pragmas_rejects_a_connection_whose_foreign_keys_were_turned_off() {
     let dir = temp_dir();
-    let path = dir.path().join("opencode.db");
+    let path = dir.path().join("zuno.db");
     let location = DbLocation::File(path.clone());
     let connection = open::open_at(&path).expect("open a fresh database");
     open::verify_pragmas(&connection, &location).expect("a configured connection verifies");
@@ -263,7 +231,7 @@ fn create_parent_and_child(connection: &zuno_db::Connection) {
 #[test]
 fn a_child_row_with_a_dangling_foreign_key_is_rejected() {
     let dir = temp_dir();
-    let path = dir.path().join("opencode.db");
+    let path = dir.path().join("zuno.db");
     let connection = open::open_at(&path).expect("open a fresh database");
     create_parent_and_child(&connection);
 
@@ -292,7 +260,7 @@ fn a_child_row_with_a_dangling_foreign_key_is_rejected() {
 #[test]
 fn the_same_insert_succeeds_once_foreign_keys_are_turned_off() {
     let dir = temp_dir();
-    let path = dir.path().join("opencode.db");
+    let path = dir.path().join("zuno.db");
     let connection = open::open_at(&path).expect("open a fresh database");
     create_parent_and_child(&connection);
     connection
@@ -340,7 +308,7 @@ fn a_cascade_declared_on_the_child_actually_fires() {
 #[test]
 fn two_concurrent_writers_both_succeed_within_the_busy_timeout() {
     let dir = temp_dir();
-    let path = dir.path().join("opencode.db");
+    let path = dir.path().join("zuno.db");
     let pool = Arc::new(Pool::open(&DbLocation::File(path)).expect("open pool"));
     pool.transaction(|tx| {
         tx.execute_batch("CREATE TABLE writes (id integer primary key, who text not null)")
@@ -402,11 +370,11 @@ fn two_concurrent_writers_both_succeed_within_the_busy_timeout() {
 }
 
 /// A reader must not be blocked by an open writer. That is the whole reason the
-/// oracle asks for WAL rather than the default rollback journal.
+/// Zuno uses WAL rather than the default rollback journal.
 #[test]
 fn a_reader_is_not_blocked_by_an_open_writer_under_wal() {
     let dir = temp_dir();
-    let path = dir.path().join("opencode.db");
+    let path = dir.path().join("zuno.db");
     let pool = Pool::open(&DbLocation::File(path)).expect("open pool");
     pool.transaction(|tx| {
         tx.execute_batch(
@@ -608,7 +576,7 @@ fn zuno_db_absolute_is_used_verbatim() {
 #[test]
 fn wal_creates_a_wal_and_shm_sidecar_beside_the_database() {
     let dir = temp_dir();
-    let path = dir.path().join("opencode.db");
+    let path = dir.path().join("zuno.db");
     let pool = Pool::open(&DbLocation::File(path.clone())).expect("open pool");
     let connection = pool.get().expect("checkout");
     connection
@@ -619,7 +587,7 @@ fn wal_creates_a_wal_and_shm_sidecar_beside_the_database() {
     found.sort();
     assert_eq!(
         found,
-        ["opencode.db", "opencode.db-shm", "opencode.db-wal"],
+        ["zuno.db", "zuno.db-shm", "zuno.db-wal"],
         "unexpected on-disk file set"
     );
 
@@ -627,8 +595,8 @@ fn wal_creates_a_wal_and_shm_sidecar_beside_the_database() {
     assert_eq!(
         sidecars,
         [
-            dir.path().join("opencode.db-wal"),
-            dir.path().join("opencode.db-shm"),
+            dir.path().join("zuno.db-wal"),
+            dir.path().join("zuno.db-shm"),
         ]
     );
     for sidecar in &sidecars {

@@ -287,8 +287,7 @@ pub fn execute(
             let mut artifact_request = ArtifactGcRequest::new(
                 outcome.preview.session_ids.clone(),
                 system_time(request.now_ms),
-            )
-            .with_legacy_json();
+            );
             if request.action == SessionPruneAction::Delete {
                 artifact_request.mode = ArtifactGcMode::Delete;
             }
@@ -428,10 +427,6 @@ fn artifact_kind(kind: ArtifactKind) -> &'static str {
     match kind {
         ArtifactKind::SnapshotStore => "snapshot_store",
         ArtifactKind::ToolOutput => "tool_output",
-        ArtifactKind::LegacySession => "legacy_session",
-        ArtifactKind::LegacyMessages => "legacy_messages",
-        ArtifactKind::LegacyParts => "legacy_parts",
-        ArtifactKind::LegacySessionDiff => "legacy_session_diff",
     }
 }
 

@@ -12,8 +12,8 @@ use zuno_db::{Connection, migration, open};
 use zuno_engine::dispatch::ToolRegistryDispatcher;
 use zuno_engine::interrupt::InterruptSignal;
 use zuno_engine::r#loop::{
-    AgentModelResolver, ResolvedAgent, ResolvedModel, RunTurnRequest, TurnContext, TurnEvent,
-    TurnOutcome, event_channel, run_turn,
+    AgentModelResolver, ResolvedAgent, ResolvedModel, RunTurnRequest, ToolFailureRecovery,
+    TurnContext, TurnEvent, TurnOutcome, event_channel, run_turn,
 };
 use zuno_error::{ProviderError, ToolError};
 use zuno_llm::cache::{DynamicContext, McpToolStatus};
@@ -22,7 +22,7 @@ use zuno_llm::registry::{
     ApiSurface, Capabilities, CompletionRequest, Provider, ProviderRegistry, ProviderStream, Spec,
 };
 use zuno_permission::{PermissionAction, Rule};
-use zuno_tool::{AllowAll, Tool, ToolContext, ToolOutput};
+use zuno_tool::{AllowAll, Tool, ToolContext, ToolOutput, ToolReplayPolicy};
 
 const SESSION_ID: &str = "ses_dispatch_loop";
 
@@ -148,6 +148,43 @@ impl Tool for TimeoutTool {
             tool: self.id().to_owned(),
             elapsed: Duration::from_secs(30),
         })
+    }
+}
+
+struct RetryableThenTerminalTool {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for RetryableThenTerminalTool {
+    fn id(&self) -> &str {
+        "fragile"
+    }
+
+    fn description(&self) -> &str {
+        "A tool whose latest failure determines whether goal recovery remains pending."
+    }
+
+    fn raw_parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "required": ["command"]
+        })
+    }
+
+    async fn execute(&self, _args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => Err(ToolError::Timeout {
+                tool: self.id().to_owned(),
+                elapsed: Duration::from_secs(30),
+            }),
+            1 => Err(ToolError::Failed {
+                tool: self.id().to_owned(),
+                source: Box::new(std::io::Error::other("terminal rejection")),
+            }),
+            call => panic!("unexpected fragile invocation {call}"),
+        }
     }
 }
 
@@ -290,10 +327,16 @@ async fn run_scenario(
         sender,
     );
     let (outcome, events) = tokio::join!(turn, collect_events(receiver));
-    assert!(matches!(
-        outcome,
-        Ok(TurnOutcome::Completed { steps: 2, .. })
-    ));
+    let TurnOutcome::Completed {
+        steps,
+        unresolved_tool_failures,
+        ..
+    } = outcome.expect("turn completes")
+    else {
+        panic!("turn was interrupted");
+    };
+    assert_eq!(steps, 2);
+    assert!(unresolved_tool_failures.is_empty());
 
     let statuses = MessageStore::new(&connection)
         .hydrate_session(SESSION_ID)
@@ -387,6 +430,78 @@ async fn dispatch_loop_appends_denial_and_continues_to_the_next_call() {
 }
 
 #[tokio::test]
+async fn dispatch_loop_rejects_namespaced_or_historical_tool_aliases() {
+    let mut connection = seeded();
+    let provider = Arc::new(ScriptedProvider::new(named_provider_events(
+        "functions.bash",
+        &[("call-alias", "git status")],
+    )));
+    let providers = registry(provider);
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![Arc::new(SequentialTool {
+            active: AtomicUsize::new(0),
+            order: Arc::clone(&order),
+        })],
+        vec![Rule {
+            permission: "*".to_owned(),
+            pattern: "*".to_owned(),
+            action: PermissionAction::Allow,
+        }],
+        Arc::new(AllowAll),
+        InterruptSignal::new(),
+        McpToolStatus::Ready,
+    );
+    let resolver = Resolver;
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        RunTurnRequest::new(SESSION_ID, "turn-exact-tool-id", DynamicContext::default()),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, events) = tokio::join!(turn, collect_events(receiver));
+
+    let TurnOutcome::Completed {
+        unresolved_tool_failures,
+        ..
+    } = outcome.expect("turn completes")
+    else {
+        panic!("turn was interrupted");
+    };
+    assert!(unresolved_tool_failures.is_empty());
+    assert!(order.lock().expect("order lock").is_empty());
+    assert_eq!(
+        lifecycle(&events),
+        [
+            "call-alias:running",
+            "call-alias:error",
+            "call-alias:result:error",
+        ]
+    );
+    let tool_part = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .expect("hydrate turn")
+        .into_iter()
+        .flat_map(|message| message.parts)
+        .find(|part| part.kind == PartKind::Tool)
+        .expect("unknown tool result is persisted");
+    assert!(
+        tool_part.data["state"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("Unknown tool: functions.bash")),
+        "{tool_part:?}"
+    );
+}
+
+#[tokio::test]
 async fn dispatch_loop_reports_a_tool_timeout_without_replaying_the_call() {
     let mut connection = seeded();
     let provider = Arc::new(ScriptedProvider::new(named_provider_events(
@@ -425,10 +540,23 @@ async fn dispatch_loop_reports_a_tool_timeout_without_replaying_the_call() {
     );
     let (outcome, events) = tokio::join!(turn, collect_events(receiver));
 
-    assert!(matches!(
-        outcome,
-        Ok(TurnOutcome::Completed { steps: 2, .. })
-    ));
+    let TurnOutcome::Completed {
+        steps,
+        unresolved_tool_failures,
+        ..
+    } = outcome.expect("turn completes")
+    else {
+        panic!("turn was interrupted");
+    };
+    assert_eq!(steps, 2);
+    assert_eq!(
+        unresolved_tool_failures,
+        vec![ToolFailureRecovery {
+            tool: "fragile".to_owned(),
+            replay_policy: ToolReplayPolicy::Never,
+            retry_after: None,
+        }]
+    );
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
@@ -457,6 +585,77 @@ async fn dispatch_loop_reports_a_tool_timeout_without_replaying_the_call() {
             .as_str()
             .is_some_and(|error| error.contains("timed out")),
         "{tool_part:?}"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_loop_keeps_only_the_latest_failure_recovery_for_each_tool() {
+    let mut connection = seeded();
+    let provider = Arc::new(ScriptedProvider::new(named_provider_events(
+        "fragile",
+        &[
+            ("call-timeout", "first attempt"),
+            ("call-terminal", "corrected attempt"),
+        ],
+    )));
+    let providers = registry(provider);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![Arc::new(RetryableThenTerminalTool {
+            calls: Arc::clone(&calls),
+        })],
+        vec![Rule {
+            permission: "*".to_owned(),
+            pattern: "*".to_owned(),
+            action: PermissionAction::Allow,
+        }],
+        Arc::new(AllowAll),
+        InterruptSignal::new(),
+        McpToolStatus::Ready,
+    );
+    let resolver = Resolver;
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        RunTurnRequest::new(
+            SESSION_ID,
+            "turn-tool-latest-recovery",
+            DynamicContext::default(),
+        ),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, events) = tokio::join!(turn, collect_events(receiver));
+
+    let TurnOutcome::Completed {
+        unresolved_tool_failures,
+        ..
+    } = outcome.expect("turn completes")
+    else {
+        panic!("turn was interrupted");
+    };
+    assert!(
+        unresolved_tool_failures.is_empty(),
+        "the terminal second result resolves the earlier retryable failure"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        lifecycle(&events),
+        [
+            "call-timeout:running",
+            "call-timeout:error",
+            "call-timeout:result:error",
+            "call-terminal:running",
+            "call-terminal:error",
+            "call-terminal:result:error",
+        ]
     );
 }
 

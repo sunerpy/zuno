@@ -131,7 +131,7 @@ async fn an_explicit_model_and_effort_reach_the_childs_outbound_request() {
 
 /// QA failure path: the refusal must list what the caller may name instead.
 #[tokio::test]
-async fn naming_the_orchestrator_is_rejected_with_a_message_listing_valid_targets() {
+async fn naming_build_is_rejected_with_a_message_listing_valid_targets() {
     let host = Arc::new(RecordingHost::new());
     let error = tool(Arc::clone(&host))
         .run_erased(
@@ -150,8 +150,8 @@ async fn naming_the_orchestrator_is_rejected_with_a_message_listing_valid_target
     let targets = valid_targets(false);
     assert_eq!(
         targets.len(),
-        4,
-        "the lean roster's delegable set: {targets:?}"
+        5,
+        "the native roster's delegable set: {targets:?}"
     );
     for target in &targets {
         assert!(text.contains(target), "must offer {target}: {text}");

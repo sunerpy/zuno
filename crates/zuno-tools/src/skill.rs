@@ -33,7 +33,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 use zuno_catalog::skill::Skills;
 use zuno_error::ToolError;
-use zuno_tool::{ToolContext, ToolOutput, TypedTool};
+use zuno_tool::{ToolContext, ToolOutput, ToolReplayPolicy, TypedTool};
 
 /// The id the model calls, and the registry slot it fills
 /// ([`crate::registry::BuiltinSlot::Skill`]).
@@ -107,6 +107,10 @@ impl TypedTool for SkillTool {
 
     fn description(&self) -> &str {
         DESCRIPTION
+    }
+
+    fn replay_policy(&self) -> ToolReplayPolicy {
+        ToolReplayPolicy::Safe
     }
 
     async fn run(&self, params: SkillParams, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {

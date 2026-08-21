@@ -220,6 +220,46 @@ fn views_question_typed_answer_replaces_the_options() {
 }
 
 #[test]
+fn views_question_newline_action_inserts_a_newline_and_submit_action_submits() {
+    let mut prompt = prompt(QuestionRequest::new("q", "h", options()));
+    prompt.handle_action(action("dialog.select.end"), &press(KeyCode::End));
+    prompt.handle_action(action("dialog.select.submit"), &press(KeyCode::Enter));
+    for character in "first line".chars() {
+        prompt.handle_action(action("messages_next"), &press(KeyCode::Char(character)));
+    }
+
+    assert_eq!(
+        prompt.handle_action(action("input_newline"), &press(KeyCode::Enter)),
+        DialogStep::Redraw
+    );
+    for character in "second line".chars() {
+        prompt.handle_action(action("messages_next"), &press(KeyCode::Char(character)));
+    }
+
+    let rendered = render(prompt, 40, 16).join("\n");
+    assert!(rendered.contains("first line"), "{rendered}");
+    assert!(rendered.contains("second line"), "{rendered}");
+}
+
+#[test]
+fn views_question_multiline_answer_preserves_the_newline_on_submit() {
+    let mut prompt = prompt(QuestionRequest::new("q", "h", options()));
+    prompt.handle_action(action("dialog.select.end"), &press(KeyCode::End));
+    prompt.handle_action(action("dialog.select.submit"), &press(KeyCode::Enter));
+    for character in "first".chars() {
+        prompt.handle_action(action("messages_next"), &press(KeyCode::Char(character)));
+    }
+    prompt.handle_action(action("input_newline"), &press(KeyCode::Enter));
+    for character in "second".chars() {
+        prompt.handle_action(action("messages_next"), &press(KeyCode::Char(character)));
+    }
+
+    let answers =
+        answered(prompt.handle_action(action("dialog.prompt.submit"), &press(KeyCode::Enter)));
+    assert_eq!(answers, vec![vec![String::from("first\nsecond")]]);
+}
+
+#[test]
 fn views_question_escaping_the_typed_row_returns_to_the_options() {
     let mut prompt = prompt(QuestionRequest::new("q", "h", options()));
     prompt.handle_action(action("dialog.select.end"), &press(KeyCode::End));
@@ -316,4 +356,14 @@ fn views_question_hints_change_for_a_multi_select() {
     request.multiple = Some(true);
     let multiple = prompt(request);
     assert!(multiple.hints().iter().any(|(key, _)| *key == "space"));
+}
+
+#[test]
+fn views_question_typed_answer_hints_explain_newline_and_submit() {
+    let mut prompt = prompt(QuestionRequest::new("q", "h", options()));
+    prompt.handle_action(action("dialog.select.end"), &press(KeyCode::End));
+    prompt.handle_action(action("dialog.select.submit"), &press(KeyCode::Enter));
+
+    assert!(prompt.hints().contains(&("shift+enter", "newline")));
+    assert!(prompt.hints().contains(&("enter", "submit")));
 }

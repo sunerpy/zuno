@@ -1,12 +1,6 @@
 //! Agent discovery over a layered on-disk config tree.
 //!
-//! This file is what survived the removal of the opencode differential suite. The
-//! seven comparative tests there asked *"does `zuno agent list` print what
-//! `opencode agent list` prints"*, a question Zuno no longer answers to. The one
-//! test kept here never asked it: it drives [`agent::load`] against a fixture and
-//! pins what Zuno itself must produce.
-//!
-//! It is not a weak assertion. The fixture places three Markdown agents at nested
+//! The fixture places three Markdown agents at nested
 //! paths across two different config directories and adds two config-file entries
 //! that override built-ins, so the assertions below cover the whole path-derived
 //! name rule, override precedence over a built-in, the `mode: "all"` default for
@@ -18,37 +12,31 @@ use zuno_catalog::agent;
 use zuno_paths::Env;
 use zuno_testkit::ConfigFixture;
 
-/// Write a file under `$XDG_CONFIG_HOME/opencode/`, one of the global config
-/// directories this crate scans for `{agent,agents}/**/*.md`.
+/// Write a file under `$XDG_CONFIG_HOME/zuno/`.
 fn global_asset(
     fixture: &ConfigFixture,
     relative: &str,
     contents: &str,
 ) -> Result<(), Box<dyn Error>> {
-    for directory in ["opencode", "zuno"] {
-        let path = fixture.env().xdg_config().join(directory).join(relative);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, contents)?;
+    let path = fixture.env().xdg_config().join("zuno").join(relative);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
     }
+    fs::write(path, contents)?;
     Ok(())
 }
 
-/// Write a file under `<project>/.opencode/`, the nearest project config
-/// directory.
+/// Write a file under `<project>/.zuno/`.
 fn project_asset(
     fixture: &ConfigFixture,
     relative: &str,
     contents: &str,
 ) -> Result<(), Box<dyn Error>> {
-    for directory in [".opencode", ".zuno"] {
-        let path = fixture.env().project().join(directory).join(relative);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, contents)?;
+    let path = fixture.env().project().join(".zuno").join(relative);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
     }
+    fs::write(path, contents)?;
     Ok(())
 }
 

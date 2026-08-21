@@ -103,6 +103,38 @@ fn idle_active_goal_prepares_exactly_one_continuation() {
 }
 
 #[test]
+fn prepared_continuation_is_rejected_after_the_goal_is_replaced() {
+    let fixture = Fixture::new();
+    let original = fixture.create("original objective");
+    let prepared = fixture
+        .continuation
+        .prepare_if_idle("ses_goal", GoalTurnMode::Work, QueuedUserInput::Absent)
+        .expect("prepare original goal");
+    let ContinuationAttempt::Prepared(prepared) = prepared else {
+        panic!("active goal should prepare");
+    };
+    assert!(
+        fixture
+            .continuation
+            .is_current(&prepared)
+            .expect("validate original goal")
+    );
+
+    let replacement = fixture
+        .store
+        .replace_goal_as_system("ses_goal", "replacement objective", Some(10_000))
+        .expect("replace the captured goal");
+    assert_ne!(replacement.goal_id, original.goal_id);
+    assert!(
+        !fixture
+            .continuation
+            .is_current(&prepared)
+            .expect("re-read replacement"),
+        "a continuation captured before replacement must not run afterward"
+    );
+}
+
+#[test]
 fn running_plan_and_queued_input_each_suppress_automatic_work() {
     let fixture = Fixture::new();
     fixture.create("guarded continuation");
@@ -404,6 +436,51 @@ fn retry_context_tells_the_model_to_verify_side_effects_before_repeating_them() 
     assert!(rendered.contains("recovery attempt 1"), "{rendered}");
     assert!(
         rendered.contains("before repeating an action with side effects"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn uncertain_tool_recovery_forbids_replay_until_external_state_is_verified() {
+    let fixture = Fixture::new();
+    fixture.create("publish without duplicating side effects");
+    fixture
+        .store
+        .schedule_retry(
+            "ses_goal",
+            crate::GoalRetryReason::ToolUncertain,
+            None,
+            crate::GoalRetryPolicy::new(
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(30),
+                0,
+                std::time::Duration::from_millis(250),
+            )
+            .expect("valid policy"),
+            1_000,
+            0,
+        )
+        .expect("schedule retry")
+        .expect("active goal");
+
+    let entry = fixture
+        .continuation
+        .injection("ses_goal")
+        .expect("read retry context")
+        .expect("active goal");
+    let rendered = entry
+        .message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            zuno_llm::event::RequestContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+
+    assert!(rendered.contains("tool_uncertain"), "{rendered}");
+    assert!(
+        rendered.contains("Verify authoritative external state"),
         "{rendered}"
     );
 }

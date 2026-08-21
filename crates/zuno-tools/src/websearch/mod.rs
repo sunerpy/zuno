@@ -17,9 +17,14 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use zuno_error::{BoxSource, ToolError};
-use zuno_tool::{InterruptHandle, PermissionAsk, ToolContext, ToolOutput, TypedTool};
+use zuno_tool::{
+    InterruptHandle, PermissionAsk, ToolContext, ToolOutput, ToolReplayPolicy, TypedTool,
+};
 
-pub use provider::{SearchExecution, SearchRequest, SearchResult, SearchSource, WebSearchProvider};
+pub use provider::{
+    SearchExecution, SearchRequest, SearchResult, SearchSource, WebSearchProvider,
+    WebSearchProviderError,
+};
 
 /// Native wire id and permission key.
 pub const ID: &str = "web_search";
@@ -236,10 +241,7 @@ impl WebSearchTool {
         .await
         {
             Ok(Ok(result)) => Ok(result),
-            Ok(Err(source)) => Err(ToolError::Failed {
-                tool: ID.to_owned(),
-                source,
-            }),
+            Ok(Err(source)) => Err(provider_error(source)),
             Err(_elapsed) => Err(ToolError::Timeout {
                 tool: ID.to_owned(),
                 elapsed: self.policy.timeout,
@@ -264,6 +266,10 @@ impl TypedTool for WebSearchTool {
 
     fn description(&self) -> &str {
         &self.description
+    }
+
+    fn replay_policy(&self) -> ToolReplayPolicy {
+        ToolReplayPolicy::Safe
     }
 
     async fn run(
@@ -430,7 +436,7 @@ pub fn describe(max_queries: usize) -> String {
 }
 
 enum QueryFailure {
-    Provider(BoxSource),
+    Provider(WebSearchProviderError),
     Timeout(Duration),
     Join(BoxSource),
 }
@@ -438,7 +444,8 @@ enum QueryFailure {
 impl QueryFailure {
     fn into_tool_error(self) -> ToolError {
         match self {
-            Self::Provider(source) | Self::Join(source) => ToolError::Failed {
+            Self::Provider(source) => provider_error(source),
+            Self::Join(source) => ToolError::Failed {
                 tool: ID.to_owned(),
                 source,
             },
@@ -447,6 +454,23 @@ impl QueryFailure {
                 elapsed,
             },
         }
+    }
+}
+
+fn provider_error(error: WebSearchProviderError) -> ToolError {
+    match error {
+        WebSearchProviderError::Transient {
+            retry_after,
+            source,
+        } => ToolError::Transient {
+            tool: ID.to_owned(),
+            retry_after,
+            source,
+        },
+        WebSearchProviderError::Failed { source } => ToolError::Failed {
+            tool: ID.to_owned(),
+            source,
+        },
     }
 }
 

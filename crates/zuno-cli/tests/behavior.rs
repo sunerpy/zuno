@@ -478,32 +478,23 @@ fn import_reports_a_missing_file() {
     assert!(stderr.contains("File not found"), "{stderr}");
 }
 
-/// A user whose config is still under the pre-rename filename must be told, on the
-/// path the TUI and `zuno run` take.
-///
-/// That path used to render the error with `Display`, which for
-/// `ConfigError::Invalid` is a bare "failed validation (1 issue(s))" — the count
-/// without the instruction. So the assertion is on the *repair instruction* rather
-/// than on failure: exiting non-zero while saying nothing actionable is the outcome
-/// this test exists to reject, and it passes for the wrong reason if it only checks
-/// the exit code.
 #[test]
-fn a_legacy_named_config_is_reported_on_the_turn_path() {
+fn an_opencode_named_file_is_not_part_of_the_zuno_config_graph() {
     let root = tempfile::tempdir().expect("tempdir");
-    let stale = root.path().join("config/zuno/opencode.json");
-    std::fs::create_dir_all(stale.parent().expect("parent")).expect("config dir");
-    std::fs::write(&stale, r#"{"model":"anthropic/claude-sonnet-4-5"}"#).expect("seed config");
+    let unrelated = root.path().join("config/zuno/opencode.json");
+    std::fs::create_dir_all(unrelated.parent().expect("parent")).expect("config dir");
+    std::fs::write(&unrelated, r#"{"username":"not-zuno-input"}"#).expect("seed file");
 
-    let output = run(root.path(), &["run", "hello"]);
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let output = run(root.path(), &["debug", "config"]);
     assert!(
-        stderr.contains(&stale.display().to_string()),
-        "the error must name the file to rename: {stderr}"
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stderr.contains("rename it to `zuno.json`"),
-        "the error must carry the repair instruction, not just an issue count: {stderr}"
+        !stdout.contains("not-zuno-input"),
+        "an unrelated product filename entered Zuno config: {stdout}"
     );
 }
 

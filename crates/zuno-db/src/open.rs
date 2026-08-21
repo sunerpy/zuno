@@ -1,7 +1,6 @@
-//! Opening a Zuno SQLite connection with the proven pragma sequence.
+//! Opening a Zuno SQLite connection with the verified pragma sequence.
 //!
-//! The pragma sequence is a verbatim port of `database.ts:27-32`, in order, and
-//! the connection target comes from [`zuno_paths::db_path`] — this module never
+//! The connection target comes from [`zuno_paths::db_path`]; this module never
 //! re-parses `ZUNO_DB`.
 
 use rusqlite::{Connection, ErrorCode};
@@ -9,12 +8,10 @@ use std::path::{Path, PathBuf};
 use zuno_error::DbError;
 use zuno_paths::DbLocation;
 
-/// The pragma sequence from `database.ts:27-32`, in the oracle's order.
+/// The pragma sequence applied to every Zuno connection.
 ///
-/// `wal_checkpoint(PASSIVE)` is part of the sequence, not an afterthought: the
-/// oracle runs it on every connection it opens, and a passive checkpoint never
-/// blocks a reader or a writer, so issuing it per connection is both faithful
-/// and free.
+/// `wal_checkpoint(PASSIVE)` is part of the sequence, not an afterthought. A
+/// passive checkpoint never blocks a reader or writer.
 pub const PRAGMA_SEQUENCE: &str = "\
 PRAGMA journal_mode = WAL;\n\
 PRAGMA synchronous = NORMAL;\n\
@@ -63,24 +60,18 @@ pub fn open_default() -> Result<Connection, DbError> {
     open_default_location(&zuno_paths::db_path())
 }
 
-/// Open a computed default location and reject a pre-rename database filename.
-///
-/// Explicit `ZUNO_DB` paths must use [`open`] and are never interpreted as a
-/// legacy default, even when their basename happens to be `zuno.db`.
+/// Open a computed default location.
 ///
 /// # Errors
 ///
-/// [`DbError::LegacyDatabase`] when only the corresponding pre-rename filename
-/// exists, or [`DbError::Open`] when opening the selected location fails.
+/// [`DbError::Open`] when opening the selected location fails.
 pub fn open_default_location(location: &DbLocation) -> Result<Connection, DbError> {
-    reject_legacy_default(location)?;
     open(location)
 }
 
-/// Open `location`, applying the oracle's pragmas.
+/// Open `location`, applying Zuno's pragmas.
 ///
-/// [`DbLocation::Memory`] yields a *private* in-memory database, matching what
-/// the oracle gets from `ZUNO_DB=:memory:`. Use
+/// [`DbLocation::Memory`] yields a private in-memory database. Use
 /// [`open_shared_memory`] when more than one connection has to see the same
 /// in-memory data.
 ///
@@ -107,31 +98,11 @@ pub fn open_at(path: &Path) -> Result<Connection, DbError> {
     open_target(&path.to_string_lossy(), &location)
 }
 
-pub(crate) fn reject_legacy_default(location: &DbLocation) -> Result<(), DbError> {
-    let DbLocation::File(new_path) = location else {
-        return Ok(());
-    };
-    if new_path.exists() {
-        return Ok(());
-    }
-    let Some(old_path) = zuno_paths::legacy_db_path(new_path) else {
-        return Ok(());
-    };
-    if old_path.exists() {
-        return Err(DbError::LegacyDatabase {
-            old_path,
-            new_path: new_path.clone(),
-        });
-    }
-    Ok(())
-}
-
 /// Create the directory a database file will live in.
 ///
-/// [`zuno_paths`] deliberately keeps every path getter pure, and the oracle relies
-/// on `global.ts` having already created `data()` at import. Doing it here is a
-/// documented superset: it also covers an `ZUNO_DB` pointing at a nested
-/// directory, which the oracle would fail to open.
+/// [`zuno_paths`] deliberately keeps every path getter pure, so directory
+/// creation belongs at the connection boundary. This also covers `ZUNO_DB`
+/// pointing at a nested directory.
 ///
 /// # Errors
 ///
@@ -201,7 +172,7 @@ pub fn open_target(target: &str, location: &DbLocation) -> Result<Connection, Db
 /// # Errors
 ///
 /// [`DbError::Open`] naming the database when a pragma reports a value other
-/// than the one the oracle asked for.
+/// than the configured value.
 pub fn apply_pragmas(connection: &Connection, location: &DbLocation) -> Result<(), DbError> {
     connection
         .execute_batch(PRAGMA_SEQUENCE)
@@ -212,7 +183,7 @@ pub fn apply_pragmas(connection: &Connection, location: &DbLocation) -> Result<(
     verify_pragmas(connection, location)
 }
 
-/// Read every pragma back and compare it against what the oracle asked for.
+/// Read every pragma back and compare it against Zuno's configured values.
 ///
 /// # Errors
 ///
@@ -364,7 +335,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pragma_sequence_matches_the_oracle_line_for_line() {
+    fn pragma_sequence_contains_every_required_setting_in_order() {
         let statements: Vec<&str> = PRAGMA_SEQUENCE.lines().collect();
         assert_eq!(
             statements,

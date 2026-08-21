@@ -1,7 +1,7 @@
 //! Append-only, per-session event log shared by runtime capabilities.
 
 use crate::{Pool, open};
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Map, Value};
 use std::error::Error;
 use std::sync::Arc;
@@ -123,6 +123,27 @@ impl SessionEventLog {
         rows.map(|row| row.map_err(open::map_error).and_then(decode_event))
             .collect()
     }
+}
+
+/// Append one event through a caller-owned connection.
+///
+/// This is the engine-facing form: the turn loop already owns the session
+/// connection and must commit the prompt snapshot before sending the provider
+/// request. Opening a second pooled connection here would introduce an avoidable
+/// writer race.
+///
+/// # Errors
+///
+/// Returns a database error when the transaction cannot begin, append, or commit.
+pub fn append_with_connection(
+    connection: &mut Connection,
+    session_id: &str,
+    event: NewSessionEvent,
+) -> Result<SessionEvent, DbError> {
+    let transaction = connection.transaction().map_err(open::map_error)?;
+    let appended = append_in(&transaction, session_id, event)?;
+    transaction.commit().map_err(open::map_error)?;
+    Ok(appended)
 }
 
 struct StoredEvent {

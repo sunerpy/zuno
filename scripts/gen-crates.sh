@@ -18,10 +18,10 @@ zuno-error	Typed error taxonomy shared by every crate; recovery decisions read d
 zuno-types	Wire and domain types shared across the workspace (sessions, messages, parts, tool payloads).
 zuno-paths	Filesystem layout resolution: project root, data dir, cache dir, and per-worktree state paths.
 zuno-observability	Tracing subscriber setup, log file rotation, and structured span conventions.
-zuno-config	Configuration schema, discovery, merge order, variable substitution, and legacy rejection.
+zuno-config	Zuno configuration schema, discovery, merge order, and variable substitution.
 zuno-permission	Permission engine: pattern matching over tool calls and the ask/allow/deny decision.
 zuno-catalog	Catalog of agents, skills, commands, and references discovered from disk and config.
-zuno-db	SQLite storage layer with schema parity against the TypeScript `opencode.db`.
+zuno-db	Zuno-native SQLite sessions, events, inboxes, jobs, and migrations.
 zuno-snapshot	Workspace snapshots and diffs used for revert and for tool-edit provenance.
 zuno-auth	Credential storage and refresh for provider authentication (API keys and OAuth).
 zuno-llm	Provider-agnostic model interface, provider registry, streaming event vocabulary.
@@ -47,7 +47,7 @@ zuno-server	HTTP server exposing the `/api` surface and the server-sent event st
 zuno-tui	Terminal user interface: views, keybindings, themes, and the render loop.
 zuno-acp	Agent Client Protocol adapter for external editor clients.
 zuno-cli	Command-line entry point and subcommand dispatch.
-zuno-testkit	Shared test fixtures, cassette replay, and differential-oracle helpers.
+zuno-testkit	Shared test fixtures, cassette replay, and deterministic integration helpers.
 EOF
 )
 

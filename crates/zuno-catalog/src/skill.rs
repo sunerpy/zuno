@@ -676,18 +676,8 @@ mod tests {
         );
         assert!(!built_in.content.contains("opencode.ai/config.json"));
         assert!(!built_in.content.contains("\"plugin\""));
-        // The skill is what a model reads before writing config, so a stale
-        // filename here teaches the old name to every session.
-        for stale in [
-            &format!("{}.json", zuno_paths::LEGACY_CONFIG_FILE_STEM),
-            &format!("{}.jsonc", zuno_paths::LEGACY_CONFIG_FILE_STEM),
-        ] {
-            assert!(
-                !built_in.content.contains(stale.as_str()),
-                "the built-in customization skill still names `{stale}`, which Zuno no longer \
-                 reads; a model following it would write a file that is rejected at startup"
-            );
-        }
+        assert!(!built_in.content.contains("opencode.json"));
+        assert!(!built_in.content.contains("opencode.jsonc"));
     }
 
     #[test]

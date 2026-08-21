@@ -135,6 +135,7 @@ pub async fn call(
         return Err(WebError::Status {
             url: url.to_owned(),
             status: status.as_u16(),
+            retry_after: crate::webfetch::bounds::retry_after(response.headers()),
         });
     }
 

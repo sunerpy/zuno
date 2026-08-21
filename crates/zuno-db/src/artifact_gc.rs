@@ -1,11 +1,11 @@
-//! Conservative garbage collection for artifacts stored outside `opencode.db`.
+//! Conservative garbage collection for artifacts stored outside the Zuno database.
 //!
 //! Filesystem deletion is intentionally separate from [`crate::prune`]'s database
 //! transaction: SQLite can roll a transaction back, but it cannot restore a removed
 //! directory. This module instead re-reads the surviving rows under an `IMMEDIATE`
 //! transaction and keeps that write lock until every filesystem decision is complete.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,7 +17,7 @@ use zuno_snapshot::{SessionRef, SnapshotError};
 
 use crate::open;
 
-/// The oracle's tool-output retention window.
+/// Default retention window for unattributable tool output.
 pub const DEFAULT_TOOL_OUTPUT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Whether a pass only reports candidates or also removes them.
@@ -30,16 +30,6 @@ pub enum ArtifactGcMode {
     Delete,
 }
 
-/// Legacy JSON is never swept unless the caller explicitly opts in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum LegacyJsonSweep {
-    /// Leave the whole `storage/` tree untouched.
-    #[default]
-    Disabled,
-    /// Remove JSON attributable to confirmed-deleted sessions.
-    Enabled,
-}
-
 /// Explicit roots keep tests and callers away from process-global path state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactGcPaths {
@@ -47,8 +37,6 @@ pub struct ArtifactGcPaths {
     pub snapshots: PathBuf,
     /// `$DATA/tool-output`.
     pub tool_output: PathBuf,
-    /// `$DATA/storage`.
-    pub legacy_storage: PathBuf,
 }
 
 impl ArtifactGcPaths {
@@ -58,7 +46,6 @@ impl ArtifactGcPaths {
         Self {
             snapshots: data.join("snapshot"),
             tool_output: data.join("tool-output"),
-            legacy_storage: data.join("storage"),
         }
     }
 
@@ -68,7 +55,6 @@ impl ArtifactGcPaths {
         Self {
             snapshots: layout.snapshot_root(),
             tool_output: layout.tool_output(),
-            legacy_storage: layout.data().join("storage"),
         }
     }
 }
@@ -82,8 +68,6 @@ pub struct ArtifactGcRequest {
     pub deleted_session_ids: Vec<String>,
     /// Age backstop for foreign, unattributable `tool_*` files.
     pub tool_output_retention: Duration,
-    /// Legacy compatibility data requires a separate opt-in.
-    pub legacy_json: LegacyJsonSweep,
     /// Injected clock for deterministic age decisions.
     pub now: SystemTime,
 }
@@ -100,7 +84,6 @@ impl ArtifactGcRequest {
             mode: ArtifactGcMode::Preview,
             deleted_session_ids: deleted_session_ids.into_iter().map(Into::into).collect(),
             tool_output_retention: DEFAULT_TOOL_OUTPUT_RETENTION,
-            legacy_json: LegacyJsonSweep::Disabled,
             now,
         }
     }
@@ -118,13 +101,6 @@ impl ArtifactGcRequest {
         self.tool_output_retention = retention;
         self
     }
-
-    /// Explicitly opt in to legacy JSON cleanup.
-    #[must_use]
-    pub const fn with_legacy_json(mut self) -> Self {
-        self.legacy_json = LegacyJsonSweep::Enabled;
-        self
-    }
 }
 
 /// The class of one reclaimable path.
@@ -134,14 +110,6 @@ pub enum ArtifactKind {
     SnapshotStore,
     /// One persisted tool output file.
     ToolOutput,
-    /// `storage/session/<project>/<session>.json`.
-    LegacySession,
-    /// `storage/message/<session>/`.
-    LegacyMessages,
-    /// `storage/part/<message>/`.
-    LegacyParts,
-    /// `storage/session_diff/<session>.json`.
-    LegacySessionDiff,
 }
 
 /// Why one path is safe to reclaim.
@@ -290,12 +258,6 @@ pub fn execute(
     let mut candidates = Vec::new();
     discover_snapshot_candidates(paths, &survivors, &mut candidates)?;
     discover_tool_output_candidates(paths, request, &deleted_session_ids, &mut candidates)?;
-    discover_legacy_candidates(
-        paths,
-        request.legacy_json,
-        &deleted_session_ids,
-        &mut candidates,
-    )?;
     candidates.sort_by(|left, right| left.path.cmp(&right.path));
 
     let mut report = ArtifactGcReport::default();
@@ -484,102 +446,6 @@ fn discover_tool_output_candidates(
     Ok(())
 }
 
-fn discover_legacy_candidates(
-    paths: &ArtifactGcPaths,
-    legacy_json: LegacyJsonSweep,
-    deleted_session_ids: &BTreeSet<String>,
-    candidates: &mut Vec<Candidate>,
-) -> Result<(), ArtifactGcError> {
-    if legacy_json == LegacyJsonSweep::Disabled {
-        return Ok(());
-    }
-    if !is_real_directory(&paths.legacy_storage)? {
-        return Ok(());
-    }
-
-    let mut message_sessions = BTreeMap::new();
-    let session_root = paths.legacy_storage.join("session");
-    if is_real_directory(&session_root)? {
-        for project in read_directory(&session_root)? {
-            if !entry_is_real_directory(&project)? {
-                continue;
-            }
-            for session_id in deleted_session_ids
-                .iter()
-                .filter(|session_id| is_safe_component(session_id))
-            {
-                let path = project.path().join(format!("{session_id}.json"));
-                if is_regular_file(&path)? {
-                    candidates.push(Candidate {
-                        path,
-                        target: Target::File,
-                        kind: ArtifactKind::LegacySession,
-                        reason: ReclaimReason::DeletedSession(session_id.clone()),
-                    });
-                }
-            }
-        }
-    }
-
-    let message_root = paths.legacy_storage.join("message");
-    let message_root_is_real = is_real_directory(&message_root)?;
-    let session_diff_root = paths.legacy_storage.join("session_diff");
-    let session_diff_root_is_real = is_real_directory(&session_diff_root)?;
-    for session_id in deleted_session_ids
-        .iter()
-        .filter(|session_id| is_safe_component(session_id))
-    {
-        let messages = message_root.join(session_id);
-        if message_root_is_real && is_real_directory(&messages)? {
-            for message in read_directory(&messages)? {
-                if !entry_is_regular_file(&message)? {
-                    continue;
-                }
-                let Some(name) = message.file_name().to_str().map(str::to_owned) else {
-                    continue;
-                };
-                if let Some(message_id) = name.strip_suffix(".json")
-                    && is_safe_component(message_id)
-                {
-                    message_sessions.insert(message_id.to_owned(), session_id.clone());
-                }
-            }
-            candidates.push(Candidate {
-                path: messages,
-                target: Target::Directory,
-                kind: ArtifactKind::LegacyMessages,
-                reason: ReclaimReason::DeletedSession(session_id.clone()),
-            });
-        }
-
-        let diff = session_diff_root.join(format!("{session_id}.json"));
-        if session_diff_root_is_real && is_regular_file(&diff)? {
-            candidates.push(Candidate {
-                path: diff,
-                target: Target::File,
-                kind: ArtifactKind::LegacySessionDiff,
-                reason: ReclaimReason::DeletedSession(session_id.clone()),
-            });
-        }
-    }
-
-    let part_root = paths.legacy_storage.join("part");
-    if is_real_directory(&part_root)? {
-        for (message_id, session_id) in message_sessions {
-            let parts = part_root.join(&message_id);
-            if is_real_directory(&parts)? {
-                candidates.push(Candidate {
-                    path: parts,
-                    target: Target::Directory,
-                    kind: ArtifactKind::LegacyParts,
-                    reason: ReclaimReason::DeletedSession(session_id),
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
 fn read_directory(path: &Path) -> Result<Vec<fs::DirEntry>, ArtifactGcError> {
     let read = match fs::read_dir(path) {
         Ok(read) => read,
@@ -600,35 +466,12 @@ fn entry_is_regular_file(entry: &fs::DirEntry) -> Result<bool, ArtifactGcError> 
         .map_err(|source| filesystem_error("inspect", &entry.path(), source))
 }
 
-fn entry_is_real_directory(entry: &fs::DirEntry) -> Result<bool, ArtifactGcError> {
-    entry
-        .file_type()
-        .map(|kind| kind.is_dir() && !kind.is_symlink())
-        .map_err(|source| filesystem_error("inspect", &entry.path(), source))
-}
-
-fn is_regular_file(path: &Path) -> Result<bool, ArtifactGcError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => Ok(metadata.file_type().is_file()),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(source) => Err(filesystem_error("inspect", path, source)),
-    }
-}
-
 fn is_real_directory(path: &Path) -> Result<bool, ArtifactGcError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => Ok(metadata.file_type().is_dir() && !metadata.file_type().is_symlink()),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(source) => Err(filesystem_error("inspect", path, source)),
     }
-}
-
-fn is_safe_component(value: &str) -> bool {
-    !value.is_empty()
-        && Path::new(value)
-            .components()
-            .all(|component| matches!(component, std::path::Component::Normal(_)))
-        && Path::new(value).components().count() == 1
 }
 
 fn measure(path: &Path) -> Result<u64, ArtifactGcError> {
@@ -919,49 +762,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_json_cleanup_is_inert_until_explicitly_enabled() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let paths = ArtifactGcPaths::from_data_root(temp.path());
-        let session = paths
-            .legacy_storage
-            .join("session/project/ses_deleted.json");
-        let message = paths
-            .legacy_storage
-            .join("message/ses_deleted/msg_deleted.json");
-        let part = paths
-            .legacy_storage
-            .join("part/msg_deleted/prt_deleted.json");
-        let diff = paths.legacy_storage.join("session_diff/ses_deleted.json");
-        for path in [&session, &message, &part, &diff] {
-            write(path, b"{}");
-        }
-        let mut connection = database();
-        insert_visibility_sentinel(&connection, temp.path());
-
-        execute(
-            &mut connection,
-            &paths,
-            &ArtifactGcRequest::new(["ses_deleted"], SystemTime::now()).deleting(),
-        )
-        .expect("default pass");
-        for path in [&session, &message, &part, &diff] {
-            assert!(path.exists(), "default pass touched {}", path.display());
-        }
-
-        execute(
-            &mut connection,
-            &paths,
-            &ArtifactGcRequest::new(["ses_deleted"], SystemTime::now())
-                .deleting()
-                .with_legacy_json(),
-        )
-        .expect("opt-in pass");
-        for path in [&session, &message, &part, &diff] {
-            assert!(!path.exists(), "opt-in pass retained {}", path.display());
-        }
-    }
-
-    #[test]
     fn preview_reports_bytes_without_removing_any_candidate() {
         let temp = tempfile::tempdir().expect("temp dir");
         let paths = ArtifactGcPaths::from_data_root(temp.path());
@@ -994,14 +794,10 @@ mod tests {
         let data = temp.path().join("data");
         let targets = temp.path().join("targets");
         let tool_target = targets.join("tool-output");
-        let legacy_target = targets.join("storage");
         let tool_file = tool_target.join("tool_ses_deleted_00000000000000000000000000000001");
-        let legacy_file = legacy_target.join("session/project/ses_deleted.json");
         write(&tool_file, b"tool");
-        write(&legacy_file, b"legacy");
         fs::create_dir_all(&data).expect("create data root");
         symlink(&tool_target, data.join("tool-output")).expect("link tool root");
-        symlink(&legacy_target, data.join("storage")).expect("link legacy root");
 
         let paths = ArtifactGcPaths::from_data_root(&data);
         let mut connection = database();
@@ -1009,46 +805,11 @@ mod tests {
         let report = execute(
             &mut connection,
             &paths,
-            &ArtifactGcRequest::new(["ses_deleted"], SystemTime::now())
-                .deleting()
-                .with_legacy_json(),
+            &ArtifactGcRequest::new(["ses_deleted"], SystemTime::now()).deleting(),
         )
         .expect("collect artifacts");
 
         assert!(report.artifacts.is_empty());
         assert!(tool_file.is_file());
-        assert!(legacy_file.is_file());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn legacy_category_symlinks_are_never_followed() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempfile::tempdir().expect("temp dir");
-        let paths = ArtifactGcPaths::from_data_root(&temp.path().join("data"));
-        let outside = temp.path().join("outside");
-        let message = outside.join("ses_deleted/msg_deleted.json");
-        let part = outside.join("msg_deleted/prt_deleted.json");
-        write(&message, b"message");
-        write(&part, b"part");
-        fs::create_dir_all(&paths.legacy_storage).expect("create legacy root");
-        symlink(&outside, paths.legacy_storage.join("message")).expect("link message root");
-        symlink(&outside, paths.legacy_storage.join("part")).expect("link part root");
-
-        let mut connection = database();
-        insert_visibility_sentinel(&connection, temp.path());
-        let report = execute(
-            &mut connection,
-            &paths,
-            &ArtifactGcRequest::new(["ses_deleted"], SystemTime::now())
-                .deleting()
-                .with_legacy_json(),
-        )
-        .expect("collect artifacts");
-
-        assert!(report.artifacts.is_empty());
-        assert!(message.is_file());
-        assert!(part.is_file());
     }
 }

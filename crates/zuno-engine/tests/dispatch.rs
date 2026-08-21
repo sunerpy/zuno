@@ -445,7 +445,7 @@ async fn the_intent_reaches_the_permission_layer_but_not_the_tool() {
 }
 
 #[tokio::test]
-async fn dispatch_aliases_bash_and_functions_bash_to_the_registered_tool() {
+async fn dispatch_rejects_unregistered_tool_aliases_without_running_the_native_tool() {
     let calls = Arc::new(AtomicUsize::new(0));
     let dispatcher = dispatcher(
         vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
@@ -463,10 +463,22 @@ async fn dispatch_aliases_bash_and_functions_bash_to_the_registered_tool() {
                 json!({ "command": "pwd", "intent": "inspect" }),
             ))
             .await;
-        assert!(!result.is_error, "{alias}: {}", result.output.output);
+        assert!(result.is_error, "{alias}: {}", result.output.output);
+        assert!(
+            result
+                .output
+                .output
+                .contains(&format!("Unknown tool: {alias}")),
+            "{alias}: {}",
+            result.output.output
+        );
     }
 
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "an unregistered alias must never execute the native tool"
+    );
 }
 
 #[tokio::test]

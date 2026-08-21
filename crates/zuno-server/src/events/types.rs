@@ -90,7 +90,7 @@ impl StreamEvent {
         self.cursor.sequence
     }
 
-    /// Returns the upstream-compatible event properties object.
+    /// Returns the model-independent event properties object.
     #[must_use]
     pub const fn properties(&self) -> &Map<String, Value> {
         &self.properties

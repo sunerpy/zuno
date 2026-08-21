@@ -40,9 +40,6 @@ pub const DEFAULT_MODELS_FILE: &str = "models.json";
 /// The database file name used on release channels.
 pub const DEFAULT_DB_FILE: &str = "zuno.db";
 
-/// The filename used by Zuno before its independent-project rename completed.
-pub const LEGACY_DB_FILE: &str = "opencode.db";
-
 /// The channels that get [`DEFAULT_DB_FILE`] rather than a suffixed name.
 pub const UNSUFFIXED_DB_CHANNELS: [&str; 3] = ["latest", "beta", "prod"];
 
@@ -249,21 +246,6 @@ impl Layout {
     }
 }
 
-/// The pre-rename Zuno database filename corresponding to `path`.
-///
-/// Arbitrary `ZUNO_DB` names return `None`; only the two default filename forms
-/// participate in the hard-cut diagnostic.
-#[must_use]
-pub fn legacy_db_path(path: &Path) -> Option<PathBuf> {
-    let file = path.file_name()?.to_str()?;
-    let legacy = if file == DEFAULT_DB_FILE {
-        LEGACY_DB_FILE.to_owned()
-    } else {
-        format!("opencode-{}", file.strip_prefix("zuno-")?)
-    };
-    Some(path.with_file_name(legacy))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,19 +430,6 @@ mod tests {
             (ZUNO_DISABLE_CHANNEL_DB, "1"),
         ]);
         assert_eq!(resolved.db_path_for_channel("mybranch"), DbLocation::Memory);
-    }
-
-    #[test]
-    fn legacy_database_path_maps_only_zuno_default_filename_forms() {
-        assert_eq!(
-            legacy_db_path(Path::new("/data/zuno.db")),
-            Some(PathBuf::from("/data/opencode.db"))
-        );
-        assert_eq!(
-            legacy_db_path(Path::new("/data/zuno-local.db")),
-            Some(PathBuf::from("/data/opencode-local.db"))
-        );
-        assert_eq!(legacy_db_path(Path::new("/data/custom.db")), None);
     }
 
     #[test]

@@ -1,34 +1,18 @@
 //! The `goal` table: one goal per session, and every write that touches it.
 //!
-//! # Where this table lives, and why not in `opencode.db`
+//! # Separate durable ownership
 //!
-//! In its own database file, `goal_1.db`, beside `opencode.db` but not inside
-//! it. Two independent reasons, either of which would be sufficient.
-//!
-//! **`opencode.db` is not ours to extend.** `zuno-db` reproduces the TypeScript
-//! `opencode.db` schema byte-for-byte — 19 application tables plus the migration
-//! journal — and proves it with a differential test against a real database
-//! (`zuno-db/src/schema.rs`, `zuno-db/tests/schema.rs`). Adding a 20th table would
-//! break that test, and papering over it would break the promise the whole crate
-//! exists for: that a user can switch between the two binaries and keep their
-//! sessions. A goal is a feature the TypeScript binary does not have, so it has
-//! no place in a file that binary also writes.
-//!
-//! **A goal must outlive session churn.** The point of a goal is to survive the
+//! Goals live in `goal_1.db`, separate from the session database. A goal must
+//! outlive session churn: the point of a goal is to survive the
 //! compaction that throws away the conversation which set it. That argues
 //! against sharing a file with state that gets pruned, vacuumed and cascaded,
 //! and it is why there is deliberately **no** `FOREIGN KEY (session_id)
 //! REFERENCES session(id) ON DELETE CASCADE` here: a goal is keyed *by* a
 //! session id, not owned by a session row.
 //!
-//! codex reached the same place by the same route. Goals live in their own
-//! `goals_1.sqlite` (`codex-rs/state/src/sqlite.rs:30`), and there is a
-//! `0034_drop_thread_goals.sql` in the *main* migration set recording the move
-//! out of the shared state database.
-//!
-//! The `_1` in the filename is codex's convention and is load-bearing: an
-//! incompatible change to this schema should rev the filename rather than
-//! migrate in place, because a goal is cheap to lose and expensive to corrupt.
+//! The `_1` filename makes the schema generation explicit. An incompatible
+//! pre-release change revs the filename rather than trying to infer an old goal
+//! format, because a corrupt continuation policy is more dangerous than a reset.
 //!
 //! # Split ownership, and where it is enforced
 //!
@@ -74,9 +58,8 @@ pub const TABLE: &str = "goal";
 
 /// The goal database's filename under [`zuno_paths::data`].
 ///
-/// Suffixed the way codex suffixes `goals_1.sqlite`
-/// (`codex-rs/state/src/sqlite.rs:30`): an incompatible schema change revs the
-/// number instead of migrating.
+/// An incompatible schema change revs the number instead of interpreting an
+/// earlier pre-release format.
 pub const GOAL_DB_FILE: &str = "goal_1.db";
 
 /// The directory under [`zuno_paths::data`] that oversized objectives spill into.
@@ -144,7 +127,9 @@ CREATE TABLE IF NOT EXISTS goal_retry (
         'step_limit',
         'empty_assistant_message',
         'context_limit',
-        'context_compacted'
+        'context_compacted',
+        'tool_transient',
+        'tool_uncertain'
     )),
     delay_ms INTEGER NOT NULL CHECK(delay_ms >= 0),
     retry_at_ms INTEGER NOT NULL,

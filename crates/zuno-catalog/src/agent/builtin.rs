@@ -1,25 +1,10 @@
-//! The seven native agents `opencode` defines before any user config is read.
+//! Zuno's native agent catalog.
 //!
-//! Oracle: `packages/opencode/src/agent/agent.ts:140-265`.
-//!
-//! Each built-in is reproduced with the fields that survive to `agent list` and to
-//! the turn loop: its name, description, mode, hidden flag, temperature, and
-//! prompt. The prompt files are byte-for-byte copies of the oracle's
-//! `src/agent/prompt/*.txt`, verified by `md5sum` at import; three built-ins
-//! (`build`, `plan`, `general`) genuinely have no prompt, and that absence is part
-//! of their definition rather than an omission here.
-//!
-//! # What is deliberately not here
-//!
-//! Each built-in also carries a permission overlay — the `Permission.fromConfig`
-//! literal at `agent.ts:145-152` for `build`, `:158-178` for `plan`, and so on —
-//! which the oracle merges over a runtime-computed default set. That merge needs
-//! `Truncate.GLOB`, the global tmp and plans directories, the discovered skill and
-//! reference directories, and a worktree-relative rewrite. All of those belong to
-//! the permission tasks, so [`Builtin::permission_overlay`] exposes the overlay as
-//! declarative data and resolution is left to them. Modelling it as data here
-//! keeps the oracle's literal in one place without this module growing a
-//! permission engine.
+//! The catalog owns agent identity, selection mode, base prompt, and the permission
+//! overlay applied by the composition root. Delegation-specific policy lives in
+//! `zuno-agent`; its tests assert that every delegable name resolves here. Keeping
+//! the catalog as the identity source prevents a tool from advertising an agent that
+//! a child turn cannot start.
 
 use crate::agent::AgentMode;
 use zuno_config::schema::ordered::OrderedMap;
@@ -27,146 +12,214 @@ use zuno_config::schema::permission::{
     PermissionAction, PermissionConfig, PermissionObject, PermissionRule,
 };
 
-/// `agent.ts:184` — `src/agent/prompt/explore.txt`.
-pub const PROMPT_EXPLORE: &str = include_str!("prompt/explore.txt");
-/// `agent.ts:192` — `src/agent/prompt/compaction.txt`.
+/// End-to-end implementation agent.
+pub const PROMPT_BUILD: &str = include_str!("prompt/build.txt");
+/// Read-only planning agent.
+pub const PROMPT_PLAN: &str = include_str!("prompt/plan.txt");
+/// Thorough cross-cutting implementation agent.
+pub const PROMPT_DEEP: &str = include_str!("prompt/deep.txt");
+/// Repository exploration specialist.
+pub const PROMPT_EXPLORER: &str = include_str!("prompt/explorer.txt");
+/// External research specialist.
+pub const PROMPT_LIBRARIAN: &str = include_str!("prompt/librarian.txt");
+/// Architecture and review specialist.
+pub const PROMPT_ADVISOR: &str = include_str!("prompt/advisor.txt");
+/// Bounded implementation specialist.
+pub const PROMPT_WORKER: &str = include_str!("prompt/worker.txt");
+/// Visual artifact specialist.
+pub const PROMPT_LOOKER: &str = include_str!("prompt/looker.txt");
+/// Context compaction agent.
 pub const PROMPT_COMPACTION: &str = include_str!("prompt/compaction.txt");
-/// `agent.ts:214` — `src/agent/prompt/title.txt`.
+/// Session title agent.
 pub const PROMPT_TITLE: &str = include_str!("prompt/title.txt");
-/// `agent.ts:229` — `src/agent/prompt/summary.txt`.
+/// Session summary agent.
 pub const PROMPT_SUMMARY: &str = include_str!("prompt/summary.txt");
 
-/// The seven built-in names, in the order `agent.ts:142-232` declares them.
-///
-/// Declaration order is not display order: `agent list` sorts natives
-/// alphabetically. It is kept because it is the order the oracle's object literal
-/// establishes, and a later task that reproduces the object's own iteration will
-/// need it.
-pub const BUILTIN_NAMES: [&str; 7] = [
+/// Native names in deterministic declaration order.
+pub const BUILTIN_NAMES: [&str; 11] = [
     "build",
     "plan",
-    "general",
-    "explore",
+    "deep",
+    "explorer",
+    "librarian",
+    "advisor",
+    "worker",
+    "looker",
     "compaction",
     "title",
     "summary",
 ];
 
-/// One native agent, as the oracle defines it before user config is applied.
+/// One native agent before user configuration is applied.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Builtin {
-    /// The agent's name, which is also its config key.
+    /// Selection name and configuration key.
     pub name: &'static str,
-    /// When to use the agent. Absent for the three hidden utility agents.
+    /// When the agent should be selected.
     pub description: Option<&'static str>,
-    /// Where the agent may be used.
+    /// Whether the agent is primary, delegable, or both.
     pub mode: AgentMode,
-    /// Hidden from the `@` autocomplete menu.
+    /// Whether user-facing selectors omit the agent.
     pub hidden: bool,
-    /// Sampling temperature, set only for `title`.
+    /// Sampling temperature when Zuno chooses one explicitly.
     pub temperature: Option<f64>,
-    /// The system prompt, absent for `build`, `plan`, and `general`.
+    /// Base system prompt.
     pub prompt: Option<&'static str>,
 }
 
-/// Every built-in, in declaration order.
+/// Every native agent in declaration order.
 #[must_use]
 pub fn all() -> Vec<Builtin> {
     vec![
         build(),
         plan(),
-        general(),
-        explore(),
+        deep(),
+        explorer(),
+        librarian(),
+        advisor(),
+        worker(),
+        looker(),
         compaction(),
         title(),
         summary(),
     ]
 }
 
-/// The built-in named `name`, if there is one.
+/// The native agent named `name`.
 #[must_use]
 pub fn get(name: &str) -> Option<Builtin> {
     all().into_iter().find(|builtin| builtin.name == name)
 }
 
-/// Whether `name` is one of the seven natives.
+/// Whether `name` is native.
 #[must_use]
 pub fn is_builtin(name: &str) -> bool {
     BUILTIN_NAMES.contains(&name)
 }
 
-/// `agent.ts:142-156`.
 fn build() -> Builtin {
     Builtin {
         name: "build",
-        description: Some("The default agent. Executes tools based on configured permissions."),
+        description: Some(
+            "Owns a development request end to end: investigates, delegates bounded work, \
+             edits, verifies, and reports only after the requested outcome is real.",
+        ),
         mode: AgentMode::Primary,
         hidden: false,
-        temperature: None,
-        prompt: None,
+        temperature: Some(0.1),
+        prompt: Some(PROMPT_BUILD),
     }
 }
 
-/// `agent.ts:157-181`.
 fn plan() -> Builtin {
     Builtin {
         name: "plan",
-        description: Some("Plan mode. Disallows all edit tools."),
+        description: Some(
+            "Researches the repository and produces an implementation-ready plan without \
+             changing product files.",
+        ),
         mode: AgentMode::Primary,
         hidden: false,
-        temperature: None,
-        prompt: None,
+        temperature: Some(0.1),
+        prompt: Some(PROMPT_PLAN),
     }
 }
 
-/// `agent.ts:182-195`.
-fn general() -> Builtin {
+fn deep() -> Builtin {
     Builtin {
-        name: "general",
+        name: "deep",
         description: Some(
-            "General-purpose agent for researching complex questions and executing multi-step \
-             tasks. Use this agent to execute multiple units of work in parallel.",
+            "Handles ambiguous or cross-cutting work that needs sustained investigation, \
+             implementation, and verification in one bounded child session.",
         ),
         mode: AgentMode::Subagent,
         hidden: false,
-        temperature: None,
-        prompt: None,
+        temperature: Some(0.1),
+        prompt: Some(PROMPT_DEEP),
     }
 }
 
-/// `agent.ts:196-217`.
-fn explore() -> Builtin {
+fn explorer() -> Builtin {
     Builtin {
-        name: "explore",
+        name: "explorer",
         description: Some(
-            "Fast agent specialized for exploring codebases. Use this when you need to quickly \
-             find files by patterns (eg. \"src/components/**/*.tsx\"), search code for keywords \
-             (eg. \"API endpoints\"), or answer questions about the codebase (eg. \"how do API \
-             endpoints work?\"). When calling this agent, specify the desired thoroughness level: \
-             \"quick\" for basic searches, \"medium\" for moderate exploration, or \"very \
-             thorough\" for comprehensive analysis across multiple locations and naming \
-             conventions.",
+            "Maps repository structure, definitions, callers, and change impact without \
+             modifying the working tree.",
         ),
         mode: AgentMode::Subagent,
         hidden: false,
-        temperature: None,
-        prompt: Some(PROMPT_EXPLORE),
+        temperature: Some(0.1),
+        prompt: Some(PROMPT_EXPLORER),
     }
 }
 
-/// `agent.ts:218-232`.
+fn librarian() -> Builtin {
+    Builtin {
+        name: "librarian",
+        description: Some(
+            "Researches current external documentation, releases, standards, and upstream \
+             implementations with explicit source and version evidence.",
+        ),
+        mode: AgentMode::Subagent,
+        hidden: false,
+        temperature: Some(0.1),
+        prompt: Some(PROMPT_LIBRARIAN),
+    }
+}
+
+fn advisor() -> Builtin {
+    Builtin {
+        name: "advisor",
+        description: Some(
+            "Reviews code and architecture, surfaces concrete failure modes, compares \
+             alternatives, and recommends one trade-off explicitly.",
+        ),
+        mode: AgentMode::Subagent,
+        hidden: false,
+        temperature: Some(0.4),
+        prompt: Some(PROMPT_ADVISOR),
+    }
+}
+
+fn worker() -> Builtin {
+    Builtin {
+        name: "worker",
+        description: Some(
+            "Completes a bounded, well-specified code change by reading, editing, testing, and \
+             reporting exact verification results.",
+        ),
+        mode: AgentMode::Subagent,
+        hidden: false,
+        temperature: Some(0.1),
+        prompt: Some(PROMPT_WORKER),
+    }
+}
+
+fn looker() -> Builtin {
+    Builtin {
+        name: "looker",
+        description: Some(
+            "Inspects images, screenshots, PDFs, and diagrams and returns only the visual \
+             evidence relevant to the caller's question.",
+        ),
+        mode: AgentMode::Subagent,
+        hidden: false,
+        temperature: Some(0.2),
+        prompt: Some(PROMPT_LOOKER),
+    }
+}
+
 fn compaction() -> Builtin {
     Builtin {
         name: "compaction",
         description: None,
         mode: AgentMode::Primary,
         hidden: true,
-        temperature: None,
+        temperature: Some(0.1),
         prompt: Some(PROMPT_COMPACTION),
     }
 }
 
-/// `agent.ts:233-248`.
 fn title() -> Builtin {
     Builtin {
         name: "title",
@@ -178,53 +231,74 @@ fn title() -> Builtin {
     }
 }
 
-/// `agent.ts:249-263`.
 fn summary() -> Builtin {
     Builtin {
         name: "summary",
         description: None,
         mode: AgentMode::Primary,
         hidden: true,
-        temperature: None,
+        temperature: Some(0.1),
         prompt: Some(PROMPT_SUMMARY),
     }
 }
 
 impl Builtin {
-    /// The overlay the oracle merges over the runtime default permission set.
+    /// Native permission overlay merged after the common defaults.
     ///
-    /// Only the parts that do not depend on runtime paths are expressed. The
-    /// path-dependent entries — `plan`'s `edit` and `external_directory` globs
-    /// (`agent.ts:163-176`) and `explore`'s `external_directory` whitelist
-    /// (`agent.ts:206`) — need the global data directory, the worktree, and the
-    /// discovered skill and reference directories, and are therefore left to the
-    /// permission tasks. Every built-in whose overlay is fully static returns it
-    /// complete.
+    /// Every subagent is deny-by-default. The primary `build` agent inherits the
+    /// common tool set and may delegate. `plan` may inspect and write only its plan
+    /// document; the path-specific edit grants are added by the CLI composition
+    /// root.
     #[must_use]
     pub fn permission_overlay(&self) -> Option<PermissionConfig> {
         let rules: Vec<(&str, PermissionRule)> = match self.name {
-            // agent.ts:146-151
-            "build" => vec![("question", allow()), ("plan_enter", allow())],
-            // agent.ts:160-177 — the static prefix only; see the note above.
+            "build" => vec![
+                ("question", allow()),
+                ("plan_enter", allow()),
+                ("task", allow()),
+            ],
             "plan" => vec![
                 ("question", allow()),
                 ("plan_exit", allow()),
-                ("task", patterns([("general", PermissionAction::Deny)])),
+                ("task", deny()),
             ],
-            // agent.ts:186-188
-            "general" => vec![("todowrite", deny())],
-            // agent.ts:199-209 — the static prefix only; see the note above.
-            "explore" => vec![
+            "deep" | "worker" => vec![
                 ("*", deny()),
-                ("grep", allow()),
+                ("read", allow()),
                 ("glob", allow()),
-                ("list", allow()),
+                ("grep", allow()),
+                ("lsp", allow()),
+                ("edit", allow()),
                 ("bash", allow()),
                 ("webfetch", allow()),
                 ("web_search", allow()),
-                ("read", allow()),
+                ("todowrite", allow()),
+                ("skill", allow()),
+                ("execute", allow()),
             ],
-            // agent.ts:221, :241, :256 — all three deny everything.
+            "explorer" => vec![
+                ("*", deny()),
+                ("read", allow()),
+                ("glob", allow()),
+                ("grep", allow()),
+                ("lsp", allow()),
+            ],
+            "librarian" => vec![
+                ("*", deny()),
+                ("read", allow()),
+                ("glob", allow()),
+                ("grep", allow()),
+                ("lsp", allow()),
+                ("webfetch", allow()),
+                ("web_search", allow()),
+            ],
+            "advisor" | "looker" => vec![
+                ("*", deny()),
+                ("read", allow()),
+                ("glob", allow()),
+                ("grep", allow()),
+                ("lsp", allow()),
+            ],
             "compaction" | "title" | "summary" => vec![("*", deny())],
             _ => return None,
         };
@@ -235,14 +309,13 @@ impl Builtin {
         Some(PermissionConfig::Object(PermissionObject(object)))
     }
 
-    /// Whether [`Self::permission_overlay`] omits runtime-path-dependent entries.
-    ///
-    /// `true` for `plan` and `explore`. A caller that needs the complete ruleset
-    /// must go through the permission tasks rather than treating the overlay as
-    /// final.
+    /// Whether the composition root must add runtime path rules.
     #[must_use]
     pub fn permission_overlay_is_partial(&self) -> bool {
-        matches!(self.name, "plan" | "explore")
+        matches!(
+            self.name,
+            "plan" | "explorer" | "librarian" | "advisor" | "looker"
+        )
     }
 }
 
@@ -254,167 +327,80 @@ fn deny() -> PermissionRule {
     PermissionRule::Action(PermissionAction::Deny)
 }
 
-fn patterns<const N: usize>(entries: [(&str, PermissionAction); N]) -> PermissionRule {
-    let mut map = OrderedMap::new();
-    for (pattern, action) in entries {
-        map.insert(pattern, action);
-    }
-    PermissionRule::Patterns(map)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn there_are_exactly_seven_built_ins_and_the_names_match_the_index() {
+    fn native_names_and_definitions_are_one_table() {
         let all = all();
-        assert_eq!(all.len(), 7);
-        let names: Vec<&str> = all.iter().map(|builtin| builtin.name).collect();
-        assert_eq!(names, BUILTIN_NAMES.to_vec());
-    }
-
-    #[test]
-    fn every_built_in_is_reachable_by_name() {
+        assert_eq!(all.len(), BUILTIN_NAMES.len());
+        assert_eq!(
+            all.iter().map(|builtin| builtin.name).collect::<Vec<_>>(),
+            BUILTIN_NAMES
+        );
         for name in BUILTIN_NAMES {
-            assert!(is_builtin(name), "{name} should be a built-in");
-            assert_eq!(get(name).expect("built-in exists").name, name);
+            assert_eq!(get(name).expect("native exists").name, name);
         }
-        assert!(!is_builtin("review/security"));
-        assert!(get("review/security").is_none());
     }
 
     #[test]
-    fn the_three_hidden_utility_agents_are_the_only_hidden_ones() {
-        let hidden: Vec<&str> = all()
-            .iter()
+    fn only_engine_internals_are_hidden() {
+        let hidden = all()
+            .into_iter()
             .filter(|builtin| builtin.hidden)
             .map(|builtin| builtin.name)
-            .collect();
+            .collect::<Vec<_>>();
         assert_eq!(hidden, vec!["compaction", "title", "summary"]);
     }
 
     #[test]
-    fn only_title_sets_a_temperature() {
+    fn every_native_has_a_non_empty_prompt_and_permission_overlay() {
         for builtin in all() {
-            let expected = if builtin.name == "title" {
-                Some(0.5)
-            } else {
-                None
-            };
-            assert_eq!(builtin.temperature, expected, "for {}", builtin.name);
-        }
-    }
-
-    #[test]
-    fn the_four_prompt_bearing_built_ins_carry_non_empty_prompts() {
-        let with_prompt: Vec<&str> = all()
-            .iter()
-            .filter(|builtin| builtin.prompt.is_some())
-            .map(|builtin| builtin.name)
-            .collect();
-        assert_eq!(
-            with_prompt,
-            vec!["explore", "compaction", "title", "summary"]
-        );
-        for builtin in all() {
-            if let Some(prompt) = builtin.prompt {
-                assert!(
-                    prompt.len() > 200,
-                    "{} prompt is {} bytes, which is too short to be the oracle's",
-                    builtin.name,
-                    prompt.len()
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn the_prompt_files_are_the_oracle_texts_not_paraphrases() {
-        // Byte lengths taken from `wc -c` on the oracle's prompt directory. A
-        // paraphrased or truncated prompt changes agent behaviour silently, so the
-        // sizes are pinned alongside anchor phrases.
-        assert_eq!(PROMPT_COMPACTION.len(), 823);
-        assert_eq!(PROMPT_EXPLORE.len(), 871);
-        assert_eq!(PROMPT_SUMMARY.len(), 648);
-        assert_eq!(PROMPT_TITLE.len(), 2120);
-        assert!(PROMPT_COMPACTION.starts_with("You are an anchored context summarization"));
-        assert!(PROMPT_EXPLORE.starts_with("You are a file search specialist."));
-        assert!(PROMPT_SUMMARY.starts_with("Summarize what was done in this conversation."));
-        assert!(PROMPT_TITLE.contains("≤50 characters"));
-        assert!(PROMPT_TITLE.trim_end().ends_with("</examples>"));
-    }
-
-    #[test]
-    fn the_three_prompt_less_built_ins_still_describe_themselves() {
-        for name in ["build", "plan", "general"] {
-            let builtin = get(name).expect("built-in exists");
-            assert!(builtin.prompt.is_none(), "{name} should have no prompt");
             assert!(
-                builtin.description.is_some_and(|text| !text.is_empty()),
-                "{name} must have a description"
+                builtin
+                    .prompt
+                    .is_some_and(|prompt| !prompt.trim().is_empty()),
+                "{} must have a prompt",
+                builtin.name
+            );
+            assert!(
+                builtin.permission_overlay().is_some(),
+                "{} must have an executable permission policy",
+                builtin.name
             );
         }
     }
 
     #[test]
-    fn modes_match_the_oracle_literal() {
-        let modes: Vec<(&str, AgentMode)> = all()
-            .iter()
-            .map(|builtin| (builtin.name, builtin.mode))
-            .collect();
-        assert_eq!(
-            modes,
-            vec![
-                ("build", AgentMode::Primary),
-                ("plan", AgentMode::Primary),
-                ("general", AgentMode::Subagent),
-                ("explore", AgentMode::Subagent),
-                ("compaction", AgentMode::Primary),
-                ("title", AgentMode::Primary),
-                ("summary", AgentMode::Primary),
-            ]
-        );
+    fn subagents_are_deny_by_default_and_cannot_delegate() {
+        for builtin in all()
+            .into_iter()
+            .filter(|builtin| builtin.mode == AgentMode::Subagent)
+        {
+            let overlay = builtin.permission_overlay().expect("overlay").normalized();
+            let first = overlay.iter().next().expect("at least wildcard deny");
+            assert_eq!(first.0, "*", "{} needs a wildcard deny", builtin.name);
+            assert_eq!(
+                first.1,
+                &PermissionRule::Action(PermissionAction::Deny),
+                "{} needs deny-by-default",
+                builtin.name
+            );
+            assert!(
+                !overlay.iter().any(|(key, rule)| {
+                    key == "task" && rule == &PermissionRule::Action(PermissionAction::Allow)
+                }),
+                "{} must not create grandchildren",
+                builtin.name
+            );
+        }
     }
 
     #[test]
-    fn every_built_in_has_a_permission_overlay_and_two_are_marked_partial() {
-        let partial: Vec<&str> = all()
-            .iter()
-            .filter(|builtin| {
-                assert!(
-                    builtin.permission_overlay().is_some(),
-                    "{} needs an overlay",
-                    builtin.name
-                );
-                builtin.permission_overlay_is_partial()
-            })
-            .map(|builtin| builtin.name)
-            .collect();
-        assert_eq!(partial, vec!["plan", "explore"]);
-    }
-
-    #[test]
-    fn explore_denies_everything_before_allowing_its_seven_tools() {
-        let overlay = get("explore")
-            .expect("explore exists")
-            .permission_overlay()
-            .expect("explore has an overlay");
-        let object = overlay.normalized();
-        let keys: Vec<&str> = object.iter().map(|(key, _)| key).collect();
-        assert_eq!(
-            keys,
-            vec![
-                "*",
-                "grep",
-                "glob",
-                "list",
-                "bash",
-                "webfetch",
-                "web_search",
-                "read"
-            ],
-            "the wildcard deny must come first or the allows are overridden"
-        );
+    fn build_plan_and_deep_are_first_class_agents() {
+        assert_eq!(get("build").expect("build").mode, AgentMode::Primary);
+        assert_eq!(get("plan").expect("plan").mode, AgentMode::Primary);
+        assert_eq!(get("deep").expect("deep").mode, AgentMode::Subagent);
     }
 }

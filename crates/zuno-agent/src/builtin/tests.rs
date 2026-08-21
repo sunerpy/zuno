@@ -78,7 +78,7 @@ fn every_agent_states_every_column() {
         }
         assert!(
             !agent.boundary.render().is_empty(),
-            "{name}: the boundary must render for the orchestrator prompt"
+            "{name}: the boundary must render for the build prompt"
         );
 
         assert!(
@@ -155,7 +155,7 @@ fn every_agent_states_every_column() {
 }
 
 #[test]
-fn the_lean_six_are_the_designed_six_and_nothing_else() {
+fn the_native_seven_are_the_designed_roster_and_nothing_else() {
     let names: Vec<&str> = lean().iter().map(|agent| agent.name).collect();
     assert_eq!(names, LEAN_NAMES.to_vec());
 }
@@ -273,7 +273,7 @@ fn the_model_id_scanner_catches_model_ids_and_nothing_else() {
         "temperature",
         "0.1",
         "webfetch",
-        "orchestrator",
+        "build",
         "and/or",
     ] {
         assert!(
@@ -311,13 +311,13 @@ fn no_agent_names_a_model() {
 }
 
 #[test]
-fn only_the_orchestrator_may_delegate() {
+fn only_build_may_delegate() {
     let may_delegate: Vec<&str> = roster(true)
         .iter()
         .filter(|agent| agent.delegation == Delegation::MayDelegate)
         .map(|agent| agent.name)
         .collect();
-    assert_eq!(may_delegate, vec!["orchestrator"]);
+    assert_eq!(may_delegate, vec!["build"]);
 
     for agent in roster(true) {
         if agent.delegation == Delegation::NoChildren {
@@ -328,28 +328,69 @@ fn only_the_orchestrator_may_delegate() {
             );
         }
     }
-    assert!(!is_tool_hidden("task", &ORCHESTRATOR.rules()));
+    assert!(!is_tool_hidden("task", &BUILD.rules()));
 }
 
 #[test]
-fn the_orchestrator_is_the_only_agent_a_caller_cannot_target() {
+fn the_build_agent_is_the_only_agent_a_caller_cannot_target() {
     let targets: Vec<&str> = delegable(true).iter().map(|agent| agent.name).collect();
     assert_eq!(
         targets,
-        vec!["explorer", "librarian", "advisor", "worker", "looker"]
+        vec![
+            "deep",
+            "explorer",
+            "librarian",
+            "advisor",
+            "worker",
+            "looker"
+        ]
     );
-    assert!(!targets.contains(&"orchestrator"));
+    assert!(!targets.contains(&"build"));
     for internal in INTERNAL_NAMES {
         assert!(!targets.contains(&internal));
     }
-    assert_eq!(delegable(false).len(), 4);
+    assert_eq!(delegable(false).len(), 5);
+}
+
+#[test]
+fn every_delegable_agent_has_a_real_catalog_definition() {
+    for agent in delegable(true) {
+        let catalog = zuno_catalog::agent::builtin::get(agent.name).unwrap_or_else(|| {
+            panic!(
+                "task advertises `{}` but no child can resolve it",
+                agent.name
+            )
+        });
+        assert_eq!(catalog.mode, AgentMode::Subagent, "{}", agent.name);
+        assert!(
+            catalog
+                .prompt
+                .is_some_and(|prompt| !prompt.trim().is_empty()),
+            "{} needs an executable prompt",
+            agent.name
+        );
+    }
+}
+
+#[test]
+fn deep_owns_cross_cutting_implementation_without_children() {
+    assert_eq!(DEEP.write, Write::Capable);
+    assert_eq!(DEEP.research, Research::Allowed);
+    assert_eq!(DEEP.delegation, Delegation::NoChildren);
+    assert!(is_tool_hidden("task", &DEEP.rules()));
+    for capability in ["edit", "bash", "web_search", "todowrite"] {
+        assert!(
+            !is_tool_hidden(capability, &DEEP.rules()),
+            "deep needs `{capability}`"
+        );
+    }
 }
 
 #[test]
 fn the_worker_writes_researches_and_iterates_but_spawns_nothing() {
     // Slim's `fixer` forbids research and multi-step work
     // (`.omo/refs/omo-slim/src/agents/fixer.ts:15-17`), which sends every
-    // explore-decide-implement-verify task back through the orchestrator between
+    // explore-decide-implement-verify task back through the build agent between
     // phases. The bound that matters is the absence of children, not the absence of
     // memory.
     assert_eq!(WORKER.write, Write::Capable);
@@ -502,7 +543,7 @@ fn the_allows_survive_the_catch_all_deny() {
 fn only_the_primary_agent_inherits_extension_tools() {
     let mcp = ["playwright_navigate", "github_create_issue"];
 
-    let orchestrator = ORCHESTRATOR.rules_with_extension_tools(&mcp);
+    let orchestrator = BUILD.rules_with_extension_tools(&mcp);
     for tool in mcp {
         assert!(
             !is_tool_hidden(tool, &orchestrator),
@@ -516,7 +557,7 @@ fn only_the_primary_agent_inherits_extension_tools() {
 
     for agent in roster(true) {
         if agent.permissions.extension_tools == ExtensionTools::Inherit {
-            assert_eq!(agent.name, "orchestrator");
+            assert_eq!(agent.name, "build");
             continue;
         }
         let rules = agent.rules_with_extension_tools(&mcp);
@@ -629,10 +670,10 @@ fn the_envelope_renders_in_the_shape_the_reference_writes_by_hand() {
          restating the hits.\n</answer>\n</results>\n"
     );
 
-    let optional = ORCHESTRATOR
+    let optional = BUILD
         .output
         .envelope()
-        .expect("the orchestrator has an envelope")
+        .expect("the build agent has an envelope")
         .render();
     assert!(
         optional.contains("(omit when empty)"),
@@ -670,7 +711,7 @@ fn every_envelope_tag_is_unique_within_its_agent_and_the_roots_are_distinct() {
 }
 
 #[test]
-fn the_rendered_list_shows_the_six_with_their_boundaries() {
+fn the_rendered_list_shows_the_seven_with_their_boundaries() {
     let listed = render_list(true);
     for name in LEAN_NAMES {
         assert!(listed.contains(name), "{name} must appear in `agent list`");

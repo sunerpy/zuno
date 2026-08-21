@@ -18,7 +18,7 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use zuno_error::ToolError;
 use zuno_search::GrepRequest;
-use zuno_tool::{PermissionAsk, ToolContext, ToolOutput, TypedTool};
+use zuno_tool::{PermissionAsk, ToolContext, ToolOutput, ToolReplayPolicy, TypedTool};
 
 /// The description the model reads, verbatim from `tool/grep.txt`.
 pub const DESCRIPTION: &str = include_str!("description/grep.txt");
@@ -69,6 +69,10 @@ impl TypedTool for GrepTool {
 
     fn description(&self) -> &str {
         DESCRIPTION
+    }
+
+    fn replay_policy(&self) -> ToolReplayPolicy {
+        ToolReplayPolicy::Safe
     }
 
     async fn run(&self, params: GrepParams, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
@@ -244,9 +248,11 @@ mod tests {
 
     #[test]
     fn the_schema_is_derived_and_names_the_oracles_parameters() {
-        let definition = erase(GrepTool::new(SearchTooling::new("/tmp"))).definition();
+        let tool = erase(GrepTool::new(SearchTooling::new("/tmp")));
+        let definition = tool.definition();
 
         assert_eq!(definition.id, "grep");
+        assert_eq!(tool.replay_policy(), ToolReplayPolicy::Safe);
         assert_eq!(
             definition.parameters["properties"]["pattern"]["description"],
             "The regex pattern to search for in file contents"

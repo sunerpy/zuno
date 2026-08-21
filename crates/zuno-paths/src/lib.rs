@@ -3,9 +3,8 @@
 //!
 //! # What this crate promises
 //!
-//! Zuno owns its configuration and data directories. The layout deliberately
-//! does not read or write OpenCode directories; oracle compatibility remains in
-//! dedicated fixtures rather than in production path resolution.
+//! Zuno owns its configuration and data directories. Production path resolution
+//! does not read, write, probe, or migrate OpenCode directories.
 //!
 //! ```text
 //! $XDG_DATA_HOME/zuno              data()
@@ -78,16 +77,13 @@ pub mod walk;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-pub use crate::config_chain::{
-    CONFIG_FILE_STEM, LEGACY_CONFIG_FILE_STEM, LEGACY_CONFIG_NAMES, LEGACY_GLOBAL_CONFIG_NAMES,
-    LEGACY_PROJECT_DIRECTORY, PROJECT_CONFIG_DIRECTORY, PROJECT_DIRECTORY, unmigrated_project_path,
-};
+pub use crate::config_chain::{CONFIG_FILE_STEM, PROJECT_CONFIG_DIRECTORY, PROJECT_DIRECTORY};
 pub use crate::ensure::PathsError;
 pub use crate::env::Env;
 pub use crate::files::{
     AUTH_FILE, DEFAULT_DB_FILE, DEFAULT_MODELS_FILE, DEFAULT_MODELS_SOURCE, DbLocation,
-    LEGACY_DB_FILE, MCP_AUTH_FILE, MEMORY_SENTINEL, SNAPSHOT_DIRECTORY, TOOL_OUTPUT_DIRECTORY,
-    installation_channel, legacy_db_path,
+    MCP_AUTH_FILE, MEMORY_SENTINEL, SNAPSHOT_DIRECTORY, TOOL_OUTPUT_DIRECTORY,
+    installation_channel,
 };
 pub use crate::layout::{APP, DEBUG_PATHS_KEYS, Layout};
 pub use crate::project::{GLOBAL_PROJECT_ID, Repository, ResolvedProject, Vcs};
@@ -288,7 +284,6 @@ mod tests {
         assert_eq!(SNAPSHOT_DIRECTORY, "snapshot");
         assert_eq!(TOOL_OUTPUT_DIRECTORY, "tool-output");
         assert_eq!(DEFAULT_DB_FILE, "zuno.db");
-        assert_eq!(LEGACY_DB_FILE, "opencode.db");
         assert_eq!(DEFAULT_MODELS_FILE, "models.json");
         assert_eq!(DEFAULT_MODELS_SOURCE, "https://models.dev");
         assert_eq!(MEMORY_SENTINEL, ":memory:");

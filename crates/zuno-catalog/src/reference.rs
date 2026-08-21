@@ -11,9 +11,7 @@
 //! 2. `{ repository, branch?, description?, hidden? }`,
 //! 3. `{ path, description?, hidden? }`.
 //!
-//! Only the plural `references` key feeds this module. The singular `reference`
-//! is a deprecated spelling that `zuno_config::legacy` rejects
-//! (`packages/core/src/v1/config/config.ts:48-50`), so nothing here reads it.
+//! Only the plural `references` key feeds this module.
 
 use std::path::Path;
 use zuno_config::schema::ordered::OrderedMap;

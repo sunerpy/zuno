@@ -15,13 +15,6 @@ pub const OPERATIONS: &[(&str, &str)] = &[
     ("/api/provider/{providerID}", "get"),
     ("/api/integration", "get"),
     ("/api/integration/{integrationID}", "get"),
-    ("/api/integration/{integrationID}/connect/key", "post"),
-    ("/api/integration/{integrationID}/connect/oauth", "post"),
-    ("/api/integration/attempt/{attemptID}", "get"),
-    ("/api/integration/attempt/{attemptID}/complete", "post"),
-    ("/api/integration/attempt/{attemptID}", "delete"),
-    ("/api/credential/{credentialID}", "patch"),
-    ("/api/credential/{credentialID}", "delete"),
     ("/api/fs/read/*", "get"),
     ("/api/fs/list", "get"),
     ("/api/fs/find", "get"),
@@ -35,9 +28,7 @@ pub const OPERATIONS: &[(&str, &str)] = &[
     ("/api/permission/request", "get"),
     ("/api/permission/saved", "get"),
     ("/api/permission/saved/{id}", "delete"),
-    ("/api/session/{sessionID}/permission", "post"),
     ("/api/session/{sessionID}/permission", "get"),
-    ("/api/session/{sessionID}/permission/{requestID}", "get"),
     (
         "/api/session/{sessionID}/permission/{requestID}/reply",
         "post",
@@ -70,7 +61,6 @@ pub const OPERATIONS: &[(&str, &str)] = &[
     ("/api/session/{sessionID}/context", "get"),
     ("/api/session/{sessionID}/history", "get"),
     ("/api/session/{sessionID}/interrupt", "post"),
-    ("/api/session/{sessionID}/message/{messageID}", "get"),
     ("/api/session/{sessionID}/message", "get"),
 ];
 
@@ -136,41 +126,6 @@ const BODY_SCHEMA_GAPS: &[BodySchemaGap] = &[
         "OptionalEnvelope<IntegrationInfo> and its nested types do not derive JsonSchema",
     ),
     (
-        "/api/integration/{integrationID}/connect/key",
-        "post",
-        "the unsupported handler has neither a typed request extractor nor a modeled success response",
-    ),
-    (
-        "/api/integration/{integrationID}/connect/oauth",
-        "post",
-        "the unsupported handler has neither a typed request extractor nor a modeled success response",
-    ),
-    (
-        "/api/integration/attempt/{attemptID}",
-        "get",
-        "the unsupported handler has no modeled success response",
-    ),
-    (
-        "/api/integration/attempt/{attemptID}/complete",
-        "post",
-        "the unsupported handler has neither a typed request extractor nor a modeled success response",
-    ),
-    (
-        "/api/integration/attempt/{attemptID}",
-        "delete",
-        "the unsupported handler has no modeled response contract",
-    ),
-    (
-        "/api/credential/{credentialID}",
-        "patch",
-        "the unsupported handler has neither a typed request extractor nor a modeled success response",
-    ),
-    (
-        "/api/credential/{credentialID}",
-        "delete",
-        "the unsupported handler has no modeled response contract",
-    ),
-    (
         "/api/fs/read/*",
         "get",
         "the response is content-type-dependent raw bytes with no schema type",
@@ -227,18 +182,8 @@ const BODY_SCHEMA_GAPS: &[BodySchemaGap] = &[
     ),
     (
         "/api/session/{sessionID}/permission",
-        "post",
-        "the unsupported handler has neither a typed request extractor nor a modeled success response",
-    ),
-    (
-        "/api/session/{sessionID}/permission",
         "get",
         "PermissionRequest does not derive JsonSchema",
-    ),
-    (
-        "/api/session/{sessionID}/permission/{requestID}",
-        "get",
-        "the unsupported handler has no modeled success response",
     ),
     (
         "/api/session/{sessionID}/permission/{requestID}/reply",
@@ -304,11 +249,6 @@ const BODY_SCHEMA_GAPS: &[BodySchemaGap] = &[
         "/api/session/{sessionID}/history",
         "get",
         "HistoryResponse does not derive JsonSchema",
-    ),
-    (
-        "/api/session/{sessionID}/message/{messageID}",
-        "get",
-        "the unsupported handler has no modeled success response",
     ),
     (
         "/api/session/{sessionID}/message",
@@ -428,7 +368,7 @@ mod tests {
     fn every_operation_is_bound_bodyless_or_a_reasoned_frozen_gap() {
         assert_eq!(
             BODY_SCHEMA_GAPS.len(),
-            48,
+            38,
             "review and re-freeze every gap change"
         );
         assert_eq!(

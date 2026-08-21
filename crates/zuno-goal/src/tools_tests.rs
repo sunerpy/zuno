@@ -2,7 +2,7 @@ use super::*;
 use crate::GoalStatus;
 use serde_json::json;
 use std::sync::Arc;
-use zuno_tool::{AllowAll, NeverInterrupted};
+use zuno_tool::{AllowAll, NeverInterrupted, ToolReplayPolicy};
 
 struct Fixture {
     store: Arc<GoalStore>,
@@ -39,6 +39,9 @@ async fn all_three_tools_share_one_authoritative_goal() {
         tools.iter().map(|tool| tool.id()).collect::<Vec<_>>(),
         [GET_GOAL_TOOL_ID, CREATE_GOAL_TOOL_ID, UPDATE_GOAL_TOOL_ID]
     );
+    assert_eq!(tools[0].replay_policy(), ToolReplayPolicy::Safe);
+    assert_eq!(tools[1].replay_policy(), ToolReplayPolicy::Never);
+    assert_eq!(tools[2].replay_policy(), ToolReplayPolicy::Never);
 
     let created = tools[1]
         .execute(

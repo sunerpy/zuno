@@ -1,14 +1,11 @@
 # Zuno database lifecycle
 
-Zuno reads only its own config and data roots. Zuno does not import an opencode database,
-restore opencode sessions, or fall back to an opencode directory. The
-migrations on this page evolve a database already selected by Zuno; they are not
-a cross-product import mechanism.
+Zuno reads only its own config and data roots. The migrations on this page evolve a database already selected and created by Zuno.
 
 ## The channel database
 
-This is the first thing that surprises people, and it looks exactly like a
-compatibility failure: **you run the binary, and the session list is empty.**
+This is the first thing that surprises people, and it looks like lost state:
+**you run the binary, and the session list is empty.**
 
 Nothing is lost. The two builds selected different database files.
 
@@ -48,42 +45,16 @@ The session-prune report also warns when it cannot attribute artifacts to the
 database it opened. See
 [session-retention.md](session-retention.md#reading-the-artifact-warning).
 
-## Pre-rename Zuno database filename
-
-An earlier unreleased Zuno build used `opencode.db` or
-`opencode-<channel>.db` inside the **Zuno** data root. When the computed default
-`zuno*.db` is absent but its corresponding old filename exists, Zuno refuses to
-open or move either file and reports both paths. Move the file explicitly after
-checking it:
-
-```sh
-mv "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/opencode.db" \
-  "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/zuno.db"
-```
-
-If both names exist, the `zuno*.db` file is authoritative. Explicit file APIs
-such as `open_at` do not reinterpret a basename; this diagnostic is confined to
-the computed default database path.
-
 ## Opening an existing Zuno database
 
-Three states, and this binary handles all three:
+Three states are recognized:
 
 1. **Empty file.** The current schema is created and the journal is pre-filled
    with every migration id.
 2. **A database with a `session` table and a `migration` journal.** Only
    migrations whose id is not recorded are run, each in its own transaction.
-3. **A database older than the `migration` table** — it has a `session` table and
-   a Drizzle journal, `__drizzle_migrations`. The `migration` table is created,
-   seeded from the names Drizzle recorded, and the remaining migrations run.
-
-State 3 preserves the schema lineage represented by a Zuno database created
-before the current journal existed. Its regression fixture is historical
-verification data; it does not make an opencode database a supported import.
-
-A database with a `session` table and *neither* journal is refused without being
-modified. That shape cannot be migrated safely by either implementation, and the
-test asserts the data is left untouched.
+3. **Any existing session database without Zuno's `migration` journal.** It is
+   refused without modification as an unsupported pre-release format.
 
 A non-empty database with no `session` table is refused outright:
 
@@ -101,11 +72,9 @@ cp "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/zuno.db" "${XDG_DATA_HOME:-$HOME/.
 
 The migration journal is forward-only. If it contains an id above this binary's
 known ceiling, Zuno refuses to open the database and names both the ceiling and
-the observed id. Compatibility tests against historical fixtures remain useful
-verification assets, but they do not establish a supported cross-binary rollback
-contract. Keep the backup before allowing any version to migrate the file.
+the observed id. Keep the backup before allowing any version to migrate the file.
 
-## The 38 migrations
+## The 39 migrations
 
 Generated from `zuno_db::migration::MIGRATION_IDS`, in execution order.
 `CURRENT_VERSION` equals this list's length; the documentation gate asserts that,
@@ -159,15 +128,6 @@ Regenerate with:
 ```sh
 ZUNO_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
 ```
-
-## Configuration that is rejected rather than reinterpreted
-
-A configuration carrying a deprecated form is refused with a message naming the
-replacement and the offending file. This is deliberate: quietly accepting a
-deprecated key leaves a configuration that behaves differently from what it says.
-All eleven forms, with the exact messages, are in
-[rejected-inputs.md](rejected-inputs.md) — including a config file still under its
-pre-rename name, which Zuno reports rather than silently ignoring.
 
 ## Provider configuration
 

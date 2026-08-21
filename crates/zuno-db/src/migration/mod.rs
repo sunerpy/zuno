@@ -1,23 +1,19 @@
-//! Atomic current-schema creation, legacy migration, and TypeScript
-//! migration-journal parity.
+//! Atomic current-schema creation and monotonic Zuno migrations.
 //!
-//! # Three databases, three paths
+//! # Recognized database states
 //!
-//! [`apply`] is a port of `packages/core/src/database/migration.ts:18-79`, and the
-//! shape of that function is the whole design. A database arrives in exactly one
-//! of three states and each needs different handling:
+//! A database arrives in exactly one of three states:
 //!
-//! * **has `session`** — someone's real history. Never recreate it; run only the
-//!   migrations its journal does not already record ([`apply_only`]).
+//! * **has `session` and `migration`** — a Zuno database. Run only migrations
+//!   its journal does not already record ([`apply_only`]).
 //! * **empty** — a fresh install. Create the current schema in one statement batch
 //!   and pre-seed all 39 journal ids, so no migration ever replays.
-//! * **non-empty without `session`** — unrecognised. Fail; touching it would be
-//!   guesswork over someone's data.
+//! * **anything else** — unsupported. Fail without manufacturing a journal or
+//!   guessing how another schema should be interpreted.
 //!
-//! The order those are tested in is load-bearing, so it matches upstream's:
-//! `session` first, then non-empty, then empty. `create_current` cannot be reached
-//! by any database that has tables, and it re-checks that *inside* its own write
-//! transaction rather than trusting the caller — see there for why.
+//! Zuno is unreleased and does not migrate pre-Zuno or cross-product database
+//! formats. `create_current` cannot be reached by any database that has tables,
+//! and it re-checks that inside its own write transaction.
 
 mod steps;
 
@@ -47,23 +43,9 @@ pub const MIGRATION_IDS: [&str; MIGRATIONS.len()] = {
 /// Numeric version attached to failures from this generated migration set.
 pub const CURRENT_VERSION: u32 = MIGRATION_IDS.len() as u32;
 
-/// The journal Drizzle wrote before upstream replaced it with `migration`.
-///
-/// Only its `name` column is read, and only once — see [`seed_from_drizzle`].
-pub const DRIZZLE_JOURNAL_TABLE: &str = "__drizzle_migrations";
-
-/// What [`apply_only`] did, so a caller can tell seeding from execution.
-///
-/// The distinction is the whole safety property of a legacy migration: an id that
-/// was *seeded* is a claim the old journal made about SQL that already ran, and an
-/// id that was *executed* is SQL this call ran itself. "Nothing was replayed" is
-/// only checkable if the two are reported separately — inferring it from a
-/// successful return would be inferring it from the fact that replayed DDL happens
-/// to error, which is a coincidence, not a guarantee.
+/// What [`apply_only`] executed.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Applied {
-    /// Ids copied out of Drizzle's journal, in the order that journal held them.
-    pub seeded: Vec<String>,
     /// Ids whose SQL this call ran, in [`MIGRATION_IDS`] order.
     pub executed: Vec<String>,
 }
@@ -71,18 +53,19 @@ pub struct Applied {
 const JOURNAL_SQL: &str =
     "CREATE TABLE \"migration\" (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)";
 
-const JOURNAL_IF_ABSENT_SQL: &str = "CREATE TABLE IF NOT EXISTS \"migration\" (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)";
-
-/// Bring a database to the current schema, whatever state it arrives in.
+/// Bring a recognized Zuno database to the current schema.
 ///
 /// # Errors
 ///
-/// [`DbError::Migration`] for a non-empty database with no `session` table, for a
-/// migration SQLite rejects, for time conversion failures, or for SQLite DDL/DML
-/// failures. [`DbError::Busy`] if another writer holds the database lock.
+/// [`DbError::Migration`] for an unsupported existing database, a migration
+/// SQLite rejects, time conversion failures, or SQLite DDL/DML failures.
+/// [`DbError::Busy`] if another writer holds the database lock.
 pub fn apply(connection: &mut Connection) -> Result<(), DbError> {
     let tables = table_names(connection)?;
     if tables.iter().any(|table| table == "session") {
+        if !tables.iter().any(|table| table == "migration") {
+            return Err(unsupported_existing_database());
+        }
         return apply_only(connection).map(|_| ());
     }
     if !tables.is_empty() {
@@ -93,41 +76,28 @@ pub fn apply(connection: &mut Connection) -> Result<(), DbError> {
     create_current(connection)
 }
 
-/// Run every migration an existing database has not recorded.
+/// Run every migration a Zuno database has not recorded.
 ///
-/// A port of `migration.ts:43-79`. Three things it does that a journal check
-/// alone does not:
+/// The journal must already exist. Missing journals are unsupported formats,
+/// rather than an invitation to infer which historical migrations ran. Recorded
+/// migrations are skipped, and a journal newer than this migration set is refused
+/// before any SQL runs.
 ///
-/// 1. **Creates the journal if it is absent.** A real install predating the
-///    `migration` table has a `session` table and no journal at all, so reading
-///    the journal first is how this function used to fail on the very databases it
-///    exists to serve.
-/// 2. **Seeds the journal from Drizzle's, once.** See [`seed_from_drizzle`].
-/// 3. **Skips anything already recorded**, so old SQL never replays over data.
-/// 4. **Refuses a journal newer than this migration set**, before running SQL.
-///
-/// Each migration commits in its own transaction, as upstream does: a chain that
-/// fails halfway leaves the completed prefix recorded, and the next launch resumes
-/// rather than starting over.
+/// Each migration commits in its own transaction. A chain that fails halfway
+/// leaves the completed prefix recorded, and the next launch resumes.
 ///
 /// # Errors
 ///
-/// [`DbError::Migration`] if the journal cannot be created or read, or if a
-/// migration's SQL fails. [`DbError::MigrationTooNew`] if the journal contains an
-/// id above this binary's known ceiling. [`DbError::Busy`] if another writer holds
-/// the lock.
+/// [`DbError::Migration`] if the journal is absent or cannot be read, or if a
+/// migration's SQL fails. [`DbError::MigrationTooNew`] if the journal contains
+/// an id above this binary's known ceiling. [`DbError::Busy`] if another writer
+/// holds the lock.
 pub fn apply_only(connection: &mut Connection) -> Result<Applied, DbError> {
-    connection
-        .execute_batch(JOURNAL_IF_ABSENT_SQL)
-        .map_err(map_error)?;
-
-    let mut applied = Applied::default();
-    let mut completed = journal_ids(connection)?;
-    if completed.is_empty() && has_table(connection, DRIZZLE_JOURNAL_TABLE)? {
-        seed_from_drizzle(connection)?;
-        applied.seeded = drizzle_names(connection)?;
-        completed = journal_ids(connection)?;
+    if !has_table(connection, "migration")? {
+        return Err(unsupported_existing_database());
     }
+    let mut applied = Applied::default();
+    let completed = journal_ids(connection)?;
     refuse_future_migrations(&completed)?;
 
     for migration in &MIGRATIONS {
@@ -163,44 +133,6 @@ fn refuse_future_migrations(completed: &HashSet<String>) -> Result<(), DbError> 
         });
     }
     Ok(())
-}
-
-/// Copy Drizzle's completed migration names into the `migration` journal.
-///
-/// Upstream's reason, verbatim from `migration.ts:52-54`: *"Existing installs used
-/// Drizzle's migration journal. Seed the new journal once so TypeScript migrations
-/// don't replay old SQL."*
-///
-/// Without this step every migration looks outstanding on a legacy install, and
-/// migration 1 would try to `CREATE TABLE session` over 2,345 live sessions. The
-/// `INSERT OR IGNORE` and the empty-journal precondition together make it a
-/// once-only operation, and the names are taken as-is: this function's job is to
-/// record what the old journal claims, not to audit it against
-/// [`MIGRATION_IDS`].
-fn seed_from_drizzle(connection: &Connection) -> Result<(), DbError> {
-    let time_completed = unix_milliseconds()?;
-    connection
-        .execute(
-            "INSERT OR IGNORE INTO migration (id, time_completed) \
-             SELECT name, ?1 FROM __drizzle_migrations WHERE name IS NOT NULL",
-            params![time_completed],
-        )
-        .map_err(map_error)?;
-    Ok(())
-}
-
-fn drizzle_names(connection: &Connection) -> Result<Vec<String>, DbError> {
-    let mut statement = connection
-        .prepare(
-            "SELECT name FROM __drizzle_migrations \
-             WHERE name IS NOT NULL ORDER BY rowid",
-        )
-        .map_err(map_error)?;
-    statement
-        .query_map([], |row| row.get(0))
-        .map_err(map_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(map_error)
 }
 
 /// Create the current schema and pre-seed the journal, atomically.
@@ -322,6 +254,12 @@ fn failure(source: impl std::error::Error + Send + Sync + 'static) -> DbError {
     }
 }
 
+fn unsupported_existing_database() -> DbError {
+    failure(std::io::Error::other(
+        "database uses an unsupported pre-release format: a Zuno session database must contain the Zuno migration journal",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_tests_for_a_session_table_before_it_tests_for_emptiness() {
+    fn apply_rejects_a_session_database_without_the_zuno_journal_without_mutating_it() {
         let mut connection = memory();
         connection
             .execute_batch(
@@ -398,15 +336,32 @@ mod tests {
             )
             .expect("stand in for a live database");
 
-        let error = apply(&mut connection).expect_err("the chain cannot migrate this shape");
+        let error = apply(&mut connection).expect_err("the format is unsupported");
         let cause = format!("{:?}", std::error::Error::source(&error));
         assert!(
-            !cause.contains("refusing to create the current schema"),
-            "apply must route a session database to the migration path, not to creation: {cause}"
+            cause.contains("unsupported pre-release format"),
+            "the error must explain the hard format cut: {cause}"
         );
         let title: String = connection
             .query_row("SELECT title FROM session", [], |row| row.get(0))
             .expect("the session survived");
         assert_eq!(title, "kept");
+        assert!(
+            !has_table(&connection, "migration").expect("inspect tables"),
+            "rejection must not manufacture a journal"
+        );
+    }
+
+    #[test]
+    fn apply_only_also_rejects_a_missing_journal_without_mutation() {
+        let mut connection = memory();
+        connection
+            .execute_batch("CREATE TABLE session (id text PRIMARY KEY)")
+            .expect("stand in for an unsupported database");
+
+        let error = apply_only(&mut connection).expect_err("the journal is required");
+        let cause = format!("{:?}", std::error::Error::source(&error));
+        assert!(cause.contains("unsupported pre-release format"), "{cause}");
+        assert!(!has_table(&connection, "migration").expect("inspect tables"));
     }
 }

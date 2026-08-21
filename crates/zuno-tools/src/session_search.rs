@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use zuno_db::fts;
 use zuno_db::{Connection, open};
 use zuno_error::{DbError, ToolError};
-use zuno_tool::{ToolContext, ToolOutput, TypedTool};
+use zuno_tool::{ToolContext, ToolOutput, ToolReplayPolicy, TypedTool};
 
 const DEFAULT_LIMIT: u32 = 3;
 const MAX_LIMIT: u32 = 10;
@@ -100,6 +100,10 @@ impl TypedTool for SessionSearchTool {
 
     fn description(&self) -> &str {
         DESCRIPTION
+    }
+
+    fn replay_policy(&self) -> ToolReplayPolicy {
+        ToolReplayPolicy::Safe
     }
 
     async fn run(
@@ -454,5 +458,18 @@ fn failed(tool: &str, source: impl std::error::Error + Send + Sync + 'static) ->
     ToolError::Failed {
         tool: tool.to_owned(),
         source: Box::new(source),
+    }
+}
+
+#[cfg(test)]
+mod replay_policy_tests {
+    use super::*;
+
+    #[test]
+    fn session_recall_is_safe_to_repeat() {
+        assert_eq!(
+            SessionSearchTool::new("/unused").replay_policy(),
+            ToolReplayPolicy::Safe
+        );
     }
 }

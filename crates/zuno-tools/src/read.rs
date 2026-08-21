@@ -14,7 +14,7 @@ use serde_json::{Map, Value, json};
 use std::path::Path;
 use std::sync::Arc;
 use zuno_error::ToolError;
-use zuno_tool::{Attachment, ToolContext, ToolOutput, TypedTool};
+use zuno_tool::{Attachment, ToolContext, ToolOutput, ToolReplayPolicy, TypedTool};
 
 const DEFAULT_READ_LIMIT: usize = 2_000;
 const MAX_LINE_LENGTH: usize = 2_000;
@@ -231,6 +231,10 @@ impl TypedTool for ReadTool {
 
     fn description(&self) -> &str {
         DESCRIPTION
+    }
+
+    fn replay_policy(&self) -> ToolReplayPolicy {
+        ToolReplayPolicy::Safe
     }
 
     async fn run(&self, params: Self::Params, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
