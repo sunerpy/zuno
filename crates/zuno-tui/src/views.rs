@@ -64,6 +64,7 @@ pub mod question;
 pub mod scroll;
 pub mod session;
 pub mod slash;
+pub mod subagent;
 pub mod toast;
 pub mod tool;
 pub mod welcome;

@@ -284,6 +284,18 @@ pub struct ResolvedModel {
     /// Model id sent on the provider wire.
     pub model_id: String,
     pub surface: ApiSurface,
+    /// Provider-native reasoning controls for the session's chosen effort level.
+    ///
+    /// The resolved options rather than a `ReasoningEffort`, because the canonical
+    /// level means nothing on a wire: Anthropic wants `thinking.budgetTokens`,
+    /// Google `thinkingConfig.thinkingLevel`, OpenAI `reasoningEffort`.
+    /// `zuno_llm::effort::resolve_effort` owns that translation and needs the
+    /// provider family — a catalog fact this module deliberately does not hold. The
+    /// caller resolves, the engine transports.
+    ///
+    /// Empty for a model without reasoning support or a session that chose no level,
+    /// which is what keeps such a request byte-identical to the pre-effort build.
+    pub reasoning_options: Map<String, Value>,
 }
 
 impl ResolvedModel {
@@ -296,7 +308,18 @@ impl ResolvedModel {
             provider,
             model_id,
             surface,
+            reasoning_options: Map::new(),
         }
+    }
+
+    /// Attach the provider-native reasoning controls for the chosen effort level.
+    ///
+    /// Built by the caller with `zuno_llm::effort::resolve_effort`, whose
+    /// `EffortResolution::options` is exactly this shape.
+    #[must_use]
+    pub fn with_reasoning_options(mut self, options: Map<String, Value>) -> Self {
+        self.reasoning_options = options;
+        self
     }
 
     /// Attach the catalog identity when it differs from the transport factory or wire id.
@@ -1900,6 +1923,15 @@ fn assistant_message(
     .map_err(TurnError::from)
 }
 
+/// # Why the reasoning controls travel as `parameters`
+///
+/// `parameters` is the one channel every provider family already overlays onto its
+/// outbound body: `CompletionRequest::apply_parameters` is called by all six
+/// adapters (anthropic, openai, bedrock, compatible, and google's three surfaces).
+/// Reaching the wire any other way would mean editing each adapter to read a new
+/// field, and the two that already accept native reasoning read it from
+/// *provider-scoped* options — a per-session choice cannot live there without
+/// rewriting the model spec on every keypress.
 fn completion_request(
     model: &ResolvedModel,
     prepared: PreparedTurn<ToolDefinition>,
@@ -1917,7 +1949,7 @@ fn completion_request(
                 parameters: tool.parameters.clone(),
             })
             .collect(),
-        parameters: Map::new(),
+        parameters: model.reasoning_options.clone(),
         headers: std::collections::BTreeMap::new(),
     }
 }

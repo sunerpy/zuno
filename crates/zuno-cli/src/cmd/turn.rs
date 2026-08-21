@@ -111,6 +111,14 @@ pub(crate) struct TurnOptions {
     pub(crate) session: SessionChoice,
     /// The title a newly created session gets.
     pub(crate) title: Option<String>,
+    /// The reasoning level to ask the model for, when it supports reasoning.
+    ///
+    /// `None` means "send no reasoning control", which is not the same as
+    /// [`zuno_llm::effort::ReasoningEffort::Off`]: `Off` actively disables thinking on
+    /// a model that would otherwise do it, while `None` leaves the provider's own
+    /// default in place and keeps the request byte-identical to a build without this
+    /// field.
+    pub(crate) effort: Option<zuno_llm::effort::ReasoningEffort>,
 }
 
 /// Everything resolved from configuration, with no handle open yet.
@@ -152,6 +160,14 @@ pub(crate) struct TurnPlan {
     delegation_facts: Arc<zuno_tools::task::FixedFacts>,
     /// Whether any reachable model accepts images, which gates one delegation target.
     vision_available: bool,
+    /// Whether the session's model declares reasoning support in the catalog.
+    ///
+    /// Kept from resolution so a surface can ask without re-resolving the catalog, and
+    /// so a key that cycles reasoning levels can refuse on a model that has none rather
+    /// than relabel a control the provider would reject.
+    reasoning_supported: bool,
+    /// The reasoning level this plan resolved with, echoed back for display.
+    effort: Option<zuno_llm::effort::ReasoningEffort>,
 }
 
 impl TurnPlan {
@@ -251,6 +267,7 @@ impl TurnPlan {
                 catalog_model.api.npm
             ));
         }
+        let reasoning_supported = catalog_model.capabilities.reasoning;
         let resolver = Resolver {
             requested_agent: agent.name.clone(),
             system_prompt: agent.prompt.clone().unwrap_or_default(),
@@ -260,6 +277,11 @@ impl TurnPlan {
             requested_provider: provider_id.clone(),
             requested_model: model_id.clone(),
             wire_model: catalog_model.api.id.clone(),
+            reasoning_options: session_reasoning_options(
+                options.effort,
+                &provider_id,
+                catalog_model,
+            ),
             spec: model_spec(&catalog, catalog_model, env)?,
         };
         let window = TokenWindow {
@@ -328,6 +350,8 @@ impl TurnPlan {
             skills,
             delegation_facts,
             vision_available,
+            reasoning_supported,
+            effort: options.effort,
         })
     }
 
@@ -369,6 +393,21 @@ impl TurnPlan {
     /// `provider/model`, as resolved.
     pub(crate) fn qualified_model(&self) -> String {
         format!("{}/{}", self.provider_id, self.model_id)
+    }
+
+    /// Whether the resolved model declares reasoning support.
+    pub(crate) const fn reasoning_supported(&self) -> bool {
+        self.reasoning_supported
+    }
+
+    /// Whether `qualified` reasons, according to the facts a delegation resolves through.
+    pub(crate) fn model_reasons(&self, qualified: &str) -> bool {
+        self.delegation_facts.reasons(qualified).unwrap_or(false)
+    }
+
+    /// The reasoning level this plan resolved with.
+    pub(crate) const fn effort(&self) -> Option<zuno_llm::effort::ReasoningEffort> {
+        self.effort
     }
 
     /// The model's context ceiling, or zero when the catalog declares none.
@@ -630,6 +669,12 @@ pub(crate) struct TurnHost {
     agent: String,
     provider_id: String,
     model_id: String,
+    /// The reasoning level this host resolved with.
+    ///
+    /// Held here because the host is the source of truth every rebuild path already
+    /// reads its model and agent back from (`refresh_mcp_host`). A level kept only in
+    /// the launch options would be dropped by the next rebuild that did not carry it.
+    effort: Option<zuno_llm::effort::ReasoningEffort>,
     internals: Internals,
     compaction_config: zuno_config::schema::CompactionConfig,
     compaction_state: CompactionState,
@@ -842,6 +887,7 @@ impl TurnHost {
             agent: plan.agent.name,
             provider_id: plan.provider_id,
             model_id: plan.model_id,
+            effort: plan.effort,
             internals: plan.internals,
             compaction_config: plan.config.compaction.clone().unwrap_or_default(),
             compaction_state: CompactionState::default(),
@@ -910,6 +956,11 @@ impl TurnHost {
 
     pub(crate) fn qualified_model(&self) -> String {
         format!("{}/{}", self.provider_id, self.model_id)
+    }
+
+    /// The reasoning level this host resolved with.
+    pub(crate) const fn effort(&self) -> Option<zuno_llm::effort::ReasoningEffort> {
+        self.effort
     }
 
     /// Commands available to interactive discovery, in catalog listing order.
@@ -2273,6 +2324,44 @@ fn credential_value(credential: &Credential) -> String {
     }
 }
 
+/// The provider-native reasoning controls for `effort` on `model`, if any.
+///
+/// Empty when the session chose no level, or when the catalog says the model does not
+/// reason. The capability check is what stops a level chosen on one model leaking onto
+/// the next: [`TurnPlan::resolve`] runs again on every model switch, so a model without
+/// reasoning resolves to no controls even while the session still remembers a level.
+///
+/// [`EffortCapabilities::default`] is passed for the same reason [`delegation_facts`]
+/// passes it: the resolved catalog carries no adaptive or token-budget shape. The
+/// consequence is bounded and stated there — a model that declares its own variant for
+/// the level still wins, because `resolve_effort` prefers a declared variant over any
+/// generic mapping.
+fn session_reasoning_options(
+    effort: Option<zuno_llm::effort::ReasoningEffort>,
+    provider_id: &str,
+    model: &zuno_llm::catalog::ResolvedModel,
+) -> serde_json::Map<String, serde_json::Value> {
+    let Some(effort) = effort.filter(|_| model.capabilities.reasoning) else {
+        return serde_json::Map::new();
+    };
+    let Some(family) = effort_family(provider_id, &model.api.npm) else {
+        return serde_json::Map::new();
+    };
+    let mut declared = zuno_llm::effort::DeclaredVariants::new();
+    for (name, options) in &model.variants {
+        if let Ok(level) = name.parse::<zuno_llm::effort::ReasoningEffort>() {
+            declared = declared.with(level, options.clone());
+        }
+    }
+    zuno_llm::effort::resolve_effort(
+        family,
+        effort,
+        zuno_llm::effort::EffortCapabilities::default(),
+        &declared,
+    )
+    .options
+}
+
 struct Resolver {
     requested_agent: String,
     system_prompt: String,
@@ -2280,6 +2369,7 @@ struct Resolver {
     requested_provider: String,
     requested_model: String,
     wire_model: String,
+    reasoning_options: serde_json::Map<String, serde_json::Value>,
     spec: Spec,
 }
 
@@ -2302,6 +2392,7 @@ impl AgentModelResolver for Resolver {
                 self.spec.surface,
             )
             .with_catalog_identity(&self.requested_provider, &self.requested_model)
+            .with_reasoning_options(self.reasoning_options.clone())
         })
     }
 }

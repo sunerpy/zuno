@@ -2313,6 +2313,15 @@ pub struct StatusView {
     /// [`Self::reset`] leaves it alone — the same reasoning that keeps `diagnostics`
     /// across a turn boundary.
     git_branch: Option<String>,
+    /// The reasoning level the session asked the model for, when it asked for one.
+    ///
+    /// Beside `configured_model` rather than among the resolved fields, and surviving
+    /// [`Self::reset`] for the same reason: it is what the *composer is set to*, not
+    /// something a turn reports. No engine event carries it.
+    ///
+    /// `None` renders nothing at all. That is the honest answer for a model with no
+    /// reasoning support, where a level would name a control the request does not send.
+    effort: Option<zuno_llm::effort::ReasoningEffort>,
 }
 
 /// Token counts for the session, accumulated across every step of every turn.
@@ -2453,6 +2462,13 @@ impl StatusView {
     /// What separates two segments of the right-hand group.
     const TRAILER_GAP: &'static str = "  ";
 
+    /// What labels the reasoning level on the strip.
+    ///
+    /// A word rather than a glyph: the level's own name (`low`, `high`, `max`) is a bare
+    /// adjective, and beside a model id it would read as part of the model's name. The
+    /// prefix is also what a user greps the help for after seeing it.
+    pub const EFFORT_PREFIX: &'static str = "think:";
+
     /// A status strip over `context`.
     #[must_use]
     pub fn new(context: ViewContext) -> Self {
@@ -2469,6 +2485,7 @@ impl StatusView {
             diagnostics: None,
             awaiting_permission: false,
             git_branch: None,
+            effort: None,
         }
     }
 
@@ -2520,6 +2537,17 @@ impl StatusView {
     /// Replace the configured agent, after the user picked a different one.
     pub fn set_configured_agent(&mut self, agent: impl Into<String>) {
         self.configured_agent = Some(agent.into());
+    }
+
+    /// State the reasoning level, or `None` to show none at all.
+    pub const fn set_effort(&mut self, effort: Option<zuno_llm::effort::ReasoningEffort>) {
+        self.effort = effort;
+    }
+
+    /// The reasoning level the strip is showing.
+    #[must_use]
+    pub const fn effort(&self) -> Option<zuno_llm::effort::ReasoningEffort> {
+        self.effort
     }
 
     /// Whether a turn is in flight, as the strip is reporting it.
@@ -2696,6 +2724,17 @@ impl StatusView {
                 text.push_str(" · ");
             }
             text.push_str(model);
+        }
+        // Directly after the model, because it qualifies the model rather than the turn:
+        // the level is a property of what the composer will send, and reading
+        // `build · claude · think:high` as one phrase is what makes the key that cycles
+        // it discoverable at all.
+        if let Some(effort) = self.effort {
+            if !text.is_empty() {
+                text.push_str(" · ");
+            }
+            text.push_str(Self::EFFORT_PREFIX);
+            text.push_str(effort.as_str());
         }
         if self.step > 0 {
             if !text.is_empty() {

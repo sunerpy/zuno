@@ -780,6 +780,7 @@ fn views_welcome_every_advertised_key_is_routed_by_the_session_screen() {
                     id: String::from("prov/one"),
                     name: String::from("one"),
                     provider: String::from("prov"),
+                    reasoning: false,
                 }],
                 agents: vec![crate::views::picker::AgentEntry {
                     name: String::from("build"),
@@ -1044,6 +1045,7 @@ fn routable_screen() -> crate::views::session::SessionScreen {
                 id: String::from("prov/one"),
                 name: String::from("one"),
                 provider: String::from("prov"),
+                reasoning: false,
             }],
             agents: vec![crate::views::picker::AgentEntry {
                 name: String::from("build"),

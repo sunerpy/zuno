@@ -1331,11 +1331,13 @@ fn catalog() -> SessionCatalog {
                 id: String::from("prov/haiku"),
                 name: String::from("haiku"),
                 provider: String::from("prov"),
+                reasoning: false,
             },
             crate::views::picker::ModelEntry {
                 id: String::from("prov/sonnet"),
                 name: String::from("sonnet"),
                 provider: String::from("prov"),
+                reasoning: false,
             },
         ],
         agents: vec![crate::views::picker::AgentEntry {
@@ -1345,6 +1347,8 @@ fn catalog() -> SessionCatalog {
         sessions: Vec::new(),
         model: Some(String::from("prov/haiku")),
         agent: Some(String::from("build")),
+        reasoning: false,
+        effort: None,
     }
 }
 
@@ -4080,6 +4084,15 @@ fn session_ignores_a_mouse_event_that_is_not_a_vertical_wheel() {
 /// capability this screen has not grown yet, recorded so the next author sees the backlog
 /// instead of rediscovering one row of it.
 const PRESSABLE_BUT_DEAD: &[&str] = &[
+    // Deliberate: the bare arrows the delegated-task view owns. They reach
+    // `crate::views::subagent::SubagentView` through `DialogHost`, which owns the keyboard
+    // and promotes the `session` scope while that view is open — the same arrangement the
+    // `diff_*` rows below describe. An arm on this screen would take `left`, `right` and
+    // `up` away from the prompt cursor, which the `input` scope wins ahead of `session`
+    // precisely so that it keeps them.
+    "session_child_cycle",
+    "session_child_cycle_reverse",
+    "session_parent",
     // Deliberate: bare characters the diff viewer owns; an arm here would make them untypeable.
     "diff_close",
     "diff_collapse",
@@ -4109,14 +4122,10 @@ const PRESSABLE_BUT_DEAD: &[&str] = &[
     "model_favorite_toggle",
     "model_provider_list",
     "session_background",
-    "session_child_cycle",
-    "session_child_cycle_reverse",
-    "session_child_first",
     "session_compact",
     "session_delete",
     "session_export",
     "session_new",
-    "session_parent",
     "session_pin_toggle",
     "session_queued_prompts",
     "session_quick_switch_1",
@@ -4200,11 +4209,12 @@ fn every_bound_action_in_a_registered_scope_either_reaches_something_or_is_a_nam
          {live_but_listed:?}"
     );
     // The census is a number as well as a set, so shrinking it is a visible event in a diff
-    // and growing it silently is impossible. `agent_cycle` and `agent_cycle_reverse` are the
-    // two this change took off the list.
+    // and growing it silently is impossible. `agent_cycle` and `agent_cycle_reverse` were the
+    // two an earlier change took off the list; `session_child_first` is the one this change
+    // did, by giving `ctrl+x down` the delegated-task view to open.
     assert_eq!(
         PRESSABLE_BUT_DEAD.len(),
-        48,
+        47,
         "the pressable-but-dead census changed size; that is a real event either way and the \
          count is pinned so it cannot pass unremarked"
     );
@@ -6320,5 +6330,218 @@ fn session_screen_states_the_session_name_above_the_sidebars_context_block() {
             "at {width} columns the session name is not above the Context block:\n{}",
             frame.join("\n")
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reasoning level (ctrl+t) and the delegated-task view (ctrl+x down).
+
+/// A catalog whose model reasons, so the cycling key has something to cycle.
+fn reasoning_catalog() -> SessionCatalog {
+    let mut catalog = catalog();
+    catalog.reasoning = true;
+    for model in &mut catalog.models {
+        model.reasoning = true;
+    }
+    catalog
+}
+
+/// `ctrl+t` steps the reasoning level and states it on the strip.
+///
+/// The level, the commit to the host and the rendered row are asserted together on
+/// purpose: any one of them alone is satisfied by a change that does not reach the other
+/// two, which is exactly the "changed a label" failure this feature must not be.
+#[test]
+fn variant_cycle_steps_the_reasoning_level_and_shows_it_on_the_model_row() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (selections, mut chosen) = mpsc::channel(4);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_catalog(reasoning_catalog())
+        .with_selection_sink(selections);
+    screen.status_mut().describe("build", "prov/haiku");
+
+    let result = screen.handle_action(action("variant_cycle"), &press_none());
+    assert!(result.handled && result.redraw, "ctrl+t did nothing");
+
+    assert_eq!(
+        screen.catalog.effort,
+        Some(zuno_llm::effort::ReasoningEffort::Off),
+        "the first press must land on the weakest level rather than mid-scale"
+    );
+    assert_eq!(
+        chosen.try_recv(),
+        Ok(Selection::Effort(zuno_llm::effort::ReasoningEffort::Off)),
+        "the level has to reach the host, or nothing re-resolves the request"
+    );
+
+    screen.handle_action(action("variant_cycle"), &press_none());
+    assert_eq!(
+        screen.catalog.effort,
+        Some(zuno_llm::effort::ReasoningEffort::Low)
+    );
+    assert_eq!(
+        chosen.try_recv(),
+        Ok(Selection::Effort(zuno_llm::effort::ReasoningEffort::Low))
+    );
+
+    let joined = rows(&render_offscreen(&mut screen, 80, 24).expect("infallible")).join("\n");
+    assert!(
+        joined.contains("prov/haiku"),
+        "the model row is not on screen, so this proves nothing:\n{joined}"
+    );
+    assert!(
+        joined.contains(&format!(
+            "{}{}",
+            crate::views::message::StatusView::EFFORT_PREFIX,
+            zuno_llm::effort::ReasoningEffort::Low
+        )),
+        "the chosen level is not shown on the model row:\n{joined}"
+    );
+}
+
+/// On a model that does not reason, `ctrl+t` must change nothing visible.
+///
+/// This is 所有功能都要完整可用 inverted: a key that looks live and is not is worse than
+/// one that is absent. It must not invent a level, must not show one on the strip, and
+/// must not send one to the host — while still saying why, so the refusal is legible.
+#[test]
+fn variant_cycle_does_nothing_visible_on_a_model_that_cannot_reason() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (selections, mut chosen) = mpsc::channel(4);
+    // `catalog()` declares `reasoning: false` for every model, as the host does for a
+    // model whose resolved catalog entry has no reasoning capability.
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_catalog(catalog())
+        .with_selection_sink(selections);
+    screen.status_mut().describe("build", "prov/haiku");
+    let before = rows(&render_offscreen(&mut screen, 80, 24).expect("infallible")).join("\n");
+
+    screen.handle_action(action("variant_cycle"), &press_none());
+
+    assert_eq!(
+        screen.catalog.effort, None,
+        "a level was adopted for a model that cannot use one"
+    );
+    assert_eq!(
+        screen.status.effort(),
+        None,
+        "the strip claims a reasoning level the request would not carry"
+    );
+    assert_eq!(
+        chosen.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty),
+        "an inapplicable level was sent to the host"
+    );
+    let after = rows(&render_offscreen(&mut screen, 80, 24).expect("infallible")).join("\n");
+    assert!(
+        !after.contains(crate::views::message::StatusView::EFFORT_PREFIX),
+        "the strip grew a reasoning segment on a model that cannot reason:\n{after}"
+    );
+    assert!(
+        before.lines().next() == after.lines().next(),
+        "the frame changed above the toast row"
+    );
+
+    let toasts = screen.drain_toasts();
+    assert_eq!(toasts.len(), 1, "the refusal was silent");
+    assert!(
+        toasts[0]
+            .text()
+            .contains("does not accept a reasoning level"),
+        "the refusal does not say why: {:?}",
+        toasts[0].text()
+    );
+}
+
+/// Switching to a model that cannot reason drops the level rather than keeping it shown.
+#[test]
+fn choosing_a_model_without_reasoning_clears_the_level() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let mut catalog = reasoning_catalog();
+    catalog.models[1].reasoning = false;
+    let plain = catalog.models[1].id.clone();
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender).with_catalog(catalog);
+    screen.handle_action(action("variant_cycle"), &press_none());
+    assert!(screen.catalog.effort.is_some());
+
+    screen.adopt(crate::views::picker::MODEL_DIALOG_ID, &plain);
+
+    assert!(
+        !screen.catalog.reasoning,
+        "the screen still believes the new model reasons"
+    );
+    assert_eq!(
+        screen.catalog.effort, None,
+        "the level survived onto a model whose request cannot carry it"
+    );
+    assert_eq!(screen.status.effort(), None);
+}
+
+/// `ctrl+x` then `down` opens the delegated-task view.
+///
+/// Driven through the dispatcher and the dialog host rather than by calling the handler,
+/// because the thing under test is that the *chord* reaches a surface: `session_child_first`
+/// was a row in the shipped table with no handler anywhere in the crate.
+#[test]
+fn the_leader_down_chord_opens_the_delegated_task_view() {
+    let keymap = Keymap::defaults().expect("the shipped table builds");
+    let (sender, _receiver) = terminal_event_channel();
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender);
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .push(delegating_message());
+    let host = crate::views::dialog::DialogHost::new(ViewContext::defaults(), Box::new(screen));
+    let mut dispatcher = KeyDispatcher::new(keymap, scopes(), Box::new(host));
+
+    for event in [
+        KeyEvent {
+            code: crossterm::event::KeyCode::Char('x'),
+            modifiers: crossterm::event::KeyModifiers::CONTROL,
+            kind: crossterm::event::KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        },
+        press(crossterm::event::KeyCode::Down),
+    ] {
+        dispatcher.handle_event(&crate::app::AppEvent::Terminal(TerminalEvent::Input(
+            crossterm::event::Event::Key(event),
+        )));
+    }
+
+    let joined = rows(&render_offscreen(&mut dispatcher, 100, 24).expect("infallible")).join("\n");
+    assert!(
+        joined.contains("Delegated tasks"),
+        "ctrl+x down did not open the delegated-task view:\n{joined}"
+    );
+    assert!(
+        joined.contains("survey the auth code"),
+        "the view opened without the delegation this session made:\n{joined}"
+    );
+}
+
+/// One assistant message carrying two `task` calls, as a delegating turn records them.
+fn delegating_message() -> Message {
+    let call = |id: &str, agent: &str, description: &str, session: &str| {
+        crate::views::message::MessagePart::Tool {
+            call_id: String::from(id),
+            name: String::from("task"),
+            arguments: format!(
+                r#"{{"description":"{description}","prompt":"go","subagent_type":"{agent}"}}"#
+            ),
+            title: None,
+            status: crate::views::message::ToolStatus::Completed,
+            output: Some(format!(
+                "<task id=\"{session}\" state=\"completed\">\nok\n</task>"
+            )),
+            diff: None,
+        }
+    };
+    Message {
+        role: Role::Assistant,
+        id: Some(String::from("msg_delegating")),
+        parts: vec![
+            call("c1", "explore", "survey the auth code", "ses_child_a"),
+            call("c2", "librarian", "find the RFC", "ses_child_b"),
+        ],
     }
 }

@@ -32,6 +32,7 @@ pub(super) fn execute(args: &RunArgs, environment: &StartupEnvironment) -> Resul
         agent: args.agent.clone(),
         session: SessionChoice::resolve(args.session.as_deref(), args.r#continue),
         title: args.title.clone(),
+        effort: None,
     };
     let runtime = runtime()?;
     let plan = runtime.block_on(TurnPlan::resolve(&options, environment))?;

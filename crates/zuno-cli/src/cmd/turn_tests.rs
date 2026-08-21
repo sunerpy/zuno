@@ -61,11 +61,14 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
             requested_model: "model".to_owned(),
             wire_model: "model".to_owned(),
             spec: Spec::new(COMPATIBLE_PROVIDER).with_surface(ApiSurface::Chat),
+            reasoning_options: serde_json::Map::new(),
         },
         catalog_models: Vec::new(),
         skills: Arc::new(zuno_catalog::skill::Skills::default()),
         delegation_facts: Arc::new(zuno_tools::task::FixedFacts::new()),
         vision_available: false,
+        reasoning_supported: false,
+        effort: None,
         directory,
         project,
         config: zuno_config::schema::Config::default(),
@@ -167,6 +170,7 @@ fn production_prompt_composition_honours_the_memory_master_switch() {
         requested_model: "model".to_owned(),
         wire_model: "model".to_owned(),
         spec: Spec::new(COMPATIBLE_PROVIDER),
+        reasoning_options: serde_json::Map::new(),
     };
 
     let mut disabled = resolver();
@@ -2687,6 +2691,7 @@ async fn run_compatible_turn(
         requested_provider: "provider".to_owned(),
         requested_model: "model".to_owned(),
         wire_model: "model".to_owned(),
+        reasoning_options: serde_json::Map::new(),
         spec,
     };
     let mut connection =
@@ -3067,6 +3072,7 @@ mod skill_prompt {
             requested_model: "model".to_owned(),
             wire_model: "model".to_owned(),
             spec: Spec::new(COMPATIBLE_PROVIDER),
+            reasoning_options: serde_json::Map::new(),
         }
     }
 

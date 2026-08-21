@@ -733,11 +733,13 @@ fn views_dialog_typed_keys_filter_the_dialog_and_never_reach_the_base() {
                 id: String::from("prov/alpha"),
                 name: String::from("alpha"),
                 provider: String::from("prov"),
+                reasoning: false,
             },
             crate::views::picker::ModelEntry {
                 id: String::from("prov/beta"),
                 name: String::from("beta"),
                 provider: String::from("prov"),
+                reasoning: false,
             },
         ],
         ..crate::views::session::SessionCatalog::default()
@@ -1187,6 +1189,7 @@ fn a_dialog_footer_drops_a_hint_rather_than_spelling_one_halfway() {
                 id: String::from("p/m"),
                 name: String::from("m"),
                 provider: String::from("p"),
+                reasoning: false,
             }],
         );
         let hints = dialog.hints();
