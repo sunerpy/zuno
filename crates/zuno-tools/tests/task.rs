@@ -17,6 +17,7 @@ use zuno_error::ToolError;
 use zuno_llm::effort::{
     EffortResolution, ProviderFamily, ReasoningEffort, ResolutionSource, resolve_effort,
 };
+use zuno_llm::registry::ApiSurface;
 use zuno_tool::{AllowAll, NeverInterrupted, ToolContext, erase};
 use zuno_tools::FileTools;
 use zuno_tools::registry::{BUILTIN_ORDER, BuiltinSlot, RegistryFlags, ToolRegistryBuilder};
@@ -87,18 +88,33 @@ async fn an_explicit_model_and_effort_reach_the_childs_outbound_request() {
     assert_eq!(request.effort, Some(ReasoningEffort::Low));
 
     // The same merge a provider adapter performs, so this is the child's real body.
+    // The assertion changed from `reasoningEffort` to the two wire fields that
+    // option becomes: the delegated options are SDK provider-option names, and
+    // asserting the pre-lowering spelling here made the child body look verified
+    // while it was in fact going out under a field no endpoint reads.
     let resolution = EffortResolution {
         effort: request.effort.expect("an effort resolved"),
         source: ResolutionSource::GenericMapping,
         options: request.provider_options.clone(),
     };
-    let mut body = base_body(&request.model.as_ref().expect("a model").model);
-    resolution.apply_to(&mut body);
+    let mut chat = base_body(&request.model.as_ref().expect("a model").model);
+    resolution.apply_to(&mut chat, ApiSurface::Chat);
+    let mut responses = base_body(&request.model.as_ref().expect("a model").model);
+    resolution.apply_to(&mut responses, ApiSurface::Responses);
 
-    assert_eq!(body["model"], REASONER);
+    assert_eq!(chat["model"], REASONER);
     assert_eq!(
-        body["reasoningEffort"], "low",
-        "the effort must survive into the outbound body: {body:?}"
+        chat["reasoning_effort"], "low",
+        "the effort must reach a chat body under its wire name: {chat:?}"
+    );
+    assert_eq!(
+        responses["reasoning"],
+        serde_json::json!({"effort": "low"}),
+        "the Responses surface takes the level nested: {responses:?}"
+    );
+    assert!(
+        !chat.contains_key("reasoningEffort") && !responses.contains_key("reasoningEffort"),
+        "the SDK option name must not reach either body"
     );
     assert_eq!(
         request.provider_options,

@@ -29,8 +29,8 @@ use zuno_llm::event::{
     ThoughtSignature,
 };
 use zuno_llm::registry::{
-    Capabilities, CompletionRequest, Declined, FactoryOutcome, Provider, ProviderStream, Spec,
-    Unavailable,
+    ApiSurface, Capabilities, CompletionRequest, Declined, FactoryOutcome, Provider,
+    ProviderStream, Spec, Unavailable,
 };
 use zuno_llm::sse::{SseEvent, SseParser, ensure_tool_input_size};
 
@@ -312,7 +312,10 @@ impl GoogleGenerativeAi {
         let base = self.options.base_url.as_deref().unwrap_or(GOOGLE_BASE_URL);
         let url = gemini_api_endpoint(base, &request.model_id)?;
         let mut body = build_gemini_body(&request.messages, &self.options)?;
-        request.apply_parameters(&mut body);
+        // Gemini's `generateContent` is neither OpenAI surface; `Messages` selects
+        // no OpenAI-specific rename, and the Google rule nests `thinkingConfig`
+        // under `generationConfig` on every surface.
+        request.apply_parameters(&mut body, ApiSurface::Messages);
         let mut prepared = PreparedRequest::new(url, body);
         prepared.headers.extend(request.headers.clone());
         Ok(prepared)
@@ -407,7 +410,10 @@ impl VertexGemini {
             vertex_gemini_endpoint(&self.project, &self.location, &request.model_id)?
         };
         let mut body = build_gemini_body(&request.messages, &self.options)?;
-        request.apply_parameters(&mut body);
+        // Gemini's `generateContent` is neither OpenAI surface; `Messages` selects
+        // no OpenAI-specific rename, and the Google rule nests `thinkingConfig`
+        // under `generationConfig` on every surface.
+        request.apply_parameters(&mut body, ApiSurface::Messages);
         let mut prepared = PreparedRequest::new(url, body);
         prepared.headers.extend(request.headers.clone());
         Ok(prepared)
@@ -1154,7 +1160,7 @@ impl VertexAnthropic {
             None => vertex_anthropic_endpoint(&self.project, &self.location, &request.model_id)?,
         };
         let mut body = build_vertex_anthropic_body(&request.messages, &self.options)?;
-        request.apply_parameters(&mut body);
+        request.apply_parameters(&mut body, ApiSurface::Messages);
         let mut prepared = PreparedRequest::new(url, body);
         prepared.headers.extend(request.headers.clone());
         Ok(prepared)
@@ -1294,7 +1300,7 @@ fn build_vertex_anthropic_body(
             options.effort_capabilities,
             &options.variants,
         )
-        .apply_to(&mut body);
+        .apply_to(&mut body, ApiSurface::Messages);
     }
     Ok(Value::Object(body))
 }

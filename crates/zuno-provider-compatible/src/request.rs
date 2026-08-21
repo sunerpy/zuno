@@ -581,7 +581,10 @@ fn translate_tool_results(message: &Message) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zuno_llm::registry::{ApiSurface, Capabilities};
+    use zuno_llm::effort::{
+        DeclaredVariants, EffortCapabilities, ProviderFamily, ReasoningEffort, resolve_effort,
+    };
+    use zuno_llm::registry::{ApiSurface, Capabilities, CompletionRequest};
 
     fn quirks(reasoning_protocol: bool, sampling: bool) -> Quirks {
         Quirks {
@@ -750,13 +753,75 @@ mod tests {
         assert!(built.get("tools").is_none());
     }
 
+    /// `extraBody` is a verbatim escape hatch for whatever an endpoint accepts.
+    ///
+    /// The key changed from `reasoning_effort` to `service_tier`. Nothing about the
+    /// old assertion was false — a hand-inserted `reasoning_effort` did survive —
+    /// but naming an effort field here made the suite *look* as though it covered
+    /// reasoning effort, while the session path was in fact emitting
+    /// `reasoningEffort`. This test never had anything to do with effort
+    /// resolution; the coverage it appeared to give is now real and lives in
+    /// [`the_sessions_effort_reaches_the_chat_body_as_reasoning_effort`].
     #[test]
     fn extra_body_reaches_unprotected_keys() {
         let mut body = RequestBody::new("gpt-oss-20b", vec![Message::new(Role::User, "hi")]);
         body.extra_body
-            .insert("reasoning_effort".to_owned(), json!("high"));
+            .insert("service_tier".to_owned(), json!("flex"));
         let built = body.build(&quirks(false, true));
+        assert_eq!(built["service_tier"], json!("flex"));
+    }
+
+    /// The chosen level must reach a Chat body as `reasoning_effort`.
+    ///
+    /// Every input is production: [`resolve_effort`] builds the options exactly as
+    /// `session_reasoning_options` does, and [`RequestBody::build`] is the same
+    /// builder the provider ships. Nothing here is hand-written except the level.
+    #[test]
+    fn the_sessions_effort_reaches_the_chat_body_as_reasoning_effort() {
+        let resolved = resolve_effort(
+            ProviderFamily::OpenAi,
+            ReasoningEffort::High,
+            EffortCapabilities::default(),
+            &DeclaredVariants::new(),
+        );
+        let request = CompletionRequest::new("gpt-oss-20b", vec![Message::new(Role::User, "hi")])
+            .on_surface(ApiSurface::Chat);
+        let mut request = request;
+        request.parameters = resolved.options.clone();
+
+        let mut built = RequestBody::new("gpt-oss-20b", vec![Message::new(Role::User, "hi")])
+            .build(&quirks(false, true));
+        request.apply_parameters(&mut built, ApiSurface::Chat);
+
         assert_eq!(built["reasoning_effort"], json!("high"));
+        assert!(
+            built.get("reasoningEffort").is_none(),
+            "the SDK option name must not reach a chat body: {built}"
+        );
+    }
+
+    /// The same level must reach a Responses body as `reasoning.effort`.
+    #[test]
+    fn the_sessions_effort_reaches_the_responses_body_as_nested_reasoning() {
+        let resolved = resolve_effort(
+            ProviderFamily::OpenAi,
+            ReasoningEffort::High,
+            EffortCapabilities::default(),
+            &DeclaredVariants::new(),
+        );
+        let mut request = CompletionRequest::new("gpt-5", vec![Message::new(Role::User, "hi")])
+            .on_surface(ApiSurface::Responses);
+        request.parameters = resolved.options;
+
+        let mut built = RequestBody::new("gpt-5", vec![Message::new(Role::User, "hi")])
+            .build(&responses_quirks());
+        request.apply_parameters(&mut built, ApiSurface::Responses);
+
+        assert_eq!(built["reasoning"], json!({"effort": "high"}));
+        assert!(
+            built.get("reasoningEffort").is_none() && built.get("reasoning_effort").is_none(),
+            "the Responses surface takes the level nested, not flat: {built}"
+        );
     }
 
     #[test]

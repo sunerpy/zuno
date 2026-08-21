@@ -185,7 +185,11 @@ impl CompatibleProvider {
         body.sampling = self.sampling;
         body.extra_body = self.extra_body.clone();
         let mut body = body.build(&quirks);
-        request.apply_parameters(&mut body);
+        // `quirks.surface`, not `request.surface`: the request usually carries
+        // `Default` and this profile's own rules decide whether that means
+        // `/chat/completions` or `/responses`. The endpoint is built from the same
+        // resolved value on the next line of `http_request`.
+        request.apply_parameters(&mut body, quirks.surface);
         body
     }
 
@@ -510,11 +514,19 @@ mod tests {
         assert!(provider.capabilities_for("llama-3.3-70b").sampling_params);
     }
 
+    /// A spec's `extraBody` is copied onto the body verbatim.
+    ///
+    /// The key changed from `reasoning_effort` to `service_tier`. The old
+    /// assertion was true, but it was about `extraBody` passthrough while reading
+    /// as though the session's reasoning effort were covered — and it was not:
+    /// `resolve_effort` was emitting `reasoningEffort`, which no endpoint reads.
+    /// Real effort coverage now lives in
+    /// `request.rs::the_sessions_effort_reaches_the_chat_body_as_reasoning_effort`.
     #[test]
     fn extra_body_from_the_spec_reaches_the_request() {
         let spec = Spec::new("groq")
             .with_base_url("https://api.groq.com/openai/v1")
-            .with_option(EXTRA_BODY_OPTION, json!({"reasoning_effort": "high"}));
+            .with_option(EXTRA_BODY_OPTION, json!({"service_tier": "flex"}));
         let provider = build(spec).expect("ok");
         let request = CompletionRequest::new(
             "llama-3.3-70b",
@@ -523,9 +535,88 @@ mod tests {
                 "hi",
             )],
         );
+        assert_eq!(provider.body_for(&request)["service_tier"], json!("flex"));
+    }
+
+    /// A session's reasoning level must reach the provider's own body builder.
+    ///
+    /// `body_for` is what `http_request` sends, so this closes the last hop: the
+    /// options come from production [`resolve_effort`], the body from production
+    /// `body_for`, and the assertion is on the wire field name rather than on the
+    /// SDK option name the resolver produced.
+    #[test]
+    fn a_sessions_reasoning_level_reaches_body_for_under_its_wire_name() {
+        let spec = Spec::new("groq").with_base_url("https://api.groq.com/openai/v1");
+        let provider = build(spec).expect("ok");
+        let resolved = zuno_llm::effort::resolve_effort(
+            zuno_llm::effort::ProviderFamily::OpenAi,
+            zuno_llm::effort::ReasoningEffort::High,
+            zuno_llm::effort::EffortCapabilities::default(),
+            &zuno_llm::effort::DeclaredVariants::new(),
+        );
+        let mut request = CompletionRequest::new(
+            "llama-3.3-70b",
+            vec![zuno_llm::event::Message::new(
+                zuno_llm::event::Role::User,
+                "hi",
+            )],
+        )
+        .on_surface(ApiSurface::Chat);
+        request.parameters = resolved.options;
+
+        let body = provider.body_for(&request);
+        assert_eq!(body["reasoning_effort"], json!("high"));
+        assert!(
+            body.get("reasoningEffort").is_none(),
+            "the SDK option name reached the wire: {body}"
+        );
+    }
+
+    /// The body must be lowered against the surface it is actually posted to.
+    ///
+    /// A wire capture caught this: a request whose own `surface` is `Default` gets
+    /// routed to `/responses` by this profile's rules, and lowering against the
+    /// request's hint instead of the resolved surface put the flat Chat field
+    /// `reasoning_effort` on a Responses request. Both halves are read from
+    /// production here — the endpoint from `endpoint`, the body from `body_for` —
+    /// so they cannot disagree without failing.
+    #[test]
+    fn the_body_is_lowered_against_the_surface_the_endpoint_resolves_to() {
+        // `xai` is one of the ids this profile pins to Responses by rule rather
+        // than by anything on the request, which is exactly the trap.
+        let spec = Spec::new("xai").with_base_url("http://127.0.0.1/v1");
+        let provider = build(spec).expect("ok");
+        let resolved = zuno_llm::effort::resolve_effort(
+            zuno_llm::effort::ProviderFamily::OpenAi,
+            zuno_llm::effort::ReasoningEffort::High,
+            zuno_llm::effort::EffortCapabilities::default(),
+            &zuno_llm::effort::DeclaredVariants::new(),
+        );
+        let mut request = CompletionRequest::new(
+            "stub-reasoner",
+            vec![zuno_llm::event::Message::new(
+                zuno_llm::event::Role::User,
+                "hi",
+            )],
+        );
+        request.parameters = resolved.options;
         assert_eq!(
-            provider.body_for(&request)["reasoning_effort"],
-            json!("high")
+            request.surface,
+            ApiSurface::Default,
+            "the trap only exists when the request itself names no surface"
+        );
+
+        let sent = provider.http_request(&request);
+        assert!(
+            sent.url.ends_with("/responses"),
+            "this spec must route to the Responses surface: {}",
+            sent.url
+        );
+        assert_eq!(sent.body["reasoning"], json!({"effort": "high"}));
+        assert!(
+            sent.body.get("reasoning_effort").is_none(),
+            "a Chat field reached a Responses request: {}",
+            sent.body
         );
     }
 

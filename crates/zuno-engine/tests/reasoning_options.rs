@@ -218,14 +218,80 @@ async fn the_sessions_reasoning_level_reaches_the_provider_request() {
     );
 
     let mut body = json!({ "model": "recording-model" });
-    sent.apply_parameters(&mut body);
-    for (name, value) in &resolved.options {
-        assert_eq!(
-            body.get(name),
-            Some(value),
-            "`{name}` did not survive the overlay every provider adapter performs: {body}"
-        );
+    sent.apply_parameters(&mut body, ApiSurface::Messages);
+    assert_eq!(
+        body["thinking"],
+        json!({"type": "enabled", "budget_tokens": 16000}),
+        "the overlay must hand Anthropic its documented wire field: {body}"
+    );
+    assert!(
+        !body.to_string().contains("budgetTokens"),
+        "the SDK option name reached the body: {body}"
+    );
+}
+
+/// A body already carrying sampling fields must keep them when the level lands.
+///
+/// Gemini's level goes to `generationConfig.thinkingConfig`, and a top-level
+/// overwrite would evict the `temperature` the provider had already written
+/// alongside it. That is why the overlay merges rather than replaces.
+#[tokio::test]
+async fn a_nested_reasoning_control_does_not_evict_the_sampling_fields_beside_it() {
+    let resolved = resolve_effort(
+        ProviderFamily::Google,
+        ReasoningEffort::High,
+        EffortCapabilities::default(),
+        &DeclaredVariants::new(),
+    );
+
+    let mut connection = seeded();
+    put_user(&connection, "think about this");
+    let provider = Arc::new(RecordingProvider::answering_once());
+    let mut providers = ProviderRegistry::new();
+    {
+        let provider = Arc::clone(&provider);
+        providers.register("recording", move |_spec| provider.clone());
     }
+    let resolver = ReasoningResolver(resolved.options.clone());
+    let dispatcher = NoTools;
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        RunTurnRequest::new(SESSION_ID, "turn-nested", DynamicContext::default()),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, ()) = tokio::join!(turn, drain(receiver));
+    outcome.expect("the turn completes");
+
+    let requests = provider.requests();
+    let sent = requests.first().expect("the provider received a request");
+    let mut body = json!({
+        "generationConfig": { "temperature": 0.7, "maxOutputTokens": 1024 }
+    });
+    sent.apply_parameters(&mut body, ApiSurface::Messages);
+
+    assert_eq!(
+        body["generationConfig"]["temperature"],
+        json!(0.7),
+        "the overlay replaced generationConfig instead of merging into it: {body}"
+    );
+    assert_eq!(body["generationConfig"]["maxOutputTokens"], json!(1024));
+    assert_eq!(
+        body["generationConfig"]["thinkingConfig"],
+        json!({"includeThoughts": true, "thinkingLevel": "high"})
+    );
+    assert!(
+        body.get("thinkingConfig").is_none(),
+        "Gemini reads thinkingConfig only inside generationConfig: {body}"
+    );
 }
 
 /// A session that chose no level must send no reasoning control at all.
